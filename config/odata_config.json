@@ -1,0 +1,7 @@
+{
+  "base_url": "http://mtzw7/unf_demo/odata/standard.odata/",
+  "username": "odata.user",
+  "password": "odata.test",
+  "entity_name": "AccumulationRegister_ЗапасыНаСкладах",
+  "select_fields": ""
+}
