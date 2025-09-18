@@ -198,7 +198,7 @@ def get_root_products(conn: sqlite3.Connection) -> pd.DataFrame:
         pass
 
     query = """
-    SELECT i.item_code, i.item_name, ps.stage_name
+    SELECT i.item_code, i.item_name, i.item_article, ps.stage_name
     FROM items i
     LEFT JOIN production_stages ps ON ps.stage_id = i.stage_id
     WHERE i.item_id NOT IN (SELECT DISTINCT child_item_id FROM bom)
