@@ -32,6 +32,35 @@ COLOR_BG_WEEKEND = PatternFill("solid", fgColor=COLOR_WEEKEND)
 COLOR_BG_SUBHEADER = PatternFill("solid", fgColor=COLOR_SUBHEADER)
 
 
+def _read_nomen_index_map() -> dict[str, str]:
+    """
+    Возвращает карту {item_code -> item_article} из локального индекса output/nomenclature_index.json.
+    Если файл отсутствует или поврежден — возвращает пустой словарь.
+    """
+    try:
+        p = Path("output/nomenclature_index.json")
+        if not p.exists():
+            return {}
+        import json
+        with p.open("r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            return {}
+        out: dict[str, str] = {}
+        for it in items:
+            try:
+                code = str(it.get("code") or "").strip()
+                article = str(it.get("article") or "").strip()
+                if code:
+                    out[code] = article
+            except Exception:
+                continue
+        return out
+    except Exception:
+        return {}
+
+
 def generate_plan_dataframe(
     db_path: Optional[Path] = None,
     horizon_days: int = 30,
@@ -66,10 +95,12 @@ def generate_plan_dataframe(
     date_headers = [d.strftime("%d.%m.%y") for d in dates]
 
     # 3) Формирование строк
+    code_to_article = _read_nomen_index_map()
     rows: list[dict[str, Any]] = []
     for _, r in roots_df.iterrows():
         name = str(r.get("item_name", "") or "")
         code = str(r.get("item_code", "") or "")
+        article = str(code_to_article.get(code, "") or "")
 
         # Инициализация дневных значений нулями для наглядного суммирования
         day_vals = [0.0] * horizon_days
@@ -77,7 +108,8 @@ def generate_plan_dataframe(
 
         record: dict[str, Any] = {
             "Номенклатурное наименование изделия": name,
-            "Артикул изделия": code,
+            "Артикул изделия": article,
+            "Код изделия": code,
             "Выполнено": "",
             "Недовыполнено": "",
             "План на месяц": total,
@@ -87,7 +119,7 @@ def generate_plan_dataframe(
         rows.append(record)
 
     columns = (
-        ["Номенклатурное наименование изделия", "Артикул изделия", "Выполнено", "Недовыполнено", "План на месяц"]
+        ["Номенклатурное наименование изделия", "Артикул изделия", "Код изделия", "Выполнено", "Недовыполнено", "План на месяц"]
         + date_headers
     )
     df = pd.DataFrame(rows, columns=columns)
@@ -146,9 +178,11 @@ def generate_production_plan(
     # 4) Данные строк
     # Если корневых изделий нет, всё равно сохранить пустой шаблон
     row_count = 0
+    code_to_article = _read_nomen_index_map()
     for _, row in roots_df.iterrows():
         name = str(row.get("item_name", "") or "")
         code = str(row.get("item_code", "") or "")
+        article = str(code_to_article.get(code, "") or "")
 
         # Базовые значения: выполнено/недовыполнено = пусто
         done = ""
@@ -159,7 +193,7 @@ def generate_production_plan(
 
         # Сформировать строку без формулы E, формула будет установлена ниже,
         # так как openpyxl не выставляет формулу при append удобно.
-        record = [name, code, done, underdone, ""] + day_values
+        record = [name, article, done, underdone, ""] + day_values
         ws.append(record)
         row_count += 1
 

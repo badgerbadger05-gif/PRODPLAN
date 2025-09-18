@@ -32,12 +32,14 @@ def init_database(db_path: Optional[Path] = None) -> None:
     """
     with get_connection(db_path) as conn:
         conn.executescript(SCHEMA_SQL)
-        # Миграции схемы: добавить items.stock_qty при отсутствии
+        # Миграции схемы: добавить недостающие колонки в items (идемпотентно)
         try:
             cols = conn.execute("PRAGMA table_info(items)").fetchall()
             col_names = {str(c[1]) for c in cols}
             if "stock_qty" not in col_names:
                 conn.execute("ALTER TABLE items ADD COLUMN stock_qty REAL DEFAULT 0.0")
+            if "item_article" not in col_names:
+                conn.execute("ALTER TABLE items ADD COLUMN item_article TEXT")
         except Exception:
             # Мягкий фоллбек: не роняем инициализацию, если ALTER недоступен (старые SQLite и пр.)
             pass

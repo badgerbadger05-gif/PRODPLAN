@@ -7,6 +7,7 @@ import sqlite3
 from pathlib import Path
 import pandas as pd
 import streamlit as st
+from streamlit_searchbox import st_searchbox
 from dataclasses import asdict
 import time
 import subprocess
@@ -112,6 +113,33 @@ def _write_nomen_index(data: dict) -> None:
     except Exception:
         pass
 
+def _sync_item_articles_from_index() -> None:
+    """
+    Обновляет items.item_article из локального индекса output/nomenclature_index.json.
+    Идемпотентно; безопасно при отсутствии файла или пустом индексе.
+    """
+    idx = _read_nomen_index()
+    try:
+        items = idx.get("items") if isinstance(idx, dict) else None
+    except Exception:
+        items = None
+    if not items:
+        return
+    with get_connection(None) as conn:
+        cur = conn.cursor()
+        for it in items:
+            try:
+                code = str(it.get("code") or "").strip()
+                if not code:
+                    continue
+                article = str(it.get("article") or "")
+                cur.execute(
+                    "UPDATE items SET item_article = ?, updated_at = datetime('now') WHERE item_code = ?",
+                    (article if article else None, code),
+                )
+            except Exception:
+                continue
+        conn.commit()
 def _ollama_embed_text(text: str, timeout: float = 60.0) -> list[float] | None:
     try:
         url = f"{OLLAMA_BASE_URL}/api/embeddings"
@@ -131,6 +159,79 @@ def _ollama_embed_text(text: str, timeout: float = 60.0) -> list[float] | None:
     except Exception:
         return None
     return None
+
+# ============================
+# Нормализация для сопоставления артикулов с визуально схожими символами
+# ============================
+_CYR_TO_LAT_MAP = {
+    "А": "A", "а": "a",
+    "В": "B", "в": "b",
+    "С": "C", "с": "c",
+    "Е": "E", "е": "e",
+    "Н": "H", "н": "h",
+    "К": "K", "к": "k",
+    "М": "M", "м": "m",
+    "О": "O", "о": "o",
+    "Р": "P", "р": "p",
+    "Т": "T", "т": "t",
+    "Х": "X", "х": "x",
+    "У": "Y", "у": "y",
+    "Г": "G", "г": "g",
+    "Ё": "E", "ё": "e",
+    "І": "I", "і": "i",
+    "Ј": "J", "ј": "j",
+}
+
+def _to_lat_lookalike(s: str) -> str:
+    if not isinstance(s, str):
+        s = str(s or "")
+    result = "".join(_CYR_TO_LAT_MAP.get(ch, ch) for ch in s)
+    
+    # Отладочный вывод для преобразования кириллицы в латиницу
+    if len(s) < 20 and s != result:  # Ограничиваем вывод для длинных строк и только при изменении
+        print(f"DEBUG: Cyr->Lat conversion: '{s}' -> '{result}'")
+    
+    return result
+
+def _normalize_for_match(s: str) -> str:
+    # Упрощенная нормализация: маппинг Кириллица→Латиница, удаление пробелов/дефисов/подчёркиваний, приведение к верхнему регистру
+    if not isinstance(s, str):
+        s = str(s or "")
+    t = _to_lat_lookalike(s)
+    t = t.replace(" ", "").replace("-", "").replace("_", "")
+    result = t.upper()
+    
+    # Отладочный вывод для нормализации
+    if len(s) < 20:  # Ограничиваем вывод для длинных строк
+        print(f"DEBUG: Normalizing '{s}' -> '{result}'")
+    
+    return result
+
+def _augment_query_for_article(q: str) -> str:
+    variants = [q]
+    
+    # Добавляем кириллица -> латиница
+    alt = _to_lat_lookalike(q)
+    if alt != q and alt.strip():
+        variants.append(alt)
+    
+    # Добавляем нормализованный вариант
+    norm = _normalize_for_match(q)
+    if norm != q and norm.strip():
+        variants.append(norm)
+    
+    # Добавляем вариант без разделителей для артикулов
+    no_separators = q.replace("-", "").replace("_", "").replace(" ", "")
+    if no_separators != q and len(no_separators) > 2:
+        variants.append(no_separators)
+    
+    result = " | ".join(variants)
+    
+    # Отладочный вывод
+    if len(q) < 20:  # Ограничиваем вывод для длинных запросов
+        print(f"DEBUG: Augmenting query '{q}' -> '{result}'")
+    
+    return result
 
 def _extract_count(resp: dict) -> int | None:
     """
@@ -193,21 +294,24 @@ def _fetch_nomenclature_from_1c(limit: int = 30000, on_progress=None) -> tuple[l
     client = OData1CClient(base_url=base_url, username=username, password=password, token=None)
 
     total_count = _try_get_nomenclature_count()
+    # Эффективный предел выгрузки:
+    # - если сервер вернул total_count — выгружаем все записи;
+    # - иначе используем переданный limit (по умолчанию 30000).
+    effective_limit = int(limit)
     if isinstance(total_count, int) and total_count >= 0:
-        total_count = min(total_count, int(limit))
-    else:
-        total_count = None
+        effective_limit = int(total_count)
 
     out: list[dict] = []
     top = 1000
     skip = 0
-    max_pages = max(1, int(limit // top) + 2)
+    max_pages = max(1, int(effective_limit // top) + 2)
     pages = 0
-    while len(out) < limit and pages < max_pages:
+    while len(out) < effective_limit and pages < max_pages:
         params = {
             "$select": "Code,Description,Артикул",
             "$top": top,
             "$skip": skip,
+            "$orderby": "Code"
         }
         try:
             resp = client._make_request("Catalog_Номенклатура", params)
@@ -227,11 +331,16 @@ def _fetch_nomenclature_from_1c(limit: int = 30000, on_progress=None) -> tuple[l
                 code = str(r.get("Code") or "").strip()
                 name = str(r.get("Description") or "").strip()
                 article = str(r.get("Артикул") or "").strip()
+                
+                # Отладочный вывод для артикулов
+                if article and len(article) < 20:  # Ограничиваем вывод для длинных артикулов
+                    print(f"DEBUG: Fetched item with article: '{article}'")
+                
                 if code or name or article:
                     out.append({"code": code, "name": name, "article": article})
                     last_name = name
                     last_code = code
-                    if len(out) >= limit:
+                    if len(out) >= effective_limit:
                         break
             except Exception:
                 continue
@@ -270,7 +379,36 @@ def _embed_items_parallel(items_to_embed: list[dict], max_workers: int, on_progr
     with ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as ex:
         futures = {}
         for it in items_to_embed:
-            txt = " | ".join([s for s in [it.get("name") or "", it.get("article") or "", it.get("code") or ""] if s])
+            # Создаем несколько вариантов текста для лучшего поиска
+            name = it.get("name") or ""
+            article = it.get("article") or ""
+            code = it.get("code") or ""
+            
+            # Отладочный вывод для артикулов
+            if article and len(article) < 20:  # Ограничиваем вывод для больших артикулов
+                print(f"DEBUG: Processing item with article: '{article}'")
+            
+            # Основной текст с приоритетом артикула
+            parts = []
+            if article:
+                parts.append(article)  # Артикул первым
+            if name:
+                parts.append(name)
+            if code and code != article:  # Избегаем дублирования
+                parts.append(code)
+                
+            txt = " | ".join(parts)
+            
+            # Добавляем нормализованный артикул для лучшего поиска
+            if article:
+                norm_article = _normalize_for_match(article)
+                if norm_article != article:
+                    txt += f" | {norm_article}"
+            
+            # Отладочный вывод для текста эмбеддинга
+            if article and len(article) < 20:
+                print(f"DEBUG: Embedding text for article '{article}': {txt[:100]}...")
+            
             futures[ex.submit(_ollama_embed_text, txt)] = it
         for fut in as_completed(futures):
             it = futures[fut]
@@ -297,7 +435,7 @@ def _embed_items_parallel(items_to_embed: list[dict], max_workers: int, on_progr
                     pass
     return results, failed
 
-def ensure_llama_index_daily(on_progress=None, max_workers: int = 4) -> tuple[bool, str, bool]:
+def ensure_llama_index_daily(on_progress=None, max_workers: int = 4, force: bool = False) -> tuple[bool, str, bool]:
     """
     Ежесуточное построение локального семантического индекса номенклатуры с инкрементальной переиндексацией.
     on_progress(processed:int, total:int|None, info:dict) — коллбек для прогресса.
@@ -314,7 +452,7 @@ def ensure_llama_index_daily(on_progress=None, max_workers: int = 4) -> tuple[bo
         last_ts = None
 
     now = dt.datetime.utcnow()
-    if last_ts:
+    if last_ts and not force:
         try:
             prev = dt.datetime.fromisoformat(str(last_ts).replace("Z", ""))
             if (now - prev).total_seconds() < 24 * 3600:
@@ -357,14 +495,27 @@ def ensure_llama_index_daily(on_progress=None, max_workers: int = 4) -> tuple[bo
             continue
         h = _compute_item_hash(name, article, code)
         rec = {"code": code, "name": name, "article": article, "hash": h}
+        
+        # Отладочный вывод для артикулов
+        if article and len(article) < 20:  # Ограничиваем вывод для длинных артикулов
+            print(f"DEBUG: Processing item for index: article='{article}', code='{code}'")
+        
         old = old_by_code.get(code)
         if old and str(old.get("hash") or "") == h and isinstance(old.get("vector"), list):
             # Не изменилось — переиспользуем вектор
             rec["vector"] = old.get("vector")
             reused += 1
+            
+            # Отладочный вывод для переиспользованных артикулов
+            if article and len(article) < 20:
+                print(f"DEBUG: Reusing vector for article: '{article}'")
         else:
             # Требуется пересчёт эмбеддинга
             to_embed.append(rec)
+            
+            # Отладочный вывод для артикулов, требующих пересчета
+            if article and len(article) < 20:
+                print(f"DEBUG: Adding to embed queue: article='{article}'")
         new_by_code[code] = rec
 
     removed_codes = [c for c in old_by_code.keys() if c not in new_by_code]
@@ -380,16 +531,46 @@ def ensure_llama_index_daily(on_progress=None, max_workers: int = 4) -> tuple[bo
     emb_by_code = {e["code"]: e for e in embedded}
     final_items: list[dict] = []
     for code, rec in new_by_code.items():
-        if "vector" in rec and isinstance(rec["vector"], list):
-            final_items.append({"code": rec["code"], "name": rec["name"], "article": rec["article"], "vector": rec["vector"], "hash": rec["hash"]})
+        # Всегда включаем запись в индекс, даже если вектор не получен.
+        # Это нужно, чтобы строковый фолбэк по индексу находил такие позиции.
+        vec = None
+        if isinstance(rec.get("vector"), list):
+            vec = rec["vector"]
         else:
             emb = emb_by_code.get(code)
             if emb and isinstance(emb.get("vector"), list):
-                final_items.append({"code": rec["code"], "name": rec["name"], "article": rec["article"], "vector": emb["vector"], "hash": rec["hash"]})
-            # Иначе пропускаем безвекторные записи (не попадут в индекс)
+                vec = emb["vector"]
+        final_items.append({
+            "code": rec["code"],
+            "name": rec["name"],
+            "article": rec["article"],
+            "vector": vec if isinstance(vec, list) else [],
+            "hash": rec["hash"]
+        })
 
     if not final_items:
         return False, "Эмбеддинги не получены (возможно, модель не загружена)", False
+
+    # 5.1) Обновляем в БД колонку items.item_article по результатам индексации (идемпотентно)
+    try:
+        with get_connection(None) as _conn:
+            _cur = _conn.cursor()
+            for _it in final_items:
+                try:
+                    _code = str(_it.get("code") or "")
+                    if not _code:
+                        continue
+                    _article = str(_it.get("article") or "") or None
+                    _cur.execute(
+                        "UPDATE items SET item_article = ?, updated_at = datetime('now') WHERE item_code = ?",
+                        (_article, _code),
+                    )
+                except Exception:
+                    continue
+            _conn.commit()
+    except Exception:
+        # Безопасный фолбэк: не блокируем индекс из-за ошибок обновления БД
+        pass
 
     # 6) Сохраняем индекс и статистику
     duration = int(time.time() - started_at)
@@ -416,64 +597,213 @@ def ensure_llama_index_daily(on_progress=None, max_workers: int = 4) -> tuple[bo
     msg = f"Индекс готов: всего={len(items)}, переиспользовано={reused}, переиндексировано={len(embedded)}, удалено={len(removed_codes)}, ошибки={failed}, {duration}с"
     return True, msg, False
 
-def _llama_search_nomenclature(query: str, limit: int = 10) -> list[dict]:
+def _llama_search_nomenclature(query: str, limit: int = 10, debug: bool = False) -> list[dict]:
     """
     Локальный семантический поиск по индексу: эмбеддинг запроса → косинусная близость.
-    Возвращает [{name, code}] для UI. Фолбэк на БД выполняется выше по стеку.
+    Возвращает [{name, code, article}] для UI. Если эмбеддинг недоступен/невалиден — строковый фолбэк.
     """
     q = (query or "").strip()
     if len(q) < 2:
         return []
+
     idx = _read_nomen_index()
     items = idx.get("items") if isinstance(idx, dict) else None
     if not items:
         return []
 
-    qvec = _ollama_embed_text(q)
+    if debug:
+        print(f"Original query: {q}")
+        print(f"DEBUG: Items in index: {len(items)}")
+
+    q_aug = _augment_query_for_article(q)
+    if debug:
+        print(f"Augmented query: {q_aug}")
+
+    qvec = _ollama_embed_text(q_aug)
+    if debug:
+        print(f"Vector obtained: {qvec is not None}")
+        if isinstance(qvec, list):
+            print(f"Vector length: {len(qvec)}")
+
+    def _fallback_string_search() -> list[dict]:
+        qnorm = _normalize_for_match(q)
+        qlow = q.lower()
+        exact: list[dict] = []
+        partial: list[dict] = []
+        for it in items:
+            try:
+                name = str(it.get("name") or "")
+                code = str(it.get("code") or "")
+                article = str(it.get("article") or "")
+
+                article_norm = _normalize_for_match(article)
+                name_norm = _normalize_for_match(name)
+
+                if article and (article.lower() == qlow or article_norm == qnorm):
+                    exact.append({"name": name, "code": code, "article": article})
+                elif code and (code.lower() == qlow):
+                    exact.append({"name": name, "code": code, "article": article})
+                elif (article and (qnorm in article_norm or qlow in article.lower())) or \
+                     (code and qlow in code.lower()) or \
+                     (name and (qnorm in name_norm or qlow in name.lower())):
+                    partial.append({"name": name, "code": code, "article": article})
+            except Exception:
+                continue
+        return (exact + partial)[:max(1, limit)]
+
+    # Если эмбеддинг не получен — используем строковый фолбэк
     if not qvec:
-        return []
+        if debug:
+            print(f"DEBUG: No vector for query '{q}', using fallback string search")
+        return _fallback_string_search()
+
+    # Подготовим матрицу векторов только для валидных элементов
+    valid_items: list[dict] = []
+    vectors: list[list[float]] = []
+    for it in items:
+        vec = it.get("vector", [])
+        if isinstance(vec, list) and len(vec) > 0:
+            valid_items.append(it)
+            vectors.append(vec)
+
+    if not vectors:
+        if debug:
+            print("DEBUG: No valid vectors in index, using fallback string search")
+        return _fallback_string_search()
 
     try:
-        M = np.array([it.get("vector", []) for it in items], dtype=np.float32)
+        M = np.array(vectors, dtype=np.float32)
         qv = np.array(qvec, dtype=np.float32)
         if M.ndim != 2 or qv.ndim != 1 or M.shape[1] != qv.shape[0]:
-            return []
+            if debug:
+                print(f"DEBUG: Shape mismatch M={M.shape}, qv={qv.shape}, using fallback")
+            return _fallback_string_search()
+
         denom = (np.linalg.norm(M, axis=1) + 1e-9) * (np.linalg.norm(qv) + 1e-9)
         sims = (M @ qv) / denom
         top_idx = np.argsort(-sims)[:max(1, limit)]
         out: list[dict] = []
         for i in top_idx:
             try:
-                it = items[int(i)]
-                name = str(it.get("name") or "")
-                code = str(it.get("code") or "")
-                out.append({"name": name, "code": code})
+                it = valid_items[int(i)]
+                out.append({
+                    "name": str(it.get("name") or ""),
+                    "code": str(it.get("code") or ""),
+                    "article": str(it.get("article") or ""),
+                })
             except Exception:
                 continue
+
+        if not out:
+            if debug:
+                print("DEBUG: Empty vector search result, using fallback")
+            return _fallback_string_search()
         return out
-    except Exception:
-        return []
+    except Exception as e:
+        if debug:
+            print(f"DEBUG: Exception in vector search: {e}, using fallback")
+        return _fallback_string_search()
 
 def _db_search_nomenclature(query: str, limit: int = 10) -> list[dict]:
+    # Отладочный вывод
+    print(f"DEBUG: DB search for query: '{query}'")
+    
+    # Расширенный фолбэк-поиск:
+    # - по названию (LIKE)
+    # - по артикулу (LIKE)
+    # - по артикулу с латинскими аналогами кириллических символов (LIKE)
+    # - по артикулу с нормализацией: убираем -, _, пробелы и приводим к верхнему регистру
+    # - по коду (на случай, если пользователь вводит именно код или смешанную строку)
     like = f"%{query}%"
+    alt = _to_lat_lookalike(query)
+    alt_like = f"%{alt}%"
+    norm = _normalize_for_match(query)
+    norm_like = f"%{norm}%"
+    
+    # Также добавляем вариант без разделителей для артикулов
+    no_separators = query.replace("-", "").replace("_", "").replace(" ", "")
+    no_separators_like = f"%{no_separators}%" if len(no_separators) > 2 else norm_like
+    
+    # Отладочный вывод для условий поиска
+    print(f"DEBUG: Search conditions: like='{like}', alt_like='{alt_like}', norm_like='{norm_like}', no_separators_like='{no_separators_like}'")
+    
     with get_connection(None) as conn:
         try:
             rows = conn.execute(
-                "SELECT item_name, item_code FROM items WHERE item_name LIKE ? OR item_code LIKE ? LIMIT 20",
-                (like, like),
+                """
+                SELECT
+                    item_name,
+                    item_code,
+                    COALESCE(item_article, '') AS item_article
+                FROM items
+                WHERE
+                    item_name LIKE ?
+                    OR item_article LIKE ?
+                    OR item_article LIKE ?
+                    OR UPPER(REPLACE(REPLACE(REPLACE(COALESCE(item_article, ''), '-', ''), '_', ''), ' ', '')) LIKE ?
+                    OR item_code LIKE ?
+                    OR UPPER(REPLACE(REPLACE(REPLACE(COALESCE(item_article, ''), '-', ''), '_', ''), ' ', '')) LIKE ?
+                LIMIT 100
+                """,
+                (like, like, alt_like, norm_like, like, no_separators_like),
             ).fetchall()
-        except Exception:
+            
+            # Отладочный вывод для найденных результатов
+            print(f"DEBUG: DB search found {len(rows)} rows")
+            for i, r in enumerate(rows[:5]):  # Показываем первые 5 результатов
+                name = str(r[0] or "")
+                code_v = str(r[1] or "")
+                article_v = str(r[2] or "")
+                print(f"DEBUG: Row {i}: name='{name}', code='{code_v}', article='{article_v}'")
+        except Exception as e:
+            print(f"DEBUG: DB search error: {e}")
             return []
     out: list[dict] = []
     for r in rows:
         name = str(r[0] or "")
         code_v = str(r[1] or "")
+        article_v = str(r[2] or "")
         if not code_v:
             continue
-        out.append({"name": name, "code": code_v})
+        out.append({"name": name, "code": code_v, "article": article_v})
         if len(out) >= limit:
             break
+    
+    # Отладочный вывод для финальных результатов
+    print(f"DEBUG: DB search returning {len(out)} items")
     return out
+
+
+def search_nomenclature_callback(searchterm: str) -> list[tuple]:
+    """Callback для поиска номенклатуры - должен возвращать list[tuple]"""
+    if not searchterm or len(searchterm.strip()) < 2:
+        return []
+    
+    q_clean = searchterm.strip()
+    # Сначала семантический поиск
+    results = _llama_search_nomenclature(q_clean, limit=8)
+    if not results:
+        # Fallback на DB поиск
+        results = _db_search_nomenclature(q_clean, limit=8)
+    
+    # Возвращаем кортежи (value, label)
+    options = []
+    for r in results:
+        name = str(r.get("name") or r.get("item_name") or "")
+        code = str(r.get("code") or r.get("item_code") or "")
+        article = str(r.get("article") or r.get("item_article") or "")
+        
+        if not code:
+            continue
+            
+        # Формируем отображаемый label
+        id_part = article if article else code
+        label = f"{name} ({id_part})" if name else id_part
+        
+        # value - это то что вернется при выборе, label - что показывается пользователю
+        options.append((code, label))
+    
+    return options
 
 def _ensure_item_and_add_to_roots(code: str, name: str = "") -> None:
     code = (code or "").strip()
@@ -633,6 +963,14 @@ def main():
         init_database()
     except Exception:
         pass
+    # Однократная синхронизация items.item_article из локального индекса в рамках сессии,
+    # чтобы фолбэк‑поиск по артикулу начал работать даже без свежей переиндексации
+    if not st.session_state.get("articles_synced_from_index"):
+        try:
+            _sync_item_articles_from_index()
+        except Exception:
+            pass
+        st.session_state["articles_synced_from_index"] = True
      
     # Проверка и автозапуск Ollama (локальный LLM)
     if "ollama_check_done" not in st.session_state:
@@ -704,7 +1042,13 @@ def main():
             except Exception as e:
                 st.warning(f"LLM: сбой индексации: {e}")
         st.session_state["llama_index_checked"] = True
-     
+        # После индексации (или при наличии старого индекса) — синхронизируем items.item_article из индекса.
+        # Это нужно, чтобы фолбэк-поиск по Артикулу сразу работал.
+        try:
+            _sync_item_articles_from_index()
+        except Exception:
+            pass
+       
     # Уменьшаем шрифты в сайдбаре
     st.markdown("""
         <style>
@@ -820,7 +1164,7 @@ def main():
         df = generate_plan_dataframe(db_path=None, horizon_days=days, start_date=start)
 
         # Заполним сохранённые значения плана по датам
-        item_codes = [str(x) for x in df.get("Артикул изделия", []) if pd.notna(x)]
+        item_codes = [str(x) for x in df.get("Код изделия", []) if pd.notna(x)]
         if not item_codes:
             return df
 
@@ -845,8 +1189,8 @@ def main():
             ).fetchall()
 
         if rows:
-            # Быстрое индексирование строк DataFrame по артикулу
-            index_by_code = {str(code): idx for idx, code in enumerate(df["Артикул изделия"].tolist())}
+            # Быстрое индексирование строк DataFrame по коду изделия
+            index_by_code = {str(code): idx for idx, code in enumerate(df["Код изделия"].tolist())}
             for r in rows:
                 code = str(r["code"])
                 try:
@@ -929,39 +1273,32 @@ def main():
     # Добавление номенклатуры в план (поиск через LLM, фолбэк БД)
     with st.container():
         st.subheader("Добавить номенклатуру в план")
-        q = st.text_input("Название или артикул", key="nom_search_query", placeholder="Начните вводить наименование или артикул…")
-        selected_option = None
-        options: list[str] = []
-        option_map: dict[str, dict] = {}
-        if isinstance(q, str) and len(q.strip()) >= 2:
-            q_clean = q.strip()
-            results = _llama_search_nomenclature(q_clean, limit=10)
-            if not results:
-                # Фолбэк из локальной БД
-                results = _db_search_nomenclature(q_clean, limit=10)
-            for r in results:
-                name = str(r.get("name") or r.get("item_name") or "")
-                code = str(r.get("code") or r.get("item_code") or "")
-                if not code:
-                    continue
-                label = f"{name}, {code}" if name else code
-                if label not in option_map:
-                    options.append(label)
-                    option_map[label] = {"name": name, "code": code}
-            if options:
-                selected_option = st.selectbox("Найденные варианты", options=options, index=0, key="nom_search_select")
-        add_disabled = (selected_option is None)
-        add_clicked = st.button("Добавить в план", type="primary", disabled=add_disabled, key="btn_add_to_plan")
-        if add_clicked and selected_option:
-            sel = option_map.get(selected_option, {})
-            name = sel.get("name") or ""
-            code = sel.get("code") or ""
+        selected_code = st_searchbox(
+            search_function=search_nomenclature_callback,
+            placeholder="🔍 Поиск номенклатуры...",
+            label="Добавить в план",
+            clear_on_submit=True,
+            key="nomenclature_search"
+        )
+
+        # Обработка выбора
+        if selected_code:
+            # Получаем полную информацию по коду
             try:
-                _ensure_item_and_add_to_roots(code=code, name=name)
-                st.success(f"Добавлено в план: {name or ''} [{code}]")
-                st.rerun()
+                with get_connection(None) as conn:
+                    row = conn.execute(
+                        "SELECT item_code, item_name, item_article FROM items WHERE item_code = ?",
+                        (selected_code,)
+                    ).fetchone()
+                    if row:
+                        code, name, article = str(row[0]), str(row[1] or ""), str(row[2] or "")
+                        _ensure_item_and_add_to_roots(code=code, name=name)
+                        st.success(f"Добавлено: {name or code}")
+                        st.rerun()
+                    else:
+                        st.error("Элемент не найден в базе данных")
             except Exception as e:
-                st.error(f"Не удалось добавить в план: {e}")
+                st.error(f"Ошибка добавления: {e}")
 
     # Сводка по таблице
     date_cols = [c for c in df.columns if _is_date_header(c)]
@@ -1020,9 +1357,9 @@ def main():
         if edit_mode:
             # Таблица выбора строк для удаления
             try:
-                select_df = df[["Номенклатурное наименование изделия", "Артикул изделия"]].copy()
+                select_df = df[["Номенклатурное наименование изделия", "Артикул изделия", "Код изделия"]].copy()
             except Exception:
-                select_df = pd.DataFrame(columns=["Номенклатурное наименование изделия", "Артикул изделия"])
+                select_df = pd.DataFrame(columns=["Номенклатурное наименование изделия", "Артикул изделия", "Код изделия"])
             select_df.insert(0, "Выбрать", False)
             edited_sel = st.data_editor(
                 select_df,
@@ -1033,11 +1370,11 @@ def main():
                 width="stretch",
                 key="edit_comp_table",
             )
-            # Собираем выбранные артикула
+            # Собираем выбранные коды изделий
             try:
                 selected_codes = [
                     str(c) for c, flag in zip(
-                        edited_sel.get("Артикул изделия", []),
+                        edited_sel.get("Код изделия", []),
                         edited_sel.get("Выбрать", [])
                     ) if flag
                 ]
@@ -1076,7 +1413,7 @@ def _save_plan_to_db(df: pd.DataFrame, date_cols: list[str]) -> int:
     Сохранить пользовательский план в таблицу production_plan_entries.
 
     Правила MVP:
-      - Для каждой строки (артикул) и каждой даты записываем planned_qty.
+      - Для каждой строки (код изделия) и каждой даты записываем planned_qty.
       - stage_id не указываем (NULL), т.к. это общий план по изделию.
       - Если запись существует (уникальный ключ item_id+stage_id+date), выполняем UPSERT planned_qty.
       - completed_qty/статус на этом этапе не трогаем (оставляем как есть, по умолчанию 0/GREEN).
@@ -1085,7 +1422,7 @@ def _save_plan_to_db(df: pd.DataFrame, date_cols: list[str]) -> int:
     """
     saved = 0
     # Предзагружаем соответствие item_code -> item_id
-    codes = [str(x) for x in df.get("Артикул изделия", []) if pd.notna(x)]
+    codes = [str(x) for x in df.get("Код изделия", []) if pd.notna(x)]
     id_by_code: dict[str, int] = {}
 
     with get_connection(None) as conn:
@@ -1100,7 +1437,7 @@ def _save_plan_to_db(df: pd.DataFrame, date_cols: list[str]) -> int:
             id_by_code = {str(r[0]): int(r[1]) for r in rows if r and r[0] is not None}
 
         for _, row in df.iterrows():
-            code = str(row.get("Артикул изделия") or "")
+            code = str(row.get("Код изделия") or "")
             item_id = id_by_code.get(code)
             if not item_id:
                 # Не нашли товар в БД — пропускаем
@@ -1528,13 +1865,15 @@ def _render_sync_settings_page() -> None:
     )
 
     # Кнопки действий
-    b1, b2, b3 = st.columns([1, 1, 1])
+    b1, b2, b3, b4 = st.columns([1, 1, 1, 1])
     with b1:
         save_click = st.button("Сохранить настройки", type="primary", key="btn_odata_save")
     with b2:
         fetch_md_click = st.button("Выгрузить метаданные", key="btn_odata_fetch_md")
     with b3:
         test_click = st.button("Тестировать подключение", key="btn_odata_test")
+    with b4:
+        force_index_click = st.button("Переиндексация номенклатуры (форс, без проверки 24ч)", key="btn_force_index")
 
     # Обработка: Сохранить настройки
     if save_click:
@@ -1620,6 +1959,48 @@ def _render_sync_settings_page() -> None:
                         st.write(resp)
             except Exception as e:
                 st.error(f"Ошибка подключения: {str(e)}")
+
+    # Обработка: Переиндексация номенклатуры (форс, без проверки 24ч)
+    if force_index_click:
+        try:
+            st.write("LLM: индексация номенклатуры…")
+            progress_text = st.empty()
+            current_line = st.empty()
+            bar = st.progress(0)
+
+            def _on_progress(processed: int, total: int | None, info: dict):
+                phase = str(info.get("phase", "") or "")
+                # Обновление прогресса: если общий объём известен — используем прогресс‑бар
+                if isinstance(total, int) and total > 0:
+                    pct = int(max(0, min(100, processed * 100.0 / total)))
+                    bar.progress(pct)
+                    progress_text.markdown(f"Этап: {phase} • обработано {processed} из {total}")
+                else:
+                    # Если общего объёма нет — только счётчик без прогресс‑бара
+                    progress_text.markdown(f"Этап: {phase} • обработано {processed}")
+                # Текущая позиция
+                name = str(info.get("name") or info.get("last_name") or "")
+                code = str(info.get("code") or info.get("last_code") or "")
+                article = str(info.get("article") or "")
+                parts = [p for p in [name, article, code] if p]
+                current_line.markdown("Текущая позиция: " + (" | ".join(parts) if parts else "—"))
+
+            ok_idx, idx_msg, skipped = ensure_llama_index_daily(on_progress=_on_progress, force=True)
+
+            # Очистим прогрессовые элементы
+            try:
+                bar.empty()
+                current_line.empty()
+                progress_text.empty()
+            except Exception:
+                pass
+
+            if ok_idx:
+                st.success(f"LLM: {idx_msg}")
+            else:
+                st.warning(f"LLM: {idx_msg}")
+        except Exception as e:
+            st.error(f"Ошибка при принудительной переиндексации: {e}")
 
     st.subheader("Текущие параметры")
     st.json({
