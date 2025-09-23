@@ -1,0 +1,11 @@
+{
+  "base_url": "http://mtzw7/unf_demo/odata/standard.odata",
+  "entity_name": "InformationRegister_СпецификацииПоУмолчанию",
+  "username": "odata.user",
+  "password": "odata.test",
+  "token": "",
+  "filter_query": null,
+  "select_fields": null,
+  "dry_run": false,
+  "zero_missing": false
+}

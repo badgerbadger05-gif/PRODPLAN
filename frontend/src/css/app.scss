@@ -1,0 +1,103 @@
+// Global styles for PRODPLAN application
+
+// Import Quasar variables (already provided via SASS import in main.ts)
+// Removed duplicate import of 'quasar/dist/quasar.css' to prevent double styles
+
+// Custom variables
+:root {
+  --q-primary: #1976d2;
+  --q-secondary: #26a69a;
+  --q-accent: #9c27b0;
+  --q-positive: #4caf50;
+  --q-negative: #f44336;
+  --q-info: #2196f3;
+  --q-warning: #ff9800;
+}
+
+// КРИТИЧЕСКИ ВАЖНО: Глобальная защита от дублирования контента
+html {
+  height: 100%;
+  }
+
+body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+#q-app {
+  height: 100%;
+}
+
+// Базовая настройка box-sizing для всех элементов
+* {
+  box-sizing: border-box;
+}
+
+// Упрощенная защита от артефактов прокрутки
+
+
+// Custom styles for feature cards
+.feature-card {
+  transition: transform 0.2s ease-in-out, box-shadow 0.2s ease-in-out;
+
+  &:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 8px 25px rgba(0, 0, 0, 0.15);
+  }
+}
+
+// Custom styles for the main layout
+// Removed custom min-height override; QLayout manages its own height.
+// Overriding it can cause visual artifacts on scroll in Quasar layouts.
+
+// Custom styles for statistics cards
+.stats-card {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+}
+
+// Responsive design improvements
+@media (max-width: 599px) {
+  .q-page {
+    padding: 8px;
+  }
+
+  .feature-card {
+    margin-bottom: 16px;
+  }
+}
+
+// Animation for cards
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(30px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.fade-in-up {
+  animation: fadeInUp 0.6s ease-out;
+}
+
+// Custom scrollbar
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f1f1;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #c1c1c1;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #a8a8a8;
+}

@@ -1,0 +1,38 @@
+services:
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: prodplan
+      POSTGRES_USER: prodplan
+      POSTGRES_PASSWORD: password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+  
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql://prodplan:password@db:5432/prodplan
+    depends_on:
+      - db
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./config:/app/config
+      - ./output:/app/output
+    extra_hosts:
+      - "mtzw7:10.36.0.6"
+      - "mtzw7.lan:10.36.0.6"
+  
+  frontend:
+    build: ./frontend
+    environment:
+      API_URL: http://localhost:8000/api
+    ports:
+      - "9000:80"
+    volumes:
+      - ./frontend/config:/app/config
+  
+volumes:
+  postgres_data:

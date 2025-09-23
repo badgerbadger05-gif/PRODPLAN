@@ -1,0 +1,29 @@
+{
+  "name": "prodplan-frontend",
+  "version": "1.0.0",
+  "description": "PRODPLAN Frontend",
+  "scripts": {
+    "dev": "quasar dev",
+    "build": "quasar build",
+    "lint": "eslint --ext .js,.ts,.vue ./src",
+    "format": "prettier --write \"**/*.{js,ts,vue,scss,html,md,json}\" --ignore-path .gitignore"
+  },
+  "dependencies": {
+    "@quasar/extras": "^1.16.0",
+    "axios": "^1.6.0",
+    "pinia": "^2.1.0",
+    "vue": "^3.3.0",
+    "vue-router": "^4.2.0"
+  },
+   "devDependencies": {
+     "@quasar/app-vite": "^2.0.0",
+     "@quasar/cli": "^2.3.0",
+     "quasar": "^2.14.0",
+     "@types/node": "^20.0.0",
+     "@typescript-eslint/eslint-plugin": "^6.0.0",
+     "@typescript-eslint/parser": "^6.0.0",
+     "eslint": "^8.50.0",
+     "prettier": "^3.0.0",
+     "typescript": "^5.2.0"
+   }
+}
