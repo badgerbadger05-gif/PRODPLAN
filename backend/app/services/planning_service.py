@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func, and_
 from collections import defaultdict
 import json
+import re
 import math
 
 from ..models import (
@@ -1395,9 +1396,10 @@ def run_planning_run(
             aligned with 'Распределение этапов' page logic.
             Returns (stage_id or None, reason_if_ambiguous, norm_hours_single).
 
-            Additionally applies a domain override:
-            - If operations' majority stage corresponds to painting ('маляр', 'крас', 'paint')
-              then prefer that stage over a unique child-stage, forcing painting when present.
+            Domain overrides for painting:
+            - If operations' majority stage corresponds to painting ('покраска'/'paint'), force painting.
+            - If item looks like a painted part by name/article/code (e.g., contains color markers or '-SP' suffix),
+              force painting.
             """
             # cache hit
             if item_id in item_stage_cache and item_id in item_norm_cache:
@@ -1411,15 +1413,50 @@ def run_planning_run(
                 item_id=int(item_id),
             )
 
-            # Painting override: if operations majority indicates painting, force it
-            try:
-                def _is_painting_stage(sid: Optional[int]) -> bool:
-                    if sid is None:
-                        return False
-                    name = (stage_name_map.get(int(sid)) or "").strip().lower()
-                    # русские корни 'маляр', 'крас' + английское 'paint'
-                    return ("маляр" in name) or ("крас" in name) or ("paint" in name)
+            # Helpers
+            def _painting_stage_id() -> Optional[int]:
+                try:
+                    for sid, nm in stage_name_map.items():
+                        nml = (nm or "").strip().lower()
+                        if "покраск" in nml or "paint" in nml:
+                            return int(sid)
+                except Exception:
+                    return None
+                return None
 
+            def _is_painting_stage(sid: Optional[int]) -> bool:
+                if sid is None:
+                    return False
+                name = (stage_name_map.get(int(sid)) or "").strip().lower()
+                return ("покраск" in name) or ("paint" in name)
+
+            def _looks_painted() -> bool:
+                it = item_by_id.get(int(item_id))
+                if not it:
+                    return False
+                txt = " ".join([
+                    str(getattr(it, "item_name", "") or ""),
+                    str(getattr(it, "item_article", "") or ""),
+                    str(getattr(it, "item_code", "") or ""),
+                ]).lower()
+                # Heuristics: color adjectives and explicit paint keywords/suffixes
+                color_keywords = [
+                    "красн", "черн", "бел", "син", "голуб", "зел", "сер", "оранж",
+                    "желт", "жёлт", "фиолет", "бордов", "слонов", "покраск", "покраш"
+                ]
+                if any(k in txt for k in color_keywords):
+                    return True
+                # Code suffixes like -SP, GSP
+                code = str(getattr(it, "item_code", "") or "")
+                if re.search(r"(-|_)?(g?sp)\b", code.lower()):
+                    return True
+                article = str(getattr(it, "item_article", "") or "")
+                if re.search(r"(-|_)?(g?sp)\b", article.lower()):
+                    return True
+                return False
+
+            # Painting override: from operations majority
+            try:
                 spec_id_local = default_spec_map.get(int(item_id))
                 op_major: Optional[int] = None
                 if spec_id_local:
@@ -1445,6 +1482,16 @@ def run_planning_run(
                     rsn = "FORCE_PAINTING_FROM_OPERATIONS"
             except Exception:
                 # fail-safe: ignore override on any error
+                pass
+
+            # Painting override: by item attributes (name/article/code)
+            try:
+                if _looks_painted():
+                    paint_sid = _painting_stage_id()
+                    if paint_sid is not None and int(stg_id or -1) != int(paint_sid):
+                        stg_id = int(paint_sid)
+                        rsn = "FORCE_PAINTING_BY_NAME"
+            except Exception:
                 pass
 
             item_stage_cache[item_id] = (stg_id, rsn)
