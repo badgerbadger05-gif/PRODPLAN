@@ -9,7 +9,8 @@ from ..schemas import (
     ProductionResourceCreate,
     ProductionResourceUpdate,
     ResourceStage as ResourceStageSchema,
-    ResourceStageCreate
+    ResourceStageCreate,
+    ResourceStageWithName
 )
 from ..services.resource_calculator import calculate_resource_distribution
 
@@ -30,7 +31,7 @@ def get_resource_distribution(db: Session = Depends(get_db)):
 @router.get("/", response_model=List[ProductionResourceSchema])
 def get_resources(db: Session = Depends(get_db)):
     """Получить список всех производственных участков"""
-    resources = db.query(ProductionResource).all()
+    resources = db.query(ProductionResource).offset(0).limit(100).all()
     return resources
 
 
@@ -97,11 +98,26 @@ def delete_resource(resource_id: int, db: Session = Depends(get_db)):
     return {"status": "success"}
 
 
-@router.get("/{resource_id}/stages", response_model=List[ResourceStageSchema])
+@router.get("/{resource_id}/stages", response_model=List[ResourceStageWithName])
 def get_resource_stages(resource_id: int, db: Session = Depends(get_db)):
-    """Получить список этапов, привязанных к участку"""
-    stages = db.query(ResourceStage).filter(ResourceStage.resource_id == resource_id).all()
-    return stages
+    """Получить список этапов, привязанных к участку, с именем этапа"""
+    rows = (
+        db.query(ResourceStage, ProductionStage.stage_name)
+        .outerjoin(ProductionStage, ProductionStage.stage_id == ResourceStage.stage_id)
+        .filter(ResourceStage.resource_id == resource_id)
+        .all()
+    )
+    return [
+        {
+            "id": int(rs.id),
+            "resource_id": int(rs.resource_id),
+            "stage_id": int(rs.stage_id),
+            "stage_name": (stage_name or None),
+            "created_at": getattr(rs, "created_at", None),
+            "updated_at": getattr(rs, "updated_at", None),
+        }
+        for (rs, stage_name) in rows
+    ]
 
 
 @router.post("/{resource_id}/stages", response_model=ResourceStageSchema)
@@ -130,8 +146,9 @@ def add_stage_to_resource(
         raise HTTPException(status_code=400, detail="Stage already assigned to this resource")
     
     try:
+        # Жёстко используем resource_id из URL, игнорируя поле из payload для предотвращения несоответствий
         db_resource_stage = ResourceStage(
-            resource_id=resource_stage.resource_id,
+            resource_id=resource_id,
             stage_id=resource_stage.stage_id
         )
         db.add(db_resource_stage)

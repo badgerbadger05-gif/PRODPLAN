@@ -15,6 +15,23 @@ from ..services.plan_service import (
     fetch_stages
 )
 
+from ..services.planning_service import (
+    create_planning_run,
+    run_planning_run,
+    list_planning_runs,
+    get_run_summary,
+    get_run_production,
+    get_run_purchases,
+    get_run_capacity,
+    get_run_pegging,
+    compute_planning_preview,
+    compute_gross_requirements,
+    # Config management
+    list_planning_configs,
+    create_planning_config_version,
+    activate_planning_config_version,
+    get_active_planning_config_full,
+)
 
 router = APIRouter(prefix="/v1/plan", tags=["plan"])
 
@@ -66,6 +83,13 @@ class ExportRequest(BaseModel):
     start_date: Optional[str] = None
     days: int = 30
     stage_id: Optional[int] = None
+
+
+class PlanningConfigCreate(BaseModel):
+    config: Dict[str, Any]
+    comment: Optional[str] = None
+    created_by: Optional[str] = None
+    activate: Optional[bool] = False
 
 
 @router.post("/matrix")
@@ -166,6 +190,270 @@ async def ensure_plan_item(
             db=db,
         )
         return {"status": "ok", "item_id": int(item_id)}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# ===== MRP Planning API (runs and results) =====
+
+class CalcRequest(BaseModel):
+    horizon_days: Optional[int] = None
+    use_weekly: Optional[bool] = None
+    config_overrides: Optional[Dict[str, Any]] = None
+    started_by: Optional[str] = None
+
+
+@router.post("/calc")
+async def start_planning_run(
+    req: CalcRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Полный расчёт планирования и сохранение результатов прогона.
+    Создаёт RUN с конфигурацией (RUNNING) → выполняет расчёт предпросмотра (gross+net),
+    классифицирует потоки (production/purchase), сохраняет planned_order/planned_purchase,
+    завершает статусом SUCCESS/FAILED и возвращает run_id.
+    """
+    try:
+        run_id = run_planning_run(
+            db=db,
+            horizon_days=req.horizon_days,
+            use_weekly=req.use_weekly,
+            config_overrides=req.config_overrides or {},
+            started_by=req.started_by or "api",
+        )
+        return {"status": "ok", "run_id": int(run_id)}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/calc_preview")
+async def calc_preview(
+    req: CalcRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Предпросчёт валовой и чистой потребности (без записи результатов в БД).
+    Политики и горизонты берутся из активной конфигурации с учётом overrides.
+    """
+    try:
+        result = compute_planning_preview(
+            db=db,
+            horizon_days=req.horizon_days,
+            use_weekly=req.use_weekly,
+            config_overrides=req.config_overrides or {},
+        )
+        return {"status": "ok", "preview": result}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/calc_gross")
+async def calc_gross(
+    req: CalcRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Валовая потребность (BOM-развёртка) без неттинга и без записи в БД.
+    """
+    try:
+        result = compute_gross_requirements(
+            db=db,
+            horizon_days=req.horizon_days,
+            use_weekly=req.use_weekly,
+            config_overrides=req.config_overrides or {},
+        )
+        return {"status": "ok", "gross": result}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# ===== Planning configuration management API =====
+
+@router.get("/configs")
+async def list_configs(
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db)
+):
+    """Список версий конфигурации планирования (пагинация)"""
+    try:
+        return list_planning_configs(db=db, limit=limit, offset=offset)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/configs/active")
+async def get_active_config(db: Session = Depends(get_db)):
+    """Получить активную конфигурацию планирования (полный JSON снапшот)"""
+    try:
+        data = get_active_planning_config_full(db=db)
+        return {"status": "ok", "config": data}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/configs")
+async def create_config(
+    req: PlanningConfigCreate,
+    db: Session = Depends(get_db)
+):
+    """Создать новую версию конфигурации планирования (опционально сразу активировать)"""
+    try:
+        result = create_planning_config_version(
+            db=db,
+            config=req.config,
+            comment=req.comment,
+            created_by=req.created_by,
+            activate=bool(req.activate or False),
+        )
+        return {"status": "ok", "created": result}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/configs/{config_id}/activate")
+async def activate_config(
+    config_id: int,
+    db: Session = Depends(get_db)
+):
+    """Активировать указанную версию конфигурации (сняв active с предыдущей)"""
+    try:
+        result = activate_planning_config_version(db=db, config_id=int(config_id))
+        return {"status": "ok", "activated": result}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/runs")
+async def get_planning_runs(
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db)
+):
+    """Список прогонов планирования с краткой статистикой"""
+    try:
+        return list_planning_runs(db=db, limit=limit, offset=offset)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/results/{run_id}")
+async def get_planning_result_summary(
+    run_id: int,
+    db: Session = Depends(get_db)
+):
+    """Сводка результатов прогона планирования (KPI, предупреждения, базовые счётчики)"""
+    try:
+        return get_run_summary(db=db, run_id=int(run_id))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/results/{run_id}/production")
+async def get_planning_result_production(
+    run_id: int,
+    item_id: Optional[int] = None,
+    bucket_type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    db: Session = Depends(get_db)
+):
+    """Производственные заказы и этапы по прогону (с фильтрами и пагинацией)"""
+    try:
+        return get_run_production(
+            db=db,
+            run_id=int(run_id),
+            item_id=item_id,
+            bucket_type=bucket_type,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit,
+            offset=offset,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/results/{run_id}/purchases")
+async def get_planning_result_purchases(
+    run_id: int,
+    item_id: Optional[int] = None,
+    bucket_type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    db: Session = Depends(get_db)
+):
+    """Заявки на закупку по прогону (с фильтрами и пагинацией)"""
+    try:
+        return get_run_purchases(
+            db=db,
+            run_id=int(run_id),
+            item_id=item_id,
+            bucket_type=bucket_type,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit,
+            offset=offset,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/results/{run_id}/capacity")
+async def get_planning_result_capacity(
+    run_id: int,
+    area_id: Optional[int] = None,
+    bucket_type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = 200,
+    offset: int = 0,
+    db: Session = Depends(get_db)
+):
+    """Загрузка мощностей по участкам (фильтры и пагинация)"""
+    try:
+        return get_run_capacity(
+            db=db,
+            run_id=int(run_id),
+            area_id=area_id,
+            bucket_type=bucket_type,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit,
+            offset=offset,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/results/{run_id}/pegging")
+async def get_planning_result_pegging(
+    run_id: int,
+    child_item_id: Optional[int] = None,
+    parent_item_id: Optional[int] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = 200,
+    offset: int = 0,
+    db: Session = Depends(get_db)
+):
+    """Трассируемость компонент → спрос (pegging) по прогону (с фильтрами и пагинацией)"""
+    try:
+        return get_run_pegging(
+            db=db,
+            run_id=int(run_id),
+            child_item_id=child_item_id,
+            parent_item_id=parent_item_id,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit,
+            offset=offset,
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

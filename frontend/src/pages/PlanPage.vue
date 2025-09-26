@@ -4,7 +4,7 @@
       <div class="col-12">
         <q-card>
           <q-card-section>
-            <div class="text-h5">План выпуска техники</div>
+            <div class="text-h5">План выпуска техники дневной</div>
           </q-card-section>
 
           <q-separator />
@@ -13,12 +13,7 @@
             <!-- Панель управления -->
             <div class="row items-center gap-2 w-full mb-4 flex-wrap">
 
-              <q-btn
-                color="positive"
-                label="Сохранить изменения"
-                @click="saveChanges"
-                :loading="loading.save"
-              />
+              <!-- read-only mode: save disabled per spec -->
 
               <!-- Горизонт дат -->
 
@@ -27,16 +22,28 @@
 
 
             <!-- Таблица плана -->
-            <q-table
-              :rows="rowData"
-              :columns="columns"
-              :pagination="pagination"
-              :loading="loading.table"
-              row-key="item_id"
-              flat
-              class="production-plan-table"
-              @request="onRequest"
-            >
+            <div class="h-scroll">
+              <div class="h-scroll-inner">
+                <q-table
+                  :rows="rowData"
+                  :columns="columns"
+                  :pagination="pagination"
+                  :loading="loading.table"
+                  row-key="item_id"
+                  flat
+                  class="production-plan-table"
+                  table-class="wide-table"
+                  :table-style="{ width: 'max-content', whiteSpace: 'nowrap' }"
+                  :wrap-cells="false"
+                  @request="onRequest"
+                >
+              <!-- Заголовки с применением headerClasses для корректной sticky-фиксации -->
+              <template v-slot:header-cell="hprops">
+                <q-th :props="hprops" :class="hprops.col.headerClasses">
+                  {{ hprops.col.label }}
+                </q-th>
+              </template>
+
               <!-- Кастомные слоты для редактируемых ячеек -->
               <template v-slot:body-cell="props">
                 <q-td :props="props">
@@ -62,16 +69,7 @@
                     />
                   </div>
                   <div v-else-if="props.col.name.startsWith('day_')">
-                    <q-input
-                      v-model.number="props.row[props.col.name]"
-                      type="number"
-                      dense
-                      min="0"
-                      step="1"
-                      class="text-center"
-                      @update:model-value="(val) => onCellInput(props.row, props.col.name, val)"
-                      @blur="onCellBlur(props.row, props.col.name)"
-                    />
+                    <div class="text-center">{{ props.row[props.col.name] || 0 }}</div>
                   </div>
                   <div v-else>
                     {{ props.value }}
@@ -80,6 +78,8 @@
               </template>
 
            </q-table>
+              </div>
+            </div>
 
            <!-- Нижняя панель с инлайн-подсказками -->
            <div class="row items-center gap-2 w-full q-pa-md bg-grey-1">
@@ -212,6 +212,7 @@ const loading = reactive({
 // Данные таблицы
 const rowData = ref<PlanItem[]>([])
 const dates = ref<string[]>([])
+const todayStr = ref<string>(new Date().toISOString().slice(0, 10))
 
 // Выходные/праздничные дни (базовый набор РФ; без переносов)
 const HOLIDAYS_MD = new Set<string>([
@@ -297,13 +298,6 @@ const columns = computed(() => {
       sortable: true
     },
     {
-      name: 'item_code',
-      label: 'Код',
-      align: 'left' as const,
-      field: 'item_code',
-      sortable: true
-    },
-    {
       name: 'month_plan',
       label: 'План на месяц',
       align: 'right' as const,
@@ -354,25 +348,39 @@ async function loadPlanData() {
       sort_dir: 'asc'
     })
 
-    rowData.value = data.rows || []
-    dates.value = data.dates || []
-
-    // Проецируем значения по дням в плоские поля для редактируемых инпутов
-    if (Array.isArray(rowData.value) && Array.isArray(dates.value)) {
-      for (const row of rowData.value) {
-        const daysMap = (row && row.days) ? row.days : {}
-        for (const d of dates.value) {
-          const key = `day_${d}`
-          row[key] = Number(daysMap?.[d] ?? 0)
-        }
-        // Пересчёт month_plan на основании спроецированных значений (на случай расхождения)
-        let sum = 0
-        for (const d of dates.value) sum += Number(row[`day_${d}`] || 0)
-        row.month_plan = sum
+    const rowsRaw: PlanItem[] = data.rows || []
+    const allDates: string[] = data.dates || []
+ 
+    // Оставляем только будущие даты (включая сегодня)
+    const futureDates = allDates.filter(d => d >= todayStr.value)
+ 
+    // Проецируем значения day_* для будущих дат
+    const rowsProj = rowsRaw.map((row) => {
+      const daysMap = (row && row.days) ? row.days as Record<string, number> : {}
+      for (const d of futureDates) {
+        const key = `day_${d}`
+        ;(row as any)[key] = Number(daysMap?.[d] ?? 0)
       }
+      return row
+    })
+ 
+    // Оставляем только те даты, где есть ненулевые значения хотя бы в одной строке
+    const nonZeroDates = futureDates.filter(d => rowsProj.some(r => Number((r as any)[`day_${d}`] || 0) > 0))
+ 
+    // Фильтруем строки: только с ненулевыми значениями в видимых датах
+    const rowsFiltered = rowsProj.filter(r => nonZeroDates.some(d => Number((r as any)[`day_${d}`] || 0) > 0))
+ 
+    // Пересчёт month_plan по видимым датам
+    for (const r of rowsFiltered) {
+      let sum = 0
+      for (const d of nonZeroDates) sum += Number((r as any)[`day_${d}`] || 0)
+      ;(r as any).month_plan = sum
     }
-
-    totalItems.value = data.total || 0
+ 
+    rowData.value = rowsFiltered
+    dates.value = nonZeroDates
+ 
+    totalItems.value = rowsFiltered.length
     totalPages.value = Math.ceil(totalItems.value / 50)
 
     // Обновляем пагинацию
@@ -639,5 +647,50 @@ onMounted(() => {
 }
 .production-plan-table :deep(td.holiday-cell) {
   background: #fff2f2;
+}
+
+/* Горизонтальный скролл контейнер */
+.h-scroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+  width: 100%;
+  scrollbar-gutter: stable both-edges;
+}
+.h-scroll-inner {
+  display: inline-block;
+  min-width: 100%;
+}
+
+/* Контент таблицы — ширина по содержимому */
+.production-plan-table.wide-content {
+  width: max-content;
+}
+.production-plan-table :deep(table) {
+  width: max-content;
+}
+:deep(.q-table) {
+  width: max-content;
+}
+/* Явный класс для table-class */
+.wide-table {
+  width: max-content;
+  white-space: nowrap;
+}
+/* Отключаем внутренний overflow у контейнеров QTable для корректной фиксации sticky-колонок относительно внешнего горизонтального скролла */
+.production-plan-table :deep(.q-table__middle) {
+  overflow: visible !important;
+}
+.production-plan-table :deep(.q-table__container) {
+  overflow: visible;
+}
+
+/* Повышаем уровень наложения фиксированных колонок слева */
+.production-plan-table :deep(th.sticky-actions),
+.production-plan-table :deep(td.sticky-actions) {
+  z-index: 20 !important;
+}
+.production-plan-table :deep(th.sticky-name),
+.production-plan-table :deep(td.sticky-name) {
+  z-index: 19 !important;
 }
 </style>

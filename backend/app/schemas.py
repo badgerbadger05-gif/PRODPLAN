@@ -389,8 +389,8 @@ class ResourceStageCreate(ResourceStageBase):
 
 class ResourceStage(ResourceStageBase):
     id: int
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -417,3 +417,12 @@ class ODataSyncStats(BaseModel):
     dry_run: bool
     odata_url: str
     odata_entity: str
+
+class ResourceStageWithName(ResourceStageBase):
+    id: int
+    stage_name: Optional[str] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True

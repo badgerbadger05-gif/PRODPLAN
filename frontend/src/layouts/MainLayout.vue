@@ -67,11 +67,32 @@
               <q-icon name="assessment" />
             </q-item-section>
             <q-item-section>
-              <q-item-label>План выпуска техники</q-item-label>
+              <q-item-label>План выпуска техники дневной</q-item-label>
               <q-item-label caption>Управление планами</q-item-label>
             </q-item-section>
           </q-item>
  
+          <q-item clickable v-ripple to="/plan/quarterly" exact class="menu-item">
+            <q-item-section avatar>
+              <q-icon name="calendar_view_week" />
+            </q-item-section>
+            <q-item-section>
+              <q-item-label>План выпуска техники квартальный</q-item-label>
+              <q-item-label caption>Планирование по неделям</q-item-label>
+            </q-item-section>
+          </q-item>
+
+          <!-- MRP планирование -->
+          <q-item clickable v-ripple to="/mrp" exact class="menu-item">
+            <q-item-section avatar>
+              <q-icon name="hub" />
+            </q-item-section>
+            <q-item-section>
+              <q-item-label>MRP планирование</q-item-label>
+              <q-item-label caption>Прогоны и результаты</q-item-label>
+            </q-item-section>
+          </q-item>
+
           <q-item clickable v-ripple to="/resources" exact class="menu-item">
             <q-item-section avatar>
               <q-icon name="widgets" />

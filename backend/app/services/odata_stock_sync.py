@@ -25,20 +25,20 @@ class _Stats:
 def _norm_code(s: str) -> str:
     """
     Нормализация кодов для устойчивого сопоставления:
-    - убрать пробелы
-    - привести буквы к верхнему регистру
-    - заменить запятую на точку
-    - если это целое число '1234' или '1234.0' — привести к '1234' без ведущих нулей
+    - trim + upper
+    - убрать все не буквенно-цифровые символы (дефисы, пробелы, слеши и т.п.)
+    - если это целое число ('1234' или '001234' или '1234.0') — привести к '1234' без ведущих нулей
     """
     import re
 
-    t = str(s or "").strip()
+    t = str(s or "").strip().upper()
     if not t:
         return ""
-    t = re.sub(r"\s+", "", t).upper()
-    t = t.replace(",", ".")
-    if re.fullmatch(r"\d+(?:\.0+)?", t):
-        t = t.split(".")[0]
+    # Удаляем все небуквенно-цифровые символы
+    t = re.sub(r"[^0-9A-Z]+", "", t)
+
+    # Если после очистки остались только цифры — убираем ведущие нули
+    if re.fullmatch(r"\d+", t):
         t = t.lstrip("0") or "0"
     return t
 
@@ -115,26 +115,71 @@ def sync_stock_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                 pass
         return asdict(stats)
 
-    # Агрегируем по нормализованным кодам
+    # Агрегируем по нормализованным кодам И по Ref_Key (GUID) — GUID имеет приоритет для сопоставления
     odata_map_norm_to_qty: Dict[str, float] = {}
+    odata_map_ref_to_qty: Dict[str, float] = {}
     for rec in stock_data:
-        norm = _norm_code(rec.get("code", ""))
-        if not norm:
-            continue
         qty = float(rec.get("qty") or 0.0)
-        odata_map_norm_to_qty[norm] = odata_map_norm_to_qty.get(norm, 0.0) + qty
 
-    if not odata_map_norm_to_qty:
+        # По коду
+        norm = _norm_code(rec.get("code", ""))
+        if norm:
+            odata_map_norm_to_qty[norm] = odata_map_norm_to_qty.get(norm, 0.0) + qty
+
+        # По GUID
+        ref = str(rec.get("ref") or "").strip()
+        if ref:
+            odata_map_ref_to_qty[ref] = odata_map_ref_to_qty.get(ref, 0.0) + qty
+
+    # Debug: показать часть "сырых" кодов/Ref до нормализации
+    try:
+        sample_raw_codes = [rec.get("code") for rec in stock_data[:10]]
+        sample_raw_refs = [rec.get("ref") for rec in stock_data[:10]]
+        print(f"[OData][stock] sample raw codes: {sample_raw_codes}", flush=True)
+        print(f"[OData][stock] sample raw refs: {sample_raw_refs}", flush=True)
+    except Exception:
+        pass
+
+    if not odata_map_norm_to_qty and not odata_map_ref_to_qty:
         stats.dry_run = True
         if progress:
             try:
                 progress.finish("stock", error=None, message="Пустая карта остатков, dry-run")
             except Exception:
                 pass
+        # Debug: показать первые поля записи при пустом результате
+        try:
+            if stock_data:
+                sample = stock_data[0]
+                print("[OData][stock] Empty map, sample fields:", list(sample.keys())[:20], flush=True)
+        except Exception:
+            pass
         return asdict(stats)
 
-    # Подсчёт совпавших норм-кодов
-    matched = sum(1 for norm in db_code_to_norm.values() if norm in odata_map_norm_to_qty)
+    # Debug: вывести примеры норм-кодов/Ref для диагностики сопоставления
+    try:
+        sample_db_codes = list({v for v in db_code_to_norm.values()})[:10]
+        sample_odata_codes = list(odata_map_norm_to_qty.keys())[:10]
+        sample_odata_refs = list(odata_map_ref_to_qty.keys())[:10]
+        print(f"[OData][stock] DB codes total={len(db_code_to_norm)} sample={sample_db_codes}", flush=True)
+        print(f"[OData][stock] OData codes total={len(odata_map_norm_to_qty)} sample={sample_odata_codes}", flush=True)
+        print(f"[OData][stock] OData refs total={len(odata_map_ref_to_qty)} sample={sample_odata_refs}", flush=True)
+    except Exception:
+        pass
+
+    # Подсчёт совпавших по GUID или по нормализованному коду
+    # Пройдёмся по всем items в БД и посчитаем, сколько найдётся либо по ref, либо по коду
+    matched = 0
+    try:
+        items_for_match: List[Item] = db.query(Item).with_entities(Item.item_code, Item.item_ref1c).all()
+        for row in items_for_match:
+            raw_code = str(row[0] or "").strip()
+            ref1c = str(row[1] or "").strip()
+            norm_code = db_code_to_norm.get(raw_code, _norm_code(raw_code))
+            if (ref1c and ref1c in odata_map_ref_to_qty) or (norm_code and norm_code in odata_map_norm_to_qty):
+                matched += 1
+    except Exception:
+        matched = sum(1 for norm in db_code_to_norm.values() if norm in odata_map_norm_to_qty)
     stats.matched_in_odata = matched
 
     zeroed_count = 0
@@ -156,9 +201,16 @@ def sync_stock_from_odata(db: Session, req: ODataSyncRequest) -> dict:
     try:
         for it in items:
             raw_code = str(it.item_code or "").strip()
+            ref1c = str(it.item_ref1c or "").strip()
             norm_code = db_code_to_norm.get(raw_code, _norm_code(raw_code))
             old_qty = float(it.stock_qty or 0.0)
-            if norm_code in odata_map_norm_to_qty:
+
+            # Приоритет сопоставления:
+            # 1) по GUID (item_ref1c)
+            # 2) по нормализованному коду
+            if ref1c and ref1c in odata_map_ref_to_qty:
+                new_qty = float(odata_map_ref_to_qty[ref1c])
+            elif norm_code in odata_map_norm_to_qty:
                 new_qty = float(odata_map_norm_to_qty[norm_code])
             else:
                 if req.zero_missing:

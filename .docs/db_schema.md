@@ -625,3 +625,221 @@ CREATE INDEX idx_resource_stages_stage ON resource_stages(stage_id);
 5. Заказы на производство содержат сложную структуру с несколькими вложенными массивами (продукция, запасы, операции), требующими особой обработки при импорте.
 6. Заказы поставщикам содержат информацию о закупаемой номенклатуре, количествах, ценах и сроках поставки.
 7. Регистр сведений "Спецификации по умолчанию" используется для определения актуальной спецификации изделия при поиске спецификации.
+
+## Новые таблицы для модуля планирования (MRP)
+
+Данный раздел добавляет сущности хранения результатов расчётов производственного и закупочного планов, а также версионируемую конфигурацию планирования. Все объекты согласованы со спецификацией в [.docs/progress.md](.docs/progress.md).
+
+### 14. planning_config_versions — Версионируемая конфигурация планирования
+```sql
+CREATE TABLE planning_config_versions (
+  id               SERIAL PRIMARY KEY,
+  version          INTEGER NOT NULL,
+  is_active        BOOLEAN NOT NULL DEFAULT FALSE,
+  config           JSONB   NOT NULL, -- Полный снимок конфигурации (planning_config)
+  comment          TEXT,
+  created_by       VARCHAR(100),
+  created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Гарантия единственной активной версии
+CREATE UNIQUE INDEX ux_planning_config_active ON planning_config_versions (is_active) WHERE is_active = TRUE;
+
+-- Уникальность номера версии
+CREATE UNIQUE INDEX ux_planning_config_version ON planning_config_versions (version);
+
+-- Последовательная выдача версий
+CREATE INDEX idx_planning_config_created_at ON planning_config_versions (created_at DESC);
+```
+
+Назначение: хранение истории конфигураций планирования с пометкой активной версии. Поле config хранит все параметры (horizon, weekly-политики, lead time, safety stock, приоритизация, toggles и т.п.) в формате JSONB.
+
+---
+
+### 15. planning_run — Прогоны планирования
+```sql
+CREATE TABLE planning_run (
+  run_id           SERIAL PRIMARY KEY,
+  started_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  finished_at      TIMESTAMP,
+  status           VARCHAR(20) NOT NULL DEFAULT 'PENDING', -- PENDING|RUNNING|SUCCESS|FAILED
+  started_by       VARCHAR(100),
+  horizon_days     INTEGER,         -- Фактически использованный горизонт
+  use_weekly       BOOLEAN DEFAULT TRUE,
+  config_version_id INTEGER,        -- Версия конфигурации на момент запуска
+  config_snapshot  JSONB   NOT NULL, -- Снимок конфигурации на момент запуска
+  warnings         JSONB,           -- Массив предупреждений (перегрузы, неполные данные и т.п.)
+  kpi              JSONB,           -- Сводные KPI прогона
+  FOREIGN KEY(config_version_id) REFERENCES planning_config_versions(id)
+);
+
+CREATE INDEX idx_planning_run_status ON planning_run (status);
+CREATE INDEX idx_planning_run_started_at ON planning_run (started_at DESC);
+```
+
+Назначение: журнал запусков планирования с фиксацией параметров, статуса и KPI.
+
+---
+
+### 16. planned_order — Плановые производственные заказы
+```sql
+CREATE TABLE planned_order (
+  order_id         SERIAL PRIMARY KEY,
+  run_id           INTEGER NOT NULL,
+  item_id          INTEGER NOT NULL,
+  qty              DECIMAL(15,3) NOT NULL,
+  need_date        DATE    NOT NULL, -- Дата потребности (daily: конкретный день; weekly: дата пятницы недели)
+  start_date       DATE,
+  finish_date      DATE,
+  route_ref        VARCHAR(255),     -- Идентификатор/название маршрута (если используется)
+  priority_index   DECIMAL(10,4),
+  bucket_type      VARCHAR(10) NOT NULL, -- 'daily' | 'weekly'
+  bucket_date      DATE        NOT NULL, -- Для weekly: дата пятницы; для daily: совпадает с need_date
+  demand_ref       TEXT,                -- Ссылка на источник спроса (строка MPS или агрегат)
+  demand_date      DATE,                -- Дата исходного спроса
+  FOREIGN KEY(run_id)  REFERENCES planning_run(run_id),
+  FOREIGN KEY(item_id) REFERENCES items(item_id),
+  CHECK (bucket_type IN ('daily', 'weekly'))
+);
+
+CREATE INDEX idx_planned_order_run ON planned_order (run_id);
+CREATE INDEX idx_planned_order_item ON planned_order (item_id);
+CREATE INDEX idx_planned_order_need_date ON planned_order (need_date);
+CREATE INDEX idx_planned_order_bucket ON planned_order (bucket_type, bucket_date);
+CREATE INDEX idx_planned_order_priority ON planned_order (priority_index);
+```
+
+Назначение: агрегированные производственные заказы с привязкой к бакетам времени и приоритетом.
+
+---
+
+### 17. planned_order_stage — Нагрузка по этапам и участкам
+```sql
+CREATE TABLE planned_order_stage (
+  id               SERIAL PRIMARY KEY,
+  run_id           INTEGER NOT NULL,
+  order_id         INTEGER NOT NULL,
+  stage_id         INTEGER NOT NULL,
+  area_id          INTEGER,           -- Производственный участок (resource)
+  bucket_type      VARCHAR(10) NOT NULL, -- 'daily' | 'weekly'
+  bucket_date      DATE        NOT NULL, -- Для weekly: дата пятницы; для daily: конкретная дата
+  hours            DECIMAL(12,3) NOT NULL DEFAULT 0.0, -- Плановые часы
+  FOREIGN KEY(run_id)    REFERENCES planning_run(run_id),
+  FOREIGN KEY(order_id)  REFERENCES planned_order(order_id),
+  FOREIGN KEY(stage_id)  REFERENCES production_stages(stage_id),
+  FOREIGN KEY(area_id)   REFERENCES production_resources(resource_id),
+  CHECK (bucket_type IN ('daily', 'weekly'))
+);
+
+CREATE INDEX idx_pos_run_order ON planned_order_stage (run_id, order_id);
+CREATE INDEX idx_pos_stage_area ON planned_order_stage (stage_id, area_id);
+CREATE INDEX idx_pos_bucket ON planned_order_stage (bucket_type, bucket_date);
+```
+
+Назначение: детальная раскладка часов по этапам и участкам для последующего контроля загрузки.
+
+---
+
+### 18. planned_purchase — План закупок (заявки)
+```sql
+CREATE TABLE planned_purchase (
+  purchase_id      SERIAL PRIMARY KEY,
+  run_id           INTEGER NOT NULL,
+  item_id          INTEGER NOT NULL,
+  qty              DECIMAL(15,3) NOT NULL,
+  need_date        DATE NOT NULL,      -- Дата потребности (daily: день; weekly: пятница недели)
+  order_date       DATE NOT NULL,      -- Округление на предыдущий рабочий день по календарю ресурсов
+  lead_time_days   INTEGER NOT NULL,   -- Фактически применённый lead time
+  priority_index   DECIMAL(10,4),
+  bucket_type      VARCHAR(10) NOT NULL, -- 'daily' | 'weekly'
+  bucket_date      DATE        NOT NULL, -- Для weekly: дата пятницы; для daily: совпадает с need_date
+  supplier_ref1c   VARCHAR(255),       -- Опциональная ссылка на контрагента
+  FOREIGN KEY(run_id)  REFERENCES planning_run(run_id),
+  FOREIGN KEY(item_id) REFERENCES items(item_id),
+  CHECK (bucket_type IN ('daily', 'weekly'))
+);
+
+CREATE INDEX idx_planned_purchase_run ON planned_purchase (run_id);
+CREATE INDEX idx_planned_purchase_item ON planned_purchase (item_id);
+CREATE INDEX idx_planned_purchase_need ON planned_purchase (need_date);
+CREATE INDEX idx_planned_purchase_order ON planned_purchase (order_date);
+CREATE INDEX idx_planned_purchase_bucket ON planned_purchase (bucket_type, bucket_date);
+```
+
+Назначение: заявки на закупку с датами потребности и заказа.
+
+---
+
+### 19. capacity_load — Загрузка мощностей по участкам
+```sql
+CREATE TABLE capacity_load (
+  id               SERIAL PRIMARY KEY,
+  run_id           INTEGER NOT NULL,
+  area_id          INTEGER NOT NULL,
+  bucket_type      VARCHAR(10) NOT NULL, -- 'daily' | 'weekly'
+  bucket_date      DATE        NOT NULL,
+  hours_planned    DECIMAL(12,3) NOT NULL DEFAULT 0.0,
+  hours_available  DECIMAL(12,3) NOT NULL DEFAULT 0.0,
+  overload_hours   DECIMAL(12,3) NOT NULL DEFAULT 0.0,
+  FOREIGN KEY(run_id)  REFERENCES planning_run(run_id),
+  FOREIGN KEY(area_id) REFERENCES production_resources(resource_id),
+  CHECK (bucket_type IN ('daily', 'weekly'))
+);
+
+CREATE UNIQUE INDEX ux_capacity_load ON capacity_load (run_id, area_id, bucket_type, bucket_date);
+CREATE INDEX idx_capacity_load_over ON capacity_load (overload_hours DESC);
+```
+
+Назначение: агрегированная загрузка участков по бакетам времени с показателем перегруза.
+
+---
+
+### 20. pegging_link — Трассируемость потребностей
+```sql
+CREATE TABLE pegging_link (
+  id               SERIAL PRIMARY KEY,
+  run_id           INTEGER NOT NULL,
+  child_item_id    INTEGER NOT NULL, -- Компонент
+  parent_item_id   INTEGER,          -- Родитель (узел верхнего уровня спроса или промежуточный)
+  demand_ref       TEXT,             -- Источник спроса (например, запись MPS)
+  qty_contribution DECIMAL(15,3) NOT NULL, -- Вклад компонента в потребность
+  need_date        DATE,             -- Дата потребности компонента
+  parent_need_date DATE,             -- Дата потребности родителя
+  FOREIGN KEY(run_id)        REFERENCES planning_run(run_id),
+  FOREIGN KEY(child_item_id) REFERENCES items(item_id),
+  FOREIGN KEY(parent_item_id) REFERENCES items(item_id)
+);
+
+CREATE INDEX idx_pegging_run_child ON pegging_link (run_id, child_item_id);
+CREATE INDEX idx_pegging_run_parent ON pegging_link (run_id, parent_item_id);
+```
+
+Назначение: хранение цепочек «компонент → родительский спрос» для объяснимости результатов планирования.
+
+---
+
+## Индексы для производительности (планирование)
+
+```sql
+-- Быстрые выборки результатов прогона
+CREATE INDEX idx_planned_order_run_item ON planned_order (run_id, item_id);
+CREATE INDEX idx_planned_order_dates ON planned_order (start_date, finish_date);
+
+-- Эффективные сводки по участкам/этапам
+CREATE INDEX idx_pos_area_bucket ON planned_order_stage (area_id, bucket_type, bucket_date);
+CREATE INDEX idx_pos_run_stage ON planned_order_stage (run_id, stage_id);
+
+-- Аналитика закупок
+CREATE INDEX idx_pp_item_need ON planned_purchase (item_id, need_date);
+CREATE INDEX idx_pp_item_order ON planned_purchase (item_id, order_date);
+
+-- Свободный поиск предупреждений/метаданных прогона
+CREATE INDEX idx_planning_run_kpi_gin ON planning_run USING GIN (kpi);
+CREATE INDEX idx_planning_run_warn_gin ON planning_run USING GIN (warnings);
+```
+
+Примечания:
+- bucket_type и bucket_date унифицируют работу с дневными и недельными бакетами. Для weekly используется дата пятницы соответствующей ISO‑недели.
+- Для planned_order и planned_purchase поля demand_ref и demand_date обеспечивают обратную трассируемость к источнику спроса (MPS). Для углублённой трассируемости применяется таблица pegging_link.
+- Поле order_date в planned_purchase должно вычисляться с округлением на предыдущий рабочий день по календарям модулей ресурсов.
+- Конфигурация планирования хранится в planning_config_versions (JSONB) с версионированием и единственной активной версией.

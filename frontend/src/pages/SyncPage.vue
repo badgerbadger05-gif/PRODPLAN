@@ -571,13 +571,17 @@ async function syncStock() {
     progressKey.value = 'stock'
     startProgressPolling()
 
+    // Подготовим фильтр по текущему моменту для регистра накопления Balance
+    const now = new Date()
+    const pad = (n:number) => String(n).padStart(2, '0')
+    const dt = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`
     const payload = {
       base_url: form.value.base_url,
-      entity_name: 'AccumulationRegister_ЗапасыНаСкладах',
+      entity_name: 'AccumulationRegister_ЗапасыНаСкладах/Balance',
       username: form.value.username || undefined,
       password: form.value.password || undefined,
       token: form.value.token || undefined,
-      filter_query: null,
+      filter_query: `Period le datetime'${dt}'`,
       select_fields: null,
       dry_run: false,
       zero_missing: false

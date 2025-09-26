@@ -38,6 +38,12 @@ class OData1CClient:
             credentials = f"{self.username}:{self.password}"
             encoded = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
             request.add_header("Authorization", f"Basic {encoded}")
+        # Trace requested URL (no auth data)
+        try:
+            from datetime import datetime as _dt
+            print(f"[OData] {_dt.utcnow().isoformat()} GET {url}")
+        except Exception:
+            pass
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 data = response.read()
@@ -302,16 +308,57 @@ def convert_1c_stock_to_records(stock_data: List[Dict[str, Any]], key_to_code: O
     converted: List[Dict[str, Any]] = []
     for record in stock_data:
         nomenclature = record.get("Номенклатура", {}) or {}
-        item_code = nomenclature.get("Артикул") or nomenclature.get("Код") or record.get("Код")
+        # Приоритет для сопоставления с нашей БД: сначала Code/Код (типичный код номенклатуры вида 00-0000...), затем Артикул
+        item_code = (
+            nomenclature.get("Code")
+            or nomenclature.get("Код")
+            or record.get("Code")
+            or record.get("Код")
+            or nomenclature.get("Артикул")
+            or record.get("Артикул")
+        )
         item_name = nomenclature.get("Наименование") or record.get("Наименование")
         if not item_code:
             ref_key = record.get(key_field_name)
+            # Пытаемся получить Ref_Key номенклатуры из разных вариантов представления
+            ref_key_val = (
+                record.get(key_field_name)
+                or record.get("НоменклатураRef_Key")
+                or record.get("Номенклатура_Ref_Key")
+                or record.get("Номенклатура")
+            )
+            if isinstance(ref_key_val, dict):
+                ref_key = str(
+                    (ref_key_val.get("Ref_Key") or ref_key_val.get("RefKey") or ref_key_val.get("ref_key") or "")
+                ).strip()
+            else:
+                ref_key = str(ref_key_val or "").strip()
+    
+            # Если есть сопоставление по Ref_Key — всегда берём код из каталога (стабильнее для сопоставления)
             if key_to_code and ref_key and ref_key in key_to_code:
-                item_code = key_to_code[ref_key].get("Code") or item_code
+                m = key_to_code[ref_key]
+                # Предпочитаем Code/Код (типичные коды вида 00-0000...), затем Артикул
+                item_code = (m.get("Code") or m.get("Артикул") or item_code)
                 if not item_name:
-                    item_name = key_to_code[ref_key].get("Description") or item_name
+                    item_name = m.get("Description") or item_name
         qty = None
-        for qf in ["Количество","Остаток","КоличествоОстаток","КоличествоОстатка","КоличествоНаСкладе","ОстатокКоличество","Quantity","Qty"]:
+        # Расширяем возможные имена полей кол-ва для Balance и вариаций остатков
+        # Пример ответа Balance: "КоличествоBalance", "КоличествоИнтBalance"
+        for qf in [
+            "КоличествоBalance",
+            "КоличествоИнтBalance",
+            "Количество",
+            "Остаток",
+            "КоличествоОстаток",
+            "КоличествоОстатка",
+            "КоличествоНаСкладе",
+            "ОстатокКоличество",
+            "КоличествоКонечныйОстаток",
+            "КонечныйОстатокКоличество",
+            "ОстатокНаКонецКоличество",
+            "Quantity",
+            "Qty"
+        ]:
             if qf in record and record.get(qf) is not None:
                 try:
                     qty = float(record.get(qf) or 0.0)
@@ -320,28 +367,121 @@ def convert_1c_stock_to_records(stock_data: List[Dict[str, Any]], key_to_code: O
                     continue
         if qty is None:
             qty = 0.0
-        if item_code:
-            converted.append({"code": str(item_code).strip(), "name": str(item_name).strip() if item_name else "", "qty": qty})
+
+        # Извлечём Ref_Key для возврата (поможет сопоставлять по GUID)
+        ref_out_val = (
+            record.get(key_field_name)
+            or record.get("НоменклатураRef_Key")
+            or record.get("Номенклатура_Ref_Key")
+            or record.get("Номенклатура")
+        )
+        if isinstance(ref_out_val, dict):
+            ref_out = str((ref_out_val.get("Ref_Key") or ref_out_val.get("RefKey") or ref_out_val.get("ref_key") or "")).strip()
+        else:
+            ref_out = str(ref_out_val or "").strip()
+
+        converted.append({
+            "code": str(item_code).strip() if item_code else "",
+            "name": str(item_name).strip() if item_name else "",
+            "qty": qty,
+            "ref": ref_out
+        })
     return converted
 
 
-def get_stock_from_1c_odata(base_url: str, entity_name: str, username: Optional[str] = None, password: Optional[str] = None, token: Optional[str] = None, filter_query: Optional[str] = None, select_fields: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+def get_stock_from_1c_odata(
+    base_url: str,
+    entity_name: str,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    token: Optional[str] = None,
+    filter_query: Optional[str] = None,
+    select_fields: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Универсальная загрузка остатков.
+    Особенность: для AccumulationRegister .../Balance у 1С может не быть поля Ref_Key,
+    поэтому $orderby по умолчанию отключаем.
+    """
     client = OData1CClient(base_url, username, password, token)
-    stock_data = client.get_all(entity_name, filter_query, select_fields)
-    keys = [str(r.get("Номенклатура_Key")).strip() for r in stock_data if r.get("Номенклатура_Key")]
+
+    # Для Balance отключаем $orderby, иначе 1С может вернуть пусто/ошибку
+    use_order_by: Optional[str] = None if "/Balance" in (entity_name or "") else "Ref_Key"
+
+    # Специальная обработка Balance: Period как параметр функции, а не через $filter
+    effective_entity = entity_name
+    eff_filter = filter_query
+    if "/Balance" in (entity_name or ""):
+        try:
+            import re
+            from datetime import datetime
+            period_val = None
+            if eff_filter:
+                m = re.search(r"Period\s+le\s+datetime'([^']+)'", str(eff_filter))
+                if m:
+                    period_val = m.group(1)
+            if not period_val:
+                period_val = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+            # По умолчанию запрашиваем баланс в разрезе Номенклатуры, Склада (СтруктурнаяЕдиница) и Организации
+            dims = "Номенклатура,СтруктурнаяЕдиница,Организация"
+            effective_entity = f"{str(entity_name).strip().rstrip('/')}(Period=datetime'{period_val}',Dimensions='{dims}')"
+            eff_filter = None
+        except Exception:
+            # В случае сбоя оставим исходные значения — запрос либо вернёт пусто, либо 1С подскажет ошибку
+            pass
+
+    stock_data = client.get_all(
+        entity_name=effective_entity,
+        filter_query=eff_filter,
+        select_fields=select_fields,
+        top=1000,
+        max_records=None,
+        max_pages=1000,
+        order_by=use_order_by,
+    )
+
+    # Сбор ключей номенклатуры из ответа Balance (вариативные поля)
+    keys: List[str] = []
+    for r in stock_data:
+        k = (
+            r.get("Номенклатура_Key")
+            or r.get("НоменклатураRef_Key")
+            or r.get("Номенклатура_Ref_Key")
+            or r.get("Номенклатура")
+        )
+        if k is None:
+            continue
+        try:
+            if isinstance(k, dict):
+                ks = str((k.get("Ref_Key") or k.get("RefKey") or k.get("ref_key") or "").strip())
+            else:
+                ks = str(k).strip()
+            if ks:
+                keys.append(ks)
+        except Exception:
+            continue
     keys = sorted({k for k in keys if k})
     key_to_code: Optional[Dict[str, Dict[str, str]]] = None
+    if not keys:
+        try:
+            # Debug-помощь: покажем доступные поля первой записи
+            if stock_data:
+                sample = stock_data[0]
+                print("[OData] Balance sample fields:", list(sample.keys())[:20])
+        except Exception:
+            pass
     if keys:
         try:
-            # Fetch names by keys in small batches similar to legacy client
-            # Build or-predicate Ref_Key eq guid'...'
-            # We'll call internal method via public API of client
+            # Получаем соответствия Ref_Key -> (Code, Description) батчами
             mapping: Dict[str, Dict[str, str]] = {}
             CHUNK = 20
             for i in range(0, len(keys), CHUNK):
-                chunk = keys[i:i+CHUNK]
+                chunk = keys[i:i + CHUNK]
                 ors = " or ".join([f"Ref_Key eq guid'{k}'" for k in chunk])
-                resp = client._make_request("Catalog_Номенклатура", {"$select": "Ref_Key,Code,Description", "$filter": f"({ors})"})
+                resp = client._make_request(
+                    "Catalog_Номенклатура",
+                    {"$select": "Ref_Key,Code,Description,Артикул", "$filter": f"({ors})"}
+                )
                 rows = []
                 if isinstance(resp, dict) and "value" in resp and isinstance(resp["value"], list):
                     rows = resp["value"]
@@ -350,10 +490,15 @@ def get_stock_from_1c_odata(base_url: str, entity_name: str, username: Optional[
                 for r in rows:
                     rk = str(r.get("Ref_Key") or "").strip()
                     if rk:
-                        mapping[rk] = {"Code": str(r.get("Code") or "").strip(), "Description": str(r.get("Description") or "").strip()}
+                        mapping[rk] = {
+                            "Code": str(r.get("Code") or "").strip(),
+                            "Description": str(r.get("Description") or "").strip(),
+                            "Артикул": str(r.get("Артикул") or "").strip(),
+                        }
             key_to_code = mapping
         except Exception:
             key_to_code = None
+
     return convert_1c_stock_to_records(stock_data, key_to_code=key_to_code)
 
 # Bind helper as a method of the client class for runtime (keeps API backward-compatible)

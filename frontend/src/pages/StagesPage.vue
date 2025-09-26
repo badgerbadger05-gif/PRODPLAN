@@ -9,6 +9,12 @@
               <div v-if="asOf" class="text-caption text-grey-7">
                 Остаток на {{ formatAsOf(asOf) }}
               </div>
+              <q-toggle
+                v-model="aggregateByProduct"
+                color="primary"
+                dense
+                label="Суммировать одинаковые по изделию"
+              />
               <q-btn
                 color="primary"
                 icon="calculate"
@@ -62,7 +68,7 @@
                     </div>
 
                     <q-table
-                      :rows="prod.components"
+                      :rows="aggregateByProduct ? aggregateComponents(prod.components) : prod.components"
                       :columns="columns"
                       row-key="item_id"
                       flat
@@ -84,6 +90,11 @@
                      <template #body-cell-norm_hours="props">
                        <q-td :props="props" class="text-right">
                          {{ formatQty(props.row.norm_hours, 2) }}
+                       </q-td>
+                     </template>
+                     <template #body-cell-norm_hours_total="props">
+                       <q-td :props="props" class="text-right">
+                         {{ formatQty((props.row.norm_hours_total ?? (props.row.norm_hours * props.row.qty_per_unit)), 2) }}
                        </q-td>
                      </template>
                     </q-table>
@@ -111,6 +122,7 @@ interface DistributedComponent {
   qty_per_unit: number
   stock_qty: number
   norm_hours: number
+  norm_hours_total: number
   stage_id?: number | null
   stage_name?: string | null
 }
@@ -133,6 +145,8 @@ const asOf = ref<string | null>(null)
 const resources = ref<ResourceDistributionResult[]>([])
 const loading = ref(false)
 // Убрана принудительная перерисовка через renderKey - источник проблем
+// Группировка одинаковых деталей по изделию
+const aggregateByProduct = ref(true)
 
 const pagination = reactive({
   page: 1,
@@ -171,7 +185,8 @@ const columns = [
   { name: 'qty_per_unit', label: 'Кол-во на 1 изделие', field: 'qty_per_unit', align: 'right' as const, sortable: true },
   { name: 'stage_name', label: 'Этап', field: 'stage_name', align: 'left' as const, sortable: true },
   { name: 'stock_qty', label: 'Остаток', field: 'stock_qty', align: 'right' as const, sortable: true },
-  { name: 'norm_hours', label: 'Норматив н/ч', field: 'norm_hours', align: 'right' as const, sortable: true }
+  { name: 'norm_hours', label: 'Норматив н/ч', field: 'norm_hours', align: 'right' as const, sortable: true },
+  { name: 'norm_hours_total', label: 'Сумма н/ч', field: 'norm_hours_total', align: 'right' as const, sortable: true }
 ]
 
 function formatQty(x: number | null | undefined, maxDigits = 3): string {
@@ -216,6 +231,44 @@ async function calculate() {
     Notify.create({ type: 'negative', message: msg })
   } finally {
     loading.value = false
+  }
+}
+
+/**
+ * Агрегация одинаковых деталей по изделию:
+ * - Группируем по (item_id, stage_id) внутри одного продукта
+ * - qty_per_unit = сумма qty
+ * - norm_hours_total = сумма total по группе (с фолбеком на norm_hours * qty)
+ * - norm_hours (за единицу) оставляем как у базовой строки
+ * - stock_qty берем из первой строки (остаток — справочный параметр)
+ */
+function aggregateComponents(rows: DistributedComponent[]): DistributedComponent[] {
+  try {
+    const map = new Map<string, DistributedComponent>()
+    for (const r of (rows || [])) {
+      const key = `${r.item_id}:${r.stage_id ?? 'null'}`
+      const qty = Number(r?.qty_per_unit ?? 0)
+      const perUnit = Number(r?.norm_hours ?? 0)
+      const total = r?.norm_hours_total != null
+        ? Number(r.norm_hours_total)
+        : perUnit * qty
+
+      const ex = map.get(key)
+      if (!ex) {
+        map.set(key, {
+          ...r,
+          qty_per_unit: qty,
+          norm_hours_total: total
+        } as any)
+      } else {
+        ex.qty_per_unit = Number(ex.qty_per_unit ?? 0) + qty
+        // norm_hours за единицу оставляем как было (предполагается одинаковым для одного item_id)
+        ex.norm_hours_total = Number(ex.norm_hours_total ?? 0) + total
+      }
+    }
+    return Array.from(map.values())
+  } catch {
+    return rows || []
   }
 }
   

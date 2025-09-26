@@ -4,7 +4,14 @@ from ..schemas import ItemCreate, ItemUpdate
 
 
 def get_items(db: Session, skip: int = 0, limit: int = 100):
-    return db.query(Item).offset(skip).limit(limit).all()
+    items = db.query(Item).offset(skip).limit(limit).all()
+    total = db.query(Item).count()
+    return {
+        "rows": items,
+        "total": total,
+        "limit": limit,
+        "offset": skip
+    }
 
 
 def get_item(db: Session, item_id: int):
