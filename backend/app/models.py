@@ -320,6 +320,8 @@ class PlanningRun(Base):
     started_by = Column(String(100), nullable=True)
     horizon_days = Column(Integer, nullable=True)
     use_weekly = Column(Boolean, nullable=False, default=True)
+    # Флаг закрепления прогона от авто‑очистки
+    pinned = Column(Boolean, nullable=False, default=False)
     config_version_id = Column(Integer, ForeignKey("planning_config_versions.id"), nullable=True)
     config_snapshot = Column(JSONB, nullable=False)
     warnings = Column(JSONB, nullable=True)

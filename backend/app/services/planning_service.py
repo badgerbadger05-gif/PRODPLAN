@@ -317,6 +317,7 @@ def list_planning_runs(db: Session, limit: int = 50, offset: int = 0) -> Dict[st
                 "finished_at": r.finished_at.isoformat() if r.finished_at else None,
                 "horizon_days": r.horizon_days,
                 "use_weekly": r.use_weekly,
+                "pinned": bool(getattr(r, "pinned", False)),
                 "order_count": int(order_cnt),
                 "purchase_count": int(purch_cnt),
                 "overload_buckets": int(overload_cnt),
@@ -347,6 +348,7 @@ def get_run_summary(db: Session, run_id: int) -> Dict[str, Any]:
             "finished_at": r.finished_at.isoformat() if r.finished_at else None,
             "horizon_days": r.horizon_days,
             "use_weekly": r.use_weekly,
+            "pinned": bool(getattr(r, "pinned", False)),
         },
         "counts": {"production_orders": int(order_cnt), "purchase_requests": int(purch_cnt)},
         "capacity": {"overload_total": overload_total, "overloaded_buckets": overloaded_buckets},
@@ -1477,18 +1479,20 @@ def run_planning_run(
                         if len(top) == 1:
                             op_major = int(top[0])
 
-                if op_major is not None and _is_painting_stage(op_major) and int(stg_id or -1) != int(op_major):
+                # Apply only when base stage is not determined yet
+                if stg_id is None and op_major is not None and _is_painting_stage(op_major):
                     stg_id = int(op_major)
                     rsn = "FORCE_PAINTING_FROM_OPERATIONS"
             except Exception:
                 # fail-safe: ignore override on any error
                 pass
 
-            # Painting override: by item attributes (name/article/code)
+            # Painting override: by item attributes (name/article/code) — behind config flag and only when stage is not defined
             try:
-                if _looks_painted():
+                enable_by_name = bool(((snapshot.get("production") or {}).get("toggles") or {}).get("force_painting_by_name", False))
+                if enable_by_name and stg_id is None and _looks_painted():
                     paint_sid = _painting_stage_id()
-                    if paint_sid is not None and int(stg_id or -1) != int(paint_sid):
+                    if paint_sid is not None:
                         stg_id = int(paint_sid)
                         rsn = "FORCE_PAINTING_BY_NAME"
             except Exception:
@@ -1583,6 +1587,42 @@ def run_planning_run(
                 continue
 
             total_hours = float(norm_single or 0.0) * float(qty or 0.0)
+
+            # Zero-norm safeguard:
+            # If total norm-hours is <= 0, we still create a stage slice with hours=0
+            # so the order is grouped by stage/area in UI (instead of falling into '—').
+            if total_hours <= 1e-9:
+                sel_area_id = pick_area_for_stage(int(stage_id))
+                if sel_area_id is None:
+                    # Fallback: choose any mapped resource for stability
+                    sel_area_id = int(sorted(candidate_res_ids)[0]) if candidate_res_ids else None
+                if sel_area_id is not None:
+                    pos = PlannedOrderStage(
+                        run_id=run_id,
+                        order_id=int(order.order_id),
+                        stage_id=int(stage_id),
+                        area_id=int(sel_area_id),
+                        bucket_type="daily",
+                        bucket_date=order.need_date,
+                        hours=0.0,
+                    )
+                    db.add(pos)
+                    stages_created += 1
+                    # Do not affect capacity usage; set order dates for consistency
+                    order.start_date = order.need_date
+                    order.finish_date = order.need_date
+                else:
+                    warnings.append(
+                        {
+                            "code": "NO_AREA_FOR_STAGE_ZERO_NORM",
+                            "msg": f"No resource area resolved for zero-norm stage_id={int(stage_id)}",
+                            "stage_id": int(stage_id),
+                            "order_id": int(order.order_id),
+                        }
+                    )
+                # Skip regular scheduling in zero-norm case
+                continue
+
             remaining = total_hours
             used_dates: List[date] = []
 
@@ -1871,3 +1911,56 @@ def run_planning_run(
         except Exception:
             db.rollback()
         raise
+
+# --- Retention & pin management for planning runs ---
+
+def cleanup_planning_runs(db: Session, older_than_days: int = 30, dry_run: bool = False) -> Dict[str, Any]:
+    """
+    Delete planning runs older than N days except those marked as pinned.
+    Returns a report with affected run_ids. When dry_run=True, nothing is deleted.
+    """
+    try:
+        days = max(1, int(older_than_days or 30))
+    except Exception:
+        days = 30
+    cutoff_dt = datetime.utcnow() - timedelta(days=days)
+
+    q = (
+        db.query(PlanningRun)
+        .filter(
+            PlanningRun.started_at < cutoff_dt,
+            PlanningRun.pinned.is_(False),
+        )
+    )
+    runs: List[PlanningRun] = q.all()
+    run_ids: List[int] = [int(r.run_id) for r in runs]
+
+    report: Dict[str, Any] = {
+        "dry_run": bool(dry_run),
+        "older_than_days": int(days),
+        "cutoff": cutoff_dt.isoformat(),
+        "count": len(run_ids),
+        "run_ids": run_ids,
+    }
+
+    if dry_run:
+        return report
+
+    if run_ids:
+        # Cascade deletes will clear dependent tables (planned_order, planned_purchase, capacity_load, pegging_link, etc.)
+        q.delete(synchronize_session=False)
+        db.commit()
+
+    return report
+
+
+def set_run_pinned(db: Session, run_id: int, pinned: bool) -> Dict[str, Any]:
+    """
+    Set pinned flag for a planning run to protect from cleanup.
+    """
+    r: Optional[PlanningRun] = db.query(PlanningRun).filter(PlanningRun.run_id == int(run_id)).first()
+    if not r:
+        raise RuntimeError(f"Run {run_id} not found")
+    r.pinned = bool(pinned)
+    db.commit()
+    return {"run_id": int(r.run_id), "pinned": bool(r.pinned)}

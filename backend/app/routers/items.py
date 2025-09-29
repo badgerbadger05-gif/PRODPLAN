@@ -10,14 +10,8 @@ router = APIRouter(prefix="/v1/items", tags=["items"])
 
 @router.get("/", response_model=List[Item])
 def read_items(skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
-<<<<<<< HEAD
-    result = get_items(db, skip=skip, limit=limit)
-    # Возвращаем только rows, чтобы соответствовать ожидаемой модели
-    return result["rows"]
-=======
     items = get_items(db, skip=skip, limit=limit)
     return items
->>>>>>> d7084eacd68e37db18f44b56b8270808ee4aa212
 
 
 @router.post("/", response_model=Item)

@@ -26,6 +26,9 @@ from ..services.planning_service import (
     get_run_pegging,
     compute_planning_preview,
     compute_gross_requirements,
+    # retention & pin control
+    cleanup_planning_runs,
+    set_run_pinned,
     # Config management
     list_planning_configs,
     create_planning_config_version,
@@ -203,6 +206,16 @@ class CalcRequest(BaseModel):
     started_by: Optional[str] = None
 
 
+# Retention & pinning DTOs
+class RetentionCleanupRequest(BaseModel):
+    older_than_days: Optional[int] = 30
+    dry_run: Optional[bool] = False
+
+
+class PinRequest(BaseModel):
+    pinned: bool
+
+
 @router.post("/calc")
 async def start_planning_run(
     req: CalcRequest,
@@ -321,6 +334,40 @@ async def activate_config(
     try:
         result = activate_planning_config_version(db=db, config_id=int(config_id))
         return {"status": "ok", "activated": result}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/runs/{run_id}/pin")
+async def pin_planning_run(
+    run_id: int,
+    req: PinRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Установить/снять флаг 'pinned' у прогона, чтобы защитить его от авто‑очистки.
+    """
+    try:
+        return set_run_pinned(db=db, run_id=int(run_id), pinned=bool(req.pinned))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/cleanup")
+async def cleanup_runs(
+    req: RetentionCleanupRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Удалить прогоны старше N дней (по умолчанию 30), кроме помеченных pinned=True.
+    Поддерживает dry_run для предварительного отчёта.
+    """
+    try:
+        return cleanup_planning_runs(
+            db=db,
+            older_than_days=int(req.older_than_days or 30),
+            dry_run=bool(req.dry_run),
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

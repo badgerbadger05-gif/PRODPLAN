@@ -61,12 +61,19 @@
           </q-card-section>
           <q-separator />
           <q-card-section v-if="(summary?.warnings || []).length > 0">
-            <div class="text-caption text-grey q-mb-xs">Предупреждения</div>
-            <div class="row q-col-gutter-xs">
-              <q-chip v-for="(w, idx) in summary?.warnings" :key="idx" color="orange" text-color="black" outline size="sm">
-                {{ warnText(w) }}
-              </q-chip>
-            </div>
+            <q-expansion-item
+              icon="warning"
+              label="Предупреждения"
+              caption="Нажмите, чтобы развернуть"
+              dense
+              switch-toggle-side
+            >
+              <div class="row q-col-gutter-xs q-pt-sm">
+                <q-chip v-for="(w, idx) in summary?.warnings" :key="idx" color="orange" text-color="black" outline size="sm">
+                  {{ warnText(w) }}
+                </q-chip>
+              </div>
+            </q-expansion-item>
           </q-card-section>
         </q-card>
       </div>
@@ -81,36 +88,49 @@
             <div class="text-h6">Рекомендуемые заказы на производство</div>
           </q-card-section>
           <q-separator />
-          <q-table
-            :rows="groupedProductionOrders"
-            :columns="recommendedProdColumns"
-            row-key="order_id"
-            :loading="prod.loading"
-            :pagination="{ rowsPerPage: 20 }"
-            hide-header
-          >
-            <template v-slot:body="props">
-              <q-tr :props="props" :key="`g_${props.row.area_id}`">
-                <q-td colspan="100%" class="bg-grey-2">
-                  <div class="text-subtitle1">
-                    <strong>Производственный участок:</strong> {{ props.row.area_name }} (ID: {{ props.row.area_id }})
-                  </div>
-                </q-td>
-              </q-tr>
-              <q-tr v-for="order in props.row.orders" :key="order.order_id" :props="props">
-                <q-td key="item_name" :props="props">
-                  <div>{{ order.item_name }}</div>
-                  <div class="text-caption text-grey">{{ order.item_article }}</div>
-                </q-td>
-                <q-td key="qty" :props="props">
-                  {{ fmt(order.qty) }}
-                </q-td>
-                <q-td key="need_date" :props="props">
-                  {{ order.need_date }}
-                </q-td>
-              </q-tr>
-            </template>
-          </q-table>
+          <!-- Если есть группировка по участкам — показываем её -->
+          <template v-if="groupedProdRows.length">
+            <q-table
+              :rows="groupedProdRows"
+              :columns="recommendedProdColumns"
+              row-key="area_id"
+              :loading="prod.loading"
+              :pagination="{ rowsPerPage: 20 }"
+              hide-header
+            >
+              <template v-slot:body="props">
+                <q-tr :props="props" :key="`g_${props.row.area_id}`">
+                  <q-td colspan="100%" class="bg-grey-2">
+                    <div class="text-subtitle1">
+                      <strong>Производственный участок:</strong> {{ props.row.area_name }}
+                    </div>
+                  </q-td>
+                </q-tr>
+                <q-tr v-for="order in props.row.orders" :key="order.order_id" :props="props">
+                  <q-td key="item_name" :props="props">
+                    <div>{{ order.item_name }}</div>
+                    <div class="text-caption text-grey">{{ order.item_article }}</div>
+                  </q-td>
+                  <q-td key="qty" :props="props">
+                    {{ fmt(order.qty) }}
+                  </q-td>
+                  <q-td key="need_date" :props="props">
+                    {{ order.need_date }}
+                  </q-td>
+                </q-tr>
+              </template>
+            </q-table>
+          </template>
+          <!-- Фолбэк: показываем простой список рекомендованных производственных заказов -->
+          <template v-else>
+            <q-table
+              :rows="plainProdRows"
+              :columns="recommendedProdColumns"
+              row-key="order_id"
+              :loading="prod.loading"
+              :pagination="{ rowsPerPage: 20 }"
+            />
+          </template>
         </q-card>
       </div>
 
@@ -316,9 +336,9 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted, watch } from 'vue'
+import { ref, reactive, onMounted, watch, computed } from 'vue'
 import { useRoute } from 'vue-router'
-import {
+import api, {
   getPlanningRunSummary,
   getPlanningResultProduction,
   getPlanningResultPurchases,
@@ -350,7 +370,8 @@ const recommendedProdColumns: QTableColumn<any>[] = [
 ];
 
 const recommendedPurchColumns: QTableColumn<any>[] = [
-  { name: 'item_id', label: 'Номенклатура (ID)', field: 'item_id', align: 'left', sortable: true },
+  { name: 'item_name', label: 'Номенклатура', field: (r: any) => (itemMap.value?.[r.item_id]?.item_name) ?? `Номенклатура #${r.item_id}`, align: 'left', sortable: true },
+  { name: 'item_article', label: 'Артикул', field: (r: any) => (itemMap.value?.[r.item_id]?.item_article) ?? '', align: 'left', sortable: true },
   { name: 'qty', label: 'Количество', field: 'qty', align: 'right', sortable: true, format: (val) => fmt(val) },
   { name: 'need_date', label: 'Требуемая дата', field: 'need_date', align: 'left', sortable: true },
   { name: 'order_date', label: 'Дата заказа', field: 'order_date', align: 'left', sortable: true }
@@ -392,11 +413,37 @@ const runId = Number(route.params.runId)
 const summary = ref<any | null>(null)
 const tab = ref<'production' | 'purchases' | 'capacity' | 'pegging' | 'components'>('production')
 
-// --- Группировка для новых таблиц ---
-const groupedProductionOrders = ref<any[]>([])
+ // --- Справочники ---
+ const itemMap = ref<{ [key: number]: any }>({})
+ const areaMap = ref<{ [key: number]: string }>({})
+ 
+ // --- Группировка для новых таблиц ---
+ const groupedProductionOrders = ref<any[]>([])
+// Итоговый источник строк для карточки «Рекомендуемые заказы на производство»
+const groupedProdRows = computed(() => {
+  const groups = groupedProductionOrders.value || []
+  if (groups.length > 0) return groups
+  // Фолбэк: если группировка по участкам пустая (нет stages/area_id),
+  // показываем плоский список как одну группу
+  const orders = (prod.rows || []).map((r: any) => ({
+    ...r,
+    item_name: (itemMap.value?.[r.item_id]?.item_name) ?? `Номенклатура #${r.item_id}`,
+    item_article: (itemMap.value?.[r.item_id]?.item_article) ?? ''
+  }))
+  return orders.length ? [{ area_id: 0, area_name: '—', orders }] : []
+})
+// Плоский список для фолбэка
+const plainProdRows = computed(() => {
+  return (prod.rows || []).map((r: any) => ({
+    ...r,
+    item_name: (itemMap.value?.[r.item_id]?.item_name) ?? `Номенклатура #${r.item_id}`,
+    item_article: (itemMap.value?.[r.item_id]?.item_article) ?? ''
+  }))
+})
 
 function rebuildGroupedProductionOrders() {
-  if (!prod.rows.length || !Object.keys(itemMap.value).length || !Object.keys(areaMap.value).length) {
+  if (!prod.rows.length) {
+    groupedProductionOrders.value = []
     return
   }
 
@@ -404,7 +451,7 @@ function rebuildGroupedProductionOrders() {
 
   for (const order of prod.rows) {
     const areaId = order.stages?.[0]?.area_id ?? 0
-    const areaName = areaMap.value[areaId] ?? `Участок #${areaId}`
+    const areaName = areaId ? (areaMap.value[areaId] ?? `Участок #${areaId}`) : '—'
     const item = itemMap.value[order.item_id]
 
     if (!groups[areaId]) {
@@ -421,11 +468,19 @@ function rebuildGroupedProductionOrders() {
     })
   }
   groupedProductionOrders.value = Object.values(groups)
+  try {
+    console.log('MRP groupedProductionOrders', {
+      prodRows: (prod.rows || []).length,
+      groups: groupedProductionOrders.value.length,
+      sampleGroup: groupedProductionOrders.value[0],
+      sampleOrder: (prod.rows || [])[0]
+    })
+  } catch (e) {
+    // no-op
+  }
 }
 
-// --- Справочники ---
-const itemMap = ref<{ [key: number]: any }>({})
-const areaMap = ref<{ [key: number]: string }>({})
+ // --- Справочники (moved above) ---
 
 async function loadDictionaries() {
   try {
@@ -447,6 +502,63 @@ async function loadDictionaries() {
     rebuildGroupedProductionOrders()
   } catch (e) {
     console.error('Failed to load dictionaries', e)
+  }
+}
+
+// Догрузка недостающих словарей по фактическим строкам production/purchases
+async function fillMissingDictionariesFromRows() {
+  try {
+    const missingItemIds = new Set<number>()
+    const missingAreaIds = new Set<number>()
+
+    // Из production
+    for (const r of (prod.rows || [])) {
+      if (r?.item_id && !itemMap.value[r.item_id]) missingItemIds.add(Number(r.item_id))
+      const stages = Array.isArray(r?.stages) ? r.stages : []
+      for (const s of stages) {
+        const aid = s?.area_id
+        if (aid && !areaMap.value[aid]) missingAreaIds.add(Number(aid))
+      }
+    }
+    // Из purchases
+    for (const r of (purch.rows || [])) {
+      if (r?.item_id && !itemMap.value[r.item_id]) missingItemIds.add(Number(r.item_id))
+    }
+
+    // Ограничим объем единичных запросов
+    const idsItems = Array.from(missingItemIds).slice(0, 500)
+    const idsAreas = Array.from(missingAreaIds).slice(0, 200)
+
+    const itemPromises = idsItems.map(id =>
+      api.get(`/v1/items/${id}`).then(resp => ({ ok: true, data: resp.data })).catch(() => ({ ok: false }))
+    )
+    const areaPromises = idsAreas.map(id =>
+      api.get(`/v1/resources/${id}`).then(resp => ({ ok: true, data: resp.data })).catch(() => ({ ok: false }))
+    )
+
+    const [itemResults, areaResults] = await Promise.all([
+      Promise.all(itemPromises),
+      Promise.all(areaPromises)
+    ])
+
+    for (const r of itemResults) {
+      if ((r as any)?.ok && (r as any)?.data) {
+        const it = (r as any).data
+        if (it?.item_id != null) {
+          itemMap.value[Number(it.item_id)] = it
+        }
+      }
+    }
+    for (const r of areaResults) {
+      if ((r as any)?.ok && (r as any)?.data) {
+        const a = (r as any).data
+        if (a?.resource_id != null) {
+          areaMap.value[Number(a.resource_id)] = String(a.resource_name ?? '')
+        }
+      }
+    }
+  } catch (e) {
+    console.error('Failed to fill dictionaries from rows', e)
   }
 }
 
@@ -555,7 +667,7 @@ async function loadProduction() {
     prod.rows = resp.rows || []
     prod.pagination.rowsNumber = resp.total || 0
     rebuildOrderOptions()
-    // обновляем сгруппированные заказы для блока «Рекомендуемые заказы на производство»
+    // Явно пересобираем группы для «Рекомендуемые заказы на производство»
     rebuildGroupedProductionOrders()
   } catch (e) {
     console.error('Failed to load production', e)
@@ -693,16 +805,30 @@ onMounted(async () => {
     loadPurchases(),
     loadDictionaries()
   ])
+  // Догружаем недостающие записи словарей по item_id/area_id из фактических строк
+  await fillMissingDictionariesFromRows()
   // Теперь, когда все данные загружены, вызываем группировку
   rebuildGroupedProductionOrders()
+  try {
+    console.log('MRP onMounted', {
+      grouped: (groupedProdRows as any)?.value?.length ?? (groupedProductionOrders as any)?.value?.length ?? 0,
+      prodRows: (prod.rows || []).length
+    })
+  } catch (e) {}
 })
 
+// Наблюдаем за вкладкой для загрузки данных при переключении
 watch(tab, (t) => {
   if (t === 'production' && !prod.rows.length) loadProduction()
   if (t === 'purchases' && !purch.rows.length) loadPurchases()
   if (t === 'capacity') loadCapacity()
   if (t === 'pegging') loadPegging()
 })
+
+// Наблюдаем за изменениями prod.rows, itemMap и areaMap для обновления groupedProductionOrders
+watch([() => prod.rows, () => itemMap.value, () => areaMap.value], () => {
+  rebuildGroupedProductionOrders()
+}, { deep: true })
 </script>
 
 <style scoped>
