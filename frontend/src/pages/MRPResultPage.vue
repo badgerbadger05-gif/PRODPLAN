@@ -79,77 +79,216 @@
       </div>
     </div>
 
-    <!-- НОВЫЕ БЛОКИ С РЕЗУЛЬТАТАМИ -->
-    <div class="row q-col-gutter-md q-mb-md">
-      <!-- Рекомендуемые заказы на производство -->
-      <div class="col-12 col-lg-6">
-        <q-card flat bordered>
-          <q-card-section>
-            <div class="text-h6">Рекомендуемые заказы на производство</div>
-          </q-card-section>
-          <q-separator />
-          <!-- Если есть группировка по участкам — показываем её -->
-          <template v-if="groupedProdRows.length">
+    <!-- Результаты прогона: две вкладки с едиными столбцами -->
+    <div class="q-mb-md">
+      <q-tabs v-model="viewTab" class="text-primary" dense>
+        <q-tab name="production" icon="build" label="Заказы на производство" />
+        <q-tab name="purchases" icon="shopping_cart" label="Заказы на закупку" />
+      </q-tabs>
+      <q-separator />
+
+      <q-tab-panels v-model="viewTab" animated>
+        <!-- Production unified tab -->
+        <q-tab-panel name="production">
+          <div class="row items-center q-gutter-sm q-mb-sm">
+            <div class="text-subtitle2">
+              Результаты MRP от {{ summary?.run?.started_at || '—' }}
+            </div>
+            <q-space />
+            <q-select v-model="prod.filter.bucket_type" :options="bucketOptions" emit-value map-options dense outlined label="Бакет" style="width: 150px" />
+            <q-input v-model="prod.filter.day_date" dense outlined label="День задания (YYYY-MM-DD)" style="width: 200px">
+              <template v-slot:append>
+                <q-btn dense flat round icon="event" @click.stop="showDayMenu = true" />
+                <q-menu v-model="showDayMenu" anchor="bottom right" self="top right" cover>
+                  <q-date v-model="prod.filter.day_date" mask="YYYY-MM-DD" @update:model-value="onDayPicked" />
+                </q-menu>
+              </template>
+            </q-input>
+            <q-separator vertical class="q-mx-xs" />
+            <q-input v-model="prod.filter.date_from" dense outlined label="От даты (YYYY-MM-DD)" style="width: 200px" />
+            <q-input v-model="prod.filter.date_to" dense outlined label="До даты (YYYY-MM-DD)" style="width: 200px" />
+            <q-btn dense color="primary" icon="search" @click="loadProduction()" />
+            <q-btn dense flat icon="refresh" @click="loadProduction()" />
+            <q-separator vertical class="q-mx-xs" />
+            <q-btn dense flat icon="download" label="CSV" @click="exportProd('csv')" />
+            <q-btn dense flat icon="table_view" label="XLSX" @click="exportProd('xlsx')" />
+          </div>
+
+          <!-- Ежедневное задание по участкам (если выбран день) -->
+          <template v-if="prod.filter.day_date && dailyAgendaGroups.length">
             <q-table
-              :rows="groupedProdRows"
-              :columns="recommendedProdColumns"
+              dense
+              table-class="compact-rows"
+              :rows="dailyAgendaGroups"
+              :columns="prodUnifiedColumns"
               row-key="area_id"
               :loading="prod.loading"
-              :pagination="{ rowsPerPage: 20 }"
+              :pagination="{ rowsPerPage: 50 }"
               hide-header
             >
               <template v-slot:body="props">
-                <q-tr :props="props" :key="`g_${props.row.area_id}`">
+                <!-- Заголовок группы (дневная повестка) -->
+                <q-tr :props="props" :key="`grp_day_${props.row.area_id}`">
                   <q-td colspan="100%" class="bg-grey-2">
                     <div class="text-subtitle1">
                       <strong>Производственный участок:</strong> {{ props.row.area_name }}
+                      <span class="text-grey q-ml-sm">
+                        · Позиции (на день): {{ (props.row.orders || []).length }}
+                        · Норматив (за день): {{ fmt(props.row.norm_sum_hours) }} ч
+                        · Выпуск (за день): {{ fmtQty(props.row.sum_qty, 'шт') }}
+                      </span>
+                      <q-badge v-if="Number(props.row.cap_overload_hours || 0) > 0" class="q-ml-sm" color="negative" outline>
+                        Перегруз: {{ fmt(props.row.cap_overload_hours) }} ч
+                      </q-badge>
                     </div>
                   </q-td>
                 </q-tr>
-                <q-tr v-for="order in props.row.orders" :key="order.order_id" :props="props">
-                  <q-td key="item_name" :props="props">
-                    <div>{{ order.item_name }}</div>
-                    <div class="text-caption text-grey">{{ order.item_article }}</div>
+                <!-- Строки позиций на день -->
+                <q-tr v-for="order in props.row.orders" :key="order.agg_key || `${order.item_id}|${order.unit || ''}`" :props="props">
+                  <q-td key="name" :props="props">
+                    <div>{{ order.item_name || ('Номенклатура #' + order.item_id) }}</div>
+                    <q-badge v-if="!(Number(order.norm_hours_per_unit || 0) > 0)" class="q-ml-xs" color="grey" outline>без норматива</q-badge>
                   </q-td>
-                  <q-td key="qty" :props="props">
-                    {{ fmt(order.qty) }}
+                  <q-td key="article" :props="props">
+                    {{ order.item_article || '—' }}
                   </q-td>
-                  <q-td key="need_date" :props="props">
-                    {{ order.need_date }}
+                  <q-td key="qty" :props="props" class="text-right">
+                    {{ fmtQty(order.qty, order.unit) }}
+                  </q-td>
+                  <q-td key="norm_per_unit" :props="props" class="text-right">
+                    {{ fmt(order.norm_hours_per_unit != null ? order.norm_hours_per_unit : ((Number(order.norm_hours_total || 0)) / (Number(order.qty || 1)))) }}
+                  </q-td>
+                  <q-td key="norm_total" :props="props" class="text-right">
+                    {{ fmt(order.norm_hours_total) }}
                   </q-td>
                 </q-tr>
               </template>
             </q-table>
           </template>
-          <!-- Фолбэк: показываем простой список рекомендованных производственных заказов -->
+
+          <!-- Группированный вывод по участкам (если день не выбран) -->
+          <template v-else-if="groupedProdRows.length">
+            <q-table
+              dense
+              table-class="compact-rows"
+              :rows="groupedProdRows"
+              :columns="prodUnifiedColumns"
+              row-key="area_id"
+              :loading="prod.loading"
+              :pagination="{ rowsPerPage: 50 }"
+              hide-header
+            >
+              <template v-slot:body="props">
+                <!-- Заголовок группы -->
+                <q-tr :props="props" :key="`grp_${props.row.area_id}`">
+                  <q-td colspan="100%" class="bg-grey-2">
+                    <div class="text-subtitle1">
+                      <strong>Производственный участок:</strong> {{ props.row.area_name }}
+                      <span class="text-grey q-ml-sm">
+                        · Заказов: {{ (props.row.orders || []).length }}
+                        · Норматив всего: {{ fmt(props.row.norm_sum_hours) }} ч
+                      </span>
+                      <q-badge v-if="props.row.min_days_to_need != null" class="q-ml-sm" color="orange" outline>
+                        Срочн.: {{ props.row.min_days_to_need }} д
+                      </q-badge>
+                      <q-badge v-if="Number(props.row.cap_overload_hours || 0) > 0" class="q-ml-sm" color="negative" outline>
+                        Перегруз: {{ fmt(props.row.cap_overload_hours) }} ч
+                      </q-badge>
+                    </div>
+                  </q-td>
+                </q-tr>
+                <!-- Строки заказов -->
+                <q-tr v-for="order in props.row.orders" :key="order.agg_key || `${order.item_id}|${order.unit || ''}`" :props="props">
+                  <q-td key="name" :props="props">
+                    <div>{{ order.item_name || ('Номенклатура #' + order.item_id) }}</div>
+                  </q-td>
+                  <q-td key="article" :props="props">
+                    {{ order.item_article || '—' }}
+                  </q-td>
+                  <q-td key="qty" :props="props" class="text-right">
+                    {{ fmtQty(order.qty, order.unit) }}
+                  </q-td>
+                  <q-td key="norm_per_unit" :props="props" class="text-right">
+                    {{ fmt(order.norm_hours_per_unit != null ? order.norm_hours_per_unit : ((Number(order.norm_hours_total || 0)) / (Number(order.qty || 1)))) }}
+                  </q-td>
+                  <q-td key="norm_total" :props="props" class="text-right">
+                    {{ fmt(order.norm_hours_total) }}
+                  </q-td>
+                </q-tr>
+              </template>
+            </q-table>
+          </template>
+
+          <!-- Фолбэк: плоский список без группировки -->
           <template v-else>
             <q-table
+              dense
+              table-class="compact-rows"
               :rows="plainProdRows"
-              :columns="recommendedProdColumns"
+              :columns="prodUnifiedColumns"
               row-key="order_id"
               :loading="prod.loading"
-              :pagination="{ rowsPerPage: 20 }"
-            />
+              :pagination="{ rowsPerPage: 50 }"
+            >
+              <template v-slot:body-cell-name="p">
+                <q-td :props="p">
+                  <div>{{ p.row.item_name || ('Номенклатура #' + p.row.item_id) }}</div>
+                </q-td>
+              </template>
+              <template v-slot:body-cell-qty="p">
+                <q-td :props="p" class="text-right">{{ fmtQty(p.row.qty, p.row.unit) }}</q-td>
+              </template>
+              <template v-slot:body-cell-norm_per_unit="p">
+                <q-td :props="p" class="text-right">
+                  {{ fmt(p.row.norm_hours_per_unit != null ? p.row.norm_hours_per_unit : ((Number(p.row.norm_hours_total || 0)) / (Number(p.row.qty || 1)))) }}
+                </q-td>
+              </template>
+              <template v-slot:body-cell-norm_total="p">
+                <q-td :props="p" class="text-right">
+                  {{ fmt(p.row.norm_hours_total) }}
+                </q-td>
+              </template>
+            </q-table>
           </template>
-        </q-card>
-      </div>
+        </q-tab-panel>
 
-      <!-- Рекомендуемые заказы на закупку -->
-      <div class="col-12 col-lg-6">
-        <q-card flat bordered>
-          <q-card-section>
-            <div class="text-h6">Рекомендуемые заказы на закупку</div>
-          </q-card-section>
-          <q-separator />
+        <!-- Purchases unified tab -->
+        <q-tab-panel name="purchases">
+          <div class="row items-center q-gutter-sm q-mb-sm">
+            <div class="text-subtitle2">
+              Результаты MRP от {{ summary?.run?.started_at || '—' }}
+            </div>
+            <q-space />
+            <q-select v-model="purch.filter.bucket_type" :options="bucketOptions" emit-value map-options dense outlined label="Бакет" style="width: 150px" />
+            <q-input v-model="purch.filter.date_from" dense outlined label="От даты (YYYY-MM-DD)" style="width: 200px" />
+            <q-input v-model="purch.filter.date_to" dense outlined label="До даты (YYYY-MM-DD)" style="width: 200px" />
+            <q-btn dense color="primary" icon="search" @click="loadPurchases()" />
+            <q-btn dense flat icon="refresh" @click="loadPurchases()" />
+            <q-separator vertical class="q-mx-xs" />
+            <q-btn dense flat icon="download" label="CSV" @click="exportPurch('csv')" />
+            <q-btn dense flat icon="table_view" label="XLSX" @click="exportPurch('xlsx')" />
+          </div>
+
           <q-table
-            :rows="purch.rows"
-            :columns="recommendedPurchColumns"
-            row-key="purchase_id"
+            dense
+            table-class="compact-rows"
+            :rows="purchAggRows"
+            :columns="purchUnifiedColumns"
+            row-key="agg_key"
             :loading="purch.loading"
-            :pagination="{ rowsPerPage: 10 }"
-          />
-        </q-card>
-      </div>
+            :pagination="{ rowsPerPage: 50 }"
+          >
+            <template v-slot:body-cell-name="p">
+              <q-td :props="p">
+                <div>{{ p.row.item_name || ('Номенклатура #' + p.row.item_id) }}</div>
+              </q-td>
+            </template>
+            <template v-slot:body-cell-qty="p">
+              <q-td :props="p" class="text-right">{{ fmtQty(p.row.qty, p.row.unit) }}</q-td>
+            </template>
+          </q-table>
+        </q-tab-panel>
+      </q-tab-panels>
     </div>
 
     <!-- Вкладки для детального анализа (можно оставить ниже) -->
@@ -168,7 +307,7 @@
       <!-- Production -->
       <q-tab-panel name="production">
         <div class="row items-center q-gutter-sm q-mb-sm">
-          <q-select v-model="prod.filter.bucket_type" :options="bucketOptions" dense outlined label="Бакет" style="width: 150px" />
+          <q-select v-model="prod.filter.bucket_type" :options="bucketOptions" emit-value map-options dense outlined label="Бакет" style="width: 150px" />
           <q-input v-model="prod.filter.date_from" dense outlined label="От даты (YYYY-MM-DD)" style="width: 200px" />
           <q-input v-model="prod.filter.date_to" dense outlined label="До даты (YYYY-MM-DD)" style="width: 200px" />
           <q-btn dense color="primary" icon="search" @click="loadProduction()" />
@@ -176,6 +315,8 @@
           <q-btn dense flat icon="refresh" @click="loadProduction()" />
         </div>
         <q-table
+          dense
+          table-class="compact-rows"
           :rows="prod.rows"
           :columns="prod.columns"
           row-key="order_id"
@@ -203,7 +344,7 @@
       <!-- Purchases -->
       <q-tab-panel name="purchases">
         <div class="row items-center q-gutter-sm q-mb-sm">
-          <q-select v-model="purch.filter.bucket_type" :options="bucketOptions" dense outlined label="Бакет" style="width: 150px" />
+          <q-select v-model="purch.filter.bucket_type" :options="bucketOptions" emit-value map-options dense outlined label="Бакет" style="width: 150px" />
           <q-input v-model="purch.filter.date_from" dense outlined label="От даты (YYYY-MM-DD)" style="width: 200px" />
           <q-input v-model="purch.filter.date_to" dense outlined label="До даты (YYYY-MM-DD)" style="width: 200px" />
           <q-btn dense color="primary" icon="search" @click="loadPurchases()" />
@@ -211,6 +352,8 @@
           <q-btn dense flat icon="refresh" @click="loadPurchases()" />
         </div>
         <q-table
+          dense
+          table-class="compact-rows"
           :rows="purch.rows"
           :columns="purch.columns"
           row-key="purchase_id"
@@ -223,7 +366,7 @@
       <!-- Capacity -->
       <q-tab-panel name="capacity">
         <div class="row items-center q-gutter-sm q-mb-sm">
-          <q-select v-model="cap.filter.bucket_type" :options="bucketOptions" dense outlined label="Бакет" style="width: 150px" />
+          <q-select v-model="cap.filter.bucket_type" :options="bucketOptions" emit-value map-options dense outlined label="Бакет" style="width: 150px" />
           <q-input v-model="cap.filter.date_from" dense outlined label="От даты (YYYY-MM-DD)" style="width: 200px" />
           <q-input v-model="cap.filter.date_to" dense outlined label="До даты (YYYY-MM-DD)" style="width: 200px" />
           <q-btn dense color="primary" icon="search" @click="loadCapacity()" />
@@ -346,7 +489,9 @@ import api, {
   getPlanningResultPegging,
   getSpecificationFull,
   listItems,
-  listResources
+  listResources,
+  exportPlanningResultProduction,
+  exportPlanningResultPurchases
 } from '../services/api'
 import type { QTableColumn } from 'quasar'
 import type { SpecNode } from '../services/api'
@@ -354,6 +499,8 @@ const prodColumns: QTableColumn<any>[] = [
   { name: 'order_id', label: 'Order', field: 'order_id', align: 'left', sortable: true },
   { name: 'item_id', label: 'Item', field: 'item_id', align: 'right', sortable: true },
   { name: 'qty', label: 'Qty', field: 'qty', align: 'right', sortable: true },
+  { name: 'norm_hours_per_unit', label: 'Норма, ч/шт', field: 'norm_hours_per_unit', align: 'right', sortable: true },
+  { name: 'norm_hours_total', label: 'Норматив всего, ч', field: 'norm_hours_total', align: 'right', sortable: true },
   { name: 'need_date', label: 'Need', field: 'need_date', align: 'left', sortable: true },
   { name: 'start_date', label: 'Start', field: 'start_date', align: 'left', sortable: true },
   { name: 'finish_date', label: 'Finish', field: 'finish_date', align: 'left', sortable: true },
@@ -407,11 +554,33 @@ const pegColumns: QTableColumn<any>[] = [
   { name: 'parent_need_date', label: 'Parent need', field: 'parent_need_date', align: 'left', sortable: true }
 ]
 
+// Унифицированные колонки для вкладок «Производство» и «Закупки»
+const prodUnifiedColumns: QTableColumn<any>[] = [
+  { name: 'name', label: 'Наименование', field: 'item_name', align: 'left' },
+  { name: 'article', label: 'Артикул', field: 'item_article', align: 'left' },
+  { name: 'qty', label: 'Количество', field: 'qty', align: 'right' },
+  { name: 'norm_per_unit', label: 'Норма, ч/шт', field: 'norm_hours_per_unit', align: 'right' },
+  { name: 'norm_total', label: 'Норматив всего, ч', field: 'norm_hours_total', align: 'right' }
+]
+
+const purchUnifiedColumns: QTableColumn<any>[] = [
+  { name: 'name', label: 'Наименование', field: 'item_name', align: 'left' },
+  { name: 'article', label: 'Артикул', field: 'item_article', align: 'left' },
+  { name: 'qty', label: 'Количество', field: 'qty', align: 'right' }
+]
+
 const route = useRoute()
 const runId = Number(route.params.runId)
 
 const summary = ref<any | null>(null)
 const tab = ref<'production' | 'purchases' | 'capacity' | 'pegging' | 'components'>('production')
+// Вкладки верхнего уровня для унифицированных таблиц
+const viewTab = ref<'production' | 'purchases'>('production')
+
+// Popup флаг для выбора даты «День задания»
+const showDayPopup = ref(false)
+// Меню выбора даты (QMenu)
+const showDayMenu = ref(false)
 
  // --- Справочники ---
  const itemMap = ref<{ [key: number]: any }>({})
@@ -419,13 +588,17 @@ const tab = ref<'production' | 'purchases' | 'capacity' | 'pegging' | 'component
  
  // --- Группировка для новых таблиц ---
  const groupedProductionOrders = ref<any[]>([])
+ // Полные наборы строк для верхних таблиц (без учёта пагинации детальных)
+ const prodAllRows = ref<any[]>([])
+ const purchAllRows = ref<any[]>([])
 // Итоговый источник строк для карточки «Рекомендуемые заказы на производство»
 const groupedProdRows = computed(() => {
   const groups = groupedProductionOrders.value || []
   if (groups.length > 0) return groups
-  // Фолбэк: если группировка по участкам пустая (нет stages/area_id),
-  // показываем плоский список как одну группу
-  const orders = (prod.rows || []).map((r: any) => ({
+  // Фолбэк: если группировка по участкам пустая — показываем плоский список,
+  // но применяем клиентский фильтр по датам/бакету для консистентности.
+  const src = (prodAllRows.value || []).filter(inProdRange)
+  const orders = src.map((r: any) => ({
     ...r,
     item_name: (itemMap.value?.[r.item_id]?.item_name) ?? `Номенклатура #${r.item_id}`,
     item_article: (itemMap.value?.[r.item_id]?.item_article) ?? ''
@@ -434,50 +607,254 @@ const groupedProdRows = computed(() => {
 })
 // Плоский список для фолбэка
 const plainProdRows = computed(() => {
-  return (prod.rows || []).map((r: any) => ({
+  const src = prodAllRows.value || []
+  return src.map((r: any) => ({
     ...r,
     item_name: (itemMap.value?.[r.item_id]?.item_name) ?? `Номенклатура #${r.item_id}`,
     item_article: (itemMap.value?.[r.item_id]?.item_article) ?? ''
   }))
 })
 
+// Агрегация закупок по item_id+unit для верхней вкладки (независимо от пагинации детальных)
+const purchAggRows = computed(() => {
+  const map = new Map<string, any>()
+  // Apply UI date filter on full dataset (by bucket_date/order_date/need_date)
+  const src = (purchAllRows.value || []).filter(inPurchRange)
+  for (const r of src) {
+    const key = `${r.item_id}|${r.unit || ''}`
+    if (!map.has(key)) {
+      map.set(key, {
+        agg_key: key,
+        item_id: r.item_id,
+        item_name: r.item_name || (itemMap.value?.[r.item_id]?.item_name) || `Номенклатура #${r.item_id}`,
+        item_article: r.item_article || (itemMap.value?.[r.item_id]?.item_article) || '',
+        unit: r.unit,
+        qty: 0
+      })
+    }
+    const ex = map.get(key)
+    ex.qty = Number(ex.qty || 0) + Number(r.qty || 0)
+  }
+  return Array.from(map.values())
+})
+
+// --- Ежедневная повестка по участкам (задание на день) ---
+const dailyAgendaGroups = ref<any[]>([])
+
+function rebuildDailyAgendaForDay() {
+  try {
+    const day = (prod.filter.day_date || '').slice(0, 10)
+    if (!day) {
+      dailyAgendaGroups.value = []
+      return
+    }
+    type Agg = {
+      item_id: number
+      unit?: string | null
+      qty: number
+      norm_hours_total: number
+      norm_hours_per_unit: number | null
+      item_name: string
+      item_article: string
+      agg_key: string
+      _added_full_qty?: boolean
+    }
+    type Group = {
+      area_id: number
+      area_name: string
+      _agg: Record<string, Agg>
+    }
+    const groups: Record<number, Group> = {}
+
+    const rows = prodAllRows.value || []
+    for (const order of rows) {
+      const stages: any[] = Array.isArray(order?.stages) ? (order.stages as any[]) : []
+      // Норма на штуку из заказа (если нет — вычисляем от общей нормы и qty)
+      const q = Number(order?.qty || 0)
+      let npu: number | null = null
+      if (order?.norm_hours_per_unit != null) {
+        npu = Number(order.norm_hours_per_unit)
+      } else if (q > 0) {
+        npu = Number(order?.norm_hours_total || 0) / q
+      }
+      for (const s of stages) {
+        const sDate = (s?.bucket_date || '').slice(0, 10)
+        if (sDate !== day) continue
+        const areaId = s?.area_id != null ? Number(s.area_id) : 0
+        if (!groups[areaId]) {
+          groups[areaId] = {
+            area_id: areaId,
+            area_name: areaId ? (areaMap.value[areaId] ?? `Участок #${areaId}`) : '—',
+            _agg: {}
+          }
+        }
+        const key = `${order.item_id}|${order.unit || ''}`
+        if (!groups[areaId]._agg[key]) {
+          groups[areaId]._agg[key] = {
+            item_id: Number(order.item_id),
+            unit: order.unit,
+            qty: 0,
+            norm_hours_total: 0,
+            norm_hours_per_unit: npu,
+            item_name: order.item_name || (itemMap.value?.[order.item_id]?.item_name) || `Номенклатура #${order.item_id}`,
+            item_article: order.item_article || (itemMap.value?.[order.item_id]?.item_article) || '',
+            agg_key: key,
+            _added_full_qty: false
+          }
+        }
+        const ex = groups[areaId]._agg[key]
+        const hours = Number(s?.hours || 0)
+        ex.norm_hours_total += hours
+        // Перевод часов дня в выпуск по позиции за день на участке
+        // Если известна норма на штуку — используем час/норму,
+        // иначе (npu <= 0) — один раз прибавляем полный объём заказа в этот день.
+        if (npu && npu > 0) {
+          ex.qty += hours / npu
+        } else {
+          if (!ex._added_full_qty) {
+            ex.qty += Number(order?.qty || 0)
+            ex._added_full_qty = true
+          }
+        }
+      }
+    }
+
+    // Преобразование в массив и расчёт итогов/перегруза за день
+    const out: any[] = []
+    for (const areaIdStr of Object.keys(groups)) {
+      const areaId = Number(areaIdStr)
+      const g = groups[areaId]
+      if (!g) continue
+      const orders = Object.values(g._agg || {}) as Agg[]
+      const normSum = orders.reduce((s, r) => s + Number(r.norm_hours_total || 0), 0)
+      const sumQty = orders.reduce((s, r) => s + Number(r.qty || 0), 0)
+      // Индикатор перегруза за день
+      const cap = (dayCapUpper.value || {})[areaId] || { overload_hours: 0 }
+      out.push({
+        area_id: g.area_id,
+        area_name: g.area_name,
+        orders,
+        norm_sum_hours: normSum,
+        sum_qty: sumQty,
+        cap_overload_hours: Number(cap.overload_hours || 0)
+      })
+    }
+    dailyAgendaGroups.value = out
+  } catch (e) {
+    console.error('Failed to rebuild daily agenda', e)
+    dailyAgendaGroups.value = []
+  }
+}
+
 function rebuildGroupedProductionOrders() {
-  if (!prod.rows.length) {
+  // Берём полный набор заказов. Полагаемся на серверные фильтры bucket_type/date,
+  // на клиенте валидируем только диапазон по bucket_date (если задан).
+  const all = (prodAllRows.value || [])
+  const from = emptyToUndef(prod.filter.date_from)
+  const to = emptyToUndef(prod.filter.date_to)
+  const src = (!from && !to) ? all : all.filter((order: any) => {
+    const dt = (order?.bucket_date || null) as string | null
+    return dateInRange(dt, from, to)
+  })
+
+  if (!src.length) {
     groupedProductionOrders.value = []
     return
   }
 
-  const groups: { [key: string]: { area_id: number; area_name: string; orders: any[] } } = {}
+  type GroupType = {
+    area_id: number
+    area_name: string
+    orders: any[]
+    norm_sum_hours: number
+    _agg: Record<string, any>
+    min_days_to_need: number | null
+  }
 
-  for (const order of prod.rows) {
-    const areaId = order.stages?.[0]?.area_id ?? 0
+  const groups: Record<number, GroupType> = {}
+
+  for (const order of src) {
+    const stages: any[] = Array.isArray(order?.stages) ? (order.stages as any[]) : []
+    // Определяем «доминирующий» участок по стадии с максимальными часами (без доп. фильтров)
+    let dominant: any = null
+    for (const s of stages) {
+      if (!dominant || Number(s?.hours || 0) > Number(dominant?.hours || 0)) dominant = s
+    }
+    const areaId = dominant?.area_id != null ? Number(dominant.area_id) : 0
     const areaName = areaId ? (areaMap.value[areaId] ?? `Участок #${areaId}`) : '—'
-    const item = itemMap.value[order.item_id]
 
     if (!groups[areaId]) {
       groups[areaId] = {
         area_id: areaId,
         area_name: areaName,
-        orders: []
+        orders: [],
+        norm_sum_hours: 0,
+        _agg: {},
+        min_days_to_need: null
       }
     }
-    groups[areaId].orders.push({
-      ...order,
-      item_name: item?.item_name ?? `Номенклатура #${order.item_id}`,
-      item_article: item?.item_article ?? ''
+    const g = groups[areaId]
+
+    // Норматив по заказу берём из ответа бэкенда
+    const hoursTotalOrder = Number(order?.norm_hours_total || 0)
+
+    // Агрегация по (item_id, unit) внутри участка
+    const key = `${order.item_id}|${order.unit || ''}`
+    if (!g._agg[key]) {
+      g._agg[key] = {
+        ...order,
+        agg_key: key,
+        item_name: order.item_name || `Номенклатура #${order.item_id}`,
+        item_article: order.item_article || '',
+        qty: 0,
+        norm_hours_total: 0,
+        norm_hours_per_unit: order.norm_hours_per_unit ?? null
+      }
+    }
+    const ex = g._agg[key]
+    ex.qty = Number(ex.qty || 0) + Number(order.qty || 0)
+    ex.norm_hours_total = Number(ex.norm_hours_total || 0) + hoursTotalOrder
+    const q = Number(ex.qty || 0)
+    ex.norm_hours_per_unit = q > 0 ? Number(ex.norm_hours_total || 0) / q : (ex.norm_hours_per_unit ?? null)
+
+    // Срочность (минимум дней до потребности по заказам группы)
+    try {
+      const today = new Date()
+      const todayUTC = new Date(Date.UTC(today.getFullYear(), today.getMonth(), today.getDate()))
+      const needStr = (order?.need_date || order?.bucket_date || null) as string | null
+      if (needStr) {
+        const nd = new Date(needStr.slice(0, 10))
+        const ndUTC = new Date(Date.UTC(nd.getFullYear(), nd.getMonth(), nd.getDate()))
+        const diffDays = Math.ceil((ndUTC.getTime() - todayUTC.getTime()) / 86400000)
+        if (g.min_days_to_need == null || diffDays < g.min_days_to_need) {
+          g.min_days_to_need = diffDays
+        }
+      }
+    } catch {}
+  }
+
+  // Финализация групп
+  const out: any[] = []
+  for (const areaIdStr of Object.keys(groups)) {
+    const areaId = Number(areaIdStr)
+    const g = groups[areaId]
+    if (!g) continue
+    const orders = Object.values(g._agg || {}) as any[]
+    const normSum = orders.reduce((s: number, r: any) => s + Number(r?.norm_hours_total || 0), 0)
+
+    // Индикаторы capacity из предварительно загруженной карты
+    const cap = (capUpper.value || {})[areaId] || { overload_hours: 0, overloaded_buckets: 0 }
+    out.push({
+      area_id: g.area_id,
+      area_name: g.area_name,
+      orders,
+      norm_sum_hours: normSum,
+      min_days_to_need: g.min_days_to_need,
+      cap_overload_hours: Number(cap.overload_hours || 0),
+      cap_overloaded_buckets: Number(cap.overloaded_buckets || 0)
     })
   }
-  groupedProductionOrders.value = Object.values(groups)
-  try {
-    console.log('MRP groupedProductionOrders', {
-      prodRows: (prod.rows || []).length,
-      groups: groupedProductionOrders.value.length,
-      sampleGroup: groupedProductionOrders.value[0],
-      sampleOrder: (prod.rows || [])[0]
-    })
-  } catch (e) {
-    // no-op
-  }
+  groupedProductionOrders.value = out
 }
 
  // --- Справочники (moved above) ---
@@ -511,8 +888,8 @@ async function fillMissingDictionariesFromRows() {
     const missingItemIds = new Set<number>()
     const missingAreaIds = new Set<number>()
 
-    // Из production
-    for (const r of (prod.rows || [])) {
+    // Из production (полный набор)
+    for (const r of (prodAllRows.value || [])) {
       if (r?.item_id && !itemMap.value[r.item_id]) missingItemIds.add(Number(r.item_id))
       const stages = Array.isArray(r?.stages) ? r.stages : []
       for (const s of stages) {
@@ -520,8 +897,8 @@ async function fillMissingDictionariesFromRows() {
         if (aid && !areaMap.value[aid]) missingAreaIds.add(Number(aid))
       }
     }
-    // Из purchases
-    for (const r of (purch.rows || [])) {
+    // Из purchases (полный набор)
+    for (const r of (purchAllRows.value || [])) {
       if (r?.item_id && !itemMap.value[r.item_id]) missingItemIds.add(Number(r.item_id))
     }
 
@@ -572,7 +949,7 @@ const bucketOptions = [
 const prod = reactive({
   rows: [] as any[],
   loading: false,
-  filter: { bucket_type: undefined as 'daily' | 'weekly' | undefined, date_from: '', date_to: '' },
+  filter: { bucket_type: undefined as 'daily' | 'weekly' | undefined, day_date: '', date_from: '', date_to: '' },
   pagination: { page: 1, rowsPerPage: 20, rowsNumber: 0 },
   columns: prodColumns
 })
@@ -621,10 +998,24 @@ const comp = reactive({
 })
 
 function fmt(v: any) {
-  if (v === null || v === undefined) return '0'
-  const n = Number(v)
-  if (Number.isNaN(n)) return String(v)
-  return n.toFixed(2)
+  try {
+    const n = Number(v ?? 0)
+    if (Number.isNaN(n)) return '0,000'
+    return new Intl.NumberFormat('ru-RU', {
+      minimumFractionDigits: 3,
+      maximumFractionDigits: 3,
+      useGrouping: true
+    }).format(n)
+  } catch {
+    return '0,000'
+  }
+}
+
+// Формат количества с единицей измерения
+function fmtQty(qty: any, unit?: string | null) {
+  const q = fmt(qty)
+  const u = (unit || '').toString().trim()
+  return u ? `${q} ${u}` : q
 }
 
 function statusColor(s?: string) {
@@ -658,17 +1049,36 @@ async function loadProduction() {
   try {
     const limit = prod.pagination.rowsPerPage
     const offset = (prod.pagination.page - 1) * prod.pagination.rowsPerPage
-    const resp = await getPlanningResultProduction(runId, {
-      bucket_type: prod.filter.bucket_type,
-      date_from: emptyToUndef(prod.filter.date_from),
-      date_to: emptyToUndef(prod.filter.date_to),
-      limit, offset
-    })
+    const [resp, full] = await Promise.all([
+      getPlanningResultProduction(runId, {
+        bucket_type: prod.filter.bucket_type,
+        date_from: emptyToUndef(prod.filter.date_from),
+        date_to: emptyToUndef(prod.filter.date_to),
+        sort_by: 'item_name',
+        sort_dir: 'asc',
+        limit, offset
+      }),
+      getPlanningResultProduction(runId, {
+        bucket_type: prod.filter.bucket_type,
+        date_from: emptyToUndef(prod.filter.date_from),
+        date_to: emptyToUndef(prod.filter.date_to),
+        sort_by: 'item_name',
+        sort_dir: 'asc',
+        limit: 100000,
+        offset: 0
+      })
+    ])
     prod.rows = resp.rows || []
     prod.pagination.rowsNumber = resp.total || 0
+    prodAllRows.value = (full?.rows || [])
     rebuildOrderOptions()
-    // Явно пересобираем группы для «Рекомендуемые заказы на производство»
+    // Пересобираем группы по полному набору
     rebuildGroupedProductionOrders()
+    // Индикаторы capacity для верхнего агрегата (по текущим фильтрам)
+    await loadCapacityUpper()
+    // Ежедневная повестка + мощность за конкретный день (если выбран)
+    rebuildDailyAgendaForDay()
+    await loadCapacityUpperDay()
   } catch (e) {
     console.error('Failed to load production', e)
   } finally {
@@ -681,18 +1091,105 @@ async function loadPurchases() {
   try {
     const limit = purch.pagination.rowsPerPage
     const offset = (purch.pagination.page - 1) * purch.pagination.rowsPerPage
-    const resp = await getPlanningResultPurchases(runId, {
-      bucket_type: purch.filter.bucket_type,
-      date_from: emptyToUndef(purch.filter.date_from),
-      date_to: emptyToUndef(purch.filter.date_to),
-      limit, offset
-    })
+    const [resp, full] = await Promise.all([
+      getPlanningResultPurchases(runId, {
+        bucket_type: purch.filter.bucket_type,
+        date_from: emptyToUndef(purch.filter.date_from),
+        date_to: emptyToUndef(purch.filter.date_to),
+        sort_by: 'item_name',
+        sort_dir: 'asc',
+        limit, offset
+      }),
+      getPlanningResultPurchases(runId, {
+        bucket_type: purch.filter.bucket_type,
+        date_from: emptyToUndef(purch.filter.date_from),
+        date_to: emptyToUndef(purch.filter.date_to),
+        sort_by: 'item_name',
+        sort_dir: 'asc',
+        limit: 100000,
+        offset: 0
+      })
+    ])
     purch.rows = resp.rows || []
     purch.pagination.rowsNumber = resp.total || 0
+    purchAllRows.value = (full?.rows || [])
   } catch (e) {
     console.error('Failed to load purchases', e)
   } finally {
     purch.loading = false
+  }
+}
+
+// --- Export helpers and actions ---
+function downloadTextFile(content: string, filename: string, mime: string) {
+  const blob = new Blob([content], { type: mime })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+function downloadBase64Xlsx(b64: string, filename: string) {
+  try {
+    const byteChars = atob(b64 || '')
+    const byteNumbers = new Array(byteChars.length)
+    for (let i = 0; i < byteChars.length; i++) {
+      byteNumbers[i] = byteChars.charCodeAt(i)
+    }
+    const byteArray = new Uint8Array(byteNumbers)
+    const blob = new Blob([byteArray], {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    a.click()
+    URL.revokeObjectURL(url)
+  } catch (e) {
+    console.error('Download XLSX failed', e)
+  }
+}
+
+async function exportProd(fmt: 'csv' | 'xlsx') {
+  try {
+    const res = await exportPlanningResultProduction(runId, {
+      format: fmt,
+      bucket_type: prod.filter.bucket_type,
+      date_from: emptyToUndef(prod.filter.date_from),
+      date_to: emptyToUndef(prod.filter.date_to),
+      sort_by: 'item_name',
+      sort_dir: 'asc'
+    })
+    if (fmt === 'csv') {
+      downloadTextFile(res?.data || '', res?.filename || `mrp_production_run_${runId}.csv`, 'text/csv;charset=utf-8')
+    } else {
+      downloadBase64Xlsx(res?.data_base64 || '', res?.filename || `mrp_production_run_${runId}.xlsx`)
+    }
+  } catch (e) {
+    console.error('Export production failed', e)
+  }
+}
+
+async function exportPurch(fmt: 'csv' | 'xlsx') {
+  try {
+    const res = await exportPlanningResultPurchases(runId, {
+      format: fmt,
+      bucket_type: purch.filter.bucket_type,
+      date_from: emptyToUndef(purch.filter.date_from),
+      date_to: emptyToUndef(purch.filter.date_to),
+      sort_by: 'item_name',
+      sort_dir: 'asc'
+    })
+    if (fmt === 'csv') {
+      downloadTextFile(res?.data || '', res?.filename || `mrp_purchases_run_${runId}.csv`, 'text/csv;charset=utf-8')
+    } else {
+      downloadBase64Xlsx(res?.data_base64 || '', res?.filename || `mrp_purchases_run_${runId}.xlsx`)
+    }
+  } catch (e) {
+    console.error('Export purchases failed', e)
   }
 }
 
@@ -714,6 +1211,103 @@ async function loadCapacity() {
     console.error('Failed to load capacity', e)
   } finally {
     cap.loading = false
+  }
+}
+
+// Карта capacity для верхнего агрегата (перегруз по участкам в выбранном периоде)
+const capUpper = ref<{ [areaId: number]: { overload_hours: number; hours_planned: number; hours_available: number; overloaded_buckets: number } }>({})
+ 
+async function loadCapacityUpper() {
+  try {
+    const resp = await getPlanningResultCapacity(runId, {
+      bucket_type: prod.filter.bucket_type,
+      date_from: emptyToUndef(prod.filter.date_from),
+      date_to: emptyToUndef(prod.filter.date_to),
+      limit: 100000,
+      offset: 0
+    })
+    const map: { [k: number]: { overload_hours: number; hours_planned: number; hours_available: number; overloaded_buckets: number } } = {}
+    for (const r of (resp.rows || [])) {
+      const aid = Number(r.area_id || 0)
+      if (!map[aid]) {
+        map[aid] = { overload_hours: 0, hours_planned: 0, hours_available: 0, overloaded_buckets: 0 }
+      }
+      map[aid].overload_hours += Number(r.overload_hours || 0)
+      map[aid].hours_planned += Number(r.hours_planned || 0)
+      map[aid].hours_available += Number(r.hours_available || 0)
+      if (Number(r.overload_hours || 0) > 0) {
+        map[aid].overloaded_buckets += 1
+      }
+    }
+    capUpper.value = map
+  } catch (e) {
+    console.error('Failed to load capacity for upper indicators', e)
+  }
+  // После обновления карты мощностей — пересобираем агрегаты, чтобы появились индикаторы перегруза
+  rebuildGroupedProductionOrders()
+}
+
+// Capacity для выбранного дня (daily)
+const dayCapUpper = ref<{ [areaId: number]: { overload_hours: number } }>({})
+
+async function loadCapacityUpperDay() {
+  try {
+    const day = (prod.filter.day_date || '').slice(0, 10)
+    if (!day) {
+      dayCapUpper.value = {}
+      return
+    }
+    const resp = await getPlanningResultCapacity(runId, {
+      bucket_type: 'daily',
+      date_from: day,
+      date_to: day,
+      limit: 100000,
+      offset: 0
+    })
+    const map: { [k: number]: { overload_hours: number } } = {}
+    for (const r of (resp.rows || [])) {
+      const aid = Number(r.area_id || 0)
+      if (!map[aid]) map[aid] = { overload_hours: 0 }
+      map[aid].overload_hours += Number(r.overload_hours || 0)
+    }
+    dayCapUpper.value = map
+  } catch (e) {
+    console.error('Failed to load capacity for selected day', e)
+  }
+}
+ 
+// Установить день как фильтр (bucket=daily) и перезагрузить данные
+function applyDayFilter() {
+  const day = (prod.filter.day_date || '').trim()
+  if (!day) return
+  prod.filter.bucket_type = 'daily'
+  prod.filter.date_from = day
+  prod.filter.date_to = day
+  // Перезагрузим данные сервера и пересчеты локальных агрегатов
+  loadProduction()
+  rebuildDailyAgendaForDay()
+  loadCapacityUpperDay()
+}
+
+// Открыть попап выбора даты
+function openDayPicker(e?: Event) {
+  try {
+    showDayPopup.value = true
+  } catch {}
+}
+
+// Обработка выбора даты в календаре
+function onDayPicked(val: string) {
+  try {
+    // val уже в маске YYYY-MM-DD
+    prod.filter.day_date = (val || '').slice(0, 10)
+    // Применяем фильтр на день
+    applyDayFilter()
+    // Закрываем попап/меню
+    showDayPopup.value = false
+    showDayMenu.value = false
+  } catch {
+    // no-op
   }
 }
 
@@ -797,7 +1391,42 @@ function emptyToUndef(s: string): string | undefined {
   return t.length ? t : undefined
 }
 
+// --- Helpers: date range filters for upper unified tables ---
+function dateInRange(dt: string | null | undefined, from?: string, to?: string): boolean {
+  if (!dt) return false
+  const d = String(dt).slice(0, 10) // YYYY-MM-DD
+  if (from && d < from) return false
+  if (to && d > to) return false
+  return true
+}
+
+function inProdRange(row: any): boolean {
+  const from = emptyToUndef(prod.filter.date_from)
+  const to = emptyToUndef(prod.filter.date_to)
+  // Валидация только по bucket_date, без повторной фильтрации по bucket_type (сервер уже отобрал)
+  const dt = (row?.bucket_date || null) as string | null
+  const okDate = (!from && !to) ? true : dateInRange(dt, from, to)
+  return okDate
+}
+
+function inPurchRange(row: any): boolean {
+  const from = emptyToUndef(purch.filter.date_from)
+  const to = emptyToUndef(purch.filter.date_to)
+  // Валидация только по дате
+  const dt = (row?.bucket_date || row?.order_date || row?.need_date || null) as string | null
+  const okDate = (!from && !to) ? true : dateInRange(dt, from, to)
+  return okDate
+}
+
 onMounted(async () => {
+  // День по умолчанию — сегодня (для повестки цеха на день)
+  try {
+    if (!prod.filter.day_date) {
+      const t = new Date()
+      const d = new Date(Date.UTC(t.getFullYear(), t.getMonth(), t.getDate()))
+      prod.filter.day_date = d.toISOString().slice(0, 10)
+    }
+  } catch {}
   await loadSummary()
   // Загружаем все данные параллельно
   await Promise.all([
@@ -809,6 +1438,8 @@ onMounted(async () => {
   await fillMissingDictionariesFromRows()
   // Теперь, когда все данные загружены, вызываем группировку
   rebuildGroupedProductionOrders()
+  rebuildDailyAgendaForDay()
+  await loadCapacityUpperDay()
   try {
     console.log('MRP onMounted', {
       grouped: (groupedProdRows as any)?.value?.length ?? (groupedProductionOrders as any)?.value?.length ?? 0,
@@ -825,14 +1456,70 @@ watch(tab, (t) => {
   if (t === 'pegging') loadPegging()
 })
 
+// Автозагрузка при переключении верхних вкладок
+watch(viewTab, (vt) => {
+  if (vt === 'production' && !prod.rows.length) loadProduction()
+  if (vt === 'purchases' && !purch.rows.length) loadPurchases()
+})
+
 // Наблюдаем за изменениями prod.rows, itemMap и areaMap для обновления groupedProductionOrders
 watch([() => prod.rows, () => itemMap.value, () => areaMap.value], () => {
   rebuildGroupedProductionOrders()
 }, { deep: true })
+
+// Пересчёт верхней группировки по изменениям полного набора, фильтров даты и типа бакета
+watch([() => prodAllRows.value, () => prod.filter.date_from, () => prod.filter.date_to, () => prod.filter.bucket_type, () => areaMap.value], () => {
+  rebuildGroupedProductionOrders()
+  // Также пересчитываем дневную повестку и перезагружаем мощность за день, если день выбран
+  rebuildDailyAgendaForDay()
+  loadCapacityUpperDay()
+})
+
+// Перестраиваем верхний агрегат при изменении карты мощностей (индикаторы перегруза)
+watch(() => capUpper.value, () => {
+  rebuildGroupedProductionOrders()
+})
+
+// Ежедневная повестка: пересчёт при изменении выбранного дня/полного набора + принудительный серверный фильтр на день
+watch([() => prodAllRows.value, () => prod.filter.day_date], () => {
+  const day = (prod.filter.day_date || '').slice(0, 10)
+  if (day) {
+    // Узкий серверный фильтр (bucket=daily) — предотвращает «сваливание» всего диапазона
+    prod.filter.bucket_type = 'daily'
+    prod.filter.date_from = day
+    prod.filter.date_to = day
+    loadProduction()
+  }
+  rebuildDailyAgendaForDay()
+  loadCapacityUpperDay()
+})
+
+// Перестраиваем верхний агрегат при изменении карты мощностей (индикаторы перегруза)
+watch(() => capUpper.value, () => {
+  rebuildGroupedProductionOrders()
+})
+
+// Актуализируем индикаторы перегруза при изменении фильтров верхней вкладки «Производство»
+watch([() => prod.filter.bucket_type, () => prod.filter.date_from, () => prod.filter.date_to], () => {
+  loadCapacityUpper()
+})
 </script>
 
 <style scoped>
 .text-h5 {
   font-weight: 600;
+}
+
+/* Компактные строки таблиц: ~в 2 раза меньше высоты */
+.compact-rows .q-td,
+.compact-rows .q-th {
+  padding: 4px 8px;   /* уменьшенные отступы по вертикали */
+  line-height: 1.1;
+  font-size: 12px;    /* компактный шрифт для плотности */
+}
+
+/* Чуть сжать содержимое ячеек с числами */
+.compact-rows .q-td.text-right {
+  padding-right: 8px;
 }
 </style>

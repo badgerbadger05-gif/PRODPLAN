@@ -123,7 +123,9 @@ export async function getPlanningResultProduction(runId: number, params: {
   date_to?: string
   limit?: number
   offset?: number
-} = {}): Promise<{ rows: any[]; total: number; limit: number; offset: number }> {
+  sort_by?: 'item_name' | 'item_article' | 'qty' | 'need_date' | 'bucket_date' | 'priority_index'
+  sort_dir?: 'asc' | 'desc'
+} = {}): Promise<{ rows: any[]; total: number; total_qty: number; limit: number; offset: number }> {
   const { data } = await api.get(`/v1/plan/results/${runId}/production`, { params })
   return data
 }
@@ -135,7 +137,9 @@ export async function getPlanningResultPurchases(runId: number, params: {
   date_to?: string
   limit?: number
   offset?: number
-} = {}): Promise<{ rows: any[]; total: number; limit: number; offset: number }> {
+  sort_by?: 'item_name' | 'item_article' | 'qty' | 'need_date' | 'order_date' | 'bucket_date' | 'priority_index'
+  sort_dir?: 'asc' | 'desc'
+} = {}): Promise<{ rows: any[]; total: number; total_qty: number; limit: number; offset: number }> {
   const { data } = await api.get(`/v1/plan/results/${runId}/purchases`, { params })
   return data
 }
@@ -220,4 +224,30 @@ export async function listResources(params: {
   const rows = (data?.rows ?? [])
   const total = (typeof data?.total === 'number') ? data.total : rows.length
   return { rows, total, limit: rows.length, offset: 0 }
+}
+
+/** Export production results as CSV or XLSX (base64) */
+export async function exportPlanningResultProduction(runId: number, params: {
+  format: 'csv' | 'xlsx'
+  bucket_type?: 'daily' | 'weekly'
+  date_from?: string
+  date_to?: string
+  sort_by?: 'item_name' | 'item_article' | 'qty' | 'need_date' | 'bucket_date' | 'priority_index'
+  sort_dir?: 'asc' | 'desc'
+}): Promise<any> {
+  const { data } = await api.get(`/v1/plan/results/${runId}/production/export`, { params })
+  return data
+}
+
+/** Export purchases results as CSV or XLSX (base64) */
+export async function exportPlanningResultPurchases(runId: number, params: {
+  format: 'csv' | 'xlsx'
+  bucket_type?: 'daily' | 'weekly'
+  date_from?: string
+  date_to?: string
+  sort_by?: 'item_name' | 'item_article' | 'qty' | 'need_date' | 'order_date' | 'bucket_date' | 'priority_index'
+  sort_dir?: 'asc' | 'desc'
+}): Promise<any> {
+  const { data } = await api.get(`/v1/plan/results/${runId}/purchases/export`, { params })
+  return data
 }

@@ -4,7 +4,7 @@ from datetime import datetime, date, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Set, DefaultDict
 
 from sqlalchemy.orm import Session
-from sqlalchemy import func, and_
+from sqlalchemy import func, and_, asc, desc
 from collections import defaultdict
 import json
 import re
@@ -19,6 +19,7 @@ from ..models import (
     CapacityLoad,
     PeggingLink,
     Item,
+    Unit,
     DefaultSpecification,
     SpecComponent,
     ProductionPlanEntry,
@@ -366,8 +367,54 @@ def get_run_production(
     date_to: Optional[str] = None,
     limit: int = 100,
     offset: int = 0,
+    sort_by: Optional[str] = None,
+    sort_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
-    q = db.query(PlannedOrder).filter(PlannedOrder.run_id == run_id)
+    """
+    Возвращает производственные заказы по прогону с денормализованными полями номенклатуры,
+    поддержкой сортировки и агрегатом total_qty. Также рассчитывает нормативы:
+      - norm_hours_total: сумма часов по PlannedOrderStage для заказа
+      - norm_hours_per_unit: norm_hours_total / qty (если qty > 0)
+    Колонки для сортировки: item_name | item_article | qty | need_date | bucket_date | priority_index
+    """
+    # Базовый запрос для total/total_qty
+    base_q = db.query(PlannedOrder).filter(PlannedOrder.run_id == run_id)
+    if item_id is not None:
+        base_q = base_q.filter(PlannedOrder.item_id == int(item_id))
+    if bucket_type in {"daily", "weekly"}:
+        base_q = base_q.filter(PlannedOrder.bucket_type == bucket_type)
+    if date_from:
+        base_q = base_q.filter(PlannedOrder.bucket_date >= _to_date(date_from))
+    if date_to:
+        base_q = base_q.filter(PlannedOrder.bucket_date <= _to_date(date_to))
+
+    total = base_q.count()
+    total_qty_q = db.query(func.coalesce(func.sum(PlannedOrder.qty), 0.0)).filter(PlannedOrder.run_id == run_id)
+    if item_id is not None:
+        total_qty_q = total_qty_q.filter(PlannedOrder.item_id == int(item_id))
+    if bucket_type in {"daily", "weekly"}:
+        total_qty_q = total_qty_q.filter(PlannedOrder.bucket_type == bucket_type)
+    if date_from:
+        total_qty_q = total_qty_q.filter(PlannedOrder.bucket_date >= _to_date(date_from))
+    if date_to:
+        total_qty_q = total_qty_q.filter(PlannedOrder.bucket_date <= _to_date(date_to))
+    total_qty_val = float(total_qty_q.scalar() or 0.0)
+
+    # Запрос с join к Item для денормализации и сортировки
+    q = (
+        db.query(
+            PlannedOrder,
+            Item.item_name,
+            Item.item_article,
+            Item.unit,
+            Unit.short_name,
+            Unit.unit_name,
+            Unit.unit_code,
+        )
+        .outerjoin(Item, PlannedOrder.item_id == Item.item_id)
+        .outerjoin(Unit, Item.unit == Unit.unit_ref1c)
+        .filter(PlannedOrder.run_id == run_id)
+    )
     if item_id is not None:
         q = q.filter(PlannedOrder.item_id == int(item_id))
     if bucket_type in {"daily", "weekly"}:
@@ -377,21 +424,36 @@ def get_run_production(
     if date_to:
         q = q.filter(PlannedOrder.bucket_date <= _to_date(date_to))
 
-    total = q.count()
-    rows: List[PlannedOrder] = (
-        q.order_by(PlannedOrder.bucket_date.asc(), PlannedOrder.order_id.asc())
-        .offset(max(0, int(offset)))
-        .limit(max(1, min(int(limit or 100), 1000)))
-        .all()
+    sort_map = {
+        "item_name": Item.item_name,
+        "item_article": Item.item_article,
+        "qty": PlannedOrder.qty,
+        "need_date": PlannedOrder.need_date,
+        "bucket_date": PlannedOrder.bucket_date,
+        "priority_index": PlannedOrder.priority_index,
+    }
+    sb = (sort_by or "bucket_date").strip().lower()
+    sd = (sort_dir or "asc").strip().lower()
+    col = sort_map.get(sb, PlannedOrder.bucket_date)
+    dir_fn = desc if sd == "desc" else asc
+    q = q.order_by(dir_fn(col), PlannedOrder.order_id.asc())
+
+    rows_joined = (
+        q.offset(max(0, int(offset)))
+         .limit(max(1, min(int(limit or 100), 1000)))
+         .all()
     )
 
-    # Stages for only selected orders
-    order_ids = [int(r.order_id) for r in rows]
+    # Stages только по выбранным заказам
+    order_ids = [int(row[0].order_id) for row in rows_joined]
     stages: List[PlannedOrderStage] = []
     if order_ids:
         stages = (
             db.query(PlannedOrderStage)
-            .filter(PlannedOrderStage.run_id == run_id, PlannedOrderStage.order_id.in_(order_ids))
+            .filter(
+                PlannedOrderStage.run_id == run_id,
+                PlannedOrderStage.order_id.in_(order_ids),
+            )
             .all()
         )
 
@@ -407,25 +469,44 @@ def get_run_production(
             }
         )
 
-    data = [
-        {
-            "order_id": int(o.order_id),
-            "item_id": int(o.item_id),
-            "qty": float(o.qty or 0.0),
-            "need_date": o.need_date.isoformat() if o.need_date else None,
-            "start_date": o.start_date.isoformat() if o.start_date else None,
-            "finish_date": o.finish_date.isoformat() if o.finish_date else None,
-            "route_ref": o.route_ref,
-            "priority_index": float(o.priority_index or 0.0) if o.priority_index is not None else None,
-            "bucket_type": o.bucket_type,
-            "bucket_date": o.bucket_date.isoformat() if o.bucket_date else None,
-            "demand_ref": o.demand_ref,
-            "demand_date": o.demand_date.isoformat() if o.demand_date else None,
-            "stages": stage_by_order.get(int(o.order_id), []),
-        }
-        for o in rows
-    ]
-    return {"rows": data, "total": int(total), "limit": int(limit), "offset": int(offset)}
+    data: List[Dict[str, Any]] = []
+    for row in rows_joined:
+        po, in_name, in_article, in_unit_guid, in_unit_short, in_unit_name, in_unit_code = row
+        st_list = stage_by_order.get(int(po.order_id), [])
+        norm_total = float(sum(float(x.get("hours") or 0.0) for x in st_list))
+        qty_val = float(po.qty or 0.0)
+        norm_per_unit = float(norm_total / qty_val) if qty_val > 1e-12 else None
+        display_unit = in_unit_short or in_unit_name or in_unit_code or in_unit_guid
+        data.append(
+            {
+                "order_id": int(po.order_id),
+                "item_id": int(po.item_id),
+                "item_name": in_name,
+                "item_article": in_article,
+                "unit": display_unit,
+                "qty": qty_val,
+                "need_date": po.need_date.isoformat() if po.need_date else None,
+                "start_date": po.start_date.isoformat() if po.start_date else None,
+                "finish_date": po.finish_date.isoformat() if po.finish_date else None,
+                "route_ref": po.route_ref,
+                "priority_index": float(po.priority_index or 0.0) if po.priority_index is not None else None,
+                "bucket_type": po.bucket_type,
+                "bucket_date": po.bucket_date.isoformat() if po.bucket_date else None,
+                "demand_ref": po.demand_ref,
+                "demand_date": po.demand_date.isoformat() if po.demand_date else None,
+                "stages": st_list,
+                "norm_hours_total": float(norm_total),
+                "norm_hours_per_unit": float(norm_per_unit) if norm_per_unit is not None else None,
+            }
+        )
+
+    return {
+        "rows": data,
+        "total": int(total),
+        "total_qty": float(total_qty_val),
+        "limit": int(limit),
+        "offset": int(offset),
+    }
 
 
 def get_run_purchases(
@@ -437,8 +518,52 @@ def get_run_purchases(
     date_to: Optional[str] = None,
     limit: int = 100,
     offset: int = 0,
+    sort_by: Optional[str] = None,
+    sort_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
-    q = db.query(PlannedPurchase).filter(PlannedPurchase.run_id == run_id)
+    """
+    Возвращает заявки на закупку по прогону с денормализованными полями номенклатуры,
+    поддержкой сортировки и агрегатом total_qty.
+    Колонки для сортировки: item_name | item_article | qty | need_date | order_date | bucket_date | priority_index
+    """
+    # Базовый запрос для total/total_qty
+    base_q = db.query(PlannedPurchase).filter(PlannedPurchase.run_id == run_id)
+    if item_id is not None:
+        base_q = base_q.filter(PlannedPurchase.item_id == int(item_id))
+    if bucket_type in {"daily", "weekly"}:
+        base_q = base_q.filter(PlannedPurchase.bucket_type == bucket_type)
+    if date_from:
+        base_q = base_q.filter(PlannedPurchase.bucket_date >= _to_date(date_from))
+    if date_to:
+        base_q = base_q.filter(PlannedPurchase.bucket_date <= _to_date(date_to))
+
+    total = base_q.count()
+    total_qty_q = db.query(func.coalesce(func.sum(PlannedPurchase.qty), 0.0)).filter(PlannedPurchase.run_id == run_id)
+    if item_id is not None:
+        total_qty_q = total_qty_q.filter(PlannedPurchase.item_id == int(item_id))
+    if bucket_type in {"daily", "weekly"}:
+        total_qty_q = total_qty_q.filter(PlannedPurchase.bucket_type == bucket_type)
+    if date_from:
+        total_qty_q = total_qty_q.filter(PlannedPurchase.bucket_date >= _to_date(date_from))
+    if date_to:
+        total_qty_q = total_qty_q.filter(PlannedPurchase.bucket_date <= _to_date(date_to))
+    total_qty_val = float(total_qty_q.scalar() or 0.0)
+
+    # Join к Item для денормализации и сортировки
+    q = (
+        db.query(
+            PlannedPurchase,
+            Item.item_name,
+            Item.item_article,
+            Item.unit,
+            Unit.short_name,
+            Unit.unit_name,
+            Unit.unit_code,
+        )
+        .outerjoin(Item, PlannedPurchase.item_id == Item.item_id)
+        .outerjoin(Unit, Item.unit == Unit.unit_ref1c)
+        .filter(PlannedPurchase.run_id == run_id)
+    )
     if item_id is not None:
         q = q.filter(PlannedPurchase.item_id == int(item_id))
     if bucket_type in {"daily", "weekly"}:
@@ -448,29 +573,56 @@ def get_run_purchases(
     if date_to:
         q = q.filter(PlannedPurchase.bucket_date <= _to_date(date_to))
 
-    total = q.count()
-    rows: List[PlannedPurchase] = (
-        q.order_by(PlannedPurchase.bucket_date.asc(), PlannedPurchase.purchase_id.asc())
-        .offset(max(0, int(offset)))
-        .limit(max(1, min(int(limit or 100), 1000)))
-        .all()
+    sort_map = {
+        "item_name": Item.item_name,
+        "item_article": Item.item_article,
+        "qty": PlannedPurchase.qty,
+        "need_date": PlannedPurchase.need_date,
+        "order_date": PlannedPurchase.order_date,
+        "bucket_date": PlannedPurchase.bucket_date,
+        "priority_index": PlannedPurchase.priority_index,
+    }
+    sb = (sort_by or "bucket_date").strip().lower()
+    sd = (sort_dir or "asc").strip().lower()
+    col = sort_map.get(sb, PlannedPurchase.bucket_date)
+    dir_fn = desc if sd == "desc" else asc
+    q = q.order_by(dir_fn(col), PlannedPurchase.purchase_id.asc())
+
+    rows_joined = (
+        q.offset(max(0, int(offset)))
+         .limit(max(1, min(int(limit or 100), 1000)))
+         .all()
     )
-    data = [
-        {
-            "purchase_id": int(r.purchase_id),
-            "item_id": int(r.item_id),
-            "qty": float(r.qty or 0.0),
-            "need_date": r.need_date.isoformat() if r.need_date else None,
-            "order_date": r.order_date.isoformat() if r.order_date else None,
-            "lead_time_days": int(r.lead_time_days),
-            "priority_index": float(r.priority_index or 0.0) if r.priority_index is not None else None,
-            "bucket_type": r.bucket_type,
-            "bucket_date": r.bucket_date.isoformat() if r.bucket_date else None,
-            "supplier_ref1c": r.supplier_ref1c,
-        }
-        for r in rows
-    ]
-    return {"rows": data, "total": int(total), "limit": int(limit), "offset": int(offset)}
+
+    data: List[Dict[str, Any]] = []
+    for row in rows_joined:
+        r, in_name, in_article, in_unit_guid, in_unit_short, in_unit_name, in_unit_code = row
+        display_unit = in_unit_short or in_unit_name or in_unit_code or in_unit_guid
+        data.append(
+            {
+                "purchase_id": int(r.purchase_id),
+                "item_id": int(r.item_id),
+                "item_name": in_name,
+                "item_article": in_article,
+                "unit": display_unit,
+                "qty": float(r.qty or 0.0),
+                "need_date": r.need_date.isoformat() if r.need_date else None,
+                "order_date": r.order_date.isoformat() if r.order_date else None,
+                "lead_time_days": int(r.lead_time_days),
+                "priority_index": float(r.priority_index or 0.0) if r.priority_index is not None else None,
+                "bucket_type": r.bucket_type,
+                "bucket_date": r.bucket_date.isoformat() if r.bucket_date else None,
+                "supplier_ref1c": r.supplier_ref1c,
+            }
+        )
+
+    return {
+        "rows": data,
+        "total": int(total),
+        "total_qty": float(total_qty_val),
+        "limit": int(limit),
+        "offset": int(offset),
+    }
 
 
 def get_run_capacity(

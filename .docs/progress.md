@@ -1326,3 +1326,218 @@ API:
 - Режим dry-run даёт безопасный отчёт без удаления.
 
 Ответственный: Kilo Code
+
+### 2025-09-30 — MRP: разделение результатов на 2 вкладки, денормализация API, форматы и экспорт
+
+Краткое описание:
+- Реализовано разделение результатов прогона MRP на две вкладки «Заказы на производство» и «Заказы на закупку» на странице результатов прогона.
+- Приведён единый набор колонок и порядок: Наименование, Артикул, Количество — в обеих вкладках.
+- Формат количества унифицирован «1 234,567» (3 знака), с отображением ЕИ при наличии.
+- Устранён вывод суррогатных ID за счёт денормализации на backend; добавлены поля item_name и item_article (и unit).
+- Для производства добавлены нормативы: norm_hours_total (сумма часов по стадиям заказа) и norm_hours_per_unit.
+- Добавлены экспортные эндпоинты CSV/XLSX для обеих вкладок.
+- Добавлена сортировка по item_name|item_article|qty|… на backend, применяемая на фронтенде.
+- В групповых заголовках по участкам отображаются: «Заказов: N» и «Норматив всего: X ч».
+
+Затронутые файлы (backend):
+- Денормализация и сортировки результатов:
+  - [python.get_run_production()](backend/app/services/planning_service.py:360)
+  - [python.get_run_purchases()](backend/app/services/planning_service.py:505)
+- Экспорт результатов (CSV/XLSX, base64 для XLSX):
+  - [python.export_planning_result_production (router)](backend/app/routers/plan.py:526)
+  - [python.export_planning_result_purchases (router)](backend/app/routers/plan.py:615)
+- Добавлены параметры sort_by/sort_dir в роутеры результатов:
+  - [python.get_planning_result_production (router)](backend/app/routers/plan.py:400)
+  - [python.get_planning_result_purchases (router)](backend/app/routers/plan.py:431)
+- Подтянут openpyxl для генерации XLSX:
+  - [requirements.txt](backend/requirements.txt:8)
+
+Затронутые файлы (frontend):
+- Страница результатов прогона: верхние вкладки, единый формат и экспорт:
+  - [vue.MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:82)
+  - Формат количества (3 знака, ru-RU): [ts.fmt()](frontend/src/pages/MRPResultPage.vue:702)
+  - Отрисовка «Производство»: группировка по участкам, заголовок группы с «Заказов: N, Норматив всего: … ч»:
+    - [vue.rebuildGroupedProductionOrders()](frontend/src/pages/MRPResultPage.vue:515)
+    - Единые колонки prodUnifiedColumns: [vue](frontend/src/pages/MRPResultPage.vue:466)
+  - Отрисовка «Закупки»: единые колонки purchUnifiedColumns: [vue](frontend/src/pages/MRPResultPage.vue:473)
+  - Экспорт CSV/XLSX (кнопки на панелях вкладок): [ts.exportProd()](frontend/src/pages/MRPResultPage.vue:829), [ts.exportPurch()](frontend/src/pages/MRPResultPage.vue:849)
+- Клиентские вызовы API (включая экспорт и сортировки):
+  - [ts.getPlanningResultProduction](frontend/src/services/api.ts:119)
+  - [ts.getPlanningResultPurchases](frontend/src/services/api.ts:133)
+  - [ts.exportPlanningResultProduction](frontend/src/services/api.ts:229)
+  - [ts.exportPlanningResultPurchases](frontend/src/services/api.ts:242)
+
+Что важно по данным и UX:
+- Никаких ID вместо пользовательских полей: backend отдаёт item_name, item_article и unit в результатах, фронтенд рендерит их напрямую.
+- Сортировка и фильтры применяются на сервере с учётом видимых колонок (item_name, item_article, qty и т.д.).
+- Пагинация: total и total_qty возвращаются сервером для полного набора, что обеспечивает корректные итоги вне зависимости от страницы.
+- Нормативы (производство): 
+  - norm_hours_total — сумма часов по PlannedOrderStage заказов [python.get_run_production()](backend/app/services/planning_service.py:467)
+  - norm_hours_per_unit — нормо‑часы на штуку (деление на qty)
+  - В группе участка в заголовке отображается суммарный норматив по всем заказам группы.
+
+Как проверить (acceptance):
+1) Пересборка и запуск (Windows):
+   - Запустить скрипт пересборки: rebuild.bat (по умолчанию без кеша, с pull)
+   - Backend: http://localhost:8000, Frontend: http://localhost:9000
+2) Открыть «MRP планирование — прогоны» → открыть результат (иконка «глаз») RUN.
+3) На странице результатов:
+   - Две верхние вкладки: «Заказы на производство», «Заказы на закупку».
+   - Заголовок/подзаголовок показывают «Результаты MRP от {started_at}».
+   - В обеих вкладках таблицы имеют колонки: Наименование, Артикул, Количество (в этом порядке).
+   - Количество формат «1 234,567»; при наличии unit — «1 234,567 {ЕИ}».
+   - Нет вывода ID вместо наименований/артикулов — проверить пагинацию, сортировку, фильтры.
+   - Для «Производства»: в заголовке каждой группы (участок) показано «Заказов: N · Норматив всего: X,XXX ч». Внутри строк использованы денормализованные поля и qty с ЕИ.
+4) Экспорт:
+   - В панели вкладки нажать «CSV»/«XLSX».
+   - Для производства выгружаются колонки: Наименование, Артикул, Количество, ЕИ, Норматив, ч/шт, Норматив всего, ч.
+   - Для закупок: Наименование, Артикул, Количество, ЕИ.
+   - Backend эндпоинты:
+     - GET /api/v1/plan/results/{run_id}/production/export?format=csv|xlsx
+     - GET /api/v1/plan/results/{run_id}/purchases/export?format=csv|xlsx
+5) Ошибки/состояния:
+   - Проверить отображение загрузки, пустых результатов и понятных сообщений об ошибках на русском.
+
+Замечания по производительности:
+- Денормализация выполнена через outer join к Item на уровне сервисов результатов; дополнительно агрегаты total_qty вычисляются отдельным запросом по тем же фильтрам.
+- Для норм часов по производству суммируются часы из PlannedOrderStage только по отрисовываемым (пагинированным) заказам; суммарный норматив группы на UI суммирует норм_hours_total в пределах текущего набора строк.
+
+Риски и дальнейшие улучшения:
+- При очень больших RUN (десятки тысяч строк) возможны длительные выгрузки XLSX. Возможные доработки: фоновые задачи и ссылочная выдача файлов.
+- По мере появления единиц измерения в карточках номенклатуры — уточнить отображение ЕИ (краткие имена/ISO).
+- При необходимости расширить сортировку на уровне БД по локализованным коллаторам (ru_RU) для item_name.
+
+Инструкции эксплуатации:
+- Пересборка контейнеров: rebuild.bat (опции: --use-cache / --no-cache / --pull)
+- Проверка серверов:
+  - Backend: http://localhost:8000/docs
+  - Frontend: http://localhost:9000
+
+Статус: изменения развернуты в контейнерах; UI и экспорт доступны.
+Ответственный: Kilo Code
+
+### 2025-09-30 — Fix: MRP результаты — человекочитаемая единица измерения (ЕИ) вместо GUID
+
+- Симптом:
+  - На странице результатов прогона рядом с количеством отображался GUID из 1С (например: «17,000 aae0017c-…») вместо человекочитаемой ЕИ.
+- Диагноз:
+  - Выдачи API для результатов MRP возвращали поле unit напрямую из Items.unit (GUID из 1С), без разрешения через справочник единиц.
+- Изменения (backend):
+  - Денормализация ЕИ в сервисах результатов:
+    - В [python.get_run_production()](backend/app/services/planning_service.py:360) и [python.get_run_purchases()](backend/app/services/planning_service.py:505) добавлен LEFT OUTER JOIN к справочнику единиц (Unit) по ключу Item.unit = Unit.unit_ref1c.
+    - Возвращаемое поле unit теперь вычисляется по приоритету: Unit.short_name → Unit.unit_name → Unit.unit_code → fallback на исходный GUID (Items.unit), если запись отсутствует в справочнике.
+  - Технические правки:
+    - Добавлен импорт модели Unit в [backend/app/services/planning_service.py](backend/app/services/planning_service.py).
+    - Расширены выборки в запросах (select) и скорректирована распаковка кортежей результатов.
+- Совместимость и влияние:
+  - Экспортные эндпоинты используют те же сервисы результатов, поэтому автоматически начали выдавать человекочитаемую ЕИ:
+    - [python.export_planning_result_production()](backend/app/routers/plan.py:526)
+    - [python.export_planning_result_purchases()](backend/app/routers/plan.py:615)
+  - Фронтенд изменений не требует: форматирование количества уже учитывает ЕИ (вызовы fmtQty(..., unit) в [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue)).
+- Как проверить:
+  1) Открыть страницу результатов прогона MRP и убедиться, что в колонке «Количество» после числа выводится краткое обозначение ЕИ (например, «шт», «м», «кг»), а не GUID.
+  2) Выполнить экспорт CSV/XLSX на обеих вкладках и проверить колонку «ЕИ» — должны быть человекочитаемые обозначения.
+- Операции:
+  - Перезапустить backend (или пересобрать контейнер бэкенда) для применения изменений.
+
+Ответственный: Kilo Code
+
+### 2025-09-30 — MRPResultPage: радикальная переработка верхних таблиц (корректные бакеты и фильтры) + индикаторы срочности/перегруза
+
+Контекст проблемы
+- Верхняя агрегирующая таблица «Производство» строилась на базе детальных стадий, где стадии всегда daily. При выборе bucket_type=weekly фильтрация по стадиям «обнуляла» норматив, т.к. weekly-стадий нет.
+- Дублировались клиентские фильтры по bucket_type/date поверх серверных, что приводило к рассинхрону и неверным отборам.
+
+Что сделано (frontend)
+- Перестроена логика группировки «Производства» по участкам:
+  - Функция [typescript.rebuildGroupedProductionOrders()](frontend/src/pages/MRPResultPage.vue:575) теперь:
+    - Полагается на серверные фильтры bucket_type/date; на клиенте выполняется лишь валидация диапазона по order.bucket_date.
+    - Определяет «участок» заказа как area_id стадии с максимальными часами (доминирующая стадия по hours) без доп. фильтрации стадий по бакетам/датам.
+    - Суммирует норматив по заказу из ответа бэкенда: order.norm_hours_total (без повторной фильтрации стадий), рассчитывает норму на штуку группы как Σ(norm_hours_total)/Σ(qty).
+  - Удалён stage-level фильтр по bucket_type/date внутри агрегирования (по стадиям больше не отбираем weekly — это делается на уровне заказа и сервером).
+- Корректное применение фильтров дат/бакетов в верхних таблицах:
+  - Production: [typescript.inProdRange()](frontend/src/pages/MRPResultPage.vue:1162) — оставлена только проверка диапазона по bucket_date (сервер уже отфильтровал по bucket_type).
+  - Purchases: [typescript.inPurchRange()](frontend/src/pages/MRPResultPage.vue:1171) — оставлена только проверка диапазона по дате (bucket_date/order_date/need_date), без повторной проверки bucket_type.
+- Индикаторы срочности и перегруза мощностей в заголовке группы участка:
+  - Срочность: минимальные дни до потребности в группе (min_days_to_need), вычисляется в [typescript.rebuildGroupedProductionOrders()](frontend/src/pages/MRPResultPage.vue:646) и показывается бейджем в шапке группы [vue.template](frontend/src/pages/MRPResultPage.vue:130).
+  - Перегруз мощностей: собрана aggregated-карта по участкам за период текущих фильтров:
+    - Объявление карты [typescript.capUpper](frontend/src/pages/MRPResultPage.vue:1041)
+    - Функция загрузки [typescript.loadCapacityUpper()](frontend/src/pages/MRPResultPage.vue:1043)
+    - Вызов после загрузки production [typescript.loadProduction()](frontend/src/pages/MRPResultPage.vue:903)
+    - Отображение бейджа «Перегруз: X ч» в заголовке группы [vue.template](frontend/src/pages/MRPResultPage.vue:133)
+  - Watchers:
+    - Пересборка групп при изменении карты мощностей: [typescript.watch(capUpper)](frontend/src/pages/MRPResultPage.vue:1219)
+    - Перезагрузка aggregated-мощностей при изменении фильтров верхней вкладки «Производство»: [typescript.watch(prod.filter.…)](frontend/src/pages/MRPResultPage.vue:1219)
+- Поведение вкладки «Закупки»: агрегирование по (item_id, unit) сохранено на клиенте [typescript.purchAggRows](frontend/src/pages/MRPResultPage.vue:552) с корректной валидирующей фильтрацией по датам [typescript.inPurchRange()](frontend/src/pages/MRPResultPage.vue:1171).
+
+Архитектурная трактовка
+- Участок (area) в верхней таблице — это измерение группировки нагрузки, а не директива «когда и что делать». «Когда» определяется датой потребности/бакетом заказа на бэкенде: заказы приходят уже в правильных бакетах (daily/weekly) [python.run_planning_run()](backend/app/services/planning_service.py:1326), а фильтрация по датам/бакетам выполняется сервером [python.get_run_production()](backend/app/services/planning_service.py:361).
+- Нормативы в агрегате — «вес» нагрузки по участкам. Время/срочность сохраняются по заказам, а в агрегате добавлены индикаторы срочности (минимальное days_to_need по группе) и перегруза (capacity).
+
+Поведение после изменений
+- Переключатель bucket_type (daily/weekly) немедленно меняет набор строк на уровне заказов (без «обнуления» норматива на weekly).
+- Диапазон дат влияет на отбор по bucket_date; дублирующей клиентской фильтрации бакетов нет.
+- Группировка по участкам стабильна (доминирующая стадия по часам). В заголовке группы видны «Заказов: N», «Норматив всего: X ч», «Срочн.: Y д», «Перегруз: Z ч».
+
+Приёмочные тесты
+1) Production: bucket=daily, date_from=today, date_to=today+7 → верхняя таблица показывает суммы norm_hours_total и qty, совпадающие с детальными заказами; индикаторы перегруза соответствуют данным /capacity за период.
+2) Production: bucket=weekly, тот же период (по пятницам) → верхняя таблица корректно показывает суммарный норматив и срочность (не 0), перегруз — агрегированный за период.
+3) Purchases: фильтры по датам применяются корректно; суммы qty в агрегате по item_id+unit совпадают с суммой детальных строк.
+4) Пустые выборки (нет данных) → без ошибок, отображается пустой набор.
+
+Точки изменений (ссылки)
+- Агрегация «Производство» по участкам: [typescript.rebuildGroupedProductionOrders()](frontend/src/pages/MRPResultPage.vue:575)
+- Индикаторы в шапке группы: [vue.template группы](frontend/src/pages/MRPResultPage.vue:125)
+- Индикаторы мощностей: [typescript.capUpper](frontend/src/pages/MRPResultPage.vue:1041), [typescript.loadCapacityUpper()](frontend/src/pages/MRPResultPage.vue:1043), вызов в [typescript.loadProduction()](frontend/src/pages/MRPResultPage.vue:903), watchers [typescript.watch](frontend/src/pages/MRPResultPage.vue:1219)
+- Валидирующие фильтры верхних таблиц: [typescript.inProdRange()](frontend/src/pages/MRPResultPage.vue:1162), [typescript.inPurchRange()](frontend/src/pages/MRPResultPage.vue:1171)
+
+Наметка следующего шага (по производительности, опционально)
+- Добавить серверные агрегирующие выдачи:
+  - /api/v1/plan/results/{run}/production/aggregate?by=area_item
+  - /api/v1/plan/results/{run}/purchases/aggregate?by=item_unit
+  Это снимет необходимость full-fetch 100k строк на FE и ускорит верхние таблицы при больших RUN.
+
+Статус: внедрено в [vue.MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:82). Экспорт/бэкенд-выдачи не менялись.
+Ответственный: Kilo Code
+
+2025-09-30
+MRPResultPage: кардинальная переработка логики верхнего уровня и добавление режима «Задание на день»
+
+Сделано:
+- Исправлена логика бакетов и дат:
+  - Верхняя таблица агрегируется по заказам (bucket_type/date отбираются на сервере), стадии не применяются как фильтр, используются только для привязки к участку.
+  - Группировка по участкам: выбирается «доминирующая» стадия по максимальным часам, без дополнительных фильтров.
+  - Источники:
+    - Рефактор группировки: [typescript.rebuildGroupedProductionOrders()](frontend/src/pages/MRPResultPage.vue:735)
+    - Фильтр по датам (клиент): [typescript.inProdRange()](frontend/src/pages/MRPResultPage.vue:1388)
+- Добавлен режим «Задание на день» (ежедневная повестка по участкам):
+  - Поле «День задания (YYYY-MM-DD)» + всплывающий календарь.
+  - Принудительный серверный фильтр bucket=daily с date_from=date_to=выбранный день.
+  - Строится повестка «на день» в разрезе участков по стадиям конкретного дня (сумма часов = Норматив (за день)).
+  - Выпуск за день (шт) рассчитывается как часы дня / норма на шт (если известна).
+  - Источники:
+    - Шаблон с календарем: [vue](frontend/src/pages/MRPResultPage.vue:99)
+    - Построение повестки: [typescript.rebuildDailyAgendaForDay()](frontend/src/pages/MRPResultPage.vue:641)
+    - Применение фильтра на день: [typescript.applyDayFilter()](frontend/src/pages/MRPResultPage.vue:1266)
+    - Открытие/обработка календаря: [typescript.openDayPicker()](frontend/src/pages/MRPResultPage.vue:1278), [typescript.onDayPicked()](frontend/src/pages/MRPResultPage.vue:1286)
+- Индикаторы перегруза (capacity):
+  - Для верхней агрегированной таблицы и для «Задания на день».
+  - Источники:
+    - Сводная карта мощностей (период): [typescript.loadCapacityUpper()](frontend/src/pages/MRPResultPage.vue:1206)
+    - За конкретный день: [typescript.loadCapacityUpperDay()](frontend/src/pages/MRPResultPage.vue:1239)
+- Итоги по участку в «Задании на день»:
+  - Позиции (за день), Норматив (ч/день), Выпуск (шт/день): [vue](frontend/src/pages/MRPResultPage.vue:136)
+
+Замечания по реализации:
+- В верхней таблице «Производство» теперь:
+  - Сумма norm_hours_total берется из бэкенда по заказам (без обнуления при weekly).
+  - Группа участка определяется доминирующей стадией по часам.
+- «Задание на день» использует только дневные срезы стадий выбранного дня, без «сваливания» диапазона.
+
+План/Next:
+- Опционально добавить фильтр «Участок» рядом с датой (по запросу).
+- После подтверждения UX — оформить подсказки и мини-хелп по режимам (daily/weekly и «Задание на день»).
+
+Тест-кейсы:
+- Выбор дня через календарь → обновляется повестка на день и индикатор перегруза: [vue](frontend/src/pages/MRPResultPage.vue:99), [typescript.onDayPicked()](frontend/src/pages/MRPResultPage.vue:1286)
+- Переключение bucket=weekly и даты в верхней таблице корректно влияет на набор заказов: [typescript.loadProduction()](frontend/src/pages/MRPResultPage.vue:1033)

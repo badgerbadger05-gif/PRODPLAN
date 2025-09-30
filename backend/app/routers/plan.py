@@ -35,6 +35,7 @@ from ..services.planning_service import (
     activate_planning_config_version,
     get_active_planning_config_full,
 )
+from ..models import ProductionResource
 
 router = APIRouter(prefix="/v1/plan", tags=["plan"])
 
@@ -406,6 +407,8 @@ async def get_planning_result_production(
     date_to: Optional[str] = None,
     limit: int = 100,
     offset: int = 0,
+    sort_by: Optional[str] = None,
+    sort_dir: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
     """Производственные заказы и этапы по прогону (с фильтрами и пагинацией)"""
@@ -419,6 +422,8 @@ async def get_planning_result_production(
             date_to=date_to,
             limit=limit,
             offset=offset,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -433,6 +438,8 @@ async def get_planning_result_purchases(
     date_to: Optional[str] = None,
     limit: int = 100,
     offset: int = 0,
+    sort_by: Optional[str] = None,
+    sort_dir: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
     """Заявки на закупку по прогону (с фильтрами и пагинацией)"""
@@ -446,6 +453,8 @@ async def get_planning_result_purchases(
             date_to=date_to,
             limit=limit,
             offset=offset,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -510,6 +519,248 @@ async def get_stages(db: Session = Depends(get_db)):
     """Получить список этапов производства"""
     try:
         return fetch_stages(db)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# === Export endpoints for results ===
+
+@router.get("/results/{run_id}/production/export")
+async def export_planning_result_production(
+    run_id: int,
+    format: str = "csv",
+    bucket_type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    sort_by: Optional[str] = None,
+    sort_dir: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Экспорт результатов «Производство» в CSV или XLSX (base64).
+    Колонки: Наименование, Артикул, Количество, ЕИ, Норматив, ч/шт, Норматив всего, ч
+    """
+    try:
+        # Получаем все строки (разумный верхний предел)
+        res = get_run_production(
+            db=db,
+            run_id=int(run_id),
+            item_id=None,
+            bucket_type=bucket_type,
+            date_from=date_from,
+            date_to=date_to,
+            limit=100000,
+            offset=0,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+        )
+        rows = res.get("rows", []) or []
+
+        # Карта названий участков (ресурсов) для разбивки по «цехам/участкам»
+        try:
+            resources = db.query(ProductionResource).all()
+            area_name_map = {int(x.resource_id): str(x.resource_name or "") for x in resources}
+        except Exception:
+            area_name_map = {}
+
+        def _dominant_area_name(stages_list):
+            dom = None
+            for s in (stages_list or []):
+                try:
+                    if dom is None or float(s.get("hours") or 0.0) > float(dom.get("hours") or 0.0):
+                        dom = s
+                except Exception:
+                    continue
+            if dom is None:
+                return ""
+            aid = None
+            try:
+                aid = int(dom.get("area_id"))
+            except Exception:
+                aid = None
+            if aid is None:
+                return ""
+            return area_name_map.get(aid, f"Участок #{aid}")
+
+        # Базовые колонки данных (как в исходной таблице)
+        headers = ["Наименование", "Артикул", "Количество", "ЕИ", "Норматив, ч/шт", "Норматив всего, ч"]
+
+        # Группировка по «доминирующему» участку как в UI (подзаголовки)
+        groups: Dict[str, list] = {}
+        for r in rows:
+            area_name = _dominant_area_name(r.get("stages"))
+            key = area_name or "—"
+            groups.setdefault(key, []).append(r)
+
+        grouped_keys = sorted(groups.keys(), key=lambda x: (x == "—", x))
+        # Количество строк данных (без учёта подзаголовков)
+        total_records = sum(len(groups.get(k, [])) for k in grouped_keys)
+
+        if (format or "csv").lower() == "xlsx":
+            # Генерируем XLSX в памяти и отдаем base64
+            import io, base64
+            try:
+                from openpyxl import Workbook
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"openpyxl not available: {e}")
+            from openpyxl.styles import Font, PatternFill
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Production"
+            # Строка с колонками
+            ws.append(headers)
+            # Печать групп с подзаголовками
+            for area_name in grouped_keys:
+                items = groups.get(area_name, [])
+                # Подзаголовок группы
+                total_norm = sum(float(x.get("norm_hours_total") or 0.0) for x in items)
+                title = f"Производственный участок: {area_name} · Заказов: {len(items)} · Норматив всего: {total_norm:.3f} ч"
+                ws.append([title])
+                # Объединение ячеек на ширину таблицы
+                r = ws.max_row
+                ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=len(headers))
+                # Стили подзаголовка
+                cell = ws.cell(row=r, column=1)
+                cell.font = Font(bold=True)
+                cell.fill = PatternFill("solid", fgColor="FFDDDDDD")
+                # Строки данных группы
+                for x in items:
+                    ws.append([
+                        x.get("item_name") or "",
+                        x.get("item_article") or "",
+                        float(x.get("qty") or 0.0),
+                        x.get("unit") or "",
+                        float(x.get("norm_hours_per_unit") or 0.0) if x.get("norm_hours_per_unit") is not None else 0.0,
+                        float(x.get("norm_hours_total") or 0.0),
+                    ])
+                # Пустая строка между группами
+                ws.append([])
+            bio = io.BytesIO()
+            wb.save(bio)
+            bio.seek(0)
+            b64 = base64.b64encode(bio.read()).decode("utf-8")
+            return {
+                "status": "ok",
+                "format": "xlsx",
+                "data_base64": b64,
+                "filename": f"mrp_production_run_{run_id}.xlsx",
+                "total_rows": int(total_records),
+            }
+        else:
+            # CSV
+            import io, csv
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(headers)
+            for area_name in grouped_keys:
+                items = groups.get(area_name, [])
+                total_norm = sum(float(x.get("norm_hours_total") or 0.0) for x in items)
+                group_title = f"Производственный участок: {area_name} · Заказов: {len(items)} · Норматив всего: {total_norm:.3f} ч"
+                # Подзаголовок группы (растягиваем на ширину таблицы пробелами)
+                writer.writerow([group_title] + [""] * (len(headers) - 1))
+                # Строки данных группы
+                for x in items:
+                    writer.writerow([
+                        x.get("item_name") or "",
+                        x.get("item_article") or "",
+                        float(x.get("qty") or 0.0),
+                        x.get("unit") or "",
+                        float(x.get("norm_hours_per_unit") or 0.0) if x.get("norm_hours_per_unit") is not None else 0.0,
+                        float(x.get("norm_hours_total") or 0.0),
+                    ])
+                # Пустая строка между группами
+                writer.writerow([])
+            return {
+                "status": "ok",
+                "format": "csv",
+                "data": output.getvalue(),
+                "filename": f"mrp_production_run_{run_id}.csv",
+                "total_rows": int(total_records),
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/results/{run_id}/purchases/export")
+async def export_planning_result_purchases(
+    run_id: int,
+    format: str = "csv",
+    bucket_type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    sort_by: Optional[str] = None,
+    sort_dir: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Экспорт результатов «Закупки» в CSV или XLSX (base64).
+    Колонки: Наименование, Артикул, Количество, ЕИ
+    """
+    try:
+        res = get_run_purchases(
+            db=db,
+            run_id=int(run_id),
+            item_id=None,
+            bucket_type=bucket_type,
+            date_from=date_from,
+            date_to=date_to,
+            limit=100000,
+            offset=0,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+        )
+        rows = res.get("rows", []) or []
+
+        headers = ["Наименование", "Артикул", "Количество", "ЕИ"]
+        data_rows = []
+        for r in rows:
+            data_rows.append([
+                r.get("item_name") or "",
+                r.get("item_article") or "",
+                float(r.get("qty") or 0.0),
+                r.get("unit") or "",
+            ])
+
+        if (format or "csv").lower() == "xlsx":
+            import io, base64
+            try:
+                from openpyxl import Workbook
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"openpyxl not available: {e}")
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Purchases"
+            ws.append(headers)
+            for row in data_rows:
+                ws.append(row)
+            bio = io.BytesIO()
+            wb.save(bio)
+            bio.seek(0)
+            b64 = base64.b64encode(bio.read()).decode("utf-8")
+            return {
+                "status": "ok",
+                "format": "xlsx",
+                "data_base64": b64,
+                "filename": f"mrp_purchases_run_{run_id}.xlsx",
+                "total_rows": len(data_rows),
+            }
+        else:
+            import io, csv
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(headers)
+            for row in data_rows:
+                writer.writerow(row)
+            return {
+                "status": "ok",
+                "format": "csv",
+                "data": output.getvalue(),
+                "filename": f"mrp_purchases_run_{run_id}.csv",
+                "total_rows": len(data_rows),
+            }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
