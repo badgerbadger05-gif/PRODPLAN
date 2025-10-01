@@ -22,9 +22,8 @@
 
 
             <!-- Таблица плана -->
-            <div class="h-scroll">
-              <div class="h-scroll-inner">
-                <q-table
+            <div class="table-scroll">
+              <q-table
                   :rows="rowData"
                   :columns="columns"
                   :pagination="pagination"
@@ -47,7 +46,7 @@
               <!-- Кастомные слоты для редактируемых ячеек -->
               <template v-slot:body-cell="props">
                 <q-td :props="props">
-                  <div v-if="props.col.name === 'actions'">
+                  <div v-if="props?.col?.name === 'actions'">
                     <q-btn
                       flat
                       round
@@ -68,8 +67,13 @@
                       @click="onDeleteRow(props.row)"
                     />
                   </div>
-                  <div v-else-if="props.col.name.startsWith('day_')">
-                    <div class="text-center">{{ props.row[props.col.name] || 0 }}</div>
+                  <div v-else-if="props?.col?.name === 'rownum'">
+                    <div class="text-right">
+                      {{ computeRowNum(props) }}
+                    </div>
+                  </div>
+                  <div v-else-if="props?.col?.name?.startsWith('day_')">
+                    <div class="text-center">{{ props.row[props.col?.name] || 0 }}</div>
                   </div>
                   <div v-else>
                     {{ props.value }}
@@ -78,8 +82,7 @@
               </template>
 
            </q-table>
-              </div>
-            </div>
+           </div>
 
            <!-- Нижняя панель с инлайн-подсказками -->
            <div class="row items-center gap-2 w-full q-pa-md bg-grey-1">
@@ -246,7 +249,22 @@ const pagination = reactive({
   rowsNumber: 0
 })
 
-// Утилита фокуса поля поиска
+
+// Безопасный расчёт глобального номера строки с учётом пагинации и вариативности индексов слота
+function computeRowNum(slotProps: any): number {
+  try {
+    const idxFromSlot = (slotProps?.rowIndex ?? slotProps?.pageIndex)
+    let localIndex = (typeof idxFromSlot === 'number') ? idxFromSlot : rowData.value.indexOf(slotProps?.row)
+    if (localIndex == null || localIndex < 0) localIndex = 0
+    const rppFallback = (pagination?.rowsNumber || rowData.value.length || 1)
+    const rpp = (pagination?.rowsPerPage && pagination.rowsPerPage > 0) ? pagination.rowsPerPage : rppFallback
+    const page = Number(pagination?.page || 1)
+    return (page - 1) * rpp + Number(localIndex) + 1
+  } catch {
+    return 1
+  }
+}
+
 function focusSearchInput() {
   nextTick(() => {
     try {
@@ -279,6 +297,15 @@ const columns = computed(() => {
       sortable: false,
       classes: 'col-actions sticky-actions',
       headerClasses: 'col-actions sticky-actions'
+    },
+    {
+      name: 'rownum',
+      label: '#',
+      align: 'right' as const,
+      field: 'rownum',
+      sortable: false,
+      classes: 'col-rownum sticky-rownum',
+      headerClasses: 'col-rownum sticky-rownum'
     },
     {
       name: 'item_name',
@@ -608,33 +635,43 @@ onMounted(() => {
   --ag-row-hover-color: #e3f2fd;
 }
 
-/* Sticky first columns for QTable */
+/* Левые фиксированные колонки */
 .production-plan-table :deep(th.col-actions),
 .production-plan-table :deep(td.col-actions) {
-  /* расширили под две круглые кнопки (дерево + удаление), чтобы не перекрывать соседнюю колонку */
   width: 88px;
   min-width: 88px;
   max-width: 88px;
 }
-
+.production-plan-table :deep(th.col-rownum),
+.production-plan-table :deep(td.col-rownum) {
+  width: 48px;
+  min-width: 48px;
+  max-width: 48px;
+}
 .production-plan-table :deep(th.sticky-actions),
 .production-plan-table :deep(td.sticky-actions) {
   position: sticky;
   left: 0;
-  z-index: 3;
+  z-index: 30; /* выше всех */
   background: #fff;
 }
-
+.production-plan-table :deep(th.sticky-rownum),
+.production-plan-table :deep(td.sticky-rownum) {
+  position: sticky;
+  left: 88px; /* ширина колонки действий */
+  z-index: 29;
+  background: #fff;
+}
 .production-plan-table :deep(th.sticky-name),
 .production-plan-table :deep(td.sticky-name) {
   position: sticky;
-  left: 88px; /* width of actions column */
-  z-index: 2;
+  left: 136px; /* width of actions (88px) + rownum (48px) */
+  z-index: 28;
   background: #fff;
   box-shadow: 1px 0 0 rgba(0, 0, 0, 0.12);
 }
 
-/* Выделение выходных и праздничных дней */
+/* Выделение выходных/праздников */
 .production-plan-table :deep(th.weekend-col) {
   background: #f2f2f2;
 }
@@ -649,10 +686,10 @@ onMounted(() => {
   background: #fff2f2;
 }
 
-/* Горизонтальный скролл контейнер */
+/* Горизонтальная прокрутка */
 .h-scroll {
   overflow-x: auto;
-  overflow-y: hidden;
+  overflow-y: visible;
   width: 100%;
   scrollbar-gutter: stable both-edges;
 }
@@ -662,35 +699,71 @@ onMounted(() => {
 }
 
 /* Контент таблицы — ширина по содержимому */
-.production-plan-table.wide-content {
-  width: max-content;
-}
+.production-plan-table.wide-content { width: max-content; }
 .production-plan-table :deep(table) {
   width: max-content;
+  border-collapse: separate;
+  border-spacing: 0;
 }
-:deep(.q-table) {
-  width: max-content;
-}
-/* Явный класс для table-class */
-.wide-table {
-  width: max-content;
-  white-space: nowrap;
-}
-/* Отключаем внутренний overflow у контейнеров QTable для корректной фиксации sticky-колонок относительно внешнего горизонтального скролла */
-.production-plan-table :deep(.q-table__middle) {
-  overflow: visible !important;
-}
-.production-plan-table :deep(.q-table__container) {
-  overflow: visible;
+:deep(.q-table) { width: max-content; }
+.wide-table { width: max-content; white-space: nowrap; }
+
+/* Отключаем внутренние overflow на контейнерах Quasar */
+.production-plan-table :deep(.q-table__middle) { overflow: visible !important; }
+.production-plan-table :deep(.q-table__container) { overflow: visible; }
+
+/* Вертикальная прокрутка для области таблицы */
+.v-scroll {
+  overflow-y: auto;
+  height: 70vh;
+  width: 100%;
+  position: relative;
+  overscroll-behavior: contain;
 }
 
-/* Повышаем уровень наложения фиксированных колонок слева */
-.production-plan-table :deep(th.sticky-actions),
-.production-plan-table :deep(td.sticky-actions) {
-  z-index: 20 !important;
+/* Sticky header таблицы (оглавление колонок) */
+.production-plan-table :deep(thead th) {
+  position: sticky;
+  top: 0;
+  z-index: 22; /* выше строк данных и слева фиксированных ячеек */
+  background: #fff;
 }
-.production-plan-table :deep(th.sticky-name),
-.production-plan-table :deep(td.sticky-name) {
-  z-index: 19 !important;
+/* Доп. явное правило для выделенных заголовков */
+.production-plan-table :deep(th.weekend-col),
+.production-plan-table :deep(th.holiday-col) {
+  position: sticky;
+  top: 0;
+  z-index: 23;
+  background: inherit;
+}
+/* Единый контейнер прокрутки для таблицы (вертикальная + горизонтальная) */
+.table-scroll {
+  max-height: 70vh;
+  overflow: auto;
+  width: 100%;
+  position: relative;
+  scrollbar-gutter: stable both-edges;
+}
+/* Усиление фиксации угловых заголовочных ячеек (левая шапка) */
+.production-plan-table :deep(thead th.sticky-actions) {
+  position: sticky;
+  top: 0;
+  left: 0;
+  z-index: 31;
+  background: #fff;
+}
+.production-plan-table :deep(thead th.sticky-rownum) {
+  position: sticky;
+  top: 0;
+  left: 88px; /* ширина колонки действий */
+  z-index: 30;
+  background: #fff;
+}
+.production-plan-table :deep(thead th.sticky-name) {
+  position: sticky;
+  top: 0;
+  left: 136px; /* actions (88px) + rownum (48px) */
+  z-index: 29;
+  background: #fff;
 }
 </style>

@@ -1541,3 +1541,50 @@ MRPResultPage: кардинальная переработка логики ве
 Тест-кейсы:
 - Выбор дня через календарь → обновляется повестка на день и индикатор перегруза: [vue](frontend/src/pages/MRPResultPage.vue:99), [typescript.onDayPicked()](frontend/src/pages/MRPResultPage.vue:1286)
 - Переключение bucket=weekly и даты в верхней таблице корректно влияет на набор заказов: [typescript.loadProduction()](frontend/src/pages/MRPResultPage.vue:1033)
+
+### 2025-09-30 — SyncPage: цепочка «Номенклатура + ЕИ» на одной кнопке
+
+- Добавлена последовательная синхронизация единиц измерения сразу после синхронизации номенклатуры на странице «Синхронизация»:
+  - Кнопка переименована в «Синхронизация номенклатуры + ЕИ»: [vue.template](frontend/src/pages/SyncPage.vue:52)
+  - Логика цепочки: внутри [vue.syncNomenclature()](frontend/src/pages/SyncPage.vue:395) выполняется:
+    1) POST /v1/sync/nomenclature-odata (ключ прогресса 'nomenclature')
+    2) затем POST /v1/sync/units-odata (ключ прогресса 'units') — блок кода: [vue](frontend/src/pages/SyncPage.vue:436)
+  - Оба шага показывают прогресс через /v1/sync/progress, после Units финализируется статус и уведомление.
+
+- Backend точки:
+  - Роут синхронизации ЕИ: [python.sync_units_odata()](backend/app/routers/sync.py:203)
+  - Сервис ЕИ (Ref_Key/Code/Description, upsert): [python.sync_units_from_odata()](backend/app/services/units_sync.py:53)
+  - Добивка недостающих ЕИ по GUID из items.unit (двойной каталог): [python.backfill_units_from_items()](backend/app/services/units_sync.py:263)
+
+- Эффект в MRPResultPage:
+  - В выдачах результатов MRP теперь поле unit возвращается человекочитаемым (Unit.short_name → unit_name → unit_code), без падения на GUID, т.к. таблица units заполняется в рамках той же кнопки.
+  - Денормализация производится на backend: [python.get_run_production()](backend/app/services/planning_service.py:361), [python.get_run_purchases()](backend/app/services/planning_service.py:512).
+
+- Приёмочные шаги:
+  1) Открыть страницу «Синхронизация».
+  2) Заполнить OData настройки (base_url/username/password/token).
+  3) Нажать «Синхронизация номенклатуры + ЕИ».
+  4) Дождаться 100% и уведомления. Открыть результаты MRP — проверить, что рядом с количеством отображаются короткие обозначения ЕИ вместо GUID.
+
+### 2025-10-01 — UI: Нумерация строк в планах (дневной и квартальный)
+- Цель: добавить нумерацию строк в таблицах дневного и квартального плана с учётом пагинации (глобальная нумерация).
+- Изменения (frontend):
+  - Добавлен первый числовой столбец «#» сразу после колонки «Действия» на страницах:
+    - [frontend/src/pages/PlanPage.vue](frontend/src/pages/PlanPage.vue)
+    - [frontend/src/pages/PlanQuarterlyPage.vue](frontend/src/pages/PlanQuarterlyPage.vue)
+  - В ячейке «#» отображается глобальный порядковый номер строки: offset страницы + индекс строки на странице + 1. Работает корректно как при стандартных размерах страницы (например, 50), так и при rowsPerPage=0 (все строки на одной странице).
+  - Верстка/стили:
+    - Ширина столбца «#»: 48px (min/max 48px), выравнивание по правому краю.
+    - Колонка «#» закреплена слева (sticky) между «Действия» и «Изделие».
+    - Из-за добавления «#» сдвинута фиксированная позиция «Изделие»:
+      - Бывшее left: 88px (только «Действия») → стало left: 136px («Действия» 88px + «#» 48px).
+    - Обновлены sticky-настройки для thead (шапки) и z-index, чтобы при вертикальной и горизонтальной прокрутке поведение оставалось корректным.
+- Приёмочные критерии:
+  - На обеих страницах первая колонка «#» показывает сквозную нумерацию по всем страницам: 1..N, далее на 2-й странице — продолжение, без сброса на 1.
+  - Колонка «#» закреплена слева и остаётся видимой при горизонтальной прокрутке.
+  - Ширина «#» компактная (48px), текст выровнен справа, верстка таблиц не «прыгает».
+- Совместимость:
+  - Пагинация серверного режима сохраняется; расчёт номера основан на текущем состоянии пагинации компонентов таблиц.
+  - Не затрагивает API/Backend, только UI-слой.
+- Файлы:
+  - Изменены: [frontend/src/pages/PlanPage.vue](frontend/src/pages/PlanPage.vue), [frontend/src/pages/PlanQuarterlyPage.vue](frontend/src/pages/PlanQuarterlyPage.vue)

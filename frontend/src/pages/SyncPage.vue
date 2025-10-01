@@ -49,7 +49,7 @@
                 <q-btn color="secondary" label="Синхронизация остатков" @click="syncStock" :loading="loading.syncStock" />
               </div>
               <div class="col-auto">
-                <q-btn color="primary" label="Синхронизация номенклатуры" @click="syncNomenclature" :loading="loading.syncNomenclature" />
+                <q-btn color="primary" label="Синхронизация номенклатуры + ЕИ" @click="syncNomenclature" :loading="loading.syncNomenclature" />
               </div>
             </div>
 

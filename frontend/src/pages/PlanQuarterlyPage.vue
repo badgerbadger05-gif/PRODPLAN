@@ -21,9 +21,8 @@
             </div>
 
             <!-- Таблица плана (недели текущего квартала) -->
-            <div class="h-scroll">
-              <div class="h-scroll-inner">
-                <q-table
+            <div class="table-scroll">
+              <q-table
               :rows="rowData"
               :columns="columns"
               :pagination="pagination"
@@ -78,6 +77,11 @@
                       @click="onDeleteRow(props.row)"
                     />
                   </div>
+                  <div v-else-if="props.col.name === 'rownum'">
+                    <div class="text-right">
+                      {{ computeRowNum(props) }}
+                    </div>
+                  </div>
                   <div v-else-if="props.col.name.startsWith('week_')" class="row items-center no-wrap">
                     <q-input
                       v-model.number="props.row[props.col.name]"
@@ -124,7 +128,6 @@
                 </q-td>
               </template>
             </q-table>
-              </div>
             </div>
 
             <!-- Нижняя панель: поиск и подсказки -->
@@ -273,6 +276,16 @@ const pagination = reactive({
   rowsPerPage: 50,
   rowsNumber: 0
 })
+
+// Безопасный расчёт глобального номера строки с учётом пагинации и вариативности индексов слота
+function computeRowNum(slotProps: any): number {
+  const localIndex = Number((slotProps?.rowIndex ?? slotProps?.pageIndex ?? 0)) || 0
+  const rpp = (pagination.rowsPerPage && pagination.rowsPerPage > 0)
+    ? pagination.rowsPerPage
+    : (pagination.rowsNumber || rowData.value.length || 0)
+  const page = Number(pagination.page || 1)
+  return (page - 1) * rpp + localIndex + 1
+}
 
 // Утилита фокуса поля поиска
 function focusSearchInput() {
@@ -448,6 +461,15 @@ const columns = computed(() => {
       sortable: false,
       classes: 'col-actions sticky-actions',
       headerClasses: 'col-actions sticky-actions'
+    },
+    {
+      name: 'rownum',
+      label: '#',
+      align: 'right' as const,
+      field: 'rownum',
+      sortable: false,
+      classes: 'col-rownum sticky-rownum',
+      headerClasses: 'col-rownum sticky-rownum'
     },
     {
       name: 'item_name',
@@ -821,36 +843,46 @@ onMounted(() => {
 </script>
 
 <style scoped>
-/* Sticky first columns for QTable */
+/* Левые фиксированные колонки */
 .production-plan-table :deep(th.col-actions),
 .production-plan-table :deep(td.col-actions) {
   width: 88px;
   min-width: 88px;
   max-width: 88px;
 }
-
+.production-plan-table :deep(th.col-rownum),
+.production-plan-table :deep(td.col-rownum) {
+  width: 48px;
+  min-width: 48px;
+  max-width: 48px;
+}
 .production-plan-table :deep(th.sticky-actions),
 .production-plan-table :deep(td.sticky-actions) {
   position: sticky;
   left: 0;
-  z-index: 20; /* выше остальных ячеек */
+  z-index: 30; /* выше остальных */
   background: #fff;
 }
-
+.production-plan-table :deep(th.sticky-rownum),
+.production-plan-table :deep(td.sticky-rownum) {
+  position: sticky;
+  left: 88px; /* width of actions column */
+  z-index: 29;
+  background: #fff;
+}
 .production-plan-table :deep(th.sticky-name),
 .production-plan-table :deep(td.sticky-name) {
   position: sticky;
-  left: 88px; /* width of actions column */
-  z-index: 19; /* сразу под actions */
+  left: 136px; /* width of actions (88px) + rownum (48px) */
+  z-index: 28; /* сразу под .sticky-rownum */
   background: #fff;
   box-shadow: 1px 0 0 rgba(0, 0, 0, 0.12);
 }
-.h-scroll { overflow-x: auto; overflow-y: hidden; width: 100%; scrollbar-gutter: stable both-edges; }
-.h-scroll-inner { min-width: 1200px; }
+
 /* Горизонтальный скролл снизу */
 .h-scroll {
   overflow-x: auto;
-  overflow-y: hidden;
+  overflow-y: visible; /* ВАЖНО: не скрывать вертикаль, иначе sticky не работает */
   width: 100%;
   scrollbar-gutter: stable both-edges;
 }
@@ -859,16 +891,32 @@ onMounted(() => {
   min-width: 100%;
 }
 
-/* Контент таблицы — ширина по содержимому */
-.production-plan-table.wide-content {
-  width: max-content;
+/* Вертикальный скролл-обертка для sticky top/left */
+.v-scroll {
+  overflow-y: auto;
+  height: 70vh;
+  width: 100%;
+  position: relative;
+  overscroll-behavior: contain;
 }
+
+/* Контент таблицы — ширина по содержимому */
+.production-plan-table.wide-content { width: max-content; }
 .production-plan-table :deep(table) {
   width: max-content;
+  border-collapse: separate;
+  border-spacing: 0;
 }
-:deep(.q-table) {
-  width: max-content;
+
+/* Единый контейнер прокрутки для таблицы (вертикальная + горизонтальная) */
+.table-scroll {
+  max-height: 70vh;
+  overflow: auto;
+  width: 100%;
+  position: relative;
+  scrollbar-gutter: stable both-edges;
 }
+:deep(.q-table) { width: max-content; }
 /* Явный класс для table-class */
 .wide-table {
   width: max-content;
@@ -876,16 +924,10 @@ onMounted(() => {
 }
 
 /* Кастомизация скролл-бара (необязательно) */
-.h-scroll::-webkit-scrollbar {
-  height: 10px;
-}
-.h-scroll::-webkit-scrollbar-thumb {
-  background-color: rgba(0,0,0,0.25);
-  border-radius: 5px;
-}
-.h-scroll::-webkit-scrollbar-track {
-  background-color: rgba(0,0,0,0.05);
-}
+.h-scroll::-webkit-scrollbar { height: 10px; }
+.h-scroll::-webkit-scrollbar-thumb { background-color: rgba(0,0,0,0.25); border-radius: 5px; }
+.h-scroll::-webkit-scrollbar-track { background-color: rgba(0,0,0,0.05); }
+
 /* Узкие колонки для недель/дней и компактные инпуты */
 .production-plan-table :deep(th.narrow-col),
 .production-plan-table :deep(td.narrow-col) {
@@ -895,27 +937,22 @@ onMounted(() => {
   padding-left: 4px;
   padding-right: 4px;
 }
-
 .production-plan-table :deep(.narrow-input) {
   max-width: 72px;
   min-width: 52px;
 }
-
 .production-plan-table :deep(.narrow-input .q-field__control) {
   padding-left: 4px;
   padding-right: 4px;
 }
-
 .production-plan-table :deep(.narrow-input .q-field__native) {
   text-align: center;
 }
+
 /* Отключаем внутренний горизонтальный скролл QTable, чтобы sticky-колонки работали с внешним .h-scroll */
-.production-plan-table :deep(.q-table__middle) {
-  overflow: visible !important;
-}
-.production-plan-table :deep(.q-table__container) {
-  overflow: visible;
-}
+.production-plan-table :deep(.q-table__middle) { overflow: visible !important; }
+.production-plan-table :deep(.q-table__container) { overflow: visible; }
+
 /* Выделение недельных колонок с кнопкой разворота */
 .production-plan-table :deep(th.week-header) {
   background: #e3f2fd;         /* светло-голубой фон */
@@ -926,21 +963,37 @@ onMounted(() => {
 .production-plan-table :deep(td.week-col-cell) {
   background: #f7fbff;          /* очень светлый фон для согласованности с шапкой */
 }
+.production-plan-table :deep(th.week-header .row) { flex-wrap: nowrap; gap: 4px; }
+.production-plan-table :deep(th.week-header .q-btn) { min-width: 24px; }
 
-/* Кнопка разворота в заголовке недели — горизонтально, без переноса */
-.production-plan-table :deep(th.week-header .row) {
-  flex-wrap: nowrap;
-  gap: 4px;
+/* Sticky header (фиксируем шапку таблицы при вертикальной прокрутке) */
+.production-plan-table :deep(thead th) {
+  position: sticky;
+  top: 0;
+  z-index: 22; /* выше строк данных */
+  background: #fff;
 }
-.production-plan-table :deep(th.week-header .q-btn) {
-  min-width: 24px;
+/* Усиление для заголовков недель: остаются цветными и тоже фиксируются */
+.production-plan-table :deep(th.week-header) {
+  position: sticky;
+  top: 0;
+  z-index: 23;
 }
 
-/* Отключаем внутренний горизонтальный скролл QTable, чтобы sticky-колонки работали с внешним .h-scroll */
-.production-plan-table :deep(.q-table__middle) {
-  overflow: visible !important;
+/* Усиление фиксации угловых заголовочных ячеек (пересечение слева/сверху) */
+.production-plan-table :deep(thead th.sticky-actions) {
+  top: 0;
+  z-index: 31; /* выше остальных заголовков */
+  background: #fff;
 }
-.production-plan-table :deep(.q-table__container) {
-  overflow: visible;
+.production-plan-table :deep(thead th.sticky-rownum) {
+  top: 0;
+  z-index: 30; /* сразу под .sticky-actions */
+  background: #fff;
+}
+.production-plan-table :deep(thead th.sticky-name) {
+  top: 0;
+  z-index: 29; /* сразу под .sticky-rownum */
+  background: #fff;
 }
 </style>
