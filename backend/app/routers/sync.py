@@ -14,6 +14,7 @@ from ..services.production_stage_sync import sync_production_stages_from_odata, 
 
 from ..services.units_sync import sync_units_from_odata, backfill_units_from_items
 from ..services.operations_sync import sync_operations_from_odata, OperationsSyncStats
+from ..services.production_kind_sync import sync_production_kinds_from_odata, ProductionKindSyncStats
 
 router = APIRouter(prefix="/v1/sync", tags=["sync"])
 
@@ -238,6 +239,21 @@ def sync_operations_odata(payload: ODataSyncRequest, db: Session = Depends(get_d
         return stats
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Sync error: {e}")
+
+
+@router.post("/production-kinds-odata", response_model=dict)
+def sync_production_kinds_odata(payload: ODataSyncRequest, db: Session = Depends(get_db)):
+    """
+    Синхронизация видов производства из 1С через OData.
+    Ожидаемая сущность: "Catalog_ВидыПроизводства" (или аналог).
+    """
+    try:
+        stats = sync_production_kinds_from_odata(db, payload)
+        return stats
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sync error: {e}")
+
+
 @router.get("/progress")
 def get_sync_progress(key: str = "nomenclature"):
     """

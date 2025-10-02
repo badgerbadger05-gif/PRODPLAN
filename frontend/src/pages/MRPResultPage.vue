@@ -114,7 +114,7 @@
             <q-btn dense flat icon="table_view" label="XLSX" @click="exportProd('xlsx')" />
           </div>
 
-          <!-- Ежедневное задание по участкам (если выбран день) -->
+          <!-- Ежедневное задание по видам производства (если выбран день) -->
           <template v-if="prod.filter.day_date && dailyAgendaGroups.length">
             <q-table
               dense
@@ -131,7 +131,7 @@
                 <q-tr :props="props" :key="`grp_day_${props.row.area_id}`">
                   <q-td colspan="100%" class="bg-grey-2">
                     <div class="text-subtitle1">
-                      <strong>Производственный участок:</strong> {{ props.row.area_name }}
+                      <strong>Вид производства:</strong> {{ props.row.area_name }}
                       <span class="text-grey q-ml-sm">
                         · Позиции (на день): {{ (props.row.orders || []).length }}
                         · Норматив (за день): {{ fmt(props.row.norm_sum_hours) }} ч
@@ -166,7 +166,7 @@
             </q-table>
           </template>
 
-          <!-- Группированный вывод по участкам (если день не выбран) -->
+          <!-- Группированный вывод по видам производства (если день не выбран) -->
           <template v-else-if="groupedProdRows.length">
             <q-table
               dense
@@ -183,7 +183,7 @@
                 <q-tr :props="props" :key="`grp_${props.row.area_id}`">
                   <q-td colspan="100%" class="bg-grey-2">
                     <div class="text-subtitle1">
-                      <strong>Производственный участок:</strong> {{ props.row.area_name }}
+                      <strong>Вид производства:</strong> {{ props.row.area_name }}
                       <span class="text-grey q-ml-sm">
                         · Заказов: {{ (props.row.orders || []).length }}
                         · Норматив всего: {{ fmt(props.row.norm_sum_hours) }} ч
@@ -684,7 +684,7 @@ function rebuildDailyAgendaForDay() {
         if (!groups[areaId]) {
           groups[areaId] = {
             area_id: areaId,
-            area_name: areaId ? (areaMap.value[areaId] ?? `Участок #${areaId}`) : '—',
+            area_name: areaId ? (areaMap.value[areaId] ?? `Вид производства #${areaId}`) : '—',
             _agg: {}
           }
         }
@@ -705,7 +705,7 @@ function rebuildDailyAgendaForDay() {
         const ex = groups[areaId]._agg[key]
         const hours = Number(s?.hours || 0)
         ex.norm_hours_total += hours
-        // Перевод часов дня в выпуск по позиции за день на участке
+        // Перевод часов дня в выпуск по позиции за день по виду производства
         // Если известна норма на штуку — используем час/норму,
         // иначе (npu <= 0) — один раз прибавляем полный объём заказа в этот день.
         if (npu && npu > 0) {
@@ -775,13 +775,13 @@ function rebuildGroupedProductionOrders() {
 
   for (const order of src) {
     const stages: any[] = Array.isArray(order?.stages) ? (order.stages as any[]) : []
-    // Определяем «доминирующий» участок по стадии с максимальными часами (без доп. фильтров)
+    // Определяем «доминирующий» вид производства по стадии с максимальными часами (без доп. фильтров)
     let dominant: any = null
     for (const s of stages) {
       if (!dominant || Number(s?.hours || 0) > Number(dominant?.hours || 0)) dominant = s
     }
     const areaId = dominant?.area_id != null ? Number(dominant.area_id) : 0
-    const areaName = areaId ? (areaMap.value[areaId] ?? `Участок #${areaId}`) : '—'
+    const areaName = areaId ? (areaMap.value[areaId] ?? `Вид производства #${areaId}`) : '—'
 
     if (!groups[areaId]) {
       groups[areaId] = {
@@ -798,7 +798,7 @@ function rebuildGroupedProductionOrders() {
     // Норматив по заказу берём из ответа бэкенда
     const hoursTotalOrder = Number(order?.norm_hours_total || 0)
 
-    // Агрегация по (item_id, unit) внутри участка
+    // Агрегация по (item_id, unit) внутри вида производства
     const key = `${order.item_id}|${order.unit || ''}`
     if (!g._agg[key]) {
       g._agg[key] = {

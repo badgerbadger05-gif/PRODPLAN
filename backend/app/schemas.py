@@ -396,6 +396,48 @@ class ResourceStage(ResourceStageBase):
         from_attributes = True
 
 
+# --- Pydantic схемы для видов производства ---
+
+class ProductionKindBase(BaseModel):
+    ref_1c: str
+    name: str
+
+
+class ProductionKindCreate(ProductionKindBase):
+    pass
+
+
+class ProductionKindUpdate(ProductionKindBase):
+    pass
+
+
+class ProductionKind(ProductionKindBase):
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class ResourceProductionKindBase(BaseModel):
+    resource_id: int
+    production_kind_id: int
+
+
+class ResourceProductionKindCreate(ResourceProductionKindBase):
+    pass
+
+
+class ResourceProductionKind(ResourceProductionKindBase):
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 class ODataSyncRequest(BaseModel):
     base_url: str
     entity_name: str

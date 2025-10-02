@@ -1,0 +1,28 @@
+# Documentation with sensitive data
+.docs/prodplan-deploy.md
+
+# Local temporary files
+.tmp/
+.tmp_items.json
+*.tmp
+
+# Python
+__pycache__/
+*.pyc
+.env
+
+# Node.js
+node_modules/
+dist/
+.quasar/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# IDE settings
+.vscode/
+.idea/
+
+# Backup files
+backup.sql

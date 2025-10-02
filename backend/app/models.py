@@ -78,8 +78,13 @@ class Specification(Base):
     spec_code = Column(String(50), index=True)
     spec_name = Column(TEXT, nullable=False)
     spec_ref1c = Column(String(36), unique=True, index=True)
+    # Новое поле для связи с видом производства
+    production_kind_id = Column(Integer, ForeignKey('production_kinds.id'), nullable=True)
     created_at = Column(TIMESTAMP, default=func.now())
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
+
+    # Связь с видом производства
+    production_kind = relationship("ProductionKind")
 
 
 class SpecComponent(Base):
@@ -411,3 +416,28 @@ class PeggingLink(Base):
     qty_contribution = Column(DECIMAL(15, 3), nullable=False)
     need_date = Column(Date, nullable=True)
     parent_need_date = Column(Date, nullable=True)
+
+
+class ProductionKind(Base):
+    __tablename__ = "production_kinds"
+
+    id = Column(Integer, primary_key=True, index=True)
+    ref_1c = Column(String(255), unique=True, nullable=False, index=True)
+    name = Column(String(255), nullable=False, index=True)
+    created_at = Column(TIMESTAMP, default=func.now())
+    updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
+
+
+class ResourceProductionKind(Base):
+    __tablename__ = "resource_production_kinds"
+
+    id = Column(Integer, primary_key=True, index=True)
+    resource_id = Column(Integer, ForeignKey('production_resources.resource_id'), nullable=False)
+    production_kind_id = Column(Integer, ForeignKey('production_kinds.id'), nullable=False)
+    created_at = Column(TIMESTAMP, default=func.now())
+    updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
+
+    # Связи
+    resource = relationship("ProductionResource")
+    production_kind = relationship("ProductionKind")
+

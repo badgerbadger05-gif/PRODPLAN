@@ -6,7 +6,7 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
-from ..models import Specification, SpecComponent, Operation, SpecOperation, Item, ProductionStage
+from ..models import Specification, SpecComponent, Operation, SpecOperation, Item, ProductionStage, ProductionKind
 from ..schemas import ODataSyncRequest
 
 
@@ -68,6 +68,7 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
         # Получаем существующие записи для сопоставления
         existing_specs = {spec.spec_ref1c: spec for spec in db.query(Specification).all() if spec.spec_ref1c}
         existing_operations = {op.operation_ref1c: op for op in db.query(Operation).all() if op.operation_ref1c}
+        existing_production_kinds = {pk.ref_1c: pk for pk in db.query(ProductionKind).all() if pk.ref_1c}
 
         # Получаем существующие номенклатуру и этапы для связей
         existing_items = {item.item_ref1c: item for item in db.query(Item).all() if item.item_ref1c}
@@ -112,16 +113,24 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                 existing_spec = existing_specs.get(ref_key)
                 current_spec = existing_spec
 
+                # Извлекаем ВидПроизводства из данных
+                production_kind_key = record.get('ВидПроизводства_Key', '').strip()
+                production_kind = None
+                if production_kind_key:
+                    production_kind = existing_production_kinds.get(production_kind_key)
+
                 if existing_spec:
                     # Проверяем, нужно ли обновлять
                     needs_update = (
                         existing_spec.spec_code != code or
-                        existing_spec.spec_name != name
+                        existing_spec.spec_name != name or
+                        existing_spec.production_kind_id != (production_kind.id if production_kind else None)
                     )
 
                     if needs_update:
                         existing_spec.spec_code = code
                         existing_spec.spec_name = name
+                        existing_spec.production_kind_id = production_kind.id if production_kind else None
                         updated_count += 1
                     else:
                         unchanged_count += 1
@@ -130,7 +139,8 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                     current_spec = Specification(
                         spec_code=code,
                         spec_name=name,
-                        spec_ref1c=ref_key
+                        spec_ref1c=ref_key,
+                        production_kind_id=production_kind.id if production_kind else None
                     )
                     db.add(current_spec)
                     # Важно: получить spec_id до создания связанных записей

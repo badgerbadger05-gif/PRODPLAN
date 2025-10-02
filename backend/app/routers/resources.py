@@ -3,14 +3,17 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from ..database import get_db
-from ..models import ProductionResource, ResourceStage, ProductionStage
+from ..models import ProductionResource, ResourceStage, ProductionStage, ResourceProductionKind, ProductionKind
 from ..schemas import (
     ProductionResource as ProductionResourceSchema,
     ProductionResourceCreate,
     ProductionResourceUpdate,
     ResourceStage as ResourceStageSchema,
     ResourceStageCreate,
-    ResourceStageWithName
+    ResourceStageWithName,
+    ResourceProductionKind as ResourceProductionKindSchema,
+    ResourceProductionKindCreate,
+    ProductionKind as ProductionKindSchema,
 )
 from ..services.resource_calculator import calculate_resource_distribution
 
@@ -120,6 +123,13 @@ def get_resource_stages(resource_id: int, db: Session = Depends(get_db)):
     ]
 
 
+@router.get("/production-kinds", response_model=List[ProductionKindSchema])
+def list_production_kinds(db: Session = Depends(get_db)):
+    """Получить список всех видов производства"""
+    kinds = db.query(ProductionKind).order_by(ProductionKind.name.asc()).all()
+    return kinds
+
+
 @router.post("/{resource_id}/stages", response_model=ResourceStageSchema)
 def add_stage_to_resource(
     resource_id: int,
@@ -172,6 +182,92 @@ def remove_stage_from_resource(resource_id: int, stage_id: int, db: Session = De
         raise HTTPException(status_code=404, detail="Stage assignment not found")
     
     db.delete(resource_stage)
+    db.commit()
+    return {"status": "success"}
+
+
+# --- Production kinds mapping (resource_production_kinds) ---
+
+@router.get("/{resource_id}/production-kinds", response_model=List[ResourceProductionKindSchema])
+def get_resource_production_kinds(resource_id: int, db: Session = Depends(get_db)):
+    """Список видов производства, привязанных к участку"""
+    rows = (
+        db.query(ResourceProductionKind)
+        .filter(ResourceProductionKind.resource_id == resource_id)
+        .all()
+    )
+    return rows
+
+
+@router.post("/{resource_id}/production-kinds", response_model=ResourceProductionKindSchema)
+def add_production_kind_to_resource(
+    resource_id: int,
+    payload: ResourceProductionKindCreate,
+    db: Session = Depends(get_db),
+):
+    """Привязать вид производства к участку"""
+    # Проверяем существование участка
+    res = db.query(ProductionResource).filter(ProductionResource.resource_id == resource_id).first()
+    if not res:
+        raise HTTPException(status_code=404, detail="Resource not found")
+
+    # Проверяем существование вида производства
+    pk = db.query(ProductionKind).filter(ProductionKind.id == payload.production_kind_id).first()
+    if not pk:
+        raise HTTPException(status_code=404, detail="Production kind not found")
+
+    # Глобальная защита от дублей:
+    # Если вид производства уже назначен на ЛЮБОЙ другой участок — запрещаем повторное назначение
+    existing_global = (
+        db.query(ResourceProductionKind)
+        .filter(ResourceProductionKind.production_kind_id == payload.production_kind_id)
+        .first()
+    )
+    if existing_global and int(existing_global.resource_id) != int(resource_id):
+        raise HTTPException(status_code=400, detail="Production kind already assigned to another resource")
+
+    # Проверяем уникальность связи для текущего участка (idempotent)
+    existing = (
+        db.query(ResourceProductionKind)
+        .filter(
+            ResourceProductionKind.resource_id == resource_id,
+            ResourceProductionKind.production_kind_id == payload.production_kind_id,
+        )
+        .first()
+    )
+    if existing:
+        raise HTTPException(status_code=400, detail="Production kind already assigned to this resource")
+
+    try:
+        rec = ResourceProductionKind(
+            resource_id=resource_id,
+            production_kind_id=payload.production_kind_id,
+        )
+        db.add(rec)
+        db.commit()
+        db.refresh(rec)
+        return rec
+    except IntegrityError:
+        db.rollback()
+        # Может сработать на уровне БД при уникальном индексе production_kind_id
+        raise HTTPException(status_code=400, detail="Error assigning production kind to resource")
+
+
+@router.delete("/{resource_id}/production-kinds/{production_kind_id}")
+def remove_production_kind_from_resource(resource_id: int, production_kind_id: int, db: Session = Depends(get_db)):
+    """Удалить привязку вида производства к участку"""
+    rec = (
+        db.query(ResourceProductionKind)
+        .filter(
+            ResourceProductionKind.resource_id == resource_id,
+            ResourceProductionKind.production_kind_id == production_kind_id,
+        )
+        .first()
+    )
+    if not rec:
+        raise HTTPException(status_code=404, detail="Production kind assignment not found")
+
+    db.delete(rec)
     db.commit()
     return {"status": "success"}
 

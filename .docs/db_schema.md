@@ -301,6 +301,210 @@ CREATE TABLE resource_stages (
 );
 ```
 
+## Таблицы MRP (из 2025-09-25)
+
+### 14. planning_config_versions
+```sql
+CREATE TABLE planning_config_versions (
+  id              SERIAL PRIMARY KEY,
+  version         INTEGER NOT NULL,
+  is_active       BOOLEAN NOT NULL DEFAULT FALSE,
+  config          JSONB NOT NULL,
+  comment         TEXT,
+  created_by      VARCHAR(100),
+  created_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+-- unique(version)
+CREATE UNIQUE INDEX ux_planning_config_version ON planning_config_versions(version);
+-- unique active config (partial)
+CREATE UNIQUE INDEX ux_planning_config_active ON planning_config_versions(is_active) WHERE is_active = TRUE;
+CREATE INDEX idx_planning_config_created_at ON planning_config_versions(created_at);
+```
+
+### 15. planning_run
+```sql
+CREATE TABLE planning_run (
+  run_id          SERIAL PRIMARY KEY,
+  started_at      TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  finished_at     TIMESTAMP,
+  status          VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+  started_by      VARCHAR(100),
+  horizon_days    INTEGER,
+  use_weekly      BOOLEAN NOT NULL DEFAULT TRUE,
+  config_version_id INTEGER,
+  config_snapshot JSONB NOT NULL,
+  warnings        JSONB,
+  kpi             JSONB,
+  pinned          BOOLEAN DEFAULT FALSE,
+  FOREIGN KEY(config_version_id) REFERENCES planning_config_versions(id)
+);
+CREATE INDEX idx_planning_run_status ON planning_run(status);
+CREATE INDEX idx_planning_run_started_at ON planning_run(started_at);
+-- GIN indexes
+CREATE INDEX idx_planning_run_kpi_gin ON planning_run USING GIN (kpi);
+CREATE INDEX idx_planning_run_warn_gin ON planning_run USING GIN (warnings);
+```
+
+### 16. planned_order
+```sql
+CREATE TABLE planned_order (
+  order_id        SERIAL PRIMARY KEY,
+  run_id          INTEGER NOT NULL,
+  item_id         INTEGER NOT NULL,
+  qty             DECIMAL(15,3) NOT NULL,
+  need_date       DATE NOT NULL,
+  start_date      DATE,
+  finish_date     DATE,
+  route_ref       VARCHAR(255),
+  priority_index  DECIMAL(10,4),
+  bucket_type     VARCHAR(10) NOT NULL,
+  bucket_date     DATE NOT NULL,
+  demand_ref      TEXT,
+  demand_date     DATE,
+  CHECK (bucket_type IN ('daily','weekly')),
+  FOREIGN KEY(run_id) REFERENCES planning_run(run_id) ON DELETE CASCADE,
+  FOREIGN KEY(item_id) REFERENCES items(item_id)
+);
+CREATE INDEX idx_planned_order_run ON planned_order(run_id);
+CREATE INDEX idx_planned_order_item ON planned_order(item_id);
+CREATE INDEX idx_planned_order_need_date ON planned_order(need_date);
+CREATE INDEX idx_planned_order_bucket ON planned_order(bucket_type, bucket_date);
+CREATE INDEX idx_planned_order_priority ON planned_order(priority_index);
+CREATE INDEX idx_planned_order_dates ON planned_order(start_date, finish_date);
+CREATE INDEX idx_planned_order_run_item ON planned_order(run_id, item_id);
+```
+
+### 17. planned_order_stage
+```sql
+CREATE TABLE planned_order_stage (
+  id              SERIAL PRIMARY KEY,
+  run_id          INTEGER NOT NULL,
+  order_id        INTEGER NOT NULL,
+  stage_id        INTEGER NOT NULL,
+  area_id         INTEGER,
+  bucket_type     VARCHAR(10) NOT NULL,
+  bucket_date     DATE NOT NULL,
+  hours           DECIMAL(12,3) NOT NULL DEFAULT 0.0,
+  CHECK (bucket_type IN ('daily','weekly')),
+  FOREIGN KEY(run_id) REFERENCES planning_run(run_id) ON DELETE CASCADE,
+  FOREIGN KEY(order_id) REFERENCES planned_order(order_id) ON DELETE CASCADE,
+  FOREIGN KEY(stage_id) REFERENCES production_stages(stage_id),
+  FOREIGN KEY(area_id) REFERENCES production_resources(resource_id)
+);
+CREATE INDEX idx_pos_run_order ON planned_order_stage(run_id, order_id);
+CREATE INDEX idx_pos_stage_area ON planned_order_stage(stage_id, area_id);
+CREATE INDEX idx_pos_bucket ON planned_order_stage(bucket_type, bucket_date);
+CREATE INDEX idx_pos_area_bucket ON planned_order_stage(area_id, bucket_type, bucket_date);
+CREATE INDEX idx_pos_run_stage ON planned_order_stage(run_id, stage_id);
+```
+
+### 18. planned_purchase
+```sql
+CREATE TABLE planned_purchase (
+  purchase_id     SERIAL PRIMARY KEY,
+ run_id          INTEGER NOT NULL,
+  item_id         INTEGER NOT NULL,
+  qty             DECIMAL(15,3) NOT NULL,
+  need_date       DATE NOT NULL,
+  order_date      DATE NOT NULL,
+  lead_time_days  INTEGER NOT NULL,
+  priority_index  DECIMAL(10,4),
+  bucket_type     VARCHAR(10) NOT NULL,
+  bucket_date     DATE NOT NULL,
+  supplier_ref1c  VARCHAR(255),
+  CHECK (bucket_type IN ('daily','weekly')),
+  FOREIGN KEY(run_id) REFERENCES planning_run(run_id) ON DELETE CASCADE,
+  FOREIGN KEY(item_id) REFERENCES items(item_id)
+);
+CREATE INDEX idx_planned_purchase_run ON planned_purchase(run_id);
+CREATE INDEX idx_planned_purchase_item ON planned_purchase(item_id);
+CREATE INDEX idx_planned_purchase_need ON planned_purchase(need_date);
+CREATE INDEX idx_planned_purchase_order ON planned_purchase(order_date);
+CREATE INDEX idx_planned_purchase_bucket ON planned_purchase(bucket_type, bucket_date);
+CREATE INDEX idx_pp_item_need ON planned_purchase(item_id, need_date);
+CREATE INDEX idx_pp_item_order ON planned_purchase(item_id, order_date);
+```
+
+### 19. capacity_load
+```sql
+CREATE TABLE capacity_load (
+  id              SERIAL PRIMARY KEY,
+  run_id          INTEGER NOT NULL,
+  area_id         INTEGER NOT NULL,
+  bucket_type     VARCHAR(10) NOT NULL,
+  bucket_date     DATE NOT NULL,
+  hours_planned   DECIMAL(12,3) NOT NULL DEFAULT 0.0,
+  hours_available DECIMAL(12,3) NOT NULL DEFAULT 0.0,
+  overload_hours  DECIMAL(12,3) NOT NULL DEFAULT 0.0,
+  CHECK (bucket_type IN ('daily','weekly')),
+  FOREIGN KEY(run_id) REFERENCES planning_run(run_id) ON DELETE CASCADE,
+  FOREIGN KEY(area_id) REFERENCES production_resources(resource_id)
+);
+CREATE UNIQUE INDEX ux_capacity_load ON capacity_load(run_id, area_id, bucket_type, bucket_date);
+CREATE INDEX idx_capacity_load_over ON capacity_load(overload_hours);
+```
+
+### 20. pegging_link
+```sql
+CREATE TABLE pegging_link (
+  id                  SERIAL PRIMARY KEY,
+  run_id              INTEGER NOT NULL,
+  child_item_id       INTEGER NOT NULL,
+  parent_item_id      INTEGER,
+  demand_ref          TEXT,
+  qty_contribution    DECIMAL(15,3) NOT NULL,
+  need_date           DATE,
+  parent_need_date    DATE,
+  FOREIGN KEY(run_id) REFERENCES planning_run(run_id) ON DELETE CASCADE,
+  FOREIGN KEY(child_item_id) REFERENCES items(item_id),
+  FOREIGN KEY(parent_item_id) REFERENCES items(item_id)
+);
+CREATE INDEX idx_pegging_run_child ON pegging_link(run_id, child_item_id);
+CREATE INDEX idx_pegging_run_parent ON pegging_link(run_id, parent_item_id);
+```
+
+## Таблицы для видов производства (из 2025-10-02)
+
+### 21. production_kinds
+```sql
+CREATE TABLE production_kinds (
+  id              SERIAL PRIMARY KEY,
+  ref_1c          VARCHAR(255) NOT NULL UNIQUE,
+  name            VARCHAR(255) NOT NULL,
+  created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+  updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL
+);
+CREATE INDEX ix_production_kinds_ref_1c ON production_kinds(ref_1c);
+CREATE INDEX ix_production_kinds_name ON production_kinds(name);
+```
+Справочник видов производства из 1С (Catalog_ВидыПроизводства).
+
+### 22. resource_production_kinds
+```sql
+CREATE TABLE resource_production_kinds (
+  id                  SERIAL PRIMARY KEY,
+  resource_id         INTEGER NOT NULL,
+  production_kind_id  INTEGER NOT NULL,
+  created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+  updated_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL,
+  FOREIGN KEY(resource_id) REFERENCES production_resources(resource_id),
+  FOREIGN KEY(production_kind_id) REFERENCES production_kinds(id),
+  UNIQUE(resource_id, production_kind_id),
+  UNIQUE(production_kind_id) -- Глобальная уникальность: вид производства может принадлежать только одному участку
+);
+CREATE INDEX ix_resource_production_kinds_resource ON resource_production_kinds(resource_id);
+CREATE INDEX ix_resource_production_kinds_kind ON resource_production_kinds(production_kind_id);
+```
+Связь производственных участков и видов производства (заполняется вручную в интерфейсе).
+
+### 23. specifications (изменения)
+```sql
+ALTER TABLE specifications ADD COLUMN production_kind_id INTEGER;
+ALTER TABLE specifications ADD CONSTRAINT fk_specifications_production_kind FOREIGN KEY (production_kind_id) REFERENCES production_kinds(id);
+CREATE INDEX ix_specifications_production_kind_id ON specifications(production_kind_id);
+```
+Добавлено поле для связи спецификации с видом производства.
+
 ## Индексы для производительности
 
 ```sql
@@ -313,533 +517,16 @@ CREATE INDEX idx_items_stage ON items(stage_id);
 CREATE INDEX idx_specifications_code ON specifications(spec_code);
 CREATE INDEX idx_resource_stages_resource ON resource_stages(resource_id);
 CREATE INDEX idx_resource_stages_stage ON resource_stages(stage_id);
+CREATE INDEX idx_specifications_production_kind_id ON specifications(production_kind_id);
+CREATE INDEX idx_resource_production_kinds_resource ON resource_production_kinds(resource_id);
+CREATE INDEX idx_resource_production_kinds_kind ON resource_production_kinds(production_kind_id);
+CREATE INDEX ix_production_kinds_ref_1c ON production_kinds(ref_1c);
+CREATE INDEX ix_production_kinds_name ON production_kinds(name);
+CREATE INDEX idx_specifications_production_kind_id ON specifications(production_kind_id);
+CREATE INDEX idx_resource_production_kinds_resource ON resource_production_kinds(resource_id);
+CREATE INDEX idx_resource_production_kinds_kind ON resource_production_kinds(production_kind_id);
+CREATE INDEX ix_production_kinds_ref_1c ON production_kinds(ref_1c);
+CREATE INDEX ix_production_kinds_name ON production_kinds(name);
 ```
 
 ---
-
-# Сущности 1С и маппинг данных
-
-Этот раздел описывает сущности, получаемые из OData API 1С, и их сопоставление с таблицами в базе данных PRODPLAN.
-
-### Основные сущности
-
-#### 1. Catalog_Номенклатура
-
-Сущность содержит информацию о номенклатуре товаров.
-
-##### Поля:
-
-| Поле | Тип | Описание |
-|------|-----|----------|
-| Ref_Key | GUID | Уникальный идентификатор номенклатуры |
-| Code | Строка | Код номенклатуры |
-| Description | Строка | Наименование номенклатуры |
-| Артикул | Строка | Артикул изделия |
-| СпособПополнения | Строка | Способ пополнения (Закупка, Производство и т.д.) |
-| СрокПополнения | Число | Срок пополнения в днях |
-| ЕдиницаИзмерения_Key | GUID | Ссылка на единицу измерения |
-| КатегорияНоменклатуры_Key | GUID | Ссылка на категорию номенклатуры |
-| ТипНоменклатуры | Строка | Тип номенклатуры (Запас, Услуга и т.д.) |
-
-#### 1.1. Catalog_КатегорииНоменклатуры
-
-Сущность содержит информацию о категориях номенклатуры. Вся иерархия категорий номенклатуры хранится в одном справочнике.
-Поле IsFolder разделяет два типа элементов:
-- IsFolder: true - "Группы категорий номенклатуры" (папки)
-- IsFolder: false - "Категории номенклатуры" (конечные категории)
-
-##### Поля:
-
-| Поле | Тип | Описание |
-|------|-----|----------|
-| Ref_Key | GUID | Уникальный идентификатор категории |
-| Code | Строка | Код категории |
-| Description | Строка | Наименование категории |
-| Parent_Key | GUID | Ссылка на родительскую категорию |
-| IsFolder | Булево | Признак группы категорий (true - группа, false - категория) |
-| Predefined | Булево | Признак предопределенной категории |
-| PredefinedDataName | Строка | Имя предопределенной категории |
-| DataVersion | Строка | Версия данных |
-| DeletionMark | Булево | Признак удаления |
-
-#### 3. AccumulationRegister_ЗапасыНаСкладах
-
-Сущность содержит информацию об остатках на складах.
-
-ВНИМАНИЕ: Остатки читаются через ресурс регистра "Остатки" (Balance), а не через набор записей регистра.
-Пример запроса к остатку:
-- GET {base}/AccumulationRegister_ЗапасыНаСкладах/Balance?$select=Номенклатура_Key,Склад_Key,КоличествоОстаток&$top=5
-
-Для получения полей номенклатуры по ссылкам (код/наименование/артикул) используйте $expand или отдельный батч‑запрос к Catalog_Номенклатура.
-
-##### Поля (ресурс Остатки/Balance):
-
-| Поле | Тип | Описание |
-|------|-----|----------|
-| Номенклатура_Key | GUID | Ссылка на номенклатуру |
-| Склад_Key | GUID | Ссылка на склад |
-| КоличествоОстаток | Число | Остаток количества |
-| Номенклатура/Code | Строка | Код номенклатуры (через расширение) |
-| Номенклатура/Description | Строка | Наименование номенклатуры (через расширение) |
-| Номенклатура/Артикул | Строка | Артикул номенклатуры (через расширение) |
-
-Примечание: если обращаться к базовому набору регистра без ресурса остатков, сервер вернёт движения с полями RecordSet/Recorder, а не срез остатков.
-
-#### 4. Catalog_Спецификации
-
-Сущность содержит информацию о спецификациях изделий, включая состав и операции.
-
-Примечание: детальные строки состава и операций доступны отдельными наборами:
-- Catalog_Спецификации_Состав — строки состава (компоненты),
-- Catalog_Спецификации_Операции — строки операций.
-В самой Catalog_Спецификации поля "Состав" и "Операции" представлены как навигации.
-
-##### Поля:
-
-| Поле | Тип | Описание |
-|------|-----|----------|
-| Ref_Key | GUID | Уникальный идентификатор спецификации |
-| Code | Строка | Код спецификации |
-| Description | Строка | Наименование спецификации |
-| Состав | Массив | Состав спецификации (номенклатура, количество, этапы) |
-| Операции | Массив | Операции по производству |
-
-##### Поля состава:
-
-| Поле | Тип | Описание |
-|------|-----|----------|
-| Номенклатура_Key | GUID | Ссылка на номенклатуру компонента |
-| Количество | Число | Количество компонента |
-| Этап_Key | GUID | Ссылка на этап производства |
-| ТипСтрокиСостава | Строка | Тип строки (Материал, Сборка) |
-
-##### Поля операций:
-
-| Поле | Тип | Описание |
-|------|-----|----------|
-| Операция_Key | GUID | Ссылка на операцию |
-| НормаВремени | Число | Норма времени на операцию |
-| Этап_Key | GUID | Ссылка на этап производства |
-
-#### 5. Document_ЗаказНаПроизводство
-
-Сущность содержит информацию о заказах на производство.
-
-##### Поля:
-
-| Поле | Тип | Описание |
-|------|-----|----------|
-| Ref_Key | GUID | Уникальный идентификатор заказа |
-| Number | Строка | Номер заказа |
-| Date | Дата | Дата заказа |
-| Posted | Булево | Проведен ли документ |
-| Продукция | Массив | Список продукции для производства |
-| Запасы | Массив | Список запасов (компонентов) |
-| Операции | Массив | Операции по производству |
-
-##### Поля продукции:
-
-| Поле | Тип | Описание |
-|------|-----|----------|
-| Номенклатура_Key | GUID | Ссылка на номенклатуру продукции |
-| Количество | Число | Количество продукции |
-| Спецификация_Key | GUID | Ссылка на спецификацию |
-| Этап_Key | GUID | Ссылка на этап производства (опционально) |
-
-##### Поля запасов (компонентов):
-
-| Поле | Тип | Описание |
-|------|-----|----------|
-| Номенклатура_Key | GUID | Ссылка на номенклатуру компонента |
-| Количество | Число | Количество компонента |
-| Спецификация_Key | GUID | Ссылка на спецификацию |
-| Этап_Key | GUID | Ссылка на этап производства |
-
-##### Поля операций:
-
-| Поле | Тип | Описание |
-|------|-----|----------|
-| Операция_Key | GUID | Ссылка на операцию |
-| КоличествоПлан | Число | Планируемое количество |
-| НормаВремени | Число | Норма времени на операцию |
-| Нормочасы | Число | Нормочасы |
-| Этап_Key | GUID | Ссылка на этап производства |
-
-#### 6. Document_ЗаказПоставщику
-
-Сущность содержит информацию о заказах поставщикам.
-
-##### Поля:
-
-| Поле | Тип | Описание |
-|------|-----|----------|
-| Ref_Key | GUID | Уникальный идентификатор заказа |
-| Number | Строка | Номер заказа |
-| Date | Дата | Дата заказа |
-| Posted | Булево | Проведен ли документ |
-| Контрагент_Key | GUID | Ссылка на контрагента (поставщика) |
-| СуммаДокумента | Число | Сумма документа |
-| Запасы | Массив | Список запасов (номенклатуры) в заказе |
-
-##### Поля запасов (номенклатуры в заказе):
-
-| Поле | Тип | Описание |
-|------|-----|----------|
-| Номенклатура_Key | GUID | Ссылка на номенклатуру |
-| Количество | Число | Количество номенклатуры |
-| Цена | Число | Цена номенклатуры |
-| Сумма | Число | Сумма позиции |
-| ДатаПоступления | Дата | Планируемая дата поступления |
-
-#### 7. InformationRegister_СпецификацииПоУмолчанию
-
-Сущность содержит информацию о спецификациях по умолчанию для номенклатуры.
-
-##### Поля:
-
-| Поле | Тип | Описание |
-|------|-----|----------|
-| Номенклатура_Key | GUID | Ссылка на номенклатуру |
-| Характеристика_Key | GUID | Ссылка на характеристику |
-| Спецификация_Key | GUID | Ссылка на спецификацию по умолчанию |
-
-### Сопоставление с собственной базой данных
-
-#### Таблица items (номенклатура)
-
-| Поле 1С | Поле нашей БД | Описание |
-|---------|---------------|----------|
-| Ref_Key | item_ref1c | GUID 1С (уникальный идентификатор номенклатуры) |
-| Code | item_code | Код номенклатуры |
-| Description | item_name | Наименование номенклатуры |
-| Артикул | item_article | Артикул изделия |
-| СпособПополнения | replenishment_method | Способ пополнения |
-| СрокПополнения | replenishment_time | Срок пополнения в днях |
-
-#### Таблица stock (остатки)
-
-| Поле 1С | Поле нашей БД | Описание |
-|---------------|----------|
-| Номенклатура_Key | item_id | Ссылка на номенклатуру |
-| Склад_Key | warehouse_id | Ссылка на склад |
-| КоличествоОстаток | quantity | Остаток количества |
-
-#### Таблица specifications (спецификации)
-
-| Поле 1С | Поле нашей БД | Описание |
-|---------|---------------|----------|
-| Ref_Key | spec_id | Уникальный идентификатор спецификации |
-| Code | spec_code | Код спецификации |
-| Description | spec_name | Наименование спецификации |
-
-#### Таблица spec_components (компоненты спецификаций)
-
-| Поле 1С | Поле нашей БД | Описание |
-|---------|---------------|----------|
-| Номенклатура_Key (в составе) | component_item_id | Ссылка на номенклатуру компонента |
-| Номенклатура_Key (владелец) | parent_item_id | Ссылка на номенклатуру изделия |
-| Количество | quantity | Количество компонента |
-| Этап_Key | stage_id | Ссылка на этап производства |
-| ТипСтрокиСостава | component_type | Тип компонента (Материал, Сборка) |
-
-#### Таблица operations (операции)
-
-| Поле 1С | Поле нашей БД | Описание |
-|---------|---------------|----------|
-| Операция_Key | operation_id | Уникальный идентификатор операции |
-| НормаВремени | time_norm | Норма времени на операцию |
-| Этап_Key | stage_id | Ссылка на этап производства |
-
-#### Таблица production_orders (заказы на производство)
-
-| Поле 1С | Поле нашей БД | Описание |
-|---------|---------------|----------|
-| Ref_Key | order_id | Уникальный идентификатор заказа |
-| Number | order_number | Номер заказа |
-| Date | order_date | Дата заказа |
-| Posted | is_posted | Проведен ли документ |
-
-#### Таблица production_products (продукция в заказах)
-
-| Поле 1С | Поле нашей БД | Описание |
-|---------|---------------|----------|
-| Номенклатура_Key | item_id | Ссылка на номенклатуру продукции |
-| Количество | quantity | Количество продукции |
-| Спецификация_Key | spec_id | Ссылка на спецификацию |
-| Этап_Key | stage_id | Ссылка на этап производства |
-
-#### Таблица production_components (компоненты в заказах)
-
-| Поле 1С | Поле нашей БД | Описание |
-|---------|---------------|----------|
-| Номенклатура_Key | item_id | Ссылка на номенклатуру компонента |
-| Количество | quantity | Количество компонента |
-| Спецификация_Key | spec_id | Ссылка на спецификацию |
-| Этап_Key | stage_id | Ссылка на этап производства |
-
-#### Таблица production_operations (операции в заказах)
-
-| Поле 1С | Поле нашей БД | Описание |
-|---------|---------------|----------|
-| Операция_Key | operation_id | Ссылка на операцию |
-| КоличествоПлан | planned_quantity | Планируемое количество |
-| НормаВремени | time_norm | Норма времени на операцию |
-| Нормочасы | standard_hours | Нормочасы |
-| Этап_Key | stage_id | Ссылка на этап производства |
-
-#### Таблица supplier_orders (заказы поставщикам)
-
-| Поле 1С | Поле нашей БД | Описание |
-|---------|---------------|----------|
-| Ref_Key | order_id | Уникальный идентификатор заказа |
-| Number | order_number | Номер заказа |
-| Date | order_date | Дата заказа |
-| Posted | is_posted | Проведен ли документ |
-| Контрагент_Key | supplier_id | Ссылка на контрагента (поставщика) |
-| СуммаДокумента | document_amount | Сумма документа |
-
-#### Таблица supplier_order_items (позиции в заказах поставщикам)
-
-| Поле 1С | Поле нашей БД | Описание |
-|---------|---------------|----------|
-| Номенклатура_Key | item_id | Ссылка на номенклатуру |
-| Количество | quantity | Количество номенклатуры |
-| Цена | price | Цена номенклатуры |
-| Сумма | amount | Сумма позиции |
-| ДатаПоступления | delivery_date | Планируемая дата поступления |
-
-#### Таблица default_specifications (спецификации по умолчанию)
-
-| Поле 1С | Поле нашей БД | Описание |
-|---------------|----------|
-| Номенклатура_Key | item_id | Ссылка на номенклатуру |
-| Характеристика_Key | characteristic_id | Ссылка на характеристику |
-| Спецификация_Key | spec_id | Ссылка на спецификацию по умолчанию |
-
-### Примечания
-
-1. Для получения полной информации о номенклатуре может потребоваться использование $expand в запросах OData.
-2. При синхронизации данных необходимо учитывать возможные различия в форматах данных между 1С и нашей базой.
-3. Необходимо реализовать механизм обработки изменений в данных 1С для поддержания актуальности нашей базы.
-4. Спецификации содержат сложную структуру с вложенными массивами, требующими особой обработки при импорте.
-5. Заказы на производство содержат сложную структуру с несколькими вложенными массивами (продукция, запасы, операции), требующими особой обработки при импорте.
-6. Заказы поставщикам содержат информацию о закупаемой номенклатуре, количествах, ценах и сроках поставки.
-7. Регистр сведений "Спецификации по умолчанию" используется для определения актуальной спецификации изделия при поиске спецификации.
-
-## Новые таблицы для модуля планирования (MRP)
-
-Данный раздел добавляет сущности хранения результатов расчётов производственного и закупочного планов, а также версионируемую конфигурацию планирования. Все объекты согласованы со спецификацией в [.docs/progress.md](.docs/progress.md).
-
-### 14. planning_config_versions — Версионируемая конфигурация планирования
-```sql
-CREATE TABLE planning_config_versions (
-  id               SERIAL PRIMARY KEY,
-  version          INTEGER NOT NULL,
-  is_active        BOOLEAN NOT NULL DEFAULT FALSE,
-  config           JSONB   NOT NULL, -- Полный снимок конфигурации (planning_config)
-  comment          TEXT,
-  created_by       VARCHAR(100),
-  created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- Гарантия единственной активной версии
-CREATE UNIQUE INDEX ux_planning_config_active ON planning_config_versions (is_active) WHERE is_active = TRUE;
-
--- Уникальность номера версии
-CREATE UNIQUE INDEX ux_planning_config_version ON planning_config_versions (version);
-
--- Последовательная выдача версий
-CREATE INDEX idx_planning_config_created_at ON planning_config_versions (created_at DESC);
-```
-
-Назначение: хранение истории конфигураций планирования с пометкой активной версии. Поле config хранит все параметры (horizon, weekly-политики, lead time, safety stock, приоритизация, toggles и т.п.) в формате JSONB.
-
----
-
-### 15. planning_run — Прогоны планирования
-```sql
-CREATE TABLE planning_run (
-  run_id           SERIAL PRIMARY KEY,
-  started_at       TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  finished_at      TIMESTAMP,
-  status           VARCHAR(20) NOT NULL DEFAULT 'PENDING', -- PENDING|RUNNING|SUCCESS|FAILED
-  started_by       VARCHAR(100),
-  horizon_days     INTEGER,         -- Фактически использованный горизонт
-  use_weekly       BOOLEAN DEFAULT TRUE,
-  config_version_id INTEGER,        -- Версия конфигурации на момент запуска
-  config_snapshot  JSONB   NOT NULL, -- Снимок конфигурации на момент запуска
-  warnings         JSONB,           -- Массив предупреждений (перегрузы, неполные данные и т.п.)
-  kpi              JSONB,           -- Сводные KPI прогона
-  FOREIGN KEY(config_version_id) REFERENCES planning_config_versions(id)
-);
-
-CREATE INDEX idx_planning_run_status ON planning_run (status);
-CREATE INDEX idx_planning_run_started_at ON planning_run (started_at DESC);
-```
-
-Назначение: журнал запусков планирования с фиксацией параметров, статуса и KPI.
-
----
-
-### 16. planned_order — Плановые производственные заказы
-```sql
-CREATE TABLE planned_order (
-  order_id         SERIAL PRIMARY KEY,
-  run_id           INTEGER NOT NULL,
-  item_id          INTEGER NOT NULL,
-  qty              DECIMAL(15,3) NOT NULL,
-  need_date        DATE    NOT NULL, -- Дата потребности (daily: конкретный день; weekly: дата пятницы недели)
-  start_date       DATE,
-  finish_date      DATE,
-  route_ref        VARCHAR(255),     -- Идентификатор/название маршрута (если используется)
-  priority_index   DECIMAL(10,4),
-  bucket_type      VARCHAR(10) NOT NULL, -- 'daily' | 'weekly'
-  bucket_date      DATE        NOT NULL, -- Для weekly: дата пятницы; для daily: совпадает с need_date
-  demand_ref       TEXT,                -- Ссылка на источник спроса (строка MPS или агрегат)
-  demand_date      DATE,                -- Дата исходного спроса
-  FOREIGN KEY(run_id)  REFERENCES planning_run(run_id),
-  FOREIGN KEY(item_id) REFERENCES items(item_id),
-  CHECK (bucket_type IN ('daily', 'weekly'))
-);
-
-CREATE INDEX idx_planned_order_run ON planned_order (run_id);
-CREATE INDEX idx_planned_order_item ON planned_order (item_id);
-CREATE INDEX idx_planned_order_need_date ON planned_order (need_date);
-CREATE INDEX idx_planned_order_bucket ON planned_order (bucket_type, bucket_date);
-CREATE INDEX idx_planned_order_priority ON planned_order (priority_index);
-```
-
-Назначение: агрегированные производственные заказы с привязкой к бакетам времени и приоритетом.
-
----
-
-### 17. planned_order_stage — Нагрузка по этапам и участкам
-```sql
-CREATE TABLE planned_order_stage (
-  id               SERIAL PRIMARY KEY,
-  run_id           INTEGER NOT NULL,
-  order_id         INTEGER NOT NULL,
-  stage_id         INTEGER NOT NULL,
-  area_id          INTEGER,           -- Производственный участок (resource)
-  bucket_type      VARCHAR(10) NOT NULL, -- 'daily' | 'weekly'
-  bucket_date      DATE        NOT NULL, -- Для weekly: дата пятницы; для daily: конкретная дата
-  hours            DECIMAL(12,3) NOT NULL DEFAULT 0.0, -- Плановые часы
-  FOREIGN KEY(run_id)    REFERENCES planning_run(run_id),
-  FOREIGN KEY(order_id)  REFERENCES planned_order(order_id),
-  FOREIGN KEY(stage_id)  REFERENCES production_stages(stage_id),
-  FOREIGN KEY(area_id)   REFERENCES production_resources(resource_id),
-  CHECK (bucket_type IN ('daily', 'weekly'))
-);
-
-CREATE INDEX idx_pos_run_order ON planned_order_stage (run_id, order_id);
-CREATE INDEX idx_pos_stage_area ON planned_order_stage (stage_id, area_id);
-CREATE INDEX idx_pos_bucket ON planned_order_stage (bucket_type, bucket_date);
-```
-
-Назначение: детальная раскладка часов по этапам и участкам для последующего контроля загрузки.
-
----
-
-### 18. planned_purchase — План закупок (заявки)
-```sql
-CREATE TABLE planned_purchase (
-  purchase_id      SERIAL PRIMARY KEY,
-  run_id           INTEGER NOT NULL,
-  item_id          INTEGER NOT NULL,
-  qty              DECIMAL(15,3) NOT NULL,
-  need_date        DATE NOT NULL,      -- Дата потребности (daily: день; weekly: пятница недели)
-  order_date       DATE NOT NULL,      -- Округление на предыдущий рабочий день по календарю ресурсов
-  lead_time_days   INTEGER NOT NULL,   -- Фактически применённый lead time
-  priority_index   DECIMAL(10,4),
-  bucket_type      VARCHAR(10) NOT NULL, -- 'daily' | 'weekly'
-  bucket_date      DATE        NOT NULL, -- Для weekly: дата пятницы; для daily: совпадает с need_date
-  supplier_ref1c   VARCHAR(255),       -- Опциональная ссылка на контрагента
-  FOREIGN KEY(run_id)  REFERENCES planning_run(run_id),
-  FOREIGN KEY(item_id) REFERENCES items(item_id),
-  CHECK (bucket_type IN ('daily', 'weekly'))
-);
-
-CREATE INDEX idx_planned_purchase_run ON planned_purchase (run_id);
-CREATE INDEX idx_planned_purchase_item ON planned_purchase (item_id);
-CREATE INDEX idx_planned_purchase_need ON planned_purchase (need_date);
-CREATE INDEX idx_planned_purchase_order ON planned_purchase (order_date);
-CREATE INDEX idx_planned_purchase_bucket ON planned_purchase (bucket_type, bucket_date);
-```
-
-Назначение: заявки на закупку с датами потребности и заказа.
-
----
-
-### 19. capacity_load — Загрузка мощностей по участкам
-```sql
-CREATE TABLE capacity_load (
-  id               SERIAL PRIMARY KEY,
-  run_id           INTEGER NOT NULL,
-  area_id          INTEGER NOT NULL,
-  bucket_type      VARCHAR(10) NOT NULL, -- 'daily' | 'weekly'
-  bucket_date      DATE        NOT NULL,
-  hours_planned    DECIMAL(12,3) NOT NULL DEFAULT 0.0,
-  hours_available  DECIMAL(12,3) NOT NULL DEFAULT 0.0,
-  overload_hours   DECIMAL(12,3) NOT NULL DEFAULT 0.0,
-  FOREIGN KEY(run_id)  REFERENCES planning_run(run_id),
-  FOREIGN KEY(area_id) REFERENCES production_resources(resource_id),
-  CHECK (bucket_type IN ('daily', 'weekly'))
-);
-
-CREATE UNIQUE INDEX ux_capacity_load ON capacity_load (run_id, area_id, bucket_type, bucket_date);
-CREATE INDEX idx_capacity_load_over ON capacity_load (overload_hours DESC);
-```
-
-Назначение: агрегированная загрузка участков по бакетам времени с показателем перегруза.
-
----
-
-### 20. pegging_link — Трассируемость потребностей
-```sql
-CREATE TABLE pegging_link (
-  id               SERIAL PRIMARY KEY,
-  run_id           INTEGER NOT NULL,
-  child_item_id    INTEGER NOT NULL, -- Компонент
-  parent_item_id   INTEGER,          -- Родитель (узел верхнего уровня спроса или промежуточный)
-  demand_ref       TEXT,             -- Источник спроса (например, запись MPS)
-  qty_contribution DECIMAL(15,3) NOT NULL, -- Вклад компонента в потребность
-  need_date        DATE,             -- Дата потребности компонента
-  parent_need_date DATE,             -- Дата потребности родителя
-  FOREIGN KEY(run_id)        REFERENCES planning_run(run_id),
-  FOREIGN KEY(child_item_id) REFERENCES items(item_id),
-  FOREIGN KEY(parent_item_id) REFERENCES items(item_id)
-);
-
-CREATE INDEX idx_pegging_run_child ON pegging_link (run_id, child_item_id);
-CREATE INDEX idx_pegging_run_parent ON pegging_link (run_id, parent_item_id);
-```
-
-Назначение: хранение цепочек «компонент → родительский спрос» для объяснимости результатов планирования.
-
----
-
-## Индексы для производительности (планирование)
-
-```sql
--- Быстрые выборки результатов прогона
-CREATE INDEX idx_planned_order_run_item ON planned_order (run_id, item_id);
-CREATE INDEX idx_planned_order_dates ON planned_order (start_date, finish_date);
-
--- Эффективные сводки по участкам/этапам
-CREATE INDEX idx_pos_area_bucket ON planned_order_stage (area_id, bucket_type, bucket_date);
-CREATE INDEX idx_pos_run_stage ON planned_order_stage (run_id, stage_id);
-
--- Аналитика закупок
-CREATE INDEX idx_pp_item_need ON planned_purchase (item_id, need_date);
-CREATE INDEX idx_pp_item_order ON planned_purchase (item_id, order_date);
-
--- Свободный поиск предупреждений/метаданных прогона
-CREATE INDEX idx_planning_run_kpi_gin ON planning_run USING GIN (kpi);
-CREATE INDEX idx_planning_run_warn_gin ON planning_run USING GIN (warnings);
-```
-
-Примечания:
-- bucket_type и bucket_date унифицируют работу с дневными и недельными бакетами. Для weekly используется дата пятницы соответствующей ISO‑недели.
-- Для planned_order и planned_purchase поля demand_ref и demand_date обеспечивают обратную трассируемость к источнику спроса (MPS). Для углублённой трассируемости применяется таблица pegging_link.
-- Поле order_date в planned_purchase должно вычисляться с округлением на предыдущий рабочий день по календарям модулей ресурсов.
-- Конфигурация планирования хранится в planning_config_versions (JSONB) с версионированием и единственной активной версией.

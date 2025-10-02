@@ -51,6 +51,9 @@
               <div class="col-auto">
                 <q-btn color="primary" label="Синхронизация номенклатуры + ЕИ" @click="syncNomenclature" :loading="loading.syncNomenclature" />
               </div>
+              <div class="col-auto">
+                <q-btn color="primary" label="Синхронизация видов производства" @click="syncProductionKinds" :loading="loading.syncProductionKinds" />
+              </div>
             </div>
 
             <!-- Прогресс-бар синхронизации номенклатуры -->
@@ -150,7 +153,8 @@ const loading = ref({
   syncNomenclature: false,
   syncSpecifications: false,
   syncOperations: false,
-  syncStock: false
+  syncStock: false,
+  syncProductionKinds: false
 })
 
 // --- Реал-тайм прогресс синхронизации номенклатуры ---
@@ -621,6 +625,61 @@ async function syncStock() {
     syncProgress.value.show = false
   } finally {
     loading.value.syncStock = false
+  }
+}
+
+async function syncProductionKinds() {
+  if (!form.value.base_url) {
+    Notify.create({ type: 'warning', message: 'Укажите base_url для подключения к 1С' })
+    return
+  }
+
+  try {
+    loading.value.syncProductionKinds = true
+
+    // Покажем общий прогресс (опрашиваем /v1/sync/progress с ключом 'production_kinds', если поддерживается)
+    syncProgress.value.show = true
+    syncProgress.value.value = 0
+    syncProgress.value.label = '0%'
+    syncProgress.value.details = 'Старт синхронизации видов производства...'
+
+    const payload = {
+      base_url: form.value.base_url,
+      entity_name: 'Catalog_ВидыПроизводства',
+      username: form.value.username || undefined,
+      password: form.value.password || undefined,
+      token: form.value.token || undefined,
+      filter_query: null,
+      select_fields: null,
+      dry_run: false,
+      zero_missing: false
+    }
+
+    const { data } = await api.post('/v1/sync/production-kinds-odata', payload, { timeout: 900000 })
+
+    const created = Number(data?.kinds_created || 0)
+    const updated = Number(data?.kinds_updated || 0)
+    const total = Number(data?.kinds_total || 0)
+
+    syncProgress.value.value = 1
+    syncProgress.value.label = '100%'
+    syncProgress.value.details = `Виды производства: всего ${total}, создано ${created}, обновлено ${updated}`
+
+    Notify.create({
+      type: 'positive',
+      message: `Виды производства синхронизированы • всего ${total}, создано ${created}, обновлено ${updated}`,
+      timeout: 6000
+    })
+
+    setTimeout(() => {
+      syncProgress.value.show = false
+    }, 2500)
+  } catch (e:any) {
+    const msg = e?.response?.data?.detail || e?.message || 'Ошибка синхронизации видов производства'
+    Notify.create({ type: 'negative', message: String(msg) })
+    syncProgress.value.show = false
+  } finally {
+    loading.value.syncProductionKinds = false
   }
 }
 

@@ -116,36 +116,35 @@
           </q-card-section>
 
           <q-card-section>
-            <div class="text-subtitle2 q-mb-sm">Этапы производства:</div>
+            <div class="text-subtitle2 q-mb-sm">Виды производства:</div>
             <q-chip
-              v-for="stage in getResourceStages(resource.resource_id)"
-              :key="stage.id"
+              v-for="pk in getResourceProductionKinds(resource.resource_id)"
+              :key="pk.id"
               removable
-              @remove="removeStageFromResource(resource.resource_id, stage.stage_id)"
+              @remove="removeProductionKindFromResource(resource.resource_id, pk.production_kind_id)"
             >
-              {{ stage.stage_name }}
+              {{ pk.production_kind_name || ('ID ' + pk.production_kind_id) }}
             </q-chip>
-            
+
             <q-select
-              v-model="selectedStageByResource[resource.resource_id]"
-              :options="availableStages(resource.resource_id)"
-              option-label="stage_name"
-              option-value="stage_id"
+              v-model="selectedKindByResource[resource.resource_id]"
+              :options="availableKinds(resource.resource_id)"
+              option-label="name"
+              option-value="id"
               emit-value
               map-options
-              label="Добавить этап"
+              label="Добавить вид производства"
               outlined
               dense
               class="q-mt-md"
-              @update:model-value="stageSelectionChanged(resource.resource_id)"
             >
               <template v-slot:after>
                 <q-btn
                   icon="add"
                   flat
                   round
-                  @click="addStageToResource(resource.resource_id)"
-                  :disable="!selectedStageByResource[resource.resource_id]"
+                  @click="addProductionKindToResource(resource.resource_id)"
+                  :disable="!selectedKindByResource[resource.resource_id]"
                 />
               </template>
             </q-select>
@@ -234,12 +233,12 @@ import { Notify } from 'quasar';
 
 // Состояние
 const resources = ref<any[]>([]);
-const stages = ref<any[]>([]);
-const resourceStages = ref<any[]>([]);
+const productionKinds = ref<any[]>([]);
+const resourceProductionKinds = ref<any[]>([]);
 const searchTerm = ref('');
 const showCreateDialog = ref(false);
 const editingResource = ref(false);
-const selectedStageByResource = ref<Record<number, number | null>>({});
+const selectedKindByResource = ref<Record<number, number | null>>({});
 const saving = ref(false);
 
 // Модель нового участка
@@ -260,9 +259,9 @@ const workScheduleOptions = ref([
 
 // Загрузка данных
 onMounted(async () => {
- await loadResources();
-  await loadStages();
-  await loadResourceStages();
+  await loadResources();
+  await loadProductionKinds();
+  await loadResourceProductionKinds();
 });
 
 // Загрузка участков
@@ -278,9 +277,9 @@ const loadResources = async () => {
       capacity: Number(r?.capacity ?? 0),
       daily_work_hours: Number(r?.daily_work_hours ?? 8.0),
     }));
-    // Синхронизируем выбранные этапы на карточках (переносим прежние значения если были)
-    const prev = selectedStageByResource.value || {};
-    selectedStageByResource.value = Object.fromEntries(
+    // Синхронизируем выбранные виды на карточках (переносим прежние значения если были)
+    const prev = selectedKindByResource.value || {};
+    selectedKindByResource.value = Object.fromEntries(
       resources.value.map((r: any) => [r.resource_id, prev[r.resource_id] ?? null])
     );
   } catch (error: any) {
@@ -293,45 +292,53 @@ const loadResources = async () => {
 };
 
 // Загрузка этапов
-const loadStages = async () => {
+const loadProductionKinds = async () => {
   try {
-    const response = await api.get('/v1/plan/stages');
-    const raw = Array.isArray(response.data) ? response.data : (response.data?.stages || []);
-    stages.value = raw.map((s: any) => ({
-      stage_id: s.stage_id ?? s.id ?? s.value,
-      stage_name: s.stage_name ?? s.name ?? s.label ?? String(s.stage_id ?? s.id ?? s.value),
-    }));
+    const response = await api.get('/v1/resources/production-kinds');
+    const list = Array.isArray(response.data) ? response.data : [];
+    productionKinds.value = list.map((k: any) => ({
+      id: Number(k.id ?? k.production_kind_id ?? k.value),
+      name: String(k.name ?? k.description ?? '').trim() || `ID ${k.id}`
+    })).sort((a: any, b: any) => (a.name || '').localeCompare(b.name || ''));
   } catch (error: any) {
-    console.error('Ошибка загрузки этапов:', error);
+    console.error('Ошибка загрузки видов производства:', error);
     Notify.create({
       type: 'negative',
-      message: `Ошибка загрузки этапов: ${error?.response?.data?.detail || error.message || ''}`.trim()
+      message: `Ошибка загрузки видов производства: ${error?.response?.data?.detail || error.message || ''}`.trim()
     });
   }
 };
 
 // Загрузка связей участок-этап
-const loadResourceStages = async () => {
+const loadResourceProductionKinds = async () => {
   // Сначала очищаем текущие связи
-  resourceStages.value = [];
-  
+  resourceProductionKinds.value = [];
+
+  const pkName = (id: number | string | null | undefined) => {
+    const nid = Number(id ?? 0);
+    const found = productionKinds.value.find((k: any) => Number(k.id) === nid);
+    return found ? found.name : null;
+  };
+
   // Загружаем связи для каждого участка
   for (const resource of resources.value) {
     try {
-      const response = await api.get(`/v1/resources/${resource.resource_id}/stages`);
-      const stagesWithInfo = response.data.map((rs: any) => {
-        const stageInfo = stages.value.find((s: any) => s.stage_id === rs.stage_id);
-        return {
-          ...rs,
-          stage_name: stageInfo ? stageInfo.stage_name : 'Неизвестный этап'
-        };
-      });
-      resourceStages.value.push(...stagesWithInfo);
+      const response = await api.get(`/v1/resources/${resource.resource_id}/production-kinds`);
+      const rows = Array.isArray(response.data) ? response.data : [];
+      const enriched = rows.map((r: any) => ({
+        id: Number(r.id),
+        resource_id: Number(r.resource_id),
+        production_kind_id: Number(r.production_kind_id),
+        production_kind_name: pkName(r.production_kind_id),
+        created_at: r.created_at,
+        updated_at: r.updated_at,
+      }));
+      resourceProductionKinds.value.push(...enriched);
     } catch (error: any) {
-      console.error(`Ошибка загрузки этапов для участка ${resource.resource_id}:`, error);
+      console.error(`Ошибка загрузки видов для участка ${resource.resource_id}:`, error);
       Notify.create({
         type: 'warning',
-        message: `Ошибка загрузки этапов для участка ${resource.resource_id}: ${error?.response?.data?.detail || error.message || ''}`.trim()
+        message: `Ошибка загрузки видов для участка ${resource.resource_id}: ${error?.response?.data?.detail || error.message || ''}`.trim()
       });
     }
   }
@@ -354,21 +361,17 @@ const isFormValid = computed(() => {
 });
 
 // Получение этапов для конкретного участка
-const getResourceStages = (resourceId: number) => {
-  return resourceStages.value.filter(rs => rs.resource_id === resourceId);
+const getResourceProductionKinds = (resourceId: number) => {
+  return resourceProductionKinds.value.filter(r => r.resource_id === resourceId);
 };
 
-/* Получение доступных этапов для участка (глобально не привязанных ни к одному участку)
-   Защита от дурака: один этап может быть назначен только одному участку.
-   Если этап уже присвоен к какому-то участку, он пропадает из списка на добавление у всех. */
-const availableStages = (resourceId: number) => {
-  // Собираем множество всех уже назначенных этапов по всем участкам
-  const globallyAssigned = new Set<number>(
-    (resourceStages.value || []).map((rs: any) => Number(rs.stage_id))
+/* Получение доступных видов для конкретного участка.
+   Глобальная защита от дублей: исключаем виды, которые уже назначены на ЛЮБОЙ участок. */
+const availableKinds = (resourceId: number) => {
+  const assignedGlobally = new Set<number>(
+    (resourceProductionKinds.value || []).map((r: any) => Number(r.production_kind_id))
   );
-
-  // В список добавления попадают только те этапы, которые ещё нигде не назначены
-  return (stages.value || []).filter((stage: any) => !globallyAssigned.has(Number(stage.stage_id)));
+  return (productionKinds.value || []).filter((k: any) => !assignedGlobally.has(Number(k.id)));
 };
 
 // Сброс формы
@@ -431,7 +434,7 @@ const saveResource = async () => {
     }
 
     await loadResources();
-    await loadResourceStages();
+    await loadResourceProductionKinds();
     closeDialog();
   } catch (error: any) {
     console.error('Ошибка сохранения участка:', error);
@@ -464,12 +467,12 @@ const deleteResource = async (resourceId: number) => {
   if (confirm('Вы уверены, что хотите удалить этот участок?')) {
     try {
       await api.delete(`/v1/resources/${resourceId}`);
-      // Очищаем выбранный этап для удаляемого участка
-      if (selectedStageByResource.value && resourceId in selectedStageByResource.value) {
-        delete selectedStageByResource.value[resourceId];
+      // Очищаем выбранный вид производства для удаляемого участка
+      if (selectedKindByResource.value && (resourceId in selectedKindByResource.value)) {
+        delete selectedKindByResource.value[resourceId];
       }
       await loadResources();
-      await loadResourceStages(); // Обновляем связи
+      await loadResourceProductionKinds(); // Обновляем связи
       Notify.create({ type: 'positive', message: 'Участок удален' });
     } catch (error: any) {
       console.error('Ошибка удаления участка:', error);
@@ -501,7 +504,7 @@ const updateResource = async (resource: any) => {
     };
     await api.put(`/v1/resources/${resource.resource_id}`, payload);
     await loadResources();
-    await loadResourceStages();
+    await loadResourceProductionKinds();
   } catch (error: any) {
     console.error('Ошибка обновления участка:', error);
     Notify.create({
@@ -512,47 +515,43 @@ const updateResource = async (resource: any) => {
 };
 
 // Добавление этапа к участку
-const addStageToResource = async (resourceId: number) => {
-  const selected = selectedStageByResource.value[resourceId];
+const addProductionKindToResource = async (resourceId: number) => {
+  const selected = selectedKindByResource.value[resourceId];
   if (!selected) return;
-  
+
   try {
-    await api.post(`/v1/resources/${resourceId}/stages`, {
+    await api.post(`/v1/resources/${resourceId}/production-kinds`, {
       resource_id: resourceId,
-      stage_id: selected
+      production_kind_id: selected
     });
-    
-    await loadResourceStages(); // Обновляем связи
-    selectedStageByResource.value[resourceId] = null;
-    Notify.create({ type: 'positive', message: 'Этап добавлен к участку' });
+    await loadResourceProductionKinds(); // Обновляем связи
+    selectedKindByResource.value[resourceId] = null;
+    Notify.create({ type: 'positive', message: 'Вид производства добавлен к участку' });
   } catch (error: any) {
-    console.error('Ошибка добавления этапа к участку:', error);
+    console.error('Ошибка добавления вида производства к участку:', error);
     Notify.create({
       type: 'negative',
-      message: `Ошибка добавления этапа к участку: ${error?.response?.data?.detail || error.message || ''}`.trim()
+      message: `Ошибка добавления вида производства к участку: ${error?.response?.data?.detail || error.message || ''}`.trim()
     });
   }
 };
 
 // Удаление этапа из участка
-const removeStageFromResource = async (resourceId: number, stageId: number) => {
+const removeProductionKindFromResource = async (resourceId: number, productionKindId: number) => {
   try {
-    await api.delete(`/v1/resources/${resourceId}/stages/${stageId}`);
-    await loadResourceStages(); // Обновляем связи
-    Notify.create({ type: 'positive', message: 'Этап удален из участка' });
+    await api.delete(`/v1/resources/${resourceId}/production-kinds/${productionKindId}`);
+    await loadResourceProductionKinds(); // Обновляем связи
+    Notify.create({ type: 'positive', message: 'Вид производства удален из участка' });
   } catch (error: any) {
-    console.error('Ошибка удаления этапа из участка:', error);
+    console.error('Ошибка удаления вида производства из участка:', error);
     Notify.create({
       type: 'negative',
-      message: `Ошибка удаления этапа из участка: ${error?.response?.data?.detail || error.message || ''}`.trim()
+      message: `Ошибка удаления вида производства из участка: ${error?.response?.data?.detail || error.message || ''}`.trim()
     });
   }
 };
 // Обработка изменения выбора этапа
-const stageSelectionChanged = (resourceId: number) => {
-  // При изменении выбора этапа, ничего дополнительно делать не нужно,
-  // так как значение уже сохраняется в selectedStage
-};
+/* зарезервировано под возможные обработчики выбора вида производства */
 </script>
 
 <style scoped>

@@ -15,6 +15,9 @@ from ..models import (
     ProductionResource,
     ResourceStage,
     SpecOperation,
+    ProductionKind,
+    ResourceProductionKind,
+    Specification,
 )
 
 
@@ -92,6 +95,10 @@ def calculate_resource_distribution(db: Session) -> Dict[str, Any]:
         if iid not in default_spec_map:
             default_spec_map[iid] = sid
 
+    # Загружаем спецификации, чтобы получить вид производства
+    specifications = db.query(Specification).all()
+    spec_by_id: Dict[int, Specification] = {int(spec.spec_id): spec for spec in specifications if spec.spec_id}
+
     components_cache: Dict[int, List[SpecComponent]] = {}
     operations_cache: Dict[int, List[SpecOperation]] = {}
 
@@ -109,16 +116,21 @@ def calculate_resource_distribution(db: Session) -> Dict[str, Any]:
         operations_cache[spec_id] = ops
         return ops
 
-    # Производственные участки и их этапы
+    # Производственные участки и их виды производства (новая логика)
     resources = db.query(ProductionResource).all()
-    resource_stages = db.query(ResourceStage).all()
+    resource_production_kinds = db.query(ResourceProductionKind).all()
 
-    stages_by_resource: Dict[int, Set[int]] = {}
-    for rs in resource_stages:
-        stages_by_resource.setdefault(rs.resource_id, set()).add(rs.stage_id)
+    # Сопоставляем участки с видами производства
+    production_kinds_by_resource: Dict[int, Set[int]] = {}
+    for rpk in resource_production_kinds:
+        production_kinds_by_resource.setdefault(rpk.resource_id, set()).add(rpk.production_kind_id)
 
     all_stages = db.query(ProductionStage).all()
     stage_name_map: Dict[int, str] = {s.stage_id: s.stage_name for s in all_stages}
+
+    # Все виды производства для получения названий
+    all_production_kinds = db.query(ProductionKind).all()
+    production_kind_name_map: Dict[int, str] = {pk.id: pk.name for pk in all_production_kinds}
 
     # Корневые изделия из плана
     root_rows = db.query(RootProduct).all()
@@ -133,7 +145,8 @@ def calculate_resource_distribution(db: Session) -> Dict[str, Any]:
 
     # Новая логика развёртки:
     # - На каждом уровне рассматриваем РОДИТЕЛЯ P (item_id), у которого есть дети-компоненты в его спецификации.
-    # - Этап родителя = единый stage_id всех ЕГО детей (если он один); иначе — ambiguous (ошибка данных).
+    # - Этап родителя по-прежнему определяется по детям (для аналитических целей), но для привязки к участку теперь используется вид производства
+    # - Вид производства родителя = production_kind_id спецификации по умолчанию
     # - Норматив родителя = сумма time_norm всех операций его спецификации; умножаем на количество вхождений (occurrences).
     # - Листья (без детей) сами в распределение не попадают.
     def expand(
@@ -154,6 +167,10 @@ def calculate_resource_distribution(db: Session) -> Dict[str, Any]:
         if not spec_id:
             return
 
+        # Получаем вид производства из спецификации
+        spec = spec_by_id.get(spec_id)
+        parent_production_kind_id = spec.production_kind_id if spec else None
+
         new_path = set(path)
         new_path.add(parent_item_id)
 
@@ -162,7 +179,7 @@ def calculate_resource_distribution(db: Session) -> Dict[str, Any]:
             # Лист — не распределяем, но его stage_id мог определять этап для его родителя (уже учтено на уровне выше)
             return
 
-        # Собираем stage_id из детей РОВНО этого уровня
+        # Собираем stage_id из детей РОВНО этого уровня (для определения этапа родителя - сохраняем для аналитики)
         child_stage_ids: Set[int] = set()
         for comp in comps:
             if comp.stage_id is not None:
@@ -171,7 +188,7 @@ def calculate_resource_distribution(db: Session) -> Dict[str, Any]:
                 except (ValueError, TypeError):
                     continue
 
-        # Определяем этап родителя
+        # Определяем этап родителя (для аналитики, не для привязки к участку)
         parent_stage_id: Optional[int] = None
         if len(child_stage_ids) == 1:
             parent_stage_id = next(iter(child_stage_ids))
@@ -185,6 +202,7 @@ def calculate_resource_distribution(db: Session) -> Dict[str, Any]:
                     "spec_id": spec_id,
                     "reason": "NO_CHILD_STAGE",
                     "child_stage_ids": [],
+                    "production_kind_id": parent_production_kind_id  # добавляем вид производства
                 }
             )
         else:
@@ -197,25 +215,40 @@ def calculate_resource_distribution(db: Session) -> Dict[str, Any]:
                     "spec_id": spec_id,
                     "reason": "MIXED_CHILD_STAGES",
                     "child_stage_ids": sorted(child_stage_ids),
+                    "production_kind_id": parent_production_kind_id  # добавляем вид производства
                 }
             )
 
-        # Если этап родителя определён, фиксируем запись распределения для РОДИТЕЛЯ
-        if parent_stage_id is not None:
+        # Если вид производства родителя определён, фиксируем запись распределения для РОДИТЕЛЯ
+        # Используем вид производства вместо этапа для определения участка
+        if parent_production_kind_id is not None:
             # Норматив родителей: сумма time_norm всех операций ЭТОЙ спецификации (stage операций игнорируем)
             spec_ops = get_operations_for_spec(spec_id)
             parent_norm_hours_single = sum(float(op.time_norm or 0.0) for op in spec_ops)
             total_parent_norm = parent_norm_hours_single
             parent_entries.append(
                 {
-                    "stage_id": parent_stage_id,
+                    "production_kind_id": parent_production_kind_id,
                     "item_id": parent_item_id,
                     "occurrences": float(occurrences or 0.0),
                     "norm_hours": total_parent_norm,
+                    "stage_id": parent_stage_id,  # сохраняем для аналитики
                 }
             )
+        else:
+            # Если вид производства не определён, но этап определён, всё равно добавляем для аналитики
+            if parent_stage_id is not None:
+                parent_entries.append(
+                    {
+                        "stage_id": parent_stage_id,
+                        "item_id": parent_item_id,
+                        "occurrences": float(occurrences or 0.0),
+                        "norm_hours": 0.0,  # не можем рассчитать норму без спецификации
+                        "production_kind_id": None,
+                    }
+                )
 
-        # Независимо от статуса этапа родителя спускаемся ниже — на каждом уровне родителя считаем отдельно
+        # Независимо от статуса этапа/вида производства родителя спускаемся ниже — на каждом уровне родителя считаем отдельно
         for comp in comps:
             try:
                 child_item_id = int(comp.item_id)
@@ -239,72 +272,70 @@ def calculate_resource_distribution(db: Session) -> Dict[str, Any]:
         parent_entries: List[Dict[str, Any]] = []
         expand(rid, 1.0, parent_entries, ambiguous_entries, set())
 
-        # Распределяем РОДИТЕЛЕЙ по участкам на основе их этапа
+        # Распределяем РОДИТЕЛЕЙ по участкам на основе их вида производства
         for entry in parent_entries:
-            stage_id = int(entry["stage_id"])
             parent_item_id = int(entry["item_id"])
             norm_hours_val = float(entry.get("norm_hours", 0.0))
             occurrences_val = float(entry.get("occurrences", 0.0))
+            # Используем вид производства вместо этапа
+            production_kind_id = entry.get("production_kind_id")
+            stage_id = entry.get("stage_id")  # сохраняем для отображения в аналитике
 
             parent_item = item_by_id.get(parent_item_id)
             if not parent_item:
                 continue
 
-            # Подбор кандидатов-участков по этапу
-            candidate_res_ids = [res_id for res_id, st_ids in stages_by_resource.items() if stage_id in st_ids]
+            # Если вид производства определён, используем его для поиска участка
+            if production_kind_id is not None:
+                # Подбор кандидатов-участков по виду производства
+                candidate_res_ids = [res_id for res_id, pk_ids in production_kinds_by_resource.items() if production_kind_id in pk_ids]
 
-            best_resource_id = None
-            if len(candidate_res_ids) == 1:
-                best_resource_id = candidate_res_ids[0]
-            elif len(candidate_res_ids) > 1:
-                stage_name = (stage_name_map.get(stage_id) or "").lower().strip()
-
-                # Ищем "идеального" кандидата по включению имени этапа в имя участка
-                perfect_matches = [
-                    res_id
-                    for res_id in candidate_res_ids
-                    if stage_name in (next((r.resource_name for r in resources if r.resource_id == res_id), "") or "").lower()
-                ]
-
-                if perfect_matches:
-                    best_resource_id = sorted(perfect_matches)[0]
-                else:
+                best_resource_id = None
+                if len(candidate_res_ids) == 1:
+                    best_resource_id = candidate_res_ids[0]
+                elif len(candidate_res_ids) > 1:
+                    # При нескольких кандидатах выбираем первый по порядку
                     best_resource_id = sorted(candidate_res_ids)[0]
 
-            if best_resource_id is not None:
-                # Создаём компонент-строку для РОДИТЕЛЯ
-                dc = DistributedComponent(
-                    item_id=parent_item_id,
-                    item_article=str(parent_item.item_article or ""),
-                    item_code=str(parent_item.item_code or ""),
-                    item_name=str(parent_item.item_name or ""),
-                    qty_per_unit=occurrences_val,  # кратность вхождений родителя в изделии
-                    stock_qty=float(parent_item.stock_qty or 0.0),
-                    replenishment_method=(parent_item.replenishment_method or None),
-                    norm_hours=norm_hours_val,
-                    norm_hours_total=norm_hours_val * occurrences_val,
-                    stage_id=stage_id,
-                    stage_name=stage_name_map.get(stage_id),
-                )
-
-                # Находим или создаём блок продукта для этого участка
-                if best_resource_id not in results_per_resource:
-                    results_per_resource[best_resource_id] = []
-
-                product_block = next(
-                    (p for p in results_per_resource[best_resource_id] if p.root_item_id == rid), None
-                )
-                if not product_block:
-                    product_block = ProductDistributionBlock(
-                        root_item_id=rid,
-                        root_item_code=str(root_item.item_code or ""),
-                        root_item_name=str(root_item.item_name or ""),
-                        components=[],
+                if best_resource_id is not None:
+                    # Создаём компонент-строку для РОДИТЕЛЯ
+                    dc = DistributedComponent(
+                        item_id=parent_item_id,
+                        item_article=str(parent_item.item_article or ""),
+                        item_code=str(parent_item.item_code or ""),
+                        item_name=str(parent_item.item_name or ""),
+                        qty_per_unit=occurrences_val,  # кратность вхождений родителя в изделии
+                        stock_qty=float(parent_item.stock_qty or 0.0),
+                        replenishment_method=(parent_item.replenishment_method or None),
+                        norm_hours=norm_hours_val,
+                        norm_hours_total=norm_hours_val * occurrences_val,
+                        stage_id=stage_id, # сохраняем этап для аналитики
+                        stage_name=stage_name_map.get(stage_id),
                     )
-                    results_per_resource[best_resource_id].append(product_block)
 
-                # ВАЖНО: не удаляем дубликаты по item_id — каждое вхождение учитывается отдельно
-                product_block.components.append(dc.as_dict())
+                    # Находим или создаём блок продукта для этого участка
+                    if best_resource_id not in results_per_resource:
+                        results_per_resource[best_resource_id] = []
+
+                    product_block = next(
+                        (p for p in results_per_resource[best_resource_id] if p.root_item_id == rid), None
+                    )
+                    if not product_block:
+                        product_block = ProductDistributionBlock(
+                            root_item_id=rid,
+                            root_item_code=str(root_item.item_code or ""),
+                            root_item_name=str(root_item.item_name or ""),
+                            components=[],
+                        )
+                        results_per_resource[best_resource_id].append(product_block)
+
+                    # ВАЖНО: не удаляем дубликаты по item_id — каждое вхождение учитывается отдельно
+                    product_block.components.append(dc.as_dict())
+            else:
+                # Если вид производства не определён, но этап определён, можно попробовать использовать старую логику
+                # или пропустить этот элемент
+                # В текущей реализации такие элементы не будут распределены по участкам
+                pass
 
     # Финальная сборка
     output_data: List[Dict[str, Any]] = []

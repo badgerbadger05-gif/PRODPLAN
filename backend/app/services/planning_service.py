@@ -27,6 +27,9 @@ from ..models import (
     ResourceStage,
     ProductionStage,
     SpecOperation,
+    ProductionKind,
+    ResourceProductionKind,
+    Specification,
 )
 from .stage_logic import determine_parent_stage_and_norm
 
@@ -1513,6 +1516,10 @@ def run_planning_run(
             except Exception:
                 continue
 
+        # Load specifications to get production kind info
+        specifications: List[Specification] = db.query(Specification).all()
+        spec_by_id: Dict[int, Specification] = {int(spec.spec_id): spec for spec in specifications if spec.spec_id}
+
         components_cache: Dict[int, List[SpecComponent]] = {}
         operations_cache: Dict[int, List[SpecOperation]] = {}
 
@@ -1530,25 +1537,32 @@ def run_planning_run(
             operations_cache[spec_id] = ops
             return ops
 
-        # Resources and stage mapping
+        # Resources list
         resources: List[ProductionResource] = db.query(ProductionResource).all()
-        resource_stages: List[ResourceStage] = db.query(ResourceStage).all()
-        stages_by_resource: Dict[int, Set[int]] = {}
-        for rs in resource_stages:
-            stages_by_resource.setdefault(int(rs.resource_id), set()).add(int(rs.stage_id))
+
+        # Resources and production kind mapping (new logic)
+        resource_production_kinds: List[ResourceProductionKind] = db.query(ResourceProductionKind).all()
+        production_kinds_by_resource: Dict[int, Set[int]] = {}
+        for rpk in resource_production_kinds:
+            production_kinds_by_resource.setdefault(int(rpk.resource_id), set()).add(int(rpk.production_kind_id))
 
         all_stages: List[ProductionStage] = db.query(ProductionStage).all()
         stage_name_map: Dict[int, str] = {int(s.stage_id): str(s.stage_name or "") for s in all_stages}
 
-        # Item-level cached analysis: stage_id and norm_hours (per unit)
+        # All production kinds for name lookup
+        all_production_kinds: List[ProductionKind] = db.query(ProductionKind).all()
+        production_kind_name_map: Dict[int, str] = {int(pk.id): str(pk.name or "") for pk in all_production_kinds}
+
+        # Item-level cached analysis: stage_id, production_kind_id and norm_hours (per unit)
         item_stage_cache: Dict[int, Tuple[Optional[int], Optional[str]]] = {}
         item_norm_cache: Dict[int, float] = {}
+        item_production_kind_cache: Dict[int, Optional[int]] = {}
 
-        def analyze_parent_item(item_id: int) -> Tuple[Optional[int], Optional[str], float]:
+        def analyze_parent_item(item_id: int) -> Tuple[Optional[int], Optional[str], float, Optional[int]]:
             """
             Delegates stage determination and norm-hours calculation to shared helper,
             aligned with 'Распределение этапов' page logic.
-            Returns (stage_id or None, reason_if_ambiguous, norm_hours_single).
+            Returns (stage_id or None, reason_if_ambiguous, norm_hours_single, production_kind_id or None).
 
             Domain overrides for painting:
             - If operations' majority stage corresponds to painting ('покраска'/'paint'), force painting.
@@ -1556,9 +1570,9 @@ def run_planning_run(
               force painting.
             """
             # cache hit
-            if item_id in item_stage_cache and item_id in item_norm_cache:
+            if item_id in item_stage_cache and item_id in item_norm_cache and item_id in item_production_kind_cache:
                 st, reason = item_stage_cache[item_id]
-                return st, reason, item_norm_cache[item_id]
+                return st, reason, item_norm_cache[item_id], item_production_kind_cache[item_id]
 
             stg_id, rsn, nh = determine_parent_stage_and_norm(
                 default_spec_map=default_spec_map,
@@ -1566,6 +1580,14 @@ def run_planning_run(
                 get_operations_for_spec=get_operations_for_spec,
                 item_id=int(item_id),
             )
+
+            # Get production kind from specification
+            spec_id = default_spec_map.get(int(item_id))
+            production_kind_id = None
+            if spec_id:
+                spec = spec_by_id.get(int(spec_id))
+                if spec:
+                    production_kind_id = spec.production_kind_id
 
             # Helpers
             def _painting_stage_id() -> Optional[int]:
@@ -1610,65 +1632,64 @@ def run_planning_run(
                 return False
 
             # Painting override: from operations majority
-            try:
-                spec_id_local = default_spec_map.get(int(item_id))
-                op_major: Optional[int] = None
-                if spec_id_local:
-                    ops_local = get_operations_for_spec(int(spec_id_local)) or []
-                    from collections import defaultdict as _dd
-                    op_counts: Dict[int, int] = _dd(int)
-                    for op in ops_local:
-                        sid = getattr(op, "stage_id", None)
-                        if sid is None:
-                            continue
-                        try:
-                            op_counts[int(sid)] += 1
-                        except Exception:
-                            continue
-                    if op_counts:
-                        max_cnt = max(op_counts.values())
-                        top = [sid for sid, cnt in op_counts.items() if cnt == max_cnt]
-                        if len(top) == 1:
-                            op_major = int(top[0])
+            # Apply only if production_kind_id is not defined (to maintain priority of production kinds)
+            if production_kind_id is None:
+                try:
+                    spec_id_local = default_spec_map.get(int(item_id))
+                    op_major: Optional[int] = None
+                    if spec_id_local:
+                        ops_local = get_operations_for_spec(int(spec_id_local)) or []
+                        from collections import defaultdict as _dd
+                        op_counts: Dict[int, int] = _dd(int)
+                        for op in ops_local:
+                            sid = getattr(op, "stage_id", None)
+                            if sid is None:
+                                continue
+                            try:
+                                op_counts[int(sid)] += 1
+                            except Exception:
+                                continue
+                        if op_counts:
+                            max_cnt = max(op_counts.values())
+                            top = [sid for sid, cnt in op_counts.items() if cnt == max_cnt]
+                            if len(top) == 1:
+                                op_major = int(top[0])
 
-                # Apply only when base stage is not determined yet
-                if stg_id is None and op_major is not None and _is_painting_stage(op_major):
-                    stg_id = int(op_major)
-                    rsn = "FORCE_PAINTING_FROM_OPERATIONS"
-            except Exception:
-                # fail-safe: ignore override on any error
-                pass
+                    # Apply only when base stage is not determined yet
+                    if stg_id is None and op_major is not None and _is_painting_stage(op_major):
+                        stg_id = int(op_major)
+                        rsn = "FORCE_PAINTING_FROM_OPERATIONS"
+                except Exception:
+                    # fail-safe: ignore override on any error
+                    pass
 
-            # Painting override: by item attributes (name/article/code) — behind config flag and only when stage is not defined
-            try:
-                enable_by_name = bool(((snapshot.get("production") or {}).get("toggles") or {}).get("force_painting_by_name", False))
-                if enable_by_name and stg_id is None and _looks_painted():
-                    paint_sid = _painting_stage_id()
-                    if paint_sid is not None:
-                        stg_id = int(paint_sid)
-                        rsn = "FORCE_PAINTING_BY_NAME"
-            except Exception:
-                pass
+                # Painting override: by item attributes (name/article/code) — behind config flag and only when stage is not defined
+                try:
+                    enable_by_name = bool(((snapshot.get("production") or {}).get("toggles") or {}).get("force_painting_by_name", False))
+                    if enable_by_name and stg_id is None and _looks_painted():
+                        paint_sid = _painting_stage_id()
+                        if paint_sid is not None:
+                            stg_id = int(paint_sid)
+                            rsn = "FORCE_PAINTING_BY_NAME"
+                except Exception:
+                    pass
 
             item_stage_cache[item_id] = (stg_id, rsn)
             item_norm_cache[item_id] = float(nh or 0.0)
-            return stg_id, rsn, float(nh or 0.0)
+            item_production_kind_cache[item_id] = production_kind_id
+            return stg_id, rsn, float(nh or 0.0), production_kind_id
 
-        def pick_area_for_stage(stage_id: int) -> Optional[int]:
-            candidates = [rid for rid, stset in stages_by_resource.items() if stage_id in stset]
+        def pick_area_for_production_kind(production_kind_id: int) -> Optional[int]:
+            """Pick area based on production kind mapping"""
+            candidates = [rid for rid, pkset in production_kinds_by_resource.items() if production_kind_id in pkset]
             if not candidates:
                 return None
             if len(candidates) == 1:
                 return candidates[0]
-            # Heuristic by name contains stage name
-            st_name = (stage_name_map.get(stage_id) or "").lower().strip()
-            def _res_name(res_id: int) -> str:
-                r = next((x for x in resources if int(x.resource_id) == int(res_id)), None)
-                return (r.resource_name or "").lower().strip() if r else ""
-            perfect = [rid for rid in candidates if st_name and st_name in _res_name(rid)]
-            if perfect:
-                return sorted(perfect)[0]
+            # Heuristic: return first candidate sorted by id
             return sorted(candidates)[0]
+
+        # Stage-based area mapping removed (migration to production kinds)
 
         # 6) Backward scheduling of stages by days with resource capacity
         stages_created = 0
@@ -1690,9 +1711,12 @@ def run_planning_run(
         # Accumulator of planned hours per (area_id, day)
         capacity_usage_daily: DefaultDict[Tuple[int, date], float] = defaultdict(float)
 
-        def _pick_area_for_day(stage_id_val: int, d: date) -> Optional[int]:
+        def _pick_area_for_day(stage_id_val: int, production_kind_id_val: Optional[int], d: date) -> Optional[int]:
             # Choose candidate resource with maximum free capacity on date d
-            candidates = [rid for rid, stset in stages_by_resource.items() if stage_id_val in stset]
+            # Use ONLY production kind mapping (no stage fallback per migration plan)
+            candidates = []
+            if production_kind_id_val is not None:
+                candidates = [rid for rid, pkset in production_kinds_by_resource.items() if production_kind_id_val in pkset]
             if not candidates:
                 return None
             best_rid: Optional[int] = None
@@ -1710,14 +1734,15 @@ def run_planning_run(
 
         d0: date = date.today()
 
-        # Track missing stage->area mappings summary
+        # Track missing mappings summary (production kind primary, stage kept for analytics/backward compatibility)
+        missing_area_pk_counts: DefaultDict[int, int] = defaultdict(int)
         missing_area_stage_counts: DefaultDict[int, int] = defaultdict(int)
 
         for order in created_orders:
             item_id = int(order.item_id)
             qty = float(order.qty or 0.0)
-            stage_id, reason, norm_single = analyze_parent_item(item_id)
-            if stage_id is None:
+            stage_id, reason, norm_single, production_kind_id = analyze_parent_item(item_id)
+            if stage_id is None and production_kind_id is None:
                 if reason in {"NO_CHILD_STAGE", "MIXED_CHILD_STAGES"}:
                     warnings.append(
                         {
@@ -1726,16 +1751,24 @@ def run_planning_run(
                             "item_id": item_id,
                         }
                     )
-                # Skip if stage undefined
+                # Skip if both stage and production kind are undefined
                 continue
 
-            # Pick candidate areas for this stage; require at least one mapping
-            candidate_res_ids = [rid for rid, stset in stages_by_resource.items() if int(stage_id) in stset]
+            # Pick candidate areas based on production kind first, then stage as fallback
+            candidate_res_ids = []
+            if production_kind_id is not None:
+                candidate_res_ids = [rid for rid, pkset in production_kinds_by_resource.items() if production_kind_id in pkset]
+            # No stage-based fallback per migration plan
             if not candidate_res_ids:
-                warnings.append(
-                    {"code": "NO_AREA_FOR_STAGE", "msg": f"No resource area for stage_id={int(stage_id)}", "stage_id": int(stage_id)}
-                )
-                missing_area_stage_counts[int(stage_id)] += 1
+                if production_kind_id is not None:
+                    warnings.append(
+                        {"code": "NO_AREA_FOR_PRODUCTION_KIND", "msg": f"No resource area for production_kind_id={int(production_kind_id)}", "production_kind_id": int(production_kind_id)}
+                    )
+                    missing_area_pk_counts[int(production_kind_id)] += 1
+                else:
+                    warnings.append(
+                        {"code": "NO_PRODUCTION_KIND", "msg": f"No production kind for item_id={int(item_id)}", "item_id": int(item_id)}
+                    )
                 continue
 
             total_hours = float(norm_single or 0.0) * float(qty or 0.0)
@@ -1744,15 +1777,17 @@ def run_planning_run(
             # If total norm-hours is <= 0, we still create a stage slice with hours=0
             # so the order is grouped by stage/area in UI (instead of falling into '—').
             if total_hours <= 1e-9:
-                sel_area_id = pick_area_for_stage(int(stage_id))
+                sel_area_id = None
+                if production_kind_id is not None:
+                    sel_area_id = pick_area_for_production_kind(int(production_kind_id))
                 if sel_area_id is None:
-                    # Fallback: choose any mapped resource for stability
+                    # Fallback: choose any mapped resource for stability (based on already computed candidates)
                     sel_area_id = int(sorted(candidate_res_ids)[0]) if candidate_res_ids else None
                 if sel_area_id is not None:
                     pos = PlannedOrderStage(
                         run_id=run_id,
                         order_id=int(order.order_id),
-                        stage_id=int(stage_id),
+                        stage_id=int(stage_id) if stage_id is not None else None,  # Stage still used for operations
                         area_id=int(sel_area_id),
                         bucket_type="daily",
                         bucket_date=order.need_date,
@@ -1766,9 +1801,9 @@ def run_planning_run(
                 else:
                     warnings.append(
                         {
-                            "code": "NO_AREA_FOR_STAGE_ZERO_NORM",
-                            "msg": f"No resource area resolved for zero-norm stage_id={int(stage_id)}",
-                            "stage_id": int(stage_id),
+                            "code": "NO_AREA_FOR_PRODUCTION_KIND_ZERO_NORM",
+                            "msg": f"No resource area resolved for zero-norm production_kind_id={int(production_kind_id) if production_kind_id is not None else 'N/A'}",
+                            "production_kind_id": int(production_kind_id) if production_kind_id is not None else None,
                             "order_id": int(order.order_id),
                         }
                     )
@@ -1786,7 +1821,7 @@ def run_planning_run(
                     cur = cur - timedelta(days=1)
                     continue
 
-                sel_area_id = _pick_area_for_day(int(stage_id), cur)
+                sel_area_id = _pick_area_for_day(int(stage_id) if stage_id is not None else None, production_kind_id, cur)
                 if sel_area_id is None:
                     # no area mapping at all (should have been caught above) – skip day
                     cur = cur - timedelta(days=1)
@@ -1810,7 +1845,7 @@ def run_planning_run(
                 pos = PlannedOrderStage(
                     run_id=run_id,
                     order_id=int(order.order_id),
-                    stage_id=int(stage_id),
+                    stage_id=int(stage_id) if stage_id is not None else None,
                     area_id=int(sel_area_id),
                     bucket_type="daily",
                     bucket_date=cur,
@@ -1836,12 +1871,12 @@ def run_planning_run(
                     fb = fb - timedelta(days=1)
                     tries -= 1
 
-                sel_area_id_fb = _pick_area_for_day(int(stage_id), fb) or int(sorted(candidate_res_ids)[0])
+                sel_area_id_fb = _pick_area_for_day(int(stage_id) if stage_id is not None else None, production_kind_id, fb) or int(sorted(candidate_res_ids)[0])
 
                 pos = PlannedOrderStage(
                     run_id=run_id,
                     order_id=int(order.order_id),
-                    stage_id=int(stage_id),
+                    stage_id=int(stage_id) if stage_id is not None else None,
                     area_id=int(sel_area_id_fb),
                     bucket_type="daily",
                     bucket_date=fb,
@@ -1941,15 +1976,15 @@ def run_planning_run(
                 }
             )
 
-        # Summary of missing stage->area mappings
-        if missing_area_stage_counts:
+        # Summary of missing production_kind->area mappings
+        if missing_area_pk_counts:
             warnings.append(
                 {
-                    "code": "NO_AREA_FOR_STAGE_SUMMARY",
-                    "msg": "Missing resource area mapping for stages",
-                    "by_stage": [
-                        {"stage_id": int(sid), "stage_name": stage_name_map.get(int(sid)), "count": int(cnt)}
-                        for sid, cnt in sorted(missing_area_stage_counts.items())
+                    "code": "NO_AREA_FOR_PRODUCTION_KIND_SUMMARY",
+                    "msg": "Missing resource area mapping for production kinds",
+                    "by_production_kind": [
+                        {"production_kind_id": int(pkid), "production_kind_name": production_kind_name_map.get(int(pkid)), "count": int(cnt)}
+                        for pkid, cnt in sorted(missing_area_pk_counts.items())
                     ],
                 }
             )
