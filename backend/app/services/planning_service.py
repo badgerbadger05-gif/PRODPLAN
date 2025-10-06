@@ -1761,13 +1761,51 @@ def run_planning_run(
             # No stage-based fallback per migration plan
             if not candidate_res_ids:
                 if production_kind_id is not None:
+                    # Enrich diagnostic: item + spec + production kind name
+                    try:
+                        item_rec = item_by_id.get(int(item_id))
+                    except Exception:
+                        item_rec = None
+                    try:
+                        spec_id_local = default_spec_map.get(int(item_id))
+                    except Exception:
+                        spec_id_local = None
+                    spec_ref1c_local = None
+                    if spec_id_local is not None:
+                        try:
+                            spec_local = spec_by_id.get(int(spec_id_local))
+                            if spec_local is not None:
+                                spec_ref1c_local = getattr(spec_local, "spec_ref1c", None)
+                        except Exception:
+                            spec_ref1c_local = None
+                    pk_name = None
+                    try:
+                        pk_name = production_kind_name_map.get(int(production_kind_id))
+                    except Exception:
+                        pk_name = None
+
                     warnings.append(
-                        {"code": "NO_AREA_FOR_PRODUCTION_KIND", "msg": f"No resource area for production_kind_id={int(production_kind_id)}", "production_kind_id": int(production_kind_id)}
+                        {
+                            "code": "NO_AREA_FOR_PRODUCTION_KIND",
+                            "msg": f"No resource area for production_kind_id={int(production_kind_id)}",
+                            "production_kind_id": int(production_kind_id),
+                            "production_kind_name": pk_name,
+                            "item_id": int(item_id),
+                            "item_code": getattr(item_rec, "item_code", None) if item_rec is not None else None,
+                            "item_name": getattr(item_rec, "item_name", None) if item_rec is not None else None,
+                            "item_article": getattr(item_rec, "item_article", None) if item_rec is not None else None,
+                            "spec_id": int(spec_id_local) if spec_id_local is not None else None,
+                            "spec_ref1c": spec_ref1c_local,
+                        }
                     )
                     missing_area_pk_counts[int(production_kind_id)] += 1
                 else:
                     warnings.append(
-                        {"code": "NO_PRODUCTION_KIND", "msg": f"No production kind for item_id={int(item_id)}", "item_id": int(item_id)}
+                        {
+                            "code": "NO_PRODUCTION_KIND",
+                            "msg": f"No production kind for item_id={int(item_id)}",
+                            "item_id": int(item_id),
+                        }
                     )
                 continue
 
@@ -1799,12 +1837,43 @@ def run_planning_run(
                     order.start_date = order.need_date
                     order.finish_date = order.need_date
                 else:
+                    # Enrich zero-norm diagnostic with item/spec/pk info
+                    try:
+                        item_rec_zn = item_by_id.get(int(order.item_id))
+                    except Exception:
+                        item_rec_zn = None
+                    try:
+                        spec_id_zn = default_spec_map.get(int(order.item_id))
+                    except Exception:
+                        spec_id_zn = None
+                    spec_ref1c_zn = None
+                    if spec_id_zn is not None:
+                        try:
+                            spec_zn = spec_by_id.get(int(spec_id_zn))
+                            if spec_zn is not None:
+                                spec_ref1c_zn = getattr(spec_zn, "spec_ref1c", None)
+                        except Exception:
+                            spec_ref1c_zn = None
+                    pk_name_zn = None
+                    if production_kind_id is not None:
+                        try:
+                            pk_name_zn = production_kind_name_map.get(int(production_kind_id))
+                        except Exception:
+                            pk_name_zn = None
+
                     warnings.append(
                         {
                             "code": "NO_AREA_FOR_PRODUCTION_KIND_ZERO_NORM",
                             "msg": f"No resource area resolved for zero-norm production_kind_id={int(production_kind_id) if production_kind_id is not None else 'N/A'}",
                             "production_kind_id": int(production_kind_id) if production_kind_id is not None else None,
+                            "production_kind_name": pk_name_zn,
                             "order_id": int(order.order_id),
+                            "item_id": int(order.item_id),
+                            "item_code": getattr(item_rec_zn, "item_code", None) if item_rec_zn is not None else None,
+                            "item_name": getattr(item_rec_zn, "item_name", None) if item_rec_zn is not None else None,
+                            "item_article": getattr(item_rec_zn, "item_article", None) if item_rec_zn is not None else None,
+                            "spec_id": int(spec_id_zn) if spec_id_zn is not None else None,
+                            "spec_ref1c": spec_ref1c_zn,
                         }
                     )
                 # Skip regular scheduling in zero-norm case

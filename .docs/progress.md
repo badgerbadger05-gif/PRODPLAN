@@ -115,3 +115,59 @@
 Примечание по деплою:
 - Прогнать миграции БД (после разрешения возможных дублей): `alembic upgrade head`
 - Перезапустить backend‑сервис, чтобы подхватить изменения кода и схем.
+
+### Fix: Прод — отсутствие столбца specifications.production_kind_id (Октябрь 2025)
+- Симптом: при синхронизации спецификаций на проде возникала ошибка:
+  psycopg2.errors.UndefinedColumn: column specifications.production_kind_id does not exist
+- Контекст: код ожидает поле в модели [Specification.production_kind_id](backend/app/models.py:82), добавляемое миграцией [add_production_kinds_tables.upgrade()](backend/alembic/versions/20251002_04_add_production_kinds_tables.py:19), и заполняется при синхронизации в [sync_specifications_from_odata()](backend/app/services/specification_sync.py:31).
+- Диагноз:
+  - Alembic не знал текущую версию (alembic current ничего не показывал изначально).
+  - Ранние таблицы уже существовали (частичный ручной/вне‑Alembic DDL ранее), из‑за чего upgrade пытался пересоздать существующие объекты и падал.
+  - Таблицы production_kinds/resource_production_kinds были на проде, но колонка specifications.production_kind_id отсутствовала.
+- Решение на проде (идемпотентно):
+  1) Быстрая диагностика:
+     ```
+     docker compose exec -T db psql -U prodplan -d prodplan -Atc "SELECT to_regclass('public.production_kinds');"
+     docker compose exec -T db psql -U prodplan -d prodplan -Atc "SELECT to_regclass('public.resource_production_kinds');"
+     docker compose exec -T db psql -U prodplan -d prodplan -Atc "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='specifications' AND column_name='production_kind_id';"
+     ```
+  2) Добавили недостающие объекты для specifications:
+     ```
+     docker compose exec -T db psql -U prodplan -d prodplan -c "ALTER TABLE specifications ADD COLUMN IF NOT EXISTS production_kind_id INTEGER;"
+     docker compose exec -T db psql -U prodplan -d prodplan -c "ALTER TABLE specifications ADD CONSTRAINT fk_specifications_production_kind FOREIGN KEY (production_kind_id) REFERENCES production_kinds(id);"
+     docker compose exec -T db psql -U prodplan -d prodplan -c "CREATE INDEX IF NOT EXISTS ix_specifications_production_kind_id ON specifications(production_kind_id);"
+     ```
+  3) Проставили версию Alembic на состояние этой миграции:
+     ```
+     docker compose exec -T backend alembic stamp 20251002_04
+     ```
+  4) Контроль и перезапуск:
+     ```
+     docker compose exec -T backend alembic current
+     docker compose restart backend
+     ```
+- Результат: alembic current показывает 20251002_04/HEAD, backend перезапущен, синхронизация спецификаций проходит без ошибок.
+- Рекомендации по деплою:
+  - После git pull обязательно выполнять alembic upgrade head, чтобы исключить дрейф схемы.
+  - При несоответствии схемы и истории — выравнивать через alembic stamp на фактическую версию, затем применять недостающие миграции.
+  - Опционально применить миграцию глобальной уникальности (может потребовать устранить дубли):
+    ```
+    docker compose exec -T backend alembic upgrade 20251002_05
+    docker compose exec -T db psql -U prodplan -d prodplan -c "SELECT production_kind_id, COUNT(*) FROM resource_production_kinds GROUP BY production_kind_id HAVING COUNT(*) > 1;"
+    ```
+
+### Feature: Диагностика NO_AREA_FOR_PRODUCTION_KIND (Октябрь 2025)
+- Требование: при отсутствии привязки вида производства к участку показывать окно с деталями (номенклатура, спецификация, проблемный вид).
+- Backend:
+  - Расширены предупреждения для случаев отсутствия привязки вида производства:
+    - NO_AREA_FOR_PRODUCTION_KIND — теперь содержит: production_kind_id, production_kind_name, item_id, item_code, item_name, item_article, spec_id, spec_ref1c. Изменения внутри [run_planning_run()](backend/app/services/planning_service.py:1330), блок формирования предупреждения при пустых кандидатов для вида (см. добавку на участке выбора area по виду производства).
+    - NO_AREA_FOR_PRODUCTION_KIND_ZERO_NORM — аналогично расширено: добавлены item/spec/pk поля для нулевых норм. Изменения в [run_planning_run()](backend/app/services/planning_service.py:1330) в ветке zero‑norm.
+- Frontend:
+  - На странице результатов MRP добавлена кнопка и диалог для проблем привязки:
+    - Кнопка «Проблемы привязки видов» рядом с блоком предупреждений (см. [MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:78)).
+    - Диалог с таблицей (Номенклатура, Артикул, Спецификация, Вид производства) — берёт данные из summary.warnings, фильтруя по code = 'NO_AREA_FOR_PRODUCTION_KIND' | 'NO_AREA_FOR_PRODUCTION_KIND_ZERO_NORM' (см. вычисления и колонки в [MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:584) и разметку диалога [MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:482)).
+- Эффект:
+  - При возникновении проблем по видам производства пользователь видит агрегированное окно с конкретными позициями и видами, что ускоряет назначение связей в UI «Производственные ресурсы».
+- Примечания к деплою:
+  - Миграций не требуется.
+  - Для появления расширенных данных в окне необходимо запускать новые прогоны MRP после обновления backend — старые прогоны могли не содержать детализированных полей в warnings.

@@ -75,6 +75,10 @@
               </div>
             </q-expansion-item>
           </q-card-section>
+          <q-card-section v-if="kindIssues.length">
+            <q-btn dense color="negative" icon="report_problem" label="Проблемы привязки видов" @click="showKindIssuesDialog = true" />
+            <span class="text-grey q-ml-sm">({{ kindIssues.length }})</span>
+          </q-card-section>
         </q-card>
       </div>
     </div>
@@ -475,6 +479,26 @@
         </q-table>
       </q-tab-panel>
     </q-tab-panels>
+    <!-- Диалог: проблемы привязки видов производства -->
+    <q-dialog v-model="showKindIssuesDialog">
+      <q-card style="min-width: 900px; max-width: 95vw;">
+        <q-card-section class="row items-center">
+          <div class="text-h6">Проблемы привязки видов производства</div>
+          <q-space />
+          <q-btn flat icon="close" round dense v-close-popup />
+        </q-card-section>
+        <q-separator />
+        <q-card-section>
+          <q-table
+            dense
+            :rows="kindIssuesRows"
+            :columns="kindIssuesColumns"
+            row-key="key"
+            :pagination="{ rowsPerPage: 50 }"
+          />
+        </q-card-section>
+      </q-card>
+    </q-dialog>
   </q-page>
 </template>
 
@@ -576,6 +600,39 @@ const summary = ref<any | null>(null)
 const tab = ref<'production' | 'purchases' | 'capacity' | 'pegging' | 'components'>('production')
 // Вкладки верхнего уровня для унифицированных таблиц
 const viewTab = ref<'production' | 'purchases'>('production')
+
+// ---- Диагностика проблем привязки видов производства ----
+const showKindIssuesDialog = ref(false)
+const kindIssues = computed(() => {
+  const arr = (summary.value?.warnings || []) as any[]
+  return arr.filter((w: any) =>
+    String(w?.code || '') === 'NO_AREA_FOR_PRODUCTION_KIND' ||
+    String(w?.code || '') === 'NO_AREA_FOR_PRODUCTION_KIND_ZERO_NORM'
+  )
+})
+const kindIssuesColumns: QTableColumn<any>[] = [
+  { name: 'pk', label: 'Вид (ID)', field: (r: any) => r.production_kind_id, align: 'right' },
+  { name: 'pk_name', label: 'Вид производства', field: 'production_kind_name', align: 'left' },
+  { name: 'item', label: 'Номенклатура', field: (r: any) => r.item_name || (r.item_id ? `Номенклатура #${r.item_id}` : '—'), align: 'left' },
+  { name: 'article', label: 'Артикул', field: 'item_article', align: 'left' },
+  { name: 'item_id', label: 'item_id', field: 'item_id', align: 'right' },
+  { name: 'spec', label: 'Спецификация', field: (r: any) => r.spec_ref1c || r.spec_id || '—', align: 'left' },
+  { name: 'code', label: 'Код', field: 'code', align: 'left' },
+]
+const kindIssuesRows = computed(() => {
+  return (kindIssues.value || []).map((w: any, idx: number) => ({
+    key: idx,
+    production_kind_id: w?.production_kind_id ?? null,
+    production_kind_name: w?.production_kind_name ?? null,
+    item_id: w?.item_id ?? null,
+    item_code: w?.item_code ?? null,
+    item_name: w?.item_name ?? null,
+    item_article: w?.item_article ?? null,
+    spec_id: w?.spec_id ?? null,
+    spec_ref1c: w?.spec_ref1c ?? null,
+    code: w?.code ?? ''
+  }))
+})
 
 // Popup флаг для выбора даты «День задания»
 const showDayPopup = ref(false)
