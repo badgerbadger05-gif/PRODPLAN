@@ -1474,12 +1474,25 @@ function emptyToUndef(s: string): string | undefined {
 
 // --- Helpers: date range filters for upper unified tables ---
 function dateInRange(dt: string | null | undefined, from?: string, to?: string): boolean {
-  if (!dt) return false
-  const d = String(dt).slice(0, 10) // YYYY-MM-DD
-  if (from && d < from) return false
-  if (to && d > to) return false
+  const d = dt ? String(dt).slice(0, 10) : undefined
+  const f = from ? String(from).slice(0, 10) : undefined
+  const t = to ? String(to).slice(0, 10) : undefined
+
+  // Если нет даты строки — не отфильтровываем на клиенте
+  if (!d) return true
+
+  let a = f
+  let b = t
+  // Если пользователь перепутал границы — переставим
+  if (a && b && a > b) {
+    const tmp = a; a = b; b = tmp
+  }
+
+  if (a && d < a) return false
+  if (b && d > b) return false
   return true
 }
+
 
 function inProdRange(row: any): boolean {
   const from = emptyToUndef(prod.filter.date_from)
