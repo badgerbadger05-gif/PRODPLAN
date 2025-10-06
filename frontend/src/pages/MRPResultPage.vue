@@ -113,6 +113,7 @@
             <q-input v-model="prod.filter.date_to" dense outlined label="До даты (YYYY-MM-DD)" style="width: 200px" />
             <q-btn dense color="primary" icon="search" @click="loadProduction()" />
             <q-btn dense flat icon="refresh" @click="loadProduction()" />
+            <q-btn dense flat icon="clear" label="Сбросить фильтры" @click="resetFilters" />
             <q-separator vertical class="q-mx-xs" />
             <q-btn dense flat icon="download" label="CSV" @click="exportProd('csv')" />
             <q-btn dense flat icon="table_view" label="XLSX" @click="exportProd('xlsx')" />
@@ -1353,6 +1354,22 @@ function applyDayFilter() {
   loadCapacityUpperDay()
 }
 
+// Сброс фильтров (день, бакет, даты) и перезагрузка данных
+function resetFilters() {
+  // Очистка фильтров
+  prod.filter.bucket_type = undefined as any
+  prod.filter.date_from = ''
+  prod.filter.date_to = ''
+  prod.filter.day_date = ''
+  // Очистка агрегатов/индикаторов дня
+  dailyAgendaGroups.value = []
+  dayCapUpper.value = {}
+  // Перезагрузка наборов
+  loadProduction()
+  loadPurchases()
+  loadCapacityUpper()
+}
+
 // Открыть попап выбора даты
 function openDayPicker(e?: Event) {
   try {
@@ -1483,14 +1500,6 @@ function inPurchRange(row: any): boolean {
 }
 
 onMounted(async () => {
-  // День по умолчанию — сегодня (для повестки цеха на день)
-  try {
-    if (!prod.filter.day_date) {
-      const t = new Date()
-      const d = new Date(Date.UTC(t.getFullYear(), t.getMonth(), t.getDate()))
-      prod.filter.day_date = d.toISOString().slice(0, 10)
-    }
-  } catch {}
   await loadSummary()
   // Загружаем все данные параллельно
   await Promise.all([
@@ -1547,13 +1556,8 @@ watch(() => capUpper.value, () => {
 // Ежедневная повестка: пересчёт при изменении выбранного дня/полного набора + принудительный серверный фильтр на день
 watch([() => prodAllRows.value, () => prod.filter.day_date], () => {
   const day = (prod.filter.day_date || '').slice(0, 10)
-  if (day) {
-    // Узкий серверный фильтр (bucket=daily) — предотвращает «сваливание» всего диапазона
-    prod.filter.bucket_type = 'daily'
-    prod.filter.date_from = day
-    prod.filter.date_to = day
-    loadProduction()
-  }
+  // Не навязываем server-side фильтры автоматически при изменении day_date.
+  // Серверные фильтры применяются явным действием (applyDayFilter).
   rebuildDailyAgendaForDay()
   loadCapacityUpperDay()
 })
