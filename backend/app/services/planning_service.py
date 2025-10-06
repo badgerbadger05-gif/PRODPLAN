@@ -31,6 +31,7 @@ from ..models import (
     ResourceProductionKind,
     Specification,
 )
+from ..models import RootProduct
 from .stage_logic import determine_parent_stage_and_norm
 
 # Default planning config fallback (aligned with Alembic seed)
@@ -1537,6 +1538,134 @@ def run_planning_run(
             operations_cache[spec_id] = ops
             return ops
 
+        # --- Roots and reachability helpers for diagnostics ---
+        root_rows: List[RootProduct] = db.query(RootProduct).all()
+        root_item_ids: List[int] = [
+            int(r.item_id) for r in root_rows
+            if getattr(r, "item_id", None) is not None
+        ]
+
+        # Cache (root_id, target_id) -> bool (reachability)
+        _contains_cache: Dict[Tuple[int, int], bool] = {}
+
+        def _child_items_of(item_id: int) -> List[int]:
+            spec_id_local = default_spec_map.get(int(item_id))
+            if not spec_id_local:
+                return []
+            comps_local = get_components_for_spec(int(spec_id_local)) or []
+            out: List[int] = []
+            for c in comps_local:
+                try:
+                    out.append(int(c.item_id))
+                except Exception:
+                    continue
+            return out
+
+        def _contains_target(root_id: int, target_id: int, depth: int = 0, seen: Optional[Set[int]] = None) -> bool:
+            key = (int(root_id), int(target_id))
+            if key in _contains_cache:
+                return _contains_cache[key]
+            if depth > 200:
+                _contains_cache[key] = False
+                return False
+            if seen is None:
+                seen = set()
+            if int(root_id) in seen:
+                _contains_cache[key] = False
+                return False
+            seen.add(int(root_id))
+            for ch in _child_items_of(int(root_id)):
+                if int(ch) == int(target_id):
+                    _contains_cache[key] = True
+                    return True
+                if _contains_target(int(ch), int(target_id), depth + 1, seen):
+                    _contains_cache[key] = True
+                    return True
+            _contains_cache[key] = False
+            return False
+
+        def _find_root_for_item(target_id: int) -> Optional[int]:
+            for rid in root_item_ids:
+                try:
+                    if _contains_target(int(rid), int(target_id)):
+                        return int(rid)
+                except Exception:
+                    continue
+            return None
+
+        def _get_item_safe(iid: int) -> Optional[Item]:
+            it = item_by_id.get(int(iid))
+            if it is not None:
+                return it
+            try:
+                it = db.query(Item).filter(Item.item_id == int(iid)).first()
+                if it is not None:
+                    item_by_id[int(iid)] = it
+                return it
+            except Exception:
+                return None
+
+        # Map spec_id -> parent item_id using default_spec_map (default specs only)
+        spec_to_item: Dict[int, int] = {}
+        try:
+            for iid, sid in (default_spec_map or {}).items():
+                try:
+                    spec_to_item[int(sid)] = int(iid)
+                except Exception:
+                    continue
+        except Exception:
+            spec_to_item = {}
+
+        # Build reverse parent map: child_item_id -> set(parent_item_id)
+        from collections import defaultdict as _dd2
+        parent_map: DefaultDict[int, Set[int]] = _dd2(set)
+        try:
+            for sid, parent_iid in (spec_to_item or {}).items():
+                try:
+                    comps = get_components_for_spec(int(sid)) or []
+                except Exception:
+                    comps = []
+                for c in comps:
+                    try:
+                        child_iid = int(c.item_id)
+                        parent_map[child_iid].add(int(parent_iid))
+                    except Exception:
+                        continue
+        except Exception:
+            parent_map = _dd2(set)
+
+        def _find_top_root_via_parents(target_id: int) -> Optional[int]:
+            """
+            Walk upward using parent_map to find the highest ancestor which is a RootProduct.
+            Falls back to None if not found or on cycles.
+            """
+            try:
+                visited: Set[int] = set()
+                frontier: Set[int] = {int(target_id)}
+                steps = 0
+                while frontier and steps < 300:
+                    next_frontier: Set[int] = set()
+                    for cur in list(frontier):
+                        cur = int(cur)
+                        if cur in visited:
+                            continue
+                        visited.add(cur)
+                        if cur in root_item_ids:
+                            return cur
+                        parents = parent_map.get(cur) or set()
+                        for p in parents:
+                            try:
+                                ip = int(p)
+                                if ip not in visited:
+                                    next_frontier.add(ip)
+                            except Exception:
+                                continue
+                    frontier = next_frontier
+                    steps += 1
+                return None
+            except Exception:
+                return None
+
         # Resources list
         resources: List[ProductionResource] = db.query(ProductionResource).all()
 
@@ -1790,6 +1919,10 @@ def run_planning_run(
                     except Exception:
                         pk_name = None
 
+                    # Determine top-level root product for diagnostics (prefer upward walk via parents, fallback to downward reachability)
+                    root_id_val = _find_top_root_via_parents(int(item_id)) or _find_root_for_item(int(item_id))
+                    root_rec = _get_item_safe(int(root_id_val)) if root_id_val is not None else None
+
                     warnings.append(
                         {
                             "code": "NO_AREA_FOR_PRODUCTION_KIND",
@@ -1800,10 +1933,10 @@ def run_planning_run(
                             "item_code": getattr(item_rec, "item_code", None) if item_rec is not None else None,
                             "item_name": getattr(item_rec, "item_name", None) if item_rec is not None else None,
                             "item_article": getattr(item_rec, "item_article", None) if item_rec is not None else None,
-                            "root_item_id": int(item_id),
-                            "root_item_code": getattr(item_rec, "item_code", None) if item_rec is not None else None,
-                            "root_item_name": getattr(item_rec, "item_name", None) if item_rec is not None else None,
-                            "root_item_article": getattr(item_rec, "item_article", None) if item_rec is not None else None,
+                            "root_item_id": int(root_id_val) if root_id_val is not None else int(item_id),
+                            "root_item_code": getattr(root_rec, "item_code", None) if root_rec is not None else (getattr(item_rec, "item_code", None) if item_rec is not None else None),
+                            "root_item_name": getattr(root_rec, "item_name", None) if root_rec is not None else (getattr(item_rec, "item_name", None) if item_rec is not None else None),
+                            "root_item_article": getattr(root_rec, "item_article", None) if root_rec is not None else (getattr(item_rec, "item_article", None) if item_rec is not None else None),
                             "spec_code": spec_code_local,
                             "spec_name": spec_name_local,
                             "spec_id": int(spec_id_local) if spec_id_local is not None else None,
@@ -1879,6 +2012,10 @@ def run_planning_run(
                         except Exception:
                             pk_name_zn = None
 
+                    # Determine top-level root product for diagnostics (zero-norm case): prefer upward walk
+                    root_id_zn = _find_top_root_via_parents(int(order.item_id)) or _find_root_for_item(int(order.item_id))
+                    root_rec_zn = _get_item_safe(int(root_id_zn)) if root_id_zn is not None else None
+
                     warnings.append(
                         {
                             "code": "NO_AREA_FOR_PRODUCTION_KIND_ZERO_NORM",
@@ -1890,10 +2027,10 @@ def run_planning_run(
                             "item_code": getattr(item_rec_zn, "item_code", None) if item_rec_zn is not None else None,
                             "item_name": getattr(item_rec_zn, "item_name", None) if item_rec_zn is not None else None,
                             "item_article": getattr(item_rec_zn, "item_article", None) if item_rec_zn is not None else None,
-                            "root_item_id": int(order.item_id),
-                            "root_item_code": getattr(item_rec_zn, "item_code", None) if item_rec_zn is not None else None,
-                            "root_item_name": getattr(item_rec_zn, "item_name", None) if item_rec_zn is not None else None,
-                            "root_item_article": getattr(item_rec_zn, "item_article", None) if item_rec_zn is not None else None,
+                            "root_item_id": int(root_id_zn) if root_id_zn is not None else int(order.item_id),
+                            "root_item_code": getattr(root_rec_zn, "item_code", None) if root_rec_zn is not None else (getattr(item_rec_zn, "item_code", None) if item_rec_zn is not None else None),
+                            "root_item_name": getattr(root_rec_zn, "item_name", None) if root_rec_zn is not None else (getattr(item_rec_zn, "item_name", None) if item_rec_zn is not None else None),
+                            "root_item_article": getattr(root_rec_zn, "item_article", None) if root_rec_zn is not None else (getattr(item_rec_zn, "item_article", None) if item_rec_zn is not None else None),
                             "spec_code": spec_code_zn,
                             "spec_name": spec_name_zn,
                             "spec_id": int(spec_id_zn) if spec_id_zn is not None else None,
