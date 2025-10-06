@@ -615,8 +615,9 @@ const kindIssuesColumns: QTableColumn<any>[] = [
   { name: 'pk_name', label: 'Вид производства', field: 'production_kind_name', align: 'left' },
   { name: 'item', label: 'Номенклатура', field: (r: any) => r.item_name || (r.item_id ? `Номенклатура #${r.item_id}` : '—'), align: 'left' },
   { name: 'article', label: 'Артикул', field: 'item_article', align: 'left' },
+  { name: 'root_article', label: 'Артикул корневого изделия', field: 'root_item_article', align: 'left' },
   { name: 'item_id', label: 'item_id', field: 'item_id', align: 'right' },
-  { name: 'spec', label: 'Спецификация', field: (r: any) => r.spec_ref1c || r.spec_id || '—', align: 'left' },
+  { name: 'spec', label: 'Спецификация', field: (r: any) => r.spec_name || r.spec_code || r.spec_ref1c || r.spec_id || '—', align: 'left' },
   { name: 'code', label: 'Код', field: 'code', align: 'left' },
 ]
 const kindIssuesRows = computed(() => {
@@ -628,8 +629,14 @@ const kindIssuesRows = computed(() => {
     item_code: w?.item_code ?? null,
     item_name: w?.item_name ?? null,
     item_article: w?.item_article ?? null,
+    root_item_id: w?.root_item_id ?? null,
+    root_item_code: w?.root_item_code ?? null,
+    root_item_name: w?.root_item_name ?? null,
+    root_item_article: w?.root_item_article ?? null,
     spec_id: w?.spec_id ?? null,
     spec_ref1c: w?.spec_ref1c ?? null,
+    spec_code: w?.spec_code ?? null,
+    spec_name: w?.spec_name ?? null,
     code: w?.code ?? ''
   }))
 })
