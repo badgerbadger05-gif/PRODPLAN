@@ -1341,15 +1341,11 @@ async function loadCapacityUpperDay() {
   }
 }
  
-// Установить день как фильтр (bucket=daily) и перезагрузить данные
+// Применить день «повестки» без изменения серверных фильтров
 function applyDayFilter() {
-  const day = (prod.filter.day_date || '').trim()
+  const day = (prod.filter.day_date || '').slice(0, 10)
   if (!day) return
-  prod.filter.bucket_type = 'daily'
-  prod.filter.date_from = day
-  prod.filter.date_to = day
-  // Перезагрузим данные сервера и пересчеты локальных агрегатов
-  loadProduction()
+  // Не навязываем bucket_type/date_* — дневную повестку считаем локально по stages (prodAllRows)
   rebuildDailyAgendaForDay()
   loadCapacityUpperDay()
 }
