@@ -112,6 +112,18 @@
                   @blur="updateResource(resource)"
                 />
               </div>
+              <div class="col-12">
+                <q-input
+                  v-model.number="resource.buffer_days"
+                  label="Буфер (дней)"
+                  type="number"
+                  outlined
+                  dense
+                  :min="0"
+                  :step="1"
+                  @blur="updateResource(resource)"
+                />
+              </div>
             </div>
           </q-card-section>
 
@@ -209,6 +221,14 @@
             dense
             class="q-mt-md"
           />
+          <q-input
+            v-model.number="newResource.buffer_days"
+            label="Буфер (дней)"
+            type="number"
+            outlined
+            dense
+            class="q-mt-md"
+          />
         </q-card-section>
 
         <q-card-actions align="right">
@@ -249,6 +269,7 @@ const newResource = ref({
   capacity: 0,
   work_schedule: '5/2',
   daily_work_hours: 8.0,
+  buffer_days: 0,
   resource_id: 0
 });
 
@@ -276,6 +297,7 @@ const loadResources = async () => {
       planning_range: Number(r?.planning_range ?? 30),
       capacity: Number(r?.capacity ?? 0),
       daily_work_hours: Number(r?.daily_work_hours ?? 8.0),
+      buffer_days: Number(r?.buffer_days ?? 0),
     }));
     // Синхронизируем выбранные виды на карточках (переносим прежние значения если были)
     const prev = selectedKindByResource.value || {};
@@ -383,6 +405,7 @@ const resetForm = () => {
     capacity: 0,
     work_schedule: '5/2',
     daily_work_hours: 8.0,
+    buffer_days: 0,
     resource_id: 0
   };
   editingResource.value = false;
@@ -416,6 +439,7 @@ const saveResource = async () => {
         capacity: numOr(rest.capacity, 0),
         work_schedule: rest.work_schedule || '5/2',
         daily_work_hours: numOr(rest.daily_work_hours, 8.0),
+        buffer_days: numOr(rest.buffer_days, 0),
       };
       await api.put(`/v1/resources/${newResource.value.resource_id}`, payload);
       Notify.create({ type: 'positive', message: 'Участок обновлен' });
@@ -428,6 +452,7 @@ const saveResource = async () => {
         capacity: numOr(rest.capacity, 0),
         work_schedule: rest.work_schedule || '5/2',
         daily_work_hours: numOr(rest.daily_work_hours, 8.0),
+        buffer_days: numOr(rest.buffer_days, 0),
       };
       await api.post('/v1/resources/', payload);
       Notify.create({ type: 'positive', message: 'Участок создан' });
@@ -456,6 +481,7 @@ const editResource = (resource: any) => {
     capacity: Number(resource.capacity ?? 0),
     work_schedule: resource.work_schedule ?? '5/2',
     daily_work_hours: Number(resource.daily_work_hours ?? 8.0),
+    buffer_days: Number(resource.buffer_days ?? 0),
     resource_id: Number(resource.resource_id ?? 0)
   });
   editingResource.value = true;
@@ -501,6 +527,7 @@ const updateResource = async (resource: any) => {
       capacity: numOr(rest.capacity, 0),
       work_schedule: rest.work_schedule || '5/2',
       daily_work_hours: numOr(rest.daily_work_hours, 8.0),
+      buffer_days: numOr(rest.buffer_days, 0),
     };
     await api.put(`/v1/resources/${resource.resource_id}`, payload);
     await loadResources();

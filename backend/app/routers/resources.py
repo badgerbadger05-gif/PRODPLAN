@@ -48,7 +48,8 @@ def create_resource(resource: ProductionResourceCreate, db: Session = Depends(ge
             planning_range=resource.planning_range,
             capacity=resource.capacity,
             work_schedule=resource.work_schedule,
-            daily_work_hours=resource.daily_work_hours
+            daily_work_hours=resource.daily_work_hours,
+            buffer_days=resource.buffer_days,
         )
         db.add(db_resource)
         db.commit()
@@ -77,6 +78,7 @@ def update_resource(
         db_resource.capacity = resource.capacity
         db_resource.work_schedule = resource.work_schedule
         db_resource.daily_work_hours = resource.daily_work_hours
+        db_resource.buffer_days = resource.buffer_days
         
         db.commit()
         db.refresh(db_resource)

@@ -1,5 +1,6 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import MainLayout from '../layouts/MainLayout.vue'
+import MRPResultPage from '../pages/MRPResultPage.vue'
 
 // Динамический импорт компонентов
 const Index = () => import('../pages/Index.vue')
@@ -11,7 +12,6 @@ const SpecificationPage = () => import('../pages/SpecificationPage.vue')
 const ResourcesPage = () => import('../pages/ResourcesPage.vue')
 
 const MRPRunsPage = () => import('../pages/MRPRunsPage.vue')
-const MRPResultPage = () => import('../pages/MRPResultPage.vue')
 // Заглушки для будущих страниц
 const OrdersPage = { template: '<div class="q-pa-lg"><h4>Расчет заказов</h4><p>Страница находится в разработке</p></div>' }
 const SettingsPage = { template: '<div class="q-pa-lg"><h4>Настройки</h4><p>Страница находится в разработке</p></div>' }
@@ -50,5 +50,18 @@ const router = createRouter({
     }
   }
 })
+
+// DIAGNOSTICS: логируем переходы роутера (временно)
+try {
+  router.beforeEach((to, from, next) => {
+    console.log('[router.beforeEach]', { to: to.fullPath, name: to.name, params: to.params })
+    next()
+  })
+  router.afterEach((to) => {
+    console.log('[router.afterEach]', { to: to.fullPath, name: to.name })
+  })
+} catch (e) {
+  // no-op
+}
 
 export default router

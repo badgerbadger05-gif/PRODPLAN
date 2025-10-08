@@ -97,7 +97,23 @@
                          {{ formatQty((props.row.norm_hours_total ?? (props.row.norm_hours * props.row.qty_per_unit)), 2) }}
                        </q-td>
                      </template>
-                    </q-table>
+                     <template #body-cell-optimal_batch="props">
+                       <q-td :props="props" class="text-right">
+                         <q-input
+                           v-model.number="optimalBatchByItem[props.row.item_id]"
+                           type="number"
+                           dense
+                           outlined
+                           input-class="text-right"
+                           placeholder="0"
+                           :min="0"
+                           :step="1"
+                           @keyup.enter="saveOptimalBatch(props.row.item_id)"
+                           @blur="saveOptimalBatch(props.row.item_id)"
+                         />
+                       </q-td>
+                     </template>
+                     </q-table>
                   </div>
                 </q-tab-panel>
               </q-tab-panels>
@@ -112,7 +128,7 @@
 <script setup lang="ts">
 import { ref, reactive, watch, nextTick } from 'vue'
 import { Notify } from 'quasar'
-import api from '../services/api'
+import api, { listItems } from '../services/api'
 
 interface DistributedComponent {
   item_id: number
@@ -155,6 +171,10 @@ const pagination = reactive({
   descending: false
 })
 
+// Кэш оптимальных партий по номенклатурам и карточки номенклатуры
+const optimalBatchByItem = reactive<Record<number, number>>({})
+const itemCacheById = reactive<Record<number, any>>({})
+
 const TAB_KEY = 'resource_distribution_active_tab'
 const activeTab = ref<number | null>(null)
 
@@ -186,7 +206,9 @@ const columns = [
   { name: 'stage_name', label: 'Этап', field: 'stage_name', align: 'left' as const, sortable: true },
   { name: 'stock_qty', label: 'Остаток', field: 'stock_qty', align: 'right' as const, sortable: true },
   { name: 'norm_hours', label: 'Норматив н/ч', field: 'norm_hours', align: 'right' as const, sortable: true },
-  { name: 'norm_hours_total', label: 'Сумма н/ч', field: 'norm_hours_total', align: 'right' as const, sortable: true }
+  { name: 'norm_hours_total', label: 'Сумма н/ч', field: 'norm_hours_total', align: 'right' as const, sortable: true },
+  // Редактируемая колонка справа: Оптимальная партия
+  { name: 'optimal_batch', label: 'Оптимальная партия', field: 'optimal_batch', align: 'right' as const, sortable: false }
 ]
 
 function formatQty(x: number | null | undefined, maxDigits = 3): string {
@@ -214,6 +236,90 @@ function onTableRequest(props: any) {
   pagination.descending = descending
 }
 
+/**
+ * Собрать уникальные item_id видимых строк (по текущему результату распределения)
+ */
+function getVisibleItemIds(): number[] {
+  const ids = new Set<number>()
+  for (const r of (resources.value || [])) {
+    for (const p of (r.products || [])) {
+      for (const c of (p.components || [])) {
+        const iid = Number(c?.item_id)
+        if (!Number.isNaN(iid)) ids.add(iid)
+      }
+    }
+  }
+  return Array.from(ids)
+}
+
+/**
+ * Загрузить текущие значения «Оптимальная партия» для видимых номенклатур
+ */
+async function loadOptimalBatchesForVisibleItems() {
+  try {
+    const ids = getVisibleItemIds()
+    if (!ids.length) return
+    const { rows } = await listItems({ limit: 100000, offset: 0 })
+    const byId: Record<number, any> = {}
+    for (const it of (rows || [])) {
+      const iid = Number(it?.item_id)
+      if (!Number.isNaN(iid)) byId[iid] = it
+    }
+    for (const iid of ids) {
+      const it = byId[iid]
+      if (it) {
+        itemCacheById[iid] = it
+        const v = Number(it?.optimal_batch ?? 0)
+        optimalBatchByItem[iid] = Number.isFinite(v) && v >= 0 ? Math.floor(v) : 0
+      } else {
+        if (optimalBatchByItem[iid] == null) optimalBatchByItem[iid] = 0
+      }
+    }
+  } catch {
+    // best-effort
+  }
+}
+
+/**
+ * Сохранить «Оптимальная партия» для указанного item_id с валидацией (целые, ≥ 0)
+ * Отправляет полную карточку ItemUpdate
+ */
+async function saveOptimalBatch(itemId: number) {
+  try {
+    let raw = optimalBatchByItem[itemId]
+    let val = Number(raw ?? 0)
+    if (!Number.isFinite(val) || val < 0) val = 0
+    val = Math.floor(val)
+    optimalBatchByItem[itemId] = val
+
+    let it = itemCacheById[itemId]
+    if (!it) {
+      const { data } = await api.get(`/v1/items/${itemId}`)
+      it = data
+      itemCacheById[itemId] = it
+    }
+
+    const payload = {
+      item_code: String(it?.item_code ?? ''),
+      item_name: String(it?.item_name ?? ''),
+      item_article: it?.item_article ?? null,
+      item_ref1c: it?.item_ref1c ?? null,
+      replenishment_time: it?.replenishment_time ?? null,
+      unit: it?.unit ?? null,
+      stock_qty: Number(it?.stock_qty ?? 0),
+      optimal_batch: val,
+      status: String(it?.status ?? 'active'),
+    }
+
+    await api.put(`/v1/items/${itemId}`, payload)
+    itemCacheById[itemId] = { ...it, ...payload }
+    Notify.create({ type: 'positive', message: 'Оптимальная партия сохранена' })
+  } catch (err: any) {
+    const msg = err?.response?.data?.detail || 'Ошибка сохранения оптимальной партии'
+    Notify.create({ type: 'negative', message: msg })
+  }
+}
+
 async function calculate() {
   if (loading.value) return // Предотвращаем множественные запуски
   
@@ -224,6 +330,7 @@ async function calculate() {
     asOf.value = data?.asOf || null
     
     resources.value = Array.isArray(data?.resources) ? data.resources : []
+    await loadOptimalBatchesForVisibleItems()
 
     Notify.create({ type: 'positive', message: 'Распределение по участкам рассчитано' })
   } catch (err: any) {

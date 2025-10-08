@@ -34,6 +34,11 @@ from ..services.planning_service import (
     create_planning_config_version,
     activate_planning_config_version,
     get_active_planning_config_full,
+    # Grouped/agenda/summary endpoints
+    get_run_production_grouped,
+    get_run_production_agenda_day,
+    get_run_purchases_grouped,
+    get_capacity_summary,
 )
 from ..models import ProductionResource
 
@@ -821,5 +826,113 @@ async def export_plan(
             "total_rows": len(export_rows)
         }
 
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+# === Backend-first aggregated/grouped endpoints (non-breaking, additive) ===
+
+@router.get("/results/{run_id}/production/grouped")
+async def get_planning_result_production_grouped(
+    run_id: int,
+    bucket_type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    area_id: Optional[int] = None,
+    limit: int = 1000,
+    offset: int = 0,
+    sort_by: Optional[str] = None,
+    sort_dir: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Группировка производственных заказов по «виду/участку» (dominant area),
+    с серверной агрегацией по (item_id, unit) и индикаторами мощности.
+    Не ломает существующие endpoints; добавлен отдельно.
+    """
+    try:
+        return get_run_production_grouped(
+            db=db,
+            run_id=int(run_id),
+            bucket_type=bucket_type,
+            date_from=date_from,
+            date_to=date_to,
+            area_id=area_id,
+            limit=limit,
+            offset=offset,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/results/{run_id}/production/agenda_day")
+async def get_planning_result_production_agenda_day(
+    run_id: int,
+    day_date: str,
+    area_id: Optional[int] = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Задание на конкретный день (daily) по видам/участкам.
+    Пересчёт: часы → количество по норме на штуку, вычисленной на сервере.
+    """
+    try:
+        return get_run_production_agenda_day(
+            db=db,
+            run_id=int(run_id),
+            day_date=day_date,
+            area_id=area_id,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/results/{run_id}/purchases/grouped")
+async def get_planning_result_purchases_grouped(
+    run_id: int,
+    bucket_type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = 1000,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+):
+    """
+    Сводная группировка закупок по (item_id, unit) на сервере.
+    """
+    try:
+        return get_run_purchases_grouped(
+            db=db,
+            run_id=int(run_id),
+            bucket_type=bucket_type,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit,
+            offset=offset,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/results/{run_id}/capacity/summary")
+async def get_planning_result_capacity_summary(
+    run_id: int,
+    bucket_type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Сводка по мощности (часы/перегрузы) по видам/участкам в заданном диапазоне.
+    """
+    try:
+        return get_capacity_summary(
+            db=db,
+            run_id=int(run_id),
+            bucket_type=bucket_type,
+            date_from=date_from,
+            date_to=date_to,
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

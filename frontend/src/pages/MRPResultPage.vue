@@ -1,310 +1,118 @@
 <template>
   <q-page padding>
+    <!-- Guards: error or loading -->
+    <q-banner v-if="loadError" dense class="bg-red-2 text-negative q-mb-md">
+      {{ t('mrp.errors.loadFailed') || 'Ошибка загрузки результатов' }}: {{ loadError }}
+    </q-banner>
+    <q-banner v-else-if="pageLoading || !summary" dense class="bg-grey-2 q-mb-md">
+      <q-spinner color="primary" size="1.2em" class="q-mr-sm" /> {{ t('mrp.loading') || 'Загрузка результатов…' }}
+    </q-banner>
+    <!-- DIAG: remove after debugging -->
+    <q-banner dense class="bg-blue-1 text-blue-9 q-mb-md">
+      {{ diagText }}
+    </q-banner>
     <div class="row items-center q-gutter-sm q-mb-md">
-      <div class="text-h5">Результаты прогона MRP #{{ runId }}</div>
+      <div class="text-h5">{{ t('mrp.title', { runId }) }}</div>
       <q-space />
       <q-chip v-if="summary?.run?.status" :color="statusColor(summary.run.status)" text-color="white" size="sm">
         {{ summary.run.status }}
       </q-chip>
     </div>
 
-    <div class="row q-col-gutter-md q-mb-md">
-      <div class="col-12 col-md-3">
-        <q-card flat bordered>
-          <q-card-section>
-            <div class="text-subtitle2">RUN</div>
-            <div class="text-h6">{{ runId }}</div>
-          </q-card-section>
-          <q-separator />
-          <q-card-section>
-            <div class="row items-center">
-              <div class="col text-caption text-grey">Старт</div>
-              <div class="col-auto">{{ summary?.run?.started_at || '—' }}</div>
-            </div>
-            <div class="row items-center">
-              <div class="col text-caption text-grey">Финиш</div>
-              <div class="col-auto">{{ summary?.run?.finished_at || '—' }}</div>
-            </div>
-            <div class="row items-center">
-              <div class="col text-caption text-grey">Горизонт</div>
-              <div class="col-auto">{{ summary?.run?.horizon_days ?? '—' }}</div>
-            </div>
-            <div class="row items-center">
-              <div class="col text-caption text-grey">Weekly</div>
-              <div class="col-auto">{{ (summary?.run?.use_weekly ? 'Да' : 'Нет') }}</div>
-            </div>
-          </q-card-section>
-        </q-card>
-      </div>
-
-      <div class="col-12 col-md-9">
-        <q-card flat bordered>
-          <q-card-section>
-            <div class="row q-col-gutter-md">
-              <div class="col-6 col-md-3">
-                <div class="text-caption text-grey">Производственные заказы</div>
-                <div class="text-h6">{{ summary?.counts?.production_orders ?? 0 }}</div>
-              </div>
-              <div class="col-6 col-md-3">
-                <div class="text-caption text-grey">Заявки на закупку</div>
-                <div class="text-h6">{{ summary?.counts?.purchase_requests ?? 0 }}</div>
-              </div>
-              <div class="col-6 col-md-3">
-                <div class="text-caption text-grey">Перегруженные бакеты</div>
-                <div class="text-h6">{{ summary?.capacity?.overloaded_buckets ?? 0 }}</div>
-              </div>
-              <div class="col-6 col-md-3">
-                <div class="text-caption text-grey">Суммарный перегруз (ч)</div>
-                <div class="text-h6">{{ fmt(summary?.capacity?.overload_total) }}</div>
-              </div>
-            </div>
-          </q-card-section>
-          <q-separator />
-          <q-card-section v-if="(summary?.warnings || []).length > 0">
-            <q-expansion-item
-              icon="warning"
-              label="Предупреждения"
-              caption="Нажмите, чтобы развернуть"
-              dense
-              switch-toggle-side
-            >
-              <div class="row q-col-gutter-xs q-pt-sm">
-                <q-chip v-for="(w, idx) in summary?.warnings" :key="idx" color="orange" text-color="black" outline size="sm">
-                  {{ warnText(w) }}
-                </q-chip>
-              </div>
-            </q-expansion-item>
-          </q-card-section>
-          <q-card-section v-if="kindIssues.length">
-            <q-btn dense color="negative" icon="report_problem" label="Проблемы привязки видов" @click="showKindIssuesDialog = true" />
-            <span class="text-grey q-ml-sm">({{ kindIssues.length }})</span>
-          </q-card-section>
-        </q-card>
-      </div>
+    <div class="q-mb-md">
+      <MRPSummaryCard
+        :run-id="runId"
+        :summary="summary"
+        @open-kind-issues="showKindIssuesDialog = true"
+      />
     </div>
 
     <!-- Результаты прогона: две вкладки с едиными столбцами -->
     <div class="q-mb-md">
       <q-tabs v-model="viewTab" class="text-primary" dense>
-        <q-tab name="production" icon="build" label="Заказы на производство" />
-        <q-tab name="purchases" icon="shopping_cart" label="Заказы на закупку" />
+        <q-tab name="production" icon="build" :label="t('mrp.tabs.production')" />
+        <q-tab name="purchases" icon="shopping_cart" :label="t('mrp.tabs.purchases')" />
       </q-tabs>
       <q-separator />
 
       <q-tab-panels v-model="viewTab" animated>
         <!-- Production unified tab -->
         <q-tab-panel name="production">
-          <div class="row items-center q-gutter-sm q-mb-sm">
-            <div class="text-subtitle2">
-              Результаты MRP от {{ summary?.run?.started_at || '—' }}
-            </div>
-            <q-space />
-            <q-select v-model="prod.filter.bucket_type" :options="bucketOptions" emit-value map-options dense outlined label="Бакет" style="width: 150px" />
-            <q-input v-model="prod.filter.day_date" dense outlined label="День задания (YYYY-MM-DD)" style="width: 200px">
-              <template v-slot:append>
-                <q-btn dense flat round icon="event" @click.stop="showDayMenu = true" />
-                <q-menu v-model="showDayMenu" anchor="bottom right" self="top right" cover>
-                  <q-date v-model="prod.filter.day_date" mask="YYYY-MM-DD" @update:model-value="onDayPicked" />
-                </q-menu>
-              </template>
-            </q-input>
-            <q-separator vertical class="q-mx-xs" />
-            <q-input v-model="prod.filter.date_from" dense outlined label="От даты (YYYY-MM-DD)" style="width: 200px" />
-            <q-input v-model="prod.filter.date_to" dense outlined label="До даты (YYYY-MM-DD)" style="width: 200px" />
-            <q-btn dense color="primary" icon="search" @click="loadProduction()" />
-            <q-btn dense flat icon="refresh" @click="loadProduction()" />
-            <q-btn dense flat icon="clear" label="Сбросить фильтры" @click="resetFilters" />
-            <q-separator vertical class="q-mx-xs" />
-            <q-btn dense flat icon="download" label="CSV" @click="exportProd('csv')" />
-            <q-btn dense flat icon="table_view" label="XLSX" @click="exportProd('xlsx')" />
-          </div>
+          <ProductionFilters
+            v-model="prod.filter"
+            :loading="prod.loading"
+            :title="`Результаты MRP от ${summary?.run?.started_at || '—'}`"
+            :show-day-picker="true"
+            @apply="applyProdFiltersDebounced()"
+            @reset="resetFilters"
+            @day-picked="onDayPicked"
+          >
+            <template #extra-actions>
+              <q-separator vertical class="q-mx-xs" />
+              <q-btn dense flat icon="download" :label="t('mrp.actions.csv')" @click="exportProd('csv')" />
+              <q-btn dense flat icon="table_view" :label="t('mrp.actions.xlsx')" @click="exportProd('xlsx')" />
+            </template>
+          </ProductionFilters>
 
           <!-- Ежедневное задание по видам производства (если выбран день) -->
           <template v-if="prod.filter.day_date && dailyAgendaGroups.length">
-            <q-table
-              dense
-              table-class="compact-rows"
-              :rows="dailyAgendaGroups"
-              :columns="prodUnifiedColumns"
-              row-key="area_id"
+            <ProductionDailyAgenda
+              :groups="dailyAgendaGroups"
               :loading="prod.loading"
-              :pagination="{ rowsPerPage: 50 }"
-              hide-header
-            >
-              <template v-slot:body="props">
-                <!-- Заголовок группы (дневная повестка) -->
-                <q-tr :props="props" :key="`grp_day_${props.row.area_id}`">
-                  <q-td colspan="100%" class="bg-grey-2">
-                    <div class="text-subtitle1">
-                      <strong>Вид производства:</strong> {{ props.row.area_name }}
-                      <span class="text-grey q-ml-sm">
-                        · Позиции (на день): {{ (props.row.orders || []).length }}
-                        · Норматив (за день): {{ fmt(props.row.norm_sum_hours) }} ч
-                        · Выпуск (за день): {{ fmtQty(props.row.sum_qty, 'шт') }}
-                      </span>
-                      <q-badge v-if="Number(props.row.cap_overload_hours || 0) > 0" class="q-ml-sm" color="negative" outline>
-                        Перегруз: {{ fmt(props.row.cap_overload_hours) }} ч
-                      </q-badge>
-                    </div>
-                  </q-td>
-                </q-tr>
-                <!-- Строки позиций на день -->
-                <q-tr v-for="order in props.row.orders" :key="order.agg_key || `${order.item_id}|${order.unit || ''}`" :props="props">
-                  <q-td key="name" :props="props">
-                    <div>{{ order.item_name || ('Номенклатура #' + order.item_id) }}</div>
-                    <q-badge v-if="!(Number(order.norm_hours_per_unit || 0) > 0)" class="q-ml-xs" color="grey" outline>без норматива</q-badge>
-                  </q-td>
-                  <q-td key="article" :props="props">
-                    {{ order.item_article || '—' }}
-                  </q-td>
-                  <q-td key="qty" :props="props" class="text-right">
-                    {{ fmtQty(order.qty, order.unit) }}
-                  </q-td>
-                  <q-td key="norm_per_unit" :props="props" class="text-right">
-                    {{ fmt(order.norm_hours_per_unit != null ? order.norm_hours_per_unit : ((Number(order.norm_hours_total || 0)) / (Number(order.qty || 1)))) }}
-                  </q-td>
-                  <q-td key="norm_total" :props="props" class="text-right">
-                    {{ fmt(order.norm_hours_total) }}
-                  </q-td>
-                </q-tr>
-              </template>
-            </q-table>
+            />
           </template>
 
           <!-- Группированный вывод по видам производства (если день не выбран) -->
           <template v-else-if="groupedProdRows.length">
-            <q-table
-              dense
-              table-class="compact-rows"
-              :rows="groupedProdRows"
-              :columns="prodUnifiedColumns"
-              row-key="area_id"
+            <ProductionGroupedTable
+              :groups="groupedProdRows"
               :loading="prod.loading"
-              :pagination="{ rowsPerPage: 50 }"
-              hide-header
-            >
-              <template v-slot:body="props">
-                <!-- Заголовок группы -->
-                <q-tr :props="props" :key="`grp_${props.row.area_id}`">
-                  <q-td colspan="100%" class="bg-grey-2">
-                    <div class="text-subtitle1">
-                      <strong>Вид производства:</strong> {{ props.row.area_name }}
-                      <span class="text-grey q-ml-sm">
-                        · Заказов: {{ (props.row.orders || []).length }}
-                        · Норматив всего: {{ fmt(props.row.norm_sum_hours) }} ч
-                      </span>
-                      <q-badge v-if="props.row.min_days_to_need != null" class="q-ml-sm" color="orange" outline>
-                        Срочн.: {{ props.row.min_days_to_need }} д
-                      </q-badge>
-                      <q-badge v-if="Number(props.row.cap_overload_hours || 0) > 0" class="q-ml-sm" color="negative" outline>
-                        Перегруз: {{ fmt(props.row.cap_overload_hours) }} ч
-                      </q-badge>
-                    </div>
-                  </q-td>
-                </q-tr>
-                <!-- Строки заказов -->
-                <q-tr v-for="order in props.row.orders" :key="order.agg_key || `${order.item_id}|${order.unit || ''}`" :props="props">
-                  <q-td key="name" :props="props">
-                    <div>{{ order.item_name || ('Номенклатура #' + order.item_id) }}</div>
-                  </q-td>
-                  <q-td key="article" :props="props">
-                    {{ order.item_article || '—' }}
-                  </q-td>
-                  <q-td key="qty" :props="props" class="text-right">
-                    {{ fmtQty(order.qty, order.unit) }}
-                  </q-td>
-                  <q-td key="norm_per_unit" :props="props" class="text-right">
-                    {{ fmt(order.norm_hours_per_unit != null ? order.norm_hours_per_unit : ((Number(order.norm_hours_total || 0)) / (Number(order.qty || 1)))) }}
-                  </q-td>
-                  <q-td key="norm_total" :props="props" class="text-right">
-                    {{ fmt(order.norm_hours_total) }}
-                  </q-td>
-                </q-tr>
-              </template>
-            </q-table>
+            />
           </template>
 
           <!-- Фолбэк: плоский список без группировки -->
           <template v-else>
-            <q-table
-              dense
-              table-class="compact-rows"
+            <ProductionUnifiedTable
               :rows="plainProdRows"
-              :columns="prodUnifiedColumns"
-              row-key="order_id"
               :loading="prod.loading"
-              :pagination="{ rowsPerPage: 50 }"
-            >
-              <template v-slot:body-cell-name="p">
-                <q-td :props="p">
-                  <div>{{ p.row.item_name || ('Номенклатура #' + p.row.item_id) }}</div>
-                </q-td>
-              </template>
-              <template v-slot:body-cell-qty="p">
-                <q-td :props="p" class="text-right">{{ fmtQty(p.row.qty, p.row.unit) }}</q-td>
-              </template>
-              <template v-slot:body-cell-norm_per_unit="p">
-                <q-td :props="p" class="text-right">
-                  {{ fmt(p.row.norm_hours_per_unit != null ? p.row.norm_hours_per_unit : ((Number(p.row.norm_hours_total || 0)) / (Number(p.row.qty || 1)))) }}
-                </q-td>
-              </template>
-              <template v-slot:body-cell-norm_total="p">
-                <q-td :props="p" class="text-right">
-                  {{ fmt(p.row.norm_hours_total) }}
-                </q-td>
-              </template>
-            </q-table>
+            />
           </template>
         </q-tab-panel>
 
         <!-- Purchases unified tab -->
         <q-tab-panel name="purchases">
-          <div class="row items-center q-gutter-sm q-mb-sm">
-            <div class="text-subtitle2">
-              Результаты MRP от {{ summary?.run?.started_at || '—' }}
-            </div>
-            <q-space />
-            <q-select v-model="purch.filter.bucket_type" :options="bucketOptions" emit-value map-options dense outlined label="Бакет" style="width: 150px" />
-            <q-input v-model="purch.filter.date_from" dense outlined label="От даты (YYYY-MM-DD)" style="width: 200px" />
-            <q-input v-model="purch.filter.date_to" dense outlined label="До даты (YYYY-MM-DD)" style="width: 200px" />
-            <q-btn dense color="primary" icon="search" @click="loadPurchases()" />
-            <q-btn dense flat icon="refresh" @click="loadPurchases()" />
-            <q-separator vertical class="q-mx-xs" />
-            <q-btn dense flat icon="download" label="CSV" @click="exportPurch('csv')" />
-            <q-btn dense flat icon="table_view" label="XLSX" @click="exportPurch('xlsx')" />
-          </div>
-
-          <q-table
-            dense
-            table-class="compact-rows"
-            :rows="purchAggRows"
-            :columns="purchUnifiedColumns"
-            row-key="agg_key"
+          <ProductionFilters
+            v-model="purch.filter"
             :loading="purch.loading"
-            :pagination="{ rowsPerPage: 50 }"
+            :title="`Результаты MRP от ${summary?.run?.started_at || '—'}`"
+            :show-day-picker="false"
+            @apply="applyPurchFiltersDebounced()"
+            @reset="onPurchReset"
           >
-            <template v-slot:body-cell-name="p">
-              <q-td :props="p">
-                <div>{{ p.row.item_name || ('Номенклатура #' + p.row.item_id) }}</div>
-              </q-td>
+            <template #extra-actions>
+              <q-separator vertical class="q-mx-xs" />
+              <q-btn dense flat icon="download" :label="t('mrp.actions.csv')" @click="exportPurch('csv')" />
+              <q-btn dense flat icon="table_view" :label="t('mrp.actions.xlsx')" @click="exportPurch('xlsx')" />
             </template>
-            <template v-slot:body-cell-qty="p">
-              <q-td :props="p" class="text-right">{{ fmtQty(p.row.qty, p.row.unit) }}</q-td>
-            </template>
-          </q-table>
+          </ProductionFilters>
+
+          <PurchasesUnifiedTable
+            :rows="purchAggRows"
+            :loading="purch.loading"
+          />
         </q-tab-panel>
       </q-tab-panels>
     </div>
 
     <!-- Вкладки для детального анализа (можно оставить ниже) -->
     <q-separator class="q-my-lg" />
-    <div class="text-h6 q-mb-md">Детальный анализ</div>
+    <div class="text-h6 q-mb-md">{{ t('mrp.sections.detail') }}</div>
     <q-tabs v-model="tab" class="text-primary q-mb-sm" dense>
-      <q-tab name="production" icon="build" label="Производство (детально)" />
-      <q-tab name="purchases" icon="shopping_cart" label="Закупки (детально)" />
-      <q-tab name="capacity" icon="bar_chart" label="Мощности" />
-      <q-tab name="pegging" icon="device_hub" label="Pegging" />
-      <q-tab name="components" icon="list" label="Компоненты заказа" />
+      <q-tab name="production" icon="build" :label="t('mrp.tabs.productionDetail')" />
+      <q-tab name="purchases" icon="shopping_cart" :label="t('mrp.tabs.purchasesDetail')" />
+      <q-tab name="capacity" icon="bar_chart" :label="t('mrp.tabs.capacity')" />
+      <q-tab name="pegging" icon="device_hub" :label="t('mrp.tabs.pegging')" />
+      <q-tab name="components" icon="list" :label="t('mrp.tabs.components')" />
     </q-tabs>
     <q-separator />
 
@@ -312,56 +120,35 @@
       <!-- Production -->
       <q-tab-panel name="production">
         <div class="row items-center q-gutter-sm q-mb-sm">
-          <q-select v-model="prod.filter.bucket_type" :options="bucketOptions" emit-value map-options dense outlined label="Бакет" style="width: 150px" />
-          <q-input v-model="prod.filter.date_from" dense outlined label="От даты (YYYY-MM-DD)" style="width: 200px" />
-          <q-input v-model="prod.filter.date_to" dense outlined label="До даты (YYYY-MM-DD)" style="width: 200px" />
+          <q-select v-model="prod.filter.bucket_type" :options="bucketOptions" emit-value map-options dense outlined :label="t('mrp.filters.bucket')" style="width: 150px" />
+          <q-input v-model="prod.filter.date_from" dense outlined :label="t('mrp.filters.fromDate')" style="width: 200px" />
+          <q-input v-model="prod.filter.date_to" dense outlined :label="t('mrp.filters.toDate')" style="width: 200px" />
           <q-btn dense color="primary" icon="search" @click="loadProduction()" />
           <q-space />
           <q-btn dense flat icon="refresh" @click="loadProduction()" />
         </div>
-        <q-table
-          dense
-          table-class="compact-rows"
+        <ProductionDetailTable
           :rows="prod.rows"
           :columns="prod.columns"
-          row-key="order_id"
           :loading="prod.loading"
           :pagination="prod.pagination"
           @request="onProdRequest"
-        >
-          <template v-slot:body-cell-stages="props">
-            <q-td :props="props">
-              <div v-if="(props.row.stages || []).length === 0" class="text-grey">—</div>
-              <q-badge
-                v-for="(s, i) in props.row.stages"
-                :key="i"
-                color="primary"
-                outline
-                class="q-mr-xs q-mb-xs"
-              >
-                {{ s.stage_id }} · {{ s.bucket_date }} · {{ fmt(s.hours) }} ч
-              </q-badge>
-            </q-td>
-          </template>
-        </q-table>
+        />
       </q-tab-panel>
 
       <!-- Purchases -->
       <q-tab-panel name="purchases">
         <div class="row items-center q-gutter-sm q-mb-sm">
-          <q-select v-model="purch.filter.bucket_type" :options="bucketOptions" emit-value map-options dense outlined label="Бакет" style="width: 150px" />
-          <q-input v-model="purch.filter.date_from" dense outlined label="От даты (YYYY-MM-DD)" style="width: 200px" />
-          <q-input v-model="purch.filter.date_to" dense outlined label="До даты (YYYY-MM-DD)" style="width: 200px" />
+          <q-select v-model="purch.filter.bucket_type" :options="bucketOptions" emit-value map-options dense outlined :label="t('mrp.filters.bucket')" style="width: 150px" />
+          <q-input v-model="purch.filter.date_from" dense outlined :label="t('mrp.filters.fromDate')" style="width: 200px" />
+          <q-input v-model="purch.filter.date_to" dense outlined :label="t('mrp.filters.toDate')" style="width: 200px" />
           <q-btn dense color="primary" icon="search" @click="loadPurchases()" />
           <q-space />
           <q-btn dense flat icon="refresh" @click="loadPurchases()" />
         </div>
-        <q-table
-          dense
-          table-class="compact-rows"
+        <PurchasesDetailTable
           :rows="purch.rows"
           :columns="purch.columns"
-          row-key="purchase_id"
           :loading="purch.loading"
           :pagination="purch.pagination"
           @request="onPurchRequest"
@@ -371,17 +158,16 @@
       <!-- Capacity -->
       <q-tab-panel name="capacity">
         <div class="row items-center q-gutter-sm q-mb-sm">
-          <q-select v-model="cap.filter.bucket_type" :options="bucketOptions" emit-value map-options dense outlined label="Бакет" style="width: 150px" />
-          <q-input v-model="cap.filter.date_from" dense outlined label="От даты (YYYY-MM-DD)" style="width: 200px" />
-          <q-input v-model="cap.filter.date_to" dense outlined label="До даты (YYYY-MM-DD)" style="width: 200px" />
+          <q-select v-model="cap.filter.bucket_type" :options="bucketOptions" emit-value map-options dense outlined :label="t('mrp.filters.bucket')" style="width: 150px" />
+          <q-input v-model="cap.filter.date_from" dense outlined :label="t('mrp.filters.fromDate')" style="width: 200px" />
+          <q-input v-model="cap.filter.date_to" dense outlined :label="t('mrp.filters.toDate')" style="width: 200px" />
           <q-btn dense color="primary" icon="search" @click="loadCapacity()" />
           <q-space />
           <q-btn dense flat icon="refresh" @click="loadCapacity()" />
         </div>
-        <q-table
+        <CapacityTable
           :rows="cap.rows"
           :columns="cap.columns"
-          row-key="key"
           :loading="cap.loading"
           :pagination="cap.pagination"
           @request="onCapRequest"
@@ -391,18 +177,16 @@
       <!-- Pegging -->
       <q-tab-panel name="pegging">
         <div class="row items-center q-gutter-sm q-mb-sm">
-          <q-input v-model.number="peg.filter.child_item_id" type="number" dense outlined label="Child item_id" style="width: 160px" />
-          <q-input v-model.number="peg.filter.parent_item_id" type="number" dense outlined label="Parent item_id" style="width: 160px" />
-          <q-input v-model="peg.filter.date_from" dense outlined label="От даты (YYYY-MM-DD)" style="width: 200px" />
-          <q-input v-model="peg.filter.date_to" dense outlined label="До даты (YYYY-MM-DD)" style="width: 200px" />
+          <q-input v-model.number="peg.filter.child_item_id" type="number" dense outlined :label="t('mrp.pegging.filters.childItemId')" style="width: 160px" />
+          <q-input v-model.number="peg.filter.parent_item_id" type="number" dense outlined :label="t('mrp.pegging.filters.parentItemId')" style="width: 160px" />
+          <q-input v-model="peg.filter.date_from" dense outlined :label="t('mrp.filters.fromDate')" style="width: 200px" />
+          <q-input v-model="peg.filter.date_to" dense outlined :label="t('mrp.filters.toDate')" style="width: 200px" />
           <q-btn dense color="primary" icon="search" @click="loadPegging()" />
           <q-space />
           <q-btn dense flat icon="refresh" @click="loadPegging()" />
         </div>
-        <q-table
+        <PeggingTable
           :rows="peg.rows"
-          :columns="peg.columns"
-          row-key="id"
           :loading="peg.loading"
           :pagination="peg.pagination"
           @request="onPegRequest"
@@ -417,16 +201,16 @@
             :options="comp.orderOptions"
             dense outlined
             emit-value map-options
-            label="Выберите производственный заказ"
+            :label="t('mrp.components.selectOrder')"
             style="min-width: 360px"
           />
-          <q-btn dense color="primary" icon="visibility" label="Показать состав (по заказу)" @click="loadComponentsFromOrder" />
+          <q-btn dense color="primary" icon="visibility" :label="t('mrp.actions.showByOrder')" @click="loadComponentsFromOrder" />
 
           <q-separator vertical inset class="q-mx-sm" />
 
           <q-input v-model.number="comp.selectedItemId" type="number" dense outlined label="item_id" style="width: 150px" />
           <q-input v-model.number="comp.selectedQty" type="number" dense outlined label="qty" style="width: 120px" />
-          <q-btn dense color="primary" icon="search" label="Показать состав" @click="fetchFullTree" />
+          <q-btn dense color="primary" icon="search" :label="t('mrp.actions.show')" @click="fetchFullTree" />
         </div>
 
         <q-table
@@ -445,9 +229,9 @@
               </q-td>
               <q-td v-for="col in comp.columns" :key="col.name" :props="props">
                 <span v-if="col.name === 'name'">{{ props.row.name }}</span>
-                <span v-else-if="col.name === 'article'">{{ props.row.article || '—' }}</span>
+                <span v-else-if="col.name === 'article'">{{ props.row.article || t('mrp.placeholder.noArticle') }}</span>
                 <span v-else-if="col.name === 'qty'">{{ fmt(props.row.computed?.treeQty ?? 0) }}</span>
-                <span v-else-if="col.name === 'stage'">{{ props.row.stage ? (props.row.stage as any).name || (props.row.stage as any).id : '—' }}</span>
+                <span v-else-if="col.name === 'stage'">{{ props.row.stage ? (props.row.stage?.name || props.row.stage?.id) : t('mrp.placeholder.noArticle') }}</span>
               </q-td>
             </q-tr>
             <q-tr v-show="props.expand" :props="props">
@@ -467,9 +251,9 @@
                       </q-td>
                       <q-td v-for="col in comp.columns" :key="col.name" :props="childProps">
                         <span v-if="col.name === 'name'">{{ childProps.row.name }}</span>
-                        <span v-else-if="col.name === 'article'">{{ childProps.row.article || '—' }}</span>
+                        <span v-else-if="col.name === 'article'">{{ childProps.row.article || t('mrp.placeholder.noArticle') }}</span>
                         <span v-else-if="col.name === 'qty'">{{ fmt(childProps.row.computed?.treeQty ?? 0) }}</span>
-                        <span v-else-if="col.name === 'stage'">{{ childProps.row.stage ? (childProps.row.stage as any).name || (childProps.row.stage as any).id : '—' }}</span>
+                        <span v-else-if="col.name === 'stage'">{{ childProps.row.stage ? (childProps.row.stage?.name || childProps.row.stage?.id) : t('mrp.placeholder.noArticle') }}</span>
                       </q-td>
                     </q-tr>
                   </template>
@@ -481,25 +265,7 @@
       </q-tab-panel>
     </q-tab-panels>
     <!-- Диалог: проблемы привязки видов производства -->
-    <q-dialog v-model="showKindIssuesDialog">
-      <q-card style="min-width: 900px; max-width: 95vw;">
-        <q-card-section class="row items-center">
-          <div class="text-h6">Проблемы привязки видов производства</div>
-          <q-space />
-          <q-btn flat icon="close" round dense v-close-popup />
-        </q-card-section>
-        <q-separator />
-        <q-card-section>
-          <q-table
-            dense
-            :rows="kindIssuesRows"
-            :columns="kindIssuesColumns"
-            row-key="key"
-            :pagination="{ rowsPerPage: 50 }"
-          />
-        </q-card-section>
-      </q-card>
-    </q-dialog>
+    <KindIssuesDialog v-model="showKindIssuesDialog" :issues="kindIssuesRows" />
   </q-page>
 </template>
 
@@ -516,88 +282,127 @@ import api, {
   listItems,
   listResources,
   exportPlanningResultProduction,
-  exportPlanningResultPurchases
+  exportPlanningResultPurchases,
+  getPlanningResultProductionGrouped,
+  getPlanningResultProductionAgendaDay,
+  getPlanningResultPurchasesGrouped,
+  getPlanningResultCapacitySummary
 } from '../services/api'
 import type { QTableColumn } from 'quasar'
 import type { SpecNode } from '../services/api'
-const prodColumns: QTableColumn<any>[] = [
-  { name: 'order_id', label: 'Order', field: 'order_id', align: 'left', sortable: true },
-  { name: 'item_id', label: 'Item', field: 'item_id', align: 'right', sortable: true },
-  { name: 'qty', label: 'Qty', field: 'qty', align: 'right', sortable: true },
-  { name: 'norm_hours_per_unit', label: 'Норма, ч/шт', field: 'norm_hours_per_unit', align: 'right', sortable: true },
-  { name: 'norm_hours_total', label: 'Норматив всего, ч', field: 'norm_hours_total', align: 'right', sortable: true },
-  { name: 'need_date', label: 'Need', field: 'need_date', align: 'left', sortable: true },
-  { name: 'start_date', label: 'Start', field: 'start_date', align: 'left', sortable: true },
-  { name: 'finish_date', label: 'Finish', field: 'finish_date', align: 'left', sortable: true },
-  { name: 'bucket_type', label: 'Bucket', field: 'bucket_type', align: 'left', sortable: true },
-  { name: 'bucket_date', label: 'Bucket date', field: 'bucket_date', align: 'left', sortable: true },
-  { name: 'priority_index', label: 'Prio', field: 'priority_index', align: 'right', sortable: true },
-  { name: 'stages', label: 'Stages', field: 'stages', align: 'left' }
+import type { ProductionOrder, PurchaseRow, CapacityRow, PeggingRow } from '../types/mrp'
+import { useFormatting } from '../composables/useFormatting'
+import MRPSummaryCard from '../components/mrp/MRPSummaryCard.vue'
+import ProductionFilters from '../components/mrp/ProductionFilters.vue'
+import ProductionUnifiedTable from '../components/mrp/ProductionUnifiedTable.vue'
+import PurchasesUnifiedTable from '../components/mrp/PurchasesUnifiedTable.vue'
+import ProductionDailyAgenda from '../components/mrp/ProductionDailyAgenda.vue'
+import ProductionGroupedTable from '../components/mrp/ProductionGroupedTable.vue'
+import CapacityTable from '../components/mrp/CapacityTable.vue'
+import PeggingTable from '../components/mrp/PeggingTable.vue'
+import KindIssuesDialog from '../components/mrp/KindIssuesDialog.vue'
+import { useI18n } from 'vue-i18n'
+
+// Safe i18n accessor to avoid NOT_INSTALLED crash during route mount
+let _i18nInst: any = null
+try {
+  _i18nInst = useI18n()
+} catch (e) {
+  console.error('useI18n NOT INSTALLED yet (fallback in use).', e)
+}
+const t = ((key: any, params?: any) => {
+  try {
+    return _i18nInst?.t ? _i18nInst.t(key as any, params as any) : String(key)
+  } catch {
+    return String(key)
+  }
+}) as any
+
+// --- Справочники (должны быть объявлены ДО использования в колонках) ---
+const itemMap = ref<{ [key: number]: any }>({})
+const areaMap = ref<{ [key: number]: string }>({})
+
+const prodColumns: QTableColumn<ProductionOrder>[] = [
+  { name: 'order_id', label: t('mrp.columns.orderId'), field: 'order_id', align: 'left', sortable: true },
+  { name: 'item_id', label: t('mrp.columns.itemId'), field: 'item_id', align: 'right', sortable: true },
+  { name: 'qty', label: t('mrp.columns.qty'), field: 'qty', align: 'right', sortable: true },
+  { name: 'norm_hours_per_unit', label: t('mrp.columns.normPerUnit'), field: 'norm_hours_per_unit', align: 'right', sortable: true },
+  { name: 'norm_hours_total', label: t('mrp.columns.normTotal'), field: 'norm_hours_total', align: 'right', sortable: true },
+  { name: 'need_date', label: t('mrp.columns.needDate'), field: 'need_date', align: 'left', sortable: true },
+  { name: 'start_date', label: t('mrp.columns.startDate'), field: 'start_date', align: 'left', sortable: true },
+  { name: 'finish_date', label: t('mrp.columns.finishDate'), field: 'finish_date', align: 'left', sortable: true },
+  { name: 'bucket_type', label: t('mrp.columns.bucketType'), field: 'bucket_type', align: 'left', sortable: true },
+  { name: 'bucket_date', label: t('mrp.columns.bucketDate'), field: 'bucket_date', align: 'left', sortable: true },
+  { name: 'priority_index', label: t('mrp.columns.priorityIndex'), field: 'priority_index', align: 'right', sortable: true },
+  { name: 'stages', label: t('mrp.columns.stages'), field: 'stages', align: 'left' }
 ]
 
 const recommendedProdColumns: QTableColumn<any>[] = [
-  { name: 'item_name', label: 'Номенклатура', field: 'item_name', align: 'left' },
-  { name: 'qty', label: 'Количество', field: 'qty', align: 'right' },
-  { name: 'need_date', label: 'Требуемая дата', field: 'need_date', align: 'left' }
+  { name: 'item_name', label: t('mrp.columns.name'), field: 'item_name', align: 'left' },
+  { name: 'qty', label: t('mrp.columns.qty'), field: 'qty', align: 'right' },
+  { name: 'need_date', label: t('mrp.columns.needDate'), field: 'need_date', align: 'left' }
 ];
 
 const recommendedPurchColumns: QTableColumn<any>[] = [
-  { name: 'item_name', label: 'Номенклатура', field: (r: any) => (itemMap.value?.[r.item_id]?.item_name) ?? `Номенклатура #${r.item_id}`, align: 'left', sortable: true },
-  { name: 'item_article', label: 'Артикул', field: (r: any) => (itemMap.value?.[r.item_id]?.item_article) ?? '', align: 'left', sortable: true },
-  { name: 'qty', label: 'Количество', field: 'qty', align: 'right', sortable: true, format: (val) => fmt(val) },
-  { name: 'need_date', label: 'Требуемая дата', field: 'need_date', align: 'left', sortable: true },
-  { name: 'order_date', label: 'Дата заказа', field: 'order_date', align: 'left', sortable: true }
+  { name: 'item_name', label: t('mrp.columns.name'), field: (r: any) => (itemMap.value?.[r.item_id]?.item_name) ?? t('mrp.placeholder.itemNameFallback', { id: r.item_id }), align: 'left', sortable: true },
+  { name: 'item_article', label: t('mrp.columns.article'), field: (r: any) => (itemMap.value?.[r.item_id]?.item_article) ?? t('mrp.placeholder.noArticle'), align: 'left', sortable: true },
+  { name: 'qty', label: t('mrp.columns.qty'), field: 'qty', align: 'right', sortable: true, format: (val) => fmt(val) },
+  { name: 'need_date', label: t('mrp.columns.needDate'), field: 'need_date', align: 'left', sortable: true },
+  { name: 'order_date', label: t('mrp.columns.orderDate'), field: 'order_date', align: 'left', sortable: true }
 ];
 
-const purchColumns: QTableColumn<any>[] = [
-  { name: 'purchase_id', label: 'Purchase', field: 'purchase_id', align: 'left', sortable: true },
-  { name: 'item_id', label: 'Item', field: 'item_id', align: 'right', sortable: true },
-  { name: 'qty', label: 'Qty', field: 'qty', align: 'right', sortable: true },
-  { name: 'need_date', label: 'Need', field: 'need_date', align: 'left', sortable: true },
-  { name: 'order_date', label: 'Order date', field: 'order_date', align: 'left', sortable: true },
-  { name: 'lead_time_days', label: 'LT (d)', field: 'lead_time_days', align: 'right', sortable: true },
-  { name: 'bucket_type', label: 'Bucket', field: 'bucket_type', align: 'left', sortable: true },
-  { name: 'bucket_date', label: 'Bucket date', field: 'bucket_date', align: 'left', sortable: true },
-  { name: 'priority_index', label: 'Prio', field: 'priority_index', align: 'right', sortable: true }
+const purchColumns: QTableColumn<PurchaseRow>[] = [
+  { name: 'purchase_id', label: t('mrp.columns.purchaseId'), field: 'purchase_id', align: 'left', sortable: true },
+  { name: 'item_id', label: t('mrp.columns.itemId'), field: 'item_id', align: 'right', sortable: true },
+  { name: 'qty', label: t('mrp.columns.qty'), field: 'qty', align: 'right', sortable: true },
+  { name: 'need_date', label: t('mrp.columns.needDate'), field: 'need_date', align: 'left', sortable: true },
+  { name: 'order_date', label: t('mrp.columns.orderDate'), field: 'order_date', align: 'left', sortable: true },
+  { name: 'lead_time_days', label: t('mrp.columns.leadTimeDays'), field: 'lead_time_days', align: 'right', sortable: true },
+  { name: 'bucket_type', label: t('mrp.columns.bucketType'), field: 'bucket_type', align: 'left', sortable: true },
+  { name: 'bucket_date', label: t('mrp.columns.bucketDate'), field: 'bucket_date', align: 'left', sortable: true },
+  { name: 'priority_index', label: t('mrp.columns.priorityIndex'), field: 'priority_index', align: 'right', sortable: true }
 ]
 
-const capColumns: QTableColumn<any>[] = [
-  { name: 'area_id', label: 'Area', field: 'area_id', align: 'right', sortable: true },
-  { name: 'bucket_type', label: 'Bucket', field: 'bucket_type', align: 'left', sortable: true },
-  { name: 'bucket_date', label: 'Date', field: 'bucket_date', align: 'left', sortable: true },
-  { name: 'hours_planned', label: 'Planned (h)', field: 'hours_planned', align: 'right', sortable: true },
-  { name: 'hours_available', label: 'Avail. (h)', field: 'hours_available', align: 'right', sortable: true },
-  { name: 'overload_hours', label: 'Overload (h)', field: 'overload_hours', align: 'right', sortable: true }
+const capColumns: QTableColumn<CapacityRow>[] = [
+  { name: 'area_id', label: t('mrp.columns.areaId'), field: 'area_id', align: 'right', sortable: true },
+  { name: 'bucket_type', label: t('mrp.columns.bucketType'), field: 'bucket_type', align: 'left', sortable: true },
+  { name: 'bucket_date', label: t('mrp.columns.bucketDate'), field: 'bucket_date', align: 'left', sortable: true },
+  { name: 'hours_planned', label: t('mrp.columns.hoursPlanned'), field: 'hours_planned', align: 'right', sortable: true },
+  { name: 'hours_available', label: t('mrp.columns.hoursAvailable'), field: 'hours_available', align: 'right', sortable: true },
+  { name: 'overload_hours', label: t('mrp.columns.overloadHours'), field: 'overload_hours', align: 'right', sortable: true }
 ]
 
-const pegColumns: QTableColumn<any>[] = [
-  { name: 'id', label: 'ID', field: 'id', align: 'right', sortable: true },
-  { name: 'child_item_id', label: 'Child', field: 'child_item_id', align: 'right', sortable: true },
-  { name: 'parent_item_id', label: 'Parent', field: 'parent_item_id', align: 'right', sortable: true },
-  { name: 'qty_contribution', label: 'Qty contrib', field: 'qty_contribution', align: 'right', sortable: true },
-  { name: 'need_date', label: 'Need date', field: 'need_date', align: 'left', sortable: true },
-  { name: 'parent_need_date', label: 'Parent need', field: 'parent_need_date', align: 'left', sortable: true }
-]
+/** Pegging columns are defined inside PeggingTable component */
 
 // Унифицированные колонки для вкладок «Производство» и «Закупки»
 const prodUnifiedColumns: QTableColumn<any>[] = [
-  { name: 'name', label: 'Наименование', field: 'item_name', align: 'left' },
-  { name: 'article', label: 'Артикул', field: 'item_article', align: 'left' },
-  { name: 'qty', label: 'Количество', field: 'qty', align: 'right' },
-  { name: 'norm_per_unit', label: 'Норма, ч/шт', field: 'norm_hours_per_unit', align: 'right' },
-  { name: 'norm_total', label: 'Норматив всего, ч', field: 'norm_hours_total', align: 'right' }
+  { name: 'name', label: t('mrp.columns.name'), field: 'item_name', align: 'left' },
+  { name: 'article', label: t('mrp.columns.article'), field: 'item_article', align: 'left' },
+  { name: 'qty', label: t('mrp.columns.qty'), field: 'qty', align: 'right' },
+  { name: 'norm_per_unit', label: t('mrp.columns.normPerUnit'), field: 'norm_hours_per_unit', align: 'right' },
+  { name: 'norm_total', label: t('mrp.columns.normTotal'), field: 'norm_hours_total', align: 'right' }
 ]
 
 const purchUnifiedColumns: QTableColumn<any>[] = [
-  { name: 'name', label: 'Наименование', field: 'item_name', align: 'left' },
-  { name: 'article', label: 'Артикул', field: 'item_article', align: 'left' },
-  { name: 'qty', label: 'Количество', field: 'qty', align: 'right' }
+  { name: 'name', label: t('mrp.columns.name'), field: 'item_name', align: 'left' },
+  { name: 'article', label: t('mrp.columns.article'), field: 'item_article', align: 'left' },
+  { name: 'qty', label: t('mrp.columns.qty'), field: 'qty', align: 'right' }
 ]
 
 const route = useRoute()
 const runId = Number(route.params.runId)
+try { console.log('MRPResultPage diag', { params: route.params, runId }) } catch {}
+const diagText = computed(() => {
+  try {
+    return `diag: runId=${runId} · params=${JSON.stringify(route.params)}`
+  } catch {
+    return `diag: runId=${runId} · params=[unserializable]`
+  }
+})
 
 const summary = ref<any | null>(null)
+const pageLoading = ref(true)
+const loadError = ref<string | null>(null)
 const tab = ref<'production' | 'purchases' | 'capacity' | 'pegging' | 'components'>('production')
 // Вкладки верхнего уровня для унифицированных таблиц
 const viewTab = ref<'production' | 'purchases'>('production')
@@ -611,16 +416,6 @@ const kindIssues = computed(() => {
     String(w?.code || '') === 'NO_AREA_FOR_PRODUCTION_KIND_ZERO_NORM'
   )
 })
-const kindIssuesColumns: QTableColumn<any>[] = [
-  { name: 'pk', label: 'Вид (ID)', field: (r: any) => r.production_kind_id, align: 'right' },
-  { name: 'pk_name', label: 'Вид производства', field: 'production_kind_name', align: 'left' },
-  { name: 'item', label: 'Номенклатура', field: (r: any) => r.item_name || (r.item_id ? `Номенклатура #${r.item_id}` : '—'), align: 'left' },
-  { name: 'article', label: 'Артикул', field: 'item_article', align: 'left' },
-  { name: 'root_article', label: 'Артикул корневого изделия', field: 'root_item_article', align: 'left' },
-  { name: 'item_id', label: 'item_id', field: 'item_id', align: 'right' },
-  { name: 'spec', label: 'Спецификация', field: (r: any) => r.spec_name || r.spec_code || r.spec_ref1c || r.spec_id || '—', align: 'left' },
-  { name: 'code', label: 'Код', field: 'code', align: 'left' },
-]
 const kindIssuesRows = computed(() => {
   return (kindIssues.value || []).map((w: any, idx: number) => ({
     key: idx,
@@ -647,279 +442,85 @@ const showDayPopup = ref(false)
 // Меню выбора даты (QMenu)
 const showDayMenu = ref(false)
 
- // --- Справочники ---
- const itemMap = ref<{ [key: number]: any }>({})
- const areaMap = ref<{ [key: number]: string }>({})
+ // --- Справочники (объявлены выше) ---
  
  // --- Группировка для новых таблиц ---
  const groupedProductionOrders = ref<any[]>([])
  // Полные наборы строк для верхних таблиц (без учёта пагинации детальных)
  const prodAllRows = ref<any[]>([])
  const purchAllRows = ref<any[]>([])
+ const purchGroupedRows = ref<any[]>([])
 // Итоговый источник строк для карточки «Рекомендуемые заказы на производство»
 const groupedProdRows = computed(() => {
-  const groups = groupedProductionOrders.value || []
-  if (groups.length > 0) return groups
-  // Фолбэк: если группировка по участкам пустая — показываем плоский список,
-  // но применяем клиентский фильтр по датам/бакету для консистентности.
-  const src = (prodAllRows.value || []).filter(inProdRange)
-  const orders = src.map((r: any) => ({
-    ...r,
-    item_name: (itemMap.value?.[r.item_id]?.item_name) ?? `Номенклатура #${r.item_id}`,
-    item_article: (itemMap.value?.[r.item_id]?.item_article) ?? ''
-  }))
-  return orders.length ? [{ area_id: 0, area_name: '—', orders }] : []
+  return groupedProductionOrders.value || []
 })
 // Плоский список для фолбэка
 const plainProdRows = computed(() => {
   const src = prodAllRows.value || []
   return src.map((r: any) => ({
     ...r,
-    item_name: (itemMap.value?.[r.item_id]?.item_name) ?? `Номенклатура #${r.item_id}`,
-    item_article: (itemMap.value?.[r.item_id]?.item_article) ?? ''
+    item_name: (itemMap.value?.[r.item_id]?.item_name) ?? t('mrp.placeholder.itemNameFallback', { id: r.item_id }),
+    item_article: (itemMap.value?.[r.item_id]?.item_article) ?? t('mrp.placeholder.noArticle')
   }))
 })
 
 // Агрегация закупок по item_id+unit для верхней вкладки (независимо от пагинации детальных)
 const purchAggRows = computed(() => {
-  const map = new Map<string, any>()
-  // Apply UI date filter on full dataset (by bucket_date/order_date/need_date)
-  const src = (purchAllRows.value || []).filter(inPurchRange)
-  for (const r of src) {
-    const key = `${r.item_id}|${r.unit || ''}`
-    if (!map.has(key)) {
-      map.set(key, {
-        agg_key: key,
-        item_id: r.item_id,
-        item_name: r.item_name || (itemMap.value?.[r.item_id]?.item_name) || `Номенклатура #${r.item_id}`,
-        item_article: r.item_article || (itemMap.value?.[r.item_id]?.item_article) || '',
-        unit: r.unit,
-        qty: 0
-      })
-    }
-    const ex = map.get(key)
-    ex.qty = Number(ex.qty || 0) + Number(r.qty || 0)
-  }
-  return Array.from(map.values())
+  return purchGroupedRows.value || []
 })
 
 // --- Ежедневная повестка по участкам (задание на день) ---
 const dailyAgendaGroups = ref<any[]>([])
 
-function rebuildDailyAgendaForDay() {
+async function rebuildDailyAgendaForDay() {
   try {
     const day = (prod.filter.day_date || '').slice(0, 10)
     if (!day) {
       dailyAgendaGroups.value = []
       return
     }
-    type Agg = {
-      item_id: number
-      unit?: string | null
-      qty: number
-      norm_hours_total: number
-      norm_hours_per_unit: number | null
-      item_name: string
-      item_article: string
-      agg_key: string
-      _added_full_qty?: boolean
-    }
-    type Group = {
-      area_id: number
-      area_name: string
-      _agg: Record<string, Agg>
-    }
-    const groups: Record<number, Group> = {}
-
-    const rows = prodAllRows.value || []
-    for (const order of rows) {
-      const stages: any[] = Array.isArray(order?.stages) ? (order.stages as any[]) : []
-      // Норма на штуку из заказа (если нет — вычисляем от общей нормы и qty)
-      const q = Number(order?.qty || 0)
-      let npu: number | null = null
-      if (order?.norm_hours_per_unit != null) {
-        npu = Number(order.norm_hours_per_unit)
-      } else if (q > 0) {
-        npu = Number(order?.norm_hours_total || 0) / q
-      }
-      for (const s of stages) {
-        const sDate = (s?.bucket_date || '').slice(0, 10)
-        if (sDate !== day) continue
-        const areaId = s?.area_id != null ? Number(s.area_id) : 0
-        if (!groups[areaId]) {
-          groups[areaId] = {
-            area_id: areaId,
-            area_name: areaId ? (areaMap.value[areaId] ?? `Вид производства #${areaId}`) : '—',
-            _agg: {}
-          }
-        }
-        const key = `${order.item_id}|${order.unit || ''}`
-        if (!groups[areaId]._agg[key]) {
-          groups[areaId]._agg[key] = {
-            item_id: Number(order.item_id),
-            unit: order.unit,
-            qty: 0,
-            norm_hours_total: 0,
-            norm_hours_per_unit: npu,
-            item_name: order.item_name || (itemMap.value?.[order.item_id]?.item_name) || `Номенклатура #${order.item_id}`,
-            item_article: order.item_article || (itemMap.value?.[order.item_id]?.item_article) || '',
-            agg_key: key,
-            _added_full_qty: false
-          }
-        }
-        const ex = groups[areaId]._agg[key]
-        const hours = Number(s?.hours || 0)
-        ex.norm_hours_total += hours
-        // Перевод часов дня в выпуск по позиции за день по виду производства
-        // Если известна норма на штуку — используем час/норму,
-        // иначе (npu <= 0) — один раз прибавляем полный объём заказа в этот день.
-        if (npu && npu > 0) {
-          ex.qty += hours / npu
-        } else {
-          if (!ex._added_full_qty) {
-            ex.qty += Number(order?.qty || 0)
-            ex._added_full_qty = true
-          }
-        }
-      }
-    }
-
-    // Преобразование в массив и расчёт итогов/перегруза за день
-    const out: any[] = []
-    for (const areaIdStr of Object.keys(groups)) {
-      const areaId = Number(areaIdStr)
-      const g = groups[areaId]
-      if (!g) continue
-      const orders = Object.values(g._agg || {}) as Agg[]
-      const normSum = orders.reduce((s, r) => s + Number(r.norm_hours_total || 0), 0)
-      const sumQty = orders.reduce((s, r) => s + Number(r.qty || 0), 0)
-      // Индикатор перегруза за день
-      const cap = (dayCapUpper.value || {})[areaId] || { overload_hours: 0 }
-      out.push({
-        area_id: g.area_id,
-        area_name: g.area_name,
-        orders,
-        norm_sum_hours: normSum,
-        sum_qty: sumQty,
-        cap_overload_hours: Number(cap.overload_hours || 0)
-      })
-    }
-    dailyAgendaGroups.value = out
+    const resp = await getPlanningResultProductionAgendaDay(runId, {
+      day_date: day
+    })
+    dailyAgendaGroups.value = (resp?.groups || []).map((g: any) => ({
+      area_id: g.area_id,
+      area_name: g.area_name,
+      orders: g.orders || [],
+      norm_sum_hours: Number(g.norm_sum_hours || 0),
+      sum_qty: Number(g.sum_qty || 0),
+      cap_overload_hours: Number(g.cap_overload_hours || 0)
+    }))
   } catch (e) {
-    console.error('Failed to rebuild daily agenda', e)
+    console.error('Failed to load daily agenda', e)
     dailyAgendaGroups.value = []
   }
 }
 
-function rebuildGroupedProductionOrders() {
-  // Берём полный набор заказов. Полагаемся на серверные фильтры bucket_type/date,
-  // на клиенте валидируем только диапазон по bucket_date (если задан).
-  const all = (prodAllRows.value || [])
-  const from = emptyToUndef(prod.filter.date_from)
-  const to = emptyToUndef(prod.filter.date_to)
-  const src = (!from && !to) ? all : all.filter((order: any) => {
-    const dt = (order?.bucket_date || null) as string | null
-    return dateInRange(dt, from, to)
-  })
-
-  if (!src.length) {
-    groupedProductionOrders.value = []
-    return
-  }
-
-  type GroupType = {
-    area_id: number
-    area_name: string
-    orders: any[]
-    norm_sum_hours: number
-    _agg: Record<string, any>
-    min_days_to_need: number | null
-  }
-
-  const groups: Record<number, GroupType> = {}
-
-  for (const order of src) {
-    const stages: any[] = Array.isArray(order?.stages) ? (order.stages as any[]) : []
-    // Определяем «доминирующий» вид производства по стадии с максимальными часами (без доп. фильтров)
-    let dominant: any = null
-    for (const s of stages) {
-      if (!dominant || Number(s?.hours || 0) > Number(dominant?.hours || 0)) dominant = s
-    }
-    const areaId = dominant?.area_id != null ? Number(dominant.area_id) : 0
-    const areaName = areaId ? (areaMap.value[areaId] ?? `Вид производства #${areaId}`) : '—'
-
-    if (!groups[areaId]) {
-      groups[areaId] = {
-        area_id: areaId,
-        area_name: areaName,
-        orders: [],
-        norm_sum_hours: 0,
-        _agg: {},
-        min_days_to_need: null
-      }
-    }
-    const g = groups[areaId]
-
-    // Норматив по заказу берём из ответа бэкенда
-    const hoursTotalOrder = Number(order?.norm_hours_total || 0)
-
-    // Агрегация по (item_id, unit) внутри вида производства
-    const key = `${order.item_id}|${order.unit || ''}`
-    if (!g._agg[key]) {
-      g._agg[key] = {
-        ...order,
-        agg_key: key,
-        item_name: order.item_name || `Номенклатура #${order.item_id}`,
-        item_article: order.item_article || '',
-        qty: 0,
-        norm_hours_total: 0,
-        norm_hours_per_unit: order.norm_hours_per_unit ?? null
-      }
-    }
-    const ex = g._agg[key]
-    ex.qty = Number(ex.qty || 0) + Number(order.qty || 0)
-    ex.norm_hours_total = Number(ex.norm_hours_total || 0) + hoursTotalOrder
-    const q = Number(ex.qty || 0)
-    ex.norm_hours_per_unit = q > 0 ? Number(ex.norm_hours_total || 0) / q : (ex.norm_hours_per_unit ?? null)
-
-    // Срочность (минимум дней до потребности по заказам группы)
-    try {
-      const today = new Date()
-      const todayUTC = new Date(Date.UTC(today.getFullYear(), today.getMonth(), today.getDate()))
-      const needStr = (order?.need_date || order?.bucket_date || null) as string | null
-      if (needStr) {
-        const nd = new Date(needStr.slice(0, 10))
-        const ndUTC = new Date(Date.UTC(nd.getFullYear(), nd.getMonth(), nd.getDate()))
-        const diffDays = Math.ceil((ndUTC.getTime() - todayUTC.getTime()) / 86400000)
-        if (g.min_days_to_need == null || diffDays < g.min_days_to_need) {
-          g.min_days_to_need = diffDays
-        }
-      }
-    } catch {}
-  }
-
-  // Финализация групп
-  const out: any[] = []
-  for (const areaIdStr of Object.keys(groups)) {
-    const areaId = Number(areaIdStr)
-    const g = groups[areaId]
-    if (!g) continue
-    const orders = Object.values(g._agg || {}) as any[]
-    const normSum = orders.reduce((s: number, r: any) => s + Number(r?.norm_hours_total || 0), 0)
-
-    // Индикаторы capacity из предварительно загруженной карты
-    const cap = (capUpper.value || {})[areaId] || { overload_hours: 0, overloaded_buckets: 0 }
-    out.push({
+async function rebuildGroupedProductionOrders() {
+  try {
+    const resp = await getPlanningResultProductionGrouped(runId, {
+      bucket_type: prod.filter.bucket_type,
+      date_from: emptyToUndef(prod.filter.date_from),
+      date_to: emptyToUndef(prod.filter.date_to),
+      limit: 1000,
+      offset: 0,
+      sort_by: 'item_name',
+      sort_dir: 'asc'
+    })
+    const groups = (resp?.groups || []).map((g: any) => ({
       area_id: g.area_id,
       area_name: g.area_name,
-      orders,
-      norm_sum_hours: normSum,
-      min_days_to_need: g.min_days_to_need,
-      cap_overload_hours: Number(cap.overload_hours || 0),
-      cap_overloaded_buckets: Number(cap.overloaded_buckets || 0)
-    })
+      orders: g.orders || [],
+      norm_sum_hours: Number(g.norm_sum_hours || 0),
+      min_days_to_need: (g.min_days_to_need != null) ? Number(g.min_days_to_need) : null,
+      cap_overload_hours: Number(g.cap_overload_hours || 0),
+      cap_overloaded_buckets: Number(g.cap_overloaded_buckets || 0)
+    }))
+    groupedProductionOrders.value = groups
+  } catch (e) {
+    console.error('Failed to load grouped production', e)
+    groupedProductionOrders.value = []
   }
-  groupedProductionOrders.value = out
 }
 
  // --- Справочники (moved above) ---
@@ -1004,46 +605,68 @@ async function fillMissingDictionariesFromRows() {
   }
 }
 
-const bucketOptions = [
-  { label: 'Любой', value: undefined },
-  { label: 'daily', value: 'daily' },
-  { label: 'weekly', value: 'weekly' }
-]
+const bucketOptions = computed(() => ([
+  { label: t('mrp.filters.bucketOption.any'), value: undefined },
+  { label: t('mrp.filters.bucketOption.daily'), value: 'daily' },
+  { label: t('mrp.filters.bucketOption.weekly'), value: 'weekly' }
+]))
 
 // Production state
-const prod = reactive({
-  rows: [] as any[],
+const prod = reactive<{
+  rows: ProductionOrder[]
+  loading: boolean
+  filter: { bucket_type: 'daily' | 'weekly' | undefined; day_date: string; date_from: string; date_to: string }
+  pagination: { page: number; rowsPerPage: number; rowsNumber: number }
+  columns: QTableColumn<ProductionOrder>[]
+}>({
+  rows: [] as ProductionOrder[],
   loading: false,
-  filter: { bucket_type: undefined as 'daily' | 'weekly' | undefined, day_date: '', date_from: '', date_to: '' },
+  filter: { bucket_type: undefined, day_date: '', date_from: '', date_to: '' },
   pagination: { page: 1, rowsPerPage: 20, rowsNumber: 0 },
   columns: prodColumns
 })
 
 // Purchases state
-const purch = reactive({
-  rows: [] as any[],
+const purch = reactive<{
+  rows: PurchaseRow[]
+  loading: boolean
+  filter: { bucket_type: 'daily' | 'weekly' | undefined; date_from: string; date_to: string }
+  pagination: { page: number; rowsPerPage: number; rowsNumber: number }
+  columns: QTableColumn<PurchaseRow>[]
+}>({
+  rows: [] as PurchaseRow[],
   loading: false,
-  filter: { bucket_type: undefined as 'daily' | 'weekly' | undefined, date_from: '', date_to: '' },
+  filter: { bucket_type: undefined, date_from: '', date_to: '' },
   pagination: { page: 1, rowsPerPage: 20, rowsNumber: 0 },
   columns: purchColumns
 })
 
 // Capacity state
-const cap = reactive({
-  rows: [] as any[],
+const cap = reactive<{
+  rows: CapacityRow[]
+  loading: boolean
+  filter: { bucket_type: 'daily' | 'weekly' | undefined; date_from: string; date_to: string }
+  pagination: { page: number; rowsPerPage: number; rowsNumber: number }
+  columns: QTableColumn<CapacityRow>[]
+}>({
+  rows: [] as CapacityRow[],
   loading: false,
-  filter: { bucket_type: undefined as 'daily' | 'weekly' | undefined, date_from: '', date_to: '' },
+  filter: { bucket_type: undefined, date_from: '', date_to: '' },
   pagination: { page: 1, rowsPerPage: 30, rowsNumber: 0 },
   columns: capColumns
 })
 
 // Pegging state
-const peg = reactive({
-  rows: [] as any[],
+const peg = reactive<{
+  rows: PeggingRow[]
+  loading: boolean
+  filter: { child_item_id?: number; parent_item_id?: number; date_from: string; date_to: string }
+  pagination: { page: number; rowsPerPage: number; rowsNumber: number }
+}>({
+  rows: [] as PeggingRow[],
   loading: false,
-  filter: { child_item_id: undefined as number | undefined, parent_item_id: undefined as number | undefined, date_from: '', date_to: '' },
-  pagination: { page: 1, rowsPerPage: 30, rowsNumber: 0 },
-  columns: pegColumns
+  filter: { child_item_id: undefined, parent_item_id: undefined, date_from: '', date_to: '' },
+  pagination: { page: 1, rowsPerPage: 30, rowsNumber: 0 }
 })
 
 // Order Components state
@@ -1055,51 +678,14 @@ const comp = reactive({
   loading: false,
   orderOptions: [] as { label: string; value: number }[],
   columns: [
-    { name: 'name', label: 'Компонент', field: 'name', align: 'left', sortable: true },
-    { name: 'article', label: 'Артикул', field: 'article', align: 'left', sortable: true },
-    { name: 'qty', label: 'Требуемое кол-во', field: (r: any) => r?.computed?.treeQty ?? 0, align: 'right', sortable: true },
-    { name: 'stage', label: 'Этап', field: (r: any) => (r?.stage ? (r.stage as any).name || (r.stage as any).id : null), align: 'left' }
-  ] as QTableColumn<any>[]
+    { name: 'name', label: t('mrp.components.columns.name'), field: 'name', align: 'left', sortable: true },
+    { name: 'article', label: t('mrp.columns.article'), field: 'article', align: 'left', sortable: true },
+    { name: 'qty', label: t('mrp.components.columns.requiredQty'), field: (r: SpecNode) => (r as any)?.computed?.treeQty ?? 0, align: 'right', sortable: true },
+    { name: 'stage', label: t('mrp.components.columns.stage'), field: (r: SpecNode) => (r?.stage ? (r.stage as any).name || (r.stage as any).id : null), align: 'left' }
+  ] as QTableColumn<SpecNode>[]
 })
 
-function fmt(v: any) {
-  try {
-    const n = Number(v ?? 0)
-    if (Number.isNaN(n)) return '0,000'
-    return new Intl.NumberFormat('ru-RU', {
-      minimumFractionDigits: 3,
-      maximumFractionDigits: 3,
-      useGrouping: true
-    }).format(n)
-  } catch {
-    return '0,000'
-  }
-}
-
-// Формат количества с единицей измерения
-function fmtQty(qty: any, unit?: string | null) {
-  const q = fmt(qty)
-  const u = (unit || '').toString().trim()
-  return u ? `${q} ${u}` : q
-}
-
-function statusColor(s?: string) {
-  const val = (s || '').toUpperCase()
-  if (val === 'SUCCESS') return 'positive'
-  if (val === 'RUNNING') return 'primary'
-  if (val === 'FAILED') return 'negative'
-  return 'grey'
-}
-
-function warnText(w: any) {
-  try {
-    const code = w?.code ? String(w.code) : ''
-    const msg = w?.msg ? String(w.msg) : ''
-    return code ? `${code}: ${msg}` : msg
-  } catch {
-    return String(w)
-  }
-}
+const { formatNumber: fmt, formatQty: fmtQty, statusColor, warnText } = useFormatting()
 
 async function loadSummary() {
   try {
@@ -1114,30 +700,20 @@ async function loadProduction() {
   try {
     const limit = prod.pagination.rowsPerPage
     const offset = (prod.pagination.page - 1) * prod.pagination.rowsPerPage
-    const [resp, full] = await Promise.all([
-      getPlanningResultProduction(runId, {
-        bucket_type: prod.filter.bucket_type,
-        date_from: emptyToUndef(prod.filter.date_from),
-        date_to: emptyToUndef(prod.filter.date_to),
-        sort_by: 'item_name',
-        sort_dir: 'asc',
-        limit, offset
-      }),
-      getPlanningResultProduction(runId, {
-        bucket_type: prod.filter.bucket_type,
-        date_from: emptyToUndef(prod.filter.date_from),
-        date_to: emptyToUndef(prod.filter.date_to),
-        sort_by: 'item_name',
-        sort_dir: 'asc',
-        limit: 100000,
-        offset: 0
-      })
-    ])
+    const resp = await getPlanningResultProduction(runId, {
+      bucket_type: prod.filter.bucket_type,
+      date_from: emptyToUndef(prod.filter.date_from),
+      date_to: emptyToUndef(prod.filter.date_to),
+      sort_by: 'item_name',
+      sort_dir: 'asc',
+      limit, offset
+    })
     prod.rows = resp.rows || []
     prod.pagination.rowsNumber = resp.total || 0
-    prodAllRows.value = (full?.rows || [])
+    // Отказываемся от полной выгрузки 100000 строк — используем только текущую страницу как «полный» источник для фолбэка
+    prodAllRows.value = (resp?.rows || [])
     rebuildOrderOptions()
-    // Пересобираем группы по полному набору
+    // Пересобираем группы на сервере
     rebuildGroupedProductionOrders()
     // Индикаторы capacity для верхнего агрегата (по текущим фильтрам)
     await loadCapacityUpper()
@@ -1156,7 +732,7 @@ async function loadPurchases() {
   try {
     const limit = purch.pagination.rowsPerPage
     const offset = (purch.pagination.page - 1) * purch.pagination.rowsPerPage
-    const [resp, full] = await Promise.all([
+    const [resp, grouped] = await Promise.all([
       getPlanningResultPurchases(runId, {
         bucket_type: purch.filter.bucket_type,
         date_from: emptyToUndef(purch.filter.date_from),
@@ -1165,19 +741,19 @@ async function loadPurchases() {
         sort_dir: 'asc',
         limit, offset
       }),
-      getPlanningResultPurchases(runId, {
+      getPlanningResultPurchasesGrouped(runId, {
         bucket_type: purch.filter.bucket_type,
         date_from: emptyToUndef(purch.filter.date_from),
         date_to: emptyToUndef(purch.filter.date_to),
-        sort_by: 'item_name',
-        sort_dir: 'asc',
-        limit: 100000,
+        limit: 1000,
         offset: 0
       })
     ])
     purch.rows = resp.rows || []
     purch.pagination.rowsNumber = resp.total || 0
-    purchAllRows.value = (full?.rows || [])
+    // Отказ от полной выгрузки 100000 строк — используем текущую страницу как «полный» источник для фолбэка
+    purchAllRows.value = (resp?.rows || [])
+    purchGroupedRows.value = (grouped?.rows || [])
   } catch (e) {
     console.error('Failed to load purchases', e)
   } finally {
@@ -1284,24 +860,21 @@ const capUpper = ref<{ [areaId: number]: { overload_hours: number; hours_planned
  
 async function loadCapacityUpper() {
   try {
-    const resp = await getPlanningResultCapacity(runId, {
+    const resp = await getPlanningResultCapacitySummary(runId, {
       bucket_type: prod.filter.bucket_type,
       date_from: emptyToUndef(prod.filter.date_from),
-      date_to: emptyToUndef(prod.filter.date_to),
-      limit: 100000,
-      offset: 0
+      date_to: emptyToUndef(prod.filter.date_to)
     })
     const map: { [k: number]: { overload_hours: number; hours_planned: number; hours_available: number; overloaded_buckets: number } } = {}
-    for (const r of (resp.rows || [])) {
-      const aid = Number(r.area_id || 0)
-      if (!map[aid]) {
-        map[aid] = { overload_hours: 0, hours_planned: 0, hours_available: 0, overloaded_buckets: 0 }
-      }
-      map[aid].overload_hours += Number(r.overload_hours || 0)
-      map[aid].hours_planned += Number(r.hours_planned || 0)
-      map[aid].hours_available += Number(r.hours_available || 0)
-      if (Number(r.overload_hours || 0) > 0) {
-        map[aid].overloaded_buckets += 1
+    const m = (resp?.map || {}) as any
+    for (const k of Object.keys(m)) {
+      const aid = Number(k)
+      const v = m[k] || {}
+      map[aid] = {
+        overload_hours: Number(v.overload_hours || 0),
+        hours_planned: Number(v.hours_planned || 0),
+        hours_available: Number(v.hours_available || 0),
+        overloaded_buckets: Number(v.overloaded_buckets || 0)
       }
     }
     capUpper.value = map
@@ -1322,18 +895,17 @@ async function loadCapacityUpperDay() {
       dayCapUpper.value = {}
       return
     }
-    const resp = await getPlanningResultCapacity(runId, {
+    const resp = await getPlanningResultCapacitySummary(runId, {
       bucket_type: 'daily',
       date_from: day,
-      date_to: day,
-      limit: 100000,
-      offset: 0
+      date_to: day
     })
     const map: { [k: number]: { overload_hours: number } } = {}
-    for (const r of (resp.rows || [])) {
-      const aid = Number(r.area_id || 0)
-      if (!map[aid]) map[aid] = { overload_hours: 0 }
-      map[aid].overload_hours += Number(r.overload_hours || 0)
+    const m = (resp?.map || {}) as any
+    for (const k of Object.keys(m)) {
+      const aid = Number(k)
+      const v = m[k] || {}
+      map[aid] = { overload_hours: Number(v.overload_hours || 0) }
     }
     dayCapUpper.value = map
   } catch (e) {
@@ -1377,12 +949,16 @@ function openDayPicker(e?: Event) {
 function onDayPicked(val: string) {
   try {
     // val уже в маске YYYY-MM-DD
-    prod.filter.day_date = (val || '').slice(0, 10)
-    // Применяем фильтр на день
-    applyDayFilter()
+    const newDay = (val || '').slice(0, 10);
+    // Проверяем, изменилось ли значение, чтобы избежать лишнего срабатывания
+    if (prod.filter.day_date !== newDay) {
+      prod.filter.day_date = newDay;
+      // Применяем фильтр на день (debounce)
+      applyDayFilterDebounced();
+    }
     // Закрываем попап/меню
-    showDayPopup.value = false
-    showDayMenu.value = false
+    showDayPopup.value = false;
+    showDayMenu.value = false;
   } catch {
     // no-op
   }
@@ -1454,6 +1030,12 @@ function onPurchRequest(ctx: any) {
   if (ctx?.pagination) purch.pagination = ctx.pagination
   loadPurchases()
 }
+function onPurchReset() {
+  purch.filter.bucket_type = undefined as any
+  purch.filter.date_from = ''
+  purch.filter.date_to = ''
+  loadPurchases()
+}
 function onCapRequest(ctx: any) {
   if (ctx?.pagination) cap.pagination = ctx.pagination
   loadCapacity()
@@ -1467,6 +1049,26 @@ function emptyToUndef(s: string): string | undefined {
   const t = (s || '').trim()
   return t.length ? t : undefined
 }
+
+// --- Debounce helpers and debounced actions ---
+function debounce<T extends (...args: any[]) => any>(fn: T, ms = 250) {
+  let timer: number | undefined
+  return (...args: Parameters<T>) => {
+    if (timer) clearTimeout(timer as any)
+    timer = window.setTimeout(() => fn(...args), ms)
+  }
+}
+
+const applyProdFilters = async () => {
+  await loadProduction()
+  await loadCapacityUpper()
+  rebuildDailyAgendaForDay()
+  await loadCapacityUpperDay()
+}
+const applyProdFiltersDebounced = debounce(applyProdFilters, 250)
+const applyPurchFiltersDebounced = debounce(loadPurchases, 250)
+const applyDayFilterDebounced = debounce(applyDayFilter, 250)
+const loadCapacityUpperDebounced = debounce(loadCapacityUpper, 250)
 
 // --- Helpers: date range filters for upper unified tables ---
 function dateInRange(dt: string | null | undefined, from?: string, to?: string): boolean {
@@ -1509,25 +1111,38 @@ function inPurchRange(row: any): boolean {
 }
 
 onMounted(async () => {
-  await loadSummary()
-  // Загружаем все данные параллельно
-  await Promise.all([
-    loadProduction(),
-    loadPurchases(),
-    loadDictionaries()
-  ])
-  // Догружаем недостающие записи словарей по item_id/area_id из фактических строк
-  await fillMissingDictionariesFromRows()
-  // Теперь, когда все данные загружены, вызываем группировку
-  rebuildGroupedProductionOrders()
-  rebuildDailyAgendaForDay()
-  await loadCapacityUpperDay()
+  console.time('MRPResultPage:onMounted')
   try {
+    await loadSummary()
+    console.time('MRP:loaders')
+    await Promise.all([
+      loadProduction(),
+      loadPurchases(),
+      loadDictionaries()
+    ])
+    console.timeEnd('MRP:loaders')
+    // Догружаем недостающие записи словарей по item_id/area_id из фактических строк
+    await fillMissingDictionariesFromRows()
+    // Теперь, когда все данные загружены, вызываем агрегаты
+    rebuildGroupedProductionOrders()
+    rebuildDailyAgendaForDay()
+    await loadCapacityUpperDay()
     console.log('MRP onMounted', {
-      grouped: (groupedProdRows as any)?.value?.length ?? (groupedProductionOrders as any)?.value?.length ?? 0,
-      prodRows: (prod.rows || []).length
+      grouped: (groupedProductionOrders as any)?.value?.length ?? 0,
+      prodRows: (prod.rows || []).length,
+      purchRows: (purch.rows || []).length
     })
-  } catch (e) {}
+  } catch (e: any) {
+    console.error('MRPResultPage mount error', e)
+    try {
+      loadError.value = e?.message ? String(e.message) : JSON.stringify(e)
+    } catch {
+      loadError.value = String(e)
+    }
+  } finally {
+    pageLoading.value = false
+    console.timeEnd('MRPResultPage:onMounted')
+  }
 })
 
 // Наблюдаем за вкладкой для загрузки данных при переключении
@@ -1545,40 +1160,21 @@ watch(viewTab, (vt) => {
 })
 
 // Наблюдаем за изменениями prod.rows, itemMap и areaMap для обновления groupedProductionOrders
-watch([() => prod.rows, () => itemMap.value, () => areaMap.value], () => {
-  rebuildGroupedProductionOrders()
-}, { deep: true })
+/**
+ * Removed heavy deep watch on prod.rows/itemMap/areaMap to reduce reactive load.
+ * Grouped data is rebuilt explicitly in loaders (loadProduction, loadDictionaries, loadCapacityUpper)
+ * and on capacity summary updates.
+ */
 
-// Пересчёт верхней группировки по изменениям полного набора, фильтров даты и типа бакета
-watch([() => prodAllRows.value, () => prod.filter.date_from, () => prod.filter.date_to, () => prod.filter.bucket_type, () => areaMap.value], () => {
-  rebuildGroupedProductionOrders()
-  // Также пересчитываем дневную повестку и перезагружаем мощность за день, если день выбран
-  rebuildDailyAgendaForDay()
-  loadCapacityUpperDay()
-})
 
-// Перестраиваем верхний агрегат при изменении карты мощностей (индикаторы перегруза)
-watch(() => capUpper.value, () => {
-  rebuildGroupedProductionOrders()
-})
+/* Перестроение агрегатов выполняется явно в loadCapacityUpper()
+   для исключения двойных вызовов и снижения реактивной нагрузки */
 
-// Ежедневная повестка: пересчёт при изменении выбранного дня/полного набора + принудительный серверный фильтр на день
-watch([() => prodAllRows.value, () => prod.filter.day_date], () => {
-  const day = (prod.filter.day_date || '').slice(0, 10)
-  // Не навязываем server-side фильтры автоматически при изменении day_date.
-  // Серверные фильтры применяются явным действием (applyDayFilter).
-  rebuildDailyAgendaForDay()
-  loadCapacityUpperDay()
-})
 
-// Перестраиваем верхний агрегат при изменении карты мощностей (индикаторы перегруза)
-watch(() => capUpper.value, () => {
-  rebuildGroupedProductionOrders()
-})
 
 // Актуализируем индикаторы перегруза при изменении фильтров верхней вкладки «Производство»
 watch([() => prod.filter.bucket_type, () => prod.filter.date_from, () => prod.filter.date_to], () => {
-  loadCapacityUpper()
+  loadCapacityUpperDebounced()
 })
 </script>
 

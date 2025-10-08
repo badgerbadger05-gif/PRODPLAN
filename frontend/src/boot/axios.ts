@@ -13,7 +13,21 @@ declare module '@vue/runtime-core' {
 // good idea to move this instance creation inside of the
 // "export default () => {}" function below (which runs individually
 // for each client)
-const api = axios.create({ baseURL: '/api', timeout: 900000 })
+/**
+ * Определение базового URL API:
+ * - В DEV (локальный фронтенд на 9000/localhost) направляем запросы на локальный backend: http://localhost:8000/api
+ * - В PROD (через nginx) используем относительный путь '/api'
+ * - Возможна переопределение через window.__API_URL__ (например, при нестандартной среде)
+ * Без import.meta.env — чтобы не зависеть от настроек tsconfig/module.
+ */
+const dev =
+  typeof window !== 'undefined' &&
+  (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1')
+
+const apiBase: string =
+  (dev ? (((window as any).__API_URL__ as string) || 'http://localhost:8000/api') : '/api')
+
+const api = axios.create({ baseURL: apiBase, timeout: 900000 })
 
 export default boot(({ app }) => {
   // for use inside Vue files (Options API) through this.$axios and this.$api

@@ -241,8 +241,15 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                         ).first()
 
                         if existing_spec_op:
-                            if existing_spec_op.stage_id != (stage.stage_id if stage else None):
-                                existing_spec_op.stage_id = stage.stage_id if stage else None
+                            desired_stage_id = stage.stage_id if stage else None
+                            updated = False
+                            if existing_spec_op.stage_id != (desired_stage_id):
+                                existing_spec_op.stage_id = desired_stage_id
+                                updated = True
+                            if existing_spec_op.time_norm != time_norm:
+                                existing_spec_op.time_norm = time_norm
+                                updated = True
+                            if updated:
                                 spec_operations_updated += 1
                         else:
                             new_spec_op = SpecOperation(

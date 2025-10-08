@@ -28,6 +28,8 @@ class Item(Base):
     replenishment_time = Column(Integer)
     unit = Column(String(50))
     stock_qty = Column(DECIMAL(10, 3), default=0.0)
+    # Опциональная оптимальная партия для лот‑сайзинга (шт)
+    optimal_batch = Column(DECIMAL(15, 3), nullable=True)
     status = Column(String(20), default='active')
     created_at = Column(TIMESTAMP, default=func.now())
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
@@ -251,6 +253,8 @@ class ProductionResource(Base):
     work_schedule = Column(String(100), default='5/2')  # График работы
     # Соответствие существующей БД: work_hours_per_day -> daily_work_hours
     daily_work_hours = Column("work_hours_per_day", DECIMAL(4, 2), default=8.0)  # Рабочее время в часах в сутки
+    # Буфер (дней) для расчёта базового количества запуска на участке
+    buffer_days = Column(Integer, default=0, nullable=False)
     created_at = Column(TIMESTAMP, default=func.now())
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
 

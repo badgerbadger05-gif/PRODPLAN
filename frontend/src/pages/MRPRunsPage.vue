@@ -17,6 +17,7 @@
       :loading="loading"
       :pagination="pagination"
       @request="onRequest"
+      @row-click="onRowClick"
     >
       <template v-slot:body-cell-status="props">
         <q-td :props="props">
@@ -205,6 +206,17 @@ function onRequest(ctx: any) {
     pagination.value = ctx.pagination
   }
   fetchRuns()
+}
+
+function onRowClick(props: any) {
+  try {
+    const runId = Number(props?.row?.run_id || 0)
+    if (Number.isFinite(runId) && runId > 0) {
+      goRun(runId)
+    }
+  } catch (e) {
+    console.error('onRowClick failed', e)
+  }
 }
 
 async function onCalc() {

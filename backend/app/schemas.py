@@ -11,6 +11,8 @@ class ItemBase(BaseModel):
     replenishment_time: Optional[int] = None
     unit: Optional[str] = None
     stock_qty: float = 0.0
+    # Опциональная оптимальная партия (лот‑сайзинг) для номенклатуры
+    optimal_batch: Optional[float] = None
     status: str = 'active'
 
 
@@ -29,6 +31,14 @@ class Item(ItemBase):
 
     class Config:
         from_attributes = True
+
+
+# Paginated DTO for items list
+class ItemsPage(BaseModel):
+    rows: List[Item]
+    total: int
+    limit: int
+    offset: int
 
 
 class ItemCategoryBase(BaseModel):
@@ -359,6 +369,7 @@ class ProductionResourceBase(BaseModel):
     capacity: float = 0.0
     work_schedule: Optional[str] = '5/2'
     daily_work_hours: float = 8.0
+    buffer_days: int = 0
 
 
 class ProductionResourceCreate(ProductionResourceBase):

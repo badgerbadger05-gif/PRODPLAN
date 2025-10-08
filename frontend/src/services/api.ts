@@ -251,3 +251,110 @@ export async function exportPlanningResultPurchases(runId: number, params: {
   const { data } = await api.get(`/v1/plan/results/${runId}/purchases/export`, { params })
   return data
 }
+// === Backend-first grouped/agenda/summary API wrappers (additive) ===
+
+export async function getPlanningResultProductionGrouped(runId: number, params: {
+  bucket_type?: 'daily' | 'weekly'
+  date_from?: string
+  date_to?: string
+  area_id?: number
+  limit?: number
+  offset?: number
+  sort_by?: 'item_name' | 'item_article' | 'qty' | 'need_date' | 'bucket_date' | 'priority_index'
+  sort_dir?: 'asc' | 'desc'
+} = {}): Promise<{
+  groups: Array<{
+    area_id: number
+    area_name: string
+    orders: Array<{
+      agg_key: string
+      item_id: number
+      item_name?: string
+      item_article?: string
+      unit?: string
+      qty: number
+      norm_hours_total: number
+      norm_hours_per_unit?: number | null
+    }>
+    norm_sum_hours: number
+    min_days_to_need?: number | null
+    cap_overload_hours?: number
+    cap_overloaded_buckets?: number
+  }>
+  total_groups: number
+  total_orders: number
+  limit: number
+  offset: number
+}> {
+  const { data } = await api.get(`/v1/plan/results/${runId}/production/grouped`, { params })
+  return data
+}
+
+export async function getPlanningResultProductionAgendaDay(runId: number, params: {
+  day_date: string
+  area_id?: number
+}): Promise<{
+  day: string
+  groups: Array<{
+    area_id: number
+    area_name: string
+    orders: Array<{
+      agg_key: string
+      item_id: number
+      item_name?: string
+      item_article?: string
+      unit?: string
+      qty: number      // выпуск за день по виду/участку
+      norm_hours_total: number // часы за день
+      norm_hours_per_unit?: number | null
+    }>
+    norm_sum_hours: number
+    sum_qty: number
+    cap_overload_hours?: number
+  }>
+}> {
+  const { data } = await api.get(`/v1/plan/results/${runId}/production/agenda_day`, { params })
+  return data
+}
+
+export async function getPlanningResultPurchasesGrouped(runId: number, params: {
+  bucket_type?: 'daily' | 'weekly'
+  date_from?: string
+  date_to?: string
+  limit?: number
+  offset?: number
+} = {}): Promise<{
+  rows: Array<{
+    agg_key: string
+    item_id: number
+    item_name?: string
+    item_article?: string
+    unit?: string
+    qty: number
+  }>
+  total: number
+  limit: number
+  offset: number
+}> {
+  const { data } = await api.get(`/v1/plan/results/${runId}/purchases/grouped`, { params })
+  return data
+}
+
+export async function getPlanningResultCapacitySummary(runId: number, params: {
+  bucket_type?: 'daily' | 'weekly'
+  date_from?: string
+  date_to?: string
+} = {}): Promise<{
+  map: {
+    [areaId: number]: {
+      hours_planned: number
+      hours_available: number
+      overload_hours: number
+      overloaded_buckets: number
+    }
+  }
+  total_rows: number
+}> {
+  const { data } = await api.get(`/v1/plan/results/${runId}/capacity/summary`, { params })
+  return data
+}

@@ -48,23 +48,35 @@ def sync_stock_odata(payload: ODataSyncRequest, db: Session = Depends(get_db)):
 def sync_nomenclature_odata(payload: ODataSyncRequest, db: Session = Depends(get_db)):
     """
     Синхронизация номенклатуры из 1С через OData.
-    Тело запроса:
-    {
-      "base_url": "http://srv-1c:8080/base/odata/standard.odata",
-      "entity_name": "Catalog_Номенклатура",
-      "username": "user",
-      "password": "pass",
-      "token": null,
-      "filter_query": null,
-      "select_fields": null,
-      "dry_run": false,
-      "zero_missing": false
-    }
+    Перед синхронизацией номенклатуры принудительно запускается синхронизация единиц измерения,
+    чтобы гарантировать целостность данных.
     """
     try:
-        stats = sync_nomenclature_from_odata(db, payload)
-        return stats
+        # --- Шаг 1: Синхронизация единиц измерения ---
+        # Создаём новый запрос для ЕИ, используя payload от номенклатуры, но меняя entity_name
+        units_payload = payload.copy(deep=True)
+        # Имя сущности ЕИ по умолчанию. Можно сделать параметром в будущем.
+        units_payload.entity_name = "Catalog_ЕдиницыИзмерения"
+        
+        # Выполняем синхронизацию ЕИ. В случае ошибки, она пробросится и остановит процесс.
+        units_stats = sync_units_from_odata(db, units_payload)
+
+        # --- Шаг 2: Синхронизация номенклатуры ---
+        nomenclature_stats = sync_nomenclature_from_odata(db, payload)
+
+        # --- Шаг 3: Добивка недостающих ЕИ ---
+        # После синхронизации номенклатуры могли появиться ссылки на ЕИ, которых не было
+        # в основном справочнике. Добираем их.
+        backfill_stats = backfill_units_from_items(db, units_payload)
+
+        # Собираем общий результат
+        return {
+            "nomenclature_sync": nomenclature_stats,
+            "units_sync": units_stats,
+            "units_backfill": backfill_stats,
+        }
     except Exception as e:
+        db.rollback()
         raise HTTPException(status_code=500, detail=f"Sync error: {e}")
 
 
