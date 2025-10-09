@@ -304,13 +304,21 @@ export async function getPlanningResultProductionAgendaDay(runId: number, params
       item_name?: string
       item_article?: string
       unit?: string
-      qty: number      // выпуск за день по виду/участку
-      norm_hours_total: number // часы за день
+      qty: number      // выпуск за день по виду/участку (если нет перегруза)
+      norm_hours_total: number // часы за день (если нет перегруза)
       norm_hours_per_unit?: number | null
+      // расширения для перегруза
+      order_id?: number
+      display_qty?: number
+      display_norm_hours_total?: number
+      overload?: boolean
     }>
     norm_sum_hours: number
     sum_qty: number
     cap_overload_hours?: number
+    // расширения по мощности на день
+    hours_available_day?: number
+    cap_overload_percent?: number | null
   }>
 }> {
   const { data } = await api.get(`/v1/plan/results/${runId}/production/agenda_day`, { params })

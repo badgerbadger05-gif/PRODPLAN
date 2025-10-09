@@ -128,6 +128,9 @@ const loading = computed(() => !!props.loading)
 const applyDisabled = computed(() => loading.value)
 
 function emitApply() {
+  // Синхронно прокидываем актуальное состояние фильтров наверх перед применением,
+  // чтобы родитель (MRPResultPage) видел обновлённый day_date при первом клике.
+  emit('update:modelValue', { ...local.value })
   emit('apply')
 }
 function emitReset() {

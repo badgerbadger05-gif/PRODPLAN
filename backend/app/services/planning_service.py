@@ -1674,7 +1674,7 @@ def run_planning_run(
                     horizon_days=horizon_days_local,
                     total_demand_by_item=total_demand_by_item_local,
                 )
-                final_qty, qn, warn_list = oqc.compute(int(iid), float(q))
+                final_before, qn, comp_details, warn_list = oqc.compute(int(iid), float(q))
                 if warn_list:
                     warnings.extend(warn_list)
                 if qn <= 0.0:
@@ -1701,6 +1701,10 @@ def run_planning_run(
             )
             db.add(rec)
             created_orders.append(rec)
+            try:
+                setattr(rec, "_comp_details", comp_details)
+            except Exception:
+                pass
 
         # Daily buckets
         for iid_str, buckets in net_daily.items():
@@ -2271,6 +2275,44 @@ def run_planning_run(
                                 workdays_window=int(workdays_window),
                             )
                         )
+                        # Недопланированный объём = разница между нормализованным и ограниченным мощностью
+                        try:
+                            unmet_qty = float(qty) - float(limited_qty)
+                        except Exception:
+                            unmet_qty = 0.0
+                        if unmet_qty > 1e-9:
+                            # Попробуем определить предполагаемый ресурс (по виду производства)
+                            try:
+                                resource_hint = int(sorted(candidate_res_ids)[0]) if candidate_res_ids else None
+                            except Exception:
+                                resource_hint = None
+                            # Детали расчёта количества (для корректного логирования дефицита мощности)
+                            comp_details = getattr(order, "_comp_details", None)
+                            req_qty_orig = float(comp_details.get("requested_qty", 0.0)) if isinstance(comp_details, dict) else None
+                            final_before_cap = float(comp_details.get("final_qty_before_capacity", float(qty))) if isinstance(comp_details, dict) else float(qty)
+                            normalized_qty_calc = float(comp_details.get("normalized_qty", float(qty))) if isinstance(comp_details, dict) else float(qty)
+                            requested_before_capacity = float(normalized_qty_calc)
+                            warnings.append(
+                                log_warning(
+                                    logger,
+                                    "CAPACITY_SHORTAGE",
+                                    f"Item {int(item_id)} unmet quantity due to capacity on need_date",
+                                    order_id=int(order.order_id),
+                                    item_id=int(item_id),
+                                    production_kind_id=int(production_kind_id) if production_kind_id is not None else None,
+                                    resource_id=resource_hint,
+                                    need_date=order.need_date.isoformat() if order.need_date else None,
+                                    requested_qty=float(req_qty_orig) if req_qty_orig is not None else None,
+                                    final_qty_before_capacity=float(final_before_cap),
+                                    normalized_qty=float(normalized_qty_calc),
+                                    requested_qty_before_capacity=float(requested_before_capacity),
+                                    limited_by_capacity=float(limited_qty),
+                                    unmet_qty=float(unmet_qty),
+                                    norm_hours_per_unit=float(norm_single or 0.0),
+                                    unmet_norm_hours=float(unmet_qty) * float(norm_single or 0.0),
+                                )
+                            )
+                        # Применяем ограничение
                         order.qty = float(limited_qty)
                         qty = float(limited_qty)
                         total_hours = float(norm_single or 0.0) * float(qty or 0.0)
@@ -3044,6 +3086,38 @@ def get_run_production_agenda_day(
     res_rows: List[ProductionResource] = db.query(ProductionResource).all()
     area_name_map: Dict[int, str] = {int(r.resource_id): str(r.resource_name or "") for r in res_rows}
 
+    # --- Дополнительно: определения доминирующего участка по всем стадиям и список заказов на день ---
+    # Карта (order_id -> карта часов по участкам)
+    hours_by_area_by_order: Dict[int, Dict[Optional[int], float]] = {}
+    for s in st_all:
+        try:
+            oid = int(s.order_id)
+            aid = int(s.area_id) if s.area_id is not None else None
+            h = float(getattr(s, "hours", 0.0) or 0.0)
+            m = hours_by_area_by_order.setdefault(oid, {})
+            m[aid] = float(m.get(aid, 0.0) + h)
+        except Exception:
+            continue
+
+    # Доминирующий участок заказа (по сумме часов всех стадий)
+    dom_area_by_order: Dict[int, Optional[int]] = {}
+    for oid, amap in hours_by_area_by_order.items():
+        best_aid: Optional[int] = None
+        best_h = -1.0
+        for aid, hh in amap.items():
+            if aid is not None and float(hh) > best_h:
+                best_h = float(hh)
+                best_aid = int(aid)
+        dom_area_by_order[int(oid)] = best_aid
+
+    # Заказы, назначенные на этот день (по bucket_date), даже если на самом деле часов в этот день нет
+    ord_day_q = db.query(PlannedOrder).filter(
+        PlannedOrder.run_id == int(run_id),
+        PlannedOrder.bucket_type == "daily",
+        PlannedOrder.bucket_date == day,
+    )
+    orders_for_day: List[PlannedOrder] = ord_day_q.all()
+
     from collections import defaultdict as _dd
     groups: Dict[int, Dict[str, Any]] = _dd(lambda: {
         "area_id": None,
@@ -3052,10 +3126,13 @@ def get_run_production_agenda_day(
         "norm_sum_hours": 0.0,
         "sum_qty": 0.0,
         "cap_overload_hours": 0.0,
+        "hours_available_day": 0.0,
+        "cap_overload_percent": None,
     })
 
     # Индексы по order_id
     ord_by_id: Dict[int, PlannedOrder] = {int(o.order_id): o for o in orders}
+    processed_oids: Set[int] = set()
 
     for s in day_stages:
         if s.area_id is None:
@@ -3067,6 +3144,7 @@ def get_run_production_agenda_day(
         o = ord_by_id.get(oid)
         if not o:
             continue
+        processed_oids.add(oid)
 
         total_hours = float(ord_total_hours.get(oid, 0.0) or 0.0)
         qty = float(getattr(o, "qty", 0.0) or 0.0)
@@ -3097,7 +3175,11 @@ def get_run_production_agenda_day(
         g = groups[aid]
         g["area_id"] = aid
         g["area_name"] = area_name_map.get(aid, f"Участок #{aid}")
-        g["orders"].append({
+        # Если на выбранный день по заказу часов 0 — трактуем как «перегруз на день»:
+        # показываем полный объём заказа в display_*, ставим флаг overload, добавляем часы в cap_overload_hours
+        overloaded_today = float(hours_today) <= 1e-9
+        row = {
+            "order_id": int(o.order_id),
             "agg_key": f"{int(o.item_id)}|{unit_disp or ''}",
             "item_id": int(o.item_id),
             "item_name": getattr(it, "item_name", None) if it else None,
@@ -3106,9 +3188,95 @@ def get_run_production_agenda_day(
             "qty": float(qty_today),
             "norm_hours_total": float(hours_today),
             "norm_hours_per_unit": float(npu) if (npu is not None) else None,
-        })
+        }
+        if overloaded_today:
+            # Показываем полный объём заказа и суммарные нормо‑часы:
+            # если по заказу нет часов вообще (total_hours≈0), используем fallback-норму на единицу.
+            try:
+                nhpu = float(npu) if (npu is not None) else 0.0
+            except Exception:
+                nhpu = 0.0
+            display_total = float(total_hours) if float(total_hours) > 1e-9 else float(qty) * float(nhpu)
+            row["display_qty"] = float(qty)
+            row["display_norm_hours_total"] = float(display_total)
+            row["overload"] = True
+            try:
+                g["cap_overload_hours"] = float(g.get("cap_overload_hours", 0.0) or 0.0) + float(display_total or 0.0)
+            except Exception:
+                pass
+        else:
+            row["overload"] = False
+        g["orders"].append(row)
         g["norm_sum_hours"] += float(hours_today)
         g["sum_qty"] += float(qty_today)
+
+    # Добавляем заказы, назначенные на этот день, но не попавшие в day_stages (hours_today == 0)
+    for o in orders_for_day:
+        try:
+            oid = int(o.order_id)
+        except Exception:
+            continue
+        if oid in processed_oids:
+            continue
+
+        # Определяем доминирующий участок по всем стадиям заказа
+        dom_aid = dom_area_by_order.get(oid)
+        if dom_aid is None:
+            continue
+        if area_id is not None and int(dom_aid) != int(area_id):
+            continue
+
+        total_hours = float(ord_total_hours.get(oid, 0.0) or 0.0)
+        qty_full = float(getattr(o, "qty", 0.0) or 0.0)
+        # Норма на единицу (если нет — из фолбэка по сумме операций спецификации)
+        npu2 = float(total_hours / qty_full) if qty_full > 1e-12 else None
+        if npu2 is None or (npu2 is not None and npu2 <= 1e-12):
+            try:
+                npu_fb2 = float(fallback_npu_day.get(int(o.item_id), 0.0) or 0.0)
+                if npu_fb2 > 0.0:
+                    npu2 = npu_fb2
+            except Exception:
+                pass
+
+        it2 = item_map.get(int(o.item_id))
+        unit_guid2 = getattr(it2, "unit", None) if it2 else None
+        unit_rec2 = unit_map.get(str(unit_guid2)) if unit_guid2 else None
+        unit_disp2 = unit_guid2
+        if unit_rec2:
+            unit_disp2 = (
+                getattr(unit_rec2, "short_name", None)
+                or getattr(unit_rec2, "unit_name", None)
+                or getattr(unit_rec2, "unit_code", None)
+                or unit_guid2
+            )
+
+        g2 = groups[int(dom_aid)]
+        g2["area_id"] = int(dom_aid)
+        g2["area_name"] = area_name_map.get(int(dom_aid), f"Участок #{int(dom_aid)}")
+        # Заказ на этот день, но часов в этот день нет — показываем «0 за день», а в display_* — полный объём
+        g2["orders"].append({
+            "order_id": int(o.order_id),
+            "agg_key": f"{int(o.item_id)}|{unit_disp2 or ''}",
+            "item_id": int(o.item_id),
+            "item_name": getattr(it2, "item_name", None) if it2 else None,
+            "item_article": getattr(it2, "item_article", None) if it2 else None,
+            "unit": unit_disp2,
+            "qty": 0.0,  # за день 0
+            "norm_hours_total": 0.0,  # за день 0
+            "norm_hours_per_unit": float(npu2) if (npu2 is not None) else None,
+            # Расширения для отображения «перегруза»
+            "display_qty": float(qty_full),
+            # Если по заказу нет часов (не был расписан), оцениваем суммарные нормо‑часы через норму на ед.
+            "display_norm_hours_total": float(total_hours) if float(total_hours) > 1e-9 else float(qty_full) * float(npu2 or 0.0),
+            "overload": True,
+        })
+        # Учитываем невыполненный объём как перегруз по участку: используем оценку display_norm_hours_total
+        try:
+            add_ov = float(total_hours) if float(total_hours) > 1e-9 else float(qty_full) * float(npu2 or 0.0)
+            g2["cap_overload_hours"] = float(g2.get("cap_overload_hours", 0.0) or 0.0) + float(add_ov or 0.0)
+        except Exception:
+            pass
+        # norm_sum_hours/sum_qty считаются по фактическим часам дня; здесь ничего не добавляем
 
     # Индикаторы перегруза за день
     if groups:
@@ -3123,5 +3291,132 @@ def get_run_production_agenda_day(
             g = groups.get(int(r.area_id))
             if g:
                 g["cap_overload_hours"] += float(r.overload_hours or 0.0)
+
+    # Дополнительно: интегрируем недопланированные объёмы из предупреждений CAPACITY_SHORTAGE на выбранную дату
+    try:
+        run_rec = db.query(PlanningRun).filter(PlanningRun.run_id == int(run_id)).first()
+    except Exception:
+        run_rec = None
+    capacity_shortages: List[Dict[str, Any]] = []
+    if run_rec is not None:
+        try:
+            for w in (run_rec.warnings or []):
+                try:
+                    if str(w.get("code") or "") != "CAPACITY_SHORTAGE":
+                        continue
+                    nd = (w.get("need_date") or "")[:10]
+                    if nd != day.isoformat():
+                        continue
+                    capacity_shortages.append(w)
+                except Exception:
+                    continue
+        except Exception:
+            capacity_shortages = []
+
+    if capacity_shortages:
+        # Справочник соответствия вида производства -> ресурсы
+        rpk_rows = db.query(ResourceProductionKind).all()
+        pk_to_resources: Dict[int, List[int]] = {}
+        for rpk in rpk_rows:
+            try:
+                pk_to_resources.setdefault(int(rpk.production_kind_id), []).append(int(rpk.resource_id))
+            except Exception:
+                continue
+
+        for w in capacity_shortages:
+            try:
+                iid = int(w.get("item_id"))
+            except Exception:
+                iid = None
+            try:
+                pkid = int(w.get("production_kind_id")) if w.get("production_kind_id") is not None else None
+            except Exception:
+                pkid = None
+            try:
+                aid_warn = int(w.get("resource_id")) if w.get("resource_id") is not None else None
+            except Exception:
+                aid_warn = None
+
+            # Определяем участок
+            target_aid: Optional[int] = aid_warn
+            if target_aid is None and pkid is not None:
+                cand = pk_to_resources.get(int(pkid)) or []
+                if cand:
+                    target_aid = int(sorted(cand)[0])
+
+            if target_aid is None:
+                # не удалось определить участок — пропускаем
+                continue
+
+            # Обеспечиваем наличие группы
+            g = groups[int(target_aid)]
+            if g.get("area_id") is None:
+                g["area_id"] = int(target_aid)
+                g["area_name"] = area_name_map.get(int(target_aid), f"Участок #{int(target_aid)}")
+
+            # Данные строки
+            unmet_qty = float(w.get("unmet_qty", 0.0) or 0.0)
+            unmet_hours = float(w.get("unmet_norm_hours", 0.0) or 0.0)
+            npu_w = float(w.get("norm_hours_per_unit", 0.0) or 0.0)
+
+            # Достаём справочник номенклатуры/ЕИ
+            itw = item_map.get(int(iid)) if iid is not None else None
+            unit_guid_w = getattr(itw, "unit", None) if itw else None
+            unit_rec_w = unit_map.get(str(unit_guid_w)) if unit_guid_w else None
+            unit_disp_w = unit_guid_w
+            if unit_rec_w:
+                unit_disp_w = (
+                    getattr(unit_rec_w, "short_name", None)
+                    or getattr(unit_rec_w, "unit_name", None)
+                    or getattr(unit_rec_w, "unit_code", None)
+                    or unit_guid_w
+                )
+
+            g["orders"].append({
+                "order_id": None,
+                "agg_key": f"{int(iid) if iid is not None else 0}|{unit_disp_w or ''}",
+                "item_id": int(iid) if iid is not None else 0,
+                "item_name": getattr(itw, "item_name", None) if itw else None,
+                "item_article": getattr(itw, "item_article", None) if itw else None,
+                "unit": unit_disp_w,
+                "qty": 0.0,
+                "norm_hours_total": 0.0,
+                "norm_hours_per_unit": float(npu_w) if npu_w > 0.0 else None,
+                "display_qty": float(unmet_qty),
+                "display_norm_hours_total": float(unmet_hours),
+                "overload": True,
+            })
+            try:
+                g["cap_overload_hours"] = float(g.get("cap_overload_hours", 0.0) or 0.0) + float(unmet_hours or 0.0)
+            except Exception:
+                pass
+
+    # Post-process groups: compute available hours for the day, overload percent and display fields
+    def _is_workday(d: date) -> bool:
+        return d.weekday() <= 4
+
+    res_by_id_local: Dict[int, ProductionResource] = {int(r.resource_id): r for r in res_rows}
+
+    for aid, g in groups.items():
+        res = res_by_id_local.get(int(aid))
+        hours_available_day = 0.0
+        if res is not None and _is_workday(day):
+            daily_hours = float(getattr(res, "daily_work_hours", 8.0) or 8.0)
+            power_coeff = float(getattr(res, "capacity", 1.0) or 1.0)
+            hours_available_day = daily_hours * power_coeff
+        g["hours_available_day"] = float(hours_available_day)
+        if hours_available_day > 1e-9:
+            g["cap_overload_percent"] = float((g.get("cap_overload_hours") or 0.0) / hours_available_day * 100.0)
+        else:
+            g["cap_overload_percent"] = None
+
+        # Не форсируем перегруз для всех строк группы.
+        # Сохраняем ранее вычисленные флаги overload на уровне строк:
+        # - строки с 0 часами на день (назначены на день) уже имеют overload=True и display_*,
+        # - синтетические CAPACITY_SHORTAGE строки тоже overload=True,
+        # - обычные строки с часами на день — overload=False.
+        for row in g.get("orders", []):
+            if "overload" not in row:
+                row["overload"] = False
 
     return {"groups": list(groups.values())}

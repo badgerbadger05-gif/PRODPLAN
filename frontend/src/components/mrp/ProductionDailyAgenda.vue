@@ -22,6 +22,7 @@
             </span>
             <q-badge v-if="Number(props.row.cap_overload_hours || 0) > 0" class="q-ml-sm" color="negative" outline>
               {{ t('mrp.group.capOverloadHours') }}: {{ fmt(props.row.cap_overload_hours) }} ч
+              <span v-if="props.row.cap_overload_percent != null"> ({{ fmt(Number(props.row.cap_overload_percent)) }}%)</span>
             </q-badge>
           </div>
         </q-td>
@@ -32,22 +33,24 @@
         v-for="order in (props.row.orders || [])"
         :key="order.agg_key || `${order.item_id}|${order.unit || ''}`"
         :props="props"
+        :class="{ 'text-negative': Boolean(order?.overload) }"
       >
         <q-td key="name" :props="props">
           <div>{{ order.item_name || t('mrp.placeholder.itemNameFallback', { id: order.item_id }) }}</div>
           <q-badge v-if="!(Number(order.norm_hours_per_unit || 0) > 0)" class="q-ml-xs" color="grey" outline>{{ t('mrp.badge.noNormPerUnit') }}</q-badge>
+          <q-badge v-if="order.overload" class="q-ml-xs" color="negative" outline>{{ t('mrp.badge.overload') }}</q-badge>
         </q-td>
         <q-td key="article" :props="props">
           {{ order.item_article || t('mrp.placeholder.noArticle') }}
         </q-td>
         <q-td key="qty" :props="props" class="text-right">
-          {{ fmtQty(order.qty, order.unit) }}
+          {{ fmtQty(order.display_qty != null ? order.display_qty : order.qty, order.unit) }}
         </q-td>
         <q-td key="norm_per_unit" :props="props" class="text-right">
           {{ fmt(resolveNormPerUnit(order.norm_hours_per_unit, order.norm_hours_total, order.qty)) }}
         </q-td>
         <q-td key="norm_total" :props="props" class="text-right">
-          {{ fmt(order.norm_hours_total) }}
+          {{ fmt(order.display_norm_hours_total != null ? order.display_norm_hours_total : order.norm_hours_total) }}
         </q-td>
       </q-tr>
     </template>

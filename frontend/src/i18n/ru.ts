@@ -90,7 +90,8 @@ export const ru = {
       showByOrder: 'Показать состав (по заказу)'
     },
     badge: {
-      noNormPerUnit: 'без норматива'
+      noNormPerUnit: 'без норматива',
+      overload: 'перегруз'
     },
     placeholder: {
       noArticle: '—',

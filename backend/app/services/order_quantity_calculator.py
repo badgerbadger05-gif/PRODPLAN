@@ -45,11 +45,23 @@ class OrderQuantityCalculator:
 
     # --- Public API ---
 
-    def compute(self, item_id: int, requested_qty: float) -> Tuple[float, float, List[Dict[str, Any]]]:
+    def compute(self, item_id: int, requested_qty: float) -> Tuple[float, float, Dict[str, Any], List[Dict[str, Any]]]:
         """
-        Returns tuple: (final_qty_limited_before_lotsizing, normalized_qty_for_production, warnings)
-        - final_qty: min(requested_qty, component_limit, horizon_total_demand)
-        - normalized_qty: lot-sized qty considering optimal_batch and buffer
+        Returns:
+          (final_qty_before_lotsizing, normalized_qty, computation_details, warnings)
+
+        where:
+          - final_qty_before_lotsizing = min(requested_qty, component_limit, horizon_total_demand)
+          - normalized_qty = lot-sized qty considering optimal_batch and buffer
+          - computation_details =
+              {
+                'requested_qty': float,
+                'buffer_qty': float,
+                'horizon_limit': float,
+                'component_limit': float,
+                'final_qty_before_capacity': float,   # equals final_qty_before_lotsizing
+                'normalized_qty': float
+              }
         """
         warnings: List[Dict[str, Any]] = []
         item = self.item_by_id.get(int(item_id))
@@ -76,7 +88,16 @@ class OrderQuantityCalculator:
         # 5) Lot sizing for production with optimal_batch priority over buffer
         normalized_qty = self._normalize_qty_for_production(final_qty, item, buffer_qty)
 
-        return float(final_qty), float(normalized_qty), warnings
+        computation_details: Dict[str, Any] = {
+            "requested_qty": float(requested_qty or 0.0),
+            "buffer_qty": float(buffer_qty),
+            "horizon_limit": float(total_horizon_demand),
+            "component_limit": float(max_producible),
+            "final_qty_before_capacity": float(final_qty),
+            "normalized_qty": float(normalized_qty),
+        }
+
+        return float(final_qty), float(normalized_qty), computation_details, warnings
 
     # --- Internals ---
 

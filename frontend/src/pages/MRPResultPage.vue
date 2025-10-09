@@ -482,14 +482,57 @@ async function rebuildDailyAgendaForDay() {
     const resp = await getPlanningResultProductionAgendaDay(runId, {
       day_date: day
     })
-    dailyAgendaGroups.value = (resp?.groups || []).map((g: any) => ({
-      area_id: g.area_id,
-      area_name: g.area_name,
-      orders: g.orders || [],
-      norm_sum_hours: Number(g.norm_sum_hours || 0),
-      sum_qty: Number(g.sum_qty || 0),
-      cap_overload_hours: Number(g.cap_overload_hours || 0)
-    }))
+    dailyAgendaGroups.value = (resp?.groups || []).map((g: any) => {
+      const mappedOrders = (g.orders || []).map((o: any) => ({
+        agg_key: String(o.agg_key ?? `${o.item_id}|${o.unit || ''}`),
+        order_id: o.order_id != null ? Number(o.order_id) : undefined,
+        item_id: Number(o.item_id),
+        item_name: o.item_name ?? (itemMap.value?.[o.item_id]?.item_name ?? t('mrp.placeholder.itemNameFallback', { id: o.item_id })),
+        item_article: o.item_article ?? (itemMap.value?.[o.item_id]?.item_article ?? t('mrp.placeholder.noArticle')),
+        unit: o.unit ?? null,
+        // оригинальные "на день"
+        qty: Number(o.qty ?? 0),
+        norm_hours_total: Number(o.norm_hours_total ?? 0),
+        norm_hours_per_unit: o.norm_hours_per_unit != null ? Number(o.norm_hours_per_unit) : null,
+        // расширения для перегруза
+        display_qty: o.display_qty != null ? Number(o.display_qty) : undefined,
+        display_norm_hours_total: o.display_norm_hours_total != null ? Number(o.display_norm_hours_total) : undefined,
+        overload: Boolean(o.overload)
+      }))
+      // Дедупликация по agg_key: отдаём приоритет перегруженным и с display_*
+      const dedupMap: { [key: string]: any } = {}
+      const score = (x: any) =>
+        (x.overload ? 10 : 0) +
+        ((x.display_qty != null || x.display_norm_hours_total != null) ? 5 : 0) +
+        ((Number(x.display_qty ?? x.qty) > 0) ? 1 : 0) +
+        ((Number(x.display_norm_hours_total ?? x.norm_hours_total) > 0) ? 1 : 0)
+      for (const ord of mappedOrders) {
+        const k = ord.agg_key
+        const cur = dedupMap[k]
+        if (!cur) {
+          dedupMap[k] = ord
+        } else if (score(ord) > score(cur)) {
+          dedupMap[k] = ord
+        } else {
+          // мягкое слияние полезных полей
+          if (cur.display_qty == null && ord.display_qty != null) cur.display_qty = ord.display_qty
+          if (cur.display_norm_hours_total == null && ord.display_norm_hours_total != null) cur.display_norm_hours_total = ord.display_norm_hours_total
+          cur.overload = Boolean(cur.overload || ord.overload)
+        }
+      }
+      const dedupedOrders = Object.values(dedupMap)
+      return {
+        area_id: g.area_id,
+        area_name: g.area_name,
+        orders: dedupedOrders,
+        norm_sum_hours: Number(g.norm_sum_hours || 0),
+        sum_qty: Number(g.sum_qty || 0),
+        cap_overload_hours: Number(g.cap_overload_hours || 0),
+        // новые поля шапки для процента перегруза
+        hours_available_day: g.hours_available_day != null ? Number(g.hours_available_day) : undefined,
+        cap_overload_percent: g.cap_overload_percent != null ? Number(g.cap_overload_percent) : null
+      }
+    })
   } catch (e) {
     console.error('Failed to load daily agenda', e)
     dailyAgendaGroups.value = []

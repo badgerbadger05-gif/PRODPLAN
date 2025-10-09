@@ -86,6 +86,11 @@ export interface ProductionGroupOrder {
   qty: number
   norm_hours_total: number
   norm_hours_per_unit?: number | null
+  // agenda_day-specific extended fields (optional)
+  order_id?: number
+  display_qty?: number
+  display_norm_hours_total?: number
+  overload?: boolean
 }
 
 export interface ProductionGroup {
@@ -105,6 +110,9 @@ export interface ProductionAgendaGroup {
   norm_sum_hours: number
   sum_qty: number
   cap_overload_hours?: number
+  // extended capacity info for day agenda
+  hours_available_day?: number
+  cap_overload_percent?: number | null
 }
 
 // ---------- Purchases ----------
