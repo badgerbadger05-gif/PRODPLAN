@@ -1685,10 +1685,18 @@ def run_planning_run(
                 if qn <= 0.0:
                     return
 
+            # Enforce integer quantities for production orders (ceil)
+            try:
+                qn_int = math.ceil(float(qn))
+            except Exception:
+                qn_int = int(qn) if qn is not None else 0
+            if qn_int <= 0:
+                return
+
             rec = PlannedOrder(
                 run_id=run_id,
                 item_id=iid,
-                qty=qn,
+                qty=float(qn_int),
                 need_date=need_dt,
                 start_date=None,
                 finish_date=None,
@@ -1702,6 +1710,10 @@ def run_planning_run(
             db.add(rec)
             created_orders.append(rec)
             try:
+                # keep original computation details and add rounded qty for diagnostics
+                if isinstance(comp_details, dict):
+                    comp_details = dict(comp_details)
+                    comp_details["normalized_qty_rounded"] = float(qn_int)
                 setattr(rec, "_comp_details", comp_details)
             except Exception:
                 pass
@@ -2261,23 +2273,26 @@ def run_planning_run(
                         need_date=order.need_date,
                         capacity_usage_daily=capacity_usage_daily,
                     )
-                    if float(limited_qty) < float(qty) - 1e-9:
+                    # Округление количества после ограничения мощностью: только целые значения (ceil)
+                    rounded_limited_qty = math.ceil(float(limited_qty))
+                    if float(rounded_limited_qty) < float(qty) - 1e-9:
                         warnings.append(
                             log_warning(
                                 logger,
                                 "CAPACITY_LIMITED",
-                                f"Order {int(order.order_id)} qty limited by capacity from {float(qty)} to {float(limited_qty)}",
+                                f"Order {int(order.order_id)} qty limited by capacity from {float(qty)} to {float(rounded_limited_qty)}",
                                 order_id=int(order.order_id),
                                 item_id=int(item_id),
                                 from_qty=float(qty),
-                                to_qty=float(limited_qty),
+                                to_qty=float(rounded_limited_qty),
                                 free_hours_window=float(free_hours_window),
                                 workdays_window=int(workdays_window),
+                                limited_qty_raw=float(limited_qty),
                             )
                         )
-                        # Недопланированный объём = разница между нормализованным и ограниченным мощностью
+                        # Недопланированный объём = разница между нормализованным и ограниченным (с округлением вверх) количеством
                         try:
-                            unmet_qty = float(qty) - float(limited_qty)
+                            unmet_qty = float(qty) - float(rounded_limited_qty)
                         except Exception:
                             unmet_qty = 0.0
                         if unmet_qty > 1e-9:
@@ -2312,9 +2327,9 @@ def run_planning_run(
                                     unmet_norm_hours=float(unmet_qty) * float(norm_single or 0.0),
                                 )
                             )
-                        # Применяем ограничение
-                        order.qty = float(limited_qty)
-                        qty = float(limited_qty)
+                        # Применяем ограничение с округлением вверх
+                        order.qty = float(rounded_limited_qty)
+                        qty = float(rounded_limited_qty)
                         total_hours = float(norm_single or 0.0) * float(qty or 0.0)
                 except Exception:
                     # fail-safe: ignore capacity limiting if any error
@@ -3158,7 +3173,17 @@ def get_run_production_agenda_day(
             except Exception:
                 pass
         hours_today = float(getattr(s, "hours", 0.0) or 0.0)
-        qty_today = (hours_today / npu) if (npu and npu > 1e-12) else 0.0
+        # Реальный выпуск в штуках по часам дня
+        qty_today_real = (hours_today / npu) if (npu and npu > 1e-12) else 0.0
+        # Требование: на день показывать только целые штуки, округляя вверх
+        qty_today_int = int(math.ceil(qty_today_real)) if (npu and npu > 1e-12) else 0
+        # Остаток нормочасов до полного изделия добавляем в общий норматив группы в шапке
+        remainder_hours = 0.0
+        if (npu and npu > 1e-12) and qty_today_int > 0:
+            try:
+                remainder_hours = max(0.0, float(qty_today_int) - float(qty_today_real)) * float(npu)
+            except Exception:
+                remainder_hours = 0.0
 
         it = item_map.get(int(o.item_id))
         unit_guid = getattr(it, "unit", None) if it else None
@@ -3185,7 +3210,7 @@ def get_run_production_agenda_day(
             "item_name": getattr(it, "item_name", None) if it else None,
             "item_article": getattr(it, "item_article", None) if it else None,
             "unit": unit_disp,
-            "qty": float(qty_today),
+            "qty": float(qty_today_int),
             "norm_hours_total": float(hours_today),
             "norm_hours_per_unit": float(npu) if (npu is not None) else None,
         }
@@ -3207,8 +3232,10 @@ def get_run_production_agenda_day(
         else:
             row["overload"] = False
         g["orders"].append(row)
-        g["norm_sum_hours"] += float(hours_today)
-        g["sum_qty"] += float(qty_today)
+        # В общий норматив группы добавляем фактические часы дня + остаток до целого изделия
+        g["norm_sum_hours"] += float(hours_today) + float(remainder_hours)
+        # Суммарный выпуск за день — целыми штуками
+        g["sum_qty"] += float(qty_today_int)
 
     # Добавляем заказы, назначенные на этот день, но не попавшие в day_stages (hours_today == 0)
     for o in orders_for_day:
