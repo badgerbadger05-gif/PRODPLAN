@@ -51,6 +51,8 @@
               <q-separator vertical class="q-mx-xs" />
               <q-btn dense flat icon="download" :label="t('mrp.actions.csv')" @click="exportProd('csv')" />
               <q-btn dense flat icon="table_view" :label="t('mrp.actions.xlsx')" @click="exportProd('xlsx')" />
+              <q-separator vertical class="q-mx-xs" />
+              <q-btn dense flat icon="warning" color="negative" :label="t('mrp.actions.shortageReport')" @click="exportShortageReport" />
             </template>
           </ProductionFilters>
 
@@ -286,7 +288,8 @@ import api, {
   getPlanningResultProductionGrouped,
   getPlanningResultProductionAgendaDay,
   getPlanningResultPurchasesGrouped,
-  getPlanningResultCapacitySummary
+  getPlanningResultCapacitySummary,
+  getShortageReport
 } from '../services/api'
 import type { QTableColumn } from 'quasar'
 import type { SpecNode } from '../services/api'
@@ -879,6 +882,25 @@ async function exportPurch(fmt: 'csv' | 'xlsx') {
     }
   } catch (e) {
     console.error('Export purchases failed', e)
+  }
+}
+
+async function exportShortageReport() {
+  try {
+    const res = await getShortageReport(runId)
+    if (res?.data_base64) {
+      downloadBase64Xlsx(res.data_base64, res.filename || `mrp_shortage_report_run_${runId}.xlsx`)
+    } else {
+      const message = res?.message || t('mrp.errors.shortageReportFailed')
+      alert(String(message))
+    }
+  } catch (e: any) {
+    console.error('Export shortage report failed', e)
+    const detail =
+      (e?.response?.data?.detail as any) ||
+      (e?.message as any) ||
+      t('mrp.errors.shortageReportFailed')
+    alert(String(detail))
   }
 }
 

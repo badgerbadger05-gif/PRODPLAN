@@ -39,6 +39,7 @@ from ..services.planning_service import (
     get_run_production_agenda_day,
     get_run_purchases_grouped,
     get_capacity_summary,
+    generate_shortage_report,
 )
 from ..models import ProductionResource
 
@@ -1069,6 +1070,20 @@ async def get_planning_result_purchases_grouped(
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/results/{run_id}/shortage-report")
+async def get_shortage_report(
+    run_id: int,
+    db: Session = Depends(get_db),
+):
+    """
+    Generate and return an XLSX shortage report for a given planning run.
+    """
+    try:
+        return generate_shortage_report(db=db, run_id=run_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/results/{run_id}/capacity/summary")

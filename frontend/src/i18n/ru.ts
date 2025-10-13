@@ -21,6 +21,10 @@ export const ru = {
     sections: {
       detail: 'Детальный анализ'
     },
+    errors: {
+      loadFailed: 'Ошибка загрузки результатов',
+      shortageReportFailed: 'Не удалось сформировать отчет о дефиците.'
+    },
     summary: {
       productionOrders: 'Производственные заказы',
       purchaseRequests: 'Заявки на закупку',
@@ -85,6 +89,7 @@ export const ru = {
     actions: {
       csv: 'CSV',
       xlsx: 'XLSX',
+      shortageReport: 'Отчет о дефиците',
       refresh: 'Обновить',
       show: 'Показать',
       showByOrder: 'Показать состав (по заказу)'
@@ -126,6 +131,10 @@ export const ru = {
         name: 'Компонент',
         requiredQty: 'Требуемое кол-во',
         stage: 'Этап'
+      },
+      errors: {
+        loadFailed: 'Ошибка загрузки результатов',
+        shortageReportFailed: 'Не удалось сформировать отчет о дефиците.'
       }
     }
   }
