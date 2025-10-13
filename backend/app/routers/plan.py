@@ -583,6 +583,48 @@ async def export_planning_result_production(
                 except Exception:
                     return 0.0
 
+            # Дедупликация строк «повестки дня» по agg_key (item_id|unit) с приоритетом:
+            # overload > наличие display_* > ненулевые показатели
+            def _score_order(x: Dict[str, Any]) -> int:
+                s = 0
+                try:
+                    if bool(x.get("overload")):
+                        s += 10
+                except Exception:
+                    pass
+                if x.get("display_qty") is not None or x.get("display_norm_hours_total") is not None:
+                    s += 5
+                try:
+                    if float(x.get("display_qty", x.get("qty") or 0.0)) > 0:
+                        s += 1
+                except Exception:
+                    pass
+                try:
+                    if float(x.get("display_norm_hours_total", x.get("norm_hours_total") or 0.0)) > 0:
+                        s += 1
+                except Exception:
+                    pass
+                return s
+
+            def _dedup_orders(orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+                by_key: Dict[str, Dict[str, Any]] = {}
+                for o in (orders or []):
+                    k = str(o.get("agg_key") or f"{o.get('item_id')}|{o.get('unit') or ''}")
+                    cur = by_key.get(k)
+                    if cur is None:
+                        by_key[k] = dict(o)
+                        continue
+                    if _score_order(o) > _score_order(cur):
+                        by_key[k] = dict(o)
+                    else:
+                        # мягкое слияние display_* и флага overload
+                        if cur.get("display_qty") is None and o.get("display_qty") is not None:
+                            cur["display_qty"] = o.get("display_qty")
+                        if cur.get("display_norm_hours_total") is None and o.get("display_norm_hours_total") is not None:
+                            cur["display_norm_hours_total"] = o.get("display_norm_hours_total")
+                        cur["overload"] = bool(cur.get("overload") or o.get("overload"))
+                return list(by_key.values())
+
             if (format or "csv").lower() == "xlsx":
                 import io, base64
                 try:
@@ -601,9 +643,11 @@ async def export_planning_result_production(
                 for g in groups:
                     area_name = g.get("area_name") or ""
                     items = (g.get("orders") or [])
+                    # Дедупликация как в UI «Повестка дня»
+                    deduped = _dedup_orders(items)
                     # Заголовок группы с нормо‑часами дня из агрегата
                     group_norm = float(g.get("norm_sum_hours") or 0.0)
-                    title = f"Производственный участок: {area_name} · Заказов: {len(items)} · Норматив дня: {group_norm:.3f} ч"
+                    title = f"Производственный участок: {area_name} · Позиции: {len(deduped)} · Норматив дня: {group_norm:.3f} ч"
                     ws.append([title])
                     r = ws.max_row
                     ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=len(headers))
@@ -611,7 +655,7 @@ async def export_planning_result_production(
                     cell.font = Font(bold=True)
                     cell.fill = PatternFill("solid", fgColor="FFDDDDDD")
 
-                    for x in items:
+                    for x in deduped:
                         ws.append([
                             x.get("item_name") or "",
                             x.get("item_article") or "",
@@ -645,11 +689,12 @@ async def export_planning_result_production(
                 for g in groups:
                     area_name = g.get("area_name") or ""
                     items = (g.get("orders") or [])
+                    deduped = _dedup_orders(items)
                     group_norm = float(g.get("norm_sum_hours") or 0.0)
-                    group_title = f"Производственный участок: {area_name} · Заказов: {len(items)} · Норматив дня: {group_norm:.3f} ч"
+                    group_title = f"Производственный участок: {area_name} · Позиции: {len(deduped)} · Норматив дня: {group_norm:.3f} ч"
                     writer.writerow([group_title] + [""] * (len(headers) - 1))
 
-                    for x in items:
+                    for x in deduped:
                         writer.writerow([
                             x.get("item_name") or "",
                             x.get("item_article") or "",
