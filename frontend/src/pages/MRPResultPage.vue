@@ -839,14 +839,19 @@ function downloadBase64Xlsx(b64: string, filename: string) {
 
 async function exportProd(fmt: 'csv' | 'xlsx') {
   try {
-    const res = await exportPlanningResultProduction(runId, {
-      format: fmt,
-      bucket_type: prod.filter.bucket_type,
-      date_from: emptyToUndef(prod.filter.date_from),
-      date_to: emptyToUndef(prod.filter.date_to),
-      sort_by: 'item_name',
-      sort_dir: 'asc'
-    })
+    const hasDay = !!prod.filter.day_date
+    const params: any = { format: fmt }
+    if (hasDay) {
+      params.day_date = String(prod.filter.day_date).slice(0, 10)
+      // Для day_date backend формирует отчет по «повестке дня» (stages), date_from/date_to не передаем
+    } else {
+      params.bucket_type = prod.filter.bucket_type
+      params.date_from = emptyToUndef(prod.filter.date_from)
+      params.date_to = emptyToUndef(prod.filter.date_to)
+      params.sort_by = 'need_date'
+      params.sort_dir = 'asc'
+    }
+    const res = await exportPlanningResultProduction(runId, params)
     if (fmt === 'csv') {
       downloadTextFile(res?.data || '', res?.filename || `mrp_production_run_${runId}.csv`, 'text/csv;charset=utf-8')
     } else {

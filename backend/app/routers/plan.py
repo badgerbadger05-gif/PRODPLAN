@@ -536,6 +536,7 @@ async def export_planning_result_production(
     bucket_type: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    day_date: Optional[str] = None,
     sort_by: Optional[str] = None,
     sort_dir: Optional[str] = None,
     db: Session = Depends(get_db),
@@ -543,9 +544,132 @@ async def export_planning_result_production(
     """
     Экспорт результатов «Производство» в CSV или XLSX (base64).
     Колонки: Наименование, Артикул, Количество, ЕИ, Норматив, ч/шт, Норматив всего, ч
+
+    Особый случай (поддержка «Задания на день»):
+    - При наличии day_date экспорт строится по данным [services.get_run_production_agenda_day]
+      с маппингом:
+        Количество = display_qty (если задано) иначе qty
+        Норматив всего, ч = display_norm_hours_total (если задано) иначе norm_hours_total
+      Групповые подзаголовки используют norm_sum_hours за день.
     """
     try:
-        # Получаем все строки (разумный верхний предел)
+        # Базовые колонки данных (как в исходной таблице)
+        headers = ["Наименование", "Артикул", "Количество", "ЕИ", "Норматив, ч/шт", "Норматив всего, ч"]
+
+        # Экспорт «Задание на день», если передан day_date
+        if (day_date or "").strip():
+            # Получаем агрегат «повестка дня» с сервера
+            resp = get_run_production_agenda_day(
+                db=db,
+                run_id=int(run_id),
+                day_date=str(day_date)[:10],
+                area_id=None,
+            )
+            groups = (resp or {}).get("groups", []) or []
+
+            def _qty_out(row: Dict[str, Any]) -> float:
+                try:
+                    if row.get("display_qty") is not None:
+                        return float(row.get("display_qty") or 0.0)
+                    return float(row.get("qty") or 0.0)
+                except Exception:
+                    return 0.0
+
+            def _norm_total_out(row: Dict[str, Any]) -> float:
+                try:
+                    if row.get("display_norm_hours_total") is not None:
+                        return float(row.get("display_norm_hours_total") or 0.0)
+                    return float(row.get("norm_hours_total") or 0.0)
+                except Exception:
+                    return 0.0
+
+            if (format or "csv").lower() == "xlsx":
+                import io, base64
+                try:
+                    from openpyxl import Workbook
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=f"openpyxl not available: {e}")
+                from openpyxl.styles import Font, PatternFill
+
+                wb = Workbook()
+                ws = wb.active
+                ws.title = "Production Day"
+                # Строка заголовков
+                ws.append(headers)
+
+                total_records = 0
+                for g in groups:
+                    area_name = g.get("area_name") or ""
+                    items = (g.get("orders") or [])
+                    # Заголовок группы с нормо‑часами дня из агрегата
+                    group_norm = float(g.get("norm_sum_hours") or 0.0)
+                    title = f"Производственный участок: {area_name} · Заказов: {len(items)} · Норматив дня: {group_norm:.3f} ч"
+                    ws.append([title])
+                    r = ws.max_row
+                    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=len(headers))
+                    cell = ws.cell(row=r, column=1)
+                    cell.font = Font(bold=True)
+                    cell.fill = PatternFill("solid", fgColor="FFDDDDDD")
+
+                    for x in items:
+                        ws.append([
+                            x.get("item_name") or "",
+                            x.get("item_article") or "",
+                            _qty_out(x),
+                            x.get("unit") or "",
+                            float(x.get("norm_hours_per_unit") or 0.0) if x.get("norm_hours_per_unit") is not None else 0.0,
+                            _norm_total_out(x),
+                        ])
+                        total_records += 1
+                    ws.append([])  # разделитель групп
+
+                bio = io.BytesIO()
+                wb.save(bio)
+                bio.seek(0)
+                b64 = base64.b64encode(bio.read()).decode("utf-8")
+                return {
+                    "status": "ok",
+                    "format": "xlsx",
+                    "data_base64": b64,
+                    "filename": f"mrp_production_run_{run_id}.xlsx",
+                    "total_rows": int(total_records),
+                }
+            else:
+                # CSV
+                import io, csv
+                output = io.StringIO()
+                writer = csv.writer(output)
+                writer.writerow(headers)
+
+                total_records = 0
+                for g in groups:
+                    area_name = g.get("area_name") or ""
+                    items = (g.get("orders") or [])
+                    group_norm = float(g.get("norm_sum_hours") or 0.0)
+                    group_title = f"Производственный участок: {area_name} · Заказов: {len(items)} · Норматив дня: {group_norm:.3f} ч"
+                    writer.writerow([group_title] + [""] * (len(headers) - 1))
+
+                    for x in items:
+                        writer.writerow([
+                            x.get("item_name") or "",
+                            x.get("item_article") or "",
+                            _qty_out(x),
+                            x.get("unit") or "",
+                            float(x.get("norm_hours_per_unit") or 0.0) if x.get("norm_hours_per_unit") is not None else 0.0,
+                            _norm_total_out(x),
+                        ])
+                        total_records += 1
+                    writer.writerow([])
+
+                return {
+                    "status": "ok",
+                    "format": "csv",
+                    "data": output.getvalue(),
+                    "filename": f"mrp_production_run_{run_id}.csv",
+                    "total_rows": int(total_records),
+                }
+
+        # Иначе — стандартный экспорт по заказам с группировкой по «доминирующему участку»
         res = get_run_production(
             db=db,
             run_id=int(run_id),
@@ -586,9 +710,6 @@ async def export_planning_result_production(
                 return ""
             return area_name_map.get(aid, f"Участок #{aid}")
 
-        # Базовые колонки данных (как в исходной таблице)
-        headers = ["Наименование", "Артикул", "Количество", "ЕИ", "Норматив, ч/шт", "Норматив всего, ч"]
-
         # Группировка по «доминирующему» участку как в UI (подзаголовки)
         groups: Dict[str, list] = {}
         for r in rows:
@@ -601,7 +722,7 @@ async def export_planning_result_production(
         total_records = sum(len(groups.get(k, [])) for k in grouped_keys)
 
         if (format or "csv").lower() == "xlsx":
-            # Генерируем XLSX в памяти и отдаем base64
+            # Генерация XLSX
             import io, base64
             try:
                 from openpyxl import Workbook
@@ -611,23 +732,17 @@ async def export_planning_result_production(
             wb = Workbook()
             ws = wb.active
             ws.title = "Production"
-            # Строка с колонками
             ws.append(headers)
-            # Печать групп с подзаголовками
             for area_name in grouped_keys:
                 items = groups.get(area_name, [])
-                # Подзаголовок группы
                 total_norm = sum(float(x.get("norm_hours_total") or 0.0) for x in items)
                 title = f"Производственный участок: {area_name} · Заказов: {len(items)} · Норматив всего: {total_norm:.3f} ч"
                 ws.append([title])
-                # Объединение ячеек на ширину таблицы
                 r = ws.max_row
                 ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=len(headers))
-                # Стили подзаголовка
                 cell = ws.cell(row=r, column=1)
                 cell.font = Font(bold=True)
                 cell.fill = PatternFill("solid", fgColor="FFDDDDDD")
-                # Строки данных группы
                 for x in items:
                     ws.append([
                         x.get("item_name") or "",
@@ -637,7 +752,6 @@ async def export_planning_result_production(
                         float(x.get("norm_hours_per_unit") or 0.0) if x.get("norm_hours_per_unit") is not None else 0.0,
                         float(x.get("norm_hours_total") or 0.0),
                     ])
-                # Пустая строка между группами
                 ws.append([])
             bio = io.BytesIO()
             wb.save(bio)
@@ -660,9 +774,7 @@ async def export_planning_result_production(
                 items = groups.get(area_name, [])
                 total_norm = sum(float(x.get("norm_hours_total") or 0.0) for x in items)
                 group_title = f"Производственный участок: {area_name} · Заказов: {len(items)} · Норматив всего: {total_norm:.3f} ч"
-                # Подзаголовок группы (растягиваем на ширину таблицы пробелами)
                 writer.writerow([group_title] + [""] * (len(headers) - 1))
-                # Строки данных группы
                 for x in items:
                     writer.writerow([
                         x.get("item_name") or "",
@@ -672,7 +784,6 @@ async def export_planning_result_production(
                         float(x.get("norm_hours_per_unit") or 0.0) if x.get("norm_hours_per_unit") is not None else 0.0,
                         float(x.get("norm_hours_total") or 0.0),
                     ])
-                # Пустая строка между группами
                 writer.writerow([])
             return {
                 "status": "ok",

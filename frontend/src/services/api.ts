@@ -232,6 +232,7 @@ export async function exportPlanningResultProduction(runId: number, params: {
   bucket_type?: 'daily' | 'weekly'
   date_from?: string
   date_to?: string
+  day_date?: string
   sort_by?: 'item_name' | 'item_article' | 'qty' | 'need_date' | 'bucket_date' | 'priority_index'
   sort_dir?: 'asc' | 'desc'
 }): Promise<any> {

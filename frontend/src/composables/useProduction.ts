@@ -241,14 +241,19 @@ export function useProduction(runId: number) {
   async function exportProd(fmt: CsvOrXlsx) {
     exporting.value = true
     try {
-      const res = await exportPlanningResultProduction(runId, {
-        format: fmt,
-        bucket_type: filters.value.bucket_type,
-        date_from: emptyToUndef(filters.value.date_from),
-        date_to: emptyToUndef(filters.value.date_to),
-        sort_by: 'item_name',
-        sort_dir: 'asc'
-      })
+      const hasDay = !!filters.value.day_date
+      const params: any = { format: fmt }
+      if (hasDay) {
+        params.day_date = String(filters.value.day_date).slice(0, 10)
+        // Для day_date backend формирует отчет по «повестке дня» (через stages)
+      } else {
+        params.bucket_type = filters.value.bucket_type
+        params.date_from = emptyToUndef(filters.value.date_from)
+        params.date_to = emptyToUndef(filters.value.date_to)
+        params.sort_by = 'need_date'
+        params.sort_dir = 'asc'
+      }
+      const res = await exportPlanningResultProduction(runId, params)
       if (fmt === 'csv') {
         downloadTextFile(res?.data || '', res?.filename || `mrp_production_run_${runId}.csv`, 'text/csv;charset=utf-8')
       } else {
