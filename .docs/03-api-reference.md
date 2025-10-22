@@ -125,35 +125,8 @@ Swagger UI (интерактивная документация) доступе�
   }
 
 2) GET /api/v1/plan/results/{run_id}/production/agenda_day
-- Описание: «Задание на день» (daily) по видам/участкам. Пересчёт часов в выпуск выполняется на сервере по норме на штуку (norm_hours_total / order.qty).
-- Query-параметры:
-  - day_date: 'YYYY-MM-DD' (обяз.)
-  - area_id: number (опц.)
-- Ответ:
-  {
-    "day": "2025-10-07",
-    "groups": [
-      {
-        "area_id": 10,
-        "area_name": "Сварка",
-        "orders": [
-          {
-            "agg_key": "123|шт",
-            "item_id": 123,
-            "item_name": "Деталь А",
-            "item_article": "ART-001",
-            "unit": "шт",
-            "qty": 45.0,
-            "norm_hours_total": 21.69,
-            "norm_hours_per_unit": 0.482
-          }
-        ],
-        "norm_sum_hours": 21.69,
-        "sum_qty": 45.0,
-        "cap_overload_hours": 2.0
-      }
-    ]
-  }
+- ⚠️ **УДАЛЕНО**: Функциональность "Задание на день" больше не поддерживается.
+- Вместо этого используйте фильтрацию по конкретному дню через параметры date_from и date_to в эндпоинтах production и production/grouped.
 
 3) GET /api/v1/plan/results/{run_id}/purchases/grouped
 - Описание: Сводная группировка заявок на закупку по (item_id, unit).

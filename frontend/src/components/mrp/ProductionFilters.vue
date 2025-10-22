@@ -14,21 +14,33 @@
       style="width: 150px"
     />
 
-    <template v-if="showDayPicker">
-      <q-input v-model="local.day_date" dense outlined :label="t('mrp.filters.dayDate')" style="width: 200px">
-        <template #append>
-          <q-btn dense flat round icon="event" @click.stop="showDayMenu = true" />
-          <q-menu v-model="showDayMenu" anchor="bottom right" self="top right" cover>
-            <q-date v-model="local.day_date" mask="YYYY-MM-DD" @update:model-value="onDayPicked" />
-          </q-menu>
-        </template>
-      </q-input>
-
-      <q-separator vertical class="q-mx-xs" />
-    </template>
-
-    <q-input v-model="local.date_from" dense outlined :label="t('mrp.filters.fromDate')" style="width: 200px" />
-    <q-input v-model="local.date_to" dense outlined :label="t('mrp.filters.toDate')" style="width: 200px" />
+    <q-input v-model="local.date_from" dense outlined :label="t('mrp.filters.fromDate')" style="width: 200px">
+      <template #append>
+        <q-icon name="event" class="cursor-pointer">
+          <q-popup-proxy cover transition-show="scale" transition-hide="scale">
+            <q-date v-model="local.date_from" mask="YYYY-MM-DD" :locale="ruDateLocale">
+              <div class="row items-center justify-end">
+                <q-btn v-close-popup label="Закрыть" color="primary" flat />
+              </div>
+            </q-date>
+          </q-popup-proxy>
+        </q-icon>
+      </template>
+    </q-input>
+    
+    <q-input v-model="local.date_to" dense outlined :label="t('mrp.filters.toDate')" style="width: 200px">
+      <template #append>
+        <q-icon name="event" class="cursor-pointer">
+          <q-popup-proxy cover transition-show="scale" transition-hide="scale">
+            <q-date v-model="local.date_to" mask="YYYY-MM-DD" :locale="ruDateLocale">
+              <div class="row items-center justify-end">
+                <q-btn v-close-popup label="Закрыть" color="primary" flat />
+              </div>
+            </q-date>
+          </q-popup-proxy>
+        </q-icon>
+      </template>
+    </q-input>
 
     <q-btn
       :disable="applyDisabled"
@@ -65,6 +77,16 @@ import { ref, watch, computed } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { ProductionFilters } from '../../types/mrp'
 
+// Локализация для календаря
+const ruDateLocale = {
+  days: 'Воскресенье_Понедельник_Вторник_Среда_Четверг_Пятница_Суббота'.split('_'),
+  daysShort: 'Вс_Пн_Вт_Ср_Чт_Пт_Сб'.split('_'),
+  months: 'Январь_Февраль_Март_Апрель_Май_Июнь_Июль_Август_Сентябрь_Октябрь_Ноябрь_Декабрь'.split('_'),
+ monthsShort: 'Янв_Фев_Мар_Апр_Май_Июн_Июл_Авг_Сен_Окт_Ноя_Дек'.split('_'),
+  firstDayOfWeek: 1, // Понедельник как первый день недели
+  format24h: true
+}
+
 const props = defineProps<{
   modelValue: ProductionFilters
   loading?: boolean
@@ -89,8 +111,7 @@ const bucketOptions = computed(() => ([
 const local = ref<ProductionFilters>({
   bucket_type: props.modelValue?.bucket_type,
   date_from: props.modelValue?.date_from,
-  date_to: props.modelValue?.date_to,
-  day_date: props.modelValue?.day_date
+  date_to: props.modelValue?.date_to
 })
 
 // Синхронизация с внешними изменениями модели
@@ -115,27 +136,19 @@ watch(local, (v) => {
   }
 }, { deep: true })
 
-const showDayMenu = ref(false)
-
-function onDayPicked(day: string) {
-  // day уже в формате YYYY-MM-DD маской QDate
-  local.value.day_date = (day || '').slice(0, 10)
-  emit('day-picked', local.value.day_date || '')
-  showDayMenu.value = false
-}
+// Удаляем переменную showDayMenu и функцию onDayPicked, так как поле day_date больше не используется
 
 const loading = computed(() => !!props.loading)
 const applyDisabled = computed(() => loading.value)
 
 function emitApply() {
-  // Синхронно прокидываем актуальное состояние фильтров наверх перед применением,
-  // чтобы родитель (MRPResultPage) видел обновлённый day_date при первом клике.
+  // Синхронно прокидываем актуальное состояние фильтров наверх перед применением
   emit('update:modelValue', { ...local.value })
   emit('apply')
 }
 function emitReset() {
   // Сбрасываем локальную модель и уведомляем родителя
-  local.value = { bucket_type: undefined, date_from: undefined, date_to: undefined, day_date: undefined }
+  local.value = { bucket_type: undefined, date_from: undefined, date_to: undefined }
   emit('update:modelValue', { ...local.value })
   emit('reset')
 }

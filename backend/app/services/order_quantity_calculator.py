@@ -87,6 +87,9 @@ class OrderQuantityCalculator:
 
         # 5) Lot sizing for production with optimal_batch priority over buffer
         normalized_qty = self._normalize_qty_for_production(final_qty, item, buffer_qty)
+        # Final cap: do not exceed limits set by plan horizon and component availability
+        if normalized_qty > final_qty:
+            normalized_qty = float(final_qty)
 
         computation_details: Dict[str, Any] = {
             "requested_qty": float(requested_qty or 0.0),

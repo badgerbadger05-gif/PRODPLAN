@@ -36,7 +36,6 @@ from ..services.planning_service import (
     get_active_planning_config_full,
     # Grouped/agenda/summary endpoints
     get_run_production_grouped,
-    get_run_production_agenda_day,
     get_run_purchases_grouped,
     get_capacity_summary,
     generate_shortage_report,
@@ -537,7 +536,7 @@ async def export_planning_result_production(
     bucket_type: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
-    day_date: Optional[str] = None,
+    # day_date: Optional[str] = None, # Параметр удален, так как функция get_run_production_agenda_day больше не используется
     sort_by: Optional[str] = None,
     sort_dir: Optional[str] = None,
     db: Session = Depends(get_db),
@@ -546,176 +545,13 @@ async def export_planning_result_production(
     Экспорт результатов «Производство» в CSV или XLSX (base64).
     Колонки: Наименование, Артикул, Количество, ЕИ, Норматив, ч/шт, Норматив всего, ч
 
-    Особый случай (поддержка «Задания на день»):
-    - При наличии day_date экспорт строится по данным [services.get_run_production_agenda_day]
-      с маппингом:
-        Количество = display_qty (если задано) иначе qty
-        Норматив всего, ч = display_norm_hours_total (если задано) иначе norm_hours_total
-      Групповые подзаголовки используют norm_sum_hours за день.
+    Примечание: Поддержка «Задания на день» (day_date) была удалена вместе с функцией get_run_production_agenda_day
     """
     try:
         # Базовые колонки данных (как в исходной таблице)
         headers = ["Наименование", "Артикул", "Количество", "ЕИ", "Норматив, ч/шт", "Норматив всего, ч"]
 
-        # Экспорт «Задание на день», если передан day_date
-        if (day_date or "").strip():
-            # Получаем агрегат «повестка дня» с сервера
-            resp = get_run_production_agenda_day(
-                db=db,
-                run_id=int(run_id),
-                day_date=str(day_date)[:10],
-                area_id=None,
-            )
-            groups = (resp or {}).get("groups", []) or []
-
-            def _qty_out(row: Dict[str, Any]) -> float:
-                try:
-                    if row.get("display_qty") is not None:
-                        return float(row.get("display_qty") or 0.0)
-                    return float(row.get("qty") or 0.0)
-                except Exception:
-                    return 0.0
-
-            def _norm_total_out(row: Dict[str, Any]) -> float:
-                try:
-                    if row.get("display_norm_hours_total") is not None:
-                        return float(row.get("display_norm_hours_total") or 0.0)
-                    return float(row.get("norm_hours_total") or 0.0)
-                except Exception:
-                    return 0.0
-
-            # Дедупликация строк «повестки дня» по agg_key (item_id|unit) с приоритетом:
-            # overload > наличие display_* > ненулевые показатели
-            def _score_order(x: Dict[str, Any]) -> int:
-                s = 0
-                try:
-                    if bool(x.get("overload")):
-                        s += 10
-                except Exception:
-                    pass
-                if x.get("display_qty") is not None or x.get("display_norm_hours_total") is not None:
-                    s += 5
-                try:
-                    if float(x.get("display_qty", x.get("qty") or 0.0)) > 0:
-                        s += 1
-                except Exception:
-                    pass
-                try:
-                    if float(x.get("display_norm_hours_total", x.get("norm_hours_total") or 0.0)) > 0:
-                        s += 1
-                except Exception:
-                    pass
-                return s
-
-            def _dedup_orders(orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-                by_key: Dict[str, Dict[str, Any]] = {}
-                for o in (orders or []):
-                    k = str(o.get("agg_key") or f"{o.get('item_id')}|{o.get('unit') or ''}")
-                    cur = by_key.get(k)
-                    if cur is None:
-                        by_key[k] = dict(o)
-                        continue
-                    if _score_order(o) > _score_order(cur):
-                        by_key[k] = dict(o)
-                    else:
-                        # мягкое слияние display_* и флага overload
-                        if cur.get("display_qty") is None and o.get("display_qty") is not None:
-                            cur["display_qty"] = o.get("display_qty")
-                        if cur.get("display_norm_hours_total") is None and o.get("display_norm_hours_total") is not None:
-                            cur["display_norm_hours_total"] = o.get("display_norm_hours_total")
-                        cur["overload"] = bool(cur.get("overload") or o.get("overload"))
-                return list(by_key.values())
-
-            if (format or "csv").lower() == "xlsx":
-                import io, base64
-                try:
-                    from openpyxl import Workbook
-                except Exception as e:
-                    raise HTTPException(status_code=500, detail=f"openpyxl not available: {e}")
-                from openpyxl.styles import Font, PatternFill
-
-                wb = Workbook()
-                ws = wb.active
-                ws.title = "Production Day"
-                # Строка заголовков
-                ws.append(headers)
-
-                total_records = 0
-                for g in groups:
-                    area_name = g.get("area_name") or ""
-                    items = (g.get("orders") or [])
-                    # Дедупликация как в UI «Повестка дня»
-                    deduped = _dedup_orders(items)
-                    # Заголовок группы с нормо‑часами дня из агрегата
-                    group_norm = float(g.get("norm_sum_hours") or 0.0)
-                    title = f"Производственный участок: {area_name} · Позиции: {len(deduped)} · Норматив дня: {group_norm:.3f} ч"
-                    ws.append([title])
-                    r = ws.max_row
-                    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=len(headers))
-                    cell = ws.cell(row=r, column=1)
-                    cell.font = Font(bold=True)
-                    cell.fill = PatternFill("solid", fgColor="FFDDDDDD")
-
-                    for x in deduped:
-                        ws.append([
-                            x.get("item_name") or "",
-                            x.get("item_article") or "",
-                            _qty_out(x),
-                            x.get("unit") or "",
-                            float(x.get("norm_hours_per_unit") or 0.0) if x.get("norm_hours_per_unit") is not None else 0.0,
-                            _norm_total_out(x),
-                        ])
-                        total_records += 1
-                    ws.append([])  # разделитель групп
-
-                bio = io.BytesIO()
-                wb.save(bio)
-                bio.seek(0)
-                b64 = base64.b64encode(bio.read()).decode("utf-8")
-                return {
-                    "status": "ok",
-                    "format": "xlsx",
-                    "data_base64": b64,
-                    "filename": f"mrp_production_run_{run_id}.xlsx",
-                    "total_rows": int(total_records),
-                }
-            else:
-                # CSV
-                import io, csv
-                output = io.StringIO()
-                writer = csv.writer(output)
-                writer.writerow(headers)
-
-                total_records = 0
-                for g in groups:
-                    area_name = g.get("area_name") or ""
-                    items = (g.get("orders") or [])
-                    deduped = _dedup_orders(items)
-                    group_norm = float(g.get("norm_sum_hours") or 0.0)
-                    group_title = f"Производственный участок: {area_name} · Позиции: {len(deduped)} · Норматив дня: {group_norm:.3f} ч"
-                    writer.writerow([group_title] + [""] * (len(headers) - 1))
-
-                    for x in deduped:
-                        writer.writerow([
-                            x.get("item_name") or "",
-                            x.get("item_article") or "",
-                            _qty_out(x),
-                            x.get("unit") or "",
-                            float(x.get("norm_hours_per_unit") or 0.0) if x.get("norm_hours_per_unit") is not None else 0.0,
-                            _norm_total_out(x),
-                        ])
-                        total_records += 1
-                    writer.writerow([])
-
-                return {
-                    "status": "ok",
-                    "format": "csv",
-                    "data": output.getvalue(),
-                    "filename": f"mrp_production_run_{run_id}.csv",
-                    "total_rows": int(total_records),
-                }
-
-        # Иначе — стандартный экспорт по заказам с группировкой по «доминирующему участку»
+        # Стандартный экспорт по заказам с группировкой по «доминирующему участку»
         res = get_run_production(
             db=db,
             run_id=int(run_id),
@@ -723,7 +559,7 @@ async def export_planning_result_production(
             bucket_type=bucket_type,
             date_from=date_from,
             date_to=date_to,
-            limit=100000,
+            limit=10000,
             offset=0,
             sort_by=sort_by,
             sort_dir=sort_dir,
@@ -788,7 +624,7 @@ async def export_planning_result_production(
                 ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=len(headers))
                 cell = ws.cell(row=r, column=1)
                 cell.font = Font(bold=True)
-                cell.fill = PatternFill("solid", fgColor="FFDDDDDD")
+                cell.fill = PatternFill("solid", fgColor="FFDDDD")
                 for x in items:
                     ws.append([
                         x.get("item_name") or "",
@@ -1023,26 +859,28 @@ async def get_planning_result_production_grouped(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.get("/results/{run_id}/production/agenda_day")
-async def get_planning_result_production_agenda_day(
-    run_id: int,
-    day_date: str,
-    area_id: Optional[int] = None,
-    db: Session = Depends(get_db),
-):
-    """
-    Задание на конкретный день (daily) по видам/участкам.
-    Пересчёт: часы → количество по норме на штуку, вычисленной на сервере.
-    """
-    try:
-        return get_run_production_agenda_day(
-            db=db,
-            run_id=int(run_id),
-            day_date=day_date,
-            area_id=area_id,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+# NOTE: Эндпоинт /results/{run_id}/production/agenda_day удален, так как функция get_run_production_agenda_day была удалена
+# ORIGINAL ENDPOINT:
+# @router.get("/results/{run_id}/production/agenda_day")
+# async def get_planning_result_production_agenda_day(
+#     run_id: int,
+#     day_date: str,
+#     area_id: Optional[int] = None,
+#     db: Session = Depends(get_db),
+# ):
+#     """
+#     Задание на конкретный день (daily) по видам/участкам.
+#     Пересчёт: часы → количество по норме на штуку, вычисленной на сервере.
+#     """
+#     try:
+#         return get_run_production_agenda_day(
+#             db=db,
+#             run_id=int(run_id),
+#             day_date=day_date,
+#             area_id=area_id,
+#         )
+#     except Exception as e:
+#         raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/results/{run_id}/purchases/grouped")

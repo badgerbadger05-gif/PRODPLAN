@@ -38,8 +38,7 @@ export function useProduction(runId: number) {
   const filters = ref<ProductionFilters>({
     bucket_type: undefined,
     date_from: undefined,
-    date_to: undefined,
-    day_date: undefined
+    date_to: undefined
   })
 
   // Пагинация детальной таблицы
@@ -169,18 +168,19 @@ export function useProduction(runId: number) {
       loadingGrouped.value = false
     }
   }
+// «Повестка дня» (daily) по видам/участкам
+async function loadAgendaDay() {
+  loadingAgenda.value = true
+  try {
+    const day = (filters.value.date_from || '')?.slice(0, 10)
+    if (!day) {
+      agendaGroups.value = []
+      return
+    }
+    // Используем date_from как день для повестки, так как бэкенд теперь фильтрует по start_date
+    const resp = await getPlanningResultProductionAgendaDay(runId, { day_date: day })
+    agendaGroups.value = (resp?.groups || []).map(g => ({
 
-  // «Повестка дня» (daily) по видам/участкам
-  async function loadAgendaDay() {
-    loadingAgenda.value = true
-    try {
-      const day = (filters.value.day_date || '')?.slice(0, 10)
-      if (!day) {
-        agendaGroups.value = []
-        return
-      }
-      const resp = await getPlanningResultProductionAgendaDay(runId, { day_date: day })
-      agendaGroups.value = (resp?.groups || []).map(g => ({
         area_id: Number(g.area_id),
         area_name: String(g.area_name ?? ''),
         orders: (g.orders || []).map(o => ({
@@ -241,18 +241,15 @@ export function useProduction(runId: number) {
   async function exportProd(fmt: CsvOrXlsx) {
     exporting.value = true
     try {
-      const hasDay = !!filters.value.day_date
       const params: any = { format: fmt }
-      if (hasDay) {
-        params.day_date = String(filters.value.day_date).slice(0, 10)
-        // Для day_date backend формирует отчет по «повестке дня» (через stages)
-      } else {
-        params.bucket_type = filters.value.bucket_type
-        params.date_from = emptyToUndef(filters.value.date_from)
-        params.date_to = emptyToUndef(filters.value.date_to)
-        params.sort_by = 'need_date'
-        params.sort_dir = 'asc'
-      }
+      
+      // Для экспорта всегда используем date_from и date_to, так как day_date больше не используется
+      params.bucket_type = filters.value.bucket_type
+      params.date_from = emptyToUndef(filters.value.date_from)
+      params.date_to = emptyToUndef(filters.value.date_to)
+      params.sort_by = 'need_date'
+      params.sort_dir = 'asc'
+      
       const res = await exportPlanningResultProduction(runId, params)
       if (fmt === 'csv') {
         downloadTextFile(res?.data || '', res?.filename || `mrp_production_run_${runId}.csv`, 'text/csv;charset=utf-8')
@@ -274,7 +271,6 @@ export function useProduction(runId: number) {
     filters.value.bucket_type = undefined
     filters.value.date_from = undefined
     filters.value.date_to = undefined
-    filters.value.day_date = undefined
   }
 
   function setFilters(next: Partial<ProductionFilters>) {

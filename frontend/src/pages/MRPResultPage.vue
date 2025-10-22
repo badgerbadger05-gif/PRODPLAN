@@ -42,10 +42,8 @@
             v-model="prod.filter"
             :loading="prod.loading"
             :title="`Результаты MRP от ${summary?.run?.started_at || '—'}`"
-            :show-day-picker="true"
             @apply="applyProdFiltersDebounced()"
             @reset="resetFilters"
-            @day-picked="onDayPicked"
           >
             <template #extra-actions>
               <q-separator vertical class="q-mx-xs" />
@@ -56,16 +54,8 @@
             </template>
           </ProductionFilters>
 
-          <!-- Ежедневное задание по видам производства (если выбран день) -->
-          <template v-if="prod.filter.day_date && dailyAgendaGroups.length">
-            <ProductionDailyAgenda
-              :groups="dailyAgendaGroups"
-              :loading="prod.loading"
-            />
-          </template>
-
-          <!-- Группированный вывод по видам производства (если день не выбран) -->
-          <template v-else-if="groupedProdRows.length">
+          <!-- Группированный вывод по видам производства -->
+          <template v-if="groupedProdRows.length">
             <ProductionGroupedTable
               :groups="groupedProdRows"
               :loading="prod.loading"
