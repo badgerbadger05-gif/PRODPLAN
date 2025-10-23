@@ -3693,6 +3693,476 @@ def get_run_production_grouped(
 #                 row["overload"] = False
 #
 #     return {"groups": list(groups.values())}
+def _generate_shortage_report_v2(db: Session, run_id: int) -> Dict[str, Any]:
+    """
+    Generates an XLSX report for component shortages based on planning run warnings.
+    Enhanced version with improved grouping and better component shortage visualization.
+    """
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.utils import get_column_letter
+        import io
+        import base64
+    except ImportError:
+        raise RuntimeError("openpyxl is required for XLSX export. Please install it.")
+
+    run = db.query(PlanningRun).filter(PlanningRun.run_id == run_id).first()
+    if not run:
+        raise RuntimeError(f"Run {run_id} not found")
+
+    warnings = run.warnings or []
+    
+    # Detailed component-caused shortages per parent item
+    comp_warnings = [w for w in (warnings or []) if str(w.get("code") or "") == "COMPONENT_SHORTAGE"]
+    if comp_warnings:
+        # Collect parent and component item ids
+        parent_ids: List[int] = []
+        component_ids: List[int] = []
+        for w in comp_warnings:
+            try:
+                pid = int(w.get("item_id"))
+                parent_ids.append(pid)
+            except Exception:
+                pass
+            try:
+                cid = int(w.get("component_id"))
+                component_ids.append(cid)
+            except Exception:
+                pass
+
+        # Preload dictionaries for names and codes
+        all_ids = list({i for i in (parent_ids + component_ids) if i is not None})
+        items = db.query(Item).filter(Item.item_id.in_(all_ids)).all() if all_ids else []
+        imap: Dict[int, Item] = {int(it.item_id): it for it in items}
+        # Preload units
+        unit_guids = {getattr(it, "unit", None) for it in items if getattr(it, "unit", None)}
+        units = db.query(Unit).filter(Unit.unit_ref1c.in_(list(unit_guids))).all() if unit_guids else []
+        unit_map: Dict[str, Unit] = {str(u.unit_ref1c): u for u in units}
+
+        # Build child->parents map from PeggingLink for this run (to recover parent when warning lacks item_id)
+        links = db.query(PeggingLink).filter(PeggingLink.run_id == int(run_id)).all()
+        child_to_parents: Dict[int, Set[int]] = {}
+        for ln in links or []:
+            try:
+                ch = int(getattr(ln, "child_item_id"))
+                pr = getattr(ln, "parent_item_id")
+                if pr is not None:
+                    child_to_parents.setdefault(ch, set()).add(int(pr))
+            except Exception:
+                continue
+
+        # Build XLSX
+        import io, base64
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Font, Alignment
+            from openpyxl.utils import get_column_letter
+        except Exception as e:
+            raise RuntimeError(f"openpyxl is required for XLSX export. Please install it. {e}")
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Дефицит по компонентам (v2)"
+        headers = [
+            "Код изделия",
+            "Изделие", 
+            "Артикул изделия",
+            "ЕИ",
+            "Запрошено, шт",
+            "Возможный выпуск, шт (по компоненту)",
+            "Дефицит изделия, шт",
+            "Компонент",
+            "Код компонента", 
+            "Артикул компонента",
+            "ЕИ компонента",
+            "Лимитирующий",
+        ]
+        ws.append(headers)
+        # Bold header
+        for cell in ws[1]:
+            cell.font = Font(bold=True)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        
+        # Row fills
+        from openpyxl.styles import PatternFill
+        green_fill = PatternFill(fill_type="solid", start_color="FFC6EFCE")  # light green
+        yellow_fill = PatternFill(fill_type="solid", start_color="FFFFF2CC") # light yellow
+        orange_fill = PatternFill(fill_type="solid", start_color="FFFFE5CC") # light orange
+
+        # Collect raw rows for grouping and sorting
+        # Tuple: (parent_id, parent_code, parent_name, parent_article, parent_unit, req, mp, shortage_parent, comp_name, comp_code, comp_article, comp_unit)
+        raw_rows: List[Tuple[int, str, str, str, str, float, float, float, str, str]] = []
+        for w in comp_warnings:
+            # Component id is mandatory for this report; skip if missing
+            try:
+                cid = int(w.get("component_id"))
+            except Exception:
+                continue
+
+            # Parents set: from warning.item_id if present; otherwise via PeggingLink mapping
+            parents: List[Optional[int]] = []
+            pid_val = w.get("item_id")
+            if pid_val is not None:
+                try:
+                    parents = [int(pid_val)]
+                except Exception:
+                    parents = []
+            if not parents:
+                parents = sorted(list(child_to_parents.get(int(cid), set()))) or [None]
+
+            c = imap.get(int(cid))
+            comp_unit = unit_map.get(getattr(c, "unit", None))
+            comp_unit_code = getattr(comp_unit, "short_name", None) or getattr(comp_unit, "unit_code", None) or getattr(comp_unit, "unit_name", None)
+
+            # Quantities
+            try:
+                req = float(w.get("requested_qty", 0.0) or 0.0)
+            except Exception:
+                req = 0.0
+            try:
+                mp = float(w.get("max_producible_from_component", 0.0) or 0.0)
+            except Exception:
+                mp = 0.0
+            try:
+                shortage_parent = float(w.get("shortage_parent_qty", max(0.0, req - mp)))
+            except Exception:
+                shortage_parent = max(0.0, req - mp)
+
+            for pid in parents:
+                p = imap.get(int(pid)) if (pid is not None) else None
+                unit = unit_map.get(getattr(p, "unit", None))
+                unit_code = getattr(unit, "short_name", None) or getattr(unit, "unit_code", None) or getattr(unit, "unit_name", None)
+                p_code = getattr(p, "item_code", "") if p else ""
+                raw_rows.append((
+                    int(pid) if (pid is not None) else 0,
+                    str(p_code or ""),
+                    getattr(p, "item_name", "") if p else "",
+                    getattr(p, "item_article", "") if p else "",
+                    str(unit_code or ""),
+                    req,
+                    mp,
+                    shortage_parent,
+                    getattr(c, "item_name", "") if c else "",
+                    getattr(c, "item_code", "") if c else "",
+                    getattr(c, "item_article", "") if c else "",
+                    str(comp_unit_code or ""),
+                ))
+
+        # Group by parent item (pid, item_name, item_article, unit) with deduplication:
+        # req_max = max(requested), mp_min = min(possible across components)
+        # shortage = req_max - mp_min
+        from collections import defaultdict
+        grouped: Dict[Tuple[int, str, str, str], Dict[str, Any]] = {}
+        for pid, p_code, p_name, p_article, p_unit, req, mp, shortage_parent, c_name, c_code, c_article, c_unit in raw_rows:
+            # Skip unknown parents (avoid empty green rows)
+            if (pid is None or int(pid) == 0) and not p_name:
+                continue
+            key = (int(pid), p_name, p_article, p_unit)
+            if key not in grouped:
+                grouped[key] = {
+                    "req_max": 0.0,
+                    "mp_min": None,
+                    "comp_map": {}  # key -> {name, code, article, unit, req_max, mp_min}
+                }
+            g = grouped[key]
+            # Parent metrics
+            if float(req or 0.0) > float(g["req_max"] or 0.0):
+                g["req_max"] = float(req or 0.0)
+            if g["mp_min"] is None or float(mp or 0.0) < float(g["mp_min"] or 0.0):
+                g["mp_min"] = float(mp or 0.0)
+            # Component deduplication by code (fallback to name|unit)
+            comp_key = str(c_code or f"{c_name}|{c_unit}")
+            cm = g["comp_map"].get(comp_key)
+            if cm is None:
+                g["comp_map"][comp_key] = {
+                    "name": c_name,
+                    "code": c_code,
+                    "article": c_article,
+                    "unit": c_unit,
+                    "req_max": float(req or 0.0),
+                    "mp_min": float(mp or 0.0),
+                }
+            else:
+                if float(req or 0.0) > float(cm["req_max"]):
+                    cm["req_max"] = float(req or 0.0)
+                if float(mp or 0.0) < float(cm["mp_min"]):
+                    cm["mp_min"] = float(mp or 0.0)
+        
+        # Sort by computed shortage descending
+        def _item_shortage(v: Dict[str, Any]) -> float:
+            reqx = float(v.get("req_max", 0.0) or 0.0)
+            mpx = float(v.get("mp_min", 0.0) or 0.0) if v.get("mp_min") is not None else 0.0
+            return max(0.0, reqx - mpx)
+        sorted_items = sorted(grouped.items(), key=lambda x: _item_shortage(x[1]), reverse=True)
+
+        # Append grouped data with coloring: parent rows green, component rows yellow
+        total_rows = 0
+        grand_total_shortage = 0.0
+        for (pid, p_name, p_article, p_unit), data in sorted_items:
+            req_par = float(data.get("req_max", 0.0) or 0.0)
+            mp_par = float(data.get("mp_min", 0.0) or 0.0) if data.get("mp_min") is not None else 0.0
+            shortage_par = max(0.0, req_par - mp_par)
+            # Skip parents without shortage to avoid clutter and empty greens
+            if shortage_par <= 1e-9:
+                continue
+            # Parent item code from dictionary
+            p_obj = imap.get(int(pid)) if pid else None
+            p_code = getattr(p_obj, "item_code", "") if p_obj else ""
+    
+            # Parent row with area/department information if available
+            # First, find the dominant area for the parent item based on planned orders
+            area_name = ""
+            try:
+                # Get planned orders for this parent item
+                orders = db.query(PlannedOrder).filter(
+                    PlannedOrder.run_id == run_id,
+                    PlannedOrder.item_id == int(pid)
+                ).all()
+                
+                if orders:
+                    # Get stages for these orders to determine dominant area
+                    order_ids = [o.order_id for o in orders]
+                    if order_ids:
+                        stages = db.query(PlannedOrderStage).filter(
+                            PlannedOrderStage.run_id == run_id,
+                            PlannedOrderStage.order_id.in_(order_ids)
+                        ).all()
+                        
+                        # Group by area_id and find the one with most hours
+                        area_hours: Dict[int, float] = {}
+                        for stage in stages:
+                            if stage.area_id:
+                                area_hours[stage.area_id] = area_hours.get(stage.area_id, 0) + (stage.hours or 0.0)
+                        
+                        if area_hours:
+                            dominant_area_id = max(area_hours, key=area_hours.get)
+                            area_resource = db.query(ProductionResource).filter(
+                                ProductionResource.resource_id == dominant_area_id
+                            ).first()
+                            if area_resource:
+                                area_name = area_resource.resource_name or f"Участок #{dominant_area_id}"
+            except Exception:
+                # If there's an error getting area, just continue without it
+                pass
+    
+            # Parent row
+            parent_row = [
+                p_code,
+                p_name,
+                p_article,
+                p_unit,
+                req_par,
+                mp_par,
+                shortage_par,
+                f"Цех: {area_name}" if area_name else "",  # Add department/area information
+                "", "", "", "",
+                "",  # Limiting flag (only for component rows)
+            ]
+            ws.append(parent_row)
+            
+            # Style parent row (green + bold)
+            pr = ws.max_row
+            from openpyxl.styles import Font as _Font
+            for col in range(1, len(headers) + 1):
+                cell = ws.cell(row=pr, column=col)
+                cell.fill = green_fill
+                cell.font = _Font(bold=True)
+                if col == 8:  # Department/area column
+                    cell.alignment = Alignment(horizontal="left", vertical="center")
+            total_rows += 1
+            grand_total_shortage += shortage_par
+    
+            # Component rows (deduped)
+            comp_list = list(data.get("comp_map", {}).values())
+            # Determine limiting mp (minimum across components)
+            min_mp = None
+            for cm in comp_list:
+                v = float(cm.get("mp_min", 0.0) or 0.0)
+                if min_mp is None or v < min_mp:
+                    min_mp = v
+            for cm in comp_list:
+                req = float(cm.get("req_max", 0.0) or 0.0)
+                mp = float(cm.get("mp_min", 0.0) or 0.0)
+                is_lim = (min_mp is not None) and (abs(mp - min_mp) <= 1e-9)
+                ws.append([
+                    p_code, p_name, p_article, p_unit,  # parent columns filled for context
+                    req,
+                    mp,
+                    "",  # shortage at component row — пусто
+                    cm.get("name", ""),
+                    cm.get("code", ""),
+                    cm.get("article", ""),
+                    cm.get("unit", ""),
+                    "Да" if is_lim else "",
+                ])
+                # Style component row (yellow)
+                rr = ws.max_row
+                for col in range(1, len(headers) + 1):
+                    ws.cell(row=rr, column=col).fill = yellow_fill
+                total_rows += 1
+        
+        # Summary row with overall shortage
+        ws.append(["", "ИТОГО дефицит, шт", "", "", "", "", grand_total_shortage, "", "", "", "", ""])
+        sr = ws.max_row
+        for col in range(1, len(headers) + 1):
+            ws.cell(row=sr, column=col).font = Font(bold=True)
+
+        # Auto-width columns
+        for col in ws.columns:
+            max_length = 0
+            column = col[0].column_letter
+            for cell in col:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = min(max(max_length + 2, 10), 50)
+            ws.column_dimensions[column].width = adjusted_width
+
+        # Freeze header row
+        ws.freeze_panes = "A2"
+
+        bio = io.BytesIO()
+        wb.save(bio)
+        bio.seek(0)
+        b64 = base64.b64encode(bio.read()).decode("utf-8")
+        return {
+            "status": "ok",
+            "format": "xlsx",
+            "data_base64": b64,
+            "filename": f"mrp_shortage_report_run_{run_id}.xlsx",
+            "total_rows": int(total_rows),
+        }
+
+    # Fallback to previous behavior (capacity/stock generic shortages)
+    shortage_warnings = [
+        w for w in warnings
+        if w.get("code") in ("INSUFFICIENT_STOCK_FOR_PRODUCTION", "CAPACITY_SHORTAGE")
+    ]
+
+    # --- Logging for debug ---
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.warning(f"Found {len(shortage_warnings)} shortage warnings to process for run {run_id}.")
+    for w in shortage_warnings:
+        logger.warning(f"Processing warning: {w}")
+    # --- End Logging ---
+
+    if not shortage_warnings:
+        return {"status": "ok", "message": "No shortages found.", "total_rows": 0}
+
+    # --- Data Aggregation ---
+    
+    # item_id -> {shortage_qty, required_for: set(parent_item_name)}
+    shortage_map: Dict[int, Dict[str, Any]] = defaultdict(lambda: {"shortage_qty": 0.0, "required_for": set()})
+    
+    for w in shortage_warnings:
+        try:
+            item_id = int(w.get("item_id"))
+            
+            # For INSUFFICIENT_STOCK_FOR_PRODUCTION
+            if w.get("code") == "INSUFFICIENT_STOCK_FOR_PRODUCTION":
+                shortage_qty = float(w.get("shortage_qty", 0.0))
+                parent_item_name = w.get("parent_item_name")
+                shortage_map[item_id]["shortage_qty"] += shortage_qty
+                if parent_item_name:
+                    shortage_map[item_id]["required_for"].add(str(parent_item_name))
+
+            # For CAPACITY_SHORTAGE, the "unmet_qty" is for the parent item,
+            # but it implies a shortage of its components. We need to find the components.
+            elif w.get("code") == "CAPACITY_SHORTAGE":
+                # This warning is for a parent item that couldn't be produced.
+                # We need to find its direct children (components) and list them as potential shortages.
+                # The actual quantity is harder to determine without a full BOM explosion for the unmet part.
+                # For now, we will just list the components that are needed for the parent.
+                parent_item_id = int(w.get("item_id"))
+                parent_item_name = w.get("item_name")
+                
+                # Fetch possibly multiple default specifications for the parent and aggregate their components
+                spec_rows = db.query(DefaultSpecification.spec_id).filter(DefaultSpecification.item_id == parent_item_id).all()
+                spec_ids: List[int] = []
+                for row in (spec_rows or []):
+                    try:
+                        sid = int(getattr(row, "spec_id", row[0]))
+                        spec_ids.append(sid)
+                    except Exception:
+                        continue
+                if spec_ids:
+                    components = db.query(SpecComponent).filter(SpecComponent.spec_id.in_(spec_ids)).all()
+                    for comp in components:
+                        # Quantity for components is unknown from capacity shortage; mark as 0 but record dependency
+                        shortage_map[int(comp.item_id)]["shortage_qty"] += 0
+                        if parent_item_name:
+                            shortage_map[int(comp.item_id)]["required_for"].add(str(parent_item_name))
+
+        except (ValueError, TypeError):
+            continue
+
+    item_ids = list(shortage_map.keys())
+    if not item_ids:
+        return {"status": "ok", "message": "No valid shortage items found.", "total_rows": 0}
+
+    items = db.query(Item).filter(Item.item_id.in_(item_ids)).all()
+    item_map = {i.item_id: i for i in items}
+
+    # --- XLSX Generation ---
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Дефицит Комплектующих"
+
+    headers = ["Наименование", "Артикул", "Дефицит, кол-во", "Требуется для"]
+    ws.append(headers)
+    
+    header_font = Font(bold=True)
+    for cell in ws[1]:
+        cell.font = header_font
+
+    total_rows = 0
+    for item_id, data in sorted(shortage_map.items(), key=lambda x: x[0]):
+        item = item_map.get(item_id)
+        if not item:
+            continue
+        
+        required_for_str = ", ".join(sorted(list(data["required_for"])))
+        
+        row_data = [
+            item.item_name,
+            item.item_article,
+            data["shortage_qty"] if data["shortage_qty"] > 0 else "н/д",
+            required_for_str
+        ]
+        ws.append(row_data)
+        total_rows += 1
+
+    # Auto-size columns
+    for col in ws.columns:
+        max_length = 0
+        column = col[0].column_letter
+        for cell in col:
+            try:
+                if len(str(cell.value)) > max_length:
+                    max_length = len(str(cell.value))
+            except:
+                pass
+        adjusted_width = (max_length + 2)
+        ws.column_dimensions[column].width = adjusted_width
+
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    b64 = base64.b64encode(bio.read()).decode("utf-8")
+
+    return {
+        "status": "ok",
+        "format": "xlsx",
+        "data_base64": b64,
+        "filename": f"mrp_shortage_report_run_{run_id}.xlsx",
+        "total_rows": total_rows,
+    }
+
+
 def generate_shortage_report(db: Session, run_id: int) -> Dict[str, Any]:
     """
     Generates an XLSX report for component shortages based on planning run warnings.
