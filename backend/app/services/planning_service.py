@@ -584,7 +584,7 @@ def get_run_production(
     sb = (sort_by or "start_date").strip().lower()
     sd = (sort_dir or "asc").strip().lower()
     key_fn = sort_map.get(sb, lambda x: x.get("start_date", ""))
-    
+
     # Сортировка с учетом направления
     final_data.sort(key=key_fn, reverse=(sd == "desc"))
     
@@ -594,7 +594,7 @@ def get_run_production(
 
     # Применение пагинации
     start_idx = max(0, int(offset))
-    end_idx = start_idx + max(1, min(int(limit or 100), 100))
+    end_idx = start_idx + max(1, min(int(limit or 10), 10))
     paginated_data = final_data[start_idx:end_idx]
 
     return {
@@ -757,7 +757,7 @@ def get_run_capacity(
     rows: List[CapacityLoad] = (
         q.order_by(CapacityLoad.bucket_date.asc(), CapacityLoad.area_id.asc())
         .offset(max(0, int(offset)))
-        .limit(max(1, min(int(limit or 200), 5000)))
+        .limit(max(1, min(int(limit or 20), 5000)))
         .all()
     )
     data = [
@@ -2207,10 +2207,10 @@ def run_planning_run(
                             if len(top) == 1:
                                 op_major = int(top[0])
 
-                    # Apply only when base stage is not determined yet
-                    if stg_id is None and op_major is not None and _is_painting_stage(op_major):
-                        stg_id = int(op_major)
-                        rsn = "FORCE_PAINTING_FROM_OPERATIONS"
+                        # Apply only when base stage is not determined yet
+                        if stg_id is None and op_major is not None and _is_painting_stage(op_major):
+                            stg_id = int(op_major)
+                            rsn = "FORCE_PAINTING_FROM_OPERATIONS"
                 except Exception:
                     # fail-safe: ignore override on any error
                     pass
@@ -2295,7 +2295,7 @@ def run_planning_run(
         # Limits: configurable max upward walk steps for finding top root via parents
         limits_cfg = ((snapshot.get("planning") or {}).get("limits") or {})
         try:
-            _max_upwalk_steps = int(limits_cfg.get("max_upwalk_steps", 300) or 300)
+            _max_upwalk_steps = int(limits_cfg.get("max_upwalk_steps", 300) or 30)
         except Exception:
             _max_upwalk_steps = 300
 
@@ -3965,7 +3965,7 @@ def _generate_shortage_report_v2(db: Session, run_id: int) -> Dict[str, Any]:
                 
                 # Make sure subheader is not part of auto filter and doesn't get outline level or zebra style
                 # No additional styling needed as it's already styled differently
-            
+             
             # Parent row
             parent_row = [
                 p_code,
@@ -4310,7 +4310,7 @@ def generate_shortage_report(db: Session, run_id: int) -> Dict[str, Any]:
 
         # Collect raw rows for grouping and sorting
         # Tuple: (parent_id, parent_code, parent_name, parent_article, parent_unit, req, mp, shortage_parent, comp_name, comp_code, comp_article, comp_unit)
-        raw_rows: List[Tuple[int, str, str, str, str, float, float, float, str, str, str, str]] = []
+        raw_rows: List[Tuple[int, str, str, str, float, float, float, str, str, str, str]] = []
         for w in comp_warnings:
             # Component id is mandatory for this report; skip if missing
             try:
@@ -4582,7 +4582,7 @@ def generate_shortage_report(db: Session, run_id: int) -> Dict[str, Any]:
         return {"status": "ok", "message": "No valid shortage items found.", "total_rows": 0}
 
     items = db.query(Item).filter(Item.item_id.in_(item_ids)).all()
-    item_map = {i.item_id: i for i in items}
+    item_map = {i.item_id: i for in items}
 
     # --- XLSX Generation ---
     wb = Workbook()
