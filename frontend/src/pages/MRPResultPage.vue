@@ -805,14 +805,15 @@ async function loadProduction() {
     rebuildDailyAgendaForDay()
     await loadCapacityUpperDay()
  } catch (e) {
-    console.error('Failed to load production', e)
-    // В случае ошибки очищаем данные
-    prod.rows = []
-    prod.pagination.rowsNumber = 0
-    prodAllRows.value = []
-  } finally {
-    prod.loading = false
- }
+     console.error('Failed to load production', e)
+     // В случае ошибки очищаем данные
+     prod.rows = []
+     prod.pagination.rowsNumber = 0
+     prodAllRows.value = []
+   } finally {
+     prod.loading = false
+  }
+}
 
 async function loadPurchases() {
   purch.loading = true
