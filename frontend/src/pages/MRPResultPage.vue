@@ -478,7 +478,6 @@ const plainProdRows = computed(() => {
   
   return Array.from(rowMap.values())
 })
-
 // Агрегация закупок по item_id+unit для верхней вкладки (независимо от пагинации детальных)
 const purchAggRows = computed(() => {
   return purchGroupedRows.value || []
@@ -814,7 +813,6 @@ async function loadProduction() {
   } finally {
     prod.loading = false
  }
-}
 
 async function loadPurchases() {
   purch.loading = true
@@ -1176,43 +1174,75 @@ function debounce<T extends (...args: any[]) => any>(fn: T, ms = 250) {
   }
 }
 
+// Новая функция для сбора параметров фильтров
+function collectFilterParams() {
+  // Собираем параметры для production фильтров
+  const prodParams = {
+    bucket_type: prod.filter.bucket_type,
+    date_from: emptyToUndef(prod.filter.date_from),
+    date_to: emptyToUndef(prod.filter.date_to),
+    day_date: emptyToUndef(prod.filter.day_date)
+  }
+  
+  // Собираем параметры для purchases фильтров
+  const purchParams = {
+    bucket_type: purch.filter.bucket_type,
+    date_from: emptyToUndef(purch.filter.date_from),
+    date_to: emptyToUndef(purch.filter.date_to)
+  }
+  
+  // Собираем параметры для capacity фильтров
+ const capParams = {
+    bucket_type: cap.filter.bucket_type,
+    date_from: emptyToUndef(cap.filter.date_from),
+    date_to: emptyToUndef(cap.filter.date_to)
+  }
+  
+ // Собираем параметры для pegging фильтров
+  const pegParams = {
+    child_item_id: peg.filter.child_item_id,
+    parent_item_id: peg.filter.parent_item_id,
+    date_from: emptyToUndef(peg.filter.date_from),
+    date_to: emptyToUndef(peg.filter.date_to)
+  }
+  
+  return {
+    prod: prodParams,
+    purch: purchParams,
+    cap: capParams,
+    peg: pegParams
+ }
+}
+
 const applyProdFilters = async () => {
+  // Собираем актуальные параметры фильтров
+  const filterParams = collectFilterParams();
+  const prodFilters = filterParams.prod;
+  
   // Перед загрузкой данных убедимся, что фильтры корректны
- // Если даты одинаковы, это однодневный диапазон
-  if (prod.filter.date_from && prod.filter.date_to && prod.filter.date_from === prod.filter.date_to) {
+  // Если даты одинаковы, это однодневный диапазон
+ if (prodFilters.date_from && prodFilters.date_to && prodFilters.date_from === prodFilters.date_to) {
     // Для однодневного диапазона дополнительно сбрасываем тип бакета, если он не указан
-    if (!prod.filter.bucket_type) {
-      prod.filter.bucket_type = 'daily' // по умолчанию используем daily для однодневного диапазона
+    if (!prodFilters.bucket_type) {
+      prodFilters.bucket_type = 'daily' // по умолчанию используем daily для однодневного диапазона
     }
  }
   
   // Добавляем отладочную информацию
-  console.log('applyProdFilters called with filters:', { ...prod.filter });
+  console.log('applyProdFilters called with filters:', prodFilters);
   
-  // Сохраняем состояние фильтров при первом вызове для сравнения
-  if (isFirstCall) {
-    firstCallFilters = { ...prod.filter };
-    isFirstCall = false;
-    console.log('First call filters saved:', firstCallFilters);
- } else {
-    console.log('Comparing filters with first call:', {
-      first: firstCallFilters,
-      current: prod.filter,
-      differences: Object.keys(firstCallFilters).filter(key =>
-        (firstCallFilters as any)[key] !== (prod.filter as any)[key]
-      )
-    });
-  }
+  // Обновляем фильтры в prod.filter для согласованности
+  prod.filter.bucket_type = prodFilters.bucket_type;
+  prod.filter.date_from = prodFilters.date_from || '';
+  prod.filter.date_to = prodFilters.date_to || '';
+  prod.filter.day_date = prodFilters.day_date || '';
   
- await loadProduction()
- await loadCapacityUpper()
-rebuildDailyAgendaForDay()
- await loadCapacityUpperDay()
- 
- // После загрузки данных сбрасываем флаг, чтобы при следующем вызове сравнение было с текущим состоянием
- isFirstCall = true;
- firstCallFilters = null;
+  await loadProduction()
+  await loadCapacityUpper()
+  rebuildDailyAgendaForDay()
+  await loadCapacityUpperDay()
 }
+
 const applyProdFiltersDebounced = debounce(applyProdFilters, 250)
 
 // Добавляем функцию для проверки состояния фильтров
@@ -1224,62 +1254,6 @@ function debugProdFilters() {
 const applyPurchFiltersDebounced = debounce(loadPurchases, 250)
 const applyDayFilterDebounced = debounce(applyDayFilter, 250)
 const loadCapacityUpperDebounced = debounce(loadCapacityUpper, 250)
-
-// Добавляем переменные для отслеживания состояния фильтров
-let firstCallFilters: any = null;
-let isFirstCall = true;
-
-// Сбрасываем флаг при изменении вкладки или при монтировании
-onMounted(() => {
-  isFirstCall = true;
-  firstCallFilters = null;
-});
-
-// Наблюдаем за изменениями вкладки для сброса флага
-watch(tab, () => {
- isFirstCall = true;
-  firstCallFilters = null;
-});
-
-// --- Helpers: date range filters for upper unified tables ---
-function dateInRange(dt: string | null | undefined, from?: string, to?: string): boolean {
-  const d = dt ? String(dt).slice(0, 10) : undefined
-  const f = from ? String(from).slice(0, 10) : undefined
-  const t = to ? String(to).slice(0, 10) : undefined
-
-  // Если нет даты строки — не отфильтровываем на клиенте
-  if (!d) return true
-
-  let a = f
-  let b = t
-  // Если пользователь перепутал границы — переставим
-  if (a && b && a > b) {
-    const tmp = a; a = b; b = tmp
-  }
-
-  if (a && d < a) return false
-  if (b && d > b) return false
-  return true
-}
-
-
-function inProdRange(row: any): boolean {
-  const from = emptyToUndef(prod.filter.date_from)
-  const to = emptyToUndef(prod.filter.date_to)
-  // Валидация только по bucket_date, без повторной фильтрации по bucket_type (сервер уже отобрал)
-  const dt = (row?.bucket_date || null) as string | null
-  const okDate = (!from && !to) ? true : dateInRange(dt, from, to)
-  return okDate
-}
-
-function inPurchRange(row: any): boolean {
-  const from = emptyToUndef(purch.filter.date_from)
-  const to = emptyToUndef(purch.filter.date_to)
-  // Валидация только по дате
-  const dt = (row?.bucket_date || row?.order_date || row?.need_date || null) as string | null
-  const okDate = (!from && !to) ? true : dateInRange(dt, from, to)
-  return okDate
-}
 
 onMounted(async () => {
   console.time('MRPResultPage:onMounted')
@@ -1322,32 +1296,13 @@ watch(tab, (t) => {
   if (t === 'purchases' && !purch.rows.length) loadPurchases()
   if (t === 'capacity') loadCapacity()
   if (t === 'pegging') loadPegging()
-  // Сбрасываем флаг при переключении вкладки
- isFirstCall = true;
-  firstCallFilters = null;
 })
 
 // Автозагрузка при переключении верхних вкладок
 watch(viewTab, (vt) => {
   if (vt === 'production' && !prod.rows.length) loadProduction()
   if (vt === 'purchases' && !purch.rows.length) loadPurchases()
-  // Сбрасываем флаг при переключении верхней вкладки
-  isFirstCall = true;
-  firstCallFilters = null;
 })
-
-// Наблюдаем за изменениями prod.rows, itemMap и areaMap для обновления groupedProductionOrders
-/**
- * Removed heavy deep watch on prod.rows/itemMap/areaMap to reduce reactive load.
- * Grouped data is rebuilt explicitly in loaders (loadProduction, loadDictionaries, loadCapacityUpper)
- * and on capacity summary updates.
- */
-
-
-/* Перестроение агрегатов выполняется явно в loadCapacityUpper()
-   для исключения двойных вызовов и снижения реактивной нагрузки */
-
-
 
 // Актуализируем индикаторы перегруза при изменении фильтров верхней вкладки «Производство»
 watch([() => prod.filter.bucket_type, () => prod.filter.date_from, () => prod.filter.date_to], () => {
