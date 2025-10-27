@@ -115,9 +115,9 @@
           <q-select v-model="prod.filter.bucket_type" :options="bucketOptions" emit-value map-options dense outlined :label="t('mrp.filters.bucket')" style="width: 150px" />
           <q-input v-model="prod.filter.date_from" dense outlined :label="t('mrp.filters.fromDate')" style="width: 200px" />
           <q-input v-model="prod.filter.date_to" dense outlined :label="t('mrp.filters.toDate')" style="width: 200px" />
-          <q-btn dense color="primary" icon="search" @click="loadProduction()" />
+          <q-btn dense color="primary" icon="search" @click="applyProdFilters()" />
           <q-space />
-          <q-btn dense flat icon="refresh" @click="loadProduction()" />
+          <q-btn dense flat icon="refresh" @click="applyProdFilters()" />
         </div>
         <ProductionDetailTable
           :rows="prod.rows"
@@ -134,9 +134,9 @@
           <q-select v-model="purch.filter.bucket_type" :options="bucketOptions" emit-value map-options dense outlined :label="t('mrp.filters.bucket')" style="width: 150px" />
           <q-input v-model="purch.filter.date_from" dense outlined :label="t('mrp.filters.fromDate')" style="width: 200px" />
           <q-input v-model="purch.filter.date_to" dense outlined :label="t('mrp.filters.toDate')" style="width: 200px" />
-          <q-btn dense color="primary" icon="search" @click="loadPurchases()" />
+          <q-btn dense color="primary" icon="search" @click="applyPurchFiltersDebounced()" />
           <q-space />
-          <q-btn dense flat icon="refresh" @click="loadPurchases()" />
+          <q-btn dense flat icon="refresh" @click="applyPurchFiltersDebounced()" />
         </div>
         <PurchasesDetailTable
           :rows="purch.rows"
