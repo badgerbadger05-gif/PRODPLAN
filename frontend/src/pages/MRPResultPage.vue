@@ -771,6 +771,13 @@ async function loadProduction() {
     const dateFrom = emptyToUndef(prod.filter.date_from)
     const dateTo = emptyToUndef(prod.filter.date_to)
     
+    console.log('loadProduction called with filters:', {
+      bucket_type: prod.filter.bucket_type,
+      date_from: dateFrom,
+      date_to: dateTo,
+      runId: runId
+    });
+    
     const resp = await getPlanningResultProduction(runId, {
       bucket_type: prod.filter.bucket_type,
       date_from: dateFrom,
@@ -779,6 +786,13 @@ async function loadProduction() {
       sort_dir: 'asc' as const,
       limit, offset
     })
+    
+    console.log('loadProduction response:', {
+      total: resp.total,
+      rowsCount: resp.rows?.length || 0,
+      rows: resp.rows || []
+    });
+    
     prod.rows = resp.rows || []
     prod.pagination.rowsNumber = resp.total || 0
     // Отказываемся от полной выгрузки 10000 строк — используем только текущую страницу как «полный» источник для фолбэка
@@ -793,9 +807,13 @@ async function loadProduction() {
     await loadCapacityUpperDay()
  } catch (e) {
     console.error('Failed to load production', e)
+    // В случае ошибки очищаем данные
+    prod.rows = []
+    prod.pagination.rowsNumber = 0
+    prodAllRows.value = []
   } finally {
     prod.loading = false
-  }
+ }
 }
 
 async function loadPurchases() {
@@ -1160,23 +1178,68 @@ function debounce<T extends (...args: any[]) => any>(fn: T, ms = 250) {
 
 const applyProdFilters = async () => {
   // Перед загрузкой данных убедимся, что фильтры корректны
-  // Если даты одинаковы, это однодневный диапазон
+ // Если даты одинаковы, это однодневный диапазон
   if (prod.filter.date_from && prod.filter.date_to && prod.filter.date_from === prod.filter.date_to) {
     // Для однодневного диапазона дополнительно сбрасываем тип бакета, если он не указан
     if (!prod.filter.bucket_type) {
       prod.filter.bucket_type = 'daily' // по умолчанию используем daily для однодневного диапазона
     }
+ }
+  
+  // Добавляем отладочную информацию
+  console.log('applyProdFilters called with filters:', { ...prod.filter });
+  
+  // Сохраняем состояние фильтров при первом вызове для сравнения
+  if (isFirstCall) {
+    firstCallFilters = { ...prod.filter };
+    isFirstCall = false;
+    console.log('First call filters saved:', firstCallFilters);
+ } else {
+    console.log('Comparing filters with first call:', {
+      first: firstCallFilters,
+      current: prod.filter,
+      differences: Object.keys(firstCallFilters).filter(key =>
+        (firstCallFilters as any)[key] !== (prod.filter as any)[key]
+      )
+    });
   }
   
-  await loadProduction()
-  await loadCapacityUpper()
-  rebuildDailyAgendaForDay()
-  await loadCapacityUpperDay()
+ await loadProduction()
+ await loadCapacityUpper()
+rebuildDailyAgendaForDay()
+ await loadCapacityUpperDay()
+ 
+ // После загрузки данных сбрасываем флаг, чтобы при следующем вызове сравнение было с текущим состоянием
+ isFirstCall = true;
+ firstCallFilters = null;
 }
 const applyProdFiltersDebounced = debounce(applyProdFilters, 250)
+
+// Добавляем функцию для проверки состояния фильтров
+function debugProdFilters() {
+  console.log('Current prod filters state:', { ...prod.filter });
+  console.log('Production rows count:', prod.rows.length);
+  console.log('Production all rows count:', prodAllRows.value.length);
+}
 const applyPurchFiltersDebounced = debounce(loadPurchases, 250)
 const applyDayFilterDebounced = debounce(applyDayFilter, 250)
 const loadCapacityUpperDebounced = debounce(loadCapacityUpper, 250)
+
+// Добавляем переменные для отслеживания состояния фильтров
+let firstCallFilters: any = null;
+let isFirstCall = true;
+
+// Сбрасываем флаг при изменении вкладки или при монтировании
+onMounted(() => {
+  isFirstCall = true;
+  firstCallFilters = null;
+});
+
+// Наблюдаем за изменениями вкладки для сброса флага
+watch(tab, () => {
+ isFirstCall = true;
+  firstCallFilters = null;
+});
 
 // --- Helpers: date range filters for upper unified tables ---
 function dateInRange(dt: string | null | undefined, from?: string, to?: string): boolean {
@@ -1259,12 +1322,18 @@ watch(tab, (t) => {
   if (t === 'purchases' && !purch.rows.length) loadPurchases()
   if (t === 'capacity') loadCapacity()
   if (t === 'pegging') loadPegging()
+  // Сбрасываем флаг при переключении вкладки
+ isFirstCall = true;
+  firstCallFilters = null;
 })
 
 // Автозагрузка при переключении верхних вкладок
 watch(viewTab, (vt) => {
   if (vt === 'production' && !prod.rows.length) loadProduction()
   if (vt === 'purchases' && !purch.rows.length) loadPurchases()
+  // Сбрасываем флаг при переключении верхней вкладки
+  isFirstCall = true;
+  firstCallFilters = null;
 })
 
 // Наблюдаем за изменениями prod.rows, itemMap и areaMap для обновления groupedProductionOrders
