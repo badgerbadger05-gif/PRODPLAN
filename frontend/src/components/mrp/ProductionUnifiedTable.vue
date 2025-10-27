@@ -42,13 +42,14 @@ import { useFormatting } from '../../composables/useFormatting'
 
 type PlainProdRow = {
   item_id: number
-  item_name?: string | null
+ item_name?: string | null
   item_article?: string | null
   unit?: string | null
-  qty: number
-  norm_hours_total: number
-  norm_hours_per_unit?: number | null
+ qty: number
+ norm_hours_total: number
+ norm_hours_per_unit?: number | null
   agg_key?: string
+  rowKey: string
 }
 
 const props = defineProps<{
@@ -67,10 +68,35 @@ const columns = computed<QTableColumn<PlainProdRow>[]>(() => ([
   { name: 'norm_total', label: t('mrp.columns.normTotal'), field: (row: PlainProdRow) => row.norm_hours_total, align: 'right' }
 ]))
 
-const safeRows = computed(() => (props.rows || []).map(r => ({
-  ...r,
-  rowKey: r.agg_key || `${r.item_id}|${r.unit || ''}`
-})))
+const safeRows = computed(() => {
+  // Create a map to deduplicate rows based on agg_key or a combination of item_id and unit
+  const rowMap = new Map<string, PlainProdRow>()
+  
+  ;(props.rows || []).forEach(r => {
+    const key = r.agg_key || `${r.item_id}|${r.unit || ''}`
+    // If row with same key already exists, merge/accumulate values as needed
+    if (rowMap.has(key)) {
+      const existingRow = rowMap.get(key)!
+      // Accumulate quantities and norm hours when duplicates found
+      rowMap.set(key, {
+        ...r,
+        qty: (existingRow.qty || 0) + (r.qty || 0),
+        norm_hours_total: (existingRow.norm_hours_total || 0) + (r.norm_hours_total || 0),
+        rowKey: key
+      })
+    } else {
+      rowMap.set(key, {
+        ...r,
+        rowKey: key
+      })
+    }
+  })
+  
+  return Array.from(rowMap.values()).map(r => ({
+    ...r,
+    rowKey: r.agg_key || `${r.item_id}|${r.unit || ''}`
+  }))
+})
 
 function resolveNormPerUnit(npu: number | null | undefined, nt: number | null | undefined, qty: number | null | undefined): number {
   if (npu != null) return Number(npu)

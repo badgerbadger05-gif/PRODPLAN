@@ -449,12 +449,34 @@ const groupedProdRows = computed(() => {
 })
 // Плоский список для фолбэка
 const plainProdRows = computed(() => {
-  const src = prodAllRows.value || []
-  return src.map((r: any) => ({
-    ...r,
-    item_name: (itemMap.value?.[r.item_id]?.item_name) ?? t('mrp.placeholder.itemNameFallback', { id: r.item_id }),
-    item_article: (itemMap.value?.[r.item_id]?.item_article) ?? t('mrp.placeholder.noArticle')
-  }))
+ const src = prodAllRows.value || []
+  
+  // Create a map to deduplicate rows based on agg_key or a combination of item_id and unit
+ const rowMap = new Map<string, any>()
+  
+  src.forEach((r: any) => {
+    const key = r.agg_key || `${r.item_id}|${r.unit || ''}`
+    // If row with same key already exists, merge/accumulate values as needed
+    if (rowMap.has(key)) {
+      const existingRow = rowMap.get(key)!
+      // Accumulate quantities and norm hours when duplicates found
+      rowMap.set(key, {
+        ...r,
+        item_name: (itemMap.value?.[r.item_id]?.item_name) ?? t('mrp.placeholder.itemNameFallback', { id: r.item_id }),
+        item_article: (itemMap.value?.[r.item_id]?.item_article) ?? t('mrp.placeholder.noArticle'),
+        qty: (existingRow.qty || 0) + (r.qty || 0),
+        norm_hours_total: (existingRow.norm_hours_total || 0) + (r.norm_hours_total || 0)
+      })
+    } else {
+      rowMap.set(key, {
+        ...r,
+        item_name: (itemMap.value?.[r.item_id]?.item_name) ?? t('mrp.placeholder.itemNameFallback', { id: r.item_id }),
+        item_article: (itemMap.value?.[r.item_id]?.item_article) ?? t('mrp.placeholder.noArticle')
+      })
+    }
+  })
+  
+  return Array.from(rowMap.values())
 })
 
 // Агрегация закупок по item_id+unit для верхней вкладки (независимо от пагинации детальных)
@@ -534,15 +556,23 @@ async function rebuildDailyAgendaForDay() {
 
 async function rebuildGroupedProductionOrders() {
   try {
-    const resp = await getPlanningResultProductionGrouped(runId, {
+    // При однодневном диапазоне (когда date_from и date_to одинаковы) бэкенд может возвращать данные по-разному
+    // Поэтому явно проверим и обработаем этот случай
+    const dateFrom = emptyToUndef(prod.filter.date_from)
+    const dateTo = emptyToUndef(prod.filter.date_to)
+    
+    // Если даты одинаковы, убедимся, что бэкенд получает корректные параметры
+    const params = {
       bucket_type: prod.filter.bucket_type,
-      date_from: emptyToUndef(prod.filter.date_from),
-      date_to: emptyToUndef(prod.filter.date_to),
+      date_from: dateFrom,
+      date_to: dateTo,
       limit: 1000,
       offset: 0,
-      sort_by: 'item_name',
-      sort_dir: 'asc'
-    })
+      sort_by: 'item_name' as const,
+      sort_dir: 'asc' as const
+    }
+    
+    const resp = await getPlanningResultProductionGrouped(runId, params)
     const groups = (resp?.groups || []).map((g: any) => ({
       area_id: g.area_id,
       area_name: g.area_name,
@@ -736,17 +766,22 @@ async function loadProduction() {
   try {
     const limit = prod.pagination.rowsPerPage
     const offset = (prod.pagination.page - 1) * prod.pagination.rowsPerPage
+    
+    // Проверяем, если диапазон дат состоит из одного дня
+    const dateFrom = emptyToUndef(prod.filter.date_from)
+    const dateTo = emptyToUndef(prod.filter.date_to)
+    
     const resp = await getPlanningResultProduction(runId, {
       bucket_type: prod.filter.bucket_type,
-      date_from: emptyToUndef(prod.filter.date_from),
-      date_to: emptyToUndef(prod.filter.date_to),
-      sort_by: 'item_name',
-      sort_dir: 'asc',
+      date_from: dateFrom,
+      date_to: dateTo,
+      sort_by: 'item_name' as const,
+      sort_dir: 'asc' as const,
       limit, offset
     })
     prod.rows = resp.rows || []
     prod.pagination.rowsNumber = resp.total || 0
-    // Отказываемся от полной выгрузки 100000 строк — используем только текущую страницу как «полный» источник для фолбэка
+    // Отказываемся от полной выгрузки 10000 строк — используем только текущую страницу как «полный» источник для фолбэка
     prodAllRows.value = (resp?.rows || [])
     rebuildOrderOptions()
     // Пересобираем группы на сервере
@@ -756,7 +791,7 @@ async function loadProduction() {
     // Ежедневная повестка + мощность за конкретный день (если выбран)
     rebuildDailyAgendaForDay()
     await loadCapacityUpperDay()
-  } catch (e) {
+ } catch (e) {
     console.error('Failed to load production', e)
   } finally {
     prod.loading = false
@@ -878,13 +913,17 @@ async function exportPurch(fmt: 'csv' | 'xlsx') {
 async function exportShortageReport() {
   try {
     const res = await getShortageReport(runId)
+    if (res.status === 'ok' && res.total_rows === 0) {
+      alert(t('mrp.messages.noShortages') || 'Дефицитов не найдено')
+      return
+    }
     if (res?.data_base64) {
       downloadBase64Xlsx(res.data_base64, res.filename || `mrp_shortage_report_run_${runId}.xlsx`)
     } else {
-      const message = res?.message || t('mrp.errors.shortageReportFailed')
+      const message = t('mrp.errors.shortageReportFailed')
       alert(String(message))
     }
-  } catch (e: any) {
+ } catch (e: any) {
     console.error('Export shortage report failed', e)
     const detail =
       (e?.response?.data?.detail as any) ||
@@ -1120,6 +1159,15 @@ function debounce<T extends (...args: any[]) => any>(fn: T, ms = 250) {
 }
 
 const applyProdFilters = async () => {
+  // Перед загрузкой данных убедимся, что фильтры корректны
+  // Если даты одинаковы, это однодневный диапазон
+  if (prod.filter.date_from && prod.filter.date_to && prod.filter.date_from === prod.filter.date_to) {
+    // Для однодневного диапазона дополнительно сбрасываем тип бакета, если он не указан
+    if (!prod.filter.bucket_type) {
+      prod.filter.bucket_type = 'daily' // по умолчанию используем daily для однодневного диапазона
+    }
+  }
+  
   await loadProduction()
   await loadCapacityUpper()
   rebuildDailyAgendaForDay()

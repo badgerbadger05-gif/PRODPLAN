@@ -31,7 +31,7 @@
 
       <!-- Строки заказов внутри группы -->
       <q-tr
-        v-for="order in (props.row.orders || [])"
+        v-for="order in deduplicateOrders(props.row.orders || [])"
         :key="order.agg_key || `${order.item_id}|${order.unit || ''}`"
         :props="props"
       >
@@ -83,6 +83,28 @@ function resolveNormPerUnit(npu?: number | null, nt?: number | null, qty?: numbe
   const total = Number(nt ?? 0)
   const q = Number(qty ?? 0)
   return q > 0 ? total / q : 0
+}
+
+// Функция для удаления дубликатов заказов
+function deduplicateOrders(orders: any[]) {
+  const orderMap = new Map<string, any>();
+  
+  orders.forEach(order => {
+    const key = order.agg_key || `${order.item_id}|${order.unit || ''}`;
+    if (orderMap.has(key)) {
+      const existingOrder = orderMap.get(key);
+      // Объединяем значения qty и norm_hours_total при наличии дубликатов
+      orderMap.set(key, {
+        ...order,
+        qty: (existingOrder.qty || 0) + (order.qty || 0),
+        norm_hours_total: (existingOrder.norm_hours_total || 0) + (order.norm_hours_total || 0)
+      });
+    } else {
+      orderMap.set(key, order);
+    }
+  });
+  
+  return Array.from(orderMap.values());
 }
 </script>
 

@@ -367,7 +367,16 @@ export async function getPlanningResultCapacitySummary(runId: number, params: {
   const { data } = await api.get(`/v1/plan/results/${runId}/capacity/summary`, { params })
   return data
 }
-export async function getShortageReport(runId: number): Promise<any> {
+export interface ShortageReportResponse {
+  status?: string;
+  format?: string;
+  data_base64?: string;
+  filename?: string;
+  total_rows?: number;
+  message?: string;
+}
+
+export async function getShortageReport(runId: number): Promise<ShortageReportResponse> {
   const response = await api.get(`/v1/plan/results/${runId}/shortage-report`)
   return response.data
 }

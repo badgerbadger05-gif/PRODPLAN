@@ -437,9 +437,9 @@ def get_run_production(
         po, in_name, in_article, in_unit_guid, in_unit_short, in_unit_name, in_unit_code = row
         order_ids.append(int(po.order_id))
         
-        # Ключ агрегации: item_id, start_date, unit
+        # Ключ агрегации: item_id, unit (без start_date для предотвращения дублирования)
         unit_display = in_unit_short or in_unit_name or in_unit_code or in_unit_guid
-        agg_key = (int(po.item_id), po.start_date.isoformat() if po.start_date else "", unit_display or "")
+        agg_key = (int(po.item_id), unit_display or "")
         
         if agg_key not in aggregated_data:
             aggregated_data[agg_key] = {
@@ -3766,14 +3766,14 @@ def _generate_shortage_report_v2(db: Session, run_id: int) -> Dict[str, Any]:
         ws.title = "Дефицит по компонентам (v2)"
         headers = [
             "Код изделия",
-            "Изделие", 
+            "Изделие",
             "Артикул изделия",
             "ЕИ",
             "Запрошено, шт",
             "Возможный выпуск, шт (по компоненту)",
             "Дефицит изделия, шт",
             "Компонент",
-            "Код компонента", 
+            "Код компонента",
             "Артикул компонента",
             "ЕИ компонента",
             "Лимитирующий",
@@ -3784,6 +3784,9 @@ def _generate_shortage_report_v2(db: Session, run_id: int) -> Dict[str, Any]:
             cell.font = Font(bold=True)
             cell.alignment = Alignment(horizontal="center", vertical="center")
         
+        # Enable outline symbols before starting to fill data
+        ws.sheet_view.showOutlineSymbols = True
+        
         # Row fills
         from openpyxl.styles import PatternFill
         green_fill = PatternFill(fill_type="solid", start_color="FFC6EFCE")  # light green
@@ -3792,7 +3795,7 @@ def _generate_shortage_report_v2(db: Session, run_id: int) -> Dict[str, Any]:
 
         # Collect raw rows for grouping and sorting
         # Tuple: (parent_id, parent_code, parent_name, parent_article, parent_unit, req, mp, shortage_parent, comp_name, comp_code, comp_article, comp_unit)
-        raw_rows: List[Tuple[int, str, str, str, str, float, float, float, str, str]] = []
+        raw_rows: List[Tuple[int, str, str, float, float, float, str, str]] = []
         for w in comp_warnings:
             # Component id is mandatory for this report; skip if missing
             try:
@@ -3946,6 +3949,23 @@ def _generate_shortage_report_v2(db: Session, run_id: int) -> Dict[str, Any]:
                 # If there's an error getting area, just continue without it
                 pass
     
+            # Add department/area subheader if available
+            if area_name:
+                # Add the subheader row
+                subheader_row = [f"Цех: {area_name}"] + [""] * (len(headers) - 1)
+                ws.append(subheader_row)
+                
+                # Merge cells A to L for the subheader
+                ws.merge_cells(start_row=ws.max_row, start_column=1, end_row=ws.max_row, end_column=len(headers))
+                
+                # Style the subheader
+                subheader_cell = ws.cell(row=ws.max_row, column=1)
+                subheader_cell.font = Font(italic=True)
+                subheader_cell.alignment = Alignment(horizontal="left", vertical="center")
+                
+                # Make sure subheader is not part of auto filter and doesn't get outline level or zebra style
+                # No additional styling needed as it's already styled differently
+            
             # Parent row
             parent_row = [
                 p_code,
@@ -3955,10 +3975,11 @@ def _generate_shortage_report_v2(db: Session, run_id: int) -> Dict[str, Any]:
                 req_par,
                 mp_par,
                 shortage_par,
-                f"Цех: {area_name}" if area_name else "",  # Add department/area information
+                "",  # Component column - empty for parent
                 "", "", "", "",
                 "",  # Limiting flag (only for component rows)
             ]
+            parent_row_num = ws.max_row + 1
             ws.append(parent_row)
             
             # Style parent row (green + bold)
@@ -3968,8 +3989,14 @@ def _generate_shortage_report_v2(db: Session, run_id: int) -> Dict[str, Any]:
                 cell = ws.cell(row=pr, column=col)
                 cell.fill = green_fill
                 cell.font = _Font(bold=True)
-                if col == 8:  # Department/area column
-                    cell.alignment = Alignment(horizontal="left", vertical="center")
+                # Apply number format to columns F, G, H (index 5, 6, 7)
+                if col in [5, 6, 7]:
+                    cell.number_format = '#,##0.###'
+                # Apply wrap_text to column C (index 2) and J (index 9)
+                if col in [2, 9]:
+                    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            # Set outline level for parent row but don't hide it
+            ws.row_dimensions[pr].outline_level = 1
             total_rows += 1
             grand_total_shortage += shortage_par
     
@@ -3999,8 +4026,25 @@ def _generate_shortage_report_v2(db: Session, run_id: int) -> Dict[str, Any]:
                 # Style component row (yellow)
                 rr = ws.max_row
                 for col in range(1, len(headers) + 1):
-                    ws.cell(row=rr, column=col).fill = yellow_fill
+                    cell = ws.cell(row=rr, column=col)
+                    cell.fill = yellow_fill
+                    # Apply number format to columns F, G, H (index 5, 6, 7)
+                    if col in [5, 6, 7]:
+                        cell.number_format = '#,##0.###'
+                    # Apply wrap_text to column C (index 2) and J (index 9)
+                    if col in [2, 9]:
+                        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                # Set outline level for child rows and hide them
+                ws.row_dimensions[rr].outline_level = 2
+                ws.row_dimensions[rr].hidden = True
                 total_rows += 1
+            
+            # Group child rows under parent if we have any
+            if comp_list:
+                first_child_row = pr + 1
+                last_child_row = pr + len(comp_list)
+                if last_child_row >= first_child_row:
+                    ws.row_dimensions.group(first_child_row, last_child_row, outline_level=2, hidden=True)
         
         # Summary row with overall shortage
         ws.append(["", "ИТОГО дефицит, шт", "", "", "", "", grand_total_shortage, "", "", "", "", ""])
@@ -4022,7 +4066,16 @@ def _generate_shortage_report_v2(db: Session, run_id: int) -> Dict[str, Any]:
             ws.column_dimensions[column].width = adjusted_width
 
         # Freeze header row
-        ws.freeze_panes = "A2"
+        ws.freeze_panes = "A3"
+        
+        # Set auto filter (excluding subheader row which is row 2 if it exists)
+        ws.auto_filter.ref = f"A2:{get_column_letter(len(headers))}2"
+
+        # Ensure outline settings
+        ws.sheet_properties.outlinePr.summaryBelow = False
+        ws.sheet_properties.outlinePr.summaryRight = False
+        # Re-enable outline symbols after setting up groups
+        ws.sheet_view.showOutlineSymbols = True
 
         bio = io.BytesIO()
         wb.save(bio)
