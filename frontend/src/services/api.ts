@@ -118,12 +118,11 @@ export async function getPlanningRunSummary(runId: number): Promise<{
 
 export async function getPlanningResultProduction(runId: number, params: {
   item_id?: number
-  bucket_type?: 'daily' | 'weekly'
   date_from?: string
   date_to?: string
   limit?: number
   offset?: number
-  sort_by?: 'item_name' | 'item_article' | 'qty' | 'need_date' | 'bucket_date' | 'priority_index'
+  sort_by?: 'item_name' | 'item_article' | 'qty' | 'need_date' | 'start_date' | 'priority_index'
   sort_dir?: 'asc' | 'desc'
 } = {}): Promise<{ rows: any[]; total: number; total_qty: number; limit: number; offset: number }> {
   const { data } = await api.get(`/v1/plan/results/${runId}/production`, { params })
@@ -132,7 +131,6 @@ export async function getPlanningResultProduction(runId: number, params: {
 
 export async function getPlanningResultPurchases(runId: number, params: {
   item_id?: number
-  bucket_type?: 'daily' | 'weekly'
   date_from?: string
   date_to?: string
   limit?: number
@@ -146,7 +144,6 @@ export async function getPlanningResultPurchases(runId: number, params: {
 
 export async function getPlanningResultCapacity(runId: number, params: {
   area_id?: number
-  bucket_type?: 'daily' | 'weekly'
   date_from?: string
   date_to?: string
   limit?: number
@@ -229,11 +226,9 @@ export async function listResources(params: {
 /** Export production results as CSV or XLSX (base64) */
 export async function exportPlanningResultProduction(runId: number, params: {
   format: 'csv' | 'xlsx'
-  bucket_type?: 'daily' | 'weekly'
   date_from?: string
   date_to?: string
-  day_date?: string
-  sort_by?: 'item_name' | 'item_article' | 'qty' | 'need_date' | 'bucket_date' | 'priority_index'
+  sort_by?: 'item_name' | 'item_article' | 'qty' | 'need_date' | 'start_date' | 'priority_index'
   sort_dir?: 'asc' | 'desc'
 }): Promise<any> {
   const { data } = await api.get(`/v1/plan/results/${runId}/production/export`, { params })
@@ -243,7 +238,6 @@ export async function exportPlanningResultProduction(runId: number, params: {
 /** Export purchases results as CSV or XLSX (base64) */
 export async function exportPlanningResultPurchases(runId: number, params: {
   format: 'csv' | 'xlsx'
-  bucket_type?: 'daily' | 'weekly'
   date_from?: string
   date_to?: string
   sort_by?: 'item_name' | 'item_article' | 'qty' | 'need_date' | 'order_date' | 'bucket_date' | 'priority_index'
@@ -255,13 +249,12 @@ export async function exportPlanningResultPurchases(runId: number, params: {
 // === Backend-first grouped/agenda/summary API wrappers (additive) ===
 
 export async function getPlanningResultProductionGrouped(runId: number, params: {
-  bucket_type?: 'daily' | 'weekly'
   date_from?: string
   date_to?: string
   area_id?: number
   limit?: number
   offset?: number
-  sort_by?: 'item_name' | 'item_article' | 'qty' | 'need_date' | 'bucket_date' | 'priority_index'
+  sort_by?: 'item_name' | 'item_article' | 'qty' | 'need_date' | 'start_date' | 'priority_index'
   sort_dir?: 'asc' | 'desc'
 } = {}): Promise<{
   groups: Array<{
@@ -291,43 +284,8 @@ export async function getPlanningResultProductionGrouped(runId: number, params: 
   return data
 }
 
-export async function getPlanningResultProductionAgendaDay(runId: number, params: {
-  day_date: string
-  area_id?: number
-}): Promise<{
-  day: string
-  groups: Array<{
-    area_id: number
-    area_name: string
-    orders: Array<{
-      agg_key: string
-      item_id: number
-      item_name?: string
-      item_article?: string
-      unit?: string
-      qty: number      // выпуск за день по виду/участку (если нет перегруза)
-      norm_hours_total: number // часы за день (если нет перегруза)
-      norm_hours_per_unit?: number | null
-      // расширения для перегруза
-      order_id?: number
-      display_qty?: number
-      display_norm_hours_total?: number
-      overload?: boolean
-    }>
-    norm_sum_hours: number
-    sum_qty: number
-    cap_overload_hours?: number
-    // расширения по мощности на день
-    hours_available_day?: number
-    cap_overload_percent?: number | null
-  }>
-}> {
-  const { data } = await api.get(`/v1/plan/results/${runId}/production/agenda_day`, { params })
-  return data
-}
 
 export async function getPlanningResultPurchasesGrouped(runId: number, params: {
-  bucket_type?: 'daily' | 'weekly'
   date_from?: string
   date_to?: string
   limit?: number
@@ -350,7 +308,6 @@ export async function getPlanningResultPurchasesGrouped(runId: number, params: {
 }
 
 export async function getPlanningResultCapacitySummary(runId: number, params: {
-  bucket_type?: 'daily' | 'weekly'
   date_from?: string
   date_to?: string
 } = {}): Promise<{

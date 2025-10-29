@@ -42,6 +42,7 @@
             v-model="prod.filter"
             :loading="prod.loading"
             :title="`Результаты MRP от ${summary?.run?.started_at || '—'}`"
+            :show-day-picker="false"
             @apply="applyProdFiltersDebounced()"
             @reset="resetFilters"
           >
@@ -112,10 +113,8 @@
       <!-- Production -->
       <q-tab-panel name="production">
         <div class="row items-center q-gutter-sm q-mb-sm">
-          <q-select v-model="prod.filter.bucket_type" :options="bucketOptions" emit-value map-options dense outlined :label="t('mrp.filters.bucket')" style="width: 150px" />
           <q-input v-model="prod.filter.date_from" dense outlined :label="t('mrp.filters.fromDate')" style="width: 200px" />
           <q-input v-model="prod.filter.date_to" dense outlined :label="t('mrp.filters.toDate')" style="width: 200px" />
-          <q-btn dense color="primary" icon="search" @click="applyProdFilters()" />
           <q-space />
           <q-btn dense flat icon="refresh" @click="applyProdFilters()" />
         </div>
@@ -131,10 +130,8 @@
       <!-- Purchases -->
       <q-tab-panel name="purchases">
         <div class="row items-center q-gutter-sm q-mb-sm">
-          <q-select v-model="purch.filter.bucket_type" :options="bucketOptions" emit-value map-options dense outlined :label="t('mrp.filters.bucket')" style="width: 150px" />
           <q-input v-model="purch.filter.date_from" dense outlined :label="t('mrp.filters.fromDate')" style="width: 200px" />
           <q-input v-model="purch.filter.date_to" dense outlined :label="t('mrp.filters.toDate')" style="width: 200px" />
-          <q-btn dense color="primary" icon="search" @click="applyPurchFiltersDebounced()" />
           <q-space />
           <q-btn dense flat icon="refresh" @click="applyPurchFiltersDebounced()" />
         </div>
@@ -150,10 +147,8 @@
       <!-- Capacity -->
       <q-tab-panel name="capacity">
         <div class="row items-center q-gutter-sm q-mb-sm">
-          <q-select v-model="cap.filter.bucket_type" :options="bucketOptions" emit-value map-options dense outlined :label="t('mrp.filters.bucket')" style="width: 150px" />
           <q-input v-model="cap.filter.date_from" dense outlined :label="t('mrp.filters.fromDate')" style="width: 200px" />
           <q-input v-model="cap.filter.date_to" dense outlined :label="t('mrp.filters.toDate')" style="width: 200px" />
-          <q-btn dense color="primary" icon="search" @click="loadCapacity()" />
           <q-space />
           <q-btn dense flat icon="refresh" @click="loadCapacity()" />
         </div>
@@ -173,7 +168,6 @@
           <q-input v-model.number="peg.filter.parent_item_id" type="number" dense outlined :label="t('mrp.pegging.filters.parentItemId')" style="width: 160px" />
           <q-input v-model="peg.filter.date_from" dense outlined :label="t('mrp.filters.fromDate')" style="width: 200px" />
           <q-input v-model="peg.filter.date_to" dense outlined :label="t('mrp.filters.toDate')" style="width: 200px" />
-          <q-btn dense color="primary" icon="search" @click="loadPegging()" />
           <q-space />
           <q-btn dense flat icon="refresh" @click="loadPegging()" />
         </div>
@@ -276,7 +270,6 @@ import api, {
   exportPlanningResultProduction,
   exportPlanningResultPurchases,
   getPlanningResultProductionGrouped,
-  getPlanningResultProductionAgendaDay,
   getPlanningResultPurchasesGrouped,
   getPlanningResultCapacitySummary,
   getShortageReport
@@ -289,7 +282,6 @@ import MRPSummaryCard from '../components/mrp/MRPSummaryCard.vue'
 import ProductionFilters from '../components/mrp/ProductionFilters.vue'
 import ProductionUnifiedTable from '../components/mrp/ProductionUnifiedTable.vue'
 import PurchasesUnifiedTable from '../components/mrp/PurchasesUnifiedTable.vue'
-import ProductionDailyAgenda from '../components/mrp/ProductionDailyAgenda.vue'
 import ProductionGroupedTable from '../components/mrp/ProductionGroupedTable.vue'
 import CapacityTable from '../components/mrp/CapacityTable.vue'
 import PeggingTable from '../components/mrp/PeggingTable.vue'
@@ -431,9 +423,6 @@ const kindIssuesRows = computed(() => {
 })
 
 // Popup флаг для выбора даты «День задания»
-const showDayPopup = ref(false)
-// Меню выбора даты (QMenu)
-const showDayMenu = ref(false)
 
  // --- Справочники (объявлены выше) ---
  
@@ -483,75 +472,6 @@ const purchAggRows = computed(() => {
   return purchGroupedRows.value || []
 })
 
-// --- Ежедневная повестка по участкам (задание на день) ---
-const dailyAgendaGroups = ref<any[]>([])
-
-async function rebuildDailyAgendaForDay() {
-  try {
-    const day = (prod.filter.day_date || '').slice(0, 10)
-    if (!day) {
-      dailyAgendaGroups.value = []
-      return
-    }
-    const resp = await getPlanningResultProductionAgendaDay(runId, {
-      day_date: day
-    })
-    dailyAgendaGroups.value = (resp?.groups || []).map((g: any) => {
-      const mappedOrders = (g.orders || []).map((o: any) => ({
-        agg_key: String(o.agg_key ?? `${o.item_id}|${o.unit || ''}`),
-        order_id: o.order_id != null ? Number(o.order_id) : undefined,
-        item_id: Number(o.item_id),
-        item_name: o.item_name ?? (itemMap.value?.[o.item_id]?.item_name ?? t('mrp.placeholder.itemNameFallback', { id: o.item_id })),
-        item_article: o.item_article ?? (itemMap.value?.[o.item_id]?.item_article ?? t('mrp.placeholder.noArticle')),
-        unit: o.unit ?? null,
-        // оригинальные "на день"
-        qty: Number(o.qty ?? 0),
-        norm_hours_total: Number(o.norm_hours_total ?? 0),
-        norm_hours_per_unit: o.norm_hours_per_unit != null ? Number(o.norm_hours_per_unit) : null,
-        // расширения для перегруза
-        display_qty: o.display_qty != null ? Number(o.display_qty) : undefined,
-        display_norm_hours_total: o.display_norm_hours_total != null ? Number(o.display_norm_hours_total) : undefined,
-        overload: Boolean(o.overload)
-      }))
-      // Дедупликация по agg_key: отдаём приоритет перегруженным и с display_*
-      const dedupMap: { [key: string]: any } = {}
-      const score = (x: any) =>
-        (x.overload ? 10 : 0) +
-        ((x.display_qty != null || x.display_norm_hours_total != null) ? 5 : 0) +
-        ((Number(x.display_qty ?? x.qty) > 0) ? 1 : 0) +
-        ((Number(x.display_norm_hours_total ?? x.norm_hours_total) > 0) ? 1 : 0)
-      for (const ord of mappedOrders) {
-        const k = ord.agg_key
-        const cur = dedupMap[k]
-        if (!cur) {
-          dedupMap[k] = ord
-        } else if (score(ord) > score(cur)) {
-          dedupMap[k] = ord
-        } else {
-          // мягкое слияние полезных полей
-          if (cur.display_qty == null && ord.display_qty != null) cur.display_qty = ord.display_qty
-          if (cur.display_norm_hours_total == null && ord.display_norm_hours_total != null) cur.display_norm_hours_total = ord.display_norm_hours_total
-          cur.overload = Boolean(cur.overload || ord.overload)
-        }
-      }
-      const dedupedOrders = Object.values(dedupMap)
-      return {
-        area_id: g.area_id,
-        area_name: g.area_name,
-        orders: dedupedOrders,
-        norm_sum_hours: Number(g.norm_sum_hours || 0),
-        sum_qty: Number(g.sum_qty || 0),
-        cap_overload_hours: Number(g.cap_overload_hours || 0),
-        // новые поля шапки для процента перегруза
-        hours_available_day: g.hours_available_day != null ? Number(g.hours_available_day) : undefined,
-        cap_overload_percent: g.cap_overload_percent != null ? Number(g.cap_overload_percent) : null
-      }
-    })
-  } catch (e) {
-    console.error('Failed to load daily agenda', e)
-    dailyAgendaGroups.value = []
-  }
-}
 
 async function rebuildGroupedProductionOrders() {
   try {
@@ -562,7 +482,6 @@ async function rebuildGroupedProductionOrders() {
     
     // Если даты одинаковы, убедимся, что бэкенд получает корректные параметры
     const params = {
-      bucket_type: prod.filter.bucket_type,
       date_from: dateFrom,
       date_to: dateTo,
       limit: 1000,
@@ -680,13 +599,13 @@ const bucketOptions = computed(() => ([
 const prod = reactive<{
   rows: ProductionOrder[]
   loading: boolean
-  filter: { bucket_type: 'daily' | 'weekly' | undefined; day_date: string; date_from: string; date_to: string }
+  filter: { date_from: string; date_to: string }
   pagination: { page: number; rowsPerPage: number; rowsNumber: number }
   columns: QTableColumn<ProductionOrder>[]
 }>({
   rows: [] as ProductionOrder[],
   loading: false,
-  filter: { bucket_type: undefined, day_date: '', date_from: '', date_to: '' },
+  filter: { date_from: '', date_to: '' },
   pagination: { page: 1, rowsPerPage: 20, rowsNumber: 0 },
   columns: prodColumns
 })
@@ -695,13 +614,13 @@ const prod = reactive<{
 const purch = reactive<{
   rows: PurchaseRow[]
   loading: boolean
-  filter: { bucket_type: 'daily' | 'weekly' | undefined; date_from: string; date_to: string }
+  filter: { date_from: string; date_to: string }
   pagination: { page: number; rowsPerPage: number; rowsNumber: number }
   columns: QTableColumn<PurchaseRow>[]
 }>({
   rows: [] as PurchaseRow[],
   loading: false,
-  filter: { bucket_type: undefined, date_from: '', date_to: '' },
+  filter: { date_from: '', date_to: '' },
   pagination: { page: 1, rowsPerPage: 20, rowsNumber: 0 },
   columns: purchColumns
 })
@@ -710,13 +629,13 @@ const purch = reactive<{
 const cap = reactive<{
   rows: CapacityRow[]
   loading: boolean
-  filter: { bucket_type: 'daily' | 'weekly' | undefined; date_from: string; date_to: string }
+  filter: { date_from: string; date_to: string }
   pagination: { page: number; rowsPerPage: number; rowsNumber: number }
   columns: QTableColumn<CapacityRow>[]
 }>({
   rows: [] as CapacityRow[],
   loading: false,
-  filter: { bucket_type: undefined, date_from: '', date_to: '' },
+  filter: { date_from: '', date_to: '' },
   pagination: { page: 1, rowsPerPage: 30, rowsNumber: 0 },
   columns: capColumns
 })
@@ -771,14 +690,12 @@ async function loadProduction() {
     const dateTo = emptyToUndef(prod.filter.date_to)
     
     console.log('loadProduction called with filters:', {
-      bucket_type: prod.filter.bucket_type,
       date_from: dateFrom,
       date_to: dateTo,
       runId: runId
     });
     
     const resp = await getPlanningResultProduction(runId, {
-      bucket_type: prod.filter.bucket_type,
       date_from: dateFrom,
       date_to: dateTo,
       sort_by: 'item_name' as const,
@@ -802,8 +719,6 @@ async function loadProduction() {
     // Индикаторы capacity для верхнего агрегата (по текущим фильтрам)
     await loadCapacityUpper()
     // Ежедневная повестка + мощность за конкретный день (если выбран)
-    rebuildDailyAgendaForDay()
-    await loadCapacityUpperDay()
  } catch (e) {
      console.error('Failed to load production', e)
      // В случае ошибки очищаем данные
@@ -822,7 +737,6 @@ async function loadPurchases() {
     const offset = (purch.pagination.page - 1) * purch.pagination.rowsPerPage
     const [resp, grouped] = await Promise.all([
       getPlanningResultPurchases(runId, {
-        bucket_type: purch.filter.bucket_type,
         date_from: emptyToUndef(purch.filter.date_from),
         date_to: emptyToUndef(purch.filter.date_to),
         sort_by: 'item_name',
@@ -830,7 +744,6 @@ async function loadPurchases() {
         limit, offset
       }),
       getPlanningResultPurchasesGrouped(runId, {
-        bucket_type: purch.filter.bucket_type,
         date_from: emptyToUndef(purch.filter.date_from),
         date_to: emptyToUndef(purch.filter.date_to),
         limit: 1000,
@@ -884,17 +797,12 @@ function downloadBase64Xlsx(b64: string, filename: string) {
 
 async function exportProd(fmt: 'csv' | 'xlsx') {
   try {
-    const hasDay = !!prod.filter.day_date
-    const params: any = { format: fmt }
-    if (hasDay) {
-      params.day_date = String(prod.filter.day_date).slice(0, 10)
-      // Для day_date backend формирует отчет по «повестке дня» (stages), date_from/date_to не передаем
-    } else {
-      params.bucket_type = prod.filter.bucket_type
-      params.date_from = emptyToUndef(prod.filter.date_from)
-      params.date_to = emptyToUndef(prod.filter.date_to)
-      params.sort_by = 'need_date'
-      params.sort_dir = 'asc'
+    const params: any = {
+      format: fmt,
+      date_from: emptyToUndef(prod.filter.date_from),
+      date_to: emptyToUndef(prod.filter.date_to),
+      sort_by: 'need_date',
+      sort_dir: 'asc'
     }
     const res = await exportPlanningResultProduction(runId, params)
     if (fmt === 'csv') {
@@ -911,7 +819,6 @@ async function exportPurch(fmt: 'csv' | 'xlsx') {
   try {
     const res = await exportPlanningResultPurchases(runId, {
       format: fmt,
-      bucket_type: purch.filter.bucket_type,
       date_from: emptyToUndef(purch.filter.date_from),
       date_to: emptyToUndef(purch.filter.date_to),
       sort_by: 'item_name',
@@ -956,7 +863,6 @@ async function loadCapacity() {
     const limit = cap.pagination.rowsPerPage
     const offset = (cap.pagination.page - 1) * cap.pagination.rowsPerPage
     const resp = await getPlanningResultCapacity(runId, {
-      bucket_type: cap.filter.bucket_type,
       date_from: emptyToUndef(cap.filter.date_from),
       date_to: emptyToUndef(cap.filter.date_to),
       limit, offset
@@ -977,7 +883,6 @@ const capUpper = ref<{ [areaId: number]: { overload_hours: number; hours_planned
 async function loadCapacityUpper() {
   try {
     const resp = await getPlanningResultCapacitySummary(runId, {
-      bucket_type: prod.filter.bucket_type,
       date_from: emptyToUndef(prod.filter.date_from),
       date_to: emptyToUndef(prod.filter.date_to)
     })
@@ -1002,83 +907,19 @@ async function loadCapacityUpper() {
 }
 
 // Capacity для выбранного дня (daily)
-const dayCapUpper = ref<{ [areaId: number]: { overload_hours: number } }>({})
-
-async function loadCapacityUpperDay() {
-  try {
-    const day = (prod.filter.day_date || '').slice(0, 10)
-    if (!day) {
-      dayCapUpper.value = {}
-      return
-    }
-    const resp = await getPlanningResultCapacitySummary(runId, {
-      bucket_type: 'daily',
-      date_from: day,
-      date_to: day
-    })
-    const map: { [k: number]: { overload_hours: number } } = {}
-    const m = (resp?.map || {}) as any
-    for (const k of Object.keys(m)) {
-      const aid = Number(k)
-      const v = m[k] || {}
-      map[aid] = { overload_hours: Number(v.overload_hours || 0) }
-    }
-    dayCapUpper.value = map
-  } catch (e) {
-    console.error('Failed to load capacity for selected day', e)
-  }
-}
  
-// Применить день «повестки» без изменения серверных фильтров
-function applyDayFilter() {
-  const day = (prod.filter.day_date || '').slice(0, 10)
-  if (!day) return
-  // Не навязываем bucket_type/date_* — дневную повестку считаем локально по stages (prodAllRows)
-  rebuildDailyAgendaForDay()
-  loadCapacityUpperDay()
-}
 
 // Сброс фильтров (день, бакет, даты) и перезагрузка данных
 function resetFilters() {
   // Очистка фильтров
-  prod.filter.bucket_type = undefined as any
   prod.filter.date_from = ''
   prod.filter.date_to = ''
-  prod.filter.day_date = ''
-  // Очистка агрегатов/индикаторов дня
-  dailyAgendaGroups.value = []
-  dayCapUpper.value = {}
   // Перезагрузка наборов
   loadProduction()
   loadPurchases()
   loadCapacityUpper()
 }
 
-// Открыть попап выбора даты
-function openDayPicker(e?: Event) {
-  try {
-    showDayPopup.value = true
-  } catch {}
-}
-
-// Обработка выбора даты в календаре
-function onDayPicked(val: string) {
-  try {
-    // val уже в маске YYYY-MM-DD
-    const newDay = (val || '').slice(0, 10);
-    // Проверяем, изменилось ли значение, чтобы избежать лишнего срабатывания
-    if (prod.filter.day_date !== newDay) {
-      prod.filter.day_date = newDay;
-      // Применяем фильтр на день (debounce)
-      applyDayFilterDebounced();
-    }
-    // Закрываем попап/меню
-    showDayPopup.value = false;
-    showDayMenu.value = false;
-  } catch {
-    // no-op
-  }
-}
 
 async function loadPegging() {
   peg.loading = true
@@ -1147,7 +988,6 @@ function onPurchRequest(ctx: any) {
   loadPurchases()
 }
 function onPurchReset() {
-  purch.filter.bucket_type = undefined as any
   purch.filter.date_from = ''
   purch.filter.date_to = ''
   loadPurchases()
@@ -1179,22 +1019,18 @@ function debounce<T extends (...args: any[]) => any>(fn: T, ms = 250) {
 function collectFilterParams() {
   // Собираем параметры для production фильтров
   const prodParams = {
-    bucket_type: prod.filter.bucket_type,
     date_from: emptyToUndef(prod.filter.date_from),
     date_to: emptyToUndef(prod.filter.date_to),
-    day_date: emptyToUndef(prod.filter.day_date)
   }
   
   // Собираем параметры для purchases фильтров
   const purchParams = {
-    bucket_type: purch.filter.bucket_type,
     date_from: emptyToUndef(purch.filter.date_from),
     date_to: emptyToUndef(purch.filter.date_to)
   }
   
   // Собираем параметры для capacity фильтров
  const capParams = {
-    bucket_type: cap.filter.bucket_type,
     date_from: emptyToUndef(cap.filter.date_from),
     date_to: emptyToUndef(cap.filter.date_to)
   }
@@ -1222,26 +1058,15 @@ const applyProdFilters = async () => {
   
   // Перед загрузкой данных убедимся, что фильтры корректны
   // Если даты одинаковы, это однодневный диапазон
- if (prodFilters.date_from && prodFilters.date_to && prodFilters.date_from === prodFilters.date_to) {
-    // Для однодневного диапазона дополнительно сбрасываем тип бакета, если он не указан
-    if (!prodFilters.bucket_type) {
-      prodFilters.bucket_type = 'daily' // по умолчанию используем daily для однодневного диапазона
-    }
- }
   
   // Добавляем отладочную информацию
   console.log('applyProdFilters called with filters:', prodFilters);
   
   // Обновляем фильтры в prod.filter для согласованности
-  prod.filter.bucket_type = prodFilters.bucket_type;
   prod.filter.date_from = prodFilters.date_from || '';
   prod.filter.date_to = prodFilters.date_to || '';
-  prod.filter.day_date = prodFilters.day_date || '';
-  
   await loadProduction()
   await loadCapacityUpper()
-  rebuildDailyAgendaForDay()
-  await loadCapacityUpperDay()
 }
 
 const applyProdFiltersDebounced = debounce(applyProdFilters, 250)
@@ -1253,7 +1078,6 @@ function debugProdFilters() {
   console.log('Production all rows count:', prodAllRows.value.length);
 }
 const applyPurchFiltersDebounced = debounce(loadPurchases, 250)
-const applyDayFilterDebounced = debounce(applyDayFilter, 250)
 const loadCapacityUpperDebounced = debounce(loadCapacityUpper, 250)
 
 onMounted(async () => {
@@ -1271,8 +1095,6 @@ onMounted(async () => {
     await fillMissingDictionariesFromRows()
     // Теперь, когда все данные загружены, вызываем агрегаты
     rebuildGroupedProductionOrders()
-    rebuildDailyAgendaForDay()
-    await loadCapacityUpperDay()
     console.log('MRP onMounted', {
       grouped: (groupedProductionOrders as any)?.value?.length ?? 0,
       prodRows: (prod.rows || []).length,
@@ -1306,7 +1128,7 @@ watch(viewTab, (vt) => {
 })
 
 // Актуализируем индикаторы перегруза при изменении фильтров верхней вкладки «Производство»
-watch([() => prod.filter.bucket_type, () => prod.filter.date_from, () => prod.filter.date_to], () => {
+watch([() => prod.filter.date_from, () => prod.filter.date_to], () => {
   loadCapacityUpperDebounced()
 })
 </script>

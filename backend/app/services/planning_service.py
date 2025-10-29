@@ -65,6 +65,10 @@ DEFAULT_PLANNING_CONFIG: Dict[str, Any] = {
     "toggles": {"include_wip": False, "enable_weekly_route_detail": False},
 }
 
+# Pagination constants
+SERVER_MAX_LIMIT = 1000
+DEFAULT_PAGE_LIMIT = 50
+
 
 def _ensure_dict(raw: Any) -> Dict[str, Any]:
     """
@@ -437,9 +441,10 @@ def get_run_production(
         po, in_name, in_article, in_unit_guid, in_unit_short, in_unit_name, in_unit_code = row
         order_ids.append(int(po.order_id))
         
-        # Ключ агрегации: item_id, unit (без start_date для предотвращения дублирования)
+        # Ключ агрегации: item_id, start_date, unit. Единый ключ для всего конвейера.
+        start_iso = po.start_date.isoformat() if po.start_date else ""
         unit_display = in_unit_short or in_unit_name or in_unit_code or in_unit_guid
-        agg_key = (int(po.item_id), unit_display or "")
+        agg_key = (int(po.item_id), start_iso, unit_display or "")
         
         if agg_key not in aggregated_data:
             aggregated_data[agg_key] = {
@@ -593,16 +598,26 @@ def get_run_production(
     total_qty_val = float(sum(item.get("qty", 0.0) for item in final_data))
 
     # Применение пагинации
-    start_idx = max(0, int(offset))
-    end_idx = start_idx + max(1, min(int(limit or 10), 10))
+    req_limit = int(limit or DEFAULT_PAGE_LIMIT)
+    if req_limit > SERVER_MAX_LIMIT:
+        logger.debug(
+            "get_run_production limit clamped: requested=%s, max=%s",
+            req_limit,
+            SERVER_MAX_LIMIT,
+        )
+    effective_limit = max(1, min(req_limit, SERVER_MAX_LIMIT))
+    effective_offset = max(0, int(offset or 0))
+
+    start_idx = effective_offset
+    end_idx = start_idx + effective_limit
     paginated_data = final_data[start_idx:end_idx]
 
     return {
         "rows": paginated_data,
         "total": int(total),
         "total_qty": float(total_qty_val),
-        "limit": int(limit),
-        "offset": int(offset),
+        "limit": int(effective_limit),
+        "offset": int(effective_offset),
     }
 
 
@@ -720,16 +735,26 @@ def get_run_purchases(
     total_qty_val = float(sum(item.get("qty", 0.0) for item in data))
 
     # Применение пагинации
-    start_idx = max(0, int(offset))
-    end_idx = start_idx + max(1, min(int(limit or 10), 10))
+    req_limit = int(limit or DEFAULT_PAGE_LIMIT)
+    if req_limit > SERVER_MAX_LIMIT:
+        logger.debug(
+            "get_run_purchases limit clamped: requested=%s, max=%s",
+            req_limit,
+            SERVER_MAX_LIMIT,
+        )
+    effective_limit = max(1, min(req_limit, SERVER_MAX_LIMIT))
+    effective_offset = max(0, int(offset or 0))
+
+    start_idx = effective_offset
+    end_idx = start_idx + effective_limit
     paginated_data = data[start_idx:end_idx]
 
     return {
         "rows": paginated_data,
         "total": int(total),
         "total_qty": float(total_qty_val),
-        "limit": int(limit),
-        "offset": int(offset),
+        "limit": int(effective_limit),
+        "offset": int(effective_offset),
     }
 
 
@@ -4582,7 +4607,7 @@ def generate_shortage_report(db: Session, run_id: int) -> Dict[str, Any]:
         return {"status": "ok", "message": "No valid shortage items found.", "total_rows": 0}
 
     items = db.query(Item).filter(Item.item_id.in_(item_ids)).all()
-    item_map = {i.item_id: i for in items}
+    item_map = {i.item_id: i for i in items}
 
     # --- XLSX Generation ---
     wb = Workbook()

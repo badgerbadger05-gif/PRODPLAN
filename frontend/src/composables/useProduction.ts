@@ -10,7 +10,6 @@ import { Notify } from 'quasar'
 import {
   getPlanningResultProduction,
   getPlanningResultProductionGrouped,
-  getPlanningResultProductionAgendaDay,
   exportPlanningResultProduction
 } from '../services/api'
 import { useDictionaries } from './useDictionaries'
@@ -36,7 +35,6 @@ export function useProduction(runId: number) {
 
   // Фильтры
   const filters = ref<ProductionFilters>({
-    bucket_type: undefined,
     date_from: undefined,
     date_to: undefined
   })
@@ -51,11 +49,8 @@ export function useProduction(runId: number) {
   // Состояние
   const rows = ref<ProductionOrder[]>([])
   const grouped = ref<ProductionGroup[]>([])
-  const agendaGroups = ref<ProductionAgendaGroup[]>([])
-
   const loadingPage = ref(false)
   const loadingGrouped = ref(false)
-  const loadingAgenda = ref(false)
   const exporting = ref(false)
 
   // Денормализация по справочнику (название/артикул) + безопасные вычисления
@@ -97,7 +92,6 @@ export function useProduction(runId: number) {
       const limit = pagination.rowsPerPage
       const offset = (pagination.page - 1) * pagination.rowsPerPage
       const resp = await getPlanningResultProduction(runId, {
-        bucket_type: filters.value.bucket_type,
         date_from: emptyToUndef(filters.value.date_from),
         date_to: emptyToUndef(filters.value.date_to),
         sort_by: 'item_name',
@@ -131,7 +125,6 @@ export function useProduction(runId: number) {
     loadingGrouped.value = true
     try {
       const resp = await getPlanningResultProductionGrouped(runId, {
-        bucket_type: filters.value.bucket_type,
         date_from: emptyToUndef(filters.value.date_from),
         date_to: emptyToUndef(filters.value.date_to),
         limit: 1000,
@@ -166,46 +159,6 @@ export function useProduction(runId: number) {
       grouped.value = []
     } finally {
       loadingGrouped.value = false
-    }
-  }
-// «Повестка дня» (daily) по видам/участкам
-async function loadAgendaDay() {
-  loadingAgenda.value = true
-  try {
-    const day = (filters.value.date_from || '')?.slice(0, 10)
-    if (!day) {
-      agendaGroups.value = []
-      return
-    }
-    // Используем date_from как день для повестки, так как бэкенд теперь фильтрует по start_date
-    const resp = await getPlanningResultProductionAgendaDay(runId, { day_date: day })
-    agendaGroups.value = (resp?.groups || []).map(g => ({
-
-        area_id: Number(g.area_id),
-        area_name: String(g.area_name ?? ''),
-        orders: (g.orders || []).map(o => ({
-          agg_key: String(o.agg_key ?? `${o.item_id}|${o.unit || ''}`),
-          item_id: Number(o.item_id),
-          item_name: o.item_name ?? (itemMap.value[o.item_id]?.item_name ?? `Номенклатура #${o.item_id}`),
-          item_article: o.item_article ?? (itemMap.value[o.item_id]?.item_article ?? ''),
-          unit: o.unit ?? null,
-          qty: Number(o.qty ?? 0),
-          norm_hours_total: Number(o.norm_hours_total ?? 0),
-          norm_hours_per_unit: o.norm_hours_per_unit != null ? Number(o.norm_hours_per_unit) : null
-        })),
-        norm_sum_hours: Number(g.norm_sum_hours ?? 0),
-        sum_qty: Number(g.sum_qty ?? 0),
-        cap_overload_hours: Number(g.cap_overload_hours ?? 0)
-      }))
-    } catch (e: any) {
-      Notify.create({
-        type: 'negative',
-        message: 'Ошибка загрузки повестки дня',
-        caption: e?.message || String(e)
-      })
-      agendaGroups.value = []
-    } finally {
-      loadingAgenda.value = false
     }
   }
 
@@ -244,7 +197,6 @@ async function loadAgendaDay() {
       const params: any = { format: fmt }
       
       // Для экспорта всегда используем date_from и date_to, так как day_date больше не используется
-      params.bucket_type = filters.value.bucket_type
       params.date_from = emptyToUndef(filters.value.date_from)
       params.date_to = emptyToUndef(filters.value.date_to)
       params.sort_by = 'need_date'
@@ -268,7 +220,6 @@ async function loadAgendaDay() {
   }
 
   function resetFilters() {
-    filters.value.bucket_type = undefined
     filters.value.date_from = undefined
     filters.value.date_to = undefined
   }
@@ -283,15 +234,12 @@ async function loadAgendaDay() {
     pagination,
     rows,
     grouped,
-    agendaGroups,
     loadingPage,
     loadingGrouped,
-    loadingAgenda,
     exporting,
     // actions
     loadPage,
     loadGrouped,
-    loadAgendaDay,
     exportProd,
     resetFilters,
     setFilters,

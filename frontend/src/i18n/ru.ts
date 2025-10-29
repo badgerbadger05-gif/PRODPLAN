@@ -68,14 +68,7 @@ export const ru = {
       capOverloadHours: 'Перегруз',
       urgencyDays: 'Срочн.'
     },
-    agenda: {
-      positionsCountDay: 'Позиции (на день)',
-      normDayHours: 'Норматив (за день)',
-      qtyDay: 'Выпуск (за день)'
-    },
     filters: {
-      bucket: 'Бакет',
-      dayDate: 'День задания (YYYY-MM-DD)',
       fromDate: 'От даты (YYYY-MM-DD)',
       toDate: 'До даты (YYYY-MM-DD)',
       apply: 'Применить',

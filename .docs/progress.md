@@ -1471,3 +1471,283 @@ ToDo (Шаг 2 — перенос строк в i18n по карте)
 - Все неотслеживаемые локальные изменения в рабочей директории были отменены с помощью `git restore .`.
 - Локальный репозиторий был синхронизирован с веткой `main` удаленного репозитория GitHub с помощью `git pull origin main`.
 - Проект приведен в соответствие с последней версией в системе контроля версий.
+
+## 2025-10-28 — Исправление фильтрации и интерфейса на странице результатов MRP
+
+Статус: выполнено.
+
+### Проблема
+- При фильтрации по узкому диапазону дат (например, один день) на странице результатов MRP таблица обновлялась, но при попытке посмотреть детали (клик на "лупу") появлялось сообщение "no data available".
+- На странице присутствовали дублирующие кнопки "лупа" и "обновить".
+
+### Корневая причина
+- **Ошибка фильтрации**: фронтенд принудительно устанавливал `bucket_type: 'daily'` для однодневных диапазонов. Если в этот день не было заказов с дневным бакетом (а были только с недельным), бэкенд возвращал пустой результат.
+- **Дублирование UI**: кнопки "лупа" и "обновить" выполняли одно и то же действие.
+
+### Выполненные изменения
+
+1.  **Исправление логики фильтрации**:
+    *   **Бэкенд**: обнаружена и исправлена синтаксическая ошибка (`for in` вместо `for i in`) в `backend/app/services/planning_service.py`, которая приводила к падению сервера при запуске. После исправления сервер был успешно перезапущен.
+    *   **Фронтенд**: полностью удалена логика, принудительно устанавливающая `bucket_type`. Фильтрация теперь основывается исключительно на `start_date` и `finish_date` заказов, как и требовалось.
+
+2.  **Упрощение интерфейса**:
+    *   Удалена кнопка "лупа" (`icon="search"`) из компонента `ProductionFilters.vue` и со всех вкладок детального просмотра на странице `MRPResultPage.vue`.
+    *   Убран селектор `bucket_type` из `ProductionFilters.vue` и со всех вкладок на `MRPResultPage.vue`.
+
+3.  **Рефакторинг кода**:
+    *   `bucket_type` удален из интерфейсов фильтров в `frontend/src/types/mrp.ts`.
+    *   `bucket_type` удален из сигнатур функций в `frontend/src/services/api.ts`.
+    *   Убрано использование `bucket_type` в `frontend/src/composables/useProduction.ts` и `frontend/src/pages/MRPResultPage.vue`.
+
+### Затронутые файлы
+- `backend/app/services/planning_service.py`
+- `frontend/src/pages/MRPResultPage.vue`
+- `frontend/src/components/mrp/ProductionFilters.vue`
+- `frontend/src/types/mrp.ts`
+- `frontend/src/services/api.ts`
+- `frontend/src/composables/useProduction.ts`
+
+### Результат
+- Исходная проблема с "no data available" решена.
+- Интерфейс упрощен, дублирующие элементы управления удалены.
+- Кодовая база фронтенда очищена от неиспользуемой логики `bucket_type`.
+
+## i18n cleanup cycle — 2025-10-28
+
+### Context summary
+
+- **Терминология:** «Бакет» (`bucket`) представлял собой временной интервал (день/неделя) для группировки потребностей в MRP. Понятие `bucket_type` определяло тип этого интервала.
+- **Устаревание:** Согласно записям в `[.docs/progress.md](.docs/progress.md)` от 2025-10-22 и 2025-10-28, система фильтрации была полностью переведена с `bucket_date` на `start_date` заказа. Функциональность `day_date` и `agenda_day` ("Задание на день") была удалена. Селектор `bucket_type` был убран из UI, что делает связанные с ним ключи переводов основными кандидатами на удаление.
+- **Практики i18n:** Файл `[frontend/src/i18n/ru.ts](frontend/src/i18n/ru.ts)` является центральным словарем для русского языка. План рефакторинга от 2025-10-07 описывает структуру ключей (например, `mrp.filters.*`).
+- **Риски и зависимости:** Ключи могут использоваться динамически, хотя в контексте `bucket_type` это маловероятно, так как он представлял собой статичный выбор. Основной риск — неполный поиск использований по кодовой базе.
+
+### Scope and constraints
+
+Текущий шаг — это исключительно анализ и документирование плана. Никакие изменения в код, кроме добавления этой секции в `[.docs/progress.md](.docs/progress.md)`, не производятся. Цель — подготовить и согласовать методику очистки неиспользуемых ключей переводов.
+
+### Detection plan
+
+Критерием «неиспользуемости» ключа является отсутствие его статических вызовов во всей кодовой базе проекта.
+
+1.  **Поиск использований ключей i18n:**
+    Ключи переводов используются через стандартные конструкции `vue-i18n`. Поиск будет производиться по следующим паттернам:
+    - `$t('...')`
+    - `i18n.t('...')`
+    - `useI18n().t('...')` или `t('...')` в `<script setup>`
+    - `this.$t('...')` в Options API компонентах
+
+2.  **Поиск строкового токена "bucket_type":**
+    Будет выполнен дополнительный поиск по всему репозиторию строки `"bucket_type"` для выявления остаточных использований в виде строковых литералов, комментариев или в конфигурационных файлах, которые могли быть пропущены при рефакторинге.
+
+3.  **Стратегия пометки ключей:**
+    - **Кандидат на удаление:** Ключ, для которого статический поиск по паттернам из п.1 не дал результатов.
+    - **Требует ручной проверки:** Ключ, который является частью динамической конструкции (например, конкатенация: `$t('prefix.' + variable)`). В данном цикле очистки, связанном с `bucket_type`, такие случаи маловероятны.
+
+4.  **Отчетность:**
+    По результатам поиска будет сформирован список ключей-кандидатов на удаление из файла `[frontend/src/i18n/ru.ts](frontend/src/i18n/ru.ts)`. Для каждого ключа будет предоставлено «доказательство» — подтверждение отсутствия его вызовов в коде.
+
+### Next steps checklist
+
+- [ ] Инвентаризация ключей в `[frontend/src/i18n/ru.ts](frontend/src/i18n/ru.ts)`, связанных с `bucket`.
+- [ ] Выполнение статического поиска по кодовой базе для каждого ключа-кандидата.
+- [ ] Выполнение поиска по строке `"bucket_type"` для обнаружения «остатков».
+- [ ] Формирование итогового списка ключей на удаление с обоснованием.
+- [ ] Согласование списка с командой.
+- [ ] Физическое удаление ключей из `[frontend/src/i18n/ru.ts](frontend/src/i18n/ru.ts)`.
+- [ ] Финальная проверка и закрытие задачи.
+
+### Inventory and static usage scan — 2025-10-28
+
+Цель: инвентаризация i18n‑ключей «бакетов» в [frontend/src/i18n/ru.ts](frontend/src/i18n/ru.ts:1) и статический поиск их использования по коду (frontend/src и backend/), включая строковый токен "bucket_type" и производные.
+
+#### Extracted bucket keys
+Листовые ключи, чьи пути содержат маркеры bucket/buckets/bucket_type/bucketType/bucketTypes (регистронезависимо). Указаны краткие значения и исходные строки.
+
+- mrp.summary.overloadedBuckets — "Перегруженные бакеты" • источник: [frontend/src/i18n/ru.ts](frontend/src/i18n/ru.ts:31)
+- mrp.columns.bucketType — "Бакет" • источник: [frontend/src/i18n/ru.ts](frontend/src/i18n/ru.ts:53)
+- mrp.columns.bucketDate — "Дата бакета" • источник: [frontend/src/i18n/ru.ts](frontend/src/i18n/ru.ts:54)
+- mrp.filters.bucket — "Бакет" • источник: [frontend/src/i18n/ru.ts](frontend/src/i18n/ru.ts:77)
+- mrp.filters.bucketOption.any — "Любой" • источник: [frontend/src/i18n/ru.ts](frontend/src/i18n/ru.ts:84)
+- mrp.filters.bucketOption.daily — "daily" • источник: [frontend/src/i18n/ru.ts](frontend/src/i18n/ru.ts:85)
+- mrp.filters.bucketOption.weekly — "weekly" • источник: [frontend/src/i18n/ru.ts](frontend/src/i18n/ru.ts:86)
+
+Примечание: структура mrp.filters.bucketOption раскрыта до листовых ключей any/daily/weekly.
+
+#### Usage findings
+Подсводка по каждому ключу: число прямых обращений через $t/t/i18n.t, места использования и возможные динамические паттерны.
+
+- mrp.summary.overloadedBuckets
+  - Прямые: 1
+    - [frontend/src/components/mrp/MRPSummaryCard.vue](frontend/src/components/mrp/MRPSummaryCard.vue:60)
+  - Динамические: не обнаружено
+
+- mrp.columns.bucketType
+  - Прямые: 3
+    - [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:320)
+    - [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:347)
+    - [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:354)
+  - Динамические: не обнаружено
+
+- mrp.columns.bucketDate
+  - Прямые: 3
+    - [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:321)
+    - [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:348)
+    - [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:355)
+  - Динамические: не обнаружено
+
+- mrp.filters.bucket
+  - Прямые: 0
+    - Поиск: $t('mrp.filters.bucket') — совпадений не найдено (см. фронтенд)
+  - Динамические: не обнаружено
+
+- mrp.filters.bucketOption.any
+  - Прямые: 2
+    - [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:666)
+    - [frontend/src/components/mrp/ProductionFilters.vue](frontend/src/components/mrp/ProductionFilters.vue:88)
+  - Динамические: не обнаружено
+
+- mrp.filters.bucketOption.daily
+  - Прямые: 2
+    - [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:667)
+    - [frontend/src/components/mrp/ProductionFilters.vue](frontend/src/components/mrp/ProductionFilters.vue:89)
+  - Динамические: не обнаружено
+
+- mrp.filters.bucketOption.weekly
+  - Прямые: 2
+    - [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:668)
+    - [frontend/src/components/mrp/ProductionFilters.vue](frontend/src/components/mrp/ProductionFilters.vue:90)
+  - Динамические: не обнаружено
+
+Итог по динамике: Поиск конкатенаций/шаблонов вида t(\`…\${…}\`) и t('…' + …) в frontend/src совпадений не дал.
+
+#### bucket_type occurrences
+Список ключевых вхождений "bucket_type" и производных ("bucket_date", а также упоминания колонок bucket в UI). Комментарий — назначение контекста.
+
+Frontend (src):
+- [frontend/src/types/mrp.ts](frontend/src/types/mrp.ts:56) • Поля моделей: bucket_type?: BucketType | null
+- [frontend/src/types/mrp.ts](frontend/src/types/mrp.ts:71) • Поля моделей: bucket_type?: BucketType | null
+- [frontend/src/types/mrp.ts](frontend/src/types/mrp.ts:127) • Поля моделей: bucket_type?: BucketType | null
+- [frontend/src/types/mrp.ts](frontend/src/types/mrp.ts:147) • Поля моделей: bucket_type?: BucketType | null
+- [frontend/src/composables/useCapacity.ts](frontend/src/composables/useCapacity.ts:31) • Фильтры/запросы API: bucket_type в параметрах
+- [frontend/src/composables/useCapacity.ts](frontend/src/composables/useCapacity.ts:59) • Прокидка bucket_type в API-вызов
+- [frontend/src/composables/usePurchases.ts](frontend/src/composables/usePurchases.ts:36) • Фильтры/запросы API: bucket_type в параметрах
+- [frontend/src/composables/usePurchases.ts](frontend/src/composables/usePurchases.ts:85) • Прокидка bucket_type в API-вызов
+- [frontend/src/composables/usePurchases.ts](frontend/src/composables/usePurchases.ts:119) • Прокидка bucket_type в grouped API
+- [frontend/src/composables/usePurchases.ts](frontend/src/composables/usePurchases.ts:179) • Прокидка bucket_type в экспорт
+- [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:320) • Колонки детальных таблиц: столбец bucket_type
+- Производные (bucket_date в UI/данных):
+  - [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:321) • Колонки: bucket_date
+  - [frontend/src/components/mrp/ProductionDetailTable.vue](frontend/src/components/mrp/ProductionDetailTable.vue:22) • Отрисовка badge со стадиями по bucket_date
+
+Backend:
+- [backend/app/models.py](backend/app/models.py:343) • CheckConstraint для planned_order.bucket_type ('daily'|'weekly')
+- [backend/app/models.py](backend/app/models.py:355) • Колонки PlannedOrder: bucket_type/bucket_date
+- [backend/app/models.py](backend/app/models.py:364) • CheckConstraint для planned_order_stage.bucket_type
+- [backend/app/models.py](backend/app/models.py:372) • Колонки PlannedOrderStage: bucket_type/bucket_date
+- [backend/app/models.py](backend/app/models.py:380) • CheckConstraint для planned_purchase.bucket_type
+- [backend/app/models.py](backend/app/models.py:391) • Колонки PlannedPurchase: bucket_type/bucket_date
+- [backend/app/models.py](backend/app/models.py:399) • CheckConstraint для capacity_load.bucket_type
+- [backend/app/models.py](backend/app/models.py:405) • Колонки CapacityLoad: bucket_type/bucket_date
+- [backend/app/services/planning_service.py](backend/app/services/planning_service.py:377) • get_run_production: параметр bucket_type
+- [backend/app/services/planning_service.py](backend/app/services/planning_service.py:409) • Фильтрация по PlannedOrder.bucket_type
+- [backend/app/services/planning_service.py](backend/app/services/planning_service.py:613) • get_run_purchases: параметр bucket_type
+- [backend/app/services/planning_service.py](backend/app/services/planning_service.py:642) • Фильтр PlannedPurchase.bucket_type
+- [backend/app/services/planning_service.py](backend/app/services/planning_service.py:740) • get_capacity_summary: параметр/фильтр CapacityLoad.bucket_type
+- [backend/app/services/planning_service.py](backend/app/services/planning_service.py:766) • Формирование ответа: bucket_type/bucket_date
+- [backend/app/services/planning_service.py](backend/app/services/planning_service.py:1684) • _add_purchase/_add_order: сохранение bucket_type/bucket_date для записей
+- [backend/app/services/planning_service.py](backend/app/services/planning_service.py:2519) • PlannedOrderStage: bucket_type="daily" при fallback/scheduling
+- [backend/app/services/planning_service.py](backend/app/services/planning_service.py:2705) • CapacityLoad: записи "weekly" по пятницам недели
+- [backend/app/services/pegging_builder.py](backend/app/services/pegging_builder.py:65) • Производное: need_date = order.bucket_date (backup need_date)
+- [backend/app/routers/plan.py](backend/app/routers/plan.py:411) • Эндпоинты: проброс query‑параметра bucket_type (несколько функций)
+
+Замечание: В документации ([.docs/03-api-reference.md](.docs/03-api-reference.md:89), [.docs/date_filtering_changes.md](.docs/date_filtering_changes.md:131)) отражены изменения стратегии фильтрации по датам; однако код (и модели) сохраняют поля bucket_type/bucket_date для совместимости и агрегаций.
+
+#### Candidates for removal
+По итогам статического анализа (поиск прямых t()/\$t()/i18n.t('…') и отсутствие динамической генерации ключей):
+
+- mrp.filters.bucket — прямых обращений не найдено; динамических паттернов не обнаружено. Кандидат на удаление.
+  - Источник ключа: [frontend/src/i18n/ru.ts](frontend/src/i18n/ru.ts:77)
+  - Пояснение: селектор bucket в UI был удалён ранее; используется только bucketOption.any/daily/weekly (см. ниже).
+
+Ключи, НЕ являющиеся кандидатами (имеют прямые использования):
+- mrp.summary.overloadedBuckets — используется в сводке (MRPSummaryCard).
+- mrp.columns.bucketType/bucketDate — используются в колонках детальных таблиц (MRPResultPage).
+- mrp.filters.bucketOption.any/daily/weekly — используются при формировании опций в фильтрах/странице.
+
+#### Notes and risks
+- Анализ выполнен статически по паттернам:
+  - Поиск прямых строковых вызовов переводов: [$t('…')](frontend/src/pages/MRPResultPage.vue:320), [i18n.t('…')](frontend/src/components/mrp/MRPSummaryCard.vue:60), [t('…')](frontend/src/components/mrp/ProductionFilters.vue:88).
+  - Поиск динамических обращений вида [ts.t(`…${…}`)](frontend/src/pages/MRPResultPage.vue:1) или конкатенаций [ts.t('…' + …)](frontend/src/pages/MRPResultPage.vue:1) — не обнаружено.
+- Ограничения:
+  - Возможны скрытые использования через сторонние утилиты или неохваченные регулярные выражения; ручная верификация не выявила таких мест.
+  - Вхождения "bucket_type" встречаются широко в backend (модели, фильтры), а также в типах/компоновках фронтенда; это не i18n‑ключи, но подтверждают, что доменные поля bucket_type/bucket_date остаются в данных и UI‑таблицах.
+- Рекомендация:
+  - Перед удалением mrp.filters.bucket выполнить короткий runtime‑прогон UI (поиск строк t('mrp.filters.bucket') в рантайме) — риск оценивается как низкий.
+
+#### Appendix — evidence links
+
+Прямые использования i18n‑ключей «бакетов»:
+- [frontend/src/components/mrp/MRPSummaryCard.vue](frontend/src/components/mrp/MRPSummaryCard.vue:60) — mrp.summary.overloadedBuckets
+- [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:320) — mrp.columns.bucketType
+- [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:321) — mrp.columns.bucketDate
+- [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:347) — mrp.columns.bucketType (закупки)
+- [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:348) — mrp.columns.bucketDate (закупки)
+- [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:354) — mrp.columns.bucketType (мощности)
+- [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:355) — mrp.columns.bucketDate (мощности)
+- [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:666) — mrp.filters.bucketOption.any
+- [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:667) — mrp.filters.bucketOption.daily
+- [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:668) — mrp.filters.bucketOption.weekly
+- [frontend/src/components/mrp/ProductionFilters.vue](frontend/src/components/mrp/ProductionFilters.vue:88) — mrp.filters.bucketOption.any
+- [frontend/src/components/mrp/ProductionFilters.vue](frontend/src/components/mrp/ProductionFilters.vue:89) — mrp.filters.bucketOption.daily
+- [frontend/src/components/mrp/ProductionFilters.vue](frontend/src/components/mrp/ProductionFilters.vue:90) — mrp.filters.bucketOption.weekly
+
+
+## 2025‑10‑28 — Аудит MRP: расчёт и выдача заказов (итоги)
+
+### Краткое заключение
+Найдены потенциальные регрессии. Ядро согласовано с документацией; критический случай — нарушение финального cap из‑за округления вверх после cap.
+
+### Находки по категориям
+
+- **High:**
+  - Нарушение финального cap из-за `ceil` после cap при создании производственного заказа: [`python.def compute()`](backend/app/services/order_quantity_calculator.py:48), [`order_quantity_calculator.py`](backend/app/services/order_quantity_calculator.py:90), [`python.def run_planning_run()`](backend/app/services/planning_service.py:1880).
+- **Medium:**
+  - Повторный `ceil` после лимита мощностей ведёт к `SCHED_OVERFLOW`: [`python.def run_planning_run()`](backend/app/services/planning_service.py:2469).
+  - Нестабильный порядок при равных приоритетах (нет tie-breakers): [`python.def run_planning_run()`](backend/app/services/planning_service.py:2357), [`python.def compute_order_priorities()`](backend/app/services/priority_manager.py:35).
+- **Low:**
+  - Фильтрация исключает заказы без дат (start/finish=None): [`python.def get_run_production()`](backend/app/services/planning_service.py:425).
+  - Агрегация (item_id, start_date, unit) согласована со стадиями: [`python.def get_run_production()`](backend/app/services/planning_service.py:444).
+  - Редкий риск коллизий хеша агрегированных строк: [`planning_service.py`](backend/app/services/planning_service.py:575).
+  - Пагинация параметризована (`SERVER_MAX_LIMIT`): [`planning_service.py`](backend/app/services/planning_service.py:600); в capacity возвращается исходный limit: [`planning_service.py`](backend/app/services/planning_service.py:799).
+
+### Соответствие документации и разъяснения
+
+- Финальный cap и шаг 6.5 (сведение «фантомных» потребностей) реализованы; нарушение cap возникает от `ceil` при записи заказа: [`python.def run_planning_run()`](backend/app/services/planning_service.py:1880).
+- Производство — фильтрация по пересечению (start/finish), закупки — по need_date; legacy agenda/day_date не используется: [`python.def get_run_production()`](backend/app/services/planning_service.py:425).
+- Агрегация и стадии — согласованы: [`python.def get_run_production()`](backend/app/services/planning_service.py:444).
+- Пагинация параметризована; жесткого «10» нет: [`planning_service.py`](backend/app/services/planning_service.py:600).
+- Закупки: MOQ/кратность применяются, финального cap нет — бизнес-правило: [`planning_service.py`](backend/app/services/planning_service.py:1585).
+- Примечание по скрапу на шаге 6.5: явной отдельной модели скрапа нет; требуется дальнейшее уточнение в бизнес‑правилах.
+
+### Smoke‑проверки (без правок кода)
+
+- Cap vs `ceil`: кейс с `final_qty_before_capacity` ≈ 9.2; проверка, что qty заказа становится 10: [`python.def run_planning_run()`](backend/app/services/planning_service.py:1880).
+- Второй `ceil` и `SCHED_OVERFLOW`: `limited_qty` ≈ 9.1; проверка появления перегруза: [`python.def run_planning_run()`](backend/app/services/planning_service.py:2469).
+- Стабильность при равных приоритетах: 2 прогона с идентичными входами; сравнить порядок: [`python.def run_planning_run()`](backend/app/services/planning_service.py:2357), [`python.def compute_order_priorities()`](backend/app/services/priority_manager.py:35).
+- Фильтрация по датам: заказ с нулевыми нормо‑часами и корректно проставленными датами — должен попадать в выдачу: [`python.def get_run_production()`](backend/app/services/planning_service.py:425).
+
+### Рекомендации высокого уровня
+
+- «`Ceil` затем post‑cap» для производственных заказов, чтобы `qn_int` не превышал финальный cap: [`python.def compute()`](backend/app/services/order_quantity_calculator.py:48), [`python.def run_planning_run()`](backend/app/services/planning_service.py:1880).
+- Детерминизм приоритизации: добавить вторичные ключи (need_date asc, item_id asc, order_id asc): [`python.def run_planning_run()`](backend/app/services/planning_service.py:2357).
+- Пост‑обработка после лимита мощностей: рассмотреть `floor(limited_qty)` либо мягкий пост‑cap в пределах доступных часов: [`python.def run_planning_run()`](backend/app/services/planning_service.py:2469).
+
+### Ссылки на вспомогательные места кода для контекста
+
+- [`python.def compute_planning_preview() — шаг 6.5`](backend/app/services/planning_service.py:1215)
+- [`python.def limit_qty_by_capacity()`](backend/app/services/capacity_scheduler.py:31), [`python.def schedule_backward()`](backend/app/services/capacity_scheduler.py:68), [`capacity_scheduler.py`](backend/app/services/capacity_scheduler.py:166)
+- [`python.def build()`](backend/app/services/pegging_builder.py:13)
+
+### Примечание о фронтенде
+
+- Переход на фильтрацию по `start_date`/`finish_date` вместо `bucket_date`/`agenda` и отказ от `day_date` уже отражён в UI и контрактах; важно сохранять текущие ключи агрегации и поля выдачи.

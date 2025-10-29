@@ -172,19 +172,16 @@ export interface PeggingRow {
 
 // ---------- Фильтры ----------
 export interface ProductionFilters {
-  bucket_type?: BucketType
  date_from?: IsoDate
   date_to?: IsoDate
 }
 
 export interface PurchaseFilters {
-  bucket_type?: BucketType
   date_from?: IsoDate
   date_to?: IsoDate
 }
 
 export interface CapacityFilters {
-  bucket_type?: BucketType
   date_from?: IsoDate
   date_to?: IsoDate
   area_id?: number

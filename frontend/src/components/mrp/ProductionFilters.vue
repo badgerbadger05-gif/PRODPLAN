@@ -3,16 +3,6 @@
     <div v-if="title" class="text-subtitle2">{{ title }}</div>
     <q-space />
 
-    <q-select
-      v-model="local.bucket_type"
-      :options="bucketOptions"
-      emit-value
-      map-options
-      dense
-      outlined
-      :label="t('mrp.filters.bucket')"
-      style="width: 150px"
-    />
 
     <q-input v-model="local.date_from" dense outlined :label="t('mrp.filters.fromDate')" style="width: 200px">
       <template #append>
@@ -42,14 +32,6 @@
       </template>
     </q-input>
 
-    <q-btn
-      :disable="applyDisabled"
-      :loading="loading"
-      dense
-      color="primary"
-      icon="search"
-      @click="emitApply"
-    />
 
     <q-btn
       :disable="loading"
@@ -109,7 +91,6 @@ const bucketOptions = computed(() => ([
 ]))
 
 const local = ref<ProductionFilters>({
-  bucket_type: props.modelValue?.bucket_type,
   date_from: props.modelValue?.date_from,
   date_to: props.modelValue?.date_to
 })
@@ -142,13 +123,11 @@ const loading = computed(() => !!props.loading)
 const applyDisabled = computed(() => loading.value)
 
 function emitApply() {
-  // Синхронно прокидываем актуальное состояние фильтров наверх перед применением
-  emit('update:modelValue', { ...local.value })
   emit('apply')
 }
 function emitReset() {
   // Сбрасываем локальную модель и уведомляем родителя
-  local.value = { bucket_type: undefined, date_from: undefined, date_to: undefined }
+  local.value = { date_from: undefined, date_to: undefined }
   emit('update:modelValue', { ...local.value })
   emit('reset')
 }
