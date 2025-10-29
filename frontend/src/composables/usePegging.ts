@@ -5,13 +5,8 @@
 import { ref, reactive } from 'vue'
 import { Notify } from 'quasar'
 import { getPlanningResultPegging } from '../services/api'
+import { buildPlanRangeQuery } from '../services/query'
 import type { PeggingRow, PeggingFilters, PageState } from '../types/mrp'
-
-// '' -> undefined
-function emptyToUndef(s?: string | null): string | undefined {
-  const t = String(s ?? '').trim()
-  return t.length ? t : undefined
-}
 
 export function usePegging(runId: number) {
   // Фильтры
@@ -37,16 +32,19 @@ export function usePegging(runId: number) {
   async function loadPage() {
     loadingPage.value = true
     try {
-      const limit = pagination.rowsPerPage
-      const offset = (pagination.page - 1) * pagination.rowsPerPage
-      const resp = await getPlanningResultPegging(runId, {
-        child_item_id: filters.value.child_item_id,
-        parent_item_id: filters.value.parent_item_id,
-        date_from: emptyToUndef(filters.value.date_from),
-        date_to: emptyToUndef(filters.value.date_to),
-        limit,
-        offset
+      const params = buildPlanRangeQuery({
+        date_from: filters.value.date_from,
+        date_to: filters.value.date_to,
+        page: pagination.page,
+        limit: pagination.rowsPerPage
       })
+      if (filters.value.child_item_id !== undefined && filters.value.child_item_id !== null) {
+        params.child_item_id = filters.value.child_item_id
+      }
+      if (filters.value.parent_item_id !== undefined && filters.value.parent_item_id !== null) {
+        params.parent_item_id = filters.value.parent_item_id
+      }
+      const resp = await getPlanningResultPegging(runId, params)
       const raw = resp.rows || []
       pagination.rowsNumber = resp.total || 0
 

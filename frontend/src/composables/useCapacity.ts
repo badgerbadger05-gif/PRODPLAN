@@ -10,6 +10,7 @@ import {
   getPlanningResultCapacitySummary
 } from '../services/api'
 import { useFormatting } from './useFormatting'
+import { buildPlanRangeQuery } from '../services/query'
 import type {
   CapacityRow,
   CapacitySummaryMap,
@@ -17,18 +18,11 @@ import type {
   PageState
 } from '../types/mrp'
 
-// '' -> undefined
-function emptyToUndef(s?: string | null): string | undefined {
-  const t = String(s ?? '').trim()
-  return t.length ? t : undefined
-}
-
 export function useCapacity(runId: number) {
   const { formatNumber } = useFormatting()
 
   // Фильтры
   const filters = ref<CapacityFilters>({
-    bucket_type: undefined,
     date_from: undefined,
     date_to: undefined,
     area_id: undefined
@@ -52,16 +46,16 @@ export function useCapacity(runId: number) {
   async function loadPage() {
     loadingPage.value = true
     try {
-      const limit = pagination.rowsPerPage
-      const offset = (pagination.page - 1) * pagination.rowsPerPage
-      const resp = await getPlanningResultCapacity(runId, {
-        area_id: filters.value.area_id,
-        bucket_type: filters.value.bucket_type,
-        date_from: emptyToUndef(filters.value.date_from),
-        date_to: emptyToUndef(filters.value.date_to),
-        limit,
-        offset
+      const params = buildPlanRangeQuery({
+        date_from: filters.value.date_from,
+        date_to: filters.value.date_to,
+        page: pagination.page,
+        limit: pagination.rowsPerPage
       })
+      if (filters.value.area_id !== undefined && filters.value.area_id !== null) {
+        params.area_id = filters.value.area_id
+      }
+      const resp = await getPlanningResultCapacity(runId, params)
       const raw = resp.rows || []
       pagination.rowsNumber = resp.total || 0
 
@@ -90,11 +84,11 @@ export function useCapacity(runId: number) {
   async function loadSummary() {
     loadingSummary.value = true
     try {
-      const resp = await getPlanningResultCapacitySummary(runId, {
-        bucket_type: filters.value.bucket_type,
-        date_from: emptyToUndef(filters.value.date_from),
-        date_to: emptyToUndef(filters.value.date_to)
+      const params = buildPlanRangeQuery({
+        date_from: filters.value.date_from,
+        date_to: filters.value.date_to
       })
+      const resp = await getPlanningResultCapacitySummary(runId, params)
       const m = (resp?.map || {}) as any
       const map: CapacitySummaryMap = {}
       for (const k of Object.keys(m)) {
@@ -121,7 +115,6 @@ export function useCapacity(runId: number) {
   }
 
   function resetFilters() {
-    filters.value.bucket_type = undefined
     filters.value.date_from = undefined
     filters.value.date_to = undefined
     filters.value.area_id = undefined

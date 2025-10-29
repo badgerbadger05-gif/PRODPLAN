@@ -86,7 +86,6 @@ export interface ProductionGroupOrder {
   qty: number
   norm_hours_total: number
   norm_hours_per_unit?: number | null
-  // agenda_day-specific extended fields (optional)
   order_id?: number
   display_qty?: number
   display_norm_hours_total?: number
@@ -209,4 +208,7 @@ export interface PagedResponse<T> {
 }
 
 // ---------- Экспортные типы ----------
+// ---------- Query-параметры ----------
+// Импортируем из query.ts для совместимости
+export type { PlanRangeParams, PaginationParams, SortingParams, PlanQueryParams } from '../services/query'
 export type CsvOrXlsx = 'csv' | 'xlsx'

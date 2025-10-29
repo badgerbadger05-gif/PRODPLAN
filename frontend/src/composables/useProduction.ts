@@ -14,6 +14,7 @@ import {
 } from '../services/api'
 import { useDictionaries } from './useDictionaries'
 import { useFormatting } from './useFormatting'
+import { buildPlanRangeQuery } from '../services/query'
 import type {
   ProductionOrder,
   ProductionGroup,
@@ -22,12 +23,6 @@ import type {
   PageState,
   CsvOrXlsx
 } from '../types/mrp'
-
-// Утилита: '' -> undefined
-function emptyToUndef(s?: string | null): string | undefined {
-  const t = String(s ?? '').trim()
-  return t.length ? t : undefined
-}
 
 export function useProduction(runId: number) {
   const { itemMap, ensureLoaded, fillMissingFromRows } = useDictionaries()
@@ -89,16 +84,15 @@ export function useProduction(runId: number) {
   async function loadPage() {
     loadingPage.value = true
     try {
-      const limit = pagination.rowsPerPage
-      const offset = (pagination.page - 1) * pagination.rowsPerPage
-      const resp = await getPlanningResultProduction(runId, {
-        date_from: emptyToUndef(filters.value.date_from),
-        date_to: emptyToUndef(filters.value.date_to),
+      const params = buildPlanRangeQuery({
+        date_from: filters.value.date_from,
+        date_to: filters.value.date_to,
+        page: pagination.page,
+        limit: pagination.rowsPerPage,
         sort_by: 'item_name',
-        sort_dir: 'asc',
-        limit,
-        offset
+        sort_dir: 'asc'
       })
+      const resp = await getPlanningResultProduction(runId, params)
       const raw = resp.rows || []
       pagination.rowsNumber = resp.total || 0
 
@@ -124,14 +118,15 @@ export function useProduction(runId: number) {
   async function loadGrouped() {
     loadingGrouped.value = true
     try {
-      const resp = await getPlanningResultProductionGrouped(runId, {
-        date_from: emptyToUndef(filters.value.date_from),
-        date_to: emptyToUndef(filters.value.date_to),
+      const params = buildPlanRangeQuery({
+        date_from: filters.value.date_from,
+        date_to: filters.value.date_to,
+        page: 1,
         limit: 1000,
-        offset: 0,
         sort_by: 'item_name',
         sort_dir: 'asc'
       })
+      const resp = await getPlanningResultProductionGrouped(runId, params)
       grouped.value = (resp?.groups || []).map(g => ({
         area_id: Number(g.area_id),
         area_name: String(g.area_name ?? ''),
@@ -194,14 +189,14 @@ export function useProduction(runId: number) {
   async function exportProd(fmt: CsvOrXlsx) {
     exporting.value = true
     try {
-      const params: any = { format: fmt }
-      
-      // Для экспорта всегда используем date_from и date_to, так как day_date больше не используется
-      params.date_from = emptyToUndef(filters.value.date_from)
-      params.date_to = emptyToUndef(filters.value.date_to)
-      params.sort_by = 'need_date'
-      params.sort_dir = 'asc'
-      
+      const params = buildPlanRangeQuery({
+        date_from: filters.value.date_from,
+        date_to: filters.value.date_to,
+        sort_by: 'need_date',
+        sort_dir: 'asc'
+      })
+      params.format = fmt
+
       const res = await exportPlanningResultProduction(runId, params)
       if (fmt === 'csv') {
         downloadTextFile(res?.data || '', res?.filename || `mrp_production_run_${runId}.csv`, 'text/csv;charset=utf-8')

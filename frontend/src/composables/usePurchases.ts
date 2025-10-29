@@ -13,6 +13,7 @@ import {
 } from '../services/api'
 import { useDictionaries } from './useDictionaries'
 import { useFormatting } from './useFormatting'
+import { buildPlanRangeQuery } from '../services/query'
 import type {
   PurchaseRow,
   PurchaseGroupedRow,
@@ -21,19 +22,12 @@ import type {
   CsvOrXlsx
 } from '../types/mrp'
 
-// '' -> undefined
-function emptyToUndef(s?: string | null): string | undefined {
-  const t = String(s ?? '').trim()
-  return t.length ? t : undefined
-}
-
 export function usePurchases(runId: number) {
   const { itemMap, ensureLoaded, fillMissingFromRows } = useDictionaries()
   const { formatNumber, formatQty } = useFormatting()
 
   // Фильтры
   const filters = ref<PurchaseFilters>({
-    bucket_type: undefined,
     date_from: undefined,
     date_to: undefined
   })
@@ -79,17 +73,15 @@ export function usePurchases(runId: number) {
   async function loadPage() {
     loadingPage.value = true
     try {
-      const limit = pagination.rowsPerPage
-      const offset = (pagination.page - 1) * pagination.rowsPerPage
-      const resp = await getPlanningResultPurchases(runId, {
-        bucket_type: filters.value.bucket_type,
-        date_from: emptyToUndef(filters.value.date_from),
-        date_to: emptyToUndef(filters.value.date_to),
+      const params = buildPlanRangeQuery({
+        date_from: filters.value.date_from,
+        date_to: filters.value.date_to,
+        page: pagination.page,
+        limit: pagination.rowsPerPage,
         sort_by: 'item_name',
-        sort_dir: 'asc',
-        limit,
-        offset
+        sort_dir: 'asc'
       })
+      const resp = await getPlanningResultPurchases(runId, params)
       const raw = resp.rows || []
       pagination.rowsNumber = resp.total || 0
 
@@ -115,13 +107,13 @@ export function usePurchases(runId: number) {
   async function loadGrouped() {
     loadingGrouped.value = true
     try {
-      const resp = await getPlanningResultPurchasesGrouped(runId, {
-        bucket_type: filters.value.bucket_type,
-        date_from: emptyToUndef(filters.value.date_from),
-        date_to: emptyToUndef(filters.value.date_to),
-        limit: 1000,
-        offset: 0
+      const params = buildPlanRangeQuery({
+        date_from: filters.value.date_from,
+        date_to: filters.value.date_to,
+        page: 1,
+        limit: 1000
       })
+      const resp = await getPlanningResultPurchasesGrouped(runId, params)
       grouped.value = (resp?.rows || []).map(r => ({
         agg_key: String(r.agg_key ?? `${r.item_id}|${r.unit || ''}`),
         item_id: Number(r.item_id),
@@ -174,14 +166,14 @@ export function usePurchases(runId: number) {
   async function exportPurch(fmt: CsvOrXlsx) {
     exporting.value = true
     try {
-      const res = await exportPlanningResultPurchases(runId, {
-        format: fmt,
-        bucket_type: filters.value.bucket_type,
-        date_from: emptyToUndef(filters.value.date_from),
-        date_to: emptyToUndef(filters.value.date_to),
+      const params = buildPlanRangeQuery({
+        date_from: filters.value.date_from,
+        date_to: filters.value.date_to,
         sort_by: 'item_name',
         sort_dir: 'asc'
       })
+      params.format = fmt
+      const res = await exportPlanningResultPurchases(runId, params)
       if (fmt === 'csv') {
         downloadTextFile(res?.data || '', res?.filename || `mrp_purchases_run_${runId}.csv`, 'text/csv;charset=utf-8')
       } else {
@@ -199,7 +191,6 @@ export function usePurchases(runId: number) {
   }
 
   function resetFilters() {
-    filters.value.bucket_type = undefined
     filters.value.date_from = undefined
     filters.value.date_to = undefined
   }

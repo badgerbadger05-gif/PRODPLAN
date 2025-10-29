@@ -2977,7 +2977,9 @@ def get_run_purchases_grouped(
 
     all_rows = []
     for (iid, unit_disp), rec in agg.items():
-        rec["agg_key"] = f"{iid}|{unit_disp}"
+        group_key = f"purch:{run_id}:{iid}:{unit_disp}"
+        rec["group_key"] = group_key
+        rec["agg_key"] = rec["group_key"]
         all_rows.append(rec)
 
     total = len(all_rows)
@@ -3204,6 +3206,9 @@ def get_run_production_grouped(
                 "need_date": po.need_date.isoformat() if po.need_date else None,
                 "dom_area_id": dom_area_id  # временно сохраняем для последующего распределения по группам
             }
+            group_key = f"prod:{run_id}:{dom_area_id}:{int(po.item_id)}:{unit_disp}"
+            item_aggregated[agg_key]["group_key"] = group_key
+            item_aggregated[agg_key]["agg_key"] = group_key
 
     # Распределяем агрегированные заказы по группам (по доминирующему участку)
     for item_data in item_aggregated.values():
@@ -3216,7 +3221,7 @@ def get_run_production_grouped(
         g["area_id"] = dom_area_id
         g["area_name"] = area_name_map.get(dom_area_id, f"Участок #{dom_area_id}")
         g["orders"].append({
-            "agg_key": item_data["agg_key"],
+            "agg_key": item_data["group_key"],
             "item_id": item_data["item_id"],
             "item_name": item_data["item_name"],
             "item_article": item_data["item_article"],

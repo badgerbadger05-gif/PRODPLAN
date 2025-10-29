@@ -117,7 +117,7 @@ watch(local, (v) => {
   }
 }, { deep: true })
 
-// Удаляем переменную showDayMenu и функцию onDayPicked, так как поле day_date больше не используется
+
 
 const loading = computed(() => !!props.loading)
 const applyDisabled = computed(() => loading.value)
