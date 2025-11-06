@@ -2999,16 +2999,18 @@ def get_run_production_grouped(
     offset: int = 0,
     sort_by: Optional[str] = None,
     sort_dir: Optional[str] = None,
+    group_by_kind: bool = False,
 ) -> Dict[str, Any]:
     """
     Группировка производственных заказов по «доминирующему участку» (dominant area, по сумме часов стадий).
+    При group_by_kind=True дополнительно группирует по виду производства (production_kind).
     Возвращает:
       {
         "groups": [
           {
             "area_id": number,
             "area_name": string,
-            "orders": [{ item_id, item_name, item_article, unit, qty, norm_hours_total, norm_hours_per_unit, agg_key }],
+            "orders": [{ item_id, item_name, item_article, unit, qty, norm_hours_total, norm_hours_per_unit, agg_key, production_kind_id? }],
             "norm_sum_hours": number,
             "min_days_to_need": number|null,
             "cap_overload_hours": number,
@@ -3138,8 +3140,8 @@ def get_run_production_grouped(
 
     today = date.today()
     
-    # Агрегация заказов по item_id и unit до определения доминирующего участка
-    item_aggregated: Dict[Tuple[int, str], Dict[str, Any]] = {}
+    # Агрегация заказов по item_id, unit и production_kind до определения доминирующего участка
+    item_aggregated: Dict[Tuple[int, str, Optional[int]], Dict[str, Any]] = {}
     
     for po, in_name, in_article, in_unit_guid, in_unit_short, in_unit_name, in_unit_code in filtered_ord_rows:
         st_list = st_by_order.get(int(po.order_id), [])
@@ -3168,19 +3170,34 @@ def get_run_production_grouped(
             continue
 
         unit_disp = in_unit_short or in_unit_name or in_unit_code or in_unit_guid or ""
-        # Ключ агрегации: item_id и unit
-        agg_key = (int(po.item_id), unit_disp)
+        
+        # Определение production_kind_id для агрегации
+        production_kind_id = None
+        if group_by_kind:
+            # Получаем production_kind_id через спецификацию
+            try:
+                spec_id = default_spec_map.get(int(po.item_id))
+                if spec_id:
+                    spec = spec_by_id.get(int(spec_id))
+                    if spec:
+                        production_kind_id = spec.production_kind_id
+            except Exception:
+                production_kind_id = None
+
+        # Ключ агрегации: item_id, unit и production_kind_id (если group_by_kind=True)
+        if group_by_kind:
+            agg_key = (int(po.item_id), unit_disp, production_kind_id)
+        else:
+            agg_key = (int(po.item_id), unit_disp)
         
         if agg_key in item_aggregated:
-            # Объединяем данные с существующей записью
+            # Объединяем данные существующей записью
             item_aggregated[agg_key]["qty"] += float(po.qty or 0.0)
             item_aggregated[agg_key]["norm_hours_total"] += float(total_hours)
             # Обновляем need_date, если текущая дата раньше
             current_need_date = item_aggregated[agg_key]["need_date"]
             if current_need_date is None or (po.need_date and po.need_date < _to_date(current_need_date)):
                 item_aggregated[agg_key]["need_date"] = po.need_date.isoformat() if po.need_date else None
-            # Также обновляем dom_area_id, если он отличается (хотя должен быть одинаковым для одного item_id)
-            # В идеале, все заказы одного item_id должны иметь одинаковый доминирующий участок
         else:
             # Создаем новую запись
             qty_val = float(po.qty or 0.0)
@@ -3204,9 +3221,13 @@ def get_run_production_grouped(
                 "norm_hours_total": float(total_hours),
                 "norm_hours_per_unit": float(norm_per_unit) if norm_per_unit is not None else None,
                 "need_date": po.need_date.isoformat() if po.need_date else None,
-                "dom_area_id": dom_area_id  # временно сохраняем для последующего распределения по группам
+                "dom_area_id": dom_area_id,  # временно сохраняем для последующего распределения по группам
+                "production_kind_id": production_kind_id
             }
-            group_key = f"prod:{run_id}:{dom_area_id}:{int(po.item_id)}:{unit_disp}"
+            if group_by_kind and production_kind_id is not None:
+                group_key = f"prod:{run_id}:{dom_area_id}:{int(po.item_id)}:{unit_disp}:{production_kind_id}"
+            else:
+                group_key = f"prod:{run_id}:{dom_area_id}:{int(po.item_id)}:{unit_disp}"
             item_aggregated[agg_key]["group_key"] = group_key
             item_aggregated[agg_key]["agg_key"] = group_key
 
@@ -3220,7 +3241,7 @@ def get_run_production_grouped(
         g = groups[dom_area_id]
         g["area_id"] = dom_area_id
         g["area_name"] = area_name_map.get(dom_area_id, f"Участок #{dom_area_id}")
-        g["orders"].append({
+        order_entry = {
             "agg_key": item_data["group_key"],
             "item_id": item_data["item_id"],
             "item_name": item_data["item_name"],
@@ -3229,7 +3250,13 @@ def get_run_production_grouped(
             "qty": item_data["qty"],
             "norm_hours_total": item_data["norm_hours_total"],
             "norm_hours_per_unit": item_data["norm_hours_per_unit"],
-        })
+        }
+        
+        # Если включена группировка по виду производства, добавляем поле production_kind_id
+        if group_by_kind and "production_kind_id" in item_data:
+            order_entry["production_kind_id"] = item_data["production_kind_id"]
+        
+        g["orders"].append(order_entry)
         g["norm_sum_hours"] += item_data["norm_hours_total"]
         if item_data["need_date"]:
             try:

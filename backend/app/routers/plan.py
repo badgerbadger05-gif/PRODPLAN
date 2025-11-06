@@ -552,53 +552,50 @@ async def export_planning_result_production(
         # Базовые колонки данных (как в исходной таблице)
         headers = ["Наименование", "Артикул", "Количество", "ЕИ", "Норматив, ч/шт", "Норматив всего, ч"]
 
-        # Стандартный экспорт по заказам с группировкой по «доминирующему участку»
-        res = get_run_production(
+        # Используем агрегированные данные с группировкой по (item_id, unit, production_kind) для устранения дублей в диапазоне дат
+        # Но сохраняем структуру с группами по "доминирующему участку" для корректного отображения в Excel
+        res = get_run_production_grouped(
             db=db,
             run_id=int(run_id),
-            item_id=None,
             bucket_type=bucket_type,
             date_from=date_from,
             date_to=date_to,
+            area_id=None,
             limit=10000,
             offset=0,
             sort_by=sort_by,
             sort_dir=sort_dir,
+            group_by_kind=True,  # включаем группировку по виду производства для устранения дублей
         )
-        rows = res.get("rows", []) or []
-
-        # Карта названий участков (ресурсов) для разбивки по «цехам/участкам»
-        try:
-            resources = db.query(ProductionResource).all()
-            area_name_map = {int(x.resource_id): str(x.resource_name or "") for x in resources}
-        except Exception:
-            area_name_map = {}
-
-        def _dominant_area_name(stages_list):
-            dom = None
-            for s in (stages_list or []):
-                try:
-                    if dom is None or float(s.get("hours") or 0.0) > float(dom.get("hours") or 0.0):
-                        dom = s
-                except Exception:
-                    continue
-            if dom is None:
-                return ""
-            aid = None
-            try:
-                aid = int(dom.get("area_id"))
-            except Exception:
-                aid = None
-            if aid is None:
-                return ""
-            return area_name_map.get(aid, f"Участок #{aid}")
-
-        # Группировка по «доминирующему» участку как в UI (подзаголовки)
-        groups: Dict[str, list] = {}
-        for r in rows:
-            area_name = _dominant_area_name(r.get("stages"))
-            key = area_name or "—"
-            groups.setdefault(key, []).append(r)
+        
+        # Создаем структуру с группами по участкам, используя результат grouped-функции
+        groups = {}
+        for group in res.get("groups", []):
+            area_name = group.get("area_name", "—")
+            group_rows = []
+            for order in group.get("orders", []):
+                # Преобразуем каждую агрегированную запись в формат, совместимый с оригинальным
+                row = {
+                    "item_name": order.get("item_name", ""),
+                    "item_article": order.get("item_article", ""),
+                    "qty": order.get("qty", 0.0),
+                    "unit": order.get("unit", ""),
+                    "norm_hours_per_unit": order.get("norm_hours_per_unit"),
+                    "norm_hours_total": order.get("norm_hours_total", 0.0),
+                    "stages": [],  # пустой список, так как данные уже агрегированы
+                    "need_date": None,
+                    "start_date": None,
+                    "finish_date": None,
+                    "route_ref": None,
+                    "priority_index": None,
+                    "bucket_type": None,
+                    "bucket_date": None,
+                    "demand_ref": None,
+                    "demand_date": None,
+                }
+                group_rows.append(row)
+            if group_rows:  # Добавляем группу только если есть записи
+                groups[area_name] = group_rows
 
         grouped_keys = sorted(groups.keys(), key=lambda x: (x == "—", x))
         # Количество строк данных (без учёта подзаголовков)
@@ -855,6 +852,7 @@ async def get_planning_result_production_grouped(
             offset=offset,
             sort_by=sort_by,
             sort_dir=sort_dir,
+            group_by_kind=False,  # по умолчанию для обратной совместимости
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
