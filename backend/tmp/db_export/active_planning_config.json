@@ -1,6 +1,0 @@
-{
-  "id": 1,
-  "comment": "initial planning config seed",
-  "created_at": "2025-09-25T09:44:45.913544",
-  "config": "{\"planning_horizon_days\": 90, \"mps_daily_horizon_days\": 90, \"weekly\": {\"enabled\": true, \"anchor_day\": \"Monday\", \"need_date_day\": \"Friday\"}, \"procurement\": {\"default_lead_time_days\": 30, \"lead_time_min_policy\": \"max(default_lead_time_days, lead_time_from_item)\", \"lot_sizing\": {\"moq_source\": \"item_card_or_1\", \"multiple\": 1, \"rounding\": \"ceil\"}, \"order_date_rounding_policy\": \"previous_workday\"}, \"production\": {\"lot_sizing\": {\"min_batch\": 1, \"multiple\": 1, \"rounding\": \"ceil\"}}, \"safety_stock_percent\": 1, \"capacity\": {\"use_resource_calendars\": true, \"consider_power_coefficients\": true}, \"prioritization\": {\"weight_criticality\": 0.4, \"weight_importance\": 0.3, \"weight_cycle_time\": 0.3, \"default_importance\": 1}, \"toggles\": {\"include_wip\": false, \"enable_weekly_route_detail\": false}}"
-}
