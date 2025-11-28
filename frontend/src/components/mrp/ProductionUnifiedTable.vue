@@ -40,11 +40,6 @@
       <q-td :props="p">{{ p.row.item_article || t('mrp.placeholder.noArticle') }}</q-td>
     </template>
 
-    <template #body-cell-area="p">
-      <q-td :props="p">
-        {{ p.row.main_area_name || t('mrp.placeholder.noArticle') }}
-      </q-td>
-    </template>
 
     <template #body-cell-qty="p">
       <q-td :props="p" class="text-right">{{ fmtQty(p.row.qty, p.row.unit) }}</q-td>
@@ -86,8 +81,6 @@ type PlainProdRow = {
   norm_hours_per_unit?: number | null
   agg_key?: string
   rowKey: string
-  main_area_id?: number | null
-  main_area_name?: string | null
   flags?: Flags
 }
 
@@ -102,7 +95,6 @@ const { t } = useI18n()
 const columns = computed<QTableColumn<PlainProdRow>[]>(() => ([
   { name: 'name', label: t('mrp.columns.name'), field: (row: PlainProdRow) => row.item_name, align: 'left' },
   { name: 'article', label: t('mrp.columns.article'), field: (row: PlainProdRow) => row.item_article, align: 'left' },
-  { name: 'area', label: t('mrp.columns.areaId'), field: (row: PlainProdRow) => row.main_area_name, align: 'left' },
   { name: 'qty', label: t('mrp.columns.qty'), field: (row: PlainProdRow) => row.qty, align: 'right' },
   { name: 'norm_per_unit', label: t('mrp.columns.normPerUnit'), field: (row: PlainProdRow) => row.norm_hours_per_unit, align: 'right' },
   { name: 'norm_total', label: t('mrp.columns.normTotal'), field: (row: PlainProdRow) => row.norm_hours_total, align: 'right' }
@@ -119,10 +111,8 @@ const safeRows = computed(() => {
         ...r,
         qty: (existingRow.qty || 0) + (r.qty || 0),
         norm_hours_total: (existingRow.norm_hours_total || 0) + (r.norm_hours_total || 0),
-        // сохраняем участок и флаги, если появились
-        main_area_id: r.main_area_id ?? existingRow.main_area_id,
-        main_area_name: r.main_area_name ?? existingRow.main_area_name,
-        flags: { ...(existingRow.flags || {}), ...(r.flags || {}) },
+        // сохраняем флаги, если появились
+       flags: { ...(existingRow.flags || {}), ...(r.flags || {}) },
         rowKey: key
       })
     } else {

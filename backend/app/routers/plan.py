@@ -20,6 +20,7 @@ from ..services.planning_service import (
     list_planning_runs,
     get_run_summary,
     get_run_production,
+    get_run_production_grouped,
     get_run_purchases,
     get_run_capacity,
     get_run_pegging,
@@ -33,6 +34,7 @@ from ..services.planning_service import (
     get_active_planning_config_full
 )
 from ..models import ProductionResource
+from ..schemas import ProductionGroupedResponse
 
 router = APIRouter(prefix="/v1/plan", tags=["plan"])
 
@@ -389,6 +391,36 @@ async def get_planning_result_production(
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+@router.get("/results/{run_id}/production/grouped", response_model=ProductionGroupedResponse)
+async def get_planning_result_production_grouped(
+    run_id: int,
+    item_id: Optional[int] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    area_id: Optional[int] = None,
+    limit: int = 100,
+    offset: int = 0,
+    sort_by: Optional[str] = None,
+    sort_dir: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    """Группированная по участкам выдача производственных заказов"""
+    try:
+        return get_run_production_grouped(
+            db=db,
+            run_id=int(run_id),
+            item_id=item_id,
+            date_from=date_from,
+            date_to=date_to,
+            area_id=area_id,
+            limit=limit,
+            offset=offset,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 
 @router.get("/results/{run_id}/purchases")
 async def get_planning_result_purchases(
@@ -486,6 +518,208 @@ async def get_stages(db: Session = Depends(get_db)):
 # === Export endpoints for results ===
 
 
+@router.get("/results/{run_id}/production/export")
+async def export_planning_result_production(
+    run_id: int,
+    format: str = "csv",
+    bucket_type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    sort_by: Optional[str] = None,
+    sort_dir: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Экспорт результатов «Производство» в CSV или XLSX (base64).
+    Колонки: Наименование, Артикул, Количество, Нормо-часы всего, Нормо-часы на ед., Дата потребности, Дата начала, Дата окончания, ЕИ
+    """
+    try:
+        res = get_run_production(
+            db=db,
+            run_id=int(run_id),
+            item_id=None,
+            bucket_type=bucket_type,
+            date_from=date_from,
+            date_to=date_to,
+            limit=100000,
+            offset=0,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+        )
+        rows = res.get("rows", []) or []
+
+        headers = [
+            "Наименование",
+            "Артикул",
+            "Количество",
+            "Нормо-часы всего",
+            "Нормо-часы на ед.",
+            "Дата потребности",
+            "Дата начала",
+            "Дата окончания",
+            "ЕИ",
+        ]
+        data_rows = []
+        for r in rows:
+            qty = float(r.get("qty") or 0.0)
+            norm_total = float(r.get("norm_hours_total") or 0.0)
+            norm_per_unit = r.get("norm_hours_per_unit")
+            if norm_per_unit is None:
+                norm_per_unit = (norm_total / qty) if qty > 0 else None
+            data_rows.append(
+                [
+                    r.get("item_name") or "",
+                    r.get("item_article") or "",
+                    qty,
+                    norm_total,
+                    float(norm_per_unit) if norm_per_unit is not None else "",
+                    r.get("need_date") or "",
+                    r.get("start_date") or "",
+                    r.get("finish_date") or "",
+                    r.get("unit") or "",
+                ]
+            )
+
+        if (format or "csv").lower() == "xlsx":
+            # Формируем XLSX с разбивкой по участкам (подзаголовки)
+            # Пытаемся получить серверную группировку; при ошибке/пусто — фолбэк к плоскому списку
+            try:
+                grouped_res = get_run_production_grouped(
+                    db=db,
+                    run_id=int(run_id),
+                    item_id=None,
+                    date_from=date_from,
+                    date_to=date_to,
+                    area_id=None,
+                    limit=1000,
+                    offset=0,
+                    sort_by=sort_by,
+                    sort_dir=sort_dir,
+                )
+                groups = (grouped_res or {}).get("groups", []) or []
+            except Exception:
+                groups = []
+
+            import io, base64
+            try:
+                from openpyxl import Workbook
+                from openpyxl.styles import PatternFill, Font, Alignment
+                from openpyxl.utils import get_column_letter
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"openpyxl not available: {e}")
+
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Production"
+
+            # Трекинг максимальной ширины контента по колонкам для псевдо-автоширины
+            max_widths = {i: len(str(h)) for i, h in enumerate(headers, start=1)}
+
+            def update_widths(values: list):
+                for idx, val in enumerate(values, start=1):
+                    text = "" if val is None else str(val)
+                    # Учитываем переносы строк по наибольшей длине строки
+                    length = max((len(line) for line in str(text).splitlines()), default=0)
+                    if length > max_widths.get(idx, 0):
+                        max_widths[idx] = length
+
+            def style_header(row_idx: int):
+                for col_idx in range(1, len(headers) + 1):
+                    cell = ws.cell(row=row_idx, column=col_idx)
+                    cell.font = Font(bold=True)
+
+            def append_group_title(title: str):
+                ws.append([title])
+                r = ws.max_row
+                # Подзаголовок на всю ширину таблицы
+                ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=len(headers))
+                cell = ws.cell(row=r, column=1)
+                cell.font = Font(bold=True, color="FFFFFFFF")
+                # Яркий синий фон для подзаголовка группы
+                cell.fill = PatternFill(fill_type="solid", fgColor="FF4F81BD")
+                cell.alignment = Alignment(horizontal="left")
+                update_widths([title])
+
+            if groups:
+                # Для каждой группы добавляем подзаголовок с названием участка, затем шапку и строки
+                for g in groups:
+                    area_name = str(g.get("area_name") or f"ID {g.get('area_id') or ''}")
+                    # Подзаголовок группы
+                    append_group_title(f"Участок: {area_name}")
+                    # Шапка колонок
+                    ws.append(headers)
+                    hdr_row = ws.max_row
+                    style_header(hdr_row)
+                    update_widths(headers)
+                    orders = (g.get("orders", []) or [])
+                    for o in orders:
+                        qty = float(o.get("qty") or 0.0)
+                        norm_total = float(o.get("norm_hours_total") or 0.0)
+                        npu = o.get("norm_hours_per_unit")
+                        if npu is None:
+                            npu = (norm_total / qty) if qty > 0 else None
+                        row_values = [
+                            o.get("item_name") or "",
+                            o.get("item_article") or "",
+                            qty,
+                            norm_total,
+                            float(npu) if npu is not None else "",
+                            "",  # Дата потребности (в агрегате может отсутствовать)
+                            "",  # Дата начала
+                            "",  # Дата окончания
+                            o.get("unit") or "",
+                        ]
+                        ws.append(row_values)
+                        update_widths(row_values)
+                    # Пустая строка между группами
+                    ws.append([])
+            else:
+                # Фолбэк: плоский список без группировки
+                ws.append(headers)
+                hdr_row = ws.max_row
+                style_header(hdr_row)
+                update_widths(headers)
+                for row in data_rows:
+                    ws.append(row)
+                    update_widths(row)
+
+            # Установка ширины колонок в зависимости от контента (псевдо-автоширина)
+            for col_idx in range(1, len(headers) + 1):
+                letter = get_column_letter(col_idx)
+                width = max_widths.get(col_idx, 10)
+                # Коэффициент подбора ширины + небольшой запас, ограничения разумных пределов
+                adjusted = min(max(width * 1.2 + 2, 12), 60)
+                ws.column_dimensions[letter].width = adjusted
+
+            bio = io.BytesIO()
+            wb.save(bio)
+            bio.seek(0)
+            b64 = base64.b64encode(bio.read()).decode("utf-8")
+            return {
+                "status": "ok",
+                "format": "xlsx",
+                "data_base64": b64,
+                "filename": f"mrp_production_run_{run_id}.xlsx",
+                "total_rows": len(data_rows) if not groups else sum(len((g.get("orders") or [])) for g in groups),
+            }
+        else:
+            import io, csv
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(headers)
+            for row in data_rows:
+                writer.writerow(row)
+            return {
+                "status": "ok",
+                "format": "csv",
+                "data": output.getvalue(),
+                "filename": f"mrp_production_run_{run_id}.csv",
+                "total_rows": len(data_rows),
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 @router.get("/results/{run_id}/purchases/export")
 async def export_planning_result_purchases(
     run_id: int,

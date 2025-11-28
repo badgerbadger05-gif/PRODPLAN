@@ -479,3 +479,54 @@ class ResourceStageWithName(ResourceStageBase):
 
     class Config:
         from_attributes = True
+# --- MRP Production response models (for grouped endpoint) ---
+
+class ProductionStage(BaseModel):
+    stage_id: int
+    area_id: Optional[int] = None
+    area_name: Optional[str] = None
+    bucket_type: Optional[str] = "daily"
+    bucket_date: Optional[str] = None
+    hours: Optional[float] = 0.0
+    missingNorm: Optional[bool] = None
+
+
+class ProductionFlags(BaseModel):
+    missingArea: Optional[bool] = None
+    missingNorm: Optional[bool] = None
+    componentBlocked: Optional[bool] = None
+    componentPartial: Optional[bool] = None
+    capacityShiftDays: Optional[int] = None
+
+
+class ProductionGroupOrder(BaseModel):
+    agg_key: str
+    item_id: int
+    item_name: Optional[str] = None
+    item_article: Optional[str] = None
+    unit: Optional[str] = None
+    qty: float
+    norm_hours_total: float
+    norm_hours_per_unit: Optional[float] = None
+    order_id: Optional[int] = None
+    display_qty: Optional[float] = None
+    display_norm_hours_total: Optional[float] = None
+    overload: Optional[bool] = None
+
+
+class ProductionGroup(BaseModel):
+    area_id: Optional[int] = None
+    area_name: str
+    orders: List[ProductionGroupOrder] = []
+    norm_sum_hours: float = 0.0
+    min_days_to_need: Optional[int] = None
+    cap_overload_hours: float = 0.0
+    cap_overloaded_buckets: int = 0
+
+
+class ProductionGroupedResponse(BaseModel):
+    groups: List[ProductionGroup]
+    total_groups: int
+    total_orders: int
+    limit: int
+    offset: int

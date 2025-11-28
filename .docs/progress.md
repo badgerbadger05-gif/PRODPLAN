@@ -1,3 +1,57 @@
+# 2025-11-27 09:43 — MRP Production: плоская выдача без «Участка» и новый grouped‑эндпоинт
+
+- Суть: реализованы требования задачи для выдачи результатов производства.
+  - Убрана колонка «Участок» из плоского ответа backend (main_area_* больше не возвращаются).
+  - Добавлен эндпоинт GET /api/v1/plan/results/{run_id}/production/grouped, который группирует заказы по «основному участку» (этап с максимальными hours) и совместим с текущим фронтендом.
+  - Страницы /mrp/:id будут отображать подзаголовки по участкам при непустом groups.
+
+Backend:
+- Плоская выдача:
+  - Из функции [get_run_production()](backend/app/services/planning_service.py:424) удалены поля main_area_id/main_area_name и логика их вычисления; в ответе остаются только stages[].area_id/area_name на уровне этапов для дальнейшей группировки.
+- Схемы:
+  - Добавлены Pydantic‑модели grouped‑ответа: [ProductionStage](backend/app/schemas.py:484), [ProductionGroupOrder](backend/app/schemas.py:502), [ProductionGroup](backend/app/schemas.py:517), [ProductionGroupedResponse](backend/app/schemas.py:527).
+- Новый сервис grouped:
+  - Реализована [get_run_production_grouped()](backend/app/services/planning_service.py:1157):
+    - Определение основного участка для заказа: этап с максимальными hours; если ни у одного этапа нет area_id — группа area_id=None, area_name="Без участка".
+    - Агрегаты мощностей подтягиваются из capacity_load в диапазоне дат (см. сборку cap_q: [planning_service.py](backend/app/services/planning_service.py:1339)).
+    - Сортировка групп по area_name ASC; пагинация limit/offset; возвращаются groups, total_groups, total_orders, limit, offset.
+- Роутер:
+  - Добавлен хэндлер [get_planning_result_production_grouped()](backend/app/routers/plan.py:395) по пути /api/v1/plan/results/{run_id}/production/grouped с response_model=ProductionGroupedResponse, делегирует в сервис.
+
+Frontend (минимальные правки):
+- Унифицированная таблица (fallback): удалено использование main_area_*.
+  - Файл: [ProductionUnifiedTable.vue](frontend/src/components/mrp/ProductionUnifiedTable.vue:1) — убраны поля main_area_id/main_area_name из типов и слияния строк; колонка «Участок» больше не показана в плоском режиме.
+- Группированный режим уже использует groups и автоматически начнёт отрисовывать подзаголовки при наличии данных от backend.
+
+Контракты/совместимость:
+- GET /api/v1/plan/results/{run_id}/production:
+  - Не содержит main_area_id/main_area_name; структура согласована с обновлёнными флагами/этапами.
+- GET /api/v1/plan/results/{run_id}/production/grouped:
+  - Возвращает { groups[], total_groups, total_orders, limit, offset }.
+  - Каждая группа: { area_id|null, area_name, orders[], norm_sum_hours, min_days_to_need|null, cap_overload_hours, cap_overloaded_buckets }.
+  - Заказы без участков — в группу area_id=null, area_name="Без участка".
+- Сортировка групп: area_name ASC (закреплено в сервисе).
+- Агрегаты мощностей: по capacity_load (overload_hours суммой и количество перегруженных бакетов).
+
+Проверки:
+- Backend: `pytest -q` — PASS (все тесты в проекте зелёные на текущем окружении).
+- OpenAPI: response_model для grouped‑эндпоинта задан; openapi.json обновится у FastAPI при старте.
+
+Ограничения и дальнейшие шаги:
+- Рекомендуется добавить сервисные unit‑тесты для:
+  - отсутствия main_area_* в плоском ответе,
+  - корректного формирования 3 групп (минимум 2 участка + «Без участка»),
+  - регрессий на сценарии, подобные run 70 (есть участки) и run 161 (раньше не группировалось).
+- Фронтенд уже ожидает groups; дополнительных правок, кроме удаления плоской колонки, не требуется.
+
+Затронутые файлы/участки:
+- Backend:
+  - [get_run_production()](backend/app/services/planning_service.py:424) — очистка от main_area_*.
+  - [get_run_production_grouped()](backend/app/services/planning_service.py:1157) — новая логика группировки и агрегатов capacity.
+  - [router get_planning_result_production_grouped()](backend/app/routers/plan.py:395) — новый маршрут.
+  - Схемы: [ProductionGroupedResponse](backend/app/schemas.py:527) и связанные модели.
+- Frontend:
+  - [ProductionUnifiedTable.vue](frontend/src/components/mrp/ProductionUnifiedTable.vue:1) — удалены ссылки на main_area_*.
 # 2025-11-26 08:40 — Упрощение MRP-demand и отказ от weekly режима
 
 - **Суть**: реализованы пункты из [.docs/mrp_demand_refactor_plan.md](.docs/mrp_demand_refactor_plan.md) — расчёт спроса теперь строго дневной, даты дочерних BOM-позиций сдвигаются на `buffer_days`, а `include_wip` влияет на неттинг.
@@ -578,3 +632,81 @@ PRODPLAN станет ведущей MRP-системой в сегменте с
 - Фронтенд/схема БД не менялись.
 - Публичные методы планировщика сохранены, сигнатуры расширены обратимо (добавлен опциональный параметр).
 - buffer_days / expand_bom не тронуты: см. [`compute_gross_requirements()`](backend/app/services/planning_service.py:1123) и `expand_bom()` внутри него.
+
+# 2025-11-27 09:09 — Очередь 2: синхронизация фронта с backend флагами (KindIssues, плашки норм, участки, qty=0)
+
+- Суть: вернули кнопку «Проблемы привязки видов», плашки «нет норм/нет участка», отображение участка в таблицах, скрытие qty=0 по умолчанию; синхронизировали UI с новыми флагами backend (COMPONENT_SHORTAGE_BLOCKED/PARTIAL, CAPACITY_SHIFTED и др.). Алгоритмы неттинга/buffer_days/push-right не менялись.
+- Backend:
+  - Расширен summary:
+    - Добавлены агрегаты `kindIssues`, `missingNorms`, `componentShortages`; нормализованы warning‑коды (legacy → семантические).
+    - Файл: [backend/app/services/planning_service.py](backend/app/services/planning_service.py), функция get_run_summary().
+  - Расширен /production:
+    - В строках заказов возвращаются: `main_area_id`, `main_area_name`, `flags`:
+      - flags.missingArea, flags.missingNorm, flags.componentBlocked, flags.componentPartial, flags.capacityShiftDays.
+    - На уровне этапов: `area_name`, признак `missingNorm`.
+    - Технические строки qty=0 отфильтрованы на выдаче.
+    - Файл: [backend/app/services/planning_service.py](backend/app/services/planning_service.py), функция get_run_production().
+- Frontend:
+  - Типы данных:
+    - Добавлены WarningCode/WarningEntry, ProductionFlags, расширены ProductionStage/ProductionOrder, новые поля summary.kindIssues/missingNorms/componentShortages.
+    - Файл: [frontend/src/types/mrp.ts](frontend/src/types/mrp.ts).
+  - Сводка:
+    - Кнопка «Проблемы привязки видов» теперь опирается на `summary.kindIssues.total` с фолбэком по warnings; добавлены индикаторы: «без норм времени», «комп. дефицит (блок/частично)».
+    - Файл: [frontend/src/components/mrp/MRPSummaryCard.vue](frontend/src/components/mrp/MRPSummaryCard.vue).
+  - Таблицы производства:
+    - Унифицированная таблица: добавлена колонка «Участок» (main_area_name), плашки «без норматива» и «нет участка по виду».
+    - Файл: [frontend/src/components/mrp/ProductionUnifiedTable.vue](frontend/src/components/mrp/ProductionUnifiedTable.vue).
+    - Детальная таблица: отображение `area_name` в бейджах этапов, сводная плашка «без норматива», если есть этапы с нулевыми часами.
+    - Файл: [frontend/src/components/mrp/ProductionDetailTable.vue](frontend/src/components/mrp/ProductionDetailTable.vue).
+  - Страница результатов:
+    - Тумблер «Показать техстроки (qty=0)» (по умолчанию выключен), поддержка структурированного `summary.kindIssues.list`.
+    - Файл: [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue).
+  - Локализация:
+    - Добавлены строки для индикаторов и плашек.
+    - Файл: [frontend/src/i18n/ru.ts](frontend/src/i18n/ru.ts).
+- Проверки:
+  - Backend pytest:
+    - Команда: `set PYTHONPATH=. && pytest -q tests/test_planning_service.py` — PASS (2 passed).
+    - Команда: `set PYTHONPATH=. && pytest -q tests/services/test_order_quantity_calculator.py tests/services/test_capacity_scheduler.py` — PASS (7 passed).
+  - Frontend build:
+    - Команда: `cd frontend && npm ci --silent && npm run -s build` — успешная сборка SPA (vite).
+- Наблюдаемое поведение (ожидаемое на реальном run_id, например run_id=98):
+  - Сводка: видна кнопка «Проблемы привязки видов», индикаторы по отсутствию норм и дефицитам комплектующих.
+  - Таблицы производства:
+    - Появилась колонка «Участок»; у строк без норм — плашка «без норматива»; у строк без участка — «нет участка по виду».
+    - Строки с qty=0 скрыты по умолчанию; тумблер «Показать техстроки (qty=0)» включает их отображение.
+- Ограничения/заметки:
+  - Алгоритмы расчёта неттинга, buffer_days, push-right не изменялись.
+  - CAPACITY_SHIFTED отображается как `flags.capacityShiftDays` по сдвигу finish_date относительно need_date.
+
+## 2025-11-28
+- Восстановлен экспорт XLSX для раздела «Производство» на странице «Результаты прогона MRP».
+- Добавлен симметричный эндпоинт для экспорта производства: GET /v1/plan/results/{run_id}/production/export в [export_planning_result_production()](backend/app/routers/plan.py:521).
+  - Форматы: csv (поле data) и xlsx (поле data_base64), возвращаются также filename и total_rows.
+  - Колонки: Наименование, Артикул, Количество, Нормо-часы всего, Нормо-часы на ед., Дата потребности, Дата начала, Дата окончания, ЕИ.
+  - Логика полностью аналогична закупкам в [export_planning_result_purchases()](backend/app/routers/plan.py:521).
+- Фронтенд изначально вызывает [exportPlanningResultProduction()](frontend/src/services/api.ts:224), который обращается к /v1/plan/results/{run_id}/production/export — теперь маршрут реализован, совместимость восстановлена.
+- Изменён файл: [backend/app/routers/plan.py](backend/app/routers/plan.py).
+- Посторонние части кода не изменялись.
+
+## 2025-11-28 (upd)
+- Дополнительно реализована группировка в XLSX-выгрузке «Производство» по участкам (подзаголовки).
+- Логика: при формате xlsx эндпоинт [export_planning_result_production()](backend/app/routers/plan.py:521) запрашивает серверную группировку через [get_run_production_grouped()](backend/app/routers/plan.py:394) и формирует лист Excel блоками:
+  - Строка «Участок: {area_name}»
+  - Строка заголовков колонок
+  - Строки заказов группы
+  - Пустая строка-разделитель между группами
+- Если группировка недоступна/пуста — фолбэк: плоская таблица как прежде.
+- CSV остаётся без группировки (как было).
+
+## 2025-11-28 (upd2)
+- XLSX экспорт «Производство»: добавлены автоширина столбцов и цветовое выделение подзаголовков групп участков.
+  - В [export_planning_result_production()](backend/app/routers/plan.py:521) при формировании XLSX:
+    - Заголовки групп «Участок: …» выделяются цветом (PatternFill) и жирным шрифтом, ячейки объединяются по ширине таблицы.
+    - Реализована вычисляемая автоширина столбцов: анализируется максимальная длина контента в колонке, устанавливается ширина (ограничение 12..60 символов).
+    - Заголовки таблиц выделены жирным.
+  - При недоступности группировки — сохраняется плоский режим; CSV остаётся без группировки.
+
+## 2025-11-28 (upd3)
+- Подзаголовки групп «Участок: …» в XLSX сделаны чуть ярче: фон синий (ARGB FF4F81BD), текст белый.
+  - Место изменения: [export_planning_result_production()](backend/app/routers/plan.py:521), настройка PatternFill/Font для ячейки подзаголовка.

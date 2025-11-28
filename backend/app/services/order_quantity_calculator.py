@@ -24,18 +24,20 @@ class OrderQuantityCalculator:
         spec_by_id: Dict[int, Any],
         components_loader: Callable[[int], List[Any]],
         item_by_id: Dict[int, Any],
-        res_by_id: Dict[int, Any],
-        production_kinds_by_resource: Dict[int, Set[int]],
-        stock_by_item: Dict[int, float],
-        wip_by_item: Dict[int, float],
-        horizon_days: int,
-        total_demand_by_item: Dict[int, float],
+        units_by_ref: Optional[Dict[str, Any]] = None,
+        res_by_id: Dict[int, Any] = None,
+        production_kinds_by_resource: Dict[int, Set[int]] = None,
+        stock_by_item: Dict[int, float] = None,
+        wip_by_item: Dict[int, float] = None,
+        horizon_days: int = 0,
+        total_demand_by_item: Dict[int, float] = None,
     ) -> None:
         self.snapshot = snapshot or {}
         self.default_spec_map = default_spec_map or {}
         self.spec_by_id = spec_by_id or {}
         self.components_loader = components_loader
         self.item_by_id = item_by_id or {}
+        self.units_by_ref = units_by_ref or {}
         self.res_by_id = res_by_id or {}
         self.production_kinds_by_resource = production_kinds_by_resource or {}
         self.stock_by_item = stock_by_item or {}
@@ -51,42 +53,48 @@ class OrderQuantityCalculator:
           (final_qty_before_lotsizing, normalized_qty, computation_details, warnings)
 
         where:
-          - final_qty_before_lotsizing = min(requested_qty, component_limit, horizon_total_demand)
+          - final_qty_before_lotsizing = min(requested_qty, horizon_total_demand) [capped to integer for discrete units]
           - normalized_qty = lot-sized qty considering optimal_batch and buffer
           - computation_details =
               {
                 'requested_qty': float,
                 'buffer_qty': float,
                 'horizon_limit': float,
-                'component_limit': float,
-                'final_qty_before_capacity': float,   # equals final_qty_before_lotsizing
+                'component_limit': float,  # integer for discrete units
+                'final_qty_before_capacity': float,
                 'normalized_qty': float
               }
         """
         warnings: List[Dict[str, Any]] = []
         item = self.item_by_id.get(int(item_id))
+        is_discrete = self._is_discrete_unit_by_item(int(item_id))
 
         # 1) Buffer qty by area buffer_days and average daily demand
         buffer_qty = self._calculate_buffer_qty(item_id)
 
-        # 2) Horizon demand limit
+        # 2) Horizon demand limit (integer for discrete units)
         total_horizon_demand = float(self.total_demand_by_item.get(int(item_id), 0.0) or 0.0)
+        if is_discrete:
+            try:
+                total_horizon_demand = math.floor(total_horizon_demand + 1e-9)
+            except Exception:
+                total_horizon_demand = float(int(total_horizon_demand))
 
         # 3) Components availability limit (based on default spec if any)
-        #    For phase-1 planning we use it only for warnings, not for hard capping qty,
-        #    because purchase proposals to cover shortages are created in the same phase.
+        #    We compute it for diagnostics, rounding down to whole units for discrete parents.
         component_limit = None
         spec_id = self.default_spec_map.get(int(item_id))
         if spec_id:
-            comp_limit, comp_warnings = self._limit_by_components(int(spec_id), float(requested_qty or 0.0))
+            comp_limit, comp_warnings = self._limit_by_components(int(spec_id), float(requested_qty or 0.0), int(item_id))
             component_limit = float(comp_limit)
             warnings.extend(comp_warnings)
 
         # 4) Compose final quantity before lot sizing:
-        #    limited by requested qty and horizon demand; component shortages are signalled via warnings.
         final_qty = min(float(requested_qty or 0.0), float(total_horizon_demand or 0.0))
         if final_qty < 0.0:
             final_qty = 0.0
+        if is_discrete:
+            final_qty = float(math.floor(final_qty + 1e-9))
 
         # 5) Lot sizing for production with optimal_batch priority over buffer
         # Important: normalized_qty may exceed requested "final_qty" due to buffer/optimal batch preferences.
@@ -97,8 +105,6 @@ class OrderQuantityCalculator:
             "requested_qty": float(requested_qty or 0.0),
             "buffer_qty": float(buffer_qty),
             "horizon_limit": float(total_horizon_demand),
-            # For diagnostics we still expose the computed component_limit (if any),
-            # but it no longer caps final_qty in phase-1 planning.
             "component_limit": float(component_limit if component_limit is not None else (requested_qty or 0.0)),
             "final_qty_before_capacity": float(final_qty),
             "normalized_qty": float(normalized_qty),
@@ -234,18 +240,49 @@ class OrderQuantityCalculator:
         avg_daily_demand = total_demand / float(max(1, self.horizon_days))
         return float(avg_daily_demand * buffer_days)
 
-    def _limit_by_components(self, spec_id: int, requested_qty: float) -> Tuple[float, List[Dict[str, Any]]]:
+    def _is_discrete_unit_by_item(self, item_id: int) -> bool:
+        """
+        Heuristic to determine if an item must be planned in whole units (шт).
+        Priority:
+          - units.precision == 0 -> discrete
+          - units.short_name in {'шт','pcs','pc'} -> discrete
+          - units.short_name in {'кг','kg','м','m','мм','cm','л'} -> metric (not discrete)
+        Fallback: treat as discrete.
+        """
+        try:
+            item = self.item_by_id.get(int(item_id))
+            ref = getattr(item, "unit", None) if item is not None else None
+            if ref and self.units_by_ref:
+                u = self.units_by_ref.get(ref)
+                if u is not None:
+                    try:
+                        prec = getattr(u, "precision", None)
+                        if prec is not None and int(prec) == 0:
+                            return True
+                    except Exception:
+                        pass
+                    short = str(getattr(u, "short_name", None) or "").strip().lower()
+                    if short in {"шт", "pcs", "pc"}:
+                        return True
+                    if short in {"кг", "kg", "м", "m", "мм", "cm", "л", "l"}:
+                        return False
+            return True
+        except Exception:
+            return True
+
+    def _limit_by_components(self, spec_id: int, requested_qty: float, parent_item_id: int) -> Tuple[float, List[Dict[str, Any]]]:
         """
         Limit possible production by availability of components:
         possible_from_child = (stock + wip) / qty_per_unit
+        Note: returns RAW possible qty (may be fractional). Discrete rounding is handled later.
         Returns (max_producible_qty, warnings_list)
         """
         warnings: List[Dict[str, Any]] = []
-
+ 
         max_producible = float(requested_qty or 0.0)
         if max_producible <= 0.0:
             return 0.0, warnings
-
+ 
         comps = self.components_loader(int(spec_id)) or []
         for comp in comps:
             try:
@@ -255,26 +292,34 @@ class OrderQuantityCalculator:
                     continue
             except Exception:
                 continue
-
-            child_stock = float(self.stock_by_item.get(child_id, 0.0) or 0.0)
-            child_wip = float(self.wip_by_item.get(child_id, 0.0) or 0.0)
-            available_child = child_stock + child_wip
-
-            possible = available_child / per_unit if per_unit > 0.0 else 0.0
-            if possible < max_producible:
-                if possible < float(requested_qty or 0.0) - 1e-9:
-                    warnings.append(
-                        make_warning(
-                            "COMPONENT_SHORTAGE",
-                            f"Component shortage limits production: component_id={child_id}",
-                            component_id=int(child_id),
-                            requested_qty=float(requested_qty),
-                            max_producible_from_component=float(possible),
+ 
+        child_stock = None
+        for comp in comps:
+            try:
+                child_id = int(getattr(comp, "item_id"))
+                per_unit = float(getattr(comp, "quantity", 0.0) or 0.0)
+                if per_unit <= 0.0:
+                    continue
+                child_stock = float(self.stock_by_item.get(child_id, 0.0) or 0.0)
+                child_wip = float(self.wip_by_item.get(child_id, 0.0) or 0.0)
+                available_child = child_stock + child_wip
+                possible = available_child / per_unit if per_unit > 0.0 else 0.0
+                if possible < max_producible:
+                    if possible < float(requested_qty or 0.0) - 1e-9:
+                        warnings.append(
+                            make_warning(
+                                "COMPONENT_SHORTAGE",
+                                f"Component shortage limits production: component_id={child_id}",
+                                component_id=int(child_id),
+                                requested_qty=float(requested_qty),
+                                max_producible_from_component=float(possible),
+                            )
                         )
-                    )
-                max_producible = possible
-
+                    max_producible = possible
+            except Exception:
+                continue
+ 
         if max_producible < 0.0:
             max_producible = 0.0
-
+ 
         return float(max_producible), warnings

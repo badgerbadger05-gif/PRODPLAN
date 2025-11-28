@@ -505,8 +505,6 @@ def get_run_production(
                 "stages": [],
                 "norm_hours_total": 0.0,
                 "norm_hours_per_unit": None,
-                "main_area_id": None,
-                "main_area_name": None,
                 # flags for UI semantics
                 "flags": {
                     "missingArea": False,
@@ -599,8 +597,6 @@ def get_run_production(
                 "stages": [],
                 "norm_hours_total": 0.0,
                 "norm_hours_per_unit": None,
-                "main_area_id": None,
-                "main_area_name": None,
                 "flags": {
                     "missingArea": False,
                     "missingNorm": False,
@@ -615,15 +611,6 @@ def get_run_production(
         norm_total = float(sum(float(x.get("hours") or 0.0) for x in order_stages))
         aggregated_data[agg_key]["norm_hours_total"] += norm_total
 
-        # Determine/refresh main area by max hours among stages (if any)
-        try:
-            all_stages = aggregated_data[agg_key]["stages"] or []
-            if all_stages:
-                best = max(all_stages, key=lambda s: float(s.get("hours") or 0.0))
-                aggregated_data[agg_key]["main_area_id"] = best.get("area_id")
-                aggregated_data[agg_key]["main_area_name"] = best.get("area_name")
-        except Exception:
-            pass
 
         # Compute flags per order and OR-aggregate into aggregated_data flags
         flags = aggregated_data[agg_key]["flags"]
@@ -1167,6 +1154,253 @@ def get_run_purchases(
         "offset": int(effective_offset),
     }
 
+def get_run_production_grouped(
+    db: Session,
+    run_id: int,
+    item_id: Optional[int] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    area_id: Optional[int] = None,
+    limit: int = 100,
+    offset: int = 0,
+    sort_by: Optional[str] = None,
+    sort_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Сгруппированная по участкам выдача производственных заказов для прогона.
+    Группы формируются по основному участку заказа (stage с максимальными hours).
+    - area_id=None => группа «Без участка»
+    - Агрегаты мощностей подтягиваются из capacity_load в заданном диапазоне дат.
+    """
+    # 1) Базовый запрос по заказам с денормализацией item/unit
+    q = (
+        db.query(
+            PlannedOrder,
+            Item.item_name,
+            Item.item_article,
+            Item.unit,
+            Unit.short_name,
+            Unit.unit_name,
+            Unit.unit_code,
+        )
+        .outerjoin(Item, PlannedOrder.item_id == Item.item_id)
+        .outerjoin(Unit, Item.unit == Unit.unit_ref1c)
+        .filter(PlannedOrder.run_id == run_id)
+    )
+    if item_id is not None:
+        q = q.filter(PlannedOrder.item_id == int(item_id))
+
+    rows_joined = q.all()
+    date_from_dt = _to_date(date_from) if date_from else None
+    date_to_dt = _to_date(date_to) if date_to else None
+
+    # 2) Фильтрация по пересечению интервала [start,finish] с [date_from,date_to]
+    filtered_rows: List[Tuple[PlannedOrder, Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]] = []
+    order_ids: List[int] = []
+    for row in rows_joined:
+        po, in_name, in_article, in_unit_guid, in_unit_short, in_unit_name, in_unit_code = row
+        include_row = True
+        start_dt = po.start_date.date() if isinstance(po.start_date, datetime) else po.start_date
+        finish_dt = po.finish_date.date() if isinstance(po.finish_date, datetime) else po.finish_date
+
+        if date_from_dt:
+            if finish_dt is None or finish_dt < date_from_dt:
+                include_row = False
+        if include_row and date_to_dt:
+            if start_dt is None or start_dt > date_to_dt:
+                include_row = False
+        if include_row:
+            filtered_rows.append(row)
+            order_ids.append(int(po.order_id))
+
+    # 3) Подтянуть этапы по выбранным заказам
+    stages: List[PlannedOrderStage] = []
+    if order_ids:
+        stages = (
+            db.query(PlannedOrderStage)
+            .filter(
+                PlannedOrderStage.run_id == run_id,
+                PlannedOrderStage.order_id.in_(order_ids),
+            )
+            .all()
+        )
+
+    # 4) Проставить area_name для этапов
+    area_name_by_id: Dict[int, str] = {}
+    try:
+        area_ids: Set[int] = {int(s.area_id) for s in stages if getattr(s, "area_id", None) is not None}
+        if area_ids:
+            res_rows: List[ProductionResource] = (
+                db.query(ProductionResource)
+                .filter(ProductionResource.resource_id.in_(list(area_ids)))
+                .all()
+            )
+            for r in res_rows:
+                try:
+                    area_name_by_id[int(r.resource_id)] = getattr(r, "resource_name", None) or ""
+                except Exception:
+                    continue
+    except Exception:
+        area_name_by_id = {}
+
+    stage_by_order: Dict[int, List[Dict[str, Any]]] = {}
+    for s in stages:
+        aid = int(s.area_id) if s.area_id is not None else None
+        aname = area_name_by_id.get(aid, "") if aid is not None else None
+        hours_f = float(s.hours or 0.0)
+        stage_by_order.setdefault(int(s.order_id), []).append(
+            {
+                "stage_id": int(s.stage_id),
+                "area_id": aid,
+                "area_name": aname,
+                "bucket_type": "daily",
+                "bucket_date": s.bucket_date.isoformat() if s.bucket_date else None,
+                "hours": hours_f,
+                "missingNorm": hours_f <= 1e-9,
+            }
+        )
+
+    # 5) Построить группы по основному участку для каждого заказа
+    groups_map: Dict[Optional[int], Dict[str, Any]] = {}
+    today_d = date.today()
+
+    def _unit_display(_guid: Optional[str], _short: Optional[str], _name: Optional[str], _code: Optional[str]) -> str:
+        return ( (_short or "") or (_name or "") or (_code or "") or (_guid or "") ).strip()
+
+    for row in filtered_rows:
+        po, in_name, in_article, in_unit_guid, in_unit_short, in_unit_name, in_unit_code = row
+        order_stages = stage_by_order.get(int(po.order_id), [])
+
+        # Нормо-часы суммарно по этапам
+        norm_total = float(sum(float(x.get("hours") or 0.0) for x in order_stages))
+
+        # Основной участок = stage с максимальными hours
+        main_area_id: Optional[int] = None
+        if order_stages:
+            try:
+                best = max(order_stages, key=lambda s: float(s.get("hours") or 0.0))
+                main_area_id = best.get("area_id")
+            except Exception:
+                main_area_id = None
+
+        # Имя группы
+        if main_area_id is None:
+            grp_area_name = "Без участка"
+        else:
+            grp_area_name = area_name_by_id.get(int(main_area_id), "") or "Без участка"
+
+        # Инициализация группы при первом заказе
+        if main_area_id not in groups_map:
+            groups_map[main_area_id] = {
+                "area_id": main_area_id,
+                "area_name": grp_area_name,
+                "orders": [],
+                "norm_sum_hours": 0.0,
+                "min_days_to_need": None,
+                "cap_overload_hours": 0.0,
+                "cap_overloaded_buckets": 0,
+            }
+
+        unit_display = _unit_display(in_unit_guid, in_unit_short, in_unit_name, in_unit_code)
+        qty_f = float(po.qty or 0.0)
+        norm_per_unit = float(norm_total / qty_f) if qty_f > 1e-12 and norm_total > 0 else None
+
+        order_entry = {
+            "agg_key": f"{int(po.item_id)}|{unit_display}",
+            "item_id": int(po.item_id),
+            "item_name": in_name,
+            "item_article": in_article,
+            "unit": unit_display,
+            "qty": qty_f,
+            "norm_hours_total": float(norm_total),
+            "norm_hours_per_unit": norm_per_unit,
+            "order_id": int(po.order_id),
+        }
+
+        grp = groups_map[main_area_id]
+        grp["orders"].append(order_entry)
+        grp["norm_sum_hours"] = float(grp.get("norm_sum_hours", 0.0) + norm_total)
+
+        # min_days_to_need обновляем как минимум по (need_date - today).days
+        try:
+            if po.need_date:
+                need_d = po.need_date.date() if isinstance(po.need_date, datetime) else po.need_date
+                days = (need_d - today_d).days
+                cur = grp.get("min_days_to_need")
+                grp["min_days_to_need"] = days if (cur is None or days < int(cur)) else cur
+        except Exception:
+            pass
+
+    # 6) Фильтр по area_id группы (если задан)
+    if area_id is not None:
+        groups_map = {k: v for k, v in groups_map.items() if (k is not None and int(k) == int(area_id))}
+
+    # 7) Подтянуть агрегаты мощностей из capacity_load
+    cap_q = db.query(CapacityLoad).filter(CapacityLoad.run_id == run_id)
+    if date_from_dt:
+        cap_q = cap_q.filter(CapacityLoad.bucket_date >= date_from_dt)
+    if date_to_dt:
+        cap_q = cap_q.filter(CapacityLoad.bucket_date <= date_to_dt)
+    cap_rows: List[CapacityLoad] = cap_q.all()
+    cap_map: Dict[int, Dict[str, float]] = {}
+    for r in cap_rows:
+        try:
+            aid = int(r.area_id)
+        except Exception:
+            continue
+        entry = cap_map.setdefault(aid, {"overload_hours": 0.0, "overloaded_buckets": 0.0})
+        ov = float(r.overload_hours or 0.0)
+        entry["overload_hours"] += ov
+        if ov > 1e-9:
+            entry["overloaded_buckets"] += 1.0
+
+    # Применить capacity агрегаты к группам
+    for k, grp in groups_map.items():
+        if k is None:
+            # Без участка оставляем нули
+            continue
+        cap = cap_map.get(int(k))
+        if cap:
+            grp["cap_overload_hours"] = float(cap.get("overload_hours", 0.0))
+            grp["cap_overloaded_buckets"] = int(cap.get("overloaded_buckets", 0.0))
+
+    # 8) Сортировка и пагинация
+    groups_list = list(groups_map.values())
+
+    # Обновим area_name для всех (на случай поздней загрузки)
+    for g in groups_list:
+        if g.get("area_id") is None:
+            g["area_name"] = "Без участка"
+        else:
+            if not g.get("area_name"):
+                g["area_name"] = area_name_by_id.get(int(g["area_id"]), "") or "Без участка"
+
+    # Сортировка групп: по area_name ASC (сначала непустые)
+    def _area_sort_key(g: Dict[str, Any]) -> Tuple[int, str]:
+        nm = (g.get("area_name") or "").strip()
+        return (0 if nm else 1, nm.lower())
+
+    groups_list.sort(key=_area_sort_key)
+
+    total_groups = len(groups_list)
+    total_orders = sum(len(g.get("orders", []) or []) for g in groups_list)
+
+    # Пагинация
+    req_limit = int(limit or DEFAULT_PAGE_LIMIT)
+    effective_limit = max(1, min(req_limit, SERVER_MAX_LIMIT))
+    effective_offset = max(0, int(offset or 0))
+    start_idx = effective_offset
+    end_idx = start_idx + effective_limit
+    groups_page = groups_list[start_idx:end_idx]
+
+    return {
+        "groups": groups_page,
+        "total_groups": int(total_groups),
+        "total_orders": int(total_orders),
+        "limit": int(effective_limit),
+        "offset": int(effective_offset),
+    }
+
 
 def get_run_capacity(
     db: Session,
@@ -1506,6 +1740,7 @@ def build_planned_orders_and_purchases(
     order_qty_calculator: OrderQuantityCalculator,
     priority_manager: PriorityManager,
     item_cache: Dict[int, Item],
+    units_by_ref: Dict[str, Unit],
 ) -> Dict[str, Any]:
     
     run_id = run.run_id
@@ -1541,6 +1776,28 @@ def build_planned_orders_and_purchases(
             warnings.append(w)
             continue
 
+        # Helper: determine discreteness (whole units) by Unit settings
+        def _is_discrete_unit(it: Optional[Item]) -> bool:
+            try:
+                ref = getattr(it, "unit", None) if it is not None else None
+                u = units_by_ref.get(ref) if ref else None
+                if u is not None:
+                    try:
+                        prec = getattr(u, "precision", None)
+                        if prec is not None and int(prec) == 0:
+                            return True
+                    except Exception:
+                        pass
+                    short = str(getattr(u, "short_name", None) or "").strip().lower()
+                    if short in {"шт", "pcs", "pc"}:
+                        return True
+                    if short in {"кг", "kg", "м", "m", "мм", "cm", "л", "l"}:
+                        return False
+                # Fallback: treat as discrete
+                return True
+            except Exception:
+                return True
+
         # Определение типа потока: производство или закупка.
         # Логика согласована с документацией модуля расчёта заказов:
         # если в наименовании способа пополнения содержится "покуп", "закуп", "purchase", "buy" —
@@ -1561,6 +1818,15 @@ def build_planned_orders_and_purchases(
 
             horizon_limit = float(comp_details.get("horizon_limit", float(requested_qty)))
             component_limit = float(comp_details.get("component_limit", float(requested_qty)))
+
+            # If item is discrete, requested must be whole after compute()
+            if _is_discrete_unit(item):
+                try:
+                    requested_qty = float(math.floor(final_qty_before + 1e-9))
+                except Exception:
+                    requested_qty = float(int(final_qty_before))
+            else:
+                requested_qty = float(final_qty_before)
 
             # Component gating:
             # - If component_limit <= 0 -> do NOT create PlannedOrder. Record a blocking warning.
@@ -1596,6 +1862,14 @@ def build_planned_orders_and_purchases(
                 planned_qty = min(float(normalized_qty or 0.0), horizon_limit, component_limit)
 
             planned_qty = float(planned_qty or 0.0)
+
+            # Enforce whole units for discrete items
+            if _is_discrete_unit(item):
+                try:
+                    planned_qty = float(math.floor(planned_qty + 1e-9))
+                except Exception:
+                    planned_qty = float(int(planned_qty))
+
             if planned_qty <= 1e-9:
                 # Safety: avoid creating qty=0 rows for any reason
                 continue
@@ -1741,6 +2015,28 @@ def build_order_stages(
 
             allowed_resources = resource_kind_cache.get(spec.production_kind_id, [])
             resource_kind = allowed_resources[0] if allowed_resources else None
+            # Если у вида производства нет ни одной привязки к участку — это проблема входящих данных.
+            # Раньше формировалось предупреждение NO_AREA_FOR_PRODUCTION_KIND, которое использовалось на фронтенде.
+            # Восстанавливаем его генерацию (даже если далее сработает фолбэк по ResourceStage).
+            if not allowed_resources:
+                try:
+                    w = log_warning(
+                        logger,
+                        "NO_AREA_FOR_PRODUCTION_KIND",
+                        "Нет привязки вида производства к участкам",
+                        run_id=run_id,
+                        item_id=int(order.item_id),
+                        spec_id=int(spec.spec_id),
+                        spec_code=getattr(spec, "spec_code", None),
+                        spec_name=getattr(spec, "spec_name", None),
+                        spec_ref1c=getattr(spec, "spec_ref1c", None),
+                        production_kind_id=int(spec.production_kind_id) if getattr(spec, "production_kind_id", None) else None,
+                        production_kind_name=getattr(kind, "name", None) if kind else None,
+                    )
+                    warnings.append(w)
+                except Exception:
+                    # Диагностика не должна ломать расчёт
+                    pass
             logger.debug(
                 "Order stage build candidate",
                 extra={
@@ -1909,12 +2205,17 @@ def run_planning_run(
         for item_id_str, buckets in net_requirements.items():
             total_demand_by_item[int(item_id_str)] += sum(float(val or 0.0) for val in buckets.values())
 
+        # Units cache for discreteness policy
+        units_all = db.query(Unit).all()
+        units_by_ref = {getattr(u, "unit_ref1c"): u for u in units_all}
+
         order_qty_calculator = OrderQuantityCalculator(
             snapshot=run.config_snapshot,
             default_spec_map=default_spec_map,
             spec_by_id=spec_by_id,
             components_loader=components_loader,
             item_by_id=item_cache,
+            units_by_ref=units_by_ref,
             res_by_id=res_by_id,
             production_kinds_by_resource=production_kinds_by_resource,
             stock_by_item=stock_by_item,
@@ -1956,7 +2257,7 @@ def run_planning_run(
 
         # --- PHASE 1: Build Orders and Purchases ---
         order_result = build_planned_orders_and_purchases(
-            db, run, net_requirements, order_qty_calculator, priority_manager, item_cache
+            db, run, net_requirements, order_qty_calculator, priority_manager, item_cache, units_by_ref
         )
         all_warnings.extend(order_result["warnings"])
         db.flush()
@@ -1983,6 +2284,61 @@ def run_planning_run(
         )
         db.add_all(pegging_links)
         
+        # Enrich warnings with nomenclature (item/root) meta so UI can display names and articles
+        try:
+            # Build child -> parent map from one-level pegging links
+            parent_by_child: Dict[int, int] = {}
+            for l in pegging_links:
+                try:
+                    if getattr(l, "child_item_id", None) is not None and getattr(l, "parent_item_id", None) is not None:
+                        parent_by_child[int(l.child_item_id)] = int(l.parent_item_id)
+                except Exception:
+                    continue
+
+            def _ensure_item(iid: Optional[int]):
+                if iid is None:
+                    return None
+                ii = int(iid)
+                it = item_cache.get(ii)
+                if it is None:
+                    try:
+                        it = db.query(Item).filter(Item.item_id == ii).first()
+                        if it:
+                            item_cache[ii] = it
+                    except Exception:
+                        it = None
+                return it
+
+            for w in all_warnings:
+                try:
+                    iid = w.get("item_id")
+                    it = _ensure_item(iid)
+                    if it is not None:
+                        # Fill current item meta if absent
+                        w.setdefault("item_code", getattr(it, "item_code", None))
+                        w.setdefault("item_name", getattr(it, "item_name", None))
+                        w.setdefault("item_article", getattr(it, "item_article", None))
+                    # Resolve root (parent from pegging) or fallback to the same item
+                    parent_iid = None
+                    try:
+                        parent_iid = parent_by_child.get(int(iid)) if iid is not None else None
+                    except Exception:
+                        parent_iid = None
+                    if parent_iid is None and iid is not None:
+                        parent_iid = int(iid)
+                    p = _ensure_item(parent_iid)
+                    if p is not None:
+                        w.setdefault("root_item_id", int(getattr(p, "item_id", None) or parent_iid or 0))
+                        w.setdefault("root_item_code", getattr(p, "item_code", None))
+                        w.setdefault("root_item_name", getattr(p, "item_name", None))
+                        w.setdefault("root_item_article", getattr(p, "item_article", None))
+                except Exception:
+                    # best-effort enrichment; skip invalid warning shapes
+                    continue
+        except Exception:
+            # Do not fail a successful run because of enrichment issues
+            pass
+
         run.status = "SUCCESS"
         run.warnings = all_warnings
 
