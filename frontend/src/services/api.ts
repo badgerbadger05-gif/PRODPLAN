@@ -74,7 +74,6 @@ export type PlanningRunRow = {
   started_at: string | null
   finished_at: string | null
   horizon_days?: number | null
-  use_weekly?: boolean
   order_count?: number
   purchase_count?: number
   overload_buckets?: number
@@ -97,7 +96,6 @@ export async function listPlanningRuns(params: {
 
 export async function startPlanningRun(body: {
   horizon_days?: number
-  use_weekly?: boolean
   config_overrides?: any
   started_by?: string
 } = {}): Promise<{ status: string; run_id: number }> {

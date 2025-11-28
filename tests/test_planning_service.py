@@ -1,0 +1,134 @@
+import datetime
+from types import SimpleNamespace
+from typing import List, Dict, Any
+
+import pytest
+
+from backend.app.services.planning_service import (
+    get_run_production,
+    get_run_purchases,
+)
+
+
+class FakeQuery:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def filter(self, *args, **kwargs):
+        return self
+
+    def outerjoin(self, *args, **kwargs):
+        return self
+
+    def add_columns(self, *args, **kwargs):
+        return self
+
+    def all(self):
+        return self._rows
+
+    def count(self):
+        return len(self._rows)
+
+    def offset(self, *args, **kwargs):
+        return self
+
+    def limit(self, *args, **kwargs):
+        return self
+
+    def order_by(self, *args, **kwargs):
+        return self
+
+
+class FakeSession:
+    def __init__(self, joins: Dict[Any, List[Any]]):
+        self.joins = joins
+
+    def query(self, *entities):
+        key = tuple(entities)
+        rows = self.joins.get(key, [])
+        return FakeQuery(rows)
+
+
+def _po(**kwargs):
+    defaults = dict(
+        order_id=1,
+        item_id=100,
+        qty=10,
+        start_date=datetime.datetime(2025, 1, 2),
+        finish_date=None,
+        need_date=datetime.date(2025, 1, 10),
+        route_ref="r",
+        priority_index=1,
+        bucket_type="daily",
+        bucket_date=datetime.date(2025, 1, 2),
+        demand_ref=None,
+        demand_date=None,
+    )
+    defaults.update(kwargs)
+    return SimpleNamespace(**defaults)
+
+
+def _pos(**kwargs):
+    defaults = dict(
+        run_id=1,
+        order_id=1,
+        stage_id=1,
+        area_id=2,
+        bucket_type="daily",
+        bucket_date=datetime.date(2025, 1, 2),
+        hours=1,
+    )
+    defaults.update(kwargs)
+    return SimpleNamespace(**defaults)
+
+
+def test_get_run_production_handles_missing_start_date():
+    po_main = _po(order_id=10, item_id=2326, start_date=None, finish_date=datetime.date(2025, 1, 5))
+    item_row = (po_main, "Item", "ART", "guid", "шт", "ШТ", "PCE")
+
+    def fake_query_planned_order(*args):
+        if args and getattr(args[0], "__name__", "") == "PlannedOrder":
+            return FakeQuery([item_row])
+        return FakeQuery([])
+
+    fake_session = FakeSession({})
+    fake_session.query = fake_query_planned_order
+
+    result = get_run_production(fake_session, run_id=1)
+    assert result["rows"], "Должна вернуться хотя бы одна строка"
+    assert result["rows"][0]["start_date"] == "2025-01-05"
+    assert result["rows"][0]["norm_hours_total"] >= 0
+
+
+def test_get_run_purchases_handles_missing_columns():
+    purchase_row = (
+        1,
+        200,
+        5,
+        datetime.date(2025, 1, 10),
+        datetime.date(2025, 1, 2),
+        7,
+        0.5,
+        "daily",
+        datetime.date(2025, 1, 2),
+        "SUP",
+        None,
+        None,
+        "guid",
+        None,
+        None,
+        None,
+    )
+
+    def fake_query_planned_purchase(*args):
+        return FakeQuery([purchase_row])
+
+    fake_session = FakeSession({})
+    fake_session.query = fake_query_planned_purchase
+
+    result = get_run_purchases(fake_session, run_id=1)
+    assert result["rows"], "Должна вернуться хотя бы одна запись закупки"
+    row = result["rows"][0]
+    assert row["qty"] == 5
+    assert row["item_id"] == 200
+    assert row["unit"] == "guid"

@@ -7,6 +7,7 @@
     row-key="rowKey"
     :loading="loading"
     :pagination="{ rowsPerPage: 50 }"
+    :no-data-label="t('mrp.table.noDataLabel')"
   >
     <template #body-cell-name="p">
       <q-td :props="p">

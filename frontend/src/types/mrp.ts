@@ -1,7 +1,24 @@
 // Типы домена MRP для фронтенда (Vue/Quasar). Единая точка правды для данных страниц результатов прогона.
 
-export type BucketType = 'daily' | 'weekly'
+export type BucketType = 'daily'
 export type IsoDate = string // 'YYYY-MM-DD'
+
+// Бэкенд предупреждения/флаги
+export type WarningCode =
+  | 'COMPONENT_SHORTAGE_BLOCKED'
+  | 'COMPONENT_SHORTAGE_PARTIAL'
+  | 'CAPACITY_UNSCHEDULED'
+  | 'CAPACITY_SHIFTED'
+  | 'NO_AREA_FOR_PRODUCTION_KIND'
+  | 'NO_PRODUCTION_KIND'
+  | 'NO_TIME_NORM'
+  | string
+
+export type WarningEntry = {
+  code: WarningCode
+  msg?: string
+  [k: string]: any
+}
 
 // ---------- Summary ----------
 export interface MRPSummaryRun {
@@ -10,7 +27,6 @@ export interface MRPSummaryRun {
   started_at: string | null
   finished_at: string | null
   horizon_days?: number | null
-  use_weekly?: boolean
 }
 
 export interface MRPSummaryCounts {
@@ -25,12 +41,31 @@ export interface MRPSummaryCapacity {
   hours_available_total?: number
 }
 
+export interface MRPSummaryKindIssues {
+  total: number
+  byCode?: Record<string, number>
+  list?: WarningEntry[]
+}
+
+export interface MRPSummaryMissingNorms {
+  total: number
+}
+
+export interface MRPSummaryComponentShortages {
+  blocked: number
+  partial: number
+}
+
 export interface MRPSummary {
   run: MRPSummaryRun
   counts?: MRPSummaryCounts
   capacity?: MRPSummaryCapacity
   kpi?: any
-  warnings: any[]
+  warnings: WarningEntry[]
+  // Новые структурированные агрегаты
+  kindIssues?: MRPSummaryKindIssues
+  missingNorms?: MRPSummaryMissingNorms
+  componentShortages?: MRPSummaryComponentShortages
 }
 
 // ---------- Справочники ----------
@@ -53,9 +88,20 @@ export type AreaMap = Record<number, string>
 export interface ProductionStage {
   stage_id: number | string
   area_id?: number | null
-  bucket_type?: BucketType | null
+  area_name?: string | null
+  bucket_type?: BucketType | null // NOTE: Now always 'daily' - keeping for compatibility with existing data structures
   bucket_date?: IsoDate | null
   hours?: number | null
+  // Признак отсутствия норматива на этапе (hours ~ 0)
+  missingNorm?: boolean
+}
+
+export interface ProductionFlags {
+  missingArea?: boolean
+  missingNorm?: boolean
+  componentBlocked?: boolean
+  componentPartial?: boolean
+  capacityShiftDays?: number
 }
 
 export interface ProductionOrder {
@@ -68,13 +114,18 @@ export interface ProductionOrder {
   need_date?: string | null
   start_date?: string | null
   finish_date?: string | null
-  bucket_type?: BucketType | null
+  bucket_type?: BucketType | null // NOTE: Now always 'daily' - keeping for compatibility with existing data structures
   bucket_date?: IsoDate | null
   priority_index?: number | null
   stages?: ProductionStage[]
   // денормализованные поля для UI
   item_name?: string | null
   item_article?: string | null
+  // Основной участок для строки заказа (по этапу с максимумом часов)
+  main_area_id?: number | null
+  main_area_name?: string | null
+  // Флаги для отрисовки плашек/индикаторов
+  flags?: ProductionFlags
 }
 
 export interface ProductionGroupOrder {
@@ -123,7 +174,7 @@ export interface PurchaseRow {
   need_date?: string | null
   order_date?: string | null
   lead_time_days?: number | null
-  bucket_type?: BucketType | null
+  bucket_type?: BucketType | null // NOTE: Now always 'daily' - keeping for compatibility with existing data structures
   bucket_date?: IsoDate | null
   priority_index?: number | null
   // денормализованные поля для UI
@@ -143,7 +194,7 @@ export interface PurchaseGroupedRow {
 // ---------- Capacity ----------
 export interface CapacityRow {
   area_id: number
-  bucket_type?: BucketType | null
+  bucket_type?: BucketType | null // NOTE: Now always 'daily' - keeping for compatibility with existing data structures
   bucket_date?: IsoDate | null
   hours_planned: number
   hours_available: number

@@ -8,10 +8,12 @@
     :loading="loading"
     :pagination="pagination"
     @request="$emit('request', $event)"
+    :no-data-label="t('mrp.table.noDataLabel')"
   />
 </template>
 
 <script setup lang="ts">
+import { useI18n } from 'vue-i18n'
 import type { QTableColumn } from 'quasar'
 import type { CapacityRow } from '../../types/mrp'
 
@@ -27,6 +29,8 @@ const props = defineProps<{
   loading?: boolean
   pagination: TablePagination
 }>()
+
+const { t } = useI18n()
 
 defineEmits<{
   (e: 'request', payload: any): void

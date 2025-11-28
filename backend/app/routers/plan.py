@@ -16,7 +16,6 @@ from ..services.plan_service import (
 )
 
 from ..services.planning_service import (
-    create_planning_run,
     run_planning_run,
     list_planning_runs,
     get_run_summary,
@@ -27,19 +26,11 @@ from ..services.planning_service import (
     compute_planning_preview,
     compute_gross_requirements,
     # retention & pin control
-    cleanup_planning_runs,
-    set_run_pinned,
     # Config management
     list_planning_configs,
     create_planning_config_version,
     activate_planning_config_version,
-    get_active_planning_config_full,
-    # Grouped/agenda/summary endpoints
-    get_run_production_grouped,
-    get_run_purchases_grouped,
-    get_capacity_summary,
-    generate_shortage_report,
-    _generate_shortage_report_v2,
+    get_active_planning_config_full
 )
 from ..models import ProductionResource
 
@@ -208,7 +199,6 @@ async def ensure_plan_item(
 
 class CalcRequest(BaseModel):
     horizon_days: Optional[int] = None
-    use_weekly: Optional[bool] = None
     config_overrides: Optional[Dict[str, Any]] = None
     started_by: Optional[str] = None
 
@@ -238,7 +228,6 @@ async def start_planning_run(
         run_id = run_planning_run(
             db=db,
             horizon_days=req.horizon_days,
-            use_weekly=req.use_weekly,
             config_overrides=req.config_overrides or {},
             started_by=req.started_by or "api",
         )
@@ -260,7 +249,6 @@ async def calc_preview(
         result = compute_planning_preview(
             db=db,
             horizon_days=req.horizon_days,
-            use_weekly=req.use_weekly,
             config_overrides=req.config_overrides or {},
         )
         return {"status": "ok", "preview": result}
@@ -280,7 +268,6 @@ async def calc_gross(
         result = compute_gross_requirements(
             db=db,
             horizon_days=req.horizon_days,
-            use_weekly=req.use_weekly,
             config_overrides=req.config_overrides or {},
         )
         return {"status": "ok", "gross": result}
@@ -345,38 +332,6 @@ async def activate_config(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.post("/runs/{run_id}/pin")
-async def pin_planning_run(
-    run_id: int,
-    req: PinRequest,
-    db: Session = Depends(get_db),
-):
-    """
-    Установить/снять флаг 'pinned' у прогона, чтобы защитить его от авто‑очистки.
-    """
-    try:
-        return set_run_pinned(db=db, run_id=int(run_id), pinned=bool(req.pinned))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.post("/cleanup")
-async def cleanup_runs(
-    req: RetentionCleanupRequest,
-    db: Session = Depends(get_db),
-):
-    """
-    Удалить прогоны старше N дней (по умолчанию 30), кроме помеченных pinned=True.
-    Поддерживает dry_run для предварительного отчёта.
-    """
-    try:
-        return cleanup_planning_runs(
-            db=db,
-            older_than_days=int(req.older_than_days or 30),
-            dry_run=bool(req.dry_run),
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/runs")
@@ -530,153 +485,6 @@ async def get_stages(db: Session = Depends(get_db)):
 
 # === Export endpoints for results ===
 
-@router.get("/results/{run_id}/production/export")
-async def export_planning_result_production(
-    run_id: int,
-    format: str = "csv",
-    bucket_type: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    # day_date: Optional[str] = None, # Параметр удален, так как функция get_run_production_agenda_day больше не используется
-    sort_by: Optional[str] = None,
-    sort_dir: Optional[str] = None,
-    db: Session = Depends(get_db),
-):
-    """
-    Экспорт результатов «Производство» в CSV или XLSX (base64).
-    Колонки: Наименование, Артикул, Количество, ЕИ, Норматив, ч/шт, Норматив всего, ч
-
-    Примечание: Поддержка «Задания на день» (day_date) была удалена вместе с функцией get_run_production_agenda_day
-    """
-    try:
-        # Базовые колонки данных (как в исходной таблице)
-        headers = ["Наименование", "Артикул", "Количество", "ЕИ", "Норматив, ч/шт", "Норматив всего, ч"]
-
-        # Используем агрегированные данные с группировкой по (item_id, unit, production_kind) для устранения дублей в диапазоне дат
-        # Но сохраняем структуру с группами по "доминирующему участку" для корректного отображения в Excel
-        res = get_run_production_grouped(
-            db=db,
-            run_id=int(run_id),
-            bucket_type=bucket_type,
-            date_from=date_from,
-            date_to=date_to,
-            area_id=None,
-            limit=10000,
-            offset=0,
-            sort_by=sort_by,
-            sort_dir=sort_dir,
-            group_by_kind=True,  # включаем группировку по виду производства для устранения дублей
-        )
-        
-        # Создаем структуру с группами по участкам, используя результат grouped-функции
-        groups = {}
-        for group in res.get("groups", []):
-            area_name = group.get("area_name", "—")
-            group_rows = []
-            for order in group.get("orders", []):
-                # Преобразуем каждую агрегированную запись в формат, совместимый с оригинальным
-                row = {
-                    "item_name": order.get("item_name", ""),
-                    "item_article": order.get("item_article", ""),
-                    "qty": order.get("qty", 0.0),
-                    "unit": order.get("unit", ""),
-                    "norm_hours_per_unit": order.get("norm_hours_per_unit"),
-                    "norm_hours_total": order.get("norm_hours_total", 0.0),
-                    "stages": [],  # пустой список, так как данные уже агрегированы
-                    "need_date": None,
-                    "start_date": None,
-                    "finish_date": None,
-                    "route_ref": None,
-                    "priority_index": None,
-                    "bucket_type": None,
-                    "bucket_date": None,
-                    "demand_ref": None,
-                    "demand_date": None,
-                }
-                group_rows.append(row)
-            if group_rows:  # Добавляем группу только если есть записи
-                groups[area_name] = group_rows
-
-        grouped_keys = sorted(groups.keys(), key=lambda x: (x == "—", x))
-        # Количество строк данных (без учёта подзаголовков)
-        total_records = sum(len(groups.get(k, [])) for k in grouped_keys)
-
-        if (format or "csv").lower() == "xlsx":
-            # Генерация XLSX
-            import io, base64
-            try:
-                from openpyxl import Workbook
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"openpyxl not available: {e}")
-            from openpyxl.styles import Font, PatternFill
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "Production"
-            ws.append(headers)
-            for area_name in grouped_keys:
-                items = groups.get(area_name, [])
-                total_norm = sum(float(x.get("norm_hours_total") or 0.0) for x in items)
-                title = f"Производственный участок: {area_name} · Заказов: {len(items)} · Норматив всего: {total_norm:.3f} ч"
-                ws.append([title])
-                r = ws.max_row
-                ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=len(headers))
-                cell = ws.cell(row=r, column=1)
-                cell.font = Font(bold=True)
-                cell.fill = PatternFill("solid", fgColor="FFDDDD")
-                for x in items:
-                    ws.append([
-                        x.get("item_name") or "",
-                        x.get("item_article") or "",
-                        float(x.get("qty") or 0.0),
-                        x.get("unit") or "",
-                        float(x.get("norm_hours_per_unit") or 0.0) if x.get("norm_hours_per_unit") is not None else 0.0,
-                        float(x.get("norm_hours_total") or 0.0),
-                    ])
-                ws.append([])
-            bio = io.BytesIO()
-            wb.save(bio)
-            bio.seek(0)
-            b64 = base64.b64encode(bio.read()).decode("utf-8")
-            return {
-                "status": "ok",
-                "format": "xlsx",
-                "data_base64": b64,
-                "filename": f"mrp_production_run_{run_id}.xlsx",
-                "total_rows": int(total_records),
-            }
-        else:
-            # CSV
-            import io, csv
-            output = io.StringIO()
-            writer = csv.writer(output)
-            writer.writerow(headers)
-            for area_name in grouped_keys:
-                items = groups.get(area_name, [])
-                total_norm = sum(float(x.get("norm_hours_total") or 0.0) for x in items)
-                group_title = f"Производственный участок: {area_name} · Заказов: {len(items)} · Норматив всего: {total_norm:.3f} ч"
-                writer.writerow([group_title] + [""] * (len(headers) - 1))
-                for x in items:
-                    writer.writerow([
-                        x.get("item_name") or "",
-                        x.get("item_article") or "",
-                        float(x.get("qty") or 0.0),
-                        x.get("unit") or "",
-                        float(x.get("norm_hours_per_unit") or 0.0) if x.get("norm_hours_per_unit") is not None else 0.0,
-                        float(x.get("norm_hours_total") or 0.0),
-                    ])
-                writer.writerow([])
-            return {
-                "status": "ok",
-                "format": "csv",
-                "data": output.getvalue(),
-                "filename": f"mrp_production_run_{run_id}.csv",
-                "total_rows": int(total_records),
-            }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
 
 @router.get("/results/{run_id}/purchases/export")
 async def export_planning_result_purchases(
@@ -817,130 +625,5 @@ async def export_plan(
             "total_rows": len(export_rows)
         }
 
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-# === Backend-first aggregated/grouped endpoints (non-breaking, additive) ===
-
-@router.get("/results/{run_id}/production/grouped")
-async def get_planning_result_production_grouped(
-    run_id: int,
-    bucket_type: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    area_id: Optional[int] = None,
-    limit: int = 1000,
-    offset: int = 0,
-    sort_by: Optional[str] = None,
-    sort_dir: Optional[str] = None,
-    db: Session = Depends(get_db),
-):
-    """
-    Группировка производственных заказов по «виду/участку» (dominant area),
-    с серверной агрегацией по (item_id, unit) и индикаторами мощности.
-    Не ломает существующие endpoints; добавлен отдельно.
-    """
-    try:
-        return get_run_production_grouped(
-            db=db,
-            run_id=int(run_id),
-            bucket_type=bucket_type,
-            date_from=date_from,
-            date_to=date_to,
-            area_id=area_id,
-            limit=limit,
-            offset=offset,
-            sort_by=sort_by,
-            sort_dir=sort_dir,
-            group_by_kind=False,  # по умолчанию для обратной совместимости
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-# NOTE: Эндпоинт /results/{run_id}/production/agenda_day удален, так как функция get_run_production_agenda_day была удалена
-# ORIGINAL ENDPOINT:
-# @router.get("/results/{run_id}/production/agenda_day")
-# async def get_planning_result_production_agenda_day(
-#     run_id: int,
-#     day_date: str,
-#     area_id: Optional[int] = None,
-#     db: Session = Depends(get_db),
-# ):
-#     """
-#     Задание на конкретный день (daily) по видам/участкам.
-#     Пересчёт: часы → количество по норме на штуку, вычисленной на сервере.
-#     """
-#     try:
-#         return get_run_production_agenda_day(
-#             db=db,
-#             run_id=int(run_id),
-#             day_date=day_date,
-#             area_id=area_id,
-#         )
-#     except Exception as e:
-#         raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.get("/results/{run_id}/purchases/grouped")
-async def get_planning_result_purchases_grouped(
-    run_id: int,
-    bucket_type: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    limit: int = 1000,
-    offset: int = 0,
-    db: Session = Depends(get_db),
-):
-    """
-    Сводная группировка закупок по (item_id, unit) на сервере.
-    """
-    try:
-        return get_run_purchases_grouped(
-            db=db,
-            run_id=int(run_id),
-            bucket_type=bucket_type,
-            date_from=date_from,
-            date_to=date_to,
-            limit=limit,
-            offset=offset,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.get("/results/{run_id}/shortage-report")
-async def get_shortage_report(
-    run_id: int,
-    db: Session = Depends(get_db),
-):
-    """
-    Generate and return an XLSX shortage report for a given planning run.
-    """
-    try:
-        return _generate_shortage_report_v2(db=db, run_id=run_id)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.get("/results/{run_id}/capacity/summary")
-async def get_planning_result_capacity_summary(
-    run_id: int,
-    bucket_type: Optional[str] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    db: Session = Depends(get_db),
-):
-    """
-    Сводка по мощности (часы/перегрузы) по видам/участкам в заданном диапазоне.
-    """
-    try:
-        return get_capacity_summary(
-            db=db,
-            run_id=int(run_id),
-            bucket_type=bucket_type,
-            date_from=date_from,
-            date_to=date_to,
-        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

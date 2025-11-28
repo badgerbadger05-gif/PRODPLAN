@@ -73,29 +73,33 @@ class OrderQuantityCalculator:
         total_horizon_demand = float(self.total_demand_by_item.get(int(item_id), 0.0) or 0.0)
 
         # 3) Components availability limit (based on default spec if any)
-        max_producible = float(requested_qty or 0.0)
+        #    For phase-1 planning we use it only for warnings, not for hard capping qty,
+        #    because purchase proposals to cover shortages are created in the same phase.
+        component_limit = None
         spec_id = self.default_spec_map.get(int(item_id))
         if spec_id:
             comp_limit, comp_warnings = self._limit_by_components(int(spec_id), float(requested_qty or 0.0))
-            max_producible = min(max_producible, comp_limit)
+            component_limit = float(comp_limit)
             warnings.extend(comp_warnings)
 
-        # 4) Compose final quantity before lot sizing
-        final_qty = min(float(requested_qty or 0.0), float(max_producible or 0.0), float(total_horizon_demand or 0.0))
+        # 4) Compose final quantity before lot sizing:
+        #    limited by requested qty and horizon demand; component shortages are signalled via warnings.
+        final_qty = min(float(requested_qty or 0.0), float(total_horizon_demand or 0.0))
         if final_qty < 0.0:
             final_qty = 0.0
 
         # 5) Lot sizing for production with optimal_batch priority over buffer
+        # Important: normalized_qty may exceed requested "final_qty" due to buffer/optimal batch preferences.
+        # Hard caps (horizon/components) are applied later at planning phase (build_planned_orders_and_purchases).
         normalized_qty = self._normalize_qty_for_production(final_qty, item, buffer_qty)
-        # Final cap: do not exceed limits set by plan horizon and component availability
-        if normalized_qty > final_qty:
-            normalized_qty = float(final_qty)
 
         computation_details: Dict[str, Any] = {
             "requested_qty": float(requested_qty or 0.0),
             "buffer_qty": float(buffer_qty),
             "horizon_limit": float(total_horizon_demand),
-            "component_limit": float(max_producible),
+            # For diagnostics we still expose the computed component_limit (if any),
+            # but it no longer caps final_qty in phase-1 planning.
+            "component_limit": float(component_limit if component_limit is not None else (requested_qty or 0.0)),
             "final_qty_before_capacity": float(final_qty),
             "normalized_qty": float(normalized_qty),
         }

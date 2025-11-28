@@ -47,6 +47,7 @@
             @reset="resetFilters"
           >
             <template #extra-actions>
+              <q-toggle dense v-model="showTechnicalRows" :label="t('mrp.filters.showTechnicalRows')" />
               <q-separator vertical class="q-mx-xs" />
               <q-btn dense flat icon="download" :label="t('mrp.actions.csv')" @click="exportProd('csv')" />
               <q-btn dense flat icon="table_view" :label="t('mrp.actions.xlsx')" @click="exportProd('xlsx')" />
@@ -316,7 +317,6 @@ const prodColumns: QTableColumn<ProductionOrder>[] = [
   { name: 'need_date', label: t('mrp.columns.needDate'), field: 'need_date', align: 'left', sortable: true },
   { name: 'start_date', label: t('mrp.columns.startDate'), field: 'start_date', align: 'left', sortable: true },
   { name: 'finish_date', label: t('mrp.columns.finishDate'), field: 'finish_date', align: 'left', sortable: true },
-  { name: 'bucket_type', label: t('mrp.columns.bucketType'), field: 'bucket_type', align: 'left', sortable: true },
   { name: 'bucket_date', label: t('mrp.columns.bucketDate'), field: 'bucket_date', align: 'left', sortable: true },
   { name: 'priority_index', label: t('mrp.columns.priorityIndex'), field: 'priority_index', align: 'right', sortable: true },
   { name: 'stages', label: t('mrp.columns.stages'), field: 'stages', align: 'left' }
@@ -343,14 +343,12 @@ const purchColumns: QTableColumn<PurchaseRow>[] = [
   { name: 'need_date', label: t('mrp.columns.needDate'), field: 'need_date', align: 'left', sortable: true },
   { name: 'order_date', label: t('mrp.columns.orderDate'), field: 'order_date', align: 'left', sortable: true },
   { name: 'lead_time_days', label: t('mrp.columns.leadTimeDays'), field: 'lead_time_days', align: 'right', sortable: true },
-  { name: 'bucket_type', label: t('mrp.columns.bucketType'), field: 'bucket_type', align: 'left', sortable: true },
   { name: 'bucket_date', label: t('mrp.columns.bucketDate'), field: 'bucket_date', align: 'left', sortable: true },
   { name: 'priority_index', label: t('mrp.columns.priorityIndex'), field: 'priority_index', align: 'right', sortable: true }
 ]
 
 const capColumns: QTableColumn<CapacityRow>[] = [
   { name: 'area_id', label: t('mrp.columns.areaId'), field: 'area_id', align: 'right', sortable: true },
-  { name: 'bucket_type', label: t('mrp.columns.bucketType'), field: 'bucket_type', align: 'left', sortable: true },
   { name: 'bucket_date', label: t('mrp.columns.bucketDate'), field: 'bucket_date', align: 'left', sortable: true },
   { name: 'hours_planned', label: t('mrp.columns.hoursPlanned'), field: 'hours_planned', align: 'right', sortable: true },
   { name: 'hours_available', label: t('mrp.columns.hoursAvailable'), field: 'hours_available', align: 'right', sortable: true },
@@ -391,18 +389,25 @@ const loadError = ref<string | null>(null)
 const tab = ref<'production' | 'purchases' | 'capacity' | 'pegging' | 'components'>('production')
 // Вкладки верхнего уровня для унифицированных таблиц
 const viewTab = ref<'production' | 'purchases'>('production')
+// Показать техстроки (qty=0) — по умолчанию скрыты
+const showTechnicalRows = ref(false)
 
 // ---- Диагностика проблем привязки видов производства ----
 const showKindIssuesDialog = ref(false)
 const kindIssues = computed(() => {
+  // Приоритет — структурированное поле summary.kindIssues.list
+  const structured = (summary.value?.kindIssues?.list as any[]) || null
+  if (Array.isArray(structured)) return structured
+  // Фолбэк — фильтрация по warnings
   const arr = (summary.value?.warnings || []) as any[]
-  return arr.filter((w: any) =>
-    String(w?.code || '') === 'NO_AREA_FOR_PRODUCTION_KIND' ||
-    String(w?.code || '') === 'NO_AREA_FOR_PRODUCTION_KIND_ZERO_NORM'
-  )
+  return arr.filter((w: any) => {
+    const code = String(w?.code || '')
+    return code === 'NO_AREA_FOR_PRODUCTION_KIND' || code === 'NO_PRODUCTION_KIND'
+  })
 })
 const kindIssuesRows = computed(() => {
-  return (kindIssues.value || []).map((w: any, idx: number) => ({
+  const list = (kindIssues.value || []) as any[]
+  return list.map((w: any, idx: number) => ({
     key: idx,
     production_kind_id: w?.production_kind_id ?? null,
     production_kind_name: w?.production_kind_name ?? null,
@@ -465,7 +470,8 @@ const plainProdRows = computed(() => {
     }
   })
   
-  return Array.from(rowMap.values())
+  const arr = Array.from(rowMap.values())
+  return showTechnicalRows.value ? arr : arr.filter((r: any) => Number(r?.qty ?? 0) > 0)
 })
 // Агрегация закупок по item_id+unit для верхней вкладки (независимо от пагинации детальных)
 const purchAggRows = computed(() => {
@@ -589,11 +595,6 @@ async function fillMissingDictionariesFromRows() {
   }
 }
 
-const bucketOptions = computed(() => ([
-  { label: t('mrp.filters.bucketOption.any'), value: undefined },
-  { label: t('mrp.filters.bucketOption.daily'), value: 'daily' },
-  { label: t('mrp.filters.bucketOption.weekly'), value: 'weekly' }
-]))
 
 // Production state
 const prod = reactive<{
@@ -868,7 +869,7 @@ async function loadCapacity() {
       limit, offset
     })
     // attach a stable key
-    cap.rows = (resp.rows || []).map((r: any, idx: number) => ({ key: `${r.area_id}-${r.bucket_type}-${r.bucket_date}-${idx}`, ...r }))
+    cap.rows = (resp.rows || []).map((r: any, idx: number) => ({ key: `${r.area_id}-${r.bucket_date}-${idx}`, ...r }))
     cap.pagination.rowsNumber = resp.total || 0
   } catch (e) {
     console.error('Failed to load capacity', e)

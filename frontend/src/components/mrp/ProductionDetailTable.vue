@@ -12,15 +12,29 @@
     <template #body-cell-stages="props">
       <q-td :props="props">
         <div v-if="(props.row.stages || []).length === 0" class="text-grey">{{ t('mrp.placeholder.noArticle') }}</div>
-        <q-badge
-          v-for="(s, i) in (props.row.stages || [])"
-          :key="i"
-          color="primary"
-          outline
-          class="q-mr-xs q-mb-xs"
-        >
-          {{ s.stage_id }} · {{ s.bucket_date }} · {{ fmt(s.hours) }} ч
-        </q-badge>
+        <div v-else>
+          <q-badge
+            v-for="(s, i) in (props.row.stages || [])"
+            :key="i"
+            color="primary"
+            outline
+            class="q-mr-xs q-mb-xs"
+          >
+            <!-- Этап: #id · дата · часы · участок -->
+            {{ s.stage_id }} · {{ s.bucket_date || '—' }} · {{ fmt(s.hours) }} ч
+            <span v-if="s.area_name"> · {{ s.area_name }}</span>
+          </q-badge>
+          <!-- Плашка по отсутствию норматива на любом этапе -->
+          <q-badge
+            v-if="(props.row.stages || []).some((s: any) => !!s?.missingNorm)"
+            color="grey-8"
+            text-color="white"
+            outline
+            class="q-ml-xs"
+          >
+            {{ t('mrp.badge.noNormPerUnit') }}
+          </q-badge>
+        </div>
       </q-td>
     </template>
   </q-table>

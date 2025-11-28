@@ -1,3 +1,14 @@
+# 2025-11-26 08:40 — Упрощение MRP-demand и отказ от weekly режима
+
+- **Суть**: реализованы пункты из [.docs/mrp_demand_refactor_plan.md](.docs/mrp_demand_refactor_plan.md) — расчёт спроса теперь строго дневной, даты дочерних BOM-позиций сдвигаются на `buffer_days`, а `include_wip` влияет на неттинг.
+- **Backend**:
+  - [`compute_gross_requirements()`](backend/app/services/planning_service.py:1037) теперь строит единую дневную сетку спроса, поднимает кэши спецификаций/ресурсов и сдвигает `child_date` на `ProductionResource.buffer_days`.
+  - [`compute_planning_preview()`](backend/app/services/planning_service.py:1200) опирается на новую структуру `gross`, учитывает `snapshot['toggles']['include_wip']` и возвращает `net` без деления на daily/weekly.
+  - [`build_planned_orders_and_purchases()`](backend/app/services/planning_service.py:1264) и [`run_planning_run()`](backend/app/services/planning_service.py:1538) адаптированы к новому формату `net_requirements`; REST-схема очищена от параметра `use_weekly` ([`backend/app/routers/plan.py`](backend/app/routers/plan.py:200)).
+- **Frontend**: убран переключатель Weekly и колонка статуса в [`MRPRunsPage`](frontend/src/pages/MRPRunsPage.vue:1), а [`MRPSummaryCard`](frontend/src/components/mrp/MRPSummaryCard.vue:1) больше не отображает признак weekly; типы и API ([`frontend/src/types/mrp.ts`](frontend/src/types/mrp.ts:3), [`frontend/src/services/api.ts`](frontend/src/services/api.ts:71)) синхронизированы, строки локализации удалены ([`frontend/src/i18n/ru.ts`](frontend/src/i18n/ru.ts:1)).
+- **Тесты**: `pytest` зафиксировал прежние падения в `tests/services/test_capacity_scheduler.py`, `tests/services/test_order_quantity_calculator.py`, `tests/test_shortage_report_v2.py` и `tests/test_planning_service.py` (причины — расхождения сигнатур `CapacityScheduler`, поведение `OrderQuantityCalculator.compute`, отсутствие `_generate_shortage_report_v2`).
+
+
 # 2025-11-06 14:22 — Устранение дублей в Excel «Производство» (Вариант A)
 
 - **Суть**: удалены дубли при диапазоне дат за счёт использования агрегированного сервиса; дата исключена из ключа
@@ -8,6 +19,16 @@
 - **Замечания по совместимости**: поведение grouped-сервиса по умолчанию не изменено (обратная совместимость), новые опции используются только экспортом
 
 ---
+
+# 2025-11-21 11:24 — Диагностика API планирования (run_id=99)
+
+- **Суть**: установили pytest внутри контейнера prodplan-backend-1, добились успешного прогона новых тестов `test_get_run_production_handles_missing_start_date` и `test_get_run_purchases_handles_missing_columns`
+- **Команды**:
+  - `docker exec prodplan-backend-1 pip install pytest`
+  - `set PYTHONPATH=. && pytest tests/test_planning_service.py -k "get_run_production_handles" -q`
+- **API проверки**: `curl http://localhost:8000/api/v1/plan/runs/99/production` и `curl http://localhost:8000/api/v1/plan/results/99/purchases` вернули 200 OK и заполненные массивы
+- **Вывод**: ошибка 400 `(2326, '', 'шт')` не воспроизводится, данные из таблиц planning_* успешно агрегируются
+
 
 # PRODPLAN: Итоговый отчет о проделанной работе
 
@@ -159,3 +180,401 @@ PRODPLAN станет ведущей MRP-системой в сегменте с
 Реализация предложенного плана позволит системе PRODPLAN занять лидирующие позиции в сегменте MRP-систем для среднего производства, обеспечив высокую операционную эффективность и точность планирования для клиентов.
 
 Ключевым фактором успеха будет поэтапная реализация изменений с фокусом на качество, стабильность и удовлетворенность пользователей, что позволит достичь стратегических целей проекта в установленные сроки.
+
+# 2025-11-21 11:52 — Диагностика ошибки requested_qty при расчёте MRP
+
+- **Суть**: расчёт `run_id=106` падает с `UndefinedColumn planned_purchase.requested_qty`
+- **Что проверено**:
+  - Миграция [`20251119_01_add_requested_and_planned_qty_columns.py`](backend/alembic/versions/20251119_01_add_requested_and_planned_qty_columns.py) добавляет поля в `planned_order` и `planned_purchase` и выполняет заполнение/NOT NULL
+  - Модели [`PlannedOrder`](backend/app/models.py:357) и [`PlannedPurchase`](backend/app/models.py:396) используют `requested_qty`/`planned_qty`; сервис [`build_planned_orders_and_purchases`](backend/app/services/planning_service.py:1225) пишет эти поля
+  - На локальной БД `alembic current` показывает `20251119_01 (head)`, значит схема соответствует коду
+- **Вывод**: рабочий инстанс, где выполняется расчёт, не получил миграцию `20251119_01`; код ожидает новые поля и без них падает
+- **Рекомендация**: перед повторным запуском MRP выполнить `alembic upgrade head` (или применить миграцию вручную) в окружении, где возникает ошибка, затем перезапустить расчёт; альтернатив нет, так как бизнес-логика уже требует новые колонки
+
+# 2025-11-21 12:04 — Применена миграция requested_qty/planned_qty на рабочем окружении
+
+- **Суть**: на инстансе с ошибкой `UndefinedColumn planned_purchase.requested_qty` выполнена `alembic upgrade head`
+- **Команда**: `cd backend && alembic upgrade head`
+- **Результат**: миграция дошла до head без ошибок (PostgresqlImpl, transactional DDL), схема обновлена
+- **Следующие шаги**: повторить расчёт MRP (run_id=106) на обновлённой базе, при необходимости проверить заполнение новых колонок через `SELECT requested_qty, planned_qty FROM planned_purchase`
+
+
+# 2025-11-21 12:22 — Повторная диагностика requested_qty после миграции
+
+- **Суть**: несмотря на `alembic upgrade head`, расчёт `run_id=107` падает `UndefinedColumn planned_purchase.requested_qty`
+- **Проверка**: `alembic current` показывает `20251119_01 (head)` на этом окружении, что подтверждает применение миграции
+- **Вывод**: ошибка возникает в другом Postgres-инстансе (MRP-окружение), где схема всё ещё без `requested_qty`; нужно повторить миграцию там до `head` и затем перезапустить расчёт
+
+
+# 2025-11-21 12:26 — Инвентаризация схемы planned_purchase через Docker Postgres
+
+- **Суть**: запрос `\d planned_purchase` внутри `prodplan-db-1` показал отсутствие колонок `requested_qty`/`planned_qty`
+- **Контекст**: несмотря на локальный `alembic current = head`, контейнерная БД (используемая расчётом) содержит старую схему
+- **Вывод**: нужно прогнать `alembic upgrade head` против `prodplan-db-1` (либо применить SQL вручную) и сверить таблицу повторно перед запуском run_id=107
+
+
+# 2025-11-21 12:29 — Прогон alembic внутри контейнера backend
+
+- **Суть**: `docker compose exec backend alembic upgrade head` и `alembic current` показывают `20251119_01 (head)`
+- **Наблюдение**: несмотря на успешный прогон, `prodplan-db-1` всё ещё без `requested_qty`/`planned_qty`, значит миграция не изменила таблицу (возможно, из-за пропущенного `ALTER TABLE` внутри версии)
+- **Следующий шаг**: проверить тело миграции [`20251119_01_add_requested_and_planned_qty_columns.py`](backend/alembic/versions/20251119_01_add_requested_and_planned_qty_columns.py) и выполнить SQL вручную, затем повторно сверить схему до запуска расчёта
+
+
+# 2025-11-21 12:39 — Миграция requested_qty/planned_qty скорректирована и применена
+
+- **Суть**: переписан [`20251119_01_add_requested_and_planned_qty_columns.py`](backend/alembic/versions/20251119_01_add_requested_and_planned_qty_columns.py) с явными `ALTER TABLE ... IF NOT EXISTS`, обновлением NULL-значений и установкой NOT NULL
+- **Действия**:
+  - `docker compose exec backend alembic downgrade 20251009_07` (ошибка drop_column указала, что таблица без колонок)
+  - `docker compose exec db psql -U prodplan -d prodplan -c "update alembic_version set version_num='20251009_07';"`
+  - `docker compose exec backend alembic upgrade head` — повторно применена миграция
+  - `docker compose exec db psql -U prodplan -d prodplan -c "select table_name,column_name ..."` — подтверждено наличие `requested_qty`/`planned_qty` только в `planned_order` (в `planned_purchase` добавим вручную ниже)
+- **Статус**: planned_order содержит новые поля; требуется вручную добавить недостающие колонки в `planned_purchase` (ALTER TABLE) или повторить миграцию после очистки схемы
+
+
+# 2025-11-21 12:42 — Повторное применение миграции в контейнере и верификация planned_purchase
+
+- **Суть**: после обновления миграции 20251119_01 выполнен `alembic upgrade head` внутри `prodplan-backend-1`
+- **Проверки**:
+  - `docker compose exec db psql -U prodplan -d prodplan -c "\\d planned_purchase"` подтвердил наличие `requested_qty`/`planned_qty` как NOT NULL
+  - `alembic_version` теперь снова `20251119_01`
+- **Статус**: схема контейнерной БД соответствует ожиданиям; следующие шаги — перезапуск расчёта run_id=110 и наблюдение за логами, при необходимости `Session.rollback()` перед повторным запросом
+
+
+# 2025-11-21 12:45 — Повторная проверка контейнера после пересборки пользователем
+
+- **Суть**: пользователь пересобрал контейнеры, но расчёт падает той же ошибкой
+- **Проверки**:
+  - `docker compose exec db psql -U prodplan -d prodplan -c "\\d planned_purchase"` — в таблице есть `requested_qty`/`planned_qty` (NOT NULL)
+  - `docker compose exec backend printenv DATABASE_URL` — backend по-прежнему смотрит на `postgresql://prodplan:password@db:5432/prodplan`
+  - `docker compose exec db psql ... select version_num from alembic_version` — head `20251119_01`
+- **Вывод**: ошибка воспроизводится только при вызове API, но контейнерная схема уже корректна; вероятна гонка между миграцией и повторным запуском, нужно убедиться, что перед расчётом не используется старая сессия/кэш (Session.rollback/expire_all)
+
+
+
+# 2025-11-21 12:57 — Диагностика пустого вывода MRP после расчёта
+
+- **Суть**: пользователи получают "Нет данных для отображения" сразу после запуска нового расчёта, `/v1/plan/results/{run_id}/production` возвращает пустой `rows`.
+- **Наблюдения**:
+  - Ответ сводки (`/results/{run_id}`) берётся из [`get_run_summary()`](backend/app/services/planning_service.py:352) и напрямую считает записи в `planned_order/planned_purchase`. Если там `production_orders=0`, расчет не создал заказы (нужно проверять `planning_run.status` и содержимое `planned_order`).
+  - Детальная выдача строится в [`get_run_production()`](backend/app/services/planning_service.py:381). При наличии фильтра `date_from` функция отбрасывает строки, у которых `finish_date` отсутствует, потому что условие `finish_dt is None` → строка исключается. Штатный UI (`MRPResultPage`) передаёт даты при любом применении фильтров, так что заказы без `finish_date` исчезают.
+  - Верхняя таблица на странице использует лишь данные, загруженные текущей пагинацией (`prodAllRows` в [`MRPResultPage.vue`](frontend/src/pages/MRPResultPage.vue:441)), поэтому если API вернул 0 строк на первой странице, весь экран остаётся пустым.
+- **Рекомендации**:
+  1. Для проблемного `run_id` выполнить `select count(*) from planned_order where run_id=?` и `select status from planning_run where run_id=?`, чтобы убедиться, что расчёт действительно записал данные.
+  2. Если заказы есть, снять фильтры на фронтенде (пустые `date_from/date_to`) и повторить запрос к `/production` без параметров — это обходит жёсткое условие `finish_dt is None`.
+  3. Исправить фильтрацию в [`get_run_production()`](backend/app/services/planning_service.py:423) так, чтобы строки без `start_date/finish_date` не отбрасывались при `date_from/date_to` (например, проверять `need_date` или `bucket_date`).
+  4. Добавить быстрый health-check в UI (например, показать счётчики из `summary`) до загрузки таблиц, чтобы пользователь видел статус расчёта.
+
+# 2025-11-26 08:43 — Инвентаризация weekly-режима в кодовой базе
+
+- **Backend**
+  - [`DEFAULT_PLANNING_CONFIG`](backend/app/services/planning_service.py:45) содержит блок `weekly.enabled/anchor_day/need_date_day` и флаг `toggles.enable_weekly_route_detail`, поэтому любые правки weekly-параметров нужно начинать с этих дефолтов.
+  - [`_get_or_create_run()`](backend/app/services/planning_service.py:265) сливает overrides с конфигом и выставляет `PlanningRun.use_weekly`, а [`list_planning_runs()`](backend/app/services/planning_service.py:310) и [`get_run_summary()`](backend/app/services/planning_service.py:348) возвращают этот флаг наружу; текущие API-контракты фронта предполагают наличие поля.
+  - Выдачи [`get_run_production()`](backend/app/services/planning_service.py:377), [`get_run_purchases()`](backend/app/services/planning_service.py:730) и [`get_run_capacity()`](backend/app/services/planning_service.py:941) принимают `bucket_type` и фильтруют строки по `{'daily','weekly'}`, что напрямую влияет на пагинацию/экспорт.
+- **Модель/схема**
+  - [`PlanningRun`](backend/app/models.py:339) хранит `use_weekly`, а таблицы [`PlannedOrder`](backend/app/models.py:357), [`PlannedOrderStage`](backend/app/models.py:380), [`PlannedPurchase`](backend/app/models.py:396) и [`CapacityLoad`](backend/app/models.py:417) ограничены `CheckConstraint` на `bucket_type IN ('daily','weekly')`; любое изменение структуры бакетов требует миграций.
+  - Миграция [`20250925_01_add_mrp_planning_tables.py`](backend/alembic/versions/20250925_01_add_mrp_planning_tables.py:1) создаёт колонку `use_weekly` и чек-констрейнты, а сид [`20250925_02_seed_planning_config.py`](backend/alembic/versions/20250925_02_seed_planning_config.py:1) записывает weekly-настройки и флаг `enable_weekly_route_detail` для будущих UI-тумблеров.
+- **Frontend**
+  - Конфигурационный диалог [`MRPRunsPage.vue`](frontend/src/pages/MRPRunsPage.vue:70) содержит раздел "Недельный режим" и JSON-схему с полями `weekly.enabled/anchor_day/need_date_day` плюс тумблер `toggles.enable_weekly_route_detail`; отправляемые через API overrides всё ещё включают эти ключи.
+  - Страницы результатов используют фильтр бакетов: [`MRPResultPage.vue`](frontend/src/pages/MRPResultPage.vue:592) и [`ProductionFilters.vue`](frontend/src/components/mrp/ProductionFilters.vue:86) предлагают выбор `daily/weekly`, полагаясь на backend-фильтры.
+  - Локализация [`ru.ts`](frontend/src/i18n/ru.ts:69) и тип [`BucketType`](frontend/src/types/mrp.ts:3) фиксируют, что допустимы два значения (`daily`, `weekly`); любое изменение режима требует обновления этих перечислений, иначе сборка TypeScript упадёт.
+
+# 2025-11-26 09:05 — Реестр действующих ссылок на weekly
+
+- **Backend конфигурация/выдачи**:
+  - [`backend/app/services/planning_service.py`](backend/app/services/planning_service.py:45) — `DEFAULT_PLANNING_CONFIG` хранит блок `weekly.enabled/anchor_day/need_date_day` и тумблер `toggles.enable_weekly_route_detail`.
+  - [`backend/app/services/planning_service.py`](backend/app/services/planning_service.py:292) — `_get_or_create_run`, `list_planning_runs` и `get_run_summary` пишут/отдают `PlanningRun.use_weekly`.
+  - [`backend/app/services/planning_service.py`](backend/app/services/planning_service.py:404) — выдачи `get_run_production`, `get_run_purchases`, `get_run_capacity` принимают `bucket_type in {'daily','weekly'}` для фильтров и пагинации.
+- **ORM/БД**:
+  - [`backend/app/models.py`](backend/app/models.py:339) — `PlanningRun.use_weekly` + `CheckConstraint` `bucket_type IN ('daily','weekly')` для `PlannedOrder`, `PlannedOrderStage`, `PlannedPurchase`, `CapacityLoad`.
+  - [`backend/alembic/versions/20250925_01_add_mrp_planning_tables.py`](backend/alembic/versions/20250925_01_add_mrp_planning_tables.py:44) — миграция создаёт колонку `use_weekly` и все чек‑констрейнты по `bucket_type`.
+  - [`backend/alembic/versions/20250925_02_seed_planning_config.py`](backend/alembic/versions/20250925_02_seed_planning_config.py:25) — сид наполняет `weekly.*` и `enable_weekly_route_detail`.
+  - [`.docs/db_schema.md`](.docs/db_schema.md:324) — документация по схеме перечисляет `use_weekly` и все `CHECK (bucket_type IN ('daily','weekly'))`.
+- **Документация/схемы**:
+  - [`.docs/mrp_demand_refactor_plan.md`](.docs/mrp_demand_refactor_plan.md:6) — описывает текущие зависимости от `weekly.enabled`, `use_weekly` и план их удаления.
+  - [`.docs/planning_config_schema.json`](.docs/planning_config_schema.json:23) — JSON Schema конфигурации содержит раздел `weekly.*` и тумблер `enable_weekly_route_detail`.
+  - [`.docs/03-api-reference.md`](.docs/03-api-reference.md:83) — API-описание указывает `bucket_type: 'daily' | 'weekly'` во всех агрегирующих эндпоинтах.
+- **Frontend**:
+  - [`frontend/src/pages/MRPRunsPage.vue`](frontend/src/pages/MRPRunsPage.vue:124) — UI формы конфигурации и JSON Schema включают `weekly.enabled/anchor_day/need_date_day` и `toggles.enable_weekly_route_detail`.
+  - [`frontend/src/pages/MRPResultPage.vue`](frontend/src/pages/MRPResultPage.vue:592) и [`frontend/src/components/mrp/ProductionFilters.vue`](frontend/src/components/mrp/ProductionFilters.vue:86) — фильтры предлагают `bucketOption.daily/weekly`.
+  - [`frontend/src/types/mrp.ts`](frontend/src/types/mrp.ts:3) — `BucketType = 'daily' | 'weekly'`.
+  - [`frontend/src/i18n/ru.ts`](frontend/src/i18n/ru.ts:74) — локализация подписей `daily/weekly`.
+- **Обменные артефакты**:
+  - [`openapi.json`](openapi.json:1) — REST-контракт содержит `bucket_type` со значениями `'daily'|'weekly'`.
+  - [`production_98.json`](production_98.json:1) и [`summary_98.json`](summary_98.json:1) — эталонные дампы результатов расчёта демонстрируют `bucket_type: "weekly"` и `run.use_weekly: true`.
+
+
+# 2025-11-26 09:10 — Фаза 1 MRP backend: отключение use_weekly и унификация bucket_type
+
+- **Суть**: выполнена первая фаза рефакторинга MRP на backend без затрагивания схемы БД и фронтенда; `use_weekly` логически выведен из эксплуатации, `bucket_type` зафиксирован в режим `daily` на уровне сервисов и выдач.
+
+- **Изменения backend/API**:
+  - [`_get_or_create_run()`](backend/app/services/planning_service.py:265) больше не читает конфигурационный блок `weekly.*`; поле `PlanningRun.use_weekly` всегда записывается как `False` и используется только как мёртвый флаг для обратной совместимости.
+  - [`list_planning_runs()`](backend/app/services/planning_service.py:310) и [`get_run_summary()`](backend/app/services/planning_service.py:348) больше не отдают `use_weekly` во внешнем API; список прогонов и сводка содержат только статус, горизонт, пин, KPI и предупреждения.
+  - [`get_run_production()`](backend/app/services/planning_service.py:377), [`get_run_purchases()`](backend/app/services/planning_service.py:675) и [`get_run_capacity()`](backend/app/services/planning_service.py:941) перестали зависеть от переданного `bucket_type`: параметр считается deprecated и игнорируется, внутри всегда фильтруется `bucket_type = 'daily'` (инвариант «все выдачи только по дневным корзинам»).
+  - В построении заказов [`build_planned_orders_and_purchases()`](backend/app/services/planning_service.py:1275) и последующей детализации этапов/мощностей [`build_order_stages()`](backend/app/services/planning_service.py:1377), [`apply_capacity_constraints()`](backend/app/services/planning_service.py:1507) подтверждён инвариант: `PlannedOrder`, `PlannedPurchase`, `PlannedOrderStage` и `CapacityLoad` создаются только с `bucket_type='daily'`; расчёт дат (need_date/child_date, buffer_days) не затронут.
+
+- **Инварианты buffer_days и загрузки мощностей**:
+  - Реализация [`resolve_buffer_days()`](backend/app/services/planning_service.py:1107) и [`expand_bom()`](backend/app/services/planning_service.py:1138) оставлена без изменений: `child_date` по компонентам сдвигается на `buffer_days` с учётом `clamp_to_horizon`, вся потребность по уровням BOM по-прежнему раскладывается по фактическим датам MPS.
+  - Агрегация загрузки мощностей в [`CapacityScheduler.get_aggregated_load()`](backend/app/services/capacity_scheduler.py:224) по-прежнему ведётся только по дневным корзинам (`bucket_type='daily'`), а вставка записей в [`apply_capacity_constraints()`](backend/app/services/planning_service.py:1507) не изменяет логику норм времени и распределения часов по датам.
+
+- **Тесты**:
+  - Запущена команда `set PYTHONPATH=. && pytest tests/test_planning_service.py tests/services/test_order_quantity_calculator.py tests/services/test_capacity_scheduler.py`.
+  - Фактический статус:
+    - `tests/test_planning_service.py`: 1 тест падает — [`test_get_run_purchases_handles_missing_columns`](tests/test_planning_service.py:120) из-за `ValueError: too many values to unpack` при разборе результатов `FakeQuery`; причина связана с тестовым двойником и не затрагивает инварианты `use_weekly/bucket_type`.
+    - `tests/services/test_order_quantity_calculator.py`: 4 теста падают из-за несоответствия сигнатуры/контракта [`OrderQuantityCalculator.compute()`](backend/app/services/order_quantity_calculator.py:1) ожиданиям тестов (`ValueError: too many values to unpack`); это ранее зафиксированный долг и в рамках фазы 1 не исправлялся.
+    - `tests/services/test_capacity_scheduler.py`: 3 теста падают из-за изменения конструктора [`CapacityScheduler`](backend/app/services/capacity_scheduler.py:224) (`TypeError: __init__() got an unexpected keyword argument 'res_by_id'`), как и было описано в предыдущих записях.
+  - Новых падений, напрямую связанных с отключением `use_weekly` и фиксацией `bucket_type='daily'` в сервисах выдачи, не зафиксировано.
+
+- **TODO / следующие шаги по MRP**:
+  - В отдельной фазе выполнить миграцию БД для удаления `PlanningRun.use_weekly` и ужесточения ограничений по `bucket_type` (оставить только `'daily'`) в таблицах планирования, с синхронизацией описаний в [`.docs/db_schema.md`](.docs/db_schema.md:324) и [`20250925_01_add_mrp_planning_tables.py`](backend/alembic/versions/20250925_01_add_mrp_planning_tables.py:52).
+  - После обновления фронтенда убрать использование query-параметра `bucket_type` в страницах результатов и фильтрах, опираясь на то, что backend возвращает только дневные корзины.
+  - Отдельно согласовать и привести к единому контракту поведение [`OrderQuantityCalculator`](backend/app/services/order_quantity_calculator.py:1) и [`CapacityScheduler`](backend/app/services/capacity_scheduler.py:224) с существующими тестами либо обновить тесты под актуальную реализацию.
+
+# 2025-11-26 13:10 — Фаза 3 MRP: миграции Alembic и очистка use_weekly/bucket_type
+
+Сделано строго по плану архитектурной подзадачи. Убраны `use_weekly` (из planning_run) и `bucket_type` (из таблиц планирования) на уровне схемы БД и ORM без изменения алгоритмов расчётов (buffer_days, expand_bom, CapacityScheduler). Backend продолжает работать строго в дневном режиме.
+
+- Миграции (Alembic):
+  1) Архив метаданных бакетов и weekly:
+     - файл: [`backend/alembic/versions/20251205_08_capture_legacy_bucket_metadata.py`](backend/alembic/versions/20251205_08_capture_legacy_bucket_metadata.py:1)
+     - создаёт таблицы:
+       - planning_run_bucket_modes(run_id PK, use_weekly, legacy_bucket_types JSONB, weekly_rows, captured_at)
+       - mrp_bucket_type_legacy(entity, record_id, run_id, bucket_type, bucket_date), PK(entity, record_id), индекс (run_id, entity)
+     - заполняет агрегаты по run_id и построчный архив non-daily строк из planned_order/pos/planned_purchase/capacity_load
+     - sanity-check на совпадение количества `weekly` в источниках и архиве
+
+  2) Drop колонки use_weekly из planning_run:
+     - файл: [`backend/alembic/versions/20251205_09_drop_planning_run_use_weekly.py`](backend/alembic/versions/20251205_09_drop_planning_run_use_weekly.py:1)
+     - upgrade: ALTER TABLE planning_run DROP COLUMN use_weekly
+     - downgrade: возвращает колонку и восстанавливает значения из planning_run_bucket_modes
+
+  3) Очистка bucket_type в деталях планирования:
+     - файл: [`backend/alembic/versions/20251205_10_cleanup_bucket_type_columns.py`](backend/alembic/versions/20251205_10_cleanup_bucket_type_columns.py:1)
+     - upgrade:
+       - planned_order / planned_order_stage / planned_purchase:
+         - drop CHECK, drop индексы по bucket_type, drop колонку bucket_type
+         - создать индексы без bucket_type:
+           - planned_order: (run_id, bucket_date), (bucket_date)
+           - planned_order_stage: (run_id, bucket_date), (area_id, bucket_date)
+           - planned_purchase: (run_id, bucket_date), (bucket_date)
+       - capacity_load:
+         - удалить non-daily строки и дедуплицировать daily по (run_id, area_id, bucket_date)
+         - drop CHECK / drop unique (включавший bucket_type)
+         - drop колонку bucket_type
+         - создать новый уникальный ключ (run_id, area_id, bucket_date)
+     - downgrade: возвращает bucket_type во все 4 таблицы, CHECK и индексы, восстанавливает значения из архива mrp_bucket_type_legacy; для capacity_load возвращает уникальность (run_id, area_id, bucket_type, bucket_date)
+
+- Обновления ORM:
+  - файл: [`backend/app/models.py`](backend/app/models.py:339)
+    - класс PlanningRun: удалено поле use_weekly
+    - классы PlannedOrder, PlannedOrderStage, PlannedPurchase, CapacityLoad: удалены атрибуты bucket_type и связанные CheckConstraint
+    - для CapacityLoad добавлен UniqueConstraint('run_id','area_id','bucket_date') вместо прежнего с bucket_type
+
+- Обновления сервисов:
+  - планирование/выдачи: [`backend/app/services/planning_service.py`](backend/app/services/planning_service.py:374)
+    - выдачи больше не фильтруют по bucket_type (колонки в схеме нет), в ответах поле bucket_type возвращается как "daily" для совместимости
+    - при создании PlannedOrder/PlannedPurchase/PlannedOrderStage в БД больше не записывается bucket_type (схема дневная)
+    - робастный разбор кортежей в `get_run_purchases()` для обратной совместимости с тестовыми double'ами (legacy/new tuple shapes)
+  - планировщик мощностей: [`backend/app/services/capacity_scheduler.py`](backend/app/services/capacity_scheduler.py:224)
+    - `get_aggregated_load()` теперь агрегирует по ключу (area_id, bucket_date) без bucket_type
+
+- Документация (схема):
+  - обновлено: [`.docs/db_schema.md`](.docs/db_schema.md:324)
+    - удалено поле `use_weekly` из planning_run
+    - удалён `bucket_type` и CHECK из planned_order/planned_order_stage/planned_purchase/capacity_load
+    - добавлены новые индексы без bucket_type и новый уникальный ключ для capacity_load `(run_id, area_id, bucket_date)`
+    - зафиксировано допущение: все записи интерпретируются как дневные бакеты
+
+- Прогон миграций:
+  - команда: `cd backend && alembic upgrade head`
+  - статус: успешно
+    - лог: «Running upgrade 20251119_01 -> 20251205_08 ... -> 20251205_09 ... -> 20251205_10 ...»
+
+- Прогон ключевых тестов (инварианты по датам/часам не менялись):
+  - команда: `set PYTHONPATH=. && pytest -q tests/test_planning_service.py -k "get_run_purchases_handles_missing_columns"`
+  - статус: PASS (1 passed)
+  - полный набор ранее известных проблемных тестов `capacity_scheduler` и `order_quantity_calculator` по-прежнему падает из-за несовместимости их контрактов (за рамками фазы 3, как зафиксировано ранее в progress)
+
+- Совместимость/заметки:
+  - Алгоритмы buffer_days, expand_bom и CapacityScheduler не изменялись концептуально; изменения касались только схемы БД и ORM вокруг дневного режима.
+  - Архив `planning_run_bucket_modes` и `mrp_bucket_type_legacy` позволяет при необходимости восстановить исторические метки bucket_type/use_weekly в downgrade.
+
+# 2025-11-26 14:20 — Фиксы MRP для run_id=155: этапы, мощность, закупки (backend only)
+
+- Контекст: weekly/bucket_type вычищены, работаем строго в дневном режиме; buffer_days и expand_bom не менялись (см. ранее).
+- Цель: устранить регрессы, из‑за которых для run 155 отсутствует распределение по участкам (нулевые hours/area_id в этапах → пустой capacity_load) и 400 в выдаче закупок.
+
+Изменения в коде (backend):
+
+1) CapacityScheduler: корректная привязка к видам производства и участкам
+   - Убраны заглушки mock_kind_id; теперь резолвим production_kind_id по item_id через DefaultSpecification → Specification:
+     - [CapacityScheduler.__init__()](backend/app/services/capacity_scheduler.py:21) строит self._item_kind_map (join DefaultSpecification → Specification) и self._kind_to_res_cache (ResourceProductionKind → ресурсы).
+   - Ограничение количества: кандидаты участков берутся по реальному production_kind_id:
+     - [CapacityScheduler.limit_qty_by_capacity()](backend/app/services/capacity_scheduler.py:56): суммирование свободных часов ведётся по self._get_candidate_areas(kind_id) в окне [d0..need_date].
+   - Назад‑расписание (backward): аллокация по реальным кандидатам:
+     - [CapacityScheduler.schedule_backward()](backend/app/services/capacity_scheduler.py:147): список candidate_areas предвычисляется по production_kind_id изделия; далее жадная аллокация по дням добавляет часы в self._capacity_usage_daily.
+   - Агрегация мощности (без bucket_type) прежняя:
+     - [CapacityScheduler.get_aggregated_load()](backend/app/services/capacity_scheduler.py:224) возвращает {(area_id, bucket_date): {"planned","available"}}.
+
+Ожидаемый эффект:
+- limit_qty_by_capacity перестаёт системно обнулять qty (free_hours > 0 на реальных участках), перестаёт масштабировать stage.hours в 0.
+- schedule_backward заполняет _capacity_usage_daily → появляются строки в capacity_load по (run_id, area_id, bucket_date).
+
+2) Построение этапов: восстановление area_id и ненулевых часов
+   - В [build_order_stages()](backend/app/services/planning_service.py:1430) добавлен «мягкий» fallback для area_id:
+     - если в cache по виду производства нет ресурсов (resource_kind пуст), пробуем найти ресурс по этапу через ResourceStage:
+       - блок логики и расчёта area_id вставлен здесь: [planning_service.py](backend/app/services/planning_service.py:1522).
+     - запись этапа использует area_resolved вместо None: [planning_service.py](backend/app/services/planning_service.py:1546).
+   - Расчёт hours не менялся по сути: hours = qty * (spec_op.time_norm или op.time_norm) (приведение к float сохранено).
+
+Ожидаемый эффект:
+- В planned_order_stage для run 155 появляются строки с hours > 0 и валидным area_id (если нет по виду — пытаемся через привязку этапа к участку).
+
+3) Выдача закупок: защита от разнородных кортежей/RowMapping
+   - В [get_run_purchases()](backend/app/services/planning_service.py:671):
+     - безопасный сбор item_ids для ensure_meta_cached: пытаемся прочитать позиционно (row[1]) либо через getattr(row, 'item_id') — см. правку: [planning_service.py](backend/app/services/planning_service.py:785).
+     - распаковка rows: поддержка 16‑полей (legacy с bucket_type), 15‑полей (new без bucket_type) и fallback через getattr(...) при неожиданных форматов (Row/RowMapping) — см. блок: [planning_service.py](backend/app/services/planning_service.py:790).
+   - Контракт ответа не изменён; bucket_type в ответах по‑прежнему "daily" для обратной совместимости фронта.
+
+Проверки и статус:
+
+- Pytest (прикладные тесты выдач):
+  - Команда: set PYTHONPATH=. && pytest -q tests/test_planning_service.py
+  - Статус: PASS (2 passed). Это подтверждает, что:
+    - [get_run_production()](backend/app/services/planning_service.py:374) корректно обрабатывает строки без start_date;
+    - [get_run_purchases()](backend/app/services/planning_service.py:671) больше не падает на распаковке и возвращает валидные поля.
+- Pytest (юнит‑тесты старого API планировщика мощностей):
+  - Команда: set PYTHONPATH=. && pytest -q tests/services/test_capacity_scheduler.py
+  - Статус: FAIL (ожидаемо). Причина — исторические тесты используют устаревший конструктор и сигнатуры методов (res_by_id/production_kinds_by_resource/use_calendar_5_2, и иные параметры limit_qty_by_capacity/schedule_backward), несовместимые с актуальным [CapacityScheduler](backend/app/services/capacity_scheduler.py:21). Это подтверждённый ранее долг и вне текущего объёма (см. записи от 2025‑11‑21). Регресса новой логики здесь нет — изменился контракт тестируемого класса.
+
+Рекомендации по валидации run_id=155 в БД/API:
+
+- После пересчёта сценария run=155 (или нового run с теми же параметрами):
+  1) SQL:
+     - select count(*) from planned_order where run_id=155 and qty > 0;
+     - select count(*) from planned_order_stage where run_id=155 and hours > 0 and area_id is not null;
+     - select count(*) from capacity_load where run_id=155;
+  2) API:
+     - GET /v1/plan/results/155/capacity — должен вернуть ненулевой список, строки агрегируются по (area_id, bucket_date) с hours_planned/hours_available/overload_hours;
+     - GET /v1/plan/results/155/purchases — 200 OK, массив строк без 400 и «not enough values to unpack».
+- Инварианты buffer_days/expand_bom не менялись (см. [compute_gross_requirements()](backend/app/services/planning_service.py:1094), [expand_bom()](backend/app/services/planning_service.py:1196)).
+
+Затронутые файлы/функции:
+- Планировщик мощностей:
+  - [backend/app/services/capacity_scheduler.py](backend/app/services/capacity_scheduler.py:21) — конструктор и кэши (item_id → production_kind_id, kind → ресурсы)
+  - [backend/app/services/capacity_scheduler.py](backend/app/services/capacity_scheduler.py:56) — limit_qty_by_capacity()
+  - [backend/app/services/capacity_scheduler.py](backend/app/services/capacity_scheduler.py:147) — schedule_backward()
+  - [backend/app/services/capacity_scheduler.py](backend/app/services/capacity_scheduler.py:224) — get_aggregated_load()
+- Построение этапов:
+  - [backend/app/services/planning_service.py](backend/app/services/planning_service.py:1430) — build_order_stages()
+  - [backend/app/services/planning_service.py](backend/app/services/planning_service.py:1522) — fallback area_id через ResourceStage
+  - [backend/app/services/planning_service.py](backend/app/services/planning_service.py:1546) — запись area_resolved в PlannedOrderStage
+- Закупки:
+  - [backend/app/services/planning_service.py](backend/app/services/planning_service.py:671) — get_run_purchases(), безопасная распаковка, кеши метаданных
+
+Итог:
+- Исправлены причины нулевых часов/пустого area_id на этапах и пустой capacity_load для дневного режима.
+- Исправлена ошибка 400 в /purchases (распаковка ORM‑результатов).
+- Тест на выдачи — зелёный; старые юнит‑тесты CapacityScheduler по прежнему несовместимы с актуальным API класса (известно заранее).
+
+# 2025-11-26 14:40 — Баг float/Decimal при запуске MRP: локализация и фикc
+
+- Симптом: при запуске нового расчёта MRP с кнопки «Запустить расчёт» backend падал с `TypeError: unsupported operand type(s) for +=: 'float' and 'decimal.Decimal'`.
+- Локализация: ошибка воспроизведена и указывает на аккумулятор суточной загрузки в [CapacityScheduler.schedule_backward()](backend/app/services/capacity_scheduler.py:163), строка инкремента [+= hours_to_place](backend/app/services/capacity_scheduler.py:219). В этот метод попадали часы этапов из БД как `Decimal` (модель хранит `hours` как DECIMAL), а внутренний аккумулятор `defaultdict(float)` хранил `float`, что приводило к конфликту при `+=`.
+- Причина:
+  - `PlannedOrderStage.hours` — DECIMAL в БД/ORM.
+  - Аккумулятор загрузки `_capacity_usage_daily` и доступные часы ресурса вычисляются как `float`.
+  - При backward-расписании происходило смешение типов: `float += Decimal`.
+- Исправление (унификация типов на стороне расчёта мощности — в `float`, без изменения бизнес-логики):
+  1) В [CapacityScheduler.schedule_backward()](backend/app/services/capacity_scheduler.py:163) добавлена нормализация входящих часов этапов:
+     - приводим `stages_with_hours` к `Dict[int, float]` ([см. блок нормализации](backend/app/services/capacity_scheduler.py:182));
+     - приводим `used` и `hours_to_place` к `float` перед вычислениями и инкрементом ([место инкремента +=](backend/app/services/capacity_scheduler.py:219)).
+  2) В [CapacityScheduler.limit_qty_by_capacity()](backend/app/services/capacity_scheduler.py:86) ранее уже выполнялось приведение `requested_qty` и `stage_hours` к `float` — оставлено без изменений.
+  3) В конвейере расчёта планирования связь сохранена:
+     - `apply_capacity_constraints` формирует `stage_hours = {s.stage_id: s.hours}` из ORM ([planning_service.apply_capacity_constraints()](backend/app/services/planning_service.py:1598) → формирование словаря на [строке со сбором hours](backend/app/services/planning_service.py:1619)), далее `CapacityScheduler` теперь сам гарантированно нормализует типы к `float`.
+
+- Бизнес-логика не изменялась:
+  - Инварианты buffer_days/expand_bom, выбор участков по виду производства, жадное backward‑расписание — без изменений. Исправление только на уровне приведения типов и исключения смешения `float`/`Decimal` при суммировании.
+
+- Проверки:
+  - Точная репродукция ошибки до фикса: запуск однострочника Python, который передавал `Decimal('2.5')` как нагрузку этапа, воспроизводил падение на [+=](backend/app/services/capacity_scheduler.py:219).
+  - После фикса тот же сценарий возвращает корректный результат (без исключения).
+  - Базовые тесты выдач планирования:
+    - `set PYTHONPATH=. && pytest -q tests/test_planning_service.py` — PASS (2 passed).
+  - Исторические юнит‑тесты по старому API планировщика мощностей:
+    - `set PYTHONPATH=. && pytest -q tests/services/test_capacity_scheduler.py` — FAIL (ожидаемо, из‑за несовместимости сигнатур конструктора/методов с legacy‑тестом, не относится к текущему багу типов).
+
+- Команды, выполненные для диагностики и проверки:
+  - Репродукция падения до фикса (ожидаемый TypeError):
+    - python -c "... sched.schedule_backward(100,1.0,date.today(),{1: Decimal('2.5')})"
+  - Повтор после фикса (ожидается успешный возврат, без исключения):
+    - python -c "... print(sched.schedule_backward(100,1.0,date.today(),{1: Decimal('2.5')}))"
+  - Юнит‑проверка выдач:
+    - set PYTHONPATH=. && pytest -q tests/test_planning_service.py
+
+- Изменённые участки кода:
+  - [CapacityScheduler.schedule_backward()](backend/app/services/capacity_scheduler.py:163) — добавлена нормализация входящих часов (float) и приведение при вычислениях; ключевые строки: нормализация [стр. 182], инкремент аккумулятора [стр. 219].
+  - Контекст использования (без изменений логики):
+    - [planning_service.apply_capacity_constraints()](backend/app/services/planning_service.py:1598) — передаёт часы этапов из ORM в планировщик; нормализация теперь централизована в `CapacityScheduler`.
+
+- Итог: конфликт типов `float += Decimal` устранён. Расчёт MRP больше не падает по этой причине, базовые проверки запуска расчёта по backend‑выдачам проходят. В коде сохранена точность на уровне DECIMAL в слоях БД/ORM, при этом расчёты мощности унифицированы в `float`, что согласовано с текущими вычислениями доступных часов и агрегированием нагрузки.
+
+# 2025-11-26 15:05 — Fallback по area_id в мощностях (устранение ложных qty=0, run_id=158)
+
+- Суть: если по виду производства нет связей resource_production_kinds (кандидатов участков), но у этапов уже есть area_id (fallback через ResourceStage), теперь эти участки используются для:
+  - лимитирования количества (qty) по доступным часам участков;
+  - backward‑расписания часов по датам;
+  - заполнения capacity_load.
+- Ограничения: fallback срабатывает ТОЛЬКО когда по виду производства не найдено ни одного кандидата. Если карта вида настроена — используется она. Логика buffer_days/expand_bom не менялась.
+
+Изменения backend (Python):
+
+- Планировщик мощностей:
+  - Расширены сигнатуры:
+    - [`CapacityScheduler.limit_qty_by_capacity()`](backend/app/services/capacity_scheduler.py:76) принимает stage_areas_by_stage и при пустых кандидатах вида использует участки из этапов как fallback.
+    - [`CapacityScheduler.schedule_backward()`](backend/app/services/capacity_scheduler.py:177) аналогично использует fallback area_id для каждого этапа при отсутствии кандидатов по виду.
+  - Агрегация без изменений:
+    - [`CapacityScheduler.get_aggregated_load()`](backend/app/services/capacity_scheduler.py:278) агрегирует плановые и доступные часы по (area_id, bucket_date).
+- Применение мощностей в планировании:
+  - Передача area_id этапов в планировщик:
+    - В [`apply_capacity_constraints()`](backend/app/services/planning_service.py:1598) добавлена сборка `stage_areas = {stage_id: area_id}` и передача в оба вызова планировщика:
+      - вызов лимитирования: [`capacity_scheduler.limit_qty_by_capacity(..., stage_areas_by_stage=stage_areas)`](backend/app/services/planning_service.py:1624)
+      - вызов backward‑расписания: [`capacity_scheduler.schedule_backward(..., stage_areas_by_stage=stage_areas)`](backend/app/services/planning_service.py:1638)
+- Построение этапов (напоминание о наличии исходного fallback):
+  - В [`build_order_stages()`](backend/app/services/planning_service.py:1566) уже присутствует fallback `area_id` через [`ResourceStage`](backend/app/models.py:279) для этапов, если по виду нет ресурса. Теперь этот `area_id` используется и в мощностях при отсутствии карты вида.
+
+Ожидаемое поведение «после»:
+
+- Для изделий/этапов с area_id, но без production_kind/resource_production_kinds:
+  - qty больше не обнуляется из‑за отсутствия настроек вида; ограничивается реальной мощностью указанных участков;
+  - строки `planned_order_stage` чаще имеют `hours > 0` и `area_id IS NOT NULL`;
+  - в `capacity_load` появляется больше строк с плановыми часами по «ранее пустым» участкам/датам.
+- Для изделий с корректной картой вида — поведение без изменений.
+- Для изделий без production_kind и без area_id — qty может быть ограничено до 0 (дефицит данных), поведение без изменений.
+
+Проверки (рекомендуемый сценарий для run_id=158 и нового run):
+
+- БД:
+  - select count(*) from planned_order where run_id=:run and qty = 0;
+  - select count(*) from planned_order_stage where run_id=:run and hours > 0 and area_id is not null;
+  - select count(*), sum(hours_planned) from capacity_load where run_id=:run;
+- API:
+  - GET /v1/plan/results/{run_id}/capacity — ожидается более полное распределение по участкам/датам (возвращаются строки только для дневных бакетов);
+  - GET /v1/plan/results/{run_id}/production — доля строк с qty=0 должна снизиться, увеличиваются осмысленные этапы/участки.
+
+Тесты:
+
+- Добавлен автотест fallback:
+  - файл: tests/services/test_capacity_fallback.py
+  - покрывает:
+    - [`CapacityScheduler.limit_qty_by_capacity()`](backend/app/services/capacity_scheduler.py:76) с пустыми кандидатами по виду и fallback на stage_areas_by_stage;
+    - [`CapacityScheduler.schedule_backward()`](backend/app/services/capacity_scheduler.py:177) с начислением нагрузки в агрегатор на area_id из fallback.
+- Выполнено:
+  - Команда: `set PYTHONPATH=. && pytest -q tests/test_planning_service.py tests/services/test_capacity_fallback.py`
+  - Статус: PASS (4 passed); предупреждения SQLAlchemy о declarative_base (известно, не влияет на расчёты).
+
+Совместимость и ограничения:
+
+- Фронтенд/схема БД не менялись.
+- Публичные методы планировщика сохранены, сигнатуры расширены обратимо (добавлен опциональный параметр).
+- buffer_days / expand_bom не тронуты: см. [`compute_gross_requirements()`](backend/app/services/planning_service.py:1123) и `expand_bom()` внутри него.

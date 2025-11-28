@@ -6,9 +6,6 @@ export const ru = {
     startedAt: 'Старт',
     finishedAt: 'Финиш',
     horizonDays: 'Горизонт (дней)',
-    weeklyYes: 'Да',
-    weeklyNo: 'Нет',
-    weeklyLabel: 'Недельный режим',
     tabs: {
       production: 'Заказы на производство',
       purchases: 'Заказы на закупку',
@@ -36,7 +33,11 @@ export const ru = {
       },
       kindIssues: {
         button: 'Проблемы привязки видов'
-      }
+      },
+      // Новые индикаторы сводки
+      missingNorms: 'Позиций без норм времени',
+      componentShortagesBlocked: 'Блокировано из‑за дефицита комплектующих',
+      componentShortagesPartial: 'Частичное планирование по комплектующим'
     },
     columns: {
       name: 'Наименование',
@@ -75,9 +76,10 @@ export const ru = {
       reset: 'Сбросить фильтры',
       bucketOption: {
         any: 'Любой',
-        daily: 'daily',
-        weekly: 'weekly'
-      }
+        daily: 'daily'
+      },
+      // Тумблер отображения техстрок qty=0
+      showTechnicalRows: 'Показать техстроки (qty=0)'
     },
     actions: {
       csv: 'CSV',
@@ -89,11 +91,16 @@ export const ru = {
     },
     badge: {
       noNormPerUnit: 'без норматива',
-      overload: 'перегруз'
+      overload: 'перегруз',
+      // Плашка отсутствия участка
+      noAreaForKind: 'нет участка по виду'
     },
     placeholder: {
       noArticle: '—',
       itemNameFallback: 'Номенклатура #{id}'
+    },
+    table: {
+      noDataLabel: 'Нет данных для отображения'
     },
     pegging: {
       child: 'Дочерний',

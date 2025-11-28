@@ -83,7 +83,7 @@ def test_buffer_days_avg_daily_demand_priority_over_qty():
 
     # Directly check internal buffer calculation via public path
     requested = 1.0
-    final_qty, normalized, warnings = oqc.compute(item_id, requested)
+    final_qty, normalized, details, warnings = oqc.compute(item_id, requested)
 
     # Buffer qty = 10 * 3 = 30; min lot sizing will raise base to at least buffer if buffer > requested
     # No optimal_batch, so normalized should be >= 30 (exact 30 with min_batch=1, multiple=1)
@@ -131,7 +131,7 @@ def test_optimal_batch_wins_over_buffer():
     )
 
     requested = 10.0
-    final_qty, normalized, warnings = oqc.compute(item_id, requested)
+    final_qty, normalized, details, warnings = oqc.compute(item_id, requested)
 
     # final_qty limited by horizon (100) and components (no limit) → 10
     assert final_qty == 10.0
@@ -179,12 +179,13 @@ def test_component_shortage_warning_and_limit():
     )
 
     requested = 10.0
-    final_qty, normalized, warnings = oqc.compute(parent_id, requested)
+    final_qty, normalized, details, warnings = oqc.compute(parent_id, requested)
 
+    # Component limit should be exposed via details and warnings emitted, but final_qty is not capped by components here.
     # Component limit: 15 / 2 = 7.5
-    assert final_qty == pytest.approx(7.5, rel=1e-6)
-    # Normalized with defaults (min_batch=1, multiple=1) → normalized ~= 8 (ceil) only if lot sizing applied;
-    # BUT in OQC: first final_qty computed, then lot sizing normalization is applied with buffer and batch config.
+    assert details.get("component_limit") == pytest.approx(7.5, rel=1e-6)
+    assert final_qty == pytest.approx(10.0, rel=1e-6)  # capped by requested only (no horizon cap in this case)
+    # Normalization should not be less than final_qty
     assert normalized >= final_qty
     assert any(w.get("code") == "COMPONENT_SHORTAGE" for w in warnings)
 
@@ -227,7 +228,7 @@ def test_horizon_cap_limits_final_qty():
     )
 
     requested = 100.0
-    final_qty, normalized, warnings = oqc.compute(item_id, requested)
+    final_qty, normalized, details, warnings = oqc.compute(item_id, requested)
 
     assert final_qty == 5.0  # capped by horizon demand
     assert normalized >= 5.0

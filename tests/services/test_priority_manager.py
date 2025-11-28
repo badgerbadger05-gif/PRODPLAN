@@ -41,11 +41,10 @@ def test_priority_ordering_by_criticality_and_cycle_time():
     created_orders = [order_A, order_B]
 
     # net buckets: средний расход по 101 достаточно высокий, а stock большой => time_to_deplete большой => coeff маленький => criticality=10
-    net_daily = {
+    net_requirements = {
         str(101): {today.isoformat(): 10.0, (today + timedelta(days=1)).isoformat(): 10.0},  # avg ~10
         str(102): {today.isoformat(): 0.0},  # практически нет спроса
     }
-    net_weekly = {}
 
     # Нормо-часы: A больше B
     item_norm_cache = {101: 100.0, 102: 1.0}
@@ -62,8 +61,7 @@ def test_priority_ordering_by_criticality_and_cycle_time():
         db=_fake_db(),
         created_orders=created_orders,
         item_norm_cache=item_norm_cache,
-        net_daily=net_daily,
-        net_weekly=net_weekly,
+        net_requirements=net_requirements,
         items=items,
     )
 

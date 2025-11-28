@@ -1,0 +1,226 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+ "title": "Схема конфигурации планирования",
+  "description": "Описание полей конфигурации MRP-планирования для генерации формы в интерфейсе",
+  "type": "object",
+  "properties": {
+    "planning_horizon_days": {
+      "type": "number",
+      "minimum": 1,
+      "maximum": 365,
+      "default": 90,
+      "title": "Горизонт планирования (дни)",
+      "description": "Количество дней вперёд, на которое рассчитывается план"
+    },
+    "mps_daily_horizon_days": {
+      "type": "number",
+      "minimum": 1,
+      "maximum": 365,
+      "default": 90,
+      "title": "Горизонт MPS (дни)",
+      "description": "Количество дней вперёд для детального планирования MPS"
+    },
+    "weekly": {
+      "type": "object",
+      "title": "Недельный режим",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "title": "Включить недельное планирование",
+          "description": "Планировать по неделям, а не по дням"
+        },
+        "anchor_day": {
+          "type": "string",
+          "enum": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+          "default": "Monday",
+          "title": "Опорный день недели",
+          "description": "День недели, с которого начинается недельный цикл"
+        },
+        "need_date_day": {
+          "type": "string",
+          "enum": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+          "default": "Friday",
+          "title": "День даты потребности",
+          "description": "День недели, к которому привязывается дата потребности"
+        }
+      }
+    },
+    "procurement": {
+      "type": "object",
+      "title": "Параметры закупок",
+      "properties": {
+        "default_lead_time_days": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 365,
+          "default": 30,
+          "title": "Время поставки по умолчанию (дни)",
+          "description": "Время поставки в днях, если не задано в карточке номенклатуры"
+        },
+        "lead_time_min_policy": {
+          "type": "string",
+          "enum": ["max(default_lead_time_days, lead_time_from_item)", "default_only", "item_only"],
+          "default": "max(default_lead_time_days, lead_time_from_item)",
+          "title": "Политика расчёта времени поставки",
+          "description": "Правило выбора времени поставки при наличии значения в карточке номенклатуры"
+        },
+        "lot_sizing": {
+          "type": "object",
+          "title": "Партионность",
+          "properties": {
+            "moq_source": {
+              "type": "string",
+              "enum": ["item_card_or_1", "item_card_only", "one_always"],
+              "default": "item_card_or_1",
+              "title": "Источник MOQ",
+              "description": "Откуда брать минимальный заказ (MOQ): из карточки номенклатуры или 1"
+            },
+            "multiple": {
+              "type": "number",
+              "minimum": 1,
+              "default": 1,
+              "title": "Кратность заказа",
+              "description": "Заказы будут округляться до этого числа"
+            },
+            "rounding": {
+              "type": "string",
+              "enum": ["ceil", "floor", "round"],
+              "default": "ceil",
+              "title": "Метод округления",
+              "description": "Как округлять количество при расчёте заказа"
+            }
+          }
+        },
+        "order_date_rounding_policy": {
+          "type": "string",
+          "enum": ["previous_workday", "current_day", "next_workday"],
+          "default": "previous_workday",
+          "title": "Округление даты заказа",
+          "description": "Как округлять дату заказа по календарю"
+        }
+      }
+    },
+    "production": {
+      "type": "object",
+      "title": "Параметры производства",
+      "properties": {
+        "lot_sizing": {
+          "type": "object",
+          "title": "Партионность производства",
+          "properties": {
+            "min_batch": {
+              "type": "number",
+              "minimum": 1,
+              "default": 1,
+              "title": "Минимальная партия",
+              "description": "Минимальное количество в производственном заказе"
+            },
+            "multiple": {
+              "type": "number",
+              "minimum": 1,
+              "default": 1,
+              "title": "Кратность партии",
+              "description": "Производственные заказы будут кратны этому числу"
+            },
+            "rounding": {
+              "type": "string",
+              "enum": ["ceil", "floor", "round"],
+              "default": "ceil",
+              "title": "Метод округления",
+              "description": "Как округлять количество при расчёте заказа"
+            }
+          }
+        }
+      }
+    },
+    "safety_stock_percent": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100,
+      "default": 1,
+      "multipleOf": 0.1,
+      "title": "Страховой запас (%)",
+      "description": "Процент от спроса для формирования страхового запаса"
+    },
+    "capacity": {
+      "type": "object",
+      "title": "Параметры мощностей",
+      "properties": {
+        "use_resource_calendars": {
+          "type": "boolean",
+          "default": true,
+          "title": "Использовать календари ресурсов",
+          "description": "Учитывать календари недоступности ресурсов при расчёте"
+        },
+        "consider_power_coefficients": {
+          "type": "boolean",
+          "default": true,
+          "title": "Учитывать коэффициенты мощности",
+          "description": "Применять коэффициенты эффективности ресурсов"
+        }
+      }
+    },
+    "prioritization": {
+      "type": "object",
+      "title": "Параметры приоритизации",
+      "properties": {
+        "weight_criticality": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.4,
+          "multipleOf": 0.05,
+          "title": "Вес критичности",
+          "description": "Вклад критичности в общий приоритет (сумма = 1.0)"
+        },
+        "weight_importance": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.3,
+          "multipleOf": 0.05,
+          "title": "Вес важности",
+          "description": "Вклад важности в общий приоритет (сумма = 1.0)"
+        },
+        "weight_cycle_time": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.3,
+          "multipleOf": 0.05,
+          "title": "Вес времени цикла",
+          "description": "Вклад времени цикла в общий приоритет (сумма = 1.0)"
+        },
+        "default_importance": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 10,
+          "default": 1,
+          "title": "Важность по умолчанию",
+          "description": "Значение важности для номенклатуры без явного указания"
+        }
+      }
+    },
+    "toggles": {
+      "type": "object",
+      "title": "Переключатели",
+      "properties": {
+        "include_wip": {
+          "type": "boolean",
+          "default": false,
+          "title": "Включать НЗП",
+          "description": "Учитывать незавершённое производство в расчётах"
+        },
+        "enable_weekly_route_detail": {
+          "type": "boolean",
+          "default": false,
+          "title": "Детализировать маршрут по неделям",
+          "description": "Разбивать операции маршрута по неделям"
+        }
+      }
+    }
+  },
+  "required": ["planning_horizon_days", "mps_daily_horizon_days", "safety_stock_percent"],
+  "additionalProperties": false
+}

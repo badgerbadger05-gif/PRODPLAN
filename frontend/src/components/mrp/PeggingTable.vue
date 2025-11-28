@@ -8,6 +8,7 @@
     :loading="loading"
     :pagination="pagination"
     @request="$emit('request', $event)"
+    :no-data-label="t('mrp.table.noDataLabel')"
   >
     <template #body-cell-child_item_id="p">
       <q-td :props="p">

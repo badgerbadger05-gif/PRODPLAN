@@ -42,11 +42,6 @@
 
       <div class="row q-col-gutter-md q-mt-sm">
         <div class="col-6 col-md-3">
-          <div class="text-caption text-grey">{{ t('mrp.weeklyLabel') }}</div>
-          <div class="text-body1">{{ (summary?.run?.use_weekly ? t('mrp.weeklyYes') : t('mrp.weeklyNo')) }}</div>
-        </div>
-
-        <div class="col-6 col-md-3">
           <div class="text-caption text-grey">{{ t('mrp.summary.productionOrders') }}</div>
           <div class="text-body1">{{ summary?.counts?.production_orders ?? 0 }}</div>
         </div>
@@ -107,6 +102,43 @@
         <span class="text-grey q-ml-sm">({{ kindIssuesCount }})</span>
       </q-card-section>
     </template>
+
+    <template v-if="summaryIndicatorsVisible">
+      <q-separator />
+      <q-card-section>
+        <div class="row q-col-gutter-sm">
+          <q-chip
+            v-if="missingNormsCount > 0"
+            color="grey-8"
+            text-color="white"
+            icon="schedule"
+            size="sm"
+          >
+            {{ t('mrp.summary.missingNorms') }}: {{ missingNormsCount }}
+          </q-chip>
+
+          <q-chip
+            v-if="componentBlockedCount > 0"
+            color="negative"
+            text-color="white"
+            icon="block"
+            size="sm"
+          >
+            {{ t('mrp.summary.componentShortagesBlocked') }}: {{ componentBlockedCount }}
+          </q-chip>
+
+          <q-chip
+            v-if="componentPartialCount > 0"
+            color="warning"
+            text-color="black"
+            icon="inventory_2"
+            size="sm"
+          >
+            {{ t('mrp.summary.componentShortagesPartial') }}: {{ componentPartialCount }}
+          </q-chip>
+        </div>
+      </q-card-section>
+    </template>
   </q-card>
 </template>
 
@@ -131,12 +163,24 @@ const fmt = (v: any) => formatNumber(v, { fractionDigits: 3 })
 
 // Подсчёт проблем сопоставления вида производства участкам
 const kindIssuesCount = computed(() => {
+  // Новый приоритет: структурированное поле summary.kindIssues.total
+  const structured = Number((props.summary as any)?.kindIssues?.total ?? 0)
+  if (structured > 0) return structured
+  // Фолбэк по кодам из warnings
   const arr = (props.summary?.warnings || []) as any[]
-  return arr.filter((w: any) =>
-    String(w?.code || '') === 'NO_AREA_FOR_PRODUCTION_KIND' ||
-    String(w?.code || '') === 'NO_AREA_FOR_PRODUCTION_KIND_ZERO_NORM'
-  ).length
+  return arr.filter((w: any) => {
+    const code = String(w?.code || '')
+    return code === 'NO_AREA_FOR_PRODUCTION_KIND' || code === 'NO_PRODUCTION_KIND'
+  }).length
 })
+
+// Индикаторы по новым агрегатам
+const missingNormsCount = computed(() => Number((props.summary as any)?.missingNorms?.total ?? 0))
+const componentBlockedCount = computed(() => Number((props.summary as any)?.componentShortages?.blocked ?? 0))
+const componentPartialCount = computed(() => Number((props.summary as any)?.componentShortages?.partial ?? 0))
+const summaryIndicatorsVisible = computed(
+  () => (missingNormsCount.value + componentBlockedCount.value + componentPartialCount.value) > 0
+)
 </script>
 
 <style scoped>

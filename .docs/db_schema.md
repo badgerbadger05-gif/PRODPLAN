@@ -330,7 +330,6 @@ CREATE TABLE planning_run (
   status          VARCHAR(20) NOT NULL DEFAULT 'PENDING',
   started_by      VARCHAR(100),
   horizon_days    INTEGER,
-  use_weekly      BOOLEAN NOT NULL DEFAULT TRUE,
   config_version_id INTEGER,
   config_snapshot JSONB NOT NULL,
   warnings        JSONB,
@@ -357,18 +356,17 @@ CREATE TABLE planned_order (
   finish_date     DATE,
   route_ref       VARCHAR(255),
   priority_index  DECIMAL(10,4),
-  bucket_type     VARCHAR(10) NOT NULL,
   bucket_date     DATE NOT NULL,
   demand_ref      TEXT,
   demand_date     DATE,
-  CHECK (bucket_type IN ('daily','weekly')),
   FOREIGN KEY(run_id) REFERENCES planning_run(run_id) ON DELETE CASCADE,
   FOREIGN KEY(item_id) REFERENCES items(item_id)
 );
 CREATE INDEX idx_planned_order_run ON planned_order(run_id);
 CREATE INDEX idx_planned_order_item ON planned_order(item_id);
 CREATE INDEX idx_planned_order_need_date ON planned_order(need_date);
-CREATE INDEX idx_planned_order_bucket ON planned_order(bucket_type, bucket_date);
+CREATE INDEX ix_planned_order_run_bucket_date ON planned_order(run_id, bucket_date);
+CREATE INDEX ix_planned_order_bucket_date ON planned_order(bucket_date);
 CREATE INDEX idx_planned_order_priority ON planned_order(priority_index);
 CREATE INDEX idx_planned_order_dates ON planned_order(start_date, finish_date);
 CREATE INDEX idx_planned_order_run_item ON planned_order(run_id, item_id);
@@ -382,10 +380,8 @@ CREATE TABLE planned_order_stage (
   order_id        INTEGER NOT NULL,
   stage_id        INTEGER NOT NULL,
   area_id         INTEGER,
-  bucket_type     VARCHAR(10) NOT NULL,
   bucket_date     DATE NOT NULL,
   hours           DECIMAL(12,3) NOT NULL DEFAULT 0.0,
-  CHECK (bucket_type IN ('daily','weekly')),
   FOREIGN KEY(run_id) REFERENCES planning_run(run_id) ON DELETE CASCADE,
   FOREIGN KEY(order_id) REFERENCES planned_order(order_id) ON DELETE CASCADE,
   FOREIGN KEY(stage_id) REFERENCES production_stages(stage_id),
@@ -393,8 +389,8 @@ CREATE TABLE planned_order_stage (
 );
 CREATE INDEX idx_pos_run_order ON planned_order_stage(run_id, order_id);
 CREATE INDEX idx_pos_stage_area ON planned_order_stage(stage_id, area_id);
-CREATE INDEX idx_pos_bucket ON planned_order_stage(bucket_type, bucket_date);
-CREATE INDEX idx_pos_area_bucket ON planned_order_stage(area_id, bucket_type, bucket_date);
+CREATE INDEX ix_pos_run_bucket_date ON planned_order_stage(run_id, bucket_date);
+CREATE INDEX ix_pos_area_bucket_date ON planned_order_stage(area_id, bucket_date);
 CREATE INDEX idx_pos_run_stage ON planned_order_stage(run_id, stage_id);
 ```
 
@@ -409,10 +405,8 @@ CREATE TABLE planned_purchase (
   order_date      DATE NOT NULL,
   lead_time_days  INTEGER NOT NULL,
   priority_index  DECIMAL(10,4),
-  bucket_type     VARCHAR(10) NOT NULL,
   bucket_date     DATE NOT NULL,
   supplier_ref1c  VARCHAR(255),
-  CHECK (bucket_type IN ('daily','weekly')),
   FOREIGN KEY(run_id) REFERENCES planning_run(run_id) ON DELETE CASCADE,
   FOREIGN KEY(item_id) REFERENCES items(item_id)
 );
@@ -420,7 +414,8 @@ CREATE INDEX idx_planned_purchase_run ON planned_purchase(run_id);
 CREATE INDEX idx_planned_purchase_item ON planned_purchase(item_id);
 CREATE INDEX idx_planned_purchase_need ON planned_purchase(need_date);
 CREATE INDEX idx_planned_purchase_order ON planned_purchase(order_date);
-CREATE INDEX idx_planned_purchase_bucket ON planned_purchase(bucket_type, bucket_date);
+CREATE INDEX ix_planned_purchase_run_bucket_date ON planned_purchase(run_id, bucket_date);
+CREATE INDEX ix_planned_purchase_bucket_date ON planned_purchase(bucket_date);
 CREATE INDEX idx_pp_item_need ON planned_purchase(item_id, need_date);
 CREATE INDEX idx_pp_item_order ON planned_purchase(item_id, order_date);
 ```
@@ -431,16 +426,14 @@ CREATE TABLE capacity_load (
   id              SERIAL PRIMARY KEY,
   run_id          INTEGER NOT NULL,
   area_id         INTEGER NOT NULL,
-  bucket_type     VARCHAR(10) NOT NULL,
   bucket_date     DATE NOT NULL,
   hours_planned   DECIMAL(12,3) NOT NULL DEFAULT 0.0,
   hours_available DECIMAL(12,3) NOT NULL DEFAULT 0.0,
   overload_hours  DECIMAL(12,3) NOT NULL DEFAULT 0.0,
-  CHECK (bucket_type IN ('daily','weekly')),
   FOREIGN KEY(run_id) REFERENCES planning_run(run_id) ON DELETE CASCADE,
   FOREIGN KEY(area_id) REFERENCES production_resources(resource_id)
 );
-CREATE UNIQUE INDEX ux_capacity_load ON capacity_load(run_id, area_id, bucket_type, bucket_date);
+CREATE UNIQUE INDEX ux_capacity_load_run_area_date ON capacity_load(run_id, area_id, bucket_date);
 CREATE INDEX idx_capacity_load_over ON capacity_load(overload_hours);
 ```
 

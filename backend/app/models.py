@@ -1,8 +1,25 @@
-from sqlalchemy import Column, Integer, String, DECIMAL, TIMESTAMP, ForeignKey, TEXT, Boolean, DateTime, Date, CheckConstraint
+from sqlalchemy import Column, Integer, String, DECIMAL, TIMESTAMP, ForeignKey, TEXT, Boolean, DateTime, Date, CheckConstraint, JSON, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.types import TypeDecorator
 from .database import Base
+
+# Use JSON for SQLite, JSONB for others
+class CrossPlatformJSON(TypeDecorator):
+    impl = JSON
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == 'postgresql':
+            return dialect.type_descriptor(JSONB())
+        else:
+            return dialect.type_descriptor(JSON())
+
+@compiles(CrossPlatformJSON, 'postgresql')
+def compile_jsonb(element, compiler, **kw):
+    return "JSONB"
 
 
 class ProductionStage(Base):
@@ -313,7 +330,7 @@ class PlanningConfigVersion(Base):
     id = Column(Integer, primary_key=True, index=True)
     version = Column(Integer, nullable=False)
     is_active = Column(Boolean, nullable=False, default=False)
-    config = Column(JSONB, nullable=False)
+    config = Column(CrossPlatformJSON, nullable=False)
     comment = Column(TEXT, nullable=True)
     created_by = Column(String(100), nullable=True)
     created_at = Column(TIMESTAMP, default=func.now())
@@ -328,31 +345,28 @@ class PlanningRun(Base):
     status = Column(String(20), nullable=False, default="PENDING")
     started_by = Column(String(100), nullable=True)
     horizon_days = Column(Integer, nullable=True)
-    use_weekly = Column(Boolean, nullable=False, default=True)
     # Флаг закрепления прогона от авто‑очистки
     pinned = Column(Boolean, nullable=False, default=False)
     config_version_id = Column(Integer, ForeignKey("planning_config_versions.id"), nullable=True)
-    config_snapshot = Column(JSONB, nullable=False)
-    warnings = Column(JSONB, nullable=True)
-    kpi = Column(JSONB, nullable=True)
+    config_snapshot = Column(CrossPlatformJSON, nullable=False)
+    warnings = Column(CrossPlatformJSON, nullable=True)
+    kpi = Column(CrossPlatformJSON, nullable=True)
 
 
 class PlannedOrder(Base):
     __tablename__ = "planned_order"
-    __table_args__ = (
-        CheckConstraint("bucket_type IN ('daily','weekly')", name="ck_planned_order_bucket_type"),
-    )
 
     order_id = Column(Integer, primary_key=True, index=True)
     run_id = Column(Integer, ForeignKey("planning_run.run_id", ondelete="CASCADE"), nullable=False)
     item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False)
+    requested_qty = Column(DECIMAL(15, 3), nullable=False)
+    planned_qty = Column(DECIMAL(15, 3), nullable=False)
     qty = Column(DECIMAL(15, 3), nullable=False)
     need_date = Column(Date, nullable=False)
     start_date = Column(Date, nullable=True)
     finish_date = Column(Date, nullable=True)
     route_ref = Column(String(255), nullable=True)
     priority_index = Column(DECIMAL(10, 4), nullable=True)
-    bucket_type = Column(String(10), nullable=False)
     bucket_date = Column(Date, nullable=False)
     demand_ref = Column(TEXT, nullable=True)
     demand_date = Column(Date, nullable=True)
@@ -360,35 +374,29 @@ class PlannedOrder(Base):
 
 class PlannedOrderStage(Base):
     __tablename__ = "planned_order_stage"
-    __table_args__ = (
-        CheckConstraint("bucket_type IN ('daily','weekly')", name="ck_planned_order_stage_bucket_type"),
-    )
 
     id = Column(Integer, primary_key=True, index=True)
     run_id = Column(Integer, ForeignKey("planning_run.run_id", ondelete="CASCADE"), nullable=False)
     order_id = Column(Integer, ForeignKey("planned_order.order_id", ondelete="CASCADE"), nullable=False)
     stage_id = Column(Integer, ForeignKey("production_stages.stage_id"), nullable=False)
     area_id = Column(Integer, ForeignKey("production_resources.resource_id"), nullable=True)
-    bucket_type = Column(String(10), nullable=False)
     bucket_date = Column(Date, nullable=False)
     hours = Column(DECIMAL(12, 3), nullable=False, default=0.0)
 
 
 class PlannedPurchase(Base):
     __tablename__ = "planned_purchase"
-    __table_args__ = (
-        CheckConstraint("bucket_type IN ('daily','weekly')", name="ck_planned_purchase_bucket_type"),
-    )
 
     purchase_id = Column(Integer, primary_key=True, index=True)
     run_id = Column(Integer, ForeignKey("planning_run.run_id", ondelete="CASCADE"), nullable=False)
     item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False)
+    requested_qty = Column(DECIMAL(15, 3), nullable=False)
+    planned_qty = Column(DECIMAL(15, 3), nullable=False)
     qty = Column(DECIMAL(15, 3), nullable=False)
     need_date = Column(Date, nullable=False)
     order_date = Column(Date, nullable=False)
     lead_time_days = Column(Integer, nullable=False)
     priority_index = Column(DECIMAL(10, 4), nullable=True)
-    bucket_type = Column(String(10), nullable=False)
     bucket_date = Column(Date, nullable=False)
     supplier_ref1c = Column(String(255), nullable=True)
 
@@ -396,13 +404,12 @@ class PlannedPurchase(Base):
 class CapacityLoad(Base):
     __tablename__ = "capacity_load"
     __table_args__ = (
-        CheckConstraint("bucket_type IN ('daily','weekly')", name="ck_capacity_load_bucket_type"),
+        UniqueConstraint('run_id','area_id','bucket_date', name='ux_capacity_load_run_area_date'),
     )
 
     id = Column(Integer, primary_key=True, index=True)
     run_id = Column(Integer, ForeignKey("planning_run.run_id", ondelete="CASCADE"), nullable=False)
     area_id = Column(Integer, ForeignKey("production_resources.resource_id"), nullable=False)
-    bucket_type = Column(String(10), nullable=False)
     bucket_date = Column(Date, nullable=False)
     hours_planned = Column(DECIMAL(12, 3), nullable=False, default=0.0)
     hours_available = Column(DECIMAL(12, 3), nullable=False, default=0.0)

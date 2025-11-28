@@ -84,11 +84,6 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
-const bucketOptions = computed(() => ([
-  { label: t('mrp.filters.bucketOption.any'), value: undefined },
-  { label: t('mrp.filters.bucketOption.daily'), value: 'daily' },
-  { label: t('mrp.filters.bucketOption.weekly'), value: 'weekly' }
-]))
 
 const local = ref<ProductionFilters>({
   date_from: props.modelValue?.date_from,

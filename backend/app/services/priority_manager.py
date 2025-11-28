@@ -37,8 +37,7 @@ class PriorityManager:
         db: Session,
         created_orders: List[PlannedOrder],
         item_norm_cache: Dict[int, float],
-        net_daily: Dict[str, Dict[str, float]],
-        net_weekly: Dict[str, Dict[str, float]],
+        net_requirements: Dict[str, Dict[str, float]],
         items: List[Item],
     ) -> Dict[int, float]:
         """
@@ -74,10 +73,7 @@ class PriorityManager:
                 current_stock = float(stock_by_item.get(iid, 0.0) or 0.0) + float(wip_by_item.get(iid, 0.0) or 0.0)
                 total_demand = 0.0
                 demand_days_count = 0
-                for qty_val in (net_daily.get(str(iid), {}) or {}).values():
-                    total_demand += float(qty_val or 0.0)
-                    demand_days_count += 1
-                for qty_val in (net_weekly.get(str(iid), {}) or {}).values():
+                for qty_val in (net_requirements.get(str(iid), {}) or {}).values():
                     total_demand += float(qty_val or 0.0)
                     demand_days_count += 1
 
