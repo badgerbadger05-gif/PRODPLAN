@@ -19,10 +19,12 @@ class SpecificationSyncStats:
     specs_unchanged: int = 0
     components_created: int = 0
     components_updated: int = 0
+    components_deleted: int = 0
     operations_created: int = 0
     operations_updated: int = 0
     spec_operations_created: int = 0
     spec_operations_updated: int = 0
+    spec_operations_deleted: int = 0
     dry_run: bool = False
     odata_url: str = ""
     odata_entity: str = ""
@@ -79,10 +81,12 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
         unchanged_count = 0
         components_created = 0
         components_updated = 0
+        components_deleted = 0
         operations_created = 0
         operations_updated = 0
         spec_operations_created = 0
         spec_operations_updated = 0
+        spec_operations_deleted = 0
 
         # Обрабатываем каждую спецификацию
         for record in spec_data:
@@ -100,14 +104,30 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                     continue
 
                 # Обрабатываем состав спецификаций
-                components_data = record.get('Состав', [])
-                if not isinstance(components_data, list):
+                # IMPORTANT: reconcile (delete removed rows) выполняем только если поле реально присутствует в ответе OData.
+                # Если поле не выгружено (select_fields не содержит вложенную табличную часть), мы НЕ имеем права удалять строки.
+                has_components_field = 'Состав' in record
+                components_data_raw = record.get('Состав', None)
+                components_data: list = []
+                can_reconcile_components = False
+                if isinstance(components_data_raw, list):
+                    components_data = components_data_raw
+                    can_reconcile_components = bool(has_components_field)
+                else:
                     components_data = []
+                    can_reconcile_components = False
 
                 # Обрабатываем операции
-                operations_data = record.get('Операции', [])
-                if not isinstance(operations_data, list):
+                has_operations_field = 'Операции' in record
+                operations_data_raw = record.get('Операции', None)
+                operations_data: list = []
+                can_reconcile_operations = False
+                if isinstance(operations_data_raw, list):
+                    operations_data = operations_data_raw
+                    can_reconcile_operations = bool(has_operations_field)
+                else:
                     operations_data = []
+                    can_reconcile_operations = False
 
                 # Проверяем, существует ли уже такая спецификация
                 existing_spec = existing_specs.get(ref_key)
@@ -154,6 +174,7 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                     continue
 
                 # Обрабатываем компоненты спецификации
+                seen_component_item_ids: set[int] = set()
                 for comp_data in components_data:
                     try:
                         comp_ref_key = comp_data.get('Ref_Key', '').strip()
@@ -171,6 +192,8 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
 
                         if not item:
                             continue
+
+                        seen_component_item_ids.add(int(item.item_id))
 
                         # Создаем или обновляем компонент
                         existing_comp = db.query(SpecComponent).filter_by(
@@ -201,7 +224,24 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                         print(f"Ошибка обработки компонента спецификации {ref_key}: {e}")
                         continue
 
+                # Reconcile: удалить компоненты, которые больше не присутствуют в 1С (только если поле 'Состав' реально выгружено)
+                if can_reconcile_components:
+                    try:
+                        q_del = db.query(SpecComponent).filter(SpecComponent.spec_id == current_spec.spec_id)
+                        if seen_component_item_ids:
+                            deleted = (
+                                q_del.filter(~SpecComponent.item_id.in_(list(seen_component_item_ids)))
+                                .delete(synchronize_session=False)
+                            )
+                        else:
+                            deleted = q_del.delete(synchronize_session=False)
+                        if deleted:
+                            components_deleted += int(deleted)
+                    except Exception as e:
+                        print(f"Ошибка reconcile компонентов спецификации {ref_key}: {e}")
+
                 # Обрабатываем операции спецификации
+                seen_operation_ids: set[int] = set()
                 for op_data in operations_data:
                     try:
                         operation_key = op_data.get('Операция_Key', '').strip()
@@ -230,6 +270,9 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                                 operations_updated += 1
                             # Страхуемся, что в индексе присутствует объект операции
                             existing_operations[operation_key] = operation
+
+                        if operation and operation.operation_id is not None:
+                            seen_operation_ids.add(int(operation.operation_id))
 
                         # Находим этап
                         stage = existing_stages.get(stage_key) if stage_key else None
@@ -265,6 +308,22 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                         print(f"Ошибка обработки операции спецификации {ref_key}: {e}")
                         continue
 
+                # Reconcile: удалить связи спецификация-операция, которые больше не присутствуют в 1С (только если поле 'Операции' выгружено)
+                if can_reconcile_operations:
+                    try:
+                        q_del = db.query(SpecOperation).filter(SpecOperation.spec_id == current_spec.spec_id)
+                        if seen_operation_ids:
+                            deleted = (
+                                q_del.filter(~SpecOperation.operation_id.in_(list(seen_operation_ids)))
+                                .delete(synchronize_session=False)
+                            )
+                        else:
+                            deleted = q_del.delete(synchronize_session=False)
+                        if deleted:
+                            spec_operations_deleted += int(deleted)
+                    except Exception as e:
+                        print(f"Ошибка reconcile операций спецификации {ref_key}: {e}")
+
             except Exception as e:
                 # Логируем ошибку, но продолжаем обработку
                 print(f"Ошибка обработки спецификации {ref_key}: {e}")
@@ -276,10 +335,12 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
         stats.specs_unchanged = unchanged_count
         stats.components_created = components_created
         stats.components_updated = components_updated
+        stats.components_deleted = components_deleted
         stats.operations_created = operations_created
         stats.operations_updated = operations_updated
         stats.spec_operations_created = spec_operations_created
         stats.spec_operations_updated = spec_operations_updated
+        stats.spec_operations_deleted = spec_operations_deleted
 
         if req.dry_run:
             db.rollback()

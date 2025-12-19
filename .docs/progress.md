@@ -1,3 +1,88 @@
+# 2025-12-19 — Диагностика: при синхронизации спецификаций не удаляются устаревшие строки состава/операций (+ копятся дубли default_specifications)
+
+- **Симптом**: после синхронизации и обновления спецификации в 1С, в расчёте MRP продолжают фигурировать детали, которые уже удалены из текущей спецификации.
+- **Пример** (по сообщению пользователя): корневое изделие «Г0002708» (в БД соответствует `item_code='00-00002708'`), «лишние» детали по артикулам: `CP-000260-GP`, `CP-000258-GSP`, `CP-000262-GP`, `CP-000257-GSP`.
+- **Подтверждение**: пользователь подтвердил, что в 1С этих CP‑строк в актуальной спецификации уже нет.
+
+## Что нашли в коде
+
+### Причина №1 (основная): sync спецификаций делает upsert, но не делает reconcile/удаление
+
+- В [`sync_specifications_from_odata()`](backend/app/services/specification_sync.py:31) компоненты спецификации записываются по схеме «создать или обновить», но **нет шага удаления** компонентов/операций, отсутствующих в текущем ответе OData.
+- Следствие: строки, удалённые в 1С, остаются в `spec_components`/`spec_operations` и участвуют в BOM explosion в [`compute_gross_requirements()`](backend/app/services/planning_service.py:1509) → [`expand_bom()`](backend/app/services/planning_service.py:1611).
+
+### Причина №2 (усугубляет): sync default_specifications не обновляет и не чистит старые записи
+
+- В [`sync_default_specifications_from_odata()`](backend/app/services/default_specification_sync.py:25) логика только добавляет новые записи, не обновляя/не удаляя старые.
+- Это приводит к дублям в `default_specifications` и потенциально недетерминированному выбору spec_id:
+  - UI дерева спецификаций использует `.first()` без явного порядка в [`_get_default_spec_id()`](backend/app/routers/specification.py:87) (может взять «старую» запись).
+  - расчёт строит `default_spec_map` из всех строк таблицы (дубликаты перетирают друг друга в зависимости от порядка выдачи) в [`compute_gross_requirements()`](backend/app/services/planning_service.py:1509).
+
+## Что нашли в БД (psql)
+
+- Для `item_code='00-00002708'` (id=3652) есть **2 записи** `default_specifications`:
+  - `id=882 spec_id=297` (старее)
+  - `id=2424 spec_id=2871` (новее)
+- Для сборки `item_code='НФ-00005609'` (id=339) есть **2 записи** `default_specifications`:
+  - `id=53 spec_id=453`
+  - `id=2271 spec_id=3380`
+- По обеим спецификациям сборки (`spec_id=453` и `spec_id=3380`) в `spec_components` присутствуют компоненты с артикулами `CP-000260-GP/…/CP-000257-GSP`, несмотря на то, что в 1С они уже удалены → подтверждает отсутствие удаления при sync.
+
+## Рекомендованный план исправления (после согласования)
+
+1) В [`sync_specifications_from_odata()`](backend/app/services/specification_sync.py:31) добавить reconcile:
+   - собирать `seen_item_ids`/`seen_operation_ids` по текущему ответу OData;
+   - удалять из БД `SpecComponent`/`SpecOperation` для `spec_id`, которых нет в `seen_*`;
+   - логировать `deleted_components/deleted_spec_operations` и `seen_counts`.
+   - В `dry_run` — только логировать разницу, без DELETE.
+2) В [`sync_default_specifications_from_odata()`](backend/app/services/default_specification_sync.py:25) сделать upsert по ключу `(item_id, characteristic_id)` и чистку дублей.
+3) Добавить уникальный constraint/index на `default_specifications` по `(item_id, characteristic_id)` (миграция Alembic) и разовый скрипт/SQL для очистки текущих дублей.
+
+## Диагностические SQL (использовали в сессии)
+
+```sql
+-- Дубли default_specifications по изделию
+select item_id, characteristic_id, count(*)
+from default_specifications
+group by item_id, characteristic_id
+having count(*) > 1;
+
+-- Компоненты спецификации с отбором по артикулам
+select s.spec_id, s.spec_code, child.item_code, child.item_article, child.item_name, sc.quantity
+from spec_components sc
+join specifications s on s.spec_id=sc.spec_id
+join items child on child.item_id=sc.item_id
+where s.spec_id = :spec_id
+  and child.item_article in ('CP-000260-GP','CP-000258-GSP','CP-000262-GP','CP-000257-GSP');
+```
+
+## 2025-12-19 (fix) — Реализовано исправление
+
+Backend:
+
+1) Reconcile в синхронизации спецификаций:
+- В [`sync_specifications_from_odata()`](backend/app/services/specification_sync.py:31) добавлено удаление «лишних» строк для табличных частей `Состав` и `Операции`.
+- Удаление выполняется **только если** поле реально присутствует в OData‑ответе (защита от сценария, когда вложенная табличная часть не выгружена из-за `select_fields`).
+- В статистику добавлены поля `components_deleted`/`spec_operations_deleted`.
+
+2) Upsert + чистка дублей в default_specifications:
+- В [`sync_default_specifications_from_odata()`](backend/app/services/default_specification_sync.py:25) ключ синхронизации изменён на `(item_id, characteristic_id)` вместо `(item_id, characteristic_id, spec_id)`.
+- Добавлена нормализация пустой характеристики (None/пусто/нулевой GUID → единый ключ) и best‑effort удаление дублей в рамках item_id, затронутых синком.
+
+3) Детерминированный выбор default спецификации в дереве:
+- В [`_get_default_spec_id()`](backend/app/routers/specification.py:87) добавлен `order_by(updated_at desc, id desc)`, чтобы при наличии дублей (до миграции/чистки) UI брал самую свежую запись.
+
+4) Миграция Alembic: уникальность default_specifications
+- Добавлена миграция [`20251219_01_default_specifications_unique.py`](backend/alembic/versions/20251219_01_default_specifications_unique.py:1), которая:
+  - дедуплицирует `default_specifications` по ключу `(item_id, COALESCE(characteristic_id,''))` (оставляет «самую новую» запись);
+  - создаёт уникальный индекс `ux_default_specifications_item_char`.
+
+Проверка (локально в docker):
+- `alembic heads` показывает `20251219_01 (head)`.
+- После `alembic upgrade head` дубли по `default_specifications` для `item_id` примеров исчезли, индекс `ux_default_specifications_item_char` создан.
+
+---
+
 # 2025-11-27 09:43 — MRP Production: плоская выдача без «Участка» и новый grouped‑эндпоинт
 
 - Суть: реализованы требования задачи для выдачи результатов производства.

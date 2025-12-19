@@ -88,6 +88,8 @@ def _get_default_spec_id(db: Session, item_id: int) -> Optional[int]:
     rec = (
         db.query(DefaultSpecification)
         .filter(DefaultSpecification.item_id == int(item_id))
+        # Если в БД (пока ещё) есть дубли, берём самую свежую запись.
+        .order_by(DefaultSpecification.updated_at.desc(), DefaultSpecification.id.desc())
         .first()
     )
     return int(rec.spec_id) if rec and rec.spec_id is not None else None
