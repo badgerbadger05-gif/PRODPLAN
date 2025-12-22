@@ -474,6 +474,60 @@ async def get_planning_result_purchases(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.get("/results/{run_id}/purchases/grouped")
+async def get_planning_result_purchases_grouped(
+    run_id: int,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = 1000,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+):
+    """Агрегированная выдача закупок по item_id+unit (для верхней таблицы UI)."""
+    try:
+        # Используем существующую агрегацию/денормализацию из сервиса.
+        # Берём большой лимит, затем режем пагинацией на уровне роутера.
+        res = get_run_purchases(
+            db=db,
+            run_id=int(run_id),
+            item_id=None,
+            bucket_type=None,
+            date_from=date_from,
+            date_to=date_to,
+            limit=100000,
+            offset=0,
+            sort_by="item_name",
+            sort_dir="asc",
+        )
+        base_rows = (res or {}).get("rows", []) or []
+
+        mapped = []
+        for r in base_rows:
+            try:
+                iid = int(r.get("item_id"))
+            except Exception:
+                continue
+            unit = r.get("unit")
+            mapped.append(
+                {
+                    "agg_key": f"{iid}|{unit or ''}",
+                    "item_id": iid,
+                    "item_name": r.get("item_name"),
+                    "item_article": r.get("item_article"),
+                    "unit": unit,
+                    "qty": float(r.get("qty") or 0.0),
+                }
+            )
+
+        total = int(len(mapped))
+        eff_limit = max(1, min(int(limit or 1000), 5000))
+        eff_offset = max(0, int(offset or 0))
+        page = mapped[eff_offset : eff_offset + eff_limit]
+        return {"rows": page, "total": total, "limit": eff_limit, "offset": eff_offset}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.get("/results/{run_id}/capacity")
 async def get_planning_result_capacity(
     run_id: int,

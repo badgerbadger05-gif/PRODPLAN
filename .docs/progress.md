@@ -1,5 +1,41 @@
 # 2025-12-22 — «Принудительные заказы» + восстановление отчёта о дефиците (shortage-report)
 
+## 2025-12-22 (fix) — MRP Purchases: «Нет данных для отображения» после рефакторинга
+
+### Симптом
+
+- На странице результатов прогона MRP во вкладке «Заказы на закупку» отображалось сообщение «Нет данных для отображения».
+- При этом детальная выдача закупок существовала (данные были в БД и доступны через API).
+
+### Диагностика
+
+- UI загружает закупки двумя запросами (в параллель):
+  - `GET /api/v1/plan/results/{run_id}/purchases` — детальные строки
+  - `GET /api/v1/plan/results/{run_id}/purchases/grouped` — агрегат для верхней таблицы
+  - место: [`loadPurchases()`](frontend/src/pages/MRPResultPage.vue:776)
+- После одного из рефакторингов маршрут `/purchases/grouped` отсутствовал на backend → `404 Not Found`.
+- Из-за `Promise.all()` падала вся загрузка закупок, и таблица оставалась пустой.
+
+Подтверждение curl:
+
+- `GET /api/v1/plan/results/178/purchases` → 200 OK (есть rows)
+- `GET /api/v1/plan/results/178/purchases/grouped` → 404 Not Found
+
+### Исправление
+
+1) Backend: добавлен эндпоинт `GET /v1/plan/results/{run_id}/purchases/grouped` в [`plan.py`](backend/app/routers/plan.py:1)
+   - Реализован как совместимый адаптер: повторно использует агрегацию из [`get_run_purchases()`](backend/app/services/planning_service.py:801) и преобразует к контракту grouped-таблицы.
+
+2) Frontend: добавлен graceful fallback
+   - в [`loadPurchases()`](frontend/src/pages/MRPResultPage.vue:776) отказались от `Promise.all()`;
+   - сначала грузим `/purchases`, затем пробуем `/purchases/grouped`, а при ошибке строим агрегат из полученных детальных строк.
+
+### Проверка
+
+- После пересборки контейнеров:
+  - `GET /api/v1/plan/results/178/purchases/grouped` → 200 OK
+  - вкладка «Заказы на закупку» отображает строки, вместо «Нет данных для отображения».
+
 ## Контекст / проблема
 
 - UI кнопка «Отчёт о дефиците» на странице результатов прогона вызывала GET `/v1/plan/results/{run_id}/shortage-report` (см. [`exportShortageReport()`](frontend/src/pages/MRPResultPage.vue:838)), но в backend отсутствовал маршрут → кнопка не работала.

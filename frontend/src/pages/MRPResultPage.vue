@@ -778,28 +778,47 @@ async function loadPurchases() {
   try {
     const limit = purch.pagination.rowsPerPage
     const offset = (purch.pagination.page - 1) * purch.pagination.rowsPerPage
-    const [resp, grouped] = await Promise.all([
-      getPlanningResultPurchases(runId, {
-        date_from: emptyToUndef(purch.filter.date_from),
-        date_to: emptyToUndef(purch.filter.date_to),
-        sort_by: 'item_name',
-        sort_dir: 'asc',
-        limit, offset
-      }),
-      getPlanningResultPurchasesGrouped(runId, {
+    // ВАЖНО: не используем Promise.all.
+    // Если /purchases/grouped отсутствует или временно падает, мы всё равно должны показать данные из /purchases.
+    const resp = await getPlanningResultPurchases(runId, {
+      date_from: emptyToUndef(purch.filter.date_from),
+      date_to: emptyToUndef(purch.filter.date_to),
+      sort_by: 'item_name',
+      sort_dir: 'asc',
+      limit, offset
+    })
+
+    purch.rows = resp.rows || []
+    purch.pagination.rowsNumber = resp.total || 0
+    // Отказ от полной выгрузки 100000 строк — используем текущую страницу как «полный» источник для фолбэка
+    purchAllRows.value = (resp?.rows || [])
+
+    // Пытаемся загрузить агрегат для верхней таблицы; при ошибке строим фолбэк из resp.rows
+    try {
+      const grouped = await getPlanningResultPurchasesGrouped(runId, {
         date_from: emptyToUndef(purch.filter.date_from),
         date_to: emptyToUndef(purch.filter.date_to),
         limit: 1000,
         offset: 0
       })
-    ])
-    purch.rows = resp.rows || []
-    purch.pagination.rowsNumber = resp.total || 0
-    // Отказ от полной выгрузки 100000 строк — используем текущую страницу как «полный» источник для фолбэка
-    purchAllRows.value = (resp?.rows || [])
-    purchGroupedRows.value = (grouped?.rows || [])
+      purchGroupedRows.value = (grouped?.rows || [])
+    } catch (e) {
+      console.warn('Purchases grouped endpoint failed; falling back to /purchases rows', e)
+      purchGroupedRows.value = (resp?.rows || []).map((r: any) => ({
+        agg_key: String(r?.agg_key ?? `${Number(r?.item_id || 0)}|${r?.unit || ''}`),
+        item_id: Number(r?.item_id || 0),
+        item_name: r?.item_name ?? null,
+        item_article: r?.item_article ?? null,
+        unit: r?.unit ?? null,
+        qty: Number(r?.qty ?? 0)
+      }))
+    }
   } catch (e) {
     console.error('Failed to load purchases', e)
+    purch.rows = []
+    purch.pagination.rowsNumber = 0
+    purchAllRows.value = []
+    purchGroupedRows.value = []
   } finally {
     purch.loading = false
   }
