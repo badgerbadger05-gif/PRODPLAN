@@ -35,6 +35,14 @@ from ..services.planning_service import (
 )
 from ..models import ProductionResource
 from ..schemas import ProductionGroupedResponse
+from ..models import ForcedOrderRequest, ForcedOrderResult
+
+from ..services.forced_orders import (
+    create_forced_order_request,
+    process_forced_order_request,
+    export_forced_order_xlsx,
+    export_shortage_report_for_run,
+)
 
 router = APIRouter(prefix="/v1/plan", tags=["plan"])
 
@@ -93,6 +101,19 @@ class PlanningConfigCreate(BaseModel):
     comment: Optional[str] = None
     created_by: Optional[str] = None
     activate: Optional[bool] = False
+
+
+# ===== Forced orders (manual/override) =====
+
+
+class ForcedOrderCreateRequest(BaseModel):
+    run_id: Optional[int] = None
+    item_id: int
+    need_date: str
+    requested_qty: float
+    created_by: Optional[str] = None
+    reason: Optional[str] = None
+
 
 
 @router.post("/matrix")
@@ -503,6 +524,99 @@ async def get_planning_result_pegging(
             limit=limit,
             offset=offset,
         )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/results/{run_id}/shortage-report")
+async def get_shortage_report(
+    run_id: int,
+    db: Session = Depends(get_db),
+):
+    """XLSX отчёт по дефицитам комплектующих (blocked/partial) для прогона"""
+    try:
+        return export_shortage_report_for_run(db=db, run_id=int(run_id))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/forced_orders")
+async def create_forced_order(
+    req: ForcedOrderCreateRequest,
+    db: Session = Depends(get_db),
+):
+    """Создать заявку на «принудительный заказ» (не влияет на основной MRP run)"""
+    try:
+        rec = create_forced_order_request(
+            db,
+            run_id=req.run_id,
+            item_id=int(req.item_id),
+            need_date=str(req.need_date),
+            requested_qty=float(req.requested_qty or 0.0),
+            created_by=req.created_by,
+            reason=req.reason,
+        )
+        db.commit()
+        return {"status": "ok", "request_id": int(rec.id)}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/forced_orders")
+async def list_forced_orders(
+    limit: int = 50,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+):
+    """Список заявок на принудительные заказы"""
+    try:
+        q = db.query(ForcedOrderRequest).order_by(ForcedOrderRequest.created_at.desc())
+        total = q.count()
+        rows = q.offset(max(0, int(offset))).limit(max(1, min(int(limit or 50), 500))).all()
+        out = []
+        for r in rows:
+            out.append(
+                {
+                    "id": int(r.id),
+                    "run_id": int(r.run_id) if r.run_id is not None else None,
+                    "item_id": int(r.item_id),
+                    "need_date": r.need_date.isoformat() if getattr(r, "need_date", None) else None,
+                    "requested_qty": float(getattr(r, "requested_qty", 0.0) or 0.0),
+                    "status": getattr(r, "status", None),
+                    "created_by": getattr(r, "created_by", None),
+                    "reason": getattr(r, "reason", None),
+                    "created_at": r.created_at.isoformat() if getattr(r, "created_at", None) else None,
+                }
+            )
+        return {"status": "ok", "rows": out, "total": int(total), "limit": int(limit), "offset": int(offset)}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/forced_orders/{request_id}/process")
+async def process_forced_order(
+    request_id: int,
+    db: Session = Depends(get_db),
+):
+    """Посчитать принудительный заказ (комплектующие не блокируют, но дефицит фиксируется в diagnostics)"""
+    try:
+        result = process_forced_order_request(db=db, request_id=int(request_id))
+        db.commit()
+        return {"status": "ok", "data": result}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/forced_orders/{request_id}/export")
+async def export_forced_order(
+    request_id: int,
+    db: Session = Depends(get_db),
+):
+    """Экспорт принудительного заказа в XLSX (base64)"""
+    try:
+        return export_forced_order_xlsx(db=db, request_id=int(request_id))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

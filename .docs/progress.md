@@ -1,3 +1,53 @@
+# 2025-12-22 — «Принудительные заказы» + восстановление отчёта о дефиците (shortage-report)
+
+## Контекст / проблема
+
+- UI кнопка «Отчёт о дефиците» на странице результатов прогона вызывала GET `/v1/plan/results/{run_id}/shortage-report` (см. [`exportShortageReport()`](frontend/src/pages/MRPResultPage.vue:838)), но в backend отсутствовал маршрут → кнопка не работала.
+- Производственные заказы при полном дефиците комплектующих не попадали в результаты: в [`build_planned_orders_and_purchases()`](backend/app/services/planning_service.py:1736) при `component_limit <= 0` выполняется `continue`, т.е. строка вообще не создаётся.
+
+## Решение
+
+Реализован отдельный контур «принудительных заказов» (manual/override), который **не меняет** основную логику MRP-прогона, но позволяет:
+
+1) Создавать отдельные заявки на выпуск даже при дефиците компонентов.
+2) Считать для них количество (лот-сайзинг/буфер) и фиксировать дефицит как диагностику.
+3) Выгружать в XLSX.
+4) Восстановить работу кнопки «Отчёт о дефиците» для прогона.
+
+### Backend
+
+- Добавлены ORM модели:
+  - [`ForcedOrderRequest`](backend/app/models.py:457)
+  - [`ForcedOrderResult`](backend/app/models.py:484)
+- Добавлена миграция Alembic: [`20251222_01_add_forced_orders.py`](backend/alembic/versions/20251222_01_add_forced_orders.py:1)
+- Добавлен сервисный модуль: [`forced_orders.py`](backend/app/services/forced_orders.py:1)
+  - создание заявки: `create_forced_order_request()`
+  - расчёт: `process_forced_order_request()` (использует [`OrderQuantityCalculator.compute()`](backend/app/services/order_quantity_calculator.py:50), но **не блокирует** по component_limit)
+  - экспорт XLSX для заявки: `export_forced_order_xlsx()`
+  - восстановленный XLSX отчёт по дефициту прогона: `export_shortage_report_for_run()`
+    - добавлена разбивка по участкам (группы «Участок: …») аналогично экспорту производства
+- Добавлены API эндпоинты в роутере планирования [`plan.py`](backend/app/routers/plan.py:1):
+  - `GET /v1/plan/results/{run_id}/shortage-report` (восстановление кнопки отчёта)
+  - `POST /v1/plan/forced_orders` (создать заявку)
+  - `GET /v1/plan/forced_orders` (список)
+  - `POST /v1/plan/forced_orders/{id}/process` (посчитать)
+  - `GET /v1/plan/forced_orders/{id}/export` (xlsx)
+
+### Frontend
+
+- Добавлен минимальный UI для «принудительного заказа» прямо на странице результатов прогона:
+  - кнопка «Принудительный заказ» + диалог ввода (`item_id`, `qty`, `need_date`, `reason`) в [`MRPResultPage.vue`](frontend/src/pages/MRPResultPage.vue:1)
+  - API-обвязки: [`createForcedOrder()`](frontend/src/services/api.ts:352), [`processForcedOrder()`](frontend/src/services/api.ts:357), [`exportForcedOrder()`](frontend/src/services/api.ts:362)
+- Кнопка «Отчёт о дефиците» продолжает вызывать `getShortageReport()` (теперь backend-эндпоинт реализован).
+
+## Проверки
+
+- Миграции: `cd backend && alembic upgrade head` — успешно (созданы forced_order_request/forced_order_result).
+- Backend тесты: `set PYTHONPATH=. && pytest -q` — PASS (17 passed).
+- Frontend сборка: `cd frontend && npm ci --silent && npm run -s build` — успешна.
+
+---
+
 # 2025-12-19 — Диагностика: при синхронизации спецификаций не удаляются устаревшие строки состава/операций (+ копятся дубли default_specifications)
 
 - **Симптом**: после синхронизации и обновления спецификации в 1С, в расчёте MRP продолжают фигурировать детали, которые уже удалены из текущей спецификации.

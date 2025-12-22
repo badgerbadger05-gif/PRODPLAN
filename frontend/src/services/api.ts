@@ -335,3 +335,34 @@ export async function getShortageReport(runId: number): Promise<ShortageReportRe
   const response = await api.get(`/v1/plan/results/${runId}/shortage-report`)
   return response.data
 }
+
+// ===== Forced orders (manual/override) =====
+
+export interface ForcedOrderCreateRequest {
+  run_id?: number | null
+  item_id: number
+  need_date: string // YYYY-MM-DD
+  requested_qty: number
+  created_by?: string | null
+  reason?: string | null
+}
+
+export async function createForcedOrder(req: ForcedOrderCreateRequest): Promise<{ status: string; request_id: number }> {
+  const { data } = await api.post('/v1/plan/forced_orders', req)
+  return data
+}
+
+export async function processForcedOrder(requestId: number): Promise<any> {
+  const { data } = await api.post(`/v1/plan/forced_orders/${requestId}/process`, {})
+  return data
+}
+
+export async function exportForcedOrder(requestId: number): Promise<any> {
+  const { data } = await api.get(`/v1/plan/forced_orders/${requestId}/export`)
+  return data
+}
+
+export async function listForcedOrders(params: { limit?: number; offset?: number } = {}): Promise<any> {
+  const { data } = await api.get('/v1/plan/forced_orders', { params })
+  return data
+}

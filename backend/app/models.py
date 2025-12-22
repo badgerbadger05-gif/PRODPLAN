@@ -452,3 +452,43 @@ class ResourceProductionKind(Base):
     resource = relationship("ProductionResource")
     production_kind = relationship("ProductionKind")
 
+
+# --- Forced/Manual planning (separate from main MRP run results) ---
+
+
+class ForcedOrderRequest(Base):
+    __tablename__ = "forced_order_request"
+
+    id = Column(Integer, primary_key=True, index=True)
+    # Optional linkage to a planning run for context (warnings, horizon, etc.)
+    run_id = Column(Integer, ForeignKey("planning_run.run_id", ondelete="SET NULL"), nullable=True, index=True)
+    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
+    need_date = Column(Date, nullable=False, index=True)
+    requested_qty = Column(DECIMAL(15, 3), nullable=False)
+    # Who/why
+    created_by = Column(String(100), nullable=True)
+    reason = Column(TEXT, nullable=True)
+    # Status tracking
+    status = Column(String(20), nullable=False, default="PENDING")  # PENDING | PROCESSED | FAILED
+    error = Column(TEXT, nullable=True)
+    # Diagnostics snapshot (optional)
+    meta = Column(CrossPlatformJSON, nullable=True)
+    created_at = Column(TIMESTAMP, default=func.now())
+    updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
+
+
+class ForcedOrderResult(Base):
+    __tablename__ = "forced_order_result"
+
+    id = Column(Integer, primary_key=True, index=True)
+    request_id = Column(Integer, ForeignKey("forced_order_request.id", ondelete="CASCADE"), nullable=False, unique=True)
+    # Computed quantities
+    planned_qty = Column(DECIMAL(15, 3), nullable=False)
+    normalized_qty = Column(DECIMAL(15, 3), nullable=True)
+    horizon_limit = Column(DECIMAL(15, 3), nullable=True)
+    component_limit = Column(DECIMAL(15, 3), nullable=True)
+    # Component shortage breakdown / warnings in a stable JSON shape
+    shortage = Column(CrossPlatformJSON, nullable=True)
+    created_at = Column(TIMESTAMP, default=func.now())
+
+

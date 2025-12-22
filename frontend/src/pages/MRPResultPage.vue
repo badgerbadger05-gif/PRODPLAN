@@ -53,6 +53,7 @@
               <q-btn dense flat icon="table_view" :label="t('mrp.actions.xlsx')" @click="exportProd('xlsx')" />
               <q-separator vertical class="q-mx-xs" />
               <q-btn dense flat icon="warning" color="negative" :label="t('mrp.actions.shortageReport')" @click="exportShortageReport" />
+              <q-btn dense flat icon="playlist_add" color="primary" label="Принудительный заказ" @click="showForcedDialog = true" />
             </template>
           </ProductionFilters>
 
@@ -253,6 +254,34 @@
     </q-tab-panels>
     <!-- Диалог: проблемы привязки видов производства -->
     <KindIssuesDialog v-model="showKindIssuesDialog" :issues="kindIssuesRows" />
+
+    <!-- Диалог: принудительный заказ (отдельно от основного MRP run) -->
+    <q-dialog v-model="showForcedDialog">
+      <q-card style="min-width: 520px">
+        <q-card-section class="row items-center">
+          <div class="text-h6">Принудительный заказ</div>
+          <q-space />
+          <q-btn flat round dense icon="close" v-close-popup />
+        </q-card-section>
+        <q-separator />
+
+        <q-card-section class="q-gutter-sm">
+          <div class="text-caption text-grey-7">
+            Создаёт отдельную заявку, которая не меняет результаты основного прогона, но позволяет выгрузить заказ даже при дефиците.
+          </div>
+          <q-input v-model.number="forcedForm.item_id" type="number" dense outlined label="item_id" />
+          <q-input v-model.number="forcedForm.requested_qty" type="number" dense outlined label="Количество" />
+          <q-input v-model="forcedForm.need_date" dense outlined label="Дата потребности (YYYY-MM-DD)" />
+          <q-input v-model="forcedForm.reason" dense outlined label="Причина (опционально)" />
+        </q-card-section>
+
+        <q-separator />
+        <q-card-actions align="right">
+          <q-btn flat label="Отмена" v-close-popup />
+          <q-btn color="primary" :loading="forcedLoading" label="Сформировать XLSX" @click="submitForcedOrder" />
+        </q-card-actions>
+      </q-card>
+    </q-dialog>
   </q-page>
 </template>
 
@@ -273,7 +302,10 @@ import api, {
   getPlanningResultProductionGrouped,
   getPlanningResultPurchasesGrouped,
   getPlanningResultCapacitySummary,
-  getShortageReport
+  getShortageReport,
+  createForcedOrder,
+  processForcedOrder,
+  exportForcedOrder
 } from '../services/api'
 import type { QTableColumn } from 'quasar'
 import type { SpecNode } from '../services/api'
@@ -394,6 +426,16 @@ const showTechnicalRows = ref(false)
 
 // ---- Диагностика проблем привязки видов производства ----
 const showKindIssuesDialog = ref(false)
+
+// ---- Forced orders ----
+const showForcedDialog = ref(false)
+const forcedLoading = ref(false)
+const forcedForm = reactive({
+  item_id: null as number | null,
+  requested_qty: null as number | null,
+  need_date: new Date().toISOString().slice(0, 10),
+  reason: ''
+})
 const kindIssues = computed(() => {
   // Приоритет — структурированное поле summary.kindIssues.list
   const structured = (summary.value?.kindIssues?.list as any[]) || null
@@ -855,6 +897,44 @@ async function exportShortageReport() {
       (e?.message as any) ||
       t('mrp.errors.shortageReportFailed')
     alert(String(detail))
+  }
+}
+
+async function submitForcedOrder() {
+  const itemId = Number(forcedForm.item_id || 0)
+  const qty = Number(forcedForm.requested_qty || 0)
+  const needDate = String(forcedForm.need_date || '').trim()
+  if (!itemId || qty <= 0 || !needDate) {
+    alert('Заполните item_id, количество и дату')
+    return
+  }
+  forcedLoading.value = true
+  try {
+    const created = await createForcedOrder({
+      run_id: runId,
+      item_id: itemId,
+      need_date: needDate,
+      requested_qty: qty,
+      created_by: 'ui',
+      reason: forcedForm.reason || null
+    })
+    const requestId = Number((created as any)?.request_id || 0)
+    if (!requestId) throw new Error('Не удалось создать заявку forced order')
+
+    await processForcedOrder(requestId)
+    const exp = await exportForcedOrder(requestId)
+    if (exp?.data_base64) {
+      downloadBase64Xlsx(exp.data_base64, exp.filename || `forced_order_${requestId}.xlsx`)
+      showForcedDialog.value = false
+    } else {
+      alert('Не удалось сформировать XLSX')
+    }
+  } catch (e: any) {
+    console.error('Forced order failed', e)
+    const detail = (e?.response?.data?.detail as any) || (e?.message as any) || 'Ошибка'
+    alert(String(detail))
+  } finally {
+    forcedLoading.value = false
   }
 }
 
