@@ -54,12 +54,33 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
         # Создаем клиент OData
         client = OData1CClient(req.base_url, req.username, req.password, req.token)
 
-        # Получаем все записи спецификаций
-        spec_data = client.get_all(
-            req.entity_name,
-            filter_query=req.filter_query,
-            select_fields=req.select_fields
-        )
+        # Получаем все записи спецификаций.
+        # IMPORTANT:
+        # - Для корректной синхронизации состава/операций и работы reconcile нам нужны поля 'Состав' и 'Операции'.
+        # - Пользовательский $select может их случайно не включить, что приводит к «зависшим» строкам в БД.
+        # Поэтому принудительно добавляем эти поля к select_fields.
+        base_select = list(req.select_fields or [])
+        required_fields = ["Ref_Key", "Code", "Description", "ВидПроизводства_Key", "Состав", "Операции"]
+        for f in required_fields:
+            if f not in base_select:
+                base_select.append(f)
+        effective_select = base_select or None
+
+        try:
+            spec_data = client.get_all(
+                req.entity_name,
+                filter_query=req.filter_query,
+                select_fields=effective_select,
+            )
+        except Exception as e:
+            # Fallback: на некоторых конфигурациях 1С узкий $select может падать.
+            # Повторяем запрос без $select, чтобы всё же получить вложенные табличные части.
+            print(f"[spec.sync] primary get_all failed, retry without $select: {e}")
+            spec_data = client.get_all(
+                req.entity_name,
+                filter_query=req.filter_query,
+                select_fields=None,
+            )
 
         if not spec_data:
             stats.dry_run = True

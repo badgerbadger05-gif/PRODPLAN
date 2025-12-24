@@ -1,3 +1,77 @@
+# 2025-12-23 — Диагностика: «родитель блокируется по дефициту», хотя остатки компонента есть (ошибка кэша stock_by_item)
+
+## Симптом
+
+- При расчёте потребностей/плана часть изделий (родители) **не создаются** в результатах и помечаются как заблокированные по дефициту комплектующих.
+- По факту в 1С/в БД остатки на «деталь‑ребёнок» есть (или должны быть достаточны), из‑за чего заказ на родителя **должен** проходить.
+
+## Что нашли (корень проблемы)
+
+В логике компонентного ограничения используется кэш остатков `stock_by_item`, который строится **неполным**:
+
+1) В [`run_planning_run()`](backend/app/services/planning_service.py:2162) кэш `item_cache` и далее `stock_by_item` формируются **только** по множеству `all_item_ids = keys(net_requirements)` (т.е. только по позициям с *ненулевой net‑потребностью*):
+   - формирование `all_item_ids`: [`run_planning_run()`](backend/app/services/planning_service.py:2177)
+   - построение `stock_by_item` из `item_cache`: [`run_planning_run()`](backend/app/services/planning_service.py:2199)
+
+2) При проверке доступности комплектующих в [`OrderQuantityCalculator._limit_by_components()`](backend/app/services/order_quantity_calculator.py:273) берётся:
+
+   - `child_stock = self.stock_by_item.get(child_id, 0.0)`
+
+   Если `child_id` отсутствует в `stock_by_item`, компонент воспринимается как **0**, даже если реальный остаток > 0.
+
+3) Ключевой сценарий, который ломается:
+
+   - если остаток компонента полностью покрывает его валовую потребность, то net‑потребность по компоненту = 0,
+   - компонент не попадает в `net_requirements` → не попадает в `stock_by_item`,
+   - родитель ошибочно блокируется как будто по компоненту дефицит.
+
+## Подтверждение на данных (run_id=179)
+
+- В `planning_run.warnings` для `run_id=179` присутствуют массовые `COMPONENT_SHORTAGE_BLOCKED`.
+- Пример: `item_id=6144` («00-00000413 / CA-000060-SPch») попадает в `COMPONENT_SHORTAGE_BLOCKED`.
+- Его единственный компонент по спецификации: `item_id=6143` («НФ-00004846 / CA-000060-S») имеет `stock_qty=178`.
+- При этом в `planned_order` для `run_id=179` нет ни строки по 6143 (нет net‑потребности), ни строки по 6144 (родитель заблокирован).
+
+Т.е. это ровно кейс «остаток компонента покрывает спрос, но из‑за cache miss компонент считается нулевым».
+
+## Наиболее вероятная причина №1 (основная)
+
+- Неполный кэш `stock_by_item` в запуске MRP → ложный нулевой остаток для компонента → `component_limit` становится 0 → родитель блокируется.
+
+## Причина №2 (сопутствующая / архитектурная)
+
+- Логика `component_limit` по смыслу учитывает только наличие компонент **на складе**, не учитывая будущие плановые заказы на полуфабрикаты (если компонент производится). Это может требовать отдельного согласования бизнес‑правила.
+
+## План точечной правки (после согласования)
+
+1) Расширить набор `item_cache/stock_by_item`:
+   - после получения `all_item_ids` собрать множество **всех компонент** по спецификациям этих items (через `default_spec_map` → `spec_components`),
+   - подгрузить недостающие `Item` и добавить их в `item_cache`, затем пересобрать `stock_by_item`.
+   - минимальный объём: 1 уровень (для проверки компонентного лимита достаточно прямых компонентов).
+
+2) Добавить диагностические логи, чтобы гарантированно поймать cache miss и доказать влияние:
+   - в [`OrderQuantityCalculator._limit_by_components()`](backend/app/services/order_quantity_calculator.py:273): логировать/варнить при `child_id not in stock_by_item` (код типа `STOCK_CACHE_MISS`, поля: parent_item_id, spec_id, child_id).
+   - в [`run_planning_run()`](backend/app/services/planning_service.py:2162): логировать размеры множеств `all_item_ids`, `component_ids`, `missing_component_ids`.
+
+## 2025-12-24 (fix) — Исправлено
+
+### Изменения
+
+1) В запуске MRP расширен кэш остатков `stock_by_item`, чтобы он включал **компоненты спецификаций** (1 уровень), даже если по ним `net=0`:
+   - реализация в [`run_planning_run()`](backend/app/services/planning_service.py:2162) (замена построения `stock_by_item` на запрос по union `net_items ∪ component_items`).
+
+2) Добавлен диагностический warning при cache miss компонента:
+   - в [`OrderQuantityCalculator._limit_by_components()`](backend/app/services/order_quantity_calculator.py:273) добавлен warning `STOCK_CACHE_MISS` (parent/spec/component).
+
+3) Добавлен регрессионный тест, демонстрирующий исходную проблему и ожидаемое поведение:
+   - [`test_parent_can_be_falsely_blocked_when_component_stock_missing_in_cache()`](tests/test_stock_by_item_cache.py:1)
+
+### Проверка
+
+- `pytest -q` — PASS (18 passed).
+
+---
+
 # 2025-12-22 — «Принудительные заказы» + восстановление отчёта о дефиците (shortage-report)
 
 ## 2025-12-22 (fix) — MRP Purchases: «Нет данных для отображения» после рефакторинга

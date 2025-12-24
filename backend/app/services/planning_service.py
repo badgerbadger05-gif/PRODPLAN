@@ -2196,7 +2196,57 @@ def run_planning_run(
         for rk in all_res_kinds:
             production_kinds_by_resource[rk.resource_id].add(rk.production_kind_id)
 
-        stock_by_item = {i.item_id: i.stock_qty for i in item_cache.values()}
+        # IMPORTANT:
+        # stock_by_item must include not only items with net requirements, but also their BOM components.
+        # Otherwise, components that are fully covered by stock (net=0) are absent from net_requirements,
+        # absent from item_cache, and thus treated as 0 in OrderQuantityCalculator._limit_by_components().
+        component_item_ids: Set[int] = set()
+        try:
+            spec_ids_for_run: Set[int] = set()
+            for iid in all_item_ids:
+                sid = default_spec_map.get(int(iid))
+                if sid:
+                    spec_ids_for_run.add(int(sid))
+            if spec_ids_for_run:
+                comp_rows = (
+                    db.query(SpecComponent.item_id)
+                    .filter(SpecComponent.spec_id.in_(list(spec_ids_for_run)))
+                    .all()
+                )
+                for (cid,) in comp_rows:
+                    try:
+                        component_item_ids.add(int(cid))
+                    except Exception:
+                        continue
+        except Exception as ex:
+            logger.exception("Failed to prefetch component ids for stock cache: %s", ex)
+            component_item_ids = set()
+
+        stock_item_ids: Set[int] = set(all_item_ids) | set(component_item_ids)
+        stock_by_item: Dict[int, float] = {}
+        if stock_item_ids:
+            try:
+                stock_rows = (
+                    db.query(Item.item_id, Item.stock_qty)
+                    .filter(Item.item_id.in_(list(stock_item_ids)))
+                    .all()
+                )
+                stock_by_item = {int(iid): float(qty or 0.0) for iid, qty in stock_rows}
+            except Exception as ex:
+                logger.exception("Failed to build stock_by_item cache: %s", ex)
+                stock_by_item = {int(i.item_id): float(i.stock_qty or 0.0) for i in item_cache.values()}
+
+        try:
+            missing_cnt = len([cid for cid in component_item_ids if cid not in stock_by_item])
+            logger.debug(
+                "stock_by_item cache built: net_items=%s, component_items=%s, total=%s, missing_components=%s",
+                len(all_item_ids),
+                len(component_item_ids),
+                len(stock_by_item),
+                missing_cnt,
+            )
+        except Exception:
+            pass
         
         # This is a simplification; in a real scenario, WIP would be calculated from open production orders
         wip_by_item = defaultdict(float)

@@ -300,6 +300,16 @@ class OrderQuantityCalculator:
                 per_unit = float(getattr(comp, "quantity", 0.0) or 0.0)
                 if per_unit <= 0.0:
                     continue
+                if child_id not in self.stock_by_item:
+                    warnings.append(
+                        make_warning(
+                            "STOCK_CACHE_MISS",
+                            "Component stock is missing in stock_by_item cache; treated as 0 (may cause false shortage)",
+                            parent_item_id=int(parent_item_id),
+                            spec_id=int(spec_id),
+                            component_id=int(child_id),
+                        )
+                    )
                 child_stock = float(self.stock_by_item.get(child_id, 0.0) or 0.0)
                 child_wip = float(self.wip_by_item.get(child_id, 0.0) or 0.0)
                 available_child = child_stock + child_wip
