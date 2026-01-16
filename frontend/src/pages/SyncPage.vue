@@ -588,7 +588,9 @@ async function syncStock() {
       filter_query: `Period le datetime'${dt}'`,
       select_fields: null,
       dry_run: false,
-      zero_missing: false
+      // IMPORTANT: many 1C Balance endpoints return only non-zero rows.
+      // Missing items must be treated as zero, otherwise old остатки stay in DB and break MRP.
+      zero_missing: true
     }
 
     const { data } = await api.post('/v1/sync/stock-odata', payload, { timeout: 900000 })

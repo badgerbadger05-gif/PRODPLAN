@@ -182,6 +182,13 @@ def sync_stock_from_odata(db: Session, req: ODataSyncRequest) -> dict:
         matched = sum(1 for norm in db_code_to_norm.values() if norm in odata_map_norm_to_qty)
     stats.matched_in_odata = matched
 
+    # IMPORTANT POLICY:
+    # If an item is absent in OData response, we treat its stock as 0.
+    # Rationale: many 1C Balance endpoints return only non-zero rows.
+    # Leaving old stock values causes false availability and wrong MRP orders.
+    # NOTE: we still keep the global guard above: if 1C returned 0 rows total, we do NOT update anything.
+    effective_zero_missing = True
+
     zeroed_count = 0
     updated = 0
     unchanged = 0
@@ -213,13 +220,15 @@ def sync_stock_from_odata(db: Session, req: ODataSyncRequest) -> dict:
             elif norm_code in odata_map_norm_to_qty:
                 new_qty = float(odata_map_norm_to_qty[norm_code])
             else:
-                if req.zero_missing:
+                # Missing in OData -> stock must become 0.
+                # (effective_zero_missing is always True by policy)
+                if effective_zero_missing:
                     new_qty = 0.0
                 else:
                     new_qty = old_qty
 
             if abs(old_qty - new_qty) > 1e-9:
-                if (norm_code not in odata_map_norm_to_qty) and req.zero_missing and old_qty != 0.0:
+                if new_qty == 0.0 and old_qty != 0.0 and effective_zero_missing:
                     zeroed_count += 1
                 it.stock_qty = new_qty
                 updated += 1
