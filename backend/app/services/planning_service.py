@@ -1674,24 +1674,152 @@ def compute_planning_preview(
     horizon_days: Optional[int] = None,
     config_overrides: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    gross_req_result = compute_gross_requirements(db, horizon_days, config_overrides)
-    gross_serialized = gross_req_result["gross"]
+    """Compute gross+net requirements with *net-first BOM explosion*.
 
-    gross_map = {
-        int(item_id): {datetime.fromisoformat(d).date(): float(qty) for d, qty in buckets.items()}
-        for item_id, buckets in gross_serialized.items()
-    }
+    Why:
+      The previous implementation exploded BOM from *gross* demand, then netted each item independently.
+      This can incorrectly generate net demand for components even when their parent is fully covered by stock/WIP
+      (classic multi-level netting issue).
 
-    item_ids = set(gross_map.keys())
-    if not item_ids:
-        gross_req_result.update({"net": {}})
-        return gross_req_result
+    New approach:
+      1) Read root demand from production_plan_entries (MPS) for the horizon.
+      2) For each BOM level:
+         - net current level demand against stock/WIP
+         - explode ONLY the residual (net) to components (with buffer_days shift)
+      3) Accumulate gross/net maps across all levels.
+    """
 
-    snapshot = gross_req_result.get("snapshot", {}) or {}
+    # --- Resolve planning snapshot (same as compute_gross_requirements) ---
+    try:
+        cfg_id, cfg = get_active_planning_config(db)
+    except Exception:
+        cfg_id, cfg = 0, dict(DEFAULT_PLANNING_CONFIG)
+
+    overrides: Dict[str, Any] = {}
+    if horizon_days is not None:
+        overrides["planning_horizon_days"] = int(horizon_days)
+    if config_overrides:
+        overrides = _deep_merge(overrides, config_overrides)
+    snapshot = _deep_merge(cfg, overrides)
+
+    horizon = int(snapshot.get("planning_horizon_days", 90))
+    ss_percent = float(snapshot.get("safety_stock_percent", 1) or 0.0)
+
+    d0: date = date.today()
+    dmax: date = d0 + timedelta(days=max(1, horizon) - 1)
+
+    limits_cfg = snapshot.get("planning", {}).get("limits", {})
+    max_bom_depth = int(limits_cfg.get("max_bom_depth", 200))
+
     include_wip = bool(snapshot.get("toggles", {}).get("include_wip", True))
 
-    items = db.query(Item).filter(Item.item_id.in_(item_ids)).all()
-    stock_by_item = {int(i.item_id): float(i.stock_qty or 0.0) for i in items}
+    # --- Root demand (MPS) ---
+    # Note: we aggregate per (item_id, date) to avoid double-counting.
+    mps_rows = (
+        db.query(
+            ProductionPlanEntry.item_id,
+            func.date(ProductionPlanEntry.date).label("d"),
+            func.sum(func.coalesce(ProductionPlanEntry.planned_qty, 0.0)).label("qty"),
+        )
+        .filter(ProductionPlanEntry.date >= d0, ProductionPlanEntry.date <= dmax)
+        .group_by(ProductionPlanEntry.item_id, func.date(ProductionPlanEntry.date))
+        .all()
+    )
+
+    factor = 1.0 + (ss_percent / 100.0)
+
+    # demand_by_level: item_id -> {date -> qty}
+    demand_map: DefaultDict[int, DefaultDict[date, float]] = defaultdict(lambda: defaultdict(float))
+    for iid, dval, qty in mps_rows:
+        try:
+            q = float(qty or 0.0)
+        except Exception:
+            q = 0.0
+        if q <= 1e-9:
+            continue
+        try:
+            # func.date returns datetime.date in PG; keep robust fallback
+            dt = dval if isinstance(dval, date) else _to_date(str(dval))
+        except Exception:
+            continue
+        if abs(factor - 1.0) > 1e-9:
+            q *= factor
+        demand_map[int(iid)][dt] += q
+
+    if not demand_map:
+        return {
+            "meta": {"asOf": _read_last_stock_sync_at(), "d0": d0.isoformat(), "dmax": dmax.isoformat()},
+            "config": {"horizon_days": horizon, "safety_stock_percent": ss_percent, "config_version_id": int(cfg_id)},
+            "snapshot": snapshot,
+            "gross": {},
+            "net": {},
+            "stats": {"items": 0, "buckets": 0},
+        }
+
+    # --- Caches for BOM + buffer days ---
+    defaults: List[DefaultSpecification] = db.query(DefaultSpecification).all()
+    default_spec_map: Dict[int, int] = {int(rec.item_id): int(rec.spec_id) for rec in defaults}
+
+    spec_ids: Set[int] = set(default_spec_map.values())
+    specs: List[Specification] = (
+        db.query(Specification).filter(Specification.spec_id.in_(spec_ids)).all() if spec_ids else []
+    )
+    spec_by_id: Dict[int, Specification] = {int(s.spec_id): s for s in specs}
+
+    kind_ids: Set[int] = {int(s.production_kind_id) for s in specs if getattr(s, "production_kind_id", None)}
+    resource_kind_cache: Dict[int, List[ResourceProductionKind]] = defaultdict(list)
+    if kind_ids:
+        for rk in (
+            db.query(ResourceProductionKind)
+            .filter(ResourceProductionKind.production_kind_id.in_(kind_ids))
+            .all()
+        ):
+            resource_kind_cache[int(rk.production_kind_id)].append(rk)
+
+    resource_ids: Set[int] = {int(rk.resource_id) for lst in resource_kind_cache.values() for rk in lst}
+    res_by_id: Dict[int, ProductionResource] = {}
+    if resource_ids:
+        resources = db.query(ProductionResource).filter(ProductionResource.resource_id.in_(resource_ids)).all()
+        res_by_id = {int(res.resource_id): res for res in resources}
+
+    components_cache: Dict[int, List[SpecComponent]] = {}
+
+    def get_components_for_spec(spec_id: int) -> List[SpecComponent]:
+        if int(spec_id) in components_cache:
+            return components_cache[int(spec_id)]
+        comps = db.query(SpecComponent).filter(SpecComponent.spec_id == int(spec_id)).all()
+        components_cache[int(spec_id)] = comps
+        return comps
+
+    buffer_days_cache: Dict[int, int] = {}
+
+    def resolve_buffer_days(item_id: int) -> int:
+        if int(item_id) in buffer_days_cache:
+            return buffer_days_cache[int(item_id)]
+        spec_id = default_spec_map.get(int(item_id))
+        buffer_val = 0
+        if spec_id:
+            spec = spec_by_id.get(int(spec_id))
+            if spec and getattr(spec, "production_kind_id", None):
+                for rk in resource_kind_cache.get(int(spec.production_kind_id), []):
+                    res = res_by_id.get(int(rk.resource_id))
+                    if res and getattr(res, "buffer_days", None):
+                        try:
+                            buffer_raw = float(res.buffer_days or 0.0)
+                        except Exception:
+                            buffer_raw = 0.0
+                        if buffer_raw > 0:
+                            buffer_val = int(buffer_raw)
+                            break
+        buffer_days_cache[int(item_id)] = max(0, int(buffer_val))
+        return buffer_days_cache[int(item_id)]
+
+    def clamp_to_horizon(dt: date) -> date:
+        return d0 if dt < d0 else dt
+
+    # --- Availability (stock + WIP) ---
+    # We load stock lazily per-level (batched) to avoid fetching every item.
+    stock_by_item: Dict[int, float] = {}
 
     wip_by_item: Dict[int, float] = {}
     if include_wip:
@@ -1706,30 +1834,127 @@ def compute_planning_preview(
         except Exception:
             wip_by_item = {}
 
-    net_map: DefaultDict[int, Dict[date, float]] = defaultdict(dict)
+    available_by_item: Dict[int, float] = {}
 
-    for iid in item_ids:
-        available_qty = float(stock_by_item.get(iid, 0.0))
-        if include_wip:
-            available_qty += float(wip_by_item.get(iid, 0.0))
+    def ensure_availability(item_ids: Set[int]) -> None:
+        missing = [int(i) for i in item_ids if int(i) not in available_by_item]
+        if not missing:
+            return
+        # batch fetch stock
+        try:
+            rows = (
+                db.query(Item.item_id, Item.stock_qty)
+                .filter(Item.item_id.in_(missing))
+                .all()
+            )
+        except Exception:
+            rows = []
+        for iid, qty in rows:
+            stock_by_item[int(iid)] = float(qty or 0.0)
+        for iid in missing:
+            stock = float(stock_by_item.get(int(iid), 0.0))
+            if include_wip:
+                stock += float(wip_by_item.get(int(iid), 0.0))
+            available_by_item[int(iid)] = stock
 
-        buckets = sorted(gross_map.get(iid, {}).items(), key=lambda x: x[0])
-        for bucket_date, bucket_qty in buckets:
-            if available_qty >= bucket_qty:
-                available_qty -= bucket_qty
-            else:
-                net_qty = bucket_qty - available_qty
-                available_qty = 0.0
-                net_map[iid][bucket_date] = net_qty
+    # --- Multi-level net-first explosion ---
+    gross_map: DefaultDict[int, DefaultDict[date, float]] = defaultdict(lambda: defaultdict(float))
+    net_map: DefaultDict[int, DefaultDict[date, float]] = defaultdict(lambda: defaultdict(float))
 
-    def serialize_net(bmap: DefaultDict[int, Dict[date, float]]) -> Dict[str, Dict[str, float]]:
-        return {
-            str(iid): {dt.isoformat(): qty for dt, qty in sorted(dtmap.items())}
-            for iid, dtmap in bmap.items()
-        }
+    for depth in range(max(1, max_bom_depth)):
+        if not demand_map:
+            break
 
-    gross_req_result.update({"net": serialize_net(net_map)})
-    return gross_req_result
+        current_item_ids: Set[int] = set(int(i) for i in demand_map.keys())
+        ensure_availability(current_item_ids)
+
+        next_demand: DefaultDict[int, DefaultDict[date, float]] = defaultdict(lambda: defaultdict(float))
+
+        for iid in sorted(current_item_ids):
+            buckets = demand_map.get(int(iid), {}) or {}
+            if not buckets:
+                continue
+
+            # netting in chronological order
+            avail = float(available_by_item.get(int(iid), 0.0) or 0.0)
+            net_buckets: List[Tuple[date, float]] = []
+
+            for bucket_date, bucket_qty in sorted(buckets.items(), key=lambda x: x[0]):
+                q = float(bucket_qty or 0.0)
+                if q <= 1e-9:
+                    continue
+                gross_map[int(iid)][bucket_date] += q
+                if avail >= q:
+                    avail -= q
+                    continue
+                net_q = q - avail
+                avail = 0.0
+                net_map[int(iid)][bucket_date] += net_q
+                net_buckets.append((bucket_date, net_q))
+
+            available_by_item[int(iid)] = avail
+
+            # explode only residual/net demand
+            if not net_buckets:
+                continue
+            spec_id = default_spec_map.get(int(iid))
+            if not spec_id:
+                continue
+            comps = get_components_for_spec(int(spec_id))
+            if not comps:
+                continue
+
+            for bucket_date, net_q in net_buckets:
+                for comp in comps:
+                    try:
+                        child_id = int(getattr(comp, "item_id"))
+                        per_unit = float(getattr(comp, "quantity", 0.0) or 0.0)
+                    except Exception:
+                        continue
+                    if per_unit <= 1e-12:
+                        continue
+                    child_qty = float(net_q) * float(per_unit)
+                    if child_qty <= 1e-9:
+                        continue
+                    # buffer shift (component timing)
+                    buf = resolve_buffer_days(int(child_id))
+                    child_date = bucket_date
+                    if buf > 0:
+                        child_date = clamp_to_horizon(bucket_date - timedelta(days=int(buf)))
+                    next_demand[int(child_id)][child_date] += child_qty
+
+        demand_map = next_demand
+
+    def serialize_bucket(bmap: DefaultDict[int, DefaultDict[date, float]]) -> Dict[str, Dict[str, float]]:
+        out: Dict[str, Dict[str, float]] = {}
+        for iid, dtmap in bmap.items():
+            if not dtmap:
+                continue
+            out[str(int(iid))] = {dt.isoformat(): float(q or 0.0) for dt, q in sorted(dtmap.items()) if float(q or 0.0) > 1e-9}
+        return out
+
+    gross_ser = serialize_bucket(gross_map)
+    net_ser = serialize_bucket(net_map)
+
+    return {
+        "meta": {
+            "asOf": _read_last_stock_sync_at(),
+            "d0": d0.isoformat(),
+            "dmax": dmax.isoformat(),
+        },
+        "config": {
+            "horizon_days": horizon,
+            "safety_stock_percent": ss_percent,
+            "config_version_id": int(cfg_id),
+        },
+        "snapshot": snapshot,
+        "gross": gross_ser,
+        "net": net_ser,
+        "stats": {
+            "items": int(len(gross_ser)),
+            "buckets": int(sum(len(v) for v in gross_ser.values())),
+        },
+    }
 
 # --- Main Planning Run ---
 
