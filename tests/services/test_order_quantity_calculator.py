@@ -46,8 +46,8 @@ def comp(item_id, quantity):
 
 def test_buffer_days_avg_daily_demand_priority_over_qty():
     """
-    Buffer quantity = avg_daily_demand * buffer_days.
-    avg_daily_demand computed as total_demand / horizon_days (not number of buckets).
+    Buffer days are treated as timing shift only (in planning_service),
+    so OrderQuantityCalculator must NOT inflate quantities due to buffer_days.
     """
     snapshot = {
         "production": {"lot_sizing": {"min_batch": 1, "multiple": 1, "rounding": "ceil"}},
@@ -85,17 +85,15 @@ def test_buffer_days_avg_daily_demand_priority_over_qty():
     requested = 1.0
     final_qty, normalized, details, warnings = oqc.compute(item_id, requested)
 
-    # Buffer qty = 10 * 3 = 30; min lot sizing will raise base to at least buffer if buffer > requested
-    # No optimal_batch, so normalized should be >= 30 (exact 30 with min_batch=1, multiple=1)
+    # No buffer quantity inflation: normalized should not jump above requested
     assert final_qty == min(requested, requested, 100.0)  # horizon cap doesn't bite here -> 1.0
-    assert normalized >= 30.0
+    assert normalized == 1.0
     assert len([w for w in warnings if w.get("code") == "COMPONENT_SHORTAGE"]) == 0
 
 
 def test_optimal_batch_wins_over_buffer():
     """
-    optimal_batch has priority over buffer.
-    If optimal_batch >= base_qty (incl. buffer), use optimal_batch.
+    optimal_batch still controls lot sizing; buffer_days must not affect quantity.
     """
     snapshot = {
         "production": {"lot_sizing": {"min_batch": 1, "multiple": 1, "rounding": "ceil"}},
@@ -135,7 +133,7 @@ def test_optimal_batch_wins_over_buffer():
 
     # final_qty limited by horizon (100) and components (no limit) → 10
     assert final_qty == 10.0
-    # normalized must become 50 (optimal_batch wins over buffer 30 and requested 10)
+    # normalized must become 50 (optimal_batch wins over requested 10)
     assert normalized == 50.0
     assert len(warnings) == 0
 

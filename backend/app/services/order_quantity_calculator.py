@@ -8,7 +8,8 @@ from .warnings import make_warning
 class OrderQuantityCalculator:
     """
     Calculate production order quantities with:
-    - buffer days by area (resource.buffer_days) using average daily demand
+    - (IMPORTANT) buffer days are treated as *timing shift only* in planning (see planning_service);
+      this calculator must NOT add any extra quantity due to buffer_days
     - optimal batch priority over buffer
     - component availability limit (by current stock + WIP)
     - horizon demand limit (sum net demand within horizon)
@@ -69,8 +70,10 @@ class OrderQuantityCalculator:
         item = self.item_by_id.get(int(item_id))
         is_discrete = self._is_discrete_unit_by_item(int(item_id))
 
-        # 1) Buffer qty by area buffer_days and average daily demand
-        buffer_qty = self._calculate_buffer_qty(item_id)
+        # 1) Buffer policy: timing shift only
+        # Buffer_days is applied as date shift during net-first BOM explosion in planning_service.
+        # To avoid overproduction, buffer must NOT translate into additional quantities here.
+        buffer_qty = 0.0
 
         # 2) Horizon demand limit (integer for discrete units)
         total_horizon_demand = float(self.total_demand_by_item.get(int(item_id), 0.0) or 0.0)
