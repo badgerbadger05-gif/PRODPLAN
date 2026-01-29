@@ -1,21 +1,18 @@
-# Диагностика и типовые операции
+# Диагностика и операции
 
 ## Docker
 
 Запуск:
-
 ```bash
 docker-compose up -d
 ```
 
 Остановка:
-
 ```bash
 docker-compose down
 ```
 
 Логи:
-
 ```bash
 docker-compose logs -f backend
 docker-compose logs -f frontend
@@ -24,14 +21,12 @@ docker-compose logs -f db
 
 ## Alembic / миграции
 
-Проверка текущей версии:
-
+Текущая версия:
 ```bash
 docker-compose exec backend alembic current
 ```
 
 Применить миграции:
-
 ```bash
 docker-compose exec backend alembic upgrade head
 ```
@@ -42,8 +37,7 @@ docker-compose exec backend alembic upgrade head
 docker-compose exec backend pytest
 ```
 
-## Быстрые проверки API
+## API
 
-- Swagger: http://localhost:8000/docs
-- Healthcheck (если есть): смотрим `/docs` + логи backend
+Swagger: http://localhost:8000/docs
 
