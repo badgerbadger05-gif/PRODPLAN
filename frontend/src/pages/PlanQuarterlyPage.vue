@@ -366,14 +366,9 @@ function getFullWeekDays(weekKey: string): string[] {
 }
 
 function getVisibleWeekDays(weekKey: string): string[] {
-  const days = getFullWeekDays(weekKey)
-  const { weekKey: currentWk } = getISOWeekInfo(todayStr.value)
-  if (weekKey === currentWk) {
-    // Текущая неделя: только дни начиная с сегодня (включительно)
-    return days.filter(d => d >= todayStr.value)
-  }
-  // Будущие недели: все 7 дней
-  return days
+  // In quarterly plan view we must not auto-shift/hide past days.
+  // Always show full week (all 7 days) when expanded.
+  return getFullWeekDays(weekKey)
 }
 
 function computeFridayRemainder(row: any, weekKey: string): number {
@@ -555,9 +550,10 @@ async function loadPlanData() {
   try {
     loading.table = true
 
-    /* Горизонт: фиксированные 12 недель квартала + 4 дополнительные недели от текущей даты */
-    const start = todayStr.value
-    const daysNeeded = 16 * 7
+    // Fixed quarter range: no auto-shift by today.
+    const qb = getQuarterBounds(new Date())
+    const start = qb.start
+    const daysNeeded = qb.daysCount
     const { data } = await api.post('/v1/plan/matrix', {
       start_date: start,
       days: daysNeeded,
@@ -588,25 +584,13 @@ async function loadPlanData() {
     weekToFriday.value = mapFriday
     weekToDates.value = mapDates
 
-    // Фильтруем прошедшие недели полностью (не показываем прошедшие периоды)
-    const { weekKey: currentWeek } = getISOWeekInfo(todayStr.value)
-    const orderFuture = order.filter((wk) => {
-      const ds = mapDates[wk] || []
-      // неделя отображается, если есть хотя бы один день >= сегодня
-      return ds.some(d => d >= todayStr.value)
-    })
-    // Сортируем по первой дате недели по возрастанию
-    orderFuture.sort((a, b) => {
+    // Keep all quarter weeks in chronological order (no hiding past weeks)
+    order.sort((a, b) => {
       const da = (mapDates[a] || []).slice().sort()[0] || ''
       const db = (mapDates[b] || []).slice().sort()[0] || ''
       return da.localeCompare(db)
     })
-    /* Текущая неделя первой и ограничение ровно 12 + 4 = 16 недель */
-    const withoutCurrent = orderFuture.filter(wk => wk !== currentWeek)
-    const ordered = (currentWeek && orderFuture.includes(currentWeek))
-      ? [currentWeek, ...withoutCurrent]
-      : orderFuture
-    weeksOrder.value = ordered.slice(0, 16)
+    weeksOrder.value = order
 
     // Проецируем дни и агрегируем строки по неделям (только по weeksOrder)
     for (const row of rows) {

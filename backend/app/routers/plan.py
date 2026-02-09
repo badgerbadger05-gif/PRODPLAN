@@ -15,6 +15,12 @@ from ..services.plan_service import (
     fetch_stages
 )
 
+from ..services.production_report_service import (
+    get_week_report,
+    bulk_upsert_fact,
+    close_previous_workday,
+)
+
 from ..services.planning_service import (
     run_planning_run,
     list_planning_runs,
@@ -103,6 +109,29 @@ class PlanningConfigCreate(BaseModel):
     activate: Optional[bool] = False
 
 
+# ===== Weekly production report (week view + day close) =====
+
+
+class ProductionReportWeekRequest(BaseModel):
+    week_start: Optional[str] = None
+    any_date_in_week: Optional[str] = None
+
+
+class ProductionReportFactEntry(BaseModel):
+    item_id: int
+    date: str
+    fact_qty: float
+
+
+class ProductionReportFactBulkUpsertRequest(BaseModel):
+    entries: List[ProductionReportFactEntry] = []
+
+
+class ProductionReportDayCloseRequest(BaseModel):
+    # MVP: без параметров, закрываем строго previous_workday(today)
+    closed_by: Optional[str] = None
+
+
 # ===== Forced orders (manual/override) =====
 
 
@@ -172,6 +201,66 @@ async def bulk_upsert_plan(
         saved = bulk_upsert_plan_entries(payload, db=db)
         return {"status": "ok", "saved": int(saved)}
     except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/production_report/week")
+async def get_production_report_week(
+    req: ProductionReportWeekRequest,
+    db: Session = Depends(get_db),
+):
+    """Недельный отчёт о выпуске техники (Пн–Вс), включая статусы закрытия дней."""
+    try:
+        ws = date.fromisoformat(req.week_start) if req.week_start else None
+        ad = date.fromisoformat(req.any_date_in_week) if req.any_date_in_week else None
+        return get_week_report(db=db, week_start=ws, any_date_in_week=ad)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/production_report/fact/bulk_upsert")
+async def bulk_upsert_production_report_fact(
+    req: ProductionReportFactBulkUpsertRequest,
+    db: Session = Depends(get_db),
+):
+    """Пакетное сохранение факта выпуска (completed_qty).
+
+    Важно: закрытые дни read-only.
+    """
+    try:
+        payload = [
+            {"item_id": int(e.item_id), "date": str(e.date), "fact_qty": float(e.fact_qty or 0.0)}
+            for e in (req.entries or [])
+        ]
+        saved = bulk_upsert_fact(db=db, entries=payload)
+        db.commit()
+        return {"status": "ok", "saved": int(saved)}
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/production_report/day/close")
+async def close_production_report_day(
+    req: ProductionReportDayCloseRequest,
+    db: Session = Depends(get_db),
+):
+    """Закрыть предыдущий рабочий день: перенос остатка (carry) на D_target.
+
+    Поддерживает re-run (повторное закрытие) с откатом предыдущего переноса.
+    """
+    try:
+        result = close_previous_workday(db=db, closed_by=req.closed_by)
+        db.commit()
+        return result
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
         raise HTTPException(status_code=400, detail=str(e))
 
 

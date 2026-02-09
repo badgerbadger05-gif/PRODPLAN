@@ -82,6 +82,16 @@
             </q-item-section>
           </q-item>
 
+          <q-item clickable v-ripple to="/plan/production-report/week" exact class="menu-item">
+            <q-item-section avatar>
+              <q-icon name="table_view" />
+            </q-item-section>
+            <q-item-section>
+              <q-item-label>Отчёт о выпуске техники недельный</q-item-label>
+              <q-item-label caption>Факт + перенос остатков (закрытие дня)</q-item-label>
+            </q-item-section>
+          </q-item>
+
           <!-- MRP планирование -->
           <q-item clickable v-ripple to="/mrp" exact class="menu-item">
             <q-item-section avatar>

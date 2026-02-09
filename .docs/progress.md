@@ -127,3 +127,70 @@ MVP-2:
   - если позиция нашлась в OData (по GUID `item_ref1c` или по нормализованному `item_code`) — пишем `new_qty`;
   - если позиция **не нашлась** в OData — то при `zero_missing=false` оставляем старое значение `stock_qty` (строка [`sync_stock_from_odata()`](backend/app/services/odata_stock_sync.py:215)); при `zero_missing=true` — обнуляем.
 - В UI синхронизации остатков сейчас запрос всегда отправляется с `zero_missing: false` ([`syncStock()`](frontend/src/pages/SyncPage.vue:561)), поэтому если OData Balance не возвращает строки с нулевыми остатками (частый кейс), то «нули» просто отсутствуют в ответе и в БД **не перезапишутся** — останутся старые положительные остатки.
+# 2026-02-06 — Недельный отчёт о выпуске техники: закрытие дня + перенос остатков
+
+Реализовано по ТЗ из [`weekly_production_report_code_change_plan.md`](.docs/weekly_production_report_code_change_plan.md:1) и решениям из [`weekly_production_report_decisions.md`](.docs/weekly_production_report_decisions.md:1).
+
+## Backend
+
+- Добавлены таблицы (миграция Alembic) для механизма закрытия дня и переносов:
+  - `work_calendar_day`
+  - `production_day_close`
+  - `production_day_close_item`
+  См. [`backend/alembic/versions/20260206_01_add_production_day_close_tables.py`](backend/alembic/versions/20260206_01_add_production_day_close_tables.py:1).
+
+- Добавлены модели:
+  - [`WorkCalendarDay`](backend/app/models.py:318)
+  - [`ProductionDayClose`](backend/app/models.py:327)
+  - [`ProductionDayCloseItem`](backend/app/models.py:344)
+
+- Сервис глобального календаря рабочих дней:
+  - [`is_workday()`](backend/app/services/work_calendar_service.py:11)
+  - [`previous_workday()`](backend/app/services/work_calendar_service.py:32)
+  - [`next_workday()`](backend/app/services/work_calendar_service.py:45)
+
+- Сервис недельного отчёта и закрытия дня:
+  - [`get_week_report()`](backend/app/services/production_report_service.py:44)
+  - [`bulk_upsert_fact()`](backend/app/services/production_report_service.py:149) — запрещает запись факта в закрытые дни (read-only)
+  - [`close_previous_workday()`](backend/app/services/production_report_service.py:215) — поддерживает re-run с откатом прошлого переноса, переносит остаток на `next_workday(next_workday(today))`, пропуски рабочих дней запрещены
+
+- API (добавлено в [`plan.py`](backend/app/routers/plan.py:1)):
+  - `POST /api/v1/plan/production_report/week`
+  - `POST /api/v1/plan/production_report/fact/bulk_upsert`
+  - `POST /api/v1/plan/production_report/day/close`
+
+## Tests
+
+Добавлены тесты закрытия дня, переносов, re-run и read-only факта:
+[`tests/services/test_production_report_day_close.py`](tests/services/test_production_report_day_close.py:1)
+
+## Frontend
+
+- Добавлена страница «Отчёт о выпуске техники недельный»:
+  [`frontend/src/pages/ProductionReportWeekPage.vue`](frontend/src/pages/ProductionReportWeekPage.vue:1)
+  - 7 колонок (Пн–Вс), ввод факта, подсветка «перевыпуск», итоги недели
+  - кнопки «Сохранить факт» (bulk upsert) и «Закрыть день»
+  - закрытые дни становятся read-only (по `close_status` из API)
+
+## Fixes
+
+- Исправлено: в недельном отчёте факт за «закрываемый день» (из `close_hint.close_date`) должен оставаться редактируемым даже если у даты уже `close_status='CLOSED'`.
+  Это нужно для сценария **re-run**: пользователь корректирует факт и нажимает «Закрыть день» повторно, а бэкенд пересчитывает перенос.
+  Реализация: UI делает исключение в [`isDateClosed()`](frontend/src/pages/ProductionReportWeekPage.vue:206) и разрешает ввод для `close_hint.close_date`.
+
+- Исправлено UX: при открытии отчёта в понедельник `close_hint.close_date` часто попадает в предыдущую неделю (прошлая пятница). Теперь UI автоматически переключает отображаемую неделю на неделю `close_hint.close_date`, если закрываемая дата не входит в текущий набор `days`.
+  Реализация: логика в [`load()`](frontend/src/pages/ProductionReportWeekPage.vue:233) переякоривает `anyDate` на `close_hint.close_date` и перезагружает данные.
+
+- Убрано авто-смещение окна в «План выпуска техники квартальный»: ранее страница якорила матрицу на `today` и скрывала прошедшие недели/дни (визуально создавая эффект «план сдвинулся на сегодня» без изменения данных в БД). Теперь квартальный план грузится за фиксированный диапазон квартала и показывает все недели в хронологическом порядке.
+  Реализация: [`loadPlanData()`](frontend/src/pages/PlanQuarterlyPage.vue:554) использует `getQuarterBounds()` как `start_date/days`, а [`getVisibleWeekDays()`](frontend/src/pages/PlanQuarterlyPage.vue:368) всегда возвращает все 7 дней.
+
+- Добавлен роут:
+  [`frontend/src/router/index.ts`](frontend/src/router/index.ts:1)
+  `'/plan/production-report/week'`
+
+- Добавлен пункт меню в [`MainLayout`](frontend/src/layouts/MainLayout.vue:1).
+
+- Добавлены API-обёртки на фронте:
+  [`frontend/src/services/api.ts`](frontend/src/services/api.ts:340)
+
+Примечание: в проекте отсутствует ESLint-конфиг (npm script `lint` падает по этой причине), поэтому автопроверка фронта ограничена.

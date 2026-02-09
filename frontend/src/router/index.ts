@@ -4,12 +4,13 @@ import MRPResultPage from '../pages/MRPResultPage.vue'
 
 // Динамический импорт компонентов
 const Index = () => import('../pages/Index.vue')
-const PlanPage = () => import('../pages/PlanPage.vue')
-const PlanQuarterlyPage = () => import('../pages/PlanQuarterlyPage.vue')
-const SyncPage = () => import('../pages/SyncPage.vue')
-const StagesPage = () => import('../pages/StagesPage.vue')
-const SpecificationPage = () => import('../pages/SpecificationPage.vue')
-const ResourcesPage = () => import('../pages/ResourcesPage.vue')
+  const PlanPage = () => import('../pages/PlanPage.vue')
+  const PlanQuarterlyPage = () => import('../pages/PlanQuarterlyPage.vue')
+  const ProductionReportWeekPage = () => import('../pages/ProductionReportWeekPage.vue')
+  const SyncPage = () => import('../pages/SyncPage.vue')
+  const StagesPage = () => import('../pages/StagesPage.vue')
+  const SpecificationPage = () => import('../pages/SpecificationPage.vue')
+  const ResourcesPage = () => import('../pages/ResourcesPage.vue')
 
 const MRPRunsPage = () => import('../pages/MRPRunsPage.vue')
 // Заглушки для будущих страниц
@@ -25,6 +26,7 @@ const routes = [
       { path: '', name: 'home', component: Index },
       { path: 'plan', name: 'plan', component: PlanPage },
       { path: 'plan/quarterly', name: 'plan-quarterly', component: PlanQuarterlyPage },
+      { path: 'plan/production-report/week', name: 'production-report-week', component: ProductionReportWeekPage },
       { path: 'sync', name: 'sync', component: SyncPage },
       { path: 'stages', name: 'stages', component: StagesPage },
       { path: 'orders', name: 'orders', component: OrdersPage },

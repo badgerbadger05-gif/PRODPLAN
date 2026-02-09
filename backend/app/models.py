@@ -309,6 +309,53 @@ class ProductionPlanEntry(Base):
     stage = relationship("ProductionStage")
 
 
+# ===== Weekly production report: day close + global work calendar =====
+
+
+class WorkCalendarDay(Base):
+    __tablename__ = "work_calendar_day"
+
+    date = Column(Date, primary_key=True)
+    is_workday = Column(Boolean, nullable=False, default=True)
+    comment = Column(TEXT, nullable=True)
+
+
+class ProductionDayClose(Base):
+    __tablename__ = "production_day_close"
+    __table_args__ = (
+        UniqueConstraint("close_date", name="ux_production_day_close_close_date"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    close_date = Column(Date, nullable=False, index=True)
+    status = Column(String(20), nullable=False, default="OPEN")  # OPEN | CLOSED
+    target_date = Column(Date, nullable=True)
+    closed_at = Column(TIMESTAMP, nullable=True)
+    closed_by = Column(String(100), nullable=True)
+    created_at = Column(TIMESTAMP, default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class ProductionDayCloseItem(Base):
+    __tablename__ = "production_day_close_item"
+    __table_args__ = (
+        UniqueConstraint("day_close_id", "item_id", name="ux_production_day_close_item_day_item"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    day_close_id = Column(Integer, ForeignKey("production_day_close.id", ondelete="CASCADE"), nullable=False)
+    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False)
+
+    planned_qty_snapshot = Column(DECIMAL(15, 3), nullable=False, default=0.0)
+    fact_qty_snapshot = Column(DECIMAL(15, 3), nullable=False, default=0.0)
+    carry_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0)
+    applied_to_date = Column(Date, nullable=True)
+
+    # Связи
+    day_close = relationship("ProductionDayClose")
+    item = relationship("Item")
+
+
 class ItemEmbedding(Base):
     __tablename__ = "item_embeddings"
 

@@ -336,6 +336,59 @@ export async function getShortageReport(runId: number): Promise<ShortageReportRe
   return response.data
 }
 
+// ===== Weekly production report (week view + day close) =====
+
+export type ProductionReportWeekDay = {
+  date: string
+  is_workday: boolean
+  close_status?: string | null
+}
+
+export type ProductionReportWeekRow = {
+  item_id: number
+  item_code: string
+  item_name: string
+  item_article?: string | null
+  plan_by_day: Record<string, number>
+  fact_by_day: Record<string, number>
+  plan_week: number
+  fact_week: number
+  remaining_week: number
+}
+
+export type ProductionReportWeekResponse = {
+  week_start: string
+  days: ProductionReportWeekDay[]
+  rows: ProductionReportWeekRow[]
+  close_hint?: {
+    today: string
+    close_date: string
+    target_date: string
+  }
+}
+
+export async function getProductionReportWeek(body: {
+  week_start?: string
+  any_date_in_week?: string
+} = {}): Promise<ProductionReportWeekResponse> {
+  const { data } = await api.post('/v1/plan/production_report/week', body)
+  return data
+}
+
+export async function bulkUpsertProductionReportFact(body: {
+  entries: Array<{ item_id: number; date: string; fact_qty: number }>
+}): Promise<{ status: string; saved: number }> {
+  const { data } = await api.post('/v1/plan/production_report/fact/bulk_upsert', body)
+  return data
+}
+
+export async function closeProductionReportDay(body: {
+  closed_by?: string | null
+} = {}): Promise<any> {
+  const { data } = await api.post('/v1/plan/production_report/day/close', body)
+  return data
+}
+
 // ===== Forced orders (manual/override) =====
 
 export interface ForcedOrderCreateRequest {
