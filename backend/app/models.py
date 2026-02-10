@@ -350,6 +350,10 @@ class ProductionDayCloseItem(Base):
     fact_qty_snapshot = Column(DECIMAL(15, 3), nullable=False, default=0.0)
     carry_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0)
     applied_to_date = Column(Date, nullable=True)
+    # Additional fields for improved carry tracking
+    original_planned_qty_before_carry = Column(DECIMAL(15, 3), nullable=True)
+    planned_qty_after_carry = Column(DECIMAL(15, 3), nullable=True)
+    carry_status = Column(String(20), nullable=True)
 
     # Связи
     day_close = relationship("ProductionDayClose")

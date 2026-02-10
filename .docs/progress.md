@@ -21,6 +21,19 @@
 
 ## Последняя сессия
 
+2026-02-09 — диагностика и исправление переносов при re-run «закрытия дня» в недельном отчёте:
+- Расширена таблица `production_day_close_item` полями для детерминированного отката переноса (снапшот состояния плана на целевую дату):
+  - `original_planned_qty_before_carry`
+  - `planned_qty_after_carry`
+  - `carry_status`
+  Миграция: [`backend/alembic/versions/20260209_01_add_fields_to_production_day_close_item_for_carry_tracking.py`](backend/alembic/versions/20260209_01_add_fields_to_production_day_close_item_for_carry_tracking.py).
+- В [`close_previous_workday()`](backend/app/services/production_report_service.py:278) изменён re-run rollback: вместо эвристики «planned_qty - carry» используется `original_planned_qty_before_carry` из `ProductionDayCloseItem`.
+- В [`get_week_report()`](backend/app/services/production_report_service.py:50) добавлены диагностические поля для UI:
+  - `days[].closed_planned/closed_fact/carry_qty` (агрегация по дню закрытия)
+  - `rows[].carry_by_day/closed_plan_by_day/closed_fact_by_day` (по изделию и дню)
+- UI недельного отчёта дополнен отображением диагностических данных в шапке и ячейках: [`ProductionReportWeekPage.vue`](frontend/src/pages/ProductionReportWeekPage.vue:1).
+- Тесты фиксируют идемпотентность re-run переноса: [`tests/services/test_production_report_day_close.py`](tests/services/test_production_report_day_close.py:1).
+
 2026-01-28 — ревизия `.docs/` (сжатие контекста, удаление повторений, устаревшего и лишнего).
 
 2026-01-27 — изменение семантики буфера: «буфер = только временной сдвиг, без добавки к количеству»:

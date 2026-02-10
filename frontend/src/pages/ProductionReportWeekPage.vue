@@ -34,7 +34,7 @@
                 />
               </div>
               <div class="col-auto">
-                <q-btn color="primary" label="Загрузить" :loading="loading.page" @click="load" />
+                <q-btn color="primary" label="Загрузить" :loading="loading.page" @click="load()" />
               </div>
 
               <div class="col-12 col-md-6">
@@ -89,7 +89,20 @@
               >
                 <template v-slot:header-cell="hprops">
                   <q-th :props="hprops" :class="hprops.col.headerClasses">
-                    {{ hprops.col.label }}
+                    <div class="col-header">
+                      <div>{{ hprops.col.label }}</div>
+
+                      <div
+                        v-if="hprops.col?.name?.startsWith('day_') && dayMetaMap[hprops.col.dateKey]"
+                        class="text-caption text-grey-7"
+                      >
+                        <div v-if="String(dayMetaMap[hprops.col.dateKey]?.close_status || '') === 'CLOSED'">
+                          закрыто: план {{ fmtNum(dayMetaMap[hprops.col.dateKey]?.closed_planned) }},
+                          факт {{ fmtNum(dayMetaMap[hprops.col.dateKey]?.closed_fact) }},
+                          перенос {{ fmtNum(dayMetaMap[hprops.col.dateKey]?.carry_qty) }}
+                        </div>
+                      </div>
+                    </div>
                   </q-th>
                 </template>
 
@@ -116,6 +129,22 @@
 
                     <div v-else-if="props.col.name.startsWith('day_')" class="day-cell">
                       <div class="text-caption text-grey-7">план: {{ fmtNum(getPlan(props.row, props.col.dateKey)) }}</div>
+
+                      <div
+                        v-if="getCarry(props.row, props.col.dateKey) > 0"
+                        class="text-caption text-blue-8"
+                      >
+                        перенос: {{ fmtNum(getCarry(props.row, props.col.dateKey)) }}
+                      </div>
+
+                      <div
+                        v-if="(getClosedPlan(props.row, props.col.dateKey) > 0) || (getClosedFact(props.row, props.col.dateKey) > 0)"
+                        class="text-caption text-grey-7"
+                      >
+                        закрыто: план {{ fmtNum(getClosedPlan(props.row, props.col.dateKey)) }},
+                        факт {{ fmtNum(getClosedFact(props.row, props.col.dateKey)) }}
+                      </div>
+
                       <q-input
                         v-model.number="props.row[props.col.name]"
                         type="number"
@@ -203,6 +232,14 @@ const closeStatusMap = computed<Record<string, string>>(() => {
   return m
 })
 
+const dayMetaMap = computed<Record<string, any>>(() => {
+  const m: Record<string, any> = {}
+  for (const d of days.value || []) {
+    if (d?.date) m[String(d.date)] = d
+  }
+  return m
+})
+
 const rerunEditableDate = computed<string | null>(() => {
   // Backend allows re-run corrections for D_close = previous_workday(today)
   // even if this day already has close_status=CLOSED.
@@ -222,6 +259,18 @@ function getPlan(row: RowVM, dateStr: string): number {
 
 function getFact(row: RowVM, dateStr: string): number {
   return Number(row?.fact_by_day?.[dateStr] ?? 0) || 0
+}
+
+function getCarry(row: RowVM, dateStr: string): number {
+  return Number((row as any)?.carry_by_day?.[dateStr] ?? 0) || 0
+}
+
+function getClosedPlan(row: RowVM, dateStr: string): number {
+  return Number((row as any)?.closed_plan_by_day?.[dateStr] ?? 0) || 0
+}
+
+function getClosedFact(row: RowVM, dateStr: string): number {
+  return Number((row as any)?.closed_fact_by_day?.[dateStr] ?? 0) || 0
 }
 
 function isOverProduced(row: RowVM, dateStr: string): boolean {
@@ -478,6 +527,10 @@ onMounted(() => {
 
 .day-cell {
   min-width: 110px;
+}
+
+.col-header {
+  line-height: 1.15;
 }
 
 .fact-input {

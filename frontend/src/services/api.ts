@@ -342,6 +342,9 @@ export type ProductionReportWeekDay = {
   date: string
   is_workday: boolean
   close_status?: string | null
+  closed_planned?: number
+  closed_fact?: number
+  carry_qty?: number
 }
 
 export type ProductionReportWeekRow = {
@@ -351,6 +354,10 @@ export type ProductionReportWeekRow = {
   item_article?: string | null
   plan_by_day: Record<string, number>
   fact_by_day: Record<string, number>
+  // Diagnostics for day close / carry
+  carry_by_day?: Record<string, number>
+  closed_plan_by_day?: Record<string, number>
+  closed_fact_by_day?: Record<string, number>
   plan_week: number
   fact_week: number
   remaining_week: number

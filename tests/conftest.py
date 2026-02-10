@@ -8,6 +8,9 @@ import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'backend')))
 
 from app.database import Base
+# Import models so SQLAlchemy registers tables on Base.metadata for create_all()
+# (tests use in-memory SQLite and create schema from ORM metadata).
+from app import models  # noqa: F401
 
 # Use an in-memory SQLite database for testing
 SQLALCHEMY_DATABASE_URL = "sqlite:///:memory:"
