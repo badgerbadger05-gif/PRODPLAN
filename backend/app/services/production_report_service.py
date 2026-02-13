@@ -17,6 +17,45 @@ from ..models import (
 from .work_calendar_service import is_workday, next_workday, previous_workday
 
 
+def get_planning_anchor_date(
+    db: Session,
+    today_override: Optional[date] = None,
+) -> Dict[str, Any]:
+    """Определить якорную дату для отображения планового окна.
+
+    Требование (UI): показывать план начиная с *первого не закрытого* рабочего дня.
+
+    Формула:
+    - last_closed = max(production_day_close.close_date where status='CLOSED')
+    - anchor_date = next_workday(last_closed)
+    - если last_closed отсутствует: anchor_date = previous_workday(today)
+
+    Примечание:
+    - Функция использует глобальный календарь рабочих дней через [`next_workday()`](backend/app/services/work_calendar_service.py:45)
+      и [`previous_workday()`](backend/app/services/work_calendar_service.py:32).
+    """
+
+    today = today_override or date.today()
+    last_closed: Optional[date] = (
+        db.query(func.max(ProductionDayClose.close_date))
+        .filter(ProductionDayClose.status == "CLOSED")
+        .scalar()
+    )
+
+    if last_closed is not None:
+        anchor = next_workday(db, last_closed)
+    else:
+        # Если процесс закрытий ещё не начинали, якорим на дне, который должен закрываться сейчас
+        # (предыдущий рабочий день относительно today).
+        anchor = previous_workday(db, today)
+
+    return {
+        "today": today.isoformat(),
+        "last_closed_date": last_closed.isoformat() if last_closed is not None else None,
+        "anchor_date": anchor.isoformat(),
+    }
+
+
 def _week_start_monday(d: date) -> date:
     # Monday = 0
     return d if d.weekday() == 0 else (d.fromordinal(d.toordinal() - d.weekday()))

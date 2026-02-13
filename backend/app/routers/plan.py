@@ -19,6 +19,7 @@ from ..services.production_report_service import (
     get_week_report,
     bulk_upsert_fact,
     close_previous_workday,
+    get_planning_anchor_date,
 )
 
 from ..services.planning_service import (
@@ -261,6 +262,20 @@ async def close_production_report_day(
             db.rollback()
         except Exception:
             pass
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/anchor")
+async def get_planning_anchor(
+    db: Session = Depends(get_db),
+):
+    """Якорная дата для отображения планового окна.
+
+    Семантика: первый НЕ закрытый рабочий день после последнего закрытого.
+    """
+    try:
+        return get_planning_anchor_date(db=db)
+    except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 

@@ -197,6 +197,24 @@ MVP-2:
 - Убрано авто-смещение окна в «План выпуска техники квартальный»: ранее страница якорила матрицу на `today` и скрывала прошедшие недели/дни (визуально создавая эффект «план сдвинулся на сегодня» без изменения данных в БД). Теперь квартальный план грузится за фиксированный диапазон квартала и показывает все недели в хронологическом порядке.
   Реализация: [`loadPlanData()`](frontend/src/pages/PlanQuarterlyPage.vue:554) использует `getQuarterBounds()` как `start_date/days`, а [`getVisibleWeekDays()`](frontend/src/pages/PlanQuarterlyPage.vue:368) всегда возвращает все 7 дней.
 
+2026-02-12 — «окно плана от первого не закрытого дня» (якорь по закрытиям дня)
+
+- Добавлен расчёт якорной даты окна плана (первый **не закрытый** рабочий день) в backend:
+  - [`get_planning_anchor_date()`](backend/app/services/production_report_service.py:21)
+  - API: `GET /api/v1/plan/anchor` ([`get_planning_anchor()`](backend/app/routers/plan.py:268))
+  - Семантика: `anchor_date = next_workday(max_closed_date)`; если закрытий нет → `anchor_date = previous_workday(today)`.
+
+- Квартальный план теперь якорится на `anchor_date` и показывает только диапазон от `anchor_date` до конца квартала:
+  - загрузка якоря: [`getPlanningAnchor()`](frontend/src/services/api.ts:401)
+  - применение в UI: [`loadPlanData()`](frontend/src/pages/PlanQuarterlyPage.vue:549)
+  - удаление строки плана (`delete_row`) выполняется в пределах текущего отображаемого окна.
+
+- Добавлены unit-тесты на вычисление якоря:
+  - [`test_planning_anchor.py`](tests/services/test_planning_anchor.py:1)
+
+- Примечание по тестам в docker: в backend image ранее не было pytest; добавлен в зависимости:
+  - [`backend/requirements.txt`](backend/requirements.txt:1)
+
 - Добавлен роут:
   [`frontend/src/router/index.ts`](frontend/src/router/index.ts:1)
   `'/plan/production-report/week'`

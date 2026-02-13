@@ -204,7 +204,7 @@
 import { ref, reactive, onMounted, computed, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { Notify } from 'quasar'
-import api from '../services/api'
+import api, { getPlanningAnchor, type PlanningAnchorResponse } from '../services/api'
 
 /**
  * Типы
@@ -247,6 +247,15 @@ const loading = reactive({
   search: false,
   table: false
 })
+
+// Якорная дата окна плана: первый НЕ закрытый рабочий день после последнего закрытого.
+// При отсутствии закрытий (процесс не начат) бэкенд вернёт previous_workday(today).
+const planningAnchor = ref<PlanningAnchorResponse | null>(null)
+const anchorDate = computed<string>(() => planningAnchor.value?.anchor_date || todayStr.value)
+
+// Текущее загруженное окно (для операций типа delete_row, чтобы совпадало с UI)
+const windowStart = ref<string>('')
+const windowDays = ref<number>(0)
 
 // Данные таблицы
 const rowData = ref<PlanItem[]>([])
@@ -443,6 +452,27 @@ function getQuarterBounds(today = new Date()): { start: string; daysCount: numbe
   return { start: toISODate(startDate), daysCount }
 }
 
+function daysBetweenInclusive(startIso: string, endIso: string): number {
+  try {
+    const s = new Date(startIso + 'T00:00:00')
+    const e = new Date(endIso + 'T00:00:00')
+    const diff = Math.floor((e.getTime() - s.getTime()) / 86400000)
+    return diff + 1
+  } catch {
+    return 1
+  }
+}
+
+function addDaysIso(startIso: string, days: number): string {
+  try {
+    const d = new Date(startIso + 'T00:00:00')
+    d.setDate(d.getDate() + Number(days || 0))
+    return toISODate(d)
+  } catch {
+    return startIso
+  }
+}
+
 /**
  * Колонки таблицы
  */
@@ -550,10 +580,24 @@ async function loadPlanData() {
   try {
     loading.table = true
 
-    // Fixed quarter range: no auto-shift by today.
-    const qb = getQuarterBounds(new Date())
-    const start = qb.start
-    const daysNeeded = qb.daysCount
+    // 1) Узнаём якорь окна плана с бэкенда (по закрытиям дня)
+    try {
+      planningAnchor.value = await getPlanningAnchor()
+    } catch (e) {
+      planningAnchor.value = null
+    }
+
+    // 2) Берём квартал относительно anchor_date (а не относительно today)
+    // и стартуем с anchor_date, чтобы скрыть уже закрытый участок.
+    const qb = getQuarterBounds(new Date(anchorDate.value + 'T00:00:00'))
+    const quarterStart = qb.start
+    const quarterEnd = addDaysIso(quarterStart, qb.daysCount - 1)
+    const start = (anchorDate.value && anchorDate.value > quarterStart) ? anchorDate.value : quarterStart
+    const daysNeeded = Math.max(1, daysBetweenInclusive(start, quarterEnd))
+
+    windowStart.value = start
+    windowDays.value = daysNeeded
+
     const { data } = await api.post('/v1/plan/matrix', {
       start_date: start,
       days: daysNeeded,
@@ -714,11 +758,13 @@ async function onDeleteRow(row: PlanItem) {
     if (!ok) return
     deletingId.value = row.item_id
 
-    const qb = getQuarterBounds(new Date())
+    // Удаляем в пределах текущего отображаемого окна (чтобы совпадало с UI)
+    const start = windowStart.value || getQuarterBounds(new Date()).start
+    const daysCount = windowDays.value || getQuarterBounds(new Date()).daysCount
     await api.post('/v1/plan/delete_row', {
       item_id: row.item_id,
-      start_date: qb.start,
-      days: qb.daysCount
+      start_date: start,
+      days: daysCount
     })
 
     Notify.create({ type: 'positive', message: 'Строка удалена' })

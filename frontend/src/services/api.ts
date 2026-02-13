@@ -396,6 +396,19 @@ export async function closeProductionReportDay(body: {
   return data
 }
 
+// ===== Planning anchor (plan window start) =====
+
+export type PlanningAnchorResponse = {
+  today: string
+  last_closed_date?: string | null
+  anchor_date: string
+}
+
+export async function getPlanningAnchor(): Promise<PlanningAnchorResponse> {
+  const { data } = await api.get('/v1/plan/anchor')
+  return data
+}
+
 // ===== Forced orders (manual/override) =====
 
 export interface ForcedOrderCreateRequest {
