@@ -126,10 +126,11 @@ class ProductionReportFactEntry(BaseModel):
 
 class ProductionReportFactBulkUpsertRequest(BaseModel):
     entries: List[ProductionReportFactEntry] = []
+    rerun_editable_date: Optional[str] = None
 
 
 class ProductionReportDayCloseRequest(BaseModel):
-    # MVP: без параметров, закрываем строго previous_workday(today)
+    close_date: Optional[str] = None
     closed_by: Optional[str] = None
 
 
@@ -229,11 +230,12 @@ async def bulk_upsert_production_report_fact(
     Важно: закрытые дни read-only.
     """
     try:
+        rerun_editable_date = date.fromisoformat(req.rerun_editable_date) if req.rerun_editable_date else None
         payload = [
             {"item_id": int(e.item_id), "date": str(e.date), "fact_qty": float(e.fact_qty or 0.0)}
             for e in (req.entries or [])
         ]
-        saved = bulk_upsert_fact(db=db, entries=payload)
+        saved = bulk_upsert_fact(db=db, entries=payload, rerun_editable_date=rerun_editable_date)
         db.commit()
         return {"status": "ok", "saved": int(saved)}
     except Exception as e:
@@ -254,7 +256,8 @@ async def close_production_report_day(
     Поддерживает re-run (повторное закрытие) с откатом предыдущего переноса.
     """
     try:
-        result = close_previous_workday(db=db, closed_by=req.closed_by)
+        close_date = date.fromisoformat(req.close_date) if req.close_date else None
+        result = close_previous_workday(db=db, closed_by=req.closed_by, close_date_override=close_date)
         db.commit()
         return result
     except Exception as e:

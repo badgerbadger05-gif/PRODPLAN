@@ -144,3 +144,56 @@ def test_fact_bulk_upsert_readonly_for_closed_day(db_session):
             entries=[{"item_id": iid, "date": closed_day.isoformat(), "fact_qty": 1.0}],
         )
 
+
+def test_fact_bulk_upsert_allows_selected_rerun_closed_day(db_session):
+    db = db_session
+    iid = _mk_root_item(db, "F")
+    closed_day = date(2026, 2, 3)
+
+    db.add(ProductionDayClose(close_date=closed_day, status="CLOSED"))
+    db.commit()
+
+    saved = bulk_upsert_fact(
+        db=db,
+        entries=[{"item_id": iid, "date": closed_day.isoformat(), "fact_qty": 4.0}],
+        rerun_editable_date=closed_day,
+    )
+    db.commit()
+
+    assert saved == 1
+
+
+def test_close_day_supports_explicit_close_date_without_skipping_workdays(db_session):
+    db = db_session
+    iid = _mk_root_item(db, "G")
+
+    # Explicitly close Monday while today is later in week.
+    d_close = date(2026, 2, 2)  # Monday
+    # Target is still calculated from "today" business rule (today=Thu -> target=Mon).
+    d_target = date(2026, 2, 9)
+
+    db.add(ProductionPlanEntry(item_id=iid, stage_id=None, date=d_close, planned_qty=10.0, completed_qty=3.0))
+    db.commit()
+
+    res = close_previous_workday(
+        db=db,
+        today_override=date(2026, 2, 5),  # Thursday
+        close_date_override=d_close,
+    )
+    db.commit()
+
+    assert res["close_date"] == d_close.isoformat()
+    assert res["target_date"] == d_target.isoformat()
+    assert abs(_get_plan(db, iid, d_target) - 7.0) < 1e-6
+
+
+def test_close_day_rejects_non_workday_explicit_date(db_session):
+    db = db_session
+
+    with pytest.raises(ValueError):
+        close_previous_workday(
+            db=db,
+            today_override=date(2026, 2, 9),
+            close_date_override=date(2026, 2, 8),  # Sunday
+        )
+

@@ -50,6 +50,9 @@ class Item(Base):
     status = Column(String(20), default='active')
     created_at = Column(TIMESTAMP, default=func.now())
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
+    
+    # Relationship для доступа к продукции в заказах
+    production_products = relationship("ProductionProduct", back_populates="item")
 
 
 class ItemCategory(Base):
@@ -150,21 +153,39 @@ class ProductionOrder(Base):
     order_date = Column(DateTime, nullable=False)
     order_ref1c = Column(String(36), unique=True, index=True)
     is_posted = Column(Boolean, default=False)
+    # 1C order state (we will use it later to filter active vs done)
+    order_state_key = Column(String(36), nullable=True, index=True)
+    order_state_name = Column(String(255), nullable=True)
+    deletion_mark = Column(Boolean, default=False, nullable=False, index=True)
     created_at = Column(TIMESTAMP, default=func.now())
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
+    
+    # Relationship для загрузки продукции заказа
+    products = relationship("ProductionProduct", back_populates="order", lazy="select")
 
 
 class ProductionProduct(Base):
     __tablename__ = "production_products"
 
+    __table_args__ = (
+        UniqueConstraint("order_id", "line_number", name="ux_production_products_order_line"),
+    )
+
     product_id = Column(Integer, primary_key=True, index=True)
     order_id = Column(Integer, ForeignKey('production_orders.order_id'), nullable=False)
     item_id = Column(Integer, ForeignKey('items.item_id'), nullable=False)
+    # 1C line normalization
+    line_number = Column(Integer, nullable=True, index=True)
+    characteristic_ref1c = Column(String(36), nullable=True)
     quantity = Column(DECIMAL(10, 3), nullable=False)
     spec_id = Column(Integer, ForeignKey('specifications.spec_id'), nullable=True)
     stage_id = Column(Integer, ForeignKey('production_stages.stage_id'), nullable=True)
     created_at = Column(TIMESTAMP, default=func.now())
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
+    
+    # Relationship для обратного доступа к заказу
+    order = relationship("ProductionOrder", back_populates="products")
+    item = relationship("Item", back_populates="production_products")
 
 
 class ProductionComponent(Base):

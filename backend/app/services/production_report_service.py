@@ -277,6 +277,7 @@ def get_week_report(
 def bulk_upsert_fact(
     db: Session,
     entries: List[Dict[str, Any]],
+    rerun_editable_date: Optional[date] = None,
 ) -> int:
     """Bulk upsert факта (completed_qty) по датам.
 
@@ -299,16 +300,11 @@ def bulk_upsert_fact(
         return 0
 
     # Pre-check: closed days
-    # NOTE on re-run: decisions require allowing re-run of the current close day.
-    # To enable correcting fact before pressing "Close day" again, we allow fact edits
-    # for D_close = previous_workday(today) even if it is already CLOSED.
+    # NOTE on re-run: allow fact edits for one explicitly selected close day
+    # even if it is already CLOSED.
     close_dates = sorted({d for _, d, _ in normalized})
     if close_dates:
-        rerun_allowed_date: Optional[date] = None
-        try:
-            rerun_allowed_date = previous_workday(db, date.today())
-        except Exception:
-            rerun_allowed_date = None
+        rerun_allowed_date: Optional[date] = rerun_editable_date
 
         closed = (
             db.query(ProductionDayClose.close_date)
@@ -355,6 +351,7 @@ def close_previous_workday(
     db: Session,
     closed_by: Optional[str] = None,
     today_override: Optional[date] = None,
+    close_date_override: Optional[date] = None,
 ) -> Dict[str, Any]:
     """Закрыть день по правилам решений (previous_workday(today)).
 
@@ -363,7 +360,22 @@ def close_previous_workday(
     from datetime import datetime
 
     today = today_override or date.today()
-    d_close = previous_workday(db, today)
+    default_close_date = previous_workday(db, today)
+    d_close = close_date_override or default_close_date
+
+    if not is_workday(db, d_close):
+        raise ValueError(f"cannot close non-workday: {d_close.isoformat()}")
+
+    # Safety: only historical/current close dates are allowed.
+    # "Current" means the default close date for today (previous workday).
+    if d_close > default_close_date:
+        raise ValueError(
+            f"cannot close {d_close.isoformat()} because max allowed close date is {default_close_date.isoformat()}"
+        )
+
+    # Keep existing business semantics for carry target:
+    # target is calculated relative to "today" (through one workday),
+    # regardless of whether close date was selected explicitly.
     d_target = next_workday(db, next_workday(db, today))
 
     # Guard: no skipping workdays once the process has started.

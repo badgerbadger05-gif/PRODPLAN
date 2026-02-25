@@ -21,6 +21,26 @@
 
 ## Последняя сессия
 
+2026-02-19 — исправлена фильтрация «активных» заказов на производство 1С (удалённые/завершённые больше не должны попадать в синх и экспорт):
+
+- В [`sync_production_orders_from_odata()`](backend/app/services/production_order_sync.py:60):
+  - добавлена нормализация GUID состояния и защита от разных форматов (`guid'...'`, `{...}`, разный регистр);
+  - расширена обработка bool для `DeletionMark` (в т.ч. «истина/ложь», «да/нет»);
+  - добавлен второй слой фильтрации на уровне приложения: исключаем `DeletionMark==true` и `state==DONE_STATE_KEY` даже если 1С/прокси некорректно обработали `$filter`.
+- В [`export_production_orders_xlsx()`](backend/app/services/production_order_export.py:18) добавлен фильтр исключения `order_state_key == DONE_STATE_KEY` поверх `deletion_mark == false`, чтобы из БД гарантированно выгружались только «не завершённые».
+
+2026-02-13 — синхронизация производственных заказов 1С: ручной запуск + отчёт для доверия пользователей:
+
+- Запросы к 1С по OData выполняются **только по явному действию пользователя** (никакого авто-обновления внутри MRP).
+  Точка входа backend: `POST /api/v1/sync/production-orders-odata` через [`sync_production_orders_odata()`](backend/app/routers/sync.py:131), который вызывает загрузку OData в [`sync_production_orders_from_odata()`](backend/app/services/production_order_sync.py:31).
+- UX на странице «Синхронизация»: требуется две кнопки:
+  1) «Синхронизировать» — выполняет OData → БД.
+  2) «Синхронизировать и скачать отчёт» — выполняет OData → БД и затем формирует Excel (XLSX) как документирование выгрузки.
+- Формат отчёта (Excel): **один лист**, строка = «заказ + позиция (деталь)». Для каждой позиции нужно выводить минимум:
+  - реквизиты заказа (номер/дата/состояние),
+  - номенклатура и (если есть) характеристика,
+  - `ordered_qty`, `produced_qty`, `remaining_qty` (для частично выполненных), где `remaining_qty = max(ordered_qty - produced_qty, 0)`.
+
 2026-02-09 — диагностика и исправление переносов при re-run «закрытия дня» в недельном отчёте:
 - Расширена таблица `production_day_close_item` полями для детерминированного отката переноса (снапшот состояния плана на целевую дату):
   - `original_planned_qty_before_carry`
@@ -225,3 +245,36 @@ MVP-2:
   [`frontend/src/services/api.ts`](frontend/src/services/api.ts:340)
 
 Примечание: в проекте отсутствует ESLint-конфиг (npm script `lint` падает по этой причине), поэтому автопроверка фронта ограничена.
+
+2026-02-25 — недельный отчёт: выбор закрываемой даты, навигация по неделям, подсветка закрытых дат
+
+- Backend/API:
+  - В запрос закрытия дня добавлен параметр `close_date` в [`ProductionReportDayCloseRequest`](backend/app/routers/plan.py:131).
+  - В [`close_production_report_day()`](backend/app/routers/plan.py:248) добавлен разбор `close_date` и передача в сервис.
+  - В bulk-upsert факта добавлен `rerun_editable_date` в [`ProductionReportFactBulkUpsertRequest`](backend/app/routers/plan.py:127).
+  - В [`bulk_upsert_production_report_fact()`](backend/app/routers/plan.py:223) добавана передача `rerun_editable_date` в сервис.
+  - В [`bulk_upsert_fact()`](backend/app/services/production_report_service.py:277) добавлен параметр `rerun_editable_date`, чтобы разрешать re-run только для явно выбранной даты.
+  - В [`close_previous_workday()`](backend/app/services/production_report_service.py:350) добавлен параметр `close_date_override`:
+    - запрещено закрытие нерабочего дня;
+    - запрещено закрытие даты позже допустимой (`previous_workday(today)`), чтобы не закрывать «будущие» дни;
+    - сохранено правило последовательности закрытий без пропуска рабочих дней.
+  - Семантика `target_date` сохранена прежней: `next_workday(next_workday(today))`.
+
+- Frontend:
+  - В [`ProductionReportWeekPage.vue`](frontend/src/pages/ProductionReportWeekPage.vue:1):
+    - добавлено поле «Закрываемая дата» (`selectedCloseDate`);
+    - кнопка «Загрузить» и навигация `Пред./След. неделя` работают без принудительного автопрыжка на неделю `close_hint`;
+    - при сохранении факта передаётся `rerun_editable_date`;
+    - при закрытии дня в API передаётся выбранная `close_date`;
+    - re-run редактирование разрешено только для выбранной даты;
+    - добавлена визуальная подсветка закрытых дней в заголовках и ячейках (`closed-day-header`, `closed-day-cell`).
+  - В [`api.ts`](frontend/src/services/api.ts:385) расширены типы запросов:
+    - `bulkUpsertProductionReportFact(..., rerun_editable_date?)`;
+    - `closeProductionReportDay(..., close_date?)`.
+
+- Тесты:
+  - Расширен набор в [`test_production_report_day_close.py`](tests/services/test_production_report_day_close.py:1):
+    - разрешение сохранения факта в closed day только при совпадении с `rerun_editable_date`;
+    - закрытие по явно выбранной дате;
+    - запрет закрытия нерабочей даты.
+  - Прогон: `set "PYTHONPATH=." && pytest tests/services/test_production_report_day_close.py` — 8 passed.

@@ -54,6 +54,14 @@
               <div class="col-auto">
                 <q-btn color="primary" label="Синхронизация видов производства" @click="syncProductionKinds" :loading="loading.syncProductionKinds" />
               </div>
+              <div class="col-auto">
+                <q-btn color="primary" label="Синхронизация заказов на производство" @click="syncProductionOrders" :loading="loading.syncProductionOrders" />
+              </div>
+              <div class="col-auto">
+                <q-btn dense flat color="secondary" icon="table_view" @click="exportProductionOrders" :loading="loading.exportProductionOrders">
+                  <q-tooltip>Экспорт заказов в Excel</q-tooltip>
+                </q-btn>
+              </div>
             </div>
 
             <!-- Прогресс-бар синхронизации номенклатуры -->
@@ -154,7 +162,9 @@ const loading = ref({
   syncSpecifications: false,
   syncOperations: false,
   syncStock: false,
-  syncProductionKinds: false
+  syncProductionKinds: false,
+  syncProductionOrders: false,
+  exportProductionOrders: false
 })
 
 // --- Реал-тайм прогресс синхронизации номенклатуры ---
@@ -682,6 +692,118 @@ async function syncProductionKinds() {
     syncProgress.value.show = false
   } finally {
     loading.value.syncProductionKinds = false
+  }
+}
+
+async function syncProductionOrders() {
+  if (!form.value.base_url) {
+    Notify.create({ type: 'warning', message: 'Укажите base_url для подключения к 1С' })
+    return
+  }
+
+  try {
+    loading.value.syncProductionOrders = true
+    syncProgress.value.show = true
+    syncProgress.value.value = 0
+    syncProgress.value.label = '0%'
+    syncProgress.value.details = 'Старт синхронизации производственных заказов...'
+
+    const payload = {
+      base_url: form.value.base_url,
+      entity_name: 'Document_ЗаказНаПроизводство',
+      username: form.value.username || undefined,
+      password: form.value.password || undefined,
+      token: form.value.token || undefined,
+      filter_query: null,
+      select_fields: null,
+      dry_run: false,
+      zero_missing: false
+    }
+
+    const { data } = await api.post('/v1/sync/production-orders-odata', payload, { timeout: 900000 })
+
+    const total = Number(data?.orders_total || 0)
+    const created = Number(data?.orders_created || 0)
+    const updated = Number(data?.orders_updated || 0)
+    const unchanged = Number(data?.orders_unchanged || 0)
+    const prodCreated = Number(data?.products_created || 0)
+    const prodUpdated = Number(data?.products_updated || 0)
+
+    syncProgress.value.value = 1
+    syncProgress.value.label = '100%'
+    syncProgress.value.details = `Заказы: всего ${total}, создано ${created}, обновлено ${updated}, без изменений ${unchanged} • Строки: создано ${prodCreated}, обновлено ${prodUpdated}`
+
+    Notify.create({
+      type: 'positive',
+      message: `Заказы на производство синхронизированы • всего ${total}, создано ${created}, обновлено ${updated}`,
+      timeout: 6000
+    })
+
+    setTimeout(() => {
+      syncProgress.value.show = false
+    }, 2500)
+  } catch (e:any) {
+    const msg = e?.response?.data?.detail || e?.message || 'Ошибка синхронизации заказов на производство'
+    Notify.create({ type: 'negative', message: String(msg) })
+    syncProgress.value.show = false
+  } finally {
+    loading.value.syncProductionOrders = false
+  }
+}
+
+/**
+ * Экспорт заказов на производство в Excel (XLSX)
+ * Данные берутся из БД
+ */
+async function exportProductionOrders() {
+  try {
+    loading.value.exportProductionOrders = true
+    
+    const { data } = await api.get('/v1/sync/production-orders-odata/export', {
+      timeout: 60000
+    })
+    
+    // Скачиваем файл
+    if (data?.data_base64) {
+      downloadBase64Xlsx(data.data_base64, data.filename || 'production_orders.xlsx')
+      
+      Notify.create({
+        type: 'positive',
+        message: `Экспорт выполнен • строк: ${data.total_rows || 0}, заказов: ${data.orders_count || 0}`,
+        timeout: 3000
+      })
+    }
+  } catch (e: any) {
+    const msg = e?.response?.data?.detail || e?.message || 'Ошибка экспорта заказов'
+    Notify.create({ type: 'negative', message: String(msg) })
+  } finally {
+    loading.value.exportProductionOrders = false
+  }
+}
+
+/**
+ * Скачивание base64 XLSX файла
+ */
+function downloadBase64Xlsx(b64: string, filename: string) {
+  try {
+    const byteChars = atob(b64 || '')
+    const byteNumbers = new Array(byteChars.length)
+    for (let i = 0; i < byteChars.length; i++) {
+      byteNumbers[i] = byteChars.charCodeAt(i)
+    }
+    const byteArray = new Uint8Array(byteNumbers)
+    const blob = new Blob([byteArray], {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    a.click()
+    URL.revokeObjectURL(url)
+  } catch (e) {
+    console.error('Download XLSX failed', e)
+    Notify.create({ type: 'negative', message: 'Ошибка скачивания файла' })
   }
 }
 

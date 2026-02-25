@@ -19,6 +19,7 @@ services:
     ports:
       - "8000:8000"
     volumes:
+      - ./backend:/app
       - ./config:/app/config
       - ./output:/app/output
     extra_hosts:

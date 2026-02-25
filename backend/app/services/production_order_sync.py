@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Iterable, DefaultDict, Tuple
 from datetime import datetime
+
+from collections import defaultdict
 
 from sqlalchemy.orm import Session
 
-from ..models import ProductionOrder, ProductionProduct, ProductionComponent, ProductionOperation, Item, Specification, Operation, ProductionStage
+from ..models import ProductionOrder, ProductionProduct, Item
 from ..schemas import ODataSyncRequest
 
 
@@ -19,13 +21,66 @@ class ProductionOrderSyncStats:
     orders_unchanged: int = 0
     products_created: int = 0
     products_updated: int = 0
-    components_created: int = 0
-    components_updated: int = 0
-    operations_created: int = 0
-    operations_updated: int = 0
+    products_failed: int = 0
+    errors: List[str] = None  # type: ignore[assignment]
     dry_run: bool = False
     odata_url: str = ""
     odata_entity: str = ""
+
+
+def _chunked(seq: List[str], size: int) -> Iterable[List[str]]:
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
+
+
+def _parse_1c_datetime(val) -> Optional[datetime]:
+    if not val:
+        return None
+    if isinstance(val, datetime):
+        return val
+    if isinstance(val, str):
+        try:
+            return datetime.fromisoformat(val.replace("Z", "+00:00"))
+        except Exception:
+            return None
+    return None
+
+
+def _parse_1c_bool(val, default: bool = False) -> bool:
+    """Корректная обработка boolean значений из 1С OData."""
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        v = val.strip().lower()
+        # EN
+        if v in ("true", "1", "yes", "y", "on"):
+            return True
+        if v in ("false", "0", "no", "n", "off"):
+            return False
+        # RU (часто встречается при кастомных прокладках/логах)
+        if v in ("истина", "да"):
+            return True
+        if v in ("ложь", "нет"):
+            return False
+        # fallback
+        return default
+    return bool(val)
+
+
+def _norm_guid(val) -> str:
+    """Нормализация GUID для сравнения (lowercase, без фигурных скобок и обёрток)."""
+    s = str(val or "").strip().lower()
+    if not s:
+        return ""
+    # {xxxxxxxx-xxxx-...}
+    if s.startswith("{") and s.endswith("}"):
+        s = s[1:-1].strip()
+    # guid'xxxxxxxx-xxxx-...'
+    if s.startswith("guid'") and s.endswith("'"):
+        s = s[len("guid'") : -1].strip()
+    return s
 
 
 def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
@@ -48,40 +103,141 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
         odata_url=req.base_url,
         odata_entity=req.entity_name,
     )
+    # lazy-init for mutable default
+    if stats.errors is None:
+        stats.errors = []
 
     try:
         # Создаем клиент OData
         client = OData1CClient(req.base_url, req.username, req.password, req.token)
 
-        # Получаем все записи заказов на производство
+        # --- 1) Заголовки заказов ---
+        orders_select_default = [
+            "Ref_Key",
+            "Number",
+            "Date",
+            "Posted",
+            "DeletionMark",
+            "СостояниеЗаказа_Key",
+        ]
+        
+        # Фильтр: только не удалённые заказы.
+        # Состояние фильтруем в коде — 1С может некорректно обрабатывать `ne guid'...'`.
+        DONE_STATE_KEY = _norm_guid("ad28565a-991b-11eb-e39a-fa163e61326a")
+        default_filter = "DeletionMark eq false"
+
+        # Если пользователь передал доп. фильтр — учитываем его, но не даём вытащить удалённые.
+        # (Защита от "перевёрнутой" выгрузки.)
+        effective_filter = default_filter
+        if getattr(req, "filter_query", None):
+            effective_filter = f"({req.filter_query}) and ({default_filter})"
+        
         order_data = client.get_all(
             req.entity_name,
-            filter_query=req.filter_query,
-            select_fields=req.select_fields
+            filter_query=effective_filter,
+            select_fields=req.select_fields or orders_select_default,
+            top=1000,
+            max_pages=1000,
+            order_by="Ref_Key",
         )
+
+        # Дублируем фильтр на уровне приложения: 1С / прокси иногда игнорируют часть условий.
+        removed_by_dm = 0
+        removed_by_state = 0
+        filtered_orders = []
+        for rec in order_data:
+            dm = _parse_1c_bool(rec.get("DeletionMark"), False)
+            if dm:
+                removed_by_dm += 1
+                continue
+            state_key = _norm_guid(rec.get("СостояниеЗаказа_Key"))
+            if state_key and state_key == DONE_STATE_KEY:
+                removed_by_state += 1
+                continue
+            filtered_orders.append(rec)
+
+        print(
+            f"[DEBUG] Загружено: {len(order_data)}, "
+            f"отфильтровано DeletionMark=true: {removed_by_dm}, "
+            f"отфильтровано state=DONE: {removed_by_state}, "
+            f"итого к обработке: {len(filtered_orders)}"
+        )
+        order_data = filtered_orders
 
         if not order_data:
             stats.dry_run = True
             return asdict(stats)
 
         stats.orders_total = len(order_data)
+        
+        # Логирование для отладки: первые 5 заказов
+        for i, rec in enumerate(order_data[:5]):
+            dm = rec.get('DeletionMark')
+            print(f"[DEBUG Order {i}] Ref_Key={rec.get('Ref_Key')}, Number={rec.get('Number')}, "
+                  f"DeletionMark={dm} (type={type(dm).__name__}), СостояниеЗаказа_Key={rec.get('СостояниеЗаказа_Key')}")
 
         # Получаем существующие записи для сопоставления
-        existing_orders = {order.order_ref1c: order for order in db.query(ProductionOrder).all() if order.order_ref1c}
+        existing_orders = {
+            order.order_ref1c: order
+            for order in db.query(ProductionOrder).all()
+            if order.order_ref1c
+        }
         existing_items = {item.item_ref1c: item for item in db.query(Item).all() if item.item_ref1c}
-        existing_specs = {spec.spec_ref1c: spec for spec in db.query(Specification).all() if spec.spec_ref1c}
-        existing_operations = {op.operation_ref1c: op for op in db.query(Operation).all() if op.operation_ref1c}
-        existing_stages = {stage.stage_ref1c: stage for stage in db.query(ProductionStage).all() if stage.stage_ref1c}
 
         created_count = 0
         updated_count = 0
         unchanged_count = 0
         products_created = 0
         products_updated = 0
-        components_created = 0
-        components_updated = 0
-        operations_created = 0
-        operations_updated = 0
+        # --- 2) Строки продукции (отдельный EntitySet) ---
+        # ВАЖНО: строки нужны нормализованные по LineNumber, т.к. item_id может повторяться в разных строках.
+        products_entity = "Document_ЗаказНаПроизводство_Продукция"
+        # Важно: 1С OData может не содержать некоторых полей (например, "Этап_Key"),
+        # и тогда запрос с $select падает с 400.
+        # Поэтому для MVP берём минимально-надёжный набор полей (как в `.docs/production_orders_odata_queries.md`).
+        products_select = [
+            "Ref_Key",
+            "LineNumber",
+            "Номенклатура_Key",
+            "Количество",
+        ]
+        order_keys: List[str] = []
+        for r in order_data:
+            rk = str((r.get("Ref_Key") or "")).strip()
+            if rk:
+                order_keys.append(rk)
+
+        products_by_order: DefaultDict[str, List[Dict]] = defaultdict(list)
+        
+        # Загружаем ВСЕ строки продукции ОДНИМ запросом (пакетная загрузка)
+        # Фильтр: Ref_Key IN (список всех GUID заказов)
+        if order_keys:
+            # 1С OData поддерживает фильтр с множеством OR, но есть лимит на длину URL.
+            # Разбиваем на пакеты по 100 заказов (безопасный лимит для 1С)
+            BATCH_SIZE = 100
+            for i in range(0, len(order_keys), BATCH_SIZE):
+                batch_keys = order_keys[i:i + BATCH_SIZE]
+                or_filter = " or ".join([f"Ref_Key eq guid'{k}'" for k in batch_keys])
+                try:
+                    rows = client.get_all(
+                        products_entity,
+                        filter_query=f"({or_filter})",
+                        select_fields=products_select,
+                        top=1000,
+                        max_pages=1000,
+                        order_by="Ref_Key",
+                    )
+                    for pr in rows:
+                        rk = str((pr.get("Ref_Key") or "")).strip()
+                        if rk:
+                            products_by_order[rk].append(pr)
+                except Exception as e:
+                    # Если пакет не загрузился, помечаем все заказы из пакета как failed
+                    for ok in batch_keys:
+                        stats.products_failed += 1
+                        stats.errors.append(f"Products load failed for order_ref1c={ok}: {e}")
+                    # продолжаем синхронизацию заголовков, чтобы пользователь видел хотя бы шапки
+                    continue
 
         # Обрабатываем каждый заказ
         for record in order_data:
@@ -92,38 +248,17 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
                     continue
 
                 # Извлекаем данные заказа
-                number = record.get('Number', '').strip()
-                date_str = record.get('Date', '')
-                is_posted = record.get('Posted', False)
-
-                # Конвертируем дату
-                order_date = None
-                if date_str:
-                    try:
-                        if isinstance(date_str, str):
-                            order_date = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
-                        else:
-                            order_date = date_str
-                    except:
-                        order_date = datetime.now()
+                number = str(record.get("Number", "") or "").strip()
+                order_date = _parse_1c_datetime(record.get("Date"))
+                is_posted = _parse_1c_bool(record.get("Posted"), False)
+                deletion_mark = _parse_1c_bool(record.get("DeletionMark"), False)
+                order_state_key = _norm_guid(record.get("СостояниеЗаказа_Key", "")) or None
 
                 if not number:
                     continue
 
-                # Обрабатываем продукцию
-                products_data = record.get('Продукция', [])
-                if not isinstance(products_data, list):
-                    products_data = []
-
-                # Обрабатываем компоненты
-                components_data = record.get('Запасы', [])
-                if not isinstance(components_data, list):
-                    components_data = []
-
-                # Обрабатываем операции
-                operations_data = record.get('Операции', [])
-                if not isinstance(operations_data, list):
-                    operations_data = []
+                # Строки продукции берём из отдельного EntitySet
+                products_data = products_by_order.get(ref_key, [])
 
                 # Проверяем, существует ли уже такой заказ
                 existing_order = existing_orders.get(ref_key)
@@ -134,13 +269,17 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
                     needs_update = (
                         existing_order.order_number != number or
                         existing_order.order_date != order_date or
-                        existing_order.is_posted != is_posted
+                        existing_order.is_posted != is_posted or
+                        getattr(existing_order, "deletion_mark", False) != deletion_mark or
+                        getattr(existing_order, "order_state_key", None) != order_state_key
                     )
 
                     if needs_update:
                         existing_order.order_number = number
                         existing_order.order_date = order_date
                         existing_order.is_posted = is_posted
+                        existing_order.deletion_mark = deletion_mark
+                        existing_order.order_state_key = order_state_key
                         updated_count += 1
                     else:
                         unchanged_count += 1
@@ -150,9 +289,13 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
                         order_number=number,
                         order_date=order_date,
                         order_ref1c=ref_key,
-                        is_posted=is_posted
+                        is_posted=is_posted,
+                        deletion_mark=deletion_mark,
+                        order_state_key=order_state_key,
                     )
                     db.add(current_order)
+                    # Нужно получить order_id для строк
+                    db.flush()
                     created_count += 1
 
                 # Проверяем, что заказ создан или найден
@@ -162,40 +305,63 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
                 # Обрабатываем продукцию заказа
                 for prod_data in products_data:
                     try:
-                        item_key = prod_data.get('Номенклатура_Key', '').strip()
-                        quantity = prod_data.get('Количество', 0.0)
-                        spec_key = prod_data.get('Спецификация_Key', '').strip()
-                        stage_key = prod_data.get('Этап_Key', '').strip()
+                        item_key = str(prod_data.get("Номенклатура_Key", "") or "").strip()
+                        # Optional fields: some 1C configs expose them, but we don't require them for MVP
+                        characteristic_key = str(prod_data.get("Характеристика_Key", "") or "").strip() or None
+                        spec_key = str(prod_data.get("Спецификация_Key", "") or "").strip()
+                        stage_key = str(prod_data.get("Этап_Key", "") or "").strip()
+                        try:
+                            line_number = int(prod_data.get("LineNumber")) if prod_data.get("LineNumber") is not None else None
+                        except Exception:
+                            line_number = None
+                        try:
+                            quantity = float(prod_data.get("Количество", 0.0) or 0.0)
+                        except Exception:
+                            quantity = 0.0
 
                         if not item_key:
                             continue
 
                         # Находим связанные объекты
                         item = existing_items.get(item_key)
-                        spec = existing_specs.get(spec_key) if spec_key else None
-                        stage = existing_stages.get(stage_key) if stage_key else None
+                        spec = None
+                        stage = None
 
                         if not item:
                             continue
 
                         # Создаем или обновляем продукцию
-                        existing_product = db.query(ProductionProduct).filter_by(
-                            order_id=current_order.order_id,
-                            item_id=item.item_id
-                        ).first()
+                        existing_product = None
+                        if line_number is not None:
+                            existing_product = db.query(ProductionProduct).filter_by(
+                                order_id=current_order.order_id,
+                                line_number=line_number,
+                            ).first()
+                        else:
+                            # fallback для старых/нестандартных ответов (неидеально, но лучше чем потерять данные)
+                            existing_product = db.query(ProductionProduct).filter_by(
+                                order_id=current_order.order_id,
+                                item_id=item.item_id,
+                            ).first()
 
                         if existing_product:
                             if (existing_product.quantity != quantity or
                                 existing_product.spec_id != (spec.spec_id if spec else None) or
-                                existing_product.stage_id != (stage.stage_id if stage else None)):
+                                existing_product.stage_id != (stage.stage_id if stage else None) or
+                                getattr(existing_product, "line_number", None) != line_number or
+                                getattr(existing_product, "characteristic_ref1c", None) != characteristic_key):
                                 existing_product.quantity = quantity
                                 existing_product.spec_id = spec.spec_id if spec else None
                                 existing_product.stage_id = stage.stage_id if stage else None
+                                existing_product.line_number = line_number
+                                existing_product.characteristic_ref1c = characteristic_key
                                 products_updated += 1
                         else:
                             new_product = ProductionProduct(
                                 order_id=current_order.order_id,
                                 item_id=item.item_id,
+                                line_number=line_number,
+                                characteristic_ref1c=characteristic_key,
                                 quantity=quantity,
                                 spec_id=spec.spec_id if spec else None,
                                 stage_id=stage.stage_id if stage else None
@@ -205,115 +371,6 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
 
                     except Exception as e:
                         print(f"Ошибка обработки продукции заказа {ref_key}: {e}")
-                        continue
-
-                # Обрабатываем компоненты заказа
-                for comp_data in components_data:
-                    try:
-                        item_key = comp_data.get('Номенклатура_Key', '').strip()
-                        quantity = comp_data.get('Количество', 0.0)
-                        spec_key = comp_data.get('Спецификация_Key', '').strip()
-                        stage_key = comp_data.get('Этап_Key', '').strip()
-
-                        if not item_key:
-                            continue
-
-                        # Находим связанные объекты
-                        item = existing_items.get(item_key)
-                        spec = existing_specs.get(spec_key) if spec_key else None
-                        stage = existing_stages.get(stage_key) if stage_key else None
-
-                        if not item:
-                            continue
-
-                        # Создаем или обновляем компонент
-                        existing_component = db.query(ProductionComponent).filter_by(
-                            order_id=current_order.order_id,
-                            item_id=item.item_id
-                        ).first()
-
-                        if existing_component:
-                            if (existing_component.quantity != quantity or
-                                existing_component.spec_id != (spec.spec_id if spec else None) or
-                                existing_component.stage_id != (stage.stage_id if stage else None)):
-                                existing_component.quantity = quantity
-                                existing_component.spec_id = spec.spec_id if spec else None
-                                existing_component.stage_id = stage.stage_id if stage else None
-                                components_updated += 1
-                        else:
-                            new_component = ProductionComponent(
-                                order_id=current_order.order_id,
-                                item_id=item.item_id,
-                                quantity=quantity,
-                                spec_id=spec.spec_id if spec else None,
-                                stage_id=stage.stage_id if stage else None
-                            )
-                            db.add(new_component)
-                            components_created += 1
-
-                    except Exception as e:
-                        print(f"Ошибка обработки компонента заказа {ref_key}: {e}")
-                        continue
-
-                # Обрабатываем операции заказа
-                for op_data in operations_data:
-                    try:
-                        operation_key = op_data.get('Операция_Key', '').strip()
-                        planned_quantity = op_data.get('КоличествоПлан', 0.0)
-                        time_norm = op_data.get('НормаВремени', 0.0)
-                        standard_hours = op_data.get('Нормочасы', 0.0)
-                        stage_key = op_data.get('Этап_Key', '').strip()
-
-                        if not operation_key:
-                            continue
-
-                        # Находим или создаем операцию
-                        operation = existing_operations.get(operation_key)
-                        if not operation:
-                            operation = Operation(
-                                operation_ref1c=operation_key,
-                                time_norm=time_norm
-                            )
-                            db.add(operation)
-                            operations_created += 1
-                        else:
-                            if operation.time_norm != time_norm:
-                                operation.time_norm = time_norm
-                                operations_updated += 1
-
-                        # Находим этап
-                        stage = existing_stages.get(stage_key) if stage_key else None
-
-                        # Создаем или обновляем операцию заказа
-                        existing_order_op = db.query(ProductionOperation).filter_by(
-                            order_id=current_order.order_id,
-                            operation_id=operation.operation_id
-                        ).first()
-
-                        if existing_order_op:
-                            if (existing_order_op.planned_quantity != planned_quantity or
-                                existing_order_op.time_norm != time_norm or
-                                existing_order_op.standard_hours != standard_hours or
-                                existing_order_op.stage_id != (stage.stage_id if stage else None)):
-                                existing_order_op.planned_quantity = planned_quantity
-                                existing_order_op.time_norm = time_norm
-                                existing_order_op.standard_hours = standard_hours
-                                existing_order_op.stage_id = stage.stage_id if stage else None
-                                # Не увеличиваем счетчик, так как это обновление
-                        else:
-                            new_order_op = ProductionOperation(
-                                order_id=current_order.order_id,
-                                operation_id=operation.operation_id,
-                                planned_quantity=planned_quantity,
-                                time_norm=time_norm,
-                                standard_hours=standard_hours,
-                                stage_id=stage.stage_id if stage else None
-                            )
-                            db.add(new_order_op)
-                            # Не увеличиваем счетчик, так как это создание
-
-                    except Exception as e:
-                        print(f"Ошибка обработки операции заказа {ref_key}: {e}")
                         continue
 
             except Exception as e:
@@ -327,10 +384,6 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
         stats.orders_unchanged = unchanged_count
         stats.products_created = products_created
         stats.products_updated = products_updated
-        stats.components_created = components_created
-        stats.components_updated = components_updated
-        stats.operations_created = operations_created
-        stats.operations_updated = operations_updated
 
         if req.dry_run:
             db.rollback()

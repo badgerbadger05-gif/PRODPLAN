@@ -4,6 +4,7 @@ import json
 import urllib.request
 import urllib.parse
 import urllib.error
+import time
 from typing import Dict, List, Optional, Any
 
 
@@ -21,7 +22,14 @@ class OData1CClient:
             "Content-Type": "application/json",
         }
 
-    def _make_request(self, endpoint: str, params: Optional[Dict[str, Any]] = None, timeout: int = 60) -> Dict[str, Any]:
+    def _make_request(
+        self,
+        endpoint: str,
+        params: Optional[Dict[str, Any]] = None,
+        timeout: int = 60,
+        retries: int = 4,
+        retry_backoff_sec: float = 1.0,
+    ) -> Dict[str, Any]:
         endpoint_clean = (endpoint or "").lstrip("/")
         endpoint_quoted = urllib.parse.quote(endpoint_clean, safe="$()_-,.=/'")
         url = f"{self.base_url}/{endpoint_quoted}"
@@ -44,26 +52,59 @@ class OData1CClient:
             print(f"[OData] {_dt.utcnow().isoformat()} GET {url}")
         except Exception:
             pass
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                data = response.read()
-                try:
-                    content_type = response.headers.get("Content-Type", "") or ""
-                except Exception:
-                    content_type = ""
-                text = data.decode("utf-8", errors="replace").strip()
-                if "application/json" in content_type.lower() or text.startswith("{") or text.startswith("["):
-                    return json.loads(text)
-                return {"_raw": text, "_content_type": content_type, "_url": url}
-        except urllib.error.HTTPError as e:
-            err_data = ""
+        last_err: Optional[Exception] = None
+        for attempt in range(0, max(0, int(retries)) + 1):
             try:
-                err_data = e.read().decode("utf-8", errors="replace")
-            except Exception:
-                pass
-            raise urllib.error.URLError(f"HTTP Error {e.code}: {e.reason}. URL: {url}. Details: {err_data}")
-        except urllib.error.URLError as e:
-            raise urllib.error.URLError(f"URL Error: {str(e)}. URL: {url}")
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    data = response.read()
+                    try:
+                        content_type = response.headers.get("Content-Type", "") or ""
+                    except Exception:
+                        content_type = ""
+                    text = data.decode("utf-8", errors="replace").strip()
+                    if "application/json" in content_type.lower() or text.startswith("{") or text.startswith("["):
+                        return json.loads(text)
+                    return {"_raw": text, "_content_type": content_type, "_url": url}
+
+            except urllib.error.HTTPError as e:
+                # Many 1C / reverse proxies respond with 503/504 under load.
+                # Retry a few times with backoff to reduce flakiness of manual sync.
+                err_data = ""
+                try:
+                    err_data = e.read().decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+                retryable = int(getattr(e, "code", 0) or 0) in {429, 500, 502, 503, 504}
+                if retryable and attempt < int(retries):
+                    # Respect Retry-After when present
+                    wait_s: Optional[float] = None
+                    try:
+                        ra = e.headers.get("Retry-After") if getattr(e, "headers", None) else None
+                        if ra:
+                            wait_s = float(ra)
+                    except Exception:
+                        wait_s = None
+                    if wait_s is None:
+                        wait_s = float(retry_backoff_sec) * (2 ** attempt)
+                    time.sleep(max(0.1, min(wait_s, 30.0)))
+                    last_err = e
+                    continue
+                raise urllib.error.URLError(
+                    f"HTTP Error {e.code}: {e.reason}. URL: {url}. Details: {err_data}"
+                )
+
+            except urllib.error.URLError as e:
+                # Network errors may be transient too (DNS/connection reset)
+                if attempt < int(retries):
+                    time.sleep(max(0.1, min(float(retry_backoff_sec) * (2 ** attempt), 30.0)))
+                    last_err = e
+                    continue
+                raise urllib.error.URLError(f"URL Error: {str(e)}. URL: {url}")
+
+        # Should be unreachable due to raises above
+        if last_err:
+            raise last_err
+        raise urllib.error.URLError(f"Unknown error. URL: {url}")
 
     @staticmethod
     def _sanitize_select_fields(select_fields: Optional[List[str]]) -> Optional[List[str]]:

@@ -8,6 +8,7 @@ from ..services.nomenclature_sync import sync_nomenclature_from_odata, Nomenclat
 from ..services.category_sync import sync_categories_from_odata, CategorySyncStats
 from ..services.specification_sync import sync_specifications_from_odata, SpecificationSyncStats
 from ..services.production_order_sync import sync_production_orders_from_odata, ProductionOrderSyncStats
+from ..services.production_order_export import export_production_orders_xlsx
 from ..services.supplier_order_sync import sync_supplier_orders_from_odata, SupplierOrderSyncStats
 from ..services.default_specification_sync import sync_default_specifications_from_odata, DefaultSpecificationSyncStats
 from ..services.production_stage_sync import sync_production_stages_from_odata, ProductionStageSyncStats
@@ -15,6 +16,8 @@ from ..services.production_stage_sync import sync_production_stages_from_odata, 
 from ..services.units_sync import sync_units_from_odata, backfill_units_from_items
 from ..services.operations_sync import sync_operations_from_odata, OperationsSyncStats
 from ..services.production_kind_sync import sync_production_kinds_from_odata, ProductionKindSyncStats
+
+from .. import models
 
 router = APIRouter(prefix="/v1/sync", tags=["sync"])
 
@@ -150,6 +153,71 @@ def sync_production_orders_odata(payload: ODataSyncRequest, db: Session = Depend
         return stats
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Sync error: {e}")
+
+
+@router.get("/production-orders-odata/export", response_model=dict)
+def export_production_orders(db: Session = Depends(get_db)):
+    """
+    Экспорт заказов на производство в Excel (XLSX, base64).
+    Данные берутся из БД (production_orders + production_products + items).
+    
+    Возвращает:
+    {
+      "status": "ok",
+      "format": "xlsx",
+      "data_base64": "<base64 encoded file>",
+      "filename": "production_orders_20260219_120000.xlsx",
+      "total_rows": 150,
+      "orders_count": 25
+    }
+    """
+    try:
+        result = export_production_orders_xlsx(db)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Export error: {e}")
+
+
+@router.get("/debug/production-order-states", response_model=dict)
+def debug_production_order_states(db: Session = Depends(get_db)):
+    """
+    Отладка: получение всех уникальных состояний заказов из 1С.
+    """
+    from ..services.odata_client import OData1CClient
+    from ..schemas import ODataSyncRequest
+    
+    # Получаем конфиг OData
+    config = db.query(models.ODataConfig).first()
+    if not config:
+        raise HTTPException(status_code=404, detail="OData config not found")
+    
+    client = OData1CClient(config.base_url, config.username, config.password)
+    
+    # Загружаем заказы с состояниями
+    data = client.get_all(
+        'Document_ЗаказНаПроизводство',
+        select_fields=['Ref_Key', 'Number', 'СостояниеЗаказа_Key', 'DeletionMark'],
+        top=1000,
+        max_pages=5
+    )
+    
+    states = {}
+    deleted_count = 0
+    for rec in data:
+        dm = rec.get('DeletionMark', False)
+        if dm is True or dm == "true":
+            deleted_count += 1
+            continue
+        key = str(rec.get('СостояниеЗаказа_Key', '') or '').strip()
+        if key and key not in states:
+            states[key] = rec.get('Number', '')
+    
+    return {
+        "total_loaded": len(data),
+        "deleted_count": deleted_count,
+        "active_states": states,
+        "sample_order": data[0] if data else None
+    }
 
 
 @router.post("/supplier-orders-odata", response_model=dict)

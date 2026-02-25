@@ -34,7 +34,17 @@
                 />
               </div>
               <div class="col-auto">
-                <q-btn color="primary" label="Загрузить" :loading="loading.page" @click="load()" />
+                <q-btn color="primary" label="Загрузить" :loading="loading.page" @click="load(false)" />
+              </div>
+              <div class="col-12 col-md-3">
+                <q-input
+                  v-model="selectedCloseDate"
+                  label="Закрываемая дата"
+                  dense
+                  outlined
+                  mask="####-##-##"
+                  placeholder="YYYY-MM-DD"
+                />
               </div>
 
               <div class="col-12 col-md-6">
@@ -197,6 +207,7 @@ const loading = ref({ page: false, save: false, close: false })
 const days = ref<ProductionReportWeekDay[]>([])
 const rows = ref<RowVM[]>([])
 const closeHint = ref<{ today: string; close_date: string; target_date: string } | null>(null)
+const selectedCloseDate = ref<string>('')
 
 // Track pending changes (dedupe by item_id|date)
 const pendingFacts = ref<Array<{ item_id: number; date: string; fact_qty: number }>>([])
@@ -241,10 +252,8 @@ const dayMetaMap = computed<Record<string, any>>(() => {
 })
 
 const rerunEditableDate = computed<string | null>(() => {
-  // Backend allows re-run corrections for D_close = previous_workday(today)
-  // even if this day already has close_status=CLOSED.
-  // UI should allow editing fact for this one day, so user can fix values and press "Закрыть день" again.
-  return closeHint.value?.close_date || null
+  // Backend allows re-run corrections for explicitly selected close day.
+  return selectedCloseDate.value || null
 })
 
 function isDateClosed(dateStr: string): boolean {
@@ -288,7 +297,7 @@ function projectFacts() {
   })
 }
 
-async function load(preferCloseWeek: boolean = true) {
+async function load(preferCloseWeek: boolean = false) {
   try {
     loading.value.page = true
 
@@ -309,6 +318,9 @@ async function load(preferCloseWeek: boolean = true) {
 
     days.value = data.days || []
     closeHint.value = (data.close_hint as any) || null
+    if (!selectedCloseDate.value) {
+      selectedCloseDate.value = String(closeHint.value?.close_date || '')
+    }
 
     const raw = (data.rows || []) as any[]
     rows.value = raw.map((r) => ({ ...r }))
@@ -366,7 +378,10 @@ async function save() {
   }
   try {
     loading.value.save = true
-    const resp = await bulkUpsertProductionReportFact({ entries: pendingFacts.value })
+    const resp = await bulkUpsertProductionReportFact({
+      entries: pendingFacts.value,
+      rerun_editable_date: selectedCloseDate.value || undefined,
+    })
     Notify.create({ type: 'positive', message: `Сохранено: ${resp.saved || 0}` })
     await load()
   } catch (e: any) {
@@ -382,12 +397,17 @@ async function save() {
 
 async function closeDay() {
   try {
-    const dClose = closeHint.value?.close_date
+    const dClose = selectedCloseDate.value || closeHint.value?.close_date
+    if (!dClose) {
+      Notify.create({ type: 'warning', message: 'Не выбрана дата закрытия' })
+      return
+    }
     const ok = window.confirm(`Закрыть день ${dClose || ''}? Перенос будет применён автоматически.`)
     if (!ok) return
 
     loading.value.close = true
-    const resp = await closeProductionReportDay({})
+    const resp = await closeProductionReportDay({ close_date: dClose })
+    selectedCloseDate.value = String(resp?.close_date || dClose)
     Notify.create({
       type: 'positive',
       message: `День закрыт: ${resp.close_date} → ${resp.target_date}`
@@ -412,7 +432,7 @@ function goWeek(deltaDays: number) {
     const d = new Date(anyDate.value)
     d.setDate(d.getDate() + deltaDays)
     anyDate.value = d.toISOString().slice(0, 10)
-    load()
+    load(false)
   } catch {
     // no-op
   }
@@ -434,8 +454,9 @@ const columns = computed(() => {
   const ds = (days.value || []).map(d => d.date)
   for (const d of ds) {
     const wknd = isWeekend(d)
-    const headerClass = wknd ? 'weekend-col' : ''
-    const cellClass = wknd ? 'weekend-cell' : ''
+    const isClosed = closeStatusMap.value[d] === 'CLOSED'
+    const headerClass = [wknd ? 'weekend-col' : '', isClosed ? 'closed-day-header' : ''].filter(Boolean).join(' ')
+    const cellClass = [wknd ? 'weekend-cell' : '', isClosed ? 'closed-day-cell' : ''].filter(Boolean).join(' ')
     cols.push({
       name: `day_${d}`,
       label: dayLabel(d),
@@ -479,7 +500,7 @@ function cellClass(props: any): string {
   const col = props?.col
   if (!col?.name?.startsWith('day_')) return ''
   const d = col.dateKey
-  if (isDateClosed(d)) return 'closed-day-cell'
+  if (closeStatusMap.value[d] === 'CLOSED') return 'closed-day-cell'
   return ''
 }
 
@@ -539,7 +560,11 @@ onMounted(() => {
 }
 
 .closed-day-cell {
-  opacity: 0.85;
+  background: #e8f5e9;
+}
+
+.production-report-table :deep(th.closed-day-header) {
+  background: #dcedc8;
 }
 
 .wide-table {

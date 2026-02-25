@@ -384,12 +384,14 @@ export async function getProductionReportWeek(body: {
 
 export async function bulkUpsertProductionReportFact(body: {
   entries: Array<{ item_id: number; date: string; fact_qty: number }>
+  rerun_editable_date?: string
 }): Promise<{ status: string; saved: number }> {
   const { data } = await api.post('/v1/plan/production_report/fact/bulk_upsert', body)
   return data
 }
 
 export async function closeProductionReportDay(body: {
+  close_date?: string | null
   closed_by?: string | null
 } = {}): Promise<any> {
   const { data } = await api.post('/v1/plan/production_report/day/close', body)

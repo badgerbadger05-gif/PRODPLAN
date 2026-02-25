@@ -170,6 +170,9 @@ class ProductionOrderBase(BaseModel):
     order_date: datetime
     order_ref1c: str
     is_posted: bool = False
+    order_state_key: Optional[str] = None
+    order_state_name: Optional[str] = None
+    deletion_mark: bool = False
 
 
 class ProductionOrderCreate(ProductionOrderBase):
@@ -192,6 +195,8 @@ class ProductionOrder(ProductionOrderBase):
 class ProductionProductBase(BaseModel):
     order_id: int
     item_id: int
+    line_number: Optional[int] = None
+    characteristic_ref1c: Optional[str] = None
     quantity: float
     spec_id: Optional[int] = None
     stage_id: Optional[int] = None
