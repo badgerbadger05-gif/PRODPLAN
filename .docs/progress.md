@@ -21,6 +21,148 @@
 
 ## Последняя сессия
 
+**2026-02-27 — точечные фиксы по ревью main (без изменения API-контрактов):**
+
+1) **Безопасность (секреты):**
+   - Удалены захардкоженные креды из исследовательских скриптов:
+     - `test_order_zsnf-000943.py`
+     - `backend/test_order_zsnf-000943.py`
+     - `test_compare.py`
+     - `backend/test_compare.py`
+     - дополнительно: `backend/test_register_balance.py`, `backend/test_register_single.py`.
+   - Скрипты переведены на переменные окружения `ODATA_USERNAME` / `ODATA_PASSWORD`.
+   - В `order_zsnf-000943_report.md` реальные учётные данные заменены на безопасный плейсхолдер.
+
+2) **Синхронизация факта выпуска (`sync_production_fact_from_odata`):**
+   - Убрано тихое отсечение данных:
+     - удалён лимит `order_keys[:200]`;
+     - удалён лимит `assembly_keys[:50]`.
+   - Сохранена устойчивость через поэтапную обработку и прогресс-логирование.
+   - Контракт возвращаемой статистики сохранён.
+
+3) **Фикс регрессии в `planning_service.py`:**
+   - Восстановлена корректная реализация `_read_last_stock_sync_at()` для чтения `config/last_sync_time.json`.
+   - Удалён недостижимый фрагмент кода после `return dict(reserved_by_component), warnings`.
+
+4) **Фильтрация заказов (`Posted`):**
+   - В `sync_production_orders_from_odata()` поле `Posted` добавлено в обязательные поля `effective_select_fields`.
+
+5) **Проверки:**
+   - `python -m pytest tests/test_stock_by_item_cache.py -q` → `4 passed`.
+   - Быстрая проверка синтаксиса:
+     - `python -m py_compile backend/app/services/production_order_sync.py backend/app/services/planning_service.py` → успешно.
+
+**2026-02-27 — внедрён учёт активных заказов 1С в MRP (A+B, рекурсивный резерв компонентов):**
+
+Реализованы изменения в расчёте планирования с защитой от перепроизводства:
+
+1) **Учёт A (как уже запланированный выпуск):**
+   - В [`build_planned_orders_and_purchases()`](backend/app/services/planning_service.py:2070) добавлен вычет активного `remaining_qty` заказов 1С из производственной потребности по `item_id`:
+     - `requested_qty_adj = max(requested_qty - active_remaining_qty, 0)`
+   - Если после вычета потребность `<= 0`, заказ на производство не создаётся.
+
+2) **Учёт B (занятие компонентов активными заказами 1С):**
+   - В [`run_planning_run()`](backend/app/services/planning_service.py:2560) добавлен расчёт `reserved_by_component` через рекурсивный взрыв BOM от `remaining_qty` активных заказов 1С.
+   - Перед созданием [`OrderQuantityCalculator`](backend/app/services/order_quantity_calculator.py:8) строится `effective_stock_by_item`:
+     - `effective_stock = max(stock - reserved, 0)`
+   - В калькулятор передаётся уже скорректированный склад (`stock_by_item=effective_stock_by_item`).
+
+3) **Фильтр активных заказов 1С в расчёте A/B:**
+   - Используется правило:
+     - `production_orders.deletion_mark = false`
+     - `lower(order_state_key) != DONE_STATE_KEY`
+     - `production_products.remaining_qty > 0`
+   - Константа `DONE_STATE_KEY` зафиксирована в [`planning_service.py`](backend/app/services/planning_service.py:72).
+
+4) **Безопасность рекурсии и защита от циклов BOM:**
+   - Добавлена функция [`_build_component_reservations_from_active_1c()`](backend/app/services/planning_service.py:1554) с:
+     - ограничением глубины (`planning.limits.max_bom_depth`, fallback 200),
+     - защитой от циклов по пути обхода,
+     - предупреждением `ACTIVE_1C_BOM_CYCLE_SKIPPED` при пропуске циклического ребра.
+
+5) **Тесты:**
+   - Расширен файл [`tests/test_stock_by_item_cache.py`](tests/test_stock_by_item_cache.py:1):
+     - проверка вычета A из потребности;
+     - проверка фильтра активных заказов 1С для агрегата `remaining_qty`;
+     - проверка рекурсивного резерва B и защиты от циклов;
+     - сохранён существующий кейс про `stock_by_item` и блокировку по компонентам.
+   - Прогон: `python -m pytest tests/test_stock_by_item_cache.py -q` → **4 passed**.
+
+6) **План валидации на реальных данных (контроль против перепроизводства):**
+   - Выполнить baseline-прогон MRP до включения изменений и сохранить:
+     - `planned_order` по изделиям,
+     - предупреждения по компонентам.
+   - После изменений повторить прогон на тех же входных данных и сравнить:
+     - для изделий с активными заказами 1С: снижение/обнуление `requested_qty` в пределах суммы `remaining_qty`;
+     - для компонент: рост предупреждений дефицита только там, где действительно есть резерв под активные заказы 1С;
+     - отсутствие строк с `qty <= 0`.
+   - Отдельно проверить контрольный кейс с частично выполненным заказом 1С (`remaining_qty > 0`) и убедиться, что объём нового выпуска в PRODPLAN не дублирует уже покрываемый объём 1С.
+
+**2026-02-26 — учёт выполнения заказов 1С (Сборка запасов) + улучшенный Excel-экспорт:**
+
+Реализовано полное отслеживание выполнения деталей по заказам на производство:
+
+1) **Модель БД** ([`models.py`](backend/app/models.py:168)):
+   - Добавлены поля в `ProductionProduct`:
+     - `produced_qty` — фактически выпущенное количество
+     - `remaining_qty` — остаток к выпуску (`quantity - produced_qty`)
+
+2) **Миграция Alembic** ([`20260226_01_add_produced_and_remaining_qty.py`](backend/alembic/versions/20260226_01_add_produced_and_remaining_qty.py)):
+   - Добавляет два поля в `production_products`
+   - Инициализирует `remaining_qty = quantity` (т.к. `produced_qty = 0`)
+
+3) **Синхронизация факта выпуска** ([`production_order_sync.py`](backend/app/services/production_order_sync.py:489)):
+   - Новая функция `sync_production_fact_from_odata()`
+   - Загружает `Document_СборкаЗапасов` и `Document_СборкаЗапасов_Продукция`
+   - Агрегирует `produced_qty` по `(order_ref1c, line_number, item_id, characteristic)`
+   - Обновляет `produced_qty` и `remaining_qty` в БД
+   - Фильтр: только `Posted == true` и `DeletionMark == false`
+   - Автоматически вызывается после `sync_production_orders_from_odata()`
+
+4) **API для факта** ([`sync.py`](backend/app/routers/sync.py:181)):
+   - Новый эндпоинт `POST /v1/sync/production-orders-fact-odata`
+   - Отдельный запуск синхронизации факта (опционально)
+
+5) **Excel-экспорт** ([`production_order_export.py`](backend/app/services/production_order_export.py:31)):
+   - **Группировка по заказам**: заказ = подзаголовок (синий фон, белый текст)
+   - **Детали заказа**: строки с чередованием цветов (zebra striping)
+   - **Колонки**: Номенклатура, Артикул, Характеристика, ЕИ, Заказано, Выполнено, Осталось
+   - Форматирование: границы, авто-ширина, слияние ячеек для подзаголовка
+
+6) **Исправления** (дополнительно):
+   - **Улучшен маппинг строк**: поиск `ProductionProduct` по приоритетам:
+     1) `(order_id, line_number)` — строгий матч
+     2) `(order_id, item_id, characteristic_ref1c)` — fallback
+     3) `(order_id, item_id)` — последний fallback
+   - **Правило "отсутствует = закрыт"**: заказы, которых нет в загрузке 1С, помечаются `deletion_mark = True`
+   - **Логирование**: детальные логи для отладки маппинга строк продукции
+
+**Результат:**
+- При синхронизации заказов автоматически загружается факт выполнения из 1С
+- Excel-файл показывает актуальное состояние: сколько заказано, выполнено, осталось
+- Визуально заказы сгруппированы с выделением цветом
+- Заказы, удалённые из 1С, автоматически закрываются в PRODPLAN
+
+---
+
+2026-02-26 — точечный фикс импорта производственных заказов 1С: устранена инверсия фильтра «активных» заказов в [`sync_production_orders_from_odata()`](backend/app/services/production_order_sync.py:86):
+
+- В OData-фильтр зафиксировано правило активного заказа: `DeletionMark eq false and (СостояниеЗаказа_Key ne guid'<DONE_STATE_KEY>')`.
+- Усилена защита от некорректного `select_fields`: в запрос принудительно добавляются поля `DeletionMark` и `СостояниеЗаказа_Key`, даже если пришёл кастомный набор полей.
+- Сохранён второй слой защиты на уровне приложения (post-filter) перед записью в БД.
+- Добавлена отдельная диагностика для записей без критичных полей фильтрации (`missing filter fields`) — такие записи исключаются из обработки.
+- Локальная проверка синтаксиса: `python -m py_compile backend/app/services/production_order_sync.py` — успешно.
+
+2026-02-26 — дополнительный фикс после диагностики «загружено 93, отфильтровано DeletionMark=true: 93»:
+
+- По логам backend выявлено, что поле `DeletionMark` может приходить в нестандартном скалярном формате (не только `bool`/`str`).
+- В [`_parse_1c_bool()`](backend/app/services/production_order_sync.py:49) добавлена безопасная обработка:
+  - словарных обёрток (`{"value": ...}`, `{"Value": ...}` и синонимы);
+  - числовых значений `0/1` как bool;
+  - строгий fallback в `default` вместо `bool(val)`, чтобы избежать ложных `True`.
+- Цель: исключить ложную интерпретацию `DeletionMark` как `true` и восстановить корректную загрузку активных заказов.
+- Локальная проверка синтаксиса: `python -m py_compile backend/app/services/production_order_sync.py` — успешно.
+
 2026-02-19 — исправлена фильтрация «активных» заказов на производство 1С (удалённые/завершённые больше не должны попадать в синх и экспорт):
 
 - В [`sync_production_orders_from_odata()`](backend/app/services/production_order_sync.py:60):

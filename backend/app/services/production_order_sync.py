@@ -50,8 +50,22 @@ def _parse_1c_bool(val, default: bool = False) -> bool:
     """Корректная обработка boolean значений из 1С OData."""
     if val is None:
         return default
+    # Иногда 1С/прокси возвращают scalar в обёртке-словаре
+    # (например {"value": false} или {"Value": "false"}).
+    if isinstance(val, dict):
+        for k in ("value", "Value", "val", "boolean", "Boolean"):
+            if k in val:
+                return _parse_1c_bool(val.get(k), default)
+        return default
     if isinstance(val, bool):
         return val
+    if isinstance(val, (int, float)):
+        # Для числовых значений принимаем только 0/1 как валидные bool.
+        if val == 1:
+            return True
+        if val == 0:
+            return False
+        return default
     if isinstance(val, str):
         v = val.strip().lower()
         # EN
@@ -66,11 +80,11 @@ def _parse_1c_bool(val, default: bool = False) -> bool:
             return False
         # fallback
         return default
-    return bool(val)
+    return default
 
 
 def _norm_guid(val) -> str:
-    """Нормализация GUID для сравнения (lowercase, без фигурных скобок и обёрток)."""
+    """Нормализация GUID для сравнения (lowercase, без фигурных скобок, кавычек и обёрток)."""
     s = str(val or "").strip().lower()
     if not s:
         return ""
@@ -80,6 +94,9 @@ def _norm_guid(val) -> str:
     # guid'xxxxxxxx-xxxx-...'
     if s.startswith("guid'") and s.endswith("'"):
         s = s[len("guid'") : -1].strip()
+    # 'xxxxxxxx-xxxx-...' (1С возвращает GUID в одинарных кавычках)
+    if s.startswith("'") and s.endswith("'"):
+        s = s[1:-1].strip()
     return s
 
 
@@ -121,10 +138,26 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
             "СостояниеЗаказа_Key",
         ]
         
-        # Фильтр: только не удалённые заказы.
-        # Состояние фильтруем в коде — 1С может некорректно обрабатывать `ne guid'...'`.
+        # Фильтр активных заказов:
+        # - DeletionMark == false
+        # - СостояниеЗаказа_Key != DONE_STATE_KEY
+        # Дублируем фильтрацию в коде, т.к. 1С/прокси иногда частично игнорируют условия.
         DONE_STATE_KEY = _norm_guid("ad28565a-991b-11eb-e39a-fa163e61326a")
-        default_filter = "DeletionMark eq false"
+        # Серверный фильтр:
+        # - Posted eq true (1С корректно фильтрует опубликованные)
+        # - СостояниеЗаказа_Key != guid'...' (Завершен)
+        # DeletionMark фильтруем в коде, т.к. 1С игнорирует этот фильтр.
+        default_filter = (
+            "Posted eq true and "
+            f"(СостояниеЗаказа_Key ne guid'{DONE_STATE_KEY}')"
+        )
+
+        # Даже если клиент прислал кастомный select_fields, принудительно добавляем
+        # поля, нужные для корректной фильтрации активных заказов.
+        effective_select_fields = list(req.select_fields or orders_select_default)
+        for required_field in ("Posted", "DeletionMark", "СостояниеЗаказа_Key"):
+            if required_field not in effective_select_fields:
+                effective_select_fields.append(required_field)
 
         # Если пользователь передал доп. фильтр — учитываем его, но не даём вытащить удалённые.
         # (Защита от "перевёрнутой" выгрузки.)
@@ -135,21 +168,50 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
         order_data = client.get_all(
             req.entity_name,
             filter_query=effective_filter,
-            select_fields=req.select_fields or orders_select_default,
+            select_fields=effective_select_fields,
             top=1000,
             max_pages=1000,
             order_by="Ref_Key",
         )
 
+        # Диагностика: посмотреть "сырые" значения полей, которые участвуют в фильтрации.
+        # Это нужно, чтобы выявить расхождение между серверным OData-фильтром и пост-фильтром приложения.
+        for i, rec in enumerate(order_data[:5]):
+            raw_dm = rec.get("DeletionMark")
+            raw_posted = rec.get("Posted")
+            raw_state = rec.get("СостояниеЗаказа_Key")
+            print(
+                f"[DEBUG RAW {i}] Ref_Key={rec.get('Ref_Key')}, Number={rec.get('Number')}, "
+                f"DeletionMark={raw_dm!r} (type={type(raw_dm).__name__}, parsed={_parse_1c_bool(raw_dm, False)}), "
+                f"Posted={raw_posted!r} (type={type(raw_posted).__name__}, parsed={_parse_1c_bool(raw_posted, False)}), "
+                f"СостояниеЗаказа_Key={raw_state!r}"
+            )
+
         # Дублируем фильтр на уровне приложения: 1С / прокси иногда игнорируют часть условий.
         removed_by_dm = 0
         removed_by_state = 0
+        removed_by_posted = 0
+        removed_by_missing_filter_fields = 0
         filtered_orders = []
         for rec in order_data:
+            # Проверяем наличие обязательных полей
+            if rec.get("СостояниеЗаказа_Key") is None:
+                removed_by_missing_filter_fields += 1
+                continue
+
+            # Фильтр DeletionMark: только не удалённые
+            # (1С может не возвращать это поле, считаем False если отсутствует)
             dm = _parse_1c_bool(rec.get("DeletionMark"), False)
             if dm:
                 removed_by_dm += 1
                 continue
+            
+            # Фильтр Posted: только опубликованные заказы
+            posted = _parse_1c_bool(rec.get("Posted"), False)
+            if not posted:
+                removed_by_posted += 1
+                continue
+            
             state_key = _norm_guid(rec.get("СостояниеЗаказа_Key"))
             if state_key and state_key == DONE_STATE_KEY:
                 removed_by_state += 1
@@ -158,7 +220,9 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
 
         print(
             f"[DEBUG] Загружено: {len(order_data)}, "
+            f"отфильтровано missing filter fields: {removed_by_missing_filter_fields}, "
             f"отфильтровано DeletionMark=true: {removed_by_dm}, "
+            f"отфильтровано Posted=false: {removed_by_posted}, "
             f"отфильтровано state=DONE: {removed_by_state}, "
             f"итого к обработке: {len(filtered_orders)}"
         )
@@ -225,7 +289,7 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
                         select_fields=products_select,
                         top=1000,
                         max_pages=1000,
-                        order_by="Ref_Key",
+                        order_by="LineNumber",
                     )
                     for pr in rows:
                         rk = str((pr.get("Ref_Key") or "")).strip()
@@ -357,12 +421,16 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
                                 existing_product.characteristic_ref1c = characteristic_key
                                 products_updated += 1
                         else:
+                            # Создаём новую строку продукции
+                            # remaining_qty = quantity т.к. produced_qty = 0 для новой строки
                             new_product = ProductionProduct(
                                 order_id=current_order.order_id,
                                 item_id=item.item_id,
                                 line_number=line_number,
                                 characteristic_ref1c=characteristic_key,
                                 quantity=quantity,
+                                produced_qty=0.0,
+                                remaining_qty=quantity,
                                 spec_id=spec.spec_id if spec else None,
                                 stage_id=stage.stage_id if stage else None
                             )
@@ -388,10 +456,214 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
         if req.dry_run:
             db.rollback()
         else:
+            # Правило: "отсутствует в загрузке = закрыт"
+            # Помечаем все заказы, которых нет в текущей выгрузке 1С, как удалённые
+            loaded_order_refs = set(order_keys)
+            orders_to_close = []
+            for order in db.query(ProductionOrder).filter(ProductionOrder.deletion_mark == False).all():
+                if order.order_ref1c and order.order_ref1c not in loaded_order_refs:
+                    orders_to_close.append(order)
+            
+            if orders_to_close:
+                print(f"[SYNC] Closing {len(orders_to_close)} orders not found in 1C load")
+                for order in orders_to_close:
+                    order.deletion_mark = True
+            
             db.commit()
+
+            # После успешной синхронизации заказов и продукции,
+            # загружаем факт выпуска из сборок (Сборка запасов)
+            # и обновляем produced_qty / remaining_qty
+            try:
+                fact_stats = sync_production_fact_from_odata(db, req)
+                print(f"[FACT SYNC] Assemblies: {fact_stats.get('assemblies_loaded', 0)}, "
+                      f"Products: {fact_stats.get('assembly_products_loaded', 0)}, "
+                      f"Updated: {fact_stats.get('products_updated', 0)}")
+            except Exception as e:
+                print(f"[FACT SYNC WARNING] {e}")
+                # Не прерываем основную синхронизацию из-за ошибки факта
 
     except Exception as e:
         db.rollback()
         raise Exception(f"Ошибка синхронизации заказов на производство: {e}")
 
     return asdict(stats)
+
+
+def sync_production_fact_from_odata(db: Session, req: ODataSyncRequest) -> Dict[str, any]:
+    """
+    Синхронизация факта выпуска из 1С через OData.
+    
+    Источник: Document_СборкаЗапасов и Document_СборкаЗапасов_Продукция.
+    
+    Алгоритм:
+    1. Загружаем все активные заказы из БД для маппинга
+    2. Для каждого заказа загружаем СборкаЗапасов с фильтром по ЗаказНаПроизводство_Key
+    3. Загружаем продукцию сборок
+    4. Агрегируем produced_qty по (order_ref1c, item_ref1c, characteristic_ref1c)
+    5. Обновляем ProductionProduct.produced_qty и remaining_qty
+    """
+    from ..services.odata_client import OData1CClient
+    from ..models import Item
+    
+    stats = {
+        "assemblies_loaded": 0,
+        "assembly_products_loaded": 0,
+        "products_updated": 0,
+        "errors": [],
+        "dry_run": bool(req.dry_run),
+    }
+    
+    try:
+        client = OData1CClient(req.base_url, req.username, req.password, req.token)
+
+        # --- 1) Загружаем все активные заказы из БД для маппинга ---
+        orders_by_ref1c = {
+            order.order_ref1c: order
+            for order in db.query(ProductionOrder).filter(
+                ProductionOrder.deletion_mark == False
+            ).all()
+        }
+
+        if not orders_by_ref1c:
+            stats["dry_run"] = True
+            return stats
+
+        # --- 2) Загружаем СборкаЗапасов для каждого заказа ---
+        # Агрегация produced_qty по (order_ref1c, item_ref1c, characteristic_ref1c)
+        produced_agg: DefaultDict[Tuple[str, str, str], float] = defaultdict(float)
+        
+        order_keys = list(orders_by_ref1c.keys())
+        print(f"[FACT SYNC] Processing {len(order_keys)} orders")
+
+        # Загружаем сборки для каждого заказа отдельно (чтобы избежать проблем с длинными URL)
+        for i, order_ref1c in enumerate(order_keys):
+            if i % 20 == 0:
+                print(f"[FACT SYNC] Progress: {i}/{len(order_keys)}")
+            
+            try:
+                # Загружаем сборки для заказа
+                assemblies = client.get_all(
+                    "Document_СборкаЗапасов",
+                    filter_query=f"ЗаказНаПроизводство_Key eq guid'{order_ref1c}' and Posted eq true",
+                    select_fields=["Ref_Key", "ЗаказНаПроизводство_Key", "DeletionMark"],
+                    top=1000,
+                    max_pages=10,
+                )
+                
+                # Фильтруем DeletionMark в коде
+                assembly_keys = []
+                for asm in assemblies:
+                    dm = _parse_1c_bool(asm.get("DeletionMark"), False)
+                    if not dm:
+                        ak = str(asm.get("Ref_Key") or "").strip()
+                        if ak:
+                            assembly_keys.append(ak)
+                            stats["assemblies_loaded"] += 1
+                
+                if not assembly_keys:
+                    continue
+                
+                # Загружаем продукцию сборок
+                # Используем expand чтобы получить продукцию одним запросом
+                for j, assembly_key in enumerate(assembly_keys):
+                    if j % 50 == 0:
+                        print(f"[FACT SYNC] Order {order_ref1c}: assembly products progress {j}/{len(assembly_keys)}")
+                    try:
+                        assembly_products = client.get_all(
+                            "Document_СборкаЗапасов_Продукция",
+                            filter_query=f"Ref_Key eq guid'{assembly_key}'",
+                            select_fields=["Номенклатура_Key", "Характеристика_Key", "Количество"],
+                            top=1000,
+                            max_pages=5,
+                        )
+                        
+                        for prod in assembly_products:
+                            item_key = str(prod.get("Номенклатура_Key", "") or "").strip()
+                            char_key = str(prod.get("Характеристика_Key", "") or "").strip() or ""
+                            try:
+                                qty = float(prod.get("Количество", 0.0) or 0.0)
+                            except Exception:
+                                qty = 0.0
+                            
+                            if not item_key:
+                                continue
+                            
+                            # Агрегируем по (order, item, characteristic)
+                            agg_key = (order_ref1c, item_key, char_key)
+                            produced_agg[agg_key] += qty
+                            stats["assembly_products_loaded"] += 1
+                            
+                    except Exception as e:
+                        print(f"[FACT SYNC] Error loading assembly products: {e}")
+                        continue
+                        
+            except Exception as e:
+                print(f"[FACT SYNC] Error for order {order_ref1c}: {e}")
+                stats["errors"].append(f"Order {order_ref1c}: {e}")
+                continue
+
+        if not produced_agg:
+            print("[FACT SYNC] No production facts found")
+            stats["dry_run"] = True
+            return stats
+
+        # --- 3) Обновляем ProductionProduct ---
+        products_updated = 0
+        products_not_found = 0
+
+        for (order_ref1c, item_ref1c, char_ref1c), produced_qty in produced_agg.items():
+            if order_ref1c not in orders_by_ref1c:
+                continue
+
+            order = orders_by_ref1c[order_ref1c]
+
+            # Находим ProductionProduct по (order_id, item_id, characteristic_ref1c)
+            product = None
+
+            # Находим item по item_ref1c
+            item = db.query(Item).filter_by(item_ref1c=item_ref1c).first()
+            if not item:
+                products_not_found += 1
+                continue
+
+            # Поиск с characteristic (если есть)
+            if char_ref1c:
+                product = db.query(ProductionProduct).filter_by(
+                    order_id=order.order_id,
+                    item_id=item.item_id,
+                    characteristic_ref1c=char_ref1c,
+                ).first()
+
+            # Поиск без characteristic
+            if not product:
+                product = db.query(ProductionProduct).filter_by(
+                    order_id=order.order_id,
+                    item_id=item.item_id,
+                ).first()
+
+            if product:
+                from decimal import Decimal
+                produced_qty_dec = Decimal(str(produced_qty))
+                product.produced_qty = float(produced_qty_dec)
+                product.remaining_qty = float(max(product.quantity - produced_qty_dec, Decimal('0')))
+                products_updated += 1
+            else:
+                products_not_found += 1
+
+        print(f"[FACT SYNC] Assemblies: {stats['assemblies_loaded']}, "
+              f"Products: {stats['assembly_products_loaded']}, "
+              f"Updated: {products_updated}, Not found: {products_not_found}")
+
+        stats["products_updated"] = products_updated
+
+        if req.dry_run:
+            db.rollback()
+        else:
+            db.commit()
+
+    except Exception as e:
+        db.rollback()
+        raise Exception(f"Ошибка синхронизации факта выпуска: {e}")
+
+    return stats

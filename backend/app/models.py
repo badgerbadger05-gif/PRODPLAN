@@ -178,11 +178,14 @@ class ProductionProduct(Base):
     line_number = Column(Integer, nullable=True, index=True)
     characteristic_ref1c = Column(String(36), nullable=True)
     quantity = Column(DECIMAL(10, 3), nullable=False)
+    # Fact tracking (from 1C Assembly/Сборка запасов)
+    produced_qty = Column(DECIMAL(10, 3), default=0.0, nullable=False)
+    remaining_qty = Column(DECIMAL(10, 3), nullable=False)
     spec_id = Column(Integer, ForeignKey('specifications.spec_id'), nullable=True)
     stage_id = Column(Integer, ForeignKey('production_stages.stage_id'), nullable=True)
     created_at = Column(TIMESTAMP, default=func.now())
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
-    
+
     # Relationship для обратного доступа к заказу
     order = relationship("ProductionOrder", back_populates="products")
     item = relationship("Item", back_populates="production_products")

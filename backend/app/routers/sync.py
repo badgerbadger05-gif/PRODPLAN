@@ -7,7 +7,7 @@ from ..services.odata_stock_sync import sync_stock_from_odata
 from ..services.nomenclature_sync import sync_nomenclature_from_odata, NomenclatureSyncStats
 from ..services.category_sync import sync_categories_from_odata, CategorySyncStats
 from ..services.specification_sync import sync_specifications_from_odata, SpecificationSyncStats
-from ..services.production_order_sync import sync_production_orders_from_odata, ProductionOrderSyncStats
+from ..services.production_order_sync import sync_production_orders_from_odata, ProductionOrderSyncStats, sync_production_fact_from_odata
 from ..services.production_order_export import export_production_orders_xlsx
 from ..services.supplier_order_sync import sync_supplier_orders_from_odata, SupplierOrderSyncStats
 from ..services.default_specification_sync import sync_default_specifications_from_odata, DefaultSpecificationSyncStats
@@ -160,7 +160,7 @@ def export_production_orders(db: Session = Depends(get_db)):
     """
     Экспорт заказов на производство в Excel (XLSX, base64).
     Данные берутся из БД (production_orders + production_products + items).
-    
+
     Возвращает:
     {
       "status": "ok",
@@ -176,6 +176,32 @@ def export_production_orders(db: Session = Depends(get_db)):
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Export error: {e}")
+
+
+@router.post("/production-orders-fact-odata", response_model=dict)
+def sync_production_orders_fact_odata(payload: ODataSyncRequest, db: Session = Depends(get_db)):
+    """
+    Синхронизация факта выпуска из 1С через OData.
+    Загружает данные из Document_СборкаЗапасов и обновляет produced_qty/remaining_qty.
+    
+    Тело запроса (как для ODataSyncRequest):
+    {
+      "base_url": "http://srv-1c:8080/base/odata/standard.odata",
+      "entity_name": "Document_СборкаЗапасов",
+      "username": "user",
+      "password": "pass",
+      "token": null,
+      "filter_query": null,
+      "select_fields": null,
+      "dry_run": false,
+      "zero_missing": false
+    }
+    """
+    try:
+        stats = sync_production_fact_from_odata(db, payload)
+        return stats
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sync error: {e}")
 
 
 @router.get("/debug/production-order-states", response_model=dict)

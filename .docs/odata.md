@@ -11,3 +11,30 @@ Backend синхронизирует справочники из 1С в PostgreS
 - Остатки в 1С читаются через ресурс регистра **Balance**, а не через движения
 - Данные приходят пакетами, требуется аккуратная обработка (dry_run, прогресс)
 
+## Кодирование URL (важно!)
+
+**Проблема (2026-02-26):** 1С игнорировала фильтры OData, если пробелы в URL не были закодированы как `%20`.
+
+**Решение:** в `OData1CClient._make_request()` параметры кодируются вручную:
+```python
+# НЕ используйте urllib.parse.urlencode() — он не кодирует пробелы!
+query_parts = []
+for key, value in params.items():
+    key_encoded = urllib.parse.quote(str(key), safe='')
+    value_encoded = urllib.parse.quote(str(value), safe="$,()*'")
+    value_encoded = value_encoded.replace(' ', '%20')  # обязательно!
+    query_parts.append(f"{key_encoded}={value_encoded}")
+query_string = "&".join(query_parts)
+```
+
+## Фильтры OData
+
+1С УНФ корректно обрабатывает:
+- ✅ `Posted eq true`
+- ✅ `СостояниеЗаказа_Key ne guid'...'`
+
+1С УНФ **игнорирует**:
+- ❌ `DeletionMark eq false` (возвращает все заказы, включая удалённые)
+
+**Решение:** фильтровать `DeletionMark` в коде (post-фильтрация). См. `production_order_sync.py`.
+

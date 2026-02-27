@@ -33,6 +33,8 @@ from ..models import (
     ProductionKind,
     ResourceProductionKind,
     Specification,
+    ProductionOrder,
+    ProductionProduct,
 )
 from ..models import RootProduct
 from .stage_logic import determine_parent_stage_and_norm
@@ -68,6 +70,9 @@ DEFAULT_PLANNING_CONFIG: Dict[str, Any] = {
 # Pagination constants
 SERVER_MAX_LIMIT = 1000
 DEFAULT_PAGE_LIMIT = 50
+
+# 1C state key for completed production orders.
+DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
 
 
 def _ensure_dict(raw: Any) -> Dict[str, Any]:
@@ -1489,12 +1494,144 @@ def _read_last_stock_sync_at() -> Optional[str]:
     if not p.exists():
         return None
     try:
-        import json
         data = json.loads(p.read_text("utf-8") or "{}")
+        if not isinstance(data, dict):
+            return None
         val = str(data.get("last_sync") or "").strip()
         return val or None
     except Exception:
         return None
+
+
+def _get_active_1c_remaining_by_item(db: Session) -> Dict[int, float]:
+    """
+    Aggregate remaining qty from active 1C production orders by produced item.
+
+    Active 1C order filter:
+    - deletion_mark == false
+    - order_state_key != DONE_STATE_KEY
+    - production_products.remaining_qty > 0
+    """
+    try:
+        rows = (
+            db.query(
+                ProductionProduct.item_id,
+                func.sum(func.coalesce(ProductionProduct.remaining_qty, 0.0)).label("remaining_qty"),
+            )
+            .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+            .filter(ProductionOrder.deletion_mark.is_(False))
+            .filter(func.lower(func.coalesce(ProductionOrder.order_state_key, "")) != DONE_STATE_KEY)
+            .filter(func.coalesce(ProductionProduct.remaining_qty, 0.0) > 0)
+            .group_by(ProductionProduct.item_id)
+            .all()
+        )
+    except Exception:
+        rows = []
+
+    result: Dict[int, float] = {}
+    for iid, qty in rows:
+        try:
+            result[int(iid)] = float(qty or 0.0)
+        except Exception:
+            continue
+    return result
+
+
+def _build_component_reservations_from_active_1c(
+    db: Session,
+    default_spec_map: Dict[int, int],
+    components_loader: Callable[[int], List[SpecComponent]],
+    max_depth: int,
+) -> Tuple[Dict[int, float], List[Dict[str, Any]]]:
+    """
+    Build recursive component reservation map from active 1C orders.
+
+    For each active 1C order line with remaining_qty > 0:
+      reserve(component) += remaining_qty * qty_per_unit
+    with recursive BOM explosion and cycle protection.
+    """
+    warnings: List[Dict[str, Any]] = []
+    reserved_by_component: DefaultDict[int, float] = defaultdict(float)
+
+    try:
+        seed_rows = (
+            db.query(
+                ProductionProduct.item_id,
+                func.sum(func.coalesce(ProductionProduct.remaining_qty, 0.0)).label("remaining_qty"),
+            )
+            .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+            .filter(ProductionOrder.deletion_mark.is_(False))
+            .filter(func.lower(func.coalesce(ProductionOrder.order_state_key, "")) != DONE_STATE_KEY)
+            .filter(func.coalesce(ProductionProduct.remaining_qty, 0.0) > 0)
+            .group_by(ProductionProduct.item_id)
+            .all()
+        )
+    except Exception:
+        seed_rows = []
+
+    seen_cycle_edges: Set[Tuple[int, int]] = set()
+
+    def explode(parent_item_id: int, qty: float, depth: int, path: Set[int]) -> None:
+        if qty <= 1e-12:
+            return
+        if depth > int(max_depth):
+            return
+
+        spec_id = default_spec_map.get(int(parent_item_id))
+        if not spec_id:
+            return
+
+        comps = components_loader(int(spec_id)) or []
+        new_path = set(path)
+        new_path.add(int(parent_item_id))
+
+        for comp in comps:
+            try:
+                child_id = int(getattr(comp, "item_id"))
+                per_unit = float(getattr(comp, "quantity", 0.0) or 0.0)
+            except Exception:
+                continue
+            if per_unit <= 1e-12:
+                continue
+
+            # Cycle protection: do not reserve cycle edge and do not recurse into it.
+            if child_id in new_path:
+                cycle_edge = (int(parent_item_id), int(child_id))
+                if cycle_edge not in seen_cycle_edges:
+                    seen_cycle_edges.add(cycle_edge)
+                    warnings.append(
+                        make_warning(
+                            "ACTIVE_1C_BOM_CYCLE_SKIPPED",
+                            "Cycle detected during recursive reservation of components from active 1C orders",
+                            parent_item_id=int(parent_item_id),
+                            child_item_id=int(child_id),
+                            depth=int(depth),
+                        )
+                    )
+                continue
+
+            child_qty = float(qty) * float(per_unit)
+            if child_qty <= 1e-12:
+                continue
+
+            # Anti-duplicates policy:
+            # identical component from different roots/paths should be summed;
+            # only cyclic re-entrance is skipped above.
+            reserved_by_component[int(child_id)] += child_qty
+
+            explode(int(child_id), float(child_qty), depth + 1, new_path)
+
+    for iid, rem_qty in seed_rows:
+        try:
+            parent_id = int(iid)
+            q = float(rem_qty or 0.0)
+        except Exception:
+            continue
+        if q <= 1e-12:
+            continue
+        explode(parent_id, q, depth=1, path=set())
+
+    return dict(reserved_by_component), warnings
 
 
 # Backward-compatibility stub for tests that monkeypatch this symbol
@@ -1966,6 +2103,7 @@ def build_planned_orders_and_purchases(
     priority_manager: PriorityManager,
     item_cache: Dict[int, Item],
     units_by_ref: Dict[str, Unit],
+    active_remaining_by_item: Optional[Dict[int, float]] = None,
 ) -> Dict[str, Any]:
     
     run_id = run.run_id
@@ -1973,6 +2111,7 @@ def build_planned_orders_and_purchases(
     warnings = []
     created_orders = []
     created_purchases = []
+    active_remaining_by_item = active_remaining_by_item or {}
 
     all_reqs = []
     for item_id_str, buckets in net_requirements.items():
@@ -1988,7 +2127,8 @@ def build_planned_orders_and_purchases(
     for req in sorted(all_reqs, key=lambda x: x["need_date"]):
         item_id = req["item_id"]
         need_date = req["need_date"]
-        requested_qty = float(req["qty"] or 0.0)
+        requested_qty_raw = float(req["qty"] or 0.0)
+        requested_qty = float(requested_qty_raw)
         
         item = item_cache.get(item_id)
         if not item:
@@ -2037,6 +2177,13 @@ def build_planned_orders_and_purchases(
         is_produced = not is_purchase
         
         if is_produced:
+            # A) Active 1C orders as already-planned finished goods output:
+            # reduce new production need by active remaining qty from 1C.
+            active_remaining_qty = float(active_remaining_by_item.get(int(item_id), 0.0) or 0.0)
+            requested_qty = max(float(requested_qty_raw) - active_remaining_qty, 0.0)
+            if requested_qty <= 1e-9:
+                continue
+
             # Compute quantity with diagnostics (component_limit + horizon_limit)
             final_qty_before, normalized_qty, comp_details, comp_warnings = order_qty_calculator.compute(item_id, requested_qty)
             warnings.extend(comp_warnings)
@@ -2112,11 +2259,12 @@ def build_planned_orders_and_purchases(
         else:  # purchased
             lead_time = item.replenishment_time or 30
             order_date = need_date - timedelta(days=lead_time)
-            planned_qty = float(requested_qty)
+            # A) does not apply to purchase flow
+            planned_qty = float(requested_qty_raw)
             purchase = PlannedPurchase(
                 run_id=run_id,
                 item_id=item_id,
-                requested_qty=requested_qty,
+                requested_qty=requested_qty_raw,
                 planned_qty=planned_qty,
                 qty=planned_qty,
                 need_date=need_date,
@@ -2413,6 +2561,19 @@ def run_planning_run(
         def components_loader(spec_id: int) -> List[SpecComponent]:
             return db.query(SpecComponent).filter(SpecComponent.spec_id == spec_id).all()
 
+        # A) Active 1C orders as already planned finished output.
+        active_remaining_by_item = _get_active_1c_remaining_by_item(db)
+
+        # B) Active 1C orders reserve components recursively across full BOM depth.
+        limits_cfg = (run.config_snapshot or {}).get("planning", {}).get("limits", {})
+        max_bom_depth = int(limits_cfg.get("max_bom_depth", 200) or 200)
+        reserved_by_component, reserve_warnings = _build_component_reservations_from_active_1c(
+            db=db,
+            default_spec_map=default_spec_map,
+            components_loader=components_loader,
+            max_depth=max_bom_depth,
+        )
+
         all_resources = db.query(ProductionResource).all()
         res_by_id = {r.resource_id: r for r in all_resources}
 
@@ -2447,7 +2608,7 @@ def run_planning_run(
             logger.exception("Failed to prefetch component ids for stock cache: %s", ex)
             component_item_ids = set()
 
-        stock_item_ids: Set[int] = set(all_item_ids) | set(component_item_ids)
+        stock_item_ids: Set[int] = set(all_item_ids) | set(component_item_ids) | set(reserved_by_component.keys())
         stock_by_item: Dict[int, float] = {}
         if stock_item_ids:
             try:
@@ -2472,6 +2633,19 @@ def run_planning_run(
             )
         except Exception:
             pass
+
+        # Apply B) reservation map to stock cache (non-negative clamp).
+        effective_stock_by_item: Dict[int, float] = dict(stock_by_item)
+        for comp_id, reserved_qty in reserved_by_component.items():
+            try:
+                iid = int(comp_id)
+                reserve_val = float(reserved_qty or 0.0)
+            except Exception:
+                continue
+            if reserve_val <= 1e-12:
+                continue
+            base_stock = float(effective_stock_by_item.get(iid, 0.0) or 0.0)
+            effective_stock_by_item[iid] = max(base_stock - reserve_val, 0.0)
         
         # This is a simplification; in a real scenario, WIP would be calculated from open production orders
         wip_by_item = defaultdict(float)
@@ -2493,7 +2667,7 @@ def run_planning_run(
             units_by_ref=units_by_ref,
             res_by_id=res_by_id,
             production_kinds_by_resource=production_kinds_by_resource,
-            stock_by_item=stock_by_item,
+            stock_by_item=effective_stock_by_item,
             wip_by_item=wip_by_item,
             horizon_days=run.horizon_days,
             total_demand_by_item=total_demand_by_item,
@@ -2529,10 +2703,18 @@ def run_planning_run(
         op_cache = {o.operation_id: o for o in all_ops}
         
         all_warnings = []
+        all_warnings.extend(reserve_warnings)
 
         # --- PHASE 1: Build Orders and Purchases ---
         order_result = build_planned_orders_and_purchases(
-            db, run, net_requirements, order_qty_calculator, priority_manager, item_cache, units_by_ref
+            db,
+            run,
+            net_requirements,
+            order_qty_calculator,
+            priority_manager,
+            item_cache,
+            units_by_ref,
+            active_remaining_by_item=active_remaining_by_item,
         )
         all_warnings.extend(order_result["warnings"])
         db.flush()

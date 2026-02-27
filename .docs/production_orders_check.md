@@ -46,6 +46,47 @@
   - `deletion_mark == false`
   - `order_state_key != DONE_STATE_KEY`
 
+## Технические детали синхронизации (2026-02-26)
+
+### Проблема кодирования URL
+
+1С игнорировала фильтр `$filter=DeletionMark eq false` и возвращала все заказы (включая удалённые).
+
+**Причина:** `urllib.parse.urlencode()` не кодировала пробелы в `%20`, и 1С некорректно обрабатывала запрос.
+
+**Решение:** в [`odata_client.py`](backend/app/services/odata_client.py:33) параметры кодируются вручную:
+```python
+query_parts = []
+for key, value in params.items():
+    key_encoded = urllib.parse.quote(str(key), safe='')
+    value_encoded = urllib.parse.quote(str(value), safe="$,()*'")
+    value_encoded = value_encoded.replace(' ', '%20')  # пробелы → %20
+    query_parts.append(f"{key_encoded}={value_encoded}")
+query_string = "&".join(query_parts)
+```
+
+### Серверный фильтр OData
+
+1С корректно фильтрует по `Posted`, но игнорирует `DeletionMark`:
+
+```python
+# Серверный фильтр (1С обрабатывает корректно):
+default_filter = "Posted eq true and (СостояниеЗаказа_Key ne guid'<DONE_STATE_KEY>')"
+
+# Post-фильтрация в коде (1С игнорирует DeletionMark):
+if _parse_1c_bool(rec.get("DeletionMark"), False):
+    continue  # пропускаем удалённые
+```
+
+### Нормализация GUID
+
+1С возвращает GUID в одинарных кавычках (`'ad28565a-...'`), функция [`_norm_guid()`](backend/app/services/production_order_sync.py:86) обрабатывает все форматы:
+```python
+# {xxxxxxxx-xxxx-...}
+# guid'xxxxxxxx-xxxx-...'
+# 'xxxxxxxx-xxxx-...' (1С)
+```
+
 ## Область учёта активных заказов 1С (A/B)
 
 Активные заказы 1С учитываются **в двух местах**:

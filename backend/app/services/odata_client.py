@@ -34,7 +34,15 @@ class OData1CClient:
         endpoint_quoted = urllib.parse.quote(endpoint_clean, safe="$()_-,.=/'")
         url = f"{self.base_url}/{endpoint_quoted}"
         if params:
-            query_string = urllib.parse.urlencode(params, doseq=True, safe="/$,()'", encoding="utf-8")
+            # Кодируем параметры вручную для корректной обработки кириллицы и пробелов
+            query_parts = []
+            for key, value in params.items():
+                key_encoded = urllib.parse.quote(str(key), safe='')
+                # value кодируем полностью, затем заменяем пробелы на %20
+                value_encoded = urllib.parse.quote(str(value), safe="$,()*'")
+                value_encoded = value_encoded.replace(' ', '%20')
+                query_parts.append(f"{key_encoded}={value_encoded}")
+            query_string = "&".join(query_parts)
             url = f"{url}?{query_string}"
         request = urllib.request.Request(url)
         for k, v in self.default_headers.items():
