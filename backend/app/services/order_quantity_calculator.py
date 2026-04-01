@@ -68,7 +68,7 @@ class OrderQuantityCalculator:
         """
         warnings: List[Dict[str, Any]] = []
         item = self.item_by_id.get(int(item_id))
-        is_discrete = self._is_discrete_unit_by_item(int(item_id))
+        is_discrete = self.is_discrete_item(int(item_id))
 
         # 1) Buffer policy: timing shift only
         # Buffer_days is applied as date shift during net-first BOM explosion in planning_service.
@@ -78,10 +78,7 @@ class OrderQuantityCalculator:
         # 2) Horizon demand limit (integer for discrete units)
         total_horizon_demand = float(self.total_demand_by_item.get(int(item_id), 0.0) or 0.0)
         if is_discrete:
-            try:
-                total_horizon_demand = math.floor(total_horizon_demand + 1e-9)
-            except Exception:
-                total_horizon_demand = float(int(total_horizon_demand))
+            total_horizon_demand = self.normalize_qty_for_item(int(item_id), total_horizon_demand)
 
         # 3) Components availability limit (based on default spec if any)
         #    We compute it for diagnostics, rounding down to whole units for discrete parents.
@@ -97,7 +94,7 @@ class OrderQuantityCalculator:
         if final_qty < 0.0:
             final_qty = 0.0
         if is_discrete:
-            final_qty = float(math.floor(final_qty + 1e-9))
+            final_qty = self.normalize_qty_for_item(int(item_id), final_qty)
 
         # 5) Lot sizing for production with optimal_batch priority over buffer
         # Important: normalized_qty may exceed requested "final_qty" due to buffer/optimal batch preferences.
@@ -117,11 +114,44 @@ class OrderQuantityCalculator:
 
     # --- Internals ---
 
-    def _normalize_lot_qty(self, qty: float, min_qty: Optional[float], multiple: Optional[float], rounding: str) -> float:
+    def is_discrete_item(self, item_id: int) -> bool:
+        return self._is_discrete_unit_by_item(int(item_id))
+
+    def normalize_qty_for_item(self, item_id: int, qty: float) -> float:
+        """
+        Shared quantity normalization for MRP flows.
+
+        Current invariant for this iteration:
+        - discrete units -> floor to whole quantity
+        - non-discrete units -> keep fractional quantity
+
+        This helper is intentionally business-neutral and can be reused by
+        planning handlers without changing existing production behavior.
+        """
+        value = self._coerce_float(qty)
+        if value <= 0.0:
+            return 0.0
+        if self.is_discrete_item(int(item_id)):
+            return self._floor_to_whole_units(value)
+        return float(value)
+
+    def _coerce_float(self, value: Any) -> float:
         try:
-            q = float(qty or 0.0)
+            return float(value or 0.0)
         except Exception:
-            q = 0.0
+            return 0.0
+
+    def _floor_to_whole_units(self, qty: float) -> float:
+        value = self._coerce_float(qty)
+        if value <= 0.0:
+            return 0.0
+        try:
+            return float(math.floor(value + 1e-9))
+        except Exception:
+            return float(int(value))
+
+    def _normalize_lot_qty(self, qty: float, min_qty: Optional[float], multiple: Optional[float], rounding: str) -> float:
+        q = self._coerce_float(qty)
         if q <= 0.0:
             return 0.0
 

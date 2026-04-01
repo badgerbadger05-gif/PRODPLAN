@@ -9,8 +9,10 @@ export const ru = {
     tabs: {
       production: 'Заказы на производство',
       purchases: 'Заказы на закупку',
+      rework: 'Заказы на переработку',
       productionDetail: 'Производство (детально)',
       purchasesDetail: 'Закупки (детально)',
+      reworkDetail: 'Переработка (детально)',
       capacity: 'Мощности',
       pegging: 'Pegging',
       components: 'Компоненты заказа'

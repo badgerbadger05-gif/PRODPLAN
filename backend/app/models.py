@@ -44,6 +44,7 @@ class Item(Base):
     replenishment_method = Column(String(50))
     replenishment_time = Column(Integer)
     unit = Column(String(50))
+    category_id = Column(Integer, ForeignKey('item_categories.category_id'), nullable=True, index=True)
     stock_qty = Column(DECIMAL(10, 3), default=0.0)
     # Опциональная оптимальная партия для лот‑сайзинга (шт)
     optimal_batch = Column(DECIMAL(15, 3), nullable=True)
@@ -52,6 +53,7 @@ class Item(Base):
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
     
     # Relationship для доступа к продукции в заказах
+    category = relationship("ItemCategory", back_populates="items")
     production_products = relationship("ProductionProduct", back_populates="item")
 
 
@@ -72,8 +74,9 @@ class ItemCategory(Base):
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
 
     # Связи
-    parent = relationship("ItemCategory", remote_side=[category_id])
-    children = relationship("ItemCategory")
+    parent = relationship("ItemCategory", remote_side=[category_id], back_populates="children")
+    children = relationship("ItemCategory", back_populates="parent", overlaps="parent")
+    items = relationship("Item", back_populates="category")
 
 
 class Unit(Base):
@@ -476,6 +479,27 @@ class PlannedPurchase(Base):
     supplier_ref1c = Column(String(255), nullable=True)
 
 
+class PlannedRework(Base):
+    __tablename__ = "planned_rework"
+
+    rework_id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(Integer, ForeignKey("planning_run.run_id", ondelete="CASCADE"), nullable=False)
+    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False)
+    spec_id = Column(Integer, ForeignKey("specifications.spec_id"), nullable=True)
+    requested_qty = Column(DECIMAL(15, 3), nullable=False)
+    planned_qty = Column(DECIMAL(15, 3), nullable=False)
+    qty = Column(DECIMAL(15, 3), nullable=False)
+    need_date = Column(Date, nullable=False)
+    order_date = Column(Date, nullable=False)
+    lead_time_days = Column(Integer, nullable=False)
+    priority_index = Column(DECIMAL(10, 4), nullable=True)
+    bucket_date = Column(Date, nullable=False)
+    component_limit = Column(DECIMAL(15, 3), nullable=True)
+    component_blocked = Column(Boolean, nullable=False, default=False)
+    component_partial = Column(Boolean, nullable=False, default=False)
+    shortage = Column(CrossPlatformJSON, nullable=True)
+
+
 class CapacityLoad(Base):
     __tablename__ = "capacity_load"
     __table_args__ = (
@@ -565,5 +589,3 @@ class ForcedOrderResult(Base):
     # Component shortage breakdown / warnings in a stable JSON shape
     shortage = Column(CrossPlatformJSON, nullable=True)
     created_at = Column(TIMESTAMP, default=func.now())
-
-

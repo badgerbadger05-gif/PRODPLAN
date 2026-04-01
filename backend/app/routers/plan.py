@@ -29,6 +29,10 @@ from ..services.planning_service import (
     get_run_production,
     get_run_production_grouped,
     get_run_purchases,
+    get_run_purchases_grouped_by_category,
+    get_run_rework,
+    get_run_rework_grouped,
+    get_run_rework_grouped_by_category,
     get_run_capacity,
     get_run_pegging,
     compute_planning_preview,
@@ -41,7 +45,7 @@ from ..services.planning_service import (
     get_active_planning_config_full
 )
 from ..models import ProductionResource
-from ..schemas import ProductionGroupedResponse
+from ..schemas import ProductionGroupedResponse, PurchaseCategoryGroupedResponse, ReworkGroupedResponse
 from ..models import ForcedOrderRequest, ForcedOrderResult
 
 from ..services.forced_orders import (
@@ -49,6 +53,10 @@ from ..services.forced_orders import (
     process_forced_order_request,
     export_forced_order_xlsx,
     export_shortage_report_for_run,
+)
+from ..services.mrp_result_export import (
+    export_purchases_results_xlsx,
+    export_rework_results_xlsx,
 )
 
 router = APIRouter(prefix="/v1/plan", tags=["plan"])
@@ -635,6 +643,124 @@ async def get_planning_result_purchases_grouped(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.get("/results/{run_id}/rework")
+async def get_planning_result_rework(
+    run_id: int,
+    item_id: Optional[int] = None,
+    bucket_type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    sort_by: Optional[str] = None,
+    sort_dir: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """Заказы на переработку по прогону (с фильтрами и пагинацией)."""
+    try:
+        return get_run_rework(
+            db=db,
+            run_id=int(run_id),
+            item_id=item_id,
+            bucket_type=bucket_type,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit,
+            offset=offset,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/results/{run_id}/rework/grouped", response_model=ReworkGroupedResponse)
+async def get_planning_result_rework_grouped(
+    run_id: int,
+    item_id: Optional[int] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    sort_by: Optional[str] = None,
+    sort_dir: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """Группированная выдача заказов на переработку."""
+    try:
+        return get_run_rework_grouped(
+            db=db,
+            run_id=int(run_id),
+            item_id=item_id,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit,
+            offset=offset,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/results/{run_id}/purchases/grouped-by-category", response_model=PurchaseCategoryGroupedResponse)
+async def get_planning_result_purchases_grouped_by_category(
+    run_id: int,
+    item_id: Optional[int] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    sort_by: Optional[str] = None,
+    sort_dir: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """Группированная выдача закупок по товарным группам."""
+    try:
+        return get_run_purchases_grouped_by_category(
+            db=db,
+            run_id=int(run_id),
+            item_id=item_id,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit,
+            offset=offset,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/results/{run_id}/rework/grouped-by-category", response_model=ReworkGroupedResponse)
+async def get_planning_result_rework_grouped_by_category(
+    run_id: int,
+    item_id: Optional[int] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    sort_by: Optional[str] = None,
+    sort_dir: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """Группированная выдача заказов на переработку по товарным группам."""
+    try:
+        return get_run_rework_grouped_by_category(
+            db=db,
+            run_id=int(run_id),
+            item_id=item_id,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit,
+            offset=offset,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.get("/results/{run_id}/capacity")
 async def get_planning_result_capacity(
     run_id: int,
@@ -1036,28 +1162,15 @@ async def export_planning_result_purchases(
             ])
 
         if (format or "csv").lower() == "xlsx":
-            import io, base64
-            try:
-                from openpyxl import Workbook
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"openpyxl not available: {e}")
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "Purchases"
-            ws.append(headers)
-            for row in data_rows:
-                ws.append(row)
-            bio = io.BytesIO()
-            wb.save(bio)
-            bio.seek(0)
-            b64 = base64.b64encode(bio.read()).decode("utf-8")
-            return {
-                "status": "ok",
-                "format": "xlsx",
-                "data_base64": b64,
-                "filename": f"mrp_purchases_run_{run_id}.xlsx",
-                "total_rows": len(data_rows),
-            }
+            return export_purchases_results_xlsx(
+                db=db,
+                run_id=int(run_id),
+                item_id=None,
+                date_from=date_from,
+                date_to=date_to,
+                sort_by=sort_by,
+                sort_dir=sort_dir,
+            )
         else:
             import io, csv
             output = io.StringIO()
@@ -1072,6 +1185,104 @@ async def export_planning_result_purchases(
                 "filename": f"mrp_purchases_run_{run_id}.csv",
                 "total_rows": len(data_rows),
             }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/results/{run_id}/rework/export")
+async def export_planning_result_rework(
+    run_id: int,
+    format: str = "csv",
+    bucket_type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    sort_by: Optional[str] = None,
+    sort_dir: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Экспорт результатов «Переработка» в CSV или XLSX (base64).
+    XLSX группируется по товарным группам.
+    """
+    try:
+        res = get_run_rework(
+            db=db,
+            run_id=int(run_id),
+            item_id=None,
+            bucket_type=bucket_type,
+            date_from=date_from,
+            date_to=date_to,
+            limit=100000,
+            offset=0,
+            sort_by=sort_by,
+            sort_dir=sort_dir,
+        )
+        rows = res.get("rows", []) or []
+
+        headers = [
+            "Наименование",
+            "Артикул",
+            "Количество",
+            "Запрошено",
+            "К плану",
+            "ЕИ",
+            "Дата потребности",
+            "Дата запуска",
+            "Срок пополнения, дн.",
+            "Спецификация",
+            "Лимит по комплектующим",
+            "Статус комплектующих",
+        ]
+        data_rows = []
+        for r in rows:
+            if bool(r.get("component_blocked")):
+                status = "Заблокирован"
+            elif bool(r.get("component_partial")):
+                status = "Частично ограничен"
+            else:
+                status = "Без ограничений"
+
+            data_rows.append([
+                r.get("item_name") or "",
+                r.get("item_article") or "",
+                float(r.get("qty") or 0.0),
+                float(r.get("requested_qty") or 0.0),
+                float(r.get("planned_qty") or 0.0),
+                r.get("unit") or "",
+                r.get("need_date") or "",
+                r.get("order_date") or "",
+                int(r.get("lead_time_days") or 0),
+                r.get("spec_name") or r.get("spec_code") or "",
+                float(r.get("component_limit") or 0.0) if r.get("component_limit") is not None else "",
+                status,
+            ])
+
+        if (format or "csv").lower() == "xlsx":
+            return export_rework_results_xlsx(
+                db=db,
+                run_id=int(run_id),
+                item_id=None,
+                date_from=date_from,
+                date_to=date_to,
+                sort_by=sort_by,
+                sort_dir=sort_dir,
+            )
+
+        import io, csv
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(headers)
+        for row in data_rows:
+            writer.writerow(row)
+        return {
+            "status": "ok",
+            "format": "csv",
+            "data": output.getvalue(),
+            "filename": f"mrp_rework_run_{run_id}.csv",
+            "total_rows": len(data_rows),
+        }
     except HTTPException:
         raise
     except Exception as e:

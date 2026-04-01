@@ -18,6 +18,7 @@ from ..models import (
     PlannedOrder,
     PlannedOrderStage,
     PlannedPurchase,
+    PlannedRework,
     CapacityLoad,
     PeggingLink,
     Item,
@@ -35,6 +36,7 @@ from ..models import (
     Specification,
     ProductionOrder,
     ProductionProduct,
+    ItemCategory,
 )
 from ..models import RootProduct
 from .stage_logic import determine_parent_stage_and_norm
@@ -42,6 +44,11 @@ from .order_quantity_calculator import OrderQuantityCalculator
 from .priority_manager import PriorityManager
 from .capacity_scheduler import CapacityScheduler
 from .pegging_builder import PeggingBuilder
+from .replenishment import (
+    REPLENISHMENT_FLOW_PURCHASE,
+    REPLENISHMENT_FLOW_REWORK,
+    classify_replenishment_flow,
+)
 from .warnings import make_warning, log_warning
 
 # Default planning config fallback (aligned with Alembic seed)
@@ -355,6 +362,7 @@ def get_run_summary(db: Session, run_id: int) -> Dict[str, Any]:
 
     order_cnt = db.query(func.count(PlannedOrder.order_id)).filter(PlannedOrder.run_id == run_id).scalar() or 0
     purch_cnt = db.query(func.count(PlannedPurchase.purchase_id)).filter(PlannedPurchase.run_id == run_id).scalar() or 0
+    rework_cnt = db.query(func.count(PlannedRework.rework_id)).filter(PlannedRework.run_id == run_id).scalar() or 0
 
     cap_rows: List[CapacityLoad] = db.query(CapacityLoad).filter(CapacityLoad.run_id == run_id).all()
     overload_total = float(sum(float(x.overload_hours or 0.0) for x in cap_rows))
@@ -405,7 +413,11 @@ def get_run_summary(db: Session, run_id: int) -> Dict[str, Any]:
             "horizon_days": r.horizon_days,
             "pinned": bool(getattr(r, "pinned", False)),
         },
-        "counts": {"production_orders": int(order_cnt), "purchase_requests": int(purch_cnt)},
+        "counts": {
+            "production_orders": int(order_cnt),
+            "purchase_requests": int(purch_cnt),
+            "rework_requests": int(rework_cnt),
+        },
         "capacity": {"overload_total": overload_total, "overloaded_buckets": overloaded_buckets},
         "kpi": r.kpi or {},
         # keep original warnings for backward compatibility
@@ -1155,6 +1167,389 @@ def get_run_purchases(
         "rows": paginated_data,
         "total": int(total),
         "total_qty": float(total_qty_val),
+        "limit": int(effective_limit),
+        "offset": int(effective_offset),
+    }
+
+
+def _load_item_category_meta(db: Session, item_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+    unique_ids = sorted({int(iid) for iid in item_ids if iid is not None})
+    if not unique_ids:
+        return {}
+
+    rows = (
+        db.query(
+            Item.item_id,
+            ItemCategory.category_id,
+            ItemCategory.category_name,
+            ItemCategory.category_ref1c,
+        )
+        .outerjoin(ItemCategory, Item.category_id == ItemCategory.category_id)
+        .filter(Item.item_id.in_(unique_ids))
+        .all()
+    )
+
+    result: Dict[int, Dict[str, Any]] = {}
+    for item_id_val, category_id_val, category_name_val, category_ref1c_val in rows:
+        result[int(item_id_val)] = {
+            "group_id": int(category_id_val) if category_id_val is not None else None,
+            "group_name": (category_name_val or "").strip() or "Без товарной группы",
+            "group_ref1c": category_ref1c_val,
+        }
+    return result
+
+
+def get_run_purchases_grouped_by_category(
+    db: Session,
+    run_id: int,
+    item_id: Optional[int] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    sort_by: Optional[str] = None,
+    sort_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    purchases = get_run_purchases(
+        db=db,
+        run_id=run_id,
+        item_id=item_id,
+        bucket_type=None,
+        date_from=date_from,
+        date_to=date_to,
+        limit=100000,
+        offset=0,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+    )
+    rows = list((purchases or {}).get("rows", []) or [])
+    category_by_item = _load_item_category_meta(db, [int(row.get("item_id")) for row in rows if row.get("item_id") is not None])
+
+    groups_map: Dict[Optional[int], Dict[str, Any]] = {}
+    for row in rows:
+        item_id_val = int(row.get("item_id") or 0)
+        category_meta = category_by_item.get(item_id_val, {"group_id": None, "group_name": "Без товарной группы"})
+        group_id = category_meta.get("group_id")
+        group_name = category_meta.get("group_name") or "Без товарной группы"
+
+        if group_id not in groups_map:
+            groups_map[group_id] = {
+                "group_id": group_id,
+                "group_name": group_name,
+                "orders": [],
+                "sum_qty": 0.0,
+            }
+
+        order_entry = dict(row)
+        groups_map[group_id]["orders"].append(order_entry)
+        groups_map[group_id]["sum_qty"] += float(row.get("qty") or 0.0)
+
+    groups_list = list(groups_map.values())
+    groups_list.sort(key=lambda g: ((g.get("group_name") or "").lower(), 1 if g.get("group_id") is None else 0))
+
+    total_groups = len(groups_list)
+    total_orders = sum(len(group.get("orders", []) or []) for group in groups_list)
+    effective_limit = max(1, min(int(limit or DEFAULT_PAGE_LIMIT), SERVER_MAX_LIMIT))
+    effective_offset = max(0, int(offset or 0))
+    groups_page = groups_list[effective_offset: effective_offset + effective_limit]
+
+    return {
+        "groups": groups_page,
+        "total_groups": int(total_groups),
+        "total_orders": int(total_orders),
+        "limit": int(effective_limit),
+        "offset": int(effective_offset),
+    }
+
+
+def _query_run_rework_rows(
+    db: Session,
+    run_id: int,
+    item_id: Optional[int] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    q = (
+        db.query(
+            PlannedRework,
+            Item.item_name,
+            Item.item_article,
+            Item.unit,
+            Unit.short_name,
+            Unit.unit_name,
+            Unit.unit_code,
+            Specification.spec_code,
+            Specification.spec_name,
+        )
+        .outerjoin(Item, PlannedRework.item_id == Item.item_id)
+        .outerjoin(Unit, Item.unit == Unit.unit_ref1c)
+        .outerjoin(Specification, PlannedRework.spec_id == Specification.spec_id)
+        .filter(PlannedRework.run_id == run_id)
+    )
+    if item_id is not None:
+        q = q.filter(PlannedRework.item_id == int(item_id))
+
+    rows_joined = q.all()
+    date_from_dt = _to_date(date_from) if date_from else None
+    date_to_dt = _to_date(date_to) if date_to else None
+
+    data: List[Dict[str, Any]] = []
+    for row in rows_joined:
+        (
+            rework,
+            item_name,
+            item_article,
+            unit_guid,
+            unit_short,
+            unit_name,
+            unit_code,
+            spec_code,
+            spec_name,
+        ) = row
+
+        bucket_dt = rework.bucket_date
+        if date_from_dt and (bucket_dt is None or bucket_dt < date_from_dt):
+            continue
+        if date_to_dt and (bucket_dt is None or bucket_dt > date_to_dt):
+            continue
+
+        unit_display = (unit_short or unit_name or unit_code or unit_guid or "").strip()
+        shortage_payload = _ensure_dict(getattr(rework, "shortage", None)) or None
+
+        data.append(
+            {
+                "rework_id": int(rework.rework_id),
+                "item_id": int(rework.item_id),
+                "item_name": item_name,
+                "item_article": item_article,
+                "unit": unit_display,
+                "requested_qty": float(rework.requested_qty or 0.0),
+                "planned_qty": float(rework.planned_qty or 0.0),
+                "qty": float(rework.qty or 0.0),
+                "need_date": rework.need_date.isoformat() if rework.need_date else None,
+                "order_date": rework.order_date.isoformat() if rework.order_date else None,
+                "lead_time_days": int(rework.lead_time_days or 0),
+                "priority_index": float(rework.priority_index or 0.0) if rework.priority_index is not None else None,
+                "bucket_type": "daily",
+                "bucket_date": rework.bucket_date.isoformat() if rework.bucket_date else None,
+                "spec_id": int(rework.spec_id) if rework.spec_id is not None else None,
+                "spec_code": spec_code,
+                "spec_name": spec_name,
+                "component_limit": float(rework.component_limit or 0.0) if rework.component_limit is not None else None,
+                "component_blocked": bool(getattr(rework, "component_blocked", False)),
+                "component_partial": bool(getattr(rework, "component_partial", False)),
+                "shortage": shortage_payload,
+            }
+        )
+
+    return data
+
+
+def get_run_rework(
+    db: Session,
+    run_id: int,
+    item_id: Optional[int] = None,
+    bucket_type: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    sort_by: Optional[str] = None,
+    sort_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    data = _query_run_rework_rows(
+        db=db,
+        run_id=run_id,
+        item_id=item_id,
+        date_from=date_from,
+        date_to=date_to,
+    )
+
+    sort_map = {
+        "item_name": lambda x: (x.get("item_name") or "").lower(),
+        "item_article": lambda x: (x.get("item_article") or "").lower(),
+        "qty": lambda x: float(x.get("qty") or 0.0),
+        "requested_qty": lambda x: float(x.get("requested_qty") or 0.0),
+        "planned_qty": lambda x: float(x.get("planned_qty") or 0.0),
+        "need_date": lambda x: x.get("need_date") or "",
+        "order_date": lambda x: x.get("order_date") or "",
+        "bucket_date": lambda x: x.get("bucket_date") or "",
+        "priority_index": lambda x: float(x.get("priority_index") or 0.0),
+        "spec_name": lambda x: (x.get("spec_name") or "").lower(),
+    }
+
+    sb = (sort_by or "bucket_date").strip().lower()
+    sd = (sort_dir or "asc").strip().lower()
+    key_fn = sort_map.get(sb, sort_map["bucket_date"])
+
+    try:
+        data.sort(key=key_fn, reverse=(sd == "desc"))
+    except TypeError:
+        data = [dict(row) for row in data]
+        data.sort(key=lambda x: str(key_fn(x)), reverse=(sd == "desc"))
+
+    total = len(data)
+    total_qty_val = float(sum(float(item.get("qty") or 0.0) for item in data))
+
+    req_limit = int(limit or DEFAULT_PAGE_LIMIT)
+    if req_limit > SERVER_MAX_LIMIT:
+        logger.debug(
+            "get_run_rework limit clamped: requested=%s, max=%s",
+            req_limit,
+            SERVER_MAX_LIMIT,
+        )
+    effective_limit = max(1, min(req_limit, SERVER_MAX_LIMIT))
+    effective_offset = max(0, int(offset or 0))
+
+    start_idx = effective_offset
+    end_idx = start_idx + effective_limit
+    paginated_data = data[start_idx:end_idx]
+
+    return {
+        "rows": paginated_data,
+        "total": int(total),
+        "total_qty": float(total_qty_val),
+        "limit": int(effective_limit),
+        "offset": int(effective_offset),
+    }
+
+
+def get_run_rework_grouped(
+    db: Session,
+    run_id: int,
+    item_id: Optional[int] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    sort_by: Optional[str] = None,
+    sort_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    rows = _query_run_rework_rows(
+        db=db,
+        run_id=run_id,
+        item_id=item_id,
+        date_from=date_from,
+        date_to=date_to,
+    )
+
+    row_sort = {
+        "item_name": lambda x: (x.get("item_name") or "").lower(),
+        "item_article": lambda x: (x.get("item_article") or "").lower(),
+        "qty": lambda x: float(x.get("qty") or 0.0),
+        "need_date": lambda x: x.get("need_date") or "",
+        "order_date": lambda x: x.get("order_date") or "",
+        "bucket_date": lambda x: x.get("bucket_date") or "",
+    }
+    row_key_fn = row_sort.get((sort_by or "need_date").strip().lower(), row_sort["need_date"])
+    rows.sort(key=row_key_fn, reverse=((sort_dir or "asc").strip().lower() == "desc"))
+
+    # Текущая модель items ещё не хранит явную связь строки результата с товарной группой,
+    # поэтому до следующей итерации backend выдаёт единый fallback-блок "Без товарной группы".
+    groups: List[Dict[str, Any]] = []
+    if rows:
+        fallback_group = {
+            "group_id": None,
+            "group_name": "Без товарной группы",
+            "orders": rows,
+            "sum_qty": float(sum(float(row.get("qty") or 0.0) for row in rows)),
+            "sum_requested_qty": float(sum(float(row.get("requested_qty") or 0.0) for row in rows)),
+            "sum_planned_qty": float(sum(float(row.get("planned_qty") or 0.0) for row in rows)),
+            "blocked_orders": int(sum(1 for row in rows if bool(row.get("component_blocked")))),
+            "partial_orders": int(sum(1 for row in rows if bool(row.get("component_partial")))),
+        }
+        groups.append(fallback_group)
+
+    total_groups = len(groups)
+    total_orders = sum(len(group.get("orders", []) or []) for group in groups)
+
+    req_limit = int(limit or DEFAULT_PAGE_LIMIT)
+    effective_limit = max(1, min(req_limit, SERVER_MAX_LIMIT))
+    effective_offset = max(0, int(offset or 0))
+    start_idx = effective_offset
+    end_idx = start_idx + effective_limit
+    groups_page = groups[start_idx:end_idx]
+
+    return {
+        "groups": groups_page,
+        "total_groups": int(total_groups),
+        "total_orders": int(total_orders),
+        "limit": int(effective_limit),
+        "offset": int(effective_offset),
+    }
+
+
+def get_run_rework_grouped_by_category(
+    db: Session,
+    run_id: int,
+    item_id: Optional[int] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    sort_by: Optional[str] = None,
+    sort_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    rows = _query_run_rework_rows(
+        db=db,
+        run_id=run_id,
+        item_id=item_id,
+        date_from=date_from,
+        date_to=date_to,
+    )
+
+    row_sort = {
+        "item_name": lambda x: (x.get("item_name") or "").lower(),
+        "item_article": lambda x: (x.get("item_article") or "").lower(),
+        "qty": lambda x: float(x.get("qty") or 0.0),
+        "need_date": lambda x: x.get("need_date") or "",
+        "order_date": lambda x: x.get("order_date") or "",
+        "bucket_date": lambda x: x.get("bucket_date") or "",
+    }
+    row_key_fn = row_sort.get((sort_by or "need_date").strip().lower(), row_sort["need_date"])
+    rows.sort(key=row_key_fn, reverse=((sort_dir or "asc").strip().lower() == "desc"))
+
+    category_by_item = _load_item_category_meta(db, [int(row.get("item_id")) for row in rows if row.get("item_id") is not None])
+    groups_map: Dict[Optional[int], Dict[str, Any]] = {}
+
+    for row in rows:
+        item_id_val = int(row.get("item_id") or 0)
+        category_meta = category_by_item.get(item_id_val, {"group_id": None, "group_name": "Без товарной группы"})
+        group_id = category_meta.get("group_id")
+        group_name = category_meta.get("group_name") or "Без товарной группы"
+
+        if group_id not in groups_map:
+            groups_map[group_id] = {
+                "group_id": group_id,
+                "group_name": group_name,
+                "orders": [],
+                "sum_qty": 0.0,
+                "sum_requested_qty": 0.0,
+                "sum_planned_qty": 0.0,
+                "blocked_orders": 0,
+                "partial_orders": 0,
+            }
+
+        groups_map[group_id]["orders"].append(dict(row))
+        groups_map[group_id]["sum_qty"] += float(row.get("qty") or 0.0)
+        groups_map[group_id]["sum_requested_qty"] += float(row.get("requested_qty") or 0.0)
+        groups_map[group_id]["sum_planned_qty"] += float(row.get("planned_qty") or 0.0)
+        groups_map[group_id]["blocked_orders"] += int(bool(row.get("component_blocked")))
+        groups_map[group_id]["partial_orders"] += int(bool(row.get("component_partial")))
+
+    groups_list = list(groups_map.values())
+    groups_list.sort(key=lambda g: ((g.get("group_name") or "").lower(), 1 if g.get("group_id") is None else 0))
+
+    total_groups = len(groups_list)
+    total_orders = sum(len(group.get("orders", []) or []) for group in groups_list)
+    effective_limit = max(1, min(int(limit or DEFAULT_PAGE_LIMIT), SERVER_MAX_LIMIT))
+    effective_offset = max(0, int(offset or 0))
+    groups_page = groups_list[effective_offset: effective_offset + effective_limit]
+
+    return {
+        "groups": groups_page,
+        "total_groups": int(total_groups),
+        "total_orders": int(total_orders),
         "limit": int(effective_limit),
         "offset": int(effective_offset),
     }
@@ -2111,6 +2506,7 @@ def build_planned_orders_and_purchases(
     warnings = []
     created_orders = []
     created_purchases = []
+    created_reworks = []
     active_remaining_by_item = active_remaining_by_item or {}
 
     all_reqs = []
@@ -2141,40 +2537,10 @@ def build_planned_orders_and_purchases(
             warnings.append(w)
             continue
 
-        # Helper: determine discreteness (whole units) by Unit settings
-        def _is_discrete_unit(it: Optional[Item]) -> bool:
-            try:
-                ref = getattr(it, "unit", None) if it is not None else None
-                u = units_by_ref.get(ref) if ref else None
-                if u is not None:
-                    try:
-                        prec = getattr(u, "precision", None)
-                        if prec is not None and int(prec) == 0:
-                            return True
-                    except Exception:
-                        pass
-                    short = str(getattr(u, "short_name", None) or "").strip().lower()
-                    if short in {"шт", "pcs", "pc"}:
-                        return True
-                    if short in {"кг", "kg", "м", "m", "мм", "cm", "л", "l"}:
-                        return False
-                # Fallback: treat as discrete
-                return True
-            except Exception:
-                return True
-
-        # Определение типа потока: производство или закупка.
-        # Логика согласована с документацией модуля расчёта заказов:
-        # если в наименовании способа пополнения содержится "покуп", "закуп", "purchase", "buy" —
-        # считаем, что это закупка; во всех остальных случаях — производство.
-        method_raw = str(getattr(item, "replenishment_method", "") or "").strip().lower()
-        is_purchase = False
-        if method_raw:
-            purchase_markers = ["покуп", "закуп", "purchase", "buy"]
-            if any(marker in method_raw for marker in purchase_markers):
-                is_purchase = True
-
-        is_produced = not is_purchase
+        flow = classify_replenishment_flow(getattr(item, "replenishment_method", None))
+        is_purchase = flow == REPLENISHMENT_FLOW_PURCHASE
+        is_rework = flow == REPLENISHMENT_FLOW_REWORK
+        is_produced = (not is_purchase) and (not is_rework)
         
         if is_produced:
             # A) Active 1C orders as already-planned finished goods output:
@@ -2191,14 +2557,8 @@ def build_planned_orders_and_purchases(
             horizon_limit = float(comp_details.get("horizon_limit", float(requested_qty)))
             component_limit = float(comp_details.get("component_limit", float(requested_qty)))
 
-            # If item is discrete, requested must be whole after compute()
-            if _is_discrete_unit(item):
-                try:
-                    requested_qty = float(math.floor(final_qty_before + 1e-9))
-                except Exception:
-                    requested_qty = float(int(final_qty_before))
-            else:
-                requested_qty = float(final_qty_before)
+            # Requested quantity is normalized via shared calculator helper.
+            requested_qty = float(order_qty_calculator.normalize_qty_for_item(item_id, final_qty_before))
 
             # Component gating:
             # - If component_limit <= 0 -> do NOT create PlannedOrder. Record a blocking warning.
@@ -2235,12 +2595,8 @@ def build_planned_orders_and_purchases(
 
             planned_qty = float(planned_qty or 0.0)
 
-            # Enforce whole units for discrete items
-            if _is_discrete_unit(item):
-                try:
-                    planned_qty = float(math.floor(planned_qty + 1e-9))
-                except Exception:
-                    planned_qty = float(int(planned_qty))
+            # Enforce shared normalization policy for the created production qty.
+            planned_qty = float(order_qty_calculator.normalize_qty_for_item(item_id, planned_qty))
 
             if planned_qty <= 1e-9:
                 # Safety: avoid creating qty=0 rows for any reason
@@ -2256,15 +2612,22 @@ def build_planned_orders_and_purchases(
                 bucket_date=need_date,
             )
             created_orders.append(order)
-        else:  # purchased
+        elif is_purchase:
             lead_time = item.replenishment_time or 30
             order_date = need_date - timedelta(days=lead_time)
-            # A) does not apply to purchase flow
-            planned_qty = float(requested_qty_raw)
+            # A) does not apply to purchase flow.
+            # Purchase flow now uses the same shared quantity normalization layer
+            # as production for the final business quantity:
+            # - discrete units -> fractional part is removed
+            # - metric/non-discrete units -> fractional value is preserved
+            requested_qty = float(order_qty_calculator.normalize_qty_for_item(item_id, requested_qty_raw))
+            if requested_qty <= 1e-9:
+                continue
+            planned_qty = float(requested_qty)
             purchase = PlannedPurchase(
                 run_id=run_id,
                 item_id=item_id,
-                requested_qty=requested_qty_raw,
+                requested_qty=requested_qty,
                 planned_qty=planned_qty,
                 qty=planned_qty,
                 need_date=need_date,
@@ -2274,9 +2637,83 @@ def build_planned_orders_and_purchases(
                 supplier_ref1c=getattr(item, 'supplier_ref1c', None),
             )
             created_purchases.append(purchase)
+        else:  # rework
+            lead_time = item.replenishment_time or 0
+            order_date = need_date - timedelta(days=lead_time)
+
+            final_qty_before, normalized_qty, comp_details, comp_warnings = order_qty_calculator.compute(item_id, requested_qty)
+            warnings.extend(comp_warnings)
+
+            horizon_limit = float(comp_details.get("horizon_limit", float(requested_qty)))
+            component_limit = float(comp_details.get("component_limit", float(requested_qty)))
+            requested_qty = float(order_qty_calculator.normalize_qty_for_item(item_id, final_qty_before))
+
+            spec_id = getattr(order_qty_calculator, "default_spec_map", {}).get(int(item_id))
+            shortage_payload = {
+                "requested_qty": float(requested_qty),
+                "normalized_qty": float(normalized_qty or 0.0),
+                "horizon_limit": float(horizon_limit),
+                "component_limit": float(component_limit),
+            }
+
+            component_blocked = component_limit <= 1e-9
+            component_partial = (component_limit > 1e-9) and (component_limit + 1e-9 < float(requested_qty))
+
+            if component_blocked:
+                warnings.append(
+                    make_warning(
+                        "REWORK_COMPONENT_SHORTAGE_BLOCKED",
+                        "Заказ на переработку заблокирован из-за дефицита комплектующих",
+                        run_id=run_id,
+                        item_id=int(item_id),
+                        requested_qty=float(requested_qty),
+                        need_date=need_date.isoformat(),
+                        spec_id=int(spec_id) if spec_id is not None else None,
+                    )
+                )
+                planned_qty = 0.0
+            elif component_partial:
+                planned_qty = min(component_limit, horizon_limit)
+                warnings.append(
+                    make_warning(
+                        "REWORK_COMPONENT_SHORTAGE_PARTIAL",
+                        "Заказ на переработку частично ограничен дефицитом комплектующих",
+                        run_id=run_id,
+                        item_id=int(item_id),
+                        requested_qty=float(requested_qty),
+                        planned_qty=float(planned_qty),
+                        component_limit=float(component_limit),
+                        need_date=need_date.isoformat(),
+                        spec_id=int(spec_id) if spec_id is not None else None,
+                    )
+                )
+            else:
+                planned_qty = min(float(normalized_qty or 0.0), horizon_limit, component_limit)
+
+            planned_qty = float(order_qty_calculator.normalize_qty_for_item(item_id, float(planned_qty or 0.0)))
+            shortage_payload["planned_qty"] = float(planned_qty)
+
+            rework = PlannedRework(
+                run_id=run_id,
+                item_id=item_id,
+                spec_id=spec_id,
+                requested_qty=requested_qty,
+                planned_qty=planned_qty,
+                qty=planned_qty,
+                need_date=need_date,
+                order_date=order_date,
+                lead_time_days=lead_time,
+                bucket_date=need_date,
+                component_limit=component_limit,
+                component_blocked=bool(component_blocked),
+                component_partial=bool(component_partial),
+                shortage=shortage_payload,
+            )
+            created_reworks.append(rework)
 
     db.add_all(created_orders)
     db.add_all(created_purchases)
+    db.add_all(created_reworks)
     db.flush()
 
     # Assign priorities after creation

@@ -152,6 +152,7 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                             updated_count += 1
                         else:
                             unchanged_count += 1
+                        target_item = existing_item
                     else:
                         # Проверяем, существует ли номенклатура с таким кодом
                         existing_item_by_code = existing_items_by_code.get(code)
@@ -169,6 +170,7 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                             existing_items_by_ref[ref_key] = existing_item_by_code
                             existing_items_by_code[code] = existing_item_by_code
                             updated_by_code_count += 1
+                            target_item = existing_item_by_code
                         else:
                             # Проверяем еще раз на уровне SQL
                             existing_item_sql = db.query(Item).filter(Item.item_code == code).first()
@@ -184,6 +186,7 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                                 existing_items_by_ref[ref_key] = existing_item_sql
                                 existing_items_by_code[code] = existing_item_sql
                                 updated_by_code_count += 1
+                                target_item = existing_item_sql
                             else:
                                 # Создаем новую номенклатуру
                                 new_item = Item(
@@ -201,6 +204,9 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                                 existing_items_by_ref[ref_key] = new_item
                                 existing_items_by_code[code] = new_item
                                 created_count += 1
+                                target_item = new_item
+
+                    resolved_category = None
 
                     # Обрабатываем категорию номенклатуры
                     if category_key:
@@ -223,6 +229,12 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                             db.add(new_category)
                             existing_categories[category_key] = new_category
                             categories_created += 1
+                            existing_category = new_category
+
+                        resolved_category = existing_category
+
+                    if target_item is not None:
+                        target_item.category = resolved_category
 
                 except Exception as e:
                     # Логируем ошибку, но продолжаем обработку
@@ -281,6 +293,12 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                         existing_items_by_code[code] = new_item  # обновим локальный кэш
                         if ref_key:
                             existing_items_by_ref[ref_key] = new_item
+
+                        category_key = (record.get('КатегорияНоменклатуры_Key') or '').strip()
+                        if category_key:
+                            existing_category = existing_categories.get(category_key)
+                            if existing_category is not None:
+                                new_item.category = existing_category
                         missing_created += 1
 
                         # Периодически сбрасываем хвост, чтобы не держать большую транзакцию

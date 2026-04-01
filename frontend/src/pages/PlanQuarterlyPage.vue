@@ -441,35 +441,18 @@ function onDayPopupBlur(row: any, dateStr: string, weekKey: string): void {
   recalcWeekAfterDayChange(row, weekKey)
 }
 
-// Получение начала и конца текущего квартала относительно "сегодня"
-function getQuarterBounds(today = new Date()): { start: string; daysCount: number } {
-  const y = today.getFullYear()
-  const m = today.getMonth() // 0..11
-  const qStartMonth = Math.floor(m / 3) * 3
-  const startDate = new Date(y, qStartMonth, 1)
-  const endDate = new Date(y, qStartMonth + 3, 0) // последний день квартала
-  const daysCount = Math.floor((endDate.getTime() - startDate.getTime()) / 86400000) + 1
-  return { start: toISODate(startDate), daysCount }
-}
-
-function daysBetweenInclusive(startIso: string, endIso: string): number {
+// Окно квартального плана как скользящий горизонт: start + 3 календарных месяца.
+function getRollingThreeMonthsBounds(startIso: string): { start: string; daysCount: number } {
   try {
-    const s = new Date(startIso + 'T00:00:00')
-    const e = new Date(endIso + 'T00:00:00')
-    const diff = Math.floor((e.getTime() - s.getTime()) / 86400000)
-    return diff + 1
+    const start = new Date(startIso + 'T00:00:00')
+    const endExclusive = new Date(start)
+    endExclusive.setMonth(endExclusive.getMonth() + 3)
+    const endInclusive = new Date(endExclusive)
+    endInclusive.setDate(endInclusive.getDate() - 1)
+    const daysCount = Math.max(1, Math.floor((endInclusive.getTime() - start.getTime()) / 86400000) + 1)
+    return { start: startIso, daysCount }
   } catch {
-    return 1
-  }
-}
-
-function addDaysIso(startIso: string, days: number): string {
-  try {
-    const d = new Date(startIso + 'T00:00:00')
-    d.setDate(d.getDate() + Number(days || 0))
-    return toISODate(d)
-  } catch {
-    return startIso
+    return { start: startIso, daysCount: 90 }
   }
 }
 
@@ -587,13 +570,11 @@ async function loadPlanData() {
       planningAnchor.value = null
     }
 
-    // 2) Берём квартал относительно anchor_date (а не относительно today)
-    // и стартуем с anchor_date, чтобы скрыть уже закрытый участок.
-    const qb = getQuarterBounds(new Date(anchorDate.value + 'T00:00:00'))
-    const quarterStart = qb.start
-    const quarterEnd = addDaysIso(quarterStart, qb.daysCount - 1)
-    const start = (anchorDate.value && anchorDate.value > quarterStart) ? anchorDate.value : quarterStart
-    const daysNeeded = Math.max(1, daysBetweenInclusive(start, quarterEnd))
+    // 2) Скользящее окно: от max(anchor_date, today) на 3 месяца вперёд.
+    // Это исключает "залипание" на прошлом календарном квартале в начале нового месяца.
+    const start = (anchorDate.value && anchorDate.value > todayStr.value) ? anchorDate.value : todayStr.value
+    const bounds = getRollingThreeMonthsBounds(start)
+    const daysNeeded = Math.max(1, bounds.daysCount)
 
     windowStart.value = start
     windowDays.value = daysNeeded
@@ -759,8 +740,10 @@ async function onDeleteRow(row: PlanItem) {
     deletingId.value = row.item_id
 
     // Удаляем в пределах текущего отображаемого окна (чтобы совпадало с UI)
-    const start = windowStart.value || getQuarterBounds(new Date()).start
-    const daysCount = windowDays.value || getQuarterBounds(new Date()).daysCount
+    const fallbackStart = todayStr.value
+    const fallbackBounds = getRollingThreeMonthsBounds(fallbackStart)
+    const start = windowStart.value || fallbackStart
+    const daysCount = windowDays.value || fallbackBounds.daysCount
     await api.post('/v1/plan/delete_row', {
       item_id: row.item_id,
       start_date: start,

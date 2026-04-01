@@ -21,6 +21,403 @@
 
 ## Последняя сессия
 
+**2026-03-16 — миграции Alembic доведены до актуального head после исправления идентификаторов ревизий и ручного выравнивания состояния БД:**
+
+1) **Исправлены несовместимые идентификаторы ревизий в миграциях:**
+   - в [backend/alembic/versions/20260312_01_add_planned_rework.py](backend/alembic/versions/20260312_01_add_planned_rework.py:1) `down_revision` приведён к фактическому id предыдущей миграции `20260226_01`;
+   - в [backend/alembic/versions/20260313_01_add_item_category_link.py](backend/alembic/versions/20260313_01_add_item_category_link.py:1) сокращён `revision` до совместимого значения `20260313_01`, чтобы запись помещалась в `alembic_version.version_num`.
+
+2) **Диагностика состояния БД показала частично применённую схему:**
+   - таблица `planned_rework` уже существовала в БД, хотя [alembic current](backend/alembic/versions/20260312_01_add_planned_rework.py:13) оставался на ревизии `20260226_01`;
+   - поле `items.category_id` ещё отсутствовало, поэтому обычный `upgrade head` падал сначала на повторном создании `planned_rework`, а затем на переполнении `version_num`.
+
+3) **Миграции доведены до актуального состояния:**
+   - выполнен `stamp` на ревизию `20260312_01_add_planned_rework` для синхронизации Alembic с уже существующей таблицей `planned_rework`;
+   - после исправления revision id успешно выполнен `python -m alembic upgrade head` в каталоге [backend](backend:1);
+   - итог: применена миграция добавления `items.category_id` из [backend/alembic/versions/20260313_01_add_item_category_link.py](backend/alembic/versions/20260313_01_add_item_category_link.py:19).
+
+4) **Результат текущей сессии:**
+   - цепочка миграций Alembic теперь проходит до актуального `head`;
+   - состояние БД соответствует последним backend-изменениям для `rework` и группировки по товарным группам.
+
+**2026-03-16 — завершение refactoring-плана `purchase` / `rework`: закрыт последний regression-пункт по сравнению production orders на контрольном run-е и формально завершена итерация 12:**
+
+1) **Добавлен контрольный regression-test на сравнение production orders «до/после» в одном сценарии с примешанными `purchase` и `rework`:**
+   - в [tests/test_stock_by_item_cache.py](tests/test_stock_by_item_cache.py:664) добавлен сценарий `test_control_run_keeps_production_orders_identical_with_purchase_and_rework_flows`;
+   - тест строит baseline-run только с `production`, затем mixed-run с тем же `production`-изделием и дополнительными потоками `purchase` / `rework`;
+   - сравнение выполняется по проекции строк [PlannedOrder](backend/app/models.py:434): `item_id`, `requested_qty`, `planned_qty`, `qty`, `need_date`, `bucket_date`.
+
+2) **Зафиксирован ожидаемый инвариант последней незакрытой проверки:**
+   - наличие потоков `purchase` и `rework` не должно изменять состав и количества production-заказов для того же контрольного спроса;
+   - mixed-run дополнительно подтверждает, что параллельно действительно создаются строки [PlannedPurchase](backend/app/models.py:462) и [PlannedRework](backend/app/models.py:479), не влияя на baseline projection production.
+
+3) **Проверка:**
+   - выполнен прогон `set "PYTHONPATH=backend" && pytest tests/test_stock_by_item_cache.py -q`;
+   - результат: `10 passed`.
+
+4) **План и документация синхронизированы с фактическим завершением:**
+   - в [`.docs/rework_refactoring_plan.md`](.docs/rework_refactoring_plan.md) закрыт пункт сравнения production orders до/после;
+   - закрыты итоговые чекбоксы по итерации 12, финальной regression-проверке и обновлению документации.
+
+**2026-03-16 — синхронизация плана рефакторинга `rework`: чекбоксы в [`.docs/rework_refactoring_plan.md`](.docs/rework_refactoring_plan.md) приведены в соответствие с уже выполненными backend/frontend/regression-итерациями, незавершённым оставлен только контрольный пункт по сравнению production orders на контрольном run-е:**
+
+1) **План рефакторинга синхронизирован с уже подтверждёнными результатами прошлых итераций:**
+   - закрыты верхнеуровневые пункты по выделению отдельного потока `rework`, сохранению production-инвариантов, поддержке спецификаций/дефицита комплектующих и стабилизации групп товаров;
+   - закрыты проектные шаги по классификатору пополнения, общей нормализации количества, отдельной сущности [PlannedRework](backend/app/models.py:479), grouped-endpoint'ам, Excel-экспорту и UI-слою результатов MRP;
+   - закрыты чекбоксы по unit/API/UI/regression-проверкам, для которых в журнале уже были зафиксированы выполненные тесты и сборки.
+
+2) **Основание для синхронизации чекбоксов — уже выполненные и задокументированные проверки:**
+   - regression-наборы по production-инвариантам и summary/warnings, описанные в [`.docs/progress.md`](.docs/progress.md:24), подтверждают сохранение текущих production-контрактов;
+   - API-регрессия результатов MRP и XLSX-export'ов подтверждена сценариями в [tests/routers/test_plan_result_endpoints.py](tests/routers/test_plan_result_endpoints.py:65);
+   - сценарии full / partial / blocked для `rework` подтверждены тестами в [tests/test_stock_by_item_cache.py](tests/test_stock_by_item_cache.py:435);
+   - проверка production-warning contract зафиксирована в [tests/test_planning_service.py](tests/test_planning_service.py:138).
+
+3) **Что осталось незавершённым в плане после синхронизации:**
+   - не закрыт только пункт сравнения production orders «до/после» на контрольном run-е в [`.docs/rework_refactoring_plan.md`](.docs/rework_refactoring_plan.md);
+   - соответственно, итерация 12 в плане остаётся частично открытой до появления отдельного контрольного сравнения именно по строкам production orders, а не только по summary/API/test-regression.
+
+4) **Граница текущей сессии:**
+   - изменения в код backend/frontend не вносились;
+   - обновлены только документы [`.docs/rework_refactoring_plan.md`](.docs/rework_refactoring_plan.md) и [`.docs/progress.md`](.docs/progress.md).
+
+**2026-03-16 — production-регрессия по refactoring-потоку `purchase` / `rework`: подтверждена неизменность текущих production-контрактов на контрольном backend-наборе:**
+
+1) **Выполнен сводный regression-прогон backend-тестов для production-инвариантов и result-endpoint'ов:**
+   - запущен набор:
+     - `set "PYTHONPATH=." && pytest tests/test_stock_by_item_cache.py tests/test_planning_service.py tests/services/test_capacity_scheduler.py tests/services/test_capacity_push_right.py tests/services/test_capacity_fallback.py tests/routers/test_plan_result_endpoints.py -q`;
+   - результат: `22 passed`.
+
+2) **Подтверждены ключевые инварианты production-потока после выделения `rework` и доработок `purchase`:**
+   - сохраняется корректность production-расчёта по контрольным сценариям склада, резервов компонентов активных заказов 1С и capacity scheduling;
+   - сохраняется контракт summary/warnings в [`get_run_summary()`](backend/app/services/planning_service.py:358);
+   - сохраняются production-result endpoint'ы списка, grouped-представления и XLSX-экспорта через [`plan.py`](backend/app/routers/plan.py:1).
+
+3) **Зафиксированы только некритичные предупреждения окружения, без падения тестов:**
+   - `MovedIn20Warning` для [`declarative_base()`](backend/app/database.py:15);
+   - `PydanticDeprecatedSince20` для class-based `Config` в [`backend/app/schemas.py`](backend/app/schemas.py:28);
+   - `DeprecationWarning` на использование `datetime.utcnow()` в тестах, например в [`tests/test_stock_by_item_cache.py`](tests/test_stock_by_item_cache.py:38).
+
+4) **Граница текущей сессии:**
+   - изменения в коде не вносились;
+   - обновлён только журнал состояния в [`.docs/progress.md`](.docs/progress.md).
+
+**2026-03-16 — frontend-итерация UI-экспорта для `rework`: добавлены кнопки выгрузки на странице результатов MRP и подключён frontend API для нового export-endpoint'а:**
+
+1) **Страница результатов MRP расширена действиями экспорта для верхнего блока `rework`:**
+   - в [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:118) в фильтрах вкладки `rework` добавлены кнопки `CSV` и `XLSX` рядом с уже существующими действиями production/purchase;
+   - в [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:1084) добавлен handler `exportRework(...)`, который скачивает либо текстовый CSV, либо base64-XLSX через уже используемые browser-side helper'ы загрузки файлов;
+   - это закрывает недостающий UI-слой над уже существующим backend-endpoint'ом `GET /v1/plan/results/{run_id}/rework/export`.
+
+2) **Frontend API синхронизирован с backend-контрактом экспорта переработки:**
+   - в [frontend/src/services/api.ts](frontend/src/services/api.ts:254) добавлена обёртка `exportPlanningResultRework(...)` для вызова [`/v1/plan/results/{run_id}/rework/export`](backend/app/routers/plan.py:1194);
+   - сигнатура повторяет существующий стиль export-обёрток для production/purchases и поддерживает оба формата: `csv` / `xlsx`.
+
+3) **Локализация вкладок `rework` переведена на i18n-ключи вместо захардкоженных подписей:**
+   - в [frontend/src/i18n/ru.ts](frontend/src/i18n/ru.ts:9) добавлены ключи `mrp.tabs.rework` и `mrp.tabs.reworkDetail`;
+   - в [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:31) и [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue:172) обе вкладки `rework` теперь используют общую локализацию, чтобы новый UI-экспорт не добавлял ещё одну точку расхождения текста.
+
+4) **Проверка:**
+   - выполнен прогон `npm run build` в каталоге [frontend](frontend/package.json:1);
+   - результат: сборка успешна, критичных ошибок TypeScript/Vue после добавления `rework`-экспорта нет.
+
+**2026-03-16 — backend-итерация API-регрессии для результатов `purchase` / `rework`: добавлены endpoint-тесты и синхронизированы чекбоксы плана:**
+
+1) **Добавлены интеграционные API-тесты для результатов MRP через роутер [`plan`](backend/app/routers/plan.py):**
+   - новый файл [tests/routers/test_plan_result_endpoints.py](tests/routers/test_plan_result_endpoints.py) поднимает тестовое FastAPI-приложение с подключением [router](backend/app/routers/plan.py:62) и override для [get_db](backend/app/database.py:24);
+   - покрыты endpoint'ы списка `rework`, grouped-by-category для закупки и переработки, а также XLSX-export для обоих потоков.
+
+2) **Зафиксированы проверяемые контракты API для новых потоков:**
+   - проверяется, что `GET /api/v1/plan/results/{run_id}/rework` возвращает поля `spec_code`, `requested_qty`, `planned_qty`, `component_partial`, `shortage`;
+   - проверяется, что grouped-endpoint'ы возвращают корректные суммы и счётчики (`sum_qty`, `sum_requested_qty`, `sum_planned_qty`, `partial_orders`, fallback `Без товарной группы`);
+   - проверяется, что export-endpoint'ы возвращают `xlsx` payload с корректными листами, group-title и содержимым строк.
+
+3) **Чекбоксы API-тестов в плане рефакторинга закрыты по факту выполнения:**
+   - в [`.docs/rework_refactoring_plan.md`](.docs/rework_refactoring_plan.md) закрыты пункты раздела `6.2. API-тесты backend` для списка `rework`, grouped endpoint'ов, Excel-export и полей агрегации.
+
+4) **Проверка:**
+   - выполнен прогон:
+     - `set "PYTHONPATH=backend" && pytest tests/routers/test_plan_result_endpoints.py tests/services/test_mrp_result_exports.py tests/services/test_grouped_by_category_results.py tests/services/test_rework_results.py -q`
+   - результат: `11 passed`.
+
+5) **Добавлена точечная регрессия на формат production-warning'ов в summary:**
+   - в [tests/test_planning_service.py](tests/test_planning_service.py) добавлен сценарий на [get_run_summary()](backend/app/services/planning_service.py:358), который проверяет сохранение production-контракта по `warnings`, `kindIssues` и `componentShortages`;
+   - отдельно зафиксировано legacy-преобразование `PRODUCTION_KIND_NOT_FOUND -> NO_PRODUCTION_KIND`, чтобы фронтенд продолжал получать прежний код предупреждения.
+
+6) **Дополнительная проверка после расширения регрессии:**
+   - выполнен прогон:
+     - `set "PYTHONPATH=." && pytest tests/test_planning_service.py tests/routers/test_plan_result_endpoints.py tests/services/test_mrp_result_exports.py tests/services/test_grouped_by_category_results.py tests/services/test_rework_results.py -q`
+   - результат: `14 passed`.
+
+7) **Прогнаны текущие production-regression тесты без изменения бизнес-логики расчёта:**
+   - дополнительно выполнен прогон:
+     - `set "PYTHONPATH=." && pytest tests/test_stock_by_item_cache.py tests/test_planning_service.py tests/services/test_capacity_scheduler.py tests/services/test_capacity_push_right.py tests/services/test_capacity_fallback.py -q`
+   - результат: `18 passed`;
+   - по итогам в [`.docs/rework_refactoring_plan.md`](.docs/rework_refactoring_plan.md) закрыт чекбокс `Прогнать тесты, покрывающие текущий расчёт production`.
+
+8) **Добавлена безопасная API-регрессия для production-result endpoints:**
+   - в [tests/routers/test_plan_result_endpoints.py](tests/routers/test_plan_result_endpoints.py) добавлен сценарий на `production`-контракты:
+     - `GET /api/v1/plan/results/{run_id}/production`;
+     - `GET /api/v1/plan/results/{run_id}/production/grouped`;
+     - `GET /api/v1/plan/results/{run_id}/production/export?format=xlsx`;
+   - тест фиксирует, что сохраняются ключевые поля и флаги production-выдачи: `norm_hours_total`, `norm_hours_per_unit`, `flags.componentPartial`, `flags.capacityShiftDays`, группировка по участку и XLSX-структура выгрузки.
+
+9) **Дополнительная проверка после расширения production-regression API:**
+   - выполнен прогон:
+     - `set "PYTHONPATH=." && pytest tests/routers/test_plan_result_endpoints.py tests/test_planning_service.py tests/test_stock_by_item_cache.py -q`
+   - результат: `16 passed`.
+
+10) **План синхронизирован с фактически добавленными API-тестами:**
+   - в [`.docs/rework_refactoring_plan.md`](.docs/rework_refactoring_plan.md) закрыт пункт `тесты API для результатов MRP` в списке обязательной проверки файлов/направлений.
+
+**2026-03-16 — backend-регрессия по потокам пополнения: синхронизированы тесты классификатора с фактическим включением `rework` и добавлен контрольный сценарий для `production`:**
+
+1) **Актуализирован тест классификации способа пополнения под уже внедрённый поток `rework`:**
+   - в [tests/services/test_replenishment.py](tests/services/test_replenishment.py) legacy-ожидание для `Переработка -> production` заменено на актуальное `Переработка -> rework`;
+   - это устраняет ложную регрессию после фактического включения [classify_replenishment_flow()](backend/app/services/replenishment.py:19) для маркеров `переработ` / `rework`.
+
+2) **Добавлен отдельный regression-test на неизменность обычного production-потока:**
+   - в [tests/services/test_replenishment.py](tests/services/test_replenishment.py) добавлен сценарий, подтверждающий, что позиция с методом `Производство` по-прежнему создаёт запись в [PlannedOrder](backend/app/models.py:425) и не утекает в [PlannedPurchase](backend/app/models.py:462) или [PlannedRework](backend/app/models.py:479);
+   - это фиксирует один из базовых инвариантов перед дальнейшей production-регрессией из плана рефакторинга.
+
+3) **Проверка набора backend-тестов для потоков `production` / `purchase` / `rework`:**
+   - выполнен прогон:
+     - `set "PYTHONPATH=backend" && pytest tests/test_stock_by_item_cache.py tests/services/test_rework_results.py tests/services/test_grouped_by_category_results.py tests/services/test_order_quantity_calculator.py tests/services/test_replenishment.py -q`
+   - результат: `25 passed`.
+
+**2026-03-16 — backend-итерация Excel-экспорта для потоков `purchase` и `rework`: добавлены отдельные XLSX-выгрузки с группировкой по товарным группам:**
+
+1) **Выделен отдельный backend-service для экспорта результатов MRP, не затрагивающий production-экспорт:**
+   - добавлен файл [backend/app/services/mrp_result_export.py](backend/app/services/mrp_result_export.py), где собраны общие helper'ы для формирования workbook, авто-ширины колонок, base64-кодирования и подзаголовков товарных групп;
+   - это изолирует новую Excel-логику закупки/переработки от существующего [export_production_orders_xlsx()](backend/app/services/production_order_export.py:30) и от production-export в [backend/app/routers/plan.py](backend/app/routers/plan.py:918).
+
+2) **XLSX-экспорт закупок переведён на backend-группировку по товарным группам:**
+   - в [export_purchases_results_xlsx()](backend/app/services/mrp_result_export.py:114) используется [get_run_purchases_grouped_by_category()](backend/app/services/planning_service.py:1202);
+   - секции Excel теперь строятся как «Товарная группа → заголовок колонок → строки заказов»;
+   - в выгрузку включены поля: наименование, артикул, количество, ЕИ, дата потребности, дата заказа, срок пополнения и `supplier_ref1c`.
+
+3) **Добавлен отдельный XLSX-экспорт переработки с диагностикой комплектующих:**
+   - в [export_rework_results_xlsx()](backend/app/services/mrp_result_export.py:167) используется [get_run_rework_grouped_by_category()](backend/app/services/planning_service.py:1482);
+   - в Excel для `rework` выводятся `requested_qty`, `planned_qty`, спецификация, лимит по комплектующим и человекочитаемый статус ограничений (`Без ограничений` / `Частично ограничен` / `Заблокирован`);
+   - fallback-группа `Без товарной группы` сохраняется и в Excel.
+
+4) **API результатов MRP расширен новым endpoint'ом экспорта `rework`, а экспорт закупок переподключён на новый service:**
+   - в [backend/app/routers/plan.py](backend/app/routers/plan.py) `GET /v1/plan/results/{run_id}/purchases/export?format=xlsx` теперь делегирует в [export_purchases_results_xlsx()](backend/app/services/mrp_result_export.py:114);
+   - добавлен новый endpoint `GET /v1/plan/results/{run_id}/rework/export`, реализованный в [export_planning_result_rework()](backend/app/routers/plan.py:1203);
+   - CSV-контракты оставлены совместимыми, а новая XLSX-логика добавлена рядом с существующей без изменения production API.
+
+5) **Добавлены тесты на Excel-экспорт новых потоков:**
+   - новый файл [tests/services/test_mrp_result_exports.py](tests/services/test_mrp_result_exports.py) проверяет:
+     - группировку закупок по товарным группам в XLSX;
+     - наличие fallback-секции `Без товарной группы`;
+     - экспорт `rework` со спецификацией и статусами ограничений по комплектующим.
+
+6) **Проверка:**
+   - выполнен прогон:
+     - `set "PYTHONPATH=backend" && pytest tests/services/test_mrp_result_exports.py tests/services/test_grouped_by_category_results.py tests/services/test_rework_results.py -q`
+   - результат: `8 passed`.
+
+**2026-03-13 — frontend-итерация рефакторинга потоков пополнения: восстановлена гидрация выбора групп и добавлен UI для `rework`/группировки закупок по товарным группам:**
+
+1) **Страница синхронизации групп теперь поднимает состояние при открытии и после выгрузки групп:**
+   - в [frontend/src/pages/SyncPage.vue](frontend/src/pages/SyncPage.vue) добавлен вызов загрузки списка групп и сохранённого выбора на `mounted`;
+   - после выгрузки групп из OData страница сразу перечитывает список и сохранённый набор `selectedIds`, поэтому повторное открытие больше не требует ручного обновления;
+   - загрузка сохранённого выбора вынесена в отдельный helper, чтобы повторно использовать его без лишнего копирования логики.
+
+2) **Frontend API и типы MRP расширены под новые backend-контракты `grouped-by-category` и `rework`:**
+   - в [frontend/src/services/api.ts](frontend/src/services/api.ts) добавлены обёртки для `/purchases/grouped-by-category`, `/rework` и `/rework/grouped-by-category`;
+   - в [frontend/src/types/mrp.ts](frontend/src/types/mrp.ts) добавлены типы `PurchaseCategoryGroupedResponse`, `ReworkRow`, `ReworkGroup`, а также счётчик `rework_requests` в summary.
+
+3) **Страница результатов MRP получила отдельный верхний и детальный блок `rework`:**
+   - в [frontend/src/pages/MRPResultPage.vue](frontend/src/pages/MRPResultPage.vue) добавлены вкладки `rework` в верхней секции и в секции деталей;
+   - загрузка `rework` теперь идёт через отдельное состояние страницы с фильтрами, пагинацией и grouped-представлением по товарным группам;
+   - для `rework` показаны суммы `requested_qty` / `planned_qty` и индикаторы `partial` / `blocked` на уровне группы.
+
+4) **Закупки в верхнем блоке MRP переведены на backend-группировку по товарным группам:**
+   - вместо старой агрегированной таблицы `item_id + unit` верхняя вкладка закупок теперь использует grouped endpoint по товарным группам;
+   - при недоступности grouped endpoint сохранён безопасный fallback в группу `Без товарной группы`, собранную из плоских строк `/purchases`.
+
+5) **Техническая зачистка страницы результатов:**
+   - удалён временный diagnostic-banner с `runId/params`;
+   - наблюдатели и первичная загрузка расширены так, чтобы `rework` поднимался вместе с production/purchases и корректно подгружался при переключении вкладок.
+
+6) **Проверка:**
+   - выполнен фронтенд-билд:
+     - `npm run build` (в каталоге `frontend`)
+   - результат: сборка успешна.
+
+7) **План рефакторинга синхронизирован с фактически выполненной frontend-итерацией:**
+   - в `.docs/rework_refactoring_plan.md` отмечены выполненные пункты по анализу frontend-точек входа, итерациям 10/11, UI-части `rework` и стабилизации страницы выбора групп;
+   - незакрытыми оставлены только шаги, для которых ещё нет отдельной UI-проверки через браузер, Excel-экспорта и production-регрессии.
+
+**2026-03-13 — итерация 6 рефакторинга потоков пополнения: добавлена backend-группировка закупки и `rework` по товарным группам:**
+
+1) **В номенклатуре введена явная связь изделия с товарной группой:**
+   - в [`Item`](backend/app/models.py) добавлено поле `category_id` и связь с [`ItemCategory`](backend/app/models.py);
+   - в [`ItemCategory`](backend/app/models.py) добавлены обратные связи `items`, `parent`/`children` приведены к согласованному виду;
+   - для БД добавлена миграция [`20260313_01_add_item_category_link.py`](backend/alembic/versions/20260313_01_add_item_category_link.py).
+
+2) **Синхронизация номенклатуры начала сохранять товарную группу прямо в `items`:**
+   - в [`sync_nomenclature_from_odata()`](backend/app/services/nomenclature_sync.py) после разрешения `КатегорияНоменклатуры_Key` запись [`Item`](backend/app/models.py) теперь получает связь `category`/`category_id`;
+   - это касается как обычного upsert по `item_ref1c`, так и fallback-сценария добивки отсутствующих `item_code`.
+
+3) **Добавлены backend-service методы grouped-выдачи по товарным группам:**
+   - [`_load_item_category_meta()`](backend/app/services/planning_service.py) загружает метаданные товарной группы для набора изделий;
+   - [`get_run_purchases_grouped_by_category()`](backend/app/services/planning_service.py) группирует закупки по `Item.category_id`;
+   - [`get_run_rework_grouped_by_category()`](backend/app/services/planning_service.py) группирует заказы на переработку по той же схеме.
+
+4) **Добавлены новые API-endpoint'ы grouped-представления по товарным группам:**
+   - [`GET /v1/plan/results/{run_id}/purchases/grouped-by-category`](backend/app/routers/plan.py);
+   - [`GET /v1/plan/results/{run_id}/rework/grouped-by-category`](backend/app/routers/plan.py);
+   - для них добавлены схемы [`PurchaseCategoryGroupedResponse`](backend/app/schemas.py), [`PurchaseCategoryGroup`](backend/app/schemas.py), [`PurchaseCategoryGroupOrder`](backend/app/schemas.py).
+
+5) **Покрытие тестами:**
+   - новый файл [`tests/services/test_grouped_by_category_results.py`](tests/services/test_grouped_by_category_results.py) проверяет:
+     - сохранение `item.category_id` при синхронизации номенклатуры;
+     - группировку закупок по товарным группам;
+     - группировку `rework` по товарным группам с корректным подсчётом `partial_orders` / `blocked_orders`.
+
+6) **Проверка:**
+   - выполнен прогон:
+     - `set "PYTHONPATH=backend" && pytest tests/services/test_grouped_by_category_results.py tests/test_stock_by_item_cache.py tests/services/test_rework_results.py -q`
+   - результат: `15 passed`.
+
+**2026-03-12 — итерация 5 рефакторинга потоков пополнения: добавлены backend-endpoint'ы чтения `rework` и базовая grouped-выдача:**
+
+1) **Расширены backend-результаты прогона для отдельного потока `rework`:**
+   - в [`get_run_summary()`](backend/app/services/planning_service.py:357) добавлен счётчик `rework_requests` рядом с существующими `production_orders` и `purchase_requests`;
+   - это позволяет UI и последующим API-итерациям видеть отдельный объём заявок на переработку без смешивания с закупкой.
+
+2) **Добавлены сервисные выборки для `planned_rework`:**
+   - в [`_query_run_rework_rows()`](backend/app/services/planning_service.py:1169) собрана единая денормализованная выборка строк `planned_rework` с номенклатурой, ЕИ и спецификацией;
+   - в [`get_run_rework()`](backend/app/services/planning_service.py:1243) добавлены фильтрация, сортировка и пагинация для плоского списка заказов на переработку;
+   - в [`get_run_rework_grouped()`](backend/app/services/planning_service.py:1305) добавлена grouped-выдача.
+
+3) **Добавлены отдельные API-endpoint'ы для `rework`:**
+   - [`GET /v1/plan/results/{run_id}/rework`](backend/app/routers/plan.py:638) возвращает список строк переработки;
+   - [`GET /v1/plan/results/{run_id}/rework/grouped`](backend/app/routers/plan.py:668) возвращает grouped-представление.
+
+4) **Зафиксирован временный fallback по товарным группам:**
+   - текущая модель [`Item`](backend/app/models.py:36) пока не содержит явной связи с `item_categories`, достаточной для надёжной backend-группировки результатов по товарной группе;
+   - поэтому [`get_run_rework_grouped()`](backend/app/services/planning_service.py:1305) на этой итерации возвращает один fallback-блок `Без товарной группы`, сохраняя уже полезный grouped-контракт для фронтенда и следующей итерации;
+   - это сознательно не меняет существующие контракты `production` и `purchase`, а лишь добавляет новый безопасный контракт для `rework`.
+
+5) **Добавлены backend-схемы ответа и тестовое покрытие:**
+   - в [`backend/app/schemas.py`](backend/app/schemas.py:540) добавлены `ReworkGroupOrder`, `ReworkGroup`, `ReworkGroupedResponse`;
+   - в [`tests/test_stock_by_item_cache.py`](tests/test_stock_by_item_cache.py:432) добавлены сценарии full / partial / blocked для создания `rework`-заказов;
+   - новый файл [`tests/services/test_rework_results.py`](tests/services/test_rework_results.py:1) покрывает список `rework`, grouped-fallback и счётчик `rework_requests` в summary.
+
+6) **Проверка:**
+   - выполнен прогон:
+     - `set "PYTHONPATH=backend" && pytest tests/test_stock_by_item_cache.py tests/services/test_rework_results.py -q`
+   - результат: `12 passed`.
+
+**2026-03-12 — итерация 4 рефакторинга потоков пополнения: введена backend-основа для отдельного потока `rework`:**
+
+1) **Активирован отдельный поток классификации `rework`:**
+   - в [`classify_replenishment_flow()`](backend/app/services/replenishment.py:19) маркеры `переработ` / `rework` теперь возвращают поток `rework`;
+   - поток `purchase` остался отдельным, а все прочие значения по-прежнему попадают в `production`.
+
+2) **Добавлена отдельная сущность результатов MRP для переработки:**
+   - в [`PlannedRework`](backend/app/models.py:479) введена новая таблица `planned_rework`;
+   - сохраняются поля количества и сроков (`requested_qty`, `planned_qty`, `qty`, `need_date`, `order_date`, `lead_time_days`), ссылка на спецификацию `spec_id`, а также диагностика дефицита комплектующих (`component_limit`, `component_blocked`, `component_partial`, `shortage`).
+
+3) **Добавлена миграция и API-schema основа:**
+   - миграция [`20260312_01_add_planned_rework.py`](backend/alembic/versions/20260312_01_add_planned_rework.py) создаёт таблицу `planned_rework` и индексы под будущие backend/API-выборки;
+   - в [`backend/app/schemas.py`](backend/app/schemas.py:538) добавлены Pydantic-схемы `PlannedReworkBase` / `PlannedRework` для следующих итераций API.
+
+4) **Поток `rework` интегрирован в расчёт без UI/API-расширений:**
+   - в [`build_planned_orders_and_purchases()`](backend/app/services/planning_service.py:2102) ветка `rework` выделена отдельно от `production` и `purchase`;
+   - `rework` использует существующий [`OrderQuantityCalculator.compute()`](backend/app/services/order_quantity_calculator.py:51), то есть уже наследует поддержку спецификаций и ограничений по комплектующим;
+   - для результата `rework` сохраняются случаи:
+     - полная блокировка по комплектующим → `planned_qty = 0` + warning `REWORK_COMPONENT_SHORTAGE_BLOCKED`;
+     - частичное ограничение → частичный `planned_qty` + warning `REWORK_COMPONENT_SHORTAGE_PARTIAL`;
+     - отсутствие дефицита → нормализованное количество через общий helper [`normalize_qty_for_item()`](backend/app/services/order_quantity_calculator.py:120).
+
+5) **Границы текущей итерации зафиксированы:**
+   - production-ветка и purchase-ветка не переводились на новые API-контракты;
+   - UI, grouped-endpoint'ы и Excel-экспорт для `rework` пока не добавлялись;
+   - следующий целевой шаг — отдельные backend-endpoint'ы чтения `planned_rework` и тесты на сценарии blocked/partial/full.
+
+6) **Проверка:**
+   - выполнен синтаксический прогон:
+     - `python -m py_compile backend/app/models.py backend/app/schemas.py backend/app/services/replenishment.py backend/app/services/planning_service.py backend/alembic/versions/20260312_01_add_planned_rework.py`
+   - результат: успешно.
+
+**2026-03-12 — итерация 3 рефакторинга потоков пополнения: исправлен закупочный поток для дискретных ЕИ:**
+
+1) **Поток закупки в [`build_planned_orders_and_purchases()`](backend/app/services/planning_service.py:2102) переведён на общий helper нормализации количества:**
+   - ветка `purchase` больше не пишет `planned_qty` напрямую из сырого `requested_qty_raw`;
+   - теперь используется [`normalize_qty_for_item()`](backend/app/services/order_quantity_calculator.py:120);
+   - для дискретных ЕИ дробная часть отбрасывается, для недискретных ЕИ дробное значение сохраняется.
+
+2) **Зафиксировано новое поведение сохранения закупки:**
+   - в [`planned_purchase`](backend/app/models.py:462) поля `requested_qty`, `planned_qty`, `qty` сохраняются уже в нормализованном бизнес-количестве;
+   - это устраняет генерацию дробных закупок для позиций в `шт` без изменения production-ветки.
+
+3) **Добавлены интеграционные тесты на purchase-flow в [`tests/test_stock_by_item_cache.py`](tests/test_stock_by_item_cache.py:1):**
+   - дискретная закупка (`шт`) с потребностью `7.9` сохраняется как `7.0`;
+   - недискретная закупка (`кг`) с потребностью `7.9` сохраняется как `7.9`.
+
+4) **Инвариант после итерации:**
+   - production остаётся на уже вынесенном shared-normalization без изменения своей логики;
+   - закупка теперь использует тот же слой нормализации количества, но без production-специфичных ограничений по комплектующим и мощностям;
+   - следующий целевой шаг может безопасно переходить к выделению отдельной сущности/потока `rework`.
+
+**2026-03-12 — итерация 1 рефакторинга потоков пополнения: вынесена классификация без изменения поведения:**
+
+1) **Вынесен единый helper классификации потока пополнения:**
+   - Добавлен модуль [`backend/app/services/replenishment.py`](backend/app/services/replenishment.py) с константами потоков и функциями:
+     - `normalize_replenishment_method(...)`
+     - `classify_replenishment_flow(...)`
+     - `is_purchase_replenishment(...)`
+   - Важно: на этой итерации сохранено прежнее поведение MRP:
+     - маркеры закупки (`покуп`, `закуп`, `purchase`, `buy`) → поток `purchase`;
+     - все остальные значения, включая `переработка`, пока остаются в потоке `production`.
+
+2) **Планирование переведено на shared-classifier без смены бизнес-результата:**
+   - В [`build_planned_orders_and_purchases()`](backend/app/services/planning_service.py:2098) удалена локальная inline-логика разбора `items.replenishment_method`.
+   - Вместо неё используется общий классификатор из [`replenishment.py`](backend/app/services/replenishment.py).
+   - Это подготавливает безопасную основу для следующей итерации, где `rework` будет выделяться в отдельный поток.
+
+3) **Добавлены тесты на классификацию и интеграцию с planning:**
+   - Новый файл [`tests/services/test_replenishment.py`](tests/services/test_replenishment.py) покрывает:
+     - распознавание синонимов закупки;
+     - сохранение legacy-default поведения для `production`;
+     - интеграцию классификатора с [`build_planned_orders_and_purchases()`](backend/app/services/planning_service.py:2098).
+
+4) **Проверки:**
+   - Выполнен прогон:
+     - `set "PYTHONPATH=backend" && pytest tests/test_stock_by_item_cache.py tests/services/test_replenishment.py -q`
+   - Результат: **7 passed**.
+
+5) **Зафиксирован текущий инвариант для следующих итераций:**
+    - поток `production` пока остаётся эталонным и не должен менять результат из-за выноса классификатора;
+    - отдельная активация `rework` как нового потока должна делаться только в следующей целевой итерации с отдельными тестами и API/DB-изменениями.
+
+**2026-03-12 — итерация 2 рефакторинга потоков пополнения: вынесена общая нормализация количества без смены бизнес-поведения:**
+
+1) **В [`OrderQuantityCalculator`](backend/app/services/order_quantity_calculator.py:8) добавлен общий слой нормализации количества:**
+   - добавлены helper-методы:
+     - `is_discrete_item(...)`
+     - `normalize_qty_for_item(...)`
+   - зафиксировано текущее правило итерации:
+     - для дискретных ЕИ количество приводится вниз к целому;
+     - для недискретных ЕИ дробная часть сохраняется.
+
+2) **Production-ветка [`build_planned_orders_and_purchases()`](backend/app/services/planning_service.py:2102) переведена на shared-normalization helper:**
+   - удалена локальная дублирующая эвристика дискретности из [`planning_service.py`](backend/app/services/planning_service.py:2102);
+   - нормализация `requested_qty` и итогового `planned_qty` теперь делается через общий helper калькулятора;
+   - бизнес-поведение production сохранено: изменён только источник общей логики, а не сами правила округления.
+
+3) **Добавлены первые тесты на общий слой нормализации в [`tests/services/test_order_quantity_calculator.py`](tests/services/test_order_quantity_calculator.py:1):**
+   - проверка, что дискретная ЕИ (`шт`) отбрасывает дробную часть;
+   - проверка, что недискретная ЕИ (`кг`) сохраняет дробные значения;
+   - дополнительно закреплено поведение [`OrderQuantityCalculator.compute()`](backend/app/services/order_quantity_calculator.py:51) для дробного горизонта спроса у недискретных ЕИ.
+
+4) **Инвариант после итерации:**
+   - закупка всё ещё не переведена на общий helper и пока сохраняет legacy-поведение с `requested_qty_raw`;
+   - это сделано намеренно, чтобы следующая итерация отдельно исправила закупочный поток и доказала изменение тестами без риска регрессии production.
+
 **2026-02-27 — точечные фиксы по ревью main (без изменения API-контрактов):**
 
 1) **Безопасность (секреты):**

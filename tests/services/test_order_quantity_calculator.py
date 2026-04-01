@@ -21,6 +21,14 @@ def make_item(optimal_batch=None, moq=None, stock_qty=0.0):
         optimal_batch=optimal_batch,
         moq=moq,
         stock_qty=stock_qty,
+        unit=None,
+    )
+
+
+def make_unit(short_name=None, precision=None):
+    return SimpleNamespace(
+        short_name=short_name,
+        precision=precision,
     )
 
 
@@ -231,3 +239,62 @@ def test_horizon_cap_limits_final_qty():
     assert final_qty == 5.0  # capped by horizon demand
     assert normalized >= 5.0
     assert len(warnings) == 0
+
+
+def test_normalize_qty_for_discrete_item_floors_fractional_values():
+    snapshot = {
+        "production": {"lot_sizing": {"min_batch": 1, "multiple": 1, "rounding": "ceil"}},
+    }
+    item_id = 1
+    item = make_item(optimal_batch=None, stock_qty=0.0)
+    item.unit = "шт-ref"
+
+    oqc = OrderQuantityCalculator(
+        snapshot=snapshot,
+        default_spec_map={},
+        spec_by_id={},
+        components_loader=lambda _spec_id: [],
+        item_by_id={item_id: item},
+        units_by_ref={"шт-ref": make_unit(short_name="шт", precision=0)},
+        stock_by_item={},
+        wip_by_item={},
+        horizon_days=30,
+        total_demand_by_item={item_id: 100.0},
+    )
+
+    assert oqc.is_discrete_item(item_id) is True
+    assert oqc.normalize_qty_for_item(item_id, 7.9) == 7.0
+
+
+def test_normalize_qty_for_metric_item_preserves_fractional_values():
+    snapshot = {
+        "production": {"lot_sizing": {"min_batch": 1, "multiple": 1, "rounding": "ceil"}},
+    }
+    item_id = 1
+    item = make_item(optimal_batch=None, stock_qty=0.0)
+    item.unit = "kg-ref"
+
+    oqc = OrderQuantityCalculator(
+        snapshot=snapshot,
+        default_spec_map={},
+        spec_by_id={},
+        components_loader=lambda _spec_id: [],
+        item_by_id={item_id: item},
+        units_by_ref={"kg-ref": make_unit(short_name="кг", precision=3)},
+        stock_by_item={},
+        wip_by_item={},
+        horizon_days=30,
+        total_demand_by_item={item_id: 5.75},
+    )
+
+    assert oqc.is_discrete_item(item_id) is False
+    assert oqc.normalize_qty_for_item(item_id, 7.9) == pytest.approx(7.9, rel=1e-9)
+
+    final_qty, normalized, details, warnings = oqc.compute(item_id, 10.0)
+
+    assert final_qty == pytest.approx(5.75, rel=1e-9)
+    # Fractional quantity is preserved in the shared normalization layer,
+    # while production lot sizing still follows the existing ceil-based policy.
+    assert normalized == pytest.approx(6.0, rel=1e-9)
+    assert details.get("horizon_limit") == pytest.approx(5.75, rel=1e-9)
+    assert warnings == []

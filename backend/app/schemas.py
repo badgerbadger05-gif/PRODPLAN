@@ -10,6 +10,7 @@ class ItemBase(BaseModel):
     item_ref1c: Optional[str] = None
     replenishment_time: Optional[int] = None
     unit: Optional[str] = None
+    category_id: Optional[int] = None
     stock_qty: float = 0.0
     # Опциональная оптимальная партия (лот‑сайзинг) для номенклатуры
     optimal_batch: Optional[float] = None
@@ -535,3 +536,110 @@ class ProductionGroupedResponse(BaseModel):
     total_orders: int
     limit: int
     offset: int
+
+
+class ReworkGroupOrder(BaseModel):
+    rework_id: int
+    item_id: int
+    item_name: Optional[str] = None
+    item_article: Optional[str] = None
+    unit: Optional[str] = None
+    qty: float
+    requested_qty: float
+    planned_qty: float
+    need_date: Optional[str] = None
+    order_date: Optional[str] = None
+    lead_time_days: int = 0
+    priority_index: Optional[float] = None
+    bucket_type: Optional[str] = "daily"
+    bucket_date: Optional[str] = None
+    spec_id: Optional[int] = None
+    spec_code: Optional[str] = None
+    spec_name: Optional[str] = None
+    component_limit: Optional[float] = None
+    component_blocked: bool = False
+    component_partial: bool = False
+    shortage: Optional[dict] = None
+
+
+class ReworkGroup(BaseModel):
+    group_id: Optional[int] = None
+    group_name: str
+    orders: List[ReworkGroupOrder] = []
+    sum_qty: float = 0.0
+    sum_requested_qty: float = 0.0
+    sum_planned_qty: float = 0.0
+    blocked_orders: int = 0
+    partial_orders: int = 0
+
+
+class ReworkGroupedResponse(BaseModel):
+    groups: List[ReworkGroup]
+    total_groups: int
+    total_orders: int
+    limit: int
+    offset: int
+
+
+class PurchaseCategoryGroupOrder(BaseModel):
+    purchase_id: int
+    item_id: int
+    item_name: Optional[str] = None
+    item_article: Optional[str] = None
+    unit: Optional[str] = None
+    qty: float
+    need_date: Optional[str] = None
+    order_date: Optional[str] = None
+    lead_time_days: int = 0
+    priority_index: Optional[float] = None
+    bucket_type: Optional[str] = "daily"
+    bucket_date: Optional[str] = None
+    supplier_ref1c: Optional[str] = None
+
+
+class PurchaseCategoryGroup(BaseModel):
+    group_id: Optional[int] = None
+    group_name: str
+    orders: List[PurchaseCategoryGroupOrder] = []
+    sum_qty: float = 0.0
+
+
+class PurchaseCategoryGroupedResponse(BaseModel):
+    groups: List[PurchaseCategoryGroup]
+    total_groups: int
+    total_orders: int
+    limit: int
+    offset: int
+
+
+class PlannedReworkBase(BaseModel):
+    run_id: int
+    item_id: int
+    spec_id: Optional[int] = None
+    requested_qty: float
+    planned_qty: float
+    qty: float
+    need_date: date
+    order_date: date
+    lead_time_days: int
+    priority_index: Optional[float] = None
+    bucket_date: date
+    component_limit: Optional[float] = None
+    component_blocked: bool = False
+    component_partial: bool = False
+    shortage: Optional[dict] = None
+
+
+class PlannedReworkCreate(PlannedReworkBase):
+    pass
+
+
+class PlannedReworkUpdate(PlannedReworkBase):
+    pass
+
+
+class PlannedRework(PlannedReworkBase):
+    rework_id: int
+
+    class Config:
+        from_attributes = True

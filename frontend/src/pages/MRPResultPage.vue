@@ -7,10 +7,6 @@
     <q-banner v-else-if="pageLoading || !summary" dense class="bg-grey-2 q-mb-md">
       <q-spinner color="primary" size="1.2em" class="q-mr-sm" /> {{ t('mrp.loading') || 'Загрузка результатов…' }}
     </q-banner>
-    <!-- DIAG: remove after debugging -->
-    <q-banner dense class="bg-blue-1 text-blue-9 q-mb-md">
-      {{ diagText }}
-    </q-banner>
     <div class="row items-center q-gutter-sm q-mb-md">
       <div class="text-h5">{{ t('mrp.title', { runId }) }}</div>
       <q-space />
@@ -32,6 +28,7 @@
       <q-tabs v-model="viewTab" class="text-primary" dense>
         <q-tab name="production" icon="build" :label="t('mrp.tabs.production')" />
         <q-tab name="purchases" icon="shopping_cart" :label="t('mrp.tabs.purchases')" />
+        <q-tab name="rework" icon="sync_alt" :label="t('mrp.tabs.rework')" />
       </q-tabs>
       <q-separator />
 
@@ -91,10 +88,77 @@
             </template>
           </ProductionFilters>
 
-          <PurchasesUnifiedTable
-            :rows="purchAggRows"
-            :loading="purch.loading"
-          />
+          <div v-if="purchaseCategoryGroups.length" class="column q-gutter-md">
+            <q-card v-for="group in purchaseCategoryGroups" :key="String(group.group_id ?? `purchase-${group.group_name}`)">
+              <q-card-section class="bg-grey-2">
+                <div class="row items-center q-gutter-sm">
+                  <div class="text-subtitle1">{{ group.group_name }}</div>
+                  <q-space />
+                  <q-badge color="primary" outline>Строк: {{ group.orders.length }}</q-badge>
+                  <q-badge color="secondary" outline>Количество: {{ fmtQty(group.sum_qty) }}</q-badge>
+                </div>
+              </q-card-section>
+              <q-separator />
+              <q-table
+                flat
+                dense
+                :rows="group.orders"
+                :columns="purchaseGroupColumns"
+                row-key="purchase_id"
+                hide-bottom
+                :pagination="{ page: 1, rowsPerPage: 1000 }"
+              />
+            </q-card>
+          </div>
+          <q-banner v-else dense class="bg-grey-2 text-grey-8">
+            Нет данных по закупкам в выбранном диапазоне.
+          </q-banner>
+        </q-tab-panel>
+
+        <q-tab-panel name="rework">
+          <ProductionFilters
+            v-model="rework.filter"
+            :loading="rework.loading"
+            :title="`Результаты MRP от ${summary?.run?.started_at || '—'}`"
+            :show-day-picker="false"
+            @apply="applyReworkFiltersDebounced()"
+            @reset="onReworkReset"
+          >
+            <template #extra-actions>
+              <q-separator vertical class="q-mx-xs" />
+              <q-btn dense flat icon="download" :label="t('mrp.actions.csv')" @click="exportRework('csv')" />
+              <q-btn dense flat icon="table_view" :label="t('mrp.actions.xlsx')" @click="exportRework('xlsx')" />
+            </template>
+          </ProductionFilters>
+
+          <div v-if="reworkGroups.length" class="column q-gutter-md">
+            <q-card v-for="group in reworkGroups" :key="String(group.group_id ?? `rework-${group.group_name}`)">
+              <q-card-section class="bg-grey-2">
+                <div class="row items-center q-gutter-sm">
+                  <div class="text-subtitle1">{{ group.group_name }}</div>
+                  <q-space />
+                  <q-badge color="primary" outline>Строк: {{ group.orders.length }}</q-badge>
+                  <q-badge color="secondary" outline>Потребность: {{ fmtQty(group.sum_requested_qty) }}</q-badge>
+                  <q-badge color="positive" outline>К плану: {{ fmtQty(group.sum_planned_qty) }}</q-badge>
+                  <q-badge v-if="group.partial_orders" color="warning" outline>Частично: {{ group.partial_orders }}</q-badge>
+                  <q-badge v-if="group.blocked_orders" color="negative" outline>Блок: {{ group.blocked_orders }}</q-badge>
+                </div>
+              </q-card-section>
+              <q-separator />
+              <q-table
+                flat
+                dense
+                :rows="group.orders"
+                :columns="reworkGroupColumns"
+                row-key="rework_id"
+                hide-bottom
+                :pagination="{ page: 1, rowsPerPage: 1000 }"
+              />
+            </q-card>
+          </div>
+          <q-banner v-else dense class="bg-grey-2 text-grey-8">
+            Нет данных по переработке в выбранном диапазоне.
+          </q-banner>
         </q-tab-panel>
       </q-tab-panels>
     </div>
@@ -105,6 +169,7 @@
     <q-tabs v-model="tab" class="text-primary q-mb-sm" dense>
       <q-tab name="production" icon="build" :label="t('mrp.tabs.productionDetail')" />
       <q-tab name="purchases" icon="shopping_cart" :label="t('mrp.tabs.purchasesDetail')" />
+      <q-tab name="rework" icon="sync_alt" :label="t('mrp.tabs.reworkDetail')" />
       <q-tab name="capacity" icon="bar_chart" :label="t('mrp.tabs.capacity')" />
       <q-tab name="pegging" icon="device_hub" :label="t('mrp.tabs.pegging')" />
       <q-tab name="components" icon="list" :label="t('mrp.tabs.components')" />
@@ -143,6 +208,23 @@
           :loading="purch.loading"
           :pagination="purch.pagination"
           @request="onPurchRequest"
+        />
+      </q-tab-panel>
+
+      <q-tab-panel name="rework">
+        <div class="row items-center q-gutter-sm q-mb-sm">
+          <q-input v-model="rework.filter.date_from" dense outlined :label="t('mrp.filters.fromDate')" style="width: 200px" />
+          <q-input v-model="rework.filter.date_to" dense outlined :label="t('mrp.filters.toDate')" style="width: 200px" />
+          <q-space />
+          <q-btn dense flat icon="refresh" @click="applyReworkFiltersDebounced()" />
+        </div>
+        <q-table
+          :rows="rework.rows"
+          :columns="rework.columns"
+          row-key="rework_id"
+          :loading="rework.loading"
+          :pagination="rework.pagination"
+          @request="onReworkRequest"
         />
       </q-tab-panel>
 
@@ -292,6 +374,7 @@ import api, {
   getPlanningRunSummary,
   getPlanningResultProduction,
   getPlanningResultPurchases,
+  getPlanningResultPurchasesGroupedByCategory,
   getPlanningResultCapacity,
   getPlanningResultPegging,
   getSpecificationFull,
@@ -299,8 +382,10 @@ import api, {
   listResources,
   exportPlanningResultProduction,
   exportPlanningResultPurchases,
+  exportPlanningResultRework,
   getPlanningResultProductionGrouped,
-  getPlanningResultPurchasesGrouped,
+  getPlanningResultRework,
+  getPlanningResultReworkGroupedByCategory,
   getPlanningResultCapacitySummary,
   getShortageReport,
   createForcedOrder,
@@ -309,12 +394,11 @@ import api, {
 } from '../services/api'
 import type { QTableColumn } from 'quasar'
 import type { SpecNode } from '../services/api'
-import type { ProductionOrder, PurchaseRow, CapacityRow, PeggingRow } from '../types/mrp'
+import type { ProductionOrder, PurchaseRow, CapacityRow, PeggingRow, PurchaseCategoryGroup, ReworkRow, ReworkGroup } from '../types/mrp'
 import { useFormatting } from '../composables/useFormatting'
 import MRPSummaryCard from '../components/mrp/MRPSummaryCard.vue'
 import ProductionFilters from '../components/mrp/ProductionFilters.vue'
 import ProductionUnifiedTable from '../components/mrp/ProductionUnifiedTable.vue'
-import PurchasesUnifiedTable from '../components/mrp/PurchasesUnifiedTable.vue'
 import ProductionGroupedTable from '../components/mrp/ProductionGroupedTable.vue'
 import CapacityTable from '../components/mrp/CapacityTable.vue'
 import PeggingTable from '../components/mrp/PeggingTable.vue'
@@ -398,29 +482,52 @@ const prodUnifiedColumns: QTableColumn<any>[] = [
   { name: 'norm_total', label: t('mrp.columns.normTotal'), field: 'norm_hours_total', align: 'right' }
 ]
 
-const purchUnifiedColumns: QTableColumn<any>[] = [
+const purchaseGroupColumns: QTableColumn<any>[] = [
   { name: 'name', label: t('mrp.columns.name'), field: 'item_name', align: 'left' },
   { name: 'article', label: t('mrp.columns.article'), field: 'item_article', align: 'left' },
-  { name: 'qty', label: t('mrp.columns.qty'), field: 'qty', align: 'right' }
+  { name: 'qty', label: t('mrp.columns.qty'), field: 'qty', align: 'right', format: (val: number) => fmtQty(val) },
+  { name: 'need_date', label: t('mrp.columns.needDate'), field: 'need_date', align: 'left' },
+  { name: 'order_date', label: t('mrp.columns.orderDate'), field: 'order_date', align: 'left' },
+  { name: 'unit', label: 'ЕИ', field: 'unit', align: 'left' }
+]
+
+function reworkStatusLabel(row: Partial<ReworkRow> | null | undefined): string {
+  if (row?.component_blocked) return 'Блок'
+  if (row?.component_partial) return 'Частично'
+  return 'OK'
+}
+
+const reworkGroupColumns: QTableColumn<any>[] = [
+  { name: 'name', label: t('mrp.columns.name'), field: 'item_name', align: 'left' },
+  { name: 'article', label: t('mrp.columns.article'), field: 'item_article', align: 'left' },
+  { name: 'requested_qty', label: 'Потребность', field: 'requested_qty', align: 'right', format: (val: number) => fmtQty(val) },
+  { name: 'planned_qty', label: 'К плану', field: 'planned_qty', align: 'right', format: (val: number) => fmtQty(val) },
+  { name: 'need_date', label: t('mrp.columns.needDate'), field: 'need_date', align: 'left' },
+  { name: 'spec_name', label: 'Спецификация', field: 'spec_name', align: 'left' },
+  { name: 'status', label: 'Статус', field: (row: ReworkRow) => reworkStatusLabel(row), align: 'left' }
+]
+
+const reworkColumns: QTableColumn<ReworkRow>[] = [
+  { name: 'rework_id', label: 'ID', field: 'rework_id', align: 'right', sortable: true },
+  { name: 'item_name', label: t('mrp.columns.name'), field: 'item_name', align: 'left', sortable: true },
+  { name: 'item_article', label: t('mrp.columns.article'), field: 'item_article', align: 'left', sortable: true },
+  { name: 'requested_qty', label: 'Потребность', field: 'requested_qty', align: 'right', sortable: true, format: (val: number) => fmtQty(val) },
+  { name: 'planned_qty', label: 'К плану', field: 'planned_qty', align: 'right', sortable: true, format: (val: number) => fmtQty(val) },
+  { name: 'need_date', label: t('mrp.columns.needDate'), field: 'need_date', align: 'left', sortable: true },
+  { name: 'order_date', label: t('mrp.columns.orderDate'), field: 'order_date', align: 'left', sortable: true },
+  { name: 'spec_name', label: 'Спецификация', field: 'spec_name', align: 'left', sortable: true },
+  { name: 'status', label: 'Статус', field: (row: ReworkRow) => reworkStatusLabel(row), align: 'left' }
 ]
 
 const route = useRoute()
 const runId = Number(route.params.runId)
-try { console.log('MRPResultPage diag', { params: route.params, runId }) } catch {}
-const diagText = computed(() => {
-  try {
-    return `diag: runId=${runId} · params=${JSON.stringify(route.params)}`
-  } catch {
-    return `diag: runId=${runId} · params=[unserializable]`
-  }
-})
 
 const summary = ref<any | null>(null)
 const pageLoading = ref(true)
 const loadError = ref<string | null>(null)
-const tab = ref<'production' | 'purchases' | 'capacity' | 'pegging' | 'components'>('production')
+const tab = ref<'production' | 'purchases' | 'rework' | 'capacity' | 'pegging' | 'components'>('production')
 // Вкладки верхнего уровня для унифицированных таблиц
-const viewTab = ref<'production' | 'purchases'>('production')
+const viewTab = ref<'production' | 'purchases' | 'rework'>('production')
 // Показать техстроки (qty=0) — по умолчанию скрыты
 const showTechnicalRows = ref(false)
 
@@ -478,7 +585,8 @@ const kindIssuesRows = computed(() => {
  // Полные наборы строк для верхних таблиц (без учёта пагинации детальных)
  const prodAllRows = ref<any[]>([])
  const purchAllRows = ref<any[]>([])
- const purchGroupedRows = ref<any[]>([])
+ const purchaseCategoryGroups = ref<PurchaseCategoryGroup[]>([])
+ const reworkGroups = ref<ReworkGroup[]>([])
 // Итоговый источник строк для карточки «Рекомендуемые заказы на производство»
 const groupedProdRows = computed(() => {
   return groupedProductionOrders.value || []
@@ -515,12 +623,6 @@ const plainProdRows = computed(() => {
   const arr = Array.from(rowMap.values())
   return showTechnicalRows.value ? arr : arr.filter((r: any) => Number(r?.qty ?? 0) > 0)
 })
-// Агрегация закупок по item_id+unit для верхней вкладки (независимо от пагинации детальных)
-const purchAggRows = computed(() => {
-  return purchGroupedRows.value || []
-})
-
-
 async function rebuildGroupedProductionOrders() {
   try {
     // При однодневном диапазоне (когда date_from и date_to одинаковы) бэкенд может возвращать данные по-разному
@@ -668,6 +770,20 @@ const purch = reactive<{
   columns: purchColumns
 })
 
+const rework = reactive<{
+  rows: ReworkRow[]
+  loading: boolean
+  filter: { date_from: string; date_to: string }
+  pagination: { page: number; rowsPerPage: number; rowsNumber: number }
+  columns: QTableColumn<ReworkRow>[]
+}>({
+  rows: [] as ReworkRow[],
+  loading: false,
+  filter: { date_from: '', date_to: '' },
+  pagination: { page: 1, rowsPerPage: 20, rowsNumber: 0 },
+  columns: reworkColumns
+})
+
 // Capacity state
 const cap = reactive<{
   rows: CapacityRow[]
@@ -793,34 +909,103 @@ async function loadPurchases() {
     // Отказ от полной выгрузки 100000 строк — используем текущую страницу как «полный» источник для фолбэка
     purchAllRows.value = (resp?.rows || [])
 
-    // Пытаемся загрузить агрегат для верхней таблицы; при ошибке строим фолбэк из resp.rows
+    // Пытаемся загрузить группировку по товарным группам; при ошибке строим фолбэк из текущих строк
     try {
-      const grouped = await getPlanningResultPurchasesGrouped(runId, {
+      const grouped = await getPlanningResultPurchasesGroupedByCategory(runId, {
         date_from: emptyToUndef(purch.filter.date_from),
         date_to: emptyToUndef(purch.filter.date_to),
+        sort_by: 'item_name',
+        sort_dir: 'asc',
         limit: 1000,
         offset: 0
       })
-      purchGroupedRows.value = (grouped?.rows || [])
+      purchaseCategoryGroups.value = (grouped?.groups || []) as PurchaseCategoryGroup[]
     } catch (e) {
-      console.warn('Purchases grouped endpoint failed; falling back to /purchases rows', e)
-      purchGroupedRows.value = (resp?.rows || []).map((r: any) => ({
-        agg_key: String(r?.agg_key ?? `${Number(r?.item_id || 0)}|${r?.unit || ''}`),
+      console.warn('Purchases grouped-by-category endpoint failed; falling back to /purchases rows', e)
+      const fallbackOrders = (resp?.rows || []).map((r: any) => ({
+        purchase_id: Number(r?.purchase_id || 0),
         item_id: Number(r?.item_id || 0),
         item_name: r?.item_name ?? null,
         item_article: r?.item_article ?? null,
         unit: r?.unit ?? null,
-        qty: Number(r?.qty ?? 0)
+        qty: Number(r?.qty ?? 0),
+        need_date: r?.need_date ?? null,
+        order_date: r?.order_date ?? null,
+        lead_time_days: r?.lead_time_days != null ? Number(r?.lead_time_days) : null,
+        priority_index: r?.priority_index != null ? Number(r?.priority_index) : null,
+        bucket_type: r?.bucket_type ?? 'daily',
+        bucket_date: r?.bucket_date ?? null,
+        supplier_ref1c: r?.supplier_ref1c ?? null,
       }))
+      purchaseCategoryGroups.value = fallbackOrders.length
+        ? [{
+            group_id: null,
+            group_name: 'Без товарной группы',
+            orders: fallbackOrders,
+            sum_qty: fallbackOrders.reduce((acc, row) => acc + Number(row.qty || 0), 0),
+          }]
+        : []
     }
   } catch (e) {
     console.error('Failed to load purchases', e)
     purch.rows = []
     purch.pagination.rowsNumber = 0
     purchAllRows.value = []
-    purchGroupedRows.value = []
+    purchaseCategoryGroups.value = []
   } finally {
     purch.loading = false
+  }
+}
+
+async function loadRework() {
+  rework.loading = true
+  try {
+    const limit = rework.pagination.rowsPerPage
+    const offset = (rework.pagination.page - 1) * rework.pagination.rowsPerPage
+    const resp = await getPlanningResultRework(runId, {
+      date_from: emptyToUndef(rework.filter.date_from),
+      date_to: emptyToUndef(rework.filter.date_to),
+      sort_by: 'need_date',
+      sort_dir: 'asc',
+      limit,
+      offset
+    })
+
+    rework.rows = resp.rows || []
+    rework.pagination.rowsNumber = resp.total || 0
+
+    try {
+      const grouped = await getPlanningResultReworkGroupedByCategory(runId, {
+        date_from: emptyToUndef(rework.filter.date_from),
+        date_to: emptyToUndef(rework.filter.date_to),
+        sort_by: 'need_date',
+        sort_dir: 'asc',
+        limit: 1000,
+        offset: 0
+      })
+      reworkGroups.value = (grouped?.groups || []) as ReworkGroup[]
+    } catch (e) {
+      console.warn('Rework grouped-by-category endpoint failed; falling back to /rework rows', e)
+      reworkGroups.value = rework.rows.length
+        ? [{
+            group_id: null,
+            group_name: 'Без товарной группы',
+            orders: [...rework.rows],
+            sum_qty: rework.rows.reduce((acc, row) => acc + Number(row.qty || 0), 0),
+            sum_requested_qty: rework.rows.reduce((acc, row) => acc + Number(row.requested_qty || 0), 0),
+            sum_planned_qty: rework.rows.reduce((acc, row) => acc + Number(row.planned_qty || 0), 0),
+            blocked_orders: rework.rows.filter((row) => Boolean(row.component_blocked)).length,
+            partial_orders: rework.rows.filter((row) => Boolean(row.component_partial)).length,
+          }]
+        : []
+    }
+  } catch (e) {
+    console.error('Failed to load rework', e)
+    rework.rows = []
+    rework.pagination.rowsNumber = 0
+    reworkGroups.value = []
+  } finally {
+    rework.loading = false
   }
 }
 
@@ -893,6 +1078,25 @@ async function exportPurch(fmt: 'csv' | 'xlsx') {
     }
   } catch (e) {
     console.error('Export purchases failed', e)
+  }
+}
+
+async function exportRework(fmt: 'csv' | 'xlsx') {
+  try {
+    const res = await exportPlanningResultRework(runId, {
+      format: fmt,
+      date_from: emptyToUndef(rework.filter.date_from),
+      date_to: emptyToUndef(rework.filter.date_to),
+      sort_by: 'need_date',
+      sort_dir: 'asc'
+    })
+    if (fmt === 'csv') {
+      downloadTextFile(res?.data || '', res?.filename || `mrp_rework_run_${runId}.csv`, 'text/csv;charset=utf-8')
+    } else {
+      downloadBase64Xlsx(res?.data_base64 || '', res?.filename || `mrp_rework_run_${runId}.xlsx`)
+    }
+  } catch (e) {
+    console.error('Export rework failed', e)
   }
 }
 
@@ -1092,6 +1296,15 @@ function onPurchReset() {
   purch.filter.date_to = ''
   loadPurchases()
 }
+function onReworkRequest(ctx: any) {
+  if (ctx?.pagination) rework.pagination = ctx.pagination
+  loadRework()
+}
+function onReworkReset() {
+  rework.filter.date_from = ''
+  rework.filter.date_to = ''
+  loadRework()
+}
 function onCapRequest(ctx: any) {
   if (ctx?.pagination) cap.pagination = ctx.pagination
   loadCapacity()
@@ -1178,6 +1391,7 @@ function debugProdFilters() {
   console.log('Production all rows count:', prodAllRows.value.length);
 }
 const applyPurchFiltersDebounced = debounce(loadPurchases, 250)
+const applyReworkFiltersDebounced = debounce(loadRework, 250)
 const loadCapacityUpperDebounced = debounce(loadCapacityUpper, 250)
 
 onMounted(async () => {
@@ -1188,6 +1402,7 @@ onMounted(async () => {
     await Promise.all([
       loadProduction(),
       loadPurchases(),
+      loadRework(),
       loadDictionaries()
     ])
     console.timeEnd('MRP:loaders')
@@ -1198,7 +1413,8 @@ onMounted(async () => {
     console.log('MRP onMounted', {
       grouped: (groupedProductionOrders as any)?.value?.length ?? 0,
       prodRows: (prod.rows || []).length,
-      purchRows: (purch.rows || []).length
+      purchRows: (purch.rows || []).length,
+      reworkRows: (rework.rows || []).length
     })
   } catch (e: any) {
     console.error('MRPResultPage mount error', e)
@@ -1217,6 +1433,7 @@ onMounted(async () => {
 watch(tab, (t) => {
   if (t === 'production' && !prod.rows.length) loadProduction()
   if (t === 'purchases' && !purch.rows.length) loadPurchases()
+  if (t === 'rework' && !rework.rows.length) loadRework()
   if (t === 'capacity') loadCapacity()
   if (t === 'pegging') loadPegging()
 })
@@ -1225,6 +1442,7 @@ watch(tab, (t) => {
 watch(viewTab, (vt) => {
   if (vt === 'production' && !prod.rows.length) loadProduction()
   if (vt === 'purchases' && !purch.rows.length) loadPurchases()
+  if (vt === 'rework' && !rework.rows.length) loadRework()
 })
 
 // Актуализируем индикаторы перегруза при изменении фильтров верхней вкладки «Производство»

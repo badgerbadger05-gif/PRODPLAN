@@ -1,4 +1,10 @@
 import { api } from '../boot/axios'
+import type {
+  PurchaseCategoryGroupedResponse,
+  ReworkGroupedResponse,
+  ReworkRow,
+  PagedResponse,
+} from '../types/mrp'
 
 // Используем единый экземпляр axios из boot (baseURL='/api', таймауты настроены там)
 
@@ -244,6 +250,18 @@ export async function exportPlanningResultPurchases(runId: number, params: {
   const { data } = await api.get(`/v1/plan/results/${runId}/purchases/export`, { params })
   return data
 }
+
+/** Export rework results as CSV or XLSX (base64) */
+export async function exportPlanningResultRework(runId: number, params: {
+  format: 'csv' | 'xlsx'
+  date_from?: string
+  date_to?: string
+  sort_by?: 'item_name' | 'item_article' | 'qty' | 'requested_qty' | 'planned_qty' | 'need_date' | 'order_date' | 'bucket_date' | 'priority_index' | 'spec_name'
+  sort_dir?: 'asc' | 'desc'
+}): Promise<any> {
+  const { data } = await api.get(`/v1/plan/results/${runId}/rework/export`, { params })
+  return data
+}
 // === Backend-first grouped/agenda/summary API wrappers (additive) ===
 
 export async function getPlanningResultProductionGrouped(runId: number, params: {
@@ -302,6 +320,45 @@ export async function getPlanningResultPurchasesGrouped(runId: number, params: {
   offset: number
 }> {
   const { data } = await api.get(`/v1/plan/results/${runId}/purchases/grouped`, { params })
+  return data
+}
+
+export async function getPlanningResultPurchasesGroupedByCategory(runId: number, params: {
+  item_id?: number
+  date_from?: string
+  date_to?: string
+  limit?: number
+  offset?: number
+  sort_by?: 'item_name' | 'item_article' | 'qty' | 'need_date' | 'order_date' | 'bucket_date' | 'priority_index'
+  sort_dir?: 'asc' | 'desc'
+} = {}): Promise<PurchaseCategoryGroupedResponse> {
+  const { data } = await api.get(`/v1/plan/results/${runId}/purchases/grouped-by-category`, { params })
+  return data
+}
+
+export async function getPlanningResultRework(runId: number, params: {
+  item_id?: number
+  date_from?: string
+  date_to?: string
+  limit?: number
+  offset?: number
+  sort_by?: 'item_name' | 'item_article' | 'qty' | 'requested_qty' | 'planned_qty' | 'need_date' | 'order_date' | 'bucket_date' | 'priority_index' | 'spec_name'
+  sort_dir?: 'asc' | 'desc'
+} = {}): Promise<PagedResponse<ReworkRow> & { total_qty: number }> {
+  const { data } = await api.get(`/v1/plan/results/${runId}/rework`, { params })
+  return data
+}
+
+export async function getPlanningResultReworkGroupedByCategory(runId: number, params: {
+  item_id?: number
+  date_from?: string
+  date_to?: string
+  limit?: number
+  offset?: number
+  sort_by?: 'item_name' | 'item_article' | 'qty' | 'need_date' | 'order_date' | 'bucket_date'
+  sort_dir?: 'asc' | 'desc'
+} = {}): Promise<ReworkGroupedResponse> {
+  const { data } = await api.get(`/v1/plan/results/${runId}/rework/grouped-by-category`, { params })
   return data
 }
 

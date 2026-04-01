@@ -121,7 +121,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onBeforeUnmount } from 'vue'
+import { ref, onBeforeUnmount, onMounted } from 'vue'
 import { Notify } from 'quasar'
 import api from '../services/api'
 
@@ -268,11 +268,22 @@ async function exportGroups() {
     loading.value.groups = true
     const { data } = await api.post('/v1/odata/categories/export_groups', form.value)
     Notify.create({ type: 'positive', message: `Выгружено групп: ${data.total}` })
+    await loadGroups()
   } catch (e:any) {
     const msg = e?.response?.data?.detail || e?.message || 'Ошибка выгрузки групп'
     Notify.create({ type: 'negative', message: String(msg) })
   } finally {
     loading.value.groups = false
+  }
+}
+
+async function loadSelection() {
+  try {
+    const sel = await api.get('/v1/odata/groups/selection')
+    const ids: string[] = Array.isArray(sel.data?.ids) ? sel.data.ids : []
+    selectedIds.value = new Set(ids)
+  } catch {
+    // не сбрасываем локальное состояние при временной ошибке загрузки выбора
   }
 }
 
@@ -289,10 +300,7 @@ async function loadGroups() {
         name: String(r.Description || r.name || '')
       }))
       .sort((a:GroupItem,b:GroupItem)=> (a.code+a.name).localeCompare(b.code+b.name))
-    // загрузим сохранённый выбор
-    const sel = await api.get('/v1/odata/groups/selection')
-    const ids: string[] = Array.isArray(sel.data?.ids) ? sel.data.ids : []
-    selectedIds.value = new Set(ids)
+    await loadSelection()
   } catch (e:any) {
     const msg = e?.response?.data?.detail || e?.message || 'Ошибка загрузки групп'
     Notify.create({ type: 'negative', message: String(msg) })
@@ -807,7 +815,10 @@ function downloadBase64Xlsx(b64: string, filename: string) {
   }
 }
 
-loadConfig()
+onMounted(() => {
+  void loadConfig()
+  void loadGroups()
+})
   
 </script>
 

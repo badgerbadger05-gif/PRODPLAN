@@ -7,6 +7,7 @@ import pytest
 from backend.app.services.planning_service import (
     get_run_production,
     get_run_purchases,
+    get_run_summary,
 )
 
 
@@ -132,3 +133,44 @@ def test_get_run_purchases_handles_missing_columns():
     assert row["qty"] == 5
     assert row["item_id"] == 200
     assert row["unit"] == "guid"
+
+
+def test_get_run_summary_keeps_production_warning_contract(db_session):
+    from backend.app.models import PlanningRun
+
+    db = db_session
+    run = PlanningRun(
+        status="SUCCESS",
+        started_by="test",
+        horizon_days=10,
+        pinned=False,
+        config_version_id=None,
+        config_snapshot={},
+        warnings=[
+            {"code": "PRODUCTION_KIND_NOT_FOUND", "item_id": 10},
+            {"code": "NO_AREA_FOR_PRODUCTION_KIND", "item_id": 10},
+            {"code": "COMPONENT_SHORTAGE_BLOCKED", "item_id": 11},
+            {"code": "COMPONENT_SHORTAGE_PARTIAL", "item_id": 12},
+        ],
+        kpi={},
+        started_at=datetime.datetime.utcnow(),
+        finished_at=datetime.datetime.utcnow(),
+    )
+    db.add(run)
+    db.commit()
+
+    result = get_run_summary(db=db, run_id=run.run_id)
+
+    assert result["counts"]["production_orders"] == 0
+    assert result["counts"]["purchase_requests"] == 0
+    assert result["counts"]["rework_requests"] == 0
+    assert result["componentShortages"]["blocked"] == 1
+    assert result["componentShortages"]["partial"] == 1
+    assert result["kindIssues"]["total"] == 2
+    assert result["kindIssues"]["byCode"]["NO_PRODUCTION_KIND"] == 1
+    assert result["kindIssues"]["byCode"]["NO_AREA_FOR_PRODUCTION_KIND"] == 1
+    codes = [warning["code"] for warning in result["warnings"]]
+    assert "NO_PRODUCTION_KIND" in codes
+    assert "NO_AREA_FOR_PRODUCTION_KIND" in codes
+    assert "COMPONENT_SHORTAGE_BLOCKED" in codes
+    assert "COMPONENT_SHORTAGE_PARTIAL" in codes

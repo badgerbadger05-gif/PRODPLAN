@@ -32,6 +32,7 @@ export interface MRPSummaryRun {
 export interface MRPSummaryCounts {
   production_orders?: number
   purchase_requests?: number
+  rework_requests?: number
 }
 
 export interface MRPSummaryCapacity {
@@ -191,6 +192,80 @@ export interface PurchaseGroupedRow {
   qty: number
 }
 
+export interface PurchaseCategoryGroupOrder {
+  purchase_id: number
+  item_id: number
+  item_name?: string | null
+  item_article?: string | null
+  unit?: string | null
+  qty: number
+  need_date?: string | null
+  order_date?: string | null
+  lead_time_days?: number | null
+  bucket_type?: BucketType | null
+  bucket_date?: IsoDate | null
+  priority_index?: number | null
+  supplier_ref1c?: string | null
+}
+
+export interface PurchaseCategoryGroup {
+  group_id?: number | null
+  group_name: string
+  orders: PurchaseCategoryGroupOrder[]
+  sum_qty: number
+}
+
+export interface PurchaseCategoryGroupedResponse {
+  groups: PurchaseCategoryGroup[]
+  total_groups: number
+  total_orders: number
+  limit: number
+  offset: number
+}
+
+export interface ReworkRow {
+  rework_id: number
+  item_id: number
+  unit?: string | null
+  qty: number
+  requested_qty: number
+  planned_qty: number
+  need_date?: string | null
+  order_date?: string | null
+  lead_time_days?: number | null
+  bucket_type?: BucketType | null
+  bucket_date?: IsoDate | null
+  priority_index?: number | null
+  spec_id?: number | null
+  spec_code?: string | null
+  spec_name?: string | null
+  component_limit?: number | null
+  component_blocked?: boolean
+  component_partial?: boolean
+  shortage?: Record<string, any> | null
+  item_name?: string | null
+  item_article?: string | null
+}
+
+export interface ReworkGroup {
+  group_id?: number | null
+  group_name: string
+  orders: ReworkRow[]
+  sum_qty: number
+  sum_requested_qty: number
+  sum_planned_qty: number
+  blocked_orders: number
+  partial_orders: number
+}
+
+export interface ReworkGroupedResponse {
+  groups: ReworkGroup[]
+  total_groups: number
+  total_orders: number
+  limit: number
+  offset: number
+}
+
 // ---------- Capacity ----------
 export interface CapacityRow {
   area_id: number
@@ -227,6 +302,11 @@ export interface ProductionFilters {
 }
 
 export interface PurchaseFilters {
+  date_from?: IsoDate
+  date_to?: IsoDate
+}
+
+export interface ReworkFilters {
   date_from?: IsoDate
   date_to?: IsoDate
 }

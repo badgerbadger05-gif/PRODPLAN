@@ -13,6 +13,8 @@ from app.models import (
     ProductionProduct,
     PlanningRun,
     PlannedOrder,
+    PlannedPurchase,
+    PlannedRework,
 )
 
 from app.services.order_quantity_calculator import OrderQuantityCalculator
@@ -200,6 +202,116 @@ def test_active_1c_remaining_reduces_requested_qty_for_production_order(db_sessi
     assert float(row.planned_qty) == 3.0
 
 
+def test_purchase_flow_normalizes_fractional_qty_for_discrete_units(db_session):
+    db = db_session
+
+    u = Unit(unit_ref1c="u-pcs", unit_name="шт", short_name="шт", precision=0)
+    db.add(u)
+
+    item = Item(
+        item_code="BUY-DISCRETE",
+        item_name="Buy Discrete",
+        item_article="BUY-DISCRETE",
+        replenishment_method="Покупка",
+        replenishment_time=5,
+        unit="u-pcs",
+        stock_qty=0,
+        status="active",
+    )
+    db.add(item)
+    db.flush()
+
+    run = _mk_run(db)
+    units_by_ref = {"u-pcs": u}
+    item_cache = {item.item_id: item}
+
+    calc = OrderQuantityCalculator(
+        snapshot=run.config_snapshot,
+        default_spec_map={},
+        spec_by_id={},
+        components_loader=lambda _sid: [],
+        item_by_id=item_cache,
+        units_by_ref=units_by_ref,
+        res_by_id={},
+        production_kinds_by_resource={},
+        stock_by_item={item.item_id: 0.0},
+        wip_by_item={},
+        horizon_days=run.horizon_days or 0,
+        total_demand_by_item={item.item_id: 7.9},
+    )
+
+    net_req = {str(item.item_id): {"2025-01-01": 7.9}}
+    build_planned_orders_and_purchases(
+        db,
+        run,
+        net_req,
+        calc,
+        priority_manager=SimpleNamespace(),
+        item_cache=item_cache,
+        units_by_ref=units_by_ref,
+    )
+
+    row = db.query(PlannedPurchase).filter(PlannedPurchase.run_id == run.run_id).one()
+    assert float(row.requested_qty) == 7.0
+    assert float(row.planned_qty) == 7.0
+    assert float(row.qty) == 7.0
+
+
+def test_purchase_flow_preserves_fractional_qty_for_metric_units(db_session):
+    db = db_session
+
+    u = Unit(unit_ref1c="u-kg", unit_name="кг", short_name="кг", precision=3)
+    db.add(u)
+
+    item = Item(
+        item_code="BUY-METRIC",
+        item_name="Buy Metric",
+        item_article="BUY-METRIC",
+        replenishment_method="Покупка",
+        replenishment_time=5,
+        unit="u-kg",
+        stock_qty=0,
+        status="active",
+    )
+    db.add(item)
+    db.flush()
+
+    run = _mk_run(db)
+    units_by_ref = {"u-kg": u}
+    item_cache = {item.item_id: item}
+
+    calc = OrderQuantityCalculator(
+        snapshot=run.config_snapshot,
+        default_spec_map={},
+        spec_by_id={},
+        components_loader=lambda _sid: [],
+        item_by_id=item_cache,
+        units_by_ref=units_by_ref,
+        res_by_id={},
+        production_kinds_by_resource={},
+        stock_by_item={item.item_id: 0.0},
+        wip_by_item={},
+        horizon_days=run.horizon_days or 0,
+        total_demand_by_item={item.item_id: 7.9},
+    )
+
+    net_req = {str(item.item_id): {"2025-01-01": 7.9}}
+    build_planned_orders_and_purchases(
+        db,
+        run,
+        net_req,
+        calc,
+        priority_manager=SimpleNamespace(),
+        item_cache=item_cache,
+        units_by_ref=units_by_ref,
+    )
+
+    row = db.query(PlannedPurchase).filter(PlannedPurchase.run_id == run.run_id).one()
+    assert float(row.requested_qty) == 7.9
+    assert float(row.planned_qty) == 7.9
+    assert float(row.qty) == 7.9
+
+
 def test_get_active_1c_remaining_by_item_filters_done_deleted_and_nonpositive(db_session):
     db = db_session
 
@@ -318,4 +430,385 @@ def test_recursive_component_reservation_with_cycle_guard(db_session):
     assert reserved.get(c.item_id) == 12.0
     assert not reserved.get(a.item_id)
     assert any(w.get("code") == "ACTIVE_1C_BOM_CYCLE_SKIPPED" for w in warnings)
+
+
+def test_rework_flow_creates_full_order_when_components_are_sufficient(db_session):
+    db = db_session
+
+    u = Unit(unit_ref1c="u-rw-full", unit_name="шт", short_name="шт", precision=0)
+    db.add(u)
+
+    parent = Item(
+        item_code="RW-FULL",
+        item_name="Rework Full",
+        item_article="RW-FULL",
+        replenishment_method="Переработка",
+        replenishment_time=2,
+        unit="u-rw-full",
+        stock_qty=0,
+        status="active",
+    )
+    component = Item(
+        item_code="RW-COMP-FULL",
+        item_name="Rework Component Full",
+        item_article="RW-COMP-FULL",
+        replenishment_method="Покупка",
+        unit="u-rw-full",
+        stock_qty=20,
+        status="active",
+    )
+    db.add_all([parent, component])
+    db.flush()
+
+    spec = Specification(spec_code="RW-S-FULL", spec_name="Rework Full Spec")
+    db.add(spec)
+    db.flush()
+    db.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db.add(SpecComponent(spec_id=spec.spec_id, item_id=component.item_id, quantity=2.0))
+    db.flush()
+
+    run = _mk_run(db)
+    units_by_ref = {"u-rw-full": u}
+    item_cache = {parent.item_id: parent, component.item_id: component}
+
+    def components_loader(spec_id: int):
+        return db.query(SpecComponent).filter(SpecComponent.spec_id == spec_id).all()
+
+    calc = OrderQuantityCalculator(
+        snapshot=run.config_snapshot,
+        default_spec_map={parent.item_id: spec.spec_id},
+        spec_by_id={spec.spec_id: spec},
+        components_loader=components_loader,
+        item_by_id=item_cache,
+        units_by_ref=units_by_ref,
+        res_by_id={},
+        production_kinds_by_resource={},
+        stock_by_item={parent.item_id: 0.0, component.item_id: 20.0},
+        wip_by_item={},
+        horizon_days=run.horizon_days or 0,
+        total_demand_by_item={parent.item_id: 5.0},
+    )
+
+    out = build_planned_orders_and_purchases(
+        db,
+        run,
+        {str(parent.item_id): {"2025-01-01": 5.0}},
+        calc,
+        priority_manager=SimpleNamespace(),
+        item_cache=item_cache,
+        units_by_ref=units_by_ref,
+    )
+
+    row = db.query(PlannedRework).filter(PlannedRework.run_id == run.run_id).one()
+    assert float(row.requested_qty) == 5.0
+    assert float(row.planned_qty) == 5.0
+    assert float(row.qty) == 5.0
+    assert row.spec_id == spec.spec_id
+    assert row.component_blocked is False
+    assert row.component_partial is False
+    assert (row.shortage or {}).get("planned_qty") == 5.0
+    assert not any(w.get("code", "").startswith("REWORK_COMPONENT_SHORTAGE_") for w in out.get("warnings", []))
+
+
+def test_rework_flow_marks_partial_when_components_limit_qty(db_session):
+    db = db_session
+
+    u = Unit(unit_ref1c="u-rw-part", unit_name="шт", short_name="шт", precision=0)
+    db.add(u)
+
+    parent = Item(
+        item_code="RW-PART",
+        item_name="Rework Partial",
+        item_article="RW-PART",
+        replenishment_method="Переработка",
+        replenishment_time=1,
+        unit="u-rw-part",
+        stock_qty=0,
+        status="active",
+    )
+    component = Item(
+        item_code="RW-COMP-PART",
+        item_name="Rework Component Part",
+        item_article="RW-COMP-PART",
+        replenishment_method="Покупка",
+        unit="u-rw-part",
+        stock_qty=6,
+        status="active",
+    )
+    db.add_all([parent, component])
+    db.flush()
+
+    spec = Specification(spec_code="RW-S-PART", spec_name="Rework Partial Spec")
+    db.add(spec)
+    db.flush()
+    db.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db.add(SpecComponent(spec_id=spec.spec_id, item_id=component.item_id, quantity=2.0))
+    db.flush()
+
+    run = _mk_run(db)
+    units_by_ref = {"u-rw-part": u}
+    item_cache = {parent.item_id: parent, component.item_id: component}
+
+    def components_loader(spec_id: int):
+        return db.query(SpecComponent).filter(SpecComponent.spec_id == spec_id).all()
+
+    calc = OrderQuantityCalculator(
+        snapshot=run.config_snapshot,
+        default_spec_map={parent.item_id: spec.spec_id},
+        spec_by_id={spec.spec_id: spec},
+        components_loader=components_loader,
+        item_by_id=item_cache,
+        units_by_ref=units_by_ref,
+        res_by_id={},
+        production_kinds_by_resource={},
+        stock_by_item={parent.item_id: 0.0, component.item_id: 6.0},
+        wip_by_item={},
+        horizon_days=run.horizon_days or 0,
+        total_demand_by_item={parent.item_id: 5.0},
+    )
+
+    out = build_planned_orders_and_purchases(
+        db,
+        run,
+        {str(parent.item_id): {"2025-01-01": 5.0}},
+        calc,
+        priority_manager=SimpleNamespace(),
+        item_cache=item_cache,
+        units_by_ref=units_by_ref,
+    )
+
+    row = db.query(PlannedRework).filter(PlannedRework.run_id == run.run_id).one()
+    assert float(row.requested_qty) == 5.0
+    assert float(row.planned_qty) == 3.0
+    assert float(row.qty) == 3.0
+    assert row.component_blocked is False
+    assert row.component_partial is True
+    assert any(w.get("code") == "REWORK_COMPONENT_SHORTAGE_PARTIAL" for w in out.get("warnings", []))
+
+
+def test_rework_flow_keeps_blocked_row_with_zero_qty_when_components_missing(db_session):
+    db = db_session
+
+    u = Unit(unit_ref1c="u-rw-block", unit_name="шт", short_name="шт", precision=0)
+    db.add(u)
+
+    parent = Item(
+        item_code="RW-BLOCK",
+        item_name="Rework Blocked",
+        item_article="RW-BLOCK",
+        replenishment_method="Переработка",
+        replenishment_time=1,
+        unit="u-rw-block",
+        stock_qty=0,
+        status="active",
+    )
+    component = Item(
+        item_code="RW-COMP-BLOCK",
+        item_name="Rework Component Blocked",
+        item_article="RW-COMP-BLOCK",
+        replenishment_method="Покупка",
+        unit="u-rw-block",
+        stock_qty=0,
+        status="active",
+    )
+    db.add_all([parent, component])
+    db.flush()
+
+    spec = Specification(spec_code="RW-S-BLOCK", spec_name="Rework Blocked Spec")
+    db.add(spec)
+    db.flush()
+    db.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db.add(SpecComponent(spec_id=spec.spec_id, item_id=component.item_id, quantity=2.0))
+    db.flush()
+
+    run = _mk_run(db)
+    units_by_ref = {"u-rw-block": u}
+    item_cache = {parent.item_id: parent, component.item_id: component}
+
+    def components_loader(spec_id: int):
+        return db.query(SpecComponent).filter(SpecComponent.spec_id == spec_id).all()
+
+    calc = OrderQuantityCalculator(
+        snapshot=run.config_snapshot,
+        default_spec_map={parent.item_id: spec.spec_id},
+        spec_by_id={spec.spec_id: spec},
+        components_loader=components_loader,
+        item_by_id=item_cache,
+        units_by_ref=units_by_ref,
+        res_by_id={},
+        production_kinds_by_resource={},
+        stock_by_item={parent.item_id: 0.0, component.item_id: 0.0},
+        wip_by_item={},
+        horizon_days=run.horizon_days or 0,
+        total_demand_by_item={parent.item_id: 5.0},
+    )
+
+    out = build_planned_orders_and_purchases(
+        db,
+        run,
+        {str(parent.item_id): {"2025-01-01": 5.0}},
+        calc,
+        priority_manager=SimpleNamespace(),
+        item_cache=item_cache,
+        units_by_ref=units_by_ref,
+    )
+
+    row = db.query(PlannedRework).filter(PlannedRework.run_id == run.run_id).one()
+    assert float(row.requested_qty) == 5.0
+    assert float(row.planned_qty) == 0.0
+    assert float(row.qty) == 0.0
+    assert row.component_blocked is True
+    assert row.component_partial is False
+    assert any(w.get("code") == "REWORK_COMPONENT_SHORTAGE_BLOCKED" for w in out.get("warnings", []))
+
+
+def test_control_run_keeps_production_orders_identical_with_purchase_and_rework_flows(db_session):
+    db = db_session
+
+    u = Unit(unit_ref1c="u-ctrl", unit_name="шт", short_name="шт", precision=0)
+    db.add(u)
+
+    production_item = Item(
+        item_code="CTRL-PROD",
+        item_name="Control Production",
+        item_article="CTRL-PROD",
+        replenishment_method="Производство",
+        unit="u-ctrl",
+        stock_qty=0,
+        status="active",
+    )
+    purchase_item = Item(
+        item_code="CTRL-BUY",
+        item_name="Control Purchase",
+        item_article="CTRL-BUY",
+        replenishment_method="Покупка",
+        replenishment_time=3,
+        unit="u-ctrl",
+        stock_qty=0,
+        status="active",
+    )
+    rework_item = Item(
+        item_code="CTRL-RW",
+        item_name="Control Rework",
+        item_article="CTRL-RW",
+        replenishment_method="Переработка",
+        replenishment_time=1,
+        unit="u-ctrl",
+        stock_qty=0,
+        status="active",
+    )
+    rework_component = Item(
+        item_code="CTRL-RW-COMP",
+        item_name="Control Rework Component",
+        item_article="CTRL-RW-COMP",
+        replenishment_method="Покупка",
+        unit="u-ctrl",
+        stock_qty=50,
+        status="active",
+    )
+    db.add_all([production_item, purchase_item, rework_item, rework_component])
+    db.flush()
+
+    rework_spec = Specification(spec_code="CTRL-RW-SPEC", spec_name="Control Rework Spec")
+    db.add(rework_spec)
+    db.flush()
+    db.add(DefaultSpecification(item_id=rework_item.item_id, spec_id=rework_spec.spec_id))
+    db.add(SpecComponent(spec_id=rework_spec.spec_id, item_id=rework_component.item_id, quantity=2.0))
+    db.flush()
+
+    units_by_ref = {"u-ctrl": u}
+    item_cache = {
+        production_item.item_id: production_item,
+        purchase_item.item_id: purchase_item,
+        rework_item.item_id: rework_item,
+        rework_component.item_id: rework_component,
+    }
+
+    def components_loader(spec_id: int):
+        return db.query(SpecComponent).filter(SpecComponent.spec_id == spec_id).all()
+
+    def build_projection(run, net_req, total_demand):
+        calc = OrderQuantityCalculator(
+            snapshot=run.config_snapshot,
+            default_spec_map={rework_item.item_id: rework_spec.spec_id},
+            spec_by_id={rework_spec.spec_id: rework_spec},
+            components_loader=components_loader,
+            item_by_id=item_cache,
+            units_by_ref=units_by_ref,
+            res_by_id={},
+            production_kinds_by_resource={},
+            stock_by_item={
+                production_item.item_id: 0.0,
+                purchase_item.item_id: 0.0,
+                rework_item.item_id: 0.0,
+                rework_component.item_id: 50.0,
+            },
+            wip_by_item={},
+            horizon_days=run.horizon_days or 0,
+            total_demand_by_item=total_demand,
+        )
+
+        build_planned_orders_and_purchases(
+            db,
+            run,
+            net_req,
+            calc,
+            priority_manager=SimpleNamespace(),
+            item_cache=item_cache,
+            units_by_ref=units_by_ref,
+        )
+
+        rows = (
+            db.query(PlannedOrder)
+            .filter(PlannedOrder.run_id == run.run_id)
+            .order_by(PlannedOrder.item_id.asc(), PlannedOrder.need_date.asc())
+            .all()
+        )
+        return [
+            {
+                "item_id": int(row.item_id),
+                "requested_qty": float(row.requested_qty),
+                "planned_qty": float(row.planned_qty),
+                "qty": float(row.qty),
+                "need_date": row.need_date.isoformat() if row.need_date else None,
+                "bucket_date": row.bucket_date.isoformat() if row.bucket_date else None,
+            }
+            for row in rows
+        ]
+
+    baseline_run = _mk_run(db)
+    baseline_projection = build_projection(
+        run=baseline_run,
+        net_req={str(production_item.item_id): {"2025-01-10": 8.0}},
+        total_demand={production_item.item_id: 8.0},
+    )
+
+    mixed_run = _mk_run(db)
+    mixed_projection = build_projection(
+        run=mixed_run,
+        net_req={
+            str(production_item.item_id): {"2025-01-10": 8.0},
+            str(purchase_item.item_id): {"2025-01-11": 5.0},
+            str(rework_item.item_id): {"2025-01-12": 6.0},
+        },
+        total_demand={
+            production_item.item_id: 8.0,
+            purchase_item.item_id: 5.0,
+            rework_item.item_id: 6.0,
+        },
+    )
+
+    assert baseline_projection == mixed_projection
+    assert mixed_projection == [
+        {
+            "item_id": production_item.item_id,
+            "requested_qty": 8.0,
+            "planned_qty": 8.0,
+            "qty": 8.0,
+            "need_date": "2025-01-10",
+            "bucket_date": "2025-01-10",
+        }
+    ]
+    assert db.query(PlannedPurchase).filter(PlannedPurchase.run_id == mixed_run.run_id).count() == 1
+    assert db.query(PlannedRework).filter(PlannedRework.run_id == mixed_run.run_id).count() == 1
 
