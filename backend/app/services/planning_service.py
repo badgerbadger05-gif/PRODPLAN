@@ -1195,7 +1195,7 @@ def _load_item_category_meta(db: Session, item_ids: List[int]) -> Dict[int, Dict
         has_linked_category = category_id_val is not None
         resolved_group_name = (category_name_val or "").strip()
         if not resolved_group_name and has_linked_category:
-            resolved_group_name = (category_code_val or "").strip() or (category_ref1c_val or "").strip()
+            resolved_group_name = "Без названия группы"
         if not resolved_group_name:
             resolved_group_name = "Без товарной группы"
 

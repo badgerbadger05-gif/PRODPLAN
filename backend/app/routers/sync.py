@@ -69,6 +69,18 @@ def sync_nomenclature_odata(payload: ODataSyncRequest, db: Session = Depends(get
         # --- Шаг 2: Синхронизация категорий номенклатуры ---
         categories_payload = payload.copy(deep=True)
         categories_payload.entity_name = "Catalog_КатегорииНоменклатуры"
+        categories_payload.filter_query = None
+        categories_payload.select_fields = [
+            "Ref_Key",
+            "Code",
+            "Description",
+            "Parent_Key",
+            "IsFolder",
+            "Predefined",
+            "PredefinedDataName",
+            "DataVersion",
+            "DeletionMark",
+        ]
         categories_stats = sync_categories_from_odata(db, categories_payload)
 
         # --- Шаг 3: Синхронизация номенклатуры ---

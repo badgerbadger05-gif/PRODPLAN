@@ -215,12 +215,14 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                         category_name = (category_data.get('Description') if category_data else '').strip()
 
                         if existing_category:
-                            if existing_category.category_name != category_name:
+                            # Не перезаписываем уже известное имя пустым значением,
+                            # если OData не вернул вложенное описание категории.
+                            if category_name and existing_category.category_name != category_name:
                                 existing_category.category_name = category_name
                                 categories_updated += 1
                         else:
                             new_category = ItemCategory(
-                                category_name=category_name,
+                                category_name=category_name or "Без названия группы",
                                 category_ref1c=category_key,
                                 is_folder=False,
                                 predefined=False,
