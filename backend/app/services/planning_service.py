@@ -1181,6 +1181,7 @@ def _load_item_category_meta(db: Session, item_ids: List[int]) -> Dict[int, Dict
         db.query(
             Item.item_id,
             ItemCategory.category_id,
+            ItemCategory.category_code,
             ItemCategory.category_name,
             ItemCategory.category_ref1c,
         )
@@ -1190,10 +1191,17 @@ def _load_item_category_meta(db: Session, item_ids: List[int]) -> Dict[int, Dict
     )
 
     result: Dict[int, Dict[str, Any]] = {}
-    for item_id_val, category_id_val, category_name_val, category_ref1c_val in rows:
+    for item_id_val, category_id_val, category_code_val, category_name_val, category_ref1c_val in rows:
+        has_linked_category = category_id_val is not None
+        resolved_group_name = (category_name_val or "").strip()
+        if not resolved_group_name and has_linked_category:
+            resolved_group_name = (category_code_val or "").strip() or (category_ref1c_val or "").strip()
+        if not resolved_group_name:
+            resolved_group_name = "Без товарной группы"
+
         result[int(item_id_val)] = {
             "group_id": int(category_id_val) if category_id_val is not None else None,
-            "group_name": (category_name_val or "").strip() or "Без товарной группы",
+            "group_name": resolved_group_name,
             "group_ref1c": category_ref1c_val,
         }
     return result

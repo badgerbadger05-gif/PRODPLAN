@@ -62,6 +62,9 @@ docker compose build
 # Запусти все сервисы
 docker compose up -d
 
+# Примени миграции БД (обязательно после обновления кода)
+docker compose exec backend alembic upgrade head
+
 # Проверь статус
 docker compose ps
 ```
@@ -164,7 +167,17 @@ docker compose down
 git pull
 docker compose build
 docker compose up -d
+docker compose exec backend alembic upgrade head
 docker compose ps
+```
+
+### Если ошибка `column items.category_id does not exist`
+```bash
+cd /opt/prodplan
+docker compose up -d
+docker compose exec backend alembic upgrade head
+docker compose restart backend
+docker compose logs -f backend
 ```
 
 ### Только перезапуск без обновления

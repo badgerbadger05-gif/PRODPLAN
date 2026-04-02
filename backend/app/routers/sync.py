@@ -53,6 +53,8 @@ def sync_nomenclature_odata(payload: ODataSyncRequest, db: Session = Depends(get
     Синхронизация номенклатуры из 1С через OData.
     Перед синхронизацией номенклатуры принудительно запускается синхронизация единиц измерения,
     чтобы гарантировать целостность данных.
+    Также запускается синхронизация категорий номенклатуры, чтобы привязки item->category
+    попадали в БД с корректными именами групп.
     """
     try:
         # --- Шаг 1: Синхронизация единиц измерения ---
@@ -64,10 +66,15 @@ def sync_nomenclature_odata(payload: ODataSyncRequest, db: Session = Depends(get
         # Выполняем синхронизацию ЕИ. В случае ошибки, она пробросится и остановит процесс.
         units_stats = sync_units_from_odata(db, units_payload)
 
-        # --- Шаг 2: Синхронизация номенклатуры ---
+        # --- Шаг 2: Синхронизация категорий номенклатуры ---
+        categories_payload = payload.copy(deep=True)
+        categories_payload.entity_name = "Catalog_КатегорииНоменклатуры"
+        categories_stats = sync_categories_from_odata(db, categories_payload)
+
+        # --- Шаг 3: Синхронизация номенклатуры ---
         nomenclature_stats = sync_nomenclature_from_odata(db, payload)
 
-        # --- Шаг 3: Добивка недостающих ЕИ ---
+        # --- Шаг 4: Добивка недостающих ЕИ ---
         # После синхронизации номенклатуры могли появиться ссылки на ЕИ, которых не было
         # в основном справочнике. Добираем их.
         backfill_stats = backfill_units_from_items(db, units_payload)
@@ -76,6 +83,7 @@ def sync_nomenclature_odata(payload: ODataSyncRequest, db: Session = Depends(get
         return {
             "nomenclature_sync": nomenclature_stats,
             "units_sync": units_stats,
+            "categories_sync": categories_stats,
             "units_backfill": backfill_stats,
         }
     except Exception as e:
