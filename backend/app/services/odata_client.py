@@ -353,7 +353,103 @@ def iter_by_guid(
             break
 
 
-def convert_1c_stock_to_records(stock_data: List[Dict[str, Any]], key_to_code: Optional[Dict[str, Dict[str, str]]] = None, key_field_name: str = "Номенклатура_Key") -> List[Dict[str, Any]]:
+def _is_guid_like(value: str) -> bool:
+    s = str(value or "").strip().lower()
+    if len(s) != 36:
+        return False
+    parts = s.split("-")
+    if len(parts) != 5:
+        return False
+    sizes = [8, 4, 4, 4, 12]
+    for p, n in zip(parts, sizes):
+        if len(p) != n:
+            return False
+        try:
+            int(p, 16)
+        except Exception:
+            return False
+    return True
+
+
+def _extract_ref_key(value: Any) -> str:
+    if isinstance(value, dict):
+        return str((value.get("Ref_Key") or value.get("RefKey") or value.get("ref_key") or "")).strip()
+    return str(value or "").strip()
+
+
+def _resolve_warehouse_mapping(client: OData1CClient, warehouse_refs: List[str]) -> Dict[str, Dict[str, str]]:
+    """
+    Пытается резолвить склады по GUID через наиболее типовые каталоги 1С.
+    Возвращает map: Ref_Key -> {"Code": "...", "Name": "..."}.
+    """
+    refs = sorted({str(x).strip() for x in (warehouse_refs or []) if str(x).strip()})
+    if not refs:
+        return {}
+
+    # В разных конфигурациях 1С склады могут лежать в разных каталогах.
+    # Пробуем типовые варианты и тихо пропускаем отсутствующие.
+    candidate_entities = [
+        "Catalog_Склады",
+        "Catalog_СтруктурныеЕдиницы",
+        "Catalog_СтруктурныеЕдиницыПредприятия",
+        "Catalog_СкладыПредприятия",
+    ]
+
+    mapping: Dict[str, Dict[str, str]] = {}
+    chunk_size = 20
+    select_fields = "Ref_Key,Code,Description,Код,Наименование,Name"
+
+    for entity in candidate_entities:
+        unresolved = [r for r in refs if r not in mapping]
+        if not unresolved:
+            break
+        try:
+            for i in range(0, len(unresolved), chunk_size):
+                chunk = unresolved[i:i + chunk_size]
+                ors = " or ".join([f"Ref_Key eq guid'{k}'" for k in chunk])
+                resp = client._make_request(
+                    entity,
+                    {"$select": select_fields, "$filter": f"({ors})"},
+                )
+                rows: List[Dict[str, Any]] = []
+                if isinstance(resp, dict) and "value" in resp and isinstance(resp["value"], list):
+                    rows = resp["value"]
+                elif isinstance(resp, dict):
+                    rows = [resp]
+                for row in rows:
+                    rk = str(row.get("Ref_Key") or "").strip()
+                    if not rk:
+                        continue
+                    code = str(
+                        row.get("Code")
+                        or row.get("Код")
+                        or ""
+                    ).strip()
+                    name = str(
+                        row.get("Description")
+                        or row.get("Наименование")
+                        or row.get("Name")
+                        or ""
+                    ).strip()
+                    if rk not in mapping:
+                        mapping[rk] = {"Code": code, "Name": name}
+                    else:
+                        if not mapping[rk].get("Code") and code:
+                            mapping[rk]["Code"] = code
+                        if not mapping[rk].get("Name") and name:
+                            mapping[rk]["Name"] = name
+        except Exception:
+            continue
+
+    return mapping
+
+
+def convert_1c_stock_to_records(
+    stock_data: List[Dict[str, Any]],
+    key_to_code: Optional[Dict[str, Dict[str, str]]] = None,
+    key_field_name: str = "Номенклатура_Key",
+    warehouse_map: Optional[Dict[str, Dict[str, str]]] = None,
+) -> List[Dict[str, Any]]:
     converted: List[Dict[str, Any]] = []
     for record in stock_data:
         nomenclature = record.get("Номенклатура", {}) or {}
@@ -376,12 +472,7 @@ def convert_1c_stock_to_records(stock_data: List[Dict[str, Any]], key_to_code: O
                 or record.get("Номенклатура_Ref_Key")
                 or record.get("Номенклатура")
             )
-            if isinstance(ref_key_val, dict):
-                ref_key = str(
-                    (ref_key_val.get("Ref_Key") or ref_key_val.get("RefKey") or ref_key_val.get("ref_key") or "")
-                ).strip()
-            else:
-                ref_key = str(ref_key_val or "").strip()
+            ref_key = _extract_ref_key(ref_key_val)
     
             # Если есть сопоставление по Ref_Key — всегда берём код из каталога (стабильнее для сопоставления)
             if key_to_code and ref_key and ref_key in key_to_code:
@@ -434,11 +525,7 @@ def convert_1c_stock_to_records(stock_data: List[Dict[str, Any]], key_to_code: O
 
         if isinstance(warehouse_raw, dict):
             if not warehouse_ref:
-                warehouse_ref = (
-                    warehouse_raw.get("Ref_Key")
-                    or warehouse_raw.get("RefKey")
-                    or warehouse_raw.get("ref_key")
-                )
+                warehouse_ref = _extract_ref_key(warehouse_raw)
             warehouse_code = (
                 warehouse_raw.get("Code")
                 or warehouse_raw.get("Код")
@@ -451,6 +538,17 @@ def convert_1c_stock_to_records(stock_data: List[Dict[str, Any]], key_to_code: O
         elif isinstance(warehouse_raw, str) and warehouse_raw.strip():
             warehouse_name = warehouse_raw.strip()
 
+        warehouse_ref = _extract_ref_key(warehouse_ref)
+        wm = warehouse_map.get(warehouse_ref) if (warehouse_map and warehouse_ref) else None
+        if wm:
+            mapped_code = str(wm.get("Code") or "").strip()
+            mapped_name = str(wm.get("Name") or "").strip()
+            if not warehouse_code and mapped_code:
+                warehouse_code = mapped_code
+            # Если name отсутствует, совпадает с GUID или тоже выглядит как GUID — подменим на справочное.
+            if mapped_name and (not warehouse_name or warehouse_name == warehouse_ref or _is_guid_like(warehouse_name)):
+                warehouse_name = mapped_name
+
         # Извлечём Ref_Key для возврата (поможет сопоставлять по GUID)
         ref_out_val = (
             record.get(key_field_name)
@@ -458,17 +556,14 @@ def convert_1c_stock_to_records(stock_data: List[Dict[str, Any]], key_to_code: O
             or record.get("Номенклатура_Ref_Key")
             or record.get("Номенклатура")
         )
-        if isinstance(ref_out_val, dict):
-            ref_out = str((ref_out_val.get("Ref_Key") or ref_out_val.get("RefKey") or ref_out_val.get("ref_key") or "")).strip()
-        else:
-            ref_out = str(ref_out_val or "").strip()
+        ref_out = _extract_ref_key(ref_out_val)
 
         converted.append({
             "code": str(item_code).strip() if item_code else "",
             "name": str(item_name).strip() if item_name else "",
             "qty": qty,
             "ref": ref_out,
-            "warehouse_ref": str(warehouse_ref).strip() if warehouse_ref else "",
+            "warehouse_ref": warehouse_ref,
             "warehouse_code": str(warehouse_code).strip() if warehouse_code else "",
             "warehouse_name": str(warehouse_name).strip() if warehouse_name else "",
         })
@@ -585,7 +680,26 @@ def get_stock_from_1c_odata(
         except Exception:
             key_to_code = None
 
-    return convert_1c_stock_to_records(stock_data, key_to_code=key_to_code)
+    warehouse_keys: List[str] = []
+    for r in stock_data:
+        w = (
+            r.get("СтруктурнаяЕдиница_Key")
+            or r.get("Склад_Key")
+            or r.get("СтруктурнаяЕдиницаRef_Key")
+            or r.get("СкладRef_Key")
+            or r.get("СтруктурнаяЕдиница")
+            or r.get("Склад")
+        )
+        wk = _extract_ref_key(w)
+        if wk:
+            warehouse_keys.append(wk)
+    warehouse_map = _resolve_warehouse_mapping(client, warehouse_keys)
+
+    return convert_1c_stock_to_records(
+        stock_data,
+        key_to_code=key_to_code,
+        warehouse_map=warehouse_map,
+    )
 
 # Bind helper as a method of the client class for runtime (keeps API backward-compatible)
 OData1CClient.iter_by_guid = iter_by_guid
