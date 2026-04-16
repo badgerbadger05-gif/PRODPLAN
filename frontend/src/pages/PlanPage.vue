@@ -47,33 +47,49 @@
               <template v-slot:body-cell="props">
                 <q-td :props="props">
                   <div v-if="props?.col?.name === 'actions'">
-                    <q-btn
-                      flat
-                      round
-                      dense
-                      icon="account_tree"
-                      color="primary"
-                      class="q-mr-xs"
-                      @click="openSpecification(props.row)"
-                    />
-                    <q-btn
-                      flat
-                      round
-                      dense
-                      icon="delete"
-                      color="negative"
-                      :loading="deletingId === props.row.item_id"
-                      :disable="deletingId === props.row.item_id"
-                      @click="onDeleteRow(props.row)"
-                    />
+                    <div class="actions-cell">
+                      <q-btn
+                        flat
+                        round
+                        dense
+                        size="8px"
+                        icon="description"
+                        color="primary"
+                        class="compact-action-btn"
+                        @click="openSpecification(props.row)"
+                      >
+                        <q-tooltip>Открыть спецификацию</q-tooltip>
+                      </q-btn>
+                      <q-btn
+                        flat
+                        round
+                        dense
+                        size="8px"
+                        icon="delete_outline"
+                        color="negative"
+                        class="compact-action-btn"
+                        :loading="deletingId === props.row.item_id"
+                        :disable="deletingId === props.row.item_id"
+                        @click="onDeleteRow(props.row)"
+                      >
+                        <q-tooltip>Удалить строку</q-tooltip>
+                      </q-btn>
+                    </div>
                   </div>
                   <div v-else-if="props?.col?.name === 'rownum'">
                     <div class="text-right">
                       {{ computeRowNum(props) }}
                     </div>
                   </div>
+                  <div v-else-if="props?.col?.name === 'item_name'" class="item-name-cell">
+                    <span class="ellipsis-text">{{ props.value }}</span>
+                    <q-tooltip v-if="String(props.value || '').length > 28">{{ props.value }}</q-tooltip>
+                  </div>
                   <div v-else-if="props?.col?.name?.startsWith('day_')">
-                    <div class="text-center">{{ props.row[props.col?.name] || 0 }}</div>
+                    <div class="text-right number-cell">{{ fmtNumber(props.row[props.col?.name]) }}</div>
+                  </div>
+                  <div v-else-if="props?.col?.name === 'month_plan'">
+                    <div class="text-right number-cell">{{ fmtNumber(props.value) }}</div>
                   </div>
                   <div v-else>
                     {{ props.value }}
@@ -265,6 +281,12 @@ function computeRowNum(slotProps: any): number {
   }
 }
 
+function fmtNumber(v: unknown): string {
+  const n = Number(v ?? 0)
+  if (!isFinite(n)) return '0'
+  return n.toLocaleString('ru-RU')
+}
+
 function focusSearchInput() {
   nextTick(() => {
     try {
@@ -337,10 +359,9 @@ const columns = computed(() => {
   // Добавляем колонки по дням
   dates.value.forEach(dateStr => {
     const date = new Date(dateStr)
-    const header = date.toLocaleDateString('ru-RU', {
-      day: '2-digit',
-      month: '2-digit'
-    })
+    const weekday = date.toLocaleDateString('ru-RU', { weekday: 'short' }).replace('.', '')
+    const dm = date.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' })
+    const header = `${weekday} ${dm}`
 
     const isW = isWeekend(dateStr)
     const isH = isHoliday(dateStr)
@@ -350,10 +371,10 @@ const columns = computed(() => {
     cols.push({
       name: `day_${dateStr}`,
       label: header,
-      align: 'center' as const,
+      align: 'right' as const,
       field: `day_${dateStr}`,
       sortable: false,
-      classes: cellClass,
+      classes: `day-col ${cellClass}`.trim(),
       headerClasses: headerClass,
       format: (val: number) => val || 0
     })
@@ -638,15 +659,15 @@ onMounted(() => {
 /* Левые фиксированные колонки */
 .production-plan-table :deep(th.col-actions),
 .production-plan-table :deep(td.col-actions) {
-  width: 88px;
-  min-width: 88px;
-  max-width: 88px;
+  width: 56px;
+  min-width: 56px;
+  max-width: 56px;
 }
 .production-plan-table :deep(th.col-rownum),
 .production-plan-table :deep(td.col-rownum) {
-  width: 48px;
-  min-width: 48px;
-  max-width: 48px;
+  width: 44px;
+  min-width: 44px;
+  max-width: 44px;
 }
 .production-plan-table :deep(th.sticky-actions),
 .production-plan-table :deep(td.sticky-actions) {
@@ -658,14 +679,14 @@ onMounted(() => {
 .production-plan-table :deep(th.sticky-rownum),
 .production-plan-table :deep(td.sticky-rownum) {
   position: sticky;
-  left: 88px; /* ширина колонки действий */
+  left: 56px; /* ширина колонки действий */
   z-index: 29;
   background: #fff;
 }
 .production-plan-table :deep(th.sticky-name),
 .production-plan-table :deep(td.sticky-name) {
   position: sticky;
-  left: 136px; /* width of actions (88px) + rownum (48px) */
+  left: 100px; /* width of actions (56px) + rownum (44px) */
   z-index: 28;
   background: #fff;
   box-shadow: 1px 0 0 rgba(0, 0, 0, 0.12);
@@ -673,17 +694,17 @@ onMounted(() => {
 
 /* Выделение выходных/праздников */
 .production-plan-table :deep(th.weekend-col) {
-  background: #f2f2f2;
+  background: #f4f7fb;
 }
 .production-plan-table :deep(td.weekend-cell) {
-  background: #fafafa;
+  background: #f8fbff;
 }
 .production-plan-table :deep(th.holiday-col) {
-  background: #ffe6e6;
+  background: #fff0f0;
   color: #b71c1c;
 }
 .production-plan-table :deep(td.holiday-cell) {
-  background: #fff2f2;
+  background: #fff7f7;
 }
 
 /* Горизонтальная прокрутка */
@@ -726,7 +747,12 @@ onMounted(() => {
   position: sticky;
   top: 0;
   z-index: 22; /* выше строк данных и слева фиксированных ячеек */
-  background: #fff;
+  background: #eef3f9;
+  color: #1f2a37;
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  border-bottom: 1px solid #d4dde8;
 }
 /* Доп. явное правило для выделенных заголовков */
 .production-plan-table :deep(th.weekend-col),
@@ -750,20 +776,74 @@ onMounted(() => {
   top: 0;
   left: 0;
   z-index: 31;
-  background: #fff;
+  background: #eef3f9;
 }
 .production-plan-table :deep(thead th.sticky-rownum) {
   position: sticky;
   top: 0;
-  left: 88px; /* ширина колонки действий */
+  left: 56px; /* ширина колонки действий */
   z-index: 30;
-  background: #fff;
+  background: #eef3f9;
 }
 .production-plan-table :deep(thead th.sticky-name) {
   position: sticky;
   top: 0;
-  left: 136px; /* actions (88px) + rownum (48px) */
+  left: 100px; /* actions (56px) + rownum (44px) */
   z-index: 29;
-  background: #fff;
+  background: #eef3f9;
+}
+
+/* Читаемость строк/ячеек */
+.production-plan-table :deep(tbody td) {
+  padding: 10px 10px;
+  min-height: 42px;
+  border-bottom: 1px solid #edf1f6;
+}
+.production-plan-table :deep(tbody tr:nth-child(even) td) {
+  background: #fafcff;
+}
+.production-plan-table :deep(tbody tr:hover td) {
+  background: #eef6ff;
+}
+.production-plan-table :deep(tbody td.weekend-cell) {
+  background: #f8fbff;
+}
+.production-plan-table :deep(tbody td.holiday-cell) {
+  background: #fff7f7;
+}
+
+/* Локальные типографические улучшения */
+.item-name-cell {
+  max-width: 240px;
+}
+.ellipsis-text {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+.number-cell {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.production-plan-table :deep(td.day-col) {
+  min-width: 92px;
+}
+
+.actions-cell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+}
+
+.compact-action-btn {
+  opacity: 0.85;
+}
+
+.compact-action-btn:hover {
+  opacity: 1;
 }
 </style>

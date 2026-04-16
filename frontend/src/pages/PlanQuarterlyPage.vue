@@ -11,7 +11,7 @@
 
           <q-card-section>
             <!-- Панель управления -->
-            <div class="row items-center gap-2 w-full mb-4 flex-wrap">
+            <div class="row items-center gap-2 w-full mb-4 flex-wrap control-bar">
               <q-btn
                 color="positive"
                 label="Сохранить изменения"
@@ -57,29 +57,44 @@
               <template v-slot:body-cell="props">
                 <q-td :props="props">
                   <div v-if="props.col.name === 'actions'">
-                    <q-btn
-                      flat
-                      round
-                      dense
-                      icon="account_tree"
-                      color="primary"
-                      class="q-mr-xs"
-                      @click="openSpecification(props.row)"
-                    />
-                    <q-btn
-                      flat
-                      round
-                      dense
-                      icon="delete"
-                      color="negative"
-                      :loading="deletingId === props.row.item_id"
-                      :disable="deletingId === props.row.item_id"
-                      @click="onDeleteRow(props.row)"
-                    />
+                    <div class="actions-cell">
+                      <q-btn
+                        flat
+                        round
+                        dense
+                        size="8px"
+                        icon="description"
+                        color="primary"
+                        class="compact-action-btn"
+                        @click="openSpecification(props.row)"
+                      >
+                        <q-tooltip>Открыть спецификацию</q-tooltip>
+                      </q-btn>
+                      <q-btn
+                        flat
+                        round
+                        dense
+                        size="8px"
+                        icon="delete_outline"
+                        color="negative"
+                        class="compact-action-btn"
+                        :loading="deletingId === props.row.item_id"
+                        :disable="deletingId === props.row.item_id"
+                        @click="onDeleteRow(props.row)"
+                      >
+                        <q-tooltip>Удалить строку</q-tooltip>
+                      </q-btn>
+                    </div>
                   </div>
                   <div v-else-if="props.col.name === 'rownum'">
                     <div class="text-right">
                       {{ computeRowNum(props) }}
+                    </div>
+                  </div>
+                  <div v-else-if="props.col.name === 'item_name'" class="item-name-cell">
+                    <span class="item-name-full">{{ props.value }}</span>
+                    <div class="text-caption text-grey-7">
+                      {{ props.row.item_article || '—' }} · {{ props.row.item_code }}
                     </div>
                   </div>
                   <div v-else-if="props.col.name.startsWith('week_')" class="row items-center no-wrap">
@@ -87,9 +102,11 @@
                       v-model.number="props.row[props.col.name]"
                       type="number"
                       dense
+                      borderless
+                      hide-bottom-space
                       min="0"
                       step="1"
-                      class="text-center narrow-input"
+                      class="text-center narrow-input cell-input"
                       @update:model-value="(val) => onCellInput(props.row, props.col.name, val)"
                       @blur="onCellBlur(props.row, props.col.name)"
                     />
@@ -100,9 +117,11 @@
                       v-model.number="props.row[props.col.name]"
                       type="number"
                       dense
+                      borderless
+                      hide-bottom-space
                       min="0"
                       step="1"
-                      class="text-center narrow-input"
+                      class="text-center narrow-input cell-input"
                       @update:model-value="(val) => {
                         const d = props.col.name.replace('day_', '')
                         onDayPopupInput(props.row, d, val, getISOWeekInfo(d).weekKey)
@@ -117,9 +136,11 @@
                       :model-value="computeFridayRemainder(props.row, getISOWeekInfo(props.col.name.replace('day_', '')).weekKey)"
                       type="number"
                       dense
+                      borderless
+                      hide-bottom-space
                       readonly
                       disable
-                      class="text-center narrow-input"
+                      class="text-center narrow-input cell-input"
                     />
                   </div>
                   <div v-else>
@@ -490,13 +511,6 @@ const columns = computed(() => {
       headerClasses: 'sticky-name'
     },
     {
-      name: 'item_article',
-      label: 'Артикул',
-      align: 'left' as const,
-      field: 'item_article',
-      sortable: true
-    },
-    {
       name: 'month_plan',
       label: 'План на квартал',
       align: 'right' as const,
@@ -856,18 +870,24 @@ onMounted(() => {
 </script>
 
 <style scoped>
+.control-bar {
+  position: relative;
+  z-index: 35;
+  margin-bottom: 12px;
+}
+
 /* Левые фиксированные колонки */
 .production-plan-table :deep(th.col-actions),
 .production-plan-table :deep(td.col-actions) {
-  width: 88px;
-  min-width: 88px;
-  max-width: 88px;
+  width: 56px;
+  min-width: 56px;
+  max-width: 56px;
 }
 .production-plan-table :deep(th.col-rownum),
 .production-plan-table :deep(td.col-rownum) {
-  width: 48px;
-  min-width: 48px;
-  max-width: 48px;
+  width: 44px;
+  min-width: 44px;
+  max-width: 44px;
 }
 .production-plan-table :deep(th.sticky-actions),
 .production-plan-table :deep(td.sticky-actions) {
@@ -879,15 +899,18 @@ onMounted(() => {
 .production-plan-table :deep(th.sticky-rownum),
 .production-plan-table :deep(td.sticky-rownum) {
   position: sticky;
-  left: 88px; /* width of actions column */
+  left: 56px; /* width of actions column */
   z-index: 29;
   background: #fff;
 }
 .production-plan-table :deep(th.sticky-name),
 .production-plan-table :deep(td.sticky-name) {
   position: sticky;
-  left: 136px; /* width of actions (88px) + rownum (48px) */
+  left: 100px; /* width of actions (56px) + rownum (44px) */
   z-index: 28; /* сразу под .sticky-rownum */
+  width: 360px;
+  min-width: 360px;
+  max-width: 360px;
   background: #fff;
   box-shadow: 1px 0 0 rgba(0, 0, 0, 0.12);
 }
@@ -951,15 +974,21 @@ onMounted(() => {
   padding-right: 4px;
 }
 .production-plan-table :deep(.narrow-input) {
-  max-width: 72px;
-  min-width: 52px;
+  max-width: 70px;
+  min-width: 50px;
 }
 .production-plan-table :deep(.narrow-input .q-field__control) {
-  padding-left: 4px;
-  padding-right: 4px;
+  min-height: 18px;
+  height: 18px;
+  padding-left: 0;
+  padding-right: 0;
 }
 .production-plan-table :deep(.narrow-input .q-field__native) {
   text-align: center;
+  padding-top: 0;
+  padding-bottom: 0;
+  font-size: 11px;
+  line-height: 1;
 }
 
 /* Отключаем внутренний горизонтальный скролл QTable, чтобы sticky-колонки работали с внешним .h-scroll */
@@ -984,7 +1013,12 @@ onMounted(() => {
   position: sticky;
   top: 0;
   z-index: 22; /* выше строк данных */
-  background: #fff;
+  background: #eef3f9;
+  color: #1f2a37;
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  border-bottom: 1px solid #d4dde8;
 }
 /* Усиление для заголовков недель: остаются цветными и тоже фиксируются */
 .production-plan-table :deep(th.week-header) {
@@ -997,16 +1031,88 @@ onMounted(() => {
 .production-plan-table :deep(thead th.sticky-actions) {
   top: 0;
   z-index: 31; /* выше остальных заголовков */
-  background: #fff;
+  background: #eef3f9;
 }
 .production-plan-table :deep(thead th.sticky-rownum) {
   top: 0;
   z-index: 30; /* сразу под .sticky-actions */
-  background: #fff;
+  background: #eef3f9;
 }
 .production-plan-table :deep(thead th.sticky-name) {
   top: 0;
   z-index: 29; /* сразу под .sticky-rownum */
-  background: #fff;
+  background: #eef3f9;
+}
+
+.production-plan-table :deep(tbody td) {
+  padding: 1px 4px;
+  min-height: 20px;
+  border-bottom: 1px solid #edf1f6;
+  line-height: 1;
+}
+.production-plan-table :deep(tbody tr:nth-child(even) td) {
+  background: #fafcff;
+}
+.production-plan-table :deep(tbody tr:hover td) {
+  background: #eef6ff;
+}
+
+.actions-cell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  min-height: 16px;
+}
+
+.compact-action-btn {
+  opacity: 0.85;
+  min-width: 16px;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+}
+
+.compact-action-btn:hover {
+  opacity: 1;
+}
+
+.item-name-cell {
+  max-width: 360px;
+}
+
+.item-name-full {
+  display: inline-block;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  line-height: 1.1;
+  vertical-align: bottom;
+}
+
+/* Ячейки ввода как обычная табличная сетка (без underline/спиннеров) */
+.production-plan-table :deep(.cell-input .q-field__control) {
+  border-radius: 0;
+  background: transparent;
+  border: 0 !important;
+  box-shadow: none !important;
+}
+.production-plan-table :deep(.cell-input .q-field__native),
+.production-plan-table :deep(.cell-input input) {
+  background: transparent !important;
+  min-height: 18px;
+  height: 18px;
+  line-height: 1;
+  padding: 0;
+}
+.production-plan-table :deep(.cell-input input[type='number']) {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+.production-plan-table :deep(.cell-input input[type='number']::-webkit-outer-spin-button),
+.production-plan-table :deep(.cell-input input[type='number']::-webkit-inner-spin-button) {
+  -webkit-appearance: none;
+  margin: 0;
 }
 </style>

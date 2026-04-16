@@ -16,10 +16,6 @@
         </q-toolbar-title>
 
         <q-space />
-
-        <q-btn flat round icon="notifications" class="q-mr-sm">
-          <q-badge color="red" floating>3</q-badge>
-        </q-btn>
       </q-toolbar>
     </q-header>
 
@@ -59,16 +55,6 @@
             <q-item-section>
               <q-item-label>Главная</q-item-label>
               <q-item-label caption>Обзор системы</q-item-label>
-            </q-item-section>
-          </q-item>
- 
-          <q-item clickable v-ripple to="/plan" exact class="menu-item">
-            <q-item-section avatar>
-              <q-icon name="assessment" />
-            </q-item-section>
-            <q-item-section>
-              <q-item-label>План выпуска техники дневной</q-item-label>
-              <q-item-label caption>Управление планами</q-item-label>
             </q-item-section>
           </q-item>
  
@@ -134,39 +120,6 @@
             </q-item-section>
           </q-item>
 
-          <q-item clickable v-ripple to="/orders" exact class="menu-item">
-            <q-item-section avatar>
-              <q-icon name="calculate" />
-            </q-item-section>
-            <q-item-section>
-              <q-item-label>Расчет заказов</q-item-label>
-              <q-item-label caption>Потребности в материалах</q-item-label>
-            </q-item-section>
-          </q-item>
- 
-          <q-separator class="q-mt-md q-mb-xs" />
- 
-          <div class="text-caption text-grey q-px-md q-pt-sm">Настройки</div>
- 
-          <q-item clickable v-ripple to="/settings" exact class="menu-item">
-            <q-item-section avatar>
-              <q-icon name="settings" />
-            </q-item-section>
-            <q-item-section>
-              <q-item-label>Настройки</q-item-label>
-              <q-item-label caption>Конфигурация системы</q-item-label>
-            </q-item-section>
-          </q-item>
-
-          <q-item clickable v-ripple to="/reports" exact class="menu-item">
-            <q-item-section avatar>
-              <q-icon name="assessment" />
-            </q-item-section>
-            <q-item-section>
-              <q-item-label>Отчеты</q-item-label>
-              <q-item-label caption>Аналитика и статистика</q-item-label>
-            </q-item-section>
-          </q-item>
         </q-list>
       </q-scroll-area>
     </q-drawer>

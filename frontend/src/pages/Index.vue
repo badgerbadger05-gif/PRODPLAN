@@ -39,10 +39,10 @@
       <div class="col-12 col-md-5 col-lg-3">
         <q-card class="feature-card">
           <q-card-section class="text-center">
-            <q-icon name="calculate" size="3rem" color="positive" class="q-mb-md" />
-            <div class="text-h6 q-mb-sm">Расчет заказов</div>
+            <q-icon name="calendar_view_week" size="3rem" color="positive" class="q-mb-md" />
+            <div class="text-h6 q-mb-sm">Квартальный план</div>
             <div class="text-body2 text-grey-6">
-              Автоматический расчет потребностей в материалах и комплектующих
+              Планирование выпуска по неделям с детализацией по дням
             </div>
           </q-card-section>
         </q-card>
@@ -133,9 +133,9 @@
               <q-btn
                 color="primary"
                 icon="assessment"
-                label="План производства"
+                label="План выпуска"
                 push
-                @click="$router.push('/plan')"
+                @click="$router.push('/plan/quarterly')"
                 class="col-12 col-sm-auto"
               />
               <q-btn
@@ -144,22 +144,6 @@
                 label="Синхронизация"
                 push
                 @click="$router.push('/sync')"
-                class="col-12 col-sm-auto"
-              />
-              <q-btn
-                color="positive"
-                icon="calculate"
-                label="Расчет заказов"
-                push
-                @click="$router.push('/orders')"
-                class="col-12 col-sm-auto"
-              />
-              <q-btn
-                color="info"
-                icon="settings"
-                label="Настройки"
-                push
-                @click="$router.push('/settings')"
                 class="col-12 col-sm-auto"
               />
             </div>
@@ -178,10 +162,10 @@
               <q-btn
                 color="primary"
                 icon="assessment"
-                label="План производства"
+                label="План выпуска"
                 push
                 size="lg"
-                @click="$router.push('/plan')"
+                @click="$router.push('/plan/quarterly')"
                 class="col-12 col-sm-5"
               />
               <q-btn
@@ -191,25 +175,6 @@
                 push
                 size="lg"
                 @click="$router.push('/sync')"
-                class="col-12 col-sm-5"
-              />
-            </div>
-            <q-separator class="q-my-md" />
-            <div class="row q-gutter-md">
-              <q-btn
-                color="positive"
-                icon="calculate"
-                label="Расчет заказов"
-                push
-                @click="$router.push('/orders')"
-                class="col-12 col-sm-5"
-              />
-              <q-btn
-                color="info"
-                icon="settings"
-                label="Настройки"
-                push
-                @click="$router.push('/settings')"
                 class="col-12 col-sm-5"
               />
             </div>

@@ -13,8 +13,20 @@
               </div>
 
               <div class="row items-center q-gutter-sm">
-                <q-btn outline icon="chevron_left" label="Пред. неделя" @click="goWeek(-7)" />
-                <q-btn outline icon="chevron_right" label="След. неделя" @click="goWeek(7)" />
+                <q-btn
+                  outline
+                  icon="chevron_left"
+                  label="Пред. неделя"
+                  :disable="loading.page || loading.save || loading.close"
+                  @click="goWeek(-7)"
+                />
+                <q-btn
+                  outline
+                  icon="chevron_right"
+                  label="След. неделя"
+                  :disable="loading.page || loading.save || loading.close"
+                  @click="goWeek(7)"
+                />
               </div>
             </div>
           </q-card-section>
@@ -31,10 +43,20 @@
                   outlined
                   mask="####-##-##"
                   placeholder="YYYY-MM-DD"
+                  :error="Boolean(anyDate) && !isValidISODate(anyDate)"
+                  error-message="Формат даты: YYYY-MM-DD"
+                  @keyup.enter="onLoadClick"
                 />
               </div>
-              <div class="col-auto">
-                <q-btn color="primary" label="Загрузить" :loading="loading.page" @click="load(false)" />
+              <div class="col-auto row items-end">
+                <q-btn
+                  color="primary"
+                  label="Загрузить"
+                  class="load-btn-align"
+                  :loading="loading.page"
+                  :disable="!isValidISODate(anyDate) || loading.save || loading.close"
+                  @click="onLoadClick"
+                />
               </div>
               <div class="col-12 col-md-3">
                 <q-input
@@ -44,6 +66,8 @@
                   outlined
                   mask="####-##-##"
                   placeholder="YYYY-MM-DD"
+                  :error="Boolean(selectedCloseDate) && !isCloseDateInWeek"
+                  error-message="Дата должна быть из текущей недели отчёта"
                 />
               </div>
 
@@ -68,7 +92,7 @@
                     color="positive"
                     label="Сохранить факт"
                     :loading="loading.save"
-                    :disable="!pendingFacts.length"
+                    :disable="!pendingFacts.length || loading.page || loading.close"
                     @click="save"
                   />
                   <q-btn
@@ -76,6 +100,7 @@
                     outline
                     label="Закрыть день"
                     :loading="loading.close"
+                    :disable="!canCloseDay"
                     @click="closeDay"
                   />
                   <div class="text-caption text-grey-7">
@@ -96,6 +121,8 @@
                 table-class="wide-table"
                 :table-style="{ width: 'max-content', whiteSpace: 'nowrap' }"
                 :wrap-cells="false"
+                hide-pagination
+                :rows-per-page-options="[0]"
               >
                 <template v-slot:header-cell="hprops">
                   <q-th :props="hprops" :class="hprops.col.headerClasses">
@@ -119,7 +146,9 @@
                 <template v-slot:body-cell="props">
                   <q-td :props="props" :class="cellClass(props)">
                     <div v-if="props.col.name === 'item_name'">
-                      <div class="text-weight-medium">{{ props.row.item_name }}</div>
+                      <div class="text-weight-medium item-name-line">
+                        <span class="item-name-full">{{ props.row.item_name }}</span>
+                      </div>
                       <div class="text-caption text-grey-7">
                         {{ props.row.item_article || '—' }} · {{ props.row.item_code }}
                       </div>
@@ -159,9 +188,11 @@
                         v-model.number="props.row[props.col.name]"
                         type="number"
                         dense
+                        borderless
+                        hide-bottom-space
                         min="0"
                         step="1"
-                        class="fact-input"
+                        class="fact-input cell-input"
                         :readonly="isDateClosed(props.col.dateKey)"
                         :disable="isDateClosed(props.col.dateKey)"
                         @update:model-value="(val) => onFactInput(props.row, props.col.dateKey, val)"
@@ -208,9 +239,28 @@ const days = ref<ProductionReportWeekDay[]>([])
 const rows = ref<RowVM[]>([])
 const closeHint = ref<{ today: string; close_date: string; target_date: string } | null>(null)
 const selectedCloseDate = ref<string>('')
+let loadSeq = 0
 
 // Track pending changes (dedupe by item_id|date)
 const pendingFacts = ref<Array<{ item_id: number; date: string; fact_qty: number }>>([])
+
+function isValidISODate(v: string): boolean {
+  const s = String(v || '').trim()
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false
+  const d = new Date(`${s}T00:00:00`)
+  if (Number.isNaN(d.getTime())) return false
+  const [y, m, day] = s.split('-').map(Number)
+  return d.getFullYear() === y && (d.getMonth() + 1) === m && d.getDate() === day
+}
+
+function dateShift(isoDate: string, deltaDays: number): string {
+  const d = new Date(`${isoDate}T00:00:00`)
+  d.setDate(d.getDate() + deltaDays)
+  const y = d.getFullYear()
+  const m = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${y}-${m}-${day}`
+}
 
 function fmtNum(v: any): string {
   const n = Number(v ?? 0)
@@ -223,7 +273,7 @@ function dayLabel(dateStr: string): string {
     const d = new Date(dateStr)
     const wd = d.toLocaleDateString('ru-RU', { weekday: 'short' })
     const dm = d.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' })
-    return `${wd} ${dm}`
+    return `${wd.replace('.', '')} ${dm}`
   } catch {
     return dateStr
   }
@@ -249,6 +299,19 @@ const dayMetaMap = computed<Record<string, any>>(() => {
     if (d?.date) m[String(d.date)] = d
   }
   return m
+})
+
+const dayDateSet = computed<Set<string>>(() => new Set((days.value || []).map(d => String(d.date || ''))))
+const isCloseDateInWeek = computed<boolean>(() => {
+  if (!isValidISODate(selectedCloseDate.value)) return false
+  return dayDateSet.value.has(selectedCloseDate.value)
+})
+const canCloseDay = computed<boolean>(() => {
+  return !loading.value.page
+    && !loading.value.save
+    && !loading.value.close
+    && pendingFacts.value.length === 0
+    && isCloseDateInWeek.value
 })
 
 const rerunEditableDate = computed<string | null>(() => {
@@ -289,20 +352,25 @@ function isOverProduced(row: RowVM, dateStr: string): boolean {
 function projectFacts() {
   const ds = (days.value || []).map(d => d.date)
   rows.value = (rows.value || []).map((r) => {
+    ;(r as any).__initialFacts = {}
     for (const d of ds) {
       const key = `fact_${d}`
-      r[key] = Number(r.fact_by_day?.[d] ?? 0) || 0
+      const value = Number(r.fact_by_day?.[d] ?? 0) || 0
+      r[key] = value
+      ;(r as any).__initialFacts[d] = value
     }
     return r
   })
 }
 
 async function load(preferCloseWeek: boolean = false) {
+  const reqId = ++loadSeq
   try {
     loading.value.page = true
 
     // 1) Load week anchored by the requested date
     let data = await getProductionReportWeek({ any_date_in_week: anyDate.value })
+    if (reqId !== loadSeq) return
 
     // 2) UX fix: if backend asks to close a day that is outside of the shown week,
     // automatically switch the report to the week of close_date.
@@ -313,13 +381,16 @@ async function load(preferCloseWeek: boolean = false) {
       if (closeDate && dayDates.length && !dayDates.includes(closeDate)) {
         anyDate.value = closeDate
         data = await getProductionReportWeek({ any_date_in_week: closeDate })
+        if (reqId !== loadSeq) return
       }
     }
 
     days.value = data.days || []
     closeHint.value = (data.close_hint as any) || null
-    if (!selectedCloseDate.value) {
-      selectedCloseDate.value = String(closeHint.value?.close_date || '')
+    const closeDate = String(closeHint.value?.close_date || '')
+    const availableDates = new Set((days.value || []).map(d => String(d.date || '')))
+    if (!selectedCloseDate.value || !availableDates.has(selectedCloseDate.value)) {
+      selectedCloseDate.value = closeDate
     }
 
     const raw = (data.rows || []) as any[]
@@ -333,7 +404,7 @@ async function load(preferCloseWeek: boolean = false) {
       caption: e?.message || String(e)
     })
   } finally {
-    loading.value.page = false
+    if (reqId === loadSeq) loading.value.page = false
   }
 }
 
@@ -345,6 +416,10 @@ function upsertPending(item_id: number, d: string, fact_qty: number) {
   } else {
     pendingFacts.value.push({ item_id, date: d, fact_qty })
   }
+}
+
+function removePending(item_id: number, d: string) {
+  pendingFacts.value = pendingFacts.value.filter(x => !(x.item_id === item_id && x.date === d))
 }
 
 function recalcWeekTotals(row: RowVM) {
@@ -365,9 +440,14 @@ function recalcWeekTotals(row: RowVM) {
 }
 
 function onFactInput(row: RowVM, d: string, val: any) {
-  const qty = Number(val ?? row[`fact_${d}`] ?? 0) || 0
+  const qty = Math.max(0, Math.round(Number(val ?? row[`fact_${d}`] ?? 0) || 0))
   row[`fact_${d}`] = qty
-  upsertPending(Number(row.item_id), d, qty)
+  const initial = Number((row as any)?.__initialFacts?.[d] ?? 0) || 0
+  if (qty === initial) {
+    removePending(Number(row.item_id), d)
+  } else {
+    upsertPending(Number(row.item_id), d, qty)
+  }
   recalcWeekTotals(row)
 }
 
@@ -424,14 +504,28 @@ async function closeDay() {
   }
 }
 
-// Quiet TS: avoid template access confusion with ref-object
-const isLoadingPage = computed(() => loading.value.page)
+function confirmDiscardChanges(actionLabel: string): boolean {
+  if (!pendingFacts.value.length) return true
+  return window.confirm(`Есть несохраненные изменения (${pendingFacts.value.length}). ${actionLabel} и потерять их?`)
+}
+
+function onLoadClick() {
+  if (!isValidISODate(anyDate.value)) {
+    Notify.create({ type: 'warning', message: 'Некорректная дата. Используйте формат YYYY-MM-DD' })
+    return
+  }
+  if (!confirmDiscardChanges('Перезагрузить данные')) return
+  load(false)
+}
 
 function goWeek(deltaDays: number) {
   try {
-    const d = new Date(anyDate.value)
-    d.setDate(d.getDate() + deltaDays)
-    anyDate.value = d.toISOString().slice(0, 10)
+    if (!isValidISODate(anyDate.value)) {
+      Notify.create({ type: 'warning', message: 'Некорректная дата. Используйте формат YYYY-MM-DD' })
+      return
+    }
+    if (!confirmDiscardChanges('Перейти на другую неделю')) return
+    anyDate.value = dateShift(anyDate.value, deltaDays)
     load(false)
   } catch {
     // no-op
@@ -505,7 +599,7 @@ function cellClass(props: any): string {
 }
 
 onMounted(() => {
-  load()
+  load(true)
 })
 </script>
 
@@ -531,11 +625,17 @@ onMounted(() => {
   position: sticky;
   top: 0;
   z-index: 15;
-  background: #fff;
+  background: #eef3f9;
+  color: #1f2a37;
+  font-weight: 700;
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  border-bottom: 1px solid #d4dde8;
 }
 
 .production-report-table :deep(thead th.sticky-name) {
   z-index: 25;
+  background: #eef3f9;
 }
 
 .production-report-table :deep(th.weekend-col) {
@@ -543,28 +643,29 @@ onMounted(() => {
 }
 
 .production-report-table :deep(td.weekend-cell) {
-  background: #fafafa;
+  background: #f8fbff;
 }
 
 .day-cell {
-  min-width: 110px;
+  min-width: 102px;
+  line-height: 1.05;
 }
 
 .col-header {
-  line-height: 1.15;
+  line-height: 1.1;
 }
 
 .fact-input {
-  max-width: 90px;
+  max-width: 70px;
   margin: 0 auto;
 }
 
 .closed-day-cell {
-  background: #e8f5e9;
+  background: #edf8ef;
 }
 
 .production-report-table :deep(th.closed-day-header) {
-  background: #dcedc8;
+  background: #e4f1d4;
 }
 
 .wide-table {
@@ -575,5 +676,83 @@ onMounted(() => {
 /* Ensure QTable doesn't create its own scroll container that breaks sticky */
 .production-report-table :deep(.q-table__middle) { overflow: visible !important; }
 .production-report-table :deep(.q-table__container) { overflow: visible; }
+
+.production-report-table :deep(tbody td) {
+  padding: 2px 6px;
+  min-height: 22px;
+  border-bottom: 1px solid #edf1f6;
+  line-height: 1;
+}
+.production-report-table :deep(tbody tr:nth-child(even) td) {
+  background: #fafcff;
+}
+.production-report-table :deep(tbody tr:hover td) {
+  background: #eef6ff;
+}
+.production-report-table :deep(tbody td.weekend-cell) {
+  background: #f8fbff;
+}
+.production-report-table :deep(tbody td.closed-day-cell) {
+  background: #edf8ef;
+}
+
+.item-name-line {
+  max-width: 360px;
+}
+.item-name-full {
+  display: inline-block;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  line-height: 1.1;
+}
+.production-report-table :deep(.text-right) {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+.production-report-table :deep(.day-cell .text-caption) {
+  font-size: 10px;
+  line-height: 1.05;
+  margin-bottom: 1px;
+}
+
+.production-report-table :deep(.day-cell .q-field__control) {
+  min-height: 18px;
+  height: 18px;
+  padding-left: 0;
+  padding-right: 0;
+  border: 0 !important;
+  box-shadow: none !important;
+  border-radius: 0;
+  background: transparent;
+}
+
+.production-report-table :deep(.day-cell .q-field__native),
+.production-report-table :deep(.day-cell input) {
+  min-height: 18px;
+  height: 18px;
+  line-height: 1;
+  font-size: 11px;
+  padding: 0;
+  text-align: center;
+  background: transparent !important;
+}
+
+.production-report-table :deep(.day-cell input[type='number']) {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+.production-report-table :deep(.day-cell input[type='number']::-webkit-outer-spin-button),
+.production-report-table :deep(.day-cell input[type='number']::-webkit-inner-spin-button) {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.load-btn-align {
+  margin-bottom: 6px;
+}
 </style>
 
