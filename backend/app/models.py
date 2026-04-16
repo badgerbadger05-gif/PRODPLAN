@@ -79,6 +79,18 @@ class ItemCategory(Base):
     items = relationship("Item", back_populates="category")
 
 
+class StockWarehouse(Base):
+    __tablename__ = "stock_warehouses"
+
+    warehouse_id = Column(Integer, primary_key=True, index=True)
+    warehouse_ref1c = Column(String(36), unique=True, nullable=False, index=True)
+    warehouse_code = Column(String(50), nullable=True, index=True)
+    warehouse_name = Column(String(255), nullable=False)
+    is_selected = Column(Boolean, nullable=False, default=True)
+    created_at = Column(TIMESTAMP, default=func.now())
+    updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
+
+
 class Unit(Base):
     __tablename__ = "units"
 

@@ -417,6 +417,40 @@ def convert_1c_stock_to_records(stock_data: List[Dict[str, Any]], key_to_code: O
         if qty is None:
             qty = 0.0
 
+        # Извлечём склад (СтруктурнаяЕдиница) для фильтрации остатков по выбранным складам
+        warehouse_raw = (
+            record.get("СтруктурнаяЕдиница")
+            or record.get("Склад")
+            or {}
+        )
+        warehouse_ref = (
+            record.get("СтруктурнаяЕдиница_Key")
+            or record.get("Склад_Key")
+            or record.get("СтруктурнаяЕдиницаRef_Key")
+            or record.get("СкладRef_Key")
+        )
+        warehouse_code = None
+        warehouse_name = None
+
+        if isinstance(warehouse_raw, dict):
+            if not warehouse_ref:
+                warehouse_ref = (
+                    warehouse_raw.get("Ref_Key")
+                    or warehouse_raw.get("RefKey")
+                    or warehouse_raw.get("ref_key")
+                )
+            warehouse_code = (
+                warehouse_raw.get("Code")
+                or warehouse_raw.get("Код")
+            )
+            warehouse_name = (
+                warehouse_raw.get("Description")
+                or warehouse_raw.get("Наименование")
+                or warehouse_raw.get("Name")
+            )
+        elif isinstance(warehouse_raw, str) and warehouse_raw.strip():
+            warehouse_name = warehouse_raw.strip()
+
         # Извлечём Ref_Key для возврата (поможет сопоставлять по GUID)
         ref_out_val = (
             record.get(key_field_name)
@@ -433,7 +467,10 @@ def convert_1c_stock_to_records(stock_data: List[Dict[str, Any]], key_to_code: O
             "code": str(item_code).strip() if item_code else "",
             "name": str(item_name).strip() if item_name else "",
             "qty": qty,
-            "ref": ref_out
+            "ref": ref_out,
+            "warehouse_ref": str(warehouse_ref).strip() if warehouse_ref else "",
+            "warehouse_code": str(warehouse_code).strip() if warehouse_code else "",
+            "warehouse_name": str(warehouse_name).strip() if warehouse_name else "",
         })
     return converted
 

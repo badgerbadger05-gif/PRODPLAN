@@ -6,7 +6,7 @@ from typing import Dict, Optional, List
 from sqlalchemy.orm import Session
 
 from .odata_client import get_stock_from_1c_odata
-from ..models import Item
+from ..models import Item, StockWarehouse
 from ..schemas import ODataSyncRequest
 
 
@@ -17,6 +17,19 @@ class _Stats:
     unmatched_zeroed: int = 0
     items_updated: int = 0
     items_unchanged: int = 0
+    dry_run: bool = False
+    odata_url: str = ""
+    odata_entity: str = ""
+    warehouses_total: int = 0
+    warehouses_selected: int = 0
+
+
+@dataclass
+class _WarehouseStats:
+    warehouses_seen_in_odata: int = 0
+    warehouses_changed: int = 0
+    warehouses_total: int = 0
+    warehouses_selected: int = 0
     dry_run: bool = False
     odata_url: str = ""
     odata_entity: str = ""
@@ -54,6 +67,68 @@ def _fetch_db_code_maps(db: Session) -> Dict[str, str]:
         raw = str(it[0]).strip()
         result[raw] = _norm_code(raw)
     return result
+
+
+def _upsert_warehouses_from_stock_rows(db: Session, stock_rows: List[Dict]) -> int:
+    """
+    Upsert складов из строк регистра остатков.
+    Новые склады по умолчанию выбираются (is_selected=true), чтобы сохранить текущее поведение "учитывать всё".
+    """
+    # Готовим уникальные склады по Ref_Key
+    by_ref: Dict[str, Dict[str, str]] = {}
+    for rec in stock_rows or []:
+        w_ref = str(rec.get("warehouse_ref") or "").strip()
+        if not w_ref:
+            continue
+        if w_ref not in by_ref:
+            by_ref[w_ref] = {
+                "warehouse_code": str(rec.get("warehouse_code") or "").strip(),
+                "warehouse_name": str(rec.get("warehouse_name") or "").strip() or w_ref,
+            }
+        else:
+            if not by_ref[w_ref].get("warehouse_name"):
+                by_ref[w_ref]["warehouse_name"] = str(rec.get("warehouse_name") or "").strip() or w_ref
+            if not by_ref[w_ref].get("warehouse_code"):
+                by_ref[w_ref]["warehouse_code"] = str(rec.get("warehouse_code") or "").strip()
+
+    if not by_ref:
+        return 0
+
+    existing_rows: List[StockWarehouse] = (
+        db.query(StockWarehouse)
+        .filter(StockWarehouse.warehouse_ref1c.in_(list(by_ref.keys())))
+        .all()
+    )
+    existing_by_ref = {str(x.warehouse_ref1c): x for x in existing_rows}
+
+    changed = 0
+    for w_ref, payload in by_ref.items():
+        row = existing_by_ref.get(w_ref)
+        if row is None:
+            db.add(
+                StockWarehouse(
+                    warehouse_ref1c=w_ref,
+                    warehouse_code=payload.get("warehouse_code") or None,
+                    warehouse_name=payload.get("warehouse_name") or w_ref,
+                    is_selected=True,
+                )
+            )
+            changed += 1
+            continue
+
+        code_new = payload.get("warehouse_code") or None
+        name_new = payload.get("warehouse_name") or w_ref
+        needs_update = False
+        if str(row.warehouse_name or "") != str(name_new):
+            row.warehouse_name = name_new
+            needs_update = True
+        if str(row.warehouse_code or "") != str(code_new or ""):
+            row.warehouse_code = code_new
+            needs_update = True
+        if needs_update:
+            changed += 1
+
+    return changed
 
 
 def sync_stock_from_odata(db: Session, req: ODataSyncRequest) -> dict:
@@ -115,6 +190,33 @@ def sync_stock_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                 pass
         return asdict(stats)
 
+    # 1) Обновляем справочник складов из ответа 1С
+    _upsert_warehouses_from_stock_rows(db, stock_data)
+    db.flush()
+
+    # 2) Применяем фильтр по выбранным складам (мультивыбор из UI)
+    warehouses_total = int(db.query(StockWarehouse).count() or 0)
+    selected_refs_rows = (
+        db.query(StockWarehouse.warehouse_ref1c)
+        .filter(StockWarehouse.is_selected.is_(True))
+        .all()
+    )
+    selected_refs = {str(x[0]).strip() for x in selected_refs_rows if x and x[0]}
+    stats.warehouses_total = warehouses_total
+    stats.warehouses_selected = len(selected_refs)
+
+    if warehouses_total > 0:
+        filtered_rows: List[Dict] = []
+        for rec in stock_data:
+            w_ref = str(rec.get("warehouse_ref") or "").strip()
+            # Если склад в строке не определён — оставляем строку (иначе риск ложного обнуления)
+            if not w_ref:
+                filtered_rows.append(rec)
+                continue
+            if w_ref in selected_refs:
+                filtered_rows.append(rec)
+        stock_data = filtered_rows
+
     # Агрегируем по нормализованным кодам И по Ref_Key (GUID) — GUID имеет приоритет для сопоставления
     odata_map_norm_to_qty: Dict[str, float] = {}
     odata_map_ref_to_qty: Dict[str, float] = {}
@@ -139,22 +241,6 @@ def sync_stock_from_odata(db: Session, req: ODataSyncRequest) -> dict:
         print(f"[OData][stock] sample raw refs: {sample_raw_refs}", flush=True)
     except Exception:
         pass
-
-    if not odata_map_norm_to_qty and not odata_map_ref_to_qty:
-        stats.dry_run = True
-        if progress:
-            try:
-                progress.finish("stock", error=None, message="Пустая карта остатков, dry-run")
-            except Exception:
-                pass
-        # Debug: показать первые поля записи при пустом результате
-        try:
-            if stock_data:
-                sample = stock_data[0]
-                print("[OData][stock] Empty map, sample fields:", list(sample.keys())[:20], flush=True)
-        except Exception:
-            pass
-        return asdict(stats)
 
     # Debug: вывести примеры норм-кодов/Ref для диагностики сопоставления
     try:
@@ -274,5 +360,49 @@ def sync_stock_from_odata(db: Session, req: ODataSyncRequest) -> dict:
             except Exception:
                 pass
         raise
+
+    return asdict(stats)
+
+
+def sync_stock_warehouses_from_odata(db: Session, req: ODataSyncRequest) -> dict:
+    """
+    Синхронизирует только справочник складов из регистра остатков 1С.
+    Не изменяет остатки items.stock_qty.
+    """
+    stats = _WarehouseStats(
+        dry_run=bool(req.dry_run),
+        odata_url=req.base_url,
+        odata_entity=req.entity_name,
+    )
+
+    stock_data = get_stock_from_1c_odata(
+        base_url=req.base_url,
+        entity_name=req.entity_name,
+        username=req.username,
+        password=req.password,
+        token=req.token,
+        filter_query=req.filter_query,
+        select_fields=req.select_fields,
+    )
+    if not stock_data:
+        return asdict(stats)
+
+    seen_refs = {
+        str(rec.get("warehouse_ref") or "").strip()
+        for rec in stock_data
+        if str(rec.get("warehouse_ref") or "").strip()
+    }
+    stats.warehouses_seen_in_odata = len(seen_refs)
+    stats.warehouses_changed = _upsert_warehouses_from_stock_rows(db, stock_data)
+    db.flush()
+    stats.warehouses_total = int(db.query(StockWarehouse).count() or 0)
+    stats.warehouses_selected = int(
+        db.query(StockWarehouse).filter(StockWarehouse.is_selected.is_(True)).count() or 0
+    )
+
+    if req.dry_run:
+        db.rollback()
+    else:
+        db.commit()
 
     return asdict(stats)

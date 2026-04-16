@@ -49,6 +49,9 @@
                 <q-btn color="secondary" label="Синхронизация остатков" @click="syncStock" :loading="loading.syncStock" />
               </div>
               <div class="col-auto">
+                <q-btn color="secondary" label="Синхронизация складов" @click="syncWarehouses" :loading="loading.syncWarehouses" />
+              </div>
+              <div class="col-auto">
                 <q-btn color="primary" label="Синхронизация номенклатуры + ЕИ" @click="syncNomenclature" :loading="loading.syncNomenclature" />
               </div>
               <div class="col-auto">
@@ -81,6 +84,39 @@
           <q-separator />
 
           <q-card-section>
+            <div class="text-subtitle1 q-mb-sm">Склады для учёта остатков в расчёте</div>
+            <div class="row q-col-gutter-sm q-mb-sm">
+              <div class="col-auto">
+                <q-btn outline label="Обновить список складов" @click="loadWarehouses" :loading="loading.loadWarehouses" />
+              </div>
+              <div class="col-auto">
+                <q-btn outline label="Выбрать все" @click="selectAllWarehouses" />
+              </div>
+              <div class="col-auto">
+                <q-btn outline label="Снять все" @click="clearAllWarehouses" />
+              </div>
+              <div class="col-auto">
+                <q-btn color="primary" label="Сохранить выбор складов" @click="saveWarehouseSelection" :loading="loading.saveWarehousesSel" />
+              </div>
+              <div class="col-12 text-caption text-grey-7">
+                Всего складов: {{ warehouses.length }} • Выбрано: {{ selectedWarehouseRefs.size }}
+              </div>
+            </div>
+
+            <div class="q-pa-sm groups-box q-mb-md">
+              <q-list dense v-if="warehouses.length">
+                <q-item v-for="w in warehouses" :key="w.warehouse_ref1c" tag="label">
+                  <q-item-section avatar>
+                    <q-checkbox :model-value="selectedWarehouseRefs.has(w.warehouse_ref1c)" @update:model-value="(v:boolean)=>toggleWarehouseSel(w.warehouse_ref1c,v)" />
+                  </q-item-section>
+                  <q-item-section>
+                    <q-item-label>{{ w.warehouse_code ? (w.warehouse_code + ' — ') : '' }}{{ w.warehouse_name }}</q-item-label>
+                  </q-item-section>
+                </q-item>
+              </q-list>
+              <div v-else class="text-grey-6">Список складов пуст. Нажмите «Синхронизация складов» выше.</div>
+            </div>
+
             <div class="text-subtitle1 q-mb-sm">Группы номенклатуры (IsFolder=true)</div>
             <div class="row q-col-gutter-sm q-mb-sm">
               <div class="col-auto">
@@ -133,6 +169,13 @@ type ODataConfig = {
 }
 
 type GroupItem = { id: string; code: string; name: string }
+type WarehouseItem = {
+  warehouse_id: number
+  warehouse_ref1c: string
+  warehouse_code: string
+  warehouse_name: string
+  is_selected: boolean
+}
 
 const form = ref<ODataConfig>({
   base_url: '',
@@ -143,6 +186,8 @@ const form = ref<ODataConfig>({
 
 const groups = ref<GroupItem[]>([])
 const selectedIds = ref<Set<string>>(new Set())
+const warehouses = ref<WarehouseItem[]>([])
+const selectedWarehouseRefs = ref<Set<string>>(new Set())
 
 const syncProgress = ref({
   show: false,
@@ -162,9 +207,12 @@ const loading = ref({
   syncSpecifications: false,
   syncOperations: false,
   syncStock: false,
+  syncWarehouses: false,
   syncProductionKinds: false,
   syncProductionOrders: false,
-  exportProductionOrders: false
+  exportProductionOrders: false,
+  loadWarehouses: false,
+  saveWarehousesSel: false
 })
 
 // --- Реал-тайм прогресс синхронизации номенклатуры ---
@@ -217,6 +265,60 @@ async function loadConfig() {
     form.value.token = cfg.token || ''
   } catch {
     // ignore
+  }
+}
+
+async function loadWarehouses() {
+  try {
+    loading.value.loadWarehouses = true
+    const { data } = await api.get('/v1/sync/warehouses')
+    const rows = Array.isArray(data?.rows) ? data.rows : []
+    warehouses.value = rows.map((r:any) => ({
+      warehouse_id: Number(r.warehouse_id || 0),
+      warehouse_ref1c: String(r.warehouse_ref1c || ''),
+      warehouse_code: String(r.warehouse_code || ''),
+      warehouse_name: String(r.warehouse_name || ''),
+      is_selected: Boolean(r.is_selected)
+    }))
+    selectedWarehouseRefs.value = new Set(
+      warehouses.value.filter(w => w.is_selected).map(w => w.warehouse_ref1c)
+    )
+  } catch (e:any) {
+    const msg = e?.response?.data?.detail || e?.message || 'Ошибка загрузки складов'
+    Notify.create({ type: 'negative', message: String(msg) })
+  } finally {
+    loading.value.loadWarehouses = false
+  }
+}
+
+function toggleWarehouseSel(ref: string, selected: boolean) {
+  if (!ref) return
+  const set = selectedWarehouseRefs.value
+  if (selected) set.add(ref)
+  else set.delete(ref)
+}
+
+function selectAllWarehouses() {
+  selectedWarehouseRefs.value = new Set(warehouses.value.map(w => w.warehouse_ref1c))
+}
+
+function clearAllWarehouses() {
+  selectedWarehouseRefs.value = new Set()
+}
+
+async function saveWarehouseSelection() {
+  try {
+    loading.value.saveWarehousesSel = true
+    await api.post('/v1/sync/warehouses/selection', {
+      selected_refs: Array.from(selectedWarehouseRefs.value)
+    })
+    Notify.create({ type: 'positive', message: 'Выбор складов сохранён' })
+    await loadWarehouses()
+  } catch (e:any) {
+    const msg = e?.response?.data?.detail || e?.message || 'Ошибка сохранения выбора складов'
+    Notify.create({ type: 'negative', message: String(msg) })
+  } finally {
+    loading.value.saveWarehousesSel = false
   }
 }
 
@@ -648,6 +750,47 @@ async function syncStock() {
   }
 }
 
+async function syncWarehouses() {
+  if (!form.value.base_url) {
+    Notify.create({ type: 'warning', message: 'Укажите base_url для подключения к 1С' })
+    return
+  }
+  try {
+    loading.value.syncWarehouses = true
+
+    const now = new Date()
+    const pad = (n:number) => String(n).padStart(2, '0')
+    const dt = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`
+    const payload = {
+      base_url: form.value.base_url,
+      entity_name: 'AccumulationRegister_ЗапасыНаСкладах/Balance',
+      username: form.value.username || undefined,
+      password: form.value.password || undefined,
+      token: form.value.token || undefined,
+      filter_query: `Period le datetime'${dt}'`,
+      select_fields: null,
+      dry_run: false,
+      zero_missing: false
+    }
+
+    const { data } = await api.post('/v1/sync/warehouses-odata', payload, { timeout: 900000 })
+    const total = Number(data?.warehouses_total || 0)
+    const selected = Number(data?.warehouses_selected || 0)
+    const changed = Number(data?.warehouses_changed || 0)
+    Notify.create({
+      type: 'positive',
+      message: `Склады синхронизированы • всего ${total}, выбрано ${selected}, изменено ${changed}`,
+      timeout: 5000
+    })
+    await loadWarehouses()
+  } catch (e:any) {
+    const msg = e?.response?.data?.detail || e?.message || 'Ошибка синхронизации складов'
+    Notify.create({ type: 'negative', message: String(msg) })
+  } finally {
+    loading.value.syncWarehouses = false
+  }
+}
+
 async function syncProductionKinds() {
   if (!form.value.base_url) {
     Notify.create({ type: 'warning', message: 'Укажите base_url для подключения к 1С' })
@@ -818,6 +961,7 @@ function downloadBase64Xlsx(b64: string, filename: string) {
 onMounted(() => {
   void loadConfig()
   void loadGroups()
+  void loadWarehouses()
 })
   
 </script>
