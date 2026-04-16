@@ -400,7 +400,7 @@ def _resolve_warehouse_mapping(client: OData1CClient, warehouse_refs: List[str])
 
     mapping: Dict[str, Dict[str, str]] = {}
     chunk_size = 20
-    select_fields = "Ref_Key,Code,Description,Код,Наименование,Name"
+    select_fields = "Ref_Key,Code,Description"
 
     for entity in candidate_entities:
         unresolved = [r for r in guid_refs if r not in mapping]
