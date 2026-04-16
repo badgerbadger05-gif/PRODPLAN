@@ -147,6 +147,90 @@ def test_parent_can_be_falsely_blocked_when_component_stock_missing_in_cache(db_
     assert db.query(PlannedOrder).filter(PlannedOrder.run_id == run2.run_id).count() == 1
 
 
+def test_component_limit_is_cumulative_across_multiple_buckets(db_session):
+    db = db_session
+
+    u = Unit(unit_ref1c="u-cum", unit_name="шт", short_name="шт", precision=0)
+    db.add(u)
+
+    parent = Item(
+        item_code="PARENT-CUM",
+        item_name="Parent Cumulative",
+        item_article="PARENT-CUM",
+        replenishment_method="Производство",
+        unit="u-cum",
+        stock_qty=0,
+        status="active",
+    )
+    child = Item(
+        item_code="CHILD-CUM",
+        item_name="Child Cumulative",
+        item_article="CHILD-CUM",
+        replenishment_method="Производство",
+        unit="u-cum",
+        stock_qty=2,
+        status="active",
+    )
+    db.add_all([parent, child])
+    db.flush()
+
+    spec = Specification(spec_code="S-CUM", spec_name="Spec Cumulative")
+    db.add(spec)
+    db.flush()
+    db.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db.add(SpecComponent(spec_id=spec.spec_id, item_id=child.item_id, quantity=1.0))
+    db.flush()
+
+    run = _mk_run(db)
+    units_by_ref = {"u-cum": u}
+    item_cache = {parent.item_id: parent, child.item_id: child}
+
+    def components_loader(spec_id: int):
+        return db.query(SpecComponent).filter(SpecComponent.spec_id == spec_id).all()
+
+    calc = OrderQuantityCalculator(
+        snapshot=run.config_snapshot,
+        default_spec_map={parent.item_id: spec.spec_id},
+        spec_by_id={spec.spec_id: spec},
+        components_loader=components_loader,
+        item_by_id=item_cache,
+        units_by_ref=units_by_ref,
+        res_by_id={},
+        production_kinds_by_resource={},
+        stock_by_item={parent.item_id: 0.0, child.item_id: 2.0},
+        wip_by_item={},
+        horizon_days=run.horizon_days or 0,
+        total_demand_by_item={parent.item_id: 10.0},
+    )
+
+    out = build_planned_orders_and_purchases(
+        db,
+        run,
+        {
+            str(parent.item_id): {
+                "2025-01-01": 5.0,
+                "2025-01-08": 5.0,
+            }
+        },
+        calc,
+        priority_manager=SimpleNamespace(),
+        item_cache=item_cache,
+        units_by_ref=units_by_ref,
+    )
+
+    rows = (
+        db.query(PlannedOrder)
+        .filter(PlannedOrder.run_id == run.run_id, PlannedOrder.item_id == parent.item_id)
+        .order_by(PlannedOrder.need_date.asc())
+        .all()
+    )
+    assert len(rows) == 1
+    assert float(rows[0].planned_qty) == 2.0
+    assert sum(float(r.planned_qty) for r in rows) == 2.0
+    assert any(w.get("code") == "COMPONENT_SHORTAGE_PARTIAL" for w in out.get("warnings", []))
+    assert any(w.get("code") == "COMPONENT_SHORTAGE_BLOCKED" for w in out.get("warnings", []))
+
+
 def test_active_1c_remaining_reduces_requested_qty_for_production_order(db_session):
     db = db_session
 

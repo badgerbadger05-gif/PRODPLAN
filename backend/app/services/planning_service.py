@@ -2528,6 +2528,47 @@ def build_planned_orders_and_purchases(
                 }
             )
 
+    def consume_component_stock(parent_item_id: int, planned_parent_qty: float) -> None:
+        """
+        Consume direct BOM components from the calculator stock cache.
+        This keeps component gating cumulative across chronological buckets
+        within the same run.
+        """
+        try:
+            parent_qty = float(planned_parent_qty or 0.0)
+        except Exception:
+            parent_qty = 0.0
+        if parent_qty <= 1e-9:
+            return
+
+        try:
+            spec_id = getattr(order_qty_calculator, "default_spec_map", {}).get(int(parent_item_id))
+        except Exception:
+            spec_id = None
+        if not spec_id:
+            return
+
+        try:
+            comps = order_qty_calculator.components_loader(int(spec_id)) or []
+        except Exception:
+            return
+
+        for comp in comps:
+            try:
+                child_id = int(getattr(comp, "item_id"))
+                per_unit = float(getattr(comp, "quantity", 0.0) or 0.0)
+            except Exception:
+                continue
+            if per_unit <= 1e-12:
+                continue
+
+            consume_qty = parent_qty * per_unit
+            if consume_qty <= 1e-12:
+                continue
+
+            base_stock = float(getattr(order_qty_calculator, "stock_by_item", {}).get(child_id, 0.0) or 0.0)
+            order_qty_calculator.stock_by_item[child_id] = max(base_stock - consume_qty, 0.0)
+
     for req in sorted(all_reqs, key=lambda x: x["need_date"]):
         item_id = req["item_id"]
         need_date = req["need_date"]
@@ -2620,6 +2661,7 @@ def build_planned_orders_and_purchases(
                 bucket_date=need_date,
             )
             created_orders.append(order)
+            consume_component_stock(parent_item_id=int(item_id), planned_parent_qty=float(planned_qty))
         elif is_purchase:
             lead_time = item.replenishment_time or 30
             order_date = need_date - timedelta(days=lead_time)
@@ -2718,6 +2760,7 @@ def build_planned_orders_and_purchases(
                 shortage=shortage_payload,
             )
             created_reworks.append(rework)
+            consume_component_stock(parent_item_id=int(item_id), planned_parent_qty=float(planned_qty))
 
     db.add_all(created_orders)
     db.add_all(created_purchases)
