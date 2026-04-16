@@ -1,6 +1,7 @@
 services:
   db:
     image: postgres:15
+    restart: unless-stopped
     environment:
       POSTGRES_DB: prodplan
       POSTGRES_USER: prodplan
@@ -18,6 +19,7 @@ services:
   
   backend:
     build: ./backend
+    restart: unless-stopped
     environment:
       DATABASE_URL: postgresql://prodplan:password@db:5432/prodplan
     depends_on:
@@ -41,6 +43,7 @@ services:
   
   frontend:
     build: ./frontend
+    restart: unless-stopped
     environment:
       API_URL: http://localhost:8000/api
     depends_on:
