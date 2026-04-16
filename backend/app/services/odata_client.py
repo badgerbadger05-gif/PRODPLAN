@@ -385,6 +385,9 @@ def _resolve_warehouse_mapping(client: OData1CClient, warehouse_refs: List[str])
     refs = sorted({str(x).strip() for x in (warehouse_refs or []) if str(x).strip()})
     if not refs:
         return {}
+    guid_refs = [r for r in refs if _is_guid_like(r)]
+    if not guid_refs:
+        return {}
 
     # В разных конфигурациях 1С склады могут лежать в разных каталогах.
     # Пробуем типовые варианты и тихо пропускаем отсутствующие.
@@ -400,7 +403,7 @@ def _resolve_warehouse_mapping(client: OData1CClient, warehouse_refs: List[str])
     select_fields = "Ref_Key,Code,Description,Код,Наименование,Name"
 
     for entity in candidate_entities:
-        unresolved = [r for r in refs if r not in mapping]
+        unresolved = [r for r in guid_refs if r not in mapping]
         if not unresolved:
             break
         try:
