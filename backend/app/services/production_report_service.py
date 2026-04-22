@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+import re
 
 from sqlalchemy import and_, func
 from sqlalchemy.orm import Session
@@ -70,6 +71,18 @@ def _to_float(v: Any) -> float:
         return float(v or 0.0)
     except Exception:
         return 0.0
+
+
+def _strip_carry_notes(notes: Optional[str]) -> Optional[str]:
+    """Remove previous carry fragments from notes, preserving other text."""
+    if not notes:
+        return None
+    try:
+        cleaned = re.sub(r"(^|;\s*)Carry[^;]*", "", str(notes), flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*;\s*", "; ", cleaned).strip(" ;")
+        return cleaned or None
+    except Exception:
+        return notes
 
 
 def _day_bounds(d: date) -> Tuple[datetime, datetime]:
@@ -632,7 +645,7 @@ def close_previous_workday(
                             planned_qty=carry,
                             completed_qty=0.0,
                             status="GREEN",
-                            notes=f"Carry from {d_close.isoformat()}",
+                            notes=f"Carry {carry:+g} from {d_close.isoformat()}",
                         )
                     )
                 else:
@@ -649,10 +662,10 @@ def close_previous_workday(
                 if carry_applied:
                     applied_to = d_target
                 # Update notes to indicate signed carry application
-                if pe_t.notes:
-                    pe_t.notes = f"{pe_t.notes}; Carry {carry:+g} from {d_close.isoformat()}"
-                else:
-                    pe_t.notes = f"Carry {carry:+g} from {d_close.isoformat()}"
+                if carry_applied:
+                    base_notes = _strip_carry_notes(pe_t.notes)
+                    carry_note = f"Carry {carry:+g} from {d_close.isoformat()}"
+                    pe_t.notes = f"{base_notes}; {carry_note}" if base_notes else carry_note
             if carry_applied:
                 applied_count += 1
 
