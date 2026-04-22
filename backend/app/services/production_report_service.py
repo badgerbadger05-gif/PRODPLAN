@@ -408,7 +408,7 @@ def close_previous_workday(
             try:
                 carry = _to_float(it.carry_qty)
                 applied = getattr(it, "applied_to_date", None)
-                if carry <= 1e-9 or applied is None:
+                if abs(carry) <= 1e-9 or applied is None:
                     continue
                 # subtract only the carry amount from plan on that date
                 a0, a1 = _day_bounds(applied)
@@ -455,13 +455,15 @@ def close_previous_workday(
     # fact 5 Fri => naive carry 25 but real week remainder may be 15, or even less if weekend fact exists).
     #
     # We net facts within the week against plans up to D_close (FIFO by date inside the week).
-    # Carry for D_close is the incremental backlog attributable to D_close:
-    #   carry = max(P_through_close - F_week, 0) - max(P_before_close - F_week, 0)
+    # Carry for D_close is the incremental backlog attributable to D_close,
+    # with support of negative credit on over-fulfillment:
+    #   carry = (P_through_close - F_week) - max(P_before_close - F_week, 0)
     # where:
     #   P_before_close  = sum(plan_qty in [week_start .. D_close-1])
     #   P_through_close = sum(plan_qty in [week_start .. D_close])
     #   F_week          = sum(fact_qty in [week_start .. min(today, week_end)])
-    # This allows weekend facts (when today is Monday and D_close is previous Friday) to reduce carry.
+    # This allows weekend facts (when today is Monday and D_close is previous Friday)
+    # to reduce carry and potentially produce negative credit.
     week_start = _week_start_monday(d_close)
     week_end = week_start + timedelta(days=6)
     fact_end = week_end if today > week_end else today
@@ -529,14 +531,17 @@ def close_previous_workday(
         p_through = _to_float(plan_through_map.get(iid, 0.0))
         f_week = _to_float(fact_week_map.get(iid, 0.0))
 
-        backlog_through = max(p_through - f_week, 0.0)
+        # Signed carry:
+        #  > 0 => backlog to move forward
+        #  < 0 => over-fulfillment credit to reduce future plan
+        backlog_through = (p_through - f_week)
         backlog_before = max(p_before - f_week, 0.0)
-        carry = max(backlog_through - backlog_before, 0.0)
+        carry = backlog_through - backlog_before
 
         applied_to: Optional[date] = None
         original_planned_before_carry: Optional[float] = None
         planned_after_carry: Optional[float] = None
-        if carry > 1e-9:
+        if abs(carry) > 1e-9:
             applied_to = d_target
             t0, t1 = _day_bounds(d_target)
             pe_t = (
@@ -545,29 +550,34 @@ def close_previous_workday(
                 .first()
             )
             if pe_t is None:
-                original_planned_before_carry = 0.0
-                planned_after_carry = float(carry)
-                db.add(
-                    ProductionPlanEntry(
-                        item_id=iid,
-                        stage_id=None,
-                        date=datetime.combine(d_target, datetime.min.time()),
-                        planned_qty=carry,
-                        completed_qty=0.0,
-                        status="GREEN",
-                        notes=f"Carry from {d_close.isoformat()}",
+                if carry > 0:
+                    original_planned_before_carry = 0.0
+                    planned_after_carry = float(carry)
+                    db.add(
+                        ProductionPlanEntry(
+                            item_id=iid,
+                            stage_id=None,
+                            date=datetime.combine(d_target, datetime.min.time()),
+                            planned_qty=carry,
+                            completed_qty=0.0,
+                            status="GREEN",
+                            notes=f"Carry from {d_close.isoformat()}",
+                        )
                     )
-                )
-            else:
-                # Store original planned quantity before adding carry for accurate rollback
-                original_planned_before_carry = _to_float(pe_t.planned_qty)
-                planned_after_carry = float(original_planned_before_carry + carry)
-                pe_t.planned_qty = planned_after_carry
-                # Update notes to indicate carry addition
-                if pe_t.notes:
-                    pe_t.notes = f"{pe_t.notes}; Carry +{carry} from {d_close.isoformat()}"
                 else:
-                    pe_t.notes = f"Carry +{carry} from {d_close.isoformat()}"
+                    # Do not create a negative target plan row when there is nothing to reduce.
+                    original_planned_before_carry = 0.0
+                    planned_after_carry = 0.0
+            else:
+                # Store original planned quantity before applying signed carry for accurate rollback
+                original_planned_before_carry = _to_float(pe_t.planned_qty)
+                planned_after_carry = max(float(original_planned_before_carry + carry), 0.0)
+                pe_t.planned_qty = planned_after_carry
+                # Update notes to indicate signed carry application
+                if pe_t.notes:
+                    pe_t.notes = f"{pe_t.notes}; Carry {carry:+g} from {d_close.isoformat()}"
+                else:
+                    pe_t.notes = f"Carry {carry:+g} from {d_close.isoformat()}"
             applied_count += 1
 
         db.add(
@@ -580,7 +590,7 @@ def close_previous_workday(
                 applied_to_date=applied_to,
                 original_planned_qty_before_carry=original_planned_before_carry,
                 planned_qty_after_carry=planned_after_carry,
-                carry_status="APPLIED" if carry > 1e-9 else "NONE",
+                carry_status="APPLIED" if abs(carry) > 1e-9 else "NONE",
             )
         )
 
