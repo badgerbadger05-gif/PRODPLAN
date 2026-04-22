@@ -126,21 +126,82 @@ def get_week_report(
         .filter(ProductionDayClose.close_date >= d0, ProductionDayClose.close_date <= d6)
         .all()
     )
+
+    # Effective carry that is currently still present in plan on applied_to_date.
+    # We keep history rows intact, but UI must show only "alive" carry in current plan state.
+    carry_keys: List[Tuple[int, date]] = []
+    for item_rec, _close_date in closed_data_rows:
+        try:
+            ii = int(item_rec.item_id)
+            ad = getattr(item_rec, "applied_to_date", None)
+            if ad is not None:
+                carry_keys.append((ii, ad))
+        except Exception:
+            continue
+
+    current_plan_on_target: Dict[Tuple[int, str], float] = {}
+    if carry_keys:
+        try:
+            item_ids_for_carry = sorted({int(i) for i, _ in carry_keys})
+            target_dates = [d for _, d in carry_keys]
+            min_dt = min(target_dates)
+            max_dt = max(target_dates) + timedelta(days=1)
+            rows_plan = (
+                db.query(
+                    ProductionPlanEntry.item_id.label("item_id"),
+                    func.date(ProductionPlanEntry.date).label("d"),
+                    func.coalesce(func.sum(ProductionPlanEntry.planned_qty), 0.0).label("plan"),
+                )
+                .filter(ProductionPlanEntry.item_id.in_(item_ids_for_carry))
+                .filter(ProductionPlanEntry.date >= datetime.combine(min_dt, datetime.min.time()))
+                .filter(ProductionPlanEntry.date < datetime.combine(max_dt, datetime.min.time()))
+                .group_by(ProductionPlanEntry.item_id, func.date(ProductionPlanEntry.date))
+                .all()
+            )
+            for iid, dval, p in rows_plan:
+                try:
+                    ds = dval.isoformat() if hasattr(dval, "isoformat") else str(dval)
+                    current_plan_on_target[(int(iid), ds)] = _to_float(p)
+                except Exception:
+                    continue
+        except Exception:
+            current_plan_on_target = {}
+
+    def _effective_carry_now(item_rec: ProductionDayCloseItem) -> float:
+        carry = _to_float(getattr(item_rec, "carry_qty", 0.0))
+        if abs(carry) <= 1e-9:
+            return 0.0
+        applied = getattr(item_rec, "applied_to_date", None)
+        before_raw = getattr(item_rec, "original_planned_qty_before_carry", None)
+        # Legacy rows: keep historical carry as fallback
+        if applied is None or before_raw is None:
+            return carry
+        try:
+            key = (int(item_rec.item_id), applied.isoformat())
+            current_plan = _to_float(current_plan_on_target.get(key, 0.0))
+            before = _to_float(before_raw)
+            delta = current_plan - before
+            if carry > 0:
+                return min(max(delta, 0.0), carry)
+            return max(min(delta, 0.0), carry)
+        except Exception:
+            return carry
     
     # Map closed data by date
     closed_data_map: Dict[date, Dict[str, Any]] = {}
     for item_rec, close_date in closed_data_rows:
+        eff_carry = _effective_carry_now(item_rec)
         if close_date not in closed_data_map:
             closed_data_map[close_date] = {
                 'closed_planned': _to_float(item_rec.planned_qty_snapshot),
                 'closed_fact': _to_float(item_rec.fact_qty_snapshot),
-                'carry_qty': _to_float(item_rec.carry_qty),
+                'carry_qty': eff_carry,
             }
         else:
             # Sum up values for multiple items closed on the same day
             closed_data_map[close_date]['closed_planned'] += _to_float(item_rec.planned_qty_snapshot)
             closed_data_map[close_date]['closed_fact'] += _to_float(item_rec.fact_qty_snapshot)
-            closed_data_map[close_date]['carry_qty'] += _to_float(item_rec.carry_qty)
+            closed_data_map[close_date]['carry_qty'] += eff_carry
 
     days_out: List[Dict[str, Any]] = []
     for d in dates:
@@ -182,6 +243,8 @@ def get_week_report(
                     ProductionDayCloseItem.planned_qty_snapshot,
                     ProductionDayCloseItem.fact_qty_snapshot,
                     ProductionDayCloseItem.carry_qty,
+                    ProductionDayCloseItem.applied_to_date,
+                    ProductionDayCloseItem.original_planned_qty_before_carry,
                 )
                 .join(ProductionDayClose, ProductionDayCloseItem.day_close_id == ProductionDayClose.id)
                 .filter(ProductionDayClose.close_date >= d0)
@@ -189,11 +252,21 @@ def get_week_report(
                 .filter(ProductionDayCloseItem.item_id.in_(item_ids))
                 .all()
             )
-            for iid, cd, p, f, c in close_item_rows:
+            for iid, cd, p, f, c, applied_to, before_raw in close_item_rows:
                 try:
                     ii = int(iid)
                     ds = cd.isoformat() if hasattr(cd, "isoformat") else str(cd)
-                    carry_by_item.setdefault(ii, {})[ds] = _to_float(c)
+                    eff_carry = _to_float(c)
+                    if abs(eff_carry) > 1e-9 and applied_to is not None and before_raw is not None:
+                        key = (ii, applied_to.isoformat())
+                        current_plan = _to_float(current_plan_on_target.get(key, 0.0))
+                        before = _to_float(before_raw)
+                        delta = current_plan - before
+                        if eff_carry > 0:
+                            eff_carry = min(max(delta, 0.0), eff_carry)
+                        else:
+                            eff_carry = max(min(delta, 0.0), eff_carry)
+                    carry_by_item.setdefault(ii, {})[ds] = eff_carry
                     closed_plan_by_item.setdefault(ii, {})[ds] = _to_float(p)
                     closed_fact_by_item.setdefault(ii, {})[ds] = _to_float(f)
                 except Exception:
