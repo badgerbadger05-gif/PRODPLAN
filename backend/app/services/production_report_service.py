@@ -483,7 +483,8 @@ def close_previous_workday(
                 applied = getattr(it, "applied_to_date", None)
                 if abs(carry) <= 1e-9 or applied is None:
                     continue
-                # subtract only the carry amount from plan on that date
+                # Delta rollback: remove exactly this carry contribution from current plan.
+                # This avoids overwriting carries from other close days that target the same date.
                 a0, a1 = _day_bounds(applied)
                 pe = (
                     db.query(ProductionPlanEntry)
@@ -492,12 +493,7 @@ def close_previous_workday(
                 )
                 if pe is None:
                     continue
-                # Deterministic rollback: restore planned_qty on target date to the snapshot before carry.
-                before = getattr(it, "original_planned_qty_before_carry", None)
-                if before is None:
-                    # Backward compatibility for old rows without the field
-                    before = _to_float(pe.planned_qty) - carry
-                pe.planned_qty = max(_to_float(before), 0.0)
+                pe.planned_qty = max(_to_float(pe.planned_qty) - carry, 0.0)
             except Exception:
                 continue
 
@@ -614,8 +610,8 @@ def close_previous_workday(
         applied_to: Optional[date] = None
         original_planned_before_carry: Optional[float] = None
         planned_after_carry: Optional[float] = None
+        carry_applied = False
         if abs(carry) > 1e-9:
-            applied_to = d_target
             t0, t1 = _day_bounds(d_target)
             pe_t = (
                 db.query(ProductionPlanEntry)
@@ -624,6 +620,8 @@ def close_previous_workday(
             )
             if pe_t is None:
                 if carry > 0:
+                    applied_to = d_target
+                    carry_applied = True
                     original_planned_before_carry = 0.0
                     planned_after_carry = float(carry)
                     db.add(
@@ -646,12 +644,17 @@ def close_previous_workday(
                 original_planned_before_carry = _to_float(pe_t.planned_qty)
                 planned_after_carry = max(float(original_planned_before_carry + carry), 0.0)
                 pe_t.planned_qty = planned_after_carry
+                # Mark as applied only when it changed target plan.
+                carry_applied = abs(planned_after_carry - original_planned_before_carry) > 1e-9
+                if carry_applied:
+                    applied_to = d_target
                 # Update notes to indicate signed carry application
                 if pe_t.notes:
                     pe_t.notes = f"{pe_t.notes}; Carry {carry:+g} from {d_close.isoformat()}"
                 else:
                     pe_t.notes = f"Carry {carry:+g} from {d_close.isoformat()}"
-            applied_count += 1
+            if carry_applied:
+                applied_count += 1
 
         db.add(
             ProductionDayCloseItem(
@@ -663,7 +666,7 @@ def close_previous_workday(
                 applied_to_date=applied_to,
                 original_planned_qty_before_carry=original_planned_before_carry,
                 planned_qty_after_carry=planned_after_carry,
-                carry_status="APPLIED" if abs(carry) > 1e-9 else "NONE",
+                carry_status="APPLIED" if carry_applied else "NONE",
             )
         )
 
