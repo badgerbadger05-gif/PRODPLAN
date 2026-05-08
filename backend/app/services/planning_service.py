@@ -82,7 +82,7 @@ DEFAULT_PAGE_LIMIT = 50
 
 # 1C state key for completed production orders.
 DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
-SUPPLIER_ORDER_EXCLUDED_STATE_NAMES = {"новый заказ", "отменен", "завершен", "завершен успешно"}
+SUPPLIER_ORDER_EXCLUDED_STATE_NAMES = {"новый заказ", "отменен", "завершен", "завершен успешно", "бухгалтерия"}
 
 
 def _ensure_dict(raw: Any) -> Dict[str, Any]:

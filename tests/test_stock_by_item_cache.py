@@ -516,6 +516,7 @@ def test_active_supplier_remaining_filters_new_cancelled_deleted_and_missing_dat
     add_order("CANCEL", "Отменён", False, 6.0, datetime.datetime(2026, 1, 10))
     add_order("DONE", "Завершён", False, 9.0, datetime.datetime(2026, 1, 10))
     add_order("DONE-OK", "Завершен успешно", False, 10.0, datetime.datetime(2026, 1, 10))
+    add_order("ACCOUNTING", "Бухгалтерия", False, 11.0, datetime.datetime(2026, 1, 10))
     add_order("DELETED", "В закупку", True, 7.0, datetime.datetime(2026, 1, 10))
     add_order("NODATE", "В закупку", False, 8.0, None)
     db.commit()

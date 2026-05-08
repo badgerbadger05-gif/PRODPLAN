@@ -56,6 +56,7 @@ def test_supplier_order_export_includes_only_orders_used_by_mrp(db_session):
     add_order("NEW", "Новый заказ", False, 4)
     add_order("CANCEL", "Отменен", False, 4)
     add_order("DONE", "Завершен", False, 4)
+    add_order("ACCOUNTING", "Бухгалтерия", False, 4)
     add_order("DELETED", "В закупку", True, 4)
     add_order("ZERO", "В закупку", False, 0)
     db.commit()

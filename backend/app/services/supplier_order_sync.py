@@ -9,6 +9,8 @@ from sqlalchemy.orm import Session
 from ..models import SupplierOrder, SupplierOrderItem, Supplier, Item
 from ..schemas import ODataSyncRequest
 
+ALLOWED_ORGANIZATION_NAMES = {"зсм", "ооо зсм"}
+
 
 def _parse_1c_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
@@ -73,6 +75,45 @@ def _extract_state_name(record: Dict[str, Any]) -> str:
     return str(record.get("СостояниеЗаказа_Name") or record.get("СостояниеЗаказа_Description") or "").strip()
 
 
+def _normalize_organization_name(value: Any) -> str:
+    normalized = str(value or "").strip().casefold().replace("ё", "е")
+    for ch in ('"', "'", "«", "»", ".", ",", "(", ")"):
+        normalized = normalized.replace(ch, " ")
+    return " ".join(normalized.split())
+
+
+def _extract_organization_name(record: Dict[str, Any], organization_names_by_key: Dict[str, str]) -> str:
+    organization_raw = record.get("Организация")
+    if isinstance(organization_raw, dict):
+        name = str(
+            organization_raw.get("Description")
+            or organization_raw.get("Наименование")
+            or organization_raw.get("Name")
+            or ""
+        ).strip()
+        if name:
+            return name
+    elif organization_raw:
+        return str(organization_raw).strip()
+
+    name = str(record.get("Организация_Name") or record.get("Организация_Description") or "").strip()
+    if name:
+        return name
+
+    organization_key = _norm_guid(record.get("Организация_Key"))
+    return organization_names_by_key.get(organization_key, "") if organization_key else ""
+
+
+def _is_allowed_organization(record: Dict[str, Any], organization_names_by_key: Dict[str, str]) -> bool:
+    organization_key = _norm_guid(record.get("Организация_Key"))
+    organization_name = _extract_organization_name(record, organization_names_by_key)
+    if not organization_key and not organization_name:
+        # Older test doubles / atypical OData schemas may not expose organization.
+        # Do not drop those records silently.
+        return True
+    return _normalize_organization_name(organization_name) in ALLOWED_ORGANIZATION_NAMES
+
+
 def _load_supplier_order_state_names(client: Any) -> Dict[str, str]:
     """
     1C returns order state in documents as GUID. Human-readable names live in a separate catalog.
@@ -98,6 +139,27 @@ def _load_supplier_order_state_names(client: Any) -> Dict[str, str]:
     return state_names
 
 
+def _load_organization_names(client: Any) -> Dict[str, str]:
+    organization_names: Dict[str, str] = {}
+    try:
+        rows = client.get_all(
+            "Catalog_Организации",
+            select_fields=["Ref_Key", "Description"],
+            top=1000,
+            max_pages=10,
+        )
+    except Exception as e:
+        print(f"Не удалось загрузить организации: {e}")
+        return organization_names
+
+    for row in rows or []:
+        key = _norm_guid(row.get("Ref_Key"))
+        name = str(row.get("Description") or "").strip()
+        if key and name:
+            organization_names[key] = name
+    return organization_names
+
+
 @dataclass
 class SupplierOrderSyncStats:
     """Статистика синхронизации заказов поставщикам"""
@@ -109,6 +171,7 @@ class SupplierOrderSyncStats:
     items_updated: int = 0
     suppliers_created: int = 0
     suppliers_updated: int = 0
+    orders_skipped_by_organization: int = 0
     dry_run: bool = False
     odata_url: str = ""
     odata_entity: str = ""
@@ -137,6 +200,7 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
         # Создаем клиент OData
         client = OData1CClient(req.base_url, req.username, req.password, req.token)
         state_names_by_key = _load_supplier_order_state_names(client)
+        organization_names_by_key = _load_organization_names(client)
 
         orders_select_default = [
             "Ref_Key",
@@ -145,6 +209,7 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
             "Posted",
             "DeletionMark",
             "СостояниеЗаказа_Key",
+            "Организация_Key",
             "Контрагент_Key",
             "СуммаДокумента",
             "Запасы",
@@ -179,6 +244,7 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
         items_updated = 0
         suppliers_created = 0
         suppliers_updated = 0
+        skipped_by_organization = 0
 
         # Обрабатываем каждый заказ
         for record in order_data:
@@ -186,6 +252,14 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
             try:
                 ref_key = record.get('Ref_Key', '').strip()
                 if not ref_key:
+                    continue
+
+                existing_order = existing_orders.get(ref_key)
+                if not _is_allowed_organization(record, organization_names_by_key):
+                    skipped_by_organization += 1
+                    if existing_order and not bool(existing_order.deletion_mark):
+                        existing_order.deletion_mark = True
+                        updated_count += 1
                     continue
 
                 # Извлекаем данные заказа
@@ -211,8 +285,6 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                 if not isinstance(items_data, list):
                     items_data = []
 
-                # Проверяем, существует ли уже такой заказ
-                existing_order = existing_orders.get(ref_key)
                 current_order = existing_order
 
                 if existing_order:
@@ -397,6 +469,7 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
         stats.items_updated = items_updated
         stats.suppliers_created = suppliers_created
         stats.suppliers_updated = suppliers_updated
+        stats.orders_skipped_by_organization = skipped_by_organization
 
         if req.dry_run:
             db.rollback()
