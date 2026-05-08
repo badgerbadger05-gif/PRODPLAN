@@ -12,6 +12,7 @@ from ..services.specification_sync import sync_specifications_from_odata, Specif
 from ..services.production_order_sync import sync_production_orders_from_odata, ProductionOrderSyncStats, sync_production_fact_from_odata
 from ..services.production_order_export import export_production_orders_xlsx
 from ..services.supplier_order_sync import sync_supplier_orders_from_odata, SupplierOrderSyncStats
+from ..services.supplier_order_export import export_supplier_orders_xlsx
 from ..services.default_specification_sync import sync_default_specifications_from_odata, DefaultSpecificationSyncStats
 from ..services.production_stage_sync import sync_production_stages_from_odata, ProductionStageSyncStats
 
@@ -348,6 +349,18 @@ def sync_supplier_orders_odata(payload: ODataSyncRequest, db: Session = Depends(
         return stats
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Sync error: {e}")
+
+
+@router.get("/supplier-orders-odata/export", response_model=dict)
+def export_supplier_orders(db: Session = Depends(get_db)):
+    """
+    Экспорт учитываемых заказов поставщику в Excel (XLSX, base64).
+    """
+    try:
+        result = export_supplier_orders_xlsx(db)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Export error: {e}")
 
 
 @router.post("/default-specifications-odata", response_model=dict)

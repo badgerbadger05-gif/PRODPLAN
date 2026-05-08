@@ -11,6 +11,8 @@ from app.models import (
     SpecComponent,
     ProductionOrder,
     ProductionProduct,
+    SupplierOrder,
+    SupplierOrderItem,
     PlanningRun,
     PlannedOrder,
     PlannedPurchase,
@@ -22,6 +24,7 @@ from app.services.planning_service import (
     build_planned_orders_and_purchases,
     _build_component_reservations_from_active_1c,
     _get_active_1c_remaining_by_item,
+    _get_active_supplier_remaining_by_item_date,
 )
 
 
@@ -394,6 +397,136 @@ def test_purchase_flow_preserves_fractional_qty_for_metric_units(db_session):
     assert float(row.requested_qty) == 7.9
     assert float(row.planned_qty) == 7.9
     assert float(row.qty) == 7.9
+
+
+def test_active_supplier_order_reduces_purchase_need_once_by_delivery_date(db_session):
+    db = db_session
+
+    u = Unit(unit_ref1c="u-sup", unit_name="шт", short_name="шт", precision=0)
+    db.add(u)
+
+    item = Item(
+        item_code="BUY-SUP",
+        item_name="Buy Supplier Covered",
+        item_article="BUY-SUP",
+        replenishment_method="Покупка",
+        replenishment_time=5,
+        unit="u-sup",
+        stock_qty=0,
+        status="active",
+    )
+    db.add(item)
+    db.flush()
+
+    run = _mk_run(db)
+    units_by_ref = {"u-sup": u}
+    item_cache = {item.item_id: item}
+
+    calc = OrderQuantityCalculator(
+        snapshot=run.config_snapshot,
+        default_spec_map={},
+        spec_by_id={},
+        components_loader=lambda _sid: [],
+        item_by_id=item_cache,
+        units_by_ref=units_by_ref,
+        res_by_id={},
+        production_kinds_by_resource={},
+        stock_by_item={item.item_id: 0.0},
+        wip_by_item={},
+        horizon_days=run.horizon_days or 0,
+        total_demand_by_item={item.item_id: 10.0},
+    )
+
+    build_planned_orders_and_purchases(
+        db,
+        run,
+        {
+            str(item.item_id): {
+                "2025-01-10": 5.0,
+                "2025-01-20": 5.0,
+            }
+        },
+        calc,
+        priority_manager=SimpleNamespace(),
+        item_cache=item_cache,
+        units_by_ref=units_by_ref,
+        supplier_remaining_by_item_date={
+            item.item_id: [
+                (datetime.date(2025, 1, 10), 6.0),
+                (datetime.date(2025, 1, 25), 100.0),
+            ]
+        },
+    )
+
+    rows = (
+        db.query(PlannedPurchase)
+        .filter(PlannedPurchase.run_id == run.run_id)
+        .order_by(PlannedPurchase.need_date.asc())
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].need_date.isoformat() == "2025-01-20"
+    assert float(rows[0].requested_qty) == 4.0
+    assert float(rows[0].planned_qty) == 4.0
+
+
+def test_active_supplier_remaining_filters_new_cancelled_deleted_and_missing_date(db_session):
+    db = db_session
+
+    item = Item(
+        item_code="SUP-REM",
+        item_name="Supplier Remaining",
+        item_article="SUP-REM",
+        replenishment_method="Покупка",
+        unit="u",
+        stock_qty=0,
+        status="active",
+    )
+    db.add(item)
+    db.flush()
+
+    def add_order(number, state_name, deletion_mark, remaining_qty, delivery_date, state_key_marker="default"):
+        order = SupplierOrder(
+            order_number=number,
+            order_date=datetime.datetime(2026, 1, 1),
+            order_ref1c=f"{number}-ref",
+            is_posted=True,
+            order_state_key=f"{number}-state" if state_key_marker == "default" else state_key_marker,
+            order_state_name=state_name,
+            deletion_mark=deletion_mark,
+        )
+        db.add(order)
+        db.flush()
+        db.add(
+            SupplierOrderItem(
+                order_id=order.order_id,
+                item_id_ref=item.item_id,
+                line_number=1,
+                quantity=10.0,
+                received_qty=10.0 - remaining_qty,
+                remaining_qty=remaining_qty,
+                delivery_date=delivery_date,
+            )
+        )
+
+    add_order("ACTIVE", "В закупку", False, 4.0, datetime.datetime(2026, 1, 10))
+    add_order("UNKNOWN", None, False, 3.0, datetime.datetime(2026, 1, 11))
+    add_order("LEGACY", None, False, 12.0, datetime.datetime(2026, 1, 12), state_key_marker=None)
+    add_order("NEW", "Новый заказ", False, 5.0, datetime.datetime(2026, 1, 10))
+    add_order("CANCEL", "Отменён", False, 6.0, datetime.datetime(2026, 1, 10))
+    add_order("DONE", "Завершён", False, 9.0, datetime.datetime(2026, 1, 10))
+    add_order("DONE-OK", "Завершен успешно", False, 10.0, datetime.datetime(2026, 1, 10))
+    add_order("DELETED", "В закупку", True, 7.0, datetime.datetime(2026, 1, 10))
+    add_order("NODATE", "В закупку", False, 8.0, None)
+    db.commit()
+
+    rem = _get_active_supplier_remaining_by_item_date(db)
+    assert rem == {
+        item.item_id: [
+            (datetime.date(2026, 1, 10), 4.0),
+            (datetime.date(2026, 1, 11), 3.0),
+        ]
+    }
 
 
 def test_get_active_1c_remaining_by_item_filters_done_deleted_and_nonpositive(db_session):

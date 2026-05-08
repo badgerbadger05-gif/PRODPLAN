@@ -36,6 +36,8 @@ from ..models import (
     Specification,
     ProductionOrder,
     ProductionProduct,
+    SupplierOrder,
+    SupplierOrderItem,
     ItemCategory,
 )
 from ..models import RootProduct
@@ -80,6 +82,7 @@ DEFAULT_PAGE_LIMIT = 50
 
 # 1C state key for completed production orders.
 DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
+SUPPLIER_ORDER_EXCLUDED_STATE_NAMES = {"новый заказ", "отменен", "завершен", "завершен успешно"}
 
 
 def _ensure_dict(raw: Any) -> Dict[str, Any]:
@@ -1940,6 +1943,60 @@ def _get_active_1c_remaining_by_item(db: Session) -> Dict[int, float]:
     return result
 
 
+def _normalize_supplier_order_state_name(value: Any) -> str:
+    return str(value or "").strip().casefold().replace("ё", "е")
+
+
+def _get_active_supplier_remaining_by_item_date(db: Session) -> Dict[int, List[Tuple[date, float]]]:
+    """
+    Aggregate open supplier-order quantities by item and expected delivery date.
+
+    Business rule:
+    - deleted orders are ignored;
+    - states "Новый заказ", "Отменен" and "Завершен" are ignored;
+    - any other state is treated as already ordered;
+    - rows without delivery date are skipped for automatic date-sensitive coverage.
+    """
+    try:
+        rows = (
+            db.query(
+                SupplierOrderItem.item_id_ref,
+                SupplierOrderItem.delivery_date,
+                SupplierOrder.order_state_key,
+                SupplierOrder.order_state_name,
+                SupplierOrderItem.remaining_qty,
+            )
+            .join(SupplierOrder, SupplierOrder.order_id == SupplierOrderItem.order_id)
+            .filter(SupplierOrder.deletion_mark.is_(False))
+            .filter(SupplierOrderItem.delivery_date.isnot(None))
+            .filter(func.coalesce(SupplierOrderItem.remaining_qty, 0.0) > 0)
+            .order_by(SupplierOrderItem.delivery_date.asc())
+            .all()
+        )
+    except Exception:
+        rows = []
+
+    result: Dict[int, List[Tuple[date, float]]] = defaultdict(list)
+    for iid, delivery_dt, state_key, state_name, qty in rows:
+        try:
+            normalized_state = _normalize_supplier_order_state_name(state_name)
+            if not normalized_state and not str(state_key or "").strip():
+                continue
+            if normalized_state in SUPPLIER_ORDER_EXCLUDED_STATE_NAMES:
+                continue
+            item_id = int(iid)
+            delivery_date = delivery_dt.date() if isinstance(delivery_dt, datetime) else delivery_dt
+            if not isinstance(delivery_date, date):
+                delivery_date = _to_date(str(delivery_dt))
+            remaining_qty = float(qty or 0.0)
+        except Exception:
+            continue
+        if remaining_qty <= 1e-12:
+            continue
+        result[item_id].append((delivery_date, remaining_qty))
+    return dict(result)
+
+
 def _build_component_reservations_from_active_1c(
     db: Session,
     default_spec_map: Dict[int, int],
@@ -2507,6 +2564,7 @@ def build_planned_orders_and_purchases(
     item_cache: Dict[int, Item],
     units_by_ref: Dict[str, Unit],
     active_remaining_by_item: Optional[Dict[int, float]] = None,
+    supplier_remaining_by_item_date: Optional[Dict[int, List[Tuple[date, float]]]] = None,
 ) -> Dict[str, Any]:
     
     run_id = run.run_id
@@ -2516,6 +2574,15 @@ def build_planned_orders_and_purchases(
     created_purchases = []
     created_reworks = []
     active_remaining_by_item = active_remaining_by_item or {}
+    supplier_remaining_by_item_date = supplier_remaining_by_item_date or {}
+    supplier_remaining_work: Dict[int, List[Dict[str, Any]]] = {
+        int(iid): [
+            {"delivery_date": delivery_date, "remaining_qty": float(qty or 0.0)}
+            for delivery_date, qty in sorted(rows, key=lambda x: x[0])
+            if float(qty or 0.0) > 1e-12
+        ]
+        for iid, rows in supplier_remaining_by_item_date.items()
+    }
 
     all_reqs = []
     for item_id_str, buckets in net_requirements.items():
@@ -2568,6 +2635,33 @@ def build_planned_orders_and_purchases(
 
             base_stock = float(getattr(order_qty_calculator, "stock_by_item", {}).get(child_id, 0.0) or 0.0)
             order_qty_calculator.stock_by_item[child_id] = max(base_stock - consume_qty, 0.0)
+
+    def consume_supplier_order_coverage(item_id: int, need_date: date, requested_qty: float) -> float:
+        """
+        Consume already placed supplier orders that arrive no later than need_date.
+        The local mutation prevents one supplier-order row from covering several MRP buckets twice.
+        """
+        remaining_need = float(requested_qty or 0.0)
+        if remaining_need <= 1e-12:
+            return 0.0
+        rows = supplier_remaining_work.get(int(item_id), [])
+        if not rows:
+            return remaining_need
+
+        for row in rows:
+            if remaining_need <= 1e-12:
+                break
+            delivery_date = row.get("delivery_date")
+            if delivery_date is None or delivery_date > need_date:
+                continue
+            available_qty = float(row.get("remaining_qty", 0.0) or 0.0)
+            if available_qty <= 1e-12:
+                continue
+            used_qty = min(available_qty, remaining_need)
+            row["remaining_qty"] = max(available_qty - used_qty, 0.0)
+            remaining_need = max(remaining_need - used_qty, 0.0)
+
+        return remaining_need
 
     for req in sorted(all_reqs, key=lambda x: x["need_date"]):
         item_id = req["item_id"]
@@ -2665,7 +2759,11 @@ def build_planned_orders_and_purchases(
         elif is_purchase:
             lead_time = item.replenishment_time or 30
             order_date = need_date - timedelta(days=lead_time)
-            # A) does not apply to purchase flow.
+            requested_qty_raw = consume_supplier_order_coverage(
+                item_id=int(item_id),
+                need_date=need_date,
+                requested_qty=float(requested_qty_raw),
+            )
             # Purchase flow now uses the same shared quantity normalization layer
             # as production for the final business quantity:
             # - discrete units -> fractional part is removed
@@ -3051,6 +3149,7 @@ def run_planning_run(
 
         # A) Active 1C orders as already planned finished output.
         active_remaining_by_item = _get_active_1c_remaining_by_item(db)
+        supplier_remaining_by_item_date = _get_active_supplier_remaining_by_item_date(db)
 
         # B) Active 1C orders reserve components recursively across full BOM depth.
         limits_cfg = (run.config_snapshot or {}).get("planning", {}).get("limits", {})
@@ -3203,6 +3302,7 @@ def run_planning_run(
             item_cache,
             units_by_ref,
             active_remaining_by_item=active_remaining_by_item,
+            supplier_remaining_by_item_date=supplier_remaining_by_item_date,
         )
         all_warnings.extend(order_result["warnings"])
         db.flush()

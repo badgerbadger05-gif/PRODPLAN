@@ -300,6 +300,9 @@ class SupplierOrderBase(BaseModel):
     supplier_id: Optional[int] = None
     document_amount: float = 0.0
     is_posted: bool = False
+    order_state_key: Optional[str] = None
+    order_state_name: Optional[str] = None
+    deletion_mark: bool = False
 
 
 class SupplierOrderCreate(SupplierOrderBase):
@@ -322,7 +325,12 @@ class SupplierOrder(SupplierOrderBase):
 class SupplierOrderItemBase(BaseModel):
     order_id: int
     item_id: int
+    item_id_ref: Optional[int] = None
+    line_number: Optional[int] = None
+    characteristic_ref1c: Optional[str] = None
     quantity: float
+    received_qty: float = 0.0
+    remaining_qty: Optional[float] = None
     price: float = 0.0
     amount: float = 0.0
     delivery_date: Optional[datetime] = None
