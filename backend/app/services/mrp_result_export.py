@@ -165,6 +165,7 @@ def export_purchases_results_xlsx(
         "Дата заказа",
         "Срок пополнения, дн.",
         "Поставщик 1С",
+        "Пометка",
     ]
 
     def build_row(order: Dict[str, Any]) -> List[Any]:
@@ -177,6 +178,7 @@ def export_purchases_results_xlsx(
             order.get("order_date") or "",
             int(order.get("lead_time_days") or 0),
             order.get("supplier_ref1c") or "",
+            order.get("badge") or "",
         ]
 
     data_base64, total_rows = _build_grouped_workbook(

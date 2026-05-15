@@ -959,6 +959,7 @@ async def export_planning_result_production(
             "Дата начала",
             "Дата окончания",
             "ЕИ",
+            "Пометка",
         ]
         data_rows = []
         for r in rows:
@@ -978,6 +979,7 @@ async def export_planning_result_production(
                     r.get("start_date") or "",
                     r.get("finish_date") or "",
                     r.get("unit") or "",
+                    r.get("badge") or "",
                 ]
             )
 
@@ -1069,6 +1071,7 @@ async def export_planning_result_production(
                             "",  # Дата начала
                             "",  # Дата окончания
                             o.get("unit") or "",
+                            o.get("badge") or "",
                         ]
                         ws.append(row_values)
                         update_widths(row_values)

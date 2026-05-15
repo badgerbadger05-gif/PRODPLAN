@@ -17,11 +17,17 @@ from app.models import (
     PlannedOrder,
     PlannedPurchase,
     PlannedRework,
+    ProductionKind,
+    ProductionPlanEntry,
+    ProductionResource,
+    ProductionStage,
+    ResourceProductionKind,
 )
 
 from app.services.order_quantity_calculator import OrderQuantityCalculator
 from app.services.planning_service import (
     build_planned_orders_and_purchases,
+    compute_planning_preview,
     _build_component_reservations_from_active_1c,
     _get_active_1c_remaining_by_item,
     _get_active_supplier_remaining_by_item_date,
@@ -468,6 +474,127 @@ def test_active_supplier_order_reduces_purchase_need_once_by_delivery_date(db_se
     assert rows[0].need_date.isoformat() == "2025-01-20"
     assert float(rows[0].requested_qty) == 4.0
     assert float(rows[0].planned_qty) == 4.0
+
+
+def test_turning_item_net_requirement_collapses_to_first_need_date_and_moves_blank(db_session):
+    db = db_session
+    today = datetime.date.today()
+
+    turning_kind = ProductionKind(ref_1c="turn-kind", name="Токарные работы")
+    blank_kind = ProductionKind(ref_1c="blank-kind", name="Заготовительные работы")
+    turning_area = ProductionResource(resource_name="Токарный участок", capacity=8, daily_work_hours=8, buffer_days=0)
+    blank_area = ProductionResource(resource_name="Заготовительный участок", capacity=8, daily_work_hours=8, buffer_days=5)
+    blank_stage = ProductionStage(stage_name="Заготовка", stage_order=1, stage_ref1c="blank-stage")
+    db.add_all([turning_kind, blank_kind, turning_area, blank_area, blank_stage])
+    db.flush()
+    db.add(ResourceProductionKind(resource_id=turning_area.resource_id, production_kind_id=turning_kind.id))
+    db.add(ResourceProductionKind(resource_id=blank_area.resource_id, production_kind_id=blank_kind.id))
+
+    parent = Item(
+        item_code="TURN-PARENT",
+        item_name="Turning Parent",
+        item_article="TURN-PARENT",
+        replenishment_method="Производство",
+        stock_qty=0,
+        status="active",
+    )
+    blank = Item(
+        item_code="TURN-BLANK",
+        item_name="Turning Blank",
+        item_article="TURN-BLANK",
+        replenishment_method="Производство",
+        stock_qty=0,
+        status="active",
+    )
+    db.add_all([parent, blank])
+    db.flush()
+
+    spec = Specification(spec_code="TURN-SPEC", spec_name="Turning Spec", production_kind_id=turning_kind.id)
+    blank_spec = Specification(spec_code="BLANK-SPEC", spec_name="Blank Spec", production_kind_id=blank_kind.id)
+    db.add_all([spec, blank_spec])
+    db.flush()
+    db.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db.add(DefaultSpecification(item_id=blank.item_id, spec_id=blank_spec.spec_id))
+    db.add(SpecComponent(spec_id=spec.spec_id, item_id=blank.item_id, quantity=2.0, stage_id=blank_stage.stage_id))
+    db.add_all(
+        [
+            ProductionPlanEntry(item_id=parent.item_id, date=today + datetime.timedelta(days=2), planned_qty=3),
+            ProductionPlanEntry(item_id=parent.item_id, date=today + datetime.timedelta(days=7), planned_qty=4),
+        ]
+    )
+    db.commit()
+
+    result = compute_planning_preview(
+        db,
+        horizon_days=20,
+        config_overrides={"safety_stock_percent": 0, "toggles": {"include_wip": False}},
+    )
+
+    first_need = (today + datetime.timedelta(days=2)).isoformat()
+    later_need = (today + datetime.timedelta(days=7)).isoformat()
+    parent_net = result["net"][str(parent.item_id)]
+    blank_net = result["net"][str(blank.item_id)]
+
+    assert parent_net == {first_need: 7.0}
+    assert blank_net == {first_need: 14.0}
+    assert later_need not in parent_net
+    assert later_need not in blank_net
+    assert any(
+        w.get("code") == "TURNING_BLANK_PRIORITY"
+        and w.get("item_id") == blank.item_id
+        and w.get("parent_item_id") == parent.item_id
+        and w.get("need_date") == first_need
+        for w in result.get("warnings", [])
+    )
+
+
+def test_non_turning_item_keeps_requirement_buckets(db_session):
+    db = db_session
+    today = datetime.date.today()
+
+    parent = Item(
+        item_code="REG-PARENT",
+        item_name="Regular Parent",
+        item_article="REG-PARENT",
+        replenishment_method="Производство",
+        stock_qty=0,
+        status="active",
+    )
+    component = Item(
+        item_code="REG-COMP",
+        item_name="Regular Component",
+        item_article="REG-COMP",
+        replenishment_method="Производство",
+        stock_qty=0,
+        status="active",
+    )
+    db.add_all([parent, component])
+    db.flush()
+    spec = Specification(spec_code="REG-SPEC", spec_name="Regular Spec")
+    db.add(spec)
+    db.flush()
+    db.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db.add(SpecComponent(spec_id=spec.spec_id, item_id=component.item_id, quantity=2.0))
+    db.add_all(
+        [
+            ProductionPlanEntry(item_id=parent.item_id, date=today + datetime.timedelta(days=2), planned_qty=3),
+            ProductionPlanEntry(item_id=parent.item_id, date=today + datetime.timedelta(days=7), planned_qty=4),
+        ]
+    )
+    db.commit()
+
+    result = compute_planning_preview(
+        db,
+        horizon_days=20,
+        config_overrides={"safety_stock_percent": 0, "toggles": {"include_wip": False}},
+    )
+
+    first_need = (today + datetime.timedelta(days=2)).isoformat()
+    later_need = (today + datetime.timedelta(days=7)).isoformat()
+
+    assert result["net"][str(parent.item_id)] == {first_need: 3.0, later_need: 4.0}
+    assert result["net"][str(component.item_id)] == {first_need: 6.0, later_need: 8.0}
+    assert not any(w.get("code") == "TURNING_BLANK_PRIORITY" for w in result.get("warnings", []))
 
 
 def test_active_supplier_remaining_filters_new_cancelled_deleted_and_missing_date(db_session):

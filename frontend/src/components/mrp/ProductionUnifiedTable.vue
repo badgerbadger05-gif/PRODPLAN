@@ -14,6 +14,16 @@
         <div>{{ p.row.item_name || t('mrp.placeholder.itemNameFallback', { id: p.row.item_id }) }}</div>
         <div class="q-mt-xs">
           <q-badge
+            v-if="p.row.badge"
+            color="orange"
+            text-color="black"
+            class="q-mr-xs"
+            outline
+            size="sm"
+          >
+            {{ p.row.badge }}
+          </q-badge>
+          <q-badge
             v-if="p.row.flags?.missingNorm"
             color="grey-8"
             text-color="white"
@@ -81,6 +91,8 @@ type PlainProdRow = {
   norm_hours_per_unit?: number | null
   agg_key?: string
   rowKey: string
+  badge?: string | null
+  turning_blank_priority?: boolean
   flags?: Flags
 }
 
@@ -112,7 +124,9 @@ const safeRows = computed(() => {
         qty: (existingRow.qty || 0) + (r.qty || 0),
         norm_hours_total: (existingRow.norm_hours_total || 0) + (r.norm_hours_total || 0),
         // сохраняем флаги, если появились
-       flags: { ...(existingRow.flags || {}), ...(r.flags || {}) },
+        badge: existingRow.badge || r.badge || null,
+        turning_blank_priority: Boolean(existingRow.turning_blank_priority || r.turning_blank_priority),
+        flags: { ...(existingRow.flags || {}), ...(r.flags || {}) },
         rowKey: key
       })
     } else {

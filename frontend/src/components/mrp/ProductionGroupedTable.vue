@@ -37,6 +37,16 @@
       >
         <q-td key="name" :props="props">
           <div>{{ order.item_name || t('mrp.placeholder.itemNameFallback', { id: order.item_id }) }}</div>
+          <q-badge
+            v-if="order.badge"
+            color="orange"
+            text-color="black"
+            outline
+            size="sm"
+            class="q-mt-xs"
+          >
+            {{ order.badge }}
+          </q-badge>
         </q-td>
         <q-td key="article" :props="props">
           {{ order.item_article || t('mrp.placeholder.noArticle') }}
@@ -97,7 +107,9 @@ function deduplicateOrders(orders: any[]) {
       orderMap.set(key, {
         ...order,
         qty: (existingOrder.qty || 0) + (order.qty || 0),
-        norm_hours_total: (existingOrder.norm_hours_total || 0) + (order.norm_hours_total || 0)
+        norm_hours_total: (existingOrder.norm_hours_total || 0) + (order.norm_hours_total || 0),
+        badge: existingOrder.badge || order.badge || null,
+        turning_blank_priority: Boolean(existingOrder.turning_blank_priority || order.turning_blank_priority)
       });
     } else {
       orderMap.set(key, order);

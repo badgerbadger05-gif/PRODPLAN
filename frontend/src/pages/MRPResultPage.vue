@@ -107,7 +107,23 @@
                 row-key="purchase_id"
                 hide-bottom
                 :pagination="{ page: 1, rowsPerPage: 1000 }"
-              />
+              >
+                <template #body-cell-name="props">
+                  <q-td :props="props">
+                    <div>{{ props.row.item_name || t('mrp.placeholder.itemNameFallback', { id: props.row.item_id }) }}</div>
+                    <q-badge
+                      v-if="props.row.badge"
+                      color="orange"
+                      text-color="black"
+                      outline
+                      size="sm"
+                      class="q-mt-xs"
+                    >
+                      {{ props.row.badge }}
+                    </q-badge>
+                  </q-td>
+                </template>
+              </q-table>
             </q-card>
           </div>
           <q-banner v-else dense class="bg-grey-2 text-grey-8">

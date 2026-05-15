@@ -125,6 +125,34 @@ def _ensure_dict(raw: Any) -> Dict[str, Any]:
     return {}
 
 
+def _load_turning_blank_priority_map(db: Session, run_id: int) -> Dict[Tuple[int, str], Dict[str, Any]]:
+    try:
+        run = db.query(PlanningRun).filter(PlanningRun.run_id == int(run_id)).first()
+        warnings = list(getattr(run, "warnings", None) or []) if run else []
+    except Exception:
+        warnings = []
+    result: Dict[Tuple[int, str], Dict[str, Any]] = {}
+    for warning in warnings:
+        if not isinstance(warning, dict) or warning.get("code") != "TURNING_BLANK_PRIORITY":
+            continue
+        try:
+            item_id = int(warning.get("item_id"))
+            need_date = str(warning.get("need_date") or "")
+        except Exception:
+            continue
+        if not need_date:
+            continue
+        result[(item_id, need_date)] = warning
+    return result
+
+
+def _turning_blank_badge(priority_map: Dict[Tuple[int, str], Dict[str, Any]], item_id: int, need_date: Any) -> Optional[str]:
+    date_key = need_date.isoformat() if isinstance(need_date, (datetime, date)) else str(need_date or "")
+    if (int(item_id), date_key) in priority_map:
+        return "Заготовка под токарный участок"
+    return None
+
+
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
     """Recursive dict merge: override values take precedence."""
     if not isinstance(base, dict) or not isinstance(override, dict):
@@ -493,6 +521,7 @@ def get_run_production(
 
     aggregated_data: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
     order_ids: List[int] = []
+    turning_blank_priority = _load_turning_blank_priority_map(db, run_id)
     
     for row in filtered_rows:
         po, in_name, in_article, in_unit_guid, in_unit_short, in_unit_name, in_unit_code = row
@@ -505,6 +534,7 @@ def get_run_production(
             start_iso = fin_dt
         unit_display = (in_unit_short or in_unit_name or in_unit_code or in_unit_guid or "").strip()
         agg_key = (int(po.item_id), start_iso, unit_display)
+        badge = _turning_blank_badge(turning_blank_priority, int(po.item_id), po.need_date)
         
         if agg_key not in aggregated_data:
             aggregated_data[agg_key] = {
@@ -522,6 +552,8 @@ def get_run_production(
                 "bucket_date": po.bucket_date.isoformat() if po.bucket_date else None,
                 "demand_ref": po.demand_ref,
                 "demand_date": po.demand_date.isoformat() if po.demand_date else None,
+                "badge": badge,
+                "turning_blank_priority": bool(badge),
                 "stages": [],
                 "norm_hours_total": 0.0,
                 "norm_hours_per_unit": None,
@@ -598,6 +630,7 @@ def get_run_production(
         agg_key = (int(po.item_id), start_iso, unit_display)
 
         order_stages = stage_by_order.get(int(po.order_id), [])
+        badge = _turning_blank_badge(turning_blank_priority, int(po.item_id), po.need_date)
         if agg_key not in aggregated_data:
             aggregated_data[agg_key] = {
                 "item_id": int(po.item_id),
@@ -614,6 +647,8 @@ def get_run_production(
                 "bucket_date": po.bucket_date.isoformat() if po.bucket_date else None,
                 "demand_ref": po.demand_ref,
                 "demand_date": po.demand_date.isoformat() if po.demand_date else None,
+                "badge": badge,
+                "turning_blank_priority": bool(badge),
                 "stages": [],
                 "norm_hours_total": 0.0,
                 "norm_hours_per_unit": None,
@@ -1034,6 +1069,7 @@ def get_run_purchases(
             )
  
     aggregated_data: Dict[Tuple[int, str], Dict[str, Any]] = {}
+    turning_blank_priority = _load_turning_blank_priority_map(db, run_id)
     
     for row in filtered_rows:
         (
@@ -1073,6 +1109,7 @@ def get_run_purchases(
         
         unit_display = (in_unit_short or in_unit_name or in_unit_code or in_unit_guid or "").strip()
         agg_key = (int(item_id_val), unit_display)
+        badge = _turning_blank_badge(turning_blank_priority, int(item_id_val), need_date_val)
         
         if agg_key not in aggregated_data:
             aggregated_data[agg_key] = {
@@ -1088,7 +1125,12 @@ def get_run_purchases(
                 "bucket_type": "daily",
                 "bucket_date": bucket_date_val.isoformat() if bucket_date_val else None,
                 "supplier_ref1c": supplier_ref1c_val,
+                "badge": badge,
+                "turning_blank_priority": bool(badge),
             }
+        elif badge:
+            aggregated_data[agg_key]["badge"] = badge
+            aggregated_data[agg_key]["turning_blank_priority"] = True
         
         aggregated_data[agg_key]["qty"] += float(qty_val or 0.0)
 
@@ -1674,6 +1716,7 @@ def get_run_production_grouped(
     # 5) Построить группы по основному участку для каждого заказа
     groups_map: Dict[Optional[int], Dict[str, Any]] = {}
     today_d = date.today()
+    turning_blank_priority = _load_turning_blank_priority_map(db, run_id)
 
     def _unit_display(_guid: Optional[str], _short: Optional[str], _name: Optional[str], _code: Optional[str]) -> str:
         return ( (_short or "") or (_name or "") or (_code or "") or (_guid or "") ).strip()
@@ -1715,6 +1758,7 @@ def get_run_production_grouped(
         unit_display = _unit_display(in_unit_guid, in_unit_short, in_unit_name, in_unit_code)
         qty_f = float(po.qty or 0.0)
         norm_per_unit = float(norm_total / qty_f) if qty_f > 1e-12 and norm_total > 0 else None
+        badge = _turning_blank_badge(turning_blank_priority, int(po.item_id), po.need_date)
 
         order_entry = {
             "agg_key": f"{int(po.item_id)}|{unit_display}",
@@ -1726,6 +1770,8 @@ def get_run_production_grouped(
             "norm_hours_total": float(norm_total),
             "norm_hours_per_unit": norm_per_unit,
             "order_id": int(po.order_id),
+            "badge": badge,
+            "turning_blank_priority": bool(badge),
         }
 
         grp = groups_map[main_area_id]
@@ -2388,6 +2434,67 @@ def compute_planning_preview(
         components_cache[int(spec_id)] = comps
         return comps
 
+    stage_ids: Set[int] = set()
+    try:
+        for comp in db.query(SpecComponent.stage_id).filter(SpecComponent.stage_id.isnot(None)).all():
+            try:
+                stage_ids.add(int(comp[0] if isinstance(comp, (tuple, list)) else comp.stage_id))
+            except Exception:
+                continue
+    except Exception:
+        stage_ids = set()
+    stage_name_by_id: Dict[int, str] = {}
+    if stage_ids:
+        try:
+            for st in db.query(ProductionStage).filter(ProductionStage.stage_id.in_(list(stage_ids))).all():
+                stage_name_by_id[int(st.stage_id)] = str(st.stage_name or "")
+        except Exception:
+            stage_name_by_id = {}
+
+    kind_names: Dict[int, str] = {}
+    if kind_ids:
+        try:
+            for kind in db.query(ProductionKind).filter(ProductionKind.id.in_(list(kind_ids))).all():
+                kind_names[int(kind.id)] = str(kind.name or "")
+        except Exception:
+            kind_names = {}
+
+    turning_item_cache: Dict[int, bool] = {}
+
+    def is_turning_item(item_id: int) -> bool:
+        item_key = int(item_id)
+        if item_key in turning_item_cache:
+            return turning_item_cache[item_key]
+        result = False
+        spec_id = default_spec_map.get(item_key)
+        spec = spec_by_id.get(int(spec_id)) if spec_id else None
+        kind_id = int(spec.production_kind_id) if spec and getattr(spec, "production_kind_id", None) else None
+        if kind_id is not None:
+            kind_name = str(kind_names.get(kind_id, "") or "").strip().casefold()
+            if "токар" in kind_name:
+                result = True
+            if not result:
+                for rk in resource_kind_cache.get(kind_id, []):
+                    res = res_by_id.get(int(rk.resource_id))
+                    res_name = str(getattr(res, "resource_name", "") or "").strip().casefold() if res else ""
+                    if "токар" in res_name:
+                        result = True
+                        break
+        turning_item_cache[item_key] = result
+        return result
+
+    def select_turning_blank_components(comps: List[SpecComponent]) -> List[SpecComponent]:
+        staged = []
+        for comp in comps or []:
+            try:
+                stage_id = getattr(comp, "stage_id", None)
+                stage_name = stage_name_by_id.get(int(stage_id), "") if stage_id is not None else ""
+            except Exception:
+                stage_name = ""
+            if "заготов" in str(stage_name or "").casefold():
+                staged.append(comp)
+        return staged or list(comps or [])
+
     buffer_days_cache: Dict[int, int] = {}
 
     def resolve_buffer_days(item_id: int) -> int:
@@ -2457,6 +2564,7 @@ def compute_planning_preview(
     # --- Multi-level net-first explosion ---
     gross_map: DefaultDict[int, DefaultDict[date, float]] = defaultdict(lambda: defaultdict(float))
     net_map: DefaultDict[int, DefaultDict[date, float]] = defaultdict(lambda: defaultdict(float))
+    warnings: List[Dict[str, Any]] = []
 
     for depth in range(max(1, max_bom_depth)):
         if not demand_map:
@@ -2486,20 +2594,31 @@ def compute_planning_preview(
                     continue
                 net_q = q - avail
                 avail = 0.0
-                net_map[int(iid)][bucket_date] += net_q
                 net_buckets.append((bucket_date, net_q))
 
             available_by_item[int(iid)] = avail
 
-            # explode only residual/net demand
             if not net_buckets:
                 continue
+
+            turning_parent = is_turning_item(int(iid))
+            if turning_parent and len(net_buckets) > 1:
+                first_date = min(bucket_date for bucket_date, _ in net_buckets)
+                total_net_qty = sum(float(q or 0.0) for _, q in net_buckets)
+                net_buckets = [(first_date, total_net_qty)]
+
+            for bucket_date, net_q in net_buckets:
+                net_map[int(iid)][bucket_date] += float(net_q or 0.0)
+
+            # explode only residual/net demand
             spec_id = default_spec_map.get(int(iid))
             if not spec_id:
                 continue
             comps = get_components_for_spec(int(spec_id))
             if not comps:
                 continue
+            priority_blank_comps = select_turning_blank_components(comps) if turning_parent else []
+            priority_blank_ids = {int(getattr(comp, "item_id")) for comp in priority_blank_comps if getattr(comp, "item_id", None) is not None}
 
             for bucket_date, net_q in net_buckets:
                 for comp in comps:
@@ -2513,12 +2632,26 @@ def compute_planning_preview(
                     child_qty = float(net_q) * float(per_unit)
                     if child_qty <= 1e-9:
                         continue
-                    # buffer shift (component timing)
-                    buf = resolve_buffer_days(int(child_id))
                     child_date = bucket_date
-                    if buf > 0:
-                        child_date = clamp_to_horizon(bucket_date - timedelta(days=int(buf)))
+                    is_priority_blank = turning_parent and child_id in priority_blank_ids
+                    if not is_priority_blank:
+                        # Regular components keep their own buffer; turning blanks start with the turning order.
+                        buf = resolve_buffer_days(int(child_id))
+                        if buf > 0:
+                            child_date = clamp_to_horizon(bucket_date - timedelta(days=int(buf)))
                     next_demand[int(child_id)][child_date] += child_qty
+                    if is_priority_blank:
+                        warnings.append(
+                            make_warning(
+                                "TURNING_BLANK_PRIORITY",
+                                "Заготовка под токарный участок",
+                                item_id=int(child_id),
+                                parent_item_id=int(iid),
+                                qty=float(child_qty),
+                                need_date=child_date.isoformat(),
+                                parent_need_date=bucket_date.isoformat(),
+                            )
+                        )
 
         demand_map = next_demand
 
@@ -2551,6 +2684,7 @@ def compute_planning_preview(
             "items": int(len(gross_ser)),
             "buckets": int(sum(len(v) for v in gross_ser.values())),
         },
+        "warnings": warnings,
     }
 
 # --- Main Planning Run ---
@@ -3294,6 +3428,7 @@ def run_planning_run(
         op_cache = {o.operation_id: o for o in all_ops}
         
         all_warnings = []
+        all_warnings.extend(net_req_result.get("warnings", []) or [])
         all_warnings.extend(reserve_warnings)
 
         # --- PHASE 1: Build Orders and Purchases ---
