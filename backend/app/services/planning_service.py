@@ -2699,6 +2699,7 @@ def build_planned_orders_and_purchases(
 
             horizon_limit = float(comp_details.get("horizon_limit", float(requested_qty)))
             component_limit = float(comp_details.get("component_limit", float(requested_qty)))
+            desired_qty = min(float(normalized_qty or 0.0), horizon_limit)
 
             # Requested quantity is normalized via shared calculator helper.
             requested_qty = float(order_qty_calculator.normalize_qty_for_item(item_id, final_qty_before))
@@ -2719,9 +2720,9 @@ def build_planned_orders_and_purchases(
                 # Skip creation entirely (no qty=0 rows)
                 continue
 
-            # - If 0 < component_limit < requested_qty -> plan partial by components within horizon
-            if component_limit + 1e-9 < float(requested_qty):
-                planned_qty = min(component_limit, horizon_limit)
+            # - If components cannot cover the horizon-capped lot-sized order, plan partial.
+            if component_limit + 1e-9 < float(desired_qty):
+                planned_qty = min(component_limit, desired_qty)
                 warnings.append(
                     make_warning(
                         "COMPONENT_SHORTAGE_PARTIAL",
@@ -2730,11 +2731,12 @@ def build_planned_orders_and_purchases(
                         requested_qty=float(requested_qty),
                         planned_qty=float(planned_qty),
                         component_limit=float(component_limit),
+                        desired_qty=float(desired_qty),
                     )
                 )
             else:
-                # Otherwise, use normalized lot sizing but never exceed horizon/component constraints
-                planned_qty = min(float(normalized_qty or 0.0), horizon_limit, component_limit)
+                # Otherwise, use lot sizing capped only by horizon demand and components.
+                planned_qty = min(desired_qty, component_limit)
 
             planned_qty = float(planned_qty or 0.0)
 
@@ -2794,6 +2796,7 @@ def build_planned_orders_and_purchases(
 
             horizon_limit = float(comp_details.get("horizon_limit", float(requested_qty)))
             component_limit = float(comp_details.get("component_limit", float(requested_qty)))
+            desired_qty = min(float(normalized_qty or 0.0), horizon_limit)
             requested_qty = float(order_qty_calculator.normalize_qty_for_item(item_id, final_qty_before))
 
             spec_id = getattr(order_qty_calculator, "default_spec_map", {}).get(int(item_id))
@@ -2805,7 +2808,7 @@ def build_planned_orders_and_purchases(
             }
 
             component_blocked = component_limit <= 1e-9
-            component_partial = (component_limit > 1e-9) and (component_limit + 1e-9 < float(requested_qty))
+            component_partial = (component_limit > 1e-9) and (component_limit + 1e-9 < float(desired_qty))
 
             if component_blocked:
                 warnings.append(
@@ -2821,7 +2824,7 @@ def build_planned_orders_and_purchases(
                 )
                 planned_qty = 0.0
             elif component_partial:
-                planned_qty = min(component_limit, horizon_limit)
+                planned_qty = min(component_limit, desired_qty)
                 warnings.append(
                     make_warning(
                         "REWORK_COMPONENT_SHORTAGE_PARTIAL",
@@ -2831,12 +2834,13 @@ def build_planned_orders_and_purchases(
                         requested_qty=float(requested_qty),
                         planned_qty=float(planned_qty),
                         component_limit=float(component_limit),
+                        desired_qty=float(desired_qty),
                         need_date=need_date.isoformat(),
                         spec_id=int(spec_id) if spec_id is not None else None,
                     )
                 )
             else:
-                planned_qty = min(float(normalized_qty or 0.0), horizon_limit, component_limit)
+                planned_qty = min(desired_qty, component_limit)
 
             planned_qty = float(order_qty_calculator.normalize_qty_for_item(item_id, float(planned_qty or 0.0)))
             shortage_payload["planned_qty"] = float(planned_qty)
