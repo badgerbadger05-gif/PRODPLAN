@@ -1070,6 +1070,10 @@ def get_run_purchases(
  
     aggregated_data: Dict[Tuple[int, str], Dict[str, Any]] = {}
     turning_blank_priority = _load_turning_blank_priority_map(db, run_id)
+    late_supplier_rows = _load_late_supplier_order_coverage(
+        db,
+        [int(row[1]) for row in filtered_rows if row[1] is not None],
+    )
     
     for row in filtered_rows:
         (
@@ -1109,7 +1113,14 @@ def get_run_purchases(
         
         unit_display = (in_unit_short or in_unit_name or in_unit_code or in_unit_guid or "").strip()
         agg_key = (int(item_id_val), unit_display)
-        badge = _turning_blank_badge(turning_blank_priority, int(item_id_val), need_date_val)
+        turning_badge = _turning_blank_badge(turning_blank_priority, int(item_id_val), need_date_val)
+        late_supplier_badge = _late_supplier_order_badge(
+            late_supplier_rows,
+            int(item_id_val),
+            need_date_val,
+            qty_val,
+        )
+        badge = _merge_badges(turning_badge, late_supplier_badge)
         
         if agg_key not in aggregated_data:
             aggregated_data[agg_key] = {
@@ -1126,11 +1137,17 @@ def get_run_purchases(
                 "bucket_date": bucket_date_val.isoformat() if bucket_date_val else None,
                 "supplier_ref1c": supplier_ref1c_val,
                 "badge": badge,
-                "turning_blank_priority": bool(badge),
+                "turning_blank_priority": bool(turning_badge),
+                "late_supplier_order": bool(late_supplier_badge),
             }
         elif badge:
-            aggregated_data[agg_key]["badge"] = badge
-            aggregated_data[agg_key]["turning_blank_priority"] = True
+            aggregated_data[agg_key]["badge"] = _merge_badges(aggregated_data[agg_key].get("badge"), badge)
+            aggregated_data[agg_key]["turning_blank_priority"] = bool(
+                aggregated_data[agg_key].get("turning_blank_priority") or turning_badge
+            )
+            aggregated_data[agg_key]["late_supplier_order"] = bool(
+                aggregated_data[agg_key].get("late_supplier_order") or late_supplier_badge
+            )
         
         aggregated_data[agg_key]["qty"] += float(qty_val or 0.0)
 
@@ -2041,6 +2058,116 @@ def _get_active_supplier_remaining_by_item_date(db: Session) -> Dict[int, List[T
             continue
         result[item_id].append((delivery_date, remaining_qty))
     return dict(result)
+
+
+def _load_late_supplier_order_coverage(db: Session, item_ids: List[int]) -> Dict[int, List[Dict[str, Any]]]:
+    """
+    Load active supplier orders that can cover demand, but arrive after the need date.
+    This is diagnostic only: late orders do not reduce MRP purchase quantity.
+    """
+    ids = sorted({int(iid) for iid in item_ids if iid is not None})
+    if not ids:
+        return {}
+
+    try:
+        rows = (
+            db.query(
+                SupplierOrderItem.item_id_ref,
+                SupplierOrderItem.delivery_date,
+                SupplierOrderItem.remaining_qty,
+                SupplierOrder.order_number,
+                SupplierOrder.order_state_key,
+                SupplierOrder.order_state_name,
+            )
+            .join(SupplierOrder, SupplierOrder.order_id == SupplierOrderItem.order_id)
+            .filter(SupplierOrderItem.item_id_ref.in_(ids))
+            .filter(SupplierOrder.deletion_mark.is_(False))
+            .filter(SupplierOrderItem.delivery_date.isnot(None))
+            .filter(func.coalesce(SupplierOrderItem.remaining_qty, 0.0) > 0)
+            .order_by(SupplierOrderItem.delivery_date.asc(), SupplierOrder.order_number.asc())
+            .all()
+        )
+    except Exception:
+        rows = []
+
+    result: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for iid, delivery_dt, qty, order_number, state_key, state_name in rows:
+        try:
+            normalized_state = _normalize_supplier_order_state_name(state_name)
+            if not normalized_state and not str(state_key or "").strip():
+                continue
+            if normalized_state in SUPPLIER_ORDER_EXCLUDED_STATE_NAMES:
+                continue
+            item_id = int(iid)
+            delivery_date = delivery_dt.date() if isinstance(delivery_dt, datetime) else delivery_dt
+            if not isinstance(delivery_date, date):
+                delivery_date = _to_date(str(delivery_dt))
+            remaining_qty = float(qty or 0.0)
+        except Exception:
+            continue
+        if remaining_qty <= 1e-12:
+            continue
+        result[item_id].append(
+            {
+                "delivery_date": delivery_date,
+                "remaining_qty": remaining_qty,
+                "order_number": str(order_number or "").strip(),
+            }
+        )
+    return dict(result)
+
+
+def _late_supplier_order_badge(
+    late_supplier_rows: Dict[int, List[Dict[str, Any]]],
+    item_id: int,
+    need_date: Any,
+    qty: Any,
+) -> Optional[str]:
+    if not need_date:
+        return None
+    try:
+        need_dt = need_date.date() if isinstance(need_date, datetime) else need_date
+        if not isinstance(need_dt, date):
+            need_dt = _to_date(str(need_date))
+        required_qty = float(qty or 0.0)
+    except Exception:
+        return None
+    if required_qty <= 1e-12:
+        return None
+
+    total_late = 0.0
+    first_delivery: Optional[date] = None
+    order_numbers: List[str] = []
+    for row in late_supplier_rows.get(int(item_id), []) or []:
+        delivery_date = row.get("delivery_date")
+        if not isinstance(delivery_date, date) or delivery_date <= need_dt:
+            continue
+        if first_delivery is None:
+            first_delivery = delivery_date
+        total_late += float(row.get("remaining_qty", 0.0) or 0.0)
+        order_number = str(row.get("order_number") or "").strip()
+        if order_number and order_number not in order_numbers:
+            order_numbers.append(order_number)
+        if total_late + 1e-9 >= required_qty:
+            break
+
+    if first_delivery is None or total_late <= 1e-12:
+        return None
+
+    delay_days = max(0, int((first_delivery - need_dt).days))
+    order_suffix = f" ({', '.join(order_numbers[:2])})" if order_numbers else ""
+    if total_late + 1e-9 >= required_qty:
+        return f"Покрыто заказом, но опоздание {delay_days} дн.{order_suffix}"
+    return f"Частично покрыто заказом, но опоздание {delay_days} дн.{order_suffix}"
+
+
+def _merge_badges(*badges: Optional[str]) -> Optional[str]:
+    parts: List[str] = []
+    for badge in badges:
+        text = str(badge or "").strip()
+        if text and text not in parts:
+            parts.append(text)
+    return "; ".join(parts) if parts else None
 
 
 def _build_component_reservations_from_active_1c(

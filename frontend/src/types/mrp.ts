@@ -187,6 +187,7 @@ export interface PurchaseRow {
   item_article?: string | null
   badge?: string | null
   turning_blank_priority?: boolean
+  late_supplier_order?: boolean
 }
 
 export interface PurchaseGroupedRow {
@@ -198,6 +199,7 @@ export interface PurchaseGroupedRow {
   qty: number
   badge?: string | null
   turning_blank_priority?: boolean
+  late_supplier_order?: boolean
 }
 
 export interface PurchaseCategoryGroupOrder {
@@ -216,6 +218,7 @@ export interface PurchaseCategoryGroupOrder {
   supplier_ref1c?: string | null
   badge?: string | null
   turning_blank_priority?: boolean
+  late_supplier_order?: boolean
 }
 
 export interface PurchaseCategoryGroup {

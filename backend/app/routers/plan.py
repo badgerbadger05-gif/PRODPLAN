@@ -1154,7 +1154,7 @@ async def export_planning_result_purchases(
         )
         rows = res.get("rows", []) or []
 
-        headers = ["Наименование", "Артикул", "Количество", "ЕИ"]
+        headers = ["Наименование", "Артикул", "Количество", "ЕИ", "Пометка"]
         data_rows = []
         for r in rows:
             data_rows.append([
@@ -1162,6 +1162,7 @@ async def export_planning_result_purchases(
                 r.get("item_article") or "",
                 float(r.get("qty") or 0.0),
                 r.get("unit") or "",
+                r.get("badge") or "",
             ])
 
         if (format or "csv").lower() == "xlsx":

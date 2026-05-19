@@ -28,6 +28,7 @@ from app.services.order_quantity_calculator import OrderQuantityCalculator
 from app.services.planning_service import (
     build_planned_orders_and_purchases,
     compute_planning_preview,
+    get_run_purchases,
     _build_component_reservations_from_active_1c,
     _get_active_1c_remaining_by_item,
     _get_active_supplier_remaining_by_item_date,
@@ -474,6 +475,69 @@ def test_active_supplier_order_reduces_purchase_need_once_by_delivery_date(db_se
     assert rows[0].need_date.isoformat() == "2025-01-20"
     assert float(rows[0].requested_qty) == 4.0
     assert float(rows[0].planned_qty) == 4.0
+
+
+def test_purchase_results_marks_late_supplier_order_coverage(db_session):
+    db = db_session
+
+    u = Unit(unit_ref1c="u-late", unit_name="шт", short_name="шт", precision=0)
+    item = Item(
+        item_code="BUY-LATE",
+        item_name="Buy Late Supplier",
+        item_article="BUY-LATE",
+        replenishment_method="Покупка",
+        replenishment_time=5,
+        unit="u-late",
+        stock_qty=0,
+        status="active",
+    )
+    db.add_all([u, item])
+    db.flush()
+
+    run = _mk_run(db)
+    db.add(
+        PlannedPurchase(
+            run_id=run.run_id,
+            item_id=item.item_id,
+            requested_qty=5,
+            planned_qty=5,
+            qty=5,
+            need_date=datetime.date(2025, 1, 10),
+            order_date=datetime.date(2025, 1, 5),
+            lead_time_days=5,
+            bucket_date=datetime.date(2025, 1, 10),
+        )
+    )
+    order = SupplierOrder(
+        order_number="ЗСНФ-LATE",
+        order_date=datetime.datetime(2025, 1, 1, 10, 0),
+        order_ref1c="late-order-ref",
+        order_state_key="state-in-work",
+        order_state_name="В закупку",
+        deletion_mark=False,
+    )
+    db.add(order)
+    db.flush()
+    db.add(
+        SupplierOrderItem(
+            order_id=order.order_id,
+            item_id_ref=item.item_id,
+            line_number=1,
+            quantity=5,
+            received_qty=0,
+            remaining_qty=5,
+            delivery_date=datetime.datetime(2025, 1, 17),
+        )
+    )
+    db.commit()
+
+    result = get_run_purchases(db, run.run_id, limit=100, offset=0)
+
+    assert result["total"] == 1
+    row = result["rows"][0]
+    assert row["late_supplier_order"] is True
+    assert "Покрыто заказом, но опоздание 7 дн." in row["badge"]
+    assert "ЗСНФ-LATE" in row["badge"]
 
 
 def test_turning_item_net_requirement_collapses_to_first_need_date_and_moves_blank(db_session):

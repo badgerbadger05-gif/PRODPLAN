@@ -50,6 +50,7 @@ type PurchAggRow = {
   agg_key?: string
   badge?: string | null
   turning_blank_priority?: boolean
+  late_supplier_order?: boolean
 }
 
 const props = defineProps<{
