@@ -255,6 +255,18 @@ class ProductionOrderLineState(Base):
 
 class ProductionMaterialIssue(Base):
     __tablename__ = "production_material_issues"
+    __table_args__ = (
+        # At most one ACTIVE (draft|requested) material issue per production
+        # line. Issues already sent to 1C (exported) or that errored out can
+        # coexist — the user may need to re-prepare a fresh draft.
+        Index(
+            "ux_production_material_issues_active_per_product",
+            "product_id",
+            unique=True,
+            postgresql_where=text("status IN ('draft', 'requested')"),
+            sqlite_where=text("status IN ('draft', 'requested')"),
+        ),
+    )
 
     issue_id = Column(Integer, primary_key=True, index=True)
     document_number = Column(String(50), nullable=False, unique=True, index=True)

@@ -231,3 +231,76 @@ def test_partial_unique_source_planned_order_blocks_duplicates(db_session):
         )
     )
     db_session.commit()
+
+
+def test_create_material_issues_is_idempotent_per_product(db_session):
+    """
+    Re-clicking "prepare issue" must not create a duplicate draft document for
+    the same production line. The second call should reuse the existing one
+    and report it in `reused` rather than `created`. The partial unique index
+    enforces this at the DB layer too.
+    """
+    parent = Item(
+        item_code="P-IDEM",
+        item_name="Parent",
+        item_article="ART-P-IDEM",
+        unit="шт",
+        stock_qty=0,
+        status="active",
+    )
+    comp = Item(
+        item_code="C-IDEM",
+        item_name="Component",
+        item_article="ART-C-IDEM",
+        unit="м",
+        stock_qty=10,
+        status="active",
+    )
+    db_session.add_all([parent, comp])
+    db_session.flush()
+
+    spec = Specification(spec_name="Idem spec", spec_ref1c="spec-idem")
+    db_session.add(spec)
+    db_session.flush()
+    db_session.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=1))
+
+    order = ProductionOrder(
+        order_number="IDEM-001",
+        order_date=datetime(2026, 5, 20),
+        order_ref1c="order-idem",
+        is_posted=True,
+        deletion_mark=False,
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=parent.item_id,
+        line_number=1,
+        quantity=5,
+        produced_qty=0,
+        remaining_qty=5,
+    )
+    db_session.add(product)
+    db_session.commit()
+
+    first = create_material_issues(db_session, [product.product_id], initiated_by="op1")
+    assert len(first["created"]) == 1
+    assert first.get("reused", []) == []
+
+    second = create_material_issues(db_session, [product.product_id], initiated_by="op2")
+    # Same product, still in draft -> no new issue created, existing one
+    # reported as reused.
+    assert second["created"] == []
+    assert len(second["reused"]) == 1
+    assert second["reused"][0]["issue_id"] == first["created"][0]["issue_id"]
+
+    # And only one row physically exists.
+    from app.models import ProductionMaterialIssue
+    assert (
+        db_session.query(ProductionMaterialIssue)
+        .filter(ProductionMaterialIssue.product_id == product.product_id)
+        .count()
+        == 1
+    )

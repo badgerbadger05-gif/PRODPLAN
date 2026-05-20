@@ -413,7 +413,17 @@ def create_material_issues(
     initiated_by: Optional[str] = None,
     warehouse_ref1c: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """
+    Idempotent per the plan: a repeated click on "prepare issue" for the same
+    production line must not create a duplicate document.
+
+    If an active (draft|requested) ProductionMaterialIssue already exists for
+    the product, return its descriptor in `reused` instead of creating a new
+    one. Issues already exported to 1C or in error state are treated as
+    archived — a fresh draft can be created in their place.
+    """
     created: List[Dict[str, Any]] = []
+    reused: List[Dict[str, Any]] = []
     errors: List[str] = []
     for pid in product_ids:
         product = (
@@ -425,6 +435,29 @@ def create_material_issues(
         if not product:
             errors.append(f"product_id={pid}: строка заказа не найдена")
             continue
+
+        existing = (
+            db.query(ProductionMaterialIssue)
+            .filter(
+                ProductionMaterialIssue.product_id == int(product.product_id),
+                ProductionMaterialIssue.status.in_(("draft", "requested")),
+            )
+            .order_by(ProductionMaterialIssue.issue_id.desc())
+            .first()
+        )
+        if existing is not None:
+            reused.append(
+                {
+                    "issue_id": int(existing.issue_id),
+                    "document_number": str(existing.document_number),
+                    "product_id": int(product.product_id),
+                    "order_number": str(product.order.order_number or ""),
+                    "item_name": str(product.item.item_name or ""),
+                    "status": str(existing.status),
+                }
+            )
+            continue
+
         spec_id, components = _components_for_product(db, product)
         if not components:
             errors.append(f"product_id={pid}: не найдена спецификация или материалы")
@@ -466,7 +499,7 @@ def create_material_issues(
             }
         )
     db.commit()
-    return {"status": "ok", "created": created, "errors": errors}
+    return {"status": "ok", "created": created, "reused": reused, "errors": errors}
 
 
 def get_issue(db: Session, issue_id: int) -> Dict[str, Any]:
