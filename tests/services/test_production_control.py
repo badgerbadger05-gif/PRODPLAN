@@ -9,11 +9,15 @@ from app.models import (
     DefaultSpecification,
     Item,
     PlannedOrder,
+    PlannedPurchase,
     PlanningRun,
     ProductionOrder,
+    ProductionOrderLineState,
     ProductionProduct,
     SpecComponent,
     Specification,
+    SupplierOrder,
+    SupplierOrderItem,
 )
 from app.services.production_control import (
     create_material_issues,
@@ -453,3 +457,205 @@ def test_create_orders_from_mrp_skips_invalid_inputs(db_session):
     assert (
         db_session.query(ProductionOrder).filter(ProductionOrder.source == "mrp").count() == 0
     )
+
+
+# ---------------------------------------------------------------------------
+# Coverage evaluation in preview_materials
+# ---------------------------------------------------------------------------
+
+
+def _make_basic_spec(db, parent_name="Parent", child_specs=()):
+    """Helper that wires Item + Specification + SpecComponents + DefaultSpecification."""
+    parent = Item(
+        item_code=f"P-{parent_name}",
+        item_name=parent_name,
+        item_article=f"ART-{parent_name}",
+        unit="шт",
+        stock_qty=0,
+        status="active",
+    )
+    db.add(parent)
+    db.flush()
+    spec = Specification(spec_name=f"Spec {parent_name}", spec_ref1c=f"spec-{parent_name}")
+    db.add(spec)
+    db.flush()
+    db.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+
+    components: list[Item] = []
+    for code, name, stock, qty_per_unit in child_specs:
+        comp = Item(
+            item_code=code,
+            item_name=name,
+            item_article=code,
+            unit="м",
+            stock_qty=stock,
+            status="active",
+        )
+        db.add(comp)
+        db.flush()
+        db.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=qty_per_unit))
+        components.append(comp)
+    return parent, spec, components
+
+
+def _make_internal_order_for(db, parent, qty=2):
+    order = ProductionOrder(
+        order_number=f"COV-{parent.item_id}",
+        order_date=datetime(2026, 5, 20),
+        is_posted=False,
+        deletion_mark=False,
+        source="1c",
+    )
+    db.add(order)
+    db.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=parent.item_id,
+        line_number=1,
+        quantity=qty,
+        produced_qty=0,
+        remaining_qty=qty,
+    )
+    db.add(product)
+    db.commit()
+    return order, product
+
+
+def test_preview_materials_marks_ready_when_stock_covers_all(db_session):
+    parent, _spec, comps = _make_basic_spec(
+        db_session,
+        parent_name="ReadyParent",
+        child_specs=[
+            ("RC1", "Comp A enough", 100, 2),  # need 2*2 = 4, have 100
+            ("RC2", "Comp B enough", 100, 3),  # need 3*2 = 6, have 100
+        ],
+    )
+    _order, product = _make_internal_order_for(db_session, parent, qty=2)
+
+    preview = preview_materials(db_session, product.product_id)
+
+    assert preview["coverage"] == "ready"
+    for c in preview["components"]:
+        assert c["coverage"] == "ok"
+        assert c["missing_qty"] == 0
+        assert c["eta_dates"] == []
+    # Line status auto-bumped from default 'shortage' to 'ready'.
+    state = (
+        db_session.query(ProductionOrderLineState)
+        .filter_by(product_id=product.product_id)
+        .one()
+    )
+    assert state.status == "ready"
+
+
+def test_preview_materials_marks_shortage_and_includes_supplier_eta(db_session):
+    parent, _spec, comps = _make_basic_spec(
+        db_session,
+        parent_name="ShortageParent",
+        child_specs=[
+            ("SC1", "No stock comp", 0, 1),  # need 1*2 = 2, have 0
+        ],
+    )
+    comp = comps[0]
+    _order, product = _make_internal_order_for(db_session, parent, qty=2)
+
+    # An open supplier order with a future delivery date covering this component.
+    sup_order = SupplierOrder(
+        order_number="ЗАКП-COVER-001",
+        order_date=datetime(2026, 5, 10, 10),
+        order_ref1c="sup-ref-cover-001",
+        order_state_key="state-in-work",
+        order_state_name="В закупку",
+        deletion_mark=False,
+    )
+    db_session.add(sup_order)
+    db_session.flush()
+    db_session.add(
+        SupplierOrderItem(
+            order_id=sup_order.order_id,
+            item_id_ref=comp.item_id,
+            line_number=1,
+            quantity=10,
+            received_qty=0,
+            remaining_qty=10,
+            delivery_date=datetime(2026, 6, 1),
+        )
+    )
+    db_session.commit()
+
+    preview = preview_materials(db_session, product.product_id)
+    assert preview["coverage"] == "shortage"
+    only_comp = preview["components"][0]
+    assert only_comp["coverage"] == "shortage"
+    assert only_comp["missing_qty"] == 2
+    # ETA from supplier_order pipe.
+    eta = only_comp["eta_dates"]
+    assert len(eta) >= 1
+    sup_etas = [e for e in eta if e["source"] == "supplier_order"]
+    assert sup_etas
+    assert sup_etas[0]["ref"] == "ЗАКП-COVER-001"
+    assert sup_etas[0]["date"] == "2026-06-01"
+
+
+def test_preview_materials_marks_partial_when_some_stock(db_session):
+    parent, _spec, comps = _make_basic_spec(
+        db_session,
+        parent_name="PartialParent",
+        child_specs=[
+            ("PC1", "Comp full", 100, 1),  # need 2, have 100 -> ok
+            ("PC2", "Comp partial", 3, 2),  # need 4, have 3 -> partial
+        ],
+    )
+    _order, product = _make_internal_order_for(db_session, parent, qty=2)
+
+    preview = preview_materials(db_session, product.product_id)
+    assert preview["coverage"] == "partial"
+    by_name = {c["item_name"]: c for c in preview["components"]}
+    assert by_name["Comp full"]["coverage"] == "ok"
+    assert by_name["Comp partial"]["coverage"] == "partial"
+    assert by_name["Comp partial"]["missing_qty"] == 1
+    state = (
+        db_session.query(ProductionOrderLineState)
+        .filter_by(product_id=product.product_id)
+        .one()
+    )
+    assert state.status == "partial"
+
+
+def test_preview_materials_does_not_override_post_coverage_status(db_session):
+    """
+    Once a line has progressed past coverage (to_move / assembled / produced),
+    re-running preview_materials must not regress it back to shortage/partial/
+    ready even if the stock numbers say so.
+    """
+    parent, _spec, _comps = _make_basic_spec(
+        db_session,
+        parent_name="StickyParent",
+        child_specs=[("STC1", "Comp empty", 0, 1)],
+    )
+    _order, product = _make_internal_order_for(db_session, parent, qty=2)
+
+    # Manually push the state past the coverage band.
+    state = (
+        db_session.query(ProductionOrderLineState)
+        .filter_by(product_id=product.product_id)
+        .one_or_none()
+    )
+    if state is None:
+        # Lazy-create through preview, then move forward.
+        preview_materials(db_session, product.product_id)
+        state = (
+            db_session.query(ProductionOrderLineState)
+            .filter_by(product_id=product.product_id)
+            .one()
+        )
+    state.status = "to_move"
+    db_session.commit()
+
+    preview_materials(db_session, product.product_id)
+    refreshed = (
+        db_session.query(ProductionOrderLineState)
+        .filter_by(product_id=product.product_id)
+        .one()
+    )
+    assert refreshed.status == "to_move"
