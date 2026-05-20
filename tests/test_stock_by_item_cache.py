@@ -11,17 +11,27 @@ from app.models import (
     SpecComponent,
     ProductionOrder,
     ProductionProduct,
+    SupplierOrder,
+    SupplierOrderItem,
     PlanningRun,
     PlannedOrder,
     PlannedPurchase,
     PlannedRework,
+    ProductionKind,
+    ProductionPlanEntry,
+    ProductionResource,
+    ProductionStage,
+    ResourceProductionKind,
 )
 
 from app.services.order_quantity_calculator import OrderQuantityCalculator
 from app.services.planning_service import (
     build_planned_orders_and_purchases,
+    compute_planning_preview,
+    get_run_purchases,
     _build_component_reservations_from_active_1c,
     _get_active_1c_remaining_by_item,
+    _get_active_supplier_remaining_by_item_date,
 )
 
 
@@ -145,6 +155,90 @@ def test_parent_can_be_falsely_blocked_when_component_stock_missing_in_cache(db_
     )
     assert not any(w.get("code") == "COMPONENT_SHORTAGE_BLOCKED" for w in out2.get("warnings", []))
     assert db.query(PlannedOrder).filter(PlannedOrder.run_id == run2.run_id).count() == 1
+
+
+def test_component_limit_is_cumulative_across_multiple_buckets(db_session):
+    db = db_session
+
+    u = Unit(unit_ref1c="u-cum", unit_name="шт", short_name="шт", precision=0)
+    db.add(u)
+
+    parent = Item(
+        item_code="PARENT-CUM",
+        item_name="Parent Cumulative",
+        item_article="PARENT-CUM",
+        replenishment_method="Производство",
+        unit="u-cum",
+        stock_qty=0,
+        status="active",
+    )
+    child = Item(
+        item_code="CHILD-CUM",
+        item_name="Child Cumulative",
+        item_article="CHILD-CUM",
+        replenishment_method="Производство",
+        unit="u-cum",
+        stock_qty=2,
+        status="active",
+    )
+    db.add_all([parent, child])
+    db.flush()
+
+    spec = Specification(spec_code="S-CUM", spec_name="Spec Cumulative")
+    db.add(spec)
+    db.flush()
+    db.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db.add(SpecComponent(spec_id=spec.spec_id, item_id=child.item_id, quantity=1.0))
+    db.flush()
+
+    run = _mk_run(db)
+    units_by_ref = {"u-cum": u}
+    item_cache = {parent.item_id: parent, child.item_id: child}
+
+    def components_loader(spec_id: int):
+        return db.query(SpecComponent).filter(SpecComponent.spec_id == spec_id).all()
+
+    calc = OrderQuantityCalculator(
+        snapshot=run.config_snapshot,
+        default_spec_map={parent.item_id: spec.spec_id},
+        spec_by_id={spec.spec_id: spec},
+        components_loader=components_loader,
+        item_by_id=item_cache,
+        units_by_ref=units_by_ref,
+        res_by_id={},
+        production_kinds_by_resource={},
+        stock_by_item={parent.item_id: 0.0, child.item_id: 2.0},
+        wip_by_item={},
+        horizon_days=run.horizon_days or 0,
+        total_demand_by_item={parent.item_id: 10.0},
+    )
+
+    out = build_planned_orders_and_purchases(
+        db,
+        run,
+        {
+            str(parent.item_id): {
+                "2025-01-01": 5.0,
+                "2025-01-08": 5.0,
+            }
+        },
+        calc,
+        priority_manager=SimpleNamespace(),
+        item_cache=item_cache,
+        units_by_ref=units_by_ref,
+    )
+
+    rows = (
+        db.query(PlannedOrder)
+        .filter(PlannedOrder.run_id == run.run_id, PlannedOrder.item_id == parent.item_id)
+        .order_by(PlannedOrder.need_date.asc())
+        .all()
+    )
+    assert len(rows) == 1
+    assert float(rows[0].planned_qty) == 2.0
+    assert sum(float(r.planned_qty) for r in rows) == 2.0
+    assert any(w.get("code") == "COMPONENT_SHORTAGE_PARTIAL" for w in out.get("warnings", []))
+    assert any(w.get("code") == "COMPONENT_SHORTAGE_BLOCKED" for w in out.get("warnings", []))
 
 
 def test_active_1c_remaining_reduces_requested_qty_for_production_order(db_session):
@@ -310,6 +404,336 @@ def test_purchase_flow_preserves_fractional_qty_for_metric_units(db_session):
     assert float(row.requested_qty) == 7.9
     assert float(row.planned_qty) == 7.9
     assert float(row.qty) == 7.9
+
+
+def test_active_supplier_order_reduces_purchase_need_once_by_delivery_date(db_session):
+    db = db_session
+
+    u = Unit(unit_ref1c="u-sup", unit_name="шт", short_name="шт", precision=0)
+    db.add(u)
+
+    item = Item(
+        item_code="BUY-SUP",
+        item_name="Buy Supplier Covered",
+        item_article="BUY-SUP",
+        replenishment_method="Покупка",
+        replenishment_time=5,
+        unit="u-sup",
+        stock_qty=0,
+        status="active",
+    )
+    db.add(item)
+    db.flush()
+
+    run = _mk_run(db)
+    units_by_ref = {"u-sup": u}
+    item_cache = {item.item_id: item}
+
+    calc = OrderQuantityCalculator(
+        snapshot=run.config_snapshot,
+        default_spec_map={},
+        spec_by_id={},
+        components_loader=lambda _sid: [],
+        item_by_id=item_cache,
+        units_by_ref=units_by_ref,
+        res_by_id={},
+        production_kinds_by_resource={},
+        stock_by_item={item.item_id: 0.0},
+        wip_by_item={},
+        horizon_days=run.horizon_days or 0,
+        total_demand_by_item={item.item_id: 10.0},
+    )
+
+    build_planned_orders_and_purchases(
+        db,
+        run,
+        {
+            str(item.item_id): {
+                "2025-01-10": 5.0,
+                "2025-01-20": 5.0,
+            }
+        },
+        calc,
+        priority_manager=SimpleNamespace(),
+        item_cache=item_cache,
+        units_by_ref=units_by_ref,
+        supplier_remaining_by_item_date={
+            item.item_id: [
+                (datetime.date(2025, 1, 10), 6.0),
+                (datetime.date(2025, 1, 25), 100.0),
+            ]
+        },
+    )
+
+    rows = (
+        db.query(PlannedPurchase)
+        .filter(PlannedPurchase.run_id == run.run_id)
+        .order_by(PlannedPurchase.need_date.asc())
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].need_date.isoformat() == "2025-01-20"
+    assert float(rows[0].requested_qty) == 4.0
+    assert float(rows[0].planned_qty) == 4.0
+
+
+def test_purchase_results_marks_late_supplier_order_coverage(db_session):
+    db = db_session
+
+    u = Unit(unit_ref1c="u-late", unit_name="шт", short_name="шт", precision=0)
+    item = Item(
+        item_code="BUY-LATE",
+        item_name="Buy Late Supplier",
+        item_article="BUY-LATE",
+        replenishment_method="Покупка",
+        replenishment_time=5,
+        unit="u-late",
+        stock_qty=0,
+        status="active",
+    )
+    db.add_all([u, item])
+    db.flush()
+
+    run = _mk_run(db)
+    db.add(
+        PlannedPurchase(
+            run_id=run.run_id,
+            item_id=item.item_id,
+            requested_qty=5,
+            planned_qty=5,
+            qty=5,
+            need_date=datetime.date(2025, 1, 10),
+            order_date=datetime.date(2025, 1, 5),
+            lead_time_days=5,
+            bucket_date=datetime.date(2025, 1, 10),
+        )
+    )
+    order = SupplierOrder(
+        order_number="ЗСНФ-LATE",
+        order_date=datetime.datetime(2025, 1, 1, 10, 0),
+        order_ref1c="late-order-ref",
+        order_state_key="state-in-work",
+        order_state_name="В закупку",
+        deletion_mark=False,
+    )
+    db.add(order)
+    db.flush()
+    db.add(
+        SupplierOrderItem(
+            order_id=order.order_id,
+            item_id_ref=item.item_id,
+            line_number=1,
+            quantity=5,
+            received_qty=0,
+            remaining_qty=5,
+            delivery_date=datetime.datetime(2025, 1, 17),
+        )
+    )
+    db.commit()
+
+    result = get_run_purchases(db, run.run_id, limit=100, offset=0)
+
+    assert result["total"] == 1
+    row = result["rows"][0]
+    assert row["late_supplier_order"] is True
+    assert "Покрыто заказом, но опоздание 7 дн." in row["badge"]
+    assert "ЗСНФ-LATE" in row["badge"]
+
+    # Regression: badge/late_supplier_order/turning_blank_priority must survive
+    # serialization through the PurchaseCategoryGroupOrder response model used
+    # by /purchases/grouped-by-category. FastAPI drops fields not declared on
+    # the response model, so the schema must explicitly list them.
+    from app.schemas import PurchaseCategoryGroupOrder
+    from app.services.planning_service import get_run_purchases_grouped_by_category
+
+    grouped = get_run_purchases_grouped_by_category(db, run.run_id)
+    assert grouped["total_orders"] == 1
+    order_row = grouped["groups"][0]["orders"][0]
+    serialized = PurchaseCategoryGroupOrder(**order_row).model_dump()
+    assert serialized["late_supplier_order"] is True
+    assert "Покрыто заказом, но опоздание 7 дн." in (serialized["badge"] or "")
+    assert "ЗСНФ-LATE" in (serialized["badge"] or "")
+
+
+def test_turning_item_net_requirement_collapses_to_first_need_date_and_moves_blank(db_session):
+    db = db_session
+    today = datetime.date.today()
+
+    turning_kind = ProductionKind(ref_1c="turn-kind", name="Токарные работы")
+    blank_kind = ProductionKind(ref_1c="blank-kind", name="Заготовительные работы")
+    turning_area = ProductionResource(resource_name="Токарный участок", capacity=8, daily_work_hours=8, buffer_days=0)
+    blank_area = ProductionResource(resource_name="Заготовительный участок", capacity=8, daily_work_hours=8, buffer_days=5)
+    blank_stage = ProductionStage(stage_name="Заготовка", stage_order=1, stage_ref1c="blank-stage")
+    db.add_all([turning_kind, blank_kind, turning_area, blank_area, blank_stage])
+    db.flush()
+    db.add(ResourceProductionKind(resource_id=turning_area.resource_id, production_kind_id=turning_kind.id))
+    db.add(ResourceProductionKind(resource_id=blank_area.resource_id, production_kind_id=blank_kind.id))
+
+    parent = Item(
+        item_code="TURN-PARENT",
+        item_name="Turning Parent",
+        item_article="TURN-PARENT",
+        replenishment_method="Производство",
+        stock_qty=0,
+        status="active",
+    )
+    blank = Item(
+        item_code="TURN-BLANK",
+        item_name="Turning Blank",
+        item_article="TURN-BLANK",
+        replenishment_method="Производство",
+        stock_qty=0,
+        status="active",
+    )
+    db.add_all([parent, blank])
+    db.flush()
+
+    spec = Specification(spec_code="TURN-SPEC", spec_name="Turning Spec", production_kind_id=turning_kind.id)
+    blank_spec = Specification(spec_code="BLANK-SPEC", spec_name="Blank Spec", production_kind_id=blank_kind.id)
+    db.add_all([spec, blank_spec])
+    db.flush()
+    db.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db.add(DefaultSpecification(item_id=blank.item_id, spec_id=blank_spec.spec_id))
+    db.add(SpecComponent(spec_id=spec.spec_id, item_id=blank.item_id, quantity=2.0, stage_id=blank_stage.stage_id))
+    db.add_all(
+        [
+            ProductionPlanEntry(item_id=parent.item_id, date=today + datetime.timedelta(days=2), planned_qty=3),
+            ProductionPlanEntry(item_id=parent.item_id, date=today + datetime.timedelta(days=7), planned_qty=4),
+        ]
+    )
+    db.commit()
+
+    result = compute_planning_preview(
+        db,
+        horizon_days=20,
+        config_overrides={"safety_stock_percent": 0, "toggles": {"include_wip": False}},
+    )
+
+    first_need = (today + datetime.timedelta(days=2)).isoformat()
+    later_need = (today + datetime.timedelta(days=7)).isoformat()
+    parent_net = result["net"][str(parent.item_id)]
+    blank_net = result["net"][str(blank.item_id)]
+
+    assert parent_net == {first_need: 7.0}
+    assert blank_net == {first_need: 14.0}
+    assert later_need not in parent_net
+    assert later_need not in blank_net
+    assert any(
+        w.get("code") == "TURNING_BLANK_PRIORITY"
+        and w.get("item_id") == blank.item_id
+        and w.get("parent_item_id") == parent.item_id
+        and w.get("need_date") == first_need
+        for w in result.get("warnings", [])
+    )
+
+
+def test_non_turning_item_keeps_requirement_buckets(db_session):
+    db = db_session
+    today = datetime.date.today()
+
+    parent = Item(
+        item_code="REG-PARENT",
+        item_name="Regular Parent",
+        item_article="REG-PARENT",
+        replenishment_method="Производство",
+        stock_qty=0,
+        status="active",
+    )
+    component = Item(
+        item_code="REG-COMP",
+        item_name="Regular Component",
+        item_article="REG-COMP",
+        replenishment_method="Производство",
+        stock_qty=0,
+        status="active",
+    )
+    db.add_all([parent, component])
+    db.flush()
+    spec = Specification(spec_code="REG-SPEC", spec_name="Regular Spec")
+    db.add(spec)
+    db.flush()
+    db.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db.add(SpecComponent(spec_id=spec.spec_id, item_id=component.item_id, quantity=2.0))
+    db.add_all(
+        [
+            ProductionPlanEntry(item_id=parent.item_id, date=today + datetime.timedelta(days=2), planned_qty=3),
+            ProductionPlanEntry(item_id=parent.item_id, date=today + datetime.timedelta(days=7), planned_qty=4),
+        ]
+    )
+    db.commit()
+
+    result = compute_planning_preview(
+        db,
+        horizon_days=20,
+        config_overrides={"safety_stock_percent": 0, "toggles": {"include_wip": False}},
+    )
+
+    first_need = (today + datetime.timedelta(days=2)).isoformat()
+    later_need = (today + datetime.timedelta(days=7)).isoformat()
+
+    assert result["net"][str(parent.item_id)] == {first_need: 3.0, later_need: 4.0}
+    assert result["net"][str(component.item_id)] == {first_need: 6.0, later_need: 8.0}
+    assert not any(w.get("code") == "TURNING_BLANK_PRIORITY" for w in result.get("warnings", []))
+
+
+def test_active_supplier_remaining_filters_new_cancelled_deleted_and_missing_date(db_session):
+    db = db_session
+
+    item = Item(
+        item_code="SUP-REM",
+        item_name="Supplier Remaining",
+        item_article="SUP-REM",
+        replenishment_method="Покупка",
+        unit="u",
+        stock_qty=0,
+        status="active",
+    )
+    db.add(item)
+    db.flush()
+
+    def add_order(number, state_name, deletion_mark, remaining_qty, delivery_date, state_key_marker="default"):
+        order = SupplierOrder(
+            order_number=number,
+            order_date=datetime.datetime(2026, 1, 1),
+            order_ref1c=f"{number}-ref",
+            is_posted=True,
+            order_state_key=f"{number}-state" if state_key_marker == "default" else state_key_marker,
+            order_state_name=state_name,
+            deletion_mark=deletion_mark,
+        )
+        db.add(order)
+        db.flush()
+        db.add(
+            SupplierOrderItem(
+                order_id=order.order_id,
+                item_id_ref=item.item_id,
+                line_number=1,
+                quantity=10.0,
+                received_qty=10.0 - remaining_qty,
+                remaining_qty=remaining_qty,
+                delivery_date=delivery_date,
+            )
+        )
+
+    add_order("ACTIVE", "В закупку", False, 4.0, datetime.datetime(2026, 1, 10))
+    add_order("UNKNOWN", None, False, 3.0, datetime.datetime(2026, 1, 11))
+    add_order("LEGACY", None, False, 12.0, datetime.datetime(2026, 1, 12), state_key_marker=None)
+    add_order("NEW", "Новый заказ", False, 5.0, datetime.datetime(2026, 1, 10))
+    add_order("CANCEL", "Отменён", False, 6.0, datetime.datetime(2026, 1, 10))
+    add_order("DONE", "Завершён", False, 9.0, datetime.datetime(2026, 1, 10))
+    add_order("DONE-OK", "Завершен успешно", False, 10.0, datetime.datetime(2026, 1, 10))
+    add_order("ACCOUNTING", "Бухгалтерия", False, 11.0, datetime.datetime(2026, 1, 10))
+    add_order("DELETED", "В закупку", True, 7.0, datetime.datetime(2026, 1, 10))
+    add_order("NODATE", "В закупку", False, 8.0, None)
+    db.commit()
+
+    rem = _get_active_supplier_remaining_by_item_date(db)
+    assert rem == {
+        item.item_id: [
+            (datetime.date(2026, 1, 10), 4.0),
+            (datetime.date(2026, 1, 11), 3.0),
+        ]
+    }
 
 
 def test_get_active_1c_remaining_by_item_filters_done_deleted_and_nonpositive(db_session):

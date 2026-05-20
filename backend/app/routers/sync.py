@@ -1,15 +1,18 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+from pydantic import BaseModel
+from typing import List
 
 from ..database import get_db
 from ..schemas import ODataSyncRequest, ODataSyncStats
-from ..services.odata_stock_sync import sync_stock_from_odata
+from ..services.odata_stock_sync import sync_stock_from_odata, sync_stock_warehouses_from_odata
 from ..services.nomenclature_sync import sync_nomenclature_from_odata, NomenclatureSyncStats
 from ..services.category_sync import sync_categories_from_odata, CategorySyncStats
 from ..services.specification_sync import sync_specifications_from_odata, SpecificationSyncStats
 from ..services.production_order_sync import sync_production_orders_from_odata, ProductionOrderSyncStats, sync_production_fact_from_odata
 from ..services.production_order_export import export_production_orders_xlsx
 from ..services.supplier_order_sync import sync_supplier_orders_from_odata, SupplierOrderSyncStats
+from ..services.supplier_order_export import export_supplier_orders_xlsx
 from ..services.default_specification_sync import sync_default_specifications_from_odata, DefaultSpecificationSyncStats
 from ..services.production_stage_sync import sync_production_stages_from_odata, ProductionStageSyncStats
 
@@ -20,6 +23,10 @@ from ..services.production_kind_sync import sync_production_kinds_from_odata, Pr
 from .. import models
 
 router = APIRouter(prefix="/v1/sync", tags=["sync"])
+
+
+class WarehouseSelectionPayload(BaseModel):
+    selected_refs: List[str] = []
 
 
 @router.post("/stock-odata", response_model=ODataSyncStats)
@@ -45,6 +52,60 @@ def sync_stock_odata(payload: ODataSyncRequest, db: Session = Depends(get_db)):
         return ODataSyncStats(**stats)  # type: ignore[arg-type]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Sync error: {e}")
+
+
+@router.post("/warehouses-odata", response_model=dict)
+def sync_warehouses_odata(payload: ODataSyncRequest, db: Session = Depends(get_db)):
+    """
+    Синхронизация списка складов из 1С (через тот же регистр остатков).
+    Остатки номенклатуры не обновляет.
+    """
+    try:
+        return sync_stock_warehouses_from_odata(db, payload)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sync error: {e}")
+
+
+@router.get("/warehouses", response_model=dict)
+def get_stock_warehouses(db: Session = Depends(get_db)):
+    rows = (
+        db.query(models.StockWarehouse)
+        .order_by(models.StockWarehouse.warehouse_name.asc(), models.StockWarehouse.warehouse_code.asc())
+        .all()
+    )
+    return {
+        "rows": [
+            {
+                "warehouse_id": int(r.warehouse_id),
+                "warehouse_ref1c": str(r.warehouse_ref1c),
+                "warehouse_code": str(r.warehouse_code or ""),
+                "warehouse_name": str(r.warehouse_name or ""),
+                "is_selected": bool(r.is_selected),
+            }
+            for r in rows
+        ],
+        "total": len(rows),
+        "selected_total": sum(1 for r in rows if bool(r.is_selected)),
+    }
+
+
+@router.post("/warehouses/selection", response_model=dict)
+def save_stock_warehouse_selection(payload: WarehouseSelectionPayload, db: Session = Depends(get_db)):
+    selected = {str(x).strip() for x in (payload.selected_refs or []) if str(x).strip()}
+    rows = db.query(models.StockWarehouse).all()
+    changed = 0
+    for r in rows:
+        new_val = str(r.warehouse_ref1c or "") in selected
+        if bool(r.is_selected) != bool(new_val):
+            r.is_selected = bool(new_val)
+            changed += 1
+    db.commit()
+    return {
+        "status": "ok",
+        "changed": changed,
+        "selected_total": sum(1 for r in rows if bool(r.is_selected)),
+        "total": len(rows),
+    }
 
 
 @router.post("/nomenclature-odata", response_model=dict)
@@ -288,6 +349,18 @@ def sync_supplier_orders_odata(payload: ODataSyncRequest, db: Session = Depends(
         return stats
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Sync error: {e}")
+
+
+@router.get("/supplier-orders-odata/export", response_model=dict)
+def export_supplier_orders(db: Session = Depends(get_db)):
+    """
+    Экспорт учитываемых заказов поставщику в Excel (XLSX, base64).
+    """
+    try:
+        result = export_supplier_orders_xlsx(db)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Export error: {e}")
 
 
 @router.post("/default-specifications-odata", response_model=dict)

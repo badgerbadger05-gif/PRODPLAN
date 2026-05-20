@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+import re
 
 from sqlalchemy import and_, func
 from sqlalchemy.orm import Session
@@ -72,6 +73,18 @@ def _to_float(v: Any) -> float:
         return 0.0
 
 
+def _strip_carry_notes(notes: Optional[str]) -> Optional[str]:
+    """Remove previous carry fragments from notes, preserving other text."""
+    if not notes:
+        return None
+    try:
+        cleaned = re.sub(r"(^|;\s*)Carry[^;]*", "", str(notes), flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*;\s*", "; ", cleaned).strip(" ;")
+        return cleaned or None
+    except Exception:
+        return notes
+
+
 def _day_bounds(d: date) -> Tuple[datetime, datetime]:
     """[start, end) границы суток для DateTime-поля."""
     start = datetime.combine(d, datetime.min.time())
@@ -126,21 +139,82 @@ def get_week_report(
         .filter(ProductionDayClose.close_date >= d0, ProductionDayClose.close_date <= d6)
         .all()
     )
+
+    # Effective carry that is currently still present in plan on applied_to_date.
+    # We keep history rows intact, but UI must show only "alive" carry in current plan state.
+    carry_keys: List[Tuple[int, date]] = []
+    for item_rec, _close_date in closed_data_rows:
+        try:
+            ii = int(item_rec.item_id)
+            ad = getattr(item_rec, "applied_to_date", None)
+            if ad is not None:
+                carry_keys.append((ii, ad))
+        except Exception:
+            continue
+
+    current_plan_on_target: Dict[Tuple[int, str], float] = {}
+    if carry_keys:
+        try:
+            item_ids_for_carry = sorted({int(i) for i, _ in carry_keys})
+            target_dates = [d for _, d in carry_keys]
+            min_dt = min(target_dates)
+            max_dt = max(target_dates) + timedelta(days=1)
+            rows_plan = (
+                db.query(
+                    ProductionPlanEntry.item_id.label("item_id"),
+                    func.date(ProductionPlanEntry.date).label("d"),
+                    func.coalesce(func.sum(ProductionPlanEntry.planned_qty), 0.0).label("plan"),
+                )
+                .filter(ProductionPlanEntry.item_id.in_(item_ids_for_carry))
+                .filter(ProductionPlanEntry.date >= datetime.combine(min_dt, datetime.min.time()))
+                .filter(ProductionPlanEntry.date < datetime.combine(max_dt, datetime.min.time()))
+                .group_by(ProductionPlanEntry.item_id, func.date(ProductionPlanEntry.date))
+                .all()
+            )
+            for iid, dval, p in rows_plan:
+                try:
+                    ds = dval.isoformat() if hasattr(dval, "isoformat") else str(dval)
+                    current_plan_on_target[(int(iid), ds)] = _to_float(p)
+                except Exception:
+                    continue
+        except Exception:
+            current_plan_on_target = {}
+
+    def _effective_carry_now(item_rec: ProductionDayCloseItem) -> float:
+        carry = _to_float(getattr(item_rec, "carry_qty", 0.0))
+        if abs(carry) <= 1e-9:
+            return 0.0
+        applied = getattr(item_rec, "applied_to_date", None)
+        before_raw = getattr(item_rec, "original_planned_qty_before_carry", None)
+        # Legacy rows: keep historical carry as fallback
+        if applied is None or before_raw is None:
+            return carry
+        try:
+            key = (int(item_rec.item_id), applied.isoformat())
+            current_plan = _to_float(current_plan_on_target.get(key, 0.0))
+            before = _to_float(before_raw)
+            delta = current_plan - before
+            if carry > 0:
+                return min(max(delta, 0.0), carry)
+            return max(min(delta, 0.0), carry)
+        except Exception:
+            return carry
     
     # Map closed data by date
     closed_data_map: Dict[date, Dict[str, Any]] = {}
     for item_rec, close_date in closed_data_rows:
+        eff_carry = _effective_carry_now(item_rec)
         if close_date not in closed_data_map:
             closed_data_map[close_date] = {
                 'closed_planned': _to_float(item_rec.planned_qty_snapshot),
                 'closed_fact': _to_float(item_rec.fact_qty_snapshot),
-                'carry_qty': _to_float(item_rec.carry_qty),
+                'carry_qty': eff_carry,
             }
         else:
             # Sum up values for multiple items closed on the same day
             closed_data_map[close_date]['closed_planned'] += _to_float(item_rec.planned_qty_snapshot)
             closed_data_map[close_date]['closed_fact'] += _to_float(item_rec.fact_qty_snapshot)
-            closed_data_map[close_date]['carry_qty'] += _to_float(item_rec.carry_qty)
+            closed_data_map[close_date]['carry_qty'] += eff_carry
 
     days_out: List[Dict[str, Any]] = []
     for d in dates:
@@ -182,6 +256,8 @@ def get_week_report(
                     ProductionDayCloseItem.planned_qty_snapshot,
                     ProductionDayCloseItem.fact_qty_snapshot,
                     ProductionDayCloseItem.carry_qty,
+                    ProductionDayCloseItem.applied_to_date,
+                    ProductionDayCloseItem.original_planned_qty_before_carry,
                 )
                 .join(ProductionDayClose, ProductionDayCloseItem.day_close_id == ProductionDayClose.id)
                 .filter(ProductionDayClose.close_date >= d0)
@@ -189,11 +265,21 @@ def get_week_report(
                 .filter(ProductionDayCloseItem.item_id.in_(item_ids))
                 .all()
             )
-            for iid, cd, p, f, c in close_item_rows:
+            for iid, cd, p, f, c, applied_to, before_raw in close_item_rows:
                 try:
                     ii = int(iid)
                     ds = cd.isoformat() if hasattr(cd, "isoformat") else str(cd)
-                    carry_by_item.setdefault(ii, {})[ds] = _to_float(c)
+                    eff_carry = _to_float(c)
+                    if abs(eff_carry) > 1e-9 and applied_to is not None and before_raw is not None:
+                        key = (ii, applied_to.isoformat())
+                        current_plan = _to_float(current_plan_on_target.get(key, 0.0))
+                        before = _to_float(before_raw)
+                        delta = current_plan - before
+                        if eff_carry > 0:
+                            eff_carry = min(max(delta, 0.0), eff_carry)
+                        else:
+                            eff_carry = max(min(delta, 0.0), eff_carry)
+                    carry_by_item.setdefault(ii, {})[ds] = eff_carry
                     closed_plan_by_item.setdefault(ii, {})[ds] = _to_float(p)
                     closed_fact_by_item.setdefault(ii, {})[ds] = _to_float(f)
                 except Exception:
@@ -408,9 +494,10 @@ def close_previous_workday(
             try:
                 carry = _to_float(it.carry_qty)
                 applied = getattr(it, "applied_to_date", None)
-                if carry <= 1e-9 or applied is None:
+                if abs(carry) <= 1e-9 or applied is None:
                     continue
-                # subtract only the carry amount from plan on that date
+                # Delta rollback: remove exactly this carry contribution from current plan.
+                # This avoids overwriting carries from other close days that target the same date.
                 a0, a1 = _day_bounds(applied)
                 pe = (
                     db.query(ProductionPlanEntry)
@@ -419,12 +506,7 @@ def close_previous_workday(
                 )
                 if pe is None:
                     continue
-                # Deterministic rollback: restore planned_qty on target date to the snapshot before carry.
-                before = getattr(it, "original_planned_qty_before_carry", None)
-                if before is None:
-                    # Backward compatibility for old rows without the field
-                    before = _to_float(pe.planned_qty) - carry
-                pe.planned_qty = max(_to_float(before), 0.0)
+                pe.planned_qty = max(_to_float(pe.planned_qty) - carry, 0.0)
             except Exception:
                 continue
 
@@ -455,13 +537,15 @@ def close_previous_workday(
     # fact 5 Fri => naive carry 25 but real week remainder may be 15, or even less if weekend fact exists).
     #
     # We net facts within the week against plans up to D_close (FIFO by date inside the week).
-    # Carry for D_close is the incremental backlog attributable to D_close:
-    #   carry = max(P_through_close - F_week, 0) - max(P_before_close - F_week, 0)
+    # Carry for D_close is the incremental backlog attributable to D_close,
+    # with support of negative credit on over-fulfillment:
+    #   carry = (P_through_close - F_week) - max(P_before_close - F_week, 0)
     # where:
     #   P_before_close  = sum(plan_qty in [week_start .. D_close-1])
     #   P_through_close = sum(plan_qty in [week_start .. D_close])
     #   F_week          = sum(fact_qty in [week_start .. min(today, week_end)])
-    # This allows weekend facts (when today is Monday and D_close is previous Friday) to reduce carry.
+    # This allows weekend facts (when today is Monday and D_close is previous Friday)
+    # to reduce carry and potentially produce negative credit.
     week_start = _week_start_monday(d_close)
     week_end = week_start + timedelta(days=6)
     fact_end = week_end if today > week_end else today
@@ -529,15 +613,18 @@ def close_previous_workday(
         p_through = _to_float(plan_through_map.get(iid, 0.0))
         f_week = _to_float(fact_week_map.get(iid, 0.0))
 
-        backlog_through = max(p_through - f_week, 0.0)
+        # Signed carry:
+        #  > 0 => backlog to move forward
+        #  < 0 => over-fulfillment credit to reduce future plan
+        backlog_through = (p_through - f_week)
         backlog_before = max(p_before - f_week, 0.0)
-        carry = max(backlog_through - backlog_before, 0.0)
+        carry = backlog_through - backlog_before
 
         applied_to: Optional[date] = None
         original_planned_before_carry: Optional[float] = None
         planned_after_carry: Optional[float] = None
-        if carry > 1e-9:
-            applied_to = d_target
+        carry_applied = False
+        if abs(carry) > 1e-9:
             t0, t1 = _day_bounds(d_target)
             pe_t = (
                 db.query(ProductionPlanEntry)
@@ -545,30 +632,42 @@ def close_previous_workday(
                 .first()
             )
             if pe_t is None:
-                original_planned_before_carry = 0.0
-                planned_after_carry = float(carry)
-                db.add(
-                    ProductionPlanEntry(
-                        item_id=iid,
-                        stage_id=None,
-                        date=datetime.combine(d_target, datetime.min.time()),
-                        planned_qty=carry,
-                        completed_qty=0.0,
-                        status="GREEN",
-                        notes=f"Carry from {d_close.isoformat()}",
+                if carry > 0:
+                    applied_to = d_target
+                    carry_applied = True
+                    original_planned_before_carry = 0.0
+                    planned_after_carry = float(carry)
+                    db.add(
+                        ProductionPlanEntry(
+                            item_id=iid,
+                            stage_id=None,
+                            date=datetime.combine(d_target, datetime.min.time()),
+                            planned_qty=carry,
+                            completed_qty=0.0,
+                            status="GREEN",
+                            notes=f"Carry {carry:+g} from {d_close.isoformat()}",
+                        )
                     )
-                )
-            else:
-                # Store original planned quantity before adding carry for accurate rollback
-                original_planned_before_carry = _to_float(pe_t.planned_qty)
-                planned_after_carry = float(original_planned_before_carry + carry)
-                pe_t.planned_qty = planned_after_carry
-                # Update notes to indicate carry addition
-                if pe_t.notes:
-                    pe_t.notes = f"{pe_t.notes}; Carry +{carry} from {d_close.isoformat()}"
                 else:
-                    pe_t.notes = f"Carry +{carry} from {d_close.isoformat()}"
-            applied_count += 1
+                    # Do not create a negative target plan row when there is nothing to reduce.
+                    original_planned_before_carry = 0.0
+                    planned_after_carry = 0.0
+            else:
+                # Store original planned quantity before applying signed carry for accurate rollback
+                original_planned_before_carry = _to_float(pe_t.planned_qty)
+                planned_after_carry = max(float(original_planned_before_carry + carry), 0.0)
+                pe_t.planned_qty = planned_after_carry
+                # Mark as applied only when it changed target plan.
+                carry_applied = abs(planned_after_carry - original_planned_before_carry) > 1e-9
+                if carry_applied:
+                    applied_to = d_target
+                # Update notes to indicate signed carry application
+                if carry_applied:
+                    base_notes = _strip_carry_notes(pe_t.notes)
+                    carry_note = f"Carry {carry:+g} from {d_close.isoformat()}"
+                    pe_t.notes = f"{base_notes}; {carry_note}" if base_notes else carry_note
+            if carry_applied:
+                applied_count += 1
 
         db.add(
             ProductionDayCloseItem(
@@ -580,7 +679,7 @@ def close_previous_workday(
                 applied_to_date=applied_to,
                 original_planned_qty_before_carry=original_planned_before_carry,
                 planned_qty_after_carry=planned_after_carry,
-                carry_status="APPLIED" if carry > 1e-9 else "NONE",
+                carry_status="APPLIED" if carry_applied else "NONE",
             )
         )
 

@@ -12,6 +12,16 @@
     <template #body-cell-name="p">
       <q-td :props="p">
         <div>{{ p.row.item_name || t('mrp.placeholder.itemNameFallback', { id: p.row.item_id }) }}</div>
+        <q-badge
+          v-if="p.row.badge"
+          color="orange"
+          text-color="black"
+          outline
+          size="sm"
+          class="q-mt-xs"
+        >
+          {{ p.row.badge }}
+        </q-badge>
       </q-td>
     </template>
 
@@ -38,6 +48,9 @@ type PurchAggRow = {
   unit?: string | null
   qty: number
   agg_key?: string
+  badge?: string | null
+  turning_blank_priority?: boolean
+  late_supplier_order?: boolean
 }
 
 const props = defineProps<{

@@ -146,6 +146,50 @@ def test_optimal_batch_wins_over_buffer():
     assert len(warnings) == 0
 
 
+def test_optimal_batch_rounds_buffer_to_optimal_multiple():
+    snapshot = {
+        "production": {"lot_sizing": {"min_batch": 1, "multiple": 1, "rounding": "ceil"}},
+    }
+    oqc = OrderQuantityCalculator(
+        snapshot=snapshot,
+        default_spec_map={},
+        spec_by_id={},
+        components_loader=lambda _spec_id: [],
+        item_by_id={1: make_item(optimal_batch=50.0, stock_qty=0.0)},
+        stock_by_item={},
+        wip_by_item={},
+        horizon_days=30,
+        total_demand_by_item={1: 500.0},
+    )
+
+    assert oqc._normalize_qty_for_production(10.0, oqc.item_by_id[1], 120.0) == 150.0
+
+
+def test_optimal_batch_used_when_horizon_can_absorb_it():
+    snapshot = {
+        "production": {"lot_sizing": {"min_batch": 1, "multiple": 1, "rounding": "ceil"}},
+    }
+    item_id = 1
+    oqc = OrderQuantityCalculator(
+        snapshot=snapshot,
+        default_spec_map={},
+        spec_by_id={},
+        components_loader=lambda _spec_id: [],
+        item_by_id={item_id: make_item(optimal_batch=50.0, stock_qty=0.0)},
+        stock_by_item={},
+        wip_by_item={},
+        horizon_days=30,
+        total_demand_by_item={item_id: 50.0},
+    )
+
+    final_qty, normalized, details, warnings = oqc.compute(item_id, 10.0)
+
+    assert final_qty == 10.0
+    assert normalized == 50.0
+    assert details["horizon_limit"] == 50.0
+    assert warnings == []
+
+
 def test_component_shortage_warning_and_limit():
     """
     If a component is limiting, final_qty is reduced and COMPONENT_SHORTAGE is emitted.

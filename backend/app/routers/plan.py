@@ -959,6 +959,7 @@ async def export_planning_result_production(
             "Дата начала",
             "Дата окончания",
             "ЕИ",
+            "Пометка",
         ]
         data_rows = []
         for r in rows:
@@ -978,6 +979,7 @@ async def export_planning_result_production(
                     r.get("start_date") or "",
                     r.get("finish_date") or "",
                     r.get("unit") or "",
+                    r.get("badge") or "",
                 ]
             )
 
@@ -1069,6 +1071,7 @@ async def export_planning_result_production(
                             "",  # Дата начала
                             "",  # Дата окончания
                             o.get("unit") or "",
+                            o.get("badge") or "",
                         ]
                         ws.append(row_values)
                         update_widths(row_values)
@@ -1151,7 +1154,7 @@ async def export_planning_result_purchases(
         )
         rows = res.get("rows", []) or []
 
-        headers = ["Наименование", "Артикул", "Количество", "ЕИ"]
+        headers = ["Наименование", "Артикул", "Количество", "ЕИ", "Пометка"]
         data_rows = []
         for r in rows:
             data_rows.append([
@@ -1159,6 +1162,7 @@ async def export_planning_result_purchases(
                 r.get("item_article") or "",
                 float(r.get("qty") or 0.0),
                 r.get("unit") or "",
+                r.get("badge") or "",
             ])
 
         if (format or "csv").lower() == "xlsx":

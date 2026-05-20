@@ -79,6 +79,18 @@ class ItemCategory(Base):
     items = relationship("Item", back_populates="category")
 
 
+class StockWarehouse(Base):
+    __tablename__ = "stock_warehouses"
+
+    warehouse_id = Column(Integer, primary_key=True, index=True)
+    warehouse_ref1c = Column(String(36), unique=True, nullable=False, index=True)
+    warehouse_code = Column(String(50), nullable=True, index=True)
+    warehouse_name = Column(String(255), nullable=False)
+    is_selected = Column(Boolean, nullable=False, default=True)
+    created_at = Column(TIMESTAMP, default=func.now())
+    updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
+
+
 class Unit(Base):
     __tablename__ = "units"
 
@@ -231,6 +243,9 @@ class SupplierOrder(Base):
     supplier_id = Column(Integer, ForeignKey('suppliers.supplier_id'), nullable=True)
     document_amount = Column(DECIMAL(10, 2), default=0.0)
     is_posted = Column(Boolean, default=False)
+    order_state_key = Column(String(36), nullable=True, index=True)
+    order_state_name = Column(String(255), nullable=True)
+    deletion_mark = Column(Boolean, default=False, nullable=False, index=True)
     created_at = Column(TIMESTAMP, default=func.now())
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
 
@@ -251,7 +266,11 @@ class SupplierOrderItem(Base):
     item_id = Column(Integer, primary_key=True, index=True)
     order_id = Column(Integer, ForeignKey('supplier_orders.order_id'), nullable=False)
     item_id_ref = Column(Integer, ForeignKey('items.item_id'), nullable=False)
+    line_number = Column(Integer, nullable=True, index=True)
+    characteristic_ref1c = Column(String(36), nullable=True)
     quantity = Column(DECIMAL(10, 3), nullable=False)
+    received_qty = Column(DECIMAL(10, 3), default=0.0, nullable=False)
+    remaining_qty = Column(DECIMAL(10, 3), nullable=False)
     price = Column(DECIMAL(10, 2), default=0.0)
     amount = Column(DECIMAL(10, 2), default=0.0)
     delivery_date = Column(DateTime, nullable=True)

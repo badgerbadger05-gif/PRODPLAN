@@ -36,6 +36,8 @@ from ..models import (
     Specification,
     ProductionOrder,
     ProductionProduct,
+    SupplierOrder,
+    SupplierOrderItem,
     ItemCategory,
 )
 from ..models import RootProduct
@@ -80,6 +82,7 @@ DEFAULT_PAGE_LIMIT = 50
 
 # 1C state key for completed production orders.
 DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
+SUPPLIER_ORDER_EXCLUDED_STATE_NAMES = {"новый заказ", "отменен", "завершен", "завершен успешно", "бухгалтерия"}
 
 
 def _ensure_dict(raw: Any) -> Dict[str, Any]:
@@ -120,6 +123,34 @@ def _ensure_dict(raw: Any) -> Dict[str, Any]:
     except Exception:
         pass
     return {}
+
+
+def _load_turning_blank_priority_map(db: Session, run_id: int) -> Dict[Tuple[int, str], Dict[str, Any]]:
+    try:
+        run = db.query(PlanningRun).filter(PlanningRun.run_id == int(run_id)).first()
+        warnings = list(getattr(run, "warnings", None) or []) if run else []
+    except Exception:
+        warnings = []
+    result: Dict[Tuple[int, str], Dict[str, Any]] = {}
+    for warning in warnings:
+        if not isinstance(warning, dict) or warning.get("code") != "TURNING_BLANK_PRIORITY":
+            continue
+        try:
+            item_id = int(warning.get("item_id"))
+            need_date = str(warning.get("need_date") or "")
+        except Exception:
+            continue
+        if not need_date:
+            continue
+        result[(item_id, need_date)] = warning
+    return result
+
+
+def _turning_blank_badge(priority_map: Dict[Tuple[int, str], Dict[str, Any]], item_id: int, need_date: Any) -> Optional[str]:
+    date_key = need_date.isoformat() if isinstance(need_date, (datetime, date)) else str(need_date or "")
+    if (int(item_id), date_key) in priority_map:
+        return "Заготовка под токарный участок"
+    return None
 
 
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
@@ -490,6 +521,7 @@ def get_run_production(
 
     aggregated_data: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
     order_ids: List[int] = []
+    turning_blank_priority = _load_turning_blank_priority_map(db, run_id)
     
     for row in filtered_rows:
         po, in_name, in_article, in_unit_guid, in_unit_short, in_unit_name, in_unit_code = row
@@ -502,6 +534,7 @@ def get_run_production(
             start_iso = fin_dt
         unit_display = (in_unit_short or in_unit_name or in_unit_code or in_unit_guid or "").strip()
         agg_key = (int(po.item_id), start_iso, unit_display)
+        badge = _turning_blank_badge(turning_blank_priority, int(po.item_id), po.need_date)
         
         if agg_key not in aggregated_data:
             aggregated_data[agg_key] = {
@@ -519,6 +552,8 @@ def get_run_production(
                 "bucket_date": po.bucket_date.isoformat() if po.bucket_date else None,
                 "demand_ref": po.demand_ref,
                 "demand_date": po.demand_date.isoformat() if po.demand_date else None,
+                "badge": badge,
+                "turning_blank_priority": bool(badge),
                 "stages": [],
                 "norm_hours_total": 0.0,
                 "norm_hours_per_unit": None,
@@ -595,6 +630,7 @@ def get_run_production(
         agg_key = (int(po.item_id), start_iso, unit_display)
 
         order_stages = stage_by_order.get(int(po.order_id), [])
+        badge = _turning_blank_badge(turning_blank_priority, int(po.item_id), po.need_date)
         if agg_key not in aggregated_data:
             aggregated_data[agg_key] = {
                 "item_id": int(po.item_id),
@@ -611,6 +647,8 @@ def get_run_production(
                 "bucket_date": po.bucket_date.isoformat() if po.bucket_date else None,
                 "demand_ref": po.demand_ref,
                 "demand_date": po.demand_date.isoformat() if po.demand_date else None,
+                "badge": badge,
+                "turning_blank_priority": bool(badge),
                 "stages": [],
                 "norm_hours_total": 0.0,
                 "norm_hours_per_unit": None,
@@ -1031,6 +1069,11 @@ def get_run_purchases(
             )
  
     aggregated_data: Dict[Tuple[int, str], Dict[str, Any]] = {}
+    turning_blank_priority = _load_turning_blank_priority_map(db, run_id)
+    late_supplier_rows = _load_late_supplier_order_coverage(
+        db,
+        [int(row[1]) for row in filtered_rows if row[1] is not None],
+    )
     
     for row in filtered_rows:
         (
@@ -1070,6 +1113,14 @@ def get_run_purchases(
         
         unit_display = (in_unit_short or in_unit_name or in_unit_code or in_unit_guid or "").strip()
         agg_key = (int(item_id_val), unit_display)
+        turning_badge = _turning_blank_badge(turning_blank_priority, int(item_id_val), need_date_val)
+        late_supplier_badge = _late_supplier_order_badge(
+            late_supplier_rows,
+            int(item_id_val),
+            need_date_val,
+            qty_val,
+        )
+        badge = _merge_badges(turning_badge, late_supplier_badge)
         
         if agg_key not in aggregated_data:
             aggregated_data[agg_key] = {
@@ -1085,7 +1136,18 @@ def get_run_purchases(
                 "bucket_type": "daily",
                 "bucket_date": bucket_date_val.isoformat() if bucket_date_val else None,
                 "supplier_ref1c": supplier_ref1c_val,
+                "badge": badge,
+                "turning_blank_priority": bool(turning_badge),
+                "late_supplier_order": bool(late_supplier_badge),
             }
+        elif badge:
+            aggregated_data[agg_key]["badge"] = _merge_badges(aggregated_data[agg_key].get("badge"), badge)
+            aggregated_data[agg_key]["turning_blank_priority"] = bool(
+                aggregated_data[agg_key].get("turning_blank_priority") or turning_badge
+            )
+            aggregated_data[agg_key]["late_supplier_order"] = bool(
+                aggregated_data[agg_key].get("late_supplier_order") or late_supplier_badge
+            )
         
         aggregated_data[agg_key]["qty"] += float(qty_val or 0.0)
 
@@ -1671,6 +1733,7 @@ def get_run_production_grouped(
     # 5) Построить группы по основному участку для каждого заказа
     groups_map: Dict[Optional[int], Dict[str, Any]] = {}
     today_d = date.today()
+    turning_blank_priority = _load_turning_blank_priority_map(db, run_id)
 
     def _unit_display(_guid: Optional[str], _short: Optional[str], _name: Optional[str], _code: Optional[str]) -> str:
         return ( (_short or "") or (_name or "") or (_code or "") or (_guid or "") ).strip()
@@ -1712,6 +1775,7 @@ def get_run_production_grouped(
         unit_display = _unit_display(in_unit_guid, in_unit_short, in_unit_name, in_unit_code)
         qty_f = float(po.qty or 0.0)
         norm_per_unit = float(norm_total / qty_f) if qty_f > 1e-12 and norm_total > 0 else None
+        badge = _turning_blank_badge(turning_blank_priority, int(po.item_id), po.need_date)
 
         order_entry = {
             "agg_key": f"{int(po.item_id)}|{unit_display}",
@@ -1723,6 +1787,8 @@ def get_run_production_grouped(
             "norm_hours_total": float(norm_total),
             "norm_hours_per_unit": norm_per_unit,
             "order_id": int(po.order_id),
+            "badge": badge,
+            "turning_blank_priority": bool(badge),
         }
 
         grp = groups_map[main_area_id]
@@ -1938,6 +2004,170 @@ def _get_active_1c_remaining_by_item(db: Session) -> Dict[int, float]:
         except Exception:
             continue
     return result
+
+
+def _normalize_supplier_order_state_name(value: Any) -> str:
+    return str(value or "").strip().casefold().replace("ё", "е")
+
+
+def _get_active_supplier_remaining_by_item_date(db: Session) -> Dict[int, List[Tuple[date, float]]]:
+    """
+    Aggregate open supplier-order quantities by item and expected delivery date.
+
+    Business rule:
+    - deleted orders are ignored;
+    - states "Новый заказ", "Отменен" and "Завершен" are ignored;
+    - any other state is treated as already ordered;
+    - rows without delivery date are skipped for automatic date-sensitive coverage.
+    """
+    try:
+        rows = (
+            db.query(
+                SupplierOrderItem.item_id_ref,
+                SupplierOrderItem.delivery_date,
+                SupplierOrder.order_state_key,
+                SupplierOrder.order_state_name,
+                SupplierOrderItem.remaining_qty,
+            )
+            .join(SupplierOrder, SupplierOrder.order_id == SupplierOrderItem.order_id)
+            .filter(SupplierOrder.deletion_mark.is_(False))
+            .filter(SupplierOrderItem.delivery_date.isnot(None))
+            .filter(func.coalesce(SupplierOrderItem.remaining_qty, 0.0) > 0)
+            .order_by(SupplierOrderItem.delivery_date.asc())
+            .all()
+        )
+    except Exception:
+        rows = []
+
+    result: Dict[int, List[Tuple[date, float]]] = defaultdict(list)
+    for iid, delivery_dt, state_key, state_name, qty in rows:
+        try:
+            normalized_state = _normalize_supplier_order_state_name(state_name)
+            if not normalized_state and not str(state_key or "").strip():
+                continue
+            if normalized_state in SUPPLIER_ORDER_EXCLUDED_STATE_NAMES:
+                continue
+            item_id = int(iid)
+            delivery_date = delivery_dt.date() if isinstance(delivery_dt, datetime) else delivery_dt
+            if not isinstance(delivery_date, date):
+                delivery_date = _to_date(str(delivery_dt))
+            remaining_qty = float(qty or 0.0)
+        except Exception:
+            continue
+        if remaining_qty <= 1e-12:
+            continue
+        result[item_id].append((delivery_date, remaining_qty))
+    return dict(result)
+
+
+def _load_late_supplier_order_coverage(db: Session, item_ids: List[int]) -> Dict[int, List[Dict[str, Any]]]:
+    """
+    Load active supplier orders that can cover demand, but arrive after the need date.
+    This is diagnostic only: late orders do not reduce MRP purchase quantity.
+    """
+    ids = sorted({int(iid) for iid in item_ids if iid is not None})
+    if not ids:
+        return {}
+
+    try:
+        rows = (
+            db.query(
+                SupplierOrderItem.item_id_ref,
+                SupplierOrderItem.delivery_date,
+                SupplierOrderItem.remaining_qty,
+                SupplierOrder.order_number,
+                SupplierOrder.order_state_key,
+                SupplierOrder.order_state_name,
+            )
+            .join(SupplierOrder, SupplierOrder.order_id == SupplierOrderItem.order_id)
+            .filter(SupplierOrderItem.item_id_ref.in_(ids))
+            .filter(SupplierOrder.deletion_mark.is_(False))
+            .filter(SupplierOrderItem.delivery_date.isnot(None))
+            .filter(func.coalesce(SupplierOrderItem.remaining_qty, 0.0) > 0)
+            .order_by(SupplierOrderItem.delivery_date.asc(), SupplierOrder.order_number.asc())
+            .all()
+        )
+    except Exception:
+        rows = []
+
+    result: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for iid, delivery_dt, qty, order_number, state_key, state_name in rows:
+        try:
+            normalized_state = _normalize_supplier_order_state_name(state_name)
+            if not normalized_state and not str(state_key or "").strip():
+                continue
+            if normalized_state in SUPPLIER_ORDER_EXCLUDED_STATE_NAMES:
+                continue
+            item_id = int(iid)
+            delivery_date = delivery_dt.date() if isinstance(delivery_dt, datetime) else delivery_dt
+            if not isinstance(delivery_date, date):
+                delivery_date = _to_date(str(delivery_dt))
+            remaining_qty = float(qty or 0.0)
+        except Exception:
+            continue
+        if remaining_qty <= 1e-12:
+            continue
+        result[item_id].append(
+            {
+                "delivery_date": delivery_date,
+                "remaining_qty": remaining_qty,
+                "order_number": str(order_number or "").strip(),
+            }
+        )
+    return dict(result)
+
+
+def _late_supplier_order_badge(
+    late_supplier_rows: Dict[int, List[Dict[str, Any]]],
+    item_id: int,
+    need_date: Any,
+    qty: Any,
+) -> Optional[str]:
+    if not need_date:
+        return None
+    try:
+        need_dt = need_date.date() if isinstance(need_date, datetime) else need_date
+        if not isinstance(need_dt, date):
+            need_dt = _to_date(str(need_date))
+        required_qty = float(qty or 0.0)
+    except Exception:
+        return None
+    if required_qty <= 1e-12:
+        return None
+
+    total_late = 0.0
+    first_delivery: Optional[date] = None
+    order_numbers: List[str] = []
+    for row in late_supplier_rows.get(int(item_id), []) or []:
+        delivery_date = row.get("delivery_date")
+        if not isinstance(delivery_date, date) or delivery_date <= need_dt:
+            continue
+        if first_delivery is None:
+            first_delivery = delivery_date
+        total_late += float(row.get("remaining_qty", 0.0) or 0.0)
+        order_number = str(row.get("order_number") or "").strip()
+        if order_number and order_number not in order_numbers:
+            order_numbers.append(order_number)
+        if total_late + 1e-9 >= required_qty:
+            break
+
+    if first_delivery is None or total_late <= 1e-12:
+        return None
+
+    delay_days = max(0, int((first_delivery - need_dt).days))
+    order_suffix = f" ({', '.join(order_numbers[:2])})" if order_numbers else ""
+    if total_late + 1e-9 >= required_qty:
+        return f"Покрыто заказом, но опоздание {delay_days} дн.{order_suffix}"
+    return f"Частично покрыто заказом, но опоздание {delay_days} дн.{order_suffix}"
+
+
+def _merge_badges(*badges: Optional[str]) -> Optional[str]:
+    parts: List[str] = []
+    for badge in badges:
+        text = str(badge or "").strip()
+        if text and text not in parts:
+            parts.append(text)
+    return "; ".join(parts) if parts else None
 
 
 def _build_component_reservations_from_active_1c(
@@ -2331,6 +2561,67 @@ def compute_planning_preview(
         components_cache[int(spec_id)] = comps
         return comps
 
+    stage_ids: Set[int] = set()
+    try:
+        for comp in db.query(SpecComponent.stage_id).filter(SpecComponent.stage_id.isnot(None)).all():
+            try:
+                stage_ids.add(int(comp[0] if isinstance(comp, (tuple, list)) else comp.stage_id))
+            except Exception:
+                continue
+    except Exception:
+        stage_ids = set()
+    stage_name_by_id: Dict[int, str] = {}
+    if stage_ids:
+        try:
+            for st in db.query(ProductionStage).filter(ProductionStage.stage_id.in_(list(stage_ids))).all():
+                stage_name_by_id[int(st.stage_id)] = str(st.stage_name or "")
+        except Exception:
+            stage_name_by_id = {}
+
+    kind_names: Dict[int, str] = {}
+    if kind_ids:
+        try:
+            for kind in db.query(ProductionKind).filter(ProductionKind.id.in_(list(kind_ids))).all():
+                kind_names[int(kind.id)] = str(kind.name or "")
+        except Exception:
+            kind_names = {}
+
+    turning_item_cache: Dict[int, bool] = {}
+
+    def is_turning_item(item_id: int) -> bool:
+        item_key = int(item_id)
+        if item_key in turning_item_cache:
+            return turning_item_cache[item_key]
+        result = False
+        spec_id = default_spec_map.get(item_key)
+        spec = spec_by_id.get(int(spec_id)) if spec_id else None
+        kind_id = int(spec.production_kind_id) if spec and getattr(spec, "production_kind_id", None) else None
+        if kind_id is not None:
+            kind_name = str(kind_names.get(kind_id, "") or "").strip().casefold()
+            if "токар" in kind_name:
+                result = True
+            if not result:
+                for rk in resource_kind_cache.get(kind_id, []):
+                    res = res_by_id.get(int(rk.resource_id))
+                    res_name = str(getattr(res, "resource_name", "") or "").strip().casefold() if res else ""
+                    if "токар" in res_name:
+                        result = True
+                        break
+        turning_item_cache[item_key] = result
+        return result
+
+    def select_turning_blank_components(comps: List[SpecComponent]) -> List[SpecComponent]:
+        staged = []
+        for comp in comps or []:
+            try:
+                stage_id = getattr(comp, "stage_id", None)
+                stage_name = stage_name_by_id.get(int(stage_id), "") if stage_id is not None else ""
+            except Exception:
+                stage_name = ""
+            if "заготов" in str(stage_name or "").casefold():
+                staged.append(comp)
+        return staged or list(comps or [])
+
     buffer_days_cache: Dict[int, int] = {}
 
     def resolve_buffer_days(item_id: int) -> int:
@@ -2400,6 +2691,7 @@ def compute_planning_preview(
     # --- Multi-level net-first explosion ---
     gross_map: DefaultDict[int, DefaultDict[date, float]] = defaultdict(lambda: defaultdict(float))
     net_map: DefaultDict[int, DefaultDict[date, float]] = defaultdict(lambda: defaultdict(float))
+    warnings: List[Dict[str, Any]] = []
 
     for depth in range(max(1, max_bom_depth)):
         if not demand_map:
@@ -2429,20 +2721,31 @@ def compute_planning_preview(
                     continue
                 net_q = q - avail
                 avail = 0.0
-                net_map[int(iid)][bucket_date] += net_q
                 net_buckets.append((bucket_date, net_q))
 
             available_by_item[int(iid)] = avail
 
-            # explode only residual/net demand
             if not net_buckets:
                 continue
+
+            turning_parent = is_turning_item(int(iid))
+            if turning_parent and len(net_buckets) > 1:
+                first_date = min(bucket_date for bucket_date, _ in net_buckets)
+                total_net_qty = sum(float(q or 0.0) for _, q in net_buckets)
+                net_buckets = [(first_date, total_net_qty)]
+
+            for bucket_date, net_q in net_buckets:
+                net_map[int(iid)][bucket_date] += float(net_q or 0.0)
+
+            # explode only residual/net demand
             spec_id = default_spec_map.get(int(iid))
             if not spec_id:
                 continue
             comps = get_components_for_spec(int(spec_id))
             if not comps:
                 continue
+            priority_blank_comps = select_turning_blank_components(comps) if turning_parent else []
+            priority_blank_ids = {int(getattr(comp, "item_id")) for comp in priority_blank_comps if getattr(comp, "item_id", None) is not None}
 
             for bucket_date, net_q in net_buckets:
                 for comp in comps:
@@ -2456,12 +2759,26 @@ def compute_planning_preview(
                     child_qty = float(net_q) * float(per_unit)
                     if child_qty <= 1e-9:
                         continue
-                    # buffer shift (component timing)
-                    buf = resolve_buffer_days(int(child_id))
                     child_date = bucket_date
-                    if buf > 0:
-                        child_date = clamp_to_horizon(bucket_date - timedelta(days=int(buf)))
+                    is_priority_blank = turning_parent and child_id in priority_blank_ids
+                    if not is_priority_blank:
+                        # Regular components keep their own buffer; turning blanks start with the turning order.
+                        buf = resolve_buffer_days(int(child_id))
+                        if buf > 0:
+                            child_date = clamp_to_horizon(bucket_date - timedelta(days=int(buf)))
                     next_demand[int(child_id)][child_date] += child_qty
+                    if is_priority_blank:
+                        warnings.append(
+                            make_warning(
+                                "TURNING_BLANK_PRIORITY",
+                                "Заготовка под токарный участок",
+                                item_id=int(child_id),
+                                parent_item_id=int(iid),
+                                qty=float(child_qty),
+                                need_date=child_date.isoformat(),
+                                parent_need_date=bucket_date.isoformat(),
+                            )
+                        )
 
         demand_map = next_demand
 
@@ -2494,6 +2811,7 @@ def compute_planning_preview(
             "items": int(len(gross_ser)),
             "buckets": int(sum(len(v) for v in gross_ser.values())),
         },
+        "warnings": warnings,
     }
 
 # --- Main Planning Run ---
@@ -2507,6 +2825,7 @@ def build_planned_orders_and_purchases(
     item_cache: Dict[int, Item],
     units_by_ref: Dict[str, Unit],
     active_remaining_by_item: Optional[Dict[int, float]] = None,
+    supplier_remaining_by_item_date: Optional[Dict[int, List[Tuple[date, float]]]] = None,
 ) -> Dict[str, Any]:
     
     run_id = run.run_id
@@ -2516,6 +2835,15 @@ def build_planned_orders_and_purchases(
     created_purchases = []
     created_reworks = []
     active_remaining_by_item = active_remaining_by_item or {}
+    supplier_remaining_by_item_date = supplier_remaining_by_item_date or {}
+    supplier_remaining_work: Dict[int, List[Dict[str, Any]]] = {
+        int(iid): [
+            {"delivery_date": delivery_date, "remaining_qty": float(qty or 0.0)}
+            for delivery_date, qty in sorted(rows, key=lambda x: x[0])
+            if float(qty or 0.0) > 1e-12
+        ]
+        for iid, rows in supplier_remaining_by_item_date.items()
+    }
 
     all_reqs = []
     for item_id_str, buckets in net_requirements.items():
@@ -2527,6 +2855,74 @@ def build_planned_orders_and_purchases(
                     "qty": float(qty),
                 }
             )
+
+    def consume_component_stock(parent_item_id: int, planned_parent_qty: float) -> None:
+        """
+        Consume direct BOM components from the calculator stock cache.
+        This keeps component gating cumulative across chronological buckets
+        within the same run.
+        """
+        try:
+            parent_qty = float(planned_parent_qty or 0.0)
+        except Exception:
+            parent_qty = 0.0
+        if parent_qty <= 1e-9:
+            return
+
+        try:
+            spec_id = getattr(order_qty_calculator, "default_spec_map", {}).get(int(parent_item_id))
+        except Exception:
+            spec_id = None
+        if not spec_id:
+            return
+
+        try:
+            comps = order_qty_calculator.components_loader(int(spec_id)) or []
+        except Exception:
+            return
+
+        for comp in comps:
+            try:
+                child_id = int(getattr(comp, "item_id"))
+                per_unit = float(getattr(comp, "quantity", 0.0) or 0.0)
+            except Exception:
+                continue
+            if per_unit <= 1e-12:
+                continue
+
+            consume_qty = parent_qty * per_unit
+            if consume_qty <= 1e-12:
+                continue
+
+            base_stock = float(getattr(order_qty_calculator, "stock_by_item", {}).get(child_id, 0.0) or 0.0)
+            order_qty_calculator.stock_by_item[child_id] = max(base_stock - consume_qty, 0.0)
+
+    def consume_supplier_order_coverage(item_id: int, need_date: date, requested_qty: float) -> float:
+        """
+        Consume already placed supplier orders that arrive no later than need_date.
+        The local mutation prevents one supplier-order row from covering several MRP buckets twice.
+        """
+        remaining_need = float(requested_qty or 0.0)
+        if remaining_need <= 1e-12:
+            return 0.0
+        rows = supplier_remaining_work.get(int(item_id), [])
+        if not rows:
+            return remaining_need
+
+        for row in rows:
+            if remaining_need <= 1e-12:
+                break
+            delivery_date = row.get("delivery_date")
+            if delivery_date is None or delivery_date > need_date:
+                continue
+            available_qty = float(row.get("remaining_qty", 0.0) or 0.0)
+            if available_qty <= 1e-12:
+                continue
+            used_qty = min(available_qty, remaining_need)
+            row["remaining_qty"] = max(available_qty - used_qty, 0.0)
+            remaining_need = max(remaining_need - used_qty, 0.0)
+
+        return remaining_need
 
     for req in sorted(all_reqs, key=lambda x: x["need_date"]):
         item_id = req["item_id"]
@@ -2564,6 +2960,7 @@ def build_planned_orders_and_purchases(
 
             horizon_limit = float(comp_details.get("horizon_limit", float(requested_qty)))
             component_limit = float(comp_details.get("component_limit", float(requested_qty)))
+            desired_qty = min(float(normalized_qty or 0.0), horizon_limit)
 
             # Requested quantity is normalized via shared calculator helper.
             requested_qty = float(order_qty_calculator.normalize_qty_for_item(item_id, final_qty_before))
@@ -2584,9 +2981,9 @@ def build_planned_orders_and_purchases(
                 # Skip creation entirely (no qty=0 rows)
                 continue
 
-            # - If 0 < component_limit < requested_qty -> plan partial by components within horizon
-            if component_limit + 1e-9 < float(requested_qty):
-                planned_qty = min(component_limit, horizon_limit)
+            # - If components cannot cover the horizon-capped lot-sized order, plan partial.
+            if component_limit + 1e-9 < float(desired_qty):
+                planned_qty = min(component_limit, desired_qty)
                 warnings.append(
                     make_warning(
                         "COMPONENT_SHORTAGE_PARTIAL",
@@ -2595,11 +2992,12 @@ def build_planned_orders_and_purchases(
                         requested_qty=float(requested_qty),
                         planned_qty=float(planned_qty),
                         component_limit=float(component_limit),
+                        desired_qty=float(desired_qty),
                     )
                 )
             else:
-                # Otherwise, use normalized lot sizing but never exceed horizon/component constraints
-                planned_qty = min(float(normalized_qty or 0.0), horizon_limit, component_limit)
+                # Otherwise, use lot sizing capped only by horizon demand and components.
+                planned_qty = min(desired_qty, component_limit)
 
             planned_qty = float(planned_qty or 0.0)
 
@@ -2620,10 +3018,15 @@ def build_planned_orders_and_purchases(
                 bucket_date=need_date,
             )
             created_orders.append(order)
+            consume_component_stock(parent_item_id=int(item_id), planned_parent_qty=float(planned_qty))
         elif is_purchase:
             lead_time = item.replenishment_time or 30
             order_date = need_date - timedelta(days=lead_time)
-            # A) does not apply to purchase flow.
+            requested_qty_raw = consume_supplier_order_coverage(
+                item_id=int(item_id),
+                need_date=need_date,
+                requested_qty=float(requested_qty_raw),
+            )
             # Purchase flow now uses the same shared quantity normalization layer
             # as production for the final business quantity:
             # - discrete units -> fractional part is removed
@@ -2654,6 +3057,7 @@ def build_planned_orders_and_purchases(
 
             horizon_limit = float(comp_details.get("horizon_limit", float(requested_qty)))
             component_limit = float(comp_details.get("component_limit", float(requested_qty)))
+            desired_qty = min(float(normalized_qty or 0.0), horizon_limit)
             requested_qty = float(order_qty_calculator.normalize_qty_for_item(item_id, final_qty_before))
 
             spec_id = getattr(order_qty_calculator, "default_spec_map", {}).get(int(item_id))
@@ -2665,7 +3069,7 @@ def build_planned_orders_and_purchases(
             }
 
             component_blocked = component_limit <= 1e-9
-            component_partial = (component_limit > 1e-9) and (component_limit + 1e-9 < float(requested_qty))
+            component_partial = (component_limit > 1e-9) and (component_limit + 1e-9 < float(desired_qty))
 
             if component_blocked:
                 warnings.append(
@@ -2681,7 +3085,7 @@ def build_planned_orders_and_purchases(
                 )
                 planned_qty = 0.0
             elif component_partial:
-                planned_qty = min(component_limit, horizon_limit)
+                planned_qty = min(component_limit, desired_qty)
                 warnings.append(
                     make_warning(
                         "REWORK_COMPONENT_SHORTAGE_PARTIAL",
@@ -2691,12 +3095,13 @@ def build_planned_orders_and_purchases(
                         requested_qty=float(requested_qty),
                         planned_qty=float(planned_qty),
                         component_limit=float(component_limit),
+                        desired_qty=float(desired_qty),
                         need_date=need_date.isoformat(),
                         spec_id=int(spec_id) if spec_id is not None else None,
                     )
                 )
             else:
-                planned_qty = min(float(normalized_qty or 0.0), horizon_limit, component_limit)
+                planned_qty = min(desired_qty, component_limit)
 
             planned_qty = float(order_qty_calculator.normalize_qty_for_item(item_id, float(planned_qty or 0.0)))
             shortage_payload["planned_qty"] = float(planned_qty)
@@ -2718,6 +3123,7 @@ def build_planned_orders_and_purchases(
                 shortage=shortage_payload,
             )
             created_reworks.append(rework)
+            consume_component_stock(parent_item_id=int(item_id), planned_parent_qty=float(planned_qty))
 
     db.add_all(created_orders)
     db.add_all(created_purchases)
@@ -3008,6 +3414,7 @@ def run_planning_run(
 
         # A) Active 1C orders as already planned finished output.
         active_remaining_by_item = _get_active_1c_remaining_by_item(db)
+        supplier_remaining_by_item_date = _get_active_supplier_remaining_by_item_date(db)
 
         # B) Active 1C orders reserve components recursively across full BOM depth.
         limits_cfg = (run.config_snapshot or {}).get("planning", {}).get("limits", {})
@@ -3148,6 +3555,7 @@ def run_planning_run(
         op_cache = {o.operation_id: o for o in all_ops}
         
         all_warnings = []
+        all_warnings.extend(net_req_result.get("warnings", []) or [])
         all_warnings.extend(reserve_warnings)
 
         # --- PHASE 1: Build Orders and Purchases ---
@@ -3160,6 +3568,7 @@ def run_planning_run(
             item_cache,
             units_by_ref,
             active_remaining_by_item=active_remaining_by_item,
+            supplier_remaining_by_item_date=supplier_remaining_by_item_date,
         )
         all_warnings.extend(order_result["warnings"])
         db.flush()

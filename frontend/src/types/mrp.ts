@@ -125,6 +125,8 @@ export interface ProductionOrder {
   // Основной участок для строки заказа (по этапу с максимумом часов)
   main_area_id?: number | null
   main_area_name?: string | null
+  badge?: string | null
+  turning_blank_priority?: boolean
   // Флаги для отрисовки плашек/индикаторов
   flags?: ProductionFlags
 }
@@ -142,6 +144,8 @@ export interface ProductionGroupOrder {
   display_qty?: number
   display_norm_hours_total?: number
   overload?: boolean
+  badge?: string | null
+  turning_blank_priority?: boolean
 }
 
 export interface ProductionGroup {
@@ -181,6 +185,9 @@ export interface PurchaseRow {
   // денормализованные поля для UI
   item_name?: string | null
   item_article?: string | null
+  badge?: string | null
+  turning_blank_priority?: boolean
+  late_supplier_order?: boolean
 }
 
 export interface PurchaseGroupedRow {
@@ -190,6 +197,9 @@ export interface PurchaseGroupedRow {
   item_article?: string | null
   unit?: string | null
   qty: number
+  badge?: string | null
+  turning_blank_priority?: boolean
+  late_supplier_order?: boolean
 }
 
 export interface PurchaseCategoryGroupOrder {
@@ -206,6 +216,9 @@ export interface PurchaseCategoryGroupOrder {
   bucket_date?: IsoDate | null
   priority_index?: number | null
   supplier_ref1c?: string | null
+  badge?: string | null
+  turning_blank_priority?: boolean
+  late_supplier_order?: boolean
 }
 
 export interface PurchaseCategoryGroup {
