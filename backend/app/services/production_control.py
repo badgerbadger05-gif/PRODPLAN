@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
     DefaultSpecification,
+    IgnoredWarehouse,
     Item,
     Operation,
     PlannedOrder,
@@ -27,6 +28,7 @@ from ..models import (
     SupplierOrder,
     SupplierOrderItem,
     Unit,
+    WorkshopWarehouseBinding,
 )
 from ..schemas import ODataSyncRequest
 from .planning_service import (
@@ -849,12 +851,35 @@ def create_material_issues(
         if not components:
             errors.append(f"product_id={pid}: не найдена спецификация или материалы")
             continue
+
+        # If the caller did not pin a destination warehouse, fall back to the
+        # workshop->warehouse binding from settings. Plan rule:
+        # "привязка участок -> склад получатель".
+        resolved_warehouse = warehouse_ref1c
+        if not resolved_warehouse:
+            state_obj = (
+                db.query(ProductionOrderLineState)
+                .filter(ProductionOrderLineState.product_id == int(product.product_id))
+                .first()
+            )
+            workshop_id_resolved: Optional[int] = (
+                int(state_obj.workshop_id) if state_obj and state_obj.workshop_id else None
+            )
+            if workshop_id_resolved:
+                binding = (
+                    db.query(WorkshopWarehouseBinding)
+                    .filter(WorkshopWarehouseBinding.workshop_id == workshop_id_resolved)
+                    .first()
+                )
+                if binding:
+                    resolved_warehouse = str(binding.warehouse_ref1c)
+
         issue = ProductionMaterialIssue(
             document_number=_next_issue_number(db),
             product_id=int(product.product_id),
             order_id=int(product.order_id),
             status="draft",
-            warehouse_ref1c=warehouse_ref1c,
+            warehouse_ref1c=resolved_warehouse,
             initiated_by=initiated_by,
         )
         db.add(issue)
@@ -1148,3 +1173,132 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int]) -> str:
   {''.join(sheets)}
 </body>
 </html>"""
+
+
+# ---------------------------------------------------------------------------
+# Warehouse settings (workshop -> warehouse bindings + ignored warehouses)
+# Plan: "В журнале есть окно настроек: привязка участок -> склад получатель;
+# список игнорируемых складов".
+# ---------------------------------------------------------------------------
+
+
+def _binding_payload(b: WorkshopWarehouseBinding) -> Dict[str, Any]:
+    name = None
+    try:
+        if b.workshop:
+            name = str(b.workshop.resource_name or "")
+    except Exception:
+        name = None
+    return {
+        "binding_id": int(b.binding_id),
+        "workshop_id": int(b.workshop_id),
+        "workshop_name": name,
+        "warehouse_ref1c": str(b.warehouse_ref1c or ""),
+    }
+
+
+def _ignored_payload(row: IgnoredWarehouse) -> Dict[str, Any]:
+    return {
+        "warehouse_ref1c": str(row.warehouse_ref1c),
+        "warehouse_name": str(row.warehouse_name or "") if row.warehouse_name else None,
+        "reason": str(row.reason or "") if row.reason else None,
+    }
+
+
+def list_settings(db: Session) -> Dict[str, Any]:
+    bindings = (
+        db.query(WorkshopWarehouseBinding)
+        .options(joinedload(WorkshopWarehouseBinding.workshop))
+        .order_by(WorkshopWarehouseBinding.workshop_id.asc())
+        .all()
+    )
+    ignored = (
+        db.query(IgnoredWarehouse)
+        .order_by(IgnoredWarehouse.warehouse_ref1c.asc())
+        .all()
+    )
+    return {
+        "workshop_warehouse_bindings": [_binding_payload(b) for b in bindings],
+        "ignored_warehouses": [_ignored_payload(r) for r in ignored],
+    }
+
+
+def upsert_workshop_binding(db: Session, workshop_id: int, warehouse_ref1c: str) -> Dict[str, Any]:
+    workshop_id_int = int(workshop_id)
+    wh = str(warehouse_ref1c or "").strip()
+    if not wh:
+        raise ValueError("warehouse_ref1c is required")
+    # Verify workshop exists
+    workshop = db.query(ProductionResource).filter(ProductionResource.resource_id == workshop_id_int).first()
+    if not workshop:
+        raise ValueError(f"workshop_id={workshop_id_int}: участок не найден")
+    binding = (
+        db.query(WorkshopWarehouseBinding)
+        .filter(WorkshopWarehouseBinding.workshop_id == workshop_id_int)
+        .first()
+    )
+    if binding is None:
+        binding = WorkshopWarehouseBinding(workshop_id=workshop_id_int, warehouse_ref1c=wh)
+        db.add(binding)
+    else:
+        binding.warehouse_ref1c = wh
+    db.commit()
+    # Re-load with workshop for the response
+    binding = (
+        db.query(WorkshopWarehouseBinding)
+        .options(joinedload(WorkshopWarehouseBinding.workshop))
+        .filter(WorkshopWarehouseBinding.workshop_id == workshop_id_int)
+        .first()
+    )
+    return _binding_payload(binding)
+
+
+def delete_workshop_binding(db: Session, workshop_id: int) -> Dict[str, Any]:
+    workshop_id_int = int(workshop_id)
+    deleted = (
+        db.query(WorkshopWarehouseBinding)
+        .filter(WorkshopWarehouseBinding.workshop_id == workshop_id_int)
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+    return {"deleted": int(deleted), "workshop_id": workshop_id_int}
+
+
+def upsert_ignored_warehouse(
+    db: Session,
+    warehouse_ref1c: str,
+    *,
+    warehouse_name: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    wh = str(warehouse_ref1c or "").strip()
+    if not wh:
+        raise ValueError("warehouse_ref1c is required")
+    row = db.query(IgnoredWarehouse).filter(IgnoredWarehouse.warehouse_ref1c == wh).first()
+    if row is None:
+        row = IgnoredWarehouse(
+            warehouse_ref1c=wh,
+            warehouse_name=warehouse_name or None,
+            reason=reason or None,
+        )
+        db.add(row)
+    else:
+        if warehouse_name is not None:
+            row.warehouse_name = warehouse_name or None
+        if reason is not None:
+            row.reason = reason or None
+    db.commit()
+    return _ignored_payload(row)
+
+
+def delete_ignored_warehouse(db: Session, warehouse_ref1c: str) -> Dict[str, Any]:
+    wh = str(warehouse_ref1c or "").strip()
+    if not wh:
+        raise ValueError("warehouse_ref1c is required")
+    deleted = (
+        db.query(IgnoredWarehouse)
+        .filter(IgnoredWarehouse.warehouse_ref1c == wh)
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+    return {"deleted": int(deleted), "warehouse_ref1c": wh}

@@ -659,3 +659,212 @@ def test_preview_materials_does_not_override_post_coverage_status(db_session):
         .one()
     )
     assert refreshed.status == "to_move"
+
+
+# ---------------------------------------------------------------------------
+# Warehouse settings
+# ---------------------------------------------------------------------------
+
+
+def test_workshop_warehouse_binding_lifecycle(db_session):
+    from app.models import ProductionResource, WorkshopWarehouseBinding
+    from app.services.production_control import (
+        delete_workshop_binding,
+        list_settings,
+        upsert_workshop_binding,
+    )
+
+    workshop = ProductionResource(resource_name="Цех сварки")
+    db_session.add(workshop)
+    db_session.flush()
+
+    # Initially empty.
+    settings = list_settings(db_session)
+    assert settings["workshop_warehouse_bindings"] == []
+    assert settings["ignored_warehouses"] == []
+
+    # Create.
+    created = upsert_workshop_binding(
+        db_session,
+        workshop.resource_id,
+        "11111111-1111-1111-1111-111111111111",
+    )
+    assert created["workshop_id"] == workshop.resource_id
+    assert created["warehouse_ref1c"] == "11111111-1111-1111-1111-111111111111"
+    assert created["workshop_name"] == "Цех сварки"
+
+    # Idempotent upsert: same workshop, new warehouse — should update, not create a 2nd row.
+    updated = upsert_workshop_binding(
+        db_session,
+        workshop.resource_id,
+        "22222222-2222-2222-2222-222222222222",
+    )
+    assert updated["warehouse_ref1c"] == "22222222-2222-2222-2222-222222222222"
+    assert (
+        db_session.query(WorkshopWarehouseBinding)
+        .filter_by(workshop_id=workshop.resource_id)
+        .count()
+        == 1
+    )
+
+    # Unknown workshop -> ValueError.
+    with pytest.raises(ValueError):
+        upsert_workshop_binding(db_session, 999_999, "33333333-3333-3333-3333-333333333333")
+
+    # Delete.
+    result = delete_workshop_binding(db_session, workshop.resource_id)
+    assert result["deleted"] == 1
+    settings_after = list_settings(db_session)
+    assert settings_after["workshop_warehouse_bindings"] == []
+
+
+def test_ignored_warehouse_lifecycle(db_session):
+    from app.services.production_control import (
+        delete_ignored_warehouse,
+        list_settings,
+        upsert_ignored_warehouse,
+    )
+
+    settings = list_settings(db_session)
+    assert settings["ignored_warehouses"] == []
+
+    added = upsert_ignored_warehouse(
+        db_session,
+        "deadbeef-0000-0000-0000-deadbeefcafe",
+        warehouse_name="Изолятор брака",
+        reason="Бракованные комплектующие",
+    )
+    assert added["warehouse_ref1c"] == "deadbeef-0000-0000-0000-deadbeefcafe"
+    assert added["warehouse_name"] == "Изолятор брака"
+    assert added["reason"] == "Бракованные комплектующие"
+
+    # Update existing.
+    updated = upsert_ignored_warehouse(
+        db_session,
+        "deadbeef-0000-0000-0000-deadbeefcafe",
+        warehouse_name="Изолятор брака (обновлено)",
+    )
+    assert updated["warehouse_name"] == "Изолятор брака (обновлено)"
+
+    listed = list_settings(db_session)["ignored_warehouses"]
+    assert len(listed) == 1
+
+    delete_ignored_warehouse(db_session, "deadbeef-0000-0000-0000-deadbeefcafe")
+    assert list_settings(db_session)["ignored_warehouses"] == []
+
+
+def test_create_material_issues_uses_workshop_binding_when_warehouse_not_pinned(db_session):
+    """
+    If the caller does not supply warehouse_ref1c, fall back to the
+    workshop->warehouse binding from settings (plan: "привязка участок ->
+    склад получатель"). If the caller does supply one, it wins.
+    """
+    from app.models import ProductionResource, WorkshopWarehouseBinding
+
+    workshop = ProductionResource(resource_name="Цех сборки")
+    db_session.add(workshop)
+    db_session.flush()
+
+    parent = Item(
+        item_code="WH-PARENT",
+        item_name="Parent",
+        item_article="WH-P",
+        unit="шт",
+        stock_qty=0,
+        status="active",
+    )
+    comp = Item(
+        item_code="WH-COMP",
+        item_name="Comp",
+        item_article="WH-C",
+        unit="м",
+        stock_qty=100,
+        status="active",
+    )
+    db_session.add_all([parent, comp])
+    db_session.flush()
+    spec = Specification(spec_name="WH spec", spec_ref1c="wh-spec")
+    db_session.add(spec)
+    db_session.flush()
+    db_session.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=1))
+
+    order = ProductionOrder(
+        order_number="WH-001",
+        order_date=datetime(2026, 5, 20),
+        is_posted=True,
+        deletion_mark=False,
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=parent.item_id,
+        line_number=1,
+        quantity=5,
+        produced_qty=0,
+        remaining_qty=5,
+    )
+    db_session.add(product)
+    db_session.flush()
+    state = ProductionOrderLineState(
+        product_id=product.product_id,
+        status="shortage",
+        issue_status="not_requested",
+        workshop_id=workshop.resource_id,
+    )
+    db_session.add(state)
+    db_session.add(
+        WorkshopWarehouseBinding(
+            workshop_id=workshop.resource_id,
+            warehouse_ref1c="aaaa1111-aaaa-1111-aaaa-111111111111",
+        )
+    )
+    db_session.commit()
+
+    res_default = create_material_issues(
+        db_session,
+        [product.product_id],
+        initiated_by="op",
+    )
+    assert len(res_default["created"]) == 1
+    issue_id = res_default["created"][0]["issue_id"]
+    from app.models import ProductionMaterialIssue
+    issue = db_session.query(ProductionMaterialIssue).filter_by(issue_id=issue_id).one()
+    assert issue.warehouse_ref1c == "aaaa1111-aaaa-1111-aaaa-111111111111"
+
+    # Caller-supplied warehouse_ref1c wins over the binding. Create a second
+    # product to avoid the active-issue idempotency lock.
+    product2 = ProductionProduct(
+        order_id=order.order_id,
+        item_id=parent.item_id,
+        line_number=2,
+        quantity=5,
+        produced_qty=0,
+        remaining_qty=5,
+    )
+    db_session.add(product2)
+    db_session.flush()
+    db_session.add(
+        ProductionOrderLineState(
+            product_id=product2.product_id,
+            status="shortage",
+            issue_status="not_requested",
+            workshop_id=workshop.resource_id,
+        )
+    )
+    db_session.commit()
+
+    res_explicit = create_material_issues(
+        db_session,
+        [product2.product_id],
+        initiated_by="op",
+        warehouse_ref1c="bbbb2222-bbbb-2222-bbbb-222222222222",
+    )
+    assert len(res_explicit["created"]) == 1
+    issue2 = (
+        db_session.query(ProductionMaterialIssue)
+        .filter_by(issue_id=res_explicit["created"][0]["issue_id"])
+        .one()
+    )
+    assert issue2.warehouse_ref1c == "bbbb2222-bbbb-2222-bbbb-222222222222"
