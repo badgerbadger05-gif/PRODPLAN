@@ -257,6 +257,44 @@ class ProductionOrderLineState(Base):
     workshop = relationship("ProductionResource")
 
 
+class WorkshopWarehouseBinding(Base):
+    """
+    Plan rule: "привязка участок -> склад получатель". One workshop maps to
+    at most one warehouse (enforced by UNIQUE on workshop_id). Used to
+    pre-fill warehouse_ref1c when creating material-issue documents.
+    """
+    __tablename__ = "workshop_warehouse_bindings"
+    __table_args__ = (
+        UniqueConstraint("workshop_id", name="ux_workshop_warehouse_bindings_workshop"),
+    )
+
+    binding_id = Column(Integer, primary_key=True, index=True)
+    workshop_id = Column(
+        Integer,
+        ForeignKey("production_resources.resource_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    warehouse_ref1c = Column(String(36), nullable=False, index=True)
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    workshop = relationship("ProductionResource")
+
+
+class IgnoredWarehouse(Base):
+    """
+    Plan rule: "список игнорируемых складов" — чтобы не задавать лишние
+    вопросы по остаткам, например если компонент лежит в изоляторе брака.
+    """
+    __tablename__ = "ignored_warehouses"
+
+    warehouse_ref1c = Column(String(36), primary_key=True, nullable=False)
+    warehouse_name = Column(String(255), nullable=True)
+    reason = Column(TEXT, nullable=True)
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+
+
 class ProductionMaterialIssue(Base):
     __tablename__ = "production_material_issues"
     __table_args__ = (

@@ -12,13 +12,18 @@ from ..schemas import ODataSyncRequest
 from ..services.production_control import (
     create_material_issues,
     create_orders_from_mrp,
+    delete_ignored_warehouse,
+    delete_workshop_binding,
+    export_issue_to_1c,
     get_issue,
     list_journal,
+    list_settings,
     mark_route_sheets_printed,
     preview_materials,
     render_route_sheets_html,
-    export_issue_to_1c,
     update_line_state,
+    upsert_ignored_warehouse,
+    upsert_workshop_binding,
 )
 
 
@@ -43,6 +48,16 @@ class MaterialIssueCreatePayload(BaseModel):
 class OrdersFromMrpPayload(BaseModel):
     planned_order_ids: List[int]
     initiated_by: Optional[str] = None
+
+
+class WorkshopBindingPayload(BaseModel):
+    warehouse_ref1c: str
+
+
+class IgnoredWarehousePayload(BaseModel):
+    warehouse_ref1c: str
+    warehouse_name: Optional[str] = None
+    reason: Optional[str] = None
 
 
 @router.get("/orders", response_model=dict)
@@ -165,5 +180,63 @@ def print_route_sheets(
         if mark_printed:
             mark_route_sheets_printed(db, ids)
         return HTMLResponse(content=html)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Settings: workshop -> warehouse bindings + ignored warehouses
+# ---------------------------------------------------------------------------
+
+
+@router.get("/settings", response_model=dict)
+def get_settings(db: Session = Depends(get_db)):
+    """Return current workshop->warehouse bindings and ignored warehouses."""
+    return list_settings(db)
+
+
+@router.put("/settings/workshop-bindings/{workshop_id}", response_model=dict)
+def put_workshop_binding(
+    workshop_id: int,
+    payload: WorkshopBindingPayload,
+    db: Session = Depends(get_db),
+):
+    try:
+        return upsert_workshop_binding(db, int(workshop_id), payload.warehouse_ref1c)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/settings/workshop-bindings/{workshop_id}", response_model=dict)
+def delete_binding(workshop_id: int, db: Session = Depends(get_db)):
+    try:
+        return delete_workshop_binding(db, int(workshop_id))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/settings/ignored-warehouses", response_model=dict)
+def post_ignored_warehouse(payload: IgnoredWarehousePayload, db: Session = Depends(get_db)):
+    try:
+        return upsert_ignored_warehouse(
+            db,
+            payload.warehouse_ref1c,
+            warehouse_name=payload.warehouse_name,
+            reason=payload.reason,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/settings/ignored-warehouses/{warehouse_ref1c}", response_model=dict)
+def delete_ignored(warehouse_ref1c: str, db: Session = Depends(get_db)):
+    try:
+        return delete_ignored_warehouse(db, str(warehouse_ref1c))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

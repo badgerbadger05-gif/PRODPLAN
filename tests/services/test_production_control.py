@@ -9,11 +9,15 @@ from app.models import (
     DefaultSpecification,
     Item,
     PlannedOrder,
+    PlannedPurchase,
     PlanningRun,
     ProductionOrder,
+    ProductionOrderLineState,
     ProductionProduct,
     SpecComponent,
     Specification,
+    SupplierOrder,
+    SupplierOrderItem,
 )
 from app.services.production_control import (
     create_material_issues,
@@ -453,3 +457,414 @@ def test_create_orders_from_mrp_skips_invalid_inputs(db_session):
     assert (
         db_session.query(ProductionOrder).filter(ProductionOrder.source == "mrp").count() == 0
     )
+
+
+# ---------------------------------------------------------------------------
+# Coverage evaluation in preview_materials
+# ---------------------------------------------------------------------------
+
+
+def _make_basic_spec(db, parent_name="Parent", child_specs=()):
+    """Helper that wires Item + Specification + SpecComponents + DefaultSpecification."""
+    parent = Item(
+        item_code=f"P-{parent_name}",
+        item_name=parent_name,
+        item_article=f"ART-{parent_name}",
+        unit="шт",
+        stock_qty=0,
+        status="active",
+    )
+    db.add(parent)
+    db.flush()
+    spec = Specification(spec_name=f"Spec {parent_name}", spec_ref1c=f"spec-{parent_name}")
+    db.add(spec)
+    db.flush()
+    db.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+
+    components: list[Item] = []
+    for code, name, stock, qty_per_unit in child_specs:
+        comp = Item(
+            item_code=code,
+            item_name=name,
+            item_article=code,
+            unit="м",
+            stock_qty=stock,
+            status="active",
+        )
+        db.add(comp)
+        db.flush()
+        db.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=qty_per_unit))
+        components.append(comp)
+    return parent, spec, components
+
+
+def _make_internal_order_for(db, parent, qty=2):
+    order = ProductionOrder(
+        order_number=f"COV-{parent.item_id}",
+        order_date=datetime(2026, 5, 20),
+        is_posted=False,
+        deletion_mark=False,
+        source="1c",
+    )
+    db.add(order)
+    db.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=parent.item_id,
+        line_number=1,
+        quantity=qty,
+        produced_qty=0,
+        remaining_qty=qty,
+    )
+    db.add(product)
+    db.commit()
+    return order, product
+
+
+def test_preview_materials_marks_ready_when_stock_covers_all(db_session):
+    parent, _spec, comps = _make_basic_spec(
+        db_session,
+        parent_name="ReadyParent",
+        child_specs=[
+            ("RC1", "Comp A enough", 100, 2),  # need 2*2 = 4, have 100
+            ("RC2", "Comp B enough", 100, 3),  # need 3*2 = 6, have 100
+        ],
+    )
+    _order, product = _make_internal_order_for(db_session, parent, qty=2)
+
+    preview = preview_materials(db_session, product.product_id)
+
+    assert preview["coverage"] == "ready"
+    for c in preview["components"]:
+        assert c["coverage"] == "ok"
+        assert c["missing_qty"] == 0
+        assert c["eta_dates"] == []
+    # Line status auto-bumped from default 'shortage' to 'ready'.
+    state = (
+        db_session.query(ProductionOrderLineState)
+        .filter_by(product_id=product.product_id)
+        .one()
+    )
+    assert state.status == "ready"
+
+
+def test_preview_materials_marks_shortage_and_includes_supplier_eta(db_session):
+    parent, _spec, comps = _make_basic_spec(
+        db_session,
+        parent_name="ShortageParent",
+        child_specs=[
+            ("SC1", "No stock comp", 0, 1),  # need 1*2 = 2, have 0
+        ],
+    )
+    comp = comps[0]
+    _order, product = _make_internal_order_for(db_session, parent, qty=2)
+
+    # An open supplier order with a future delivery date covering this component.
+    sup_order = SupplierOrder(
+        order_number="ЗАКП-COVER-001",
+        order_date=datetime(2026, 5, 10, 10),
+        order_ref1c="sup-ref-cover-001",
+        order_state_key="state-in-work",
+        order_state_name="В закупку",
+        deletion_mark=False,
+    )
+    db_session.add(sup_order)
+    db_session.flush()
+    db_session.add(
+        SupplierOrderItem(
+            order_id=sup_order.order_id,
+            item_id_ref=comp.item_id,
+            line_number=1,
+            quantity=10,
+            received_qty=0,
+            remaining_qty=10,
+            delivery_date=datetime(2026, 6, 1),
+        )
+    )
+    db_session.commit()
+
+    preview = preview_materials(db_session, product.product_id)
+    assert preview["coverage"] == "shortage"
+    only_comp = preview["components"][0]
+    assert only_comp["coverage"] == "shortage"
+    assert only_comp["missing_qty"] == 2
+    # ETA from supplier_order pipe.
+    eta = only_comp["eta_dates"]
+    assert len(eta) >= 1
+    sup_etas = [e for e in eta if e["source"] == "supplier_order"]
+    assert sup_etas
+    assert sup_etas[0]["ref"] == "ЗАКП-COVER-001"
+    assert sup_etas[0]["date"] == "2026-06-01"
+
+
+def test_preview_materials_marks_partial_when_some_stock(db_session):
+    parent, _spec, comps = _make_basic_spec(
+        db_session,
+        parent_name="PartialParent",
+        child_specs=[
+            ("PC1", "Comp full", 100, 1),  # need 2, have 100 -> ok
+            ("PC2", "Comp partial", 3, 2),  # need 4, have 3 -> partial
+        ],
+    )
+    _order, product = _make_internal_order_for(db_session, parent, qty=2)
+
+    preview = preview_materials(db_session, product.product_id)
+    assert preview["coverage"] == "partial"
+    by_name = {c["item_name"]: c for c in preview["components"]}
+    assert by_name["Comp full"]["coverage"] == "ok"
+    assert by_name["Comp partial"]["coverage"] == "partial"
+    assert by_name["Comp partial"]["missing_qty"] == 1
+    state = (
+        db_session.query(ProductionOrderLineState)
+        .filter_by(product_id=product.product_id)
+        .one()
+    )
+    assert state.status == "partial"
+
+
+def test_preview_materials_does_not_override_post_coverage_status(db_session):
+    """
+    Once a line has progressed past coverage (to_move / assembled / produced),
+    re-running preview_materials must not regress it back to shortage/partial/
+    ready even if the stock numbers say so.
+    """
+    parent, _spec, _comps = _make_basic_spec(
+        db_session,
+        parent_name="StickyParent",
+        child_specs=[("STC1", "Comp empty", 0, 1)],
+    )
+    _order, product = _make_internal_order_for(db_session, parent, qty=2)
+
+    # Manually push the state past the coverage band.
+    state = (
+        db_session.query(ProductionOrderLineState)
+        .filter_by(product_id=product.product_id)
+        .one_or_none()
+    )
+    if state is None:
+        # Lazy-create through preview, then move forward.
+        preview_materials(db_session, product.product_id)
+        state = (
+            db_session.query(ProductionOrderLineState)
+            .filter_by(product_id=product.product_id)
+            .one()
+        )
+    state.status = "to_move"
+    db_session.commit()
+
+    preview_materials(db_session, product.product_id)
+    refreshed = (
+        db_session.query(ProductionOrderLineState)
+        .filter_by(product_id=product.product_id)
+        .one()
+    )
+    assert refreshed.status == "to_move"
+
+
+# ---------------------------------------------------------------------------
+# Warehouse settings
+# ---------------------------------------------------------------------------
+
+
+def test_workshop_warehouse_binding_lifecycle(db_session):
+    from app.models import ProductionResource, WorkshopWarehouseBinding
+    from app.services.production_control import (
+        delete_workshop_binding,
+        list_settings,
+        upsert_workshop_binding,
+    )
+
+    workshop = ProductionResource(resource_name="Цех сварки")
+    db_session.add(workshop)
+    db_session.flush()
+
+    # Initially empty.
+    settings = list_settings(db_session)
+    assert settings["workshop_warehouse_bindings"] == []
+    assert settings["ignored_warehouses"] == []
+
+    # Create.
+    created = upsert_workshop_binding(
+        db_session,
+        workshop.resource_id,
+        "11111111-1111-1111-1111-111111111111",
+    )
+    assert created["workshop_id"] == workshop.resource_id
+    assert created["warehouse_ref1c"] == "11111111-1111-1111-1111-111111111111"
+    assert created["workshop_name"] == "Цех сварки"
+
+    # Idempotent upsert: same workshop, new warehouse — should update, not create a 2nd row.
+    updated = upsert_workshop_binding(
+        db_session,
+        workshop.resource_id,
+        "22222222-2222-2222-2222-222222222222",
+    )
+    assert updated["warehouse_ref1c"] == "22222222-2222-2222-2222-222222222222"
+    assert (
+        db_session.query(WorkshopWarehouseBinding)
+        .filter_by(workshop_id=workshop.resource_id)
+        .count()
+        == 1
+    )
+
+    # Unknown workshop -> ValueError.
+    with pytest.raises(ValueError):
+        upsert_workshop_binding(db_session, 999_999, "33333333-3333-3333-3333-333333333333")
+
+    # Delete.
+    result = delete_workshop_binding(db_session, workshop.resource_id)
+    assert result["deleted"] == 1
+    settings_after = list_settings(db_session)
+    assert settings_after["workshop_warehouse_bindings"] == []
+
+
+def test_ignored_warehouse_lifecycle(db_session):
+    from app.services.production_control import (
+        delete_ignored_warehouse,
+        list_settings,
+        upsert_ignored_warehouse,
+    )
+
+    settings = list_settings(db_session)
+    assert settings["ignored_warehouses"] == []
+
+    added = upsert_ignored_warehouse(
+        db_session,
+        "deadbeef-0000-0000-0000-deadbeefcafe",
+        warehouse_name="Изолятор брака",
+        reason="Бракованные комплектующие",
+    )
+    assert added["warehouse_ref1c"] == "deadbeef-0000-0000-0000-deadbeefcafe"
+    assert added["warehouse_name"] == "Изолятор брака"
+    assert added["reason"] == "Бракованные комплектующие"
+
+    # Update existing.
+    updated = upsert_ignored_warehouse(
+        db_session,
+        "deadbeef-0000-0000-0000-deadbeefcafe",
+        warehouse_name="Изолятор брака (обновлено)",
+    )
+    assert updated["warehouse_name"] == "Изолятор брака (обновлено)"
+
+    listed = list_settings(db_session)["ignored_warehouses"]
+    assert len(listed) == 1
+
+    delete_ignored_warehouse(db_session, "deadbeef-0000-0000-0000-deadbeefcafe")
+    assert list_settings(db_session)["ignored_warehouses"] == []
+
+
+def test_create_material_issues_uses_workshop_binding_when_warehouse_not_pinned(db_session):
+    """
+    If the caller does not supply warehouse_ref1c, fall back to the
+    workshop->warehouse binding from settings (plan: "привязка участок ->
+    склад получатель"). If the caller does supply one, it wins.
+    """
+    from app.models import ProductionResource, WorkshopWarehouseBinding
+
+    workshop = ProductionResource(resource_name="Цех сборки")
+    db_session.add(workshop)
+    db_session.flush()
+
+    parent = Item(
+        item_code="WH-PARENT",
+        item_name="Parent",
+        item_article="WH-P",
+        unit="шт",
+        stock_qty=0,
+        status="active",
+    )
+    comp = Item(
+        item_code="WH-COMP",
+        item_name="Comp",
+        item_article="WH-C",
+        unit="м",
+        stock_qty=100,
+        status="active",
+    )
+    db_session.add_all([parent, comp])
+    db_session.flush()
+    spec = Specification(spec_name="WH spec", spec_ref1c="wh-spec")
+    db_session.add(spec)
+    db_session.flush()
+    db_session.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=1))
+
+    order = ProductionOrder(
+        order_number="WH-001",
+        order_date=datetime(2026, 5, 20),
+        is_posted=True,
+        deletion_mark=False,
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=parent.item_id,
+        line_number=1,
+        quantity=5,
+        produced_qty=0,
+        remaining_qty=5,
+    )
+    db_session.add(product)
+    db_session.flush()
+    state = ProductionOrderLineState(
+        product_id=product.product_id,
+        status="shortage",
+        issue_status="not_requested",
+        workshop_id=workshop.resource_id,
+    )
+    db_session.add(state)
+    db_session.add(
+        WorkshopWarehouseBinding(
+            workshop_id=workshop.resource_id,
+            warehouse_ref1c="aaaa1111-aaaa-1111-aaaa-111111111111",
+        )
+    )
+    db_session.commit()
+
+    res_default = create_material_issues(
+        db_session,
+        [product.product_id],
+        initiated_by="op",
+    )
+    assert len(res_default["created"]) == 1
+    issue_id = res_default["created"][0]["issue_id"]
+    from app.models import ProductionMaterialIssue
+    issue = db_session.query(ProductionMaterialIssue).filter_by(issue_id=issue_id).one()
+    assert issue.warehouse_ref1c == "aaaa1111-aaaa-1111-aaaa-111111111111"
+
+    # Caller-supplied warehouse_ref1c wins over the binding. Create a second
+    # product to avoid the active-issue idempotency lock.
+    product2 = ProductionProduct(
+        order_id=order.order_id,
+        item_id=parent.item_id,
+        line_number=2,
+        quantity=5,
+        produced_qty=0,
+        remaining_qty=5,
+    )
+    db_session.add(product2)
+    db_session.flush()
+    db_session.add(
+        ProductionOrderLineState(
+            product_id=product2.product_id,
+            status="shortage",
+            issue_status="not_requested",
+            workshop_id=workshop.resource_id,
+        )
+    )
+    db_session.commit()
+
+    res_explicit = create_material_issues(
+        db_session,
+        [product2.product_id],
+        initiated_by="op",
+        warehouse_ref1c="bbbb2222-bbbb-2222-bbbb-222222222222",
+    )
+    assert len(res_explicit["created"]) == 1
+    issue2 = (
+        db_session.query(ProductionMaterialIssue)
+        .filter_by(issue_id=res_explicit["created"][0]["issue_id"])
+        .one()
+    )
+    assert issue2.warehouse_ref1c == "bbbb2222-bbbb-2222-bbbb-222222222222"
