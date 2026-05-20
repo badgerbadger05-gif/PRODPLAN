@@ -11,6 +11,7 @@ from ..models import (
     DefaultSpecification,
     IgnoredWarehouse,
     Item,
+    ItemWarehouseStock,
     Operation,
     PlannedOrder,
     PlannedPurchase,
@@ -536,6 +537,70 @@ def _components_for_product(db: Session, product: ProductionProduct) -> Tuple[Op
     return spec_id, components
 
 
+def _stock_by_item(db: Session, item_ids: Sequence[int]) -> Dict[int, float]:
+    """
+    Return per-item available stock with `ignored_warehouses` excluded.
+
+    Resolution order:
+    1. If `ignored_warehouses` is empty -> aggregated Item.stock_qty (legacy
+       behavior, fast).
+    2. Else use item_warehouse_stock filtered by warehouse_ref1c NOT IN
+       (ignored). Items that have ANY rows in item_warehouse_stock are
+       considered "covered by the breakdown" — if all of their stock is in
+       ignored warehouses they end up with 0, which is the desired effect.
+    3. Items without any breakdown rows fallback to Item.stock_qty so a
+       partially-synced DB doesn't blank coverage. After a full re-sync the
+       breakdown path becomes authoritative for everything.
+    """
+    ids = [int(x) for x in item_ids if x is not None]
+    if not ids:
+        return {}
+
+    ignored_refs_rows = db.query(IgnoredWarehouse.warehouse_ref1c).all()
+    ignored_refs = {str(r[0]) for r in ignored_refs_rows if r and r[0]}
+
+    if not ignored_refs:
+        result: Dict[int, float] = {}
+        for iid, stock in (
+            db.query(Item.item_id, Item.stock_qty).filter(Item.item_id.in_(ids)).all()
+        ):
+            result[int(iid)] = _to_float(stock)
+        return result
+
+    # Per-warehouse path: sum non-ignored buckets per item.
+    sum_rows = (
+        db.query(ItemWarehouseStock.item_id, func.sum(ItemWarehouseStock.qty))
+        .filter(ItemWarehouseStock.item_id.in_(ids))
+        .filter(~ItemWarehouseStock.warehouse_ref1c.in_(ignored_refs))
+        .group_by(ItemWarehouseStock.item_id)
+        .all()
+    )
+    breakdown_stocks: Dict[int, float] = {int(iid): _to_float(qty) for iid, qty in sum_rows}
+
+    # Items that have ANY breakdown rows at all (even if 0 after ignored
+    # filter). These items are "authoritative" via the breakdown table.
+    has_any_rows = {
+        int(iid)
+        for (iid,) in db.query(ItemWarehouseStock.item_id)
+        .filter(ItemWarehouseStock.item_id.in_(ids))
+        .distinct()
+        .all()
+    }
+
+    result: Dict[int, float] = {}
+    missing_ids = [iid for iid in ids if iid not in has_any_rows]
+    if missing_ids:
+        # No breakdown yet for these items -> fallback to aggregated.
+        for iid, stock in (
+            db.query(Item.item_id, Item.stock_qty).filter(Item.item_id.in_(missing_ids)).all()
+        ):
+            result[int(iid)] = _to_float(stock)
+    for iid in ids:
+        if iid in has_any_rows:
+            result[iid] = breakdown_stocks.get(iid, 0.0)
+    return result
+
+
 def _open_issue_reservations_by_item(db: Session, item_ids: Sequence[int]) -> Dict[int, float]:
     """
     Material already committed but not yet physically moved: sum of
@@ -738,12 +803,9 @@ def preview_materials(db: Session, product_id: int) -> Dict[str, Any]:
     spec_id, components = _components_for_product(db, product)
 
     comp_ids = [int(c["component_item_id"]) for c in components]
-    stock_by_item: Dict[int, float] = {}
-    if comp_ids:
-        for iid, stock in (
-            db.query(Item.item_id, Item.stock_qty).filter(Item.item_id.in_(comp_ids)).all()
-        ):
-            stock_by_item[int(iid)] = _to_float(stock)
+    # Stock honours `ignored_warehouses`: items lying in е.g. изоляторе брака
+    # are not counted as available (plan rule).
+    stock_by_item = _stock_by_item(db, comp_ids)
 
     reservations = _open_issue_reservations_by_item(db, comp_ids)
     run_id = _latest_run_id(db)

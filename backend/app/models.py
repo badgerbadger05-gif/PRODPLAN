@@ -92,6 +92,31 @@ class StockWarehouse(Base):
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
 
 
+class ItemWarehouseStock(Base):
+    """
+    Per-(item, warehouse) stock breakdown synchronized from 1C OData. Lets
+    coverage analysis exclude warehouses listed in `ignored_warehouses` and
+    is a foundation for automatic source-warehouse selection during material
+    issue creation. Primary key (item_id, warehouse_ref1c).
+    """
+    __tablename__ = "item_warehouse_stock"
+
+    item_id = Column(
+        Integer,
+        ForeignKey("items.item_id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    warehouse_ref1c = Column(String(36), primary_key=True, index=True)
+    qty = Column(DECIMAL(15, 3), nullable=False, default=0, server_default="0")
+    updated_at = Column(
+        TIMESTAMP,
+        default=func.now(),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
 class Unit(Base):
     __tablename__ = "units"
 

@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from typing import Dict, Optional, List
+from typing import Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
 from .odata_client import get_stock_from_1c_odata
-from ..models import Item, StockWarehouse
+from ..models import Item, ItemWarehouseStock, StockWarehouse
 from ..schemas import ODataSyncRequest
 
 
@@ -22,6 +22,9 @@ class _Stats:
     odata_entity: str = ""
     warehouses_total: int = 0
     warehouses_selected: int = 0
+    # Per-warehouse breakdown stats (writes to item_warehouse_stock)
+    warehouse_stock_rows_upserted: int = 0
+    warehouse_stock_items_touched: int = 0
 
 
 @dataclass
@@ -131,6 +134,82 @@ def _upsert_warehouses_from_stock_rows(db: Session, stock_rows: List[Dict]) -> i
     return changed
 
 
+def _upsert_item_warehouse_stock(
+    db: Session,
+    stock_rows: List[Dict],
+    db_code_to_norm: Dict[str, str],
+) -> Tuple[int, int]:
+    """
+    Refresh item_warehouse_stock from per-(item, warehouse) lines returned by
+    1C OData.
+
+    For every item that appears in `stock_rows` we DELETE existing rows for
+    that item from item_warehouse_stock and re-insert the current snapshot.
+    Items absent from `stock_rows` are left alone — the caller is responsible
+    for the global zero-out policy (which it already does on Item.stock_qty).
+
+    Returns (rows_upserted, items_touched).
+    """
+    # Build item_id -> {warehouse_ref1c: qty} from raw records using the same
+    # ref-first / code-second resolution as the aggregated path.
+    items_by_ref: Dict[str, int] = {}
+    items_by_norm_code: Dict[str, int] = {}
+    for it in db.query(Item.item_id, Item.item_code, Item.item_ref1c).all():
+        item_id, raw_code, ref1c = int(it[0]), str(it[1] or "").strip(), str(it[2] or "").strip()
+        if ref1c:
+            items_by_ref[ref1c] = item_id
+        norm = db_code_to_norm.get(raw_code) or _norm_code(raw_code)
+        if norm:
+            items_by_norm_code.setdefault(norm, item_id)
+
+    new_map: Dict[int, Dict[str, float]] = {}
+    for rec in stock_rows or []:
+        w_ref = str(rec.get("warehouse_ref") or "").strip()
+        if not w_ref:
+            continue
+        qty_val = float(rec.get("qty") or 0.0)
+        if qty_val == 0.0:
+            # Don't bother storing zero rows; absence implies zero on read side.
+            continue
+
+        ref1c = str(rec.get("ref") or "").strip()
+        item_id: Optional[int] = items_by_ref.get(ref1c) if ref1c else None
+        if item_id is None:
+            norm = _norm_code(rec.get("code", ""))
+            item_id = items_by_norm_code.get(norm) if norm else None
+        if item_id is None:
+            continue
+
+        bucket = new_map.setdefault(int(item_id), {})
+        bucket[w_ref] = bucket.get(w_ref, 0.0) + qty_val
+
+    if not new_map:
+        return (0, 0)
+
+    touched_item_ids = list(new_map.keys())
+    # Delete-then-insert for the touched item_ids gives us a clean snapshot.
+    # synchronize_session="fetch" so SQLAlchemy expires the in-session ORM
+    # objects we just removed and a fresh insert below doesn't collide on
+    # identity-map keys.
+    db.query(ItemWarehouseStock).filter(
+        ItemWarehouseStock.item_id.in_(touched_item_ids)
+    ).delete(synchronize_session="fetch")
+
+    rows_upserted = 0
+    for item_id, by_wh in new_map.items():
+        for w_ref, qty_val in by_wh.items():
+            db.add(
+                ItemWarehouseStock(
+                    item_id=int(item_id),
+                    warehouse_ref1c=str(w_ref),
+                    qty=float(qty_val),
+                )
+            )
+            rows_upserted += 1
+
+    return (rows_upserted, len(touched_item_ids))
+
+
 def sync_stock_from_odata(db: Session, req: ODataSyncRequest) -> dict:
     """
     Синхронизация остатков из 1С через OData.
@@ -216,6 +295,19 @@ def sync_stock_from_odata(db: Session, req: ODataSyncRequest) -> dict:
             if w_ref in selected_refs:
                 filtered_rows.append(rec)
         stock_data = filtered_rows
+
+    # 3) Build per-(item, warehouse) breakdown snapshot. Done from the
+    #    selected-warehouse-filtered set, so deselected warehouses also
+    #    disappear from item_warehouse_stock and won't leak into coverage.
+    try:
+        rows_upserted, items_touched = _upsert_item_warehouse_stock(db, stock_data, db_code_to_norm)
+        stats.warehouse_stock_rows_upserted = int(rows_upserted)
+        stats.warehouse_stock_items_touched = int(items_touched)
+        db.flush()
+    except Exception as e:
+        # Per-warehouse breakdown is auxiliary; don't fail the whole sync if
+        # the new table isn't migrated yet on this DB.
+        print(f"[OData][stock] per-warehouse breakdown skipped: {e}", flush=True)
 
     # Агрегируем по нормализованным кодам И по Ref_Key (GUID) — GUID имеет приоритет для сопоставления
     odata_map_norm_to_qty: Dict[str, float] = {}

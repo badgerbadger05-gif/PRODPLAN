@@ -868,3 +868,144 @@ def test_create_material_issues_uses_workshop_binding_when_warehouse_not_pinned(
         .one()
     )
     assert issue2.warehouse_ref1c == "bbbb2222-bbbb-2222-bbbb-222222222222"
+
+
+# ---------------------------------------------------------------------------
+# Coverage with ignored_warehouses + per-warehouse stock breakdown
+# ---------------------------------------------------------------------------
+
+
+def test_preview_materials_excludes_ignored_warehouses_from_stock(db_session):
+    """
+    Plan rule: "Игнорируемые склады нужны, чтобы не задавать лишние вопросы
+    по остаткам, например если компонент лежит в изоляторе брака."
+
+    With item_warehouse_stock populated AND an ignored_warehouses entry, the
+    coverage calculation must use the per-warehouse breakdown and exclude
+    stock sitting in ignored warehouses, even if Item.stock_qty (aggregated)
+    suggests there's enough.
+    """
+    from app.models import ItemWarehouseStock
+    from app.services.production_control import upsert_ignored_warehouse
+
+    parent, _spec, comps = _make_basic_spec(
+        db_session,
+        parent_name="IgnoreCheckParent",
+        child_specs=[("IGNCMP", "Ignored-stock comp", 0, 1)],
+    )
+    comp = comps[0]
+    _order, product = _make_internal_order_for(db_session, parent, qty=2)
+
+    # Aggregated says we have 10 — but it's all in the brak isolator.
+    comp.stock_qty = 10
+    db_session.add(
+        ItemWarehouseStock(
+            item_id=comp.item_id,
+            warehouse_ref1c="brak-warehouse-guid",
+            qty=10,
+        )
+    )
+    db_session.commit()
+
+    # Before adding to the ignore list: coverage should be 'ready' (10 >= 2).
+    preview = preview_materials(db_session, product.product_id)
+    assert preview["coverage"] == "ready"
+    assert preview["components"][0]["available_qty"] == 10
+    assert preview["components"][0]["coverage"] == "ok"
+
+    # Bump state back into the coverage band so the next preview can refresh
+    # it (sticky-status guarantee from PR #4).
+    state = (
+        db_session.query(ProductionOrderLineState)
+        .filter_by(product_id=product.product_id)
+        .one()
+    )
+    state.status = "shortage"
+    db_session.commit()
+
+    # Mark brak warehouse as ignored — that stock should drop out.
+    upsert_ignored_warehouse(
+        db_session,
+        "brak-warehouse-guid",
+        warehouse_name="Изолятор брака",
+        reason="Бракованные комплектующие",
+    )
+
+    preview_after = preview_materials(db_session, product.product_id)
+    assert preview_after["coverage"] == "shortage"
+    only_comp = preview_after["components"][0]
+    assert only_comp["available_qty"] == 0
+    assert only_comp["missing_qty"] == 2
+    assert only_comp["coverage"] == "shortage"
+
+
+def test_preview_materials_falls_back_to_aggregated_when_no_breakdown(db_session):
+    """
+    With ignored_warehouses configured but no item_warehouse_stock rows for
+    the component (e.g. stock hasn't been re-synced yet after the migration),
+    fall back to aggregated Item.stock_qty so coverage doesn't collapse to 0
+    during the rollout.
+    """
+    from app.services.production_control import upsert_ignored_warehouse
+
+    parent, _spec, comps = _make_basic_spec(
+        db_session,
+        parent_name="FallbackParent",
+        child_specs=[("FBCMP", "Aggregated-only comp", 0, 1)],
+    )
+    comp = comps[0]
+    _order, product = _make_internal_order_for(db_session, parent, qty=2)
+    comp.stock_qty = 5  # aggregated value, no per-warehouse rows
+    db_session.commit()
+
+    upsert_ignored_warehouse(db_session, "some-other-warehouse")
+
+    preview = preview_materials(db_session, product.product_id)
+    # With no breakdown rows, fallback returns 5 -> need 2 -> ok.
+    assert preview["coverage"] == "ready"
+    assert preview["components"][0]["available_qty"] == 5
+    assert preview["components"][0]["coverage"] == "ok"
+
+
+def test_preview_materials_mixes_breakdown_and_aggregated_fallback(db_session):
+    """
+    Component A has per-warehouse breakdown with everything in an ignored
+    warehouse -> 0 available. Component B has no breakdown rows at all ->
+    falls back to aggregated Item.stock_qty.
+
+    Order-level coverage aggregates per the plan: any 'shortage' -> shortage.
+    So this case is a 'shortage' (blocked on comp A) despite comp B being
+    fully covered. The point of the test is the per-component values:
+    breakdown path is authoritative when present, aggregated is the fallback.
+    """
+    from app.models import ItemWarehouseStock
+    from app.services.production_control import upsert_ignored_warehouse
+
+    parent, _spec, comps = _make_basic_spec(
+        db_session,
+        parent_name="MixParent",
+        child_specs=[
+            ("MIXA", "Comp A all-ignored", 50, 1),  # need 1*2 = 2
+            ("MIXB", "Comp B aggregated only", 50, 1),  # need 1*2 = 2
+        ],
+    )
+    comp_a, _comp_b = comps
+    _order, product = _make_internal_order_for(db_session, parent, qty=2)
+
+    db_session.add(
+        ItemWarehouseStock(
+            item_id=comp_a.item_id,
+            warehouse_ref1c="brak-mix-guid",
+            qty=50,
+        )
+    )
+    db_session.commit()
+    upsert_ignored_warehouse(db_session, "brak-mix-guid")
+
+    preview = preview_materials(db_session, product.product_id)
+    assert preview["coverage"] == "shortage"  # blocked by comp A
+    by_name = {c["item_name"]: c for c in preview["components"]}
+    assert by_name["Comp A all-ignored"]["available_qty"] == 0
+    assert by_name["Comp A all-ignored"]["coverage"] == "shortage"
+    assert by_name["Comp B aggregated only"]["available_qty"] == 50
+    assert by_name["Comp B aggregated only"]["coverage"] == "ok"
