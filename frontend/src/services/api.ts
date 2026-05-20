@@ -579,3 +579,67 @@ export async function createProductionMaterialIssues(body: {
   const { data } = await api.post('/v1/production-control/material-issues', body)
   return data
 }
+
+
+// ---------------------------------------------------------------------------
+// Production Control settings — workshop->warehouse bindings + ignored
+// warehouses. Mirrors POST/PUT/DELETE /v1/production-control/settings/*
+// endpoints introduced in PR #4.
+// ---------------------------------------------------------------------------
+
+export interface WorkshopWarehouseBinding {
+  binding_id: number
+  workshop_id: number
+  workshop_name?: string | null
+  warehouse_ref1c: string
+}
+
+export interface IgnoredWarehouseEntry {
+  warehouse_ref1c: string
+  warehouse_name?: string | null
+  reason?: string | null
+}
+
+export interface ProductionControlSettings {
+  workshop_warehouse_bindings: WorkshopWarehouseBinding[]
+  ignored_warehouses: IgnoredWarehouseEntry[]
+}
+
+export async function getProductionControlSettings(): Promise<ProductionControlSettings> {
+  const { data } = await api.get('/v1/production-control/settings')
+  return data
+}
+
+export async function upsertProductionControlWorkshopBinding(
+  workshopId: number,
+  warehouseRef1c: string,
+): Promise<WorkshopWarehouseBinding> {
+  const { data } = await api.put(
+    `/v1/production-control/settings/workshop-bindings/${workshopId}`,
+    { warehouse_ref1c: warehouseRef1c },
+  )
+  return data
+}
+
+export async function deleteProductionControlWorkshopBinding(workshopId: number): Promise<any> {
+  const { data } = await api.delete(
+    `/v1/production-control/settings/workshop-bindings/${workshopId}`,
+  )
+  return data
+}
+
+export async function upsertProductionControlIgnoredWarehouse(body: {
+  warehouse_ref1c: string
+  warehouse_name?: string | null
+  reason?: string | null
+}): Promise<IgnoredWarehouseEntry> {
+  const { data } = await api.post('/v1/production-control/settings/ignored-warehouses', body)
+  return data
+}
+
+export async function deleteProductionControlIgnoredWarehouse(warehouseRef1c: string): Promise<any> {
+  const { data } = await api.delete(
+    `/v1/production-control/settings/ignored-warehouses/${encodeURIComponent(warehouseRef1c)}`,
+  )
+  return data
+}
