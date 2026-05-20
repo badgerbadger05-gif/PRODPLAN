@@ -31,6 +31,7 @@ from app.services.planning_service import (
     get_run_purchases,
     _build_component_reservations_from_active_1c,
     _get_active_1c_remaining_by_item,
+    _get_active_production_remaining_by_item,
     _get_active_supplier_remaining_by_item_date,
 )
 
@@ -790,6 +791,58 @@ def test_get_active_1c_remaining_by_item_filters_done_deleted_and_nonpositive(db
 
     rem = _get_active_1c_remaining_by_item(db)
     assert rem.get(item.item_id) == 5.0
+
+
+def test_active_remaining_counts_mrp_sourced_production_orders(db_session):
+    """
+    Plan rule: внутренние MRP-заказы (source='mrp') должны учитываться в
+    следующих MRP-расчётах наравне с 1С-заказами. Their order_state_key is
+    NULL (we never set it for internal orders), so the same DONE_STATE_KEY
+    filter that lets active 1C orders through must also let MRP-source ones
+    through. Verify both via the new generic name and the legacy alias.
+    """
+    db = db_session
+
+    item = Item(
+        item_code="MRP-ACT",
+        item_name="MRP active",
+        item_article="MRP-ACT",
+        replenishment_method="Производство",
+        unit="u",
+        stock_qty=0,
+        status="active",
+    )
+    db.add(item)
+    db.flush()
+
+    run = _mk_run(db)
+    internal_order = ProductionOrder(
+        order_number=f"MRP-{run.run_id}-test",
+        order_date=datetime.datetime(2026, 5, 20),
+        order_ref1c=None,             # MRP-source orders are not in 1C yet
+        deletion_mark=False,
+        order_state_key=None,         # No 1C state -> passes DONE filter
+        is_posted=False,
+        source="mrp",
+        source_run_id=run.run_id,
+    )
+    db.add(internal_order)
+    db.flush()
+    db.add(
+        ProductionProduct(
+            order_id=internal_order.order_id,
+            item_id=item.item_id,
+            quantity=8.0,
+            produced_qty=0.0,
+            remaining_qty=8.0,
+        )
+    )
+    db.commit()
+
+    rem_new = _get_active_production_remaining_by_item(db)
+    assert rem_new.get(item.item_id) == 8.0
+    rem_legacy = _get_active_1c_remaining_by_item(db)
+    assert rem_legacy.get(item.item_id) == 8.0
 
 
 def test_recursive_component_reservation_with_cycle_guard(db_session):

@@ -1979,13 +1979,21 @@ def _read_last_stock_sync_at() -> Optional[str]:
         return None
 
 
-def _get_active_1c_remaining_by_item(db: Session) -> Dict[int, float]:
+def _get_active_production_remaining_by_item(db: Session) -> Dict[int, float]:
     """
-    Aggregate remaining qty from active 1C production orders by produced item.
+    Aggregate remaining qty from ALL active production orders by produced item,
+    regardless of source. Internal MRP-originated orders (source='mrp', created
+    via /v1/production-control/orders/from-mrp) and 1C-synced ones (source='1c')
+    are both counted here, because both represent already-committed production
+    that should reduce the net requirement of subsequent MRP runs (plan rule:
+    "эти заказы учитываются в следующих MRP-расчетах как активное ожидаемое
+    производство").
 
-    Active 1C order filter:
+    Active filter:
     - deletion_mark == false
-    - order_state_key != DONE_STATE_KEY
+    - order_state_key != DONE_STATE_KEY (1C-side completion);
+      MRP-source orders have NULL order_state_key, which passes the filter
+      via COALESCE('') != DONE_STATE_KEY
     - production_products.remaining_qty > 0
     """
     try:
@@ -2011,6 +2019,14 @@ def _get_active_1c_remaining_by_item(db: Session) -> Dict[int, float]:
         except Exception:
             continue
     return result
+
+
+# Backwards-compatible alias for older imports / external callers.
+# The "1c" name was a misnomer — the function never restricted by source,
+# and now we explicitly want it to cover MRP-source orders too. Prefer the
+# new name; this alias is kept for one release cycle to avoid breaking tests
+# / scripts that imported the old symbol.
+_get_active_1c_remaining_by_item = _get_active_production_remaining_by_item
 
 
 def _normalize_supplier_order_state_name(value: Any) -> str:
@@ -3419,8 +3435,11 @@ def run_planning_run(
         def components_loader(spec_id: int) -> List[SpecComponent]:
             return db.query(SpecComponent).filter(SpecComponent.spec_id == spec_id).all()
 
-        # A) Active 1C orders as already planned finished output.
-        active_remaining_by_item = _get_active_1c_remaining_by_item(db)
+        # A) Active production orders as already planned finished output.
+        # Covers both 1C-synced orders and internal MRP-originated ones
+        # (source='mrp' from /v1/production-control/orders/from-mrp), per plan
+        # rule "эти заказы учитываются в следующих MRP-расчетах".
+        active_remaining_by_item = _get_active_production_remaining_by_item(db)
         supplier_remaining_by_item_date = _get_active_supplier_remaining_by_item_date(db)
 
         # B) Active 1C orders reserve components recursively across full BOM depth.
