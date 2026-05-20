@@ -129,6 +129,7 @@ export interface ProductionOrder {
   turning_blank_priority?: boolean
   // Флаги для отрисовки плашек/индикаторов
   flags?: ProductionFlags
+  source_order_ids?: number[]
 }
 
 export interface ProductionGroupOrder {
@@ -146,6 +147,7 @@ export interface ProductionGroupOrder {
   overload?: boolean
   badge?: string | null
   turning_blank_priority?: boolean
+  source_order_ids?: number[]
 }
 
 export interface ProductionGroup {
@@ -216,6 +218,7 @@ export interface PurchaseCategoryGroupOrder {
   bucket_date?: IsoDate | null
   priority_index?: number | null
   supplier_ref1c?: string | null
+  source_purchase_ids?: number[]
   badge?: string | null
   turning_blank_priority?: boolean
   late_supplier_order?: boolean

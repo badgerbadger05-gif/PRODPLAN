@@ -1,0 +1,286 @@
+{
+  "value": [
+    {
+      "Ref_Key": "f1580d26-9141-11ef-829d-9ee51454587f",
+      "Code": "НФ-00007511",
+      "Description": "Аксессуары Ikudzo",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "730e3b76-c58a-11ee-94f6-9ee51454587f",
+      "Code": "НФ-00005980",
+      "Description": "Битрикс",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "67531602-a8d3-11eb-088b-fa163e61326a",
+      "Code": "00-00000267",
+      "Description": "Готовая продукция",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "674424f2-a613-11eb-c196-fa163e61326a",
+      "Code": "00-00000148",
+      "Description": "Гусеницы",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "ae16e106-a41c-11eb-659a-fa163e61326a",
+      "Code": "00-00000106",
+      "Description": "Двигатели",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "4ddc37e2-1dd8-11f1-9d63-9ee51454587f",
+      "Code": "НФ-00010863",
+      "Description": "для производства расходники",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "44b5aafc-075f-11f1-8db9-9ee51454587f",
+      "Code": "НФ-00010576",
+      "Description": "Закупка",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "022c31ce-a611-11eb-c196-fa163e61326a",
+      "Code": "00-00000144",
+      "Description": "Закупка Китай",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "59ae6cf2-a687-11eb-6c85-fa163e61326a",
+      "Code": "00-00000168",
+      "Description": "закупки общие",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "535b64ca-9140-11ef-829d-9ee51454587f",
+      "Code": "НФ-00007510",
+      "Description": "Запчасти",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "9b81ed5e-24d0-11f0-8b5b-9ee51454587f",
+      "Code": "НФ-00008523",
+      "Description": "Запчасти для продаж",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "63866cf8-2d95-11f1-986b-9ee51454587f",
+      "Code": "НФ-00011140",
+      "Description": "Инструмент, оснастка",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "4194de2c-24d1-11f0-8b5b-9ee51454587f",
+      "Code": "НФ-00008524",
+      "Description": "Лазерная резка",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "b7532aec-01b7-11f1-8fb2-9ee51454587f",
+      "Code": "НФ-00010558",
+      "Description": "ЛМ (крашеные)",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "e1221a88-1c6d-11f1-9d63-9ee51454587f",
+      "Code": "НФ-00010856",
+      "Description": "Металл прокат",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "594b97c0-993b-11eb-e39a-fa163e61326a",
+      "Code": "00-00000004",
+      "Description": "Метизы",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "65819054-389a-11f1-9779-9ee51454587f",
+      "Code": "НФ-00011265",
+      "Description": "не используется",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "6495ce00-37d6-11f0-8437-9ee51454587f",
+      "Code": "НФ-00008608",
+      "Description": "Оборудование",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "417f1c46-a7f8-11ef-9725-9ee51454587f",
+      "Code": "НФ-00007803",
+      "Description": "ОЗОН",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "4a5a5f28-a69a-11eb-2882-fa163e61326a",
+      "Code": "00-00000186",
+      "Description": "Оснастка",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "d39579fa-2dbb-11f1-986b-9ee51454587f",
+      "Code": "НФ-00011143",
+      "Description": "Офис",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "d8c01d9a-a6c5-11eb-2882-fa163e61326a",
+      "Code": "00-00000187",
+      "Description": "Переработка",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "5cd1d33a-1c6e-11f1-9d63-9ee51454587f",
+      "Code": "НФ-00010858",
+      "Description": "Пластик",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "485ae3a0-a262-11eb-ff98-fa163e61326a",
+      "Code": "00-00000059",
+      "Description": "Подвеска",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "764d941e-b3cf-11eb-7f85-fa163e61326a",
+      "Code": "00-00000318",
+      "Description": "Полуфабрикат",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "0f021b14-a75d-11eb-8287-fa163e61326a",
+      "Code": "00-00000198",
+      "Description": "Работа",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "db80f1ce-37d7-11f0-8437-9ee51454587f",
+      "Code": "НФ-00008610",
+      "Description": "Разработка",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "e71f8138-067d-11f1-8db9-9ee51454587f",
+      "Code": "НФ-00010572",
+      "Description": "Сидение(крашеные)",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "545513e0-a679-11eb-6c85-fa163e61326a",
+      "Code": "00-00000153",
+      "Description": "Стройка",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "712d4ffc-01b7-11f1-8fb2-9ee51454587f",
+      "Code": "НФ-00010557",
+      "Description": "Толкач (крашеные)",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "2968ba7e-1c6c-11f1-9d63-9ee51454587f",
+      "Code": "НФ-00010855",
+      "Description": "Трансмиссия",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "ac8ac9da-5579-11ef-982f-9ee51454587f",
+      "Code": "НФ-00007026",
+      "Description": "Удалено",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "7416c756-993a-11eb-e39a-fa163e61326a",
+      "Code": "00-00000001",
+      "Description": "удалить Кронштейны мотобукс ",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "a5c5516e-5e36-11ee-9a06-9ee51454587f",
+      "Code": "НФ-00004844",
+      "Description": "удалить Лыжный модуль",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "9119b0a4-24d0-11f0-8b5b-9ee51454587f",
+      "Code": "НФ-00008521",
+      "Description": "удалить после покраски",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "3658b9ac-24ef-11f0-8b5b-9ee51454587f",
+      "Code": "НФ-00008531",
+      "Description": "удалить после сборки",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "8a475b64-24d0-11f0-8b5b-9ee51454587f",
+      "Code": "НФ-00008520",
+      "Description": "удалить после сварки",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "c4c83974-37d7-11f0-8437-9ee51454587f",
+      "Code": "НФ-00008609",
+      "Description": "удалить после сверловки",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "95853c58-24d0-11f0-8b5b-9ee51454587f",
+      "Code": "НФ-00008522",
+      "Description": "удалить после токарки",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "f3b8b25e-37d7-11f0-8437-9ee51454587f",
+      "Code": "НФ-00008611",
+      "Description": "удалить после фрезеровки",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "1a85e656-df8b-11ed-93a3-fa163e31a232",
+      "Code": "НФ-00003802",
+      "Description": "удалить Снегоход",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "f0d6bb40-a603-11eb-c196-fa163e61326a",
+      "Code": "00-00000124",
+      "Description": "удалить Трансмиссия",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "4c877274-01b5-11f1-8fb2-9ee51454587f",
+      "Code": "НФ-00010556",
+      "Description": "Узлы (после сборки)",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "df11a02c-1c6f-11f1-9d63-9ee51454587f",
+      "Code": "НФ-00010859",
+      "Description": "Упаковка",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "3214bd16-2cb7-11ec-9b20-fa163e61326a",
+      "Code": "00-00001110",
+      "Description": "Услуги Рыбинск",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "b59d0dba-34bd-11f1-8ba3-9ee51454587f",
+      "Code": "НФ-00011257",
+      "Description": "Хозчасть",
+      "IsFolder": true
+    },
+    {
+      "Ref_Key": "0e1d9ba2-1c6e-11f1-9d63-9ee51454587f",
+      "Code": "НФ-00010857",
+      "Description": "Электрика",
+      "IsFolder": true
+    }
+  ]
+}

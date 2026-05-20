@@ -35,6 +35,13 @@
         :key="order.agg_key || `${order.item_id}|${order.unit || ''}`"
         :props="props"
       >
+        <q-td key="select" auto-width>
+          <q-checkbox
+            dense
+            :model-value="isSelected(order)"
+            @update:model-value="(val) => toggleOrder(order, Boolean(val))"
+          />
+        </q-td>
         <q-td key="name" :props="props">
           <div>{{ order.item_name || t('mrp.placeholder.itemNameFallback', { id: order.item_id }) }}</div>
           <q-badge
@@ -75,12 +82,18 @@ import type { ProductionGroup } from '../../types/mrp'
 const props = defineProps<{
   groups: ProductionGroup[]
   loading?: boolean
+  selectedOrderIds?: number[]
+}>()
+
+const emit = defineEmits<{
+  (e: 'update:selectedOrderIds', value: number[]): void
 }>()
 
 const { formatNumber: fmt, formatQty: fmtQty } = useFormatting()
 const { t } = useI18n()
 
 const columns = computed<QTableColumn[]>(() => ([
+  { name: 'select', label: '', field: 'select', align: 'left' },
   { name: 'name', label: t('mrp.columns.name'), field: 'item_name', align: 'left' },
   { name: 'article', label: t('mrp.columns.article'), field: 'item_article', align: 'left' },
   { name: 'qty', label: t('mrp.columns.qty'), field: 'qty', align: 'right' },
@@ -109,7 +122,10 @@ function deduplicateOrders(orders: any[]) {
         qty: (existingOrder.qty || 0) + (order.qty || 0),
         norm_hours_total: (existingOrder.norm_hours_total || 0) + (order.norm_hours_total || 0),
         badge: existingOrder.badge || order.badge || null,
-        turning_blank_priority: Boolean(existingOrder.turning_blank_priority || order.turning_blank_priority)
+        turning_blank_priority: Boolean(existingOrder.turning_blank_priority || order.turning_blank_priority),
+        source_order_ids: [
+          ...new Set([...(existingOrder.source_order_ids || []), ...(order.source_order_ids || [])].map(Number).filter(Boolean))
+        ]
       });
     } else {
       orderMap.set(key, order);
@@ -117,6 +133,26 @@ function deduplicateOrders(orders: any[]) {
   });
   
   return Array.from(orderMap.values());
+}
+
+function sourceIds(order: any): number[] {
+  const ids = Array.isArray(order?.source_order_ids) ? order.source_order_ids : []
+  return ids.map(Number).filter((id) => Number.isFinite(id) && id > 0)
+}
+
+function isSelected(order: any): boolean {
+  const selected = new Set((props.selectedOrderIds || []).map(Number))
+  const ids = sourceIds(order)
+  return ids.length > 0 && ids.every((id) => selected.has(id))
+}
+
+function toggleOrder(order: any, checked: boolean) {
+  const selected = new Set((props.selectedOrderIds || []).map(Number))
+  for (const id of sourceIds(order)) {
+    if (checked) selected.add(id)
+    else selected.delete(id)
+  }
+  emit('update:selectedOrderIds', Array.from(selected.values()).sort((a, b) => a - b))
 }
 </script>
 

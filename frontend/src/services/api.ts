@@ -251,6 +251,17 @@ export async function exportPlanningResultPurchases(runId: number, params: {
   return data
 }
 
+/** Create 1C supplier orders from purchase planning results */
+export async function exportPlanningResultPurchasesTo1C(runId: number, body: {
+  date_from?: string
+  date_to?: string
+  purchase_ids?: number[]
+  dry_run?: boolean
+} = {}): Promise<any> {
+  const { data } = await api.post(`/v1/plan/results/${runId}/purchases/export-to-1c`, body)
+  return data
+}
+
 /** Export rework results as CSV or XLSX (base64) */
 export async function exportPlanningResultRework(runId: number, params: {
   format: 'csv' | 'xlsx'
@@ -496,5 +507,75 @@ export async function exportForcedOrder(requestId: number): Promise<any> {
 
 export async function listForcedOrders(params: { limit?: number; offset?: number } = {}): Promise<any> {
   const { data } = await api.get('/v1/plan/forced_orders', { params })
+  return data
+}
+
+// ===== Production control journal =====
+
+export type ProductionControlOrderRow = {
+  product_id: number
+  order_id: number
+  order_number: string
+  order_date?: string | null
+  line_number?: number | null
+  item_id: number
+  item_code: string
+  item_name: string
+  item_article?: string | null
+  unit?: string | null
+  quantity: number
+  produced_qty: number
+  remaining_qty: number
+  status: string
+  issue_status: string
+  planned_start_date?: string | null
+  planned_finish_date?: string | null
+  opened_at?: string | null
+  workshop_id?: number | null
+  workshop_name?: string | null
+  stage_id?: number | null
+  stage_name?: string | null
+  spec_id?: number | null
+  issue_count: number
+  route_sheet_printed_at?: string | null
+  comment?: string | null
+}
+
+export async function listProductionControlOrders(params: {
+  workshop_id?: number | null
+  status?: string | null
+  search?: string | null
+  date_from?: string | null
+  date_to?: string | null
+  limit?: number
+  offset?: number
+} = {}): Promise<{ rows: ProductionControlOrderRow[]; total: number; limit: number; offset: number; latest_run_id?: number | null }> {
+  const { data } = await api.get('/v1/production-control/orders', { params })
+  return data
+}
+
+export async function updateProductionControlOrderState(productId: number, body: {
+  status?: string
+  issue_status?: string
+  workshop_id?: number | null
+  planned_start_date?: string | null
+  planned_finish_date?: string | null
+  comment?: string | null
+}): Promise<any> {
+  const { data } = await api.patch(`/v1/production-control/orders/${productId}/state`, body)
+  return data
+}
+
+export async function getProductionControlMaterials(productId: number): Promise<any> {
+  const { data } = await api.get(`/v1/production-control/orders/${productId}/materials`)
+  return data
+}
+
+export async function createProductionMaterialIssues(body: {
+  product_ids: number[]
+  initiated_by?: string | null
+  warehouse_ref1c?: string | null
+}): Promise<any> {
+  const { data } = await api.post('/v1/production-control/material-issues', body)
   return data
 }

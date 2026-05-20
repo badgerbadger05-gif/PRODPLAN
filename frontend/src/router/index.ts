@@ -10,6 +10,7 @@ const Index = () => import('../pages/Index.vue')
   const StagesPage = () => import('../pages/StagesPage.vue')
   const SpecificationPage = () => import('../pages/SpecificationPage.vue')
   const ResourcesPage = () => import('../pages/ResourcesPage.vue')
+  const ProductionControlPage = () => import('../pages/ProductionControlPage.vue')
 
 const MRPRunsPage = () => import('../pages/MRPRunsPage.vue')
 
@@ -25,6 +26,7 @@ const routes = [
       { path: 'stages', name: 'stages', component: StagesPage },
       { path: 'specification', name: 'specification', component: SpecificationPage },
       { path: 'resources', name: 'resources', component: ResourcesPage },
+      { path: 'production-control', name: 'production-control', component: ProductionControlPage },
       { path: 'mrp', name: 'mrp-runs', component: MRPRunsPage },
       { path: 'mrp/:runId', name: 'mrp-result', component: MRPResultPage, props: true }
     ]

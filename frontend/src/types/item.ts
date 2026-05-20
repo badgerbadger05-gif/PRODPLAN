@@ -4,6 +4,7 @@ export interface Item {
   item_name: string
   item_article?: string
   item_ref1c?: string
+  supplier_ref1c?: string
   replenishment_method?: string
   replenishment_time?: number
   unit?: string
@@ -18,6 +19,7 @@ export interface ItemCreate {
   item_name: string
   item_article?: string
  item_ref1c?: string
+  supplier_ref1c?: string
   replenishment_method?: string
   replenishment_time?: number
   unit?: string
@@ -30,6 +32,7 @@ export interface ItemUpdate {
   item_name?: string
   item_article?: string
   item_ref1c?: string
+  supplier_ref1c?: string
   replenishment_method?: string
   replenishment_time?: number
   unit?: string

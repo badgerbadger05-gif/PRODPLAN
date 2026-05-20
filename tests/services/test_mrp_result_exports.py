@@ -103,7 +103,7 @@ def test_export_purchases_results_xlsx_groups_by_category(db_session):
     assert ws["A1"].value == "Товарная группа: Группа закупки"
     assert ws["A5"].value == "Товарная группа: Без товарной группы"
 
-    headers = [ws.cell(row=2, column=idx).value for idx in range(1, 9)]
+    headers = [ws.cell(row=2, column=idx).value for idx in range(1, 10)]
     assert headers == [
         "Наименование",
         "Артикул",
@@ -113,6 +113,7 @@ def test_export_purchases_results_xlsx_groups_by_category(db_session):
         "Дата заказа",
         "Срок пополнения, дн.",
         "Поставщик 1С",
+        "Пометка",
     ]
     assert ws["A3"].value == "Покупка с группой"
     assert ws["C3"].value == 5

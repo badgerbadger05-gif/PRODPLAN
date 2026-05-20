@@ -58,6 +58,7 @@ from ..services.mrp_result_export import (
     export_purchases_results_xlsx,
     export_rework_results_xlsx,
 )
+from ..services.one_c_purchase_order_export import export_planned_purchases_to_1c
 
 router = APIRouter(prefix="/v1/plan", tags=["plan"])
 
@@ -152,6 +153,13 @@ class ForcedOrderCreateRequest(BaseModel):
     requested_qty: float
     created_by: Optional[str] = None
     reason: Optional[str] = None
+
+
+class PurchaseOrder1CExportRequest(BaseModel):
+    date_from: Optional[str] = None
+    date_to: Optional[str] = None
+    purchase_ids: Optional[List[int]] = None
+    dry_run: Optional[bool] = False
 
 
 
@@ -1191,6 +1199,29 @@ async def export_planning_result_purchases(
             }
     except HTTPException:
         raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/results/{run_id}/purchases/export-to-1c")
+async def export_planning_result_purchases_to_1c(
+    run_id: int,
+    req: PurchaseOrder1CExportRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Создать в 1С заказы поставщикам по результатам закупок MRP.
+    Строки группируются по поставщику: один `Document_ЗаказПоставщику` на каждого поставщика.
+    """
+    try:
+        return export_planned_purchases_to_1c(
+            db=db,
+            run_id=int(run_id),
+            date_from=req.date_from,
+            date_to=req.date_to,
+            purchase_ids=req.purchase_ids,
+            dry_run=bool(req.dry_run),
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

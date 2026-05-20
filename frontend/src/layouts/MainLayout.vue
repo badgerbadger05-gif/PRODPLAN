@@ -98,6 +98,16 @@
               <q-item-label caption>Управление участками</q-item-label>
             </q-item-section>
           </q-item>
+
+          <q-item clickable v-ripple to="/production-control" exact class="menu-item">
+            <q-item-section avatar>
+              <q-icon name="assignment" />
+            </q-item-section>
+            <q-item-section>
+              <q-item-label>Журнал заказов</q-item-label>
+              <q-item-label caption>Маршрутные листы и выдача</q-item-label>
+            </q-item-section>
+          </q-item>
  
           <!-- Этапы производства -->
           <q-item clickable v-ripple to="/stages" exact class="menu-item">

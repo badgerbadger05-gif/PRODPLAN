@@ -45,6 +45,7 @@
           >
             <template #extra-actions>
               <q-toggle dense v-model="showTechnicalRows" :label="t('mrp.filters.showTechnicalRows')" />
+              <q-badge color="primary" outline>Выбрано: {{ selectedProductionOrderIds.length }}</q-badge>
               <q-separator vertical class="q-mx-xs" />
               <q-btn dense flat icon="download" :label="t('mrp.actions.csv')" @click="exportProd('csv')" />
               <q-btn dense flat icon="table_view" :label="t('mrp.actions.xlsx')" @click="exportProd('xlsx')" />
@@ -59,6 +60,7 @@
             <ProductionGroupedTable
               :groups="groupedProdRows"
               :loading="prod.loading"
+              v-model:selected-order-ids="selectedProductionOrderIds"
             />
           </template>
 
@@ -67,6 +69,7 @@
             <ProductionUnifiedTable
               :rows="plainProdRows"
               :loading="prod.loading"
+              v-model:selected-order-ids="selectedProductionOrderIds"
             />
           </template>
         </q-tab-panel>
@@ -85,6 +88,7 @@
               <q-separator vertical class="q-mx-xs" />
               <q-btn dense flat icon="download" :label="t('mrp.actions.csv')" @click="exportPurch('csv')" />
               <q-btn dense flat icon="table_view" :label="t('mrp.actions.xlsx')" @click="exportPurch('xlsx')" />
+              <q-btn dense flat color="primary" icon="cloud_upload" :label="`В 1С (${selectedPurchaseIds.length})`" :loading="purchaseExport1cLoading" @click="exportPurchasesTo1C" />
             </template>
           </ProductionFilters>
 
@@ -108,6 +112,15 @@
                 hide-bottom
                 :pagination="{ page: 1, rowsPerPage: 1000 }"
               >
+                <template #body-cell-select="props">
+                  <q-td :props="props" auto-width>
+                    <q-checkbox
+                      dense
+                      :model-value="isPurchaseRowSelected(props.row)"
+                      @update:model-value="(val) => togglePurchaseRow(props.row, Boolean(val))"
+                    />
+                  </q-td>
+                </template>
                 <template #body-cell-name="props">
                   <q-td :props="props">
                     <div>{{ props.row.item_name || t('mrp.placeholder.itemNameFallback', { id: props.row.item_id }) }}</div>
@@ -398,6 +411,7 @@ import api, {
   listResources,
   exportPlanningResultProduction,
   exportPlanningResultPurchases,
+  exportPlanningResultPurchasesTo1C,
   exportPlanningResultRework,
   getPlanningResultProductionGrouped,
   getPlanningResultRework,
@@ -499,6 +513,7 @@ const prodUnifiedColumns: QTableColumn<any>[] = [
 ]
 
 const purchaseGroupColumns: QTableColumn<any>[] = [
+  { name: 'select', label: '', field: () => '', align: 'left' },
   { name: 'name', label: t('mrp.columns.name'), field: 'item_name', align: 'left' },
   { name: 'article', label: t('mrp.columns.article'), field: 'item_article', align: 'left' },
   { name: 'qty', label: t('mrp.columns.qty'), field: 'qty', align: 'right', format: (val: number) => fmtQty(val) },
@@ -601,8 +616,11 @@ const kindIssuesRows = computed(() => {
  // Полные наборы строк для верхних таблиц (без учёта пагинации детальных)
  const prodAllRows = ref<any[]>([])
  const purchAllRows = ref<any[]>([])
- const purchaseCategoryGroups = ref<PurchaseCategoryGroup[]>([])
- const reworkGroups = ref<ReworkGroup[]>([])
+const purchaseCategoryGroups = ref<PurchaseCategoryGroup[]>([])
+const reworkGroups = ref<ReworkGroup[]>([])
+const purchaseExport1cLoading = ref(false)
+const selectedPurchaseIds = ref<number[]>([])
+const selectedProductionOrderIds = ref<number[]>([])
 // Итоговый источник строк для карточки «Рекомендуемые заказы на производство»
 const groupedProdRows = computed(() => {
   return groupedProductionOrders.value || []
@@ -900,6 +918,7 @@ async function loadProduction() {
      prod.rows = []
      prod.pagination.rowsNumber = 0
      prodAllRows.value = []
+     selectedProductionOrderIds.value = []
    } finally {
      prod.loading = false
   }
@@ -952,6 +971,7 @@ async function loadPurchases() {
         bucket_type: r?.bucket_type ?? 'daily',
         bucket_date: r?.bucket_date ?? null,
         supplier_ref1c: r?.supplier_ref1c ?? null,
+        source_purchase_ids: Array.isArray(r?.source_purchase_ids) ? r.source_purchase_ids.map(Number).filter(Boolean) : [Number(r?.purchase_id || 0)].filter(Boolean),
       }))
       purchaseCategoryGroups.value = fallbackOrders.length
         ? [{
@@ -968,6 +988,7 @@ async function loadPurchases() {
     purch.pagination.rowsNumber = 0
     purchAllRows.value = []
     purchaseCategoryGroups.value = []
+    selectedPurchaseIds.value = []
   } finally {
     purch.loading = false
   }
@@ -1095,6 +1116,59 @@ async function exportPurch(fmt: 'csv' | 'xlsx') {
   } catch (e) {
     console.error('Export purchases failed', e)
   }
+}
+
+async function exportPurchasesTo1C() {
+  if (!selectedPurchaseIds.value.length) {
+    alert('Выберите строки закупки для выгрузки в 1С')
+    return
+  }
+  purchaseExport1cLoading.value = true
+  try {
+    const res = await exportPlanningResultPurchasesTo1C(runId, {
+      date_from: emptyToUndef(purch.filter.date_from),
+      date_to: emptyToUndef(purch.filter.date_to),
+      purchase_ids: selectedPurchaseIds.value,
+      dry_run: false
+    })
+    const created = Number(res?.orders_created || 0)
+    const existing = Number(res?.orders_existing || 0)
+    const skipped = Array.isArray(res?.skipped_rows) ? res.skipped_rows.length : 0
+    const errors = Array.isArray(res?.orders) ? res.orders.filter((order: any) => order?.status === 'error') : []
+    const statusText = res?.status === 'partial_error' ? 'Выгрузка завершилась с ошибками' : 'Выгрузка завершена'
+    const errorText = errors
+      .slice(0, 3)
+      .map((order: any) => `${order?.number || order?.supplier_ref1c || 'заказ'}: ${order?.error || 'ошибка без текста'}`)
+      .join('\n')
+    const moreErrors = errors.length > 3 ? `\nЕще ошибок: ${errors.length - 3}.` : ''
+    alert(`${statusText}. Создано заказов: ${created}. Уже существовало: ${existing}. Пропущено строк: ${skipped}.${errorText ? `\n${errorText}${moreErrors}` : ''}`)
+  } catch (e: any) {
+    console.error('Export purchases to 1C failed', e)
+    const detail = e?.response?.data?.detail || e?.message || e
+    alert(`Не удалось выгрузить заказы поставщикам в 1С: ${String(detail)}`)
+  } finally {
+    purchaseExport1cLoading.value = false
+  }
+}
+
+function purchaseSourceIds(row: any): number[] {
+  const ids = Array.isArray(row?.source_purchase_ids) ? row.source_purchase_ids : []
+  return ids.map(Number).filter((id) => Number.isFinite(id) && id > 0)
+}
+
+function isPurchaseRowSelected(row: any): boolean {
+  const selected = new Set(selectedPurchaseIds.value.map(Number))
+  const ids = purchaseSourceIds(row)
+  return ids.length > 0 && ids.every((id) => selected.has(id))
+}
+
+function togglePurchaseRow(row: any, checked: boolean) {
+  const selected = new Set(selectedPurchaseIds.value.map(Number))
+  for (const id of purchaseSourceIds(row)) {
+    if (checked) selected.add(id)
+    else selected.delete(id)
+  }
+  selectedPurchaseIds.value = Array.from(selected.values()).sort((a, b) => a - b)
 }
 
 async function exportRework(fmt: 'csv' | 'xlsx') {
@@ -1310,6 +1384,7 @@ function onPurchRequest(ctx: any) {
 function onPurchReset() {
   purch.filter.date_from = ''
   purch.filter.date_to = ''
+  selectedPurchaseIds.value = []
   loadPurchases()
 }
 function onReworkRequest(ctx: any) {
@@ -1394,6 +1469,7 @@ const applyProdFilters = async () => {
   // Обновляем фильтры в prod.filter для согласованности
   prod.filter.date_from = prodFilters.date_from || '';
   prod.filter.date_to = prodFilters.date_to || '';
+  selectedProductionOrderIds.value = []
   await loadProduction()
   await loadCapacityUpper()
 }
@@ -1406,7 +1482,10 @@ function debugProdFilters() {
   console.log('Production rows count:', prod.rows.length);
   console.log('Production all rows count:', prodAllRows.value.length);
 }
-const applyPurchFiltersDebounced = debounce(loadPurchases, 250)
+const applyPurchFiltersDebounced = debounce(() => {
+  selectedPurchaseIds.value = []
+  loadPurchases()
+}, 250)
 const applyReworkFiltersDebounced = debounce(loadRework, 250)
 const loadCapacityUpperDebounced = debounce(loadCapacityUpper, 250)
 

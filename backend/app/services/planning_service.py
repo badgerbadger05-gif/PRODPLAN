@@ -557,6 +557,7 @@ def get_run_production(
                 "stages": [],
                 "norm_hours_total": 0.0,
                 "norm_hours_per_unit": None,
+                "source_order_ids": [],
                 # flags for UI semantics
                 "flags": {
                     "missingArea": False,
@@ -568,6 +569,7 @@ def get_run_production(
             }
         
         aggregated_data[agg_key]["qty"] += float(po.qty or 0.0)
+        aggregated_data[agg_key].setdefault("source_order_ids", []).append(int(po.order_id))
 
     # Stages enrichment
     stages: List[PlannedOrderStage] = []
@@ -652,6 +654,7 @@ def get_run_production(
                 "stages": [],
                 "norm_hours_total": 0.0,
                 "norm_hours_per_unit": None,
+                "source_order_ids": [int(po.order_id)],
                 "flags": {
                     "missingArea": False,
                     "missingNorm": False,
@@ -1139,6 +1142,7 @@ def get_run_purchases(
                 "badge": badge,
                 "turning_blank_priority": bool(turning_badge),
                 "late_supplier_order": bool(late_supplier_badge),
+                "source_purchase_ids": [],
             }
         elif badge:
             aggregated_data[agg_key]["badge"] = _merge_badges(aggregated_data[agg_key].get("badge"), badge)
@@ -1150,6 +1154,8 @@ def get_run_purchases(
             )
         
         aggregated_data[agg_key]["qty"] += float(qty_val or 0.0)
+        if purchase_id is not None:
+            aggregated_data[agg_key].setdefault("source_purchase_ids", []).append(int(purchase_id))
 
     data: List[Dict[str, Any]] = []
     for key in sorted(aggregated_data.keys()):
@@ -1787,6 +1793,7 @@ def get_run_production_grouped(
             "norm_hours_total": float(norm_total),
             "norm_hours_per_unit": norm_per_unit,
             "order_id": int(po.order_id),
+            "source_order_ids": [int(po.order_id)],
             "badge": badge,
             "turning_blank_priority": bool(badge),
         }
