@@ -11,6 +11,7 @@ from ..database import get_db
 from ..schemas import ODataSyncRequest
 from ..services.production_control import (
     create_material_issues,
+    create_orders_from_mrp,
     get_issue,
     list_journal,
     mark_route_sheets_printed,
@@ -37,6 +38,11 @@ class MaterialIssueCreatePayload(BaseModel):
     product_ids: List[int]
     initiated_by: Optional[str] = None
     warehouse_ref1c: Optional[str] = None
+
+
+class OrdersFromMrpPayload(BaseModel):
+    planned_order_ids: List[int]
+    initiated_by: Optional[str] = None
 
 
 @router.get("/orders", response_model=dict)
@@ -81,6 +87,25 @@ def get_order_line_materials(product_id: int, db: Session = Depends(get_db)):
         return preview_materials(db, int(product_id))
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/orders/from-mrp", response_model=dict)
+def post_orders_from_mrp(payload: OrdersFromMrpPayload, db: Session = Depends(get_db)):
+    """
+    Materialize selected MRP planned_order rows as internal production orders
+    (production_orders.source='mrp'). Idempotent: planned_orders that already
+    back a production_products line are returned under `reused`.
+    """
+    if not payload.planned_order_ids:
+        raise HTTPException(status_code=400, detail="Не выбраны строки MRP")
+    try:
+        return create_orders_from_mrp(
+            db,
+            [int(x) for x in payload.planned_order_ids],
+            initiated_by=payload.initiated_by,
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

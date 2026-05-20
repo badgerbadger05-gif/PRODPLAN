@@ -177,6 +177,142 @@ def _main_workshop_for_spec(db: Session, spec_id: Optional[int]) -> Tuple[Option
     return (workshop_id, workshop_name, stage_id, stage_name)
 
 
+def create_orders_from_mrp(
+    db: Session,
+    planned_order_ids: Sequence[int],
+    *,
+    initiated_by: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Materialize selected MRP planned_order rows into internal production
+    orders (ProductionOrder.source='mrp', ProductionProduct.source_planned_
+    order_id=...).
+
+    Idempotent per the plan: if a planned_order is already backed by a
+    ProductionProduct, it is returned in `reused` and no duplicate is made.
+    The partial UNIQUE INDEX ux_production_products_source_planned_order
+    enforces this at the DB layer as a safety net.
+
+    Each internal order gets a single line with quantity / remaining_qty
+    equal to the planned_order's planned_qty, and a ProductionOrderLineState
+    row in status='new' / issue_status='not_requested'.
+    """
+    created: List[Dict[str, Any]] = []
+    reused: List[Dict[str, Any]] = []
+    errors: List[str] = []
+
+    today = datetime.utcnow()
+    for pid_raw in planned_order_ids:
+        try:
+            pid = int(pid_raw)
+        except Exception:
+            errors.append(f"planned_order_id={pid_raw!r}: невалидный идентификатор")
+            continue
+
+        planned = db.query(PlannedOrder).filter(PlannedOrder.order_id == pid).first()
+        if not planned:
+            errors.append(f"planned_order_id={pid}: запись MRP не найдена")
+            continue
+
+        item = db.query(Item).filter(Item.item_id == int(planned.item_id)).first()
+        if not item:
+            errors.append(f"planned_order_id={pid}: номенклатура {planned.item_id} не найдена")
+            continue
+
+        # Idempotency check at the application layer (cheap, friendly error)
+        existing_product = (
+            db.query(ProductionProduct)
+            .filter(ProductionProduct.source_planned_order_id == pid)
+            .order_by(ProductionProduct.product_id.desc())
+            .first()
+        )
+        if existing_product is not None:
+            existing_order = (
+                db.query(ProductionOrder)
+                .filter(ProductionOrder.order_id == existing_product.order_id)
+                .first()
+            )
+            reused.append(
+                {
+                    "planned_order_id": pid,
+                    "product_id": int(existing_product.product_id),
+                    "order_id": int(existing_product.order_id),
+                    "order_number": str(existing_order.order_number) if existing_order else None,
+                    "item_id": int(planned.item_id),
+                    "item_name": str(item.item_name or ""),
+                }
+            )
+            continue
+
+        qty = _to_float(planned.planned_qty) or _to_float(planned.qty)
+        if qty <= 0:
+            errors.append(f"planned_order_id={pid}: planned_qty={planned.planned_qty!r} — нечего материализовать")
+            continue
+
+        # Deterministic, traceable internal number — also unique because
+        # production_orders.order_number is indexed (not unique-constrained,
+        # but planned_order.order_id never repeats within a planning_run).
+        order_number = f"MRP-{int(planned.run_id)}-{pid}"
+        order = ProductionOrder(
+            order_number=order_number,
+            order_date=today,
+            order_ref1c=None,
+            is_posted=False,
+            deletion_mark=False,
+            source="mrp",
+            source_run_id=int(planned.run_id),
+        )
+        db.add(order)
+        db.flush()
+
+        product = ProductionProduct(
+            order_id=int(order.order_id),
+            item_id=int(planned.item_id),
+            line_number=1,
+            quantity=qty,
+            produced_qty=0,
+            remaining_qty=qty,
+            spec_id=_default_spec_id_for_item(db, int(planned.item_id)),
+            source_planned_order_id=pid,
+        )
+        db.add(product)
+        db.flush()
+
+        state = ProductionOrderLineState(
+            product_id=int(product.product_id),
+            status="new",
+            issue_status="not_requested",
+            planned_start_date=planned.start_date,
+            planned_finish_date=planned.finish_date or planned.need_date,
+        )
+        db.add(state)
+
+        created.append(
+            {
+                "planned_order_id": pid,
+                "product_id": int(product.product_id),
+                "order_id": int(order.order_id),
+                "order_number": order_number,
+                "item_id": int(planned.item_id),
+                "item_name": str(item.item_name or ""),
+                "qty": qty,
+            }
+        )
+
+    db.commit()
+    return {"status": "ok", "created": created, "reused": reused, "errors": errors, "initiated_by": initiated_by}
+
+
+def _default_spec_id_for_item(db: Session, item_id: int) -> Optional[int]:
+    row = (
+        db.query(DefaultSpecification)
+        .filter(DefaultSpecification.item_id == int(item_id))
+        .order_by(DefaultSpecification.id.asc())
+        .first()
+    )
+    return int(row.spec_id) if row else None
+
+
 def _latest_run_id(db: Session) -> Optional[int]:
     row = (
         db.query(PlanningRun)

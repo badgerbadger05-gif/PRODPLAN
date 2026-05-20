@@ -15,7 +15,12 @@ from app.models import (
     SpecComponent,
     Specification,
 )
-from app.services.production_control import create_material_issues, list_journal, preview_materials
+from app.services.production_control import (
+    create_material_issues,
+    create_orders_from_mrp,
+    list_journal,
+    preview_materials,
+)
 
 
 def test_journal_and_material_issue_are_scoped_to_order_line(db_session):
@@ -303,4 +308,143 @@ def test_create_material_issues_is_idempotent_per_product(db_session):
         .filter(ProductionMaterialIssue.product_id == product.product_id)
         .count()
         == 1
+    )
+
+
+def test_create_orders_from_mrp_materializes_planned_orders(db_session):
+    """
+    POST /v1/production-control/orders/from-mrp must turn selected
+    planned_order rows into internal production orders tagged source='mrp',
+    with the source_planned_order_id back-link and an initial line state.
+    Second call for the same planned_orders is a no-op (reused).
+    """
+    item = Item(
+        item_code="MRP-ITEM",
+        item_name="Item from MRP",
+        item_article="ART-MRP",
+        unit="шт",
+        stock_qty=0,
+        status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+
+    run = PlanningRun(status="DONE", config_snapshot=json.dumps({}))
+    db_session.add(run)
+    db_session.flush()
+    planned_a = PlannedOrder(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        requested_qty=10,
+        planned_qty=10,
+        qty=10,
+        need_date=_dt.date(2026, 6, 1),
+        start_date=_dt.date(2026, 5, 25),
+        finish_date=_dt.date(2026, 5, 31),
+        bucket_date=_dt.date(2026, 6, 1),
+    )
+    planned_b = PlannedOrder(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        requested_qty=4,
+        planned_qty=4,
+        qty=4,
+        need_date=_dt.date(2026, 6, 5),
+        bucket_date=_dt.date(2026, 6, 5),
+    )
+    db_session.add_all([planned_a, planned_b])
+    db_session.commit()
+
+    first = create_orders_from_mrp(
+        db_session,
+        [planned_a.order_id, planned_b.order_id],
+        initiated_by="planner",
+    )
+    assert first["status"] == "ok"
+    assert first["errors"] == []
+    assert first["reused"] == []
+    assert {row["planned_order_id"] for row in first["created"]} == {
+        planned_a.order_id,
+        planned_b.order_id,
+    }
+    for row in first["created"]:
+        order = (
+            db_session.query(ProductionOrder)
+            .filter(ProductionOrder.order_id == row["order_id"])
+            .one()
+        )
+        assert order.source == "mrp"
+        assert order.source_run_id == run.run_id
+        assert order.is_posted is False
+        assert order.order_ref1c is None
+        product = (
+            db_session.query(ProductionProduct)
+            .filter(ProductionProduct.product_id == row["product_id"])
+            .one()
+        )
+        assert product.source_planned_order_id == row["planned_order_id"]
+        assert float(product.quantity) == row["qty"]
+        assert float(product.remaining_qty) == row["qty"]
+        # ProductionOrderLineState seeded with status='new'.
+        from app.models import ProductionOrderLineState as POLS
+        state = (
+            db_session.query(POLS)
+            .filter(POLS.product_id == product.product_id)
+            .one()
+        )
+        assert state.status == "new"
+        assert state.issue_status == "not_requested"
+
+    # Second call must be a no-op.
+    second = create_orders_from_mrp(
+        db_session,
+        [planned_a.order_id, planned_b.order_id],
+    )
+    assert second["created"] == []
+    assert len(second["reused"]) == 2
+    assert (
+        db_session.query(ProductionOrder)
+        .filter(ProductionOrder.source == "mrp", ProductionOrder.source_run_id == run.run_id)
+        .count()
+        == 2
+    )
+
+
+def test_create_orders_from_mrp_skips_invalid_inputs(db_session):
+    """
+    Bad planned_order ids and 0-qty rows must be reported as errors instead of
+    aborting the whole batch.
+    """
+    item = Item(
+        item_code="MRP-SKIP",
+        item_name="Skip item",
+        item_article="SKIP",
+        unit="шт",
+        stock_qty=0,
+        status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+    run = PlanningRun(status="DONE", config_snapshot=json.dumps({}))
+    db_session.add(run)
+    db_session.flush()
+    zero_qty = PlannedOrder(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        requested_qty=0,
+        planned_qty=0,
+        qty=0,
+        need_date=_dt.date(2026, 6, 1),
+        bucket_date=_dt.date(2026, 6, 1),
+    )
+    db_session.add(zero_qty)
+    db_session.commit()
+
+    result = create_orders_from_mrp(db_session, [zero_qty.order_id, 999_999])
+    assert result["created"] == []
+    assert result["reused"] == []
+    assert len(result["errors"]) == 2
+    # Nothing committed for the invalid batch.
+    assert (
+        db_session.query(ProductionOrder).filter(ProductionOrder.source == "mrp").count() == 0
     )
