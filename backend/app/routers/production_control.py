@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..schemas import ODataSyncRequest
+from ..services.one_c_production_order_export import export_production_orders_to_1c
 from ..services.production_control import (
     create_material_issues,
     create_orders_from_mrp,
@@ -58,6 +59,12 @@ class IgnoredWarehousePayload(BaseModel):
     warehouse_ref1c: str
     warehouse_name: Optional[str] = None
     reason: Optional[str] = None
+
+
+class ExportProductionOrdersPayload(BaseModel):
+    order_ids: List[int]
+    dry_run: bool = True
+    allow_production: bool = False
 
 
 @router.get("/orders", response_model=dict)
@@ -123,6 +130,42 @@ def post_orders_from_mrp(payload: OrdersFromMrpPayload, db: Session = Depends(ge
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/orders/export-to-1c", response_model=dict)
+def post_export_production_orders_to_1c(
+    payload: ExportProductionOrdersPayload,
+    db: Session = Depends(get_db),
+):
+    """
+    Export selected internal MRP production_orders to 1C as
+    Document_ЗаказНаПроизводство (Posted=false).
+
+    Idempotent via sync_link: orders already linked are returned in the
+    response under entries[].status='existing' and not re-sent.
+
+    Safety:
+    - Default `dry_run=true` returns the payload that would be sent without
+      contacting 1C.
+    - To actually write, pass `dry_run=false`. Refuses non-demo base_url
+      unless `allow_production=true` is also set.
+    """
+    if not payload.order_ids:
+        raise HTTPException(status_code=400, detail="Не выбраны заказы для экспорта")
+    try:
+        return export_production_orders_to_1c(
+            db,
+            [int(x) for x in payload.order_ids],
+            dry_run=bool(payload.dry_run),
+            allow_production=bool(payload.allow_production),
+        )
+    except PermissionError as e:
+        # Demo-DB safety guard tripped.
+        raise HTTPException(status_code=403, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/material-issues", response_model=dict)
