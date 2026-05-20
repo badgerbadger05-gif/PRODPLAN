@@ -539,6 +539,21 @@ def test_purchase_results_marks_late_supplier_order_coverage(db_session):
     assert "Покрыто заказом, но опоздание 7 дн." in row["badge"]
     assert "ЗСНФ-LATE" in row["badge"]
 
+    # Regression: badge/late_supplier_order/turning_blank_priority must survive
+    # serialization through the PurchaseCategoryGroupOrder response model used
+    # by /purchases/grouped-by-category. FastAPI drops fields not declared on
+    # the response model, so the schema must explicitly list them.
+    from app.schemas import PurchaseCategoryGroupOrder
+    from app.services.planning_service import get_run_purchases_grouped_by_category
+
+    grouped = get_run_purchases_grouped_by_category(db, run.run_id)
+    assert grouped["total_orders"] == 1
+    order_row = grouped["groups"][0]["orders"][0]
+    serialized = PurchaseCategoryGroupOrder(**order_row).model_dump()
+    assert serialized["late_supplier_order"] is True
+    assert "Покрыто заказом, но опоздание 7 дн." in (serialized["badge"] or "")
+    assert "ЗСНФ-LATE" in (serialized["badge"] or "")
+
 
 def test_turning_item_net_requirement_collapses_to_first_need_date_and_moves_blank(db_session):
     db = db_session
