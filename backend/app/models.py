@@ -1,6 +1,6 @@
-from sqlalchemy import Column, Integer, String, DECIMAL, TIMESTAMP, ForeignKey, TEXT, Boolean, DateTime, Date, CheckConstraint, JSON, UniqueConstraint
+from sqlalchemy import Column, Integer, String, DECIMAL, TIMESTAMP, ForeignKey, TEXT, Boolean, DateTime, Date, CheckConstraint, JSON, UniqueConstraint, Index
 from sqlalchemy.orm import relationship
-from sqlalchemy.sql import func
+from sqlalchemy.sql import func, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.types import TypeDecorator
@@ -173,9 +173,14 @@ class ProductionOrder(Base):
     order_state_key = Column(String(36), nullable=True, index=True)
     order_state_name = Column(String(255), nullable=True)
     deletion_mark = Column(Boolean, default=False, nullable=False, index=True)
+    # Source tagging: distinguishes internally created MRP orders ('mrp') from
+    # 1C-synced ones ('1c'). source_run_id ties an internal order back to the
+    # planning_run it was generated from.
+    source = Column(String(16), nullable=False, default="1c", server_default="1c", index=True)
+    source_run_id = Column(Integer, ForeignKey('planning_run.run_id', ondelete="SET NULL"), nullable=True, index=True)
     created_at = Column(TIMESTAMP, default=func.now())
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
-    
+
     # Relationship для загрузки продукции заказа
     products = relationship("ProductionProduct", back_populates="order", lazy="select")
 
@@ -185,6 +190,15 @@ class ProductionProduct(Base):
 
     __table_args__ = (
         UniqueConstraint("order_id", "line_number", name="ux_production_products_order_line"),
+        # Partial unique index (NULLs not constrained) enforced at the DB layer
+        # via migration 20260520_01. Declared here for ORM autogenerate parity.
+        Index(
+            "ux_production_products_source_planned_order",
+            "source_planned_order_id",
+            unique=True,
+            postgresql_where=text("source_planned_order_id IS NOT NULL"),
+            sqlite_where=text("source_planned_order_id IS NOT NULL"),
+        ),
     )
 
     product_id = Column(Integer, primary_key=True, index=True)
@@ -199,6 +213,14 @@ class ProductionProduct(Base):
     remaining_qty = Column(DECIMAL(10, 3), nullable=False)
     spec_id = Column(Integer, ForeignKey('specifications.spec_id'), nullable=True)
     stage_id = Column(Integer, ForeignKey('production_stages.stage_id'), nullable=True)
+    # When this line was generated from MRP (rather than 1C-synced), points to
+    # the planned_order row it came from. NULL for 1C-synced lines. Partial
+    # unique index above prevents the same planned_order being duplicated.
+    source_planned_order_id = Column(
+        Integer,
+        ForeignKey('planned_order.order_id', ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at = Column(TIMESTAMP, default=func.now())
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
 
