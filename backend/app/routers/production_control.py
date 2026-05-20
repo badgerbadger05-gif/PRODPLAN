@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from ..database import get_db
 from ..schemas import ODataSyncRequest
 from ..services.one_c_production_order_export import export_production_orders_to_1c
+from ..services.one_c_stock_transfer_export import export_material_issues_to_1c
 from ..services.production_control import (
     create_material_issues,
     create_orders_from_mrp,
@@ -63,6 +64,12 @@ class IgnoredWarehousePayload(BaseModel):
 
 class ExportProductionOrdersPayload(BaseModel):
     order_ids: List[int]
+    dry_run: bool = True
+    allow_production: bool = False
+
+
+class ExportMaterialIssuesPayload(BaseModel):
+    issue_ids: List[int]
     dry_run: bool = True
     allow_production: bool = False
 
@@ -193,13 +200,45 @@ def get_material_issue(issue_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.post("/material-issues/{issue_id}/export-to-1c", response_model=dict)
-def post_material_issue_to_1c(issue_id: int, payload: ODataSyncRequest, db: Session = Depends(get_db)):
+@router.post("/material-issues/export-to-1c", response_model=dict)
+def post_export_material_issues_to_1c(
+    payload: ExportMaterialIssuesPayload,
+    db: Session = Depends(get_db),
+):
     """
-    Экспорт внутреннего документа выдачи в 1С.
+    Bulk-экспорт выдач материалов в 1С как Document_ПеремещениеЗапасов
+    (Posted=false). Идемпотентно через sync_link.
 
-    Для первой настройки используйте dry_run=true: endpoint вернет payload, который
-    нужно сопоставить с фактическим документом/обработкой в вашей конфигурации 1С.
+    - `dry_run=true` (default) — возвращает payload, не пишет в 1С.
+    - `dry_run=false` — реально пишет; refuse при non-demo base_url без
+      `allow_production=true`.
+    """
+    if not payload.issue_ids:
+        raise HTTPException(status_code=400, detail="Не выбраны документы выдачи")
+    try:
+        return export_material_issues_to_1c(
+            db,
+            [int(x) for x in payload.issue_ids],
+            dry_run=bool(payload.dry_run),
+            allow_production=bool(payload.allow_production),
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/material-issues/{issue_id}/export-to-1c", response_model=dict, deprecated=True)
+def post_material_issue_to_1c_legacy(
+    issue_id: int,
+    payload: ODataSyncRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Legacy: single-issue export. Kept for backwards-compatibility with
+    existing clients. Prefer POST /material-issues/export-to-1c.
     """
     try:
         return export_issue_to_1c(db, int(issue_id), payload)
