@@ -29,7 +29,18 @@ from ..schemas import ODataSyncRequest
 
 
 DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
-LINE_STATUSES = {"new", "opened", "in_work", "waiting_materials", "done", "cancelled"}
+# Plan: колонка "Обеспечение" — состояния обеспечения компонентами.
+# 'cancelled' добавлено как out-of-band статус для админских отмен.
+LINE_STATUSES = {
+    "shortage",
+    "partial",
+    "ready",
+    "to_move",
+    "assembled",
+    "produced_partial",
+    "produced",
+    "cancelled",
+}
 ISSUE_STATUSES = {"not_requested", "requested", "issued", "exported", "error"}
 
 
@@ -112,7 +123,7 @@ def _ensure_state(db: Session, product: ProductionProduct) -> ProductionOrderLin
         return state
     state = ProductionOrderLineState(
         product_id=product.product_id,
-        status="new",
+        status="shortage",
         issue_status="not_requested",
     )
     db.add(state)
@@ -280,7 +291,7 @@ def create_orders_from_mrp(
 
         state = ProductionOrderLineState(
             product_id=int(product.product_id),
-            status="new",
+            status="shortage",
             issue_status="not_requested",
             planned_start_date=planned.start_date,
             planned_finish_date=planned.finish_date or planned.need_date,
@@ -371,7 +382,7 @@ def list_journal(
     )
 
     if status:
-        query = query.filter(func.coalesce(ProductionOrderLineState.status, "new") == status)
+        query = query.filter(func.coalesce(ProductionOrderLineState.status, "shortage") == status)
     if search:
         like = f"%{search.strip()}%"
         query = query.filter(
@@ -423,7 +434,7 @@ def list_journal(
                 "quantity": _to_float(product.quantity),
                 "produced_qty": _to_float(product.produced_qty),
                 "remaining_qty": _to_float(product.remaining_qty),
-                "status": str(state.status if state else "new"),
+                "status": str(state.status if state else "shortage"),
                 "issue_status": str(state.issue_status if state else "not_requested"),
                 "planned_start_date": _date_to_iso(planned_start),
                 "planned_finish_date": _date_to_iso(planned_finish),
@@ -462,7 +473,9 @@ def update_line_state(db: Session, product_id: int, payload: Dict[str, Any]) -> 
         if status not in LINE_STATUSES:
             raise ValueError(f"Недопустимый статус: {status}")
         state.status = status
-        if status == "opened" and not state.opened_at:
+        # First time the journal moves the line past 'shortage' / 'partial',
+        # stamp opened_at — it acts as a workshop-side timestamp.
+        if status in {"ready", "to_move", "assembled", "produced_partial", "produced"} and not state.opened_at:
             state.opened_at = datetime.utcnow()
     if "issue_status" in payload and payload.get("issue_status"):
         issue_status = str(payload.get("issue_status")).strip()
@@ -622,8 +635,11 @@ def create_material_issues(
             )
         state = _ensure_state(db, product)
         state.issue_status = "requested"
-        if state.status == "new":
-            state.status = "waiting_materials"
+        # Once a material-issue draft is open, the line has moved beyond the
+        # "no coverage yet" phase. Bump status to 'to_move' (документы созданы,
+        # ждём проведения) unless it's already further along.
+        if state.status in {"shortage", "partial", "ready"}:
+            state.status = "to_move"
         created.append(
             {
                 "issue_id": int(issue.issue_id),

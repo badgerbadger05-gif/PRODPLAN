@@ -73,7 +73,9 @@ def test_journal_and_material_issue_are_scoped_to_order_line(db_session):
     assert journal["total"] == 1
     assert journal["rows"][0]["order_number"] == "1839"
     assert journal["rows"][0]["item_article"] == "ART-P"
-    assert journal["rows"][0]["status"] == "new"
+    # Default per plan-aligned status set: 'shortage' until coverage is
+    # evaluated (was 'new' under the legacy workshop-progress set).
+    assert journal["rows"][0]["status"] == "shortage"
 
     materials = preview_materials(db_session, product.product_id)
     assert materials["components"][0]["component_item_id"] == component.item_id
@@ -85,6 +87,9 @@ def test_journal_and_material_issue_are_scoped_to_order_line(db_session):
 
     journal_after = list_journal(db_session)
     assert journal_after["rows"][0]["issue_status"] == "requested"
+    # Creating a material-issue draft moves the line from 'shortage' to
+    # 'to_move' ("документы созданы, ждём проведения") per plan.
+    assert journal_after["rows"][0]["status"] == "to_move"
     assert journal_after["rows"][0]["issue_count"] == 1
 
 
@@ -385,14 +390,14 @@ def test_create_orders_from_mrp_materializes_planned_orders(db_session):
         assert product.source_planned_order_id == row["planned_order_id"]
         assert float(product.quantity) == row["qty"]
         assert float(product.remaining_qty) == row["qty"]
-        # ProductionOrderLineState seeded with status='new'.
+        # ProductionOrderLineState seeded with status='shortage' per plan.
         from app.models import ProductionOrderLineState as POLS
         state = (
             db_session.query(POLS)
             .filter(POLS.product_id == product.product_id)
             .one()
         )
-        assert state.status == "new"
+        assert state.status == "shortage"
         assert state.issue_status == "not_requested"
 
     # Second call must be a no-op.

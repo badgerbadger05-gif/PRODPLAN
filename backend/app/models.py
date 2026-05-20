@@ -238,7 +238,11 @@ class ProductionOrderLineState(Base):
 
     state_id = Column(Integer, primary_key=True, index=True)
     product_id = Column(Integer, ForeignKey("production_products.product_id", ondelete="CASCADE"), nullable=False)
-    status = Column(String(32), nullable=False, default="new", index=True)
+    # Plan ("Обеспечение") status set:
+    #   shortage / partial / ready / to_move / assembled / produced_partial / produced
+    # plus an out-of-band 'cancelled' which is not in the plan but kept for
+    # real-world overrides.
+    status = Column(String(32), nullable=False, default="shortage", server_default="shortage", index=True)
     workshop_id = Column(Integer, ForeignKey("production_resources.resource_id"), nullable=True, index=True)
     planned_start_date = Column(Date, nullable=True, index=True)
     planned_finish_date = Column(Date, nullable=True, index=True)

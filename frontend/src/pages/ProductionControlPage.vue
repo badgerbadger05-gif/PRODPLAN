@@ -177,12 +177,17 @@ const pagination = ref({
   rowsNumber: 0
 })
 
+// Plan-aligned "Обеспечение" status set:
+//   shortage / partial / ready / to_move / assembled / produced_partial / produced
+// Plus an out-of-band 'cancelled' kept for manual admin overrides.
 const statusOptions = [
-  { label: 'Новый', value: 'new' },
-  { label: 'Открыт', value: 'opened' },
-  { label: 'В работе', value: 'in_work' },
-  { label: 'Ждет материалы', value: 'waiting_materials' },
-  { label: 'Готов', value: 'done' },
+  { label: 'Дефицит', value: 'shortage' },
+  { label: 'Частично', value: 'partial' },
+  { label: 'Обеспечен', value: 'ready' },
+  { label: 'К перемещению', value: 'to_move' },
+  { label: 'Собран', value: 'assembled' },
+  { label: 'Произведен частично', value: 'produced_partial' },
+  { label: 'Произведен', value: 'produced' },
   { label: 'Отменен', value: 'cancelled' }
 ]
 
@@ -192,7 +197,7 @@ const columns: QTableColumn<ProductionControlOrderRow>[] = [
   { name: 'qty', label: 'Остаток / заказ', field: 'remaining_qty', align: 'left', sortable: true },
   { name: 'workshop_name', label: 'Цех', field: 'workshop_name', align: 'left', sortable: true },
   { name: 'dates', label: 'Плановые даты', field: 'planned_start_date', align: 'left' },
-  { name: 'status', label: 'Статус', field: 'status', align: 'left' },
+  { name: 'status', label: 'Обеспечение', field: 'status', align: 'left' },
   { name: 'issue_status', label: 'Выдача', field: 'issue_status', align: 'left' },
   { name: 'actions', label: '', field: 'product_id', align: 'right' }
 ]
@@ -210,12 +215,14 @@ function statusLabel(value: string) {
 
 function statusColor(value: string) {
   return ({
-    new: 'grey-7',
-    opened: 'blue',
-    in_work: 'indigo',
-    waiting_materials: 'orange',
-    done: 'positive',
-    cancelled: 'negative'
+    shortage: 'negative',
+    partial: 'orange',
+    ready: 'blue',
+    to_move: 'indigo',
+    assembled: 'purple',
+    produced_partial: 'amber',
+    produced: 'positive',
+    cancelled: 'grey-7'
   } as Record<string, string>)[value] || 'grey'
 }
 
