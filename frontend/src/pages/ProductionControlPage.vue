@@ -8,6 +8,7 @@
       <q-space />
       <q-btn color="primary" icon="print" label="Печать маршрутных" :disable="selected.length === 0" @click="printSelected" />
       <q-btn color="secondary" icon="inventory_2" label="Создать выдачу" :disable="selected.length === 0" :loading="issueLoading" @click="createIssues" />
+      <q-btn flat color="primary" icon="settings" label="Настройки складов" @click="openSettings" />
       <q-btn flat color="primary" icon="refresh" label="Обновить" :loading="loading" @click="fetchRows" />
     </div>
 
@@ -117,6 +118,143 @@
       </template>
     </q-table>
 
+    <!-- Settings dialog: workshop -> warehouse bindings + ignored warehouses -->
+    <q-dialog v-model="settingsDialog" persistent>
+      <q-card style="min-width: 720px; max-width: 95vw;">
+        <q-card-section class="row items-center q-pb-none">
+          <div class="text-h6">Настройки складов</div>
+          <q-space />
+          <q-btn flat round dense icon="close" v-close-popup />
+        </q-card-section>
+
+        <q-card-section>
+          <div class="text-subtitle1 q-mb-sm">Привязка участок → склад получатель</div>
+          <q-table
+            :rows="settings.workshop_warehouse_bindings"
+            :columns="bindingsColumns"
+            row-key="workshop_id"
+            hide-bottom
+            flat
+            dense
+            :loading="settingsLoading"
+            :no-data-label="'Привязок ещё нет'"
+          >
+            <template #body-cell-actions="props">
+              <q-td :props="props" class="text-right">
+                <q-btn
+                  flat
+                  dense
+                  round
+                  color="negative"
+                  icon="delete"
+                  size="sm"
+                  @click="removeBinding(props.row.workshop_id)"
+                />
+              </q-td>
+            </template>
+          </q-table>
+
+          <div class="row q-col-gutter-sm q-mt-sm items-end">
+            <div class="col-12 col-md-5">
+              <q-select
+                v-model="newBinding.workshop_id"
+                dense
+                outlined
+                emit-value
+                map-options
+                :options="workshopOptions"
+                label="Участок"
+              />
+            </div>
+            <div class="col-12 col-md-5">
+              <q-input
+                v-model="newBinding.warehouse_ref1c"
+                dense
+                outlined
+                label="Склад (Ref1C GUID)"
+                placeholder="00000000-0000-0000-0000-000000000000"
+              />
+            </div>
+            <div class="col-12 col-md-2">
+              <q-btn
+                color="primary"
+                label="Добавить"
+                icon="add"
+                :disable="!newBinding.workshop_id || !newBinding.warehouse_ref1c"
+                :loading="bindingSaving"
+                @click="saveBinding"
+              />
+            </div>
+          </div>
+        </q-card-section>
+
+        <q-separator />
+
+        <q-card-section>
+          <div class="text-subtitle1 q-mb-sm">Игнорируемые склады</div>
+          <div class="text-caption text-grey-7 q-mb-sm">
+            Эти склады не учитываются в расчёте обеспечения — например, изолятор брака.
+          </div>
+          <q-table
+            :rows="settings.ignored_warehouses"
+            :columns="ignoredColumns"
+            row-key="warehouse_ref1c"
+            hide-bottom
+            flat
+            dense
+            :loading="settingsLoading"
+            :no-data-label="'Игнор-список пуст'"
+          >
+            <template #body-cell-actions="props">
+              <q-td :props="props" class="text-right">
+                <q-btn
+                  flat
+                  dense
+                  round
+                  color="negative"
+                  icon="delete"
+                  size="sm"
+                  @click="removeIgnored(props.row.warehouse_ref1c)"
+                />
+              </q-td>
+            </template>
+          </q-table>
+
+          <div class="row q-col-gutter-sm q-mt-sm items-end">
+            <div class="col-12 col-md-4">
+              <q-input
+                v-model="newIgnored.warehouse_ref1c"
+                dense
+                outlined
+                label="Склад (Ref1C GUID)"
+                placeholder="00000000-0000-0000-0000-000000000000"
+              />
+            </div>
+            <div class="col-12 col-md-3">
+              <q-input v-model="newIgnored.warehouse_name" dense outlined label="Название" />
+            </div>
+            <div class="col-12 col-md-3">
+              <q-input v-model="newIgnored.reason" dense outlined label="Причина" />
+            </div>
+            <div class="col-12 col-md-2">
+              <q-btn
+                color="primary"
+                label="Добавить"
+                icon="add"
+                :disable="!newIgnored.warehouse_ref1c"
+                :loading="ignoredSaving"
+                @click="saveIgnored"
+              />
+            </div>
+          </div>
+        </q-card-section>
+
+        <q-card-actions align="right">
+          <q-btn flat label="Закрыть" v-close-popup />
+        </q-card-actions>
+      </q-card>
+    </q-dialog>
+
     <q-dialog v-model="materialsDialog" maximized>
       <q-card>
         <q-card-section class="row items-center">
@@ -146,11 +284,19 @@ import { useQuasar } from 'quasar'
 import type { QTableColumn } from 'quasar'
 import {
   createProductionMaterialIssues,
+  deleteProductionControlIgnoredWarehouse,
+  deleteProductionControlWorkshopBinding,
   getProductionControlMaterials,
+  getProductionControlSettings,
   listResources,
   listProductionControlOrders,
   updateProductionControlOrderState,
-  type ProductionControlOrderRow
+  upsertProductionControlIgnoredWarehouse,
+  upsertProductionControlWorkshopBinding,
+  type IgnoredWarehouseEntry,
+  type ProductionControlOrderRow,
+  type ProductionControlSettings,
+  type WorkshopWarehouseBinding
 } from '../services/api'
 
 const $q = useQuasar()
@@ -208,6 +354,118 @@ const materialColumns: QTableColumn<any>[] = [
   { name: 'qty_per_unit', label: 'На ед.', field: 'qty_per_unit', align: 'right', sortable: true },
   { name: 'required_qty', label: 'К выдаче', field: 'required_qty', align: 'right', sortable: true }
 ]
+
+// ---------------------------------------------------------------------------
+// Settings dialog (workshop->warehouse bindings + ignored warehouses).
+// Backend: GET/PUT/DELETE /v1/production-control/settings/*.
+// ---------------------------------------------------------------------------
+const settingsDialog = ref(false)
+const settingsLoading = ref(false)
+const bindingSaving = ref(false)
+const ignoredSaving = ref(false)
+const settings = reactive<ProductionControlSettings>({
+  workshop_warehouse_bindings: [],
+  ignored_warehouses: []
+})
+const newBinding = reactive<{ workshop_id: number | null; warehouse_ref1c: string }>({
+  workshop_id: null,
+  warehouse_ref1c: ''
+})
+const newIgnored = reactive<{ warehouse_ref1c: string; warehouse_name: string; reason: string }>({
+  warehouse_ref1c: '',
+  warehouse_name: '',
+  reason: ''
+})
+
+const bindingsColumns: QTableColumn<WorkshopWarehouseBinding>[] = [
+  { name: 'workshop_name', label: 'Участок', field: r => r.workshop_name || `#${r.workshop_id}`, align: 'left' },
+  { name: 'warehouse_ref1c', label: 'Склад (Ref1C)', field: 'warehouse_ref1c', align: 'left' },
+  { name: 'actions', label: '', field: 'workshop_id', align: 'right' }
+]
+
+const ignoredColumns: QTableColumn<IgnoredWarehouseEntry>[] = [
+  { name: 'warehouse_ref1c', label: 'Склад (Ref1C)', field: 'warehouse_ref1c', align: 'left' },
+  { name: 'warehouse_name', label: 'Название', field: r => r.warehouse_name || '', align: 'left' },
+  { name: 'reason', label: 'Причина', field: r => r.reason || '', align: 'left' },
+  { name: 'actions', label: '', field: 'warehouse_ref1c', align: 'right' }
+]
+
+async function loadSettings() {
+  settingsLoading.value = true
+  try {
+    const data = await getProductionControlSettings()
+    settings.workshop_warehouse_bindings = data.workshop_warehouse_bindings || []
+    settings.ignored_warehouses = data.ignored_warehouses || []
+  } catch (e: any) {
+    $q.notify({ type: 'negative', message: `Ошибка загрузки настроек: ${e?.message || e}` })
+  } finally {
+    settingsLoading.value = false
+  }
+}
+
+async function openSettings() {
+  settingsDialog.value = true
+  await loadSettings()
+}
+
+async function saveBinding() {
+  if (!newBinding.workshop_id || !newBinding.warehouse_ref1c.trim()) return
+  bindingSaving.value = true
+  try {
+    await upsertProductionControlWorkshopBinding(
+      newBinding.workshop_id,
+      newBinding.warehouse_ref1c.trim()
+    )
+    newBinding.workshop_id = null
+    newBinding.warehouse_ref1c = ''
+    await loadSettings()
+    $q.notify({ type: 'positive', message: 'Привязка сохранена' })
+  } catch (e: any) {
+    $q.notify({ type: 'negative', message: `Не удалось сохранить: ${e?.response?.data?.detail || e?.message || e}` })
+  } finally {
+    bindingSaving.value = false
+  }
+}
+
+async function removeBinding(workshopId: number) {
+  try {
+    await deleteProductionControlWorkshopBinding(workshopId)
+    await loadSettings()
+  } catch (e: any) {
+    $q.notify({ type: 'negative', message: `Не удалось удалить: ${e?.response?.data?.detail || e?.message || e}` })
+  }
+}
+
+async function saveIgnored() {
+  const ref = newIgnored.warehouse_ref1c.trim()
+  if (!ref) return
+  ignoredSaving.value = true
+  try {
+    await upsertProductionControlIgnoredWarehouse({
+      warehouse_ref1c: ref,
+      warehouse_name: newIgnored.warehouse_name.trim() || null,
+      reason: newIgnored.reason.trim() || null
+    })
+    newIgnored.warehouse_ref1c = ''
+    newIgnored.warehouse_name = ''
+    newIgnored.reason = ''
+    await loadSettings()
+    $q.notify({ type: 'positive', message: 'Склад добавлен в игнор-список' })
+  } catch (e: any) {
+    $q.notify({ type: 'negative', message: `Не удалось сохранить: ${e?.response?.data?.detail || e?.message || e}` })
+  } finally {
+    ignoredSaving.value = false
+  }
+}
+
+async function removeIgnored(warehouseRef1c: string) {
+  try {
+    await deleteProductionControlIgnoredWarehouse(warehouseRef1c)
+    await loadSettings()
+  } catch (e: any) {
+    $q.notify({ type: 'negative', message: `Не удалось удалить: ${e?.response?.data?.detail || e?.message || e}` })
+  }
+}
 
 function statusLabel(value: string) {
   return statusOptions.find(x => x.value === value)?.label || value
