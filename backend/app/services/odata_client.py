@@ -114,6 +114,94 @@ class OData1CClient:
             raise last_err
         raise urllib.error.URLError(f"Unknown error. URL: {url}")
 
+    def _build_headers(self) -> Dict[str, str]:
+        headers = dict(self.default_headers)
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        elif self.username and self.password:
+            import base64
+
+            credentials = f"{self.username}:{self.password}"
+            encoded = base64.b64encode(credentials.encode("utf-8")).decode("utf-8")
+            headers["Authorization"] = f"Basic {encoded}"
+        return headers
+
+    def post(
+        self,
+        endpoint: str,
+        payload: Dict[str, Any],
+        timeout: int = 60,
+    ) -> Dict[str, Any]:
+        endpoint_clean = (endpoint or "").lstrip("/")
+        endpoint_quoted = urllib.parse.quote(endpoint_clean, safe="$()_-,.=/'")
+        url = f"{self.base_url}/{endpoint_quoted}"
+        body = json.dumps(payload or {}, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(url, data=body, method="POST")
+        for k, v in self._build_headers().items():
+            request.add_header(k, v)
+        try:
+            from datetime import datetime as _dt
+            print(f"[OData] {_dt.utcnow().isoformat()} POST {url}")
+        except Exception:
+            pass
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                data = response.read()
+                text = data.decode("utf-8", errors="replace").strip()
+                if not text:
+                    return {}
+                content_type = response.headers.get("Content-Type", "") or ""
+                if "application/json" in content_type.lower() or text.startswith("{") or text.startswith("["):
+                    return json.loads(text)
+                return {"_raw": text, "_content_type": content_type, "_url": url}
+        except urllib.error.HTTPError as e:
+            err_data = ""
+            try:
+                err_data = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            raise urllib.error.URLError(
+                f"HTTP Error {e.code}: {e.reason}. URL: {url}. Details: {err_data}"
+            )
+
+    def patch(
+        self,
+        endpoint: str,
+        payload: Dict[str, Any],
+        timeout: int = 60,
+    ) -> Dict[str, Any]:
+        endpoint_clean = (endpoint or "").lstrip("/")
+        endpoint_quoted = urllib.parse.quote(endpoint_clean, safe="$()_-,.=/'")
+        url = f"{self.base_url}/{endpoint_quoted}"
+        body = json.dumps(payload or {}, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(url, data=body, method="PATCH")
+        for k, v in self._build_headers().items():
+            request.add_header(k, v)
+        try:
+            from datetime import datetime as _dt
+            print(f"[OData] {_dt.utcnow().isoformat()} PATCH {url}")
+        except Exception:
+            pass
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                data = response.read()
+                text = data.decode("utf-8", errors="replace").strip()
+                if not text:
+                    return {}
+                content_type = response.headers.get("Content-Type", "") or ""
+                if "application/json" in content_type.lower() or text.startswith("{") or text.startswith("["):
+                    return json.loads(text)
+                return {"_raw": text, "_content_type": content_type, "_url": url}
+        except urllib.error.HTTPError as e:
+            err_data = ""
+            try:
+                err_data = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            raise urllib.error.URLError(
+                f"HTTP Error {e.code}: {e.reason}. URL: {url}. Details: {err_data}"
+            )
+
     @staticmethod
     def _sanitize_select_fields(select_fields: Optional[List[str]]) -> Optional[List[str]]:
         if not select_fields:

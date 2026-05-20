@@ -41,6 +41,7 @@ class Item(Base):
     item_name = Column(TEXT, nullable=False)
     item_article = Column(String(100), index=True)
     item_ref1c = Column(String(36), index=True)
+    supplier_ref1c = Column(String(36), nullable=True, index=True)
     replenishment_method = Column(String(50))
     replenishment_time = Column(Integer)
     unit = Column(String(50))
@@ -204,6 +205,69 @@ class ProductionProduct(Base):
     # Relationship для обратного доступа к заказу
     order = relationship("ProductionOrder", back_populates="products")
     item = relationship("Item", back_populates="production_products")
+    control_state = relationship("ProductionOrderLineState", back_populates="product", uselist=False)
+
+
+class ProductionOrderLineState(Base):
+    __tablename__ = "production_order_line_states"
+    __table_args__ = (
+        UniqueConstraint("product_id", name="ux_production_order_line_states_product"),
+    )
+
+    state_id = Column(Integer, primary_key=True, index=True)
+    product_id = Column(Integer, ForeignKey("production_products.product_id", ondelete="CASCADE"), nullable=False)
+    status = Column(String(32), nullable=False, default="new", index=True)
+    workshop_id = Column(Integer, ForeignKey("production_resources.resource_id"), nullable=True, index=True)
+    planned_start_date = Column(Date, nullable=True, index=True)
+    planned_finish_date = Column(Date, nullable=True, index=True)
+    opened_at = Column(TIMESTAMP, nullable=True)
+    route_sheet_printed_at = Column(TIMESTAMP, nullable=True)
+    issue_status = Column(String(32), nullable=False, default="not_requested", index=True)
+    comment = Column(TEXT, nullable=True)
+    created_at = Column(TIMESTAMP, default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now(), nullable=False)
+
+    product = relationship("ProductionProduct", back_populates="control_state")
+    workshop = relationship("ProductionResource")
+
+
+class ProductionMaterialIssue(Base):
+    __tablename__ = "production_material_issues"
+
+    issue_id = Column(Integer, primary_key=True, index=True)
+    document_number = Column(String(50), nullable=False, unique=True, index=True)
+    product_id = Column(Integer, ForeignKey("production_products.product_id", ondelete="CASCADE"), nullable=False, index=True)
+    order_id = Column(Integer, ForeignKey("production_orders.order_id"), nullable=False, index=True)
+    status = Column(String(32), nullable=False, default="draft", index=True)
+    warehouse_ref1c = Column(String(36), nullable=True, index=True)
+    initiated_by = Column(String(100), nullable=True)
+    exported_ref1c = Column(String(36), nullable=True, index=True)
+    exported_at = Column(TIMESTAMP, nullable=True)
+    export_error = Column(TEXT, nullable=True)
+    created_at = Column(TIMESTAMP, default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now(), nullable=False)
+
+    product = relationship("ProductionProduct")
+    order = relationship("ProductionOrder")
+    lines = relationship("ProductionMaterialIssueLine", back_populates="issue", cascade="all, delete-orphan")
+
+
+class ProductionMaterialIssueLine(Base):
+    __tablename__ = "production_material_issue_lines"
+
+    line_id = Column(Integer, primary_key=True, index=True)
+    issue_id = Column(Integer, ForeignKey("production_material_issues.issue_id", ondelete="CASCADE"), nullable=False)
+    component_item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
+    required_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0)
+    issued_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0)
+    unit = Column(String(50), nullable=True)
+    source_spec_id = Column(Integer, ForeignKey("specifications.spec_id"), nullable=True)
+    line_status = Column(String(32), nullable=False, default="planned", index=True)
+    created_at = Column(TIMESTAMP, default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now(), nullable=False)
+
+    issue = relationship("ProductionMaterialIssue", back_populates="lines")
+    component_item = relationship("Item")
 
 
 class ProductionComponent(Base):

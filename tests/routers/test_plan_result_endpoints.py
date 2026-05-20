@@ -233,6 +233,7 @@ def test_grouped_by_category_endpoints_return_group_sums_and_flags(client, db_se
     purchase_groups = {group["group_name"]: group for group in purchase_payload["groups"]}
     assert purchase_groups["Группа закупки API"]["sum_qty"] == 5.0
     assert purchase_groups["Группа закупки API"]["orders"][0]["supplier_ref1c"] == "supp-api-1"
+    assert purchase_groups["Группа закупки API"]["orders"][0]["source_purchase_ids"]
     assert purchase_groups["Без товарной группы"]["sum_qty"] == 2.0
 
     rework_response = client.get(f"/api/v1/plan/results/{run.run_id}/rework/grouped-by-category")

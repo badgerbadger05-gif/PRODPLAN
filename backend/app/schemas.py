@@ -8,6 +8,7 @@ class ItemBase(BaseModel):
     item_name: str
     item_article: Optional[str] = None
     item_ref1c: Optional[str] = None
+    supplier_ref1c: Optional[str] = None
     replenishment_time: Optional[int] = None
     unit: Optional[str] = None
     category_id: Optional[int] = None
@@ -606,6 +607,7 @@ class PurchaseCategoryGroupOrder(BaseModel):
     badge: Optional[str] = None
     turning_blank_priority: Optional[bool] = False
     late_supplier_order: Optional[bool] = False
+    source_purchase_ids: List[int] = []
 
 
 class PurchaseCategoryGroup(BaseModel):

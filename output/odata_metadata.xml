@@ -852,6 +852,15 @@
 				<Property Name="СуммаСПревышения"
 						Type="Edm.Double"
 						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке18"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке20"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке22"
+						Type="Edm.Double"
+						Nullable="true"/>
 				<Property Name="Recorder_Type"
 						Type="Edm.String"
 						Nullable="false"/>
@@ -10824,7 +10833,13 @@
 				<Property Name="НаименованиеОперации"
 						Type="Edm.String"
 						Nullable="true"/>
+				<Property Name="Регистратор"
+						Type="Edm.String"
+						Nullable="true"/>
 				<Property Name="РасчетныйДокумент_Type"
+						Type="Edm.String"
+						Nullable="true"/>
+				<Property Name="Регистратор_Type"
 						Type="Edm.String"
 						Nullable="true"/>
 				<NavigationProperty Name="Договор"
@@ -10874,7 +10889,13 @@
 				<Property Name="НаименованиеОперации"
 						Type="Edm.String"
 						Nullable="true"/>
+				<Property Name="Регистратор"
+						Type="Edm.String"
+						Nullable="true"/>
 				<Property Name="РасчетныйДокумент_Type"
+						Type="Edm.String"
+						Nullable="true"/>
+				<Property Name="Регистратор_Type"
 						Type="Edm.String"
 						Nullable="true"/>
 				<NavigationProperty Name="Договор"
@@ -15770,6 +15791,15 @@
 				<Property Name="СуммаСПревышения"
 						Type="Edm.Double"
 						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке18"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке20"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке22"
+						Type="Edm.Double"
+						Nullable="true"/>
 				<NavigationProperty Name="Сотрудник"
 						Relationship="StandardODATA.Document_ПлатежнаяВедомость_НалогиНаДоходы_Сотрудник"
 						FromRole="Begin"
@@ -16999,6 +17029,15 @@
 						Type="Edm.Double"
 						Nullable="true"/>
 				<Property Name="СуммаСПревышения"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке18"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке20"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке22"
 						Type="Edm.Double"
 						Nullable="true"/>
 				<NavigationProperty Name="Сотрудник"
@@ -18701,6 +18740,9 @@
 						Type="Edm.Guid"
 						Nullable="true"/>
 				<Property Name="СуммаРасходовБезНДС"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаРасходовБезНДСДоИзменения"
 						Type="Edm.Double"
 						Nullable="true"/>
 				<Property Name="ЗаказПокупателя_Key"
@@ -27957,25 +27999,25 @@
 				<Property Name="ТипШаблона"
 						Type="Edm.String"
 						Nullable="true"/>
-				<Property Name="ДатаСоздания"
+				<Property Name="УдалитьДатаСоздания"
 						Type="Edm.DateTime"
 						Nullable="true"/>
-				<Property Name="ДатаИзменения"
+				<Property Name="УдалитьДатаИзменения"
 						Type="Edm.DateTime"
 						Nullable="true"/>
-				<Property Name="ОбъектМетаданных"
+				<Property Name="УдалитьОбъектМетаданных"
 						Type="Edm.String"
 						Nullable="true"/>
-				<Property Name="ПользовательСоздал_Key"
+				<Property Name="УдалитьПользовательСоздал_Key"
 						Type="Edm.Guid"
 						Nullable="true"/>
-				<Property Name="ПользовательИзменил_Key"
+				<Property Name="УдалитьПользовательИзменил_Key"
 						Type="Edm.Guid"
 						Nullable="true"/>
-				<Property Name="КоличествоПоВертикали"
+				<Property Name="УдалитьКоличествоПоВертикали"
 						Type="Edm.Int16"
 						Nullable="true"/>
-				<Property Name="КоличествоПоГоризонтали"
+				<Property Name="УдалитьКоличествоПоГоризонтали"
 						Type="Edm.Int16"
 						Nullable="true"/>
 				<Property Name="СхемаКомпоновкиДанных_Base64Data"
@@ -27984,11 +28026,8 @@
 				<Property Name="РазмерМакета"
 						Type="Edm.String"
 						Nullable="true"/>
-				<Property Name="УдалитьШаблонЧекаРМК_Key"
-						Type="Edm.Guid"
-						Nullable="true"/>
-				<Property Name="Условия"
-						Type="Collection(StandardODATA.Catalog_ХранилищеШаблонов_Условия_RowType)"
+				<Property Name="УдалитьУсловия"
+						Type="Collection(StandardODATA.Catalog_ХранилищеШаблонов_УдалитьУсловия_RowType)"
 						Nullable="true"/>
 				<Property Name="Шаблон_Type"
 						Type="Edm.String"
@@ -28006,16 +28045,16 @@
 						Relationship="StandardODATA.Catalog_ХранилищеШаблонов_Parent"
 						FromRole="Begin"
 						ToRole="End"/>
-				<NavigationProperty Name="ПользовательСоздал"
-						Relationship="StandardODATA.Catalog_ХранилищеШаблонов_ПользовательСоздал"
+				<NavigationProperty Name="УдалитьПользовательСоздал"
+						Relationship="StandardODATA.Catalog_ХранилищеШаблонов_УдалитьПользовательСоздал"
 						FromRole="Begin"
 						ToRole="End"/>
-				<NavigationProperty Name="ПользовательИзменил"
-						Relationship="StandardODATA.Catalog_ХранилищеШаблонов_ПользовательИзменил"
+				<NavigationProperty Name="УдалитьПользовательИзменил"
+						Relationship="StandardODATA.Catalog_ХранилищеШаблонов_УдалитьПользовательИзменил"
 						FromRole="Begin"
 						ToRole="End"/>
 			</EntityType>
-			<EntityType Name="Catalog_ХранилищеШаблонов_Условия">
+			<EntityType Name="Catalog_ХранилищеШаблонов_УдалитьУсловия">
 				<Key>
 					<PropertyRef Name="Ref_Key"/>
 					<PropertyRef Name="LineNumber"/>
@@ -31489,14 +31528,23 @@
 				<Property Name="Описание"
 						Type="Edm.String"
 						Nullable="true"/>
-				<Property Name="Цвет_Base64Data"
-						Type="Edm.Binary"
-						Nullable="true"/>
 				<Property Name="РеквизитДопУпорядочивания"
 						Type="Edm.Int64"
 						Nullable="true"/>
+				<Property Name="УдалитьЦветСтарый_Base64Data"
+						Type="Edm.Binary"
+						Nullable="true"/>
+				<Property Name="Цвет_Base64Data"
+						Type="Edm.Binary"
+						Nullable="true"/>
+				<Property Name="УдалитьЦветСтарый_Type"
+						Type="Edm.String"
+						Nullable="true"/>
 				<Property Name="Цвет_Type"
 						Type="Edm.String"
+						Nullable="true"/>
+				<Property Name="УдалитьЦветСтарый"
+						Type="Edm.Stream"
 						Nullable="true"/>
 				<Property Name="Цвет"
 						Type="Edm.Stream"
@@ -31530,11 +31578,20 @@
 				<Property Name="РеквизитДопУпорядочивания"
 						Type="Edm.Int64"
 						Nullable="true"/>
+				<Property Name="УдалитьЦветСтарый_Base64Data"
+						Type="Edm.Binary"
+						Nullable="true"/>
 				<Property Name="Цвет_Base64Data"
 						Type="Edm.Binary"
 						Nullable="true"/>
+				<Property Name="УдалитьЦветСтарый_Type"
+						Type="Edm.String"
+						Nullable="true"/>
 				<Property Name="Цвет_Type"
 						Type="Edm.String"
+						Nullable="true"/>
+				<Property Name="УдалитьЦветСтарый"
+						Type="Edm.Stream"
 						Nullable="true"/>
 				<Property Name="Цвет"
 						Type="Edm.Stream"
@@ -31568,11 +31625,20 @@
 				<Property Name="УдалитьСтатусЗаказа"
 						Type="Edm.String"
 						Nullable="true"/>
+				<Property Name="УдалитьЦветСтарый_Base64Data"
+						Type="Edm.Binary"
+						Nullable="true"/>
 				<Property Name="Цвет_Base64Data"
 						Type="Edm.Binary"
 						Nullable="true"/>
+				<Property Name="УдалитьЦветСтарый_Type"
+						Type="Edm.String"
+						Nullable="true"/>
 				<Property Name="Цвет_Type"
 						Type="Edm.String"
+						Nullable="true"/>
+				<Property Name="УдалитьЦветСтарый"
+						Type="Edm.Stream"
 						Nullable="true"/>
 				<Property Name="Цвет"
 						Type="Edm.Stream"
@@ -31606,22 +31672,31 @@
 				<Property Name="УдалитьСтатусЗаказа"
 						Type="Edm.String"
 						Nullable="true"/>
+				<Property Name="УдалитьЦветСтарый_Base64Data"
+						Type="Edm.Binary"
+						Nullable="true"/>
+				<Property Name="УдалитьЦветФона_Base64Data"
+						Type="Edm.Binary"
+						Nullable="true"/>
 				<Property Name="Цвет_Base64Data"
 						Type="Edm.Binary"
 						Nullable="true"/>
-				<Property Name="ЦветФона_Base64Data"
-						Type="Edm.Binary"
+				<Property Name="УдалитьЦветСтарый_Type"
+						Type="Edm.String"
+						Nullable="true"/>
+				<Property Name="УдалитьЦветФона_Type"
+						Type="Edm.String"
 						Nullable="true"/>
 				<Property Name="Цвет_Type"
 						Type="Edm.String"
 						Nullable="true"/>
-				<Property Name="ЦветФона_Type"
-						Type="Edm.String"
-						Nullable="true"/>
-				<Property Name="Цвет"
+				<Property Name="УдалитьЦветСтарый"
 						Type="Edm.Stream"
 						Nullable="true"/>
-				<Property Name="ЦветФона"
+				<Property Name="УдалитьЦветФона"
+						Type="Edm.Stream"
+						Nullable="true"/>
+				<Property Name="Цвет"
 						Type="Edm.Stream"
 						Nullable="true"/>
 			</EntityType>
@@ -31653,11 +31728,20 @@
 				<Property Name="УдалитьСтатусЗаказа"
 						Type="Edm.String"
 						Nullable="true"/>
+				<Property Name="УдалитьЦветСтарый_Base64Data"
+						Type="Edm.Binary"
+						Nullable="true"/>
 				<Property Name="Цвет_Base64Data"
 						Type="Edm.Binary"
 						Nullable="true"/>
+				<Property Name="УдалитьЦветСтарый_Type"
+						Type="Edm.String"
+						Nullable="true"/>
 				<Property Name="Цвет_Type"
 						Type="Edm.String"
+						Nullable="true"/>
+				<Property Name="УдалитьЦветСтарый"
+						Type="Edm.Stream"
 						Nullable="true"/>
 				<Property Name="Цвет"
 						Type="Edm.Stream"
@@ -31688,11 +31772,20 @@
 				<Property Name="РеквизитДопУпорядочивания"
 						Type="Edm.Int64"
 						Nullable="true"/>
+				<Property Name="УдалитьЦветСтарый_Base64Data"
+						Type="Edm.Binary"
+						Nullable="true"/>
 				<Property Name="Цвет_Base64Data"
 						Type="Edm.Binary"
 						Nullable="true"/>
+				<Property Name="УдалитьЦветСтарый_Type"
+						Type="Edm.String"
+						Nullable="true"/>
 				<Property Name="Цвет_Type"
 						Type="Edm.String"
+						Nullable="true"/>
+				<Property Name="УдалитьЦветСтарый"
+						Type="Edm.Stream"
 						Nullable="true"/>
 				<Property Name="Цвет"
 						Type="Edm.Stream"
@@ -31720,22 +31813,31 @@
 				<Property Name="DeletionMark"
 						Type="Edm.Boolean"
 						Nullable="true"/>
+				<Property Name="УдалитьЦветСтарый_Base64Data"
+						Type="Edm.Binary"
+						Nullable="true"/>
+				<Property Name="УдалитьЦветФона_Base64Data"
+						Type="Edm.Binary"
+						Nullable="true"/>
 				<Property Name="Цвет_Base64Data"
 						Type="Edm.Binary"
 						Nullable="true"/>
-				<Property Name="ЦветФона_Base64Data"
-						Type="Edm.Binary"
+				<Property Name="УдалитьЦветСтарый_Type"
+						Type="Edm.String"
+						Nullable="true"/>
+				<Property Name="УдалитьЦветФона_Type"
+						Type="Edm.String"
 						Nullable="true"/>
 				<Property Name="Цвет_Type"
 						Type="Edm.String"
 						Nullable="true"/>
-				<Property Name="ЦветФона_Type"
-						Type="Edm.String"
-						Nullable="true"/>
-				<Property Name="Цвет"
+				<Property Name="УдалитьЦветСтарый"
 						Type="Edm.Stream"
 						Nullable="true"/>
-				<Property Name="ЦветФона"
+				<Property Name="УдалитьЦветФона"
+						Type="Edm.Stream"
+						Nullable="true"/>
+				<Property Name="Цвет"
 						Type="Edm.Stream"
 						Nullable="true"/>
 			</EntityType>
@@ -34451,7 +34553,7 @@
 				<Property Name="ВидПодакцизногоТовара"
 						Type="Edm.String"
 						Nullable="true"/>
-				<Property Name="ВидПродукцииИС"
+				<Property Name="УдалитьВидПродукцииИС"
 						Type="Edm.String"
 						Nullable="true"/>
 				<Property Name="АвтоматическиГенерироватьПартии"
@@ -36562,6 +36664,9 @@
 				<Property Name="Сумма"
 						Type="Edm.Double"
 						Nullable="true"/>
+				<Property Name="ЗначениеСкидкиНаценки"
+						Type="Edm.Double"
+						Nullable="true"/>
 			</EntityType>
 			<EntityType Name="Document_АктВыполненныхРабот_ДобавленныеНаборы">
 				<Key>
@@ -37934,7 +38039,7 @@
 				<Property Name="УдалитьОбувнаяПродукция"
 						Type="Edm.Boolean"
 						Nullable="true"/>
-				<Property Name="ВидПродукцииИС"
+				<Property Name="УдалитьВидПродукцииИС"
 						Type="Edm.String"
 						Nullable="true"/>
 				<Property Name="ПодакцизныйТовар"
@@ -38323,6 +38428,9 @@
 						Nullable="true"/>
 				<Property Name="ПоложениеЯчейки"
 						Type="Edm.String"
+						Nullable="true"/>
+				<Property Name="СуммаДокумента"
+						Type="Edm.Double"
 						Nullable="true"/>
 				<Property Name="Запасы"
 						Type="Collection(StandardODATA.Document_СписаниеЗапасов_Запасы_RowType)"
@@ -39379,6 +39487,9 @@
 				<Property Name="ЯвляетсяДолжностьюЛетногоЭкипажа"
 						Type="Edm.Boolean"
 						Nullable="true"/>
+				<Property Name="ЯвляетсяШахтерскойДолжностью"
+						Type="Edm.Boolean"
+						Nullable="true"/>
 				<Property Name="ЯвляетсяФармацевтическойДолжностью"
 						Type="Edm.Boolean"
 						Nullable="true"/>
@@ -39399,9 +39510,6 @@
 						Nullable="true"/>
 				<Property Name="ВидСтажаШахтеров"
 						Type="Edm.String"
-						Nullable="true"/>
-				<Property Name="ЯвляетсяШахтерскойДолжностью"
-						Type="Edm.Boolean"
 						Nullable="true"/>
 				<Property Name="ЯвляетсяДолжностьюЕдиноличногоРуководителяКоммерческойОрганизации"
 						Type="Edm.Boolean"
@@ -39702,6 +39810,12 @@
 				<Property Name="КоличествоДнейРасчетаДатыОплаты"
 						Type="Edm.Int64"
 						Nullable="true"/>
+				<Property Name="ПереноситьКомиссиюБанкаНаРасчетыСПоставщиком"
+						Type="Edm.Boolean"
+						Nullable="true"/>
+				<Property Name="ДоговорКомиссииЭквайринга_Key"
+						Type="Edm.Guid"
+						Nullable="true"/>
 				<Property Name="ДоговорОбслуживанияПолучателиРассылки"
 						Type="Collection(StandardODATA.Catalog_ДоговорыКонтрагентов_ДоговорОбслуживанияПолучателиРассылки_RowType)"
 						Nullable="true"/>
@@ -39783,6 +39897,10 @@
 						ToRole="End"/>
 				<NavigationProperty Name="ПроизводственныйКалендарьРасчетаДатыОплаты"
 						Relationship="StandardODATA.Catalog_ДоговорыКонтрагентов_ПроизводственныйКалендарьРасчетаДатыОплаты"
+						FromRole="Begin"
+						ToRole="End"/>
+				<NavigationProperty Name="ДоговорКомиссииЭквайринга"
+						Relationship="StandardODATA.Catalog_ДоговорыКонтрагентов_ДоговорКомиссииЭквайринга"
 						FromRole="Begin"
 						ToRole="End"/>
 			</EntityType>
@@ -40941,6 +41059,12 @@
 				<Property Name="ФактПроживанияЗОХО"
 						Type="Edm.Boolean"
 						Nullable="true"/>
+				<Property Name="ДатаВременнойРегистрации"
+						Type="Edm.DateTime"
+						Nullable="true"/>
+				<Property Name="ДатаФактическогоПроживания"
+						Type="Edm.DateTime"
+						Nullable="true"/>
 				<Property Name="КонтактнаяИнформация"
 						Type="Collection(StandardODATA.Catalog_ФизическиеЛица_КонтактнаяИнформация_RowType)"
 						Nullable="true"/>
@@ -41788,7 +41912,7 @@
 						Type="Edm.Guid"
 						Nullable="true"/>
 				<Property Name="ПоказательДаты"
-						Type="Edm.DateTime"
+						Type="Edm.String"
 						Nullable="true"/>
 				<Property Name="ПоказательНомера"
 						Type="Edm.String"
@@ -41869,6 +41993,9 @@
 						Type="Edm.String"
 						Nullable="true"/>
 				<Property Name="ДокументОснование_Type"
+						Type="Edm.String"
+						Nullable="true"/>
+				<Property Name="ПоказательДаты_Type"
 						Type="Edm.String"
 						Nullable="true"/>
 				<NavigationProperty Name="Организация"
@@ -44949,6 +45076,15 @@
 				<Property Name="СуммаСПревышения"
 						Type="Edm.Double"
 						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке18"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке20"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке22"
+						Type="Edm.Double"
+						Nullable="true"/>
 				<Property Name="Recorder_Type"
 						Type="Edm.String"
 						Nullable="false"/>
@@ -44967,6 +45103,15 @@
 						Type="Edm.Double"
 						Nullable="true"/>
 				<Property Name="СуммаСПревышенияBalance"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке18Balance"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке20Balance"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке22Balance"
 						Type="Edm.Double"
 						Nullable="true"/>
 			</ComplexType>
@@ -45035,6 +45180,33 @@
 						Type="Edm.Double"
 						Nullable="true"/>
 				<Property Name="СуммаСПревышенияExpense"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке18Turnover"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке18Receipt"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке18Expense"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке20Turnover"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке20Receipt"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке20Expense"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке22Turnover"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке22Receipt"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке22Expense"
 						Type="Edm.Double"
 						Nullable="true"/>
 				<Property Name="Recorder_Type"
@@ -45118,6 +45290,51 @@
 						Type="Edm.Double"
 						Nullable="true"/>
 				<Property Name="СуммаСПревышенияClosingBalance"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке18OpeningBalance"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке18Turnover"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке18Receipt"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке18Expense"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке18ClosingBalance"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке20OpeningBalance"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке20Turnover"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке20Receipt"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке20Expense"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке20ClosingBalance"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке22OpeningBalance"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке22Turnover"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке22Receipt"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке22Expense"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке22ClosingBalance"
 						Type="Edm.Double"
 						Nullable="true"/>
 				<Property Name="Recorder_Type"
@@ -59514,7 +59731,13 @@
 				<Property Name="НаименованиеОперации"
 						Type="Edm.String"
 						Nullable="true"/>
+				<Property Name="Регистратор"
+						Type="Edm.String"
+						Nullable="true"/>
 				<Property Name="РасчетныйДокумент_Type"
+						Type="Edm.String"
+						Nullable="true"/>
+				<Property Name="Регистратор_Type"
 						Type="Edm.String"
 						Nullable="true"/>
 			</ComplexType>
@@ -59555,7 +59778,13 @@
 				<Property Name="НаименованиеОперации"
 						Type="Edm.String"
 						Nullable="true"/>
+				<Property Name="Регистратор"
+						Type="Edm.String"
+						Nullable="true"/>
 				<Property Name="РасчетныйДокумент_Type"
+						Type="Edm.String"
+						Nullable="true"/>
+				<Property Name="Регистратор_Type"
 						Type="Edm.String"
 						Nullable="true"/>
 			</ComplexType>
@@ -61428,6 +61657,15 @@
 				<Property Name="СуммаСПревышения"
 						Type="Edm.Double"
 						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке18"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке20"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке22"
+						Type="Edm.Double"
+						Nullable="true"/>
 			</ComplexType>
 			<ComplexType Name="Document_ПланПродаж_Запасы_RowType">
 				<Property Name="Ref_Key"
@@ -61847,6 +62085,15 @@
 						Type="Edm.Double"
 						Nullable="true"/>
 				<Property Name="СуммаСПревышения"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке18"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке20"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаСПревышенияПоСтавке22"
 						Type="Edm.Double"
 						Nullable="true"/>
 			</ComplexType>
@@ -62519,6 +62766,9 @@
 						Type="Edm.Guid"
 						Nullable="true"/>
 				<Property Name="СуммаРасходовБезНДС"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="СуммаРасходовБезНДСДоИзменения"
 						Type="Edm.Double"
 						Nullable="true"/>
 				<Property Name="ЗаказПокупателя_Key"
@@ -66491,7 +66741,7 @@
 						Type="Edm.Double"
 						Nullable="true"/>
 			</ComplexType>
-			<ComplexType Name="Catalog_ХранилищеШаблонов_Условия_RowType">
+			<ComplexType Name="Catalog_ХранилищеШаблонов_УдалитьУсловия_RowType">
 				<Property Name="Ref_Key"
 						Type="Edm.Guid"
 						Nullable="false"/>
@@ -69270,6 +69520,9 @@
 						Type="Edm.Guid"
 						Nullable="true"/>
 				<Property Name="Сумма"
+						Type="Edm.Double"
+						Nullable="true"/>
+				<Property Name="ЗначениеСкидкиНаценки"
 						Type="Edm.Double"
 						Nullable="true"/>
 			</ComplexType>
@@ -82219,7 +82472,7 @@
 						Type="StandardODATA.Catalog_ХранилищеШаблонов"
 						Multiplicity="0..1"/>
 			</Association>
-			<Association Name="Catalog_ХранилищеШаблонов_ПользовательСоздал">
+			<Association Name="Catalog_ХранилищеШаблонов_УдалитьПользовательСоздал">
 				<End Role="Begin"
 						Type="StandardODATA.Catalog_ХранилищеШаблонов"
 						Multiplicity="*"/>
@@ -82227,7 +82480,7 @@
 						Type="StandardODATA.Catalog_Пользователи"
 						Multiplicity="0..1"/>
 			</Association>
-			<Association Name="Catalog_ХранилищеШаблонов_ПользовательИзменил">
+			<Association Name="Catalog_ХранилищеШаблонов_УдалитьПользовательИзменил">
 				<End Role="Begin"
 						Type="StandardODATA.Catalog_ХранилищеШаблонов"
 						Multiplicity="*"/>
@@ -85387,6 +85640,14 @@
 						Type="StandardODATA.Catalog_ПроизводственныеКалендари"
 						Multiplicity="0..1"/>
 			</Association>
+			<Association Name="Catalog_ДоговорыКонтрагентов_ДоговорКомиссииЭквайринга">
+				<End Role="Begin"
+						Type="StandardODATA.Catalog_ДоговорыКонтрагентов"
+						Multiplicity="*"/>
+				<End Role="End"
+						Type="StandardODATA.Catalog_ДоговорыКонтрагентов"
+						Multiplicity="0..1"/>
+			</Association>
 			<Association Name="Catalog_ДоговорыКонтрагентов_ДополнительныеРеквизиты_Свойство">
 				<End Role="Begin"
 						Type="StandardODATA.Catalog_ДоговорыКонтрагентов_ДополнительныеРеквизиты"
@@ -86387,8 +86648,11 @@
 				<Member Name="ЗаДисконтнуюКарту"/>
 				<Member Name="ЗаКомплектПокупки"/>
 				<Member Name="ЗаНакопленныйОбъемПродаж"/>
+				<Member Name="ЗаОстатокСрокаГодности"/>
 				<Member Name="ЗаПромокод"/>
 				<Member Name="ЗаРазовыйОбъемПродаж"/>
+				<Member Name="ЗаСоциальнуюКатегорию"/>
+				<Member Name="ЗаШтрихкод"/>
 				<Member Name="ПроизвольныйЗапрос"/>
 				<Member Name="Расширение"/>
 			</EnumType>
@@ -86412,7 +86676,7 @@
 			</EnumType>
 			<EnumType Name="ТипыШаблонов"
 					UnderlyingType="Edm.Int32">
-				<Member Name="ЧекККМ"/>
+				<Member Name="УдалитьЧекККМ"/>
 				<Member Name="ЭтикеткаДляШтрихкодовУпаковок"/>
 				<Member Name="ЭтикеткаКодМаркировкиИСМП"/>
 				<Member Name="ЭтикеткаЦенник"/>
@@ -87215,7 +87479,7 @@
 				<Member Name="СозданиеСогласияОшибкаПередачи"/>
 				<Member Name="Черновик"/>
 			</EnumType>
-			<EnumType Name="СтатусыОбластейДанных"
+			<EnumType Name="УдалитьСтатусыОбластейДанных"
 					UnderlyingType="Edm.Int32">
 				<Member Name="ИмпортИзФайла"/>
 				<Member Name="Используется"/>
@@ -87251,6 +87515,7 @@
 			<EnumType Name="СтатусыКодовМаркировкиИСМП"
 					UnderlyingType="Edm.Int32">
 				<Member Name="ВведенВОборот"/>
+				<Member Name="ВведенВОборотВозвращен"/>
 				<Member Name="ВведенВОборотПриВозврате"/>
 				<Member Name="ВыведенИзОборота"/>
 				<Member Name="ВыведенИзОборотаБезвозмезднаяПередача"/>
@@ -87272,6 +87537,8 @@
 				<Member Name="Индивидуализирован"/>
 				<Member Name="НаКонтролеФТС"/>
 				<Member Name="Нанесен"/>
+				<Member Name="НанесенНеОплачен"/>
+				<Member Name="НанесенОплачен"/>
 				<Member Name="НаходитсяВСеройЗоне"/>
 				<Member Name="НеИндивидуализирован"/>
 				<Member Name="НеИспользован"/>
@@ -87285,6 +87552,7 @@
 				<Member Name="ОтрицательноеРешениеФТС"/>
 				<Member Name="ОтсутствуетПоИтогуИнвентаризации"/>
 				<Member Name="ПодключенКОборудованиюРозлива"/>
+				<Member Name="Продан"/>
 				<Member Name="Разагрегирован"/>
 				<Member Name="Списан"/>
 				<Member Name="Утилизирован"/>
@@ -87380,6 +87648,9 @@
 				<Member Name="Ставка09"/>
 				<Member Name="Ставка13"/>
 				<Member Name="Ставка15"/>
+				<Member Name="Ставка18"/>
+				<Member Name="Ставка20"/>
+				<Member Name="Ставка22"/>
 				<Member Name="Ставка30"/>
 				<Member Name="Ставка35"/>
 			</EnumType>
@@ -87552,6 +87823,7 @@
 				<Member Name="СчетОферта"/>
 				<Member Name="СчетФактура"/>
 				<Member Name="ТоварнаяНакладная"/>
+				<Member Name="ТоварнаяНакладнаяРБ"/>
 				<Member Name="УКД"/>
 				<Member Name="УПД"/>
 				<Member Name="Уведомление"/>
@@ -87704,7 +87976,7 @@
 				<Member Name="ТребуетсяСинхронизация"/>
 				<Member Name="УдалитьТребуетсяСопоставление"/>
 			</EnumType>
-			<EnumType Name="СостоянияРасширений"
+			<EnumType Name="УдалитьСостоянияРасширений"
 					UnderlyingType="Edm.Int32">
 				<Member Name="НеУстановлено"/>
 				<Member Name="Отключено"/>
@@ -87785,7 +88057,7 @@
 				<Member Name="ВправоНа90"/>
 				<Member Name="НетПоворота"/>
 			</EnumType>
-			<EnumType Name="СостоянияИнтеграцииОбъектов"
+			<EnumType Name="УдалитьСостоянияИнтеграцииОбъектов"
 					UnderlyingType="Edm.Int32">
 				<Member Name="Интегрирован"/>
 				<Member Name="Ожидание"/>
@@ -87905,6 +88177,7 @@
 				<Member Name="Сервис1СДоставка"/>
 				<Member Name="Сервис1СКурьер"/>
 				<Member Name="Сервис1СКурьерика"/>
+				<Member Name="Сервис1ССДЭК"/>
 				<Member Name="ЯндексДоставка"/>
 			</EnumType>
 			<EnumType Name="СтатусыПоискаНовыхДанныхВРегистрахМП"
@@ -88039,7 +88312,7 @@
 				<Member Name="ОчищатьУдаленные"/>
 				<Member Name="ОчищатьУдаленныеИНенужные"/>
 			</EnumType>
-			<EnumType Name="РежимыИспользованияИнформационнойБазы"
+			<EnumType Name="УдалитьРежимыИспользованияИнформационнойБазы"
 					UnderlyingType="Edm.Int32">
 				<Member Name="Демонстрационный"/>
 				<Member Name="Рабочий"/>
@@ -88111,7 +88384,6 @@
 			<EnumType Name="ПрочиеЗоныПересчетаАлкогольнойПродукции"
 					UnderlyingType="Edm.Int32">
 				<Member Name="БутылкиБезКоробки"/>
-				<Member Name="ЗонаПереупаковки"/>
 			</EnumType>
 			<EnumType Name="ПрофилиМобильногоПриложения"
 					UnderlyingType="Edm.Int32">
@@ -89476,6 +89748,7 @@
 				<Member Name="ВыборНОТуристическийНалог"/>
 				<Member Name="ВыборНалоговогоОрганаДляПредставленияДеклараций"/>
 				<Member Name="ВыборНалоговогоОрганаНДФЛ"/>
+				<Member Name="ВыдачаСвидительстваЭтиловыйСпирт"/>
 				<Member Name="ВыдачаСправкиПоРасчетам"/>
 				<Member Name="ВыплатаДоходаЛицуНеИмеющемуПраваПолучения"/>
 				<Member Name="ГрафикПереходаНалоговыйМониторинг"/>
@@ -89486,15 +89759,18 @@
 				<Member Name="ДосрочноеИсполнениеОтсрочки"/>
 				<Member Name="ДоступГИРБО"/>
 				<Member Name="ДубликатСвидетельстваПереработкаНефти"/>
+				<Member Name="ДубликатСвидительстваЭтиловыйСпирт"/>
 				<Member Name="ЖалобаФНС"/>
 				<Member Name="ЗаключениеТрудовогоДоговора"/>
 				<Member Name="ЗаменаБанковскойГарантии"/>
 				<Member Name="ЗапретПредставленияУполномоченнымиЛицами"/>
+				<Member Name="ЗапросИзРеестраНалогоплательщиков"/>
 				<Member Name="ЗапросМотивированногоМнения"/>
 				<Member Name="ЗапросСведенийСоставляющихНалоговуюТайну"/>
 				<Member Name="ЗапросСостояниеРасчетов"/>
 				<Member Name="ЗапросСуммЕНП"/>
 				<Member Name="ЗачетГоспошлины"/>
+				<Member Name="ЗачетПошлиныФСРАР"/>
 				<Member Name="ЗачетСФР"/>
 				<Member Name="ЗачетСуммыНВОС"/>
 				<Member Name="ЗачетЭкосбор"/>
@@ -89546,6 +89822,7 @@
 				<Member Name="НастройкаЗащищеннойСети"/>
 				<Member Name="НачалоСовершенияСделок"/>
 				<Member Name="НевозможностьПредоставленияДокументов"/>
+				<Member Name="НевозможностьПредоставленияИнформации"/>
 				<Member Name="НеполныйДень"/>
 				<Member Name="ОбработкаПерсональныхДанных"/>
 				<Member Name="ОбязательстваВыплатаЗП"/>
@@ -89571,6 +89848,7 @@
 				<Member Name="ПереходНаЕСХН"/>
 				<Member Name="ПереходНаУдаленку"/>
 				<Member Name="ПодключениеИСОрганизации"/>
+				<Member Name="ПониженныеТарифыСтраховыеВзносыКурилы"/>
 				<Member Name="ПостановкаНаУчетИностранцаФНС"/>
 				<Member Name="ПостановкаСнятиеВКачествеНалоговогоАгента"/>
 				<Member Name="ПоясненияПоСуммамНалогов"/>
@@ -90258,6 +90536,7 @@
 				<Member Name="АктНалоговойПроверки"/>
 				<Member Name="АктОВоспрепятствованииДоступуДолжностныхЛицНаТерриториюИлиВПомещение"/>
 				<Member Name="АктОбОбнаруженииФактовСвидетельствующихОНалоговыхПравонарушениях"/>
+				<Member Name="АктПроверкиСделокМеждуВзаимозависимымиЛицами"/>
 				<Member Name="ВыручкаПоККТ"/>
 				<Member Name="ЗапросОПредставленииДокументовИнформации"/>
 				<Member Name="КвитанцияОПрисвоенииРНПТ"/>
@@ -90294,6 +90573,7 @@
 				<Member Name="РешениеОЗаменеОбеспечительныхМер"/>
 				<Member Name="РешениеОПривлеченииКОтветственностиЗаНалоговоеПравонарушение"/>
 				<Member Name="РешениеОПривлеченииКОтветственностиЗаСовершениеНалоговогоПравонарушения"/>
+				<Member Name="РешениеОПривлеченииКОтветственностиПоРезультатамПроверкиСделок"/>
 				<Member Name="РешениеОПривлеченииКУчастиюСвидетеляЭкспертаСпециалиста"/>
 				<Member Name="РешениеОПривлеченииЛицаКОтветственностиЗаНалоговоеПравонарушение"/>
 				<Member Name="РешениеОПринятииОбеспечительныхМер"/>
@@ -90312,6 +90592,7 @@
 				<Member Name="РешениеОбОтказеВВозмещенииСуммыНалогаНаДобавленнуюСтоимость"/>
 				<Member Name="РешениеОбОтказеВПривлеченииКОтветственностиЗаСовершениеНалоговогоПравонарушения"/>
 				<Member Name="РешениеОбОтказеВПривлеченииКОтветственностиЛицаЗаНалоговоеПравонарушение"/>
+				<Member Name="РешениеОбОтказеВПривлеченииКОтветственностиПоРезультатамПроверкиСделок"/>
 				<Member Name="РешениеОбОтказеВПривлеченииЛицаКОтветственностиЗаНалоговоеПравонарушение"/>
 				<Member Name="РешениеОбОтложенииРассмотренияМатериаловНалоговойПроверкиВСвязиСНеявкойЛица"/>
 				<Member Name="РешениеОбОтменеОбеспечительныхМер"/>
@@ -90519,6 +90800,9 @@
 					UnderlyingType="Edm.Int32">
 				<Member Name="ВИнформационнойБазе"/>
 				<Member Name="ВТомахНаДиске"/>
+				<Member Name="ВТомахТомНеОпределен"/>
+				<Member Name="ВоВнешнемХранилищеДвоичныхДанных"/>
+				<Member Name="ВоВстроенномХранилищеДвоичныхДанных"/>
 			</EnumType>
 			<EnumType Name="ВидыЛицензийАлкогольнойПродукции"
 					UnderlyingType="Edm.Int32">
@@ -90574,7 +90858,7 @@
 				<Member Name="Уничтожен"/>
 				<Member Name="Утерян"/>
 			</EnumType>
-			<EnumType Name="ПричиныОтключенияРасширенийВМоделиСервиса"
+			<EnumType Name="УдалитьПричиныОтключенияРасширенийВМоделиСервиса"
 					UnderlyingType="Edm.Int32">
 				<Member Name="БлокировкаАдминистраторомСервиса"/>
 				<Member Name="БлокировкаВладельцем"/>
@@ -90639,7 +90923,7 @@
 				<Member Name="ПоДате"/>
 				<Member Name="ПоСчетчику"/>
 			</EnumType>
-			<EnumType Name="ПричиныСписанияКодовМаркировкиИСМП"
+			<EnumType Name="УдалитьПричиныСписанияКодовМаркировкиИСМП"
 					UnderlyingType="Edm.Int32">
 				<Member Name="ВыбытиеДоОбязательностиМаркировки"/>
 				<Member Name="ДемонстрационныеОбразцы"/>
@@ -92104,14 +92388,6 @@
 				<Member Name="Экспортер"/>
 				<Member Name="Эмитент"/>
 			</EnumType>
-			<EnumType Name="УдалитьВидыОповещенийПользователей"
-					UnderlyingType="Edm.Int32">
-				<Member Name="ЗапросНаПолучениеДанных"/>
-				<Member Name="ОповещениеОНедоступности"/>
-				<Member Name="ПредупреждениеОБлокировкеРаботы"/>
-				<Member Name="ПредупреждениеПриЗавершенииСеанса"/>
-				<Member Name="СообщениеПользователю"/>
-			</EnumType>
 			<EnumType Name="ТипыПодписокСервиса"
 					UnderlyingType="Edm.Int32">
 				<Member Name="Основная"/>
@@ -92263,6 +92539,7 @@
 				<Member Name="Групповая"/>
 				<Member Name="Логистическая"/>
 				<Member Name="Набор"/>
+				<Member Name="НеЯвляетсяУпаковкой"/>
 				<Member Name="Неопределен"/>
 				<Member Name="ОбъемноСортовойУчет"/>
 				<Member Name="Потребительская"/>
@@ -92541,7 +92818,7 @@
 				<Member Name="Безналичные"/>
 				<Member Name="Наличные"/>
 			</EnumType>
-			<EnumType Name="СтатусыКодовМаркировкиМОТП"
+			<EnumType Name="УдалитьСтатусыКодовМаркировкиМОТП"
 					UnderlyingType="Edm.Int32">
 				<Member Name="ВведенВОборот"/>
 				<Member Name="ВведенВОборотВозвращен"/>
@@ -92601,14 +92878,6 @@
 				<Member Name="НеправильныйИНН"/>
 				<Member Name="ПолученоИзКэша"/>
 				<Member Name="ПолученоИзФоновогоЗадания"/>
-			</EnumType>
-			<EnumType Name="СостоянияРегистрацииКассовогоАппарата"
-					UnderlyingType="Edm.Int32">
-				<Member Name="НеПодключен"/>
-				<Member Name="ОжидаетОтключение"/>
-				<Member Name="ОжидаетПереподключение"/>
-				<Member Name="ОжидаетПодключение"/>
-				<Member Name="Подключен"/>
 			</EnumType>
 			<EnumType Name="УдалитьФорматыДокументооборотаСФНС"
 					UnderlyingType="Edm.Int32">
@@ -93741,8 +94010,8 @@
 						EntityType="StandardODATA.Document_ПриходнаяНакладная_БонусныеБаллыКНачислению"/>
 				<EntitySet Name="Catalog_ХранилищеШаблонов"
 						EntityType="StandardODATA.Catalog_ХранилищеШаблонов"/>
-				<EntitySet Name="Catalog_ХранилищеШаблонов_Условия"
-						EntityType="StandardODATA.Catalog_ХранилищеШаблонов_Условия"/>
+				<EntitySet Name="Catalog_ХранилищеШаблонов_УдалитьУсловия"
+						EntityType="StandardODATA.Catalog_ХранилищеШаблонов_УдалитьУсловия"/>
 				<EntitySet Name="Catalog_ХозяйственныеОперации"
 						EntityType="StandardODATA.Catalog_ХозяйственныеОперации"/>
 				<EntitySet Name="Catalog_УчетныеЗаписиДокументооборота"
