@@ -340,7 +340,14 @@ class ProductionMaterialIssue(Base):
     product_id = Column(Integer, ForeignKey("production_products.product_id", ondelete="CASCADE"), nullable=False, index=True)
     order_id = Column(Integer, ForeignKey("production_orders.order_id"), nullable=False, index=True)
     status = Column(String(32), nullable=False, default="draft", index=True)
+    # Destination warehouse for the transfer (workshop's bound warehouse from
+    # workshop_warehouse_bindings, or caller-supplied). Used as
+    # "СкладПолучатель_Key" in the 1C Document_ПеремещениеЗапасов payload.
     warehouse_ref1c = Column(String(36), nullable=True, index=True)
+    # Source warehouse — where the materials currently sit. NULL means
+    # "unknown / to be filled in 1C on the draft". Used as
+    # "СкладОтправитель_Key".
+    source_warehouse_ref1c = Column(String(36), nullable=True, index=True)
     initiated_by = Column(String(100), nullable=True)
     exported_ref1c = Column(String(36), nullable=True, index=True)
     exported_at = Column(TIMESTAMP, nullable=True)

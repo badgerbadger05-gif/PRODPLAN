@@ -80,6 +80,10 @@ def test_journal_and_material_issue_are_scoped_to_order_line(db_session):
     # Default per plan-aligned status set: 'shortage' until coverage is
     # evaluated (was 'new' under the legacy workshop-progress set).
     assert journal["rows"][0]["status"] == "shortage"
+    # 1C-synced order: source defaults to '1c', order_ref1c populated.
+    # Frontend uses these to hide the "Export to 1C" button on 1C rows.
+    assert journal["rows"][0]["order_source"] == "1c"
+    assert journal["rows"][0]["order_ref1c"] == "order-001"
 
     materials = preview_materials(db_session, product.product_id)
     assert materials["components"][0]["component_item_id"] == component.item_id
