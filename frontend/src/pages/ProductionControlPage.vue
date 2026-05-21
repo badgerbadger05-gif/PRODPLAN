@@ -9,6 +9,21 @@
       <q-btn color="primary" icon="print" label="Печать маршрутных" :disable="selected.length === 0" @click="printSelected" />
       <q-btn color="secondary" icon="inventory_2" label="Создать выдачу" :disable="selected.length === 0" :loading="issueLoading" @click="createIssues" />
       <q-btn
+        color="positive"
+        icon="factory"
+        label="Произвести"
+        :disable="produceCandidate === null"
+        :loading="produceLoading"
+        @click="openProduceDialog"
+      >
+        <q-tooltip v-if="selected.length !== 1">
+          Выберите ровно одну строку с положительным остатком к выпуску
+        </q-tooltip>
+        <q-tooltip v-else-if="produceCandidate === null">
+          У выбранной строки нечего производить (remaining_qty = 0)
+        </q-tooltip>
+      </q-btn>
+      <q-btn
         color="accent"
         icon="cloud_upload"
         label="Выгрузить заказ в 1С"
@@ -129,6 +144,110 @@
         </q-td>
       </template>
     </q-table>
+
+    <!-- Produce dialog: bumps produced_qty + optionally exports to 1C -->
+    <q-dialog v-model="produceDialog" persistent>
+      <q-card style="min-width: 540px; max-width: 95vw;">
+        <q-card-section class="row items-center q-pb-none">
+          <div class="text-h6">Произвести</div>
+          <q-space />
+          <q-btn flat round dense icon="close" v-close-popup />
+        </q-card-section>
+
+        <q-card-section v-if="produceCandidate">
+          <div class="text-body2 q-mb-sm">
+            Деталь: <b>{{ produceCandidate.item_name }}</b>
+            <span class="text-grey-7">({{ produceCandidate.item_article || '—' }})</span>
+          </div>
+          <div class="text-caption text-grey-7 q-mb-md">
+            Заказ № {{ produceCandidate.order_number }} ·
+            строка {{ produceCandidate.line_number || produceCandidate.product_id }} ·
+            остаток к выпуску: <b>{{ produceCandidate.remaining_qty }}</b> {{ produceCandidate.unit || '' }}
+          </div>
+
+          <div class="row q-col-gutter-md">
+            <div class="col-12 col-md-4">
+              <q-input
+                v-model.number="produceForm.qty"
+                type="number"
+                dense
+                outlined
+                label="Количество"
+                :rules="produceQtyRules"
+                :min="0"
+                :max="produceCandidate.remaining_qty"
+              />
+            </div>
+            <div class="col-12 col-md-8">
+              <q-input v-model="produceForm.executor" dense outlined label="Исполнитель" />
+            </div>
+            <div class="col-12">
+              <q-input v-model="produceForm.comment" dense outlined label="Комментарий" type="textarea" autogrow />
+            </div>
+          </div>
+
+          <q-separator class="q-my-sm" />
+
+          <q-checkbox
+            v-model="produceForm.export_to_1c"
+            label="Сразу выгрузить выпуск в 1С (Document_СборкаЗапасов)"
+            color="accent"
+          />
+          <q-checkbox
+            v-if="produceForm.export_to_1c"
+            v-model="produceForm.dry_run"
+            label="Только dry-run (показать payload, не писать)"
+            color="primary"
+            class="block"
+          />
+          <q-banner
+            v-if="produceForm.export_to_1c && !produceForm.dry_run"
+            dense
+            class="bg-blue-1 text-primary q-mt-sm"
+          >
+            <template #avatar><q-icon name="info" /></template>
+            Запись только в demo-базу 1С (URL должен содержать <code>unf_demo</code>).
+          </q-banner>
+
+          <div v-if="produceResult" class="q-mt-md">
+            <div class="text-subtitle2">Результат:</div>
+            <div class="text-caption">
+              Выпущено: <b>{{ produceResult.qty }}</b>, всего по строке:
+              <b>{{ produceResult.produced_qty_total }}</b>, остаток:
+              <b>{{ produceResult.remaining_qty }}</b>. Статус линии:
+              <q-chip dense :color="entryColor(produceResult.line_status)" text-color="white">
+                {{ produceResult.line_status }}
+              </q-chip>
+            </div>
+            <div v-if="produceExportResult" class="q-mt-sm">
+              <q-badge v-if="produceExportResult.dry_run" color="warning" outline>DRY-RUN</q-badge>
+              <q-badge v-else-if="produceExportResult.manufactures_created > 0" color="positive" outline>
+                В 1С создано: {{ produceExportResult.manufactures_created }}
+              </q-badge>
+              <q-badge v-if="produceExportResult.manufactures_error > 0" color="negative" outline>
+                Ошибок 1С: {{ produceExportResult.manufactures_error }}
+              </q-badge>
+              <div v-if="produceExportResult.entries?.[0]?.target_ref_key" class="text-caption text-grey-7 q-mt-xs">
+                Ref_Key: {{ produceExportResult.entries[0].target_ref_key }}
+              </div>
+            </div>
+          </div>
+        </q-card-section>
+
+        <q-card-actions align="right">
+          <q-btn flat label="Закрыть" v-close-popup />
+          <q-btn
+            color="positive"
+            :label="produceForm.export_to_1c
+              ? (produceForm.dry_run ? 'Произвести + dry-run' : 'Произвести + выгрузить')
+              : 'Произвести'"
+            :loading="produceLoading"
+            :disable="!produceForm.qty || produceForm.qty <= 0"
+            @click="runProduce"
+          />
+        </q-card-actions>
+      </q-card>
+    </q-dialog>
 
     <!-- Export to 1C dialog: production orders (Document_ЗаказНаПроизводство) -->
     <q-dialog v-model="exportDialog" persistent>
@@ -428,16 +547,20 @@ import {
   createProductionMaterialIssues,
   deleteProductionControlIgnoredWarehouse,
   deleteProductionControlWorkshopBinding,
+  exportManufacturesTo1C,
   exportProductionOrdersTo1C,
   getProductionControlMaterials,
   getProductionControlSettings,
   listResources,
   listProductionControlOrders,
+  produceProductionLine,
   updateProductionControlOrderState,
   upsertProductionControlIgnoredWarehouse,
   upsertProductionControlWorkshopBinding,
+  type ExportManufacturesResult,
   type ExportProductionOrdersResult,
   type IgnoredWarehouseEntry,
+  type ProduceLineResult,
   type ProductionControlOrderRow,
   type ProductionControlSettings,
   type WorkshopWarehouseBinding
@@ -498,6 +621,119 @@ const materialColumns: QTableColumn<any>[] = [
   { name: 'qty_per_unit', label: 'На ед.', field: 'qty_per_unit', align: 'right', sortable: true },
   { name: 'required_qty', label: 'К выдаче', field: 'required_qty', align: 'right', sortable: true }
 ]
+
+// ---------------------------------------------------------------------------
+// "Произвести" dialog: bumps produced_qty + optionally exports to 1C as
+// Document_СборкаЗапасов.
+// Backends: POST /orders/{id}/produce  +  POST /manufactures/export-to-1c.
+// ---------------------------------------------------------------------------
+const produceDialog = ref(false)
+const produceLoading = ref(false)
+const produceForm = reactive<{
+  qty: number | null
+  executor: string
+  comment: string
+  export_to_1c: boolean
+  dry_run: boolean
+}>({
+  qty: null,
+  executor: '',
+  comment: '',
+  export_to_1c: false,
+  dry_run: true
+})
+const produceResult = ref<ProduceLineResult | null>(null)
+const produceExportResult = ref<ExportManufacturesResult | null>(null)
+
+const produceCandidate = computed<ProductionControlOrderRow | null>(() => {
+  // Single-selected row with positive remaining qty.
+  if (selected.value.length !== 1) return null
+  const row = selected.value[0]
+  return (row.remaining_qty || 0) > 0 ? row : null
+})
+
+const produceQtyRules = [
+  (v: any) => (v != null && Number(v) > 0) || 'Количество должно быть > 0',
+  (v: any) => {
+    const cand = produceCandidate.value
+    if (!cand) return true
+    return Number(v) <= Number(cand.remaining_qty || 0) || 'Не больше остатка'
+  }
+]
+
+function openProduceDialog() {
+  const cand = produceCandidate.value
+  if (!cand) return
+  produceForm.qty = Number(cand.remaining_qty) || null
+  produceForm.executor = ''
+  produceForm.comment = ''
+  produceForm.export_to_1c = false
+  produceForm.dry_run = true
+  produceResult.value = null
+  produceExportResult.value = null
+  produceDialog.value = true
+}
+
+async function runProduce() {
+  const cand = produceCandidate.value
+  if (!cand || !produceForm.qty || produceForm.qty <= 0) return
+  produceLoading.value = true
+  try {
+    const r = await produceProductionLine(cand.product_id, {
+      qty: Number(produceForm.qty),
+      executor: produceForm.executor.trim() || null,
+      comment: produceForm.comment.trim() || null
+    })
+    produceResult.value = r
+    $q.notify({
+      type: 'positive',
+      message: r.line_status === 'produced'
+        ? `Готово: ${r.qty}. Строка закрыта.`
+        : `Готово: ${r.qty}. Остаток: ${r.remaining_qty}.`
+    })
+
+    if (produceForm.export_to_1c) {
+      try {
+        const exp = await exportManufacturesTo1C({
+          manufacture_ids: [r.manufacture_id],
+          dry_run: produceForm.dry_run,
+          allow_production: false
+        })
+        produceExportResult.value = exp
+        if (!exp.dry_run) {
+          const created = exp.manufactures_created || 0
+          const errored = exp.manufactures_error || 0
+          if (errored === 0) {
+            $q.notify({ type: 'positive', message: `В 1С создано: ${created}` })
+          } else {
+            $q.notify({
+              type: 'warning',
+              message: `1С: создано ${created}, ошибок ${errored}.`
+            })
+          }
+        }
+      } catch (e: any) {
+        const detail = e?.response?.data?.detail || e?.message || String(e)
+        if (e?.response?.status === 403) {
+          $q.notify({
+            type: 'negative',
+            timeout: 8000,
+            message: `Демо-guard: ${detail}. Локальный выпуск всё равно сохранён.`
+          })
+        } else {
+          $q.notify({ type: 'negative', message: `Ошибка экспорта в 1С: ${detail}` })
+        }
+      }
+    }
+
+    await fetchRows()
+  } catch (e: any) {
+    const detail = e?.response?.data?.detail || e?.message || String(e)
+    $q.notify({ type: 'negative', message: `Не удалось произвести: ${detail}` })
+  } finally {
+    produceLoading.value = false
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Export-to-1C dialog (production orders -> Document_ЗаказНаПроизводство).

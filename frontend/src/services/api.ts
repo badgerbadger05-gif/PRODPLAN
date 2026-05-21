@@ -690,3 +690,58 @@ export async function exportProductionOrdersTo1C(body: {
   })
   return data
 }
+
+
+// ---------------------------------------------------------------------------
+// "Произвести" action + Document_СборкаЗапасов export.
+// Endpoints landed in the same commit as this helper.
+// ---------------------------------------------------------------------------
+
+export interface ProduceLineResult {
+  status: 'ok'
+  manufacture_id: number
+  product_id: number
+  order_id: number
+  qty: number
+  produced_qty_total: number
+  remaining_qty: number
+  line_status: 'produced_partial' | 'produced' | string
+}
+
+export async function produceProductionLine(
+  productId: number,
+  body: { qty: number; executor?: string | null; comment?: string | null }
+): Promise<ProduceLineResult> {
+  const { data } = await api.post(
+    `/v1/production-control/orders/${productId}/produce`,
+    body
+  )
+  return data
+}
+
+export interface ExportManufacturesResult {
+  status: 'ok' | 'partial_error' | string
+  dry_run: boolean
+  entity: string
+  manufactures_requested: number
+  manufactures_eligible: number
+  manufactures_already_linked: number
+  manufactures_created: number
+  manufactures_error: number
+  skipped_rows: Array<{ manufacture_id?: number; reason?: string }>
+  entries: ExportEntry[]
+  payloads?: Array<{ manufacture_id: number; number: string; payload: Record<string, any> }>
+}
+
+export async function exportManufacturesTo1C(body: {
+  manufacture_ids: number[]
+  dry_run?: boolean
+  allow_production?: boolean
+}): Promise<ExportManufacturesResult> {
+  const { data } = await api.post('/v1/production-control/manufactures/export-to-1c', {
+    manufacture_ids: body.manufacture_ids,
+    dry_run: body.dry_run ?? true,
+    allow_production: body.allow_production ?? false,
+  })
+  return data
+}
