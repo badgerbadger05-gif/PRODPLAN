@@ -323,15 +323,21 @@ class IgnoredWarehouse(Base):
 class ProductionMaterialIssue(Base):
     __tablename__ = "production_material_issues"
     __table_args__ = (
-        # At most one ACTIVE (draft|requested) material issue per production
-        # line. Issues already sent to 1C (exported) or that errored out can
-        # coexist — the user may need to re-prepare a fresh draft.
+        # At most one ACTIVE (draft|requested) outgoing material issue per
+        # production line. Issues already sent to 1C (exported) or that
+        # errored out can coexist — the user may need to re-prepare a fresh
+        # draft. Returns (direction='return') are excluded so a return draft
+        # can coexist with the original outgoing issue.
         Index(
             "ux_production_material_issues_active_per_product",
             "product_id",
             unique=True,
-            postgresql_where=text("status IN ('draft', 'requested')"),
-            sqlite_where=text("status IN ('draft', 'requested')"),
+            postgresql_where=text(
+                "status IN ('draft', 'requested') AND direction = 'issue'"
+            ),
+            sqlite_where=text(
+                "status IN ('draft', 'requested') AND direction = 'issue'"
+            ),
         ),
     )
 
@@ -340,13 +346,20 @@ class ProductionMaterialIssue(Base):
     product_id = Column(Integer, ForeignKey("production_products.product_id", ondelete="CASCADE"), nullable=False, index=True)
     order_id = Column(Integer, ForeignKey("production_orders.order_id"), nullable=False, index=True)
     status = Column(String(32), nullable=False, default="draft", index=True)
-    # Destination warehouse for the transfer (workshop's bound warehouse from
-    # workshop_warehouse_bindings, or caller-supplied). Used as
-    # "СкладПолучатель_Key" in the 1C Document_ПеремещениеЗапасов payload.
+    # 'issue'  — outgoing transfer source -> workshop (the original use case).
+    # 'return' — workshop -> source, для leftover-компонентов при частичном
+    # выпуске. Both are emitted as Document_ПеремещениеЗапасов with the
+    # warehouse columns interpreted at face value.
+    direction = Column(
+        String(16), nullable=False, default="issue", server_default="issue"
+    )
+    # For direction='issue': destination warehouse (workshop's bound warehouse).
+    # For direction='return': original source warehouse (where leftover goes back).
+    # Used as "СкладПолучатель_Key" in the 1C payload.
     warehouse_ref1c = Column(String(36), nullable=True, index=True)
-    # Source warehouse — where the materials currently sit. NULL means
-    # "unknown / to be filled in 1C on the draft". Used as
-    # "СкладОтправитель_Key".
+    # For direction='issue': source warehouse (where materials sit).
+    # For direction='return': workshop warehouse (where leftover currently is).
+    # Used as "СкладОтправитель_Key".
     source_warehouse_ref1c = Column(String(36), nullable=True, index=True)
     initiated_by = Column(String(100), nullable=True)
     exported_ref1c = Column(String(36), nullable=True, index=True)
