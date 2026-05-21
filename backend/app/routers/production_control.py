@@ -26,6 +26,7 @@ from ..services.production_control import (
     preview_materials,
     produce_line,
     render_route_sheets_html,
+    return_leftover_components,
     update_line_state,
     upsert_ignored_warehouse,
     upsert_workshop_binding,
@@ -155,6 +156,29 @@ def post_produce_line(
             executor=payload.executor,
             comment=payload.comment,
         )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/orders/{product_id}/return-leftovers", response_model=dict)
+def post_return_leftovers(
+    product_id: int,
+    initiated_by: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """
+    Создать обратное перемещение лишних компонентов на исходные склады для
+    частично произведённой строки. Локально только — в 1С документ
+    отправится отдельно через /material-issues/export-to-1c.
+
+    Возвращает либо status='ok' с return_issue_id и list of lines, либо
+    status='skipped' с человекочитаемой причиной (produced_qty=0, нет
+    выгруженных исходящих перемещений, или нет компонентов с остатком).
+    """
+    try:
+        return return_leftover_components(db, int(product_id), initiated_by=initiated_by)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

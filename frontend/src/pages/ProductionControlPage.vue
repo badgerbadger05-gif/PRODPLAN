@@ -24,6 +24,21 @@
         </q-tooltip>
       </q-btn>
       <q-btn
+        color="warning"
+        icon="undo"
+        label="Вернуть остаток"
+        :disable="returnCandidate === null"
+        :loading="returnLoading"
+        @click="openReturnDialog"
+      >
+        <q-tooltip v-if="selected.length !== 1">
+          Выберите ровно одну частично произведённую строку
+        </q-tooltip>
+        <q-tooltip v-else-if="returnCandidate === null">
+          Доступно только для строк со статусом «Произведён частично»
+        </q-tooltip>
+      </q-btn>
+      <q-btn
         color="accent"
         icon="cloud_upload"
         label="Выгрузить заказ в 1С"
@@ -244,6 +259,82 @@
             :loading="produceLoading"
             :disable="!produceForm.qty || produceForm.qty <= 0"
             @click="runProduce"
+          />
+        </q-card-actions>
+      </q-card>
+    </q-dialog>
+
+    <!-- Return-leftover dialog -->
+    <q-dialog v-model="returnDialog" persistent>
+      <q-card style="min-width: 560px; max-width: 95vw;">
+        <q-card-section class="row items-center q-pb-none">
+          <div class="text-h6">Вернуть остаток компонентов</div>
+          <q-space />
+          <q-btn flat round dense icon="close" v-close-popup />
+        </q-card-section>
+
+        <q-card-section v-if="returnCandidate">
+          <div class="text-body2 q-mb-sm">
+            Деталь: <b>{{ returnCandidate.item_name }}</b>
+            <span class="text-grey-7">({{ returnCandidate.item_article || '—' }})</span>
+          </div>
+          <div class="text-caption text-grey-7 q-mb-md">
+            Заказ № {{ returnCandidate.order_number }} ·
+            строка {{ returnCandidate.line_number || returnCandidate.product_id }} ·
+            произведено: <b>{{ returnCandidate.produced_qty }}</b>,
+            остаток к выпуску: <b>{{ returnCandidate.remaining_qty }}</b>
+          </div>
+          <div class="text-caption text-grey-8 q-mb-sm">
+            Будет создан черновик <b>Document_ПеремещениеЗапасов</b>
+            (направление workshop → исходный склад) с остатком компонентов,
+            не использованных при частичном выпуске. В 1С этот документ
+            отправляется отдельно через «Создать выдачу» (он попадёт в общий
+            экспорт как обычная выдача).
+          </div>
+
+          <div v-if="returnResult" class="q-mt-md">
+            <div v-if="returnResult.status === 'skipped'">
+              <q-banner dense class="bg-orange-1 text-orange-10">
+                <template #avatar><q-icon name="info" /></template>
+                Не удалось создать возврат: {{ returnResult.skipped_reason }}
+              </q-banner>
+            </div>
+            <div v-else>
+              <div class="text-subtitle2 q-mb-xs">
+                <q-chip v-if="returnResult.reused" dense color="grey-7" text-color="white">
+                  Уже существует черновик
+                </q-chip>
+                <q-chip v-else dense color="positive" text-color="white">
+                  Создан черновик № {{ returnResult.document_number }}
+                </q-chip>
+              </div>
+              <div class="text-caption text-grey-7 q-mb-xs">
+                Источник: <code>{{ returnResult.source_warehouse_ref1c || '—' }}</code>
+                → получатель: <code>{{ returnResult.destination_warehouse_ref1c || '—' }}</code>
+              </div>
+              <q-table
+                v-if="returnResult.lines.length > 0"
+                dense
+                flat
+                bordered
+                :rows="returnResult.lines"
+                :columns="returnLineColumns"
+                row-key="component_item_id"
+                hide-bottom
+                :pagination="{ rowsPerPage: 100 }"
+              />
+            </div>
+          </div>
+        </q-card-section>
+
+        <q-card-actions align="right">
+          <q-btn flat label="Закрыть" v-close-popup />
+          <q-btn
+            v-if="!returnResult || returnResult.status !== 'ok'"
+            color="warning"
+            label="Создать возврат"
+            :loading="returnLoading"
+            @click="runReturn"
           />
         </q-card-actions>
       </q-card>
@@ -554,6 +645,7 @@ import {
   listResources,
   listProductionControlOrders,
   produceProductionLine,
+  returnLeftoverComponents,
   updateProductionControlOrderState,
   upsertProductionControlIgnoredWarehouse,
   upsertProductionControlWorkshopBinding,
@@ -563,6 +655,7 @@ import {
   type ProduceLineResult,
   type ProductionControlOrderRow,
   type ProductionControlSettings,
+  type ReturnLeftoverResult,
   type WorkshopWarehouseBinding
 } from '../services/api'
 
@@ -732,6 +825,72 @@ async function runProduce() {
     $q.notify({ type: 'negative', message: `Не удалось произвести: ${detail}` })
   } finally {
     produceLoading.value = false
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Return-leftover dialog (workshop -> source for partial production).
+// Backend: POST /v1/production-control/orders/{product_id}/return-leftovers.
+// ---------------------------------------------------------------------------
+const returnDialog = ref(false)
+const returnLoading = ref(false)
+const returnResult = ref<ReturnLeftoverResult | null>(null)
+
+const returnCandidate = computed<ProductionControlOrderRow | null>(() => {
+  if (selected.value.length !== 1) return null
+  const row = selected.value[0]
+  // Status comes from the "Обеспечение" column; we offer the action only
+  // for partially-produced lines.
+  if (row.status !== 'produced_partial') return null
+  return row
+})
+
+const returnLineColumns = [
+  { name: 'component_item_id', label: 'item_id', field: 'component_item_id', align: 'left' as const },
+  { name: 'issued_qty', label: 'Выдано', field: 'issued_qty', align: 'right' as const },
+  { name: 'consumed_qty', label: 'Потреблено', field: 'consumed_qty', align: 'right' as const },
+  { name: 'leftover_qty', label: 'К возврату', field: 'leftover_qty', align: 'right' as const },
+  { name: 'unit', label: 'ЕИ', field: 'unit', align: 'left' as const },
+]
+
+function openReturnDialog() {
+  if (returnCandidate.value === null) return
+  returnResult.value = null
+  returnDialog.value = true
+}
+
+async function runReturn() {
+  const cand = returnCandidate.value
+  if (!cand) return
+  returnLoading.value = true
+  try {
+    const r = await returnLeftoverComponents(cand.product_id)
+    returnResult.value = r
+    if (r.status === 'ok') {
+      if (r.reused) {
+        $q.notify({
+          type: 'info',
+          message: `Уже есть черновик возврата № ${r.document_number}`
+        })
+      } else {
+        $q.notify({
+          type: 'positive',
+          message: `Создан возврат № ${r.document_number}, позиций: ${r.lines.length}`
+        })
+      }
+      await fetchRows()
+    } else {
+      $q.notify({
+        type: 'warning',
+        timeout: 6000,
+        message: `Пропущено: ${r.skipped_reason}`
+      })
+    }
+  } catch (e: any) {
+    const detail = e?.response?.data?.detail || e?.message || String(e)
+    $q.notify({ type: 'negative', message: `Ошибка возврата: ${detail}` })
+  } finally {
+    returnLoading.value = false
   }
 }
 

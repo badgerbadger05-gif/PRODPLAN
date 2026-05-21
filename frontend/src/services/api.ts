@@ -745,3 +745,44 @@ export async function exportManufacturesTo1C(body: {
   })
   return data
 }
+
+
+// ---------------------------------------------------------------------------
+// Return leftover components after partial production (plan #6).
+// Endpoint: POST /v1/production-control/orders/{product_id}/return-leftovers
+// ---------------------------------------------------------------------------
+
+export interface ReturnLeftoverLine {
+  component_item_id: number
+  issued_qty: number
+  consumed_qty: number
+  qty_per_unit: number
+  leftover_qty: number
+  unit?: string | null
+  source_spec_id?: number | null
+}
+
+export interface ReturnLeftoverResult {
+  status: 'ok' | 'skipped' | string
+  reused?: boolean
+  return_issue_id?: number
+  document_number?: string
+  source_warehouse_ref1c?: string | null
+  destination_warehouse_ref1c?: string | null
+  lines: ReturnLeftoverLine[]
+  skipped_reason?: string
+}
+
+export async function returnLeftoverComponents(
+  productId: number,
+  body: { initiated_by?: string | null } = {}
+): Promise<ReturnLeftoverResult> {
+  const params: Record<string, string> = {}
+  if (body.initiated_by) params.initiated_by = body.initiated_by
+  const { data } = await api.post(
+    `/v1/production-control/orders/${productId}/return-leftovers`,
+    null,
+    { params }
+  )
+  return data
+}
