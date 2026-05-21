@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..schemas import ODataSyncRequest
+from ..services.one_c_manufacture_export import export_manufactures_to_1c
 from ..services.one_c_posted_transfer_sync import sync_posted_transfers
 from ..services.one_c_production_order_export import export_production_orders_to_1c
 from ..services.one_c_stock_transfer_export import export_material_issues_to_1c
@@ -23,6 +24,7 @@ from ..services.production_control import (
     list_settings,
     mark_route_sheets_printed,
     preview_materials,
+    produce_line,
     render_route_sheets_html,
     update_line_state,
     upsert_ignored_warehouse,
@@ -75,6 +77,18 @@ class ExportMaterialIssuesPayload(BaseModel):
     allow_production: bool = False
 
 
+class ProduceLinePayload(BaseModel):
+    qty: float
+    executor: Optional[str] = None
+    comment: Optional[str] = None
+
+
+class ExportManufacturesPayload(BaseModel):
+    manufacture_ids: List[int]
+    dry_run: bool = True
+    allow_production: bool = False
+
+
 @router.get("/orders", response_model=dict)
 def get_orders_journal(
     workshop_id: Optional[int] = None,
@@ -119,6 +133,58 @@ def get_order_line_materials(product_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/orders/{product_id}/produce", response_model=dict)
+def post_produce_line(
+    product_id: int,
+    payload: ProduceLinePayload,
+    db: Session = Depends(get_db),
+):
+    """
+    Record one production event on the line. Bumps produced_qty / decreases
+    remaining_qty / promotes line status to produced_partial or produced.
+    Creates a ProductionManufacture row. Local only — does NOT send to 1C;
+    use POST /manufactures/export-to-1c for that.
+    """
+    try:
+        return produce_line(
+            db,
+            int(product_id),
+            qty=float(payload.qty),
+            executor=payload.executor,
+            comment=payload.comment,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/manufactures/export-to-1c", response_model=dict)
+def post_export_manufactures_to_1c(
+    payload: ExportManufacturesPayload,
+    db: Session = Depends(get_db),
+):
+    """
+    Bulk-экспорт выпусков (производств) в 1С как Document_СборкаЗапасов
+    (Posted=false). Идемпотентно через sync_link.
+    """
+    if not payload.manufacture_ids:
+        raise HTTPException(status_code=400, detail="Не выбраны выпуски")
+    try:
+        return export_manufactures_to_1c(
+            db,
+            [int(x) for x in payload.manufacture_ids],
+            dry_run=bool(payload.dry_run),
+            allow_production=bool(payload.allow_production),
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/orders/from-mrp", response_model=dict)

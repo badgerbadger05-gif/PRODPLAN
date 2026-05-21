@@ -16,6 +16,7 @@ from ..models import (
     PlannedOrder,
     PlannedPurchase,
     PlanningRun,
+    ProductionManufacture,
     ProductionMaterialIssue,
     ProductionMaterialIssueLine,
     ProductionOrder,
@@ -1370,3 +1371,99 @@ def delete_ignored_warehouse(db: Session, warehouse_ref1c: str) -> Dict[str, Any
     )
     db.commit()
     return {"deleted": int(deleted), "warehouse_ref1c": wh}
+
+
+# ---------------------------------------------------------------------------
+# "Произвести" action — local production record.
+# Plan: "Реализовать кнопку 'Произвести': запрос количества и исполнителя,
+# создание производства и сдельного наряда."
+# ---------------------------------------------------------------------------
+
+
+def produce_line(
+    db: Session,
+    product_id: int,
+    *,
+    qty: float,
+    executor: Optional[str] = None,
+    comment: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Record one production event on a ProductionProduct line.
+
+    Effects:
+    - Creates a ProductionManufacture row (qty + executor + comment).
+    - Bumps production_products.produced_qty by qty.
+    - Decreases production_products.remaining_qty by qty (clamped >=0).
+    - Updates ProductionOrderLineState.status:
+        remaining > 0 -> 'produced_partial'
+        remaining <= 0 -> 'produced'
+      The state is sticky past those values: never regresses.
+
+    The 1C-side Document_СборкаЗапасов is created separately via
+    one_c_manufacture_export.export_manufactures_to_1c (typically right after
+    via the journal "Выгрузить выпуск в 1С" action).
+    """
+    qty_f = float(qty or 0)
+    if qty_f <= 0:
+        raise ValueError("qty должен быть положительным")
+
+    product = (
+        db.query(ProductionProduct)
+        .filter(ProductionProduct.product_id == int(product_id))
+        .one_or_none()
+    )
+    if product is None:
+        raise ValueError(f"product_id={product_id}: строка заказа не найдена")
+
+    remaining = _to_float(product.remaining_qty)
+    if remaining <= 1e-9:
+        raise ValueError(
+            "remaining_qty=0: эта строка уже произведена полностью"
+        )
+    if qty_f - remaining > 1e-6:
+        raise ValueError(
+            f"qty={qty_f} больше остатка к выпуску ({remaining}). "
+            "Если нужно увеличить — сначала отмените лишний выпуск."
+        )
+
+    manufacture = ProductionManufacture(
+        product_id=int(product.product_id),
+        order_id=int(product.order_id),
+        qty=qty_f,
+        executor=(str(executor).strip() if executor else None) or None,
+        comment=(str(comment).strip() if comment else None) or None,
+        status="draft",
+    )
+    db.add(manufacture)
+    db.flush()
+
+    product.produced_qty = _to_float(product.produced_qty) + qty_f
+    new_remaining = max(0.0, remaining - qty_f)
+    product.remaining_qty = new_remaining
+
+    state = _ensure_state(db, product)
+    if new_remaining <= 1e-9:
+        new_state = "produced"
+    else:
+        new_state = "produced_partial"
+    # Stickiness: don't drop from 'produced' back to 'produced_partial'
+    # if the user somehow recorded a negative-equivalent.
+    if state.status not in {"produced", "cancelled"}:
+        state.status = new_state
+    elif state.status == "produced_partial" and new_state == "produced":
+        # Partial -> full produced (final batch).
+        state.status = "produced"
+
+    db.commit()
+
+    return {
+        "status": "ok",
+        "manufacture_id": int(manufacture.manufacture_id),
+        "product_id": int(product.product_id),
+        "order_id": int(product.order_id),
+        "qty": float(qty_f),
+        "produced_qty_total": float(product.produced_qty),
+        "remaining_qty": float(product.remaining_qty),
+        "line_status": state.status,
+    }
