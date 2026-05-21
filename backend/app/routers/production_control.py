@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..schemas import ODataSyncRequest
+from ..services.one_c_posted_transfer_sync import sync_posted_transfers
 from ..services.one_c_production_order_export import export_production_orders_to_1c
 from ..services.one_c_stock_transfer_export import export_material_issues_to_1c
 from ..services.production_control import (
@@ -246,6 +247,23 @@ def post_material_issue_to_1c_legacy(
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/sync-posted-transfers", response_model=dict)
+def post_sync_posted_transfers(dry_run: bool = False, db: Session = Depends(get_db)):
+    """
+    Pull Posted=true flag from 1C for previously-exported material-issue
+    transfers and advance local state to 'assembled' per plan rule
+    ("К перемещению" -> "Собран"). Read-only on the 1C side.
+
+    `?dry_run=true` performs the same reads but skips local DB writes.
+    """
+    try:
+        return sync_posted_transfers(db, dry_run=bool(dry_run))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/route-sheets/print", response_class=HTMLResponse)

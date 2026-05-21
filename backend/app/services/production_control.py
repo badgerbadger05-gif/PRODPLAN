@@ -51,7 +51,9 @@ LINE_STATUSES = {
     "produced",
     "cancelled",
 }
-ISSUE_STATUSES = {"not_requested", "requested", "issued", "exported", "error"}
+# 'exported' = PRODPLAN posted the draft into 1C (Posted=false there).
+# 'posted'   = 1C admin провёл документ (we discovered Posted=true on sync).
+ISSUE_STATUSES = {"not_requested", "requested", "issued", "exported", "posted", "error"}
 
 
 def _norm_guid(val: Any) -> str:
