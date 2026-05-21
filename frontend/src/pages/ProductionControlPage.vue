@@ -8,6 +8,18 @@
       <q-space />
       <q-btn color="primary" icon="print" label="Печать маршрутных" :disable="selected.length === 0" @click="printSelected" />
       <q-btn color="secondary" icon="inventory_2" label="Создать выдачу" :disable="selected.length === 0" :loading="issueLoading" @click="createIssues" />
+      <q-btn
+        color="accent"
+        icon="cloud_upload"
+        label="Выгрузить заказ в 1С"
+        :disable="exportableOrderIds.length === 0"
+        :loading="exportLoading"
+        @click="openExportDialog"
+      >
+        <q-tooltip v-if="selected.length > 0 && exportableOrderIds.length === 0">
+          Выбранные строки уже выгружены или принадлежат заказам из 1С
+        </q-tooltip>
+      </q-btn>
       <q-btn flat color="primary" icon="settings" label="Настройки складов" @click="openSettings" />
       <q-btn flat color="primary" icon="refresh" label="Обновить" :loading="loading" @click="fetchRows" />
     </div>
@@ -117,6 +129,136 @@
         </q-td>
       </template>
     </q-table>
+
+    <!-- Export to 1C dialog: production orders (Document_ЗаказНаПроизводство) -->
+    <q-dialog v-model="exportDialog" persistent>
+      <q-card style="min-width: 640px; max-width: 95vw;">
+        <q-card-section class="row items-center q-pb-none">
+          <div class="text-h6">Выгрузка заказов в 1С</div>
+          <q-space />
+          <q-btn flat round dense icon="close" v-close-popup />
+        </q-card-section>
+
+        <q-card-section>
+          <div class="text-body2 q-mb-sm">
+            Будет выгружено как <b>Document_ЗаказНаПроизводство</b>, непроведённым
+            (Posted=false). Документ остаётся в 1С на ручное проведение администратором.
+          </div>
+          <div class="text-caption text-grey-7 q-mb-md">
+            Уникальных заказов к выгрузке: <b>{{ exportableOrderIds.length }}</b>
+            (из {{ selected.length }} выбранных строк журнала).
+          </div>
+
+          <q-option-group
+            v-model="exportMode"
+            :options="exportModeOptions"
+            color="primary"
+            inline
+          />
+
+          <q-banner
+            v-if="exportMode === 'apply' && !exportAllowProduction"
+            dense
+            class="bg-blue-1 text-primary q-mt-sm"
+          >
+            <template #avatar><q-icon name="info" /></template>
+            Запись только в demo-базу 1С (URL должен содержать <code>unf_demo</code>).
+          </q-banner>
+          <q-banner
+            v-else-if="exportMode === 'apply' && exportAllowProduction"
+            dense
+            class="bg-orange-2 text-negative q-mt-sm"
+          >
+            <template #avatar><q-icon name="warning" /></template>
+            <b>Внимание!</b> Включён режим записи в продовую базу 1С.
+            Используйте только если уверены.
+          </q-banner>
+
+          <q-checkbox
+            v-if="exportMode === 'apply'"
+            v-model="exportAllowProduction"
+            label="Разрешить запись в non-demo базу (с осторожностью)"
+            color="negative"
+            class="q-mt-sm"
+          />
+
+          <q-separator class="q-my-md" />
+
+          <div v-if="exportResult" class="q-mt-sm">
+            <div class="text-subtitle2 q-mb-xs">Результат:</div>
+            <div class="q-gutter-xs">
+              <q-badge color="primary" outline>Запрошено: {{ exportResult.orders_requested }}</q-badge>
+              <q-badge color="info" outline>К выгрузке: {{ exportResult.orders_eligible }}</q-badge>
+              <q-badge color="grey-7" outline>Уже выгружены: {{ exportResult.orders_already_linked }}</q-badge>
+              <q-badge v-if="!exportResult.dry_run" color="positive" outline>
+                Создано: {{ exportResult.orders_created }}
+              </q-badge>
+              <q-badge v-if="exportResult.orders_error > 0" color="negative" outline>
+                Ошибок: {{ exportResult.orders_error }}
+              </q-badge>
+              <q-badge v-if="exportResult.dry_run" color="warning" outline>DRY-RUN</q-badge>
+            </div>
+
+            <q-list
+              v-if="(exportResult.entries || []).length > 0"
+              dense
+              bordered
+              separator
+              class="q-mt-sm"
+              style="max-height: 240px; overflow-y: auto;"
+            >
+              <q-item v-for="(e, idx) in exportResult.entries" :key="idx">
+                <q-item-section>
+                  <q-item-label>
+                    <q-chip
+                      dense
+                      :color="entryColor(e.status)"
+                      text-color="white"
+                      class="q-mr-xs"
+                    >
+                      {{ e.status }}
+                    </q-chip>
+                    №{{ e.number || e.document_number || '-' }}
+                    <span v-if="e.target_ref_key" class="text-caption text-grey-7">
+                      → {{ e.target_ref_key }}
+                    </span>
+                  </q-item-label>
+                  <q-item-label v-if="e.reason || e.error" caption class="text-grey-8">
+                    {{ e.error || e.reason }}
+                  </q-item-label>
+                </q-item-section>
+              </q-item>
+            </q-list>
+
+            <q-list
+              v-if="(exportResult.skipped_rows || []).length > 0"
+              dense
+              bordered
+              separator
+              class="q-mt-sm"
+            >
+              <q-item-label header>Пропущены:</q-item-label>
+              <q-item v-for="(s, idx) in exportResult.skipped_rows" :key="`skip-${idx}`">
+                <q-item-section>
+                  <q-item-label caption>order_id={{ s.order_id }}: {{ s.reason }}</q-item-label>
+                </q-item-section>
+              </q-item>
+            </q-list>
+          </div>
+        </q-card-section>
+
+        <q-card-actions align="right">
+          <q-btn flat label="Закрыть" v-close-popup />
+          <q-btn
+            color="primary"
+            :label="exportMode === 'dry' ? 'Показать payload' : 'Выгрузить в 1С'"
+            :loading="exportLoading"
+            :disable="exportableOrderIds.length === 0"
+            @click="runExport"
+          />
+        </q-card-actions>
+      </q-card>
+    </q-dialog>
 
     <!-- Settings dialog: workshop -> warehouse bindings + ignored warehouses -->
     <q-dialog v-model="settingsDialog" persistent>
@@ -279,13 +421,14 @@
 </template>
 
 <script setup lang="ts">
-import { onMounted, reactive, ref } from 'vue'
+import { computed, onMounted, reactive, ref } from 'vue'
 import { useQuasar } from 'quasar'
 import type { QTableColumn } from 'quasar'
 import {
   createProductionMaterialIssues,
   deleteProductionControlIgnoredWarehouse,
   deleteProductionControlWorkshopBinding,
+  exportProductionOrdersTo1C,
   getProductionControlMaterials,
   getProductionControlSettings,
   listResources,
@@ -293,6 +436,7 @@ import {
   updateProductionControlOrderState,
   upsertProductionControlIgnoredWarehouse,
   upsertProductionControlWorkshopBinding,
+  type ExportProductionOrdersResult,
   type IgnoredWarehouseEntry,
   type ProductionControlOrderRow,
   type ProductionControlSettings,
@@ -354,6 +498,91 @@ const materialColumns: QTableColumn<any>[] = [
   { name: 'qty_per_unit', label: 'На ед.', field: 'qty_per_unit', align: 'right', sortable: true },
   { name: 'required_qty', label: 'К выдаче', field: 'required_qty', align: 'right', sortable: true }
 ]
+
+// ---------------------------------------------------------------------------
+// Export-to-1C dialog (production orders -> Document_ЗаказНаПроизводство).
+// Backend: POST /v1/production-control/orders/export-to-1c.
+// ---------------------------------------------------------------------------
+const exportDialog = ref(false)
+const exportLoading = ref(false)
+const exportMode = ref<'dry' | 'apply'>('dry')
+const exportAllowProduction = ref(false)
+const exportResult = ref<ExportProductionOrdersResult | null>(null)
+const exportModeOptions = [
+  { label: 'Dry-run (только показать payload)', value: 'dry' },
+  { label: 'Запись в 1С', value: 'apply' }
+]
+
+const exportableOrderIds = computed<number[]>(() => {
+  // Unique order_ids among selected rows that look like internal MRP orders:
+  // source='mrp' AND no order_ref1c stamped yet. Rows from 1C are hidden;
+  // already-exported MRP rows still pass through and get reported as
+  // 'existing' on the backend (the button itself stays enabled so the user
+  // can re-confirm and see the empty result).
+  const set = new Set<number>()
+  for (const row of selected.value) {
+    if (row.order_source !== 'mrp') continue
+    set.add(row.order_id)
+  }
+  return Array.from(set)
+})
+
+function entryColor(status: string): string {
+  return ({
+    created: 'positive',
+    existing: 'grey-7',
+    error: 'negative',
+    skipped: 'orange',
+    planned: 'blue'
+  } as Record<string, string>)[status] || 'grey'
+}
+
+function openExportDialog() {
+  exportResult.value = null
+  exportMode.value = 'dry'
+  exportAllowProduction.value = false
+  exportDialog.value = true
+}
+
+async function runExport() {
+  if (exportableOrderIds.value.length === 0) return
+  exportLoading.value = true
+  try {
+    const result = await exportProductionOrdersTo1C({
+      order_ids: exportableOrderIds.value,
+      dry_run: exportMode.value === 'dry',
+      allow_production: exportAllowProduction.value
+    })
+    exportResult.value = result
+    if (exportMode.value === 'apply') {
+      const created = result.orders_created || 0
+      const errored = result.orders_error || 0
+      if (errored === 0) {
+        $q.notify({ type: 'positive', message: `Создано в 1С: ${created}` })
+      } else {
+        $q.notify({
+          type: 'warning',
+          message: `Создано: ${created}, ошибок: ${errored}. Подробности в диалоге.`
+        })
+      }
+      // Refresh journal so new order_ref1c is reflected in source/status.
+      await fetchRows()
+    }
+  } catch (e: any) {
+    const detail = e?.response?.data?.detail || e?.message || String(e)
+    if (e?.response?.status === 403) {
+      $q.notify({
+        type: 'negative',
+        timeout: 8000,
+        message: `Отказ: ${detail}. Поставьте «Разрешить запись в non-demo базу» если действительно хотите.`
+      })
+    } else {
+      $q.notify({ type: 'negative', message: `Ошибка экспорта: ${detail}` })
+    }
+  } finally {
+    exportLoading.value = false
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Settings dialog (workshop->warehouse bindings + ignored warehouses).
