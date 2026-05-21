@@ -378,6 +378,44 @@ class ProductionMaterialIssueLine(Base):
     component_item = relationship("Item")
 
 
+class ProductionManufacture(Base):
+    """
+    A record of one "Произвести" click on a production_products line. Local
+    counterpart of 1C Document_СборкаЗапасов. Multiple manufactures per
+    product line are allowed (partial production across shifts/days).
+    """
+    __tablename__ = "production_manufactures"
+
+    manufacture_id = Column(Integer, primary_key=True, index=True)
+    product_id = Column(
+        Integer,
+        ForeignKey("production_products.product_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    order_id = Column(
+        Integer,
+        ForeignKey("production_orders.order_id"),
+        nullable=False,
+        index=True,
+    )
+    qty = Column(DECIMAL(15, 3), nullable=False)
+    executor = Column(String(100), nullable=True)
+    comment = Column(TEXT, nullable=True)
+    # draft -> exported (1C document created) -> cancelled (admin reversal)
+    status = Column(
+        String(32), nullable=False, default="draft", server_default="draft", index=True
+    )
+    exported_ref1c = Column(String(36), nullable=True, index=True)
+    exported_at = Column(TIMESTAMP, nullable=True)
+    export_error = Column(TEXT, nullable=True)
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    product = relationship("ProductionProduct")
+    order = relationship("ProductionOrder")
+
+
 class ProductionComponent(Base):
     __tablename__ = "production_components"
 
