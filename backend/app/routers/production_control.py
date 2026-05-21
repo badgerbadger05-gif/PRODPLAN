@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from ..database import get_db
 from ..schemas import ODataSyncRequest
 from ..services.one_c_manufacture_export import export_manufactures_to_1c
+from ..services.one_c_piece_order_export import export_piece_orders_to_1c
 from ..services.one_c_posted_transfer_sync import sync_posted_transfers
 from ..services.one_c_production_order_export import export_production_orders_to_1c
 from ..services.one_c_stock_transfer_export import export_material_issues_to_1c
@@ -85,6 +86,12 @@ class ProduceLinePayload(BaseModel):
 
 
 class ExportManufacturesPayload(BaseModel):
+    manufacture_ids: List[int]
+    dry_run: bool = True
+    allow_production: bool = False
+
+
+class ExportPieceOrdersPayload(BaseModel):
     manufacture_ids: List[int]
     dry_run: bool = True
     allow_production: bool = False
@@ -198,6 +205,36 @@ def post_export_manufactures_to_1c(
         raise HTTPException(status_code=400, detail="Не выбраны выпуски")
     try:
         return export_manufactures_to_1c(
+            db,
+            [int(x) for x in payload.manufacture_ids],
+            dry_run=bool(payload.dry_run),
+            allow_production=bool(payload.allow_production),
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/piece-orders/export-to-1c", response_model=dict)
+def post_export_piece_orders_to_1c(
+    payload: ExportPieceOrdersPayload,
+    db: Session = Depends(get_db),
+):
+    """
+    Bulk-экспорт сдельных нарядов в 1С как Document_СдельныйНаряд
+    (Posted=false, Закрыт=false). Каждый ProductionManufacture порождает
+    один наряд; строки Операции[] строятся из SpecOperation спецификации
+    продукта. Расценки / исполнитель / прочие catalog-refs остаются
+    пустыми — 1С админ заполняет их на черновике. Идемпотентно через
+    sync_link (source_doctype='piece_order').
+    """
+    if not payload.manufacture_ids:
+        raise HTTPException(status_code=400, detail="Не выбраны выпуски")
+    try:
+        return export_piece_orders_to_1c(
             db,
             [int(x) for x in payload.manufacture_ids],
             dry_run=bool(payload.dry_run),

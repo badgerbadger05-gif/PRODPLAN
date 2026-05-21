@@ -786,3 +786,35 @@ export async function returnLeftoverComponents(
   )
   return data
 }
+
+// ---------------------------------------------------------------------------
+// Export piece-rate orders (Document_СдельныйНаряд) — fourth and final
+// PRODPLAN -> 1C write service.
+// ---------------------------------------------------------------------------
+
+export interface ExportPieceOrdersResult {
+  status: 'ok' | 'partial_error' | string
+  dry_run: boolean
+  entity: string
+  manufactures_requested: number
+  manufactures_eligible: number
+  manufactures_already_linked: number
+  manufactures_created: number
+  manufactures_error: number
+  skipped_rows: Array<{ manufacture_id?: number; reason?: string }>
+  entries: ExportEntry[]
+  payloads?: Array<{ manufacture_id: number; number: string; payload: Record<string, any> }>
+}
+
+export async function exportPieceOrdersTo1C(body: {
+  manufacture_ids: number[]
+  dry_run?: boolean
+  allow_production?: boolean
+}): Promise<ExportPieceOrdersResult> {
+  const { data } = await api.post('/v1/production-control/piece-orders/export-to-1c', {
+    manufacture_ids: body.manufacture_ids,
+    dry_run: body.dry_run ?? true,
+    allow_production: body.allow_production ?? false,
+  })
+  return data
+}

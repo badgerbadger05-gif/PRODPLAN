@@ -209,14 +209,20 @@
             color="accent"
           />
           <q-checkbox
-            v-if="produceForm.export_to_1c"
+            v-model="produceForm.export_piece_order_to_1c"
+            label="Также выгрузить сдельный наряд (Document_СдельныйНаряд)"
+            color="accent"
+            class="block"
+          />
+          <q-checkbox
+            v-if="produceForm.export_to_1c || produceForm.export_piece_order_to_1c"
             v-model="produceForm.dry_run"
             label="Только dry-run (показать payload, не писать)"
             color="primary"
             class="block"
           />
           <q-banner
-            v-if="produceForm.export_to_1c && !produceForm.dry_run"
+            v-if="(produceForm.export_to_1c || produceForm.export_piece_order_to_1c) && !produceForm.dry_run"
             dense
             class="bg-blue-1 text-primary q-mt-sm"
           >
@@ -253,7 +259,7 @@
           <q-btn flat label="Закрыть" v-close-popup />
           <q-btn
             color="positive"
-            :label="produceForm.export_to_1c
+            :label="(produceForm.export_to_1c || produceForm.export_piece_order_to_1c)
               ? (produceForm.dry_run ? 'Произвести + dry-run' : 'Произвести + выгрузить')
               : 'Произвести'"
             :loading="produceLoading"
@@ -639,6 +645,7 @@ import {
   deleteProductionControlIgnoredWarehouse,
   deleteProductionControlWorkshopBinding,
   exportManufacturesTo1C,
+  exportPieceOrdersTo1C,
   exportProductionOrdersTo1C,
   getProductionControlMaterials,
   getProductionControlSettings,
@@ -650,6 +657,7 @@ import {
   upsertProductionControlIgnoredWarehouse,
   upsertProductionControlWorkshopBinding,
   type ExportManufacturesResult,
+  type ExportPieceOrdersResult,
   type ExportProductionOrdersResult,
   type IgnoredWarehouseEntry,
   type ProduceLineResult,
@@ -727,16 +735,19 @@ const produceForm = reactive<{
   executor: string
   comment: string
   export_to_1c: boolean
+  export_piece_order_to_1c: boolean
   dry_run: boolean
 }>({
   qty: null,
   executor: '',
   comment: '',
   export_to_1c: false,
+  export_piece_order_to_1c: false,
   dry_run: true
 })
 const produceResult = ref<ProduceLineResult | null>(null)
 const produceExportResult = ref<ExportManufacturesResult | null>(null)
+const produceExportPieceOrderResult = ref<ExportPieceOrdersResult | null>(null)
 
 const produceCandidate = computed<ProductionControlOrderRow | null>(() => {
   // Single-selected row with positive remaining qty.
@@ -761,9 +772,11 @@ function openProduceDialog() {
   produceForm.executor = ''
   produceForm.comment = ''
   produceForm.export_to_1c = false
+  produceForm.export_piece_order_to_1c = false
   produceForm.dry_run = true
   produceResult.value = null
   produceExportResult.value = null
+  produceExportPieceOrderResult.value = null
   produceDialog.value = true
 }
 
@@ -797,11 +810,11 @@ async function runProduce() {
           const created = exp.manufactures_created || 0
           const errored = exp.manufactures_error || 0
           if (errored === 0) {
-            $q.notify({ type: 'positive', message: `В 1С создано: ${created}` })
+            $q.notify({ type: 'positive', message: `СборкаЗапасов в 1С: ${created}` })
           } else {
             $q.notify({
               type: 'warning',
-              message: `1С: создано ${created}, ошибок ${errored}.`
+              message: `СборкаЗапасов: создано ${created}, ошибок ${errored}.`
             })
           }
         }
@@ -811,10 +824,44 @@ async function runProduce() {
           $q.notify({
             type: 'negative',
             timeout: 8000,
-            message: `Демо-guard: ${detail}. Локальный выпуск всё равно сохранён.`
+            message: `Демо-guard (выпуск): ${detail}. Локальный выпуск всё равно сохранён.`
           })
         } else {
-          $q.notify({ type: 'negative', message: `Ошибка экспорта в 1С: ${detail}` })
+          $q.notify({ type: 'negative', message: `Ошибка экспорта выпуска в 1С: ${detail}` })
+        }
+      }
+    }
+
+    if (produceForm.export_piece_order_to_1c) {
+      try {
+        const exp = await exportPieceOrdersTo1C({
+          manufacture_ids: [r.manufacture_id],
+          dry_run: produceForm.dry_run,
+          allow_production: false
+        })
+        produceExportPieceOrderResult.value = exp
+        if (!exp.dry_run) {
+          const created = exp.manufactures_created || 0
+          const errored = exp.manufactures_error || 0
+          if (errored === 0) {
+            $q.notify({ type: 'positive', message: `СдельныйНаряд в 1С: ${created}` })
+          } else {
+            $q.notify({
+              type: 'warning',
+              message: `СдельныйНаряд: создано ${created}, ошибок ${errored}.`
+            })
+          }
+        }
+      } catch (e: any) {
+        const detail = e?.response?.data?.detail || e?.message || String(e)
+        if (e?.response?.status === 403) {
+          $q.notify({
+            type: 'negative',
+            timeout: 8000,
+            message: `Демо-guard (наряд): ${detail}. Локальный выпуск всё равно сохранён.`
+          })
+        } else {
+          $q.notify({ type: 'negative', message: `Ошибка экспорта наряда в 1С: ${detail}` })
         }
       }
     }
