@@ -113,3 +113,116 @@ export function planningStatusLabel(status: string) {
   if (value === 'FAILED') return 'Ошибка'
   return status || 'Неизвестно'
 }
+
+// ── Period Plans ──────────────────────────────────────────────────────────────
+
+export type PeriodPlan = {
+  id: number
+  name: string
+  status: 'draft' | 'fixed' | 'archived'
+  period_from: string
+  period_to: string
+  fixed_at?: string | null
+  fixed_by?: string | null
+  created_at?: string | null
+}
+
+export type PeriodPlanListResponse = {
+  rows: PeriodPlan[]
+  total: number
+}
+
+export type PeriodPlanMatrixRow = {
+  item_id: number
+  item_code: string
+  item_name: string
+  item_article?: string | null
+  total_qty: number
+  buckets: Record<string, number>
+  locked_buckets: Record<string, number>
+}
+
+export type PeriodPlanMatrix = {
+  plan: PeriodPlan
+  buckets: string[]
+  rows: PeriodPlanMatrixRow[]
+  total: number
+}
+
+export type ExecutionWorkItem = {
+  type: 'production_order' | 'planned_purchase' | 'planned_rework'
+  product_id?: number
+  order_id?: number
+  order_number?: string
+  order_state?: string
+  purchase_id?: number
+  rework_id?: number
+  qty: number
+  remaining_qty?: number
+  need_date?: string | null
+  order_date?: string | null
+  lead_time_days?: number
+}
+
+export type ExecutionJournalRow = {
+  req_id: number
+  item_id: number
+  item_code: string
+  item_name: string
+  flow: 'production' | 'purchase' | 'rework'
+  bom_level: number
+  gross_qty: number
+  net_qty: number
+  covered_qty: number
+  remaining_qty: number
+  coverage_pct: number
+  work_items: ExecutionWorkItem[]
+}
+
+export type ExecutionJournalSummary = {
+  total_items: number
+  fully_covered: number
+  partially_covered: number
+  not_covered: number
+  net_zero: number
+}
+
+export type ExecutionJournalResponse = {
+  plan: PeriodPlan
+  run_id: number
+  rows: ExecutionJournalRow[]
+  summary: ExecutionJournalSummary
+}
+
+export function periodPlanStatusLabel(status: string) {
+  if (status === 'draft') return 'Черновик'
+  if (status === 'fixed') return 'Зафиксирован'
+  if (status === 'archived') return 'Архив'
+  return status
+}
+
+export function periodPlanStatusClass(status: string) {
+  if (status === 'draft') return 'running'
+  if (status === 'fixed') return 'success'
+  return ''
+}
+
+export function flowLabel(flow: string) {
+  if (flow === 'production') return 'Производство'
+  if (flow === 'purchase') return 'Закупка'
+  if (flow === 'rework') return 'Переработка'
+  return flow
+}
+
+export function flowClass(flow: string) {
+  if (flow === 'production') return 'to_move'
+  if (flow === 'purchase') return 'ready'
+  if (flow === 'rework') return 'partial'
+  return ''
+}
+
+export function coverageClass(pct: number) {
+  if (pct >= 95) return 'ready'
+  if (pct >= 50) return 'partial'
+  return 'shortage'
+}

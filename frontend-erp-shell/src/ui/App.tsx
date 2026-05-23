@@ -2,6 +2,7 @@ import { useState } from 'react'
 import type { PlanningRunRow } from '../domain/planning'
 import { MrpResultPage } from './pages/MrpResultPage'
 import { MrpRunsPage } from './pages/MrpRunsPage'
+import { PeriodPlanPage } from './pages/PeriodPlanPage'
 import { ProductionControlPage } from './pages/ProductionControlPage'
 import { ProductionPlanQuarterPage } from './pages/ProductionPlanQuarterPage'
 import { ProductionReportWeekPage } from './pages/ProductionReportWeekPage'
@@ -10,10 +11,11 @@ import { SpecificationPage } from './pages/SpecificationPage'
 import { StageDistributionPage } from './pages/StageDistributionPage'
 import { SyncPage } from './pages/SyncPage'
 
-type SectionId = 'home' | 'production-control' | 'production-plan-quarter' | 'production-report-week' | 'mrp-runs' | 'mrp-result' | 'resources' | 'stage-distribution' | 'specification' | 'sync'
+type SectionId = 'home' | 'period-plan' | 'production-control' | 'production-plan-quarter' | 'production-report-week' | 'mrp-runs' | 'mrp-result' | 'resources' | 'stage-distribution' | 'specification' | 'sync'
 
 const sections: Array<{ id: SectionId; title: string }> = [
   { id: 'home', title: 'Главная' },
+  { id: 'period-plan', title: 'Период план' },
   { id: 'production-control', title: 'Журнал заказов' },
   { id: 'production-plan-quarter', title: 'План выпуска' },
   { id: 'production-report-week', title: 'Выпуск недельный' },
@@ -55,6 +57,7 @@ export function App() {
       </aside>
 
       {section === 'home' && <HomePage onNavigate={setSection} />}
+      {section === 'period-plan' && <PeriodPlanPage />}
       {section === 'production-control' && <ProductionControlPage />}
       {section === 'production-plan-quarter' && <ProductionPlanQuarterPage />}
       {section === 'production-report-week' && <ProductionReportWeekPage />}
