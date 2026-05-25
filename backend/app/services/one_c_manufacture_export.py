@@ -22,11 +22,8 @@ augment the draft document if needed.
 """
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import dataclass, field, asdict
 from datetime import date, datetime
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session, joinedload
@@ -39,10 +36,18 @@ from ..models import (
     ProductionProduct,
     SyncLink,
 )
+from .one_c_export_common import (
+    clean_ref1c as _clean_ref1c,
+    create_odata_client as _create_odata_client,
+    fmt_1c_datetime as _fmt_1c_datetime,
+    find_sync_link as _find_sync_link,
+    post_export_entries as _post_export_entries,
+    upsert_sync_link as _upsert_sync_link,
+)
+from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
 
 
-CONFIG_PATH = Path("config") / "odata_config.json"
 MANUFACTURE_ENTITY = "Document_СборкаЗапасов"
 EMPTY_REF1C = "00000000-0000-0000-0000-000000000000"
 
@@ -65,58 +70,19 @@ class ManufactureExportEntry:
     reason: Optional[str] = None
 
 
-def _load_odata_config() -> Dict[str, Any]:
-    try:
-        if CONFIG_PATH.exists():
-            return json.loads(CONFIG_PATH.read_text("utf-8") or "{}")
-    except Exception:
-        pass
-    return {}
-
-
-def _fmt_1c_datetime(value: Optional[date]) -> Optional[str]:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.replace(microsecond=0).isoformat()
-    return datetime.combine(value, datetime.min.time()).isoformat()
-
-
-def _clean_ref1c(value: Any) -> str:
-    ref = str(value or "").strip()
-    if not ref or ref == EMPTY_REF1C:
-        return ""
-    return ref
-
-
-def _payload_hash(payload: Dict[str, Any]) -> str:
-    try:
-        normalized = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
-    except Exception:
-        normalized = str(payload)
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-
-
 def _short_manufacture_number(manufacture_id: int) -> str:
     """Short, recognizable, unique number that fits 1C's Number column."""
     return f"PM{int(manufacture_id) % 1_000_000_000:09d}"
 
 
 def _existing_link(db: Session, manufacture_id: int) -> Optional[SyncLink]:
-    return (
-        db.query(SyncLink)
-        .filter(
-            SyncLink.source_system == "PRODPLAN",
-            SyncLink.source_doctype == "manufacture",
-            SyncLink.source_id == int(manufacture_id),
-            SyncLink.target_entity == MANUFACTURE_ENTITY,
-        )
-        .one_or_none()
+    return _find_sync_link(
+        db,
+        SyncLink,
+        source_doctype="manufacture",
+        source_id=int(manufacture_id),
+        target_entity=MANUFACTURE_ENTITY,
     )
-
-
-def _is_demo_base_url(base_url: str) -> bool:
-    return "unf_demo" in (base_url or "").lower()
 
 
 def _collect_export_entries(
@@ -218,32 +184,18 @@ def _upsert_link(
     status: str,
     last_error: Optional[str],
 ) -> None:
-    existing = _existing_link(db, entry.manufacture_id)
-    if existing is None:
-        db.add(
-            SyncLink(
-                source_system="PRODPLAN",
-                source_doctype="manufacture",
-                source_id=int(entry.manufacture_id),
-                target_system="1C",
-                target_entity=MANUFACTURE_ENTITY,
-                target_ref_key=target_ref_key,
-                target_number=entry.number,
-                payload_hash=payload_hash,
-                status=status,
-                last_error=last_error,
-                last_synced_at=datetime.utcnow() if status == "success" else None,
-            )
-        )
-        return
-    existing.target_number = entry.number
-    existing.payload_hash = payload_hash
-    existing.status = status
-    existing.last_error = last_error
-    if target_ref_key:
-        existing.target_ref_key = target_ref_key
-    if status == "success":
-        existing.last_synced_at = datetime.utcnow()
+    _upsert_sync_link(
+        db,
+        SyncLink,
+        source_doctype="manufacture",
+        source_id=int(entry.manufacture_id),
+        target_entity=MANUFACTURE_ENTITY,
+        target_number=entry.number,
+        payload_hash=payload_hash,
+        target_ref_key=target_ref_key,
+        status=status,
+        last_error=last_error,
+    )
 
 
 def export_manufactures_to_1c(
@@ -307,94 +259,45 @@ def export_manufactures_to_1c(
         summary["payloads"] = payloads
         return summary
 
-    cfg = _load_odata_config()
-    base_url = str(cfg.get("base_url") or "").strip()
-    if not base_url:
-        raise ValueError("OData config is not set. Save 1C connection settings first.")
-    if not _is_demo_base_url(base_url) and not allow_production:
-        raise PermissionError(
-            f"Refusing to write to non-demo base_url '{base_url}'. "
-            "Pass allow_production=true to override (use with caution)."
-        )
-
-    client = OData1CClient(
-        base_url=base_url,
-        username=cfg.get("username") or None,
-        password=cfg.get("password") or None,
-        token=cfg.get("token") or None,
+    client = _create_odata_client(
+        _load_odata_config(),
+        OData1CClient,
+        allow_production=allow_production,
+        require_demo_base=True,
     )
 
-    created = 0
-    errored = 0
-    for entry, payload_envelope in zip(eligible, payloads):
-        payload = payload_envelope["payload"]
-        try:
-            phash = _payload_hash(payload)
-            _upsert_link(
-                db,
-                entry=entry,
-                payload_hash=phash,
-                target_ref_key=None,
-                status="planned",
-                last_error=None,
-            )
-            db.flush()
+    def _mark_success(entry: ManufactureExportEntry, ref_key: str) -> None:
+        m_row = (
+            db.query(ProductionManufacture)
+            .filter(ProductionManufacture.manufacture_id == entry.manufacture_id)
+            .one()
+        )
+        m_row.status = "exported"
+        m_row.exported_ref1c = ref_key
+        m_row.exported_at = datetime.utcnow()
+        m_row.export_error = None
 
-            created_header = client.post(MANUFACTURE_ENTITY, payload)
-            ref_key = _clean_ref1c(created_header.get("Ref_Key"))
-            if not ref_key:
-                raise RuntimeError("1C did not return Ref_Key for new Document_СборкаЗапасов")
+    def _mark_error(entry: ManufactureExportEntry, error: str) -> None:
+        m_row = (
+            db.query(ProductionManufacture)
+            .filter(ProductionManufacture.manufacture_id == entry.manufacture_id)
+            .one()
+        )
+        m_row.export_error = error
 
-            entry.target_ref_key = ref_key
-            entry.status = "created"
-            created += 1
-
-            _upsert_link(
-                db,
-                entry=entry,
-                payload_hash=phash,
-                target_ref_key=ref_key,
-                status="success",
-                last_error=None,
-            )
-            m_row = (
-                db.query(ProductionManufacture)
-                .filter(ProductionManufacture.manufacture_id == entry.manufacture_id)
-                .one()
-            )
-            m_row.status = "exported"
-            m_row.exported_ref1c = ref_key
-            m_row.exported_at = datetime.utcnow()
-            m_row.export_error = None
-        except Exception as exc:
-            entry.status = "error"
-            entry.error = str(exc)
-            errored += 1
-            try:
-                _upsert_link(
-                    db,
-                    entry=entry,
-                    payload_hash=_payload_hash(payload),
-                    target_ref_key=None,
-                    status="error",
-                    last_error=str(exc),
-                )
-                m_row = (
-                    db.query(ProductionManufacture)
-                    .filter(ProductionManufacture.manufacture_id == entry.manufacture_id)
-                    .one()
-                )
-                m_row.export_error = str(exc)
-            except Exception:
-                pass
-            try:
-                print(
-                    f"[1C manufacture export] manufacture_id={entry.manufacture_id} failed: {entry.error}"
-                )
-            except Exception:
-                pass
-
-    db.commit()
+    created, errored = _post_export_entries(
+        db,
+        entries=zip(eligible, payloads),
+        client=client,
+        target_entity=MANUFACTURE_ENTITY,
+        missing_ref_error=f"1C did not return Ref_Key for new {MANUFACTURE_ENTITY}",
+        upsert_link=lambda **kwargs: _upsert_link(db, **kwargs),
+        on_success=_mark_success,
+        on_error=_mark_error,
+        log_error=lambda entry: (
+            f"[1C manufacture export] manufacture_id={entry.manufacture_id} failed: {entry.error}"
+        ),
+    )
 
     summary["manufactures_created"] = created
     summary["manufactures_error"] = errored

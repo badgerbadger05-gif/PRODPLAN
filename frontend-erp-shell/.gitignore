@@ -2,3 +2,5 @@ dist/
 node_modules/
 *.tsbuildinfo
 *.log
+test-results/
+playwright-report/

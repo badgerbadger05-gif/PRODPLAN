@@ -16,10 +16,7 @@ from app.models import (
     SpecComponent,
     Specification,
 )
-from app.services.production_control import (
-    produce_line,
-    return_leftover_components,
-)
+from app.services.production_control_production_flow import produce_line, return_leftover_components
 
 
 # ---------------------------------------------------------------------------

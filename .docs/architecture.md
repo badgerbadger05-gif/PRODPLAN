@@ -1,32 +1,29 @@
-# Архитектура
+﻿# Architecture
 
-## Компоненты
+## Components
+- Frontend (React ERP shell): SPA at port 9000
+- Backend (FastAPI): REST API at port 8000
+- DB (PostgreSQL): application and planning data
+- 1C integration: OData sync
 
-- **Frontend** (Quasar/Vue): SPA на порту 9000
-- **Backend** (FastAPI): REST API на порту 8000
-- **DB** (PostgreSQL): хранение данных + результатов MRP
-- **Интеграция 1С**: OData (синхронизация справочников и остатков)
-
-## Структура кода
-
+## Code layout
 Backend:
-- `backend/app/main.py` — приложение FastAPI, регистрация роутеров
-- `backend/app/routers/` — слой HTTP (эндпоинты)
-- `backend/app/services/` — бизнес-логика (MRP, синхронизации, экспорт)
-- `backend/app/models.py` — SQLAlchemy модели
-- `backend/alembic/` — миграции
+- `backend/app/main.py` - app bootstrap
+- `backend/app/routers/` - HTTP endpoints
+- `backend/app/services/` - business logic
+- `backend/app/models.py` - SQLAlchemy models
+- `backend/alembic/` - migrations
 
 Frontend:
-- `frontend/src/pages/` — страницы
-- `frontend/src/components/` — компоненты
-- `frontend/src/services/api.ts` — единая точка вызова backend API
+- `frontend-erp-shell/src/ui/pages/` - pages
+- `frontend-erp-shell/src/ui/layout/` - shell layout
+- `frontend-erp-shell/src/services/` - typed API services
+- `frontend-erp-shell/src/lib/api.ts` - API transport wrapper
 
-## MRP конвейер
-
-1) загрузка конфигурации и входных данных
-2) расчёт gross/net потребностей
-3) формирование заказов производства/закупки
-4) планирование мощностей
-5) pegging + приоритезация
-6) сохранение результатов в таблицы `planned_*` и `capacity_load`
-
+## MRP flow
+1. Load config and source data
+2. Calculate gross/net demand
+3. Create production/purchase proposals
+4. Run capacity planning
+5. Apply pegging and prioritization
+6. Save results to `planned_*` and `capacity_load`

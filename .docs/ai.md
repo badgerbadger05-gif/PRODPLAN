@@ -1,47 +1,27 @@
-# Как работать с проектом через ИИ
+﻿# How To Work In This Repo
 
-Этот репозиторий **пишется нейросетями**. От владельца проекта — логика и бизнес-правила.
+This repository is now split strictly into:
+- stable production branch: `main`
+- active development branch: `next-erp`
 
-## Формат задачи ИИ
-
-1) **Что изменить** (одной фразой)
-2) **Контракт** (поля/эндпоинты/страницы)
-3) **Ограничения** (что нельзя трогать)
-4) **Критерии готовности**
-
-Пример:
-> Добавь фильтр по складу в синхронизацию остатков.
-> Контракт: новый query-параметр warehouse_id.
-> Ограничения: не ломать текущие запросы без warehouse_id.
-> Готово: есть тест + swagger показывает параметр.
-
-## Инварианты разработки
-
+## Current stack
 - Backend: FastAPI + SQLAlchemy + Alembic
-- Frontend: Quasar (Vue 3 + TS)
-- Слои:
-  - HTTP/валидация: `backend/app/routers/`
-  - бизнес-логика: `backend/app/services/`
-  - схемы API: `backend/app/schemas.py`
-  - ORM/таблицы: `backend/app/models.py`
+- Frontend: React + TypeScript + Vite (`frontend-erp-shell`)
+- Database: PostgreSQL
 
-## Правила изменений
+Legacy Quasar/Vue frontend has been removed from this branch on 2026-05-23.
 
-1) Любая правка таблиц в `models.py` → **новая миграция Alembic**
-2) Любая новая логика в backend → **pytest**
-3) Новая интеграция во фронте → через `frontend/src/services/api.ts`
-4) После завершения задачи — обновить `progress.md`
+## Change rules
+1. Any DB model change in `backend/app/models.py` must include an Alembic migration.
+2. Any backend business logic change must include or update pytest tests.
+3. Any frontend API integration must go through `frontend-erp-shell/src/lib/api.ts` and `frontend-erp-shell/src/services/*`.
+4. After finishing a task, update project progress docs.
 
-## Команды
-
-Docker:
+## Local run
 ```bash
-docker-compose up -d
-docker-compose logs -f backend
+docker compose up -d --build
 ```
 
-Тесты:
-```bash
-docker-compose exec backend pytest
-```
-
+## Health checks
+- Backend: `http://localhost:8000/health`
+- Frontend: `http://localhost:9000`

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { MrpCapacityRow, MrpProductionRow, MrpPurchaseRow, MrpReworkRow, MrpSummary } from '../../domain/planning'
 import { planningStatusLabel } from '../../domain/planning'
 import { downloadBase64File } from '../../lib/download'
@@ -59,12 +59,12 @@ export function MrpResultPage({ runId, onBack }: Props) {
     overloadHours: capacityRows.reduce((sum, row) => sum + Number(row.overload_hours || 0), 0),
   }), [productionRows, purchaseRows, reworkRows, capacityRows])
 
-  async function load() {
+  const load = useCallback(async (nextDateFrom = '', nextDateTo = '') => {
     setLoading(true)
     setError('')
     setMessage('')
     try {
-      const params = { date_from: dateFrom || undefined, date_to: dateTo || undefined, limit, offset: 0 }
+      const params = { date_from: nextDateFrom || undefined, date_to: nextDateTo || undefined, limit, offset: 0 }
       const [summaryData, productionData, purchaseData, reworkData, capacityData] = await Promise.all([
         getPlanningRunSummary(runId),
         getPlanningResultProduction(runId, params),
@@ -88,7 +88,7 @@ export function MrpResultPage({ runId, onBack }: Props) {
     } finally {
       setLoading(false)
     }
-  }
+  }, [runId])
 
   async function exportActive(format: 'csv' | 'xlsx') {
     setExporting(true)
@@ -164,7 +164,7 @@ export function MrpResultPage({ runId, onBack }: Props) {
 
   useEffect(() => {
     void load()
-  }, [runId])
+  }, [load])
 
   return (
     <main className="workArea">
@@ -193,7 +193,7 @@ export function MrpResultPage({ runId, onBack }: Props) {
       >
         <div className="commandBar">
           <button onClick={onBack}>К списку прогонов</button>
-          <button onClick={() => void load()} disabled={loading}>Обновить</button>
+          <button onClick={() => void load(dateFrom, dateTo)} disabled={loading}>Обновить</button>
           {tab !== 'capacity' && <button onClick={() => void exportActive('csv')} disabled={loading || exporting}>CSV</button>}
           {tab !== 'capacity' && <button onClick={() => void exportActive('xlsx')} disabled={loading || exporting}>XLSX</button>}
           <button onClick={() => void exportShortageReport()} disabled={loading || exporting}>Отчёт дефицитов</button>
@@ -208,7 +208,7 @@ export function MrpResultPage({ runId, onBack }: Props) {
             <span>По</span>
             <input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} />
           </label>
-          <button className="filterBtn" onClick={() => void load()} disabled={loading}>Сформировать</button>
+          <button className="filterBtn" onClick={() => void load(dateFrom, dateTo)} disabled={loading}>Сформировать</button>
         </div>
 
         {error && <div className="errorLine">{error}</div>}

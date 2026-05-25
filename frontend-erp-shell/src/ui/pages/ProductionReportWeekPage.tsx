@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ProductionReportFactEntry, ProductionReportWeekDay, ProductionReportWeekRow } from '../../domain/productionReport'
 import { dateRu, isoToday, qty, shiftIsoDate } from '../../lib/format'
 import { bulkUpsertProductionReportFact, closeProductionReportDay, getProductionReportWeek } from '../../services/productionReport'
@@ -21,6 +21,7 @@ function isClosed(day?: ProductionReportWeekDay) {
 
 export function ProductionReportWeekPage() {
   const [anyDate, setAnyDate] = useState(isoToday())
+  const initialAnyDate = useRef(anyDate)
   const [closeDate, setCloseDate] = useState('')
   const [weekStart, setWeekStart] = useState('')
   const [days, setDays] = useState<ProductionReportWeekDay[]>([])
@@ -37,7 +38,7 @@ export function ProductionReportWeekPage() {
   const closeDateInWeek = !closeDate || days.some((day) => day.date === closeDate)
   const canCloseDay = Boolean(closeDate && closeDateInWeek && !loading && !saving && !closing)
 
-  async function load(nextDate = anyDate) {
+  const load = useCallback(async (nextDate: string) => {
     setLoading(true)
     setError('')
     setMessage('')
@@ -57,7 +58,7 @@ export function ProductionReportWeekPage() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [])
 
   function updateFact(row: RowVm, date: string, value: string) {
     const fact = Number(value || 0)
@@ -111,8 +112,8 @@ export function ProductionReportWeekPage() {
   }
 
   useEffect(() => {
-    void load(anyDate)
-  }, [])
+    void load(initialAnyDate.current)
+  }, [load])
 
   return (
     <main className="workArea">

@@ -21,9 +21,7 @@ production_order_sync / supplier_order_sync code paths.
 """
 from __future__ import annotations
 
-import json
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from sqlalchemy.orm import Session
@@ -33,24 +31,15 @@ from ..models import (
     ProductionOrderLineState,
     SyncLink,
 )
+from .one_c_export_common import create_odata_client as _create_odata_client
+from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
 from .one_c_stock_transfer_export import STOCK_TRANSFER_ENTITY
 
 
-CONFIG_PATH = Path("config") / "odata_config.json"
-
 # 1C OData filters often choke on overly-long URLs. Match the production_
 # order_sync batch size.
 BATCH_SIZE = 100
-
-
-def _load_odata_config() -> Dict[str, Any]:
-    try:
-        if CONFIG_PATH.exists():
-            return json.loads(CONFIG_PATH.read_text("utf-8") or "{}")
-    except Exception:
-        pass
-    return {}
 
 
 def _fetch_pending_links(db: Session) -> List[SyncLink]:
@@ -188,17 +177,7 @@ def sync_posted_transfers(db: Session, *, dry_run: bool = False) -> Dict[str, An
     if not by_ref:
         return summary
 
-    cfg = _load_odata_config()
-    base_url = str(cfg.get("base_url") or "").strip()
-    if not base_url:
-        raise ValueError("OData config is not set.")
-
-    client = OData1CClient(
-        base_url=base_url,
-        username=cfg.get("username") or None,
-        password=cfg.get("password") or None,
-        token=cfg.get("token") or None,
-    )
+    client = _create_odata_client(_load_odata_config(), OData1CClient)
 
     posted_refs = _query_posted_refs(client, by_ref.keys())
     summary["posted_found"] = len(posted_refs)

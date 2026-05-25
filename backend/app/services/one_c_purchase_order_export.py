@@ -1,17 +1,20 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field, asdict
-from datetime import date, datetime
-from pathlib import Path
+from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
 from ..models import Item, PlannedPurchase, Unit
+from .one_c_export_common import (
+    clean_ref1c as _clean_ref1c,
+    create_odata_client as _create_odata_client,
+    fmt_1c_datetime as _fmt_1c_datetime,
+)
+from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
 
-CONFIG_PATH = Path("config") / "odata_config.json"
 PURCHASE_ORDER_ENTITY = "Document_ЗаказПоставщику"
 EMPTY_REF1C = "00000000-0000-0000-0000-000000000000"
 UNIT_TYPE_1C = "StandardODATA.Catalog_КлассификаторЕдиницИзмерения"
@@ -40,32 +43,8 @@ class PurchaseOrderExportGroup:
     error: Optional[str] = None
 
 
-def _load_odata_config() -> Dict[str, Any]:
-    try:
-        if CONFIG_PATH.exists():
-            return json.loads(CONFIG_PATH.read_text("utf-8") or "{}")
-    except Exception:
-        pass
-    return {}
-
-
-def _fmt_1c_datetime(value: Optional[date]) -> Optional[str]:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.replace(microsecond=0).isoformat()
-    return datetime.combine(value, datetime.min.time()).isoformat()
-
-
 def _short_order_number(run_id: int, index: int) -> str:
     return f"PP{int(run_id) % 100000:05d}{int(index) % 1000:03d}"
-
-
-def _clean_ref1c(value: Any) -> str:
-    ref = str(value or "").strip()
-    if not ref or ref == EMPTY_REF1C:
-        return ""
-    return ref
 
 
 def _existing_order_by_number(client: OData1CClient, number: str) -> Optional[Dict[str, Any]]:
@@ -274,17 +253,7 @@ def export_planned_purchases_to_1c(
             "orders": [asdict(g) for g in groups],
         }
 
-    cfg = _load_odata_config()
-    base_url = str(cfg.get("base_url") or "").strip()
-    if not base_url:
-        raise ValueError("OData config is not set. Save 1C connection settings first.")
-
-    client = OData1CClient(
-        base_url=base_url,
-        username=cfg.get("username") or None,
-        password=cfg.get("password") or None,
-        token=cfg.get("token") or None,
-    )
+    client = _create_odata_client(_load_odata_config(), OData1CClient)
 
     created = 0
     existing = 0

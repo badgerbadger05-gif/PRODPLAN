@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import Optional, List
 from datetime import date, datetime
 
@@ -31,8 +31,7 @@ class Item(ItemBase):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 # Paginated DTO for items list
@@ -68,8 +67,7 @@ class ItemCategory(ItemCategoryBase):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class SpecificationBase(BaseModel):
@@ -91,8 +89,7 @@ class Specification(SpecificationBase):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class SpecComponentBase(BaseModel):
@@ -116,8 +113,7 @@ class SpecComponent(SpecComponentBase):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class OperationBase(BaseModel):
@@ -139,8 +135,7 @@ class Operation(OperationBase):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class SpecOperationBase(BaseModel):
@@ -163,8 +158,7 @@ class SpecOperation(SpecOperationBase):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ProductionOrderBase(BaseModel):
@@ -190,8 +184,7 @@ class ProductionOrder(ProductionOrderBase):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ProductionProductBase(BaseModel):
@@ -217,8 +210,7 @@ class ProductionProduct(ProductionProductBase):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ProductionComponentBase(BaseModel):
@@ -242,8 +234,7 @@ class ProductionComponent(ProductionComponentBase):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ProductionOperationBase(BaseModel):
@@ -268,8 +259,7 @@ class ProductionOperation(ProductionOperationBase):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class SupplierBase(BaseModel):
@@ -290,8 +280,7 @@ class Supplier(SupplierBase):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class SupplierOrderBase(BaseModel):
@@ -319,8 +308,7 @@ class SupplierOrder(SupplierOrderBase):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class SupplierOrderItemBase(BaseModel):
@@ -350,8 +338,7 @@ class SupplierOrderItem(SupplierOrderItemBase):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class DefaultSpecificationBase(BaseModel):
@@ -373,8 +360,7 @@ class DefaultSpecification(DefaultSpecificationBase):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ProductionResourceBase(BaseModel):
@@ -400,8 +386,7 @@ class ProductionResource(ProductionResourceBase):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ResourceStageBase(BaseModel):
@@ -418,8 +403,7 @@ class ResourceStage(ResourceStageBase):
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 # --- Pydantic схемы для видов производства ---
@@ -442,8 +426,7 @@ class ProductionKind(ProductionKindBase):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ResourceProductionKindBase(BaseModel):
@@ -460,8 +443,7 @@ class ResourceProductionKind(ResourceProductionKindBase):
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class ODataSyncRequest(BaseModel):
@@ -492,8 +474,7 @@ class ResourceStageWithName(ResourceStageBase):
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 # --- MRP Production response models (for grouped endpoint) ---
 
 class ProductionStage(BaseModel):
@@ -654,5 +635,4 @@ class PlannedReworkUpdate(PlannedReworkBase):
 class PlannedRework(PlannedReworkBase):
     rework_id: int
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)

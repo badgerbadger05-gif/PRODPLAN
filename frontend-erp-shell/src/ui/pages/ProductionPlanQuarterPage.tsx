@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { NomenclatureSearchItem, PlanChange, PlanMatrixRow, WeekInfo } from '../../domain/productionPlan'
-import { dateRu, isoToday, localIsoDate, qty } from '../../lib/format'
+import { isoToday, localIsoDate, qty } from '../../lib/format'
 import { bulkUpsertPlan, deletePlanRow, ensurePlanItem, getPlanMatrix, searchNomenclature } from '../../services/productionPlan'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
@@ -45,6 +45,7 @@ function buildWeeks(dates: string[]): WeekInfo[] {
 
 export function ProductionPlanQuarterPage() {
   const [startDate, setStartDate] = useState(isoToday())
+  const initialStartDate = useRef(startDate)
   const [rows, setRows] = useState<RowVm[]>([])
   const [weeks, setWeeks] = useState<WeekInfo[]>([])
   const [page, setPage] = useState(1)
@@ -65,7 +66,7 @@ export function ProductionPlanQuarterPage() {
 
   const quarterSum = useMemo(() => rows.reduce((sum, row) => sum + Number(row.month_plan || 0), 0), [rows])
 
-  async function load(nextPage = page, nextStartDate = startDate) {
+  const load = useCallback(async (nextPage: number, nextStartDate: string) => {
     setLoading(true)
     setError('')
     setMessage('')
@@ -96,7 +97,7 @@ export function ProductionPlanQuarterPage() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [])
 
   function updateWeek(row: RowVm, week: WeekInfo, value: string) {
     const nextValue = Number(value || 0)
@@ -181,8 +182,8 @@ export function ProductionPlanQuarterPage() {
   }
 
   useEffect(() => {
-    void load(1, startDate)
-  }, [])
+    void load(1, initialStartDate.current)
+  }, [load])
 
   return (
     <main className="workArea">

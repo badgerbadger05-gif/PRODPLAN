@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   coverageLabels,
   type ControlSettings,
@@ -34,6 +34,8 @@ export function ProductionControlPage() {
   const [runId, setRunId] = useState<number | null>(null)
   const [offset, setOffset] = useState(0)
   const [filters, setFilters] = useState<ProductionFilters>({ search: '', status: '', workshop_id: '', date_from: '', date_to: '' })
+  const filtersRef = useRef(filters)
+  const offsetRef = useRef(offset)
   const [message, setMessage] = useState('')
   const [resources, setResources] = useState<ProductionResource[]>([])
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -42,10 +44,18 @@ export function ProductionControlPage() {
   const [workshopRows, setWorkshopRows] = useState<WorkshopWarehouse[]>([])
   const [ignoredRefs, setIgnoredRefs] = useState<Set<string>>(new Set())
 
+  useEffect(() => {
+    filtersRef.current = filters
+  }, [filters])
+
+  useEffect(() => {
+    offsetRef.current = offset
+  }, [offset])
+
   const activeRow = useMemo(() => rows.find((row) => row.product_id === activeId) ?? rows[0] ?? null, [rows, activeId])
   const selectedRows = useMemo(() => rows.filter((row) => selectedIds.has(row.product_id)), [rows, selectedIds])
 
-  async function load(nextOffset = offset) {
+  const load = useCallback(async (nextOffset: number) => {
     setLoading(true)
     setError('')
     setMessage('')
@@ -53,7 +63,7 @@ export function ProductionControlPage() {
       const params = new URLSearchParams()
       params.set('limit', String(limit))
       params.set('offset', String(nextOffset))
-      Object.entries(filters).forEach(([key, value]) => {
+      Object.entries(filtersRef.current).forEach(([key, value]) => {
         if (value) params.set(key, value)
       })
       const data = await api<OrdersResponse>(`/v1/production-control/orders?${params.toString()}`)
@@ -70,15 +80,15 @@ export function ProductionControlPage() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [])
 
-  async function loadResources() {
+  const loadResources = useCallback(async () => {
     try {
       setResources(await listResources())
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
-  }
+  }, [])
 
   async function openSettings() {
     setSettingsOpen(true)
@@ -115,7 +125,7 @@ export function ProductionControlPage() {
       setWorkshopRows(saved.workshop_warehouses ?? [])
       setIgnoredRefs(new Set((saved.ignored_warehouses ?? []).map((row) => row.warehouse_ref1c).filter(Boolean)))
       setSettingsOpen(false)
-      await load()
+      await load(offsetRef.current)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -123,7 +133,7 @@ export function ProductionControlPage() {
     }
   }
 
-  async function loadMaterials(row: OrderRow) {
+  const loadMaterials = useCallback(async (row: OrderRow) => {
     setActiveId(row.product_id)
     setMaterials(null)
     try {
@@ -131,7 +141,7 @@ export function ProductionControlPage() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
-  }
+  }, [])
 
   async function changeStatus(row: OrderRow, status: string) {
     const previous = row.status
@@ -156,7 +166,7 @@ export function ProductionControlPage() {
         body: JSON.stringify({ product_ids: Array.from(selectedIds) }),
       })
       setSelectedIds(new Set())
-      await load()
+      await load(offsetRef.current)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -177,7 +187,7 @@ export function ProductionControlPage() {
       const created = result.created?.length ?? 0
       const errors = result.errors?.length ?? 0
       setSelectedIds(new Set())
-      await load()
+      await load(offsetRef.current)
       setMessage(`Выдача материалов: создано документов ${created}${errors ? `, ошибок ${errors}` : ''}`)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -194,11 +204,11 @@ export function ProductionControlPage() {
   useEffect(() => {
     void load(0)
     void loadResources()
-  }, [])
+  }, [load, loadResources])
 
   useEffect(() => {
     if (activeRow) void loadMaterials(activeRow)
-  }, [activeRow?.product_id])
+  }, [activeRow, loadMaterials])
 
   const visibleFrom = total ? offset + 1 : 0
   const visibleTo = Math.min(offset + rows.length, total)
@@ -238,7 +248,7 @@ export function ProductionControlPage() {
           onCreateMaterialIssues={() => void createMaterialIssues()}
           onLoadMaterials={() => activeRow && void loadMaterials(activeRow)}
           onOpenSettings={() => void openSettings()}
-          onRefresh={() => void load()}
+          onRefresh={() => void load(offset)}
           onSelectAll={() => setSelectedIds(new Set(rows.map((row) => row.product_id)))}
           onClearSelection={() => setSelectedIds(new Set())}
         />

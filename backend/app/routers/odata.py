@@ -7,11 +7,15 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from ..services.odata_config import (
+    load_odata_config,
+    sanitize_base_url,
+    save_odata_config,
+)
 from ..services.odata_client import OData1CClient
 
 router = APIRouter(prefix="/v1/odata", tags=["odata"])
 
-CONFIG_PATH = Path("config") / "odata_config.json"
 OUTPUT_DIR = Path("output")
 GROUPS_JSON = OUTPUT_DIR / "odata_groups_nomenclature.json"
 GROUPS_SELECTED = Path("config") / "odata_groups_selected.json"
@@ -28,28 +32,12 @@ class GroupsSelection(BaseModel):
     ids: List[str]
 
 
-def _sanitize_base_url(u: str) -> str:
-    s = (u or "").strip().rstrip("/")
-    if s.lower().endswith("$metadata"):
-        s = s[: -len("$metadata")].rstrip("/")
-    return s
-
-
 def _load_config() -> Dict[str, Any]:
-    try:
-        if CONFIG_PATH.exists():
-            return json.loads(CONFIG_PATH.read_text("utf-8") or "{}")
-    except Exception:
-        pass
-    return {}
+    return load_odata_config()
 
 
 def _save_config(data: Dict[str, Any]) -> Dict[str, Any]:
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    data = dict(data or {})
-    data["base_url"] = _sanitize_base_url(str(data.get("base_url") or ""))
-    CONFIG_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    return data
+    return save_odata_config(data)
 
 
 @router.get("/config")
@@ -73,7 +61,7 @@ def test_connection(cfg: Optional[ODataConfig] = None):
     if not base_url:
         raise HTTPException(status_code=400, detail="base_url is required")
     client = OData1CClient(
-        base_url=_sanitize_base_url(base_url),
+        base_url=sanitize_base_url(base_url),
         username=data.get("username") or None,
         password=data.get("password") or None,
         token=data.get("token") or None,
@@ -98,7 +86,7 @@ def fetch_metadata(cfg: Optional[ODataConfig] = None):
     if not base_url:
         raise HTTPException(status_code=400, detail="base_url is required")
     client = OData1CClient(
-        base_url=_sanitize_base_url(base_url),
+        base_url=sanitize_base_url(base_url),
         username=data.get("username") or None,
         password=data.get("password") or None,
         token=data.get("token") or None,
@@ -148,7 +136,7 @@ def export_groups(cfg: Optional[ODataConfig] = None):
         raise HTTPException(status_code=400, detail="base_url is required")
 
     client = OData1CClient(
-        base_url=_sanitize_base_url(base_url),
+        base_url=sanitize_base_url(base_url),
         username=data.get("username") or None,
         password=data.get("password") or None,
         token=data.get("token") or None,

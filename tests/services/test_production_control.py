@@ -19,12 +19,9 @@ from app.models import (
     SupplierOrder,
     SupplierOrderItem,
 )
-from app.services.production_control import (
-    create_material_issues,
-    create_orders_from_mrp,
-    list_journal,
-    preview_materials,
-)
+from app.services.production_control_journal import create_orders_from_mrp, list_journal
+from app.services.production_control_material_availability import preview_materials
+from app.services.production_control_material_issues import create_material_issues
 
 
 def test_journal_and_material_issue_are_scoped_to_order_line(db_session):
@@ -672,7 +669,7 @@ def test_preview_materials_does_not_override_post_coverage_status(db_session):
 
 def test_workshop_warehouse_binding_lifecycle(db_session):
     from app.models import ProductionResource, WorkshopWarehouseBinding
-    from app.services.production_control import (
+    from app.services.production_control_settings import (
         delete_workshop_binding,
         list_settings,
         upsert_workshop_binding,
@@ -723,7 +720,7 @@ def test_workshop_warehouse_binding_lifecycle(db_session):
 
 
 def test_ignored_warehouse_lifecycle(db_session):
-    from app.services.production_control import (
+    from app.services.production_control_settings import (
         delete_ignored_warehouse,
         list_settings,
         upsert_ignored_warehouse,
@@ -890,7 +887,7 @@ def test_preview_materials_excludes_ignored_warehouses_from_stock(db_session):
     suggests there's enough.
     """
     from app.models import ItemWarehouseStock
-    from app.services.production_control import upsert_ignored_warehouse
+    from app.services.production_control_settings import upsert_ignored_warehouse
 
     parent, _spec, comps = _make_basic_spec(
         db_session,
@@ -950,7 +947,7 @@ def test_preview_materials_falls_back_to_aggregated_when_no_breakdown(db_session
     fall back to aggregated Item.stock_qty so coverage doesn't collapse to 0
     during the rollout.
     """
-    from app.services.production_control import upsert_ignored_warehouse
+    from app.services.production_control_settings import upsert_ignored_warehouse
 
     parent, _spec, comps = _make_basic_spec(
         db_session,
@@ -983,7 +980,7 @@ def test_preview_materials_mixes_breakdown_and_aggregated_fallback(db_session):
     breakdown path is authoritative when present, aggregated is the fallback.
     """
     from app.models import ItemWarehouseStock
-    from app.services.production_control import upsert_ignored_warehouse
+    from app.services.production_control_settings import upsert_ignored_warehouse
 
     parent, _spec, comps = _make_basic_spec(
         db_session,

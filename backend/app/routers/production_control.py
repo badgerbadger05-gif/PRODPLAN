@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
@@ -13,24 +13,20 @@ from ..services.one_c_manufacture_export import export_manufactures_to_1c
 from ..services.one_c_posted_transfer_sync import sync_posted_transfers
 from ..services.one_c_production_order_export import export_production_orders_to_1c
 from ..services.one_c_stock_transfer_export import export_material_issues_to_1c
-from ..services.production_control import (
+from ..services.production_control_material_issues import (
     create_material_issues,
-    create_orders_from_mrp,
-    delete_ignored_warehouse,
-    delete_workshop_binding,
     export_issue_to_1c,
     get_issue,
-    list_journal,
-    list_settings,
-    mark_route_sheets_printed,
-    preview_materials,
-    produce_line,
-    render_route_sheets_html,
-    return_leftover_components,
-    update_line_state,
-    upsert_ignored_warehouse,
-    upsert_workshop_binding,
 )
+from ..services.production_control_journal import (
+    create_orders_from_mrp,
+    list_journal,
+    update_line_state,
+)
+from ..services.production_control_material_availability import preview_materials
+from ..services.production_control_printing import mark_route_sheets_printed, render_route_sheets_html
+from ..services.production_control_production_flow import produce_line, return_leftover_components
+from .production_control_settings import router as settings_router
 
 
 router = APIRouter(prefix="/v1/production-control", tags=["production-control"])
@@ -54,16 +50,6 @@ class MaterialIssueCreatePayload(BaseModel):
 class OrdersFromMrpPayload(BaseModel):
     planned_order_ids: List[int]
     initiated_by: Optional[str] = None
-
-
-class WorkshopBindingPayload(BaseModel):
-    warehouse_ref1c: str
-
-
-class IgnoredWarehousePayload(BaseModel):
-    warehouse_ref1c: str
-    warehouse_name: Optional[str] = None
-    reason: Optional[str] = None
 
 
 class ExportProductionOrdersPayload(BaseModel):
@@ -145,7 +131,7 @@ def post_produce_line(
     """
     Record one production event on the line. Bumps produced_qty / decreases
     remaining_qty / promotes line status to produced_partial or produced.
-    Creates a ProductionManufacture row. Local only — does NOT send to 1C;
+    Creates a ProductionManufacture row. Local only вЂ” does NOT send to 1C;
     use POST /manufactures/export-to-1c for that.
     """
     try:
@@ -170,7 +156,7 @@ def post_return_leftovers(
 ):
     """
     Создать обратное перемещение лишних компонентов на исходные склады для
-    частично произведённой строки. Локально только — в 1С документ
+    частично произведённой строки. Локально только вЂ” в 1С документ
     отправится отдельно через /material-issues/export-to-1c.
 
     Возвращает либо status='ok' с return_issue_id и list of lines, либо
@@ -192,7 +178,7 @@ def post_export_manufactures_to_1c(
 ):
     """
     Bulk-экспорт выпусков (производств) в 1С как Document_СборкаЗапасов
-    (Posted=false). Идемпотентно через sync_link.
+    (Posted=false). РРґРµРјРїРѕС‚РµРЅС‚РЅРѕ через sync_link.
     """
     if not payload.manufacture_ids:
         raise HTTPException(status_code=400, detail="Не выбраны выпуски")
@@ -298,10 +284,10 @@ def post_export_material_issues_to_1c(
 ):
     """
     Bulk-экспорт выдач материалов в 1С как Document_ПеремещениеЗапасов
-    (Posted=false). Идемпотентно через sync_link.
+    (Posted=false). РРґРµРјРїРѕС‚РµРЅС‚РЅРѕ через sync_link.
 
-    - `dry_run=true` (default) — возвращает payload, не пишет в 1С.
-    - `dry_run=false` — реально пишет; refuse при non-demo base_url без
+    - `dry_run=true` (default) вЂ” возвращает payload, не пишет в 1С.
+    - `dry_run=false` вЂ” реально пишет; refuse при non-demo base_url без
       `allow_production=true`.
     """
     if not payload.issue_ids:
@@ -374,59 +360,5 @@ def print_route_sheets(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-# ---------------------------------------------------------------------------
-# Settings: workshop -> warehouse bindings + ignored warehouses
-# ---------------------------------------------------------------------------
+router.include_router(settings_router)
 
-
-@router.get("/settings", response_model=dict)
-def get_settings(db: Session = Depends(get_db)):
-    """Return current workshop->warehouse bindings and ignored warehouses."""
-    return list_settings(db)
-
-
-@router.put("/settings/workshop-bindings/{workshop_id}", response_model=dict)
-def put_workshop_binding(
-    workshop_id: int,
-    payload: WorkshopBindingPayload,
-    db: Session = Depends(get_db),
-):
-    try:
-        return upsert_workshop_binding(db, int(workshop_id), payload.warehouse_ref1c)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.delete("/settings/workshop-bindings/{workshop_id}", response_model=dict)
-def delete_binding(workshop_id: int, db: Session = Depends(get_db)):
-    try:
-        return delete_workshop_binding(db, int(workshop_id))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.post("/settings/ignored-warehouses", response_model=dict)
-def post_ignored_warehouse(payload: IgnoredWarehousePayload, db: Session = Depends(get_db)):
-    try:
-        return upsert_ignored_warehouse(
-            db,
-            payload.warehouse_ref1c,
-            warehouse_name=payload.warehouse_name,
-            reason=payload.reason,
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.delete("/settings/ignored-warehouses/{warehouse_ref1c}", response_model=dict)
-def delete_ignored(warehouse_ref1c: str, db: Session = Depends(get_db)):
-    try:
-        return delete_ignored_warehouse(db, str(warehouse_ref1c))
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))

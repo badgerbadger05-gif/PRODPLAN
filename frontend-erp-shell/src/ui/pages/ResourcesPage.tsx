@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { ProductionKind, ProductionResource, ProductionResourcePayload, ResourceProductionKind, ResourceStage } from '../../domain/resources'
 import { qty } from '../../lib/format'
 import {
@@ -47,7 +47,7 @@ export function ResourcesPage() {
 
   const active = useMemo(() => creating ? null : rows.find((row) => row.resource_id === activeId) ?? filtered[0] ?? null, [rows, filtered, activeId, creating])
 
-  async function load() {
+  const load = useCallback(async () => {
     setLoading(true)
     setError('')
     setMessage('')
@@ -60,17 +60,17 @@ export function ResourcesPage() {
     } finally {
       setLoading(false)
     }
-  }
+  }, [])
 
-  async function loadProductionKindsCatalog() {
+  const loadProductionKindsCatalog = useCallback(async () => {
     try {
       setAllKinds(await listProductionKinds())
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
-  }
+  }, [])
 
-  async function loadDetails(resource: ProductionResource) {
+  const loadDetails = useCallback(async (resource: ProductionResource) => {
     if (creating) return
     setActiveId(resource.resource_id)
     setForm(resourceToForm(resource))
@@ -87,7 +87,7 @@ export function ResourcesPage() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
-  }
+  }, [creating])
 
   function beginCreate() {
     setCreating(true)
@@ -169,11 +169,11 @@ export function ResourcesPage() {
   useEffect(() => {
     void load()
     void loadProductionKindsCatalog()
-  }, [])
+  }, [load, loadProductionKindsCatalog])
 
   useEffect(() => {
     if (active) void loadDetails(active)
-  }, [active?.resource_id])
+  }, [active, loadDetails])
 
   return (
     <main className="workArea">

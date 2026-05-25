@@ -14,7 +14,7 @@ from app.models import (
     SyncLink,
 )
 from app.services import one_c_manufacture_export as exporter
-from app.services.production_control import produce_line
+from app.services.production_control_production_flow import produce_line
 
 
 # ---------------------------------------------------------------------------
