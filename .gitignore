@@ -1,20 +1,48 @@
-# Documentation with sensitive data
+﻿# Documentation with sensitive data
 .docs/prodplan-deploy.md
 
 # Local temporary files
 .tmp/
 .tmp_items.json
+.tmp_preview.json
+tmp/
 *.tmp
 
 # Python
 __pycache__/
 *.pyc
 .env
+.venv/
+.pytest_cache/
+
+# Local secrets/config overrides
+config/odata_config.local.json
+
+# Docker compose local override (machine-specific networking, hostnames)
+docker-compose.override.yml
 
 # Node.js
 node_modules/
 dist/
 .quasar/
+
+# Build/debug artifacts in repo root
+/all_logs.txt
+/backend_logs.txt
+/backend_logs2.txt
+/docs.html
+/metadata.xml
+/openapi.json
+/pegging*.json
+/production*.json
+/root.json
+/runs.json
+/shortage.json
+/states_raw.json
+/summary*.json
+/test_export.json
+/test_output.txt
+/0
 
 # OS generated files
 .DS_Store
