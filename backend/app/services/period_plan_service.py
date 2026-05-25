@@ -1,0 +1,1053 @@
+from __future__ import annotations
+
+from datetime import date, datetime, timedelta
+from decimal import Decimal
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+from ..models import (
+    DefaultSpecification,
+    Item,
+    MrpRequirement,
+    MrpRequirementBucket,
+    PlannedPurchase,
+    PlannedRework,
+    PlanningRun,
+    ProductionOrder,
+    ProductionProduct,
+    ProductionPlanHeader,
+    ProductionPlanLine,
+    ProductionResource,
+    ResourceProductionKind,
+    SpecComponent,
+    Specification,
+)
+from .planning_service import DEFAULT_PLANNING_CONFIG, get_active_planning_config
+from .replenishment import (
+    REPLENISHMENT_FLOW_PRODUCTION,
+    REPLENISHMENT_FLOW_PURCHASE,
+    REPLENISHMENT_FLOW_REWORK,
+    classify_replenishment_flow,
+)
+
+
+PLAN_STATUSES = {"draft", "fixed", "archived"}
+
+# Matches planning_service.DONE_STATE_KEY — 1C state for completed production orders.
+_DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
+
+
+def _parse_date(value: Any, field: str = "date") -> date:
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except Exception as exc:
+        raise ValueError(f"Invalid {field}") from exc
+
+
+def _to_float(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except Exception:
+        return 0.0
+
+
+def _fridays_between(start: date, finish: date) -> List[date]:
+    if finish < start:
+        return []
+    days_to_friday = (4 - start.weekday()) % 7
+    current = start + timedelta(days=days_to_friday)
+    out: List[date] = []
+    while current <= finish:
+        out.append(current)
+        current += timedelta(days=7)
+    if not out:
+        out.append(finish)
+    return out
+
+
+def _serialize_plan(
+    plan: ProductionPlanHeader,
+    *,
+    line_count: Optional[int] = None,
+    total_qty: Optional[float] = None,
+) -> Dict[str, Any]:
+    return {
+        "id": int(plan.id),
+        "name": str(plan.name or ""),
+        "period_from": plan.period_from.isoformat() if plan.period_from else None,
+        "period_to": plan.period_to.isoformat() if plan.period_to else None,
+        "status": str(plan.status or "draft"),
+        "comment": str(plan.comment or "") if plan.comment else None,
+        "created_by": str(plan.created_by or "") if plan.created_by else None,
+        "fixed_by": str(plan.fixed_by or "") if plan.fixed_by else None,
+        "fixed_at": plan.fixed_at.isoformat() if plan.fixed_at else None,
+        "created_at": plan.created_at.isoformat() if plan.created_at else None,
+        "updated_at": plan.updated_at.isoformat() if plan.updated_at else None,
+        "line_count": int(line_count or 0) if line_count is not None else None,
+        "total_qty": float(total_qty or 0.0) if total_qty is not None else None,
+    }
+
+
+def _get_plan(db: Session, plan_id: int) -> ProductionPlanHeader:
+    plan = db.query(ProductionPlanHeader).filter(ProductionPlanHeader.id == int(plan_id)).first()
+    if not plan:
+        raise ValueError("План не найден")
+    return plan
+
+
+def _assert_plan_editable(plan: ProductionPlanHeader) -> None:
+    if str(plan.status or "").lower() != "draft":
+        raise ValueError("План зафиксирован и недоступен для редактирования")
+
+
+def list_period_plans(
+    db: Session,
+    *,
+    limit: int = 100,
+    offset: int = 0,
+    status: Optional[str] = None,
+    period_from: Any = None,
+    period_to: Any = None,
+    created_by: Optional[str] = None,
+    sort_by: Optional[str] = None,
+    sort_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    q = db.query(ProductionPlanHeader)
+    if status:
+        q = q.filter(ProductionPlanHeader.status == str(status).strip().lower())
+    if period_from:
+        q = q.filter(ProductionPlanHeader.period_to >= _parse_date(period_from, "period_from"))
+    if period_to:
+        q = q.filter(ProductionPlanHeader.period_from <= _parse_date(period_to, "period_to"))
+    if created_by:
+        q = q.filter(ProductionPlanHeader.created_by.ilike(f"%{str(created_by).strip()}%"))
+    total = q.count()
+    sort_cols = {
+        "name": ProductionPlanHeader.name,
+        "status": ProductionPlanHeader.status,
+        "period_from": ProductionPlanHeader.period_from,
+        "period_to": ProductionPlanHeader.period_to,
+        "fixed_at": ProductionPlanHeader.fixed_at,
+        "created_at": ProductionPlanHeader.created_at,
+    }
+    sort_col = sort_cols.get((sort_by or "period_from").lower(), ProductionPlanHeader.period_from)
+    sort_expr = sort_col.asc() if (sort_dir or "desc").lower() == "asc" else sort_col.desc()
+    plans = (
+        q.order_by(sort_expr, ProductionPlanHeader.id.desc())
+        .offset(max(0, int(offset or 0)))
+        .limit(max(1, min(int(limit or 100), 500)))
+        .all()
+    )
+    plan_ids = [int(plan.id) for plan in plans]
+    line_stats: Dict[int, Dict[str, float]] = {}
+    if plan_ids:
+        stats_rows = (
+            db.query(
+                ProductionPlanLine.plan_id,
+                func.count(ProductionPlanLine.id).label("line_count"),
+                func.coalesce(func.sum(ProductionPlanLine.qty), 0.0).label("total_qty"),
+            )
+            .filter(ProductionPlanLine.plan_id.in_(plan_ids))
+            .group_by(ProductionPlanLine.plan_id)
+            .all()
+        )
+        line_stats = {
+            int(row.plan_id): {"line_count": int(row.line_count or 0), "total_qty": _to_float(row.total_qty)}
+            for row in stats_rows
+        }
+    return {
+        "rows": [
+            _serialize_plan(
+                plan,
+                line_count=int(line_stats.get(int(plan.id), {}).get("line_count", 0)),
+                total_qty=float(line_stats.get(int(plan.id), {}).get("total_qty", 0.0)),
+            )
+            for plan in plans
+        ],
+        "total": int(total),
+    }
+
+
+def create_period_plan(
+    db: Session,
+    *,
+    name: str,
+    period_from: Any,
+    period_to: Any,
+    created_by: Optional[str] = None,
+    comment: Optional[str] = None,
+) -> Dict[str, Any]:
+    start = _parse_date(period_from, "period_from")
+    finish = _parse_date(period_to, "period_to")
+    if finish < start:
+        raise ValueError("Дата окончания периода не может быть раньше даты начала")
+    title = str(name or "").strip()
+    if not title:
+        raise ValueError("Название плана обязательно")
+
+    plan = ProductionPlanHeader(
+        name=title,
+        period_from=start,
+        period_to=finish,
+        status="draft",
+        created_by=created_by,
+        comment=comment,
+    )
+    db.add(plan)
+    db.commit()
+    db.refresh(plan)
+    return _serialize_plan(plan)
+
+
+def get_period_plan(db: Session, plan_id: int) -> Dict[str, Any]:
+    return _serialize_plan(_get_plan(db, plan_id))
+
+
+def fix_period_plan(db: Session, plan_id: int, *, fixed_by: Optional[str] = None) -> Dict[str, Any]:
+    plan = _get_plan(db, plan_id)
+    if plan.status == "archived":
+        raise ValueError("Архивный план нельзя фиксировать")
+    if plan.status != "fixed":
+        plan.status = "fixed"
+        plan.fixed_by = fixed_by
+        plan.fixed_at = datetime.utcnow()
+    db.commit()
+    db.refresh(plan)
+    return _serialize_plan(plan)
+
+
+def archive_period_plan(db: Session, plan_id: int) -> Dict[str, Any]:
+    plan = _get_plan(db, plan_id)
+    plan.status = "archived"
+    db.commit()
+    db.refresh(plan)
+    return _serialize_plan(plan)
+
+
+def unarchive_period_plan(db: Session, plan_id: int) -> Dict[str, Any]:
+    """Restore plan from archive. Returns to 'fixed' if previously fixed (has fixed_at), else 'draft'."""
+    plan = _get_plan(db, plan_id)
+    if plan.status != "archived":
+        raise ValueError("Только архивный план можно вернуть из архива")
+    plan.status = "fixed" if plan.fixed_at else "draft"
+    db.commit()
+    db.refresh(plan)
+    return _serialize_plan(plan)
+
+
+def update_period_plan_header(
+    db: Session,
+    plan_id: int,
+    *,
+    name: Optional[str] = None,
+    period_from: Any = None,
+    period_to: Any = None,
+    comment: Any = None,
+) -> Dict[str, Any]:
+    """Update editable header fields. Only allowed for draft plans."""
+    plan = _get_plan(db, plan_id)
+    _assert_plan_editable(plan)
+    if name is not None:
+        title = str(name).strip()
+        if not title:
+            raise ValueError("Название плана обязательно")
+        plan.name = title
+    new_from = _parse_date(period_from, "period_from") if period_from is not None else plan.period_from
+    new_to = _parse_date(period_to, "period_to") if period_to is not None else plan.period_to
+    if new_to < new_from:
+        raise ValueError("Дата окончания периода не может быть раньше даты начала")
+    plan.period_from = new_from
+    plan.period_to = new_to
+    if comment is not None:
+        plan.comment = str(comment) if str(comment).strip() else None
+    db.commit()
+    db.refresh(plan)
+    return _serialize_plan(plan)
+
+
+def list_mrp_runs_for_plan(db: Session, plan_id: int, *, limit: int = 50) -> Dict[str, Any]:
+    """Return MRP runs whose source_plan_id matches this plan, newest first."""
+    _get_plan(db, plan_id)  # validates existence
+    runs = (
+        db.query(PlanningRun)
+        .filter(PlanningRun.source_plan_id == int(plan_id))
+        .order_by(PlanningRun.run_id.desc())
+        .limit(max(1, min(int(limit or 50), 200)))
+        .all()
+    )
+    rows = []
+    for r in runs:
+        rows.append({
+            "run_id": int(r.run_id),
+            "status": str(r.status or ""),
+            "started_at": r.started_at.isoformat() if r.started_at else None,
+            "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+            "started_by": r.started_by,
+            "horizon_days": int(r.horizon_days) if r.horizon_days is not None else None,
+            "period_from": r.period_from.isoformat() if r.period_from else None,
+            "period_to": r.period_to.isoformat() if r.period_to else None,
+            "fixed_at": r.fixed_at.isoformat() if r.fixed_at else None,
+        })
+    return {"rows": rows, "total": len(rows)}
+
+
+def delete_period_plan(db: Session, plan_id: int) -> Dict[str, Any]:
+    """Delete a period plan. Only allowed if no fixed (non-draft) MRP runs exist for this plan."""
+    from ..models import PlanningRun
+    plan = _get_plan(db, plan_id)
+    fixed_runs = (
+        db.query(PlanningRun)
+        .filter(
+            PlanningRun.source_plan_id == plan_id,
+            PlanningRun.status == "SUCCESS",
+        )
+        .count()
+    )
+    if fixed_runs > 0:
+        raise ValueError(
+            f"Нельзя удалить план: по нему есть {fixed_runs} зафиксированных расчётов MRP"
+        )
+    name = plan.name
+    db.delete(plan)
+    db.commit()
+    return {"status": "deleted", "id": plan_id, "name": name}
+
+
+def _explode_bom_net_first(
+    db: Session,
+    plan_demands: Dict[int, Dict[date, float]],
+) -> Tuple[Dict[int, Dict[date, float]], Dict[int, Dict[date, float]], Dict[int, int]]:
+    """Net-first multi-level BOM explosion with WIP netting and lead-time shifting.
+
+    For each plan item (level 0), explode the BOM tree level by level.
+    At each level:
+      1. Accumulate gross demand for each item.
+      2. Net gross demand against available stock + WIP (chronologically per bucket).
+      3. Explode only the residual (net) demand to the item's components,
+         shifting each child's need-date back by its buffer_days.
+
+    Returns:
+        gross_map  — {item_id: {bucket_date: gross_qty}}
+        net_map    — {item_id: {bucket_date: net_qty}}
+        bom_level_map — {item_id: minimum_bom_level}  (0 = plan item, 1 = component, …)
+
+    Cycle safety: each item is exploded as a parent at most once (``exploded_parents``
+    set). Convergent BOMs (same sub-assembly under multiple parents) are handled
+    correctly because all parents at the same depth contribute to ``next_demand``
+    before the next iteration starts.
+    """
+    # --- Pre-load BOM data in bulk (avoid N+1 per item) ---
+    stock_by_item: Dict[int, float] = {
+        int(row.item_id): float(row.stock_qty or 0.0)
+        for row in db.query(Item.item_id, Item.stock_qty).all()
+    }
+
+    default_spec_map: Dict[int, int] = {
+        int(ds.item_id): int(ds.spec_id)
+        for ds in db.query(DefaultSpecification).all()
+    }
+
+    components_by_spec: Dict[int, List[SpecComponent]] = {}
+    for comp in db.query(SpecComponent).all():
+        components_by_spec.setdefault(int(comp.spec_id), []).append(comp)
+
+    # --- WIP: remaining qty from active (non-done, non-deleted) production orders ---
+    try:
+        wip_rows = (
+            db.query(
+                ProductionProduct.item_id,
+                func.sum(ProductionProduct.remaining_qty),
+            )
+            .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+            .filter(ProductionOrder.deletion_mark.is_(False))
+            .filter(
+                func.lower(func.coalesce(ProductionOrder.order_state_key, ""))
+                != _DONE_STATE_KEY
+            )
+            .filter(ProductionProduct.remaining_qty > 0)
+            .group_by(ProductionProduct.item_id)
+            .all()
+        )
+        wip_by_item: Dict[int, float] = {int(iid): float(qty or 0.0) for iid, qty in wip_rows}
+    except Exception:
+        wip_by_item = {}
+
+    # --- Buffer-days lookup: item → default spec → production_kind → resource.buffer_days ---
+    all_spec_ids: set = set(default_spec_map.values())
+    if all_spec_ids:
+        specs = db.query(Specification).filter(Specification.spec_id.in_(all_spec_ids)).all()
+    else:
+        specs = []
+    spec_by_id: Dict[int, Any] = {int(s.spec_id): s for s in specs}
+
+    kind_ids: set = {int(s.production_kind_id) for s in specs if getattr(s, "production_kind_id", None)}
+    resource_kind_by_kind: Dict[int, list] = {}
+    if kind_ids:
+        for rk in (
+            db.query(ResourceProductionKind)
+            .filter(ResourceProductionKind.production_kind_id.in_(kind_ids))
+            .all()
+        ):
+            resource_kind_by_kind.setdefault(int(rk.production_kind_id), []).append(rk)
+
+    resource_ids: set = {int(rk.resource_id) for lst in resource_kind_by_kind.values() for rk in lst}
+    res_by_id: Dict[int, Any] = {}
+    if resource_ids:
+        resources = db.query(ProductionResource).filter(ProductionResource.resource_id.in_(resource_ids)).all()
+        res_by_id = {int(r.resource_id): r for r in resources}
+
+    buffer_days_cache: Dict[int, int] = {}
+
+    def resolve_buffer_days(item_id: int) -> int:
+        if item_id in buffer_days_cache:
+            return buffer_days_cache[item_id]
+        spec_id = default_spec_map.get(item_id)
+        buffer_val = 0
+        if spec_id:
+            spec = spec_by_id.get(int(spec_id))
+            if spec and getattr(spec, "production_kind_id", None):
+                for rk in resource_kind_by_kind.get(int(spec.production_kind_id), []):
+                    res = res_by_id.get(int(rk.resource_id))
+                    if res and getattr(res, "buffer_days", None):
+                        try:
+                            buffer_raw = float(res.buffer_days or 0.0)
+                        except Exception:
+                            buffer_raw = 0.0
+                        if buffer_raw > 0:
+                            buffer_val = int(buffer_raw)
+                            break
+        buffer_days_cache[item_id] = max(0, buffer_val)
+        return buffer_days_cache[item_id]
+
+    # --- BFS state ---
+    gross_map: Dict[int, Dict[date, float]] = {}
+    net_map: Dict[int, Dict[date, float]] = {}
+    bom_level_map: Dict[int, int] = {}
+    # Available = stock + WIP, consumed chronologically as demand is processed.
+    avail_remaining: Dict[int, float] = {
+        iid: stock_by_item.get(iid, 0.0) + wip_by_item.get(iid, 0.0)
+        for iid in set(stock_by_item) | set(wip_by_item)
+    }
+    # Prevent cycles: track items already exploded as parents
+    exploded_parents: set = set()
+
+    # Level 0: demand from plan lines
+    demand_map: Dict[int, Dict[date, float]] = {
+        int(iid): dict(buckets) for iid, buckets in plan_demands.items()
+    }
+
+    MAX_BOM_DEPTH = 20
+    for depth in range(MAX_BOM_DEPTH):
+        if not demand_map:
+            break
+
+        next_demand: Dict[int, Dict[date, float]] = {}
+
+        for iid, buckets in sorted(demand_map.items()):
+            if not buckets:
+                continue
+
+            iid = int(iid)
+
+            # Track minimum BOM level at which this item appears
+            if iid not in bom_level_map:
+                bom_level_map[iid] = depth
+            else:
+                bom_level_map[iid] = min(bom_level_map[iid], depth)
+
+            # Accumulate gross demand
+            if iid not in gross_map:
+                gross_map[iid] = {}
+            for bucket_date, qty in buckets.items():
+                gross_map[iid][bucket_date] = gross_map[iid].get(bucket_date, 0.0) + float(qty)
+
+            # Net demand chronologically against available (stock + WIP)
+            avail = avail_remaining.get(iid, 0.0)
+            net_buckets: List[Tuple[date, float]] = []
+
+            for bucket_date, bucket_qty in sorted(buckets.items()):
+                q = float(bucket_qty or 0.0)
+                if q <= 1e-9:
+                    continue
+                if avail >= q:
+                    avail -= q
+                    continue
+                net_q = q - avail
+                avail = 0.0
+                net_buckets.append((bucket_date, net_q))
+
+            avail_remaining[iid] = avail
+
+            # Accumulate net demand
+            if net_buckets:
+                if iid not in net_map:
+                    net_map[iid] = {}
+                for bucket_date, net_q in net_buckets:
+                    net_map[iid][bucket_date] = net_map[iid].get(bucket_date, 0.0) + float(net_q)
+
+            # Explode ONLY net demand to child components
+            if not net_buckets or iid in exploded_parents:
+                continue  # Nothing to propagate, or cycle guard
+            exploded_parents.add(iid)
+
+            spec_id = default_spec_map.get(iid)
+            if not spec_id:
+                continue  # Leaf item (purchased material or item without BOM)
+
+            comps = components_by_spec.get(int(spec_id), [])
+            if not comps:
+                continue
+
+            for bucket_date, net_q in net_buckets:
+                for comp in comps:
+                    try:
+                        child_id = int(comp.item_id)
+                        per_unit = float(comp.quantity or 0.0)
+                    except Exception:
+                        continue
+                    if per_unit <= 1e-12 or net_q <= 1e-9:
+                        continue
+                    child_qty = net_q * per_unit
+                    # Shift need-date back by buffer_days so components are
+                    # required before the parent's production start.
+                    buf = resolve_buffer_days(child_id)
+                    child_date = (bucket_date - timedelta(days=buf)) if buf > 0 else bucket_date
+                    if child_id not in next_demand:
+                        next_demand[child_id] = {}
+                    next_demand[child_id][child_date] = (
+                        next_demand[child_id].get(child_date, 0.0) + child_qty
+                    )
+
+        demand_map = next_demand
+
+    return gross_map, net_map, bom_level_map
+
+
+def create_mrp_snapshot_from_period_plan(
+    db: Session,
+    plan_id: int,
+    *,
+    started_by: Optional[str] = None,
+) -> Dict[str, Any]:
+    plan = _get_plan(db, plan_id)
+    if plan.status != "fixed":
+        raise ValueError("MRP-снимок можно создать только из зафиксированного плана")
+
+    lines = (
+        db.query(ProductionPlanLine)
+        .filter(ProductionPlanLine.plan_id == int(plan.id))
+        .filter(ProductionPlanLine.qty > 0)
+        .order_by(ProductionPlanLine.item_id.asc(), ProductionPlanLine.bucket_date.asc())
+        .all()
+    )
+    if not lines:
+        raise ValueError("В плане нет положительной потребности для MRP")
+
+    try:
+        cfg_id, cfg = get_active_planning_config(db)
+    except Exception:
+        cfg_id, cfg = 0, dict(DEFAULT_PLANNING_CONFIG)
+
+    snapshot = dict(cfg or {})
+    snapshot["planning_horizon_days"] = max(1, (plan.period_to - plan.period_from).days + 1)
+    snapshot["source_plan"] = {
+        "id": int(plan.id),
+        "name": str(plan.name or ""),
+        "period_from": plan.period_from.isoformat(),
+        "period_to": plan.period_to.isoformat(),
+    }
+
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        started_by=started_by or "api",
+        horizon_days=int(snapshot["planning_horizon_days"]),
+        pinned=True,
+        source_plan_id=int(plan.id),
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        fixed_at=datetime.utcnow(),
+        config_version_id=cfg_id,
+        config_snapshot=snapshot,
+        warnings=[],
+        kpi={},
+        started_at=datetime.utcnow(),
+        finished_at=datetime.utcnow(),
+    )
+    db.add(run)
+    db.flush()
+
+    # --- Collect plan-level (level 0) demand and lock plan lines ---
+    buckets_by_item: Dict[int, Dict[date, float]] = {}
+    for line in lines:
+        item_id = int(line.item_id)
+        line_qty = _to_float(line.qty)
+        if line_qty <= 0:
+            continue
+        buckets_by_item.setdefault(item_id, {})
+        buckets_by_item[item_id][line.bucket_date] = (
+            buckets_by_item[item_id].get(line.bucket_date, 0.0) + line_qty
+        )
+        line.locked_by_run_id = int(run.run_id)
+
+    # --- Multi-level net-first BOM explosion + stock netting ---
+    # gross_map[item_id][bucket_date] = gross qty (before stock)
+    # net_map[item_id][bucket_date]   = net qty  (after stock)
+    # bom_level_map[item_id]          = 0 for plan items, 1+ for components
+    gross_map, net_map, bom_level_map = _explode_bom_net_first(db, buckets_by_item)
+
+    # --- Persist MrpRequirement + MrpRequirementBucket for every item with demand ---
+    req_count = 0
+    bucket_count = 0
+    req_by_item: Dict[int, MrpRequirement] = {}
+    for item_id, gross_buckets in sorted(gross_map.items()):
+        total_gross = sum(float(q) for q in gross_buckets.values())
+        if total_gross <= 1e-9:
+            continue
+
+        net_buckets = net_map.get(item_id, {})
+        total_net = sum(float(q) for q in net_buckets.values()) if net_buckets else 0.0
+        bom_lvl = bom_level_map.get(item_id, 0)
+
+        req = MrpRequirement(
+            run_id=int(run.run_id),
+            item_id=int(item_id),
+            total_required_qty=total_gross,
+            net_required_qty=total_net,
+            covered_qty=0.0,
+            remaining_qty=total_net,
+            period_from=plan.period_from,
+            period_to=plan.period_to,
+            bom_level=bom_lvl,
+        )
+        db.add(req)
+        db.flush()
+        req_by_item[item_id] = req
+        req_count += 1
+
+        # Store per-bucket gross and net quantities for traceability
+        all_bucket_dates = sorted(set(gross_buckets) | set(net_buckets))
+        for bucket_date in all_bucket_dates:
+            gross_qty = float(gross_buckets.get(bucket_date, 0.0))
+            net_qty = float(net_buckets.get(bucket_date, 0.0)) if net_buckets else 0.0
+            if gross_qty <= 1e-9 and net_qty <= 1e-9:
+                continue
+            db.add(
+                MrpRequirementBucket(
+                    requirement_id=int(req.id),
+                    run_id=int(run.run_id),
+                    item_id=int(item_id),
+                    bucket_date=bucket_date,
+                    gross_qty=gross_qty,
+                    net_qty=net_qty,
+                )
+            )
+            bucket_count += 1
+
+    # --- Allocate PlannedPurchase / PlannedRework for non-manufactured items ---
+    allocatable_item_ids = [
+        iid for iid, buckets in net_map.items()
+        if any(float(q) > 1e-9 for q in buckets.values())
+    ]
+    purchase_count = 0
+    rework_count = 0
+    if allocatable_item_ids:
+        items_by_id: Dict[int, Item] = {
+            r.item_id: r
+            for r in db.query(Item).filter(Item.item_id.in_(allocatable_item_ids)).all()
+        }
+        # Batch-load default spec_id per item (needed for PlannedRework.spec_id)
+        spec_id_by_item: Dict[int, int] = {
+            int(ds.item_id): int(ds.spec_id)
+            for ds in db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
+            .filter(DefaultSpecification.item_id.in_(allocatable_item_ids))
+            .all()
+        }
+        for iid in allocatable_item_ids:
+            item = items_by_id.get(iid)
+            if not item:
+                continue
+            flow = classify_replenishment_flow(item.replenishment_method)
+            lead_time = int(item.replenishment_time or 0)
+            alloc_total_qty = 0.0
+
+            if flow == REPLENISHMENT_FLOW_PURCHASE:
+                for bucket_date, net_qty in sorted(net_map[iid].items()):
+                    net_qty = float(net_qty)
+                    if net_qty <= 1e-9:
+                        continue
+                    need_date = bucket_date
+                    order_date = need_date - timedelta(days=lead_time)
+                    db.add(PlannedPurchase(
+                        run_id=int(run.run_id),
+                        item_id=int(iid),
+                        requested_qty=net_qty,
+                        planned_qty=net_qty,
+                        qty=net_qty,
+                        need_date=need_date,
+                        order_date=order_date,
+                        lead_time_days=lead_time,
+                        bucket_date=need_date,
+                        supplier_ref1c=getattr(item, "supplier_ref1c", None),
+                    ))
+                    purchase_count += 1
+                    alloc_total_qty += net_qty
+
+            elif flow == REPLENISHMENT_FLOW_REWORK:
+                spec_id = spec_id_by_item.get(iid)
+                for bucket_date, net_qty in sorted(net_map[iid].items()):
+                    net_qty = float(net_qty)
+                    if net_qty <= 1e-9:
+                        continue
+                    need_date = bucket_date
+                    order_date = need_date - timedelta(days=lead_time)
+                    db.add(PlannedRework(
+                        run_id=int(run.run_id),
+                        item_id=int(iid),
+                        spec_id=spec_id,
+                        requested_qty=net_qty,
+                        planned_qty=net_qty,
+                        qty=net_qty,
+                        need_date=need_date,
+                        order_date=order_date,
+                        lead_time_days=lead_time,
+                        bucket_date=need_date,
+                        component_blocked=False,
+                        component_partial=False,
+                    ))
+                    rework_count += 1
+                    alloc_total_qty += net_qty
+
+            else:
+                continue  # manufactured — handled by create_orders_from_mrp
+
+            # Update MrpRequirement coverage for this non-manufactured item.
+            req = req_by_item.get(iid)
+            if req and alloc_total_qty > 0:
+                total_net = _to_float(req.net_required_qty)
+                req.covered_qty = min(alloc_total_qty, total_net)
+                req.remaining_qty = max(0.0, total_net - alloc_total_qty)
+
+    db.commit()
+    return {
+        "status": "ok",
+        "run_id": int(run.run_id),
+        "plan_id": int(plan.id),
+        "requirement_count": int(req_count),
+        "bucket_count": int(bucket_count),
+        "purchase_count": int(purchase_count),
+        "rework_count": int(rework_count),
+    }
+
+
+def delete_period_plan_item(db: Session, plan_id: int, item_id: int) -> Dict[str, Any]:
+    """Delete all lines for an item across all buckets of the plan. Locked lines block deletion."""
+    plan = _get_plan(db, plan_id)
+    _assert_plan_editable(plan)
+    locked = (
+        db.query(ProductionPlanLine)
+        .filter(
+            ProductionPlanLine.plan_id == int(plan.id),
+            ProductionPlanLine.item_id == int(item_id),
+            ProductionPlanLine.locked_by_run_id.isnot(None),
+        )
+        .count()
+    )
+    if locked > 0:
+        raise ValueError("Нельзя удалить номенклатуру: есть строки, зафиксированные MRP-прогоном")
+    deleted = (
+        db.query(ProductionPlanLine)
+        .filter(
+            ProductionPlanLine.plan_id == int(plan.id),
+            ProductionPlanLine.item_id == int(item_id),
+        )
+        .delete(synchronize_session=False)
+    )
+    db.commit()
+    return {"status": "ok", "plan_id": int(plan.id), "item_id": int(item_id), "deleted": int(deleted)}
+
+
+def add_item_to_period_plan(db: Session, plan_id: int, item_id: int) -> Dict[str, Any]:
+    plan = _get_plan(db, plan_id)
+    _assert_plan_editable(plan)
+    item = db.query(Item).filter(Item.item_id == int(item_id)).first()
+    if not item:
+        raise ValueError("Номенклатура не найдена")
+    first_bucket = _fridays_between(plan.period_from, plan.period_to)[0]
+    line = (
+        db.query(ProductionPlanLine)
+        .filter(
+            ProductionPlanLine.plan_id == int(plan.id),
+            ProductionPlanLine.item_id == int(item_id),
+            ProductionPlanLine.bucket_date == first_bucket,
+        )
+        .first()
+    )
+    if not line:
+        db.add(ProductionPlanLine(plan_id=int(plan.id), item_id=int(item_id), bucket_date=first_bucket, qty=0))
+        db.commit()
+    return {"status": "ok", "plan_id": int(plan.id), "item_id": int(item_id)}
+
+
+def bulk_upsert_period_plan_lines(db: Session, plan_id: int, entries: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+    plan = _get_plan(db, plan_id)
+    _assert_plan_editable(plan)
+    saved = 0
+    for entry in entries or []:
+        item_id = int(entry.get("item_id"))
+        bucket_date = _parse_date(entry.get("bucket_date") or entry.get("date"), "bucket_date")
+        qty = Decimal(str(float(entry.get("qty") or 0.0)))
+        if bucket_date < plan.period_from or bucket_date > plan.period_to:
+            raise ValueError("Дата ячейки вне периода плана")
+        line = (
+            db.query(ProductionPlanLine)
+            .filter(
+                ProductionPlanLine.plan_id == int(plan.id),
+                ProductionPlanLine.item_id == item_id,
+                ProductionPlanLine.bucket_date == bucket_date,
+            )
+            .first()
+        )
+        if line:
+            if line.locked_by_run_id is not None:
+                raise ValueError("Строка уже использована в MRP и недоступна для редактирования")
+            line.qty = qty
+        else:
+            db.add(ProductionPlanLine(plan_id=int(plan.id), item_id=item_id, bucket_date=bucket_date, qty=qty))
+        saved += 1
+    db.commit()
+    return {"status": "ok", "saved": int(saved)}
+
+
+def lock_period_plan_lines(db: Session, plan_id: int, run_id: int, line_ids: Optional[Iterable[int]] = None) -> int:
+    plan = _get_plan(db, plan_id)
+    q = db.query(ProductionPlanLine).filter(ProductionPlanLine.plan_id == int(plan.id))
+    if line_ids is not None:
+        ids = [int(x) for x in line_ids]
+        q = q.filter(ProductionPlanLine.id.in_(ids))
+    count = q.update({"locked_by_run_id": int(run_id)}, synchronize_session=False)
+    db.commit()
+    return int(count or 0)
+
+
+def get_period_plan_matrix(db: Session, plan_id: int) -> Dict[str, Any]:
+    plan = _get_plan(db, plan_id)
+    buckets = _fridays_between(plan.period_from, plan.period_to)
+    bucket_keys = [dt.isoformat() for dt in buckets]
+
+    rows = (
+        db.query(
+            Item.item_id,
+            Item.item_code,
+            Item.item_name,
+            Item.item_article,
+            ProductionPlanLine.bucket_date,
+            ProductionPlanLine.qty,
+            ProductionPlanLine.locked_by_run_id,
+        )
+        .join(Item, Item.item_id == ProductionPlanLine.item_id)
+        .filter(ProductionPlanLine.plan_id == int(plan.id))
+        .order_by(Item.item_name.asc(), Item.item_code.asc(), ProductionPlanLine.bucket_date.asc())
+        .all()
+    )
+
+    by_item: Dict[int, Dict[str, Any]] = {}
+    for row in rows:
+        item_id = int(row.item_id)
+        rec = by_item.setdefault(
+            item_id,
+            {
+                "item_id": item_id,
+                "item_code": str(row.item_code or ""),
+                "item_name": str(row.item_name or ""),
+                "item_article": str(row.item_article or "") if row.item_article else None,
+                "total_qty": 0.0,
+                "buckets": {key: 0.0 for key in bucket_keys},
+                "locked_buckets": {},
+            },
+        )
+        key = row.bucket_date.isoformat()
+        q = _to_float(row.qty)
+        rec["buckets"][key] = q
+        rec["total_qty"] = _to_float(rec["total_qty"]) + q
+        if row.locked_by_run_id is not None:
+            rec["locked_buckets"][key] = int(row.locked_by_run_id)
+
+    return {
+        "plan": _serialize_plan(plan),
+        "buckets": bucket_keys,
+        "rows": list(by_item.values()),
+        "total": len(by_item),
+    }
+
+
+def get_period_plan_execution_journal(
+    db: Session,
+    plan_id: int,
+    *,
+    run_id: Optional[int] = None,
+    bom_level: Optional[int] = None,
+    flow: Optional[str] = None,
+) -> Dict[str, Any]:
+    plan = _get_plan(db, plan_id)
+
+    if run_id is not None:
+        run = db.query(PlanningRun).filter(PlanningRun.run_id == int(run_id)).first()
+        if not run or int(run.source_plan_id or -1) != int(plan.id):
+            raise ValueError("Run not found for this plan")
+    else:
+        run = (
+            db.query(PlanningRun)
+            .filter(
+                PlanningRun.source_plan_id == int(plan.id),
+                PlanningRun.status == "FIXED_SNAPSHOT",
+            )
+            .order_by(PlanningRun.run_id.desc())
+            .first()
+        )
+        if not run:
+            raise ValueError("No FIXED_SNAPSHOT run found for this plan")
+
+    reqs_with_items = (
+        db.query(MrpRequirement, Item)
+        .join(Item, Item.item_id == MrpRequirement.item_id)
+        .filter(MrpRequirement.run_id == int(run.run_id))
+        .order_by(MrpRequirement.bom_level.asc(), Item.item_name.asc())
+        .all()
+    )
+
+    if not reqs_with_items:
+        return {
+            "plan": _serialize_plan(plan),
+            "run_id": int(run.run_id),
+            "rows": [],
+            "summary": {
+                "total_items": 0,
+                "fully_covered": 0,
+                "partially_covered": 0,
+                "not_covered": 0,
+                "net_zero": 0,
+            },
+        }
+
+    req_ids = [int(req.id) for req, _ in reqs_with_items]
+    item_ids = [int(req.item_id) for req, _ in reqs_with_items]
+
+    # Production: ProductionProduct linked via source_mrp_requirement_id
+    prod_rows = (
+        db.query(ProductionProduct, ProductionOrder)
+        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+        .filter(ProductionProduct.source_mrp_requirement_id.in_(req_ids))
+        .all()
+    )
+    prods_by_req_id: Dict[int, List[Dict[str, Any]]] = {}
+    for pp, po in prod_rows:
+        prods_by_req_id.setdefault(int(pp.source_mrp_requirement_id), []).append({
+            "type": "production_order",
+            "product_id": int(pp.product_id),
+            "order_id": int(po.order_id),
+            "order_number": str(po.order_number or ""),
+            "order_state": str(po.order_state_name or po.order_state_key or ""),
+            "qty": _to_float(pp.quantity),
+            "remaining_qty": _to_float(pp.remaining_qty),
+        })
+
+    # Purchase: PlannedPurchase by run_id + item_id
+    purchases_by_item: Dict[int, List[Dict[str, Any]]] = {}
+    for pp in (
+        db.query(PlannedPurchase)
+        .filter(PlannedPurchase.run_id == int(run.run_id), PlannedPurchase.item_id.in_(item_ids))
+        .all()
+    ):
+        purchases_by_item.setdefault(int(pp.item_id), []).append({
+            "type": "planned_purchase",
+            "purchase_id": int(pp.purchase_id),
+            "qty": _to_float(pp.qty),
+            "need_date": pp.need_date.isoformat() if pp.need_date else None,
+            "order_date": pp.order_date.isoformat() if pp.order_date else None,
+            "lead_time_days": int(pp.lead_time_days or 0),
+        })
+
+    # Rework: PlannedRework by run_id + item_id
+    reworks_by_item: Dict[int, List[Dict[str, Any]]] = {}
+    for rw in (
+        db.query(PlannedRework)
+        .filter(PlannedRework.run_id == int(run.run_id), PlannedRework.item_id.in_(item_ids))
+        .all()
+    ):
+        reworks_by_item.setdefault(int(rw.item_id), []).append({
+            "type": "planned_rework",
+            "rework_id": int(rw.rework_id),
+            "qty": _to_float(rw.qty),
+            "need_date": rw.need_date.isoformat() if rw.need_date else None,
+            "order_date": rw.order_date.isoformat() if rw.order_date else None,
+            "lead_time_days": int(rw.lead_time_days or 0),
+        })
+
+    rows: List[Dict[str, Any]] = []
+    summary = {
+        "total_items": 0,
+        "fully_covered": 0,
+        "partially_covered": 0,
+        "not_covered": 0,
+        "net_zero": 0,
+    }
+
+    for req, item in reqs_with_items:
+        item_flow = classify_replenishment_flow(getattr(item, "replenishment_method", None))
+
+        if bom_level is not None and int(req.bom_level or 0) != bom_level:
+            continue
+        if flow is not None and item_flow != flow:
+            continue
+
+        req_id = int(req.id)
+        net_qty = _to_float(req.net_required_qty)
+        covered_qty = _to_float(req.covered_qty)
+        remaining_qty = _to_float(req.remaining_qty)
+
+        if item_flow == REPLENISHMENT_FLOW_PRODUCTION:
+            work_items = prods_by_req_id.get(req_id, [])
+        elif item_flow == REPLENISHMENT_FLOW_PURCHASE:
+            work_items = purchases_by_item.get(int(req.item_id), [])
+        else:
+            work_items = reworks_by_item.get(int(req.item_id), [])
+
+        coverage_pct = round(covered_qty / net_qty * 100.0, 1) if net_qty > 1e-9 else 100.0
+
+        rows.append({
+            "req_id": req_id,
+            "item_id": int(req.item_id),
+            "item_code": str(item.item_code or ""),
+            "item_name": str(item.item_name or ""),
+            "flow": item_flow,
+            "bom_level": int(req.bom_level or 0),
+            "gross_qty": _to_float(req.total_required_qty),
+            "net_qty": net_qty,
+            "covered_qty": covered_qty,
+            "remaining_qty": remaining_qty,
+            "coverage_pct": coverage_pct,
+            "work_items": work_items,
+        })
+
+        summary["total_items"] += 1
+        if net_qty < 1e-9:
+            summary["net_zero"] += 1
+        elif remaining_qty < 1e-9:
+            summary["fully_covered"] += 1
+        elif covered_qty > 1e-9:
+            summary["partially_covered"] += 1
+        else:
+            summary["not_covered"] += 1
+
+    return {
+        "plan": _serialize_plan(plan),
+        "run_id": int(run.run_id),
+        "rows": rows,
+        "summary": summary,
+    }

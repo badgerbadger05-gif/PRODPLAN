@@ -59,6 +59,23 @@ from ..services.mrp_result_export import (
     export_rework_results_xlsx,
 )
 from ..services.one_c_purchase_order_export import export_planned_purchases_to_1c
+from ..services.period_plan_service import (
+    add_item_to_period_plan,
+    archive_period_plan,
+    bulk_upsert_period_plan_lines,
+    create_period_plan,
+    create_mrp_snapshot_from_period_plan,
+    delete_period_plan,
+    delete_period_plan_item,
+    fix_period_plan,
+    get_period_plan,
+    get_period_plan_execution_journal,
+    get_period_plan_matrix,
+    list_mrp_runs_for_plan,
+    list_period_plans,
+    unarchive_period_plan,
+    update_period_plan_header,
+)
 
 router = APIRouter(prefix="/v1/plan", tags=["plan"])
 
@@ -143,6 +160,46 @@ class ProductionReportDayCloseRequest(BaseModel):
     closed_by: Optional[str] = None
 
 
+# ===== Period plans =====
+
+
+class PeriodPlanCreateRequest(BaseModel):
+    name: str
+    period_from: str
+    period_to: str
+    created_by: Optional[str] = None
+    comment: Optional[str] = None
+
+
+class PeriodPlanLineEntry(BaseModel):
+    item_id: int
+    bucket_date: str
+    qty: float
+
+
+class PeriodPlanBulkUpsertRequest(BaseModel):
+    entries: List[PeriodPlanLineEntry] = []
+
+
+class PeriodPlanItemRequest(BaseModel):
+    item_id: int
+
+
+class PeriodPlanFixRequest(BaseModel):
+    fixed_by: Optional[str] = None
+
+
+class PeriodPlanMrpSnapshotRequest(BaseModel):
+    started_by: Optional[str] = None
+
+
+class PeriodPlanUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    period_from: Optional[str] = None
+    period_to: Optional[str] = None
+    comment: Optional[str] = None
+
+
 # ===== Forced orders (manual/override) =====
 
 
@@ -161,6 +218,198 @@ class PurchaseOrder1CExportRequest(BaseModel):
     purchase_ids: Optional[List[int]] = None
     dry_run: Optional[bool] = False
 
+
+# ===== Period plan routes =====
+
+@router.get("/period-plans")
+async def period_plans_list(
+    status: Optional[str] = None,
+    period_from: Optional[str] = None,
+    period_to: Optional[str] = None,
+    created_by: Optional[str] = None,
+    sort_by: Optional[str] = None,
+    sort_dir: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+):
+    return list_period_plans(
+        db,
+        status=status,
+        period_from=period_from,
+        period_to=period_to,
+        created_by=created_by,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.post("/period-plans")
+async def period_plans_create(
+    req: PeriodPlanCreateRequest,
+    db: Session = Depends(get_db),
+):
+    try:
+        return create_period_plan(
+            db,
+            name=req.name,
+            period_from=req.period_from,
+            period_to=req.period_to,
+            created_by=req.created_by,
+            comment=req.comment,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/period-plans/{plan_id}")
+async def period_plans_delete(plan_id: int, db: Session = Depends(get_db)):
+    try:
+        return delete_period_plan(db, plan_id)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/period-plans/{plan_id}")
+async def period_plans_get(plan_id: int, db: Session = Depends(get_db)):
+    try:
+        return get_period_plan(db, plan_id)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.get("/period-plans/{plan_id}/matrix")
+async def period_plans_matrix(plan_id: int, db: Session = Depends(get_db)):
+    try:
+        return get_period_plan_matrix(db, plan_id)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.post("/period-plans/{plan_id}/items")
+async def period_plans_add_item(
+    plan_id: int,
+    req: PeriodPlanItemRequest,
+    db: Session = Depends(get_db),
+):
+    try:
+        return add_item_to_period_plan(db, plan_id, req.item_id)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/period-plans/{plan_id}/items/{item_id}")
+async def period_plans_delete_item(
+    plan_id: int,
+    item_id: int,
+    db: Session = Depends(get_db),
+):
+    try:
+        return delete_period_plan_item(db, plan_id, item_id)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/period-plans/{plan_id}/lines/bulk_upsert")
+async def period_plans_bulk_upsert(
+    plan_id: int,
+    req: PeriodPlanBulkUpsertRequest,
+    db: Session = Depends(get_db),
+):
+    try:
+        payload = [e.model_dump() for e in (req.entries or [])]
+        return bulk_upsert_period_plan_lines(db, plan_id, payload)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/period-plans/{plan_id}/fix")
+async def period_plans_fix(
+    plan_id: int,
+    req: PeriodPlanFixRequest,
+    db: Session = Depends(get_db),
+):
+    try:
+        return fix_period_plan(db, plan_id, fixed_by=req.fixed_by)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/period-plans/{plan_id}/archive")
+async def period_plans_archive(plan_id: int, db: Session = Depends(get_db)):
+    try:
+        return archive_period_plan(db, plan_id)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/period-plans/{plan_id}/unarchive")
+async def period_plans_unarchive(plan_id: int, db: Session = Depends(get_db)):
+    try:
+        return unarchive_period_plan(db, plan_id)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.patch("/period-plans/{plan_id}")
+async def period_plans_patch(
+    plan_id: int,
+    req: PeriodPlanUpdateRequest,
+    db: Session = Depends(get_db),
+):
+    try:
+        return update_period_plan_header(
+            db,
+            plan_id,
+            name=req.name,
+            period_from=req.period_from,
+            period_to=req.period_to,
+            comment=req.comment,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/period-plans/{plan_id}/runs")
+async def period_plans_runs(
+    plan_id: int,
+    limit: int = 50,
+    db: Session = Depends(get_db),
+):
+    try:
+        return list_mrp_runs_for_plan(db, plan_id, limit=limit)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.post("/period-plans/{plan_id}/mrp-snapshot")
+async def period_plans_mrp_snapshot(
+    plan_id: int,
+    req: PeriodPlanMrpSnapshotRequest,
+    db: Session = Depends(get_db),
+):
+    try:
+        return create_mrp_snapshot_from_period_plan(db, plan_id, started_by=req.started_by or "api")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/period-plans/{plan_id}/execution-journal")
+async def period_plans_execution_journal(
+    plan_id: int,
+    run_id: Optional[int] = None,
+    bom_level: Optional[int] = None,
+    flow: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    try:
+        return get_period_plan_execution_journal(
+            db, plan_id, run_id=run_id, bom_level=bom_level, flow=flow
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/matrix")

@@ -656,6 +656,48 @@ class PlanningConfigVersion(Base):
     created_at = Column(TIMESTAMP, default=func.now())
 
 
+class ProductionPlanHeader(Base):
+    __tablename__ = "production_plan_header"
+    __table_args__ = (
+        CheckConstraint("period_to >= period_from", name="ck_production_plan_header_period"),
+        CheckConstraint("status in ('draft', 'fixed', 'archived')", name="ck_production_plan_header_status"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(255), nullable=False, index=True)
+    period_from = Column(Date, nullable=False, index=True)
+    period_to = Column(Date, nullable=False, index=True)
+    status = Column(String(20), nullable=False, default="draft", index=True)
+    comment = Column(TEXT, nullable=True)
+    created_by = Column(String(100), nullable=True)
+    fixed_by = Column(String(100), nullable=True)
+    fixed_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now(), nullable=False)
+
+    lines = relationship("ProductionPlanLine", back_populates="plan", cascade="all, delete-orphan")
+
+
+class ProductionPlanLine(Base):
+    __tablename__ = "production_plan_line"
+    __table_args__ = (
+        UniqueConstraint("plan_id", "item_id", "bucket_date", name="ux_production_plan_line_plan_item_bucket"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    plan_id = Column(Integer, ForeignKey("production_plan_header.id", ondelete="CASCADE"), nullable=False, index=True)
+    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
+    bucket_date = Column(Date, nullable=False, index=True)
+    qty = Column(DECIMAL(15, 3), nullable=False, default=0.0)
+    locked_by_run_id = Column(Integer, ForeignKey("planning_run.run_id", ondelete="SET NULL"), nullable=True, index=True)
+    created_at = Column(TIMESTAMP, default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now(), nullable=False)
+
+    plan = relationship("ProductionPlanHeader", back_populates="lines")
+    item = relationship("Item")
+    locked_by_run = relationship("PlanningRun", foreign_keys=[locked_by_run_id])
+
+
 class PlanningRun(Base):
     __tablename__ = "planning_run"
 
@@ -671,6 +713,11 @@ class PlanningRun(Base):
     config_snapshot = Column(CrossPlatformJSON, nullable=False)
     warnings = Column(CrossPlatformJSON, nullable=True)
     kpi = Column(CrossPlatformJSON, nullable=True)
+    # Period plan link
+    source_plan_id = Column(Integer, ForeignKey("production_plan_header.id", ondelete="SET NULL"), nullable=True, index=True)
+    period_from = Column(Date, nullable=True, index=True)
+    period_to = Column(Date, nullable=True, index=True)
+    fixed_at = Column(TIMESTAMP, nullable=True)
 
 
 class PlannedOrder(Base):
@@ -740,6 +787,51 @@ class PlannedRework(Base):
     component_blocked = Column(Boolean, nullable=False, default=False)
     component_partial = Column(Boolean, nullable=False, default=False)
     shortage = Column(CrossPlatformJSON, nullable=True)
+
+
+class MrpRequirement(Base):
+    __tablename__ = "mrp_requirement"
+    __table_args__ = (
+        UniqueConstraint("run_id", "item_id", name="ux_mrp_requirement_run_item"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(Integer, ForeignKey("planning_run.run_id", ondelete="CASCADE"), nullable=False, index=True)
+    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
+    total_required_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0)
+    net_required_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0)
+    covered_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0)
+    remaining_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0)
+    period_from = Column(Date, nullable=False, index=True)
+    period_to = Column(Date, nullable=False, index=True)
+    bom_level = Column(Integer, nullable=False, default=0)
+    created_at = Column(TIMESTAMP, default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now(), nullable=False)
+
+    run = relationship("PlanningRun")
+    item = relationship("Item")
+    buckets = relationship("MrpRequirementBucket", back_populates="requirement", cascade="all, delete-orphan")
+
+
+class MrpRequirementBucket(Base):
+    __tablename__ = "mrp_requirement_bucket"
+    __table_args__ = (
+        UniqueConstraint("requirement_id", "bucket_date", name="ux_mrp_requirement_bucket_req_date"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    requirement_id = Column(Integer, ForeignKey("mrp_requirement.id", ondelete="CASCADE"), nullable=False, index=True)
+    run_id = Column(Integer, ForeignKey("planning_run.run_id", ondelete="CASCADE"), nullable=False, index=True)
+    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
+    bucket_date = Column(Date, nullable=False, index=True)
+    gross_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0)
+    net_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0)
+    created_at = Column(TIMESTAMP, default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now(), nullable=False)
+
+    requirement = relationship("MrpRequirement", back_populates="buckets")
+    run = relationship("PlanningRun")
+    item = relationship("Item")
 
 
 class CapacityLoad(Base):
