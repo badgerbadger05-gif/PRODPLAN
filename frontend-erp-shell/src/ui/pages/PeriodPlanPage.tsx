@@ -226,13 +226,13 @@ function PeriodPlanListView({ onOpenPlan }: ListViewProps) {
   return (
     <main className="workArea">
       <div className="topLine">
-        <div className="breadcrumbs">Планирование / Период план</div>
+        <div className="breadcrumbs">Планирование / Планирование выпуска</div>
         <div className="runBadge">Планов: {total}</div>
       </div>
 
       <DocumentWindow
-        title="Период план"
-        subtitle="Список периодических планов производства"
+        title="Планирование выпуска"
+        subtitle="Список планов производства на выбранный период"
         hotkeys="F5 Обновить · Enter Открыть"
         footer={(
           <StatusBar
@@ -896,7 +896,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   return (
     <main className="workArea">
       <div className="topLine">
-        <div className="breadcrumbs">Планирование / Период план / {planTitle}</div>
+        <div className="breadcrumbs">Планирование / Планирование выпуска / {planTitle}</div>
         {plan && <div className="runBadge">{periodPlanStatusLabel(plan.status)}</div>}
       </div>
 

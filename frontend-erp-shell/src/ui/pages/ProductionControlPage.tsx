@@ -43,6 +43,12 @@ export function ProductionControlPage() {
   const [warehouses, setWarehouses] = useState<ControlWarehouse[]>([])
   const [workshopRows, setWorkshopRows] = useState<WorkshopWarehouse[]>([])
   const [ignoredRefs, setIgnoredRefs] = useState<Set<string>>(new Set())
+  const [produceOpen, setProduceOpen] = useState(false)
+  const [produceQty, setProduceQty] = useState('')
+  const [producePerformer, setProducePerformer] = useState('')
+  const [produceDryRun, setProduceDryRun] = useState(false)
+  const [produceSaving, setProduceSaving] = useState(false)
+  const [produceDryRunPayload, setProduceDryRunPayload] = useState<string | null>(null)
 
   useEffect(() => {
     filtersRef.current = filters
@@ -196,6 +202,153 @@ export function ProductionControlPage() {
     }
   }
 
+  async function exportTo1C() {
+    if (!selectedIds.size) return
+    setLoading(true)
+    setError('')
+    setMessage('')
+    try {
+      const result = await api<Record<string, unknown>>('/v1/production-control/orders/export-to-1c', {
+        method: 'POST',
+        body: JSON.stringify({ product_ids: Array.from(selectedIds) }),
+      })
+      const created = Number(result.created ?? 0)
+      const skipped = Number(result.skipped ?? 0)
+      const errors = Number(result.errors ?? 0)
+      setMessage(`Экспорт в 1С: создано ${created}${skipped ? `, пропущено ${skipped}` : ''}${errors ? `, ошибок ${errors}` : ''}`)
+      setSelectedIds(new Set())
+      await load(offsetRef.current)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function syncFrom1C() {
+    setLoading(true)
+    setError('')
+    setMessage('')
+    try {
+      const body = selectedIds.size ? { product_ids: Array.from(selectedIds) } : {}
+      const result = await api<Record<string, unknown>>('/v1/production-control/orders/sync-from-1c', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      })
+      const checked = Number(result.checked ?? 0)
+      const updated = Number(result.updated_to_assembled ?? 0)
+      const errors = Array.isArray(result.errors) ? result.errors.length : 0
+      setMessage(`Синхронизация: проверено ${checked}, обновлено ${updated}${errors ? `, ошибок ${errors}` : ''}`)
+      if (updated > 0) {
+        setSelectedIds(new Set())
+        await load(offsetRef.current)
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  function openProduceDialog() {
+    if (!activeRow) return
+    setProduceQty(String(activeRow.remaining_qty ?? activeRow.quantity ?? 0))
+    setProducePerformer('')
+    setProduceDryRun(false)
+    setProduceDryRunPayload(null)
+    setProduceOpen(true)
+  }
+
+  async function submitProduce() {
+    if (!activeRow) return
+    setProduceSaving(true)
+    setError('')
+    try {
+      const result = await api<Record<string, unknown>>(
+        `/v1/production-control/orders/${activeRow.product_id}/produce-to-1c`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            qty: Number(produceQty) || 0,
+            performer: producePerformer || '',
+            dry_run: produceDryRun,
+          }),
+        },
+      )
+      if (result.status === 'dry_run') {
+        setProduceDryRunPayload(
+          JSON.stringify({ assembly: result.assembly_payload, piecework: result.piecework_payload }, null, 2),
+        )
+      } else if (result.status === 'created') {
+        setMessage(
+          `Произведено: ${result.new_produced_qty}, осталось: ${result.new_remaining_qty}. СборкаЗапасов: ${String(result.assembly_ref1c ?? '').slice(0, 8)}...`,
+        )
+        setProduceOpen(false)
+        setSelectedIds(new Set())
+        await load(offsetRef.current)
+      } else {
+        setError(String(result.error ?? 'Неизвестная ошибка'))
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setProduceSaving(false)
+    }
+  }
+
+  async function fillRemaining(runId: number, requirementId: number) {
+    setLoading(true)
+    setError('')
+    setMessage('')
+    try {
+      const result = await api<Record<string, unknown>>('/v1/production-control/orders/from-mrp', {
+        method: 'POST',
+        body: JSON.stringify({ run_id: runId, planned_order_ids: [requirementId] }),
+      })
+      const created = Number(result.created_count ?? (Array.isArray(result.created) ? result.created.length : 0))
+      const existing = Number(result.existing_count ?? (Array.isArray(result.existing) ? result.existing.length : 0))
+      setMessage(`Досоздано: новых ${created}, уже было ${existing}`)
+      await load(offsetRef.current)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function saveOptimalBatch(itemId: number, value: number | null) {
+    const item = await api<Record<string, unknown>>(`/v1/items/${itemId}`)
+    await api(`/v1/items/${itemId}`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        item_code: String(item.item_code ?? ''),
+        item_name: String(item.item_name ?? ''),
+        item_article: item.item_article ?? null,
+        item_ref1c: item.item_ref1c ?? null,
+        supplier_ref1c: item.supplier_ref1c ?? null,
+        replenishment_time: item.replenishment_time ?? null,
+        unit: item.unit ?? null,
+        category_id: item.category_id ?? null,
+        stock_qty: Number(item.stock_qty ?? 0),
+        optimal_batch: value,
+        status: String(item.status ?? 'active'),
+      }),
+    })
+    setRows((list) => list.map((row) => row.item_id === itemId ? { ...row, optimal_batch: value } : row))
+  }
+
+  async function saveOrderQuantity(productId: number, value: number) {
+    const result = await api<{ quantity: number; remaining_qty: number }>(`/v1/production-control/orders/${productId}/quantity`, {
+      method: 'PATCH',
+      body: JSON.stringify({ quantity: value }),
+    })
+    setRows((list) => list.map((row) => row.product_id === productId ? {
+      ...row,
+      quantity: Number(result.quantity ?? value),
+      remaining_qty: Number(result.remaining_qty ?? value),
+    } : row))
+  }
+
   function printRows(ids: number[]) {
     if (!ids.length) return
     window.open(`/api/v1/production-control/route-sheets/print?product_ids=${ids.join(',')}`, '_blank')
@@ -244,6 +397,9 @@ export function ProductionControlPage() {
           selectedIds={selectedIds}
           loading={loading}
           onStartSelected={() => void startSelected()}
+          onExportTo1C={() => void exportTo1C()}
+          onSyncFrom1C={() => void syncFrom1C()}
+          onProduce={() => openProduceDialog()}
           onPrintSelected={() => printRows(Array.from(selectedIds))}
           onCreateMaterialIssues={() => void createMaterialIssues()}
           onLoadMaterials={() => activeRow && void loadMaterials(activeRow)}
@@ -290,10 +446,61 @@ export function ProductionControlPage() {
               coverageLabels={coverageLabels}
               onLoadMaterials={() => activeRow && void loadMaterials(activeRow)}
               onPrint={() => activeRow && printRows([activeRow.product_id])}
+              onOptimalBatchSave={(itemId, value) => saveOptimalBatch(itemId, value)}
+              onQuantitySave={(productId, value) => saveOrderQuantity(productId, value)}
+              onFillRemaining={(sourceRunId, requirementId) => fillRemaining(sourceRunId, requirementId)}
             />
           )}
         </div>
       </DocumentWindow>
+
+      {produceOpen && activeRow && (
+        <div className="dialogOverlay" onClick={(e) => { if (e.target === e.currentTarget) setProduceOpen(false) }}>
+          <div className="dialogBox">
+            <div className="dialogHeader">Произвести - {activeRow.item_name}</div>
+            <div className="dialogBody">
+              <div className="dialogField">
+                <label>Количество ({activeRow.unit || 'шт'})</label>
+                <input
+                  type="number"
+                  min={0}
+                  step={1}
+                  value={produceQty}
+                  onChange={(e) => setProduceQty(e.target.value)}
+                  disabled={produceSaving}
+                />
+              </div>
+              <div className="dialogField">
+                <label>Исполнитель (имя, войдёт в комментарий)</label>
+                <input
+                  type="text"
+                  value={producePerformer}
+                  onChange={(e) => setProducePerformer(e.target.value)}
+                  placeholder="Иванов И.И."
+                  disabled={produceSaving}
+                />
+              </div>
+              <div className="dialogCheckRow">
+                <input
+                  type="checkbox"
+                  id="produceDryRun"
+                  checked={produceDryRun}
+                  onChange={(e) => { setProduceDryRun(e.target.checked); setProduceDryRunPayload(null) }}
+                  disabled={produceSaving}
+                />
+                <label htmlFor="produceDryRun">dry_run - показать payload, не отправлять в 1С</label>
+              </div>
+              {produceDryRunPayload && <div className="dialogPreview">{produceDryRunPayload}</div>}
+            </div>
+            <div className="dialogFooter">
+              <button onClick={() => setProduceOpen(false)} disabled={produceSaving}>Отмена</button>
+              <button className="primary" onClick={() => void submitProduce()} disabled={produceSaving}>
+                {produceSaving ? 'Создаём...' : produceDryRun ? 'Показать payload' : 'Создать в 1С'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </main>
   )
 }

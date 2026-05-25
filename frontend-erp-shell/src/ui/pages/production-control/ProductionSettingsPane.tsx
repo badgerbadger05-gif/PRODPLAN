@@ -50,34 +50,36 @@ export function ProductionSettingsPane({
         <button onClick={onClose}>Закрыть</button>
       </div>
 
-      <div className="settingsBlock">
+      <div className="settingsBlock settingsWorkshopBlock">
         <h3>Склады получатели по участкам</h3>
-        <table className="miniSettingsTable">
-          <thead>
-            <tr>
-              <th>Участок</th>
-              <th>Склад получатель</th>
-            </tr>
-          </thead>
-          <tbody>
-            {resources.map((resource) => (
-              <tr key={resource.resource_id}>
-                <td>{resource.resource_name}</td>
-                <td>
-                  <select value={byResource.get(resource.resource_id) ?? ''} onChange={(e) => setWorkshopWarehouse(resource.resource_id, e.target.value)}>
-                    <option value="">Не назначен</option>
-                    {warehouses.map((warehouse) => (
-                      <option key={warehouse.warehouse_ref1c} value={warehouse.warehouse_ref1c}>{warehouseLabel(warehouse)}</option>
-                    ))}
-                  </select>
-                </td>
+        <div className="settingsTableScroll">
+          <table className="miniSettingsTable">
+            <thead>
+              <tr>
+                <th>Участок</th>
+                <th>Склад получатель</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {resources.map((resource) => (
+                <tr key={resource.resource_id}>
+                  <td>{resource.resource_name}</td>
+                  <td>
+                    <select value={byResource.get(resource.resource_id) ?? ''} onChange={(e) => setWorkshopWarehouse(resource.resource_id, e.target.value)}>
+                      <option value="">Не назначен</option>
+                      {warehouses.map((warehouse) => (
+                        <option key={warehouse.warehouse_ref1c} value={warehouse.warehouse_ref1c}>{warehouseLabel(warehouse)}</option>
+                      ))}
+                    </select>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       </div>
 
-      <div className="settingsBlock">
+      <div className="settingsBlock settingsIgnoredBlock">
         <h3>Игнорируемые склады</h3>
         <div className="settingsWarehouseList">
           {warehouses.map((warehouse) => (

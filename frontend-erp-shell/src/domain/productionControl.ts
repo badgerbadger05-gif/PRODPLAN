@@ -1,5 +1,6 @@
 export type OrderRow = {
   product_id: number
+  item_id?: number | null
   order_number: string
   order_date?: string | null
   line_number?: number | string | null
@@ -21,6 +22,15 @@ export type OrderRow = {
   planned_finish_date?: string | null
   route_sheet_printed_at?: string | null
   comment?: string | null
+  optimal_batch?: number | null
+  source?: string | null
+  source_run_id?: number | null
+  source_planned_order_id?: number | null
+  source_mrp_requirement_id?: number | null
+  source_mrp_allocation_key?: string | null
+  mrp_req_net_qty?: number | null
+  mrp_req_covered_qty?: number | null
+  mrp_req_remaining_qty?: number | null
 }
 
 export type MaterialRow = {

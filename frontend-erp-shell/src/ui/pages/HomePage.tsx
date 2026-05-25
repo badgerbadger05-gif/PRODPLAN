@@ -8,8 +8,8 @@ import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
 
 type SectionId =
+  | 'period-plan'
   | 'production-control'
-  | 'production-plan-quarter'
   | 'production-report-week'
   | 'mrp-runs'
   | 'resources'
@@ -91,8 +91,8 @@ export function HomePage({ onNavigate }: Props) {
           <section className="homePanel">
             <h2>Рабочие разделы</h2>
             <div className="homeActions">
-              <button className="primary" onClick={() => onNavigate('production-control')}>Журнал заказов</button>
-              <button onClick={() => onNavigate('production-plan-quarter')}>План выпуска</button>
+              <button className="primary" onClick={() => onNavigate('period-plan')}>Планирование выпуска</button>
+              <button onClick={() => onNavigate('production-control')}>Журнал заказов</button>
               <button onClick={() => onNavigate('production-report-week')}>Выпуск недельный</button>
               <button onClick={() => onNavigate('mrp-runs')}>MRP прогоны</button>
               <button onClick={() => onNavigate('sync')}>Синхронизация</button>
@@ -100,19 +100,6 @@ export function HomePage({ onNavigate }: Props) {
               <button onClick={() => onNavigate('stage-distribution')}>Распределение этапов</button>
               <button onClick={() => onNavigate('specification')}>Спецификации</button>
             </div>
-          </section>
-
-          <section className="homePanel">
-            <h2>Что перенесено</h2>
-            <table className="miniStatusTable">
-              <tbody>
-                <tr><td>План выпуска</td><td><span className="pill ready">работает</span></td></tr>
-                <tr><td>Отчёт выпуска</td><td><span className="pill ready">работает</span></td></tr>
-                <tr><td>MRP</td><td><span className="pill ready">работает</span></td></tr>
-                <tr><td>Синхронизация</td><td><span className="pill ready">работает</span></td></tr>
-                <tr><td>Ресурсы</td><td><span className="pill partial">просмотр</span></td></tr>
-              </tbody>
-            </table>
           </section>
         </div>
       </DocumentWindow>

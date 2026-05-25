@@ -6,6 +6,9 @@ type Props = {
   selectedIds: Set<number>
   loading: boolean
   onStartSelected: () => void
+  onExportTo1C: () => void
+  onSyncFrom1C: () => void
+  onProduce: () => void
   onPrintSelected: () => void
   onCreateMaterialIssues: () => void
   onLoadMaterials: () => void
@@ -21,6 +24,9 @@ export function ProductionCommandBar({
   selectedIds,
   loading,
   onStartSelected,
+  onExportTo1C,
+  onSyncFrom1C,
+  onProduce,
   onPrintSelected,
   onCreateMaterialIssues,
   onLoadMaterials,
@@ -31,7 +37,11 @@ export function ProductionCommandBar({
 }: Props) {
   return (
     <div className="commandBar">
-      <button className="primary" onClick={onStartSelected} disabled={!selectedIds.size || loading}>Запустить в 1С</button>
+      <button className="primary" onClick={onStartSelected} disabled={!selectedIds.size || loading} title="Создать ЗаказНаПроизводство в 1С">Запустить в 1С</button>
+      <button onClick={onExportTo1C} disabled={!selectedIds.size || loading} title="Экспортировать выбранные строки в 1С">Экспорт в 1С</button>
+      <button onClick={onSyncFrom1C} disabled={loading} title="Проверить статусы в 1С">Синхронизировать</button>
+      <button onClick={onProduce} disabled={!activeRow || loading} title="Создать выпуск в 1С">Произвести</button>
+      <div className="barSeparator" />
       <button onClick={onPrintSelected} disabled={!selectedIds.size}>Печать маршрутных</button>
       <button onClick={onCreateMaterialIssues} disabled={!selectedIds.size || loading}>Выдача материалов</button>
       <button onClick={onLoadMaterials} disabled={!activeRow}>Материалы</button>

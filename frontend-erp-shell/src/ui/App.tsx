@@ -4,20 +4,18 @@ import { MrpResultPage } from './pages/MrpResultPage'
 import { MrpRunsPage } from './pages/MrpRunsPage'
 import { PeriodPlanPage } from './pages/PeriodPlanPage'
 import { ProductionControlPage } from './pages/ProductionControlPage'
-import { ProductionPlanQuarterPage } from './pages/ProductionPlanQuarterPage'
 import { ProductionReportWeekPage } from './pages/ProductionReportWeekPage'
 import { ResourcesPage } from './pages/ResourcesPage'
 import { SpecificationPage } from './pages/SpecificationPage'
 import { StageDistributionPage } from './pages/StageDistributionPage'
 import { SyncPage } from './pages/SyncPage'
 
-type SectionId = 'home' | 'period-plan' | 'production-control' | 'production-plan-quarter' | 'production-report-week' | 'mrp-runs' | 'mrp-result' | 'resources' | 'stage-distribution' | 'specification' | 'sync'
+type SectionId = 'home' | 'period-plan' | 'production-control' | 'production-report-week' | 'mrp-runs' | 'mrp-result' | 'resources' | 'stage-distribution' | 'specification' | 'sync'
 
 const sections: Array<{ id: SectionId; title: string }> = [
   { id: 'home', title: 'Главная' },
-  { id: 'period-plan', title: 'Период план' },
+  { id: 'period-plan', title: 'Планирование выпуска' },
   { id: 'production-control', title: 'Журнал заказов' },
-  { id: 'production-plan-quarter', title: 'План выпуска' },
   { id: 'production-report-week', title: 'Выпуск недельный' },
   { id: 'mrp-runs', title: 'MRP прогоны' },
   { id: 'resources', title: 'Ресурсы' },
@@ -59,7 +57,6 @@ export function App() {
       {section === 'home' && <HomePage onNavigate={setSection} />}
       {section === 'period-plan' && <PeriodPlanPage />}
       {section === 'production-control' && <ProductionControlPage />}
-      {section === 'production-plan-quarter' && <ProductionPlanQuarterPage />}
       {section === 'production-report-week' && <ProductionReportWeekPage />}
       {section === 'mrp-runs' && <MrpRunsPage onOpenRun={openRun} />}
       {section === 'mrp-result' && activeRun && <MrpResultPage runId={activeRun.run_id} onBack={() => setSection('mrp-runs')} />}

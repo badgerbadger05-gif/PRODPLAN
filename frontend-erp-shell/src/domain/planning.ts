@@ -4,6 +4,12 @@ export type PlanningRunRow = {
   started_at: string | null
   finished_at: string | null
   horizon_days?: number | null
+  source_plan_id?: number | null
+  source_plan_name?: string | null
+  period_from?: string | null
+  period_to?: string | null
+  requirement_count?: number | null
+  requirement_remaining_qty?: number | null
   order_count?: number | null
   purchase_count?: number | null
   overload_buckets?: number | null
@@ -39,11 +45,16 @@ export type MrpSummary = {
 
 export type MrpProductionRow = {
   order_id: number
+  requirement_id?: number
   item_id: number
   item_name?: string | null
   item_article?: string | null
   unit?: string | null
   qty: number
+  requested_qty?: number | null
+  planned_qty?: number | null
+  covered_qty?: number | null
+  remaining_qty?: number | null
   need_date?: string | null
   start_date?: string | null
   finish_date?: string | null

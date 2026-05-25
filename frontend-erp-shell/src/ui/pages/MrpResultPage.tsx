@@ -120,8 +120,9 @@ export function MrpResultPage({ runId, onBack }: Props) {
         date_to: dateTo || undefined,
         planned_order_ids: Array.from(selectedProductionIds),
       })
-      setMessage(formatActionResult('Создание заказов', result))
       setSelectedProductionIds(new Set())
+      await load(dateFrom, dateTo)
+      setMessage(formatActionResult('Создание заказов', result))
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -288,6 +289,10 @@ function rowOrderIds(row: MrpProductionRow) {
   return row.source_order_ids?.length ? row.source_order_ids : [row.order_id]
 }
 
+function isProductionRowSelectable(row: MrpProductionRow) {
+  return Number(row.qty || 0) > 0
+}
+
 function rowPurchaseIds(row: MrpPurchaseRow) {
   return row.source_purchase_ids?.length ? row.source_purchase_ids : [row.purchase_id]
 }
@@ -297,7 +302,7 @@ function ProductionResultTable({ rows, selectedIds, onSelectedIdsChange }: {
   selectedIds: Set<number>
   onSelectedIdsChange: (ids: Set<number>) => void
 }) {
-  const visibleIds = rows.flatMap(rowOrderIds)
+  const visibleIds = rows.filter(isProductionRowSelectable).flatMap(rowOrderIds)
   const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id))
 
   return (
@@ -329,6 +334,7 @@ function ProductionResultTable({ rows, selectedIds, onSelectedIdsChange }: {
               <input
                 type="checkbox"
                 checked={rowOrderIds(row).every((id) => selectedIds.has(id))}
+                disabled={!isProductionRowSelectable(row)}
                 onChange={(e) => onSelectedIdsChange(toggleMany(selectedIds, rowOrderIds(row), e.target.checked))}
                 aria-label={`Выбрать ${row.item_name || row.item_article || row.order_id}`}
               />
