@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from ..database import get_db
 from ..schemas import ODataSyncRequest
 from ..services.one_c_manufacture_export import export_manufactures_to_1c
+from ..services.one_c_piecework_export import export_piecework_to_1c
 from ..services.one_c_posted_transfer_sync import sync_posted_transfers
 from ..services.one_c_production_order_export import export_production_orders_to_1c
 from ..services.one_c_stock_transfer_export import export_material_issues_to_1c
@@ -84,6 +85,18 @@ class ProduceLinePayload(BaseModel):
 
 class ExportManufacturesPayload(BaseModel):
     manufacture_ids: List[int]
+    dry_run: bool = True
+    allow_production: bool = False
+
+
+class ExportPieceworkPayload(BaseModel):
+    manufacture_ids: List[int]
+    operation_ref: str
+    time_norm: float = 0.0
+    price: float = 0.0
+    organization_ref: Optional[str] = None
+    structural_unit_ref: Optional[str] = None
+    business_operation_ref: Optional[str] = None
     dry_run: bool = True
     allow_production: bool = False
 
@@ -213,6 +226,44 @@ def post_export_manufactures_to_1c(
         return export_manufactures_to_1c(
             db,
             [int(x) for x in payload.manufacture_ids],
+            dry_run=bool(payload.dry_run),
+            allow_production=bool(payload.allow_production),
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/manufactures/export-piecework-to-1c", response_model=dict)
+def post_export_piecework_to_1c(
+    payload: ExportPieceworkPayload,
+    db: Session = Depends(get_db),
+):
+    """
+    Bulk-экспорт выпусков в 1С как Document_СдельныйНаряд (Posted=false).
+    Идемпотентно через sync_link (source_doctype='piecework').
+
+    Требование: каждый manufacture должен быть уже выгружен как
+    Document_СборкаЗапасов (поле exported_ref1c заполнено) — он используется
+    как ДокументОснование сдельного наряда.
+    """
+    if not payload.manufacture_ids:
+        raise HTTPException(status_code=400, detail="Не выбраны выпуски")
+    if not payload.operation_ref:
+        raise HTTPException(status_code=400, detail="Не указан operation_ref")
+    try:
+        return export_piecework_to_1c(
+            db,
+            [int(x) for x in payload.manufacture_ids],
+            operation_ref=payload.operation_ref,
+            time_norm=float(payload.time_norm),
+            price=float(payload.price),
+            organization_ref=payload.organization_ref,
+            structural_unit_ref=payload.structural_unit_ref,
+            business_operation_ref=payload.business_operation_ref,
             dry_run=bool(payload.dry_run),
             allow_production=bool(payload.allow_production),
         )
