@@ -1,4 +1,4 @@
-services:
+﻿services:
   db:
     image: postgres:15
     restart: unless-stopped
@@ -9,16 +9,19 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "${POSTGRES_HOST_PORT:-55432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U prodplan -d prodplan"]
       interval: 10s
       timeout: 5s
       retries: 10
       start_period: 10s
-  
+
   backend:
-    build: ./backend
+    build:
+      context: ./backend
+      args:
+        INSTALL_DEV: "true"
     restart: unless-stopped
     environment:
       DATABASE_URL: postgresql://prodplan:password@db:5432/prodplan
@@ -29,6 +32,8 @@ services:
       - "8000:8000"
     volumes:
       - ./backend:/app
+      - ./backend:/app/backend:ro
+      - ./tests:/app/tests:ro
       - ./config:/app/config
       - ./output:/app/output
     extra_hosts:
@@ -40,25 +45,43 @@ services:
       timeout: 5s
       retries: 10
       start_period: 15s
-  
+
   frontend:
-    build: ./frontend
+    build: ./frontend-erp-shell
     restart: unless-stopped
-    environment:
-      API_URL: http://localhost:8000/api
     depends_on:
       backend:
         condition: service_healthy
     ports:
       - "9000:80"
-    volumes:
-      - ./frontend/config:/app/config
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
       start_period: 10s
-  
+
 volumes:
   postgres_data:
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Note about the legacy `prodplan_default` Docker network
+# ───────────────────────────────────────────────────────────────────────────────
+# The project was previously rooted at C:\prodplan and produced a docker-compose
+# stack named `prodplan_*` (network `prodplan_default`, db container `prodplan-db-1`).
+#
+# After moving the repo to C:\prodplan-erp this stack creates new containers
+# (`prodplan-erp-*`) on a new isolated network `prodplan-erp_default`. The legacy
+# DB still holds production-like data (~11k items, real specs, planning history),
+# while the local `db` service here starts empty.
+#
+# Until the data is migrated, the backend container is manually attached to BOTH
+# networks so that its `db` hostname resolves to the legacy populated database:
+#
+#   docker network connect --alias backend prodplan-erp_default prodplan-erp-backend-1
+#   docker network connect prodplan_default prodplan-erp-backend-1
+#
+# When you're ready to retire the legacy stack run scripts/migrate_legacy_db.sh
+# (it dumps prodplan-db-1, wipes prodplan-erp-db-1, and restores). After that
+# the backend can stay on `prodplan-erp_default` only and the legacy containers
+# can be stopped and removed.

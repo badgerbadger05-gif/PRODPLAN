@@ -21,6 +21,35 @@
 
 ## Последняя сессия
 
+**2026-05-25 — Period Plan в ERP-shell доведён до целевой логики:**
+
+1) Бэкенд (`backend/app/routers/plan.py`, `backend/app/services/period_plan_service.py`):
+   - `DELETE /v1/plan/period-plans/{id}` (нельзя если есть SUCCESS MRP-прогоны по плану),
+   - `DELETE /v1/plan/period-plans/{id}/items/{item_id}` (удаление строки матрицы; блокируется при locked-ячейках),
+   - `POST /v1/plan/period-plans/{id}/unarchive`, `PATCH /v1/plan/period-plans/{id}` (rename / период / comment — только draft),
+   - `GET /v1/plan/period-plans/{id}/runs` — история MRP-прогонов по `source_plan_id`,
+   - `GET /v1/plan/period-plans` — фильтры `status`/`period_from`/`period_to`/`created_by`, сортировка `sort_by`/`sort_dir`.
+
+2) Фронтенд (`frontend-erp-shell/src/ui/pages/PeriodPlanPage.tsx`):
+   - Полноценное окно вместо split/модалки — клик по строке плана заменяет список на детальное окно (паттерн `MrpRunsPage → MrpResultPage`).
+   - Список: фильтры по статусу/периоду/автору, сортировка по колонкам, дополнительные колонки `comment` / `created_by` / `created_at` / `line_count`, архивные планы тусклые.
+   - Создание плана: поле `comment`, валидация `period_to ≥ period_from`, подсказка о пятницах, автофокус на названии.
+   - Подбор номенклатуры в матрице — search-as-you-type через `/v1/nomenclature/search`, выпадающий список с подсветкой, навигация `↑/↓`, выбор по `Enter`, автофокус на инпуте при открытии черновика.
+   - Матрица: Tab/Enter/стрелки навигация между ячейками, двойной клик копирует значение по строке, кнопка `≡` равномерно разносит итого по доступным неделям, итоги по колонкам в `<tfoot>`, locked-ячейки помечены штриховкой, dirty-ячейки подсвечены жёлтым.
+   - Журнал: дропдаун выбора прогона (MRP-runs), фильтры по `BOM level` / покрытию, сортируемые колонки, экспорт в CSV.
+   - Шапка плана редактируется в режиме «Изменить шапку» (для draft).
+   - Хоткеи: Esc возвращает к списку, F5 обновляет, Enter в списке открывает выбранный план.
+
+3) Инфраструктура:
+   - `frontend-erp-shell/nginx.conf` — `proxy_pass http://backend:8000;` без trailing slash (бэкенд монтирует `/api` префикс).
+   - `frontend-erp-shell/Dockerfile` и `nginx.conf` — UTF-8 без BOM, иначе nginx падает на парсинге.
+   - `backend/.dockerignore` — `!requirements.txt` исключение из общего `*.txt`.
+   - Бэкенд-контейнер вручную подключён к двум сетям (`prodplan-erp_default` и legacy `prodplan_default`), чтобы достучаться до populated DB `prodplan-db-1`. Скрипт миграции — `scripts/migrate_legacy_db.sh`, комментарий с инструкциями — в `docker-compose.yml`. После миграции legacy-стек можно потушить.
+
+4) Контракт фичи зафиксирован в [`.docs/period_plan_target.md`](.docs/period_plan_target.md).
+
+5) Проверка: `npm run build` во `frontend-erp-shell` — успешно; ручной smoke в браузере на `http://localhost:9000` — список открывается, фильтры работают, создание плана с автооткрытием, search-as-you-type, добавление номенклатуры, удаление строки, фиксация, MRP-снимок, журнал с фильтрами и экспортом.
+
 **2026-05-19 — исправлена выгрузка заказов поставщикам и добавлены галочки выбора строк для выгрузок MRP:**
 
 1) Закупки:
@@ -904,3 +933,215 @@ MVP-2:
 - В журнал заказов добавлены фильтр по участку, настройки складов, выдача материалов, материалы, печать маршрутных и запуск в 1С.
 - В ресурсах добавлены создание/сохранение участка и привязки видов производства; опасное удаление участков намеренно не перенесено.
 - Проверка: `npm run build` в `frontend-erp-shell` — успешно; browser smoke-test ключевых экранов — без console errors.
+
+---
+
+## 2026-05-23 — hard split cleanup (next-erp)
+
+- Legacy Quasar frontend (`frontend/`) полностью удален из ветки `next-erp`.
+- Docker frontend service переведен на `frontend-erp-shell`.
+- Добавлены `frontend-erp-shell/Dockerfile`, `frontend-erp-shell/nginx.conf`, `frontend-erp-shell/.dockerignore`.
+- Обновлены базовые документы архитектуры и правил: `.docs/ai.md`, `.docs/architecture.md`, `.docs/frontend_erp_shell_migration.md`.
+- Выполнена зачистка tracked временных артефактов и кэш-файлов (`.tmp/*`, `tmp/*`, `__pycache__`, root debug/log/json snapshots).
+- Усилен `.gitignore` для предотвращения повторного засорения репозитория.
+- Проверка: `npm run build` в `frontend-erp-shell` проходит успешно.
+
+## 2026-05-23 — local test workflow and refactor cleanup
+
+- Installed local Python 3.11 and created project `.venv` workflow.
+- Added `pytest.ini` so the canonical backend suite is `tests/`, avoiding root diagnostic artifacts.
+- Added `httpx` to backend test/runtime dependencies because FastAPI `TestClient` requires it.
+- Added `scripts/test.ps1` and `scripts/test.sh` as repeatable backend/frontend verification entrypoints.
+- Moved ad-hoc OData diagnostics from repo root and `backend/` into `tools/diagnostics/`; moved generated reports into `docs/reports/`.
+- Removed hard-coded OData credentials from tracked config and added `config/odata_config.example.json`.
+- Centralized OData config loading/saving in `backend/app/services/odata_config.py`.
+- Migrated SQLAlchemy declarative base import and Pydantic schema config to current APIs, removing deprecation warning noise from the backend suite.
+- Extracted common 1C export helpers (`payload_hash`, date formatting, demo URL guard, empty Ref_Key cleanup) into `backend/app/services/one_c_export_common.py`.
+- Centralized 1C export `SyncLink` lookup/upsert helpers and OData client construction while keeping local module monkeypatch points for tests.
+- Aligned `frontend-erp-shell/package.json` with the actual npm/package-lock workflow (`packageManager: npm@10.5.1`).
+- Updated Docker Compose test ergonomics:
+  - PostgreSQL host port defaults to `55432`.
+  - backend container mounts `tests/` and `pytest.ini` for `docker compose run --rm --no-deps backend pytest -q`.
+- Verification:
+  - local `scripts/test.ps1` — 131 passed + frontend build passed;
+  - `docker compose run --rm --no-deps backend pytest -q` — 131 passed;
+  - direct `npm run build` in `frontend-erp-shell` — passed.
+
+## 2026-05-24 — dependency split and frontend lint baseline
+
+- Split backend Python dependencies:
+  - `backend/requirements.txt` now contains runtime dependencies only;
+  - `backend/requirements-dev.txt` includes runtime + pytest/httpx test dependencies.
+- Updated `backend/Dockerfile` with `INSTALL_DEV` build arg; local `docker-compose.yml` enables it for backend test ergonomics.
+- Updated `backend/.dockerignore` so both requirements files are included in backend image builds.
+- Added frontend ESLint flat config in `frontend-erp-shell/eslint.config.js`.
+- Added `npm run lint` to `frontend-erp-shell/package.json` and committed the npm lockfile changes.
+- Updated `scripts/test.ps1` and `scripts/test.sh` to run backend pytest, frontend lint, and frontend production build.
+- Cleaned one real lint issue: removed unused `dateRu` import from `ProductionPlanQuarterPage`.
+- Verification:
+  - local `.venv` pytest — 131 passed;
+  - `npm run lint` — passes with 10 React Hooks `exhaustive-deps` warnings;
+  - `npm run build` — passed;
+  - `docker compose build backend` — passed;
+  - `docker compose run --rm --no-deps backend pytest -q` — 131 passed;
+  - `scripts/test.ps1` — passed end-to-end.
+
+## 2026-05-24 — clean frontend lint baseline
+
+- Stabilized React ERP-shell page data loaders with `useCallback` and explicit loader parameters.
+- Preserved manual-load UX for filter/date fields by avoiding dependency arrays that auto-fetch on every input edit.
+- Cleaned React Hooks `exhaustive-deps` warnings in:
+  - `MrpResultPage`;
+  - `MrpRunsPage`;
+  - `PeriodPlanPage`;
+  - `ProductionControlPage`;
+  - `ProductionPlanQuarterPage`;
+  - `ProductionReportWeekPage`;
+  - `ResourcesPage`.
+- Verification:
+  - `npm run lint` — passed with zero warnings;
+  - `npm run build` — passed;
+  - local `.venv` pytest — 131 passed;
+  - `scripts/test.ps1` — passed end-to-end.
+
+## 2026-05-24 — 1C export write-loop consolidation
+
+- Added `post_export_entries` to `backend/app/services/one_c_export_common.py`.
+- Centralized the repeated real-write protocol for production order, material issue, and manufacture exports:
+  - write planned `sync_link`;
+  - POST to 1C;
+  - validate returned `Ref_Key`;
+  - write success/error `sync_link`;
+  - commit once after the batch.
+- Kept exporter-specific domain callbacks local:
+  - production orders still stamp `production_orders.order_ref1c`;
+  - material issues still update issue/export state and line state;
+  - manufacture exports still update manufacture status/ref/error fields.
+- Verification:
+  - targeted 1C export tests — 23 passed;
+  - local `.venv` pytest — 131 passed;
+  - `scripts/test.ps1` — passed end-to-end.
+
+## 2026-05-24 — React ERP-shell browser smoke
+
+- Added Playwright test runner to `frontend-erp-shell`.
+- Added `frontend-erp-shell/playwright.config.ts` with Chromium project and Vite webServer integration.
+- Added `frontend-erp-shell/tests/smoke/app-smoke.spec.ts`.
+- Smoke scenario checks:
+  - backend health endpoint is available at `http://127.0.0.1:8000/health`;
+  - shell opens on `http://127.0.0.1:9300`;
+  - critical sections render via real sidebar navigation;
+  - console errors and page errors fail the test.
+- Added `npm run smoke`.
+- Added opt-in smoke mode to project test scripts:
+  - PowerShell: `scripts/test.ps1 -Smoke`;
+  - Bash: `scripts/test.sh --smoke`.
+- Ignored Playwright generated artifacts (`test-results/`, `playwright-report/`).
+- Verification:
+  - `npm run smoke` — 1 passed;
+  - frontend `npm run lint` + `npm run smoke` — passed;
+  - backend pytest — 131 passed.
+
+## 2026-05-24 - production-control settings split
+
+- Extracted warehouse settings service logic from `backend/app/services/production_control.py` into `backend/app/services/production_control_settings.py`.
+- Kept backwards-compatible re-exports from `production_control.py` for existing tests/imports while moving new direct consumers to the dedicated module.
+- Split settings HTTP endpoints from the large production-control router into `backend/app/routers/production_control_settings.py` and included it from the existing router to preserve all API paths.
+- Reduced current production-control module sizes:
+  - router: 309 lines;
+  - service: 1387 lines;
+  - new settings service: 114 lines;
+  - new settings router: 63 lines.
+- Verification:
+  - `pytest tests/services/test_production_control.py -q` - 16 passed;
+  - `.venv\Scripts\python.exe -m pytest -q` - 131 passed;
+  - `scripts/test.ps1` - backend pytest, frontend lint, and frontend build passed;
+  - direct router import confirmed all `/v1/production-control/settings*` routes are still registered.
+- Note: importing `app.main` directly still depends on the active local Postgres credentials because `Base.metadata.create_all(bind=engine)` runs at import time.
+
+## 2026-05-24 - production-control common and route-sheet split
+
+- Extracted pure production-control helpers into `backend/app/services/production_control_common.py`:
+  - GUID normalization/checking;
+  - safe float conversion;
+  - date parsing/ISO formatting;
+  - production line number fallback.
+- Extracted route-sheet printing/rendering into `backend/app/services/production_control_route_sheets.py`.
+- Updated the production-control router to import route-sheet handlers from the dedicated module while keeping lazy compatibility wrappers in `production_control.py`.
+- Reduced current production-control service size from 1389 to 1241 lines.
+- Current split module sizes:
+  - common helpers: 47 lines;
+  - route sheets: 130 lines;
+  - settings service: 117 lines;
+  - settings router: 63 lines.
+- Verification:
+  - `pytest tests/services/test_production_control.py -q` - 16 passed;
+  - `.venv\\Scripts\\python.exe -m pytest -q` - 131 passed;
+  - direct router import confirmed `/v1/production-control/route-sheets/print` remains registered.
+
+## 2026-05-24 - production-control printing rename and material-issue split
+
+- Renamed the narrow route-sheet module concept to `backend/app/services/production_control_printing.py` so the layer can host future production-control print views, not only route sheets.
+- Removed the old `production_control_route_sheets.py` module name and updated router/service imports to `production_control_printing`.
+- Extracted material issue create/read/legacy export helpers into `backend/app/services/production_control_material_issues.py`.
+- Updated the production-control router to import material issue handlers from the dedicated module while keeping lazy compatibility wrappers in `production_control.py`.
+- Cleaned unused imports left by the split (`Any`/`Dict` in the router, `ProductionResource`/`WorkshopWarehouseBinding` and unused private aliases in the service).
+- Normalized encoding in touched production-control files after PowerShell editing exposed mojibake/BOM artifacts.
+- Reduced current production-control service size to 1014 lines.
+- Verification:
+  - `pytest tests/services/test_production_control.py tests/services/test_produce_and_manufacture_export.py tests/services/test_return_leftover_components.py -q` - 34 passed;
+  - targeted 1C/export tests - 32 passed;
+  - `.venv\\Scripts\\python.exe -m pytest -q` - 131 passed.
+
+## 2026-05-24 - production-control material availability split
+
+- Extracted shared production-control domain helpers into `backend/app/services/production_control_domain.py`:
+  - `unit_display`;
+  - `ensure_state`;
+  - `default_spec_id`;
+  - `latest_run_id`.
+- Extracted material availability and coverage logic into `backend/app/services/production_control_material_availability.py`:
+  - BOM component expansion;
+  - stock availability excluding ignored warehouses;
+  - active material issue reservations;
+  - supplier/planned ETA aggregation;
+  - component/order coverage labels;
+  - `preview_materials`.
+- Updated router, printing, and material-issue modules to use the dedicated availability/domain modules instead of importing through the large `production_control.py` service.
+- Kept lazy compatibility wrappers in `production_control.py` for existing imports of `_components_for_product` and `preview_materials`.
+- Cleaned stale imports left by the split.
+- Reduced current production-control service size to 669 lines.
+- Verification:
+  - `pytest tests/services/test_production_control.py tests/services/test_produce_and_manufacture_export.py tests/services/test_return_leftover_components.py -q` - 34 passed;
+  - `.venv\\Scripts\\python.exe -m pytest -q` - 131 passed.
+
+## 2026-05-24 - production-control production flow split
+
+- Extracted local production flow into `backend/app/services/production_control_production_flow.py`:
+  - `produce_line`;
+  - outgoing material issue lookup for returns;
+  - return document numbering;
+  - `return_leftover_components`.
+- Updated the production-control router to import production flow handlers from the dedicated module.
+- Kept lazy compatibility wrappers in `production_control.py` for old imports used by existing tests and possible external callers.
+- Cleaned stale imports and wrapper-section comments after the move.
+- Reduced current production-control service size to 418 lines.
+- Verification:
+  - `pytest tests/services/test_production_control.py tests/services/test_produce_and_manufacture_export.py tests/services/test_return_leftover_components.py -q` - 34 passed;
+  - `.venv\\Scripts\\python.exe -m pytest -q` - 131 passed.
+
+## 2026-05-25 - production-control journal split and facade cleanup
+
+- Extracted journal/order materialization into `backend/app/services/production_control_journal.py`:
+  - MRP planned-order materialization;
+  - journal listing/filtering;
+  - line state patching;
+  - journal-local status constants and workshop inference helpers.
+- Updated the production-control router to import journal handlers from the dedicated module.
+- Migrated tests away from the old `app.services.production_control` imports to focused modules.
+- Reduced `backend/app/services/production_control.py` to a small compatibility facade with explicit re-exports only.
+- Removed stale imports and BOM artifacts from touched production-control files.
+- Verification:
+  - targeted production-control/produce/return tests - 34 passed;
+  - compatibility facade smoke import points to focused modules;
+  - `.venv\\Scripts\\python.exe -m pytest -q` - 131 passed.

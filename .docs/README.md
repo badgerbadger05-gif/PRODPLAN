@@ -35,7 +35,9 @@ rebuild.bat
 - `db_schema.md` — база данных (кратко)
 - `odata.md` — интеграция с 1С/OData
 - `production_orders_check.md` — учет активных заказов на производство 1С в MRP
-- `supplier_orders_check.md` — целевая документация по учету заказов поставщику 1С в MRP`r`n- `frontend_erp_shell_migration.md` — решение и правила переноса фронта в новый ERP-shell
+- `supplier_orders_check.md` — целевая документация по учету заказов поставщику 1С в MRP
+- `frontend_erp_shell_migration.md` — решение и правила переноса фронта в новый ERP-shell
+- `period_plan_target.md` — контракт страницы «Период план» (жизненный цикл, матрица, MRP-снимок, журнал, хоткеи)
 - `troubleshooting.md` — команды и диагностика
 - `progress.md` — текущее состояние/решения/проблемы
 
