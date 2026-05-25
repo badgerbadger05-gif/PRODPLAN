@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { planningStatusLabel, type PlanningRunRow } from '../../domain/planning'
 import { dateTimeRu, qty } from '../../lib/format'
 import { listPlanningRuns, startPlanningRun } from '../../services/planning'
@@ -8,11 +9,8 @@ import { StatusBar } from '../layout/StatusBar'
 const limit = 30
 const horizonOptions = [30, 60, 90, 120]
 
-type Props = {
-  onOpenRun: (run: PlanningRunRow) => void
-}
-
-export function MrpRunsPage({ onOpenRun }: Props) {
+export function MrpRunsPage() {
+  const navigate = useNavigate()
   const [rows, setRows] = useState<PlanningRunRow[]>([])
   const [activeId, setActiveId] = useState<number | null>(null)
   const [horizonDays, setHorizonDays] = useState(90)
@@ -125,7 +123,7 @@ export function MrpRunsPage({ onOpenRun }: Props) {
               </thead>
               <tbody>
                 {rows.map((row) => (
-                  <tr key={row.run_id} className={row.run_id === activeRun?.run_id ? 'activeRow' : ''} onClick={() => setActiveId(row.run_id)} onDoubleClick={() => onOpenRun(row)}>
+                  <tr key={row.run_id} className={row.run_id === activeRun?.run_id ? 'activeRow' : ''} onClick={() => setActiveId(row.run_id)} onDoubleClick={() => navigate(`/mrp-runs/${row.run_id}`)}>
                     <td className="orderCell">
                       <strong>#{row.run_id}</strong>
                       <span>расчёт</span>
@@ -161,7 +159,7 @@ export function MrpRunsPage({ onOpenRun }: Props) {
                   <span>Перегрузы</span><strong>{qty(activeRun.overload_buckets)}</strong>
                 </div>
                 <div className="detailActions">
-                  <button className="primary" onClick={() => onOpenRun(activeRun)}>Открыть результат</button>
+                  <button className="primary" onClick={() => navigate(`/mrp-runs/${activeRun.run_id}`)}>Открыть результат</button>
                 </div>
               </>
             ) : (

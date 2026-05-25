@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useNavigate, useParams } from 'react-router-dom'
 import type {
   ExecutionJournalResponse,
   PeriodPlan,
@@ -56,25 +57,22 @@ function bucketLabel(iso: string) {
 // ── Main page (list ↔ detail) ────────────────────────────────────────────────
 
 export function PeriodPlanPage() {
-  const [openPlanId, setOpenPlanId] = useState<number | null>(null)
-  const [refreshKey, setRefreshKey] = useState(0)
+  const { planId: planIdParam } = useParams<{ planId: string }>()
+  const navigate = useNavigate()
+  const planId = planIdParam ? Number(planIdParam) : null
 
-  if (openPlanId !== null) {
+  if (planId !== null) {
     return (
       <PeriodPlanDetailView
-        planId={openPlanId}
-        onBack={() => {
-          setOpenPlanId(null)
-          setRefreshKey((k) => k + 1)
-        }}
+        planId={planId}
+        onBack={() => navigate('/period-plan')}
       />
     )
   }
 
   return (
     <PeriodPlanListView
-      key={refreshKey}
-      onOpenPlan={(id) => setOpenPlanId(id)}
+      onOpenPlan={(id) => navigate(`/period-plan/${id}`)}
     />
   )
 }
@@ -900,7 +898,8 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     URL.revokeObjectURL(url)
   }
 
-  function workItemHref(wi: { type: string; order_id?: number; purchase_id?: number; rework_id?: number; run_id?: number }) {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  function workItemHref(_wi: { type: string; order_id?: number; purchase_id?: number; rework_id?: number; run_id?: number }) {
     // Cross-page deep linking is not wired; for now return null and just label the row.
     return null as string | null
   }

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import type { PlanningRunRow } from '../../domain/planning'
 import { dateTimeRu, qty } from '../../lib/format'
 import { listPlanningRuns } from '../../services/planning'
@@ -7,21 +8,8 @@ import { listWarehouses } from '../../services/sync'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
 
-type SectionId =
-  | 'period-plan'
-  | 'production-control'
-  | 'production-report-week'
-  | 'mrp-runs'
-  | 'resources'
-  | 'stage-distribution'
-  | 'specification'
-  | 'sync'
-
-type Props = {
-  onNavigate: (section: SectionId) => void
-}
-
-export function HomePage({ onNavigate }: Props) {
+export function HomePage() {
+  const navigate = useNavigate()
   const [latestRun, setLatestRun] = useState<PlanningRunRow | null>(null)
   const [resourceCount, setResourceCount] = useState(0)
   const [warehouseTotal, setWarehouseTotal] = useState(0)
@@ -91,14 +79,14 @@ export function HomePage({ onNavigate }: Props) {
           <section className="homePanel">
             <h2>Рабочие разделы</h2>
             <div className="homeActions">
-              <button className="primary" onClick={() => onNavigate('period-plan')}>Планирование выпуска</button>
-              <button onClick={() => onNavigate('production-control')}>Журнал заказов</button>
-              <button onClick={() => onNavigate('production-report-week')}>Выпуск недельный</button>
-              <button onClick={() => onNavigate('mrp-runs')}>MRP прогоны</button>
-              <button onClick={() => onNavigate('sync')}>Синхронизация</button>
-              <button onClick={() => onNavigate('resources')}>Ресурсы</button>
-              <button onClick={() => onNavigate('stage-distribution')}>Распределение этапов</button>
-              <button onClick={() => onNavigate('specification')}>Спецификации</button>
+              <button className="primary" onClick={() => navigate('/period-plan')}>Планирование выпуска</button>
+              <button onClick={() => navigate('/production-control')}>Журнал заказов</button>
+              <button onClick={() => navigate('/production-report-week')}>Выпуск недельный</button>
+              <button onClick={() => navigate('/mrp-runs')}>MRP прогоны</button>
+              <button onClick={() => navigate('/sync')}>Синхронизация</button>
+              <button onClick={() => navigate('/resources')}>Ресурсы</button>
+              <button onClick={() => navigate('/stage-distribution')}>Распределение этапов</button>
+              <button onClick={() => navigate('/specification')}>Спецификации</button>
             </div>
           </section>
         </div>

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useNavigate, useParams } from 'react-router-dom'
 import type { MrpCapacityRow, MrpProductionRow, MrpPurchaseRow, MrpReworkRow, MrpSummary } from '../../domain/planning'
 import { planningStatusLabel } from '../../domain/planning'
 import { downloadBase64File } from '../../lib/download'
@@ -19,16 +20,14 @@ import {
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
 
-type Props = {
-  runId: number
-  onBack: () => void
-}
-
 type Tab = 'production' | 'purchases' | 'rework' | 'capacity'
 
 const limit = 200
 
-export function MrpResultPage({ runId, onBack }: Props) {
+export function MrpResultPage() {
+  const { runId: runIdParam } = useParams<{ runId: string }>()
+  const runId = Number(runIdParam)
+  const navigate = useNavigate()
   const [summary, setSummary] = useState<MrpSummary | null>(null)
   const [tab, setTab] = useState<Tab>('production')
   const [productionRows, setProductionRows] = useState<MrpProductionRow[]>([])
@@ -193,7 +192,7 @@ export function MrpResultPage({ runId, onBack }: Props) {
         )}
       >
         <div className="commandBar">
-          <button onClick={onBack}>К списку прогонов</button>
+          <button onClick={() => navigate('/mrp-runs')}>К списку прогонов</button>
           <button onClick={() => void load(dateFrom, dateTo)} disabled={loading}>Обновить</button>
           {tab !== 'capacity' && <button onClick={() => void exportActive('csv')} disabled={loading || exporting}>CSV</button>}
           {tab !== 'capacity' && <button onClick={() => void exportActive('xlsx')} disabled={loading || exporting}>XLSX</button>}
@@ -347,7 +346,7 @@ function ProductionResultTable({ rows, selectedIds, onSelectedIdsChange }: {
             <td>{dateRu(row.need_date) || '—'}</td>
             <td>{dateRu(row.start_date) || '—'}</td>
             <td>{dateRu(row.finish_date) || '—'}</td>
-            <td>{row.main_area_name || '—'}</td>
+            <td>{row.main_area_name || row.main_stage_name || '—'}</td>
             <td className="numCell"><strong>{qty(row.norm_hours_total)}</strong><span>н/ч</span></td>
           </tr>
         ))}
@@ -380,6 +379,7 @@ function PurchaseResultTable({ rows, selectedIds, onSelectedIdsChange }: {
           <th>Номенклатура</th>
           <th>К заказу</th>
           <th>Потребность</th>
+          <th>Участок</th>
           <th>Заказать до</th>
           <th>Срок пост.</th>
           <th>Покрыто</th>
@@ -410,7 +410,9 @@ function PurchaseResultTable({ rows, selectedIds, onSelectedIdsChange }: {
             </td>
             <td className="numCell"><strong>{qty(row.qty)}</strong><span>{row.unit || ''}</span></td>
             <td>{dateRu(row.need_date) || '—'}</td>
+            <td>{row.main_area_name || row.main_stage_name || '—'}</td>
             <td>{dateRu(row.order_date) || '—'}</td>
+            <td className="numCell"><strong>{Number(row.lead_time_days || 0) || '—'}</strong>{Number(row.lead_time_days || 0) > 0 && <span>дн.</span>}</td>
             <td className="numCell" title={`Покрыто активными заказами поставщику: ${coverageLabel}`} style={{ color: covered > 0 ? (coveragePct >= 100 ? 'var(--color-success, green)' : 'var(--color-warning, orange)') : undefined }}>
               {covered > 0 ? coverageLabel : '—'}
             </td>

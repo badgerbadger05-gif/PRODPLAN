@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import type { PlanningRunRow } from '../domain/planning'
+import { NavLink, Route, Routes } from 'react-router-dom'
+import { HomePage } from './pages/HomePage'
 import { MrpResultPage } from './pages/MrpResultPage'
 import { MrpRunsPage } from './pages/MrpRunsPage'
 import { PeriodPlanPage } from './pages/PeriodPlanPage'
@@ -10,29 +10,19 @@ import { SpecificationPage } from './pages/SpecificationPage'
 import { StageDistributionPage } from './pages/StageDistributionPage'
 import { SyncPage } from './pages/SyncPage'
 
-type SectionId = 'home' | 'period-plan' | 'production-control' | 'production-report-week' | 'mrp-runs' | 'mrp-result' | 'resources' | 'stage-distribution' | 'specification' | 'sync'
-
-const sections: Array<{ id: SectionId; title: string }> = [
-  { id: 'home', title: 'Главная' },
-  { id: 'period-plan', title: 'Планирование выпуска' },
-  { id: 'production-control', title: 'Журнал заказов' },
-  { id: 'production-report-week', title: 'Выпуск недельный' },
-  { id: 'mrp-runs', title: 'MRP прогоны' },
-  { id: 'resources', title: 'Ресурсы' },
-  { id: 'stage-distribution', title: 'Распределение этапов' },
-  { id: 'specification', title: 'Спецификации' },
-  { id: 'sync', title: 'Синхронизация' },
+const navItems = [
+  { to: '/', title: 'Главная', end: true },
+  { to: '/period-plan', title: 'Планирование выпуска' },
+  { to: '/production-control', title: 'Журнал заказов' },
+  { to: '/production-report-week', title: 'Выпуск недельный' },
+  { to: '/mrp-runs', title: 'MRP прогоны' },
+  { to: '/resources', title: 'Ресурсы' },
+  { to: '/stage-distribution', title: 'Распределение этапов' },
+  { to: '/specification', title: 'Спецификации' },
+  { to: '/sync', title: 'Синхронизация' },
 ]
 
 export function App() {
-  const [section, setSection] = useState<SectionId>('home')
-  const [activeRun, setActiveRun] = useState<PlanningRunRow | null>(null)
-
-  function openRun(run: PlanningRunRow) {
-    setActiveRun(run)
-    setSection('mrp-result')
-  }
-
   return (
     <div className="app">
       <aside className="nav">
@@ -43,28 +33,31 @@ export function App() {
             <span>ERP shell</span>
           </div>
         </div>
-        {sections.map((item) => (
-          <button
-            key={item.id}
-            className={`navItem ${section === item.id ? 'active' : ''}`}
-            onClick={() => setSection(item.id)}
+        {navItems.map((item) => (
+          <NavLink
+            key={item.to}
+            to={item.to}
+            end={item.end}
+            className={({ isActive }) => `navItem${isActive ? ' active' : ''}`}
           >
             {item.title}
-          </button>
+          </NavLink>
         ))}
       </aside>
 
-      {section === 'home' && <HomePage onNavigate={setSection} />}
-      {section === 'period-plan' && <PeriodPlanPage />}
-      {section === 'production-control' && <ProductionControlPage />}
-      {section === 'production-report-week' && <ProductionReportWeekPage />}
-      {section === 'mrp-runs' && <MrpRunsPage onOpenRun={openRun} />}
-      {section === 'mrp-result' && activeRun && <MrpResultPage runId={activeRun.run_id} onBack={() => setSection('mrp-runs')} />}
-      {section === 'resources' && <ResourcesPage />}
-      {section === 'stage-distribution' && <StageDistributionPage />}
-      {section === 'specification' && <SpecificationPage />}
-      {section === 'sync' && <SyncPage />}
+      <Routes>
+        <Route path="/" element={<HomePage />} />
+        <Route path="/period-plan" element={<PeriodPlanPage />} />
+        <Route path="/period-plan/:planId" element={<PeriodPlanPage />} />
+        <Route path="/production-control" element={<ProductionControlPage />} />
+        <Route path="/production-report-week" element={<ProductionReportWeekPage />} />
+        <Route path="/mrp-runs" element={<MrpRunsPage />} />
+        <Route path="/mrp-runs/:runId" element={<MrpResultPage />} />
+        <Route path="/resources" element={<ResourcesPage />} />
+        <Route path="/stage-distribution" element={<StageDistributionPage />} />
+        <Route path="/specification" element={<SpecificationPage />} />
+        <Route path="/sync" element={<SyncPage />} />
+      </Routes>
     </div>
   )
 }
-import { HomePage } from './pages/HomePage'
