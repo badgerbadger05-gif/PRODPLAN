@@ -19,7 +19,92 @@
 
 - Бизнес-правило учёта компонентов: учитывать только склад или также будущие плановые заказы на полуфабрикаты.
 
+## Текущий head миграций Alembic
+
+Цепочка (порядок `down_revision`):
+```
+20260522_08_add_source_mrp_requirement_id_to_planned_purchase
+  ← 20260522_07_add_bom_level_to_mrp_requirement
+  ← 20260522_06_link_production_products_to_mrp_requirements
+  ← 20260522_05_add_mrp_requirements
+  ← 20260522_04_add_period_plan_journal
+  ← 20260520_09_add_direction_to_material_issues  (и далее вглубь)
+```
+
 ## Последняя сессия
+
+**2026-05-25 — закрыты три накопившихся разрыва в реализации period-plan → production-control:**
+
+### 1. Исправлен разрыв ORM / миграция в `ProductionProduct`
+
+Миграция `20260522_06` добавила в `production_products` два столбца —
+`source_mrp_requirement_id` (FK → `mrp_requirement.id ON DELETE SET NULL`) и
+`source_mrp_allocation_key` — но ORM-класс `ProductionProduct` в `models.py`
+этих полей не содержал. Это приводило к `AttributeError` при обращении к
+`ProductionProduct.source_mrp_requirement_id.in_(...)` в execution journal.
+
+Фикс: оба столбца добавлены в класс `ProductionProduct` (`models.py`).
+
+### 2. Функция `create_production_orders_from_mrp_requirements`
+
+Файл: `backend/app/services/production_control_journal.py`
+
+Прежде журнал производственного контроля умел создавать заказы только из
+`PlannedOrder` (legacy MRP). Period-plan MRP создаёт `MrpRequirement`-строки,
+и до этой сессии пути от «MRP-снимок period-плана» к «производственный заказ»
+не существовало.
+
+Новая функция:
+- принимает список `requirement_ids`;
+- пропускает строки с `flow != production` и с `remaining_qty ≈ 0`;
+- идемпотентна через `ProductionProduct.source_mrp_requirement_id`;
+- создаёт `ProductionOrder(source='mrp')` + `ProductionProduct` +
+  `ProductionOrderLineState(status='shortage')`;
+- обновляет `MrpRequirement.covered_qty` / `remaining_qty`;
+- возвращает `{status, created, reused, skipped, errors}`.
+
+Эндпоинт: `POST /v1/production-control/orders/from-mrp-requirements`
+(файл `backend/app/routers/production_control.py`, payload
+`OrdersFromMrpRequirementsPayload`).
+
+### 3. Исправлен lookup `work_items` в `get_period_plan_execution_journal`
+
+Файл: `backend/app/services/period_plan_service.py`
+
+Ранее запрос закупок (PlannedPurchase) был переписан на двойной словарь:
+- `purchases_by_req_id` — строки с `source_mrp_requirement_id` (точный lookup);
+- `purchases_by_item_fallback` — строки без него (legacy).
+
+Но строка, которая назначает `work_items` в цикле по строкам журнала, по-прежнему
+обращалась к несуществующей переменной `purchases_by_item` → `NameError` в
+production. Исправлено:
+```python
+work_items = purchases_by_req_id.get(req_id, []) or purchases_by_item_fallback.get(int(req.item_id), [])
+```
+
+### 4. Frontend: кнопка «Создать заказы производства»
+
+- `frontend-erp-shell/src/services/periodPlan.ts` — добавлена функция
+  `createProductionOrdersFromRequirements(requirementIds, initiatedBy)`.
+- `frontend-erp-shell/src/ui/pages/PeriodPlanPage.tsx` — добавлен обработчик
+  `handleCreateProductionOrders()` и кнопка «Создать заказы производства» в
+  commandBar вкладки «Журнал исполнения». Кнопка активна только если в журнале
+  есть production-строки с `remaining_qty > 0`. После успеха показывает счётчик
+  created/reused/skipped и перезагружает журнал.
+
+### 5. Тесты и коммиты
+
+- `tests/services/test_period_plan_service.py` (15 тестов) — покрытие логики
+  аллокации `PlannedPurchase` с нетингом заказов поставщику.
+- Вся цепочка: 146 passed, TypeScript — 0 ошибок.
+- Коммиты:
+  - `6602840` — feat: net PlannedPurchase against active supplier orders
+    (миграция `20260522_08`, хелпер `_load_purchase_supplier_remaining`,
+    нетинг в `create_mrp_snapshot_from_period_plan`)
+  - `f3a039a` — feat: materialize MRP requirements into production orders +
+    fix ORM/journal gaps (три разрыва выше + frontend)
+
+---
 
 **2026-05-25 — Period Plan в ERP-shell доведён до целевой логики:**
 
