@@ -122,13 +122,35 @@ export type PeriodPlan = {
   status: 'draft' | 'fixed' | 'archived'
   period_from: string
   period_to: string
+  comment?: string | null
+  created_by?: string | null
   fixed_at?: string | null
   fixed_by?: string | null
   created_at?: string | null
+  updated_at?: string | null
+  line_count?: number
+  total_qty?: number
 }
 
 export type PeriodPlanListResponse = {
   rows: PeriodPlan[]
+  total: number
+}
+
+export type PeriodPlanRun = {
+  run_id: number
+  status: string
+  started_at?: string | null
+  finished_at?: string | null
+  started_by?: string | null
+  horizon_days?: number | null
+  period_from?: string | null
+  period_to?: string | null
+  fixed_at?: string | null
+}
+
+export type PeriodPlanRunsResponse = {
+  rows: PeriodPlanRun[]
   total: number
 }
 

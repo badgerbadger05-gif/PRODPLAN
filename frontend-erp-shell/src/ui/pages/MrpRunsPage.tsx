@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { planningStatusLabel, type PlanningRunRow } from '../../domain/planning'
 import { dateTimeRu, qty } from '../../lib/format'
 import { listPlanningRuns, startPlanningRun } from '../../services/planning'
@@ -25,7 +25,7 @@ export function MrpRunsPage({ onOpenRun }: Props) {
 
   const activeRun = useMemo(() => rows.find((row) => row.run_id === activeId) ?? rows[0] ?? null, [rows, activeId])
 
-  async function load(nextOffset = offset) {
+  const load = useCallback(async (nextOffset: number) => {
     setLoading(true)
     setError('')
     try {
@@ -42,7 +42,7 @@ export function MrpRunsPage({ onOpenRun }: Props) {
     } finally {
       setLoading(false)
     }
-  }
+  }, [])
 
   async function calculate() {
     setCalculating(true)
@@ -62,7 +62,7 @@ export function MrpRunsPage({ onOpenRun }: Props) {
 
   useEffect(() => {
     void load(0)
-  }, [])
+  }, [load])
 
   const visibleFrom = total ? offset + 1 : 0
   const visibleTo = Math.min(offset + rows.length, total)
@@ -94,7 +94,7 @@ export function MrpRunsPage({ onOpenRun }: Props) {
       >
         <div className="commandBar">
           <button className="primary" onClick={() => void calculate()} disabled={calculating || loading}>Рассчитать</button>
-          <button onClick={() => void load()} disabled={loading || calculating}>Обновить</button>
+          <button onClick={() => void load(offset)} disabled={loading || calculating}>Обновить</button>
           <div className="barSeparator" />
           <label className="inlineControl">
             <span>Горизонт</span>

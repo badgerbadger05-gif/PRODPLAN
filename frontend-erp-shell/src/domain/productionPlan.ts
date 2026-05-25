@@ -23,6 +23,7 @@ export type PlanChange = {
 }
 
 export type NomenclatureSearchItem = {
+  item_id?: number
   item_code: string
   item_name: string
   item_article?: string | null
