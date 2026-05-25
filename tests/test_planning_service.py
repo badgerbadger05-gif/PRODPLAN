@@ -103,22 +103,22 @@ def test_get_run_production_handles_missing_start_date():
 
 def test_get_run_purchases_handles_missing_columns():
     purchase_row = (
-        1,
-        200,
-        5,
-        datetime.date(2025, 1, 10),
-        datetime.date(2025, 1, 2),
-        7,
-        0.5,
-        "daily",
-        datetime.date(2025, 1, 2),
-        "SUP",
-        None,
-        None,
-        "guid",
-        None,
-        None,
-        None,
+        1,                           # purchase_id
+        200,                         # item_id
+        5,                           # qty
+        datetime.date(2025, 1, 10),  # need_date
+        datetime.date(2025, 1, 2),   # order_date
+        7,                           # lead_time_days
+        0.5,                         # priority_index
+        datetime.date(2025, 1, 2),   # bucket_date
+        "SUP",                       # supplier_ref1c
+        5,                           # requested_qty
+        None,                        # item_name
+        None,                        # item_article
+        "guid",                      # unit (ref)
+        None,                        # short_name
+        None,                        # unit_name
+        None,                        # unit_code
     )
 
     def fake_query_planned_purchase(*args):

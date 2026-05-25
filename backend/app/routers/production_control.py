@@ -23,6 +23,7 @@ from ..services.production_control_journal import (
     create_production_orders_from_mrp_requirements,
     list_journal,
     update_line_state,
+    update_product_quantity,
 )
 from ..services.production_control_material_availability import preview_materials
 from ..services.production_control_printing import mark_route_sheets_printed, render_route_sheets_html
@@ -46,6 +47,7 @@ class MaterialIssueCreatePayload(BaseModel):
     product_ids: List[int]
     initiated_by: Optional[str] = None
     warehouse_ref1c: Optional[str] = None
+    source_warehouse_ref1c: Optional[str] = None
 
 
 class OrdersFromMrpPayload(BaseModel):
@@ -56,6 +58,10 @@ class OrdersFromMrpPayload(BaseModel):
 class OrdersFromMrpRequirementsPayload(BaseModel):
     requirement_ids: List[int]
     initiated_by: Optional[str] = None
+
+
+class UpdateQuantityPayload(BaseModel):
+    quantity: float
 
 
 class ExportProductionOrdersPayload(BaseModel):
@@ -106,6 +112,21 @@ def get_orders_journal(
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.patch("/orders/{product_id}/quantity", response_model=dict)
+def patch_order_line_quantity(product_id: int, payload: UpdateQuantityPayload, db: Session = Depends(get_db)):
+    """
+    Adjust the planned quantity of a production line.
+    Cannot be set below already-produced qty.
+    Recalculates remaining_qty automatically.
+    """
+    try:
+        return update_product_quantity(db, int(product_id), float(payload.quantity))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.patch("/orders/{product_id}/state", response_model=dict)
@@ -294,6 +315,7 @@ def post_material_issues(payload: MaterialIssueCreatePayload, db: Session = Depe
             [int(x) for x in payload.product_ids],
             initiated_by=payload.initiated_by,
             warehouse_ref1c=payload.warehouse_ref1c,
+            source_warehouse_ref1c=payload.source_warehouse_ref1c,
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

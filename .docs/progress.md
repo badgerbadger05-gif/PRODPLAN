@@ -33,6 +33,48 @@
 
 ## Последняя сессия
 
+**2026-05-25 — завершена реализация всех групп workplan.md (кроме Document_СдельныйНаряд и formatter policy):**
+
+Группа 3 — Остатки по складам:
+- `ItemWarehouseStock` и синхронизация (`odata_stock_sync.py`) уже существовали
+- Реализован `_auto_select_source_warehouse()` в `production_control_material_issues.py`: выбирает склад-источник по `ItemWarehouseStock`, исключает `ignored_warehouses` и deselected склады
+- При неоднозначности (тай) фронт показывает диалог с radio-кнопками; повторный вызов API с `source_warehouse_ref1c`
+- `MaterialIssueCreatePayload` расширен полем `source_warehouse_ref1c`
+
+Группа 4 — Факт поступления заказов поставщику:
+- Синхронизация `received_qty` уже была реализована в `supplier_order_sync.py` (поле `КоличествоПоступило`)
+- Добавлен `supplier_covered_qty` = `requested_qty - qty` в API `get_run_purchases` (`planning_service.py`)
+- В таблице MRP-закупок (`MrpResultPage.tsx`) добавлена колонка «Покрыто» с % и цветовой индикацией
+
+Группа 5 — Мелкие доработки period plan:
+- Автогенерация `comment` при создании плана: «МАЙ 2026» / «МАЙ–ИЮНЬ 2026»
+- Пояснительный текст в SyncPage для пустого списка групп с сохранённым выбором
+
+Группа 6 — Технический долг:
+- Удалён compatibility facade `production_control.py` (нет внешних импортов)
+- Матрица CI-команд добавлена в `.docs/README.md`
+
+Проверка: **148 passed**, lint — 0 ошибок, build — успешно.
+
+---
+
+**2026-05-25 — исправлены API-рассогласования фронта с бэкендом в производственном контроле:**
+
+Ревью кодовой базы показало, что все backend write-сервисы (`one_c_production_order_export`, `one_c_stock_transfer_export`, `one_c_manufacture_export`, `one_c_posted_transfer_sync`) уже реализованы. Фронт при этом вызывал несуществующие эндпоинты и отправлял неправильные поля.
+
+Исправлено в `ProductionControlPage.tsx` и `ProductionCommandBar.tsx`:
+- `start-in-1c` → удалена дублирующая кнопка; единая «Запустить в 1С» теперь вызывает правильный `POST /orders/export-to-1c` с `order_ids` (ранее слал `product_ids`)
+- `sync-from-1c` → `POST /sync-posted-transfers` (правильный эндпоинт для `К перемещению → Собран`)
+- `produce-to-1c` → 2-шаговый flow: `POST /orders/{id}/produce` + `POST /manufactures/export-to-1c`
+
+Добавлено:
+- `order_id`, `order_source`, `order_ref1c` в тип `OrderRow` (бэкенд уже возвращал их)
+- Функция `update_product_quantity()` в `production_control_journal.py`
+- Эндпоинт `PATCH /orders/{product_id}/quantity` (использует `ProductionDetailPane`)
+- Lint-фикс `PeriodPlanPage.tsx` (unused `wi` parameter)
+
+Проверка: **147 passed**, lint — 0 ошибок, build — успешно.
+
 **2026-05-25 — закрыты три накопившихся разрыва в реализации period-plan → production-control:**
 
 ### 1. Исправлен разрыв ORM / миграция в `ProductionProduct`

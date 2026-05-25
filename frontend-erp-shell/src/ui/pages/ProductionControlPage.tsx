@@ -8,6 +8,7 @@ import {
   type OrderRow,
   type OrdersResponse,
   type ProductionFilters,
+  type WarehouseCandidate,
   type WorkshopWarehouse,
 } from '../../domain/productionControl'
 import type { ProductionResource } from '../../domain/resources'
@@ -49,6 +50,10 @@ export function ProductionControlPage() {
   const [produceDryRun, setProduceDryRun] = useState(false)
   const [produceSaving, setProduceSaving] = useState(false)
   const [produceDryRunPayload, setProduceDryRunPayload] = useState<string | null>(null)
+  const [warehousePickerOpen, setWarehousePickerOpen] = useState(false)
+  const [warehousePickerCandidates, setWarehousePickerCandidates] = useState<WarehouseCandidate[]>([])
+  const [warehousePickerProductIds, setWarehousePickerProductIds] = useState<number[]>([])
+  const [warehousePickerSelected, setWarehousePickerSelected] = useState('')
 
   useEffect(() => {
     filtersRef.current = filters
@@ -163,38 +168,43 @@ export function ProductionControlPage() {
     }
   }
 
-  async function startSelected() {
-    if (!selectedIds.size) return
-    setLoading(true)
-    try {
-      await api('/v1/production-control/orders/start-in-1c', {
-        method: 'POST',
-        body: JSON.stringify({ product_ids: Array.from(selectedIds) }),
-      })
-      setSelectedIds(new Set())
-      await load(offsetRef.current)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  async function createMaterialIssues() {
-    if (!selectedIds.size) return
+  async function createMaterialIssues(sourceWarehouseRef?: string, productIds?: number[]) {
+    const ids = productIds ?? Array.from(selectedIds)
+    if (!ids.length) return
     setLoading(true)
     setError('')
     setMessage('')
     try {
+      const body: Record<string, unknown> = { product_ids: ids, initiated_by: 'erp-shell' }
+      if (sourceWarehouseRef) body.source_warehouse_ref1c = sourceWarehouseRef
       const result = await api<MaterialIssueCreateResponse>('/v1/production-control/material-issues', {
         method: 'POST',
-        body: JSON.stringify({ product_ids: Array.from(selectedIds), initiated_by: 'erp-shell' }),
+        body: JSON.stringify(body),
       })
-      const created = result.created?.length ?? 0
+      // Collect items where warehouse selection is ambiguous (multiple candidates)
+      const ambiguous = (result.created ?? []).filter(
+        (item) => item.warehouse_candidates && item.warehouse_candidates.length > 1
+      )
+      const autoResolved = (result.created ?? []).filter(
+        (item) => !item.warehouse_candidates || item.warehouse_candidates.length <= 1
+      )
       const errors = result.errors?.length ?? 0
-      setSelectedIds(new Set())
+
+      if (ambiguous.length > 0) {
+        // Use the first item's candidates (in practice all should share the same set
+        // of warehouses for a given workshop's materials)
+        const candidates = ambiguous[0].warehouse_candidates!
+        setWarehousePickerCandidates(candidates)
+        setWarehousePickerProductIds(ambiguous.map((item) => item.product_id))
+        setWarehousePickerSelected(candidates[0]?.ref1c ?? '')
+        setWarehousePickerOpen(true)
+        const msg = `Создано документов: ${autoResolved.length}${errors ? `, ошибок ${errors}` : ''}. Для ${ambiguous.length} поз. нужно выбрать склад-источник.`
+        setMessage(msg)
+      } else {
+        setSelectedIds(new Set())
+        setMessage(`Выдача материалов: создано документов ${result.created?.length ?? 0}${errors ? `, ошибок ${errors}` : ''}`)
+      }
       await load(offsetRef.current)
-      setMessage(`Выдача материалов: создано документов ${created}${errors ? `, ошибок ${errors}` : ''}`)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -202,20 +212,42 @@ export function ProductionControlPage() {
     }
   }
 
+  async function confirmWarehousePicker() {
+    if (!warehousePickerSelected || !warehousePickerProductIds.length) return
+    setWarehousePickerOpen(false)
+    await createMaterialIssues(warehousePickerSelected, warehousePickerProductIds)
+    setWarehousePickerProductIds([])
+    setWarehousePickerCandidates([])
+    setWarehousePickerSelected('')
+  }
+
   async function exportTo1C() {
     if (!selectedIds.size) return
+    // Only MRP-sourced orders can be exported; 1C-sourced orders already exist there.
+    const mrpRows = selectedRows.filter((r) => r.order_source === 'mrp' && r.order_id)
+    if (!mrpRows.length) {
+      setError('Выбраны только заказы из 1С — нечего создавать в 1С. Выберите строки с source=mrp.')
+      return
+    }
+    const orderIds = [...new Set(mrpRows.map((r) => r.order_id!))]
     setLoading(true)
     setError('')
     setMessage('')
     try {
       const result = await api<Record<string, unknown>>('/v1/production-control/orders/export-to-1c', {
         method: 'POST',
-        body: JSON.stringify({ product_ids: Array.from(selectedIds) }),
+        body: JSON.stringify({ order_ids: orderIds, dry_run: false, allow_production: false }),
       })
-      const created = Number(result.created ?? 0)
-      const skipped = Number(result.skipped ?? 0)
-      const errors = Number(result.errors ?? 0)
-      setMessage(`Экспорт в 1С: создано ${created}${skipped ? `, пропущено ${skipped}` : ''}${errors ? `, ошибок ${errors}` : ''}`)
+      const created = Number(result.orders_created ?? 0)
+      const existing = Number(result.orders_already_linked ?? 0)
+      const errored = Number(result.orders_error ?? 0)
+      const skipped = (result.skipped_rows as unknown[])?.length ?? 0
+      setMessage(
+        `Запуск в 1С: создано ${created}` +
+        (existing ? `, уже было ${existing}` : '') +
+        (skipped ? `, пропущено ${skipped}` : '') +
+        (errored ? `, ошибок ${errored}` : ''),
+      )
       setSelectedIds(new Set())
       await load(offsetRef.current)
     } catch (e) {
@@ -230,17 +262,16 @@ export function ProductionControlPage() {
     setError('')
     setMessage('')
     try {
-      const body = selectedIds.size ? { product_ids: Array.from(selectedIds) } : {}
-      const result = await api<Record<string, unknown>>('/v1/production-control/orders/sync-from-1c', {
+      // Pulls Posted=true flag from 1C for previously exported transfers and
+      // advances local status: К перемещению → Собран.
+      const result = await api<Record<string, unknown>>('/v1/production-control/sync-posted-transfers', {
         method: 'POST',
-        body: JSON.stringify(body),
       })
-      const checked = Number(result.checked ?? 0)
-      const updated = Number(result.updated_to_assembled ?? 0)
+      const candidates = Number(result.candidates ?? 0)
+      const advanced = Number(result.advanced ?? 0)
       const errors = Array.isArray(result.errors) ? result.errors.length : 0
-      setMessage(`Синхронизация: проверено ${checked}, обновлено ${updated}${errors ? `, ошибок ${errors}` : ''}`)
-      if (updated > 0) {
-        setSelectedIds(new Set())
+      setMessage(`Синхронизация: проверено ${candidates}, переведено в «Собран» ${advanced}${errors ? `, ошибок ${errors}` : ''}`)
+      if (advanced > 0) {
         await load(offsetRef.current)
       }
     } catch (e) {
@@ -263,32 +294,44 @@ export function ProductionControlPage() {
     if (!activeRow) return
     setProduceSaving(true)
     setError('')
+    setProduceDryRunPayload(null)
     try {
-      const result = await api<Record<string, unknown>>(
-        `/v1/production-control/orders/${activeRow.product_id}/produce-to-1c`,
+      // Step 1: record manufacture locally (bumps produced_qty / remaining_qty).
+      const localResult = await api<Record<string, unknown>>(
+        `/v1/production-control/orders/${activeRow.product_id}/produce`,
         {
           method: 'POST',
           body: JSON.stringify({
             qty: Number(produceQty) || 0,
-            performer: producePerformer || '',
-            dry_run: produceDryRun,
+            executor: producePerformer || undefined,
           }),
         },
       )
-      if (result.status === 'dry_run') {
-        setProduceDryRunPayload(
-          JSON.stringify({ assembly: result.assembly_payload, piecework: result.piecework_payload }, null, 2),
-        )
-      } else if (result.status === 'created') {
-        setMessage(
-          `Произведено: ${result.new_produced_qty}, осталось: ${result.new_remaining_qty}. СборкаЗапасов: ${String(result.assembly_ref1c ?? '').slice(0, 8)}...`,
-        )
-        setProduceOpen(false)
-        setSelectedIds(new Set())
-        await load(offsetRef.current)
-      } else {
-        setError(String(result.error ?? 'Неизвестная ошибка'))
+      const manufacture_id = Number(localResult.manufacture_id)
+
+      if (produceDryRun) {
+        // Show what would go to 1C without actually sending.
+        setProduceDryRunPayload(JSON.stringify(localResult, null, 2))
+        return
       }
+
+      // Step 2: export the manufacture to 1C as Document_СборкаЗапасов (Posted=false).
+      const exportResult = await api<Record<string, unknown>>(
+        '/v1/production-control/manufactures/export-to-1c',
+        {
+          method: 'POST',
+          body: JSON.stringify({ manufacture_ids: [manufacture_id], dry_run: false, allow_production: false }),
+        },
+      )
+      const created1c = Number(exportResult.manufactures_created ?? 0)
+      const ref = (exportResult.entries as Array<Record<string, unknown>>)?.[0]?.target_ref_key
+      setMessage(
+        `Произведено: ${localResult.qty}, осталось: ${localResult.remaining_qty}.` +
+        (created1c ? ` СборкаЗапасов создана${ref ? `: ${String(ref).slice(0, 8)}…` : ''}` : ''),
+      )
+      setProduceOpen(false)
+      setSelectedIds(new Set())
+      await load(offsetRef.current)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -396,7 +439,6 @@ export function ProductionControlPage() {
           rows={rows}
           selectedIds={selectedIds}
           loading={loading}
-          onStartSelected={() => void startSelected()}
           onExportTo1C={() => void exportTo1C()}
           onSyncFrom1C={() => void syncFrom1C()}
           onProduce={() => openProduceDialog()}
@@ -496,6 +538,37 @@ export function ProductionControlPage() {
               <button onClick={() => setProduceOpen(false)} disabled={produceSaving}>Отмена</button>
               <button className="primary" onClick={() => void submitProduce()} disabled={produceSaving}>
                 {produceSaving ? 'Создаём...' : produceDryRun ? 'Показать payload' : 'Создать в 1С'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {warehousePickerOpen && warehousePickerCandidates.length > 0 && (
+        <div className="dialogOverlay" onClick={(e) => { if (e.target === e.currentTarget) setWarehousePickerOpen(false) }}>
+          <div className="dialogBox">
+            <div className="dialogHeader">Выберите склад-источник материалов</div>
+            <div className="dialogBody">
+              <p>Найдено несколько складов с остатком ({warehousePickerProductIds.length} поз.). Выберите склад отправитель:</p>
+              {warehousePickerCandidates.map((c) => (
+                <div key={c.ref1c} className="dialogField" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <input
+                    type="radio"
+                    id={`wh-${c.ref1c}`}
+                    name="warehousePicker"
+                    value={c.ref1c}
+                    checked={warehousePickerSelected === c.ref1c}
+                    onChange={() => setWarehousePickerSelected(c.ref1c)}
+                  />
+                  <label htmlFor={`wh-${c.ref1c}`}>
+                    {c.name} ({c.components_covered}/{c.total_components} компонентов)
+                  </label>
+                </div>
+              ))}
+            </div>
+            <div className="dialogFooter">
+              <button onClick={() => setWarehousePickerOpen(false)}>Отмена</button>
+              <button className="primary" onClick={() => void confirmWarehousePicker()} disabled={!warehousePickerSelected}>
+                Подтвердить
               </button>
             </div>
           </div>

@@ -1,5 +1,8 @@
 export type OrderRow = {
   product_id: number
+  order_id?: number | null
+  order_source?: string | null  // 'mrp' | '1c'
+  order_ref1c?: string | null
   item_id?: number | null
   order_number: string
   order_date?: string | null
@@ -87,6 +90,13 @@ export type ControlSettings = {
   ignored_warehouses: IgnoredWarehouse[]
 }
 
+export type WarehouseCandidate = {
+  ref1c: string
+  name: string
+  components_covered: number
+  total_components: number
+}
+
 export type MaterialIssueCreateResponse = {
   status: string
   created: Array<{
@@ -96,6 +106,8 @@ export type MaterialIssueCreateResponse = {
     order_number?: string
     item_name?: string
     lines_count?: number
+    source_warehouse_ref1c?: string | null
+    warehouse_candidates?: WarehouseCandidate[]
   }>
   errors: string[]
 }

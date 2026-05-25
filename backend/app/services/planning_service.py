@@ -879,6 +879,7 @@ def get_run_purchases(
             PlannedPurchase.priority_index,
             PlannedPurchase.bucket_date,
             PlannedPurchase.supplier_ref1c,
+            PlannedPurchase.requested_qty,
         )
         .filter(PlannedPurchase.run_id == run_id)
     )
@@ -987,7 +988,9 @@ def get_run_purchases(
     for row in rows_joined:
         # Support both legacy tuples (with bucket_type) and new tuples (without)
         seq = list(row) if isinstance(row, (tuple, list)) else [row]
-        if len(seq) >= 16:
+        requested_qty_val = None
+        if len(seq) >= 17:
+            # Ultra-legacy: bucket_type + requested_qty both present
             (
                 purchase_id,
                 item_id_val,
@@ -999,6 +1002,27 @@ def get_run_purchases(
                 bucket_type_val,
                 bucket_date_val,
                 supplier_ref1c_val,
+                requested_qty_val,
+                in_name,
+                in_article,
+                in_unit_guid,
+                in_unit_short,
+                in_unit_name,
+                in_unit_code,
+            ) = seq[:17]
+        elif len(seq) >= 16:
+            # Current schema: requested_qty at position 9, no bucket_type
+            (
+                purchase_id,
+                item_id_val,
+                qty_val,
+                need_date_val,
+                order_date_val,
+                lead_time_days_val,
+                priority_index_val,
+                bucket_date_val,
+                supplier_ref1c_val,
+                requested_qty_val,
                 in_name,
                 in_article,
                 in_unit_guid,
@@ -1006,7 +1030,9 @@ def get_run_purchases(
                 in_unit_name,
                 in_unit_code,
             ) = seq[:16]
+            bucket_type_val = "daily"
         elif len(seq) >= 15:
+            # Old schema without requested_qty
             (
                 purchase_id,
                 item_id_val,
@@ -1036,6 +1062,7 @@ def get_run_purchases(
             priority_index_val = getattr(row, "priority_index", None)
             bucket_date_val = getattr(row, "bucket_date", None)
             supplier_ref1c_val = getattr(row, "supplier_ref1c", None)
+            requested_qty_val = getattr(row, "requested_qty", None)
             in_name = getattr(row, "item_name", None)
             in_article = getattr(row, "item_article", None)
             in_unit_guid = getattr(row, "unit", None)
@@ -1062,6 +1089,7 @@ def get_run_purchases(
                     priority_index_val,
                     bucket_date_val,
                     supplier_ref1c_val,
+                    requested_qty_val,
                     in_name,
                     in_article,
                     in_unit_guid,
@@ -1089,6 +1117,7 @@ def get_run_purchases(
             priority_index_val,
             bucket_date_val,
             supplier_ref1c_val,
+            requested_qty_val,
             in_name,
             in_article,
             in_unit_guid,
@@ -1132,6 +1161,7 @@ def get_run_purchases(
                 "item_article": in_article,
                 "unit": unit_display,
                 "qty": 0.0,
+                "requested_qty": 0.0,
                 "need_date": need_date_val.isoformat() if need_date_val else None,
                 "order_date": order_date_val.isoformat() if order_date_val else None,
                 "lead_time_days": int(lead_time_days_val or 0),
@@ -1154,6 +1184,7 @@ def get_run_purchases(
             )
         
         aggregated_data[agg_key]["qty"] += float(qty_val or 0.0)
+        aggregated_data[agg_key]["requested_qty"] += float(requested_qty_val or 0.0)
         if purchase_id is not None:
             aggregated_data[agg_key].setdefault("source_purchase_ids", []).append(int(purchase_id))
 
@@ -1163,6 +1194,10 @@ def get_run_purchases(
         values["purchase_id"] = hash(
             f"{values['item_id']}_{values['unit']}_{values['need_date'] or ''}_{values['bucket_type']}_{values['bucket_date']}"
         ) % (10**10)
+        # supplier_covered_qty = gross need minus net planned purchase (rounded to avoid float noise)
+        req = float(values.get("requested_qty") or 0.0)
+        net = float(values.get("qty") or 0.0)
+        values["supplier_covered_qty"] = round(max(0.0, req - net), 6)
         data.append(values)
 
     sort_map = {

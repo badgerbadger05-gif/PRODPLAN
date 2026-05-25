@@ -538,3 +538,33 @@ def update_line_state(db: Session, product_id: int, payload: Dict[str, Any]) -> 
 
     db.commit()
     return {"status": "ok", "product_id": int(product_id)}
+
+
+def update_product_quantity(db: Session, product_id: int, quantity: float) -> Dict[str, Any]:
+    """
+    Adjust the planned quantity on a ProductionProduct line.
+
+    Rules:
+    - quantity must be > 0.
+    - quantity cannot be set below already produced_qty (can't un-produce).
+    - remaining_qty is recalculated as max(0, quantity - produced_qty).
+    """
+    product = db.query(ProductionProduct).filter(ProductionProduct.product_id == int(product_id)).one_or_none()
+    if product is None:
+        raise ValueError(f"product_id={product_id}: строка заказа не найдена")
+
+    qty = float(quantity)
+    if qty <= 0:
+        raise ValueError("quantity должен быть положительным")
+
+    produced = _to_float(product.produced_qty)
+    if qty < produced - 1e-9:
+        raise ValueError(
+            f"quantity={qty} меньше уже выпущенного ({produced}). "
+            "Нельзя уменьшить заказ ниже факта."
+        )
+
+    product.quantity = qty
+    product.remaining_qty = max(0.0, qty - produced)
+    db.commit()
+    return {"status": "ok", "product_id": int(product_id), "quantity": float(qty), "remaining_qty": float(product.remaining_qty)}

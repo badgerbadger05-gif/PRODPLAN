@@ -378,15 +378,23 @@ function PurchaseResultTable({ rows, selectedIds, onSelectedIdsChange }: {
             />
           </th>
           <th>Номенклатура</th>
-          <th>Кол-во</th>
+          <th>К заказу</th>
           <th>Потребность</th>
-          <th>Заказать</th>
-          <th>Срок</th>
+          <th>Заказать до</th>
+          <th>Срок пост.</th>
+          <th>Покрыто</th>
           <th>Примечание</th>
         </tr>
       </thead>
       <tbody>
-        {rows.map((row) => (
+        {rows.map((row) => {
+          const covered = Number(row.supplier_covered_qty ?? 0)
+          const requested = Number(row.requested_qty ?? row.qty)
+          const coveragePct = requested > 0 ? Math.min(100, Math.round((covered / requested) * 100)) : 0
+          const coverageLabel = covered > 0
+            ? `${qty(covered)} / ${qty(requested)} ${row.unit || ''} (${coveragePct}%)`
+            : '—'
+          return (
           <tr key={row.purchase_id}>
             <td className="checkCol">
               <input
@@ -403,10 +411,13 @@ function PurchaseResultTable({ rows, selectedIds, onSelectedIdsChange }: {
             <td className="numCell"><strong>{qty(row.qty)}</strong><span>{row.unit || ''}</span></td>
             <td>{dateRu(row.need_date) || '—'}</td>
             <td>{dateRu(row.order_date) || '—'}</td>
-            <td className="numCell"><strong>{qty(row.lead_time_days)}</strong><span>дн.</span></td>
+            <td className="numCell" title={`Покрыто активными заказами поставщику: ${coverageLabel}`} style={{ color: covered > 0 ? (coveragePct >= 100 ? 'var(--color-success, green)' : 'var(--color-warning, orange)') : undefined }}>
+              {covered > 0 ? coverageLabel : '—'}
+            </td>
             <td>{row.badge || (row.late_supplier_order ? 'Покрыто заказом, но с опозданием' : '')}</td>
           </tr>
-        ))}
+          )
+        })}
       </tbody>
     </table>
   )

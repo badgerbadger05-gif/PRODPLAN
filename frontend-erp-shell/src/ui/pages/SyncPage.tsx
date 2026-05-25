@@ -273,7 +273,13 @@ export function SyncPage() {
               onClear={() => setSelectedGroups(new Set())}
               onSave={() => void runNamed('Сохранить выбор групп', () => saveNomenclatureGroupSelection(Array.from(selectedGroups)))}
             >
-              {groups.map((g) => (
+              {groups.length === 0 ? (
+                <div className="emptyDetail" style={{ padding: '8px 0' }}>
+                  {selectedGroups.size > 0
+                    ? `Список групп не загружен. Сохранено ${selectedGroups.size} позиций — запустите синхронизацию «Группы номенклатуры», чтобы обновить список.`
+                    : 'Список групп пуст — запустите синхронизацию «Группы номенклатуры».'}
+                </div>
+              ) : groups.map((g) => (
                 <label className="selectionRow" key={g.id}>
                   <input
                     type="checkbox"

@@ -5,7 +5,6 @@ type Props = {
   rows: OrderRow[]
   selectedIds: Set<number>
   loading: boolean
-  onStartSelected: () => void
   onExportTo1C: () => void
   onSyncFrom1C: () => void
   onProduce: () => void
@@ -23,7 +22,6 @@ export function ProductionCommandBar({
   rows,
   selectedIds,
   loading,
-  onStartSelected,
   onExportTo1C,
   onSyncFrom1C,
   onProduce,
@@ -37,8 +35,7 @@ export function ProductionCommandBar({
 }: Props) {
   return (
     <div className="commandBar">
-      <button className="primary" onClick={onStartSelected} disabled={!selectedIds.size || loading} title="Создать ЗаказНаПроизводство в 1С">Запустить в 1С</button>
-      <button onClick={onExportTo1C} disabled={!selectedIds.size || loading} title="Экспортировать выбранные строки в 1С">Экспорт в 1С</button>
+      <button className="primary" onClick={onExportTo1C} disabled={!selectedIds.size || loading} title="Создать Document_ЗаказНаПроизводство в 1С (только MRP-строки)">Запустить в 1С</button>
       <button onClick={onSyncFrom1C} disabled={loading} title="Проверить статусы в 1С">Синхронизировать</button>
       <button onClick={onProduce} disabled={!activeRow || loading} title="Создать выпуск в 1С">Произвести</button>
       <div className="barSeparator" />

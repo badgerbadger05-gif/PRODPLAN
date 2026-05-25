@@ -72,6 +72,8 @@ export type MrpPurchaseRow = {
   item_article?: string | null
   unit?: string | null
   qty: number
+  requested_qty?: number | null
+  supplier_covered_qty?: number | null
   need_date?: string | null
   order_date?: string | null
   lead_time_days?: number | null

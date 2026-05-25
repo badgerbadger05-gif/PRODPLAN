@@ -197,13 +197,28 @@ def create_period_plan(
     if not title:
         raise ValueError("Название плана обязательно")
 
+    # Auto-generate comment from period_from if caller did not provide one.
+    # Format: "МАЙ 2026" / "МАЙ–ИЮНЬ 2026" for multi-month ranges.
+    effective_comment = comment
+    if not effective_comment:
+        _RU_MONTHS = [
+            "ЯНВАРЬ", "ФЕВРАЛЬ", "МАРТ", "АПРЕЛЬ", "МАЙ", "ИЮНЬ",
+            "ИЮЛЬ", "АВГУСТ", "СЕНТЯБРЬ", "ОКТЯБРЬ", "НОЯБРЬ", "ДЕКАБРЬ",
+        ]
+        if start.year == finish.year and start.month == finish.month:
+            effective_comment = f"{_RU_MONTHS[start.month - 1]} {start.year}"
+        elif start.year == finish.year:
+            effective_comment = f"{_RU_MONTHS[start.month - 1]}–{_RU_MONTHS[finish.month - 1]} {start.year}"
+        else:
+            effective_comment = f"{_RU_MONTHS[start.month - 1]} {start.year} – {_RU_MONTHS[finish.month - 1]} {finish.year}"
+
     plan = ProductionPlanHeader(
         name=title,
         period_from=start,
         period_to=finish,
         status="draft",
         created_by=created_by,
-        comment=comment,
+        comment=effective_comment,
     )
     db.add(plan)
     db.commit()

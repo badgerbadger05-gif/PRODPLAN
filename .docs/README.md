@@ -40,6 +40,20 @@ rebuild.bat
 - `period_plan_target.md` — контракт страницы «Период план» (жизненный цикл, матрица, MRP-снимок, журнал, хоткеи)
 - `troubleshooting.md` — команды и диагностика
 - `progress.md` — текущее состояние/решения/проблемы
+- `workplan.md` — **план работ с чекбоксами** (что делать дальше, приоритеты)
+
+## Матрица CI-команд
+
+Перед мержем убедиться что все четыре шага зелёные:
+
+| Шаг | Директория | Команда | Что проверяет |
+|---|---|---|---|
+| Backend pytest | корень проекта | `python -m pytest tests/ -x -q` | 148 тестов сервисов/роутеров |
+| Frontend lint | `frontend-erp-shell/` | `npm run lint` | ESLint flat-config (0 ошибок) |
+| Frontend build | `frontend-erp-shell/` | `npm run build` | TypeScript + Vite (0 ошибок типов) |
+| Docker smoke | корень проекта | `docker compose up -d && curl -f http://localhost:8000/health` | Backend стартует в контейнере |
+
+Playwright (E2E) — пока не настроен, TODO.
 
 ## Правила
 

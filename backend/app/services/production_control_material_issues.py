@@ -1,21 +1,102 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
+    IgnoredWarehouse,
+    ItemWarehouseStock,
     ProductionMaterialIssue,
     ProductionMaterialIssueLine,
     ProductionOrderLineState,
     ProductionProduct,
+    StockWarehouse,
     WorkshopWarehouseBinding,
 )
 from ..schemas import ODataSyncRequest
 from .production_control_common import date_to_iso as _date_to_iso, to_float as _to_float
 from .production_control_domain import ensure_state as _ensure_state, unit_display as _unit_display
 from .production_control_material_availability import _components_for_product
+
+
+def _auto_select_source_warehouse(
+    db: Session,
+    component_item_ids: List[int],
+) -> Tuple[Optional[str], List[Dict[str, Any]]]:
+    """
+    Given a list of component item_ids, find the best source warehouse.
+
+    Returns (selected_ref1c, candidates) where:
+    - selected_ref1c is the auto-chosen warehouse ref (or None if ambiguous/none)
+    - candidates is a list of dicts with {ref1c, name, components_covered, total_components}
+
+    Excludes ignored_warehouses. Ignores warehouses with is_selected=False
+    (those are deliberately excluded from stock accounting).
+
+    A warehouse is "best" if it covers the most distinct components with qty>0.
+    If exactly one warehouse covers the maximum — it is auto-selected.
+    If there's a tie — returns None + all tied candidates so UI can ask.
+    """
+    if not component_item_ids:
+        return None, []
+
+    total = len(component_item_ids)
+
+    ignored_refs = {
+        str(r[0])
+        for r in db.query(IgnoredWarehouse.warehouse_ref1c).all()
+    }
+    selected_refs = {
+        str(r[0])
+        for r in db.query(StockWarehouse.warehouse_ref1c)
+        .filter(StockWarehouse.is_selected.is_(True))
+        .all()
+    }
+
+    rows = (
+        db.query(ItemWarehouseStock.warehouse_ref1c, ItemWarehouseStock.item_id)
+        .filter(
+            ItemWarehouseStock.item_id.in_(component_item_ids),
+            ItemWarehouseStock.qty > 0,
+        )
+        .all()
+    )
+
+    coverage: Dict[str, set] = {}
+    for wh_ref, item_id in rows:
+        wh_ref = str(wh_ref)
+        if wh_ref in ignored_refs:
+            continue
+        if selected_refs and wh_ref not in selected_refs:
+            continue
+        coverage.setdefault(wh_ref, set()).add(int(item_id))
+
+    if not coverage:
+        return None, []
+
+    wh_names: Dict[str, str] = {
+        str(r[0]): str(r[1] or r[0])
+        for r in db.query(StockWarehouse.warehouse_ref1c, StockWarehouse.warehouse_name).all()
+    }
+
+    max_covered = max(len(v) for v in coverage.values())
+    candidates = [
+        {
+            "ref1c": ref,
+            "name": wh_names.get(ref, ref),
+            "components_covered": len(covered),
+            "total_components": total,
+        }
+        for ref, covered in coverage.items()
+        if len(covered) == max_covered
+    ]
+
+    if len(candidates) == 1:
+        return candidates[0]["ref1c"], candidates
+
+    return None, candidates
 
 
 def _next_issue_number(db: Session) -> str:
@@ -31,6 +112,7 @@ def create_material_issues(
     *,
     initiated_by: Optional[str] = None,
     warehouse_ref1c: Optional[str] = None,
+    source_warehouse_ref1c: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Idempotent per the plan: a repeated click on "prepare issue" for the same
@@ -82,6 +164,13 @@ def create_material_issues(
             errors.append(f"product_id={pid}: не найдена спецификация или материалы")
             continue
 
+        # Auto-select source warehouse from per-warehouse stock breakdown.
+        # Caller may override by passing source_warehouse_ref1c explicitly
+        # (e.g. after showing the user a picker when ambiguous).
+        component_item_ids = [int(c["component_item_id"]) for c in components]
+        auto_source_wh, source_candidates = _auto_select_source_warehouse(db, component_item_ids)
+        resolved_source_wh = source_warehouse_ref1c or auto_source_wh
+
         # If the caller did not pin a destination warehouse, fall back to the
         # workshop->warehouse binding from settings. Plan rule:
         # "привязка участок -> склад получатель".
@@ -110,6 +199,7 @@ def create_material_issues(
             order_id=int(product.order_id),
             status="draft",
             warehouse_ref1c=resolved_warehouse,
+            source_warehouse_ref1c=resolved_source_wh,
             initiated_by=initiated_by,
         )
         db.add(issue)
@@ -133,16 +223,18 @@ def create_material_issues(
         # ждём проведения) unless it's already further along.
         if state.status in {"shortage", "partial", "ready"}:
             state.status = "to_move"
-        created.append(
-            {
-                "issue_id": int(issue.issue_id),
-                "document_number": issue.document_number,
-                "product_id": int(product.product_id),
-                "order_number": str(product.order.order_number or ""),
-                "item_name": str(product.item.item_name or ""),
-                "lines_count": len(components),
-            }
-        )
+        entry: Dict[str, Any] = {
+            "issue_id": int(issue.issue_id),
+            "document_number": issue.document_number,
+            "product_id": int(product.product_id),
+            "order_number": str(product.order.order_number or ""),
+            "item_name": str(product.item.item_name or ""),
+            "lines_count": len(components),
+            "source_warehouse_ref1c": resolved_source_wh,
+        }
+        if len(source_candidates) > 1:
+            entry["warehouse_candidates"] = source_candidates
+        created.append(entry)
     db.commit()
     return {"status": "ok", "created": created, "reused": reused, "errors": errors}
 
