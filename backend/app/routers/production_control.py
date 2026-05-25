@@ -20,6 +20,7 @@ from ..services.production_control_material_issues import (
 )
 from ..services.production_control_journal import (
     create_orders_from_mrp,
+    create_production_orders_from_mrp_requirements,
     list_journal,
     update_line_state,
 )
@@ -49,6 +50,11 @@ class MaterialIssueCreatePayload(BaseModel):
 
 class OrdersFromMrpPayload(BaseModel):
     planned_order_ids: List[int]
+    initiated_by: Optional[str] = None
+
+
+class OrdersFromMrpRequirementsPayload(BaseModel):
+    requirement_ids: List[int]
     initiated_by: Optional[str] = None
 
 
@@ -210,6 +216,32 @@ def post_orders_from_mrp(payload: OrdersFromMrpPayload, db: Session = Depends(ge
         return create_orders_from_mrp(
             db,
             [int(x) for x in payload.planned_order_ids],
+            initiated_by=payload.initiated_by,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/orders/from-mrp-requirements", response_model=dict)
+def post_orders_from_mrp_requirements(
+    payload: OrdersFromMrpRequirementsPayload,
+    db: Session = Depends(get_db),
+):
+    """
+    Materialize selected MrpRequirement rows (production-flow items from a
+    period-plan MRP snapshot) into internal production orders.
+
+    Idempotent: requirements that already have a ProductionProduct linked via
+    source_mrp_requirement_id are returned under `reused`.
+    Purchase/rework requirements are returned under `skipped`.
+    MrpRequirement.covered_qty / remaining_qty are updated.
+    """
+    if not payload.requirement_ids:
+        raise HTTPException(status_code=400, detail="Не выбраны требования MRP")
+    try:
+        return create_production_orders_from_mrp_requirements(
+            db,
+            [int(x) for x in payload.requirement_ids],
             initiated_by=payload.initiated_by,
         )
     except Exception as e:

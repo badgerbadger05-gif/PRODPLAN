@@ -246,6 +246,18 @@ class ProductionProduct(Base):
         ForeignKey('planned_order.order_id', ondelete="SET NULL"),
         nullable=True,
     )
+    # When this line was generated from a period-plan MRP snapshot, points to
+    # the mrp_requirement row it satisfies. NULL for 1C-synced and legacy-MRP
+    # planned_order lines. Added by migration 20260522_06.
+    source_mrp_requirement_id = Column(
+        Integer,
+        ForeignKey('mrp_requirement.id', ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # Opaque idempotency key for period-plan order allocation. Added by
+    # migration 20260522_06.
+    source_mrp_allocation_key = Column(String(100), nullable=True, index=True)
     created_at = Column(TIMESTAMP, default=func.now())
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
 

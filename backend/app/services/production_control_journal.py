@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session, joinedload
 from ..models import (
     DefaultSpecification,
     Item,
+    MrpRequirement,
     PlannedOrder,
     ProductionMaterialIssue,
     ProductionOrder,
@@ -26,6 +27,7 @@ from .production_control_domain import (
     latest_run_id as _latest_run_id,
     unit_display as _unit_display,
 )
+from .replenishment import REPLENISHMENT_FLOW_PRODUCTION, classify_replenishment_flow
 
 
 DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
@@ -214,6 +216,155 @@ def create_orders_from_mrp(
 
     db.commit()
     return {"status": "ok", "created": created, "reused": reused, "errors": errors, "initiated_by": initiated_by}
+
+
+def create_production_orders_from_mrp_requirements(
+    db: Session,
+    requirement_ids: Sequence[int],
+    *,
+    initiated_by: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Materialize selected MrpRequirement rows (production-flow items) into
+    internal production orders (ProductionOrder.source='mrp').
+
+    Only production-flow items are processed; purchase/rework requirements are
+    skipped (they are covered by PlannedPurchase / PlannedRework instead).
+
+    Idempotent: if a ProductionProduct already links to this requirement via
+    source_mrp_requirement_id, the existing order is returned in `reused` and
+    no duplicate is created.
+
+    MrpRequirement.covered_qty / remaining_qty are updated to reflect newly
+    created orders.
+    """
+    created: List[Dict[str, Any]] = []
+    reused: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    errors: List[str] = []
+
+    today = datetime.utcnow()
+
+    for rid_raw in requirement_ids:
+        try:
+            rid = int(rid_raw)
+        except Exception:
+            errors.append(f"requirement_id={rid_raw!r}: невалидный идентификатор")
+            continue
+
+        req = db.query(MrpRequirement).filter(MrpRequirement.id == rid).first()
+        if not req:
+            errors.append(f"requirement_id={rid}: требование не найдено")
+            continue
+
+        item = db.query(Item).filter(Item.item_id == int(req.item_id)).first()
+        if not item:
+            errors.append(f"requirement_id={rid}: номенклатура {req.item_id} не найдена")
+            continue
+
+        # Only production-flow items get production orders
+        flow = classify_replenishment_flow(getattr(item, "replenishment_method", None))
+        if flow != REPLENISHMENT_FLOW_PRODUCTION:
+            skipped.append({
+                "requirement_id": rid,
+                "item_id": int(req.item_id),
+                "reason": f"flow={flow}",
+            })
+            continue
+
+        remaining = _to_float(req.remaining_qty)
+        if remaining <= 1e-9:
+            skipped.append({
+                "requirement_id": rid,
+                "item_id": int(req.item_id),
+                "reason": "remaining_qty=0 (уже покрыто)",
+            })
+            continue
+
+        # Idempotency: one production order per requirement
+        existing_product = (
+            db.query(ProductionProduct)
+            .filter(ProductionProduct.source_mrp_requirement_id == rid)
+            .order_by(ProductionProduct.product_id.desc())
+            .first()
+        )
+        if existing_product is not None:
+            existing_order = (
+                db.query(ProductionOrder)
+                .filter(ProductionOrder.order_id == existing_product.order_id)
+                .first()
+            )
+            reused.append({
+                "requirement_id": rid,
+                "product_id": int(existing_product.product_id),
+                "order_id": int(existing_product.order_id),
+                "order_number": str(existing_order.order_number) if existing_order else None,
+                "item_id": int(req.item_id),
+                "item_name": str(item.item_name or ""),
+            })
+            continue
+
+        qty = remaining
+        order_number = f"MRP-R-{rid}"
+        order = ProductionOrder(
+            order_number=order_number,
+            order_date=today,
+            order_ref1c=None,
+            is_posted=False,
+            deletion_mark=False,
+            source="mrp",
+            source_run_id=int(req.run_id),
+        )
+        db.add(order)
+        db.flush()
+
+        product = ProductionProduct(
+            order_id=int(order.order_id),
+            item_id=int(req.item_id),
+            line_number=1,
+            quantity=qty,
+            produced_qty=0,
+            remaining_qty=qty,
+            spec_id=_default_spec_id_for_item(db, int(req.item_id)),
+            source_mrp_requirement_id=rid,
+        )
+        db.add(product)
+        db.flush()
+
+        state = ProductionOrderLineState(
+            product_id=int(product.product_id),
+            status="shortage",
+            issue_status="not_requested",
+            planned_start_date=req.period_from,
+            planned_finish_date=req.period_to,
+        )
+        db.add(state)
+
+        # Reflect coverage in the requirement row
+        net_qty = _to_float(req.net_required_qty)
+        new_covered = min(_to_float(req.covered_qty) + qty, net_qty)
+        req.covered_qty = new_covered
+        req.remaining_qty = max(net_qty - new_covered, 0.0)
+
+        created.append({
+            "requirement_id": rid,
+            "product_id": int(product.product_id),
+            "order_id": int(order.order_id),
+            "order_number": order_number,
+            "item_id": int(req.item_id),
+            "item_name": str(item.item_name or ""),
+            "qty": qty,
+        })
+
+    db.commit()
+    return {
+        "status": "ok",
+        "created": created,
+        "reused": reused,
+        "skipped": skipped,
+        "errors": errors,
+        "initiated_by": initiated_by,
+    }
 
 
 def _default_spec_id_for_item(db: Session, item_id: int) -> Optional[int]:

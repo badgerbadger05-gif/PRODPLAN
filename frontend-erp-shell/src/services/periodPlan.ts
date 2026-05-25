@@ -128,3 +128,13 @@ export function allocatePurchases(runId: number) {
 export function allocateRework(runId: number) {
   return api<{ status: string; updated_count: number }>(`/v1/plan/results/${runId}/rework/allocate`, { method: 'POST' })
 }
+
+export function createProductionOrdersFromRequirements(requirementIds: number[], initiatedBy = 'erp-shell') {
+  return api<{ status: string; created: unknown[]; reused: unknown[]; skipped: unknown[]; errors: string[] }>(
+    '/v1/production-control/orders/from-mrp-requirements',
+    {
+      method: 'POST',
+      body: JSON.stringify({ requirement_ids: requirementIds, initiated_by: initiatedBy }),
+    },
+  )
+}

@@ -1069,21 +1069,27 @@ def get_period_plan_execution_journal(
             "remaining_qty": _to_float(pp.remaining_qty),
         })
 
-    # Purchase: PlannedPurchase by run_id + item_id
-    purchases_by_item: Dict[int, List[Dict[str, Any]]] = {}
+    # Purchase: PlannedPurchase linked via source_mrp_requirement_id (precise),
+    # with a fallback to run_id + item_id for rows created before migration 08.
+    purchases_by_req_id: Dict[int, List[Dict[str, Any]]] = {}
+    purchases_by_item_fallback: Dict[int, List[Dict[str, Any]]] = {}
     for pp in (
         db.query(PlannedPurchase)
         .filter(PlannedPurchase.run_id == int(run.run_id), PlannedPurchase.item_id.in_(item_ids))
         .all()
     ):
-        purchases_by_item.setdefault(int(pp.item_id), []).append({
+        entry = {
             "type": "planned_purchase",
             "purchase_id": int(pp.purchase_id),
             "qty": _to_float(pp.qty),
             "need_date": pp.need_date.isoformat() if pp.need_date else None,
             "order_date": pp.order_date.isoformat() if pp.order_date else None,
             "lead_time_days": int(pp.lead_time_days or 0),
-        })
+        }
+        if pp.source_mrp_requirement_id is not None:
+            purchases_by_req_id.setdefault(int(pp.source_mrp_requirement_id), []).append(entry)
+        else:
+            purchases_by_item_fallback.setdefault(int(pp.item_id), []).append(entry)
 
     # Rework: PlannedRework by run_id + item_id
     reworks_by_item: Dict[int, List[Dict[str, Any]]] = {}
@@ -1126,7 +1132,7 @@ def get_period_plan_execution_journal(
         if item_flow == REPLENISHMENT_FLOW_PRODUCTION:
             work_items = prods_by_req_id.get(req_id, [])
         elif item_flow == REPLENISHMENT_FLOW_PURCHASE:
-            work_items = purchases_by_item.get(int(req.item_id), [])
+            work_items = purchases_by_req_id.get(req_id, []) or purchases_by_item_fallback.get(int(req.item_id), [])
         else:
             work_items = reworks_by_item.get(int(req.item_id), [])
 

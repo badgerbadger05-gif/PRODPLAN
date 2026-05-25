@@ -24,6 +24,7 @@ import {
   bulkUpsertPeriodPlanLines,
   createMrpSnapshot,
   createPeriodPlan,
+  createProductionOrdersFromRequirements,
   deleteItemFromPeriodPlan,
   deletePeriodPlan,
   fixPeriodPlan,
@@ -650,6 +651,34 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     }
   }
 
+  async function handleCreateProductionOrders() {
+    if (!journal) return
+    const reqIds = journal.rows
+      .filter((r) => r.flow === 'production' && r.remaining_qty > 1e-9)
+      .map((r) => r.req_id)
+    if (!reqIds.length) return
+    setActing(true)
+    setError('')
+    setMessage('')
+    try {
+      const result = await createProductionOrdersFromRequirements(reqIds)
+      const created = (result.created as unknown[]).length
+      const reused = (result.reused as unknown[]).length
+      const skipped = (result.skipped as unknown[]).length
+      const parts: string[] = []
+      if (created) parts.push(`создано ${created}`)
+      if (reused) parts.push(`уже было ${reused}`)
+      if (skipped) parts.push(`пропущено ${skipped}`)
+      setMessage(`Заказы производства: ${parts.join(', ') || 'нет изменений'}`)
+      if (result.errors?.length) setError(result.errors.join('; '))
+      await loadJournal(journalFlow, activeRunId ?? undefined)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setActing(false)
+    }
+  }
+
   async function handleSaveMatrix() {
     if (!matrix) return
     const entries: Array<{ item_id: number; bucket_date: string; qty: number }> = []
@@ -1235,6 +1264,14 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
             <div className="commandBar">
               <button onClick={() => void loadJournal(journalFlow, activeRunId ?? undefined)} disabled={journalLoading}>Обновить</button>
               <button onClick={downloadJournalCsv} disabled={!journal || journalLoading}>CSV</button>
+              <div className="barSeparator" />
+              <button
+                onClick={() => void handleCreateProductionOrders()}
+                disabled={acting || !journal || !journal.rows.some((r) => r.flow === 'production' && r.remaining_qty > 1e-9)}
+                title="Создать заказы производства для незакрытых строк производственного потока"
+              >
+                Создать заказы производства
+              </button>
               <div className="barSeparator" />
               <label className="inlineControl">
                 <span>Прогон</span>
