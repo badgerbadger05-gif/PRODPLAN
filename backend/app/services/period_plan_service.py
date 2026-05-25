@@ -23,8 +23,14 @@ from ..models import (
     ResourceProductionKind,
     SpecComponent,
     Specification,
+    SupplierOrder,
+    SupplierOrderItem,
 )
-from .planning_service import DEFAULT_PLANNING_CONFIG, get_active_planning_config
+from .planning_service import (
+    DEFAULT_PLANNING_CONFIG,
+    SUPPLIER_ORDER_EXCLUDED_STATE_NAMES,
+    get_active_planning_config,
+)
 from .replenishment import (
     REPLENISHMENT_FLOW_PRODUCTION,
     REPLENISHMENT_FLOW_PURCHASE,
@@ -529,6 +535,69 @@ def _explode_bom_net_first(
     return gross_map, net_map, bom_level_map
 
 
+def _load_purchase_supplier_remaining(
+    db: Session,
+    item_ids: List[int],
+    period_to: date,
+) -> Dict[int, List[Dict[str, Any]]]:
+    """
+    Batch-load open supplier-order lines for the given purchased item IDs where
+    delivery_date <= period_to.  Results are sorted by delivery_date ascending so
+    they can be consumed greedily (earliest supply covers earliest demand).
+
+    Filtering rules mirror planning_service._get_active_supplier_remaining_by_item_date:
+    - Deleted supplier orders are skipped (deletion_mark=True).
+    - Orders whose normalised state name is in SUPPLIER_ORDER_EXCLUDED_STATE_NAMES are skipped.
+    - Lines without a delivery_date are skipped.
+    - Lines with remaining_qty <= 0 are skipped.
+    """
+    if not item_ids:
+        return {}
+
+    try:
+        rows = (
+            db.query(
+                SupplierOrderItem.item_id_ref,
+                SupplierOrderItem.delivery_date,
+                SupplierOrder.order_state_key,
+                SupplierOrder.order_state_name,
+                SupplierOrderItem.remaining_qty,
+            )
+            .join(SupplierOrder, SupplierOrder.order_id == SupplierOrderItem.order_id)
+            .filter(SupplierOrderItem.item_id_ref.in_(item_ids))
+            .filter(SupplierOrder.deletion_mark.is_(False))
+            .filter(SupplierOrderItem.delivery_date.isnot(None))
+            .filter(SupplierOrderItem.delivery_date < period_to + timedelta(days=1))
+            .filter(func.coalesce(SupplierOrderItem.remaining_qty, 0.0) > 0)
+            .order_by(SupplierOrderItem.delivery_date.asc())
+            .all()
+        )
+    except Exception:
+        rows = []
+
+    result: Dict[int, List[Dict[str, Any]]] = {}
+    for iid, delivery_dt, state_key, state_name, qty in rows:
+        try:
+            state_norm = str(state_name or "").strip().casefold().replace("ё", "е")
+            if not state_norm and not str(state_key or "").strip():
+                continue
+            if state_norm in SUPPLIER_ORDER_EXCLUDED_STATE_NAMES:
+                continue
+            item_id = int(iid)
+            delivery_date = (
+                delivery_dt.date() if isinstance(delivery_dt, datetime) else delivery_dt
+            )
+            remaining = float(qty or 0.0)
+        except Exception:
+            continue
+        if remaining <= 1e-12:
+            continue
+        result.setdefault(item_id, []).append(
+            {"delivery_date": delivery_date, "remaining_qty": remaining}
+        )
+    return result
+
+
 def create_mrp_snapshot_from_period_plan(
     db: Session,
     plan_id: int,
@@ -668,6 +737,25 @@ def create_mrp_snapshot_from_period_plan(
             .filter(DefaultSpecification.item_id.in_(allocatable_item_ids))
             .all()
         }
+
+        # Identify purchased items and pre-load active supplier orders for them.
+        # Supplier orders with delivery_date <= plan.period_to reduce the net
+        # demand that we need to issue PlannedPurchase for.
+        purchase_item_ids = [
+            iid for iid in allocatable_item_ids
+            if classify_replenishment_flow(
+                getattr(items_by_id.get(iid), "replenishment_method", None)
+            ) == REPLENISHMENT_FLOW_PURCHASE
+        ]
+        # Mutable working copy: {item_id: [{"delivery_date": date, "remaining_qty": float}, ...]}
+        # Already sorted by delivery_date ascending — consumed greedily per bucket.
+        supplier_work: Dict[int, List[Dict[str, Any]]] = {
+            iid: [dict(row) for row in rows]
+            for iid, rows in _load_purchase_supplier_remaining(
+                db, purchase_item_ids, plan.period_to
+            ).items()
+        }
+
         for iid in allocatable_item_ids:
             item = items_by_id.get(iid)
             if not item:
@@ -677,26 +765,50 @@ def create_mrp_snapshot_from_period_plan(
             alloc_total_qty = 0.0
 
             if flow == REPLENISHMENT_FLOW_PURCHASE:
+                req_id = int(req_by_item[iid].id) if iid in req_by_item else None
+                sup_rows = supplier_work.get(iid, [])  # sorted by delivery_date asc
+
                 for bucket_date, net_qty in sorted(net_map[iid].items()):
                     net_qty = float(net_qty)
                     if net_qty <= 1e-9:
                         continue
-                    need_date = bucket_date
-                    order_date = need_date - timedelta(days=lead_time)
-                    db.add(PlannedPurchase(
-                        run_id=int(run.run_id),
-                        item_id=int(iid),
-                        requested_qty=net_qty,
-                        planned_qty=net_qty,
-                        qty=net_qty,
-                        need_date=need_date,
-                        order_date=order_date,
-                        lead_time_days=lead_time,
-                        bucket_date=need_date,
-                        supplier_ref1c=getattr(item, "supplier_ref1c", None),
-                    ))
-                    purchase_count += 1
+
+                    # Consume supplier orders arriving no later than this bucket's need_date.
+                    # Earlier supply covers earlier demand (chronological greedy match).
+                    remaining_need = net_qty
+                    for sup_row in sup_rows:
+                        if remaining_need <= 1e-12:
+                            break
+                        if sup_row["delivery_date"] > bucket_date:
+                            break  # list is sorted; no earlier-arriving supply after this
+                        avail = float(sup_row.get("remaining_qty", 0.0) or 0.0)
+                        if avail <= 1e-12:
+                            continue
+                        used = min(avail, remaining_need)
+                        sup_row["remaining_qty"] = max(avail - used, 0.0)
+                        remaining_need = max(remaining_need - used, 0.0)
+
+                    # Full bucket demand is considered covered (by supplier or planned purchase).
                     alloc_total_qty += net_qty
+
+                    if remaining_need > 1e-9:
+                        # Only create a PlannedPurchase for the portion not covered by supplier.
+                        need_date = bucket_date
+                        order_date = need_date - timedelta(days=lead_time)
+                        db.add(PlannedPurchase(
+                            run_id=int(run.run_id),
+                            item_id=int(iid),
+                            requested_qty=net_qty,      # original bucket net demand
+                            planned_qty=remaining_need,  # after supplier netting
+                            qty=remaining_need,
+                            need_date=need_date,
+                            order_date=order_date,
+                            lead_time_days=lead_time,
+                            bucket_date=need_date,
+                            supplier_ref1c=getattr(item, "supplier_ref1c", None),
+                            source_mrp_requirement_id=req_id,
+                        ))
+                        purchase_count += 1
 
             elif flow == REPLENISHMENT_FLOW_REWORK:
                 spec_id = spec_id_by_item.get(iid)

@@ -766,6 +766,12 @@ class PlannedPurchase(Base):
     priority_index = Column(DECIMAL(10, 4), nullable=True)
     bucket_date = Column(Date, nullable=False)
     supplier_ref1c = Column(String(255), nullable=True)
+    source_mrp_requirement_id = Column(
+        Integer,
+        ForeignKey("mrp_requirement.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
 
 class PlannedRework(Base):
