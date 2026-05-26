@@ -12,6 +12,9 @@ from ..models import (
     Item,
     MrpRequirement,
     MrpRequirementBucket,
+    Operation,
+    PlannedOrder,
+    PlannedOrderStage,
     PlannedPurchase,
     PlannedRework,
     PlanningRun,
@@ -20,8 +23,10 @@ from ..models import (
     ProductionPlanHeader,
     ProductionPlanLine,
     ProductionResource,
+    ResourceStage,
     ResourceProductionKind,
     SpecComponent,
+    SpecOperation,
     Specification,
     SupplierOrder,
     SupplierOrderItem,
@@ -733,13 +738,16 @@ def create_mrp_snapshot_from_period_plan(
             )
             bucket_count += 1
 
-    # --- Allocate PlannedPurchase / PlannedRework for non-manufactured items ---
+    # --- Allocate PlannedOrder / PlannedPurchase / PlannedRework by replenishment flow ---
     allocatable_item_ids = [
         iid for iid, buckets in net_map.items()
         if any(float(q) > 1e-9 for q in buckets.values())
     ]
     purchase_count = 0
     rework_count = 0
+    production_count = 0
+    stage_count = 0
+    created_production_orders: List[PlannedOrder] = []
     if allocatable_item_ids:
         items_by_id: Dict[int, Item] = {
             r.item_id: r
@@ -851,14 +859,93 @@ def create_mrp_snapshot_from_period_plan(
                     alloc_total_qty += net_qty
 
             else:
-                continue  # manufactured — handled by create_orders_from_mrp
+                req_id = int(req_by_item[iid].id) if iid in req_by_item else None
+                for bucket_date, net_qty in sorted(net_map[iid].items()):
+                    net_qty = float(net_qty)
+                    if net_qty <= 1e-9:
+                        continue
+                    order = PlannedOrder(
+                        run_id=int(run.run_id),
+                        item_id=int(iid),
+                        requested_qty=net_qty,
+                        planned_qty=net_qty,
+                        qty=net_qty,
+                        need_date=bucket_date,
+                        start_date=bucket_date,
+                        finish_date=bucket_date,
+                        bucket_date=bucket_date,
+                        demand_ref=f"mrp_requirement:{req_id}" if req_id else None,
+                        demand_date=bucket_date,
+                    )
+                    db.add(order)
+                    created_production_orders.append(order)
+                    production_count += 1
+                    alloc_total_qty += net_qty
 
-            # Update MrpRequirement coverage for this non-manufactured item.
+            # Mark the requirement covered by the allocation created above.
             req = req_by_item.get(iid)
             if req and alloc_total_qty > 0:
                 total_net = _to_float(req.net_required_qty)
                 req.covered_qty = min(alloc_total_qty, total_net)
                 req.remaining_qty = max(0.0, total_net - alloc_total_qty)
+
+        if created_production_orders:
+            db.flush()
+            produced_item_ids = sorted({int(order.item_id) for order in created_production_orders})
+            produced_spec_id_by_item: Dict[int, int] = {
+                int(ds.item_id): int(ds.spec_id)
+                for ds in db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
+                .filter(DefaultSpecification.item_id.in_(produced_item_ids))
+                .all()
+            }
+            spec_ids = sorted(set(produced_spec_id_by_item.values()))
+            stage_norms_by_spec: Dict[int, List[Tuple[int, float]]] = {}
+            if spec_ids:
+                resource_id_by_stage: Dict[int, int] = {}
+                for row in db.query(ResourceStage.stage_id, ResourceStage.resource_id).all():
+                    try:
+                        sid = int(row.stage_id)
+                        resource_id_by_stage.setdefault(sid, int(row.resource_id))
+                    except Exception:
+                        continue
+                stage_rows = (
+                    db.query(
+                        SpecOperation.spec_id.label("spec_id"),
+                        SpecOperation.stage_id.label("stage_id"),
+                        func.sum(func.coalesce(SpecOperation.time_norm, Operation.time_norm, 0)).label("hours"),
+                    )
+                    .join(Operation, SpecOperation.operation_id == Operation.operation_id)
+                    .filter(SpecOperation.spec_id.in_(spec_ids))
+                    .filter(SpecOperation.stage_id.isnot(None))
+                    .group_by(SpecOperation.spec_id, SpecOperation.stage_id)
+                    .all()
+                )
+                for row in stage_rows:
+                    try:
+                        sid = int(row.stage_id)
+                        hours = float(row.hours or 0.0)
+                        if sid > 0 and hours > 1e-12:
+                            stage_norms_by_spec.setdefault(int(row.spec_id), []).append((sid, hours))
+                    except Exception:
+                        continue
+
+            for order in created_production_orders:
+                spec_id = produced_spec_id_by_item.get(int(order.item_id))
+                if not spec_id:
+                    continue
+                qty = _to_float(order.qty)
+                if qty <= 1e-12:
+                    continue
+                for stage_id, hours_per_unit in stage_norms_by_spec.get(int(spec_id), []):
+                    db.add(PlannedOrderStage(
+                        run_id=int(run.run_id),
+                        order_id=int(order.order_id),
+                        stage_id=int(stage_id),
+                        area_id=resource_id_by_stage.get(int(stage_id)),
+                        bucket_date=order.bucket_date,
+                        hours=float(hours_per_unit) * qty,
+                    ))
+                    stage_count += 1
 
     db.commit()
     return {
@@ -867,6 +954,8 @@ def create_mrp_snapshot_from_period_plan(
         "plan_id": int(plan.id),
         "requirement_count": int(req_count),
         "bucket_count": int(bucket_count),
+        "production_count": int(production_count),
+        "stage_count": int(stage_count),
         "purchase_count": int(purchase_count),
         "rework_count": int(rework_count),
     }
@@ -1065,7 +1154,7 @@ def get_period_plan_execution_journal(
     req_ids = [int(req.id) for req, _ in reqs_with_items]
     item_ids = [int(req.item_id) for req, _ in reqs_with_items]
 
-    # Production: ProductionProduct linked via source_mrp_requirement_id
+    # Production: actual production orders linked via source_mrp_requirement_id.
     prod_rows = (
         db.query(ProductionProduct, ProductionOrder)
         .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
@@ -1073,50 +1162,102 @@ def get_period_plan_execution_journal(
         .all()
     )
     prods_by_req_id: Dict[int, List[Dict[str, Any]]] = {}
+    prod_ordered_by_req_id: Dict[int, float] = {}
+    prod_done_by_req_id: Dict[int, float] = {}
     for pp, po in prod_rows:
-        prods_by_req_id.setdefault(int(pp.source_mrp_requirement_id), []).append({
+        req_id = int(pp.source_mrp_requirement_id)
+        qty_value = _to_float(pp.quantity)
+        remaining_value = _to_float(pp.remaining_qty)
+        produced_value = _to_float(getattr(pp, "produced_qty", 0.0))
+        done_value = produced_value if produced_value > 1e-9 else max(0.0, qty_value - remaining_value)
+        prod_ordered_by_req_id[req_id] = prod_ordered_by_req_id.get(req_id, 0.0) + qty_value
+        prod_done_by_req_id[req_id] = prod_done_by_req_id.get(req_id, 0.0) + done_value
+        prods_by_req_id.setdefault(req_id, []).append({
             "type": "production_order",
             "product_id": int(pp.product_id),
             "order_id": int(po.order_id),
             "order_number": str(po.order_number or ""),
             "order_state": str(po.order_state_name or po.order_state_key or ""),
-            "qty": _to_float(pp.quantity),
-            "remaining_qty": _to_float(pp.remaining_qty),
+            "qty": qty_value,
+            "completed_qty": done_value,
+            "remaining_qty": remaining_value,
         })
+
+    # Production: planned MRP tasks. They are the live work queue before real
+    # 1C production orders are created, so the execution journal must show them.
+    demand_refs = [f"mrp_requirement:{req_id}" for req_id in req_ids]
+    planned_orders_by_req_id: Dict[int, List[Dict[str, Any]]] = {}
+    planned_ordered_by_req_id: Dict[int, float] = {}
+    if demand_refs:
+        for po in (
+            db.query(PlannedOrder)
+            .filter(PlannedOrder.run_id == int(run.run_id), PlannedOrder.demand_ref.in_(demand_refs))
+            .all()
+        ):
+            raw_ref = str(po.demand_ref or "")
+            try:
+                req_id = int(raw_ref.split(":", 1)[1])
+            except Exception:
+                continue
+            qty_value = _to_float(po.qty)
+            planned_ordered_by_req_id[req_id] = planned_ordered_by_req_id.get(req_id, 0.0) + qty_value
+            planned_orders_by_req_id.setdefault(req_id, []).append({
+                "type": "planned_order",
+                "order_id": int(po.order_id),
+                "qty": qty_value,
+                "completed_qty": 0.0,
+                "remaining_qty": qty_value,
+                "need_date": po.need_date.isoformat() if po.need_date else None,
+            })
 
     # Purchase: PlannedPurchase linked via source_mrp_requirement_id (precise),
     # with a fallback to run_id + item_id for rows created before migration 08.
     purchases_by_req_id: Dict[int, List[Dict[str, Any]]] = {}
     purchases_by_item_fallback: Dict[int, List[Dict[str, Any]]] = {}
+    purchase_ordered_by_req_id: Dict[int, float] = {}
+    purchase_ordered_by_item_fallback: Dict[int, float] = {}
     for pp in (
         db.query(PlannedPurchase)
         .filter(PlannedPurchase.run_id == int(run.run_id), PlannedPurchase.item_id.in_(item_ids))
         .all()
     ):
+        qty_value = _to_float(pp.qty)
         entry = {
             "type": "planned_purchase",
             "purchase_id": int(pp.purchase_id),
-            "qty": _to_float(pp.qty),
+            "qty": qty_value,
+            "completed_qty": 0.0,
+            "remaining_qty": qty_value,
             "need_date": pp.need_date.isoformat() if pp.need_date else None,
             "order_date": pp.order_date.isoformat() if pp.order_date else None,
             "lead_time_days": int(pp.lead_time_days or 0),
         }
         if pp.source_mrp_requirement_id is not None:
-            purchases_by_req_id.setdefault(int(pp.source_mrp_requirement_id), []).append(entry)
+            req_id = int(pp.source_mrp_requirement_id)
+            purchases_by_req_id.setdefault(req_id, []).append(entry)
+            purchase_ordered_by_req_id[req_id] = purchase_ordered_by_req_id.get(req_id, 0.0) + qty_value
         else:
-            purchases_by_item_fallback.setdefault(int(pp.item_id), []).append(entry)
+            item_id = int(pp.item_id)
+            purchases_by_item_fallback.setdefault(item_id, []).append(entry)
+            purchase_ordered_by_item_fallback[item_id] = purchase_ordered_by_item_fallback.get(item_id, 0.0) + qty_value
 
     # Rework: PlannedRework by run_id + item_id
     reworks_by_item: Dict[int, List[Dict[str, Any]]] = {}
+    rework_ordered_by_item: Dict[int, float] = {}
     for rw in (
         db.query(PlannedRework)
         .filter(PlannedRework.run_id == int(run.run_id), PlannedRework.item_id.in_(item_ids))
         .all()
     ):
+        item_id = int(rw.item_id)
+        qty_value = _to_float(rw.qty)
+        rework_ordered_by_item[item_id] = rework_ordered_by_item.get(item_id, 0.0) + qty_value
         reworks_by_item.setdefault(int(rw.item_id), []).append({
             "type": "planned_rework",
             "rework_id": int(rw.rework_id),
-            "qty": _to_float(rw.qty),
+            "qty": qty_value,
+            "completed_qty": 0.0,
+            "remaining_qty": qty_value,
             "need_date": rw.need_date.isoformat() if rw.need_date else None,
             "order_date": rw.order_date.isoformat() if rw.order_date else None,
             "lead_time_days": int(rw.lead_time_days or 0),
@@ -1140,31 +1281,51 @@ def get_period_plan_execution_journal(
             continue
 
         req_id = int(req.id)
+        item_id = int(req.item_id)
+        gross_qty = _to_float(req.total_required_qty)
         net_qty = _to_float(req.net_required_qty)
-        covered_qty = _to_float(req.covered_qty)
-        remaining_qty = _to_float(req.remaining_qty)
+        stock_qty = max(0.0, gross_qty - net_qty)
 
         if item_flow == REPLENISHMENT_FLOW_PRODUCTION:
-            work_items = prods_by_req_id.get(req_id, [])
+            actual_items = prods_by_req_id.get(req_id, [])
+            planned_items = planned_orders_by_req_id.get(req_id, [])
+            work_items = actual_items or planned_items
+            ordered_qty = max(
+                prod_ordered_by_req_id.get(req_id, 0.0),
+                planned_ordered_by_req_id.get(req_id, 0.0),
+            )
+            completed_qty = prod_done_by_req_id.get(req_id, 0.0)
         elif item_flow == REPLENISHMENT_FLOW_PURCHASE:
-            work_items = purchases_by_req_id.get(req_id, []) or purchases_by_item_fallback.get(int(req.item_id), [])
+            work_items = purchases_by_req_id.get(req_id, []) or purchases_by_item_fallback.get(item_id, [])
+            ordered_qty = purchase_ordered_by_req_id.get(req_id, purchase_ordered_by_item_fallback.get(item_id, 0.0))
+            completed_qty = 0.0
         else:
-            work_items = reworks_by_item.get(int(req.item_id), [])
+            work_items = reworks_by_item.get(item_id, [])
+            ordered_qty = rework_ordered_by_item.get(item_id, 0.0)
+            completed_qty = 0.0
 
-        coverage_pct = round(covered_qty / net_qty * 100.0, 1) if net_qty > 1e-9 else 100.0
+        completed_qty = min(max(0.0, completed_qty), net_qty) if net_qty > 1e-9 else 0.0
+        remaining_qty = max(0.0, net_qty - completed_qty)
+        unassigned_qty = max(0.0, net_qty - ordered_qty)
+        progress_pct = round(completed_qty / net_qty * 100.0, 1) if net_qty > 1e-9 else 100.0
 
         rows.append({
             "req_id": req_id,
-            "item_id": int(req.item_id),
+            "item_id": item_id,
             "item_code": str(item.item_code or ""),
+            "item_article": str(item.item_article or "") if item.item_article else None,
             "item_name": str(item.item_name or ""),
             "flow": item_flow,
             "bom_level": int(req.bom_level or 0),
-            "gross_qty": _to_float(req.total_required_qty),
+            "gross_qty": gross_qty,
+            "stock_qty": stock_qty,
             "net_qty": net_qty,
-            "covered_qty": covered_qty,
+            "ordered_qty": ordered_qty,
+            "completed_qty": completed_qty,
+            "covered_qty": completed_qty,
             "remaining_qty": remaining_qty,
-            "coverage_pct": coverage_pct,
+            "unassigned_qty": unassigned_qty,
+            "coverage_pct": progress_pct,
             "work_items": work_items,
         })
 
@@ -1173,7 +1334,7 @@ def get_period_plan_execution_journal(
             summary["net_zero"] += 1
         elif remaining_qty < 1e-9:
             summary["fully_covered"] += 1
-        elif covered_qty > 1e-9:
+        elif completed_qty > 1e-9:
             summary["partially_covered"] += 1
         else:
             summary["not_covered"] += 1

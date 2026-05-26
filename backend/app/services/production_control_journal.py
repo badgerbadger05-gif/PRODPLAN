@@ -46,6 +46,16 @@ LINE_STATUSES = {
 # 'exported' = PRODPLAN posted the draft into 1C (Posted=false there).
 # 'posted'   = 1C admin провёл документ (we discovered Posted=true on sync).
 ISSUE_STATUSES = {"not_requested", "requested", "issued", "exported", "posted", "error"}
+COVERAGE_LABELS = {
+    "shortage": "Дефицит",
+    "partial": "Частично",
+    "ready": "Обеспечен",
+    "to_move": "К перемещению",
+    "assembled": "Собрано",
+    "produced_partial": "Произведен частично",
+    "produced": "Произведен",
+    "cancelled": "Отменен",
+}
 
 
 def _main_workshop_for_spec(db: Session, spec_id: Optional[int]) -> Tuple[Optional[int], Optional[str], Optional[int], Optional[str]]:
@@ -460,6 +470,7 @@ def list_journal(
             planned_finish = state.planned_finish_date
 
         issue_count = db.query(ProductionMaterialIssue).filter(ProductionMaterialIssue.product_id == product.product_id).count()
+        coverage_status = str(state.status if state else "shortage")
         result.append(
             {
                 "product_id": int(product.product_id),
@@ -479,7 +490,9 @@ def list_journal(
                 "quantity": _to_float(product.quantity),
                 "produced_qty": _to_float(product.produced_qty),
                 "remaining_qty": _to_float(product.remaining_qty),
-                "status": str(state.status if state else "shortage"),
+                "status": coverage_status,
+                "coverage_status": coverage_status,
+                "coverage_label": COVERAGE_LABELS.get(coverage_status, coverage_status),
                 "issue_status": str(state.issue_status if state else "not_requested"),
                 "planned_start_date": _date_to_iso(planned_start),
                 "planned_finish_date": _date_to_iso(planned_finish),

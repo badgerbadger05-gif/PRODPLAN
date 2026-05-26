@@ -380,7 +380,18 @@ interface DetailViewProps {
   onBack: () => void
 }
 
-type JournalSortKey = 'item_code' | 'item_name' | 'flow' | 'bom_level' | 'gross_qty' | 'net_qty' | 'covered_qty' | 'remaining_qty' | 'coverage_pct'
+type JournalSortKey =
+  | 'item_article'
+  | 'item_code'
+  | 'item_name'
+  | 'flow'
+  | 'bom_level'
+  | 'gross_qty'
+  | 'net_qty'
+  | 'ordered_qty'
+  | 'completed_qty'
+  | 'remaining_qty'
+  | 'coverage_pct'
 
 function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   const [plan, setPlan] = useState<PeriodPlan | null>(null)
@@ -858,9 +869,10 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     }
     if (journalCoverage) {
       rows = rows.filter((r) => {
-        if (journalCoverage === 'covered') return r.coverage_pct >= 95 && r.remaining_qty <= 0
-        if (journalCoverage === 'partial') return r.coverage_pct > 0 && r.coverage_pct < 95
-        if (journalCoverage === 'none') return r.coverage_pct <= 0
+        if (journalCoverage === 'covered') return r.remaining_qty <= 0 && r.net_qty > 0
+        if (journalCoverage === 'partial') return r.completed_qty > 0 && r.remaining_qty > 0
+        if (journalCoverage === 'ordered') return r.ordered_qty > 0 && r.completed_qty <= 0
+        if (journalCoverage === 'none') return r.ordered_qty <= 0 && r.completed_qty <= 0
         return true
       })
     }
@@ -882,12 +894,12 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   function downloadJournalCsv() {
     if (!journal) return
     const rows = filteredJournalRows
-    const headers = ['Код', 'Номенклатура', 'Поток', 'Уровень', 'Валовый', 'Нетто', 'Покрыто', 'Остаток', 'Покрытие %', 'Заданий']
+    const headers = ['Артикул', 'Номенклатура', 'Поток', 'Уровень', 'Потребность', 'К запуску/заказу', 'В заказах', 'Выполнено', 'Осталось', 'Прогресс %', 'Заданий']
     const esc = (v: unknown) => {
       const s = String(v ?? '')
       return /[",;\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
     }
-    const body = rows.map((r) => [r.item_code, r.item_name, flowLabel(r.flow), r.bom_level, r.gross_qty, r.net_qty, r.covered_qty, r.remaining_qty, r.coverage_pct, r.work_items.length].map(esc).join(';'))
+    const body = rows.map((r) => [r.item_article || r.item_code, r.item_name, flowLabel(r.flow), r.bom_level, r.gross_qty, r.net_qty, r.ordered_qty, r.completed_qty, r.remaining_qty, r.coverage_pct, r.work_items.length].map(esc).join(';'))
     const csv = '﻿' + [headers.join(';'), ...body].join('\n')
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
     const url = URL.createObjectURL(blob)
@@ -1309,20 +1321,21 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                 </select>
               </label>
               <label className="inlineControl">
-                <span>Покрытие</span>
+                <span>Статус</span>
                 <select value={journalCoverage} onChange={(e) => setJournalCoverage(e.target.value)}>
                   <option value="">Все</option>
-                  <option value="covered">Покрыто</option>
+                  <option value="covered">Закрыто</option>
                   <option value="partial">Частично</option>
-                  <option value="none">Не покрыто</option>
+                  <option value="ordered">В заказах</option>
+                  <option value="none">Без заданий</option>
                 </select>
               </label>
               {journal && (
                 <>
                   <div className="barSeparator" />
-                  <span className="toolbarText">Покрыто: {journal.summary.fully_covered} / {journal.summary.total_items}</span>
+                  <span className="toolbarText">Закрыто: {journal.summary.fully_covered} / {journal.summary.total_items}</span>
                   {journal.summary.not_covered > 0 && (
-                    <span style={{ color: 'var(--red)' }}>Не покрыто: {journal.summary.not_covered}</span>
+                    <span style={{ color: 'var(--red)' }}>Не начато: {journal.summary.not_covered}</span>
                   )}
                   {journal.summary.partially_covered > 0 && (
                     <span style={{ color: 'var(--orange)' }}>Частично: {journal.summary.partially_covered}</span>
@@ -1341,18 +1354,19 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
 
             {journal && (
               <div className="tablePane resultTablePane" style={{ flex: 1 }}>
-                <table className="journalTable" style={{ minWidth: 920 }}>
+                <table className="journalTable" style={{ minWidth: 1110 }}>
                   <thead>
                     <tr>
-                      <th style={{ width: 74, cursor: 'pointer' }} onClick={() => toggleJournalSort('item_code')}>Код{jSortArrow('item_code')}</th>
-                      <th style={{ width: 280, cursor: 'pointer' }} onClick={() => toggleJournalSort('item_name')}>Номенклатура{jSortArrow('item_name')}</th>
-                      <th style={{ width: 104, cursor: 'pointer' }} onClick={() => toggleJournalSort('flow')}>Поток{jSortArrow('flow')}</th>
+                      <th style={{ width: 88, cursor: 'pointer' }} onClick={() => toggleJournalSort('item_article')}>Артикул{jSortArrow('item_article')}</th>
+                      <th style={{ width: 300, cursor: 'pointer' }} onClick={() => toggleJournalSort('item_name')}>Номенклатура{jSortArrow('item_name')}</th>
+                      <th style={{ width: 104, cursor: 'pointer' }} onClick={() => toggleJournalSort('flow')}>Тип{jSortArrow('flow')}</th>
                       <th style={{ width: 52, textAlign: 'center', cursor: 'pointer' }} onClick={() => toggleJournalSort('bom_level')}>Ур.{jSortArrow('bom_level')}</th>
-                      <th className="numCell" style={{ cursor: 'pointer' }} onClick={() => toggleJournalSort('gross_qty')}>Валовый{jSortArrow('gross_qty')}</th>
-                      <th className="numCell" style={{ cursor: 'pointer' }} onClick={() => toggleJournalSort('net_qty')}>Нетто{jSortArrow('net_qty')}</th>
-                      <th className="numCell" style={{ cursor: 'pointer' }} onClick={() => toggleJournalSort('covered_qty')}>Покрыто{jSortArrow('covered_qty')}</th>
-                      <th className="numCell" style={{ cursor: 'pointer' }} onClick={() => toggleJournalSort('remaining_qty')}>Остаток{jSortArrow('remaining_qty')}</th>
-                      <th style={{ width: 80, textAlign: 'center', cursor: 'pointer' }} onClick={() => toggleJournalSort('coverage_pct')}>%{jSortArrow('coverage_pct')}</th>
+                      <th className="numCell" style={{ cursor: 'pointer' }} onClick={() => toggleJournalSort('gross_qty')}>Потребность{jSortArrow('gross_qty')}</th>
+                      <th className="numCell" style={{ cursor: 'pointer' }} onClick={() => toggleJournalSort('net_qty')}>К запуску{jSortArrow('net_qty')}</th>
+                      <th className="numCell" style={{ cursor: 'pointer' }} onClick={() => toggleJournalSort('ordered_qty')}>В заказах{jSortArrow('ordered_qty')}</th>
+                      <th className="numCell" style={{ cursor: 'pointer' }} onClick={() => toggleJournalSort('completed_qty')}>Выполнено{jSortArrow('completed_qty')}</th>
+                      <th className="numCell" style={{ cursor: 'pointer' }} onClick={() => toggleJournalSort('remaining_qty')}>Осталось{jSortArrow('remaining_qty')}</th>
+                      <th style={{ width: 82, textAlign: 'center', cursor: 'pointer' }} onClick={() => toggleJournalSort('coverage_pct')}>Прогресс{jSortArrow('coverage_pct')}</th>
                       <th style={{ width: 64, textAlign: 'center' }}>Заданий</th>
                     </tr>
                   </thead>
@@ -1364,13 +1378,14 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                           style={{ cursor: row.work_items.length ? 'pointer' : undefined }}
                           onClick={() => setExpandedReq(expandedReq === row.req_id ? null : row.req_id)}
                         >
-                          <td><span className="muted">{row.item_code}</span></td>
+                          <td><span className="muted">{row.item_article || row.item_code}</span></td>
                           <td><strong>{row.item_name}</strong></td>
                           <td><span className={`miniPill ${flowClass(row.flow)}`}>{flowLabel(row.flow)}</span></td>
                           <td style={{ textAlign: 'center' }}>{row.bom_level}</td>
                           <td className="numCell"><strong>{qty(row.gross_qty)}</strong></td>
                           <td className="numCell"><strong>{qty(row.net_qty)}</strong></td>
-                          <td className="numCell">{qty(row.covered_qty)}</td>
+                          <td className="numCell">{row.ordered_qty > 0 ? qty(row.ordered_qty) : <span className="muted">—</span>}</td>
+                          <td className="numCell">{row.completed_qty > 0 ? qty(row.completed_qty) : <span className="muted">—</span>}</td>
                           <td className="numCell" style={{ color: row.remaining_qty > 0 ? 'var(--red)' : undefined }}>
                             {row.remaining_qty > 0 ? qty(row.remaining_qty) : '—'}
                           </td>
@@ -1387,9 +1402,11 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                           const href = workItemHref(wi as unknown as { type: string; order_id?: number; purchase_id?: number; rework_id?: number; run_id?: number })
                           const label = wi.type === 'production_order'
                             ? `Заказ ${wi.order_number || '#' + wi.order_id}`
-                            : wi.type === 'planned_purchase'
-                              ? `Закупка #${wi.purchase_id}`
-                              : `Переработка #${wi.rework_id}`
+                            : wi.type === 'planned_order'
+                              ? `Задание ${wi.order_id ? '#' + wi.order_id : ''}`
+                              : wi.type === 'planned_purchase'
+                                ? `Закупка ${wi.purchase_id ? '#' + wi.purchase_id : ''}`
+                                : `Переработка ${wi.rework_id ? '#' + wi.rework_id : ''}`
                           return (
                             <tr key={`${row.req_id}-${i}`} style={{ background: '#f8fbff' }}>
                               <td />
@@ -1403,6 +1420,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                               <td />
                               <td />
                               <td className="numCell"><strong>{qty(wi.qty)}</strong></td>
+                              <td className="numCell">{wi.completed_qty !== undefined && wi.completed_qty > 0 ? qty(wi.completed_qty) : '—'}</td>
                               <td className="numCell">{wi.remaining_qty !== undefined ? qty(wi.remaining_qty) : '—'}</td>
                               <td />
                               <td style={{ textAlign: 'center' }}>
@@ -1415,7 +1433,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                       </React.Fragment>
                     ))}
                     {!filteredJournalRows.length && (
-                      <tr><td colSpan={10}><div className="emptyDetail">Нет данных по выбранному фильтру</div></td></tr>
+                      <tr><td colSpan={11}><div className="emptyDetail">Нет данных по выбранному фильтру</div></td></tr>
                     )}
                   </tbody>
                 </table>

@@ -164,6 +164,42 @@ class OData1CClient:
                 f"HTTP Error {e.code}: {e.reason}. URL: {url}. Details: {err_data}"
             )
 
+    def post_operation(
+        self,
+        endpoint: str,
+        timeout: int = 60,
+    ) -> Dict[str, Any]:
+        endpoint_clean = (endpoint or "").lstrip("/")
+        endpoint_quoted = urllib.parse.quote(endpoint_clean, safe="$()_-,.=/'?&")
+        url = f"{self.base_url}/{endpoint_quoted}"
+        request = urllib.request.Request(url, data=b"", method="POST")
+        for k, v in self._build_headers().items():
+            request.add_header(k, v)
+        try:
+            from datetime import datetime as _dt
+            print(f"[OData] {_dt.utcnow().isoformat()} POST {url}")
+        except Exception:
+            pass
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                data = response.read()
+                text = data.decode("utf-8", errors="replace").strip()
+                if not text:
+                    return {}
+                content_type = response.headers.get("Content-Type", "") or ""
+                if "application/json" in content_type.lower() or text.startswith("{") or text.startswith("["):
+                    return json.loads(text)
+                return {"_raw": text, "_content_type": content_type, "_url": url}
+        except urllib.error.HTTPError as e:
+            err_data = ""
+            try:
+                err_data = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                pass
+            raise urllib.error.URLError(
+                f"HTTP Error {e.code}: {e.reason}. URL: {url}. Details: {err_data}"
+            )
+
     def patch(
         self,
         endpoint: str,
@@ -676,6 +712,17 @@ def get_stock_from_1c_odata(
     поэтому $orderby по умолчанию отключаем.
     """
     client = OData1CClient(base_url, username, password, token)
+
+    # The plain AccumulationRegister_ЗапасыНаСкладах entity returns movement
+    # recorders with nested RecordSet lines in UNF demo. For stock sync we need
+    # the actual current balance, so use the virtual Balance table by default.
+    if (
+        "/Balance" not in (entity_name or "")
+        and str(entity_name or "").strip().startswith("AccumulationRegister_ЗапасыНаСкладах")
+        and not filter_query
+        and not select_fields
+    ):
+        entity_name = str(entity_name).strip().rstrip("/") + "/Balance"
 
     # Для Balance отключаем $orderby, иначе 1С может вернуть пусто/ошибку
     use_order_by: Optional[str] = None if "/Balance" in (entity_name or "") else "Ref_Key"

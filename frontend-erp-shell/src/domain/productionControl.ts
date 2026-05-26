@@ -47,7 +47,10 @@ export type MaterialRow = {
   missing_qty?: number
   unit?: string | null
   availability_status?: string | null
-  expected_dates?: Array<{ source: string; order_number?: string; date?: string; qty?: number }>
+  coverage_status?: string | null
+  coverage_label?: string | null
+  expected_dates?: Array<{ source: string; order_number?: string; ref?: string; date?: string; qty?: number }>
+  eta_dates?: Array<{ source: string; ref?: string; date?: string; qty?: number }>
 }
 
 export type OrdersResponse = {
@@ -109,15 +112,74 @@ export type MaterialIssueCreateResponse = {
     source_warehouse_ref1c?: string | null
     warehouse_candidates?: WarehouseCandidate[]
   }>
+  reused?: Array<{
+    issue_id: number
+    document_number: string
+    product_id: number
+    order_number?: string
+    item_name?: string
+    status?: string
+  }>
   errors: string[]
 }
 
+export type TransferIssueRow = {
+  issue_id: number
+  document_number: string
+  status: string
+  direction?: string
+  product_id: number
+  order_id: number
+  order_number: string
+  order_ref1c?: string | null
+  item_id?: number | null
+  item_name: string
+  item_article?: string | null
+  item_code?: string | null
+  quantity: number
+  remaining_qty: number
+  unit?: string | null
+  warehouse_ref1c?: string | null
+  source_warehouse_ref1c?: string | null
+  exported_ref1c?: string | null
+  exported_at?: string | null
+  created_at?: string | null
+  export_error?: string | null
+  line_status?: string | null
+  issue_status?: string | null
+  lines_count?: number
+}
+
+export type TransferIssuesResponse = {
+  rows: TransferIssueRow[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export type MaterialIssueDetail = TransferIssueRow & {
+  initiated_by?: string | null
+  lines: Array<{
+    line_id: number
+    component_item_id: number
+    item_code?: string | null
+    item_name: string
+    item_article?: string | null
+    required_qty: number
+    issued_qty: number
+    unit?: string | null
+    line_status?: string | null
+  }>
+}
+
 export const productionStatuses = [
-  ['new', 'Новый'],
-  ['opened', 'Открыт'],
-  ['in_work', 'В работе'],
-  ['waiting_materials', 'Ждет материалы'],
-  ['done', 'Готов'],
+  ['shortage', 'Дефицит'],
+  ['partial', 'Частично'],
+  ['ready', 'Обеспечен'],
+  ['to_move', 'К перемещению'],
+  ['assembled', 'Собрано'],
+  ['produced_partial', 'Произведен частично'],
+  ['produced', 'Произведен'],
   ['cancelled', 'Отменен'],
 ] as const
 
@@ -127,7 +189,7 @@ export const coverageLabels: Record<string, string> = {
   partial: 'Частично',
   ready: 'Обеспечен',
   to_move: 'К перемещению',
-  assembled: 'Собран',
+  assembled: 'Собрано',
   produced_partial: 'Произведен частично',
   produced: 'Произведен',
 }

@@ -16,7 +16,10 @@ __pycache__/
 .pytest_cache/
 
 # Local secrets/config overrides
+config/odata_config.json
 config/odata_config.local.json
+config-test/odata_config.json
+config-test/odata_config.local.json
 
 # Docker compose local override (machine-specific networking, hostnames)
 docker-compose.override.yml

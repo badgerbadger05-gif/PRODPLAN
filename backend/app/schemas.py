@@ -581,6 +581,10 @@ class PurchaseCategoryGroupOrder(BaseModel):
     need_date: Optional[str] = None
     order_date: Optional[str] = None
     lead_time_days: int = 0
+    main_area_id: Optional[int] = None
+    main_area_name: Optional[str] = None
+    main_stage_id: Optional[int] = None
+    main_stage_name: Optional[str] = None
     priority_index: Optional[float] = None
     bucket_type: Optional[str] = "daily"
     bucket_date: Optional[str] = None

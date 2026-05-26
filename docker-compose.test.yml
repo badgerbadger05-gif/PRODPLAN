@@ -1,0 +1,64 @@
+name: prodplan-next-test
+
+services:
+  db:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${PRODPLAN_NEXT_POSTGRES_DB:-prodplan_next}
+      POSTGRES_USER: ${PRODPLAN_NEXT_POSTGRES_USER:-prodplan_next}
+      POSTGRES_PASSWORD: ${PRODPLAN_NEXT_POSTGRES_PASSWORD:-prodplan_next_password_change_me}
+    volumes:
+      - prodplan_next_postgres_data:/var/lib/postgresql/data
+    ports:
+      - "${PRODPLAN_NEXT_POSTGRES_HOST_PORT:-55433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${PRODPLAN_NEXT_POSTGRES_USER:-prodplan_next} -d ${PRODPLAN_NEXT_POSTGRES_DB:-prodplan_next}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  backend:
+    build:
+      context: ./backend
+      args:
+        INSTALL_DEV: "false"
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${PRODPLAN_NEXT_POSTGRES_USER:-prodplan_next}:${PRODPLAN_NEXT_POSTGRES_PASSWORD:-prodplan_next_password_change_me}@db:5432/${PRODPLAN_NEXT_POSTGRES_DB:-prodplan_next}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${PRODPLAN_NEXT_BACKEND_PORT:-8010}:8000"
+    volumes:
+      - ./config-test:/app/config
+      - ./output-test:/app/output
+    extra_hosts:
+      - "mtzw7:10.36.0.6"
+      - "mtzw7.lan:10.36.0.6"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  frontend:
+    build: ./frontend-erp-shell
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${PRODPLAN_NEXT_FRONTEND_PORT:-9010}:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  prodplan_next_postgres_data:

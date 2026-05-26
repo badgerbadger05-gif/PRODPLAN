@@ -68,7 +68,9 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, onSelectId
               </select>
             </td>
             <td>
-              <span className={`pill ${row.coverage_status || 'unknown'}`}>{row.coverage_label || coverageLabels[String(row.coverage_status || '')] || row.coverage_status}</span>
+              <span className={`pill ${row.coverage_status || row.status || 'unknown'}`}>
+                {row.coverage_label || coverageLabels[String(row.coverage_status || row.status || '')] || row.coverage_status || row.status || '—'}
+              </span>
               {!!row.issue_count && <span className="muted issueCount">док. {row.issue_count}</span>}
             </td>
           </tr>

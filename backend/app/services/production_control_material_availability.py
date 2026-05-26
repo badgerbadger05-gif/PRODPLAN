@@ -275,6 +275,19 @@ def _component_coverage_label(required: float, available: float) -> str:
     return "shortage"
 
 
+def _ui_coverage_status(label: str) -> str:
+    return "ready" if label == "ok" else label
+
+
+def _ui_coverage_label(label: str) -> str:
+    return {
+        "ok": "Обеспечен",
+        "ready": "Обеспечен",
+        "partial": "Частично",
+        "shortage": "Дефицит",
+    }.get(label, label)
+
+
 def _aggregate_coverage(component_labels: Sequence[str]) -> str:
     """
     Plan rules:
@@ -302,10 +315,11 @@ def _maybe_bump_coverage_status(state: ProductionOrderLineState, new_status: str
         state.status = new_status
 
 
-def preview_materials(db: Session, product_id: int) -> Dict[str, Any]:
+def preview_materials(db: Session, product_id: int, *, refresh_state: bool = False) -> Dict[str, Any]:
     """
     Return the BOM components required for a production line plus per-component
-    availability and ETA, and refresh the line's coverage status accordingly.
+    availability and ETA. Status persistence is deliberately opt-in: the UI
+    preview must not rewrite the journal while the user browses rows.
 
     Per-component fields:
       required_qty   вЂ” needed for this order line
@@ -353,18 +367,33 @@ def preview_materials(db: Session, product_id: int) -> Dict[str, Any]:
         comp["reserved_qty"] = reserved
         comp["missing_qty"] = missing
         comp["coverage"] = label
+        comp["availability_status"] = _ui_coverage_status(label)
+        comp["coverage_status"] = _ui_coverage_status(label)
+        comp["coverage_label"] = _ui_coverage_label(label)
         if label == "ok":
             comp["eta_dates"] = []
+            comp["expected_dates"] = []
         else:
             etas: List[Dict[str, Any]] = list(supplier_eta.get(iid, [])) + list(planned_eta.get(iid, []))
             etas.sort(key=lambda e: e.get("date") or "")
             comp["eta_dates"] = etas
+            comp["expected_dates"] = [
+                {
+                    "source": eta.get("source"),
+                    "date": eta.get("date"),
+                    "qty": eta.get("qty"),
+                    "order_number": eta.get("ref"),
+                    "ref": eta.get("ref"),
+                }
+                for eta in etas
+            ]
 
     order_coverage = _aggregate_coverage([str(c["coverage"]) for c in components])
 
-    state = _ensure_state(db, product)
-    _maybe_bump_coverage_status(state, order_coverage)
-    db.commit()
+    if refresh_state:
+        state = _ensure_state(db, product)
+        _maybe_bump_coverage_status(state, order_coverage)
+        db.commit()
 
     return {
         "product_id": int(product.product_id),
@@ -375,4 +404,6 @@ def preview_materials(db: Session, product_id: int) -> Dict[str, Any]:
         "spec_id": spec_id,
         "components": components,
         "coverage": order_coverage,
+        "coverage_status": order_coverage,
+        "coverage_label": _ui_coverage_label(order_coverage),
     }

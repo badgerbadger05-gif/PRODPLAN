@@ -15,9 +15,11 @@ from ..services.one_c_posted_transfer_sync import sync_posted_transfers
 from ..services.one_c_production_order_export import export_production_orders_to_1c
 from ..services.one_c_stock_transfer_export import export_material_issues_to_1c
 from ..services.production_control_material_issues import (
+    assemble_material_issue,
     create_material_issues,
     export_issue_to_1c,
     get_issue,
+    list_material_issues,
 )
 from ..services.production_control_journal import (
     create_orders_from_mrp,
@@ -74,6 +76,10 @@ class ExportProductionOrdersPayload(BaseModel):
 class ExportMaterialIssuesPayload(BaseModel):
     issue_ids: List[int]
     dry_run: bool = True
+    allow_production: bool = False
+
+
+class AssembleMaterialIssuePayload(BaseModel):
     allow_production: bool = False
 
 
@@ -372,6 +378,26 @@ def post_material_issues(payload: MaterialIssueCreatePayload, db: Session = Depe
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.get("/material-issues", response_model=dict)
+def get_material_issues_journal(
+    status: Optional[str] = None,
+    search: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+):
+    try:
+        return list_material_issues(
+            db,
+            status=status,
+            search=search,
+            limit=limit,
+            offset=offset,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.get("/material-issues/{issue_id}", response_model=dict)
 def get_material_issue(issue_id: int, db: Session = Depends(get_db)):
     try:
@@ -402,6 +428,26 @@ def post_export_material_issues_to_1c(
             db,
             [int(x) for x in payload.issue_ids],
             dry_run=bool(payload.dry_run),
+            allow_production=bool(payload.allow_production),
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/material-issues/{issue_id}/assembled", response_model=dict)
+def post_material_issue_assembled(
+    issue_id: int,
+    payload: AssembleMaterialIssuePayload,
+    db: Session = Depends(get_db),
+):
+    try:
+        return assemble_material_issue(
+            db,
+            int(issue_id),
             allow_production=bool(payload.allow_production),
         )
     except PermissionError as e:

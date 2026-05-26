@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
+from .odata_client import OData1CClient
 from .odata_client import get_stock_from_1c_odata
 from ..models import Item, ItemWarehouseStock, StockWarehouse
 from ..schemas import ODataSyncRequest
@@ -132,6 +133,92 @@ def _upsert_warehouses_from_stock_rows(db: Session, stock_rows: List[Dict]) -> i
             changed += 1
 
     return changed
+
+
+def _upsert_warehouses_from_catalog_rows(db: Session, rows: List[Dict]) -> int:
+    by_ref: Dict[str, Dict[str, str]] = {}
+    for rec in rows or []:
+        if rec.get("DeletionMark") is True or str(rec.get("DeletionMark") or "").lower() == "true":
+            continue
+        w_ref = str(rec.get("Ref_Key") or rec.get("RefKey") or "").strip()
+        if not w_ref:
+            continue
+        by_ref[w_ref] = {
+            "warehouse_code": str(rec.get("Code") or rec.get("Код") or "").strip(),
+            "warehouse_name": str(
+                rec.get("Description")
+                or rec.get("Наименование")
+                or rec.get("Name")
+                or w_ref
+            ).strip(),
+        }
+
+    if not by_ref:
+        return 0
+
+    existing_rows: List[StockWarehouse] = (
+        db.query(StockWarehouse)
+        .filter(StockWarehouse.warehouse_ref1c.in_(list(by_ref.keys())))
+        .all()
+    )
+    existing_by_ref = {str(x.warehouse_ref1c): x for x in existing_rows}
+
+    changed = 0
+    for w_ref, payload in by_ref.items():
+        row = existing_by_ref.get(w_ref)
+        if row is None:
+            db.add(
+                StockWarehouse(
+                    warehouse_ref1c=w_ref,
+                    warehouse_code=payload.get("warehouse_code") or None,
+                    warehouse_name=payload.get("warehouse_name") or w_ref,
+                    is_selected=True,
+                )
+            )
+            changed += 1
+            continue
+
+        code_new = payload.get("warehouse_code") or None
+        name_new = payload.get("warehouse_name") or w_ref
+        needs_update = False
+        if str(row.warehouse_name or "") != str(name_new):
+            row.warehouse_name = name_new
+            needs_update = True
+        if str(row.warehouse_code or "") != str(code_new or ""):
+            row.warehouse_code = code_new
+            needs_update = True
+        if needs_update:
+            changed += 1
+
+    return changed
+
+
+def _fetch_warehouse_catalog_rows(req: ODataSyncRequest) -> Tuple[List[Dict], str]:
+    client = OData1CClient(req.base_url, req.username, req.password, req.token)
+    candidate_entities = [
+        "Catalog_Склады",
+        "Catalog_СтруктурныеЕдиницы",
+        "Catalog_СтруктурныеЕдиницыПредприятия",
+        "Catalog_СкладыПредприятия",
+    ]
+    last_error: Optional[Exception] = None
+    for entity in candidate_entities:
+        try:
+            rows = client.get_all(
+                entity_name=entity,
+                select_fields=["Ref_Key", "Code", "Description", "DeletionMark"],
+                top=1000,
+                max_pages=100,
+                order_by="Ref_Key",
+            )
+        except Exception as exc:
+            last_error = exc
+            continue
+        if rows:
+            return rows, entity
+    if last_error:
+        print(f"[OData][warehouses] catalog lookup fallback: {last_error}", flush=True)
+    return [], ""
 
 
 def _upsert_item_warehouse_stock(
@@ -466,6 +553,28 @@ def sync_stock_warehouses_from_odata(db: Session, req: ODataSyncRequest) -> dict
         odata_url=req.base_url,
         odata_entity=req.entity_name,
     )
+
+    catalog_rows, catalog_entity = _fetch_warehouse_catalog_rows(req)
+    if catalog_rows:
+        stats.odata_entity = catalog_entity
+        stats.warehouses_seen_in_odata = len(
+            {
+                str(rec.get("Ref_Key") or rec.get("RefKey") or "").strip()
+                for rec in catalog_rows
+                if str(rec.get("Ref_Key") or rec.get("RefKey") or "").strip()
+            }
+        )
+        stats.warehouses_changed = _upsert_warehouses_from_catalog_rows(db, catalog_rows)
+        db.flush()
+        stats.warehouses_total = int(db.query(StockWarehouse).count() or 0)
+        stats.warehouses_selected = int(
+            db.query(StockWarehouse).filter(StockWarehouse.is_selected.is_(True)).count() or 0
+        )
+        if req.dry_run:
+            db.rollback()
+        else:
+            db.commit()
+        return asdict(stats)
 
     stock_data = get_stock_from_1c_odata(
         base_url=req.base_url,

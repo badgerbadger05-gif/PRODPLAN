@@ -134,6 +134,19 @@ class Unit(Base):
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
 
 
+class Employee(Base):
+    __tablename__ = "employees"
+
+    employee_id = Column(Integer, primary_key=True, index=True)
+    employee_ref1c = Column(String(36), unique=True, nullable=False, index=True)
+    employee_code = Column(String(50), nullable=True, index=True)
+    employee_name = Column(String(255), nullable=False)
+    deletion_mark = Column(Boolean, nullable=False, default=False, server_default="false", index=True)
+    data_version = Column(String(50), nullable=True)
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
 class Specification(Base):
     __tablename__ = "specifications"
 

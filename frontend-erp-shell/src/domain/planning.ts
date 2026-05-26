@@ -58,7 +58,10 @@ export type MrpProductionRow = {
   need_date?: string | null
   start_date?: string | null
   finish_date?: string | null
+  main_area_id?: number | null
   main_area_name?: string | null
+  main_stage_id?: number | null
+  main_stage_name?: string | null
   norm_hours_total?: number | null
   badge?: string | null
   turning_blank_priority?: boolean
@@ -77,6 +80,10 @@ export type MrpPurchaseRow = {
   need_date?: string | null
   order_date?: string | null
   lead_time_days?: number | null
+  main_area_id?: number | null
+  main_area_name?: string | null
+  main_stage_id?: number | null
+  main_stage_name?: string | null
   badge?: string | null
   late_supplier_order?: boolean
   turning_blank_priority?: boolean
@@ -185,7 +192,7 @@ export type PeriodPlanMatrix = {
 }
 
 export type ExecutionWorkItem = {
-  type: 'production_order' | 'planned_purchase' | 'planned_rework'
+  type: 'production_order' | 'planned_order' | 'planned_purchase' | 'planned_rework'
   product_id?: number
   order_id?: number
   order_number?: string
@@ -193,6 +200,7 @@ export type ExecutionWorkItem = {
   purchase_id?: number
   rework_id?: number
   qty: number
+  completed_qty?: number
   remaining_qty?: number
   need_date?: string | null
   order_date?: string | null
@@ -203,13 +211,18 @@ export type ExecutionJournalRow = {
   req_id: number
   item_id: number
   item_code: string
+  item_article?: string | null
   item_name: string
   flow: 'production' | 'purchase' | 'rework'
   bom_level: number
   gross_qty: number
+  stock_qty?: number
   net_qty: number
+  ordered_qty: number
+  completed_qty: number
   covered_qty: number
   remaining_qty: number
+  unassigned_qty?: number
   coverage_pct: number
   work_items: ExecutionWorkItem[]
 }

@@ -217,6 +217,7 @@ class PurchaseOrder1CExportRequest(BaseModel):
     date_to: Optional[str] = None
     purchase_ids: Optional[List[int]] = None
     dry_run: Optional[bool] = False
+    allow_production: Optional[bool] = False
 
 
 # ===== Period plan routes =====
@@ -1470,6 +1471,7 @@ async def export_planning_result_purchases_to_1c(
             date_to=req.date_to,
             purchase_ids=req.purchase_ids,
             dry_run=bool(req.dry_run),
+            allow_production=bool(req.allow_production),
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

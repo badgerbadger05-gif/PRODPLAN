@@ -379,7 +379,6 @@ function PurchaseResultTable({ rows, selectedIds, onSelectedIdsChange }: {
           <th>Номенклатура</th>
           <th>К заказу</th>
           <th>Потребность</th>
-          <th>Участок</th>
           <th>Заказать до</th>
           <th>Срок пост.</th>
           <th>Покрыто</th>
@@ -410,7 +409,6 @@ function PurchaseResultTable({ rows, selectedIds, onSelectedIdsChange }: {
             </td>
             <td className="numCell"><strong>{qty(row.qty)}</strong><span>{row.unit || ''}</span></td>
             <td>{dateRu(row.need_date) || '—'}</td>
-            <td>{row.main_area_name || row.main_stage_name || '—'}</td>
             <td>{dateRu(row.order_date) || '—'}</td>
             <td className="numCell"><strong>{Number(row.lead_time_days || 0) || '—'}</strong>{Number(row.lead_time_days || 0) > 0 && <span>дн.</span>}</td>
             <td className="numCell" title={`Покрыто активными заказами поставщику: ${coverageLabel}`} style={{ color: covered > 0 ? (coveragePct >= 100 ? 'var(--color-success, green)' : 'var(--color-warning, orange)') : undefined }}>

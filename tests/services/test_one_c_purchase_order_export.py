@@ -1,6 +1,9 @@
 import datetime
 
+import pytest
+
 from app.models import Item, PlannedPurchase, PlanningRun, Unit
+import app.services.one_c_purchase_order_export as exporter
 from app.services.one_c_purchase_order_export import export_planned_purchases_to_1c
 
 
@@ -197,3 +200,44 @@ def test_purchase_order_export_limits_to_selected_purchase_ids(db_session):
     assert result["orders_planned"] == 1
     assert result["lines_total"] == 1
     assert result["orders"][0]["lines"][0]["qty"] == 2.0
+
+
+def test_purchase_order_export_refuses_non_demo_base_without_override(db_session, monkeypatch):
+    db = db_session
+
+    item = Item(
+        item_code="PO-1C-GUARD",
+        item_name="Защищённая закупка",
+        item_article="GUARD",
+        item_ref1c="item-ref-guard",
+        supplier_ref1c="supplier-guard",
+        replenishment_method="Покупка",
+        status="active",
+    )
+    db.add(item)
+    db.flush()
+
+    run = _mk_run(db)
+    db.add(
+        PlannedPurchase(
+            run_id=run.run_id,
+            item_id=item.item_id,
+            requested_qty=1,
+            planned_qty=1,
+            qty=1,
+            need_date=datetime.date(2026, 5, 25),
+            order_date=datetime.date(2026, 5, 20),
+            lead_time_days=5,
+            bucket_date=datetime.date(2026, 5, 25),
+        )
+    )
+    db.commit()
+
+    monkeypatch.setattr(
+        exporter,
+        "_load_odata_config",
+        lambda: {"base_url": "http://mtzw7/unf/odata/standard.odata"},
+    )
+
+    with pytest.raises(PermissionError):
+        export_planned_purchases_to_1c(db, run.run_id, dry_run=False)

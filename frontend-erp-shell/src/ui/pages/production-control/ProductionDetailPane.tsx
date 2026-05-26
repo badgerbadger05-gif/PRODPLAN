@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { productionStatusLabel, type MaterialsResponse, type OrderRow } from '../../../domain/productionControl'
-import { qty } from '../../../lib/format'
+import { dateRu, qty } from '../../../lib/format'
 
 type Props = {
   activeRow: OrderRow | null
@@ -94,6 +94,34 @@ export function ProductionDetailPane({
   const hasMrpCoverage = activeRow?.source_mrp_requirement_id != null && activeRow?.mrp_req_net_qty != null
   const mrpRemaining = activeRow?.mrp_req_remaining_qty ?? 0
   const canFillRemaining = hasMrpCoverage && mrpRemaining > 0.001 && !!activeRow?.source_run_id
+  const activeCoverageStatus = materials?.coverage_status || activeRow?.coverage_status || activeRow?.status || 'unknown'
+  const activeCoverageLabel = materials?.coverage_label || activeRow?.coverage_label || coverageLabels[String(activeCoverageStatus)] || activeCoverageStatus
+
+  function sourceLabel(source?: string | null) {
+    if (source === 'supplier_order') return 'Заказ поставщику'
+    if (source === 'planned_purchase') return 'MRP закупка'
+    if (source === 'planned_production') return 'MRP производство'
+    return 'Заказ'
+  }
+
+  function expectedLine(m: NonNullable<MaterialsResponse['components']>[number]) {
+    const dates = m.expected_dates?.length ? m.expected_dates : (m.eta_dates ?? []).map((eta) => ({
+      source: eta.source,
+      order_number: eta.ref,
+      date: eta.date,
+      qty: eta.qty,
+    }))
+    if (dates.length) {
+      return dates.slice(0, 2).map((eta) => {
+        const ref = eta.order_number || ('ref' in eta ? eta.ref : undefined) || 'без номера'
+        const when = eta.date ? dateRu(eta.date) : 'дата не указана'
+        const amount = eta.qty != null ? `, ${qty(eta.qty)} ${m.unit || ''}` : ''
+        return `${sourceLabel(eta.source)} ${ref}: ${when}${amount}`
+      }).join('; ')
+    }
+    if ((m.missing_qty ?? 0) > 0) return 'В заказах нет'
+    return 'На складе'
+  }
 
   return (
     <aside className="detailPane">
@@ -124,7 +152,12 @@ export function ProductionDetailPane({
               {quantityError && <span className="batchHint error">{quantityError}</span>}
             </span>
             <span>Статус</span><strong>{productionStatusLabel(activeRow.status)}</strong>
-            <span>Обеспечение</span><strong>{activeRow.coverage_label || coverageLabels[String(activeRow.coverage_status || '')]}</strong>
+            <span>Обеспечение</span>
+            <strong>
+              <span className={`pill ${activeCoverageStatus}`}>
+                {activeCoverageLabel}
+              </span>
+            </strong>
             <span>Участок</span><strong>{activeRow.workshop_name || activeRow.stage_name || '—'}</strong>
             <span>Оптим. партия</span>
             <span className="batchEditCell">
@@ -176,16 +209,20 @@ export function ProductionDetailPane({
           <h3>Комплектующие</h3>
           <div className="materialsList">
             {(materials?.components ?? []).map((m) => (
-              <div className="materialRow" key={m.component_item_id}>
+              <div className={`materialRow ${m.availability_status || m.coverage_status || 'unknown'}`} key={m.component_item_id}>
                 <div>
                   <strong>{m.item_name}</strong>
                   <span>{m.item_article || m.item_code}</span>
+                  <em className="materialEta">{expectedLine(m)}</em>
                 </div>
                 <div className="matNums">
                   <span>нужно {qty(m.required_qty)}</span>
                   <span>есть {qty(m.available_qty)}</span>
+                  {(m.missing_qty ?? 0) > 0 && <span className="matMissing">нет {qty(m.missing_qty)}</span>}
                 </div>
-                <span className={`miniPill ${m.availability_status || 'unknown'}`}>{coverageLabels[String(m.availability_status || '')] || m.availability_status}</span>
+                <span className={`miniPill ${m.availability_status || m.coverage_status || 'unknown'}`}>
+                  {m.coverage_label || coverageLabels[String(m.availability_status || m.coverage_status || '')] || m.availability_status || m.coverage_status}
+                </span>
               </div>
             ))}
             {!materials?.components?.length && <div className="emptyDetail">Материалы не загружены</div>}

@@ -7,7 +7,8 @@ Safety rules from the doc are enforced on top of the call site:
 1. Default `dry_run=True`; explicit dry_run=False is required to write.
 2. Refuse to write if the configured base_url doesn't look like a demo DB
    (substring 'unf_demo'), unless `allow_production=True` is also set.
-3. Always send `Posted=false`. Posting is on the 1C admin side per plan.
+3. Always send `Posted=false`, then immediately conduct the created order
+   through the standard 1C `Post?PostingModeOperational=true` command.
 4. Idempotency: skip orders that already have a successful sync_link OR a
    non-empty `production_orders.order_ref1c` (it gets stamped from the
    1C response on first successful export).
@@ -35,6 +36,7 @@ from .one_c_export_common import (
     create_odata_client as _create_odata_client,
     fmt_1c_datetime as _fmt_1c_datetime,
     find_sync_link as _find_sync_link,
+    post_document_operational as _post_document_operational,
     post_export_entries as _post_export_entries,
     upsert_sync_link as _upsert_sync_link,
 )
@@ -233,7 +235,8 @@ def export_production_orders_to_1c(
 ) -> Dict[str, Any]:
     """
     Export the given internal MRP production_orders to 1C as
-    Document_ЗаказНаПроизводство with Posted=false.
+    Document_ЗаказНаПроизводство with Posted=false, then operationally posts
+    each created 1C document.
 
     Default is `dry_run=True` per plan safety rule. Caller must pass
     `dry_run=False` to actually write. A second guard refuses to write to a
@@ -297,6 +300,12 @@ def export_production_orders_to_1c(
     )
 
     def _mark_success(entry: ProductionOrderExportEntry, ref_key: str) -> None:
+        _post_document_operational(
+            client,
+            entity=PRODUCTION_ORDER_ENTITY,
+            ref_key=ref_key,
+            unpost_first=False,
+        )
         # Stamp success on production_orders.order_ref1c so the journal stops
         # treating it as MRP-only.
         order_row = db.query(ProductionOrder).filter(ProductionOrder.order_id == entry.order_id).one()

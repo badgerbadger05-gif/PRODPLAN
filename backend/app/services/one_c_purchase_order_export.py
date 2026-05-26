@@ -233,6 +233,7 @@ def export_planned_purchases_to_1c(
     date_to: Optional[str] = None,
     purchase_ids: Optional[List[int]] = None,
     dry_run: bool = False,
+    allow_production: bool = False,
 ) -> Dict[str, Any]:
     groups, skipped_rows = _collect_purchase_groups(
         db,
@@ -253,7 +254,12 @@ def export_planned_purchases_to_1c(
             "orders": [asdict(g) for g in groups],
         }
 
-    client = _create_odata_client(_load_odata_config(), OData1CClient)
+    client = _create_odata_client(
+        _load_odata_config(),
+        OData1CClient,
+        allow_production=allow_production,
+        require_demo_base=True,
+    )
 
     created = 0
     existing = 0

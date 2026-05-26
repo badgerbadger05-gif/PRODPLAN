@@ -19,6 +19,7 @@ from ..services.production_stage_sync import sync_production_stages_from_odata, 
 from ..services.units_sync import sync_units_from_odata, backfill_units_from_items
 from ..services.operations_sync import sync_operations_from_odata, OperationsSyncStats
 from ..services.production_kind_sync import sync_production_kinds_from_odata, ProductionKindSyncStats
+from ..services.employee_sync import sync_employees_from_odata
 
 from .. import models
 
@@ -435,6 +436,21 @@ def sync_operations_odata(payload: ODataSyncRequest, db: Session = Depends(get_d
         if not getattr(payload, "entity_name", None):
             payload.entity_name = "Catalog_Спецификации_Операции"
         stats = sync_operations_from_odata(db, payload)
+        return stats
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sync error: {e}")
+
+
+@router.post("/employees-odata", response_model=dict)
+def sync_employees_odata(payload: ODataSyncRequest, db: Session = Depends(get_db)):
+    """
+    Синхронизация сотрудников из 1С через OData.
+    По умолчанию используем сущность "Catalog_Сотрудники".
+    """
+    try:
+        if not getattr(payload, "entity_name", None):
+            payload.entity_name = "Catalog_Сотрудники"
+        stats = sync_employees_from_odata(db, payload)
         return stats
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Sync error: {e}")

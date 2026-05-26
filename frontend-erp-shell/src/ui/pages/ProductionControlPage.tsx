@@ -148,7 +148,8 @@ export function ProductionControlPage() {
     setActiveId(row.product_id)
     setMaterials(null)
     try {
-      setMaterials(await api<MaterialsResponse>(`/v1/production-control/orders/${row.product_id}/materials`))
+      const data = await api<MaterialsResponse>(`/v1/production-control/orders/${row.product_id}/materials`)
+      setMaterials(data)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
@@ -223,28 +224,40 @@ export function ProductionControlPage() {
 
   async function exportTo1C() {
     if (!selectedIds.size) return
-    // Only MRP-sourced orders can be exported; 1C-sourced orders already exist there.
-    const mrpRows = selectedRows.filter((r) => r.order_source === 'mrp' && r.order_id)
-    if (!mrpRows.length) {
-      setError('Выбраны только заказы из 1С — нечего создавать в 1С. Выберите строки с source=mrp.')
-      return
-    }
-    const orderIds = [...new Set(mrpRows.map((r) => r.order_id!))]
     setLoading(true)
     setError('')
     setMessage('')
     try {
-      const result = await api<Record<string, unknown>>('/v1/production-control/orders/export-to-1c', {
+      const issueResult = await api<MaterialIssueCreateResponse>('/v1/production-control/material-issues', {
         method: 'POST',
-        body: JSON.stringify({ order_ids: orderIds, dry_run: false, allow_production: false }),
+        body: JSON.stringify({ product_ids: Array.from(selectedIds), initiated_by: 'erp-shell' }),
       })
-      const created = Number(result.orders_created ?? 0)
-      const existing = Number(result.orders_already_linked ?? 0)
-      const errored = Number(result.orders_error ?? 0)
+      const issueIds = [
+        ...(issueResult.created ?? []).map((row) => row.issue_id),
+        ...(issueResult.reused ?? []).map((row) => row.issue_id),
+      ].filter(Boolean)
+      if (!issueIds.length) {
+        const errors = issueResult.errors?.length ?? 0
+        setMessage(`Запуск в 1С: заявок на перемещение не создано${errors ? `, ошибок ${errors}` : ''}`)
+        await load(offsetRef.current)
+        return
+      }
+      const result = await api<Record<string, unknown>>('/v1/production-control/material-issues/export-to-1c', {
+        method: 'POST',
+        body: JSON.stringify({ issue_ids: issueIds, dry_run: false, allow_production: false }),
+      })
+      const parent = (result.parent_orders_export ?? {}) as Record<string, unknown>
+      const ordersCreated = Number(parent.orders_created ?? 0)
+      const ordersExisting = Number(parent.orders_already_linked ?? 0)
+      const transfersCreated = Number(result.issues_created ?? 0)
+      const transfersExisting = Number(result.issues_already_linked ?? 0)
+      const errored = Number(result.issues_error ?? 0) + Number(parent.orders_error ?? 0)
       const skipped = (result.skipped_rows as unknown[])?.length ?? 0
       setMessage(
-        `Запуск в 1С: создано ${created}` +
-        (existing ? `, уже было ${existing}` : '') +
+        `Запуск в 1С: заказов проведено ${ordersCreated}` +
+        (ordersExisting ? `, заказов уже было ${ordersExisting}` : '') +
+        `; перемещений создано ${transfersCreated}` +
+        (transfersExisting ? `, перемещений уже было ${transfersExisting}` : '') +
         (skipped ? `, пропущено ${skipped}` : '') +
         (errored ? `, ошибок ${errored}` : ''),
       )

@@ -128,6 +128,28 @@ def upsert_sync_link(
         existing.last_synced_at = synced_at
 
 
+def post_document_operational(
+    client: Any,
+    *,
+    entity: str,
+    ref_key: str,
+    unpost_first: bool = False,
+) -> None:
+    ref = clean_ref1c(ref_key)
+    if not ref:
+        raise ValueError("Ref_Key is required for 1C posting")
+    base = f"{entity}(guid'{ref}')"
+    post_operation = getattr(client, "post_operation", None)
+    if post_operation is None:
+        # Unit-test fakes created before operational posting usually expose
+        # only `post`. The real OData1CClient has `post_operation`; skip here
+        # instead of turning the action into a fake document POST.
+        return
+    if unpost_first:
+        post_operation(f"{base}/Unpost")
+    post_operation(f"{base}/Post?PostingModeOperational=true")
+
+
 def post_export_entries(
     db: Any,
     *,

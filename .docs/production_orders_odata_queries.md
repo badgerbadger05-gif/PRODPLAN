@@ -9,7 +9,7 @@
 ## Предпосылки (метаданные)
 - Заказ: `Document_ЗаказНаПроизводство`
 - Состояние заказа: `СостояниеЗаказа_Key`, navigation `СостояниеЗаказа`
-- Факт выпуска: `Document_СборкаЗапасов` содержит `ЗаказНаПроизводство_Key`
+- Факт выпуска: `Document_СборкаЗапасов` содержит `ЗаказНаПроизводство_Key`; новые документы из PRODPLAN должны также содержать `ДокументОснование=<Ref_Key заказа>` и `ДокументОснование_Type=StandardODATA.Document_ЗаказНаПроизводство`
 
 ## Как пользоваться
 1) Подставь URL: `{{BASE}}` = `https://<host>/<base>/odata/standard.odata/`
@@ -51,7 +51,7 @@
 ## C1) Документы «Сборка запасов», привязанные к заказу 000070
 Сначала возьми `{{ORDER_REF_KEY}}`.
 
-`{{BASE}}Document_СборкаЗапасов?$format=json&$select=Ref_Key,Number,Date,Posted,DeletionMark,ЗаказНаПроизводство_Key&$filter=ЗаказНаПроизводство_Key eq guid'{{ORDER_REF_KEY}}'`
+`{{BASE}}Document_СборкаЗапасов?$format=json&$select=Ref_Key,Number,Date,Posted,DeletionMark,ЗаказНаПроизводство_Key,ДокументОснование,ДокументОснование_Type&$filter=ЗаказНаПроизводство_Key eq guid'{{ORDER_REF_KEY}}'`
 
 ## C2) «Продукция» по найденным сборкам
 Вариант 1 (через отдельный EntitySet табличной части):
@@ -62,7 +62,7 @@
 
 Вариант 2 (через expand, одной пачкой):
 
-`{{BASE}}Document_СборкаЗапасов?$format=json&$select=Ref_Key,Number,Date,Posted,ЗаказНаПроизводство_Key&$expand=Продукция&$filter=ЗаказНаПроизводство_Key eq guid'{{ORDER_REF_KEY}}'`
+`{{BASE}}Document_СборкаЗапасов?$format=json&$select=Ref_Key,Number,Date,Posted,ЗаказНаПроизводство_Key,ДокументОснование,ДокументОснование_Type&$expand=Продукция&$filter=ЗаказНаПроизводство_Key eq guid'{{ORDER_REF_KEY}}'`
 
 ### Проверка частичного выполнения
 1) Из B1 получаем `ordered_qty` по каждой номенклатуре

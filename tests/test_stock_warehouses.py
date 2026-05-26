@@ -72,6 +72,7 @@ def test_sync_stock_warehouses_upserts_and_selects_by_default(db_session, monkey
             {"code": "ITEM-002", "qty": 2.0, "ref": "", "warehouse_ref": "W2", "warehouse_code": "02", "warehouse_name": "Reserve"},
         ]
 
+    monkeypatch.setattr(stock_sync, "_fetch_warehouse_catalog_rows", lambda req: ([], ""))
     monkeypatch.setattr(stock_sync, "get_stock_from_1c_odata", _fake_stock)
 
     out = stock_sync.sync_stock_warehouses_from_odata(db, _mk_req())
@@ -80,6 +81,46 @@ def test_sync_stock_warehouses_upserts_and_selects_by_default(db_session, monkey
     assert int(out.get("warehouses_total", 0)) == 2
     assert len(rows) == 2
     assert all(bool(r.is_selected) for r in rows)
+
+
+def test_sync_stock_warehouses_prefers_catalog_lookup(db_session, monkeypatch):
+    db = db_session
+
+    monkeypatch.setattr(
+        stock_sync,
+        "_fetch_warehouse_catalog_rows",
+        lambda req: (
+            [
+                {
+                    "Ref_Key": "WH-CATALOG-1",
+                    "Code": "НФ-000001",
+                    "Description": "Основной склад",
+                    "DeletionMark": False,
+                },
+                {
+                    "Ref_Key": "WH-DELETED",
+                    "Code": "НФ-000002",
+                    "Description": "Удаленный склад",
+                    "DeletionMark": True,
+                },
+            ],
+            "Catalog_СтруктурныеЕдиницы",
+        ),
+    )
+    monkeypatch.setattr(
+        stock_sync,
+        "get_stock_from_1c_odata",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("stock register must not be used")),
+    )
+
+    out = stock_sync.sync_stock_warehouses_from_odata(db, _mk_req())
+    rows = db.query(StockWarehouse).order_by(StockWarehouse.warehouse_ref1c.asc()).all()
+
+    assert out["odata_entity"] == "Catalog_СтруктурныеЕдиницы"
+    assert int(out["warehouses_seen_in_odata"]) == 2
+    assert [(r.warehouse_ref1c, r.warehouse_code, r.warehouse_name) for r in rows] == [
+        ("WH-CATALOG-1", "НФ-000001", "Основной склад")
+    ]
 
 
 def test_sync_stock_populates_per_warehouse_breakdown(db_session, monkeypatch):

@@ -1141,7 +1141,7 @@ input:focus, select:focus {
 
 .materialRow {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 94px 92px;
+  grid-template-columns: minmax(0, 1fr) 94px 96px;
   gap: 6px;
   align-items: start;
   border: 1px solid var(--line2);
@@ -1149,13 +1149,40 @@ input:focus, select:focus {
   padding: 5px;
 }
 
+.materialRow.ready {
+  border-color: #a9d6bd;
+  background: linear-gradient(#f7fffa, #edf8f1);
+}
+
+.materialRow.partial {
+  border-color: #e7c56a;
+  background: linear-gradient(#fffaf0, #fff4d8);
+}
+
+.materialRow.shortage {
+  border-color: #efb0b0;
+  background: linear-gradient(#fff7f7, #ffecec);
+}
+
 .materialRow strong, .materialRow span {
   display: block;
 }
 
-.materialRow span, .matNums {
+.materialRow span, .matNums, .materialEta {
   color: var(--muted);
   font-size: 11px;
+}
+
+.materialEta {
+  display: block;
+  margin-top: 4px;
+  font-style: normal;
+  line-height: 1.25;
+}
+
+.matMissing {
+  color: var(--red) !important;
+  font-weight: 700;
 }
 
 .matNums {

@@ -7,18 +7,28 @@ from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
     IgnoredWarehouse,
+    Item,
     ItemWarehouseStock,
     ProductionMaterialIssue,
     ProductionMaterialIssueLine,
     ProductionOrderLineState,
     ProductionProduct,
     StockWarehouse,
+    SyncLink,
     WorkshopWarehouseBinding,
 )
 from ..schemas import ODataSyncRequest
 from .production_control_common import date_to_iso as _date_to_iso, to_float as _to_float
 from .production_control_domain import ensure_state as _ensure_state, unit_display as _unit_display
 from .production_control_material_availability import _components_for_product
+from .one_c_export_common import (
+    clean_ref1c as _clean_ref1c,
+    create_odata_client as _create_odata_client,
+    post_document_operational as _post_document_operational,
+)
+from .odata_config import load_odata_config as _load_odata_config
+from .odata_client import OData1CClient
+from .one_c_stock_transfer_export import STOCK_TRANSFER_ENTITY
 
 
 def _auto_select_source_warehouse(
@@ -279,6 +289,166 @@ def get_issue(db: Session, issue_id: int) -> Dict[str, Any]:
             }
             for line in sorted(issue.lines, key=lambda x: x.line_id)
         ],
+    }
+
+
+def _issue_header(db: Session, issue: ProductionMaterialIssue) -> Dict[str, Any]:
+    product = issue.product
+    item = product.item if product and product.item else None
+    state = (
+        getattr(product, "control_state", None)
+        if product is not None
+        else None
+    )
+    return {
+        "issue_id": int(issue.issue_id),
+        "document_number": str(issue.document_number),
+        "status": str(issue.status or ""),
+        "direction": str(issue.direction or "issue"),
+        "product_id": int(issue.product_id),
+        "order_id": int(issue.order_id),
+        "order_number": str(issue.order.order_number or "") if issue.order else "",
+        "order_ref1c": str(issue.order.order_ref1c or "") if issue.order and issue.order.order_ref1c else None,
+        "item_id": int(product.item_id) if product else None,
+        "item_name": str(item.item_name or "") if item else "",
+        "item_article": str(item.item_article or "") if item else "",
+        "item_code": str(item.item_code or "") if item else "",
+        "quantity": _to_float(product.quantity) if product else 0.0,
+        "remaining_qty": _to_float(product.remaining_qty) if product else 0.0,
+        "unit": _unit_display(db, item.unit) if item else "",
+        "warehouse_ref1c": str(issue.warehouse_ref1c or ""),
+        "source_warehouse_ref1c": str(issue.source_warehouse_ref1c or ""),
+        "exported_ref1c": str(issue.exported_ref1c or ""),
+        "exported_at": _date_to_iso(issue.exported_at),
+        "created_at": _date_to_iso(issue.created_at),
+        "export_error": str(issue.export_error or ""),
+        "line_status": str(state.status if state else ""),
+        "issue_status": str(state.issue_status if state else ""),
+        "lines_count": len(issue.lines or []),
+    }
+
+
+def list_material_issues(
+    db: Session,
+    *,
+    status: Optional[str] = None,
+    search: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    query = (
+        db.query(ProductionMaterialIssue)
+        .options(
+            joinedload(ProductionMaterialIssue.order),
+            joinedload(ProductionMaterialIssue.product)
+            .joinedload(ProductionProduct.item),
+            joinedload(ProductionMaterialIssue.product)
+            .joinedload(ProductionProduct.control_state),
+            joinedload(ProductionMaterialIssue.lines),
+        )
+        .filter(ProductionMaterialIssue.direction == "issue")
+    )
+    if status:
+        query = query.filter(ProductionMaterialIssue.status == status)
+    if search:
+        like = f"%{search.strip()}%"
+        query = (
+            query.join(ProductionProduct, ProductionProduct.product_id == ProductionMaterialIssue.product_id)
+            .join(ProductionProduct.item)
+            .filter(
+                (ProductionMaterialIssue.document_number.ilike(like))
+                | (ProductionProduct.item.has(Item.item_name.ilike(like)))
+                | (ProductionProduct.item.has(Item.item_article.ilike(like)))
+                | (ProductionProduct.item.has(Item.item_code.ilike(like)))
+            )
+        )
+
+    total = query.count()
+    effective_limit = max(1, min(int(limit or 100), 500))
+    effective_offset = max(0, int(offset or 0))
+    rows = (
+        query.order_by(ProductionMaterialIssue.created_at.desc(), ProductionMaterialIssue.issue_id.desc())
+        .offset(effective_offset)
+        .limit(effective_limit)
+        .all()
+    )
+    return {
+        "rows": [_issue_header(db, issue) for issue in rows],
+        "total": int(total),
+        "limit": effective_limit,
+        "offset": effective_offset,
+    }
+
+
+def assemble_material_issue(
+    db: Session,
+    issue_id: int,
+    *,
+    allow_production: bool = False,
+) -> Dict[str, Any]:
+    issue = (
+        db.query(ProductionMaterialIssue)
+        .options(
+            joinedload(ProductionMaterialIssue.order),
+            joinedload(ProductionMaterialIssue.product).joinedload(ProductionProduct.item),
+            joinedload(ProductionMaterialIssue.lines),
+        )
+        .filter(ProductionMaterialIssue.issue_id == int(issue_id))
+        .one_or_none()
+    )
+    if issue is None:
+        raise ValueError("Заявка на перемещение не найдена")
+    ref_key = _clean_ref1c(issue.exported_ref1c)
+    if not ref_key:
+        raise ValueError("Перемещение ещё не выгружено в 1С")
+    if str(issue.status or "") == "posted":
+        return {"status": "ok", "issue_id": int(issue.issue_id), "already_posted": True}
+
+    client = _create_odata_client(
+        _load_odata_config(),
+        OData1CClient,
+        allow_production=allow_production,
+        require_demo_base=True,
+    )
+    _post_document_operational(
+        client,
+        entity=STOCK_TRANSFER_ENTITY,
+        ref_key=ref_key,
+        unpost_first=True,
+    )
+
+    issue.status = "posted"
+    link = (
+        db.query(SyncLink)
+        .filter(
+            SyncLink.source_system == "PRODPLAN",
+            SyncLink.source_doctype == "material_issue",
+            SyncLink.source_id == int(issue.issue_id),
+            SyncLink.target_entity == STOCK_TRANSFER_ENTITY,
+        )
+        .one_or_none()
+    )
+    if link is not None:
+        link.status = "posted"
+        link.last_synced_at = datetime.utcnow()
+    for line in issue.lines or []:
+        line.issued_qty = line.required_qty
+        line.line_status = "issued"
+    state = (
+        db.query(ProductionOrderLineState)
+        .filter(ProductionOrderLineState.product_id == issue.product_id)
+        .one_or_none()
+    )
+    if state is not None:
+        if state.status in {"shortage", "partial", "ready", "to_move"}:
+            state.status = "assembled"
+        state.issue_status = "posted"
+    db.commit()
+    return {
+        "status": "ok",
+        "issue_id": int(issue.issue_id),
+        "product_id": int(issue.product_id),
+        "target_ref_key": ref_key,
     }
 
 

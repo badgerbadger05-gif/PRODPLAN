@@ -41,7 +41,7 @@ from ..models import (
     ItemCategory,
 )
 from ..models import RootProduct
-from .stage_logic import determine_parent_stage_and_norm
+from .stage_logic import determine_parent_stage_and_norm, pick_area_for_stage
 from .order_quantity_calculator import OrderQuantityCalculator
 from .priority_manager import PriorityManager
 from .capacity_scheduler import CapacityScheduler
@@ -52,6 +52,177 @@ from .replenishment import (
     classify_replenishment_flow,
 )
 from .warnings import make_warning, log_warning
+
+
+def _load_stage_area_context(db: Session) -> Tuple[Dict[int, str], Dict[int, int], Dict[int, str]]:
+    """Return stage names plus the best production resource for each stage."""
+    stage_name_by_id: Dict[int, str] = {}
+    try:
+        for stage in db.query(ProductionStage).all():
+            sid = getattr(stage, "stage_id", None)
+            if sid is not None:
+                stage_name_by_id[int(sid)] = str(getattr(stage, "stage_name", "") or "")
+    except Exception:
+        stage_name_by_id = {}
+
+    resources: List[ProductionResource] = []
+    stages_by_resource: Dict[int, Set[int]] = {}
+    try:
+        resources = db.query(ProductionResource).all()
+        for row in db.query(ResourceStage).all():
+            rid = getattr(row, "resource_id", None)
+            sid = getattr(row, "stage_id", None)
+            if rid is None or sid is None:
+                continue
+            stages_by_resource.setdefault(int(rid), set()).add(int(sid))
+    except Exception:
+        resources = []
+        stages_by_resource = {}
+
+    area_id_by_stage: Dict[int, int] = {}
+    for stage_id in stage_name_by_id:
+        area_id = pick_area_for_stage(resources, stages_by_resource, stage_name_by_id, int(stage_id))
+        if area_id is not None:
+            area_id_by_stage[int(stage_id)] = int(area_id)
+
+    area_name_by_id: Dict[int, str] = {}
+    for resource in resources:
+        rid = getattr(resource, "resource_id", None)
+        if rid is None:
+            continue
+        area_name_by_id[int(rid)] = str(getattr(resource, "resource_name", "") or "")
+
+    return stage_name_by_id, area_id_by_stage, area_name_by_id
+
+
+def _load_purchase_area_map(db: Session, item_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+    """Map a purchased component to the stage/resource where it is consumed."""
+    unique_item_ids = sorted({int(item_id) for item_id in item_ids if item_id is not None})
+    if not unique_item_ids:
+        return {}
+
+    stage_name_by_id, area_id_by_stage, area_name_by_id = _load_stage_area_context(db)
+    component_stage: Dict[int, int] = {}
+    try:
+        rows = (
+            db.query(SpecComponent.item_id, SpecComponent.stage_id)
+            .filter(SpecComponent.item_id.in_(unique_item_ids))
+            .filter(SpecComponent.stage_id.isnot(None))
+            .all()
+        )
+    except Exception:
+        rows = []
+
+    for row in rows:
+        item_id_val = getattr(row, "item_id", row[0] if isinstance(row, (tuple, list)) and len(row) > 0 else None)
+        stage_id_val = getattr(row, "stage_id", row[1] if isinstance(row, (tuple, list)) and len(row) > 1 else None)
+        if item_id_val is None or stage_id_val is None:
+            continue
+        iid = int(item_id_val)
+        if iid in component_stage:
+            continue
+        component_stage[iid] = int(stage_id_val)
+
+    result: Dict[int, Dict[str, Any]] = {}
+    for iid, sid in component_stage.items():
+        area_id = area_id_by_stage.get(int(sid))
+        area_name = area_name_by_id.get(int(area_id), "") if area_id is not None else ""
+        result[int(iid)] = {
+            "main_area_id": int(area_id) if area_id is not None else None,
+            "main_area_name": area_name or stage_name_by_id.get(int(sid)) or None,
+            "main_stage_id": int(sid),
+            "main_stage_name": stage_name_by_id.get(int(sid)) or None,
+        }
+    return result
+
+
+def _load_production_area_map(db: Session, item_ids: List[int]) -> Dict[int, Dict[str, Any]]:
+    """Map a produced item to its main stage/resource from the default spec."""
+    unique_item_ids = sorted({int(item_id) for item_id in item_ids if item_id is not None})
+    if not unique_item_ids:
+        return {}
+
+    stage_name_by_id, area_id_by_stage, area_name_by_id = _load_stage_area_context(db)
+    item_to_spec: Dict[int, int] = {}
+    try:
+        defaults = (
+            db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
+            .filter(DefaultSpecification.item_id.in_(unique_item_ids))
+            .all()
+        )
+    except Exception:
+        defaults = []
+
+    spec_ids: Set[int] = set()
+    for row in defaults or []:
+        item_id_val = getattr(row, "item_id", row[0] if isinstance(row, (tuple, list)) and len(row) > 0 else None)
+        spec_id_val = getattr(row, "spec_id", row[1] if isinstance(row, (tuple, list)) and len(row) > 1 else None)
+        if item_id_val is None or spec_id_val is None:
+            continue
+        item_to_spec[int(item_id_val)] = int(spec_id_val)
+        spec_ids.add(int(spec_id_val))
+
+    if not spec_ids:
+        return {}
+
+    stage_hours_by_spec: Dict[int, Dict[int, float]] = defaultdict(dict)
+    try:
+        op_rows = (
+            db.query(
+                SpecOperation.spec_id,
+                SpecOperation.stage_id,
+                func.sum(func.coalesce(SpecOperation.time_norm, Operation.time_norm, 0.0)).label("hours"),
+            )
+            .outerjoin(Operation, SpecOperation.operation_id == Operation.operation_id)
+            .filter(SpecOperation.spec_id.in_(list(spec_ids)))
+            .filter(SpecOperation.stage_id.isnot(None))
+            .group_by(SpecOperation.spec_id, SpecOperation.stage_id)
+            .all()
+        )
+    except Exception:
+        op_rows = []
+
+    for row in op_rows or []:
+        spec_id_val = getattr(row, "spec_id", row[0] if isinstance(row, (tuple, list)) and len(row) > 0 else None)
+        stage_id_val = getattr(row, "stage_id", row[1] if isinstance(row, (tuple, list)) and len(row) > 1 else None)
+        hours_val = getattr(row, "hours", row[2] if isinstance(row, (tuple, list)) and len(row) > 2 else 0.0)
+        if spec_id_val is None or stage_id_val is None:
+            continue
+        stage_hours_by_spec[int(spec_id_val)][int(stage_id_val)] = float(hours_val or 0.0)
+
+    if not stage_hours_by_spec:
+        try:
+            comp_rows = (
+                db.query(SpecComponent.spec_id, SpecComponent.stage_id)
+                .filter(SpecComponent.spec_id.in_(list(spec_ids)))
+                .filter(SpecComponent.stage_id.isnot(None))
+                .all()
+            )
+        except Exception:
+            comp_rows = []
+        for row in comp_rows or []:
+            spec_id_val = getattr(row, "spec_id", row[0] if isinstance(row, (tuple, list)) and len(row) > 0 else None)
+            stage_id_val = getattr(row, "stage_id", row[1] if isinstance(row, (tuple, list)) and len(row) > 1 else None)
+            if spec_id_val is None or stage_id_val is None:
+                continue
+            stage_hours_by_spec[int(spec_id_val)].setdefault(int(stage_id_val), 0.0)
+
+    result: Dict[int, Dict[str, Any]] = {}
+    for item_id_val, spec_id_val in item_to_spec.items():
+        stage_hours = stage_hours_by_spec.get(int(spec_id_val), {})
+        if not stage_hours:
+            continue
+        sid = max(stage_hours.items(), key=lambda item: float(item[1] or 0.0))[0]
+        area_id = area_id_by_stage.get(int(sid))
+        area_name = area_name_by_id.get(int(area_id), "") if area_id is not None else ""
+        result[int(item_id_val)] = {
+            "main_area_id": int(area_id) if area_id is not None else None,
+            "main_area_name": area_name or stage_name_by_id.get(int(sid)) or None,
+            "main_stage_id": int(sid),
+            "main_stage_name": stage_name_by_id.get(int(sid)) or None,
+        }
+    return result
+
 
 # Default planning config fallback (aligned with Alembic seed)
 DEFAULT_PLANNING_CONFIG: Dict[str, Any] = {
@@ -522,6 +693,10 @@ def get_run_production(
     aggregated_data: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
     order_ids: List[int] = []
     turning_blank_priority = _load_turning_blank_priority_map(db, run_id)
+    production_area_by_item = _load_production_area_map(
+        db,
+        [int(row[0].item_id) for row in filtered_rows if getattr(row[0], "item_id", None) is not None],
+    )
     
     for row in filtered_rows:
         po, in_name, in_article, in_unit_guid, in_unit_short, in_unit_name, in_unit_code = row
@@ -600,15 +775,19 @@ def get_run_production(
                     continue
     except Exception:
         area_name_by_id = {}
+    stage_name_by_id, fallback_area_by_stage, fallback_area_name_by_id = _load_stage_area_context(db)
+    area_name_by_id.update(fallback_area_name_by_id)
 
     stage_by_order: Dict[int, List[Dict[str, Any]]] = {}
     for s in stages:
-        aid = int(s.area_id) if s.area_id is not None else None
-        aname = area_name_by_id.get(aid, "") if aid is not None else None
+        sid = int(s.stage_id)
+        aid = int(s.area_id) if s.area_id is not None else fallback_area_by_stage.get(sid)
+        aname = area_name_by_id.get(aid, "") if aid is not None else stage_name_by_id.get(sid)
         hours_f = float(s.hours or 0.0)
         stage_by_order.setdefault(int(s.order_id), []).append(
             {
-                "stage_id": int(s.stage_id),
+                "stage_id": sid,
+                "stage_name": stage_name_by_id.get(sid),
                 "area_id": aid,
                 "area_name": aname,
                 "bucket_type": "daily",
@@ -766,6 +945,20 @@ def get_run_production(
 
         # stable synthetic order_id for UI tables (aggregated view)
         data["order_id"] = hash(f"{data['item_id']}_{data['start_date']}_{data['unit']}") % (10**10)
+
+        stage_rows = list(data.get("stages") or [])
+        if stage_rows:
+            best_stage = max(stage_rows, key=lambda x: float(x.get("hours") or 0.0))
+            data["main_area_id"] = best_stage.get("area_id")
+            data["main_area_name"] = best_stage.get("area_name") or best_stage.get("stage_name") or None
+            data["main_stage_id"] = best_stage.get("stage_id")
+            data["main_stage_name"] = best_stage.get("stage_name")
+        else:
+            area_meta = production_area_by_item.get(int(data.get("item_id") or 0), {})
+            data["main_area_id"] = area_meta.get("main_area_id")
+            data["main_area_name"] = area_meta.get("main_area_name")
+            data["main_stage_id"] = area_meta.get("main_stage_id")
+            data["main_stage_name"] = area_meta.get("main_stage_name")
         
         final_data.append(data)
 
@@ -1105,6 +1298,10 @@ def get_run_purchases(
         db,
         [int(row[1]) for row in filtered_rows if row[1] is not None],
     )
+    purchase_area_by_item = _load_purchase_area_map(
+        db,
+        [int(row[1]) for row in filtered_rows if row[1] is not None],
+    )
     
     for row in filtered_rows:
         (
@@ -1144,19 +1341,21 @@ def get_run_purchases(
                 in_unit_code = in_unit_code or cu_code
         
         unit_display = (in_unit_short or in_unit_name or in_unit_code or in_unit_guid or "").strip()
-        agg_key = (int(item_id_val), unit_display)
+        item_id_int = int(item_id_val)
+        agg_key = (item_id_int, unit_display)
         turning_badge = _turning_blank_badge(turning_blank_priority, int(item_id_val), need_date_val)
         late_supplier_badge = _late_supplier_order_badge(
             late_supplier_rows,
-            int(item_id_val),
+            item_id_int,
             need_date_val,
             qty_val,
         )
         badge = _merge_badges(turning_badge, late_supplier_badge)
+        area_meta = purchase_area_by_item.get(item_id_int, {})
         
         if agg_key not in aggregated_data:
             aggregated_data[agg_key] = {
-                "item_id": int(item_id_val),
+                "item_id": item_id_int,
                 "item_name": in_name,
                 "item_article": in_article,
                 "unit": unit_display,
@@ -1173,6 +1372,10 @@ def get_run_purchases(
                 "turning_blank_priority": bool(turning_badge),
                 "late_supplier_order": bool(late_supplier_badge),
                 "source_purchase_ids": [],
+                "main_area_id": area_meta.get("main_area_id"),
+                "main_area_name": area_meta.get("main_area_name"),
+                "main_stage_id": area_meta.get("main_stage_id"),
+                "main_stage_name": area_meta.get("main_stage_name"),
             }
         elif badge:
             aggregated_data[agg_key]["badge"] = _merge_badges(aggregated_data[agg_key].get("badge"), badge)
@@ -1232,6 +1435,10 @@ def get_run_purchases(
             normalized["lead_time_days"] = int(row.get("lead_time_days") or 0)
             normalized["supplier_ref1c"] = row.get("supplier_ref1c") or ""
             normalized["purchase_id"] = int(row.get("purchase_id") or 0)
+            normalized["main_area_id"] = row.get("main_area_id")
+            normalized["main_area_name"] = row.get("main_area_name")
+            normalized["main_stage_id"] = row.get("main_stage_id")
+            normalized["main_stage_name"] = row.get("main_stage_name")
             return normalized
 
         normalized_rows = [normalize_row(r) for r in data]
