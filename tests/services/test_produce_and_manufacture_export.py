@@ -208,8 +208,10 @@ def test_dry_run_returns_payload_with_order_ref(db_session, monkeypatch):
     payload = pl["payload"]
     assert payload["Posted"] is False
     assert payload["Number"].startswith("PM")
-    # Plan links manufacture back to the parent production order in 1C.
+    # Manufacture is created on the basis of the parent production order in 1C.
     assert payload["ЗаказНаПроизводство_Key"] == "order-ref-{}".format(item.item_id)
+    assert payload["ДокументОснование"] == "order-ref-{}".format(item.item_id)
+    assert payload["ДокументОснование_Type"] == "StandardODATA.Document_ЗаказНаПроизводство"
     [prod_row] = payload["Продукция"]
     assert prod_row["Номенклатура_Key"] == "item-ref-exp"
     assert float(prod_row["Количество"]) == 4.0
@@ -288,6 +290,25 @@ def test_second_export_is_noop(db_session, monkeypatch):
     assert result["manufactures_created"] == 0
     assert result["manufactures_already_linked"] == 1
     assert len(fake.posts) == 1
+
+
+def test_skips_manufacture_without_parent_order_ref1c(db_session):
+    """Per contract: Document_СборкаЗапасов requires ДокументОснование →
+    Document_ЗаказНаПроизводство. Without parent's order_ref1c the manufacture
+    cannot be exported."""
+    item = _mk_item(db_session, code="MF-NOBASE", ref1c="item-ref-nobase")
+    product = _mk_product(db_session, item, qty=3)
+    mid = produce_line(db_session, product.product_id, qty=3)["manufacture_id"]
+    # Clear the parent's order_ref1c.
+    m = db_session.query(ProductionManufacture).filter_by(manufacture_id=mid).one()
+    m.order.order_ref1c = None
+    db_session.commit()
+
+    result = exporter.export_manufactures_to_1c(db_session, [mid], dry_run=True)
+
+    assert result["manufactures_eligible"] == 0
+    assert len(result["skipped_rows"]) == 1
+    assert "order_ref1c" in result["skipped_rows"][0]["reason"]
 
 
 def test_skipped_for_invalid_inputs(db_session, monkeypatch):

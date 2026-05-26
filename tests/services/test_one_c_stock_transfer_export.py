@@ -158,6 +158,8 @@ def test_dry_run_returns_payload_with_both_warehouses(db_session, monkeypatch):
     assert payload["Posted"] is False
     assert payload["СкладОтправитель_Key"] == "src-warehouse-guid"
     assert payload["СкладПолучатель_Key"] == "dst-warehouse-guid"
+    assert payload["ДокументОснование"] == f"order-ref-{parent.item_id}"
+    assert payload["ДокументОснование_Type"] == "StandardODATA.Document_ЗаказНаПроизводство"
     [stock_line] = payload["Запасы"]
     assert stock_line["Номенклатура_Key"] == "comp-ref-1"
     assert float(stock_line["Количество"]) == 5.0
@@ -165,6 +167,25 @@ def test_dry_run_returns_payload_with_both_warehouses(db_session, monkeypatch):
 
     # No sync_link writes during dry-run.
     assert db.query(SyncLink).filter_by(source_doctype="material_issue").count() == 0
+
+
+def test_skips_issue_without_parent_order_ref1c(db_session):
+    """Per contract: child document cannot be exported without a basis.
+    If the parent ProductionOrder isn't in 1C yet (no order_ref1c), the
+    transfer must be skipped, not exported orphaned."""
+    db = db_session
+    parent = _mk_item(db, code="TR-NOBASE", ref1c="parent-ref-nobase")
+    comp = _mk_item(db, code="TR-NOBASE-C", ref1c="comp-ref-nobase")
+    issue = _mk_issue(db, parent=parent, component=comp)
+    # Clear the parent's order_ref1c — simulating an order not yet exported to 1C.
+    issue.order.order_ref1c = None
+    db.commit()
+
+    result = exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=True)
+
+    assert result["issues_eligible"] == 0
+    assert len(result["skipped_rows"]) == 1
+    assert "order_ref1c" in result["skipped_rows"][0]["reason"]
 
 
 def test_payload_omits_warehouse_keys_when_unset(db_session, monkeypatch):

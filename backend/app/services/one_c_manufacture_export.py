@@ -118,6 +118,23 @@ def _collect_export_entries(
             )
             continue
 
+        # Contract rule (.docs/one_c_export_from_prodplan.md): child documents
+        # (here: Document_СборкаЗапасов) must carry ДокументОснование pointing
+        # at Document_ЗаказНаПроизводство. Without a parent order_ref1c, the
+        # сборка cannot be exported.
+        order_ref = _clean_ref1c(m.order.order_ref1c) if m.order else None
+        if not order_ref:
+            skipped.append(
+                {
+                    "manufacture_id": int(m.manufacture_id),
+                    "reason": (
+                        "order_ref1c пуст — родительский ЗаказНаПроизводство "
+                        "ещё не выгружен в 1С, основание не сформировать"
+                    ),
+                }
+            )
+            continue
+
         item = m.product.item if m.product else None
         item_ref = _clean_ref1c(item.item_ref1c) if item else ""
         if not item_ref:
@@ -134,7 +151,7 @@ def _collect_export_entries(
                 manufacture_id=int(m.manufacture_id),
                 product_id=int(m.product_id),
                 order_id=int(m.order_id),
-                order_ref1c=_clean_ref1c(m.order.order_ref1c) if m.order else None,
+                order_ref1c=order_ref,
                 item_ref1c=item_ref,
                 item_name=str(item.item_name or "") if item else "",
                 item_article=str(item.item_article or "") if item else "",
@@ -169,9 +186,13 @@ def _build_header_payload(entry: ManufactureExportEntry) -> Dict[str, Any]:
         "Комментарий": comment,
         "Продукция": products,
     }
-    if entry.order_ref1c:
-        # Link the manufacture back to the parent production order in 1C.
-        payload["ЗаказНаПроизводство_Key"] = entry.order_ref1c
+    # Per contract: ДокументОснование is mandatory for child documents.
+    # _collect_export_entries guarantees order_ref1c is set; this assertion
+    # protects against accidental drift if the collector ever changes.
+    assert entry.order_ref1c, "manufacture export requires order_ref1c basis"
+    payload["ЗаказНаПроизводство_Key"] = entry.order_ref1c
+    payload["ДокументОснование"] = entry.order_ref1c
+    payload["ДокументОснование_Type"] = "StandardODATA.Document_ЗаказНаПроизводство"
     return payload
 
 

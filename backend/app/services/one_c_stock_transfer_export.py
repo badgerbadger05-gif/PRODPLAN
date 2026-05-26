@@ -64,6 +64,7 @@ class StockTransferExportEntry:
     document_number: str
     product_id: int
     order_id: int
+    order_ref1c: Optional[str]
     source_warehouse_ref1c: Optional[str]
     destination_warehouse_ref1c: Optional[str]
     lines: List[StockTransferExportLine] = field(default_factory=list)
@@ -123,6 +124,24 @@ def _collect_export_entries(
             )
             continue
 
+        # Contract rule (.docs/one_c_export_from_prodplan.md): child documents
+        # (here: Document_ПеремещениеЗапасов) must carry ДокументОснование
+        # pointing at Document_ЗаказНаПроизводство. If the parent order has no
+        # order_ref1c (not yet exported to 1C), we refuse to export the
+        # transfer without a basis.
+        order_ref = _clean_ref1c(issue.order.order_ref1c) if issue.order else None
+        if not order_ref:
+            skipped.append(
+                {
+                    "issue_id": int(issue.issue_id),
+                    "reason": (
+                        "order_ref1c пуст — родительский ЗаказНаПроизводство "
+                        "ещё не выгружен в 1С, основание не сформировать"
+                    ),
+                }
+            )
+            continue
+
         lines: List[StockTransferExportLine] = []
         bad_line = False
         for ln in sorted(issue.lines, key=lambda x: x.line_id):
@@ -157,6 +176,7 @@ def _collect_export_entries(
                 document_number=str(issue.document_number),
                 product_id=int(issue.product_id),
                 order_id=int(issue.order_id),
+                order_ref1c=order_ref,
                 source_warehouse_ref1c=_clean_ref1c(issue.source_warehouse_ref1c) or None,
                 destination_warehouse_ref1c=_clean_ref1c(issue.warehouse_ref1c) or None,
                 lines=lines,
@@ -191,6 +211,12 @@ def _build_header_payload(entry: StockTransferExportEntry) -> Dict[str, Any]:
         payload["СкладОтправитель_Key"] = entry.source_warehouse_ref1c
     if entry.destination_warehouse_ref1c:
         payload["СкладПолучатель_Key"] = entry.destination_warehouse_ref1c
+    # Per contract: ДокументОснование is mandatory for child documents.
+    # _collect_export_entries guarantees order_ref1c is set; this assertion
+    # protects against accidental drift if the collector ever changes.
+    assert entry.order_ref1c, "stock-transfer export requires order_ref1c basis"
+    payload["ДокументОснование"] = entry.order_ref1c
+    payload["ДокументОснование_Type"] = "StandardODATA.Document_ЗаказНаПроизводство"
     return payload
 
 
