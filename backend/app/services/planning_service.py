@@ -54,6 +54,24 @@ from .replenishment import (
 from .warnings import make_warning, log_warning
 
 
+_REF1C_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+
+
+def _unit_display_from_parts(
+    guid: Optional[str],
+    short_name: Optional[str],
+    unit_name: Optional[str],
+    unit_code: Optional[str],
+) -> str:
+    value = str(short_name or unit_name or unit_code or "").strip()
+    if value:
+        return value
+    raw_guid = str(guid or "").strip()
+    if raw_guid and not _REF1C_RE.match(raw_guid):
+        return raw_guid
+    return "шт."
+
+
 def _load_stage_area_context(db: Session) -> Tuple[Dict[int, str], Dict[int, int], Dict[int, str]]:
     """Return stage names plus the best production resource for each stage."""
     stage_name_by_id: Dict[int, str] = {}
@@ -707,7 +725,7 @@ def get_run_production(
             # fallback to finish_date if start_date is missing
             fin_dt = po.finish_date.isoformat() if po.finish_date else ""
             start_iso = fin_dt
-        unit_display = (in_unit_short or in_unit_name or in_unit_code or in_unit_guid or "").strip()
+        unit_display = _unit_display_from_parts(in_unit_guid, in_unit_short, in_unit_name, in_unit_code)
         agg_key = (int(po.item_id), start_iso, unit_display)
         badge = _turning_blank_badge(turning_blank_priority, int(po.item_id), po.need_date)
         
@@ -802,7 +820,7 @@ def get_run_production(
     for row in filtered_rows:
         po, in_name, in_article, in_unit_guid, in_unit_short, in_unit_name, in_unit_code = row
 
-        unit_display = (in_unit_short or in_unit_name or in_unit_code or in_unit_guid or "").strip()
+        unit_display = _unit_display_from_parts(in_unit_guid, in_unit_short, in_unit_name, in_unit_code)
         start_iso = (
             po.start_date.isoformat()
             if po.start_date
@@ -1340,7 +1358,7 @@ def get_run_purchases(
                 in_unit_name = in_unit_name or cu_name
                 in_unit_code = in_unit_code or cu_code
         
-        unit_display = (in_unit_short or in_unit_name or in_unit_code or in_unit_guid or "").strip()
+        unit_display = _unit_display_from_parts(in_unit_guid, in_unit_short, in_unit_name, in_unit_code)
         item_id_int = int(item_id_val)
         agg_key = (item_id_int, unit_display)
         turning_badge = _turning_blank_badge(turning_blank_priority, int(item_id_val), need_date_val)
@@ -1631,7 +1649,7 @@ def _query_run_rework_rows(
         if date_to_dt and (bucket_dt is None or bucket_dt > date_to_dt):
             continue
 
-        unit_display = (unit_short or unit_name or unit_code or unit_guid or "").strip()
+        unit_display = _unit_display_from_parts(unit_guid, unit_short, unit_name, unit_code)
         shortage_payload = _ensure_dict(getattr(rework, "shortage", None)) or None
 
         data.append(
@@ -1984,7 +2002,7 @@ def get_run_production_grouped(
     turning_blank_priority = _load_turning_blank_priority_map(db, run_id)
 
     def _unit_display(_guid: Optional[str], _short: Optional[str], _name: Optional[str], _code: Optional[str]) -> str:
-        return ( (_short or "") or (_name or "") or (_code or "") or (_guid or "") ).strip()
+        return _unit_display_from_parts(_guid, _short, _name, _code)
 
     for row in filtered_rows:
         po, in_name, in_article, in_unit_guid, in_unit_short, in_unit_name, in_unit_code = row
