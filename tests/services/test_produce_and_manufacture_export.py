@@ -292,23 +292,26 @@ def test_second_export_is_noop(db_session, monkeypatch):
     assert len(fake.posts) == 1
 
 
-def test_skips_manufacture_without_parent_order_ref1c(db_session):
-    """Per contract: Document_СборкаЗапасов requires ДокументОснование →
-    Document_ЗаказНаПроизводство. Without parent's order_ref1c the manufacture
-    cannot be exported."""
-    item = _mk_item(db_session, code="MF-NOBASE", ref1c="item-ref-nobase")
+def test_chain_auto_exports_parent_order_in_dry_run(db_session):
+    """Per contract: Document_СборкаЗапасов is created ONLY on the basis of a
+    production order. When the parent isn't in 1C yet, the manufacture export
+    chains the parent order export first. In dry_run both payloads appear in
+    the result."""
+    item = _mk_item(db_session, code="MF-CHAIN", ref1c="item-ref-chain")
     product = _mk_product(db_session, item, qty=3)
     mid = produce_line(db_session, product.product_id, qty=3)["manufacture_id"]
-    # Clear the parent's order_ref1c.
     m = db_session.query(ProductionManufacture).filter_by(manufacture_id=mid).one()
     m.order.order_ref1c = None
+    m.order.source = "mrp"
     db_session.commit()
 
     result = exporter.export_manufactures_to_1c(db_session, [mid], dry_run=True)
 
+    assert result["parent_orders_export"] is not None
+    assert result["parent_orders_export"]["entity"] == "Document_ЗаказНаПроизводство"
+    assert result["parent_orders_export"]["orders_eligible"] == 1
+    # Child skips in dry_run because parent isn't actually stamped.
     assert result["manufactures_eligible"] == 0
-    assert len(result["skipped_rows"]) == 1
-    assert "order_ref1c" in result["skipped_rows"][0]["reason"]
 
 
 def test_skipped_for_invalid_inputs(db_session, monkeypatch):

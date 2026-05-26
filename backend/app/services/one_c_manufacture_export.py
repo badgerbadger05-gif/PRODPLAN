@@ -46,6 +46,7 @@ from .one_c_export_common import (
 )
 from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
+from .one_c_production_order_export import export_production_orders_to_1c
 
 
 MANUFACTURE_ENTITY = "Document_СборкаЗапасов"
@@ -219,6 +220,42 @@ def _upsert_link(
     )
 
 
+def _chain_export_parent_orders(
+    db: Session,
+    manufacture_ids: List[int],
+    *,
+    dry_run: bool,
+    allow_production: bool,
+) -> Optional[Dict[str, Any]]:
+    """
+    Per .docs/one_c_export_from_prodplan.md: a Document_СборкаЗапасов MUST be
+    created in 1C on the basis of a Document_ЗаказНаПроизводство. So before
+    exporting any manufacture, ensure its parent production_order is in 1C —
+    auto-export the missing ones first.
+    """
+    parent_ids_rows = (
+        db.query(ProductionOrder.order_id)
+        .join(ProductionManufacture, ProductionManufacture.order_id == ProductionOrder.order_id)
+        .filter(ProductionManufacture.manufacture_id.in_(list(manufacture_ids)))
+        .filter(
+            (ProductionOrder.order_ref1c.is_(None))
+            | (ProductionOrder.order_ref1c == "")
+            | (ProductionOrder.order_ref1c == EMPTY_REF1C)
+        )
+        .distinct()
+        .all()
+    )
+    parent_ids = [int(r[0]) for r in parent_ids_rows]
+    if not parent_ids:
+        return None
+    return export_production_orders_to_1c(
+        db,
+        parent_ids,
+        dry_run=dry_run,
+        allow_production=allow_production,
+    )
+
+
 def export_manufactures_to_1c(
     db: Session,
     manufacture_ids: List[int],
@@ -229,7 +266,13 @@ def export_manufactures_to_1c(
     """
     Export selected ProductionManufactures to 1C as Document_СборкаЗапасов
     with Posted=false. Idempotent via sync_link.
+
+    Enforces the chain rule: any parent ProductionOrder that is not yet in 1C
+    is exported first (so the manufacture can carry a valid ДокументОснование).
     """
+    parent_export = _chain_export_parent_orders(
+        db, list(manufacture_ids), dry_run=dry_run, allow_production=allow_production
+    )
     entries, skipped = _collect_export_entries(db, list(manufacture_ids))
 
     eligible: List[ManufactureExportEntry] = []
@@ -266,6 +309,7 @@ def export_manufactures_to_1c(
         "manufactures_error": 0,
         "skipped_rows": skipped,
         "entries": [],
+        "parent_orders_export": parent_export,
     }
 
     payloads: List[Dict[str, Any]] = []

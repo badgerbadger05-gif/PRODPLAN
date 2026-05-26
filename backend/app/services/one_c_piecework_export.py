@@ -44,6 +44,7 @@ from .one_c_export_common import (
 )
 from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
+from .one_c_manufacture_export import export_manufactures_to_1c
 
 
 PIECEWORK_ENTITY = "Document_СдельныйНаряд"
@@ -228,6 +229,40 @@ def _upsert_link(
     )
 
 
+def _chain_export_parent_manufactures(
+    db: Session,
+    manufacture_ids: List[int],
+    *,
+    dry_run: bool,
+    allow_production: bool,
+) -> Optional[Dict[str, Any]]:
+    """
+    Per .docs/one_c_export_from_prodplan.md: a Document_СдельныйНаряд MUST be
+    created on the basis of a Document_СборкаЗапасов. So before exporting any
+    piecework order, ensure its parent ProductionManufacture is in 1C —
+    auto-export the missing ones first. That export itself chains through
+    the production order if needed.
+    """
+    parent_ids_rows = (
+        db.query(ProductionManufacture.manufacture_id)
+        .filter(ProductionManufacture.manufacture_id.in_(list(manufacture_ids)))
+        .filter(
+            (ProductionManufacture.exported_ref1c.is_(None))
+            | (ProductionManufacture.exported_ref1c == "")
+        )
+        .all()
+    )
+    parent_ids = [int(r[0]) for r in parent_ids_rows]
+    if not parent_ids:
+        return None
+    return export_manufactures_to_1c(
+        db,
+        parent_ids,
+        dry_run=dry_run,
+        allow_production=allow_production,
+    )
+
+
 def export_piecework_to_1c(
     db: Session,
     manufacture_ids: List[int],
@@ -245,9 +280,13 @@ def export_piecework_to_1c(
     Export selected ProductionManufactures to 1C as Document_СдельныйНаряд
     with Posted=false. Idempotent via sync_link (source_doctype='piecework').
 
-    Requires manufacture.exported_ref1c to be set — the manufacture must be
-    already exported as Document_СборкаЗапасов so it can serve as the basis.
+    Enforces the full chain: parent ProductionManufacture is auto-exported as
+    Document_СборкаЗапасов first (which itself ensures Document_ЗаказНаПроизводство
+    is in 1C), so the piecework order can carry a valid ДокументОснование.
     """
+    parent_export = _chain_export_parent_manufactures(
+        db, list(manufacture_ids), dry_run=dry_run, allow_production=allow_production
+    )
     entries, skipped = _collect_export_entries(db, list(manufacture_ids))
 
     eligible: List[PieceworkExportEntry] = []
@@ -273,6 +312,7 @@ def export_piecework_to_1c(
         "manufactures_error": 0,
         "skipped_rows": skipped,
         "entries": [],
+        "parent_manufactures_export": parent_export,
     }
 
     payloads: List[Dict[str, Any]] = []

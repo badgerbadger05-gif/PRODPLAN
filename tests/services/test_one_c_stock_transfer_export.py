@@ -169,23 +169,78 @@ def test_dry_run_returns_payload_with_both_warehouses(db_session, monkeypatch):
     assert db.query(SyncLink).filter_by(source_doctype="material_issue").count() == 0
 
 
-def test_skips_issue_without_parent_order_ref1c(db_session):
-    """Per contract: child document cannot be exported without a basis.
-    If the parent ProductionOrder isn't in 1C yet (no order_ref1c), the
-    transfer must be skipped, not exported orphaned."""
+def test_chain_auto_exports_parent_order_in_dry_run(db_session):
+    """Per contract: a transfer is created ONLY on the basis of a production
+    order. When the parent isn't in 1C yet, the transfer export should
+    chain-call the parent order export first. In dry_run, both payloads
+    appear in the result; the transfer itself still skips because dry_run
+    doesn't actually stamp order_ref1c."""
     db = db_session
-    parent = _mk_item(db, code="TR-NOBASE", ref1c="parent-ref-nobase")
-    comp = _mk_item(db, code="TR-NOBASE-C", ref1c="comp-ref-nobase")
+    parent = _mk_item(db, code="TR-CHAIN", ref1c="parent-ref-chain")
+    comp = _mk_item(db, code="TR-CHAIN-C", ref1c="comp-ref-chain")
     issue = _mk_issue(db, parent=parent, component=comp)
-    # Clear the parent's order_ref1c — simulating an order not yet exported to 1C.
+    # Clear parent's order_ref1c and mark it MRP-source so it's eligible.
     issue.order.order_ref1c = None
+    issue.order.source = "mrp"
     db.commit()
 
     result = exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=True)
 
+    # The chain step ran and produced a parent-order payload.
+    assert result["parent_orders_export"] is not None
+    assert result["parent_orders_export"]["entity"] == "Document_ЗаказНаПроизводство"
+    assert result["parent_orders_export"]["orders_eligible"] == 1
+
+    # In dry_run the parent isn't actually stamped, so the child still
+    # cannot find a basis and skips with a diagnostic.
     assert result["issues_eligible"] == 0
-    assert len(result["skipped_rows"]) == 1
-    assert "order_ref1c" in result["skipped_rows"][0]["reason"]
+
+
+def test_chain_full_apply_exports_order_then_transfer(db_session, monkeypatch):
+    """In apply mode the chain actually exports the parent order first,
+    stamps order_ref1c, then exports the transfer with the correct
+    ДокументОснование."""
+    db = db_session
+    parent = _mk_item(db, code="TR-FULL", ref1c="parent-ref-full")
+    comp = _mk_item(db, code="TR-FULL-C", ref1c="comp-ref-full")
+    issue = _mk_issue(db, parent=parent, component=comp, dest_wh="dst-wh")
+    issue.order.order_ref1c = None
+    issue.order.source = "mrp"
+    db.commit()
+
+    fake = _FakeClient(ref_key="stub-key")
+    # Both parent-order and transfer exports go through the same fake client.
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+    # The chained production-order exporter uses its own _create_odata_client.
+    from app.services import one_c_production_order_export as poe
+    monkeypatch.setattr(poe, "_load_odata_config", lambda: {"base_url": "http://demo/odata/unf_demo", "username": "u", "password": "p"})
+    monkeypatch.setattr(poe, "OData1CClient", lambda **_: fake)
+    # First POST returns the order's ref; second POST returns the transfer's ref.
+    fake.ref_key = "order-created-ref"
+    original_post = fake.post
+
+    def staged_post(entity, payload, **kw):
+        # Cycle ref_key: order first, then transfer
+        if entity == "Document_ЗаказНаПроизводство":
+            fake.ref_key = "transfer-created-ref"
+            return {"Ref_Key": "order-created-ref"}
+        return original_post(entity, payload, **kw)
+    monkeypatch.setattr(fake, "post", staged_post)
+
+    result = exporter.export_material_issues_to_1c(
+        db, [issue.issue_id], dry_run=False, allow_production=False
+    )
+
+    # Parent chain happened first.
+    assert result["parent_orders_export"]["orders_created"] == 1
+    # Then the transfer was exported and stamped the parent's ref as basis.
+    assert result["issues_created"] == 1
+    # Verify the actual basis in the posted transfer payload.
+    transfer_posts = [p for p in fake.posts if p[0] == "Document_ПеремещениеЗапасов"]
+    assert len(transfer_posts) == 1
+    assert transfer_posts[0][1]["ДокументОснование"] == "order-created-ref"
+    assert transfer_posts[0][1]["ДокументОснование_Type"] == "StandardODATA.Document_ЗаказНаПроизводство"
 
 
 def test_payload_omits_warehouse_keys_when_unset(db_session, monkeypatch):
