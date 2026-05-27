@@ -587,6 +587,7 @@ def assemble_material_issue(
         raise ValueError(message) from exc
 
     issue.status = "posted"
+    issue.export_error = None
     if link is not None:
         link.status = "posted"
         link.last_synced_at = datetime.utcnow()

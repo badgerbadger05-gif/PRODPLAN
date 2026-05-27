@@ -6,6 +6,7 @@
       POSTGRES_DB: prodplan
       POSTGRES_USER: prodplan
       POSTGRES_PASSWORD: password
+      TZ: Europe/Moscow
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
@@ -25,6 +26,7 @@
     restart: unless-stopped
     environment:
       DATABASE_URL: postgresql://prodplan:password@db:5432/prodplan
+      TZ: Europe/Moscow
     depends_on:
       db:
         condition: service_healthy
@@ -49,6 +51,8 @@
   frontend:
     build: ./frontend-erp-shell
     restart: unless-stopped
+    environment:
+      TZ: Europe/Moscow
     depends_on:
       backend:
         condition: service_healthy

@@ -28,7 +28,7 @@ def _mk_item(db, *, code: str, ref1c: str | None = None) -> Item:
         item_name=f"Item {code}",
         item_article=code,
         item_ref1c=ref1c,
-        unit="шт",
+        unit=f"unit-ref-{code}",
         stock_qty=0,
         status="active",
     )
@@ -207,13 +207,15 @@ def test_dry_run_returns_payload_with_order_ref(db_session, monkeypatch):
     [pl] = result["payloads"]
     payload = pl["payload"]
     assert payload["Posted"] is False
-    assert payload["Number"].startswith("PM")
+    assert payload["Number"].startswith("MF")
     # Manufacture is created on the basis of the parent production order in 1C.
     assert payload["ЗаказНаПроизводство_Key"] == "order-ref-{}".format(item.item_id)
     assert payload["ДокументОснование"] == "order-ref-{}".format(item.item_id)
     assert payload["ДокументОснование_Type"] == "StandardODATA.Document_ЗаказНаПроизводство"
     [prod_row] = payload["Продукция"]
     assert prod_row["Номенклатура_Key"] == "item-ref-exp"
+    assert prod_row["ЕдиницаИзмерения"] == item.unit
+    assert prod_row["ЕдиницаИзмерения_Type"] == "StandardODATA.Catalog_КлассификаторЕдиницИзмерения"
     assert float(prod_row["Количество"]) == 4.0
     assert (
         db.query(SyncLink).filter_by(source_doctype="manufacture").count() == 0

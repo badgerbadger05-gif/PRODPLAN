@@ -45,6 +45,9 @@ export function App() {
             {item.title}
           </NavLink>
         ))}
+        <div className="navLogoSlot" aria-label="Логотип компании ЗСМ">
+          <img src="/zsm-logo-sidebar.png" alt="ЗСМ" />
+        </div>
       </aside>
 
       <Routes>

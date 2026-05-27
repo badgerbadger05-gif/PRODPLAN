@@ -242,7 +242,15 @@ def test_component_limit_is_cumulative_across_multiple_buckets(db_session):
     assert any(w.get("code") == "COMPONENT_SHORTAGE_BLOCKED" for w in out.get("warnings", []))
 
 
-def test_active_1c_remaining_reduces_requested_qty_for_production_order(db_session):
+def test_active_1c_remaining_already_netted_upstream_not_double_subtracted(db_session):
+    """WIP netting is the responsibility of compute_planning_preview, which
+    chronologically subtracts active production remaining_qty from gross
+    demand and passes the residual under `net_requirements`. The
+    build_planned_orders_and_purchases function must NOT subtract WIP again
+    or it would double-count (and worse: read the same dict for every
+    bucket without consuming it). The `active_remaining_by_item` argument
+    is kept on the signature for backward compatibility but no longer
+    influences production-flow requested_qty."""
     db = db_session
 
     u = Unit(unit_ref1c="u2", unit_name="шт", short_name="шт", precision=0)
@@ -276,10 +284,12 @@ def test_active_1c_remaining_reduces_requested_qty_for_production_order(db_sessi
         stock_by_item={parent.item_id: 0.0},
         wip_by_item={},
         horizon_days=run.horizon_days or 0,
-        total_demand_by_item={parent.item_id: 10.0},
+        total_demand_by_item={parent.item_id: 3.0},
     )
 
-    net_req = {str(parent.item_id): {"2025-01-01": 10.0}}
+    # Gross demand was 10; upstream WIP netting already subtracted 7 active
+    # remaining. net_requirements carries the post-WIP residual 3.0.
+    net_req = {str(parent.item_id): {"2025-01-01": 3.0}}
     out = build_planned_orders_and_purchases(
         db,
         run,
@@ -288,6 +298,8 @@ def test_active_1c_remaining_reduces_requested_qty_for_production_order(db_sessi
         priority_manager=SimpleNamespace(),
         item_cache=item_cache,
         units_by_ref=units_by_ref,
+        # Even with active_remaining_by_item passed, the function should NOT
+        # subtract again — that would yield a PlannedOrder of qty 0.
         active_remaining_by_item={parent.item_id: 7.0},
     )
 
@@ -474,8 +486,15 @@ def test_active_supplier_order_reduces_purchase_need_once_by_delivery_date(db_se
     )
     assert len(rows) == 1
     assert rows[0].need_date.isoformat() == "2025-01-20"
-    assert float(rows[0].requested_qty) == 4.0
-    assert float(rows[0].planned_qty) == 4.0
+    # PlannedPurchase semantics (consistent with period_plan_service):
+    # - requested_qty = gross net demand BEFORE supplier-order netting,
+    #   kept for the «Покрыто поставщиком» diagnostic
+    #   (supplier_covered_qty = requested_qty - qty).
+    # - planned_qty / qty = residual AFTER supplier coverage, this is what
+    #   actually gets ordered.
+    assert float(rows[0].requested_qty) == 5.0  # original bucket demand
+    assert float(rows[0].planned_qty) == 4.0    # after 1 unit supplier coverage
+    assert float(rows[0].qty) == 4.0
 
 
 def test_purchase_results_marks_late_supplier_order_coverage(db_session):
@@ -626,6 +645,95 @@ def test_turning_item_net_requirement_collapses_to_first_need_date_and_moves_bla
         and w.get("need_date") == first_need
         for w in result.get("warnings", [])
     )
+
+
+def test_bom_explosion_shifts_child_need_date_by_parent_lead_time(db_session):
+    """Classical MRP lead-time offsetting: the child component's need_date
+    is shifted back by the PARENT's production buffer_days. Across multiple
+    BOM levels the buffers accumulate (grandparent + parent + ... ), so the
+    leaf material gets a need_date far enough back to cover the full chain.
+
+    Earlier code used `resolve_buffer_days(child_id)` at every level, which
+    shifted by the wrong link and effectively lost one level of lead time
+    per BOM hop (a 3-level chain with buffers 7/5/3 mis-shifted by 12
+    days).
+    """
+    db = db_session
+    today = datetime.date.today()
+
+    # Two production stages with different lead times.
+    top_kind = ProductionKind(ref_1c="top-kind", name="Сборка")
+    sub_kind = ProductionKind(ref_1c="sub-kind", name="Узлы")
+    # buffer_days here represents the workshop's production lead time.
+    top_area = ProductionResource(resource_name="Сборка", capacity=8, daily_work_hours=8, buffer_days=7)
+    sub_area = ProductionResource(resource_name="Узлы", capacity=8, daily_work_hours=8, buffer_days=5)
+    db.add_all([top_kind, sub_kind, top_area, sub_area])
+    db.flush()
+    db.add(ResourceProductionKind(resource_id=top_area.resource_id, production_kind_id=top_kind.id))
+    db.add(ResourceProductionKind(resource_id=sub_area.resource_id, production_kind_id=sub_kind.id))
+
+    top = Item(
+        item_code="LT-TOP",
+        item_name="Top Product",
+        item_article="LT-TOP",
+        replenishment_method="Производство",
+        stock_qty=0,
+        status="active",
+    )
+    sub = Item(
+        item_code="LT-SUB",
+        item_name="Sub Assembly",
+        item_article="LT-SUB",
+        replenishment_method="Производство",
+        stock_qty=0,
+        status="active",
+    )
+    leaf = Item(
+        item_code="LT-LEAF",
+        item_name="Leaf Material",
+        item_article="LT-LEAF",
+        replenishment_method="Покупка",   # purchased leaf, no production buffer
+        stock_qty=0,
+        status="active",
+    )
+    db.add_all([top, sub, leaf])
+    db.flush()
+
+    top_spec = Specification(spec_code="TOP", spec_name="Top Spec", production_kind_id=top_kind.id)
+    sub_spec = Specification(spec_code="SUB", spec_name="Sub Spec", production_kind_id=sub_kind.id)
+    db.add_all([top_spec, sub_spec])
+    db.flush()
+    db.add(DefaultSpecification(item_id=top.item_id, spec_id=top_spec.spec_id))
+    db.add(DefaultSpecification(item_id=sub.item_id, spec_id=sub_spec.spec_id))
+    db.add(SpecComponent(spec_id=top_spec.spec_id, item_id=sub.item_id, quantity=1.0))
+    db.add(SpecComponent(spec_id=sub_spec.spec_id, item_id=leaf.item_id, quantity=1.0))
+
+    # Top is needed in 30 days — well past any buffer, so the shift is not
+    # clamped by `today` for any level.
+    top_need = today + datetime.timedelta(days=30)
+    db.add(ProductionPlanEntry(item_id=top.item_id, date=top_need, planned_qty=1))
+    db.commit()
+
+    result = compute_planning_preview(
+        db,
+        horizon_days=60,
+        config_overrides={"safety_stock_percent": 0, "toggles": {"include_wip": False}},
+    )
+
+    # Top stays at its plan date — it's the root of the explosion.
+    assert result["net"][str(top.item_id)] == {top_need.isoformat(): 1.0}
+
+    # Sub is shifted back by TOP's buffer (7 days) — the time it takes to
+    # assemble the top product. Sub must be ready 7 days before top ships.
+    sub_need = top_need - datetime.timedelta(days=7)
+    assert result["net"][str(sub.item_id)] == {sub_need.isoformat(): 1.0}
+
+    # Leaf is shifted back by SUB's buffer (5 days). Total accumulated
+    # offset from top: 7 + 5 = 12 days. The pre-fix code would have shifted
+    # leaf by leaf's own (purchase-flow) buffer of 0 — dropping 12 days of
+    # lead time.
+    leaf_need = sub_need - datetime.timedelta(days=5)
+    assert result["net"][str(leaf.item_id)] == {leaf_need.isoformat(): 1.0}
 
 
 def test_non_turning_item_keeps_requirement_buckets(db_session):

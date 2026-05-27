@@ -156,6 +156,21 @@ input:focus, select:focus {
   color: #fff;
 }
 
+.navLogoSlot {
+  margin-top: clamp(176px, 20vh, 220px);
+  padding: 0 18px;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.navLogoSlot img {
+  display: block;
+  width: 178px;
+  max-width: 100%;
+  height: auto;
+}
+
 .workArea {
   min-width: 0;
   height: 100vh;
@@ -433,8 +448,9 @@ input:focus, select:focus {
 .pill.partial, .miniPill.partial { background: #fff2c7; border-color: #e7c56a; color: var(--orange); }
 .pill.ready, .miniPill.ready { background: #e7f6ee; border-color: #9bd0b4; color: var(--green); }
 .pill.to_move, .miniPill.to_move { background: #e6f0ff; border-color: #9cbce8; color: var(--blue); }
-.pill.assembled, .pill.produced, .pill.produced_partial,
-.miniPill.assembled, .miniPill.produced, .miniPill.produced_partial { background: #e7f7f4; border-color: #9fd3cd; color: #0f766e; }
+.pill.assembled, .miniPill.assembled { background: #ece8ff; border-color: #8f79e8; color: #4b2bbf; }
+.pill.produced, .pill.produced_partial,
+.miniPill.produced, .miniPill.produced_partial { background: #e7f7f4; border-color: #9fd3cd; color: #0f766e; }
 .pill.success { background: #e7f6ee; border-color: #9bd0b4; color: var(--green); }
 .pill.running { background: #e6f0ff; border-color: #9cbce8; color: var(--blue); }
 .pill.failed { background: #ffe5e5; border-color: #ef9a9a; color: var(--red); }

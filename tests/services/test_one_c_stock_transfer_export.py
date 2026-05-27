@@ -19,6 +19,7 @@ from app.models import (
     SyncLink,
 )
 from app.services import one_c_stock_transfer_export as exporter
+from app.services.one_c_document_numbers import material_issue_number
 
 
 # -----------------------------
@@ -32,7 +33,7 @@ def _mk_item(db, *, code: str, ref1c: str) -> Item:
         item_name=f"Item {code}",
         item_article=code,
         item_ref1c=ref1c,
-        unit="шт",
+        unit=f"unit-ref-{code}",
         stock_qty=100,
         status="active",
     )
@@ -110,12 +111,18 @@ class _FakeClient:
         self.ref_key = ref_key
         self.fail = fail
         self.posts: list = []
+        self.balance_rows: list = []
 
     def post(self, entity, payload, **_kwargs):
         self.posts.append((entity, payload))
         if self.fail:
             raise RuntimeError("simulated 1C failure")
         return {"Ref_Key": self.ref_key}
+
+    def get_all(self, entity_name, **_kwargs):
+        if str(entity_name).startswith("AccumulationRegister_ЗапасыНаСкладах/Balance"):
+            return list(self.balance_rows)
+        return []
 
 
 def _stub_config(monkeypatch, *, base_url: str) -> None:
@@ -131,7 +138,7 @@ def _stub_config(monkeypatch, *, base_url: str) -> None:
 # -----------------------------
 
 
-def test_dry_run_returns_payload_with_both_warehouses(db_session, monkeypatch):
+def test_dry_run_returns_payload_with_both_structural_units(db_session, monkeypatch):
     db = db_session
     parent = _mk_item(db, code="TRP1", ref1c="parent-ref-1")
     comp = _mk_item(db, code="TRC1", ref1c="comp-ref-1")
@@ -156,17 +163,90 @@ def test_dry_run_returns_payload_with_both_warehouses(db_session, monkeypatch):
     [pl] = result["payloads"]
     payload = pl["payload"]
     assert payload["Posted"] is False
-    assert payload["СкладОтправитель_Key"] == "src-warehouse-guid"
-    assert payload["СкладПолучатель_Key"] == "dst-warehouse-guid"
+    assert payload["Number"] == material_issue_number(db, issue)
+    assert payload["СтруктурнаяЕдиница_Key"] == "src-warehouse-guid"
+    assert payload["СтруктурнаяЕдиницаПолучатель_Key"] == "dst-warehouse-guid"
     assert payload["ДокументОснование"] == f"order-ref-{parent.item_id}"
     assert payload["ДокументОснование_Type"] == "StandardODATA.Document_ЗаказНаПроизводство"
     [stock_line] = payload["Запасы"]
     assert stock_line["Номенклатура_Key"] == "comp-ref-1"
+    assert stock_line["ЕдиницаИзмерения"] == comp.unit
+    assert stock_line["ЕдиницаИзмерения_Type"] == "StandardODATA.Catalog_КлассификаторЕдиницИзмерения"
+    assert stock_line["СтавкаНДС_Key"] == exporter.DEFAULT_STOCK_TRANSFER_VAT_RATE_REF1C
+    assert stock_line["КлючСвязи"] == 1
     assert float(stock_line["Количество"]) == 5.0
     assert "PRODPLAN source=material_issue/" in payload["Комментарий"]
 
     # No sync_link writes during dry-run.
     assert db.query(SyncLink).filter_by(source_doctype="material_issue").count() == 0
+
+
+def test_apply_payload_fills_source_storage_cell_from_live_1c_balance(db_session, monkeypatch):
+    db = db_session
+    parent = _mk_item(db, code="TRP-CELL", ref1c="parent-cell-ref")
+    comp = _mk_item(db, code="TRC-CELL", ref1c="comp-cell-ref")
+    issue = _mk_issue(
+        db,
+        parent=parent,
+        component=comp,
+        source_wh="src-cell-wh",
+        dest_wh="dst-cell-wh",
+    )
+
+    _stub_config(monkeypatch, base_url="http://1c-demo/odata/unf_demo")
+    fake = _FakeClient(ref_key="transfer-cell-ref")
+    fake.balance_rows = [
+        {
+            "Номенклатура_Key": "comp-cell-ref",
+            "СтруктурнаяЕдиница_Key": "src-cell-wh",
+            "Ячейка_Key": "cell-ref-1",
+            "КоличествоBalance": 12,
+        }
+    ]
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    result = exporter.export_material_issues_to_1c(
+        db, [issue.issue_id], dry_run=False, allow_production=False
+    )
+
+    assert result["issues_created"] == 1
+    [(_, payload)] = fake.posts
+    [stock_line] = payload["Запасы"]
+    assert stock_line["Ячейка_Key"] == "cell-ref-1"
+    assert payload["ПоложениеЯчейкиОтправителя"] == "ВТабличнойЧасти"
+
+
+def test_transfer_numbers_share_order_key_and_use_suffixes(db_session):
+    db = db_session
+    parent = _mk_item(db, code="TRP-SFX", ref1c="parent-sfx")
+    comp = _mk_item(db, code="TRC-SFX", ref1c="comp-sfx")
+    first = _mk_issue(db, parent=parent, component=comp)
+    order = first.order
+    product2 = ProductionProduct(
+        order_id=order.order_id,
+        item_id=parent.item_id,
+        line_number=2,
+        quantity=3,
+        produced_qty=0,
+        remaining_qty=3,
+    )
+    db.add(product2)
+    db.flush()
+    second = ProductionMaterialIssue(
+        document_number="tmp-second-suffix",
+        product_id=product2.product_id,
+        order_id=order.order_id,
+        status="draft",
+        warehouse_ref1c="dst-2",
+        source_warehouse_ref1c="src-2",
+    )
+    db.add(second)
+    db.flush()
+    db.commit()
+
+    assert material_issue_number(db, first).endswith("A")
+    assert material_issue_number(db, second).endswith("B")
+    assert material_issue_number(db, first)[2:-1] == material_issue_number(db, second)[2:-1]
 
 
 def test_chain_auto_exports_parent_order_in_dry_run(db_session):
@@ -243,9 +323,9 @@ def test_chain_full_apply_exports_order_then_transfer(db_session, monkeypatch):
     assert transfer_posts[0][1]["ДокументОснование_Type"] == "StandardODATA.Document_ЗаказНаПроизводство"
 
 
-def test_payload_omits_warehouse_keys_when_unset(db_session, monkeypatch):
-    """If source/destination warehouse aren't known, omit those keys
-    entirely so 1C accepts the draft and the user can fill them in."""
+def test_payload_defaults_destination_when_unset(db_session, monkeypatch):
+    """If source/destination aren't known, still fill the ZSM destination
+    default so 1C can create a valid draft."""
     db = db_session
     parent = _mk_item(db, code="TRP2", ref1c="parent-ref-2")
     comp = _mk_item(db, code="TRC2", ref1c="comp-ref-2")
@@ -254,8 +334,8 @@ def test_payload_omits_warehouse_keys_when_unset(db_session, monkeypatch):
     monkeypatch.setattr(exporter, "OData1CClient", lambda **_: pytest.fail("no network"))
     result = exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=True)
     payload = result["payloads"][0]["payload"]
-    assert "СкладОтправитель_Key" not in payload
-    assert "СкладПолучатель_Key" not in payload
+    assert "СтруктурнаяЕдиница_Key" not in payload
+    assert payload["СтруктурнаяЕдиницаПолучатель_Key"]
 
 
 def test_demo_guard_refuses_non_demo_without_override(db_session, monkeypatch):
@@ -316,7 +396,7 @@ def test_successful_export_stamps_sync_link_and_issue_status(db_session, monkeyp
     )
     assert link.status == "success"
     assert link.target_ref_key == "c8dbfcc4-trf-ref"
-    assert link.target_number == issue.document_number
+    assert link.target_number == material_issue_number(db, issue)
 
     # ProductionOrderLineState.issue_status moves to 'exported'.
     state = (

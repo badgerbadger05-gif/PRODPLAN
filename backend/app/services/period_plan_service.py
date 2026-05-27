@@ -38,6 +38,11 @@ from .planning_service import (
     get_active_planning_config,
 )
 from .capacity_scheduler import CapacityScheduler
+from .mrp_stock_helpers import (
+    active_wip_eta_by_item as _active_wip_eta_by_item,
+    consume_wip_at_or_before as _consume_wip_at_or_before,
+    effective_stock_by_item_all as _effective_stock_by_item_all,
+)
 from .replenishment import (
     REPLENISHMENT_FLOW_PRODUCTION,
     REPLENISHMENT_FLOW_PURCHASE,
@@ -403,10 +408,10 @@ def _explode_bom_net_first(
     before the next iteration starts.
     """
     # --- Pre-load BOM data in bulk (avoid N+1 per item) ---
-    stock_by_item: Dict[int, float] = {
-        int(row.item_id): float(row.stock_qty or 0.0)
-        for row in db.query(Item.item_id, Item.stock_qty).all()
-    }
+    # Effective stock with ignored warehouses (e.g., brak isolator) excluded;
+    # using Item.stock_qty directly would let MRP "see" stock that production
+    # control then refuses as a material-issue source.
+    stock_by_item: Dict[int, float] = _effective_stock_by_item_all(db)
 
     default_spec_map: Dict[int, int] = {
         int(ds.item_id): int(ds.spec_id)
@@ -417,26 +422,16 @@ def _explode_bom_net_first(
     for comp in db.query(SpecComponent).all():
         components_by_spec.setdefault(int(comp.spec_id), []).append(comp)
 
-    # --- WIP: remaining qty from active (non-done, non-deleted) production orders ---
+    # --- WIP: remaining qty from active (non-done, non-deleted) production
+    # orders, keyed by planned_finish_date so the netting respects when the
+    # WIP is actually expected to be physically available. A WIP order that
+    # finishes in September does NOT cover a July demand bucket; previously
+    # we collapsed all WIP into one timeless pool, which over-credited early
+    # buckets and under-planned production.
     try:
-        wip_rows = (
-            db.query(
-                ProductionProduct.item_id,
-                func.sum(ProductionProduct.remaining_qty),
-            )
-            .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
-            .filter(ProductionOrder.deletion_mark.is_(False))
-            .filter(
-                func.lower(func.coalesce(ProductionOrder.order_state_key, ""))
-                != _DONE_STATE_KEY
-            )
-            .filter(ProductionProduct.remaining_qty > 0)
-            .group_by(ProductionProduct.item_id)
-            .all()
-        )
-        wip_by_item: Dict[int, float] = {int(iid): float(qty or 0.0) for iid, qty in wip_rows}
+        wip_eta_by_item: Dict[int, list] = _active_wip_eta_by_item(db)
     except Exception:
-        wip_by_item = {}
+        wip_eta_by_item = {}
 
     # --- Buffer-days lookup: item → default spec → production_kind → resource.buffer_days ---
     all_spec_ids: set = set(default_spec_map.values())
@@ -493,10 +488,12 @@ def _explode_bom_net_first(
     gross_map: Dict[int, Dict[date, float]] = {}
     net_map: Dict[int, Dict[date, float]] = {}
     bom_level_map: Dict[int, int] = {}
-    # Available = stock + WIP, consumed chronologically as demand is processed.
-    avail_remaining: Dict[int, float] = {
-        iid: stock_by_item.get(iid, 0.0) + wip_by_item.get(iid, 0.0)
-        for iid in set(stock_by_item) | set(wip_by_item)
+    # Stock pool (immediate, no ETA) — consumed before WIP for each bucket.
+    avail_stock: Dict[int, float] = dict(stock_by_item)
+    # WIP pool with per-item ETA list; mutated as buckets are netted so the
+    # same WIP line can't cover two different demand buckets.
+    avail_wip: Dict[int, list] = {
+        int(iid): list(entries) for iid, entries in wip_eta_by_item.items()
     }
     # Prevent cycles: track items already exploded as parents
     exploded_parents: set = set()
@@ -531,22 +528,32 @@ def _explode_bom_net_first(
             for bucket_date, qty in buckets.items():
                 gross_map[iid][bucket_date] = gross_map[iid].get(bucket_date, 0.0) + float(qty)
 
-            # Net demand chronologically against available (stock + WIP)
-            avail = avail_remaining.get(iid, 0.0)
+            # Net demand chronologically: first against the immediate stock
+            # pool, then against WIP whose ETA is at or before the bucket.
+            # WIP entries with eta > bucket_date can't cover that bucket but
+            # may cover a later one, so the per-item WIP list is mutated in
+            # place across the bucket loop.
+            stock_left = avail_stock.get(iid, 0.0)
+            wip_list = avail_wip.setdefault(iid, [])
             net_buckets: List[Tuple[date, float]] = []
 
             for bucket_date, bucket_qty in sorted(buckets.items()):
                 q = float(bucket_qty or 0.0)
                 if q <= 1e-9:
                     continue
-                if avail >= q:
-                    avail -= q
+                # 1) Consume free stock first (always available).
+                if stock_left >= q:
+                    stock_left -= q
                     continue
-                net_q = q - avail
-                avail = 0.0
-                net_buckets.append((bucket_date, net_q))
+                residual = q - stock_left
+                stock_left = 0.0
+                # 2) Consume WIP whose ETA <= bucket_date.
+                residual = _consume_wip_at_or_before(wip_list, bucket_date, residual)
+                if residual <= 1e-9:
+                    continue
+                net_buckets.append((bucket_date, residual))
 
-            avail_remaining[iid] = avail
+            avail_stock[iid] = stock_left
 
             # Accumulate net demand
             if net_buckets:
@@ -578,9 +585,18 @@ def _explode_bom_net_first(
                     if per_unit <= 1e-12 or net_q <= 1e-9:
                         continue
                     child_qty = net_q * per_unit
-                    # Shift need-date back by buffer_days so components are
-                    # required before the parent's production start.
-                    buf = resolve_buffer_days(child_id)
+                    # Classical MRP lead-time offset: shift the child's
+                    # need_date back by the PARENT's production time
+                    # (`resolve_buffer_days(iid)`), so the components are
+                    # required by the moment the parent's production starts.
+                    # The child's OWN buffer applies one level deeper, when
+                    # the child is itself exploded into its components —
+                    # the BFS accumulates the buffer chain correctly.
+                    # Earlier this used `resolve_buffer_days(child_id)`,
+                    # which shifted by the wrong link and effectively lost
+                    # the parent's lead time at every level (over 3 levels
+                    # with buffers 7/5/3 it produced a 12-day error).
+                    buf = resolve_buffer_days(iid)
                     child_date = (bucket_date - timedelta(days=buf)) if buf > 0 else bucket_date
                     child_date = clamp_to_today(child_date)
                     if child_id not in next_demand:
@@ -922,11 +938,21 @@ def create_mrp_snapshot_from_period_plan(
                     alloc_total_qty += net_qty
 
             # Mark the requirement covered by the allocation created above.
-            req = req_by_item.get(iid)
-            if req and alloc_total_qty > 0:
-                total_net = _to_float(req.net_required_qty)
-                req.covered_qty = min(alloc_total_qty, total_net)
-                req.remaining_qty = max(0.0, total_net - alloc_total_qty)
+            #
+            # Only purchase and rework flows close the requirement at snapshot
+            # time, because their PlannedPurchase / PlannedRework rows ARE the
+            # downstream orders that will be issued to 1C. PlannedOrder for a
+            # production-flow item is just an MRP proposal — covered_qty is
+            # incremented when a ProductionProduct is materialized via
+            # create_production_orders_from_mrp_requirements. Otherwise the
+            # very first materialization always skips with
+            # "remaining_qty=0 (уже покрыто)".
+            if flow in (REPLENISHMENT_FLOW_PURCHASE, REPLENISHMENT_FLOW_REWORK):
+                req = req_by_item.get(iid)
+                if req and alloc_total_qty > 0:
+                    total_net = _to_float(req.net_required_qty)
+                    req.covered_qty = min(alloc_total_qty, total_net)
+                    req.remaining_qty = max(0.0, total_net - alloc_total_qty)
 
         if created_production_orders:
             db.flush()

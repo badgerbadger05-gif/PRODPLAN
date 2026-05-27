@@ -123,6 +123,63 @@ def test_sync_stock_warehouses_prefers_catalog_lookup(db_session, monkeypatch):
     ]
 
 
+def test_fetch_warehouse_catalog_rows_merges_all_catalog_candidates(monkeypatch):
+    calls = []
+
+    def _fake_get_all(self, entity_name, **kwargs):
+        calls.append(entity_name)
+        if entity_name == "Catalog_Склады":
+            return [
+                {
+                    "Ref_Key": "WH-1",
+                    "Code": "НФ-000001",
+                    "Description": "Склад основной",
+                    "DeletionMark": False,
+                }
+            ]
+        if entity_name == "Catalog_СтруктурныеЕдиницы":
+            return [
+                {
+                    "Ref_Key": "WH-2",
+                    "Code": "НФ-000002",
+                    "Description": "Склад участка",
+                    "DeletionMark": False,
+                }
+            ]
+        if entity_name == "Catalog_СтруктурныеЕдиницыПредприятия":
+            return [
+                {
+                    "Ref_Key": "WH-1",
+                    "Code": "НФ-000001",
+                    "Description": "Склад основной дубль",
+                    "DeletionMark": False,
+                },
+                {
+                    "Ref_Key": "WH-3",
+                    "Code": "НФ-000003",
+                    "Description": "Кладовая",
+                    "DeletionMark": False,
+                },
+            ]
+        return []
+
+    monkeypatch.setattr(stock_sync.OData1CClient, "get_all", _fake_get_all)
+
+    rows, entity = stock_sync._fetch_warehouse_catalog_rows(_mk_req())
+
+    assert calls == [
+        "Catalog_Склады",
+        "Catalog_СтруктурныеЕдиницы",
+        "Catalog_СтруктурныеЕдиницыПредприятия",
+        "Catalog_СкладыПредприятия",
+    ]
+    assert entity == (
+        "Catalog_Склады, Catalog_СтруктурныеЕдиницы, "
+        "Catalog_СтруктурныеЕдиницыПредприятия"
+    )
+    assert {row["Ref_Key"] for row in rows} == {"WH-1", "WH-2", "WH-3"}
+
+
 def test_sync_stock_populates_per_warehouse_breakdown(db_session, monkeypatch):
     """
     sync_stock_from_odata must populate item_warehouse_stock with one row per

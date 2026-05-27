@@ -533,7 +533,7 @@ def test_preview_materials_marks_ready_when_stock_covers_all(db_session):
     )
     _order, product = _make_internal_order_for(db_session, parent, qty=2)
 
-    preview = preview_materials(db_session, product.product_id)
+    preview = preview_materials(db_session, product.product_id, refresh_state=True)
 
     assert preview["coverage"] == "ready"
     for c in preview["components"]:
@@ -584,7 +584,7 @@ def test_preview_materials_marks_shortage_and_includes_supplier_eta(db_session):
     )
     db_session.commit()
 
-    preview = preview_materials(db_session, product.product_id)
+    preview = preview_materials(db_session, product.product_id, refresh_state=True)
     assert preview["coverage"] == "shortage"
     only_comp = preview["components"][0]
     assert only_comp["coverage"] == "shortage"
@@ -609,7 +609,7 @@ def test_preview_materials_marks_partial_when_some_stock(db_session):
     )
     _order, product = _make_internal_order_for(db_session, parent, qty=2)
 
-    preview = preview_materials(db_session, product.product_id)
+    preview = preview_materials(db_session, product.product_id, refresh_state=True)
     assert preview["coverage"] == "partial"
     by_name = {c["item_name"]: c for c in preview["components"]}
     assert by_name["Comp full"]["coverage"] == "ok"
@@ -644,7 +644,7 @@ def test_preview_materials_does_not_override_post_coverage_status(db_session):
     )
     if state is None:
         # Lazy-create through preview, then move forward.
-        preview_materials(db_session, product.product_id)
+        preview_materials(db_session, product.product_id, refresh_state=True)
         state = (
             db_session.query(ProductionOrderLineState)
             .filter_by(product_id=product.product_id)
@@ -653,7 +653,7 @@ def test_preview_materials_does_not_override_post_coverage_status(db_session):
     state.status = "to_move"
     db_session.commit()
 
-    preview_materials(db_session, product.product_id)
+    preview_materials(db_session, product.product_id, refresh_state=True)
     refreshed = (
         db_session.query(ProductionOrderLineState)
         .filter_by(product_id=product.product_id)
@@ -1028,7 +1028,7 @@ def test_preview_materials_excludes_ignored_warehouses_from_stock(db_session):
     db_session.commit()
 
     # Before adding to the ignore list: coverage should be 'ready' (10 >= 2).
-    preview = preview_materials(db_session, product.product_id)
+    preview = preview_materials(db_session, product.product_id, refresh_state=True)
     assert preview["coverage"] == "ready"
     assert preview["components"][0]["available_qty"] == 10
     assert preview["components"][0]["coverage"] == "ok"
@@ -1051,7 +1051,7 @@ def test_preview_materials_excludes_ignored_warehouses_from_stock(db_session):
         reason="Бракованные комплектующие",
     )
 
-    preview_after = preview_materials(db_session, product.product_id)
+    preview_after = preview_materials(db_session, product.product_id, refresh_state=True)
     assert preview_after["coverage"] == "shortage"
     only_comp = preview_after["components"][0]
     assert only_comp["available_qty"] == 0

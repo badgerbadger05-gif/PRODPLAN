@@ -123,7 +123,7 @@ def _stock_balance_cell_rows(
         return []
     entity = (
         "AccumulationRegister_ЗапасыНаСкладах/Balance("
-        f"Period=datetime'{datetime.now().replace(microsecond=0).isoformat()}',"
+        f"Period=datetime'{_current_1c_datetime()}',"
         "Dimensions='Номенклатура,СтруктурнаяЕдиница,Ячейка,Организация')"
     )
     filter_query = (
@@ -211,6 +211,8 @@ def add_source_cells_to_payload(
         row["LineNumber"] = idx
         row["КлючСвязи"] = idx
     payload["Запасы"] = rebuilt
+    if any(_clean_ref1c(row.get("Ячейка_Key")) for row in rebuilt):
+        payload["ПоложениеЯчейкиОтправителя"] = "ВТабличнойЧасти"
     return payload
 
 
