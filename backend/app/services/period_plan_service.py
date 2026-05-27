@@ -585,9 +585,18 @@ def _explode_bom_net_first(
                     if per_unit <= 1e-12 or net_q <= 1e-9:
                         continue
                     child_qty = net_q * per_unit
-                    # Shift need-date back by buffer_days so components are
-                    # required before the parent's production start.
-                    buf = resolve_buffer_days(child_id)
+                    # Classical MRP lead-time offset: shift the child's
+                    # need_date back by the PARENT's production time
+                    # (`resolve_buffer_days(iid)`), so the components are
+                    # required by the moment the parent's production starts.
+                    # The child's OWN buffer applies one level deeper, when
+                    # the child is itself exploded into its components —
+                    # the BFS accumulates the buffer chain correctly.
+                    # Earlier this used `resolve_buffer_days(child_id)`,
+                    # which shifted by the wrong link and effectively lost
+                    # the parent's lead time at every level (over 3 levels
+                    # with buffers 7/5/3 it produced a 12-day error).
+                    buf = resolve_buffer_days(iid)
                     child_date = (bucket_date - timedelta(days=buf)) if buf > 0 else bucket_date
                     child_date = clamp_to_today(child_date)
                     if child_id not in next_demand:

@@ -647,6 +647,95 @@ def test_turning_item_net_requirement_collapses_to_first_need_date_and_moves_bla
     )
 
 
+def test_bom_explosion_shifts_child_need_date_by_parent_lead_time(db_session):
+    """Classical MRP lead-time offsetting: the child component's need_date
+    is shifted back by the PARENT's production buffer_days. Across multiple
+    BOM levels the buffers accumulate (grandparent + parent + ... ), so the
+    leaf material gets a need_date far enough back to cover the full chain.
+
+    Earlier code used `resolve_buffer_days(child_id)` at every level, which
+    shifted by the wrong link and effectively lost one level of lead time
+    per BOM hop (a 3-level chain with buffers 7/5/3 mis-shifted by 12
+    days).
+    """
+    db = db_session
+    today = datetime.date.today()
+
+    # Two production stages with different lead times.
+    top_kind = ProductionKind(ref_1c="top-kind", name="Сборка")
+    sub_kind = ProductionKind(ref_1c="sub-kind", name="Узлы")
+    # buffer_days here represents the workshop's production lead time.
+    top_area = ProductionResource(resource_name="Сборка", capacity=8, daily_work_hours=8, buffer_days=7)
+    sub_area = ProductionResource(resource_name="Узлы", capacity=8, daily_work_hours=8, buffer_days=5)
+    db.add_all([top_kind, sub_kind, top_area, sub_area])
+    db.flush()
+    db.add(ResourceProductionKind(resource_id=top_area.resource_id, production_kind_id=top_kind.id))
+    db.add(ResourceProductionKind(resource_id=sub_area.resource_id, production_kind_id=sub_kind.id))
+
+    top = Item(
+        item_code="LT-TOP",
+        item_name="Top Product",
+        item_article="LT-TOP",
+        replenishment_method="Производство",
+        stock_qty=0,
+        status="active",
+    )
+    sub = Item(
+        item_code="LT-SUB",
+        item_name="Sub Assembly",
+        item_article="LT-SUB",
+        replenishment_method="Производство",
+        stock_qty=0,
+        status="active",
+    )
+    leaf = Item(
+        item_code="LT-LEAF",
+        item_name="Leaf Material",
+        item_article="LT-LEAF",
+        replenishment_method="Покупка",   # purchased leaf, no production buffer
+        stock_qty=0,
+        status="active",
+    )
+    db.add_all([top, sub, leaf])
+    db.flush()
+
+    top_spec = Specification(spec_code="TOP", spec_name="Top Spec", production_kind_id=top_kind.id)
+    sub_spec = Specification(spec_code="SUB", spec_name="Sub Spec", production_kind_id=sub_kind.id)
+    db.add_all([top_spec, sub_spec])
+    db.flush()
+    db.add(DefaultSpecification(item_id=top.item_id, spec_id=top_spec.spec_id))
+    db.add(DefaultSpecification(item_id=sub.item_id, spec_id=sub_spec.spec_id))
+    db.add(SpecComponent(spec_id=top_spec.spec_id, item_id=sub.item_id, quantity=1.0))
+    db.add(SpecComponent(spec_id=sub_spec.spec_id, item_id=leaf.item_id, quantity=1.0))
+
+    # Top is needed in 30 days — well past any buffer, so the shift is not
+    # clamped by `today` for any level.
+    top_need = today + datetime.timedelta(days=30)
+    db.add(ProductionPlanEntry(item_id=top.item_id, date=top_need, planned_qty=1))
+    db.commit()
+
+    result = compute_planning_preview(
+        db,
+        horizon_days=60,
+        config_overrides={"safety_stock_percent": 0, "toggles": {"include_wip": False}},
+    )
+
+    # Top stays at its plan date — it's the root of the explosion.
+    assert result["net"][str(top.item_id)] == {top_need.isoformat(): 1.0}
+
+    # Sub is shifted back by TOP's buffer (7 days) — the time it takes to
+    # assemble the top product. Sub must be ready 7 days before top ships.
+    sub_need = top_need - datetime.timedelta(days=7)
+    assert result["net"][str(sub.item_id)] == {sub_need.isoformat(): 1.0}
+
+    # Leaf is shifted back by SUB's buffer (5 days). Total accumulated
+    # offset from top: 7 + 5 = 12 days. The pre-fix code would have shifted
+    # leaf by leaf's own (purchase-flow) buffer of 0 — dropping 12 days of
+    # lead time.
+    leaf_need = sub_need - datetime.timedelta(days=5)
+    assert result["net"][str(leaf.item_id)] == {leaf_need.isoformat(): 1.0}
+
+
 def test_non_turning_item_keeps_requirement_buckets(db_session):
     db = db_session
     today = datetime.date.today()

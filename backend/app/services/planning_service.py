@@ -3067,8 +3067,18 @@ def compute_planning_preview(
                     child_date = bucket_date
                     is_priority_blank = turning_parent and child_id in priority_blank_ids
                     if not is_priority_blank:
-                        # Regular components keep their own buffer; turning blanks start with the turning order.
-                        buf = resolve_buffer_days(int(child_id))
+                        # Classical MRP lead-time offset: shift the child's
+                        # need_date back by the PARENT's production time
+                        # (`resolve_buffer_days(int(iid))`). The child's
+                        # own lead time will apply when the child is itself
+                        # exploded one BFS level deeper — the BFS accumulates
+                        # the buffer chain across the BOM correctly.
+                        # Earlier this used `resolve_buffer_days(child_id)`,
+                        # which shifted by the wrong link and dropped the
+                        # parent's lead time at every level. Turning blanks
+                        # remain pinned to the parent's bucket — they ARE
+                        # the parent's first operation.
+                        buf = resolve_buffer_days(int(iid))
                         if buf > 0:
                             child_date = clamp_to_horizon(bucket_date - timedelta(days=int(buf)))
                     next_demand[int(child_id)][child_date] += child_qty
