@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 from decimal import Decimal
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -19,6 +19,7 @@ from ..models import (
     PlannedRework,
     PlanningRun,
     ProductionOrder,
+    ProductionOrderLineState,
     ProductionProduct,
     ProductionPlanHeader,
     ProductionPlanLine,
@@ -35,6 +36,12 @@ from .planning_service import (
     DEFAULT_PLANNING_CONFIG,
     SUPPLIER_ORDER_EXCLUDED_STATE_NAMES,
     get_active_planning_config,
+)
+from .capacity_scheduler import CapacityScheduler
+from .mrp_stock_helpers import (
+    active_wip_eta_by_item as _active_wip_eta_by_item,
+    consume_wip_at_or_before as _consume_wip_at_or_before,
+    effective_stock_by_item_all as _effective_stock_by_item_all,
 )
 from .replenishment import (
     REPLENISHMENT_FLOW_PRODUCTION,
@@ -66,6 +73,38 @@ def _to_float(value: Any) -> float:
         return float(value or 0.0)
     except Exception:
         return 0.0
+
+
+def _date_to_iso(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value)[:10] if value else None
+
+
+def _forecast_payload(
+    forecast_date: Optional[date],
+    due_date: Optional[date],
+    *,
+    reason: str = "capacity",
+) -> Dict[str, Any]:
+    if not forecast_date or not due_date:
+        return {"forecast_date": _date_to_iso(forecast_date), "forecast_shift_days": None, "forecast_reason": None}
+    shift = (forecast_date - due_date).days
+    if shift > 0:
+        reason_text = "смещение по мощностям" if reason == "capacity" else reason
+    elif shift < 0:
+        reason_text = "раньше плановой даты"
+    else:
+        reason_text = "в срок"
+    return {
+        "forecast_date": forecast_date.isoformat(),
+        "forecast_shift_days": shift,
+        "forecast_reason": reason_text,
+    }
 
 
 def _fridays_between(start: date, finish: date) -> List[date]:
@@ -369,10 +408,10 @@ def _explode_bom_net_first(
     before the next iteration starts.
     """
     # --- Pre-load BOM data in bulk (avoid N+1 per item) ---
-    stock_by_item: Dict[int, float] = {
-        int(row.item_id): float(row.stock_qty or 0.0)
-        for row in db.query(Item.item_id, Item.stock_qty).all()
-    }
+    # Effective stock with ignored warehouses (e.g., brak isolator) excluded;
+    # using Item.stock_qty directly would let MRP "see" stock that production
+    # control then refuses as a material-issue source.
+    stock_by_item: Dict[int, float] = _effective_stock_by_item_all(db)
 
     default_spec_map: Dict[int, int] = {
         int(ds.item_id): int(ds.spec_id)
@@ -383,26 +422,16 @@ def _explode_bom_net_first(
     for comp in db.query(SpecComponent).all():
         components_by_spec.setdefault(int(comp.spec_id), []).append(comp)
 
-    # --- WIP: remaining qty from active (non-done, non-deleted) production orders ---
+    # --- WIP: remaining qty from active (non-done, non-deleted) production
+    # orders, keyed by planned_finish_date so the netting respects when the
+    # WIP is actually expected to be physically available. A WIP order that
+    # finishes in September does NOT cover a July demand bucket; previously
+    # we collapsed all WIP into one timeless pool, which over-credited early
+    # buckets and under-planned production.
     try:
-        wip_rows = (
-            db.query(
-                ProductionProduct.item_id,
-                func.sum(ProductionProduct.remaining_qty),
-            )
-            .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
-            .filter(ProductionOrder.deletion_mark.is_(False))
-            .filter(
-                func.lower(func.coalesce(ProductionOrder.order_state_key, ""))
-                != _DONE_STATE_KEY
-            )
-            .filter(ProductionProduct.remaining_qty > 0)
-            .group_by(ProductionProduct.item_id)
-            .all()
-        )
-        wip_by_item: Dict[int, float] = {int(iid): float(qty or 0.0) for iid, qty in wip_rows}
+        wip_eta_by_item: Dict[int, list] = _active_wip_eta_by_item(db)
     except Exception:
-        wip_by_item = {}
+        wip_eta_by_item = {}
 
     # --- Buffer-days lookup: item → default spec → production_kind → resource.buffer_days ---
     all_spec_ids: set = set(default_spec_map.values())
@@ -429,6 +458,10 @@ def _explode_bom_net_first(
         res_by_id = {int(r.resource_id): r for r in resources}
 
     buffer_days_cache: Dict[int, int] = {}
+    today = date.today()
+
+    def clamp_to_today(value: date) -> date:
+        return today if value < today else value
 
     def resolve_buffer_days(item_id: int) -> int:
         if item_id in buffer_days_cache:
@@ -455,10 +488,12 @@ def _explode_bom_net_first(
     gross_map: Dict[int, Dict[date, float]] = {}
     net_map: Dict[int, Dict[date, float]] = {}
     bom_level_map: Dict[int, int] = {}
-    # Available = stock + WIP, consumed chronologically as demand is processed.
-    avail_remaining: Dict[int, float] = {
-        iid: stock_by_item.get(iid, 0.0) + wip_by_item.get(iid, 0.0)
-        for iid in set(stock_by_item) | set(wip_by_item)
+    # Stock pool (immediate, no ETA) — consumed before WIP for each bucket.
+    avail_stock: Dict[int, float] = dict(stock_by_item)
+    # WIP pool with per-item ETA list; mutated as buckets are netted so the
+    # same WIP line can't cover two different demand buckets.
+    avail_wip: Dict[int, list] = {
+        int(iid): list(entries) for iid, entries in wip_eta_by_item.items()
     }
     # Prevent cycles: track items already exploded as parents
     exploded_parents: set = set()
@@ -493,22 +528,32 @@ def _explode_bom_net_first(
             for bucket_date, qty in buckets.items():
                 gross_map[iid][bucket_date] = gross_map[iid].get(bucket_date, 0.0) + float(qty)
 
-            # Net demand chronologically against available (stock + WIP)
-            avail = avail_remaining.get(iid, 0.0)
+            # Net demand chronologically: first against the immediate stock
+            # pool, then against WIP whose ETA is at or before the bucket.
+            # WIP entries with eta > bucket_date can't cover that bucket but
+            # may cover a later one, so the per-item WIP list is mutated in
+            # place across the bucket loop.
+            stock_left = avail_stock.get(iid, 0.0)
+            wip_list = avail_wip.setdefault(iid, [])
             net_buckets: List[Tuple[date, float]] = []
 
             for bucket_date, bucket_qty in sorted(buckets.items()):
                 q = float(bucket_qty or 0.0)
                 if q <= 1e-9:
                     continue
-                if avail >= q:
-                    avail -= q
+                # 1) Consume free stock first (always available).
+                if stock_left >= q:
+                    stock_left -= q
                     continue
-                net_q = q - avail
-                avail = 0.0
-                net_buckets.append((bucket_date, net_q))
+                residual = q - stock_left
+                stock_left = 0.0
+                # 2) Consume WIP whose ETA <= bucket_date.
+                residual = _consume_wip_at_or_before(wip_list, bucket_date, residual)
+                if residual <= 1e-9:
+                    continue
+                net_buckets.append((bucket_date, residual))
 
-            avail_remaining[iid] = avail
+            avail_stock[iid] = stock_left
 
             # Accumulate net demand
             if net_buckets:
@@ -544,6 +589,7 @@ def _explode_bom_net_first(
                     # required before the parent's production start.
                     buf = resolve_buffer_days(child_id)
                     child_date = (bucket_date - timedelta(days=buf)) if buf > 0 else bucket_date
+                    child_date = clamp_to_today(child_date)
                     if child_id not in next_demand:
                         next_demand[child_id] = {}
                     next_demand[child_id][child_date] = (
@@ -817,7 +863,7 @@ def create_mrp_snapshot_from_period_plan(
                     if remaining_need > 1e-9:
                         # Only create a PlannedPurchase for the portion not covered by supplier.
                         need_date = bucket_date
-                        order_date = need_date - timedelta(days=lead_time)
+                        order_date = max(date.today(), need_date - timedelta(days=lead_time))
                         db.add(PlannedPurchase(
                             run_id=int(run.run_id),
                             item_id=int(iid),
@@ -840,7 +886,7 @@ def create_mrp_snapshot_from_period_plan(
                     if net_qty <= 1e-9:
                         continue
                     need_date = bucket_date
-                    order_date = need_date - timedelta(days=lead_time)
+                    order_date = max(date.today(), need_date - timedelta(days=lead_time))
                     db.add(PlannedRework(
                         run_id=int(run.run_id),
                         item_id=int(iid),
@@ -883,11 +929,21 @@ def create_mrp_snapshot_from_period_plan(
                     alloc_total_qty += net_qty
 
             # Mark the requirement covered by the allocation created above.
-            req = req_by_item.get(iid)
-            if req and alloc_total_qty > 0:
-                total_net = _to_float(req.net_required_qty)
-                req.covered_qty = min(alloc_total_qty, total_net)
-                req.remaining_qty = max(0.0, total_net - alloc_total_qty)
+            #
+            # Only purchase and rework flows close the requirement at snapshot
+            # time, because their PlannedPurchase / PlannedRework rows ARE the
+            # downstream orders that will be issued to 1C. PlannedOrder for a
+            # production-flow item is just an MRP proposal — covered_qty is
+            # incremented when a ProductionProduct is materialized via
+            # create_production_orders_from_mrp_requirements. Otherwise the
+            # very first materialization always skips with
+            # "remaining_qty=0 (уже покрыто)".
+            if flow in (REPLENISHMENT_FLOW_PURCHASE, REPLENISHMENT_FLOW_REWORK):
+                req = req_by_item.get(iid)
+                if req and alloc_total_qty > 0:
+                    total_net = _to_float(req.net_required_qty)
+                    req.covered_qty = min(alloc_total_qty, total_net)
+                    req.remaining_qty = max(0.0, total_net - alloc_total_qty)
 
         if created_production_orders:
             db.flush()
@@ -946,6 +1002,48 @@ def create_mrp_snapshot_from_period_plan(
                         hours=float(hours_per_unit) * qty,
                     ))
                     stage_count += 1
+
+            db.flush()
+            scheduler = CapacityScheduler(db, run.config_snapshot)
+            schedule_warnings: List[Dict[str, Any]] = []
+            for order in sorted(created_production_orders, key=lambda o: (o.need_date, int(o.order_id))):
+                stages = (
+                    db.query(PlannedOrderStage)
+                    .filter(PlannedOrderStage.order_id == int(order.order_id))
+                    .all()
+                )
+                if not stages:
+                    continue
+                stage_hours = {int(stage.stage_id): _to_float(stage.hours) for stage in stages}
+                stage_areas = {
+                    int(stage.stage_id): (int(stage.area_id) if stage.area_id is not None else None)
+                    for stage in stages
+                }
+                schedule_result, warnings = scheduler.schedule_backward(
+                    int(order.item_id),
+                    _to_float(order.qty),
+                    order.need_date,
+                    stage_hours,
+                    stage_areas_by_stage=stage_areas,
+                )
+                for warning in warnings:
+                    warning["run_id"] = int(run.run_id)
+                    warning["order_id"] = int(order.order_id)
+                schedule_warnings.extend(warnings)
+
+                start_dt = schedule_result.get("order_start_date")
+                finish_dt = schedule_result.get("order_finish_date")
+                if isinstance(start_dt, datetime):
+                    order.start_date = start_dt.date()
+                elif isinstance(start_dt, date):
+                    order.start_date = start_dt
+                if isinstance(finish_dt, datetime):
+                    order.finish_date = finish_dt.date()
+                elif isinstance(finish_dt, date):
+                    order.finish_date = finish_dt
+
+            if schedule_warnings:
+                run.warnings = list(run.warnings or []) + schedule_warnings
 
     db.commit()
     return {
@@ -1051,6 +1149,98 @@ def lock_period_plan_lines(db: Session, plan_id: int, run_id: int, line_ids: Opt
     return int(count or 0)
 
 
+def _latest_fixed_run_for_plan(db: Session, plan_id: int) -> Optional[PlanningRun]:
+    return (
+        db.query(PlanningRun)
+        .filter(
+            PlanningRun.source_plan_id == int(plan_id),
+            PlanningRun.status == "FIXED_SNAPSHOT",
+        )
+        .order_by(PlanningRun.run_id.desc())
+        .first()
+    )
+
+
+def _bom_descendants_by_item(db: Session, item_ids: Iterable[int]) -> Dict[int, Set[int]]:
+    roots = sorted({int(i) for i in item_ids})
+    if not roots:
+        return {}
+
+    spec_by_item: Dict[int, int] = {
+        int(row.item_id): int(row.spec_id)
+        for row in db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
+        .filter(DefaultSpecification.item_id.in_(roots))
+        .all()
+    }
+    result: Dict[int, Set[int]] = {root: {root} for root in roots}
+
+    def visit(root_id: int, item_id: int, seen: Set[int]) -> None:
+        spec_id = spec_by_item.get(int(item_id))
+        if not spec_id or spec_id in seen:
+            return
+        seen.add(spec_id)
+        components = (
+            db.query(SpecComponent.item_id)
+            .filter(SpecComponent.spec_id == int(spec_id))
+            .all()
+        )
+        for row in components:
+            child_id = int(row.item_id)
+            result[root_id].add(child_id)
+            if child_id not in spec_by_item:
+                ds = db.query(DefaultSpecification.spec_id).filter(DefaultSpecification.item_id == child_id).first()
+                if ds:
+                    spec_by_item[child_id] = int(ds.spec_id)
+            visit(root_id, child_id, seen)
+
+    for root in roots:
+        visit(root, root, set())
+    return result
+
+
+def _plan_matrix_forecasts(
+    db: Session,
+    plan_id: int,
+    item_ids: Iterable[int],
+    bucket_keys: Iterable[str],
+) -> Dict[Tuple[int, str], Dict[str, Any]]:
+    run = _latest_fixed_run_for_plan(db, plan_id)
+    if not run:
+        return {}
+    ids = sorted({int(i) for i in item_ids})
+    if not ids:
+        return {}
+    buckets = [_parse_date(key, "bucket_date") for key in bucket_keys]
+    descendants = _bom_descendants_by_item(db, ids)
+    all_relevant_item_ids = sorted(set().union(*descendants.values())) if descendants else ids
+    result: Dict[Tuple[int, str], Dict[str, Any]] = {}
+    rows = (
+        db.query(PlannedOrder)
+        .filter(PlannedOrder.run_id == int(run.run_id), PlannedOrder.item_id.in_(all_relevant_item_ids))
+        .all()
+    )
+    for order in rows:
+        forecast = order.finish_date or order.start_date or order.need_date
+        order_need = order.bucket_date or order.need_date
+        if not order_need or not forecast:
+            continue
+        order_item_id = int(order.item_id)
+        for root_id, related_item_ids in descendants.items():
+            if order_item_id not in related_item_ids:
+                continue
+            for plan_bucket in buckets:
+                if order_need > plan_bucket:
+                    continue
+                payload = _forecast_payload(forecast, plan_bucket)
+                if (payload.get("forecast_shift_days") or 0) <= 0:
+                    continue
+                key = (int(root_id), plan_bucket.isoformat())
+                prev = result.get(key)
+                if not prev or (payload.get("forecast_shift_days") or 0) > (prev.get("forecast_shift_days") or 0):
+                    result[key] = payload
+    return result
+
+
 def get_period_plan_matrix(db: Session, plan_id: int) -> Dict[str, Any]:
     plan = _get_plan(db, plan_id)
     buckets = _fridays_between(plan.period_from, plan.period_to)
@@ -1072,6 +1262,8 @@ def get_period_plan_matrix(db: Session, plan_id: int) -> Dict[str, Any]:
         .all()
     )
 
+    forecast_by_cell = _plan_matrix_forecasts(db, int(plan.id), [int(row.item_id) for row in rows], bucket_keys)
+
     by_item: Dict[int, Dict[str, Any]] = {}
     for row in rows:
         item_id = int(row.item_id)
@@ -1085,6 +1277,7 @@ def get_period_plan_matrix(db: Session, plan_id: int) -> Dict[str, Any]:
                 "total_qty": 0.0,
                 "buckets": {key: 0.0 for key in bucket_keys},
                 "locked_buckets": {},
+                "bucket_forecasts": {},
             },
         )
         key = row.bucket_date.isoformat()
@@ -1093,6 +1286,9 @@ def get_period_plan_matrix(db: Session, plan_id: int) -> Dict[str, Any]:
         rec["total_qty"] = _to_float(rec["total_qty"]) + q
         if row.locked_by_run_id is not None:
             rec["locked_buckets"][key] = int(row.locked_by_run_id)
+        forecast = forecast_by_cell.get((item_id, key))
+        if forecast:
+            rec["bucket_forecasts"][key] = forecast
 
     return {
         "plan": _serialize_plan(plan),
@@ -1153,18 +1349,20 @@ def get_period_plan_execution_journal(
 
     req_ids = [int(req.id) for req, _ in reqs_with_items]
     item_ids = [int(req.item_id) for req, _ in reqs_with_items]
+    req_by_id = {int(req.id): req for req, _ in reqs_with_items}
 
     # Production: actual production orders linked via source_mrp_requirement_id.
     prod_rows = (
-        db.query(ProductionProduct, ProductionOrder)
+        db.query(ProductionProduct, ProductionOrder, ProductionOrderLineState)
         .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+        .outerjoin(ProductionOrderLineState, ProductionOrderLineState.product_id == ProductionProduct.product_id)
         .filter(ProductionProduct.source_mrp_requirement_id.in_(req_ids))
         .all()
     )
     prods_by_req_id: Dict[int, List[Dict[str, Any]]] = {}
     prod_ordered_by_req_id: Dict[int, float] = {}
     prod_done_by_req_id: Dict[int, float] = {}
-    for pp, po in prod_rows:
+    for pp, po, state in prod_rows:
         req_id = int(pp.source_mrp_requirement_id)
         qty_value = _to_float(pp.quantity)
         remaining_value = _to_float(pp.remaining_qty)
@@ -1172,6 +1370,9 @@ def get_period_plan_execution_journal(
         done_value = produced_value if produced_value > 1e-9 else max(0.0, qty_value - remaining_value)
         prod_ordered_by_req_id[req_id] = prod_ordered_by_req_id.get(req_id, 0.0) + qty_value
         prod_done_by_req_id[req_id] = prod_done_by_req_id.get(req_id, 0.0) + done_value
+        req_due = req_by_id.get(req_id).period_to if req_by_id.get(req_id) else None
+        planned_finish = state.planned_finish_date if state and state.planned_finish_date else None
+        forecast = _forecast_payload(planned_finish, req_due or planned_finish)
         prods_by_req_id.setdefault(req_id, []).append({
             "type": "production_order",
             "product_id": int(pp.product_id),
@@ -1181,6 +1382,7 @@ def get_period_plan_execution_journal(
             "qty": qty_value,
             "completed_qty": done_value,
             "remaining_qty": remaining_value,
+            **forecast,
         })
 
     # Production: planned MRP tasks. They are the live work queue before real
@@ -1201,6 +1403,7 @@ def get_period_plan_execution_journal(
                 continue
             qty_value = _to_float(po.qty)
             planned_ordered_by_req_id[req_id] = planned_ordered_by_req_id.get(req_id, 0.0) + qty_value
+            forecast_date = po.finish_date or po.start_date or po.need_date
             planned_orders_by_req_id.setdefault(req_id, []).append({
                 "type": "planned_order",
                 "order_id": int(po.order_id),
@@ -1208,6 +1411,7 @@ def get_period_plan_execution_journal(
                 "completed_qty": 0.0,
                 "remaining_qty": qty_value,
                 "need_date": po.need_date.isoformat() if po.need_date else None,
+                **_forecast_payload(forecast_date, po.need_date),
             })
 
     # Purchase: PlannedPurchase linked via source_mrp_requirement_id (precise),
@@ -1231,6 +1435,7 @@ def get_period_plan_execution_journal(
             "need_date": pp.need_date.isoformat() if pp.need_date else None,
             "order_date": pp.order_date.isoformat() if pp.order_date else None,
             "lead_time_days": int(pp.lead_time_days or 0),
+            **_forecast_payload(pp.need_date, pp.need_date, reason="purchase"),
         }
         if pp.source_mrp_requirement_id is not None:
             req_id = int(pp.source_mrp_requirement_id)
@@ -1261,6 +1466,7 @@ def get_period_plan_execution_journal(
             "need_date": rw.need_date.isoformat() if rw.need_date else None,
             "order_date": rw.order_date.isoformat() if rw.order_date else None,
             "lead_time_days": int(rw.lead_time_days or 0),
+            **_forecast_payload(rw.need_date, rw.need_date, reason="rework"),
         })
 
     rows: List[Dict[str, Any]] = []
@@ -1308,6 +1514,17 @@ def get_period_plan_execution_journal(
         remaining_qty = max(0.0, net_qty - completed_qty)
         unassigned_qty = max(0.0, net_qty - ordered_qty)
         progress_pct = round(completed_qty / net_qty * 100.0, 1) if net_qty > 1e-9 else 100.0
+        forecast_dates: List[date] = []
+        for wi in work_items:
+            raw_forecast = wi.get("forecast_date") or wi.get("need_date")
+            if raw_forecast:
+                try:
+                    forecast_dates.append(_parse_date(raw_forecast, "forecast_date"))
+                except Exception:
+                    pass
+        row_forecast = max(forecast_dates) if forecast_dates else None
+        row_due = req.period_to if req.period_to else None
+        row_forecast_payload = _forecast_payload(row_forecast, row_due)
 
         rows.append({
             "req_id": req_id,
@@ -1326,6 +1543,7 @@ def get_period_plan_execution_journal(
             "remaining_qty": remaining_qty,
             "unassigned_qty": unassigned_qty,
             "coverage_pct": progress_pct,
+            **row_forecast_payload,
             "work_items": work_items,
         })
 

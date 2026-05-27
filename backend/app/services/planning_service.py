@@ -45,6 +45,11 @@ from .stage_logic import determine_parent_stage_and_norm, pick_area_for_stage
 from .order_quantity_calculator import OrderQuantityCalculator
 from .priority_manager import PriorityManager
 from .capacity_scheduler import CapacityScheduler
+from .mrp_stock_helpers import (
+    active_wip_eta_by_item as _active_wip_eta_by_item,
+    consume_wip_at_or_before as _consume_wip_at_or_before,
+    effective_stock_by_item_all as _effective_stock_by_item_all,
+)
 from .pegging_builder import PeggingBuilder
 from .replenishment import (
     REPLENISHMENT_FLOW_PURCHASE,
@@ -960,6 +965,23 @@ def get_run_production(
 
         if not data.get("start_date") and data.get("finish_date"):
             data["start_date"] = data["finish_date"]
+
+        try:
+            if data.get("finish_date") and data.get("need_date"):
+                fin_d = date.fromisoformat(str(data["finish_date"])[:10])
+                need_d = date.fromisoformat(str(data["need_date"])[:10])
+                shift = (fin_d - need_d).days
+                data["forecast_date"] = fin_d.isoformat()
+                data["forecast_shift_days"] = shift
+                data["forecast_reason"] = (
+                    "смещение по мощностям"
+                    if shift > 0
+                    else ("раньше плановой даты" if shift < 0 else "в срок")
+                )
+        except Exception:
+            data["forecast_date"] = data.get("finish_date")
+            data["forecast_shift_days"] = None
+            data["forecast_reason"] = None
 
         # stable synthetic order_id for UI tables (aggregated view)
         data["order_id"] = hash(f"{data['item_id']}_{data['start_date']}_{data['unit']}") % (10**10)
@@ -2932,44 +2954,34 @@ def compute_planning_preview(
         return d0 if dt < d0 else dt
 
     # --- Availability (stock + WIP) ---
-    # We load stock lazily per-level (batched) to avoid fetching every item.
-    stock_by_item: Dict[int, float] = {}
+    # Effective stock with `ignored_warehouses` excluded — Item.stock_qty
+    # alone would let the MRP see stock parked in brak/isolator warehouses,
+    # which production control later refuses as a source for material issues.
+    stock_by_item: Dict[int, float] = _effective_stock_by_item_all(db)
 
-    wip_by_item: Dict[int, float] = {}
+    # WIP keyed by planned_finish_date so the netting respects when the WIP
+    # is physically available. A WIP order finishing in September must NOT
+    # cover a July demand bucket. The earlier implementation used .quantity
+    # (not remaining_qty), without any active-state filter, and treated WIP
+    # as timeless — leading to systematic under-planning.
+    wip_eta_by_item: Dict[int, list] = {}
     if include_wip:
         try:
-            from ..models import ProductionProduct
-            wip_rows = (
-                db.query(ProductionProduct.item_id, func.sum(ProductionProduct.quantity))
-                .group_by(ProductionProduct.item_id)
-                .all()
-            )
-            wip_by_item = {int(iid): float(qty or 0.0) for iid, qty in wip_rows}
+            wip_eta_by_item = _active_wip_eta_by_item(db)
         except Exception:
-            wip_by_item = {}
+            wip_eta_by_item = {}
 
-    available_by_item: Dict[int, float] = {}
+    # Per-item working pools that are mutated during the netting loop.
+    avail_stock: Dict[int, float] = {}
+    avail_wip: Dict[int, list] = {}
 
     def ensure_availability(item_ids: Set[int]) -> None:
-        missing = [int(i) for i in item_ids if int(i) not in available_by_item]
-        if not missing:
-            return
-        # batch fetch stock
-        try:
-            rows = (
-                db.query(Item.item_id, Item.stock_qty)
-                .filter(Item.item_id.in_(missing))
-                .all()
-            )
-        except Exception:
-            rows = []
-        for iid, qty in rows:
-            stock_by_item[int(iid)] = float(qty or 0.0)
-        for iid in missing:
-            stock = float(stock_by_item.get(int(iid), 0.0))
-            if include_wip:
-                stock += float(wip_by_item.get(int(iid), 0.0))
-            available_by_item[int(iid)] = stock
+        for i in item_ids:
+            iid = int(i)
+            if iid not in avail_stock:
+                avail_stock[iid] = float(stock_by_item.get(iid, 0.0) or 0.0)
+            if include_wip and iid not in avail_wip:
+                avail_wip[iid] = list(wip_eta_by_item.get(iid, []))
 
     # --- Multi-level net-first explosion ---
     gross_map: DefaultDict[int, DefaultDict[date, float]] = defaultdict(lambda: defaultdict(float))
@@ -2990,23 +3002,33 @@ def compute_planning_preview(
             if not buckets:
                 continue
 
-            # netting in chronological order
-            avail = float(available_by_item.get(int(iid), 0.0) or 0.0)
+            # netting in chronological order:
+            #   1) consume free stock (timeless),
+            #   2) then WIP whose planned_finish_date <= bucket_date.
+            iid_int = int(iid)
+            stock_left = float(avail_stock.get(iid_int, 0.0) or 0.0)
+            wip_list = avail_wip.setdefault(iid_int, [])
             net_buckets: List[Tuple[date, float]] = []
 
             for bucket_date, bucket_qty in sorted(buckets.items(), key=lambda x: x[0]):
                 q = float(bucket_qty or 0.0)
                 if q <= 1e-9:
                     continue
-                gross_map[int(iid)][bucket_date] += q
-                if avail >= q:
-                    avail -= q
+                gross_map[iid_int][bucket_date] += q
+                # 1) Stock first.
+                if stock_left >= q:
+                    stock_left -= q
                     continue
-                net_q = q - avail
-                avail = 0.0
-                net_buckets.append((bucket_date, net_q))
+                residual = q - stock_left
+                stock_left = 0.0
+                # 2) Then WIP whose ETA is at or before this bucket.
+                if include_wip:
+                    residual = _consume_wip_at_or_before(wip_list, bucket_date, residual)
+                if residual <= 1e-9:
+                    continue
+                net_buckets.append((bucket_date, residual))
 
-            available_by_item[int(iid)] = avail
+            avail_stock[iid_int] = stock_left
 
             if not net_buckets:
                 continue
@@ -3230,10 +3252,16 @@ def build_planned_orders_and_purchases(
         is_produced = (not is_purchase) and (not is_rework)
         
         if is_produced:
-            # A) Active 1C orders as already-planned finished goods output:
-            # reduce new production need by active remaining qty from 1C.
-            active_remaining_qty = float(active_remaining_by_item.get(int(item_id), 0.0) or 0.0)
-            requested_qty = max(float(requested_qty_raw) - active_remaining_qty, 0.0)
+            # NOTE: WIP/active-production netting is already applied upstream
+            # in compute_planning_preview (which subtracts remaining_qty of
+            # active orders from gross demand chronologically per bucket).
+            # Subtracting `active_remaining_by_item` here would double-count
+            # WIP — and worse, the per-item amount is read fresh for every
+            # bucket without being consumed, so every bucket of a multi-bucket
+            # item would receive full WIP credit. The argument is kept on the
+            # signature for backward compatibility but no longer used for
+            # production-flow netting.
+            requested_qty = float(requested_qty_raw)
             if requested_qty <= 1e-9:
                 continue
 
@@ -3305,19 +3333,27 @@ def build_planned_orders_and_purchases(
         elif is_purchase:
             lead_time = item.replenishment_time or 30
             order_date = need_date - timedelta(days=lead_time)
-            requested_qty_raw = consume_supplier_order_coverage(
+            # Keep the original (pre-supplier-netting) demand for diagnostics:
+            # the UI «Покрыто поставщиком» indicator derives supplier coverage
+            # as `requested_qty - qty`, so requested_qty MUST stay as the gross
+            # net demand. Overwriting it with the post-netting residual makes
+            # supplier_covered_qty always equal 0.
+            net_demand_for_period = float(requested_qty_raw)
+            residual_after_supplier = consume_supplier_order_coverage(
                 item_id=int(item_id),
                 need_date=need_date,
-                requested_qty=float(requested_qty_raw),
+                requested_qty=net_demand_for_period,
             )
-            # Purchase flow now uses the same shared quantity normalization layer
+            # Purchase flow uses the same shared quantity normalization layer
             # as production for the final business quantity:
             # - discrete units -> fractional part is removed
             # - metric/non-discrete units -> fractional value is preserved
-            requested_qty = float(order_qty_calculator.normalize_qty_for_item(item_id, requested_qty_raw))
-            if requested_qty <= 1e-9:
+            planned_qty = float(order_qty_calculator.normalize_qty_for_item(item_id, residual_after_supplier))
+            if planned_qty <= 1e-9:
                 continue
-            planned_qty = float(requested_qty)
+            # Normalize the diagnostic original-demand too so the unit policy
+            # stays consistent on display.
+            requested_qty = float(order_qty_calculator.normalize_qty_for_item(item_id, net_demand_for_period))
             purchase = PlannedPurchase(
                 run_id=run_id,
                 item_id=item_id,

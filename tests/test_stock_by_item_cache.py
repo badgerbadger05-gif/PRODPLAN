@@ -242,7 +242,15 @@ def test_component_limit_is_cumulative_across_multiple_buckets(db_session):
     assert any(w.get("code") == "COMPONENT_SHORTAGE_BLOCKED" for w in out.get("warnings", []))
 
 
-def test_active_1c_remaining_reduces_requested_qty_for_production_order(db_session):
+def test_active_1c_remaining_already_netted_upstream_not_double_subtracted(db_session):
+    """WIP netting is the responsibility of compute_planning_preview, which
+    chronologically subtracts active production remaining_qty from gross
+    demand and passes the residual under `net_requirements`. The
+    build_planned_orders_and_purchases function must NOT subtract WIP again
+    or it would double-count (and worse: read the same dict for every
+    bucket without consuming it). The `active_remaining_by_item` argument
+    is kept on the signature for backward compatibility but no longer
+    influences production-flow requested_qty."""
     db = db_session
 
     u = Unit(unit_ref1c="u2", unit_name="шт", short_name="шт", precision=0)
@@ -276,10 +284,12 @@ def test_active_1c_remaining_reduces_requested_qty_for_production_order(db_sessi
         stock_by_item={parent.item_id: 0.0},
         wip_by_item={},
         horizon_days=run.horizon_days or 0,
-        total_demand_by_item={parent.item_id: 10.0},
+        total_demand_by_item={parent.item_id: 3.0},
     )
 
-    net_req = {str(parent.item_id): {"2025-01-01": 10.0}}
+    # Gross demand was 10; upstream WIP netting already subtracted 7 active
+    # remaining. net_requirements carries the post-WIP residual 3.0.
+    net_req = {str(parent.item_id): {"2025-01-01": 3.0}}
     out = build_planned_orders_and_purchases(
         db,
         run,
@@ -288,6 +298,8 @@ def test_active_1c_remaining_reduces_requested_qty_for_production_order(db_sessi
         priority_manager=SimpleNamespace(),
         item_cache=item_cache,
         units_by_ref=units_by_ref,
+        # Even with active_remaining_by_item passed, the function should NOT
+        # subtract again — that would yield a PlannedOrder of qty 0.
         active_remaining_by_item={parent.item_id: 7.0},
     )
 
@@ -474,8 +486,15 @@ def test_active_supplier_order_reduces_purchase_need_once_by_delivery_date(db_se
     )
     assert len(rows) == 1
     assert rows[0].need_date.isoformat() == "2025-01-20"
-    assert float(rows[0].requested_qty) == 4.0
-    assert float(rows[0].planned_qty) == 4.0
+    # PlannedPurchase semantics (consistent with period_plan_service):
+    # - requested_qty = gross net demand BEFORE supplier-order netting,
+    #   kept for the «Покрыто поставщиком» diagnostic
+    #   (supplier_covered_qty = requested_qty - qty).
+    # - planned_qty / qty = residual AFTER supplier coverage, this is what
+    #   actually gets ordered.
+    assert float(rows[0].requested_qty) == 5.0  # original bucket demand
+    assert float(rows[0].planned_qty) == 4.0    # after 1 unit supplier coverage
+    assert float(rows[0].qty) == 4.0
 
 
 def test_purchase_results_marks_late_supplier_order_coverage(db_session):
