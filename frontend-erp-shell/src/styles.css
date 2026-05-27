@@ -157,7 +157,7 @@ input:focus, select:focus {
 }
 
 .navLogoSlot {
-  margin-top: clamp(118px, 16vh, 160px);
+  margin-top: clamp(176px, 20vh, 220px);
   padding: 0 18px;
   display: flex;
   justify-content: center;
