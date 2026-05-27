@@ -23,6 +23,9 @@ export type OrderRow = {
   stage_name?: string | null
   planned_start_date?: string | null
   planned_finish_date?: string | null
+  forecast_date?: string | null
+  forecast_shift_days?: number | null
+  forecast_reason?: string | null
   route_sheet_printed_at?: string | null
   comment?: string | null
   optimal_batch?: number | null
@@ -78,8 +81,11 @@ export type ControlWarehouse = {
 }
 
 export type WorkshopWarehouse = {
-  resource_id: number
+  resource_id?: number
+  workshop_id?: number
+  workshop_name?: string | null
   warehouse_ref1c: string
+  production_warehouse_ref1c?: string | null
 }
 
 export type IgnoredWarehouse = {
@@ -142,9 +148,12 @@ export type TransferIssueRow = {
   warehouse_ref1c?: string | null
   source_warehouse_ref1c?: string | null
   exported_ref1c?: string | null
+  one_c_number?: string | null
   exported_at?: string | null
   created_at?: string | null
   export_error?: string | null
+  can_assemble?: boolean
+  assemble_disabled_reason?: string | null
   line_status?: string | null
   issue_status?: string | null
   lines_count?: number

@@ -37,6 +37,7 @@ from ..models import (
     SyncLink,
 )
 from .one_c_export_common import (
+    add_unit_payload as _add_unit_payload,
     clean_ref1c as _clean_ref1c,
     create_odata_client as _create_odata_client,
     fmt_1c_datetime as _fmt_1c_datetime,
@@ -46,6 +47,7 @@ from .one_c_export_common import (
 )
 from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
+from .one_c_document_numbers import manufacture_number
 from .one_c_production_order_export import export_production_orders_to_1c
 
 
@@ -62,6 +64,7 @@ class ManufactureExportEntry:
     item_ref1c: str
     item_name: str
     item_article: str
+    unit_ref1c: Optional[str]
     qty: float
     executor: Optional[str] = None
     number: str = ""
@@ -156,9 +159,10 @@ def _collect_export_entries(
                 item_ref1c=item_ref,
                 item_name=str(item.item_name or "") if item else "",
                 item_article=str(item.item_article or "") if item else "",
+                unit_ref1c=_clean_ref1c(item.unit) if item else None,
                 qty=float(m.qty or 0),
                 executor=str(m.executor) if m.executor else None,
-                number=_short_manufacture_number(int(m.manufacture_id)),
+                number=manufacture_number(db, m),
             )
         )
 
@@ -173,13 +177,13 @@ def _build_header_payload(entry: ManufactureExportEntry) -> Dict[str, Any]:
     )
     if entry.executor:
         comment += f"; executor={entry.executor}"
-    products = [
-        {
-            "LineNumber": 1,
-            "Номенклатура_Key": entry.item_ref1c,
-            "Количество": float(entry.qty),
-        }
-    ]
+    product_row: Dict[str, Any] = {
+        "LineNumber": 1,
+        "Номенклатура_Key": entry.item_ref1c,
+        "Количество": float(entry.qty),
+    }
+    _add_unit_payload(product_row, entry.unit_ref1c)
+    products = [product_row]
     payload: Dict[str, Any] = {
         "Number": entry.number,
         "Date": _fmt_1c_datetime(date.today()),

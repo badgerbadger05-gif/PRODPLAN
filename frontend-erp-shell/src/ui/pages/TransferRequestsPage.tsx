@@ -39,6 +39,11 @@ export function TransferRequestsPage() {
   }, [offset])
 
   const activeRow = useMemo(() => rows.find((row) => row.issue_id === activeId) ?? rows[0] ?? null, [rows, activeId])
+  const canAssemble = activeRow
+    ? (activeRow.can_assemble ?? (!!activeRow.exported_ref1c && activeRow.status !== 'posted'))
+    : false
+  const assembleDisabledReason = activeRow?.assemble_disabled_reason
+    || (!activeRow ? 'Выберите заявку' : !activeRow.exported_ref1c ? 'Сначала выгрузите перемещение в 1С' : activeRow.status === 'posted' ? 'Перемещение уже собрано' : '')
 
   const load = useCallback(async (nextOffset: number) => {
     setLoading(true)
@@ -83,7 +88,7 @@ export function TransferRequestsPage() {
         method: 'POST',
         body: JSON.stringify({ allow_production: false }),
       })
-      setMessage(`Перемещение ${activeRow.document_number} проведено, обеспечение обновлено: собрано`)
+      setMessage(`Перемещение ${activeRow.one_c_number || activeRow.document_number} проведено, обеспечение обновлено: собрано`)
       await load(offsetRef.current)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -129,10 +134,11 @@ export function TransferRequestsPage() {
         )}
       >
         <div className="commandBar">
-          <button className="primary" onClick={() => void markAssembled()} disabled={!activeRow || loading || activeRow.status === 'posted' || !activeRow.exported_ref1c}>
+          <button className="primary" onClick={() => void markAssembled()} disabled={!canAssemble || loading} title={!canAssemble ? assembleDisabledReason : 'Провести перемещение в 1С'}>
             Собрано
           </button>
           <button onClick={() => void load(offset)} disabled={loading}>Обновить</button>
+          {!canAssemble && assembleDisabledReason && <span className="toolbarText">{assembleDisabledReason}</span>}
           <div className="barSeparator" />
           <label className="inlineControl">
             <span>Статус</span>
@@ -160,6 +166,7 @@ export function TransferRequestsPage() {
             <table className="journalTable transferTable">
               <thead>
                 <tr>
+                  <th className="checkCol"></th>
                   <th>Заявка</th>
                   <th>Заказ</th>
                   <th>Деталь</th>
@@ -171,6 +178,15 @@ export function TransferRequestsPage() {
               <tbody>
                 {rows.map((row) => (
                   <tr key={row.issue_id} className={row.issue_id === activeRow?.issue_id ? 'activeRow' : ''} onClick={() => setActiveId(row.issue_id)}>
+                    <td className="checkCol">
+                      <input
+                        type="checkbox"
+                        checked={row.issue_id === activeRow?.issue_id}
+                        onChange={() => setActiveId(row.issue_id)}
+                        onClick={(e) => e.stopPropagation()}
+                        aria-label={`Выбрать ${row.document_number}`}
+                      />
+                    </td>
                     <td className="orderCell">
                       <strong>{row.document_number}</strong>
                       <span>{dateRu(row.created_at) || '—'} · строк {row.lines_count ?? 0}</span>
@@ -188,8 +204,8 @@ export function TransferRequestsPage() {
                       <span>{row.unit || ''}</span>
                     </td>
                     <td>
-                      <strong>{row.exported_ref1c ? row.exported_ref1c.slice(0, 8) : '—'}</strong>
-                      <span>{dateRu(row.exported_at) || row.export_error || ''}</span>
+                      <strong>{row.one_c_number || (row.exported_ref1c ? row.exported_ref1c.slice(0, 8) : '—')}</strong>
+                      <span>{row.one_c_number && row.exported_ref1c ? row.exported_ref1c.slice(0, 8) : dateRu(row.exported_at) || row.export_error || ''}</span>
                     </td>
                     <td>
                       <span className={`pill ${row.status === 'posted' ? 'assembled' : row.status === 'error' ? 'shortage' : 'to_move'}`}>
@@ -207,13 +223,16 @@ export function TransferRequestsPage() {
             {activeRow ? (
               <>
                 <div className="detailTitle">{activeRow.item_name}</div>
-                <div className="detailMeta">{activeRow.document_number} · {activeRow.order_number}</div>
+                <div className="detailMeta">{activeRow.one_c_number || activeRow.document_number} · {activeRow.order_number}</div>
                 <div className="detailGrid">
                   <span>Статус</span><strong>{transferStatusLabels[activeRow.status] || activeRow.status}</strong>
                   <span>Обеспечение</span><strong>{coverageLabels[String(activeRow.line_status || '')] || activeRow.line_status || '—'}</strong>
                   <span>Отправитель</span><strong>{activeRow.source_warehouse_ref1c || '—'}</strong>
                   <span>Получатель</span><strong>{activeRow.warehouse_ref1c || '—'}</strong>
+                  <span>Номер 1С</span><strong>{activeRow.one_c_number || '—'}</strong>
                   <span>Ref 1С</span><strong>{activeRow.exported_ref1c || '—'}</strong>
+                  {activeRow.export_error && <span>Ошибка 1С</span>}
+                  {activeRow.export_error && <strong>{activeRow.export_error}</strong>}
                 </div>
                 <h3>Комплектующие</h3>
                 <div className="materialsList">

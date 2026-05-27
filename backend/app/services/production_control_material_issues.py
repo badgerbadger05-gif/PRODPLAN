@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
+import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
@@ -13,6 +16,9 @@ from ..models import (
     ProductionMaterialIssueLine,
     ProductionOrderLineState,
     ProductionProduct,
+    ResourceStage,
+    SpecComponent,
+    SpecOperation,
     StockWarehouse,
     SyncLink,
     WorkshopWarehouseBinding,
@@ -29,11 +35,34 @@ from .one_c_export_common import (
 from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
 from .one_c_stock_transfer_export import STOCK_TRANSFER_ENTITY
+from .one_c_document_numbers import material_issue_number
+
+
+def _clean_odata_error_message(error: Exception) -> str:
+    raw = str(error or "")
+    match = re.search(r"Details:\s*(\{.*\})", raw, flags=re.S)
+    if match:
+        try:
+            data = json.loads(match.group(1))
+            value = (
+                data.get("odata.error", {})
+                .get("message", {})
+                .get("value")
+            )
+            if value:
+                return str(value)
+        except Exception:
+            pass
+    if "URL:" in raw:
+        raw = raw.split("URL:", 1)[0].strip()
+    return raw.strip("<> ") or "1С отказала в проведении перемещения"
 
 
 def _auto_select_source_warehouse(
     db: Session,
     component_item_ids: List[int],
+    *,
+    excluded_refs: Optional[set[str]] = None,
 ) -> Tuple[Optional[str], List[Dict[str, Any]]]:
     """
     Given a list of component item_ids, find the best source warehouse.
@@ -58,6 +87,7 @@ def _auto_select_source_warehouse(
         str(r[0])
         for r in db.query(IgnoredWarehouse.warehouse_ref1c).all()
     }
+    excluded_refs = {str(ref) for ref in (excluded_refs or set()) if str(ref)}
     selected_refs = {
         str(r[0])
         for r in db.query(StockWarehouse.warehouse_ref1c)
@@ -78,6 +108,8 @@ def _auto_select_source_warehouse(
     for wh_ref, item_id in rows:
         wh_ref = str(wh_ref)
         if wh_ref in ignored_refs:
+            continue
+        if wh_ref in excluded_refs:
             continue
         if selected_refs and wh_ref not in selected_refs:
             continue
@@ -114,6 +146,62 @@ def _next_issue_number(db: Session) -> str:
     prefix = f"MI-{today}-"
     count = db.query(ProductionMaterialIssue).filter(ProductionMaterialIssue.document_number.like(f"{prefix}%")).count()
     return f"{prefix}{count + 1:04d}"
+
+
+def _workshop_id_for_product(
+    db: Session,
+    product: ProductionProduct,
+    spec_id: Optional[int],
+) -> Optional[int]:
+    state_obj = (
+        db.query(ProductionOrderLineState)
+        .filter(ProductionOrderLineState.product_id == int(product.product_id))
+        .first()
+    )
+    if state_obj and state_obj.workshop_id:
+        return int(state_obj.workshop_id)
+    if not spec_id:
+        return None
+    stage_hours = (
+        db.query(SpecOperation.stage_id)
+        .filter(SpecOperation.spec_id == int(spec_id), SpecOperation.stage_id.isnot(None))
+        .group_by(SpecOperation.stage_id)
+        .order_by(func.sum(SpecOperation.time_norm).desc())
+        .first()
+    )
+    stage_id = int(stage_hours[0]) if stage_hours else None
+    if stage_id is None:
+        comp_stage = (
+            db.query(SpecComponent.stage_id)
+            .filter(SpecComponent.spec_id == int(spec_id), SpecComponent.stage_id.isnot(None))
+            .first()
+        )
+        stage_id = int(comp_stage[0]) if comp_stage else None
+    if stage_id is None:
+        return None
+    resource = (
+        db.query(ResourceStage.resource_id)
+        .filter(ResourceStage.stage_id == int(stage_id))
+        .order_by(ResourceStage.id.asc())
+        .first()
+    )
+    return int(resource[0]) if resource else None
+
+
+def _destination_warehouse_for_product(
+    db: Session,
+    product: ProductionProduct,
+    spec_id: Optional[int],
+) -> Optional[str]:
+    workshop_id_resolved = _workshop_id_for_product(db, product, spec_id)
+    if not workshop_id_resolved:
+        return None
+    binding = (
+        db.query(WorkshopWarehouseBinding)
+        .filter(WorkshopWarehouseBinding.workshop_id == int(workshop_id_resolved))
+        .first()
+    )
+    return _clean_ref1c(binding.warehouse_ref1c) if binding else None
 
 
 def create_material_issues(
@@ -157,6 +245,27 @@ def create_material_issues(
             .first()
         )
         if existing is not None:
+            spec_id, components = _components_for_product(db, product)
+            if not existing.warehouse_ref1c:
+                existing.warehouse_ref1c = _destination_warehouse_for_product(db, product, spec_id)
+            if source_warehouse_ref1c:
+                existing.source_warehouse_ref1c = source_warehouse_ref1c
+            elif (
+                (not existing.source_warehouse_ref1c)
+                or (
+                    existing.warehouse_ref1c
+                    and existing.source_warehouse_ref1c == existing.warehouse_ref1c
+                )
+            ) and components:
+                component_item_ids = [int(c["component_item_id"]) for c in components]
+                excluded = {str(existing.warehouse_ref1c)} if existing.warehouse_ref1c else set()
+                auto_source_wh, _source_candidates = _auto_select_source_warehouse(
+                    db,
+                    component_item_ids,
+                    excluded_refs=excluded,
+                )
+                existing.source_warehouse_ref1c = auto_source_wh
+            db.flush()
             reused.append(
                 {
                     "issue_id": int(existing.issue_id),
@@ -174,37 +283,28 @@ def create_material_issues(
             errors.append(f"product_id={pid}: не найдена спецификация или материалы")
             continue
 
-        # Auto-select source warehouse from per-warehouse stock breakdown.
-        # Caller may override by passing source_warehouse_ref1c explicitly
-        # (e.g. after showing the user a picker when ambiguous).
-        component_item_ids = [int(c["component_item_id"]) for c in components]
-        auto_source_wh, source_candidates = _auto_select_source_warehouse(db, component_item_ids)
-        resolved_source_wh = source_warehouse_ref1c or auto_source_wh
-
         # If the caller did not pin a destination warehouse, fall back to the
         # workshop->warehouse binding from settings. Plan rule:
         # "привязка участок -> склад получатель".
         resolved_warehouse = warehouse_ref1c
         if not resolved_warehouse:
-            state_obj = (
-                db.query(ProductionOrderLineState)
-                .filter(ProductionOrderLineState.product_id == int(product.product_id))
-                .first()
-            )
-            workshop_id_resolved: Optional[int] = (
-                int(state_obj.workshop_id) if state_obj and state_obj.workshop_id else None
-            )
-            if workshop_id_resolved:
-                binding = (
-                    db.query(WorkshopWarehouseBinding)
-                    .filter(WorkshopWarehouseBinding.workshop_id == workshop_id_resolved)
-                    .first()
-                )
-                if binding:
-                    resolved_warehouse = str(binding.warehouse_ref1c)
+            resolved_warehouse = _destination_warehouse_for_product(db, product, spec_id)
+
+        # Auto-select source warehouse from per-warehouse stock breakdown.
+        # The destination warehouse must not be auto-picked as source; if the
+        # remaining stock is split between multiple warehouses, return
+        # candidates so the UI can ask the operator.
+        component_item_ids = [int(c["component_item_id"]) for c in components]
+        excluded = {str(resolved_warehouse)} if resolved_warehouse else set()
+        auto_source_wh, source_candidates = _auto_select_source_warehouse(
+            db,
+            component_item_ids,
+            excluded_refs=excluded,
+        )
+        resolved_source_wh = source_warehouse_ref1c or auto_source_wh
 
         issue = ProductionMaterialIssue(
-            document_number=_next_issue_number(db),
+            document_number="",
             product_id=int(product.product_id),
             order_id=int(product.order_id),
             status="draft",
@@ -214,6 +314,7 @@ def create_material_issues(
         )
         db.add(issue)
         db.flush()
+        issue.document_number = material_issue_number(db, issue)
         for comp in components:
             db.add(
                 ProductionMaterialIssueLine(
@@ -262,6 +363,17 @@ def get_issue(db: Session, issue_id: int) -> Dict[str, Any]:
     )
     if not issue:
         raise ValueError("Документ выдачи не найден")
+    link = (
+        db.query(SyncLink)
+        .filter(
+            SyncLink.source_system == "PRODPLAN",
+            SyncLink.source_doctype == "material_issue",
+            SyncLink.source_id == int(issue.issue_id),
+            SyncLink.target_entity == STOCK_TRANSFER_ENTITY,
+        )
+        .one_or_none()
+    )
+    one_c_number = str(link.target_number or "") if link else ""
     return {
         "issue_id": int(issue.issue_id),
         "document_number": str(issue.document_number),
@@ -274,6 +386,7 @@ def get_issue(db: Session, issue_id: int) -> Dict[str, Any]:
         "item_article": str(issue.product.item.item_article or "") if issue.product and issue.product.item else "",
         "created_at": _date_to_iso(issue.created_at),
         "exported_ref1c": str(issue.exported_ref1c or ""),
+        "one_c_number": one_c_number,
         "export_error": str(issue.export_error or ""),
         "lines": [
             {
@@ -300,10 +413,29 @@ def _issue_header(db: Session, issue: ProductionMaterialIssue) -> Dict[str, Any]
         if product is not None
         else None
     )
+    issue_status = str(issue.status or "")
+    exported_ref = _clean_ref1c(issue.exported_ref1c)
+    link = (
+        db.query(SyncLink)
+        .filter(
+            SyncLink.source_system == "PRODPLAN",
+            SyncLink.source_doctype == "material_issue",
+            SyncLink.source_id == int(issue.issue_id),
+            SyncLink.target_entity == STOCK_TRANSFER_ENTITY,
+        )
+        .one_or_none()
+    )
+    one_c_number = str(link.target_number or "") if link else ""
+    can_assemble = bool(exported_ref) and issue_status != "posted"
+    assemble_disabled_reason = ""
+    if issue_status == "posted":
+        assemble_disabled_reason = "Перемещение уже собрано"
+    elif not exported_ref:
+        assemble_disabled_reason = "Сначала выгрузите перемещение в 1С"
     return {
         "issue_id": int(issue.issue_id),
         "document_number": str(issue.document_number),
-        "status": str(issue.status or ""),
+        "status": issue_status,
         "direction": str(issue.direction or "issue"),
         "product_id": int(issue.product_id),
         "order_id": int(issue.order_id),
@@ -318,10 +450,13 @@ def _issue_header(db: Session, issue: ProductionMaterialIssue) -> Dict[str, Any]
         "unit": _unit_display(db, item.unit) if item else "",
         "warehouse_ref1c": str(issue.warehouse_ref1c or ""),
         "source_warehouse_ref1c": str(issue.source_warehouse_ref1c or ""),
-        "exported_ref1c": str(issue.exported_ref1c or ""),
+        "exported_ref1c": exported_ref,
+        "one_c_number": one_c_number,
         "exported_at": _date_to_iso(issue.exported_at),
         "created_at": _date_to_iso(issue.created_at),
         "export_error": str(issue.export_error or ""),
+        "can_assemble": can_assemble,
+        "assemble_disabled_reason": assemble_disabled_reason,
         "line_status": str(state.status if state else ""),
         "issue_status": str(state.issue_status if state else ""),
         "lines_count": len(issue.lines or []),
@@ -404,20 +539,6 @@ def assemble_material_issue(
     if str(issue.status or "") == "posted":
         return {"status": "ok", "issue_id": int(issue.issue_id), "already_posted": True}
 
-    client = _create_odata_client(
-        _load_odata_config(),
-        OData1CClient,
-        allow_production=allow_production,
-        require_demo_base=True,
-    )
-    _post_document_operational(
-        client,
-        entity=STOCK_TRANSFER_ENTITY,
-        ref_key=ref_key,
-        unpost_first=True,
-    )
-
-    issue.status = "posted"
     link = (
         db.query(SyncLink)
         .filter(
@@ -428,6 +549,45 @@ def assemble_material_issue(
         )
         .one_or_none()
     )
+    client = _create_odata_client(
+        _load_odata_config(),
+        OData1CClient,
+        allow_production=allow_production,
+        require_demo_base=True,
+    )
+    try:
+        from .one_c_stock_transfer_export import (
+            add_source_cells_to_payload,
+            _build_header_payload,
+            _collect_export_entries,
+            _export_defaults,
+        )
+
+        entries, skipped = _collect_export_entries(db, [int(issue.issue_id)])
+        if skipped:
+            raise ValueError("; ".join(str(row.get("reason") or row) for row in skipped))
+        if entries:
+            payload = _build_header_payload(entries[0], _export_defaults(_load_odata_config()))
+            if link is not None and link.target_number:
+                payload["Number"] = str(link.target_number)
+            add_source_cells_to_payload(client, entries[0], payload)
+            patch = getattr(client, "patch", None)
+            if patch is not None:
+                patch(f"{STOCK_TRANSFER_ENTITY}(guid'{ref_key}')", payload)
+        _post_document_operational(
+            client,
+            entity=STOCK_TRANSFER_ENTITY,
+            ref_key=ref_key,
+            unpost_first=True,
+        )
+    except Exception as exc:
+        message = _clean_odata_error_message(exc)
+        issue.export_error = message
+        db.commit()
+        raise ValueError(message) from exc
+
+    issue.status = "posted"
+    issue.export_error = None
     if link is not None:
         link.status = "posted"
         link.last_synced_at = datetime.utcnow()

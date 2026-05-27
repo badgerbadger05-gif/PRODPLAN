@@ -14,6 +14,7 @@ from app.models import (
     SyncLink,
 )
 from app.services import one_c_piecework_export as exporter
+from app.services.one_c_document_numbers import piecework_number
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +254,7 @@ def test_already_linked_not_re_sent(db_session):
         source_doctype="piecework",
         source_id=m.manufacture_id,
         target_entity="Document_СдельныйНаряд",
-        target_number=f"PW{m.manufacture_id % 1_000_000_000:09d}",
+        target_number=piecework_number(db, m),
         payload_hash="hash",
         target_ref_key="existing-pw-ref",
         status="success",

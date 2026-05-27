@@ -12,6 +12,7 @@ from .one_c_export_common import (
     create_odata_client as _create_odata_client,
     fmt_1c_datetime as _fmt_1c_datetime,
 )
+from .one_c_document_numbers import purchase_order_number
 from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
 
@@ -44,7 +45,7 @@ class PurchaseOrderExportGroup:
 
 
 def _short_order_number(run_id: int, index: int) -> str:
-    return f"PP{int(run_id) % 100000:05d}{int(index) % 1000:03d}"
+    return purchase_order_number(run_id, index)
 
 
 def _existing_order_by_number(client: OData1CClient, number: str) -> Optional[Dict[str, Any]]:

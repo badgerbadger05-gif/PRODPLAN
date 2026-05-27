@@ -54,6 +54,23 @@ function bucketLabel(iso: string) {
   return dateRu(iso).slice(0, 5)
 }
 
+type ForecastInfo = {
+  forecast_date?: string | null
+  forecast_shift_days?: number | null
+  forecast_reason?: string | null
+}
+
+function ForecastShift({ forecast }: { forecast?: ForecastInfo | null }) {
+  if (!forecast || forecast.forecast_shift_days === null || forecast.forecast_shift_days === undefined) return null
+  const days = Number(forecast.forecast_shift_days)
+  if (!Number.isFinite(days) || days === 0) return null
+  const cls = days > 5 ? 'late' : days > 0 ? 'warn' : 'early'
+  const label = `${days > 0 ? '+' : ''}${days} дн`
+  const dateText = forecast.forecast_date ? dateRu(forecast.forecast_date).slice(0, 5) : ''
+  const title = [forecast.forecast_reason, forecast.forecast_date ? `прогноз ${dateRu(forecast.forecast_date)}` : null].filter(Boolean).join(' · ')
+  return <span className={`forecastShift ${cls}`} title={title}>{label}{dateText ? ` · ${dateText}` : ''}</span>
+}
+
 // ── Main page (list ↔ detail) ────────────────────────────────────────────────
 
 export function PeriodPlanPage() {
@@ -1178,6 +1195,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                           const val = cellValue(row, b)
                           const dirtyValue = dirty[row.item_id]?.[b]
                           const isDirtyCell = dirtyValue !== undefined && dirtyValue !== (row.buckets[b] ?? 0)
+                          const forecast = row.bucket_forecasts?.[b]
                           if (isDraft && !locked) {
                             return (
                               <td
@@ -1197,6 +1215,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                                   onChange={(e) => handleCellChange(row.item_id, b, e.target.value)}
                                   onKeyDown={(e) => handleCellKeyDown(e, row.item_id, b)}
                                 />
+                                <ForecastShift forecast={forecast} />
                               </td>
                             )
                           }
@@ -1210,6 +1229,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                               <span style={{ display: 'block', textAlign: 'right', paddingRight: 4, color: locked ? 'var(--muted)' : undefined }}>
                                 {val ? qty(val) : (isDraft ? '' : <span className="muted">—</span>)}
                               </span>
+                              <ForecastShift forecast={forecast} />
                             </td>
                           )
                         })}
@@ -1391,6 +1411,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                           </td>
                           <td style={{ textAlign: 'center' }}>
                             <span className={`miniPill ${coverageClass(row.coverage_pct)}`}>{row.coverage_pct}%</span>
+                            <ForecastShift forecast={row} />
                           </td>
                           <td style={{ textAlign: 'center' }}>
                             {row.work_items.length ? (
@@ -1425,6 +1446,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                               <td />
                               <td style={{ textAlign: 'center' }}>
                                 {wi.need_date ? <span className="muted">{dateRu(wi.need_date)}</span> : '—'}
+                                <ForecastShift forecast={wi} />
                               </td>
                               <td />
                             </tr>

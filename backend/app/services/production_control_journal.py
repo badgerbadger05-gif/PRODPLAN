@@ -58,6 +58,21 @@ COVERAGE_LABELS = {
 }
 
 
+def _forecast_payload(forecast_date: Optional[date], due_date: Optional[date]) -> Dict[str, Any]:
+    if not forecast_date or not due_date:
+        return {
+            "forecast_date": _date_to_iso(forecast_date),
+            "forecast_shift_days": None,
+            "forecast_reason": None,
+        }
+    shift = (forecast_date - due_date).days
+    return {
+        "forecast_date": forecast_date.isoformat(),
+        "forecast_shift_days": shift,
+        "forecast_reason": "смещение по мощностям" if shift > 0 else ("раньше плановой даты" if shift < 0 else "в срок"),
+    }
+
+
 def _main_workshop_for_spec(db: Session, spec_id: Optional[int]) -> Tuple[Optional[int], Optional[str], Optional[int], Optional[str]]:
     if not spec_id:
         return (None, None, None, None)
@@ -341,12 +356,23 @@ def create_production_orders_from_mrp_requirements(
         db.add(product)
         db.flush()
 
+        planned_tasks = (
+            db.query(PlannedOrder)
+            .filter(
+                PlannedOrder.run_id == int(req.run_id),
+                PlannedOrder.demand_ref == f"mrp_requirement:{rid}",
+            )
+            .all()
+        )
+        planned_start = min((task.start_date for task in planned_tasks if task.start_date), default=req.period_from)
+        planned_finish = max((task.finish_date or task.need_date for task in planned_tasks if task.finish_date or task.need_date), default=req.period_to)
+
         state = ProductionOrderLineState(
             product_id=int(product.product_id),
             status="shortage",
             issue_status="not_requested",
-            planned_start_date=req.period_from,
-            planned_finish_date=req.period_to,
+            planned_start_date=planned_start,
+            planned_finish_date=planned_finish,
         )
         db.add(state)
 
@@ -452,6 +478,34 @@ def list_journal(
         query = query.filter(ProductionOrder.order_date < datetime.combine(finish, datetime.max.time()))
 
     rows = query.order_by(ProductionOrder.order_date.desc(), ProductionOrder.order_number.asc(), ProductionProduct.line_number.asc()).all()
+    planned_order_ids = sorted({
+        int(product.source_planned_order_id)
+        for product in rows
+        if getattr(product, "source_planned_order_id", None) is not None
+    })
+    req_ids = sorted({
+        int(product.source_mrp_requirement_id)
+        for product in rows
+        if getattr(product, "source_mrp_requirement_id", None) is not None
+    })
+    planned_due_by_id: Dict[int, date] = {}
+    if planned_order_ids:
+        for row in (
+            db.query(PlannedOrder.order_id, PlannedOrder.need_date)
+            .filter(PlannedOrder.order_id.in_(planned_order_ids))
+            .all()
+        ):
+            if row.need_date:
+                planned_due_by_id[int(row.order_id)] = row.need_date
+    req_due_by_id: Dict[int, date] = {}
+    if req_ids:
+        for row in (
+            db.query(MrpRequirement.id, MrpRequirement.period_to)
+            .filter(MrpRequirement.id.in_(req_ids))
+            .all()
+        ):
+            if row.period_to:
+                req_due_by_id[int(row.id)] = row.period_to
 
     result: List[Dict[str, Any]] = []
     for product in rows:
@@ -468,6 +522,14 @@ def list_journal(
             planned_start = state.planned_start_date
         if state and state.planned_finish_date:
             planned_finish = state.planned_finish_date
+        due_date = None
+        source_planned_order_id = int(product.source_planned_order_id) if product.source_planned_order_id is not None else None
+        source_mrp_requirement_id = int(product.source_mrp_requirement_id) if product.source_mrp_requirement_id is not None else None
+        if source_planned_order_id is not None:
+            due_date = planned_due_by_id.get(source_planned_order_id)
+        if due_date is None and source_mrp_requirement_id is not None:
+            due_date = req_due_by_id.get(source_mrp_requirement_id)
+        forecast = _forecast_payload(planned_finish, due_date or planned_finish)
 
         issue_count = db.query(ProductionMaterialIssue).filter(ProductionMaterialIssue.product_id == product.product_id).count()
         coverage_status = str(state.status if state else "shortage")
@@ -496,6 +558,7 @@ def list_journal(
                 "issue_status": str(state.issue_status if state else "not_requested"),
                 "planned_start_date": _date_to_iso(planned_start),
                 "planned_finish_date": _date_to_iso(planned_finish),
+                **forecast,
                 "opened_at": _date_to_iso(state.opened_at) if state else None,
                 "workshop_id": resolved_workshop_id,
                 "workshop_name": (state.workshop.resource_name if state and state.workshop else inferred_workshop_name),
@@ -505,6 +568,9 @@ def list_journal(
                 "issue_count": int(issue_count),
                 "route_sheet_printed_at": _date_to_iso(state.route_sheet_printed_at) if state else None,
                 "comment": str(state.comment or "") if state else "",
+                "source_run_id": int(product.order.source_run_id) if product.order.source_run_id is not None else None,
+                "source_planned_order_id": source_planned_order_id,
+                "source_mrp_requirement_id": source_mrp_requirement_id,
             }
         )
 

@@ -11,6 +11,17 @@ type Props = {
   onChangeStatus: (row: OrderRow, status: string) => void
 }
 
+function ForecastShift({ row }: { row: OrderRow }) {
+  if (row.forecast_shift_days === null || row.forecast_shift_days === undefined) return null
+  const days = Number(row.forecast_shift_days)
+  if (!Number.isFinite(days) || days === 0) return null
+  const cls = days > 5 ? 'late' : days > 0 ? 'warn' : 'early'
+  const label = `${days > 0 ? '+' : ''}${days} дн`
+  const dateText = row.forecast_date ? dateRu(row.forecast_date).slice(0, 5) : ''
+  const title = [row.forecast_reason, row.forecast_date ? `прогноз ${dateRu(row.forecast_date)}` : null].filter(Boolean).join(' · ')
+  return <span className={`forecastShift ${cls}`} title={title}>{label}{dateText ? ` · ${dateText}` : ''}</span>
+}
+
 export function ProductionOrdersTable({ rows, activeRow, selectedIds, onSelectIds, onActivate, onOpenMaterials, onChangeStatus }: Props) {
   return (
     <table className="journalTable">
@@ -61,6 +72,7 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, onSelectId
             <td className="dateCell">
               <span>С: {dateRu(row.planned_start_date) || '—'}</span>
               <span>По: {dateRu(row.planned_finish_date) || '—'}</span>
+              <ForecastShift row={row} />
             </td>
             <td>
               <select value={row.status} onChange={(e) => onChangeStatus(row, e.target.value)} onClick={(e) => e.stopPropagation()}>

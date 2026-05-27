@@ -24,13 +24,39 @@ export function ProductionSettingsPane({
   onSave,
   onClose,
 }: Props) {
-  const byResource = new Map(workshopRows.map((row) => [row.resource_id, row.warehouse_ref1c]))
+  const byResource = new Map(
+    workshopRows
+      .map((row) => [row.resource_id ?? row.workshop_id, row.warehouse_ref1c] as const)
+      .filter((row): row is readonly [number, string] => typeof row[0] === 'number' && !!row[1]),
+  )
+  const productionByResource = new Map(
+    workshopRows
+      .map((row) => [row.resource_id ?? row.workshop_id, row.production_warehouse_ref1c ?? ''] as const)
+      .filter((row): row is readonly [number, string] => typeof row[0] === 'number' && !!row[1]),
+  )
+
+  function rowsFromMaps(workshopMap: Map<number, string>, productionMap: Map<number, string>) {
+    const resourceIds = new Set([...workshopMap.keys(), ...productionMap.keys()])
+    return Array.from(resourceIds).map((resource_id) => ({
+      resource_id,
+      workshop_id: resource_id,
+      warehouse_ref1c: workshopMap.get(resource_id) ?? '',
+      production_warehouse_ref1c: productionMap.get(resource_id) ?? '',
+    })).filter((row) => row.warehouse_ref1c || row.production_warehouse_ref1c)
+  }
 
   function setWorkshopWarehouse(resourceId: number, warehouseRef: string) {
     const next = new Map(byResource)
     if (warehouseRef) next.set(resourceId, warehouseRef)
     else next.delete(resourceId)
-    onWorkshopRowsChange(Array.from(next.entries()).map(([resource_id, warehouse_ref1c]) => ({ resource_id, warehouse_ref1c })))
+    onWorkshopRowsChange(rowsFromMaps(next, productionByResource))
+  }
+
+  function setProductionWarehouse(resourceId: number, warehouseRef: string) {
+    const next = new Map(productionByResource)
+    if (warehouseRef) next.set(resourceId, warehouseRef)
+    else next.delete(resourceId)
+    onWorkshopRowsChange(rowsFromMaps(byResource, next))
   }
 
   function toggleIgnored(ref: string, checked: boolean) {
@@ -45,19 +71,20 @@ export function ProductionSettingsPane({
       <div className="paneHeader">
         <div>
           <h2>Настройки журнала</h2>
-          <span>Склады выдачи по участкам и склады, которые не участвуют в подборе</span>
+          <span>Склады участка, получатели продукции в 1С и склады, которые не участвуют в подборе</span>
         </div>
         <button onClick={onClose}>Закрыть</button>
       </div>
 
       <div className="settingsBlock settingsWorkshopBlock">
-        <h3>Склады получатели по участкам</h3>
+        <h3>Склады по участкам</h3>
         <div className="settingsTableScroll">
           <table className="miniSettingsTable">
             <thead>
               <tr>
                 <th>Участок</th>
-                <th>Склад получатель</th>
+                <th>Склад участка</th>
+                <th>Получатель продукции в заказе 1С</th>
               </tr>
             </thead>
             <tbody>
@@ -66,6 +93,14 @@ export function ProductionSettingsPane({
                   <td>{resource.resource_name}</td>
                   <td>
                     <select value={byResource.get(resource.resource_id) ?? ''} onChange={(e) => setWorkshopWarehouse(resource.resource_id, e.target.value)}>
+                      <option value="">Не назначен</option>
+                      {warehouses.map((warehouse) => (
+                        <option key={warehouse.warehouse_ref1c} value={warehouse.warehouse_ref1c}>{warehouseLabel(warehouse)}</option>
+                      ))}
+                    </select>
+                  </td>
+                  <td>
+                    <select value={productionByResource.get(resource.resource_id) ?? ''} onChange={(e) => setProductionWarehouse(resource.resource_id, e.target.value)}>
                       <option value="">Не назначен</option>
                       {warehouses.map((warehouse) => (
                         <option key={warehouse.warehouse_ref1c} value={warehouse.warehouse_ref1c}>{warehouseLabel(warehouse)}</option>

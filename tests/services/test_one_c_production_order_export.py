@@ -18,11 +18,22 @@ from pathlib import Path
 import pytest
 
 from app.models import (
+    DefaultSpecification,
     Item,
+    Operation,
     PlannedOrder,
     PlanningRun,
+    ProductionOrderLineState,
     ProductionOrder,
+    ProductionMaterialIssue,
     ProductionProduct,
+    ProductionResource,
+    ProductionStage,
+    ResourceStage,
+    SpecComponent,
+    Specification,
+    SpecOperation,
+    WorkshopWarehouseBinding,
     SyncLink,
 )
 from app.services import one_c_production_order_export as exporter
@@ -46,7 +57,7 @@ def _mk_item(db, *, code: str, ref1c: str) -> Item:
         item_name=f"Item {code}",
         item_article=code,
         item_ref1c=ref1c,
-        unit="шт",
+        unit=f"unit-ref-{code}",
         stock_qty=0,
         status="active",
     )
@@ -139,11 +150,97 @@ def test_dry_run_returns_payload_without_touching_network(db_session, monkeypatc
     assert pl["payload"]["Number"].startswith("PP")
     [prod_row] = pl["payload"]["Продукция"]
     assert prod_row["Номенклатура_Key"] == item.item_ref1c
+    assert prod_row["ЕдиницаИзмерения"] == item.unit
+    assert prod_row["ЕдиницаИзмерения_Type"] == "StandardODATA.Catalog_КлассификаторЕдиницИзмерения"
     assert float(prod_row["Количество"]) == 7.0
     assert "PRODPLAN source=production_order/" in pl["payload"]["Комментарий"]
 
     # No sync_link writes on dry-run.
     assert db.query(SyncLink).count() == 0
+
+
+def test_dry_run_payload_includes_materials_operations_and_reserve_warehouse(db_session, monkeypatch):
+    db = db_session
+    parent = _mk_item(db, code="P-BOM", ref1c="parent-ref")
+    component = _mk_item(db, code="C-BOM", ref1c="component-ref")
+    spec = Specification(spec_name="Spec BOM", spec_ref1c="spec-ref")
+    op = Operation(operation_ref1c="operation-ref", operation_name="Cut", time_norm=0.25)
+    stage = ProductionStage(stage_name="Stage BOM", stage_ref1c="stage-ref")
+    resource = ProductionResource(resource_name="Workshop BOM")
+    db.add_all([spec, op, stage, resource])
+    db.flush()
+    db.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db.add(SpecComponent(spec_id=spec.spec_id, item_id=component.item_id, quantity=2, stage_id=stage.stage_id))
+    db.add(SpecOperation(spec_id=spec.spec_id, operation_id=op.operation_id, stage_id=stage.stage_id, time_norm=0.5))
+    db.add(ResourceStage(resource_id=resource.resource_id, stage_id=stage.stage_id))
+    db.add(
+        WorkshopWarehouseBinding(
+            workshop_id=resource.resource_id,
+            warehouse_ref1c="workshop-warehouse-ref",
+            production_warehouse_ref1c="production-warehouse-ref",
+        )
+    )
+    db.flush()
+    run = _mk_run(db)
+    order = _mk_mrp_order(db, parent, run_id=run.run_id, qty=3)
+    product = db.query(ProductionProduct).filter_by(order_id=order.order_id).one()
+    product.spec_id = spec.spec_id
+    db.add(
+        ProductionOrderLineState(
+            product_id=product.product_id,
+            status="ready",
+            issue_status="not_requested",
+            workshop_id=resource.resource_id,
+            planned_start_date=_dt.date(2026, 6, 12),
+            planned_finish_date=_dt.date(2026, 6, 13),
+        )
+    )
+    db.add(
+        ProductionMaterialIssue(
+            document_number="MI-BOM",
+            product_id=product.product_id,
+            order_id=order.order_id,
+            status="draft",
+            warehouse_ref1c="workshop-warehouse-ref",
+            source_warehouse_ref1c="source-warehouse-ref",
+        )
+    )
+    db.commit()
+
+    _stub_odata_config(monkeypatch, base_url="http://1c-demo.local/odata/unf_demo")
+    monkeypatch.setattr(
+        exporter,
+        "OData1CClient",
+        lambda **_: pytest.fail("Network client must not be instantiated in dry-run"),
+    )
+    monkeypatch.setattr(exporter, "_current_1c_datetime", lambda: "2026-05-27T09:58:40")
+    monkeypatch.setattr(exporter, "_current_moscow_datetime", lambda: "2026-05-27T10:58:40")
+
+    result = exporter.export_production_orders_to_1c(db, [order.order_id], dry_run=True)
+    payload = result["payloads"][0]["payload"]
+
+    assert payload["Date"] == "2026-05-27T09:58:40"
+    assert payload["Старт"] == "2026-06-12T10:58:40"
+    assert payload["Финиш"] == "2026-06-13T10:58:40"
+    assert payload["СтруктурнаяЕдиницаРезерв_Key"] == "workshop-warehouse-ref"
+    assert payload["СтруктурнаяЕдиницаПродукции_Key"] == "production-warehouse-ref"
+    [prod_row] = payload["Продукция"]
+    assert prod_row["СтруктурнаяЕдиница_Key"] == "production-warehouse-ref"
+    assert prod_row["КлючСвязи"] == 1
+    [stock_row] = payload["Запасы"]
+    assert stock_row["Номенклатура_Key"] == component.item_ref1c
+    assert stock_row["Количество"] == 6.0
+    assert stock_row["ЕдиницаИзмерения"] == component.unit
+    assert stock_row["Спецификация_Key"] == "spec-ref"
+    assert stock_row["СтруктурнаяЕдиница_Key"] == "workshop-warehouse-ref"
+    [operation_row] = payload["Операции"]
+    assert operation_row["Операция_Key"] == "operation-ref"
+    assert operation_row["КоличествоПлан"] == 3.0
+    assert operation_row["НормаВремени"] == 0.5
+    assert operation_row["Нормочасы"] == 1.5
+    assert operation_row["СтруктурнаяЕдиница_Key"] == "production-warehouse-ref"
+    assert operation_row["КлючСвязиПродукция"] == 1
+    assert payload["ЗапланированыОперации"] is True
 
 
 def test_demo_base_url_guard_blocks_non_demo_without_override(db_session, monkeypatch):
