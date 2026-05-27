@@ -58,6 +58,9 @@ export type MrpProductionRow = {
   need_date?: string | null
   start_date?: string | null
   finish_date?: string | null
+  forecast_date?: string | null
+  forecast_shift_days?: number | null
+  forecast_reason?: string | null
   main_area_id?: number | null
   main_area_name?: string | null
   main_stage_id?: number | null
@@ -182,6 +185,11 @@ export type PeriodPlanMatrixRow = {
   total_qty: number
   buckets: Record<string, number>
   locked_buckets: Record<string, number>
+  bucket_forecasts?: Record<string, {
+    forecast_date?: string | null
+    forecast_shift_days?: number | null
+    forecast_reason?: string | null
+  }>
 }
 
 export type PeriodPlanMatrix = {
@@ -205,6 +213,9 @@ export type ExecutionWorkItem = {
   need_date?: string | null
   order_date?: string | null
   lead_time_days?: number
+  forecast_date?: string | null
+  forecast_shift_days?: number | null
+  forecast_reason?: string | null
 }
 
 export type ExecutionJournalRow = {
@@ -224,6 +235,9 @@ export type ExecutionJournalRow = {
   remaining_qty: number
   unassigned_qty?: number
   coverage_pct: number
+  forecast_date?: string | null
+  forecast_shift_days?: number | null
+  forecast_reason?: string | null
   work_items: ExecutionWorkItem[]
 }
 

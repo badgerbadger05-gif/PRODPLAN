@@ -202,6 +202,8 @@ def _fetch_warehouse_catalog_rows(req: ODataSyncRequest) -> Tuple[List[Dict], st
         "Catalog_СкладыПредприятия",
     ]
     last_error: Optional[Exception] = None
+    rows_by_ref: Dict[str, Dict] = {}
+    used_entities: List[str] = []
     for entity in candidate_entities:
         try:
             rows = client.get_all(
@@ -215,7 +217,19 @@ def _fetch_warehouse_catalog_rows(req: ODataSyncRequest) -> Tuple[List[Dict], st
             last_error = exc
             continue
         if rows:
-            return rows, entity
+            used_entities.append(entity)
+        for rec in rows or []:
+            w_ref = str(rec.get("Ref_Key") or rec.get("RefKey") or "").strip()
+            if not w_ref:
+                continue
+            existing = rows_by_ref.get(w_ref)
+            if existing is None:
+                rows_by_ref[w_ref] = rec
+                continue
+            if not str(existing.get("Description") or existing.get("Наименование") or existing.get("Name") or "").strip():
+                rows_by_ref[w_ref] = rec
+    if rows_by_ref:
+        return list(rows_by_ref.values()), ", ".join(used_entities)
     if last_error:
         print(f"[OData][warehouses] catalog lookup fallback: {last_error}", flush=True)
     return [], ""

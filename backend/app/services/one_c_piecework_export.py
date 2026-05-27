@@ -44,6 +44,7 @@ from .one_c_export_common import (
 )
 from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
+from .one_c_document_numbers import piecework_number
 from .one_c_manufacture_export import export_manufactures_to_1c
 
 
@@ -138,7 +139,7 @@ def _collect_export_entries(
             item_ref1c=item_ref,
             item_name=str(item.item_name or "") if item else "",
             qty=float(m.qty or 0),
-            number=_short_piecework_number(int(m.manufacture_id)),
+            number=piecework_number(db, m),
         ))
 
     return entries, skipped

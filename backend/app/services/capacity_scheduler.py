@@ -197,7 +197,8 @@ class CapacityScheduler:
         warnings: List[Dict[str, Any]] = []
         stage_dates: Dict[int, Dict[str, datetime]] = {}
 
-        current_need_dt = datetime.combine(need_date, datetime.min.time())
+        effective_need_date = max(need_date, self._d0)
+        current_need_dt = datetime.combine(effective_need_date, datetime.min.time())
 
         # Normalize inputs
         try:
@@ -277,7 +278,7 @@ class CapacityScheduler:
 
         def allocate_forward(hours: float, area_ids: List[int], start_dt: datetime) -> Tuple[float, Optional[datetime], Optional[datetime]]:
             remaining = float(hours)
-            d = (start_dt + timedelta(days=1)).date()
+            d = max((start_dt + timedelta(days=1)).date(), self._d0)
             first_start_dt: Optional[datetime] = None
             last_finish_dt: Optional[datetime] = None
             while remaining > 1e-9 and d <= self._dmax:

@@ -22,7 +22,6 @@ router = APIRouter()
 
 class WorkshopBindingPayload(BaseModel):
     warehouse_ref1c: str
-    production_warehouse_ref1c: Optional[str] = None
 
 
 class IgnoredWarehousePayload(BaseModel):
@@ -63,12 +62,7 @@ def put_workshop_binding(
     db: Session = Depends(get_db),
 ):
     try:
-        return upsert_workshop_binding(
-            db,
-            int(workshop_id),
-            payload.warehouse_ref1c,
-            production_warehouse_ref1c=payload.production_warehouse_ref1c,
-        )
+        return upsert_workshop_binding(db, int(workshop_id), payload.warehouse_ref1c)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:

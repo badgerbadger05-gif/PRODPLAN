@@ -961,6 +961,23 @@ def get_run_production(
         if not data.get("start_date") and data.get("finish_date"):
             data["start_date"] = data["finish_date"]
 
+        try:
+            if data.get("finish_date") and data.get("need_date"):
+                fin_d = date.fromisoformat(str(data["finish_date"])[:10])
+                need_d = date.fromisoformat(str(data["need_date"])[:10])
+                shift = (fin_d - need_d).days
+                data["forecast_date"] = fin_d.isoformat()
+                data["forecast_shift_days"] = shift
+                data["forecast_reason"] = (
+                    "смещение по мощностям"
+                    if shift > 0
+                    else ("раньше плановой даты" if shift < 0 else "в срок")
+                )
+        except Exception:
+            data["forecast_date"] = data.get("finish_date")
+            data["forecast_shift_days"] = None
+            data["forecast_reason"] = None
+
         # stable synthetic order_id for UI tables (aggregated view)
         data["order_id"] = hash(f"{data['item_id']}_{data['start_date']}_{data['unit']}") % (10**10)
 

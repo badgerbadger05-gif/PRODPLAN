@@ -439,6 +439,21 @@ input:focus, select:focus {
 .pill.running { background: #e6f0ff; border-color: #9cbce8; color: var(--blue); }
 .pill.failed { background: #ffe5e5; border-color: #ef9a9a; color: var(--red); }
 
+.forecastShift {
+  display: block;
+  margin-top: 2px;
+  font-size: 11px;
+  line-height: 1.15;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.forecastShift.warn { color: var(--orange); }
+.forecastShift.late { color: var(--red); }
+.forecastShift.early { color: var(--blue); }
+
 .runsTable td {
   height: 38px;
 }

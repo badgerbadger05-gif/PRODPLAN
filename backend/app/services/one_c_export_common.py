@@ -3,10 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
 
 EMPTY_REF1C = "00000000-0000-0000-0000-000000000000"
+DEFAULT_ORGANIZATION_REF1C = "c78bcd0e-81f0-11ee-9ce5-9ee51454587f"
+DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C = "c74ea54c-d1b2-11ef-9e01-9ee51454587f"
+UNIT_TYPE_1C = "StandardODATA.Catalog_КлассификаторЕдиницИзмерения"
 
 
 def fmt_1c_datetime(value: Optional[date]) -> Optional[str]:
@@ -17,11 +21,29 @@ def fmt_1c_datetime(value: Optional[date]) -> Optional[str]:
     return datetime.combine(value, datetime.min.time()).isoformat()
 
 
+def current_1c_datetime() -> str:
+    try:
+        return datetime.now(ZoneInfo("Europe/Moscow")).replace(microsecond=0).isoformat()
+    except Exception:
+        return fmt_1c_datetime(datetime.now().replace(microsecond=0)) or ""
+
+
 def clean_ref1c(value: Any, *, empty_ref: str = EMPTY_REF1C) -> str:
     ref = str(value or "").strip()
     if not ref or ref == empty_ref:
         return ""
     return ref
+
+
+def config_ref1c(config: Dict[str, Any], key: str, fallback: Optional[str] = None) -> str:
+    return clean_ref1c(config.get(key) or fallback)
+
+
+def add_unit_payload(row: Dict[str, Any], unit_value: Any) -> None:
+    unit_ref = clean_ref1c(unit_value)
+    if unit_ref:
+        row["ЕдиницаИзмерения"] = unit_ref
+        row["ЕдиницаИзмерения_Type"] = UNIT_TYPE_1C
 
 
 def payload_hash(payload: Dict[str, Any]) -> str:
@@ -168,23 +190,30 @@ def post_export_entries(
         payload = payload_envelope["payload"]
         try:
             phash = payload_hash(payload)
+            existing_ref_key = clean_ref1c(getattr(entry, "target_ref_key", None))
             upsert_link(
                 entry=entry,
                 payload_hash=phash,
-                target_ref_key=None,
+                target_ref_key=existing_ref_key or None,
                 status="planned",
                 last_error=None,
             )
             db.flush()
 
-            created_header = client.post(target_entity, payload)
-            ref_key = clean_ref1c(created_header.get("Ref_Key"))
-            if not ref_key:
-                raise RuntimeError(missing_ref_error)
+            if existing_ref_key:
+                patch = getattr(client, "patch", None)
+                if patch is None:
+                    raise RuntimeError("1C document already exists, but OData client cannot patch it")
+                patch(f"{target_entity}(guid'{existing_ref_key}')", payload)
+                ref_key = existing_ref_key
+            else:
+                created_header = client.post(target_entity, payload)
+                ref_key = clean_ref1c(created_header.get("Ref_Key"))
+                if not ref_key:
+                    raise RuntimeError(missing_ref_error)
 
             entry.target_ref_key = ref_key
             entry.status = "created"
-            created += 1
 
             upsert_link(
                 entry=entry,
@@ -194,6 +223,7 @@ def post_export_entries(
                 last_error=None,
             )
             on_success(entry, ref_key)
+            created += 1
         except Exception as exc:
             entry.status = "error"
             entry.error = str(exc)

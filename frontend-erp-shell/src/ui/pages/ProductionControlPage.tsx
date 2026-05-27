@@ -128,7 +128,14 @@ export function ProductionControlPage() {
       const saved = await api<ControlSettings>('/v1/production-control/settings', {
         method: 'POST',
         body: JSON.stringify({
-          workshop_warehouses: workshopRows.filter((row) => row.warehouse_ref1c),
+          workshop_warehouses: workshopRows
+            .map((row) => ({
+              resource_id: row.resource_id ?? row.workshop_id,
+              workshop_id: row.workshop_id ?? row.resource_id,
+              warehouse_ref1c: row.warehouse_ref1c,
+              production_warehouse_ref1c: row.production_warehouse_ref1c ?? '',
+            }))
+            .filter((row) => row.resource_id && row.warehouse_ref1c),
           ignored_warehouses: Array.from(ignoredRefs).map((warehouse_ref1c) => ({ warehouse_ref1c })),
         }),
       })

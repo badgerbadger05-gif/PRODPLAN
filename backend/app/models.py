@@ -309,9 +309,12 @@ class ProductionOrderLineState(Base):
 
 class WorkshopWarehouseBinding(Base):
     """
-    Plan rule: "привязка участок -> склад получатель". One workshop maps to
-    at most one warehouse (enforced by UNIQUE on workshop_id). Used to
-    pre-fill warehouse_ref1c when creating material-issue documents.
+    Plan rule: workshop warehouse settings. One workshop maps to at most one
+    settings row (enforced by UNIQUE on workshop_id).
+
+    warehouse_ref1c is the workshop warehouse used as material transfer
+    destination and production-order reserve warehouse. production_warehouse_ref1c
+    is the finished-product recipient used in 1C production orders.
     """
     __tablename__ = "workshop_warehouse_bindings"
     __table_args__ = (
@@ -326,6 +329,7 @@ class WorkshopWarehouseBinding(Base):
         index=True,
     )
     warehouse_ref1c = Column(String(36), nullable=False, index=True)
+    production_warehouse_ref1c = Column(String(36), nullable=True, index=True)
     created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
 

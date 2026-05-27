@@ -14,6 +14,7 @@ from ..models import (
 )
 from .production_control_common import to_float as _to_float
 from .production_control_domain import default_spec_id as _default_spec_id, ensure_state as _ensure_state
+from .one_c_document_numbers import material_issue_number
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +274,7 @@ def return_leftover_components(
     return_dest = str(latest_outgoing.source_warehouse_ref1c or "") or None
 
     new_issue = ProductionMaterialIssue(
-        document_number=_next_return_number(db),
+        document_number="",
         product_id=int(product.product_id),
         order_id=int(product.order_id),
         status="draft",
@@ -284,6 +285,7 @@ def return_leftover_components(
     )
     db.add(new_issue)
     db.flush()
+    new_issue.document_number = material_issue_number(db, new_issue)
     for ln in return_lines:
         db.add(
             ProductionMaterialIssueLine(

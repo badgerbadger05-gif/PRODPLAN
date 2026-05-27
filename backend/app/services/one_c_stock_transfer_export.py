@@ -18,7 +18,7 @@ components.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
-from datetime import date, datetime
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session, joinedload
@@ -33,20 +33,26 @@ from ..models import (
     SyncLink,
 )
 from .one_c_export_common import (
+    DEFAULT_ORGANIZATION_REF1C,
+    DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C,
+    add_unit_payload as _add_unit_payload,
     clean_ref1c as _clean_ref1c,
+    config_ref1c as _config_ref1c,
     create_odata_client as _create_odata_client,
-    fmt_1c_datetime as _fmt_1c_datetime,
+    current_1c_datetime as _current_1c_datetime,
     find_sync_link as _find_sync_link,
     post_export_entries as _post_export_entries,
     upsert_sync_link as _upsert_sync_link,
 )
 from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
+from .one_c_document_numbers import material_issue_number
 from .one_c_production_order_export import export_production_orders_to_1c
 
 
 STOCK_TRANSFER_ENTITY = "Document_ПеремещениеЗапасов"
 EMPTY_REF1C = "00000000-0000-0000-0000-000000000000"
+DEFAULT_STOCK_TRANSFER_VAT_RATE_REF1C = "4eae6f42-e295-11f0-9d39-9ee51454587f"
 
 
 @dataclass
@@ -56,6 +62,7 @@ class StockTransferExportLine:
     item_ref1c: str
     item_name: str
     item_article: str
+    unit_ref1c: Optional[str]
     qty: float
 
 
@@ -75,6 +82,162 @@ class StockTransferExportEntry:
     reason: Optional[str] = None
 
 
+@dataclass
+class StockTransferExportDefaults:
+    organization_ref1c: str = ""
+    source_structural_unit_ref1c: str = ""
+    destination_structural_unit_ref1c: str = ""
+    vat_rate_ref1c: str = ""
+
+
+def _qty_from_balance_row(row: Dict[str, Any]) -> float:
+    for key in ("КоличествоBalance", "КоличествоОстаток", "ВНаличииBalance", "ВНаличииОстаток"):
+        if key in row:
+            try:
+                return float(row.get(key) or 0.0)
+            except Exception:
+                return 0.0
+    return 0.0
+
+
+def _stock_balance_cell_rows(
+    client: OData1CClient,
+    *,
+    item_ref1c: str,
+    warehouse_ref1c: str,
+) -> List[Dict[str, Any]]:
+    """
+    Read live 1C balance by storage cell for a single item/warehouse pair.
+
+    Some warehouses in UNF track stock by "Ячейка". A transfer row without
+    Ячейка_Key can be created but cannot be conducted: 1C sees zero available
+    stock in the empty-cell bucket. We intentionally query 1C at export/post
+    time instead of relying on PRODPLAN's warehouse-only cache.
+    """
+    item_ref = _clean_ref1c(item_ref1c)
+    warehouse_ref = _clean_ref1c(warehouse_ref1c)
+    if not item_ref or not warehouse_ref:
+        return []
+    get_all = getattr(client, "get_all", None)
+    if get_all is None:
+        return []
+    entity = (
+        "AccumulationRegister_ЗапасыНаСкладах/Balance("
+        f"Period=datetime'{datetime.now().replace(microsecond=0).isoformat()}',"
+        "Dimensions='Номенклатура,СтруктурнаяЕдиница,Ячейка,Организация')"
+    )
+    filter_query = (
+        f"Номенклатура_Key eq guid'{item_ref}' and "
+        f"СтруктурнаяЕдиница_Key eq guid'{warehouse_ref}'"
+    )
+    try:
+        rows = get_all(
+            entity,
+            filter_query=filter_query,
+            top=100,
+            max_records=100,
+            max_pages=5,
+            order_by=None,
+        )
+    except Exception:
+        return []
+    useful: List[Dict[str, Any]] = []
+    for row in rows or []:
+        qty = _qty_from_balance_row(row)
+        if qty <= 0:
+            continue
+        cell_ref = _clean_ref1c(row.get("Ячейка_Key"))
+        if not cell_ref or cell_ref == EMPTY_REF1C:
+            continue
+        useful.append({"cell_ref1c": cell_ref, "qty": qty})
+    useful.sort(key=lambda r: float(r.get("qty") or 0.0), reverse=True)
+    return useful
+
+
+def add_source_cells_to_payload(
+    client: OData1CClient,
+    entry: StockTransferExportEntry,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Fill/split transfer stock rows with Ячейка_Key from live 1C balances.
+
+    The helper mutates and returns `payload`. Rows that do not require a
+    storage cell stay as-is. If a required quantity is split across cells, the
+    payload row is split accordingly with fresh LineNumber/КлючСвязи values.
+    """
+    source_ref = _clean_ref1c(payload.get("СтруктурнаяЕдиница_Key") or entry.source_warehouse_ref1c)
+    if not source_ref:
+        return payload
+
+    rebuilt: List[Dict[str, Any]] = []
+    for row in list(payload.get("Запасы") or []):
+        item_ref = _clean_ref1c(row.get("Номенклатура_Key"))
+        required_qty = float(row.get("Количество") or 0.0)
+        if not item_ref or required_qty <= 0:
+            rebuilt.append(row)
+            continue
+
+        cell_rows = _stock_balance_cell_rows(client, item_ref1c=item_ref, warehouse_ref1c=source_ref)
+        if not cell_rows:
+            rebuilt.append(row)
+            continue
+
+        single = next((r for r in cell_rows if float(r["qty"]) + 1e-9 >= required_qty), None)
+        if single is not None:
+            patched = dict(row)
+            patched["Ячейка_Key"] = str(single["cell_ref1c"])
+            rebuilt.append(patched)
+            continue
+
+        if sum(float(r["qty"]) for r in cell_rows) + 1e-9 < required_qty:
+            patched = dict(row)
+            patched["Ячейка_Key"] = str(cell_rows[0]["cell_ref1c"])
+            rebuilt.append(patched)
+            continue
+
+        remaining = required_qty
+        for cell in cell_rows:
+            if remaining <= 1e-9:
+                break
+            qty = min(remaining, float(cell["qty"]))
+            patched = dict(row)
+            patched["Количество"] = qty
+            patched["Ячейка_Key"] = str(cell["cell_ref1c"])
+            rebuilt.append(patched)
+            remaining -= qty
+
+    for idx, row in enumerate(rebuilt, start=1):
+        row["LineNumber"] = idx
+        row["КлючСвязи"] = idx
+    payload["Запасы"] = rebuilt
+    return payload
+
+
+def _export_defaults(config: Dict[str, Any]) -> StockTransferExportDefaults:
+    return StockTransferExportDefaults(
+        organization_ref1c=_config_ref1c(
+            config,
+            "default_organization_ref1c",
+            DEFAULT_ORGANIZATION_REF1C,
+        ),
+        source_structural_unit_ref1c=_config_ref1c(
+            config,
+            "default_transfer_source_structural_unit_ref1c",
+        ),
+        destination_structural_unit_ref1c=_config_ref1c(
+            config,
+            "default_transfer_destination_structural_unit_ref1c",
+            DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C,
+        ),
+        vat_rate_ref1c=_config_ref1c(
+            config,
+            "default_stock_transfer_vat_rate_ref1c",
+            DEFAULT_STOCK_TRANSFER_VAT_RATE_REF1C,
+        ),
+    )
+
+
 def _existing_link(db: Session, issue_id: int) -> Optional[SyncLink]:
     return _find_sync_link(
         db,
@@ -83,6 +246,10 @@ def _existing_link(db: Session, issue_id: int) -> Optional[SyncLink]:
         source_id=int(issue_id),
         target_entity=STOCK_TRANSFER_ENTITY,
     )
+
+
+def _short_transfer_number(issue_id: int) -> str:
+    return f"MT{int(issue_id) % 1_000_000_000:09d}"
 
 
 def _collect_export_entries(
@@ -145,7 +312,7 @@ def _collect_export_entries(
 
         lines: List[StockTransferExportLine] = []
         bad_line = False
-        for ln in sorted(issue.lines, key=lambda x: x.line_id):
+        for line_number, ln in enumerate(sorted(issue.lines, key=lambda x: x.line_id), start=1):
             ref1c = _clean_ref1c(ln.component_item.item_ref1c) if ln.component_item else ""
             if not ref1c:
                 skipped.append(
@@ -158,13 +325,14 @@ def _collect_export_entries(
                 break
             lines.append(
                 StockTransferExportLine(
-                    line_number=int(ln.line_id),
+                    line_number=line_number,
                     component_item_id=int(ln.component_item_id),
                     item_ref1c=ref1c,
                     item_name=str(ln.component_item.item_name or "") if ln.component_item else "",
                     item_article=str(ln.component_item.item_article or "")
                     if ln.component_item
                     else "",
+                    unit_ref1c=_clean_ref1c(ln.unit or ln.component_item.unit) if ln.component_item else None,
                     qty=float(ln.required_qty or 0.0),
                 )
             )
@@ -174,7 +342,7 @@ def _collect_export_entries(
         entries.append(
             StockTransferExportEntry(
                 issue_id=int(issue.issue_id),
-                document_number=str(issue.document_number),
+                document_number=material_issue_number(db, issue),
                 product_id=int(issue.product_id),
                 order_id=int(issue.order_id),
                 order_ref1c=order_ref,
@@ -187,31 +355,43 @@ def _collect_export_entries(
     return entries, skipped
 
 
-def _build_header_payload(entry: StockTransferExportEntry) -> Dict[str, Any]:
+def _build_header_payload(
+    entry: StockTransferExportEntry,
+    defaults: Optional[StockTransferExportDefaults] = None,
+) -> Dict[str, Any]:
+    defaults = defaults or StockTransferExportDefaults()
     comment = (
         f"PRODPLAN source=material_issue/{entry.issue_id}; "
         f"order_id={entry.order_id}; product_id={entry.product_id}; "
         f"number={entry.document_number}"
     )
-    stock_lines = [
-        {
+    stock_lines = []
+    for ln in entry.lines:
+        row: Dict[str, Any] = {
             "LineNumber": ln.line_number,
             "Номенклатура_Key": ln.item_ref1c,
             "Количество": float(ln.qty),
+            "КлючСвязи": int(ln.line_number),
         }
-        for ln in entry.lines
-    ]
+        if defaults.vat_rate_ref1c:
+            row["СтавкаНДС_Key"] = defaults.vat_rate_ref1c
+        _add_unit_payload(row, ln.unit_ref1c)
+        stock_lines.append(row)
     payload: Dict[str, Any] = {
         "Number": entry.document_number,
-        "Date": _fmt_1c_datetime(date.today()),
+        "Date": _current_1c_datetime(),
         "Posted": False,
         "Комментарий": comment,
         "Запасы": stock_lines,
     }
-    if entry.source_warehouse_ref1c:
-        payload["СкладОтправитель_Key"] = entry.source_warehouse_ref1c
-    if entry.destination_warehouse_ref1c:
-        payload["СкладПолучатель_Key"] = entry.destination_warehouse_ref1c
+    if defaults.organization_ref1c:
+        payload["Организация_Key"] = defaults.organization_ref1c
+    source_unit = entry.source_warehouse_ref1c or defaults.source_structural_unit_ref1c
+    destination_unit = entry.destination_warehouse_ref1c or defaults.destination_structural_unit_ref1c
+    if source_unit:
+        payload["СтруктурнаяЕдиница_Key"] = source_unit
+    if destination_unit:
+        payload["СтруктурнаяЕдиницаПолучатель_Key"] = destination_unit
     # Per contract: ДокументОснование is mandatory for child documents.
     # _collect_export_entries guarantees order_ref1c is set; this assertion
     # protects against accidental drift if the collector ever changes.
@@ -350,6 +530,9 @@ def export_material_issues_to_1c(
             entry.reason = "уже выгружен в 1С (sync_link)"
             already_linked.append(entry)
             continue
+        if link and _clean_ref1c(link.target_ref_key):
+            entry.target_ref_key = _clean_ref1c(link.target_ref_key)
+            entry.reason = "повторная отправка: 1С-документ уже был создан, обновляем реквизиты"
         issue_row = (
             db.query(ProductionMaterialIssue)
             .filter(ProductionMaterialIssue.issue_id == entry.issue_id)
@@ -377,9 +560,12 @@ def export_material_issues_to_1c(
         "parent_orders_export": parent_export,
     }
 
+    config = _load_odata_config()
+    defaults = _export_defaults(config)
+
     payloads: List[Dict[str, Any]] = []
     for entry in eligible:
-        payload = _build_header_payload(entry)
+        payload = _build_header_payload(entry, defaults)
         payloads.append(
             {"issue_id": entry.issue_id, "number": entry.document_number, "payload": payload}
         )
@@ -390,11 +576,13 @@ def export_material_issues_to_1c(
         return summary
 
     client = _create_odata_client(
-        _load_odata_config(),
+        config,
         OData1CClient,
         allow_production=allow_production,
         require_demo_base=True,
     )
+    for entry, payload in zip(eligible, payloads):
+        add_source_cells_to_payload(client, entry, payload["payload"])
 
     created, errored = _post_export_entries(
         db,

@@ -719,6 +719,68 @@ def test_workshop_warehouse_binding_lifecycle(db_session):
     assert settings_after["workshop_warehouse_bindings"] == []
 
 
+def test_replace_settings_matches_frontend_contract(db_session):
+    from app.models import IgnoredWarehouse, ProductionResource, StockWarehouse, WorkshopWarehouseBinding
+    from app.services.production_control_settings import list_settings, replace_settings
+
+    workshop_a = ProductionResource(resource_name="Цех А")
+    workshop_b = ProductionResource(resource_name="Цех Б")
+    warehouse_a = StockWarehouse(
+        warehouse_ref1c="wh-a",
+        warehouse_code="A",
+        warehouse_name="Склад А",
+        is_selected=True,
+    )
+    warehouse_b = StockWarehouse(
+        warehouse_ref1c="wh-b",
+        warehouse_code="B",
+        warehouse_name="Склад Б",
+        is_selected=True,
+    )
+    workshop_location = StockWarehouse(
+        warehouse_ref1c="wh-workshop",
+        warehouse_code="W",
+        warehouse_name="Участок сборки модулей",
+        is_selected=True,
+    )
+    employee_location = StockWarehouse(
+        warehouse_ref1c="wh-person",
+        warehouse_code="P",
+        warehouse_name="Иванов Иван Иванович",
+        is_selected=True,
+    )
+    db_session.add_all([workshop_a, workshop_b, warehouse_a, warehouse_b, workshop_location, employee_location])
+    db_session.flush()
+
+    saved = replace_settings(
+        db_session,
+        workshop_warehouses=[
+            {"resource_id": workshop_a.resource_id, "warehouse_ref1c": "wh-a", "production_warehouse_ref1c": "wh-workshop"},
+            {"resource_id": workshop_b.resource_id, "warehouse_ref1c": "wh-b"},
+        ],
+        ignored_warehouses=[{"warehouse_ref1c": "wh-b"}],
+    )
+    assert [row["warehouse_ref1c"] for row in saved["warehouses"]] == ["wh-a", "wh-b", "wh-workshop"]
+    assert "wh-person" not in {row["warehouse_ref1c"] for row in saved["warehouses"]}
+    assert saved["workshop_warehouses"] == saved["workshop_warehouse_bindings"]
+    assert len(saved["workshop_warehouses"]) == 2
+    assert saved["workshop_warehouses"][0]["resource_id"] == saved["workshop_warehouses"][0]["workshop_id"]
+    assert saved["workshop_warehouses"][0]["production_warehouse_ref1c"] == "wh-workshop"
+    assert db_session.query(WorkshopWarehouseBinding).count() == 2
+    assert db_session.query(IgnoredWarehouse).count() == 1
+
+    replaced = replace_settings(
+        db_session,
+        workshop_warehouses=[{"resource_id": workshop_a.resource_id, "warehouse_ref1c": "wh-b"}],
+        ignored_warehouses=[],
+    )
+    assert len(replaced["workshop_warehouses"]) == 1
+    assert replaced["workshop_warehouses"][0]["warehouse_ref1c"] == "wh-b"
+    assert db_session.query(WorkshopWarehouseBinding).count() == 1
+    assert db_session.query(IgnoredWarehouse).count() == 0
+    assert "warehouses" in list_settings(db_session)
+
+
 def test_ignored_warehouse_lifecycle(db_session):
     from app.services.production_control_settings import (
         delete_ignored_warehouse,
@@ -869,6 +931,63 @@ def test_create_material_issues_uses_workshop_binding_when_warehouse_not_pinned(
         .one()
     )
     assert issue2.warehouse_ref1c == "bbbb2222-bbbb-2222-bbbb-222222222222"
+
+
+def test_create_material_issues_does_not_auto_select_destination_as_source(db_session):
+    from app.models import (
+        ItemWarehouseStock,
+        ProductionMaterialIssue,
+        ProductionResource,
+        StockWarehouse,
+        WorkshopWarehouseBinding,
+    )
+
+    workshop = ProductionResource(resource_name="Сварочный участок")
+    db_session.add(workshop)
+    db_session.flush()
+
+    parent = Item(item_code="SRC-PARENT", item_name="Parent", item_article="SRC-P", unit="шт", stock_qty=0, status="active")
+    comp_a = Item(item_code="SRC-A", item_name="Comp A", item_article="SRC-A", unit="шт", stock_qty=0, status="active")
+    comp_b = Item(item_code="SRC-B", item_name="Comp B", item_article="SRC-B", unit="шт", stock_qty=0, status="active")
+    db_session.add_all([parent, comp_a, comp_b])
+    db_session.flush()
+    spec = Specification(spec_name="SRC spec", spec_ref1c="src-spec")
+    db_session.add(spec)
+    db_session.flush()
+    db_session.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db_session.add_all([
+        SpecComponent(spec_id=spec.spec_id, item_id=comp_a.item_id, quantity=1),
+        SpecComponent(spec_id=spec.spec_id, item_id=comp_b.item_id, quantity=1),
+    ])
+
+    order = ProductionOrder(order_number="SRC-001", order_date=datetime(2026, 5, 20), is_posted=True, deletion_mark=False)
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(order_id=order.order_id, item_id=parent.item_id, line_number=1, quantity=1, produced_qty=0, remaining_qty=1)
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(ProductionOrderLineState(product_id=product.product_id, workshop_id=workshop.resource_id))
+    db_session.add(WorkshopWarehouseBinding(workshop_id=workshop.resource_id, warehouse_ref1c="WH-DEST"))
+    db_session.add_all([
+        StockWarehouse(warehouse_ref1c="WH-DEST", warehouse_code="DEST", warehouse_name="Участок сварочный", is_selected=True),
+        StockWarehouse(warehouse_ref1c="WH-A", warehouse_code="A", warehouse_name="Склад А", is_selected=True),
+        StockWarehouse(warehouse_ref1c="WH-B", warehouse_code="B", warehouse_name="Склад Б", is_selected=True),
+    ])
+    db_session.add_all([
+        ItemWarehouseStock(item_id=comp_a.item_id, warehouse_ref1c="WH-DEST", qty=10),
+        ItemWarehouseStock(item_id=comp_b.item_id, warehouse_ref1c="WH-DEST", qty=10),
+        ItemWarehouseStock(item_id=comp_a.item_id, warehouse_ref1c="WH-A", qty=5),
+        ItemWarehouseStock(item_id=comp_b.item_id, warehouse_ref1c="WH-B", qty=5),
+    ])
+    db_session.commit()
+
+    result = create_material_issues(db_session, [product.product_id], initiated_by="op")
+    [created] = result["created"]
+    issue = db_session.query(ProductionMaterialIssue).filter_by(issue_id=created["issue_id"]).one()
+
+    assert issue.warehouse_ref1c == "WH-DEST"
+    assert issue.source_warehouse_ref1c is None
+    assert {row["ref1c"] for row in created["warehouse_candidates"]} == {"WH-A", "WH-B"}
 
 
 # ---------------------------------------------------------------------------
