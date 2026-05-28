@@ -31,16 +31,20 @@ from .replenishment import REPLENISHMENT_FLOW_PRODUCTION, classify_replenishment
 
 
 DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
-# Plan: колонка "Обеспечение" вЂ” состояния обеспечения компонентами.
-# 'cancelled' добавлено как out-of-band статус для админских отмен.
+# Plan: line statuses shown in the production journal.
+# Legacy technical states are kept for compatibility and mapped to the compact
+# workshop-facing labels below.
 LINE_STATUSES = {
     "shortage",
     "partial",
     "ready",
     "to_move",
     "assembled",
+    "in_progress",
+    "done",
     "produced_partial",
     "produced",
+    "completed",
     "cancelled",
 }
 # 'exported' = PRODPLAN posted the draft into 1C (Posted=false there).
@@ -48,13 +52,21 @@ LINE_STATUSES = {
 ISSUE_STATUSES = {"not_requested", "requested", "issued", "exported", "posted", "error"}
 COVERAGE_LABELS = {
     "shortage": "Дефицит",
-    "partial": "Частично",
-    "ready": "Обеспечен",
+    "partial": "Дефицит",
+    "ready": "В работу",
     "to_move": "К перемещению",
-    "assembled": "Собрано",
-    "produced_partial": "Произведен частично",
-    "produced": "Произведен",
+    "assembled": "В работу",
+    "in_progress": "В работе",
+    "done": "Готов",
+    "produced_partial": "Готов",
+    "produced": "Готов",
+    "completed": "Завершён",
     "cancelled": "Отменен",
+}
+STATUS_FILTER_GROUPS = {
+    "shortage": ("shortage", "partial"),
+    "ready": ("ready", "assembled"),
+    "done": ("done", "produced_partial", "produced"),
 }
 
 
@@ -459,7 +471,8 @@ def list_journal(
     )
 
     if status:
-        query = query.filter(func.coalesce(ProductionOrderLineState.status, "shortage") == status)
+        status_values = STATUS_FILTER_GROUPS.get(str(status), (str(status),))
+        query = query.filter(func.coalesce(ProductionOrderLineState.status, "shortage").in_(status_values))
     if search:
         like = f"%{search.strip()}%"
         query = query.filter(
@@ -599,7 +612,7 @@ def update_line_state(db: Session, product_id: int, payload: Dict[str, Any]) -> 
         state.status = status
         # First time the journal moves the line past 'shortage' / 'partial',
         # stamp opened_at вЂ” it acts as a workshop-side timestamp.
-        if status in {"ready", "to_move", "assembled", "produced_partial", "produced"} and not state.opened_at:
+        if status in {"ready", "to_move", "assembled", "in_progress", "done", "produced_partial", "produced", "completed"} and not state.opened_at:
             state.opened_at = datetime.utcnow()
     if "issue_status" in payload and payload.get("issue_status"):
         issue_status = str(payload.get("issue_status")).strip()

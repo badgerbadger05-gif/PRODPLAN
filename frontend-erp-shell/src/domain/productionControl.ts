@@ -64,6 +64,18 @@ export type OrdersResponse = {
   latest_run_id?: number | null
 }
 
+export type EmployeeOption = {
+  employee_id: number
+  employee_ref1c: string
+  employee_code?: string | null
+  employee_name: string
+}
+
+export type EmployeesResponse = {
+  rows: EmployeeOption[]
+  total: number
+}
+
 export type MaterialsResponse = {
   order_number?: string
   item_name?: string
@@ -181,26 +193,27 @@ export type MaterialIssueDetail = TransferIssueRow & {
   }>
 }
 
-export const productionStatuses = [
+export const productionStatusOptions = [
   ['shortage', 'Дефицит'],
-  ['partial', 'Частично'],
-  ['ready', 'Обеспечен'],
   ['to_move', 'К перемещению'],
-  ['assembled', 'Собрано'],
-  ['produced_partial', 'Произведен частично'],
-  ['produced', 'Произведен'],
-  ['cancelled', 'Отменен'],
+  ['ready', 'В работу'],
+  ['in_progress', 'В работе'],
+  ['done', 'Готов'],
+  ['completed', 'Завершён'],
 ] as const
 
 export const coverageLabels: Record<string, string> = {
   unknown: 'Неизвестно',
   shortage: 'Дефицит',
-  partial: 'Частично',
-  ready: 'Обеспечен',
+  partial: 'Дефицит',
+  ready: 'В работу',
   to_move: 'К перемещению',
-  assembled: 'Собрано',
-  produced_partial: 'Произведен частично',
-  produced: 'Произведен',
+  assembled: 'В работу',
+  in_progress: 'В работе',
+  done: 'Готов',
+  produced_partial: 'Готов',
+  produced: 'Готов',
+  completed: 'Завершён',
 }
 
 export type ProductionFilters = {
@@ -212,5 +225,12 @@ export type ProductionFilters = {
 }
 
 export function productionStatusLabel(value: string) {
-  return productionStatuses.find((row) => row[0] === value)?.[1] ?? value
+  return coverageLabels[value] ?? value
+}
+
+export function productionStatusSelectValue(value: string) {
+  if (value === 'partial') return 'shortage'
+  if (value === 'assembled') return 'ready'
+  if (value === 'produced' || value === 'produced_partial') return 'done'
+  return productionStatusOptions.some(([status]) => status === value) ? value : ''
 }

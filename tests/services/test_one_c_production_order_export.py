@@ -99,12 +99,23 @@ class _FakeClient:
         self.ref_key = ref_key
         self.fail = fail
         self.posts: list = []
+        self.patches: list = []
+        self.operations: list = []
 
     def post(self, entity, payload, **_kwargs):
         self.posts.append((entity, payload))
         if self.fail:
             raise RuntimeError("simulated 1C failure")
         return {"Ref_Key": self.ref_key}
+
+    def patch(self, entity_ref, payload, **_kwargs):
+        self.patches.append((entity_ref, payload))
+        if self.fail:
+            raise RuntimeError("simulated 1C failure")
+        return {}
+
+    def post_operation(self, operation_path):
+        self.operations.append(operation_path)
 
 
 def _stub_odata_config(monkeypatch, *, base_url: str) -> None:
@@ -323,6 +334,43 @@ def test_second_export_is_noop_due_to_existing_link(db_session, monkeypatch):
     assert result["orders_created"] == 0
     assert result["orders_already_linked"] == 1
     assert len(fake.posts) == 1  # no additional POST
+
+
+def test_existing_error_link_with_ref_patches_not_posts_duplicate(db_session, monkeypatch):
+    db = db_session
+    item = _mk_item(db, code="P4R", ref1c="44444444-4444-4444-4444-44444444444a")
+    run = _mk_run(db)
+    order = _mk_mrp_order(db, item, run_id=run.run_id)
+
+    db.add(SyncLink(
+        source_system="PRODPLAN",
+        source_doctype="production_order",
+        source_id=order.order_id,
+        target_system="1C",
+        target_entity=exporter.PRODUCTION_ORDER_ENTITY,
+        target_number="PP-RETRY",
+        payload_hash="old-hash",
+        target_ref_key="existing-order-ref",
+        status="error",
+        last_error="post failed after create",
+    ))
+    db.commit()
+
+    _stub_odata_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    fake = _FakeClient(ref_key="new-ref-should-not-be-used")
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    result = exporter.export_production_orders_to_1c(db, [order.order_id], dry_run=False)
+
+    assert result["orders_created"] == 1
+    assert fake.posts == []
+    assert len(fake.patches) == 1
+    assert fake.patches[0][0] == "Document_ЗаказНаПроизводство(guid'existing-order-ref')"
+    assert fake.operations == [
+        "Document_ЗаказНаПроизводство(guid'existing-order-ref')/Post?PostingModeOperational=true"
+    ]
+    db.refresh(order)
+    assert order.order_ref1c == "existing-order-ref"
 
 
 def test_skipped_rows_for_invalid_orders(db_session, monkeypatch):

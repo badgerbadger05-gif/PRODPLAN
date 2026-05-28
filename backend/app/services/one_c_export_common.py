@@ -228,11 +228,12 @@ def post_export_entries(
             entry.status = "error"
             entry.error = str(exc)
             errored += 1
+            existing_ref_key = clean_ref1c(getattr(entry, "target_ref_key", None))
             try:
                 upsert_link(
                     entry=entry,
                     payload_hash=payload_hash(payload),
-                    target_ref_key=None,
+                    target_ref_key=existing_ref_key or None,
                     status="error",
                     last_error=str(exc),
                 )

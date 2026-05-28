@@ -1,12 +1,51 @@
 # Инструкция по развертыванию и обновлению prodplan
 
+> Важно: это шпаргалка по **старому** продплану в Docker (`/opt/prodplan`, порт
+> `9000`). Для текущего `PRODPLAN-NEXT` используй `docs/test-prod-deploy.md`:
+> сервер `mtzdock.lan`, путь `/home/barsukov/prodplan-next`, compose-файл
+> `docker-compose.test.yml`, проект `prodplan-next-test`, frontend `9010`,
+> backend `8010`, PostgreSQL host port `55433`.
+
+## Что смотреть в первую очередь
+
+### Текущий PRODPLAN-NEXT
+```bash
+ssh barsukov@mtzdock.lan
+cd /home/barsukov/prodplan-next
+docker compose -f docker-compose.test.yml ps
+docker compose -f docker-compose.test.yml logs --tail=120 frontend
+curl -I http://localhost:9010
+curl -I http://localhost:8010/health
+```
+
+Открывать в браузере:
+
+```text
+http://mtzdock.lan:9010
+```
+
+### Старый продплан
+```bash
+ssh barsukov@mtzdock.lan
+cd /opt/prodplan
+docker compose ps
+```
+
+Открывать в браузере:
+
+```text
+http://mtzdock.lan:9000
+```
+
 ## Информация о сервере
 
 - **Адрес:** `mtzdock.lan` (10.36.0.12)
 - **Пользователь:** `barsukov`
 - **Пароль:** `Chai3rae`
-- **Путь к проекту:** `/opt/prodplan`
-- **Веб-интерфейс:** http://mtzdock.lan:9000 или http://10.36.0.12:9000
+- **Путь к старому проекту:** `/opt/prodplan`
+- **Старый веб-интерфейс:** http://mtzdock.lan:9000 или http://10.36.0.12:9000
+- **Путь к текущему PRODPLAN-NEXT:** `/home/barsukov/prodplan-next`
+- **Текущий веб-интерфейс:** http://mtzdock.lan:9010 или http://10.36.0.12:9010
 
 ## Подключение к серверу
 

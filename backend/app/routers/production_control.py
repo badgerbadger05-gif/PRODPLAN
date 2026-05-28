@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Annotated, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ..database import get_db
+from ..models import Employee
 from ..schemas import ODataSyncRequest
 from ..services.one_c_manufacture_export import export_manufactures_to_1c
 from ..services.one_c_piecework_export import export_piecework_to_1c
@@ -30,11 +31,47 @@ from ..services.production_control_journal import (
 )
 from ..services.production_control_material_availability import preview_materials
 from ..services.production_control_printing import mark_route_sheets_printed, render_route_sheets_html
-from ..services.production_control_production_flow import produce_line, return_leftover_components
+from ..services.production_control_production_flow import (
+    produce_line,
+    return_leftover_components,
+    rollback_local_manufacture,
+)
 from .production_control_settings import router as settings_router
 
 
 router = APIRouter(prefix="/v1/production-control", tags=["production-control"])
+
+
+@router.get("/employees", response_model=dict)
+def list_employees(
+    search: Optional[str] = None,
+    limit: Annotated[int, Query(ge=1, le=1000)] = 500,
+    db: Session = Depends(get_db),
+):
+    query = db.query(Employee).filter(Employee.deletion_mark.is_(False))
+    if search:
+        pattern = f"%{search.strip()}%"
+        query = query.filter(
+            (Employee.employee_name.ilike(pattern))
+            | (Employee.employee_code.ilike(pattern))
+        )
+    rows = (
+        query.order_by(Employee.employee_name.asc(), Employee.employee_code.asc())
+        .limit(int(limit))
+        .all()
+    )
+    return {
+        "rows": [
+            {
+                "employee_id": int(row.employee_id),
+                "employee_ref1c": row.employee_ref1c,
+                "employee_code": row.employee_code,
+                "employee_name": row.employee_name,
+            }
+            for row in rows
+        ],
+        "total": len(rows),
+    }
 
 
 class LineStatePayload(BaseModel):
@@ -97,7 +134,7 @@ class ExportManufacturesPayload(BaseModel):
 
 class ExportPieceworkPayload(BaseModel):
     manufacture_ids: List[int]
-    operation_ref: str
+    operation_ref: Optional[str] = None
     time_norm: float = 0.0
     price: float = 0.0
     organization_ref: Optional[str] = None
@@ -243,23 +280,35 @@ def post_export_manufactures_to_1c(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.post("/manufactures/{manufacture_id}/rollback-local", response_model=dict)
+def post_rollback_local_manufacture(
+    manufacture_id: int,
+    db: Session = Depends(get_db),
+):
+    try:
+        return rollback_local_manufacture(db, int(manufacture_id))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/manufactures/export-piecework-to-1c", response_model=dict)
 def post_export_piecework_to_1c(
     payload: ExportPieceworkPayload,
     db: Session = Depends(get_db),
 ):
     """
-    Bulk-экспорт выпусков в 1С как Document_СдельныйНаряд (Posted=false).
+    Bulk-экспорт выпусков в 1С как Document_СдельныйНаряд.
     Идемпотентно через sync_link (source_doctype='piecework').
 
     Требование: каждый manufacture должен быть уже выгружен как
     Document_СборкаЗапасов (поле exported_ref1c заполнено) — он используется
-    как ДокументОснование сдельного наряда.
+    как ДокументОснование сдельного наряда. Операция по умолчанию берется
+    из спецификации выпуска; operation_ref нужен только для ручного override.
     """
     if not payload.manufacture_ids:
         raise HTTPException(status_code=400, detail="Не выбраны выпуски")
-    if not payload.operation_ref:
-        raise HTTPException(status_code=400, detail="Не указан operation_ref")
     try:
         return export_piecework_to_1c(
             db,

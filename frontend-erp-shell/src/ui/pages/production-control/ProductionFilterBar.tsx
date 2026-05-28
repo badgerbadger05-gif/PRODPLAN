@@ -1,4 +1,4 @@
-import { productionStatuses, type ProductionFilters } from '../../../domain/productionControl'
+import { productionStatusOptions, type ProductionFilters } from '../../../domain/productionControl'
 import type { ProductionResource } from '../../../domain/resources'
 
 type Props = {
@@ -19,7 +19,7 @@ export function ProductionFilterBar({ filters, resources, onChange, onSubmit }: 
         <span>Статус</span>
         <select value={filters.status} onChange={(e) => onChange({ ...filters, status: e.target.value })}>
           <option value="">Все</option>
-          {productionStatuses.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+          {productionStatusOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
         </select>
       </label>
       <label>

@@ -3,6 +3,8 @@ import {
   coverageLabels,
   type ControlSettings,
   type ControlWarehouse,
+  type EmployeeOption,
+  type EmployeesResponse,
   type MaterialIssueCreateResponse,
   type MaterialsResponse,
   type OrderRow,
@@ -46,9 +48,12 @@ export function ProductionControlPage() {
   const [ignoredRefs, setIgnoredRefs] = useState<Set<string>>(new Set())
   const [produceOpen, setProduceOpen] = useState(false)
   const [produceQty, setProduceQty] = useState('')
-  const [producePerformer, setProducePerformer] = useState('')
+  const [produceEmployeeRef, setProduceEmployeeRef] = useState('')
+  const [employees, setEmployees] = useState<EmployeeOption[]>([])
+  const [employeesLoading, setEmployeesLoading] = useState(false)
   const [produceDryRun, setProduceDryRun] = useState(false)
   const [produceSaving, setProduceSaving] = useState(false)
+  const [produceError, setProduceError] = useState('')
   const [produceDryRunPayload, setProduceDryRunPayload] = useState<string | null>(null)
   const [warehousePickerOpen, setWarehousePickerOpen] = useState(false)
   const [warehousePickerCandidates, setWarehousePickerCandidates] = useState<WarehouseCandidate[]>([])
@@ -65,6 +70,12 @@ export function ProductionControlPage() {
 
   const activeRow = useMemo(() => rows.find((row) => row.product_id === activeId) ?? rows[0] ?? null, [rows, activeId])
   const selectedRows = useMemo(() => rows.filter((row) => selectedIds.has(row.product_id)), [rows, selectedIds])
+  const selectedEmployee = useMemo(
+    () => employees.find((employee) => employee.employee_ref1c === produceEmployeeRef) ?? null,
+    [employees, produceEmployeeRef],
+  )
+  const activeRemainingQty = Number(activeRow?.remaining_qty ?? 0)
+  const canProduceActiveRow = Boolean(activeRow && activeRemainingQty > 0)
 
   const load = useCallback(async (nextOffset: number) => {
     setLoading(true)
@@ -98,6 +109,18 @@ export function ProductionControlPage() {
       setResources(await listResources())
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
+    }
+  }, [])
+
+  const loadEmployees = useCallback(async () => {
+    setEmployeesLoading(true)
+    try {
+      const data = await api<EmployeesResponse>('/v1/production-control/employees')
+      setEmployees(data.rows ?? [])
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setEmployeesLoading(false)
     }
   }, [])
 
@@ -303,17 +326,31 @@ export function ProductionControlPage() {
 
   function openProduceDialog() {
     if (!activeRow) return
+    const remaining = Number(activeRow.remaining_qty ?? 0)
+    if (remaining <= 0) {
+      setError('Эта строка уже произведена полностью. Открывать выпуск нечего.')
+      setProduceOpen(false)
+      return
+    }
     setProduceQty(String(activeRow.remaining_qty ?? activeRow.quantity ?? 0))
-    setProducePerformer('')
+    setProduceEmployeeRef('')
     setProduceDryRun(false)
+    setProduceError('')
     setProduceDryRunPayload(null)
     setProduceOpen(true)
+    void loadEmployees()
   }
 
   async function submitProduce() {
     if (!activeRow) return
+    if (Number(activeRow.remaining_qty ?? 0) <= 0) {
+      setError('Эта строка уже произведена полностью. Открывать выпуск нечего.')
+      setProduceOpen(false)
+      return
+    }
     setProduceSaving(true)
     setError('')
+    setProduceError('')
     setProduceDryRunPayload(null)
     try {
       // Step 1: record manufacture locally (bumps produced_qty / remaining_qty).
@@ -323,15 +360,23 @@ export function ProductionControlPage() {
           method: 'POST',
           body: JSON.stringify({
             qty: Number(produceQty) || 0,
-            executor: producePerformer || undefined,
+            executor: selectedEmployee?.employee_name || undefined,
           }),
         },
       )
       const manufacture_id = Number(localResult.manufacture_id)
 
       if (produceDryRun) {
-        // Show what would go to 1C without actually sending.
-        setProduceDryRunPayload(JSON.stringify(localResult, null, 2))
+        const dryRunResult = await api<Record<string, unknown>>(
+          '/v1/production-control/manufactures/export-to-1c',
+          {
+            method: 'POST',
+            body: JSON.stringify({ manufacture_ids: [manufacture_id], dry_run: true, allow_production: false }),
+          },
+        )
+        await api(`/v1/production-control/manufactures/${manufacture_id}/rollback-local`, { method: 'POST' })
+        setProduceDryRunPayload(JSON.stringify(dryRunResult, null, 2))
+        await load(offsetRef.current)
         return
       }
 
@@ -344,16 +389,47 @@ export function ProductionControlPage() {
         },
       )
       const created1c = Number(exportResult.manufactures_created ?? 0)
+      const errored = Number(exportResult.manufactures_error ?? 0)
       const ref = (exportResult.entries as Array<Record<string, unknown>>)?.[0]?.target_ref_key
+      if (errored > 0 || created1c < 1 || !ref) {
+        await api(`/v1/production-control/manufactures/${manufacture_id}/rollback-local`, { method: 'POST' })
+        const entries = (exportResult.entries as Array<Record<string, unknown>>) ?? []
+        const exportError = entries.map((entry) => entry.error || entry.reason).find(Boolean)
+        throw new Error(String(exportError || '1C не создала документ выпуска; локальный выпуск откатан'))
+      }
+      const pieceworkResult = await api<Record<string, unknown>>(
+        '/v1/production-control/manufactures/export-piecework-to-1c',
+        {
+          method: 'POST',
+          body: JSON.stringify({ manufacture_ids: [manufacture_id], dry_run: false, allow_production: false }),
+        },
+      )
+      const pieceworkCreated = Number(pieceworkResult.manufactures_created ?? 0)
+      const pieceworkErrored = Number(pieceworkResult.manufactures_error ?? 0)
+      const pieceworkEntry = ((pieceworkResult.entries as Array<Record<string, unknown>>) ?? [])[0]
+      if (pieceworkErrored > 0 || pieceworkCreated < 1 || !pieceworkEntry?.target_ref_key) {
+        const exportError = pieceworkEntry?.error || pieceworkEntry?.reason || '1C не создала сдельный наряд'
+        throw new Error(`Производство создано в 1С, но сдельный наряд не создан: ${String(exportError)}`)
+      }
+      const manufactureNumber = String(((exportResult.entries as Array<Record<string, unknown>>) ?? [])[0]?.number ?? '')
+      const pieceworkNumber = String(pieceworkEntry.number ?? '')
       setMessage(
-        `Произведено: ${localResult.qty}, осталось: ${localResult.remaining_qty}.` +
-        (created1c ? ` СборкаЗапасов создана${ref ? `: ${String(ref).slice(0, 8)}…` : ''}` : ''),
+        `Создано в 1С: производство ${manufactureNumber || String(ref).slice(0, 8)} ` +
+        `(${String(ref).slice(0, 8)}…), сдельный наряд ${pieceworkNumber || String(pieceworkEntry.target_ref_key).slice(0, 8)} ` +
+        `(${String(pieceworkEntry.target_ref_key).slice(0, 8)}…). ` +
+        `Произведено: ${localResult.qty}, осталось: ${localResult.remaining_qty}.`,
       )
       setProduceOpen(false)
       setSelectedIds(new Set())
       await load(offsetRef.current)
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      const text = e instanceof Error ? e.message : String(e)
+      setError(text)
+      setProduceError(text)
+      if (text.includes('remaining_qty=0') || text.includes('уже произведена полностью')) {
+        setProduceOpen(false)
+        await load(offsetRef.current)
+      }
     } finally {
       setProduceSaving(false)
     }
@@ -521,6 +597,10 @@ export function ProductionControlPage() {
           <div className="dialogBox">
             <div className="dialogHeader">Произвести - {activeRow.item_name}</div>
             <div className="dialogBody">
+              {produceError && <div className="dialogError">{produceError}</div>}
+              {!canProduceActiveRow && (
+                <div className="fieldHint danger">Эта строка уже произведена полностью.</div>
+              )}
               <div className="dialogField">
                 <label>Количество ({activeRow.unit || 'шт'})</label>
                 <input
@@ -533,14 +613,22 @@ export function ProductionControlPage() {
                 />
               </div>
               <div className="dialogField">
-                <label>Исполнитель (имя, войдёт в комментарий)</label>
-                <input
-                  type="text"
-                  value={producePerformer}
-                  onChange={(e) => setProducePerformer(e.target.value)}
-                  placeholder="Иванов И.И."
-                  disabled={produceSaving}
-                />
+                <label>Исполнитель</label>
+                <select
+                  value={produceEmployeeRef}
+                  onChange={(e) => setProduceEmployeeRef(e.target.value)}
+                  disabled={produceSaving || employeesLoading}
+                >
+                  <option value="">{employeesLoading ? 'Загрузка сотрудников...' : 'Выберите сотрудника'}</option>
+                  {employees.map((employee) => (
+                    <option key={employee.employee_ref1c} value={employee.employee_ref1c}>
+                      {employee.employee_name}{employee.employee_code ? ` (${employee.employee_code})` : ''}
+                    </option>
+                  ))}
+                </select>
+                {!employeesLoading && employees.length === 0 && (
+                  <div className="fieldHint">Список пуст. Запустите синхронизацию сотрудников в разделе «Синхронизация».</div>
+                )}
               </div>
               <div className="dialogCheckRow">
                 <input
@@ -556,7 +644,11 @@ export function ProductionControlPage() {
             </div>
             <div className="dialogFooter">
               <button onClick={() => setProduceOpen(false)} disabled={produceSaving}>Отмена</button>
-              <button className="primary" onClick={() => void submitProduce()} disabled={produceSaving}>
+              <button
+                className="primary"
+                onClick={() => void submitProduce()}
+                disabled={!canProduceActiveRow || produceSaving || employeesLoading || (employees.length > 0 && !produceEmployeeRef)}
+              >
                 {produceSaving ? 'Создаём...' : produceDryRun ? 'Показать payload' : 'Создать в 1С'}
               </button>
             </div>

@@ -1,4 +1,4 @@
-import { coverageLabels, productionStatuses, type OrderRow } from '../../../domain/productionControl'
+import { coverageLabels, productionStatusOptions, productionStatusSelectValue, type OrderRow } from '../../../domain/productionControl'
 import { dateRu, qty } from '../../../lib/format'
 
 type Props = {
@@ -75,8 +75,8 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, onSelectId
               <ForecastShift row={row} />
             </td>
             <td>
-              <select value={row.status} onChange={(e) => onChangeStatus(row, e.target.value)} onClick={(e) => e.stopPropagation()}>
-                {productionStatuses.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+              <select value={productionStatusSelectValue(row.status)} onChange={(e) => onChangeStatus(row, e.target.value)} onClick={(e) => e.stopPropagation()}>
+                {productionStatusOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
               </select>
             </td>
             <td>

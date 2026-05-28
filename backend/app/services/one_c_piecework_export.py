@@ -6,7 +6,7 @@ Documentation: .docs/piecework_order_odata.md.
 Safety per the doc:
 1. Default dry_run=True.
 2. Refuse non-demo base_url unless allow_production=True.
-3. Posted=false. Posting stays on 1C admin side.
+3. Create as not posted, then close and conduct through standard 1C Post operation.
 4. Idempotency via sync_link (source_doctype='piecework').
 
 Basis rule (from piecework_order_odata.md):
@@ -32,13 +32,25 @@ from ..models import (
     ProductionManufacture,
     ProductionOrder,
     ProductionProduct,
+    Employee,
+    Operation,
+    ProductionStage,
+    ResourceStage,
+    Specification,
+    SpecOperation,
     SyncLink,
+    WorkshopWarehouseBinding,
 )
 from .one_c_export_common import (
+    DEFAULT_ORGANIZATION_REF1C,
+    DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C,
+    add_unit_payload as _add_unit_payload,
     clean_ref1c as _clean_ref1c,
+    config_ref1c as _config_ref1c,
     create_odata_client as _create_odata_client,
-    fmt_1c_datetime as _fmt_1c_datetime,
+    current_1c_datetime as _current_1c_datetime,
     find_sync_link as _find_sync_link,
+    post_document_operational as _post_document_operational,
     post_export_entries as _post_export_entries,
     upsert_sync_link as _upsert_sync_link,
 )
@@ -62,8 +74,16 @@ class PieceworkExportEntry:
     basis_ref1c: Optional[str]
     item_ref1c: str
     item_name: str
+    unit_ref1c: Optional[str]
     qty: float
     number: str
+    operation_ref1c: Optional[str] = None
+    time_norm: float = 0.0
+    spec_ref1c: Optional[str] = None
+    stage_ref1c: Optional[str] = None
+    structural_unit_ref1c: Optional[str] = None
+    employee_ref1c: Optional[str] = None
+    document_datetime: Optional[str] = None
     target_ref_key: Optional[str] = None
     status: str = "planned"
     error: Optional[str] = None
@@ -130,6 +150,59 @@ def _collect_export_entries(
             })
             continue
 
+        operation_ref = None
+        time_norm = 0.0
+        stage_ref = None
+        structural_unit_ref = None
+        spec_ref = None
+        if m.product and m.product.spec_id:
+            spec = db.query(Specification).filter(Specification.spec_id == int(m.product.spec_id)).one_or_none()
+            spec_ref = _clean_ref1c(getattr(spec, "spec_ref1c", None)) or None
+            spec_operation = (
+                db.query(SpecOperation, Operation)
+                .join(Operation, Operation.operation_id == SpecOperation.operation_id)
+                .filter(SpecOperation.spec_id == int(m.product.spec_id))
+                .filter(Operation.operation_ref1c.isnot(None))
+                .order_by(SpecOperation.spec_operation_id.asc())
+                .first()
+            )
+            if spec_operation:
+                so, op = spec_operation
+                operation_ref = _clean_ref1c(op.operation_ref1c) or None
+                time_norm = float(so.time_norm or 0)
+                if so.stage_id:
+                    stage = db.query(ProductionStage).filter(ProductionStage.stage_id == int(so.stage_id)).one_or_none()
+                    stage_ref = _clean_ref1c(getattr(stage, "stage_ref1c", None)) or None
+                    resource_stage = (
+                        db.query(ResourceStage)
+                        .filter(ResourceStage.stage_id == int(so.stage_id))
+                        .order_by(ResourceStage.id.asc())
+                        .first()
+                    )
+                    if resource_stage:
+                        binding = (
+                            db.query(WorkshopWarehouseBinding)
+                            .filter(WorkshopWarehouseBinding.workshop_id == int(resource_stage.resource_id))
+                            .one_or_none()
+                        )
+                        if binding:
+                            structural_unit_ref = (
+                                _clean_ref1c(binding.production_warehouse_ref1c)
+                                or _clean_ref1c(binding.warehouse_ref1c)
+                                or None
+                            )
+
+        employee_ref = None
+        if m.executor:
+            employee = (
+                db.query(Employee)
+                .filter(Employee.employee_name == str(m.executor))
+                .filter(Employee.deletion_mark.is_(False))
+                .one_or_none()
+            )
+            if employee:
+                employee_ref = _clean_ref1c(employee.employee_ref1c) or None
+
         entries.append(PieceworkExportEntry(
             manufacture_id=int(m.manufacture_id),
             product_id=int(m.product_id),
@@ -138,7 +211,14 @@ def _collect_export_entries(
             basis_ref1c=basis_ref,
             item_ref1c=item_ref,
             item_name=str(item.item_name or "") if item else "",
+            unit_ref1c=_clean_ref1c(item.unit) if item else None,
             qty=float(m.qty or 0),
+            operation_ref1c=operation_ref,
+            time_norm=time_norm,
+            spec_ref1c=spec_ref or None,
+            stage_ref1c=stage_ref,
+            structural_unit_ref1c=structural_unit_ref,
+            employee_ref1c=employee_ref,
             number=piecework_number(db, m),
         ))
 
@@ -155,7 +235,15 @@ def _build_header_payload(
     structural_unit_ref: Optional[str] = None,
     business_operation_ref: Optional[str] = None,
 ) -> Dict[str, Any]:
-    when = _fmt_1c_datetime(date.today())
+    when = entry.document_datetime or _current_1c_datetime()
+    entry.document_datetime = when
+    operation_ref = _clean_ref1c(operation_ref) or entry.operation_ref1c
+    if not operation_ref:
+        raise ValueError(
+            f"manufacture_id={entry.manufacture_id}: не найдена операция спецификации для сдельного наряда"
+        )
+    time_norm = float(time_norm or entry.time_norm or 0.0)
+    structural_unit_ref = structural_unit_ref or entry.structural_unit_ref1c
     link_key = int(entry.manufacture_id) % 2_000_000_000
     hours = entry.qty * time_norm
     cost = entry.qty * price
@@ -183,12 +271,23 @@ def _build_header_payload(
         operation_row["ЗаказНаПроизводство_Key"] = entry.order_ref1c
     if structural_unit_ref:
         operation_row["СтруктурнаяЕдиница_Key"] = structural_unit_ref
+    if entry.spec_ref1c:
+        operation_row["Спецификация_Key"] = entry.spec_ref1c
+    if entry.stage_ref1c:
+        operation_row["Этап_Key"] = entry.stage_ref1c
+    if structural_unit_ref:
+        operation_row["ПодразделениеЗавершающегоЭтапа_Key"] = structural_unit_ref
+    _add_unit_payload(operation_row, entry.unit_ref1c)
+    if entry.employee_ref1c:
+        operation_row["Исполнитель"] = entry.employee_ref1c
+        operation_row["Исполнитель_Type"] = "StandardODATA.Catalog_Сотрудники"
 
     payload: Dict[str, Any] = {
         "Number": entry.number,
         "Date": when,
         "Posted": False,
-        "Закрыт": False,
+        "Закрыт": True,
+        "ДатаЗакрытия": when,
         "Комментарий": comment,
         "Операции": [operation_row],
     }
@@ -203,6 +302,18 @@ def _build_header_payload(
         payload["СтруктурнаяЕдиница_Key"] = structural_unit_ref
     if business_operation_ref:
         payload["ХозяйственнаяОперация_Key"] = business_operation_ref
+    if entry.employee_ref1c:
+        payload["Исполнитель"] = entry.employee_ref1c
+        payload["Исполнитель_Type"] = "StandardODATA.Catalog_Сотрудники"
+        payload["СоставБригады"] = [
+            {
+                "LineNumber": 1,
+                "Сотрудник_Key": entry.employee_ref1c,
+                "КТУ": 1,
+                "КлючСвязи": link_key,
+                **({"СтруктурнаяЕдиница_Key": structural_unit_ref} if structural_unit_ref else {}),
+            }
+        ]
 
     return payload
 
@@ -268,7 +379,7 @@ def export_piecework_to_1c(
     db: Session,
     manufacture_ids: List[int],
     *,
-    operation_ref: str,
+    operation_ref: Optional[str] = None,
     time_norm: float = 0.0,
     price: float = 0.0,
     organization_ref: Optional[str] = None,
@@ -279,7 +390,9 @@ def export_piecework_to_1c(
 ) -> Dict[str, Any]:
     """
     Export selected ProductionManufactures to 1C as Document_СдельныйНаряд
-    with Posted=false. Idempotent via sync_link (source_doctype='piecework').
+    The document is closed with the same Date/ДатаЗакрытия value and then
+    conducted through 1C OData Post. Idempotent via sync_link
+    (source_doctype='piecework').
 
     Enforces the full chain: parent ProductionManufacture is auto-exported as
     Document_СборкаЗапасов first (which itself ensures Document_ЗаказНаПроизводство
@@ -300,6 +413,9 @@ def export_piecework_to_1c(
             entry.reason = "уже выгружен в 1С (sync_link)"
             already_linked.append(entry)
             continue
+        if link and _clean_ref1c(link.target_ref_key):
+            entry.target_ref_key = _clean_ref1c(link.target_ref_key)
+            entry.reason = "повторная отправка: 1С-документ уже был создан, обновляем реквизиты и проводим"
         eligible.append(entry)
 
     summary: Dict[str, Any] = {
@@ -315,6 +431,14 @@ def export_piecework_to_1c(
         "entries": [],
         "parent_manufactures_export": parent_export,
     }
+
+    config = _load_odata_config()
+    organization_ref = organization_ref or _config_ref1c(
+        config, "default_organization_ref1c", DEFAULT_ORGANIZATION_REF1C
+    )
+    structural_unit_ref = structural_unit_ref or _config_ref1c(
+        config, "default_production_structural_unit_ref1c", DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C
+    )
 
     payloads: List[Dict[str, Any]] = []
     for entry in eligible:
@@ -335,11 +459,31 @@ def export_piecework_to_1c(
         return summary
 
     client = _create_odata_client(
-        _load_odata_config(),
+        config,
         OData1CClient,
         allow_production=allow_production,
         require_demo_base=True,
     )
+
+    def _mark_success(entry: PieceworkExportEntry, ref_key: str) -> None:
+        _post_document_operational(
+            client,
+            entity=PIECEWORK_ENTITY,
+            ref_key=ref_key,
+            unpost_first=False,
+        )
+        # 1C can move Date to the posting moment. Keep the business timestamp
+        # identical to creation time and mark the order closed explicitly.
+        patch = getattr(client, "patch", None)
+        if patch is not None and entry.document_datetime:
+            patch(
+                f"{PIECEWORK_ENTITY}(guid'{ref_key}')",
+                {
+                    "Date": entry.document_datetime,
+                    "Закрыт": True,
+                    "ДатаЗакрытия": entry.document_datetime,
+                },
+            )
 
     created, errored = _post_export_entries(
         db,
@@ -348,7 +492,7 @@ def export_piecework_to_1c(
         target_entity=PIECEWORK_ENTITY,
         missing_ref_error=f"1C did not return Ref_Key for new {PIECEWORK_ENTITY}",
         upsert_link=lambda **kwargs: _upsert_link(db, **kwargs),
-        on_success=lambda entry, ref_key: None,
+        on_success=_mark_success,
         on_error=lambda entry, error: None,
         log_error=lambda entry: (
             f"[1C piecework export] manufacture_id={entry.manufacture_id} failed: {entry.error}"

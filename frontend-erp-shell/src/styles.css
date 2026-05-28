@@ -449,6 +449,9 @@ input:focus, select:focus {
 .pill.ready, .miniPill.ready { background: #e7f6ee; border-color: #9bd0b4; color: var(--green); }
 .pill.to_move, .miniPill.to_move { background: #e6f0ff; border-color: #9cbce8; color: var(--blue); }
 .pill.assembled, .miniPill.assembled { background: #ece8ff; border-color: #8f79e8; color: #4b2bbf; }
+.pill.in_progress, .miniPill.in_progress { background: #fff6dc; border-color: #d8b35d; color: #7a4c00; }
+.pill.done, .miniPill.done { background: #e7f7f4; border-color: #9fd3cd; color: #0f766e; }
+.pill.completed, .miniPill.completed { background: #eef1f5; border-color: #9aa6b2; color: #334155; }
 .pill.produced, .pill.produced_partial,
 .miniPill.produced, .miniPill.produced_partial { background: #e7f7f4; border-color: #9fd3cd; color: #0f766e; }
 .pill.success { background: #e7f6ee; border-color: #9bd0b4; color: var(--green); }
@@ -1369,11 +1372,31 @@ input:focus, select:focus {
 }
 
 .dialogField input[type="number"],
-.dialogField input[type="text"] {
+.dialogField input[type="text"],
+.dialogField select {
   height: 28px;
   padding: 5px 8px;
   border: 1px solid var(--line);
   font-size: 14px;
+}
+
+.fieldHint {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.fieldHint.danger,
+.dialogError {
+  color: #8b1e1e;
+}
+
+.dialogError {
+  border: 1px solid #d99;
+  background: #fff0f0;
+  padding: 8px 10px;
+  font-size: 13px;
+  line-height: 1.35;
 }
 
 .dialogCheckRow {

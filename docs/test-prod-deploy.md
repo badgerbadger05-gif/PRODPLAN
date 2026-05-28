@@ -136,3 +136,34 @@ curl -s http://localhost:8010/api/v1/odata/test -X POST \
   -H 'Content-Type: application/json' \
   --data @config-test/odata_config.json
 ```
+
+## Frontend white screen check
+
+If `http://mtzdock.lan:9010` opens as a blank white page while
+`curl -I http://localhost:9010` returns `200`, check frontend logs:
+
+```bash
+cd /home/barsukov/prodplan-next
+docker compose -f docker-compose.test.yml logs --tail=120 frontend
+```
+
+The symptom below means nginx cannot read the built Vite assets and is serving
+the SPA fallback `index.html` instead of JS/CSS:
+
+```text
+stat() "/usr/share/nginx/html/assets/..." failed (13: Permission denied)
+```
+
+The frontend Dockerfile must normalize permissions after copying `dist`:
+
+```dockerfile
+COPY --from=builder /app/dist /usr/share/nginx/html
+RUN chmod -R a+rX /usr/share/nginx/html
+```
+
+Then rebuild only the frontend:
+
+```bash
+docker compose -f docker-compose.test.yml build frontend
+docker compose -f docker-compose.test.yml up -d frontend
+```

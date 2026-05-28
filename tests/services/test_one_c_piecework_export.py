@@ -87,12 +87,23 @@ class _FakeClient:
         self.ref_key = ref_key
         self.fail = fail
         self.posts: list = []
+        self.patches: list = []
+        self.operations: list = []
 
     def post(self, entity, payload, **_):
         self.posts.append((entity, payload))
         if self.fail:
             raise RuntimeError("simulated 1C failure")
         return {"Ref_Key": self.ref_key}
+
+    def patch(self, entity_ref, payload, **_):
+        self.patches.append((entity_ref, payload))
+        if self.fail:
+            raise RuntimeError("simulated 1C failure")
+        return {}
+
+    def post_operation(self, operation_path):
+        self.operations.append(operation_path)
 
 
 def _stub_config(monkeypatch, *, base_url: str) -> None:
@@ -124,7 +135,8 @@ def test_dry_run_returns_payload(db_session):
     assert len(result["payloads"]) == 1
     payload = result["payloads"][0]["payload"]
     assert payload["Posted"] is False
-    assert payload["Закрыт"] is False
+    assert payload["Закрыт"] is True
+    assert payload["ДатаЗакрытия"] == payload["Date"]
     assert payload["ДокументОснование"] == "basis-ref-abc"
     assert payload["ДокументОснование_Type"] == "StandardODATA.Document_СборкаЗапасов"
     assert payload["ЗаказНаПроизводство_Key"] == f"order-ref-{item.item_id}"
@@ -295,6 +307,13 @@ def test_live_post_creates_sync_link(db_session, monkeypatch):
     assert result["manufactures_error"] == 0
     assert len(fake.posts) == 1
     assert fake.posts[0][0] == "Document_СдельныйНаряд"
+    assert fake.operations == [
+        "Document_СдельныйНаряд(guid'pw-created-ref')/Post?PostingModeOperational=true"
+    ]
+    assert len(fake.patches) == 1
+    assert fake.patches[0][0] == "Document_СдельныйНаряд(guid'pw-created-ref')"
+    assert fake.patches[0][1]["Date"] == fake.posts[0][1]["Date"]
+    assert fake.patches[0][1]["ДатаЗакрытия"] == fake.posts[0][1]["Date"]
 
     link = db.query(SyncLink).filter_by(
         source_doctype="piecework",
@@ -303,6 +322,50 @@ def test_live_post_creates_sync_link(db_session, monkeypatch):
     ).one()
     assert link.status == "success"
     assert link.target_ref_key == "pw-created-ref"
+
+
+def test_existing_error_link_with_ref_patches_not_posts_duplicate(db_session, monkeypatch):
+    db = db_session
+    item = _mk_item(db, code="PW-RETRY", ref1c="item-ref-retry")
+    m = _mk_manufacture(db, item, exported_ref1c="ref-retry")
+
+    db.add(SyncLink(
+        source_doctype="piecework",
+        source_id=m.manufacture_id,
+        target_entity="Document_СдельныйНаряд",
+        target_number=piecework_number(db, m),
+        payload_hash="old-hash",
+        target_ref_key="existing-ref",
+        status="error",
+        last_error="post failed after create",
+    ))
+    db.commit()
+
+    fake = _FakeClient(ref_key="new-ref-should-not-be-used")
+    _stub_config(monkeypatch, base_url="http://mtzw7/unf_demo/odata/standard.odata")
+    monkeypatch.setattr(exporter, "_create_odata_client", lambda *a, **kw: fake)
+
+    result = exporter.export_piecework_to_1c(
+        db, [m.manufacture_id],
+        operation_ref="op-ref-retry",
+        dry_run=False,
+    )
+
+    assert result["manufactures_created"] == 1
+    assert fake.posts == []
+    assert len(fake.patches) == 2
+    assert fake.patches[0][0] == "Document_СдельныйНаряд(guid'existing-ref')"
+    assert fake.operations == [
+        "Document_СдельныйНаряд(guid'existing-ref')/Post?PostingModeOperational=true"
+    ]
+    assert fake.patches[1][0] == "Document_СдельныйНаряд(guid'existing-ref')"
+    link = db.query(SyncLink).filter_by(
+        source_doctype="piecework",
+        source_id=m.manufacture_id,
+        target_entity="Document_СдельныйНаряд",
+    ).one()
+    assert link.status == "success"
+    assert link.target_ref_key == "existing-ref"
 
 
 def test_live_post_error_recorded_in_sync_link(db_session, monkeypatch):

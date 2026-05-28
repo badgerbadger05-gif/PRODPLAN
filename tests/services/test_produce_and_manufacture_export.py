@@ -13,13 +13,21 @@ from app.models import (
     ProductionProduct,
     SyncLink,
 )
+from app.routers.production_control import ExportPieceworkPayload
 from app.services import one_c_manufacture_export as exporter
-from app.services.production_control_production_flow import produce_line
+from app.services.production_control_production_flow import produce_line, rollback_local_manufacture
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def test_export_piecework_payload_does_not_require_operation_ref():
+    payload = ExportPieceworkPayload(manufacture_ids=[1], dry_run=False)
+
+    assert payload.operation_ref is None
+    assert payload.manufacture_ids == [1]
 
 
 def _mk_item(db, *, code: str, ref1c: str | None = None) -> Item:
@@ -208,10 +216,11 @@ def test_dry_run_returns_payload_with_order_ref(db_session, monkeypatch):
     payload = pl["payload"]
     assert payload["Posted"] is False
     assert payload["Number"].startswith("MF")
-    # Manufacture is created on the basis of the parent production order in 1C.
+    # Manufacture is linked to the parent production order through the UNF
+    # dedicated field. Its generic basis type does not accept production orders.
     assert payload["ЗаказНаПроизводство_Key"] == "order-ref-{}".format(item.item_id)
-    assert payload["ДокументОснование"] == "order-ref-{}".format(item.item_id)
-    assert payload["ДокументОснование_Type"] == "StandardODATA.Document_ЗаказНаПроизводство"
+    assert "ДокументОснование" not in payload
+    assert "ДокументОснование_Type" not in payload
     [prod_row] = payload["Продукция"]
     assert prod_row["Номенклатура_Key"] == "item-ref-exp"
     assert prod_row["ЕдиницаИзмерения"] == item.unit
@@ -220,6 +229,21 @@ def test_dry_run_returns_payload_with_order_ref(db_session, monkeypatch):
     assert (
         db.query(SyncLink).filter_by(source_doctype="manufacture").count() == 0
     )
+
+
+def test_rollback_local_manufacture_restores_line(db_session):
+    db = db_session
+    item = _mk_item(db, code="ROLLBACK", ref1c="item-ref-rollback")
+    product = _mk_product(db, item, qty=5)
+    result = produce_line(db, product.product_id, qty=5, executor="operator")
+
+    rolled_back = rollback_local_manufacture(db, result["manufacture_id"])
+
+    assert rolled_back["status"] == "rolled_back"
+    product = db.query(ProductionProduct).filter_by(product_id=product.product_id).one()
+    assert float(product.produced_qty) == 0
+    assert float(product.remaining_qty) == 5
+    assert db.query(ProductionManufacture).filter_by(manufacture_id=result["manufacture_id"]).one_or_none() is None
 
 
 def test_demo_guard_refuses_non_demo_without_override(db_session, monkeypatch):

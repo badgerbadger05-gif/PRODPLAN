@@ -7,6 +7,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.models import (
     DefaultSpecification,
+    Employee,
     Item,
     PlannedOrder,
     PlannedPurchase,
@@ -19,9 +20,34 @@ from app.models import (
     SupplierOrder,
     SupplierOrderItem,
 )
+from app.routers.production_control import list_employees
 from app.services.production_control_journal import create_orders_from_mrp, list_journal
 from app.services.production_control_material_availability import preview_materials
 from app.services.production_control_material_issues import create_material_issues
+
+
+def test_list_employees_returns_active_synced_employees(db_session):
+    db_session.add_all([
+        Employee(
+            employee_ref1c="11111111-1111-1111-1111-111111111111",
+            employee_code="0001",
+            employee_name="Иванов Иван",
+            deletion_mark=False,
+        ),
+        Employee(
+            employee_ref1c="22222222-2222-2222-2222-222222222222",
+            employee_code="0002",
+            employee_name="Петров Петр",
+            deletion_mark=True,
+        ),
+    ])
+    db_session.commit()
+
+    result = list_employees(db=db_session)
+
+    assert result["total"] == 1
+    assert result["rows"][0]["employee_name"] == "Иванов Иван"
+    assert result["rows"][0]["employee_ref1c"] == "11111111-1111-1111-1111-111111111111"
 
 
 def test_journal_and_material_issue_are_scoped_to_order_line(db_session):

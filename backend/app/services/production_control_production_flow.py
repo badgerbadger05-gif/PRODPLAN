@@ -109,6 +109,52 @@ def produce_line(
     }
 
 
+def rollback_local_manufacture(db: Session, manufacture_id: int) -> Dict[str, Any]:
+    """
+    Undo a local manufacture that was created before its 1C export failed.
+    Only non-exported draft rows may be rolled back.
+    """
+    manufacture = (
+        db.query(ProductionManufacture)
+        .filter(ProductionManufacture.manufacture_id == int(manufacture_id))
+        .one_or_none()
+    )
+    if manufacture is None:
+        raise ValueError(f"manufacture_id={manufacture_id}: выпуск не найден")
+    if getattr(manufacture, "exported_ref1c", None):
+        raise ValueError("Нельзя откатить выпуск, уже выгруженный в 1С")
+    if manufacture.status == "exported":
+        raise ValueError("Нельзя откатить выгруженный выпуск")
+
+    product = (
+        db.query(ProductionProduct)
+        .filter(ProductionProduct.product_id == int(manufacture.product_id))
+        .one_or_none()
+    )
+    if product is None:
+        raise ValueError(f"product_id={manufacture.product_id}: строка заказа не найдена")
+
+    qty_f = _to_float(manufacture.qty)
+    product.produced_qty = max(0.0, _to_float(product.produced_qty) - qty_f)
+    product.remaining_qty = _to_float(product.remaining_qty) + qty_f
+
+    state = _ensure_state(db, product)
+    if state.status in {"produced", "produced_partial"}:
+        state.status = "assembled"
+
+    db.delete(manufacture)
+    db.commit()
+
+    return {
+        "status": "rolled_back",
+        "manufacture_id": int(manufacture_id),
+        "product_id": int(product.product_id),
+        "produced_qty_total": float(product.produced_qty),
+        "remaining_qty": float(product.remaining_qty),
+        "line_status": state.status,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Reverse transfer: return leftover components from workshop to source.
 # Plan rule (Следующие этапы #6): "При частичном выпуске создавать обратное

@@ -111,6 +111,7 @@ class _FakeClient:
         self.ref_key = ref_key
         self.fail = fail
         self.posts: list = []
+        self.patches: list = []
         self.balance_rows: list = []
 
     def post(self, entity, payload, **_kwargs):
@@ -118,6 +119,12 @@ class _FakeClient:
         if self.fail:
             raise RuntimeError("simulated 1C failure")
         return {"Ref_Key": self.ref_key}
+
+    def patch(self, entity_ref, payload, **_kwargs):
+        self.patches.append((entity_ref, payload))
+        if self.fail:
+            raise RuntimeError("simulated 1C failure")
+        return {}
 
     def get_all(self, entity_name, **_kwargs):
         if str(entity_name).startswith("AccumulationRegister_ЗапасыНаСкладах/Balance"):
@@ -424,6 +431,39 @@ def test_second_export_is_noop(db_session, monkeypatch):
     assert result["issues_created"] == 0
     assert result["issues_already_linked"] == 1
     assert len(fake.posts) == 1
+
+
+def test_existing_error_link_with_ref_patches_not_posts_duplicate(db_session, monkeypatch):
+    db = db_session
+    parent = _mk_item(db, code="TRP5R", ref1c="parent-ref-5r")
+    comp = _mk_item(db, code="TRC5R", ref1c="comp-ref-5r")
+    issue = _mk_issue(db, parent=parent, component=comp, dest_wh="dst-5r")
+
+    db.add(SyncLink(
+        source_doctype="material_issue",
+        source_id=issue.issue_id,
+        target_entity=exporter.STOCK_TRANSFER_ENTITY,
+        target_number=material_issue_number(db, issue),
+        payload_hash="old-hash",
+        target_ref_key="existing-transfer-ref",
+        status="error",
+        last_error="post failed after create",
+    ))
+    db.commit()
+
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    fake = _FakeClient(ref_key="new-ref-should-not-be-used")
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    result = exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=False)
+
+    assert result["issues_created"] == 1
+    assert fake.posts == []
+    assert len(fake.patches) == 1
+    assert fake.patches[0][0] == "Document_ПеремещениеЗапасов(guid'existing-transfer-ref')"
+    db.refresh(issue)
+    assert issue.status == "exported"
+    assert issue.exported_ref1c == "existing-transfer-ref"
 
 
 def test_skipped_invalid_inputs(db_session, monkeypatch):

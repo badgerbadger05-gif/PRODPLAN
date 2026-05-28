@@ -6,7 +6,7 @@ Documentation: .docs/one_c_export_from_prodplan.md.
 Safety per the doc:
 1. Default dry_run=True.
 2. Refuse non-demo base_url unless allow_production=True.
-3. Posted=false. Posting stays on 1C admin side.
+3. Posted=false on create, then conduct through standard 1C Post operation.
 4. Idempotency via sync_link (source_doctype='manufacture').
 
 A ProductionManufacture represents one "Произвести" event on a
@@ -15,10 +15,8 @@ production_products line. In 1C this maps to Document_СборкаЗапасов
 via ЗаказНаПроизводство_Key and lists the finished product in the Продукция
 table part.
 
-Minimal payload: header + Продукция[]. Material consumption (Запасы table
-part) is intentionally omitted in this first iteration — material movements
-are handled separately via the transfer export (PR #8). The 1C admin can
-augment the draft document if needed.
+Payload includes header + Продукция[] + Запасы[] so the 1C document is ready
+for posting and does not rely on UI-side autofill.
 """
 from __future__ import annotations
 
@@ -34,14 +32,22 @@ from ..models import (
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
+    ResourceStage,
+    SpecComponent,
+    SpecOperation,
     SyncLink,
+    WorkshopWarehouseBinding,
 )
 from .one_c_export_common import (
+    DEFAULT_ORGANIZATION_REF1C,
+    DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C,
     add_unit_payload as _add_unit_payload,
     clean_ref1c as _clean_ref1c,
+    config_ref1c as _config_ref1c,
     create_odata_client as _create_odata_client,
-    fmt_1c_datetime as _fmt_1c_datetime,
+    current_1c_datetime as _current_1c_datetime,
     find_sync_link as _find_sync_link,
+    post_document_operational as _post_document_operational,
     post_export_entries as _post_export_entries,
     upsert_sync_link as _upsert_sync_link,
 )
@@ -66,6 +72,11 @@ class ManufactureExportEntry:
     item_article: str
     unit_ref1c: Optional[str]
     qty: float
+    spec_id: Optional[int] = None
+    material_structural_unit_ref1c: Optional[str] = None
+    product_structural_unit_ref1c: Optional[str] = None
+    stage_ref1c: Optional[str] = None
+    materials: List[Dict[str, Any]] = field(default_factory=list)
     executor: Optional[str] = None
     number: str = ""
     target_ref_key: Optional[str] = None
@@ -87,6 +98,84 @@ def _existing_link(db: Session, manufacture_id: int) -> Optional[SyncLink]:
         source_id=int(manufacture_id),
         target_entity=MANUFACTURE_ENTITY,
     )
+
+
+def _main_stage_id_for_spec(db: Session, spec_id: Optional[int]) -> Optional[int]:
+    if not spec_id:
+        return None
+    stage_hours = (
+        db.query(SpecOperation.stage_id)
+        .filter(SpecOperation.spec_id == int(spec_id), SpecOperation.stage_id.isnot(None))
+        .order_by(SpecOperation.time_norm.desc(), SpecOperation.spec_operation_id.asc())
+        .first()
+    )
+    if stage_hours:
+        return int(stage_hours.stage_id)
+    component_stage = (
+        db.query(SpecComponent.stage_id)
+        .filter(SpecComponent.spec_id == int(spec_id), SpecComponent.stage_id.isnot(None))
+        .order_by(SpecComponent.component_id.asc())
+        .first()
+    )
+    return int(component_stage.stage_id) if component_stage else None
+
+
+def _binding_for_product(db: Session, product: ProductionProduct) -> Optional[WorkshopWarehouseBinding]:
+    state_workshop_id = None
+    state = getattr(product, "control_state", None)
+    if state and state.workshop_id:
+        state_workshop_id = int(state.workshop_id)
+
+    workshop_id = state_workshop_id
+    if workshop_id is None:
+        stage_id = _main_stage_id_for_spec(db, int(product.spec_id) if product.spec_id else None)
+        if stage_id:
+            resource_stage = (
+                db.query(ResourceStage)
+                .filter(ResourceStage.stage_id == int(stage_id))
+                .order_by(ResourceStage.id.asc())
+                .first()
+            )
+            if resource_stage:
+                workshop_id = int(resource_stage.resource_id)
+
+    if workshop_id is None:
+        return None
+    return (
+        db.query(WorkshopWarehouseBinding)
+        .filter(WorkshopWarehouseBinding.workshop_id == int(workshop_id))
+        .one_or_none()
+    )
+
+
+def _component_rows(db: Session, product: ProductionProduct, qty: float) -> List[Dict[str, Any]]:
+    if not product.spec_id:
+        return []
+    rows: List[Dict[str, Any]] = []
+    components = (
+        db.query(SpecComponent, Item)
+        .join(Item, Item.item_id == SpecComponent.item_id)
+        .filter(SpecComponent.spec_id == int(product.spec_id))
+        .order_by(SpecComponent.component_id.asc())
+        .all()
+    )
+    for idx, (component, item) in enumerate(components, start=1):
+        item_ref = _clean_ref1c(item.item_ref1c)
+        if not item_ref:
+            continue
+        row: Dict[str, Any] = {
+            "LineNumber": idx,
+            "Номенклатура_Key": item_ref,
+            "Количество": float(component.quantity or 0) * float(qty or 0),
+            "КлючСвязи": idx,
+        }
+        _add_unit_payload(row, item.unit)
+        if product.spec_id:
+            spec = getattr(product, "specification", None)
+            if spec and _clean_ref1c(getattr(spec, "spec_ref1c", None)):
+                row["Спецификация_Key"] = _clean_ref1c(spec.spec_ref1c)
+        rows.append(row)
+    return rows
 
 
 def _collect_export_entries(
@@ -161,15 +250,45 @@ def _collect_export_entries(
                 item_article=str(item.item_article or "") if item else "",
                 unit_ref1c=_clean_ref1c(item.unit) if item else None,
                 qty=float(m.qty or 0),
+                spec_id=int(m.product.spec_id) if m.product and m.product.spec_id else None,
                 executor=str(m.executor) if m.executor else None,
                 number=manufacture_number(db, m),
             )
         )
+        entry = entries[-1]
+        if m.product:
+            binding = _binding_for_product(db, m.product)
+            if binding:
+                entry.material_structural_unit_ref1c = _clean_ref1c(binding.warehouse_ref1c) or None
+                entry.product_structural_unit_ref1c = (
+                    _clean_ref1c(binding.production_warehouse_ref1c)
+                    or _clean_ref1c(binding.warehouse_ref1c)
+                    or None
+                )
+            stage_id = _main_stage_id_for_spec(db, entry.spec_id)
+            if stage_id:
+                from ..models import ProductionStage
+                stage = db.query(ProductionStage).filter(ProductionStage.stage_id == int(stage_id)).one_or_none()
+                entry.stage_ref1c = _clean_ref1c(getattr(stage, "stage_ref1c", None)) or None
+            entry.materials = _component_rows(db, m.product, float(m.qty or 0))
 
     return entries, skipped
 
 
-def _build_header_payload(entry: ManufactureExportEntry) -> Dict[str, Any]:
+def _build_header_payload(entry: ManufactureExportEntry, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    cfg = config or {}
+    organization_ref = _config_ref1c(cfg, "default_organization_ref1c", DEFAULT_ORGANIZATION_REF1C)
+    default_structural_unit = _config_ref1c(
+        cfg,
+        "default_production_structural_unit_ref1c",
+        DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C,
+    )
+    product_structural_unit = entry.product_structural_unit_ref1c or _config_ref1c(
+        cfg,
+        "default_product_structural_unit_ref1c",
+        default_structural_unit,
+    )
+    material_structural_unit = entry.material_structural_unit_ref1c or default_structural_unit
     comment = (
         f"PRODPLAN source=manufacture/{entry.manufacture_id}; "
         f"order_id={entry.order_id}; product_id={entry.product_id}; "
@@ -181,23 +300,43 @@ def _build_header_payload(entry: ManufactureExportEntry) -> Dict[str, Any]:
         "LineNumber": 1,
         "Номенклатура_Key": entry.item_ref1c,
         "Количество": float(entry.qty),
+        "КлючСвязи": 1,
     }
     _add_unit_payload(product_row, entry.unit_ref1c)
+    if product_structural_unit:
+        product_row["СтруктурнаяЕдиница_Key"] = product_structural_unit
     products = [product_row]
+    material_rows: List[Dict[str, Any]] = []
+    for idx, material in enumerate(entry.materials, start=1):
+        row = dict(material)
+        row["LineNumber"] = idx
+        if material_structural_unit:
+            row["СтруктурнаяЕдиница_Key"] = material_structural_unit
+        if entry.stage_ref1c:
+            row["Этап_Key"] = entry.stage_ref1c
+        material_rows.append(row)
     payload: Dict[str, Any] = {
         "Number": entry.number,
-        "Date": _fmt_1c_datetime(date.today()),
+        "Date": _current_1c_datetime(),
         "Posted": False,
         "Комментарий": comment,
         "Продукция": products,
     }
-    # Per contract: ДокументОснование is mandatory for child documents.
-    # _collect_export_entries guarantees order_ref1c is set; this assertion
-    # protects against accidental drift if the collector ever changes.
+    if material_rows:
+        payload["Запасы"] = material_rows
+    if organization_ref:
+        payload["Организация_Key"] = organization_ref
+    if default_structural_unit:
+        payload["СтруктурнаяЕдиница_Key"] = default_structural_unit
+    if product_structural_unit:
+        payload["СтруктурнаяЕдиницаПродукции_Key"] = product_structural_unit
+    if material_structural_unit:
+        payload["СтруктурнаяЕдиницаЗапасов_Key"] = material_structural_unit
+    # 1C UNF links assembly to production order through this dedicated field.
+    # The generic composite ДокументОснование on Document_СборкаЗапасов does
+    # not accept Document_ЗаказНаПроизводство in the current OData metadata.
     assert entry.order_ref1c, "manufacture export requires order_ref1c basis"
     payload["ЗаказНаПроизводство_Key"] = entry.order_ref1c
-    payload["ДокументОснование"] = entry.order_ref1c
-    payload["ДокументОснование_Type"] = "StandardODATA.Document_ЗаказНаПроизводство"
     return payload
 
 
@@ -289,6 +428,9 @@ def export_manufactures_to_1c(
             entry.reason = "уже выгружен в 1С (sync_link)"
             already_linked.append(entry)
             continue
+        if link and _clean_ref1c(link.target_ref_key):
+            entry.target_ref_key = _clean_ref1c(link.target_ref_key)
+            entry.reason = "повторная отправка: 1С-документ уже был создан, обновляем реквизиты и проводим"
         m_row = (
             db.query(ProductionManufacture)
             .filter(ProductionManufacture.manufacture_id == entry.manufacture_id)
@@ -316,9 +458,10 @@ def export_manufactures_to_1c(
         "parent_orders_export": parent_export,
     }
 
+    config = _load_odata_config()
     payloads: List[Dict[str, Any]] = []
     for entry in eligible:
-        payload = _build_header_payload(entry)
+        payload = _build_header_payload(entry, config)
         payloads.append(
             {"manufacture_id": entry.manufacture_id, "number": entry.number, "payload": payload}
         )
@@ -329,13 +472,19 @@ def export_manufactures_to_1c(
         return summary
 
     client = _create_odata_client(
-        _load_odata_config(),
+        config,
         OData1CClient,
         allow_production=allow_production,
         require_demo_base=True,
     )
 
     def _mark_success(entry: ManufactureExportEntry, ref_key: str) -> None:
+        _post_document_operational(
+            client,
+            entity=MANUFACTURE_ENTITY,
+            ref_key=ref_key,
+            unpost_first=False,
+        )
         m_row = (
             db.query(ProductionManufacture)
             .filter(ProductionManufacture.manufacture_id == entry.manufacture_id)
