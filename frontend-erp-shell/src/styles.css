@@ -512,6 +512,18 @@ input:focus, select:focus {
   width: auto;
 }
 
+.productionOrdersTable,
+.transferTable {
+  table-layout: auto;
+}
+
+.productionOrdersTable th:not(.itemCell),
+.productionOrdersTable td:not(.itemCell),
+.transferTable th:not(.itemCell),
+.transferTable td:not(.itemCell) {
+  white-space: nowrap;
+}
+
 .pill, .miniPill {
   display: inline-flex;
   align-items: center;

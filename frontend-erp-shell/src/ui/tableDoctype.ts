@@ -6,6 +6,7 @@ export type TableColumnDoctype = {
   className?: string
   width?: number
   minWidth?: number
+  autoWidth?: boolean
   grow?: boolean
   align?: 'left' | 'right' | 'center'
   sortable?: boolean
@@ -18,14 +19,14 @@ export type TableSortState<TKey extends string = string> = {
 
 export function tableColumnStyle(column: TableColumnDoctype): CSSProperties {
   return {
-    width: column.grow ? undefined : column.width,
+    width: column.grow ? undefined : column.autoWidth ? '1%' : column.width,
     minWidth: column.minWidth,
     textAlign: column.align,
   }
 }
 
 export function tableMinWidth(columns: TableColumnDoctype[]) {
-  return columns.reduce((sum, column) => sum + (column.width ?? column.minWidth ?? 120), 0)
+  return columns.reduce((sum, column) => sum + (column.autoWidth ? column.minWidth ?? 64 : column.width ?? column.minWidth ?? 120), 0)
 }
 
 export function sortGlyph<TKey extends string>(state: TableSortState<TKey>, key: TKey) {
