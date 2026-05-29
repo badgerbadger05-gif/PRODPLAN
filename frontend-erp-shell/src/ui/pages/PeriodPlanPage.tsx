@@ -38,6 +38,7 @@ import {
 } from '../../services/periodPlan'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
+import { tableColumnStyle, tableMinWidth, type TableColumnDoctype } from '../tableDoctype'
 
 const PLAN_LIMIT = 50
 
@@ -102,6 +103,17 @@ interface ListViewProps {
 
 type SortKey = 'name' | 'status' | 'period_from' | 'period_to' | 'fixed_at' | 'created_at'
 type SortDir = 'asc' | 'desc'
+
+const periodPlanListColumns = [
+  { key: 'name', title: 'Название', width: 240, minWidth: 240, grow: false, sortable: true },
+  { key: 'status', title: 'Статус', width: 110, minWidth: 110, grow: false, sortable: true },
+  { key: 'period_from', title: 'Период', width: 180, minWidth: 180, grow: false, sortable: true },
+  { key: 'fixed_at', title: 'Зафиксирован', width: 140, minWidth: 140, grow: false, sortable: true },
+  { key: 'fixed_by', title: 'Кем', width: 110, minWidth: 110, grow: false, sortable: false },
+  { key: 'created_at', title: 'Создан', width: 140, minWidth: 140, grow: false, sortable: true },
+  { key: 'line_count', title: 'Строк', width: 64, minWidth: 64, grow: false, align: 'right', sortable: false },
+  { key: 'comment', title: 'Комментарий', minWidth: 240, grow: true, sortable: false },
+] as const satisfies TableColumnDoctype[]
 
 function PeriodPlanListView({ onOpenPlan }: ListViewProps) {
   const [plans, setPlans] = useState<PeriodPlan[]>([])
@@ -276,37 +288,6 @@ function PeriodPlanListView({ onOpenPlan }: ListViewProps) {
           )}
         </div>
 
-        {/* Filter bar */}
-        <div className="requisites" style={{ gridTemplateColumns: '160px 150px 150px minmax(180px,1fr) auto' }}>
-          <label>
-            <span>Статус</span>
-            <select value={filterStatus} onChange={(e) => setFilterStatus(e.target.value)}>
-              <option value="">Все</option>
-              <option value="draft">Черновик</option>
-              <option value="fixed">Зафиксирован</option>
-              <option value="archived">Архив</option>
-            </select>
-          </label>
-          <label>
-            <span>Период с</span>
-            <input type="date" value={filterFrom} onChange={(e) => setFilterFrom(e.target.value)} />
-          </label>
-          <label>
-            <span>Период по</span>
-            <input type="date" value={filterTo} onChange={(e) => setFilterTo(e.target.value)} />
-          </label>
-          <label>
-            <span>Автор (created_by)</span>
-            <input value={filterCreatedBy} onChange={(e) => setFilterCreatedBy(e.target.value)} placeholder="любая часть имени" />
-          </label>
-          <button
-            style={{ alignSelf: 'end' }}
-            onClick={() => { setFilterStatus(''); setFilterFrom(''); setFilterTo(''); setFilterCreatedBy('') }}
-          >
-            Сбросить
-          </button>
-        </div>
-
         {error && <div className="errorLine">{error}</div>}
         {message && <div className="successLine">{message}</div>}
 
@@ -347,17 +328,73 @@ function PeriodPlanListView({ onOpenPlan }: ListViewProps) {
         )}
 
         <div className="tablePane resultTablePane" style={{ flex: 1 }}>
-          <table className="journalTable" style={{ minWidth: 980, tableLayout: 'fixed' }}>
+          <table className="journalTable columnFilterTable" style={{ minWidth: tableMinWidth(periodPlanListColumns) }}>
+            <colgroup>
+              {periodPlanListColumns.map((column) => (
+                <col key={column.key} style={tableColumnStyle(column)} />
+              ))}
+            </colgroup>
+            <tbody>
+              <tr>
+                <td></td>
+                <td>
+                  <label className="columnFilterControl">
+                    <span>Статус</span>
+                    <select value={filterStatus} onChange={(e) => setFilterStatus(e.target.value)}>
+                      <option value="">Все</option>
+                      <option value="draft">Черновик</option>
+                      <option value="fixed">Зафиксирован</option>
+                      <option value="archived">Архив</option>
+                    </select>
+                  </label>
+                </td>
+                <td colSpan={2}>
+                  <div className="columnFilterRange">
+                    <label className="columnFilterControl">
+                      <span>Период с</span>
+                      <input type="date" value={filterFrom} onChange={(e) => setFilterFrom(e.target.value)} />
+                    </label>
+                    <label className="columnFilterControl">
+                      <span>Период по</span>
+                      <input type="date" value={filterTo} onChange={(e) => setFilterTo(e.target.value)} />
+                    </label>
+                  </div>
+                </td>
+                <td colSpan={2}>
+                  <label className="columnFilterControl">
+                    <span>Автор</span>
+                    <input value={filterCreatedBy} onChange={(e) => setFilterCreatedBy(e.target.value)} placeholder="любая часть имени" />
+                  </label>
+                </td>
+                <td></td>
+                <td>
+                  <button
+                    className="columnFilterButton"
+                    onClick={() => { setFilterStatus(''); setFilterFrom(''); setFilterTo(''); setFilterCreatedBy('') }}
+                  >
+                    Сбросить
+                  </button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          <table className="journalTable" style={{ minWidth: tableMinWidth(periodPlanListColumns), tableLayout: 'fixed' }}>
+            <colgroup>
+              {periodPlanListColumns.map((column) => (
+                <col key={column.key} style={tableColumnStyle(column)} />
+              ))}
+            </colgroup>
             <thead>
               <tr>
-                <th style={{ width: 240, cursor: 'pointer' }} onClick={() => toggleSort('name')}>Название{sortArrow('name')}</th>
-                <th style={{ width: 110, cursor: 'pointer' }} onClick={() => toggleSort('status')}>Статус{sortArrow('status')}</th>
-                <th style={{ width: 180, cursor: 'pointer' }} onClick={() => toggleSort('period_from')}>Период{sortArrow('period_from')}</th>
-                <th style={{ width: 140, cursor: 'pointer' }} onClick={() => toggleSort('fixed_at')}>Зафиксирован{sortArrow('fixed_at')}</th>
-                <th style={{ width: 110 }}>Кем</th>
-                <th style={{ width: 140, cursor: 'pointer' }} onClick={() => toggleSort('created_at')}>Создан{sortArrow('created_at')}</th>
-                <th style={{ width: 64, textAlign: 'right' }}>Строк</th>
-                <th>Комментарий</th>
+                {periodPlanListColumns.map((column) => (
+                  <th key={column.key} style={tableColumnStyle(column)}>
+                    {column.sortable ? (
+                      <button type="button" className="tableSortButton" onClick={() => toggleSort(column.key as SortKey)}>
+                        {column.title}{sortArrow(column.key as SortKey)}
+                      </button>
+                    ) : column.title}
+                  </th>
+                ))}
               </tr>
             </thead>
             <tbody>
