@@ -75,14 +75,14 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
               <strong>{qty(row.remaining_qty)}</strong>
               <span>/ {qty(row.quantity)} {row.unit || ''}</span>
             </td>
-            <td>
-              <strong>{row.workshop_name || 'Не назначен'}</strong>
-              <span className="muted">{row.stage_name || ''}</span>
-            </td>
             <td className="dateCell">
               <span>С: {dateRu(row.planned_start_date) || '—'}</span>
               <span>По: {dateRu(row.planned_finish_date) || '—'}</span>
               <ForecastShift row={row} />
+            </td>
+            <td>
+              <strong>{row.workshop_name || 'Не назначен'}</strong>
+              <span className="muted">{row.stage_name || ''}</span>
             </td>
             <td>
               <select value={productionStatusSelectValue(row.status)} onChange={(e) => onChangeStatus(row, e.target.value)} onClick={(e) => e.stopPropagation()}>

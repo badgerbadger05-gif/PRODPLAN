@@ -35,6 +35,11 @@ export function ProductionFilterBar({ filters, resources, onChange, onSubmit, on
           </td>
           <td></td>
           <td>
+            <button className="filterBtn columnFilterButton" onClick={() => onToggleSort('planned_start_date')}>
+              План {filters.sort_dir === 'asc' ? '▲' : '▼'}
+            </button>
+          </td>
+          <td>
             <label className="columnFilterControl">
               <span>Участок</span>
               <select value={filters.workshop_id} onChange={(e) => onChange({ ...filters, workshop_id: e.target.value })}>
@@ -42,11 +47,6 @@ export function ProductionFilterBar({ filters, resources, onChange, onSubmit, on
                 {resources.map((row) => <option key={row.resource_id} value={row.resource_id}>{row.resource_name}</option>)}
               </select>
             </label>
-          </td>
-          <td>
-            <button className="filterBtn columnFilterButton" onClick={() => onToggleSort('planned_start_date')}>
-              План {filters.sort_dir === 'asc' ? '▲' : '▼'}
-            </button>
           </td>
           <td>
             <label className="columnFilterControl">
