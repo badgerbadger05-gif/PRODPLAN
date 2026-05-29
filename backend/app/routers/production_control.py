@@ -146,6 +146,8 @@ class ExportPieceworkPayload(BaseModel):
 
 @router.get("/orders", response_model=dict)
 def get_orders_journal(
+    product_id: Optional[int] = None,
+    order_id: Optional[int] = None,
     workshop_id: Optional[int] = None,
     status: Optional[str] = None,
     coverage_status: Optional[str] = None,
@@ -161,6 +163,8 @@ def get_orders_journal(
     try:
         return list_journal(
             db,
+            product_id=product_id,
+            order_id=order_id,
             workshop_id=workshop_id,
             status=status,
             coverage_status=coverage_status,

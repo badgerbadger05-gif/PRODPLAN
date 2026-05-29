@@ -127,6 +127,28 @@ def test_journal_and_material_issue_are_scoped_to_order_line(db_session):
     assert journal_after["rows"][0]["issue_count"] == 1
 
 
+def test_journal_can_filter_by_product_id(db_session):
+    item_a = Item(item_code="P-FLT-A", item_name="Деталь A", unit="шт", stock_qty=0, status="active")
+    item_b = Item(item_code="P-FLT-B", item_name="Деталь B", unit="шт", stock_qty=0, status="active")
+    db_session.add_all([item_a, item_b])
+    db_session.flush()
+
+    order_a = ProductionOrder(order_number="FLT-A", order_date=datetime(2026, 5, 18), deletion_mark=False)
+    order_b = ProductionOrder(order_number="FLT-B", order_date=datetime(2026, 5, 18), deletion_mark=False)
+    db_session.add_all([order_a, order_b])
+    db_session.flush()
+    product_a = ProductionProduct(order_id=order_a.order_id, item_id=item_a.item_id, quantity=3, produced_qty=0, remaining_qty=3)
+    product_b = ProductionProduct(order_id=order_b.order_id, item_id=item_b.item_id, quantity=7, produced_qty=0, remaining_qty=7)
+    db_session.add_all([product_a, product_b])
+    db_session.commit()
+
+    result = list_journal(db_session, product_id=product_b.product_id)
+
+    assert result["total"] == 1
+    assert result["rows"][0]["product_id"] == product_b.product_id
+    assert result["rows"][0]["order_number"] == "FLT-B"
+
+
 def test_journal_splits_work_status_from_material_coverage(db_session):
     parent = Item(
         item_code="P-ASM",

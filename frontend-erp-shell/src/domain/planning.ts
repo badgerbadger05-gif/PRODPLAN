@@ -204,6 +204,10 @@ export type ExecutionWorkItem = {
   product_id?: number
   order_id?: number
   order_number?: string
+  order_ref1c?: string | null
+  order_source?: string | null
+  one_c_opened?: boolean
+  opened_at?: string | null
   order_state?: string
   purchase_id?: number
   rework_id?: number

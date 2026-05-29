@@ -460,6 +460,8 @@ def _planned_dates_by_item(db: Session, run_id: Optional[int]) -> Dict[int, Tupl
 def list_journal(
     db: Session,
     *,
+    product_id: Optional[int] = None,
+    order_id: Optional[int] = None,
     workshop_id: Optional[int] = None,
     status: Optional[str] = None,
     coverage_status: Optional[str] = None,
@@ -489,6 +491,10 @@ def list_journal(
         )
     )
 
+    if product_id is not None:
+        query = query.filter(ProductionProduct.product_id == int(product_id))
+    if order_id is not None:
+        query = query.filter(ProductionOrder.order_id == int(order_id))
     if status:
         status_values = STATUS_FILTER_GROUPS.get(str(status), (str(status),))
         query = query.filter(func.coalesce(ProductionOrderLineState.status, "shortage").in_(status_values))

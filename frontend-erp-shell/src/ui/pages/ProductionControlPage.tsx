@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import {
   coverageLabels,
   type ControlSettings,
@@ -47,6 +48,9 @@ function firstExportProblem(...summaries: Array<Record<string, unknown> | null |
 }
 
 export function ProductionControlPage() {
+  const [searchParams] = useSearchParams()
+  const focusProductId = searchParams.get('product_id')
+  const focusOrderId = searchParams.get('order_id')
   const [rows, setRows] = useState<OrderRow[]>([])
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [activeId, setActiveId] = useState<number | null>(null)
@@ -114,6 +118,8 @@ export function ProductionControlPage() {
       const params = new URLSearchParams()
       params.set('limit', String(limit))
       params.set('offset', String(nextOffset))
+      if (focusProductId) params.set('product_id', focusProductId)
+      if (focusOrderId) params.set('order_id', focusOrderId)
       Object.entries(filtersRef.current).forEach(([key, value]) => {
         if (value) params.set(key, value)
       })
@@ -123,6 +129,8 @@ export function ProductionControlPage() {
       setRunId(data.latest_run_id ?? null)
       setOffset(nextOffset)
       setActiveId((current) => {
+        const focusedProductId = Number(focusProductId || 0)
+        if (focusedProductId && data.rows?.some((row) => row.product_id === focusedProductId)) return focusedProductId
         if (current && data.rows?.some((row) => row.product_id === current)) return current
         return data.rows?.[0]?.product_id ?? null
       })
@@ -131,7 +139,7 @@ export function ProductionControlPage() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [focusOrderId, focusProductId])
 
   const loadResources = useCallback(async () => {
     try {

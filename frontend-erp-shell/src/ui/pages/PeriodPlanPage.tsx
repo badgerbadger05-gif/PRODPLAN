@@ -978,9 +978,10 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     URL.revokeObjectURL(url)
   }
 
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  function workItemHref(_wi: { type: string; order_id?: number; purchase_id?: number; rework_id?: number; run_id?: number }) {
-    // Cross-page deep linking is not wired; for now return null and just label the row.
+  function workItemHref(wi: { type: string; product_id?: number; order_id?: number; purchase_id?: number; rework_id?: number; run_id?: number }) {
+    if (wi.type !== 'production_order') return null
+    if (wi.product_id) return `/production-control?product_id=${encodeURIComponent(String(wi.product_id))}`
+    if (wi.order_id) return `/production-control?order_id=${encodeURIComponent(String(wi.order_id))}`
     return null as string | null
   }
 
@@ -1500,7 +1501,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                           </td>
                         </tr>
                         {expandedReq === row.req_id && row.work_items.map((wi, i) => {
-                          const href = workItemHref(wi as unknown as { type: string; order_id?: number; purchase_id?: number; rework_id?: number; run_id?: number })
+                          const href = workItemHref(wi as unknown as { type: string; product_id?: number; order_id?: number; purchase_id?: number; rework_id?: number; run_id?: number })
                           const label = wi.type === 'production_order'
                             ? `Заказ ${wi.order_number || '#' + wi.order_id}`
                             : wi.type === 'planned_order'
@@ -1516,6 +1517,15 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                                   <a href={href} className="muted">{label}</a>
                                 ) : (
                                   <span className="muted">{label}</span>
+                                )}
+                                {wi.type === 'production_order' && (
+                                  <span
+                                    className={`miniPill ${wi.one_c_opened ? 'ready' : 'partial'}`}
+                                    title={wi.one_c_opened && wi.order_ref1c ? `1C Ref_Key: ${wi.order_ref1c}` : 'Внутренний заказ PRODPLAN'}
+                                    style={{ marginLeft: 8 }}
+                                  >
+                                    {wi.one_c_opened ? 'Открыт в 1С' : 'Внутренний заказ'}
+                                  </span>
                                 )}
                               </td>
                               <td />

@@ -13,14 +13,17 @@ from app.models import (
     MrpRequirement,
     PlannedPurchase,
     PlanningRun,
+    ProductionOrder,
+    ProductionOrderLineState,
     ProductionPlanHeader,
     ProductionPlanLine,
+    ProductionProduct,
     SpecComponent,
     Specification,
     SupplierOrder,
     SupplierOrderItem,
 )
-from app.services.period_plan_service import create_mrp_snapshot_from_period_plan
+from app.services.period_plan_service import create_mrp_snapshot_from_period_plan, get_period_plan_execution_journal
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +115,77 @@ def _make_supplier_order(
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+def test_execution_journal_marks_production_order_opened_in_1c(db_session):
+    bucket = date(2026, 6, 2)
+    item = Item(
+        item_code="MAKE-1C",
+        item_name="Производимая деталь",
+        item_article="MAKE-1C",
+        unit="шт",
+        stock_qty=0,
+        replenishment_method="Производство",
+        status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+    plan = _make_fixed_plan(db_session, item, bucket, qty=12.0)
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        source_plan_id=plan.id,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        started_at=datetime.datetime(2026, 5, 26, 5, 25),
+        finished_at=datetime.datetime(2026, 5, 26, 5, 25),
+    )
+    db_session.add(run)
+    db_session.flush()
+    req = MrpRequirement(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        total_required_qty=12,
+        net_required_qty=12,
+        covered_qty=12,
+        remaining_qty=0,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        bom_level=0,
+    )
+    db_session.add(req)
+    db_session.flush()
+    order = ProductionOrder(
+        order_number="MRP-R-OPEN",
+        order_date=datetime.datetime(2026, 5, 27),
+        order_ref1c="order-ref-opened",
+        is_posted=True,
+        deletion_mark=False,
+        source="mrp",
+        source_run_id=run.run_id,
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=item.item_id,
+        line_number=1,
+        quantity=12,
+        produced_qty=0,
+        remaining_qty=12,
+        source_mrp_requirement_id=req.id,
+    )
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(ProductionOrderLineState(product_id=product.product_id, status="shortage"))
+    db_session.commit()
+
+    journal = get_period_plan_execution_journal(db_session, plan.id, run_id=run.run_id)
+
+    work_item = journal["rows"][0]["work_items"][0]
+    assert work_item["type"] == "production_order"
+    assert work_item["product_id"] == product.product_id
+    assert work_item["order_ref1c"] == "order-ref-opened"
+    assert work_item["one_c_opened"] is True
+
 
 class TestPurchaseAllocationNoSupplierOrders:
     """When no supplier orders exist, full net demand becomes PlannedPurchase."""
