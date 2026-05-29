@@ -27,6 +27,25 @@ import type { ProductionOrderSortKey } from './production-control/productionOrde
 
 const limit = 100
 
+function recordArray(value: unknown): Array<Record<string, unknown>> {
+  return Array.isArray(value) ? value.filter((row): row is Record<string, unknown> => Boolean(row) && typeof row === 'object') : []
+}
+
+function firstExportProblem(...summaries: Array<Record<string, unknown> | null | undefined>) {
+  for (const summary of summaries) {
+    if (!summary) continue
+    for (const entry of recordArray(summary.entries)) {
+      const problem = entry.error || entry.reason
+      if (problem) return String(problem)
+    }
+    for (const row of recordArray(summary.skipped_rows)) {
+      const problem = row.error || row.reason
+      if (problem) return String(problem)
+    }
+  }
+  return ''
+}
+
 export function ProductionControlPage() {
   const [rows, setRows] = useState<OrderRow[]>([])
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
@@ -63,6 +82,7 @@ export function ProductionControlPage() {
   const [produceSaving, setProduceSaving] = useState(false)
   const [produceError, setProduceError] = useState('')
   const [produceDryRunPayload, setProduceDryRunPayload] = useState<string | null>(null)
+  const [produceProductId, setProduceProductId] = useState<number | null>(null)
   const [warehousePickerOpen, setWarehousePickerOpen] = useState(false)
   const [warehousePickerCandidates, setWarehousePickerCandidates] = useState<WarehouseCandidate[]>([])
   const [warehousePickerProductIds, setWarehousePickerProductIds] = useState<number[]>([])
@@ -78,12 +98,13 @@ export function ProductionControlPage() {
 
   const activeRow = useMemo(() => rows.find((row) => row.product_id === activeId) ?? rows[0] ?? null, [rows, activeId])
   const selectedRows = useMemo(() => rows.filter((row) => selectedIds.has(row.product_id)), [rows, selectedIds])
+  const produceRow = useMemo(() => rows.find((row) => row.product_id === produceProductId) ?? null, [rows, produceProductId])
   const selectedEmployee = useMemo(
     () => employees.find((employee) => employee.employee_ref1c === produceEmployeeRef) ?? null,
     [employees, produceEmployeeRef],
   )
-  const activeRemainingQty = Number(activeRow?.remaining_qty ?? 0)
-  const canProduceActiveRow = Boolean(activeRow && activeRemainingQty > 0)
+  const produceRemainingQty = Number(produceRow?.remaining_qty ?? 0)
+  const canProduceRow = Boolean(produceRow && produceRemainingQty > 0)
 
   const load = useCallback(async (nextOffset: number) => {
     setLoading(true)
@@ -291,14 +312,18 @@ export function ProductionControlPage() {
       const transfersExisting = Number(result.issues_already_linked ?? 0)
       const errored = Number(result.issues_error ?? 0) + Number(parent.orders_error ?? 0)
       const skipped = (result.skipped_rows as unknown[])?.length ?? 0
-      setMessage(
+      const summary =
         `Запуск в 1С: заказов проведено ${ordersCreated}` +
         (ordersExisting ? `, заказов уже было ${ordersExisting}` : '') +
         `; перемещений создано ${transfersCreated}` +
         (transfersExisting ? `, перемещений уже было ${transfersExisting}` : '') +
         (skipped ? `, пропущено ${skipped}` : '') +
-        (errored ? `, ошибок ${errored}` : ''),
-      )
+        (errored ? `, ошибок ${errored}` : '')
+      if (errored > 0 || result.status === 'partial_error' || parent.status === 'partial_error') {
+        const detail = firstExportProblem(result, parent)
+        throw new Error(`${summary}${detail ? `. ${detail}` : ''}`)
+      }
+      setMessage(summary)
       setSelectedIds(new Set())
       await load(offsetRef.current)
     } catch (e) {
@@ -333,14 +358,26 @@ export function ProductionControlPage() {
   }
 
   function openProduceDialog() {
-    if (!activeRow) return
-    const remaining = Number(activeRow.remaining_qty ?? 0)
+    if (selectedRows.length !== 1) {
+      setError('Для выпуска выберите ровно одну строку чекбоксом.')
+      setProduceOpen(false)
+      return
+    }
+    const row = selectedRows[0]
+    setActiveId(row.product_id)
+    setProduceProductId(row.product_id)
+    const remaining = Number(row.remaining_qty ?? 0)
     if (remaining <= 0) {
       setError('Эта строка уже произведена полностью. Открывать выпуск нечего.')
       setProduceOpen(false)
       return
     }
-    setProduceQty(String(activeRow.remaining_qty ?? activeRow.quantity ?? 0))
+    if (row.coverage_status !== 'assembled' && row.issue_status !== 'posted') {
+      setError('Нельзя создать выпуск: по выбранной строке нет проведённого перемещения материалов.')
+      setProduceOpen(false)
+      return
+    }
+    setProduceQty(String(row.remaining_qty ?? row.quantity ?? 0))
     setProduceEmployeeRef('')
     setProduceDryRun(false)
     setProduceError('')
@@ -350,9 +387,14 @@ export function ProductionControlPage() {
   }
 
   async function submitProduce() {
-    if (!activeRow) return
-    if (Number(activeRow.remaining_qty ?? 0) <= 0) {
+    if (!produceRow) return
+    if (Number(produceRow.remaining_qty ?? 0) <= 0) {
       setError('Эта строка уже произведена полностью. Открывать выпуск нечего.')
+      setProduceOpen(false)
+      return
+    }
+    if (produceRow.coverage_status !== 'assembled' && produceRow.issue_status !== 'posted') {
+      setError('Нельзя создать выпуск: по выбранной строке нет проведённого перемещения материалов.')
       setProduceOpen(false)
       return
     }
@@ -363,7 +405,7 @@ export function ProductionControlPage() {
     try {
       // Step 1: record manufacture locally (bumps produced_qty / remaining_qty).
       const localResult = await api<Record<string, unknown>>(
-        `/v1/production-control/orders/${activeRow.product_id}/produce`,
+        `/v1/production-control/orders/${produceRow.product_id}/produce`,
         {
           method: 'POST',
           body: JSON.stringify({
@@ -398,12 +440,18 @@ export function ProductionControlPage() {
       )
       const created1c = Number(exportResult.manufactures_created ?? 0)
       const errored = Number(exportResult.manufactures_error ?? 0)
-      const ref = (exportResult.entries as Array<Record<string, unknown>>)?.[0]?.target_ref_key
+      const exportEntry = recordArray(exportResult.entries)[0]
+      const ref = exportEntry?.target_ref_key
       if (errored > 0 || created1c < 1 || !ref) {
-        await api(`/v1/production-control/manufactures/${manufacture_id}/rollback-local`, { method: 'POST' })
-        const entries = (exportResult.entries as Array<Record<string, unknown>>) ?? []
-        const exportError = entries.map((entry) => entry.error || entry.reason).find(Boolean)
-        throw new Error(String(exportError || '1C не создала документ выпуска; локальный выпуск откатан'))
+        const exportError = exportEntry?.error || exportEntry?.reason || firstExportProblem(exportResult)
+        if (!ref) {
+          await api(`/v1/production-control/manufactures/${manufacture_id}/rollback-local`, { method: 'POST' })
+          throw new Error(String(exportError || '1C не создала документ выпуска; локальный выпуск откатан'))
+        }
+        throw new Error(
+          `1C создала документ выпуска ${String(ref).slice(0, 8)}…, но не провела его: ` +
+          `${String(exportError || 'ошибка проведения')}. Локальный выпуск оставлен для разбора.`,
+        )
       }
       const pieceworkResult = await api<Record<string, unknown>>(
         '/v1/production-control/manufactures/export-piecework-to-1c',
@@ -556,7 +604,6 @@ export function ProductionControlPage() {
         )}
       >
         <ProductionCommandBar
-          activeRow={activeRow}
           rows={rows}
           selectedIds={selectedIds}
           loading={loading}
@@ -619,17 +666,17 @@ export function ProductionControlPage() {
         </div>
       </DocumentWindow>
 
-      {produceOpen && activeRow && (
+      {produceOpen && produceRow && (
         <div className="dialogOverlay" onClick={(e) => { if (e.target === e.currentTarget) setProduceOpen(false) }}>
           <div className="dialogBox">
-            <div className="dialogHeader">Произвести - {activeRow.item_name}</div>
+            <div className="dialogHeader">Произвести - {produceRow.item_name}</div>
             <div className="dialogBody">
               {produceError && <div className="dialogError">{produceError}</div>}
-              {!canProduceActiveRow && (
+              {!canProduceRow && (
                 <div className="fieldHint danger">Эта строка уже произведена полностью.</div>
               )}
               <div className="dialogField">
-                <label>Количество ({activeRow.unit || 'шт'})</label>
+                <label>Количество ({produceRow.unit || 'шт'})</label>
                 <input
                   type="number"
                   min={0}
@@ -674,7 +721,7 @@ export function ProductionControlPage() {
               <button
                 className="primary"
                 onClick={() => void submitProduce()}
-                disabled={!canProduceActiveRow || produceSaving || employeesLoading || (employees.length > 0 && !produceEmployeeRef)}
+                disabled={!canProduceRow || produceSaving || employeesLoading || (employees.length > 0 && !produceEmployeeRef)}
               >
                 {produceSaving ? 'Создаём...' : produceDryRun ? 'Показать payload' : 'Создать в 1С'}
               </button>

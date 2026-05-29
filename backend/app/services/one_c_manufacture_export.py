@@ -501,6 +501,11 @@ def export_manufactures_to_1c(
             .filter(ProductionManufacture.manufacture_id == entry.manufacture_id)
             .one()
         )
+        created_ref = _clean_ref1c(getattr(entry, "target_ref_key", None))
+        if created_ref:
+            m_row.status = "error"
+            m_row.exported_ref1c = created_ref
+            m_row.exported_at = datetime.utcnow()
         m_row.export_error = error
 
     created, errored = _post_export_entries(

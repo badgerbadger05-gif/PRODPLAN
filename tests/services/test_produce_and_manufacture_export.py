@@ -8,6 +8,7 @@ import pytest
 from app.models import (
     Item,
     ProductionManufacture,
+    ProductionMaterialIssue,
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
@@ -69,7 +70,18 @@ def _mk_product(db, item: Item, *, qty: float = 10.0) -> ProductionProduct:
         ProductionOrderLineState(
             product_id=product.product_id,
             status="ready",
-            issue_status="not_requested",
+            issue_status="posted",
+        )
+    )
+    db.add(
+        ProductionMaterialIssue(
+            document_number=f"MI-{product.product_id}",
+            product_id=product.product_id,
+            order_id=order.order_id,
+            status="posted",
+            direction="issue",
+            warehouse_ref1c="workshop-ref",
+            source_warehouse_ref1c="source-ref",
         )
     )
     db.commit()
@@ -87,6 +99,11 @@ class _FakeClient:
         if self.fail:
             raise RuntimeError("simulated 1C failure")
         return {"Ref_Key": self.ref_key}
+
+
+class _PostFailsAfterCreateClient(_FakeClient):
+    def post_operation(self, *_args, **_kwargs):
+        raise RuntimeError("posting failed after create")
 
 
 def _stub_config(monkeypatch, *, base_url: str) -> None:
@@ -188,6 +205,24 @@ def test_produce_zero_or_negative_raises(db_session):
 def test_produce_unknown_product_raises(db_session):
     with pytest.raises(ValueError, match="не найдена"):
         produce_line(db_session, 999_999, qty=1)
+
+
+def test_produce_requires_posted_material_issue(db_session):
+    db = db_session
+    item = _mk_item(db, code="PRD-NOMOVE", ref1c="ref-prd-nomove")
+    product = _mk_product(db, item, qty=4.0)
+    db.query(ProductionMaterialIssue).filter_by(product_id=product.product_id).delete()
+    state = db.query(ProductionOrderLineState).filter_by(product_id=product.product_id).one()
+    state.issue_status = "not_requested"
+    db.commit()
+
+    with pytest.raises(ValueError, match="перемещения материалов"):
+        produce_line(db, product.product_id, qty=1)
+
+    db.refresh(product)
+    assert float(product.produced_qty) == 0
+    assert float(product.remaining_qty) == 4
+    assert db.query(ProductionManufacture).filter_by(product_id=product.product_id).count() == 0
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +332,42 @@ def test_successful_export_stamps_link_and_manufacture(db_session, monkeypatch):
     )
     assert link.status == "success"
     assert link.target_ref_key == "be5ab6fe-manu-ok"
+
+
+def test_failed_posting_keeps_created_ref_on_manufacture(db_session, monkeypatch):
+    db = db_session
+    item = _mk_item(db, code="EXP-POST-FAIL", ref1c="item-ref-post-fail")
+    product = _mk_product(db, item, qty=3)
+    mid = produce_line(db, product.product_id, qty=3, executor="petrov")["manufacture_id"]
+
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    monkeypatch.setattr(
+        exporter,
+        "OData1CClient",
+        lambda **_: _PostFailsAfterCreateClient(ref_key="created-but-not-posted"),
+    )
+
+    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False)
+
+    assert result["status"] == "partial_error"
+    assert result["manufactures_error"] == 1
+    m = db.query(ProductionManufacture).filter_by(manufacture_id=mid).one()
+    assert m.status == "error"
+    assert m.exported_ref1c == "created-but-not-posted"
+    assert m.exported_at is not None
+    assert "posting failed after create" in m.export_error
+
+    link = (
+        db.query(SyncLink)
+        .filter_by(
+            source_doctype="manufacture",
+            source_id=mid,
+            target_entity=exporter.MANUFACTURE_ENTITY,
+        )
+        .one()
+    )
+    assert link.status == "error"
+    assert link.target_ref_key == "created-but-not-posted"
 
 
 def test_second_export_is_noop(db_session, monkeypatch):

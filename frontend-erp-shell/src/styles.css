@@ -65,6 +65,18 @@ button.primary {
   font-weight: 700;
 }
 
+button.success {
+  border-color: #0f6b3d;
+  background: linear-gradient(#42b978, #198754 52%, #12663f);
+  color: #fff;
+  font-weight: 700;
+}
+
+button.success:hover:not(:disabled) {
+  border-color: #0b5731;
+  background: linear-gradient(#4dc785, #157347 52%, #0f5a36);
+}
+
 input, select {
   height: 24px;
   border: 1px solid #9fa7b2;

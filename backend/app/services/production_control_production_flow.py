@@ -67,6 +67,21 @@ def produce_line(
             "Если нужно увеличить вЂ” сначала отмените лишний выпуск."
         )
 
+    material_issue = (
+        db.query(ProductionMaterialIssue)
+        .filter(
+            ProductionMaterialIssue.product_id == int(product.product_id),
+            ProductionMaterialIssue.direction == "issue",
+            ProductionMaterialIssue.status.in_(("posted", "issued")),
+        )
+        .order_by(ProductionMaterialIssue.issue_id.desc())
+        .first()
+    )
+    if material_issue is None:
+        raise ValueError(
+            "Нельзя создать выпуск без проведённого перемещения материалов по этой строке"
+        )
+
     manufacture = ProductionManufacture(
         product_id=int(product.product_id),
         order_id=int(product.order_id),
