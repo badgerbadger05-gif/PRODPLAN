@@ -447,6 +447,20 @@ type JournalSortKey =
   | 'remaining_qty'
   | 'coverage_pct'
 
+const periodPlanJournalColumns = [
+  { key: 'item_article', title: 'Артикул', width: 108, minWidth: 108, grow: false, sortable: true },
+  { key: 'item_name', title: 'Номенклатура', minWidth: 300, grow: true, sortable: true },
+  { key: 'flow', title: 'Тип', width: 136, minWidth: 136, grow: false, sortable: true },
+  { key: 'bom_level', title: 'Ур.', width: 68, minWidth: 68, grow: false, align: 'center', sortable: true },
+  { key: 'gross_qty', title: 'Потребность', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true },
+  { key: 'net_qty', title: 'К запуску', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true },
+  { key: 'ordered_qty', title: 'В заказах', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true },
+  { key: 'completed_qty', title: 'Выполнено', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true },
+  { key: 'remaining_qty', title: 'Осталось', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true },
+  { key: 'coverage_pct', title: 'Прогресс', width: 96, minWidth: 96, grow: false, align: 'center', sortable: true },
+  { key: 'work_items', title: 'Заданий', width: 72, minWidth: 72, grow: false, align: 'center', sortable: false },
+] as const satisfies TableColumnDoctype[]
+
 function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   const [plan, setPlan] = useState<PeriodPlan | null>(null)
   const [tab, setTab] = useState<Tab>('matrix')
@@ -1340,53 +1354,6 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
               >
                 Создать заказы производства
               </button>
-              <div className="barSeparator" />
-              <label className="inlineControl">
-                <span>Прогон</span>
-                <select
-                  value={String(selectedRunId ?? '')}
-                  onChange={(e) => {
-                    const v = e.target.value
-                    const runId = v ? Number(v) : null
-                    setSelectedRunId(runId)
-                    void loadJournal(journalFlow, runId ?? undefined)
-                  }}
-                  disabled={!runs.length}
-                >
-                  {!runs.length && <option value="">—</option>}
-                  {runs.map((r) => (
-                    <option key={r.run_id} value={r.run_id}>
-                      #{r.run_id} · {planningStatusLabel(r.status)} · {r.started_at ? dateTimeRu(r.started_at) : '—'}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="inlineControl">
-                <span>Поток</span>
-                <select value={journalFlow} onChange={(e) => { setJournalFlow(e.target.value); void loadJournal(e.target.value, activeRunId ?? undefined) }}>
-                  <option value="">Все</option>
-                  <option value="production">Производство</option>
-                  <option value="purchase">Закупка</option>
-                  <option value="rework">Переработка</option>
-                </select>
-              </label>
-              <label className="inlineControl">
-                <span>BOM ур.</span>
-                <select value={journalBomLevel} onChange={(e) => setJournalBomLevel(e.target.value)}>
-                  <option value="">Все</option>
-                  {bomLevels.map((lvl) => <option key={lvl} value={lvl}>{lvl}</option>)}
-                </select>
-              </label>
-              <label className="inlineControl">
-                <span>Статус</span>
-                <select value={journalCoverage} onChange={(e) => setJournalCoverage(e.target.value)}>
-                  <option value="">Все</option>
-                  <option value="covered">Закрыто</option>
-                  <option value="partial">Частично</option>
-                  <option value="ordered">В заказах</option>
-                  <option value="none">Без заданий</option>
-                </select>
-              </label>
               {journal && (
                 <>
                   <div className="barSeparator" />
@@ -1411,20 +1378,96 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
 
             {journal && (
               <div className="tablePane resultTablePane" style={{ flex: 1 }}>
-                <table className="journalTable" style={{ minWidth: 1110 }}>
+                <table className="journalTable columnFilterTable" style={{ minWidth: tableMinWidth(periodPlanJournalColumns), tableLayout: 'fixed' }}>
+                  <colgroup>
+                    {periodPlanJournalColumns.map((column) => (
+                      <col key={column.key} style={tableColumnStyle(column)} />
+                    ))}
+                  </colgroup>
+                  <tbody>
+                    <tr>
+                      <td colSpan={2}>
+                        <label className="columnFilterControl">
+                          <span>Прогон</span>
+                          <select
+                            value={String(selectedRunId ?? '')}
+                            onChange={(e) => {
+                              const v = e.target.value
+                              const runId = v ? Number(v) : null
+                              setSelectedRunId(runId)
+                              void loadJournal(journalFlow, runId ?? undefined)
+                            }}
+                            disabled={!runs.length}
+                          >
+                            {!runs.length && <option value="">—</option>}
+                            {runs.map((r) => (
+                              <option key={r.run_id} value={r.run_id}>
+                                #{r.run_id} · {planningStatusLabel(r.status)} · {r.started_at ? dateTimeRu(r.started_at) : '—'}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      </td>
+                      <td>
+                        <label className="columnFilterControl">
+                          <span>Поток</span>
+                          <select value={journalFlow} onChange={(e) => { setJournalFlow(e.target.value); void loadJournal(e.target.value, activeRunId ?? undefined) }}>
+                            <option value="">Все</option>
+                            <option value="production">Производство</option>
+                            <option value="purchase">Закупка</option>
+                            <option value="rework">Переработка</option>
+                          </select>
+                        </label>
+                      </td>
+                      <td>
+                        <label className="columnFilterControl">
+                          <span>BOM ур.</span>
+                          <select value={journalBomLevel} onChange={(e) => setJournalBomLevel(e.target.value)}>
+                            <option value="">Все</option>
+                            {bomLevels.map((lvl) => <option key={lvl} value={lvl}>{lvl}</option>)}
+                          </select>
+                        </label>
+                      </td>
+                      <td colSpan={5} />
+                      <td>
+                        <label className="columnFilterControl">
+                          <span>Статус</span>
+                          <select value={journalCoverage} onChange={(e) => setJournalCoverage(e.target.value)}>
+                            <option value="">Все</option>
+                            <option value="covered">Закрыто</option>
+                            <option value="partial">Частично</option>
+                            <option value="ordered">В заказах</option>
+                            <option value="none">Без заданий</option>
+                          </select>
+                        </label>
+                      </td>
+                      <td />
+                    </tr>
+                  </tbody>
+                </table>
+                <table className="journalTable" style={{ minWidth: tableMinWidth(periodPlanJournalColumns), tableLayout: 'fixed' }}>
+                  <colgroup>
+                    {periodPlanJournalColumns.map((column) => (
+                      <col key={column.key} style={tableColumnStyle(column)} />
+                    ))}
+                  </colgroup>
                   <thead>
                     <tr>
-                      <th style={{ width: 88, cursor: 'pointer' }} onClick={() => toggleJournalSort('item_article')}>Артикул{jSortArrow('item_article')}</th>
-                      <th style={{ width: 300, cursor: 'pointer' }} onClick={() => toggleJournalSort('item_name')}>Номенклатура{jSortArrow('item_name')}</th>
-                      <th style={{ width: 104, cursor: 'pointer' }} onClick={() => toggleJournalSort('flow')}>Тип{jSortArrow('flow')}</th>
-                      <th style={{ width: 52, textAlign: 'center', cursor: 'pointer' }} onClick={() => toggleJournalSort('bom_level')}>Ур.{jSortArrow('bom_level')}</th>
-                      <th className="numCell" style={{ cursor: 'pointer' }} onClick={() => toggleJournalSort('gross_qty')}>Потребность{jSortArrow('gross_qty')}</th>
-                      <th className="numCell" style={{ cursor: 'pointer' }} onClick={() => toggleJournalSort('net_qty')}>К запуску{jSortArrow('net_qty')}</th>
-                      <th className="numCell" style={{ cursor: 'pointer' }} onClick={() => toggleJournalSort('ordered_qty')}>В заказах{jSortArrow('ordered_qty')}</th>
-                      <th className="numCell" style={{ cursor: 'pointer' }} onClick={() => toggleJournalSort('completed_qty')}>Выполнено{jSortArrow('completed_qty')}</th>
-                      <th className="numCell" style={{ cursor: 'pointer' }} onClick={() => toggleJournalSort('remaining_qty')}>Осталось{jSortArrow('remaining_qty')}</th>
-                      <th style={{ width: 82, textAlign: 'center', cursor: 'pointer' }} onClick={() => toggleJournalSort('coverage_pct')}>Прогресс{jSortArrow('coverage_pct')}</th>
-                      <th style={{ width: 64, textAlign: 'center' }}>Заданий</th>
+                      {periodPlanJournalColumns.map((column) => {
+                        const columnDoctype = column as TableColumnDoctype
+                        return (
+                          <th key={column.key} className={columnDoctype.className} style={tableColumnStyle(column)}>
+                            {column.sortable ? (() => {
+                              const sortKey: JournalSortKey = column.key
+                              return (
+                                <button type="button" className="tableSortButton" onClick={() => toggleJournalSort(sortKey)}>
+                                {column.title}{jSortArrow(sortKey)}
+                              </button>
+                              )
+                            })() : column.title}
+                          </th>
+                        )
+                      })}
                     </tr>
                   </thead>
                   <tbody>
