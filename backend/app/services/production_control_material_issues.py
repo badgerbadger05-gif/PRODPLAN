@@ -479,6 +479,45 @@ def create_material_issues(
     }
 
 
+def _warehouse_name_lookup(db: Session, refs: Sequence[str]) -> Dict[str, str]:
+    clean_refs = sorted({_clean_ref1c(ref) for ref in refs if _clean_ref1c(ref)})
+    if not clean_refs:
+        return {}
+    return {
+        str(row.warehouse_ref1c): str(row.warehouse_name or row.warehouse_ref1c)
+        for row in db.query(StockWarehouse)
+        .filter(StockWarehouse.warehouse_ref1c.in_(clean_refs))
+        .all()
+    }
+
+
+def _warehouse_display_name(warehouse_names: Dict[str, str], ref: Optional[str]) -> str:
+    clean_ref = _clean_ref1c(ref)
+    if not clean_ref:
+        return ""
+    return warehouse_names.get(clean_ref, clean_ref)
+
+
+def _issue_source_warehouse_options(db: Session, query) -> List[Dict[str, str]]:
+    refs = [
+        _clean_ref1c(row[0])
+        for row in query.order_by(None)
+        .with_entities(ProductionMaterialIssue.source_warehouse_ref1c)
+        .filter(ProductionMaterialIssue.source_warehouse_ref1c.isnot(None))
+        .distinct()
+        .all()
+    ]
+    refs = sorted({ref for ref in refs if ref})
+    warehouse_names = _warehouse_name_lookup(db, refs)
+    return [
+        {
+            "warehouse_ref1c": ref,
+            "warehouse_name": _warehouse_display_name(warehouse_names, ref),
+        }
+        for ref in sorted(refs, key=lambda value: _warehouse_display_name(warehouse_names, value).casefold())
+    ]
+
+
 def get_issue(db: Session, issue_id: int) -> Dict[str, Any]:
     issue = (
         db.query(ProductionMaterialIssue)
@@ -492,6 +531,10 @@ def get_issue(db: Session, issue_id: int) -> Dict[str, Any]:
     )
     if not issue:
         raise ValueError("Документ выдачи не найден")
+    warehouse_names = _warehouse_name_lookup(
+        db,
+        [str(issue.source_warehouse_ref1c or ""), str(issue.warehouse_ref1c or "")],
+    )
     link = (
         db.query(SyncLink)
         .filter(
@@ -508,6 +551,9 @@ def get_issue(db: Session, issue_id: int) -> Dict[str, Any]:
         "document_number": str(issue.document_number),
         "status": str(issue.status),
         "warehouse_ref1c": str(issue.warehouse_ref1c or ""),
+        "destination_warehouse_name": _warehouse_display_name(warehouse_names, issue.warehouse_ref1c),
+        "source_warehouse_ref1c": str(issue.source_warehouse_ref1c or ""),
+        "source_warehouse_name": _warehouse_display_name(warehouse_names, issue.source_warehouse_ref1c),
         "initiated_by": str(issue.initiated_by or ""),
         "order_number": str(issue.order.order_number or ""),
         "product_id": int(issue.product_id),
@@ -534,7 +580,11 @@ def get_issue(db: Session, issue_id: int) -> Dict[str, Any]:
     }
 
 
-def _issue_header(db: Session, issue: ProductionMaterialIssue) -> Dict[str, Any]:
+def _issue_header(
+    db: Session,
+    issue: ProductionMaterialIssue,
+    warehouse_names: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
     product = issue.product
     item = product.item if product and product.item else None
     state = (
@@ -561,6 +611,10 @@ def _issue_header(db: Session, issue: ProductionMaterialIssue) -> Dict[str, Any]
         assemble_disabled_reason = "Перемещение уже собрано"
     elif not exported_ref:
         assemble_disabled_reason = "Сначала выгрузите перемещение в 1С"
+    warehouse_names = warehouse_names or _warehouse_name_lookup(
+        db,
+        [str(issue.source_warehouse_ref1c or ""), str(issue.warehouse_ref1c or "")],
+    )
     return {
         "issue_id": int(issue.issue_id),
         "document_number": str(issue.document_number),
@@ -578,7 +632,9 @@ def _issue_header(db: Session, issue: ProductionMaterialIssue) -> Dict[str, Any]
         "remaining_qty": _to_float(product.remaining_qty) if product else 0.0,
         "unit": _unit_display(db, item.unit) if item else "",
         "warehouse_ref1c": str(issue.warehouse_ref1c or ""),
+        "destination_warehouse_name": _warehouse_display_name(warehouse_names, issue.warehouse_ref1c),
         "source_warehouse_ref1c": str(issue.source_warehouse_ref1c or ""),
+        "source_warehouse_name": _warehouse_display_name(warehouse_names, issue.source_warehouse_ref1c),
         "exported_ref1c": exported_ref,
         "one_c_number": one_c_number,
         "exported_at": _date_to_iso(issue.exported_at),
@@ -597,6 +653,7 @@ def list_material_issues(
     *,
     status: Optional[str] = None,
     search: Optional[str] = None,
+    source_warehouse_ref1c: Optional[str] = None,
     limit: int = 100,
     offset: int = 0,
 ) -> Dict[str, Any]:
@@ -626,6 +683,10 @@ def list_material_issues(
                 | (ProductionProduct.item.has(Item.item_code.ilike(like)))
             )
         )
+    source_warehouses = _issue_source_warehouse_options(db, query)
+    clean_source_ref = _clean_ref1c(source_warehouse_ref1c)
+    if clean_source_ref:
+        query = query.filter(ProductionMaterialIssue.source_warehouse_ref1c == clean_source_ref)
 
     total = query.count()
     effective_limit = max(1, min(int(limit or 100), 500))
@@ -636,11 +697,20 @@ def list_material_issues(
         .limit(effective_limit)
         .all()
     )
+    warehouse_names = _warehouse_name_lookup(
+        db,
+        [
+            ref
+            for issue in rows
+            for ref in (str(issue.source_warehouse_ref1c or ""), str(issue.warehouse_ref1c or ""))
+        ],
+    )
     return {
-        "rows": [_issue_header(db, issue) for issue in rows],
+        "rows": [_issue_header(db, issue, warehouse_names) for issue in rows],
         "total": int(total),
         "limit": effective_limit,
         "offset": effective_offset,
+        "source_warehouses": source_warehouses,
     }
 
 

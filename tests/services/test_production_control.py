@@ -12,11 +12,13 @@ from app.models import (
     PlannedOrder,
     PlannedPurchase,
     PlanningRun,
+    ProductionMaterialIssue,
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
     ProductionResource,
     SpecComponent,
+    StockWarehouse,
     Specification,
     SupplierOrder,
     SupplierOrderItem,
@@ -24,7 +26,7 @@ from app.models import (
 from app.routers.production_control import list_employees
 from app.services.production_control_journal import create_orders_from_mrp, list_journal
 from app.services.production_control_material_availability import preview_materials
-from app.services.production_control_material_issues import create_material_issues
+from app.services.production_control_material_issues import create_material_issues, list_material_issues
 
 
 def test_list_employees_returns_active_synced_employees(db_session):
@@ -486,6 +488,88 @@ def test_create_material_issues_is_idempotent_per_product(db_session):
         .count()
         == 1
     )
+
+
+def test_material_issue_journal_shows_warehouse_names_and_filters_source(db_session):
+    parent = Item(
+        item_code="P-WH",
+        item_name="Warehouse parent",
+        unit="шт",
+        stock_qty=0,
+        status="active",
+    )
+    db_session.add(parent)
+    db_session.flush()
+    order = ProductionOrder(
+        order_number="WH-001",
+        order_date=datetime(2026, 5, 20),
+        is_posted=True,
+        deletion_mark=False,
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=parent.item_id,
+        line_number=1,
+        quantity=5,
+        produced_qty=0,
+        remaining_qty=5,
+    )
+    db_session.add(product)
+    db_session.add_all([
+        StockWarehouse(
+            warehouse_ref1c="src-a",
+            warehouse_code="A",
+            warehouse_name="Склад отправитель A",
+            is_selected=True,
+        ),
+        StockWarehouse(
+            warehouse_ref1c="src-b",
+            warehouse_code="B",
+            warehouse_name="Склад отправитель B",
+            is_selected=True,
+        ),
+        StockWarehouse(
+            warehouse_ref1c="dst-1",
+            warehouse_code="D",
+            warehouse_name="Склад получатель",
+            is_selected=True,
+        ),
+    ])
+    db_session.flush()
+    db_session.add_all([
+        ProductionMaterialIssue(
+            document_number="MI-WH-A",
+            product_id=product.product_id,
+            order_id=order.order_id,
+            status="requested",
+            direction="issue",
+            source_warehouse_ref1c="src-a",
+            warehouse_ref1c="dst-1",
+        ),
+        ProductionMaterialIssue(
+            document_number="MI-WH-B",
+            product_id=product.product_id,
+            order_id=order.order_id,
+            status="requested",
+            direction="issue",
+            source_warehouse_ref1c="src-b",
+            warehouse_ref1c="dst-1",
+        ),
+    ])
+    db_session.commit()
+
+    result = list_material_issues(db_session, source_warehouse_ref1c="src-a")
+
+    assert result["total"] == 1
+    assert result["rows"][0]["document_number"] == "MI-WH-A"
+    assert result["rows"][0]["source_warehouse_name"] == "Склад отправитель A"
+    assert result["rows"][0]["destination_warehouse_name"] == "Склад получатель"
+    assert {row["warehouse_name"] for row in result["source_warehouses"]} == {
+        "Склад отправитель A",
+        "Склад отправитель B",
+    }
 
 
 def test_create_orders_from_mrp_materializes_planned_orders(db_session):

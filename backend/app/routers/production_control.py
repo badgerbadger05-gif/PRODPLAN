@@ -437,6 +437,7 @@ def post_material_issues(payload: MaterialIssueCreatePayload, db: Session = Depe
 def get_material_issues_journal(
     status: Optional[str] = None,
     search: Optional[str] = None,
+    source_warehouse_ref1c: Optional[str] = None,
     limit: int = 100,
     offset: int = 0,
     db: Session = Depends(get_db),
@@ -446,6 +447,7 @@ def get_material_issues_journal(
             db,
             status=status,
             search=search,
+            source_warehouse_ref1c=source_warehouse_ref1c,
             limit=limit,
             offset=offset,
         )

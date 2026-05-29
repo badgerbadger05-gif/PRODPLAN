@@ -173,7 +173,9 @@ export type TransferIssueRow = {
   remaining_qty: number
   unit?: string | null
   warehouse_ref1c?: string | null
+  destination_warehouse_name?: string | null
   source_warehouse_ref1c?: string | null
+  source_warehouse_name?: string | null
   exported_ref1c?: string | null
   one_c_number?: string | null
   exported_at?: string | null
@@ -191,6 +193,10 @@ export type TransferIssuesResponse = {
   total: number
   limit: number
   offset: number
+  source_warehouses?: Array<{
+    warehouse_ref1c: string
+    warehouse_name?: string | null
+  }>
 }
 
 export type MaterialIssueDetail = TransferIssueRow & {

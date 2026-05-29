@@ -23,11 +23,17 @@ const transferStatusLabels: Record<string, string> = {
   cancelled: 'Отменено',
 }
 
+function warehouseLabel(name?: string | null, ref?: string | null) {
+  return name || ref || '—'
+}
+
 export function TransferRequestsPage() {
   const [rows, setRows] = useState<TransferIssueRow[]>([])
   const [activeId, setActiveId] = useState<number | null>(null)
   const [detail, setDetail] = useState<MaterialIssueDetail | null>(null)
   const [status, setStatus] = useState('')
+  const [sourceWarehouseRef, setSourceWarehouseRef] = useState('')
+  const [sourceWarehouses, setSourceWarehouses] = useState<TransferIssuesResponse['source_warehouses']>([])
   const [search, setSearch] = useState('')
   const [offset, setOffset] = useState(0)
   const [total, setTotal] = useState(0)
@@ -55,9 +61,11 @@ export function TransferRequestsPage() {
       params.set('limit', String(limit))
       params.set('offset', String(nextOffset))
       if (status) params.set('status', status)
+      if (sourceWarehouseRef) params.set('source_warehouse_ref1c', sourceWarehouseRef)
       if (search.trim()) params.set('search', search.trim())
       const data = await api<TransferIssuesResponse>(`/v1/production-control/material-issues?${params.toString()}`)
       setRows(data.rows ?? [])
+      setSourceWarehouses(data.source_warehouses ?? [])
       setTotal(data.total ?? 0)
       setOffset(nextOffset)
       setActiveId((current) => {
@@ -69,7 +77,7 @@ export function TransferRequestsPage() {
     } finally {
       setLoading(false)
     }
-  }, [search, status])
+  }, [search, sourceWarehouseRef, status])
 
   const loadDetail = useCallback(async (issueId: number) => {
     setDetail(null)
@@ -157,7 +165,7 @@ export function TransferRequestsPage() {
               <tbody>
                 <tr>
                   <td className="checkCol"></td>
-                  <td colSpan={5}>
+                  <td colSpan={3}>
                     <div className="columnFilterSearch">
                       <label className="columnFilterControl">
                         <span>Поиск</span>
@@ -166,6 +174,21 @@ export function TransferRequestsPage() {
                       <button onClick={() => void load(0)} disabled={loading}>Найти</button>
                     </div>
                   </td>
+                  <td></td>
+                  <td>
+                    <label className="columnFilterControl">
+                      <span>Склад</span>
+                      <select value={sourceWarehouseRef} onChange={(e) => setSourceWarehouseRef(e.target.value)}>
+                        <option value="">Все</option>
+                        {(sourceWarehouses ?? []).map((warehouse) => (
+                          <option key={warehouse.warehouse_ref1c} value={warehouse.warehouse_ref1c}>
+                            {warehouseLabel(warehouse.warehouse_name, warehouse.warehouse_ref1c)}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </td>
+                  <td></td>
                   <td>
                     <label className="columnFilterControl">
                       <span>Статус</span>
@@ -224,6 +247,9 @@ export function TransferRequestsPage() {
                       <span>{row.unit || ''}</span>
                     </td>
                     <td>
+                      <strong>{warehouseLabel(row.source_warehouse_name, row.source_warehouse_ref1c)}</strong>
+                    </td>
+                    <td>
                       <strong>{row.one_c_number || (row.exported_ref1c ? row.exported_ref1c.slice(0, 8) : '—')}</strong>
                       <span>{row.one_c_number && row.exported_ref1c ? row.exported_ref1c.slice(0, 8) : dateRu(row.exported_at) || row.export_error || ''}</span>
                     </td>
@@ -247,8 +273,8 @@ export function TransferRequestsPage() {
                 <div className="detailGrid">
                   <span>Статус</span><strong>{transferStatusLabels[activeRow.status] || activeRow.status}</strong>
                   <span>Обеспечение</span><strong>{coverageLabels[String(activeRow.line_status || '')] || activeRow.line_status || '—'}</strong>
-                  <span>Отправитель</span><strong>{activeRow.source_warehouse_ref1c || '—'}</strong>
-                  <span>Получатель</span><strong>{activeRow.warehouse_ref1c || '—'}</strong>
+                  <span>Отправитель</span><strong>{warehouseLabel(activeRow.source_warehouse_name, activeRow.source_warehouse_ref1c)}</strong>
+                  <span>Получатель</span><strong>{warehouseLabel(activeRow.destination_warehouse_name, activeRow.warehouse_ref1c)}</strong>
                   <span>Номер 1С</span><strong>{activeRow.one_c_number || '—'}</strong>
                   <span>Ref 1С</span><strong>{activeRow.exported_ref1c || '—'}</strong>
                   {activeRow.export_error && <span>Ошибка 1С</span>}
