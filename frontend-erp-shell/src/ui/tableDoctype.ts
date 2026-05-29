@@ -19,7 +19,7 @@ export type TableSortState<TKey extends string = string> = {
 
 export function tableColumnStyle(column: TableColumnDoctype): CSSProperties {
   return {
-    width: column.grow ? undefined : column.autoWidth ? '1%' : column.width,
+    width: column.grow ? undefined : column.autoWidth ? column.minWidth : column.width,
     minWidth: column.minWidth,
     textAlign: column.align,
   }

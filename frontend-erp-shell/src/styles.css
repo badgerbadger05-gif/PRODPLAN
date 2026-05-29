@@ -514,7 +514,7 @@ input:focus, select:focus {
 
 .productionOrdersTable,
 .transferTable {
-  table-layout: auto;
+  table-layout: fixed;
 }
 
 .productionOrdersTable th:not(.itemCell),
