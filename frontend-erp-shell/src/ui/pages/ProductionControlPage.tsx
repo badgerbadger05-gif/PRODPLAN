@@ -619,13 +619,12 @@ export function ProductionControlPage() {
           onClearSelection={() => setSelectedIds(new Set())}
         />
 
-        <ProductionFilterBar filters={filters} resources={resources} onChange={changeFilters} onSubmit={() => void load(0)} onToggleSort={toggleSort} />
-
         {error && <div className="errorLine">{error}</div>}
         {message && <div className="successLine">{message}</div>}
 
         <div className="split">
           <div className="tablePane">
+            <ProductionFilterBar filters={filters} resources={resources} onChange={changeFilters} onSubmit={() => void load(0)} onToggleSort={toggleSort} />
             <ProductionOrdersTable
               rows={rows}
               activeRow={activeRow}

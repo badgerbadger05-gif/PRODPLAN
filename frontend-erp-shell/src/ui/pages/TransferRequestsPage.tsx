@@ -9,6 +9,8 @@ import { api } from '../../lib/api'
 import { dateRu, qty } from '../../lib/format'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
+import { tableColumnStyle, tableMinWidth } from '../tableDoctype'
+import { transferRequestColumns } from './transferRequestsDoctype'
 
 const limit = 100
 
@@ -139,23 +141,6 @@ export function TransferRequestsPage() {
           </button>
           <button onClick={() => void load(offset)} disabled={loading}>Обновить</button>
           {!canAssemble && assembleDisabledReason && <span className="toolbarText">{assembleDisabledReason}</span>}
-          <div className="barSeparator" />
-          <label className="inlineControl">
-            <span>Статус</span>
-            <select value={status} onChange={(e) => setStatus(e.target.value)}>
-              <option value="">Все</option>
-              <option value="draft">Черновик</option>
-              <option value="requested">Заявка</option>
-              <option value="exported">В 1С</option>
-              <option value="posted">Собрано</option>
-              <option value="error">Ошибка</option>
-            </select>
-          </label>
-          <label className="inlineControl">
-            <span>Поиск</span>
-            <input value={search} onChange={(e) => setSearch(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') void load(0) }} />
-          </label>
-          <button onClick={() => void load(0)} disabled={loading}>Найти</button>
         </div>
 
         {error && <div className="errorLine">{error}</div>}
@@ -163,16 +148,51 @@ export function TransferRequestsPage() {
 
         <div className="split">
           <div className="tablePane">
-            <table className="journalTable transferTable">
+            <table className="journalTable columnFilterTable transferTable" style={{ minWidth: tableMinWidth(transferRequestColumns) }}>
+              <colgroup>
+                {transferRequestColumns.map((column) => (
+                  <col key={column.key} style={tableColumnStyle(column)} />
+                ))}
+              </colgroup>
+              <tbody>
+                <tr>
+                  <td className="checkCol"></td>
+                  <td colSpan={5}>
+                    <div className="columnFilterSearch">
+                      <label className="columnFilterControl">
+                        <span>Поиск</span>
+                        <input value={search} onChange={(e) => setSearch(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') void load(0) }} />
+                      </label>
+                      <button onClick={() => void load(0)} disabled={loading}>Найти</button>
+                    </div>
+                  </td>
+                  <td>
+                    <label className="columnFilterControl">
+                      <span>Статус</span>
+                      <select value={status} onChange={(e) => setStatus(e.target.value)}>
+                        <option value="">Все</option>
+                        <option value="draft">Черновик</option>
+                        <option value="requested">Заявка</option>
+                        <option value="exported">В 1С</option>
+                        <option value="posted">Собрано</option>
+                        <option value="error">Ошибка</option>
+                      </select>
+                    </label>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <table className="journalTable transferTable" style={{ minWidth: tableMinWidth(transferRequestColumns) }}>
+              <colgroup>
+                {transferRequestColumns.map((column) => (
+                  <col key={column.key} style={tableColumnStyle(column)} />
+                ))}
+              </colgroup>
               <thead>
                 <tr>
-                  <th className="checkCol"></th>
-                  <th>Заявка</th>
-                  <th>Заказ</th>
-                  <th>Деталь</th>
-                  <th>Кол-во</th>
-                  <th>1С</th>
-                  <th>Статус</th>
+                  {transferRequestColumns.map((column) => (
+                    <th key={column.key} className={column.className} style={tableColumnStyle(column)}>{column.title}</th>
+                  ))}
                 </tr>
               </thead>
               <tbody>
