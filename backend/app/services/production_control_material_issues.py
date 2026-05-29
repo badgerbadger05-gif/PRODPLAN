@@ -141,6 +141,117 @@ def _auto_select_source_warehouse(
     return None, candidates
 
 
+def _source_warehouse_options(
+    db: Session,
+    component_item_ids: List[int],
+    *,
+    excluded_refs: Optional[set[str]] = None,
+) -> Dict[int, List[Dict[str, Any]]]:
+    if not component_item_ids:
+        return {}
+
+    ignored_refs = {
+        str(r[0])
+        for r in db.query(IgnoredWarehouse.warehouse_ref1c).all()
+    }
+    excluded_refs = {str(ref) for ref in (excluded_refs or set()) if str(ref)}
+    selected_refs = {
+        str(r[0])
+        for r in db.query(StockWarehouse.warehouse_ref1c)
+        .filter(StockWarehouse.is_selected.is_(True))
+        .all()
+    }
+    wh_names: Dict[str, str] = {
+        str(r[0]): str(r[1] or r[0])
+        for r in db.query(StockWarehouse.warehouse_ref1c, StockWarehouse.warehouse_name).all()
+    }
+
+    rows = (
+        db.query(
+            ItemWarehouseStock.item_id,
+            ItemWarehouseStock.warehouse_ref1c,
+            func.sum(ItemWarehouseStock.qty),
+        )
+        .filter(
+            ItemWarehouseStock.item_id.in_(component_item_ids),
+            ItemWarehouseStock.qty > 0,
+        )
+        .group_by(ItemWarehouseStock.item_id, ItemWarehouseStock.warehouse_ref1c)
+        .all()
+    )
+
+    result: Dict[int, List[Dict[str, Any]]] = {}
+    for item_id, wh_ref, qty in rows:
+        ref = str(wh_ref)
+        if ref in ignored_refs or ref in excluded_refs:
+            continue
+        if selected_refs and ref not in selected_refs:
+            continue
+        result.setdefault(int(item_id), []).append(
+            {
+                "ref1c": ref,
+                "name": wh_names.get(ref, ref),
+                "qty": _to_float(qty),
+            }
+        )
+    for options in result.values():
+        options.sort(key=lambda row: (-float(row.get("qty") or 0.0), str(row.get("name") or "")))
+    return result
+
+
+def _allocate_components_by_source_warehouse(
+    db: Session,
+    components: List[Dict[str, Any]],
+    *,
+    destination_warehouse_ref1c: Optional[str] = None,
+    selected_source_warehouse_ref1c: Optional[str] = None,
+) -> Tuple[Dict[Optional[str], List[Dict[str, Any]]], List[Dict[str, Any]]]:
+    component_item_ids = [int(c["component_item_id"]) for c in components]
+    excluded = {str(destination_warehouse_ref1c)} if destination_warehouse_ref1c else set()
+    options_by_item = _source_warehouse_options(
+        db,
+        component_item_ids,
+        excluded_refs=excluded,
+    )
+    selected_ref = _clean_ref1c(selected_source_warehouse_ref1c) or None
+
+    groups: Dict[Optional[str], List[Dict[str, Any]]] = {}
+    selection_required: List[Dict[str, Any]] = []
+    for comp in components:
+        component_id = int(comp["component_item_id"])
+        options = options_by_item.get(component_id, [])
+        if not options:
+            groups.setdefault(None, []).append(comp)
+            continue
+        if len(options) == 1:
+            groups.setdefault(str(options[0]["ref1c"]), []).append(comp)
+            continue
+        option_refs = {str(row["ref1c"]) for row in options}
+        if not selected_ref or selected_ref not in option_refs:
+            selection_required.append(
+                {
+                    "component_item_id": component_id,
+                    "item_name": str(comp.get("item_name") or ""),
+                    "item_article": str(comp.get("item_article") or ""),
+                    "required_qty": _to_float(comp.get("required_qty")),
+                    "warehouse_candidates": [
+                        {
+                            "ref1c": str(row["ref1c"]),
+                            "name": str(row["name"]),
+                            "qty": _to_float(row.get("qty")),
+                        }
+                        for row in options
+                    ],
+                }
+            )
+            continue
+        groups.setdefault(selected_ref, []).append(comp)
+
+    if selection_required:
+        return {}, selection_required
+    return groups, []
+
+
 def _next_issue_number(db: Session) -> str:
     today = datetime.utcnow().strftime("%Y%m%d")
     prefix = f"MI-{today}-"
@@ -223,6 +334,7 @@ def create_material_issues(
     """
     created: List[Dict[str, Any]] = []
     reused: List[Dict[str, Any]] = []
+    selection_required: List[Dict[str, Any]] = []
     errors: List[str] = []
     for pid in product_ids:
         product = (
@@ -235,47 +347,29 @@ def create_material_issues(
             errors.append(f"product_id={pid}: строка заказа не найдена")
             continue
 
-        existing = (
+        existing_rows = (
             db.query(ProductionMaterialIssue)
             .filter(
                 ProductionMaterialIssue.product_id == int(product.product_id),
                 ProductionMaterialIssue.status.in_(("draft", "requested")),
+                ProductionMaterialIssue.direction == "issue",
             )
             .order_by(ProductionMaterialIssue.issue_id.desc())
-            .first()
+            .all()
         )
-        if existing is not None:
-            spec_id, components = _components_for_product(db, product)
-            if not existing.warehouse_ref1c:
-                existing.warehouse_ref1c = _destination_warehouse_for_product(db, product, spec_id)
-            if source_warehouse_ref1c:
-                existing.source_warehouse_ref1c = source_warehouse_ref1c
-            elif (
-                (not existing.source_warehouse_ref1c)
-                or (
-                    existing.warehouse_ref1c
-                    and existing.source_warehouse_ref1c == existing.warehouse_ref1c
+        if existing_rows and not source_warehouse_ref1c:
+            for existing in existing_rows:
+                reused.append(
+                    {
+                        "issue_id": int(existing.issue_id),
+                        "document_number": str(existing.document_number),
+                        "product_id": int(product.product_id),
+                        "order_number": str(product.order.order_number or ""),
+                        "item_name": str(product.item.item_name or ""),
+                        "status": str(existing.status),
+                        "source_warehouse_ref1c": str(existing.source_warehouse_ref1c or ""),
+                    }
                 )
-            ) and components:
-                component_item_ids = [int(c["component_item_id"]) for c in components]
-                excluded = {str(existing.warehouse_ref1c)} if existing.warehouse_ref1c else set()
-                auto_source_wh, _source_candidates = _auto_select_source_warehouse(
-                    db,
-                    component_item_ids,
-                    excluded_refs=excluded,
-                )
-                existing.source_warehouse_ref1c = auto_source_wh
-            db.flush()
-            reused.append(
-                {
-                    "issue_id": int(existing.issue_id),
-                    "document_number": str(existing.document_number),
-                    "product_id": int(product.product_id),
-                    "order_number": str(product.order.order_number or ""),
-                    "item_name": str(product.item.item_name or ""),
-                    "status": str(existing.status),
-                }
-            )
             continue
 
         spec_id, components = _components_for_product(db, product)
@@ -290,64 +384,99 @@ def create_material_issues(
         if not resolved_warehouse:
             resolved_warehouse = _destination_warehouse_for_product(db, product, spec_id)
 
-        # Auto-select source warehouse from per-warehouse stock breakdown.
-        # The destination warehouse must not be auto-picked as source; if the
-        # remaining stock is split between multiple warehouses, return
-        # candidates so the UI can ask the operator.
-        component_item_ids = [int(c["component_item_id"]) for c in components]
-        excluded = {str(resolved_warehouse)} if resolved_warehouse else set()
-        auto_source_wh, source_candidates = _auto_select_source_warehouse(
+        groups, needed_selection = _allocate_components_by_source_warehouse(
             db,
-            component_item_ids,
-            excluded_refs=excluded,
+            components,
+            destination_warehouse_ref1c=resolved_warehouse,
+            selected_source_warehouse_ref1c=source_warehouse_ref1c,
         )
-        resolved_source_wh = source_warehouse_ref1c or auto_source_wh
-
-        issue = ProductionMaterialIssue(
-            document_number="",
-            product_id=int(product.product_id),
-            order_id=int(product.order_id),
-            status="draft",
-            warehouse_ref1c=resolved_warehouse,
-            source_warehouse_ref1c=resolved_source_wh,
-            initiated_by=initiated_by,
-        )
-        db.add(issue)
-        db.flush()
-        issue.document_number = material_issue_number(db, issue)
-        for comp in components:
-            db.add(
-                ProductionMaterialIssueLine(
-                    issue_id=int(issue.issue_id),
-                    component_item_id=int(comp["component_item_id"]),
-                    required_qty=float(comp["required_qty"]),
-                    issued_qty=0.0,
-                    unit=comp.get("unit"),
-                    source_spec_id=spec_id,
-                    line_status="planned",
-                )
+        if needed_selection:
+            selection_required.append(
+                {
+                    "product_id": int(product.product_id),
+                    "order_number": str(product.order.order_number or ""),
+                    "item_name": str(product.item.item_name or ""),
+                    "components": needed_selection,
+                    "warehouse_candidates": needed_selection[0]["warehouse_candidates"],
+                }
             )
-        state = _ensure_state(db, product)
-        state.issue_status = "requested"
-        # Once a material-issue draft is open, the line has moved beyond the
-        # "no coverage yet" phase. Bump status to 'to_move' (документы созданы,
-        # ждём проведения) unless it's already further along.
-        if state.status in {"shortage", "partial", "ready"}:
-            state.status = "to_move"
-        entry: Dict[str, Any] = {
-            "issue_id": int(issue.issue_id),
-            "document_number": issue.document_number,
-            "product_id": int(product.product_id),
-            "order_number": str(product.order.order_number or ""),
-            "item_name": str(product.item.item_name or ""),
-            "lines_count": len(components),
-            "source_warehouse_ref1c": resolved_source_wh,
+            continue
+
+        existing_by_source = {
+            str(row.source_warehouse_ref1c or ""): row
+            for row in existing_rows
         }
-        if len(source_candidates) > 1:
-            entry["warehouse_candidates"] = source_candidates
-        created.append(entry)
+        for resolved_source_wh, grouped_components in groups.items():
+            source_key = str(resolved_source_wh or "")
+            existing = existing_by_source.get(source_key)
+            if existing is not None:
+                if not existing.warehouse_ref1c:
+                    existing.warehouse_ref1c = resolved_warehouse
+                reused.append(
+                    {
+                        "issue_id": int(existing.issue_id),
+                        "document_number": str(existing.document_number),
+                        "product_id": int(product.product_id),
+                        "order_number": str(product.order.order_number or ""),
+                        "item_name": str(product.item.item_name or ""),
+                        "status": str(existing.status),
+                        "source_warehouse_ref1c": str(existing.source_warehouse_ref1c or ""),
+                    }
+                )
+                continue
+
+            issue = ProductionMaterialIssue(
+                document_number="",
+                product_id=int(product.product_id),
+                order_id=int(product.order_id),
+                status="draft",
+                warehouse_ref1c=resolved_warehouse,
+                source_warehouse_ref1c=resolved_source_wh,
+                initiated_by=initiated_by,
+            )
+            db.add(issue)
+            db.flush()
+            issue.document_number = material_issue_number(db, issue)
+            for comp in grouped_components:
+                db.add(
+                    ProductionMaterialIssueLine(
+                        issue_id=int(issue.issue_id),
+                        component_item_id=int(comp["component_item_id"]),
+                        required_qty=float(comp["required_qty"]),
+                        issued_qty=0.0,
+                        unit=comp.get("unit"),
+                        source_spec_id=spec_id,
+                        line_status="planned",
+                    )
+                )
+            entry: Dict[str, Any] = {
+                "issue_id": int(issue.issue_id),
+                "document_number": issue.document_number,
+                "product_id": int(product.product_id),
+                "order_number": str(product.order.order_number or ""),
+                "item_name": str(product.item.item_name or ""),
+                "lines_count": len(grouped_components),
+                "source_warehouse_ref1c": resolved_source_wh,
+            }
+            created.append(entry)
+
+        if groups:
+            state = _ensure_state(db, product)
+            state.issue_status = "requested"
+            # Once material-issue drafts are open, the line has moved beyond
+            # the "no coverage yet" phase. Bump status to 'to_move'
+            # ("документы созданы, ждём проведения") unless it's already
+            # further along.
+            if state.status in {"shortage", "partial", "ready"}:
+                state.status = "to_move"
     db.commit()
-    return {"status": "ok", "created": created, "reused": reused, "errors": errors}
+    return {
+        "status": "ok",
+        "created": created,
+        "reused": reused,
+        "selection_required": selection_required,
+        "errors": errors,
+    }
 
 
 def get_issue(db: Session, issue_id: int) -> Dict[str, Any]:

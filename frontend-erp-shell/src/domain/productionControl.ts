@@ -114,8 +114,9 @@ export type ControlSettings = {
 export type WarehouseCandidate = {
   ref1c: string
   name: string
-  components_covered: number
-  total_components: number
+  components_covered?: number
+  total_components?: number
+  qty?: number
 }
 
 export type MaterialIssueCreateResponse = {
@@ -137,6 +138,20 @@ export type MaterialIssueCreateResponse = {
     order_number?: string
     item_name?: string
     status?: string
+    source_warehouse_ref1c?: string | null
+  }>
+  selection_required?: Array<{
+    product_id: number
+    order_number?: string
+    item_name?: string
+    warehouse_candidates: WarehouseCandidate[]
+    components?: Array<{
+      component_item_id: number
+      item_name: string
+      item_article?: string | null
+      required_qty: number
+      warehouse_candidates: WarehouseCandidate[]
+    }>
   }>
   errors: string[]
 }

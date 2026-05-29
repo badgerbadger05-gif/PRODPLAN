@@ -241,24 +241,16 @@ export function ProductionControlPage() {
         method: 'POST',
         body: JSON.stringify(body),
       })
-      // Collect items where warehouse selection is ambiguous (multiple candidates)
-      const ambiguous = (result.created ?? []).filter(
-        (item) => item.warehouse_candidates && item.warehouse_candidates.length > 1
-      )
-      const autoResolved = (result.created ?? []).filter(
-        (item) => !item.warehouse_candidates || item.warehouse_candidates.length <= 1
-      )
+      const selectionRequired = result.selection_required ?? []
       const errors = result.errors?.length ?? 0
 
-      if (ambiguous.length > 0) {
-        // Use the first item's candidates (in practice all should share the same set
-        // of warehouses for a given workshop's materials)
-        const candidates = ambiguous[0].warehouse_candidates!
+      if (selectionRequired.length > 0) {
+        const candidates = selectionRequired[0].warehouse_candidates
         setWarehousePickerCandidates(candidates)
-        setWarehousePickerProductIds(ambiguous.map((item) => item.product_id))
+        setWarehousePickerProductIds(selectionRequired.map((item) => item.product_id))
         setWarehousePickerSelected(candidates[0]?.ref1c ?? '')
         setWarehousePickerOpen(true)
-        const msg = `Создано документов: ${autoResolved.length}${errors ? `, ошибок ${errors}` : ''}. Для ${ambiguous.length} поз. нужно выбрать склад-источник.`
+        const msg = `Создано документов: ${result.created?.length ?? 0}${errors ? `, ошибок ${errors}` : ''}. Для ${selectionRequired.length} поз. нужно выбрать склад-источник.`
         setMessage(msg)
       } else {
         setSelectedIds(new Set())
@@ -291,6 +283,17 @@ export function ProductionControlPage() {
         method: 'POST',
         body: JSON.stringify({ product_ids: Array.from(selectedIds), initiated_by: 'erp-shell' }),
       })
+      const selectionRequired = issueResult.selection_required ?? []
+      if (selectionRequired.length > 0) {
+        const candidates = selectionRequired[0].warehouse_candidates
+        setWarehousePickerCandidates(candidates)
+        setWarehousePickerProductIds(selectionRequired.map((item) => item.product_id))
+        setWarehousePickerSelected(candidates[0]?.ref1c ?? '')
+        setWarehousePickerOpen(true)
+        setMessage(`Для ${selectionRequired.length} поз. нужно выбрать склад-источник перед выгрузкой в 1С.`)
+        await load(offsetRef.current)
+        return
+      }
       const issueIds = [
         ...(issueResult.created ?? []).map((row) => row.issue_id),
         ...(issueResult.reused ?? []).map((row) => row.issue_id),
@@ -745,7 +748,12 @@ export function ProductionControlPage() {
                     onChange={() => setWarehousePickerSelected(c.ref1c)}
                   />
                   <label htmlFor={`wh-${c.ref1c}`}>
-                    {c.name} ({c.components_covered}/{c.total_components} компонентов)
+                    {c.name}
+                    {typeof c.qty === 'number'
+                      ? ` (${c.qty.toLocaleString('ru-RU')})`
+                      : typeof c.components_covered === 'number' && typeof c.total_components === 'number'
+                        ? ` (${c.components_covered}/${c.total_components} компонентов)`
+                        : ''}
                   </label>
                 </div>
               ))}

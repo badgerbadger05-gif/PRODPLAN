@@ -1100,7 +1100,7 @@ def test_create_material_issues_uses_workshop_binding_when_warehouse_not_pinned(
     assert issue2.warehouse_ref1c == "bbbb2222-bbbb-2222-bbbb-222222222222"
 
 
-def test_create_material_issues_does_not_auto_select_destination_as_source(db_session):
+def test_create_material_issues_splits_components_by_source_warehouse(db_session):
     from app.models import (
         ItemWarehouseStock,
         ProductionMaterialIssue,
@@ -1149,12 +1149,84 @@ def test_create_material_issues_does_not_auto_select_destination_as_source(db_se
     db_session.commit()
 
     result = create_material_issues(db_session, [product.product_id], initiated_by="op")
-    [created] = result["created"]
-    issue = db_session.query(ProductionMaterialIssue).filter_by(issue_id=created["issue_id"]).one()
+    assert result["selection_required"] == []
+    assert len(result["created"]) == 2
+    issues = (
+        db_session.query(ProductionMaterialIssue)
+        .filter(ProductionMaterialIssue.issue_id.in_([row["issue_id"] for row in result["created"]]))
+        .order_by(ProductionMaterialIssue.source_warehouse_ref1c.asc())
+        .all()
+    )
 
-    assert issue.warehouse_ref1c == "WH-DEST"
-    assert issue.source_warehouse_ref1c is None
-    assert {row["ref1c"] for row in created["warehouse_candidates"]} == {"WH-A", "WH-B"}
+    assert [issue.warehouse_ref1c for issue in issues] == ["WH-DEST", "WH-DEST"]
+    assert [issue.source_warehouse_ref1c for issue in issues] == ["WH-A", "WH-B"]
+    assert [len(issue.lines) for issue in issues] == [1, 1]
+    assert {issues[0].lines[0].component_item_id, issues[1].lines[0].component_item_id} == {
+        comp_a.item_id,
+        comp_b.item_id,
+    }
+
+
+def test_create_material_issues_asks_when_component_has_multiple_source_warehouses(db_session):
+    from app.models import (
+        ItemWarehouseStock,
+        ProductionMaterialIssue,
+        ProductionResource,
+        StockWarehouse,
+        WorkshopWarehouseBinding,
+    )
+
+    workshop = ProductionResource(resource_name="Сборочный участок")
+    db_session.add(workshop)
+    db_session.flush()
+
+    parent = Item(item_code="AMB-PARENT", item_name="Parent", item_article="AMB-P", unit="шт", stock_qty=0, status="active")
+    comp = Item(item_code="AMB-C", item_name="Comp", item_article="AMB-C", unit="шт", stock_qty=0, status="active")
+    db_session.add_all([parent, comp])
+    db_session.flush()
+    spec = Specification(spec_name="AMB spec", spec_ref1c="amb-spec")
+    db_session.add(spec)
+    db_session.flush()
+    db_session.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=1))
+
+    order = ProductionOrder(order_number="AMB-001", order_date=datetime(2026, 5, 20), is_posted=True, deletion_mark=False)
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(order_id=order.order_id, item_id=parent.item_id, line_number=1, quantity=1, produced_qty=0, remaining_qty=1)
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(ProductionOrderLineState(product_id=product.product_id, workshop_id=workshop.resource_id))
+    db_session.add(WorkshopWarehouseBinding(workshop_id=workshop.resource_id, warehouse_ref1c="WH-DEST"))
+    db_session.add_all([
+        StockWarehouse(warehouse_ref1c="WH-A", warehouse_code="A", warehouse_name="Склад А", is_selected=True),
+        StockWarehouse(warehouse_ref1c="WH-B", warehouse_code="B", warehouse_name="Склад Б", is_selected=True),
+        StockWarehouse(warehouse_ref1c="WH-DEST", warehouse_code="DEST", warehouse_name="Участок", is_selected=True),
+    ])
+    db_session.add_all([
+        ItemWarehouseStock(item_id=comp.item_id, warehouse_ref1c="WH-A", qty=5),
+        ItemWarehouseStock(item_id=comp.item_id, warehouse_ref1c="WH-B", qty=7),
+        ItemWarehouseStock(item_id=comp.item_id, warehouse_ref1c="WH-DEST", qty=100),
+    ])
+    db_session.commit()
+
+    first = create_material_issues(db_session, [product.product_id], initiated_by="op")
+    assert first["created"] == []
+    assert len(first["selection_required"]) == 1
+    candidates = first["selection_required"][0]["components"][0]["warehouse_candidates"]
+    assert {row["ref1c"] for row in candidates} == {"WH-A", "WH-B"}
+    assert db_session.query(ProductionMaterialIssue).count() == 0
+
+    second = create_material_issues(
+        db_session,
+        [product.product_id],
+        initiated_by="op",
+        source_warehouse_ref1c="WH-B",
+    )
+    assert len(second["created"]) == 1
+    issue = db_session.query(ProductionMaterialIssue).one()
+    assert issue.source_warehouse_ref1c == "WH-B"
+    assert len(issue.lines) == 1
 
 
 # ---------------------------------------------------------------------------

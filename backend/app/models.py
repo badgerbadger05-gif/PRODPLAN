@@ -351,13 +351,13 @@ class ProductionMaterialIssue(Base):
     __tablename__ = "production_material_issues"
     __table_args__ = (
         # At most one ACTIVE (draft|requested) outgoing material issue per
-        # production line. Issues already sent to 1C (exported) or that
-        # errored out can coexist — the user may need to re-prepare a fresh
-        # draft. Returns (direction='return') are excluded so a return draft
-        # can coexist with the original outgoing issue.
+        # production line and source warehouse. A line can legitimately need
+        # several outgoing transfers when its components are stored in
+        # different warehouses.
         Index(
             "ux_production_material_issues_active_per_product",
             "product_id",
+            "source_warehouse_ref1c",
             unique=True,
             postgresql_where=text(
                 "status IN ('draft', 'requested') AND direction = 'issue'"
