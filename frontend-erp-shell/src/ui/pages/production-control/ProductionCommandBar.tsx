@@ -8,8 +8,6 @@ type Props = {
   onSyncFrom1C: () => void
   onProduce: () => void
   onPrintSelected: () => void
-  onCreateMaterialIssues: () => void
-  onLoadMaterials: () => void
   onOpenSettings: () => void
   onRefresh: () => void
   onSelectAll: () => void
@@ -24,8 +22,6 @@ export function ProductionCommandBar({
   onSyncFrom1C,
   onProduce,
   onPrintSelected,
-  onCreateMaterialIssues,
-  onLoadMaterials,
   onOpenSettings,
   onRefresh,
   onSelectAll,
@@ -52,13 +48,12 @@ export function ProductionCommandBar({
       <button onClick={onSyncFrom1C} disabled={loading} title="Проверить статусы в 1С">Синхронизировать</button>
       <div className="barSeparator" />
       <button onClick={onPrintSelected} disabled={!selectedIds.size}>Печать маршрутных</button>
-      <button onClick={onCreateMaterialIssues} disabled={!selectedIds.size || loading}>Выдача материалов</button>
-      <button onClick={onLoadMaterials} disabled={!rows.length}>Материалы</button>
-      <button onClick={onOpenSettings}>Настройки</button>
       <button onClick={onRefresh} disabled={loading}>Обновить</button>
       <div className="barSeparator" />
       <button onClick={onSelectAll} disabled={!rows.length}>Выбрать все</button>
       <button onClick={onClearSelection} disabled={!selectedIds.size}>Снять выбор</button>
+      <div className="commandBarSpacer" />
+      <button onClick={onOpenSettings}>Настройки</button>
     </div>
   )
 }

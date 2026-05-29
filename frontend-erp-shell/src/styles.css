@@ -272,6 +272,10 @@ input:focus, select:focus {
   margin: 0 4px;
 }
 
+.commandBarSpacer {
+  flex: 1 1 auto;
+}
+
 .requisites {
   display: grid;
   grid-template-columns: minmax(300px, 1fr) 150px 190px 140px 140px auto;

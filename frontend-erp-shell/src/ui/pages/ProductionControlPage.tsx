@@ -614,8 +614,6 @@ export function ProductionControlPage() {
           onSyncFrom1C={() => void syncFrom1C()}
           onProduce={() => openProduceDialog()}
           onPrintSelected={() => printRows(Array.from(selectedIds))}
-          onCreateMaterialIssues={() => void createMaterialIssues()}
-          onLoadMaterials={() => activeRow && void loadMaterials(activeRow)}
           onOpenSettings={() => void openSettings()}
           onRefresh={() => void load(offset)}
           onSelectAll={() => setSelectedIds(new Set(rows.map((row) => row.product_id)))}
