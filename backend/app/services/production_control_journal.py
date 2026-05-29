@@ -52,10 +52,10 @@ LINE_STATUSES = {
 ISSUE_STATUSES = {"not_requested", "requested", "issued", "exported", "posted", "error"}
 COVERAGE_LABELS = {
     "shortage": "Дефицит",
-    "partial": "Дефицит",
-    "ready": "В работу",
+    "partial": "Частично",
+    "ready": "Обеспечен",
     "to_move": "К перемещению",
-    "assembled": "В работу",
+    "assembled": "Собрано",
     "in_progress": "В работе",
     "done": "Готов",
     "produced_partial": "Готов",
@@ -68,6 +68,22 @@ STATUS_FILTER_GROUPS = {
     "ready": ("ready", "assembled"),
     "done": ("done", "produced_partial", "produced"),
 }
+
+
+def _journal_work_status(line_status: str) -> str:
+    # "assembled" describes material coverage in the journal, not the workshop
+    # action state. Keep the row actionable as "В работу".
+    if line_status == "assembled":
+        return "ready"
+    return line_status
+
+
+def _journal_coverage_status(line_status: str, issue_status: str) -> str:
+    if issue_status == "posted":
+        return "assembled"
+    if issue_status in {"requested", "issued", "exported"}:
+        return "to_move"
+    return line_status
 
 
 def _forecast_payload(forecast_date: Optional[date], due_date: Optional[date]) -> Dict[str, Any]:
@@ -545,7 +561,10 @@ def list_journal(
         forecast = _forecast_payload(planned_finish, due_date or planned_finish)
 
         issue_count = db.query(ProductionMaterialIssue).filter(ProductionMaterialIssue.product_id == product.product_id).count()
-        coverage_status = str(state.status if state else "shortage")
+        line_status = str(state.status if state else "shortage")
+        issue_status = str(state.issue_status if state else "not_requested")
+        work_status = _journal_work_status(line_status)
+        coverage_status = _journal_coverage_status(line_status, issue_status)
         result.append(
             {
                 "product_id": int(product.product_id),
@@ -565,10 +584,10 @@ def list_journal(
                 "quantity": _to_float(product.quantity),
                 "produced_qty": _to_float(product.produced_qty),
                 "remaining_qty": _to_float(product.remaining_qty),
-                "status": coverage_status,
+                "status": work_status,
                 "coverage_status": coverage_status,
                 "coverage_label": COVERAGE_LABELS.get(coverage_status, coverage_status),
-                "issue_status": str(state.issue_status if state else "not_requested"),
+                "issue_status": issue_status,
                 "planned_start_date": _date_to_iso(planned_start),
                 "planned_finish_date": _date_to_iso(planned_finish),
                 **forecast,

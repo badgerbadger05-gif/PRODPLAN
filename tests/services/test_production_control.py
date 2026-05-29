@@ -124,6 +124,52 @@ def test_journal_and_material_issue_are_scoped_to_order_line(db_session):
     assert journal_after["rows"][0]["issue_count"] == 1
 
 
+def test_journal_splits_work_status_from_material_coverage(db_session):
+    parent = Item(
+        item_code="P-ASM",
+        item_name="Собранная деталь",
+        item_article="ASM",
+        unit="шт",
+        stock_qty=0,
+        status="active",
+    )
+    db_session.add(parent)
+    db_session.flush()
+
+    order = ProductionOrder(
+        order_number="ASM-001",
+        order_date=datetime(2026, 5, 29),
+        is_posted=True,
+        deletion_mark=False,
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=parent.item_id,
+        line_number=1,
+        quantity=1,
+        produced_qty=0,
+        remaining_qty=1,
+    )
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(
+        ProductionOrderLineState(
+            product_id=product.product_id,
+            status="assembled",
+            issue_status="posted",
+        )
+    )
+    db_session.commit()
+
+    row = list_journal(db_session)["rows"][0]
+
+    assert row["status"] == "ready"
+    assert row["coverage_status"] == "assembled"
+    assert row["coverage_label"] == "Собрано"
+
+
 def _make_planned_order(db, item, qty=4) -> PlannedOrder:
     run = PlanningRun(
         status="DONE",

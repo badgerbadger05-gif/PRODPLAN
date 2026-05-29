@@ -281,9 +281,9 @@ def _ui_coverage_status(label: str) -> str:
 
 def _ui_coverage_label(label: str) -> str:
     return {
-        "ok": "В работу",
-        "ready": "В работу",
-        "partial": "Дефицит",
+        "ok": "Обеспечен",
+        "ready": "Обеспечен",
+        "partial": "Частично",
         "shortage": "Дефицит",
     }.get(label, label)
 

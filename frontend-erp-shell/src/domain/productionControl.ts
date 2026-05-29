@@ -205,10 +205,10 @@ export const productionStatusOptions = [
 export const coverageLabels: Record<string, string> = {
   unknown: 'Неизвестно',
   shortage: 'Дефицит',
-  partial: 'Дефицит',
-  ready: 'В работу',
+  partial: 'Частично',
+  ready: 'Обеспечен',
   to_move: 'К перемещению',
-  assembled: 'В работу',
+  assembled: 'Собрано',
   in_progress: 'В работе',
   done: 'Готов',
   produced_partial: 'Готов',
