@@ -1,16 +1,20 @@
-import { productionStatusOptions, type ProductionFilters } from '../../../domain/productionControl'
+import { coverageLabels, productionStatusOptions, type ProductionFilters } from '../../../domain/productionControl'
 import type { ProductionResource } from '../../../domain/resources'
+import type { ProductionOrderSortKey } from './productionOrdersDoctype'
 
 type Props = {
   filters: ProductionFilters
   resources: ProductionResource[]
   onChange: (filters: ProductionFilters) => void
   onSubmit: () => void
+  onToggleSort: (key: ProductionOrderSortKey) => void
 }
 
-export function ProductionFilterBar({ filters, resources, onChange, onSubmit }: Props) {
+const coverageOptions = ['shortage', 'partial', 'ready', 'to_move', 'assembled', 'in_progress', 'done', 'completed'] as const
+
+export function ProductionFilterBar({ filters, resources, onChange, onSubmit, onToggleSort }: Props) {
   return (
-    <div className="requisites">
+    <div className="requisites productionFilters">
       <label>
         <span>Поиск</span>
         <input value={filters.search} onChange={(e) => onChange({ ...filters, search: e.target.value })} onKeyDown={(e) => e.key === 'Enter' && onSubmit()} />
@@ -30,13 +34,15 @@ export function ProductionFilterBar({ filters, resources, onChange, onSubmit }: 
         </select>
       </label>
       <label>
-        <span>Открыт с</span>
-        <input type="date" value={filters.date_from} onChange={(e) => onChange({ ...filters, date_from: e.target.value })} />
+        <span>Обеспечение</span>
+        <select value={filters.coverage_status} onChange={(e) => onChange({ ...filters, coverage_status: e.target.value })}>
+          <option value="">Все</option>
+          {coverageOptions.map((value) => <option key={value} value={value}>{coverageLabels[value]}</option>)}
+        </select>
       </label>
-      <label>
-        <span>Открыт по</span>
-        <input type="date" value={filters.date_to} onChange={(e) => onChange({ ...filters, date_to: e.target.value })} />
-      </label>
+      <button className="filterBtn sortFilterBtn" onClick={() => onToggleSort('planned_start_date')}>
+        План {filters.sort_dir === 'asc' ? '▲' : '▼'}
+      </button>
       <button className="filterBtn" onClick={onSubmit}>Сформировать</button>
     </div>
   )

@@ -15,6 +15,7 @@ from app.models import (
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
+    ProductionResource,
     SpecComponent,
     Specification,
     SupplierOrder,
@@ -168,6 +169,100 @@ def test_journal_splits_work_status_from_material_coverage(db_session):
     assert row["status"] == "ready"
     assert row["coverage_status"] == "assembled"
     assert row["coverage_label"] == "Собрано"
+
+
+def test_journal_filters_by_workshop_and_coverage_before_paging(db_session):
+    item = Item(item_code="P-FLT", item_name="Filter part", unit="шт", stock_qty=0, status="active")
+    workshop_a = ProductionResource(resource_name="Сборка")
+    workshop_b = ProductionResource(resource_name="Покраска")
+    db_session.add_all([item, workshop_a, workshop_b])
+    db_session.flush()
+
+    rows = []
+    for idx, (workshop, status, issue_status) in enumerate([
+        (workshop_a, "shortage", "not_requested"),
+        (workshop_a, "assembled", "posted"),
+        (workshop_b, "assembled", "posted"),
+    ], start=1):
+        order = ProductionOrder(
+            order_number=f"FLT-{idx}",
+            order_date=datetime(2026, 5, 20),
+            is_posted=True,
+            deletion_mark=False,
+        )
+        db_session.add(order)
+        db_session.flush()
+        product = ProductionProduct(
+            order_id=order.order_id,
+            item_id=item.item_id,
+            line_number=1,
+            quantity=1,
+            produced_qty=0,
+            remaining_qty=1,
+        )
+        db_session.add(product)
+        db_session.flush()
+        db_session.add(ProductionOrderLineState(
+            product_id=product.product_id,
+            status=status,
+            issue_status=issue_status,
+            workshop_id=workshop.resource_id,
+        ))
+        rows.append(product)
+    db_session.commit()
+
+    journal = list_journal(
+        db_session,
+        workshop_id=workshop_a.resource_id,
+        coverage_status="assembled",
+        limit=1,
+        offset=0,
+    )
+
+    assert journal["total"] == 1
+    assert [row["order_number"] for row in journal["rows"]] == ["FLT-2"]
+
+
+def test_journal_sorts_by_planned_start_date(db_session):
+    item = Item(item_code="P-SORT", item_name="Sort part", unit="шт", stock_qty=0, status="active")
+    db_session.add(item)
+    db_session.flush()
+
+    for order_number, planned_start in [
+        ("SORT-LATE", _dt.date(2026, 6, 20)),
+        ("SORT-EARLY", _dt.date(2026, 6, 4)),
+        ("SORT-MID", _dt.date(2026, 6, 12)),
+    ]:
+        order = ProductionOrder(
+            order_number=order_number,
+            order_date=datetime(2026, 5, 20),
+            is_posted=True,
+            deletion_mark=False,
+        )
+        db_session.add(order)
+        db_session.flush()
+        product = ProductionProduct(
+            order_id=order.order_id,
+            item_id=item.item_id,
+            line_number=1,
+            quantity=1,
+            produced_qty=0,
+            remaining_qty=1,
+        )
+        db_session.add(product)
+        db_session.flush()
+        db_session.add(ProductionOrderLineState(
+            product_id=product.product_id,
+            status="shortage",
+            planned_start_date=planned_start,
+        ))
+    db_session.commit()
+
+    asc_rows = list_journal(db_session, sort_by="planned_start_date", sort_dir="asc")["rows"]
+    desc_rows = list_journal(db_session, sort_by="planned_start_date", sort_dir="desc")["rows"]
+
+    assert [row["order_number"] for row in asc_rows] == ["SORT-EARLY", "SORT-MID", "SORT-LATE"]
+    assert [row["order_number"] for row in desc_rows] == ["SORT-LATE", "SORT-MID", "SORT-EARLY"]
 
 
 def _make_planned_order(db, item, qty=4) -> PlannedOrder:

@@ -220,8 +220,9 @@ export type ProductionFilters = {
   search: string
   status: string
   workshop_id: string
-  date_from: string
-  date_to: string
+  coverage_status: string
+  sort_by: 'planned_start_date'
+  sort_dir: 'asc' | 'desc'
 }
 
 export function productionStatusLabel(value: string) {

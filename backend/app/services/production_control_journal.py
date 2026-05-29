@@ -462,9 +462,12 @@ def list_journal(
     *,
     workshop_id: Optional[int] = None,
     status: Optional[str] = None,
+    coverage_status: Optional[str] = None,
     search: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
+    sort_by: Optional[str] = None,
+    sort_dir: Optional[str] = None,
     limit: int = 100,
     offset: int = 0,
 ) -> Dict[str, Any]:
@@ -605,6 +608,16 @@ def list_journal(
                 "source_mrp_requirement_id": source_mrp_requirement_id,
             }
         )
+
+    if coverage_status:
+        result = [row for row in result if str(row.get("coverage_status") or "") == str(coverage_status)]
+
+    sort_field = (sort_by or "").strip().lower()
+    if sort_field in {"planned_start_date", "planned_finish_date"}:
+        descending = (sort_dir or "").strip().lower() == "desc"
+        result.sort(key=lambda row: (row.get("order_number") or "", row.get("line_number") or 0))
+        result.sort(key=lambda row: row.get(sort_field) or "", reverse=descending)
+        result.sort(key=lambda row: row.get(sort_field) in (None, ""))
 
     total = len(result)
     effective_limit = max(1, min(int(limit or 100), 500))

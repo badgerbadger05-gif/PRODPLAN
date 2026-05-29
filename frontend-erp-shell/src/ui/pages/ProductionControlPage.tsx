@@ -23,6 +23,7 @@ import { ProductionDetailPane } from './production-control/ProductionDetailPane'
 import { ProductionFilterBar } from './production-control/ProductionFilterBar'
 import { ProductionOrdersTable } from './production-control/ProductionOrdersTable'
 import { ProductionSettingsPane } from './production-control/ProductionSettingsPane'
+import type { ProductionOrderSortKey } from './production-control/productionOrdersDoctype'
 
 const limit = 100
 
@@ -36,7 +37,14 @@ export function ProductionControlPage() {
   const [total, setTotal] = useState(0)
   const [runId, setRunId] = useState<number | null>(null)
   const [offset, setOffset] = useState(0)
-  const [filters, setFilters] = useState<ProductionFilters>({ search: '', status: '', workshop_id: '', date_from: '', date_to: '' })
+  const [filters, setFilters] = useState<ProductionFilters>({
+    search: '',
+    status: '',
+    workshop_id: '',
+    coverage_status: '',
+    sort_by: 'planned_start_date',
+    sort_dir: 'asc',
+  })
   const filtersRef = useRef(filters)
   const offsetRef = useRef(offset)
   const [message, setMessage] = useState('')
@@ -493,6 +501,23 @@ export function ProductionControlPage() {
     window.open(`/api/v1/production-control/route-sheets/print?product_ids=${ids.join(',')}`, '_blank')
   }
 
+  function toggleSort(key: ProductionOrderSortKey) {
+    const current = filtersRef.current
+    const next = {
+      ...current,
+      sort_by: key,
+      sort_dir: current.sort_by === key && current.sort_dir === 'asc' ? 'desc' : 'asc',
+    } satisfies ProductionFilters
+    filtersRef.current = next
+    setFilters(next)
+    void load(0)
+  }
+
+  function changeFilters(next: ProductionFilters) {
+    filtersRef.current = next
+    setFilters(next)
+  }
+
   useEffect(() => {
     void load(0)
     void loadResources()
@@ -547,7 +572,7 @@ export function ProductionControlPage() {
           onClearSelection={() => setSelectedIds(new Set())}
         />
 
-        <ProductionFilterBar filters={filters} resources={resources} onChange={setFilters} onSubmit={() => void load(0)} />
+        <ProductionFilterBar filters={filters} resources={resources} onChange={changeFilters} onSubmit={() => void load(0)} onToggleSort={toggleSort} />
 
         {error && <div className="errorLine">{error}</div>}
         {message && <div className="successLine">{message}</div>}
@@ -558,10 +583,12 @@ export function ProductionControlPage() {
               rows={rows}
               activeRow={activeRow}
               selectedIds={selectedIds}
+              sort={{ sortBy: filters.sort_by, sortDir: filters.sort_dir }}
               onSelectIds={setSelectedIds}
               onActivate={setActiveId}
               onOpenMaterials={(row) => void loadMaterials(row)}
               onChangeStatus={(row, status) => void changeStatus(row, status)}
+              onToggleSort={toggleSort}
             />
           </div>
 

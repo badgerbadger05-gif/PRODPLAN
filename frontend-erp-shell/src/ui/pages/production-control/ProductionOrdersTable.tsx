@@ -1,14 +1,18 @@
 import { coverageLabels, productionStatusOptions, productionStatusSelectValue, type OrderRow } from '../../../domain/productionControl'
 import { dateRu, qty } from '../../../lib/format'
+import { sortGlyph, tableColumnStyle, tableMinWidth, type TableSortState } from '../../tableDoctype'
+import { productionOrderColumns, type ProductionOrderSortKey } from './productionOrdersDoctype'
 
 type Props = {
   rows: OrderRow[]
   activeRow: OrderRow | null
   selectedIds: Set<number>
+  sort: TableSortState<ProductionOrderSortKey>
   onSelectIds: (ids: Set<number>) => void
   onActivate: (id: number) => void
   onOpenMaterials: (row: OrderRow) => void
   onChangeStatus: (row: OrderRow, status: string) => void
+  onToggleSort: (key: ProductionOrderSortKey) => void
 }
 
 function ForecastShift({ row }: { row: OrderRow }) {
@@ -22,19 +26,25 @@ function ForecastShift({ row }: { row: OrderRow }) {
   return <span className={`forecastShift ${cls}`} title={title}>{label}{dateText ? ` · ${dateText}` : ''}</span>
 }
 
-export function ProductionOrdersTable({ rows, activeRow, selectedIds, onSelectIds, onActivate, onOpenMaterials, onChangeStatus }: Props) {
+export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSelectIds, onActivate, onOpenMaterials, onChangeStatus, onToggleSort }: Props) {
   return (
-    <table className="journalTable">
+    <table className="journalTable productionOrdersTable" style={{ minWidth: tableMinWidth(productionOrderColumns) }}>
+      <colgroup>
+        {productionOrderColumns.map((column) => (
+          <col key={column.key} className={column.grow ? 'growCol' : undefined} style={tableColumnStyle(column)} />
+        ))}
+      </colgroup>
       <thead>
         <tr>
-          <th className="checkCol"></th>
-          <th>Заказ</th>
-          <th>Деталь</th>
-          <th>Кол-во</th>
-          <th>Участок</th>
-          <th>План</th>
-          <th>Статус</th>
-          <th>Обеспечение</th>
+          {productionOrderColumns.map((column) => (
+            <th key={column.key} className={column.className} style={tableColumnStyle(column)}>
+              {column.sortable ? (
+                <button type="button" className="tableSortButton" onClick={() => onToggleSort(column.key as ProductionOrderSortKey)}>
+                  {column.title}{sortGlyph(sort, column.key as ProductionOrderSortKey)}
+                </button>
+              ) : column.title}
+            </th>
+          ))}
         </tr>
       </thead>
       <tbody>

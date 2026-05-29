@@ -271,6 +271,10 @@ input:focus, select:focus {
   padding: 7px 8px;
 }
 
+.productionFilters {
+  grid-template-columns: minmax(300px, 1fr) 150px 190px 150px auto auto;
+}
+
 .requisites label {
   display: grid;
   gap: 2px;
@@ -429,6 +433,28 @@ input:focus, select:focus {
   width: 100%;
   height: 22px;
   font-size: 12px;
+}
+
+.tableSortButton {
+  width: 100%;
+  min-height: 0;
+  height: auto;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  box-shadow: none;
+  text-align: left;
+  font-weight: 700;
+}
+
+.tableSortButton:hover:not(:disabled) {
+  border-color: transparent;
+  background: transparent;
+  color: var(--blue);
+}
+
+.productionOrdersTable .itemCell {
+  width: auto;
 }
 
 .pill, .miniPill {
