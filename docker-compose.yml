@@ -65,6 +65,24 @@
       retries: 10
       start_period: 10s
 
+  # Регламент сверки остаточной потребности MRP. Каждые 3 часа POST-ит на
+  # /api/v1/plan/reconcile: пересчитывает активные снимки и добирает
+  # недопокрытие (заказы в журнал, строки закупок). В 1С ничего не пишет.
+  reconcile-worker:
+    build:
+      context: ./backend
+      args:
+        INSTALL_DEV: "true"
+    restart: unless-stopped
+    command: ["python", "reconcile_worker.py"]
+    environment:
+      TZ: Europe/Moscow
+      RECONCILE_BASE_URL: "http://backend:8000"
+      RECONCILE_INTERVAL_SECONDS: "10800"
+    depends_on:
+      backend:
+        condition: service_healthy
+
 volumes:
   postgres_data:
 
