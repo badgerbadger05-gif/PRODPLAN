@@ -158,3 +158,61 @@ def test_schedule_backward_allocates_greedily():
     assert len(planned_by_day) == 3
     assert sorted(planned_by_day.values(), reverse=True) == [8.0, 8.0, 4.0]
     assert not any(w.get("code") == "CAPACITY_UNSCHEDULED" for w in (warnings or []))
+
+# ---------------------------------------------------------------------------
+# BOM-aware orchestration: child→parent precedence, today-anchor, fixed orders
+# ---------------------------------------------------------------------------
+
+def _bom_scheduler():
+    db = FakeSession([_resource(1, 8.0, 1.0)])
+    cfg = {"capacity": {"use_resource_calendars": False}, "planning_horizon_days": 60}
+    return CapacityScheduler(db, cfg)
+
+
+def test_bom_aware_child_finishes_before_parent_starts():
+    sched = _bom_scheduler()
+    d0 = date.today()
+    need = d0 + timedelta(days=10)
+    orders = [
+        {"key": "parent", "item_id": 10, "qty": 1.0, "need_date": need,
+         "stage_hours": {1: 8.0}, "stage_areas": {1: 1}},
+        {"key": "child", "item_id": 20, "qty": 1.0, "need_date": need,
+         "stage_hours": {1: 8.0}, "stage_areas": {1: 1}},
+    ]
+    results, warnings = sched.schedule_orders_bom_aware(orders, {20: {10}})
+
+    parent_start = results["parent"]["order_start_date"].date()
+    child_finish = results["child"]["order_finish_date"].date()
+    assert child_finish <= parent_start
+    assert not any(w.get("code") == "BOM_PRECEDENCE_LATE" for w in warnings)
+
+
+def test_bom_aware_anchors_past_due_order_to_today():
+    sched = _bom_scheduler()
+    d0 = date.today()
+    orders = [
+        {"key": "late", "item_id": 10, "qty": 1.0, "need_date": d0 - timedelta(days=5),
+         "stage_hours": {1: 8.0}, "stage_areas": {1: 1}},
+    ]
+    results, _ = sched.schedule_orders_bom_aware(orders, {})
+    assert results["late"]["order_start_date"].date() >= d0
+
+
+def test_bom_aware_fixed_order_kept_and_child_precedes_it():
+    sched = _bom_scheduler()
+    d0 = date.today()
+    fixed_start = d0 + timedelta(days=3)
+    orders = [
+        {"key": "fixed_parent", "item_id": 10, "qty": 1.0, "need_date": d0 + timedelta(days=10),
+         "stage_hours": {1: 8.0}, "stage_areas": {1: 1},
+         "fixed": True, "fixed_start": fixed_start, "fixed_finish": fixed_start},
+        {"key": "child", "item_id": 20, "qty": 1.0, "need_date": d0 + timedelta(days=10),
+         "stage_hours": {1: 8.0}, "stage_areas": {1: 1}},
+    ]
+    results, _ = sched.schedule_orders_bom_aware(orders, {20: {10}})
+
+    # Fixed parent keeps its date and is flagged.
+    assert results["fixed_parent"].get("fixed") is True
+    assert results["fixed_parent"]["order_start_date"].date() == fixed_start
+    # Child of the fixed parent finishes no later than the parent's fixed start.
+    assert results["child"]["order_finish_date"].date() <= fixed_start

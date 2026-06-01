@@ -38,15 +38,21 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..models import (
+    DefaultSpecification,
     Item,
     MrpRequirement,
+    Operation,
     PlannedPurchase,
     PlanningRun,
     ProductionOrder,
     ProductionOrderLineState,
     ProductionPlanLine,
     ProductionProduct,
+    ResourceStage,
+    SpecComponent,
+    SpecOperation,
 )
+from .capacity_scheduler import CapacityScheduler
 from .period_plan_service import (
     _explode_bom_net_first,
     _load_purchase_supplier_remaining,
@@ -300,6 +306,11 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
             purchase_added.append(entry)
         # rework flow is intentionally not auto-topped-up in v1.
 
+    # Re-anchor every production line that is NOT yet open in 1C to a fresh
+    # capacity-aware, child→parent-aware schedule starting today. Lines already
+    # open in 1C stay where they are and pre-book their capacity.
+    reschedule = _reschedule_run_journal(db, run, dry_run=dry_run)
+
     if dry_run:
         db.rollback()
     else:
@@ -312,7 +323,152 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
         "dry_run": bool(dry_run),
         "production_added": production_added,
         "purchase_added": purchase_added,
+        "rescheduled": reschedule,
     }
+
+
+def _stage_hours_and_areas(
+    db: Session,
+    spec_id: Optional[int],
+    qty: float,
+    resource_id_by_stage: Dict[int, int],
+) -> tuple[Dict[int, float], Dict[int, Optional[int]]]:
+    """Per-stage total norm-hours (time_norm * qty) and the area for each stage."""
+    if not spec_id or qty <= 0:
+        return {}, {}
+    rows = (
+        db.query(
+            SpecOperation.stage_id,
+            func.sum(func.coalesce(SpecOperation.time_norm, Operation.time_norm, 0)).label("h"),
+        )
+        .join(Operation, SpecOperation.operation_id == Operation.operation_id)
+        .filter(SpecOperation.spec_id == int(spec_id))
+        .filter(SpecOperation.stage_id.isnot(None))
+        .group_by(SpecOperation.stage_id)
+        .all()
+    )
+    stage_hours: Dict[int, float] = {}
+    stage_areas: Dict[int, Optional[int]] = {}
+    for stage_id, hours in rows:
+        sid = int(stage_id)
+        per_unit = float(hours or 0.0)
+        if per_unit <= 1e-12:
+            continue
+        stage_hours[sid] = per_unit * float(qty)
+        stage_areas[sid] = resource_id_by_stage.get(sid)
+    return stage_hours, stage_areas
+
+
+def _reschedule_run_journal(db: Session, run: PlanningRun, *, dry_run: bool) -> Dict[str, Any]:
+    """
+    Recompute planned start/finish for the run's production journal lines.
+
+    Lines whose order is already open in 1C (order_ref1c set) are fixed; they
+    keep their dates and pre-book capacity. Lines not yet in 1C are replanned
+    from today, parents-first, components finishing before the assemblies that
+    consume them.
+    """
+    req_ids = [
+        int(r.id)
+        for r in db.query(MrpRequirement.id).filter(MrpRequirement.run_id == int(run.run_id)).all()
+    ]
+    if not req_ids:
+        return {"floating": 0, "fixed": 0, "warnings": []}
+
+    rows = (
+        db.query(ProductionProduct, ProductionOrder, ProductionOrderLineState)
+        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+        .outerjoin(
+            ProductionOrderLineState,
+            ProductionOrderLineState.product_id == ProductionProduct.product_id,
+        )
+        .filter(ProductionProduct.source_mrp_requirement_id.in_(req_ids))
+        .all()
+    )
+    if not rows:
+        return {"floating": 0, "fixed": 0, "warnings": []}
+
+    resource_id_by_stage: Dict[int, int] = {}
+    for sid, rid in db.query(ResourceStage.stage_id, ResourceStage.resource_id).all():
+        resource_id_by_stage.setdefault(int(sid), int(rid))
+
+    req_by_id = {
+        int(r.id): r
+        for r in db.query(MrpRequirement).filter(MrpRequirement.run_id == int(run.run_id)).all()
+    }
+
+    # Build child→parent map among the items in play: a parent's default-spec
+    # components are its children.
+    item_ids = {int(pp.item_id) for pp, _po, _st in rows}
+    default_spec_by_item = {
+        int(ds.item_id): int(ds.spec_id)
+        for ds in db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
+        .filter(DefaultSpecification.item_id.in_(item_ids))
+        .all()
+    }
+    parents_of_item: Dict[int, set] = {}
+    if default_spec_by_item:
+        comp_rows = (
+            db.query(SpecComponent.spec_id, SpecComponent.item_id)
+            .filter(SpecComponent.spec_id.in_(set(default_spec_by_item.values())))
+            .all()
+        )
+        spec_to_parent = {sid: iid for iid, sid in default_spec_by_item.items()}
+        for spec_id, comp_item in comp_rows:
+            parent = spec_to_parent.get(int(spec_id))
+            child = int(comp_item)
+            if parent is not None and child in item_ids:
+                parents_of_item.setdefault(child, set()).add(int(parent))
+
+    scheduler = CapacityScheduler(db, run.config_snapshot or {})
+    orders: List[Dict[str, Any]] = []
+    state_by_key: Dict[int, ProductionOrderLineState] = {}
+    for pp, po, state in rows:
+        qty_open = _to_float(pp.remaining_qty)
+        if qty_open <= 1e-9:
+            qty_open = _to_float(pp.quantity)
+        spec_id = pp.spec_id or default_spec_by_item.get(int(pp.item_id))
+        stage_hours, stage_areas = _stage_hours_and_areas(db, spec_id, qty_open, resource_id_by_stage)
+        req = req_by_id.get(int(pp.source_mrp_requirement_id)) if pp.source_mrp_requirement_id else None
+        need_date = (req.period_to if req else None) or run.period_to
+        fixed = bool(po.order_ref1c)
+        orders.append({
+            "key": int(pp.product_id),
+            "item_id": int(pp.item_id),
+            "qty": qty_open,
+            "need_date": need_date,
+            "stage_hours": stage_hours,
+            "stage_areas": stage_areas,
+            "fixed": fixed,
+            "fixed_start": (state.planned_start_date if state else None),
+            "fixed_finish": (state.planned_finish_date if state else None),
+        })
+        if state is not None:
+            state_by_key[int(pp.product_id)] = state
+
+    results, warnings = scheduler.schedule_orders_bom_aware(orders, parents_of_item)
+
+    floating = 0
+    for key, res in results.items():
+        if res.get("fixed"):
+            continue
+        state = state_by_key.get(key)
+        if state is None:
+            continue
+        start_dt = res.get("order_start_date")
+        finish_dt = res.get("order_finish_date")
+        if isinstance(start_dt, datetime):
+            state.planned_start_date = start_dt.date()
+        elif isinstance(start_dt, date):
+            state.planned_start_date = start_dt
+        if isinstance(finish_dt, datetime):
+            state.planned_finish_date = finish_dt.date()
+        elif isinstance(finish_dt, date):
+            state.planned_finish_date = finish_dt
+        floating += 1
+
+    fixed = sum(1 for o in orders if o.get("fixed"))
+    return {"floating": floating, "fixed": fixed, "warnings": warnings}
 
 
 def reconcile_all_active(db: Session, *, dry_run: bool = False) -> Dict[str, Any]:
