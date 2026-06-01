@@ -1,13 +1,29 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { planningStatusLabel, type PlanningRunRow } from '../../domain/planning'
-import { dateTimeRu, qty } from '../../lib/format'
+import { dateRu, dateTimeRu, qty } from '../../lib/format'
 import { listPlanningRuns, startPlanningRun } from '../../services/planning'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
 
 const limit = 30
 const horizonOptions = [30, 60, 90, 120]
+
+function planLabel(row?: PlanningRunRow | null) {
+  if (!row) return '—'
+  if (row.source_plan_name) return row.source_plan_name
+  if (row.source_plan_id) return `План #${row.source_plan_id}`
+  return 'скользящий план'
+}
+
+function periodLabel(row?: PlanningRunRow | null) {
+  if (!row) return '—'
+  const from = dateRu(row.period_from)
+  const to = dateRu(row.period_to)
+  if (from && to) return `${from} — ${to}`
+  if (from || to) return from || to
+  return '—'
+}
 
 export function MrpRunsPage() {
   const navigate = useNavigate()
@@ -111,10 +127,9 @@ export function MrpRunsPage() {
               <thead>
                 <tr>
                   <th>RUN</th>
+                  <th>План</th>
                   <th>Статус</th>
-                  <th>Старт</th>
-                  <th>Финиш</th>
-                  <th>Источник</th>
+                  <th>Период</th>
                   <th>Горизонт</th>
                   <th>Производство</th>
                   <th>Закупки</th>
@@ -128,10 +143,12 @@ export function MrpRunsPage() {
                       <strong>#{row.run_id}</strong>
                       <span>расчёт</span>
                     </td>
+                    <td className="orderCell">
+                      <strong>{planLabel(row)}</strong>
+                      {row.source_plan_id && <span>план #{row.source_plan_id}</span>}
+                    </td>
                     <td><span className={`pill ${row.status.toLowerCase()}`}>{planningStatusLabel(row.status)}</span></td>
-                    <td>{dateTimeRu(row.started_at) || '—'}</td>
-                    <td>{dateTimeRu(row.finished_at) || '—'}</td>
-                    <td>{row.source_plan_name || 'скользящий план'}</td>
+                    <td>{periodLabel(row)}</td>
                     <td className="numCell"><strong>{qty(row.horizon_days)}</strong><span>дн.</span></td>
                     <td className="numCell"><strong>{qty(row.order_count)}</strong><span>заказов</span></td>
                     <td className="numCell"><strong>{qty(row.purchase_count)}</strong><span>строк</span></td>
@@ -151,8 +168,9 @@ export function MrpRunsPage() {
                 <div className="detailGrid">
                   <span>Старт</span><strong>{dateTimeRu(activeRun.started_at) || '—'}</strong>
                   <span>Финиш</span><strong>{dateTimeRu(activeRun.finished_at) || '—'}</strong>
+                  <span>Период</span><strong>{periodLabel(activeRun)}</strong>
                   <span>Горизонт</span><strong>{qty(activeRun.horizon_days)} дн.</strong>
-                  <span>Источник</span><strong>{activeRun.source_plan_name || 'скользящий план'}</strong>
+                  <span>План</span><strong>{planLabel(activeRun)}</strong>
                   <span>Потребность</span><strong>{qty(activeRun.requirement_count)} / {qty(activeRun.requirement_remaining_qty)}</strong>
                   <span>Производство</span><strong>{qty(activeRun.order_count)}</strong>
                   <span>Закупки</span><strong>{qty(activeRun.purchase_count)}</strong>

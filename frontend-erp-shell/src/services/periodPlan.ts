@@ -93,9 +93,10 @@ export function bulkUpsertPeriodPlanLines(planId: number, entries: Array<{ item_
   })
 }
 
-export function getExecutionJournal(planId: number, params: { run_id?: number; bom_level?: number; flow?: string } = {}) {
+export function getExecutionJournal(planId: number, params: { run_id?: number; root_item_id?: number | null; bom_level?: number; flow?: string } = {}) {
   const search = new URLSearchParams()
   if (params.run_id) search.set('run_id', String(params.run_id))
+  if (params.root_item_id) search.set('root_item_id', String(params.root_item_id))
   if (typeof params.bom_level === 'number') search.set('bom_level', String(params.bom_level))
   if (params.flow) search.set('flow', params.flow)
   return api<ExecutionJournalResponse>(`/v1/plan/period-plans/${planId}/execution-journal?${search.toString()}`)

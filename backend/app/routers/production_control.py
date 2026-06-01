@@ -148,6 +148,7 @@ class ExportPieceworkPayload(BaseModel):
 def get_orders_journal(
     product_id: Optional[int] = None,
     order_id: Optional[int] = None,
+    root_item_id: Optional[int] = None,
     workshop_id: Optional[int] = None,
     status: Optional[str] = None,
     coverage_status: Optional[str] = None,
@@ -165,6 +166,7 @@ def get_orders_journal(
             db,
             product_id=product_id,
             order_id=order_id,
+            root_item_id=root_item_id,
             workshop_id=workshop_id,
             status=status,
             coverage_status=coverage_status,

@@ -11,6 +11,7 @@ from ..models import (
     Item,
     MrpRequirement,
     PlannedOrder,
+    PlanningRun,
     ProductionMaterialIssue,
     ProductionOrder,
     ProductionOrderLineState,
@@ -84,6 +85,34 @@ def _journal_coverage_status(line_status: str, issue_status: str) -> str:
     if issue_status in {"requested", "issued", "exported"}:
         return "to_move"
     return line_status
+
+
+def _bom_descendant_ids_for_root(db: Session, root_item_id: int) -> set[int]:
+    result = {int(root_item_id)}
+    spec_by_item: Dict[int, int] = {
+        int(row.item_id): int(row.spec_id)
+        for row in db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
+        .filter(DefaultSpecification.item_id == int(root_item_id))
+        .all()
+    }
+
+    def visit(item_id: int, seen_specs: set[int]) -> None:
+        spec_id = spec_by_item.get(int(item_id))
+        if not spec_id or spec_id in seen_specs:
+            return
+        next_seen = set(seen_specs)
+        next_seen.add(int(spec_id))
+        for row in db.query(SpecComponent.item_id).filter(SpecComponent.spec_id == int(spec_id)).all():
+            child_id = int(row.item_id)
+            result.add(child_id)
+            if child_id not in spec_by_item:
+                ds = db.query(DefaultSpecification.spec_id).filter(DefaultSpecification.item_id == child_id).first()
+                if ds:
+                    spec_by_item[child_id] = int(ds.spec_id)
+            visit(child_id, next_seen)
+
+    visit(int(root_item_id), set())
+    return result
 
 
 def _forecast_payload(forecast_date: Optional[date], due_date: Optional[date]) -> Dict[str, Any]:
@@ -462,6 +491,7 @@ def list_journal(
     *,
     product_id: Optional[int] = None,
     order_id: Optional[int] = None,
+    root_item_id: Optional[int] = None,
     workshop_id: Optional[int] = None,
     status: Optional[str] = None,
     coverage_status: Optional[str] = None,
@@ -475,6 +505,7 @@ def list_journal(
 ) -> Dict[str, Any]:
     run_id = _latest_run_id(db)
     plan_dates = _planned_dates_by_item(db, run_id)
+    latest_run = db.query(PlanningRun).filter(PlanningRun.run_id == run_id).first() if run_id else None
 
     query = (
         db.query(ProductionProduct)
@@ -495,6 +526,9 @@ def list_journal(
         query = query.filter(ProductionProduct.product_id == int(product_id))
     if order_id is not None:
         query = query.filter(ProductionOrder.order_id == int(order_id))
+    if root_item_id is not None:
+        related_ids = _bom_descendant_ids_for_root(db, int(root_item_id))
+        query = query.filter(ProductionProduct.item_id.in_(related_ids))
     if status:
         status_values = STATUS_FILTER_GROUPS.get(str(status), (str(status),))
         query = query.filter(func.coalesce(ProductionOrderLineState.status, "shortage").in_(status_values))
@@ -651,6 +685,7 @@ def list_journal(
         "limit": effective_limit,
         "offset": effective_offset,
         "latest_run_id": run_id,
+        "latest_source_plan_id": int(latest_run.source_plan_id) if latest_run and latest_run.source_plan_id is not None else None,
     }
 
 

@@ -62,6 +62,7 @@ export type OrdersResponse = {
   limit: number
   offset: number
   latest_run_id?: number | null
+  latest_source_plan_id?: number | null
 }
 
 export type EmployeeOption = {
@@ -242,6 +243,7 @@ export type ProductionFilters = {
   status: string
   workshop_id: string
   coverage_status: string
+  root_item_id: string
   sort_by: 'planned_start_date'
   sort_dir: 'asc' | 'desc'
 }

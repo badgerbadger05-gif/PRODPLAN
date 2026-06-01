@@ -23,6 +23,7 @@ from ..models import (
     PeggingLink,
     Item,
     Unit,
+    ProductionPlanHeader,
     DefaultSpecification,
     SpecComponent,
     ProductionPlanEntry,
@@ -76,6 +77,39 @@ def _unit_display_from_parts(
     if raw_guid and not _REF1C_RE.match(raw_guid):
         return raw_guid
     return "шт."
+
+
+def _bom_descendant_ids_for_roots(db: Session, root_item_ids: List[int]) -> Set[int]:
+    roots = sorted({int(i) for i in root_item_ids if i is not None})
+    if not roots:
+        return set()
+
+    spec_by_item: Dict[int, int] = {
+        int(row.item_id): int(row.spec_id)
+        for row in db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
+        .filter(DefaultSpecification.item_id.in_(roots))
+        .all()
+    }
+    result: Set[int] = set(roots)
+
+    def visit(item_id: int, seen_specs: Set[int]) -> None:
+        spec_id = spec_by_item.get(int(item_id))
+        if not spec_id or spec_id in seen_specs:
+            return
+        next_seen = set(seen_specs)
+        next_seen.add(int(spec_id))
+        for row in db.query(SpecComponent.item_id).filter(SpecComponent.spec_id == int(spec_id)).all():
+            child_id = int(row.item_id)
+            result.add(child_id)
+            if child_id not in spec_by_item:
+                ds = db.query(DefaultSpecification.spec_id).filter(DefaultSpecification.item_id == child_id).first()
+                if ds:
+                    spec_by_item[child_id] = int(ds.spec_id)
+            visit(child_id, next_seen)
+
+    for root_id in roots:
+        visit(root_id, set())
+    return result
 
 
 def _load_stage_area_context(db: Session) -> Tuple[Dict[int, str], Dict[int, int], Dict[int, str]]:
@@ -552,6 +586,13 @@ def list_planning_runs(db: Session, limit: int = 50, offset: int = 0) -> Dict[st
         .limit(max(1, min(int(limit or 50), 200)))
     )
     rows: List[PlanningRun] = q.all()
+    plan_ids = sorted({int(r.source_plan_id) for r in rows if getattr(r, "source_plan_id", None) is not None})
+    plans_by_id: Dict[int, ProductionPlanHeader] = {}
+    if plan_ids:
+        plans_by_id = {
+            int(plan.id): plan
+            for plan in db.query(ProductionPlanHeader).filter(ProductionPlanHeader.id.in_(plan_ids)).all()
+        }
 
     result: List[Dict[str, Any]] = []
     for r in rows:
@@ -563,6 +604,9 @@ def list_planning_runs(db: Session, limit: int = 50, offset: int = 0) -> Dict[st
             .scalar()
             or 0
         )
+        source_plan = plans_by_id.get(int(r.source_plan_id)) if getattr(r, "source_plan_id", None) is not None else None
+        period_from = r.period_from or (source_plan.period_from if source_plan else None)
+        period_to = r.period_to or (source_plan.period_to if source_plan else None)
         result.append(
             {
                 "run_id": int(r.run_id),
@@ -571,6 +615,10 @@ def list_planning_runs(db: Session, limit: int = 50, offset: int = 0) -> Dict[st
                 "finished_at": r.finished_at.isoformat() if r.finished_at else None,
                 "horizon_days": r.horizon_days,
                 "pinned": bool(getattr(r, "pinned", False)),
+                "source_plan_id": int(r.source_plan_id) if r.source_plan_id is not None else None,
+                "source_plan_name": str(source_plan.name or "") if source_plan else None,
+                "period_from": period_from.isoformat() if period_from else None,
+                "period_to": period_to.isoformat() if period_to else None,
                 "order_count": int(order_cnt),
                 "purchase_count": int(purch_cnt),
                 "overload_buckets": int(overload_cnt),
@@ -589,6 +637,11 @@ def get_run_summary(db: Session, run_id: int) -> Dict[str, Any]:
     order_cnt = db.query(func.count(PlannedOrder.order_id)).filter(PlannedOrder.run_id == run_id).scalar() or 0
     purch_cnt = db.query(func.count(PlannedPurchase.purchase_id)).filter(PlannedPurchase.run_id == run_id).scalar() or 0
     rework_cnt = db.query(func.count(PlannedRework.rework_id)).filter(PlannedRework.run_id == run_id).scalar() or 0
+    source_plan = None
+    if getattr(r, "source_plan_id", None) is not None:
+        source_plan = db.query(ProductionPlanHeader).filter(ProductionPlanHeader.id == int(r.source_plan_id)).first()
+    period_from = r.period_from or (source_plan.period_from if source_plan else None)
+    period_to = r.period_to or (source_plan.period_to if source_plan else None)
 
     cap_rows: List[CapacityLoad] = db.query(CapacityLoad).filter(CapacityLoad.run_id == run_id).all()
     overload_total = float(sum(float(x.overload_hours or 0.0) for x in cap_rows))
@@ -638,6 +691,10 @@ def get_run_summary(db: Session, run_id: int) -> Dict[str, Any]:
             "finished_at": r.finished_at.isoformat() if r.finished_at else None,
             "horizon_days": r.horizon_days,
             "pinned": bool(getattr(r, "pinned", False)),
+            "source_plan_id": int(r.source_plan_id) if r.source_plan_id is not None else None,
+            "source_plan_name": str(source_plan.name or "") if source_plan else None,
+            "period_from": period_from.isoformat() if period_from else None,
+            "period_to": period_to.isoformat() if period_to else None,
         },
         "counts": {
             "production_orders": int(order_cnt),
@@ -668,6 +725,7 @@ def get_run_production(
     db: Session,
     run_id: int,
     item_id: Optional[int] = None,
+    root_item_id: Optional[int] = None,
     bucket_type: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
@@ -692,6 +750,9 @@ def get_run_production(
     )
     if item_id is not None:
         q = q.filter(PlannedOrder.item_id == int(item_id))
+    if root_item_id is not None:
+        descendant_ids = _bom_descendant_ids_for_roots(db, [int(root_item_id)])
+        q = q.filter(PlannedOrder.item_id.in_(descendant_ids or {int(root_item_id)}))
     # bucket_type removed from schema; all rows are daily
 
     rows_joined = q.all()
@@ -1094,6 +1155,7 @@ def get_run_purchases(
     db: Session,
     run_id: int,
     item_id: Optional[int] = None,
+    root_item_id: Optional[int] = None,
     bucket_type: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
@@ -1203,6 +1265,9 @@ def get_run_purchases(
     )
     if item_id is not None:
         q = q.filter(PlannedPurchase.item_id == int(item_id))
+    if root_item_id is not None:
+        descendant_ids = _bom_descendant_ids_for_roots(db, [int(root_item_id)])
+        q = q.filter(PlannedPurchase.item_id.in_(descendant_ids or {int(root_item_id)}))
     # bucket_type removed from schema; all rows are daily
 
     rows_joined = q.all()
@@ -1603,6 +1668,7 @@ def get_run_purchases_grouped_by_category(
     db: Session,
     run_id: int,
     item_id: Optional[int] = None,
+    root_item_id: Optional[int] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     limit: int = 100,
@@ -1614,6 +1680,7 @@ def get_run_purchases_grouped_by_category(
         db=db,
         run_id=run_id,
         item_id=item_id,
+        root_item_id=root_item_id,
         bucket_type=None,
         date_from=date_from,
         date_to=date_to,
@@ -1666,6 +1733,7 @@ def _query_run_rework_rows(
     db: Session,
     run_id: int,
     item_id: Optional[int] = None,
+    root_item_id: Optional[int] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
@@ -1688,6 +1756,9 @@ def _query_run_rework_rows(
     )
     if item_id is not None:
         q = q.filter(PlannedRework.item_id == int(item_id))
+    if root_item_id is not None:
+        descendant_ids = _bom_descendant_ids_for_roots(db, [int(root_item_id)])
+        q = q.filter(PlannedRework.item_id.in_(descendant_ids or {int(root_item_id)}))
 
     rows_joined = q.all()
     date_from_dt = _to_date(date_from) if date_from else None
@@ -1749,6 +1820,7 @@ def get_run_rework(
     db: Session,
     run_id: int,
     item_id: Optional[int] = None,
+    root_item_id: Optional[int] = None,
     bucket_type: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
@@ -1761,6 +1833,7 @@ def get_run_rework(
         db=db,
         run_id=run_id,
         item_id=item_id,
+        root_item_id=root_item_id,
         date_from=date_from,
         date_to=date_to,
     )
@@ -1818,6 +1891,7 @@ def get_run_rework_grouped(
     db: Session,
     run_id: int,
     item_id: Optional[int] = None,
+    root_item_id: Optional[int] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     limit: int = 100,
@@ -1829,6 +1903,7 @@ def get_run_rework_grouped(
         db=db,
         run_id=run_id,
         item_id=item_id,
+        root_item_id=root_item_id,
         date_from=date_from,
         date_to=date_to,
     )
@@ -1883,6 +1958,7 @@ def get_run_rework_grouped_by_category(
     db: Session,
     run_id: int,
     item_id: Optional[int] = None,
+    root_item_id: Optional[int] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     limit: int = 100,
@@ -1894,6 +1970,7 @@ def get_run_rework_grouped_by_category(
         db=db,
         run_id=run_id,
         item_id=item_id,
+        root_item_id=root_item_id,
         date_from=date_from,
         date_to=date_to,
     )

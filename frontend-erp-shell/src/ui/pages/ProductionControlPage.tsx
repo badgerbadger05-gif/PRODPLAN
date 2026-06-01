@@ -16,8 +16,10 @@ import {
 } from '../../domain/productionControl'
 import type { ProductionResource } from '../../domain/resources'
 import { api } from '../../lib/api'
+import { getPeriodPlanMatrix } from '../../services/periodPlan'
 import { listResources } from '../../services/resources'
 import { DocumentWindow } from '../layout/DocumentWindow'
+import { RootProductFilterDialog, rootProductLabel, type RootProductOption } from '../RootProductFilterDialog'
 import { StatusBar } from '../layout/StatusBar'
 import { ProductionCommandBar } from './production-control/ProductionCommandBar'
 import { ProductionDetailPane } from './production-control/ProductionDetailPane'
@@ -59,12 +61,16 @@ export function ProductionControlPage() {
   const [error, setError] = useState('')
   const [total, setTotal] = useState(0)
   const [runId, setRunId] = useState<number | null>(null)
+  const [sourcePlanId, setSourcePlanId] = useState<number | null>(null)
+  const [rootOptions, setRootOptions] = useState<RootProductOption[]>([])
+  const [rootDialogOpen, setRootDialogOpen] = useState(false)
   const [offset, setOffset] = useState(0)
   const [filters, setFilters] = useState<ProductionFilters>({
     search: '',
     status: '',
     workshop_id: '',
     coverage_status: '',
+    root_item_id: '',
     sort_by: 'planned_start_date',
     sort_dir: 'asc',
   })
@@ -127,6 +133,7 @@ export function ProductionControlPage() {
       setRows(data.rows ?? [])
       setTotal(data.total ?? 0)
       setRunId(data.latest_run_id ?? null)
+      setSourcePlanId(data.latest_source_plan_id ?? null)
       setOffset(nextOffset)
       setActiveId((current) => {
         const focusedProductId = Number(focusProductId || 0)
@@ -148,6 +155,27 @@ export function ProductionControlPage() {
       setError(e instanceof Error ? e.message : String(e))
     }
   }, [])
+
+  useEffect(() => {
+    let cancelled = false
+    async function loadRootOptions(planId: number) {
+      try {
+        const data = await getPeriodPlanMatrix(planId)
+        if (cancelled) return
+        setRootOptions((data.rows ?? []).map((row) => ({
+          item_id: row.item_id,
+          item_name: row.item_name,
+          item_article: row.item_article,
+          item_code: row.item_code,
+        })))
+      } catch {
+        if (!cancelled) setRootOptions([])
+      }
+    }
+    if (sourcePlanId) void loadRootOptions(sourcePlanId)
+    else setRootOptions([])
+    return () => { cancelled = true }
+  }, [sourcePlanId])
 
   const loadEmployees = useCallback(async () => {
     setEmployeesLoading(true)
@@ -628,6 +656,10 @@ export function ProductionControlPage() {
           onSelectAll={() => setSelectedIds(new Set(rows.map((row) => row.product_id)))}
           onClearSelection={() => setSelectedIds(new Set())}
         />
+        <div className="commandBar" style={{ paddingTop: 0 }}>
+          <button onClick={() => setRootDialogOpen(true)} disabled={!rootOptions.length}>Корневое изделие</button>
+          <span className="toolbarText">{rootProductLabel(rootOptions, filters.root_item_id ? Number(filters.root_item_id) : null)}</span>
+        </div>
 
         {error && <div className="errorLine">{error}</div>}
         {message && <div className="successLine">{message}</div>}
@@ -738,6 +770,19 @@ export function ProductionControlPage() {
           </div>
         </div>
       )}
+      <RootProductFilterDialog
+        open={rootDialogOpen}
+        options={rootOptions}
+        value={filters.root_item_id ? Number(filters.root_item_id) : null}
+        onApply={(value) => {
+          const next = { ...filtersRef.current, root_item_id: value ? String(value) : '' }
+          filtersRef.current = next
+          setFilters(next)
+          setRootDialogOpen(false)
+          void load(0)
+        }}
+        onClose={() => setRootDialogOpen(false)}
+      />
       {warehousePickerOpen && warehousePickerCandidates.length > 0 && (
         <div className="dialogOverlay" onClick={(e) => { if (e.target === e.currentTarget) setWarehousePickerOpen(false) }}>
           <div className="dialogBox">
