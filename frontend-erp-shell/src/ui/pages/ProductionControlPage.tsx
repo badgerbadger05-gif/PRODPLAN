@@ -502,18 +502,19 @@ export function ProductionControlPage() {
     }
   }
 
-  async function fillRemaining(runId: number, requirementId: number) {
+  async function fillRemaining(_runId: number, requirementId: number) {
     setLoading(true)
     setError('')
     setMessage('')
     try {
-      const result = await api<Record<string, unknown>>('/v1/production-control/orders/from-mrp', {
+      const result = await api<Record<string, unknown>>('/v1/production-control/orders/from-mrp-requirements', {
         method: 'POST',
-        body: JSON.stringify({ run_id: runId, planned_order_ids: [requirementId] }),
+        body: JSON.stringify({ requirement_ids: [requirementId], initiated_by: 'erp-shell' }),
       })
       const created = Number(result.created_count ?? (Array.isArray(result.created) ? result.created.length : 0))
-      const existing = Number(result.existing_count ?? (Array.isArray(result.existing) ? result.existing.length : 0))
-      setMessage(`Досоздано: новых ${created}, уже было ${existing}`)
+      const existing = Number(result.existing_count ?? (Array.isArray(result.reused) ? result.reused.length : 0))
+      const skipped = Number(Array.isArray(result.skipped) ? result.skipped.length : 0)
+      setMessage(`Досоздано: новых ${created}, уже было ${existing}${skipped ? `, пропущено ${skipped}` : ''}`)
       await load(offsetRef.current)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))

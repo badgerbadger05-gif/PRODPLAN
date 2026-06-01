@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import type { MrpCapacityRow, MrpProductionRow, MrpPurchaseRow, MrpReworkRow, MrpSummary } from '../../domain/planning'
 import { planningStatusLabel } from '../../domain/planning'
 import { downloadBase64File } from '../../lib/download'
@@ -24,6 +24,16 @@ type Tab = 'production' | 'purchases' | 'rework' | 'capacity'
 
 const limit = 200
 
+function parseTab(value: string | null): Tab | null {
+  if (value === 'production' || value === 'purchases' || value === 'rework' || value === 'capacity') return value
+  return null
+}
+
+function parseId(value: string | null) {
+  const id = Number(value)
+  return Number.isFinite(id) && id > 0 ? id : null
+}
+
 function ForecastShift({ forecast }: { forecast?: { forecast_date?: string | null; forecast_shift_days?: number | null; forecast_reason?: string | null } | null }) {
   if (!forecast || forecast.forecast_shift_days === null || forecast.forecast_shift_days === undefined) return null
   const days = Number(forecast.forecast_shift_days)
@@ -39,6 +49,11 @@ export function MrpResultPage() {
   const { runId: runIdParam } = useParams<{ runId: string }>()
   const runId = Number(runIdParam)
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  const queryTab = parseTab(searchParams.get('tab'))
+  const highlightedProductionId = parseId(searchParams.get('planned_order_id'))
+  const highlightedPurchaseId = parseId(searchParams.get('purchase_id'))
+  const highlightedReworkId = parseId(searchParams.get('rework_id'))
   const [summary, setSummary] = useState<MrpSummary | null>(null)
   const [tab, setTab] = useState<Tab>('production')
   const [productionRows, setProductionRows] = useState<MrpProductionRow[]>([])
@@ -68,6 +83,10 @@ export function MrpResultPage() {
     reworkQty: reworkRows.reduce((sum, row) => sum + Number(row.qty || 0), 0),
     overloadHours: capacityRows.reduce((sum, row) => sum + Number(row.overload_hours || 0), 0),
   }), [productionRows, purchaseRows, reworkRows, capacityRows])
+
+  useEffect(() => {
+    if (queryTab) setTab(queryTab)
+  }, [queryTab])
 
   const load = useCallback(async (nextDateFrom = '', nextDateTo = '') => {
     setLoading(true)
@@ -242,9 +261,9 @@ export function MrpResultPage() {
         </div>
 
         <div className="tablePane resultTablePane">
-          {tab === 'production' && <ProductionResultTable rows={productionRows} selectedIds={selectedProductionIds} onSelectedIdsChange={setSelectedProductionIds} />}
-          {tab === 'purchases' && <PurchaseResultTable rows={purchaseRows} selectedIds={selectedPurchaseIds} onSelectedIdsChange={setSelectedPurchaseIds} />}
-          {tab === 'rework' && <ReworkResultTable rows={reworkRows} />}
+          {tab === 'production' && <ProductionResultTable rows={productionRows} selectedIds={selectedProductionIds} highlightedId={highlightedProductionId} onSelectedIdsChange={setSelectedProductionIds} />}
+          {tab === 'purchases' && <PurchaseResultTable rows={purchaseRows} selectedIds={selectedPurchaseIds} highlightedId={highlightedPurchaseId} onSelectedIdsChange={setSelectedPurchaseIds} />}
+          {tab === 'rework' && <ReworkResultTable rows={reworkRows} highlightedId={highlightedReworkId} />}
           {tab === 'capacity' && <CapacityResultTable rows={capacityRows} />}
         </div>
       </DocumentWindow>
@@ -307,9 +326,10 @@ function rowPurchaseIds(row: MrpPurchaseRow) {
   return row.source_purchase_ids?.length ? row.source_purchase_ids : [row.purchase_id]
 }
 
-function ProductionResultTable({ rows, selectedIds, onSelectedIdsChange }: {
+function ProductionResultTable({ rows, selectedIds, highlightedId, onSelectedIdsChange }: {
   rows: MrpProductionRow[]
   selectedIds: Set<number>
+  highlightedId: number | null
   onSelectedIdsChange: (ids: Set<number>) => void
 }) {
   const visibleIds = rows.filter(isProductionRowSelectable).flatMap(rowOrderIds)
@@ -339,7 +359,7 @@ function ProductionResultTable({ rows, selectedIds, onSelectedIdsChange }: {
       </thead>
       <tbody>
         {rows.map((row) => (
-          <tr key={row.order_id}>
+          <tr key={row.order_id} className={highlightedId && rowOrderIds(row).includes(highlightedId) ? 'activeRow' : undefined}>
             <td className="checkCol">
               <input
                 type="checkbox"
@@ -366,9 +386,10 @@ function ProductionResultTable({ rows, selectedIds, onSelectedIdsChange }: {
   )
 }
 
-function PurchaseResultTable({ rows, selectedIds, onSelectedIdsChange }: {
+function PurchaseResultTable({ rows, selectedIds, highlightedId, onSelectedIdsChange }: {
   rows: MrpPurchaseRow[]
   selectedIds: Set<number>
+  highlightedId: number | null
   onSelectedIdsChange: (ids: Set<number>) => void
 }) {
   const visibleIds = rows.flatMap(rowPurchaseIds)
@@ -405,7 +426,7 @@ function PurchaseResultTable({ rows, selectedIds, onSelectedIdsChange }: {
             ? `${qty(covered)} / ${qty(requested)} ${row.unit || ''} (${coveragePct}%)`
             : '—'
           return (
-          <tr key={row.purchase_id}>
+          <tr key={row.purchase_id} className={highlightedId && rowPurchaseIds(row).includes(highlightedId) ? 'activeRow' : undefined}>
             <td className="checkCol">
               <input
                 type="checkbox"
@@ -434,7 +455,7 @@ function PurchaseResultTable({ rows, selectedIds, onSelectedIdsChange }: {
   )
 }
 
-function ReworkResultTable({ rows }: { rows: MrpReworkRow[] }) {
+function ReworkResultTable({ rows, highlightedId }: { rows: MrpReworkRow[]; highlightedId: number | null }) {
   return (
     <table className="journalTable resultTable">
       <thead>
@@ -450,7 +471,7 @@ function ReworkResultTable({ rows }: { rows: MrpReworkRow[] }) {
       </thead>
       <tbody>
         {rows.map((row) => (
-          <tr key={row.rework_id}>
+          <tr key={row.rework_id} className={highlightedId === row.rework_id ? 'activeRow' : undefined}>
             <td className="itemCell">
               <strong>{row.item_name || `Номенклатура #${row.item_id}`}</strong>
               <span>{row.item_article || ''} {row.badge || ''}</span>

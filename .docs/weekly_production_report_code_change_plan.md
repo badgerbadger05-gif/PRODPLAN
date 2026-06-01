@@ -2,6 +2,13 @@
 
 Дата: 2026-02-06
 
+Статус на 2026-06-01: план реализован. В коде есть таблицы
+`production_day_close` / `production_day_close_item` / `work_calendar_day`,
+сервис `production_report_service.py`, endpoints `/v1/plan/production_report/*`,
+страница `frontend-erp-shell/src/ui/pages/ProductionReportWeekPage.tsx` и тесты
+`tests/services/test_production_report_day_close.py`. Ниже оставлен
+исторический план реализации и принятые правила.
+
 ## 1) Контекст и текущая проблема
 
 ### 1.1. Наблюдение бизнеса

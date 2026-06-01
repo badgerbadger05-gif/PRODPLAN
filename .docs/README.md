@@ -46,16 +46,15 @@ rebuild.bat
 
 ## Матрица CI-команд
 
-Перед мержем убедиться что все четыре шага зелёные:
+Перед мержем убедиться что основные шаги зелёные:
 
 | Шаг | Директория | Команда | Что проверяет |
 |---|---|---|---|
 | Backend pytest | корень проекта | `python -m pytest tests/ -x -q` | 148 тестов сервисов/роутеров |
 | Frontend lint | `frontend-erp-shell/` | `npm run lint` | ESLint flat-config (0 ошибок) |
 | Frontend build | `frontend-erp-shell/` | `npm run build` | TypeScript + Vite (0 ошибок типов) |
+| Frontend smoke | `frontend-erp-shell/` | `npm run smoke` | Playwright smoke по ERP-shell |
 | Docker smoke | корень проекта | `docker compose up -d && curl -f http://localhost:8000/health` | Backend стартует в контейнере |
-
-Playwright (E2E) — пока не настроен, TODO.
 
 ## Правила
 

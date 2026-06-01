@@ -90,7 +90,8 @@ export function ProductionDetailPane({
     }
   }
 
-  const canEditQuantity = activeRow?.source === 'mrp' && !activeRow?.source_mrp_allocation_key?.startsWith('1C')
+  const rowSource = activeRow?.order_source || activeRow?.source
+  const canEditQuantity = rowSource === 'mrp' && !activeRow?.source_mrp_allocation_key?.startsWith('1C')
   const hasMrpCoverage = activeRow?.source_mrp_requirement_id != null && activeRow?.mrp_req_net_qty != null
   const mrpRemaining = activeRow?.mrp_req_remaining_qty ?? 0
   const canFillRemaining = hasMrpCoverage && mrpRemaining > 0.001 && !!activeRow?.source_run_id
@@ -132,7 +133,7 @@ export function ProductionDetailPane({
           <div className="detailMeta">{activeRow.item_article || activeRow.item_code}</div>
           <div className="detailGrid">
             <span>Заказ</span><strong>{activeRow.order_number}</strong>
-            <span>Источник</span><strong>{activeRow.source_mrp_requirement_id ? `MRP req #${activeRow.source_mrp_requirement_id}` : activeRow.source || '1C'}</strong>
+            <span>Источник</span><strong>{activeRow.source_mrp_requirement_id ? `MRP req #${activeRow.source_mrp_requirement_id}` : rowSource || '1C'}</strong>
             <span>Остаток</span><strong>{qty(activeRow.remaining_qty)} {activeRow.unit}</strong>
             <span>Кол-во запуска</span>
             <span className="batchEditCell">

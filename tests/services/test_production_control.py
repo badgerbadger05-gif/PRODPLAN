@@ -9,6 +9,7 @@ from app.models import (
     DefaultSpecification,
     Employee,
     Item,
+    MrpRequirement,
     PlannedOrder,
     PlannedPurchase,
     PlanningRun,
@@ -147,6 +148,68 @@ def test_journal_can_filter_by_product_id(db_session):
     assert result["total"] == 1
     assert result["rows"][0]["product_id"] == product_b.product_id
     assert result["rows"][0]["order_number"] == "FLT-B"
+
+
+def test_journal_exposes_mrp_requirement_coverage_fields(db_session):
+    item = Item(
+        item_code="MRP-COV",
+        item_name="MRP coverage item",
+        unit="шт",
+        stock_qty=0,
+        replenishment_method="Производство",
+        status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+
+    run = PlanningRun(status="FIXED_SNAPSHOT", started_at=datetime(2026, 5, 27))
+    db_session.add(run)
+    db_session.flush()
+    req = MrpRequirement(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        total_required_qty=20,
+        net_required_qty=20,
+        covered_qty=8,
+        remaining_qty=12,
+        period_from=_dt.date(2026, 6, 1),
+        period_to=_dt.date(2026, 6, 5),
+        bom_level=0,
+    )
+    db_session.add(req)
+    db_session.flush()
+
+    order = ProductionOrder(
+        order_number="MRP-R-COV",
+        order_date=datetime(2026, 5, 27),
+        deletion_mark=False,
+        source="mrp",
+        source_run_id=run.run_id,
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=item.item_id,
+        line_number=1,
+        quantity=8,
+        produced_qty=0,
+        remaining_qty=8,
+        source_mrp_requirement_id=req.id,
+        source_mrp_allocation_key="MRP-REQ-1",
+    )
+    db_session.add(product)
+    db_session.commit()
+
+    row = list_journal(db_session, product_id=product.product_id)["rows"][0]
+
+    assert row["order_source"] == "mrp"
+    assert row["source"] == "mrp"
+    assert row["source_mrp_requirement_id"] == req.id
+    assert row["source_mrp_allocation_key"] == "MRP-REQ-1"
+    assert row["mrp_req_net_qty"] == 20
+    assert row["mrp_req_covered_qty"] == 8
+    assert row["mrp_req_remaining_qty"] == 12
 
 
 def test_journal_splits_work_status_from_material_coverage(db_session):

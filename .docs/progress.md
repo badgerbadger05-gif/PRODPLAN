@@ -21,18 +21,30 @@
 
 ## Текущий head миграций Alembic
 
-Цепочка (порядок `down_revision`):
-```
-20260526_01_add_employees
-  ← 20260522_08_add_source_mrp_requirement_id_to_planned_purchase
-  ← 20260522_07_add_bom_level_to_mrp_requirement
-  ← 20260522_06_link_production_products_to_mrp_requirements
-  ← 20260522_05_add_mrp_requirements
-  ← 20260522_04_add_period_plan_journal
-  ← 20260520_09_add_direction_to_material_issues  (и далее вглубь)
-```
+Цепочка продолжается до `20260529_01_material_issue_unique_by_source_warehouse`
+через `20260527_01_add_production_warehouse_to_workshop_bindings` и
+`20260526_01_add_employees`.
 
 ## Последняя сессия
+
+**2026-06-01 — закрыты найденные разрывы по текущему TODO:**
+
+- `Document_СдельныйНаряд` признан реализованным в документации: сервис
+  `one_c_piecework_export.py`, endpoint
+  `POST /v1/production-control/manufactures/export-piecework-to-1c`, вызов из
+  flow «Произвести».
+- Журнал заказов теперь отдаёт в API MRP-поля для period-plan требований:
+  `source`, `source_mrp_allocation_key`, `mrp_req_net_qty`,
+  `mrp_req_covered_qty`, `mrp_req_remaining_qty`.
+- Кнопка «Досоздать» в карточке строки использует
+  `/v1/production-control/orders/from-mrp-requirements`, а не legacy
+  `/orders/from-mrp`.
+- Deep-link из журнала исполнения Period Plan ведёт в журнал заказов или в
+  нужную вкладку MRP-результата (`production`, `purchases`, `rework`) с
+  подсветкой строки.
+- Проверка: `pytest tests/services/test_production_control.py
+  tests/services/test_period_plan_service.py -q` — 42 passed; `npm run lint`
+  и `npm run build` во `frontend-erp-shell` — успешно.
 
 **2026-05-26 — закрыто правило первичных документов из MRP:**
 

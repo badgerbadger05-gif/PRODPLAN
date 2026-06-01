@@ -979,10 +979,27 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   }
 
   function workItemHref(wi: { type: string; product_id?: number; order_id?: number; purchase_id?: number; rework_id?: number; run_id?: number }) {
-    if (wi.type !== 'production_order') return null
-    if (wi.product_id) return `/production-control?product_id=${encodeURIComponent(String(wi.product_id))}`
-    if (wi.order_id) return `/production-control?order_id=${encodeURIComponent(String(wi.order_id))}`
-    return null as string | null
+    if (wi.type === 'production_order') {
+      if (wi.product_id) return `/production-control?product_id=${encodeURIComponent(String(wi.product_id))}`
+      if (wi.order_id) return `/production-control?order_id=${encodeURIComponent(String(wi.order_id))}`
+      return null as string | null
+    }
+    const runId = wi.run_id ?? activeRunId ?? journal?.run_id
+    if (!runId) return null as string | null
+    const search = new URLSearchParams()
+    if (wi.type === 'planned_order') {
+      search.set('tab', 'production')
+      if (wi.order_id) search.set('planned_order_id', String(wi.order_id))
+    } else if (wi.type === 'planned_purchase') {
+      search.set('tab', 'purchases')
+      if (wi.purchase_id) search.set('purchase_id', String(wi.purchase_id))
+    } else if (wi.type === 'planned_rework') {
+      search.set('tab', 'rework')
+      if (wi.rework_id) search.set('rework_id', String(wi.rework_id))
+    } else {
+      return null as string | null
+    }
+    return `/mrp-runs/${encodeURIComponent(String(runId))}?${search.toString()}`
   }
 
   // Column sums for matrix footer
