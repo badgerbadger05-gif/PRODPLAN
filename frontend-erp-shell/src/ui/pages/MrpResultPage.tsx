@@ -300,7 +300,7 @@ export function MrpResultPage() {
           {tab === 'production' && <button className="primary" onClick={() => void createSelectedProductionOrders()} disabled={!selectedProductionIds.size || loading || exporting}>Создать заказы ({selectedProductionIds.size})</button>}
           {tab === 'purchases' && <button className="primary" onClick={() => void exportSelectedPurchasesTo1C()} disabled={!selectedPurchaseIds.size || loading || exporting}>Выгрузить в 1С ({selectedPurchaseIds.size})</button>}
           <div className="barSeparator" />
-          <button onClick={() => setRootDialogOpen(true)} disabled={!rootOptions.length}>Корневое изделие</button>
+          <button onClick={() => setRootDialogOpen(true)}>Корневое изделие</button>
           <span className="toolbarText">{rootProductLabel(rootOptions, rootItemId)}</span>
           <div className="barSeparator" />
           <label className="inlineControl">

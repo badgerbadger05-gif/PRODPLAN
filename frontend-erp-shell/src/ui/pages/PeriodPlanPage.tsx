@@ -1394,6 +1394,8 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
               >
                 Создать заказы производства
               </button>
+              <button onClick={() => setJournalRootDialogOpen(true)}>Корневое изделие</button>
+              <span className="toolbarText">{rootProductLabel(rootOptions, journalRootItemId)}</span>
               {journal && (
                 <>
                   <div className="barSeparator" />

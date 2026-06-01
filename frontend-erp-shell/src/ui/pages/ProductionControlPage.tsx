@@ -657,7 +657,7 @@ export function ProductionControlPage() {
           onClearSelection={() => setSelectedIds(new Set())}
         />
         <div className="commandBar" style={{ paddingTop: 0 }}>
-          <button onClick={() => setRootDialogOpen(true)} disabled={!rootOptions.length}>Корневое изделие</button>
+          <button onClick={() => setRootDialogOpen(true)}>Корневое изделие</button>
           <span className="toolbarText">{rootProductLabel(rootOptions, filters.root_item_id ? Number(filters.root_item_id) : null)}</span>
         </div>
 

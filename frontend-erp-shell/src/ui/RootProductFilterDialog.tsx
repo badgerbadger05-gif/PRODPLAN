@@ -22,6 +22,7 @@ function optionLabel(option?: RootProductOption | null) {
 }
 
 export function rootProductLabel(options: RootProductOption[], value: number | null) {
+  if (!options.length) return 'Нет строк плана'
   return optionLabel(options.find((option) => option.item_id === value) ?? null)
 }
 
@@ -41,7 +42,7 @@ export function RootProductFilterDialog({ open, title = 'Корневое изд
               ))}
             </select>
           </div>
-          {!options.length && <div className="fieldHint">В связанном плане пока нет строк для отбора.</div>}
+          {!options.length && <div className="fieldHint">Связанный периодический план не найден или в нём нет строк для отбора.</div>}
         </div>
         <div className="dialogFooter">
           <button onClick={() => onApply(null)}>Сбросить</button>
