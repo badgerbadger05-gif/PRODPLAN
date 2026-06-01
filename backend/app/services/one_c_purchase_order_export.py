@@ -6,11 +6,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
-from ..models import Item, PlannedPurchase, Unit
+from ..models import Item, PlannedPurchase, SyncLink, Unit
 from .one_c_export_common import (
     clean_ref1c as _clean_ref1c,
     create_odata_client as _create_odata_client,
     fmt_1c_datetime as _fmt_1c_datetime,
+    payload_hash as _payload_hash,
+    upsert_sync_link as _upsert_sync_link,
 )
 from .one_c_document_numbers import purchase_order_number
 from .odata_config import load_odata_config as _load_odata_config
@@ -23,6 +25,7 @@ UNIT_TYPE_1C = "StandardODATA.Catalog_КлассификаторЕдиницИз
 
 @dataclass
 class PurchaseOrderExportLine:
+    purchase_ids: List[int]
     item_id: int
     item_ref1c: str
     item_name: str
@@ -128,6 +131,7 @@ def _collect_purchase_groups(
         supplier_bucket = grouped.setdefault(supplier_ref, {})
         if key not in supplier_bucket:
             supplier_bucket[key] = PurchaseOrderExportLine(
+                purchase_ids=[],
                 item_id=int(row.item_id),
                 item_ref1c=item_ref,
                 item_name=row.item_name or "",
@@ -138,6 +142,7 @@ def _collect_purchase_groups(
                 need_date=need_iso,
                 order_date=order_iso,
             )
+        supplier_bucket[key].purchase_ids.append(int(row.purchase_id))
         supplier_bucket[key].qty += qty
 
     groups: List[PurchaseOrderExportGroup] = []
@@ -192,6 +197,34 @@ def _order_lines_payload(ref_key: str, group: PurchaseOrderExportGroup) -> List[
 
 def _doc_endpoint(ref_key: str) -> str:
     return f"{PURCHASE_ORDER_ENTITY}(guid'{ref_key}')"
+
+
+def _purchase_ids_for_group(group: PurchaseOrderExportGroup) -> List[int]:
+    return sorted({int(pid) for line in group.lines for pid in line.purchase_ids})
+
+
+def _upsert_purchase_links(
+    db: Session,
+    group: PurchaseOrderExportGroup,
+    *,
+    payload_hash: str,
+    target_ref_key: Optional[str],
+    status: str,
+    last_error: Optional[str],
+) -> None:
+    for purchase_id in _purchase_ids_for_group(group):
+        _upsert_sync_link(
+            db,
+            SyncLink,
+            source_doctype="planned_purchase",
+            source_id=int(purchase_id),
+            target_entity=PURCHASE_ORDER_ENTITY,
+            target_number=group.number,
+            payload_hash=payload_hash,
+            target_ref_key=target_ref_key,
+            status=status,
+            last_error=last_error,
+        )
 
 
 def _has_stock_lines(doc: Dict[str, Any]) -> bool:
@@ -272,12 +305,21 @@ def export_planned_purchases_to_1c(
                 if not _has_stock_lines(existing_doc):
                     if not group.target_ref_key:
                         raise RuntimeError(f"1C did not return Ref_Key for existing {group.number}")
-                    client.patch(_doc_endpoint(group.target_ref_key), {"Запасы": _order_lines_payload(group.target_ref_key, group)})
+                    patch_payload = {"Запасы": _order_lines_payload(group.target_ref_key, group)}
+                    client.patch(_doc_endpoint(group.target_ref_key), patch_payload)
                     group.status = "created"
                     created += 1
                 else:
                     group.status = "existing"
                     existing += 1
+                _upsert_purchase_links(
+                    db,
+                    group,
+                    payload_hash=_payload_hash(asdict(group)),
+                    target_ref_key=group.target_ref_key,
+                    status="success",
+                    last_error=None,
+                )
                 continue
 
             min_need = min((date.fromisoformat(line.need_date) for line in group.lines if line.need_date), default=None)
@@ -296,16 +338,34 @@ def export_planned_purchases_to_1c(
             if not ref_key:
                 raise RuntimeError(f"1C did not return Ref_Key for {group.number}")
             group.target_ref_key = ref_key
+            _upsert_purchase_links(
+                db,
+                group,
+                payload_hash=_payload_hash(header_payload),
+                target_ref_key=ref_key,
+                status="success",
+                last_error=None,
+            )
 
             group.status = "created"
             created += 1
         except Exception as exc:
             group.status = "error"
             group.error = str(exc)
+            _upsert_purchase_links(
+                db,
+                group,
+                payload_hash=_payload_hash(asdict(group)),
+                target_ref_key=group.target_ref_key,
+                status="error",
+                last_error=group.error,
+            )
             try:
                 print(f"[1C purchase export] {group.number} failed: {group.error}")
             except Exception:
                 pass
+
+    db.commit()
 
     return {
         "status": "ok" if all(g.status != "error" for g in groups) else "partial_error",

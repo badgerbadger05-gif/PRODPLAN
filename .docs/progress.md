@@ -42,9 +42,16 @@
 - Deep-link из журнала исполнения Period Plan ведёт в журнал заказов или в
   нужную вкладку MRP-результата (`production`, `purchases`, `rework`) с
   подсветкой строки.
+- После успешного `Document_СдельныйНаряд` PRODPLAN отправляет родительскому
+  `Document_ЗаказНаПроизводство` состояние `Завершен`
+  (`СостояниеЗаказа_Key=ad28565a-991b-11eb-e39a-fa163e61326a`) и обновляет
+  локальный `ProductionOrder`.
 - Проверка: `pytest tests/services/test_production_control.py
   tests/services/test_period_plan_service.py -q` — 42 passed; `npm run lint`
-  и `npm run build` во `frontend-erp-shell` — успешно.
+  и `npm run build` во `frontend-erp-shell` — успешно. Дополнительно для
+  цепочки «Произвести»:
+  `pytest tests/services/test_one_c_piecework_export.py tests/services/test_produce_and_manufacture_export.py tests/services/test_production_control.py -q`
+  — 52 passed.
 
 **2026-05-26 — закрыто правило первичных документов из MRP:**
 

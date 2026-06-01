@@ -88,6 +88,11 @@ export type MrpPurchaseRow = {
   main_stage_id?: number | null
   main_stage_name?: string | null
   badge?: string | null
+  supplier_ref1c?: string | null
+  supplier_name?: string | null
+  category_id?: number | null
+  category_name?: string | null
+  category_ref1c?: string | null
   late_supplier_order?: boolean
   turning_blank_priority?: boolean
   source_purchase_ids?: number[]

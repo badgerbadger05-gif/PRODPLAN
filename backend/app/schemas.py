@@ -589,6 +589,10 @@ class PurchaseCategoryGroupOrder(BaseModel):
     bucket_type: Optional[str] = "daily"
     bucket_date: Optional[str] = None
     supplier_ref1c: Optional[str] = None
+    supplier_name: Optional[str] = None
+    category_id: Optional[int] = None
+    category_name: Optional[str] = None
+    category_ref1c: Optional[str] = None
     badge: Optional[str] = None
     turning_blank_priority: Optional[bool] = False
     late_supplier_order: Optional[bool] = False

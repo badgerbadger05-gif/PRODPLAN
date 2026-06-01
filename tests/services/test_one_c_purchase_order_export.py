@@ -2,7 +2,7 @@ import datetime
 
 import pytest
 
-from app.models import Item, PlannedPurchase, PlanningRun, Unit
+from app.models import Item, PlannedPurchase, PlanningRun, SyncLink, Unit
 import app.services.one_c_purchase_order_export as exporter
 from app.services.one_c_purchase_order_export import export_planned_purchases_to_1c
 
@@ -241,3 +241,73 @@ def test_purchase_order_export_refuses_non_demo_base_without_override(db_session
 
     with pytest.raises(PermissionError):
         export_planned_purchases_to_1c(db, run.run_id, dry_run=False)
+
+
+def test_purchase_order_export_stamps_sync_links_for_source_purchases(db_session, monkeypatch):
+    db = db_session
+
+    item = Item(
+        item_code="PO-1C-LINK",
+        item_name="Связанная закупка",
+        item_article="LINK",
+        item_ref1c="item-ref-link",
+        supplier_ref1c="supplier-link",
+        replenishment_method="Покупка",
+        status="active",
+    )
+    db.add(item)
+    db.flush()
+
+    run = _mk_run(db)
+    first = PlannedPurchase(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        requested_qty=2,
+        planned_qty=2,
+        qty=2,
+        need_date=datetime.date(2026, 5, 25),
+        order_date=datetime.date(2026, 5, 20),
+        lead_time_days=5,
+        bucket_date=datetime.date(2026, 5, 25),
+    )
+    second = PlannedPurchase(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        requested_qty=3,
+        planned_qty=3,
+        qty=3,
+        need_date=datetime.date(2026, 5, 25),
+        order_date=datetime.date(2026, 5, 20),
+        lead_time_days=5,
+        bucket_date=datetime.date(2026, 5, 25),
+    )
+    db.add_all([first, second])
+    db.commit()
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def get_all(self, *args, **kwargs):
+            return []
+
+        def post(self, *args, **kwargs):
+            return {"Ref_Key": "purchase-order-ref"}
+
+    monkeypatch.setattr(
+        exporter,
+        "_load_odata_config",
+        lambda: {"base_url": "http://mtzdock/unf_demo/odata/standard.odata"},
+    )
+    monkeypatch.setattr(exporter, "OData1CClient", FakeClient)
+
+    result = export_planned_purchases_to_1c(db, run.run_id, dry_run=False)
+
+    assert result["status"] == "ok"
+    assert result["orders_created"] == 1
+    assert result["orders"][0]["lines"][0]["purchase_ids"] == [first.purchase_id, second.purchase_id]
+    links = db.query(SyncLink).filter_by(source_doctype="planned_purchase").order_by(SyncLink.source_id).all()
+    assert [link.source_id for link in links] == [first.purchase_id, second.purchase_id]
+    assert {link.target_ref_key for link in links} == {"purchase-order-ref"}
+    assert {link.target_entity for link in links} == {"Document_ЗаказПоставщику"}
+    assert {link.status for link in links} == {"success"}

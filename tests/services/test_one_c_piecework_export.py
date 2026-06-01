@@ -310,10 +310,16 @@ def test_live_post_creates_sync_link(db_session, monkeypatch):
     assert fake.operations == [
         "Document_СдельныйНаряд(guid'pw-created-ref')/Post?PostingModeOperational=true"
     ]
-    assert len(fake.patches) == 1
+    assert len(fake.patches) == 2
     assert fake.patches[0][0] == "Document_СдельныйНаряд(guid'pw-created-ref')"
     assert fake.patches[0][1]["Date"] == fake.posts[0][1]["Date"]
     assert fake.patches[0][1]["ДатаЗакрытия"] == fake.posts[0][1]["Date"]
+    assert fake.patches[1][0] == f"Document_ЗаказНаПроизводство(guid'order-ref-{item.item_id}')"
+    assert fake.patches[1][1]["СостояниеЗаказа_Key"] == exporter.DONE_STATE_KEY
+
+    db.refresh(m.order)
+    assert m.order.order_state_key == exporter.DONE_STATE_KEY
+    assert m.order.order_state_name == "Завершен"
 
     link = db.query(SyncLink).filter_by(
         source_doctype="piecework",
@@ -353,12 +359,14 @@ def test_existing_error_link_with_ref_patches_not_posts_duplicate(db_session, mo
 
     assert result["manufactures_created"] == 1
     assert fake.posts == []
-    assert len(fake.patches) == 2
+    assert len(fake.patches) == 3
     assert fake.patches[0][0] == "Document_СдельныйНаряд(guid'existing-ref')"
     assert fake.operations == [
         "Document_СдельныйНаряд(guid'existing-ref')/Post?PostingModeOperational=true"
     ]
     assert fake.patches[1][0] == "Document_СдельныйНаряд(guid'existing-ref')"
+    assert fake.patches[2][0] == f"Document_ЗаказНаПроизводство(guid'order-ref-{item.item_id}')"
+    assert fake.patches[2][1]["СостояниеЗаказа_Key"] == exporter.DONE_STATE_KEY
     link = db.query(SyncLink).filter_by(
         source_doctype="piecework",
         source_id=m.manufacture_id,
@@ -366,6 +374,8 @@ def test_existing_error_link_with_ref_patches_not_posts_duplicate(db_session, mo
     ).one()
     assert link.status == "success"
     assert link.target_ref_key == "existing-ref"
+    db.refresh(m.order)
+    assert m.order.order_state_key == exporter.DONE_STATE_KEY
 
 
 def test_live_post_error_recorded_in_sync_link(db_session, monkeypatch):

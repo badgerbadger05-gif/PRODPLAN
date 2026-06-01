@@ -70,11 +70,44 @@ export function MrpResultPage() {
   const [exporting, setExporting] = useState(false)
   const [selectedProductionIds, setSelectedProductionIds] = useState<Set<number>>(new Set())
   const [selectedPurchaseIds, setSelectedPurchaseIds] = useState<Set<number>>(new Set())
+  const [purchaseSupplierFilter, setPurchaseSupplierFilter] = useState('')
+  const [purchaseCategoryFilter, setPurchaseCategoryFilter] = useState('')
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
 
-  const activeTotal = tab === 'production' ? productionTotal : tab === 'purchases' ? purchaseTotal : tab === 'rework' ? reworkTotal : capacityTotal
-  const activeRowsLength = tab === 'production' ? productionRows.length : tab === 'purchases' ? purchaseRows.length : tab === 'rework' ? reworkRows.length : capacityRows.length
+  const purchaseSupplierOptions = useMemo(() => {
+    const map = new Map<string, string>()
+    purchaseRows.forEach((row) => {
+      const key = row.supplier_ref1c || row.supplier_name || ''
+      if (!key) return
+      map.set(key, row.supplier_name || row.supplier_ref1c || 'Без поставщика')
+    })
+    return Array.from(map.entries()).map(([value, label]) => ({ value, label })).sort((a, b) => a.label.localeCompare(b.label, 'ru'))
+  }, [purchaseRows])
+  const purchaseCategoryOptions = useMemo(() => {
+    const map = new Map<string, string>()
+    purchaseRows.forEach((row) => {
+      const key = row.category_id !== null && row.category_id !== undefined
+        ? String(row.category_id)
+        : (row.category_ref1c || row.category_name || '')
+      if (!key) return
+      map.set(key, row.category_name || 'Без товарной группы')
+    })
+    return Array.from(map.entries()).map(([value, label]) => ({ value, label })).sort((a, b) => a.label.localeCompare(b.label, 'ru'))
+  }, [purchaseRows])
+  const filteredPurchaseRows = useMemo(() => (
+    purchaseRows.filter((row) => {
+      const supplierKey = row.supplier_ref1c || row.supplier_name || ''
+      const categoryKey = row.category_id !== null && row.category_id !== undefined
+        ? String(row.category_id)
+        : (row.category_ref1c || row.category_name || '')
+      if (purchaseSupplierFilter && supplierKey !== purchaseSupplierFilter) return false
+      if (purchaseCategoryFilter && categoryKey !== purchaseCategoryFilter) return false
+      return true
+    })
+  ), [purchaseCategoryFilter, purchaseRows, purchaseSupplierFilter])
+  const activeTotal = tab === 'production' ? productionTotal : tab === 'purchases' ? filteredPurchaseRows.length : tab === 'rework' ? reworkTotal : capacityTotal
+  const activeRowsLength = tab === 'production' ? productionRows.length : tab === 'purchases' ? filteredPurchaseRows.length : tab === 'rework' ? reworkRows.length : capacityRows.length
   const selectedCount = tab === 'production' ? selectedProductionIds.size : tab === 'purchases' ? selectedPurchaseIds.size : 0
 
   const totals = useMemo(() => ({
@@ -112,6 +145,8 @@ export function MrpResultPage() {
       setCapacityTotal(capacityData.total ?? 0)
       setSelectedProductionIds(new Set())
       setSelectedPurchaseIds(new Set())
+      setPurchaseSupplierFilter('')
+      setPurchaseCategoryFilter('')
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -262,7 +297,20 @@ export function MrpResultPage() {
 
         <div className="tablePane resultTablePane">
           {tab === 'production' && <ProductionResultTable rows={productionRows} selectedIds={selectedProductionIds} highlightedId={highlightedProductionId} onSelectedIdsChange={setSelectedProductionIds} />}
-          {tab === 'purchases' && <PurchaseResultTable rows={purchaseRows} selectedIds={selectedPurchaseIds} highlightedId={highlightedPurchaseId} onSelectedIdsChange={setSelectedPurchaseIds} />}
+          {tab === 'purchases' && (
+            <PurchaseResultTable
+              rows={filteredPurchaseRows}
+              selectedIds={selectedPurchaseIds}
+              highlightedId={highlightedPurchaseId}
+              supplierFilter={purchaseSupplierFilter}
+              categoryFilter={purchaseCategoryFilter}
+              supplierOptions={purchaseSupplierOptions}
+              categoryOptions={purchaseCategoryOptions}
+              onSupplierFilterChange={setPurchaseSupplierFilter}
+              onCategoryFilterChange={setPurchaseCategoryFilter}
+              onSelectedIdsChange={setSelectedPurchaseIds}
+            />
+          )}
           {tab === 'rework' && <ReworkResultTable rows={reworkRows} highlightedId={highlightedReworkId} />}
           {tab === 'capacity' && <CapacityResultTable rows={capacityRows} />}
         </div>
@@ -386,10 +434,27 @@ function ProductionResultTable({ rows, selectedIds, highlightedId, onSelectedIds
   )
 }
 
-function PurchaseResultTable({ rows, selectedIds, highlightedId, onSelectedIdsChange }: {
+function PurchaseResultTable({
+  rows,
+  selectedIds,
+  highlightedId,
+  supplierFilter,
+  categoryFilter,
+  supplierOptions,
+  categoryOptions,
+  onSupplierFilterChange,
+  onCategoryFilterChange,
+  onSelectedIdsChange,
+}: {
   rows: MrpPurchaseRow[]
   selectedIds: Set<number>
   highlightedId: number | null
+  supplierFilter: string
+  categoryFilter: string
+  supplierOptions: Array<{ value: string; label: string }>
+  categoryOptions: Array<{ value: string; label: string }>
+  onSupplierFilterChange: (value: string) => void
+  onCategoryFilterChange: (value: string) => void
   onSelectedIdsChange: (ids: Set<number>) => void
 }) {
   const visibleIds = rows.flatMap(rowPurchaseIds)
@@ -409,12 +474,50 @@ function PurchaseResultTable({ rows, selectedIds, highlightedId, onSelectedIdsCh
             />
           </th>
           <th>Номенклатура</th>
+          <th>Поставщик</th>
+          <th>Категория</th>
           <th>К заказу</th>
           <th>Потребность</th>
           <th>Заказать до</th>
           <th>Срок пост.</th>
           <th>Покрыто</th>
           <th>Примечание</th>
+        </tr>
+        <tr>
+          <th />
+          <th />
+          <th>
+            <select
+              className="tableFilterSelect"
+              value={supplierFilter}
+              onChange={(e) => onSupplierFilterChange(e.target.value)}
+              aria-label="Фильтр по поставщику"
+            >
+              <option value="">Все</option>
+              {supplierOptions.map((option) => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
+            </select>
+          </th>
+          <th>
+            <select
+              className="tableFilterSelect"
+              value={categoryFilter}
+              onChange={(e) => onCategoryFilterChange(e.target.value)}
+              aria-label="Фильтр по категории"
+            >
+              <option value="">Все</option>
+              {categoryOptions.map((option) => (
+                <option key={option.value} value={option.value}>{option.label}</option>
+              ))}
+            </select>
+          </th>
+          <th />
+          <th />
+          <th />
+          <th />
+          <th />
+          <th />
         </tr>
       </thead>
       <tbody>
@@ -438,6 +541,13 @@ function PurchaseResultTable({ rows, selectedIds, highlightedId, onSelectedIdsCh
             <td className="itemCell">
               <strong>{row.item_name || `Номенклатура #${row.item_id}`}</strong>
               <span>{row.item_article || ''}</span>
+            </td>
+            <td className="itemCell">
+              <strong>{row.supplier_name || '—'}</strong>
+              <span>{row.supplier_ref1c || ''}</span>
+            </td>
+            <td className="itemCell">
+              <strong>{row.category_name || 'Без товарной группы'}</strong>
             </td>
             <td className="numCell"><strong>{qty(row.qty)}</strong><span>{row.unit || ''}</span></td>
             <td>{dateRu(row.need_date) || '—'}</td>

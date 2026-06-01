@@ -11,6 +11,7 @@ from app.models import (
     DefaultSpecification,
     Item,
     MrpRequirement,
+    PlannedOrder,
     PlannedPurchase,
     PlanningRun,
     ProductionOrder,
@@ -20,6 +21,7 @@ from app.models import (
     ProductionProduct,
     SpecComponent,
     Specification,
+    SyncLink,
     SupplierOrder,
     SupplierOrderItem,
 )
@@ -180,11 +182,152 @@ def test_execution_journal_marks_production_order_opened_in_1c(db_session):
 
     journal = get_period_plan_execution_journal(db_session, plan.id, run_id=run.run_id)
 
-    work_item = journal["rows"][0]["work_items"][0]
+    row = journal["rows"][0]
+    assert row["ordered_qty"] == 12
+    assert row["completed_qty"] == 0
+    work_item = row["work_items"][0]
     assert work_item["type"] == "production_order"
     assert work_item["product_id"] == product.product_id
     assert work_item["order_ref1c"] == "order-ref-opened"
     assert work_item["one_c_opened"] is True
+
+
+def test_execution_journal_does_not_count_planned_task_as_ordered(db_session):
+    bucket = date(2026, 6, 2)
+    item = Item(
+        item_code="MAKE-PLAN",
+        item_name="Плановая производимая деталь",
+        item_article="MAKE-PLAN",
+        unit="шт",
+        stock_qty=0,
+        replenishment_method="Производство",
+        status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+    plan = _make_fixed_plan(db_session, item, bucket, qty=10.0)
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        source_plan_id=plan.id,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        started_at=datetime.datetime(2026, 5, 26, 5, 25),
+        finished_at=datetime.datetime(2026, 5, 26, 5, 25),
+    )
+    db_session.add(run)
+    db_session.flush()
+    req = MrpRequirement(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        total_required_qty=10,
+        net_required_qty=10,
+        covered_qty=0,
+        remaining_qty=10,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        bom_level=0,
+    )
+    db_session.add(req)
+    db_session.flush()
+    db_session.add(
+        PlannedOrder(
+            run_id=run.run_id,
+            item_id=item.item_id,
+            requested_qty=10,
+            planned_qty=10,
+            qty=10,
+            need_date=bucket,
+            start_date=bucket,
+            finish_date=bucket,
+            bucket_date=bucket,
+            demand_ref=f"mrp_requirement:{req.id}",
+            demand_date=bucket,
+        )
+    )
+    db_session.commit()
+
+    row = get_period_plan_execution_journal(db_session, plan.id, run_id=run.run_id)["rows"][0]
+
+    assert row["ordered_qty"] == 0
+    assert row["completed_qty"] == 0
+    assert row["remaining_qty"] == 10
+    assert row["work_items"][0]["type"] == "planned_order"
+    assert row["work_items"][0]["qty"] == 10
+
+
+def test_execution_journal_counts_supplier_order_accepted_to_stock_as_completed(db_session):
+    bucket = date(2026, 6, 2)
+    item = _make_purchased_item(db_session, "BUY-DONE")
+    plan = _make_fixed_plan(db_session, item, bucket, qty=10.0)
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        source_plan_id=plan.id,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        started_at=datetime.datetime(2026, 5, 26, 5, 25),
+        finished_at=datetime.datetime(2026, 5, 26, 5, 25),
+    )
+    db_session.add(run)
+    db_session.flush()
+    req = MrpRequirement(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        total_required_qty=10,
+        net_required_qty=10,
+        covered_qty=0,
+        remaining_qty=10,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        bom_level=0,
+    )
+    db_session.add(req)
+    db_session.flush()
+    purchase = PlannedPurchase(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        requested_qty=10,
+        planned_qty=10,
+        qty=10,
+        need_date=bucket,
+        order_date=bucket,
+        lead_time_days=0,
+        bucket_date=bucket,
+        source_mrp_requirement_id=req.id,
+    )
+    db_session.add(purchase)
+    db_session.flush()
+    supplier_order = SupplierOrder(
+        order_number="ЗП-ACCEPTED",
+        order_date=datetime.datetime(2026, 6, 1),
+        order_ref1c="supplier-order-accepted-ref",
+        is_posted=True,
+        deletion_mark=False,
+        order_state_name="Принят на склад",
+    )
+    db_session.add(supplier_order)
+    db_session.add(
+        SyncLink(
+            source_doctype="planned_purchase",
+            source_id=purchase.purchase_id,
+            target_entity="Document_ЗаказПоставщику",
+            target_ref_key="supplier-order-accepted-ref",
+            target_number="ЗП-ACCEPTED",
+            status="success",
+        )
+    )
+    db_session.commit()
+
+    row = get_period_plan_execution_journal(db_session, plan.id, run_id=run.run_id)["rows"][0]
+
+    assert row["ordered_qty"] == 10
+    assert row["completed_qty"] == 10
+    assert row["remaining_qty"] == 0
+    assert row["coverage_pct"] == 100
+    work_item = row["work_items"][0]
+    assert work_item["type"] == "planned_purchase"
+    assert work_item["one_c_opened"] is True
+    assert work_item["order_ref1c"] == "supplier-order-accepted-ref"
+    assert work_item["order_state"] == "Принят на склад"
 
 
 class TestPurchaseAllocationNoSupplierOrders:

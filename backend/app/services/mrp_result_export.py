@@ -159,6 +159,8 @@ def export_purchases_results_xlsx(
     headers = [
         "Наименование",
         "Артикул",
+        "Поставщик",
+        "Категория",
         "Количество",
         "ЕИ",
         "Дата потребности",
@@ -172,6 +174,8 @@ def export_purchases_results_xlsx(
         return [
             order.get("item_name") or "",
             order.get("item_article") or "",
+            order.get("supplier_name") or order.get("supplier_ref1c") or "",
+            order.get("category_name") or "",
             float(order.get("qty") or 0.0),
             order.get("unit") or "",
             order.get("need_date") or "",

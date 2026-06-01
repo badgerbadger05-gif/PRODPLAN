@@ -61,8 +61,10 @@ from .one_c_manufacture_export import export_manufactures_to_1c
 
 
 PIECEWORK_ENTITY = "Document_СдельныйНаряд"
+PRODUCTION_ORDER_ENTITY = "Document_ЗаказНаПроизводство"
 BASIS_TYPE = "StandardODATA.Document_СборкаЗапасов"
 ORDER_TYPE = "StandardODATA.Document_ЗаказНаПроизводство"
+DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
 
 
 @dataclass
@@ -484,6 +486,22 @@ def export_piecework_to_1c(
                     "ДатаЗакрытия": entry.document_datetime,
                 },
             )
+        order_ref = _clean_ref1c(entry.order_ref1c)
+        if order_ref:
+            if patch is None:
+                raise RuntimeError("OData client cannot patch production order completion state")
+            patch(
+                f"{PRODUCTION_ORDER_ENTITY}(guid'{order_ref}')",
+                {"СостояниеЗаказа_Key": DONE_STATE_KEY},
+            )
+            order = (
+                db.query(ProductionOrder)
+                .filter(ProductionOrder.order_id == int(entry.order_id))
+                .one_or_none()
+            )
+            if order is not None:
+                order.order_state_key = DONE_STATE_KEY
+                order.order_state_name = "Завершен"
 
     created, errored = _post_export_entries(
         db,

@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import type {
   ExecutionJournalResponse,
+  ExecutionWorkItem,
   PeriodPlan,
   PeriodPlanMatrix,
   PeriodPlanRun,
@@ -980,8 +981,8 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
 
   function workItemHref(wi: { type: string; product_id?: number; order_id?: number; purchase_id?: number; rework_id?: number; run_id?: number }) {
     if (wi.type === 'production_order') {
-      if (wi.product_id) return `/production-control?product_id=${encodeURIComponent(String(wi.product_id))}`
-      if (wi.order_id) return `/production-control?order_id=${encodeURIComponent(String(wi.order_id))}`
+      if (wi.product_id) return `#/production-control?product_id=${encodeURIComponent(String(wi.product_id))}`
+      if (wi.order_id) return `#/production-control?order_id=${encodeURIComponent(String(wi.order_id))}`
       return null as string | null
     }
     const runId = wi.run_id ?? activeRunId ?? journal?.run_id
@@ -999,7 +1000,17 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     } else {
       return null as string | null
     }
-    return `/mrp-runs/${encodeURIComponent(String(runId))}?${search.toString()}`
+    return `#/mrp-runs/${encodeURIComponent(String(runId))}?${search.toString()}`
+  }
+
+  function workItemStartedQty(wi: ExecutionWorkItem) {
+    return wi.type === 'planned_order' || wi.type === 'planned_purchase' || wi.type === 'planned_rework'
+      ? wi.qty
+      : null
+  }
+
+  function workItemOrderedQty(wi: ExecutionWorkItem) {
+    return wi.type === 'production_order' || (wi.type === 'planned_purchase' && wi.one_c_opened) ? wi.qty : null
   }
 
   // Column sums for matrix footer
@@ -1519,6 +1530,8 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                         </tr>
                         {expandedReq === row.req_id && row.work_items.map((wi, i) => {
                           const href = workItemHref(wi as unknown as { type: string; product_id?: number; order_id?: number; purchase_id?: number; rework_id?: number; run_id?: number })
+                          const startedQty = workItemStartedQty(wi)
+                          const orderedQty = workItemOrderedQty(wi)
                           const label = wi.type === 'production_order'
                             ? `Заказ ${wi.order_number || '#' + wi.order_id}`
                             : wi.type === 'planned_order'
@@ -1544,13 +1557,22 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                                     {wi.one_c_opened ? 'Открыт в 1С' : 'Внутренний заказ'}
                                   </span>
                                 )}
+                                {wi.type === 'planned_purchase' && wi.one_c_opened && (
+                                  <span
+                                    className={`miniPill ${(wi.completed_qty ?? 0) > 0 ? 'ready' : 'partial'}`}
+                                    title={wi.order_state || (wi.order_ref1c ? `1C Ref_Key: ${wi.order_ref1c}` : 'Заказ поставщику в 1С')}
+                                    style={{ marginLeft: 8 }}
+                                  >
+                                    {(wi.completed_qty ?? 0) > 0 ? 'Принят на склад' : 'Заказ в 1С'}
+                                  </span>
+                                )}
                               </td>
                               <td />
                               <td />
-                              <td className="numCell"><strong>{qty(wi.qty)}</strong></td>
+                              <td className="numCell">{startedQty !== null ? <strong>{qty(startedQty)}</strong> : '—'}</td>
+                              <td className="numCell">{orderedQty !== null ? <strong>{qty(orderedQty)}</strong> : '—'}</td>
                               <td className="numCell">{wi.completed_qty !== undefined && wi.completed_qty > 0 ? qty(wi.completed_qty) : '—'}</td>
                               <td className="numCell">{wi.remaining_qty !== undefined ? qty(wi.remaining_qty) : '—'}</td>
-                              <td />
                               <td style={{ textAlign: 'center' }}>
                                 {wi.need_date ? <span className="muted">{dateRu(wi.need_date)}</span> : '—'}
                                 <ForecastShift forecast={wi} />

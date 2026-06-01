@@ -38,6 +38,7 @@ from ..models import (
     ProductionProduct,
     SupplierOrder,
     SupplierOrderItem,
+    Supplier,
     ItemCategory,
 )
 from ..models import RootProduct
@@ -1342,6 +1343,30 @@ def get_run_purchases(
         db,
         [int(row[1]) for row in filtered_rows if row[1] is not None],
     )
+    category_by_item = _load_item_category_meta(
+        db,
+        [int(row[1]) for row in filtered_rows if row[1] is not None],
+    )
+    supplier_refs = sorted({
+        str(row[8]).strip()
+        for row in filtered_rows
+        if row[8] is not None and str(row[8]).strip()
+    })
+    supplier_name_by_ref: Dict[str, str] = {}
+    if supplier_refs:
+        try:
+            supplier_rows = (
+                db.query(Supplier.supplier_ref1c, Supplier.supplier_name)
+                .filter(Supplier.supplier_ref1c.in_(supplier_refs))
+                .all()
+            )
+            supplier_name_by_ref = {
+                str(ref): str(name or "")
+                for ref, name in supplier_rows
+                if ref
+            }
+        except Exception:
+            supplier_name_by_ref = {}
     
     for row in filtered_rows:
         (
@@ -1392,6 +1417,8 @@ def get_run_purchases(
         )
         badge = _merge_badges(turning_badge, late_supplier_badge)
         area_meta = purchase_area_by_item.get(item_id_int, {})
+        category_meta = category_by_item.get(item_id_int, {})
+        supplier_ref_clean = str(supplier_ref1c_val or "").strip()
         
         if agg_key not in aggregated_data:
             aggregated_data[agg_key] = {
@@ -1407,7 +1434,11 @@ def get_run_purchases(
                 "priority_index": float(priority_index_val or 0.0) if priority_index_val is not None else None,
                 "bucket_type": "daily",
                 "bucket_date": bucket_date_val.isoformat() if bucket_date_val else None,
-                "supplier_ref1c": supplier_ref1c_val,
+                "supplier_ref1c": supplier_ref_clean or None,
+                "supplier_name": supplier_name_by_ref.get(supplier_ref_clean) or "",
+                "category_id": category_meta.get("group_id"),
+                "category_name": category_meta.get("group_name") or "Без товарной группы",
+                "category_ref1c": category_meta.get("group_ref1c"),
                 "badge": badge,
                 "turning_blank_priority": bool(turning_badge),
                 "late_supplier_order": bool(late_supplier_badge),
@@ -1474,6 +1505,10 @@ def get_run_purchases(
             normalized["unit"] = row.get("unit") or ""
             normalized["lead_time_days"] = int(row.get("lead_time_days") or 0)
             normalized["supplier_ref1c"] = row.get("supplier_ref1c") or ""
+            normalized["supplier_name"] = row.get("supplier_name") or ""
+            normalized["category_id"] = row.get("category_id")
+            normalized["category_name"] = row.get("category_name") or ""
+            normalized["category_ref1c"] = row.get("category_ref1c") or ""
             normalized["purchase_id"] = int(row.get("purchase_id") or 0)
             normalized["main_area_id"] = row.get("main_area_id")
             normalized["main_area_name"] = row.get("main_area_name")
@@ -1527,21 +1562,28 @@ def _load_item_category_meta(db: Session, item_ids: List[int]) -> Dict[int, Dict
     if not unique_ids:
         return {}
 
-    rows = (
-        db.query(
-            Item.item_id,
-            ItemCategory.category_id,
-            ItemCategory.category_code,
-            ItemCategory.category_name,
-            ItemCategory.category_ref1c,
+    try:
+        rows = (
+            db.query(
+                Item.item_id,
+                ItemCategory.category_id,
+                ItemCategory.category_code,
+                ItemCategory.category_name,
+                ItemCategory.category_ref1c,
+            )
+            .outerjoin(ItemCategory, Item.category_id == ItemCategory.category_id)
+            .filter(Item.item_id.in_(unique_ids))
+            .all()
         )
-        .outerjoin(ItemCategory, Item.category_id == ItemCategory.category_id)
-        .filter(Item.item_id.in_(unique_ids))
-        .all()
-    )
+    except Exception:
+        rows = []
 
     result: Dict[int, Dict[str, Any]] = {}
-    for item_id_val, category_id_val, category_code_val, category_name_val, category_ref1c_val in rows:
+    for row in rows:
+        try:
+            item_id_val, category_id_val, category_code_val, category_name_val, category_ref1c_val = row
+        except Exception:
+            continue
         has_linked_category = category_id_val is not None
         resolved_group_name = (category_name_val or "").strip()
         if not resolved_group_name and has_linked_category:

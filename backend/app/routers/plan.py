@@ -1412,12 +1412,14 @@ async def export_planning_result_purchases(
         )
         rows = res.get("rows", []) or []
 
-        headers = ["Наименование", "Артикул", "Количество", "ЕИ", "Пометка"]
+        headers = ["Наименование", "Артикул", "Поставщик", "Категория", "Количество", "ЕИ", "Пометка"]
         data_rows = []
         for r in rows:
             data_rows.append([
                 r.get("item_name") or "",
                 r.get("item_article") or "",
+                r.get("supplier_name") or r.get("supplier_ref1c") or "",
+                r.get("category_name") or "",
                 float(r.get("qty") or 0.0),
                 r.get("unit") or "",
                 r.get("badge") or "",

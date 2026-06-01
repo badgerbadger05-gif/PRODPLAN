@@ -29,6 +29,7 @@ from ..models import (
     SpecComponent,
     SpecOperation,
     Specification,
+    SyncLink,
     SupplierOrder,
     SupplierOrderItem,
 )
@@ -36,6 +37,7 @@ from .planning_service import (
     DEFAULT_PLANNING_CONFIG,
     SUPPLIER_ORDER_EXCLUDED_STATE_NAMES,
     get_active_planning_config,
+    _normalize_supplier_order_state_name,
 )
 from .capacity_scheduler import CapacityScheduler
 from .mrp_stock_helpers import (
@@ -55,6 +57,7 @@ PLAN_STATUSES = {"draft", "fixed", "archived"}
 
 # Matches planning_service.DONE_STATE_KEY — 1C state for completed production orders.
 _DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
+_SUPPLIER_ORDER_DONE_STATES = {"принят на склад"}
 
 
 def _parse_date(value: Any, field: str = "date") -> date:
@@ -142,6 +145,13 @@ def _serialize_plan(
         "line_count": int(line_count or 0) if line_count is not None else None,
         "total_qty": float(total_qty or 0.0) if total_qty is not None else None,
     }
+
+
+def _is_supplier_order_done(order: Optional[SupplierOrder]) -> bool:
+    if order is None or bool(getattr(order, "deletion_mark", False)):
+        return False
+    state_name = _normalize_supplier_order_state_name(getattr(order, "order_state_name", None))
+    return state_name in _SUPPLIER_ORDER_DONE_STATES
 
 
 def _get_plan(db: Session, plan_id: int) -> ProductionPlanHeader:
@@ -1433,31 +1443,78 @@ def get_period_plan_execution_journal(
     purchases_by_item_fallback: Dict[int, List[Dict[str, Any]]] = {}
     purchase_ordered_by_req_id: Dict[int, float] = {}
     purchase_ordered_by_item_fallback: Dict[int, float] = {}
-    for pp in (
+    purchase_done_by_req_id: Dict[int, float] = {}
+    purchase_done_by_item_fallback: Dict[int, float] = {}
+    planned_purchase_rows = (
         db.query(PlannedPurchase)
         .filter(PlannedPurchase.run_id == int(run.run_id), PlannedPurchase.item_id.in_(item_ids))
         .all()
-    ):
+    )
+    purchase_ids = [int(pp.purchase_id) for pp in planned_purchase_rows]
+    purchase_links_by_id: Dict[int, SyncLink] = {}
+    if purchase_ids:
+        for link in (
+            db.query(SyncLink)
+            .filter(
+                SyncLink.source_system == "PRODPLAN",
+                SyncLink.source_doctype == "planned_purchase",
+                SyncLink.source_id.in_(purchase_ids),
+                SyncLink.target_entity == "Document_ЗаказПоставщику",
+                SyncLink.status == "success",
+                SyncLink.target_ref_key.isnot(None),
+            )
+            .all()
+        ):
+            purchase_links_by_id[int(link.source_id)] = link
+    supplier_refs = sorted({
+        str(link.target_ref_key).strip()
+        for link in purchase_links_by_id.values()
+        if str(link.target_ref_key or "").strip()
+    })
+    supplier_orders_by_ref: Dict[str, SupplierOrder] = {}
+    if supplier_refs:
+        for order in (
+            db.query(SupplierOrder)
+            .filter(SupplierOrder.order_ref1c.in_(supplier_refs))
+            .all()
+        ):
+            supplier_orders_by_ref[str(order.order_ref1c or "").strip()] = order
+
+    for pp in planned_purchase_rows:
         qty_value = _to_float(pp.qty)
+        purchase_id = int(pp.purchase_id)
+        link = purchase_links_by_id.get(purchase_id)
+        supplier_ref = str(getattr(link, "target_ref_key", "") or "").strip() if link else ""
+        supplier_order = supplier_orders_by_ref.get(supplier_ref) if supplier_ref else None
+        is_ordered = bool(supplier_ref)
+        is_done = _is_supplier_order_done(supplier_order)
+        ordered_value = qty_value if is_ordered else 0.0
+        done_value = qty_value if is_done else 0.0
         entry = {
             "type": "planned_purchase",
-            "purchase_id": int(pp.purchase_id),
+            "purchase_id": purchase_id,
             "qty": qty_value,
-            "completed_qty": 0.0,
-            "remaining_qty": qty_value,
+            "completed_qty": done_value,
+            "remaining_qty": max(0.0, qty_value - done_value),
             "need_date": pp.need_date.isoformat() if pp.need_date else None,
             "order_date": pp.order_date.isoformat() if pp.order_date else None,
             "lead_time_days": int(pp.lead_time_days or 0),
+            "order_ref1c": supplier_ref or None,
+            "order_number": str(getattr(supplier_order, "order_number", "") or "") if supplier_order else None,
+            "order_state": str(getattr(supplier_order, "order_state_name", "") or getattr(supplier_order, "order_state_key", "") or "") if supplier_order else None,
+            "one_c_opened": is_ordered,
             **_forecast_payload(pp.need_date, pp.need_date, reason="purchase"),
         }
         if pp.source_mrp_requirement_id is not None:
             req_id = int(pp.source_mrp_requirement_id)
             purchases_by_req_id.setdefault(req_id, []).append(entry)
-            purchase_ordered_by_req_id[req_id] = purchase_ordered_by_req_id.get(req_id, 0.0) + qty_value
+            purchase_ordered_by_req_id[req_id] = purchase_ordered_by_req_id.get(req_id, 0.0) + ordered_value
+            purchase_done_by_req_id[req_id] = purchase_done_by_req_id.get(req_id, 0.0) + done_value
         else:
             item_id = int(pp.item_id)
             purchases_by_item_fallback.setdefault(item_id, []).append(entry)
-            purchase_ordered_by_item_fallback[item_id] = purchase_ordered_by_item_fallback.get(item_id, 0.0) + qty_value
+            purchase_ordered_by_item_fallback[item_id] = purchase_ordered_by_item_fallback.get(item_id, 0.0) + ordered_value
+            purchase_done_by_item_fallback[item_id] = purchase_done_by_item_fallback.get(item_id, 0.0) + done_value
 
     # Rework: PlannedRework by run_id + item_id
     reworks_by_item: Dict[int, List[Dict[str, Any]]] = {}
@@ -1509,15 +1566,15 @@ def get_period_plan_execution_journal(
             actual_items = prods_by_req_id.get(req_id, [])
             planned_items = planned_orders_by_req_id.get(req_id, [])
             work_items = actual_items or planned_items
-            ordered_qty = max(
-                prod_ordered_by_req_id.get(req_id, 0.0),
-                planned_ordered_by_req_id.get(req_id, 0.0),
-            )
+            # "В заказах" is the quantity placed into real production orders.
+            # Planned MRP tasks remain visible in work_items and in "К запуску",
+            # but they are not actual orders yet.
+            ordered_qty = prod_ordered_by_req_id.get(req_id, 0.0)
             completed_qty = prod_done_by_req_id.get(req_id, 0.0)
         elif item_flow == REPLENISHMENT_FLOW_PURCHASE:
             work_items = purchases_by_req_id.get(req_id, []) or purchases_by_item_fallback.get(item_id, [])
             ordered_qty = purchase_ordered_by_req_id.get(req_id, purchase_ordered_by_item_fallback.get(item_id, 0.0))
-            completed_qty = 0.0
+            completed_qty = purchase_done_by_req_id.get(req_id, purchase_done_by_item_fallback.get(item_id, 0.0))
         else:
             work_items = reworks_by_item.get(item_id, [])
             ordered_qty = rework_ordered_by_item.get(item_id, 0.0)
