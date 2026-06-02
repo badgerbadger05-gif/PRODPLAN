@@ -171,12 +171,3 @@ def save_groups_selection(payload: GroupsSelection):
     GROUPS_SELECTED.parent.mkdir(parents=True, exist_ok=True)
     GROUPS_SELECTED.write_text(json.dumps(payload.ids, ensure_ascii=False, indent=2), encoding="utf-8")
     return {"status": "ok", "saved": len(payload.ids)}
-
-
-@router.post("/reindex")
-def reindex_placeholder():
-    """
-    Заглушка для переиндексации номенклатуры.
-    Вprod-версии тут может запускаться фоновая задача.
-    """
-    return {"status": "ok", "message": "Reindex task enqueued (placeholder)"}
