@@ -1003,6 +1003,29 @@ def create_mrp_snapshot_from_period_plan(
                             stage_norms_by_spec.setdefault(int(row.spec_id), []).append((sid, hours))
                     except Exception:
                         continue
+                missing_stage_spec_ids = [
+                    int(spec_id)
+                    for spec_id in spec_ids
+                    if int(spec_id) not in stage_norms_by_spec
+                ]
+                if missing_stage_spec_ids:
+                    component_stage_rows = (
+                        db.query(
+                            SpecComponent.spec_id.label("spec_id"),
+                            SpecComponent.stage_id.label("stage_id"),
+                        )
+                        .filter(SpecComponent.spec_id.in_(missing_stage_spec_ids))
+                        .filter(SpecComponent.stage_id.isnot(None))
+                        .group_by(SpecComponent.spec_id, SpecComponent.stage_id)
+                        .all()
+                    )
+                    for row in component_stage_rows:
+                        try:
+                            sid = int(row.stage_id)
+                            if sid > 0:
+                                stage_norms_by_spec.setdefault(int(row.spec_id), []).append((sid, 0.0))
+                        except Exception:
+                            continue
 
             for order in created_production_orders:
                 spec_id = produced_spec_id_by_item.get(int(order.item_id))

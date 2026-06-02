@@ -223,11 +223,15 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                         ).first()
 
                         if existing_comp:
+                            # Real 1C OData may omit component stage data. Keep a
+                            # previously curated/backfilled stage instead of
+                            # erasing it to NULL on every sync.
+                            desired_stage_id = stage.stage_id if stage else existing_comp.stage_id
                             if (existing_comp.quantity != quantity or
-                                existing_comp.stage_id != (stage.stage_id if stage else None) or
+                                existing_comp.stage_id != desired_stage_id or
                                 existing_comp.component_type != component_type):
                                 existing_comp.quantity = quantity
-                                existing_comp.stage_id = stage.stage_id if stage else None
+                                existing_comp.stage_id = desired_stage_id
                                 existing_comp.component_type = component_type
                                 components_updated += 1
                         else:
@@ -305,7 +309,10 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                         ).first()
 
                         if existing_spec_op:
-                            desired_stage_id = stage.stage_id if stage else None
+                            # Same preservation rule as for components: an
+                            # absent stage in OData must not wipe local stage
+                            # knowledge used by capacity/MRP views.
+                            desired_stage_id = stage.stage_id if stage else existing_spec_op.stage_id
                             updated = False
                             if existing_spec_op.stage_id != (desired_stage_id):
                                 existing_spec_op.stage_id = desired_stage_id
