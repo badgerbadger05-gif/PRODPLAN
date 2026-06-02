@@ -65,6 +65,24 @@
       retries: 10
       start_period: 10s
 
+  # Авто-синхронизация с 1С, растянутая по времени. Каждые ~2 минуты дёргает
+  # /api/v1/sync/auto/tick — оркестратор выполняет не более одного просроченного
+  # job за тик (один OData-pull за раз, без пиков). Read-only к 1С.
+  sync-worker:
+    build:
+      context: ./backend
+      args:
+        INSTALL_DEV: "true"
+    restart: unless-stopped
+    command: ["python", "sync_worker.py"]
+    environment:
+      TZ: Europe/Moscow
+      SYNC_BASE_URL: "http://backend:8000"
+      SYNC_TICK_INTERVAL_SECONDS: "120"
+    depends_on:
+      backend:
+        condition: service_healthy
+
 volumes:
   postgres_data:
 

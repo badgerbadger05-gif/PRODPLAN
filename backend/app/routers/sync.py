@@ -20,14 +20,25 @@ from ..services.units_sync import sync_units_from_odata, backfill_units_from_ite
 from ..services.operations_sync import sync_operations_from_odata, OperationsSyncStats
 from ..services.production_kind_sync import sync_production_kinds_from_odata, ProductionKindSyncStats
 from ..services.employee_sync import sync_employees_from_odata
+from ..services import sync_orchestrator
 
 from .. import models
+from typing import Dict, Optional
 
 router = APIRouter(prefix="/v1/sync", tags=["sync"])
 
 
 class WarehouseSelectionPayload(BaseModel):
     selected_refs: List[str] = []
+
+
+class SyncJobConfigPatch(BaseModel):
+    interval_seconds: Optional[int] = None
+    enabled: Optional[bool] = None
+
+
+class SyncAutoConfigPayload(BaseModel):
+    jobs: Dict[str, SyncJobConfigPatch] = {}
 
 
 @router.post("/stock-odata", response_model=ODataSyncStats)
@@ -467,6 +478,43 @@ def sync_production_kinds_odata(payload: ODataSyncRequest, db: Session = Depends
         return stats
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Sync error: {e}")
+
+
+@router.post("/auto/tick", response_model=dict)
+def sync_auto_tick(db: Session = Depends(get_db)):
+    """
+    Выполнить не более одного «просроченного» job автоматической синхронизации.
+    Вызывается воркером каждые ~2 минуты: один job за тик → нагрузка на 1С
+    размазана по времени, без пиков и параллельных запусков. Read-only к 1С.
+    """
+    try:
+        return sync_orchestrator.tick(db)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sync tick error: {e}")
+
+
+@router.get("/auto/status", response_model=dict)
+def sync_auto_status(db: Session = Depends(get_db)):
+    """Состояние расписания авто-синхронизации: по каждому job — последний запуск,
+    интервал, когда следующий, статус/ошибка."""
+    try:
+        return sync_orchestrator.status(db)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sync status error: {e}")
+
+
+@router.post("/auto/config", response_model=dict)
+def sync_auto_config(payload: SyncAutoConfigPayload):
+    """Правка расписания: {jobs: {<job_id>: {interval_seconds?, enabled?}}}.
+    Возвращает обновлённое состояние."""
+    try:
+        updates = {
+            job_id: patch.dict(exclude_unset=True)
+            for job_id, patch in (payload.jobs or {}).items()
+        }
+        return sync_orchestrator.update_config(updates)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Sync config error: {e}")
 
 
 @router.get("/progress")
