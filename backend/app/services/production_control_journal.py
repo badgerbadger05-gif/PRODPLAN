@@ -19,9 +19,11 @@ from ..models import (
     ProductionProduct,
     ProductionResource,
     ProductionStage,
+    ResourceProductionKind,
     ResourceStage,
     SpecComponent,
     SpecOperation,
+    Specification,
     SyncLink,
     Unit,
 )
@@ -73,8 +75,10 @@ COVERAGE_LABELS = {
     "cancelled": "Отменен",
 }
 STATUS_FILTER_GROUPS = {
-    "shortage": ("shortage", "partial"),
-    "ready": ("ready", "assembled"),
+    "shortage": ("shortage",),
+    "partial": ("partial",),
+    "ready": ("ready",),
+    "assembled": ("assembled",),
     "done": ("done", "produced_partial", "produced"),
 }
 
@@ -255,15 +259,41 @@ def _main_workshops_for_specs(
             resource_by_stage.setdefault(int(row.stage_id), (int(row.resource_id), str(row.resource_name or "")))
 
     result: Dict[int, Tuple[Optional[int], Optional[str], Optional[int], Optional[str]]] = {}
+    missing_resource_specs: List[int] = []
     for spec_id in ids:
         stage_id = stage_by_spec.get(spec_id)
         resource_id, resource_name = resource_by_stage.get(stage_id or 0, (None, None))
+        if resource_id is None:
+            missing_resource_specs.append(spec_id)
         result[spec_id] = (
             resource_id,
             resource_name,
             stage_id,
             stage_name_by_id.get(stage_id or 0),
         )
+    if missing_resource_specs:
+        for row in (
+            db.query(
+                Specification.spec_id,
+                ResourceProductionKind.resource_id,
+                ProductionResource.resource_name,
+            )
+            .join(ResourceProductionKind, ResourceProductionKind.production_kind_id == Specification.production_kind_id)
+            .join(ProductionResource, ProductionResource.resource_id == ResourceProductionKind.resource_id)
+            .filter(Specification.spec_id.in_(missing_resource_specs))
+            .filter(Specification.production_kind_id.isnot(None))
+            .order_by(ResourceProductionKind.id.asc())
+            .all()
+        ):
+            spec_id = int(row.spec_id)
+            current_resource_id, _, stage_id, stage_name = result.get(spec_id, (None, None, None, None))
+            if current_resource_id is None:
+                result[spec_id] = (
+                    int(row.resource_id),
+                    str(row.resource_name or ""),
+                    stage_id,
+                    stage_name,
+                )
     return result
 
 
@@ -762,9 +792,12 @@ def list_journal(
             (None, None, None, None),
         )
         state_workshop_id = int(state.workshop_id) if state and state.workshop_id else None
-        resolved_workshop_id = state_workshop_id or inferred_workshop_id
+        resolved_workshop_id = inferred_workshop_id or state_workshop_id
         if workshop_id and resolved_workshop_id != int(workshop_id):
             continue
+        resolved_workshop_name = inferred_workshop_name or (
+            state.workshop.resource_name if state and state.workshop else None
+        )
 
         planned_start, planned_finish = plan_dates.get(int(product.item_id), (None, None))
         if state and state.planned_start_date:
@@ -822,7 +855,7 @@ def list_journal(
                 **forecast,
                 "opened_at": _date_to_iso(state.opened_at) if state else None,
                 "workshop_id": resolved_workshop_id,
-                "workshop_name": (state.workshop.resource_name if state and state.workshop else inferred_workshop_name),
+                "workshop_name": resolved_workshop_name,
                 "stage_id": stage_id,
                 "stage_name": stage_name,
                 "spec_id": spec_id,

@@ -248,12 +248,14 @@ def _load_production_area_map(db: Session, item_ids: List[int]) -> Dict[int, Dic
             continue
         stage_hours_by_spec[int(spec_id_val)][int(stage_id_val)] = float(hours_val or 0.0)
 
-    if not stage_hours_by_spec:
+    missing_stage_spec_ids = [spec_id for spec_id in spec_ids if spec_id not in stage_hours_by_spec]
+    if missing_stage_spec_ids:
         try:
             comp_rows = (
                 db.query(SpecComponent.spec_id, SpecComponent.stage_id)
-                .filter(SpecComponent.spec_id.in_(list(spec_ids)))
+                .filter(SpecComponent.spec_id.in_(missing_stage_spec_ids))
                 .filter(SpecComponent.stage_id.isnot(None))
+                .order_by(SpecComponent.component_id.asc())
                 .all()
             )
         except Exception:
@@ -265,10 +267,48 @@ def _load_production_area_map(db: Session, item_ids: List[int]) -> Dict[int, Dic
                 continue
             stage_hours_by_spec[int(spec_id_val)].setdefault(int(stage_id_val), 0.0)
 
+    kind_resource_by_spec: Dict[int, Dict[str, Any]] = {}
+    missing_stage_spec_ids = [spec_id for spec_id in spec_ids if spec_id not in stage_hours_by_spec]
+    if missing_stage_spec_ids:
+        try:
+            kind_rows = (
+                db.query(
+                    Specification.spec_id,
+                    ResourceProductionKind.resource_id,
+                    ProductionResource.resource_name,
+                )
+                .join(ResourceProductionKind, ResourceProductionKind.production_kind_id == Specification.production_kind_id)
+                .join(ProductionResource, ProductionResource.resource_id == ResourceProductionKind.resource_id)
+                .filter(Specification.spec_id.in_(missing_stage_spec_ids))
+                .filter(Specification.production_kind_id.isnot(None))
+                .order_by(ResourceProductionKind.id.asc())
+                .all()
+            )
+        except Exception:
+            kind_rows = []
+        for row in kind_rows or []:
+            spec_id_val = getattr(row, "spec_id", row[0] if isinstance(row, (tuple, list)) and len(row) > 0 else None)
+            resource_id_val = getattr(row, "resource_id", row[1] if isinstance(row, (tuple, list)) and len(row) > 1 else None)
+            resource_name_val = getattr(row, "resource_name", row[2] if isinstance(row, (tuple, list)) and len(row) > 2 else None)
+            if spec_id_val is None or resource_id_val is None:
+                continue
+            kind_resource_by_spec.setdefault(
+                int(spec_id_val),
+                {
+                    "main_area_id": int(resource_id_val),
+                    "main_area_name": str(resource_name_val or ""),
+                    "main_stage_id": None,
+                    "main_stage_name": None,
+                },
+            )
+
     result: Dict[int, Dict[str, Any]] = {}
     for item_id_val, spec_id_val in item_to_spec.items():
         stage_hours = stage_hours_by_spec.get(int(spec_id_val), {})
         if not stage_hours:
+            kind_meta = kind_resource_by_spec.get(int(spec_id_val))
+            if kind_meta:
+                result[int(item_id_val)] = kind_meta
             continue
         sid = max(stage_hours.items(), key=lambda item: float(item[1] or 0.0))[0]
         area_id = area_id_by_stage.get(int(sid))
@@ -2136,6 +2176,10 @@ def get_run_production_grouped(
                 "missingNorm": hours_f <= 1e-9,
             }
         )
+    production_area_by_item = _load_production_area_map(
+        db,
+        [int(row[0].item_id) for row in filtered_rows if getattr(row[0], "item_id", None) is not None],
+    )
 
     # 5) Построить группы по основному участку для каждого заказа
     groups_map: Dict[Optional[int], Dict[str, Any]] = {}
@@ -2160,12 +2204,19 @@ def get_run_production_grouped(
                 main_area_id = best.get("area_id")
             except Exception:
                 main_area_id = None
+        area_meta = production_area_by_item.get(int(po.item_id), {})
+        if main_area_id is None:
+            main_area_id = area_meta.get("main_area_id")
 
         # Имя группы
         if main_area_id is None:
             grp_area_name = "Без участка"
         else:
-            grp_area_name = area_name_by_id.get(int(main_area_id), "") or "Без участка"
+            grp_area_name = (
+                area_name_by_id.get(int(main_area_id), "")
+                or str(area_meta.get("main_area_name") or "")
+                or "Без участка"
+            )
 
         # Инициализация группы при первом заказе
         if main_area_id not in groups_map:

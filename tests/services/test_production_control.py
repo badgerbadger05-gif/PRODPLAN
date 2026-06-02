@@ -17,7 +17,9 @@ from app.models import (
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
+    ProductionKind,
     ProductionResource,
+    ResourceProductionKind,
     SpecComponent,
     StockWarehouse,
     Specification,
@@ -308,6 +310,78 @@ def test_journal_filters_by_workshop_and_coverage_before_paging(db_session):
 
     assert journal["total"] == 1
     assert [row["order_number"] for row in journal["rows"]] == ["FLT-2"]
+
+
+def test_journal_status_shortage_filter_is_exact(db_session):
+    item = Item(item_code="P-STAT", item_name="Status part", unit="шт", stock_qty=0, status="active")
+    db_session.add(item)
+    db_session.flush()
+
+    for idx, status in enumerate(["shortage", "partial"], start=1):
+        order = ProductionOrder(
+            order_number=f"STAT-{idx}",
+            order_date=datetime(2026, 5, 20),
+            is_posted=True,
+            deletion_mark=False,
+        )
+        db_session.add(order)
+        db_session.flush()
+        product = ProductionProduct(
+            order_id=order.order_id,
+            item_id=item.item_id,
+            line_number=1,
+            quantity=1,
+            produced_qty=0,
+            remaining_qty=1,
+        )
+        db_session.add(product)
+        db_session.flush()
+        db_session.add(ProductionOrderLineState(product_id=product.product_id, status=status))
+    db_session.commit()
+
+    journal = list_journal(db_session, status="shortage")
+
+    assert journal["total"] == 1
+    assert [row["order_number"] for row in journal["rows"]] == ["STAT-1"]
+
+
+def test_journal_prefers_spec_kind_workshop_over_saved_state(db_session):
+    old_workshop = ProductionResource(resource_name="Старый участок")
+    inferred_workshop = ProductionResource(resource_name="Расчетный участок")
+    kind = ProductionKind(ref_1c="kind-journal", name="Вид сборки")
+    item = Item(item_code="P-KIND", item_name="Kind part", unit="шт", stock_qty=0, status="active")
+    db_session.add_all([old_workshop, inferred_workshop, kind, item])
+    db_session.flush()
+    spec = Specification(spec_name="Kind spec", spec_ref1c="spec-journal", production_kind_id=kind.id)
+    db_session.add(spec)
+    db_session.flush()
+    db_session.add(DefaultSpecification(item_id=item.item_id, spec_id=spec.spec_id))
+    db_session.add(ResourceProductionKind(resource_id=inferred_workshop.resource_id, production_kind_id=kind.id))
+    order = ProductionOrder(
+        order_number="KIND-1",
+        order_date=datetime(2026, 5, 20),
+        is_posted=True,
+        deletion_mark=False,
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=item.item_id,
+        line_number=1,
+        quantity=1,
+        produced_qty=0,
+        remaining_qty=1,
+    )
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(ProductionOrderLineState(product_id=product.product_id, workshop_id=old_workshop.resource_id))
+    db_session.commit()
+
+    journal = list_journal(db_session, product_id=product.product_id)
+
+    assert journal["rows"][0]["workshop_id"] == inferred_workshop.resource_id
+    assert journal["rows"][0]["workshop_name"] == "Расчетный участок"
 
 
 def test_journal_sorts_by_planned_start_date(db_session):
