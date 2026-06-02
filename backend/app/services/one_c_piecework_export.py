@@ -54,6 +54,7 @@ from .one_c_export_common import (
     post_export_entries as _post_export_entries,
     upsert_sync_link as _upsert_sync_link,
 )
+from .production_workshop_resolver import resolve_workshop_binding_for_product
 from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
 from .one_c_document_numbers import piecework_number
@@ -193,6 +194,14 @@ def _collect_export_entries(
                                 or _clean_ref1c(binding.warehouse_ref1c)
                                 or None
                             )
+            if structural_unit_ref is None and m.product:
+                binding = resolve_workshop_binding_for_product(db, m.product, int(m.product.spec_id))
+                if binding:
+                    structural_unit_ref = (
+                        _clean_ref1c(binding.production_warehouse_ref1c)
+                        or _clean_ref1c(binding.warehouse_ref1c)
+                        or None
+                    )
 
         employee_ref = None
         if m.executor:
