@@ -174,7 +174,7 @@ def _load_supplier_names(client: Any, supplier_refs: set[str]) -> Dict[str, str]
             rows = client.get_all(
                 "Catalog_Контрагенты",
                 filter_query=filter_query,
-                select_fields=["Ref_Key", "Description", "Наименование"],
+                select_fields=["Ref_Key", "Description"],
                 top=1000,
                 max_pages=5,
             )
@@ -183,7 +183,7 @@ def _load_supplier_names(client: Any, supplier_refs: set[str]) -> Dict[str, str]
             continue
         for row in rows or []:
             key = _norm_guid(row.get("Ref_Key"))
-            name = str(row.get("Description") or row.get("Наименование") or "").strip()
+            name = str(row.get("Description") or "").strip()
             if key and name:
                 supplier_names[key] = name
     return supplier_names
