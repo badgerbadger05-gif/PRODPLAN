@@ -166,7 +166,7 @@ def _load_supplier_names(client: Any, supplier_refs: set[str]) -> Dict[str, str]
     if not refs:
         return supplier_names
 
-    chunk_size = 80
+    chunk_size = 20
     for start in range(0, len(refs), chunk_size):
         chunk = refs[start : start + chunk_size]
         filter_query = " or ".join(f"Ref_Key eq guid'{ref}'" for ref in chunk)
