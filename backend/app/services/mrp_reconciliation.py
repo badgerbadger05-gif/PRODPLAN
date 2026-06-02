@@ -356,6 +356,21 @@ def _stage_hours_and_areas(
             continue
         stage_hours[sid] = per_unit * float(qty)
         stage_areas[sid] = resource_id_by_stage.get(sid)
+    if not stage_hours:
+        component_stage_rows = (
+            db.query(SpecComponent.stage_id)
+            .filter(SpecComponent.spec_id == int(spec_id))
+            .filter(SpecComponent.stage_id.isnot(None))
+            .group_by(SpecComponent.stage_id)
+            .all()
+        )
+        for row in component_stage_rows:
+            sid_raw = getattr(row, "stage_id", row[0] if isinstance(row, (tuple, list)) and row else None)
+            if sid_raw is None:
+                continue
+            sid = int(sid_raw)
+            stage_hours[sid] = 0.0
+            stage_areas[sid] = resource_id_by_stage.get(sid)
     return stage_hours, stage_areas
 
 
