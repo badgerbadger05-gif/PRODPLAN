@@ -12,21 +12,28 @@ from ..models import (
     MrpRequirement,
     PlannedOrder,
     PlanningRun,
+    ProductionPlanHeader,
     ProductionMaterialIssue,
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
+    ProductionResource,
     ProductionStage,
     ResourceStage,
     SpecComponent,
     SpecOperation,
+    SyncLink,
+    Unit,
 )
-from .production_control_common import date_to_iso as _date_to_iso, parse_date as _parse_date, to_float as _to_float
+from .production_control_common import (
+    date_to_iso as _date_to_iso,
+    looks_like_guid as _looks_like_guid,
+    parse_date as _parse_date,
+    to_float as _to_float,
+)
 from .production_control_domain import (
-    default_spec_id as _default_spec_id,
     ensure_state as _ensure_state,
     latest_run_id as _latest_run_id,
-    unit_display as _unit_display,
 )
 from .replenishment import REPLENISHMENT_FLOW_PRODUCTION, classify_replenishment_flow
 
@@ -51,6 +58,7 @@ LINE_STATUSES = {
 # 'exported' = PRODPLAN posted the draft into 1C (Posted=false there).
 # 'posted'   = 1C admin провёл документ (we discovered Posted=true on sync).
 ISSUE_STATUSES = {"not_requested", "requested", "issued", "exported", "posted", "error"}
+PRODUCTION_ORDER_ENTITY = "Document_ЗаказНаПроизводство"
 COVERAGE_LABELS = {
     "shortage": "Дефицит",
     "partial": "Частично",
@@ -172,6 +180,107 @@ def _main_workshop_for_spec(db: Session, spec_id: Optional[int]) -> Tuple[Option
             workshop_name = str(resource_stage.resource.resource_name)
 
     return (workshop_id, workshop_name, stage_id, stage_name)
+
+
+def _default_spec_ids_by_item(db: Session, item_ids: Sequence[int]) -> Dict[int, int]:
+    if not item_ids:
+        return {}
+    result: Dict[int, int] = {}
+    for row in (
+        db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
+        .filter(DefaultSpecification.item_id.in_(list({int(item_id) for item_id in item_ids})))
+        .order_by(DefaultSpecification.id.asc())
+        .all()
+    ):
+        result.setdefault(int(row.item_id), int(row.spec_id))
+    return result
+
+
+def _main_workshops_for_specs(
+    db: Session,
+    spec_ids: Sequence[int],
+) -> Dict[int, Tuple[Optional[int], Optional[str], Optional[int], Optional[str]]]:
+    ids = sorted({int(spec_id) for spec_id in spec_ids if spec_id})
+    if not ids:
+        return {}
+
+    stage_by_spec: Dict[int, int] = {}
+    hours_by_spec_stage = (
+        db.query(
+            SpecOperation.spec_id,
+            SpecOperation.stage_id,
+            func.sum(SpecOperation.time_norm).label("hours"),
+        )
+        .filter(SpecOperation.spec_id.in_(ids), SpecOperation.stage_id.isnot(None))
+        .group_by(SpecOperation.spec_id, SpecOperation.stage_id)
+        .all()
+    )
+    best_hours: Dict[int, float] = {}
+    for row in hours_by_spec_stage:
+        spec_id = int(row.spec_id)
+        hours = _to_float(row.hours)
+        if spec_id not in best_hours or hours > best_hours[spec_id]:
+            best_hours[spec_id] = hours
+            stage_by_spec[spec_id] = int(row.stage_id)
+
+    missing_ids = [spec_id for spec_id in ids if spec_id not in stage_by_spec]
+    if missing_ids:
+        for row in (
+            db.query(SpecComponent.spec_id, SpecComponent.stage_id)
+            .filter(SpecComponent.spec_id.in_(missing_ids), SpecComponent.stage_id.isnot(None))
+            .order_by(SpecComponent.component_id.asc())
+            .all()
+        ):
+            stage_by_spec.setdefault(int(row.spec_id), int(row.stage_id))
+
+    stage_ids = sorted({stage_id for stage_id in stage_by_spec.values() if stage_id})
+    stage_name_by_id: Dict[int, str] = {}
+    if stage_ids:
+        for row in (
+            db.query(ProductionStage.stage_id, ProductionStage.stage_name)
+            .filter(ProductionStage.stage_id.in_(stage_ids))
+            .all()
+        ):
+            stage_name_by_id[int(row.stage_id)] = str(row.stage_name or "")
+
+    resource_by_stage: Dict[int, Tuple[int, str]] = {}
+    if stage_ids:
+        for row in (
+            db.query(ResourceStage.stage_id, ResourceStage.resource_id, ProductionResource.resource_name)
+            .join(ProductionResource, ProductionResource.resource_id == ResourceStage.resource_id)
+            .filter(ResourceStage.stage_id.in_(stage_ids))
+            .order_by(ResourceStage.id.asc())
+            .all()
+        ):
+            resource_by_stage.setdefault(int(row.stage_id), (int(row.resource_id), str(row.resource_name or "")))
+
+    result: Dict[int, Tuple[Optional[int], Optional[str], Optional[int], Optional[str]]] = {}
+    for spec_id in ids:
+        stage_id = stage_by_spec.get(spec_id)
+        resource_id, resource_name = resource_by_stage.get(stage_id or 0, (None, None))
+        result[spec_id] = (
+            resource_id,
+            resource_name,
+            stage_id,
+            stage_name_by_id.get(stage_id or 0),
+        )
+    return result
+
+
+def _unit_display_by_raw(db: Session, raw_units: Sequence[Any]) -> Dict[str, str]:
+    raw_values = {str(raw or "").strip() for raw in raw_units if str(raw or "").strip()}
+    if not raw_values:
+        return {}
+    result: Dict[str, str] = {}
+    guid_values = {raw for raw in raw_values if _looks_like_guid(raw)}
+    if guid_values:
+        for unit in db.query(Unit).filter(Unit.unit_ref1c.in_(list(guid_values))).all():
+            result[str(unit.unit_ref1c or "").strip()] = str(
+                unit.short_name or unit.unit_name or unit.unit_code or ""
+            ).strip()
+    for raw in raw_values:
+        result.setdefault(raw, "" if _looks_like_guid(raw) else raw)
+    return result
 
 
 def create_orders_from_mrp(
@@ -550,6 +659,42 @@ def list_journal(
         query = query.filter(ProductionOrder.order_date < datetime.combine(finish, datetime.max.time()))
 
     rows = query.order_by(ProductionOrder.order_date.desc(), ProductionOrder.order_number.asc(), ProductionProduct.line_number.asc()).all()
+    order_ids = sorted({int(product.order_id) for product in rows})
+    run_ids = sorted({
+        int(product.order.source_run_id)
+        for product in rows
+        if product.order and product.order.source_run_id is not None
+    })
+    order_one_c_number_by_id: Dict[int, str] = {}
+    if order_ids:
+        for row in (
+            db.query(SyncLink.source_id, SyncLink.target_number)
+            .filter(
+                SyncLink.source_doctype == "production_order",
+                SyncLink.source_id.in_(order_ids),
+                SyncLink.target_entity == PRODUCTION_ORDER_ENTITY,
+                SyncLink.target_number.isnot(None),
+            )
+            .all()
+        ):
+            order_one_c_number_by_id[int(row.source_id)] = str(row.target_number or "")
+    source_plan_by_run_id: Dict[int, Dict[str, Any]] = {}
+    if run_ids:
+        run_rows = (
+            db.query(PlanningRun, ProductionPlanHeader)
+            .outerjoin(ProductionPlanHeader, ProductionPlanHeader.id == PlanningRun.source_plan_id)
+            .filter(PlanningRun.run_id.in_(run_ids))
+            .all()
+        )
+        for run, plan in run_rows:
+            period_from = run.period_from or (plan.period_from if plan else None)
+            period_to = run.period_to or (plan.period_to if plan else None)
+            source_plan_by_run_id[int(run.run_id)] = {
+                "source_plan_id": int(run.source_plan_id) if run.source_plan_id is not None else None,
+                "source_plan_name": str(plan.name or "") if plan else "",
+                "source_plan_period_from": _date_to_iso(period_from),
+                "source_plan_period_to": _date_to_iso(period_to),
+            }
     planned_order_ids = sorted({
         int(product.source_planned_order_id)
         for product in rows
@@ -588,12 +733,34 @@ def list_journal(
                 "covered_qty": _to_float(row.covered_qty),
                 "remaining_qty": _to_float(row.remaining_qty),
             }
+    item_ids = sorted({int(product.item_id) for product in rows if product.item_id is not None})
+    product_ids = sorted({int(product.product_id) for product in rows if product.product_id is not None})
+    default_spec_by_item = _default_spec_ids_by_item(db, item_ids)
+    spec_ids = sorted({
+        int(product.spec_id or default_spec_by_item.get(int(product.item_id)) or 0)
+        for product in rows
+        if product.spec_id or default_spec_by_item.get(int(product.item_id))
+    })
+    workshop_by_spec = _main_workshops_for_specs(db, spec_ids)
+    issue_count_by_product: Dict[int, int] = {}
+    if product_ids:
+        for row in (
+            db.query(ProductionMaterialIssue.product_id, func.count(ProductionMaterialIssue.issue_id).label("issue_count"))
+            .filter(ProductionMaterialIssue.product_id.in_(product_ids))
+            .group_by(ProductionMaterialIssue.product_id)
+            .all()
+        ):
+            issue_count_by_product[int(row.product_id)] = int(row.issue_count or 0)
+    unit_by_raw = _unit_display_by_raw(db, [getattr(product.item, "unit", None) for product in rows if product.item])
 
     result: List[Dict[str, Any]] = []
     for product in rows:
         state = getattr(product, "control_state", None)
-        spec_id = _default_spec_id(db, product)
-        inferred_workshop_id, inferred_workshop_name, stage_id, stage_name = _main_workshop_for_spec(db, spec_id)
+        spec_id = int(product.spec_id or default_spec_by_item.get(int(product.item_id)) or 0) or None
+        inferred_workshop_id, inferred_workshop_name, stage_id, stage_name = workshop_by_spec.get(
+            spec_id or 0,
+            (None, None, None, None),
+        )
         state_workshop_id = int(state.workshop_id) if state and state.workshop_id else None
         resolved_workshop_id = state_workshop_id or inferred_workshop_id
         if workshop_id and resolved_workshop_id != int(workshop_id):
@@ -614,8 +781,13 @@ def list_journal(
             due_date = req_meta.get("period_to")
         forecast = _forecast_payload(planned_finish, due_date or planned_finish)
         order_source = str(product.order.source or "1c")
+        run_id_for_source = int(product.order.source_run_id) if product.order.source_run_id is not None else None
+        source_plan = source_plan_by_run_id.get(run_id_for_source or 0, {})
+        order_one_c_number = order_one_c_number_by_id.get(int(product.order_id), "")
+        if not order_one_c_number and product.order.order_ref1c and order_source == "1c":
+            order_one_c_number = str(product.order.order_number or "")
 
-        issue_count = db.query(ProductionMaterialIssue).filter(ProductionMaterialIssue.product_id == product.product_id).count()
+        issue_count = issue_count_by_product.get(int(product.product_id), 0)
         line_status = str(state.status if state else "shortage")
         issue_status = str(state.issue_status if state else "not_requested")
         work_status = _journal_work_status(line_status)
@@ -631,12 +803,13 @@ def list_journal(
                 "order_source": order_source,
                 "source": order_source,
                 "order_ref1c": str(product.order.order_ref1c or "") if product.order.order_ref1c else None,
+                "order_one_c_number": order_one_c_number or None,
                 "line_number": product.line_number,
                 "item_id": int(product.item_id),
                 "item_code": str(product.item.item_code or ""),
                 "item_name": str(product.item.item_name or ""),
                 "item_article": str(product.item.item_article or ""),
-                "unit": _unit_display(db, product.item.unit),
+                "unit": unit_by_raw.get(str(product.item.unit or "").strip(), ""),
                 "quantity": _to_float(product.quantity),
                 "produced_qty": _to_float(product.produced_qty),
                 "remaining_qty": _to_float(product.remaining_qty),
@@ -657,6 +830,7 @@ def list_journal(
                 "route_sheet_printed_at": _date_to_iso(state.route_sheet_printed_at) if state else None,
                 "comment": str(state.comment or "") if state else "",
                 "source_run_id": int(product.order.source_run_id) if product.order.source_run_id is not None else None,
+                **source_plan,
                 "source_planned_order_id": source_planned_order_id,
                 "source_mrp_requirement_id": source_mrp_requirement_id,
                 "source_mrp_allocation_key": str(product.source_mrp_allocation_key or "") if product.source_mrp_allocation_key else None,
@@ -678,7 +852,9 @@ def list_journal(
 
     total = len(result)
     effective_limit = max(1, min(int(limit or 100), 500))
-    effective_offset = max(0, int(offset or 0))
+    requested_offset = max(0, int(offset or 0))
+    max_offset = max(0, ((total - 1) // effective_limit) * effective_limit) if total else 0
+    effective_offset = min(requested_offset, max_offset)
     return {
         "rows": result[effective_offset : effective_offset + effective_limit],
         "total": total,

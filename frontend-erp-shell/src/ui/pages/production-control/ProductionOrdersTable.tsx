@@ -26,6 +26,11 @@ function ForecastShift({ row }: { row: OrderRow }) {
   return <span className={`forecastShift ${cls}`} title={title}>{label}{dateText ? ` · ${dateText}` : ''}</span>
 }
 
+function orderSubline(row: OrderRow) {
+  if (row.order_ref1c) return row.order_one_c_number || (row.order_source === '1c' ? row.order_number : 'Открыт в 1С')
+  return `${dateRu(row.order_date)} · стр. ${row.line_number || '—'}`
+}
+
 export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSelectIds, onActivate, onOpenMaterials, onChangeStatus, onToggleSort }: Props) {
   return (
     <table className="journalTable productionOrdersTable" style={{ minWidth: tableMinWidth(productionOrderColumns) }}>
@@ -63,9 +68,9 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
                 onClick={(e) => e.stopPropagation()}
               />
             </td>
-            <td className="orderCell">
+            <td className={`orderCell ${row.order_ref1c ? 'oneCOrderCell' : ''}`}>
               <strong>{row.order_number}</strong>
-              <span>{dateRu(row.order_date)} · стр. {row.line_number || '—'}</span>
+              <span>{orderSubline(row)}</span>
             </td>
             <td className="itemCell">
               <strong>{row.item_name}</strong>

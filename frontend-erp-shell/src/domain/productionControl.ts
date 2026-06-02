@@ -3,6 +3,7 @@ export type OrderRow = {
   order_id?: number | null
   order_source?: string | null  // 'mrp' | '1c'
   order_ref1c?: string | null
+  order_one_c_number?: string | null
   item_id?: number | null
   order_number: string
   order_date?: string | null
@@ -31,6 +32,10 @@ export type OrderRow = {
   optimal_batch?: number | null
   source?: string | null
   source_run_id?: number | null
+  source_plan_id?: number | null
+  source_plan_name?: string | null
+  source_plan_period_from?: string | null
+  source_plan_period_to?: string | null
   source_planned_order_id?: number | null
   source_mrp_requirement_id?: number | null
   source_mrp_allocation_key?: string | null

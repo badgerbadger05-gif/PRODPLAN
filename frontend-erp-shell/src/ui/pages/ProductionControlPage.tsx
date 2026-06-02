@@ -134,7 +134,7 @@ export function ProductionControlPage() {
       setTotal(data.total ?? 0)
       setRunId(data.latest_run_id ?? null)
       setSourcePlanId(data.latest_source_plan_id ?? null)
-      setOffset(nextOffset)
+      setOffset(data.offset ?? nextOffset)
       setActiveId((current) => {
         const focusedProductId = Number(focusProductId || 0)
         if (focusedProductId && data.rows?.some((row) => row.product_id === focusedProductId)) return focusedProductId
@@ -601,9 +601,10 @@ export function ProductionControlPage() {
     void load(0)
   }
 
-  function changeFilters(next: ProductionFilters) {
+  function changeFilters(next: ProductionFilters, submit = false) {
     filtersRef.current = next
     setFilters(next)
+    if (submit) void load(0)
   }
 
   useEffect(() => {
@@ -655,18 +656,22 @@ export function ProductionControlPage() {
           onRefresh={() => void load(offset)}
           onSelectAll={() => setSelectedIds(new Set(rows.map((row) => row.product_id)))}
           onClearSelection={() => setSelectedIds(new Set())}
+          rootProductLabel={rootProductLabel(rootOptions, filters.root_item_id ? Number(filters.root_item_id) : null)}
+          onOpenRootProductFilter={() => setRootDialogOpen(true)}
         />
-        <div className="commandBar" style={{ paddingTop: 0 }}>
-          <button onClick={() => setRootDialogOpen(true)}>Корневое изделие</button>
-          <span className="toolbarText">{rootProductLabel(rootOptions, filters.root_item_id ? Number(filters.root_item_id) : null)}</span>
-        </div>
 
         {error && <div className="errorLine">{error}</div>}
         {message && <div className="successLine">{message}</div>}
 
         <div className="split">
           <div className="tablePane">
-            <ProductionFilterBar filters={filters} resources={resources} onChange={changeFilters} onSubmit={() => void load(0)} onToggleSort={toggleSort} />
+            <ProductionFilterBar
+              filters={filters}
+              resources={resources}
+              onChange={changeFilters}
+              onSubmit={() => void load(0)}
+              onToggleSort={toggleSort}
+            />
             <ProductionOrdersTable
               rows={rows}
               activeRow={activeRow}

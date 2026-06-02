@@ -566,8 +566,8 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
 
   useEffect(() => {
     if (tab === 'matrix' && !matrix) void loadMatrix()
-    if (tab === 'journal' && !journal) void loadJournal(journalFlow, activeRunId ?? undefined)
-  }, [journal, loadJournal, loadMatrix, matrix, tab, journalFlow, activeRunId])
+    if (tab === 'journal' && !journal) void loadJournal(journalFlow, activeRunId ?? undefined, journalRootItemId)
+  }, [journal, loadJournal, loadMatrix, matrix, tab, journalFlow, activeRunId, journalRootItemId])
 
   // Autofocus search input on entering draft matrix
   useEffect(() => {
@@ -589,13 +589,13 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
       if (e.key === 'F5') {
         e.preventDefault()
         if (tab === 'matrix') void loadMatrix()
-        else void loadJournal(journalFlow, activeRunId ?? undefined)
+        else void loadJournal(journalFlow, activeRunId ?? undefined, journalRootItemId)
         void loadRuns()
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [onBack, tab, loadMatrix, loadJournal, loadRuns, journalFlow, activeRunId])
+  }, [onBack, tab, loadMatrix, loadJournal, loadRuns, journalFlow, activeRunId, journalRootItemId])
 
   function nonEmptyMatrix() {
     if (!matrix) return false
@@ -706,7 +706,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
       setSelectedRunId(result.run_id)
       setMessage(`MRP-снимок создан: run #${result.run_id}, требований: ${result.requirement_count}, закупок: ${result.purchase_count}, переработок: ${result.rework_count}`)
       setTab('journal')
-      await Promise.all([loadJournal(journalFlow, result.run_id), loadRuns()])
+      await Promise.all([loadJournal(journalFlow, result.run_id, journalRootItemId), loadRuns()])
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -723,7 +723,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     try {
       const [p, r] = await Promise.all([allocatePurchases(runId), allocateRework(runId)])
       setMessage(`Аллокация: закупки ${p.updated_count} строк, переработки ${r.updated_count} строк`)
-      await loadJournal(journalFlow, runId)
+      await loadJournal(journalFlow, runId, journalRootItemId)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -751,7 +751,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
       if (skipped) parts.push(`пропущено ${skipped}`)
       setMessage(`Заказы производства: ${parts.join(', ') || 'нет изменений'}`)
       if (result.errors?.length) setError(result.errors.join('; '))
-      await loadJournal(journalFlow, activeRunId ?? undefined)
+      await loadJournal(journalFlow, activeRunId ?? undefined, journalRootItemId)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -1384,7 +1384,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
         {tab === 'journal' && (
           <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
             <div className="commandBar">
-              <button onClick={() => void loadJournal(journalFlow, activeRunId ?? undefined)} disabled={journalLoading}>Обновить</button>
+              <button onClick={() => void loadJournal(journalFlow, activeRunId ?? undefined, journalRootItemId)} disabled={journalLoading}>Обновить</button>
               <button onClick={downloadJournalCsv} disabled={!journal || journalLoading}>CSV</button>
               <div className="barSeparator" />
               <button
@@ -1394,8 +1394,6 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
               >
                 Создать заказы производства
               </button>
-              <button onClick={() => setJournalRootDialogOpen(true)}>Корневое изделие</button>
-              <span className="toolbarText">{rootProductLabel(rootOptions, journalRootItemId)}</span>
               {journal && (
                 <>
                   <div className="barSeparator" />

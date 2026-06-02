@@ -12,6 +12,8 @@ type Props = {
   onRefresh: () => void
   onSelectAll: () => void
   onClearSelection: () => void
+  rootProductLabel: string
+  onOpenRootProductFilter: () => void
 }
 
 export function ProductionCommandBar({
@@ -26,6 +28,8 @@ export function ProductionCommandBar({
   onRefresh,
   onSelectAll,
   onClearSelection,
+  rootProductLabel,
+  onOpenRootProductFilter,
 }: Props) {
   const selectedRows = rows.filter((row) => selectedIds.has(row.product_id))
   const selectedProduceRow = selectedRows.length === 1 ? selectedRows[0] : null
@@ -52,6 +56,9 @@ export function ProductionCommandBar({
       <div className="barSeparator" />
       <button onClick={onSelectAll} disabled={!rows.length}>Выбрать все</button>
       <button onClick={onClearSelection} disabled={!selectedIds.size}>Снять выбор</button>
+      <div className="barSeparator" />
+      <button onClick={onOpenRootProductFilter}>Корневое изделие</button>
+      <span className="toolbarText">{rootProductLabel}</span>
       <div className="commandBarSpacer" />
       <button onClick={onOpenSettings}>Настройки</button>
     </div>

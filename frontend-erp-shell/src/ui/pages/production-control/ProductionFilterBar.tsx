@@ -6,12 +6,12 @@ import { productionOrderColumns, type ProductionOrderSortKey } from './productio
 type Props = {
   filters: ProductionFilters
   resources: ProductionResource[]
-  onChange: (filters: ProductionFilters) => void
+  onChange: (filters: ProductionFilters, submit?: boolean) => void
   onSubmit: () => void
   onToggleSort: (key: ProductionOrderSortKey) => void
 }
 
-const coverageOptions = ['shortage', 'partial', 'ready', 'to_move', 'assembled', 'in_progress', 'done', 'completed'] as const
+const coverageOptions = ['shortage', 'partial', 'ready', 'to_move', 'assembled'] as const
 
 export function ProductionFilterBar({ filters, resources, onChange, onSubmit, onToggleSort }: Props) {
   return (
@@ -42,7 +42,7 @@ export function ProductionFilterBar({ filters, resources, onChange, onSubmit, on
           <td>
             <label className="columnFilterControl">
               <span>Участок</span>
-              <select value={filters.workshop_id} onChange={(e) => onChange({ ...filters, workshop_id: e.target.value })}>
+              <select value={filters.workshop_id} onChange={(e) => onChange({ ...filters, workshop_id: e.target.value }, true)}>
                 <option value="">Все</option>
                 {resources.map((row) => <option key={row.resource_id} value={row.resource_id}>{row.resource_name}</option>)}
               </select>
@@ -51,7 +51,7 @@ export function ProductionFilterBar({ filters, resources, onChange, onSubmit, on
           <td>
             <label className="columnFilterControl">
               <span>Статус</span>
-              <select value={filters.status} onChange={(e) => onChange({ ...filters, status: e.target.value })}>
+              <select value={filters.status} onChange={(e) => onChange({ ...filters, status: e.target.value }, true)}>
                 <option value="">Все</option>
                 {productionStatusOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
               </select>
@@ -60,7 +60,7 @@ export function ProductionFilterBar({ filters, resources, onChange, onSubmit, on
           <td>
             <label className="columnFilterControl">
               <span>Обеспечение</span>
-              <select value={filters.coverage_status} onChange={(e) => onChange({ ...filters, coverage_status: e.target.value })}>
+              <select value={filters.coverage_status} onChange={(e) => onChange({ ...filters, coverage_status: e.target.value }, true)}>
                 <option value="">Все</option>
                 {coverageOptions.map((value) => <option key={value} value={value}>{coverageLabels[value]}</option>)}
               </select>

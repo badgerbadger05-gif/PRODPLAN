@@ -15,7 +15,6 @@ import {
   getPlanningResultPurchases,
   getPlanningResultRework,
   getPlanningRunSummary,
-  getShortageReport,
 } from '../../services/planning'
 import { getPeriodPlanMatrix } from '../../services/periodPlan'
 import { DocumentWindow } from '../layout/DocumentWindow'
@@ -220,7 +219,7 @@ export function MrpResultPage() {
         planned_order_ids: Array.from(selectedProductionIds),
       })
       setSelectedProductionIds(new Set())
-      await load(dateFrom, dateTo)
+      await load(dateFrom, dateTo, rootItemId)
       setMessage(formatActionResult('Создание заказов', result))
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -242,19 +241,6 @@ export function MrpResultPage() {
       })
       setMessage(formatActionResult('Выгрузка закупок в 1С', result))
       setSelectedPurchaseIds(new Set())
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setExporting(false)
-    }
-  }
-
-  async function exportShortageReport() {
-    setExporting(true)
-    setError('')
-    try {
-      const response = await getShortageReport(runId)
-      downloadBase64File(response, `mrp_shortage_${runId}.xlsx`)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -294,9 +280,7 @@ export function MrpResultPage() {
         <div className="commandBar">
           <button onClick={() => navigate('/mrp-runs')}>К списку прогонов</button>
           <button onClick={() => void load(dateFrom, dateTo, rootItemId)} disabled={loading}>Обновить</button>
-          {tab !== 'capacity' && <button onClick={() => void exportActive('csv')} disabled={loading || exporting}>CSV</button>}
           {tab !== 'capacity' && <button onClick={() => void exportActive('xlsx')} disabled={loading || exporting}>XLSX</button>}
-          <button onClick={() => void exportShortageReport()} disabled={loading || exporting}>Отчёт дефицитов</button>
           {tab === 'production' && <button className="primary" onClick={() => void createSelectedProductionOrders()} disabled={!selectedProductionIds.size || loading || exporting}>Создать заказы ({selectedProductionIds.size})</button>}
           {tab === 'purchases' && <button className="primary" onClick={() => void exportSelectedPurchasesTo1C()} disabled={!selectedPurchaseIds.size || loading || exporting}>Выгрузить в 1С ({selectedPurchaseIds.size})</button>}
           <div className="barSeparator" />

@@ -1,15 +1,29 @@
 from __future__ import annotations
 
 import html
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from sqlalchemy.orm import Session, joinedload
 
-from ..models import Operation, ProductionProduct, ProductionStage, SpecOperation
-from .production_control_common import date_to_iso as _date_to_iso, line_number as _line_number, to_float as _to_float
+from ..models import (
+    DefaultSpecification,
+    Item,
+    MrpRequirement,
+    Operation,
+    PlanningRun,
+    ProductionPlanHeader,
+    ProductionPlanLine,
+    ProductionProduct,
+    ProductionStage,
+    SpecComponent,
+    SpecOperation,
+    SyncLink,
+)
+from .production_control_common import to_float as _to_float
 from .production_control_domain import ensure_state as _ensure_state, unit_display as _unit_display
 from .production_control_material_availability import _components_for_product
+from .one_c_production_order_export import PRODUCTION_ORDER_ENTITY
 
 
 def mark_route_sheets_printed(db: Session, product_ids: Iterable[int]) -> int:
@@ -47,6 +61,123 @@ def _operation_rows(db: Session, spec_id: Optional[int]) -> List[Dict[str, Any]]
     ]
 
 
+def _date_ru(value: Any) -> str:
+    if not value:
+        return ""
+    if isinstance(value, datetime):
+        value = value.date()
+    if isinstance(value, date):
+        return value.strftime("%d.%m.%Y")
+    return str(value)
+
+
+def _datetime_ru(value: Any) -> str:
+    if not value:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%d.%m.%Y %H:%M")
+    return _date_ru(value)
+
+
+def _item_label(item: Optional[Item]) -> str:
+    if not item:
+        return ""
+    article = str(item.item_article or item.item_code or "").strip()
+    name = str(item.item_name or "").strip()
+    return f"{name} ({article})" if article else name
+
+
+def _bom_descendant_ids(db: Session, root_item_id: int) -> set[int]:
+    result = {int(root_item_id)}
+    spec_by_item: Dict[int, int] = {
+        int(row.item_id): int(row.spec_id)
+        for row in db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
+        .filter(DefaultSpecification.item_id == int(root_item_id))
+        .all()
+    }
+
+    def visit(item_id: int, seen_specs: set[int]) -> None:
+        spec_id = spec_by_item.get(int(item_id))
+        if not spec_id or spec_id in seen_specs:
+            return
+        next_seen = set(seen_specs)
+        next_seen.add(int(spec_id))
+        for row in db.query(SpecComponent.item_id).filter(SpecComponent.spec_id == int(spec_id)).all():
+            child_id = int(row.item_id)
+            result.add(child_id)
+            if child_id not in spec_by_item:
+                ds = db.query(DefaultSpecification.spec_id).filter(DefaultSpecification.item_id == child_id).first()
+                if ds:
+                    spec_by_item[child_id] = int(ds.spec_id)
+            visit(child_id, next_seen)
+
+    visit(int(root_item_id), set())
+    return result
+
+
+def _route_context(db: Session, product: ProductionProduct) -> Dict[str, str]:
+    order = product.order
+    run: Optional[PlanningRun] = None
+    if order and order.source_run_id:
+        run = db.query(PlanningRun).filter(PlanningRun.run_id == int(order.source_run_id)).first()
+    if run is None and product.source_mrp_requirement_id:
+        req = db.query(MrpRequirement).filter(MrpRequirement.id == int(product.source_mrp_requirement_id)).first()
+        if req:
+            run = db.query(PlanningRun).filter(PlanningRun.run_id == int(req.run_id)).first()
+
+    plan: Optional[ProductionPlanHeader] = None
+    if run and run.source_plan_id:
+        plan = db.query(ProductionPlanHeader).filter(ProductionPlanHeader.id == int(run.source_plan_id)).first()
+
+    root_item: Optional[Item] = None
+    if plan:
+        root_ids = [
+            int(row.item_id)
+            for row in (
+                db.query(ProductionPlanLine.item_id)
+                .filter(ProductionPlanLine.plan_id == int(plan.id), ProductionPlanLine.qty > 0)
+                .distinct()
+                .all()
+            )
+        ]
+        root_rows = (
+            db.query(Item)
+            .filter(Item.item_id.in_(root_ids))
+            .order_by(Item.item_article.asc(), Item.item_name.asc())
+            .all()
+        )
+        for item in root_rows:
+            if int(product.item_id) in _bom_descendant_ids(db, int(item.item_id)):
+                root_item = item
+                break
+
+    one_c_number = ""
+    if order:
+        link = (
+            db.query(SyncLink)
+            .filter(
+                SyncLink.source_doctype == "production_order",
+                SyncLink.source_id == int(order.order_id),
+                SyncLink.target_entity == PRODUCTION_ORDER_ENTITY,
+            )
+            .one_or_none()
+        )
+        one_c_number = str(link.target_number or "") if link else ""
+
+    plan_period = ""
+    if plan:
+        plan_period = f"{_date_ru(plan.period_from)} - {_date_ru(plan.period_to)}"
+    elif run and (run.period_from or run.period_to):
+        plan_period = f"{_date_ru(run.period_from)} - {_date_ru(run.period_to)}"
+
+    return {
+        "plan_name": str(plan.name or "") if plan else "",
+        "plan_period": plan_period.strip(" -"),
+        "root_item": _item_label(root_item),
+        "one_c_number": one_c_number,
+    }
+
+
 def render_route_sheets_html(db: Session, product_ids: Sequence[int]) -> str:
     products = (
         db.query(ProductionProduct)
@@ -61,22 +192,25 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int]) -> str:
     for product in ordered:
         spec_id, components = _components_for_product(db, product)
         operations = _operation_rows(db, spec_id)
-        order_date = _date_to_iso(product.order.order_date) or ""
-        title = f"МАРШРУТНЫЙ ЛИСТ № {html.escape(str(product.order.order_number or ''))}/{_line_number(product)} от {now}"
+        order_date = _datetime_ru(product.order.order_date)
+        route_ctx = _route_context(db, product)
+        order_number = html.escape(str(product.order.order_number or ""))
+        one_c_number = html.escape(route_ctx["one_c_number"] or "—")
+        title = f"МАРШРУТНЫЙ ЛИСТ № {order_number} от {now}"
         component_rows = "".join(
             "<tr>"
-            f"<td>{html.escape(c['item_name'])}</td>"
-            f"<td>{html.escape(c['item_article'])}</td>"
+            f"<td colspan='2' class='text'>{html.escape(c['item_name'])}</td>"
+            f"<td class='text'>{html.escape(c['item_article'])}</td>"
             f"<td class='num'>{c['qty_per_unit']:.3f}</td>"
-            f"<td class='num'>{c['required_qty']:.3f}</td>"
+            f"<td colspan='3' class='num'>{c['required_qty']:.3f}</td>"
             "</tr>"
             for c in components
-        ) or "<tr><td colspan='4'>Материалы по спецификации не найдены</td></tr>"
+        ) or "<tr><td colspan='7'>Материалы по спецификации не найдены</td></tr>"
         op_rows = "".join(
             "<tr>"
             f"<td class='num'>{op['number']}</td>"
-            f"<td>{html.escape(op['stage_name'])}</td>"
-            f"<td>{html.escape(op['operation_name'] or op['stage_name'] or 'Операция')}</td>"
+            f"<td class='text'>{html.escape(op['stage_name'])}</td>"
+            f"<td colspan='2' class='text'>{html.escape(op['operation_name'] or op['stage_name'] or 'Операция')}</td>"
             f"<td class='num'>{op['time_norm']:.3f}</td>"
             "<td></td><td></td><td></td>"
             "</tr>"
@@ -86,14 +220,32 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int]) -> str:
             f"""
             <section class="sheet">
               <table class="route">
+                <colgroup>
+                  <col class="c-num">
+                  <col class="c-material">
+                  <col class="c-article">
+                  <col class="c-qty">
+                  <col class="c-qty">
+                  <col class="c-worker">
+                  <col class="c-otk">
+                </colgroup>
                 <tr>
                   <td colspan="4" class="title">{title}<br><span>(Изготовление новых)</span></td>
-                  <td colspan="3" class="order">Заказ на производство №{html.escape(str(product.order.order_number or ""))}<br>Дата заказа: {html.escape(order_date)}</td>
+                  <td colspan="3" class="order">
+                    <b>Заказ PRODPLAN:</b> №{order_number}<br>
+                    <b>Номер 1С:</b> {one_c_number}<br>
+                    <b>Дата заказа:</b> {html.escape(order_date)}
+                  </td>
                 </tr>
                 <tr>
-                  <td colspan="3"><b>Наименование:</b><br>{html.escape(str(product.item.item_name or ""))}</td>
-                  <td colspan="2"><b>Артикул:</b><br>{html.escape(str(product.item.item_article or ""))}</td>
+                  <td colspan="4"><b>Наименование:</b><br>{html.escape(str(product.item.item_name or ""))}</td>
+                  <td><b>Артикул:</b><br>{html.escape(str(product.item.item_article or ""))}</td>
                   <td colspan="2"><b>Количество:</b><br>{_to_float(product.remaining_qty) or _to_float(product.quantity):g} {html.escape(_unit_display(db, product.item.unit))}</td>
+                </tr>
+                <tr>
+                  <td colspan="4"><b>План:</b><br>{html.escape(route_ctx["plan_name"] or "—")}</td>
+                  <td><b>Период:</b><br>{html.escape(route_ctx["plan_period"] or "—")}</td>
+                  <td colspan="2"><b>Корневое изделие:</b><br>{html.escape(route_ctx["root_item"] or "—")}</td>
                 </tr>
                 <tr><td colspan="7"><b>Материалы и заготовки</b></td></tr>
                 <tr><th colspan="2">Материал</th><th>Артикул</th><th>Кол-во на ед.</th><th colspan="3">Кол-во по заказу</th></tr>
@@ -111,18 +263,25 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int]) -> str:
   <meta charset="utf-8">
   <title>Маршрутные листы</title>
   <style>
-    @page {{ size: A4 landscape; margin: 8mm; }}
+    @page {{ size: A4 portrait; margin: 8mm; }}
     body {{ font-family: "Times New Roman", serif; color: #000; margin: 0; }}
     .toolbar {{ position: sticky; top: 0; padding: 8px; background: #f4f6f8; border-bottom: 1px solid #cfd8dc; font-family: Arial, sans-serif; }}
     .toolbar button {{ padding: 6px 12px; }}
     .sheet {{ page-break-after: always; padding: 6px; }}
-    table.route {{ border-collapse: collapse; width: 100%; font-size: 15px; }}
-    .route td, .route th {{ border: 1px solid #000; padding: 4px; vertical-align: top; }}
-    .title {{ font-size: 22px; line-height: 1.25; }}
-    .title span {{ font-size: 20px; }}
-    .order {{ font-size: 18px; vertical-align: middle; }}
+    table.route {{ border-collapse: collapse; width: 100%; table-layout: fixed; font-size: 12px; }}
+    .route td, .route th {{ border: 1px solid #000; padding: 3px 4px; vertical-align: top; overflow-wrap: anywhere; }}
+    .c-num {{ width: 6%; }}
+    .c-material {{ width: 29%; }}
+    .c-article {{ width: 16%; }}
+    .c-qty {{ width: 11%; }}
+    .c-worker {{ width: 17%; }}
+    .c-otk {{ width: 10%; }}
+    .title {{ font-size: 16px; line-height: 1.2; }}
+    .title span {{ font-size: 14px; }}
+    .order {{ font-size: 12px; line-height: 1.25; }}
     th {{ text-align: center; font-weight: bold; }}
     .num {{ text-align: center; white-space: nowrap; }}
+    .text {{ text-align: left; }}
     .notes {{ height: 90px; }}
     @media print {{ .toolbar {{ display: none; }} .sheet {{ padding: 0; }} }}
   </style>

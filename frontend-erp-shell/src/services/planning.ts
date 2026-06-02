@@ -51,7 +51,7 @@ export function getPlanningResultRework(runId: number, params: { date_from?: str
   return api<MrpPagedResponse<MrpReworkRow>>(`/v1/plan/results/${runId}/rework?${buildResultQuery(params)}`)
 }
 
-export function getPlanningResultCapacity(runId: number, params: { date_from?: string; date_to?: string; limit?: number; offset?: number } = {}) {
+export function getPlanningResultCapacity(runId: number, params: { date_from?: string; date_to?: string; root_item_id?: number | null; limit?: number; offset?: number } = {}) {
   return api<MrpPagedResponse<MrpCapacityRow>>(`/v1/plan/results/${runId}/capacity?${buildResultQuery(params)}`)
 }
 

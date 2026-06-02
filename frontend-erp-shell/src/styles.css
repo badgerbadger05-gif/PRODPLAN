@@ -436,6 +436,15 @@ input:focus, select:focus {
   white-space: nowrap;
 }
 
+.oneCOrderCell {
+  background: #e9f7ed;
+}
+
+.oneCOrderCell strong,
+.oneCOrderCell span {
+  color: #06723f;
+}
+
 .issueCount {
   margin-top: 2px;
   font-size: 11px;
