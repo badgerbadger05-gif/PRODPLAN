@@ -645,6 +645,7 @@ def list_journal(
     run_id = _latest_run_id(db)
     plan_dates = _planned_dates_by_item(db, run_id)
     latest_run = db.query(PlanningRun).filter(PlanningRun.run_id == run_id).first() if run_id else None
+    requested_coverage_status = str(coverage_status) if coverage_status else None
 
     query = (
         db.query(ProductionProduct)
@@ -824,7 +825,7 @@ def list_journal(
         line_status = str(state.status if state else "shortage")
         issue_status = str(state.issue_status if state else "not_requested")
         work_status = _journal_work_status(line_status)
-        coverage_status = _journal_coverage_status(line_status, issue_status)
+        row_coverage_status = _journal_coverage_status(line_status, issue_status)
         result.append(
             {
                 "product_id": int(product.product_id),
@@ -847,8 +848,8 @@ def list_journal(
                 "produced_qty": _to_float(product.produced_qty),
                 "remaining_qty": _to_float(product.remaining_qty),
                 "status": work_status,
-                "coverage_status": coverage_status,
-                "coverage_label": COVERAGE_LABELS.get(coverage_status, coverage_status),
+                "coverage_status": row_coverage_status,
+                "coverage_label": COVERAGE_LABELS.get(row_coverage_status, row_coverage_status),
                 "issue_status": issue_status,
                 "planned_start_date": _date_to_iso(planned_start),
                 "planned_finish_date": _date_to_iso(planned_finish),
@@ -873,8 +874,8 @@ def list_journal(
             }
         )
 
-    if coverage_status:
-        result = [row for row in result if str(row.get("coverage_status") or "") == str(coverage_status)]
+    if requested_coverage_status:
+        result = [row for row in result if str(row.get("coverage_status") or "") == requested_coverage_status]
 
     sort_field = (sort_by or "").strip().lower()
     if sort_field in {"planned_start_date", "planned_finish_date"}:

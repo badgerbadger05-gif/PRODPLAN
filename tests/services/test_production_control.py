@@ -345,6 +345,40 @@ def test_journal_status_shortage_filter_is_exact(db_session):
     assert [row["order_number"] for row in journal["rows"]] == ["STAT-1"]
 
 
+def test_journal_without_coverage_filter_does_not_reuse_last_row_status(db_session):
+    item = Item(item_code="P-COV", item_name="Coverage part", unit="шт", stock_qty=0, status="active")
+    db_session.add(item)
+    db_session.flush()
+
+    for idx, status in enumerate(["ready", "partial"], start=1):
+        order = ProductionOrder(
+            order_number=f"COV-{idx}",
+            order_date=datetime(2026, 5, 20),
+            is_posted=True,
+            deletion_mark=False,
+        )
+        db_session.add(order)
+        db_session.flush()
+        product = ProductionProduct(
+            order_id=order.order_id,
+            item_id=item.item_id,
+            line_number=1,
+            quantity=1,
+            produced_qty=0,
+            remaining_qty=1,
+        )
+        db_session.add(product)
+        db_session.flush()
+        db_session.add(ProductionOrderLineState(product_id=product.product_id, status=status))
+    db_session.commit()
+
+    all_rows = list_journal(db_session)["rows"]
+    partial_rows = list_journal(db_session, coverage_status="partial")["rows"]
+
+    assert {row["order_number"] for row in all_rows} == {"COV-1", "COV-2"}
+    assert [row["order_number"] for row in partial_rows] == ["COV-2"]
+
+
 def test_journal_prefers_spec_kind_workshop_over_saved_state(db_session):
     old_workshop = ProductionResource(resource_name="Старый участок")
     inferred_workshop = ProductionResource(resource_name="Расчетный участок")
