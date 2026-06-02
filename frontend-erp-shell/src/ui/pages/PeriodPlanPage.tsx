@@ -1082,7 +1082,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
             <button className="primary" onClick={() => void handleSnapshot()} disabled={acting}>MRP снимок</button>
           )}
           {hasRuns && (
-            <button onClick={() => void handleAllocate()} disabled={acting || !activeRunId}>Ре-аллокация</button>
+            <button onClick={() => void handleAllocate()} disabled={acting || !activeRunId} title="Пересчитать остаточную потребность: добор недопокрытия и перепланировка ещё не открытых в 1С заказов от сегодня">Пересчёт</button>
           )}
           {isFixed && (
             <button onClick={() => void handleArchive()} disabled={acting}>В архив</button>
