@@ -16,6 +16,9 @@ from ..models import (
     ProductionMaterialIssueLine,
     ProductionOrderLineState,
     ProductionProduct,
+    ResourceStage,
+    SpecComponent,
+    SpecOperation,
     StockWarehouse,
     SyncLink,
     WorkshopWarehouseBinding,
@@ -24,7 +27,6 @@ from ..schemas import ODataSyncRequest
 from .production_control_common import date_to_iso as _date_to_iso, to_float as _to_float
 from .production_control_domain import ensure_state as _ensure_state, unit_display as _unit_display
 from .production_control_material_availability import _components_for_product
-from .production_workshop_resolver import resolve_workshop_id_for_product
 from .one_c_export_common import (
     clean_ref1c as _clean_ref1c,
     create_odata_client as _create_odata_client,
@@ -262,7 +264,39 @@ def _workshop_id_for_product(
     product: ProductionProduct,
     spec_id: Optional[int],
 ) -> Optional[int]:
-    return resolve_workshop_id_for_product(db, product, spec_id)
+    state_obj = (
+        db.query(ProductionOrderLineState)
+        .filter(ProductionOrderLineState.product_id == int(product.product_id))
+        .first()
+    )
+    if state_obj and state_obj.workshop_id:
+        return int(state_obj.workshop_id)
+    if not spec_id:
+        return None
+    stage_hours = (
+        db.query(SpecOperation.stage_id)
+        .filter(SpecOperation.spec_id == int(spec_id), SpecOperation.stage_id.isnot(None))
+        .group_by(SpecOperation.stage_id)
+        .order_by(func.sum(SpecOperation.time_norm).desc())
+        .first()
+    )
+    stage_id = int(stage_hours[0]) if stage_hours else None
+    if stage_id is None:
+        comp_stage = (
+            db.query(SpecComponent.stage_id)
+            .filter(SpecComponent.spec_id == int(spec_id), SpecComponent.stage_id.isnot(None))
+            .first()
+        )
+        stage_id = int(comp_stage[0]) if comp_stage else None
+    if stage_id is None:
+        return None
+    resource = (
+        db.query(ResourceStage.resource_id)
+        .filter(ResourceStage.stage_id == int(stage_id))
+        .order_by(ResourceStage.id.asc())
+        .first()
+    )
+    return int(resource[0]) if resource else None
 
 
 def _destination_warehouse_for_product(

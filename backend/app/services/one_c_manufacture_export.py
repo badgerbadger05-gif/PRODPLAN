@@ -30,13 +30,14 @@ from ..models import (
     Item,
     ProductionManufacture,
     ProductionOrder,
+    ProductionOrderLineState,
     ProductionProduct,
+    ResourceStage,
     SpecComponent,
     SpecOperation,
     SyncLink,
     WorkshopWarehouseBinding,
 )
-from .production_workshop_resolver import resolve_workshop_binding_for_product
 from .one_c_export_common import (
     DEFAULT_ORGANIZATION_REF1C,
     DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C,
@@ -120,7 +121,31 @@ def _main_stage_id_for_spec(db: Session, spec_id: Optional[int]) -> Optional[int
 
 
 def _binding_for_product(db: Session, product: ProductionProduct) -> Optional[WorkshopWarehouseBinding]:
-    return resolve_workshop_binding_for_product(db, product, int(product.spec_id) if product.spec_id else None)
+    state_workshop_id = None
+    state = getattr(product, "control_state", None)
+    if state and state.workshop_id:
+        state_workshop_id = int(state.workshop_id)
+
+    workshop_id = state_workshop_id
+    if workshop_id is None:
+        stage_id = _main_stage_id_for_spec(db, int(product.spec_id) if product.spec_id else None)
+        if stage_id:
+            resource_stage = (
+                db.query(ResourceStage)
+                .filter(ResourceStage.stage_id == int(stage_id))
+                .order_by(ResourceStage.id.asc())
+                .first()
+            )
+            if resource_stage:
+                workshop_id = int(resource_stage.resource_id)
+
+    if workshop_id is None:
+        return None
+    return (
+        db.query(WorkshopWarehouseBinding)
+        .filter(WorkshopWarehouseBinding.workshop_id == int(workshop_id))
+        .one_or_none()
+    )
 
 
 def _component_rows(db: Session, product: ProductionProduct, qty: float) -> List[Dict[str, Any]]:
