@@ -160,6 +160,35 @@ def _load_organization_names(client: Any) -> Dict[str, str]:
     return organization_names
 
 
+def _load_supplier_names(client: Any, supplier_refs: set[str]) -> Dict[str, str]:
+    supplier_names: Dict[str, str] = {}
+    refs = sorted({str(ref or "").strip() for ref in supplier_refs if str(ref or "").strip()})
+    if not refs:
+        return supplier_names
+
+    chunk_size = 80
+    for start in range(0, len(refs), chunk_size):
+        chunk = refs[start : start + chunk_size]
+        filter_query = " or ".join(f"Ref_Key eq guid'{ref}'" for ref in chunk)
+        try:
+            rows = client.get_all(
+                "Catalog_Контрагенты",
+                filter_query=filter_query,
+                select_fields=["Ref_Key", "Description", "Наименование"],
+                top=1000,
+                max_pages=5,
+            )
+        except Exception as e:
+            print(f"Не удалось загрузить контрагентов: {e}")
+            continue
+        for row in rows or []:
+            key = _norm_guid(row.get("Ref_Key"))
+            name = str(row.get("Description") or row.get("Наименование") or "").strip()
+            if key and name:
+                supplier_names[key] = name
+    return supplier_names
+
+
 @dataclass
 class SupplierOrderSyncStats:
     """Статистика синхронизации заказов поставщикам"""
@@ -236,6 +265,14 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
         existing_orders = {order.order_ref1c: order for order in db.query(SupplierOrder).all() if order.order_ref1c}
         existing_suppliers = {sup.supplier_ref1c: sup for sup in db.query(Supplier).all() if sup.supplier_ref1c}
         existing_items = {item.item_ref1c: item for item in db.query(Item).all() if item.item_ref1c}
+        supplier_names_by_key = _load_supplier_names(
+            client,
+            {
+                str(record.get("Контрагент_Key") or "").strip()
+                for record in order_data
+                if str(record.get("Контрагент_Key") or "").strip()
+            },
+        )
 
         created_count = 0
         updated_count = 0
@@ -336,10 +373,12 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                         supplier_name = str(supplier_raw.get('Description') or supplier_raw.get('Наименование') or '').strip()
                     else:
                         supplier_name = str(supplier_raw or '').strip()
+                    if not supplier_name:
+                        supplier_name = supplier_names_by_key.get(supplier_key, "")
                     existing_supplier = existing_suppliers.get(supplier_key)
 
                     if existing_supplier:
-                        if existing_supplier.supplier_name != supplier_name:
+                        if supplier_name and existing_supplier.supplier_name != supplier_name:
                             existing_supplier.supplier_name = supplier_name
                             suppliers_updated += 1
                         current_order.supplier_id = existing_supplier.supplier_id
