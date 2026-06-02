@@ -865,12 +865,44 @@ def list_journal(
     }
 
 
+def _adjust_requirement_coverage(db: Session, product: ProductionProduct, delta_covered: float) -> None:
+    """
+    Shift the backing MrpRequirement.covered_qty by `delta_covered` (signed) and
+    recompute remaining_qty, clamped to [0, net_required_qty].
+
+    Mirrors the coverage bump done at materialization
+    (create_production_orders_from_mrp_requirements). A negative delta releases
+    coverage so the residual demand becomes visible again — used when a line is
+    closed/cancelled with an un-produced remainder, or its planned quantity is
+    reduced. No-op for lines that are not backed by an MrpRequirement
+    (1C-source lines, planned-order-source lines).
+    """
+    rid = getattr(product, "source_mrp_requirement_id", None)
+    if rid is None:
+        return
+    req = db.query(MrpRequirement).filter(MrpRequirement.id == int(rid)).first()
+    if req is None:
+        return
+    net_qty = _to_float(req.net_required_qty)
+    new_covered = _to_float(req.covered_qty) + float(delta_covered)
+    new_covered = max(0.0, min(new_covered, net_qty))
+    req.covered_qty = new_covered
+    req.remaining_qty = max(net_qty - new_covered, 0.0)
+
+
+# Terminal states that close a line: a remainder left un-produced here is never
+# going to be made on this line, so its coverage must be released back to the
+# requirement.
+_TERMINAL_LINE_STATUSES = {"completed", "cancelled"}
+
+
 def update_line_state(db: Session, product_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
     product = db.query(ProductionProduct).filter(ProductionProduct.product_id == int(product_id)).first()
     if not product:
         raise ValueError("Строка заказа не найдена")
 
     state = _ensure_state(db, product)
+    prev_status = str(state.status or "")
     if "status" in payload and payload.get("status"):
         status = str(payload.get("status")).strip()
         if status not in LINE_STATUSES:
@@ -880,6 +912,14 @@ def update_line_state(db: Session, product_id: int, payload: Dict[str, Any]) -> 
         # stamp opened_at вЂ” it acts as a workshop-side timestamp.
         if status in {"ready", "to_move", "assembled", "in_progress", "done", "produced_partial", "produced", "completed"} and not state.opened_at:
             state.opened_at = datetime.utcnow()
+        # Closing the line with an un-produced remainder: release that remainder
+        # from the requirement's coverage so the reconciliation job (and the
+        # journal) can see the demand is no longer fully ordered.
+        if status in _TERMINAL_LINE_STATUSES and prev_status not in _TERMINAL_LINE_STATUSES:
+            released = _to_float(product.remaining_qty)
+            if released > 1e-9:
+                _adjust_requirement_coverage(db, product, -released)
+                product.remaining_qty = 0.0
     if "issue_status" in payload and payload.get("issue_status"):
         issue_status = str(payload.get("issue_status")).strip()
         if issue_status not in ISSUE_STATUSES:
@@ -922,7 +962,13 @@ def update_product_quantity(db: Session, product_id: int, quantity: float) -> Di
             "Нельзя уменьшить заказ ниже факта."
         )
 
+    old_qty = _to_float(product.quantity)
     product.quantity = qty
     product.remaining_qty = max(0.0, qty - produced)
+    # Keep the backing requirement's coverage in sync: shrinking the line frees
+    # coverage (exposes residual demand), growing it consumes more.
+    delta = qty - old_qty
+    if abs(delta) > 1e-9:
+        _adjust_requirement_coverage(db, product, delta)
     db.commit()
     return {"status": "ok", "product_id": int(product_id), "quantity": float(qty), "remaining_qty": float(product.remaining_qty)}

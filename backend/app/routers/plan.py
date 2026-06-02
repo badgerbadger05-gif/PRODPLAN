@@ -59,6 +59,7 @@ from ..services.mrp_result_export import (
     export_rework_results_xlsx,
 )
 from ..services.one_c_purchase_order_export import export_planned_purchases_to_1c
+from ..services.mrp_reconciliation import reconcile_all_active, reconcile_snapshot
 from ..services.period_plan_service import (
     add_item_to_period_plan,
     archive_period_plan,
@@ -1489,6 +1490,44 @@ async def export_planning_result_purchases_to_1c(
             dry_run=bool(req.dry_run),
             allow_production=bool(req.allow_production),
         )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+class ReconcileRequest(BaseModel):
+    dry_run: bool = False
+
+
+@router.post("/reconcile")
+async def reconcile_active_snapshots(
+    req: ReconcileRequest = ReconcileRequest(),
+    db: Session = Depends(get_db),
+):
+    """
+    Регламентная сверка остаточной потребности: пересчитать текущий нетто-расчёт
+    для каждого активного MRP-снимка и добрать недопокрытие (заказы на
+    производство в журнал, строки закупок в MRP). В 1С ничего не уходит —
+    только по кнопке пользователя.
+
+    `dry_run=true` считает и возвращает дельту, ничего не записывая.
+    """
+    try:
+        return reconcile_all_active(db, dry_run=bool(req.dry_run))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/results/{run_id}/reconcile")
+async def reconcile_single_snapshot(
+    run_id: int,
+    req: ReconcileRequest = ReconcileRequest(),
+    db: Session = Depends(get_db),
+):
+    """Сверка одного FIXED_SNAPSHOT-прогона. См. POST /reconcile."""
+    try:
+        return reconcile_snapshot(db, int(run_id), dry_run=bool(req.dry_run))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

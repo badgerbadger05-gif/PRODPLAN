@@ -19,8 +19,7 @@ import { dateRu, dateTimeRu, qty } from '../../lib/format'
 import { ensurePlanItem, searchNomenclature } from '../../services/productionPlan'
 import {
   addItemToPeriodPlan,
-  allocatePurchases,
-  allocateRework,
+  reconcileRun,
   archivePeriodPlan,
   bulkUpsertPeriodPlanLines,
   createMrpSnapshot,
@@ -721,8 +720,11 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     setError('')
     setMessage('')
     try {
-      const [p, r] = await Promise.all([allocatePurchases(runId), allocateRework(runId)])
-      setMessage(`Аллокация: закупки ${p.updated_count} строк, переработки ${r.updated_count} строк`)
+      const res = await reconcileRun(runId)
+      const prod = res.production_added?.length ?? 0
+      const purch = res.purchase_added?.length ?? 0
+      const moved = res.rescheduled?.floating ?? 0
+      setMessage(`Пересчёт: производство +${prod}, закупки +${purch}, перепланировано ${moved} строк`)
       await loadJournal(journalFlow, runId, journalRootItemId)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -1080,7 +1082,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
             <button className="primary" onClick={() => void handleSnapshot()} disabled={acting}>MRP снимок</button>
           )}
           {hasRuns && (
-            <button onClick={() => void handleAllocate()} disabled={acting || !activeRunId}>Ре-аллокация</button>
+            <button onClick={() => void handleAllocate()} disabled={acting || !activeRunId} title="Пересчитать остаточную потребность: добор недопокрытия и перепланировка ещё не открытых в 1С заказов от сегодня">Пересчёт</button>
           )}
           {isFixed && (
             <button onClick={() => void handleArchive()} disabled={acting}>В архив</button>

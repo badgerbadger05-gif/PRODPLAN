@@ -3764,7 +3764,6 @@ def apply_capacity_constraints(
     run_id = run.run_id
     warnings = []
 
-    # Process orders one by one in priority order
     orders_to_schedule = (
         db.query(PlannedOrder)
         .filter(PlannedOrder.run_id == run_id)
@@ -3772,48 +3771,82 @@ def apply_capacity_constraints(
         .all()
     )
 
+    # Stages per order (built in PHASE 2).
+    stages_by_order: Dict[int, List[PlannedOrderStage]] = defaultdict(list)
+    for s in db.query(PlannedOrderStage).filter(PlannedOrderStage.run_id == run_id).all():
+        stages_by_order[int(s.order_id)].append(s)
+
+    # child→parent map among the items being scheduled: a parent's default-spec
+    # components are its children, so the component must be ready first.
+    order_item_ids = {int(o.item_id) for o in orders_to_schedule}
+    default_spec_by_item = {
+        int(ds.item_id): int(ds.spec_id)
+        for ds in db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
+        .filter(DefaultSpecification.item_id.in_(order_item_ids))
+        .all()
+    } if order_item_ids else {}
+    parents_of_item: Dict[int, Set[int]] = {}
+    if default_spec_by_item:
+        spec_to_parent = {sid: iid for iid, sid in default_spec_by_item.items()}
+        for spec_id, comp_item in (
+            db.query(SpecComponent.spec_id, SpecComponent.item_id)
+            .filter(SpecComponent.spec_id.in_(set(default_spec_by_item.values())))
+            .all()
+        ):
+            parent = spec_to_parent.get(int(spec_id))
+            child = int(comp_item)
+            if parent is not None and child in order_item_ids:
+                parents_of_item.setdefault(child, set()).add(int(parent))
+
+    # Build the batch and keep analytic CAPACITY_LIMITED warnings (no qty change).
+    batch: List[Dict[str, Any]] = []
+    order_by_key: Dict[int, PlannedOrder] = {}
     for order in orders_to_schedule:
-        stages = db.query(PlannedOrderStage).filter(PlannedOrderStage.order_id == order.order_id).all()
+        stages = stages_by_order.get(int(order.order_id), [])
         if not stages:
             continue
-
-        # 1. Capacity analytics only (no qty modifications)
-        stage_hours = {s.stage_id: s.hours for s in stages}
-        stage_areas = {s.stage_id: (int(s.area_id) if s.area_id is not None else None) for s in stages}
-
-        # Keep analytic warnings but do not mutate order.qty or stage.hours
+        stage_hours = {int(s.stage_id): float(s.hours or 0.0) for s in stages}
+        stage_areas = {int(s.stage_id): (int(s.area_id) if s.area_id is not None else None) for s in stages}
         try:
             _, _, limit_warnings = capacity_scheduler.limit_qty_by_capacity(
                 order.item_id, order.qty, order.need_date, stage_hours, stage_areas_by_stage=stage_areas
             )
             warnings.extend(limit_warnings)
         except Exception:
-            # If analytic fails, ignore and proceed to scheduling
             pass
+        order_by_key[int(order.order_id)] = order
+        batch.append({
+            "key": int(order.order_id),
+            "item_id": int(order.item_id),
+            "qty": float(order.qty or 0.0),
+            "need_date": order.need_date,
+            "stage_hours": stage_hours,
+            "stage_areas": stage_areas,
+            "priority": float(order.priority_index or 0.0),
+            "fixed": False,
+        })
 
-        # 2. Schedule with push-right; qty remains unchanged
-        final_stages_with_hours = {s.stage_id: s.hours for s in stages}
-        schedule_result, schedule_warnings = capacity_scheduler.schedule_backward(
-            order.item_id, order.qty, order.need_date, final_stages_with_hours, stage_areas_by_stage=stage_areas
-        )
-        # Enrich warnings with run_id/order_id
-        for w in schedule_warnings:
-            try:
-                w["run_id"] = int(run_id)
-                w["order_id"] = int(order.order_id)
-            except Exception:
-                pass
-        warnings.extend(schedule_warnings)
+    # Capacity-aware, child→parent-aware scheduling (parents first; a component
+    # finishes before the assembly that consumes it; push-right never before today).
+    results, schedule_warnings = capacity_scheduler.schedule_orders_bom_aware(batch, parents_of_item)
+    for w in schedule_warnings:
+        try:
+            w.setdefault("run_id", int(run_id))
+        except Exception:
+            pass
+    warnings.extend(schedule_warnings)
 
+    for okey, schedule_result in results.items():
+        order = order_by_key.get(int(okey))
+        if order is None:
+            continue
         order.start_date = schedule_result.get("order_start_date")
         order.finish_date = schedule_result.get("order_finish_date")
-
-        for stage in stages:
+        for stage in stages_by_order.get(int(okey), []):
             stage_dates = schedule_result.get("stage_dates", {}).get(stage.stage_id)
             if stage_dates:
                 stage.start_date = stage_dates["start"]
                 stage.finish_date = stage_dates["finish"]
-                # Bucket date should reflect when the work is actually happening
                 stage.bucket_date = stage_dates["start"].date() if stage_dates.get("start") else order.bucket_date
 
     # 3. Aggregate capacity load at the very end

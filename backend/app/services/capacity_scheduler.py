@@ -374,6 +374,191 @@ class CapacityScheduler:
             "stage_dates": stage_dates,
         }, warnings
 
+    def add_fixed_load(self, area_id: int, day: date, hours: float) -> None:
+        """
+        Pre-book capacity for an order we are NOT allowed to move (e.g. already
+        open in 1C). Floating orders scheduled afterwards will see this area-day
+        as partially busy and route around it.
+        """
+        if hours <= 1e-9:
+            return
+        self._capacity_usage_daily[(int(area_id), day)] += float(hours)
+
+    def _candidate_areas_for(self, item_id: int, stage_areas_by_stage: Optional[Dict[int, Optional[int]]]) -> List[int]:
+        kind_id = self._get_production_kind_for_item(int(item_id))
+        cands: List[int] = []
+        if kind_id is not None:
+            cands = list(self._get_candidate_areas(kind_id)) or []
+        if not cands and stage_areas_by_stage:
+            for area in stage_areas_by_stage.values():
+                if area is not None:
+                    cands.append(int(area))
+        return cands
+
+    @staticmethod
+    def _topo_order_parents_first(
+        keys: List[Any],
+        item_of: Dict[Any, int],
+        parents_of_item: Dict[int, Set[int]],
+        priority_of: Dict[Any, float],
+        need_date_of: Dict[Any, date],
+    ) -> List[Any]:
+        """
+        Order schedule keys so that a parent assembly is scheduled before its
+        components. Falls back to (priority desc, need_date asc) inside the same
+        BOM depth. Depth = longest chain of parents above the item (0 = top).
+        """
+        depth_cache: Dict[int, int] = {}
+
+        def depth(item_id: int, seen: Set[int]) -> int:
+            if item_id in depth_cache:
+                return depth_cache[item_id]
+            parents = parents_of_item.get(item_id) or set()
+            if not parents or item_id in seen:
+                depth_cache[item_id] = 0
+                return 0
+            best = 0
+            for p in parents:
+                if p == item_id:
+                    continue
+                best = max(best, 1 + depth(p, seen | {item_id}))
+            depth_cache[item_id] = best
+            return best
+
+        return sorted(
+            keys,
+            key=lambda k: (
+                depth(int(item_of[k]), set()),
+                -float(priority_of.get(k, 0.0) or 0.0),
+                need_date_of.get(k) or date.max,
+            ),
+        )
+
+    def schedule_orders_bom_aware(
+        self,
+        orders: List[Dict[str, Any]],
+        parents_of_item: Optional[Dict[int, Set[int]]] = None,
+    ) -> Tuple[Dict[Any, Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        Schedule a batch of production orders honouring child→parent precedence
+        and per-area capacity.
+
+        Each order dict carries:
+          key            — opaque id returned back in results
+          item_id        — produced item
+          qty            — quantity
+          need_date      — due date (latest acceptable finish)
+          stage_hours    — {stage_id: norm_hours}
+          stage_areas    — {stage_id: area_id|None}
+          priority       — optional float (default 0), tie-break within a level
+          fixed          — bool; True = already committed (open in 1C). Not moved.
+          fixed_start    — date; required when fixed
+          fixed_finish   — date; required when fixed
+        `parents_of_item` maps {child_item_id: {parent_item_id, ...}}.
+
+        Rules:
+          * Fixed orders are left where they are and pre-book their capacity so
+            floating work routes around them.
+          * Floating orders are scheduled parents-first; each one finishes no
+            later than min(own need_date, earliest start of its parents) — the
+            component is ready before the assembly that consumes it.
+          * Backward allocation with push-right fallback (never earlier than
+            today). If a component is forced to finish after its parent starts,
+            a BOM_PRECEDENCE_LATE warning is emitted (parent is not auto-moved
+            in this version).
+
+        Returns ({key: {order_start_date, order_finish_date, stage_dates}}, warnings).
+        """
+        parents_of_item = {
+            int(c): {int(p) for p in (parents or set())}
+            for c, parents in (parents_of_item or {}).items()
+        }
+
+        results: Dict[Any, Dict[str, Any]] = {}
+        warnings: List[Dict[str, Any]] = []
+        # Earliest known start per produced item (across fixed + scheduled).
+        start_by_item: Dict[int, date] = {}
+
+        item_of = {o["key"]: int(o["item_id"]) for o in orders}
+        priority_of = {o["key"]: float(o.get("priority", 0.0) or 0.0) for o in orders}
+        need_of = {o["key"]: o.get("need_date") for o in orders}
+
+        # 1) Pre-book fixed orders and seed their start as a precedence anchor.
+        for o in orders:
+            if not o.get("fixed"):
+                continue
+            iid = int(o["item_id"])
+            fstart = o.get("fixed_start")
+            ffinish = o.get("fixed_finish") or fstart
+            if fstart is not None:
+                start_by_item[iid] = min(start_by_item.get(iid, fstart), fstart)
+            # Book the line's hours on candidate areas across its [start, finish]
+            # window (best-effort, even split per workday).
+            cands = self._candidate_areas_for(iid, o.get("stage_areas"))
+            total_hours = sum(float(h or 0.0) for h in (o.get("stage_hours") or {}).values())
+            if cands and total_hours > 1e-9 and fstart is not None:
+                workdays = [
+                    fstart + timedelta(days=n)
+                    for n in range((max(ffinish, fstart) - fstart).days + 1)
+                    if self._is_workday(fstart + timedelta(days=n))
+                ] or [fstart]
+                per_day = total_hours / len(workdays)
+                for d in workdays:
+                    self.add_fixed_load(cands[0], d, per_day)
+            results[o["key"]] = {
+                "order_start_date": datetime.combine(fstart, datetime.min.time()) if fstart else None,
+                "order_finish_date": datetime.combine(ffinish, datetime.min.time()) if ffinish else None,
+                "stage_dates": {},
+                "fixed": True,
+            }
+
+        # 2) Schedule floating orders parents-first.
+        floating = [o for o in orders if not o.get("fixed")]
+        ordered_keys = self._topo_order_parents_first(
+            [o["key"] for o in floating], item_of, parents_of_item, priority_of, need_of
+        )
+        order_by_key = {o["key"]: o for o in floating}
+
+        for key in ordered_keys:
+            o = order_by_key[key]
+            iid = int(o["item_id"])
+            own_need = o.get("need_date") or self._dmax
+            parent_starts = [
+                start_by_item[p]
+                for p in parents_of_item.get(iid, set())
+                if p in start_by_item
+            ]
+            deadline = own_need
+            if parent_starts:
+                deadline = min(deadline, min(parent_starts))
+
+            schedule_result, sched_warnings = self.schedule_backward(
+                iid,
+                float(o.get("qty", 0.0)),
+                deadline,
+                o.get("stage_hours") or {},
+                stage_areas_by_stage=o.get("stage_areas"),
+            )
+            warnings.extend(sched_warnings)
+            results[key] = schedule_result
+
+            start_dt = schedule_result.get("order_start_date")
+            finish_dt = schedule_result.get("order_finish_date")
+            start_d = start_dt.date() if isinstance(start_dt, datetime) else start_dt
+            finish_d = finish_dt.date() if isinstance(finish_dt, datetime) else finish_dt
+            if start_d is not None:
+                start_by_item[iid] = min(start_by_item.get(iid, start_d), start_d)
+
+            if parent_starts and finish_d is not None and finish_d > min(parent_starts):
+                warnings.append({
+                    "code": "BOM_PRECEDENCE_LATE",
+                    "item_id": iid,
+                    "component_finish": finish_d.isoformat(),
+                    "parent_start": min(parent_starts).isoformat(),
+                })
+
+        return results, warnings
+
     def get_aggregated_load(self) -> Dict[Tuple[int, date], Dict[str, float]]:
         """
         Aggregates the capacity usage into a structured format for DB insertion.
