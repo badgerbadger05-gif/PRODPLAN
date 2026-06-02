@@ -121,12 +121,22 @@ export function deleteItemFromPeriodPlan(planId: number, itemId: number) {
   )
 }
 
-export function allocatePurchases(runId: number) {
-  return api<{ status: string; updated_count: number }>(`/v1/plan/results/${runId}/purchases/allocate`, { method: 'POST' })
+export type ReconcileResult = {
+  status: string
+  run_id: number
+  production_added: { item_id: number; item_code?: string; qty: number }[]
+  purchase_added: { item_id: number; item_code?: string; qty: number }[]
+  rescheduled?: { floating: number; fixed: number; warnings: unknown[] }
 }
 
-export function allocateRework(runId: number) {
-  return api<{ status: string; updated_count: number }>(`/v1/plan/results/${runId}/rework/allocate`, { method: 'POST' })
+// Пересчёт остаточной потребности по снимку: добор недопокрытия (заказы в
+// журнал, строки закупок) + перепланировка ещё не открытых в 1С заказов от
+// сегодня. В 1С ничего не пишется — только по кнопке пользователя.
+export function reconcileRun(runId: number) {
+  return api<ReconcileResult>(`/v1/plan/results/${runId}/reconcile`, {
+    method: 'POST',
+    body: JSON.stringify({ dry_run: false }),
+  })
 }
 
 export function createProductionOrdersFromRequirements(requirementIds: number[], initiatedBy = 'erp-shell') {

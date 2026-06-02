@@ -20,8 +20,7 @@ import { dateRu, dateTimeRu, qty } from '../../lib/format'
 import { ensurePlanItem, searchNomenclature } from '../../services/productionPlan'
 import {
   addItemToPeriodPlan,
-  allocatePurchases,
-  allocateRework,
+  reconcileRun,
   archivePeriodPlan,
   bulkUpsertPeriodPlanLines,
   createMrpSnapshot,
@@ -719,8 +718,11 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     setError('')
     setMessage('')
     try {
-      const [p, r] = await Promise.all([allocatePurchases(runId), allocateRework(runId)])
-      setMessage(`Аллокация: закупки ${p.updated_count} строк, переработки ${r.updated_count} строк`)
+      const res = await reconcileRun(runId)
+      const prod = res.production_added?.length ?? 0
+      const purch = res.purchase_added?.length ?? 0
+      const moved = res.rescheduled?.floating ?? 0
+      setMessage(`Пересчёт: производство +${prod}, закупки +${purch}, перепланировано ${moved} строк`)
       await loadJournal(journalFlow, runId)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
