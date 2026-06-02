@@ -402,13 +402,14 @@ async def period_plans_mrp_snapshot(
 async def period_plans_execution_journal(
     plan_id: int,
     run_id: Optional[int] = None,
+    root_item_id: Optional[int] = None,
     bom_level: Optional[int] = None,
     flow: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
     try:
         return get_period_plan_execution_journal(
-            db, plan_id, run_id=run_id, bom_level=bom_level, flow=flow
+            db, plan_id, run_id=run_id, root_item_id=root_item_id, bom_level=bom_level, flow=flow
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -760,6 +761,7 @@ async def get_planning_result_summary(
 async def get_planning_result_production(
     run_id: int,
     item_id: Optional[int] = None,
+    root_item_id: Optional[int] = None,
     bucket_type: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
@@ -775,6 +777,7 @@ async def get_planning_result_production(
             db=db,
             run_id=int(run_id),
             item_id=item_id,
+            root_item_id=root_item_id,
             bucket_type=bucket_type,
             date_from=date_from,
             date_to=date_to,
@@ -821,6 +824,7 @@ async def get_planning_result_production_grouped(
 async def get_planning_result_purchases(
     run_id: int,
     item_id: Optional[int] = None,
+    root_item_id: Optional[int] = None,
     bucket_type: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
@@ -836,6 +840,7 @@ async def get_planning_result_purchases(
             db=db,
             run_id=int(run_id),
             item_id=item_id,
+            root_item_id=root_item_id,
             bucket_type=bucket_type,
             date_from=date_from,
             date_to=date_to,
@@ -906,6 +911,7 @@ async def get_planning_result_purchases_grouped(
 async def get_planning_result_rework(
     run_id: int,
     item_id: Optional[int] = None,
+    root_item_id: Optional[int] = None,
     bucket_type: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
@@ -921,6 +927,7 @@ async def get_planning_result_rework(
             db=db,
             run_id=int(run_id),
             item_id=item_id,
+            root_item_id=root_item_id,
             bucket_type=bucket_type,
             date_from=date_from,
             date_to=date_to,
@@ -1182,6 +1189,7 @@ async def get_stages(db: Session = Depends(get_db)):
 async def export_planning_result_production(
     run_id: int,
     format: str = "csv",
+    root_item_id: Optional[int] = None,
     bucket_type: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
@@ -1198,6 +1206,7 @@ async def export_planning_result_production(
             db=db,
             run_id=int(run_id),
             item_id=None,
+            root_item_id=root_item_id,
             bucket_type=bucket_type,
             date_from=date_from,
             date_to=date_to,
@@ -1245,21 +1254,24 @@ async def export_planning_result_production(
         if (format or "csv").lower() == "xlsx":
             # Формируем XLSX с разбивкой по участкам (подзаголовки)
             # Пытаемся получить серверную группировку; при ошибке/пусто — фолбэк к плоскому списку
-            try:
-                grouped_res = get_run_production_grouped(
-                    db=db,
-                    run_id=int(run_id),
-                    item_id=None,
-                    date_from=date_from,
-                    date_to=date_to,
-                    area_id=None,
-                    limit=1000,
-                    offset=0,
-                    sort_by=sort_by,
-                    sort_dir=sort_dir,
-                )
-                groups = (grouped_res or {}).get("groups", []) or []
-            except Exception:
+            if root_item_id is None:
+                try:
+                    grouped_res = get_run_production_grouped(
+                        db=db,
+                        run_id=int(run_id),
+                        item_id=None,
+                        date_from=date_from,
+                        date_to=date_to,
+                        area_id=None,
+                        limit=1000,
+                        offset=0,
+                        sort_by=sort_by,
+                        sort_dir=sort_dir,
+                    )
+                    groups = (grouped_res or {}).get("groups", []) or []
+                except Exception:
+                    groups = []
+            else:
                 groups = []
 
             import io, base64
@@ -1387,6 +1399,7 @@ async def export_planning_result_production(
 async def export_planning_result_purchases(
     run_id: int,
     format: str = "csv",
+    root_item_id: Optional[int] = None,
     bucket_type: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
@@ -1403,6 +1416,7 @@ async def export_planning_result_purchases(
             db=db,
             run_id=int(run_id),
             item_id=None,
+            root_item_id=root_item_id,
             bucket_type=bucket_type,
             date_from=date_from,
             date_to=date_to,
@@ -1522,6 +1536,7 @@ async def reconcile_single_snapshot(
 async def export_planning_result_rework(
     run_id: int,
     format: str = "csv",
+    root_item_id: Optional[int] = None,
     bucket_type: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
@@ -1538,6 +1553,7 @@ async def export_planning_result_rework(
             db=db,
             run_id=int(run_id),
             item_id=None,
+            root_item_id=root_item_id,
             bucket_type=bucket_type,
             date_from=date_from,
             date_to=date_to,

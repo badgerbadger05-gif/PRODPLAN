@@ -14,10 +14,10 @@ import { TransferRequestsPage } from './pages/TransferRequestsPage'
 const navItems = [
   { to: '/', title: 'Главная', end: true },
   { to: '/period-plan', title: 'Планирование выпуска' },
+  { to: '/mrp-runs', title: 'MRP прогоны' },
   { to: '/production-control', title: 'Журнал заказов' },
   { to: '/transfer-requests', title: 'Заявки перемещений' },
   { to: '/production-report-week', title: 'Выпуск недельный' },
-  { to: '/mrp-runs', title: 'MRP прогоны' },
   { to: '/resources', title: 'Ресурсы' },
   { to: '/stage-distribution', title: 'Распределение этапов' },
   { to: '/specification', title: 'Спецификации' },

@@ -97,6 +97,8 @@ export function ProductionDetailPane({
   const canFillRemaining = hasMrpCoverage && mrpRemaining > 0.001 && !!activeRow?.source_run_id
   const activeCoverageStatus = materials?.coverage_status || activeRow?.coverage_status || activeRow?.status || 'unknown'
   const activeCoverageLabel = materials?.coverage_label || activeRow?.coverage_label || coverageLabels[String(activeCoverageStatus)] || activeCoverageStatus
+  const planSourceLabel = activeRow?.source_plan_name
+    || (activeRow?.source_plan_id ? `План #${activeRow.source_plan_id}` : '')
 
   function sourceLabel(source?: string | null) {
     if (source === 'supplier_order') return 'Заказ поставщику'
@@ -133,7 +135,7 @@ export function ProductionDetailPane({
           <div className="detailMeta">{activeRow.item_article || activeRow.item_code}</div>
           <div className="detailGrid">
             <span>Заказ</span><strong>{activeRow.order_number}</strong>
-            <span>Источник</span><strong>{activeRow.source_mrp_requirement_id ? `MRP req #${activeRow.source_mrp_requirement_id}` : rowSource || '1C'}</strong>
+            <span>Источник</span><strong>{planSourceLabel || rowSource || '1C'}</strong>
             <span>Остаток</span><strong>{qty(activeRow.remaining_qty)} {activeRow.unit}</strong>
             <span>Кол-во запуска</span>
             <span className="batchEditCell">

@@ -15,9 +15,10 @@ import {
   getPlanningResultPurchases,
   getPlanningResultRework,
   getPlanningRunSummary,
-  getShortageReport,
 } from '../../services/planning'
+import { getPeriodPlanMatrix } from '../../services/periodPlan'
 import { DocumentWindow } from '../layout/DocumentWindow'
+import { RootProductFilterDialog, rootProductLabel, type RootProductOption } from '../RootProductFilterDialog'
 import { StatusBar } from '../layout/StatusBar'
 
 type Tab = 'production' | 'purchases' | 'rework' | 'capacity'
@@ -32,6 +33,14 @@ function parseTab(value: string | null): Tab | null {
 function parseId(value: string | null) {
   const id = Number(value)
   return Number.isFinite(id) && id > 0 ? id : null
+}
+
+function supplierDisplayName(row: MrpPurchaseRow) {
+  return (row.supplier_name || '').trim() || 'Без наименования'
+}
+
+function supplierFilterKey(row: MrpPurchaseRow) {
+  return (row.supplier_name || '').trim() ? (row.supplier_ref1c || row.supplier_name || '') : '__missing_supplier_name'
 }
 
 function ForecastShift({ forecast }: { forecast?: { forecast_date?: string | null; forecast_shift_days?: number | null; forecast_reason?: string | null } | null }) {
@@ -72,15 +81,18 @@ export function MrpResultPage() {
   const [selectedPurchaseIds, setSelectedPurchaseIds] = useState<Set<number>>(new Set())
   const [purchaseSupplierFilter, setPurchaseSupplierFilter] = useState('')
   const [purchaseCategoryFilter, setPurchaseCategoryFilter] = useState('')
+  const [rootItemId, setRootItemId] = useState<number | null>(null)
+  const [rootOptions, setRootOptions] = useState<RootProductOption[]>([])
+  const [rootDialogOpen, setRootDialogOpen] = useState(false)
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
 
   const purchaseSupplierOptions = useMemo(() => {
     const map = new Map<string, string>()
     purchaseRows.forEach((row) => {
-      const key = row.supplier_ref1c || row.supplier_name || ''
+      const key = supplierFilterKey(row)
       if (!key) return
-      map.set(key, row.supplier_name || row.supplier_ref1c || 'Без поставщика')
+      map.set(key, supplierDisplayName(row))
     })
     return Array.from(map.entries()).map(([value, label]) => ({ value, label })).sort((a, b) => a.label.localeCompare(b.label, 'ru'))
   }, [purchaseRows])
@@ -97,7 +109,7 @@ export function MrpResultPage() {
   }, [purchaseRows])
   const filteredPurchaseRows = useMemo(() => (
     purchaseRows.filter((row) => {
-      const supplierKey = row.supplier_ref1c || row.supplier_name || ''
+      const supplierKey = supplierFilterKey(row)
       const categoryKey = row.category_id !== null && row.category_id !== undefined
         ? String(row.category_id)
         : (row.category_ref1c || row.category_name || '')
@@ -121,12 +133,12 @@ export function MrpResultPage() {
     if (queryTab) setTab(queryTab)
   }, [queryTab])
 
-  const load = useCallback(async (nextDateFrom = '', nextDateTo = '') => {
+  const load = useCallback(async (nextDateFrom = '', nextDateTo = '', nextRootItemId: number | null = null) => {
     setLoading(true)
     setError('')
     setMessage('')
     try {
-      const params = { date_from: nextDateFrom || undefined, date_to: nextDateTo || undefined, limit, offset: 0 }
+      const params = { date_from: nextDateFrom || undefined, date_to: nextDateTo || undefined, root_item_id: nextRootItemId, limit, offset: 0 }
       const [summaryData, productionData, purchaseData, reworkData, capacityData] = await Promise.all([
         getPlanningRunSummary(runId),
         getPlanningResultProduction(runId, params),
@@ -154,11 +166,33 @@ export function MrpResultPage() {
     }
   }, [runId])
 
+  useEffect(() => {
+    let cancelled = false
+    async function loadRootOptions(planId: number) {
+      try {
+        const data = await getPeriodPlanMatrix(planId)
+        if (cancelled) return
+        setRootOptions((data.rows ?? []).map((row) => ({
+          item_id: row.item_id,
+          item_name: row.item_name,
+          item_article: row.item_article,
+          item_code: row.item_code,
+        })))
+      } catch {
+        if (!cancelled) setRootOptions([])
+      }
+    }
+    const planId = summary?.run?.source_plan_id
+    if (planId) void loadRootOptions(planId)
+    else setRootOptions([])
+    return () => { cancelled = true }
+  }, [summary?.run?.source_plan_id])
+
   async function exportActive(format: 'csv' | 'xlsx') {
     setExporting(true)
     setError('')
     try {
-      const params = { format, date_from: dateFrom || undefined, date_to: dateTo || undefined }
+      const params = { format, date_from: dateFrom || undefined, date_to: dateTo || undefined, root_item_id: rootItemId }
       const response = tab === 'production'
         ? await exportPlanningResultProduction(runId, params)
         : tab === 'purchases'
@@ -185,7 +219,7 @@ export function MrpResultPage() {
         planned_order_ids: Array.from(selectedProductionIds),
       })
       setSelectedProductionIds(new Set())
-      await load(dateFrom, dateTo)
+      await load(dateFrom, dateTo, rootItemId)
       setMessage(formatActionResult('Создание заказов', result))
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -207,19 +241,6 @@ export function MrpResultPage() {
       })
       setMessage(formatActionResult('Выгрузка закупок в 1С', result))
       setSelectedPurchaseIds(new Set())
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setExporting(false)
-    }
-  }
-
-  async function exportShortageReport() {
-    setExporting(true)
-    setError('')
-    try {
-      const response = await getShortageReport(runId)
-      downloadBase64File(response, `mrp_shortage_${runId}.xlsx`)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -258,12 +279,13 @@ export function MrpResultPage() {
       >
         <div className="commandBar">
           <button onClick={() => navigate('/mrp-runs')}>К списку прогонов</button>
-          <button onClick={() => void load(dateFrom, dateTo)} disabled={loading}>Обновить</button>
-          {tab !== 'capacity' && <button onClick={() => void exportActive('csv')} disabled={loading || exporting}>CSV</button>}
+          <button onClick={() => void load(dateFrom, dateTo, rootItemId)} disabled={loading}>Обновить</button>
           {tab !== 'capacity' && <button onClick={() => void exportActive('xlsx')} disabled={loading || exporting}>XLSX</button>}
-          <button onClick={() => void exportShortageReport()} disabled={loading || exporting}>Отчёт дефицитов</button>
           {tab === 'production' && <button className="primary" onClick={() => void createSelectedProductionOrders()} disabled={!selectedProductionIds.size || loading || exporting}>Создать заказы ({selectedProductionIds.size})</button>}
           {tab === 'purchases' && <button className="primary" onClick={() => void exportSelectedPurchasesTo1C()} disabled={!selectedPurchaseIds.size || loading || exporting}>Выгрузить в 1С ({selectedPurchaseIds.size})</button>}
+          <div className="barSeparator" />
+          <button onClick={() => setRootDialogOpen(true)}>Корневое изделие</button>
+          <span className="toolbarText">{rootProductLabel(rootOptions, rootItemId)}</span>
           <div className="barSeparator" />
           <label className="inlineControl">
             <span>С</span>
@@ -273,7 +295,7 @@ export function MrpResultPage() {
             <span>По</span>
             <input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} />
           </label>
-          <button className="filterBtn" onClick={() => void load(dateFrom, dateTo)} disabled={loading}>Сформировать</button>
+          <button className="filterBtn" onClick={() => void load(dateFrom, dateTo, rootItemId)} disabled={loading}>Сформировать</button>
         </div>
 
         {error && <div className="errorLine">{error}</div>}
@@ -315,6 +337,17 @@ export function MrpResultPage() {
           {tab === 'capacity' && <CapacityResultTable rows={capacityRows} />}
         </div>
       </DocumentWindow>
+      <RootProductFilterDialog
+        open={rootDialogOpen}
+        options={rootOptions}
+        value={rootItemId}
+        onApply={(value) => {
+          setRootItemId(value)
+          setRootDialogOpen(false)
+          void load(dateFrom, dateTo, value)
+        }}
+        onClose={() => setRootDialogOpen(false)}
+      />
     </main>
   )
 }
@@ -543,8 +576,7 @@ function PurchaseResultTable({
               <span>{row.item_article || ''}</span>
             </td>
             <td className="itemCell">
-              <strong>{row.supplier_name || '—'}</strong>
-              <span>{row.supplier_ref1c || ''}</span>
+              <strong title={row.supplier_ref1c || undefined}>{supplierDisplayName(row)}</strong>
             </td>
             <td className="itemCell">
               <strong>{row.category_name || 'Без товарной группы'}</strong>

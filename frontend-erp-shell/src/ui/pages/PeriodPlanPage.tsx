@@ -13,7 +13,6 @@ import {
   flowLabel,
   periodPlanStatusClass,
   periodPlanStatusLabel,
-  planningStatusLabel,
 } from '../../domain/planning'
 import type { NomenclatureSearchItem } from '../../domain/productionPlan'
 import { dateRu, dateTimeRu, qty } from '../../lib/format'
@@ -37,6 +36,7 @@ import {
   updatePeriodPlanHeader,
 } from '../../services/periodPlan'
 import { DocumentWindow } from '../layout/DocumentWindow'
+import { RootProductFilterDialog, rootProductLabel, type RootProductOption } from '../RootProductFilterDialog'
 import { StatusBar } from '../layout/StatusBar'
 import { tableColumnStyle, tableMinWidth, type TableColumnDoctype } from '../tableDoctype'
 
@@ -477,6 +477,8 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   const [journalFlow, setJournalFlow] = useState('')
   const [journalBomLevel, setJournalBomLevel] = useState<string>('')
   const [journalCoverage, setJournalCoverage] = useState<string>('')
+  const [journalRootItemId, setJournalRootItemId] = useState<number | null>(null)
+  const [journalRootDialogOpen, setJournalRootDialogOpen] = useState(false)
   const [journalSortBy, setJournalSortBy] = useState<JournalSortKey>('bom_level')
   const [journalSortDir, setJournalSortDir] = useState<SortDir>('asc')
   const [expandedReq, setExpandedReq] = useState<number | null>(null)
@@ -541,11 +543,11 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     }
   }, [planId, selectedRunId])
 
-  const loadJournal = useCallback(async (flow = journalFlow, runId?: number) => {
+  const loadJournal = useCallback(async (flow = journalFlow, runId?: number, rootItemId = journalRootItemId) => {
     setJournalLoading(true)
     setJournalError('')
     try {
-      const data = await getExecutionJournal(planId, { flow: flow || undefined, run_id: runId })
+      const data = await getExecutionJournal(planId, { flow: flow || undefined, run_id: runId, root_item_id: rootItemId })
       setJournal(data)
       setLastRunId(data.run_id)
       if (!selectedRunId) setSelectedRunId(data.run_id)
@@ -556,15 +558,15 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     } finally {
       setJournalLoading(false)
     }
-  }, [journalFlow, planId, selectedRunId])
+  }, [journalFlow, journalRootItemId, planId, selectedRunId])
 
   useEffect(() => { void loadMatrix() }, [loadMatrix])
   useEffect(() => { void loadRuns() }, [loadRuns])
 
   useEffect(() => {
     if (tab === 'matrix' && !matrix) void loadMatrix()
-    if (tab === 'journal' && !journal) void loadJournal(journalFlow, activeRunId ?? undefined)
-  }, [journal, loadJournal, loadMatrix, matrix, tab, journalFlow, activeRunId])
+    if (tab === 'journal' && !journal) void loadJournal(journalFlow, activeRunId ?? undefined, journalRootItemId)
+  }, [journal, loadJournal, loadMatrix, matrix, tab, journalFlow, activeRunId, journalRootItemId])
 
   // Autofocus search input on entering draft matrix
   useEffect(() => {
@@ -586,13 +588,13 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
       if (e.key === 'F5') {
         e.preventDefault()
         if (tab === 'matrix') void loadMatrix()
-        else void loadJournal(journalFlow, activeRunId ?? undefined)
+        else void loadJournal(journalFlow, activeRunId ?? undefined, journalRootItemId)
         void loadRuns()
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [onBack, tab, loadMatrix, loadJournal, loadRuns, journalFlow, activeRunId])
+  }, [onBack, tab, loadMatrix, loadJournal, loadRuns, journalFlow, activeRunId, journalRootItemId])
 
   function nonEmptyMatrix() {
     if (!matrix) return false
@@ -703,7 +705,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
       setSelectedRunId(result.run_id)
       setMessage(`MRP-снимок создан: run #${result.run_id}, требований: ${result.requirement_count}, закупок: ${result.purchase_count}, переработок: ${result.rework_count}`)
       setTab('journal')
-      await Promise.all([loadJournal(journalFlow, result.run_id), loadRuns()])
+      await Promise.all([loadJournal(journalFlow, result.run_id, journalRootItemId), loadRuns()])
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -723,7 +725,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
       const purch = res.purchase_added?.length ?? 0
       const moved = res.rescheduled?.floating ?? 0
       setMessage(`Пересчёт: производство +${prod}, закупки +${purch}, перепланировано ${moved} строк`)
-      await loadJournal(journalFlow, runId)
+      await loadJournal(journalFlow, runId, journalRootItemId)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -751,7 +753,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
       if (skipped) parts.push(`пропущено ${skipped}`)
       setMessage(`Заказы производства: ${parts.join(', ') || 'нет изменений'}`)
       if (result.errors?.length) setError(result.errors.join('; '))
-      await loadJournal(journalFlow, activeRunId ?? undefined)
+      await loadJournal(journalFlow, activeRunId ?? undefined, journalRootItemId)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -961,6 +963,15 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     if (!journal) return [] as number[]
     return Array.from(new Set(journal.rows.map((r) => r.bom_level))).sort((a, b) => a - b)
   }, [journal])
+
+  const rootOptions = useMemo<RootProductOption[]>(() => (
+    (matrix?.rows ?? []).map((row) => ({
+      item_id: row.item_id,
+      item_name: row.item_name,
+      item_article: row.item_article,
+      item_code: row.item_code,
+    }))
+  ), [matrix])
 
   function downloadJournalCsv() {
     if (!journal) return
@@ -1375,7 +1386,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
         {tab === 'journal' && (
           <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
             <div className="commandBar">
-              <button onClick={() => void loadJournal(journalFlow, activeRunId ?? undefined)} disabled={journalLoading}>Обновить</button>
+              <button onClick={() => void loadJournal(journalFlow, activeRunId ?? undefined, journalRootItemId)} disabled={journalLoading}>Обновить</button>
               <button onClick={downloadJournalCsv} disabled={!journal || journalLoading}>CSV</button>
               <div className="barSeparator" />
               <button
@@ -1419,30 +1430,16 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                     <tr>
                       <td colSpan={2}>
                         <label className="columnFilterControl">
-                          <span>Прогон</span>
-                          <select
-                            value={String(selectedRunId ?? '')}
-                            onChange={(e) => {
-                              const v = e.target.value
-                              const runId = v ? Number(v) : null
-                              setSelectedRunId(runId)
-                              void loadJournal(journalFlow, runId ?? undefined)
-                            }}
-                            disabled={!runs.length}
-                          >
-                            {!runs.length && <option value="">—</option>}
-                            {runs.map((r) => (
-                              <option key={r.run_id} value={r.run_id}>
-                                #{r.run_id} · {planningStatusLabel(r.status)} · {r.started_at ? dateTimeRu(r.started_at) : '—'}
-                              </option>
-                            ))}
-                          </select>
+                          <span>Корневое изделие</span>
+                          <button className="filterBtn columnFilterButton" onClick={() => setJournalRootDialogOpen(true)}>
+                            {rootProductLabel(rootOptions, journalRootItemId)}
+                          </button>
                         </label>
                       </td>
                       <td>
                         <label className="columnFilterControl">
                           <span>Поток</span>
-                          <select value={journalFlow} onChange={(e) => { setJournalFlow(e.target.value); void loadJournal(e.target.value, activeRunId ?? undefined) }}>
+                          <select value={journalFlow} onChange={(e) => { setJournalFlow(e.target.value); void loadJournal(e.target.value, activeRunId ?? undefined, journalRootItemId) }}>
                             <option value="">Все</option>
                             <option value="production">Производство</option>
                             <option value="purchase">Закупка</option>
@@ -1595,6 +1592,17 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
           </div>
         )}
       </DocumentWindow>
+      <RootProductFilterDialog
+        open={journalRootDialogOpen}
+        options={rootOptions}
+        value={journalRootItemId}
+        onApply={(value) => {
+          setJournalRootItemId(value)
+          setJournalRootDialogOpen(false)
+          void loadJournal(journalFlow, activeRunId ?? undefined, value)
+        }}
+        onClose={() => setJournalRootDialogOpen(false)}
+      />
     </main>
   )
 }

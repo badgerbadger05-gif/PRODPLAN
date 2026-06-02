@@ -1,25 +1,37 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { planningStatusLabel, type PlanningRunRow } from '../../domain/planning'
-import { dateTimeRu, qty } from '../../lib/format'
-import { listPlanningRuns, startPlanningRun } from '../../services/planning'
+import { dateRu, dateTimeRu, qty } from '../../lib/format'
+import { listPlanningRuns } from '../../services/planning'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
 
 const limit = 30
-const horizonOptions = [30, 60, 90, 120]
+
+function planLabel(row?: PlanningRunRow | null) {
+  if (!row) return '—'
+  if (row.source_plan_name) return row.source_plan_name
+  if (row.source_plan_id) return `План #${row.source_plan_id}`
+  return 'скользящий план'
+}
+
+function periodLabel(row?: PlanningRunRow | null) {
+  if (!row) return '—'
+  const from = dateRu(row.period_from)
+  const to = dateRu(row.period_to)
+  if (from && to) return `${from} — ${to}`
+  if (from || to) return from || to
+  return '—'
+}
 
 export function MrpRunsPage() {
   const navigate = useNavigate()
   const [rows, setRows] = useState<PlanningRunRow[]>([])
   const [activeId, setActiveId] = useState<number | null>(null)
-  const [horizonDays, setHorizonDays] = useState(90)
   const [total, setTotal] = useState(0)
   const [offset, setOffset] = useState(0)
   const [loading, setLoading] = useState(false)
-  const [calculating, setCalculating] = useState(false)
   const [error, setError] = useState('')
-  const [message, setMessage] = useState('')
 
   const activeRun = useMemo(() => rows.find((row) => row.run_id === activeId) ?? rows[0] ?? null, [rows, activeId])
 
@@ -42,22 +54,6 @@ export function MrpRunsPage() {
     }
   }, [])
 
-  async function calculate() {
-    setCalculating(true)
-    setError('')
-    setMessage('')
-    try {
-      const result = await startPlanningRun({ horizon_days: horizonDays, started_by: 'erp-shell' })
-      setMessage(`Создан прогон #${result.run_id}`)
-      await load(0)
-      setActiveId(result.run_id)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setCalculating(false)
-    }
-  }
-
   useEffect(() => {
     void load(0)
   }, [load])
@@ -74,11 +70,11 @@ export function MrpRunsPage() {
 
       <DocumentWindow
         title="MRP планирование"
-        subtitle="Контрольные прогоны расчёта: производство, закупки, перегрузы и горизонт"
-        hotkeys="F5 Обновить · Enter Детали"
+        subtitle="Контрольные прогоны расчёта: производство, закупки и перегрузы"
+        hotkeys="Enter Детали"
         footer={(
           <StatusBar
-            loading={loading || calculating}
+            loading={loading}
             visibleFrom={visibleFrom}
             visibleTo={visibleTo}
             total={total}
@@ -90,20 +86,7 @@ export function MrpRunsPage() {
           />
         )}
       >
-        <div className="commandBar">
-          <button className="primary" onClick={() => void calculate()} disabled={calculating || loading}>Рассчитать</button>
-          <button onClick={() => void load(offset)} disabled={loading || calculating}>Обновить</button>
-          <div className="barSeparator" />
-          <label className="inlineControl">
-            <span>Горизонт</span>
-            <select value={horizonDays} onChange={(e) => setHorizonDays(Number(e.target.value))} disabled={calculating}>
-              {horizonOptions.map((value) => <option key={value} value={value}>{value} дней</option>)}
-            </select>
-          </label>
-        </div>
-
         {error && <div className="errorLine">{error}</div>}
-        {message && <div className="successLine">{message}</div>}
 
         <div className="split splitRuns">
           <div className="tablePane">
@@ -111,11 +94,9 @@ export function MrpRunsPage() {
               <thead>
                 <tr>
                   <th>RUN</th>
+                  <th>План</th>
                   <th>Статус</th>
-                  <th>Старт</th>
-                  <th>Финиш</th>
-                  <th>Источник</th>
-                  <th>Горизонт</th>
+                  <th>Период</th>
                   <th>Производство</th>
                   <th>Закупки</th>
                   <th>Перегрузы</th>
@@ -128,11 +109,12 @@ export function MrpRunsPage() {
                       <strong>#{row.run_id}</strong>
                       <span>расчёт</span>
                     </td>
+                    <td className="orderCell">
+                      <strong>{planLabel(row)}</strong>
+                      {row.source_plan_id && <span>план #{row.source_plan_id}</span>}
+                    </td>
                     <td><span className={`pill ${row.status.toLowerCase()}`}>{planningStatusLabel(row.status)}</span></td>
-                    <td>{dateTimeRu(row.started_at) || '—'}</td>
-                    <td>{dateTimeRu(row.finished_at) || '—'}</td>
-                    <td>{row.source_plan_name || 'скользящий план'}</td>
-                    <td className="numCell"><strong>{qty(row.horizon_days)}</strong><span>дн.</span></td>
+                    <td>{periodLabel(row)}</td>
                     <td className="numCell"><strong>{qty(row.order_count)}</strong><span>заказов</span></td>
                     <td className="numCell"><strong>{qty(row.purchase_count)}</strong><span>строк</span></td>
                     <td className="numCell"><strong>{qty(row.overload_buckets)}</strong><span>окон</span></td>
@@ -151,8 +133,8 @@ export function MrpRunsPage() {
                 <div className="detailGrid">
                   <span>Старт</span><strong>{dateTimeRu(activeRun.started_at) || '—'}</strong>
                   <span>Финиш</span><strong>{dateTimeRu(activeRun.finished_at) || '—'}</strong>
-                  <span>Горизонт</span><strong>{qty(activeRun.horizon_days)} дн.</strong>
-                  <span>Источник</span><strong>{activeRun.source_plan_name || 'скользящий план'}</strong>
+                  <span>Период</span><strong>{periodLabel(activeRun)}</strong>
+                  <span>План</span><strong>{planLabel(activeRun)}</strong>
                   <span>Потребность</span><strong>{qty(activeRun.requirement_count)} / {qty(activeRun.requirement_remaining_qty)}</strong>
                   <span>Производство</span><strong>{qty(activeRun.order_count)}</strong>
                   <span>Закупки</span><strong>{qty(activeRun.purchase_count)}</strong>

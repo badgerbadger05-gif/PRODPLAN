@@ -174,3 +174,43 @@ def test_get_run_summary_keeps_production_warning_contract(db_session):
     assert "NO_AREA_FOR_PRODUCTION_KIND" in codes
     assert "COMPONENT_SHORTAGE_BLOCKED" in codes
     assert "COMPONENT_SHORTAGE_PARTIAL" in codes
+
+
+def test_list_planning_runs_includes_source_plan_period(db_session):
+    from backend.app.models import PlanningRun, ProductionPlanHeader
+    from backend.app.services.planning_service import list_planning_runs
+
+    db = db_session
+    plan = ProductionPlanHeader(
+        name="План июнь",
+        period_from=datetime.date(2026, 6, 1),
+        period_to=datetime.date(2026, 6, 30),
+        status="fixed",
+        created_by="test",
+    )
+    db.add(plan)
+    db.flush()
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        started_by="test",
+        horizon_days=30,
+        pinned=False,
+        config_version_id=None,
+        config_snapshot={},
+        warnings=[],
+        kpi={},
+        source_plan_id=plan.id,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        started_at=datetime.datetime(2026, 5, 26, 11, 32),
+        finished_at=datetime.datetime(2026, 5, 26, 11, 33),
+    )
+    db.add(run)
+    db.commit()
+
+    row = list_planning_runs(db, limit=10, offset=0)["rows"][0]
+
+    assert row["source_plan_id"] == plan.id
+    assert row["source_plan_name"] == "План июнь"
+    assert row["period_from"] == "2026-06-01"
+    assert row["period_to"] == "2026-06-30"

@@ -6,7 +6,7 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
-from ..models import Item, ItemCategory
+from ..models import Item, ItemCategory, Supplier
 from ..schemas import ODataSyncRequest
 
 
@@ -61,7 +61,7 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
         local_select = (req.select_fields or [
             'Ref_Key', 'Code', 'Description', 'Артикул',
             'ЕдиницаИзмерения_Key', 'КатегорияНоменклатуры_Key',
-            'СпособПополнения', 'СрокПополнения', 'Поставщик_Key', 'IsFolder'
+            'СпособПополнения', 'СрокПополнения', 'Поставщик_Key', 'Поставщик', 'IsFolder'
         ])
 
         total_count = 0
@@ -82,6 +82,7 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
         existing_items_by_ref = {item.item_ref1c: item for item in db.query(Item).all() if item.item_ref1c}
         existing_items_by_code = {item.item_code: item for item in db.query(Item).all() if item.item_code}
         existing_categories = {cat.category_ref1c: cat for cat in db.query(ItemCategory).all() if cat.category_ref1c}
+        existing_suppliers = {sup.supplier_ref1c: sup for sup in db.query(Supplier).all() if sup.supplier_ref1c}
         existing_codes_count = len(existing_items_by_code)
 
         created_count = 0
@@ -122,12 +123,27 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                     replenishment_method = (record.get('СпособПополнения') or '').strip()
                     replenishment_time = record.get('СрокПополнения')
                     supplier_ref1c = (record.get('Поставщик_Key') or '').strip() or None
+                    supplier_raw = record.get('Поставщик') or {}
+                    if isinstance(supplier_raw, dict):
+                        supplier_name = str(supplier_raw.get('Description') or supplier_raw.get('Наименование') or '').strip()
+                    else:
+                        supplier_name = str(supplier_raw or '').strip()
                     unit_key = (record.get('ЕдиницаИзмерения_Key') or '').strip()
                     category_key = (record.get('КатегорияНоменклатуры_Key') or '').strip()
                     item_type = (record.get('ТипНоменклатуры') or '').strip()
 
                     if not name:
                         continue
+
+                    if supplier_ref1c and supplier_name:
+                        existing_supplier = existing_suppliers.get(supplier_ref1c)
+                        if existing_supplier is not None:
+                            if existing_supplier.supplier_name != supplier_name:
+                                existing_supplier.supplier_name = supplier_name
+                        else:
+                            existing_supplier = Supplier(supplier_ref1c=supplier_ref1c, supplier_name=supplier_name)
+                            db.add(existing_supplier)
+                            existing_suppliers[supplier_ref1c] = existing_supplier
 
                     # Проверяем, существует ли уже такая номенклатура
                     existing_item = existing_items_by_ref.get(ref_key)
@@ -283,6 +299,15 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                         replenishment_method = (record.get('СпособПополнения') or '').strip()
                         replenishment_time = record.get('СрокПополнения')
                         supplier_ref1c = (record.get('Поставщик_Key') or '').strip() or None
+                        supplier_raw = record.get('Поставщик') or {}
+                        if isinstance(supplier_raw, dict):
+                            supplier_name = str(supplier_raw.get('Description') or supplier_raw.get('Наименование') or '').strip()
+                        else:
+                            supplier_name = str(supplier_raw or '').strip()
+                        if supplier_ref1c and supplier_name and supplier_ref1c not in existing_suppliers:
+                            new_supplier = Supplier(supplier_ref1c=supplier_ref1c, supplier_name=supplier_name)
+                            db.add(new_supplier)
+                            existing_suppliers[supplier_ref1c] = new_supplier
                         unit_key = (record.get('ЕдиницаИзмерения_Key') or '').strip()
                         ref_key = (record.get('Ref_Key') or '').strip()
 

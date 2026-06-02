@@ -1322,6 +1322,7 @@ def get_period_plan_execution_journal(
     plan_id: int,
     *,
     run_id: Optional[int] = None,
+    root_item_id: Optional[int] = None,
     bom_level: Optional[int] = None,
     flow: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -1351,6 +1352,9 @@ def get_period_plan_execution_journal(
         .order_by(MrpRequirement.bom_level.asc(), Item.item_name.asc())
         .all()
     )
+    if root_item_id is not None:
+        related_ids = _bom_descendants_by_item(db, [int(root_item_id)]).get(int(root_item_id), {int(root_item_id)})
+        reqs_with_items = [(req, item) for req, item in reqs_with_items if int(req.item_id) in related_ids]
 
     if not reqs_with_items:
         return {
