@@ -73,8 +73,10 @@ COVERAGE_LABELS = {
     "cancelled": "Отменен",
 }
 STATUS_FILTER_GROUPS = {
-    "shortage": ("shortage", "partial"),
-    "ready": ("ready", "assembled"),
+    "shortage": ("shortage",),
+    "partial": ("partial",),
+    "ready": ("ready",),
+    "assembled": ("assembled",),
     "done": ("done", "produced_partial", "produced"),
 }
 
