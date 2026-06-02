@@ -41,6 +41,7 @@ from .employee_sync import sync_employees_from_odata
 from .odata_stock_sync import sync_stock_from_odata, sync_stock_warehouses_from_odata
 from .production_order_sync import sync_production_orders_from_odata, sync_production_fact_from_odata
 from .supplier_order_sync import sync_supplier_orders_from_odata
+from .nomenclature_groups_sync import refresh_nomenclature_groups
 
 
 STATE_PATH = Path("config") / "sync_schedule.json"
@@ -86,6 +87,12 @@ def _run_nomenclature(db: Session, config: Dict[str, Any]) -> Dict[str, Any]:
     return {"nomenclature": nom, "units": units, "categories": cats, "units_backfill": backfill}
 
 
+def _run_nomenclature_groups(db: Session, config: Dict[str, Any]) -> Dict[str, Any]:
+    # Refresh the nomenclature folder list for the group-selection UI. Does not
+    # touch the user's selection. db is unused (file-backed cache).
+    return refresh_nomenclature_groups(config)
+
+
 def _single(entity: str, service: Callable[[Session, ODataSyncRequest], Any]) -> Callable[[Session, Dict[str, Any]], Any]:
     def runner(db: Session, config: Dict[str, Any]) -> Any:
         return service(db, _build_payload(config, entity))
@@ -105,6 +112,7 @@ class SyncJob:
 # lowest-index due job so references are refreshed before dependents.
 SYNC_JOBS: List[SyncJob] = [
     SyncJob("nomenclature", "Номенклатура + ЕИ + категории", 86_400, _run_nomenclature),
+    SyncJob("nomenclatureGroups", "Группы номенклатуры (папки)", 86_400, _run_nomenclature_groups),
     SyncJob("productionKinds", "Виды производства", 86_400, _single("Catalog_ВидыПроизводства", sync_production_kinds_from_odata)),
     SyncJob("employees", "Сотрудники", 86_400, _single("Catalog_Сотрудники", sync_employees_from_odata)),
     SyncJob("operations", "Операции", 43_200, _single("Catalog_Спецификации_Операции", sync_operations_from_odata)),

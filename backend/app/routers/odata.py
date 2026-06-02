@@ -13,11 +13,10 @@ from ..services.odata_config import (
     save_odata_config,
 )
 from ..services.odata_client import OData1CClient
+from ..services.nomenclature_groups_sync import GROUPS_JSON, OUTPUT_DIR, refresh_nomenclature_groups
 
 router = APIRouter(prefix="/v1/odata", tags=["odata"])
 
-OUTPUT_DIR = Path("output")
-GROUPS_JSON = OUTPUT_DIR / "odata_groups_nomenclature.json"
 GROUPS_SELECTED = Path("config") / "odata_groups_selected.json"
 
 
@@ -131,26 +130,10 @@ def export_groups(cfg: Optional[ODataConfig] = None):
     Выгружает группы номенклатуры (IsFolder eq true) в output/odata_groups_nomenclature.json.
     """
     data = cfg.dict() if cfg is not None else _load_config()
-    base_url = data.get("base_url")
-    if not base_url:
+    if not data.get("base_url"):
         raise HTTPException(status_code=400, detail="base_url is required")
-
-    client = OData1CClient(
-        base_url=sanitize_base_url(base_url),
-        username=data.get("username") or None,
-        password=data.get("password") or None,
-        token=data.get("token") or None,
-    )
     try:
-        rows = client.get_all(
-            "Catalog_Номенклатура",
-            filter_query="IsFolder eq true",
-            select_fields=["Ref_Key", "Code", "Description", "IsFolder"],
-            top=1000,
-        )
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        GROUPS_JSON.write_text(json.dumps({"value": rows}, ensure_ascii=False, indent=2), encoding="utf-8")
-        return {"status": "ok", "total": len(rows), "file": str(GROUPS_JSON)}
+        return refresh_nomenclature_groups(data)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Export groups failed: {e}")
 
