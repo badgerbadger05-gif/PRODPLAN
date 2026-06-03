@@ -251,9 +251,13 @@ def test_transfer_numbers_share_order_key_and_use_suffixes(db_session):
     db.flush()
     db.commit()
 
-    assert material_issue_number(db, first).endswith("A")
-    assert material_issue_number(db, second).endswith("B")
-    assert material_issue_number(db, first)[2:-1] == material_issue_number(db, second)[2:-1]
+    first_number = material_issue_number(db, first)
+    second_number = material_issue_number(db, second)
+    assert first_number.startswith("MT")
+    assert second_number.startswith("MT")
+    assert len(first_number) == 11
+    assert len(second_number) == 11
+    assert first_number != second_number
 
 
 def test_chain_auto_exports_parent_order_in_dry_run(db_session):

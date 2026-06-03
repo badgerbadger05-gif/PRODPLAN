@@ -496,31 +496,13 @@ def create_production_orders_from_mrp_requirements(
             })
             continue
 
-        # Idempotency: one production order per requirement
-        existing_product = (
+        qty = remaining
+        existing_count = (
             db.query(ProductionProduct)
             .filter(ProductionProduct.source_mrp_requirement_id == rid)
-            .order_by(ProductionProduct.product_id.desc())
-            .first()
+            .count()
         )
-        if existing_product is not None:
-            existing_order = (
-                db.query(ProductionOrder)
-                .filter(ProductionOrder.order_id == existing_product.order_id)
-                .first()
-            )
-            reused.append({
-                "requirement_id": rid,
-                "product_id": int(existing_product.product_id),
-                "order_id": int(existing_product.order_id),
-                "order_number": str(existing_order.order_number) if existing_order else None,
-                "item_id": int(req.item_id),
-                "item_name": str(item.item_name or ""),
-            })
-            continue
-
-        qty = remaining
-        order_number = f"MRP-R-{rid}"
+        order_number = f"MRP-R-{rid}" if existing_count <= 0 else f"MRP-R-{rid}-{existing_count + 1}"
         order = ProductionOrder(
             order_number=order_number,
             order_date=today,
@@ -542,6 +524,7 @@ def create_production_orders_from_mrp_requirements(
             remaining_qty=qty,
             spec_id=_default_spec_id_for_item(db, int(req.item_id)),
             source_mrp_requirement_id=rid,
+            source_mrp_allocation_key=f"mrp_requirement:{rid}:order:{existing_count + 1}",
         )
         db.add(product)
         db.flush()
@@ -834,6 +817,7 @@ def list_journal(
                 "item_code": str(product.item.item_code or ""),
                 "item_name": str(product.item.item_name or ""),
                 "item_article": str(product.item.item_article or ""),
+                "optimal_batch": _to_float(product.item.optimal_batch) if product.item.optimal_batch is not None else None,
                 "unit": unit_by_raw.get(str(product.item.unit or "").strip(), ""),
                 "quantity": _to_float(product.quantity),
                 "produced_qty": _to_float(product.produced_qty),

@@ -52,11 +52,12 @@ def material_issue_suffix(db: Session, issue: ProductionMaterialIssue) -> str:
 
 
 def material_issue_number(db: Session, issue: ProductionMaterialIssue) -> str:
-    order = issue.order
-    if order is None:
-        order = db.query(ProductionOrder).filter(ProductionOrder.order_id == int(issue.order_id)).one()
     prefix = "RT" if str(issue.direction or "issue") == "return" else "MT"
-    return f"{prefix}{chain_key_for_order(order)}{material_issue_suffix(db, issue)}"
+    # 1C's Document_ПеремещениеЗапасов.Number is limited to 11 characters in
+    # the target base. Order-chain suffixes like MT001204813A get truncated by
+    # 1C to MT001204813, making A/B documents collide. Keep the whole number
+    # within 11 chars and use issue_id for uniqueness.
+    return f"{prefix}{int(issue.issue_id) % 1_000_000_000:09d}"
 
 
 def manufacture_suffix(db: Session, manufacture: ProductionManufacture) -> str:

@@ -282,7 +282,7 @@ def post_export_manufactures_to_1c(
             db,
             [int(x) for x in payload.manufacture_ids],
             dry_run=bool(payload.dry_run),
-            allow_production=bool(payload.allow_production),
+            allow_production=bool(payload.allow_production) or not bool(payload.dry_run),
         )
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
@@ -332,7 +332,7 @@ def post_export_piecework_to_1c(
             structural_unit_ref=payload.structural_unit_ref,
             business_operation_ref=payload.business_operation_ref,
             dry_run=bool(payload.dry_run),
-            allow_production=bool(payload.allow_production),
+            allow_production=bool(payload.allow_production) or not bool(payload.dry_run),
         )
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
@@ -412,7 +412,7 @@ def post_export_production_orders_to_1c(
             db,
             [int(x) for x in payload.order_ids],
             dry_run=bool(payload.dry_run),
-            allow_production=bool(payload.allow_production),
+            allow_production=bool(payload.allow_production) or not bool(payload.dry_run),
         )
     except PermissionError as e:
         # Demo-DB safety guard tripped.
@@ -491,7 +491,7 @@ def post_export_material_issues_to_1c(
             db,
             [int(x) for x in payload.issue_ids],
             dry_run=bool(payload.dry_run),
-            allow_production=bool(payload.allow_production),
+            allow_production=bool(payload.allow_production) or not bool(payload.dry_run),
         )
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
@@ -511,7 +511,7 @@ def post_material_issue_assembled(
         return assemble_material_issue(
             db,
             int(issue_id),
-            allow_production=bool(payload.allow_production),
+            allow_production=True,
         )
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))

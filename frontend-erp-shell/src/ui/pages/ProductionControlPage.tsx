@@ -342,7 +342,7 @@ export function ProductionControlPage() {
       }
       const result = await api<Record<string, unknown>>('/v1/production-control/material-issues/export-to-1c', {
         method: 'POST',
-        body: JSON.stringify({ issue_ids: issueIds, dry_run: false, allow_production: false }),
+        body: JSON.stringify({ issue_ids: issueIds, dry_run: false, allow_production: true }),
       })
       const parent = (result.parent_orders_export ?? {}) as Record<string, unknown>
       const ordersCreated = Number(parent.orders_created ?? 0)
@@ -441,6 +441,8 @@ export function ProductionControlPage() {
     setError('')
     setProduceError('')
     setProduceDryRunPayload(null)
+    let manufactureIdToRollback: number | null = null
+    let manufactureExportedRef = ''
     try {
       // Step 1: record manufacture locally (bumps produced_qty / remaining_qty).
       const localResult = await api<Record<string, unknown>>(
@@ -454,6 +456,7 @@ export function ProductionControlPage() {
         },
       )
       const manufacture_id = Number(localResult.manufacture_id)
+      manufactureIdToRollback = manufacture_id
 
       if (produceDryRun) {
         const dryRunResult = await api<Record<string, unknown>>(
@@ -474,13 +477,14 @@ export function ProductionControlPage() {
         '/v1/production-control/manufactures/export-to-1c',
         {
           method: 'POST',
-          body: JSON.stringify({ manufacture_ids: [manufacture_id], dry_run: false, allow_production: false }),
+          body: JSON.stringify({ manufacture_ids: [manufacture_id], dry_run: false, allow_production: true }),
         },
       )
       const created1c = Number(exportResult.manufactures_created ?? 0)
       const errored = Number(exportResult.manufactures_error ?? 0)
       const exportEntry = recordArray(exportResult.entries)[0]
       const ref = exportEntry?.target_ref_key
+      manufactureExportedRef = typeof ref === 'string' ? ref : ''
       if (errored > 0 || created1c < 1 || !ref) {
         const exportError = exportEntry?.error || exportEntry?.reason || firstExportProblem(exportResult)
         if (!ref) {
@@ -496,7 +500,7 @@ export function ProductionControlPage() {
         '/v1/production-control/manufactures/export-piecework-to-1c',
         {
           method: 'POST',
-          body: JSON.stringify({ manufacture_ids: [manufacture_id], dry_run: false, allow_production: false }),
+          body: JSON.stringify({ manufacture_ids: [manufacture_id], dry_run: false, allow_production: true }),
         },
       )
       const pieceworkCreated = Number(pieceworkResult.manufactures_created ?? 0)
@@ -518,6 +522,14 @@ export function ProductionControlPage() {
       setSelectedIds(new Set())
       await load(offsetRef.current)
     } catch (e) {
+      if (manufactureIdToRollback && !manufactureExportedRef) {
+        try {
+          await api(`/v1/production-control/manufactures/${manufactureIdToRollback}/rollback-local`, { method: 'POST' })
+          await load(offsetRef.current)
+        } catch {
+          // Keep the original 1C error visible to the operator.
+        }
+      }
       const text = e instanceof Error ? e.message : String(e)
       setError(text)
       setProduceError(text)

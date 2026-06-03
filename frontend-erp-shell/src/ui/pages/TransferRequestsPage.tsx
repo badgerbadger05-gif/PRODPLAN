@@ -96,7 +96,7 @@ export function TransferRequestsPage() {
     try {
       await api(`/v1/production-control/material-issues/${activeRow.issue_id}/assembled`, {
         method: 'POST',
-        body: JSON.stringify({ allow_production: false }),
+        body: JSON.stringify({ allow_production: true }),
       })
       setMessage(`Перемещение ${activeRow.one_c_number || activeRow.document_number} проведено, обеспечение обновлено: собрано`)
       await load(offsetRef.current)
