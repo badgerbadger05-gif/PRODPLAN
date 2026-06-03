@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import type { ProductionKind, ProductionResource, ProductionResourcePayload, ResourceProductionKind, ResourceStage } from '../../domain/resources'
+import type { ProductionKind, ProductionResource, ProductionResourcePayload, ResourceProductionKind } from '../../domain/resources'
 import { qty } from '../../lib/format'
 import {
   addResourceProductionKind,
@@ -7,7 +7,6 @@ import {
   listProductionKinds,
   listResourceProductionKinds,
   listResources,
-  listResourceStages,
   removeResourceProductionKind,
   updateResource,
 } from '../../services/resources'
@@ -27,7 +26,6 @@ const emptyForm: ProductionResourcePayload = {
 export function ResourcesPage() {
   const [rows, setRows] = useState<ProductionResource[]>([])
   const [activeId, setActiveId] = useState<number | null>(null)
-  const [stages, setStages] = useState<ResourceStage[]>([])
   const [kinds, setKinds] = useState<ResourceProductionKind[]>([])
   const [allKinds, setAllKinds] = useState<ProductionKind[]>([])
   const [selectedKind, setSelectedKind] = useState('')
@@ -74,14 +72,9 @@ export function ResourcesPage() {
     if (creating) return
     setActiveId(resource.resource_id)
     setForm(resourceToForm(resource))
-    setStages([])
     setKinds([])
     try {
-      const [nextStages, nextKinds] = await Promise.all([
-        listResourceStages(resource.resource_id),
-        listResourceProductionKinds(resource.resource_id),
-      ])
-      setStages(nextStages)
+      const nextKinds = await listResourceProductionKinds(resource.resource_id)
       setKinds(nextKinds)
       setSelectedKind('')
     } catch (e) {
@@ -92,7 +85,6 @@ export function ResourcesPage() {
   function beginCreate() {
     setCreating(true)
     setActiveId(null)
-    setStages([])
     setKinds([])
     setForm(emptyForm)
     setError('')
@@ -273,12 +265,6 @@ export function ResourcesPage() {
                         {availableKinds(allKinds, kinds).map((kind) => <option key={kind.id} value={kind.id}>{kind.name}</option>)}
                       </select>
                       <button onClick={() => void addKind()} disabled={!selectedKind || saving}>Добавить</button>
-                    </div>
-
-                    <h3>Этапы</h3>
-                    <div className="tagList">
-                      {stages.map((stage) => <span className="resourceTag" key={stage.id}>{stage.stage_name || `Этап ${stage.stage_id}`}</span>)}
-                      {!stages.length && <div className="emptyDetail">Нет привязок этапов</div>}
                     </div>
                   </>
                 )}

@@ -13,7 +13,6 @@ from ..models import (
     SpecComponent,
     ProductionStage,
     ProductionResource,
-    ResourceStage,
     SpecOperation,
     ProductionKind,
     ResourceProductionKind,

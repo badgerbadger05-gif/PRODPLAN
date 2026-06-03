@@ -24,7 +24,6 @@ from ..models import (
     ProductionPlanHeader,
     ProductionPlanLine,
     ProductionResource,
-    ResourceStage,
     ResourceProductionKind,
     SpecComponent,
     SpecOperation,
@@ -975,12 +974,19 @@ def create_mrp_snapshot_from_period_plan(
             }
             spec_ids = sorted(set(produced_spec_id_by_item.values()))
             stage_norms_by_spec: Dict[int, List[Tuple[int, float]]] = {}
+            resource_id_by_spec: Dict[int, int] = {}
             if spec_ids:
-                resource_id_by_stage: Dict[int, int] = {}
-                for row in db.query(ResourceStage.stage_id, ResourceStage.resource_id).all():
+                for row in (
+                    db.query(Specification.spec_id, ResourceProductionKind.resource_id)
+                    .join(
+                        ResourceProductionKind,
+                        ResourceProductionKind.production_kind_id == Specification.production_kind_id,
+                    )
+                    .filter(Specification.spec_id.in_(spec_ids))
+                    .all()
+                ):
                     try:
-                        sid = int(row.stage_id)
-                        resource_id_by_stage.setdefault(sid, int(row.resource_id))
+                        resource_id_by_spec[int(row.spec_id)] = int(row.resource_id)
                     except Exception:
                         continue
                 stage_rows = (
@@ -1039,7 +1045,7 @@ def create_mrp_snapshot_from_period_plan(
                         run_id=int(run.run_id),
                         order_id=int(order.order_id),
                         stage_id=int(stage_id),
-                        area_id=resource_id_by_stage.get(int(stage_id)),
+                        area_id=resource_id_by_spec.get(int(spec_id)),
                         bucket_date=order.bucket_date,
                         hours=float(hours_per_unit) * qty,
                     ))

@@ -31,10 +31,3 @@ export type ProductionKind = {
   ref_1c?: string | null
   name: string
 }
-
-export type ResourceStage = {
-  id: number
-  resource_id: number
-  stage_id: number
-  stage_name?: string | null
-}

@@ -48,9 +48,10 @@ from ..models import (
     ProductionOrderLineState,
     ProductionPlanLine,
     ProductionProduct,
-    ResourceStage,
+    ResourceProductionKind,
     SpecComponent,
     SpecOperation,
+    Specification,
 )
 from .capacity_scheduler import CapacityScheduler
 from .period_plan_service import (
@@ -331,9 +332,9 @@ def _stage_hours_and_areas(
     db: Session,
     spec_id: Optional[int],
     qty: float,
-    resource_id_by_stage: Dict[int, int],
+    resource_id_by_spec: Dict[int, int],
 ) -> tuple[Dict[int, float], Dict[int, Optional[int]]]:
-    """Per-stage total norm-hours (time_norm * qty) and the area for each stage."""
+    """Per-stage total norm-hours (time_norm * qty) and the spec's production-kind area."""
     if not spec_id or qty <= 0:
         return {}, {}
     rows = (
@@ -355,7 +356,7 @@ def _stage_hours_and_areas(
         if per_unit <= 1e-12:
             continue
         stage_hours[sid] = per_unit * float(qty)
-        stage_areas[sid] = resource_id_by_stage.get(sid)
+        stage_areas[sid] = resource_id_by_spec.get(int(spec_id))
     if not stage_hours:
         component_stage_rows = (
             db.query(SpecComponent.stage_id)
@@ -370,7 +371,7 @@ def _stage_hours_and_areas(
                 continue
             sid = int(sid_raw)
             stage_hours[sid] = 0.0
-            stage_areas[sid] = resource_id_by_stage.get(sid)
+            stage_areas[sid] = resource_id_by_spec.get(int(spec_id))
     return stage_hours, stage_areas
 
 
@@ -403,10 +404,6 @@ def _reschedule_run_journal(db: Session, run: PlanningRun, *, dry_run: bool) -> 
     if not rows:
         return {"floating": 0, "fixed": 0, "warnings": []}
 
-    resource_id_by_stage: Dict[int, int] = {}
-    for sid, rid in db.query(ResourceStage.stage_id, ResourceStage.resource_id).all():
-        resource_id_by_stage.setdefault(int(sid), int(rid))
-
     req_by_id = {
         int(r.id): r
         for r in db.query(MrpRequirement).filter(MrpRequirement.run_id == int(run.run_id)).all()
@@ -421,6 +418,15 @@ def _reschedule_run_journal(db: Session, run: PlanningRun, *, dry_run: bool) -> 
         .filter(DefaultSpecification.item_id.in_(item_ids))
         .all()
     }
+    resource_id_by_spec: Dict[int, int] = {}
+    if default_spec_by_item:
+        for spec_id, resource_id in (
+            db.query(Specification.spec_id, ResourceProductionKind.resource_id)
+            .join(ResourceProductionKind, ResourceProductionKind.production_kind_id == Specification.production_kind_id)
+            .filter(Specification.spec_id.in_(set(default_spec_by_item.values())))
+            .all()
+        ):
+            resource_id_by_spec[int(spec_id)] = int(resource_id)
     parents_of_item: Dict[int, set] = {}
     if default_spec_by_item:
         comp_rows = (
@@ -443,7 +449,7 @@ def _reschedule_run_journal(db: Session, run: PlanningRun, *, dry_run: bool) -> 
         if qty_open <= 1e-9:
             qty_open = _to_float(pp.quantity)
         spec_id = pp.spec_id or default_spec_by_item.get(int(pp.item_id))
-        stage_hours, stage_areas = _stage_hours_and_areas(db, spec_id, qty_open, resource_id_by_stage)
+        stage_hours, stage_areas = _stage_hours_and_areas(db, spec_id, qty_open, resource_id_by_spec)
         req = req_by_id.get(int(pp.source_mrp_requirement_id)) if pp.source_mrp_requirement_id else None
         need_date = (req.period_to if req else None) or run.period_to
         fixed = bool(po.order_ref1c)

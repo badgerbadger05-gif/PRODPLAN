@@ -19,7 +19,8 @@ from ..models import (
     ProductionProduct,
     ProductionResource,
     ProductionStage,
-    ResourceStage,
+    ResourceProductionKind,
+    Specification,
     SpecComponent,
     SpecOperation,
     SyncLink,
@@ -169,17 +170,16 @@ def _main_workshop_for_spec(db: Session, spec_id: Optional[int]) -> Tuple[Option
 
     workshop_id: Optional[int] = None
     workshop_name: Optional[str] = None
-    if stage_id:
-        resource_stage = (
-            db.query(ResourceStage)
-            .options(joinedload(ResourceStage.resource))
-            .filter(ResourceStage.stage_id == stage_id)
-            .order_by(ResourceStage.id.asc())
-            .first()
-        )
-        if resource_stage and resource_stage.resource:
-            workshop_id = int(resource_stage.resource_id)
-            workshop_name = str(resource_stage.resource.resource_name)
+    mapping = (
+        db.query(ResourceProductionKind.resource_id, ProductionResource.resource_name)
+        .join(ProductionResource, ProductionResource.resource_id == ResourceProductionKind.resource_id)
+        .join(Specification, Specification.production_kind_id == ResourceProductionKind.production_kind_id)
+        .filter(Specification.spec_id == int(spec_id))
+        .first()
+    )
+    if mapping:
+        workshop_id = int(mapping.resource_id)
+        workshop_name = str(mapping.resource_name or "")
 
     return (workshop_id, workshop_name, stage_id, stage_name)
 
@@ -245,21 +245,20 @@ def _main_workshops_for_specs(
         ):
             stage_name_by_id[int(row.stage_id)] = str(row.stage_name or "")
 
-    resource_by_stage: Dict[int, Tuple[int, str]] = {}
-    if stage_ids:
-        for row in (
-            db.query(ResourceStage.stage_id, ResourceStage.resource_id, ProductionResource.resource_name)
-            .join(ProductionResource, ProductionResource.resource_id == ResourceStage.resource_id)
-            .filter(ResourceStage.stage_id.in_(stage_ids))
-            .order_by(ResourceStage.id.asc())
-            .all()
-        ):
-            resource_by_stage.setdefault(int(row.stage_id), (int(row.resource_id), str(row.resource_name or "")))
+    resource_by_spec: Dict[int, Tuple[int, str]] = {}
+    for row in (
+        db.query(Specification.spec_id, ResourceProductionKind.resource_id, ProductionResource.resource_name)
+        .join(ResourceProductionKind, ResourceProductionKind.production_kind_id == Specification.production_kind_id)
+        .join(ProductionResource, ProductionResource.resource_id == ResourceProductionKind.resource_id)
+        .filter(Specification.spec_id.in_(ids))
+        .all()
+    ):
+        resource_by_spec[int(row.spec_id)] = (int(row.resource_id), str(row.resource_name or ""))
 
     result: Dict[int, Tuple[Optional[int], Optional[str], Optional[int], Optional[str]]] = {}
     for spec_id in ids:
         stage_id = stage_by_spec.get(spec_id)
-        resource_id, resource_name = resource_by_stage.get(stage_id or 0, (None, None))
+        resource_id, resource_name = resource_by_spec.get(spec_id, (None, None))
         result[spec_id] = (
             resource_id,
             resource_name,
@@ -751,7 +750,6 @@ def list_journal(
         if getattr(product, "stage_id", None) is not None
     })
     product_stage_name_by_id: Dict[int, str] = {}
-    product_stage_workshop_by_id: Dict[int, Tuple[int, str]] = {}
     if product_stage_ids:
         for row in (
             db.query(ProductionStage.stage_id, ProductionStage.stage_name)
@@ -759,17 +757,6 @@ def list_journal(
             .all()
         ):
             product_stage_name_by_id[int(row.stage_id)] = str(row.stage_name or "")
-        for row in (
-            db.query(ResourceStage.stage_id, ResourceStage.resource_id, ProductionResource.resource_name)
-            .join(ProductionResource, ProductionResource.resource_id == ResourceStage.resource_id)
-            .filter(ResourceStage.stage_id.in_(product_stage_ids))
-            .order_by(ResourceStage.id.asc())
-            .all()
-        ):
-            product_stage_workshop_by_id.setdefault(
-                int(row.stage_id),
-                (int(row.resource_id), str(row.resource_name or "")),
-            )
     issue_count_by_product: Dict[int, int] = {}
     if product_ids:
         for row in (
@@ -793,9 +780,6 @@ def list_journal(
             product_stage_id = int(product.stage_id)
             stage_id = product_stage_id
             stage_name = product_stage_name_by_id.get(product_stage_id) or stage_name
-            stage_workshop = product_stage_workshop_by_id.get(product_stage_id)
-            if inferred_workshop_id is None and stage_workshop:
-                inferred_workshop_id, inferred_workshop_name = stage_workshop
         state_workshop_id = int(state.workshop_id) if state and state.workshop_id else None
         resolved_workshop_id = state_workshop_id or inferred_workshop_id
         if workshop_id and resolved_workshop_id != int(workshop_id):

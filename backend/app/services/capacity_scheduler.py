@@ -126,7 +126,7 @@ class CapacityScheduler:
         total_free_hours = 0.0
 
         # This is a simplification. A real implementation should consider stage dependencies.
-        # Для лимитирования используем объединение кандидатов по виду; если их нет — fallback на area_id этапов
+        # Capacity areas are resolved only through the item's production kind.
         all_candidate_areas: Set[int] = set()
         kind_id = self._get_production_kind_for_item(item_id)
         if kind_id is not None:
@@ -135,16 +135,6 @@ class CapacityScheduler:
                     all_candidate_areas.add(int(area_id))
                 except Exception:
                     continue
-
-        # Fallback: если по виду нет кандидатов, используем участки из самих этапов (если есть)
-        if not all_candidate_areas and stage_areas_by_stage:
-            try:
-                for area in stage_areas_by_stage.values():
-                    if area is not None:
-                        all_candidate_areas.add(int(area))
-            except Exception:
-                # игнорируем невалидные значения
-                pass
 
         current_date = self._d0
         while current_date <= need_date:
@@ -208,22 +198,12 @@ class CapacityScheduler:
         except Exception:
             stages_with_hours_f = {}
 
-        stage_areas_norm: Dict[int, Optional[int]] = {}
-        if stage_areas_by_stage:
-            try:
-                for sid, area in stage_areas_by_stage.items():
-                    stage_areas_norm[int(sid)] = (int(area) if area is not None else None)
-            except Exception:
-                stage_areas_norm = dict(stage_areas_by_stage)
-
         kind_id = self._get_production_kind_for_item(item_id)
 
         def candidate_areas_for_stage(stage_id: int) -> List[int]:
             cands: List[int] = []
             if kind_id is not None:
                 cands = list(self._get_candidate_areas(kind_id)) or []
-            if (not cands) and (stage_id in stage_areas_norm) and (stage_areas_norm[stage_id] is not None):
-                cands = [int(stage_areas_norm[stage_id])]
             return cands
 
         def best_free_for_day(day: date, area_ids: List[int]) -> Tuple[int, float]:
@@ -389,10 +369,6 @@ class CapacityScheduler:
         cands: List[int] = []
         if kind_id is not None:
             cands = list(self._get_candidate_areas(kind_id)) or []
-        if not cands and stage_areas_by_stage:
-            for area in stage_areas_by_stage.values():
-                if area is not None:
-                    cands.append(int(area))
         return cands
 
     @staticmethod

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 from collections import defaultdict
 
 
@@ -108,40 +108,3 @@ def determine_parent_stage_and_norm(
                 reason = "FROM_OPERATIONS"
 
     return stage_id, reason, norm_hours_single
-
-
-def pick_area_for_stage(
-    resources: List,
-    stages_by_resource: Dict[int, Set[int]],
-    stage_name_map: Dict[int, str],
-    stage_id: int,
-) -> Optional[int]:
-    """
-    Choose resource (area_id) for a given stage_id:
-      - Candidates: resources that have this stage mapped (resource_stages)
-      - If single candidate -> choose it
-      - If multiple: choose one whose resource_name contains stage name (case-insensitive)
-        If none match by name, choose the one with the smallest resource_id for stability.
-    """
-    if stage_id is None:
-        return None
-
-    # Build candidates
-    candidates: List[int] = [rid for rid, stset in stages_by_resource.items() if int(stage_id) in stset]
-    if not candidates:
-        return None
-
-    if len(candidates) == 1:
-        return int(candidates[0])
-
-    st_name = (stage_name_map.get(int(stage_id)) or "").strip().lower()
-
-    def _res_name(res_id: int) -> str:
-        r = next((x for x in resources if int(getattr(x, "resource_id", 0)) == int(res_id)), None)
-        return (getattr(r, "resource_name", "") or "").strip().lower() if r else ""
-
-    perfect = [rid for rid in candidates if st_name and st_name in _res_name(rid)]
-    if perfect:
-        return int(sorted(perfect)[0])
-
-    return int(sorted(candidates)[0])

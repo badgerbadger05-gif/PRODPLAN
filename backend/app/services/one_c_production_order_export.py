@@ -23,7 +23,6 @@ from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
@@ -34,7 +33,7 @@ from ..models import (
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
-    ResourceStage,
+    ResourceProductionKind,
     SpecComponent,
     Specification,
     SpecOperation,
@@ -191,27 +190,10 @@ def _workshop_id_for_product(db: Session, product: ProductionProduct, spec_id: O
 
     if not spec_id:
         return None
-    stage_hours = (
-        db.query(SpecOperation.stage_id)
-        .filter(SpecOperation.spec_id == int(spec_id), SpecOperation.stage_id.isnot(None))
-        .group_by(SpecOperation.stage_id)
-        .order_by(func.sum(SpecOperation.time_norm).desc())
-        .first()
-    )
-    stage_id = int(stage_hours[0]) if stage_hours else None
-    if stage_id is None:
-        comp_stage = (
-            db.query(SpecComponent.stage_id)
-            .filter(SpecComponent.spec_id == int(spec_id), SpecComponent.stage_id.isnot(None))
-            .first()
-        )
-        stage_id = int(comp_stage[0]) if comp_stage else None
-    if stage_id is None:
-        return None
     resource = (
-        db.query(ResourceStage.resource_id)
-        .filter(ResourceStage.stage_id == int(stage_id))
-        .order_by(ResourceStage.id.asc())
+        db.query(ResourceProductionKind.resource_id)
+        .join(Specification, Specification.production_kind_id == ResourceProductionKind.production_kind_id)
+        .filter(Specification.spec_id == int(spec_id))
         .first()
     )
     return int(resource[0]) if resource else None

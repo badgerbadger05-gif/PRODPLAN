@@ -35,7 +35,7 @@ from ..models import (
     Employee,
     Operation,
     ProductionStage,
-    ResourceStage,
+    ResourceProductionKind,
     Specification,
     SpecOperation,
     SyncLink,
@@ -175,16 +175,18 @@ def _collect_export_entries(
                 if so.stage_id:
                     stage = db.query(ProductionStage).filter(ProductionStage.stage_id == int(so.stage_id)).one_or_none()
                     stage_ref = _clean_ref1c(getattr(stage, "stage_ref1c", None)) or None
-                    resource_stage = (
-                        db.query(ResourceStage)
-                        .filter(ResourceStage.stage_id == int(so.stage_id))
-                        .order_by(ResourceStage.id.asc())
-                        .first()
-                    )
-                    if resource_stage:
+                    if spec and spec.production_kind_id:
+                        resource = (
+                            db.query(ResourceProductionKind.resource_id)
+                            .filter(ResourceProductionKind.production_kind_id == int(spec.production_kind_id))
+                            .first()
+                        )
+                    else:
+                        resource = None
+                    if resource:
                         binding = (
                             db.query(WorkshopWarehouseBinding)
-                            .filter(WorkshopWarehouseBinding.workshop_id == int(resource_stage.resource_id))
+                            .filter(WorkshopWarehouseBinding.workshop_id == int(resource[0]))
                             .one_or_none()
                         )
                         if binding:

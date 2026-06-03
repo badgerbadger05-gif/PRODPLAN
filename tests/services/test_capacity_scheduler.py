@@ -52,6 +52,11 @@ def _resource(resource_id=1, daily_work_hours=8.0, capacity=1.0, buffer_days=0):
     )
 
 
+def _map_item_to_area(sched: CapacityScheduler, item_id: int, area_id: int, kind_id: int = 10):
+    sched._item_kind_map[int(item_id)] = int(kind_id)  # type: ignore[attr-defined]
+    sched._kind_to_res_cache[int(kind_id)] = [int(area_id)]  # type: ignore[attr-defined]
+
+
 def test_limit_qty_by_capacity_simple_window():
     """
     Window [d0..d0+3] = 4 workdays, resource daily capacity = 8h => free_hours = 32h.
@@ -60,6 +65,7 @@ def test_limit_qty_by_capacity_simple_window():
     db = FakeSession([_resource(1, 8.0, 1.0)])
     cfg = {"capacity": {"use_resource_calendars": False}, "planning_horizon_days": 30}
     sched = CapacityScheduler(db, cfg)
+    _map_item_to_area(sched, 123, 1)
 
     d0 = date.today()
     need = d0 + timedelta(days=3)
@@ -92,6 +98,7 @@ def test_limit_qty_by_capacity_with_existing_usage():
     db = FakeSession([_resource(1, 8.0, 1.0)])
     cfg = {"capacity": {"use_resource_calendars": False}, "planning_horizon_days": 30}
     sched = CapacityScheduler(db, cfg)
+    _map_item_to_area(sched, 123, 1)
 
     d0 = date.today()
     need = d0 + timedelta(days=3)
@@ -129,6 +136,7 @@ def test_schedule_backward_allocates_greedily():
     db = FakeSession([_resource(1, 8.0, 1.0)])
     cfg = {"capacity": {"use_resource_calendars": False}, "planning_horizon_days": 30}
     sched = CapacityScheduler(db, cfg)
+    _map_item_to_area(sched, 123, 1)
 
     d0 = date.today()
     need = d0 + timedelta(days=3)
@@ -166,7 +174,10 @@ def test_schedule_backward_allocates_greedily():
 def _bom_scheduler():
     db = FakeSession([_resource(1, 8.0, 1.0)])
     cfg = {"capacity": {"use_resource_calendars": False}, "planning_horizon_days": 60}
-    return CapacityScheduler(db, cfg)
+    sched = CapacityScheduler(db, cfg)
+    for item_id in (10, 20):
+        _map_item_to_area(sched, item_id, 1)
+    return sched
 
 
 def test_bom_aware_child_finishes_before_parent_starts():
