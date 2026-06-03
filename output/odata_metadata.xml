@@ -44,6 +44,15 @@
 				<Property Name="Заказ"
 						Type="Edm.String"
 						Nullable="true"/>
+				<Property Name="ЗаказПокупателя_Key"
+						Type="Edm.Guid"
+						Nullable="true"/>
+				<Property Name="ЗаказНаПроизводство_Key"
+						Type="Edm.Guid"
+						Nullable="true"/>
+				<Property Name="Узел_Key"
+						Type="Edm.Guid"
+						Nullable="true"/>
 				<Property Name="Номенклатура_Key"
 						Type="Edm.Guid"
 						Nullable="true"/>
@@ -55,6 +64,12 @@
 						Nullable="true"/>
 				<Property Name="Партия_Key"
 						Type="Edm.Guid"
+						Nullable="true"/>
+				<Property Name="Подразделение_Key"
+						Type="Edm.Guid"
+						Nullable="true"/>
+				<Property Name="ТипЭтапа"
+						Type="Edm.String"
 						Nullable="true"/>
 				<Property Name="Этап_Key"
 						Type="Edm.Guid"
@@ -77,12 +92,28 @@
 				<Property Name="Заказ_Type"
 						Type="Edm.String"
 						Nullable="true"/>
+				<NavigationProperty Name="ЗаказПокупателя"
+						Relationship="StandardODATA.AccumulationRegister_ЭтапыПроизводства_RecordType_ЗаказПокупателя"
+						FromRole="Begin"
+						ToRole="End"/>
+				<NavigationProperty Name="ЗаказНаПроизводство"
+						Relationship="StandardODATA.AccumulationRegister_ЭтапыПроизводства_RecordType_ЗаказНаПроизводство"
+						FromRole="Begin"
+						ToRole="End"/>
+				<NavigationProperty Name="Узел"
+						Relationship="StandardODATA.AccumulationRegister_ЭтапыПроизводства_RecordType_Узел"
+						FromRole="Begin"
+						ToRole="End"/>
 				<NavigationProperty Name="Номенклатура"
 						Relationship="StandardODATA.AccumulationRegister_ЭтапыПроизводства_RecordType_Номенклатура"
 						FromRole="Begin"
 						ToRole="End"/>
 				<NavigationProperty Name="Спецификация"
 						Relationship="StandardODATA.AccumulationRegister_ЭтапыПроизводства_RecordType_Спецификация"
+						FromRole="Begin"
+						ToRole="End"/>
+				<NavigationProperty Name="Подразделение"
+						Relationship="StandardODATA.AccumulationRegister_ЭтапыПроизводства_RecordType_Подразделение"
 						FromRole="Begin"
 						ToRole="End"/>
 				<NavigationProperty Name="Этап"
@@ -10594,6 +10625,9 @@
 				<Property Name="ПодразделениеЗавершающегоЭтапа_Key"
 						Type="Edm.Guid"
 						Nullable="true"/>
+				<Property Name="Узел_Key"
+						Type="Edm.Guid"
+						Nullable="true"/>
 				<Property Name="ЕдиницаИзмерения_Type"
 						Type="Edm.String"
 						Nullable="true"/>
@@ -10630,6 +10664,10 @@
 						ToRole="End"/>
 				<NavigationProperty Name="ПодразделениеЗавершающегоЭтапа"
 						Relationship="StandardODATA.Document_СдельныйНаряд_Операции_ПодразделениеЗавершающегоЭтапа"
+						FromRole="Begin"
+						ToRole="End"/>
+				<NavigationProperty Name="Узел"
+						Relationship="StandardODATA.Document_СдельныйНаряд_Операции_Узел"
 						FromRole="Begin"
 						ToRole="End"/>
 			</EntityType>
@@ -11968,6 +12006,9 @@
 						Nullable="true"/>
 				<Property Name="РазрешительныйРежимВерсияБазы"
 						Type="Edm.String"
+						Nullable="true"/>
+				<Property Name="МинимальнаяРозничнаяЦена"
+						Type="Edm.Double"
 						Nullable="true"/>
 				<NavigationProperty Name="ЧастичноеВыбытиеНоменклатура"
 						Relationship="StandardODATA.Document_РасходнаяНакладная_ШтрихкодыУпаковок_ЧастичноеВыбытиеНоменклатура"
@@ -13461,6 +13502,12 @@
 				<Property Name="ЗаказПокупателя_Key"
 						Type="Edm.Guid"
 						Nullable="true"/>
+				<Property Name="ЗаказНаПроизводство_Key"
+						Type="Edm.Guid"
+						Nullable="true"/>
+				<Property Name="Узел_Key"
+						Type="Edm.Guid"
+						Nullable="true"/>
 				<Property Name="ПодразделениеЗавершающегоЭтапа_Key"
 						Type="Edm.Guid"
 						Nullable="true"/>
@@ -13494,6 +13541,14 @@
 						ToRole="End"/>
 				<NavigationProperty Name="ЗаказПокупателя"
 						Relationship="StandardODATA.Document_СборкаЗапасов_Продукция_ЗаказПокупателя"
+						FromRole="Begin"
+						ToRole="End"/>
+				<NavigationProperty Name="ЗаказНаПроизводство"
+						Relationship="StandardODATA.Document_СборкаЗапасов_Продукция_ЗаказНаПроизводство"
+						FromRole="Begin"
+						ToRole="End"/>
+				<NavigationProperty Name="Узел"
+						Relationship="StandardODATA.Document_СборкаЗапасов_Продукция_Узел"
 						FromRole="Begin"
 						ToRole="End"/>
 				<NavigationProperty Name="ПодразделениеЗавершающегоЭтапа"
@@ -20367,6 +20422,9 @@
 				<Property Name="Корреспонденция_Key"
 						Type="Edm.Guid"
 						Nullable="true"/>
+				<Property Name="МаршрутСогласования_Key"
+						Type="Edm.Guid"
+						Nullable="true"/>
 				<Property Name="Налог_Key"
 						Type="Edm.Guid"
 						Nullable="true"/>
@@ -23117,6 +23175,9 @@
 				<Property Name="РазрешительныйРежимВерсияБазы"
 						Type="Edm.String"
 						Nullable="true"/>
+				<Property Name="МинимальнаяРозничнаяЦена"
+						Type="Edm.Double"
+						Nullable="true"/>
 				<NavigationProperty Name="ЧастичноеВыбытиеНоменклатура"
 						Relationship="StandardODATA.Document_ЗаказПокупателя_ШтрихкодыУпаковок_ЧастичноеВыбытиеНоменклатура"
 						FromRole="Begin"
@@ -23221,6 +23282,12 @@
 				<Property Name="ХарактеристикаНабора_Key"
 						Type="Edm.Guid"
 						Nullable="true"/>
+				<Property Name="СтавкаНДС_Key"
+						Type="Edm.Guid"
+						Nullable="true"/>
+				<Property Name="ПроцентСкидкиНаценки"
+						Type="Edm.Double"
+						Nullable="true"/>
 				<Property Name="Номенклатура_Type"
 						Type="Edm.String"
 						Nullable="true"/>
@@ -23248,6 +23315,10 @@
 						ToRole="End"/>
 				<NavigationProperty Name="НоменклатураНабора"
 						Relationship="StandardODATA.Document_ЗаказПокупателя_ОтмененныеЗапасы_НоменклатураНабора"
+						FromRole="Begin"
+						ToRole="End"/>
+				<NavigationProperty Name="СтавкаНДС"
+						Relationship="StandardODATA.Document_ЗаказПокупателя_ОтмененныеЗапасы_СтавкаНДС"
 						FromRole="Begin"
 						ToRole="End"/>
 			</EntityType>
@@ -23490,6 +23561,9 @@
 				<Property Name="ЗаказПокупателя_Key"
 						Type="Edm.Guid"
 						Nullable="true"/>
+				<Property Name="Узел_Key"
+						Type="Edm.Guid"
+						Nullable="true"/>
 				<Property Name="КлючСвязи"
 						Type="Edm.Int64"
 						Nullable="true"/>
@@ -23513,6 +23587,10 @@
 						ToRole="End"/>
 				<NavigationProperty Name="ЗаказПокупателя"
 						Relationship="StandardODATA.Document_ЗаказНаПроизводство_Продукция_ЗаказПокупателя"
+						FromRole="Begin"
+						ToRole="End"/>
+				<NavigationProperty Name="Узел"
+						Relationship="StandardODATA.Document_ЗаказНаПроизводство_Продукция_Узел"
 						FromRole="Begin"
 						ToRole="End"/>
 				<NavigationProperty Name="ПодразделениеЗавершающегоЭтапа"
@@ -26603,6 +26681,9 @@
 				<Property Name="ВидДокВходящий"
 						Type="Edm.String"
 						Nullable="true"/>
+				<Property Name="КассовыйЧек_Key"
+						Type="Edm.Guid"
+						Nullable="true"/>
 				<Property Name="ЕдиницаИзмерения_Type"
 						Type="Edm.String"
 						Nullable="true"/>
@@ -26712,6 +26793,9 @@
 						Nullable="true"/>
 				<Property Name="ВидДокВходящий"
 						Type="Edm.String"
+						Nullable="true"/>
+				<Property Name="КассовыйЧек_Key"
+						Type="Edm.Guid"
 						Nullable="true"/>
 				<Property Name="ЕдиницаИзмерения_Type"
 						Type="Edm.String"
@@ -27891,6 +27975,9 @@
 						Nullable="true"/>
 				<Property Name="РазрешительныйРежимВерсияБазы"
 						Type="Edm.String"
+						Nullable="true"/>
+				<Property Name="МинимальнаяРозничнаяЦена"
+						Type="Edm.Double"
 						Nullable="true"/>
 				<NavigationProperty Name="ЧастичноеВыбытиеНоменклатура"
 						Relationship="StandardODATA.Document_ПриходнаяНакладная_ШтрихкодыУпаковок_ЧастичноеВыбытиеНоменклатура"
@@ -43416,6 +43503,15 @@
 				<Property Name="Заказ"
 						Type="Edm.String"
 						Nullable="true"/>
+				<Property Name="ЗаказПокупателя_Key"
+						Type="Edm.Guid"
+						Nullable="true"/>
+				<Property Name="ЗаказНаПроизводство_Key"
+						Type="Edm.Guid"
+						Nullable="true"/>
+				<Property Name="Узел_Key"
+						Type="Edm.Guid"
+						Nullable="true"/>
 				<Property Name="Номенклатура_Key"
 						Type="Edm.Guid"
 						Nullable="true"/>
@@ -43427,6 +43523,12 @@
 						Nullable="true"/>
 				<Property Name="Партия_Key"
 						Type="Edm.Guid"
+						Nullable="true"/>
+				<Property Name="Подразделение_Key"
+						Type="Edm.Guid"
+						Nullable="true"/>
+				<Property Name="ТипЭтапа"
+						Type="Edm.String"
 						Nullable="true"/>
 				<Property Name="Этап_Key"
 						Type="Edm.Guid"
@@ -43454,6 +43556,15 @@
 				<Property Name="Заказ"
 						Type="Edm.String"
 						Nullable="true"/>
+				<Property Name="ЗаказПокупателя_Key"
+						Type="Edm.Guid"
+						Nullable="true"/>
+				<Property Name="ЗаказНаПроизводство_Key"
+						Type="Edm.Guid"
+						Nullable="true"/>
+				<Property Name="Узел_Key"
+						Type="Edm.Guid"
+						Nullable="true"/>
 				<Property Name="Номенклатура_Key"
 						Type="Edm.Guid"
 						Nullable="true"/>
@@ -43465,6 +43576,12 @@
 						Nullable="true"/>
 				<Property Name="Партия_Key"
 						Type="Edm.Guid"
+						Nullable="true"/>
+				<Property Name="Подразделение_Key"
+						Type="Edm.Guid"
+						Nullable="true"/>
+				<Property Name="ТипЭтапа"
+						Type="Edm.String"
 						Nullable="true"/>
 				<Property Name="Этап_Key"
 						Type="Edm.Guid"
@@ -59667,6 +59784,9 @@
 				<Property Name="ПодразделениеЗавершающегоЭтапа_Key"
 						Type="Edm.Guid"
 						Nullable="true"/>
+				<Property Name="Узел_Key"
+						Type="Edm.Guid"
+						Nullable="true"/>
 				<Property Name="ЕдиницаИзмерения_Type"
 						Type="Edm.String"
 						Nullable="true"/>
@@ -60158,6 +60278,9 @@
 						Nullable="true"/>
 				<Property Name="РазрешительныйРежимВерсияБазы"
 						Type="Edm.String"
+						Nullable="true"/>
+				<Property Name="МинимальнаяРозничнаяЦена"
+						Type="Edm.Double"
 						Nullable="true"/>
 			</ComplexType>
 			<ComplexType Name="Document_РасходнаяНакладная_СведенияПрослеживаемости_RowType">
@@ -60770,6 +60893,12 @@
 						Type="Edm.Guid"
 						Nullable="true"/>
 				<Property Name="ЗаказПокупателя_Key"
+						Type="Edm.Guid"
+						Nullable="true"/>
+				<Property Name="ЗаказНаПроизводство_Key"
+						Type="Edm.Guid"
+						Nullable="true"/>
+				<Property Name="Узел_Key"
 						Type="Edm.Guid"
 						Nullable="true"/>
 				<Property Name="ПодразделениеЗавершающегоЭтапа_Key"
@@ -64673,6 +64802,9 @@
 				<Property Name="РазрешительныйРежимВерсияБазы"
 						Type="Edm.String"
 						Nullable="true"/>
+				<Property Name="МинимальнаяРозничнаяЦена"
+						Type="Edm.Double"
+						Nullable="true"/>
 			</ComplexType>
 			<ComplexType Name="Document_ЗаказПокупателя_ВыбранныеУправляемыеСкидки_RowType">
 				<Property Name="Ref_Key"
@@ -64764,6 +64896,12 @@
 				<Property Name="ХарактеристикаНабора_Key"
 						Type="Edm.Guid"
 						Nullable="true"/>
+				<Property Name="СтавкаНДС_Key"
+						Type="Edm.Guid"
+						Nullable="true"/>
+				<Property Name="ПроцентСкидкиНаценки"
+						Type="Edm.Double"
+						Nullable="true"/>
 				<Property Name="Номенклатура_Type"
 						Type="Edm.String"
 						Nullable="true"/>
@@ -64809,6 +64947,9 @@
 						Type="Edm.Guid"
 						Nullable="true"/>
 				<Property Name="ЗаказПокупателя_Key"
+						Type="Edm.Guid"
+						Nullable="true"/>
+				<Property Name="Узел_Key"
 						Type="Edm.Guid"
 						Nullable="true"/>
 				<Property Name="КлючСвязи"
@@ -66043,6 +66184,9 @@
 				<Property Name="ВидДокВходящий"
 						Type="Edm.String"
 						Nullable="true"/>
+				<Property Name="КассовыйЧек_Key"
+						Type="Edm.Guid"
+						Nullable="true"/>
 				<Property Name="ЕдиницаИзмерения_Type"
 						Type="Edm.String"
 						Nullable="true"/>
@@ -66119,6 +66263,9 @@
 						Nullable="true"/>
 				<Property Name="ВидДокВходящий"
 						Type="Edm.String"
+						Nullable="true"/>
+				<Property Name="КассовыйЧек_Key"
+						Type="Edm.Guid"
 						Nullable="true"/>
 				<Property Name="ЕдиницаИзмерения_Type"
 						Type="Edm.String"
@@ -66687,6 +66834,9 @@
 						Nullable="true"/>
 				<Property Name="РазрешительныйРежимВерсияБазы"
 						Type="Edm.String"
+						Nullable="true"/>
+				<Property Name="МинимальнаяРозничнаяЦена"
+						Type="Edm.Double"
 						Nullable="true"/>
 			</ComplexType>
 			<ComplexType Name="Document_ПриходнаяНакладная_СведенияПрослеживаемости_RowType">
@@ -71184,6 +71334,30 @@
 						Type="Edm.String"
 						Nullable="true"/>
 			</ComplexType>
+			<Association Name="AccumulationRegister_ЭтапыПроизводства_RecordType_ЗаказПокупателя">
+				<End Role="Begin"
+						Type="StandardODATA.AccumulationRegister_ЭтапыПроизводства_RecordType"
+						Multiplicity="*"/>
+				<End Role="End"
+						Type="StandardODATA.Document_ЗаказПокупателя"
+						Multiplicity="0..1"/>
+			</Association>
+			<Association Name="AccumulationRegister_ЭтапыПроизводства_RecordType_ЗаказНаПроизводство">
+				<End Role="Begin"
+						Type="StandardODATA.AccumulationRegister_ЭтапыПроизводства_RecordType"
+						Multiplicity="*"/>
+				<End Role="End"
+						Type="StandardODATA.Document_ЗаказНаПроизводство"
+						Multiplicity="0..1"/>
+			</Association>
+			<Association Name="AccumulationRegister_ЭтапыПроизводства_RecordType_Узел">
+				<End Role="Begin"
+						Type="StandardODATA.AccumulationRegister_ЭтапыПроизводства_RecordType"
+						Multiplicity="*"/>
+				<End Role="End"
+						Type="StandardODATA.Document_ЗаказНаПроизводство"
+						Multiplicity="0..1"/>
+			</Association>
 			<Association Name="AccumulationRegister_ЭтапыПроизводства_RecordType_Номенклатура">
 				<End Role="Begin"
 						Type="StandardODATA.AccumulationRegister_ЭтапыПроизводства_RecordType"
@@ -71198,6 +71372,14 @@
 						Multiplicity="*"/>
 				<End Role="End"
 						Type="StandardODATA.Catalog_Спецификации"
+						Multiplicity="0..1"/>
+			</Association>
+			<Association Name="AccumulationRegister_ЭтапыПроизводства_RecordType_Подразделение">
+				<End Role="Begin"
+						Type="StandardODATA.AccumulationRegister_ЭтапыПроизводства_RecordType"
+						Multiplicity="*"/>
+				<End Role="End"
+						Type="StandardODATA.Catalog_СтруктурныеЕдиницы"
 						Multiplicity="0..1"/>
 			</Association>
 			<Association Name="AccumulationRegister_ЭтапыПроизводства_RecordType_Этап">
@@ -75344,6 +75526,14 @@
 						Type="StandardODATA.Catalog_СтруктурныеЕдиницы"
 						Multiplicity="0..1"/>
 			</Association>
+			<Association Name="Document_СдельныйНаряд_Операции_Узел">
+				<End Role="Begin"
+						Type="StandardODATA.Document_СдельныйНаряд_Операции"
+						Multiplicity="*"/>
+				<End Role="End"
+						Type="StandardODATA.Document_ЗаказНаПроизводство"
+						Multiplicity="0..1"/>
+			</Association>
 			<Association Name="Document_СдельныйНаряд_СоставБригады_Сотрудник">
 				<End Role="Begin"
 						Type="StandardODATA.Document_СдельныйНаряд_СоставБригады"
@@ -76534,6 +76724,22 @@
 						Multiplicity="*"/>
 				<End Role="End"
 						Type="StandardODATA.Document_ЗаказПокупателя"
+						Multiplicity="0..1"/>
+			</Association>
+			<Association Name="Document_СборкаЗапасов_Продукция_ЗаказНаПроизводство">
+				<End Role="Begin"
+						Type="StandardODATA.Document_СборкаЗапасов_Продукция"
+						Multiplicity="*"/>
+				<End Role="End"
+						Type="StandardODATA.Document_ЗаказНаПроизводство"
+						Multiplicity="0..1"/>
+			</Association>
+			<Association Name="Document_СборкаЗапасов_Продукция_Узел">
+				<End Role="Begin"
+						Type="StandardODATA.Document_СборкаЗапасов_Продукция"
+						Multiplicity="*"/>
+				<End Role="End"
+						Type="StandardODATA.Document_ЗаказНаПроизводство"
 						Multiplicity="0..1"/>
 			</Association>
 			<Association Name="Document_СборкаЗапасов_Продукция_ПодразделениеЗавершающегоЭтапа">
@@ -80416,6 +80622,14 @@
 						Type="StandardODATA.Catalog_Номенклатура"
 						Multiplicity="0..1"/>
 			</Association>
+			<Association Name="Document_ЗаказПокупателя_ОтмененныеЗапасы_СтавкаНДС">
+				<End Role="Begin"
+						Type="StandardODATA.Document_ЗаказПокупателя_ОтмененныеЗапасы"
+						Multiplicity="*"/>
+				<End Role="End"
+						Type="StandardODATA.Catalog_СтавкиНДС"
+						Multiplicity="0..1"/>
+			</Association>
 			<Association Name="Document_ЗаказНаПроизводство_Автор">
 				<End Role="Begin"
 						Type="StandardODATA.Document_ЗаказНаПроизводство"
@@ -80534,6 +80748,14 @@
 						Multiplicity="*"/>
 				<End Role="End"
 						Type="StandardODATA.Document_ЗаказПокупателя"
+						Multiplicity="0..1"/>
+			</Association>
+			<Association Name="Document_ЗаказНаПроизводство_Продукция_Узел">
+				<End Role="Begin"
+						Type="StandardODATA.Document_ЗаказНаПроизводство_Продукция"
+						Multiplicity="*"/>
+				<End Role="End"
+						Type="StandardODATA.Document_ЗаказНаПроизводство"
 						Multiplicity="0..1"/>
 			</Association>
 			<Association Name="Document_ЗаказНаПроизводство_Продукция_ПодразделениеЗавершающегоЭтапа">
@@ -86633,6 +86855,8 @@
 				<Member Name="ТитановаяМеталлопродукцияНабор"/>
 				<Member Name="ТитановаяМеталлопродукцияНаборСтандартныйКМ"/>
 				<Member Name="ТитановаяМеталлопродукцияСтандартныйКМ"/>
+				<Member Name="ТоварыИзНатуральногоМеха"/>
+				<Member Name="ТоварыИзНатуральногоМехаНабор"/>
 				<Member Name="УпакованнаяВода"/>
 				<Member Name="УпакованнаяВодаГрупповаяУпаковка"/>
 				<Member Name="Фотоаппараты"/>
@@ -88541,6 +88765,7 @@
 				<Member Name="Новая"/>
 				<Member Name="ОжидаетВыгрузки"/>
 				<Member Name="ОжидаетИсправления"/>
+				<Member Name="ОжидаетПодписания"/>
 				<Member Name="ОжидаетПодтверждения"/>
 				<Member Name="ОжидаетПроверки"/>
 				<Member Name="Отклонена"/>
@@ -88564,6 +88789,7 @@
 				<Member Name="Просрочено"/>
 				<Member Name="Расход"/>
 				<Member Name="СтатусПлатежногоПоручения"/>
+				<Member Name="ТекущийСогласующий"/>
 			</EnumType>
 			<EnumType Name="ФорматыДокументооборотаСПФР"
 					UnderlyingType="Edm.Int32">
@@ -89373,6 +89599,7 @@
 				<Member Name="Загрузить"/>
 				<Member Name="ЗагрузитьПриглашения"/>
 				<Member Name="ЗакрытьПринудительно"/>
+				<Member Name="ЗапроситьУточнение"/>
 				<Member Name="Отклонить"/>
 				<Member Name="ОтклонитьАннулирование"/>
 				<Member Name="ОтклонитьПодписание"/>
@@ -89388,6 +89615,7 @@
 				<Member Name="ПринятьПриглашения"/>
 				<Member Name="СнятьСУтверждения"/>
 				<Member Name="Сформировать"/>
+				<Member Name="СформироватьДополнительнуюИнформацию"/>
 				<Member Name="СформироватьИзвещение"/>
 				<Member Name="СформироватьИсправление"/>
 				<Member Name="СформироватьОтвет"/>
@@ -89754,6 +89982,7 @@
 				<Member Name="ГрафикПереходаНалоговыйМониторинг"/>
 				<Member Name="ДекларацияОХарактеристикахОбъектаНедвижимости"/>
 				<Member Name="ДобычаЦифровойВалюты"/>
+				<Member Name="ДокументОПредстоящейПоставке"/>
 				<Member Name="ДополнительнаяИнформацияКЖалобе"/>
 				<Member Name="ДорожнаяКартаНМ"/>
 				<Member Name="ДосрочноеИсполнениеОтсрочки"/>
@@ -90061,6 +90290,7 @@
 				<Member Name="КреслаКоляски"/>
 				<Member Name="ЛегкаяПромышленность"/>
 				<Member Name="ЛегкаяПромышленность2025"/>
+				<Member Name="ЛегкаяПромышленность2026"/>
 				<Member Name="МедицинскиеИзделия"/>
 				<Member Name="МедицинскиеИзделия20"/>
 				<Member Name="МолочнаяПродукцияБезВЕТИС"/>
@@ -90096,6 +90326,7 @@
 				<Member Name="ТелефоныИНоутбуки"/>
 				<Member Name="ТехническиеСредстваРеабилитации"/>
 				<Member Name="ТитановаяМеталлопродукция"/>
+				<Member Name="ТоварыИзНатуральногоМеха"/>
 				<Member Name="ТоварыЛичнойГигиены"/>
 				<Member Name="УпакованнаяВода"/>
 				<Member Name="Фотоаппараты"/>
@@ -90540,6 +90771,7 @@
 				<Member Name="ВыручкаПоККТ"/>
 				<Member Name="ЗапросОПредставленииДокументовИнформации"/>
 				<Member Name="КвитанцияОПрисвоенииРНПТ"/>
+				<Member Name="КвитанцияОПрисвоенииСтатусаДОПП"/>
 				<Member Name="МотивированноеЗаключение"/>
 				<Member Name="МотивированноеМнение"/>
 				<Member Name="НалоговоеУведомление"/>
@@ -92418,6 +92650,7 @@
 					UnderlyingType="Edm.Int32">
 				<Member Name="МВД"/>
 				<Member Name="Минобороны"/>
+				<Member Name="Минпромторг"/>
 				<Member Name="Минюст"/>
 				<Member Name="ПФР"/>
 				<Member Name="РПН"/>
