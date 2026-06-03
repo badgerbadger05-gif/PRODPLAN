@@ -51,11 +51,6 @@ def _resource(resource_id=7, daily_work_hours=8.0, capacity=1.0, buffer_days=0):
     )
 
 
-def _map_item_to_area(sched: CapacityScheduler, item_id: int, area_id: int, kind_id: int = 10):
-    sched._item_kind_map[int(item_id)] = int(kind_id)  # type: ignore[attr-defined]
-    sched._kind_to_res_cache[int(kind_id)] = [int(area_id)]  # type: ignore[attr-defined]
-
-
 def test_push_right_when_backward_window_insufficient():
     """
     Given need_date == d0 and zero free hours backward (same day only),
@@ -65,7 +60,6 @@ def test_push_right_when_backward_window_insufficient():
     db = FakeSession([_resource(7, 8.0, 1.0)])
     cfg = {"capacity": {"use_resource_calendars": False}, "planning_horizon_days": 10}
     sched = CapacityScheduler(db, cfg)
-    _map_item_to_area(sched, 123, 7)
 
     d0 = date.today()
     need = d0  # window backward includes only d0; since no pre-placed usage, free=8 on d0, but algorithm prefers push-right if not enough to fit entire stage backward

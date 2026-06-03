@@ -28,6 +28,7 @@ from ..models import (
     SpecComponent,
     ProductionPlanEntry,
     ProductionResource,
+    ResourceStage,
     ProductionStage,
     SpecOperation,
     Operation,
@@ -42,7 +43,7 @@ from ..models import (
     ItemCategory,
 )
 from ..models import RootProduct
-from .stage_logic import determine_parent_stage_and_norm
+from .stage_logic import determine_parent_stage_and_norm, pick_area_for_stage
 from .order_quantity_calculator import OrderQuantityCalculator
 from .priority_manager import PriorityManager
 from .capacity_scheduler import CapacityScheduler
@@ -112,7 +113,7 @@ def _bom_descendant_ids_for_roots(db: Session, root_item_ids: List[int]) -> Set[
 
 
 def _load_stage_area_context(db: Session) -> Tuple[Dict[int, str], Dict[int, int], Dict[int, str]]:
-    """Return stage names and resource names without mapping stages to areas."""
+    """Return stage names plus the best production resource for each stage."""
     stage_name_by_id: Dict[int, str] = {}
     try:
         for stage in db.query(ProductionStage).all():
@@ -122,17 +123,34 @@ def _load_stage_area_context(db: Session) -> Tuple[Dict[int, str], Dict[int, int
     except Exception:
         stage_name_by_id = {}
 
-    area_name_by_id: Dict[int, str] = {}
+    resources: List[ProductionResource] = []
+    stages_by_resource: Dict[int, Set[int]] = {}
     try:
-        for resource in db.query(ProductionResource).all():
-            rid = getattr(resource, "resource_id", None)
-            if rid is None:
+        resources = db.query(ProductionResource).all()
+        for row in db.query(ResourceStage).all():
+            rid = getattr(row, "resource_id", None)
+            sid = getattr(row, "stage_id", None)
+            if rid is None or sid is None:
                 continue
-            area_name_by_id[int(rid)] = str(getattr(resource, "resource_name", "") or "")
+            stages_by_resource.setdefault(int(rid), set()).add(int(sid))
     except Exception:
-        area_name_by_id = {}
+        resources = []
+        stages_by_resource = {}
 
-    return stage_name_by_id, {}, area_name_by_id
+    area_id_by_stage: Dict[int, int] = {}
+    for stage_id in stage_name_by_id:
+        area_id = pick_area_for_stage(resources, stages_by_resource, stage_name_by_id, int(stage_id))
+        if area_id is not None:
+            area_id_by_stage[int(stage_id)] = int(area_id)
+
+    area_name_by_id: Dict[int, str] = {}
+    for resource in resources:
+        rid = getattr(resource, "resource_id", None)
+        if rid is None:
+            continue
+        area_name_by_id[int(rid)] = str(getattr(resource, "resource_name", "") or "")
+
+    return stage_name_by_id, area_id_by_stage, area_name_by_id
 
 
 def _load_purchase_area_map(db: Session, item_ids: List[int]) -> Dict[int, Dict[str, Any]]:
@@ -141,7 +159,7 @@ def _load_purchase_area_map(db: Session, item_ids: List[int]) -> Dict[int, Dict[
     if not unique_item_ids:
         return {}
 
-    stage_name_by_id, _, _ = _load_stage_area_context(db)
+    stage_name_by_id, area_id_by_stage, area_name_by_id = _load_stage_area_context(db)
     component_stage: Dict[int, int] = {}
     try:
         rows = (
@@ -165,9 +183,11 @@ def _load_purchase_area_map(db: Session, item_ids: List[int]) -> Dict[int, Dict[
 
     result: Dict[int, Dict[str, Any]] = {}
     for iid, sid in component_stage.items():
+        area_id = area_id_by_stage.get(int(sid))
+        area_name = area_name_by_id.get(int(area_id), "") if area_id is not None else ""
         result[int(iid)] = {
-            "main_area_id": None,
-            "main_area_name": None,
+            "main_area_id": int(area_id) if area_id is not None else None,
+            "main_area_name": area_name or stage_name_by_id.get(int(sid)) or None,
             "main_stage_id": int(sid),
             "main_stage_name": stage_name_by_id.get(int(sid)) or None,
         }
@@ -180,7 +200,7 @@ def _load_production_area_map(db: Session, item_ids: List[int]) -> Dict[int, Dic
     if not unique_item_ids:
         return {}
 
-    stage_name_by_id, _, area_name_by_id = _load_stage_area_context(db)
+    stage_name_by_id, area_id_by_stage, area_name_by_id = _load_stage_area_context(db)
     item_to_spec: Dict[int, int] = {}
     try:
         defaults = (
@@ -202,25 +222,6 @@ def _load_production_area_map(db: Session, item_ids: List[int]) -> Dict[int, Dic
 
     if not spec_ids:
         return {}
-
-    area_by_spec: Dict[int, int] = {}
-    try:
-        for row in (
-            db.query(Specification.spec_id, ResourceProductionKind.resource_id)
-            .join(
-                ResourceProductionKind,
-                ResourceProductionKind.production_kind_id == Specification.production_kind_id,
-            )
-            .filter(Specification.spec_id.in_(list(spec_ids)))
-            .all()
-        ):
-            spec_id_val = getattr(row, "spec_id", row[0] if isinstance(row, (tuple, list)) and len(row) > 0 else None)
-            resource_id_val = getattr(row, "resource_id", row[1] if isinstance(row, (tuple, list)) and len(row) > 1 else None)
-            if spec_id_val is None or resource_id_val is None:
-                continue
-            area_by_spec[int(spec_id_val)] = int(resource_id_val)
-    except Exception:
-        area_by_spec = {}
 
     stage_hours_by_spec: Dict[int, Dict[int, float]] = defaultdict(dict)
     try:
@@ -270,11 +271,11 @@ def _load_production_area_map(db: Session, item_ids: List[int]) -> Dict[int, Dic
         if not stage_hours:
             continue
         sid = max(stage_hours.items(), key=lambda item: float(item[1] or 0.0))[0]
-        area_id = area_by_spec.get(int(spec_id_val))
+        area_id = area_id_by_stage.get(int(sid))
         area_name = area_name_by_id.get(int(area_id), "") if area_id is not None else ""
         result[int(item_id_val)] = {
             "main_area_id": int(area_id) if area_id is not None else None,
-            "main_area_name": area_name or None,
+            "main_area_name": area_name or stage_name_by_id.get(int(sid)) or None,
             "main_stage_id": int(sid),
             "main_stage_name": stage_name_by_id.get(int(sid)) or None,
         }
@@ -859,14 +860,14 @@ def get_run_production(
                     continue
     except Exception:
         area_name_by_id = {}
-    stage_name_by_id, _, fallback_area_name_by_id = _load_stage_area_context(db)
+    stage_name_by_id, fallback_area_by_stage, fallback_area_name_by_id = _load_stage_area_context(db)
     area_name_by_id.update(fallback_area_name_by_id)
 
     stage_by_order: Dict[int, List[Dict[str, Any]]] = {}
     for s in stages:
         sid = int(s.stage_id)
-        aid = int(s.area_id) if s.area_id is not None else None
-        aname = area_name_by_id.get(aid, "") if aid is not None else None
+        aid = int(s.area_id) if s.area_id is not None else fallback_area_by_stage.get(sid)
+        aname = area_name_by_id.get(aid, "") if aid is not None else stage_name_by_id.get(sid)
         hours_f = float(s.hours or 0.0)
         stage_by_order.setdefault(int(s.order_id), []).append(
             {
@@ -1051,7 +1052,7 @@ def get_run_production(
         if stage_rows:
             best_stage = max(stage_rows, key=lambda x: float(x.get("hours") or 0.0))
             data["main_area_id"] = best_stage.get("area_id")
-            data["main_area_name"] = best_stage.get("area_name") or None
+            data["main_area_name"] = best_stage.get("area_name") or best_stage.get("stage_name") or None
             data["main_stage_id"] = best_stage.get("stage_id")
             data["main_stage_name"] = best_stage.get("stage_name")
         else:
@@ -3655,7 +3656,7 @@ def build_order_stages(
                     logger,
                     "PRODUCTION_KIND_NOT_FOUND",
                     "Не найден вид производства для операции при построении этапов заказа",
-                    production_kind_id=spec.production_kind_id,
+                    production_kind_id=spec_op.production_kind_id,
                     spec_id=spec.spec_id,
                     operation_id=spec_op.operation_id,
                 )
@@ -3667,6 +3668,7 @@ def build_order_stages(
                         "spec_id": spec.spec_id,
                         "spec_operation_id": spec_op.spec_operation_id,
                         "spec_production_kind_id": spec.production_kind_id,
+                        "op_production_kind_id": spec_op.production_kind_id,
                     },
                 )
                 continue
@@ -3685,6 +3687,9 @@ def build_order_stages(
 
             allowed_resources = resource_kind_cache.get(spec.production_kind_id, [])
             resource_kind = allowed_resources[0] if allowed_resources else None
+            # Если у вида производства нет ни одной привязки к участку — это проблема входящих данных.
+            # Раньше формировалось предупреждение NO_AREA_FOR_PRODUCTION_KIND, которое использовалось на фронтенде.
+            # Восстанавливаем его генерацию (даже если далее сработает фолбэк по ResourceStage).
             if not allowed_resources:
                 try:
                     w = log_warning(
@@ -3719,7 +3724,15 @@ def build_order_stages(
                 },
             )
             
+            # Resolve area_id with fallback via ResourceStage if needed
             area_resolved = resource_kind.resource_id if resource_kind else None
+            if area_resolved is None and spec_op.stage_id:
+                try:
+                    rs = db.query(ResourceStage).filter(ResourceStage.stage_id == spec_op.stage_id).first()
+                    if rs:
+                        area_resolved = int(rs.resource_id)
+                except Exception:
+                    area_resolved = None
 
             # Приводим типы к float, так как значения из БД приходят как Decimal
             norm_hours_per_unit_raw = spec_op.time_norm or op.time_norm or 0.0

@@ -40,7 +40,7 @@ def _resource(resource_id=7, daily_work_hours=8.0, capacity=1.0):
     return SimpleNamespace(resource_id=resource_id, daily_work_hours=daily_work_hours, capacity=capacity)
 
 
-def test_limit_qty_by_capacity_ignores_stage_area_without_kind_mapping():
+def test_limit_qty_by_capacity_uses_stage_area_fallback():
     db = FakeSession([_resource(7, 8.0, 1.0)])
     cfg = {"capacity": {"use_resource_calendars": False}}
     sched = CapacityScheduler(db, cfg)
@@ -56,12 +56,11 @@ def test_limit_qty_by_capacity_ignores_stage_area_without_kind_mapping():
         item_id=123, requested_qty=requested_qty, need_date=need, stage_hours=stage_hours, stage_areas_by_stage=stage_areas
     )
 
-    assert limited_qty == pytest.approx(0.0, rel=1e-6)
-    assert limited_stage_hours[1] == pytest.approx(0.0, rel=1e-6)
-    assert warnings[0]["code"] == "CAPACITY_LIMITED"
+    assert limited_qty == pytest.approx(16.0, rel=1e-6)
+    assert limited_stage_hours[1] == pytest.approx(32.0, rel=1e-6)
 
 
-def test_schedule_backward_ignores_stage_area_without_kind_mapping():
+def test_schedule_backward_uses_stage_area_fallback_and_accumulates_load():
     db = FakeSession([_resource(7, 8.0, 1.0)])
     cfg = {"capacity": {"use_resource_calendars": False}}
     sched = CapacityScheduler(db, cfg)
@@ -76,5 +75,6 @@ def test_schedule_backward_ignores_stage_area_without_kind_mapping():
         item_id=123, qty=10.0, need_date=need, stages_with_hours=stages_with_hours, stage_areas_by_stage=stage_areas
     )
     load = sched.get_aggregated_load()
-    assert load == {}
-    assert warnings[0]["code"] == "CAPACITY_UNSCHEDULED"
+    assert any(k[0] == 7 for k in load.keys())
+    total_planned = sum(v["planned"] for v in load.values())
+    assert total_planned == pytest.approx(12.0, rel=1e-6)

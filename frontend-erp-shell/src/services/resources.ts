@@ -1,4 +1,4 @@
-import type { ProductionKind, ProductionResource, ProductionResourcePayload, ResourceProductionKind } from '../domain/resources'
+import type { ProductionKind, ProductionResource, ProductionResourcePayload, ResourceProductionKind, ResourceStage } from '../domain/resources'
 import { api } from '../lib/api'
 
 export function listResources() {
@@ -17,6 +17,10 @@ export function updateResource(resourceId: number, payload: ProductionResourcePa
     method: 'PUT',
     body: JSON.stringify(payload),
   })
+}
+
+export function listResourceStages(resourceId: number) {
+  return api<ResourceStage[]>(`/v1/resources/${resourceId}/stages`)
 }
 
 export function listResourceProductionKinds(resourceId: number) {

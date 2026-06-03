@@ -32,10 +32,9 @@ from ..models import (
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
-    ResourceProductionKind,
+    ResourceStage,
     SpecComponent,
     SpecOperation,
-    Specification,
     SyncLink,
     WorkshopWarehouseBinding,
 )
@@ -129,16 +128,16 @@ def _binding_for_product(db: Session, product: ProductionProduct) -> Optional[Wo
 
     workshop_id = state_workshop_id
     if workshop_id is None:
-        spec_id = int(product.spec_id) if product.spec_id else None
-        if spec_id:
-            resource = (
-                db.query(ResourceProductionKind.resource_id)
-                .join(Specification, Specification.production_kind_id == ResourceProductionKind.production_kind_id)
-                .filter(Specification.spec_id == int(spec_id))
+        stage_id = _main_stage_id_for_spec(db, int(product.spec_id) if product.spec_id else None)
+        if stage_id:
+            resource_stage = (
+                db.query(ResourceStage)
+                .filter(ResourceStage.stage_id == int(stage_id))
+                .order_by(ResourceStage.id.asc())
                 .first()
             )
-            if resource:
-                workshop_id = int(resource[0])
+            if resource_stage:
+                workshop_id = int(resource_stage.resource_id)
 
     if workshop_id is None:
         return None

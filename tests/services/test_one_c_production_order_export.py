@@ -29,6 +29,7 @@ from app.models import (
     ProductionProduct,
     ProductionResource,
     ProductionStage,
+    ResourceStage,
     SpecComponent,
     Specification,
     SpecOperation,
@@ -182,6 +183,7 @@ def test_dry_run_payload_includes_materials_operations_and_reserve_warehouse(db_
     db.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
     db.add(SpecComponent(spec_id=spec.spec_id, item_id=component.item_id, quantity=2, stage_id=stage.stage_id))
     db.add(SpecOperation(spec_id=spec.spec_id, operation_id=op.operation_id, stage_id=stage.stage_id, time_norm=0.5))
+    db.add(ResourceStage(resource_id=resource.resource_id, stage_id=stage.stage_id))
     db.add(
         WorkshopWarehouseBinding(
             workshop_id=resource.resource_id,
