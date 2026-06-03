@@ -745,31 +745,6 @@ def list_journal(
         if product.spec_id or default_spec_by_item.get(int(product.item_id))
     })
     workshop_by_spec = _main_workshops_for_specs(db, spec_ids)
-    product_stage_ids = sorted({
-        int(product.stage_id)
-        for product in rows
-        if getattr(product, "stage_id", None) is not None
-    })
-    product_stage_name_by_id: Dict[int, str] = {}
-    product_stage_workshop_by_id: Dict[int, Tuple[int, str]] = {}
-    if product_stage_ids:
-        for row in (
-            db.query(ProductionStage.stage_id, ProductionStage.stage_name)
-            .filter(ProductionStage.stage_id.in_(product_stage_ids))
-            .all()
-        ):
-            product_stage_name_by_id[int(row.stage_id)] = str(row.stage_name or "")
-        for row in (
-            db.query(ResourceStage.stage_id, ResourceStage.resource_id, ProductionResource.resource_name)
-            .join(ProductionResource, ProductionResource.resource_id == ResourceStage.resource_id)
-            .filter(ResourceStage.stage_id.in_(product_stage_ids))
-            .order_by(ResourceStage.id.asc())
-            .all()
-        ):
-            product_stage_workshop_by_id.setdefault(
-                int(row.stage_id),
-                (int(row.resource_id), str(row.resource_name or "")),
-            )
     issue_count_by_product: Dict[int, int] = {}
     if product_ids:
         for row in (
@@ -789,13 +764,6 @@ def list_journal(
             spec_id or 0,
             (None, None, None, None),
         )
-        if getattr(product, "stage_id", None) is not None:
-            product_stage_id = int(product.stage_id)
-            stage_id = product_stage_id
-            stage_name = product_stage_name_by_id.get(product_stage_id) or stage_name
-            stage_workshop = product_stage_workshop_by_id.get(product_stage_id)
-            if inferred_workshop_id is None and stage_workshop:
-                inferred_workshop_id, inferred_workshop_name = stage_workshop
         state_workshop_id = int(state.workshop_id) if state and state.workshop_id else None
         resolved_workshop_id = state_workshop_id or inferred_workshop_id
         if workshop_id and resolved_workshop_id != int(workshop_id):
