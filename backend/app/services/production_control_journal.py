@@ -19,9 +19,11 @@ from ..models import (
     ProductionProduct,
     ProductionResource,
     ProductionStage,
+    ResourceProductionKind,
     ResourceStage,
     SpecComponent,
     SpecOperation,
+    Specification,
     SyncLink,
     Unit,
 )
@@ -245,6 +247,23 @@ def _main_workshops_for_specs(
         ):
             stage_name_by_id[int(row.stage_id)] = str(row.stage_name or "")
 
+    resource_by_spec: Dict[int, Tuple[int, str]] = {}
+    for row in (
+        db.query(Specification.spec_id, ResourceProductionKind.resource_id, ProductionResource.resource_name)
+        .join(
+            ResourceProductionKind,
+            ResourceProductionKind.production_kind_id == Specification.production_kind_id,
+        )
+        .join(ProductionResource, ProductionResource.resource_id == ResourceProductionKind.resource_id)
+        .filter(Specification.spec_id.in_(ids))
+        .order_by(ResourceProductionKind.id.asc())
+        .all()
+    ):
+        resource_by_spec.setdefault(
+            int(row.spec_id),
+            (int(row.resource_id), str(row.resource_name or "")),
+        )
+
     resource_by_stage: Dict[int, Tuple[int, str]] = {}
     if stage_ids:
         for row in (
@@ -259,7 +278,10 @@ def _main_workshops_for_specs(
     result: Dict[int, Tuple[Optional[int], Optional[str], Optional[int], Optional[str]]] = {}
     for spec_id in ids:
         stage_id = stage_by_spec.get(spec_id)
-        resource_id, resource_name = resource_by_stage.get(stage_id or 0, (None, None))
+        resource_id, resource_name = resource_by_spec.get(
+            spec_id,
+            resource_by_stage.get(stage_id or 0, (None, None)),
+        )
         result[spec_id] = (
             resource_id,
             resource_name,
