@@ -455,6 +455,7 @@ def _reschedule_run_journal(db: Session, run: PlanningRun, *, dry_run: bool) -> 
             qty_open = _to_float(pp.quantity)
         spec_id = pp.spec_id or default_spec_by_item.get(int(pp.item_id))
         stage_hours, stage_areas = _stage_hours_and_areas(db, spec_id, qty_open, resource_id_by_spec)
+        workshop_id = resource_id_by_spec.get(int(spec_id)) if spec_id else None
         req = req_by_id.get(int(pp.source_mrp_requirement_id)) if pp.source_mrp_requirement_id else None
         need_date = (req.period_to if req else None) or run.period_to
         fixed = bool(po.order_ref1c)
@@ -465,6 +466,7 @@ def _reschedule_run_journal(db: Session, run: PlanningRun, *, dry_run: bool) -> 
             "need_date": need_date,
             "stage_hours": stage_hours,
             "stage_areas": stage_areas,
+            "workshop_id": workshop_id,
             "fixed": fixed,
             "fixed_start": (state.planned_start_date if state else None),
             "fixed_finish": (state.planned_finish_date if state else None),
@@ -481,6 +483,11 @@ def _reschedule_run_journal(db: Session, run: PlanningRun, *, dry_run: bool) -> 
         state = state_by_key.get(key)
         if state is None:
             continue
+        workshop_id = res.get("workshop_id")
+        if workshop_id is None:
+            order_meta = next((o for o in orders if int(o["key"]) == int(key)), {})
+            workshop_id = order_meta.get("workshop_id")
+        state.workshop_id = int(workshop_id) if workshop_id is not None else None
         start_dt = res.get("order_start_date")
         finish_dt = res.get("order_finish_date")
         if isinstance(start_dt, datetime):
