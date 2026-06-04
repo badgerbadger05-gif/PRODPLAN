@@ -82,6 +82,8 @@ STATUS_FILTER_GROUPS = {
     "done": ("done", "produced_partial", "produced"),
 }
 
+ACTIVE_COVERAGE_STATUSES = {"shortage", "partial", "ready"}
+
 
 def _journal_work_status(line_status: str) -> str:
     # "assembled" describes material coverage in the journal, not the workshop
@@ -97,6 +99,232 @@ def _journal_coverage_status(line_status: str, issue_status: str) -> str:
     if issue_status in {"requested", "issued", "exported"}:
         return "to_move"
     return line_status
+
+
+def _active_mrp_products_for_requirement(db: Session, req: MrpRequirement) -> List[Tuple[ProductionProduct, ProductionOrder]]:
+    """
+    Existing open MRP journal lines for the same item and planning scope.
+
+    MRP snapshots are recreated during manual refreshes and autoruns, so a new
+    MrpRequirement.id can describe demand already covered by an older open
+    PRODPLAN order. Treat those open lines as coverage before materialising
+    another order.
+    """
+    current_run = db.query(PlanningRun).filter(PlanningRun.run_id == int(req.run_id)).first()
+    source_plan_id = int(current_run.source_plan_id) if current_run and current_run.source_plan_id is not None else None
+
+    rows = (
+        db.query(ProductionProduct, ProductionOrder, ProductionOrderLineState, PlanningRun)
+        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+        .outerjoin(ProductionOrderLineState, ProductionOrderLineState.product_id == ProductionProduct.product_id)
+        .outerjoin(PlanningRun, PlanningRun.run_id == ProductionOrder.source_run_id)
+        .filter(ProductionProduct.item_id == int(req.item_id))
+        .filter(ProductionOrder.source == "mrp")
+        .filter(ProductionOrder.deletion_mark == False)
+        .filter(or_(ProductionOrder.order_state_key.is_(None), func.lower(ProductionOrder.order_state_key) != DONE_STATE_KEY))
+        .filter(func.coalesce(ProductionProduct.remaining_qty, 0) > 0)
+        .filter(func.coalesce(ProductionOrderLineState.status, "shortage").notin_(tuple(_TERMINAL_LINE_STATUSES)))
+        .all()
+    )
+
+    result: List[Tuple[ProductionProduct, ProductionOrder]] = []
+    for product, order, state, run in rows:
+        if source_plan_id is not None:
+            if run is not None and run.source_plan_id == source_plan_id:
+                result.append((product, order))
+            continue
+
+        start = state.planned_start_date if state and state.planned_start_date else None
+        finish = state.planned_finish_date if state and state.planned_finish_date else None
+        if start is None and finish is None:
+            if order.source_run_id == req.run_id or product.source_mrp_requirement_id == req.id:
+                result.append((product, order))
+            continue
+        interval_start = start or finish
+        interval_finish = finish or start
+        if interval_start and interval_finish and interval_start <= req.period_to and interval_finish >= req.period_from:
+            result.append((product, order))
+    return result
+
+
+def _reused_product_payload(
+    product: ProductionProduct,
+    order: Optional[ProductionOrder],
+    *,
+    requirement_id: int,
+) -> Dict[str, Any]:
+    item = getattr(product, "item", None)
+    return {
+        "requirement_id": int(requirement_id),
+        "product_id": int(product.product_id),
+        "order_id": int(product.order_id),
+        "order_number": str(order.order_number or "") if order else None,
+        "item_id": int(product.item_id),
+        "item_name": str(item.item_name or "") if item else "",
+        "qty": _to_float(product.remaining_qty) or _to_float(product.quantity),
+    }
+
+
+def _mrp_duplicate_scope_key(req: MrpRequirement, run: Optional[PlanningRun]) -> Tuple[Any, ...]:
+    source_plan_id = int(run.source_plan_id) if run and run.source_plan_id is not None else None
+    if source_plan_id is not None:
+        return ("plan", source_plan_id, int(req.item_id))
+    return ("period", int(req.item_id), req.period_from, req.period_to)
+
+
+def _production_order_1c_linked_order_ids(db: Session, order_ids: Sequence[int]) -> set[int]:
+    ids = sorted({int(order_id) for order_id in order_ids if order_id is not None})
+    if not ids:
+        return set()
+    return {
+        int(row.source_id)
+        for row in (
+            db.query(SyncLink.source_id)
+            .filter(
+                SyncLink.source_system == "PRODPLAN",
+                SyncLink.source_doctype == "production_order",
+                SyncLink.source_id.in_(ids),
+                SyncLink.target_entity == PRODUCTION_ORDER_ENTITY,
+                SyncLink.status == "success",
+                SyncLink.target_ref_key.isnot(None),
+            )
+            .all()
+        )
+    }
+
+
+def dedupe_mrp_production_orders(db: Session, *, dry_run: bool = True) -> Dict[str, Any]:
+    """
+    Cancel local MRP duplicates left by earlier non-idempotent recalculations.
+
+    Hard rule: production orders already opened in 1C are immutable. They are
+    counted as coverage and never cancelled; only local PRODPLAN MRP rows
+    without a 1C ref/success sync-link can be cancelled.
+    """
+    rows = (
+        db.query(ProductionProduct, ProductionOrder, ProductionOrderLineState, MrpRequirement, PlanningRun)
+        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+        .join(MrpRequirement, MrpRequirement.id == ProductionProduct.source_mrp_requirement_id)
+        .join(PlanningRun, PlanningRun.run_id == MrpRequirement.run_id)
+        .outerjoin(ProductionOrderLineState, ProductionOrderLineState.product_id == ProductionProduct.product_id)
+        .filter(ProductionOrder.source == "mrp")
+        .filter(ProductionOrder.deletion_mark == False)
+        .filter(or_(ProductionOrder.order_state_key.is_(None), func.lower(ProductionOrder.order_state_key) != DONE_STATE_KEY))
+        .filter(func.coalesce(ProductionProduct.remaining_qty, 0) > 0)
+        .filter(func.coalesce(ProductionOrderLineState.status, "shortage").notin_(tuple(_TERMINAL_LINE_STATUSES)))
+        .all()
+    )
+    linked_order_ids = _production_order_1c_linked_order_ids(db, [int(order.order_id) for _p, order, _s, _r, _run in rows])
+
+    groups: Dict[Tuple[Any, ...], List[Tuple[ProductionProduct, ProductionOrder, Optional[ProductionOrderLineState], MrpRequirement, PlanningRun]]] = {}
+    for row in rows:
+        _product, _order, _state, req, run = row
+        groups.setdefault(_mrp_duplicate_scope_key(req, run), []).append(row)
+
+    repaired: List[Dict[str, Any]] = []
+    untouched: List[Dict[str, Any]] = []
+    cancelled_count = 0
+    released_qty_total = 0.0
+
+    for key, group_rows in groups.items():
+        if len(group_rows) <= 1:
+            continue
+
+        latest_req = max(group_rows, key=lambda row: (row[4].started_at or row[3].created_at, int(row[4].run_id), int(row[3].id)))[3]
+        required_qty = _to_float(latest_req.net_required_qty)
+        if required_qty <= 1e-9:
+            required_qty = max(_to_float(req.net_required_qty) for _p, _o, _s, req, _run in group_rows)
+
+        def keep_priority(row: Tuple[ProductionProduct, ProductionOrder, Optional[ProductionOrderLineState], MrpRequirement, PlanningRun]) -> Tuple[int, int, int, Any, int]:
+            product, order, state, req, _run = row
+            is_1c = bool(order.order_ref1c) or int(order.order_id) in linked_order_ids
+            status = str(state.status if state else "shortage")
+            is_work_started = status not in ACTIVE_COVERAGE_STATUSES
+            is_latest = int(req.id) == int(latest_req.id)
+            return (
+                1 if is_1c else 0,
+                1 if is_work_started else 0,
+                1 if is_latest else 0,
+                order.order_date,
+                -int(product.product_id),
+            )
+
+        kept: List[Tuple[ProductionProduct, ProductionOrder, Optional[ProductionOrderLineState], MrpRequirement, PlanningRun]] = []
+        cancelled: List[Tuple[ProductionProduct, ProductionOrder, Optional[ProductionOrderLineState], MrpRequirement, PlanningRun]] = []
+        kept_qty = 0.0
+        protected_qty = 0.0
+        for row in sorted(group_rows, key=keep_priority, reverse=True):
+            product, order, state, _req, _run = row
+            qty = _to_float(product.remaining_qty)
+            is_1c = bool(order.order_ref1c) or int(order.order_id) in linked_order_ids
+            if is_1c:
+                kept.append(row)
+                kept_qty += qty
+                protected_qty += qty
+                continue
+            if kept_qty < required_qty - 1e-9:
+                kept.append(row)
+                kept_qty += qty
+            else:
+                cancelled.append(row)
+
+        if not cancelled:
+            if protected_qty > required_qty + 1e-9:
+                untouched.append({
+                    "scope": list(key),
+                    "item_id": int(latest_req.item_id),
+                    "required_qty": required_qty,
+                    "protected_qty": protected_qty,
+                    "reason": "1C-заказы покрывают больше потребности; локальных дублей для отмены нет",
+                })
+            continue
+
+        cancelled_payload: List[Dict[str, Any]] = []
+        for product, order, state, req, _run in cancelled:
+            qty = _to_float(product.remaining_qty)
+            cancelled_payload.append({
+                "product_id": int(product.product_id),
+                "order_id": int(order.order_id),
+                "order_number": str(order.order_number or ""),
+                "requirement_id": int(req.id),
+                "qty": qty,
+            })
+            if not dry_run:
+                actual_state = state or _ensure_state(db, product)
+                if actual_state.status not in _TERMINAL_LINE_STATUSES:
+                    _adjust_requirement_coverage(db, product, -qty)
+                    actual_state.status = "cancelled"
+                    product.remaining_qty = 0.0
+            cancelled_count += 1
+            released_qty_total += qty
+
+        if not dry_run:
+            latest_req.covered_qty = min(kept_qty, required_qty)
+            latest_req.remaining_qty = max(required_qty - _to_float(latest_req.covered_qty), 0.0)
+
+        repaired.append({
+            "scope": list(key),
+            "item_id": int(latest_req.item_id),
+            "latest_requirement_id": int(latest_req.id),
+            "required_qty": required_qty,
+            "kept_qty": kept_qty,
+            "protected_1c_qty": protected_qty,
+            "cancelled_qty": sum(row["qty"] for row in cancelled_payload),
+            "cancelled": cancelled_payload,
+        })
+
+    if not dry_run:
+        db.commit()
+
+    return {
+        "status": "ok",
+        "dry_run": bool(dry_run),
+        "groups_repaired": len(repaired),
+        "cancelled_count": cancelled_count,
+        "released_qty": released_qty_total,
+        "repaired": repaired,
+        "untouched": untouched,
+    }
 
 
 def _bom_descendant_ids_for_root(db: Session, root_item_id: int) -> set[int]:
@@ -487,12 +715,19 @@ def create_production_orders_from_mrp_requirements(
             })
             continue
 
-        remaining = _to_float(req.remaining_qty)
+        net_qty = _to_float(req.net_required_qty)
+        active_products = _active_mrp_products_for_requirement(db, req)
+        active_open_qty = sum(_to_float(product.remaining_qty) for product, _order in active_products)
+        remaining = max(0.0, net_qty - active_open_qty)
         if remaining <= 1e-9:
+            req.covered_qty = min(active_open_qty, net_qty)
+            req.remaining_qty = max(net_qty - _to_float(req.covered_qty), 0.0)
+            for product, order in active_products:
+                reused.append(_reused_product_payload(product, order, requirement_id=rid))
             skipped.append({
                 "requirement_id": rid,
                 "item_id": int(req.item_id),
-                "reason": "remaining_qty=0 (уже покрыто)",
+                "reason": "remaining_qty=0 (уже покрыто открытыми заказами)",
             })
             continue
 
@@ -565,8 +800,7 @@ def create_production_orders_from_mrp_requirements(
             })
 
         # Reflect coverage in the requirement row
-        net_qty = _to_float(req.net_required_qty)
-        new_covered = min(_to_float(req.covered_qty) + created_total, net_qty)
+        new_covered = min(active_open_qty + created_total, net_qty)
         req.covered_qty = new_covered
         req.remaining_qty = max(net_qty - new_covered, 0.0)
 
@@ -820,6 +1054,19 @@ def list_journal(
         issue_count = issue_count_by_product.get(int(product.product_id), 0)
         line_status = str(state.status if state else "shortage")
         issue_status = str(state.issue_status if state else "not_requested")
+        if order_source == "mrp" and issue_status == "not_requested" and line_status in ACTIVE_COVERAGE_STATUSES:
+            try:
+                from .production_control_material_availability import preview_materials
+
+                material_preview = preview_materials(db, int(product.product_id), refresh_state=False)
+                refreshed_coverage = str(material_preview.get("coverage_status") or "")
+                has_materials = bool(material_preview.get("spec_id")) and bool(material_preview.get("components"))
+                if has_materials and refreshed_coverage in ACTIVE_COVERAGE_STATUSES:
+                    line_status = refreshed_coverage
+            except Exception:
+                # The journal must remain available even if one row has a
+                # broken/missing specification; keep its stored status then.
+                pass
         work_status = _journal_work_status(line_status)
         row_coverage_status = _journal_coverage_status(line_status, issue_status)
         result.append(

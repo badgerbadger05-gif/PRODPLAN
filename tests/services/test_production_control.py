@@ -27,11 +27,13 @@ from app.models import (
     Specification,
     SupplierOrder,
     SupplierOrderItem,
+    SyncLink,
 )
 from app.routers.production_control import list_employees
 from app.services.production_control_journal import (
     create_orders_from_mrp,
     create_production_orders_from_mrp_requirements,
+    dedupe_mrp_production_orders,
     list_journal,
 )
 from app.services.production_control_material_availability import preview_materials
@@ -431,6 +433,223 @@ def test_fill_remaining_splits_requirement_by_optimal_batch(db_session):
         f"mrp_requirement:{req.id}:order:3",
         f"mrp_requirement:{req.id}:order:4",
     ]
+
+
+def test_repeated_mrp_requirement_materialization_reuses_open_order_from_previous_run(db_session):
+    item = Item(
+        item_code="MRP-RERUN",
+        item_name="MRP rerun item",
+        unit="шт",
+        stock_qty=0,
+        replenishment_method="Производство",
+        status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+
+    run1 = PlanningRun(status="FIXED_SNAPSHOT", started_at=datetime(2026, 6, 4))
+    db_session.add(run1)
+    db_session.flush()
+    req1 = MrpRequirement(
+        run_id=run1.run_id,
+        item_id=item.item_id,
+        total_required_qty=25,
+        net_required_qty=25,
+        covered_qty=0,
+        remaining_qty=25,
+        period_from=_dt.date(2026, 6, 1),
+        period_to=_dt.date(2026, 6, 30),
+        bom_level=0,
+    )
+    db_session.add(req1)
+    db_session.commit()
+
+    first = create_production_orders_from_mrp_requirements(db_session, [req1.id])
+    assert len(first["created"]) == 1
+
+    run2 = PlanningRun(status="FIXED_SNAPSHOT", started_at=datetime(2026, 6, 4))
+    db_session.add(run2)
+    db_session.flush()
+    req2 = MrpRequirement(
+        run_id=run2.run_id,
+        item_id=item.item_id,
+        total_required_qty=25,
+        net_required_qty=25,
+        covered_qty=0,
+        remaining_qty=25,
+        period_from=_dt.date(2026, 6, 1),
+        period_to=_dt.date(2026, 6, 30),
+        bom_level=0,
+    )
+    db_session.add(req2)
+    db_session.commit()
+
+    second = create_production_orders_from_mrp_requirements(db_session, [req2.id])
+
+    assert second["created"] == []
+    assert len(second["reused"]) == 1
+    db_session.refresh(req2)
+    assert float(req2.covered_qty) == 25
+    assert float(req2.remaining_qty) == 0
+    assert db_session.query(ProductionProduct).filter(ProductionProduct.item_id == item.item_id).count() == 1
+
+
+def test_dedupe_mrp_production_orders_cancels_local_excess_duplicates(db_session):
+    item = Item(
+        item_code="MRP-DEDUP",
+        item_name="MRP dedupe item",
+        unit="шт",
+        stock_qty=0,
+        replenishment_method="Производство",
+        status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+
+    products = []
+    reqs = []
+    for idx in (1, 2):
+        run = PlanningRun(status="FIXED_SNAPSHOT", started_at=datetime(2026, 6, 4))
+        db_session.add(run)
+        db_session.flush()
+        req = MrpRequirement(
+            run_id=run.run_id,
+            item_id=item.item_id,
+            total_required_qty=25,
+            net_required_qty=25,
+            covered_qty=25,
+            remaining_qty=0,
+            period_from=_dt.date(2026, 6, 1),
+            period_to=_dt.date(2026, 6, 30),
+            bom_level=0,
+        )
+        db_session.add(req)
+        db_session.flush()
+        order = ProductionOrder(
+            order_number=f"DEDUP-{idx}",
+            order_date=datetime(2026, 6, 4, 12, idx),
+            deletion_mark=False,
+            source="mrp",
+            source_run_id=run.run_id,
+        )
+        db_session.add(order)
+        db_session.flush()
+        product = ProductionProduct(
+            order_id=order.order_id,
+            item_id=item.item_id,
+            line_number=1,
+            quantity=25,
+            produced_qty=0,
+            remaining_qty=25,
+            source_mrp_requirement_id=req.id,
+        )
+        db_session.add(product)
+        db_session.flush()
+        db_session.add(ProductionOrderLineState(product_id=product.product_id, status="shortage"))
+        products.append(product)
+        reqs.append(req)
+    db_session.commit()
+
+    dry = dedupe_mrp_production_orders(db_session, dry_run=True)
+    assert dry["cancelled_count"] == 1
+    assert all(float(product.remaining_qty) == 25 for product in products)
+
+    applied = dedupe_mrp_production_orders(db_session, dry_run=False)
+
+    assert applied["cancelled_count"] == 1
+    cancelled = (
+        db_session.query(ProductionProduct)
+        .join(ProductionOrderLineState, ProductionOrderLineState.product_id == ProductionProduct.product_id)
+        .filter(ProductionOrderLineState.status == "cancelled")
+        .one()
+    )
+    kept = [product for product in products if product.product_id != cancelled.product_id][0]
+    db_session.refresh(cancelled)
+    db_session.refresh(kept)
+    assert float(cancelled.remaining_qty) == 0
+    assert float(kept.remaining_qty) == 25
+    old_req = next(req for req in reqs if req.id == cancelled.source_mrp_requirement_id)
+    db_session.refresh(old_req)
+    assert float(old_req.covered_qty) == 0
+    assert float(old_req.remaining_qty) == 25
+
+
+def test_dedupe_mrp_production_orders_never_cancels_1c_open_order(db_session):
+    item = Item(
+        item_code="MRP-DEDUP-1C",
+        item_name="MRP dedupe 1C item",
+        unit="шт",
+        stock_qty=0,
+        replenishment_method="Производство",
+        status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+
+    products = []
+    for idx, ref in enumerate(("11111111-1111-1111-1111-111111111111", None), start=1):
+        run = PlanningRun(status="FIXED_SNAPSHOT", started_at=datetime(2026, 6, 4))
+        db_session.add(run)
+        db_session.flush()
+        req = MrpRequirement(
+            run_id=run.run_id,
+            item_id=item.item_id,
+            total_required_qty=25,
+            net_required_qty=25,
+            covered_qty=25,
+            remaining_qty=0,
+            period_from=_dt.date(2026, 6, 1),
+            period_to=_dt.date(2026, 6, 30),
+            bom_level=0,
+        )
+        db_session.add(req)
+        db_session.flush()
+        order = ProductionOrder(
+            order_number=f"DEDUP-1C-{idx}",
+            order_date=datetime(2026, 6, 4, 12, idx),
+            order_ref1c=ref,
+            deletion_mark=False,
+            source="mrp",
+            source_run_id=run.run_id,
+        )
+        db_session.add(order)
+        db_session.flush()
+        if ref:
+            db_session.add(SyncLink(
+                source_system="PRODPLAN",
+                source_doctype="production_order",
+                source_id=order.order_id,
+                target_entity="Document_ЗаказНаПроизводство",
+                target_ref_key=ref,
+                status="success",
+            ))
+        product = ProductionProduct(
+            order_id=order.order_id,
+            item_id=item.item_id,
+            line_number=1,
+            quantity=25,
+            produced_qty=0,
+            remaining_qty=25,
+            source_mrp_requirement_id=req.id,
+        )
+        db_session.add(product)
+        db_session.flush()
+        db_session.add(ProductionOrderLineState(product_id=product.product_id, status="shortage"))
+        products.append(product)
+    db_session.commit()
+
+    result = dedupe_mrp_production_orders(db_session, dry_run=False)
+
+    assert result["cancelled_count"] == 1
+    one_c_product, local_product = products
+    db_session.refresh(one_c_product)
+    db_session.refresh(local_product)
+    assert float(one_c_product.remaining_qty) == 25
+    assert float(local_product.remaining_qty) == 0
+    one_c_state = db_session.query(ProductionOrderLineState).filter_by(product_id=one_c_product.product_id).one()
+    local_state = db_session.query(ProductionOrderLineState).filter_by(product_id=local_product.product_id).one()
+    assert one_c_state.status == "shortage"
+    assert local_state.status == "cancelled"
 
 
 def test_journal_splits_work_status_from_material_coverage(db_session):
@@ -1241,6 +1460,33 @@ def test_preview_materials_marks_ready_when_stock_covers_all(db_session):
         .one()
     )
     assert state.status == "ready"
+
+
+def test_journal_uses_live_material_coverage_for_coverage_band_rows(db_session):
+    parent, _spec, _comps = _make_basic_spec(
+        db_session,
+        parent_name="JournalReadyParent",
+        child_specs=[("JRC1", "Journal component enough", 10, 1)],
+    )
+    _order, product = _make_internal_order_for(db_session, parent, qty=2)
+    _order.source = "mrp"
+    state = (
+        db_session.query(ProductionOrderLineState)
+        .filter_by(product_id=product.product_id)
+        .one_or_none()
+    )
+    if state is None:
+        state = ProductionOrderLineState(product_id=product.product_id, status="shortage")
+        db_session.add(state)
+    state.status = "shortage"
+    state.issue_status = "not_requested"
+    db_session.commit()
+
+    row = list_journal(db_session, product_id=product.product_id)["rows"][0]
+
+    assert row["coverage_status"] == "ready"
+    assert row["coverage_label"] == "Обеспечен"
+    assert row["status"] == "ready"
 
 
 def test_preview_materials_marks_shortage_and_includes_supplier_eta(db_session):
