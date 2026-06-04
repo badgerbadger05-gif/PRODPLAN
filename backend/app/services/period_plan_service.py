@@ -404,12 +404,15 @@ def _explode_bom_net_first(
     At each level:
       1. Accumulate gross demand for each item.
       2. Net gross demand against available stock + WIP (chronologically per bucket).
-      3. Explode only the residual (net) demand to the item's components,
-         shifting each child's need-date back by its buffer_days.
+      3. Explode the demand that on-hand STOCK does not cover (after-stock, not
+         after-WIP) to the item's components, shifting each child's need-date
+         back by its buffer_days. WIP nets the parent's own NEW orders but must
+         not suppress this explosion: an open parent order still consumes its
+         components, so their demand has to keep propagating down the tree.
 
     Returns:
         gross_map  — {item_id: {bucket_date: gross_qty}}
-        net_map    — {item_id: {bucket_date: net_qty}}
+        net_map    — {item_id: {bucket_date: net_qty}}  (after stock + WIP)
         bom_level_map — {item_id: minimum_bom_level}  (0 = plan item, 1 = component, …)
 
     Cycle safety: each item is exploded as a parent at most once (``exploded_parents``
@@ -543,9 +546,24 @@ def _explode_bom_net_first(
             # WIP entries with eta > bucket_date can't cover that bucket but
             # may cover a later one, so the per-item WIP list is mutated in
             # place across the bucket loop.
+            #
+            # Two residuals are tracked, because on-hand stock and open WIP are
+            # NOT interchangeable for the purpose of component demand:
+            #   * after-stock (`explode_buckets`) — gross minus on-hand stock.
+            #     This is everything that still has to be MADE, so it drives the
+            #     dependent demand exploded to children. An open parent order
+            #     (WIP) does not put the parent's components on hand — producing
+            #     that order still consumes them, so they must still be planned.
+            #     Only physical stock of the parent legitimately stops the
+            #     explosion (its components were consumed historically).
+            #   * after-stock-and-WIP (`net_buckets`) — used to size NEW orders
+            #     for THIS item (net_map / net_required_qty / reconciliation
+            #     top-ups). An open order already covers this, so no duplicate
+            #     parent order is created.
             stock_left = avail_stock.get(iid, 0.0)
             wip_list = avail_wip.setdefault(iid, [])
-            net_buckets: List[Tuple[date, float]] = []
+            net_buckets: List[Tuple[date, float]] = []      # after stock + WIP → orders
+            explode_buckets: List[Tuple[date, float]] = []  # after stock only → children
 
             for bucket_date, bucket_qty in sorted(buckets.items()):
                 q = float(bucket_qty or 0.0)
@@ -555,25 +573,31 @@ def _explode_bom_net_first(
                 if stock_left >= q:
                     stock_left -= q
                     continue
-                residual = q - stock_left
+                after_stock = q - stock_left
                 stock_left = 0.0
-                # 2) Consume WIP whose ETA <= bucket_date.
-                residual = _consume_wip_at_or_before(wip_list, bucket_date, residual)
-                if residual <= 1e-9:
+                # Whatever on-hand stock can't cover still has to be produced,
+                # so it propagates to components regardless of existing WIP.
+                explode_buckets.append((bucket_date, after_stock))
+                # 2) Consume WIP whose ETA <= bucket_date to size NEW orders only.
+                after_wip = _consume_wip_at_or_before(wip_list, bucket_date, after_stock)
+                if after_wip <= 1e-9:
                     continue
-                net_buckets.append((bucket_date, residual))
+                net_buckets.append((bucket_date, after_wip))
 
             avail_stock[iid] = stock_left
 
-            # Accumulate net demand
+            # Accumulate net demand (after stock + WIP) — sizes orders for THIS item.
             if net_buckets:
                 if iid not in net_map:
                     net_map[iid] = {}
                 for bucket_date, net_q in net_buckets:
                     net_map[iid][bucket_date] = net_map[iid].get(bucket_date, 0.0) + float(net_q)
 
-            # Explode ONLY net demand to child components
-            if not net_buckets or iid in exploded_parents:
+            # Explode demand that on-hand stock does NOT cover (after-stock,
+            # NOT after-stock-and-WIP): an open parent order still needs its
+            # components produced, so WIP must not suppress the explosion or
+            # lower BOM levels silently stay in deficit with no orders.
+            if not explode_buckets or iid in exploded_parents:
                 continue  # Nothing to propagate, or cycle guard
             exploded_parents.add(iid)
 
@@ -585,16 +609,16 @@ def _explode_bom_net_first(
             if not comps:
                 continue
 
-            for bucket_date, net_q in net_buckets:
+            for bucket_date, exp_q in explode_buckets:
                 for comp in comps:
                     try:
                         child_id = int(comp.item_id)
                         per_unit = float(comp.quantity or 0.0)
                     except Exception:
                         continue
-                    if per_unit <= 1e-12 or net_q <= 1e-9:
+                    if per_unit <= 1e-12 or exp_q <= 1e-9:
                         continue
-                    child_qty = net_q * per_unit
+                    child_qty = exp_q * per_unit
                     # Classical MRP lead-time offset: shift the child's
                     # need_date back by the PARENT's production time
                     # (`resolve_buffer_days(iid)`), so the components are

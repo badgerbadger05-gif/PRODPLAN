@@ -3,6 +3,7 @@
 from datetime import date
 
 from app.models import (
+    DefaultSpecification,
     Item,
     MrpRequirement,
     PlanningRun,
@@ -11,6 +12,8 @@ from app.models import (
     ProductionPlanHeader,
     ProductionPlanLine,
     ProductionProduct,
+    SpecComponent,
+    Specification,
 )
 from app.services.mrp_reconciliation import reconcile_snapshot
 from app.services.period_plan_service import create_mrp_snapshot_from_period_plan
@@ -213,5 +216,78 @@ def test_reconcile_tops_up_after_partial_close(db_session):
     assert abs(added[0]["qty"] - 30.0) < 1e-6
 
     # Running again is idempotent: the new order is open WIP, so no further gap.
+    res = reconcile_snapshot(db_session, run_id)
+    assert res["production_added"] == []
+
+
+def _link_bom(db, parent: Item, child: Item, qty_per_unit: float = 1.0) -> None:
+    """Give `parent` a default spec whose single component is `child`."""
+    spec = Specification(
+        spec_name=f"Spec {parent.item_code}",
+        spec_ref1c=f"spec-{parent.item_code}",
+    )
+    db.add(spec)
+    db.flush()
+    db.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db.add(SpecComponent(spec_id=spec.spec_id, item_id=child.item_id, quantity=qty_per_unit))
+    db.flush()
+
+
+def test_reconcile_explodes_through_wip_covered_parent(db_session):
+    """Regression: an open production order on a parent must NOT stop the BOM
+    explosion to its components.
+
+    BOM: painted → welded → blank, all out of stock. Only the painted line is
+    materialised as an open order (WIP). Earlier the parent's WIP zeroed its
+    net demand, the explosion stopped, and the welded/blank deficit produced no
+    catch-up orders. Reconciliation must now create welded AND blank in a single
+    pass, and a second pass must be idempotent.
+    """
+    painted = _make_production_item(db_session, "P-PAINT", stock=0.0)
+    welded = _make_production_item(db_session, "P-WELD", stock=0.0)
+    blank = _make_production_item(db_session, "P-BLANK", stock=0.0)
+    _link_bom(db_session, painted, welded, qty_per_unit=1.0)
+    _link_bom(db_session, welded, blank, qty_per_unit=1.0)
+
+    plan = ProductionPlanHeader(
+        name="План июнь",
+        period_from=date(2026, 6, 1),
+        period_to=date(2026, 6, 30),
+        status="fixed",
+        created_by="test",
+    )
+    db_session.add(plan)
+    db_session.flush()
+    db_session.add(
+        ProductionPlanLine(
+            plan_id=plan.id, item_id=painted.item_id, bucket_date=date(2026, 6, 15), qty=32
+        )
+    )
+    db_session.commit()
+
+    snap = create_mrp_snapshot_from_period_plan(db_session, plan.id)
+    run_id = snap["run_id"]
+
+    # With painted out of stock, the snapshot explodes the whole tree.
+    reqs = {
+        int(r.item_id): r
+        for r in db_session.query(MrpRequirement).filter(MrpRequirement.run_id == run_id).all()
+    }
+    assert set(reqs) == {painted.item_id, welded.item_id, blank.item_id}
+    assert float(reqs[blank.item_id].net_required_qty) == 32.0
+
+    # Materialise ONLY the painted line → it becomes the parent's open WIP.
+    create_production_orders_from_mrp_requirements(db_session, [reqs[painted.item_id].id])
+    db_session.commit()
+
+    # Reconcile: painted is fully covered by its open order, but welded and blank
+    # are still in deficit and must each get a catch-up order in this single pass.
+    res = reconcile_snapshot(db_session, run_id)
+    added = {entry["item_id"]: entry["qty"] for entry in res["production_added"]}
+    assert welded.item_id in added and abs(added[welded.item_id] - 32.0) < 1e-6
+    assert blank.item_id in added and abs(added[blank.item_id] - 32.0) < 1e-6
+    assert painted.item_id not in added  # parent already covered by its open order
+
+    # Second pass: the new welded/blank orders are open WIP → no further gap.
     res = reconcile_snapshot(db_session, run_id)
     assert res["production_added"] == []
