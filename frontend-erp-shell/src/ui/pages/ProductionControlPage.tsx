@@ -247,6 +247,20 @@ export function ProductionControlPage() {
     try {
       const data = await api<MaterialsResponse>(`/v1/production-control/orders/${row.product_id}/materials`)
       setMaterials(data)
+      const coverageStatus = data.coverage_status || row.coverage_status
+      setRows((list) => list.map((item) => {
+        if (item.product_id !== row.product_id) return item
+        const status =
+          coverageStatus && ['shortage', 'partial', 'ready'].includes(item.status)
+            ? coverageStatus
+            : item.status
+        return {
+          ...item,
+          status,
+          coverage_status: coverageStatus,
+          coverage_label: data.coverage_label || item.coverage_label,
+        }
+      }))
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }

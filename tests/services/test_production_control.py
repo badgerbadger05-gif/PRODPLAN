@@ -345,7 +345,8 @@ def test_fill_remaining_creates_top_up_order_for_partially_covered_requirement(d
 
     assert len(result["created"]) == 1
     assert result["created"][0]["qty"] == 23
-    assert result["reused"] == []
+    assert len(result["reused"]) == 1
+    assert result["reused"][0]["product_id"] == existing.product_id
     db_session.refresh(req)
     assert float(req.covered_qty) == 27
     assert float(req.remaining_qty) == 0
@@ -356,6 +357,72 @@ def test_fill_remaining_creates_top_up_order_for_partially_covered_requirement(d
         .all()
     )
     assert [float(p.quantity) for p in products] == [4, 23]
+
+
+def test_fill_remaining_reuses_active_order_when_it_already_covers_requirement(db_session):
+    item = Item(
+        item_code="MRP-NODUP",
+        item_name="MRP no duplicate item",
+        unit="шт",
+        stock_qty=0,
+        replenishment_method="Производство",
+        status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+
+    run = PlanningRun(status="FIXED_SNAPSHOT", started_at=datetime(2026, 5, 27))
+    db_session.add(run)
+    db_session.flush()
+    req = MrpRequirement(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        total_required_qty=23,
+        net_required_qty=23,
+        covered_qty=0,
+        remaining_qty=23,
+        period_from=_dt.date(2026, 6, 1),
+        period_to=_dt.date(2026, 6, 30),
+        bom_level=0,
+    )
+    db_session.add(req)
+    db_session.flush()
+
+    order = ProductionOrder(
+        order_number="MRP-R-NODUP",
+        order_date=datetime(2026, 5, 27),
+        deletion_mark=False,
+        source="mrp",
+        source_run_id=run.run_id,
+    )
+    db_session.add(order)
+    db_session.flush()
+    existing = ProductionProduct(
+        order_id=order.order_id,
+        item_id=item.item_id,
+        line_number=1,
+        quantity=23,
+        produced_qty=0,
+        remaining_qty=23,
+        source_mrp_requirement_id=req.id,
+        source_mrp_allocation_key=f"mrp_requirement:{req.id}:order:1",
+    )
+    db_session.add(existing)
+    db_session.commit()
+
+    result = create_production_orders_from_mrp_requirements(db_session, [req.id])
+
+    assert result["created"] == []
+    assert len(result["reused"]) == 1
+    db_session.refresh(req)
+    assert float(req.covered_qty) == 23
+    assert float(req.remaining_qty) == 0
+    products = (
+        db_session.query(ProductionProduct)
+        .filter(ProductionProduct.source_mrp_requirement_id == req.id)
+        .all()
+    )
+    assert len(products) == 1
 
 
 def test_journal_splits_work_status_from_material_coverage(db_session):
@@ -1300,6 +1367,9 @@ def test_preview_materials_marks_ready_when_stock_covers_all(db_session):
         .one()
     )
     assert state.status == "ready"
+    row = list_journal(db_session, product_id=product.product_id)["rows"][0]
+    assert row["coverage_status"] == "ready"
+    assert row["coverage_label"] == "Обеспечен"
 
 
 def test_preview_materials_marks_shortage_and_includes_supplier_eta(db_session):

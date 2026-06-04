@@ -211,7 +211,7 @@ def patch_order_line_state(product_id: int, payload: LineStatePayload, db: Sessi
 @router.get("/orders/{product_id}/materials", response_model=dict)
 def get_order_line_materials(product_id: int, db: Session = Depends(get_db)):
     try:
-        return preview_materials(db, int(product_id))
+        return preview_materials(db, int(product_id), refresh_state=True)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:

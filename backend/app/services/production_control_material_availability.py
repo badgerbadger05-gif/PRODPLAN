@@ -14,12 +14,14 @@ from ..models import (
     PlannedPurchase,
     ProductionMaterialIssue,
     ProductionMaterialIssueLine,
+    ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
     SpecComponent,
     SupplierOrder,
     SupplierOrderItem,
 )
+from .mrp_stock_helpers import _DONE_STATE_KEY as DONE_STATE_KEY
 from .planning_service import (
     SUPPLIER_ORDER_EXCLUDED_STATE_NAMES,
     _normalize_supplier_order_state_name,
@@ -265,6 +267,65 @@ def _planned_eta_by_item(db: Session, item_ids: Sequence[int], run_id: Optional[
     return result
 
 
+def _production_order_eta_by_item(db: Session, item_ids: Sequence[int]) -> Dict[int, List[Dict[str, Any]]]:
+    """
+    Per-item list of expected arrivals from OPEN production journal orders.
+
+    These are the real, trackable orders shown in the production journal —
+    including catch-up orders created by MRP reconciliation, which never get a
+    `PlannedOrder` row. Without this source the components panel reported
+    "В заказах нет" for a component that actually had an open production order.
+
+    The active filter mirrors `active_wip_eta_by_item` (the very orders that net
+    MRP demand), so the panel reads "в заказах" exactly when the order really
+    covers the requirement:
+      - production_orders.deletion_mark = false
+      - order_state_key != DONE
+      - production_products.remaining_qty > 0
+    ETA = production_order_line_states.planned_finish_date (may be NULL when the
+    line is not scheduled yet — surfaced with date=None, "дата не указана").
+    """
+    ids = [int(x) for x in item_ids if x is not None]
+    if not ids:
+        return {}
+    rows = (
+        db.query(
+            ProductionProduct.item_id,
+            ProductionOrderLineState.planned_finish_date,
+            func.coalesce(ProductionProduct.remaining_qty, 0.0),
+            ProductionOrder.order_number,
+        )
+        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+        .outerjoin(
+            ProductionOrderLineState,
+            ProductionOrderLineState.product_id == ProductionProduct.product_id,
+        )
+        .filter(ProductionProduct.item_id.in_(ids))
+        .filter(ProductionOrder.deletion_mark.is_(False))
+        .filter(func.lower(func.coalesce(ProductionOrder.order_state_key, "")) != DONE_STATE_KEY)
+        .filter(func.coalesce(ProductionProduct.remaining_qty, 0.0) > 0)
+        .all()
+    )
+    result: Dict[int, List[Dict[str, Any]]] = {}
+    for iid, finish, remaining, order_number in rows:
+        qty = _to_float(remaining)
+        if qty <= 1e-9:
+            continue
+        finish_d = finish.date() if isinstance(finish, datetime) else finish
+        result.setdefault(int(iid), []).append(
+            {
+                # Reuse the existing UI source label ("MRP производство"); these
+                # are real MRP production orders, sourced from the journal rather
+                # than the PlannedOrder table, so no frontend change is needed.
+                "source": "planned_production",
+                "date": _date_to_iso(finish_d) if finish_d else None,
+                "qty": qty,
+                "ref": str(order_number or ""),
+            }
+        )
+    return result
+
+
 def _component_coverage_label(required: float, available: float) -> str:
     if required <= 1e-9:
         return "ok"
@@ -353,6 +414,7 @@ def preview_materials(db: Session, product_id: int, *, refresh_state: bool = Fal
     run_id = _latest_run_id(db)
     supplier_eta = _supplier_eta_by_item(db, comp_ids)
     planned_eta = _planned_eta_by_item(db, comp_ids, run_id)
+    production_order_eta = _production_order_eta_by_item(db, comp_ids)
 
     for comp in components:
         iid = int(comp["component_item_id"])
@@ -374,7 +436,16 @@ def preview_materials(db: Session, product_id: int, *, refresh_state: bool = Fal
             comp["eta_dates"] = []
             comp["expected_dates"] = []
         else:
-            etas: List[Dict[str, Any]] = list(supplier_eta.get(iid, [])) + list(planned_eta.get(iid, []))
+            prod_orders = production_order_eta.get(iid, [])
+            planned = planned_eta.get(iid, [])
+            if prod_orders:
+                # Real journal orders supersede the planning-run PlannedOrder
+                # rows they were materialised from, so the same production isn't
+                # listed twice. Planned purchases are unrelated and kept.
+                planned = [e for e in planned if e.get("source") != "planned_production"]
+            etas: List[Dict[str, Any]] = (
+                list(supplier_eta.get(iid, [])) + list(prod_orders) + list(planned)
+            )
             etas.sort(key=lambda e: e.get("date") or "")
             comp["eta_dates"] = etas
             comp["expected_dates"] = [

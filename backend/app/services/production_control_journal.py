@@ -487,21 +487,61 @@ def create_production_orders_from_mrp_requirements(
             })
             continue
 
-        remaining = _to_float(req.remaining_qty)
+        net_qty = _to_float(req.net_required_qty)
+        existing_products = (
+            db.query(ProductionProduct)
+            .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+            .outerjoin(
+                ProductionOrderLineState,
+                ProductionOrderLineState.product_id == ProductionProduct.product_id,
+            )
+            .filter(ProductionProduct.source_mrp_requirement_id == rid)
+            .order_by(ProductionProduct.product_id.asc())
+            .all()
+        )
+        active_existing: List[ProductionProduct] = []
+        for existing_product in existing_products:
+            existing_order = existing_product.order
+            existing_state = getattr(existing_product, "control_state", None)
+            order_state_key = str(getattr(existing_order, "order_state_key", "") or "").lower()
+            line_status = str(getattr(existing_state, "status", "") or "")
+            if getattr(existing_order, "deletion_mark", False):
+                continue
+            if order_state_key == DONE_STATE_KEY:
+                continue
+            if line_status in _TERMINAL_LINE_STATUSES:
+                continue
+            if _to_float(existing_product.remaining_qty) <= 1e-9:
+                continue
+            active_existing.append(existing_product)
+
+        active_covered_qty = sum(_to_float(product.quantity) for product in active_existing)
+        if active_existing:
+            synced_covered = min(max(_to_float(req.covered_qty), active_covered_qty), net_qty)
+            req.covered_qty = synced_covered
+            req.remaining_qty = max(net_qty - synced_covered, 0.0)
+            for existing_product in active_existing:
+                reused.append({
+                    "requirement_id": rid,
+                    "product_id": int(existing_product.product_id),
+                    "order_id": int(existing_product.order_id),
+                    "order_number": str(existing_product.order.order_number or ""),
+                    "item_id": int(req.item_id),
+                    "item_name": str(item.item_name or ""),
+                    "qty": _to_float(existing_product.quantity),
+                })
+
+        remaining = min(_to_float(req.remaining_qty), max(net_qty - active_covered_qty, 0.0))
         if remaining <= 1e-9:
             skipped.append({
                 "requirement_id": rid,
                 "item_id": int(req.item_id),
-                "reason": "remaining_qty=0 (уже покрыто)",
+                "reason": "remaining_qty=0 (уже покрыто активным заказом)",
             })
             continue
 
         qty = remaining
-        existing_count = (
-            db.query(ProductionProduct)
-            .filter(ProductionProduct.source_mrp_requirement_id == rid)
-            .count()
-        )
+        existing_count = len(existing_products)
         order_number = f"MRP-R-{rid}" if existing_count <= 0 else f"MRP-R-{rid}-{existing_count + 1}"
         order = ProductionOrder(
             order_number=order_number,
@@ -550,7 +590,6 @@ def create_production_orders_from_mrp_requirements(
         db.add(state)
 
         # Reflect coverage in the requirement row
-        net_qty = _to_float(req.net_required_qty)
         new_covered = min(_to_float(req.covered_qty) + qty, net_qty)
         req.covered_qty = new_covered
         req.remaining_qty = max(net_qty - new_covered, 0.0)
