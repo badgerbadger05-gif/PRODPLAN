@@ -14,6 +14,7 @@ from app.models import (
     PlannedPurchase,
     PlanningRun,
     ProductionMaterialIssue,
+    ProductionMaterialIssueLine,
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
@@ -32,6 +33,7 @@ from app.services.production_control_journal import (
 )
 from app.services.production_control_material_availability import preview_materials
 from app.services.production_control_material_issues import create_material_issues, list_material_issues
+from app.services.production_control_printing import render_route_sheets_html
 
 
 def test_list_employees_returns_active_synced_employees(db_session):
@@ -56,6 +58,75 @@ def test_list_employees_returns_active_synced_employees(db_session):
     assert result["total"] == 1
     assert result["rows"][0]["employee_name"] == "Иванов Иван"
     assert result["rows"][0]["employee_ref1c"] == "11111111-1111-1111-1111-111111111111"
+
+
+def test_route_sheet_includes_material_transfer_route(db_session):
+    item = Item(
+        item_code="P-ROUTE",
+        item_name="Деталь маршрута",
+        item_article="ART-ROUTE",
+        unit="шт",
+        status="active",
+    )
+    workshop = ProductionResource(resource_name="Сварочный участок")
+    source_wh = StockWarehouse(
+        warehouse_ref1c="src-route",
+        warehouse_code="SRC",
+        warehouse_name="Склад металла",
+    )
+    dest_wh = StockWarehouse(
+        warehouse_ref1c="dst-route",
+        warehouse_code="DST",
+        warehouse_name="Склад сварки",
+    )
+    db_session.add_all([item, workshop, source_wh, dest_wh])
+    db_session.flush()
+
+    order = ProductionOrder(
+        order_number="MRP-ROUTE",
+        order_date=datetime(2026, 6, 4),
+        deletion_mark=False,
+        source="mrp",
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=item.item_id,
+        line_number=1,
+        quantity=5,
+        produced_qty=0,
+        remaining_qty=5,
+    )
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(
+        ProductionOrderLineState(
+            product_id=product.product_id,
+            status="to_move",
+            workshop_id=workshop.resource_id,
+        )
+    )
+    db_session.add(
+        ProductionMaterialIssue(
+            document_number="MT000000123",
+            product_id=product.product_id,
+            order_id=order.order_id,
+            status="requested",
+            direction="issue",
+            source_warehouse_ref1c="src-route",
+            warehouse_ref1c="dst-route",
+        )
+    )
+    db_session.commit()
+
+    html = render_route_sheets_html(db_session, [product.product_id])
+
+    assert "Маршрут перемещения материалов" in html
+    assert "Сварочный участок" in html
+    assert "MT000000123" in html
+    assert "Склад металла" in html
+    assert "Склад сварки" in html
 
 
 def test_journal_and_material_issue_are_scoped_to_order_line(db_session):
@@ -714,6 +785,76 @@ def test_create_material_issues_is_idempotent_per_product(db_session):
         .count()
         == 1
     )
+
+
+def test_create_material_issues_reuses_exported_transfer_and_refreshes_qty(db_session):
+    parent = Item(
+        item_code="P-REEXP",
+        item_name="Parent reexport",
+        item_article="ART-P-REEXP",
+        unit="шт",
+        stock_qty=0,
+        status="active",
+    )
+    comp = Item(
+        item_code="C-REEXP",
+        item_name="Component reexport",
+        item_article="ART-C-REEXP",
+        unit="м",
+        stock_qty=10,
+        status="active",
+    )
+    db_session.add_all([parent, comp])
+    db_session.flush()
+
+    spec = Specification(spec_name="Reexport spec", spec_ref1c="spec-reexport")
+    db_session.add(spec)
+    db_session.flush()
+    db_session.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=1))
+
+    order = ProductionOrder(
+        order_number="REEXP-001",
+        order_date=datetime(2026, 5, 20),
+        order_ref1c="order-reexport",
+        is_posted=True,
+        deletion_mark=False,
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=parent.item_id,
+        line_number=1,
+        quantity=5,
+        produced_qty=0,
+        remaining_qty=5,
+    )
+    db_session.add(product)
+    db_session.commit()
+
+    first = create_material_issues(db_session, [product.product_id], initiated_by="op1")
+    issue_id = first["created"][0]["issue_id"]
+    issue = db_session.query(ProductionMaterialIssue).filter_by(issue_id=issue_id).one()
+    issue.status = "exported"
+    issue.exported_ref1c = "existing-transfer-ref"
+    product.quantity = 3
+    product.remaining_qty = 3
+    db_session.commit()
+
+    second = create_material_issues(db_session, [product.product_id], initiated_by="op2")
+
+    assert second["created"] == []
+    assert len(second["reused"]) == 1
+    assert second["reused"][0]["issue_id"] == issue_id
+    assert (
+        db_session.query(ProductionMaterialIssue)
+        .filter(ProductionMaterialIssue.product_id == product.product_id)
+        .count()
+        == 1
+    )
+    line = db_session.query(ProductionMaterialIssueLine).filter_by(issue_id=issue_id).one()
+    assert float(line.required_qty) == 3.0
 
 
 def test_material_issue_journal_shows_warehouse_names_and_filters_source(db_session):

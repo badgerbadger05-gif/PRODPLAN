@@ -57,15 +57,17 @@ def produce_line(
         raise ValueError(f"product_id={product_id}: строка заказа не найдена")
 
     remaining = _to_float(product.remaining_qty)
+    produced_before = _to_float(product.produced_qty)
+    overproduced_qty = 0.0
+    order_quantity_before = _to_float(product.quantity)
     if remaining <= 1e-9:
         raise ValueError(
             "remaining_qty=0: эта строка уже произведена полностью"
         )
     if qty_f - remaining > 1e-6:
-        raise ValueError(
-            f"qty={qty_f} больше остатка к выпуску ({remaining}). "
-            "Если нужно увеличить вЂ” сначала отмените лишний выпуск."
-        )
+        overproduced_qty = qty_f - remaining
+        product.quantity = produced_before + qty_f
+        remaining = qty_f
 
     material_issue = (
         db.query(ProductionMaterialIssue)
@@ -93,7 +95,7 @@ def produce_line(
     db.add(manufacture)
     db.flush()
 
-    product.produced_qty = _to_float(product.produced_qty) + qty_f
+    product.produced_qty = produced_before + qty_f
     new_remaining = max(0.0, remaining - qty_f)
     product.remaining_qty = new_remaining
 
@@ -120,6 +122,9 @@ def produce_line(
         "qty": float(qty_f),
         "produced_qty_total": float(product.produced_qty),
         "remaining_qty": float(product.remaining_qty),
+        "overproduced_qty": float(overproduced_qty),
+        "order_quantity_before": float(order_quantity_before),
+        "order_quantity_after": float(product.quantity),
         "line_status": state.status,
     }
 

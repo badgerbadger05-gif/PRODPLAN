@@ -525,27 +525,26 @@ def export_material_issues_to_1c(
     eligible: List[StockTransferExportEntry] = []
     already_linked: List[StockTransferExportEntry] = []
     for entry in entries:
-        link = _existing_link(db, entry.issue_id)
-        if link and link.status == "success" and (link.target_ref_key or ""):
-            entry.status = "existing"
-            entry.target_ref_key = str(link.target_ref_key)
-            entry.reason = "уже выгружен в 1С (sync_link)"
-            already_linked.append(entry)
-            continue
-        if link and _clean_ref1c(link.target_ref_key):
-            entry.target_ref_key = _clean_ref1c(link.target_ref_key)
-            entry.reason = "повторная отправка: 1С-документ уже был создан, обновляем реквизиты"
         issue_row = (
             db.query(ProductionMaterialIssue)
             .filter(ProductionMaterialIssue.issue_id == entry.issue_id)
             .one()
         )
-        if _clean_ref1c(issue_row.exported_ref1c):
+        link = _existing_link(db, entry.issue_id)
+        linked_ref = _clean_ref1c(link.target_ref_key) if link else ""
+        exported_ref = _clean_ref1c(issue_row.exported_ref1c)
+        target_ref = linked_ref or exported_ref
+
+        if str(issue_row.status or "").lower() == "posted" and target_ref:
             entry.status = "existing"
-            entry.target_ref_key = _clean_ref1c(issue_row.exported_ref1c)
-            entry.reason = "exported_ref1c уже стоит"
+            entry.target_ref_key = target_ref
+            entry.reason = "перемещение уже проведено в 1С"
             already_linked.append(entry)
             continue
+
+        if target_ref:
+            entry.target_ref_key = target_ref
+            entry.reason = "повторная отправка: 1С-документ уже был создан, обновляем реквизиты"
         eligible.append(entry)
 
     summary: Dict[str, Any] = {

@@ -259,6 +259,74 @@ def _next_issue_number(db: Session) -> str:
     return f"{prefix}{count + 1:04d}"
 
 
+def _issue_reuse_payload(
+    issue: ProductionMaterialIssue,
+    product: ProductionProduct,
+) -> Dict[str, Any]:
+    return {
+        "issue_id": int(issue.issue_id),
+        "document_number": str(issue.document_number),
+        "product_id": int(product.product_id),
+        "order_number": str(product.order.order_number or ""),
+        "item_name": str(product.item.item_name or ""),
+        "status": str(issue.status),
+        "source_warehouse_ref1c": str(issue.source_warehouse_ref1c or ""),
+    }
+
+
+def _sync_existing_issue_lines(
+    db: Session,
+    issue: ProductionMaterialIssue,
+    components: List[Dict[str, Any]],
+    *,
+    spec_id: Optional[int],
+    replace_missing: bool = False,
+) -> None:
+    """
+    Keep a non-posted local transfer aligned with the current order quantity.
+
+    Re-clicking "Запустить в 1С" should update the existing 1C document, not
+    create a duplicate local transfer. That only works if the local transfer
+    lines also reflect the edited order quantity.
+    """
+    by_component = {int(comp["component_item_id"]): comp for comp in components}
+    existing_by_component = {
+        int(line.component_item_id): line
+        for line in (issue.lines or [])
+    }
+
+    for component_id, line in list(existing_by_component.items()):
+        comp = by_component.get(component_id)
+        if comp is None:
+            if replace_missing:
+                db.delete(line)
+            continue
+        line.required_qty = float(comp["required_qty"])
+        line.unit = comp.get("unit")
+        line.source_spec_id = spec_id
+        if str(line.line_status or "") == "planned":
+            line.issued_qty = 0.0
+
+    if not replace_missing:
+        return
+
+    for comp in components:
+        component_id = int(comp["component_item_id"])
+        if component_id in existing_by_component:
+            continue
+        db.add(
+            ProductionMaterialIssueLine(
+                issue_id=int(issue.issue_id),
+                component_item_id=component_id,
+                required_qty=float(comp["required_qty"]),
+                issued_qty=0.0,
+                unit=comp.get("unit"),
+                source_spec_id=spec_id,
+                line_status="planned",
+            )
+        )
+
+
 def _workshop_id_for_product(
     db: Session,
     product: ProductionProduct,
@@ -327,10 +395,10 @@ def create_material_issues(
     Idempotent per the plan: a repeated click on "prepare issue" for the same
     production line must not create a duplicate document.
 
-    If an active (draft|requested) ProductionMaterialIssue already exists for
-    the product, return its descriptor in `reused` instead of creating a new
-    one. Issues already exported to 1C or in error state are treated as
-    archived вЂ” a fresh draft can be created in their place.
+    If an active non-posted ProductionMaterialIssue already exists for the
+    product, return its descriptor in `reused` instead of creating a new one.
+    Already posted transfers are complete documents; after them a fresh draft
+    may be created for a real delta (for example overproduction).
     """
     created: List[Dict[str, Any]] = []
     reused: List[Dict[str, Any]] = []
@@ -349,28 +417,15 @@ def create_material_issues(
 
         existing_rows = (
             db.query(ProductionMaterialIssue)
+            .options(joinedload(ProductionMaterialIssue.lines))
             .filter(
                 ProductionMaterialIssue.product_id == int(product.product_id),
-                ProductionMaterialIssue.status.in_(("draft", "requested")),
+                ProductionMaterialIssue.status.in_(("draft", "requested", "issued", "exported", "error")),
                 ProductionMaterialIssue.direction == "issue",
             )
             .order_by(ProductionMaterialIssue.issue_id.desc())
             .all()
         )
-        if existing_rows and not source_warehouse_ref1c:
-            for existing in existing_rows:
-                reused.append(
-                    {
-                        "issue_id": int(existing.issue_id),
-                        "document_number": str(existing.document_number),
-                        "product_id": int(product.product_id),
-                        "order_number": str(product.order.order_number or ""),
-                        "item_name": str(product.item.item_name or ""),
-                        "status": str(existing.status),
-                        "source_warehouse_ref1c": str(existing.source_warehouse_ref1c or ""),
-                    }
-                )
-            continue
 
         spec_id, components = _components_for_product(db, product)
         if not components:
@@ -383,6 +438,20 @@ def create_material_issues(
         resolved_warehouse = warehouse_ref1c
         if not resolved_warehouse:
             resolved_warehouse = _destination_warehouse_for_product(db, product, spec_id)
+
+        if existing_rows and not source_warehouse_ref1c:
+            for existing in existing_rows:
+                if not existing.warehouse_ref1c:
+                    existing.warehouse_ref1c = resolved_warehouse
+                _sync_existing_issue_lines(
+                    db,
+                    existing,
+                    components,
+                    spec_id=spec_id,
+                    replace_missing=False,
+                )
+                reused.append(_issue_reuse_payload(existing, product))
+            continue
 
         groups, needed_selection = _allocate_components_by_source_warehouse(
             db,
@@ -412,17 +481,14 @@ def create_material_issues(
             if existing is not None:
                 if not existing.warehouse_ref1c:
                     existing.warehouse_ref1c = resolved_warehouse
-                reused.append(
-                    {
-                        "issue_id": int(existing.issue_id),
-                        "document_number": str(existing.document_number),
-                        "product_id": int(product.product_id),
-                        "order_number": str(product.order.order_number or ""),
-                        "item_name": str(product.item.item_name or ""),
-                        "status": str(existing.status),
-                        "source_warehouse_ref1c": str(existing.source_warehouse_ref1c or ""),
-                    }
+                _sync_existing_issue_lines(
+                    db,
+                    existing,
+                    grouped_components,
+                    spec_id=spec_id,
+                    replace_missing=True,
                 )
+                reused.append(_issue_reuse_payload(existing, product))
                 continue
 
             issue = ProductionMaterialIssue(

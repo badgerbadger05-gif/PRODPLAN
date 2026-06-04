@@ -176,20 +176,28 @@ def test_partial_then_remaining_finishes_line(db_session):
     assert [float(m.qty) for m in mans] == [3.0, 4.0]
 
 
-def test_produce_more_than_remaining_raises(db_session):
+def test_produce_more_than_remaining_expands_order_quantity(db_session):
     db = db_session
     item = _mk_item(db, code="PRD-OVER", ref1c="ref-prd-over")
     product = _mk_product(db, item, qty=2.0)
 
-    with pytest.raises(ValueError, match="больше остатка"):
-        produce_line(db, product.product_id, qty=3)
-    # No partial side-effects: product untouched.
+    result = produce_line(db, product.product_id, qty=3)
+
+    assert result["status"] == "ok"
+    assert result["qty"] == 3.0
+    assert result["overproduced_qty"] == 1.0
+    assert result["order_quantity_before"] == 2.0
+    assert result["order_quantity_after"] == 3.0
+    assert result["produced_qty_total"] == 3.0
+    assert result["remaining_qty"] == 0.0
+
     db.refresh(product)
-    assert float(product.produced_qty) == 0.0
-    assert float(product.remaining_qty) == 2.0
+    assert float(product.quantity) == 3.0
+    assert float(product.produced_qty) == 3.0
+    assert float(product.remaining_qty) == 0.0
     assert (
         db.query(ProductionManufacture).filter_by(product_id=product.product_id).count()
-        == 0
+        == 1
     )
 
 

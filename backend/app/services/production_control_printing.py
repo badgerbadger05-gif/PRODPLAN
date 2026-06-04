@@ -14,8 +14,10 @@ from ..models import (
     PlanningRun,
     ProductionPlanHeader,
     ProductionPlanLine,
+    ProductionMaterialIssue,
     ProductionProduct,
     ProductionStage,
+    StockWarehouse,
     SpecComponent,
     SpecOperation,
     SyncLink,
@@ -178,6 +180,82 @@ def _route_context(db: Session, product: ProductionProduct) -> Dict[str, str]:
     }
 
 
+def _warehouse_names(db: Session, refs: Sequence[str]) -> Dict[str, str]:
+    clean_refs = sorted({str(ref or "").strip() for ref in refs if str(ref or "").strip()})
+    if not clean_refs:
+        return {}
+    return {
+        str(row.warehouse_ref1c): str(row.warehouse_name or row.warehouse_ref1c)
+        for row in db.query(StockWarehouse)
+        .filter(StockWarehouse.warehouse_ref1c.in_(clean_refs))
+        .all()
+    }
+
+
+def _warehouse_label(names: Dict[str, str], ref: Optional[str]) -> str:
+    clean_ref = str(ref or "").strip()
+    if not clean_ref:
+        return ""
+    return names.get(clean_ref, clean_ref)
+
+
+def _material_transfer_rows(db: Session, product: ProductionProduct) -> List[Dict[str, str]]:
+    issues = (
+        db.query(ProductionMaterialIssue)
+        .filter(
+            ProductionMaterialIssue.product_id == int(product.product_id),
+            ProductionMaterialIssue.direction == "issue",
+            ProductionMaterialIssue.status != "cancelled",
+        )
+        .order_by(ProductionMaterialIssue.issue_id.asc())
+        .all()
+    )
+    if not issues:
+        return []
+
+    warehouse_names = _warehouse_names(
+        db,
+        [
+            ref
+            for issue in issues
+            for ref in (str(issue.source_warehouse_ref1c or ""), str(issue.warehouse_ref1c or ""))
+        ],
+    )
+    state = getattr(product, "control_state", None)
+    workshop = state.workshop if state and state.workshop else None
+    workshop_name = str(workshop.resource_name or "") if workshop else ""
+
+    links_by_issue_id: Dict[int, SyncLink] = {
+        int(link.source_id): link
+        for link in db.query(SyncLink)
+        .filter(
+            SyncLink.source_system == "PRODPLAN",
+            SyncLink.source_doctype == "material_issue",
+            SyncLink.source_id.in_([int(issue.issue_id) for issue in issues]),
+        )
+        .all()
+    }
+
+    rows: List[Dict[str, str]] = []
+    for issue in issues:
+        link = links_by_issue_id.get(int(issue.issue_id))
+        one_c_number = str(link.target_number or "") if link else ""
+        local_number = str(issue.document_number or "")
+        if one_c_number and one_c_number != local_number:
+            transfer_number = f"{local_number} / {one_c_number}"
+        else:
+            transfer_number = one_c_number or local_number
+        rows.append(
+            {
+                "transfer_number": transfer_number,
+                "workshop_name": workshop_name,
+                "source_warehouse": _warehouse_label(warehouse_names, issue.source_warehouse_ref1c),
+                "destination_warehouse": _warehouse_label(warehouse_names, issue.warehouse_ref1c),
+            }
+        )
+    return rows
+
+
 def render_route_sheets_html(db: Session, product_ids: Sequence[int]) -> str:
     products = (
         db.query(ProductionProduct)
@@ -194,9 +272,19 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int]) -> str:
         operations = _operation_rows(db, spec_id)
         order_date = _datetime_ru(product.order.order_date)
         route_ctx = _route_context(db, product)
+        transfer_rows_data = _material_transfer_rows(db, product)
         order_number = html.escape(str(product.order.order_number or ""))
         one_c_number = html.escape(route_ctx["one_c_number"] or "—")
         title = f"МАРШРУТНЫЙ ЛИСТ № {order_number} от {now}"
+        transfer_rows = "".join(
+            "<tr>"
+            f"<td colspan='2' class='text'>{html.escape(row['workshop_name'] or '—')}</td>"
+            f"<td colspan='2' class='text'>{html.escape(row['transfer_number'] or '—')}</td>"
+            f"<td colspan='2' class='text'>{html.escape(row['source_warehouse'] or '—')}</td>"
+            f"<td class='text'>{html.escape(row['destination_warehouse'] or '—')}</td>"
+            "</tr>"
+            for row in transfer_rows_data
+        ) or "<tr><td colspan='7'>Перемещения материалов не созданы</td></tr>"
         component_rows = "".join(
             "<tr>"
             f"<td colspan='2' class='text'>{html.escape(c['item_name'])}</td>"
@@ -247,6 +335,9 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int]) -> str:
                   <td><b>Период:</b><br>{html.escape(route_ctx["plan_period"] or "—")}</td>
                   <td colspan="2"><b>Корневое изделие:</b><br>{html.escape(route_ctx["root_item"] or "—")}</td>
                 </tr>
+                <tr><td colspan="7"><b>Маршрут перемещения материалов</b></td></tr>
+                <tr><th colspan="2">Участок получатель</th><th colspan="2">№ перемещения</th><th colspan="2">Склад отправитель</th><th>Склад получатель</th></tr>
+                {transfer_rows}
                 <tr><td colspan="7"><b>Материалы и заготовки</b></td></tr>
                 <tr><th colspan="2">Материал</th><th>Артикул</th><th>Кол-во на ед.</th><th colspan="3">Кол-во по заказу</th></tr>
                 {component_rows}

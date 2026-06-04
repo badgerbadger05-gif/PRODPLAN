@@ -114,6 +114,8 @@ export function ProductionControlPage() {
     [employees, produceEmployeeRef],
   )
   const produceRemainingQty = Number(produceRow?.remaining_qty ?? 0)
+  const produceRequestedQty = Number(produceQty || 0)
+  const produceOverageQty = produceRequestedQty - produceRemainingQty
   const canProduceRow = Boolean(produceRow && produceRemainingQty > 0)
 
   const load = useCallback(async (nextOffset: number) => {
@@ -444,13 +446,60 @@ export function ProductionControlPage() {
     let manufactureIdToRollback: number | null = null
     let manufactureExportedRef = ''
     try {
+      const requestedQty = Number(produceQty) || 0
+      const currentRemaining = Number(produceRow.remaining_qty ?? 0)
+      const overageQty = requestedQty - currentRemaining
+      if (overageQty > 0.000001) {
+        if (produceDryRun) {
+          throw new Error('dry_run для выпуска больше плана пока недоступен: сначала нужно создать и провести дополнительное перемещение.')
+        }
+        const targetQuantity = Number(produceRow.produced_qty ?? 0) + requestedQty
+        await api(`/v1/production-control/orders/${produceRow.product_id}/quantity`, {
+          method: 'PATCH',
+          body: JSON.stringify({ quantity: targetQuantity }),
+        })
+        const issueResult = await api<MaterialIssueCreateResponse>('/v1/production-control/material-issues', {
+          method: 'POST',
+          body: JSON.stringify({ product_ids: [produceRow.product_id], initiated_by: 'erp-shell-overproduction' }),
+        })
+        const selectionRequired = issueResult.selection_required ?? []
+        if (selectionRequired.length > 0) {
+          throw new Error('Для дополнительного перемещения на разницу нужно выбрать склад-источник материалов.')
+        }
+        const issueIds = [
+          ...(issueResult.created ?? []).map((row) => row.issue_id),
+          ...(issueResult.reused ?? []).map((row) => row.issue_id),
+        ].filter(Boolean)
+        if (!issueIds.length) {
+          const detail = issueResult.errors?.join('; ')
+          throw new Error(`Не удалось создать дополнительное перемещение на разницу ${overageQty}.${detail ? ` ${detail}` : ''}`)
+        }
+        const transferResult = await api<Record<string, unknown>>('/v1/production-control/material-issues/export-to-1c', {
+          method: 'POST',
+          body: JSON.stringify({ issue_ids: issueIds, dry_run: false, allow_production: true }),
+        })
+        const transferErrors = Number(transferResult.issues_error ?? 0)
+        const transferCreated = Number(transferResult.issues_created ?? 0)
+        const transferExisting = Number(transferResult.issues_already_linked ?? 0)
+        if (transferErrors > 0 || transferCreated + transferExisting < 1 || transferResult.status === 'partial_error') {
+          const detail = firstExportProblem(transferResult, transferResult.parent_orders_export as Record<string, unknown> | undefined)
+          throw new Error(`Дополнительное перемещение на разницу не выгружено в 1С.${detail ? ` ${detail}` : ''}`)
+        }
+        for (const issueId of issueIds) {
+          await api(`/v1/production-control/material-issues/${issueId}/assembled`, {
+            method: 'POST',
+            body: JSON.stringify({ allow_production: true }),
+          })
+        }
+      }
+
       // Step 1: record manufacture locally (bumps produced_qty / remaining_qty).
       const localResult = await api<Record<string, unknown>>(
         `/v1/production-control/orders/${produceRow.product_id}/produce`,
         {
           method: 'POST',
           body: JSON.stringify({
-            qty: Number(produceQty) || 0,
+            qty: requestedQty,
             executor: selectedEmployee?.employee_name || undefined,
           }),
         },
@@ -743,6 +792,11 @@ export function ProductionControlPage() {
                   onChange={(e) => setProduceQty(e.target.value)}
                   disabled={produceSaving}
                 />
+                {produceOverageQty > 0.000001 && (
+                  <div className="fieldHint">
+                    Больше плана на {produceOverageQty.toLocaleString('ru-RU')}: будет создано дополнительное перемещение материалов.
+                  </div>
+                )}
               </div>
               <div className="dialogField">
                 <label>Исполнитель</label>

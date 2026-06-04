@@ -418,7 +418,7 @@ def test_successful_export_stamps_sync_link_and_issue_status(db_session, monkeyp
     assert state.issue_status == "exported"
 
 
-def test_second_export_is_noop(db_session, monkeypatch):
+def test_second_export_patches_existing_transfer(db_session, monkeypatch):
     db = db_session
     parent = _mk_item(db, code="TRP5", ref1c="parent-ref-5")
     comp = _mk_item(db, code="TRC5", ref1c="comp-ref-5")
@@ -432,9 +432,33 @@ def test_second_export_is_noop(db_session, monkeypatch):
     assert len(fake.posts) == 1
 
     result = exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=False)
+    assert result["issues_created"] == 1
+    assert result["issues_already_linked"] == 0
+    assert len(fake.posts) == 1
+    assert len(fake.patches) == 1
+    assert fake.patches[0][0] == "Document_ПеремещениеЗапасов(guid'reuse-ref-key')"
+
+
+def test_posted_transfer_is_not_patched_on_second_export(db_session, monkeypatch):
+    db = db_session
+    parent = _mk_item(db, code="TRP5P", ref1c="parent-ref-5p")
+    comp = _mk_item(db, code="TRC5P", ref1c="comp-ref-5p")
+    issue = _mk_issue(db, parent=parent, component=comp, dest_wh="dst-5p")
+
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    fake = _FakeClient(ref_key="posted-ref-key")
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=False)
+    issue.status = "posted"
+    db.commit()
+
+    result = exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=False)
+
     assert result["issues_created"] == 0
     assert result["issues_already_linked"] == 1
     assert len(fake.posts) == 1
+    assert fake.patches == []
 
 
 def test_existing_error_link_with_ref_patches_not_posts_duplicate(db_session, monkeypatch):
