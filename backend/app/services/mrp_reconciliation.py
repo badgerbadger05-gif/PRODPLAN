@@ -34,7 +34,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from ..models import (
@@ -49,6 +49,7 @@ from ..models import (
     ProductionPlanLine,
     ProductionProduct,
     ResourceProductionKind,
+    SyncLink,
     SpecComponent,
     SpecOperation,
     Specification,
@@ -68,6 +69,8 @@ from .replenishment import (
 
 EPS = 1e-9
 FIXED_SNAPSHOT_STATUS = "FIXED_SNAPSHOT"
+PRODUCTION_ORDER_ENTITY = "Document_ЗаказНаПроизводство"
+DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
 
 
 def _latest_active_snapshot_run_ids(db: Session) -> List[int]:
@@ -114,6 +117,43 @@ def _bump_requirement_coverage(req: Optional[MrpRequirement], added_qty: float) 
     new_covered = min(_to_float(req.covered_qty) + float(added_qty), net_qty)
     req.covered_qty = new_covered
     req.remaining_qty = max(net_qty - new_covered, 0.0)
+
+
+def _existing_open_catchup_product(db: Session, *, run_id: int, item_id: int) -> Optional[ProductionProduct]:
+    order_number = f"MRP-RC-{int(run_id)}-{int(item_id)}"
+    linked_order_ids = {
+        int(row.source_id)
+        for row in (
+            db.query(SyncLink.source_id)
+            .filter(
+                SyncLink.source_system == "PRODPLAN",
+                SyncLink.source_doctype == "production_order",
+                SyncLink.target_entity == PRODUCTION_ORDER_ENTITY,
+                SyncLink.status == "success",
+                SyncLink.target_ref_key.isnot(None),
+            )
+            .all()
+        )
+    }
+    query = (
+        db.query(ProductionProduct)
+        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+        .outerjoin(ProductionOrderLineState, ProductionOrderLineState.product_id == ProductionProduct.product_id)
+        .filter(ProductionOrder.source == "mrp")
+        .filter(ProductionOrder.source_run_id == int(run_id))
+        .filter(ProductionOrder.order_number == order_number)
+        .filter(ProductionProduct.item_id == int(item_id))
+        .filter(ProductionOrder.deletion_mark == False)
+        .filter(or_(ProductionOrder.order_state_key.is_(None), func.lower(ProductionOrder.order_state_key) != DONE_STATE_KEY))
+        .filter(func.coalesce(ProductionProduct.remaining_qty, 0) > 0)
+        .filter(func.coalesce(ProductionOrderLineState.status, "shortage").notin_(("completed", "cancelled")))
+        .order_by(ProductionProduct.product_id.desc())
+    )
+    for product in query.all():
+        order = product.order
+        if order and not order.order_ref1c and int(order.order_id) not in linked_order_ids:
+            return product
+    return None
 
 
 def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Dict[str, Any]:
@@ -219,6 +259,9 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
                 "requirement_id": int(req.id) if req else None,
             }
             if not dry_run:
+                existing_product = _existing_open_catchup_product(db, run_id=int(run.run_id), item_id=int(iid))
+                if existing_product is not None:
+                    continue
                 order = ProductionOrder(
                     order_number=f"MRP-RC-{int(run.run_id)}-{int(iid)}",
                     order_date=now,

@@ -5,7 +5,9 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import time
+from datetime import datetime
 from typing import Dict, List, Optional, Any
+from zoneinfo import ZoneInfo
 
 
 class OData1CClient:
@@ -571,6 +573,13 @@ def _resolve_warehouse_mapping(client: OData1CClient, warehouse_refs: List[str])
     return mapping
 
 
+def _default_balance_period() -> str:
+    try:
+        return datetime.now(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%dT%H:%M:%S")
+    except Exception:
+        return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+
 def convert_1c_stock_to_records(
     stock_data: List[Dict[str, Any]],
     key_to_code: Optional[Dict[str, Dict[str, str]]] = None,
@@ -733,14 +742,13 @@ def get_stock_from_1c_odata(
     if "/Balance" in (entity_name or ""):
         try:
             import re
-            from datetime import datetime
             period_val = None
             if eff_filter:
                 m = re.search(r"Period\s+le\s+datetime'([^']+)'", str(eff_filter))
                 if m:
                     period_val = m.group(1)
             if not period_val:
-                period_val = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                period_val = _default_balance_period()
             # По умолчанию запрашиваем баланс в разрезе Номенклатуры, Склада (СтруктурнаяЕдиница) и Организации
             dims = "Номенклатура,СтруктурнаяЕдиница,Организация"
             effective_entity = f"{str(entity_name).strip().rstrip('/')}(Period=datetime'{period_val}',Dimensions='{dims}')"

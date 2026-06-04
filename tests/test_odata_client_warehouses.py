@@ -121,3 +121,38 @@ def test_get_stock_warehouse_resolve_skips_non_guid_refs(monkeypatch):
     by_wh = {x["warehouse_ref"]: x for x in out}
     assert by_wh[warehouse_ref]["warehouse_name"] == "Разработка склад(ЗСМ)"
     assert by_wh[warehouse_ref]["warehouse_code"] == "НФ-000079"
+
+
+def test_get_stock_default_balance_period_uses_moscow_time(monkeypatch):
+    captured = {}
+
+    class FakeDateTime:
+        @classmethod
+        def now(cls, tz=None):
+            captured["tz"] = tz
+
+            class _Value:
+                def strftime(self, fmt):
+                    return "2026-06-04T15:10:00"
+
+            return _Value()
+
+    def _fake_get_all(self, entity_name, filter_query=None, select_fields=None, top=1000, max_records=None, max_pages=1000, order_by=None):
+        captured["entity_name"] = str(entity_name)
+        return []
+
+    monkeypatch.setattr(odata_client, "datetime", FakeDateTime)
+    monkeypatch.setattr(odata_client.OData1CClient, "get_all", _fake_get_all)
+
+    get_stock_from_1c_odata(
+        base_url="http://example.local/odata",
+        entity_name="AccumulationRegister_ЗапасыНаСкладах",
+        username=None,
+        password=None,
+        token=None,
+        filter_query=None,
+        select_fields=None,
+    )
+
+    assert "Period=datetime'2026-06-04T15:10:00'" in captured["entity_name"]
+    assert str(captured["tz"]) == "Europe/Moscow"

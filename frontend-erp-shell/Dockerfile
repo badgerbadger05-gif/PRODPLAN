@@ -12,6 +12,11 @@ COPY . .
 RUN npm run build
 
 FROM nginx:1.27-alpine
+ENV TZ=Europe/Moscow
+RUN apk add --no-cache tzdata \
+    && cp /usr/share/zoneinfo/$TZ /etc/localtime \
+    && echo $TZ > /etc/timezone
+
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=builder /app/dist /usr/share/nginx/html
 RUN chmod -R a+rX /usr/share/nginx/html
