@@ -22,6 +22,7 @@ from app.models import (
     SpecComponent,
     StockWarehouse,
     Specification,
+    SyncLink,
     SupplierOrder,
     SupplierOrderItem,
 )
@@ -32,7 +33,7 @@ from app.services.production_control_journal import (
     list_journal,
 )
 from app.services.production_control_material_availability import preview_materials
-from app.services.production_control_material_issues import create_material_issues, list_material_issues
+from app.services.production_control_material_issues import create_material_issues, delete_material_issue, list_material_issues
 from app.services.production_control_printing import render_route_sheets_html
 
 
@@ -855,6 +856,140 @@ def test_create_material_issues_reuses_exported_transfer_and_refreshes_qty(db_se
     )
     line = db_session.query(ProductionMaterialIssueLine).filter_by(issue_id=issue_id).one()
     assert float(line.required_qty) == 3.0
+
+
+def test_delete_material_issue_removes_non_posted_request(db_session):
+    parent = Item(
+        item_code="P-DEL",
+        item_name="Parent delete",
+        unit="шт",
+        stock_qty=0,
+        status="active",
+    )
+    comp = Item(
+        item_code="C-DEL",
+        item_name="Component delete",
+        unit="м",
+        stock_qty=10,
+        status="active",
+    )
+    db_session.add_all([parent, comp])
+    db_session.flush()
+
+    spec = Specification(spec_name="Delete spec", spec_ref1c="spec-delete")
+    db_session.add(spec)
+    db_session.flush()
+    db_session.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=1))
+    order = ProductionOrder(
+        order_number="DEL-001",
+        order_date=datetime(2026, 5, 20),
+        order_ref1c="order-delete",
+        is_posted=True,
+        deletion_mark=False,
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=parent.item_id,
+        line_number=1,
+        quantity=5,
+        produced_qty=0,
+        remaining_qty=5,
+    )
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(ProductionOrderLineState(product_id=product.product_id, status="to_move", issue_status="requested"))
+    db_session.commit()
+
+    created = create_material_issues(db_session, [product.product_id], initiated_by="op")
+    issue_id = created["created"][0]["issue_id"]
+
+    result = delete_material_issue(db_session, issue_id)
+
+    assert result["status"] == "deleted"
+    assert result["issue_id"] == issue_id
+    assert db_session.query(ProductionMaterialIssue).filter_by(issue_id=issue_id).one_or_none() is None
+    state = db_session.query(ProductionOrderLineState).filter_by(product_id=product.product_id).one()
+    assert state.issue_status == "not_requested"
+    assert state.status == "ready"
+
+
+def test_delete_material_issue_blocks_posted_request(db_session):
+    parent = Item(item_code="P-DELPOST", item_name="Parent posted delete", unit="шт", status="active")
+    db_session.add(parent)
+    db_session.flush()
+    order = ProductionOrder(
+        order_number="DEL-POST-001",
+        order_date=datetime(2026, 5, 20),
+        order_ref1c="order-delete-posted",
+        is_posted=True,
+        deletion_mark=False,
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(order_id=order.order_id, item_id=parent.item_id, line_number=1, quantity=1, produced_qty=0, remaining_qty=1)
+    db_session.add(product)
+    db_session.flush()
+    issue = ProductionMaterialIssue(
+        document_number="MT-POSTED-DEL",
+        product_id=product.product_id,
+        order_id=order.order_id,
+        status="posted",
+        direction="issue",
+    )
+    db_session.add(issue)
+    db_session.commit()
+
+    with pytest.raises(ValueError, match="проведённое"):
+        delete_material_issue(db_session, issue.issue_id)
+
+    assert db_session.query(ProductionMaterialIssue).filter_by(issue_id=issue.issue_id).one_or_none() is not None
+
+
+def test_delete_material_issue_blocks_posted_sync_link(db_session):
+    parent = Item(item_code="P-DELLINK", item_name="Parent link delete", unit="шт", status="active")
+    db_session.add(parent)
+    db_session.flush()
+    order = ProductionOrder(
+        order_number="DEL-LINK-001",
+        order_date=datetime(2026, 5, 20),
+        order_ref1c="order-delete-link",
+        is_posted=True,
+        deletion_mark=False,
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(order_id=order.order_id, item_id=parent.item_id, line_number=1, quantity=1, produced_qty=0, remaining_qty=1)
+    db_session.add(product)
+    db_session.flush()
+    issue = ProductionMaterialIssue(
+        document_number="MT-LINK-DEL",
+        product_id=product.product_id,
+        order_id=order.order_id,
+        status="exported",
+        direction="issue",
+        exported_ref1c="posted-in-1c-ref",
+    )
+    db_session.add(issue)
+    db_session.flush()
+    db_session.add(
+        SyncLink(
+            source_doctype="material_issue",
+            source_id=issue.issue_id,
+            target_entity="Document_ПеремещениеЗапасов",
+            target_ref_key="posted-in-1c-ref",
+            target_number="MT-LINK-DEL",
+            status="posted",
+        )
+    )
+    db_session.commit()
+
+    with pytest.raises(ValueError, match="проведённое"):
+        delete_material_issue(db_session, issue.issue_id)
+
+    assert db_session.query(ProductionMaterialIssue).filter_by(issue_id=issue.issue_id).one_or_none() is not None
 
 
 def test_material_issue_journal_shows_warehouse_names_and_filters_source(db_session):

@@ -780,6 +780,82 @@ def list_material_issues(
     }
 
 
+def delete_material_issue(db: Session, issue_id: int) -> Dict[str, Any]:
+    issue = (
+        db.query(ProductionMaterialIssue)
+        .options(
+            joinedload(ProductionMaterialIssue.lines),
+            joinedload(ProductionMaterialIssue.product),
+        )
+        .filter(ProductionMaterialIssue.issue_id == int(issue_id))
+        .one_or_none()
+    )
+    if issue is None:
+        raise ValueError("Заявка на перемещение не найдена")
+
+    link = (
+        db.query(SyncLink)
+        .filter(
+            SyncLink.source_system == "PRODPLAN",
+            SyncLink.source_doctype == "material_issue",
+            SyncLink.source_id == int(issue.issue_id),
+            SyncLink.target_entity == STOCK_TRANSFER_ENTITY,
+        )
+        .one_or_none()
+    )
+    if str(issue.status or "").lower() == "posted" or (link is not None and str(link.status or "").lower() == "posted"):
+        raise ValueError("Нельзя удалить перемещение, уже проведённое в 1С")
+
+    product_id = int(issue.product_id)
+    deleted = {
+        "issue_id": int(issue.issue_id),
+        "document_number": str(issue.document_number or ""),
+        "product_id": product_id,
+        "order_id": int(issue.order_id),
+    }
+    if link is not None:
+        db.delete(link)
+    db.delete(issue)
+    db.flush()
+
+    state = (
+        db.query(ProductionOrderLineState)
+        .filter(ProductionOrderLineState.product_id == product_id)
+        .one_or_none()
+    )
+    if state is not None:
+        remaining = (
+            db.query(ProductionMaterialIssue)
+            .filter(
+                ProductionMaterialIssue.product_id == product_id,
+                ProductionMaterialIssue.direction == "issue",
+                ProductionMaterialIssue.status != "cancelled",
+            )
+            .all()
+        )
+        if any(str(row.status or "").lower() == "posted" for row in remaining):
+            state.issue_status = "posted"
+            if state.status in {"shortage", "partial", "ready", "to_move"}:
+                state.status = "assembled"
+        elif any(str(row.status or "").lower() == "exported" for row in remaining):
+            state.issue_status = "exported"
+            if state.status in {"shortage", "partial", "ready"}:
+                state.status = "to_move"
+        elif any(str(row.status or "").lower() in {"draft", "requested", "issued"} for row in remaining):
+            state.issue_status = "requested"
+            if state.status in {"shortage", "partial", "ready"}:
+                state.status = "to_move"
+        elif any(str(row.status or "").lower() == "error" for row in remaining):
+            state.issue_status = "error"
+        else:
+            state.issue_status = "not_requested"
+            if state.status in {"to_move", "assembled"}:
+                state.status = "ready"
+
+    db.commit()
+    return {"status": "deleted", **deleted}
+
+
 def assemble_material_issue(
     db: Session,
     issue_id: int,

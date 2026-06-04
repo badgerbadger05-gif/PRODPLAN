@@ -18,6 +18,7 @@ from ..services.one_c_stock_transfer_export import export_material_issues_to_1c
 from ..services.production_control_material_issues import (
     assemble_material_issue,
     create_material_issues,
+    delete_material_issue,
     export_issue_to_1c,
     get_issue,
     list_material_issues,
@@ -469,6 +470,16 @@ def get_material_issue(issue_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/material-issues/{issue_id}", response_model=dict)
+def delete_material_issue_route(issue_id: int, db: Session = Depends(get_db)):
+    try:
+        return delete_material_issue(db, int(issue_id))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/material-issues/export-to-1c", response_model=dict)
