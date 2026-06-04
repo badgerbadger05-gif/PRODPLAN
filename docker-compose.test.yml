@@ -1,19 +1,19 @@
-name: prodplan-next-test
+name: prodplan
 
 services:
   db:
     image: postgres:15
     restart: unless-stopped
     environment:
-      POSTGRES_DB: ${PRODPLAN_NEXT_POSTGRES_DB:-prodplan_next}
-      POSTGRES_USER: ${PRODPLAN_NEXT_POSTGRES_USER:-prodplan_next}
-      POSTGRES_PASSWORD: ${PRODPLAN_NEXT_POSTGRES_PASSWORD:-prodplan_next_password_change_me}
+      POSTGRES_DB: ${PRODPLAN_POSTGRES_DB:-prodplan}
+      POSTGRES_USER: ${PRODPLAN_POSTGRES_USER:-prodplan}
+      POSTGRES_PASSWORD: ${PRODPLAN_POSTGRES_PASSWORD:-prodplan_password_change_me}
     volumes:
-      - prodplan_next_postgres_data:/var/lib/postgresql/data
+      - prodplan_postgres_data:/var/lib/postgresql/data
     ports:
-      - "${PRODPLAN_NEXT_POSTGRES_HOST_PORT:-55433}:5432"
+      - "${PRODPLAN_POSTGRES_HOST_PORT:-55433}:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${PRODPLAN_NEXT_POSTGRES_USER:-prodplan_next} -d ${PRODPLAN_NEXT_POSTGRES_DB:-prodplan_next}"]
+      test: ["CMD-SHELL", "pg_isready -U ${PRODPLAN_POSTGRES_USER:-prodplan} -d ${PRODPLAN_POSTGRES_DB:-prodplan}"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -26,12 +26,12 @@ services:
         INSTALL_DEV: "false"
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgresql://${PRODPLAN_NEXT_POSTGRES_USER:-prodplan_next}:${PRODPLAN_NEXT_POSTGRES_PASSWORD:-prodplan_next_password_change_me}@db:5432/${PRODPLAN_NEXT_POSTGRES_DB:-prodplan_next}
+      DATABASE_URL: postgresql://${PRODPLAN_POSTGRES_USER:-prodplan}:${PRODPLAN_POSTGRES_PASSWORD:-prodplan_password_change_me}@db:5432/${PRODPLAN_POSTGRES_DB:-prodplan}
     depends_on:
       db:
         condition: service_healthy
     ports:
-      - "${PRODPLAN_NEXT_BACKEND_PORT:-8010}:8000"
+      - "${PRODPLAN_BACKEND_PORT:-8010}:8000"
     volumes:
       - ./config-test:/app/config
       - ./output-test:/app/output
@@ -52,7 +52,7 @@ services:
       backend:
         condition: service_healthy
     ports:
-      - "${PRODPLAN_NEXT_FRONTEND_PORT:-9010}:80"
+      - "${PRODPLAN_FRONTEND_PORT:-9010}:80"
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
       interval: 10s
@@ -69,7 +69,7 @@ services:
     command: ["python", "sync_worker.py"]
     environment:
       SYNC_BASE_URL: "http://backend:8000"
-      SYNC_TICK_INTERVAL_SECONDS: "${PRODPLAN_NEXT_SYNC_TICK_INTERVAL_SECONDS:-120}"
+      SYNC_TICK_INTERVAL_SECONDS: "${PRODPLAN_SYNC_TICK_INTERVAL_SECONDS:-120}"
     depends_on:
       backend:
         condition: service_healthy
@@ -83,10 +83,10 @@ services:
     command: ["python", "reconcile_worker.py"]
     environment:
       RECONCILE_BASE_URL: "http://backend:8000"
-      RECONCILE_INTERVAL_SECONDS: "${PRODPLAN_NEXT_RECONCILE_INTERVAL_SECONDS:-10800}"
+      RECONCILE_INTERVAL_SECONDS: "${PRODPLAN_RECONCILE_INTERVAL_SECONDS:-10800}"
     depends_on:
       backend:
         condition: service_healthy
 
 volumes:
-  prodplan_next_postgres_data:
+  prodplan_postgres_data:
