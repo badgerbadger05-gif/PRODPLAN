@@ -888,6 +888,7 @@ def list_journal(
         .filter(ProductionOrder.deletion_mark == False)
         .filter(or_(ProductionOrder.order_state_key.is_(None), func.lower(ProductionOrder.order_state_key) != DONE_STATE_KEY))
         .filter(func.coalesce(ProductionProduct.remaining_qty, ProductionProduct.quantity) > 0)
+        .filter(func.coalesce(ProductionOrderLineState.status, "shortage").notin_(tuple(_TERMINAL_LINE_STATUSES)))
         .options(
             joinedload(ProductionProduct.order),
             joinedload(ProductionProduct.item),

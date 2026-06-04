@@ -361,31 +361,31 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int]) -> str:
   <meta charset="utf-8">
   <title>Маршрутные листы</title>
   <style>
-    @page {{ size: A4 landscape; margin: 7mm; }}
+    @page {{ size: A4 portrait; margin: 5mm; }}
     body {{ font-family: "Times New Roman", serif; color: #000; margin: 0; }}
     .toolbar {{ position: sticky; top: 0; padding: 8px; background: #f4f6f8; border-bottom: 1px solid #cfd8dc; font-family: Arial, sans-serif; }}
     .toolbar button {{ padding: 6px 12px; }}
-    .sheet {{ page-break-after: always; padding: 6px; }}
-    table.route {{ border-collapse: collapse; width: 100%; table-layout: fixed; font-size: 13px; }}
-    .route td, .route th {{ border: 1px solid #000; padding: 3px 5px; vertical-align: top; overflow-wrap: anywhere; }}
+    .sheet {{ page-break-after: always; padding: 3px; }}
+    table.route {{ border-collapse: collapse; width: 100%; table-layout: fixed; font-size: 10.5px; line-height: 1.12; }}
+    .route td, .route th {{ border: 1px solid #000; padding: 2px 3px; vertical-align: top; overflow-wrap: anywhere; }}
     .c-num {{ width: 4%; }}
-    .c-material {{ width: 26%; }}
-    .c-article {{ width: 13%; }}
+    .c-material {{ width: 23%; }}
+    .c-article {{ width: 12%; }}
     .c-qty {{ width: 8%; }}
     .c-worker {{ width: 14%; }}
     .c-presented {{ width: 8%; }}
-    .c-nonconforming {{ width: 7%; }}
+    .c-nonconforming {{ width: 8%; }}
     .c-good {{ width: 7%; }}
-    .c-otk {{ width: 10%; }}
-    .title {{ font-size: 16px; line-height: 1.2; }}
-    .title span {{ font-size: 14px; }}
-    .order {{ font-size: 14px; line-height: 1.25; }}
-    .product-name, .product-article {{ font-size: 14px; line-height: 1.25; }}
+    .c-otk {{ width: 8%; }}
+    .title {{ font-size: 13px; line-height: 1.15; }}
+    .title span {{ font-size: 11px; }}
+    .order {{ font-size: 11.5px; line-height: 1.15; }}
+    .product-name, .product-article {{ font-size: 11.5px; line-height: 1.15; }}
     th {{ text-align: center; font-weight: bold; }}
     .num {{ text-align: center; white-space: nowrap; }}
     .text {{ text-align: left; }}
-    .signature {{ height: 28px; color: #555; font-size: 11px; text-align: center; vertical-align: bottom; }}
-    .notes {{ height: 90px; }}
+    .signature {{ height: 20px; color: #555; font-size: 8.5px; line-height: 1.05; text-align: center; vertical-align: bottom; }}
+    .notes {{ height: 45px; }}
     @media print {{ .toolbar {{ display: none; }} .sheet {{ padding: 0; }} }}
   </style>
 </head>
