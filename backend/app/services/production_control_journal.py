@@ -14,6 +14,7 @@ from ..models import (
     PlanningRun,
     ProductionPlanHeader,
     ProductionMaterialIssue,
+    ProductionManufacture,
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
@@ -942,6 +943,187 @@ def _adjust_requirement_coverage(db: Session, product: ProductionProduct, delta_
 # going to be made on this line, so its coverage must be released back to the
 # requirement.
 _TERMINAL_LINE_STATUSES = {"completed", "cancelled"}
+
+
+def _is_active_mrp_duplicate_candidate(product: ProductionProduct) -> bool:
+    order = product.order
+    state = getattr(product, "control_state", None)
+    if getattr(order, "deletion_mark", False):
+        return False
+    if str(getattr(order, "order_state_key", "") or "").lower() == DONE_STATE_KEY:
+        return False
+    if str(getattr(state, "status", "") or "") in _TERMINAL_LINE_STATUSES:
+        return False
+    return _to_float(product.remaining_qty) > 1e-9
+
+
+def _cleanup_blockers_for_duplicate_product(db: Session, product: ProductionProduct) -> List[str]:
+    blockers: List[str] = []
+    state = getattr(product, "control_state", None)
+    line_status = str(getattr(state, "status", "") or "shortage")
+    if line_status not in {"shortage", "partial", "ready"}:
+        blockers.append(f"статус строки {line_status}")
+    if _to_float(product.produced_qty) > 1e-9:
+        blockers.append("есть выпущенное количество")
+    if abs(_to_float(product.quantity) - _to_float(product.remaining_qty)) > 1e-9:
+        blockers.append("количество строки уже менялось выпуском")
+    issue_count = (
+        db.query(ProductionMaterialIssue)
+        .filter(ProductionMaterialIssue.product_id == int(product.product_id))
+        .count()
+    )
+    if issue_count:
+        blockers.append("есть заявки на перемещение")
+    manufacture_count = (
+        db.query(ProductionManufacture)
+        .filter(ProductionManufacture.product_id == int(product.product_id))
+        .count()
+    )
+    if manufacture_count:
+        blockers.append("есть выпуск/сборка")
+    sync_count = (
+        db.query(SyncLink)
+        .filter(
+            SyncLink.source_system == "PRODPLAN",
+            SyncLink.source_doctype == "production_order",
+            SyncLink.source_id == int(product.order_id),
+            SyncLink.target_entity == PRODUCTION_ORDER_ENTITY,
+        )
+        .count()
+    )
+    if sync_count:
+        blockers.append("заказ связан с 1С")
+    order_line_count = (
+        db.query(ProductionProduct)
+        .filter(ProductionProduct.order_id == int(product.order_id))
+        .count()
+    )
+    if order_line_count != 1:
+        blockers.append("в заказе есть другие строки")
+    return blockers
+
+
+def cleanup_mrp_requirement_duplicate_orders(
+    db: Session,
+    *,
+    requirement_ids: Optional[Sequence[int]] = None,
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """
+    Remove old duplicate production journal rows created for the same
+    MrpRequirement before idempotency was fixed.
+
+    Safety policy:
+    - group only active rows linked by source_mrp_requirement_id;
+    - keep one row per requirement, preferring rows that already have movement,
+      production, or 1C links;
+    - delete only empty local duplicate orders with no material issues,
+      manufactures, or 1C sync links.
+    """
+    query = (
+        db.query(ProductionProduct)
+        .options(
+            joinedload(ProductionProduct.order),
+            joinedload(ProductionProduct.item),
+            joinedload(ProductionProduct.control_state),
+        )
+        .filter(ProductionProduct.source_mrp_requirement_id.isnot(None))
+    )
+    if requirement_ids:
+        ids = [int(x) for x in requirement_ids]
+        query = query.filter(ProductionProduct.source_mrp_requirement_id.in_(ids))
+    products = query.order_by(
+        ProductionProduct.source_mrp_requirement_id.asc(),
+        ProductionProduct.product_id.asc(),
+    ).all()
+
+    by_requirement: Dict[int, List[ProductionProduct]] = {}
+    for product in products:
+        if not _is_active_mrp_duplicate_candidate(product):
+            continue
+        by_requirement.setdefault(int(product.source_mrp_requirement_id), []).append(product)
+
+    deleted: List[Dict[str, Any]] = []
+    kept: List[Dict[str, Any]] = []
+    blocked: List[Dict[str, Any]] = []
+    scanned_groups = 0
+
+    for rid, group in sorted(by_requirement.items()):
+        if len(group) <= 1:
+            continue
+        scanned_groups += 1
+
+        def keeper_score(product: ProductionProduct) -> Tuple[int, int]:
+            blockers = _cleanup_blockers_for_duplicate_product(db, product)
+            return (1 if blockers else 0, -int(product.product_id))
+
+        keeper = max(group, key=keeper_score)
+        kept.append({
+            "requirement_id": rid,
+            "product_id": int(keeper.product_id),
+            "order_id": int(keeper.order_id),
+            "order_number": str(keeper.order.order_number or ""),
+            "qty": _to_float(keeper.quantity),
+        })
+
+        for product in group:
+            if int(product.product_id) == int(keeper.product_id):
+                continue
+            blockers = _cleanup_blockers_for_duplicate_product(db, product)
+            row = {
+                "requirement_id": rid,
+                "product_id": int(product.product_id),
+                "order_id": int(product.order_id),
+                "order_number": str(product.order.order_number or ""),
+                "item_id": int(product.item_id),
+                "item_name": str(product.item.item_name or "") if product.item else "",
+                "qty": _to_float(product.quantity),
+            }
+            if blockers:
+                blocked.append({**row, "reasons": blockers})
+                continue
+            deleted.append(row)
+            if not dry_run:
+                state = getattr(product, "control_state", None)
+                if state is not None:
+                    db.delete(state)
+                    db.flush()
+                order = product.order
+                db.delete(product)
+                db.flush()
+                db.delete(order)
+                db.flush()
+
+        if not dry_run:
+            req = db.query(MrpRequirement).filter(MrpRequirement.id == rid).first()
+            if req is not None:
+                remaining_active_qty = sum(
+                    _to_float(product.quantity)
+                    for product in group
+                    if int(product.product_id) == int(keeper.product_id)
+                    or all(
+                        int(product.product_id) != int(row["product_id"])
+                        for row in deleted
+                        if int(row["requirement_id"]) == rid
+                    )
+                )
+                net_qty = _to_float(req.net_required_qty)
+                req.covered_qty = min(remaining_active_qty, net_qty)
+                req.remaining_qty = max(net_qty - _to_float(req.covered_qty), 0.0)
+
+    if not dry_run:
+        db.commit()
+
+    return {
+        "status": "ok",
+        "dry_run": bool(dry_run),
+        "scanned_groups": scanned_groups,
+        "deleted": deleted,
+        "kept": kept,
+        "blocked": blocked,
+        "deleted_count": len(deleted),
+        "blocked_count": len(blocked),
+    }
 
 
 def update_line_state(db: Session, product_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:

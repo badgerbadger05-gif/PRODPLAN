@@ -24,6 +24,7 @@ from ..services.production_control_material_issues import (
     list_material_issues,
 )
 from ..services.production_control_journal import (
+    cleanup_mrp_requirement_duplicate_orders,
     create_orders_from_mrp,
     create_production_orders_from_mrp_requirements,
     list_journal,
@@ -99,6 +100,11 @@ class OrdersFromMrpPayload(BaseModel):
 class OrdersFromMrpRequirementsPayload(BaseModel):
     requirement_ids: List[int]
     initiated_by: Optional[str] = None
+
+
+class CleanupMrpDuplicatesPayload(BaseModel):
+    requirement_ids: Optional[List[int]] = None
+    dry_run: bool = True
 
 
 class UpdateQuantityPayload(BaseModel):
@@ -383,6 +389,21 @@ def post_orders_from_mrp_requirements(
             db,
             [int(x) for x in payload.requirement_ids],
             initiated_by=payload.initiated_by,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/orders/cleanup-mrp-duplicates", response_model=dict)
+def post_cleanup_mrp_duplicate_orders(
+    payload: CleanupMrpDuplicatesPayload,
+    db: Session = Depends(get_db),
+):
+    try:
+        return cleanup_mrp_requirement_duplicate_orders(
+            db,
+            requirement_ids=payload.requirement_ids,
+            dry_run=payload.dry_run,
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

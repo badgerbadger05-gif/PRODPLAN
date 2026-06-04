@@ -28,6 +28,7 @@ from app.models import (
 )
 from app.routers.production_control import list_employees
 from app.services.production_control_journal import (
+    cleanup_mrp_requirement_duplicate_orders,
     create_orders_from_mrp,
     create_production_orders_from_mrp_requirements,
     list_journal,
@@ -423,6 +424,157 @@ def test_fill_remaining_reuses_active_order_when_it_already_covers_requirement(d
         .all()
     )
     assert len(products) == 1
+
+
+def test_cleanup_mrp_duplicates_deletes_only_empty_duplicate_orders(db_session):
+    item = Item(
+        item_code="MRP-CLEAN",
+        item_name="MRP cleanup item",
+        unit="шт",
+        stock_qty=0,
+        replenishment_method="Производство",
+        status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+    run = PlanningRun(status="FIXED_SNAPSHOT", started_at=datetime(2026, 5, 27))
+    db_session.add(run)
+    db_session.flush()
+    req = MrpRequirement(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        total_required_qty=23,
+        net_required_qty=23,
+        covered_qty=23,
+        remaining_qty=0,
+        period_from=_dt.date(2026, 6, 1),
+        period_to=_dt.date(2026, 6, 30),
+        bom_level=0,
+    )
+    db_session.add(req)
+    db_session.flush()
+    products = []
+    for suffix in ("A", "B"):
+        order = ProductionOrder(
+            order_number=f"MRP-R-CLEAN-{suffix}",
+            order_date=datetime(2026, 5, 27),
+            deletion_mark=False,
+            source="mrp",
+            source_run_id=run.run_id,
+        )
+        db_session.add(order)
+        db_session.flush()
+        product = ProductionProduct(
+            order_id=order.order_id,
+            item_id=item.item_id,
+            line_number=1,
+            quantity=23,
+            produced_qty=0,
+            remaining_qty=23,
+            source_mrp_requirement_id=req.id,
+            source_mrp_allocation_key=f"mrp_requirement:{req.id}:order:{suffix}",
+        )
+        db_session.add(product)
+        db_session.flush()
+        db_session.add(ProductionOrderLineState(product_id=product.product_id, status="ready"))
+        products.append(product)
+    db_session.commit()
+
+    dry = cleanup_mrp_requirement_duplicate_orders(db_session, requirement_ids=[req.id], dry_run=True)
+    assert dry["deleted_count"] == 1
+    assert db_session.query(ProductionProduct).filter(ProductionProduct.source_mrp_requirement_id == req.id).count() == 2
+
+    result = cleanup_mrp_requirement_duplicate_orders(db_session, requirement_ids=[req.id], dry_run=False)
+
+    assert result["deleted_count"] == 1
+    assert result["blocked"] == []
+    remaining_products = (
+        db_session.query(ProductionProduct)
+        .filter(ProductionProduct.source_mrp_requirement_id == req.id)
+        .all()
+    )
+    assert len(remaining_products) == 1
+    assert remaining_products[0].product_id == products[0].product_id
+    assert db_session.query(ProductionOrder).filter(ProductionOrder.order_number == "MRP-R-CLEAN-B").one_or_none() is None
+    db_session.refresh(req)
+    assert float(req.covered_qty) == 23
+    assert float(req.remaining_qty) == 0
+
+
+def test_cleanup_mrp_duplicates_blocks_rows_with_material_documents(db_session):
+    item = Item(
+        item_code="MRP-CLEAN-BLOCK",
+        item_name="MRP cleanup blocked item",
+        unit="шт",
+        stock_qty=0,
+        replenishment_method="Производство",
+        status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+    run = PlanningRun(status="FIXED_SNAPSHOT", started_at=datetime(2026, 5, 27))
+    db_session.add(run)
+    db_session.flush()
+    req = MrpRequirement(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        total_required_qty=23,
+        net_required_qty=23,
+        covered_qty=23,
+        remaining_qty=0,
+        period_from=_dt.date(2026, 6, 1),
+        period_to=_dt.date(2026, 6, 30),
+        bom_level=0,
+    )
+    db_session.add(req)
+    db_session.flush()
+    products = []
+    for suffix in ("A", "B"):
+        order = ProductionOrder(
+            order_number=f"MRP-R-CLEAN-BLOCK-{suffix}",
+            order_date=datetime(2026, 5, 27),
+            deletion_mark=False,
+            source="mrp",
+            source_run_id=run.run_id,
+        )
+        db_session.add(order)
+        db_session.flush()
+        product = ProductionProduct(
+            order_id=order.order_id,
+            item_id=item.item_id,
+            line_number=1,
+            quantity=23,
+            produced_qty=0,
+            remaining_qty=23,
+            source_mrp_requirement_id=req.id,
+            source_mrp_allocation_key=f"mrp_requirement:{req.id}:order:{suffix}",
+        )
+        db_session.add(product)
+        db_session.flush()
+        db_session.add(ProductionOrderLineState(product_id=product.product_id, status="ready"))
+        issue = ProductionMaterialIssue(
+            document_number=f"MT-CLEAN-{suffix}",
+            product_id=product.product_id,
+            order_id=order.order_id,
+            status="requested",
+            direction="issue",
+        )
+        db_session.add(issue)
+        products.append(product)
+    db_session.commit()
+
+    result = cleanup_mrp_requirement_duplicate_orders(db_session, requirement_ids=[req.id], dry_run=False)
+
+    assert result["deleted"] == []
+    assert result["blocked_count"] == 1
+    assert "есть заявки на перемещение" in result["blocked"][0]["reasons"]
+    remaining_ids = {
+        row.product_id
+        for row in db_session.query(ProductionProduct)
+        .filter(ProductionProduct.source_mrp_requirement_id == req.id)
+        .all()
+    }
+    assert remaining_ids == {products[0].product_id, products[1].product_id}
 
 
 def test_journal_splits_work_status_from_material_coverage(db_session):
