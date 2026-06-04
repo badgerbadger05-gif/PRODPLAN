@@ -496,39 +496,11 @@ def create_production_orders_from_mrp_requirements(
             })
             continue
 
-        qty = remaining
         existing_count = (
             db.query(ProductionProduct)
             .filter(ProductionProduct.source_mrp_requirement_id == rid)
             .count()
         )
-        order_number = f"MRP-R-{rid}" if existing_count <= 0 else f"MRP-R-{rid}-{existing_count + 1}"
-        order = ProductionOrder(
-            order_number=order_number,
-            order_date=today,
-            order_ref1c=None,
-            is_posted=False,
-            deletion_mark=False,
-            source="mrp",
-            source_run_id=int(req.run_id),
-        )
-        db.add(order)
-        db.flush()
-
-        product = ProductionProduct(
-            order_id=int(order.order_id),
-            item_id=int(req.item_id),
-            line_number=1,
-            quantity=qty,
-            produced_qty=0,
-            remaining_qty=qty,
-            spec_id=_default_spec_id_for_item(db, int(req.item_id)),
-            source_mrp_requirement_id=rid,
-            source_mrp_allocation_key=f"mrp_requirement:{rid}:order:{existing_count + 1}",
-        )
-        db.add(product)
-        db.flush()
-
         planned_tasks = (
             db.query(PlannedOrder)
             .filter(
@@ -539,31 +511,64 @@ def create_production_orders_from_mrp_requirements(
         )
         planned_start = min((task.start_date for task in planned_tasks if task.start_date), default=req.period_from)
         planned_finish = max((task.finish_date or task.need_date for task in planned_tasks if task.finish_date or task.need_date), default=req.period_to)
+        spec_id = _default_spec_id_for_item(db, int(req.item_id))
+        batches = _split_qty_by_optimal_batch(remaining, getattr(item, "optimal_batch", None))
+        created_total = 0.0
 
-        state = ProductionOrderLineState(
-            product_id=int(product.product_id),
-            status="shortage",
-            issue_status="not_requested",
-            planned_start_date=planned_start,
-            planned_finish_date=planned_finish,
-        )
-        db.add(state)
+        for index, qty in enumerate(batches, start=1):
+            seq = existing_count + index
+            order_number = f"MRP-R-{rid}" if seq == 1 and len(batches) == 1 else f"MRP-R-{rid}-{seq}"
+            order = ProductionOrder(
+                order_number=order_number,
+                order_date=today,
+                order_ref1c=None,
+                is_posted=False,
+                deletion_mark=False,
+                source="mrp",
+                source_run_id=int(req.run_id),
+            )
+            db.add(order)
+            db.flush()
+
+            product = ProductionProduct(
+                order_id=int(order.order_id),
+                item_id=int(req.item_id),
+                line_number=1,
+                quantity=qty,
+                produced_qty=0,
+                remaining_qty=qty,
+                spec_id=spec_id,
+                source_mrp_requirement_id=rid,
+                source_mrp_allocation_key=f"mrp_requirement:{rid}:order:{seq}",
+            )
+            db.add(product)
+            db.flush()
+
+            state = ProductionOrderLineState(
+                product_id=int(product.product_id),
+                status="shortage",
+                issue_status="not_requested",
+                planned_start_date=planned_start,
+                planned_finish_date=planned_finish,
+            )
+            db.add(state)
+
+            created_total += _to_float(qty)
+            created.append({
+                "requirement_id": rid,
+                "product_id": int(product.product_id),
+                "order_id": int(order.order_id),
+                "order_number": order_number,
+                "item_id": int(req.item_id),
+                "item_name": str(item.item_name or ""),
+                "qty": qty,
+            })
 
         # Reflect coverage in the requirement row
         net_qty = _to_float(req.net_required_qty)
-        new_covered = min(_to_float(req.covered_qty) + qty, net_qty)
+        new_covered = min(_to_float(req.covered_qty) + created_total, net_qty)
         req.covered_qty = new_covered
         req.remaining_qty = max(net_qty - new_covered, 0.0)
-
-        created.append({
-            "requirement_id": rid,
-            "product_id": int(product.product_id),
-            "order_id": int(order.order_id),
-            "order_number": order_number,
-            "item_id": int(req.item_id),
-            "item_name": str(item.item_name or ""),
-            "qty": qty,
-        })
 
     db.commit()
     return {
@@ -574,6 +579,23 @@ def create_production_orders_from_mrp_requirements(
         "errors": errors,
         "initiated_by": initiated_by,
     }
+
+
+def _split_qty_by_optimal_batch(qty: float, optimal_batch: Optional[float]) -> List[float]:
+    total = _to_float(qty)
+    batch = _to_float(optimal_batch)
+    if total <= 1e-9:
+        return []
+    if batch <= 1e-9 or batch >= total - 1e-9:
+        return [total]
+
+    result: List[float] = []
+    remaining = total
+    while remaining > 1e-9:
+        part = min(batch, remaining)
+        result.append(float(part))
+        remaining -= part
+    return result
 
 
 def _default_spec_id_for_item(db: Session, item_id: int) -> Optional[int]:

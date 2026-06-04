@@ -255,6 +255,77 @@ def test_execution_journal_does_not_count_planned_task_as_ordered(db_session):
     assert row["work_items"][0]["qty"] == 10
 
 
+def test_execution_journal_uses_existing_orders_as_progress_base_when_net_is_zero(db_session):
+    bucket = date(2026, 6, 2)
+    item = Item(
+        item_code="MAKE-WIP",
+        item_name="Деталь уже в заказах",
+        item_article="MAKE-WIP",
+        unit="шт",
+        stock_qty=0,
+        replenishment_method="Производство",
+        status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+    plan = _make_fixed_plan(db_session, item, bucket, qty=94.0)
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        source_plan_id=plan.id,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        started_at=datetime.datetime(2026, 5, 26, 5, 25),
+        finished_at=datetime.datetime(2026, 5, 26, 5, 25),
+    )
+    db_session.add(run)
+    db_session.flush()
+    req = MrpRequirement(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        total_required_qty=94,
+        net_required_qty=0,
+        covered_qty=0,
+        remaining_qty=0,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        bom_level=1,
+    )
+    db_session.add(req)
+    db_session.flush()
+    order = ProductionOrder(
+        order_number="MRP-R-WIP",
+        order_date=datetime.datetime(2026, 5, 27),
+        is_posted=False,
+        deletion_mark=False,
+        source="mrp",
+        source_run_id=run.run_id,
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=item.item_id,
+        line_number=1,
+        quantity=65,
+        produced_qty=0,
+        remaining_qty=65,
+        source_mrp_requirement_id=req.id,
+    )
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(ProductionOrderLineState(product_id=product.product_id, status="shortage"))
+    db_session.commit()
+
+    row = get_period_plan_execution_journal(db_session, plan.id, run_id=run.run_id)["rows"][0]
+
+    assert row["net_qty"] == 0
+    assert row["ordered_qty"] == 65
+    assert row["completed_qty"] == 0
+    assert row["remaining_qty"] == 65
+    assert row["progress_base_qty"] == 65
+    assert row["coverage_pct"] == 0
+
+
 def test_execution_journal_counts_supplier_order_accepted_to_stock_as_completed(db_session):
     bucket = date(2026, 6, 2)
     item = _make_purchased_item(db_session, "BUY-DONE")

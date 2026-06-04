@@ -280,30 +280,34 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int]) -> str:
             "<tr>"
             f"<td colspan='2' class='text'>{html.escape(row['workshop_name'] or '—')}</td>"
             f"<td colspan='2' class='text'>{html.escape(row['transfer_number'] or '—')}</td>"
-            f"<td colspan='2' class='text'>{html.escape(row['source_warehouse'] or '—')}</td>"
-            f"<td class='text'>{html.escape(row['destination_warehouse'] or '—')}</td>"
+            f"<td colspan='3' class='text'>{html.escape(row['source_warehouse'] or '—')}</td>"
+            f"<td colspan='3' class='text'>{html.escape(row['destination_warehouse'] or '—')}</td>"
             "</tr>"
             for row in transfer_rows_data
-        ) or "<tr><td colspan='7'>Перемещения материалов не созданы</td></tr>"
+        ) or "<tr><td colspan='10'>Перемещения материалов не созданы</td></tr>"
         component_rows = "".join(
             "<tr>"
             f"<td colspan='2' class='text'>{html.escape(c['item_name'])}</td>"
             f"<td class='text'>{html.escape(c['item_article'])}</td>"
             f"<td class='num'>{c['qty_per_unit']:.3f}</td>"
-            f"<td colspan='3' class='num'>{c['required_qty']:.3f}</td>"
+            f"<td colspan='6' class='num'>{c['required_qty']:.3f}</td>"
             "</tr>"
             for c in components
-        ) or "<tr><td colspan='7'>Материалы по спецификации не найдены</td></tr>"
+        ) or "<tr><td colspan='10'>Материалы по спецификации не найдены</td></tr>"
         op_rows = "".join(
             "<tr>"
             f"<td class='num'>{op['number']}</td>"
             f"<td class='text'>{html.escape(op['stage_name'])}</td>"
             f"<td colspan='2' class='text'>{html.escape(op['operation_name'] or op['stage_name'] or 'Операция')}</td>"
             f"<td class='num'>{op['time_norm']:.3f}</td>"
-            "<td></td><td></td><td></td>"
+            "<td class='signature'>ФИО, подпись, дата</td>"
+            "<td></td>"
+            "<td></td>"
+            "<td></td>"
+            "<td class='signature'>Клеймо, ФИО, подпись, дата</td>"
             "</tr>"
             for op in operations
-        ) or "<tr><td colspan='7'>Операции по спецификации не найдены</td></tr>"
+        ) or "<tr><td colspan='10'>Операции по спецификации не найдены</td></tr>"
         sheets.append(
             f"""
             <section class="sheet">
@@ -315,35 +319,38 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int]) -> str:
                   <col class="c-qty">
                   <col class="c-qty">
                   <col class="c-worker">
+                  <col class="c-presented">
+                  <col class="c-nonconforming">
+                  <col class="c-good">
                   <col class="c-otk">
                 </colgroup>
                 <tr>
-                  <td colspan="4" class="title">{title}<br><span>(Изготовление новых)</span></td>
-                  <td colspan="3" class="order">
+                  <td colspan="5" class="title">{title}<br><span>(Изготовление новых)</span></td>
+                  <td colspan="5" class="order">
                     <b>Заказ PRODPLAN:</b> №{order_number}<br>
                     <b>Номер 1С:</b> {one_c_number}<br>
                     <b>Дата заказа:</b> {html.escape(order_date)}
                   </td>
                 </tr>
                 <tr>
-                  <td colspan="4"><b>Наименование:</b><br>{html.escape(str(product.item.item_name or ""))}</td>
-                  <td><b>Артикул:</b><br>{html.escape(str(product.item.item_article or ""))}</td>
-                  <td colspan="2"><b>Количество:</b><br>{_to_float(product.remaining_qty) or _to_float(product.quantity):g} {html.escape(_unit_display(db, product.item.unit))}</td>
+                  <td colspan="5" class="product-name"><b>Наименование:</b><br>{html.escape(str(product.item.item_name or ""))}</td>
+                  <td class="product-article"><b>Артикул:</b><br>{html.escape(str(product.item.item_article or ""))}</td>
+                  <td colspan="4"><b>Количество:</b><br>{_to_float(product.remaining_qty) or _to_float(product.quantity):g} {html.escape(_unit_display(db, product.item.unit))}</td>
                 </tr>
                 <tr>
-                  <td colspan="4"><b>План:</b><br>{html.escape(route_ctx["plan_name"] or "—")}</td>
+                  <td colspan="5"><b>План:</b><br>{html.escape(route_ctx["plan_name"] or "—")}</td>
                   <td><b>Период:</b><br>{html.escape(route_ctx["plan_period"] or "—")}</td>
-                  <td colspan="2"><b>Корневое изделие:</b><br>{html.escape(route_ctx["root_item"] or "—")}</td>
+                  <td colspan="4"><b>Корневое изделие:</b><br>{html.escape(route_ctx["root_item"] or "—")}</td>
                 </tr>
-                <tr><td colspan="7"><b>Маршрут перемещения материалов</b></td></tr>
-                <tr><th colspan="2">Участок получатель</th><th colspan="2">№ перемещения</th><th colspan="2">Склад отправитель</th><th>Склад получатель</th></tr>
+                <tr><td colspan="10"><b>Маршрут перемещения материалов</b></td></tr>
+                <tr><th colspan="2">Участок получатель</th><th colspan="2">№ перемещения</th><th colspan="3">Склад отправитель</th><th colspan="3">Склад получатель</th></tr>
                 {transfer_rows}
-                <tr><td colspan="7"><b>Материалы и заготовки</b></td></tr>
-                <tr><th colspan="2">Материал</th><th>Артикул</th><th>Кол-во на ед.</th><th colspan="3">Кол-во по заказу</th></tr>
+                <tr><td colspan="10"><b>Материалы и заготовки</b></td></tr>
+                <tr><th colspan="2">Материал</th><th>Артикул</th><th>Кол-во на ед.</th><th colspan="6">Кол-во по заказу</th></tr>
                 {component_rows}
-                <tr><th>№</th><th>Цех / участок</th><th colspan="2">Операция</th><th>Трудоемкость</th><th>Исполнитель</th><th>ОТК</th></tr>
+                <tr><th>№</th><th>Цех / участок</th><th colspan="2">Операция</th><th>Трудоемкость</th><th>Исполнитель</th><th>Предъявлено</th><th>Несоотв.</th><th>Годн.</th><th>ОТК</th></tr>
                 {op_rows}
-                <tr><td colspan="7" class="notes"><b>Дополнительная информация:</b><br><br><br><br></td></tr>
+                <tr><td colspan="10" class="notes"><b>Дополнительная информация:</b><br><br><br><br></td></tr>
               </table>
             </section>
             """
@@ -354,25 +361,30 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int]) -> str:
   <meta charset="utf-8">
   <title>Маршрутные листы</title>
   <style>
-    @page {{ size: A4 portrait; margin: 8mm; }}
+    @page {{ size: A4 landscape; margin: 7mm; }}
     body {{ font-family: "Times New Roman", serif; color: #000; margin: 0; }}
     .toolbar {{ position: sticky; top: 0; padding: 8px; background: #f4f6f8; border-bottom: 1px solid #cfd8dc; font-family: Arial, sans-serif; }}
     .toolbar button {{ padding: 6px 12px; }}
     .sheet {{ page-break-after: always; padding: 6px; }}
-    table.route {{ border-collapse: collapse; width: 100%; table-layout: fixed; font-size: 12px; }}
-    .route td, .route th {{ border: 1px solid #000; padding: 3px 4px; vertical-align: top; overflow-wrap: anywhere; }}
-    .c-num {{ width: 6%; }}
-    .c-material {{ width: 29%; }}
-    .c-article {{ width: 16%; }}
-    .c-qty {{ width: 11%; }}
-    .c-worker {{ width: 17%; }}
+    table.route {{ border-collapse: collapse; width: 100%; table-layout: fixed; font-size: 13px; }}
+    .route td, .route th {{ border: 1px solid #000; padding: 3px 5px; vertical-align: top; overflow-wrap: anywhere; }}
+    .c-num {{ width: 4%; }}
+    .c-material {{ width: 26%; }}
+    .c-article {{ width: 13%; }}
+    .c-qty {{ width: 8%; }}
+    .c-worker {{ width: 14%; }}
+    .c-presented {{ width: 8%; }}
+    .c-nonconforming {{ width: 7%; }}
+    .c-good {{ width: 7%; }}
     .c-otk {{ width: 10%; }}
     .title {{ font-size: 16px; line-height: 1.2; }}
     .title span {{ font-size: 14px; }}
-    .order {{ font-size: 12px; line-height: 1.25; }}
+    .order {{ font-size: 14px; line-height: 1.25; }}
+    .product-name, .product-article {{ font-size: 14px; line-height: 1.25; }}
     th {{ text-align: center; font-weight: bold; }}
     .num {{ text-align: center; white-space: nowrap; }}
     .text {{ text-align: left; }}
+    .signature {{ height: 28px; color: #555; font-size: 11px; text-align: center; vertical-align: bottom; }}
     .notes {{ height: 90px; }}
     @media print {{ .toolbar {{ display: none; }} .sheet {{ padding: 0; }} }}
   </style>

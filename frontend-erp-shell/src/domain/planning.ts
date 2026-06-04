@@ -243,6 +243,7 @@ export type ExecutionJournalRow = {
   covered_qty: number
   remaining_qty: number
   unassigned_qty?: number
+  progress_base_qty?: number
   coverage_pct: number
   forecast_date?: string | null
   forecast_shift_days?: number | null

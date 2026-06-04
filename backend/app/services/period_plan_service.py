@@ -1639,10 +1639,11 @@ def get_period_plan_execution_journal(
             ordered_qty = rework_ordered_by_item.get(item_id, 0.0)
             completed_qty = 0.0
 
-        completed_qty = min(max(0.0, completed_qty), net_qty) if net_qty > 1e-9 else 0.0
-        remaining_qty = max(0.0, net_qty - completed_qty)
+        progress_base_qty = net_qty if net_qty > 1e-9 else ordered_qty
+        completed_qty = min(max(0.0, completed_qty), progress_base_qty) if progress_base_qty > 1e-9 else 0.0
+        remaining_qty = max(0.0, progress_base_qty - completed_qty)
         unassigned_qty = max(0.0, net_qty - ordered_qty)
-        progress_pct = round(completed_qty / net_qty * 100.0, 1) if net_qty > 1e-9 else 100.0
+        progress_pct = round(completed_qty / progress_base_qty * 100.0, 1) if progress_base_qty > 1e-9 else 100.0
         forecast_dates: List[date] = []
         for wi in work_items:
             raw_forecast = wi.get("forecast_date") or wi.get("need_date")
@@ -1671,6 +1672,7 @@ def get_period_plan_execution_journal(
             "covered_qty": completed_qty,
             "remaining_qty": remaining_qty,
             "unassigned_qty": unassigned_qty,
+            "progress_base_qty": progress_base_qty,
             "coverage_pct": progress_pct,
             **row_forecast_payload,
             "work_items": work_items,

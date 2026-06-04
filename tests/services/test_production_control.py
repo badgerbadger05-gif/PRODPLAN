@@ -10,6 +10,7 @@ from app.models import (
     Employee,
     Item,
     MrpRequirement,
+    Operation,
     PlannedOrder,
     PlannedPurchase,
     PlanningRun,
@@ -19,7 +20,9 @@ from app.models import (
     ProductionOrderLineState,
     ProductionProduct,
     ProductionResource,
+    ProductionStage,
     SpecComponent,
+    SpecOperation,
     StockWarehouse,
     Specification,
     SupplierOrder,
@@ -90,6 +93,20 @@ def test_route_sheet_includes_material_transfer_route(db_session):
     )
     db_session.add(order)
     db_session.flush()
+    spec = Specification(spec_name="Спецификация маршрута", spec_ref1c="spec-route")
+    stage = ProductionStage(stage_name="Заготовка", stage_order=1)
+    operation = Operation(operation_ref1c="op-route", operation_name="Шлифовка, заготовка")
+    db_session.add_all([spec, stage, operation])
+    db_session.flush()
+    db_session.add(DefaultSpecification(item_id=item.item_id, spec_id=spec.spec_id))
+    db_session.add(
+        SpecOperation(
+            spec_id=spec.spec_id,
+            stage_id=stage.stage_id,
+            operation_id=operation.operation_id,
+            time_norm=0.005,
+        )
+    )
     product = ProductionProduct(
         order_id=order.order_id,
         item_id=item.item_id,
@@ -127,6 +144,12 @@ def test_route_sheet_includes_material_transfer_route(db_session):
     assert "MT000000123" in html
     assert "Склад металла" in html
     assert "Склад сварки" in html
+    assert "@page { size: A4 landscape; margin: 7mm; }" in html
+    assert "ФИО, подпись, дата" in html
+    assert "Предъявлено" in html
+    assert "Несоотв." in html
+    assert "Годн." in html
+    assert "Клеймо, ФИО, подпись, дата" in html
 
 
 def test_journal_and_material_issue_are_scoped_to_order_line(db_session):
@@ -355,6 +378,59 @@ def test_fill_remaining_creates_top_up_order_for_partially_covered_requirement(d
         .all()
     )
     assert [float(p.quantity) for p in products] == [4, 23]
+
+
+def test_fill_remaining_splits_requirement_by_optimal_batch(db_session):
+    item = Item(
+        item_code="MRP-BATCH",
+        item_name="MRP optimal batch item",
+        unit="шт",
+        stock_qty=0,
+        optimal_batch=12,
+        replenishment_method="Производство",
+        status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+
+    run = PlanningRun(status="FIXED_SNAPSHOT", started_at=datetime(2026, 6, 4))
+    db_session.add(run)
+    db_session.flush()
+    req = MrpRequirement(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        total_required_qty=38,
+        net_required_qty=38,
+        covered_qty=0,
+        remaining_qty=38,
+        period_from=_dt.date(2026, 6, 4),
+        period_to=_dt.date(2026, 6, 8),
+        bom_level=0,
+    )
+    db_session.add(req)
+    db_session.commit()
+
+    result = create_production_orders_from_mrp_requirements(db_session, [req.id])
+
+    assert [float(row["qty"]) for row in result["created"]] == [12, 12, 12, 2]
+    assert result["reused"] == []
+    db_session.refresh(req)
+    assert float(req.covered_qty) == 38
+    assert float(req.remaining_qty) == 0
+
+    products = (
+        db_session.query(ProductionProduct)
+        .filter(ProductionProduct.source_mrp_requirement_id == req.id)
+        .order_by(ProductionProduct.product_id.asc())
+        .all()
+    )
+    assert [float(p.quantity) for p in products] == [12, 12, 12, 2]
+    assert [p.source_mrp_allocation_key for p in products] == [
+        f"mrp_requirement:{req.id}:order:1",
+        f"mrp_requirement:{req.id}:order:2",
+        f"mrp_requirement:{req.id}:order:3",
+        f"mrp_requirement:{req.id}:order:4",
+    ]
 
 
 def test_journal_splits_work_status_from_material_coverage(db_session):

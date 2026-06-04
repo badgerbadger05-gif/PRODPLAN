@@ -443,6 +443,7 @@ type JournalSortKey =
   | 'gross_qty'
   | 'net_qty'
   | 'ordered_qty'
+  | 'unassigned_qty'
   | 'completed_qty'
   | 'remaining_qty'
   | 'coverage_pct'
@@ -455,6 +456,7 @@ const periodPlanJournalColumns = [
   { key: 'gross_qty', title: 'Потребность', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true },
   { key: 'net_qty', title: 'К запуску', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true },
   { key: 'ordered_qty', title: 'В заказах', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true },
+  { key: 'unassigned_qty', title: 'К заказу', width: 104, minWidth: 104, grow: false, align: 'right', className: 'numCell', sortable: true },
   { key: 'completed_qty', title: 'Выполнено', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true },
   { key: 'remaining_qty', title: 'Осталось', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true },
   { key: 'coverage_pct', title: 'Прогресс', width: 96, minWidth: 96, grow: false, align: 'center', sortable: true },
@@ -976,12 +978,12 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   function downloadJournalCsv() {
     if (!journal) return
     const rows = filteredJournalRows
-    const headers = ['Артикул', 'Номенклатура', 'Поток', 'Уровень', 'Потребность', 'К запуску/заказу', 'В заказах', 'Выполнено', 'Осталось', 'Прогресс %', 'Заданий']
+    const headers = ['Артикул', 'Номенклатура', 'Поток', 'Уровень', 'Потребность', 'К запуску/заказу', 'В заказах', 'К заказу', 'Выполнено', 'Осталось', 'Прогресс %', 'Заданий']
     const esc = (v: unknown) => {
       const s = String(v ?? '')
       return /[",;\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
     }
-    const body = rows.map((r) => [r.item_article || r.item_code, r.item_name, flowLabel(r.flow), r.bom_level, r.gross_qty, r.net_qty, r.ordered_qty, r.completed_qty, r.remaining_qty, r.coverage_pct, r.work_items.length].map(esc).join(';'))
+    const body = rows.map((r) => [r.item_article || r.item_code, r.item_name, flowLabel(r.flow), r.bom_level, r.gross_qty, r.net_qty, r.ordered_qty, r.unassigned_qty ?? 0, r.completed_qty, r.remaining_qty, r.coverage_pct, r.work_items.length].map(esc).join(';'))
     const csv = '﻿' + [headers.join(';'), ...body].join('\n')
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
     const url = URL.createObjectURL(blob)
@@ -1513,6 +1515,9 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                           <td className="numCell"><strong>{qty(row.gross_qty)}</strong></td>
                           <td className="numCell"><strong>{qty(row.net_qty)}</strong></td>
                           <td className="numCell">{row.ordered_qty > 0 ? qty(row.ordered_qty) : <span className="muted">—</span>}</td>
+                          <td className="numCell" style={{ color: (row.unassigned_qty ?? 0) > 0 ? 'var(--red)' : undefined }}>
+                            {(row.unassigned_qty ?? 0) > 0 ? qty(row.unassigned_qty ?? 0) : <span className="muted">—</span>}
+                          </td>
                           <td className="numCell">{row.completed_qty > 0 ? qty(row.completed_qty) : <span className="muted">—</span>}</td>
                           <td className="numCell" style={{ color: row.remaining_qty > 0 ? 'var(--red)' : undefined }}>
                             {row.remaining_qty > 0 ? qty(row.remaining_qty) : '—'}
@@ -1570,6 +1575,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                               <td />
                               <td className="numCell">{startedQty !== null ? <strong>{qty(startedQty)}</strong> : '—'}</td>
                               <td className="numCell">{orderedQty !== null ? <strong>{qty(orderedQty)}</strong> : '—'}</td>
+                              <td />
                               <td className="numCell">{wi.completed_qty !== undefined && wi.completed_qty > 0 ? qty(wi.completed_qty) : '—'}</td>
                               <td className="numCell">{wi.remaining_qty !== undefined ? qty(wi.remaining_qty) : '—'}</td>
                               <td style={{ textAlign: 'center' }}>
@@ -1583,7 +1589,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                       </React.Fragment>
                     ))}
                     {!filteredJournalRows.length && (
-                      <tr><td colSpan={11}><div className="emptyDetail">Нет данных по выбранному фильтру</div></td></tr>
+                      <tr><td colSpan={12}><div className="emptyDetail">Нет данных по выбранному фильтру</div></td></tr>
                     )}
                   </tbody>
                 </table>
