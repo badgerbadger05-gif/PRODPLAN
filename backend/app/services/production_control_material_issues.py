@@ -14,6 +14,7 @@ from ..models import (
     ItemWarehouseStock,
     ProductionMaterialIssue,
     ProductionMaterialIssueLine,
+    ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
     ResourceStage,
@@ -36,6 +37,8 @@ from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
 from .one_c_stock_transfer_export import STOCK_TRANSFER_ENTITY
 from .one_c_document_numbers import material_issue_number
+
+PRODUCTION_ORDER_ENTITY = "Document_ЗаказНаПроизводство"
 
 
 def _clean_odata_error_message(error: Exception) -> str:
@@ -274,6 +277,61 @@ def _issue_reuse_payload(
     }
 
 
+def _prodplan_order_display_number(product: Optional[ProductionProduct], order: Optional[ProductionOrder]) -> str:
+    if order is None:
+        return ""
+    order_source = str(order.source or "1c")
+    if order_source != "mrp" or product is None:
+        return str(order.order_number or "")
+
+    run_id = int(order.source_run_id) if order.source_run_id is not None else None
+    planned_order_id = (
+        int(product.source_planned_order_id)
+        if getattr(product, "source_planned_order_id", None) is not None
+        else None
+    )
+    if run_id is not None and planned_order_id is not None:
+        return f"MRP-{run_id}-{planned_order_id}"
+
+    requirement_id = (
+        int(product.source_mrp_requirement_id)
+        if getattr(product, "source_mrp_requirement_id", None) is not None
+        else None
+    )
+    allocation_key = str(product.source_mrp_allocation_key or "")
+    if requirement_id is not None and allocation_key.startswith(f"mrp_requirement:{requirement_id}:order:"):
+        try:
+            seq = int(allocation_key.rsplit(":", 1)[-1])
+        except Exception:
+            seq = 1
+        return f"MRP-R-{requirement_id}" if seq <= 1 else f"MRP-R-{requirement_id}-{seq}"
+
+    if run_id is not None and getattr(product, "item_id", None) is not None:
+        return f"MRP-RC-{run_id}-{int(product.item_id)}"
+
+    return str(order.order_number or "")
+
+
+def _order_one_c_number(db: Session, order: Optional[ProductionOrder]) -> str:
+    if order is None:
+        return ""
+    link = (
+        db.query(SyncLink)
+        .filter(
+            SyncLink.source_system == "PRODPLAN",
+            SyncLink.source_doctype == "production_order",
+            SyncLink.source_id == int(order.order_id),
+            SyncLink.target_entity == PRODUCTION_ORDER_ENTITY,
+        )
+        .one_or_none()
+    )
+    if link and link.target_number:
+        return str(link.target_number)
+    if order.order_ref1c and str(order.source or "1c") == "1c":
+        return str(order.order_number or "")
+    return ""
+
+
 def _sync_existing_issue_lines(
     db: Session,
     issue: ProductionMaterialIssue,
@@ -395,10 +453,10 @@ def create_material_issues(
     Idempotent per the plan: a repeated click on "prepare issue" for the same
     production line must not create a duplicate document.
 
-    If an active non-posted ProductionMaterialIssue already exists for the
-    product, return its descriptor in `reused` instead of creating a new one.
-    Already posted transfers are complete documents; after them a fresh draft
-    may be created for a real delta (for example overproduction).
+    If an existing ProductionMaterialIssue already exists for the product,
+    return its descriptor in `reused` instead of creating a duplicate. Posted
+    transfers are final 1C documents, so re-clicking the action must be a
+    no-op unless a separate delta flow explicitly creates another document.
     """
     created: List[Dict[str, Any]] = []
     reused: List[Dict[str, Any]] = []
@@ -420,7 +478,7 @@ def create_material_issues(
             .options(joinedload(ProductionMaterialIssue.lines))
             .filter(
                 ProductionMaterialIssue.product_id == int(product.product_id),
-                ProductionMaterialIssue.status.in_(("draft", "requested", "issued", "exported", "error")),
+                ProductionMaterialIssue.status.in_(("draft", "requested", "issued", "exported", "posted", "error")),
                 ProductionMaterialIssue.direction == "issue",
             )
             .order_by(ProductionMaterialIssue.issue_id.desc())
@@ -443,13 +501,14 @@ def create_material_issues(
             for existing in existing_rows:
                 if not existing.warehouse_ref1c:
                     existing.warehouse_ref1c = resolved_warehouse
-                _sync_existing_issue_lines(
-                    db,
-                    existing,
-                    components,
-                    spec_id=spec_id,
-                    replace_missing=False,
-                )
+                if str(existing.status or "") != "posted":
+                    _sync_existing_issue_lines(
+                        db,
+                        existing,
+                        components,
+                        spec_id=spec_id,
+                        replace_missing=False,
+                    )
                 reused.append(_issue_reuse_payload(existing, product))
             continue
 
@@ -481,13 +540,14 @@ def create_material_issues(
             if existing is not None:
                 if not existing.warehouse_ref1c:
                     existing.warehouse_ref1c = resolved_warehouse
-                _sync_existing_issue_lines(
-                    db,
-                    existing,
-                    grouped_components,
-                    spec_id=spec_id,
-                    replace_missing=True,
-                )
+                if str(existing.status or "") != "posted":
+                    _sync_existing_issue_lines(
+                        db,
+                        existing,
+                        grouped_components,
+                        spec_id=spec_id,
+                        replace_missing=True,
+                    )
                 reused.append(_issue_reuse_payload(existing, product))
                 continue
 
@@ -622,6 +682,8 @@ def get_issue(db: Session, issue_id: int) -> Dict[str, Any]:
         "source_warehouse_name": _warehouse_display_name(warehouse_names, issue.source_warehouse_ref1c),
         "initiated_by": str(issue.initiated_by or ""),
         "order_number": str(issue.order.order_number or ""),
+        "order_prodplan_number": _prodplan_order_display_number(issue.product, issue.order),
+        "order_one_c_number": _order_one_c_number(db, issue.order),
         "product_id": int(issue.product_id),
         "item_name": str(issue.product.item.item_name or "") if issue.product and issue.product.item else "",
         "item_article": str(issue.product.item.item_article or "") if issue.product and issue.product.item else "",
@@ -689,6 +751,9 @@ def _issue_header(
         "product_id": int(issue.product_id),
         "order_id": int(issue.order_id),
         "order_number": str(issue.order.order_number or "") if issue.order else "",
+        "order_prodplan_number": _prodplan_order_display_number(product, issue.order),
+        "order_one_c_number": _order_one_c_number(db, issue.order),
+        "order_source": str(issue.order.source or "1c") if issue.order else "",
         "order_ref1c": str(issue.order.order_ref1c or "") if issue.order and issue.order.order_ref1c else None,
         "item_id": int(product.item_id) if product else None,
         "item_name": str(item.item_name or "") if item else "",

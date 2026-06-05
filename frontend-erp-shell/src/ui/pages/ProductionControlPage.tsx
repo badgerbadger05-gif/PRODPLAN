@@ -634,7 +634,13 @@ export function ProductionControlPage() {
   }
 
   async function saveOrderQuantity(productId: number, value: number) {
-    const result = await api<{ quantity: number; remaining_qty: number }>(`/v1/production-control/orders/${productId}/quantity`, {
+    const result = await api<{
+      quantity: number
+      remaining_qty: number
+      mrp_req_net_qty?: number | null
+      mrp_req_covered_qty?: number | null
+      mrp_req_remaining_qty?: number | null
+    }>(`/v1/production-control/orders/${productId}/quantity`, {
       method: 'PATCH',
       body: JSON.stringify({ quantity: value }),
     })
@@ -642,6 +648,9 @@ export function ProductionControlPage() {
       ...row,
       quantity: Number(result.quantity ?? value),
       remaining_qty: Number(result.remaining_qty ?? value),
+      mrp_req_net_qty: result.mrp_req_net_qty ?? row.mrp_req_net_qty,
+      mrp_req_covered_qty: result.mrp_req_covered_qty ?? row.mrp_req_covered_qty,
+      mrp_req_remaining_qty: result.mrp_req_remaining_qty ?? row.mrp_req_remaining_qty,
     } : row))
   }
 

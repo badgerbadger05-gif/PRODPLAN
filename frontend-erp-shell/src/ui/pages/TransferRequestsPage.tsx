@@ -27,6 +27,15 @@ function warehouseLabel(name?: string | null, ref?: string | null) {
   return name || ref || '—'
 }
 
+function orderMainLine(row: TransferIssueRow) {
+  return row.order_prodplan_number || row.order_number
+}
+
+function orderSubline(row: TransferIssueRow) {
+  if (row.order_ref1c) return row.order_one_c_number || row.order_number
+  return row.order_ref1c ? row.order_ref1c.slice(0, 8) : 'заказ без Ref_Key'
+}
+
 export function TransferRequestsPage() {
   const [rows, setRows] = useState<TransferIssueRow[]>([])
   const [activeId, setActiveId] = useState<number | null>(null)
@@ -234,9 +243,9 @@ export function TransferRequestsPage() {
                       <strong>{row.document_number}</strong>
                       <span>{dateRu(row.created_at) || '—'} · строк {row.lines_count ?? 0}</span>
                     </td>
-                    <td className="orderCell">
-                      <strong>{row.order_number}</strong>
-                      <span>{row.order_ref1c ? row.order_ref1c.slice(0, 8) : 'заказ без Ref_Key'}</span>
+                    <td className="orderCell transferOrderCell">
+                      <strong>{orderMainLine(row)}</strong>
+                      <span>{orderSubline(row)}</span>
                     </td>
                     <td className="itemCell">
                       <strong>{row.item_name}</strong>
@@ -269,9 +278,14 @@ export function TransferRequestsPage() {
             {activeRow ? (
               <>
                 <div className="detailTitle">{activeRow.item_name}</div>
-                <div className="detailMeta">{activeRow.one_c_number || activeRow.document_number} · {activeRow.order_number}</div>
+                <div className="detailMeta">{activeRow.one_c_number || activeRow.document_number} · {orderMainLine(activeRow)}</div>
                 <div className="detailGrid">
                   <span>Статус</span><strong>{transferStatusLabels[activeRow.status] || activeRow.status}</strong>
+                  {activeRow.order_ref1c && (
+                    <>
+                      <span>Заказ 1С</span><strong>{activeRow.order_one_c_number || activeRow.order_number}</strong>
+                    </>
+                  )}
                   <span>Обеспечение</span><strong>{coverageLabels[String(activeRow.line_status || '')] || activeRow.line_status || '—'}</strong>
                   <span>Отправитель</span><strong>{warehouseLabel(activeRow.source_warehouse_name, activeRow.source_warehouse_ref1c)}</strong>
                   <span>Получатель</span><strong>{warehouseLabel(activeRow.destination_warehouse_name, activeRow.warehouse_ref1c)}</strong>

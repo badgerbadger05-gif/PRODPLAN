@@ -533,6 +533,17 @@ input:focus, select:focus {
   white-space: nowrap;
 }
 
+.transferTable .transferOrderCell,
+.transferTable .transferOrderCell strong,
+.transferTable .transferOrderCell span {
+  white-space: normal;
+}
+
+.transferTable .transferOrderCell strong,
+.transferTable .transferOrderCell span {
+  overflow-wrap: anywhere;
+}
+
 .pill, .miniPill {
   display: inline-flex;
   align-items: center;

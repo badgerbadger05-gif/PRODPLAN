@@ -35,6 +35,7 @@ from app.services.production_control_journal import (
     create_production_orders_from_mrp_requirements,
     dedupe_mrp_production_orders,
     list_journal,
+    update_product_quantity,
 )
 from app.services.production_control_material_availability import preview_materials
 from app.services.production_control_material_issues import create_material_issues, list_material_issues
@@ -228,6 +229,59 @@ def test_journal_and_material_issue_are_scoped_to_order_line(db_session):
     assert journal_after["rows"][0]["issue_count"] == 1
 
 
+def test_journal_exposes_prodplan_number_separately_from_1c_number(db_session):
+    item = Item(
+        item_code="P-ORDER-NUMBERS",
+        item_name="Order number item",
+        item_article="ART-ORDER-NUMBERS",
+        unit="шт",
+        stock_qty=0,
+        status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+
+    order = ProductionOrder(
+        order_number="PP001204945",
+        order_date=datetime(2026, 6, 4),
+        order_ref1c="order-ref-1c",
+        is_posted=False,
+        deletion_mark=False,
+        source="mrp",
+        source_run_id=12,
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=item.item_id,
+        line_number=1,
+        quantity=50,
+        produced_qty=0,
+        remaining_qty=50,
+        source_mrp_requirement_id=14014,
+    )
+    db_session.add(product)
+    db_session.add(
+        SyncLink(
+            source_system="PRODPLAN",
+            source_doctype="production_order",
+            source_id=order.order_id,
+            target_entity="Document_ЗаказНаПроизводство",
+            target_ref_key="order-ref-1c",
+            target_number="PP001204945",
+            status="success",
+        )
+    )
+    db_session.commit()
+
+    row = list_journal(db_session)["rows"][0]
+
+    assert row["order_number"] == "PP001204945"
+    assert row["order_one_c_number"] == "PP001204945"
+    assert row["order_prodplan_number"] == f"MRP-RC-12-{item.item_id}"
+
+
 def test_journal_can_filter_by_product_id(db_session):
     item_a = Item(item_code="P-FLT-A", item_name="Деталь A", unit="шт", stock_qty=0, status="active")
     item_b = Item(item_code="P-FLT-B", item_name="Деталь B", unit="шт", stock_qty=0, status="active")
@@ -312,6 +366,68 @@ def test_journal_exposes_mrp_requirement_coverage_fields(db_session):
     assert row["mrp_req_net_qty"] == 20
     assert row["mrp_req_covered_qty"] == 8
     assert row["mrp_req_remaining_qty"] == 12
+
+
+def test_update_product_quantity_releases_mrp_requirement_coverage(db_session):
+    item = Item(
+        item_code="MRP-QTY-REL",
+        item_name="MRP quantity release item",
+        unit="шт",
+        stock_qty=0,
+        replenishment_method="Производство",
+        status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+
+    run = PlanningRun(status="FIXED_SNAPSHOT", started_at=datetime(2026, 6, 4))
+    db_session.add(run)
+    db_session.flush()
+    req = MrpRequirement(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        total_required_qty=20,
+        net_required_qty=20,
+        covered_qty=20,
+        remaining_qty=0,
+        period_from=_dt.date(2026, 6, 1),
+        period_to=_dt.date(2026, 6, 30),
+        bom_level=0,
+    )
+    db_session.add(req)
+    db_session.flush()
+    order = ProductionOrder(
+        order_number="MRP-QTY-REL",
+        order_date=datetime(2026, 6, 4),
+        deletion_mark=False,
+        source="mrp",
+        source_run_id=run.run_id,
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=item.item_id,
+        line_number=1,
+        quantity=20,
+        produced_qty=0,
+        remaining_qty=20,
+        source_mrp_requirement_id=req.id,
+    )
+    db_session.add(product)
+    db_session.commit()
+
+    result = update_product_quantity(db_session, product.product_id, 12)
+
+    db_session.refresh(req)
+    db_session.refresh(product)
+    assert float(product.quantity) == 12
+    assert float(product.remaining_qty) == 12
+    assert float(req.covered_qty) == 12
+    assert float(req.remaining_qty) == 8
+    assert result["mrp_req_net_qty"] == 20
+    assert result["mrp_req_covered_qty"] == 12
+    assert result["mrp_req_remaining_qty"] == 8
 
 
 def test_fill_remaining_creates_top_up_order_for_partially_covered_requirement(db_session):
@@ -1152,19 +1268,36 @@ def test_create_material_issues_reuses_exported_transfer_and_refreshes_qty(db_se
     assert float(line.required_qty) == 3.0
 
 
-def test_material_issue_journal_shows_warehouse_names_and_filters_source(db_session):
+def test_create_material_issues_reuses_posted_transfer_without_duplicate(db_session):
     parent = Item(
-        item_code="P-WH",
-        item_name="Warehouse parent",
+        item_code="P-POSTED-REUSE",
+        item_name="Parent posted reuse",
+        item_article="ART-P-POSTED-REUSE",
         unit="шт",
         stock_qty=0,
         status="active",
     )
-    db_session.add(parent)
+    comp = Item(
+        item_code="C-POSTED-REUSE",
+        item_name="Component posted reuse",
+        item_article="ART-C-POSTED-REUSE",
+        unit="шт",
+        stock_qty=10,
+        status="active",
+    )
+    db_session.add_all([parent, comp])
     db_session.flush()
+
+    spec = Specification(spec_name="Posted reuse spec", spec_ref1c="spec-posted-reuse")
+    db_session.add(spec)
+    db_session.flush()
+    db_session.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=1))
+
     order = ProductionOrder(
-        order_number="WH-001",
-        order_date=datetime(2026, 5, 20),
+        order_number="POSTED-REUSE-001",
+        order_date=datetime(2026, 6, 4),
+        order_ref1c="order-posted-reuse",
         is_posted=True,
         deletion_mark=False,
     )
@@ -1179,6 +1312,72 @@ def test_material_issue_journal_shows_warehouse_names_and_filters_source(db_sess
         remaining_qty=5,
     )
     db_session.add(product)
+    db_session.commit()
+
+    first = create_material_issues(db_session, [product.product_id], initiated_by="op1")
+    issue_id = first["created"][0]["issue_id"]
+    issue = db_session.query(ProductionMaterialIssue).filter_by(issue_id=issue_id).one()
+    issue.status = "posted"
+    issue.exported_ref1c = "posted-transfer-ref"
+    line = db_session.query(ProductionMaterialIssueLine).filter_by(issue_id=issue_id).one()
+    line.issued_qty = line.required_qty
+    line.line_status = "issued"
+    db_session.commit()
+
+    second = create_material_issues(db_session, [product.product_id], initiated_by="op2")
+
+    assert second["created"] == []
+    assert len(second["reused"]) == 1
+    assert second["reused"][0]["issue_id"] == issue_id
+    assert (
+        db_session.query(ProductionMaterialIssue)
+        .filter(ProductionMaterialIssue.product_id == product.product_id)
+        .count()
+        == 1
+    )
+
+
+def test_material_issue_journal_shows_warehouse_names_and_filters_source(db_session):
+    parent = Item(
+        item_code="P-WH",
+        item_name="Warehouse parent",
+        unit="шт",
+        stock_qty=0,
+        status="active",
+    )
+    db_session.add(parent)
+    db_session.flush()
+    order = ProductionOrder(
+        order_number="PP001200001",
+        order_date=datetime(2026, 5, 20),
+        order_ref1c="order-wh-ref",
+        is_posted=True,
+        deletion_mark=False,
+        source="mrp",
+        source_run_id=12,
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=parent.item_id,
+        line_number=1,
+        quantity=5,
+        produced_qty=0,
+        remaining_qty=5,
+    )
+    db_session.add(product)
+    db_session.add(
+        SyncLink(
+            source_system="PRODPLAN",
+            source_doctype="production_order",
+            source_id=order.order_id,
+            target_entity="Document_ЗаказНаПроизводство",
+            target_ref_key="order-wh-ref",
+            target_number="PP001200001",
+            status="success",
+        )
+    )
     db_session.add_all([
         StockWarehouse(
             warehouse_ref1c="src-a",
@@ -1226,6 +1425,9 @@ def test_material_issue_journal_shows_warehouse_names_and_filters_source(db_sess
 
     assert result["total"] == 1
     assert result["rows"][0]["document_number"] == "MI-WH-A"
+    assert result["rows"][0]["order_number"] == "PP001200001"
+    assert result["rows"][0]["order_one_c_number"] == "PP001200001"
+    assert result["rows"][0]["order_prodplan_number"] == f"MRP-RC-12-{parent.item_id}"
     assert result["rows"][0]["source_warehouse_name"] == "Склад отправитель A"
     assert result["rows"][0]["destination_warehouse_name"] == "Склад получатель"
     assert {row["warehouse_name"] for row in result["source_warehouses"]} == {

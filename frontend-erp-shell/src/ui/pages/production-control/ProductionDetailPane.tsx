@@ -126,6 +126,10 @@ export function ProductionDetailPane({
     return 'На складе'
   }
 
+  function activeOrderNumber() {
+    return activeRow?.order_prodplan_number || activeRow?.order_number || ''
+  }
+
   return (
     <aside className="detailPane">
       <h2>Карточка строки</h2>
@@ -134,7 +138,12 @@ export function ProductionDetailPane({
           <div className="detailTitle">{activeRow.item_name}</div>
           <div className="detailMeta">{activeRow.item_article || activeRow.item_code}</div>
           <div className="detailGrid">
-            <span>Заказ</span><strong>{activeRow.order_number}</strong>
+            <span>Заказ</span><strong>{activeOrderNumber()}</strong>
+            {activeRow.order_ref1c && (
+              <>
+                <span>Заказ 1С</span><strong>{activeRow.order_one_c_number || activeRow.order_number}</strong>
+              </>
+            )}
             <span>Источник</span><strong>{planSourceLabel || rowSource || '1C'}</strong>
             <span>Остаток</span><strong>{qty(activeRow.remaining_qty)} {activeRow.unit}</strong>
             <span>Кол-во запуска</span>

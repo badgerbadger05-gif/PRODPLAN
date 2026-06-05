@@ -31,6 +31,10 @@ function orderSubline(row: OrderRow) {
   return `${dateRu(row.order_date)} · стр. ${row.line_number || '—'}`
 }
 
+function orderMainLine(row: OrderRow) {
+  return row.order_prodplan_number || row.order_number
+}
+
 export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSelectIds, onActivate, onOpenMaterials, onChangeStatus, onToggleSort }: Props) {
   return (
     <table className="journalTable productionOrdersTable" style={{ minWidth: tableMinWidth(productionOrderColumns) }}>
@@ -69,7 +73,7 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
               />
             </td>
             <td className={`orderCell ${row.order_ref1c ? 'oneCOrderCell' : ''}`}>
-              <strong>{row.order_number}</strong>
+              <strong>{orderMainLine(row)}</strong>
               <span>{orderSubline(row)}</span>
             </td>
             <td className="itemCell">

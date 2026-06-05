@@ -4,6 +4,7 @@ export type OrderRow = {
   order_source?: string | null  // 'mrp' | '1c'
   order_ref1c?: string | null
   order_one_c_number?: string | null
+  order_prodplan_number?: string | null
   item_id?: number | null
   order_number: string
   order_date?: string | null
@@ -170,6 +171,9 @@ export type TransferIssueRow = {
   product_id: number
   order_id: number
   order_number: string
+  order_prodplan_number?: string | null
+  order_one_c_number?: string | null
+  order_source?: string | null
   order_ref1c?: string | null
   item_id?: number | null
   item_name: string
