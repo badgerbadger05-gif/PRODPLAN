@@ -307,7 +307,7 @@ def _prodplan_order_display_number(product: Optional[ProductionProduct], order: 
         return f"MRP-R-{requirement_id}" if seq <= 1 else f"MRP-R-{requirement_id}-{seq}"
 
     if run_id is not None and getattr(product, "item_id", None) is not None:
-        return f"MRP-RC-{run_id}-{int(product.item_id)}"
+        return f"MRP-RC-{run_id}-{int(product.item_id)}-{int(order.order_id)}"
 
     return str(order.order_number or "")
 
@@ -330,6 +330,56 @@ def _order_one_c_number(db: Session, order: Optional[ProductionOrder]) -> str:
     if order.order_ref1c and str(order.source or "1c") == "1c":
         return str(order.order_number or "")
     return ""
+
+
+def _material_issue_sync_link(db: Session, issue_id: int) -> Optional[SyncLink]:
+    return (
+        db.query(SyncLink)
+        .filter(
+            SyncLink.source_system == "PRODPLAN",
+            SyncLink.source_doctype == "material_issue",
+            SyncLink.source_id == int(issue_id),
+            SyncLink.target_entity == STOCK_TRANSFER_ENTITY,
+        )
+        .one_or_none()
+    )
+
+
+def _material_issue_has_1c_link(db: Session, issue: ProductionMaterialIssue) -> bool:
+    return bool(_clean_ref1c(issue.exported_ref1c) or _material_issue_sync_link(db, int(issue.issue_id)))
+
+
+def delete_local_material_issue(db: Session, issue_id: int) -> Dict[str, Any]:
+    issue = (
+        db.query(ProductionMaterialIssue)
+        .options(joinedload(ProductionMaterialIssue.product).joinedload(ProductionProduct.control_state))
+        .filter(ProductionMaterialIssue.issue_id == int(issue_id))
+        .one_or_none()
+    )
+    if issue is None:
+        raise ValueError("Заявка на перемещение не найдена")
+    if _material_issue_has_1c_link(db, issue):
+        raise ValueError("Заявка уже открыта в 1С, локальное удаление запрещено")
+    product_id = int(issue.product_id)
+    db.delete(issue)
+    state = issue.product.control_state if issue.product else None
+    if state is not None:
+        active_count = (
+            db.query(ProductionMaterialIssue)
+            .filter(
+                ProductionMaterialIssue.product_id == product_id,
+                ProductionMaterialIssue.direction == "issue",
+                ProductionMaterialIssue.status.in_(("draft", "requested", "issued", "exported", "posted", "error")),
+                ProductionMaterialIssue.issue_id != int(issue_id),
+            )
+            .count()
+        )
+        if active_count == 0:
+            state.issue_status = "not_requested"
+            if state.status == "to_move":
+                state.status = "shortage"
+    db.commit()
+    return {"status": "ok", "issue_id": int(issue_id), "deleted": True}
 
 
 def _sync_existing_issue_lines(
@@ -498,6 +548,21 @@ def create_material_issues(
             resolved_warehouse = _destination_warehouse_for_product(db, product, spec_id)
 
         if existing_rows and not source_warehouse_ref1c:
+            for existing in existing_rows:
+                if not existing.warehouse_ref1c:
+                    existing.warehouse_ref1c = resolved_warehouse
+                if str(existing.status or "") != "posted":
+                    _sync_existing_issue_lines(
+                        db,
+                        existing,
+                        components,
+                        spec_id=spec_id,
+                        replace_missing=False,
+                    )
+                reused.append(_issue_reuse_payload(existing, product))
+            continue
+
+        if existing_rows and source_warehouse_ref1c:
             for existing in existing_rows:
                 if not existing.warehouse_ref1c:
                     existing.warehouse_ref1c = resolved_warehouse

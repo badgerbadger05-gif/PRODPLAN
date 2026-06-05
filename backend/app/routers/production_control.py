@@ -18,6 +18,7 @@ from ..services.one_c_stock_transfer_export import export_material_issues_to_1c
 from ..services.production_control_material_issues import (
     assemble_material_issue,
     create_material_issues,
+    delete_local_material_issue,
     export_issue_to_1c,
     get_issue,
     list_material_issues,
@@ -25,6 +26,7 @@ from ..services.production_control_material_issues import (
 from ..services.production_control_journal import (
     create_orders_from_mrp,
     create_production_orders_from_mrp_requirements,
+    cancel_local_order,
     list_journal,
     update_line_state,
     update_product_quantity,
@@ -211,6 +213,16 @@ def patch_order_line_state(product_id: int, payload: LineStatePayload, db: Sessi
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/orders/{product_id}", response_model=dict)
+def delete_local_order(product_id: int, db: Session = Depends(get_db)):
+    try:
+        return cancel_local_order(db, int(product_id))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/orders/{product_id}/materials", response_model=dict)
@@ -475,6 +487,16 @@ def get_material_issue(issue_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/material-issues/{issue_id}", response_model=dict)
+def delete_material_issue(issue_id: int, db: Session = Depends(get_db)):
+    try:
+        return delete_local_material_issue(db, int(issue_id))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/material-issues/export-to-1c", response_model=dict)

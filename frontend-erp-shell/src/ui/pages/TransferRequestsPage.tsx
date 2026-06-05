@@ -59,6 +59,7 @@ export function TransferRequestsPage() {
   const canAssemble = activeRow
     ? (activeRow.can_assemble ?? (!!activeRow.exported_ref1c && activeRow.status !== 'posted'))
     : false
+  const canDelete = Boolean(activeRow && !activeRow.exported_ref1c && !activeRow.one_c_number)
   const assembleDisabledReason = activeRow?.assemble_disabled_reason
     || (!activeRow ? 'Выберите заявку' : !activeRow.exported_ref1c ? 'Сначала выгрузите перемещение в 1С' : activeRow.status === 'posted' ? 'Перемещение уже собрано' : '')
 
@@ -116,6 +117,23 @@ export function TransferRequestsPage() {
     }
   }
 
+  async function deleteActiveIssue() {
+    if (!activeRow || !canDelete) return
+    if (!window.confirm(`Удалить локальную заявку ${activeRow.document_number}?`)) return
+    setLoading(true)
+    setError('')
+    setMessage('')
+    try {
+      await api(`/v1/production-control/material-issues/${activeRow.issue_id}`, { method: 'DELETE' })
+      setMessage(`Удалена локальная заявка ${activeRow.document_number}`)
+      await load(offsetRef.current)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLoading(false)
+    }
+  }
+
   useEffect(() => {
     void load(0)
   }, [load])
@@ -156,6 +174,7 @@ export function TransferRequestsPage() {
           <button className="primary" onClick={() => void markAssembled()} disabled={!canAssemble || loading} title={!canAssemble ? assembleDisabledReason : 'Провести перемещение в 1С'}>
             Собрано
           </button>
+          <button onClick={() => void deleteActiveIssue()} disabled={!canDelete || loading} title={canDelete ? 'Удалить локальную заявку без 1С' : 'Можно удалить только заявку без 1С'}>Удалить</button>
           <button onClick={() => void load(offset)} disabled={loading}>Обновить</button>
           {!canAssemble && assembleDisabledReason && <span className="toolbarText">{assembleDisabledReason}</span>}
         </div>

@@ -702,6 +702,29 @@ export function ProductionControlPage() {
     openRouteSheets(ids)
   }
 
+  async function deleteSelectedLocalOrders() {
+    const selected = rows.filter((row) => selectedIds.has(row.product_id))
+    const deletable = selected.filter((row) => !row.order_ref1c)
+    if (!deletable.length) return
+    const names = deletable.map((row) => row.order_prodplan_number || row.order_number).join(', ')
+    if (!window.confirm(`Удалить локальные заказы без 1С: ${names}?`)) return
+    setLoading(true)
+    setError('')
+    setMessage('')
+    try {
+      for (const row of deletable) {
+        await api(`/v1/production-control/orders/${row.product_id}`, { method: 'DELETE' })
+      }
+      setSelectedIds(new Set())
+      setMessage(`Удалено локальных заказов: ${deletable.length}`)
+      await load(offsetRef.current)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLoading(false)
+    }
+  }
+
   function toggleSort(key: ProductionOrderSortKey) {
     const current = filtersRef.current
     const next = {
@@ -765,6 +788,7 @@ export function ProductionControlPage() {
           onSyncFrom1C={() => void syncFrom1C()}
           onProduce={() => openProduceDialog()}
           onPrintSelected={() => printRows(Array.from(selectedIds))}
+          onDeleteSelected={() => void deleteSelectedLocalOrders()}
           onOpenSettings={() => void openSettings()}
           onRefresh={() => void load(offset)}
           onSelectAll={() => setSelectedIds(new Set(rows.map((row) => row.product_id)))}

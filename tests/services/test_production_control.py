@@ -33,12 +33,13 @@ from app.routers.production_control import list_employees
 from app.services.production_control_journal import (
     create_orders_from_mrp,
     create_production_orders_from_mrp_requirements,
+    cancel_local_order,
     dedupe_mrp_production_orders,
     list_journal,
     update_product_quantity,
 )
 from app.services.production_control_material_availability import preview_materials
-from app.services.production_control_material_issues import create_material_issues, list_material_issues
+from app.services.production_control_material_issues import create_material_issues, delete_local_material_issue, list_material_issues
 from app.services.production_control_printing import render_route_sheets_html
 
 
@@ -279,7 +280,51 @@ def test_journal_exposes_prodplan_number_separately_from_1c_number(db_session):
 
     assert row["order_number"] == "PP001204945"
     assert row["order_one_c_number"] == "PP001204945"
-    assert row["order_prodplan_number"] == f"MRP-RC-12-{item.item_id}"
+    assert row["order_prodplan_number"] == f"MRP-RC-12-{item.item_id}-{order.order_id}"
+
+
+def test_journal_prodplan_numbers_are_unique_for_same_item_and_run(db_session):
+    item = Item(
+        item_code="P-DUP-PRODPLAN-NUMBERS",
+        item_name="Duplicate display number item",
+        unit="шт",
+        stock_qty=0,
+        status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+
+    orders = [
+        ProductionOrder(
+            order_number=f"PP00130000{idx}",
+            order_date=datetime(2026, 6, 5),
+            deletion_mark=False,
+            source="mrp",
+            source_run_id=13,
+        )
+        for idx in range(2)
+    ]
+    db_session.add_all(orders)
+    db_session.flush()
+    products = [
+        ProductionProduct(
+            order_id=order.order_id,
+            item_id=item.item_id,
+            line_number=1,
+            quantity=10 + idx,
+            produced_qty=0,
+            remaining_qty=10 + idx,
+        )
+        for idx, order in enumerate(orders)
+    ]
+    db_session.add_all(products)
+    db_session.commit()
+
+    rows = list_journal(db_session)["rows"]
+    display_numbers = [row["order_prodplan_number"] for row in rows]
+
+    assert len(display_numbers) == 2
+    assert len(set(display_numbers)) == 2
 
 
 def test_journal_can_filter_by_product_id(db_session):
@@ -1337,6 +1382,114 @@ def test_create_material_issues_reuses_posted_transfer_without_duplicate(db_sess
     )
 
 
+def test_create_material_issues_reuses_existing_issue_when_source_changes(db_session):
+    parent = Item(item_code="P-SRC-REUSE", item_name="Parent source reuse", unit="шт", stock_qty=0, status="active")
+    comp = Item(item_code="C-SRC-REUSE", item_name="Component source reuse", unit="шт", stock_qty=10, status="active")
+    db_session.add_all([parent, comp])
+    db_session.flush()
+    spec = Specification(spec_name="Source reuse spec", spec_ref1c="spec-source-reuse")
+    db_session.add(spec)
+    db_session.flush()
+    db_session.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=1))
+    order = ProductionOrder(order_number="SRC-REUSE-001", order_date=datetime(2026, 6, 4), deletion_mark=False)
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(order_id=order.order_id, item_id=parent.item_id, line_number=1, quantity=5, produced_qty=0, remaining_qty=5)
+    db_session.add(product)
+    db_session.commit()
+
+    first = create_material_issues(db_session, [product.product_id], source_warehouse_ref1c="src-a")
+    second = create_material_issues(db_session, [product.product_id], source_warehouse_ref1c="src-b")
+
+    assert len(first["created"]) == 1
+    assert second["created"] == []
+    assert len(second["reused"]) == 1
+    assert (
+        db_session.query(ProductionMaterialIssue)
+        .filter(ProductionMaterialIssue.product_id == product.product_id)
+        .count()
+        == 1
+    )
+
+
+def test_delete_local_material_issue_only_before_1c(db_session):
+    parent = Item(item_code="P-DEL-ISSUE", item_name="Parent delete issue", unit="шт", stock_qty=0, status="active")
+    comp = Item(item_code="C-DEL-ISSUE", item_name="Component delete issue", unit="шт", stock_qty=10, status="active")
+    db_session.add_all([parent, comp])
+    db_session.flush()
+    spec = Specification(spec_name="Delete issue spec", spec_ref1c="spec-delete-issue")
+    db_session.add(spec)
+    db_session.flush()
+    db_session.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=1))
+    order = ProductionOrder(order_number="DEL-ISSUE-001", order_date=datetime(2026, 6, 4), deletion_mark=False)
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(order_id=order.order_id, item_id=parent.item_id, line_number=1, quantity=5, produced_qty=0, remaining_qty=5)
+    db_session.add(product)
+    db_session.commit()
+    created = create_material_issues(db_session, [product.product_id], source_warehouse_ref1c="src-a")
+    issue_id = created["created"][0]["issue_id"]
+
+    result = delete_local_material_issue(db_session, issue_id)
+
+    assert result["deleted"] is True
+    assert db_session.query(ProductionMaterialIssue).filter_by(issue_id=issue_id).first() is None
+
+
+def test_cancel_local_order_without_1c_marks_deleted_and_removes_local_issues(db_session):
+    item = Item(item_code="P-DEL-ORDER", item_name="Parent delete order", unit="шт", stock_qty=0, status="active")
+    comp = Item(item_code="C-DEL-ORDER", item_name="Component delete order", unit="шт", stock_qty=10, status="active")
+    db_session.add_all([item, comp])
+    db_session.flush()
+    run = PlanningRun(status="DONE", config_snapshot=json.dumps({}))
+    db_session.add(run)
+    db_session.flush()
+    req = MrpRequirement(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        net_required_qty=5,
+        covered_qty=5,
+        remaining_qty=0,
+        period_from=_dt.date(2026, 6, 1),
+        period_to=_dt.date(2026, 6, 30),
+        bom_level=0,
+    )
+    db_session.add(req)
+    db_session.flush()
+    spec = Specification(spec_name="Delete order spec", spec_ref1c="spec-delete-order")
+    db_session.add(spec)
+    db_session.flush()
+    db_session.add(DefaultSpecification(item_id=item.item_id, spec_id=spec.spec_id))
+    db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=1))
+    order = ProductionOrder(order_number="MRP-RC-1-1", order_date=datetime(2026, 6, 4), deletion_mark=False, source="mrp", source_run_id=run.run_id)
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=item.item_id,
+        line_number=1,
+        quantity=5,
+        produced_qty=0,
+        remaining_qty=5,
+        source_mrp_requirement_id=req.id,
+    )
+    db_session.add(product)
+    db_session.commit()
+    create_material_issues(db_session, [product.product_id], source_warehouse_ref1c="src-a")
+
+    result = cancel_local_order(db_session, product.product_id)
+
+    db_session.refresh(order)
+    db_session.refresh(req)
+    assert result["deleted_issues"] == 1
+    assert order.deletion_mark is True
+    assert float(req.covered_qty) == 0
+    assert float(req.remaining_qty) == 5
+    assert list_journal(db_session)["total"] == 0
+
+
 def test_material_issue_journal_shows_warehouse_names_and_filters_source(db_session):
     parent = Item(
         item_code="P-WH",
@@ -1427,7 +1580,7 @@ def test_material_issue_journal_shows_warehouse_names_and_filters_source(db_sess
     assert result["rows"][0]["document_number"] == "MI-WH-A"
     assert result["rows"][0]["order_number"] == "PP001200001"
     assert result["rows"][0]["order_one_c_number"] == "PP001200001"
-    assert result["rows"][0]["order_prodplan_number"] == f"MRP-RC-12-{parent.item_id}"
+    assert result["rows"][0]["order_prodplan_number"] == f"MRP-RC-12-{parent.item_id}-{order.order_id}"
     assert result["rows"][0]["source_warehouse_name"] == "Склад отправитель A"
     assert result["rows"][0]["destination_warehouse_name"] == "Склад получатель"
     assert {row["warehouse_name"] for row in result["source_warehouses"]} == {

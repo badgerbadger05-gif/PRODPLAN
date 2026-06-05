@@ -193,7 +193,7 @@ def _prodplan_order_display_number(product: ProductionProduct, order: Production
         return f"MRP-R-{requirement_id}" if seq <= 1 else f"MRP-R-{requirement_id}-{seq}"
 
     if run_id is not None and product.item_id is not None:
-        return f"MRP-RC-{run_id}-{int(product.item_id)}"
+        return f"MRP-RC-{run_id}-{int(product.item_id)}-{int(order.order_id)}"
 
     return str(order.order_number or "")
 
@@ -1249,6 +1249,97 @@ def update_line_state(db: Session, product_id: int, payload: Dict[str, Any]) -> 
 
     db.commit()
     return {"status": "ok", "product_id": int(product_id)}
+
+
+def _production_order_has_1c_link(db: Session, order: ProductionOrder) -> bool:
+    if order.order_ref1c:
+        return True
+    return (
+        db.query(SyncLink.source_id)
+        .filter(
+            SyncLink.source_system == "PRODPLAN",
+            SyncLink.source_doctype == "production_order",
+            SyncLink.source_id == int(order.order_id),
+            SyncLink.target_entity == PRODUCTION_ORDER_ENTITY,
+        )
+        .first()
+        is not None
+    )
+
+
+def _material_issue_has_1c_link(db: Session, issue: ProductionMaterialIssue) -> bool:
+    if issue.exported_ref1c:
+        return True
+    return (
+        db.query(SyncLink.source_id)
+        .filter(
+            SyncLink.source_system == "PRODPLAN",
+            SyncLink.source_doctype == "material_issue",
+            SyncLink.source_id == int(issue.issue_id),
+            SyncLink.target_entity == "Document_ПеремещениеЗапасов",
+        )
+        .first()
+        is not None
+    )
+
+
+def cancel_local_order(db: Session, product_id: int) -> Dict[str, Any]:
+    product = (
+        db.query(ProductionProduct)
+        .options(joinedload(ProductionProduct.order), joinedload(ProductionProduct.control_state))
+        .filter(ProductionProduct.product_id == int(product_id))
+        .one_or_none()
+    )
+    if product is None or product.order is None:
+        raise ValueError("Строка заказа не найдена")
+    order = product.order
+    if _production_order_has_1c_link(db, order):
+        raise ValueError("Заказ уже открыт в 1С, локальное удаление запрещено")
+
+    products = (
+        db.query(ProductionProduct)
+        .options(joinedload(ProductionProduct.control_state))
+        .filter(ProductionProduct.order_id == int(order.order_id))
+        .all()
+    )
+    product_ids = [int(row.product_id) for row in products]
+    issues = (
+        db.query(ProductionMaterialIssue)
+        .filter(ProductionMaterialIssue.product_id.in_(product_ids))
+        .filter(ProductionMaterialIssue.direction == "issue")
+        .all()
+    )
+    linked_issues = [issue for issue in issues if _material_issue_has_1c_link(db, issue)]
+    if linked_issues:
+        numbers = ", ".join(str(issue.document_number or issue.issue_id) for issue in linked_issues[:5])
+        raise ValueError(f"Есть перемещения, уже открытые в 1С: {numbers}")
+
+    deleted_issues = 0
+    for issue in issues:
+        db.delete(issue)
+        deleted_issues += 1
+
+    released_qty = 0.0
+    for row in products:
+        state = row.control_state or _ensure_state(db, row)
+        if state.status != "cancelled":
+            qty_to_release = _to_float(row.remaining_qty)
+            if qty_to_release > 1e-9:
+                _adjust_requirement_coverage(db, row, -qty_to_release)
+                released_qty += qty_to_release
+                row.remaining_qty = 0.0
+            state.status = "cancelled"
+        state.issue_status = "not_requested"
+
+    order.deletion_mark = True
+    db.commit()
+    return {
+        "status": "ok",
+        "order_id": int(order.order_id),
+        "product_ids": product_ids,
+        "deleted_issues": deleted_issues,
+        "released_qty": released_qty,
+    }
 
 
 def update_product_quantity(db: Session, product_id: int, quantity: float) -> Dict[str, Any]:

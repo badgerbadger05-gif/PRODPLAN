@@ -8,6 +8,7 @@ type Props = {
   onSyncFrom1C: () => void
   onProduce: () => void
   onPrintSelected: () => void
+  onDeleteSelected: () => void
   onOpenSettings: () => void
   onRefresh: () => void
   onSelectAll: () => void
@@ -24,6 +25,7 @@ export function ProductionCommandBar({
   onSyncFrom1C,
   onProduce,
   onPrintSelected,
+  onDeleteSelected,
   onOpenSettings,
   onRefresh,
   onSelectAll,
@@ -38,6 +40,7 @@ export function ProductionCommandBar({
     && Number(selectedProduceRow.remaining_qty ?? 0) > 0
     && (selectedProduceRow.coverage_status === 'assembled' || selectedProduceRow.issue_status === 'posted'),
   )
+  const canDeleteSelected = selectedRows.length > 0 && selectedRows.every((row) => !row.order_ref1c)
   const produceTitle = !selectedIds.size
     ? 'Выберите одну строку чекбоксом'
     : selectedIds.size > 1
@@ -52,6 +55,7 @@ export function ProductionCommandBar({
       <button onClick={onSyncFrom1C} disabled={loading} title="Проверить статусы в 1С">Синхронизировать</button>
       <div className="barSeparator" />
       <button onClick={onPrintSelected} disabled={!selectedIds.size}>Печать маршрутных</button>
+      <button onClick={onDeleteSelected} disabled={!canDeleteSelected || loading} title={canDeleteSelected ? 'Удалить локальные заказы, которые ещё не открыты в 1С' : 'Можно удалить только заказы без 1С'}>Удалить</button>
       <button onClick={onRefresh} disabled={loading}>Обновить</button>
       <div className="barSeparator" />
       <button onClick={onSelectAll} disabled={!rows.length}>Выбрать все</button>
