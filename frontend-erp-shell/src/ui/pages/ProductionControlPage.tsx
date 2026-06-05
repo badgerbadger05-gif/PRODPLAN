@@ -29,6 +29,7 @@ import { ProductionSettingsPane } from './production-control/ProductionSettingsP
 import type { ProductionOrderSortKey } from './production-control/productionOrdersDoctype'
 
 const limit = 100
+const coverageDrivenStatuses = new Set(['shortage', 'partial', 'ready'])
 
 function recordArray(value: unknown): Array<Record<string, unknown>> {
   return Array.isArray(value) ? value.filter((row): row is Record<string, unknown> => Boolean(row) && typeof row === 'object') : []
@@ -248,6 +249,21 @@ export function ProductionControlPage() {
     try {
       const data = await api<MaterialsResponse>(`/v1/production-control/orders/${row.product_id}/materials`)
       setMaterials(data)
+      const coverageStatus = String(data.coverage_status || '')
+      if (coverageStatus) {
+        setRows((list) => list.map((item) => {
+          if (item.product_id !== row.product_id) return item
+          const nextStatus = item.issue_status === 'not_requested' && coverageDrivenStatuses.has(String(item.status || ''))
+            ? coverageStatus
+            : item.status
+          return {
+            ...item,
+            status: nextStatus,
+            coverage_status: coverageStatus,
+            coverage_label: data.coverage_label || coverageLabels[coverageStatus] || coverageStatus,
+          }
+        }))
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
