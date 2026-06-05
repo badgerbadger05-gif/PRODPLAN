@@ -9,6 +9,7 @@ export const productionOrderColumns = [
   { key: 'workshop', title: 'Участок', className: undefined, minWidth: 150, autoWidth: true, grow: false, align: 'left', sortable: false },
   { key: 'status', title: 'Статус', className: undefined, minWidth: 136, autoWidth: true, grow: false, align: 'left', sortable: false },
   { key: 'coverage', title: 'Обеспечение', className: undefined, minWidth: 118, autoWidth: true, grow: false, align: 'left', sortable: false },
+  { key: 'route_sheet', title: 'Маршрутный', className: undefined, minWidth: 104, autoWidth: true, grow: false, align: 'left', sortable: false },
 ] as const satisfies TableColumnDoctype[]
 
 export type ProductionOrderColumnKey = typeof productionOrderColumns[number]['key']

@@ -809,6 +809,7 @@ def list_material_issues(
             .join(ProductionProduct.item)
             .filter(
                 (ProductionMaterialIssue.document_number.ilike(like))
+                | (ProductionMaterialIssue.order.has(ProductionOrder.order_number.ilike(like)))
                 | (ProductionProduct.item.has(Item.item_name.ilike(like)))
                 | (ProductionProduct.item.has(Item.item_article.ilike(like)))
                 | (ProductionProduct.item.has(Item.item_code.ilike(like)))

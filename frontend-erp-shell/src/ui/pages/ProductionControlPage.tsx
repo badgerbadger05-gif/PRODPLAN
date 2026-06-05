@@ -97,6 +97,7 @@ export function ProductionControlPage() {
   const [warehousePickerCandidates, setWarehousePickerCandidates] = useState<WarehouseCandidate[]>([])
   const [warehousePickerProductIds, setWarehousePickerProductIds] = useState<number[]>([])
   const [warehousePickerSelected, setWarehousePickerSelected] = useState('')
+  const [warehousePickerMode, setWarehousePickerMode] = useState<'issues' | 'export'>('issues')
 
   useEffect(() => {
     filtersRef.current = filters
@@ -266,6 +267,61 @@ export function ProductionControlPage() {
     }
   }
 
+  async function requestMaterialIssues(sourceWarehouseRef: string | undefined, productIds: number[]) {
+    const body: Record<string, unknown> = { product_ids: productIds, initiated_by: 'erp-shell' }
+    if (sourceWarehouseRef) body.source_warehouse_ref1c = sourceWarehouseRef
+    return api<MaterialIssueCreateResponse>('/v1/production-control/material-issues', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
+  }
+
+  function showWarehousePicker(result: MaterialIssueCreateResponse, mode: 'issues' | 'export') {
+    const selectionRequired = result.selection_required ?? []
+    if (!selectionRequired.length) return false
+    const candidates = selectionRequired[0].warehouse_candidates
+    setWarehousePickerCandidates(candidates)
+    setWarehousePickerProductIds(selectionRequired.map((item) => item.product_id))
+    setWarehousePickerSelected(candidates[0]?.ref1c ?? '')
+    setWarehousePickerMode(mode)
+    setWarehousePickerOpen(true)
+    return true
+  }
+
+  function issueIdsFromCreateResult(result: MaterialIssueCreateResponse) {
+    return [
+      ...(result.created ?? []).map((row) => row.issue_id),
+      ...(result.reused ?? []).map((row) => row.issue_id),
+    ].filter(Boolean)
+  }
+
+  function openRouteSheets(ids: number[]) {
+    if (!ids.length) return
+    const printWindow = window.open('', '_blank')
+    if (!printWindow) {
+      setError('Браузер заблокировал окно печати. Разрешите всплывающие окна для PRODPLAN.')
+      return
+    }
+    printWindow.document.write('<!doctype html><title>Маршрутные листы</title><body>Загрузка...</body>')
+    void fetch('/api/v1/production-control/route-sheets/print', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ product_ids: ids, mark_printed: true, auto_print: true }),
+    })
+      .then(async (response) => {
+        const html = await response.text()
+        if (!response.ok) throw new Error(html || response.statusText)
+        printWindow.document.open()
+        printWindow.document.write(html)
+        printWindow.document.close()
+        window.setTimeout(() => void load(offsetRef.current), 1200)
+      })
+      .catch((e) => {
+        printWindow.close()
+        setError(e instanceof Error ? e.message : String(e))
+      })
+  }
+
   async function createMaterialIssues(sourceWarehouseRef?: string, productIds?: number[]) {
     const ids = productIds ?? Array.from(selectedIds)
     if (!ids.length) return
@@ -273,25 +329,15 @@ export function ProductionControlPage() {
     setError('')
     setMessage('')
     try {
-      const body: Record<string, unknown> = { product_ids: ids, initiated_by: 'erp-shell' }
-      if (sourceWarehouseRef) body.source_warehouse_ref1c = sourceWarehouseRef
-      const result = await api<MaterialIssueCreateResponse>('/v1/production-control/material-issues', {
-        method: 'POST',
-        body: JSON.stringify(body),
-      })
+      const result = await requestMaterialIssues(sourceWarehouseRef, ids)
       const selectionRequired = result.selection_required ?? []
       const errors = result.errors?.length ?? 0
 
       if (selectionRequired.length > 0) {
-        const candidates = selectionRequired[0].warehouse_candidates
-        setWarehousePickerCandidates(candidates)
-        setWarehousePickerProductIds(selectionRequired.map((item) => item.product_id))
-        setWarehousePickerSelected(candidates[0]?.ref1c ?? '')
-        setWarehousePickerOpen(true)
+        showWarehousePicker(result, 'issues')
         const msg = `Создано документов: ${result.created?.length ?? 0}${errors ? `, ошибок ${errors}` : ''}. Для ${selectionRequired.length} поз. нужно выбрать склад-источник.`
         setMessage(msg)
       } else {
-        setSelectedIds(new Set())
         setMessage(`Выдача материалов: создано документов ${result.created?.length ?? 0}${errors ? `, ошибок ${errors}` : ''}`)
       }
       await load(offsetRef.current)
@@ -304,38 +350,36 @@ export function ProductionControlPage() {
 
   async function confirmWarehousePicker() {
     if (!warehousePickerSelected || !warehousePickerProductIds.length) return
+    const mode = warehousePickerMode
+    const productIds = [...warehousePickerProductIds]
+    const sourceRef = warehousePickerSelected
     setWarehousePickerOpen(false)
-    await createMaterialIssues(warehousePickerSelected, warehousePickerProductIds)
     setWarehousePickerProductIds([])
     setWarehousePickerCandidates([])
     setWarehousePickerSelected('')
+    if (mode === 'export') {
+      await exportTo1C(sourceRef, productIds)
+    } else {
+      await createMaterialIssues(sourceRef, productIds)
+    }
   }
 
-  async function exportTo1C() {
-    if (!selectedIds.size) return
+  async function exportTo1C(sourceWarehouseRef?: string, productIds?: number[]) {
+    const ids = productIds ?? Array.from(selectedIds)
+    if (!ids.length) return
     setLoading(true)
     setError('')
     setMessage('')
     try {
-      const issueResult = await api<MaterialIssueCreateResponse>('/v1/production-control/material-issues', {
-        method: 'POST',
-        body: JSON.stringify({ product_ids: Array.from(selectedIds), initiated_by: 'erp-shell' }),
-      })
+      const issueResult = await requestMaterialIssues(sourceWarehouseRef, ids)
       const selectionRequired = issueResult.selection_required ?? []
       if (selectionRequired.length > 0) {
-        const candidates = selectionRequired[0].warehouse_candidates
-        setWarehousePickerCandidates(candidates)
-        setWarehousePickerProductIds(selectionRequired.map((item) => item.product_id))
-        setWarehousePickerSelected(candidates[0]?.ref1c ?? '')
-        setWarehousePickerOpen(true)
+        showWarehousePicker(issueResult, 'export')
         setMessage(`Для ${selectionRequired.length} поз. нужно выбрать склад-источник перед выгрузкой в 1С.`)
         await load(offsetRef.current)
         return
       }
-      const issueIds = [
-        ...(issueResult.created ?? []).map((row) => row.issue_id),
-        ...(issueResult.reused ?? []).map((row) => row.issue_id),
-      ].filter(Boolean)
+      const issueIds = issueIdsFromCreateResult(issueResult)
       if (!issueIds.length) {
         const errors = issueResult.errors?.length ?? 0
         setMessage(`Запуск в 1С: заявок на перемещение не создано${errors ? `, ошибок ${errors}` : ''}`)
@@ -364,9 +408,9 @@ export function ProductionControlPage() {
         const detail = firstExportProblem(result, parent)
         throw new Error(`${summary}${detail ? `. ${detail}` : ''}`)
       }
-      setMessage(summary)
-      setSelectedIds(new Set())
+      setMessage(`${summary}. Открыта печать маршрутных листов.`)
       await load(offsetRef.current)
+      openRouteSheets(ids)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -655,8 +699,7 @@ export function ProductionControlPage() {
   }
 
   function printRows(ids: number[]) {
-    if (!ids.length) return
-    window.open(`/api/v1/production-control/route-sheets/print?product_ids=${ids.join(',')}`, '_blank')
+    openRouteSheets(ids)
   }
 
   function toggleSort(key: ProductionOrderSortKey) {

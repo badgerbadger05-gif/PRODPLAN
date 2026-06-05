@@ -256,7 +256,7 @@ def _material_transfer_rows(db: Session, product: ProductionProduct) -> List[Dic
     return rows
 
 
-def render_route_sheets_html(db: Session, product_ids: Sequence[int]) -> str:
+def render_route_sheets_html(db: Session, product_ids: Sequence[int], *, auto_print: bool = False) -> str:
     products = (
         db.query(ProductionProduct)
         .options(joinedload(ProductionProduct.order), joinedload(ProductionProduct.item))
@@ -355,6 +355,11 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int]) -> str:
             </section>
             """
         )
+    auto_print_script = (
+        "<script>window.addEventListener('load', () => setTimeout(() => window.print(), 250));</script>"
+        if auto_print
+        else ""
+    )
     return f"""<!doctype html>
 <html lang="ru">
 <head>
@@ -392,5 +397,6 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int]) -> str:
 <body>
   <div class="toolbar"><button onclick="window.print()">Печать</button> <span>Листов: {len(sheets)}</span></div>
   {''.join(sheets)}
+  {auto_print_script}
 </body>
 </html>"""

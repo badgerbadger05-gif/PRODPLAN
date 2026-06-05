@@ -120,6 +120,12 @@ class AssembleMaterialIssuePayload(BaseModel):
     allow_production: bool = False
 
 
+class PrintRouteSheetsPayload(BaseModel):
+    product_ids: List[int]
+    mark_printed: bool = True
+    auto_print: bool = True
+
+
 class ProduceLinePayload(BaseModel):
     qty: float
     executor: Optional[str] = None
@@ -560,14 +566,32 @@ def post_sync_posted_transfers(dry_run: bool = False, db: Session = Depends(get_
 def print_route_sheets(
     product_ids: str = Query(..., description="Comma-separated production product ids"),
     mark_printed: bool = True,
+    auto_print: bool = False,
     db: Session = Depends(get_db),
 ):
     try:
         ids = [int(x) for x in product_ids.split(",") if x.strip()]
         if not ids:
             raise ValueError("Не выбраны строки заказа")
-        html = render_route_sheets_html(db, ids)
+        html = render_route_sheets_html(db, ids, auto_print=auto_print)
         if mark_printed:
+            mark_route_sheets_printed(db, ids)
+        return HTMLResponse(content=html)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/route-sheets/print", response_class=HTMLResponse)
+def post_print_route_sheets(
+    payload: PrintRouteSheetsPayload,
+    db: Session = Depends(get_db),
+):
+    try:
+        ids = [int(x) for x in payload.product_ids if x is not None]
+        if not ids:
+            raise ValueError("Не выбраны строки заказа")
+        html = render_route_sheets_html(db, ids, auto_print=bool(payload.auto_print))
+        if payload.mark_printed:
             mark_route_sheets_printed(db, ids)
         return HTMLResponse(content=html)
     except Exception as e:

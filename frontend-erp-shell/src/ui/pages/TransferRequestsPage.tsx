@@ -33,7 +33,7 @@ function orderMainLine(row: TransferIssueRow) {
 
 function orderSubline(row: TransferIssueRow) {
   if (row.order_ref1c) return row.order_one_c_number || row.order_number
-  return row.order_ref1c ? row.order_ref1c.slice(0, 8) : 'заказ без Ref_Key'
+  return 'заказ не в 1С'
 }
 
 export function TransferRequestsPage() {
@@ -281,11 +281,7 @@ export function TransferRequestsPage() {
                 <div className="detailMeta">{activeRow.one_c_number || activeRow.document_number} · {orderMainLine(activeRow)}</div>
                 <div className="detailGrid">
                   <span>Статус</span><strong>{transferStatusLabels[activeRow.status] || activeRow.status}</strong>
-                  {activeRow.order_ref1c && (
-                    <>
-                      <span>Заказ 1С</span><strong>{activeRow.order_one_c_number || activeRow.order_number}</strong>
-                    </>
-                  )}
+                  <span>Заказ 1С</span><strong>{activeRow.order_ref1c ? (activeRow.order_one_c_number || activeRow.order_number) : 'не выгружен'}</strong>
                   <span>Обеспечение</span><strong>{coverageLabels[String(activeRow.line_status || '')] || activeRow.line_status || '—'}</strong>
                   <span>Отправитель</span><strong>{warehouseLabel(activeRow.source_warehouse_name, activeRow.source_warehouse_ref1c)}</strong>
                   <span>Получатель</span><strong>{warehouseLabel(activeRow.destination_warehouse_name, activeRow.warehouse_ref1c)}</strong>
