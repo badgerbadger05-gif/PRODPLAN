@@ -183,6 +183,7 @@ class Operation(Base):
     operation_ref1c = Column(String(36), unique=True, index=True)
     operation_name = Column(String(255))
     time_norm = Column(DECIMAL(10, 4), default=0.0)
+    operation_price = Column(DECIMAL(10, 2), default=0.0)
     created_at = Column(TIMESTAMP, default=func.now())
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
 

@@ -117,6 +117,19 @@ def _add_outgoing_issue(
     return issue
 
 
+def _mark_locally_produced(db, product: ProductionProduct, *, qty: float) -> None:
+    product.produced_qty = qty
+    product.remaining_qty = max(0.0, float(product.quantity or 0.0) - float(qty or 0.0))
+    state = (
+        db.query(ProductionOrderLineState)
+        .filter_by(product_id=product.product_id)
+        .one_or_none()
+    )
+    if state:
+        state.status = "produced" if float(product.remaining_qty or 0.0) <= 1e-9 else "produced_partial"
+    db.commit()
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -213,7 +226,7 @@ def test_no_outgoing_issue_skipped(db_session):
     compute issued qty against."""
     db = db_session
     parent, comp, product = _setup_scenario(db, order_qty=4)
-    produce_line(db, product.product_id, qty=2)
+    _mark_locally_produced(db, product, qty=2)
 
     result = return_leftover_components(db, product.product_id)
     assert result["status"] == "skipped"
@@ -226,7 +239,7 @@ def test_draft_outgoing_issue_does_not_count(db_session):
     db = db_session
     parent, comp, product = _setup_scenario(db, order_qty=5)
     _add_outgoing_issue(db, product, comp, required_qty=10, status="draft")
-    produce_line(db, product.product_id, qty=2)
+    _mark_locally_produced(db, product, qty=2)
 
     result = return_leftover_components(db, product.product_id)
     assert result["status"] == "skipped"

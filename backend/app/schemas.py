@@ -120,6 +120,7 @@ class OperationBase(BaseModel):
     operation_ref1c: str
     operation_name: Optional[str] = None
     time_norm: float = 0.0
+    operation_price: float = 0.0
 
 
 class OperationCreate(OperationBase):

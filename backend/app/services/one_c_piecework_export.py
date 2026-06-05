@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
+    DefaultSpecification,
     ProductionManufacture,
     ProductionOrder,
     ProductionProduct,
@@ -81,6 +82,7 @@ class PieceworkExportEntry:
     number: str
     operation_ref1c: Optional[str] = None
     time_norm: float = 0.0
+    price: float = 0.0
     spec_ref1c: Optional[str] = None
     stage_ref1c: Optional[str] = None
     structural_unit_ref1c: Optional[str] = None
@@ -90,6 +92,16 @@ class PieceworkExportEntry:
     status: str = "planned"
     error: Optional[str] = None
     reason: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class PieceworkOperationDefaults:
+    operation_ref1c: Optional[str] = None
+    time_norm: float = 0.0
+    price: float = 0.0
+    spec_ref1c: Optional[str] = None
+    stage_ref1c: Optional[str] = None
+    structural_unit_ref1c: Optional[str] = None
 
 
 def _short_piecework_number(manufacture_id: int) -> str:
@@ -103,6 +115,79 @@ def _existing_link(db: Session, manufacture_id: int) -> Optional[SyncLink]:
         source_doctype="piecework",
         source_id=int(manufacture_id),
         target_entity=PIECEWORK_ENTITY,
+    )
+
+
+def _piecework_spec_id(db: Session, product: Optional[ProductionProduct]) -> Optional[int]:
+    if not product:
+        return None
+    if product.spec_id:
+        return int(product.spec_id)
+    item_id = getattr(product, "item_id", None)
+    if not item_id:
+        return None
+    row = (
+        db.query(DefaultSpecification.spec_id)
+        .filter(DefaultSpecification.item_id == int(item_id))
+        .order_by(DefaultSpecification.id.asc())
+        .first()
+    )
+    return int(row.spec_id) if row else None
+
+
+def _piecework_operation_defaults(
+    db: Session,
+    product: Optional[ProductionProduct],
+) -> PieceworkOperationDefaults:
+    spec_id = _piecework_spec_id(db, product)
+    if not spec_id:
+        return PieceworkOperationDefaults()
+
+    spec = db.query(Specification).filter(Specification.spec_id == int(spec_id)).one_or_none()
+    spec_ref = _clean_ref1c(getattr(spec, "spec_ref1c", None)) or None
+    spec_operation = (
+        db.query(SpecOperation, Operation)
+        .join(Operation, Operation.operation_id == SpecOperation.operation_id)
+        .filter(SpecOperation.spec_id == int(spec_id))
+        .filter(Operation.operation_ref1c.isnot(None))
+        .order_by(SpecOperation.spec_operation_id.asc())
+        .first()
+    )
+    if not spec_operation:
+        return PieceworkOperationDefaults(spec_ref1c=spec_ref)
+
+    so, op = spec_operation
+    stage_ref = None
+    structural_unit_ref = None
+    if so.stage_id:
+        stage = db.query(ProductionStage).filter(ProductionStage.stage_id == int(so.stage_id)).one_or_none()
+        stage_ref = _clean_ref1c(getattr(stage, "stage_ref1c", None)) or None
+        resource_stage = (
+            db.query(ResourceStage)
+            .filter(ResourceStage.stage_id == int(so.stage_id))
+            .order_by(ResourceStage.id.asc())
+            .first()
+        )
+        if resource_stage:
+            binding = (
+                db.query(WorkshopWarehouseBinding)
+                .filter(WorkshopWarehouseBinding.workshop_id == int(resource_stage.resource_id))
+                .one_or_none()
+            )
+            if binding:
+                structural_unit_ref = (
+                    _clean_ref1c(binding.production_warehouse_ref1c)
+                    or _clean_ref1c(binding.warehouse_ref1c)
+                    or None
+                )
+
+    return PieceworkOperationDefaults(
+        operation_ref1c=_clean_ref1c(op.operation_ref1c) or None,
+        time_norm=float(so.time_norm or op.time_norm or 0),
+        price=float(op.operation_price or 0),
+        spec_ref1c=spec_ref,
+        stage_ref1c=stage_ref,
+        structural_unit_ref1c=structural_unit_ref,
     )
 
 
@@ -152,47 +237,7 @@ def _collect_export_entries(
             })
             continue
 
-        operation_ref = None
-        time_norm = 0.0
-        stage_ref = None
-        structural_unit_ref = None
-        spec_ref = None
-        if m.product and m.product.spec_id:
-            spec = db.query(Specification).filter(Specification.spec_id == int(m.product.spec_id)).one_or_none()
-            spec_ref = _clean_ref1c(getattr(spec, "spec_ref1c", None)) or None
-            spec_operation = (
-                db.query(SpecOperation, Operation)
-                .join(Operation, Operation.operation_id == SpecOperation.operation_id)
-                .filter(SpecOperation.spec_id == int(m.product.spec_id))
-                .filter(Operation.operation_ref1c.isnot(None))
-                .order_by(SpecOperation.spec_operation_id.asc())
-                .first()
-            )
-            if spec_operation:
-                so, op = spec_operation
-                operation_ref = _clean_ref1c(op.operation_ref1c) or None
-                time_norm = float(so.time_norm or 0)
-                if so.stage_id:
-                    stage = db.query(ProductionStage).filter(ProductionStage.stage_id == int(so.stage_id)).one_or_none()
-                    stage_ref = _clean_ref1c(getattr(stage, "stage_ref1c", None)) or None
-                    resource_stage = (
-                        db.query(ResourceStage)
-                        .filter(ResourceStage.stage_id == int(so.stage_id))
-                        .order_by(ResourceStage.id.asc())
-                        .first()
-                    )
-                    if resource_stage:
-                        binding = (
-                            db.query(WorkshopWarehouseBinding)
-                            .filter(WorkshopWarehouseBinding.workshop_id == int(resource_stage.resource_id))
-                            .one_or_none()
-                        )
-                        if binding:
-                            structural_unit_ref = (
-                                _clean_ref1c(binding.production_warehouse_ref1c)
-                                or _clean_ref1c(binding.warehouse_ref1c)
-                                or None
-                            )
+        operation_defaults = _piecework_operation_defaults(db, m.product)
 
         employee_ref = None
         if m.executor:
@@ -215,11 +260,12 @@ def _collect_export_entries(
             item_name=str(item.item_name or "") if item else "",
             unit_ref1c=_clean_ref1c(item.unit) if item else None,
             qty=float(m.qty or 0),
-            operation_ref1c=operation_ref,
-            time_norm=time_norm,
-            spec_ref1c=spec_ref or None,
-            stage_ref1c=stage_ref,
-            structural_unit_ref1c=structural_unit_ref,
+            operation_ref1c=operation_defaults.operation_ref1c,
+            time_norm=operation_defaults.time_norm,
+            price=operation_defaults.price,
+            spec_ref1c=operation_defaults.spec_ref1c,
+            stage_ref1c=operation_defaults.stage_ref1c,
+            structural_unit_ref1c=operation_defaults.structural_unit_ref1c,
             employee_ref1c=employee_ref,
             number=piecework_number(db, m),
         ))
@@ -248,7 +294,7 @@ def _build_header_payload(
     structural_unit_ref = structural_unit_ref or entry.structural_unit_ref1c
     link_key = int(entry.manufacture_id) % 2_000_000_000
     hours = entry.qty * time_norm
-    cost = entry.qty * price
+    price = float(price or entry.price or 0.0)
 
     comment = (
         f"PRODPLAN source=piecework/{entry.manufacture_id}; "
@@ -264,11 +310,12 @@ def _build_header_payload(
         "КоличествоПлан": float(entry.qty),
         "КоличествоФакт": float(entry.qty),
         "НормаВремени": float(time_norm),
-        "Расценка": float(price),
         "Нормочасы": float(hours),
-        "Стоимость": float(cost),
         "КлючСвязи": link_key,
     }
+    if price > 0:
+        operation_row["Расценка"] = float(price)
+        operation_row["Стоимость"] = float(entry.qty * price)
     if entry.order_ref1c:
         operation_row["ЗаказНаПроизводство_Key"] = entry.order_ref1c
     if structural_unit_ref:

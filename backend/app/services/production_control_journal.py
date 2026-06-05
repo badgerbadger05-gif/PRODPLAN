@@ -875,19 +875,25 @@ def _default_spec_id_for_item(db: Session, item_id: int) -> Optional[int]:
     return int(row.spec_id) if row else None
 
 
-def _planned_dates_by_item(db: Session, run_id: Optional[int]) -> Dict[int, Tuple[Optional[date], Optional[date]]]:
+def _planned_dates_by_item(
+    db: Session,
+    run_id: Optional[int],
+    item_ids: Optional[Sequence[int]] = None,
+) -> Dict[int, Tuple[Optional[date], Optional[date]]]:
     if not run_id:
         return {}
-    rows = (
+    q = (
         db.query(
             PlannedOrder.item_id,
             func.min(PlannedOrder.start_date).label("start_date"),
             func.max(PlannedOrder.finish_date).label("finish_date"),
         )
         .filter(PlannedOrder.run_id == run_id)
-        .group_by(PlannedOrder.item_id)
-        .all()
     )
+    ids = sorted({int(item_id) for item_id in (item_ids or []) if item_id is not None})
+    if ids:
+        q = q.filter(PlannedOrder.item_id.in_(ids))
+    rows = q.group_by(PlannedOrder.item_id).all()
     return {int(r.item_id): (r.start_date, r.finish_date) for r in rows}
 
 
@@ -909,9 +915,9 @@ def list_journal(
     offset: int = 0,
 ) -> Dict[str, Any]:
     run_id = _latest_run_id(db)
-    plan_dates = _planned_dates_by_item(db, run_id)
     latest_run = db.query(PlanningRun).filter(PlanningRun.run_id == run_id).first() if run_id else None
     requested_coverage_status = str(coverage_status) if coverage_status else None
+    live_coverage_allowed = product_id is not None or requested_coverage_status is not None
 
     query = (
         db.query(ProductionProduct)
@@ -956,7 +962,46 @@ def list_journal(
     if finish:
         query = query.filter(ProductionOrder.order_date < datetime.combine(finish, datetime.max.time()))
 
-    rows = query.order_by(ProductionOrder.order_date.desc(), ProductionOrder.order_number.asc(), ProductionProduct.line_number.asc()).all()
+    sort_field = (sort_by or "").strip().lower()
+    fast_page = not workshop_id and not requested_coverage_status
+    if fast_page:
+        total = int(query.count())
+        effective_limit = max(1, min(int(limit or 100), 500))
+        requested_offset = max(0, int(offset or 0))
+        max_offset = max(0, ((total - 1) // effective_limit) * effective_limit) if total else 0
+        effective_offset = min(requested_offset, max_offset)
+        if sort_field in {"planned_start_date", "planned_finish_date"}:
+            planned_dates_sq = (
+                db.query(
+                    PlannedOrder.item_id.label("item_id"),
+                    func.min(PlannedOrder.start_date).label("start_date"),
+                    func.max(PlannedOrder.finish_date).label("finish_date"),
+                )
+                .filter(PlannedOrder.run_id == run_id)
+                .group_by(PlannedOrder.item_id)
+                .subquery()
+            )
+            query = query.outerjoin(planned_dates_sq, planned_dates_sq.c.item_id == ProductionProduct.item_id)
+            date_expr = (
+                func.coalesce(ProductionOrderLineState.planned_finish_date, planned_dates_sq.c.finish_date)
+                if sort_field == "planned_finish_date"
+                else func.coalesce(ProductionOrderLineState.planned_start_date, planned_dates_sq.c.start_date)
+            )
+            if (sort_dir or "").strip().lower() == "desc":
+                query = query.order_by(date_expr.is_(None), date_expr.desc(), ProductionOrder.order_number.asc(), ProductionProduct.line_number.asc())
+            else:
+                query = query.order_by(date_expr.is_(None), date_expr.asc(), ProductionOrder.order_number.asc(), ProductionProduct.line_number.asc())
+        else:
+            query = query.order_by(ProductionOrder.order_date.desc(), ProductionOrder.order_number.asc(), ProductionProduct.line_number.asc())
+        rows = query.offset(effective_offset).limit(effective_limit).all()
+    else:
+        rows = query.order_by(ProductionOrder.order_date.desc(), ProductionOrder.order_number.asc(), ProductionProduct.line_number.asc()).all()
+        total = 0
+        effective_limit = max(1, min(int(limit or 100), 500))
+        effective_offset = max(0, int(offset or 0))
+
+    page_item_ids = sorted({int(product.item_id) for product in rows if product.item_id is not None})
+    plan_dates = _planned_dates_by_item(db, run_id, page_item_ids)
     order_ids = sorted({int(product.order_id) for product in rows})
     run_ids = sorted({
         int(product.order.source_run_id)
@@ -1088,7 +1133,7 @@ def list_journal(
         issue_count = issue_count_by_product.get(int(product.product_id), 0)
         line_status = str(state.status if state else "shortage")
         issue_status = str(state.issue_status if state else "not_requested")
-        if order_source == "mrp" and issue_status == "not_requested" and line_status in ACTIVE_COVERAGE_STATUSES:
+        if live_coverage_allowed and order_source == "mrp" and issue_status == "not_requested" and line_status in ACTIVE_COVERAGE_STATUSES:
             try:
                 from .production_control_material_availability import preview_materials
 
@@ -1156,20 +1201,20 @@ def list_journal(
     if requested_coverage_status:
         result = [row for row in result if str(row.get("coverage_status") or "") == requested_coverage_status]
 
-    sort_field = (sort_by or "").strip().lower()
-    if sort_field in {"planned_start_date", "planned_finish_date"}:
+    if not fast_page and sort_field in {"planned_start_date", "planned_finish_date"}:
         descending = (sort_dir or "").strip().lower() == "desc"
         result.sort(key=lambda row: (row.get("order_number") or "", row.get("line_number") or 0))
         result.sort(key=lambda row: row.get(sort_field) or "", reverse=descending)
         result.sort(key=lambda row: row.get(sort_field) in (None, ""))
 
-    total = len(result)
-    effective_limit = max(1, min(int(limit or 100), 500))
-    requested_offset = max(0, int(offset or 0))
-    max_offset = max(0, ((total - 1) // effective_limit) * effective_limit) if total else 0
-    effective_offset = min(requested_offset, max_offset)
+    if not fast_page:
+        total = len(result)
+        requested_offset = max(0, int(offset or 0))
+        max_offset = max(0, ((total - 1) // effective_limit) * effective_limit) if total else 0
+        effective_offset = min(requested_offset, max_offset)
+        result = result[effective_offset : effective_offset + effective_limit]
     return {
-        "rows": result[effective_offset : effective_offset + effective_limit],
+        "rows": result,
         "total": total,
         "limit": effective_limit,
         "offset": effective_offset,

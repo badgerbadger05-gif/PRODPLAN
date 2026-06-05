@@ -6,11 +6,15 @@ from datetime import datetime
 import pytest
 
 from app.models import (
+    DefaultSpecification,
     Item,
+    Operation,
     ProductionManufacture,
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
+    Specification,
+    SpecOperation,
     SyncLink,
 )
 from app.services import one_c_piecework_export as exporter
@@ -180,6 +184,48 @@ def test_norm_and_price_computed(db_session):
     assert op["Расценка"] == 10.0
     assert op["Нормочасы"] == pytest.approx(2.0)
     assert op["Стоимость"] == pytest.approx(40.0)
+
+
+def test_default_spec_operation_used_when_product_spec_missing(db_session):
+    db = db_session
+    item = _mk_item(db, code="PW-DEF-SPEC", ref1c="item-ref-def-spec")
+    spec = Specification(spec_name="Default piecework spec", spec_ref1c="spec-ref-def")
+    operation = Operation(operation_ref1c="op-ref-def", operation_name="Сборка", time_norm=0.25, operation_price=30)
+    db.add_all([spec, operation])
+    db.flush()
+    db.add(DefaultSpecification(item_id=item.item_id, spec_id=spec.spec_id))
+    db.add(SpecOperation(spec_id=spec.spec_id, operation_id=operation.operation_id, time_norm=0.75))
+    db.commit()
+    m = _mk_manufacture(db, item, qty=2.0, exported_ref1c="ref-def-spec")
+
+    result = exporter.export_piecework_to_1c(db, [m.manufacture_id], dry_run=True)
+
+    op = result["payloads"][0]["payload"]["Операции"][0]
+    assert op["Операция_Key"] == "op-ref-def"
+    assert op["Спецификация_Key"] == "spec-ref-def"
+    assert op["НормаВремени"] == 0.75
+    assert op["Расценка"] == 30.0
+    assert op["Нормочасы"] == pytest.approx(1.5)
+    assert op["Стоимость"] == pytest.approx(60.0)
+
+
+def test_zero_price_is_not_sent_as_piecework_rate(db_session):
+    db = db_session
+    item = _mk_item(db, code="PW-NO-PRICE", ref1c="item-ref-no-price")
+    m = _mk_manufacture(db, item, qty=4.0, exported_ref1c="ref-no-price")
+
+    result = exporter.export_piecework_to_1c(
+        db, [m.manufacture_id],
+        operation_ref="op-ref",
+        time_norm=0.5,
+        price=0.0,
+        dry_run=True,
+    )
+
+    op = result["payloads"][0]["payload"]["Операции"][0]
+    assert "Расценка" not in op
+    assert "Стоимость" not in op
+    assert op["Нормочасы"] == pytest.approx(2.0)
 
 
 def test_optional_org_and_unit_in_payload(db_session):

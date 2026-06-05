@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import type { MrpCapacityRow, MrpProductionRow, MrpPurchaseRow, MrpReworkRow, MrpSummary } from '../../domain/planning'
 import { planningStatusLabel } from '../../domain/planning'
@@ -24,6 +24,14 @@ import { StatusBar } from '../layout/StatusBar'
 type Tab = 'production' | 'purchases' | 'rework' | 'capacity'
 
 const limit = 200
+
+function emptyTabFlags(): Record<Tab, boolean> {
+  return { production: false, purchases: false, rework: false, capacity: false }
+}
+
+function emptyTabOffsets(): Record<Tab, number> {
+  return { production: 0, purchases: 0, rework: 0, capacity: 0 }
+}
 
 function parseTab(value: string | null): Tab | null {
   if (value === 'production' || value === 'purchases' || value === 'rework' || value === 'capacity') return value
@@ -64,7 +72,9 @@ export function MrpResultPage() {
   const highlightedPurchaseId = parseId(searchParams.get('purchase_id'))
   const highlightedReworkId = parseId(searchParams.get('rework_id'))
   const [summary, setSummary] = useState<MrpSummary | null>(null)
-  const [tab, setTab] = useState<Tab>('production')
+  const [tab, setTab] = useState<Tab>(() => queryTab ?? 'production')
+  const [loadedTabs, setLoadedTabs] = useState<Record<Tab, boolean>>(() => emptyTabFlags())
+  const [offsets, setOffsets] = useState<Record<Tab, number>>(() => emptyTabOffsets())
   const [productionRows, setProductionRows] = useState<MrpProductionRow[]>([])
   const [purchaseRows, setPurchaseRows] = useState<MrpPurchaseRow[]>([])
   const [reworkRows, setReworkRows] = useState<MrpReworkRow[]>([])
@@ -75,6 +85,8 @@ export function MrpResultPage() {
   const [capacityTotal, setCapacityTotal] = useState(0)
   const [dateFrom, setDateFrom] = useState('')
   const [dateTo, setDateTo] = useState('')
+  const [draftDateFrom, setDraftDateFrom] = useState('')
+  const [draftDateTo, setDraftDateTo] = useState('')
   const [loading, setLoading] = useState(false)
   const [exporting, setExporting] = useState(false)
   const [selectedProductionIds, setSelectedProductionIds] = useState<Set<number>>(new Set())
@@ -86,6 +98,7 @@ export function MrpResultPage() {
   const [rootDialogOpen, setRootDialogOpen] = useState(false)
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
+  const loadSeq = useRef(0)
 
   const purchaseSupplierOptions = useMemo(() => {
     const map = new Map<string, string>()
@@ -118,8 +131,11 @@ export function MrpResultPage() {
       return true
     })
   ), [purchaseCategoryFilter, purchaseRows, purchaseSupplierFilter])
-  const activeTotal = tab === 'production' ? productionTotal : tab === 'purchases' ? filteredPurchaseRows.length : tab === 'rework' ? reworkTotal : capacityTotal
-  const activeRowsLength = tab === 'production' ? productionRows.length : tab === 'purchases' ? filteredPurchaseRows.length : tab === 'rework' ? reworkRows.length : capacityRows.length
+  const activeOffset = offsets[tab]
+  const activeTotal = tab === 'production' ? productionTotal : tab === 'purchases' ? purchaseTotal : tab === 'rework' ? reworkTotal : capacityTotal
+  const activeRowsLength = tab === 'production' ? productionRows.length : tab === 'purchases' ? purchaseRows.length : tab === 'rework' ? reworkRows.length : capacityRows.length
+  const activeVisibleFrom = activeTotal && activeRowsLength ? activeOffset + 1 : 0
+  const activeVisibleTo = activeTotal && activeRowsLength ? Math.min(activeOffset + activeRowsLength, activeTotal) : 0
   const selectedCount = tab === 'production' ? selectedProductionIds.size : tab === 'purchases' ? selectedPurchaseIds.size : 0
 
   const totals = useMemo(() => ({
@@ -133,38 +149,80 @@ export function MrpResultPage() {
     if (queryTab) setTab(queryTab)
   }, [queryTab])
 
-  const load = useCallback(async (nextDateFrom = '', nextDateTo = '', nextRootItemId: number | null = null) => {
+  const loadSummary = useCallback(async () => {
+    try {
+      setSummary(await getPlanningRunSummary(runId))
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }, [runId])
+
+  const loadTab = useCallback(async (targetTab: Tab, nextOffset: number) => {
+    const seq = ++loadSeq.current
     setLoading(true)
     setError('')
     setMessage('')
     try {
-      const params = { date_from: nextDateFrom || undefined, date_to: nextDateTo || undefined, root_item_id: nextRootItemId, limit, offset: 0 }
-      const [summaryData, productionData, purchaseData, reworkData, capacityData] = await Promise.all([
-        getPlanningRunSummary(runId),
-        getPlanningResultProduction(runId, params),
-        getPlanningResultPurchases(runId, params),
-        getPlanningResultRework(runId, params),
-        getPlanningResultCapacity(runId, params),
-      ])
-      setSummary(summaryData)
-      setProductionRows(productionData.rows ?? [])
-      setProductionTotal(productionData.total ?? 0)
-      setPurchaseRows(purchaseData.rows ?? [])
-      setPurchaseTotal(purchaseData.total ?? 0)
-      setReworkRows(reworkData.rows ?? [])
-      setReworkTotal(reworkData.total ?? 0)
-      setCapacityRows(capacityData.rows ?? [])
-      setCapacityTotal(capacityData.total ?? 0)
-      setSelectedProductionIds(new Set())
-      setSelectedPurchaseIds(new Set())
-      setPurchaseSupplierFilter('')
-      setPurchaseCategoryFilter('')
+      const params = { date_from: dateFrom || undefined, date_to: dateTo || undefined, root_item_id: rootItemId, limit, offset: nextOffset }
+      if (targetTab === 'production') {
+        const data = await getPlanningResultProduction(runId, params)
+        if (seq !== loadSeq.current) return
+        setProductionRows(data.rows ?? [])
+        setProductionTotal(data.total ?? 0)
+      } else if (targetTab === 'purchases') {
+        const data = await getPlanningResultPurchases(runId, params)
+        if (seq !== loadSeq.current) return
+        setPurchaseRows(data.rows ?? [])
+        setPurchaseTotal(data.total ?? 0)
+      } else if (targetTab === 'rework') {
+        const data = await getPlanningResultRework(runId, params)
+        if (seq !== loadSeq.current) return
+        setReworkRows(data.rows ?? [])
+        setReworkTotal(data.total ?? 0)
+      } else {
+        const data = await getPlanningResultCapacity(runId, params)
+        if (seq !== loadSeq.current) return
+        setCapacityRows(data.rows ?? [])
+        setCapacityTotal(data.total ?? 0)
+      }
+      setOffsets((prev) => ({ ...prev, [targetTab]: nextOffset }))
+      setLoadedTabs((prev) => ({ ...prev, [targetTab]: true }))
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      if (seq === loadSeq.current) setError(e instanceof Error ? e.message : String(e))
     } finally {
-      setLoading(false)
+      if (seq === loadSeq.current) setLoading(false)
     }
-  }, [runId])
+  }, [dateFrom, dateTo, rootItemId, runId])
+
+  const invalidateTabs = useCallback(() => {
+    loadSeq.current += 1
+    setLoadedTabs(emptyTabFlags())
+    setOffsets(emptyTabOffsets())
+    setProductionRows([])
+    setPurchaseRows([])
+    setReworkRows([])
+    setCapacityRows([])
+    setProductionTotal(0)
+    setPurchaseTotal(0)
+    setReworkTotal(0)
+    setCapacityTotal(0)
+    setSelectedProductionIds(new Set())
+    setSelectedPurchaseIds(new Set())
+    setPurchaseSupplierFilter('')
+    setPurchaseCategoryFilter('')
+  }, [])
+
+  const refreshActiveTab = useCallback(() => {
+    void loadTab(tab, offsets[tab])
+  }, [loadTab, offsets, tab])
+
+  useEffect(() => {
+    void loadSummary()
+  }, [loadSummary])
+
+  useEffect(() => {
+    if (!loadedTabs[tab]) void loadTab(tab, offsets[tab])
+  }, [loadedTabs, loadTab, offsets, tab])
 
   useEffect(() => {
     let cancelled = false
@@ -219,7 +277,8 @@ export function MrpResultPage() {
         planned_order_ids: Array.from(selectedProductionIds),
       })
       setSelectedProductionIds(new Set())
-      await load(dateFrom, dateTo, rootItemId)
+      await loadSummary()
+      await loadTab('production', offsets.production)
       setMessage(formatActionResult('Создание заказов', result))
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -248,9 +307,29 @@ export function MrpResultPage() {
     }
   }
 
-  useEffect(() => {
-    void load()
-  }, [load])
+  function applyDateFilters() {
+    setDateFrom(draftDateFrom)
+    setDateTo(draftDateTo)
+    invalidateTabs()
+  }
+
+  function applyRootFilter(value: number | null) {
+    setRootItemId(value)
+    setRootDialogOpen(false)
+    invalidateTabs()
+  }
+
+  function goPrev() {
+    const nextOffset = Math.max(0, activeOffset - limit)
+    setLoadedTabs((prev) => ({ ...prev, [tab]: false }))
+    setOffsets((prev) => ({ ...prev, [tab]: nextOffset }))
+  }
+
+  function goNext() {
+    const nextOffset = activeOffset + limit
+    setLoadedTabs((prev) => ({ ...prev, [tab]: false }))
+    setOffsets((prev) => ({ ...prev, [tab]: nextOffset }))
+  }
 
   return (
     <main className="workArea">
@@ -266,20 +345,20 @@ export function MrpResultPage() {
         footer={(
           <StatusBar
             loading={loading}
-            visibleFrom={activeTotal ? 1 : 0}
-            visibleTo={Math.min(activeRowsLength, activeTotal)}
+            visibleFrom={activeVisibleFrom}
+            visibleTo={activeVisibleTo}
             total={activeTotal}
             selectedCount={selectedCount}
-            canPrev={false}
-            canNext={false}
-            onPrev={() => undefined}
-            onNext={() => undefined}
+            canPrev={activeOffset > 0}
+            canNext={activeOffset + activeRowsLength < activeTotal}
+            onPrev={goPrev}
+            onNext={goNext}
           />
         )}
       >
         <div className="commandBar">
           <button onClick={() => navigate('/mrp-runs')}>К списку прогонов</button>
-          <button onClick={() => void load(dateFrom, dateTo, rootItemId)} disabled={loading}>Обновить</button>
+          <button onClick={() => { void loadSummary(); refreshActiveTab() }} disabled={loading}>Обновить</button>
           {tab !== 'capacity' && <button onClick={() => void exportActive('xlsx')} disabled={loading || exporting}>XLSX</button>}
           {tab === 'production' && <button className="primary" onClick={() => void createSelectedProductionOrders()} disabled={!selectedProductionIds.size || loading || exporting}>Создать заказы ({selectedProductionIds.size})</button>}
           {tab === 'purchases' && <button className="primary" onClick={() => void exportSelectedPurchasesTo1C()} disabled={!selectedPurchaseIds.size || loading || exporting}>Выгрузить в 1С ({selectedPurchaseIds.size})</button>}
@@ -289,13 +368,13 @@ export function MrpResultPage() {
           <div className="barSeparator" />
           <label className="inlineControl">
             <span>С</span>
-            <input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} />
+            <input type="date" value={draftDateFrom} onChange={(e) => setDraftDateFrom(e.target.value)} />
           </label>
           <label className="inlineControl">
             <span>По</span>
-            <input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} />
+            <input type="date" value={draftDateTo} onChange={(e) => setDraftDateTo(e.target.value)} />
           </label>
-          <button className="filterBtn" onClick={() => void load(dateFrom, dateTo, rootItemId)} disabled={loading}>Сформировать</button>
+          <button className="filterBtn" onClick={applyDateFilters} disabled={loading}>Сформировать</button>
         </div>
 
         {error && <div className="errorLine">{error}</div>}
@@ -341,11 +420,7 @@ export function MrpResultPage() {
         open={rootDialogOpen}
         options={rootOptions}
         value={rootItemId}
-        onApply={(value) => {
-          setRootItemId(value)
-          setRootDialogOpen(false)
-          void load(dateFrom, dateTo, value)
-        }}
+        onApply={applyRootFilter}
         onClose={() => setRootDialogOpen(false)}
       />
     </main>

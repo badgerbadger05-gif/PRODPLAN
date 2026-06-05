@@ -3,6 +3,7 @@ import json
 from datetime import datetime
 
 import pytest
+from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError
 
 from app.models import (
@@ -154,6 +155,81 @@ def test_route_sheet_includes_material_transfer_route(db_session):
     assert "Несоотв." in html
     assert "Годн." in html
     assert "Клеймо, ФИО, подпись, дата" in html
+
+
+def test_route_sheet_printing_batches_multiple_products(db_session):
+    item = Item(
+        item_code="P-ROUTE-BATCH",
+        item_name="Деталь пакетной печати",
+        item_article="ART-BATCH",
+        unit="шт",
+        status="active",
+    )
+    component = Item(
+        item_code="C-ROUTE-BATCH",
+        item_name="Материал пакетной печати",
+        item_article="MAT-BATCH",
+        unit="кг",
+        status="active",
+    )
+    spec = Specification(spec_name="Спецификация пакетной печати", spec_ref1c="spec-route-batch")
+    stage = ProductionStage(stage_name="Сборка", stage_order=1)
+    operation = Operation(operation_ref1c="op-route-batch", operation_name="Собрать")
+    db_session.add_all([item, component, spec, stage, operation])
+    db_session.flush()
+    db_session.add(DefaultSpecification(item_id=item.item_id, spec_id=spec.spec_id))
+    db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=component.item_id, quantity=2))
+    db_session.add(
+        SpecOperation(
+            spec_id=spec.spec_id,
+            stage_id=stage.stage_id,
+            operation_id=operation.operation_id,
+            time_norm=1.5,
+        )
+    )
+
+    product_ids = []
+    for idx in range(3):
+        order = ProductionOrder(
+            order_number=f"MRP-BATCH-{idx + 1}",
+            order_date=datetime(2026, 6, 4),
+            deletion_mark=False,
+            source="mrp",
+        )
+        db_session.add(order)
+        db_session.flush()
+        product = ProductionProduct(
+            order_id=order.order_id,
+            item_id=item.item_id,
+            line_number=1,
+            quantity=idx + 1,
+            produced_qty=0,
+            remaining_qty=idx + 1,
+        )
+        db_session.add(product)
+        db_session.flush()
+        product_ids.append(product.product_id)
+    db_session.commit()
+
+    statements = []
+
+    def before_cursor_execute(*_args):
+        statements.append(1)
+
+    event.listen(db_session.bind, "before_cursor_execute", before_cursor_execute)
+    try:
+        html = render_route_sheets_html(db_session, product_ids)
+    finally:
+        event.remove(db_session.bind, "before_cursor_execute", before_cursor_execute)
+
+    assert "Листов: 3" in html
+    assert html.count("МАРШРУТНЫЙ ЛИСТ №") == 3
+    assert "MRP-BATCH-1" in html
+    assert "MRP-BATCH-2" in html
+    assert "MRP-BATCH-3" in html
+    assert "Материал пакетной печати" in html
+    assert "Собрать" in html
+    assert len(statements) <= 10
 
 
 def test_journal_and_material_issue_are_scoped_to_order_line(db_session):
