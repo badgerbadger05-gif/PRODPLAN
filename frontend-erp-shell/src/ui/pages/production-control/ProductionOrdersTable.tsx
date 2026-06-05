@@ -76,7 +76,10 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
               <strong>{orderMainLine(row)}</strong>
               <span>{orderSubline(row)}</span>
             </td>
-            <td className="itemCell">
+            <td
+              className={`itemCell ${row.route_sheet_printed_at ? 'printedRouteSheetCell' : ''}`}
+              title={row.route_sheet_printed_at ? `Маршрутный лист печатался ${dateRu(row.route_sheet_printed_at)}` : undefined}
+            >
               <strong>{row.item_name}</strong>
               <span>{row.item_article || row.item_code || ''}</span>
             </td>
@@ -103,16 +106,6 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
                 {row.coverage_label || coverageLabels[String(row.coverage_status || row.status || '')] || row.coverage_status || row.status || '—'}
               </span>
               {!!row.issue_count && <span className="muted issueCount">док. {row.issue_count}</span>}
-            </td>
-            <td>
-              {row.route_sheet_printed_at ? (
-                <>
-                  <span className="pill printed">Печатался</span>
-                  <span className="muted issueCount">{dateRu(row.route_sheet_printed_at)}</span>
-                </>
-              ) : (
-                <span className="pill notPrinted">Не печатался</span>
-              )}
             </td>
           </tr>
         ))}
