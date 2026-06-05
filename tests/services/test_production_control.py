@@ -39,7 +39,7 @@ from app.services.production_control_journal import (
     list_journal,
     update_product_quantity,
 )
-from app.services.production_control_material_availability import preview_materials
+from app.services.production_control_material_availability import preview_materials, recalculate_production_coverage
 from app.services.production_control_material_issues import create_material_issues, delete_local_material_issue, list_material_issues
 from app.services.production_control_printing import render_route_sheets_html
 
@@ -1884,16 +1884,20 @@ def test_preview_materials_marks_ready_when_stock_covers_all(db_session):
         assert c["coverage"] == "ok"
         assert c["missing_qty"] == 0
         assert c["eta_dates"] == []
-    # Line status auto-bumped from default 'shortage' to 'ready'.
+    # Material coverage is cached on the line state; the workflow status is
+    # bumped only while the line has not moved past the coverage band.
     state = (
         db_session.query(ProductionOrderLineState)
         .filter_by(product_id=product.product_id)
         .one()
     )
     assert state.status == "ready"
+    assert state.material_coverage_status == "ready"
+    assert state.material_coverage_label == "Обеспечен"
+    assert state.material_coverage_calculated_at is not None
 
 
-def test_journal_uses_live_material_coverage_for_coverage_band_rows(db_session):
+def test_journal_uses_cached_material_coverage_for_coverage_band_rows(db_session):
     parent, _spec, _comps = _make_basic_spec(
         db_session,
         parent_name="JournalReadyParent",
@@ -1911,6 +1915,8 @@ def test_journal_uses_live_material_coverage_for_coverage_band_rows(db_session):
         db_session.add(state)
     state.status = "shortage"
     state.issue_status = "not_requested"
+    state.material_coverage_status = "ready"
+    state.material_coverage_label = "Обеспечен"
     db_session.commit()
 
     row = list_journal(db_session, product_id=product.product_id)["rows"][0]
@@ -1992,6 +1998,7 @@ def test_preview_materials_marks_partial_when_some_stock(db_session):
         .one()
     )
     assert state.status == "partial"
+    assert state.material_coverage_status == "partial"
 
 
 def test_preview_materials_does_not_override_post_coverage_status(db_session):
@@ -2031,6 +2038,27 @@ def test_preview_materials_does_not_override_post_coverage_status(db_session):
         .one()
     )
     assert refreshed.status == "to_move"
+    assert refreshed.material_coverage_status == "shortage"
+
+
+def test_recalculate_production_coverage_refreshes_static_cache(db_session):
+    parent, _spec, _comps = _make_basic_spec(
+        db_session,
+        parent_name="CachedParent",
+        child_specs=[("CACHED1", "Cached component", 10, 1)],
+    )
+    _order, product = _make_internal_order_for(db_session, parent, qty=2)
+
+    result = recalculate_production_coverage(db_session)
+
+    assert result["processed"] == 1
+    state = (
+        db_session.query(ProductionOrderLineState)
+        .filter_by(product_id=product.product_id)
+        .one()
+    )
+    assert state.material_coverage_status == "ready"
+    assert state.material_coverage_label == "Обеспечен"
 
 
 # ---------------------------------------------------------------------------

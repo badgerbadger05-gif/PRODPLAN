@@ -95,8 +95,15 @@ export function ProductionDetailPane({
   const hasMrpCoverage = activeRow?.source_mrp_requirement_id != null && activeRow?.mrp_req_net_qty != null
   const mrpRemaining = activeRow?.mrp_req_remaining_qty ?? 0
   const canFillRemaining = hasMrpCoverage && mrpRemaining > 0.001 && !!activeRow?.source_run_id
-  const activeCoverageStatus = materials?.coverage_status || activeRow?.coverage_status || activeRow?.status || 'unknown'
-  const activeCoverageLabel = materials?.coverage_label || activeRow?.coverage_label || coverageLabels[String(activeCoverageStatus)] || activeCoverageStatus
+  const canUseMaterialCoverage = !activeRow?.issue_status || activeRow.issue_status === 'not_requested'
+  const activeCoverageStatus = (canUseMaterialCoverage ? materials?.coverage_status : '')
+    || activeRow?.coverage_status
+    || activeRow?.status
+    || 'unknown'
+  const activeCoverageLabel = (canUseMaterialCoverage ? materials?.coverage_label : '')
+    || activeRow?.coverage_label
+    || coverageLabels[String(activeCoverageStatus)]
+    || activeCoverageStatus
   const planSourceLabel = activeRow?.source_plan_name
     || (activeRow?.source_plan_id ? `План #${activeRow.source_plan_id}` : '')
 

@@ -93,11 +93,17 @@ def _journal_work_status(line_status: str) -> str:
     return line_status
 
 
-def _journal_coverage_status(line_status: str, issue_status: str) -> str:
+def _journal_coverage_status(
+    line_status: str,
+    issue_status: str,
+    material_coverage_status: Optional[str] = None,
+) -> str:
     if issue_status == "posted":
         return "assembled"
     if issue_status in {"requested", "issued", "exported"}:
         return "to_move"
+    if material_coverage_status in ACTIVE_COVERAGE_STATUSES:
+        return material_coverage_status
     return line_status
 
 
@@ -917,7 +923,6 @@ def list_journal(
     run_id = _latest_run_id(db)
     latest_run = db.query(PlanningRun).filter(PlanningRun.run_id == run_id).first() if run_id else None
     requested_coverage_status = str(coverage_status) if coverage_status else None
-    live_coverage_allowed = product_id is not None or requested_coverage_status is not None
 
     query = (
         db.query(ProductionProduct)
@@ -1133,21 +1138,18 @@ def list_journal(
         issue_count = issue_count_by_product.get(int(product.product_id), 0)
         line_status = str(state.status if state else "shortage")
         issue_status = str(state.issue_status if state else "not_requested")
-        if live_coverage_allowed and order_source == "mrp" and issue_status == "not_requested" and line_status in ACTIVE_COVERAGE_STATUSES:
-            try:
-                from .production_control_material_availability import preview_materials
-
-                material_preview = preview_materials(db, int(product.product_id), refresh_state=False)
-                refreshed_coverage = str(material_preview.get("coverage_status") or "")
-                has_materials = bool(material_preview.get("spec_id")) and bool(material_preview.get("components"))
-                if has_materials and refreshed_coverage in ACTIVE_COVERAGE_STATUSES:
-                    line_status = refreshed_coverage
-            except Exception:
-                # The journal must remain available even if one row has a
-                # broken/missing specification; keep its stored status then.
-                pass
-        work_status = _journal_work_status(line_status)
-        row_coverage_status = _journal_coverage_status(line_status, issue_status)
+        material_coverage_status = str(getattr(state, "material_coverage_status", "") or "")
+        material_coverage_label = str(getattr(state, "material_coverage_label", "") or "")
+        row_coverage_status = _journal_coverage_status(line_status, issue_status, material_coverage_status)
+        if issue_status in {"", "not_requested"} and row_coverage_status in ACTIVE_COVERAGE_STATUSES:
+            work_status = _journal_work_status(row_coverage_status)
+        else:
+            work_status = _journal_work_status(line_status)
+        coverage_label = (
+            material_coverage_label
+            if row_coverage_status == material_coverage_status and material_coverage_label
+            else COVERAGE_LABELS.get(row_coverage_status, row_coverage_status)
+        )
         result.append(
             {
                 "product_id": int(product.product_id),
@@ -1173,8 +1175,11 @@ def list_journal(
                 "remaining_qty": _to_float(product.remaining_qty),
                 "status": work_status,
                 "coverage_status": row_coverage_status,
-                "coverage_label": COVERAGE_LABELS.get(row_coverage_status, row_coverage_status),
+                "coverage_label": coverage_label,
                 "issue_status": issue_status,
+                "material_coverage_status": material_coverage_status or None,
+                "material_coverage_label": material_coverage_label or None,
+                "material_coverage_calculated_at": _date_to_iso(getattr(state, "material_coverage_calculated_at", None)) if state else None,
                 "planned_start_date": _date_to_iso(planned_start),
                 "planned_finish_date": _date_to_iso(planned_finish),
                 **forecast,

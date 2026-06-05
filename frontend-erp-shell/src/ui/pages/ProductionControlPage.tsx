@@ -243,22 +243,22 @@ export function ProductionControlPage() {
     }
   }
 
-  const loadMaterials = useCallback(async (row: OrderRow) => {
-    setActiveId(row.product_id)
+  const loadMaterials = useCallback(async (productId: number, refresh = true) => {
+    setActiveId(productId)
     setMaterials(null)
     try {
-      const data = await api<MaterialsResponse>(`/v1/production-control/orders/${row.product_id}/materials`)
+      const data = await api<MaterialsResponse>(`/v1/production-control/orders/${productId}/materials${refresh ? '?refresh=true' : ''}`)
       setMaterials(data)
       const coverageStatus = String(data.coverage_status || '')
       if (coverageStatus) {
         setRows((list) => list.map((item) => {
-          if (item.product_id !== row.product_id) return item
-          const nextStatus = item.issue_status === 'not_requested' && coverageDrivenStatuses.has(String(item.status || ''))
-            ? coverageStatus
-            : item.status
+          if (item.product_id !== productId) return item
+          const canApplyMaterialCoverage = (!item.issue_status || item.issue_status === 'not_requested')
+            && coverageDrivenStatuses.has(String(item.coverage_status || item.status || ''))
+          if (!canApplyMaterialCoverage) return item
           return {
             ...item,
-            status: nextStatus,
+            status: coverageDrivenStatuses.has(String(item.status || '')) ? coverageStatus : item.status,
             coverage_status: coverageStatus,
             coverage_label: data.coverage_label || coverageLabels[coverageStatus] || coverageStatus,
           }
@@ -765,8 +765,8 @@ export function ProductionControlPage() {
   }, [load, loadResources])
 
   useEffect(() => {
-    if (activeRow) void loadMaterials(activeRow)
-  }, [activeRow, loadMaterials])
+    setMaterials(null)
+  }, [activeRow?.product_id])
 
   const visibleFrom = total ? offset + 1 : 0
   const visibleTo = Math.min(offset + rows.length, total)
@@ -832,7 +832,7 @@ export function ProductionControlPage() {
               sort={{ sortBy: filters.sort_by, sortDir: filters.sort_dir }}
               onSelectIds={setSelectedIds}
               onActivate={setActiveId}
-              onOpenMaterials={(row) => void loadMaterials(row)}
+          onOpenMaterials={(row) => void loadMaterials(row.product_id)}
               onChangeStatus={(row, status) => void changeStatus(row, status)}
               onToggleSort={toggleSort}
             />
@@ -855,7 +855,7 @@ export function ProductionControlPage() {
               activeRow={activeRow}
               materials={materials}
               coverageLabels={coverageLabels}
-              onLoadMaterials={() => activeRow && void loadMaterials(activeRow)}
+              onLoadMaterials={() => activeRow && void loadMaterials(activeRow.product_id)}
               onPrint={() => activeRow && printRows([activeRow.product_id])}
               onOptimalBatchSave={(itemId, value) => saveOptimalBatch(itemId, value)}
               onQuantitySave={(productId, value) => saveOrderQuantity(productId, value)}

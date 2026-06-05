@@ -226,9 +226,13 @@ def delete_local_order(product_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/orders/{product_id}/materials", response_model=dict)
-def get_order_line_materials(product_id: int, db: Session = Depends(get_db)):
+def get_order_line_materials(
+    product_id: int,
+    refresh: bool = False,
+    db: Session = Depends(get_db),
+):
     try:
-        return preview_materials(db, int(product_id))
+        return preview_materials(db, int(product_id), refresh_state=bool(refresh))
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:

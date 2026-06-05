@@ -305,13 +305,25 @@ def _aggregate_coverage(component_labels: Sequence[str]) -> str:
     return "ready"
 
 
-def _maybe_bump_coverage_status(state: ProductionOrderLineState, new_status: str) -> None:
+def _store_material_coverage_status(
+    state: ProductionOrderLineState,
+    new_status: str,
+    label: str,
+) -> None:
     """
-    Auto-refresh the line status only while it sits in one of the coverage-
-    evaluation states. Once the user / system moves past (to_move, assembled,
-    produced_*, cancelled), the status is sticky and we don't override it.
+    Persist material availability separately from the workflow state.
+
+    A line can be "to_move" while current stock says "ready"; those meanings
+    must not overwrite each other.
     """
-    if state.status in {"shortage", "partial", "ready"} and state.status != new_status:
+    state.material_coverage_status = new_status
+    state.material_coverage_label = label
+    state.material_coverage_calculated_at = datetime.utcnow()
+    if (
+        state.issue_status in {None, "", "not_requested"}
+        and state.status in {"shortage", "partial", "ready"}
+        and state.status != new_status
+    ):
         state.status = new_status
 
 
@@ -392,7 +404,7 @@ def preview_materials(db: Session, product_id: int, *, refresh_state: bool = Fal
 
     if refresh_state:
         state = _ensure_state(db, product)
-        _maybe_bump_coverage_status(state, order_coverage)
+        _store_material_coverage_status(state, order_coverage, _ui_coverage_label(order_coverage))
         db.commit()
 
     return {
@@ -406,4 +418,48 @@ def preview_materials(db: Session, product_id: int, *, refresh_state: bool = Fal
         "coverage": order_coverage,
         "coverage_status": order_coverage,
         "coverage_label": _ui_coverage_label(order_coverage),
+    }
+
+
+def _active_product_ids(db: Session, *, limit: int = 0) -> List[int]:
+    from sqlalchemy import or_
+
+    from ..models import ProductionOrder
+    from .production_control_journal import DONE_STATE_KEY, _TERMINAL_LINE_STATUSES
+
+    query = (
+        db.query(ProductionProduct.product_id)
+        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+        .outerjoin(ProductionOrderLineState, ProductionOrderLineState.product_id == ProductionProduct.product_id)
+        .filter(ProductionOrder.deletion_mark == False)
+        .filter(or_(ProductionOrder.order_state_key.is_(None), func.lower(ProductionOrder.order_state_key) != DONE_STATE_KEY))
+        .filter(func.coalesce(ProductionProduct.remaining_qty, ProductionProduct.quantity) > 0)
+        .filter(func.coalesce(ProductionOrderLineState.status, "shortage").notin_(tuple(_TERMINAL_LINE_STATUSES)))
+        .order_by(ProductionOrder.order_date.desc(), ProductionOrder.order_number.asc(), ProductionProduct.line_number.asc())
+    )
+    if limit:
+        query = query.limit(max(0, int(limit)))
+    return [int(row[0]) for row in query.all()]
+
+
+def recalculate_production_coverage(db: Session, *, limit: int = 0) -> Dict[str, Any]:
+    from collections import Counter
+
+    statuses: Counter[str] = Counter()
+    errors: List[Dict[str, Any]] = []
+    processed = 0
+    for product_id in _active_product_ids(db, limit=limit):
+        try:
+            result = preview_materials(db, product_id, refresh_state=True)
+            statuses[str(result.get("coverage_status") or "unknown")] += 1
+            processed += 1
+        except Exception as exc:  # pragma: no cover - operational safety net
+            db.rollback()
+            errors.append({"product_id": product_id, "error": str(exc)})
+    return {
+        "status": "ok" if not errors else "partial",
+        "processed": processed,
+        "errors": len(errors),
+        "coverage": dict(statuses),
+        "sample_errors": errors[:20],
     }

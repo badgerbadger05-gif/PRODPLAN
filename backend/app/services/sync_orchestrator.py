@@ -40,6 +40,7 @@ from .operations_sync import sync_operations_from_odata
 from .employee_sync import sync_employees_from_odata
 from .odata_stock_sync import sync_stock_from_odata, sync_stock_warehouses_from_odata
 from .production_order_sync import sync_production_orders_from_odata, sync_production_fact_from_odata
+from .production_control_material_availability import recalculate_production_coverage
 from .supplier_order_sync import sync_supplier_orders_from_odata
 from .nomenclature_groups_sync import refresh_nomenclature_groups
 
@@ -93,6 +94,12 @@ def _run_nomenclature_groups(db: Session, config: Dict[str, Any]) -> Dict[str, A
     return refresh_nomenclature_groups(config)
 
 
+def _run_stock(db: Session, config: Dict[str, Any]) -> Dict[str, Any]:
+    stock = sync_stock_from_odata(db, _build_payload(config, "AccumulationRegister_ЗапасыНаСкладах"))
+    coverage = recalculate_production_coverage(db)
+    return {"stock": stock, "production_coverage": coverage}
+
+
 def _single(entity: str, service: Callable[[Session, ODataSyncRequest], Any]) -> Callable[[Session, Dict[str, Any]], Any]:
     def runner(db: Session, config: Dict[str, Any]) -> Any:
         return service(db, _build_payload(config, entity))
@@ -120,7 +127,7 @@ SYNC_JOBS: List[SyncJob] = [
     SyncJob("defaultSpecifications", "Спецификации по умолчанию", 43_200, _single("InformationRegister_СпецификацииПоУмолчанию", sync_default_specifications_from_odata)),
     SyncJob("productionStages", "Этапы производства", 86_400, _single("Catalog_ЭтапыПроизводства", sync_production_stages_from_odata)),
     SyncJob("warehouses", "Склады", 86_400, _single("AccumulationRegister_ЗапасыНаСкладах", sync_stock_warehouses_from_odata)),
-    SyncJob("stock", "Остатки", 1_800, _single("AccumulationRegister_ЗапасыНаСкладах", sync_stock_from_odata)),
+    SyncJob("stock", "Остатки + обеспечение журнала", 1_800, _run_stock),
     SyncJob("productionOrders", "Заказы на производство", 3_600, _single("Document_ЗаказНаПроизводство", sync_production_orders_from_odata)),
     SyncJob("productionFacts", "Факт выпуска", 3_600, _single("Document_СборкаЗапасов", sync_production_fact_from_odata)),
     SyncJob("supplierOrders", "Заказы поставщику", 3_600, _single("Document_ЗаказПоставщику", sync_supplier_orders_from_odata)),

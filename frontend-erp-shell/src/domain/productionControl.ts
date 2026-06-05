@@ -19,6 +19,9 @@ export type OrderRow = {
   status: string
   coverage_status?: string | null
   coverage_label?: string | null
+  material_coverage_status?: string | null
+  material_coverage_label?: string | null
+  material_coverage_calculated_at?: string | null
   issue_status?: string | null
   issue_count?: number
   workshop_name?: string | null
