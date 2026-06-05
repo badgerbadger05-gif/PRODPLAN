@@ -276,12 +276,12 @@ export function ProductionControlPage() {
     })
   }
 
-  function showWarehousePicker(result: MaterialIssueCreateResponse, mode: 'issues' | 'export') {
+  function showWarehousePicker(result: MaterialIssueCreateResponse, mode: 'issues' | 'export', productIds?: number[]) {
     const selectionRequired = result.selection_required ?? []
     if (!selectionRequired.length) return false
     const candidates = selectionRequired[0].warehouse_candidates
     setWarehousePickerCandidates(candidates)
-    setWarehousePickerProductIds(selectionRequired.map((item) => item.product_id))
+    setWarehousePickerProductIds(productIds?.length ? productIds : selectionRequired.map((item) => item.product_id))
     setWarehousePickerSelected(candidates[0]?.ref1c ?? '')
     setWarehousePickerMode(mode)
     setWarehousePickerOpen(true)
@@ -374,7 +374,7 @@ export function ProductionControlPage() {
       const issueResult = await requestMaterialIssues(sourceWarehouseRef, ids)
       const selectionRequired = issueResult.selection_required ?? []
       if (selectionRequired.length > 0) {
-        showWarehousePicker(issueResult, 'export')
+        showWarehousePicker(issueResult, 'export', ids)
         setMessage(`Для ${selectionRequired.length} поз. нужно выбрать склад-источник перед выгрузкой в 1С.`)
         await load(offsetRef.current)
         return
