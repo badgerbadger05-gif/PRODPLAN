@@ -104,6 +104,16 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
               </span>
               {!!row.issue_count && <span className="muted issueCount">док. {row.issue_count}</span>}
             </td>
+            <td>
+              {row.route_sheet_printed_at ? (
+                <>
+                  <span className="pill printed">Печатался</span>
+                  <span className="muted issueCount">{dateRu(row.route_sheet_printed_at)}</span>
+                </>
+              ) : (
+                <span className="pill notPrinted">Не печатался</span>
+              )}
+            </td>
           </tr>
         ))}
       </tbody>

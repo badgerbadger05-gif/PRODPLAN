@@ -171,6 +171,10 @@ export function ProductionDetailPane({
               </span>
             </strong>
             <span>Участок</span><strong>{activeRow.workshop_name || activeRow.stage_name || '—'}</strong>
+            <span>Маршрутный</span>
+            <strong>
+              {activeRow.route_sheet_printed_at ? `Печатался ${dateRu(activeRow.route_sheet_printed_at)}` : 'Не печатался'}
+            </strong>
             <span>Оптим. партия</span>
             <span className="batchEditCell">
               <input
