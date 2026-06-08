@@ -109,6 +109,7 @@ export function ProductionDetailPane({
 
   function sourceLabel(source?: string | null) {
     if (source === 'supplier_order') return 'Заказ поставщику'
+    if (source === 'production_order') return 'Заказ на производство'
     if (source === 'planned_purchase') return 'MRP закупка'
     if (source === 'planned_production') return 'MRP производство'
     return 'Заказ'

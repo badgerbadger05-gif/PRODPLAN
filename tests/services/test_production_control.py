@@ -1976,6 +1976,57 @@ def test_preview_materials_marks_shortage_and_includes_supplier_eta(db_session):
     assert sup_etas[0]["date"] == "2026-06-01"
 
 
+def test_preview_materials_includes_active_production_order_eta(db_session):
+    parent, _spec, comps = _make_basic_spec(
+        db_session,
+        parent_name="ProductionEtaParent",
+        child_specs=[
+            ("PEC1", "Production ETA component", 0, 3),  # need 3*2 = 6, have 0
+        ],
+    )
+    comp = comps[0]
+    _order, product = _make_internal_order_for(db_session, parent, qty=2)
+
+    supply_order = ProductionOrder(
+        order_number="MRP-RC-13-PEC1",
+        order_date=datetime(2026, 6, 4, 8),
+        is_posted=False,
+        deletion_mark=False,
+        source="mrp",
+    )
+    db_session.add(supply_order)
+    db_session.flush()
+    supply_product = ProductionProduct(
+        order_id=supply_order.order_id,
+        item_id=comp.item_id,
+        line_number=1,
+        quantity=10,
+        produced_qty=0,
+        remaining_qty=10,
+    )
+    db_session.add(supply_product)
+    db_session.flush()
+    db_session.add(
+        ProductionOrderLineState(
+            product_id=supply_product.product_id,
+            status="partial",
+            issue_status="not_requested",
+            planned_finish_date=_dt.date(2026, 6, 30),
+        )
+    )
+    db_session.commit()
+
+    preview = preview_materials(db_session, product.product_id, refresh_state=True)
+    only_comp = preview["components"][0]
+    prod_etas = [e for e in only_comp["expected_dates"] if e["source"] == "production_order"]
+
+    assert only_comp["coverage"] == "shortage"
+    assert prod_etas
+    assert prod_etas[0]["order_number"] == "MRP-RC-13-PEC1"
+    assert prod_etas[0]["date"] == "2026-06-30"
+    assert prod_etas[0]["qty"] == 10
+
+
 def test_preview_materials_marks_partial_when_some_stock(db_session):
     parent, _spec, comps = _make_basic_spec(
         db_session,

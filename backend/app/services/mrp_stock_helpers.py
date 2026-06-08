@@ -2,14 +2,12 @@
 
 Both `period_plan_service._explode_bom_net_first` and
 `planning_service.compute_planning_preview` need per-item effective stock
-that excludes warehouses listed in `ignored_warehouses` (e.g., brak isolator).
+that applies the warehouse availability settings.
 
-`Item.stock_qty` is aggregated across all warehouses with
-`StockWarehouse.is_selected=True` — but it does NOT subtract stock parked in
-`IgnoredWarehouse`. Using `Item.stock_qty` directly in MRP makes the planner
-believe items in defective-isolator warehouses are available, then production
-control later blocks the material issue because the source warehouse cannot
-be picked.
+`Item.stock_qty` can lag behind the detailed warehouse settings. Using it
+directly in MRP may let the planner see stock parked in unchecked warehouses
+or in `IgnoredWarehouse`, then production control later blocks the material
+issue because the source warehouse cannot be picked.
 
 This helper mirrors the policy used in
 `production_control_material_availability._stock_by_item`, but returns the
@@ -31,6 +29,7 @@ from ..models import (
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
+    StockWarehouse,
 )
 
 
@@ -41,15 +40,16 @@ _DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
 
 def effective_stock_by_item_all(db: Session) -> Dict[int, float]:
     """
-    Return `{item_id: effective_stock}` for every item, excluding stock that
-    sits in `ignored_warehouses`.
+    Return `{item_id: effective_stock}` for every item with warehouse settings
+    applied.
 
     Resolution order:
-      1. If `ignored_warehouses` is empty → aggregated `Item.stock_qty`
+      1. If no warehouse settings exist → aggregated `Item.stock_qty`
          (legacy behaviour, single query).
-      2. Else use `item_warehouse_stock` filtered by `warehouse_ref1c NOT IN
-         (ignored)`. Items with ANY breakdown row are authoritative — if all
-         of their stock is in ignored warehouses they correctly resolve to 0.
+      2. Else use `item_warehouse_stock` filtered to selected warehouses and
+         with ignored warehouses excluded. Items with ANY breakdown row are
+         authoritative — if all of their stock is in unchecked/ignored
+         warehouses they correctly resolve to 0.
       3. Items without any breakdown row fall back to `Item.stock_qty` so a
          partially-synced DB doesn't blank coverage. After a full re-sync
          the breakdown path becomes authoritative for everything.
@@ -57,22 +57,34 @@ def effective_stock_by_item_all(db: Session) -> Dict[int, float]:
     ignored_refs = {
         str(r[0]) for r in db.query(IgnoredWarehouse.warehouse_ref1c).all() if r and r[0]
     }
+    warehouse_rows = db.query(StockWarehouse.warehouse_ref1c, StockWarehouse.is_selected).all()
+    selected_refs = {
+        str(ref)
+        for ref, is_selected in warehouse_rows
+        if ref and bool(is_selected)
+    }
+    has_warehouse_settings = bool(warehouse_rows)
 
-    if not ignored_refs:
+    if not has_warehouse_settings and not ignored_refs:
         return {
             int(iid): float(qty or 0.0)
             for iid, qty in db.query(Item.item_id, Item.stock_qty).all()
         }
 
-    sum_rows = (
+    sum_query = (
         db.query(
             ItemWarehouseStock.item_id,
             func.sum(ItemWarehouseStock.qty),
         )
-        .filter(~ItemWarehouseStock.warehouse_ref1c.in_(ignored_refs))
-        .group_by(ItemWarehouseStock.item_id)
-        .all()
     )
+    if has_warehouse_settings:
+        if selected_refs:
+            sum_query = sum_query.filter(ItemWarehouseStock.warehouse_ref1c.in_(selected_refs))
+        else:
+            sum_query = sum_query.filter(False)
+    if ignored_refs:
+        sum_query = sum_query.filter(~ItemWarehouseStock.warehouse_ref1c.in_(ignored_refs))
+    sum_rows = sum_query.group_by(ItemWarehouseStock.item_id).all()
     breakdown_stocks: Dict[int, float] = {
         int(iid): float(qty or 0.0) for iid, qty in sum_rows
     }

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
@@ -14,9 +14,11 @@ from ..models import (
     PlannedPurchase,
     ProductionMaterialIssue,
     ProductionMaterialIssueLine,
+    ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
     SpecComponent,
+    StockWarehouse,
     SupplierOrder,
     SupplierOrderItem,
 )
@@ -67,15 +69,16 @@ def _components_for_product(db: Session, product: ProductionProduct) -> Tuple[Op
 
 def _stock_by_item(db: Session, item_ids: Sequence[int]) -> Dict[int, float]:
     """
-    Return per-item available stock with `ignored_warehouses` excluded.
+    Return per-item available stock with warehouse settings applied.
 
     Resolution order:
-    1. If `ignored_warehouses` is empty -> aggregated Item.stock_qty (legacy
-       behavior, fast).
-    2. Else use item_warehouse_stock filtered by warehouse_ref1c NOT IN
-       (ignored). Items that have ANY rows in item_warehouse_stock are
-       considered "covered by the breakdown" вЂ” if all of their stock is in
-       ignored warehouses they end up with 0, which is the desired effect.
+    1. If there are no warehouse rows at all -> aggregated Item.stock_qty
+       (legacy behavior, fast).
+    2. Else use item_warehouse_stock filtered to selected warehouses and with
+       ignored warehouses excluded. Items that have ANY rows in
+       item_warehouse_stock are considered "covered by the breakdown" — if all
+       of their stock is in unselected/ignored warehouses they end up with 0,
+       which is the desired effect.
     3. Items without any breakdown rows fallback to Item.stock_qty so a
        partially-synced DB doesn't blank coverage. After a full re-sync the
        breakdown path becomes authoritative for everything.
@@ -86,8 +89,15 @@ def _stock_by_item(db: Session, item_ids: Sequence[int]) -> Dict[int, float]:
 
     ignored_refs_rows = db.query(IgnoredWarehouse.warehouse_ref1c).all()
     ignored_refs = {str(r[0]) for r in ignored_refs_rows if r and r[0]}
+    warehouse_rows = db.query(StockWarehouse.warehouse_ref1c, StockWarehouse.is_selected).all()
+    selected_refs = {
+        str(ref)
+        for ref, is_selected in warehouse_rows
+        if ref and bool(is_selected)
+    }
+    has_warehouse_settings = bool(warehouse_rows)
 
-    if not ignored_refs:
+    if not has_warehouse_settings and not ignored_refs:
         result: Dict[int, float] = {}
         for iid, stock in (
             db.query(Item.item_id, Item.stock_qty).filter(Item.item_id.in_(ids)).all()
@@ -95,14 +105,19 @@ def _stock_by_item(db: Session, item_ids: Sequence[int]) -> Dict[int, float]:
             result[int(iid)] = _to_float(stock)
         return result
 
-    # Per-warehouse path: sum non-ignored buckets per item.
-    sum_rows = (
+    # Per-warehouse path: sum selected, non-ignored buckets per item.
+    sum_query = (
         db.query(ItemWarehouseStock.item_id, func.sum(ItemWarehouseStock.qty))
         .filter(ItemWarehouseStock.item_id.in_(ids))
-        .filter(~ItemWarehouseStock.warehouse_ref1c.in_(ignored_refs))
-        .group_by(ItemWarehouseStock.item_id)
-        .all()
     )
+    if has_warehouse_settings:
+        if selected_refs:
+            sum_query = sum_query.filter(ItemWarehouseStock.warehouse_ref1c.in_(selected_refs))
+        else:
+            sum_query = sum_query.filter(False)
+    if ignored_refs:
+        sum_query = sum_query.filter(~ItemWarehouseStock.warehouse_ref1c.in_(ignored_refs))
+    sum_rows = sum_query.group_by(ItemWarehouseStock.item_id).all()
     breakdown_stocks: Dict[int, float] = {int(iid): _to_float(qty) for iid, qty in sum_rows}
 
     # Items that have ANY breakdown rows at all (even if 0 after ignored
@@ -265,6 +280,54 @@ def _planned_eta_by_item(db: Session, item_ids: Sequence[int], run_id: Optional[
     return result
 
 
+def _production_eta_by_item(db: Session, item_ids: Sequence[int]) -> Dict[int, List[Dict[str, Any]]]:
+    """
+    Per-item expected arrivals from actual PRODPLAN production journal lines.
+
+    PlannedOrder rows can disappear or be superseded once an MRP recommendation
+    is materialised into production_products. The material card still needs to
+    show those active orders as expected supply instead of "В заказах нет".
+    """
+    ids = [int(x) for x in item_ids if x is not None]
+    if not ids:
+        return {}
+
+    from .production_control_journal import DONE_STATE_KEY, _TERMINAL_LINE_STATUSES
+
+    rows = (
+        db.query(ProductionProduct, ProductionOrder, ProductionOrderLineState)
+        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+        .outerjoin(ProductionOrderLineState, ProductionOrderLineState.product_id == ProductionProduct.product_id)
+        .filter(ProductionProduct.item_id.in_(ids))
+        .filter(ProductionOrder.deletion_mark == False)
+        .filter(func.coalesce(ProductionProduct.remaining_qty, 0) > 0)
+        .filter(or_(ProductionOrder.order_state_key.is_(None), func.lower(ProductionOrder.order_state_key) != DONE_STATE_KEY))
+        .filter(func.coalesce(ProductionOrderLineState.status, "shortage").notin_(tuple(_TERMINAL_LINE_STATUSES)))
+        .order_by(
+            ProductionOrderLineState.planned_finish_date.asc().nulls_last(),
+            ProductionOrder.order_date.asc(),
+            ProductionOrder.order_number.asc(),
+        )
+        .all()
+    )
+
+    result: Dict[int, List[Dict[str, Any]]] = {}
+    for product, order, state in rows:
+        finish = state.planned_finish_date if state and state.planned_finish_date else None
+        order_dt = order.order_date.date() if isinstance(order.order_date, datetime) else order.order_date
+        result.setdefault(int(product.item_id), []).append(
+            {
+                "source": "production_order",
+                "date": _date_to_iso(finish or order_dt),
+                "qty": _to_float(product.remaining_qty),
+                "ref": str(order.order_number or ""),
+                "product_id": int(product.product_id),
+                "order_id": int(order.order_id),
+            }
+        )
+    return result
+
+
 def _component_coverage_label(required: float, available: float) -> str:
     if required <= 1e-9:
         return "ok"
@@ -366,6 +429,7 @@ def preview_materials(db: Session, product_id: int, *, refresh_state: bool = Fal
     reservations = _open_issue_reservations_by_item(db, comp_ids)
     run_id = _latest_run_id(db)
     supplier_eta = _supplier_eta_by_item(db, comp_ids)
+    production_eta = _production_eta_by_item(db, comp_ids)
     planned_eta = _planned_eta_by_item(db, comp_ids, run_id)
 
     for comp in components:
@@ -388,7 +452,11 @@ def preview_materials(db: Session, product_id: int, *, refresh_state: bool = Fal
             comp["eta_dates"] = []
             comp["expected_dates"] = []
         else:
-            etas: List[Dict[str, Any]] = list(supplier_eta.get(iid, [])) + list(planned_eta.get(iid, []))
+            etas: List[Dict[str, Any]] = (
+                list(supplier_eta.get(iid, []))
+                + list(production_eta.get(iid, []))
+                + list(planned_eta.get(iid, []))
+            )
             etas.sort(key=lambda e: e.get("date") or "")
             comp["eta_dates"] = etas
             comp["expected_dates"] = [
