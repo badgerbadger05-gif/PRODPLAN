@@ -267,6 +267,70 @@ def test_reconcile_tops_up_when_stock_drops_after_snapshot(db_session):
     assert res["production_added"] == []
 
 
+def test_reconcile_grows_existing_catchup_order_when_stock_drops(db_session):
+    item = _make_production_item(db_session, "P-STOCK-DROP-RC", stock=32.0)
+    plan = ProductionPlanHeader(
+        name="План июнь",
+        period_from=date(2026, 6, 1),
+        period_to=date(2026, 6, 30),
+        status="fixed",
+        created_by="test",
+    )
+    db_session.add(plan)
+    db_session.flush()
+    db_session.add(
+        ProductionPlanLine(
+            plan_id=plan.id, item_id=item.item_id, bucket_date=date(2026, 6, 15), qty=34
+        )
+    )
+    db_session.commit()
+
+    snap = create_mrp_snapshot_from_period_plan(db_session, plan.id)
+    run_id = snap["run_id"]
+    req = (
+        db_session.query(MrpRequirement)
+        .filter(MrpRequirement.run_id == run_id, MrpRequirement.item_id == item.item_id)
+        .one()
+    )
+    order = ProductionOrder(
+        order_number=f"MRP-RC-{run_id}-{item.item_id}",
+        order_date=date(2026, 6, 15),
+        is_posted=False,
+        deletion_mark=False,
+        source="mrp",
+        source_run_id=run_id,
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=item.item_id,
+        line_number=1,
+        quantity=2,
+        produced_qty=0,
+        remaining_qty=2,
+        source_mrp_requirement_id=req.id,
+    )
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(ProductionOrderLineState(product_id=product.product_id, status="partial"))
+    item.stock_qty = 17.0
+    db_session.commit()
+
+    res = reconcile_snapshot(db_session, run_id)
+
+    added = res["production_added"]
+    assert len(added) == 1
+    assert abs(added[0]["qty"] - 15.0) < 1e-6
+    db_session.refresh(product)
+    db_session.refresh(req)
+    assert float(product.quantity) == 17.0
+    assert float(product.remaining_qty) == 17.0
+    assert float(req.net_required_qty) == 17.0
+    assert float(req.covered_qty) == 17.0
+    assert float(req.remaining_qty) == 0.0
+
+
 def _link_bom(db, parent: Item, child: Item, qty_per_unit: float = 1.0) -> None:
     """Give `parent` a default spec whose single component is `child`."""
     spec = Specification(

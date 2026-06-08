@@ -295,39 +295,43 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
             if not dry_run:
                 existing_product = _existing_open_catchup_product(db, run_id=int(run.run_id), item_id=int(iid))
                 if existing_product is not None:
-                    continue
-                order = ProductionOrder(
-                    order_number=f"MRP-RC-{int(run.run_id)}-{int(iid)}",
-                    order_date=now,
-                    order_ref1c=None,
-                    is_posted=False,
-                    deletion_mark=False,
-                    source="mrp",
-                    source_run_id=int(run.run_id),
-                )
-                db.add(order)
-                db.flush()
-                product = ProductionProduct(
-                    order_id=int(order.order_id),
-                    item_id=int(iid),
-                    line_number=1,
-                    quantity=gap,
-                    produced_qty=0,
-                    remaining_qty=gap,
-                    spec_id=_default_spec_id_for_item(db, int(iid)),
-                    source_mrp_requirement_id=int(req.id) if req else None,
-                )
-                db.add(product)
-                db.flush()
-                db.add(
-                    ProductionOrderLineState(
-                        product_id=int(product.product_id),
-                        status="shortage",
-                        issue_status="not_requested",
-                        planned_start_date=req.period_from if req else run.period_from,
-                        planned_finish_date=req.period_to if req else run.period_to,
+                    existing_product.quantity = _to_float(existing_product.quantity) + gap
+                    existing_product.remaining_qty = _to_float(existing_product.remaining_qty) + gap
+                    product = existing_product
+                    order = existing_product.order
+                else:
+                    order = ProductionOrder(
+                        order_number=f"MRP-RC-{int(run.run_id)}-{int(iid)}",
+                        order_date=now,
+                        order_ref1c=None,
+                        is_posted=False,
+                        deletion_mark=False,
+                        source="mrp",
+                        source_run_id=int(run.run_id),
                     )
-                )
+                    db.add(order)
+                    db.flush()
+                    product = ProductionProduct(
+                        order_id=int(order.order_id),
+                        item_id=int(iid),
+                        line_number=1,
+                        quantity=gap,
+                        produced_qty=0,
+                        remaining_qty=gap,
+                        spec_id=_default_spec_id_for_item(db, int(iid)),
+                        source_mrp_requirement_id=int(req.id) if req else None,
+                    )
+                    db.add(product)
+                    db.flush()
+                    db.add(
+                        ProductionOrderLineState(
+                            product_id=int(product.product_id),
+                            status="shortage",
+                            issue_status="not_requested",
+                            planned_start_date=req.period_from if req else run.period_from,
+                            planned_finish_date=req.period_to if req else run.period_to,
+                        )
+                    )
                 _bump_requirement_coverage(req, gap)
                 active_production_by_item[iid] = open_qty + gap
                 entry["order_id"] = int(order.order_id)
