@@ -60,7 +60,7 @@ from .period_plan_service import (
     _load_purchase_supplier_remaining,
     _to_float,
 )
-from .production_control_journal import _default_spec_id_for_item
+from .production_control_journal import _default_spec_id_for_item, dedupe_mrp_production_orders
 from .replenishment import (
     REPLENISHMENT_FLOW_PRODUCTION,
     REPLENISHMENT_FLOW_PURCHASE,
@@ -360,6 +360,8 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
     else:
         db.commit()
 
+    mrp_order_repair = dedupe_mrp_production_orders(db, dry_run=dry_run)
+
     return {
         "run_id": int(run.run_id),
         "source_plan_id": int(run.source_plan_id),
@@ -368,6 +370,7 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
         "production_added": production_added,
         "purchase_added": purchase_added,
         "rescheduled": reschedule,
+        "mrp_order_repair": mrp_order_repair,
     }
 
 

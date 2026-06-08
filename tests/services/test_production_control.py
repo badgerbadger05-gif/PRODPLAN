@@ -811,6 +811,137 @@ def test_dedupe_mrp_production_orders_cancels_local_excess_duplicates(db_session
     assert float(old_req.remaining_qty) == 25
 
 
+def test_dedupe_mrp_production_orders_reduces_single_local_overcoverage(db_session):
+    item = Item(
+        item_code="MRP-REDUCE",
+        item_name="MRP reduce item",
+        unit="шт",
+        stock_qty=10,
+        replenishment_method="Производство",
+        status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+    run = PlanningRun(status="FIXED_SNAPSHOT", started_at=datetime(2026, 6, 8))
+    db_session.add(run)
+    db_session.flush()
+    req = MrpRequirement(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        total_required_qty=20,
+        net_required_qty=6,
+        covered_qty=12,
+        remaining_qty=0,
+        period_from=_dt.date(2026, 6, 1),
+        period_to=_dt.date(2026, 6, 30),
+        bom_level=0,
+    )
+    db_session.add(req)
+    db_session.flush()
+    order = ProductionOrder(
+        order_number="REDUCE-1",
+        order_date=datetime(2026, 6, 4),
+        deletion_mark=False,
+        source="mrp",
+        source_run_id=run.run_id,
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=item.item_id,
+        line_number=1,
+        quantity=12,
+        produced_qty=0,
+        remaining_qty=12,
+        source_mrp_requirement_id=req.id,
+    )
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(ProductionOrderLineState(product_id=product.product_id, status="partial"))
+    db_session.commit()
+
+    dry = dedupe_mrp_production_orders(db_session, dry_run=True)
+    assert dry["reduced_count"] == 1
+    assert dry["cancelled_count"] == 0
+    db_session.refresh(product)
+    assert float(product.remaining_qty) == 12
+
+    applied = dedupe_mrp_production_orders(db_session, dry_run=False)
+
+    assert applied["reduced_count"] == 1
+    assert applied["cancelled_count"] == 0
+    db_session.refresh(product)
+    db_session.refresh(req)
+    assert float(product.quantity) == 6
+    assert float(product.remaining_qty) == 6
+    assert float(req.covered_qty) == 6
+    assert float(req.remaining_qty) == 0
+
+
+def test_dedupe_mrp_production_orders_cancels_single_local_when_requirement_zero(db_session):
+    item = Item(
+        item_code="MRP-ZERO",
+        item_name="MRP zero item",
+        unit="шт",
+        stock_qty=30,
+        replenishment_method="Производство",
+        status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+    run = PlanningRun(status="FIXED_SNAPSHOT", started_at=datetime(2026, 6, 8))
+    db_session.add(run)
+    db_session.flush()
+    req = MrpRequirement(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        total_required_qty=20,
+        net_required_qty=0,
+        covered_qty=10,
+        remaining_qty=0,
+        period_from=_dt.date(2026, 6, 1),
+        period_to=_dt.date(2026, 6, 30),
+        bom_level=0,
+    )
+    db_session.add(req)
+    db_session.flush()
+    order = ProductionOrder(
+        order_number="ZERO-1",
+        order_date=datetime(2026, 6, 4),
+        deletion_mark=False,
+        source="mrp",
+        source_run_id=run.run_id,
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=item.item_id,
+        line_number=1,
+        quantity=10,
+        produced_qty=0,
+        remaining_qty=10,
+        source_mrp_requirement_id=req.id,
+    )
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(ProductionOrderLineState(product_id=product.product_id, status="shortage"))
+    db_session.commit()
+
+    result = dedupe_mrp_production_orders(db_session, dry_run=False)
+
+    assert result["cancelled_count"] == 1
+    assert result["reduced_count"] == 0
+    db_session.refresh(product)
+    db_session.refresh(req)
+    state = db_session.query(ProductionOrderLineState).filter_by(product_id=product.product_id).one()
+    assert state.status == "cancelled"
+    assert float(product.remaining_qty) == 0
+    assert float(req.covered_qty) == 0
+    assert float(req.remaining_qty) == 0
+
+
 def test_dedupe_mrp_production_orders_never_cancels_1c_open_order(db_session):
     item = Item(
         item_code="MRP-DEDUP-1C",

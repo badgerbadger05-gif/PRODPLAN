@@ -27,6 +27,7 @@ from ..services.production_control_journal import (
     create_orders_from_mrp,
     create_production_orders_from_mrp_requirements,
     cancel_local_order,
+    dedupe_mrp_production_orders,
     list_journal,
     update_line_state,
     update_product_quantity,
@@ -100,6 +101,10 @@ class OrdersFromMrpPayload(BaseModel):
 class OrdersFromMrpRequirementsPayload(BaseModel):
     requirement_ids: List[int]
     initiated_by: Optional[str] = None
+
+
+class DedupeMrpOrdersPayload(BaseModel):
+    dry_run: bool = True
 
 
 class UpdateQuantityPayload(BaseModel):
@@ -223,6 +228,21 @@ def delete_local_order(product_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/orders/dedupe-mrp", response_model=dict)
+def post_dedupe_mrp_orders(payload: DedupeMrpOrdersPayload, db: Session = Depends(get_db)):
+    """
+    Repair local MRP production-order overcoverage.
+
+    Dry-run by default. The applied mode only touches local PRODPLAN MRP rows
+    that are not linked to 1C: duplicates are cancelled, and a single oversized
+    row is reduced to the latest MRP requirement.
+    """
+    try:
+        return dedupe_mrp_production_orders(db, dry_run=bool(payload.dry_run))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/orders/{product_id}/materials", response_model=dict)
@@ -625,4 +645,3 @@ def post_print_route_sheets(
 
 
 router.include_router(settings_router)
-

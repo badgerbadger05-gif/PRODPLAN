@@ -263,16 +263,13 @@ def dedupe_mrp_production_orders(db: Session, *, dry_run: bool = True) -> Dict[s
     repaired: List[Dict[str, Any]] = []
     untouched: List[Dict[str, Any]] = []
     cancelled_count = 0
+    reduced_count = 0
     released_qty_total = 0.0
+    reduced_qty_total = 0.0
 
     for key, group_rows in groups.items():
-        if len(group_rows) <= 1:
-            continue
-
         latest_req = max(group_rows, key=lambda row: (row[4].started_at or row[3].created_at, int(row[4].run_id), int(row[3].id)))[3]
         required_qty = _to_float(latest_req.net_required_qty)
-        if required_qty <= 1e-9:
-            required_qty = max(_to_float(req.net_required_qty) for _p, _o, _s, req, _run in group_rows)
 
         def keep_priority(row: Tuple[ProductionProduct, ProductionOrder, Optional[ProductionOrderLineState], MrpRequirement, PlanningRun]) -> Tuple[int, int, int, Any, int]:
             product, order, state, req, _run = row
@@ -290,8 +287,10 @@ def dedupe_mrp_production_orders(db: Session, *, dry_run: bool = True) -> Dict[s
 
         kept: List[Tuple[ProductionProduct, ProductionOrder, Optional[ProductionOrderLineState], MrpRequirement, PlanningRun]] = []
         cancelled: List[Tuple[ProductionProduct, ProductionOrder, Optional[ProductionOrderLineState], MrpRequirement, PlanningRun]] = []
+        reduced: List[Tuple[ProductionProduct, ProductionOrder, Optional[ProductionOrderLineState], MrpRequirement, PlanningRun, float, float]] = []
         kept_qty = 0.0
         protected_qty = 0.0
+        editable_target_qty = required_qty
         for row in sorted(group_rows, key=keep_priority, reverse=True):
             product, order, state, _req, _run = row
             qty = _to_float(product.remaining_qty)
@@ -300,14 +299,24 @@ def dedupe_mrp_production_orders(db: Session, *, dry_run: bool = True) -> Dict[s
                 kept.append(row)
                 kept_qty += qty
                 protected_qty += qty
+                editable_target_qty = max(0.0, required_qty - protected_qty)
                 continue
-            if kept_qty < required_qty - 1e-9:
+
+            editable_kept_qty = max(0.0, kept_qty - protected_qty)
+            remaining_editable_target = max(0.0, editable_target_qty - editable_kept_qty)
+            if remaining_editable_target <= 1e-9:
+                cancelled.append(row)
+                continue
+            if qty <= remaining_editable_target + 1e-9:
                 kept.append(row)
                 kept_qty += qty
             else:
-                cancelled.append(row)
+                new_qty = remaining_editable_target
+                kept.append(row)
+                kept_qty += new_qty
+                reduced.append((product, order, state, _req, _run, qty, new_qty))
 
-        if not cancelled:
+        if not cancelled and not reduced:
             if protected_qty > required_qty + 1e-9:
                 untouched.append({
                     "scope": list(key),
@@ -337,6 +346,27 @@ def dedupe_mrp_production_orders(db: Session, *, dry_run: bool = True) -> Dict[s
             cancelled_count += 1
             released_qty_total += qty
 
+        reduced_payload: List[Dict[str, Any]] = []
+        for product, order, _state, req, _run, old_qty, new_qty in reduced:
+            delta = max(0.0, old_qty - new_qty)
+            reduced_payload.append({
+                "product_id": int(product.product_id),
+                "order_id": int(order.order_id),
+                "order_number": str(order.order_number or ""),
+                "requirement_id": int(req.id),
+                "old_qty": old_qty,
+                "new_qty": new_qty,
+                "delta_qty": delta,
+            })
+            if not dry_run and delta > 1e-9:
+                _adjust_requirement_coverage(db, product, -delta)
+                product.remaining_qty = new_qty
+                produced_qty = _to_float(product.produced_qty)
+                product.quantity = max(produced_qty + new_qty, produced_qty)
+            if delta > 1e-9:
+                reduced_count += 1
+                reduced_qty_total += delta
+
         if not dry_run:
             latest_req.covered_qty = min(kept_qty, required_qty)
             latest_req.remaining_qty = max(required_qty - _to_float(latest_req.covered_qty), 0.0)
@@ -350,6 +380,8 @@ def dedupe_mrp_production_orders(db: Session, *, dry_run: bool = True) -> Dict[s
             "protected_1c_qty": protected_qty,
             "cancelled_qty": sum(row["qty"] for row in cancelled_payload),
             "cancelled": cancelled_payload,
+            "reduced_qty": sum(row["delta_qty"] for row in reduced_payload),
+            "reduced": reduced_payload,
         })
 
     if not dry_run:
@@ -360,7 +392,9 @@ def dedupe_mrp_production_orders(db: Session, *, dry_run: bool = True) -> Dict[s
         "dry_run": bool(dry_run),
         "groups_repaired": len(repaired),
         "cancelled_count": cancelled_count,
+        "reduced_count": reduced_count,
         "released_qty": released_qty_total,
+        "reduced_qty": reduced_qty_total,
         "repaired": repaired,
         "untouched": untouched,
     }
