@@ -60,7 +60,11 @@ from .period_plan_service import (
     _load_purchase_supplier_remaining,
     _to_float,
 )
-from .production_control_journal import _default_spec_id_for_item, dedupe_mrp_production_orders
+from .production_control_journal import (
+    _default_spec_id_for_item,
+    _split_qty_by_optimal_batch,
+    dedupe_mrp_production_orders,
+)
 from .mrp_stock_helpers import effective_stock_by_item_all
 from .replenishment import (
     REPLENISHMENT_FLOW_PRODUCTION,
@@ -185,6 +189,174 @@ def _active_production_qty_by_item(db: Session, item_ids: List[int]) -> Dict[int
         .all()
     )
     return {int(iid): _to_float(qty) for iid, qty in rows}
+
+
+def _next_catchup_order_number(db: Session, *, run_id: int, item_id: int) -> str:
+    base = f"MRP-RC-{int(run_id)}-{int(item_id)}"
+    existing = {
+        str(order_number)
+        for (order_number,) in (
+            db.query(ProductionOrder.order_number)
+            .filter(ProductionOrder.source == "mrp")
+            .filter(ProductionOrder.source_run_id == int(run_id))
+            .filter(ProductionOrder.order_number.like(f"{base}%"))
+            .all()
+        )
+        if order_number
+    }
+    if base not in existing:
+        return base
+    seq = 2
+    while f"{base}-{seq}" in existing:
+        seq += 1
+    return f"{base}-{seq}"
+
+
+def _create_catchup_product(
+    db: Session,
+    *,
+    run: PlanningRun,
+    item_id: int,
+    qty: float,
+    req: Optional[MrpRequirement],
+    now: datetime,
+) -> tuple[ProductionOrder, ProductionProduct]:
+    order = ProductionOrder(
+        order_number=_next_catchup_order_number(db, run_id=int(run.run_id), item_id=int(item_id)),
+        order_date=now,
+        order_ref1c=None,
+        is_posted=False,
+        deletion_mark=False,
+        source="mrp",
+        source_run_id=int(run.run_id),
+    )
+    db.add(order)
+    db.flush()
+    product = ProductionProduct(
+        order_id=int(order.order_id),
+        item_id=int(item_id),
+        line_number=1,
+        quantity=qty,
+        produced_qty=0,
+        remaining_qty=qty,
+        spec_id=_default_spec_id_for_item(db, int(item_id)),
+        source_mrp_requirement_id=int(req.id) if req else None,
+    )
+    db.add(product)
+    db.flush()
+    db.add(
+        ProductionOrderLineState(
+            product_id=int(product.product_id),
+            status="shortage",
+            issue_status="not_requested",
+            planned_start_date=req.period_from if req else run.period_from,
+            planned_finish_date=req.period_to if req else run.period_to,
+        )
+    )
+    return order, product
+
+
+def _split_oversized_catchup_batches(
+    db: Session,
+    run: PlanningRun,
+    *,
+    dry_run: bool,
+    now: datetime,
+) -> Dict[str, Any]:
+    rows = (
+        db.query(ProductionProduct, ProductionOrder, ProductionOrderLineState, Item, MrpRequirement)
+        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+        .join(Item, Item.item_id == ProductionProduct.item_id)
+        .join(MrpRequirement, MrpRequirement.id == ProductionProduct.source_mrp_requirement_id)
+        .outerjoin(ProductionOrderLineState, ProductionOrderLineState.product_id == ProductionProduct.product_id)
+        .filter(ProductionOrder.source == "mrp")
+        .filter(ProductionOrder.source_run_id == int(run.run_id))
+        .filter(ProductionOrder.order_number.like(f"MRP-RC-{int(run.run_id)}-%"))
+        .filter(ProductionOrder.order_ref1c.is_(None))
+        .filter(ProductionOrder.deletion_mark == False)
+        .filter(or_(ProductionOrder.order_state_key.is_(None), func.lower(ProductionOrder.order_state_key) != DONE_STATE_KEY))
+        .filter(func.coalesce(ProductionProduct.remaining_qty, 0) > 0)
+        .filter(func.coalesce(ProductionProduct.produced_qty, 0) <= EPS)
+        .filter(Item.optimal_batch.isnot(None))
+        .filter(Item.optimal_batch > 0)
+        .filter(func.coalesce(ProductionOrderLineState.status, "shortage").notin_(("completed", "cancelled")))
+        .order_by(ProductionProduct.product_id.asc())
+        .all()
+    )
+
+    repaired: List[Dict[str, Any]] = []
+    created_count = 0
+    for product, order, state, item, req in rows:
+        total = _to_float(product.remaining_qty)
+        batch = _to_float(item.optimal_batch)
+        if total <= batch + EPS:
+            continue
+        batches = _split_qty_by_optimal_batch(total, batch)
+        if len(batches) <= 1:
+            continue
+        payload = {
+            "item_id": int(product.item_id),
+            "product_id": int(product.product_id),
+            "order_id": int(order.order_id),
+            "order_number": str(order.order_number or ""),
+            "old_qty": total,
+            "batches": [round(_to_float(q), 6) for q in batches],
+        }
+        repaired.append(payload)
+        if dry_run:
+            created_count += max(0, len(batches) - 1)
+            continue
+
+        product.quantity = batches[0]
+        product.remaining_qty = batches[0]
+        if state is not None:
+            state.status = state.status or "shortage"
+        for qty in batches[1:]:
+            new_order, _new_product = _create_catchup_product(
+                db,
+                run=run,
+                item_id=int(product.item_id),
+                qty=_to_float(qty),
+                req=req,
+                now=now,
+            )
+            created_count += 1
+            payload.setdefault("created_order_numbers", []).append(str(new_order.order_number or ""))
+
+    return {
+        "repaired": repaired,
+        "created_orders": created_count,
+    }
+
+
+def _materialize_catchup_gap(
+    db: Session,
+    *,
+    run: PlanningRun,
+    item: Item,
+    req: Optional[MrpRequirement],
+    gap: float,
+    now: datetime,
+) -> List[tuple[ProductionOrder, ProductionProduct, float]]:
+    item_id = int(item.item_id)
+    batch = _to_float(getattr(item, "optimal_batch", None))
+    if batch <= EPS:
+        existing_product = _existing_open_catchup_product(db, run_id=int(run.run_id), item_id=item_id)
+        if existing_product is not None:
+            existing_product.quantity = _to_float(existing_product.quantity) + gap
+            existing_product.remaining_qty = _to_float(existing_product.remaining_qty) + gap
+            return [(existing_product.order, existing_product, gap)]
+        order, product = _create_catchup_product(db, run=run, item_id=item_id, qty=gap, req=req, now=now)
+        return [(order, product, gap)]
+
+    created: List[tuple[ProductionOrder, ProductionProduct, float]] = []
+    remaining_gap = _to_float(gap)
+    while remaining_gap > EPS:
+        qty = min(batch, remaining_gap)
+        order, product = _create_catchup_product(db, run=run, item_id=item_id, qty=qty, req=req, now=now)
+        created.append((order, product, qty))
+        remaining_gap = max(remaining_gap - qty, 0.0)
+    return created
 
 
 def _current_snapshot_gross_by_item(
@@ -381,50 +553,23 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
                 "requirement_id": int(req.id) if req else None,
             }
             if not dry_run:
-                existing_product = _existing_open_catchup_product(db, run_id=int(run.run_id), item_id=int(iid))
-                if existing_product is not None:
-                    existing_product.quantity = _to_float(existing_product.quantity) + gap
-                    existing_product.remaining_qty = _to_float(existing_product.remaining_qty) + gap
-                    product = existing_product
-                    order = existing_product.order
-                else:
-                    order = ProductionOrder(
-                        order_number=f"MRP-RC-{int(run.run_id)}-{int(iid)}",
-                        order_date=now,
-                        order_ref1c=None,
-                        is_posted=False,
-                        deletion_mark=False,
-                        source="mrp",
-                        source_run_id=int(run.run_id),
-                    )
-                    db.add(order)
-                    db.flush()
-                    product = ProductionProduct(
-                        order_id=int(order.order_id),
-                        item_id=int(iid),
-                        line_number=1,
-                        quantity=gap,
-                        produced_qty=0,
-                        remaining_qty=gap,
-                        spec_id=_default_spec_id_for_item(db, int(iid)),
-                        source_mrp_requirement_id=int(req.id) if req else None,
-                    )
-                    db.add(product)
-                    db.flush()
-                    db.add(
-                        ProductionOrderLineState(
-                            product_id=int(product.product_id),
-                            status="shortage",
-                            issue_status="not_requested",
-                            planned_start_date=req.period_from if req else run.period_from,
-                            planned_finish_date=req.period_to if req else run.period_to,
-                        )
-                    )
+                products = _materialize_catchup_gap(db, run=run, item=item, req=req, gap=gap, now=now)
                 _bump_requirement_coverage(req, gap)
                 active_production_by_item[iid] = open_qty + gap
-                entry["order_id"] = int(order.order_id)
-                entry["order_number"] = order.order_number
-                entry["product_id"] = int(product.product_id)
+                entry["orders"] = [
+                    {
+                        "order_id": int(order.order_id),
+                        "order_number": order.order_number,
+                        "product_id": int(product.product_id),
+                        "qty": round(_to_float(qty), 6),
+                    }
+                    for order, product, qty in products
+                ]
+                if products:
+                    order, product, _qty = products[0]
+                    entry["order_id"] = int(order.order_id)
+                    entry["order_number"] = order.order_number
+                    entry["product_id"] = int(product.product_id)
             production_added.append(entry)
 
         elif flow == REPLENISHMENT_FLOW_PURCHASE:
@@ -482,6 +627,8 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
             purchase_added.append(entry)
         # rework flow is intentionally not auto-topped-up in v1.
 
+    batch_repair = _split_oversized_catchup_batches(db, run, dry_run=dry_run, now=now)
+
     # Re-anchor every production line that is NOT yet open in 1C to a fresh
     # capacity-aware, child→parent-aware schedule starting today. Lines already
     # open in 1C stay where they are and pre-book their capacity.
@@ -503,6 +650,7 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
         "purchase_added": purchase_added,
         "rescheduled": reschedule,
         "mrp_order_repair": mrp_order_repair,
+        "mrp_batch_repair": batch_repair,
     }
 
 

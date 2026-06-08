@@ -331,6 +331,119 @@ def test_reconcile_grows_existing_catchup_order_when_stock_drops(db_session):
     assert float(req.remaining_qty) == 0.0
 
 
+def test_reconcile_splits_catchup_order_by_optimal_batch(db_session):
+    item = _make_production_item(db_session, "P-STOCK-DROP-BATCH", stock=32.0)
+    item.optimal_batch = 15
+    plan = ProductionPlanHeader(
+        name="План июнь",
+        period_from=date(2026, 6, 1),
+        period_to=date(2026, 6, 30),
+        status="fixed",
+        created_by="test",
+    )
+    db_session.add(plan)
+    db_session.flush()
+    db_session.add(
+        ProductionPlanLine(
+            plan_id=plan.id, item_id=item.item_id, bucket_date=date(2026, 6, 15), qty=34
+        )
+    )
+    db_session.commit()
+
+    snap = create_mrp_snapshot_from_period_plan(db_session, plan.id)
+    run_id = snap["run_id"]
+    req = (
+        db_session.query(MrpRequirement)
+        .filter(MrpRequirement.run_id == run_id, MrpRequirement.item_id == item.item_id)
+        .one()
+    )
+    create_production_orders_from_mrp_requirements(db_session, [req.id])
+    item.stock_qty = 0.0
+    db_session.commit()
+
+    res = reconcile_snapshot(db_session, run_id)
+
+    added = res["production_added"]
+    assert len(added) == 1
+    assert abs(added[0]["qty"] - 32.0) < 1e-6
+    assert [entry["qty"] for entry in added[0]["orders"]] == [15.0, 15.0, 2.0]
+    products = (
+        db_session.query(ProductionProduct)
+        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+        .filter(ProductionOrder.source_run_id == run_id, ProductionProduct.item_id == item.item_id)
+        .order_by(ProductionProduct.product_id.asc())
+        .all()
+    )
+    assert [float(product.quantity) for product in products] == [2.0, 15.0, 15.0, 2.0]
+
+
+def test_reconcile_repairs_oversized_catchup_order_by_optimal_batch(db_session):
+    item = _make_production_item(db_session, "P-BATCH-REPAIR", stock=0.0)
+    item.optimal_batch = 15
+    plan = ProductionPlanHeader(
+        name="План июнь",
+        period_from=date(2026, 6, 1),
+        period_to=date(2026, 6, 30),
+        status="fixed",
+        created_by="test",
+    )
+    db_session.add(plan)
+    db_session.flush()
+    db_session.add(
+        ProductionPlanLine(
+            plan_id=plan.id, item_id=item.item_id, bucket_date=date(2026, 6, 15), qty=67
+        )
+    )
+    db_session.commit()
+
+    snap = create_mrp_snapshot_from_period_plan(db_session, plan.id)
+    run_id = snap["run_id"]
+    req = (
+        db_session.query(MrpRequirement)
+        .filter(MrpRequirement.run_id == run_id, MrpRequirement.item_id == item.item_id)
+        .one()
+    )
+    order = ProductionOrder(
+        order_number=f"MRP-RC-{run_id}-{item.item_id}",
+        order_date=date(2026, 6, 15),
+        is_posted=False,
+        deletion_mark=False,
+        source="mrp",
+        source_run_id=run_id,
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=item.item_id,
+        line_number=1,
+        quantity=67,
+        produced_qty=0,
+        remaining_qty=67,
+        source_mrp_requirement_id=req.id,
+    )
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(ProductionOrderLineState(product_id=product.product_id, status="shortage"))
+    req.covered_qty = 67
+    req.remaining_qty = 0
+    db_session.commit()
+
+    res = reconcile_snapshot(db_session, run_id)
+
+    assert res["production_added"] == []
+    assert res["mrp_batch_repair"]["created_orders"] == 4
+    products = (
+        db_session.query(ProductionProduct)
+        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+        .filter(ProductionOrder.source_run_id == run_id, ProductionProduct.item_id == item.item_id)
+        .order_by(ProductionProduct.product_id.asc())
+        .all()
+    )
+    assert [float(product.quantity) for product in products] == [15.0, 15.0, 15.0, 15.0, 7.0]
+    assert [float(product.remaining_qty) for product in products] == [15.0, 15.0, 15.0, 15.0, 7.0]
+
+
 def test_reconcile_propagates_parent_stock_drop_to_component(db_session):
     painted = _make_production_item(db_session, "P-PAINT-DROP", stock=32.0)
     welded = _make_production_item(db_session, "P-WELD-DROP", stock=7.0)
