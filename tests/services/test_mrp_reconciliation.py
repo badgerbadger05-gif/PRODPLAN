@@ -220,6 +220,53 @@ def test_reconcile_tops_up_after_partial_close(db_session):
     assert res["production_added"] == []
 
 
+def test_reconcile_tops_up_when_stock_drops_after_snapshot(db_session):
+    item = _make_production_item(db_session, "P-STOCK-DROP", stock=32.0)
+    plan = ProductionPlanHeader(
+        name="План июнь",
+        period_from=date(2026, 6, 1),
+        period_to=date(2026, 6, 30),
+        status="fixed",
+        created_by="test",
+    )
+    db_session.add(plan)
+    db_session.flush()
+    db_session.add(
+        ProductionPlanLine(
+            plan_id=plan.id, item_id=item.item_id, bucket_date=date(2026, 6, 15), qty=34
+        )
+    )
+    db_session.commit()
+
+    snap = create_mrp_snapshot_from_period_plan(db_session, plan.id)
+    run_id = snap["run_id"]
+    req = (
+        db_session.query(MrpRequirement)
+        .filter(MrpRequirement.run_id == run_id, MrpRequirement.item_id == item.item_id)
+        .one()
+    )
+    assert float(req.total_required_qty) == 34.0
+    assert float(req.net_required_qty) == 2.0
+
+    create_production_orders_from_mrp_requirements(db_session, [req.id])
+    item.stock_qty = 17.0
+    db_session.commit()
+
+    res = reconcile_snapshot(db_session, run_id)
+
+    added = res["production_added"]
+    assert len(added) == 1
+    assert added[0]["item_id"] == item.item_id
+    assert abs(added[0]["qty"] - 15.0) < 1e-6
+    db_session.refresh(req)
+    assert float(req.net_required_qty) == 17.0
+    assert float(req.covered_qty) == 17.0
+    assert float(req.remaining_qty) == 0.0
+
+    res = reconcile_snapshot(db_session, run_id)
+    assert res["production_added"] == []
+
+
 def _link_bom(db, parent: Item, child: Item, qty_per_unit: float = 1.0) -> None:
     """Give `parent` a default spec whose single component is `child`."""
     spec = Specification(

@@ -56,11 +56,11 @@ from ..models import (
 )
 from .capacity_scheduler import CapacityScheduler
 from .period_plan_service import (
-    _explode_bom_net_first,
     _load_purchase_supplier_remaining,
     _to_float,
 )
 from .production_control_journal import _default_spec_id_for_item, dedupe_mrp_production_orders
+from .mrp_stock_helpers import effective_stock_by_item_all
 from .replenishment import (
     REPLENISHMENT_FLOW_PRODUCTION,
     REPLENISHMENT_FLOW_PURCHASE,
@@ -156,6 +156,36 @@ def _existing_open_catchup_product(db: Session, *, run_id: int, item_id: int) ->
     return None
 
 
+def _active_production_qty_by_item(db: Session, item_ids: List[int]) -> Dict[int, float]:
+    """Open production/WIP quantity per item, including 1C and local rows."""
+    if not item_ids:
+        return {}
+    rows = (
+        db.query(
+            ProductionProduct.item_id,
+            func.sum(func.coalesce(ProductionProduct.remaining_qty, 0.0)).label("qty"),
+        )
+        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+        .outerjoin(
+            ProductionOrderLineState,
+            ProductionOrderLineState.product_id == ProductionProduct.product_id,
+        )
+        .filter(ProductionProduct.item_id.in_([int(iid) for iid in item_ids]))
+        .filter(ProductionOrder.deletion_mark == False)
+        .filter(
+            or_(
+                ProductionOrder.order_state_key.is_(None),
+                func.lower(ProductionOrder.order_state_key) != DONE_STATE_KEY,
+            )
+        )
+        .filter(func.coalesce(ProductionProduct.remaining_qty, 0.0) > 0)
+        .filter(func.coalesce(ProductionOrderLineState.status, "shortage").notin_(("completed", "cancelled")))
+        .group_by(ProductionProduct.item_id)
+        .all()
+    )
+    return {int(iid): _to_float(qty) for iid, qty in rows}
+
+
 def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Dict[str, Any]:
     """
     Recompute current net demand for one FIXED_SNAPSHOT run and top up the gap.
@@ -170,8 +200,12 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
     if run.source_plan_id is None:
         raise ValueError(f"run_id={run_id}: прогон не привязан к плану периода")
 
-    raw_demands = _rebuild_plan_demands(db, int(run.source_plan_id))
-    if not raw_demands:
+    snapshot_requirements = (
+        db.query(MrpRequirement)
+        .filter(MrpRequirement.run_id == int(run.run_id))
+        .all()
+    )
+    if not snapshot_requirements:
         return {
             "run_id": int(run.run_id),
             "source_plan_id": int(run.source_plan_id),
@@ -182,28 +216,24 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
             "note": "в плане нет положительной потребности",
         }
 
-    period_to = run.period_to or max(
-        (d for buckets in raw_demands.values() for d in buckets), default=date.today()
-    )
+    period_to = run.period_to or max((req.period_to for req in snapshot_requirements), default=date.today())
 
-    # Reconciliation is a TOTAL-over-the-period balance check, not a schedule:
-    # we ask "is the whole period's demand covered by current stock + every open
-    # order + incoming supply?", deliberately ignoring per-bucket timing.
-    # `_explode_bom_net_first` nets WIP time-aware (a late order can't cover an
-    # earlier bucket), so we collapse each item's demand into a single bucket at
-    # period_to. Then every open WIP line with ETA <= period_to is credited and
-    # we don't raise false gaps just because an existing order is scheduled mid
-    # period. Catch-up orders we create carry planned_finish = period_to, so the
-    # next run nets them out (idempotent).
-    plan_demands: Dict[int, Dict[date, float]] = {
-        int(iid): {period_to: sum(_to_float(q) for q in buckets.values())}
-        for iid, buckets in raw_demands.items()
-    }
+    # A fixed snapshot already contains the BOM explosion result in
+    # MrpRequirement.total_required_qty. Reconciliation must not explode the
+    # current plan again: doing so can reintroduce obsolete gross demand after
+    # local MRP orders were reduced/cancelled. Re-anchor only the net side of the
+    # frozen snapshot to current effective stock, then compare it with open WIP.
+    item_ids = [int(req.item_id) for req in snapshot_requirements]
+    stock_by_item = effective_stock_by_item_all(db)
+    active_production_by_item = _active_production_qty_by_item(db, item_ids)
+    current_net_by_item: Dict[int, float] = {}
+    for req in snapshot_requirements:
+        iid = int(req.item_id)
+        current_net_by_item[iid] = max(
+            _to_float(req.total_required_qty) - _to_float(stock_by_item.get(iid, 0.0)),
+            0.0,
+        )
 
-    # Fresh net demand: nets gross against CURRENT stock + open WIP.
-    _gross_map, net_map, _bom = _explode_bom_net_first(db, plan_demands)
-
-    item_ids = [int(iid) for iid in net_map.keys()]
     items_by_id: Dict[int, Item] = {
         int(r.item_id): r
         for r in db.query(Item).filter(Item.item_id.in_(item_ids)).all()
@@ -236,21 +266,25 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
     purchase_added: List[Dict[str, Any]] = []
     now = datetime.utcnow()
 
-    for iid in sorted(net_map.keys()):
-        fresh_net = sum(_to_float(q) for q in net_map[iid].values())
-        if fresh_net <= EPS:
-            continue
+    for iid in sorted(current_net_by_item.keys()):
         item = items_by_id.get(iid)
         if item is None:
             continue
         flow = classify_replenishment_flow(getattr(item, "replenishment_method", None))
         req = req_by_item.get(iid)
+        current_net = _to_float(current_net_by_item.get(iid, 0.0))
+
+        if req is not None:
+            req.net_required_qty = current_net
 
         if flow == REPLENISHMENT_FLOW_PRODUCTION:
-            # net_map already excludes current stock and open WIP, so the whole
-            # fresh_net is the catch-up quantity. Creating it as an open journal
-            # line turns it into WIP, which the next run nets out (idempotent).
-            gap = fresh_net
+            open_qty = _to_float(active_production_by_item.get(iid, 0.0))
+            if req is not None:
+                req.covered_qty = min(open_qty, current_net)
+                req.remaining_qty = max(current_net - _to_float(req.covered_qty), 0.0)
+            gap = max(current_net - open_qty, 0.0)
+            if gap <= EPS:
+                continue
             entry = {
                 "item_id": int(iid),
                 "item_code": str(item.item_code or ""),
@@ -295,16 +329,19 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
                     )
                 )
                 _bump_requirement_coverage(req, gap)
+                active_production_by_item[iid] = open_qty + gap
                 entry["order_id"] = int(order.order_id)
                 entry["order_number"] = order.order_number
                 entry["product_id"] = int(product.product_id)
             production_added.append(entry)
 
         elif flow == REPLENISHMENT_FLOW_PURCHASE:
-            # net_map gives gross - stock for purchased items (no production WIP).
-            # Net further against incoming supplier orders, then against purchase
-            # lines already present in this run (dedup → idempotent).
-            target = fresh_net
+            if current_net <= EPS:
+                if req is not None:
+                    req.covered_qty = 0.0
+                    req.remaining_qty = 0.0
+                continue
+            target = current_net
             for sup_row in supplier_work.get(iid, []):
                 if target <= EPS:
                     break
@@ -316,6 +353,9 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
                 target -= used
             already = existing_planned_purchase.get(iid, 0.0)
             gap = target - already
+            if req is not None:
+                req.covered_qty = min(current_net - max(gap, 0.0), current_net)
+                req.remaining_qty = max(current_net - _to_float(req.covered_qty), 0.0)
             if gap <= EPS:
                 continue
             lead_time = int(getattr(item, "replenishment_time", 0) or 0)
