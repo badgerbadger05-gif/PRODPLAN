@@ -301,6 +301,7 @@ class ProductionOrderLineState(Base):
     material_coverage_status = Column(String(32), nullable=True, index=True)
     material_coverage_label = Column(String(64), nullable=True)
     material_coverage_calculated_at = Column(TIMESTAMP, nullable=True)
+    material_coverage_snapshot = Column(CrossPlatformJSON, nullable=True)
     comment = Column(TEXT, nullable=True)
     created_at = Column(TIMESTAMP, default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now(), nullable=False)

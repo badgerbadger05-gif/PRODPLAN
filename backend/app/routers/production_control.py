@@ -31,7 +31,7 @@ from ..services.production_control_journal import (
     update_line_state,
     update_product_quantity,
 )
-from ..services.production_control_material_availability import preview_materials
+from ..services.production_control_material_availability import get_materials_snapshot, preview_materials
 from ..services.production_control_printing import mark_route_sheets_printed, render_route_sheets_html
 from ..services.production_control_production_flow import (
     produce_line,
@@ -232,7 +232,7 @@ def get_order_line_materials(
     db: Session = Depends(get_db),
 ):
     try:
-        return preview_materials(db, int(product_id), refresh_state=bool(refresh))
+        return get_materials_snapshot(db, int(product_id), refresh=bool(refresh))
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:

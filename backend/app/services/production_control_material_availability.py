@@ -309,6 +309,7 @@ def _store_material_coverage_status(
     state: ProductionOrderLineState,
     new_status: str,
     label: str,
+    snapshot: Dict[str, Any],
 ) -> None:
     """
     Persist material availability separately from the workflow state.
@@ -319,6 +320,7 @@ def _store_material_coverage_status(
     state.material_coverage_status = new_status
     state.material_coverage_label = label
     state.material_coverage_calculated_at = datetime.utcnow()
+    state.material_coverage_snapshot = snapshot
     if (
         state.issue_status in {None, "", "not_requested"}
         and state.status in {"shortage", "partial", "ready"}
@@ -402,12 +404,7 @@ def preview_materials(db: Session, product_id: int, *, refresh_state: bool = Fal
 
     order_coverage = _aggregate_coverage([str(c["coverage"]) for c in components])
 
-    if refresh_state:
-        state = _ensure_state(db, product)
-        _store_material_coverage_status(state, order_coverage, _ui_coverage_label(order_coverage))
-        db.commit()
-
-    return {
+    payload = {
         "product_id": int(product.product_id),
         "order_number": str(product.order.order_number or ""),
         "item_name": str(product.item.item_name or ""),
@@ -419,6 +416,25 @@ def preview_materials(db: Session, product_id: int, *, refresh_state: bool = Fal
         "coverage_status": order_coverage,
         "coverage_label": _ui_coverage_label(order_coverage),
     }
+    if refresh_state:
+        state = _ensure_state(db, product)
+        _store_material_coverage_status(state, order_coverage, _ui_coverage_label(order_coverage), payload)
+        db.commit()
+    return payload
+
+
+def get_materials_snapshot(db: Session, product_id: int, *, refresh: bool = False) -> Dict[str, Any]:
+    if refresh:
+        return preview_materials(db, int(product_id), refresh_state=True)
+    state = (
+        db.query(ProductionOrderLineState)
+        .filter(ProductionOrderLineState.product_id == int(product_id))
+        .first()
+    )
+    snapshot = state.material_coverage_snapshot if state else None
+    if isinstance(snapshot, dict):
+        return dict(snapshot)
+    return preview_materials(db, int(product_id), refresh_state=False)
 
 
 def _active_product_ids(db: Session, *, limit: int = 0) -> List[int]:

@@ -250,7 +250,7 @@ export function ProductionControlPage() {
       const data = await api<MaterialsResponse>(`/v1/production-control/orders/${productId}/materials${refresh ? '?refresh=true' : ''}`)
       setMaterials(data)
       const coverageStatus = String(data.coverage_status || '')
-      if (coverageStatus) {
+      if (refresh && coverageStatus) {
         setRows((list) => list.map((item) => {
           if (item.product_id !== productId) return item
           const canApplyMaterialCoverage = (!item.issue_status || item.issue_status === 'not_requested')
@@ -767,6 +767,11 @@ export function ProductionControlPage() {
   useEffect(() => {
     setMaterials(null)
   }, [activeRow?.product_id])
+
+  useEffect(() => {
+    const productId = activeRow?.product_id
+    if (productId) void loadMaterials(productId, false)
+  }, [activeRow?.product_id, loadMaterials])
 
   const visibleFrom = total ? offset + 1 : 0
   const visibleTo = Math.min(offset + rows.length, total)

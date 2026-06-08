@@ -1895,6 +1895,7 @@ def test_preview_materials_marks_ready_when_stock_covers_all(db_session):
     assert state.material_coverage_status == "ready"
     assert state.material_coverage_label == "Обеспечен"
     assert state.material_coverage_calculated_at is not None
+    assert state.material_coverage_snapshot["components"][0]["coverage_status"] == "ready"
 
 
 def test_journal_uses_cached_material_coverage_for_coverage_band_rows(db_session):
@@ -2059,6 +2060,7 @@ def test_recalculate_production_coverage_refreshes_static_cache(db_session):
     )
     assert state.material_coverage_status == "ready"
     assert state.material_coverage_label == "Обеспечен"
+    assert state.material_coverage_snapshot["coverage_status"] == "ready"
 
 
 # ---------------------------------------------------------------------------
