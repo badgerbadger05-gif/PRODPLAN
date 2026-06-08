@@ -41,6 +41,7 @@ from ..models import (
     DefaultSpecification,
     Item,
     MrpRequirement,
+    MrpRequirementBucket,
     Operation,
     PlannedPurchase,
     PlanningRun,
@@ -228,6 +229,17 @@ def _current_snapshot_gross_by_item(
             continue
         components_by_spec.setdefault(int(spec_id), []).append((child_id, _to_float(qty)))
 
+    saved_net_by_item = {
+        int(item_id): _to_float(qty)
+        for item_id, qty in (
+            db.query(MrpRequirementBucket.item_id, func.sum(MrpRequirementBucket.net_qty))
+            .filter(MrpRequirementBucket.run_id == int(requirements[0].run_id))
+            .filter(MrpRequirementBucket.item_id.in_(item_ids))
+            .group_by(MrpRequirementBucket.item_id)
+            .all()
+        )
+    }
+
     for req in sorted(requirements, key=lambda r: (int(r.bom_level or 0), int(r.item_id))):
         parent_id = int(req.item_id)
         spec_id = spec_by_parent.get(parent_id)
@@ -240,7 +252,7 @@ def _current_snapshot_gross_by_item(
             _to_float(current_gross.get(parent_id, 0.0)) - _to_float(stock_by_item.get(parent_id, 0.0)),
             0.0,
         )
-        parent_saved_net = _to_float(req.net_required_qty)
+        parent_saved_net = _to_float(saved_net_by_item.get(parent_id, req.net_required_qty))
         parent_net_delta = parent_current_net - parent_saved_net
         if abs(parent_net_delta) <= EPS:
             continue
