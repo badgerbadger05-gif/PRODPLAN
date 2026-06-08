@@ -331,6 +331,53 @@ def test_reconcile_grows_existing_catchup_order_when_stock_drops(db_session):
     assert float(req.remaining_qty) == 0.0
 
 
+def test_reconcile_propagates_parent_stock_drop_to_component(db_session):
+    painted = _make_production_item(db_session, "P-PAINT-DROP", stock=32.0)
+    welded = _make_production_item(db_session, "P-WELD-DROP", stock=7.0)
+    _link_bom(db_session, painted, welded, qty_per_unit=1.0)
+    plan = ProductionPlanHeader(
+        name="План июнь",
+        period_from=date(2026, 6, 1),
+        period_to=date(2026, 6, 30),
+        status="fixed",
+        created_by="test",
+    )
+    db_session.add(plan)
+    db_session.flush()
+    db_session.add(
+        ProductionPlanLine(
+            plan_id=plan.id, item_id=painted.item_id, bucket_date=date(2026, 6, 15), qty=34
+        )
+    )
+    db_session.commit()
+
+    snap = create_mrp_snapshot_from_period_plan(db_session, plan.id)
+    run_id = snap["run_id"]
+    reqs = {
+        int(r.item_id): r
+        for r in db_session.query(MrpRequirement).filter(MrpRequirement.run_id == run_id).all()
+    }
+    assert float(reqs[painted.item_id].net_required_qty) == 2.0
+    assert float(reqs[welded.item_id].total_required_qty) == 2.0
+    assert float(reqs[welded.item_id].net_required_qty) == 0.0
+
+    create_production_orders_from_mrp_requirements(db_session, [reqs[painted.item_id].id])
+    painted.stock_qty = 17.0
+    db_session.commit()
+
+    res = reconcile_snapshot(db_session, run_id)
+
+    added = {entry["item_id"]: entry["qty"] for entry in res["production_added"]}
+    assert abs(added[painted.item_id] - 15.0) < 1e-6
+    assert abs(added[welded.item_id] - 10.0) < 1e-6
+    db_session.refresh(reqs[painted.item_id])
+    db_session.refresh(reqs[welded.item_id])
+    assert float(reqs[painted.item_id].net_required_qty) == 17.0
+    assert float(reqs[welded.item_id].net_required_qty) == 10.0
+    assert float(reqs[welded.item_id].covered_qty) == 10.0
+    assert float(reqs[welded.item_id].remaining_qty) == 0.0
+
+
 def _link_bom(db, parent: Item, child: Item, qty_per_unit: float = 1.0) -> None:
     """Give `parent` a default spec whose single component is `child`."""
     spec = Specification(

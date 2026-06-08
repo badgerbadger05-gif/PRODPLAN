@@ -186,6 +186,75 @@ def _active_production_qty_by_item(db: Session, item_ids: List[int]) -> Dict[int
     return {int(iid): _to_float(qty) for iid, qty in rows}
 
 
+def _current_snapshot_gross_by_item(
+    db: Session,
+    requirements: List[MrpRequirement],
+    stock_by_item: Dict[int, float],
+) -> Dict[int, float]:
+    """
+    Recompute fixed-snapshot gross demand after parent net demand drift.
+
+    A child requirement's stored total_required_qty was derived from the
+    parent's net_required_qty at snapshot time. If current stock changes the
+    parent's net, the child gross must move by the same delta through BOM.
+    """
+    req_by_item = {int(req.item_id): req for req in requirements}
+    current_gross = {
+        int(req.item_id): _to_float(req.total_required_qty)
+        for req in requirements
+    }
+
+    item_ids = list(req_by_item)
+    spec_by_parent = {
+        int(row.item_id): int(row.spec_id)
+        for row in (
+            db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
+            .filter(DefaultSpecification.item_id.in_(item_ids))
+            .all()
+        )
+    }
+    if not spec_by_parent:
+        return current_gross
+
+    component_rows = (
+        db.query(SpecComponent.spec_id, SpecComponent.item_id, SpecComponent.quantity)
+        .filter(SpecComponent.spec_id.in_(list(spec_by_parent.values())))
+        .all()
+    )
+    components_by_spec: Dict[int, List[tuple[int, float]]] = {}
+    for spec_id, component_id, qty in component_rows:
+        child_id = int(component_id)
+        if child_id not in req_by_item:
+            continue
+        components_by_spec.setdefault(int(spec_id), []).append((child_id, _to_float(qty)))
+
+    for req in sorted(requirements, key=lambda r: (int(r.bom_level or 0), int(r.item_id))):
+        parent_id = int(req.item_id)
+        spec_id = spec_by_parent.get(parent_id)
+        if spec_id is None:
+            continue
+        children = components_by_spec.get(spec_id, [])
+        if not children:
+            continue
+        parent_current_net = max(
+            _to_float(current_gross.get(parent_id, 0.0)) - _to_float(stock_by_item.get(parent_id, 0.0)),
+            0.0,
+        )
+        parent_saved_net = _to_float(req.net_required_qty)
+        parent_net_delta = parent_current_net - parent_saved_net
+        if abs(parent_net_delta) <= EPS:
+            continue
+        for child_id, qty_per_unit in children:
+            if qty_per_unit <= EPS:
+                continue
+            current_gross[child_id] = max(
+                _to_float(current_gross.get(child_id, 0.0)) + parent_net_delta * qty_per_unit,
+                0.0,
+            )
+
+    return current_gross
+
+
 def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Dict[str, Any]:
     """
     Recompute current net demand for one FIXED_SNAPSHOT run and top up the gap.
@@ -226,11 +295,12 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
     item_ids = [int(req.item_id) for req in snapshot_requirements]
     stock_by_item = effective_stock_by_item_all(db)
     active_production_by_item = _active_production_qty_by_item(db, item_ids)
+    current_gross_by_item = _current_snapshot_gross_by_item(db, snapshot_requirements, stock_by_item)
     current_net_by_item: Dict[int, float] = {}
     for req in snapshot_requirements:
         iid = int(req.item_id)
         current_net_by_item[iid] = max(
-            _to_float(req.total_required_qty) - _to_float(stock_by_item.get(iid, 0.0)),
+            _to_float(current_gross_by_item.get(iid, req.total_required_qty)) - _to_float(stock_by_item.get(iid, 0.0)),
             0.0,
         )
 
