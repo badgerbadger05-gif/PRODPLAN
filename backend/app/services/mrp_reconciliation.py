@@ -200,6 +200,10 @@ def _current_snapshot_gross_by_item(
     parent's net, the child gross must move by the same delta through BOM.
     """
     req_by_item = {int(req.item_id): req for req in requirements}
+    bom_level_by_item = {
+        int(req.item_id): int(req.bom_level or 0)
+        for req in requirements
+    }
     current_gross = {
         int(req.item_id): _to_float(req.total_required_qty)
         for req in requirements
@@ -258,6 +262,8 @@ def _current_snapshot_gross_by_item(
             continue
         for child_id, qty_per_unit in children:
             if qty_per_unit <= EPS:
+                continue
+            if bom_level_by_item.get(child_id, 0) <= bom_level_by_item.get(parent_id, 0):
                 continue
             current_gross[child_id] = max(
                 _to_float(current_gross.get(child_id, 0.0)) + parent_net_delta * qty_per_unit,
