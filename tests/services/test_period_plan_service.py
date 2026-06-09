@@ -295,6 +295,7 @@ def test_execution_journal_uses_existing_orders_as_progress_base_when_net_is_zer
     order = ProductionOrder(
         order_number="MRP-R-WIP",
         order_date=datetime.datetime(2026, 5, 27),
+        order_ref1c="order-ref-wip",
         is_posted=False,
         deletion_mark=False,
         source="mrp",
@@ -326,7 +327,7 @@ def test_execution_journal_uses_existing_orders_as_progress_base_when_net_is_zer
     assert row["coverage_pct"] == 0
 
 
-def test_execution_journal_ignores_cancelled_production_rows_and_uses_produced_qty_only(db_session):
+def test_execution_journal_ignores_cancelled_and_unopened_production_rows(db_session):
     bucket = date(2026, 6, 2)
     item = Item(
         item_code="MAKE-CANCELLED",
@@ -411,12 +412,14 @@ def test_execution_journal_ignores_cancelled_production_rows_and_uses_produced_q
 
     assert row["gross_qty"] == 86
     assert row["net_qty"] == 81
-    assert row["ordered_qty"] == 81
+    assert row["ordered_qty"] == 0
     assert row["completed_qty"] == 0
     assert row["remaining_qty"] == 81
+    assert row["unassigned_qty"] == 81
     assert row["coverage_pct"] == 0
     assert len(row["work_items"]) == 1
     assert row["work_items"][0]["product_id"] == active_product.product_id
+    assert row["work_items"][0]["one_c_opened"] is False
 
 
 def test_execution_journal_counts_supplier_order_accepted_to_stock_as_completed(db_session):

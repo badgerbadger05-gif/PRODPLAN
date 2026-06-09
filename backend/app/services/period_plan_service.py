@@ -1502,8 +1502,10 @@ def get_period_plan_execution_journal(
         qty_value = _to_float(pp.quantity)
         remaining_value = _to_float(pp.remaining_qty)
         done_value = min(qty_value, max(0.0, _to_float(getattr(pp, "produced_qty", 0.0))))
-        prod_ordered_by_req_id[req_id] = prod_ordered_by_req_id.get(req_id, 0.0) + qty_value
-        prod_done_by_req_id[req_id] = prod_done_by_req_id.get(req_id, 0.0) + done_value
+        is_one_c_opened = bool(po.order_ref1c)
+        if is_one_c_opened:
+            prod_ordered_by_req_id[req_id] = prod_ordered_by_req_id.get(req_id, 0.0) + qty_value
+            prod_done_by_req_id[req_id] = prod_done_by_req_id.get(req_id, 0.0) + done_value
         req_due = req_by_id.get(req_id).period_to if req_by_id.get(req_id) else None
         planned_finish = state.planned_finish_date if state and state.planned_finish_date else None
         forecast = _forecast_payload(planned_finish, req_due or planned_finish)
@@ -1514,7 +1516,7 @@ def get_period_plan_execution_journal(
             "order_number": str(po.order_number or ""),
             "order_ref1c": str(po.order_ref1c or "") if po.order_ref1c else None,
             "order_source": str(po.source or "1c"),
-            "one_c_opened": bool(po.order_ref1c),
+            "one_c_opened": is_one_c_opened,
             "opened_at": state.opened_at.isoformat() if state and state.opened_at else None,
             "order_state": str(po.order_state_name or po.order_state_key or ""),
             "qty": qty_value,
