@@ -81,8 +81,8 @@ DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
 def _latest_active_snapshot_run_ids(db: Session) -> List[int]:
     """
     Latest FIXED_SNAPSHOT run per source plan whose period has not fully passed
-    (``period_to`` is null or >= today). One snapshot per plan is reconciled —
-    the most recent one.
+    (``period_to`` is null or >= today). There must be only one active fixed
+    snapshot per plan; max(run_id) is a defensive fallback for legacy duplicates.
     """
     today = date.today()
     rows = (
@@ -363,7 +363,7 @@ def _current_snapshot_gross_by_item(
     db: Session,
     requirements: List[MrpRequirement],
     stock_by_item: Dict[int, float],
-) -> Dict[int, float]:
+) -> tuple[Dict[int, float], Dict[int, int]]:
     """
     Recompute fixed-snapshot gross demand after parent net demand drift.
 
@@ -381,69 +381,155 @@ def _current_snapshot_gross_by_item(
         for req in requirements
     }
 
+    run_id = int(requirements[0].run_id)
     item_ids = list(req_by_item)
-    spec_by_parent = {
-        int(row.item_id): int(row.spec_id)
-        for row in (
-            db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
-            .filter(DefaultSpecification.item_id.in_(item_ids))
-            .all()
-        )
-    }
-    if not spec_by_parent:
-        return current_gross
-
-    component_rows = (
-        db.query(SpecComponent.spec_id, SpecComponent.item_id, SpecComponent.quantity)
-        .filter(SpecComponent.spec_id.in_(list(spec_by_parent.values())))
-        .all()
-    )
-    components_by_spec: Dict[int, List[tuple[int, float]]] = {}
-    for spec_id, component_id, qty in component_rows:
-        child_id = int(component_id)
-        if child_id not in req_by_item:
-            continue
-        components_by_spec.setdefault(int(spec_id), []).append((child_id, _to_float(qty)))
-
     saved_net_by_item = {
         int(item_id): _to_float(qty)
         for item_id, qty in (
             db.query(MrpRequirementBucket.item_id, func.sum(MrpRequirementBucket.net_qty))
-            .filter(MrpRequirementBucket.run_id == int(requirements[0].run_id))
+            .filter(MrpRequirementBucket.run_id == run_id)
             .filter(MrpRequirementBucket.item_id.in_(item_ids))
             .group_by(MrpRequirementBucket.item_id)
             .all()
         )
     }
 
-    for req in sorted(requirements, key=lambda r: (int(r.bom_level or 0), int(r.item_id))):
-        parent_id = int(req.item_id)
-        spec_id = spec_by_parent.get(parent_id)
-        if spec_id is None:
+    processed: set[int] = set()
+    while True:
+        pending_parent_ids = [
+            int(item_id)
+            for item_id in sorted(current_gross, key=lambda iid: (bom_level_by_item.get(int(iid), 0), int(iid)))
+            if int(item_id) not in processed
+        ]
+        if not pending_parent_ids:
+            break
+        spec_by_parent = {
+            int(row.item_id): int(row.spec_id)
+            for row in (
+                db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
+                .filter(DefaultSpecification.item_id.in_(pending_parent_ids))
+                .all()
+            )
+        }
+        if not spec_by_parent:
+            processed.update(pending_parent_ids)
             continue
-        children = components_by_spec.get(spec_id, [])
-        if not children:
-            continue
-        parent_current_net = max(
-            _to_float(current_gross.get(parent_id, 0.0)) - _to_float(stock_by_item.get(parent_id, 0.0)),
-            0.0,
+        component_rows = (
+            db.query(SpecComponent.spec_id, SpecComponent.item_id, SpecComponent.quantity)
+            .filter(SpecComponent.spec_id.in_(list(spec_by_parent.values())))
+            .all()
         )
-        parent_saved_net = _to_float(saved_net_by_item.get(parent_id, req.net_required_qty))
-        parent_net_delta = parent_current_net - parent_saved_net
-        if abs(parent_net_delta) <= EPS:
-            continue
-        for child_id, qty_per_unit in children:
-            if qty_per_unit <= EPS:
+        components_by_spec: Dict[int, List[tuple[int, float]]] = {}
+        for spec_id, component_id, qty in component_rows:
+            components_by_spec.setdefault(int(spec_id), []).append((int(component_id), _to_float(qty)))
+
+        for parent_id in pending_parent_ids:
+            processed.add(parent_id)
+            spec_id = spec_by_parent.get(parent_id)
+            if spec_id is None:
                 continue
-            if bom_level_by_item.get(child_id, 0) <= bom_level_by_item.get(parent_id, 0):
+            children = components_by_spec.get(spec_id, [])
+            if not children:
                 continue
-            current_gross[child_id] = max(
-                _to_float(current_gross.get(child_id, 0.0)) + parent_net_delta * qty_per_unit,
+            parent_current_net = max(
+                _to_float(current_gross.get(parent_id, 0.0)) - _to_float(stock_by_item.get(parent_id, 0.0)),
                 0.0,
             )
+            parent_req = req_by_item.get(parent_id)
+            parent_saved_net = _to_float(
+                saved_net_by_item.get(
+                    parent_id,
+                    parent_req.net_required_qty if parent_req is not None else 0.0,
+                )
+            )
+            parent_net_delta = parent_current_net - parent_saved_net
+            if abs(parent_net_delta) <= EPS:
+                continue
+            parent_level = bom_level_by_item.get(parent_id, 0)
+            for child_id, qty_per_unit in children:
+                if qty_per_unit <= EPS:
+                    continue
+                child_level = bom_level_by_item.get(child_id)
+                if child_level is not None and child_level <= parent_level:
+                    continue
+                if child_level is None:
+                    bom_level_by_item[child_id] = parent_level + 1
+                current_gross[child_id] = max(
+                    _to_float(current_gross.get(child_id, 0.0)) + parent_net_delta * qty_per_unit,
+                    0.0,
+                )
 
-    return current_gross
+    return current_gross, bom_level_by_item
 
+
+def _ensure_reconciled_requirements(
+    db: Session,
+    run: PlanningRun,
+    existing_requirements: List[MrpRequirement],
+    current_gross_by_item: Dict[int, float],
+    current_net_by_item: Dict[int, float],
+    bom_level_by_item: Dict[int, int],
+) -> Dict[int, MrpRequirement]:
+    req_by_item: Dict[int, MrpRequirement] = {int(req.item_id): req for req in existing_requirements}
+    for item_id in sorted(current_gross_by_item):
+        if item_id in req_by_item:
+            continue
+        gross = _to_float(current_gross_by_item.get(item_id, 0.0))
+        net = _to_float(current_net_by_item.get(item_id, 0.0))
+        if gross <= EPS and net <= EPS:
+            continue
+        req = MrpRequirement(
+            run_id=int(run.run_id),
+            item_id=int(item_id),
+            total_required_qty=gross,
+            net_required_qty=net,
+            covered_qty=0.0,
+            remaining_qty=net,
+            period_from=run.period_from,
+            period_to=run.period_to,
+            bom_level=bom_level_by_item.get(item_id, 0),
+        )
+        db.add(req)
+        db.flush()
+        db.add(
+            MrpRequirementBucket(
+                requirement_id=int(req.id),
+                run_id=int(run.run_id),
+                item_id=int(item_id),
+                bucket_date=run.period_to or run.period_from or date.today(),
+                gross_qty=gross,
+                net_qty=net,
+            )
+        )
+        req_by_item[item_id] = req
+    return req_by_item
+
+
+def _link_orphan_mrp_products_to_requirements(
+    db: Session,
+    run: PlanningRun,
+    req_by_item: Dict[int, MrpRequirement],
+) -> Dict[str, Any]:
+    if not req_by_item:
+        return {"linked": 0, "items": []}
+    rows = (
+        db.query(ProductionProduct, ProductionOrder)
+        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+        .filter(ProductionOrder.source == "mrp")
+        .filter(ProductionOrder.source_run_id == int(run.run_id))
+        .filter(ProductionOrder.deletion_mark == False)
+        .filter(ProductionProduct.item_id.in_(list(req_by_item)))
+        .filter(ProductionProduct.source_mrp_requirement_id.is_(None))
+        .all()
+    )
+    linked_items: set[int] = set()
+    for product, _order in rows:
+        req = req_by_item.get(int(product.item_id))
+        if req is None:
+            continue
+        product.source_mrp_requirement_id = int(req.id)
+        linked_items.add(int(product.item_id))
+    return {"linked": len(rows), "items": sorted(linked_items)}
 
 def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Dict[str, Any]:
     """
@@ -482,26 +568,30 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
     # current plan again: doing so can reintroduce obsolete gross demand after
     # local MRP orders were reduced/cancelled. Re-anchor only the net side of the
     # frozen snapshot to current effective stock, then compare it with open WIP.
-    item_ids = [int(req.item_id) for req in snapshot_requirements]
     stock_by_item = effective_stock_by_item_all(db)
-    active_production_by_item = _active_production_qty_by_item(db, item_ids)
-    current_gross_by_item = _current_snapshot_gross_by_item(db, snapshot_requirements, stock_by_item)
+    current_gross_by_item, bom_level_by_item = _current_snapshot_gross_by_item(db, snapshot_requirements, stock_by_item)
     current_net_by_item: Dict[int, float] = {}
-    for req in snapshot_requirements:
-        iid = int(req.item_id)
+    for iid in sorted(current_gross_by_item):
         current_net_by_item[iid] = max(
-            _to_float(current_gross_by_item.get(iid, req.total_required_qty)) - _to_float(stock_by_item.get(iid, 0.0)),
+            _to_float(current_gross_by_item.get(iid, 0.0)) - _to_float(stock_by_item.get(iid, 0.0)),
             0.0,
         )
 
+    req_by_item = _ensure_reconciled_requirements(
+        db,
+        run,
+        snapshot_requirements,
+        current_gross_by_item,
+        current_net_by_item,
+        bom_level_by_item,
+    )
+    orphan_link_repair = _link_orphan_mrp_products_to_requirements(db, run, req_by_item)
+    item_ids = sorted(current_net_by_item)
+    active_production_by_item = _active_production_qty_by_item(db, item_ids)
     items_by_id: Dict[int, Item] = {
         int(r.item_id): r
         for r in db.query(Item).filter(Item.item_id.in_(item_ids)).all()
     } if item_ids else {}
-    req_by_item: Dict[int, MrpRequirement] = {
-        int(r.item_id): r
-        for r in db.query(MrpRequirement).filter(MrpRequirement.run_id == int(run.run_id)).all()
-    }
 
     purchase_item_ids = [
         iid for iid in item_ids
@@ -651,6 +741,7 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
         "rescheduled": reschedule,
         "mrp_order_repair": mrp_order_repair,
         "mrp_batch_repair": batch_repair,
+        "orphan_link_repair": orphan_link_repair,
     }
 
 

@@ -542,6 +542,80 @@ def test_reconcile_uses_bucket_net_baseline_after_parent_requirement_was_updated
     assert float(reqs[welded.item_id].remaining_qty) == 0.0
 
 
+def test_reconcile_adds_component_requirement_missing_from_snapshot(db_session):
+    painted = _make_production_item(db_session, "P-MISSING-PAINT", stock=10.0)
+    welded = _make_production_item(db_session, "P-MISSING-WELD", stock=0.0)
+    welded.optimal_batch = 30
+    _link_bom(db_session, painted, welded, qty_per_unit=1.0)
+    plan = ProductionPlanHeader(
+        name="План июнь",
+        period_from=date(2026, 6, 1),
+        period_to=date(2026, 6, 30),
+        status="fixed",
+        created_by="test",
+    )
+    db_session.add(plan)
+    db_session.flush()
+    db_session.add(
+        ProductionPlanLine(
+            plan_id=plan.id, item_id=painted.item_id, bucket_date=date(2026, 6, 15), qty=10
+        )
+    )
+    db_session.commit()
+
+    snap = create_mrp_snapshot_from_period_plan(db_session, plan.id)
+    run_id = snap["run_id"]
+    reqs = {
+        int(r.item_id): r
+        for r in db_session.query(MrpRequirement).filter(MrpRequirement.run_id == run_id).all()
+    }
+    assert painted.item_id in reqs
+    assert welded.item_id not in reqs
+
+    order = ProductionOrder(
+        order_number=f"MRP-RC-{run_id}-{welded.item_id}",
+        order_date=date(2026, 6, 15),
+        is_posted=False,
+        deletion_mark=False,
+        source="mrp",
+        source_run_id=run_id,
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=welded.item_id,
+        line_number=1,
+        quantity=40,
+        produced_qty=0,
+        remaining_qty=40,
+        source_mrp_requirement_id=None,
+    )
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(ProductionOrderLineState(product_id=product.product_id, status="shortage"))
+    painted.stock_qty = 0.0
+    db_session.commit()
+
+    res = reconcile_snapshot(db_session, run_id)
+
+    added = {entry["item_id"]: entry["qty"] for entry in res["production_added"]}
+    assert added[painted.item_id] == 10.0
+    assert welded.item_id not in added
+    assert res["orphan_link_repair"]["linked"] == 1
+    req = (
+        db_session.query(MrpRequirement)
+        .filter(MrpRequirement.run_id == run_id, MrpRequirement.item_id == welded.item_id)
+        .one()
+    )
+    db_session.refresh(product)
+    assert product.source_mrp_requirement_id == req.id
+    assert float(req.total_required_qty) == 10.0
+    assert float(req.net_required_qty) == 10.0
+    assert float(product.quantity) == 10.0
+    assert float(product.remaining_qty) == 10.0
+
+
 def _link_bom(db, parent: Item, child: Item, qty_per_unit: float = 1.0) -> None:
     """Give `parent` a default spec whose single component is `child`."""
     spec = Specification(

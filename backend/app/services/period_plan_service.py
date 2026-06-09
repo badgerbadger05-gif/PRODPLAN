@@ -741,24 +741,53 @@ def create_mrp_snapshot_from_period_plan(
         "period_to": plan.period_to.isoformat(),
     }
 
-    run = PlanningRun(
-        status="FIXED_SNAPSHOT",
-        started_by=started_by or "api",
-        horizon_days=int(snapshot["planning_horizon_days"]),
-        pinned=True,
-        source_plan_id=int(plan.id),
-        period_from=plan.period_from,
-        period_to=plan.period_to,
-        fixed_at=datetime.utcnow(),
-        config_version_id=cfg_id,
-        config_snapshot=snapshot,
-        warnings=[],
-        kpi={},
-        started_at=datetime.utcnow(),
-        finished_at=datetime.utcnow(),
-    )
-    db.add(run)
+    now = datetime.utcnow()
+    run = _latest_fixed_run_for_plan(db, int(plan.id))
+    if run is None:
+        run = PlanningRun(
+            status="FIXED_SNAPSHOT",
+            started_by=started_by or "api",
+            horizon_days=int(snapshot["planning_horizon_days"]),
+            pinned=True,
+            source_plan_id=int(plan.id),
+            period_from=plan.period_from,
+            period_to=plan.period_to,
+            fixed_at=now,
+            config_version_id=cfg_id,
+            config_snapshot=snapshot,
+            warnings=[],
+            kpi={},
+            started_at=now,
+            finished_at=now,
+        )
+        db.add(run)
+    else:
+        run.started_by = started_by or run.started_by or "api"
+        run.horizon_days = int(snapshot["planning_horizon_days"])
+        run.pinned = True
+        run.period_from = plan.period_from
+        run.period_to = plan.period_to
+        run.fixed_at = now
+        run.config_version_id = cfg_id
+        run.config_snapshot = snapshot
+        run.warnings = []
+        run.kpi = {}
+        run.started_at = now
+        run.finished_at = now
     db.flush()
+    # Rebuilding a plan-bound snapshot reuses the same run_id. Keep
+    # MrpRequirement rows so existing ProductionProduct links remain valid, but
+    # rebuild all derived bucket/proposal rows from the current plan.
+    existing_req_by_item: Dict[int, MrpRequirement] = {
+        int(req.item_id): req
+        for req in db.query(MrpRequirement).filter(MrpRequirement.run_id == int(run.run_id)).all()
+    }
+    if existing_req_by_item:
+        db.query(PlannedOrderStage).filter(PlannedOrderStage.run_id == int(run.run_id)).delete(synchronize_session=False)
+        db.query(PlannedOrder).filter(PlannedOrder.run_id == int(run.run_id)).delete(synchronize_session=False)
+        db.query(PlannedPurchase).filter(PlannedPurchase.run_id == int(run.run_id)).delete(synchronize_session=False)
+        db.query(PlannedRework).filter(PlannedRework.run_id == int(run.run_id)).delete(synchronize_session=False)
+        db.query(MrpRequirementBucket).filter(MrpRequirementBucket.run_id == int(run.run_id)).delete(synchronize_session=False)
 
     # --- Collect plan-level (level 0) demand and lock plan lines ---
     buckets_by_item: Dict[int, Dict[date, float]] = {}
@@ -783,6 +812,7 @@ def create_mrp_snapshot_from_period_plan(
     req_count = 0
     bucket_count = 0
     req_by_item: Dict[int, MrpRequirement] = {}
+    seen_requirement_item_ids: Set[int] = set()
     for item_id, gross_buckets in sorted(gross_map.items()):
         total_gross = sum(float(q) for q in gross_buckets.values())
         if total_gross <= 1e-9:
@@ -792,20 +822,31 @@ def create_mrp_snapshot_from_period_plan(
         total_net = sum(float(q) for q in net_buckets.values()) if net_buckets else 0.0
         bom_lvl = bom_level_map.get(item_id, 0)
 
-        req = MrpRequirement(
-            run_id=int(run.run_id),
-            item_id=int(item_id),
-            total_required_qty=total_gross,
-            net_required_qty=total_net,
-            covered_qty=0.0,
-            remaining_qty=total_net,
-            period_from=plan.period_from,
-            period_to=plan.period_to,
-            bom_level=bom_lvl,
-        )
-        db.add(req)
+        req = existing_req_by_item.get(int(item_id))
+        if req is None:
+            req = MrpRequirement(
+                run_id=int(run.run_id),
+                item_id=int(item_id),
+                total_required_qty=total_gross,
+                net_required_qty=total_net,
+                covered_qty=0.0,
+                remaining_qty=total_net,
+                period_from=plan.period_from,
+                period_to=plan.period_to,
+                bom_level=bom_lvl,
+            )
+            db.add(req)
+        else:
+            req.total_required_qty = total_gross
+            req.net_required_qty = total_net
+            req.covered_qty = 0.0
+            req.remaining_qty = total_net
+            req.period_from = plan.period_from
+            req.period_to = plan.period_to
+            req.bom_level = bom_lvl
         db.flush()
         req_by_item[item_id] = req
+        seen_requirement_item_ids.add(int(item_id))
         req_count += 1
 
         # Store per-bucket gross and net quantities for traceability
@@ -826,6 +867,16 @@ def create_mrp_snapshot_from_period_plan(
                 )
             )
             bucket_count += 1
+
+    for item_id, req in existing_req_by_item.items():
+        if item_id in seen_requirement_item_ids:
+            continue
+        req.total_required_qty = 0.0
+        req.net_required_qty = 0.0
+        req.covered_qty = 0.0
+        req.remaining_qty = 0.0
+        req.period_from = plan.period_from
+        req.period_to = plan.period_to
 
     # --- Allocate PlannedOrder / PlannedPurchase / PlannedRework by replenishment flow ---
     allocatable_item_ids = [

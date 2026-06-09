@@ -404,6 +404,25 @@ def test_execution_journal_counts_supplier_order_accepted_to_stock_as_completed(
 class TestPurchaseAllocationNoSupplierOrders:
     """When no supplier orders exist, full net demand becomes PlannedPurchase."""
 
+    def test_reuses_existing_fixed_snapshot_for_plan_recalculation(self, db_session):
+        bucket = date(2026, 6, 2)
+        item = _make_purchased_item(db_session, "BUY-RECALC", stock=0.0)
+        plan = _make_fixed_plan(db_session, item, bucket, qty=30.0)
+
+        first = create_mrp_snapshot_from_period_plan(db_session, plan.id)
+        line = db_session.query(ProductionPlanLine).filter_by(plan_id=plan.id, item_id=item.item_id).one()
+        line.qty = 45
+        db_session.commit()
+
+        second = create_mrp_snapshot_from_period_plan(db_session, plan.id)
+
+        assert second["run_id"] == first["run_id"]
+        assert db_session.query(PlanningRun).filter_by(source_plan_id=plan.id, status="FIXED_SNAPSHOT").count() == 1
+        req = db_session.query(MrpRequirement).filter_by(run_id=first["run_id"], item_id=item.item_id).one()
+        assert float(req.total_required_qty) == pytest.approx(45.0)
+        assert float(req.net_required_qty) == pytest.approx(45.0)
+        assert db_session.query(PlannedPurchase).filter_by(run_id=first["run_id"], item_id=item.item_id).count() == 1
+
     def test_creates_planned_purchase_for_full_net_qty(self, db_session):
         bucket = date(2026, 6, 2)
         item = _make_purchased_item(db_session, "BUY-001", stock=0.0)
