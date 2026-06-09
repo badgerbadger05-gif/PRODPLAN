@@ -19,6 +19,10 @@ def _has_column(inspector, table_name: str, column_name: str) -> bool:
     return column_name in {col["name"] for col in inspector.get_columns(table_name)}
 
 
+def _has_index(inspector, table_name: str, index_name: str) -> bool:
+    return index_name in {idx["name"] for idx in inspector.get_indexes(table_name)}
+
+
 def upgrade() -> None:
     bind = op.get_bind()
     inspector = sa.inspect(bind)
@@ -34,10 +38,8 @@ def upgrade() -> None:
                 server_default="employee",
             ),
         )
-    try:
+    if not _has_index(inspector, "employees", "ix_employees_employee_type"):
         op.create_index("ix_employees_employee_type", "employees", ["employee_type"], unique=False)
-    except Exception:
-        pass
 
 
 def downgrade() -> None:
@@ -45,9 +47,7 @@ def downgrade() -> None:
     inspector = sa.inspect(bind)
     if "employees" not in set(inspector.get_table_names()):
         return
-    try:
+    if _has_index(inspector, "employees", "ix_employees_employee_type"):
         op.drop_index("ix_employees_employee_type", table_name="employees")
-    except Exception:
-        pass
     if _has_column(inspector, "employees", "employee_type"):
         op.drop_column("employees", "employee_type")
