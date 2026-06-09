@@ -87,6 +87,7 @@ class PieceworkExportEntry:
     stage_ref1c: Optional[str] = None
     structural_unit_ref1c: Optional[str] = None
     employee_ref1c: Optional[str] = None
+    employee_type: str = "employee"
     document_datetime: Optional[str] = None
     target_ref_key: Optional[str] = None
     status: str = "planned"
@@ -240,6 +241,7 @@ def _collect_export_entries(
         operation_defaults = _piecework_operation_defaults(db, m.product)
 
         employee_ref = None
+        employee_type = "employee"
         if m.executor:
             employee = (
                 db.query(Employee)
@@ -249,6 +251,7 @@ def _collect_export_entries(
             )
             if employee:
                 employee_ref = _clean_ref1c(employee.employee_ref1c) or None
+                employee_type = str(getattr(employee, "employee_type", None) or "employee")
 
         entries.append(PieceworkExportEntry(
             manufacture_id=int(m.manufacture_id),
@@ -267,6 +270,7 @@ def _collect_export_entries(
             stage_ref1c=operation_defaults.stage_ref1c,
             structural_unit_ref1c=operation_defaults.structural_unit_ref1c,
             employee_ref1c=employee_ref,
+            employee_type=employee_type,
             number=piecework_number(db, m),
         ))
 
@@ -327,9 +331,14 @@ def _build_header_payload(
     if structural_unit_ref:
         operation_row["ПодразделениеЗавершающегоЭтапа_Key"] = structural_unit_ref
     _add_unit_payload(operation_row, entry.unit_ref1c)
+    executor_type = (
+        "StandardODATA.Catalog_Бригады"
+        if entry.employee_type == "brigade"
+        else "StandardODATA.Catalog_Сотрудники"
+    )
     if entry.employee_ref1c:
         operation_row["Исполнитель"] = entry.employee_ref1c
-        operation_row["Исполнитель_Type"] = "StandardODATA.Catalog_Сотрудники"
+        operation_row["Исполнитель_Type"] = executor_type
 
     payload: Dict[str, Any] = {
         "Number": entry.number,
@@ -353,18 +362,62 @@ def _build_header_payload(
         payload["ХозяйственнаяОперация_Key"] = business_operation_ref
     if entry.employee_ref1c:
         payload["Исполнитель"] = entry.employee_ref1c
-        payload["Исполнитель_Type"] = "StandardODATA.Catalog_Сотрудники"
-        payload["СоставБригады"] = [
+        payload["Исполнитель_Type"] = executor_type
+        if entry.employee_type != "brigade":
+            payload["СоставБригады"] = [
+                {
+                    "LineNumber": 1,
+                    "Сотрудник_Key": entry.employee_ref1c,
+                    "КТУ": 1,
+                    "КлючСвязи": link_key,
+                    **({"СтруктурнаяЕдиница_Key": structural_unit_ref} if structural_unit_ref else {}),
+                }
+            ]
+
+    return payload
+
+
+def _add_brigade_composition_to_payload(
+    client: OData1CClient,
+    entry: PieceworkExportEntry,
+    payload: Dict[str, Any],
+) -> None:
+    if entry.employee_type != "brigade":
+        return
+    brigade_ref = _clean_ref1c(entry.employee_ref1c)
+    if not brigade_ref:
+        return
+    link_key = int(entry.manufacture_id) % 2_000_000_000
+    structural_unit_ref = (
+        _clean_ref1c(payload.get("СтруктурнаяЕдиница_Key"))
+        or _clean_ref1c(entry.structural_unit_ref1c)
+        or None
+    )
+    try:
+        doc = client._make_request(
+            f"Catalog_Бригады(guid'{brigade_ref}')",
+            params={"$format": "json"},
+            timeout=60,
+            retries=1,
+        )
+    except Exception:
+        return
+    rows = []
+    for row in doc.get("Состав") or []:
+        employee_ref = _clean_ref1c(row.get("Сотрудник_Key"))
+        if not employee_ref:
+            continue
+        rows.append(
             {
-                "LineNumber": 1,
-                "Сотрудник_Key": entry.employee_ref1c,
-                "КТУ": 1,
+                "LineNumber": len(rows) + 1,
+                "Сотрудник_Key": employee_ref,
+                "КТУ": float(row.get("КТУ") or 1),
                 "КлючСвязи": link_key,
                 **({"СтруктурнаяЕдиница_Key": structural_unit_ref} if structural_unit_ref else {}),
             }
-        ]
-
-    return payload
+        )
+    if rows:
+        payload["СоставБригады"] = rows
 
 
 def _upsert_link(
@@ -513,6 +566,8 @@ def export_piecework_to_1c(
         allow_production=allow_production,
         require_demo_base=True,
     )
+    for entry, payload_envelope in zip(eligible, payloads):
+        _add_brigade_composition_to_payload(client, entry, payload_envelope["payload"])
 
     def _mark_success(entry: PieceworkExportEntry, ref_key: str) -> None:
         _post_document_operational(

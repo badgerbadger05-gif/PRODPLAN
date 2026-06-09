@@ -11,6 +11,7 @@ export type SyncActionId =
   | 'stock'
   | 'productionKinds'
   | 'employees'
+  | 'brigades'
   | 'operations'
   | 'specifications'
   | 'defaultSpecifications'
@@ -55,6 +56,7 @@ export const syncActions: SyncAction[] = [
   { id: 'stock', title: 'Остатки', group: 'Склад и заказы', endpoint: '/v1/sync/stock-odata', entity_name: 'AccumulationRegister_ЗапасыНаСкладах' },
   { id: 'productionKinds', title: 'Виды производства', group: 'Справочники', endpoint: '/v1/sync/production-kinds-odata', entity_name: 'Catalog_ВидыПроизводства' },
   { id: 'employees', title: 'Сотрудники', group: 'Справочники', endpoint: '/v1/sync/employees-odata', entity_name: 'Catalog_Сотрудники' },
+  { id: 'brigades', title: 'Бригады', group: 'Справочники', endpoint: '/v1/sync/employees-odata', entity_name: 'Catalog_Бригады' },
   { id: 'operations', title: 'Операции', group: 'Структура производства', endpoint: '/v1/sync/operations-odata', entity_name: 'Catalog_Спецификации_Операции' },
   { id: 'specifications', title: 'Спецификации', group: 'Структура производства', endpoint: '/v1/sync/specifications-odata', entity_name: 'Catalog_Спецификации' },
   { id: 'defaultSpecifications', title: 'Спецификации по умолчанию', group: 'Структура производства', endpoint: '/v1/sync/default-specifications-odata', entity_name: 'InformationRegister_СпецификацииПоУмолчанию' },
@@ -68,6 +70,7 @@ export const fullSyncOrder: SyncActionId[] = [
   'nomenclature',
   'productionKinds',
   'employees',
+  'brigades',
   'operations',
   'specifications',
   'defaultSpecifications',

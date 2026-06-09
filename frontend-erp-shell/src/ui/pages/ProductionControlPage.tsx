@@ -905,7 +905,7 @@ export function ProductionControlPage() {
                   <option value="">{employeesLoading ? 'Загрузка сотрудников...' : 'Выберите сотрудника'}</option>
                   {employees.map((employee) => (
                     <option key={employee.employee_ref1c} value={employee.employee_ref1c}>
-                      {employee.employee_name}{employee.employee_code ? ` (${employee.employee_code})` : ''}
+                      {employee.employee_name}{employee.employee_type === 'brigade' ? ' [бригада]' : ''}{employee.employee_code ? ` (${employee.employee_code})` : ''}
                     </option>
                   ))}
                 </select>

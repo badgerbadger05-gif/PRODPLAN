@@ -139,6 +139,7 @@ class Employee(Base):
 
     employee_id = Column(Integer, primary_key=True, index=True)
     employee_ref1c = Column(String(36), unique=True, nullable=False, index=True)
+    employee_type = Column(String(20), nullable=False, default="employee", server_default="employee", index=True)
     employee_code = Column(String(50), nullable=True, index=True)
     employee_name = Column(String(255), nullable=False)
     deletion_mark = Column(Boolean, nullable=False, default=False, server_default="false", index=True)

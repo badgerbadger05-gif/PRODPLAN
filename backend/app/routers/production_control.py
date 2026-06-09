@@ -68,6 +68,7 @@ def list_employees(
             {
                 "employee_id": int(row.employee_id),
                 "employee_ref1c": row.employee_ref1c,
+                "employee_type": getattr(row, "employee_type", "employee") or "employee",
                 "employee_code": row.employee_code,
                 "employee_name": row.employee_name,
             }

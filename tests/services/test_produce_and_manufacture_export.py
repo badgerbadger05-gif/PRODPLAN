@@ -6,12 +6,16 @@ from datetime import datetime
 import pytest
 
 from app.models import (
+    DefaultSpecification,
     Item,
     ProductionManufacture,
     ProductionMaterialIssue,
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
+    ProductionStage,
+    SpecComponent,
+    Specification,
     SyncLink,
 )
 from app.routers.production_control import ExportPieceworkPayload
@@ -89,16 +93,28 @@ def _mk_product(db, item: Item, *, qty: float = 10.0) -> ProductionProduct:
 
 
 class _FakeClient:
-    def __init__(self, *, ref_key: str = "manuf-ref-key", fail: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        ref_key: str = "manuf-ref-key",
+        fail: bool = False,
+        parent_order_doc: dict | None = None,
+    ) -> None:
         self.ref_key = ref_key
         self.fail = fail
+        self.parent_order_doc = parent_order_doc or {}
         self.posts: list = []
+        self.gets: list = []
 
     def post(self, entity, payload, **_):
         self.posts.append((entity, payload))
         if self.fail:
             raise RuntimeError("simulated 1C failure")
         return {"Ref_Key": self.ref_key}
+
+    def _make_request(self, endpoint, params=None, **_):
+        self.gets.append((endpoint, params or {}))
+        return dict(self.parent_order_doc)
 
 
 class _PostFailsAfterCreateClient(_FakeClient):
@@ -272,6 +288,94 @@ def test_dry_run_returns_payload_with_order_ref(db_session, monkeypatch):
     assert (
         db.query(SyncLink).filter_by(source_doctype="manufacture").count() == 0
     )
+
+
+def test_manufacture_payload_header_uses_product_structural_unit():
+    entry = exporter.ManufactureExportEntry(
+        manufacture_id=1,
+        product_id=2,
+        order_id=3,
+        order_ref1c="order-ref",
+        item_ref1c="item-ref",
+        item_name="Item",
+        item_article="ART",
+        unit_ref1c="unit-ref",
+        qty=4,
+        material_structural_unit_ref1c="materials-ref",
+        product_structural_unit_ref1c="products-ref",
+        number="MF000000001",
+    )
+
+    payload = exporter._build_header_payload(entry, {})
+
+    assert payload["СтруктурнаяЕдиница_Key"] == exporter.DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C
+    assert payload["СтруктурнаяЕдиницаПродукции_Key"] == "products-ref"
+    assert payload["СтруктурнаяЕдиницаЗапасов_Key"] == "materials-ref"
+    assert payload["Продукция"][0]["СтруктурнаяЕдиница_Key"] == "products-ref"
+    assert (
+        payload["Продукция"][0]["ПодразделениеЗавершающегоЭтапа_Key"]
+        == exporter.DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C
+    )
+
+
+def test_export_inherits_warehouses_from_parent_1c_order_when_local_binding_missing(db_session, monkeypatch):
+    db = db_session
+    item = _mk_item(db, code="EXP-INHERIT", ref1c="item-ref-inherit")
+    component = _mk_item(db, code="EXP-INHERIT-C", ref1c="component-ref-inherit")
+    spec = Specification(spec_name="Spec inherit", spec_ref1c="spec-ref-inherit")
+    stage = ProductionStage(stage_name="Stage inherit", stage_ref1c="stage-ref")
+    db.add(spec)
+    db.add(stage)
+    db.flush()
+    db.add(DefaultSpecification(item_id=item.item_id, spec_id=spec.spec_id))
+    db.add(
+        SpecComponent(
+            spec_id=spec.spec_id,
+            item_id=component.item_id,
+            quantity=2,
+            stage_id=stage.stage_id,
+        )
+    )
+    product = _mk_product(db, item, qty=5)
+    # Mirror a 1C-synced line without spec/workshop: local binding cannot be
+    # resolved, but the already-linked parent order has authoritative units.
+    product.spec_id = None
+    state = db.query(ProductionOrderLineState).filter_by(product_id=product.product_id).one()
+    state.workshop_id = None
+    mid = produce_line(db, product.product_id, qty=5, executor="operator")["manufacture_id"]
+    db.commit()
+
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    fake = _FakeClient(
+        ref_key="inherit-manuf-ref",
+        parent_order_doc={
+            "СтруктурнаяЕдиницаРезерв_Key": "parent-reserve-ref",
+            "СтруктурнаяЕдиницаПродукции_Key": "parent-product-ref",
+            "Продукция": [],
+            "Запасы": [],
+        },
+    )
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False, allow_production=True)
+
+    assert result["manufactures_created"] == 1
+    assert fake.gets
+    payload = fake.posts[0][1]
+    assert payload["СтруктурнаяЕдиница_Key"] == exporter.DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C
+    assert payload["СтруктурнаяЕдиницаПродукции_Key"] == "parent-product-ref"
+    assert payload["СтруктурнаяЕдиницаЗапасов_Key"] == "parent-reserve-ref"
+    assert payload["Продукция"][0]["СтруктурнаяЕдиница_Key"] == "parent-product-ref"
+    assert (
+        payload["Продукция"][0]["ПодразделениеЗавершающегоЭтапа_Key"]
+        == exporter.DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C
+    )
+    assert payload["Продукция"][0]["Спецификация_Key"] == "spec-ref-inherit"
+    assert payload["Запасы"][0]["Номенклатура_Key"] == "component-ref-inherit"
+    assert payload["Запасы"][0]["Количество"] == 10.0
+    assert payload["Запасы"][0]["Спецификация_Key"] == "spec-ref-inherit"
+    assert payload["Запасы"][0]["СтруктурнаяЕдиница_Key"] == "parent-reserve-ref"
+    assert payload["Запасы"][0]["Этап_Key"] == "stage-ref"
 
 
 def test_rollback_local_manufacture_restores_line(db_session):

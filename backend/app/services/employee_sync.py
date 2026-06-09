@@ -43,6 +43,7 @@ def sync_employees_from_odata(db: Session, req: ODataSyncRequest) -> dict:
     сохранить Ref_Key сотрудников для последующего создания сдельных нарядов.
     """
     entity_name = _s(req.entity_name or "Catalog_Сотрудники")
+    employee_type = "brigade" if entity_name == "Catalog_Бригады" else "employee"
     client = OData1CClient(req.base_url, req.username, req.password, req.token)
 
     stats = EmployeeSyncStats(
@@ -113,6 +114,9 @@ def sync_employees_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                     if existing.employee_code != code:
                         existing.employee_code = code
                         need_update = True
+                    if getattr(existing, "employee_type", None) != employee_type:
+                        existing.employee_type = employee_type
+                        need_update = True
                     if existing.employee_name != name:
                         existing.employee_name = name
                         need_update = True
@@ -130,6 +134,7 @@ def sync_employees_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                 else:
                     employee = Employee(
                         employee_ref1c=ref_key,
+                        employee_type=employee_type,
                         employee_code=code,
                         employee_name=name,
                         deletion_mark=deletion_mark,

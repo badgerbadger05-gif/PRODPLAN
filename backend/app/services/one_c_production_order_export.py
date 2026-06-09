@@ -450,6 +450,19 @@ def _collect_export_entries(
                     unit_ref1c=product_unit_ref,
                     qty=product_qty,
                     characteristic_ref1c=_clean_ref1c(product.characteristic_ref1c) or None,
+                    spec_ref1c=(
+                        _clean_ref1c(
+                            getattr(
+                                db.query(Specification)
+                                .filter(Specification.spec_id == int(spec_id))
+                                .first(),
+                                "spec_ref1c",
+                                None,
+                            )
+                        )
+                        if spec_id
+                        else None
+                    ),
                     structural_unit_ref1c=product_destination_ref,
                 )
             )
@@ -522,6 +535,8 @@ def _build_header_payload(
                 else {}
             ),
         }
+        if ln.spec_ref1c:
+            row["Спецификация_Key"] = ln.spec_ref1c
         _add_unit_payload(row, ln.unit_ref1c)
         products.append(row)
     stock_lines = []

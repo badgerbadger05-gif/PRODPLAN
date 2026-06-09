@@ -7,6 +7,7 @@ import pytest
 
 from app.models import (
     DefaultSpecification,
+    Employee,
     Item,
     Operation,
     ProductionManufacture,
@@ -108,6 +109,16 @@ class _FakeClient:
 
     def post_operation(self, operation_path):
         self.operations.append(operation_path)
+
+    def _make_request(self, endpoint, params=None, **_):
+        if "Catalog_Бригады" in endpoint:
+            return {
+                "Состав": [
+                    {"LineNumber": "1", "Сотрудник_Key": "member-ref-1"},
+                    {"LineNumber": "2", "Сотрудник_Key": "member-ref-2"},
+                ]
+            }
+        return {}
 
 
 def _stub_config(monkeypatch, *, base_url: str) -> None:
@@ -226,6 +237,44 @@ def test_zero_price_is_not_sent_as_piecework_rate(db_session):
     assert "Расценка" not in op
     assert "Стоимость" not in op
     assert op["Нормочасы"] == pytest.approx(2.0)
+
+
+def test_brigade_executor_uses_brigade_type_and_composition(db_session, monkeypatch):
+    db = db_session
+    item = _mk_item(db, code="PW-BRIGADE", ref1c="item-ref-brigade")
+    m = _mk_manufacture(db, item, qty=4.0, exported_ref1c="basis-ref-brigade")
+    db.add(
+        Employee(
+            employee_ref1c="brigade-ref",
+            employee_type="brigade",
+            employee_code="000000022",
+            employee_name="Иванов",
+            deletion_mark=False,
+        )
+    )
+    db.commit()
+
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    fake = _FakeClient(ref_key="pw-brigade-ref")
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    result = exporter.export_piecework_to_1c(
+        db,
+        [m.manufacture_id],
+        operation_ref="op-ref",
+        dry_run=False,
+        allow_production=True,
+    )
+
+    assert result["manufactures_created"] == 1
+    payload = fake.posts[0][1]
+    assert payload["Исполнитель"] == "brigade-ref"
+    assert payload["Исполнитель_Type"] == "StandardODATA.Catalog_Бригады"
+    assert payload["Операции"][0]["Исполнитель_Type"] == "StandardODATA.Catalog_Бригады"
+    assert [row["Сотрудник_Key"] for row in payload["СоставБригады"]] == [
+        "member-ref-1",
+        "member-ref-2",
+    ]
 
 
 def test_optional_org_and_unit_in_payload(db_session):

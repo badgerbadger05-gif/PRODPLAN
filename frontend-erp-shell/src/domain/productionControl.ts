@@ -77,6 +77,7 @@ export type OrdersResponse = {
 export type EmployeeOption = {
   employee_id: number
   employee_ref1c: string
+  employee_type?: 'employee' | 'brigade' | string
   employee_code?: string | null
   employee_name: string
 }

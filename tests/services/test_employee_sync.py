@@ -39,6 +39,16 @@ def _request(dry_run=False):
     )
 
 
+def _brigades_request(dry_run=False):
+    return ODataSyncRequest(
+        base_url="http://mtzw7/unf_demo/odata/standard.odata",
+        entity_name="Catalog_Бригады",
+        username="odata.user",
+        password="secret",
+        dry_run=dry_run,
+    )
+
+
 def test_sync_employees_creates_rows(db_session, monkeypatch):
     _FakeODataClient.count = 2
     _FakeODataClient.pages = [
@@ -69,7 +79,31 @@ def test_sync_employees_creates_rows(db_session, monkeypatch):
 
     rows = db_session.query(Employee).order_by(Employee.employee_code.asc()).all()
     assert [row.employee_name for row in rows] == ["Иванов Иван", "Петров Петр"]
+    assert [row.employee_type for row in rows] == ["employee", "employee"]
     assert rows[1].deletion_mark is True
+
+
+def test_sync_brigades_creates_brigade_executor_rows(db_session, monkeypatch):
+    _FakeODataClient.count = 1
+    _FakeODataClient.pages = [
+        [
+            {
+                "Ref_Key": "33333333-3333-3333-3333-333333333333",
+                "Code": "000000022",
+                "Description": "Сварщики с 01.06.2026",
+                "DeletionMark": False,
+                "DataVersion": "AAAAAw",
+            },
+        ]
+    ]
+    monkeypatch.setattr(employee_sync, "OData1CClient", _FakeODataClient)
+
+    stats = sync_employees_from_odata(db_session, _brigades_request())
+
+    assert stats["employees_created"] == 1
+    row = db_session.query(Employee).one()
+    assert row.employee_name == "Сварщики с 01.06.2026"
+    assert row.employee_type == "brigade"
 
 
 def test_sync_employees_updates_existing_row(db_session, monkeypatch):

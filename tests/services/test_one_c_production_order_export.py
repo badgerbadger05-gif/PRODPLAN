@@ -237,6 +237,7 @@ def test_dry_run_payload_includes_materials_operations_and_reserve_warehouse(db_
     assert payload["СтруктурнаяЕдиницаПродукции_Key"] == "production-warehouse-ref"
     [prod_row] = payload["Продукция"]
     assert prod_row["СтруктурнаяЕдиница_Key"] == "production-warehouse-ref"
+    assert prod_row["Спецификация_Key"] == "spec-ref"
     assert prod_row["КлючСвязи"] == 1
     [stock_row] = payload["Запасы"]
     assert stock_row["Номенклатура_Key"] == component.item_ref1c

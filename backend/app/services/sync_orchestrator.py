@@ -122,6 +122,7 @@ SYNC_JOBS: List[SyncJob] = [
     SyncJob("nomenclatureGroups", "Группы номенклатуры (папки)", 86_400, _run_nomenclature_groups),
     SyncJob("productionKinds", "Виды производства", 86_400, _single("Catalog_ВидыПроизводства", sync_production_kinds_from_odata)),
     SyncJob("employees", "Сотрудники", 86_400, _single("Catalog_Сотрудники", sync_employees_from_odata)),
+    SyncJob("brigades", "Бригады", 86_400, _single("Catalog_Бригады", sync_employees_from_odata)),
     SyncJob("operations", "Операции", 43_200, _single("Catalog_Спецификации_Операции", sync_operations_from_odata)),
     SyncJob("specifications", "Спецификации", 43_200, _single("Catalog_Спецификации", sync_specifications_from_odata)),
     SyncJob("defaultSpecifications", "Спецификации по умолчанию", 43_200, _single("InformationRegister_СпецификацииПоУмолчанию", sync_default_specifications_from_odata)),

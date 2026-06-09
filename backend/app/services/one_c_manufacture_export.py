@@ -28,6 +28,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
     Item,
+    DefaultSpecification,
     ProductionManufacture,
     ProductionOrder,
     ProductionOrderLineState,
@@ -35,6 +36,7 @@ from ..models import (
     ResourceStage,
     SpecComponent,
     SpecOperation,
+    Specification,
     SyncLink,
     WorkshopWarehouseBinding,
 )
@@ -73,6 +75,7 @@ class ManufactureExportEntry:
     unit_ref1c: Optional[str]
     qty: float
     spec_id: Optional[int] = None
+    spec_ref1c: Optional[str] = None
     material_structural_unit_ref1c: Optional[str] = None
     product_structural_unit_ref1c: Optional[str] = None
     stage_ref1c: Optional[str] = None
@@ -120,6 +123,18 @@ def _main_stage_id_for_spec(db: Session, spec_id: Optional[int]) -> Optional[int
     return int(component_stage.stage_id) if component_stage else None
 
 
+def _default_spec_id(db: Session, product: ProductionProduct) -> Optional[int]:
+    if product.spec_id:
+        return int(product.spec_id)
+    row = (
+        db.query(DefaultSpecification)
+        .filter(DefaultSpecification.item_id == int(product.item_id))
+        .order_by(DefaultSpecification.id.asc())
+        .first()
+    )
+    return int(row.spec_id) if row else None
+
+
 def _binding_for_product(db: Session, product: ProductionProduct) -> Optional[WorkshopWarehouseBinding]:
     state_workshop_id = None
     state = getattr(product, "control_state", None)
@@ -128,7 +143,7 @@ def _binding_for_product(db: Session, product: ProductionProduct) -> Optional[Wo
 
     workshop_id = state_workshop_id
     if workshop_id is None:
-        stage_id = _main_stage_id_for_spec(db, int(product.spec_id) if product.spec_id else None)
+        stage_id = _main_stage_id_for_spec(db, _default_spec_id(db, product))
         if stage_id:
             resource_stage = (
                 db.query(ResourceStage)
@@ -148,14 +163,16 @@ def _binding_for_product(db: Session, product: ProductionProduct) -> Optional[Wo
     )
 
 
-def _component_rows(db: Session, product: ProductionProduct, qty: float) -> List[Dict[str, Any]]:
-    if not product.spec_id:
+def _component_rows(db: Session, product: ProductionProduct, qty: float, spec_id: Optional[int]) -> List[Dict[str, Any]]:
+    if not spec_id:
         return []
     rows: List[Dict[str, Any]] = []
+    spec = db.query(Specification).filter(Specification.spec_id == int(spec_id)).first()
+    spec_ref = _clean_ref1c(getattr(spec, "spec_ref1c", None)) if spec else None
     components = (
         db.query(SpecComponent, Item)
         .join(Item, Item.item_id == SpecComponent.item_id)
-        .filter(SpecComponent.spec_id == int(product.spec_id))
+        .filter(SpecComponent.spec_id == int(spec_id))
         .order_by(SpecComponent.component_id.asc())
         .all()
     )
@@ -170,12 +187,68 @@ def _component_rows(db: Session, product: ProductionProduct, qty: float) -> List
             "КлючСвязи": idx,
         }
         _add_unit_payload(row, item.unit)
-        if product.spec_id:
-            spec = getattr(product, "specification", None)
-            if spec and _clean_ref1c(getattr(spec, "spec_ref1c", None)):
-                row["Спецификация_Key"] = _clean_ref1c(spec.spec_ref1c)
+        if spec_ref:
+            row["Спецификация_Key"] = spec_ref
         rows.append(row)
     return rows
+
+
+def _inherit_structural_units_from_parent_order(client: OData1CClient, entries: List[ManufactureExportEntry]) -> None:
+    """
+    Fill manufacture warehouses from the linked 1C production order when local
+    PRODPLAN data cannot resolve a workshop. This happens for rows synced back
+    from 1C without spec_id/workshop_id: the parent order still carries the
+    authoritative reserve/product structural units.
+    """
+    need_refs = {
+        str(entry.order_ref1c)
+        for entry in entries
+        if entry.order_ref1c
+        and (not entry.material_structural_unit_ref1c or not entry.product_structural_unit_ref1c)
+    }
+    if not need_refs:
+        return
+
+    by_ref: Dict[str, Dict[str, Any]] = {}
+    for ref in sorted(need_refs):
+        try:
+            by_ref[ref] = client._make_request(
+                f"Document_ЗаказНаПроизводство(guid'{ref}')",
+                params={
+                    "$format": "json",
+                    "$select": (
+                        "Ref_Key,СтруктурнаяЕдиницаРезерв_Key,"
+                        "СтруктурнаяЕдиницаПродукции_Key,Продукция,Запасы"
+                    ),
+                },
+                timeout=60,
+                retries=1,
+            )
+        except Exception:
+            # Export can still proceed with the local/default fallback; the
+            # actual post/patch will surface any critical 1C connectivity issue.
+            continue
+
+    for entry in entries:
+        doc = by_ref.get(str(entry.order_ref1c or ""))
+        if not doc:
+            continue
+        reserve_ref = _clean_ref1c(doc.get("СтруктурнаяЕдиницаРезерв_Key"))
+        product_ref = _clean_ref1c(doc.get("СтруктурнаяЕдиницаПродукции_Key"))
+        if not reserve_ref:
+            for row in doc.get("Запасы") or []:
+                reserve_ref = _clean_ref1c(row.get("СтруктурнаяЕдиница_Key"))
+                if reserve_ref:
+                    break
+        if not product_ref:
+            for row in doc.get("Продукция") or []:
+                product_ref = _clean_ref1c(row.get("СтруктурнаяЕдиница_Key"))
+                if product_ref:
+                    break
+        if reserve_ref and not entry.material_structural_unit_ref1c:
+            entry.material_structural_unit_ref1c = reserve_ref
+        if product_ref and not entry.product_structural_unit_ref1c:
+            entry.product_structural_unit_ref1c = product_ref
 
 
 def _collect_export_entries(
@@ -239,6 +312,12 @@ def _collect_export_entries(
             )
             continue
 
+        resolved_spec_id = _default_spec_id(db, m.product) if m.product else None
+        resolved_spec = (
+            db.query(Specification).filter(Specification.spec_id == int(resolved_spec_id)).first()
+            if resolved_spec_id
+            else None
+        )
         entries.append(
             ManufactureExportEntry(
                 manufacture_id=int(m.manufacture_id),
@@ -250,7 +329,8 @@ def _collect_export_entries(
                 item_article=str(item.item_article or "") if item else "",
                 unit_ref1c=_clean_ref1c(item.unit) if item else None,
                 qty=float(m.qty or 0),
-                spec_id=int(m.product.spec_id) if m.product and m.product.spec_id else None,
+                spec_id=resolved_spec_id,
+                spec_ref1c=_clean_ref1c(getattr(resolved_spec, "spec_ref1c", None)) or None,
                 executor=str(m.executor) if m.executor else None,
                 number=manufacture_number(db, m),
             )
@@ -270,7 +350,7 @@ def _collect_export_entries(
                 from ..models import ProductionStage
                 stage = db.query(ProductionStage).filter(ProductionStage.stage_id == int(stage_id)).one_or_none()
                 entry.stage_ref1c = _clean_ref1c(getattr(stage, "stage_ref1c", None)) or None
-            entry.materials = _component_rows(db, m.product, float(m.qty or 0))
+            entry.materials = _component_rows(db, m.product, float(m.qty or 0), entry.spec_id)
 
     return entries, skipped
 
@@ -303,8 +383,12 @@ def _build_header_payload(entry: ManufactureExportEntry, config: Optional[Dict[s
         "КлючСвязи": 1,
     }
     _add_unit_payload(product_row, entry.unit_ref1c)
+    if entry.spec_ref1c:
+        product_row["Спецификация_Key"] = entry.spec_ref1c
     if product_structural_unit:
         product_row["СтруктурнаяЕдиница_Key"] = product_structural_unit
+    if default_structural_unit:
+        product_row["ПодразделениеЗавершающегоЭтапа_Key"] = default_structural_unit
     products = [product_row]
     material_rows: List[Dict[str, Any]] = []
     for idx, material in enumerate(entry.materials, start=1):
@@ -459,14 +543,13 @@ def export_manufactures_to_1c(
     }
 
     config = _load_odata_config()
-    payloads: List[Dict[str, Any]] = []
-    for entry in eligible:
-        payload = _build_header_payload(entry, config)
-        payloads.append(
-            {"manufacture_id": entry.manufacture_id, "number": entry.number, "payload": payload}
-        )
-
     if dry_run:
+        payloads: List[Dict[str, Any]] = []
+        for entry in eligible:
+            payload = _build_header_payload(entry, config)
+            payloads.append(
+                {"manufacture_id": entry.manufacture_id, "number": entry.number, "payload": payload}
+            )
         summary["entries"] = [asdict(e) for e in entries]
         summary["payloads"] = payloads
         return summary
@@ -477,6 +560,14 @@ def export_manufactures_to_1c(
         allow_production=allow_production,
         require_demo_base=True,
     )
+    _inherit_structural_units_from_parent_order(client, eligible)
+
+    payloads: List[Dict[str, Any]] = []
+    for entry in eligible:
+        payload = _build_header_payload(entry, config)
+        payloads.append(
+            {"manufacture_id": entry.manufacture_id, "number": entry.number, "payload": payload}
+        )
 
     def _mark_success(entry: ManufactureExportEntry, ref_key: str) -> None:
         _post_document_operational(

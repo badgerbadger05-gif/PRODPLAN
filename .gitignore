@@ -30,6 +30,10 @@ dist/
 .quasar/
 
 # Build/debug artifacts in repo root
+/reports/
+/tmp_*.csv
+/tmp_*.json
+/tmp_*.txt
 /all_logs.txt
 /backend_logs.txt
 /backend_logs2.txt

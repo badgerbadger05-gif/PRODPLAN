@@ -1,5 +1,16 @@
-﻿services:
+﻿# Local developer stack only.
+#
+# Production on mtzdock.lan uses docker-compose.test.yml on ports 8010/9010/55433.
+# This file is intentionally behind the "local-dev" profile so a bare
+# `docker compose up -d` cannot accidentally start a second stack on prod.
+#
+# Local run:
+#   docker compose --profile local-dev up -d
+name: prodplan-local-dev
+
+services:
   db:
+    profiles: ["local-dev"]
     image: postgres:15
     restart: unless-stopped
     environment:
@@ -19,6 +30,7 @@
       start_period: 10s
 
   backend:
+    profiles: ["local-dev"]
     build:
       context: ./backend
       args:
@@ -49,6 +61,7 @@
       start_period: 15s
 
   frontend:
+    profiles: ["local-dev"]
     build: ./frontend-erp-shell
     restart: unless-stopped
     environment:
@@ -69,6 +82,7 @@
   # /api/v1/sync/auto/tick — оркестратор выполняет не более одного просроченного
   # job за тик (один OData-pull за раз, без пиков). Read-only к 1С.
   sync-worker:
+    profiles: ["local-dev"]
     build:
       context: ./backend
       args:
@@ -87,6 +101,7 @@
   # /api/v1/plan/reconcile: пересчитывает активные снимки и добирает
   # недопокрытие (заказы в журнал, строки закупок). В 1С ничего не пишет.
   reconcile-worker:
+    profiles: ["local-dev"]
     build:
       context: ./backend
       args:
