@@ -326,6 +326,99 @@ def test_execution_journal_uses_existing_orders_as_progress_base_when_net_is_zer
     assert row["coverage_pct"] == 0
 
 
+def test_execution_journal_ignores_cancelled_production_rows_and_uses_produced_qty_only(db_session):
+    bucket = date(2026, 6, 2)
+    item = Item(
+        item_code="MAKE-CANCELLED",
+        item_name="Деталь с отмененными дублями",
+        item_article="MAKE-CANCELLED",
+        unit="шт",
+        stock_qty=0,
+        replenishment_method="Производство",
+        status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+    plan = _make_fixed_plan(db_session, item, bucket, qty=86.0)
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        source_plan_id=plan.id,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        started_at=datetime.datetime(2026, 5, 26, 5, 25),
+        finished_at=datetime.datetime(2026, 5, 26, 5, 25),
+    )
+    db_session.add(run)
+    db_session.flush()
+    req = MrpRequirement(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        total_required_qty=86,
+        net_required_qty=81,
+        covered_qty=81,
+        remaining_qty=0,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        bom_level=1,
+    )
+    db_session.add(req)
+    db_session.flush()
+
+    active_order = ProductionOrder(
+        order_number="MRP-R-ACTIVE",
+        order_date=datetime.datetime(2026, 5, 27),
+        is_posted=False,
+        deletion_mark=False,
+        source="mrp",
+        source_run_id=run.run_id,
+    )
+    cancelled_order = ProductionOrder(
+        order_number="MRP-R-CANCELLED",
+        order_date=datetime.datetime(2026, 5, 27),
+        is_posted=False,
+        deletion_mark=False,
+        source="mrp",
+        source_run_id=run.run_id,
+    )
+    db_session.add_all([active_order, cancelled_order])
+    db_session.flush()
+
+    active_product = ProductionProduct(
+        order_id=active_order.order_id,
+        item_id=item.item_id,
+        line_number=1,
+        quantity=81,
+        produced_qty=0,
+        remaining_qty=81,
+        source_mrp_requirement_id=req.id,
+    )
+    cancelled_product = ProductionProduct(
+        order_id=cancelled_order.order_id,
+        item_id=item.item_id,
+        line_number=1,
+        quantity=141,
+        produced_qty=0,
+        remaining_qty=0,
+        source_mrp_requirement_id=req.id,
+    )
+    db_session.add_all([active_product, cancelled_product])
+    db_session.flush()
+    db_session.add(ProductionOrderLineState(product_id=active_product.product_id, status="partial"))
+    db_session.add(ProductionOrderLineState(product_id=cancelled_product.product_id, status="cancelled"))
+    db_session.commit()
+
+    row = get_period_plan_execution_journal(db_session, plan.id, run_id=run.run_id)["rows"][0]
+
+    assert row["gross_qty"] == 86
+    assert row["net_qty"] == 81
+    assert row["ordered_qty"] == 81
+    assert row["completed_qty"] == 0
+    assert row["remaining_qty"] == 81
+    assert row["coverage_pct"] == 0
+    assert len(row["work_items"]) == 1
+    assert row["work_items"][0]["product_id"] == active_product.product_id
+
+
 def test_execution_journal_counts_supplier_order_accepted_to_stock_as_completed(db_session):
     bucket = date(2026, 6, 2)
     item = _make_purchased_item(db_session, "BUY-DONE")

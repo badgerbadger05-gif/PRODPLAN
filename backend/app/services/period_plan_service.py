@@ -1496,11 +1496,12 @@ def get_period_plan_execution_journal(
     prod_ordered_by_req_id: Dict[int, float] = {}
     prod_done_by_req_id: Dict[int, float] = {}
     for pp, po, state in prod_rows:
+        if state and str(state.status or "").lower() in {"cancelled"}:
+            continue
         req_id = int(pp.source_mrp_requirement_id)
         qty_value = _to_float(pp.quantity)
         remaining_value = _to_float(pp.remaining_qty)
-        produced_value = _to_float(getattr(pp, "produced_qty", 0.0))
-        done_value = produced_value if produced_value > 1e-9 else max(0.0, qty_value - remaining_value)
+        done_value = min(qty_value, max(0.0, _to_float(getattr(pp, "produced_qty", 0.0))))
         prod_ordered_by_req_id[req_id] = prod_ordered_by_req_id.get(req_id, 0.0) + qty_value
         prod_done_by_req_id[req_id] = prod_done_by_req_id.get(req_id, 0.0) + done_value
         req_due = req_by_id.get(req_id).period_to if req_by_id.get(req_id) else None
