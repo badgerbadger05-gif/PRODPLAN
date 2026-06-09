@@ -613,6 +613,7 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int], *, auto_pr
         order_number = html.escape(str(product.order.order_number or ""))
         one_c_number = html.escape(route_ctx.get("one_c_number") or "—")
         title = f"МАРШРУТНЫЙ ЛИСТ № {order_number} от {now}"
+        warehouse_warning_html = ' <strong class="warehouse-warning">проверь склады</strong>'
         transfer_rows = "".join(
             "<tr>"
             f"<td colspan='2' class='text strong-value'>{html.escape(row['workshop_name'] or '—')}</td>"
@@ -625,7 +626,7 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int], *, auto_pr
         component_rows = "".join(
             "<tr>"
             f"<td colspan='2' class='text'>{html.escape(c['item_name'])}"
-            f"{' <strong class=\"warehouse-warning\">проверь склады</strong>' if c.get('multi_stock_warning') else ''}</td>"
+            f"{warehouse_warning_html if c.get('multi_stock_warning') else ''}</td>"
             f"<td class='text strong-value'>{html.escape(c['item_article'])}</td>"
             f"<td class='num'>{c['qty_per_unit']:.3f}</td>"
             f"<td colspan='6' class='num'>{c['required_qty']:.3f}</td>"
