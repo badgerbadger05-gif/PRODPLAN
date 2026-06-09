@@ -348,3 +348,56 @@ def test_sync_stock_refreshes_breakdown_replacing_old_rows(db_session, monkeypat
         .all()
     )
     assert [(r.warehouse_ref1c, float(r.qty)) for r in rows_after] == [("WH-MAIN", 8.0)]
+
+
+def test_sync_stock_removes_breakdown_for_items_missing_from_balance(db_session, monkeypatch):
+    """
+    1C Balance returns non-zero rows only. If an item disappears from the
+    current Balance response, both aggregated stock and per-warehouse breakdown
+    must become zero; otherwise MRP sees stale warehouse availability.
+    """
+    db = db_session
+
+    item = Item(
+        item_code="WH-MISSING",
+        item_name="Missing from Balance",
+        item_article="WH-MISSING",
+        stock_qty=5.0,
+        status="active",
+    )
+    other = Item(
+        item_code="WH-PRESENT",
+        item_name="Present in Balance",
+        item_article="WH-PRESENT",
+        stock_qty=0.0,
+        status="active",
+    )
+    db.add_all([item, other])
+    db.flush()
+    db.add(
+        StockWarehouse(
+            warehouse_ref1c="WH-MAIN",
+            warehouse_code="01",
+            warehouse_name="Main",
+            is_selected=True,
+        )
+    )
+    db.add(ItemWarehouseStock(item_id=item.item_id, warehouse_ref1c="WH-MAIN", qty=5.0))
+    db.commit()
+
+    def _fake_stock(**kwargs):
+        return [
+            {"code": "WH-PRESENT", "qty": 2.0, "ref": "", "warehouse_ref": "WH-MAIN", "warehouse_code": "01", "warehouse_name": "Main"},
+        ]
+
+    monkeypatch.setattr(stock_sync, "get_stock_from_1c_odata", _fake_stock)
+
+    stock_sync.sync_stock_from_odata(db, _mk_req())
+
+    db.refresh(item)
+    db.refresh(other)
+    assert float(item.stock_qty) == 0.0
+    assert float(other.stock_qty) == 2.0
+    assert db.query(ItemWarehouseStock).filter(ItemWarehouseStock.item_id == item.item_id).count() == 0
+    rows_other = db.query(ItemWarehouseStock).filter(ItemWarehouseStock.item_id == other.item_id).all()
+    assert [(row.warehouse_ref1c, float(row.qty)) for row in rows_other] == [("WH-MAIN", 2.0)]

@@ -244,10 +244,10 @@ def _upsert_item_warehouse_stock(
     Refresh item_warehouse_stock from per-(item, warehouse) lines returned by
     1C OData.
 
-    For every item that appears in `stock_rows` we DELETE existing rows for
-    that item from item_warehouse_stock and re-insert the current snapshot.
-    Items absent from `stock_rows` are left alone — the caller is responsible
-    for the global zero-out policy (which it already does on Item.stock_qty).
+    `stock_rows` is a full non-zero Balance snapshot after the selected
+    warehouse filter. Replace the whole breakdown table so items that disappear
+    from 1C also disappear from item_warehouse_stock. Keeping old rows here
+    would make MRP see stale warehouse stock even after Item.stock_qty is zeroed.
 
     Returns (rows_upserted, items_touched).
     """
@@ -284,17 +284,12 @@ def _upsert_item_warehouse_stock(
         bucket = new_map.setdefault(int(item_id), {})
         bucket[w_ref] = bucket.get(w_ref, 0.0) + qty_val
 
-    if not new_map:
-        return (0, 0)
-
     touched_item_ids = list(new_map.keys())
-    # Delete-then-insert for the touched item_ids gives us a clean snapshot.
+    # Delete-then-insert for the full breakdown gives us a clean snapshot.
     # synchronize_session="fetch" so SQLAlchemy expires the in-session ORM
     # objects we just removed and a fresh insert below doesn't collide on
     # identity-map keys.
-    db.query(ItemWarehouseStock).filter(
-        ItemWarehouseStock.item_id.in_(touched_item_ids)
-    ).delete(synchronize_session="fetch")
+    db.query(ItemWarehouseStock).delete(synchronize_session="fetch")
 
     rows_upserted = 0
     for item_id, by_wh in new_map.items():
