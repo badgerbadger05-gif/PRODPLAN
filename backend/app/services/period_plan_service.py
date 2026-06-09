@@ -1473,6 +1473,10 @@ def get_period_plan_execution_journal(
                 "partially_covered": 0,
                 "not_covered": 0,
                 "net_zero": 0,
+                "execution_completed_qty": 0.0,
+                "execution_base_qty": 0.0,
+                "execution_pct": 100.0,
+                "execution_by_flow": {},
             },
         }
 
@@ -1656,7 +1660,12 @@ def get_period_plan_execution_journal(
         "partially_covered": 0,
         "not_covered": 0,
         "net_zero": 0,
+        "execution_completed_qty": 0.0,
+        "execution_base_qty": 0.0,
+        "execution_pct": 100.0,
+        "execution_by_flow": {},
     }
+    execution_by_flow: Dict[str, Dict[str, float]] = {}
 
     for req, item in reqs_with_items:
         item_flow = classify_replenishment_flow(getattr(item, "replenishment_method", None))
@@ -1730,6 +1739,14 @@ def get_period_plan_execution_journal(
         })
 
         summary["total_items"] += 1
+        summary["execution_completed_qty"] += completed_qty
+        summary["execution_base_qty"] += progress_base_qty
+        flow_summary = execution_by_flow.setdefault(
+            item_flow,
+            {"completed_qty": 0.0, "base_qty": 0.0, "execution_pct": 100.0},
+        )
+        flow_summary["completed_qty"] += completed_qty
+        flow_summary["base_qty"] += progress_base_qty
         if net_qty < 1e-9:
             summary["net_zero"] += 1
         elif remaining_qty < 1e-9:
@@ -1738,6 +1755,21 @@ def get_period_plan_execution_journal(
             summary["partially_covered"] += 1
         else:
             summary["not_covered"] += 1
+
+    execution_base_qty = _to_float(summary["execution_base_qty"])
+    summary["execution_pct"] = (
+        round(_to_float(summary["execution_completed_qty"]) / execution_base_qty * 100.0, 1)
+        if execution_base_qty > 1e-9
+        else 100.0
+    )
+    for flow_summary in execution_by_flow.values():
+        base_qty = _to_float(flow_summary["base_qty"])
+        flow_summary["execution_pct"] = (
+            round(_to_float(flow_summary["completed_qty"]) / base_qty * 100.0, 1)
+            if base_qty > 1e-9
+            else 100.0
+        )
+    summary["execution_by_flow"] = execution_by_flow
 
     return {
         "plan": _serialize_plan(plan),

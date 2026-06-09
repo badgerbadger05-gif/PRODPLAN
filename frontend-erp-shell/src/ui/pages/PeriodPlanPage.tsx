@@ -454,12 +454,12 @@ const periodPlanJournalColumns = [
   { key: 'flow', title: 'Тип', width: 136, minWidth: 136, grow: false, sortable: true },
   { key: 'bom_level', title: 'Ур.', width: 68, minWidth: 68, grow: false, align: 'center', sortable: true },
   { key: 'gross_qty', title: 'Потребность', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true },
-  { key: 'net_qty', title: 'К запуску', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true },
-  { key: 'ordered_qty', title: 'В заказах', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true },
-  { key: 'unassigned_qty', title: 'К заказу', width: 104, minWidth: 104, grow: false, align: 'right', className: 'numCell', sortable: true },
+  { key: 'net_qty', title: 'Чистая потребность', width: 128, minWidth: 128, grow: false, align: 'right', className: 'numCell', sortable: true },
+  { key: 'ordered_qty', title: 'Оформлено', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true },
+  { key: 'unassigned_qty', title: 'Не оформлено', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true },
   { key: 'completed_qty', title: 'Выполнено', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true },
-  { key: 'remaining_qty', title: 'Осталось', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true },
-  { key: 'coverage_pct', title: 'Прогресс', width: 96, minWidth: 96, grow: false, align: 'center', sortable: true },
+  { key: 'remaining_qty', title: 'Осталось выполнить', width: 128, minWidth: 128, grow: false, align: 'right', className: 'numCell', sortable: true },
+  { key: 'coverage_pct', title: 'Выполнение', width: 104, minWidth: 104, grow: false, align: 'center', sortable: true },
   { key: 'work_items', title: 'Заданий', width: 72, minWidth: 72, grow: false, align: 'center', sortable: false },
 ] as const satisfies TableColumnDoctype[]
 
@@ -966,6 +966,46 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     return Array.from(new Set(journal.rows.map((r) => r.bom_level))).sort((a, b) => a - b)
   }, [journal])
 
+  const journalExecutionPct = useMemo(() => {
+    if (!journal) return null
+    if (typeof journal.summary.execution_pct === 'number') return journal.summary.execution_pct
+    const base = journal.rows.reduce((sum, row) => sum + (row.progress_base_qty ?? row.net_qty ?? 0), 0)
+    if (base <= 1e-9) return 100
+    const completed = journal.rows.reduce((sum, row) => sum + (row.completed_qty ?? 0), 0)
+    return Math.round((completed / base) * 1000) / 10
+  }, [journal])
+
+  const journalExecutionByFlow = useMemo(() => {
+    if (!journal) return [] as Array<{ flow: string; label: string; pct: number; base: number }>
+    const source = journal.summary.execution_by_flow
+    if (source) {
+      return ['purchase', 'production', 'rework']
+        .map((flow) => ({
+          flow,
+          label: flowLabel(flow),
+          pct: source[flow]?.execution_pct ?? 100,
+          base: source[flow]?.base_qty ?? 0,
+        }))
+        .filter((row) => row.base > 1e-9)
+    }
+    const grouped = new Map<string, { completed: number; base: number }>()
+    journal.rows.forEach((row) => {
+      const base = row.progress_base_qty ?? row.net_qty ?? 0
+      const entry = grouped.get(row.flow) ?? { completed: 0, base: 0 }
+      entry.completed += row.completed_qty ?? 0
+      entry.base += base
+      grouped.set(row.flow, entry)
+    })
+    return ['purchase', 'production', 'rework']
+      .map((flow) => {
+        const entry = grouped.get(flow)
+        const base = entry?.base ?? 0
+        const pct = base > 1e-9 ? Math.round(((entry?.completed ?? 0) / base) * 1000) / 10 : 100
+        return { flow, label: flowLabel(flow), pct, base }
+      })
+      .filter((row) => row.base > 1e-9)
+  }, [journal])
+
   const rootOptions = useMemo<RootProductOption[]>(() => (
     (matrix?.rows ?? []).map((row) => ({
       item_id: row.item_id,
@@ -978,7 +1018,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   function downloadJournalCsv() {
     if (!journal) return
     const rows = filteredJournalRows
-    const headers = ['Артикул', 'Номенклатура', 'Поток', 'Уровень', 'Потребность', 'К запуску/заказу', 'В заказах', 'К заказу', 'Выполнено', 'Осталось', 'Прогресс %', 'Заданий']
+    const headers = ['Артикул', 'Номенклатура', 'Поток', 'Уровень', 'Потребность', 'Чистая потребность', 'Оформлено', 'Не оформлено', 'Выполнено', 'Осталось выполнить', 'Выполнение %', 'Заданий']
     const esc = (v: unknown) => {
       const s = String(v ?? '')
       return /[",;\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
@@ -1018,14 +1058,16 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     return `#/mrp-runs/${encodeURIComponent(String(runId))}?${search.toString()}`
   }
 
-  function workItemStartedQty(wi: ExecutionWorkItem) {
-    return wi.type === 'planned_order' || wi.type === 'planned_purchase' || wi.type === 'planned_rework'
+  function workItemAssignedQty(wi: ExecutionWorkItem) {
+    return wi.type === 'production_order' || wi.type === 'planned_rework' || (wi.type === 'planned_purchase' && wi.one_c_opened)
       ? wi.qty
       : null
   }
 
-  function workItemOrderedQty(wi: ExecutionWorkItem) {
-    return wi.type === 'production_order' || (wi.type === 'planned_purchase' && wi.one_c_opened) ? wi.qty : null
+  function workItemUnassignedQty(wi: ExecutionWorkItem) {
+    return wi.type === 'planned_order' || (wi.type === 'planned_purchase' && !wi.one_c_opened)
+      ? wi.qty
+      : null
   }
 
   // Column sums for matrix footer
@@ -1401,6 +1443,12 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
               {journal && (
                 <>
                   <div className="barSeparator" />
+                  {journalExecutionPct !== null && (
+                    <span className="toolbarText">Общее выполнение: {journalExecutionPct}%</span>
+                  )}
+                  {journalExecutionByFlow.map((row) => (
+                    <span key={row.flow} className="toolbarText">{row.label}: {row.pct}%</span>
+                  ))}
                   <span className="toolbarText">Закрыто: {journal.summary.fully_covered} / {journal.summary.total_items}</span>
                   {journal.summary.not_covered > 0 && (
                     <span style={{ color: 'var(--red)' }}>Не начато: {journal.summary.not_covered}</span>
@@ -1466,7 +1514,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                             <option value="">Все</option>
                             <option value="covered">Закрыто</option>
                             <option value="partial">Частично</option>
-                            <option value="ordered">В заказах</option>
+                            <option value="ordered">Оформлено</option>
                             <option value="none">Без заданий</option>
                           </select>
                         </label>
@@ -1534,8 +1582,8 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                         </tr>
                         {expandedReq === row.req_id && row.work_items.map((wi, i) => {
                           const href = workItemHref(wi as unknown as { type: string; product_id?: number; order_id?: number; purchase_id?: number; rework_id?: number; run_id?: number })
-                          const startedQty = workItemStartedQty(wi)
-                          const orderedQty = workItemOrderedQty(wi)
+                          const assignedQty = workItemAssignedQty(wi)
+                          const unassignedQty = workItemUnassignedQty(wi)
                           const label = wi.type === 'production_order'
                             ? `Заказ ${wi.order_number || '#' + wi.order_id}`
                             : wi.type === 'planned_order'
@@ -1573,9 +1621,9 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                               </td>
                               <td />
                               <td />
-                              <td className="numCell">{startedQty !== null ? <strong>{qty(startedQty)}</strong> : '—'}</td>
-                              <td className="numCell">{orderedQty !== null ? <strong>{qty(orderedQty)}</strong> : '—'}</td>
                               <td />
+                              <td className="numCell">{assignedQty !== null ? <strong>{qty(assignedQty)}</strong> : '—'}</td>
+                              <td className="numCell">{unassignedQty !== null ? <strong>{qty(unassignedQty)}</strong> : '—'}</td>
                               <td className="numCell">{wi.completed_qty !== undefined && wi.completed_qty > 0 ? qty(wi.completed_qty) : '—'}</td>
                               <td className="numCell">{wi.remaining_qty !== undefined ? qty(wi.remaining_qty) : '—'}</td>
                               <td style={{ textAlign: 'center' }}>

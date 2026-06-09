@@ -8,7 +8,9 @@ from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
     DefaultSpecification,
+    IgnoredWarehouse,
     Item,
+    ItemWarehouseStock,
     MrpRequirement,
     Operation,
     PlanningRun,
@@ -204,6 +206,43 @@ def _unit_display_by_raw(db: Session, raw_units: Sequence[Any]) -> Dict[str, str
     for raw in raw_by_key:
         result[raw] = units_by_ref.get(raw, "" if _looks_like_guid(raw) else raw)
     return result
+
+
+def _multi_stock_warehouse_item_ids(db: Session, item_ids: Sequence[int]) -> set[int]:
+    ids = sorted({int(item_id) for item_id in item_ids if item_id is not None})
+    if not ids:
+        return set()
+
+    ignored_refs = {
+        str(row.warehouse_ref1c or "").strip()
+        for row in db.query(IgnoredWarehouse.warehouse_ref1c).all()
+        if str(row.warehouse_ref1c or "").strip()
+    }
+    warehouse_settings = {
+        str(row.warehouse_ref1c or "").strip(): bool(row.is_selected)
+        for row in db.query(StockWarehouse.warehouse_ref1c, StockWarehouse.is_selected).all()
+        if str(row.warehouse_ref1c or "").strip()
+    }
+    selected_refs = {ref for ref, is_selected in warehouse_settings.items() if is_selected}
+
+    rows = (
+        db.query(ItemWarehouseStock.item_id, ItemWarehouseStock.warehouse_ref1c)
+        .filter(
+            ItemWarehouseStock.item_id.in_(ids),
+            ItemWarehouseStock.qty > 0,
+        )
+        .all()
+    )
+
+    refs_by_item_id: Dict[int, set[str]] = {}
+    for item_id, warehouse_ref in rows:
+        ref = str(warehouse_ref or "").strip()
+        if not ref or ref in ignored_refs:
+            continue
+        if warehouse_settings and ref not in selected_refs:
+            continue
+        refs_by_item_id.setdefault(int(item_id), set()).add(ref)
+    return {item_id for item_id, refs in refs_by_item_id.items() if len(refs) > 1}
 
 
 def _bom_descendant_ids_by_root(db: Session, root_item_ids: Sequence[int]) -> Dict[int, set[int]]:
@@ -509,6 +548,13 @@ def _route_sheet_print_data(
         )
 
     components_by_spec = _components_by_spec(db, [spec_id for spec_id in spec_id_by_product_id.values() if spec_id])
+    component_item_ids = {
+        int(item.item_id)
+        for rows in components_by_spec.values()
+        for _comp, item in rows
+        if item.item_id is not None
+    }
+    multi_stock_item_ids = _multi_stock_warehouse_item_ids(db, sorted(component_item_ids))
     components_by_product_id: Dict[int, List[Dict[str, Any]]] = {}
     for product in products:
         spec_id = spec_id_by_product_id.get(int(product.product_id))
@@ -527,6 +573,7 @@ def _route_sheet_print_data(
                     "qty_per_unit": _to_float(comp.quantity),
                     "required_qty": required,
                     "source_spec_id": spec_id,
+                    "multi_stock_warning": int(item.item_id) in multi_stock_item_ids,
                 }
             )
         components_by_product_id[int(product.product_id)] = component_rows
@@ -568,17 +615,18 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int], *, auto_pr
         title = f"МАРШРУТНЫЙ ЛИСТ № {order_number} от {now}"
         transfer_rows = "".join(
             "<tr>"
-            f"<td colspan='2' class='text'>{html.escape(row['workshop_name'] or '—')}</td>"
+            f"<td colspan='2' class='text strong-value'>{html.escape(row['workshop_name'] or '—')}</td>"
             f"<td colspan='2' class='text'>{html.escape(row['transfer_number'] or '—')}</td>"
-            f"<td colspan='3' class='text'>{html.escape(row['source_warehouse'] or '—')}</td>"
-            f"<td colspan='3' class='text'>{html.escape(row['destination_warehouse'] or '—')}</td>"
+            f"<td colspan='3' class='text strong-value'>{html.escape(row['source_warehouse'] or '—')}</td>"
+            f"<td colspan='3' class='text strong-value'>{html.escape(row['destination_warehouse'] or '—')}</td>"
             "</tr>"
             for row in transfer_rows_data
         ) or "<tr><td colspan='10'>Перемещения материалов не созданы</td></tr>"
         component_rows = "".join(
             "<tr>"
-            f"<td colspan='2' class='text'>{html.escape(c['item_name'])}</td>"
-            f"<td class='text'>{html.escape(c['item_article'])}</td>"
+            f"<td colspan='2' class='text'>{html.escape(c['item_name'])}"
+            f"{' <strong class=\"warehouse-warning\">проверь склады</strong>' if c.get('multi_stock_warning') else ''}</td>"
+            f"<td class='text strong-value'>{html.escape(c['item_article'])}</td>"
             f"<td class='num'>{c['qty_per_unit']:.3f}</td>"
             f"<td colspan='6' class='num'>{c['required_qty']:.3f}</td>"
             "</tr>"
@@ -587,7 +635,7 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int], *, auto_pr
         op_rows = "".join(
             "<tr>"
             f"<td class='num'>{op['number']}</td>"
-            f"<td class='text'>{html.escape(op['stage_name'])}</td>"
+            f"<td class='text strong-value'>{html.escape(op['stage_name'])}</td>"
             f"<td colspan='2' class='text'>{html.escape(op['operation_name'] or op['stage_name'] or 'Операция')}</td>"
             f"<td class='num'>{op['time_norm']:.3f}</td>"
             "<td class='signature'>ФИО, подпись, дата</td>"
@@ -618,13 +666,13 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int], *, auto_pr
                   <td colspan="5" class="title">{title}<br><span>(Изготовление новых)</span></td>
                   <td colspan="5" class="order">
                     <b>Заказ PRODPLAN:</b> №{order_number}<br>
-                    <b>Номер 1С:</b> {one_c_number}<br>
+                    <b>Номер 1С:</b> <strong class="strong-value">{one_c_number}</strong><br>
                     <b>Дата заказа:</b> {html.escape(order_date)}
                   </td>
                 </tr>
                 <tr>
                   <td colspan="5" class="product-name"><b>Наименование:</b><br>{html.escape(str(product.item.item_name or ""))}</td>
-                  <td class="product-article"><b>Артикул:</b><br>{html.escape(str(product.item.item_article or ""))}</td>
+                  <td class="product-article"><b>Артикул:</b><br><strong class="strong-value">{html.escape(str(product.item.item_article or ""))}</strong></td>
                   <td colspan="4"><b>Количество:</b><br>{_to_float(product.remaining_qty) or _to_float(product.quantity):g} {html.escape(product_unit)}</td>
                 </tr>
                 <tr>
@@ -679,6 +727,8 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int], *, auto_pr
     th {{ text-align: center; font-weight: bold; }}
     .num {{ text-align: center; white-space: nowrap; }}
     .text {{ text-align: left; }}
+    .strong-value, .warehouse-warning {{ font-weight: 700; }}
+    .warehouse-warning {{ margin-left: 6px; white-space: nowrap; }}
     .signature {{ height: 20px; color: #555; font-size: 8.5px; line-height: 1.05; text-align: center; vertical-align: bottom; }}
     .notes {{ height: 45px; }}
     @media print {{ .toolbar {{ display: none; }} .sheet {{ padding: 0; }} }}

@@ -257,6 +257,10 @@ export type ExecutionJournalSummary = {
   partially_covered: number
   not_covered: number
   net_zero: number
+  execution_completed_qty?: number
+  execution_base_qty?: number
+  execution_pct?: number
+  execution_by_flow?: Record<string, { completed_qty: number; base_qty: number; execution_pct: number }>
 }
 
 export type ExecutionJournalResponse = {

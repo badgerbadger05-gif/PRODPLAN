@@ -29,6 +29,8 @@ from app.models import (
     SupplierOrder,
     SupplierOrderItem,
     SyncLink,
+    ItemWarehouseStock,
+    IgnoredWarehouse,
 )
 from app.routers.production_control import list_employees
 from app.services.production_control_journal import (
@@ -42,6 +44,7 @@ from app.services.production_control_journal import (
 from app.services.production_control_material_availability import preview_materials, recalculate_production_coverage
 from app.services.production_control_material_issues import create_material_issues, delete_local_material_issue, list_material_issues
 from app.services.production_control_printing import render_route_sheets_html
+from app.services.one_c_production_order_export import PRODUCTION_ORDER_ENTITY
 
 
 def test_list_employees_returns_active_synced_employees(db_session):
@@ -155,6 +158,106 @@ def test_route_sheet_includes_material_transfer_route(db_session):
     assert "Несоотв." in html
     assert "Годн." in html
     assert "Клеймо, ФИО, подпись, дата" in html
+
+
+def test_route_sheet_highlights_warehouse_conflict_and_key_values(db_session):
+    product_item = Item(
+        item_code="P-HL",
+        item_name="Деталь подсветки",
+        item_article="ART-P-HL",
+        unit="шт",
+        status="active",
+    )
+    component = Item(
+        item_code="C-HL",
+        item_name="Материал на двух складах",
+        item_article="ART-C-HL",
+        unit="шт",
+        status="active",
+    )
+    workshop = ProductionResource(resource_name="Слесарный участок")
+    source_wh = StockWarehouse(warehouse_ref1c="src-hl", warehouse_code="SRC-HL", warehouse_name="Склад основной")
+    second_wh = StockWarehouse(warehouse_ref1c="src-hl-2", warehouse_code="SRC-HL-2", warehouse_name="Склад дубль")
+    ignored_wh = StockWarehouse(warehouse_ref1c="ignored-hl", warehouse_code="IGN-HL", warehouse_name="Склад участка")
+    dest_wh = StockWarehouse(warehouse_ref1c="dst-hl", warehouse_code="DST-HL", warehouse_name="Склад участка получатель")
+    spec = Specification(spec_name="Спецификация подсветки", spec_ref1c="spec-hl")
+    stage = ProductionStage(stage_name="Сборочный участок", stage_order=1)
+    operation = Operation(operation_ref1c="op-hl", operation_name="Собрать")
+    db_session.add_all([
+        product_item,
+        component,
+        workshop,
+        source_wh,
+        second_wh,
+        ignored_wh,
+        dest_wh,
+        spec,
+        stage,
+        operation,
+    ])
+    db_session.flush()
+    db_session.add(DefaultSpecification(item_id=product_item.item_id, spec_id=spec.spec_id))
+    db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=component.item_id, quantity=1))
+    db_session.add(SpecOperation(spec_id=spec.spec_id, stage_id=stage.stage_id, operation_id=operation.operation_id, time_norm=1))
+    db_session.add(IgnoredWarehouse(warehouse_ref1c="ignored-hl", warehouse_name="Склад участка"))
+    db_session.add_all([
+        ItemWarehouseStock(item_id=component.item_id, warehouse_ref1c="src-hl", qty=3),
+        ItemWarehouseStock(item_id=component.item_id, warehouse_ref1c="src-hl-2", qty=4),
+        ItemWarehouseStock(item_id=component.item_id, warehouse_ref1c="ignored-hl", qty=5),
+    ])
+
+    order = ProductionOrder(
+        order_number="MRP-HL",
+        order_date=datetime(2026, 6, 4),
+        deletion_mark=False,
+        source="mrp",
+    )
+    db_session.add(order)
+    db_session.flush()
+    db_session.add(
+        SyncLink(
+            source_system="PRODPLAN",
+            source_doctype="production_order",
+            source_id=order.order_id,
+            target_entity=PRODUCTION_ORDER_ENTITY,
+            target_number="1C-HL-777",
+            status="success",
+        )
+    )
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=product_item.item_id,
+        line_number=1,
+        quantity=2,
+        produced_qty=0,
+        remaining_qty=2,
+    )
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(ProductionOrderLineState(product_id=product.product_id, status="to_move", workshop_id=workshop.resource_id))
+    db_session.add(
+        ProductionMaterialIssue(
+            document_number="MT-HL-1",
+            product_id=product.product_id,
+            order_id=order.order_id,
+            status="requested",
+            direction="issue",
+            source_warehouse_ref1c="src-hl",
+            warehouse_ref1c="dst-hl",
+        )
+    )
+    db_session.commit()
+
+    html = render_route_sheets_html(db_session, [product.product_id])
+
+    assert '<strong class="warehouse-warning">проверь склады</strong>' in html
+    assert '<strong class="strong-value">1C-HL-777</strong>' in html
+    assert '<strong class="strong-value">ART-P-HL</strong>' in html
+    assert "text strong-value'>ART-C-HL</td>" in html
+    assert "text strong-value'>Слесарный участок</td>" in html
+    assert "text strong-value'>Склад основной</td>" in html
+    assert "text strong-value'>Склад участка получатель</td>" in html
+    assert "text strong-value'>Сборочный участок</td>" in html
 
 
 def test_route_sheet_printing_batches_multiple_products(db_session):
