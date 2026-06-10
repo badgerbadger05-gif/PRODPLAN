@@ -687,3 +687,92 @@ def test_reconcile_explodes_through_wip_covered_parent(db_session):
     # Second pass: the new welded/blank orders are open WIP → no further gap.
     res = reconcile_snapshot(db_session, run_id)
     assert res["production_added"] == []
+
+
+def test_reconcile_does_not_reinflate_components_covered_by_parent_wip_at_snapshot(db_session):
+    """Regression: a parent covered by an open order ALREADY AT SNAPSHOT TIME
+    must not inflate its components on reconcile.
+
+    At snapshot the parent's net is WIP-netted to 0, but its gross still
+    explodes to the child (the open order will consume components). The old
+    drift logic compared the parent's after-stock current net (32) against the
+    WIP-netted bucket net (0) and pushed the "drift" (+32) into the child's
+    gross on every cycle — the child demand doubled and a spurious catch-up
+    order was created.
+    """
+    painted = _make_production_item(db_session, "P-PAINT-PREWIP", stock=0.0)
+    welded = _make_production_item(db_session, "P-WELD-PREWIP", stock=0.0)
+    _link_bom(db_session, painted, welded, qty_per_unit=1.0)
+
+    # Open production order for the parent BEFORE the snapshot (mirrors an
+    # order already opened in 1C).
+    order = ProductionOrder(
+        order_number="ЗСНФ-PREWIP",
+        order_date=date(2026, 6, 1),
+        order_ref1c="ref-prewip",
+        is_posted=True,
+        deletion_mark=False,
+        source="1c",
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=painted.item_id,
+        line_number=1,
+        quantity=32,
+        produced_qty=0,
+        remaining_qty=32,
+        source_mrp_requirement_id=None,
+    )
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(ProductionOrderLineState(product_id=product.product_id, status="in_progress"))
+
+    plan = ProductionPlanHeader(
+        name="План июнь",
+        period_from=date(2026, 6, 1),
+        period_to=date(2026, 6, 30),
+        status="fixed",
+        created_by="test",
+    )
+    db_session.add(plan)
+    db_session.flush()
+    db_session.add(
+        ProductionPlanLine(
+            plan_id=plan.id, item_id=painted.item_id, bucket_date=date(2026, 6, 15), qty=32
+        )
+    )
+    db_session.commit()
+
+    snap = create_mrp_snapshot_from_period_plan(db_session, plan.id)
+    run_id = snap["run_id"]
+    reqs = {
+        int(r.item_id): r
+        for r in db_session.query(MrpRequirement).filter(MrpRequirement.run_id == run_id).all()
+    }
+    # Parent's net is WIP-netted to 0; the child's gross exploded through WIP.
+    assert float(reqs[painted.item_id].net_required_qty) == 0.0
+    assert float(reqs[welded.item_id].total_required_qty) == 32.0
+    assert float(reqs[welded.item_id].net_required_qty) == 32.0
+
+    # Materialise the child line → it becomes open WIP covering the child.
+    create_production_orders_from_mrp_requirements(db_session, [reqs[welded.item_id].id])
+    db_session.commit()
+
+    # Nothing drifted since the snapshot → reconcile must add nothing, twice.
+    for _ in range(2):
+        res = reconcile_snapshot(db_session, run_id)
+        assert res["production_added"] == []
+
+    db_session.refresh(reqs[welded.item_id])
+    assert float(reqs[welded.item_id].net_required_qty) == 32.0
+    assert float(reqs[welded.item_id].covered_qty) == 32.0
+    assert float(reqs[welded.item_id].remaining_qty) == 0.0
+    # The child's materialised order must survive the dedupe untouched.
+    child_product = (
+        db_session.query(ProductionProduct)
+        .filter(ProductionProduct.source_mrp_requirement_id == reqs[welded.item_id].id)
+        .one()
+    )
+    assert float(child_product.remaining_qty) == 32.0
