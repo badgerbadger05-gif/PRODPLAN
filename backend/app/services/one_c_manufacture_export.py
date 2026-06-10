@@ -293,7 +293,7 @@ def _inherit_structural_units_from_parent_order(client: OData1CClient, entries: 
                     break
         if reserve_ref and not entry.material_structural_unit_ref1c:
             entry.material_structural_unit_ref1c = reserve_ref
-        if product_ref and not entry.product_structural_unit_ref1c:
+        if product_ref:
             entry.product_structural_unit_ref1c = product_ref
 
 

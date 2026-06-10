@@ -17,6 +17,7 @@ from app.models import (
     SpecComponent,
     Specification,
     SyncLink,
+    WorkshopWarehouseBinding,
 )
 from app.routers.production_control import ExportPieceworkPayload
 from app.services import one_c_manufacture_export as exporter
@@ -392,6 +393,50 @@ def test_export_inherits_warehouses_from_parent_1c_order_when_local_binding_miss
         {"LineNumber": 1, "КлючСвязи": 1, "Этап_Key": "stage-ref"},
         {"LineNumber": 2, "КлючСвязи": 1, "Этап_Key": "completion-stage-ref"},
     ]
+
+
+def test_export_uses_parent_order_product_warehouse_over_local_binding(db_session, monkeypatch):
+    db = db_session
+    item = _mk_item(db, code="EXP-PARENT-WH", ref1c="item-ref-parent-wh")
+    component = _mk_item(db, code="EXP-PARENT-WH-C", ref1c="component-ref-parent-wh")
+    spec = Specification(spec_name="Spec parent warehouse", spec_ref1c="spec-ref-parent-wh")
+    db.add(spec)
+    db.flush()
+    db.add(DefaultSpecification(item_id=item.item_id, spec_id=spec.spec_id))
+    db.add(SpecComponent(spec_id=spec.spec_id, item_id=component.item_id, quantity=1))
+    product = _mk_product(db, item, qty=3)
+    state = db.query(ProductionOrderLineState).filter_by(product_id=product.product_id).one()
+    state.workshop_id = 77
+    db.add(
+        WorkshopWarehouseBinding(
+            workshop_id=77,
+            warehouse_ref1c="local-material-ref",
+            production_warehouse_ref1c="local-product-ref",
+        )
+    )
+    mid = produce_line(db, product.product_id, qty=3, executor="operator")["manufacture_id"]
+    db.commit()
+
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    fake = _FakeClient(
+        ref_key="parent-wh-manuf-ref",
+        parent_order_doc={
+            "СтруктурнаяЕдиницаРезерв_Key": "parent-reserve-ref",
+            "СтруктурнаяЕдиницаПродукции_Key": "parent-product-ref",
+            "Продукция": [],
+            "Запасы": [],
+        },
+    )
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False, allow_production=True)
+
+    assert result["manufactures_created"] == 1
+    payload = fake.posts[0][1]
+    assert payload["СтруктурнаяЕдиницаПродукции_Key"] == "parent-product-ref"
+    assert payload["Продукция"][0]["СтруктурнаяЕдиница_Key"] == "parent-product-ref"
+    assert payload["СтруктурнаяЕдиницаЗапасов_Key"] == "local-material-ref"
+    assert payload["Запасы"][0]["СтруктурнаяЕдиница_Key"] == "local-material-ref"
 
 
 def test_export_uses_completion_stage_even_without_local_spec_stages(db_session, monkeypatch):
