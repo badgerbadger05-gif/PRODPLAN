@@ -13,11 +13,13 @@ services:
     profiles: ["local-dev"]
     image: postgres:15
     restart: unless-stopped
+    command: ["postgres", "-c", "timezone=Europe/Moscow"]
     environment:
       POSTGRES_DB: prodplan
       POSTGRES_USER: prodplan
       POSTGRES_PASSWORD: password
       TZ: Europe/Moscow
+      PGTZ: Europe/Moscow
     volumes:
       - postgres_data:/var/lib/postgresql/data
     ports:
