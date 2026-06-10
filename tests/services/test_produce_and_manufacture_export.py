@@ -107,6 +107,7 @@ class _FakeClient:
         self.posts: list = []
         self.patches: list = []
         self.gets: list = []
+        self.operations: list = []
 
     def post(self, entity, payload, **_):
         self.posts.append((entity, payload))
@@ -123,6 +124,9 @@ class _FakeClient:
     def _make_request(self, endpoint, params=None, **_):
         self.gets.append((endpoint, params or {}))
         return dict(self.parent_order_doc)
+
+    def post_operation(self, operation_path):
+        self.operations.append(operation_path)
 
 
 class _PostFailsAfterCreateClient(_FakeClient):
@@ -606,7 +610,7 @@ def test_failed_posting_keeps_created_ref_on_manufacture(db_session, monkeypatch
     assert m.export_error is None
 
 
-def test_second_export_is_noop(db_session, monkeypatch):
+def test_second_export_repairs_existing_document(db_session, monkeypatch):
     db = db_session
     item = _mk_item(db, code="EXP-DUP", ref1c="item-ref-dup")
     product = _mk_product(db, item, qty=2)
@@ -620,9 +624,13 @@ def test_second_export_is_noop(db_session, monkeypatch):
     assert len(fake.posts) == 1
 
     result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False)
-    assert result["manufactures_created"] == 0
-    assert result["manufactures_already_linked"] == 1
+    assert result["manufactures_created"] == 1
+    assert result["manufactures_already_linked"] == 0
     assert len(fake.posts) == 1
+    assert len(fake.patches) == 1
+    assert fake.patches[0][0] == "Document_СборкаЗапасов(guid'reuse-ref')"
+    assert "Document_СборкаЗапасов(guid'reuse-ref')/Unpost" in fake.operations
+    assert "Document_СборкаЗапасов(guid'reuse-ref')/Post?PostingModeOperational=true" in fake.operations
 
 
 def test_chain_auto_exports_parent_order_in_dry_run(db_session):

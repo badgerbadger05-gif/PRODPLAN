@@ -20,6 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from uuid import UUID
 
 from sqlalchemy.orm import Session, joinedload
 
@@ -31,6 +32,7 @@ from ..models import (
     ProductionOrderLineState,
     ProductionProduct,
     SyncLink,
+    Unit,
 )
 from .one_c_export_common import (
     DEFAULT_ORGANIZATION_REF1C,
@@ -254,6 +256,38 @@ def _short_transfer_number(issue_id: int) -> str:
     return f"MT{int(issue_id) % 1_000_000_000:09d}"
 
 
+def _guid_or_empty(value: Optional[str]) -> str:
+    ref = _clean_ref1c(value)
+    if not ref:
+        return ""
+    try:
+        UUID(str(ref))
+    except Exception:
+        return ""
+    return ref
+
+
+def _resolve_unit_ref1c(db: Session, raw_unit: Optional[str]) -> Optional[str]:
+    unit = str(raw_unit or "").strip()
+    ref = _guid_or_empty(unit)
+    if ref:
+        return ref
+    if not unit:
+        return None
+    row = (
+        db.query(Unit)
+        .filter(
+            (Unit.unit_name == unit)
+            | (Unit.short_name == unit)
+            | (Unit.unit_full_name == unit)
+            | (Unit.unit_code == unit)
+        )
+        .order_by(Unit.unit_id.asc())
+        .first()
+    )
+    return _guid_or_empty(getattr(row, "unit_ref1c", None)) if row else None
+
+
 def _collect_export_entries(
     db: Session, issue_ids: List[int]
 ) -> Tuple[List[StockTransferExportEntry], List[Dict[str, Any]]]:
@@ -334,7 +368,9 @@ def _collect_export_entries(
                     item_article=str(ln.component_item.item_article or "")
                     if ln.component_item
                     else "",
-                    unit_ref1c=_clean_ref1c(ln.unit or ln.component_item.unit) if ln.component_item else None,
+                    unit_ref1c=_resolve_unit_ref1c(
+                        db, (ln.unit or ln.component_item.unit) if ln.component_item else None
+                    ),
                     qty=float(ln.required_qty or 0.0),
                 )
             )

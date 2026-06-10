@@ -201,6 +201,10 @@ def post_export_entries(
             db.flush()
 
             if existing_ref_key:
+                if getattr(entry, "unpost_before_patch", False):
+                    post_operation = getattr(client, "post_operation", None)
+                    if post_operation is not None:
+                        post_operation(f"{target_entity}(guid'{existing_ref_key}')/Unpost")
                 patch = getattr(client, "patch", None)
                 if patch is None:
                     raise RuntimeError("1C document already exists, but OData client cannot patch it")

@@ -86,6 +86,7 @@ class ManufactureExportEntry:
     executor: Optional[str] = None
     number: str = ""
     target_ref_key: Optional[str] = None
+    unpost_before_patch: bool = False
     status: str = "planned"
     error: Optional[str] = None
     reason: Optional[str] = None
@@ -555,14 +556,9 @@ def export_manufactures_to_1c(
     already_linked: List[ManufactureExportEntry] = []
     for entry in entries:
         link = _existing_link(db, entry.manufacture_id)
-        if link and link.status == "success" and (link.target_ref_key or ""):
-            entry.status = "existing"
-            entry.target_ref_key = str(link.target_ref_key)
-            entry.reason = "уже выгружен в 1С (sync_link)"
-            already_linked.append(entry)
-            continue
         if link and _clean_ref1c(link.target_ref_key):
             entry.target_ref_key = _clean_ref1c(link.target_ref_key)
+            entry.unpost_before_patch = True
             entry.reason = "повторная отправка: 1С-документ уже был создан, обновляем реквизиты и проводим"
         m_row = (
             db.query(ProductionManufacture)
@@ -570,14 +566,9 @@ def export_manufactures_to_1c(
             .one()
         )
         manufacture_ref = _clean_ref1c(m_row.exported_ref1c)
-        if manufacture_ref and m_row.status == "exported":
-            entry.status = "existing"
-            entry.target_ref_key = manufacture_ref
-            entry.reason = "exported_ref1c уже стоит"
-            already_linked.append(entry)
-            continue
         if manufacture_ref:
             entry.target_ref_key = entry.target_ref_key or manufacture_ref
+            entry.unpost_before_patch = True
             entry.reason = "повторная отправка: 1С-документ уже был создан, обновляем реквизиты и проводим"
         eligible.append(entry)
 
