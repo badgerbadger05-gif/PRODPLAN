@@ -48,7 +48,7 @@ def _mk_issue(
     *,
     parent: Item,
     component: Item,
-    source_wh: str | None = None,
+    source_wh: str | None = "src-wh",
     dest_wh: str | None = None,
     status: str = "draft",
 ) -> ProductionMaterialIssue:
@@ -363,9 +363,8 @@ def test_chain_full_apply_exports_order_then_transfer(db_session, monkeypatch):
     assert transfer_posts[0][1]["ДокументОснование_Type"] == "StandardODATA.Document_ЗаказНаПроизводство"
 
 
-def test_payload_defaults_destination_when_unset(db_session, monkeypatch):
-    """If source/destination aren't known, still fill the ZSM destination
-    default so 1C can create a valid draft."""
+def test_export_skips_issue_when_source_warehouse_unset(db_session, monkeypatch):
+    """Transfers without a source warehouse must not become 1C documents."""
     db = db_session
     parent = _mk_item(db, code="TRP2", ref1c="parent-ref-2")
     comp = _mk_item(db, code="TRC2", ref1c="comp-ref-2")
@@ -373,9 +372,9 @@ def test_payload_defaults_destination_when_unset(db_session, monkeypatch):
 
     monkeypatch.setattr(exporter, "OData1CClient", lambda **_: pytest.fail("no network"))
     result = exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=True)
-    payload = result["payloads"][0]["payload"]
-    assert "СтруктурнаяЕдиница_Key" not in payload
-    assert payload["СтруктурнаяЕдиницаПолучатель_Key"]
+    assert result["payloads"] == []
+    assert result["issues_eligible"] == 0
+    assert result["skipped_rows"][0]["reason"] == "склад отправитель пуст — перемещение в 1С не сформировано"
 
 
 def test_demo_guard_refuses_non_demo_without_override(db_session, monkeypatch):

@@ -96,6 +96,7 @@ export function ProductionControlPage() {
   const [produceProductId, setProduceProductId] = useState<number | null>(null)
   const [warehousePickerOpen, setWarehousePickerOpen] = useState(false)
   const [warehousePickerCandidates, setWarehousePickerCandidates] = useState<WarehouseCandidate[]>([])
+  const [warehousePickerComponents, setWarehousePickerComponents] = useState<Array<{ item_name: string; item_article?: string | null; required_qty: number }>>([])
   const [warehousePickerProductIds, setWarehousePickerProductIds] = useState<number[]>([])
   const [warehousePickerSelected, setWarehousePickerSelected] = useState('')
   const [warehousePickerMode, setWarehousePickerMode] = useState<'issues' | 'export'>('issues')
@@ -296,7 +297,13 @@ export function ProductionControlPage() {
     const selectionRequired = result.selection_required ?? []
     if (!selectionRequired.length) return false
     const candidates = selectionRequired[0].warehouse_candidates
+    const components = selectionRequired.flatMap((item) => item.components ?? [])
     setWarehousePickerCandidates(candidates)
+    setWarehousePickerComponents(components.map((item) => ({
+      item_name: item.item_name,
+      item_article: item.item_article,
+      required_qty: item.required_qty,
+    })))
     setWarehousePickerProductIds(productIds?.length ? productIds : selectionRequired.map((item) => item.product_id))
     setWarehousePickerSelected(candidates[0]?.ref1c ?? '')
     setWarehousePickerMode(mode)
@@ -348,13 +355,14 @@ export function ProductionControlPage() {
       const result = await requestMaterialIssues(sourceWarehouseRef, ids)
       const selectionRequired = result.selection_required ?? []
       const errors = result.errors?.length ?? 0
+      const alreadyOnDestination = result.already_on_destination?.reduce((sum, row) => sum + (row.components?.length ?? 0), 0) ?? 0
 
       if (selectionRequired.length > 0) {
         showWarehousePicker(result, 'issues')
-        const msg = `Создано документов: ${result.created?.length ?? 0}${errors ? `, ошибок ${errors}` : ''}. Для ${selectionRequired.length} поз. нужно выбрать склад-источник.`
+        const msg = `Создано документов: ${result.created?.length ?? 0}${alreadyOnDestination ? `, уже на участке ${alreadyOnDestination}` : ''}${errors ? `, ошибок ${errors}` : ''}. Для ${selectionRequired.length} поз. нужно выбрать склад-источник.`
         setMessage(msg)
       } else {
-        setMessage(`Выдача материалов: создано документов ${result.created?.length ?? 0}${errors ? `, ошибок ${errors}` : ''}`)
+        setMessage(`Выдача материалов: создано документов ${result.created?.length ?? 0}${alreadyOnDestination ? `, уже на участке ${alreadyOnDestination}` : ''}${errors ? `, ошибок ${errors}` : ''}`)
       }
       await load(offsetRef.current)
     } catch (e) {
@@ -372,6 +380,7 @@ export function ProductionControlPage() {
     setWarehousePickerOpen(false)
     setWarehousePickerProductIds([])
     setWarehousePickerCandidates([])
+    setWarehousePickerComponents([])
     setWarehousePickerSelected('')
     if (mode === 'export') {
       await exportTo1C(sourceRef, productIds)
@@ -389,16 +398,17 @@ export function ProductionControlPage() {
     try {
       const issueResult = await requestMaterialIssues(sourceWarehouseRef, ids)
       const selectionRequired = issueResult.selection_required ?? []
+      const alreadyOnDestination = issueResult.already_on_destination?.reduce((sum, row) => sum + (row.components?.length ?? 0), 0) ?? 0
       if (selectionRequired.length > 0) {
         showWarehousePicker(issueResult, 'export', ids)
-        setMessage(`Для ${selectionRequired.length} поз. нужно выбрать склад-источник перед выгрузкой в 1С.`)
+        setMessage(`${alreadyOnDestination ? `Уже на участке: ${alreadyOnDestination}. ` : ''}Для ${selectionRequired.length} поз. нужно выбрать склад-источник перед выгрузкой в 1С.`)
         await load(offsetRef.current)
         return
       }
       const issueIds = issueIdsFromCreateResult(issueResult)
       if (!issueIds.length) {
         const errors = issueResult.errors?.length ?? 0
-        setMessage(`Запуск в 1С: заявок на перемещение не создано${errors ? `, ошибок ${errors}` : ''}`)
+        setMessage(`Запуск в 1С: заявок на перемещение не создано${alreadyOnDestination ? `, уже на участке ${alreadyOnDestination}` : ''}${errors ? `, ошибок ${errors}` : ''}`)
         await load(offsetRef.current)
         return
       }
@@ -957,6 +967,18 @@ export function ProductionControlPage() {
             <div className="dialogHeader">Выберите склад-источник материалов</div>
             <div className="dialogBody">
               <p>Найдено несколько складов с остатком ({warehousePickerProductIds.length} поз.). Выберите склад отправитель:</p>
+              {warehousePickerComponents.length > 0 && (
+                <div className="dialogField">
+                  <label>Детали</label>
+                  <div className="fieldHint">
+                    {warehousePickerComponents.map((component, index) => (
+                      <div key={`${component.item_name}-${component.item_article ?? ''}-${index}`}>
+                        {component.item_name}{component.item_article ? ` (${component.item_article})` : ''} · нужно {component.required_qty.toLocaleString('ru-RU')}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
               {warehousePickerCandidates.map((c) => (
                 <div key={c.ref1c} className="dialogField" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                   <input

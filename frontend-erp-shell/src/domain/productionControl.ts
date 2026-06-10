@@ -164,6 +164,21 @@ export type MaterialIssueCreateResponse = {
       warehouse_candidates: WarehouseCandidate[]
     }>
   }>
+  already_on_destination?: Array<{
+    product_id: number
+    order_number?: string
+    item_name?: string
+    warehouse_ref1c?: string | null
+    components?: Array<{
+      component_item_id: number
+      item_name: string
+      item_article?: string | null
+      required_qty: number
+      covered_qty: number
+      remaining_qty: number
+      warehouse_ref1c?: string | null
+    }>
+  }>
   errors: string[]
 }
 

@@ -377,6 +377,25 @@ def _collect_export_entries(
         if bad_line or not lines:
             continue
 
+        source_ref = _clean_ref1c(issue.source_warehouse_ref1c)
+        destination_ref = _clean_ref1c(issue.warehouse_ref1c)
+        if not source_ref:
+            skipped.append(
+                {
+                    "issue_id": int(issue.issue_id),
+                    "reason": "склад отправитель пуст — перемещение в 1С не сформировано",
+                }
+            )
+            continue
+        if destination_ref and source_ref == destination_ref:
+            skipped.append(
+                {
+                    "issue_id": int(issue.issue_id),
+                    "reason": "склад отправитель совпадает со складом получателем — перемещение не требуется",
+                }
+            )
+            continue
+
         entries.append(
             StockTransferExportEntry(
                 issue_id=int(issue.issue_id),
@@ -384,8 +403,8 @@ def _collect_export_entries(
                 product_id=int(issue.product_id),
                 order_id=int(issue.order_id),
                 order_ref1c=order_ref,
-                source_warehouse_ref1c=_clean_ref1c(issue.source_warehouse_ref1c) or None,
-                destination_warehouse_ref1c=_clean_ref1c(issue.warehouse_ref1c) or None,
+                source_warehouse_ref1c=source_ref or None,
+                destination_warehouse_ref1c=destination_ref or None,
                 lines=lines,
             )
         )
