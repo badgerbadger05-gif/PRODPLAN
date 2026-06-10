@@ -10,6 +10,9 @@ from ..schemas import ODataSyncRequest
 from ..models import Unit, Item
 from ..services.odata_client import OData1CClient
 
+UNIT_CLASSIFIER_ENTITY = "Catalog_КлассификаторЕдиницИзмерения"
+UNIT_ENTITY = "Catalog_ЕдиницыИзмерения"
+
 
 def _to_float(val: Any, default: float = 0.0) -> float:
     try:
@@ -38,6 +41,15 @@ def _s(val: Any) -> str:
     return str(val or "").strip()
 
 
+def _unit_short_name(row: Dict[str, Any], name: Optional[str]) -> Optional[str]:
+    short = _s(row.get("Сокращение") or row.get("КраткоеНаименование") or row.get("ShortName") or "")
+    if short:
+        return short
+    # Catalog_КлассификаторЕдиницИзмерения usually stores the short label in
+    # Description ("шт", "м", "кг") and the full label in НаименованиеПолное.
+    return _s(name) or None
+
+
 @dataclass
 class UnitsSyncStats:
     """Статистика синхронизации единиц измерения"""
@@ -54,7 +66,7 @@ def sync_units_from_odata(db: Session, req: ODataSyncRequest) -> dict:
     """
     Синхронизация справочника единиц измерения из 1С через OData.
 
-    Предполагаемая сущность: Catalog_ЕдиницыИзмерения (или аналог в конфигурации).
+    Предполагаемая сущность: Catalog_КлассификаторЕдиницИзмерения (или аналог в конфигурации).
     Мэппинг полей гибкий: берём безопасные Ref_Key, Code, Description, а расширенные атрибуты пытаемся
     читать по частым названиям, если они присутствуют в конфигурации.
 
@@ -128,7 +140,7 @@ def sync_units_from_odata(db: Session, req: ODataSyncRequest) -> dict:
 
                     # Расширенные поля (опциональные и могут отсутствовать)
                     full_name = _s(r.get("НаименованиеПолное") or r.get("ПолноеНаименование") or r.get("FullName") or "")
-                    short_name = _s(r.get("Сокращение") or r.get("КраткоеНаименование") or r.get("ShortName") or "")
+                    short_name = _unit_short_name(r, name)
                     iso_code = _s(
                         r.get("МеждународноеСокращение")
                         or r.get("МеждународноеОбозначение")
@@ -263,8 +275,7 @@ from typing import List
 def backfill_units_from_items(db: Session, req: ODataSyncRequest, catalogs: Optional[List[str]] = None) -> dict:
     """
     Добирает записи единиц измерения по GUID из Item.unit, которых нет в таблице units.
-    Пробует найти их в одном или нескольких справочниках 1С (по умолчанию:
-    'Catalog_ЕдиницыИзмерения' и 'Catalog_КлассификаторЕдиницИзмерения').
+    Пробует найти их в одном или нескольких справочниках 1С.
     """
     client = OData1CClient(req.base_url, req.username, req.password, req.token)
 
@@ -280,14 +291,14 @@ def backfill_units_from_items(db: Session, req: ODataSyncRequest, catalogs: Opti
         "created": 0,
         "updated": 0,
         "missing_after": None,  # заполним позже
-        "catalogs": catalogs or ["Catalog_ЕдиницыИзмерения", "Catalog_КлассификаторЕдиницИзмерения"],
+        "catalogs": catalogs or [UNIT_CLASSIFIER_ENTITY, UNIT_ENTITY],
     }
 
     if not missing:
         result["missing_after"] = 0
         return result
 
-    catalogs_to_probe = catalogs or ["Catalog_ЕдиницыИзмерения", "Catalog_КлассификаторЕдиницИзмерения"]
+    catalogs_to_probe = catalogs or [UNIT_CLASSIFIER_ENTITY, UNIT_ENTITY]
 
     created = 0
     updated = 0
@@ -304,7 +315,7 @@ def backfill_units_from_items(db: Session, req: ODataSyncRequest, catalogs: Opti
         code = _s(row.get("Code")) or None
         name = _s(row.get("Description")) or None
         full_name = _s(row.get("НаименованиеПолное") or row.get("ПолноеНаименование") or row.get("FullName") or "")
-        short_name = _s(row.get("Сокращение") or row.get("КраткоеНаименование") or row.get("ShortName") or "")
+        short_name = _unit_short_name(row, name)
         iso_code = _s(
             row.get("МеждународноеСокращение")
             or row.get("МеждународноеОбозначение")
@@ -372,10 +383,10 @@ def backfill_units_from_items(db: Session, req: ODataSyncRequest, catalogs: Opti
             chunk = missing_list[i:i + CHUNK]
             ors = " or ".join([f"Ref_Key eq guid'{g}'" for g in chunk])
             try:
-                resp = client._make_request(cat, {
-                    "$select": "Ref_Key,Code,Description,НаименованиеПолное,ПолноеНаименование,Сокращение,КраткоеНаименование,ISOCode,МеждународноеСокращение,БазоваяЕдиница_Key,БазоваяЕдиницаИзмерения_Key,BaseUnit_Key,Кратность,Коэффициент,Точность",
-                    "$filter": f"({ors})"
-                })
+                # Do not use a broad $select here: 1C configurations differ
+                # and reject unknown fields. Fetching full rows for a small
+                # GUID chunk is safer and keeps missing units recoverable.
+                resp = client._make_request(cat, {"$filter": f"({ors})"})
                 rows = []
                 if isinstance(resp, dict) and "value" in resp and isinstance(resp["value"], list):
                     rows = resp["value"]

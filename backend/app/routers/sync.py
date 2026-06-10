@@ -16,7 +16,7 @@ from ..services.supplier_order_export import export_supplier_orders_xlsx
 from ..services.default_specification_sync import sync_default_specifications_from_odata, DefaultSpecificationSyncStats
 from ..services.production_stage_sync import sync_production_stages_from_odata, ProductionStageSyncStats
 
-from ..services.units_sync import sync_units_from_odata, backfill_units_from_items
+from ..services.units_sync import UNIT_CLASSIFIER_ENTITY, UNIT_ENTITY, sync_units_from_odata, backfill_units_from_items
 from ..services.operations_sync import sync_operations_from_odata, OperationsSyncStats
 from ..services.production_kind_sync import sync_production_kinds_from_odata, ProductionKindSyncStats
 from ..services.employee_sync import sync_employees_from_odata
@@ -133,8 +133,7 @@ def sync_nomenclature_odata(payload: ODataSyncRequest, db: Session = Depends(get
         # --- Шаг 1: Синхронизация единиц измерения ---
         # Создаём новый запрос для ЕИ, используя payload от номенклатуры, но меняя entity_name
         units_payload = payload.copy(deep=True)
-        # Имя сущности ЕИ по умолчанию. Можно сделать параметром в будущем.
-        units_payload.entity_name = "Catalog_ЕдиницыИзмерения"
+        units_payload.entity_name = UNIT_CLASSIFIER_ENTITY
         
         # Выполняем синхронизацию ЕИ. В случае ошибки, она пробросится и остановит процесс.
         units_stats = sync_units_from_odata(db, units_payload)
@@ -417,10 +416,13 @@ def sync_production_stages_odata(payload: ODataSyncRequest, db: Session = Depend
 def sync_units_odata(payload: ODataSyncRequest, db: Session = Depends(get_db)):
     """
     Синхронизация единиц измерения из 1С через OData.
-    Ожидаемая сущность: "Catalog_ЕдиницыИзмерения" (или аналог).
+    Ожидаемая сущность: "Catalog_КлассификаторЕдиницИзмерения" (или аналог).
     Дополнительно выполняется добивка недостающих ЕИ по GUID из items.unit.
     """
     try:
+        if payload.entity_name == UNIT_ENTITY:
+            payload = payload.copy(deep=True)
+            payload.entity_name = UNIT_CLASSIFIER_ENTITY
         stats = sync_units_from_odata(db, payload)
         # Пытаемся добрать недостающие GUID из items.unit из альтернативных каталогов
         try:

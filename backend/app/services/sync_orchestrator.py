@@ -31,7 +31,7 @@ from .odata_config import load_odata_config
 # Sync service callables (read-only).
 from .nomenclature_sync import sync_nomenclature_from_odata
 from .category_sync import sync_categories_from_odata
-from .units_sync import sync_units_from_odata, backfill_units_from_items
+from .units_sync import UNIT_CLASSIFIER_ENTITY, sync_units_from_odata, backfill_units_from_items
 from .specification_sync import sync_specifications_from_odata
 from .default_specification_sync import sync_default_specifications_from_odata
 from .production_stage_sync import sync_production_stages_from_odata
@@ -79,12 +79,12 @@ def _build_payload(config: Dict[str, Any], entity_name: str, **overrides: Any) -
 def _run_nomenclature(db: Session, config: Dict[str, Any]) -> Dict[str, Any]:
     # Composite, mirrors POST /v1/sync/nomenclature-odata: units → categories →
     # nomenclature → backfill missing units.
-    units = sync_units_from_odata(db, _build_payload(config, "Catalog_ЕдиницыИзмерения"))
+    units = sync_units_from_odata(db, _build_payload(config, UNIT_CLASSIFIER_ENTITY))
     cats = sync_categories_from_odata(
         db, _build_payload(config, "Catalog_КатегорииНоменклатуры", select_fields=_CATEGORY_SELECT)
     )
     nom = sync_nomenclature_from_odata(db, _build_payload(config, "Catalog_Номенклатура"))
-    backfill = backfill_units_from_items(db, _build_payload(config, "Catalog_ЕдиницыИзмерения"))
+    backfill = backfill_units_from_items(db, _build_payload(config, UNIT_CLASSIFIER_ENTITY))
     return {"nomenclature": nom, "units": units, "categories": cats, "units_backfill": backfill}
 
 

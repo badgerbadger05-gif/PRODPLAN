@@ -294,10 +294,18 @@ class OrderQuantityCalculator:
                             return True
                     except Exception:
                         pass
-                    short = str(getattr(u, "short_name", None) or "").strip().lower()
-                    if short in {"шт", "pcs", "pc"}:
+                    labels = {
+                        str(value or "").strip().lower()
+                        for value in (
+                            getattr(u, "short_name", None),
+                            getattr(u, "unit_name", None),
+                            getattr(u, "unit_code", None),
+                        )
+                        if str(value or "").strip()
+                    }
+                    if labels & {"шт", "pcs", "pc"}:
                         return True
-                    if short in {"кг", "kg", "м", "m", "мм", "cm", "л", "l"}:
+                    if labels & {"кг", "kg", "м", "m", "мм", "mm", "см", "cm", "л", "l"}:
                         return False
             return True
         except Exception:
