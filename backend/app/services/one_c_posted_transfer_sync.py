@@ -127,6 +127,15 @@ def _apply_posted(
         issue.status = "posted"
         changed = True
 
+    for line in issue.lines or []:
+        required = float(line.required_qty or 0.0)
+        if float(line.issued_qty or 0.0) != required:
+            line.issued_qty = required
+            changed = True
+        if str(line.line_status or "") != "issued":
+            line.line_status = "issued"
+            changed = True
+
     state = (
         db.query(ProductionOrderLineState)
         .filter(ProductionOrderLineState.product_id == issue.product_id)

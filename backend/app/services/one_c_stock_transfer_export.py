@@ -294,6 +294,17 @@ def _collect_export_entries(
             )
             continue
 
+        # Local-only reservation of components already lying on the workshop
+        # warehouse: nothing physically moves, 1C has no such document.
+        if str(issue.direction or "") == "in_place":
+            skipped.append(
+                {
+                    "issue_id": int(issue.issue_id),
+                    "reason": "direction='in_place': локальный резерв, в 1С не выгружается",
+                }
+            )
+            continue
+
         # Contract rule (.docs/one_c_export_from_prodplan.md): child documents
         # (here: Document_ПеремещениеЗапасов) must carry ДокументОснование
         # pointing at Document_ЗаказНаПроизводство. If the parent order has no

@@ -2659,9 +2659,10 @@ def test_create_material_issues_splits_components_by_source_warehouse(db_session
         StockWarehouse(warehouse_ref1c="WH-A", warehouse_code="A", warehouse_name="Склад А", is_selected=True),
         StockWarehouse(warehouse_ref1c="WH-B", warehouse_code="B", warehouse_name="Склад Б", is_selected=True),
     ])
+    # No stock on WH-DEST: components lying on the destination workshop are
+    # claimed in place (direction='in_place') instead of being transferred,
+    # which is covered by test_section_stock_reservations.py.
     db_session.add_all([
-        ItemWarehouseStock(item_id=comp_a.item_id, warehouse_ref1c="WH-DEST", qty=10),
-        ItemWarehouseStock(item_id=comp_b.item_id, warehouse_ref1c="WH-DEST", qty=10),
         ItemWarehouseStock(item_id=comp_a.item_id, warehouse_ref1c="WH-A", qty=5),
         ItemWarehouseStock(item_id=comp_b.item_id, warehouse_ref1c="WH-B", qty=5),
     ])
@@ -2722,10 +2723,11 @@ def test_create_material_issues_asks_when_component_has_multiple_source_warehous
         StockWarehouse(warehouse_ref1c="WH-B", warehouse_code="B", warehouse_name="Склад Б", is_selected=True),
         StockWarehouse(warehouse_ref1c="WH-DEST", warehouse_code="DEST", warehouse_name="Участок", is_selected=True),
     ])
+    # No stock on WH-DEST (it would be claimed in place); the ambiguity is
+    # between the two source warehouses only.
     db_session.add_all([
         ItemWarehouseStock(item_id=comp.item_id, warehouse_ref1c="WH-A", qty=5),
         ItemWarehouseStock(item_id=comp.item_id, warehouse_ref1c="WH-B", qty=7),
-        ItemWarehouseStock(item_id=comp.item_id, warehouse_ref1c="WH-DEST", qty=100),
     ])
     db_session.commit()
 

@@ -526,30 +526,36 @@ export function ProductionControlPage() {
         if (selectionRequired.length > 0) {
           throw new Error('Для дополнительного перемещения на разницу нужно выбрать склад-источник материалов.')
         }
-        const issueIds = [
-          ...(issueResult.created ?? []).map((row) => row.issue_id),
-          ...(issueResult.reused ?? []).map((row) => row.issue_id),
-        ].filter(Boolean)
-        if (!issueIds.length) {
+        // direction='in_place' — локальный резерв компонентов, уже лежащих на
+        // участке: в 1С не выгружается и не проводится.
+        const physicalRows = [
+          ...(issueResult.created ?? []),
+          ...(issueResult.reused ?? []),
+        ].filter((row) => row.issue_id && row.direction !== 'in_place')
+        const claimedInPlace = (issueResult.created ?? []).some((row) => row.direction === 'in_place')
+        const issueIds = physicalRows.map((row) => row.issue_id)
+        if (!issueIds.length && !claimedInPlace) {
           const detail = issueResult.errors?.join('; ')
           throw new Error(`Не удалось создать дополнительное перемещение на разницу ${overageQty}.${detail ? ` ${detail}` : ''}`)
         }
-        const transferResult = await api<Record<string, unknown>>('/v1/production-control/material-issues/export-to-1c', {
-          method: 'POST',
-          body: JSON.stringify({ issue_ids: issueIds, dry_run: false, allow_production: true }),
-        })
-        const transferErrors = Number(transferResult.issues_error ?? 0)
-        const transferCreated = Number(transferResult.issues_created ?? 0)
-        const transferExisting = Number(transferResult.issues_already_linked ?? 0)
-        if (transferErrors > 0 || transferCreated + transferExisting < 1 || transferResult.status === 'partial_error') {
-          const detail = firstExportProblem(transferResult, transferResult.parent_orders_export as Record<string, unknown> | undefined)
-          throw new Error(`Дополнительное перемещение на разницу не выгружено в 1С.${detail ? ` ${detail}` : ''}`)
-        }
-        for (const issueId of issueIds) {
-          await api(`/v1/production-control/material-issues/${issueId}/assembled`, {
+        if (issueIds.length) {
+          const transferResult = await api<Record<string, unknown>>('/v1/production-control/material-issues/export-to-1c', {
             method: 'POST',
-            body: JSON.stringify({ allow_production: true }),
+            body: JSON.stringify({ issue_ids: issueIds, dry_run: false, allow_production: true }),
           })
+          const transferErrors = Number(transferResult.issues_error ?? 0)
+          const transferCreated = Number(transferResult.issues_created ?? 0)
+          const transferExisting = Number(transferResult.issues_already_linked ?? 0)
+          if (transferErrors > 0 || transferCreated + transferExisting < 1 || transferResult.status === 'partial_error') {
+            const detail = firstExportProblem(transferResult, transferResult.parent_orders_export as Record<string, unknown> | undefined)
+            throw new Error(`Дополнительное перемещение на разницу не выгружено в 1С.${detail ? ` ${detail}` : ''}`)
+          }
+          for (const issueId of issueIds) {
+            await api(`/v1/production-control/material-issues/${issueId}/assembled`, {
+              method: 'POST',
+              body: JSON.stringify({ allow_production: true }),
+            })
+          }
         }
       }
 

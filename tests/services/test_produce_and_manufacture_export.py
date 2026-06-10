@@ -10,6 +10,7 @@ from app.models import (
     Item,
     ProductionManufacture,
     ProductionMaterialIssue,
+    ProductionMaterialIssueLine,
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
@@ -91,6 +92,27 @@ def _mk_product(db, item: Item, *, qty: float = 10.0) -> ProductionProduct:
     )
     db.commit()
     return product
+
+
+def _stock_kit_on_workshop(db, product: ProductionProduct, component: Item, qty: float) -> None:
+    """Add a delivered line to the product's posted issue so the produce
+    guard sees the kit reserved on the workshop."""
+    issue = (
+        db.query(ProductionMaterialIssue)
+        .filter_by(product_id=product.product_id)
+        .order_by(ProductionMaterialIssue.issue_id.desc())
+        .first()
+    )
+    db.add(
+        ProductionMaterialIssueLine(
+            issue_id=issue.issue_id,
+            component_item_id=component.item_id,
+            required_qty=qty,
+            issued_qty=qty,
+            line_status="issued",
+        )
+    )
+    db.commit()
 
 
 class _FakeClient:
@@ -355,6 +377,7 @@ def test_export_inherits_warehouses_from_parent_1c_order_when_local_binding_miss
     product.spec_id = None
     state = db.query(ProductionOrderLineState).filter_by(product_id=product.product_id).one()
     state.workshop_id = None
+    _stock_kit_on_workshop(db, product, component, 10)
     mid = produce_line(db, product.product_id, qty=5, executor="operator")["manufacture_id"]
     db.commit()
 
@@ -414,6 +437,7 @@ def test_export_uses_parent_order_product_warehouse_over_local_binding(db_sessio
             production_warehouse_ref1c="local-product-ref",
         )
     )
+    _stock_kit_on_workshop(db, product, component, 3)
     mid = produce_line(db, product.product_id, qty=3, executor="operator")["manufacture_id"]
     db.commit()
 
@@ -461,6 +485,7 @@ def test_export_uses_completion_stage_even_without_local_spec_stages(db_session,
     )
     product = _mk_product(db, item, qty=4)
     product.spec_id = None
+    _stock_kit_on_workshop(db, product, component, 4)
     mid = produce_line(db, product.product_id, qty=4, executor="operator")["manufacture_id"]
     db.commit()
 

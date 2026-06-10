@@ -1390,7 +1390,7 @@ def cancel_local_order(db: Session, product_id: int) -> Dict[str, Any]:
     issues = (
         db.query(ProductionMaterialIssue)
         .filter(ProductionMaterialIssue.product_id.in_(product_ids))
-        .filter(ProductionMaterialIssue.direction == "issue")
+        .filter(ProductionMaterialIssue.direction.in_(("issue", "in_place")))
         .all()
     )
     linked_issues = [issue for issue in issues if _material_issue_has_1c_link(db, issue)]

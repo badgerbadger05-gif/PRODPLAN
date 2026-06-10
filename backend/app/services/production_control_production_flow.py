@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
+    Item,
     ProductionManufacture,
     ProductionMaterialIssue,
     ProductionMaterialIssueLine,
@@ -18,6 +19,59 @@ from .one_c_document_numbers import material_issue_number
 
 
 # ---------------------------------------------------------------------------
+
+
+def _ensure_workshop_reservation_covers(
+    db: Session,
+    product: ProductionProduct,
+    qty: float,
+) -> None:
+    """
+    Block a production event that would write off more components than this
+    line holds on the workshop. 1C has no reservations, so this is the only
+    place that turns "СборкаЗапасов не проведётся при закрытии" into an
+    early, explainable error: the missing part must first arrive via a
+    transfer or be claimed in place.
+    """
+    from .production_control_domain import default_spec_id as _spec_for
+    from .production_control_reservations import load_reservation_state
+
+    spec_id = _spec_for(db, product)
+    if not spec_id:
+        return
+    spec_rows = (
+        db.query(SpecComponent)
+        .filter(SpecComponent.spec_id == int(spec_id))
+        .all()
+    )
+    if not spec_rows:
+        return
+    per_unit = {int(row.item_id): _to_float(row.quantity) for row in spec_rows}
+    state = load_reservation_state(db, item_ids=list(per_unit.keys()))
+    reservation = state.for_product(int(product.product_id))
+
+    shortfall_by_item: Dict[int, tuple] = {}
+    for cid, per in per_unit.items():
+        needed = per * qty
+        if needed <= 1e-9:
+            continue
+        held = reservation.at_workshop.get(cid, 0.0)
+        if held + 1e-6 < needed:
+            shortfall_by_item[cid] = (needed, held)
+    if shortfall_by_item:
+        names = {
+            int(item.item_id): str(item.item_name or item.item_code or item.item_id)
+            for item in db.query(Item).filter(Item.item_id.in_(shortfall_by_item.keys())).all()
+        }
+        shortfalls = [
+            f"{names.get(cid, cid)}: нужно {needed:g}, на участке {held:g}"
+            for cid, (needed, held) in sorted(shortfall_by_item.items())
+        ]
+        raise ValueError(
+            "Недостаточно компонентов, зарезервированных на участке под эту строку: "
+            + "; ".join(shortfalls[:10])
+            + ". Сначала проведите перемещение недостающего или скомплектуйте строку с участка."
+        )
 
 
 def produce_line(
@@ -73,7 +127,7 @@ def produce_line(
         db.query(ProductionMaterialIssue)
         .filter(
             ProductionMaterialIssue.product_id == int(product.product_id),
-            ProductionMaterialIssue.direction == "issue",
+            ProductionMaterialIssue.direction.in_(("issue", "in_place")),
             ProductionMaterialIssue.status.in_(("posted", "issued")),
         )
         .order_by(ProductionMaterialIssue.issue_id.desc())
@@ -83,6 +137,8 @@ def produce_line(
         raise ValueError(
             "Нельзя создать выпуск без проведённого перемещения материалов по этой строке"
         )
+
+    _ensure_workshop_reservation_covers(db, product, qty_f)
 
     manufacture = ProductionManufacture(
         product_id=int(product.product_id),
@@ -194,7 +250,7 @@ def _outgoing_issues_for_product(
         db.query(ProductionMaterialIssue)
         .options(joinedload(ProductionMaterialIssue.lines))
         .filter(ProductionMaterialIssue.product_id == int(product_id))
-        .filter(ProductionMaterialIssue.direction == "issue")
+        .filter(ProductionMaterialIssue.direction.in_(("issue", "in_place")))
         .filter(ProductionMaterialIssue.status.in_(("exported", "posted", "issued")))
         .all()
     )
@@ -309,33 +365,80 @@ def return_leftover_components(
         )
         qty_per_unit = {int(iid): _to_float(q) for iid, q in rows}
 
-    return_lines: List[Dict[str, Any]] = []
+    leftovers: Dict[int, Dict[str, Any]] = {}
     for cid, issued in issued_by_component.items():
         per_unit = qty_per_unit.get(cid, 0.0)
         consumed = produced_qty * per_unit
         leftover = issued - consumed
         if leftover <= 1e-9:
             continue
-        return_lines.append(
-            {
-                "component_item_id": cid,
-                "issued_qty": float(issued),
-                "consumed_qty": float(consumed),
-                "qty_per_unit": float(per_unit),
-                "leftover_qty": float(leftover),
-                "unit": unit_by_component.get(cid),
-                "source_spec_id": spec_by_component.get(cid),
-            }
-        )
+        leftovers[cid] = {
+            "component_item_id": cid,
+            "issued_qty": float(issued),
+            "consumed_qty": float(consumed),
+            "qty_per_unit": float(per_unit),
+            "leftover_qty": float(leftover),
+            "unit": unit_by_component.get(cid),
+            "source_spec_id": spec_by_component.get(cid),
+        }
+
+    # In-place claims release without a 1C document: those components never
+    # physically moved, dropping the local reservation puts them back into
+    # the free workshop pool. Only the remainder needs a physical return.
+    released_in_place: List[Dict[str, Any]] = []
+    for issue in sorted(outgoing, key=lambda i: i.issue_id, reverse=True):
+        if str(issue.direction or "") != "in_place":
+            continue
+        for line in sorted(issue.lines or [], key=lambda l: l.line_id, reverse=True):
+            cid = int(line.component_item_id)
+            entry = leftovers.get(cid)
+            if entry is None or entry["leftover_qty"] <= 1e-9:
+                continue
+            held = _to_float(line.issued_qty)
+            take = min(held, entry["leftover_qty"])
+            if take <= 1e-9:
+                continue
+            line.issued_qty = held - take
+            line.required_qty = max(0.0, _to_float(line.required_qty) - take)
+            entry["leftover_qty"] = float(entry["leftover_qty"] - take)
+            released_in_place.append(
+                {"component_item_id": cid, "released_qty": float(take)}
+            )
+
+    return_lines: List[Dict[str, Any]] = [
+        entry for entry in leftovers.values() if entry["leftover_qty"] > 1e-9
+    ]
 
     if not return_lines:
+        if released_in_place:
+            db.commit()
+            return {
+                "status": "ok",
+                "reused": False,
+                "released_in_place": released_in_place,
+                "lines": [],
+            }
         return {
             "status": "skipped",
             "skipped_reason": "Нет компонентов с положительным остатком",
             "lines": [],
         }
 
-    latest_outgoing = max(outgoing, key=lambda i: i.issue_id)
+    physical_outgoing = [
+        issue for issue in outgoing if str(issue.direction or "") == "issue"
+    ]
+    if not physical_outgoing:
+        db.commit()
+        return {
+            "status": "skipped",
+            "skipped_reason": (
+                "Остаток числится только по комплектации с участка — "
+                "физический возврат не требуется"
+            ),
+            "released_in_place": released_in_place,
+            "lines": return_lines,
+        }
+    latest_outgoing = max(physical_outgoing, key=lambda i: i.issue_id)
     return_source = str(latest_outgoing.warehouse_ref1c or "") or None
     return_dest = str(latest_outgoing.source_warehouse_ref1c or "") or None
 
@@ -373,5 +476,6 @@ def return_leftover_components(
         "document_number": new_issue.document_number,
         "source_warehouse_ref1c": return_source,
         "destination_warehouse_ref1c": return_dest,
+        "released_in_place": released_in_place,
         "lines": return_lines,
     }

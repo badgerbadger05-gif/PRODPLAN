@@ -52,7 +52,10 @@ def material_issue_suffix(db: Session, issue: ProductionMaterialIssue) -> str:
 
 
 def material_issue_number(db: Session, issue: ProductionMaterialIssue) -> str:
-    prefix = "RT" if str(issue.direction or "issue") == "return" else "MT"
+    direction = str(issue.direction or "issue")
+    # 'in_place' is a local-only reservation document (components claimed
+    # where they already lie); it never reaches 1C but needs its own series.
+    prefix = {"return": "RT", "in_place": "RS"}.get(direction, "MT")
     # 1C's Document_ПеремещениеЗапасов.Number is limited to 11 characters in
     # the target base. Order-chain suffixes like MT001204813A get truncated by
     # 1C to MT001204813, making A/B documents collide. Keep the whole number

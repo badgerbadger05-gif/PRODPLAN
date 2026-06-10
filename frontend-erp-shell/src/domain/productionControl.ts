@@ -140,6 +140,7 @@ export type MaterialIssueCreateResponse = {
     item_name?: string
     lines_count?: number
     source_warehouse_ref1c?: string | null
+    direction?: string
     warehouse_candidates?: WarehouseCandidate[]
   }>
   reused?: Array<{
@@ -150,6 +151,7 @@ export type MaterialIssueCreateResponse = {
     item_name?: string
     status?: string
     source_warehouse_ref1c?: string | null
+    direction?: string
   }>
   selection_required?: Array<{
     product_id: number

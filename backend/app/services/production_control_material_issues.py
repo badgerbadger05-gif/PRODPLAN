@@ -37,6 +37,11 @@ from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
 from .one_c_stock_transfer_export import STOCK_TRANSFER_ENTITY
 from .one_c_document_numbers import material_issue_number
+from .production_control_reservations import (
+    ReservationState,
+    TRANSIT_STATUSES,
+    load_reservation_state,
+)
 
 PRODUCTION_ORDER_ENTITY = "Document_ЗаказНаПроизводство"
 
@@ -274,6 +279,7 @@ def _issue_reuse_payload(
         "item_name": str(product.item.item_name or ""),
         "status": str(issue.status),
         "source_warehouse_ref1c": str(issue.source_warehouse_ref1c or ""),
+        "direction": str(issue.direction or "issue"),
     }
 
 
@@ -382,59 +388,6 @@ def delete_local_material_issue(db: Session, issue_id: int) -> Dict[str, Any]:
     return {"status": "ok", "issue_id": int(issue_id), "deleted": True}
 
 
-def _sync_existing_issue_lines(
-    db: Session,
-    issue: ProductionMaterialIssue,
-    components: List[Dict[str, Any]],
-    *,
-    spec_id: Optional[int],
-    replace_missing: bool = False,
-) -> None:
-    """
-    Keep a non-posted local transfer aligned with the current order quantity.
-
-    Re-clicking "Запустить в 1С" should update the existing 1C document, not
-    create a duplicate local transfer. That only works if the local transfer
-    lines also reflect the edited order quantity.
-    """
-    by_component = {int(comp["component_item_id"]): comp for comp in components}
-    existing_by_component = {
-        int(line.component_item_id): line
-        for line in (issue.lines or [])
-    }
-
-    for component_id, line in list(existing_by_component.items()):
-        comp = by_component.get(component_id)
-        if comp is None:
-            if replace_missing:
-                db.delete(line)
-            continue
-        line.required_qty = float(comp["required_qty"])
-        line.unit = comp.get("unit")
-        line.source_spec_id = spec_id
-        if str(line.line_status or "") == "planned":
-            line.issued_qty = 0.0
-
-    if not replace_missing:
-        return
-
-    for comp in components:
-        component_id = int(comp["component_item_id"])
-        if component_id in existing_by_component:
-            continue
-        db.add(
-            ProductionMaterialIssueLine(
-                issue_id=int(issue.issue_id),
-                component_item_id=component_id,
-                required_qty=float(comp["required_qty"]),
-                issued_qty=0.0,
-                unit=comp.get("unit"),
-                source_spec_id=spec_id,
-                line_status="planned",
-            )
-        )
-
-
 def _workshop_id_for_product(
     db: Session,
     product: ProductionProduct,
@@ -491,6 +444,193 @@ def _destination_warehouse_for_product(
     return _clean_ref1c(binding.warehouse_ref1c) if binding else None
 
 
+def _free_destination_stock(
+    db: Session,
+    component_item_ids: List[int],
+    destination_warehouse_ref1c: Optional[str],
+    reservation_state: ReservationState,
+) -> Dict[int, float]:
+    """
+    Free (unreserved by ANY order) component stock lying on the destination
+    workshop warehouse. Only counted when the warehouse participates in stock
+    accounting (selected, not ignored) — mirrors the coverage rules.
+    """
+    dest = _clean_ref1c(destination_warehouse_ref1c)
+    if not dest or not component_item_ids:
+        return {}
+    ignored = {
+        str(r[0]) for r in db.query(IgnoredWarehouse.warehouse_ref1c).all()
+    }
+    if dest in ignored:
+        return {}
+    selected_rows = db.query(StockWarehouse.warehouse_ref1c, StockWarehouse.is_selected).all()
+    if selected_rows:
+        selected = {str(ref) for ref, is_sel in selected_rows if ref and bool(is_sel)}
+        if dest not in selected:
+            return {}
+    rows = (
+        db.query(ItemWarehouseStock.item_id, func.sum(ItemWarehouseStock.qty))
+        .filter(
+            ItemWarehouseStock.item_id.in_(component_item_ids),
+            ItemWarehouseStock.warehouse_ref1c == dest,
+        )
+        .group_by(ItemWarehouseStock.item_id)
+        .all()
+    )
+    result: Dict[int, float] = {}
+    for item_id, qty in rows:
+        cid = int(item_id)
+        reserved = reservation_state.reserved_at_warehouse(dest, cid)
+        free = _to_float(qty) - reserved
+        if free > 1e-9:
+            result[cid] = free
+    return result
+
+
+def _claim_components_in_place(
+    db: Session,
+    product: ProductionProduct,
+    components: List[Dict[str, Any]],
+    *,
+    spec_id: Optional[int],
+    destination_warehouse_ref1c: Optional[str],
+    initiated_by: Optional[str],
+) -> Optional[ProductionMaterialIssue]:
+    """
+    Record that components already lying on the workshop warehouse are taken
+    by this order. Creates/extends a direction='in_place' issue: a local-only
+    reservation document, posted immediately, never exported to 1C (1C has no
+    reservation concept — the components physically stay where they are and
+    get written off the workshop by the closing СборкаЗапасов).
+    """
+    dest = _clean_ref1c(destination_warehouse_ref1c)
+    issue = (
+        db.query(ProductionMaterialIssue)
+        .options(joinedload(ProductionMaterialIssue.lines))
+        .filter(
+            ProductionMaterialIssue.product_id == int(product.product_id),
+            ProductionMaterialIssue.direction == "in_place",
+            ProductionMaterialIssue.status == "posted",
+        )
+        .order_by(ProductionMaterialIssue.issue_id.desc())
+        .first()
+    )
+    if issue is None:
+        issue = ProductionMaterialIssue(
+            document_number="",
+            product_id=int(product.product_id),
+            order_id=int(product.order_id),
+            status="posted",
+            direction="in_place",
+            warehouse_ref1c=dest,
+            source_warehouse_ref1c=dest,
+            initiated_by=initiated_by,
+        )
+        db.add(issue)
+        db.flush()
+        issue.document_number = material_issue_number(db, issue)
+    lines_by_component = {
+        int(line.component_item_id): line for line in (issue.lines or [])
+    }
+    for comp in components:
+        cid = int(comp["component_item_id"])
+        qty = _to_float(comp["claim_qty"])
+        if qty <= 1e-9:
+            continue
+        line = lines_by_component.get(cid)
+        if line is None:
+            db.add(
+                ProductionMaterialIssueLine(
+                    issue_id=int(issue.issue_id),
+                    component_item_id=cid,
+                    required_qty=qty,
+                    issued_qty=qty,
+                    unit=comp.get("unit"),
+                    source_spec_id=spec_id,
+                    line_status="issued",
+                )
+            )
+        else:
+            line.required_qty = _to_float(line.required_qty) + qty
+            line.issued_qty = _to_float(line.issued_qty) + qty
+    return issue
+
+
+def _add_delta_to_issue(
+    db: Session,
+    issue: ProductionMaterialIssue,
+    components: List[Dict[str, Any]],
+    *,
+    spec_id: Optional[int],
+) -> None:
+    """Grow a non-posted transfer by the outstanding delta (never shrinks)."""
+    lines_by_component = {
+        int(line.component_item_id): line for line in (issue.lines or [])
+    }
+    for comp in components:
+        cid = int(comp["component_item_id"])
+        delta = _to_float(comp["required_qty"])
+        if delta <= 1e-9:
+            continue
+        line = lines_by_component.get(cid)
+        if line is None:
+            db.add(
+                ProductionMaterialIssueLine(
+                    issue_id=int(issue.issue_id),
+                    component_item_id=cid,
+                    required_qty=delta,
+                    issued_qty=0.0,
+                    unit=comp.get("unit"),
+                    source_spec_id=spec_id,
+                    line_status="planned",
+                )
+            )
+        else:
+            line.required_qty = _to_float(line.required_qty) + delta
+
+
+def _shrink_transit_reservations(
+    db: Session,
+    issues: List[ProductionMaterialIssue],
+    excess_by_component: Dict[int, float],
+) -> None:
+    """
+    Release over-reservation after the order quantity went down. Non-posted
+    transfer lines shrink (newest documents first); in_place claims release
+    by decreasing both required and issued. Posted transfers stay — physical
+    leftovers go back via the return flow.
+    """
+    def _release_from(issue: ProductionMaterialIssue, *, in_place: bool) -> None:
+        for line in sorted(issue.lines or [], key=lambda l: l.line_id, reverse=True):
+            cid = int(line.component_item_id)
+            excess = excess_by_component.get(cid, 0.0)
+            if excess <= 1e-9:
+                continue
+            if in_place:
+                current = _to_float(line.issued_qty)
+                take = min(current, excess)
+                line.issued_qty = current - take
+                line.required_qty = max(0.0, _to_float(line.required_qty) - take)
+            else:
+                current = max(0.0, _to_float(line.required_qty) - _to_float(line.issued_qty))
+                take = min(current, excess)
+                line.required_qty = _to_float(line.required_qty) - take
+            excess_by_component[cid] = excess - take
+
+    ordered = sorted(issues, key=lambda i: i.issue_id, reverse=True)
+    for issue in ordered:
+        if str(issue.direction or "") == "issue" and str(issue.status or "") in (
+            "draft",
+            "requested",
+            "issued",
+            "exported",
+        ):
+            _release_from(issue, in_place=False)
+    for issue in ordered:
+        if str(issue.direction or "") == "in_place" and str(issue.status or "") == "posted":
+            _release_from(issue, in_place=True)
+
+
 def create_material_issues(
     db: Session,
     product_ids: Sequence[int],
@@ -500,13 +640,22 @@ def create_material_issues(
     source_warehouse_ref1c: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Idempotent per the plan: a repeated click on "prepare issue" for the same
-    production line must not create a duplicate document.
+    Bring the order's component reservations up to its BOM requirement.
 
-    If an existing ProductionMaterialIssue already exists for the product,
-    return its descriptor in `reused` instead of creating a duplicate. Posted
-    transfers are final 1C documents, so re-clicking the action must be a
-    no-op unless a separate delta flow explicitly creates another document.
+    For every production line the outstanding need is computed as
+    ``required - already reserved for this line`` (kits in transit + kits on
+    the workshop). The outstanding part is covered in two steps:
+
+    1. Free stock already lying on the destination workshop warehouse is
+       claimed in place (direction='in_place', no 1C document) — the rule
+       "компоненты на участке списываются с участка".
+    2. Only the remainder becomes physical transfer requests, so storekeepers
+       are never asked to move a full kit that partially exists at the
+       destination already.
+
+    Idempotent: a repeated click with nothing outstanding returns the
+    existing documents in `reused`. After the order quantity shrinks, open
+    (non-posted) reservations are released down to the requirement.
     """
     created: List[Dict[str, Any]] = []
     reused: List[Dict[str, Any]] = []
@@ -529,7 +678,7 @@ def create_material_issues(
             .filter(
                 ProductionMaterialIssue.product_id == int(product.product_id),
                 ProductionMaterialIssue.status.in_(("draft", "requested", "issued", "exported", "posted", "error")),
-                ProductionMaterialIssue.direction == "issue",
+                ProductionMaterialIssue.direction.in_(("issue", "in_place")),
             )
             .order_by(ProductionMaterialIssue.issue_id.desc())
             .all()
@@ -547,57 +696,103 @@ def create_material_issues(
         if not resolved_warehouse:
             resolved_warehouse = _destination_warehouse_for_product(db, product, spec_id)
 
-        if existing_rows and not source_warehouse_ref1c:
+        comp_ids = [int(c["component_item_id"]) for c in components]
+        reservation_state = load_reservation_state(db, item_ids=comp_ids)
+        own = reservation_state.for_product(int(product.product_id))
+
+        outstanding: Dict[int, float] = {}
+        excess: Dict[int, float] = {}
+        for comp in components:
+            cid = int(comp["component_item_id"])
+            need = _to_float(comp["required_qty"]) - own.total(cid)
+            if need > 1e-9:
+                outstanding[cid] = need
+            elif need < -1e-9:
+                excess[cid] = -need
+
+        if excess:
+            _shrink_transit_reservations(db, existing_rows, excess)
+
+        if not outstanding:
             for existing in existing_rows:
                 if not existing.warehouse_ref1c:
                     existing.warehouse_ref1c = resolved_warehouse
-                if str(existing.status or "") != "posted":
-                    _sync_existing_issue_lines(
-                        db,
-                        existing,
-                        components,
-                        spec_id=spec_id,
-                        replace_missing=False,
-                    )
                 reused.append(_issue_reuse_payload(existing, product))
             continue
 
-        if existing_rows and source_warehouse_ref1c:
-            for existing in existing_rows:
-                if not existing.warehouse_ref1c:
-                    existing.warehouse_ref1c = resolved_warehouse
-                if str(existing.status or "") != "posted":
-                    _sync_existing_issue_lines(
-                        db,
-                        existing,
-                        components,
-                        spec_id=spec_id,
-                        replace_missing=False,
-                    )
-                reused.append(_issue_reuse_payload(existing, product))
-            continue
+        outstanding_components = [
+            {**comp, "required_qty": outstanding[int(comp["component_item_id"])]}
+            for comp in components
+            if int(comp["component_item_id"]) in outstanding
+        ]
 
-        groups, needed_selection = _allocate_components_by_source_warehouse(
+        # Step 1 (planned, applied after source selection succeeds): claim
+        # free stock already on the destination workshop.
+        free_dest = _free_destination_stock(
             db,
-            components,
-            destination_warehouse_ref1c=resolved_warehouse,
-            selected_source_warehouse_ref1c=source_warehouse_ref1c,
+            [int(c["component_item_id"]) for c in outstanding_components],
+            resolved_warehouse,
+            reservation_state,
         )
-        if needed_selection:
-            selection_required.append(
-                {
-                    "product_id": int(product.product_id),
-                    "order_number": str(product.order.order_number or ""),
-                    "item_name": str(product.item.item_name or ""),
-                    "components": needed_selection,
-                    "warehouse_candidates": needed_selection[0]["warehouse_candidates"],
-                }
+        claims: List[Dict[str, Any]] = []
+        transfer_components: List[Dict[str, Any]] = []
+        for comp in outstanding_components:
+            cid = int(comp["component_item_id"])
+            claim_qty = min(_to_float(comp["required_qty"]), free_dest.get(cid, 0.0))
+            remainder = _to_float(comp["required_qty"]) - claim_qty
+            if claim_qty > 1e-9:
+                claims.append({**comp, "claim_qty": claim_qty})
+            if remainder > 1e-9:
+                transfer_components.append({**comp, "required_qty": remainder})
+
+        groups: Dict[Optional[str], List[Dict[str, Any]]] = {}
+        if transfer_components:
+            groups, needed_selection = _allocate_components_by_source_warehouse(
+                db,
+                transfer_components,
+                destination_warehouse_ref1c=resolved_warehouse,
+                selected_source_warehouse_ref1c=source_warehouse_ref1c,
             )
-            continue
+            if needed_selection:
+                selection_required.append(
+                    {
+                        "product_id": int(product.product_id),
+                        "order_number": str(product.order.order_number or ""),
+                        "item_name": str(product.item.item_name or ""),
+                        "components": needed_selection,
+                        "warehouse_candidates": needed_selection[0]["warehouse_candidates"],
+                    }
+                )
+                continue
+
+        if claims:
+            claim_issue = _claim_components_in_place(
+                db,
+                product,
+                claims,
+                spec_id=spec_id,
+                destination_warehouse_ref1c=resolved_warehouse,
+                initiated_by=initiated_by,
+            )
+            if claim_issue is not None:
+                created.append(
+                    {
+                        "issue_id": int(claim_issue.issue_id),
+                        "document_number": claim_issue.document_number,
+                        "product_id": int(product.product_id),
+                        "order_number": str(product.order.order_number or ""),
+                        "item_name": str(product.item.item_name or ""),
+                        "lines_count": len(claims),
+                        "source_warehouse_ref1c": _clean_ref1c(resolved_warehouse),
+                        "direction": "in_place",
+                    }
+                )
 
         existing_by_source = {
             str(row.source_warehouse_ref1c or ""): row
             for row in existing_rows
+            if str(row.direction or "") == "issue"
+            and str(row.status or "") in ("draft", "requested")
         }
         for resolved_source_wh, grouped_components in groups.items():
             source_key = str(resolved_source_wh or "")
@@ -605,14 +800,7 @@ def create_material_issues(
             if existing is not None:
                 if not existing.warehouse_ref1c:
                     existing.warehouse_ref1c = resolved_warehouse
-                if str(existing.status or "") != "posted":
-                    _sync_existing_issue_lines(
-                        db,
-                        existing,
-                        grouped_components,
-                        spec_id=spec_id,
-                        replace_missing=True,
-                    )
+                _add_delta_to_issue(db, existing, grouped_components, spec_id=spec_id)
                 reused.append(_issue_reuse_payload(existing, product))
                 continue
 
@@ -651,8 +839,17 @@ def create_material_issues(
             }
             created.append(entry)
 
-        if groups:
-            state = _ensure_state(db, product)
+        db.flush()
+        has_open_transfers = any(
+            str(row.direction or "") == "issue" and str(row.status or "") in TRANSIT_STATUSES
+            for row in (
+                db.query(ProductionMaterialIssue)
+                .filter(ProductionMaterialIssue.product_id == int(product.product_id))
+                .all()
+            )
+        )
+        state = _ensure_state(db, product)
+        if has_open_transfers or groups:
             state.issue_status = "requested"
             # Once material-issue drafts are open, the line has moved beyond
             # the "no coverage yet" phase. Bump status to 'to_move'
@@ -660,6 +857,12 @@ def create_material_issues(
             # further along.
             if state.status in {"shortage", "partial", "ready"}:
                 state.status = "to_move"
+        elif claims and not transfer_components:
+            # Fully covered by components already on the workshop: nothing to
+            # move, the line is assembled right away.
+            state.issue_status = "posted"
+            if state.status in {"shortage", "partial", "ready", "to_move"}:
+                state.status = "assembled"
     db.commit()
     return {
         "status": "ok",

@@ -12,8 +12,6 @@ from ..models import (
     ItemWarehouseStock,
     PlannedOrder,
     PlannedPurchase,
-    ProductionMaterialIssue,
-    ProductionMaterialIssueLine,
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
@@ -146,31 +144,13 @@ def _stock_by_item(db: Session, item_ids: Sequence[int]) -> Dict[int, float]:
 
 def _open_issue_reservations_by_item(db: Session, item_ids: Sequence[int]) -> Dict[int, float]:
     """
-    Material already committed but not yet physically moved: sum of
-    (required_qty - issued_qty) across production_material_issue_lines whose
-    parent issue is in an active state ('draft', 'requested', 'issued',
-    'exported'). 'error' and 'cancelled' issues do not reserve.
+    Components held for production lines: kits in transit (draft..exported
+    transfers) plus kits already delivered to workshop warehouses (posted
+    transfers and in-place claims) that production has not consumed yet.
     """
-    ids = [int(x) for x in item_ids if x is not None]
-    if not ids:
-        return {}
-    rows = (
-        db.query(
-            ProductionMaterialIssueLine.component_item_id,
-            func.coalesce(
-                func.sum(
-                    ProductionMaterialIssueLine.required_qty - func.coalesce(ProductionMaterialIssueLine.issued_qty, 0)
-                ),
-                0,
-            ),
-        )
-        .join(ProductionMaterialIssue, ProductionMaterialIssue.issue_id == ProductionMaterialIssueLine.issue_id)
-        .filter(ProductionMaterialIssueLine.component_item_id.in_(ids))
-        .filter(ProductionMaterialIssue.status.in_(("draft", "requested", "issued", "exported")))
-        .group_by(ProductionMaterialIssueLine.component_item_id)
-        .all()
-    )
-    return {int(iid): max(0.0, _to_float(amount)) for iid, amount in rows}
+    from .production_control_reservations import open_reservations_by_item
+
+    return open_reservations_by_item(db, item_ids)
 
 
 def _supplier_eta_by_item(db: Session, item_ids: Sequence[int]) -> Dict[int, List[Dict[str, Any]]]:
@@ -426,7 +406,16 @@ def preview_materials(db: Session, product_id: int, *, refresh_state: bool = Fal
     # are not counted as available (plan rule).
     stock_by_item = _stock_by_item(db, comp_ids)
 
-    reservations = _open_issue_reservations_by_item(db, comp_ids)
+    from .production_control_reservations import load_reservation_state
+
+    reservation_state = load_reservation_state(db, item_ids=comp_ids)
+    # Components held by OTHER lines are unavailable; components this line
+    # already holds (in transit or delivered to its workshop) count as its own
+    # coverage instead of re-entering the pool.
+    reservations = reservation_state.total_by_item(
+        exclude_product_id=int(product.product_id)
+    )
+    own_reservation = reservation_state.for_product(int(product.product_id))
     run_id = _latest_run_id(db)
     supplier_eta = _supplier_eta_by_item(db, comp_ids)
     production_eta = _production_eta_by_item(db, comp_ids)
@@ -437,12 +426,17 @@ def preview_materials(db: Session, product_id: int, *, refresh_state: bool = Fal
         required = _to_float(comp["required_qty"])
         raw_stock = stock_by_item.get(iid, 0.0)
         reserved = reservations.get(iid, 0.0)
-        available = max(0.0, raw_stock - reserved)
-        missing = max(0.0, required - available)
-        label = _component_coverage_label(required, available)
+        own_reserved = own_reservation.total(iid)
+        available = max(0.0, raw_stock - reserved - own_reserved)
+        covering = available + own_reserved
+        missing = max(0.0, required - covering)
+        label = _component_coverage_label(required, covering)
         comp["available_qty"] = available
         comp["stock_qty"] = raw_stock
         comp["reserved_qty"] = reserved
+        comp["reserved_for_order_qty"] = own_reserved
+        comp["reserved_at_workshop_qty"] = own_reservation.at_workshop.get(iid, 0.0)
+        comp["reserved_in_transit_qty"] = own_reservation.in_transit.get(iid, 0.0)
         comp["missing_qty"] = missing
         comp["coverage"] = label
         comp["availability_status"] = _ui_coverage_status(label)
