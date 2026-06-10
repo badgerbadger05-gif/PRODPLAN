@@ -24,6 +24,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
@@ -33,6 +34,7 @@ from ..models import (
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
+    ProductionStage,
     ResourceStage,
     SpecComponent,
     SpecOperation,
@@ -79,6 +81,7 @@ class ManufactureExportEntry:
     material_structural_unit_ref1c: Optional[str] = None
     product_structural_unit_ref1c: Optional[str] = None
     stage_ref1c: Optional[str] = None
+    completed_stage_refs: List[str] = field(default_factory=list)
     materials: List[Dict[str, Any]] = field(default_factory=list)
     executor: Optional[str] = None
     number: str = ""
@@ -193,6 +196,50 @@ def _component_rows(db: Session, product: ProductionProduct, qty: float, spec_id
     return rows
 
 
+def _completion_stage_ref1c(db: Session) -> Optional[str]:
+    row = (
+        db.query(ProductionStage)
+        .filter(
+            or_(
+                ProductionStage.stage_name.ilike("%заверш%"),
+                ProductionStage.stage_name.like("%Заверш%"),
+            )
+        )
+        .order_by(ProductionStage.stage_order.asc().nullslast(), ProductionStage.stage_id.asc())
+        .first()
+    )
+    return _clean_ref1c(getattr(row, "stage_ref1c", None)) or None
+
+
+def _completed_stage_refs_for_spec(db: Session, spec_id: Optional[int]) -> List[str]:
+    refs: List[str] = []
+    if spec_id:
+        for (stage_ref,) in (
+            db.query(ProductionStage.stage_ref1c)
+            .join(SpecOperation, SpecOperation.stage_id == ProductionStage.stage_id)
+            .filter(SpecOperation.spec_id == int(spec_id), ProductionStage.stage_ref1c.isnot(None))
+            .order_by(SpecOperation.spec_operation_id.asc())
+            .all()
+        ):
+            ref = _clean_ref1c(stage_ref)
+            if ref and ref not in refs:
+                refs.append(ref)
+        for (stage_ref,) in (
+            db.query(ProductionStage.stage_ref1c)
+            .join(SpecComponent, SpecComponent.stage_id == ProductionStage.stage_id)
+            .filter(SpecComponent.spec_id == int(spec_id), ProductionStage.stage_ref1c.isnot(None))
+            .order_by(SpecComponent.component_id.asc())
+            .all()
+        ):
+            ref = _clean_ref1c(stage_ref)
+            if ref and ref not in refs:
+                refs.append(ref)
+    completion_ref = _completion_stage_ref1c(db)
+    if completion_ref and completion_ref not in refs:
+        refs.append(completion_ref)
+    return refs
+
+
 def _inherit_structural_units_from_parent_order(client: OData1CClient, entries: List[ManufactureExportEntry]) -> None:
     """
     Fill manufacture warehouses from the linked 1C production order when local
@@ -204,7 +251,6 @@ def _inherit_structural_units_from_parent_order(client: OData1CClient, entries: 
         str(entry.order_ref1c)
         for entry in entries
         if entry.order_ref1c
-        and (not entry.material_structural_unit_ref1c or not entry.product_structural_unit_ref1c)
     }
     if not need_refs:
         return
@@ -333,6 +379,7 @@ def _collect_export_entries(
                 spec_ref1c=_clean_ref1c(getattr(resolved_spec, "spec_ref1c", None)) or None,
                 executor=str(m.executor) if m.executor else None,
                 number=manufacture_number(db, m),
+                completed_stage_refs=_completed_stage_refs_for_spec(db, resolved_spec_id),
             )
         )
         entry = entries[-1]
@@ -345,11 +392,6 @@ def _collect_export_entries(
                     or _clean_ref1c(binding.warehouse_ref1c)
                     or None
                 )
-            stage_id = _main_stage_id_for_spec(db, entry.spec_id)
-            if stage_id:
-                from ..models import ProductionStage
-                stage = db.query(ProductionStage).filter(ProductionStage.stage_id == int(stage_id)).one_or_none()
-                entry.stage_ref1c = _clean_ref1c(getattr(stage, "stage_ref1c", None)) or None
             entry.materials = _component_rows(db, m.product, float(m.qty or 0), entry.spec_id)
 
     return entries, skipped
@@ -396,8 +438,6 @@ def _build_header_payload(entry: ManufactureExportEntry, config: Optional[Dict[s
         row["LineNumber"] = idx
         if material_structural_unit:
             row["СтруктурнаяЕдиница_Key"] = material_structural_unit
-        if entry.stage_ref1c:
-            row["Этап_Key"] = entry.stage_ref1c
         material_rows.append(row)
     payload: Dict[str, Any] = {
         "Number": entry.number,
@@ -408,6 +448,15 @@ def _build_header_payload(entry: ManufactureExportEntry, config: Optional[Dict[s
     }
     if material_rows:
         payload["Запасы"] = material_rows
+    if entry.completed_stage_refs:
+        payload["ВыполненныеЭтапы"] = [
+            {
+                "LineNumber": idx,
+                "КлючСвязи": 1,
+                "Этап_Key": stage_ref,
+            }
+            for idx, stage_ref in enumerate(entry.completed_stage_refs, start=1)
+        ]
     if organization_ref:
         payload["Организация_Key"] = organization_ref
     if default_structural_unit:
@@ -520,12 +569,16 @@ def export_manufactures_to_1c(
             .filter(ProductionManufacture.manufacture_id == entry.manufacture_id)
             .one()
         )
-        if _clean_ref1c(m_row.exported_ref1c):
+        manufacture_ref = _clean_ref1c(m_row.exported_ref1c)
+        if manufacture_ref and m_row.status == "exported":
             entry.status = "existing"
-            entry.target_ref_key = _clean_ref1c(m_row.exported_ref1c)
+            entry.target_ref_key = manufacture_ref
             entry.reason = "exported_ref1c уже стоит"
             already_linked.append(entry)
             continue
+        if manufacture_ref:
+            entry.target_ref_key = entry.target_ref_key or manufacture_ref
+            entry.reason = "повторная отправка: 1С-документ уже был создан, обновляем реквизиты и проводим"
         eligible.append(entry)
 
     summary: Dict[str, Any] = {

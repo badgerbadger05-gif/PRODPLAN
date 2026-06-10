@@ -104,6 +104,7 @@ class _FakeClient:
         self.fail = fail
         self.parent_order_doc = parent_order_doc or {}
         self.posts: list = []
+        self.patches: list = []
         self.gets: list = []
 
     def post(self, entity, payload, **_):
@@ -111,6 +112,12 @@ class _FakeClient:
         if self.fail:
             raise RuntimeError("simulated 1C failure")
         return {"Ref_Key": self.ref_key}
+
+    def patch(self, entity_ref, payload, **_):
+        self.patches.append((entity_ref, payload))
+        if self.fail:
+            raise RuntimeError("simulated 1C failure")
+        return {}
 
     def _make_request(self, endpoint, params=None, **_):
         self.gets.append((endpoint, params or {}))
@@ -324,8 +331,13 @@ def test_export_inherits_warehouses_from_parent_1c_order_when_local_binding_miss
     component = _mk_item(db, code="EXP-INHERIT-C", ref1c="component-ref-inherit")
     spec = Specification(spec_name="Spec inherit", spec_ref1c="spec-ref-inherit")
     stage = ProductionStage(stage_name="Stage inherit", stage_ref1c="stage-ref")
+    completion_stage = ProductionStage(
+        stage_name="Завершение производства",
+        stage_ref1c="completion-stage-ref",
+    )
     db.add(spec)
     db.add(stage)
+    db.add(completion_stage)
     db.flush()
     db.add(DefaultSpecification(item_id=item.item_id, spec_id=spec.spec_id))
     db.add(
@@ -375,7 +387,58 @@ def test_export_inherits_warehouses_from_parent_1c_order_when_local_binding_miss
     assert payload["Запасы"][0]["Количество"] == 10.0
     assert payload["Запасы"][0]["Спецификация_Key"] == "spec-ref-inherit"
     assert payload["Запасы"][0]["СтруктурнаяЕдиница_Key"] == "parent-reserve-ref"
-    assert payload["Запасы"][0]["Этап_Key"] == "stage-ref"
+    assert "Этап_Key" not in payload["Запасы"][0]
+    assert payload["ВыполненныеЭтапы"] == [
+        {"LineNumber": 1, "КлючСвязи": 1, "Этап_Key": "stage-ref"},
+        {"LineNumber": 2, "КлючСвязи": 1, "Этап_Key": "completion-stage-ref"},
+    ]
+
+
+def test_export_uses_completion_stage_even_without_local_spec_stages(db_session, monkeypatch):
+    db = db_session
+    item = _mk_item(db, code="EXP-STAGE", ref1c="item-ref-stage")
+    component = _mk_item(db, code="EXP-STAGE-C", ref1c="component-ref-stage")
+    spec = Specification(spec_name="Spec stage", spec_ref1c="spec-ref-stage")
+    completion_stage = ProductionStage(
+        stage_name="Завершение производства",
+        stage_ref1c="completion-stage-ref",
+    )
+    db.add(spec)
+    db.add(completion_stage)
+    db.flush()
+    db.add(DefaultSpecification(item_id=item.item_id, spec_id=spec.spec_id))
+    db.add(
+        SpecComponent(
+            spec_id=spec.spec_id,
+            item_id=component.item_id,
+            quantity=1,
+        )
+    )
+    product = _mk_product(db, item, qty=4)
+    product.spec_id = None
+    mid = produce_line(db, product.product_id, qty=4, executor="operator")["manufacture_id"]
+    db.commit()
+
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    fake = _FakeClient(
+        ref_key="stage-manuf-ref",
+        parent_order_doc={
+            "СтруктурнаяЕдиницаРезерв_Key": "parent-reserve-ref",
+            "СтруктурнаяЕдиницаПродукции_Key": "parent-product-ref",
+            "Продукция": [],
+            "Запасы": [{"Этап_Key": "parent-stage-ref"}],
+        },
+    )
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False, allow_production=True)
+
+    assert result["manufactures_created"] == 1
+    payload = fake.posts[0][1]
+    assert "Этап_Key" not in payload["Запасы"][0]
+    assert payload["ВыполненныеЭтапы"] == [
+        {"LineNumber": 1, "КлючСвязи": 1, "Этап_Key": "completion-stage-ref"},
+    ]
 
 
 def test_rollback_local_manufacture_restores_line(db_session):
@@ -480,6 +543,22 @@ def test_failed_posting_keeps_created_ref_on_manufacture(db_session, monkeypatch
     )
     assert link.status == "error"
     assert link.target_ref_key == "created-but-not-posted"
+
+    retry_client = _FakeClient(ref_key="should-not-create")
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: retry_client)
+
+    retry = exporter.export_manufactures_to_1c(db, [mid], dry_run=False)
+
+    assert retry["status"] == "ok"
+    assert retry["manufactures_created"] == 1
+    assert retry["manufactures_already_linked"] == 0
+    assert retry_client.posts == []
+    assert len(retry_client.patches) == 1
+    assert retry_client.patches[0][0] == "Document_СборкаЗапасов(guid'created-but-not-posted')"
+    m = db.query(ProductionManufacture).filter_by(manufacture_id=mid).one()
+    assert m.status == "exported"
+    assert m.exported_ref1c == "created-but-not-posted"
+    assert m.export_error is None
 
 
 def test_second_export_is_noop(db_session, monkeypatch):
