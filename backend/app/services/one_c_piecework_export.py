@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session, joinedload
 from ..models import (
     DefaultSpecification,
     ProductionManufacture,
+    ProductionManufactureOperation,
     ProductionOrder,
     ProductionProduct,
     Employee,
@@ -75,6 +76,8 @@ class PieceworkOperationLine:
     time_norm: float = 0.0
     price: float = 0.0
     stage_ref1c: Optional[str] = None
+    spec_operation_id: Optional[int] = None
+    operation_id: Optional[int] = None
     employee_ref1c: Optional[str] = None
     employee_type: str = "employee"
 
@@ -211,6 +214,8 @@ def _piecework_operation_defaults(
                 time_norm=float(so.time_norm if so.time_norm is not None else op.time_norm or 0),
                 price=float(op.operation_price or 0),
                 stage_ref1c=stage_ref,
+                spec_operation_id=int(so.spec_operation_id),
+                operation_id=int(op.operation_id),
             )
         )
 
@@ -292,6 +297,60 @@ def _collect_export_entries(
             if employee:
                 employee_ref = _clean_ref1c(employee.employee_ref1c) or None
                 employee_type = str(getattr(employee, "employee_type", None) or "employee")
+        operation_lines = list(operation_defaults.operation_lines)
+        operation_employee_rows = (
+            db.query(ProductionManufactureOperation)
+            .filter(ProductionManufactureOperation.manufacture_id == int(m.manufacture_id))
+            .order_by(ProductionManufactureOperation.line_number.asc(), ProductionManufactureOperation.id.asc())
+            .all()
+        )
+        employees_by_spec_operation_id = {
+            int(row.spec_operation_id): row
+            for row in operation_employee_rows
+            if row.spec_operation_id is not None
+        }
+        employees_by_operation_id = {
+            int(row.operation_id): row
+            for row in operation_employee_rows
+            if row.operation_id is not None
+        }
+        if operation_employee_rows:
+            enriched_lines: List[PieceworkOperationLine] = []
+            for line in operation_lines:
+                employee_row = None
+                spec_operation_id = getattr(line, "spec_operation_id", None)
+                operation_id = getattr(line, "operation_id", None)
+                if spec_operation_id is not None:
+                    employee_row = employees_by_spec_operation_id.get(int(spec_operation_id))
+                if employee_row is None and operation_id is not None:
+                    employee_row = employees_by_operation_id.get(int(operation_id))
+                enriched_lines.append(PieceworkOperationLine(
+                    operation_ref1c=line.operation_ref1c,
+                    time_norm=line.time_norm,
+                    price=line.price,
+                    stage_ref1c=line.stage_ref1c,
+                    spec_operation_id=getattr(line, "spec_operation_id", None),
+                    operation_id=getattr(line, "operation_id", None),
+                    employee_ref1c=_clean_ref1c(getattr(employee_row, "employee_ref1c", None)) if employee_row else None,
+                    employee_type=str(getattr(employee_row, "employee_type", None) or "employee") if employee_row else "employee",
+                ))
+            operation_lines = enriched_lines
+            employee_ref = None
+        elif employee_ref and operation_lines:
+            operation_lines = [
+                PieceworkOperationLine(
+                    operation_ref1c=line.operation_ref1c,
+                    time_norm=line.time_norm,
+                    price=line.price,
+                    stage_ref1c=line.stage_ref1c,
+                    spec_operation_id=getattr(line, "spec_operation_id", None),
+                    operation_id=getattr(line, "operation_id", None),
+                    employee_ref1c=employee_ref,
+                    employee_type=employee_type,
+                )
+                for line in operation_lines
+            ]
+            employee_ref = None
 
         entries.append(PieceworkExportEntry(
             manufacture_id=int(m.manufacture_id),
@@ -308,7 +367,7 @@ def _collect_export_entries(
             price=operation_defaults.price,
             spec_ref1c=operation_defaults.spec_ref1c,
             stage_ref1c=operation_defaults.stage_ref1c,
-            operation_lines=list(operation_defaults.operation_lines),
+            operation_lines=operation_lines,
             structural_unit_ref1c=operation_defaults.structural_unit_ref1c,
             employee_ref1c=employee_ref,
             employee_type=employee_type,
@@ -338,6 +397,8 @@ def _build_header_payload(
                 time_norm=float(time_norm or entry.time_norm or 0.0),
                 price=float(price or entry.price or 0.0),
                 stage_ref1c=entry.stage_ref1c,
+                employee_ref1c=entry.employee_ref1c,
+                employee_type=entry.employee_type,
             )
         ]
     else:
@@ -437,7 +498,7 @@ def _build_header_payload(
         payload["СтруктурнаяЕдиница_Key"] = structural_unit_ref
     if business_operation_ref:
         payload["ХозяйственнаяОперация_Key"] = business_operation_ref
-    if entry.employee_ref1c:
+    if entry.employee_ref1c and not has_row_executor:
         payload["Исполнитель"] = entry.employee_ref1c
         payload["Исполнитель_Type"] = header_executor_type
         payload["ПоложениеИсполнителя"] = "ВШапке"

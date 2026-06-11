@@ -82,6 +82,24 @@ export type EmployeeOption = {
   employee_name: string
 }
 
+export type ProductionOperationOption = {
+  line_number: number
+  spec_id?: number | null
+  spec_ref1c?: string | null
+  spec_operation_id: number
+  operation_id: number
+  operation_ref1c?: string | null
+  operation_name?: string | null
+  stage_id?: number | null
+  stage_name?: string | null
+  time_norm?: number | null
+}
+
+export type ProductionOperationsResponse = {
+  rows: ProductionOperationOption[]
+  total: number
+}
+
 export type EmployeesResponse = {
   rows: EmployeeOption[]
   total: number

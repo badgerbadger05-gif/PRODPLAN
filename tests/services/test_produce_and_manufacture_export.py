@@ -7,8 +7,11 @@ import pytest
 
 from app.models import (
     DefaultSpecification,
+    Employee,
     Item,
+    Operation,
     ProductionManufacture,
+    ProductionManufactureOperation,
     ProductionMaterialIssue,
     ProductionMaterialIssueLine,
     ProductionOrder,
@@ -16,6 +19,7 @@ from app.models import (
     ProductionProduct,
     ProductionStage,
     SpecComponent,
+    SpecOperation,
     Specification,
     SyncLink,
     WorkshopWarehouseBinding,
@@ -201,6 +205,49 @@ def test_produce_full_marks_line_produced(db_session):
     assert float(manufacture.qty) == 5.0
     assert manufacture.executor == "иван"
     assert manufacture.status == "draft"
+
+
+def test_produce_line_saves_operation_executors(db_session):
+    db = db_session
+    item = _mk_item(db, code="PRD-OP-EXEC", ref1c="ref-prd-op-exec")
+    product = _mk_product(db, item, qty=5.0)
+    employee = Employee(
+        employee_ref1c="employee-op-ref",
+        employee_type="employee",
+        employee_code="000000031",
+        employee_name="Оператор операции",
+        deletion_mark=False,
+    )
+    operation = Operation(operation_ref1c="op-exec-ref", operation_name="Сборка", time_norm=0.25)
+    spec = Specification(spec_name="Operation executor spec")
+    db.add_all([employee, operation, spec])
+    db.flush()
+    product.spec_id = spec.spec_id
+    spec_operation = SpecOperation(spec_id=spec.spec_id, operation_id=operation.operation_id, time_norm=0.25)
+    db.add(spec_operation)
+    db.commit()
+
+    result = produce_line(
+        db,
+        product.product_id,
+        qty=5,
+        operation_executors=[{
+            "line_number": 1,
+            "spec_operation_id": spec_operation.spec_operation_id,
+            "operation_id": operation.operation_id,
+            "employee_ref1c": employee.employee_ref1c,
+        }],
+    )
+
+    row = (
+        db.query(ProductionManufactureOperation)
+        .filter_by(manufacture_id=result["manufacture_id"])
+        .one()
+    )
+    assert row.spec_operation_id == spec_operation.spec_operation_id
+    assert row.operation_id == operation.operation_id
+    assert row.employee_ref1c == "employee-op-ref"
+    assert row.employee_name == "Оператор операции"
 
 
 def test_partial_then_remaining_finishes_line(db_session):

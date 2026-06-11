@@ -1502,6 +1502,44 @@ input:focus, select:focus {
   font-size: 14px;
 }
 
+.operationExecutorList {
+  display: grid;
+  gap: 8px;
+}
+
+.operationExecutorRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(180px, 240px);
+  gap: 10px;
+  align-items: center;
+  padding: 8px;
+  border: 1px solid var(--line);
+  background: #f8fafc;
+}
+
+.operationExecutorMeta {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.operationExecutorMeta strong,
+.operationExecutorMeta span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.operationExecutorMeta strong {
+  font-size: 13px;
+}
+
+.operationExecutorMeta span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .fieldHint {
   color: var(--muted);
   font-size: 12px;

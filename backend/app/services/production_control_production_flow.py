@@ -6,12 +6,16 @@ from typing import Any, Dict, List, Optional
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
+    Employee,
     Item,
+    Operation,
     ProductionManufacture,
+    ProductionManufactureOperation,
     ProductionMaterialIssue,
     ProductionMaterialIssueLine,
     ProductionProduct,
     SpecComponent,
+    SpecOperation,
     Specification,
 )
 from ..schemas import ODataSyncRequest
@@ -132,6 +136,7 @@ def produce_line(
     *,
     qty: float,
     executor: Optional[str] = None,
+    operation_executors: Optional[List[Dict[str, Any]]] = None,
     comment: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
@@ -202,6 +207,46 @@ def produce_line(
     )
     db.add(manufacture)
     db.flush()
+
+    executor_rows = [row for row in (operation_executors or []) if isinstance(row, dict)]
+    for idx, row in enumerate(executor_rows, start=1):
+        employee_ref = str(row.get("employee_ref1c") or "").strip()
+        if not employee_ref:
+            continue
+        employee = (
+            db.query(Employee)
+            .filter(Employee.employee_ref1c == employee_ref)
+            .filter(Employee.deletion_mark.is_(False))
+            .one_or_none()
+        )
+        if employee is None:
+            raise ValueError(f"employee_ref1c={employee_ref}: исполнитель не найден")
+        spec_operation_id = row.get("spec_operation_id")
+        operation_id = row.get("operation_id")
+        spec_operation = None
+        if spec_operation_id is not None:
+            spec_operation = (
+                db.query(SpecOperation)
+                .filter(SpecOperation.spec_operation_id == int(spec_operation_id))
+                .one_or_none()
+            )
+            if spec_operation is None:
+                raise ValueError(f"spec_operation_id={spec_operation_id}: операция спецификации не найдена")
+            operation_id = int(spec_operation.operation_id)
+        if operation_id is None:
+            raise ValueError("operation_id обязателен для исполнителя операции")
+        operation = db.query(Operation).filter(Operation.operation_id == int(operation_id)).one_or_none()
+        if operation is None:
+            raise ValueError(f"operation_id={operation_id}: операция не найдена")
+        db.add(ProductionManufactureOperation(
+            manufacture_id=int(manufacture.manufacture_id),
+            spec_operation_id=int(spec_operation.spec_operation_id) if spec_operation else None,
+            operation_id=int(operation.operation_id),
+            line_number=int(row.get("line_number") or idx),
+            employee_ref1c=str(employee.employee_ref1c),
+            employee_name=str(employee.employee_name or ""),
+            employee_type=str(getattr(employee, "employee_type", None) or "employee"),
+        ))
 
     product.produced_qty = produced_before + qty_f
     new_remaining = max(0.0, remaining - qty_f)

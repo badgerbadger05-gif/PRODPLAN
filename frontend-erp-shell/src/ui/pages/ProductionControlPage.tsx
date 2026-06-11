@@ -10,6 +10,8 @@ import {
   type MaterialsResponse,
   type OrderRow,
   type OrdersResponse,
+  type ProductionOperationOption,
+  type ProductionOperationsResponse,
   type ProductionFilters,
   type WarehouseCandidate,
   type WorkshopWarehouse,
@@ -87,6 +89,9 @@ export function ProductionControlPage() {
   const [produceOpen, setProduceOpen] = useState(false)
   const [produceQty, setProduceQty] = useState('')
   const [produceEmployeeRef, setProduceEmployeeRef] = useState('')
+  const [produceOperations, setProduceOperations] = useState<ProductionOperationOption[]>([])
+  const [produceOperationEmployees, setProduceOperationEmployees] = useState<Record<number, string>>({})
+  const [produceOperationsLoading, setProduceOperationsLoading] = useState(false)
   const [employees, setEmployees] = useState<EmployeeOption[]>([])
   const [employeesLoading, setEmployeesLoading] = useState(false)
   const [produceDryRun, setProduceDryRun] = useState(false)
@@ -115,6 +120,10 @@ export function ProductionControlPage() {
   const selectedEmployee = useMemo(
     () => employees.find((employee) => employee.employee_ref1c === produceEmployeeRef) ?? null,
     [employees, produceEmployeeRef],
+  )
+  const allOperationExecutorsSelected = useMemo(
+    () => produceOperations.length === 0 || produceOperations.every((operation) => Boolean(produceOperationEmployees[operation.spec_operation_id])),
+    [produceOperations, produceOperationEmployees],
   )
   const produceRemainingQty = Number(produceRow?.remaining_qty ?? 0)
   const produceRequestedQty = Number(produceQty || 0)
@@ -191,6 +200,21 @@ export function ProductionControlPage() {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
       setEmployeesLoading(false)
+    }
+  }, [])
+
+  const loadProduceOperations = useCallback(async (productId: number) => {
+    setProduceOperationsLoading(true)
+    try {
+      const data = await api<ProductionOperationsResponse>(`/v1/production-control/orders/${productId}/operations`)
+      setProduceOperations(data.rows ?? [])
+      setProduceOperationEmployees({})
+    } catch (e) {
+      setProduceOperations([])
+      setProduceOperationEmployees({})
+      setProduceError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setProduceOperationsLoading(false)
     }
   }, [])
 
@@ -511,11 +535,14 @@ export function ProductionControlPage() {
     }
     setProduceQty(String(row.remaining_qty ?? row.quantity ?? 0))
     setProduceEmployeeRef('')
+    setProduceOperations([])
+    setProduceOperationEmployees({})
     setProduceDryRun(false)
     setProduceError('')
     setProduceDryRunPayload(null)
     setProduceOpen(true)
     void loadEmployees()
+    void loadProduceOperations(row.product_id)
   }
 
   async function submitProduce() {
@@ -591,13 +618,24 @@ export function ProductionControlPage() {
       }
 
       // Step 1: record manufacture locally (bumps produced_qty / remaining_qty).
+      const operationExecutors = produceOperations.map((operation) => {
+        const employeeRef = produceOperationEmployees[operation.spec_operation_id]
+        const employee = employees.find((row) => row.employee_ref1c === employeeRef)
+        return {
+          line_number: operation.line_number,
+          spec_operation_id: operation.spec_operation_id,
+          operation_id: operation.operation_id,
+          employee_ref1c: employee?.employee_ref1c || employeeRef,
+        }
+      })
       const localResult = await api<Record<string, unknown>>(
         `/v1/production-control/orders/${produceRow.product_id}/produce`,
         {
           method: 'POST',
           body: JSON.stringify({
             qty: requestedQty,
-            executor: selectedEmployee?.employee_name || undefined,
+            executor: produceOperations.length ? undefined : selectedEmployee?.employee_name || undefined,
+            operation_executors: produceOperations.length ? operationExecutors : undefined,
           }),
         },
       )
@@ -932,24 +970,58 @@ export function ProductionControlPage() {
                   </div>
                 )}
               </div>
-              <div className="dialogField">
-                <label>Исполнитель</label>
-                <select
-                  value={produceEmployeeRef}
-                  onChange={(e) => setProduceEmployeeRef(e.target.value)}
-                  disabled={produceSaving || employeesLoading}
-                >
-                  <option value="">{employeesLoading ? 'Загрузка сотрудников...' : 'Выберите сотрудника'}</option>
-                  {employees.map((employee) => (
-                    <option key={employee.employee_ref1c} value={employee.employee_ref1c}>
-                      {employee.employee_name}{employee.employee_type === 'brigade' ? ' [бригада]' : ''}{employee.employee_code ? ` (${employee.employee_code})` : ''}
-                    </option>
-                  ))}
-                </select>
-                {!employeesLoading && employees.length === 0 && (
-                  <div className="fieldHint">Список пуст. Запустите синхронизацию сотрудников в разделе «Синхронизация».</div>
-                )}
-              </div>
+              {produceOperations.length > 0 ? (
+                <div className="dialogField">
+                  <label>Исполнители операций</label>
+                  <div className="operationExecutorList">
+                    {produceOperations.map((operation) => (
+                      <div className="operationExecutorRow" key={operation.spec_operation_id}>
+                        <div className="operationExecutorMeta">
+                          <strong>{operation.line_number}. {operation.operation_name || 'Операция'}</strong>
+                          <span>{operation.stage_name || 'Этап не указан'} · норма {Number(operation.time_norm ?? 0).toLocaleString('ru-RU')}</span>
+                        </div>
+                        <select
+                          value={produceOperationEmployees[operation.spec_operation_id] || ''}
+                          onChange={(e) => setProduceOperationEmployees((current) => ({
+                            ...current,
+                            [operation.spec_operation_id]: e.target.value,
+                          }))}
+                          disabled={produceSaving || employeesLoading || produceOperationsLoading}
+                        >
+                          <option value="">{employeesLoading ? 'Загрузка сотрудников...' : 'Выберите сотрудника'}</option>
+                          {employees.map((employee) => (
+                            <option key={employee.employee_ref1c} value={employee.employee_ref1c}>
+                              {employee.employee_name}{employee.employee_type === 'brigade' ? ' [бригада]' : ''}{employee.employee_code ? ` (${employee.employee_code})` : ''}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    ))}
+                  </div>
+                  {!employeesLoading && employees.length === 0 && (
+                    <div className="fieldHint">Список пуст. Запустите синхронизацию сотрудников в разделе «Синхронизация».</div>
+                  )}
+                </div>
+              ) : (
+                <div className="dialogField">
+                  <label>Исполнитель</label>
+                  <select
+                    value={produceEmployeeRef}
+                    onChange={(e) => setProduceEmployeeRef(e.target.value)}
+                    disabled={produceSaving || employeesLoading || produceOperationsLoading}
+                  >
+                    <option value="">{produceOperationsLoading || employeesLoading ? 'Загрузка...' : 'Выберите сотрудника'}</option>
+                    {employees.map((employee) => (
+                      <option key={employee.employee_ref1c} value={employee.employee_ref1c}>
+                        {employee.employee_name}{employee.employee_type === 'brigade' ? ' [бригада]' : ''}{employee.employee_code ? ` (${employee.employee_code})` : ''}
+                      </option>
+                    ))}
+                  </select>
+                  {!employeesLoading && employees.length === 0 && (
+                    <div className="fieldHint">Список пуст. Запустите синхронизацию сотрудников в разделе «Синхронизация».</div>
+                  )}
+                </div>
+              )}
               <div className="dialogCheckRow">
                 <input
                   type="checkbox"
@@ -967,7 +1039,7 @@ export function ProductionControlPage() {
               <button
                 className="primary"
                 onClick={() => void submitProduce()}
-                disabled={!canProduceRow || produceSaving || employeesLoading || (employees.length > 0 && !produceEmployeeRef)}
+                disabled={!canProduceRow || produceSaving || employeesLoading || produceOperationsLoading || (employees.length > 0 && (produceOperations.length ? !allOperationExecutorsSelected : !produceEmployeeRef))}
               >
                 {produceSaving ? 'Создаём...' : produceDryRun ? 'Показать payload' : 'Создать в 1С'}
               </button>

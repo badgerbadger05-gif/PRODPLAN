@@ -296,15 +296,10 @@ def test_brigade_executor_uses_brigade_type_and_composition(db_session, monkeypa
 
     assert result["manufactures_created"] == 1
     payload = fake.posts[0][1]
-    assert payload["Исполнитель"] == "brigade-ref"
-    assert payload["Исполнитель_Type"] == "StandardODATA.Catalog_Бригады"
-    assert payload["ПоложениеИсполнителя"] == "ВШапке"
-    assert "Исполнитель" not in payload["Операции"][0]
-    assert "Исполнитель_Type" not in payload["Операции"][0]
-    assert [row["Сотрудник_Key"] for row in payload["СоставБригады"]] == [
-        "member-ref-1",
-        "member-ref-2",
-    ]
+    assert "Исполнитель" not in payload
+    assert payload["ПоложениеИсполнителя"] == "ВТабличнойЧасти"
+    assert payload["Операции"][0]["Исполнитель"] == "brigade-ref"
+    assert payload["Операции"][0]["Исполнитель_Type"] == "StandardODATA.Catalog_Бригады"
 
 
 def test_optional_org_and_unit_in_payload(db_session):
@@ -326,7 +321,7 @@ def test_optional_org_and_unit_in_payload(db_session):
     assert payload["Операции"][0]["СтруктурнаяЕдиница_Key"] == "unit-ref-abc"
 
 
-def test_single_executor_is_written_to_header_not_operation_rows(db_session, monkeypatch):
+def test_single_executor_is_written_to_operation_rows(db_session, monkeypatch):
     db = db_session
     item = _mk_item(db, code="PW-HEADER-EXEC", ref1c="item-ref-header-exec")
     m = _mk_manufacture(db, item, exported_ref1c="ref-header-exec")
@@ -355,11 +350,10 @@ def test_single_executor_is_written_to_header_not_operation_rows(db_session, mon
 
     assert result["manufactures_created"] == 1
     payload = fake.posts[0][1]
-    assert payload["Исполнитель"] == "employee-ref"
-    assert payload["Исполнитель_Type"] == "StandardODATA.Catalog_Сотрудники"
-    assert payload["ПоложениеИсполнителя"] == "ВШапке"
-    assert "Исполнитель" not in payload["Операции"][0]
-    assert "Исполнитель_Type" not in payload["Операции"][0]
+    assert "Исполнитель" not in payload
+    assert payload["ПоложениеИсполнителя"] == "ВТабличнойЧасти"
+    assert payload["Операции"][0]["Исполнитель"] == "employee-ref"
+    assert payload["Операции"][0]["Исполнитель_Type"] == "StandardODATA.Catalog_Сотрудники"
 
 
 # ---------------------------------------------------------------------------

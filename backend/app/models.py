@@ -460,6 +460,39 @@ class ProductionManufacture(Base):
 
     product = relationship("ProductionProduct")
     order = relationship("ProductionOrder")
+    operations = relationship(
+        "ProductionManufactureOperation",
+        back_populates="manufacture",
+        cascade="all, delete-orphan",
+    )
+
+
+class ProductionManufactureOperation(Base):
+    """
+    Per-operation executor selected for a ProductionManufacture.
+    Drives Document_СдельныйНаряд with ПоложениеИсполнителя=ВТабличнойЧасти.
+    """
+    __tablename__ = "production_manufacture_operations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    manufacture_id = Column(
+        Integer,
+        ForeignKey("production_manufactures.manufacture_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    spec_operation_id = Column(Integer, ForeignKey("spec_operations.spec_operation_id"), nullable=True, index=True)
+    operation_id = Column(Integer, ForeignKey("operations.operation_id"), nullable=False, index=True)
+    line_number = Column(Integer, nullable=False)
+    employee_ref1c = Column(String(36), nullable=False, index=True)
+    employee_name = Column(String(255), nullable=False)
+    employee_type = Column(String(20), nullable=False, default="employee", server_default="employee")
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    manufacture = relationship("ProductionManufacture", back_populates="operations")
+    spec_operation = relationship("SpecOperation")
+    operation = relationship("Operation")
 
 
 class ProductionComponent(Base):

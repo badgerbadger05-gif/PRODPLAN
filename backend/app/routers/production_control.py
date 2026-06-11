@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..models import Employee
+from ..models import DefaultSpecification, Employee, Operation, ProductionProduct, ProductionStage, Specification, SpecOperation
 from ..schemas import ODataSyncRequest
 from ..services.one_c_manufacture_export import export_manufactures_to_1c
 from ..services.one_c_piecework_export import export_piecework_to_1c
@@ -78,6 +78,57 @@ def list_employees(
     }
 
 
+@router.get("/orders/{product_id}/operations", response_model=dict)
+def get_order_line_operations(
+    product_id: int,
+    db: Session = Depends(get_db),
+):
+    product = (
+        db.query(ProductionProduct)
+        .filter(ProductionProduct.product_id == int(product_id))
+        .one_or_none()
+    )
+    if product is None:
+        raise HTTPException(status_code=404, detail="Строка заказа не найдена")
+    spec_id = product.spec_id
+    if not spec_id:
+        default_spec = (
+            db.query(DefaultSpecification.spec_id)
+            .filter(DefaultSpecification.item_id == int(product.item_id))
+            .order_by(DefaultSpecification.id.asc())
+            .first()
+        )
+        spec_id = int(default_spec.spec_id) if default_spec else None
+    if not spec_id:
+        return {"rows": [], "total": 0}
+    spec = db.query(Specification).filter(Specification.spec_id == int(spec_id)).one_or_none()
+    rows = (
+        db.query(SpecOperation, Operation, ProductionStage)
+        .join(Operation, Operation.operation_id == SpecOperation.operation_id)
+        .outerjoin(ProductionStage, ProductionStage.stage_id == SpecOperation.stage_id)
+        .filter(SpecOperation.spec_id == int(spec_id))
+        .filter(Operation.operation_ref1c.isnot(None))
+        .order_by(SpecOperation.spec_operation_id.asc())
+        .all()
+    )
+    result = [
+        {
+            "line_number": idx,
+            "spec_id": int(spec_id),
+            "spec_ref1c": spec.spec_ref1c if spec else None,
+            "spec_operation_id": int(spec_op.spec_operation_id),
+            "operation_id": int(operation.operation_id),
+            "operation_ref1c": operation.operation_ref1c,
+            "operation_name": operation.operation_name,
+            "stage_id": int(stage.stage_id) if stage else None,
+            "stage_name": stage.stage_name if stage else None,
+            "time_norm": float(spec_op.time_norm if spec_op.time_norm is not None else operation.time_norm or 0),
+        }
+        for idx, (spec_op, operation, stage) in enumerate(rows, start=1)
+    ]
+    return {"rows": result, "total": len(result)}
+
+
 class LineStatePayload(BaseModel):
     status: Optional[str] = None
     issue_status: Optional[str] = None
@@ -137,6 +188,7 @@ class PrintRouteSheetsPayload(BaseModel):
 class ProduceLinePayload(BaseModel):
     qty: float
     executor: Optional[str] = None
+    operation_executors: Optional[List[dict]] = None
     comment: Optional[str] = None
 
 
@@ -278,6 +330,7 @@ def post_produce_line(
             int(product_id),
             qty=float(payload.qty),
             executor=payload.executor,
+            operation_executors=payload.operation_executors,
             comment=payload.comment,
         )
     except ValueError as e:
