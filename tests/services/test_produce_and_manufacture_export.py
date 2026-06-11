@@ -22,6 +22,7 @@ from app.models import (
 )
 from app.routers.production_control import ExportPieceworkPayload
 from app.services import one_c_manufacture_export as exporter
+from app.services import production_control_production_flow as flow
 from app.services.production_control_production_flow import produce_line, rollback_local_manufacture
 
 
@@ -281,6 +282,52 @@ def test_produce_requires_posted_material_issue(db_session):
     assert float(product.produced_qty) == 0
     assert float(product.remaining_qty) == 4
     assert db.query(ProductionManufacture).filter_by(product_id=product.product_id).count() == 0
+
+
+def test_produce_refreshes_1c_spec_before_reservation_guard(db_session, monkeypatch):
+    db = db_session
+    item = _mk_item(db, code="PRD-SPEC-REFRESH", ref1c="ref-prd-spec-refresh")
+    component = _mk_item(db, code="COMP-SPEC-REFRESH", ref1c="ref-comp-spec-refresh")
+    product = _mk_product(db, item, qty=16.0)
+
+    spec = Specification(
+        spec_code="SPEC-REFRESH",
+        spec_name="Spec refresh",
+        spec_ref1c="spec-refresh-ref",
+    )
+    db.add(spec)
+    db.flush()
+    product.spec_id = spec.spec_id
+    db.add(
+        SpecComponent(
+            spec_id=spec.spec_id,
+            item_id=component.item_id,
+            quantity=0.043,
+            component_type="Материал",
+        )
+    )
+    _stock_kit_on_workshop(db, product, component, qty=0.656)
+
+    def fake_refresh(db_arg, product_arg):
+        assert int(product_arg.product_id) == int(product.product_id)
+        row = (
+            db_arg.query(SpecComponent)
+            .filter_by(spec_id=spec.spec_id, item_id=component.item_id)
+            .one()
+        )
+        row.quantity = 0.041
+        db_arg.flush()
+        return True
+
+    monkeypatch.setattr(flow, "_refresh_product_spec_from_1c", fake_refresh)
+
+    result = produce_line(db, product.product_id, qty=16.0)
+
+    assert result["status"] == "ok"
+    assert result["line_status"] == "produced"
+    db.refresh(product)
+    assert float(product.produced_qty) == 16.0
+    assert float(product.remaining_qty) == 0.0
 
 
 # ---------------------------------------------------------------------------

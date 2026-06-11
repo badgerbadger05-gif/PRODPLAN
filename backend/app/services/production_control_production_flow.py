@@ -12,13 +12,64 @@ from ..models import (
     ProductionMaterialIssueLine,
     ProductionProduct,
     SpecComponent,
+    Specification,
 )
+from ..schemas import ODataSyncRequest
+from .odata_config import load_odata_config
 from .production_control_common import to_float as _to_float
 from .production_control_domain import default_spec_id as _default_spec_id, ensure_state as _ensure_state
+from .specification_sync import sync_specifications_from_odata
 from .one_c_document_numbers import material_issue_number
 
 
 # ---------------------------------------------------------------------------
+
+
+def _refresh_product_spec_from_1c(db: Session, product: ProductionProduct) -> bool:
+    """
+    Pull the current 1C BOM for this line's specification before production.
+
+    Operators may move materials after a technologist changed the 1C
+    specification, while PRODPLAN still holds an older BOM snapshot. Production
+    must be validated against the 1C-confirmed current BOM so quantity and
+    composition changes in either direction are honored before the local
+    reservation guard and 1C manufacture payload are built.
+    """
+    spec_id = _default_spec_id(db, product)
+    if not spec_id:
+        return False
+    spec = db.query(Specification).filter(Specification.spec_id == int(spec_id)).first()
+    spec_ref = str(getattr(spec, "spec_ref1c", None) or "").strip()
+    if not spec_ref:
+        return False
+
+    config = load_odata_config()
+    base_url = str(config.get("base_url") or "").strip()
+    if not base_url:
+        return False
+
+    try:
+        sync_specifications_from_odata(
+            db,
+            ODataSyncRequest(
+                base_url=base_url,
+                entity_name="Catalog_Спецификации",
+                username=config.get("username") or None,
+                password=config.get("password") or None,
+                token=config.get("token") or None,
+                filter_query=f"Ref_Key eq guid'{spec_ref}'",
+                select_fields=["Ref_Key", "Code", "Description", "ВидПроизводства_Key", "Состав", "Операции"],
+                dry_run=False,
+                zero_missing=False,
+            ),
+        )
+        db.expire_all()
+        return True
+    except Exception as exc:
+        raise ValueError(
+            "Не удалось подтвердить актуальную спецификацию в 1С перед выпуском: "
+            f"{exc}"
+        ) from exc
 
 
 def _ensure_workshop_reservation_covers(
@@ -36,6 +87,7 @@ def _ensure_workshop_reservation_covers(
     from .production_control_domain import default_spec_id as _spec_for
     from .production_control_reservations import load_reservation_state
 
+    _refresh_product_spec_from_1c(db, product)
     spec_id = _spec_for(db, product)
     if not spec_id:
         return
