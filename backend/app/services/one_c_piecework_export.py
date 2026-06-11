@@ -415,6 +415,7 @@ def _build_header_payload(
         raise ValueError(
             f"manufacture_id={entry.manufacture_id}: не найдена операция спецификации для сдельного наряда"
         )
+    has_row_executor = any(_clean_ref1c(line.employee_ref1c) for line in operation_lines)
 
     payload: Dict[str, Any] = {
         "Number": entry.number,
@@ -439,6 +440,7 @@ def _build_header_payload(
     if entry.employee_ref1c:
         payload["Исполнитель"] = entry.employee_ref1c
         payload["Исполнитель_Type"] = header_executor_type
+        payload["ПоложениеИсполнителя"] = "ВШапке"
         if entry.employee_type != "brigade":
             payload["СоставБригады"] = [
                 {
@@ -449,6 +451,8 @@ def _build_header_payload(
                     **({"СтруктурнаяЕдиница_Key": structural_unit_ref} if structural_unit_ref else {}),
                 }
             ]
+    elif has_row_executor:
+        payload["ПоложениеИсполнителя"] = "ВТабличнойЧасти"
 
     return payload
 

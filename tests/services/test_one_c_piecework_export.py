@@ -298,6 +298,7 @@ def test_brigade_executor_uses_brigade_type_and_composition(db_session, monkeypa
     payload = fake.posts[0][1]
     assert payload["Исполнитель"] == "brigade-ref"
     assert payload["Исполнитель_Type"] == "StandardODATA.Catalog_Бригады"
+    assert payload["ПоложениеИсполнителя"] == "ВШапке"
     assert "Исполнитель" not in payload["Операции"][0]
     assert "Исполнитель_Type" not in payload["Операции"][0]
     assert [row["Сотрудник_Key"] for row in payload["СоставБригады"]] == [
@@ -356,6 +357,7 @@ def test_single_executor_is_written_to_header_not_operation_rows(db_session, mon
     payload = fake.posts[0][1]
     assert payload["Исполнитель"] == "employee-ref"
     assert payload["Исполнитель_Type"] == "StandardODATA.Catalog_Сотрудники"
+    assert payload["ПоложениеИсполнителя"] == "ВШапке"
     assert "Исполнитель" not in payload["Операции"][0]
     assert "Исполнитель_Type" not in payload["Операции"][0]
 
