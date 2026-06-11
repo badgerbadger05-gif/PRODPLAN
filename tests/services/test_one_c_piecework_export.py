@@ -220,6 +220,34 @@ def test_default_spec_operation_used_when_product_spec_missing(db_session):
     assert op["Стоимость"] == pytest.approx(60.0)
 
 
+def test_all_spec_operations_are_exported_to_piecework(db_session):
+    db = db_session
+    item = _mk_item(db, code="PW-MULTI-OPS", ref1c="item-ref-multi-ops")
+    spec = Specification(spec_name="Multi operation spec", spec_ref1c="spec-ref-multi")
+    drill = Operation(operation_ref1c="op-ref-drill", operation_name="Сверловка", time_norm=0.01)
+    weld = Operation(operation_ref1c="op-ref-weld", operation_name="Сварка", time_norm=0.10)
+    db.add_all([spec, drill, weld])
+    db.flush()
+    db.add_all([
+        SpecOperation(spec_id=spec.spec_id, operation_id=drill.operation_id, time_norm=0.01),
+        SpecOperation(spec_id=spec.spec_id, operation_id=weld.operation_id, time_norm=0.10),
+    ])
+    db.commit()
+    m = _mk_manufacture(db, item, qty=8.0, exported_ref1c="ref-multi-ops")
+    m.product.spec_id = spec.spec_id
+    db.commit()
+
+    result = exporter.export_piecework_to_1c(db, [m.manufacture_id], dry_run=True)
+
+    operations = result["payloads"][0]["payload"]["Операции"]
+    assert [op["LineNumber"] for op in operations] == [1, 2]
+    assert [op["Операция_Key"] for op in operations] == ["op-ref-drill", "op-ref-weld"]
+    assert [op["КоличествоПлан"] for op in operations] == [8.0, 8.0]
+    assert [op["КоличествоФакт"] for op in operations] == [8.0, 8.0]
+    assert [op["НормаВремени"] for op in operations] == [0.01, 0.10]
+    assert [op["Нормочасы"] for op in operations] == [pytest.approx(0.08), pytest.approx(0.8)]
+
+
 def test_zero_price_is_not_sent_as_piecework_rate(db_session):
     db = db_session
     item = _mk_item(db, code="PW-NO-PRICE", ref1c="item-ref-no-price")

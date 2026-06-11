@@ -16,13 +16,12 @@ Basis rule (from piecework_order_odata.md):
 The manufacture must already be exported to 1C (exported_ref1c set) before a
 piecework order can reference it as its basis.
 
-Норма времени and расценка default to 0 — they can be filled by the 1C admin
-from the routing sheet. operation_ref is required and supplied by the caller
-at the batch level (one operation per export run).
+Норма времени and расценка are taken from the product specification operations.
+operation_ref is still accepted as a manual single-operation override.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -71,6 +70,14 @@ DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
 
 
 @dataclass
+class PieceworkOperationLine:
+    operation_ref1c: str
+    time_norm: float = 0.0
+    price: float = 0.0
+    stage_ref1c: Optional[str] = None
+
+
+@dataclass
 class PieceworkExportEntry:
     manufacture_id: int
     product_id: int
@@ -87,6 +94,7 @@ class PieceworkExportEntry:
     price: float = 0.0
     spec_ref1c: Optional[str] = None
     stage_ref1c: Optional[str] = None
+    operation_lines: List[PieceworkOperationLine] = field(default_factory=list)
     structural_unit_ref1c: Optional[str] = None
     employee_ref1c: Optional[str] = None
     employee_type: str = "employee"
@@ -104,6 +112,7 @@ class PieceworkOperationDefaults:
     price: float = 0.0
     spec_ref1c: Optional[str] = None
     stage_ref1c: Optional[str] = None
+    operation_lines: Tuple[PieceworkOperationLine, ...] = ()
     structural_unit_ref1c: Optional[str] = None
 
 
@@ -148,22 +157,16 @@ def _piecework_operation_defaults(
 
     spec = db.query(Specification).filter(Specification.spec_id == int(spec_id)).one_or_none()
     spec_ref = _clean_ref1c(getattr(spec, "spec_ref1c", None)) or None
-    spec_operation = (
+    spec_operations = (
         db.query(SpecOperation, Operation)
         .join(Operation, Operation.operation_id == SpecOperation.operation_id)
         .filter(SpecOperation.spec_id == int(spec_id))
         .filter(Operation.operation_ref1c.isnot(None))
         .order_by(SpecOperation.spec_operation_id.asc())
-        .first()
+        .all()
     )
-    if not spec_operation:
+    if not spec_operations:
         return PieceworkOperationDefaults(spec_ref1c=spec_ref)
-
-    so, op = spec_operation
-    stage_ref = None
-    if so.stage_id:
-        stage = db.query(ProductionStage).filter(ProductionStage.stage_id == int(so.stage_id)).one_or_none()
-        stage_ref = _clean_ref1c(getattr(stage, "stage_ref1c", None)) or None
 
     # Structural unit of the piecework order = the line's resolved workshop
     # (production kind / manual assignment), not the stage chain. The document
@@ -180,12 +183,49 @@ def _piecework_operation_defaults(
             or None
         )
 
+    stage_ids = {
+        int(so.stage_id)
+        for so, _op in spec_operations
+        if getattr(so, "stage_id", None)
+    }
+    stages_by_id = {}
+    if stage_ids:
+        stages_by_id = {
+            int(stage.stage_id): _clean_ref1c(getattr(stage, "stage_ref1c", None)) or None
+            for stage in db.query(ProductionStage)
+            .filter(ProductionStage.stage_id.in_(stage_ids))
+            .all()
+        }
+
+    operation_lines: List[PieceworkOperationLine] = []
+    for so, op in spec_operations:
+        op_ref = _clean_ref1c(op.operation_ref1c)
+        if not op_ref:
+            continue
+        stage_ref = stages_by_id.get(int(so.stage_id)) if so.stage_id else None
+        operation_lines.append(
+            PieceworkOperationLine(
+                operation_ref1c=op_ref,
+                time_norm=float(so.time_norm if so.time_norm is not None else op.time_norm or 0),
+                price=float(op.operation_price or 0),
+                stage_ref1c=stage_ref,
+            )
+        )
+
+    if not operation_lines:
+        return PieceworkOperationDefaults(
+            spec_ref1c=spec_ref,
+            structural_unit_ref1c=structural_unit_ref,
+        )
+
+    first = operation_lines[0]
     return PieceworkOperationDefaults(
-        operation_ref1c=_clean_ref1c(op.operation_ref1c) or None,
-        time_norm=float(so.time_norm or op.time_norm or 0),
-        price=float(op.operation_price or 0),
+        operation_ref1c=first.operation_ref1c,
+        time_norm=first.time_norm,
+        price=first.price,
         spec_ref1c=spec_ref,
-        stage_ref1c=stage_ref,
+        stage_ref1c=first.stage_ref1c,
+        operation_lines=tuple(operation_lines),
         structural_unit_ref1c=structural_unit_ref,
     )
 
@@ -266,6 +306,7 @@ def _collect_export_entries(
             price=operation_defaults.price,
             spec_ref1c=operation_defaults.spec_ref1c,
             stage_ref1c=operation_defaults.stage_ref1c,
+            operation_lines=list(operation_defaults.operation_lines),
             structural_unit_ref1c=operation_defaults.structural_unit_ref1c,
             employee_ref1c=employee_ref,
             employee_type=employee_type,
@@ -287,16 +328,33 @@ def _build_header_payload(
 ) -> Dict[str, Any]:
     when = entry.document_datetime or _current_1c_datetime()
     entry.document_datetime = when
-    operation_ref = _clean_ref1c(operation_ref) or entry.operation_ref1c
-    if not operation_ref:
+    operation_ref = _clean_ref1c(operation_ref)
+    if operation_ref:
+        operation_lines = [
+            PieceworkOperationLine(
+                operation_ref1c=operation_ref,
+                time_norm=float(time_norm or entry.time_norm or 0.0),
+                price=float(price or entry.price or 0.0),
+                stage_ref1c=entry.stage_ref1c,
+            )
+        ]
+    else:
+        operation_lines = list(entry.operation_lines)
+        if not operation_lines and entry.operation_ref1c:
+            operation_lines = [
+                PieceworkOperationLine(
+                    operation_ref1c=entry.operation_ref1c,
+                    time_norm=float(entry.time_norm or 0.0),
+                    price=float(entry.price or 0.0),
+                    stage_ref1c=entry.stage_ref1c,
+                )
+            ]
+    if not operation_lines:
         raise ValueError(
             f"manufacture_id={entry.manufacture_id}: не найдена операция спецификации для сдельного наряда"
         )
-    time_norm = float(time_norm or entry.time_norm or 0.0)
     structural_unit_ref = structural_unit_ref or entry.structural_unit_ref1c
-    link_key = int(entry.manufacture_id) % 2_000_000_000
-    hours = entry.qty * time_norm
-    price = float(price or entry.price or 0.0)
+    base_link_key = int(entry.manufacture_id) % 2_000_000_000
 
     comment = (
         f"PRODPLAN source=piecework/{entry.manufacture_id}; "
@@ -304,39 +362,52 @@ def _build_header_payload(
         f"number={entry.number}"
     )
 
-    operation_row: Dict[str, Any] = {
-        "LineNumber": 1,
-        "Период": when,
-        "Номенклатура_Key": entry.item_ref1c,
-        "Операция_Key": operation_ref,
-        "КоличествоПлан": float(entry.qty),
-        "КоличествоФакт": float(entry.qty),
-        "НормаВремени": float(time_norm),
-        "Нормочасы": float(hours),
-        "КлючСвязи": link_key,
-    }
-    if price > 0:
-        operation_row["Расценка"] = float(price)
-        operation_row["Стоимость"] = float(entry.qty * price)
-    if entry.order_ref1c:
-        operation_row["ЗаказНаПроизводство_Key"] = entry.order_ref1c
-    if structural_unit_ref:
-        operation_row["СтруктурнаяЕдиница_Key"] = structural_unit_ref
-    if entry.spec_ref1c:
-        operation_row["Спецификация_Key"] = entry.spec_ref1c
-    if entry.stage_ref1c:
-        operation_row["Этап_Key"] = entry.stage_ref1c
-    if structural_unit_ref:
-        operation_row["ПодразделениеЗавершающегоЭтапа_Key"] = structural_unit_ref
-    _add_unit_payload(operation_row, entry.unit_ref1c)
     executor_type = (
         "StandardODATA.Catalog_Бригады"
         if entry.employee_type == "brigade"
         else "StandardODATA.Catalog_Сотрудники"
     )
-    if entry.employee_ref1c:
-        operation_row["Исполнитель"] = entry.employee_ref1c
-        operation_row["Исполнитель_Type"] = executor_type
+    operation_rows: List[Dict[str, Any]] = []
+    for idx, line in enumerate(operation_lines, start=1):
+        row_operation_ref = _clean_ref1c(line.operation_ref1c)
+        if not row_operation_ref:
+            continue
+        row_time_norm = float(line.time_norm or 0.0)
+        row_price = float(line.price or 0.0)
+        operation_row: Dict[str, Any] = {
+            "LineNumber": idx,
+            "Период": when,
+            "Номенклатура_Key": entry.item_ref1c,
+            "Операция_Key": row_operation_ref,
+            "КоличествоПлан": float(entry.qty),
+            "КоличествоФакт": float(entry.qty),
+            "НормаВремени": row_time_norm,
+            "Нормочасы": float(entry.qty) * row_time_norm,
+            "КлючСвязи": base_link_key + idx - 1,
+        }
+        if row_price > 0:
+            operation_row["Расценка"] = row_price
+            operation_row["Стоимость"] = float(entry.qty) * row_price
+        if entry.order_ref1c:
+            operation_row["ЗаказНаПроизводство_Key"] = entry.order_ref1c
+        if structural_unit_ref:
+            operation_row["СтруктурнаяЕдиница_Key"] = structural_unit_ref
+        if entry.spec_ref1c:
+            operation_row["Спецификация_Key"] = entry.spec_ref1c
+        if line.stage_ref1c:
+            operation_row["Этап_Key"] = line.stage_ref1c
+        if structural_unit_ref:
+            operation_row["ПодразделениеЗавершающегоЭтапа_Key"] = structural_unit_ref
+        _add_unit_payload(operation_row, entry.unit_ref1c)
+        if entry.employee_ref1c:
+            operation_row["Исполнитель"] = entry.employee_ref1c
+            operation_row["Исполнитель_Type"] = executor_type
+        operation_rows.append(operation_row)
+
+    if not operation_rows:
+        raise ValueError(
+            f"manufacture_id={entry.manufacture_id}: не найдена операция спецификации для сдельного наряда"
+        )
 
     payload: Dict[str, Any] = {
         "Number": entry.number,
@@ -345,7 +416,7 @@ def _build_header_payload(
         "Закрыт": True,
         "ДатаЗакрытия": when,
         "Комментарий": comment,
-        "Операции": [operation_row],
+        "Операции": operation_rows,
     }
     if entry.order_ref1c:
         payload["ЗаказНаПроизводство_Key"] = entry.order_ref1c
@@ -367,7 +438,7 @@ def _build_header_payload(
                     "LineNumber": 1,
                     "Сотрудник_Key": entry.employee_ref1c,
                     "КТУ": 1,
-                    "КлючСвязи": link_key,
+                    "КлючСвязи": base_link_key,
                     **({"СтруктурнаяЕдиница_Key": structural_unit_ref} if structural_unit_ref else {}),
                 }
             ]
