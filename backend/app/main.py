@@ -11,6 +11,7 @@ from app.routers import stages as stages_router
 from app.routers import specification as specification_router
 from app.routers import resources as resources_router
 from app.routers import production_control as production_control_router
+from app.routers import workshop_binding_review as workshop_binding_review_router
 
 import os
 import logging
@@ -44,6 +45,7 @@ app.include_router(stages_router.router, prefix="/api")
 app.include_router(specification_router.router, prefix="/api")
 app.include_router(resources_router.router, prefix="/api")
 app.include_router(production_control_router.router, prefix="/api")
+app.include_router(workshop_binding_review_router.router, prefix="/api")
 
 @app.get("/")
 async def root():
