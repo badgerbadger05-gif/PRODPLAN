@@ -47,6 +47,7 @@ from .workshop_resolution import (
 from .one_c_export_common import (
     DEFAULT_ORGANIZATION_REF1C,
     DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C,
+    EMPTY_REF1C,
     add_unit_payload as _add_unit_payload,
     clean_ref1c as _clean_ref1c,
     config_ref1c as _config_ref1c,
@@ -513,6 +514,8 @@ def _build_header_payload(
                 }
             ]
     elif has_row_executor:
+        payload["Исполнитель"] = EMPTY_REF1C
+        payload["Исполнитель_Type"] = "StandardODATA.Catalog_Сотрудники"
         payload["ПоложениеИсполнителя"] = "ВТабличнойЧасти"
 
     return payload

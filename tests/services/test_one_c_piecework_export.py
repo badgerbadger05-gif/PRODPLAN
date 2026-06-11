@@ -296,7 +296,7 @@ def test_brigade_executor_uses_brigade_type_and_composition(db_session, monkeypa
 
     assert result["manufactures_created"] == 1
     payload = fake.posts[0][1]
-    assert "Исполнитель" not in payload
+    assert payload["Исполнитель"] == exporter.EMPTY_REF1C
     assert payload["ПоложениеИсполнителя"] == "ВТабличнойЧасти"
     assert payload["Операции"][0]["Исполнитель"] == "brigade-ref"
     assert payload["Операции"][0]["Исполнитель_Type"] == "StandardODATA.Catalog_Бригады"
@@ -350,7 +350,7 @@ def test_single_executor_is_written_to_operation_rows(db_session, monkeypatch):
 
     assert result["manufactures_created"] == 1
     payload = fake.posts[0][1]
-    assert "Исполнитель" not in payload
+    assert payload["Исполнитель"] == exporter.EMPTY_REF1C
     assert payload["ПоложениеИсполнителя"] == "ВТабличнойЧасти"
     assert payload["Операции"][0]["Исполнитель"] == "employee-ref"
     assert payload["Операции"][0]["Исполнитель_Type"] == "StandardODATA.Catalog_Сотрудники"
