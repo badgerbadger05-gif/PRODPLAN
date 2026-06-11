@@ -298,7 +298,8 @@ def test_brigade_executor_uses_brigade_type_and_composition(db_session, monkeypa
     payload = fake.posts[0][1]
     assert payload["Исполнитель"] == "brigade-ref"
     assert payload["Исполнитель_Type"] == "StandardODATA.Catalog_Бригады"
-    assert payload["Операции"][0]["Исполнитель_Type"] == "StandardODATA.Catalog_Бригады"
+    assert "Исполнитель" not in payload["Операции"][0]
+    assert "Исполнитель_Type" not in payload["Операции"][0]
     assert [row["Сотрудник_Key"] for row in payload["СоставБригады"]] == [
         "member-ref-1",
         "member-ref-2",
@@ -322,6 +323,41 @@ def test_optional_org_and_unit_in_payload(db_session):
     assert payload["Организация_Key"] == "org-ref-abc"
     assert payload["СтруктурнаяЕдиница_Key"] == "unit-ref-abc"
     assert payload["Операции"][0]["СтруктурнаяЕдиница_Key"] == "unit-ref-abc"
+
+
+def test_single_executor_is_written_to_header_not_operation_rows(db_session, monkeypatch):
+    db = db_session
+    item = _mk_item(db, code="PW-HEADER-EXEC", ref1c="item-ref-header-exec")
+    m = _mk_manufacture(db, item, exported_ref1c="ref-header-exec")
+    db.add(
+        Employee(
+            employee_ref1c="employee-ref",
+            employee_type="employee",
+            employee_code="000000023",
+            employee_name="Иванов",
+            deletion_mark=False,
+        )
+    )
+    db.commit()
+
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    fake = _FakeClient(ref_key="pw-header-exec-ref")
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    result = exporter.export_piecework_to_1c(
+        db,
+        [m.manufacture_id],
+        operation_ref="op-ref",
+        dry_run=False,
+        allow_production=True,
+    )
+
+    assert result["manufactures_created"] == 1
+    payload = fake.posts[0][1]
+    assert payload["Исполнитель"] == "employee-ref"
+    assert payload["Исполнитель_Type"] == "StandardODATA.Catalog_Сотрудники"
+    assert "Исполнитель" not in payload["Операции"][0]
+    assert "Исполнитель_Type" not in payload["Операции"][0]
 
 
 # ---------------------------------------------------------------------------

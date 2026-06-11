@@ -75,6 +75,8 @@ class PieceworkOperationLine:
     time_norm: float = 0.0
     price: float = 0.0
     stage_ref1c: Optional[str] = None
+    employee_ref1c: Optional[str] = None
+    employee_type: str = "employee"
 
 
 @dataclass
@@ -362,7 +364,7 @@ def _build_header_payload(
         f"number={entry.number}"
     )
 
-    executor_type = (
+    header_executor_type = (
         "StandardODATA.Catalog_Бригады"
         if entry.employee_type == "brigade"
         else "StandardODATA.Catalog_Сотрудники"
@@ -399,9 +401,14 @@ def _build_header_payload(
         if structural_unit_ref:
             operation_row["ПодразделениеЗавершающегоЭтапа_Key"] = structural_unit_ref
         _add_unit_payload(operation_row, entry.unit_ref1c)
-        if entry.employee_ref1c:
-            operation_row["Исполнитель"] = entry.employee_ref1c
-            operation_row["Исполнитель_Type"] = executor_type
+        row_executor_ref = _clean_ref1c(line.employee_ref1c)
+        if row_executor_ref:
+            operation_row["Исполнитель"] = row_executor_ref
+            operation_row["Исполнитель_Type"] = (
+                "StandardODATA.Catalog_Бригады"
+                if line.employee_type == "brigade"
+                else "StandardODATA.Catalog_Сотрудники"
+            )
         operation_rows.append(operation_row)
 
     if not operation_rows:
@@ -431,7 +438,7 @@ def _build_header_payload(
         payload["ХозяйственнаяОперация_Key"] = business_operation_ref
     if entry.employee_ref1c:
         payload["Исполнитель"] = entry.employee_ref1c
-        payload["Исполнитель_Type"] = executor_type
+        payload["Исполнитель_Type"] = header_executor_type
         if entry.employee_type != "brigade":
             payload["СоставБригады"] = [
                 {
