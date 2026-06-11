@@ -1198,6 +1198,11 @@ def update_line_state(db: Session, product_id: int, payload: Dict[str, Any]) -> 
         status = str(payload.get("status")).strip()
         if status not in LINE_STATUSES:
             raise ValueError(f"Недопустимый статус: {status}")
+        if status == "completed" and (
+            _to_float(product.remaining_qty) > 1e-9
+            or _to_float(product.produced_qty) <= 1e-9
+        ):
+            raise ValueError("Нельзя вручную завершить строку с невыпущенным остатком. Используйте выпуск.")
         state.status = status
         # First time the journal moves the line past 'shortage' / 'partial',
         # stamp opened_at вЂ” it acts as a workshop-side timestamp.

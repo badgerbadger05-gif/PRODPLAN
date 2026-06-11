@@ -2,6 +2,8 @@
 
 from datetime import date
 
+import pytest
+
 from app.models import (
     DefaultSpecification,
     Item,
@@ -98,13 +100,13 @@ def _make_requirement_with_line(db, item, *, net, covered, produced, quantity):
 # Part 1 — covered_qty rollback
 # ---------------------------------------------------------------------------
 
-def test_closing_partial_line_releases_requirement_coverage(db_session):
+def test_cancelling_partial_line_releases_requirement_coverage(db_session):
     item = _make_production_item(db_session, "P-CLOSE")
     req, product = _make_requirement_with_line(
         db_session, item, net=40, covered=40, produced=10, quantity=40
     )
 
-    update_line_state(db_session, product.product_id, {"status": "completed"})
+    update_line_state(db_session, product.product_id, {"status": "cancelled"})
 
     db_session.refresh(req)
     db_session.refresh(product)
@@ -112,6 +114,22 @@ def test_closing_partial_line_releases_requirement_coverage(db_session):
     # 30 un-produced units released back into the requirement's open demand.
     assert float(req.covered_qty) == 10.0
     assert float(req.remaining_qty) == 30.0
+
+
+def test_manual_completed_rejects_unproduced_remainder(db_session):
+    item = _make_production_item(db_session, "P-COMPLETE-GUARD")
+    req, product = _make_requirement_with_line(
+        db_session, item, net=40, covered=40, produced=10, quantity=40
+    )
+
+    with pytest.raises(ValueError, match="Нельзя вручную завершить"):
+        update_line_state(db_session, product.product_id, {"status": "completed"})
+
+    db_session.refresh(req)
+    db_session.refresh(product)
+    assert float(product.remaining_qty) == 30.0
+    assert float(req.covered_qty) == 40.0
+    assert float(req.remaining_qty) == 0.0
 
 
 def test_closing_fully_produced_line_releases_nothing(db_session):
@@ -194,7 +212,7 @@ def test_reconcile_tops_up_after_partial_close(db_session):
     res = reconcile_snapshot(db_session, run_id)
     assert res["production_added"] == []
 
-    # Produce 10, close the line: 30 un-produced units are released; the 10
+    # Produce 10, cancel the line: 30 un-produced units are released; the 10
     # produced are returned to stock (simulate the stock effect).
     product = (
         db_session.query(ProductionProduct)
@@ -204,7 +222,7 @@ def test_reconcile_tops_up_after_partial_close(db_session):
     product.produced_qty = 10
     product.remaining_qty = 30
     db_session.flush()
-    update_line_state(db_session, product.product_id, {"status": "completed"})
+    update_line_state(db_session, product.product_id, {"status": "cancelled"})
     item.stock_qty = 10
     db_session.commit()
 

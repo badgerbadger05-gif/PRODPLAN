@@ -15,6 +15,8 @@ type Props = {
   onToggleSort: (key: ProductionOrderSortKey) => void
 }
 
+const manualProductionStatusOptions = productionStatusOptions.filter(([value]) => value !== 'completed')
+
 function ForecastShift({ row }: { row: OrderRow }) {
   if (row.forecast_shift_days === null || row.forecast_shift_days === undefined) return null
   const days = Number(row.forecast_shift_days)
@@ -98,7 +100,7 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
             </td>
             <td>
               <select value={productionStatusSelectValue(row.status)} onChange={(e) => onChangeStatus(row, e.target.value)} onClick={(e) => e.stopPropagation()}>
-                {productionStatusOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                {manualProductionStatusOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
               </select>
             </td>
             <td>
