@@ -31,6 +31,7 @@ from app.models import (
     SyncLink,
     ItemWarehouseStock,
     IgnoredWarehouse,
+    WorkshopWarehouseBinding,
 )
 from app.routers.production_control import list_employees
 from app.services.production_control_journal import (
@@ -2685,6 +2686,145 @@ def test_create_material_issues_splits_components_by_source_warehouse(db_session
         comp_a.item_id,
         comp_b.item_id,
     }
+
+
+def test_create_material_issues_skips_component_already_on_destination_warehouse(db_session):
+    workshop = ProductionResource(resource_name="Участок сборки")
+    db_session.add(workshop)
+    db_session.flush()
+
+    parent = Item(item_code="DST-PARENT", item_name="Parent", item_article="DST-P", unit="шт", stock_qty=0, status="active")
+    comp = Item(item_code="DST-C", item_name="Comp", item_article="DST-C", unit="шт", stock_qty=0, status="active")
+    db_session.add_all([parent, comp])
+    db_session.flush()
+    spec = Specification(spec_name="DST spec", spec_ref1c="dst-spec")
+    db_session.add(spec)
+    db_session.flush()
+    db_session.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=2))
+
+    order = ProductionOrder(order_number="DST-001", order_date=datetime(2026, 5, 20), is_posted=True, deletion_mark=False)
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(order_id=order.order_id, item_id=parent.item_id, line_number=1, quantity=1, produced_qty=0, remaining_qty=1)
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(ProductionOrderLineState(product_id=product.product_id, workshop_id=workshop.resource_id))
+    db_session.add(WorkshopWarehouseBinding(workshop_id=workshop.resource_id, warehouse_ref1c="WH-DEST"))
+    db_session.add(StockWarehouse(warehouse_ref1c="WH-DEST", warehouse_code="DEST", warehouse_name="Участок", is_selected=True))
+    db_session.add(ItemWarehouseStock(item_id=comp.item_id, warehouse_ref1c="WH-DEST", qty=2))
+    db_session.commit()
+
+    result = create_material_issues(db_session, [product.product_id], initiated_by="op")
+
+    assert len(result["created"]) == 1
+    assert result["created"][0]["direction"] == "in_place"
+    assert result["reused"] == []
+    assert result["selection_required"] == []
+    assert result["errors"] == []
+    assert result["already_on_destination"][0]["components"][0]["covered_qty"] == 2
+    issue = db_session.query(ProductionMaterialIssue).one()
+    assert issue.direction == "in_place"
+    assert issue.status == "posted"
+    assert issue.warehouse_ref1c == "WH-DEST"
+    assert issue.lines[0].required_qty == 2
+    assert issue.lines[0].issued_qty == 2
+
+
+def test_create_material_issues_moves_only_missing_qty_when_partially_on_destination(db_session):
+    workshop = ProductionResource(resource_name="Участок частичного покрытия")
+    db_session.add(workshop)
+    db_session.flush()
+
+    parent = Item(item_code="PART-PARENT", item_name="Parent", item_article="PART-P", unit="шт", stock_qty=0, status="active")
+    comp = Item(item_code="PART-C", item_name="Comp", item_article="PART-C", unit="шт", stock_qty=0, status="active")
+    db_session.add_all([parent, comp])
+    db_session.flush()
+    spec = Specification(spec_name="PART spec", spec_ref1c="part-spec")
+    db_session.add(spec)
+    db_session.flush()
+    db_session.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=5))
+
+    order = ProductionOrder(order_number="PART-001", order_date=datetime(2026, 5, 20), is_posted=True, deletion_mark=False)
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(order_id=order.order_id, item_id=parent.item_id, line_number=1, quantity=1, produced_qty=0, remaining_qty=1)
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(ProductionOrderLineState(product_id=product.product_id, workshop_id=workshop.resource_id))
+    db_session.add(WorkshopWarehouseBinding(workshop_id=workshop.resource_id, warehouse_ref1c="WH-DEST"))
+    db_session.add_all([
+        StockWarehouse(warehouse_ref1c="WH-DEST", warehouse_code="DEST", warehouse_name="Участок", is_selected=True),
+        StockWarehouse(warehouse_ref1c="WH-SRC", warehouse_code="SRC", warehouse_name="Склад", is_selected=True),
+    ])
+    db_session.add_all([
+        ItemWarehouseStock(item_id=comp.item_id, warehouse_ref1c="WH-DEST", qty=2),
+        ItemWarehouseStock(item_id=comp.item_id, warehouse_ref1c="WH-SRC", qty=10),
+    ])
+    db_session.commit()
+
+    result = create_material_issues(db_session, [product.product_id], initiated_by="op")
+
+    assert len(result["created"]) == 2
+    assert {row.get("direction", "issue") for row in result["created"]} == {"in_place", "issue"}
+    assert result["already_on_destination"][0]["components"][0]["covered_qty"] == 2
+    issues = db_session.query(ProductionMaterialIssue).order_by(ProductionMaterialIssue.issue_id).all()
+    assert [issue.direction for issue in issues] == ["in_place", "issue"]
+    assert issues[0].source_warehouse_ref1c == "WH-DEST"
+    assert issues[0].lines[0].required_qty == 2
+    assert issues[0].lines[0].issued_qty == 2
+    assert issues[1].source_warehouse_ref1c == "WH-SRC"
+    assert issues[1].lines[0].required_qty == 3
+
+
+def test_create_material_issues_does_not_reuse_destination_stock_for_multiple_products(db_session):
+    workshop = ProductionResource(resource_name="Участок общего остатка")
+    db_session.add(workshop)
+    db_session.flush()
+
+    parent = Item(item_code="SHARED-PARENT", item_name="Parent", item_article="SHARED-P", unit="шт", stock_qty=0, status="active")
+    comp = Item(item_code="SHARED-C", item_name="Comp", item_article="SHARED-C", unit="шт", stock_qty=0, status="active")
+    db_session.add_all([parent, comp])
+    db_session.flush()
+    spec = Specification(spec_name="SHARED spec", spec_ref1c="shared-spec")
+    db_session.add(spec)
+    db_session.flush()
+    db_session.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=2))
+
+    order = ProductionOrder(order_number="SHARED-001", order_date=datetime(2026, 5, 20), is_posted=True, deletion_mark=False)
+    db_session.add(order)
+    db_session.flush()
+    products = []
+    for line_number in (1, 2):
+        product = ProductionProduct(order_id=order.order_id, item_id=parent.item_id, line_number=line_number, quantity=1, produced_qty=0, remaining_qty=1)
+        db_session.add(product)
+        db_session.flush()
+        db_session.add(ProductionOrderLineState(product_id=product.product_id, workshop_id=workshop.resource_id))
+        products.append(product)
+    db_session.add(WorkshopWarehouseBinding(workshop_id=workshop.resource_id, warehouse_ref1c="WH-DEST"))
+    db_session.add_all([
+        StockWarehouse(warehouse_ref1c="WH-DEST", warehouse_code="DEST", warehouse_name="Участок", is_selected=True),
+        StockWarehouse(warehouse_ref1c="WH-SRC", warehouse_code="SRC", warehouse_name="Склад", is_selected=True),
+    ])
+    db_session.add_all([
+        ItemWarehouseStock(item_id=comp.item_id, warehouse_ref1c="WH-DEST", qty=2),
+        ItemWarehouseStock(item_id=comp.item_id, warehouse_ref1c="WH-SRC", qty=10),
+    ])
+    db_session.commit()
+
+    result = create_material_issues(db_session, [p.product_id for p in products], initiated_by="op")
+
+    assert len(result["created"]) == 2
+    assert {row.get("direction", "issue") for row in result["created"]} == {"in_place", "issue"}
+    assert len(result["already_on_destination"]) == 1
+    issues = db_session.query(ProductionMaterialIssue).order_by(ProductionMaterialIssue.issue_id).all()
+    assert [issue.direction for issue in issues] == ["in_place", "issue"]
+    assert issues[0].product_id == products[0].product_id
+    assert issues[0].lines[0].required_qty == 2
+    assert issues[1].product_id == products[1].product_id
+    assert issues[1].lines[0].required_qty == 2
 
 
 def test_create_material_issues_asks_when_component_has_multiple_source_warehouses(db_session):

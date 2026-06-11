@@ -260,6 +260,76 @@ def _allocate_components_by_source_warehouse(
     return groups, []
 
 
+def _destination_stock_by_component(
+    db: Session,
+    components: List[Dict[str, Any]],
+    destination_warehouse_ref1c: Optional[str],
+) -> Dict[int, float]:
+    destination_ref = _clean_ref1c(destination_warehouse_ref1c)
+    if not destination_ref or not components:
+        return {}
+    component_ids = sorted({int(comp["component_item_id"]) for comp in components})
+    rows = (
+        db.query(ItemWarehouseStock.item_id, func.sum(ItemWarehouseStock.qty))
+        .filter(
+            ItemWarehouseStock.item_id.in_(component_ids),
+            ItemWarehouseStock.warehouse_ref1c == destination_ref,
+            ItemWarehouseStock.qty > 0,
+        )
+        .group_by(ItemWarehouseStock.item_id)
+        .all()
+    )
+    return {int(item_id): _to_float(qty) for item_id, qty in rows}
+
+
+def _components_still_to_move(
+    db: Session,
+    components: List[Dict[str, Any]],
+    destination_warehouse_ref1c: Optional[str],
+    consumed_destination_stock: Optional[Dict[Tuple[str, int], float]] = None,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Do not create a transfer for quantities that are already on the recipient
+    workshop warehouse. If the workshop has a partial balance, move only the
+    missing remainder.
+    """
+    destination_stock = _destination_stock_by_component(db, components, destination_warehouse_ref1c)
+    if not destination_stock:
+        return components, []
+
+    destination_ref = _clean_ref1c(destination_warehouse_ref1c)
+    consumed_destination_stock = consumed_destination_stock if consumed_destination_stock is not None else {}
+    to_move: List[Dict[str, Any]] = []
+    already_on_destination: List[Dict[str, Any]] = []
+    for comp in components:
+        component_id = int(comp["component_item_id"])
+        required_qty = _to_float(comp.get("required_qty"))
+        consumed_key = (destination_ref, component_id)
+        available_qty = max(destination_stock.get(component_id, 0.0) - consumed_destination_stock.get(consumed_key, 0.0), 0.0)
+        covered_qty = min(required_qty, available_qty)
+        if covered_qty > 1e-9:
+            consumed_destination_stock[consumed_key] = consumed_destination_stock.get(consumed_key, 0.0) + covered_qty
+            already_on_destination.append(
+                {
+                    "component_item_id": component_id,
+                    "item_name": str(comp.get("item_name") or ""),
+                    "item_article": str(comp.get("item_article") or ""),
+                    "required_qty": required_qty,
+                    "covered_qty": covered_qty,
+                    "remaining_qty": max(required_qty - covered_qty, 0.0),
+                    "warehouse_ref1c": _clean_ref1c(destination_warehouse_ref1c),
+                }
+            )
+        if available_qty + 1e-9 >= required_qty:
+            continue
+        next_comp = dict(comp)
+        next_comp["required_qty"] = max(required_qty - available_qty, 0.0)
+        if _to_float(next_comp.get("required_qty")) > 1e-9:
+            to_move.append(next_comp)
+
+    return to_move, already_on_destination
+
+
 def _next_issue_number(db: Session) -> str:
     today = datetime.utcnow().strftime("%Y%m%d")
     prefix = f"MI-{today}-"
@@ -661,6 +731,8 @@ def create_material_issues(
     reused: List[Dict[str, Any]] = []
     selection_required: List[Dict[str, Any]] = []
     errors: List[str] = []
+    already_on_destination: List[Dict[str, Any]] = []
+    consumed_destination_stock: Dict[Tuple[str, int], float] = {}
     for pid in product_ids:
         product = (
             db.query(ProductionProduct)
@@ -734,6 +806,14 @@ def create_material_issues(
             resolved_warehouse,
             reservation_state,
         )
+        destination_ref = _clean_ref1c(resolved_warehouse)
+        if destination_ref:
+            for cid, qty in list(free_dest.items()):
+                consumed_key = (destination_ref, int(cid))
+                free_dest[int(cid)] = max(
+                    _to_float(qty) - _to_float(consumed_destination_stock.get(consumed_key, 0.0)),
+                    0.0,
+                )
         claims: List[Dict[str, Any]] = []
         transfer_components: List[Dict[str, Any]] = []
         for comp in outstanding_components:
@@ -742,6 +822,11 @@ def create_material_issues(
             remainder = _to_float(comp["required_qty"]) - claim_qty
             if claim_qty > 1e-9:
                 claims.append({**comp, "claim_qty": claim_qty})
+                if destination_ref:
+                    consumed_key = (destination_ref, cid)
+                    consumed_destination_stock[consumed_key] = (
+                        _to_float(consumed_destination_stock.get(consumed_key, 0.0)) + claim_qty
+                    )
             if remainder > 1e-9:
                 transfer_components.append({**comp, "required_qty": remainder})
 
@@ -766,6 +851,29 @@ def create_material_issues(
                 continue
 
         if claims:
+            already_on_destination.append(
+                {
+                    "product_id": int(product.product_id),
+                    "order_number": str(product.order.order_number or ""),
+                    "item_name": str(product.item.item_name or ""),
+                    "warehouse_ref1c": _clean_ref1c(resolved_warehouse),
+                    "components": [
+                        {
+                            "component_item_id": int(comp["component_item_id"]),
+                            "item_name": str(comp.get("item_name") or ""),
+                            "item_article": str(comp.get("item_article") or ""),
+                            "required_qty": _to_float(comp.get("required_qty")),
+                            "covered_qty": _to_float(comp.get("claim_qty")),
+                            "remaining_qty": max(
+                                _to_float(comp.get("required_qty")) - _to_float(comp.get("claim_qty")),
+                                0.0,
+                            ),
+                            "warehouse_ref1c": _clean_ref1c(resolved_warehouse),
+                        }
+                        for comp in claims
+                    ],
+                }
+            )
             claim_issue = _claim_components_in_place(
                 db,
                 product,
@@ -869,6 +977,7 @@ def create_material_issues(
         "created": created,
         "reused": reused,
         "selection_required": selection_required,
+        "already_on_destination": already_on_destination,
         "errors": errors,
     }
 

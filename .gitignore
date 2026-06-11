@@ -3,6 +3,7 @@
 
 # Local temporary files
 .tmp/
+.tmp_invest/
 .tmp_items.json
 .tmp_preview.json
 tmp/

@@ -17,6 +17,7 @@ from app.models import (
     SpecComponent,
     Specification,
     SyncLink,
+    Unit,
 )
 from app.services import one_c_stock_transfer_export as exporter
 from app.services.one_c_document_numbers import material_issue_number
@@ -47,7 +48,7 @@ def _mk_issue(
     *,
     parent: Item,
     component: Item,
-    source_wh: str | None = None,
+    source_wh: str | None = "src-wh",
     dest_wh: str | None = None,
     status: str = "draft",
 ) -> ProductionMaterialIssue:
@@ -177,8 +178,7 @@ def test_dry_run_returns_payload_with_both_structural_units(db_session, monkeypa
     assert payload["ДокументОснование_Type"] == "StandardODATA.Document_ЗаказНаПроизводство"
     [stock_line] = payload["Запасы"]
     assert stock_line["Номенклатура_Key"] == "comp-ref-1"
-    assert stock_line["ЕдиницаИзмерения"] == comp.unit
-    assert stock_line["ЕдиницаИзмерения_Type"] == "StandardODATA.Catalog_КлассификаторЕдиницИзмерения"
+    assert "ЕдиницаИзмерения" not in stock_line
     assert stock_line["СтавкаНДС_Key"] == exporter.DEFAULT_STOCK_TRANSFER_VAT_RATE_REF1C
     assert stock_line["КлючСвязи"] == 1
     assert float(stock_line["Количество"]) == 5.0
@@ -186,6 +186,35 @@ def test_dry_run_returns_payload_with_both_structural_units(db_session, monkeypa
 
     # No sync_link writes during dry-run.
     assert db.query(SyncLink).filter_by(source_doctype="material_issue").count() == 0
+
+
+def test_text_unit_is_resolved_to_classifier_guid(db_session, monkeypatch):
+    db = db_session
+    unit_ref = "aae0017c-991b-11eb-e39a-fa163e61326a"
+    db.add(Unit(unit_ref1c=unit_ref, unit_name="шт", short_name="шт", unit_code="796"))
+    db.commit()
+    parent = _mk_item(db, code="TRP-TXT-UNIT", ref1c="parent-text-unit-ref")
+    comp = _mk_item(db, code="TRC-TXT-UNIT", ref1c="comp-text-unit-ref")
+    comp.unit = "шт"
+    issue = _mk_issue(
+        db,
+        parent=parent,
+        component=comp,
+        source_wh="src-text-unit-wh",
+        dest_wh="dst-text-unit-wh",
+    )
+
+    monkeypatch.setattr(
+        exporter,
+        "OData1CClient",
+        lambda **_: pytest.fail("Network client must not be instantiated in dry-run"),
+    )
+
+    result = exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=True)
+
+    [stock_line] = result["payloads"][0]["payload"]["Запасы"]
+    assert stock_line["ЕдиницаИзмерения"] == unit_ref
+    assert stock_line["ЕдиницаИзмерения_Type"] == "StandardODATA.Catalog_КлассификаторЕдиницИзмерения"
 
 
 def test_apply_payload_fills_source_storage_cell_from_live_1c_balance(db_session, monkeypatch):
@@ -334,9 +363,8 @@ def test_chain_full_apply_exports_order_then_transfer(db_session, monkeypatch):
     assert transfer_posts[0][1]["ДокументОснование_Type"] == "StandardODATA.Document_ЗаказНаПроизводство"
 
 
-def test_payload_defaults_destination_when_unset(db_session, monkeypatch):
-    """If source/destination aren't known, still fill the ZSM destination
-    default so 1C can create a valid draft."""
+def test_export_skips_issue_when_source_warehouse_unset(db_session, monkeypatch):
+    """Transfers without a source warehouse must not become 1C documents."""
     db = db_session
     parent = _mk_item(db, code="TRP2", ref1c="parent-ref-2")
     comp = _mk_item(db, code="TRC2", ref1c="comp-ref-2")
@@ -344,9 +372,9 @@ def test_payload_defaults_destination_when_unset(db_session, monkeypatch):
 
     monkeypatch.setattr(exporter, "OData1CClient", lambda **_: pytest.fail("no network"))
     result = exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=True)
-    payload = result["payloads"][0]["payload"]
-    assert "СтруктурнаяЕдиница_Key" not in payload
-    assert payload["СтруктурнаяЕдиницаПолучатель_Key"]
+    assert result["payloads"] == []
+    assert result["issues_eligible"] == 0
+    assert result["skipped_rows"][0]["reason"] == "склад отправитель пуст — перемещение в 1С не сформировано"
 
 
 def test_demo_guard_refuses_non_demo_without_override(db_session, monkeypatch):

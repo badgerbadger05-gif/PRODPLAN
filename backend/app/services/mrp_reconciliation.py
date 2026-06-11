@@ -22,12 +22,14 @@ Nothing is sent to 1C here — that stays a user action (see
 
 Idempotency
 -----------
-The recompute reuses ``_explode_bom_net_first``, which nets gross demand against
-current stock **and open WIP** (open journal lines with ``remaining_qty > 0``).
-So once this service materialises a catch-up production order, that order becomes
-open WIP and the next run nets it out — the gap returns to zero and no duplicate
-is created. For purchases, the gap is additionally deduped against supplier
-orders already arriving and ``PlannedPurchase`` rows already present in the run.
+The snapshot's gross demand is re-derived from its anchored level-0 roots
+through current stock (``_current_snapshot_gross_by_item``), then the gap is
+sized as ``net - open WIP`` (open journal lines with ``remaining_qty > 0``,
+both 1C and local). So once this service materialises a catch-up production
+order, that order becomes open WIP and the next run nets it out — the gap
+returns to zero and no duplicate is created. For purchases, the gap is
+additionally deduped against supplier orders already arriving and
+``PlannedPurchase`` rows already present in the run.
 """
 from __future__ import annotations
 
@@ -365,13 +367,26 @@ def _current_snapshot_gross_by_item(
     stock_by_item: Dict[int, float],
 ) -> tuple[Dict[int, float], Dict[int, int]]:
     """
-    Recompute fixed-snapshot gross demand after parent net demand drift.
+    Recompute fixed-snapshot gross demand from its level-0 roots through
+    current stock.
 
-    A child requirement's stored total_required_qty was derived from the
-    parent's net_required_qty at snapshot time. If current stock changes the
-    parent's net, the child gross must move by the same delta through BOM.
+    Roots (bom_level 0) stay anchored to the frozen snapshot gross — the plan
+    is not re-read. Each deeper node's gross is re-derived top-down as the sum
+    of parent explode quantities, where a parent explodes
+    ``max(gross - stock, 0)``: only physical stock stops the BOM explosion,
+    open WIP does not — producing an open parent order still consumes its
+    components (same rule as ``_explode_bom_net_first``'s explode_buckets).
+
+    The previous implementation kept each child's frozen gross and added the
+    parent's drift versus the snapshot bucket *net* — a stock+WIP-netted
+    baseline. Comparing an after-stock current value against an after-stock-
+    and-WIP baseline counted everything covered by open parent orders at
+    snapshot time as new demand, inflating the whole component subtree of any
+    WIP-covered parent on every reconcile cycle.
+
+    Requirements the explosion no longer reaches get gross 0, so their net
+    (and hence local order coverage) is zeroed downstream.
     """
-    req_by_item = {int(req.item_id): req for req in requirements}
     bom_level_by_item = {
         int(req.item_id): int(req.bom_level or 0)
         for req in requirements
@@ -379,19 +394,7 @@ def _current_snapshot_gross_by_item(
     current_gross = {
         int(req.item_id): _to_float(req.total_required_qty)
         for req in requirements
-    }
-
-    run_id = int(requirements[0].run_id)
-    item_ids = list(req_by_item)
-    saved_net_by_item = {
-        int(item_id): _to_float(qty)
-        for item_id, qty in (
-            db.query(MrpRequirementBucket.item_id, func.sum(MrpRequirementBucket.net_qty))
-            .filter(MrpRequirementBucket.run_id == run_id)
-            .filter(MrpRequirementBucket.item_id.in_(item_ids))
-            .group_by(MrpRequirementBucket.item_id)
-            .all()
-        )
+        if int(req.bom_level or 0) == 0
     }
 
     processed: set[int] = set()
@@ -431,19 +434,11 @@ def _current_snapshot_gross_by_item(
             children = components_by_spec.get(spec_id, [])
             if not children:
                 continue
-            parent_current_net = max(
+            parent_explode_qty = max(
                 _to_float(current_gross.get(parent_id, 0.0)) - _to_float(stock_by_item.get(parent_id, 0.0)),
                 0.0,
             )
-            parent_req = req_by_item.get(parent_id)
-            parent_saved_net = _to_float(
-                saved_net_by_item.get(
-                    parent_id,
-                    parent_req.net_required_qty if parent_req is not None else 0.0,
-                )
-            )
-            parent_net_delta = parent_current_net - parent_saved_net
-            if abs(parent_net_delta) <= EPS:
+            if parent_explode_qty <= EPS:
                 continue
             parent_level = bom_level_by_item.get(parent_id, 0)
             for child_id, qty_per_unit in children:
@@ -454,10 +449,12 @@ def _current_snapshot_gross_by_item(
                     continue
                 if child_level is None:
                     bom_level_by_item[child_id] = parent_level + 1
-                current_gross[child_id] = max(
-                    _to_float(current_gross.get(child_id, 0.0)) + parent_net_delta * qty_per_unit,
-                    0.0,
+                current_gross[child_id] = (
+                    _to_float(current_gross.get(child_id, 0.0)) + parent_explode_qty * qty_per_unit
                 )
+
+    for req in requirements:
+        current_gross.setdefault(int(req.item_id), 0.0)
 
     return current_gross, bom_level_by_item
 
