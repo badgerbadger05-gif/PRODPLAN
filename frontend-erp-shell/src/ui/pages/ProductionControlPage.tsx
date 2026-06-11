@@ -318,14 +318,22 @@ export function ProductionControlPage() {
     ].filter(Boolean)
   }
 
-  function openRouteSheets(ids: number[]) {
-    if (!ids.length) return
+  function prepareRouteSheetWindow() {
     const printWindow = window.open('', '_blank')
     if (!printWindow) {
       setError('Браузер заблокировал окно печати. Разрешите всплывающие окна для PRODPLAN.')
-      return
+      return null
     }
     printWindow.document.write('<!doctype html><title>Маршрутные листы</title><body>Загрузка...</body>')
+    return printWindow
+  }
+
+  function closeRouteSheetWindow(printWindow: Window | null) {
+    if (printWindow && !printWindow.closed) printWindow.close()
+  }
+
+  function renderRouteSheets(ids: number[], printWindow: Window | null) {
+    if (!ids.length || !printWindow || printWindow.closed) return
     void fetch('/api/v1/production-control/route-sheets/print', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -340,9 +348,14 @@ export function ProductionControlPage() {
         window.setTimeout(() => void load(offsetRef.current), 1200)
       })
       .catch((e) => {
-        printWindow.close()
+        closeRouteSheetWindow(printWindow)
         setError(e instanceof Error ? e.message : String(e))
       })
+  }
+
+  function openRouteSheets(ids: number[]) {
+    if (!ids.length) return
+    renderRouteSheets(ids, prepareRouteSheetWindow())
   }
 
   async function createMaterialIssues(sourceWarehouseRef?: string, productIds?: number[]) {
@@ -395,11 +408,13 @@ export function ProductionControlPage() {
     setLoading(true)
     setError('')
     setMessage('')
+    const printWindow = prepareRouteSheetWindow()
     try {
       const issueResult = await requestMaterialIssues(sourceWarehouseRef, ids)
       const selectionRequired = issueResult.selection_required ?? []
       const alreadyOnDestination = issueResult.already_on_destination?.reduce((sum, row) => sum + (row.components?.length ?? 0), 0) ?? 0
       if (selectionRequired.length > 0) {
+        closeRouteSheetWindow(printWindow)
         showWarehousePicker(issueResult, 'export', ids)
         setMessage(`${alreadyOnDestination ? `Уже на участке: ${alreadyOnDestination}. ` : ''}Для ${selectionRequired.length} поз. нужно выбрать склад-источник перед выгрузкой в 1С.`)
         await load(offsetRef.current)
@@ -407,6 +422,7 @@ export function ProductionControlPage() {
       }
       const issueIds = issueIdsFromCreateResult(issueResult)
       if (!issueIds.length) {
+        closeRouteSheetWindow(printWindow)
         const errors = issueResult.errors?.length ?? 0
         setMessage(`Запуск в 1С: заявок на перемещение не создано${alreadyOnDestination ? `, уже на участке ${alreadyOnDestination}` : ''}${errors ? `, ошибок ${errors}` : ''}`)
         await load(offsetRef.current)
@@ -434,10 +450,15 @@ export function ProductionControlPage() {
         const detail = firstExportProblem(result, parent)
         throw new Error(`${summary}${detail ? `. ${detail}` : ''}`)
       }
-      setMessage(`${summary}. Открыта печать маршрутных листов.`)
+      setMessage(
+        printWindow
+          ? `${summary}. Открыта печать маршрутных листов.`
+          : `${summary}. Печать не открыта: браузер заблокировал окно.`,
+      )
       await load(offsetRef.current)
-      openRouteSheets(ids)
+      renderRouteSheets(ids, printWindow)
     } catch (e) {
+      closeRouteSheetWindow(printWindow)
       setError(e instanceof Error ? e.message : String(e))
     } finally {
       setLoading(false)
