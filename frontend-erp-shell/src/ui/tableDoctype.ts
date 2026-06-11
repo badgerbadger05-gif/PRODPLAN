@@ -3,6 +3,8 @@ import type { CSSProperties } from 'react'
 export type TableColumnDoctype = {
   key: string
   title: string
+  // Однострочное пояснение термина, показывается как title заголовка колонки
+  tooltip?: string
   className?: string
   width?: number
   minWidth?: number

@@ -1718,6 +1718,27 @@ def get_period_plan_execution_journal(
         row_due = req.period_to if req.period_to else None
         row_forecast_payload = _forecast_payload(row_forecast, row_due)
 
+        need_dates: List[date] = []
+        for wi in work_items:
+            raw_need = wi.get("need_date")
+            if raw_need:
+                try:
+                    need_dates.append(_parse_date(raw_need, "need_date"))
+                except Exception:
+                    pass
+        row_need_date = min(need_dates) if need_dates else row_due
+
+        if net_qty < 1e-9:
+            row_status = "net_zero"
+        elif remaining_qty < 1e-9:
+            row_status = "covered"
+        elif completed_qty > 1e-9:
+            row_status = "partial"
+        elif ordered_qty > 1e-9:
+            row_status = "ordered"
+        else:
+            row_status = "none"
+
         rows.append({
             "req_id": req_id,
             "item_id": item_id,
@@ -1736,6 +1757,8 @@ def get_period_plan_execution_journal(
             "unassigned_qty": unassigned_qty,
             "progress_base_qty": progress_base_qty,
             "coverage_pct": progress_pct,
+            "need_date": row_need_date.isoformat() if row_need_date else None,
+            "status": row_status,
             **row_forecast_payload,
             "work_items": work_items,
         })

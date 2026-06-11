@@ -185,6 +185,7 @@ def test_execution_journal_marks_production_order_opened_in_1c(db_session):
     row = journal["rows"][0]
     assert row["ordered_qty"] == 12
     assert row["completed_qty"] == 0
+    assert row["status"] == "ordered"
     work_item = row["work_items"][0]
     assert work_item["type"] == "production_order"
     assert work_item["product_id"] == product.product_id
@@ -251,6 +252,8 @@ def test_execution_journal_does_not_count_planned_task_as_ordered(db_session):
     assert row["ordered_qty"] == 0
     assert row["completed_qty"] == 0
     assert row["remaining_qty"] == 10
+    assert row["status"] == "none"
+    assert row["need_date"] == bucket.isoformat()
     assert row["work_items"][0]["type"] == "planned_order"
     assert row["work_items"][0]["qty"] == 10
 

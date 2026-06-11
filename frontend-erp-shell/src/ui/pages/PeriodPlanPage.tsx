@@ -11,6 +11,9 @@ import {
   coverageClass,
   flowClass,
   flowLabel,
+  journalRowStatus,
+  journalRowStatusClass,
+  journalRowStatusLabel,
   periodPlanStatusClass,
   periodPlanStatusLabel,
 } from '../../domain/planning'
@@ -440,27 +443,27 @@ type JournalSortKey =
   | 'item_name'
   | 'flow'
   | 'bom_level'
-  | 'gross_qty'
   | 'net_qty'
   | 'ordered_qty'
-  | 'unassigned_qty'
   | 'completed_qty'
   | 'remaining_qty'
+  | 'need_date'
+  | 'status'
   | 'coverage_pct'
 
 const periodPlanJournalColumns = [
   { key: 'item_article', title: 'Артикул', width: 108, minWidth: 108, grow: false, sortable: true },
   { key: 'item_name', title: 'Номенклатура', minWidth: 300, grow: true, sortable: true },
-  { key: 'flow', title: 'Тип', width: 136, minWidth: 136, grow: false, sortable: true },
-  { key: 'bom_level', title: 'Ур.', width: 68, minWidth: 68, grow: false, align: 'center', sortable: true },
-  { key: 'gross_qty', title: 'Потребность', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true },
-  { key: 'net_qty', title: 'Чистая потребность', width: 128, minWidth: 128, grow: false, align: 'right', className: 'numCell', sortable: true },
-  { key: 'ordered_qty', title: 'Оформлено', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true },
-  { key: 'unassigned_qty', title: 'Не оформлено', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true },
-  { key: 'completed_qty', title: 'Выполнено', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true },
-  { key: 'remaining_qty', title: 'Осталось выполнить', width: 128, minWidth: 128, grow: false, align: 'right', className: 'numCell', sortable: true },
-  { key: 'coverage_pct', title: 'Выполнение', width: 104, minWidth: 104, grow: false, align: 'center', sortable: true },
-  { key: 'work_items', title: 'Заданий', width: 72, minWidth: 72, grow: false, align: 'center', sortable: false },
+  { key: 'flow', title: 'Тип', width: 136, minWidth: 136, grow: false, sortable: true, tooltip: 'Способ пополнения: производство, закупка или переработка' },
+  { key: 'bom_level', title: 'Ур.', width: 68, minWidth: 68, grow: false, align: 'center', sortable: true, tooltip: 'Уровень в дереве спецификации (0 — изделие плана)' },
+  { key: 'net_qty', title: 'Потребность', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true, tooltip: 'Чистая потребность = потребность с припусками − остаток склада. Брутто и склад — в подсказке ячейки' },
+  { key: 'ordered_qty', title: 'Оформлено', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true, tooltip: 'Оформлено в заказы (1С). Красным — есть неоформленный остаток, см. подсказку ячейки' },
+  { key: 'completed_qty', title: 'Выполнено', width: 116, minWidth: 116, grow: false, align: 'right', className: 'numCell', sortable: true, tooltip: 'Выпущено производством / принято на склад' },
+  { key: 'remaining_qty', title: 'Осталось', width: 110, minWidth: 110, grow: false, align: 'right', className: 'numCell', sortable: true, tooltip: 'Осталось выполнить до закрытия потребности' },
+  { key: 'need_date', title: 'Срок', width: 118, minWidth: 118, grow: false, align: 'center', sortable: true, tooltip: 'Дата потребности; рядом — прогнозный сдвиг (+N дн = опоздание)' },
+  { key: 'status', title: 'Статус', width: 128, minWidth: 128, grow: false, align: 'center', sortable: true, tooltip: 'Закрыто — выполнено полностью; Частично — есть выполнение; Оформлено — заказы созданы, выполнения нет; Не оформлено — требуются заказы; Покрыто складом — потребность закрыта остатком' },
+  { key: 'coverage_pct', title: 'Выполнение', width: 104, minWidth: 104, grow: false, align: 'center', sortable: true, tooltip: '% выполнения от чистой потребности' },
+  { key: 'work_items', title: 'Заданий', width: 72, minWidth: 72, grow: false, align: 'center', sortable: false, tooltip: 'Число заказов/заданий по строке; клик по строке раскрывает список' },
 ] as const satisfies TableColumnDoctype[]
 
 function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
@@ -479,6 +482,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   const [journalFlow, setJournalFlow] = useState('')
   const [journalBomLevel, setJournalBomLevel] = useState<string>('')
   const [journalCoverage, setJournalCoverage] = useState<string>('')
+  const [journalShowNetZero, setJournalShowNetZero] = useState(false)
   const [journalRootItemId, setJournalRootItemId] = useState<number | null>(null)
   const [journalRootDialogOpen, setJournalRootDialogOpen] = useState(false)
   const [journalSortBy, setJournalSortBy] = useState<JournalSortKey>('bom_level')
@@ -942,24 +946,24 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
       const lvl = Number(journalBomLevel)
       rows = rows.filter((r) => r.bom_level === lvl)
     }
+    if (!journalShowNetZero && journalCoverage !== 'net_zero') {
+      rows = rows.filter((r) => journalRowStatus(r) !== 'net_zero')
+    }
     if (journalCoverage) {
-      rows = rows.filter((r) => {
-        if (journalCoverage === 'covered') return r.remaining_qty <= 0 && r.net_qty > 0
-        if (journalCoverage === 'partial') return r.completed_qty > 0 && r.remaining_qty > 0
-        if (journalCoverage === 'ordered') return r.ordered_qty > 0 && r.completed_qty <= 0
-        if (journalCoverage === 'none') return r.ordered_qty <= 0 && r.completed_qty <= 0
-        return true
-      })
+      rows = rows.filter((r) => journalRowStatus(r) === journalCoverage)
     }
     const dir = journalSortDir === 'asc' ? 1 : -1
     rows.sort((a, b) => {
+      if (journalSortBy === 'status') {
+        return journalRowStatusLabel(journalRowStatus(a)).localeCompare(journalRowStatusLabel(journalRowStatus(b)), 'ru') * dir
+      }
       const va: unknown = (a as unknown as Record<JournalSortKey, unknown>)[journalSortBy]
       const vb: unknown = (b as unknown as Record<JournalSortKey, unknown>)[journalSortBy]
       if (typeof va === 'number' && typeof vb === 'number') return (va - vb) * dir
       return String(va ?? '').localeCompare(String(vb ?? ''), 'ru') * dir
     })
     return rows
-  }, [journal, journalBomLevel, journalCoverage, journalSortBy, journalSortDir])
+  }, [journal, journalBomLevel, journalCoverage, journalShowNetZero, journalSortBy, journalSortDir])
 
   const bomLevels = useMemo(() => {
     if (!journal) return [] as number[]
@@ -1018,12 +1022,12 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   function downloadJournalCsv() {
     if (!journal) return
     const rows = filteredJournalRows
-    const headers = ['Артикул', 'Номенклатура', 'Поток', 'Уровень', 'Потребность', 'Чистая потребность', 'Оформлено', 'Не оформлено', 'Выполнено', 'Осталось выполнить', 'Выполнение %', 'Заданий']
+    const headers = ['Артикул', 'Номенклатура', 'Поток', 'Уровень', 'Потребность (брутто)', 'Чистая потребность', 'Оформлено', 'Не оформлено', 'Выполнено', 'Осталось выполнить', 'Срок', 'Статус', 'Выполнение %', 'Заданий']
     const esc = (v: unknown) => {
       const s = String(v ?? '')
       return /[",;\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
     }
-    const body = rows.map((r) => [r.item_article || r.item_code, r.item_name, flowLabel(r.flow), r.bom_level, r.gross_qty, r.net_qty, r.ordered_qty, r.unassigned_qty ?? 0, r.completed_qty, r.remaining_qty, r.coverage_pct, r.work_items.length].map(esc).join(';'))
+    const body = rows.map((r) => [r.item_article || r.item_code, r.item_name, flowLabel(r.flow), r.bom_level, r.gross_qty, r.net_qty, r.ordered_qty, r.unassigned_qty ?? 0, r.completed_qty, r.remaining_qty, r.need_date ?? '', journalRowStatusLabel(journalRowStatus(r)), r.coverage_pct, r.work_items.length].map(esc).join(';'))
     const csv = '﻿' + [headers.join(';'), ...body].join('\n')
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
     const url = URL.createObjectURL(blob)
@@ -1034,11 +1038,14 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     URL.revokeObjectURL(url)
   }
 
-  function workItemHref(wi: { type: string; product_id?: number; order_id?: number; purchase_id?: number; rework_id?: number; run_id?: number }) {
+  function workItemHref(wi: { type: string; product_id?: number; order_id?: number; purchase_id?: number; rework_id?: number; run_id?: number; one_c_opened?: boolean; order_number?: string }) {
     if (wi.type === 'production_order') {
       if (wi.product_id) return `#/production-control?product_id=${encodeURIComponent(String(wi.product_id))}`
       if (wi.order_id) return `#/production-control?order_id=${encodeURIComponent(String(wi.order_id))}`
       return null as string | null
+    }
+    if (wi.type === 'planned_purchase' && wi.one_c_opened && wi.order_number) {
+      return `#/purchase-control?search=${encodeURIComponent(wi.order_number)}`
     }
     const runId = wi.run_id ?? activeRunId ?? journal?.run_id
     if (!runId) return null as string | null
@@ -1444,17 +1451,47 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                 <>
                   <div className="barSeparator" />
                   {journalExecutionPct !== null && (
-                    <span className="toolbarText">Общее выполнение: {journalExecutionPct}%</span>
+                    <span className="toolbarText" title="Выполнено / чистая потребность по всем строкам">Общее выполнение: {journalExecutionPct}%</span>
                   )}
                   {journalExecutionByFlow.map((row) => (
                     <span key={row.flow} className="toolbarText">{row.label}: {row.pct}%</span>
                   ))}
-                  <span className="toolbarText">Закрыто: {journal.summary.fully_covered} / {journal.summary.total_items}</span>
+                  <button
+                    className="filterBtn"
+                    onClick={() => setJournalCoverage((v) => (v === 'covered' ? '' : 'covered'))}
+                    title="Показать только закрытые строки"
+                  >
+                    Закрыто: {journal.summary.fully_covered} / {journal.summary.total_items}
+                  </button>
                   {journal.summary.not_covered > 0 && (
-                    <span style={{ color: 'var(--red)' }}>Не начато: {journal.summary.not_covered}</span>
+                    <button
+                      className="filterBtn"
+                      style={{ color: 'var(--red)' }}
+                      onClick={() => setJournalCoverage((v) => (v === 'none' ? '' : 'none'))}
+                      title="Показать только строки без оформленных заказов"
+                    >
+                      Не начато: {journal.summary.not_covered}
+                    </button>
                   )}
                   {journal.summary.partially_covered > 0 && (
-                    <span style={{ color: 'var(--orange)' }}>Частично: {journal.summary.partially_covered}</span>
+                    <button
+                      className="filterBtn"
+                      style={{ color: 'var(--orange)' }}
+                      onClick={() => setJournalCoverage((v) => (v === 'partial' ? '' : 'partial'))}
+                      title="Показать только частично выполненные строки"
+                    >
+                      Частично: {journal.summary.partially_covered}
+                    </button>
+                  )}
+                  {journal.summary.net_zero > 0 && (
+                    <label className="toolbarText" style={{ display: 'inline-flex', alignItems: 'center', gap: 4, cursor: 'pointer' }} title="Строки, потребность которых полностью закрыта остатком склада">
+                      <input
+                        type="checkbox"
+                        checked={journalShowNetZero}
+                        onChange={(e) => setJournalShowNetZero(e.target.checked)}
+                      />
+                      Покрытые складом: {journal.summary.net_zero}
+                    </label>
                   )}
                 </>
               )}
@@ -1506,7 +1543,8 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                           </select>
                         </label>
                       </td>
-                      <td colSpan={5} />
+                      <td colSpan={4} />
+                      <td />
                       <td>
                         <label className="columnFilterControl">
                           <span>Статус</span>
@@ -1515,11 +1553,12 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                             <option value="covered">Закрыто</option>
                             <option value="partial">Частично</option>
                             <option value="ordered">Оформлено</option>
-                            <option value="none">Без заданий</option>
+                            <option value="none">Не оформлено</option>
+                            <option value="net_zero">Покрыто складом</option>
                           </select>
                         </label>
                       </td>
-                      <td />
+                      <td colSpan={2} />
                     </tr>
                   </tbody>
                 </table>
@@ -1534,7 +1573,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                       {periodPlanJournalColumns.map((column) => {
                         const columnDoctype = column as TableColumnDoctype
                         return (
-                          <th key={column.key} className={columnDoctype.className} style={tableColumnStyle(column)}>
+                          <th key={column.key} className={columnDoctype.className} style={tableColumnStyle(column)} title={columnDoctype.tooltip}>
                             {column.sortable ? (() => {
                               const sortKey: JournalSortKey = column.key
                               return (
@@ -1560,19 +1599,34 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                           <td><strong>{row.item_name}</strong></td>
                           <td><span className={`miniPill ${flowClass(row.flow)}`}>{flowLabel(row.flow)}</span></td>
                           <td style={{ textAlign: 'center' }}>{row.bom_level}</td>
-                          <td className="numCell"><strong>{qty(row.gross_qty)}</strong></td>
-                          <td className="numCell"><strong>{qty(row.net_qty)}</strong></td>
-                          <td className="numCell">{row.ordered_qty > 0 ? qty(row.ordered_qty) : <span className="muted">—</span>}</td>
-                          <td className="numCell" style={{ color: (row.unassigned_qty ?? 0) > 0 ? 'var(--red)' : undefined }}>
-                            {(row.unassigned_qty ?? 0) > 0 ? qty(row.unassigned_qty ?? 0) : <span className="muted">—</span>}
+                          <td
+                            className="numCell"
+                            title={`Потребность с припусками: ${qty(row.gross_qty)} · Остаток склада: ${qty(row.stock_qty ?? Math.max(0, row.gross_qty - row.net_qty))}`}
+                          >
+                            <strong>{qty(row.net_qty)}</strong>
+                          </td>
+                          <td
+                            className="numCell"
+                            style={{ color: (row.unassigned_qty ?? 0) > 0 ? 'var(--red)' : undefined }}
+                            title={(row.unassigned_qty ?? 0) > 0 ? `Не оформлено в заказы: ${qty(row.unassigned_qty ?? 0)}` : undefined}
+                          >
+                            {row.ordered_qty > 0 || (row.unassigned_qty ?? 0) > 0 ? qty(row.ordered_qty) : <span className="muted">—</span>}
                           </td>
                           <td className="numCell">{row.completed_qty > 0 ? qty(row.completed_qty) : <span className="muted">—</span>}</td>
                           <td className="numCell" style={{ color: row.remaining_qty > 0 ? 'var(--red)' : undefined }}>
                             {row.remaining_qty > 0 ? qty(row.remaining_qty) : '—'}
                           </td>
                           <td style={{ textAlign: 'center' }}>
-                            <span className={`miniPill ${coverageClass(row.coverage_pct)}`}>{row.coverage_pct}%</span>
+                            {row.need_date ? dateRu(row.need_date) : '—'}
                             <ForecastShift forecast={row} />
+                          </td>
+                          <td style={{ textAlign: 'center' }}>
+                            <span className={`miniPill ${journalRowStatusClass(journalRowStatus(row))}`}>
+                              {journalRowStatusLabel(journalRowStatus(row))}
+                            </span>
+                          </td>
+                          <td style={{ textAlign: 'center' }}>
+                            <span className={`miniPill ${coverageClass(row.coverage_pct)}`}>{row.coverage_pct}%</span>
                           </td>
                           <td style={{ textAlign: 'center' }}>
                             {row.work_items.length ? (
@@ -1594,43 +1648,48 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                           return (
                             <tr key={`${row.req_id}-${i}`} style={{ background: '#f8fbff' }}>
                               <td />
-                              <td colSpan={2} style={{ paddingLeft: 24 }}>
-                                {href ? (
-                                  <a href={href} className="muted">{label}</a>
-                                ) : (
-                                  <span className="muted">{label}</span>
-                                )}
-                                {wi.type === 'production_order' && (
-                                  <span
-                                    className={`miniPill ${wi.one_c_opened ? 'ready' : 'partial'}`}
-                                    title={wi.one_c_opened && wi.order_ref1c ? `1C Ref_Key: ${wi.order_ref1c}` : 'Внутренний заказ PRODPLAN'}
-                                    style={{ marginLeft: 8 }}
-                                  >
-                                    {wi.one_c_opened ? 'Открыт в 1С' : 'Внутренний заказ'}
+                              <td colSpan={11} style={{ paddingLeft: 24 }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                                  {href ? (
+                                    <a href={href} title="Открыть источник">{label}</a>
+                                  ) : (
+                                    <span>{label}</span>
+                                  )}
+                                  {wi.type === 'production_order' && (
+                                    <span
+                                      className={`miniPill ${wi.one_c_opened ? 'ready' : 'partial'}`}
+                                      title={wi.one_c_opened && wi.order_ref1c ? `1C Ref_Key: ${wi.order_ref1c}` : 'Внутренний заказ PRODPLAN, ещё не открыт в 1С'}
+                                    >
+                                      {wi.one_c_opened ? 'Открыт в 1С' : 'Внутренний заказ'}
+                                    </span>
+                                  )}
+                                  {wi.type === 'planned_purchase' && (
+                                    wi.one_c_opened ? (
+                                      <span
+                                        className={`miniPill ${(wi.completed_qty ?? 0) > 0 ? 'ready' : 'partial'}`}
+                                        title={wi.order_state || (wi.order_ref1c ? `1C Ref_Key: ${wi.order_ref1c}` : 'Заказ поставщику в 1С')}
+                                      >
+                                        {(wi.completed_qty ?? 0) > 0 ? 'Принят на склад' : `Заказ в 1С${wi.order_number ? ' ' + wi.order_number : ''}`}
+                                      </span>
+                                    ) : (
+                                      <span className="miniPill to_move" title="Плановая закупка MRP, заказ поставщику ещё не создан">План MRP</span>
+                                    )
+                                  )}
+                                  {(wi.type === 'planned_order' || wi.type === 'planned_rework') && (
+                                    <span className="miniPill to_move" title="Плановое задание MRP, заказ ещё не создан">План MRP</span>
+                                  )}
+                                  <span className="muted">
+                                    оформлено: <strong>{assignedQty !== null ? qty(assignedQty) : '—'}</strong>
+                                    {unassignedQty !== null && unassignedQty > 0 && (
+                                      <> · не оформлено: <strong style={{ color: 'var(--red)' }}>{qty(unassignedQty)}</strong></>
+                                    )}
+                                    {' '}· выполнено: <strong>{wi.completed_qty !== undefined && wi.completed_qty > 0 ? qty(wi.completed_qty) : '—'}</strong>
+                                    {' '}· осталось: <strong>{wi.remaining_qty !== undefined ? qty(wi.remaining_qty) : '—'}</strong>
+                                    {wi.need_date && <> · срок: <strong>{dateRu(wi.need_date)}</strong></>}
                                   </span>
-                                )}
-                                {wi.type === 'planned_purchase' && wi.one_c_opened && (
-                                  <span
-                                    className={`miniPill ${(wi.completed_qty ?? 0) > 0 ? 'ready' : 'partial'}`}
-                                    title={wi.order_state || (wi.order_ref1c ? `1C Ref_Key: ${wi.order_ref1c}` : 'Заказ поставщику в 1С')}
-                                    style={{ marginLeft: 8 }}
-                                  >
-                                    {(wi.completed_qty ?? 0) > 0 ? 'Принят на склад' : 'Заказ в 1С'}
-                                  </span>
-                                )}
+                                  <ForecastShift forecast={wi} />
+                                </div>
                               </td>
-                              <td />
-                              <td />
-                              <td />
-                              <td className="numCell">{assignedQty !== null ? <strong>{qty(assignedQty)}</strong> : '—'}</td>
-                              <td className="numCell">{unassignedQty !== null ? <strong>{qty(unassignedQty)}</strong> : '—'}</td>
-                              <td className="numCell">{wi.completed_qty !== undefined && wi.completed_qty > 0 ? qty(wi.completed_qty) : '—'}</td>
-                              <td className="numCell">{wi.remaining_qty !== undefined ? qty(wi.remaining_qty) : '—'}</td>
-                              <td style={{ textAlign: 'center' }}>
-                                {wi.need_date ? <span className="muted">{dateRu(wi.need_date)}</span> : '—'}
-                                <ForecastShift forecast={wi} />
-                              </td>
-                              <td />
                             </tr>
                           )
                         })}

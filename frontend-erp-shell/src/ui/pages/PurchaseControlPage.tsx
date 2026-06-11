@@ -42,6 +42,7 @@ const csvColumns: Array<[string, (row: PurchaseRow) => string | number]> = [
 export function PurchaseControlPage() {
   const [searchParams] = useSearchParams()
   const focusOrderId = searchParams.get('order_id')
+  const focusSearch = searchParams.get('search')
   const [rows, setRows] = useState<PurchaseRow[]>([])
   const [summary, setSummary] = useState<PurchaseJournalSummary | null>(null)
   const [selectedPurchaseIds, setSelectedPurchaseIds] = useState<Set<number>>(new Set())
@@ -55,7 +56,7 @@ export function PurchaseControlPage() {
   const [suppliers, setSuppliers] = useState<PurchaseSupplierOption[]>([])
   const [states, setStates] = useState<string[]>([])
   const [filters, setFilters] = useState<PurchaseFilters>({
-    search: '',
+    search: focusSearch ?? '',
     supplier_id: '',
     line_status: '',
     state: '',

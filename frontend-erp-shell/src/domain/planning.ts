@@ -245,10 +245,39 @@ export type ExecutionJournalRow = {
   unassigned_qty?: number
   progress_base_qty?: number
   coverage_pct: number
+  need_date?: string | null
+  status?: JournalRowStatus
   forecast_date?: string | null
   forecast_shift_days?: number | null
   forecast_reason?: string | null
   work_items: ExecutionWorkItem[]
+}
+
+export type JournalRowStatus = 'net_zero' | 'covered' | 'partial' | 'ordered' | 'none'
+
+export function journalRowStatus(row: Pick<ExecutionJournalRow, 'status' | 'net_qty' | 'remaining_qty' | 'completed_qty' | 'ordered_qty'>): JournalRowStatus {
+  if (row.status) return row.status
+  if (row.net_qty <= 0) return 'net_zero'
+  if (row.remaining_qty <= 0) return 'covered'
+  if (row.completed_qty > 0) return 'partial'
+  if (row.ordered_qty > 0) return 'ordered'
+  return 'none'
+}
+
+export function journalRowStatusLabel(status: JournalRowStatus) {
+  if (status === 'covered') return 'Закрыто'
+  if (status === 'partial') return 'Частично'
+  if (status === 'ordered') return 'Оформлено'
+  if (status === 'none') return 'Не оформлено'
+  return 'Покрыто складом'
+}
+
+export function journalRowStatusClass(status: JournalRowStatus) {
+  if (status === 'covered') return 'ready'
+  if (status === 'partial') return 'partial'
+  if (status === 'ordered') return 'to_move'
+  if (status === 'none') return 'shortage'
+  return 'completed'
 }
 
 export type ExecutionJournalSummary = {
