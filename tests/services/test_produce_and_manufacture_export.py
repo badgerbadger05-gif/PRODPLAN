@@ -836,3 +836,81 @@ def test_export_fails_open_when_balance_query_errors(db_session, monkeypatch):
 
     assert result["manufactures_blocked"] == 0
     assert result["manufactures_created"] == 1
+
+
+def test_guard_skips_repair_of_existing_1c_document(db_session, monkeypatch):
+    """A manufacture whose 1C document already exists (retry/repair path) must
+    not be balance-checked: if that document was posted, its write-off already
+    left the register and the live balance would double-count it."""
+    db = db_session
+    mid, _comp_ref = _guard_scenario(db, code="RETRY", produce_qty=3.0)
+    m = db.query(ProductionManufacture).filter_by(manufacture_id=mid).one()
+    m.exported_ref1c = "existing-manuf-ref"
+    m.status = "error"
+    db.commit()
+
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    # Live balance is empty — would block a fresh export, must not block repair.
+    fake = _BalanceClient(balance_rows=[])
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False, allow_production=True)
+
+    assert result["manufactures_blocked"] == 0
+    assert result["manufactures_created"] == 1
+    # Repair goes through patch of the existing document, not a new post.
+    assert fake.patches
+    assert fake.balance_queries == []
+    db.refresh(m)
+    assert m.status == "exported"
+
+
+def test_guard_checks_bulk_batch_against_shared_balance(db_session, monkeypatch):
+    """Two manufactures that fit the unit balance individually but not
+    together: the first passes, the second is blocked against the remainder."""
+    db = db_session
+    item = _mk_item(db, code="GRD-BULK", ref1c="item-ref-guard-bulk")
+    component = _mk_item(db, code="GRD-BULK-C", ref1c="component-ref-guard-bulk")
+    spec = Specification(spec_name="Spec guard bulk", spec_ref1c="spec-ref-guard-bulk")
+    db.add(spec)
+    db.flush()
+    db.add(DefaultSpecification(item_id=item.item_id, spec_id=spec.spec_id))
+    db.add(SpecComponent(spec_id=spec.spec_id, item_id=component.item_id, quantity=2))
+    product = _mk_product(db, item, qty=6.0)
+    state = db.query(ProductionOrderLineState).filter_by(product_id=product.product_id).one()
+    state.workshop_id = 178
+    db.add(
+        WorkshopWarehouseBinding(
+            workshop_id=178,
+            warehouse_ref1c="guard-bulk-material-ref",
+            production_warehouse_ref1c="guard-bulk-product-ref",
+        )
+    )
+    _stock_kit_on_workshop(db, product, component, 12.0)
+    mid1 = produce_line(db, product.product_id, qty=3, executor="op")["manufacture_id"]
+    mid2 = produce_line(db, product.product_id, qty=3, executor="op")["manufacture_id"]
+    db.commit()
+
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    # Each manufacture writes off 6; 1C unit holds 10 — only one fits.
+    fake = _BalanceClient(
+        balance_rows=[
+            {"Номенклатура_Key": "component-ref-guard-bulk", "КоличествоBalance": 10.0}
+        ]
+    )
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    result = exporter.export_manufactures_to_1c(
+        db, [mid1, mid2], dry_run=False, allow_production=True
+    )
+
+    assert result["manufactures_created"] == 1
+    assert result["manufactures_blocked"] == 1
+    m1 = db.query(ProductionManufacture).filter_by(manufacture_id=mid1).one()
+    m2 = db.query(ProductionManufacture).filter_by(manufacture_id=mid2).one()
+    assert m1.status == "exported"
+    assert m2.status == "draft"
+    # The second entry is judged against the remainder: 10 - 6 = 4.
+    assert "нужно 6" in m2.export_error and "в 1С 4" in m2.export_error
+    # One shared balance read per unit for the whole batch, not per entry.
+    assert len(fake.balance_queries) == 1

@@ -452,22 +452,11 @@ def _live_unit_balances(
     return result
 
 
-def _verify_material_balances(
-    db: Session,
-    client: OData1CClient,
+def _entry_material_requirements(
     entry: ManufactureExportEntry,
     config: Optional[Dict[str, Any]] = None,
-) -> Optional[str]:
-    """
-    PRODPLAN reservations and the 1C ledger are separate books: manual 1C
-    documents, re-posted transfers or cell-tracked warehouses can leave the
-    workshop unit short even when the local kit looks complete. Posting
-    Document_СборкаЗапасов would then fail with an opaque 1C error after the
-    document is already created. Check the live unit balance first and return
-    a human-readable refusal instead (None = ok to export).
-    """
-    if not entry.materials:
-        return None
+) -> Tuple[Optional[str], Dict[str, float]]:
+    """(material unit ref, {item_ref1c: write-off qty}) for one manufacture."""
     cfg = config or {}
     default_structural_unit = _config_ref1c(
         cfg,
@@ -475,30 +464,20 @@ def _verify_material_balances(
         DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C,
     )
     material_unit = _clean_ref1c(entry.material_structural_unit_ref1c or default_structural_unit)
-    if not material_unit:
-        return None
-
     needed: Dict[str, float] = {}
-    for row in entry.materials:
+    for row in entry.materials or []:
         ref = _clean_ref1c(row.get("Номенклатура_Key"))
         qty = float(row.get("Количество") or 0.0)
         if ref and qty > 1e-9:
             needed[ref] = needed.get(ref, 0.0) + qty
-    if not needed:
-        return None
+    return material_unit or None, needed
 
-    balances = _live_unit_balances(client, list(needed.keys()), material_unit)
-    if balances is None:
-        return None
 
-    shortfalls: List[Tuple[str, float, float]] = []
-    for ref, qty in needed.items():
-        have = balances.get(ref, 0.0)
-        if have + 1e-6 < qty:
-            shortfalls.append((ref, qty, have))
-    if not shortfalls:
-        return None
-
+def _balance_shortfall_message(
+    db: Session,
+    material_unit: str,
+    shortfalls: List[Tuple[str, float, float]],
+) -> str:
     names = {
         _clean_ref1c(item_ref): str(name or article or code or "")
         for item_ref, name, article, code in (
@@ -521,6 +500,82 @@ def _verify_material_balances(
         f"Недостаточно остатков в 1С на складе материалов «{unit_name}»: {details}. "
         "СборкаЗапасов не выгружена — переместите недостающее в 1С и повторите выпуск."
     )
+
+
+def _apply_balance_guard(
+    db: Session,
+    client: OData1CClient,
+    eligible: List[ManufactureExportEntry],
+    config: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[ManufactureExportEntry], int]:
+    """
+    PRODPLAN reservations and the 1C ledger are separate books: manual 1C
+    documents, re-posted transfers or cell-tracked warehouses can leave the
+    workshop unit short even when the local kit looks complete. Posting
+    Document_СборкаЗапасов would then fail with an opaque 1C error after the
+    document is already created. Refuse such exports up front with a
+    human-readable message; returns (exportable_entries, blocked_count).
+
+    The batch is checked against one shared live balance per material unit:
+    every approved entry consumes its write-off from the remaining pool, so
+    two manufactures that fit individually but not together do not slip
+    through. Entries repairing an existing 1C document (target_ref_key set)
+    are skipped — if that document was posted, its write-off has already left
+    the register and the live balance would double-count it.
+    """
+    requirements: List[Tuple[ManufactureExportEntry, Optional[str], Dict[str, float]]] = []
+    refs_by_unit: Dict[str, set] = {}
+    for entry in eligible:
+        if _clean_ref1c(entry.target_ref_key):
+            requirements.append((entry, None, {}))
+            continue
+        unit, needed = _entry_material_requirements(entry, config)
+        if unit and needed:
+            refs_by_unit.setdefault(unit, set()).update(needed.keys())
+        requirements.append((entry, unit, needed))
+
+    balances_by_unit: Dict[str, Optional[Dict[str, float]]] = {
+        unit: _live_unit_balances(client, sorted(refs), unit)
+        for unit, refs in refs_by_unit.items()
+    }
+
+    remaining: Dict[Tuple[str, str], float] = {}
+    exportable: List[ManufactureExportEntry] = []
+    blocked = 0
+    for entry, unit, needed in requirements:
+        if not unit or not needed:
+            exportable.append(entry)
+            continue
+        unit_balances = balances_by_unit.get(unit)
+        if unit_balances is None:
+            # Balance unreadable: fail open, 1C validates at posting time.
+            exportable.append(entry)
+            continue
+        shortfalls: List[Tuple[str, float, float]] = []
+        for ref, qty in needed.items():
+            key = (unit, ref)
+            if key not in remaining:
+                remaining[key] = unit_balances.get(ref, 0.0)
+            if remaining[key] + 1e-6 < qty:
+                shortfalls.append((ref, qty, remaining[key]))
+        if shortfalls:
+            error = _balance_shortfall_message(db, unit, shortfalls)
+            entry.status = "error"
+            entry.error = error
+            m_row = (
+                db.query(ProductionManufacture)
+                .filter(ProductionManufacture.manufacture_id == entry.manufacture_id)
+                .one()
+            )
+            m_row.export_error = error
+            blocked += 1
+            continue
+        for ref, qty in needed.items():
+            remaining[(unit, ref)] -= qty
+        exportable.append(entry)
+    if blocked:
+        db.commit()
+    return exportable, blocked
 
 
 def _build_header_payload(entry: ManufactureExportEntry, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -735,25 +790,7 @@ def export_manufactures_to_1c(
     # by the live 1C balance of the material unit. Catches PRODPLAN/1C ledger
     # divergence before a document is created instead of an opaque posting
     # failure after.
-    blocked = 0
-    exportable: List[ManufactureExportEntry] = []
-    for entry in eligible:
-        guard_error = _verify_material_balances(db, client, entry, config)
-        if guard_error:
-            entry.status = "error"
-            entry.error = guard_error
-            m_row = (
-                db.query(ProductionManufacture)
-                .filter(ProductionManufacture.manufacture_id == entry.manufacture_id)
-                .one()
-            )
-            m_row.export_error = guard_error
-            blocked += 1
-            continue
-        exportable.append(entry)
-    if blocked:
-        db.commit()
-    eligible = exportable
+    eligible, blocked = _apply_balance_guard(db, client, eligible, config)
 
     payloads: List[Dict[str, Any]] = []
     for entry in eligible:
