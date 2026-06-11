@@ -38,6 +38,8 @@ rebuild.bat
 - `piecework_order_odata.md` — проверенный контракт `Document_СдельныйНаряд` и его основание от `Document_СборкаЗапасов`
 - `production_orders_check.md` — учет активных заказов на производство 1С в MRP
 - `supplier_orders_check.md` — целевая документация по учету заказов поставщику 1С в MRP
+- `execution_journal_ux_plan.md` — план улучшения читаемости журнала исполнения
+- `purchase_journal_plan.md` — план журнала закупок (аналог журнала заказов)
 - `frontend_erp_shell_migration.md` — решение и правила переноса фронта в новый ERP-shell
 - `period_plan_target.md` — контракт страницы «Период план» (жизненный цикл, матрица, MRP-снимок, журнал, хоткеи)
 - `troubleshooting.md` — команды и диагностика
