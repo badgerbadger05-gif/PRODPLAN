@@ -10,6 +10,7 @@ import { SpecificationPage } from './pages/SpecificationPage'
 import { StageDistributionPage } from './pages/StageDistributionPage'
 import { SyncPage } from './pages/SyncPage'
 import { TransferRequestsPage } from './pages/TransferRequestsPage'
+import { WorkshopBindingReviewPage } from './pages/WorkshopBindingReviewPage'
 
 const navItems = [
   { to: '/', title: 'Главная', end: true },
@@ -19,6 +20,7 @@ const navItems = [
   { to: '/transfer-requests', title: 'Заявки перемещений' },
   { to: '/production-report-week', title: 'Выпуск недельный' },
   { to: '/resources', title: 'Ресурсы' },
+  { to: '/workshop-binding-review', title: 'Разбор привязок' },
   { to: '/stage-distribution', title: 'Распределение этапов' },
   { to: '/specification', title: 'Спецификации' },
   { to: '/sync', title: 'Синхронизация' },
@@ -60,6 +62,7 @@ export function App() {
         <Route path="/mrp-runs" element={<MrpRunsPage />} />
         <Route path="/mrp-runs/:runId" element={<MrpResultPage />} />
         <Route path="/resources" element={<ResourcesPage />} />
+        <Route path="/workshop-binding-review" element={<WorkshopBindingReviewPage />} />
         <Route path="/stage-distribution" element={<StageDistributionPage />} />
         <Route path="/specification" element={<SpecificationPage />} />
         <Route path="/sync" element={<SyncPage />} />
