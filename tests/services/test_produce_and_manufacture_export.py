@@ -706,3 +706,133 @@ def test_skipped_for_invalid_inputs(db_session, monkeypatch):
     assert any("cancelled" in r for r in reasons)
     assert any("не найден" in r for r in reasons)
     assert fake.posts == []
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight 1C balance guard (Document_СборкаЗапасов write-off coverage)
+# ---------------------------------------------------------------------------
+
+
+class _BalanceClient(_FakeClient):
+    """FakeClient with the get_all used by the live-balance guard."""
+
+    def __init__(self, *, balance_rows=None, balance_fail: bool = False, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.balance_rows = list(balance_rows or [])
+        self.balance_fail = balance_fail
+        self.balance_queries: list = []
+
+    def get_all(self, entity, **kwargs):
+        self.balance_queries.append((entity, kwargs.get("filter_query")))
+        if self.balance_fail:
+            raise RuntimeError("balance query failed")
+        return list(self.balance_rows)
+
+
+def _guard_scenario(db, *, code: str, produce_qty: float = 3.0):
+    """Item + 1-component spec + workshop binding; returns (mid, component_ref)."""
+    item = _mk_item(db, code=f"GRD-{code}", ref1c=f"item-ref-guard-{code}")
+    component = _mk_item(db, code=f"GRD-{code}-C", ref1c=f"component-ref-guard-{code}")
+    spec = Specification(spec_name=f"Spec guard {code}", spec_ref1c=f"spec-ref-guard-{code}")
+    db.add(spec)
+    db.flush()
+    db.add(DefaultSpecification(item_id=item.item_id, spec_id=spec.spec_id))
+    db.add(SpecComponent(spec_id=spec.spec_id, item_id=component.item_id, quantity=1))
+    product = _mk_product(db, item, qty=produce_qty)
+    state = db.query(ProductionOrderLineState).filter_by(product_id=product.product_id).one()
+    state.workshop_id = 177
+    db.add(
+        WorkshopWarehouseBinding(
+            workshop_id=177,
+            warehouse_ref1c="guard-material-ref",
+            production_warehouse_ref1c="guard-product-ref",
+        )
+    )
+    _stock_kit_on_workshop(db, product, component, produce_qty)
+    mid = produce_line(db, product.product_id, qty=produce_qty, executor="op")["manufacture_id"]
+    db.commit()
+    return mid, component.item_ref1c
+
+
+def test_export_blocked_when_1c_unit_balance_insufficient(db_session, monkeypatch):
+    db = db_session
+    mid, comp_ref = _guard_scenario(db, code="SHORT", produce_qty=3.0)
+
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    fake = _BalanceClient(
+        balance_rows=[{"Номенклатура_Key": comp_ref, "КоличествоBalance": 2.0}]
+    )
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False, allow_production=True)
+
+    assert result["manufactures_blocked"] == 1
+    assert result["manufactures_error"] == 1
+    assert result["manufactures_created"] == 0
+    assert result["status"] == "partial_error"
+    # No 1C document was created or posted.
+    assert fake.posts == []
+    assert fake.operations == []
+    # The balance was queried for the bound material unit.
+    assert any("guard-material-ref" in str(q[1]) for q in fake.balance_queries)
+
+    m = db.query(ProductionManufacture).filter_by(manufacture_id=mid).one()
+    assert m.status == "draft"
+    assert m.exported_ref1c is None
+    assert "нужно 3" in m.export_error and "в 1С 2" in m.export_error
+
+    entry = result["entries"][0]
+    assert entry["error"] and "Недостаточно остатков в 1С" in entry["error"]
+
+
+def test_export_blocked_when_component_absent_on_unit(db_session, monkeypatch):
+    db = db_session
+    mid, _comp_ref = _guard_scenario(db, code="ZERO", produce_qty=2.0)
+
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    fake = _BalanceClient(balance_rows=[])
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False, allow_production=True)
+
+    assert result["manufactures_blocked"] == 1
+    assert fake.posts == []
+    m = db.query(ProductionManufacture).filter_by(manufacture_id=mid).one()
+    assert "в 1С 0" in m.export_error
+
+
+def test_export_proceeds_when_1c_unit_balance_sufficient(db_session, monkeypatch):
+    db = db_session
+    mid, comp_ref = _guard_scenario(db, code="OK", produce_qty=3.0)
+
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    fake = _BalanceClient(
+        ref_key="guard-ok-ref",
+        balance_rows=[{"Номенклатура_Key": comp_ref, "КоличествоBalance": 5.0}],
+    )
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False, allow_production=True)
+
+    assert result["manufactures_blocked"] == 0
+    assert result["manufactures_created"] == 1
+    assert result["status"] == "ok"
+    m = db.query(ProductionManufacture).filter_by(manufacture_id=mid).one()
+    assert m.status == "exported"
+    assert m.export_error is None
+
+
+def test_export_fails_open_when_balance_query_errors(db_session, monkeypatch):
+    """1C connectivity hiccups must not block exports — 1C itself validates
+    stock at posting time."""
+    db = db_session
+    mid, _comp_ref = _guard_scenario(db, code="FOPEN", produce_qty=3.0)
+
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    fake = _BalanceClient(ref_key="guard-fopen-ref", balance_fail=True)
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False, allow_production=True)
+
+    assert result["manufactures_blocked"] == 0
+    assert result["manufactures_created"] == 1

@@ -39,6 +39,7 @@ from ..models import (
     SpecComponent,
     SpecOperation,
     Specification,
+    StockWarehouse,
     SyncLink,
     WorkshopWarehouseBinding,
 )
@@ -398,6 +399,130 @@ def _collect_export_entries(
     return entries, skipped
 
 
+_BALANCE_FILTER_CHUNK = 15
+
+
+def _live_unit_balances(
+    client: OData1CClient,
+    item_refs: List[str],
+    unit_ref1c: str,
+) -> Optional[Dict[str, float]]:
+    """
+    Live 1C stock of the given items on one structural unit, summed over
+    cells/organizations: {item_ref1c: qty}. Items without a register row are
+    simply absent (= 0 on the unit).
+
+    Returns None when the balance cannot be read (client without get_all or a
+    failed OData request) — the caller must fail open and let 1C validate at
+    posting time, otherwise a connectivity hiccup would block all exports.
+    """
+    get_all = getattr(client, "get_all", None)
+    if get_all is None:
+        return None
+    refs = [ref for ref in item_refs if ref]
+    if not refs:
+        return {}
+    entity = (
+        "AccumulationRegister_ЗапасыНаСкладах/Balance("
+        f"Period=datetime'{_current_1c_datetime()}',"
+        "Dimensions='Номенклатура,СтруктурнаяЕдиница')"
+    )
+    from .one_c_stock_transfer_export import _qty_from_balance_row
+
+    result: Dict[str, float] = {}
+    for start in range(0, len(refs), _BALANCE_FILTER_CHUNK):
+        chunk = refs[start : start + _BALANCE_FILTER_CHUNK]
+        item_filter = " or ".join(f"Номенклатура_Key eq guid'{ref}'" for ref in chunk)
+        filter_query = f"СтруктурнаяЕдиница_Key eq guid'{unit_ref1c}' and ({item_filter})"
+        try:
+            rows = get_all(
+                entity,
+                filter_query=filter_query,
+                top=200,
+                max_records=500,
+                max_pages=10,
+                order_by=None,
+            )
+        except Exception:
+            return None
+        for row in rows or []:
+            ref = _clean_ref1c(row.get("Номенклатура_Key"))
+            if ref:
+                result[ref] = result.get(ref, 0.0) + _qty_from_balance_row(row)
+    return result
+
+
+def _verify_material_balances(
+    db: Session,
+    client: OData1CClient,
+    entry: ManufactureExportEntry,
+    config: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """
+    PRODPLAN reservations and the 1C ledger are separate books: manual 1C
+    documents, re-posted transfers or cell-tracked warehouses can leave the
+    workshop unit short even when the local kit looks complete. Posting
+    Document_СборкаЗапасов would then fail with an opaque 1C error after the
+    document is already created. Check the live unit balance first and return
+    a human-readable refusal instead (None = ok to export).
+    """
+    if not entry.materials:
+        return None
+    cfg = config or {}
+    default_structural_unit = _config_ref1c(
+        cfg,
+        "default_production_structural_unit_ref1c",
+        DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C,
+    )
+    material_unit = _clean_ref1c(entry.material_structural_unit_ref1c or default_structural_unit)
+    if not material_unit:
+        return None
+
+    needed: Dict[str, float] = {}
+    for row in entry.materials:
+        ref = _clean_ref1c(row.get("Номенклатура_Key"))
+        qty = float(row.get("Количество") or 0.0)
+        if ref and qty > 1e-9:
+            needed[ref] = needed.get(ref, 0.0) + qty
+    if not needed:
+        return None
+
+    balances = _live_unit_balances(client, list(needed.keys()), material_unit)
+    if balances is None:
+        return None
+
+    shortfalls: List[Tuple[str, float, float]] = []
+    for ref, qty in needed.items():
+        have = balances.get(ref, 0.0)
+        if have + 1e-6 < qty:
+            shortfalls.append((ref, qty, have))
+    if not shortfalls:
+        return None
+
+    names = {
+        _clean_ref1c(item_ref): str(name or article or code or "")
+        for item_ref, name, article, code in (
+            db.query(Item.item_ref1c, Item.item_name, Item.item_article, Item.item_code)
+            .filter(Item.item_ref1c.in_([ref for ref, _, _ in shortfalls]))
+            .all()
+        )
+    }
+    warehouse_row = (
+        db.query(StockWarehouse.warehouse_name)
+        .filter(StockWarehouse.warehouse_ref1c == material_unit)
+        .first()
+    )
+    unit_name = str(warehouse_row[0]) if warehouse_row and warehouse_row[0] else material_unit
+    details = "; ".join(
+        f"{names.get(ref) or ref}: нужно {qty:g}, в 1С {have:g}"
+        for ref, qty, have in shortfalls[:10]
+    )
+    return (
+        f"Недостаточно остатков в 1С на складе материалов «{unit_name}»: {details}. "
+        "СборкаЗапасов не выгружена — переместите недостающее в 1С и повторите выпуск."
+    )
+
+
 def _build_header_payload(entry: ManufactureExportEntry, config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     cfg = config or {}
     organization_ref = _config_ref1c(cfg, "default_organization_ref1c", DEFAULT_ORGANIZATION_REF1C)
@@ -606,6 +731,30 @@ def export_manufactures_to_1c(
     )
     _inherit_structural_units_from_parent_order(client, eligible)
 
+    # Pre-flight: refuse exports whose component write-off cannot be covered
+    # by the live 1C balance of the material unit. Catches PRODPLAN/1C ledger
+    # divergence before a document is created instead of an opaque posting
+    # failure after.
+    blocked = 0
+    exportable: List[ManufactureExportEntry] = []
+    for entry in eligible:
+        guard_error = _verify_material_balances(db, client, entry, config)
+        if guard_error:
+            entry.status = "error"
+            entry.error = guard_error
+            m_row = (
+                db.query(ProductionManufacture)
+                .filter(ProductionManufacture.manufacture_id == entry.manufacture_id)
+                .one()
+            )
+            m_row.export_error = guard_error
+            blocked += 1
+            continue
+        exportable.append(entry)
+    if blocked:
+        db.commit()
+    eligible = exportable
+
     payloads: List[Dict[str, Any]] = []
     for entry in eligible:
         payload = _build_header_payload(entry, config)
@@ -658,7 +807,8 @@ def export_manufactures_to_1c(
     )
 
     summary["manufactures_created"] = created
-    summary["manufactures_error"] = errored
+    summary["manufactures_blocked"] = blocked
+    summary["manufactures_error"] = errored + blocked
     summary["entries"] = [asdict(e) for e in entries]
-    summary["status"] = "ok" if errored == 0 else "partial_error"
+    summary["status"] = "ok" if errored + blocked == 0 else "partial_error"
     return summary
