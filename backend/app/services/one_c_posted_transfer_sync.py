@@ -38,9 +38,10 @@ from .odata_client import OData1CClient
 from .one_c_stock_transfer_export import STOCK_TRANSFER_ENTITY
 
 
-# 1C OData filters often choke on overly-long URLs. Match the production_
-# order_sync batch size.
-BATCH_SIZE = 100
+# 1C OData filters often choke on overly-long OR URLs, especially when the
+# response includes the nested Запасы table part. Keep batches deliberately
+# small so already-posted documents are not silently missed.
+BATCH_SIZE = 15
 
 
 def _fetch_pending_links(db: Session) -> List[SyncLink]:
