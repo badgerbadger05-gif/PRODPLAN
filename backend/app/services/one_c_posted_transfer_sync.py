@@ -22,11 +22,12 @@ production_order_sync / supplier_order_sync code paths.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
 from ..models import (
+    Item,
     ProductionMaterialIssue,
     ProductionOrderLineState,
     SyncLink,
@@ -50,21 +51,22 @@ def _fetch_pending_links(db: Session) -> List[SyncLink]:
             SyncLink.source_system == "PRODPLAN",
             SyncLink.source_doctype == "material_issue",
             SyncLink.target_entity == STOCK_TRANSFER_ENTITY,
-            SyncLink.status == "success",
+            SyncLink.status.in_(("success", "posted")),
             SyncLink.target_ref_key.isnot(None),
         )
         .all()
     )
 
 
-def _query_posted_refs(client: OData1CClient, ref_keys: Iterable[str]) -> Set[str]:
+def _query_posted_docs(client: OData1CClient, ref_keys: Iterable[str]) -> Dict[str, Dict[str, Any]]:
     """
-    Return the subset of `ref_keys` that exist in 1C as
-    Document_ПеремещениеЗапасов with Posted=true. Filters non-deleted server
-    side too where 1C honours it; we double-check DeletionMark in code per the
-    proven pattern in production_order_sync.
+    Return posted 1C transfer docs by Ref_Key, including their stock rows.
+
+    We re-read already-posted links too: users may manually edit and re-post a
+    transfer in 1C after PRODPLAN first observed Posted=true. The local
+    reservation must follow the posted 1C document quantity.
     """
-    found: Set[str] = set()
+    found: Dict[str, Dict[str, Any]] = {}
     refs = [str(r).strip() for r in ref_keys if str(r or "").strip()]
     for i in range(0, len(refs), BATCH_SIZE):
         batch = refs[i : i + BATCH_SIZE]
@@ -76,7 +78,7 @@ def _query_posted_refs(client: OData1CClient, ref_keys: Iterable[str]) -> Set[st
             rows = client.get_all(
                 STOCK_TRANSFER_ENTITY,
                 filter_query=filter_q,
-                select_fields=["Ref_Key", "Posted", "DeletionMark"],
+                select_fields=["Ref_Key", "Posted", "DeletionMark", "Запасы"],
                 top=BATCH_SIZE,
                 max_records=BATCH_SIZE,
                 max_pages=1,
@@ -95,13 +97,56 @@ def _query_posted_refs(client: OData1CClient, ref_keys: Iterable[str]) -> Set[st
                 continue
             ref = str(rec.get("Ref_Key") or "").strip()
             if ref:
-                found.add(ref)
+                found[ref] = rec
     return found
+
+
+def _posted_quantities_by_item_ref(doc: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    result: Dict[str, float] = {}
+    for row in (doc or {}).get("Запасы") or []:
+        ref = str(row.get("Номенклатура_Key") or "").strip()
+        qty = float(row.get("Количество") or 0.0)
+        if ref and qty > 1e-9:
+            result[ref] = result.get(ref, 0.0) + qty
+    return result
+
+
+def _sync_issue_lines_from_posted_doc(
+    db: Session,
+    issue: ProductionMaterialIssue,
+    doc: Optional[Dict[str, Any]],
+) -> bool:
+    posted_by_ref = _posted_quantities_by_item_ref(doc)
+    if not posted_by_ref:
+        return False
+
+    item_ids = [int(line.component_item_id) for line in issue.lines or [] if line.component_item_id]
+    if not item_ids:
+        return False
+    item_ref_by_id = {
+        int(item.item_id): str(item.item_ref1c or "").strip()
+        for item in db.query(Item).filter(Item.item_id.in_(item_ids)).all()
+    }
+
+    changed = False
+    for line in issue.lines or []:
+        item_ref = item_ref_by_id.get(int(line.component_item_id))
+        if not item_ref or item_ref not in posted_by_ref:
+            continue
+        posted_qty = posted_by_ref[item_ref]
+        if abs(float(line.required_qty or 0.0) - posted_qty) > 1e-6:
+            line.required_qty = posted_qty
+            changed = True
+        if abs(float(line.issued_qty or 0.0) - posted_qty) > 1e-6:
+            line.issued_qty = posted_qty
+            changed = True
+    return changed
 
 
 def _apply_posted(
     db: Session,
     link: SyncLink,
+    doc: Optional[Dict[str, Any]] = None,
 ) -> Tuple[bool, Optional[str]]:
     """
     Idempotent state advancement for one material-issue link whose 1C
@@ -125,6 +170,9 @@ def _apply_posted(
 
     if issue.status != "posted":
         issue.status = "posted"
+        changed = True
+
+    if _sync_issue_lines_from_posted_doc(db, issue, doc):
         changed = True
 
     for line in issue.lines or []:
@@ -188,17 +236,17 @@ def sync_posted_transfers(db: Session, *, dry_run: bool = False) -> Dict[str, An
 
     client = _create_odata_client(_load_odata_config(), OData1CClient)
 
-    posted_refs = _query_posted_refs(client, by_ref.keys())
-    summary["posted_found"] = len(posted_refs)
+    posted_docs = _query_posted_docs(client, by_ref.keys())
+    summary["posted_found"] = len(posted_docs)
 
     advanced = 0
     errors: List[str] = []
-    for ref in posted_refs:
+    for ref, doc in posted_docs.items():
         link = by_ref.get(ref)
         if link is None:
             continue
         try:
-            changed, err = _apply_posted(db, link)
+            changed, err = _apply_posted(db, link, doc)
             if err:
                 errors.append(err)
                 continue

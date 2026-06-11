@@ -9,6 +9,7 @@ import pytest
 from app.models import (
     Item,
     ProductionMaterialIssue,
+    ProductionMaterialIssueLine,
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
@@ -79,6 +80,15 @@ def _mk_issue_with_link(
     )
     db.add(issue)
     db.flush()
+    db.add(
+        ProductionMaterialIssueLine(
+            issue_id=int(issue.issue_id),
+            component_item_id=int(item.item_id),
+            required_qty=1.0,
+            issued_qty=0.0,
+            line_status="planned",
+        )
+    )
 
     link = SyncLink(
         source_system="PRODPLAN",
@@ -113,7 +123,17 @@ class _FakeOData:
                     ref = chunk.split("'", 1)[0]
                     if ref in self.posted_refs:
                         rows.append(
-                            {"Ref_Key": ref, "Posted": True, "DeletionMark": False}
+                            {
+                                "Ref_Key": ref,
+                                "Posted": True,
+                                "DeletionMark": False,
+                                "Запасы": [
+                                    {
+                                        "Номенклатура_Key": f"item-ref-{ref}",
+                                        "Количество": 1.0,
+                                    }
+                                ],
+                            }
                         )
         return rows
 
@@ -167,7 +187,7 @@ def test_advances_to_assembled_when_1c_says_posted(db_session, monkeypatch):
 
 
 def test_idempotent_repeat_run(db_session, monkeypatch):
-    """Second pass after the first must not flag anything as `advanced`."""
+    """Second pass still checks posted docs, but does not flag unchanged rows."""
     db = db_session
     issue, link = _mk_issue_with_link(db, target_ref_key="ref-bbb")
     _stub_config(monkeypatch)
@@ -178,12 +198,46 @@ def test_idempotent_repeat_run(db_session, monkeypatch):
     first = posted_sync.sync_posted_transfers(db)
     assert first["advanced"] == 1
 
-    # Re-run. Link is already status='posted' AND not in pending list anymore
-    # (filter sync_link.status == 'success' excludes it). So candidates drop
-    # to 0 and advanced stays 0.
     second = posted_sync.sync_posted_transfers(db)
-    assert second["candidates"] == 0
+    assert second["candidates"] == 1
+    assert second["posted_found"] == 1
     assert second["advanced"] == 0
+
+
+def test_repeat_run_updates_quantity_changed_in_1c(db_session, monkeypatch):
+    db = db_session
+    issue, link = _mk_issue_with_link(
+        db,
+        issue_status="posted",
+        target_ref_key="ref-qty",
+        link_status="posted",
+    )
+    line = issue.lines[0]
+    line.required_qty = 0.656
+    line.issued_qty = 0.656
+    db.commit()
+
+    class _QtyChangedOData(_FakeOData):
+        def get_all(self, entity, filter_query=None, select_fields=None, **kwargs):
+            rows = super().get_all(entity, filter_query, select_fields, **kwargs)
+            for row in rows:
+                row["Запасы"][0]["Количество"] = 0.688
+            return rows
+
+    _stub_config(monkeypatch)
+    monkeypatch.setattr(
+        posted_sync, "OData1CClient", lambda **_: _QtyChangedOData({"ref-qty"})
+    )
+
+    result = posted_sync.sync_posted_transfers(db)
+
+    assert result["status"] == "ok"
+    assert result["candidates"] == 1
+    assert result["posted_found"] == 1
+    assert result["advanced"] == 1
+    db.refresh(line)
+    assert float(line.required_qty) == pytest.approx(0.688)
+    assert float(line.issued_qty) == pytest.approx(0.688)
 
 
 def test_does_not_regress_state_past_assembled(db_session, monkeypatch):
