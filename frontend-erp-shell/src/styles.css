@@ -576,6 +576,7 @@ input:focus, select:focus {
 .pill.completed, .miniPill.completed { background: #eef1f5; border-color: #9aa6b2; color: #334155; }
 .pill.produced, .pill.produced_partial,
 .miniPill.produced, .miniPill.produced_partial { background: #e7f7f4; border-color: #9fd3cd; color: #0f766e; }
+.pill.production_error, .miniPill.production_error { background: #ffe5e5; border-color: #ef9a9a; color: var(--red); }
 .pill.success { background: #e7f6ee; border-color: #9bd0b4; color: var(--green); }
 .pill.running { background: #e6f0ff; border-color: #9cbce8; color: var(--blue); }
 .pill.failed { background: #ffe5e5; border-color: #ef9a9a; color: var(--red); }

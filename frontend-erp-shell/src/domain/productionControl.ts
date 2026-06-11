@@ -46,6 +46,8 @@ export type OrderRow = {
   mrp_req_net_qty?: number | null
   mrp_req_covered_qty?: number | null
   mrp_req_remaining_qty?: number | null
+  failed_manufacture_id?: number | null
+  failed_manufacture_error?: string | null
 }
 
 export type MaterialRow = {
@@ -283,6 +285,7 @@ export const coverageLabels: Record<string, string> = {
   done: 'Готов',
   produced_partial: 'Готов',
   produced: 'Готов',
+  production_error: 'Ошибка выпуска',
   completed: 'Завершён',
 }
 

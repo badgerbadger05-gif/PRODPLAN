@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
@@ -13,6 +13,7 @@ from ..models import (
     PlannedOrder,
     PlanningRun,
     ProductionPlanHeader,
+    ProductionManufacture,
     ProductionMaterialIssue,
     ProductionOrder,
     ProductionOrderLineState,
@@ -51,6 +52,7 @@ LINE_STATUSES = {
     "done",
     "produced_partial",
     "produced",
+    "production_error",
     "completed",
     "cancelled",
 }
@@ -68,6 +70,7 @@ COVERAGE_LABELS = {
     "done": "Готов",
     "produced_partial": "Готов",
     "produced": "Готов",
+    "production_error": "Ошибка выпуска",
     "completed": "Завершён",
     "cancelled": "Отменен",
 }
@@ -851,6 +854,10 @@ def list_journal(
     run_id = _latest_run_id(db)
     latest_run = db.query(PlanningRun).filter(PlanningRun.run_id == run_id).first() if run_id else None
     requested_coverage_status = str(coverage_status) if coverage_status else None
+    failed_manufacture_products = (
+        select(ProductionManufacture.product_id)
+        .filter(ProductionManufacture.status == "error")
+    )
 
     query = (
         db.query(ProductionProduct)
@@ -859,8 +866,14 @@ def list_journal(
         .outerjoin(ProductionOrderLineState, ProductionOrderLineState.product_id == ProductionProduct.product_id)
         .filter(ProductionOrder.deletion_mark == False)
         .filter(or_(ProductionOrder.order_state_key.is_(None), func.lower(ProductionOrder.order_state_key) != DONE_STATE_KEY))
-        .filter(func.coalesce(ProductionProduct.remaining_qty, ProductionProduct.quantity) > 0)
-        .filter(func.coalesce(ProductionOrderLineState.status, "shortage").notin_(tuple(_TERMINAL_LINE_STATUSES)))
+        .filter(or_(
+            func.coalesce(ProductionProduct.remaining_qty, ProductionProduct.quantity) > 0,
+            ProductionProduct.product_id.in_(failed_manufacture_products),
+        ))
+        .filter(or_(
+            func.coalesce(ProductionOrderLineState.status, "shortage").notin_(tuple(_TERMINAL_LINE_STATUSES)),
+            ProductionProduct.product_id.in_(failed_manufacture_products),
+        ))
         .options(
             joinedload(ProductionProduct.order),
             joinedload(ProductionProduct.item),
@@ -1027,6 +1040,17 @@ def list_journal(
             .all()
         ):
             issue_count_by_product[int(row.product_id)] = int(row.issue_count or 0)
+    failed_manufacture_by_product: Dict[int, ProductionManufacture] = {}
+    if product_ids:
+        failed_rows = (
+            db.query(ProductionManufacture)
+            .filter(ProductionManufacture.product_id.in_(product_ids))
+            .filter(ProductionManufacture.status == "error")
+            .order_by(ProductionManufacture.product_id.asc(), ProductionManufacture.manufacture_id.desc())
+            .all()
+        )
+        for manufacture in failed_rows:
+            failed_manufacture_by_product.setdefault(int(manufacture.product_id), manufacture)
     unit_by_raw = _unit_display_by_raw(db, [getattr(product.item, "unit", None) for product in rows if product.item])
 
     result: List[Dict[str, Any]] = []
@@ -1064,6 +1088,7 @@ def list_journal(
             order_one_c_number = str(product.order.order_number or "")
 
         issue_count = issue_count_by_product.get(int(product.product_id), 0)
+        failed_manufacture = failed_manufacture_by_product.get(int(product.product_id))
         line_status = str(state.status if state else "shortage")
         issue_status = str(state.issue_status if state else "not_requested")
         material_coverage_status = str(getattr(state, "material_coverage_status", "") or "")
@@ -1073,6 +1098,8 @@ def list_journal(
             work_status = _journal_work_status(row_coverage_status)
         else:
             work_status = _journal_work_status(line_status)
+        if failed_manufacture is not None:
+            work_status = "production_error"
         coverage_label = (
             material_coverage_label
             if row_coverage_status == material_coverage_status and material_coverage_label
@@ -1120,6 +1147,8 @@ def list_journal(
                 "issue_count": int(issue_count),
                 "route_sheet_printed_at": _date_to_iso(state.route_sheet_printed_at) if state else None,
                 "comment": str(state.comment or "") if state else "",
+                "failed_manufacture_id": int(failed_manufacture.manufacture_id) if failed_manufacture else None,
+                "failed_manufacture_error": str(failed_manufacture.export_error or "") if failed_manufacture else None,
                 "source_run_id": int(product.order.source_run_id) if product.order.source_run_id is not None else None,
                 **source_plan,
                 "source_planned_order_id": source_planned_order_id,

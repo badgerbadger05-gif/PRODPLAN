@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from app.models import (
     DefaultSpecification,
     ProductionKind,
+    ProductionManufacture,
     ResourceProductionKind,
     Employee,
     Item,
@@ -425,6 +426,60 @@ def test_journal_and_material_issue_are_scoped_to_order_line(db_session):
     # 'to_move' ("документы созданы, ждём проведения") per plan.
     assert journal_after["rows"][0]["status"] == "to_move"
     assert journal_after["rows"][0]["issue_count"] == 1
+
+
+def test_journal_keeps_failed_1c_manufacture_visible(db_session):
+    item = Item(
+        item_code="ERR-P",
+        item_name="Деталь с ошибкой выпуска",
+        item_article="ERR-P",
+        unit="шт",
+        stock_qty=0,
+        status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+    order = ProductionOrder(
+        order_number="PP001308410",
+        order_date=datetime(2026, 6, 8),
+        order_ref1c="order-ref-error",
+        is_posted=True,
+        deletion_mark=False,
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=item.item_id,
+        line_number=1,
+        quantity=140,
+        produced_qty=140,
+        remaining_qty=0,
+    )
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(ProductionOrderLineState(
+        product_id=product.product_id,
+        status="produced",
+        issue_status="posted",
+    ))
+    db_session.add(ProductionManufacture(
+        product_id=product.product_id,
+        order_id=order.order_id,
+        qty=140,
+        status="error",
+        exported_ref1c="manufacture-ref-error",
+        export_error="Не удалось провести производство",
+    ))
+    db_session.commit()
+
+    journal = list_journal(db_session, search="1308410")
+
+    assert journal["total"] == 1
+    row = journal["rows"][0]
+    assert row["product_id"] == product.product_id
+    assert row["status"] == "production_error"
+    assert row["failed_manufacture_error"] == "Не удалось провести производство"
 
 
 def test_journal_exposes_prodplan_number_separately_from_1c_number(db_session):
