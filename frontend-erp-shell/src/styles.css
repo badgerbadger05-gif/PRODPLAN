@@ -1572,3 +1572,99 @@ input:focus, select:focus {
   display: flex;
   gap: 4px;
 }
+
+.bomCommandBar {
+  flex-wrap: nowrap;
+}
+
+.bomSearchInput input {
+  width: 280px;
+}
+
+.bomStart {
+  min-height: 0;
+  flex: 1;
+  display: flex;
+}
+
+.bomSearchPane {
+  flex: 1;
+  border-right: 0;
+}
+
+.bomSearchTable {
+  min-width: 980px;
+}
+
+.bomSummaryStrip {
+  grid-template-columns: repeat(6, minmax(110px, 1fr));
+}
+
+.bomTabs {
+  flex: 0 0 auto;
+}
+
+.bomCockpitSplit {
+  grid-template-columns: minmax(820px, 1fr) 360px;
+}
+
+.bomTreeTable {
+  min-width: 1220px;
+}
+
+.bomFlatTable {
+  min-width: 1120px;
+}
+
+.bomWhereTable {
+  min-width: 1080px;
+}
+
+.bomQualityTable {
+  min-width: 960px;
+}
+
+.bomNameCell strong {
+  padding-left: calc(var(--level, 0) * 18px);
+}
+
+.operationRow td {
+  background: #f3f6fb !important;
+  color: #394454;
+}
+
+.operationRow .itemCell strong {
+  font-style: italic;
+}
+
+.bomDetailPane {
+  border-left: 1px solid var(--line);
+}
+
+.bomPathList {
+  margin-top: 10px;
+}
+
+.bomPathItem {
+  display: grid;
+  grid-template-columns: 70px 1fr;
+  gap: 8px;
+  border: 1px solid var(--line2);
+  border-bottom: 0;
+  background: #fff;
+  padding: 6px 7px;
+}
+
+.bomPathItem:last-child {
+  border-bottom: 1px solid var(--line2);
+}
+
+.bomPathItem strong {
+  text-align: right;
+  color: var(--blue);
+}
+
+.bomPathItem span {
+  color: #253040;
+  line-height: 1.25;
+}

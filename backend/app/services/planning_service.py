@@ -3688,8 +3688,7 @@ def build_order_stages(
             allowed_resources = resource_kind_cache.get(spec.production_kind_id, [])
             resource_kind = allowed_resources[0] if allowed_resources else None
             # Если у вида производства нет ни одной привязки к участку — это проблема входящих данных.
-            # Раньше формировалось предупреждение NO_AREA_FOR_PRODUCTION_KIND, которое использовалось на фронтенде.
-            # Восстанавливаем его генерацию (даже если далее сработает фолбэк по ResourceStage).
+            # Предупреждение NO_AREA_FOR_PRODUCTION_KIND показывается на фронтенде и странице разбора привязок.
             if not allowed_resources:
                 try:
                     w = log_warning(
@@ -3724,15 +3723,10 @@ def build_order_stages(
                 },
             )
             
-            # Resolve area_id with fallback via ResourceStage if needed
+            # Area comes from the production kind only. No stage fallback:
+            # an unbound kind stays visible as NO_AREA_FOR_PRODUCTION_KIND
+            # instead of being silently routed by ResourceStage.
             area_resolved = resource_kind.resource_id if resource_kind else None
-            if area_resolved is None and spec_op.stage_id:
-                try:
-                    rs = db.query(ResourceStage).filter(ResourceStage.stage_id == spec_op.stage_id).first()
-                    if rs:
-                        area_resolved = int(rs.resource_id)
-                except Exception:
-                    area_resolved = None
 
             # Приводим типы к float, так как значения из БД приходят как Decimal
             norm_hours_per_unit_raw = spec_op.time_norm or op.time_norm or 0.0

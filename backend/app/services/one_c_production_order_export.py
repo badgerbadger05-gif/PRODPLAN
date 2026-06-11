@@ -27,20 +27,23 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
-    DefaultSpecification,
     Item,
     Operation,
     ProductionMaterialIssue,
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
-    ResourceStage,
     SpecComponent,
     Specification,
     SpecOperation,
     SyncLink,
     Unit,
-    WorkshopWarehouseBinding,
+)
+from .workshop_resolution import (
+    diagnose_product,
+    resolve_workshop_for_product,
+    spec_id_for_product,
+    warehouse_binding_for_workshop,
 )
 from .one_c_export_common import (
     DEFAULT_ORGANIZATION_REF1C,
@@ -168,63 +171,8 @@ def _short_order_number(order_id: int, run_id: Optional[int]) -> str:
     return f"PP{run_part:04d}{int(order_id) % 100000:05d}"
 
 
-def _default_spec_id(db: Session, product: ProductionProduct) -> Optional[int]:
-    if product.spec_id:
-        return int(product.spec_id)
-    row = (
-        db.query(DefaultSpecification)
-        .filter(DefaultSpecification.item_id == int(product.item_id))
-        .order_by(DefaultSpecification.id.asc())
-        .first()
-    )
-    return int(row.spec_id) if row else None
-
-
-def _workshop_id_for_product(db: Session, product: ProductionProduct, spec_id: Optional[int]) -> Optional[int]:
-    state = (
-        db.query(ProductionOrderLineState)
-        .filter(ProductionOrderLineState.product_id == int(product.product_id))
-        .first()
-    )
-    if state and state.workshop_id:
-        return int(state.workshop_id)
-
-    if not spec_id:
-        return None
-    stage_hours = (
-        db.query(SpecOperation.stage_id)
-        .filter(SpecOperation.spec_id == int(spec_id), SpecOperation.stage_id.isnot(None))
-        .group_by(SpecOperation.stage_id)
-        .order_by(func.sum(SpecOperation.time_norm).desc())
-        .first()
-    )
-    stage_id = int(stage_hours[0]) if stage_hours else None
-    if stage_id is None:
-        comp_stage = (
-            db.query(SpecComponent.stage_id)
-            .filter(SpecComponent.spec_id == int(spec_id), SpecComponent.stage_id.isnot(None))
-            .first()
-        )
-        stage_id = int(comp_stage[0]) if comp_stage else None
-    if stage_id is None:
-        return None
-    resource = (
-        db.query(ResourceStage.resource_id)
-        .filter(ResourceStage.stage_id == int(stage_id))
-        .order_by(ResourceStage.id.asc())
-        .first()
-    )
-    return int(resource[0]) if resource else None
-
-
 def _workshop_warehouse_refs(db: Session, workshop_id: Optional[int]) -> Tuple[Optional[str], Optional[str]]:
-    if not workshop_id:
-        return None, None
-    binding = (
-        db.query(WorkshopWarehouseBinding)
-        .filter(WorkshopWarehouseBinding.workshop_id == int(workshop_id))
-        .first()
-    )
+    binding = warehouse_binding_for_workshop(db, workshop_id)
     if not binding:
         return None, None
     workshop_ref = _clean_ref1c(binding.warehouse_ref1c) or None
@@ -359,18 +307,20 @@ def _current_moscow_datetime() -> str:
 
 def _collect_export_entries(
     db: Session, order_ids: List[int]
-) -> Tuple[List[ProductionOrderExportEntry], List[Dict[str, Any]]]:
+) -> Tuple[List[ProductionOrderExportEntry], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Load production_orders + their single ProductionProduct line + Item lookup.
-    Returns (entries, skipped) where skipped contains diagnostic dicts for
-    orders that can't be exported (wrong source, missing item ref, etc).
+    Returns (entries, skipped, warnings): skipped contains diagnostic dicts
+    for orders that can't be exported (wrong source, missing item ref, etc);
+    warnings are non-blocking routing problems (workshop not resolved).
     """
     entries: List[ProductionOrderExportEntry] = []
     skipped: List[Dict[str, Any]] = []
+    warnings: List[Dict[str, Any]] = []
 
     ids = [int(x) for x in order_ids if x is not None]
     if not ids:
-        return entries, skipped
+        return entries, skipped, warnings
 
     rows = (
         db.query(ProductionOrder)
@@ -415,8 +365,20 @@ def _collect_export_entries(
                 )
                 lines = []
                 break
-            spec_id = _default_spec_id(db, product)
-            workshop_id = _workshop_id_for_product(db, product, spec_id)
+            spec_id = spec_id_for_product(db, product)
+            workshop_id = resolve_workshop_for_product(db, product, spec_id=spec_id)
+            if workshop_id is None:
+                # The order is still exported (1C needs it even without a
+                # reserve unit), but the routing gap must be visible.
+                diagnosis = diagnose_product(db, product)
+                warnings.append(
+                    {
+                        "order_id": int(order.order_id),
+                        "product_id": int(product.product_id),
+                        "reason_code": diagnosis.reason_code,
+                        "message": f"{diagnosis.reason_text}. {diagnosis.recommendation}",
+                    }
+                )
             issue = _active_issue_for_product(db, int(product.product_id))
             workshop_warehouse_ref, production_warehouse_ref = _workshop_warehouse_refs(db, workshop_id)
             material_destination_ref = (
@@ -504,7 +466,7 @@ def _collect_export_entries(
             )
         )
 
-    return entries, skipped
+    return entries, skipped, warnings
 
 
 def _build_header_payload(
@@ -644,7 +606,7 @@ def export_production_orders_to_1c(
     base_url that doesn't look like a demo DB unless `allow_production=True`
     is also passed.
     """
-    entries, skipped = _collect_export_entries(db, list(order_ids))
+    entries, skipped, warnings = _collect_export_entries(db, list(order_ids))
 
     # Pre-flight: split entries into eligible / already-linked.
     eligible: List[ProductionOrderExportEntry] = []
@@ -681,6 +643,7 @@ def export_production_orders_to_1c(
         "orders_created": 0,
         "orders_error": 0,
         "skipped_rows": skipped,
+        "warnings": warnings,
         "entries": [],
     }
 

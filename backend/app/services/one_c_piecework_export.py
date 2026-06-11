@@ -36,11 +36,13 @@ from ..models import (
     Employee,
     Operation,
     ProductionStage,
-    ResourceStage,
     Specification,
     SpecOperation,
     SyncLink,
-    WorkshopWarehouseBinding,
+)
+from .workshop_resolution import (
+    resolve_workshop_for_product,
+    warehouse_binding_for_workshop,
 )
 from .one_c_export_common import (
     DEFAULT_ORGANIZATION_REF1C,
@@ -159,28 +161,24 @@ def _piecework_operation_defaults(
 
     so, op = spec_operation
     stage_ref = None
-    structural_unit_ref = None
     if so.stage_id:
         stage = db.query(ProductionStage).filter(ProductionStage.stage_id == int(so.stage_id)).one_or_none()
         stage_ref = _clean_ref1c(getattr(stage, "stage_ref1c", None)) or None
-        resource_stage = (
-            db.query(ResourceStage)
-            .filter(ResourceStage.stage_id == int(so.stage_id))
-            .order_by(ResourceStage.id.asc())
-            .first()
+
+    # Structural unit of the piecework order = the line's resolved workshop
+    # (production kind / manual assignment), not the stage chain. The document
+    # has always carried a single unit (the first operation's stage used to
+    # pick it), so this loses no granularity and keeps the piecework order
+    # consistent with the journal and the transfers.
+    structural_unit_ref = None
+    workshop_id = resolve_workshop_for_product(db, product, spec_id=spec_id) if product else None
+    binding = warehouse_binding_for_workshop(db, workshop_id)
+    if binding:
+        structural_unit_ref = (
+            _clean_ref1c(binding.production_warehouse_ref1c)
+            or _clean_ref1c(binding.warehouse_ref1c)
+            or None
         )
-        if resource_stage:
-            binding = (
-                db.query(WorkshopWarehouseBinding)
-                .filter(WorkshopWarehouseBinding.workshop_id == int(resource_stage.resource_id))
-                .one_or_none()
-            )
-            if binding:
-                structural_unit_ref = (
-                    _clean_ref1c(binding.production_warehouse_ref1c)
-                    or _clean_ref1c(binding.warehouse_ref1c)
-                    or None
-                )
 
     return PieceworkOperationDefaults(
         operation_ref1c=_clean_ref1c(op.operation_ref1c) or None,

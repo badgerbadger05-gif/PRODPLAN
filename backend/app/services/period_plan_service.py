@@ -24,7 +24,6 @@ from ..models import (
     ProductionPlanHeader,
     ProductionPlanLine,
     ProductionResource,
-    ResourceStage,
     ResourceProductionKind,
     SpecComponent,
     SpecOperation,

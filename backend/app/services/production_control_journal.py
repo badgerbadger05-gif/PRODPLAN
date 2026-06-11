@@ -18,11 +18,8 @@ from ..models import (
     ProductionOrderLineState,
     ProductionProduct,
     ProductionResource,
-    ProductionStage,
     ResourceProductionKind,
-    ResourceStage,
     SpecComponent,
-    SpecOperation,
     Specification,
     SyncLink,
     Unit,
@@ -443,110 +440,26 @@ def _forecast_payload(forecast_date: Optional[date], due_date: Optional[date]) -
     }
 
 
-def _main_workshop_for_spec(db: Session, spec_id: Optional[int]) -> Tuple[Optional[int], Optional[str], Optional[int], Optional[str]]:
-    if not spec_id:
-        return (None, None, None, None)
-
-    stage_hours = (
-        db.query(SpecOperation.stage_id, func.sum(SpecOperation.time_norm).label("hours"))
-        .filter(SpecOperation.spec_id == spec_id, SpecOperation.stage_id.isnot(None))
-        .group_by(SpecOperation.stage_id)
-        .all()
-    )
-    stage_id: Optional[int] = None
-    if stage_hours:
-        stage_id = int(max(stage_hours, key=lambda r: _to_float(r.hours)).stage_id)
-    else:
-        comp_stage = (
-            db.query(SpecComponent.stage_id)
-            .filter(SpecComponent.spec_id == spec_id, SpecComponent.stage_id.isnot(None))
-            .first()
-        )
-        if comp_stage:
-            stage_id = int(comp_stage.stage_id)
-
-    stage_name: Optional[str] = None
-    if stage_id:
-        stage = db.query(ProductionStage).filter(ProductionStage.stage_id == stage_id).first()
-        stage_name = str(stage.stage_name) if stage else None
-
-    workshop_id: Optional[int] = None
-    workshop_name: Optional[str] = None
-    if stage_id:
-        resource_stage = (
-            db.query(ResourceStage)
-            .options(joinedload(ResourceStage.resource))
-            .filter(ResourceStage.stage_id == stage_id)
-            .order_by(ResourceStage.id.asc())
-            .first()
-        )
-        if resource_stage and resource_stage.resource:
-            workshop_id = int(resource_stage.resource_id)
-            workshop_name = str(resource_stage.resource.resource_name)
-
-    return (workshop_id, workshop_name, stage_id, stage_name)
-
-
 def _default_spec_ids_by_item(db: Session, item_ids: Sequence[int]) -> Dict[int, int]:
-    if not item_ids:
-        return {}
-    result: Dict[int, int] = {}
-    for row in (
-        db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
-        .filter(DefaultSpecification.item_id.in_(list({int(item_id) for item_id in item_ids})))
-        .order_by(DefaultSpecification.id.asc())
-        .all()
-    ):
-        result.setdefault(int(row.item_id), int(row.spec_id))
-    return result
+    from .workshop_resolution import default_spec_ids_for_items
+
+    return default_spec_ids_for_items(db, item_ids)
 
 
 def _main_workshops_for_specs(
     db: Session,
     spec_ids: Sequence[int],
 ) -> Dict[int, Tuple[Optional[int], Optional[str], Optional[int], Optional[str]]]:
+    from .workshop_resolution import main_stages_for_specs
+
     ids = sorted({int(spec_id) for spec_id in spec_ids if spec_id})
     if not ids:
         return {}
 
-    stage_by_spec: Dict[int, int] = {}
-    hours_by_spec_stage = (
-        db.query(
-            SpecOperation.spec_id,
-            SpecOperation.stage_id,
-            func.sum(SpecOperation.time_norm).label("hours"),
-        )
-        .filter(SpecOperation.spec_id.in_(ids), SpecOperation.stage_id.isnot(None))
-        .group_by(SpecOperation.spec_id, SpecOperation.stage_id)
-        .all()
-    )
-    best_hours: Dict[int, float] = {}
-    for row in hours_by_spec_stage:
-        spec_id = int(row.spec_id)
-        hours = _to_float(row.hours)
-        if spec_id not in best_hours or hours > best_hours[spec_id]:
-            best_hours[spec_id] = hours
-            stage_by_spec[spec_id] = int(row.stage_id)
-
-    missing_ids = [spec_id for spec_id in ids if spec_id not in stage_by_spec]
-    if missing_ids:
-        for row in (
-            db.query(SpecComponent.spec_id, SpecComponent.stage_id)
-            .filter(SpecComponent.spec_id.in_(missing_ids), SpecComponent.stage_id.isnot(None))
-            .order_by(SpecComponent.component_id.asc())
-            .all()
-        ):
-            stage_by_spec.setdefault(int(row.spec_id), int(row.stage_id))
-
-    stage_ids = sorted({stage_id for stage_id in stage_by_spec.values() if stage_id})
-    stage_name_by_id: Dict[int, str] = {}
-    if stage_ids:
-        for row in (
-            db.query(ProductionStage.stage_id, ProductionStage.stage_name)
-            .filter(ProductionStage.stage_id.in_(stage_ids))
-            .all()
-        ):
-            stage_name_by_id[int(row.stage_id)] = str(row.stage_name or "")
+    # Stage is display-only (the journal's "этап" column). The workshop comes
+    # exclusively from the spec's production kind — the legacy stage->resource
+    # fallback used to mask specs with an unfilled kind.
+    stage_by_spec = main_stages_for_specs(db, ids)
 
     resource_by_spec: Dict[int, Tuple[int, str]] = {}
     for row in (
@@ -565,30 +478,11 @@ def _main_workshops_for_specs(
             (int(row.resource_id), str(row.resource_name or "")),
         )
 
-    resource_by_stage: Dict[int, Tuple[int, str]] = {}
-    if stage_ids:
-        for row in (
-            db.query(ResourceStage.stage_id, ResourceStage.resource_id, ProductionResource.resource_name)
-            .join(ProductionResource, ProductionResource.resource_id == ResourceStage.resource_id)
-            .filter(ResourceStage.stage_id.in_(stage_ids))
-            .order_by(ResourceStage.id.asc())
-            .all()
-        ):
-            resource_by_stage.setdefault(int(row.stage_id), (int(row.resource_id), str(row.resource_name or "")))
-
     result: Dict[int, Tuple[Optional[int], Optional[str], Optional[int], Optional[str]]] = {}
     for spec_id in ids:
-        stage_id = stage_by_spec.get(spec_id)
-        resource_id, resource_name = resource_by_spec.get(
-            spec_id,
-            resource_by_stage.get(stage_id or 0, (None, None)),
-        )
-        result[spec_id] = (
-            resource_id,
-            resource_name,
-            stage_id,
-            stage_name_by_id.get(stage_id or 0),
-        )
+        stage_id, stage_name = stage_by_spec.get(spec_id, (None, None))
+        resource_id, resource_name = resource_by_spec.get(spec_id, (None, None))
+        result[spec_id] = (resource_id, resource_name, stage_id, stage_name)
     return result
 
 

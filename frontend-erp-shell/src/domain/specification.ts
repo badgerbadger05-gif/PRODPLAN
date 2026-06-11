@@ -18,4 +18,88 @@ export type SpecNode = {
 
 export type SpecFlatRow = SpecNode & {
   level: number
+  path?: string[]
+}
+
+export type BomItem = {
+  item_id: number
+  item_code: string
+  item_name: string
+  item_article?: string | null
+  item_ref1c?: string | null
+  unit?: string | null
+  unit_ref1c?: string | null
+  replenishment_method?: string | null
+  stock_qty?: number | null
+  spec_id?: number | null
+  spec_code?: string | null
+  spec_name?: string | null
+  spec_ref1c?: string | null
+  default_spec_count?: number
+  has_children?: boolean
+}
+
+export type BomSearchResponse = {
+  items: BomItem[]
+  meta: { q?: string; count?: number; limit?: number }
+}
+
+export type BomFlattenedItem = {
+  item_id: number
+  item_code: string
+  article?: string | null
+  name: string
+  unit?: string | null
+  replenishment_method?: string | null
+  total_qty: number
+  occurrences: number
+  levels: number[]
+  stages: string[]
+  paths: Array<{ level: number; qty: number; path: string }>
+  warnings: string[]
+  has_children?: boolean
+}
+
+export type BomFlattenedResponse = {
+  items: BomFlattenedItem[]
+  meta: { root?: BomItem; count?: number; root_qty?: number }
+}
+
+export type BomWhereUsedItem = {
+  parent: BomItem
+  spec: {
+    spec_id: number
+    spec_code?: string | null
+    spec_name?: string | null
+    spec_ref1c?: string | null
+  }
+  component_item_id: number
+  qty_per_parent: number
+  total_qty_to_target: number
+  level_up: number
+  stage?: { id: number; name: string } | null
+  path: Array<{ item_id: number; article?: string | null; name: string }>
+}
+
+export type BomWhereUsedResponse = {
+  items: BomWhereUsedItem[]
+  meta: { target?: BomItem; count?: number; max_depth?: number }
+}
+
+export type BomQualityIssue = {
+  code: string
+  severity: 'error' | 'warning' | 'info' | string
+  message: string
+  item?: {
+    item_id: number
+    item_code: string
+    item_article?: string | null
+    item_name: string
+  } | null
+  spec_id?: number | null
+}
+
+export type BomQualityResponse = {
+  issues: BomQualityIssue[]
+  meta: { root?: BomItem; count?: number }
 }

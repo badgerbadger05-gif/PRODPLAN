@@ -17,9 +17,7 @@ from ..models import (
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
-    ResourceStage,
     SpecComponent,
-    SpecOperation,
     StockWarehouse,
     SyncLink,
     WorkshopWarehouseBinding,
@@ -41,6 +39,12 @@ from .production_control_reservations import (
     ReservationState,
     TRANSIT_STATUSES,
     load_reservation_state,
+)
+from .workshop_resolution import (
+    diagnose_product,
+    format_diagnosis_error,
+    resolve_workshop_for_product,
+    warehouse_binding_for_workshop,
 )
 
 PRODUCTION_ORDER_ENTITY = "Document_ЗаказНаПроизводство"
@@ -458,59 +462,13 @@ def delete_local_material_issue(db: Session, issue_id: int) -> Dict[str, Any]:
     return {"status": "ok", "issue_id": int(issue_id), "deleted": True}
 
 
-def _workshop_id_for_product(
-    db: Session,
-    product: ProductionProduct,
-    spec_id: Optional[int],
-) -> Optional[int]:
-    state_obj = (
-        db.query(ProductionOrderLineState)
-        .filter(ProductionOrderLineState.product_id == int(product.product_id))
-        .first()
-    )
-    if state_obj and state_obj.workshop_id:
-        return int(state_obj.workshop_id)
-    if not spec_id:
-        return None
-    stage_hours = (
-        db.query(SpecOperation.stage_id)
-        .filter(SpecOperation.spec_id == int(spec_id), SpecOperation.stage_id.isnot(None))
-        .group_by(SpecOperation.stage_id)
-        .order_by(func.sum(SpecOperation.time_norm).desc())
-        .first()
-    )
-    stage_id = int(stage_hours[0]) if stage_hours else None
-    if stage_id is None:
-        comp_stage = (
-            db.query(SpecComponent.stage_id)
-            .filter(SpecComponent.spec_id == int(spec_id), SpecComponent.stage_id.isnot(None))
-            .first()
-        )
-        stage_id = int(comp_stage[0]) if comp_stage else None
-    if stage_id is None:
-        return None
-    resource = (
-        db.query(ResourceStage.resource_id)
-        .filter(ResourceStage.stage_id == int(stage_id))
-        .order_by(ResourceStage.id.asc())
-        .first()
-    )
-    return int(resource[0]) if resource else None
-
-
 def _destination_warehouse_for_product(
     db: Session,
     product: ProductionProduct,
     spec_id: Optional[int],
 ) -> Optional[str]:
-    workshop_id_resolved = _workshop_id_for_product(db, product, spec_id)
-    if not workshop_id_resolved:
-        return None
-    binding = (
-        db.query(WorkshopWarehouseBinding)
-        .filter(WorkshopWarehouseBinding.workshop_id == int(workshop_id_resolved))
-        .first()
-    )
+    workshop_id_resolved = resolve_workshop_for_product(db, product, spec_id=spec_id)
+    binding = warehouse_binding_for_workshop(db, workshop_id_resolved)
     return _clean_ref1c(binding.warehouse_ref1c) if binding else None
 
 
@@ -758,7 +716,12 @@ def create_material_issues(
 
         spec_id, components = _components_for_product(db, product)
         if not components:
-            errors.append(f"product_id={pid}: не найдена спецификация или материалы")
+            if not spec_id:
+                errors.append(
+                    format_diagnosis_error(f"product_id={pid}", diagnose_product(db, product))
+                )
+            else:
+                errors.append(f"product_id={pid}: в спецификации нет материалов")
             continue
 
         # If the caller did not pin a destination warehouse, fall back to the
@@ -767,6 +730,14 @@ def create_material_issues(
         resolved_warehouse = warehouse_ref1c
         if not resolved_warehouse:
             resolved_warehouse = _destination_warehouse_for_product(db, product, spec_id)
+        if not resolved_warehouse:
+            # No explicit destination and the kind->workshop->warehouse chain
+            # does not resolve: refuse instead of creating a transfer with an
+            # empty destination. The diagnosis names the exact fix.
+            errors.append(
+                format_diagnosis_error(f"product_id={pid}", diagnose_product(db, product))
+            )
+            continue
 
         comp_ids = [int(c["component_item_id"]) for c in components]
         reservation_state = load_reservation_state(db, item_ids=comp_ids)

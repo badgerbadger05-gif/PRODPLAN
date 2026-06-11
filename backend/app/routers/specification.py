@@ -129,6 +129,87 @@ def _resolve_spec_id_for_item_id(db: Session, item_id: int) -> Optional[int]:
     return _resolve_spec_id_for_item(db, item)
 
 
+def _default_spec_count(db: Session, item_id: int) -> int:
+    return int(
+        db.query(DefaultSpecification)
+        .filter(DefaultSpecification.item_id == int(item_id))
+        .count()
+    )
+
+
+def _item_payload(db: Session, item: Item, units_map: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    units = units_map if units_map is not None else _build_units_map(db)
+    spec_id = _resolve_spec_id_for_item(db, item)
+    spec = db.query(Specification).filter(Specification.spec_id == int(spec_id)).first() if spec_id else None
+    return {
+        "item_id": int(item.item_id),
+        "item_code": str(item.item_code or ""),
+        "item_name": str(item.item_name or ""),
+        "item_article": str(item.item_article or "") if item.item_article else None,
+        "item_ref1c": str(item.item_ref1c or "") if item.item_ref1c else None,
+        "unit": _unit_label(units, item.unit),
+        "unit_ref1c": str(item.unit or "") if item.unit else None,
+        "replenishment_method": str(item.replenishment_method or "") if item.replenishment_method else None,
+        "stock_qty": _round_qty(_to_float(item.stock_qty), 3),
+        "spec_id": int(spec_id) if spec_id else None,
+        "spec_code": str(spec.spec_code or "") if spec else None,
+        "spec_name": str(spec.spec_name or "") if spec else None,
+        "spec_ref1c": str(spec.spec_ref1c or "") if spec and spec.spec_ref1c else None,
+        "default_spec_count": _default_spec_count(db, int(item.item_id)),
+        "has_children": _has_children(db, int(item.item_id)),
+    }
+
+
+def _node_item_id(node: Dict[str, Any]) -> Optional[int]:
+    try:
+        payload = node.get("item") or {}
+        if payload.get("id") is not None:
+            return int(payload.get("id"))
+    except Exception:
+        return None
+    return None
+
+
+def _walk_nodes(nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+
+    def visit(node: Dict[str, Any], path: List[Dict[str, Any]], level: int) -> None:
+        current_path = path
+        if node.get("type") == "item":
+            current_path = path + [
+                {
+                    "item_id": _node_item_id(node),
+                    "article": node.get("article"),
+                    "name": node.get("name"),
+                }
+            ]
+        copy = dict(node)
+        copy["level"] = level
+        copy["path"] = current_path
+        result.append(copy)
+        for child in node.get("children") or []:
+            visit(child, current_path, level + 1)
+
+    for root in nodes:
+        visit(root, [], 0)
+    return result
+
+
+def _quality_issue(code: str, severity: str, message: str, *, item: Optional[Item] = None, spec_id: Optional[int] = None) -> Dict[str, Any]:
+    return {
+        "code": code,
+        "severity": severity,
+        "message": message,
+        "item": {
+            "item_id": int(item.item_id),
+            "item_code": str(item.item_code or ""),
+            "item_article": str(item.item_article or "") if item.item_article else None,
+            "item_name": str(item.item_name or ""),
+        } if item else None,
+        "spec_id": int(spec_id) if spec_id else None,
+    }
+
+
 def _has_children(db: Session, for_item_id: int) -> bool:
     spec_id = _resolve_spec_id_for_item_id(db, for_item_id)
     if not spec_id:
@@ -915,3 +996,251 @@ def get_specification_full(
     except Exception as e:
         logger.exception(f"[spec.full] error: {e}")
         raise HTTPException(status_code=500, detail=f"Specification full error: {e}")
+
+
+@router.get("/search")
+def search_specification_items(
+    q: str = Query("", description="Поиск по артикулу, коду, названию или GUID"),
+    has_spec: Optional[bool] = Query(None, description="Фильтр по наличию разрешаемой спецификации"),
+    quality: Optional[str] = Query(None, description="Фильтр качества: no_spec|multiple_defaults"),
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    term = str(q or "").strip()
+    units_map = _build_units_map(db)
+    query = db.query(Item)
+    if term:
+        like = f"%{term}%"
+        query = query.filter(
+            or_(
+                Item.item_code.ilike(like),
+                Item.item_article.ilike(like),
+                Item.item_name.ilike(like),
+                Item.item_ref1c.ilike(like),
+            )
+        )
+    query = query.order_by(Item.item_article.asc().nulls_last(), Item.item_code.asc()).limit(int(limit) * 4)
+    rows: List[Dict[str, Any]] = []
+    for item in query.all():
+        payload = _item_payload(db, item, units_map)
+        resolved_has_spec = bool(payload.get("spec_id"))
+        if has_spec is not None and resolved_has_spec != bool(has_spec):
+            continue
+        if quality == "no_spec" and resolved_has_spec:
+            continue
+        if quality == "multiple_defaults" and int(payload.get("default_spec_count") or 0) <= 1:
+            continue
+        rows.append(payload)
+        if len(rows) >= int(limit):
+            break
+    return {"items": rows, "meta": {"q": term, "count": len(rows), "limit": int(limit)}}
+
+
+@router.get("/flattened")
+def get_specification_flattened(
+    item_code: Optional[str] = Query(None),
+    item_id: Optional[int] = Query(None),
+    item_ref1c: Optional[str] = Query(None),
+    root_qty: float = Query(1.0),
+    max_depth: int = Query(15, ge=1, le=50),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    if item_code is None and item_id is None and (item_ref1c is None or str(item_ref1c).strip() == ""):
+        raise HTTPException(status_code=400, detail="Either item_code, item_id or item_ref1c is required")
+    item = _get_item_by_code_or_id(db, item_code=item_code, item_id=item_id, item_ref1c=item_ref1c)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    units_map = _build_units_map(db)
+    root_node = _build_full_tree(db, item, _to_float(root_qty, 1.0), units_map, int(max_depth or 15))
+    flat_nodes = _walk_nodes([root_node])
+    by_item: Dict[int, Dict[str, Any]] = {}
+    for node in flat_nodes:
+        if node.get("type") != "item" or int(node.get("level") or 0) == 0:
+            continue
+        iid = _node_item_id(node)
+        if iid is None:
+            continue
+        entry = by_item.setdefault(
+            iid,
+            {
+                "item_id": iid,
+                "item_code": str((node.get("item") or {}).get("code") or ""),
+                "article": node.get("article"),
+                "name": node.get("name"),
+                "unit": node.get("unit"),
+                "replenishment_method": node.get("replenishmentMethod"),
+                "total_qty": 0.0,
+                "occurrences": 0,
+                "levels": [],
+                "stages": [],
+                "paths": [],
+                "warnings": [],
+                "has_children": bool(node.get("hasChildren")),
+            },
+        )
+        qty = _to_float((node.get("computed") or {}).get("treeQty"), 0.0)
+        entry["total_qty"] = _to_float(entry["total_qty"]) + qty
+        entry["occurrences"] = int(entry["occurrences"]) + 1
+        level = int(node.get("level") or 0)
+        if level not in entry["levels"]:
+            entry["levels"].append(level)
+        stage_name = ((node.get("stage") or {}).get("name") if isinstance(node.get("stage"), dict) else None)
+        if stage_name and stage_name not in entry["stages"]:
+            entry["stages"].append(stage_name)
+        for warning in node.get("warnings") or []:
+            if warning not in entry["warnings"]:
+                entry["warnings"].append(warning)
+        path_names = [str(p.get("article") or p.get("name") or "") for p in node.get("path") or [] if p.get("name") or p.get("article")]
+        entry["paths"].append(
+            {
+                "level": level,
+                "qty": _round_qty(qty, 3),
+                "path": " / ".join(path_names),
+            }
+        )
+    rows = []
+    for entry in by_item.values():
+        entry["total_qty"] = _round_qty(_to_float(entry["total_qty"]), 3)
+        entry["levels"] = sorted(entry["levels"])
+        entry["stages"] = sorted(entry["stages"])
+        rows.append(entry)
+    rows.sort(key=lambda r: (str(r.get("article") or ""), str(r.get("name") or "")))
+    return {
+        "items": rows,
+        "meta": {
+            "root": _item_payload(db, item, units_map),
+            "root_qty": _round_qty(_to_float(root_qty, 1.0), 3),
+            "count": len(rows),
+        },
+    }
+
+
+@router.get("/where-used")
+def get_specification_where_used(
+    item_code: Optional[str] = Query(None),
+    item_id: Optional[int] = Query(None),
+    item_ref1c: Optional[str] = Query(None),
+    max_depth: int = Query(8, ge=1, le=25),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    if item_code is None and item_id is None and (item_ref1c is None or str(item_ref1c).strip() == ""):
+        raise HTTPException(status_code=400, detail="Either item_code, item_id or item_ref1c is required")
+    item = _get_item_by_code_or_id(db, item_code=item_code, item_id=item_id, item_ref1c=item_ref1c)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    units_map = _build_units_map(db)
+    target_id = int(item.item_id)
+    rows: List[Dict[str, Any]] = []
+    visited: set[Tuple[int, int]] = set()
+
+    def parents_for(child_item_id: int) -> List[Tuple[SpecComponent, Specification, Item]]:
+        return (
+            db.query(SpecComponent, Specification, Item)
+            .join(Specification, Specification.spec_id == SpecComponent.spec_id)
+            .join(DefaultSpecification, DefaultSpecification.spec_id == Specification.spec_id)
+            .join(Item, Item.item_id == DefaultSpecification.item_id)
+            .filter(SpecComponent.item_id == int(child_item_id))
+            .order_by(Item.item_article.asc().nulls_last(), Item.item_code.asc())
+            .all()
+        )
+
+    def climb(child_item_id: int, depth: int, multiplier: float, path: List[Dict[str, Any]]) -> None:
+        if depth >= int(max_depth):
+            return
+        for comp, spec, parent_item in parents_for(child_item_id):
+            key = (int(parent_item.item_id), int(child_item_id))
+            if key in visited:
+                continue
+            visited.add(key)
+            qty_per_parent = _to_float(comp.quantity)
+            total_qty = multiplier * qty_per_parent
+            stage = db.query(ProductionStage).filter(ProductionStage.stage_id == comp.stage_id).first() if comp.stage_id else None
+            row = {
+                "parent": _item_payload(db, parent_item, units_map),
+                "spec": {
+                    "spec_id": int(spec.spec_id),
+                    "spec_code": str(spec.spec_code or ""),
+                    "spec_name": str(spec.spec_name or ""),
+                    "spec_ref1c": str(spec.spec_ref1c or "") if spec.spec_ref1c else None,
+                },
+                "component_item_id": int(child_item_id),
+                "qty_per_parent": _round_qty(qty_per_parent, 3),
+                "total_qty_to_target": _round_qty(total_qty, 3),
+                "level_up": depth + 1,
+                "stage": {"id": int(stage.stage_id), "name": str(stage.stage_name or "")} if stage else None,
+                "path": path + [{
+                    "item_id": int(parent_item.item_id),
+                    "article": str(parent_item.item_article or "") if parent_item.item_article else None,
+                    "name": str(parent_item.item_name or ""),
+                }],
+            }
+            rows.append(row)
+            climb(int(parent_item.item_id), depth + 1, total_qty, row["path"])
+
+    climb(target_id, 0, 1.0, [])
+    rows.sort(key=lambda r: (int(r.get("level_up") or 0), str((r.get("parent") or {}).get("item_article") or ""), str((r.get("parent") or {}).get("item_name") or "")))
+    return {"items": rows, "meta": {"target": _item_payload(db, item, units_map), "count": len(rows), "max_depth": int(max_depth)}}
+
+
+@router.get("/quality")
+def get_specification_quality(
+    item_code: Optional[str] = Query(None),
+    item_id: Optional[int] = Query(None),
+    item_ref1c: Optional[str] = Query(None),
+    max_depth: int = Query(15, ge=1, le=50),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    if item_code is None and item_id is None and (item_ref1c is None or str(item_ref1c).strip() == ""):
+        raise HTTPException(status_code=400, detail="Either item_code, item_id or item_ref1c is required")
+    item = _get_item_by_code_or_id(db, item_code=item_code, item_id=item_id, item_ref1c=item_ref1c)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    units_map = _build_units_map(db)
+    root_node = _build_full_tree(db, item, 1.0, units_map, int(max_depth or 15))
+    nodes = _walk_nodes([root_node])
+    issues: List[Dict[str, Any]] = []
+    seen_item_ids = sorted({_node_item_id(node) for node in nodes if node.get("type") == "item" and _node_item_id(node) is not None})
+    for iid in seen_item_ids:
+        current = db.query(Item).filter(Item.item_id == int(iid)).first()
+        if not current:
+            continue
+        spec_count = _default_spec_count(db, int(iid))
+        spec_id = _resolve_spec_id_for_item(db, current)
+        if spec_count == 0 and not spec_id:
+            issues.append(_quality_issue("NO_DEFAULT_SPEC", "warning", "Нет спецификации по умолчанию и fallback не найден", item=current))
+        if spec_count > 1:
+            issues.append(_quality_issue("MULTIPLE_DEFAULT_SPECS", "warning", "Несколько спецификаций по умолчанию", item=current, spec_id=spec_id))
+        if current.unit is None or not str(current.unit).strip():
+            issues.append(_quality_issue("NO_UNIT", "warning", "У номенклатуры не заполнена единица измерения", item=current, spec_id=spec_id))
+    for node in nodes:
+        iid = _node_item_id(node)
+        current = db.query(Item).filter(Item.item_id == int(iid)).first() if iid else None
+        for warning in node.get("warnings") or []:
+            severity = "error" if warning == "CYCLE_DETECTED" else "warning"
+            issues.append(_quality_issue(warning, severity, warning, item=current))
+    checked_specs = sorted({int(sid) for sid in (_resolve_spec_id_for_item_id(db, int(iid)) for iid in seen_item_ids) if sid})
+    for sid in checked_specs:
+        component_seen: Dict[int, int] = {}
+        for comp in db.query(SpecComponent).filter(SpecComponent.spec_id == sid).all():
+            if _to_float(comp.quantity) <= 0:
+                comp_item = db.query(Item).filter(Item.item_id == comp.item_id).first()
+                issues.append(_quality_issue("NON_POSITIVE_QTY", "error", "Нулевая или отрицательная норма компонента", item=comp_item, spec_id=sid))
+            component_seen[int(comp.item_id)] = component_seen.get(int(comp.item_id), 0) + 1
+        for component_item_id, count in component_seen.items():
+            if count > 1:
+                comp_item = db.query(Item).filter(Item.item_id == component_item_id).first()
+                issues.append(_quality_issue("DUPLICATE_COMPONENT", "warning", "Компонент повторяется в одной спецификации", item=comp_item, spec_id=sid))
+        for spec_op, op in (
+            db.query(SpecOperation, Operation)
+            .join(Operation, Operation.operation_id == SpecOperation.operation_id)
+            .filter(SpecOperation.spec_id == sid)
+            .all()
+        ):
+            time_norm = _to_float(spec_op.time_norm if spec_op.time_norm is not None else op.time_norm, 0.0)
+            if spec_op.stage_id is None:
+                issues.append(_quality_issue("OPERATION_NO_STAGE", "warning", f"Операция без этапа: {op.operation_name or op.operation_id}", spec_id=sid))
+            if time_norm <= 0:
+                issues.append(_quality_issue("OPERATION_NO_TIME_NORM", "warning", f"Операция без нормы времени: {op.operation_name or op.operation_id}", spec_id=sid))
+    severity_order = {"error": 0, "warning": 1, "info": 2}
+    issues.sort(key=lambda row: (severity_order.get(str(row.get("severity")), 9), str(row.get("code") or ""), str(((row.get("item") or {}).get("item_article") or ""))))
+    return {"issues": issues, "meta": {"root": _item_payload(db, item, units_map), "count": len(issues)}}

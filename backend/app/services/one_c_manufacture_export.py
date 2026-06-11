@@ -29,19 +29,23 @@ from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
     Item,
-    DefaultSpecification,
     ProductionManufacture,
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
     ProductionStage,
-    ResourceStage,
     SpecComponent,
     SpecOperation,
     Specification,
     StockWarehouse,
     SyncLink,
     WorkshopWarehouseBinding,
+)
+from .workshop_resolution import (
+    diagnose_product,
+    resolve_workshop_for_product,
+    spec_id_for_product,
+    warehouse_binding_for_workshop,
 )
 from .one_c_export_common import (
     DEFAULT_ORGANIZATION_REF1C,
@@ -108,64 +112,9 @@ def _existing_link(db: Session, manufacture_id: int) -> Optional[SyncLink]:
     )
 
 
-def _main_stage_id_for_spec(db: Session, spec_id: Optional[int]) -> Optional[int]:
-    if not spec_id:
-        return None
-    stage_hours = (
-        db.query(SpecOperation.stage_id)
-        .filter(SpecOperation.spec_id == int(spec_id), SpecOperation.stage_id.isnot(None))
-        .order_by(SpecOperation.time_norm.desc(), SpecOperation.spec_operation_id.asc())
-        .first()
-    )
-    if stage_hours:
-        return int(stage_hours.stage_id)
-    component_stage = (
-        db.query(SpecComponent.stage_id)
-        .filter(SpecComponent.spec_id == int(spec_id), SpecComponent.stage_id.isnot(None))
-        .order_by(SpecComponent.component_id.asc())
-        .first()
-    )
-    return int(component_stage.stage_id) if component_stage else None
-
-
-def _default_spec_id(db: Session, product: ProductionProduct) -> Optional[int]:
-    if product.spec_id:
-        return int(product.spec_id)
-    row = (
-        db.query(DefaultSpecification)
-        .filter(DefaultSpecification.item_id == int(product.item_id))
-        .order_by(DefaultSpecification.id.asc())
-        .first()
-    )
-    return int(row.spec_id) if row else None
-
-
 def _binding_for_product(db: Session, product: ProductionProduct) -> Optional[WorkshopWarehouseBinding]:
-    state_workshop_id = None
-    state = getattr(product, "control_state", None)
-    if state and state.workshop_id:
-        state_workshop_id = int(state.workshop_id)
-
-    workshop_id = state_workshop_id
-    if workshop_id is None:
-        stage_id = _main_stage_id_for_spec(db, _default_spec_id(db, product))
-        if stage_id:
-            resource_stage = (
-                db.query(ResourceStage)
-                .filter(ResourceStage.stage_id == int(stage_id))
-                .order_by(ResourceStage.id.asc())
-                .first()
-            )
-            if resource_stage:
-                workshop_id = int(resource_stage.resource_id)
-
-    if workshop_id is None:
-        return None
-    return (
-        db.query(WorkshopWarehouseBinding)
-        .filter(WorkshopWarehouseBinding.workshop_id == int(workshop_id))
-        .one_or_none()
-    )
+    workshop_id = resolve_workshop_for_product(db, product)
+    return warehouse_binding_for_workshop(db, workshop_id)
 
 
 def _component_rows(db: Session, product: ProductionProduct, qty: float, spec_id: Optional[int]) -> List[Dict[str, Any]]:
@@ -301,13 +250,14 @@ def _inherit_structural_units_from_parent_order(client: OData1CClient, entries: 
 
 def _collect_export_entries(
     db: Session, manufacture_ids: List[int]
-) -> Tuple[List[ManufactureExportEntry], List[Dict[str, Any]]]:
+) -> Tuple[List[ManufactureExportEntry], List[Dict[str, Any]], List[Dict[str, Any]]]:
     entries: List[ManufactureExportEntry] = []
     skipped: List[Dict[str, Any]] = []
+    warnings: List[Dict[str, Any]] = []
 
     ids = [int(x) for x in manufacture_ids if x is not None]
     if not ids:
-        return entries, skipped
+        return entries, skipped, warnings
 
     rows = (
         db.query(ProductionManufacture)
@@ -360,7 +310,7 @@ def _collect_export_entries(
             )
             continue
 
-        resolved_spec_id = _default_spec_id(db, m.product) if m.product else None
+        resolved_spec_id = spec_id_for_product(db, m.product) if m.product else None
         resolved_spec = (
             db.query(Specification).filter(Specification.spec_id == int(resolved_spec_id)).first()
             if resolved_spec_id
@@ -394,9 +344,21 @@ def _collect_export_entries(
                     or _clean_ref1c(binding.warehouse_ref1c)
                     or None
                 )
+            else:
+                # Export still proceeds on parent-order / config defaults, but
+                # the silent fallback used to mask routing gaps — surface it.
+                diagnosis = diagnose_product(db, m.product)
+                warnings.append(
+                    {
+                        "manufacture_id": int(m.manufacture_id),
+                        "product_id": int(m.product_id),
+                        "reason_code": diagnosis.reason_code,
+                        "message": f"{diagnosis.reason_text}. {diagnosis.recommendation}",
+                    }
+                )
             entry.materials = _component_rows(db, m.product, float(m.qty or 0), entry.spec_id)
 
-    return entries, skipped
+    return entries, skipped, warnings
 
 
 _BALANCE_FILTER_CHUNK = 15
@@ -730,7 +692,7 @@ def export_manufactures_to_1c(
     parent_export = _chain_export_parent_orders(
         db, list(manufacture_ids), dry_run=dry_run, allow_production=allow_production
     )
-    entries, skipped = _collect_export_entries(db, list(manufacture_ids))
+    entries, skipped, warnings = _collect_export_entries(db, list(manufacture_ids))
 
     eligible: List[ManufactureExportEntry] = []
     already_linked: List[ManufactureExportEntry] = []
@@ -762,6 +724,7 @@ def export_manufactures_to_1c(
         "manufactures_created": 0,
         "manufactures_error": 0,
         "skipped_rows": skipped,
+        "warnings": warnings,
         "entries": [],
         "parent_orders_export": parent_export,
     }

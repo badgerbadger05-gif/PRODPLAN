@@ -8,6 +8,8 @@ from sqlalchemy.exc import IntegrityError
 
 from app.models import (
     DefaultSpecification,
+    ProductionKind,
+    ResourceProductionKind,
     Employee,
     Item,
     MrpRequirement,
@@ -336,6 +338,20 @@ def test_route_sheet_printing_batches_multiple_products(db_session):
     assert len(statements) <= 10
 
 
+def _route_spec_to_workshop(db, spec, suffix: str) -> None:
+    """Wire spec -> production kind -> workshop -> warehouse: since the stage
+    fallback removal, material issues require this chain (or an explicit
+    destination) to resolve the destination warehouse."""
+    kind = ProductionKind(ref_1c=f"kind-{suffix}", name=f"Вид {suffix}")
+    resource = ProductionResource(resource_name=f"Участок {suffix}")
+    db.add_all([kind, resource])
+    db.flush()
+    spec.production_kind_id = kind.id
+    db.add(ResourceProductionKind(resource_id=resource.resource_id, production_kind_id=kind.id))
+    db.add(WorkshopWarehouseBinding(workshop_id=resource.resource_id, warehouse_ref1c=f"wh-{suffix}"))
+    db.flush()
+
+
 def test_journal_and_material_issue_are_scoped_to_order_line(db_session):
     parent = Item(
         item_code="P-001",
@@ -359,6 +375,7 @@ def test_journal_and_material_issue_are_scoped_to_order_line(db_session):
     spec = Specification(spec_name="Спецификация детали", spec_ref1c="spec-001")
     db_session.add(spec)
     db_session.flush()
+    _route_spec_to_workshop(db_session, spec, "spec-001")
     db_session.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
     db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=component.item_id, quantity=2.5))
 
@@ -1510,6 +1527,7 @@ def test_create_material_issues_is_idempotent_per_product(db_session):
     spec = Specification(spec_name="Idem spec", spec_ref1c="spec-idem")
     db_session.add(spec)
     db_session.flush()
+    _route_spec_to_workshop(db_session, spec, "spec-idem")
     db_session.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
     db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=1))
 
@@ -1577,6 +1595,7 @@ def test_create_material_issues_reuses_exported_transfer_and_refreshes_qty(db_se
     spec = Specification(spec_name="Reexport spec", spec_ref1c="spec-reexport")
     db_session.add(spec)
     db_session.flush()
+    _route_spec_to_workshop(db_session, spec, "spec-reexport")
     db_session.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
     db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=1))
 
@@ -1647,6 +1666,7 @@ def test_create_material_issues_reuses_posted_transfer_without_duplicate(db_sess
     spec = Specification(spec_name="Posted reuse spec", spec_ref1c="spec-posted-reuse")
     db_session.add(spec)
     db_session.flush()
+    _route_spec_to_workshop(db_session, spec, "spec-posted-reuse")
     db_session.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
     db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=1))
 
@@ -1701,6 +1721,7 @@ def test_create_material_issues_reuses_existing_issue_when_source_changes(db_ses
     spec = Specification(spec_name="Source reuse spec", spec_ref1c="spec-source-reuse")
     db_session.add(spec)
     db_session.flush()
+    _route_spec_to_workshop(db_session, spec, "spec-source-reuse")
     db_session.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
     db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=1))
     order = ProductionOrder(order_number="SRC-REUSE-001", order_date=datetime(2026, 6, 4), deletion_mark=False)
@@ -1732,6 +1753,7 @@ def test_delete_local_material_issue_only_before_1c(db_session):
     spec = Specification(spec_name="Delete issue spec", spec_ref1c="spec-delete-issue")
     db_session.add(spec)
     db_session.flush()
+    _route_spec_to_workshop(db_session, spec, "spec-delete-issue")
     db_session.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
     db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=1))
     order = ProductionOrder(order_number="DEL-ISSUE-001", order_date=datetime(2026, 6, 4), deletion_mark=False)
@@ -1772,6 +1794,7 @@ def test_cancel_local_order_without_1c_marks_deleted_and_removes_local_issues(db
     spec = Specification(spec_name="Delete order spec", spec_ref1c="spec-delete-order")
     db_session.add(spec)
     db_session.flush()
+    _route_spec_to_workshop(db_session, spec, "spec-delete-order")
     db_session.add(DefaultSpecification(item_id=item.item_id, spec_id=spec.spec_id))
     db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=1))
     order = ProductionOrder(order_number="MRP-RC-1-1", order_date=datetime(2026, 6, 4), deletion_mark=False, source="mrp", source_run_id=run.run_id)

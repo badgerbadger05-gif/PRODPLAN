@@ -51,7 +51,6 @@ from ..models import (
     ProductionOrderLineState,
     ProductionPlanLine,
     ProductionProduct,
-    ResourceProductionKind,
     SyncLink,
     SpecComponent,
     SpecOperation,
@@ -832,19 +831,11 @@ def _reschedule_run_journal(db: Session, run: PlanningRun, *, dry_run: bool) -> 
         .filter(DefaultSpecification.item_id.in_(item_ids))
         .all()
     }
-    resource_id_by_spec: Dict[int, int] = {}
-    if default_spec_by_item:
-        for spec_id, resource_id in (
-            db.query(Specification.spec_id, ResourceProductionKind.resource_id)
-            .join(
-                ResourceProductionKind,
-                ResourceProductionKind.production_kind_id == Specification.production_kind_id,
-            )
-            .filter(Specification.spec_id.in_(set(default_spec_by_item.values())))
-            .order_by(ResourceProductionKind.id.asc())
-            .all()
-        ):
-            resource_id_by_spec.setdefault(int(spec_id), int(resource_id))
+    from .workshop_resolution import resolve_workshop_for_specs
+
+    resource_id_by_spec: Dict[int, int] = resolve_workshop_for_specs(
+        db, list(set(default_spec_by_item.values()))
+    )
 
     parents_of_item: Dict[int, set] = {}
     if default_spec_by_item:
