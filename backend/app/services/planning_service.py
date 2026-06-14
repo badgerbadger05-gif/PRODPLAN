@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple, Set, DefaultDict, Callable
 
 from sqlalchemy.orm import Session, load_only
@@ -571,11 +571,23 @@ def _get_or_create_run(
         config_snapshot=snapshot,
         warnings=[],
         kpi={},
-        started_at=datetime.utcnow(),
+        started_at=datetime.now(timezone.utc),
     )
     db.add(run)
     db.flush()
     return run
+
+
+def _clear_run_outputs(db: Session, run_id: int) -> None:
+    """Delete all planned outputs of a run so a re-run is idempotent.
+
+    Without this, recomputing an existing run_id re-adds orders/stages/etc.
+    on top of the previous rows and doubles every result. PlannedOrderStage
+    references planned_order, so it is deleted first.
+    """
+    db.query(PlannedOrderStage).filter(PlannedOrderStage.run_id == run_id).delete(synchronize_session=False)
+    for model in (PeggingLink, CapacityLoad, PlannedRework, PlannedPurchase, PlannedOrder):
+        db.query(model).filter(model.run_id == run_id).delete(synchronize_session=False)
 
 
 def list_planning_runs(db: Session, limit: int = 50, offset: int = 0) -> Dict[str, Any]:
@@ -3867,7 +3879,19 @@ def run_planning_run(
 ) -> int:
     
     run = _get_or_create_run(db, run_id, horizon_days, config_overrides, started_by)
-    
+
+    # Recomputing an existing run must be idempotent: drop the previous
+    # outputs and reset the header to IN_PROGRESS before producing new rows.
+    if run_id:
+        _clear_run_outputs(db, run.run_id)
+        run.status = "IN_PROGRESS"
+        run.warnings = []
+        run.finished_at = None
+
+    # Commit the run header (and any clearing) up front so it survives a
+    # rollback of partial work on failure below.
+    db.commit()
+
     try:
         # --- PREPARATION ---
         net_req_result = compute_planning_preview(db, run.horizon_days, run.config_snapshot)
@@ -4130,14 +4154,21 @@ def run_planning_run(
 
         run.status = "SUCCESS"
         run.warnings = all_warnings
+        run.finished_at = datetime.now(timezone.utc)
+        db.commit()
 
     except Exception as e:
         logger.exception(f"Planning run {run.run_id} failed.")
-        run.status = "FAILURE"
-        run.warnings = (run.warnings or []) + [make_warning("PLANNING_RUN_FAILED", msg=f"Critical error during planning run: {e}", error=str(e))]
+        run_id_failed = run.run_id
+        # Discard any partial rows written before the failure so reports never
+        # read a half-built FAILURE run as if it were valid.
+        db.rollback()
+        run = db.query(PlanningRun).filter(PlanningRun.run_id == run_id_failed).first()
+        if run is not None:
+            run.status = "FAILURE"
+            run.finished_at = datetime.now(timezone.utc)
+            run.warnings = (run.warnings or []) + [make_warning("PLANNING_RUN_FAILED", msg=f"Critical error during planning run: {e}", error=str(e))]
+            db.commit()
         raise
-    finally:
-        run.finished_at = datetime.utcnow()
-        db.commit()
-    
+
     return run.run_id
