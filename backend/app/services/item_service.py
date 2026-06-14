@@ -19,7 +19,7 @@ def get_item(db: Session, item_id: int):
 
 
 def create_item(db: Session, item: ItemCreate):
-    db_item = Item(**item.dict())
+    db_item = Item(**item.model_dump())
     db.add(db_item)
     db.commit()
     db.refresh(db_item)
@@ -29,7 +29,7 @@ def create_item(db: Session, item: ItemCreate):
 def update_item(db: Session, item_id: int, item: ItemUpdate):
     db_item = db.query(Item).filter(Item.item_id == item_id).first()
     if db_item:
-        for key, value in item.dict().items():
+        for key, value in item.model_dump().items():
             setattr(db_item, key, value)
         db.commit()
         db.refresh(db_item)

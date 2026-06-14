@@ -9,6 +9,7 @@ from pydantic import BaseModel
 
 from ..services.odata_config import (
     load_odata_config,
+    mask_odata_config,
     sanitize_base_url,
     save_odata_config,
 )
@@ -41,21 +42,21 @@ def _save_config(data: Dict[str, Any]) -> Dict[str, Any]:
 
 @router.get("/config")
 def get_config():
-    """Возвращает сохранённую конфигурацию OData."""
-    return _load_config()
+    """Возвращает сохранённую конфигурацию OData (секреты замаскированы)."""
+    return mask_odata_config(_load_config())
 
 
 @router.post("/config")
 def save_config(cfg: ODataConfig):
     """Сохраняет конфигурацию OData."""
-    saved = _save_config(cfg.dict())
-    return {"status": "ok", "config": saved}
+    saved = _save_config(cfg.model_dump())
+    return {"status": "ok", "config": mask_odata_config(saved)}
 
 
 @router.post("/test")
 def test_connection(cfg: Optional[ODataConfig] = None):
     """Проверка подключения к OData ($metadata)."""
-    data = cfg.dict() if cfg is not None else _load_config()
+    data = cfg.model_dump() if cfg is not None else _load_config()
     base_url = data.get("base_url")
     if not base_url:
         raise HTTPException(status_code=400, detail="base_url is required")
@@ -80,7 +81,7 @@ def test_connection(cfg: Optional[ODataConfig] = None):
 @router.post("/metadata")
 def fetch_metadata(cfg: Optional[ODataConfig] = None):
     """Выгружает $metadata в output/odata_metadata.xml и краткое summary в output/odata_metadata_summary.json."""
-    data = cfg.dict() if cfg is not None else _load_config()
+    data = cfg.model_dump() if cfg is not None else _load_config()
     base_url = data.get("base_url")
     if not base_url:
         raise HTTPException(status_code=400, detail="base_url is required")
@@ -129,7 +130,7 @@ def export_groups(cfg: Optional[ODataConfig] = None):
     """
     Выгружает группы номенклатуры (IsFolder eq true) в output/odata_groups_nomenclature.json.
     """
-    data = cfg.dict() if cfg is not None else _load_config()
+    data = cfg.model_dump() if cfg is not None else _load_config()
     if not data.get("base_url"):
         raise HTTPException(status_code=400, detail="base_url is required")
     try:

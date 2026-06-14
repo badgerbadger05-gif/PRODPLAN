@@ -24,6 +24,19 @@ def load_odata_config() -> Dict[str, Any]:
     return {}
 
 
+def mask_odata_config(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Возвращает копию конфига с замаскированными секретами для отдачи в HTTP-ответ.
+
+    Не мутирует исходный словарь. password/token: "" если пусто, иначе "***".
+    Реальные значения остаются только во внутреннем использовании и при записи на диск.
+    """
+    masked = dict(data or {})
+    for key in ("password", "token"):
+        if key in masked:
+            masked[key] = "***" if masked.get(key) else ""
+    return masked
+
+
 def save_odata_config(data: Dict[str, Any]) -> Dict[str, Any]:
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     clean = dict(data or {})
