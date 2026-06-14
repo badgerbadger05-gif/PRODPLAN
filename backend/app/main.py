@@ -32,8 +32,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[frontend_origin, "http://127.0.0.1:9000"],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
 )
 
 # Routers
