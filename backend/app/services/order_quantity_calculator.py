@@ -331,16 +331,6 @@ class OrderQuantityCalculator:
                 per_unit = float(getattr(comp, "quantity", 0.0) or 0.0)
                 if per_unit <= 0.0:
                     continue
-            except Exception:
-                continue
- 
-        child_stock = None
-        for comp in comps:
-            try:
-                child_id = int(getattr(comp, "item_id"))
-                per_unit = float(getattr(comp, "quantity", 0.0) or 0.0)
-                if per_unit <= 0.0:
-                    continue
                 if child_id not in self.stock_by_item:
                     warnings.append(
                         make_warning(
