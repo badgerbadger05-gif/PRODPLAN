@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from ..services.odata_config import (
     load_odata_config,
     mask_odata_config,
+    resolve_config_secrets,
     sanitize_base_url,
     save_odata_config,
 )
@@ -40,6 +41,14 @@ def _save_config(data: Dict[str, Any]) -> Dict[str, Any]:
     return save_odata_config(data)
 
 
+def _config_from_request(cfg: Optional["ODataConfig"]) -> Dict[str, Any]:
+    """Use the posted config (with masked secrets restored from storage) or the
+    stored one when the request body is empty."""
+    if cfg is None:
+        return _load_config()
+    return resolve_config_secrets(cfg.model_dump())
+
+
 @router.get("/config")
 def get_config():
     """Возвращает сохранённую конфигурацию OData (секреты замаскированы)."""
@@ -56,7 +65,7 @@ def save_config(cfg: ODataConfig):
 @router.post("/test")
 def test_connection(cfg: Optional[ODataConfig] = None):
     """Проверка подключения к OData ($metadata)."""
-    data = cfg.model_dump() if cfg is not None else _load_config()
+    data = _config_from_request(cfg)
     base_url = data.get("base_url")
     if not base_url:
         raise HTTPException(status_code=400, detail="base_url is required")
@@ -81,7 +90,7 @@ def test_connection(cfg: Optional[ODataConfig] = None):
 @router.post("/metadata")
 def fetch_metadata(cfg: Optional[ODataConfig] = None):
     """Выгружает $metadata в output/odata_metadata.xml и краткое summary в output/odata_metadata_summary.json."""
-    data = cfg.model_dump() if cfg is not None else _load_config()
+    data = _config_from_request(cfg)
     base_url = data.get("base_url")
     if not base_url:
         raise HTTPException(status_code=400, detail="base_url is required")
@@ -130,7 +139,7 @@ def export_groups(cfg: Optional[ODataConfig] = None):
     """
     Выгружает группы номенклатуры (IsFolder eq true) в output/odata_groups_nomenclature.json.
     """
-    data = cfg.model_dump() if cfg is not None else _load_config()
+    data = _config_from_request(cfg)
     if not data.get("base_url"):
         raise HTTPException(status_code=400, detail="base_url is required")
     try:
