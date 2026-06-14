@@ -71,7 +71,23 @@ def _collect_purchase_groups(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     purchase_ids: Optional[List[int]] = None,
-) -> Tuple[List[PurchaseOrderExportGroup], List[Dict[str, Any]]]:
+) -> Tuple[List[PurchaseOrderExportGroup], List[Dict[str, Any]], List[int]]:
+    # Planned purchases already exported to 1C (successful SyncLink) must be
+    # excluded before grouping. Otherwise a later export of the full run
+    # regroups them and the positional numbering can hand a supplier a second
+    # order number — a duplicate supplier order in 1C. Their existing 1C order
+    # is left untouched.
+    already_exported: set[int] = {
+        int(pid)
+        for (pid,) in db.query(SyncLink.source_id)
+        .filter(
+            SyncLink.source_system == "PRODPLAN",
+            SyncLink.source_doctype == "planned_purchase",
+            SyncLink.target_entity == PURCHASE_ORDER_ENTITY,
+            SyncLink.status == "success",
+        )
+        .all()
+    }
     q = (
         db.query(
             PlannedPurchase.purchase_id,
@@ -105,6 +121,8 @@ def _collect_purchase_groups(
     grouped: Dict[str, Dict[Tuple[int, str, Optional[str]], PurchaseOrderExportLine]] = {}
 
     for row in q.all():
+        if int(row.purchase_id) in already_exported:
+            continue
         supplier_ref = (row.supplier_ref1c or row.item_supplier_ref1c or "").strip()
         supplier_ref = _clean_ref1c(supplier_ref)
         item_ref = _clean_ref1c(row.item_ref1c)
@@ -158,7 +176,7 @@ def _collect_purchase_groups(
                 lines=lines,
             )
         )
-    return groups, missing
+    return groups, missing, sorted(already_exported)
 
 
 def _order_lines_payload(ref_key: str, group: PurchaseOrderExportGroup) -> List[Dict[str, Any]]:
@@ -269,7 +287,7 @@ def export_planned_purchases_to_1c(
     dry_run: bool = False,
     allow_production: bool = False,
 ) -> Dict[str, Any]:
-    groups, skipped_rows = _collect_purchase_groups(
+    groups, skipped_rows, already_exported_ids = _collect_purchase_groups(
         db,
         run_id,
         date_from=date_from,
@@ -285,6 +303,7 @@ def export_planned_purchases_to_1c(
             "orders_existing": 0,
             "lines_total": sum(len(g.lines) for g in groups),
             "skipped_rows": skipped_rows,
+            "already_exported_purchase_ids": already_exported_ids,
             "orders": [asdict(g) for g in groups],
         }
 
@@ -375,5 +394,6 @@ def export_planned_purchases_to_1c(
         "orders_existing": existing,
         "lines_total": sum(len(g.lines) for g in groups),
         "skipped_rows": skipped_rows,
+        "already_exported_purchase_ids": already_exported_ids,
         "orders": [asdict(g) for g in groups],
     }
