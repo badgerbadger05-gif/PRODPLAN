@@ -1357,9 +1357,24 @@ def build_issue_1c_payload(db: Session, issue_id: int) -> Dict[str, Any]:
 
 
 def export_issue_to_1c(db: Session, issue_id: int, req: ODataSyncRequest) -> Dict[str, Any]:
+    from .one_c_export_common import clean_ref1c
+
     issue = db.query(ProductionMaterialIssue).filter(ProductionMaterialIssue.issue_id == int(issue_id)).first()
     if not issue:
         raise ValueError("Документ выдачи не найден")
+
+    # Idempotency: a document already created in 1C must not be POSTed again —
+    # a repeat would create a duplicate Document_ПеремещениеЗапасов (a real
+    # second stock transfer). Return the existing ref instead of re-posting.
+    existing_ref = clean_ref1c(getattr(issue, "exported_ref1c", None))
+    if existing_ref and not req.dry_run:
+        return {
+            "status": "already_exported",
+            "issue_id": int(issue.issue_id),
+            "document_number": str(issue.document_number),
+            "exported_ref1c": existing_ref,
+        }
+
     payload = build_issue_1c_payload(db, issue_id)
 
     if req.dry_run:
