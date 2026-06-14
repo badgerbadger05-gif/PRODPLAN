@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
@@ -121,7 +121,7 @@ def upsert_sync_link(
         source_id=source_id,
         target_entity=target_entity,
     )
-    synced_at = datetime.utcnow() if status == "success" else None
+    synced_at = datetime.now(timezone.utc) if status == "success" else None
     if existing is None:
         db.add(
             sync_link_model(
@@ -228,11 +228,20 @@ def post_export_entries(
             )
             on_success(entry, ref_key)
             created += 1
+            # Persist each successful export immediately. A single commit at the
+            # end of the batch meant a crash (or a later DB failure) after a 1C
+            # POST but before that commit lost the stored Ref_Key, so a re-run
+            # re-POSTed and created a duplicate document in 1C. Committing per
+            # entry bounds that window to the single in-flight document.
+            db.commit()
         except Exception as exc:
+            # Read the ref_key before any rollback: if the POST succeeded and a
+            # later step (on_success/link) failed, we still want to record the
+            # Ref_Key so a re-run PATCHes the existing doc instead of duplicating.
+            existing_ref_key = clean_ref1c(getattr(entry, "target_ref_key", None))
             entry.status = "error"
             entry.error = str(exc)
             errored += 1
-            existing_ref_key = clean_ref1c(getattr(entry, "target_ref_key", None))
             try:
                 upsert_link(
                     entry=entry,
@@ -243,13 +252,14 @@ def post_export_entries(
                 )
                 if on_error is not None:
                     on_error(entry, str(exc))
+                db.commit()
             except Exception:
-                pass
+                # Keep the session usable for the remaining entries.
+                db.rollback()
             if log_error is not None:
                 try:
                     print(log_error(entry))
                 except Exception:
                     pass
-    db.commit()
     return created, errored
 
