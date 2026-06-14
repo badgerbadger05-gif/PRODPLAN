@@ -33,7 +33,7 @@ additionally deduped against supplier orders already arriving and
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import func, or_
@@ -610,7 +610,7 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
 
     production_added: List[Dict[str, Any]] = []
     purchase_added: List[Dict[str, Any]] = []
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     for iid in sorted(current_net_by_item.keys()):
         item = items_by_id.get(iid)

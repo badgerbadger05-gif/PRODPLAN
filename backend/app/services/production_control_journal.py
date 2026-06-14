@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from sqlalchemy import func, or_, select
@@ -529,7 +529,7 @@ def create_orders_from_mrp(
     reused: List[Dict[str, Any]] = []
     errors: List[str] = []
 
-    today = datetime.utcnow()
+    today = datetime.now(timezone.utc)
     for pid_raw in planned_order_ids:
         try:
             pid = int(pid_raw)
@@ -656,7 +656,7 @@ def create_production_orders_from_mrp_requirements(
     skipped: List[Dict[str, Any]] = []
     errors: List[str] = []
 
-    today = datetime.utcnow()
+    today = datetime.now(timezone.utc)
 
     for rid_raw in requirement_ids:
         try:
@@ -1236,7 +1236,7 @@ def update_line_state(db: Session, product_id: int, payload: Dict[str, Any]) -> 
         # First time the journal moves the line past 'shortage' / 'partial',
         # stamp opened_at вЂ” it acts as a workshop-side timestamp.
         if status in {"ready", "to_move", "assembled", "in_progress", "done", "produced_partial", "produced", "completed"} and not state.opened_at:
-            state.opened_at = datetime.utcnow()
+            state.opened_at = datetime.now(timezone.utc)
         # Closing the line with an un-produced remainder: release that remainder
         # from the requirement's coverage so the reconciliation job (and the
         # journal) can see the demand is no longer fully ordered.

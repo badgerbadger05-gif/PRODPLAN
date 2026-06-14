@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from sqlalchemy import func, or_
@@ -362,7 +362,7 @@ def _store_material_coverage_status(
     """
     state.material_coverage_status = new_status
     state.material_coverage_label = label
-    state.material_coverage_calculated_at = datetime.utcnow()
+    state.material_coverage_calculated_at = datetime.now(timezone.utc)
     state.material_coverage_snapshot = snapshot
     if (
         state.issue_status in {None, "", "not_requested"}

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import html
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from sqlalchemy.orm import Session, joinedload
@@ -51,7 +51,7 @@ def mark_route_sheets_printed(db: Session, product_ids: Iterable[int]) -> int:
         .filter(ProductionOrderLineState.product_id.in_(existing_ids))
         .all()
     }
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     if existing_state_ids:
         (
             db.query(ProductionOrderLineState)

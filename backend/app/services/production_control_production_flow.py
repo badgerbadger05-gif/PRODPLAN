@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session, joinedload
@@ -354,7 +354,7 @@ def _outgoing_issues_for_product(
 
 
 def _next_return_number(db: Session) -> str:
-    today = datetime.utcnow().strftime("%Y%m%d")
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
     prefix = f"MR-{today}-"
     count = (
         db.query(ProductionMaterialIssue)

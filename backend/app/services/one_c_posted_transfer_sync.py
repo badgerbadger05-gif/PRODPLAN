@@ -21,7 +21,7 @@ production_order_sync / supplier_order_sync code paths.
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
@@ -162,7 +162,7 @@ def _apply_posted(
         return (False, f"material_issue id={link.source_id} не найден")
 
     changed = False
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     if link.status != "posted":
         link.status = "posted"

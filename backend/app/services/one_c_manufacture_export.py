@@ -21,7 +21,7 @@ for posting and does not rely on UI-side autofill.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import or_
@@ -776,7 +776,7 @@ def export_manufactures_to_1c(
         )
         m_row.status = "exported"
         m_row.exported_ref1c = ref_key
-        m_row.exported_at = datetime.utcnow()
+        m_row.exported_at = datetime.now(timezone.utc)
         m_row.export_error = None
 
     def _mark_error(entry: ManufactureExportEntry, error: str) -> None:
@@ -789,7 +789,7 @@ def export_manufactures_to_1c(
         if created_ref:
             m_row.status = "error"
             m_row.exported_ref1c = created_ref
-            m_row.exported_at = datetime.utcnow()
+            m_row.exported_at = datetime.now(timezone.utc)
         m_row.export_error = error
 
     created, errored = _post_export_entries(

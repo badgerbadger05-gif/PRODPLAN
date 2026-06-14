@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -290,7 +290,7 @@ def fix_period_plan(db: Session, plan_id: int, *, fixed_by: Optional[str] = None
     if plan.status != "fixed":
         plan.status = "fixed"
         plan.fixed_by = fixed_by
-        plan.fixed_at = datetime.utcnow()
+        plan.fixed_at = datetime.now(timezone.utc)
     db.commit()
     db.refresh(plan)
     return _serialize_plan(plan)
@@ -740,7 +740,7 @@ def create_mrp_snapshot_from_period_plan(
         "period_to": plan.period_to.isoformat(),
     }
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     run = _latest_fixed_run_for_plan(db, int(plan.id))
     if run is None:
         run = PlanningRun(

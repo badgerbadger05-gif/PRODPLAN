@@ -18,7 +18,7 @@ components.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import UUID
 
@@ -502,7 +502,7 @@ def _mark_issue_exported(
     )
     issue.status = "exported"
     issue.exported_ref1c = ref_key
-    issue.exported_at = datetime.utcnow()
+    issue.exported_at = datetime.now(timezone.utc)
     issue.export_error = None
     state = (
         db.query(ProductionOrderLineState)

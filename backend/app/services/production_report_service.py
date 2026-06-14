@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 import re
 
@@ -685,7 +685,7 @@ def close_previous_workday(
 
     day_close.status = "CLOSED"
     day_close.target_date = d_target
-    day_close.closed_at = datetime.utcnow()
+    day_close.closed_at = datetime.now(timezone.utc)
     day_close.closed_by = closed_by
 
     return {
