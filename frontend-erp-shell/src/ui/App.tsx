@@ -1,4 +1,5 @@
-import { NavLink, Route, Routes } from 'react-router-dom'
+import { Link, NavLink, Route, Routes } from 'react-router-dom'
+import { ErrorBoundary } from './ErrorBoundary'
 import { HomePage } from './pages/HomePage'
 import { MrpResultPage } from './pages/MrpResultPage'
 import { MrpRunsPage } from './pages/MrpRunsPage'
@@ -54,7 +55,8 @@ export function App() {
         </div>
       </aside>
 
-      <Routes>
+      <ErrorBoundary>
+        <Routes>
         <Route path="/" element={<HomePage />} />
         <Route path="/period-plan" element={<PeriodPlanPage />} />
         <Route path="/period-plan/:planId" element={<PeriodPlanPage />} />
@@ -69,7 +71,17 @@ export function App() {
         <Route path="/stage-distribution" element={<StageDistributionPage />} />
         <Route path="/specification" element={<SpecificationPage />} />
         <Route path="/sync" element={<SyncPage />} />
-      </Routes>
+        <Route
+          path="*"
+          element={(
+            <main className="workArea">
+              <div className="errorLine">Страница не найдена</div>
+              <Link to="/" className="navItem">На главную</Link>
+            </main>
+          )}
+        />
+        </Routes>
+      </ErrorBoundary>
     </div>
   )
 }

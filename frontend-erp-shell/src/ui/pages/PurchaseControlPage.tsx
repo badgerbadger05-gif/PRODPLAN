@@ -91,7 +91,17 @@ export function PurchaseControlPage() {
       params.set('sort_by', current.sort_by)
       params.set('sort_dir', current.sort_dir)
       const data = await listPurchaseJournal(params)
-      setRows(data.rows ?? [])
+      const nextRows = data.rows ?? []
+      setRows(nextRows)
+      const visibleIds = new Set(
+        nextRows
+          .filter((row) => row.line_status === 'to_order' && row.purchase_id !== null)
+          .map((row) => row.purchase_id as number),
+      )
+      setSelectedPurchaseIds((current) => {
+        const pruned = new Set([...current].filter((id) => visibleIds.has(id)))
+        return pruned.size === current.size ? current : pruned
+      })
       setTotal(data.total ?? 0)
       setRunId(data.run_id ?? null)
       setSummary(data.summary ?? null)
@@ -151,7 +161,8 @@ export function PurchaseControlPage() {
       setError('Нет зафиксированного MRP-прогона: нечего заказывать')
       return
     }
-    const ids = Array.from(selectedPurchaseIds)
+    const visibleIds = new Set(toOrderRows.map((row) => row.purchase_id as number))
+    const ids = Array.from(selectedPurchaseIds).filter((id) => visibleIds.has(id))
     if (!ids.length) return
     setLoading(true)
     setError('')
@@ -165,6 +176,7 @@ export function PurchaseControlPage() {
       await load(offset)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
+    } finally {
       setLoading(false)
     }
   }
@@ -180,6 +192,7 @@ export function PurchaseControlPage() {
       await load(offset)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
+    } finally {
       setLoading(false)
     }
   }
