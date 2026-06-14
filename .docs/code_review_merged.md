@@ -47,6 +47,8 @@ Codex [X] отметил `routers/production_control.py:381,431,511,600` (`allow
 - **POST/PATCH/post_operation без ретраев** [C]: `odata_client.py:131-241` — таймаут на POST особенно опасен (документ мог создаться).
 → Коммитить линк `planned` с заранее сгенерированным `Ref_Key` **до** POST (1С принимает Ref_Key в payload) либо per-entry commit сразу после POST; `INSERT … ON CONFLICT DO UPDATE` + advisory-lock по `source_id`; исключать уже связанные строки до группировки; убрать/защитить legacy-эндпоинт; ретраить PATCH/Post.
 
+**Статус M-4 (фиксы test-first):** ✅ per-entry commit в `post_export_entries`; ✅ legacy `export_issue_to_1c` теперь не повторяет POST при уже выставленном `exported_ref1c` (idempotency-guard); ✅ частичный экспорт закупок исключает строки с успешным `SyncLink` до группировки (нет дубля заказа поставщику). Остаточно (требует прод-валидации): pre-generated `Ref_Key` до POST для устранения окна на один документ; `ON CONFLICT` в `upsert_sync_link`; ретраи PATCH/Post.
+
 ### M-5. Двойной счёт остатков — системный класс (кейс PP001308915) — [C] ✅
 Нетто-потребность вычитает остаток/WIP на каждом уровне разузлования, затем те же остатки учитываются повторно (≥5 мест):
 - `planning_service.py:3968-4004` ⊕ `order_quantity_calculator.py:51-113` — preview уже `net`, но в калькулятор идёт свежий `Item.stock_qty`, и `_limit_by_components` снова лимитирует родителя наличием уже «потраченных» компонентов.
