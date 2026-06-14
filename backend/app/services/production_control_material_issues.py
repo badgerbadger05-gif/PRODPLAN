@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
@@ -335,7 +335,7 @@ def _components_still_to_move(
 
 
 def _next_issue_number(db: Session) -> str:
-    today = datetime.utcnow().strftime("%Y%m%d")
+    today = datetime.now(timezone.utc).strftime("%Y%m%d")
     prefix = f"MI-{today}-"
     count = db.query(ProductionMaterialIssue).filter(ProductionMaterialIssue.document_number.like(f"{prefix}%")).count()
     return f"{prefix}{count + 1:04d}"
@@ -659,6 +659,26 @@ def _shrink_transit_reservations(
             _release_from(issue, in_place=True)
 
 
+# Arbitrary stable key for the transaction-scoped advisory lock that serializes
+# concurrent material-issue creation. Two parallel requests for different
+# products that share a component on the same workshop warehouse would otherwise
+# both read the same free stock and both claim it (section-stock double count,
+# case PP001308915). The lock auto-releases when the transaction commits/rolls back.
+_MATERIAL_ISSUE_LOCK_KEY = 0x70726D6973  # "prmis"
+
+
+def _lock_material_issue_pool(db: Session) -> None:
+    """Serialize the free-stock read-modify-write across concurrent callers.
+
+    PostgreSQL only — a transaction advisory lock held until commit. On other
+    backends (SQLite in tests) this is a no-op; real deployments run on Postgres.
+    """
+    bind = db.get_bind()
+    if getattr(bind.dialect, "name", "") != "postgresql":
+        return
+    db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": _MATERIAL_ISSUE_LOCK_KEY})
+
+
 def create_material_issues(
     db: Session,
     product_ids: Sequence[int],
@@ -685,6 +705,10 @@ def create_material_issues(
     existing documents in `reused`. After the order quantity shrinks, open
     (non-posted) reservations are released down to the requirement.
     """
+    # Hold a transaction-scoped lock for the whole read-modify-write below so
+    # concurrent callers cannot both claim the same free workshop stock.
+    _lock_material_issue_pool(db)
+
     created: List[Dict[str, Any]] = []
     reused: List[Dict[str, Any]] = []
     selection_required: List[Dict[str, Any]] = []
@@ -1269,7 +1293,7 @@ def assemble_material_issue(
     issue.export_error = None
     if link is not None:
         link.status = "posted"
-        link.last_synced_at = datetime.utcnow()
+        link.last_synced_at = datetime.now(timezone.utc)
     for line in issue.lines or []:
         line.issued_qty = line.required_qty
         line.line_status = "issued"
@@ -1308,7 +1332,7 @@ def build_issue_1c_payload(db: Session, issue_id: int) -> Dict[str, Any]:
 
     return {
         "Number": str(issue.document_number),
-        "Date": datetime.utcnow().replace(microsecond=0).isoformat(),
+        "Date": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
         "Posted": False,
         "Комментарий": f"PRODPLAN: выдача под заказ {issue.order.order_number}, строка {issue.product.line_number or issue.product_id}",
         "ЗаказНаПроизводство_Key": str(issue.order.order_ref1c or ""),
@@ -1353,7 +1377,7 @@ def export_issue_to_1c(db: Session, issue_id: int, req: ODataSyncRequest) -> Dic
         ref = str(response.get("Ref_Key") or response.get("ref") or response.get("Ref") or "")
         issue.status = "exported"
         issue.exported_ref1c = ref or None
-        issue.exported_at = datetime.utcnow()
+        issue.exported_at = datetime.now(timezone.utc)
         issue.export_error = None
         state = (
             db.query(ProductionOrderLineState)
