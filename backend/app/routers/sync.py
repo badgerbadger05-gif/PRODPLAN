@@ -302,14 +302,20 @@ def debug_production_order_states(db: Session = Depends(get_db)):
     Отладка: получение всех уникальных состояний заказов из 1С.
     """
     from ..services.odata_client import OData1CClient
-    from ..schemas import ODataSyncRequest
-    
-    # Получаем конфиг OData
-    config = db.query(models.ODataConfig).first()
-    if not config:
+    from ..services.odata_config import load_odata_config, sanitize_base_url
+
+    # Получаем конфиг OData из файла (в этом проекте он хранится не в БД)
+    config = load_odata_config()
+    base_url = str(config.get("base_url") or "").strip()
+    if not base_url:
         raise HTTPException(status_code=404, detail="OData config not found")
-    
-    client = OData1CClient(config.base_url, config.username, config.password)
+
+    client = OData1CClient(
+        base_url=sanitize_base_url(base_url),
+        username=config.get("username") or None,
+        password=config.get("password") or None,
+        token=config.get("token") or None,
+    )
     
     # Загружаем заказы с состояниями
     data = client.get_all(

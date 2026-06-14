@@ -5,7 +5,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 from zoneinfo import ZoneInfo
 
@@ -59,7 +59,7 @@ class OData1CClient:
         # Trace requested URL (no auth data)
         try:
             from datetime import datetime as _dt
-            print(f"[OData] {_dt.utcnow().isoformat()} GET {url}")
+            print(f"[OData] {_dt.now(timezone.utc).isoformat()} GET {url}")
         except Exception:
             pass
         last_err: Optional[Exception] = None
@@ -143,7 +143,7 @@ class OData1CClient:
             request.add_header(k, v)
         try:
             from datetime import datetime as _dt
-            print(f"[OData] {_dt.utcnow().isoformat()} POST {url}")
+            print(f"[OData] {_dt.now(timezone.utc).isoformat()} POST {url}")
         except Exception:
             pass
         try:
@@ -179,7 +179,7 @@ class OData1CClient:
             request.add_header(k, v)
         try:
             from datetime import datetime as _dt
-            print(f"[OData] {_dt.utcnow().isoformat()} POST {url}")
+            print(f"[OData] {_dt.now(timezone.utc).isoformat()} POST {url}")
         except Exception:
             pass
         try:
@@ -217,7 +217,7 @@ class OData1CClient:
             request.add_header(k, v)
         try:
             from datetime import datetime as _dt
-            print(f"[OData] {_dt.utcnow().isoformat()} PATCH {url}")
+            print(f"[OData] {_dt.now(timezone.utc).isoformat()} PATCH {url}")
         except Exception:
             pass
         try:
@@ -412,71 +412,70 @@ class OData1CClient:
                     yield [result]
                 break
 
+    def iter_by_guid(
+        self,
+        entity_name: str,
+        key_field: str = "Ref_Key",
+        filter_query: Optional[str] = None,
+        select_fields: Optional[List[str]] = None,
+        top: int = 1000,
+        max_pages: int = 10000,
+    ):
+        """
+        Ключевая постраничная выборка по GUID-ключу (например, Ref_Key) для 1С OData.
 
-def iter_by_guid(
-    self,
-    entity_name: str,
-    key_field: str = "Ref_Key",
-    filter_query: Optional[str] = None,
-    select_fields: Optional[List[str]] = None,
-    top: int = 1000,
-    max_pages: int = 10000,
-):
-    """
-    Ключевая постраничная выборка по GUID-ключу (например, Ref_Key) для 1С OData.
+        Алгоритм:
+        - $orderby key_field
+        - при наличии last_key: добавляем к исходному фильтру условие key_field gt guid'last_key'
+        - идём батчами top, пока страница неполная
+        """
+        last_key: Optional[str] = None
+        page_count = 0
 
-    Алгоритм:
-    - $orderby key_field
-    - при наличии last_key: добавляем к исходному фильтру условие key_field gt guid'last_key'
-    - идём батчами top, пока страница неполная
-    """
-    last_key: Optional[str] = None
-    page_count = 0
-
-    while True:
-        page_count += 1
-        if max_pages and page_count > max_pages:
-            break
-
-        filters: List[str] = []
-        if filter_query:
-            filters.append(f"({filter_query})")
-        if last_key:
-            filters.append(f"{key_field} gt guid'{last_key}'")
-        combined_filter = " and ".join(filters) if filters else None
-
-        params: Dict[str, Any] = {"$top": top, "$orderby": key_field}
-        if combined_filter:
-            params["$filter"] = combined_filter
-
-        sanitized = self._sanitize_select_fields(select_fields)
-        if sanitized:
-            params["$select"] = ",".join(sanitized)
-
-        result = self._make_request(entity_name, params)
-        if isinstance(result, dict) and "value" in result:
-            data = result["value"] or []
-            if not data:
+        while True:
+            page_count += 1
+            if max_pages and page_count > max_pages:
                 break
 
-            yield data
+            filters: List[str] = []
+            if filter_query:
+                filters.append(f"({filter_query})")
+            if last_key:
+                filters.append(f"{key_field} gt guid'{last_key}'")
+            combined_filter = " and ".join(filters) if filters else None
 
-            if len(data) < top:
-                break
+            params: Dict[str, Any] = {"$top": top, "$orderby": key_field}
+            if combined_filter:
+                params["$filter"] = combined_filter
 
-            # Запоминаем последний ключ
-            try:
-                last = data[-1]
-                last_key = str((last.get(key_field) or "")).strip()
-                if not last_key:
+            sanitized = self._sanitize_select_fields(select_fields)
+            if sanitized:
+                params["$select"] = ",".join(sanitized)
+
+            result = self._make_request(entity_name, params)
+            if isinstance(result, dict) and "value" in result:
+                data = result["value"] or []
+                if not data:
                     break
-            except Exception:
+
+                yield data
+
+                if len(data) < top:
+                    break
+
+                # Запоминаем последний ключ
+                try:
+                    last = data[-1]
+                    last_key = str((last.get(key_field) or "")).strip()
+                    if not last_key:
+                        break
+                except Exception:
+                    break
+            else:
+                # Неожиданный ответ — считаем как одна "страница"
+                if result:
+                    yield [result]
                 break
-        else:
-            # Неожиданный ответ — считаем как одна "страница"
-            if result:
-                yield [result]
-            break
 
 
 def _is_guid_like(value: str) -> bool:
@@ -846,6 +845,3 @@ def get_stock_from_1c_odata(
         key_to_code=key_to_code,
         warehouse_map=warehouse_map,
     )
-
-# Bind helper as a method of the client class for runtime (keeps API backward-compatible)
-OData1CClient.iter_by_guid = iter_by_guid
