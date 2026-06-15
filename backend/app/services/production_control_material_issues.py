@@ -48,6 +48,8 @@ from .workshop_resolution import (
 )
 
 PRODUCTION_ORDER_ENTITY = "Document_ЗаказНаПроизводство"
+DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
+HIDDEN_ORDER_LINE_STATUSES = {"produced", "done", "completed", "cancelled"}
 
 
 def _clean_odata_error_message(error: Exception) -> str:
@@ -427,6 +429,74 @@ def _material_issue_sync_link(db: Session, issue_id: int) -> Optional[SyncLink]:
 
 def _material_issue_has_1c_link(db: Session, issue: ProductionMaterialIssue) -> bool:
     return bool(_clean_ref1c(issue.exported_ref1c) or _material_issue_sync_link(db, int(issue.issue_id)))
+
+
+def refresh_existing_material_issues_for_product(
+    db: Session,
+    product: ProductionProduct,
+) -> Dict[str, Any]:
+    """
+    Keep already-open local material issue quantities aligned after a line edit.
+
+    Posted 1C documents are final here; they are reported back to the caller so
+    the UI can tell the operator that a separate correction is needed.
+    """
+    existing_rows = (
+        db.query(ProductionMaterialIssue)
+        .options(joinedload(ProductionMaterialIssue.lines))
+        .filter(
+            ProductionMaterialIssue.product_id == int(product.product_id),
+            ProductionMaterialIssue.direction == "issue",
+            ProductionMaterialIssue.status.in_(("draft", "requested", "issued", "exported", "posted", "error")),
+        )
+        .order_by(ProductionMaterialIssue.issue_id.asc())
+        .all()
+    )
+    if not existing_rows:
+        return {"updated": [], "blocked": []}
+
+    spec_id, components = _components_for_product(db, product)
+    by_component = {int(comp["component_item_id"]): comp for comp in components}
+    updated: List[Dict[str, Any]] = []
+    blocked: List[Dict[str, Any]] = []
+
+    for issue in existing_rows:
+        if str(issue.status or "") == "posted":
+            blocked.append(
+                {
+                    "issue_id": int(issue.issue_id),
+                    "document_number": str(issue.document_number or ""),
+                    "status": str(issue.status or ""),
+                    "reason": "posted",
+                }
+            )
+            continue
+
+        changed_lines = 0
+        for line in issue.lines or []:
+            comp = by_component.get(int(line.component_item_id))
+            if comp is None:
+                continue
+            old_required = _to_float(line.required_qty)
+            new_required = _to_float(comp.get("required_qty"))
+            if abs(old_required - new_required) > 1e-9:
+                line.required_qty = new_required
+                changed_lines += 1
+                if str(line.line_status or "") == "planned":
+                    line.issued_qty = 0.0
+            line.unit = comp.get("unit")
+            line.source_spec_id = spec_id
+
+        if changed_lines:
+            updated.append(
+                {
+                    "issue_id": int(issue.issue_id),
+                    "document_number": str(issue.document_number or ""),
+                    "changed_lines": int(changed_lines),
+                }
+            )
+
+    return {"updated": updated, "blocked": blocked}
 
 
 def delete_local_material_issue(db: Session, issue_id: int) -> Dict[str, Any]:
@@ -1162,6 +1232,12 @@ def list_material_issues(
 ) -> Dict[str, Any]:
     query = (
         db.query(ProductionMaterialIssue)
+        .join(ProductionOrder, ProductionOrder.order_id == ProductionMaterialIssue.order_id)
+        .join(ProductionProduct, ProductionProduct.product_id == ProductionMaterialIssue.product_id)
+        .outerjoin(
+            ProductionOrderLineState,
+            ProductionOrderLineState.product_id == ProductionMaterialIssue.product_id,
+        )
         .options(
             joinedload(ProductionMaterialIssue.order),
             joinedload(ProductionMaterialIssue.product)
@@ -1171,15 +1247,15 @@ def list_material_issues(
             joinedload(ProductionMaterialIssue.lines),
         )
         .filter(ProductionMaterialIssue.direction == "issue")
+        .filter(func.lower(func.coalesce(ProductionOrder.order_state_key, "")) != DONE_STATE_KEY)
+        .filter(func.coalesce(ProductionOrderLineState.status, "").notin_(tuple(HIDDEN_ORDER_LINE_STATUSES)))
     )
     if status:
         query = query.filter(ProductionMaterialIssue.status == status)
     if search:
         like = f"%{search.strip()}%"
         query = (
-            query.join(ProductionProduct, ProductionProduct.product_id == ProductionMaterialIssue.product_id)
-            .join(ProductionProduct.item)
-            .filter(
+            query.filter(
                 (ProductionMaterialIssue.document_number.ilike(like))
                 | (ProductionMaterialIssue.order.has(ProductionOrder.order_number.ilike(like)))
                 | (ProductionProduct.item.has(Item.item_name.ilike(like)))

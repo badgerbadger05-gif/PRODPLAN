@@ -1488,7 +1488,7 @@ async def export_planning_result_purchases_to_1c(
             date_to=req.date_to,
             purchase_ids=req.purchase_ids,
             dry_run=bool(req.dry_run),
-            allow_production=bool(req.allow_production),
+            allow_production=bool(req.allow_production) or not bool(req.dry_run),
         )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

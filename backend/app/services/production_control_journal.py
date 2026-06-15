@@ -35,6 +35,7 @@ from .production_control_domain import (
     ensure_state as _ensure_state,
     latest_run_id as _latest_run_id,
 )
+from .production_control_material_issues import refresh_existing_material_issues_for_product
 from .replenishment import REPLENISHMENT_FLOW_PRODUCTION, classify_replenishment_flow
 
 
@@ -1386,12 +1387,14 @@ def update_product_quantity(db: Session, product_id: int, quantity: float) -> Di
     delta = qty - old_qty
     if abs(delta) > 1e-9:
         _adjust_requirement_coverage(db, product, delta)
+    material_issues_refresh = refresh_existing_material_issues_for_product(db, product)
     db.commit()
     payload: Dict[str, Any] = {
         "status": "ok",
         "product_id": int(product_id),
         "quantity": float(qty),
         "remaining_qty": float(product.remaining_qty),
+        "material_issues_refresh": material_issues_refresh,
     }
     rid = getattr(product, "source_mrp_requirement_id", None)
     if rid is not None:

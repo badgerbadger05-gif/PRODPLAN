@@ -97,6 +97,7 @@ export function exportPurchasesTo1C(runId: number, body: {
   date_to?: string
   purchase_ids?: number[]
   dry_run?: boolean
+  allow_production?: boolean
 }) {
   return api<Record<string, unknown>>(`/v1/plan/results/${runId}/purchases/export-to-1c`, {
     method: 'POST',

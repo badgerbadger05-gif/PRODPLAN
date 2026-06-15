@@ -727,6 +727,94 @@ def test_update_product_quantity_releases_mrp_requirement_coverage(db_session):
     assert result["mrp_req_remaining_qty"] == 8
 
 
+def test_update_product_quantity_refreshes_open_material_issue_lines(db_session):
+    parent = Item(item_code="P-QTY-ISSUE", item_name="Parent qty issue", unit="шт", stock_qty=0, status="active")
+    comp = Item(item_code="C-QTY-ISSUE", item_name="Component qty issue", unit="шт", stock_qty=100, status="active")
+    db_session.add_all([parent, comp])
+    db_session.flush()
+
+    spec = Specification(spec_name="Qty issue spec", spec_ref1c="spec-qty-issue")
+    db_session.add(spec)
+    db_session.flush()
+    _route_spec_to_workshop(db_session, spec, "qty-issue")
+    db_session.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=1))
+    db_session.add(StockWarehouse(warehouse_ref1c="src-qty-issue", warehouse_code="SRC", warehouse_name="Source", is_selected=True))
+    db_session.add(ItemWarehouseStock(item_id=comp.item_id, warehouse_ref1c="src-qty-issue", qty=100))
+
+    order = ProductionOrder(order_number="QTY-ISSUE-001", order_date=datetime(2026, 6, 15), deletion_mark=False)
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=parent.item_id,
+        line_number=1,
+        quantity=7,
+        produced_qty=0,
+        remaining_qty=7,
+    )
+    db_session.add(product)
+    db_session.commit()
+
+    created = create_material_issues(db_session, [product.product_id], initiated_by="op")
+    issue_id = created["created"][0]["issue_id"]
+    line = db_session.query(ProductionMaterialIssueLine).filter_by(issue_id=issue_id).one()
+    assert float(line.required_qty) == 7.0
+
+    result = update_product_quantity(db_session, product.product_id, 4)
+
+    db_session.refresh(line)
+    assert float(line.required_qty) == 4.0
+    assert result["material_issues_refresh"]["updated"][0]["issue_id"] == issue_id
+    assert result["material_issues_refresh"]["blocked"] == []
+
+
+def test_update_product_quantity_reports_posted_material_issues_as_blocked(db_session):
+    parent = Item(item_code="P-QTY-POSTED", item_name="Parent qty posted", unit="шт", stock_qty=0, status="active")
+    comp = Item(item_code="C-QTY-POSTED", item_name="Component qty posted", unit="шт", stock_qty=100, status="active")
+    db_session.add_all([parent, comp])
+    db_session.flush()
+
+    spec = Specification(spec_name="Qty posted spec", spec_ref1c="spec-qty-posted")
+    db_session.add(spec)
+    db_session.flush()
+    _route_spec_to_workshop(db_session, spec, "qty-posted")
+    db_session.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=1))
+    db_session.add(StockWarehouse(warehouse_ref1c="src-qty-posted", warehouse_code="SRC", warehouse_name="Source", is_selected=True))
+    db_session.add(ItemWarehouseStock(item_id=comp.item_id, warehouse_ref1c="src-qty-posted", qty=100))
+
+    order = ProductionOrder(order_number="QTY-POSTED-001", order_date=datetime(2026, 6, 15), deletion_mark=False)
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=parent.item_id,
+        line_number=1,
+        quantity=7,
+        produced_qty=0,
+        remaining_qty=7,
+    )
+    db_session.add(product)
+    db_session.commit()
+
+    created = create_material_issues(db_session, [product.product_id], initiated_by="op")
+    issue_id = created["created"][0]["issue_id"]
+    issue = db_session.query(ProductionMaterialIssue).filter_by(issue_id=issue_id).one()
+    issue.status = "posted"
+    line = db_session.query(ProductionMaterialIssueLine).filter_by(issue_id=issue_id).one()
+    line.issued_qty = line.required_qty
+    line.line_status = "issued"
+    db_session.commit()
+
+    result = update_product_quantity(db_session, product.product_id, 4)
+
+    db_session.refresh(line)
+    assert float(line.required_qty) == 7.0
+    assert result["material_issues_refresh"]["updated"] == []
+    assert result["material_issues_refresh"]["blocked"][0]["issue_id"] == issue_id
+
+
 def test_fill_remaining_creates_top_up_order_for_partially_covered_requirement(db_session):
     item = Item(
         item_code="MRP-TOPUP",
@@ -1976,6 +2064,86 @@ def test_material_issue_journal_shows_warehouse_names_and_filters_source(db_sess
         "Склад отправитель A",
         "Склад отправитель B",
     }
+
+
+def test_material_issue_journal_hides_completed_orders(db_session):
+    item = Item(item_code="P-MI-DONE", item_name="Parent done issue", unit="шт", stock_qty=0, status="active")
+    db_session.add(item)
+    db_session.flush()
+    active_order = ProductionOrder(order_number="MI-ACTIVE", order_date=datetime(2026, 6, 15), deletion_mark=False)
+    done_order = ProductionOrder(
+        order_number="MI-DONE",
+        order_date=datetime(2026, 6, 15),
+        deletion_mark=False,
+        order_state_key="ad28565a-991b-11eb-e39a-fa163e61326a",
+        order_state_name="Завершен",
+    )
+    db_session.add_all([active_order, done_order])
+    db_session.flush()
+    active_product = ProductionProduct(order_id=active_order.order_id, item_id=item.item_id, line_number=1, quantity=1, produced_qty=0, remaining_qty=1)
+    done_product = ProductionProduct(order_id=done_order.order_id, item_id=item.item_id, line_number=1, quantity=1, produced_qty=0, remaining_qty=1)
+    db_session.add_all([active_product, done_product])
+    db_session.flush()
+    db_session.add_all([
+        ProductionMaterialIssue(
+            document_number="MI-ACTIVE-ISSUE",
+            product_id=active_product.product_id,
+            order_id=active_order.order_id,
+            status="exported",
+            direction="issue",
+        ),
+        ProductionMaterialIssue(
+            document_number="MI-DONE-ISSUE",
+            product_id=done_product.product_id,
+            order_id=done_order.order_id,
+            status="exported",
+            direction="issue",
+        ),
+    ])
+    db_session.commit()
+
+    result = list_material_issues(db_session)
+
+    assert result["total"] == 1
+    assert result["rows"][0]["document_number"] == "MI-ACTIVE-ISSUE"
+
+
+def test_material_issue_journal_hides_produced_lines(db_session):
+    item = Item(item_code="P-MI-PRODUCED", item_name="Parent produced issue", unit="шт", stock_qty=0, status="active")
+    db_session.add(item)
+    db_session.flush()
+    active_order = ProductionOrder(order_number="MI-LINE-ACTIVE", order_date=datetime(2026, 6, 15), deletion_mark=False)
+    produced_order = ProductionOrder(order_number="MI-LINE-PRODUCED", order_date=datetime(2026, 6, 15), deletion_mark=False)
+    db_session.add_all([active_order, produced_order])
+    db_session.flush()
+    active_product = ProductionProduct(order_id=active_order.order_id, item_id=item.item_id, line_number=1, quantity=1, produced_qty=0, remaining_qty=1)
+    produced_product = ProductionProduct(order_id=produced_order.order_id, item_id=item.item_id, line_number=1, quantity=1, produced_qty=1, remaining_qty=0)
+    db_session.add_all([active_product, produced_product])
+    db_session.flush()
+    db_session.add_all([
+        ProductionOrderLineState(product_id=active_product.product_id, status="assembled", issue_status="posted"),
+        ProductionOrderLineState(product_id=produced_product.product_id, status="produced", issue_status="posted"),
+        ProductionMaterialIssue(
+            document_number="MI-LINE-ACTIVE-ISSUE",
+            product_id=active_product.product_id,
+            order_id=active_order.order_id,
+            status="posted",
+            direction="issue",
+        ),
+        ProductionMaterialIssue(
+            document_number="MI-LINE-PRODUCED-ISSUE",
+            product_id=produced_product.product_id,
+            order_id=produced_order.order_id,
+            status="posted",
+            direction="issue",
+        ),
+    ])
+    db_session.commit()
+
+    result = list_material_issues(db_session)
+
+    assert result["total"] == 1
+    assert result["rows"][0]["document_number"] == "MI-LINE-ACTIVE-ISSUE"
 
 
 def test_create_orders_from_mrp_materializes_planned_orders(db_session):

@@ -297,6 +297,8 @@ export function MrpResultPage() {
         date_from: dateFrom || undefined,
         date_to: dateTo || undefined,
         purchase_ids: Array.from(selectedPurchaseIds),
+        dry_run: false,
+        allow_production: true,
       })
       setMessage(formatActionResult('Выгрузка закупок в 1С', result))
       setSelectedPurchaseIds(new Set())

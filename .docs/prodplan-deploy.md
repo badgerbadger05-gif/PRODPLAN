@@ -1,300 +1,201 @@
-# Инструкция по развертыванию и обновлению prodplan
+# PRODPLAN production deploy
 
-> Важно: это шпаргалка по **старому** продплану в Docker (`/opt/prodplan`, порт
-> `9000`). Для текущего `PRODPLAN-NEXT` используй `docs/test-prod-deploy.md`:
-> сервер `mtzdock.lan`, путь `/home/barsukov/prodplan-next`, compose-файл
-> `docker-compose.test.yml`, проект `prodplan-next-test`, frontend `9010`,
-> backend `8010`, PostgreSQL host port `55433`.
+This is the single deploy runbook for the live PRODPLAN instance.
 
-## Что смотреть в первую очередь
+## Source Of Truth
 
-### Текущий PRODPLAN-NEXT
+- Host: `mtzdock.lan`
+- Deploy user: `barsukov`
+- Project path: `/home/barsukov/prodplan`
+- Compose file: `docker-compose.test.yml`
+- Compose project: `prodplan`
+- Frontend: `http://mtzdock.lan:9010`
+- Backend health: `http://mtzdock.lan:8010/health`
+- PostgreSQL host port: `55433`
+- OData config mount: `/home/barsukov/prodplan/config-test`
+- Output mount: `/home/barsukov/prodplan/output-test`
+
+Current live services are:
+
+```text
+prodplan-db-1
+prodplan-backend-1
+prodplan-frontend-1
+prodplan-sync-worker-1
+prodplan-reconcile-worker-1
+```
+
+## Important Rule
+
+Production can be ahead of the local workstation. As of 2026-06-15, production
+was on commit `3bcb50af`, while this local checkout was behind it.
+
+Before deploying from any machine, compare the local commit to production. Do
+not rebuild production from an older local checkout.
+
+```bash
+git rev-parse --short HEAD
+ssh barsukov@mtzdock.lan "cd /home/barsukov/prodplan && git rev-parse --short HEAD && git status --short"
+```
+
+If production is ahead, first bring the local branch up to the production code
+or make the fix from the production branch. Treat production as the freshest
+state until Git history proves otherwise.
+
+## Connect
+
 ```bash
 ssh barsukov@mtzdock.lan
-cd /home/barsukov/prodplan-next
+cd /home/barsukov/prodplan
+```
+
+Never store SSH passwords or 1C credentials in this repository. Use the local
+operator's credential store or the existing server setup.
+
+## Inspect Production
+
+```bash
+cd /home/barsukov/prodplan
+git status --short
+git log -1 --format='%h %ci %s'
 docker compose -f docker-compose.test.yml ps
-docker compose -f docker-compose.test.yml logs --tail=120 frontend
+docker ps --format 'table {{.Names}}\t{{.Ports}}\t{{.Status}}'
+curl -fsS http://localhost:8010/health
 curl -I http://localhost:9010
-curl -I http://localhost:8010/health
 ```
 
-Открывать в браузере:
+Check the active OData base without printing credentials:
+
+```bash
+docker compose -f docker-compose.test.yml exec backend python - <<'PY'
+from app.services.odata_config import load_odata_config
+cfg = load_odata_config()
+print(cfg.get("base_url"))
+PY
+```
+
+The live production base is expected to be the real `unf` OData base, not
+`unf_demo`, unless the team explicitly switches the environment.
+
+## Logs
+
+Use exact service names from compose:
+
+```bash
+cd /home/barsukov/prodplan
+docker compose -f docker-compose.test.yml logs --tail=200 backend
+docker compose -f docker-compose.test.yml logs --tail=200 frontend
+docker compose -f docker-compose.test.yml logs --tail=200 sync-worker
+docker compose -f docker-compose.test.yml logs --tail=200 reconcile-worker
+```
+
+For an incident window:
+
+```bash
+docker compose -f docker-compose.test.yml logs --since=2026-06-15T08:00:00 backend sync-worker reconcile-worker
+```
+
+## Database
+
+Connect through the container for production diagnostics:
+
+```bash
+docker exec -it prodplan-db-1 psql -U prodplan -d prodplan
+```
+
+One-shot read-only query example:
+
+```bash
+docker exec prodplan-db-1 psql -U prodplan -d prodplan -P pager=off -c "select now();"
+```
+
+Avoid direct SQL writes in production unless the corrective action has been
+agreed explicitly. For 1C-linked documents, prefer the application flow or a
+document-level correction in 1C.
+
+## Update Deploy
+
+Use this when the target commit is known and newer than production:
+
+```bash
+cd /home/barsukov/prodplan
+git status --short
+git fetch --all --prune
+git log --oneline --decorate -5
+git pull --ff-only
+
+docker compose -f docker-compose.test.yml build
+docker compose -f docker-compose.test.yml up -d
+docker compose -f docker-compose.test.yml exec backend alembic upgrade head
+docker compose -f docker-compose.test.yml ps
+curl -fsS http://localhost:8010/health
+```
+
+If `git pull --ff-only` refuses, stop and inspect the branch history. Do not
+force-reset production without an explicit decision.
+
+## Restart Without Code Changes
+
+```bash
+cd /home/barsukov/prodplan
+docker compose -f docker-compose.test.yml restart backend frontend sync-worker reconcile-worker
+docker compose -f docker-compose.test.yml ps
+```
+
+## Rebuild One Service
+
+Backend:
+
+```bash
+cd /home/barsukov/prodplan
+docker compose -f docker-compose.test.yml build backend sync-worker reconcile-worker
+docker compose -f docker-compose.test.yml up -d backend sync-worker reconcile-worker
+docker compose -f docker-compose.test.yml exec backend alembic upgrade head
+```
+
+Frontend:
+
+```bash
+cd /home/barsukov/prodplan
+docker compose -f docker-compose.test.yml build frontend
+docker compose -f docker-compose.test.yml up -d frontend
+curl -I http://localhost:9010
+```
+
+## Frontend White Screen
+
+If `http://mtzdock.lan:9010` is blank but `curl -I http://localhost:9010`
+returns `200`, inspect nginx logs:
+
+```bash
+cd /home/barsukov/prodplan
+docker compose -f docker-compose.test.yml logs --tail=120 frontend
+```
+
+If nginx cannot read Vite assets, rebuild the frontend image after confirming
+the Dockerfile normalizes permissions under `/usr/share/nginx/html`.
+
+## Worker Cadence
+
+- `sync-worker`: calls `/api/v1/sync/auto/tick` about every 120 seconds and
+  runs at most one due 1C sync job per tick.
+- `reconcile-worker`: calls `/api/v1/plan/reconcile` about every 10800 seconds.
+
+Both workers use the backend service URL inside the compose network:
 
 ```text
-http://mtzdock.lan:9010
+http://backend:8000
 ```
 
-### Старый продплан
-```bash
-ssh barsukov@mtzdock.lan
-cd /opt/prodplan
-docker compose ps
-```
+## Safety Notes
 
-Открывать в браузере:
-
-```text
-http://mtzdock.lan:9000
-```
-
-## Информация о сервере
-
-- **Адрес:** `mtzdock.lan` (10.36.0.12)
-- **Пользователь:** `barsukov`
-- **Пароль:** `Chai3rae`
-- **Путь к старому проекту:** `/opt/prodplan`
-- **Старый веб-интерфейс:** http://mtzdock.lan:9000 или http://10.36.0.12:9000
-- **Путь к текущему PRODPLAN-NEXT:** `/home/barsukov/prodplan-next`
-- **Текущий веб-интерфейс:** http://mtzdock.lan:9010 или http://10.36.0.12:9010
-
-## Подключение к серверу
-
-### Windows (PowerShell)
-```powershell
-ssh barsukov@mtzdock.lan
-# Введи пароль: Chai3rae
-```
-
-### При первом подключении
-```
-Are you sure you want to continue connecting (yes/no/[fingerprint])? yes
-barsukov@mtzdock.lan's password: Chai3rae
-```
-
-## Обновление проекта
-
-### 1. Подключение и переход в проект
-```bash
-ssh barsukov@mtzdock.lan
-cd /opt/prodplan
-```
-
-### 2. Остановка текущих контейнеров
-```bash
-# Останови все сервисы
-docker compose down
-
-# Для полной очистки (удалит образы):
-docker compose down --rmi local
-```
-
-### 3. Обновление кода
-```bash
-# Проверь текущее состояние
-git status
-git branch
-
-# Получи последние изменения
-git pull origin main
-
-# Если есть локальные изменения
-git stash          # сохрани изменения
-git pull           # обновись
-git stash pop      # верни изменения (если нужно)
-```
-
-### 4. Запуск обновленной версии
-```bash
-# Собери новые образы
-docker compose build
-
-# Запусти все сервисы
-docker compose up -d
-
-# Примени миграции БД (обязательно после обновления кода)
-docker compose exec backend alembic upgrade head
-
-# Проверь статус
-docker compose ps
-```
-
-## Проверка работоспособности
-
-### Проверка контейнеров
-```bash
-# Статус всех сервисов проекта
-docker compose ps
-
-# Все запущенные контейнеры в системе
-docker ps
-
-# Логи всех сервисов
-docker compose logs
-
-# Логи конкретного сервиса
-docker compose logs frontend
-docker compose logs backend
-docker compose logs db
-```
-
-### Проверка доступности
-```bash
-# Frontend (веб-интерфейс)
-curl -I http://localhost:9000
-
-# Backend API
-curl -I http://localhost:8000
-
-# Проверь открытые порты
-netstat -tuln | grep -E ':9000|:8000|:5432'
-```
-
-### Ожидаемый результат
-```bash
-$ docker compose ps
-NAME                  IMAGE               COMMAND                  SERVICE    STATUS          PORTS
-prodplan-backend-1    prodplan-backend    "uvicorn app.main:ap…"   backend    Up XX seconds   0.0.0.0:8000->8000/tcp
-prodplan-db-1         postgres:15         "docker-entrypoint.s…"   db         Up XX seconds   0.0.0.0:5432->5432/tcp
-prodplan-frontend-1   prodplan-frontend   "/docker-entrypoint.…"   frontend   Up XX seconds   0.0.0.0:9000->80/tcp
-```
-
-## Диагностика проблем
-
-### Если контейнеры не запускаются
-```bash
-# Логи с ошибками
-docker compose logs
-
-# Пересборка без кеша
-docker compose build --no-cache
-
-# Принудительный пересброс
-docker compose down --rmi all -v
-docker compose build
-docker compose up -d
-```
-
-### Если frontend не может найти backend
-**Ошибка:** `host not found in upstream "backend"`
-
-**Решение:** Добавить в docker-compose.yml в секцию frontend:
-```yaml
-frontend:
-  depends_on:
-    - backend
-```
-
-### Проверка ресурсов сервера
-```bash
-# Место на диске
-df -h
-
-# Использование CPU и памяти
-top
-# (нажми 'q' для выхода)
-
-# Процессы Docker
-ps aux | grep docker
-```
-
-### Проблемы с сетевым подключением
-```bash
-# Проверка доступности сервера
-ping mtzdock.lan
-ping 10.36.0.12
-
-# Проверка SSH порта
-telnet mtzdock.lan 22
-```
-
-## Быстрые команды
-
-### Полный перезапуск
-```bash
-cd /opt/prodplan
-docker compose down
-git pull
-docker compose build
-docker compose up -d
-docker compose exec backend alembic upgrade head
-docker compose ps
-```
-
-### Если ошибка `column items.category_id does not exist`
-```bash
-cd /opt/prodplan
-docker compose up -d
-docker compose exec backend alembic upgrade head
-docker compose restart backend
-docker compose logs -f backend
-```
-
-### Только перезапуск без обновления
-```bash
-cd /opt/prodplan
-docker compose restart
-docker compose ps
-```
-
-### Просмотр логов в реальном времени
-```bash
-cd /opt/prodplan
-docker compose logs -f
-# Ctrl+C для выхода
-```
-
-## Архитектура проекта
-
-**Сервисы:**
-- **db** - PostgreSQL база данных (порт 5432)
-- **backend** - FastAPI/Uvicorn сервер (порт 8000)  
-- **frontend** - Nginx веб-сервер (порт 9000)
-
-**Volumes:**
-- `postgres_data` - данные базы PostgreSQL
-- `./config` - конфигурационные файлы
-- `./output` - выходные файлы
-- `./frontend/config` - конфигурация frontend
-
-**Зависимости запуска:**
-1. `db` (база данных)
-2. `backend` (зависит от db)
-3. `frontend` (зависит от backend)
-
-## Работа с VS Code Remote SSH
-
-### Подключение
-1. Открой VS Code
-2. Ctrl+Shift+P → "Remote-SSH: Connect to Host"
-3. Выбери `barsukov@mtzdock.lan` 
-4. Введи пароль `Chai3rae`
-
-### Полезные команды в VS Code Terminal
-```bash
-# Быстрая диагностика
-hostname && docker compose -f /opt/prodplan/docker-compose.yml ps && docker ps
-
-# Логи с автообновлением
-docker compose -f /opt/prodplan/docker-compose.yml logs -f
-```
-
-## Troubleshooting
-
-### VS Code команды зависают
-**Причина:** Контейнеры не запущены или Docker API не отвечает
-
-**Решение:**
-1. Подключись через обычный SSH в PowerShell
-2. Проверь статус контейнеров: `docker compose ps`
-3. Запусти контейнеры если они остановлены
-4. Повтори команду в VS Code
-
-### Веб-интерфейс недоступен
-**Проверь:**
-1. Контейнеры запущены: `docker compose ps`
-2. Порт 9000 открыт: `netstat -tuln | grep :9000`
-3. Frontend логи: `docker compose logs frontend`
-4. Доступность с сервера: `curl -I http://localhost:9000`
-
-### Ошибки базы данных
-```bash
-# Проверь статус PostgreSQL
-docker compose logs db
-
-# Подключение к базе
-docker compose exec db psql -U prodplan -d prodplan
-```
-
----
-
-**Примечание:** После каждого изменения кода обязательно выполняй полное обновление с пересборкой образов (`docker compose build`) для применения изменений.
+- Current production uses `docker-compose.test.yml` by history, but it is the
+  live production compose file on `mtzdock.lan`.
+- `config-test/odata_config.json` is a live secret-bearing config file. Never
+  commit it and never paste credentials into logs.
+- Child 1C documents must keep their business basis: transfers and manufactures
+  must point to the production order; piecework orders must point to the
+  manufacture document.
+- When investigating a 1C mismatch, start with backend logs, then local DB
+  state, then 1C document refs. Do not "fix" linked rows with SQL before
+  deciding what happens to the corresponding 1C documents.

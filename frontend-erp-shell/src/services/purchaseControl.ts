@@ -18,7 +18,7 @@ export function getPurchaseFilters() {
 export function exportPurchasesTo1C(runId: number, purchaseIds: number[]) {
   return api<Record<string, unknown>>(`/v1/plan/results/${runId}/purchases/export-to-1c`, {
     method: 'POST',
-    body: JSON.stringify({ purchase_ids: purchaseIds, dry_run: false }),
+    body: JSON.stringify({ purchase_ids: purchaseIds, dry_run: false, allow_production: true }),
   })
 }
 
