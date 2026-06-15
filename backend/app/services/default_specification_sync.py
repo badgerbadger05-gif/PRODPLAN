@@ -206,10 +206,23 @@ def sync_default_specifications_from_odata(db: Session, req: ODataSyncRequest) -
         stats.records_unchanged = unchanged_count
         stats.duplicates_deleted = duplicates_deleted
 
+        binding_repair = None
+        if not req.dry_run and touched_keys:
+            from .production_binding_repair import repair_clean_mrp_bindings
+
+            binding_repair = repair_clean_mrp_bindings(
+                db,
+                item_ids=[item_id for item_id, _char in touched_keys],
+            )
+
         if req.dry_run:
             db.rollback()
         else:
             db.commit()
+        if binding_repair is not None:
+            result = asdict(stats)
+            result["binding_repair"] = binding_repair
+            return result
 
     except Exception as e:
         db.rollback()

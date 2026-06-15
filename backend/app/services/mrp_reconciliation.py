@@ -66,6 +66,7 @@ from .production_control_journal import (
     _split_qty_by_optimal_batch,
     dedupe_mrp_production_orders,
 )
+from .production_binding_repair import repair_clean_mrp_bindings
 from .mrp_stock_helpers import effective_stock_by_item_all
 from .replenishment import (
     REPLENISHMENT_FLOW_PRODUCTION,
@@ -519,11 +520,20 @@ def _link_orphan_mrp_products_to_requirements(
         .all()
     )
     linked_items: set[int] = set()
-    for product, _order in rows:
+    for product, order in rows:
         req = req_by_item.get(int(product.item_id))
         if req is None:
             continue
         product.source_mrp_requirement_id = int(req.id)
+        req_qty = _to_float(req.net_required_qty)
+        if (
+            req_qty > EPS
+            and not order.order_ref1c
+            and _to_float(product.produced_qty) <= EPS
+            and _to_float(product.remaining_qty) > req_qty + EPS
+        ):
+            product.quantity = req_qty
+            product.remaining_qty = req_qty
         linked_items.add(int(product.item_id))
     return {"linked": len(rows), "items": sorted(linked_items)}
 
@@ -714,6 +724,11 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
         # rework flow is intentionally not auto-topped-up in v1.
 
     batch_repair = _split_oversized_catchup_batches(db, run, dry_run=dry_run, now=now)
+    binding_repair = (
+        {"checked": 0, "spec_updated": 0, "workshop_auto_cleared": 0, "local_issues_deleted": 0, "blocked": {}}
+        if dry_run
+        else repair_clean_mrp_bindings(db, run_id=int(run.run_id))
+    )
 
     # Re-anchor every production line that is NOT yet open in 1C to a fresh
     # capacity-aware, child→parent-aware schedule starting today. Lines already
@@ -737,6 +752,7 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
         "rescheduled": reschedule,
         "mrp_order_repair": mrp_order_repair,
         "mrp_batch_repair": batch_repair,
+        "binding_repair": binding_repair,
         "orphan_link_repair": orphan_link_repair,
     }
 
@@ -893,6 +909,8 @@ def _reschedule_run_journal(db: Session, run: PlanningRun, *, dry_run: bool) -> 
             order_meta = next((o for o in orders if int(o["key"]) == int(key)), {})
             workshop_id = order_meta.get("workshop_id")
         state.workshop_id = int(workshop_id) if workshop_id is not None else None
+        state.workshop_id_source = "auto" if state.workshop_id is not None else None
+        state.workshop_id_set_at = datetime.now(timezone.utc) if state.workshop_id is not None else None
         start_dt = res.get("order_start_date")
         finish_dt = res.get("order_finish_date")
         if isinstance(start_dt, datetime):

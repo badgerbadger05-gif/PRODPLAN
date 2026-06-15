@@ -11,14 +11,21 @@ from app.models import (
     PlanningRun,
     ProductionOrder,
     ProductionOrderLineState,
+    ProductionKind,
     ProductionPlanHeader,
     ProductionPlanLine,
     ProductionProduct,
+    ProductionMaterialIssue,
+    ProductionMaterialIssueLine,
+    ProductionResource,
+    ResourceProductionKind,
     SpecComponent,
     Specification,
+    SyncLink,
 )
 from app.services.mrp_reconciliation import reconcile_snapshot
 from app.services.period_plan_service import create_mrp_snapshot_from_period_plan
+from app.services.production_binding_repair import repair_clean_mrp_bindings
 from app.services.production_control_journal import (
     create_production_orders_from_mrp_requirements,
     update_line_state,
@@ -94,6 +101,152 @@ def _make_requirement_with_line(db, item, *, net, covered, produced, quantity):
     )
     db.flush()
     return req, product
+
+
+def _make_spec(db, item: Item, name: str, *, resource_name: str | None = None) -> Specification:
+    kind = None
+    if resource_name:
+        kind = ProductionKind(ref_1c=f"kind-{name}", name=f"Kind {name}")
+        resource = ProductionResource(resource_name=resource_name)
+        db.add_all([kind, resource])
+        db.flush()
+        db.add(ResourceProductionKind(resource_id=resource.resource_id, production_kind_id=kind.id))
+    spec = Specification(
+        spec_code=name,
+        spec_name=name,
+        spec_ref1c=f"spec-{name}",
+        production_kind_id=kind.id if kind else None,
+    )
+    db.add(spec)
+    db.flush()
+    return spec
+
+
+def test_repair_clean_mrp_line_updates_default_spec_and_clears_auto_workshop(db_session):
+    item = _make_production_item(db_session, "P-BIND")
+    component = _make_production_item(db_session, "P-BIND-COMP")
+    old_spec = _make_spec(db_session, item, "OLD", resource_name="Старый участок")
+    new_spec = _make_spec(db_session, item, "NEW", resource_name="Новый участок")
+    db_session.add(SpecComponent(spec_id=new_spec.spec_id, item_id=component.item_id, quantity=2))
+    db_session.add(DefaultSpecification(item_id=item.item_id, spec_id=old_spec.spec_id))
+    run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={}, pinned=True)
+    db_session.add(run)
+    db_session.flush()
+    order = ProductionOrder(
+        order_number="MRP-RC-TEST",
+        order_date=date(2026, 6, 1),
+        is_posted=False,
+        deletion_mark=False,
+        source="mrp",
+        source_run_id=run.run_id,
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=item.item_id,
+        line_number=1,
+        quantity=5,
+        produced_qty=0,
+        remaining_qty=5,
+        spec_id=old_spec.spec_id,
+    )
+    db_session.add(product)
+    db_session.flush()
+    state = ProductionOrderLineState(
+        product_id=product.product_id,
+        status="to_move",
+        issue_status="requested",
+        workshop_id=999,
+        workshop_id_source="auto",
+    )
+    db_session.add(state)
+    issue = ProductionMaterialIssue(
+        document_number="MI-DRAFT",
+        product_id=product.product_id,
+        order_id=order.order_id,
+        status="draft",
+        direction="issue",
+    )
+    db_session.add(issue)
+    db_session.flush()
+    db_session.add(
+        ProductionMaterialIssueLine(
+            issue_id=issue.issue_id,
+            component_item_id=component.item_id,
+            required_qty=1,
+            issued_qty=0,
+            source_spec_id=old_spec.spec_id,
+        )
+    )
+    db_session.flush()
+
+    default = db_session.query(DefaultSpecification).filter_by(item_id=item.item_id).one()
+    default.spec_id = new_spec.spec_id
+    stats = repair_clean_mrp_bindings(db_session, run_id=run.run_id)
+    db_session.commit()
+
+    db_session.refresh(product)
+    db_session.refresh(state)
+    assert stats["spec_updated"] == 1
+    assert stats["workshop_auto_cleared"] == 1
+    assert stats["local_issues_deleted"] == 1
+    assert product.spec_id == new_spec.spec_id
+    assert state.workshop_id is None
+    assert state.workshop_id_source is None
+    assert state.issue_status == "not_requested"
+    assert db_session.query(ProductionMaterialIssue).filter_by(product_id=product.product_id).count() == 0
+
+
+def test_repair_clean_mrp_line_blocks_after_production_order_export(db_session):
+    item = _make_production_item(db_session, "P-BLOCK")
+    old_spec = _make_spec(db_session, item, "BLOCK-OLD")
+    new_spec = _make_spec(db_session, item, "BLOCK-NEW")
+    db_session.add(DefaultSpecification(item_id=item.item_id, spec_id=new_spec.spec_id))
+    run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={}, pinned=True)
+    db_session.add(run)
+    db_session.flush()
+    order = ProductionOrder(
+        order_number="MRP-BLOCK",
+        order_date=date(2026, 6, 1),
+        is_posted=False,
+        deletion_mark=False,
+        source="mrp",
+        source_run_id=run.run_id,
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=item.item_id,
+        line_number=1,
+        quantity=5,
+        produced_qty=0,
+        remaining_qty=5,
+        spec_id=old_spec.spec_id,
+    )
+    db_session.add(product)
+    db_session.flush()
+    db_session.add(
+        SyncLink(
+            source_system="PRODPLAN",
+            source_doctype="production_order",
+            source_id=order.order_id,
+            target_system="1C",
+            target_entity="Document_ЗаказНаПроизводство",
+            target_ref_key="11111111-1111-1111-1111-111111111111",
+            status="success",
+        )
+    )
+    db_session.flush()
+
+    stats = repair_clean_mrp_bindings(db_session, run_id=run.run_id)
+    db_session.commit()
+
+    db_session.refresh(product)
+    assert product.spec_id == old_spec.spec_id
+    assert stats["spec_updated"] == 0
+    assert stats["blocked"]["order_in_1c"] == 1
 
 
 # ---------------------------------------------------------------------------

@@ -157,11 +157,11 @@ def resolve_workshop_for_product(
 ) -> Optional[int]:
     """Explicit line assignment wins; otherwise spec → production kind → workshop."""
     state = (
-        db.query(ProductionOrderLineState.workshop_id)
+        db.query(ProductionOrderLineState.workshop_id, ProductionOrderLineState.workshop_id_source)
         .filter(ProductionOrderLineState.product_id == int(product.product_id))
         .first()
     )
-    if state and state[0]:
+    if state and state[0] and str(state[1] or "") not in {"auto", "legacy"}:
         return int(state[0])
     resolved_spec = int(spec_id) if spec_id else spec_id_for_product(db, product)
     return resolve_workshop_for_spec(db, resolved_spec)
@@ -371,11 +371,11 @@ def diagnose_product(db: Session, product: ProductionProduct) -> WorkshopDiagnos
     spec_id = spec_id_for_product(db, product)
 
     state = (
-        db.query(ProductionOrderLineState.workshop_id)
+        db.query(ProductionOrderLineState.workshop_id, ProductionOrderLineState.workshop_id_source)
         .filter(ProductionOrderLineState.product_id == int(product.product_id))
         .first()
     )
-    manual_workshop = int(state[0]) if state and state[0] else None
+    manual_workshop = int(state[0]) if state and state[0] and str(state[1] or "") not in {"auto", "legacy"} else None
     if manual_workshop:
         binding = warehouse_binding_for_workshop(db, manual_workshop)
         workshop_name = ""

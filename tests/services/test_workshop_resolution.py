@@ -157,6 +157,7 @@ def test_manual_state_assignment_wins(db_session):
             status="ready",
             issue_status="not_requested",
             workshop_id=manual_resource.resource_id,
+            workshop_id_source="manual",
         )
     )
     db.commit()
@@ -231,6 +232,7 @@ def test_diagnose_product_no_spec_and_manual_state(db_session):
             status="ready",
             issue_status="not_requested",
             workshop_id=resource.resource_id,
+            workshop_id_source="manual",
         )
     )
     db.commit()

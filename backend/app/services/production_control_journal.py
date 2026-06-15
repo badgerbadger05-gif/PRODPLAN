@@ -1062,7 +1062,13 @@ def list_journal(
             spec_id or 0,
             (None, None, None, None),
         )
-        state_workshop_id = int(state.workshop_id) if state and state.workshop_id else None
+        state_workshop_id = (
+            int(state.workshop_id)
+            if state
+            and state.workshop_id
+            and str(getattr(state, "workshop_id_source", "") or "") not in {"auto", "legacy"}
+            else None
+        )
         resolved_workshop_id = state_workshop_id or inferred_workshop_id
         if workshop_id and resolved_workshop_id != int(workshop_id):
             continue
@@ -1253,6 +1259,8 @@ def update_line_state(db: Session, product_id: int, payload: Dict[str, Any]) -> 
         state.issue_status = issue_status
     if "workshop_id" in payload:
         state.workshop_id = int(payload["workshop_id"]) if payload.get("workshop_id") else None
+        state.workshop_id_source = "manual" if state.workshop_id else None
+        state.workshop_id_set_at = datetime.now(timezone.utc) if state.workshop_id else None
     if "planned_start_date" in payload:
         state.planned_start_date = _parse_date(payload.get("planned_start_date"))
     if "planned_finish_date" in payload:

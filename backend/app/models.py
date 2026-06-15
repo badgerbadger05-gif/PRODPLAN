@@ -294,6 +294,8 @@ class ProductionOrderLineState(Base):
     # and mapped by the service layer to the compact workshop-facing labels.
     status = Column(String(32), nullable=False, default="shortage", server_default="shortage", index=True)
     workshop_id = Column(Integer, ForeignKey("production_resources.resource_id"), nullable=True, index=True)
+    workshop_id_source = Column(String(16), nullable=True, index=True)
+    workshop_id_set_at = Column(TIMESTAMP, nullable=True)
     planned_start_date = Column(Date, nullable=True, index=True)
     planned_finish_date = Column(Date, nullable=True, index=True)
     opened_at = Column(TIMESTAMP, nullable=True)

@@ -176,7 +176,7 @@ def _active_problem_rows(db: Session) -> List[Dict[str, Any]]:
     spec_ids = set()
     manual_workshops = set()
     for product, _order, state in lines:
-        if state is not None and state.workshop_id:
+        if state is not None and state.workshop_id and str(getattr(state, "workshop_id_source", "") or "") not in {"auto", "legacy"}:
             manual_workshops.add(int(state.workshop_id))
             continue
         spec_id = int(product.spec_id) if product.spec_id else default_specs.get(int(product.item_id))
@@ -189,7 +189,7 @@ def _active_problem_rows(db: Session) -> List[Dict[str, Any]]:
     per_item: Dict[int, Dict[str, Any]] = {}
     for product, _order, state in lines:
         item_id = int(product.item_id)
-        if state is not None and state.workshop_id:
+        if state is not None and state.workshop_id and str(getattr(state, "workshop_id_source", "") or "") not in {"auto", "legacy"}:
             diagnosis = manual_diagnoses.get(int(state.workshop_id))
         else:
             spec_id = int(product.spec_id) if product.spec_id else default_specs.get(item_id)

@@ -370,10 +370,20 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
         stats.spec_operations_updated = spec_operations_updated
         stats.spec_operations_deleted = spec_operations_deleted
 
+        binding_repair = None
+        if not req.dry_run and updated_count:
+            from .production_binding_repair import repair_clean_mrp_bindings
+
+            binding_repair = repair_clean_mrp_bindings(db)
+
         if req.dry_run:
             db.rollback()
         else:
             db.commit()
+        if binding_repair is not None:
+            result = asdict(stats)
+            result["binding_repair"] = binding_repair
+            return result
 
     except Exception as e:
         db.rollback()

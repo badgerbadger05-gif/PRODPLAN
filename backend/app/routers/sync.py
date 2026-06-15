@@ -21,6 +21,7 @@ from ..services.operations_sync import sync_operations_from_odata, OperationsSyn
 from ..services.production_kind_sync import sync_production_kinds_from_odata, ProductionKindSyncStats
 from ..services.employee_sync import sync_employees_from_odata
 from ..services import sync_orchestrator
+from ..services.odata_config import resolve_config_secrets
 
 from .. import models
 from typing import Dict, Optional
@@ -41,8 +42,14 @@ class SyncAutoConfigPayload(BaseModel):
     jobs: Dict[str, SyncJobConfigPatch] = {}
 
 
+def _resolve_sync_payload(payload: ODataSyncRequest) -> ODataSyncRequest:
+    data = resolve_config_secrets(payload.model_dump())
+    return ODataSyncRequest(**data)
+
+
 @router.post("/stock-odata", response_model=ODataSyncStats)
 def sync_stock_odata(payload: ODataSyncRequest, db: Session = Depends(get_db)):
+    payload = _resolve_sync_payload(payload)
     """
     Синхронизация остатков из 1С через OData.
     Тело запроса:
@@ -68,6 +75,7 @@ def sync_stock_odata(payload: ODataSyncRequest, db: Session = Depends(get_db)):
 
 @router.post("/warehouses-odata", response_model=dict)
 def sync_warehouses_odata(payload: ODataSyncRequest, db: Session = Depends(get_db)):
+    payload = _resolve_sync_payload(payload)
     """
     Синхронизация списка складов из 1С (через тот же регистр остатков).
     Остатки номенклатуры не обновляет.
@@ -122,6 +130,7 @@ def save_stock_warehouse_selection(payload: WarehouseSelectionPayload, db: Sessi
 
 @router.post("/nomenclature-odata", response_model=dict)
 def sync_nomenclature_odata(payload: ODataSyncRequest, db: Session = Depends(get_db)):
+    payload = _resolve_sync_payload(payload)
     """
     Синхронизация номенклатуры из 1С через OData.
     Перед синхронизацией номенклатуры принудительно запускается синхронизация единиц измерения,
@@ -177,6 +186,7 @@ def sync_nomenclature_odata(payload: ODataSyncRequest, db: Session = Depends(get
 
 @router.post("/categories-odata", response_model=dict)
 def sync_categories_odata(payload: ODataSyncRequest, db: Session = Depends(get_db)):
+    payload = _resolve_sync_payload(payload)
     """
     Синхронизация категорий номенклатуры из 1С через OData.
     Тело запроса:
@@ -201,6 +211,7 @@ def sync_categories_odata(payload: ODataSyncRequest, db: Session = Depends(get_d
 
 @router.post("/specifications-odata", response_model=dict)
 def sync_specifications_odata(payload: ODataSyncRequest, db: Session = Depends(get_db)):
+    payload = _resolve_sync_payload(payload)
     """
     Синхронизация спецификаций из 1С через OData.
     Тело запроса:
@@ -225,6 +236,7 @@ def sync_specifications_odata(payload: ODataSyncRequest, db: Session = Depends(g
 
 @router.post("/production-orders-odata", response_model=dict)
 def sync_production_orders_odata(payload: ODataSyncRequest, db: Session = Depends(get_db)):
+    payload = _resolve_sync_payload(payload)
     """
     Синхронизация заказов на производство из 1С через OData.
     Тело запроса:
@@ -272,6 +284,7 @@ def export_production_orders(db: Session = Depends(get_db)):
 
 @router.post("/production-orders-fact-odata", response_model=dict)
 def sync_production_orders_fact_odata(payload: ODataSyncRequest, db: Session = Depends(get_db)):
+    payload = _resolve_sync_payload(payload)
     """
     Синхронизация факта выпуска из 1С через OData.
     Загружает данные из Document_СборкаЗапасов и обновляет produced_qty/remaining_qty.
@@ -346,6 +359,7 @@ def debug_production_order_states(db: Session = Depends(get_db)):
 
 @router.post("/supplier-orders-odata", response_model=dict)
 def sync_supplier_orders_odata(payload: ODataSyncRequest, db: Session = Depends(get_db)):
+    payload = _resolve_sync_payload(payload)
     """
     Синхронизация заказов поставщикам из 1С через OData.
     Тело запроса:
@@ -382,6 +396,7 @@ def export_supplier_orders(db: Session = Depends(get_db)):
 
 @router.post("/default-specifications-odata", response_model=dict)
 def sync_default_specifications_odata(payload: ODataSyncRequest, db: Session = Depends(get_db)):
+    payload = _resolve_sync_payload(payload)
     """
     Синхронизация спецификаций по умолчанию из 1С через OData.
     Тело запроса:
@@ -406,6 +421,7 @@ def sync_default_specifications_odata(payload: ODataSyncRequest, db: Session = D
 
 @router.post("/production-stages-odata", response_model=dict)
 def sync_production_stages_odata(payload: ODataSyncRequest, db: Session = Depends(get_db)):
+    payload = _resolve_sync_payload(payload)
     """
     Синхронизация этапов производства из 1С через OData.
     Ожидаемая сущность: каталог этапов (например, "Catalog_ЭтапыПроизводства").
@@ -420,6 +436,7 @@ def sync_production_stages_odata(payload: ODataSyncRequest, db: Session = Depend
 
 @router.post("/units-odata", response_model=dict)
 def sync_units_odata(payload: ODataSyncRequest, db: Session = Depends(get_db)):
+    payload = _resolve_sync_payload(payload)
     """
     Синхронизация единиц измерения из 1С через OData.
     Ожидаемая сущность: "Catalog_КлассификаторЕдиницИзмерения" (или аналог).
@@ -446,6 +463,7 @@ def sync_units_odata(payload: ODataSyncRequest, db: Session = Depends(get_db)):
 
 @router.post("/operations-odata", response_model=dict)
 def sync_operations_odata(payload: ODataSyncRequest, db: Session = Depends(get_db)):
+    payload = _resolve_sync_payload(payload)
     """
     Синхронизация наименований операций через строки спецификаций 1С.
     По умолчанию используем сущность "Catalog_Спецификации_Операции" и навигацию Операция@navigationLinkUrl.
@@ -462,6 +480,7 @@ def sync_operations_odata(payload: ODataSyncRequest, db: Session = Depends(get_d
 
 @router.post("/employees-odata", response_model=dict)
 def sync_employees_odata(payload: ODataSyncRequest, db: Session = Depends(get_db)):
+    payload = _resolve_sync_payload(payload)
     """
     Синхронизация сотрудников из 1С через OData.
     По умолчанию используем сущность "Catalog_Сотрудники".
@@ -477,6 +496,7 @@ def sync_employees_odata(payload: ODataSyncRequest, db: Session = Depends(get_db
 
 @router.post("/production-kinds-odata", response_model=dict)
 def sync_production_kinds_odata(payload: ODataSyncRequest, db: Session = Depends(get_db)):
+    payload = _resolve_sync_payload(payload)
     """
     Синхронизация видов производства из 1С через OData.
     Ожидаемая сущность: "Catalog_ВидыПроизводства" (или аналог).
