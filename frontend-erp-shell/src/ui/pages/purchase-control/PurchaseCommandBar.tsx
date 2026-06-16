@@ -1,9 +1,10 @@
-import type { PurchaseJournalSummary } from '../../../domain/purchaseControl'
+import { supplyPhaseOptions, type PurchaseJournalSummary } from '../../../domain/purchaseControl'
 
 type Props = {
   selectedCount: number
   toOrderCount: number
   summary: PurchaseJournalSummary | null
+  activePhase: string
   loading: boolean
   onOrderTo1C: () => void
   onSyncFrom1C: () => void
@@ -12,12 +13,14 @@ type Props = {
   onSelectAllToOrder: () => void
   onClearSelection: () => void
   onShowStatus: (status: string) => void
+  onShowPhase: (phase: string) => void
 }
 
 export function PurchaseCommandBar({
   selectedCount,
   toOrderCount,
   summary,
+  activePhase,
   loading,
   onOrderTo1C,
   onSyncFrom1C,
@@ -26,6 +29,7 @@ export function PurchaseCommandBar({
   onSelectAllToOrder,
   onClearSelection,
   onShowStatus,
+  onShowPhase,
 }: Props) {
   return (
     <div className="commandBar">
@@ -46,6 +50,18 @@ export function PurchaseCommandBar({
       <button onClick={onRefresh} disabled={loading}>Обновить</button>
       {summary && (
         <>
+          <div className="barSeparator" />
+          {supplyPhaseOptions.map(([value, label]) => (
+            <button
+              key={value}
+              className="filterBtn"
+              onClick={() => onShowPhase(value)}
+              style={activePhase === value ? { fontWeight: 700, textDecoration: 'underline' } : undefined}
+              title={`Показать только фазу «${label}»`}
+            >
+              {label}: {summary.by_phase?.[value] ?? 0}
+            </button>
+          ))}
           <div className="barSeparator" />
           <button className="filterBtn" onClick={() => onShowStatus('to_order')} title="Показать только строки «К заказу»">
             К заказу: {summary.to_order}

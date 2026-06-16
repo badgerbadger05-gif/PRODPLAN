@@ -1,6 +1,8 @@
 import {
   purchaseLineStatusLabel,
   purchaseLineStatusPillClass,
+  supplyPhaseLabel,
+  supplyPhasePillClass,
   type PurchaseRow,
 } from '../../../domain/purchaseControl'
 import { dateRu, qty } from '../../../lib/format'
@@ -59,22 +61,22 @@ export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseIds, sort
             <td className={`orderCell ${row.order_ref1c ? 'oneCOrderCell' : ''}`}>
               {row.line_status === 'to_order' ? (
                 <>
-                  <strong>MRP #{row.purchase_id}</strong>
-                  <span>заказ {dateRu(row.order_date) || '—'}</span>
+                  <strong title={`MRP #${row.purchase_id}`}>MRP #{row.purchase_id}</strong>
+                  <span title={`заказ ${dateRu(row.order_date) || '—'}`}>заказ {dateRu(row.order_date) || '—'}</span>
                 </>
               ) : (
                 <>
-                  <strong>{row.order_number}</strong>
-                  <span>{dateRu(row.order_date) || ''}{row.source === 'mrp' ? ' · из MRP' : ''}</span>
+                  <strong title={row.order_number}>{row.order_number}</strong>
+                  <span title={`${dateRu(row.order_date) || ''}${row.source === 'mrp' ? ' · из MRP' : ''}`}>{dateRu(row.order_date) || ''}{row.source === 'mrp' ? ' · из MRP' : ''}</span>
                 </>
               )}
             </td>
             <td className="itemCell">
-              <strong>{row.item_name}</strong>
-              <span>{row.item_article || row.item_code || ''}</span>
+              <strong title={row.item_name}>{row.item_name}</strong>
+              <span title={row.item_article || row.item_code || ''}>{row.item_article || row.item_code || ''}</span>
             </td>
             <td>
-              <strong>{row.supplier_name || 'Не указан'}</strong>
+              <strong title={row.supplier_name || 'Не указан'}>{row.supplier_name || 'Не указан'}</strong>
             </td>
             <td className="numCell">
               <strong>{qty(row.remaining_qty)}</strong>
@@ -94,7 +96,16 @@ export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseIds, sort
               )}
             </td>
             <td>
-              <span className="muted">{row.order_state_name || (row.line_status === 'to_order' ? 'Не заказан' : '—')}</span>
+              {row.order_state_name ? (
+                <span
+                  className={`pill ${supplyPhasePillClass(row.supply_phase)}`}
+                  title={`${row.order_state_name} · фаза «${supplyPhaseLabel(row.supply_phase)}»${row.counts_in_mrp ? ' · учитывается в MRP' : ' · не учитывается в MRP'}`}
+                >
+                  {row.order_state_name}
+                </span>
+              ) : (
+                <span className="muted">{row.line_status === 'to_order' ? 'Не заказан' : '—'}</span>
+              )}
             </td>
             <td>
               <span className={`pill ${purchaseLineStatusPillClass(row.line_status)}`}>

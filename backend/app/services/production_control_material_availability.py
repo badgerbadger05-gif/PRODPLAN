@@ -20,10 +20,7 @@ from ..models import (
     SupplierOrder,
     SupplierOrderItem,
 )
-from .planning_service import (
-    SUPPLIER_ORDER_EXCLUDED_STATE_NAMES,
-    _normalize_supplier_order_state_name,
-)
+from .supplier_order_status import state_counts_in_mrp as _supplier_order_counts_in_mrp
 from .production_control_common import date_to_iso as _date_to_iso, to_float as _to_float
 from .production_control_domain import (
     default_spec_id as _default_spec_id,
@@ -155,9 +152,9 @@ def _open_issue_reservations_by_item(db: Session, item_ids: Sequence[int]) -> Di
 
 def _supplier_eta_by_item(db: Session, item_ids: Sequence[int]) -> Dict[int, List[Dict[str, Any]]]:
     """
-    Per-item list of expected arrivals from active supplier orders (excluded
-    states are filtered out, see SUPPLIER_ORDER_EXCLUDED_STATE_NAMES). Sorted
-    by delivery_date ascending. Only deliveries with a positive remaining_qty
+    Per-item list of expected arrivals from active supplier orders (учитываются
+    только фазы «в пути» / «на складе», см. supplier_order_status.state_counts_in_mrp).
+    Sorted by delivery_date ascending. Only deliveries with a positive remaining_qty
     are included; rows without delivery_date are skipped.
     """
     ids = [int(x) for x in item_ids if x is not None]
@@ -185,8 +182,7 @@ def _supplier_eta_by_item(db: Session, item_ids: Sequence[int]) -> Dict[int, Lis
 
     result: Dict[int, List[Dict[str, Any]]] = {}
     for iid, deliv, remaining, order_number, state_name in rows:
-        norm_state = _normalize_supplier_order_state_name(state_name)
-        if norm_state in SUPPLIER_ORDER_EXCLUDED_STATE_NAMES:
+        if not _supplier_order_counts_in_mrp(state_name):
             continue
         deliv_dt = deliv.date() if isinstance(deliv, datetime) else deliv
         result.setdefault(int(iid), []).append(

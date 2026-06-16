@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react'
 import {
   purchaseLineStatusLabel,
   purchaseLineStatusPillClass,
+  supplyPhaseLabel,
+  supplyPhasePillClass,
   type PurchaseOrderCard,
   type PurchaseRow,
 } from '../../../domain/purchaseControl'
@@ -62,7 +64,18 @@ export function PurchaseDetailPane({ activeRow }: Props) {
             <span>Заказ</span><strong>{activeRow.order_number}</strong>
             <span>Дата заказа</span><strong>{dateRu(activeRow.order_date) || '—'}</strong>
             <span>Дата поставки</span><strong>{dateRu(activeRow.delivery_date) || '—'}</strong>
-            <span>Статус 1С</span><strong>{activeRow.order_state_name || '—'}</strong>
+            <span>Статус 1С</span>
+            <strong>
+              {activeRow.order_state_name ? (
+                <span
+                  className={`pill ${supplyPhasePillClass(activeRow.supply_phase)}`}
+                  title={activeRow.counts_in_mrp ? 'Учитывается в расчёте MRP' : 'Не учитывается в расчёте MRP'}
+                >
+                  {activeRow.order_state_name}
+                </span>
+              ) : '—'}
+            </strong>
+            <span>Фаза</span><strong>{supplyPhaseLabel(activeRow.supply_phase)}</strong>
           </>
         )}
         <span>Поставщик</span><strong>{activeRow.supplier_name || 'Не указан'}</strong>

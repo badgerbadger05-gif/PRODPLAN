@@ -59,6 +59,11 @@ from .replenishment import (
     classify_replenishment_flow,
 )
 from .warnings import make_warning, log_warning
+from .supplier_order_status import (
+    STATE_TO_PHASE,
+    NETTING_PHASES,
+    state_counts_in_mrp as _supplier_order_counts_in_mrp,
+)
 
 
 _REF1C_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
@@ -311,7 +316,13 @@ DEFAULT_PAGE_LIMIT = 50
 
 # 1C state key for completed production orders.
 DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
-SUPPLIER_ORDER_EXCLUDED_STATE_NAMES = {"новый заказ", "отменен", "завершен", "завершен успешно", "бухгалтерия"}
+# Состояния заказа поставщику, НЕ учитываемые как ожидаемое поступление в MRP.
+# Производная от канонической карты фаз (см. supplier_order_status): всё, что не
+# относится к фазам «в пути» / «на складе». Сохранена для обратной совместимости
+# импортов в production_control_material_availability / period_plan_service.
+SUPPLIER_ORDER_EXCLUDED_STATE_NAMES = {
+    name for name, phase in STATE_TO_PHASE.items() if phase not in NETTING_PHASES
+}
 
 
 def _ensure_dict(raw: Any) -> Dict[str, Any]:
@@ -2442,18 +2453,15 @@ def _get_active_production_remaining_by_item(db: Session) -> Dict[int, float]:
 _get_active_1c_remaining_by_item = _get_active_production_remaining_by_item
 
 
-def _normalize_supplier_order_state_name(value: Any) -> str:
-    return str(value or "").strip().casefold().replace("ё", "е")
-
-
 def _get_active_supplier_remaining_by_item_date(db: Session) -> Dict[int, List[Tuple[date, float]]]:
     """
     Aggregate open supplier-order quantities by item and expected delivery date.
 
-    Business rule:
+    Business rule (см. supplier_order_status):
     - deleted orders are ignored;
-    - states "Новый заказ", "Отменен" and "Завершен" are ignored;
-    - any other state is treated as already ordered;
+    - учитываются только фазы «в пути» / «на складе» (state_counts_in_mrp);
+      группа «Нет товара» (Новый заказ / В закупку / Бухгалтерия) и терминальные
+      (Отменён / Завершён) — игнорируются;
     - rows without delivery date are skipped for automatic date-sensitive coverage.
     """
     try:
@@ -2478,10 +2486,7 @@ def _get_active_supplier_remaining_by_item_date(db: Session) -> Dict[int, List[T
     result: Dict[int, List[Tuple[date, float]]] = defaultdict(list)
     for iid, delivery_dt, state_key, state_name, qty in rows:
         try:
-            normalized_state = _normalize_supplier_order_state_name(state_name)
-            if not normalized_state and not str(state_key or "").strip():
-                continue
-            if normalized_state in SUPPLIER_ORDER_EXCLUDED_STATE_NAMES:
+            if not _supplier_order_counts_in_mrp(state_name):
                 continue
             item_id = int(iid)
             delivery_date = delivery_dt.date() if isinstance(delivery_dt, datetime) else delivery_dt
@@ -2529,10 +2534,7 @@ def _load_late_supplier_order_coverage(db: Session, item_ids: List[int]) -> Dict
     result: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
     for iid, delivery_dt, qty, order_number, state_key, state_name in rows:
         try:
-            normalized_state = _normalize_supplier_order_state_name(state_name)
-            if not normalized_state and not str(state_key or "").strip():
-                continue
-            if normalized_state in SUPPLIER_ORDER_EXCLUDED_STATE_NAMES:
+            if not _supplier_order_counts_in_mrp(state_name):
                 continue
             item_id = int(iid)
             delivery_date = delivery_dt.date() if isinstance(delivery_dt, datetime) else delivery_dt

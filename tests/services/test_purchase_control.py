@@ -112,6 +112,54 @@ def test_list_journal_active_only_excludes_closed_orders(db_session):
     assert [row["order_number"] for row in closed] == ["ЗП-002"]
 
 
+def test_list_journal_phase_grouping_and_active_no_goods(db_session):
+    supplier = _make_supplier(db_session, "s-ref-1", "ООО Метиз")
+    # «Новый заказ» и «Бухгалтерия» — фаза no_goods, но активные (видимы)
+    new_order = _make_order(db_session, "ЗП-NEW", supplier, state="Новый заказ")
+    accounting = _make_order(db_session, "ЗП-ACC", supplier, state="Бухгалтерия")
+    in_transit = _make_order(db_session, "ЗП-WAY", supplier, state="В пути")
+    in_stock = _make_order(db_session, "ЗП-WH", supplier, state="Принят на склад")
+    finished = _make_order(db_session, "ЗП-DONE", supplier, state="Завершен")
+    item = _make_item(db_session, "M-1", "Болт М10")
+    for order in (new_order, accounting, in_transit, in_stock, finished):
+        _make_line(db_session, order, item, qty=5, delivery=date(2026, 6, 20))
+    db_session.commit()
+
+    result = list_journal(db_session, today=TODAY)
+    by_number = {row["order_number"]: row for row in result["rows"]}
+
+    # терминальный «Завершен» скрыт при active_only, фазовые — видны
+    assert set(by_number) == {"ЗП-NEW", "ЗП-ACC", "ЗП-WAY", "ЗП-WH"}
+    assert by_number["ЗП-NEW"]["supply_phase"] == "no_goods"
+    assert by_number["ЗП-NEW"]["counts_in_mrp"] is False
+    assert by_number["ЗП-WAY"]["supply_phase"] == "in_transit"
+    assert by_number["ЗП-WAY"]["counts_in_mrp"] is True
+    assert by_number["ЗП-WH"]["supply_phase"] == "in_stock"
+
+    assert result["summary"]["by_phase"] == {"no_goods": 2, "in_transit": 1, "in_stock": 1}
+
+    only_transit = list_journal(db_session, phase="in_transit", today=TODAY)
+    assert [r["order_number"] for r in only_transit["rows"]] == ["ЗП-WAY"]
+    # summary считается до фильтра по фазе
+    assert only_transit["summary"]["by_phase"]["no_goods"] == 2
+
+
+def test_list_journal_closed_only_on_terminal_states(db_session):
+    supplier = _make_supplier(db_session, "s-ref-1", "ООО Метиз")
+    accounting = _make_order(db_session, "ЗП-ACC", supplier, state="Бухгалтерия")
+    cancelled = _make_order(db_session, "ЗП-CANCEL", supplier, state="Отменён")
+    item = _make_item(db_session, "M-1", "Болт М10")
+    for order in (accounting, cancelled):
+        _make_line(db_session, order, item, qty=5, delivery=date(2026, 6, 20))
+    db_session.commit()
+
+    everything = list_journal(db_session, active_only=False, today=TODAY)
+    by_number = {row["order_number"]: row for row in everything["rows"]}
+    # «Бухгалтерия» активна (не закрыта), «Отменён» — closed
+    assert by_number["ЗП-ACC"]["line_status"] != "closed"
+    assert by_number["ЗП-CANCEL"]["line_status"] == "closed"
+
+
 def test_list_journal_includes_unordered_mrp_purchases(db_session):
     run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={})
     db_session.add(run)

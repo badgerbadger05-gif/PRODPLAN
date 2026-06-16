@@ -1,5 +1,6 @@
 import {
   purchaseLineStatusOptions,
+  supplyPhaseOptions,
   type PurchaseFilters,
   type PurchaseSupplierOption,
 } from '../../../domain/purchaseControl'
@@ -43,10 +44,18 @@ export function PurchaseFilterBar({ filters, suppliers, states, onChange, onSubm
               </select>
             </label>
           </td>
-          <td></td>
+          <td>
+            <label className="columnFilterControl" title="Фаза движения товара: Нет товара / Товар в пути / На складе">
+              <span>Фаза</span>
+              <select value={filters.phase} onChange={(e) => onChange({ ...filters, phase: e.target.value }, true)}>
+                <option value="">Все</option>
+                {supplyPhaseOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+              </select>
+            </label>
+          </td>
           <td></td>
           <td>
-            <label className="columnFilterControl" title="Показывать только незавершённые заказы (статусы 1С кроме «Новый заказ», «Отменен», «Завершен»)">
+            <label className="columnFilterControl" title="Показывать только незавершённые заказы (закрыты лишь терминальные статусы 1С: «Отменен», «Завершен»)">
               <span>Активные</span>
               <select value={filters.active_only ? '1' : ''} onChange={(e) => onChange({ ...filters, active_only: e.target.value === '1' }, true)}>
                 <option value="1">Только активные</option>

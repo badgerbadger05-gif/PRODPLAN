@@ -7,6 +7,9 @@ export type PurchaseLineStatus =
   | 'received'
   | 'closed'
 
+// Фаза движения товара по модели снабжения (группировка состояний 1С).
+export type SupplyPhase = 'no_goods' | 'in_transit' | 'in_stock' | 'terminal' | 'unknown'
+
 export type PurchaseRow = {
   row_key: string
   line_id: number | null
@@ -31,6 +34,8 @@ export type PurchaseRow = {
   need_date: string | null
   overdue_days: number
   line_status: PurchaseLineStatus
+  supply_phase: SupplyPhase
+  counts_in_mrp: boolean
   price: number
   amount: number
   run_id: number | null
@@ -39,6 +44,7 @@ export type PurchaseRow = {
 export type PurchaseJournalSummary = {
   total_rows: number
   by_status: Record<string, number>
+  by_phase: Record<string, number>
   to_order: number
   overdue: number
   expected_7d: number
@@ -61,6 +67,8 @@ export type PurchaseOrderCard = {
     order_date: string | null
     order_ref1c: string | null
     order_state_name: string | null
+    supply_phase: SupplyPhase
+    counts_in_mrp: boolean
     deletion_mark: boolean
     is_posted: boolean
     document_amount: number
@@ -87,6 +95,7 @@ export type PurchaseFilters = {
   supplier_id: string
   line_status: string
   state: string
+  phase: string
   active_only: boolean
   sort_by: 'delivery_date' | 'order_date'
   sort_dir: 'asc' | 'desc'
@@ -123,3 +132,35 @@ export function purchaseLineStatusPillClass(status: string): string {
 
 export const purchaseLineStatusOptions = (Object.entries(purchaseLineStatusLabels) as Array<[PurchaseLineStatus, string]>)
   .filter(([value]) => value !== 'closed')
+
+// Фазы движения товара: подписи и цветовые классы пилюль
+export const supplyPhaseLabels: Record<SupplyPhase, string> = {
+  no_goods: 'Нет товара',
+  in_transit: 'Товар в пути',
+  in_stock: 'На складе',
+  terminal: 'Закрыт',
+  unknown: 'Не определён',
+}
+
+const supplyPhasePillClasses: Record<SupplyPhase, string> = {
+  no_goods: 'in_progress',
+  in_transit: 'to_move',
+  in_stock: 'ready',
+  terminal: 'completed',
+  unknown: 'completed',
+}
+
+export function supplyPhaseLabel(phase: string): string {
+  return supplyPhaseLabels[phase as SupplyPhase] ?? phase
+}
+
+export function supplyPhasePillClass(phase: string): string {
+  return supplyPhasePillClasses[phase as SupplyPhase] ?? 'completed'
+}
+
+// Фазы для сводных счётчиков/фильтра (без terminal/unknown)
+export const supplyPhaseOptions: Array<[SupplyPhase, string]> = [
+  ['no_goods', supplyPhaseLabels.no_goods],
+  ['in_transit', supplyPhaseLabels.in_transit],
+  ['in_stock', supplyPhaseLabels.in_stock],
+]

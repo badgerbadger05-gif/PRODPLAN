@@ -50,15 +50,20 @@ def test_supplier_order_export_includes_only_orders_used_by_mrp(db_session):
             )
         )
 
-    add_order("ACTIVE", "В закупку", False, 4)
+    # Учитываются только фазы «в пути» / «на складе» (deny-by-default).
+    add_order("ATRANSIT", "В пути", False, 4)
+    add_order("BSTOCK", "Принят на склад", False, 3)
+    # «В закупку» теперь фаза «Нет товара» → не экспортируется.
+    add_order("PURCHASING", "В закупку", False, 5)
+    # Незамапленное/пустое состояние → UNKNOWN → не экспортируется.
     add_order("UNKNOWN", None, False, 3, state_key="unknown-state")
     add_order("LEGACY", None, False, 5, state_key=None)
     add_order("NEW", "Новый заказ", False, 4)
     add_order("CANCEL", "Отменен", False, 4)
     add_order("DONE", "Завершен", False, 4)
     add_order("ACCOUNTING", "Бухгалтерия", False, 4)
-    add_order("DELETED", "В закупку", True, 4)
-    add_order("ZERO", "В закупку", False, 0)
+    add_order("DELETED", "В пути", True, 4)
+    add_order("ZERO", "В пути", False, 0)
     db.commit()
 
     result = export_supplier_orders_xlsx(db)
@@ -70,11 +75,11 @@ def test_supplier_order_export_includes_only_orders_used_by_mrp(db_session):
     ws = wb.active
     assert ws.title == "ЗаказыПоставщику"
     assert ws.auto_filter.ref
-    assert ws.cell(row=2, column=1).value == "Заказ №ACTIVE от 2026-05-08 • В закупку • Supplier"
-    assert ws.cell(row=3, column=1).value == "ACTIVE"
-    assert ws.cell(row=3, column=3).value == "В закупку"
+    assert ws.cell(row=2, column=1).value == "Заказ №ATRANSIT от 2026-05-08 • В пути • Supplier"
+    assert ws.cell(row=3, column=1).value == "ATRANSIT"
+    assert ws.cell(row=3, column=3).value == "В пути"
     assert ws.cell(row=3, column=11).value == 4
-    assert ws.cell(row=5, column=1).value == "Заказ №UNKNOWN от 2026-05-08 • ID: unknown-... • Supplier"
-    assert ws.cell(row=6, column=1).value == "UNKNOWN"
-    assert ws.cell(row=6, column=3).value == "ID: unknown-..."
+    assert ws.cell(row=5, column=1).value == "Заказ №BSTOCK от 2026-05-08 • Принят на склад • Supplier"
+    assert ws.cell(row=6, column=1).value == "BSTOCK"
+    assert ws.cell(row=6, column=3).value == "Принят на склад"
     assert ws.cell(row=6, column=11).value == 3

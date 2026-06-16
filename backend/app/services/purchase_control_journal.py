@@ -25,22 +25,29 @@ from ..models import (
     SyncLink,
 )
 from .one_c_purchase_order_export import PURCHASE_ORDER_ENTITY
-from .planning_service import SUPPLIER_ORDER_EXCLUDED_STATE_NAMES
+from .supplier_order_status import (
+    normalize_state as _normalize_state,
+    phase_value as _supply_phase_value,
+    state_counts_in_mrp as _supplier_order_counts_in_mrp,
+    state_is_terminal as _supplier_order_state_is_terminal,
+)
 
 _EPS = 1e-9
 
 # line_status values, in display priority order
 LINE_STATUSES = ("to_order", "overdue", "no_date", "expected", "partial", "received", "closed")
 
-
-def _normalize_state(name: Optional[str]) -> str:
-    return (name or "").strip().lower().replace("ё", "е")
+# Фазы движения товара, по которым строится сводка журнала (см. supplier_order_status).
+SUPPLY_PHASES = ("no_goods", "in_transit", "in_stock")
 
 
 def _order_is_active(order: SupplierOrder) -> bool:
+    # Закрытым считаем заказ только при удалении или терминальном состоянии 1С
+    # (Отменён / Завершён). Стадии «Новый заказ» / «Бухгалтерия» / «В закупку» —
+    # активные этапы пайплайна и остаются видимыми в журнале.
     if bool(order.deletion_mark):
         return False
-    return _normalize_state(order.order_state_name) not in SUPPLIER_ORDER_EXCLUDED_STATE_NAMES
+    return not _supplier_order_state_is_terminal(order.order_state_name)
 
 
 def _to_float(value: Any) -> float:
@@ -202,6 +209,8 @@ def _supplier_order_rows(
                 "order_date": _date_to_iso(order.order_date),
                 "order_ref1c": order.order_ref1c,
                 "order_state_name": order.order_state_name,
+                "supply_phase": _supply_phase_value(order.order_state_name),
+                "counts_in_mrp": _supplier_order_counts_in_mrp(order.order_state_name),
                 "source": "mrp" if (order.order_ref1c or "").lower() in mrp_refs else "1c",
                 "supplier_id": int(order.supplier_id) if order.supplier_id is not None else None,
                 "supplier_name": str(supplier.supplier_name or "") if supplier else "",
@@ -278,6 +287,8 @@ def _to_order_rows(
                 "order_date": _date_to_iso(purchase.order_date),
                 "order_ref1c": None,
                 "order_state_name": None,
+                "supply_phase": "no_goods",
+                "counts_in_mrp": False,
                 "source": "mrp",
                 "supplier_id": row_supplier_id,
                 "supplier_name": supplier_name,
@@ -310,11 +321,15 @@ def _summary(rows: List[Dict[str, Any]], today: date) -> Dict[str, Any]:
     week_ahead = (today + timedelta(days=7)).isoformat()
     today_iso = today.isoformat()
     by_status: Dict[str, int] = {}
+    by_phase: Dict[str, int] = {phase: 0 for phase in SUPPLY_PHASES}
     in_transit_amount = 0.0
     expected_7d = 0
     for row in rows:
         status = str(row.get("line_status"))
         by_status[status] = by_status.get(status, 0) + 1
+        phase = str(row.get("supply_phase") or "")
+        if phase in by_phase:
+            by_phase[phase] += 1
         if status in ("expected", "partial", "overdue", "no_date"):
             in_transit_amount += _to_float(row.get("remaining_qty")) * _to_float(row.get("price"))
         delivery = row.get("delivery_date")
@@ -323,6 +338,7 @@ def _summary(rows: List[Dict[str, Any]], today: date) -> Dict[str, Any]:
     return {
         "total_rows": len(rows),
         "by_status": by_status,
+        "by_phase": by_phase,
         "to_order": by_status.get("to_order", 0),
         "overdue": by_status.get("overdue", 0),
         "expected_7d": expected_7d,
@@ -336,6 +352,7 @@ def list_journal(
     order_id: Optional[int] = None,
     supplier_id: Optional[int] = None,
     state: Optional[str] = None,
+    phase: Optional[str] = None,
     line_status: Optional[str] = None,
     search: Optional[str] = None,
     date_from: Optional[str] = None,
@@ -385,6 +402,9 @@ def list_journal(
 
     summary = _summary(rows, today)
 
+    if phase:
+        phase_norm = str(phase).strip()
+        rows = [r for r in rows if str(r.get("supply_phase") or "") == phase_norm]
     if line_status:
         rows = [r for r in rows if r.get("line_status") == str(line_status)]
 
@@ -436,6 +456,8 @@ def get_order_card(db: Session, order_id: int, *, today: Optional[date] = None) 
             "order_date": _date_to_iso(order.order_date),
             "order_ref1c": order.order_ref1c,
             "order_state_name": order.order_state_name,
+            "supply_phase": _supply_phase_value(order.order_state_name),
+            "counts_in_mrp": _supplier_order_counts_in_mrp(order.order_state_name),
             "deletion_mark": bool(order.deletion_mark),
             "is_posted": bool(order.is_posted),
             "document_amount": _to_float(order.document_amount),

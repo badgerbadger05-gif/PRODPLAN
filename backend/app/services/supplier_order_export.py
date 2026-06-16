@@ -14,16 +14,15 @@ from typing import Any, Dict
 from sqlalchemy.orm import Session
 
 from ..models import Supplier, SupplierOrder, SupplierOrderItem, Item
-from .planning_service import SUPPLIER_ORDER_EXCLUDED_STATE_NAMES, _normalize_supplier_order_state_name
+from .supplier_order_status import state_counts_in_mrp as _supplier_order_counts_in_mrp
 
 
 def _is_included_supplier_order(order: SupplierOrder) -> bool:
+    # Экспортируем только заказы, учитываемые MRP как ожидаемое поступление
+    # (фазы «в пути» / «на складе»), см. supplier_order_status.
     if bool(getattr(order, "deletion_mark", False)):
         return False
-    state_name = _normalize_supplier_order_state_name(getattr(order, "order_state_name", None))
-    if not state_name and not str(getattr(order, "order_state_key", "") or "").strip():
-        return False
-    return state_name not in SUPPLIER_ORDER_EXCLUDED_STATE_NAMES
+    return _supplier_order_counts_in_mrp(getattr(order, "order_state_name", None))
 
 
 def export_supplier_orders_xlsx(db: Session) -> Dict[str, Any]:

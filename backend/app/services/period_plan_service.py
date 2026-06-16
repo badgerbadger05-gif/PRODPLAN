@@ -34,9 +34,11 @@ from ..models import (
 )
 from .planning_service import (
     DEFAULT_PLANNING_CONFIG,
-    SUPPLIER_ORDER_EXCLUDED_STATE_NAMES,
     get_active_planning_config,
-    _normalize_supplier_order_state_name,
+)
+from .supplier_order_status import (
+    normalize_state as _normalize_supplier_order_state_name,
+    state_counts_in_mrp as _supplier_order_counts_in_mrp,
 )
 from .capacity_scheduler import CapacityScheduler
 from .mrp_stock_helpers import (
@@ -655,7 +657,8 @@ def _load_purchase_supplier_remaining(
 
     Filtering rules mirror planning_service._get_active_supplier_remaining_by_item_date:
     - Deleted supplier orders are skipped (deletion_mark=True).
-    - Orders whose normalised state name is in SUPPLIER_ORDER_EXCLUDED_STATE_NAMES are skipped.
+    - Учитываются только фазы «в пути» / «на складе» (state_counts_in_mrp);
+      «Нет товара» (Новый заказ / В закупку / Бухгалтерия) и терминальные — пропускаются.
     - Lines without a delivery_date are skipped.
     - Lines with remaining_qty <= 0 are skipped.
     """
@@ -686,10 +689,7 @@ def _load_purchase_supplier_remaining(
     result: Dict[int, List[Dict[str, Any]]] = {}
     for iid, delivery_dt, state_key, state_name, qty in rows:
         try:
-            state_norm = str(state_name or "").strip().casefold().replace("ё", "е")
-            if not state_norm and not str(state_key or "").strip():
-                continue
-            if state_norm in SUPPLIER_ORDER_EXCLUDED_STATE_NAMES:
+            if not _supplier_order_counts_in_mrp(state_name):
                 continue
             item_id = int(iid)
             delivery_date = (

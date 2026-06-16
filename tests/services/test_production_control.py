@@ -2425,7 +2425,7 @@ def test_preview_materials_marks_shortage_and_includes_supplier_eta(db_session):
         order_date=datetime(2026, 5, 10, 10),
         order_ref1c="sup-ref-cover-001",
         order_state_key="state-in-work",
-        order_state_name="В закупку",
+        order_state_name="В пути",
         deletion_mark=False,
     )
     db_session.add(sup_order)

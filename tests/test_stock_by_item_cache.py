@@ -533,7 +533,7 @@ def test_purchase_results_marks_late_supplier_order_coverage(db_session):
         order_date=datetime.datetime(2025, 1, 1, 10, 0),
         order_ref1c="late-order-ref",
         order_state_key="state-in-work",
-        order_state_name="В закупку",
+        order_state_name="В пути",
         deletion_mark=False,
     )
     db.add(order)
@@ -824,16 +824,21 @@ def test_active_supplier_remaining_filters_new_cancelled_deleted_and_missing_dat
             )
         )
 
-    add_order("ACTIVE", "В закупку", False, 4.0, datetime.datetime(2026, 1, 10))
-    add_order("UNKNOWN", None, False, 3.0, datetime.datetime(2026, 1, 11))
-    add_order("LEGACY", None, False, 12.0, datetime.datetime(2026, 1, 12), state_key_marker=None)
+    # Учитываются только фазы «в пути» / «на складе» (deny-by-default).
+    add_order("IN-TRANSIT", "В пути", False, 4.0, datetime.datetime(2026, 1, 10))
+    add_order("IN-STOCK", "Принят на склад", False, 3.0, datetime.datetime(2026, 1, 11))
+    # «В закупку» теперь относится к фазе «Нет товара» и НЕ нетует.
+    add_order("PURCHASING", "В закупку", False, 5.0, datetime.datetime(2026, 1, 12))
+    # Незамапленное/пустое состояние → UNKNOWN → не нетует.
+    add_order("UNKNOWN", None, False, 3.0, datetime.datetime(2026, 1, 13))
+    add_order("LEGACY", None, False, 12.0, datetime.datetime(2026, 1, 14), state_key_marker=None)
     add_order("NEW", "Новый заказ", False, 5.0, datetime.datetime(2026, 1, 10))
     add_order("CANCEL", "Отменён", False, 6.0, datetime.datetime(2026, 1, 10))
     add_order("DONE", "Завершён", False, 9.0, datetime.datetime(2026, 1, 10))
     add_order("DONE-OK", "Завершен успешно", False, 10.0, datetime.datetime(2026, 1, 10))
     add_order("ACCOUNTING", "Бухгалтерия", False, 11.0, datetime.datetime(2026, 1, 10))
-    add_order("DELETED", "В закупку", True, 7.0, datetime.datetime(2026, 1, 10))
-    add_order("NODATE", "В закупку", False, 8.0, None)
+    add_order("DELETED", "В пути", True, 7.0, datetime.datetime(2026, 1, 10))
+    add_order("NODATE", "В пути", False, 8.0, None)
     db.commit()
 
     rem = _get_active_supplier_remaining_by_item_date(db)

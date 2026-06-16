@@ -86,7 +86,7 @@ def _make_supplier_order(
     item: Item,
     remaining_qty: float,
     delivery_date: date,
-    state_name: str = "подтверждён",
+    state_name: str = "В пути",
     state_key: str = "some-key-001",
 ) -> SupplierOrder:
     so = SupplierOrder(
@@ -653,7 +653,7 @@ class TestPurchaseAllocationSupplierPartiallyCoversDemand:
 class TestPurchaseAllocationExcludedStates:
     """Orders in excluded states must not be used as supply."""
 
-    @pytest.mark.parametrize("state_name", ["новый заказ", "отменен", "завершен", "бухгалтерия"])
+    @pytest.mark.parametrize("state_name", ["новый заказ", "в закупку", "отменен", "завершен", "бухгалтерия"])
     def test_excluded_state_order_not_consumed(self, db_session, state_name):
         bucket = date(2026, 6, 2)
         item = _make_purchased_item(db_session, f"BUY-EXC-{state_name[:4]}")

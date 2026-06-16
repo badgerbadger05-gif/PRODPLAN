@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import {
   purchaseLineStatusLabel,
+  supplyPhaseLabel,
   type PurchaseFilters,
   type PurchaseJournalSummary,
   type PurchaseRow,
@@ -35,6 +36,7 @@ const csvColumns: Array<[string, (row: PurchaseRow) => string | number]> = [
   ['Дата поставки', (row) => row.delivery_date ?? row.need_date ?? ''],
   ['Просрочка, дн', (row) => row.overdue_days || ''],
   ['Статус 1С', (row) => row.order_state_name ?? ''],
+  ['Фаза', (row) => supplyPhaseLabel(row.supply_phase)],
   ['Статус', (row) => purchaseLineStatusLabel(row.line_status)],
   ['Сумма', (row) => row.amount || ''],
 ]
@@ -60,6 +62,7 @@ export function PurchaseControlPage() {
     supplier_id: '',
     line_status: '',
     state: '',
+    phase: '',
     active_only: true,
     sort_by: 'delivery_date',
     sort_dir: 'asc',
@@ -87,6 +90,7 @@ export function PurchaseControlPage() {
       if (current.supplier_id) params.set('supplier_id', current.supplier_id)
       if (current.line_status) params.set('line_status', current.line_status)
       if (current.state) params.set('state', current.state)
+      if (current.phase) params.set('phase', current.phase)
       params.set('active_only', current.active_only ? 'true' : 'false')
       params.set('sort_by', current.sort_by)
       params.set('sort_dir', current.sort_dir)
@@ -154,6 +158,11 @@ export function PurchaseControlPage() {
   function showStatus(status: string) {
     const current = filtersRef.current
     changeFilters({ ...current, line_status: current.line_status === status ? '' : status }, true)
+  }
+
+  function showPhase(phase: string) {
+    const current = filtersRef.current
+    changeFilters({ ...current, phase: current.phase === phase ? '' : phase }, true)
   }
 
   async function orderTo1C() {
@@ -242,6 +251,7 @@ export function PurchaseControlPage() {
           selectedCount={selectedPurchaseIds.size}
           toOrderCount={toOrderRows.length}
           summary={summary}
+          activePhase={filters.phase}
           loading={loading}
           onOrderTo1C={() => void orderTo1C()}
           onSyncFrom1C={() => void syncFrom1C()}
@@ -250,6 +260,7 @@ export function PurchaseControlPage() {
           onSelectAllToOrder={() => setSelectedPurchaseIds(new Set(toOrderRows.map((row) => row.purchase_id as number)))}
           onClearSelection={() => setSelectedPurchaseIds(new Set())}
           onShowStatus={showStatus}
+          onShowPhase={showPhase}
         />
 
         {error && <div className="errorLine">{error}</div>}
