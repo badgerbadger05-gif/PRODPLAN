@@ -350,6 +350,14 @@ export function SpecificationPage() {
 
                 {tab === 'where-used' && (
                   <table className="journalTable bomWhereTable">
+                    <colgroup>
+                      <col className="bomWhereParentCol" />
+                      <col className="bomWhereSpecCol" />
+                      <col className="bomWhereSmallCol" />
+                      <col className="bomWhereSmallCol" />
+                      <col className="bomWhereQtyCol" />
+                      <col className="bomWhereStageCol" />
+                    </colgroup>
                     <thead>
                       <tr>
                         <th>Родитель</th>
@@ -363,12 +371,17 @@ export function SpecificationPage() {
                     <tbody>
                       {loaded.whereUsed.map((row, index) => (
                         <tr key={`${row.parent.item_id}-${index}`}>
-                          <td className="itemCell"><strong>{row.parent.item_name}</strong><span>{row.parent.item_article || row.parent.item_code}</span></td>
-                          <td>{row.spec.spec_name || row.spec.spec_code || `#${row.spec.spec_id}`}</td>
+                          <td className="itemCell bomWhereParentCell">
+                            <strong title={row.parent.item_name}>{row.parent.item_name}</strong>
+                            <span title={row.parent.item_article || row.parent.item_code}>{row.parent.item_article || row.parent.item_code}</span>
+                          </td>
+                          <td className="bomWhereSpecCell" title={row.spec.spec_name || row.spec.spec_code || `#${row.spec.spec_id}`}>
+                            {row.spec.spec_name || row.spec.spec_code || `#${row.spec.spec_id}`}
+                          </td>
                           <td className="numCell"><strong>{row.level_up}</strong></td>
                           <td className="numCell"><strong>{qty(row.qty_per_parent)}</strong></td>
                           <td className="numCell"><strong>{qty(row.total_qty_to_target)}</strong></td>
-                          <td>{row.stage?.name || ''}</td>
+                          <td className="bomWhereStageCell" title={row.stage?.name || ''}>{row.stage?.name || ''}</td>
                         </tr>
                       ))}
                       {!loaded.whereUsed.length && <tr><td colSpan={6} className="emptyDetail">В родительских спецификациях не найдено</td></tr>}

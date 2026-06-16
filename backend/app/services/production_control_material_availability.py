@@ -368,6 +368,62 @@ def _store_material_coverage_status(
         state.status = new_status
 
 
+def _reservation_orders_by_item(
+    db: Session,
+    reservation_state: Any,
+    *,
+    exclude_product_id: int,
+) -> Dict[int, List[Dict[str, Any]]]:
+    product_ids: List[int] = []
+    for product_id, reservation in reservation_state.by_product.items():
+        if int(product_id) == int(exclude_product_id):
+            continue
+        has_reservation = any(qty > 1e-9 for qty in reservation.in_transit.values()) or any(
+            qty > 1e-9 for qty in reservation.at_workshop.values()
+        )
+        if has_reservation:
+            product_ids.append(int(product_id))
+    product_ids.sort()
+    if not product_ids:
+        return {}
+
+    products = (
+        db.query(ProductionProduct)
+        .options(joinedload(ProductionProduct.order), joinedload(ProductionProduct.item))
+        .filter(ProductionProduct.product_id.in_(product_ids))
+        .all()
+    )
+    product_by_id = {int(product.product_id): product for product in products}
+    result: Dict[int, List[Dict[str, Any]]] = {}
+    for product_id in product_ids:
+        product = product_by_id.get(product_id)
+        reservation = reservation_state.by_product.get(product_id)
+        if product is None or reservation is None:
+            continue
+        order = product.order
+        display_number = str(getattr(order, "order_number", "") or "")
+        for cid in sorted(set(reservation.in_transit) | set(reservation.at_workshop)):
+            qty_total = reservation.total(cid)
+            if qty_total <= 1e-9:
+                continue
+            result.setdefault(int(cid), []).append(
+                {
+                    "product_id": int(product.product_id),
+                    "order_id": int(product.order_id),
+                    "order_number": display_number,
+                    "order_ref1c": str(getattr(order, "order_ref1c", "") or "") or None,
+                    "item_name": str(getattr(product.item, "item_name", "") or ""),
+                    "reserved_qty": qty_total,
+                    "reserved_at_workshop_qty": reservation.at_workshop.get(cid, 0.0),
+                    "reserved_in_transit_qty": reservation.in_transit.get(cid, 0.0),
+                }
+            )
+
+    for rows in result.values():
+        rows.sort(key=lambda row: (-_to_float(row.get("reserved_qty")), str(row.get("order_number") or "")))
+    return result
+
+
 def preview_materials(db: Session, product_id: int, *, refresh_state: bool = False) -> Dict[str, Any]:
     """
     Return the BOM components required for a production line plus per-component
@@ -389,7 +445,11 @@ def preview_materials(db: Session, product_id: int, *, refresh_state: bool = Fal
     """
     product = (
         db.query(ProductionProduct)
-        .options(joinedload(ProductionProduct.order), joinedload(ProductionProduct.item))
+        .options(
+            joinedload(ProductionProduct.order),
+            joinedload(ProductionProduct.item),
+            joinedload(ProductionProduct.control_state),
+        )
         .filter(ProductionProduct.product_id == int(product_id))
         .first()
     )
@@ -412,10 +472,23 @@ def preview_materials(db: Session, product_id: int, *, refresh_state: bool = Fal
         exclude_product_id=int(product.product_id)
     )
     own_reservation = reservation_state.for_product(int(product.product_id))
+    reserved_orders_by_item = _reservation_orders_by_item(
+        db,
+        reservation_state,
+        exclude_product_id=int(product.product_id),
+    )
     run_id = _latest_run_id(db)
     supplier_eta = _supplier_eta_by_item(db, comp_ids)
     production_eta = _production_eta_by_item(db, comp_ids)
     planned_eta = _planned_eta_by_item(db, comp_ids, run_id)
+    state = product.control_state
+    require_reserved_at_workshop = bool(
+        state
+        and (
+            str(state.issue_status or "") == "posted"
+            or str(state.status or "") in {"assembled", "in_progress", "done", "produced_partial", "produced"}
+        )
+    )
 
     for comp in components:
         iid = int(comp["component_item_id"])
@@ -424,15 +497,18 @@ def preview_materials(db: Session, product_id: int, *, refresh_state: bool = Fal
         reserved = reservations.get(iid, 0.0)
         own_reserved = own_reservation.total(iid)
         available = max(0.0, raw_stock - reserved - own_reserved)
-        covering = available + own_reserved
+        own_at_workshop = own_reservation.at_workshop.get(iid, 0.0)
+        own_in_transit = own_reservation.in_transit.get(iid, 0.0)
+        covering = own_at_workshop if require_reserved_at_workshop else available + own_reserved
         missing = max(0.0, required - covering)
         label = _component_coverage_label(required, covering)
         comp["available_qty"] = available
         comp["stock_qty"] = raw_stock
         comp["reserved_qty"] = reserved
         comp["reserved_for_order_qty"] = own_reserved
-        comp["reserved_at_workshop_qty"] = own_reservation.at_workshop.get(iid, 0.0)
-        comp["reserved_in_transit_qty"] = own_reservation.in_transit.get(iid, 0.0)
+        comp["reserved_at_workshop_qty"] = own_at_workshop
+        comp["reserved_in_transit_qty"] = own_in_transit
+        comp["reserved_orders"] = reserved_orders_by_item.get(iid, [])
         comp["missing_qty"] = missing
         comp["coverage"] = label
         comp["availability_status"] = _ui_coverage_status(label)

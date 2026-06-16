@@ -2379,6 +2379,58 @@ def test_preview_materials_marks_ready_when_stock_covers_all(db_session):
     assert state.material_coverage_snapshot["components"][0]["coverage_status"] == "ready"
 
 
+def test_posted_issue_coverage_uses_workshop_reservation_not_free_stock(db_session):
+    parent, _spec, comps = _make_basic_spec(
+        db_session,
+        parent_name="PostedPartialParent",
+        child_specs=[("PPC1", "Posted partial comp", 100, 2)],
+    )
+    comp = comps[0]
+    _order, product = _make_internal_order_for(db_session, parent, qty=2)
+    state = ProductionOrderLineState(
+        product_id=product.product_id,
+        status="assembled",
+        issue_status="posted",
+    )
+    db_session.add(state)
+    issue = ProductionMaterialIssue(
+        document_number="MT-PARTIAL-POSTED",
+        product_id=product.product_id,
+        order_id=product.order_id,
+        status="posted",
+        direction="issue",
+        warehouse_ref1c="WORKSHOP",
+        source_warehouse_ref1c="SOURCE",
+    )
+    db_session.add(issue)
+    db_session.flush()
+    db_session.add(
+        ProductionMaterialIssueLine(
+            issue_id=issue.issue_id,
+            component_item_id=comp.item_id,
+            required_qty=2,
+            issued_qty=2,
+            unit="шт",
+            line_status="issued",
+        )
+    )
+    db_session.commit()
+
+    preview = preview_materials(db_session, product.product_id, refresh_state=True)
+    only = preview["components"][0]
+
+    assert only["required_qty"] == 4
+    assert only["available_qty"] > 0
+    assert only["reserved_at_workshop_qty"] == 2
+    assert only["missing_qty"] == 2
+    assert only["coverage"] == "partial"
+    assert preview["coverage_status"] == "partial"
+
+    row = list_journal(db_session, product_id=product.product_id)["rows"][0]
+    assert row["coverage_status"] == "partial"
+    assert row["coverage_label"] == "Частично"
+
+
 def test_journal_uses_cached_material_coverage_for_coverage_band_rows(db_session):
     parent, _spec, _comps = _make_basic_spec(
         db_session,

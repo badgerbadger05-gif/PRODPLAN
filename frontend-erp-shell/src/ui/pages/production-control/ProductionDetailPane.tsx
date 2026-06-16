@@ -116,6 +116,13 @@ export function ProductionDetailPane({
   }
 
   function expectedLine(m: NonNullable<MaterialsResponse['components']>[number]) {
+    const reservedOrders = m.reserved_orders ?? []
+    if ((m.missing_qty ?? 0) > 0 && reservedOrders.length) {
+      return `В резерве: ${reservedOrders.slice(0, 2).map((r) => {
+        const ref = r.order_number || `#${r.product_id}`
+        return `${ref} — ${qty(r.reserved_qty)} ${m.unit || ''}`
+      }).join('; ')}`
+    }
     const dates = m.expected_dates?.length ? m.expected_dates : (m.eta_dates ?? []).map((eta) => ({
       source: eta.source,
       order_number: eta.ref,
@@ -136,6 +143,26 @@ export function ProductionDetailPane({
 
   function activeOrderNumber() {
     return activeRow?.order_prodplan_number || activeRow?.order_number || ''
+  }
+
+  function reservationLine(m: NonNullable<MaterialsResponse['components']>[number]) {
+    const parts: string[] = []
+    const own = m.reserved_for_order_qty ?? 0
+    const atWorkshop = m.reserved_at_workshop_qty ?? 0
+    const inTransit = m.reserved_in_transit_qty ?? 0
+    const other = m.reserved_qty ?? 0
+    if (own > 0) {
+      const place = atWorkshop > 0 && inTransit > 0
+        ? `участок ${qty(atWorkshop)}, в пути ${qty(inTransit)}`
+        : atWorkshop > 0
+          ? `на участке ${qty(atWorkshop)}`
+          : inTransit > 0
+            ? `в пути ${qty(inTransit)}`
+            : qty(own)
+      parts.push(`под эту строку: ${place}`)
+    }
+    if (other > 0) parts.push(`чужой резерв: ${qty(other)}`)
+    return parts.join('; ')
   }
 
   return (
@@ -234,6 +261,17 @@ export function ProductionDetailPane({
                   <strong>{m.item_name}</strong>
                   <span>{m.item_article || m.item_code}</span>
                   <em className="materialEta">{expectedLine(m)}</em>
+                  {reservationLine(m) && <em className="materialReserve">{reservationLine(m)}</em>}
+                  {!!m.reserved_orders?.length && (
+                    <em className="materialReserve">
+                      {m.reserved_orders.slice(0, 3).map((r) => (
+                        <span key={`${m.component_item_id}-${r.product_id}`}>
+                          в резерве {r.order_number || `#${r.product_id}`}: {qty(r.reserved_qty)} {m.unit || ''}
+                        </span>
+                      ))}
+                      {m.reserved_orders.length > 3 && <span>ещё {m.reserved_orders.length - 3}</span>}
+                    </em>
+                  )}
                 </div>
                 <div className="matNums">
                   <span>нужно {qty(m.required_qty)}</span>

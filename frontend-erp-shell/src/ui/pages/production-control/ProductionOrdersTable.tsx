@@ -75,15 +75,15 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
               />
             </td>
             <td className={`orderCell ${row.order_ref1c ? 'oneCOrderCell' : ''}`}>
-              <strong>{orderMainLine(row)}</strong>
-              <span>{orderSubline(row)}</span>
+              <strong title={orderMainLine(row)}>{orderMainLine(row)}</strong>
+              <span title={orderSubline(row)}>{orderSubline(row)}</span>
             </td>
             <td
               className={`itemCell ${row.route_sheet_printed_at ? 'printedRouteSheetCell' : ''}`}
               title={row.route_sheet_printed_at ? `Маршрутный лист печатался ${dateRu(row.route_sheet_printed_at)}` : undefined}
             >
-              <strong>{row.item_name}</strong>
-              <span>{row.item_article || row.item_code || ''}</span>
+              <strong title={row.item_name}>{row.item_name}</strong>
+              <span title={row.item_article || row.item_code || ''}>{row.item_article || row.item_code || ''}</span>
             </td>
             <td className="numCell">
               <strong>{qty(row.remaining_qty)}</strong>

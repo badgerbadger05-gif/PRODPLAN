@@ -39,6 +39,7 @@ from ..services.production_control_production_flow import (
     return_leftover_components,
     rollback_local_manufacture,
 )
+from ..services.production_reservation_repair import repair_in_place_reservations
 from .production_control_settings import router as settings_router
 
 
@@ -177,6 +178,13 @@ class ExportMaterialIssuesPayload(BaseModel):
 
 class AssembleMaterialIssuePayload(BaseModel):
     allow_production: bool = False
+
+
+class InPlaceReservationRepairPayload(BaseModel):
+    product_ids: List[int]
+    initiated_by: Optional[str] = None
+    warehouse_ref1c: Optional[str] = None
+    dry_run: bool = True
 
 
 class PrintRouteSheetsPayload(BaseModel):
@@ -621,6 +629,27 @@ def post_material_issue_assembled(
         )
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/reservation-repair/in-place", response_model=dict)
+def post_repair_in_place_reservations(
+    payload: InPlaceReservationRepairPayload,
+    db: Session = Depends(get_db),
+):
+    if not payload.product_ids:
+        raise HTTPException(status_code=400, detail="Не выбраны строки заказа")
+    try:
+        return repair_in_place_reservations(
+            db,
+            [int(x) for x in payload.product_ids],
+            initiated_by=payload.initiated_by,
+            warehouse_ref1c=payload.warehouse_ref1c,
+            dry_run=bool(payload.dry_run),
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

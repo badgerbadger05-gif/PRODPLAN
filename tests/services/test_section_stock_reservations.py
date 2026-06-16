@@ -34,6 +34,7 @@ from app.services.production_control_reservations import (
     load_reservation_state,
     open_reservations_by_item,
 )
+from app.services.production_reservation_repair import repair_in_place_reservations
 
 WORKSHOP_WH = "wh-weld"
 SOURCE_WH = "wh-metal"
@@ -209,14 +210,33 @@ def test_transit_reserves_at_source_posted_reserves_at_workshop(db_session):
     assert state.reserved_at_warehouse(SOURCE_WH, comp.item_id) == pytest.approx(8.0)
     assert state.reserved_at_warehouse(WORKSHOP_WH, comp.item_id) == pytest.approx(0.0)
 
-    issue.status = "posted"
-    for line in issue.lines:
-        line.issued_qty = line.required_qty
-    db.commit()
+
+def test_repair_in_place_reservation_covers_legacy_shortfall(db_session):
+    db = db_session
+    _add_warehouses(db)
+    parent, comp, product = _setup(db, qty_per_unit=1.0, order_qty=8.0)
+    _post_full_transfer(db, product, comp, qty=4.0)
+
+    with pytest.raises(ValueError, match="Недостаточно компонентов"):
+        produce_line(db, product.product_id, qty=8.0)
+
+    result = repair_in_place_reservations(
+        db,
+        [product.product_id],
+        warehouse_ref1c=WORKSHOP_WH,
+        initiated_by="test repair",
+        dry_run=False,
+    )
+
+    assert result["errors"] == []
+    assert result["repaired"][0]["direction"] == "in_place"
+    assert result["repaired"][0]["lines"][0]["claim_qty"] == pytest.approx(4.0)
 
     state = load_reservation_state(db, item_ids=[comp.item_id])
-    assert state.reserved_at_warehouse(SOURCE_WH, comp.item_id) == pytest.approx(0.0)
-    assert state.reserved_at_warehouse(WORKSHOP_WH, comp.item_id) == pytest.approx(8.0)
+    assert state.for_product(product.product_id).at_workshop[comp.item_id] == pytest.approx(8.0)
+
+    produced = produce_line(db, product.product_id, qty=8.0)
+    assert produced["status"] == "ok"
 
 
 def test_posted_without_issued_qty_still_reserves(db_session):
@@ -256,6 +276,18 @@ def test_second_order_cannot_be_covered_by_first_orders_kit(db_session):
     assert comp_row["available_qty"] == pytest.approx(0.0)
     assert comp_row["missing_qty"] == pytest.approx(8.0)
     assert preview_b["coverage_status"] == "shortage"
+    assert comp_row["reserved_orders"] == [
+        {
+            "product_id": product_a.product_id,
+            "order_id": product_a.order_id,
+            "order_number": "O-A",
+            "order_ref1c": "ord-A",
+            "item_name": "Parent A",
+            "reserved_qty": pytest.approx(8.0),
+            "reserved_at_workshop_qty": pytest.approx(8.0),
+            "reserved_in_transit_qty": pytest.approx(0.0),
+        }
+    ]
 
     # Order A itself stays covered by its own reservation.
     preview_a = preview_materials(db, product_a.product_id)

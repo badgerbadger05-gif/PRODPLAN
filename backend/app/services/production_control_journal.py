@@ -99,6 +99,8 @@ def _journal_coverage_status(
     issue_status: str,
     material_coverage_status: Optional[str] = None,
 ) -> str:
+    if issue_status == "posted" and material_coverage_status in {"shortage", "partial"}:
+        return material_coverage_status
     if issue_status == "posted":
         return "assembled"
     if issue_status in {"requested", "issued", "exported"}:

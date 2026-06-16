@@ -172,6 +172,9 @@ def _apply_posted(
     if issue.status != "posted":
         issue.status = "posted"
         changed = True
+    if issue.export_error:
+        issue.export_error = None
+        changed = True
 
     if _sync_issue_lines_from_posted_doc(db, issue, doc):
         changed = True

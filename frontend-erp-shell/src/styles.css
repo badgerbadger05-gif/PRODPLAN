@@ -417,7 +417,11 @@ input:focus, select:focus {
 }
 
 .orderCell { width: 136px; }
+.productionOrderNumberCell { width: 182px; }
+.purchaseOrderNumberCell { width: 168px; }
 .itemCell { width: 360px; }
+.purchaseItemCell { width: auto; }
+.supplierCell { width: 180px; }
 .numCell { width: 112px; text-align: right; }
 .dateCell { width: 116px; }
 
@@ -551,6 +555,44 @@ input:focus, select:focus {
 .transferTable .transferOrderCell strong,
 .transferTable .transferOrderCell span {
   overflow-wrap: anywhere;
+}
+
+.productionOrderNumberCell strong,
+.purchaseOrderNumberCell strong {
+  font-size: 11px;
+  letter-spacing: 0;
+}
+
+.bomWhereTable {
+  min-width: 1080px;
+}
+
+.bomWhereParentCol { width: 260px; }
+.bomWhereSpecCol { width: 420px; }
+.bomWhereSmallCol { width: 92px; }
+.bomWhereQtyCol { width: 104px; }
+.bomWhereStageCol { width: 160px; }
+
+.bomWhereTable td {
+  height: auto;
+  min-height: 38px;
+  vertical-align: top;
+}
+
+.bomWhereParentCell strong,
+.bomWhereParentCell span,
+.bomWhereSpecCell,
+.bomWhereStageCell {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+  word-break: normal;
+}
+
+.bomWhereSpecCell,
+.bomWhereStageCell {
+  line-height: 1.25;
 }
 
 .pill, .miniPill {
@@ -1351,16 +1393,24 @@ input:focus, select:focus {
   display: block;
 }
 
-.materialRow span, .matNums, .materialEta {
+.materialRow span, .matNums, .materialEta, .materialReserve {
   color: var(--muted);
   font-size: 11px;
 }
 
-.materialEta {
+.materialEta, .materialReserve {
   display: block;
   margin-top: 4px;
   font-style: normal;
   line-height: 1.25;
+}
+
+.materialReserve {
+  color: #6b5a16;
+}
+
+.materialReserve span {
+  color: inherit;
 }
 
 .matMissing {
@@ -1681,9 +1731,6 @@ input:focus, select:focus {
   min-width: 1120px;
 }
 
-.bomWhereTable {
-  min-width: 1080px;
-}
 
 .bomQualityTable {
   min-width: 960px;

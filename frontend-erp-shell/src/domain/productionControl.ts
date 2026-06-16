@@ -60,6 +60,20 @@ export type MaterialRow = {
   required_qty: number
   missing_qty?: number
   unit?: string | null
+  reserved_qty?: number
+  reserved_for_order_qty?: number
+  reserved_at_workshop_qty?: number
+  reserved_in_transit_qty?: number
+  reserved_orders?: Array<{
+    product_id: number
+    order_id?: number | null
+    order_number?: string | null
+    order_ref1c?: string | null
+    item_name?: string | null
+    reserved_qty: number
+    reserved_at_workshop_qty?: number
+    reserved_in_transit_qty?: number
+  }>
   availability_status?: string | null
   coverage_status?: string | null
   coverage_label?: string | null
