@@ -24,11 +24,13 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from ..models import (
     Item,
     ProductionMaterialIssue,
+    ProductionMaterialIssueLine,
     ProductionOrderLineState,
     SyncLink,
 )
@@ -59,9 +61,9 @@ def _fetch_pending_links(db: Session) -> List[SyncLink]:
     )
 
 
-def _query_posted_docs(client: OData1CClient, ref_keys: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+def _query_transfer_docs(client: OData1CClient, ref_keys: Iterable[str]) -> Dict[str, Dict[str, Any]]:
     """
-    Return posted 1C transfer docs by Ref_Key, including their stock rows.
+    Return 1C transfer docs by Ref_Key, including their stock rows.
 
     We re-read already-posted links too: users may manually edit and re-post a
     transfer in 1C after PRODPLAN first observed Posted=true. The local
@@ -72,9 +74,7 @@ def _query_posted_docs(client: OData1CClient, ref_keys: Iterable[str]) -> Dict[s
     for i in range(0, len(refs), BATCH_SIZE):
         batch = refs[i : i + BATCH_SIZE]
         or_filter = " or ".join(f"Ref_Key eq guid'{r}'" for r in batch)
-        # Server filter: Posted eq true (1C honours this; DeletionMark we
-        # re-check in code as production_order_sync.py does).
-        filter_q = f"({or_filter}) and Posted eq true"
+        filter_q = f"({or_filter})"
         try:
             rows = client.get_all(
                 STOCK_TRANSFER_ENTITY,
@@ -92,10 +92,6 @@ def _query_posted_docs(client: OData1CClient, ref_keys: Iterable[str]) -> Dict[s
             continue
 
         for rec in rows or []:
-            if bool(rec.get("DeletionMark")):
-                continue
-            if not bool(rec.get("Posted")):
-                continue
             ref = str(rec.get("Ref_Key") or "").strip()
             if ref:
                 found[ref] = rec
@@ -122,18 +118,23 @@ def _sync_issue_lines_from_posted_doc(
         return False
 
     item_ids = [int(line.component_item_id) for line in issue.lines or [] if line.component_item_id]
-    if not item_ids:
-        return False
     item_ref_by_id = {
         int(item.item_id): str(item.item_ref1c or "").strip()
         for item in db.query(Item).filter(Item.item_id.in_(item_ids)).all()
     }
+    item_by_ref = {
+        str(item.item_ref1c or "").strip(): item
+        for item in db.query(Item).filter(Item.item_ref1c.in_(posted_by_ref.keys())).all()
+        if str(item.item_ref1c or "").strip()
+    }
 
     changed = False
+    seen_refs: set[str] = set()
     for line in issue.lines or []:
         item_ref = item_ref_by_id.get(int(line.component_item_id))
         if not item_ref or item_ref not in posted_by_ref:
             continue
+        seen_refs.add(item_ref)
         posted_qty = posted_by_ref[item_ref]
         if abs(float(line.required_qty or 0.0) - posted_qty) > 1e-6:
             line.required_qty = posted_qty
@@ -141,7 +142,58 @@ def _sync_issue_lines_from_posted_doc(
         if abs(float(line.issued_qty or 0.0) - posted_qty) > 1e-6:
             line.issued_qty = posted_qty
             changed = True
+        if str(line.line_status or "") != "issued":
+            line.line_status = "issued"
+            changed = True
+
+    for item_ref, posted_qty in posted_by_ref.items():
+        if item_ref in seen_refs:
+            continue
+        item = item_by_ref.get(item_ref)
+        if item is None:
+            continue
+        db.add(
+            ProductionMaterialIssueLine(
+                issue_id=int(issue.issue_id),
+                component_item_id=int(item.item_id),
+                required_qty=posted_qty,
+                issued_qty=posted_qty,
+                unit=item.unit,
+                line_status="issued",
+            )
+        )
+        changed = True
     return changed
+
+
+def _apply_deleted(db: Session, link: SyncLink) -> Tuple[bool, Optional[str]]:
+    issue = (
+        db.query(ProductionMaterialIssue)
+        .filter(ProductionMaterialIssue.issue_id == int(link.source_id))
+        .one_or_none()
+    )
+    if issue is None:
+        return (False, f"material_issue id={link.source_id} не найден")
+    if str(issue.status or "") == "posted":
+        return (False, None)
+
+    changed = False
+    now = datetime.now(timezone.utc)
+    if link.status != "cancelled":
+        link.status = "cancelled"
+        link.last_synced_at = now
+        changed = True
+    if issue.status != "cancelled":
+        issue.status = "cancelled"
+        changed = True
+    if issue.export_error:
+        issue.export_error = None
+        changed = True
+    for line in issue.lines or []:
+        if str(line.line_status or "") != "cancelled":
+            line.line_status = "cancelled"
+            changed = True
+    return (changed, None)
 
 
 def _apply_posted(
@@ -188,19 +240,46 @@ def _apply_posted(
             line.line_status = "issued"
             changed = True
 
+    db.flush()
+    has_pending_delivery = (
+        db.query(ProductionMaterialIssue.issue_id)
+        .filter(
+            ProductionMaterialIssue.product_id == int(issue.product_id),
+            or_(
+                ProductionMaterialIssue.direction.is_(None),
+                ProductionMaterialIssue.direction == "",
+                ProductionMaterialIssue.direction.in_(("issue", "in_place")),
+            ),
+            ProductionMaterialIssue.status.in_(("draft", "requested", "issued", "exported")),
+        )
+        .first()
+        is not None
+    )
+
     state = (
         db.query(ProductionOrderLineState)
         .filter(ProductionOrderLineState.product_id == issue.product_id)
         .one_or_none()
     )
     if state is not None:
-        if state.status in {"shortage", "partial", "ready", "to_move"}:
+        if has_pending_delivery:
+            if state.status in {"shortage", "partial", "ready", "assembled"}:
+                state.status = "to_move"
+                changed = True
+            if state.issue_status != "requested":
+                state.issue_status = "requested"
+                changed = True
+        elif state.status in {"shortage", "partial", "ready", "to_move"}:
             if state.status != "assembled":
                 state.status = "assembled"
                 changed = True
-        # else: state already past 'assembled' (produced_partial / produced /
-        # cancelled) — do not regress.
-        if state.issue_status != "posted":
+            if state.issue_status != "posted":
+                state.issue_status = "posted"
+                changed = True
+        elif state.issue_status != "posted":
+            # State already past 'assembled' (produced_partial / produced /
+            # cancelled) — do not regress the line status, only the issue
+            # pipeline signal.
             state.issue_status = "posted"
             changed = True
 
@@ -240,11 +319,42 @@ def sync_posted_transfers(db: Session, *, dry_run: bool = False) -> Dict[str, An
 
     client = _create_odata_client(_load_odata_config(), OData1CClient)
 
-    posted_docs = _query_posted_docs(client, by_ref.keys())
+    docs = _query_transfer_docs(client, by_ref.keys())
+    posted_docs = {
+        ref: doc
+        for ref, doc in docs.items()
+        if bool(doc.get("Posted")) and not bool(doc.get("DeletionMark"))
+    }
+    deleted_docs = {
+        ref: doc
+        for ref, doc in docs.items()
+        if bool(doc.get("DeletionMark"))
+    }
     summary["posted_found"] = len(posted_docs)
 
     advanced = 0
     errors: List[str] = []
+    for ref in sorted(deleted_docs):
+        link = by_ref.get(ref)
+        if link is None:
+            continue
+        try:
+            changed, err = _apply_deleted(db, link)
+            if err:
+                errors.append(err)
+                continue
+            if changed:
+                advanced += 1
+                summary["details"].append(
+                    {
+                        "issue_id": int(link.source_id),
+                        "target_ref_key": ref,
+                        "action": "cancelled",
+                    }
+                )
+        except Exception as exc:
+            errors.append(f"{ref}: {exc}")
+
     for ref, doc in posted_docs.items():
         link = by_ref.get(ref)
         if link is None:

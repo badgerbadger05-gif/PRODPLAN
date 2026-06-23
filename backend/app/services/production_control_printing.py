@@ -684,6 +684,8 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int], *, auto_pr
                 <tr><td colspan="10"><b>Маршрут перемещения материалов</b></td></tr>
                 <tr><th colspan="2">Участок получатель</th><th colspan="2">№ перемещения</th><th colspan="3">Склад отправитель</th><th colspan="3">Склад получатель</th></tr>
                 {transfer_rows}
+                <tr><td colspan="10" class="material-signoff"><b>Материал выдан:</b> дата __________ подпись __________</td></tr>
+                <tr><td colspan="10" class="material-signoff"><b>Материал получен:</b> дата __________ подпись __________</td></tr>
                 <tr><td colspan="10"><b>Материалы и заготовки</b></td></tr>
                 <tr><th colspan="2">Материал</th><th>Артикул</th><th>Кол-во на ед.</th><th colspan="6">Кол-во по заказу</th></tr>
                 {component_rows}
@@ -731,6 +733,7 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int], *, auto_pr
     .strong-value, .warehouse-warning {{ font-weight: 700; }}
     .warehouse-warning {{ margin-left: 6px; white-space: nowrap; }}
     .signature {{ height: 20px; color: #555; font-size: 8.5px; line-height: 1.05; text-align: center; vertical-align: bottom; }}
+    .material-signoff {{ height: 18px; font-size: 10.5px; vertical-align: middle; }}
     .notes {{ height: 45px; }}
     @media print {{ .toolbar {{ display: none; }} .sheet {{ padding: 0; }} }}
   </style>

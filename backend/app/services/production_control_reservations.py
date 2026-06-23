@@ -41,6 +41,10 @@ from ..models import (
 )
 from .production_control_common import to_float as _to_float
 
+# 1C state for completed production orders. Duplicated locally to keep this
+# low-level reservation module independent from journal/planning services.
+DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
+
 # Issue statuses where the kit has not physically moved yet.
 TRANSIT_STATUSES = ("draft", "requested", "issued", "exported")
 # Directions that deliver components into the workshop for an order.
@@ -48,6 +52,7 @@ DELIVERY_DIRECTIONS = ("issue", "in_place")
 # Local-only direction: components claimed where they already lie. Never
 # exported to 1C.
 IN_PLACE_DIRECTION = "in_place"
+_RESERVATION_CLOSED_LINE_STATUSES = {"completed", "cancelled", "produced"}
 
 
 @dataclass
@@ -134,6 +139,27 @@ def _spec_qty_per_unit(db: Session, products: Sequence[ProductionProduct]) -> Di
     return result
 
 
+def is_product_reservation_active(product: ProductionProduct) -> bool:
+    """Whether a production line may still hold component reservations."""
+    order = getattr(product, "order", None)
+    if order is not None:
+        if bool(getattr(order, "deletion_mark", False)):
+            return False
+        state_key = str(getattr(order, "order_state_key", "") or "").lower()
+        if state_key == DONE_STATE_KEY:
+            return False
+
+    control_state = getattr(product, "control_state", None)
+    line_status = str(getattr(control_state, "status", "") or "").lower()
+    if line_status in _RESERVATION_CLOSED_LINE_STATUSES:
+        return False
+
+    if _to_float(getattr(product, "remaining_qty", 0.0)) <= 1e-9:
+        return False
+
+    return True
+
+
 def load_reservation_state(
     db: Session,
     *,
@@ -184,10 +210,22 @@ def load_reservation_state(
     product_ids = sorted({int(issue.product_id) for issue in issues})
     products = (
         db.query(ProductionProduct)
+        .options(
+            joinedload(ProductionProduct.order),
+            joinedload(ProductionProduct.control_state),
+        )
         .filter(ProductionProduct.product_id.in_(product_ids))
         .all()
     )
-    products_by_id = {int(p.product_id): p for p in products}
+    products_by_id = {
+        int(p.product_id): p
+        for p in products
+        if is_product_reservation_active(p)
+    }
+    issues = [issue for issue in issues if int(issue.product_id) in products_by_id]
+    if not issues:
+        return ReservationState()
+
     per_unit_by_product = _spec_qty_per_unit(db, products)
 
     state = ReservationState()

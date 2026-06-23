@@ -76,6 +76,7 @@ def _mk_issue_with_link(
         product_id=product.product_id,
         order_id=order.order_id,
         status=issue_status,
+        direction="issue",
         exported_ref1c=target_ref_key,
     )
     db.add(issue)
@@ -110,6 +111,7 @@ class _FakeOData:
 
     def __init__(self, posted_refs: set[str]) -> None:
         self.posted_refs = posted_refs
+        self.deleted_refs: set[str] = set()
         self.calls: list = []
 
     def get_all(self, entity, filter_query=None, select_fields=None, **_kwargs):
@@ -133,6 +135,15 @@ class _FakeOData:
                                         "Количество": 1.0,
                                     }
                                 ],
+                            }
+                        )
+                    elif ref in self.deleted_refs:
+                        rows.append(
+                            {
+                                "Ref_Key": ref,
+                                "Posted": False,
+                                "DeletionMark": True,
+                                "Запасы": [],
                             }
                         )
         return rows
@@ -184,6 +195,84 @@ def test_advances_to_assembled_when_1c_says_posted(db_session, monkeypatch):
     )
     assert state.status == "assembled"
     assert state.issue_status == "posted"
+
+
+def test_keeps_line_to_move_until_all_delivery_issues_are_posted(db_session, monkeypatch):
+    db = db_session
+    issue_posted, link_posted = _mk_issue_with_link(
+        db, line_status="to_move", issue_status="exported", target_ref_key="ref-one"
+    )
+    product_id = int(issue_posted.product_id)
+    order_id = int(issue_posted.order_id)
+
+    item = Item(
+        item_code="IT-ref-two",
+        item_name="Item ref-two",
+        item_article="ART-ref-two",
+        item_ref1c="item-ref-two",
+        unit="шт",
+        stock_qty=0,
+        status="active",
+    )
+    db.add(item)
+    db.flush()
+    issue_pending = ProductionMaterialIssue(
+        document_number="MI-ref-two",
+        product_id=product_id,
+        order_id=order_id,
+        status="exported",
+        exported_ref1c="ref-two",
+    )
+    db.add(issue_pending)
+    db.flush()
+    db.add(
+        ProductionMaterialIssueLine(
+            issue_id=int(issue_pending.issue_id),
+            component_item_id=int(item.item_id),
+            required_qty=1.0,
+            issued_qty=0.0,
+            line_status="planned",
+        )
+    )
+    db.add(
+        SyncLink(
+            source_system="PRODPLAN",
+            source_doctype="material_issue",
+            source_id=issue_pending.issue_id,
+            target_system="1C",
+            target_entity=STOCK_TRANSFER_ENTITY,
+            target_ref_key="ref-two",
+            target_number=issue_pending.document_number,
+            status="success",
+        )
+    )
+    db.commit()
+
+    _stub_config(monkeypatch)
+    monkeypatch.setattr(
+        posted_sync, "OData1CClient", lambda **_: _FakeOData({"ref-one"})
+    )
+
+    result = posted_sync.sync_posted_transfers(db)
+
+    assert result["status"] == "ok"
+    assert result["posted_found"] == 1
+    assert result["advanced"] == 1
+
+    db.refresh(link_posted)
+    db.refresh(issue_posted)
+    db.refresh(issue_pending)
+    assert link_posted.status == "posted"
+    assert issue_posted.status == "posted"
+    assert issue_pending.status == "exported"
+
+    state = (
+        db.query(ProductionOrderLineState)
+        .filter_by(product_id=product_id)
+        .one()
+    )
+    assert state.status == "to_move"
+    assert state.issue_status == "requested"
 
 
 def test_idempotent_repeat_run(db_session, monkeypatch):
@@ -240,6 +329,59 @@ def test_repeat_run_updates_quantity_changed_in_1c(db_session, monkeypatch):
     assert float(line.issued_qty) == pytest.approx(0.688)
 
 
+def test_repeat_run_adds_component_line_added_in_1c(db_session, monkeypatch):
+    db = db_session
+    issue, _link = _mk_issue_with_link(
+        db,
+        issue_status="posted",
+        target_ref_key="ref-added",
+        link_status="posted",
+    )
+    added_item = Item(
+        item_code="IT-added",
+        item_name="Added in 1C",
+        item_article="ART-added",
+        item_ref1c="item-ref-added-extra",
+        unit="шт",
+        stock_qty=0,
+        status="active",
+    )
+    db.add(added_item)
+    db.commit()
+
+    class _AddedLineOData(_FakeOData):
+        def get_all(self, entity, filter_query=None, select_fields=None, **kwargs):
+            rows = super().get_all(entity, filter_query, select_fields, **kwargs)
+            for row in rows:
+                row["Запасы"].append(
+                    {
+                        "Номенклатура_Key": "item-ref-added-extra",
+                        "Количество": 7.0,
+                    }
+                )
+            return rows
+
+    _stub_config(monkeypatch)
+    monkeypatch.setattr(
+        posted_sync, "OData1CClient", lambda **_: _AddedLineOData({"ref-added"})
+    )
+
+    result = posted_sync.sync_posted_transfers(db)
+
+    assert result["advanced"] == 1
+    lines = (
+        db.query(ProductionMaterialIssueLine)
+        .filter_by(issue_id=issue.issue_id)
+        .order_by(ProductionMaterialIssueLine.component_item_id)
+        .all()
+    )
+    added = [line for line in lines if line.component_item_id == added_item.item_id]
+    assert len(added) == 1
+    assert float(added[0].required_qty) == pytest.approx(7.0)
+    assert float(added[0].issued_qty) == pytest.approx(7.0)
+    assert added[0].line_status == "issued"
+
+
 def test_does_not_regress_state_past_assembled(db_session, monkeypatch):
     """If the line is already 'produced' / 'produced_partial', the posted
     transfer must not roll it back to 'assembled'."""
@@ -293,6 +435,29 @@ def test_skips_links_not_posted_in_1c(db_session, monkeypatch):
     db.refresh(issue_pending)
     assert issue_posted.status == "posted"
     assert issue_pending.status == "exported"  # untouched
+
+
+def test_cancels_deleted_transfer_in_1c(db_session, monkeypatch):
+    db = db_session
+    issue, link = _mk_issue_with_link(db, target_ref_key="ref-deleted")
+
+    class _DeletedOData(_FakeOData):
+        def __init__(self):
+            super().__init__(set())
+            self.deleted_refs = {"ref-deleted"}
+
+    _stub_config(monkeypatch)
+    monkeypatch.setattr(posted_sync, "OData1CClient", lambda **_: _DeletedOData())
+
+    result = posted_sync.sync_posted_transfers(db)
+
+    assert result["advanced"] == 1
+    assert result["details"][0]["action"] == "cancelled"
+    db.refresh(link)
+    db.refresh(issue)
+    assert link.status == "cancelled"
+    assert issue.status == "cancelled"
+    assert issue.lines[0].line_status == "cancelled"
 
 
 def test_dry_run_does_not_persist(db_session, monkeypatch):

@@ -211,6 +211,53 @@ def test_transit_reserves_at_source_posted_reserves_at_workshop(db_session):
     assert state.reserved_at_warehouse(WORKSHOP_WH, comp.item_id) == pytest.approx(0.0)
 
 
+def test_finished_production_line_releases_exported_transfer_reservations(db_session):
+    """Completed 1C orders may keep historical transfer docs, but no reserve."""
+    db = db_session
+    _add_warehouses(db)
+    parent, comp, product = _setup(db, order_qty=99.0, suffix="DONE")
+    product.order.order_state_key = "ad28565a-991b-11eb-e39a-fa163e61326a"
+    product.order.order_state_name = "Завершен"
+    product.order.deletion_mark = True
+    product.produced_qty = 99.0
+    product.remaining_qty = 0.0
+    product.control_state.status = "produced"
+
+    for idx, status in enumerate(("exported", "posted", "exported"), start=1):
+        issue = ProductionMaterialIssue(
+            document_number=f"MT-DONE-{idx}",
+            product_id=product.product_id,
+            order_id=product.order_id,
+            status=status,
+            direction="issue",
+            warehouse_ref1c=WORKSHOP_WH,
+            source_warehouse_ref1c=SOURCE_WH,
+        )
+        db.add(issue)
+        db.flush()
+        db.add(
+            ProductionMaterialIssueLine(
+                issue_id=issue.issue_id,
+                component_item_id=comp.item_id,
+                required_qty=99.0,
+                issued_qty=99.0 if status == "posted" else 0.0,
+                line_status="issued" if status == "posted" else "planned",
+            )
+        )
+    db.commit()
+
+    state = load_reservation_state(db, item_ids=[comp.item_id])
+    assert state.for_product(product.product_id).total(comp.item_id) == pytest.approx(0.0)
+    assert state.reserved_at_warehouse(SOURCE_WH, comp.item_id) == pytest.approx(0.0)
+
+    retry = create_material_issues(db, [product.product_id], initiated_by="op")
+    assert retry["created"] == []
+    assert retry["errors"] == [
+        f"product_id={product.product_id}: строка заказа уже закрыта или завершена в 1С; "
+        "новые перемещения не создаются"
+    ]
+
+
 def test_repair_in_place_reservation_covers_legacy_shortfall(db_session):
     db = db_session
     _add_warehouses(db)

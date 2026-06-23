@@ -38,6 +38,7 @@ from .one_c_document_numbers import material_issue_number
 from .production_control_reservations import (
     ReservationState,
     TRANSIT_STATUSES,
+    is_product_reservation_active,
     load_reservation_state,
 )
 from .workshop_resolution import (
@@ -794,6 +795,12 @@ def create_material_issues(
         )
         if not product:
             errors.append(f"product_id={pid}: строка заказа не найдена")
+            continue
+        if not is_product_reservation_active(product):
+            errors.append(
+                f"product_id={pid}: строка заказа уже закрыта или завершена в 1С; "
+                "новые перемещения не создаются"
+            )
             continue
 
         existing_rows = (

@@ -1,0 +1,46 @@
+# Repository Guidelines
+
+## Project Structure & Module Organization
+
+PRODPLAN is split into a FastAPI backend and a Vite/React frontend. Backend code lives in `backend/app`, with Alembic migrations in `backend/alembic` and worker entrypoints in `backend/sync_worker.py` and `backend/reconcile_worker.py`. Frontend source is in `frontend-erp-shell/src`; static assets are in `frontend-erp-shell/public`. Shared or operational material is kept in `docs`, `scripts`, `tools`, `config`, and `config-test`. Main pytest coverage lives in the root `tests` directory, with additional frontend smoke tests in `frontend-erp-shell/tests`.
+
+## Build, Test, and Development Commands
+
+Backend tests:
+
+```powershell
+pytest -q
+pytest tests/services/test_production_control.py -q
+```
+
+Frontend commands, run from `frontend-erp-shell`:
+
+```powershell
+npm run dev      # start Vite on port 9300
+npm run build    # TypeScript build plus production Vite bundle
+npm run lint     # ESLint
+npm run smoke    # Playwright smoke tests
+```
+
+Local container stack:
+
+```powershell
+docker compose -f docker-compose.test.yml up -d --build
+docker compose -f docker-compose.test.yml exec -T backend alembic upgrade head
+```
+
+## Coding Style & Naming Conventions
+
+Python uses 4-space indentation, type hints where useful, and snake_case for modules, functions, and variables. Keep service logic in `backend/app/services`, request routing in `backend/app/routers`, and database shape changes in Alembic migrations. TypeScript/React uses 2-space indentation, PascalCase components, camelCase values, and domain types under `frontend-erp-shell/src/domain`. Prefer existing helpers and DTO shapes over ad hoc duplicates.
+
+## Testing Guidelines
+
+Pytest is configured by `pytest.ini` to discover `test_*.py` under `tests`, with `backend` on `pythonpath`. Add or update focused service tests for backend behavior changes, especially sync, planning, reservations, and 1C export flows. For UI changes, run `npm run build`; add Playwright coverage when behavior spans navigation or critical user workflows.
+
+## Commit & Pull Request Guidelines
+
+History uses short imperative commit subjects, for example `Add production reservation repair workflow` or `Repair stale MRP workshop bindings`. Keep commits scoped and avoid mixing generated artifacts or local config with product changes. Pull requests should describe the operational impact, list tests run, mention migrations or deploy steps, and include screenshots for visible UI changes.
+
+## Security & Configuration Tips
+
+Do not commit real 1C credentials, database passwords, or machine-specific config. Runtime OData settings belong in `config/odata_config.json` or the mounted production config, not source code. The container stack pins `Europe/Moscow`; preserve `TZ`, `PGTZ`, and Postgres timezone settings when editing compose or Docker files.

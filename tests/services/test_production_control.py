@@ -157,6 +157,8 @@ def test_route_sheet_includes_material_transfer_route(db_session):
     assert "Склад металла" in html
     assert "Склад сварки" in html
     assert "@page { size: A4 portrait; margin: 5mm; }" in html
+    assert "Материал выдан:" in html
+    assert "Материал получен:" in html
     assert "ФИО, подпись, дата" in html
     assert "Предъявлено" in html
     assert "Несоотв." in html

@@ -51,6 +51,7 @@ dist/
 /test_export.json
 /test_output.txt
 /0
+/output/pdf/
 
 # OS generated files
 .DS_Store
