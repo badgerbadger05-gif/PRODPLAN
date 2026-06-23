@@ -173,6 +173,12 @@ class SpecComponent(Base):
     quantity = Column(DECIMAL(10, 3), nullable=False)
     stage_id = Column(Integer, ForeignKey('production_stages.stage_id'), nullable=True)
     component_type = Column(String(50), default='Материал')  # Материал, Сборка
+    # Закреплённая спецификация компонента (1С: Спецификации_Состав.Спецификация_Key).
+    # Значима только для строк типа Сборка/Узел; именно её 1С подставляет в документы.
+    # NULL/пусто = компонент идёт по основной спецификации номенклатуры.
+    # Входит в естественный ключ строки состава: один и тот же компонент может
+    # стоять в одной спецификации несколько раз с разными закреплёнными спеками.
+    component_spec_ref1c = Column(String(36), nullable=True, index=True)
     created_at = Column(TIMESTAMP, default=func.now())
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
 
