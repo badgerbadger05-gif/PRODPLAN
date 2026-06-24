@@ -332,3 +332,55 @@ def preview_kind_change(db: Session, *, item_id: int, new_production_kind_id: in
             ),
         },
     }
+
+
+# --- Мост к 1С: резолв локальной правки в ключи 1С для spec_writeback_1c ---
+# Возвращают «план» в терминах GUID 1С; сам read-modify-write выполняет supervised
+# раннер через SpecWriteback. Здесь нет ни одного обращения к 1С.
+
+def _require_spec_ref(spec: Specification) -> str:
+    ref = (spec.spec_ref1c or "").strip()
+    if not ref:
+        raise SpecRepairError(f"У спецификации spec_id={spec.spec_id} нет spec_ref1c — нечего писать в 1С")
+    return ref
+
+
+def _stage_ref(db: Session, stage_id: Optional[int]) -> Optional[str]:
+    if stage_id is None:
+        return None
+    st = db.query(ProductionStage).filter_by(stage_id=int(stage_id)).first()
+    if not st:
+        raise SpecRepairError(f"Этап не найден: stage_id={stage_id}")
+    return (st.stage_ref1c or "").strip() or None
+
+
+def build_restage_plan(db: Session, *, component_id: int, new_stage_id: Optional[int]) -> Dict[str, Any]:
+    """Ключи 1С для restage: какую строку какой спеки и на какой этап перевести."""
+    comp = _get_component(db, component_id)
+    spec = _require_spec(db, comp.spec_id)
+    item = db.query(Item).filter_by(item_id=int(comp.item_id)).first()
+    return {
+        "op": "restage",
+        "spec_ref": _require_spec_ref(spec),
+        "nomenclature_key": (item.item_ref1c if item else None),
+        "child_spec_key": comp.component_spec_ref1c,
+        "new_stage_key": _stage_ref(db, new_stage_id),
+    }
+
+
+def build_move_plan(db: Session, *, component_id: int, target_spec_id: int, new_stage_id: Optional[int] = None) -> Dict[str, Any]:
+    """Ключи 1С для move: вынуть строку из source-спеки и добавить в target-спеку."""
+    comp = _get_component(db, component_id)
+    if int(target_spec_id) == int(comp.spec_id):
+        raise SpecRepairError("Целевая спецификация совпадает с исходной")
+    source_spec = _require_spec(db, comp.spec_id)
+    target_spec = _require_spec(db, target_spec_id)
+    item = db.query(Item).filter_by(item_id=int(comp.item_id)).first()
+    return {
+        "op": "move",
+        "source_spec_ref": _require_spec_ref(source_spec),
+        "target_spec_ref": _require_spec_ref(target_spec),
+        "nomenclature_key": (item.item_ref1c if item else None),
+        "child_spec_key": comp.component_spec_ref1c,
+        "new_stage_key": _stage_ref(db, new_stage_id),
+    }
