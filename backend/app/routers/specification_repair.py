@@ -43,6 +43,11 @@ class AddRequest(BaseModel):
     dry_run: bool = True
 
 
+class KindChangePreviewRequest(BaseModel):
+    item_id: int
+    new_production_kind_id: int
+
+
 @router.post("/restage")
 def restage(req: RestageRequest, db: Session = Depends(get_db)) -> dict:
     try:
@@ -80,6 +85,17 @@ def add(req: AddRequest, db: Session = Depends(get_db)) -> dict:
             stage_id=req.stage_id,
             component_spec_ref1c=req.component_spec_ref1c,
             dry_run=req.dry_run,
+        )
+    except SpecRepairError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/kind-change/preview")
+def kind_change_preview(req: KindChangePreviewRequest, db: Session = Depends(get_db)) -> dict:
+    """Read-only: чек-лист родителей, которых затронет смена вида производства детали."""
+    try:
+        return spec_repair.preview_kind_change(
+            db, item_id=req.item_id, new_production_kind_id=req.new_production_kind_id
         )
     except SpecRepairError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

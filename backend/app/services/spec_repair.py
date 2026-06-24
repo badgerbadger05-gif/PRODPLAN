@@ -23,7 +23,14 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
-from ..models import Item, ProductionStage, SpecComponent, Specification
+from ..models import (
+    DefaultSpecification,
+    Item,
+    ProductionKind,
+    ProductionStage,
+    SpecComponent,
+    Specification,
+)
 from .specification_sync import _norm_component_spec_ref
 
 
@@ -242,3 +249,86 @@ def add_component(
     }
     _finish(db, dry_run)
     return result
+
+
+def _resolve_default_spec_id(db: Session, item_id: int) -> Optional[int]:
+    rec = (
+        db.query(DefaultSpecification)
+        .filter(DefaultSpecification.item_id == int(item_id))
+        .order_by(DefaultSpecification.updated_at.desc(), DefaultSpecification.id.desc())
+        .first()
+    )
+    return int(rec.spec_id) if rec and rec.spec_id is not None else None
+
+
+def _kind_payload(kind: Optional[ProductionKind]) -> Optional[Dict[str, Any]]:
+    if not kind:
+        return None
+    return {"id": int(kind.id), "ref_1c": kind.ref_1c, "name": kind.name}
+
+
+def preview_kind_change(db: Session, *, item_id: int, new_production_kind_id: int) -> Dict[str, Any]:
+    """Операция Б (read-only превью). Чек-лист родителей, которых затронет смена вида
+    производства детали.
+
+    Смена вида в 1С требует НОВОЙ спеки (новый GUID присваивает 1С), поэтому сам apply —
+    supervised-шаг. Здесь только показываем: какие родительские строки состава явно
+    закрепили текущую спеку детали (Сборка/Узел) и потому потребуют каскадного
+    переключения на новую спеку. Строки с пустой закреплённой спекой пойдут по новой
+    основной сами и в каскад не входят.
+    """
+    item = db.query(Item).filter_by(item_id=int(item_id)).first()
+    if not item:
+        raise SpecRepairError(f"Номенклатура не найдена: item_id={item_id}")
+
+    new_kind = db.query(ProductionKind).filter_by(id=int(new_production_kind_id)).first()
+    if not new_kind:
+        raise SpecRepairError(f"Вид производства не найден: id={new_production_kind_id}")
+
+    spec_id = _resolve_default_spec_id(db, int(item_id))
+    if not spec_id:
+        raise SpecRepairError("У детали нет основной спецификации (default_specifications)")
+    spec = db.query(Specification).filter_by(spec_id=int(spec_id)).first()
+    current_kind = (
+        db.query(ProductionKind).filter_by(id=int(spec.production_kind_id)).first()
+        if spec and spec.production_kind_id
+        else None
+    )
+
+    old_ref = spec.spec_ref1c if spec else None
+    affected: List[Dict[str, Any]] = []
+    if old_ref:
+        rows = (
+            db.query(SpecComponent)
+            .filter(
+                SpecComponent.item_id == int(item_id),
+                SpecComponent.component_spec_ref1c == old_ref,
+            )
+            .all()
+        )
+        for r in rows:
+            parent = db.query(Specification).filter_by(spec_id=int(r.spec_id)).first()
+            affected.append({
+                "parent_spec_id": int(r.spec_id),
+                "parent_spec_code": (parent.spec_code if parent else None),
+                "component_id": int(r.component_id),
+                "component_type": r.component_type,
+            })
+
+    return {
+        "action": "kind_change_preview",
+        "item_id": int(item_id),
+        "current_spec_id": int(spec_id),
+        "current_spec_ref1c": old_ref,
+        "current_kind": _kind_payload(current_kind),
+        "new_kind": _kind_payload(new_kind),
+        "cascade": {
+            "affected_parent_rows": len(affected),
+            "parents": affected,
+            "note": (
+                "Превью только. Apply (POST новой спеки + переключение основной в "
+                "СпецификацииПоУмолчанию + каскадный PATCH родителей) — supervised "
+                "шаг против unf_demo: новой спеке нужен GUID из 1С."
+            ),
+        },
+    }
