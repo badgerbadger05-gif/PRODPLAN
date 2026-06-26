@@ -193,6 +193,85 @@ def test_execution_journal_marks_production_order_opened_in_1c(db_session):
     assert work_item["one_c_opened"] is True
 
 
+def test_execution_journal_counts_direct_completed_1c_order_by_item(db_session):
+    bucket = date(2026, 6, 19)
+    item = Item(
+        item_code="MAKE-DIRECT-1C",
+        item_name="Прямой выпуск из 1С",
+        item_article="MAKE-DIRECT-1C",
+        unit="шт",
+        stock_qty=0,
+        replenishment_method="Производство",
+        status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+    plan = _make_fixed_plan(
+        db_session,
+        item,
+        bucket,
+        qty=20.0,
+        period_from=date(2026, 6, 1),
+        period_to=date(2026, 6, 30),
+    )
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        source_plan_id=plan.id,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        started_at=datetime.datetime(2026, 6, 2, 5, 25),
+        finished_at=datetime.datetime(2026, 6, 2, 5, 25),
+    )
+    db_session.add(run)
+    db_session.flush()
+    req = MrpRequirement(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        total_required_qty=20,
+        net_required_qty=20,
+        covered_qty=0,
+        remaining_qty=20,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        bom_level=0,
+    )
+    db_session.add(req)
+    db_session.flush()
+    order = ProductionOrder(
+        order_number="1C-DIRECT-DONE",
+        order_date=datetime.datetime(2026, 6, 15, 12, 0),
+        order_ref1c="direct-1c-done-ref",
+        is_posted=True,
+        deletion_mark=False,
+        source="1c",
+        order_state_key="ad28565a-991b-11eb-e39a-fa163e61326a",
+        order_state_name="Завершен",
+    )
+    db_session.add(order)
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=item.item_id,
+        line_number=1,
+        quantity=20,
+        produced_qty=20,
+        remaining_qty=0,
+        source_mrp_requirement_id=None,
+    )
+    db_session.add(product)
+    db_session.commit()
+
+    row = get_period_plan_execution_journal(db_session, plan.id, run_id=run.run_id)["rows"][0]
+
+    assert row["ordered_qty"] == 20
+    assert row["completed_qty"] == 20
+    assert row["remaining_qty"] == 0
+    assert row["unassigned_qty"] == 0
+    assert row["coverage_pct"] == 100
+    assert row["status"] == "covered"
+    assert row["work_items"][0]["order_number"] == "1C-DIRECT-DONE"
+
+
 def test_execution_journal_does_not_count_planned_task_as_ordered(db_session):
     bucket = date(2026, 6, 2)
     item = Item(
