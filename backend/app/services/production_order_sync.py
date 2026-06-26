@@ -12,6 +12,10 @@ from ..models import ProductionOrder, ProductionProduct, Item
 from ..schemas import ODataSyncRequest
 
 
+PRODUCTION_ORDER_SYNC_FROM = datetime(2026, 5, 1)
+PRODUCTION_ORDER_SYNC_FROM_1C = "2026-05-01T00:00:00"
+
+
 @dataclass
 class ProductionOrderSyncStats:
     """Статистика синхронизации заказов на производство"""
@@ -141,13 +145,18 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
         # Фильтр заказов для расчёта:
         # - DeletionMark == false
         # - Posted == true
+        # - Date >= 2026-05-01
         # Завершённые заказы намеренно синхронизируем: они должны попадать в
         # общую базу и участвовать в расчётах, а UI скрывает их отдельным правилом.
         # Дублируем фильтрацию в коде, т.к. 1С/прокси иногда частично игнорируют условия.
         # Серверный фильтр:
         # - Posted eq true (1С корректно фильтрует опубликованные)
+        # - Date ge 2026-05-01, чтобы не тянуть старые завершённые хвосты из 1С.
         # DeletionMark фильтруем в коде, т.к. 1С игнорирует этот фильтр.
-        default_filter = "Posted eq true"
+        default_filter = (
+            f"Date ge datetime'{PRODUCTION_ORDER_SYNC_FROM_1C}' and "
+            "Posted eq true"
+        )
 
         # Даже если клиент прислал кастомный select_fields, принудительно добавляем
         # поля, нужные для корректной фильтрации активных заказов.
@@ -447,11 +456,15 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
         if req.dry_run:
             db.rollback()
         else:
-            # Правило: "отсутствует в загрузке = закрыт"
-            # Помечаем все заказы, которых нет в текущей выгрузке 1С, как удалённые
+            # Правило: "отсутствует в загрузке = закрыт" действует только в
+            # синхронизируемом горизонте. Старые локальные заказы до 2026-05-01
+            # не трогаем, иначе date-фильтр превращает их в ложные удаления.
             loaded_order_refs = set(order_keys)
             orders_to_close = []
-            for order in db.query(ProductionOrder).filter(ProductionOrder.deletion_mark == False).all():
+            for order in db.query(ProductionOrder).filter(
+                ProductionOrder.deletion_mark == False,
+                ProductionOrder.order_date >= PRODUCTION_ORDER_SYNC_FROM,
+            ).all():
                 if order.order_ref1c and order.order_ref1c not in loaded_order_refs:
                     orders_to_close.append(order)
             
