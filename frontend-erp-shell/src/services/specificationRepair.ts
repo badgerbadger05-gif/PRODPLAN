@@ -10,6 +10,8 @@ import type {
   RemoveResult,
   RestageRequest,
   RestageResult,
+  SetQuantityRequest,
+  SetQuantityResult,
   StageOption,
 } from '../domain/specificationRepair'
 import { api } from '../lib/api'
@@ -30,6 +32,10 @@ export function repairAdd(req: AddRequest) {
 
 export function repairRemove(req: RemoveRequest) {
   return api<RemoveResult>(`${BASE}/remove`, { method: 'POST', body: JSON.stringify(req) })
+}
+
+export function repairSetQuantity(req: SetQuantityRequest) {
+  return api<SetQuantityResult>(`${BASE}/set-quantity`, { method: 'POST', body: JSON.stringify(req) })
 }
 
 export function repairKindChangePreview(req: KindChangePreviewRequest) {

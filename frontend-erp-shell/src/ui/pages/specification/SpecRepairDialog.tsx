@@ -7,6 +7,7 @@ import type {
   ProductionKind,
   RemoveResult,
   RestageResult,
+  SetQuantityResult,
   StageOption,
 } from '../../../domain/specificationRepair'
 import {
@@ -17,15 +18,17 @@ import {
   repairMove,
   repairRemove,
   repairRestage,
+  repairSetQuantity,
 } from '../../../services/specificationRepair'
 import { searchSpecificationItems } from '../../../services/specification'
 
-export type RepairAction = 'restage' | 'move' | 'add' | 'remove' | 'kind'
+export type RepairAction = 'restage' | 'move' | 'add' | 'quantity' | 'remove' | 'kind'
 
 const TITLES: Record<RepairAction, string> = {
   restage: 'Сменить этап компонента',
   move: 'Перенести компонент в другую спецификацию',
   add: 'Добавить компонент в спецификацию',
+  quantity: 'Изменить количество компонента',
   remove: 'Убрать компонент из спецификации',
   kind: 'Смена вида производства — превью каскада',
 }
@@ -44,7 +47,7 @@ function nodeTitle(node: SpecNode | null) {
   return node.type === 'operation' ? node.operation?.name || 'Операция' : node.name || 'Номенклатура'
 }
 
-type RepairResult = RestageResult | MoveResult | AddResult | RemoveResult | KindChangePreviewResult
+type RepairResult = RestageResult | MoveResult | AddResult | SetQuantityResult | RemoveResult | KindChangePreviewResult
 
 type Props = {
   action: RepairAction
@@ -73,6 +76,9 @@ export function SpecRepairDialog({ action, node, rootItem, treeRows, onClose, on
 
   // remove
   const [confirmRemove, setConfirmRemove] = useState(false)
+
+  // quantity — преднабор текущим количеством выбранной строки
+  const [qtyValue, setQtyValue] = useState<number>(node?.qtyPerParent ?? 1)
 
   // add
   const [addItemQuery, setAddItemQuery] = useState('')
@@ -151,6 +157,10 @@ export function SpecRepairDialog({ action, node, rootItem, treeRows, onClose, on
       if (!addItem) return 'Выберите номенклатуру для добавления.'
       if (!(addQty > 0)) return 'Количество должно быть больше нуля.'
     }
+    if (action === 'quantity') {
+      if (componentId == null) return 'Выберите строку состава (компонент, не корень).'
+      if (!(qtyValue > 0)) return 'Количество должно быть больше нуля.'
+    }
     if (action === 'remove') {
       if (componentId == null) return 'Выберите строку состава (компонент, не корень).'
       if (!confirmRemove) return 'Поставьте галку подтверждения удаления.'
@@ -160,7 +170,7 @@ export function SpecRepairDialog({ action, node, rootItem, treeRows, onClose, on
       if (!newKindId.trim()) return 'Выберите новый вид производства.'
     }
     return ''
-  }, [action, refError, componentId, targetSpecId, addSpecId, addItem, addQty, confirmRemove, itemId, newKindId])
+  }, [action, refError, componentId, targetSpecId, addSpecId, addItem, addQty, qtyValue, confirmRemove, itemId, newKindId])
 
   async function submit() {
     if (blocker) return
@@ -191,6 +201,9 @@ export function SpecRepairDialog({ action, node, rootItem, treeRows, onClose, on
           dry_run: dryRun,
         })
         setResult(res)
+      } else if (action === 'quantity') {
+        const res = await repairSetQuantity({ component_id: componentId!, quantity: qtyValue, dry_run: dryRun })
+        setResult(res)
       } else if (action === 'remove') {
         const res = await repairRemove({ component_id: componentId!, force, dry_run: dryRun })
         setResult(res)
@@ -210,7 +223,7 @@ export function SpecRepairDialog({ action, node, rootItem, treeRows, onClose, on
   }
 
   const isWriteResult = result != null && action !== 'kind'
-  const writeResult = isWriteResult ? (result as RestageResult | MoveResult | AddResult | RemoveResult) : null
+  const writeResult = isWriteResult ? (result as RestageResult | MoveResult | AddResult | SetQuantityResult | RemoveResult) : null
   const kindResult = action === 'kind' && result ? (result as KindChangePreviewResult) : null
 
   const stageLabel =
@@ -334,6 +347,19 @@ export function SpecRepairDialog({ action, node, rootItem, treeRows, onClose, on
                 </select>
               </div>
             </>
+          )}
+
+          {action === 'quantity' && (
+            <div className="dialogField">
+              <label>Новое количество (норма расхода){node?.unit ? `, ${node.unit}` : ''}</label>
+              <input
+                type="number"
+                min="0.0001"
+                step="any"
+                value={qtyValue}
+                onChange={(e) => setQtyValue(Number(e.target.value || 0))}
+              />
+            </div>
           )}
 
           {action === 'remove' && (

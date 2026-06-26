@@ -51,6 +51,12 @@ class RemoveRequest(BaseModel):
     dry_run: bool = True
 
 
+class SetQuantityRequest(BaseModel):
+    component_id: int
+    quantity: float
+    dry_run: bool = True
+
+
 class KindChangePreviewRequest(BaseModel):
     item_id: int
     new_production_kind_id: int
@@ -185,6 +191,34 @@ def remove(req: RemoveRequest, db: Session = Depends(get_db)) -> dict:
             )
         result = spec_repair.remove_component(
             db, component_id=req.component_id, force=req.force, dry_run=req.dry_run
+        )
+        if writeback is not None:
+            result["writeback_1c"] = writeback
+        return result
+    except SpecRepairError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except SpecWritebackError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@router.post("/set-quantity")
+def set_quantity(req: SetQuantityRequest, db: Session = Depends(get_db)) -> dict:
+    try:
+        writeback = None
+        if not req.dry_run:
+            plan = spec_repair.build_set_quantity_plan(
+                db, component_id=req.component_id, quantity=req.quantity
+            )
+            writeback = spec_writeback_1c.writeback_set_quantity(
+                spec_writeback_1c.build_client_from_config(),
+                spec_ref=plan["spec_ref"],
+                nomenclature_key=plan["nomenclature_key"],
+                child_spec_key=plan["child_spec_key"],
+                quantity=plan["quantity"],
+                dry_run=False,
+            )
+        result = spec_repair.set_quantity_component(
+            db, component_id=req.component_id, quantity=req.quantity, dry_run=req.dry_run
         )
         if writeback is not None:
             result["writeback_1c"] = writeback

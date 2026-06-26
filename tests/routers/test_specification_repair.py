@@ -197,6 +197,44 @@ def test_move_same_spec_returns_400(client, db_session):
     assert resp.status_code == 400
 
 
+def test_set_quantity_dry_run_previews_without_change(client, db_session):
+    a, b, part, comp = _seed_move(db_session)  # comp.quantity == 1
+
+    resp = client.post(f"{API}/set-quantity", json={"component_id": comp.component_id, "quantity": 7})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["action"] == "set_quantity" and body["dry_run"] is True
+    assert body["old_quantity"] == 1 and body["new_quantity"] == 7
+    assert set(body["pending_1c"]["specs"]) == {a.spec_id}
+    # dry-run количество не изменил
+    assert float(db_session.query(SpecComponent).filter_by(component_id=comp.component_id).first().quantity) == 1
+
+
+def test_set_quantity_apply_writes_to_1c(client, db_session, fake_1c):
+    a, b, part, comp = _seed_move(db_session)
+    fc = fake_1c(specs={"a": [{"Номенклатура_Key": "p",
+                              "Спецификация_Key": "00000000-0000-0000-0000-000000000000",
+                              "Этап_Key": "st", "Количество": 1}]})
+
+    resp = client.post(
+        f"{API}/set-quantity",
+        json={"component_id": comp.component_id, "quantity": 5, "dry_run": False},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["writeback_1c"]["op"] == "set_quantity"
+    _, payload = fc.patches[0]
+    assert payload["Состав"][0]["Количество"] == 5
+    assert float(db_session.query(SpecComponent).filter_by(component_id=comp.component_id).first().quantity) == 5
+
+
+def test_set_quantity_non_positive_returns_400(client, db_session):
+    a, b, part, comp = _seed_move(db_session)
+    resp = client.post(f"{API}/set-quantity", json={"component_id": comp.component_id, "quantity": 0})
+    assert resp.status_code == 400
+
+
 def test_remove_dry_run_previews_without_change(client, db_session):
     a, b, part, comp = _seed_move(db_session)
 

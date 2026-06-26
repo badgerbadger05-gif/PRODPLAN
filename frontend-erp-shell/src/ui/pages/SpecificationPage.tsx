@@ -472,6 +472,11 @@ export function SpecificationPage() {
                     title="Добавить компонент в спецификацию выбранного узла"
                   >Добавить компонент</button>
                   <button
+                    onClick={() => setRepairAction('quantity')}
+                    disabled={!selectedNode || selectedNode.type !== 'item' || selectedNode.componentId == null}
+                    title="Изменить количество (норму расхода) этой строки состава"
+                  >Изменить кол-во</button>
+                  <button
                     onClick={() => setRepairAction('remove')}
                     disabled={!selectedNode || selectedNode.type !== 'item' || selectedNode.componentId == null}
                     title="Убрать компонент из спецификации (с подтверждением)"

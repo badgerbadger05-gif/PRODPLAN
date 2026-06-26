@@ -77,6 +77,25 @@ def set_stage_on_rows(
     return out, changed
 
 
+def set_quantity_on_rows(
+    rows: List[Dict[str, Any]],
+    *,
+    nomenclature_key: str,
+    child_spec_key: Optional[str],
+    quantity: Any,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """set_quantity: на совпавших строках меняет только Количество, остальное не трогает."""
+    changed = 0
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        r = copy.deepcopy(row)
+        if _row_matches(r, nomenclature_key, child_spec_key):
+            r["Количество"] = quantity
+            changed += 1
+        out.append(r)
+    return out, changed
+
+
 def pop_row(
     rows: List[Dict[str, Any]],
     *,
@@ -257,6 +276,33 @@ def writeback_move(
         }
 
     return _guard("move", _run)
+
+
+def writeback_set_quantity(
+    client: Any,
+    *,
+    spec_ref: str,
+    nomenclature_key: str,
+    child_spec_key: Optional[str],
+    quantity: Any,
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """set_quantity в 1С: на совпавшей строке состава меняем только Количество."""
+    def _run():
+        sb = SpecWriteback(client, dry_run=dry_run)
+        rows = sb.read_sostav(spec_ref)
+        new_rows, changed = set_quantity_on_rows(
+            rows, nomenclature_key=nomenclature_key, child_spec_key=child_spec_key, quantity=quantity
+        )
+        if changed != 1:
+            raise SpecWritebackError(
+                f"set_quantity: в 1С ожидалась ровно 1 совпавшая строка, найдено {changed} "
+                f"(spec={spec_ref}, ном={nomenclature_key})"
+            )
+        res = sb.patch_sostav(spec_ref, new_rows)
+        return {"op": "set_quantity", "changed": changed, "rows": len(new_rows), "patch": res}
+
+    return _guard("set_quantity", _run)
 
 
 def writeback_remove(

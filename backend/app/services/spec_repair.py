@@ -194,6 +194,38 @@ def move_component(
     return result
 
 
+def set_quantity_component(
+    db: Session,
+    *,
+    component_id: int,
+    quantity: Any,
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """Изменить количество компонента (норму расхода) в строке состава."""
+    comp = _get_component(db, component_id)
+    if quantity is None or float(quantity) <= 0:
+        raise SpecRepairError("Количество должно быть > 0")
+
+    old_quantity = comp.quantity
+    comp.quantity = quantity
+    db.flush()
+
+    result = {
+        "action": "set_quantity",
+        "ok": True,
+        "component_id": int(component_id),
+        "spec_id": int(comp.spec_id),
+        "item_id": int(comp.item_id),
+        "old_quantity": (float(old_quantity) if old_quantity is not None else None),
+        "new_quantity": float(quantity),
+        "warnings": [],
+        "pending_1c": _pending_1c([comp.spec_id]),
+        "dry_run": bool(dry_run),
+    }
+    _finish(db, dry_run)
+    return result
+
+
 def remove_component(
     db: Session,
     *,
@@ -459,6 +491,20 @@ def build_remove_plan(db: Session, *, component_id: int) -> Dict[str, Any]:
         "spec_ref": _require_spec_ref(spec),
         "nomenclature_key": (item.item_ref1c if item else None),
         "child_spec_key": comp.component_spec_ref1c,
+    }
+
+
+def build_set_quantity_plan(db: Session, *, component_id: int, quantity: Any) -> Dict[str, Any]:
+    """Ключи 1С для set_quantity: какой строке какой спеки проставить Количество."""
+    comp = _get_component(db, component_id)
+    spec = _require_spec(db, comp.spec_id)
+    item = db.query(Item).filter_by(item_id=int(comp.item_id)).first()
+    return {
+        "op": "set_quantity",
+        "spec_ref": _require_spec_ref(spec),
+        "nomenclature_key": (item.item_ref1c if item else None),
+        "child_spec_key": comp.component_spec_ref1c,
+        "quantity": quantity,
     }
 
 

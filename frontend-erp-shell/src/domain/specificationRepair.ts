@@ -37,6 +37,12 @@ export type RemoveRequest = {
   dry_run: boolean
 }
 
+export type SetQuantityRequest = {
+  component_id: number
+  quantity: number
+  dry_run: boolean
+}
+
 export type KindChangePreviewRequest = {
   item_id: number
   new_production_kind_id: number
@@ -108,6 +114,20 @@ export type RemoveResult = {
     specs_before: number[]
     specs_after: number[]
   }
+  warnings: unknown[]
+  pending_1c: PendingOneC
+  dry_run: boolean
+  writeback_1c?: Writeback1C
+}
+
+export type SetQuantityResult = {
+  action: 'set_quantity'
+  ok: boolean
+  component_id: number
+  spec_id: number
+  item_id: number
+  old_quantity: number | null
+  new_quantity: number
   warnings: unknown[]
   pending_1c: PendingOneC
   dry_run: boolean
