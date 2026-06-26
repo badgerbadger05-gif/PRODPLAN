@@ -138,19 +138,16 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
             "СостояниеЗаказа_Key",
         ]
         
-        # Фильтр активных заказов:
+        # Фильтр заказов для расчёта:
         # - DeletionMark == false
-        # - СостояниеЗаказа_Key != DONE_STATE_KEY
+        # - Posted == true
+        # Завершённые заказы намеренно синхронизируем: они должны попадать в
+        # общую базу и участвовать в расчётах, а UI скрывает их отдельным правилом.
         # Дублируем фильтрацию в коде, т.к. 1С/прокси иногда частично игнорируют условия.
-        DONE_STATE_KEY = _norm_guid("ad28565a-991b-11eb-e39a-fa163e61326a")
         # Серверный фильтр:
         # - Posted eq true (1С корректно фильтрует опубликованные)
-        # - СостояниеЗаказа_Key != guid'...' (Завершен)
         # DeletionMark фильтруем в коде, т.к. 1С игнорирует этот фильтр.
-        default_filter = (
-            "Posted eq true and "
-            f"(СостояниеЗаказа_Key ne guid'{DONE_STATE_KEY}')"
-        )
+        default_filter = "Posted eq true"
 
         # Даже если клиент прислал кастомный select_fields, принудительно добавляем
         # поля, нужные для корректной фильтрации активных заказов.
@@ -189,7 +186,6 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
 
         # Дублируем фильтр на уровне приложения: 1С / прокси иногда игнорируют часть условий.
         removed_by_dm = 0
-        removed_by_state = 0
         removed_by_posted = 0
         removed_by_missing_filter_fields = 0
         filtered_orders = []
@@ -212,10 +208,6 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
                 removed_by_posted += 1
                 continue
             
-            state_key = _norm_guid(rec.get("СостояниеЗаказа_Key"))
-            if state_key and state_key == DONE_STATE_KEY:
-                removed_by_state += 1
-                continue
             filtered_orders.append(rec)
 
         print(
@@ -223,7 +215,6 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
             f"отфильтровано missing filter fields: {removed_by_missing_filter_fields}, "
             f"отфильтровано DeletionMark=true: {removed_by_dm}, "
             f"отфильтровано Posted=false: {removed_by_posted}, "
-            f"отфильтровано state=DONE: {removed_by_state}, "
             f"итого к обработке: {len(filtered_orders)}"
         )
         order_data = filtered_orders

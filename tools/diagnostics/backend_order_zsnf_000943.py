@@ -302,7 +302,7 @@ def main():
         {
             "$format": "json",
             "$select": "Ref_Key,Number,Date,Posted,DeletionMark,СостояниеЗаказа_Key",
-            "$filter": "DeletionMark eq false and Posted eq true and СостояниеЗаказа ne Catalog_СостоянияЗаказовНаПроизводство.Завершен",
+            "$filter": "DeletionMark eq false and Posted eq true",
             "$orderby": "Number",
             "$top": "100"
         }
@@ -318,10 +318,10 @@ def main():
         print("  ❌ Заказы не получены")
     
     # =====================================================================
-    # Шаг 10: Исправленный фильтр (по GUID)
+    # Шаг 10: Текущий фильтр без исключения завершённых
     # =====================================================================
     print("\n\n" + "="*80)
-    print("ШАГ 10: Исправленный фильтр (по GUID)")
+    print("ШАГ 10: Текущий фильтр без исключения завершённых")
     print("="*80)
     
     result = make_request(
@@ -329,12 +329,12 @@ def main():
         {
             "$format": "json",
             "$select": "Ref_Key,Number,Date,Posted,DeletionMark,СостояниеЗаказа_Key",
-            "$filter": "DeletionMark eq false and Posted eq true and (СостояниеЗаказа_Key ne guid'ad28565a-991b-11eb-e39a-fa163e61326a')",
+            "$filter": "DeletionMark eq false and Posted eq true",
             "$orderby": "Number",
             "$top": "100"
         }
     )
-    print_result("Шаг 10: Исправленный фильтр (GUID)", result)
+    print_result("Шаг 10: Текущий фильтр", result)
     print("\n📋 Номера заказов из Шага 10 (первые 30):")
     if result and isinstance(result, dict) and "value" in result:
         for item in result["value"][:30]:
@@ -345,10 +345,10 @@ def main():
         print("  ❌ Заказы не получены")
     
     # =====================================================================
-    # Шаг 11: Проверка ЗСНФ-000943 с фильтром по GUID
+    # Шаг 11: Проверка ЗСНФ-000943 с текущим фильтром
     # =====================================================================
     print("\n\n" + "="*80)
-    print("ШАГ 11: Проверка ЗСНФ-000943 с фильтром по GUID")
+    print("ШАГ 11: Проверка ЗСНФ-000943 с текущим фильтром")
     print("="*80)
     
     result = make_request(
@@ -356,10 +356,10 @@ def main():
         {
             "$format": "json",
             "$select": "Ref_Key,Number,Date,Posted,DeletionMark,СостояниеЗаказа_Key",
-            "$filter": "Number eq 'ЗСНФ-000943' and DeletionMark eq false and Posted eq true and (СостояниеЗаказа_Key ne guid'ad28565a-991b-11eb-e39a-fa163e61326a')"
+            "$filter": "Number eq 'ЗСНФ-000943' and DeletionMark eq false and Posted eq true"
         }
     )
-    print_result("Шаг 11: ЗСНФ-000943 с фильтром по GUID", result)
+    print_result("Шаг 11: ЗСНФ-000943 с текущим фильтром", result)
     
     # =====================================================================
     # ИТОГИ

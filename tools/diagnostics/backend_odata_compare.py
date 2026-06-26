@@ -41,10 +41,10 @@ def query(name, filter, orderby="Ref_Key", top=1000):
 
 # Запрос 1: Как в программе (orderby=Ref_Key)
 query("1. Программа (orderby=Ref_Key)", 
-      "DeletionMark eq false and (СостояниеЗаказа_Key ne guid'ad28565a-991b-11eb-e39a-fa163e61326a')",
+      "DeletionMark eq false and Posted eq true",
       orderby="Ref_Key")
 
 # Запрос 2: Как в моём скрипте (orderby=Number)
 query("2. Мой скрипт (orderby=Number)", 
-      "DeletionMark eq false and (СостояниеЗаказа_Key ne guid'ad28565a-991b-11eb-e39a-fa163e61326a')",
+      "DeletionMark eq false and Posted eq true",
       orderby="Number")
