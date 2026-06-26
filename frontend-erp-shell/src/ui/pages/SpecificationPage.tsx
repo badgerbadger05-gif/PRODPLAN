@@ -101,6 +101,7 @@ export function SpecificationPage() {
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
   const [repairAction, setRepairAction] = useState<RepairAction | null>(null)
+  const [picking, setPicking] = useState(false)
 
   const rows = useMemo(() => flatten(loaded?.nodes ?? []), [loaded])
   const filteredRows = useFilteredRows(rows, treeFilter)
@@ -116,11 +117,17 @@ export function SpecificationPage() {
     setMessage('')
     try {
       const data = await searchSpecificationItems({ q: query.trim(), limit: 60 })
-      setSearchItems(data.items ?? [])
-      if ((data.items ?? []).length === 1) {
-        await loadItem(data.items[0])
+      const items = data.items ?? []
+      setSearchItems(items)
+      if (items.length === 1) {
+        await loadItem(items[0])
+      } else if (items.length === 0) {
+        setPicking(false)
+        setMessage('Ничего не найдено')
       } else {
-        setMessage(`Найдено позиций: ${(data.items ?? []).length}`)
+        // Несколько совпадений — показываем выбор (в т.ч. поверх уже загруженного изделия).
+        setPicking(true)
+        setMessage(`Найдено позиций: ${items.length}`)
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -133,6 +140,7 @@ export function SpecificationPage() {
     setLoading(true)
     setError('')
     setMessage('')
+    setPicking(false)
     try {
       const [tree, flattened, whereUsed, quality] = await Promise.all([
         getSpecificationFull({ item_id: item.item_id, root_qty: rootQty, max_depth: 20 }),
@@ -477,6 +485,37 @@ export function SpecificationPage() {
               </aside>
             </div>
           </>
+        )}
+
+        {loaded && picking && searchItems.length > 0 && (
+          <div className="dialogOverlay" onClick={(e) => e.target === e.currentTarget && setPicking(false)}>
+            <div className="dialogBox bomPickerBox">
+              <div className="dialogHeader">Найдено позиций: {searchItems.length} — выберите</div>
+              <div className="dialogBody">
+                <table className="journalTable bomSearchTable">
+                  <thead>
+                    <tr><th>Номенклатура</th><th>Код</th><th>Спецификация</th><th>Метод</th></tr>
+                  </thead>
+                  <tbody>
+                    {searchItems.map((item) => (
+                      <tr key={item.item_id} onDoubleClick={() => void loadItem(item)}>
+                        <td className="itemCell"><strong>{item.item_name}</strong><span>{item.item_article || ''}</span></td>
+                        <td>{item.item_code}</td>
+                        <td>
+                          <button onClick={() => void loadItem(item)} disabled={loading || !item.spec_id}>Открыть</button>
+                          <span className={`miniPill ${item.spec_id ? 'ready' : 'failed'}`}>{item.spec_id ? `#${item.spec_id}` : 'нет'}</span>
+                        </td>
+                        <td>{item.replenishment_method || ''}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="dialogFooter">
+                <button onClick={() => setPicking(false)}>Закрыть</button>
+              </div>
+            </div>
+          </div>
         )}
 
         {repairAction && loaded && (

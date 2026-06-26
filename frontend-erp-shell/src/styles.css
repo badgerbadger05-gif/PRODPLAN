@@ -1245,6 +1245,10 @@ input:focus, select:focus {
   padding-top: 8px;
 }
 
+.bomPickerBox {
+  width: min(760px, calc(100vw - 48px));
+}
+
 .dialogHint {
   color: var(--muted);
   font-size: 12px;
