@@ -19,7 +19,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Dict, List, Optional, Tuple
 
-from sqlalchemy import func
+from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from ..models import (
@@ -31,6 +31,24 @@ from ..models import (
     ProductionProduct,
     StockWarehouse,
 )
+
+
+_DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
+
+
+def _production_supply_qty_expr():
+    done_state = func.lower(func.coalesce(ProductionOrder.order_state_key, "")) == _DONE_STATE_KEY
+    produced_qty = func.coalesce(ProductionProduct.produced_qty, 0.0)
+    return case(
+        (
+            done_state,
+            case(
+                (produced_qty > 0, produced_qty),
+                else_=func.coalesce(ProductionProduct.quantity, 0.0),
+            ),
+        ),
+        else_=func.coalesce(ProductionProduct.remaining_qty, 0.0),
+    )
 
 
 def effective_stock_by_item_all(db: Session) -> Dict[int, float]:
@@ -114,10 +132,9 @@ def active_wip_eta_by_item(db: Session) -> Dict[int, List[Tuple[Optional[date], 
 
     Active filter:
       - production_orders.deletion_mark = false
-      - completed 1C orders are included intentionally: they still represent
-        supply for repeated MRP calculations when direct 1C completion is the
-        first signal PRODPLAN receives.
-      - production_products.remaining_qty > 0
+      - completed 1C orders are included intentionally: for them supply is
+        produced_qty (or quantity if fact was not linked), not remaining_qty.
+      - effective supply qty > 0
 
     ETA source:
       - production_order_line_states.planned_finish_date (the operational
@@ -127,11 +144,12 @@ def active_wip_eta_by_item(db: Session) -> Dict[int, List[Tuple[Optional[date], 
         That keeps results stable for orders that haven't been scheduled yet,
         while letting scheduled orders correctly tie to their bucket.
     """
+    supply_qty = _production_supply_qty_expr()
     rows = (
         db.query(
             ProductionProduct.item_id,
             ProductionOrderLineState.planned_finish_date,
-            func.coalesce(ProductionProduct.remaining_qty, 0.0).label("remaining_qty"),
+            supply_qty.label("remaining_qty"),
         )
         .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
         .outerjoin(
@@ -139,7 +157,7 @@ def active_wip_eta_by_item(db: Session) -> Dict[int, List[Tuple[Optional[date], 
             ProductionOrderLineState.product_id == ProductionProduct.product_id,
         )
         .filter(ProductionOrder.deletion_mark.is_(False))
-        .filter(func.coalesce(ProductionProduct.remaining_qty, 0.0) > 0)
+        .filter(supply_qty > 0)
         .all()
     )
 

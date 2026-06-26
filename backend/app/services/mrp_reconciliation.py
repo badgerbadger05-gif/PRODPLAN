@@ -24,8 +24,9 @@ Idempotency
 -----------
 The snapshot's gross demand is re-derived from its anchored level-0 roots
 through current stock (``_current_snapshot_gross_by_item``), then the gap is
-sized as ``net - open WIP`` (open journal lines with ``remaining_qty > 0``,
-both 1C and local). So once this service materialises a catch-up production
+sized as ``net - effective production supply`` (open local/1C lines by
+``remaining_qty`` plus completed 1C lines by actual produced quantity). So
+once this service materialises a catch-up production
 order, that order becomes open WIP and the next run nets it out — the gap
 returns to zero and no duplicate is created. For purchases, the gap is
 additionally deduped against supplier orders already arriving and
@@ -36,7 +37,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import func, or_
+from sqlalchemy import case, func, or_
 from sqlalchemy.orm import Session
 
 from ..models import (
@@ -78,6 +79,21 @@ EPS = 1e-9
 FIXED_SNAPSHOT_STATUS = "FIXED_SNAPSHOT"
 PRODUCTION_ORDER_ENTITY = "Document_ЗаказНаПроизводство"
 DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
+
+
+def _production_supply_qty_expr():
+    done_state = func.lower(func.coalesce(ProductionOrder.order_state_key, "")) == DONE_STATE_KEY
+    produced_qty = func.coalesce(ProductionProduct.produced_qty, 0.0)
+    return case(
+        (
+            done_state,
+            case(
+                (produced_qty > 0, produced_qty),
+                else_=func.coalesce(ProductionProduct.quantity, 0.0),
+            ),
+        ),
+        else_=func.coalesce(ProductionProduct.remaining_qty, 0.0),
+    )
 
 
 def _latest_active_snapshot_run_ids(db: Session) -> List[int]:
@@ -167,10 +183,12 @@ def _active_production_qty_by_item(db: Session, item_ids: List[int]) -> Dict[int
     """Open production/WIP quantity per item, including 1C and local rows."""
     if not item_ids:
         return {}
+    supply_qty = _production_supply_qty_expr()
+    done_state = func.lower(func.coalesce(ProductionOrder.order_state_key, "")) == DONE_STATE_KEY
     rows = (
         db.query(
             ProductionProduct.item_id,
-            func.sum(func.coalesce(ProductionProduct.remaining_qty, 0.0)).label("qty"),
+            func.sum(supply_qty).label("qty"),
         )
         .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
         .outerjoin(
@@ -179,8 +197,13 @@ def _active_production_qty_by_item(db: Session, item_ids: List[int]) -> Dict[int
         )
         .filter(ProductionProduct.item_id.in_([int(iid) for iid in item_ids]))
         .filter(ProductionOrder.deletion_mark == False)
-        .filter(func.coalesce(ProductionProduct.remaining_qty, 0.0) > 0)
-        .filter(func.coalesce(ProductionOrderLineState.status, "shortage").notin_(("completed", "cancelled")))
+        .filter(supply_qty > 0)
+        .filter(
+            or_(
+                done_state,
+                func.coalesce(ProductionOrderLineState.status, "shortage").notin_(("completed", "cancelled")),
+            )
+        )
         .group_by(ProductionProduct.item_id)
         .all()
     )

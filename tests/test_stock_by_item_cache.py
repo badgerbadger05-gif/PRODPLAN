@@ -903,7 +903,7 @@ def test_get_active_1c_remaining_by_item_includes_done_but_filters_deleted_and_n
     db.commit()
 
     rem = _get_active_1c_remaining_by_item(db)
-    assert rem.get(item.item_id) == 12.0
+    assert rem.get(item.item_id) == 8.0
 
 
 def test_active_remaining_counts_mrp_sourced_production_orders(db_session):

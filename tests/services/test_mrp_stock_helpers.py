@@ -199,3 +199,21 @@ def test_active_wip_eta_skips_zero_remaining(db_session):
 
     result = active_wip_eta_by_item(db)
     assert item.item_id not in result
+
+
+def test_active_wip_eta_counts_completed_zero_remaining_by_produced_qty(db_session):
+    db = db_session
+    item = _mk_item(db, code="WIP-DONE-Z", stock=0.0)
+    product = _mk_active_wip(
+        db,
+        item,
+        remaining=5.0,
+        planned_finish=None,
+        order_state_key="ad28565a-991b-11eb-e39a-fa163e61326a",
+    )
+    product.produced_qty = 5.0
+    product.remaining_qty = 0.0
+    db.commit()
+
+    result = active_wip_eta_by_item(db)
+    assert result[item.item_id] == [(None, 5.0)]

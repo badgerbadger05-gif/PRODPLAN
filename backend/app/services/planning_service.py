@@ -4,7 +4,7 @@ from datetime import datetime, date, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple, Set, DefaultDict, Callable
 
 from sqlalchemy.orm import Session, load_only
-from sqlalchemy import func, and_, asc, desc
+from sqlalchemy import case, func, and_, asc, desc
 from collections import defaultdict
 import json
 import re
@@ -316,6 +316,21 @@ DEFAULT_PAGE_LIMIT = 50
 
 # 1C state key for completed production orders.
 DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
+
+
+def _production_supply_qty_expr():
+    done_state = func.lower(func.coalesce(ProductionOrder.order_state_key, "")) == DONE_STATE_KEY
+    produced_qty = func.coalesce(ProductionProduct.produced_qty, 0.0)
+    return case(
+        (
+            done_state,
+            case(
+                (produced_qty > 0, produced_qty),
+                else_=func.coalesce(ProductionProduct.quantity, 0.0),
+            ),
+        ),
+        else_=func.coalesce(ProductionProduct.remaining_qty, 0.0),
+    )
 # Состояния заказа поставщику, НЕ учитываемые как ожидаемое поступление в MRP.
 # Производная от канонической карты фаз (см. supplier_order_status): всё, что не
 # относится к фазам «в пути» / «на складе». Сохранена для обратной совместимости
@@ -2418,17 +2433,19 @@ def _get_active_production_remaining_by_item(db: Session) -> Dict[int, float]:
     - completed 1C orders are included intentionally: some direct 1C orders
       only become visible to PRODPLAN after completion, but still must reduce
       the net requirement of subsequent MRP runs.
-    - production_products.remaining_qty > 0
+    - effective supply qty > 0; completed 1C orders use produced_qty (or
+      quantity if fact was not linked), other orders use remaining_qty.
     """
     try:
+        supply_qty = _production_supply_qty_expr()
         rows = (
             db.query(
                 ProductionProduct.item_id,
-                func.sum(func.coalesce(ProductionProduct.remaining_qty, 0.0)).label("remaining_qty"),
+                func.sum(supply_qty).label("remaining_qty"),
             )
             .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
             .filter(ProductionOrder.deletion_mark.is_(False))
-            .filter(func.coalesce(ProductionProduct.remaining_qty, 0.0) > 0)
+            .filter(supply_qty > 0)
             .group_by(ProductionProduct.item_id)
             .all()
         )
@@ -2616,22 +2633,23 @@ def _build_component_reservations_from_active_1c(
     """
     Build recursive component reservation map from active 1C orders.
 
-    For each active 1C order line with remaining_qty > 0:
-      reserve(component) += remaining_qty * qty_per_unit
+    For each active 1C order line with effective supply qty > 0:
+      reserve(component) += supply_qty * qty_per_unit
     with recursive BOM explosion and cycle protection.
     """
     warnings: List[Dict[str, Any]] = []
     reserved_by_component: DefaultDict[int, float] = defaultdict(float)
 
     try:
+        supply_qty = _production_supply_qty_expr()
         seed_rows = (
             db.query(
                 ProductionProduct.item_id,
-                func.sum(func.coalesce(ProductionProduct.remaining_qty, 0.0)).label("remaining_qty"),
+                func.sum(supply_qty).label("remaining_qty"),
             )
             .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
             .filter(ProductionOrder.deletion_mark.is_(False))
-            .filter(func.coalesce(ProductionProduct.remaining_qty, 0.0) > 0)
+            .filter(supply_qty > 0)
             .group_by(ProductionProduct.item_id)
             .all()
         )
