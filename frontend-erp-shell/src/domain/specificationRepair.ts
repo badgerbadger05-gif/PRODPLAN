@@ -31,6 +31,12 @@ export type AddRequest = {
   dry_run: boolean
 }
 
+export type RemoveRequest = {
+  component_id: number
+  force?: boolean
+  dry_run: boolean
+}
+
 export type KindChangePreviewRequest = {
   item_id: number
   new_production_kind_id: number
@@ -86,6 +92,23 @@ export type AddResult = {
   stage_id: number | null
   component_type: string
   warnings: AddWarning[]
+  pending_1c: PendingOneC
+  dry_run: boolean
+  writeback_1c?: Writeback1C
+}
+
+export type RemoveResult = {
+  action: 'remove'
+  ok: boolean
+  component_id: number
+  item_id: number
+  spec_id: number
+  safety: {
+    global_presence_after: number
+    specs_before: number[]
+    specs_after: number[]
+  }
+  warnings: unknown[]
   pending_1c: PendingOneC
   dry_run: boolean
   writeback_1c?: Writeback1C

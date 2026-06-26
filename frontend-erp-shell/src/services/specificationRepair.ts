@@ -6,6 +6,8 @@ import type {
   MoveRequest,
   MoveResult,
   ProductionKind,
+  RemoveRequest,
+  RemoveResult,
   RestageRequest,
   RestageResult,
   StageOption,
@@ -24,6 +26,10 @@ export function repairMove(req: MoveRequest) {
 
 export function repairAdd(req: AddRequest) {
   return api<AddResult>(`${BASE}/add`, { method: 'POST', body: JSON.stringify(req) })
+}
+
+export function repairRemove(req: RemoveRequest) {
+  return api<RemoveResult>(`${BASE}/remove`, { method: 'POST', body: JSON.stringify(req) })
 }
 
 export function repairKindChangePreview(req: KindChangePreviewRequest) {

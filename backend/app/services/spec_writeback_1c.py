@@ -259,6 +259,29 @@ def writeback_move(
     return _guard("move", _run)
 
 
+def writeback_remove(
+    client: Any,
+    *,
+    spec_ref: str,
+    nomenclature_key: str,
+    child_spec_key: Optional[str],
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """remove в 1С: POP совпавшей строки из состава и PATCH оставшихся."""
+    def _run():
+        sb = SpecWriteback(client, dry_run=dry_run)
+        rows = sb.read_sostav(spec_ref)
+        remaining, popped = pop_row(rows, nomenclature_key=nomenclature_key, child_spec_key=child_spec_key)
+        if popped is None:
+            raise SpecWritebackError(
+                f"remove: строка не найдена в спеке 1С (spec={spec_ref}, ном={nomenclature_key})"
+            )
+        res = sb.patch_sostav(spec_ref, remaining)
+        return {"op": "remove", "removed": 1, "rows": len(remaining), "patch": res}
+
+    return _guard("remove", _run)
+
+
 def writeback_add(
     client: Any,
     *,

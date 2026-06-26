@@ -197,6 +197,73 @@ def test_move_same_spec_returns_400(client, db_session):
     assert resp.status_code == 400
 
 
+def test_remove_dry_run_previews_without_change(client, db_session):
+    a, b, part, comp = _seed_move(db_session)
+
+    resp = client.post(f"{API}/remove", json={"component_id": comp.component_id, "force": True})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["action"] == "remove" and body["dry_run"] is True
+    assert body["spec_id"] == a.spec_id
+    assert set(body["pending_1c"]["specs"]) == {a.spec_id}
+    # dry-run строку не удалил
+    assert db_session.query(SpecComponent).filter_by(component_id=comp.component_id).count() == 1
+
+
+def test_remove_orphan_without_force_returns_400(client, db_session):
+    a, b, part, comp = _seed_move(db_session)  # part стоит только в спеке a
+
+    resp = client.post(f"{API}/remove", json={"component_id": comp.component_id})
+
+    assert resp.status_code == 400
+    assert "вне всех спецификаций" in resp.json()["detail"]
+    # строка на месте
+    assert db_session.query(SpecComponent).filter_by(component_id=comp.component_id).count() == 1
+
+
+def test_remove_orphan_with_force_apply_writes_to_1c(client, db_session, fake_1c):
+    a, b, part, comp = _seed_move(db_session)
+    fc = fake_1c(specs={"a": [{"Номенклатура_Key": "p",
+                              "Спецификация_Key": "00000000-0000-0000-0000-000000000000",
+                              "Этап_Key": "st", "Количество": 1}]})
+
+    resp = client.post(
+        f"{API}/remove",
+        json={"component_id": comp.component_id, "force": True, "dry_run": False},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["writeback_1c"]["op"] == "remove" and body["writeback_1c"]["removed"] == 1
+    # 1С: строка удалена -> состав пуст
+    _, payload = fc.patches[0]
+    assert payload["Состав"] == []
+    # локальная БД-зеркало: строки больше нет
+    assert db_session.query(SpecComponent).filter_by(component_id=comp.component_id).count() == 0
+
+
+def test_remove_non_orphan_succeeds_without_force(client, db_session, fake_1c):
+    a, b, part, comp = _seed_move(db_session)
+    # та же деталь стоит и в спеке b -> удаление из a не осиротит
+    db_session.add(SpecComponent(spec_id=b.spec_id, item_id=part.item_id, quantity=1,
+                                 component_type="Сборка"))
+    db_session.commit()
+    fc = fake_1c(specs={"a": [{"Номенклатура_Key": "p",
+                              "Спецификация_Key": "00000000-0000-0000-0000-000000000000",
+                              "Этап_Key": "st", "Количество": 1}]})
+
+    resp = client.post(
+        f"{API}/remove",
+        json={"component_id": comp.component_id, "dry_run": False},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["safety"]["global_presence_after"] == 1
+    assert db_session.query(SpecComponent).filter_by(spec_id=a.spec_id).count() == 0
+    assert db_session.query(SpecComponent).filter_by(spec_id=b.spec_id).count() == 1
+
+
 def test_add_apply_inserts(client, db_session, fake_1c):
     sp = Specification(spec_code="S", spec_name="S", spec_ref1c="s")
     it = Item(item_code="X", item_name="X", item_ref1c="x", unit="PCE")

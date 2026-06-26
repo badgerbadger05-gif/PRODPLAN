@@ -194,6 +194,56 @@ def move_component(
     return result
 
 
+def remove_component(
+    db: Session,
+    *,
+    component_id: int,
+    force: bool = False,
+    dry_run: bool = True,
+) -> Dict[str, Any]:
+    """Убрать компонент из спецификации (явное удаление строки состава).
+
+    Защита: если удаление оставит деталь вне всех спецификаций (глобальное присутствие
+    падает до нуля) — требуем явный force. Иначе обычное удаление неиспользуемой больше
+    нигде строки (как «Чека толкач») просто проводится.
+    """
+    comp = _get_component(db, component_id)
+    spec_id = int(comp.spec_id)
+    item_id = int(comp.item_id)
+
+    specs_before = specs_containing_item(db, item_id)
+
+    db.delete(comp)
+    db.flush()
+
+    presence_after = _global_presence(db, item_id)
+    if presence_after < 1 and not force:
+        db.rollback()
+        raise SpecRepairError(
+            "Удаление оставит деталь вне всех спецификаций (используйте force для подтверждения)"
+        )
+
+    specs_after = specs_containing_item(db, item_id)
+
+    result = {
+        "action": "remove",
+        "ok": True,
+        "component_id": int(component_id),
+        "item_id": item_id,
+        "spec_id": spec_id,
+        "safety": {
+            "global_presence_after": int(presence_after),
+            "specs_before": specs_before,
+            "specs_after": specs_after,
+        },
+        "warnings": [],
+        "pending_1c": _pending_1c([spec_id]),
+        "dry_run": bool(dry_run),
+    }
+    _finish(db, dry_run)
+    return result
+
+
 def add_component(
     db: Session,
     *,
@@ -396,6 +446,19 @@ def build_add_plan(
         "stage_key": _stage_ref(db, stage_id),
         "component_type": component_type,
         "child_spec_key": _norm_component_spec_ref(component_spec_ref1c),
+    }
+
+
+def build_remove_plan(db: Session, *, component_id: int) -> Dict[str, Any]:
+    """Ключи 1С для remove: из какой спеки вынуть какую строку состава."""
+    comp = _get_component(db, component_id)
+    spec = _require_spec(db, comp.spec_id)
+    item = db.query(Item).filter_by(item_id=int(comp.item_id)).first()
+    return {
+        "op": "remove",
+        "spec_ref": _require_spec_ref(spec),
+        "nomenclature_key": (item.item_ref1c if item else None),
+        "child_spec_key": comp.component_spec_ref1c,
     }
 
 

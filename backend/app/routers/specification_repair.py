@@ -45,6 +45,12 @@ class AddRequest(BaseModel):
     dry_run: bool = True
 
 
+class RemoveRequest(BaseModel):
+    component_id: int
+    force: bool = False
+    dry_run: bool = True
+
+
 class KindChangePreviewRequest(BaseModel):
     item_id: int
     new_production_kind_id: int
@@ -149,6 +155,36 @@ def add(req: AddRequest, db: Session = Depends(get_db)) -> dict:
             stage_id=req.stage_id,
             component_spec_ref1c=req.component_spec_ref1c,
             dry_run=req.dry_run,
+        )
+        if writeback is not None:
+            result["writeback_1c"] = writeback
+        return result
+    except SpecRepairError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except SpecWritebackError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@router.post("/remove")
+def remove(req: RemoveRequest, db: Session = Depends(get_db)) -> dict:
+    try:
+        writeback = None
+        if not req.dry_run:
+            # Сначала валидируем безопасность (осиротение/force) на dry-run — ДО записи в
+            # 1С. Иначе при отказе локальной мутации строка осталась бы удалённой в 1С.
+            spec_repair.remove_component(
+                db, component_id=req.component_id, force=req.force, dry_run=True
+            )
+            plan = spec_repair.build_remove_plan(db, component_id=req.component_id)
+            writeback = spec_writeback_1c.writeback_remove(
+                spec_writeback_1c.build_client_from_config(),
+                spec_ref=plan["spec_ref"],
+                nomenclature_key=plan["nomenclature_key"],
+                child_spec_key=plan["child_spec_key"],
+                dry_run=False,
+            )
+        result = spec_repair.remove_component(
+            db, component_id=req.component_id, force=req.force, dry_run=req.dry_run
         )
         if writeback is not None:
             result["writeback_1c"] = writeback

@@ -464,6 +464,11 @@ export function SpecificationPage() {
                     title="Добавить компонент в спецификацию выбранного узла"
                   >Добавить компонент</button>
                   <button
+                    onClick={() => setRepairAction('remove')}
+                    disabled={!selectedNode || selectedNode.type !== 'item' || selectedNode.componentId == null}
+                    title="Убрать компонент из спецификации (с подтверждением)"
+                  >Убрать компонент</button>
+                  <button
                     onClick={() => setRepairAction('kind')}
                     disabled={!selectedNode || selectedNode.type !== 'item' || !nodeItemId(selectedNode)}
                     title="Превью каскада смены вида производства"
@@ -476,6 +481,7 @@ export function SpecificationPage() {
 
         {repairAction && loaded && (
           <SpecRepairDialog
+            key={`${repairAction}-${selectedNode?.id ?? 'root'}`}
             action={repairAction}
             node={selectedNode}
             rootItem={loaded.item}

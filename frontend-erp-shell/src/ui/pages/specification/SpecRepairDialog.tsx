@@ -5,6 +5,7 @@ import type {
   KindChangePreviewResult,
   MoveResult,
   ProductionKind,
+  RemoveResult,
   RestageResult,
   StageOption,
 } from '../../../domain/specificationRepair'
@@ -14,16 +15,18 @@ import {
   repairAdd,
   repairKindChangePreview,
   repairMove,
+  repairRemove,
   repairRestage,
 } from '../../../services/specificationRepair'
 import { searchSpecificationItems } from '../../../services/specification'
 
-export type RepairAction = 'restage' | 'move' | 'add' | 'kind'
+export type RepairAction = 'restage' | 'move' | 'add' | 'remove' | 'kind'
 
 const TITLES: Record<RepairAction, string> = {
   restage: 'Сменить этап компонента',
   move: 'Перенести компонент в другую спецификацию',
   add: 'Добавить компонент в спецификацию',
+  remove: 'Убрать компонент из спецификации',
   kind: 'Смена вида производства — превью каскада',
 }
 
@@ -41,7 +44,7 @@ function nodeTitle(node: SpecNode | null) {
   return node.type === 'operation' ? node.operation?.name || 'Операция' : node.name || 'Номенклатура'
 }
 
-type RepairResult = RestageResult | MoveResult | AddResult | KindChangePreviewResult
+type RepairResult = RestageResult | MoveResult | AddResult | RemoveResult | KindChangePreviewResult
 
 type Props = {
   action: RepairAction
@@ -64,9 +67,12 @@ export function SpecRepairDialog({ action, node, rootItem, treeRows, onClose, on
   const [errorText, setErrorText] = useState('')
   const [result, setResult] = useState<RepairResult | null>(null)
 
-  // move
+  // move / remove
   const [targetSpecId, setTargetSpecId] = useState<string>('')
   const [force, setForce] = useState(false)
+
+  // remove
+  const [confirmRemove, setConfirmRemove] = useState(false)
 
   // add
   const [addItemQuery, setAddItemQuery] = useState('')
@@ -145,12 +151,16 @@ export function SpecRepairDialog({ action, node, rootItem, treeRows, onClose, on
       if (!addItem) return 'Выберите номенклатуру для добавления.'
       if (!(addQty > 0)) return 'Количество должно быть больше нуля.'
     }
+    if (action === 'remove') {
+      if (componentId == null) return 'Выберите строку состава (компонент, не корень).'
+      if (!confirmRemove) return 'Поставьте галку подтверждения удаления.'
+    }
     if (action === 'kind') {
       if (itemId == null) return 'Не удалось определить номенклатуру узла.'
       if (!newKindId.trim()) return 'Выберите новый вид производства.'
     }
     return ''
-  }, [action, refError, componentId, targetSpecId, addSpecId, addItem, addQty, itemId, newKindId])
+  }, [action, refError, componentId, targetSpecId, addSpecId, addItem, addQty, confirmRemove, itemId, newKindId])
 
   async function submit() {
     if (blocker) return
@@ -181,6 +191,9 @@ export function SpecRepairDialog({ action, node, rootItem, treeRows, onClose, on
           dry_run: dryRun,
         })
         setResult(res)
+      } else if (action === 'remove') {
+        const res = await repairRemove({ component_id: componentId!, force, dry_run: dryRun })
+        setResult(res)
       } else {
         // kind — всегда read-only превью
         const res = await repairKindChangePreview({ item_id: itemId!, new_production_kind_id: Number(newKindId) })
@@ -197,7 +210,7 @@ export function SpecRepairDialog({ action, node, rootItem, treeRows, onClose, on
   }
 
   const isWriteResult = result != null && action !== 'kind'
-  const writeResult = isWriteResult ? (result as RestageResult | MoveResult | AddResult) : null
+  const writeResult = isWriteResult ? (result as RestageResult | MoveResult | AddResult | RemoveResult) : null
   const kindResult = action === 'kind' && result ? (result as KindChangePreviewResult) : null
 
   const stageLabel =
@@ -319,6 +332,23 @@ export function SpecRepairDialog({ action, node, rootItem, treeRows, onClose, on
                     <option key={s.value} value={s.value}>{s.label}</option>
                   ))}
                 </select>
+              </div>
+            </>
+          )}
+
+          {action === 'remove' && (
+            <>
+              <div className="dialogHint">
+                Компонент будет удалён из спецификации. Если деталь больше нигде не
+                используется — отметьте «force», иначе операция не пройдёт.
+              </div>
+              <div className="dialogCheckRow">
+                <input id="repairConfirmRemove" type="checkbox" checked={confirmRemove} onChange={(e) => setConfirmRemove(e.target.checked)} />
+                <label htmlFor="repairConfirmRemove">подтверждаю удаление компонента</label>
+              </div>
+              <div className="dialogCheckRow">
+                <input id="repairRemoveForce" type="checkbox" checked={force} onChange={(e) => setForce(e.target.checked)} />
+                <label htmlFor="repairRemoveForce">force — удалить, даже если деталь останется вне всех спецификаций</label>
               </div>
             </>
           )}
