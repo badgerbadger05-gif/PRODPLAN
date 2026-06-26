@@ -2,6 +2,10 @@ export type SpecNode = {
   id: string
   parentId: string | null
   type: 'item' | 'operation'
+  // componentId — PK строки состава (для ремонта: restage/move). null у корня.
+  componentId?: number | null
+  // specId — собственная спека этой номенклатуры (куда добавлять компоненты). null, если спеки нет.
+  specId?: number | null
   name?: string | null
   article?: string | null
   stage?: { id?: string | number | null; name?: string | null } | null

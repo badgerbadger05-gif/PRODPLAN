@@ -1239,6 +1239,36 @@ input:focus, select:focus {
   margin: 8px 0;
 }
 
+.detailRepairActions {
+  flex-wrap: wrap;
+  border-top: 1px dashed var(--line2);
+  padding-top: 8px;
+}
+
+.dialogHint {
+  color: var(--muted);
+  font-size: 12px;
+  font-style: italic;
+}
+
+.repairItemPick {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px;
+}
+
+.repairItemRow {
+  text-align: left;
+  background: #fff;
+  border: 1px solid var(--line2);
+  font-size: 12px;
+}
+
+.repairItemRow:hover {
+  background: #eef3fb;
+}
+
 .detailPane h3 {
   margin: 12px 0 6px;
   font-size: 14px;

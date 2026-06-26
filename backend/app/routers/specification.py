@@ -342,11 +342,19 @@ def _make_item_node(
     unit: Optional[str],
     has_children: bool,
     warnings: List[str],
+    component_id: Optional[int] = None,
+    spec_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     return {
         "id": f"item:{int(item.item_id)}:{_round_qty(tree_qty, 6)}",
         "parentId": parent_id,
         "type": "item",
+        # component_id — PK строки состава (SpecComponent) в спеке родителя; нужен
+        # ремонтным операциям restage/move. None у корня (он не строка состава).
+        "componentId": (int(component_id) if component_id is not None else None),
+        # specId — собственная спека этой номенклатуры (куда добавлять детей,
+        # цель для переноса). None, если у номенклатуры нет спеки.
+        "specId": (int(spec_id) if spec_id is not None else None),
         "name": str(item.item_name or ""),
         "article": str(item.item_article or "") if item.item_article else None,
         "stage": ({
@@ -436,6 +444,7 @@ def _children_for_item(db: Session, item_id: int, parent_tree_qty: float, parent
         warn: List[str] = []
         if comp.stage_id is None:
             warn.append("NO_STAGE")
+        child_spec_id = _resolve_spec_id_for_item_id(db, int(child_item.item_id))
         child_has_children = _has_children(db, int(child_item.item_id))
         nodes.append(
             _make_item_node(
@@ -447,6 +456,8 @@ def _children_for_item(db: Session, item_id: int, parent_tree_qty: float, parent
                 unit=_unit_label(units_map, child_item.unit),
                 has_children=child_has_children,
                 warnings=warn,
+                component_id=int(comp.component_id),
+                spec_id=child_spec_id,
             )
         )
 
@@ -554,6 +565,7 @@ def get_specification_tree(
             unit=_unit_label(units_map, item.unit),
             has_children=_has_children(db, int(item.item_id)),
             warnings=node_warnings,
+            spec_id=_resolve_spec_id_for_item_id(db, int(item.item_id)),
         )
 
         # Optional pre-expand first level (depth >= 1)
@@ -868,6 +880,7 @@ def _build_full_tree(
         unit=_unit_label(units_map, root_item.unit),
         has_children=_has_children(db, int(root_item.item_id)),
         warnings=[],
+        spec_id=_resolve_spec_id_for_item_id(db, int(root_item.item_id)),
     )
 
     try:

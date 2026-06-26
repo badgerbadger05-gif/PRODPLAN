@@ -17,6 +17,7 @@ import {
 } from '../../services/specification'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
+import { SpecRepairDialog, type RepairAction } from './specification/SpecRepairDialog'
 
 type BomTab = 'tree' | 'flat' | 'where-used' | 'quality'
 
@@ -99,6 +100,7 @@ export function SpecificationPage() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
+  const [repairAction, setRepairAction] = useState<RepairAction | null>(null)
 
   const rows = useMemo(() => flatten(loaded?.nodes ?? []), [loaded])
   const filteredRows = useFilteredRows(rows, treeFilter)
@@ -446,9 +448,45 @@ export function SpecificationPage() {
                   <button onClick={() => setTab('where-used')}>Где используется</button>
                   <button onClick={() => setTab('quality')}>Качество</button>
                 </div>
+                <div className="detailActions detailRepairActions">
+                  <button
+                    onClick={() => setRepairAction('restage')}
+                    disabled={!selectedNode || selectedNode.type !== 'item' || selectedNode.componentId == null}
+                    title="Сменить этап списания этой строки состава"
+                  >Сменить этап</button>
+                  <button
+                    onClick={() => setRepairAction('move')}
+                    disabled={!selectedNode || selectedNode.type !== 'item' || selectedNode.componentId == null}
+                    title="Перенести компонент в другую спецификацию"
+                  >Перенести</button>
+                  <button
+                    onClick={() => setRepairAction('add')}
+                    title="Добавить компонент в спецификацию выбранного узла"
+                  >Добавить компонент</button>
+                  <button
+                    onClick={() => setRepairAction('kind')}
+                    disabled={!selectedNode || selectedNode.type !== 'item' || !nodeItemId(selectedNode)}
+                    title="Превью каскада смены вида производства"
+                  >Сменить вид произв.</button>
+                </div>
               </aside>
             </div>
           </>
+        )}
+
+        {repairAction && loaded && (
+          <SpecRepairDialog
+            action={repairAction}
+            node={selectedNode}
+            rootItem={loaded.item}
+            treeRows={rows}
+            onClose={() => setRepairAction(null)}
+            onApplied={(msg) => {
+              setRepairAction(null)
+              setMessage(msg)
+              void loadItem(loaded.item)
+            }}
+          />
         )}
       </DocumentWindow>
     </main>
