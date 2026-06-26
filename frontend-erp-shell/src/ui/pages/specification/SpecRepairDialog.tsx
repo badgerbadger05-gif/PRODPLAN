@@ -298,7 +298,7 @@ export function SpecRepairDialog({ action, node, rootItem, treeRows, onClose, on
                 <label>Номенклатура</label>
                 {addItem ? (
                   <div className="detailMeta">
-                    <span>{addItem.item_name} ({addItem.item_code})</span>
+                    <span>{addItem.item_name} ({addItem.item_article || addItem.item_code})</span>
                     <button onClick={() => setAddItem(null)}>Сменить</button>
                   </div>
                 ) : (
@@ -317,7 +317,7 @@ export function SpecRepairDialog({ action, node, rootItem, treeRows, onClose, on
                       <div className="dialogPreview repairItemPick">
                         {addSearchItems.map((it) => (
                           <button key={it.item_id} className="repairItemRow" onClick={() => { setAddItem(it); setAddSearchItems([]) }}>
-                            {it.item_name} · {it.item_code}
+                            {it.item_name} · {it.item_article || it.item_code}
                           </button>
                         ))}
                       </div>
