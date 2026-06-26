@@ -368,6 +368,37 @@ def build_restage_plan(db: Session, *, component_id: int, new_stage_id: Optional
     }
 
 
+def build_add_plan(
+    db: Session,
+    *,
+    spec_id: int,
+    item_id: int,
+    quantity: Any,
+    component_type: str = "Сборка",
+    stage_id: Optional[int] = None,
+    component_spec_ref1c: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Ключи 1С для add: в какую спеку добавить какую номенклатуру (с ЕИ и этапом)."""
+    spec = _require_spec(db, spec_id)
+    item = db.query(Item).filter_by(item_id=int(item_id)).first()
+    if not item:
+        raise SpecRepairError(f"Номенклатура не найдена: item_id={item_id}")
+    if not (item.item_ref1c or "").strip():
+        raise SpecRepairError(f"У номенклатуры item_id={item_id} нет item_ref1c — нечего писать в 1С")
+    if stage_id is None:
+        stage_id = _neighbor_stage_id(db, int(spec_id))
+    return {
+        "op": "add",
+        "spec_ref": _require_spec_ref(spec),
+        "nomenclature_key": item.item_ref1c,
+        "unit_key": (item.unit or None),
+        "quantity": quantity,
+        "stage_key": _stage_ref(db, stage_id),
+        "component_type": component_type,
+        "child_spec_key": _norm_component_spec_ref(component_spec_ref1c),
+    }
+
+
 def build_move_plan(db: Session, *, component_id: int, target_spec_id: int, new_stage_id: Optional[int] = None) -> Dict[str, Any]:
     """Ключи 1С для move: вынуть строку из source-спеки и добавить в target-спеку."""
     comp = _get_component(db, component_id)
