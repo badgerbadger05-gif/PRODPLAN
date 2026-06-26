@@ -33,11 +33,6 @@ from ..models import (
 )
 
 
-# Mirrors planning_service.DONE_STATE_KEY — duplicated to avoid a circular
-# import (planning_service itself imports this helper).
-_DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
-
-
 def effective_stock_by_item_all(db: Session) -> Dict[int, float]:
     """
     Return `{item_id: effective_stock}` for every item with warehouse settings
@@ -119,7 +114,9 @@ def active_wip_eta_by_item(db: Session) -> Dict[int, List[Tuple[Optional[date], 
 
     Active filter:
       - production_orders.deletion_mark = false
-      - LOWER(COALESCE(order_state_key, '')) != DONE_STATE_KEY
+      - completed 1C orders are included intentionally: they still represent
+        supply for repeated MRP calculations when direct 1C completion is the
+        first signal PRODPLAN receives.
       - production_products.remaining_qty > 0
 
     ETA source:
@@ -142,9 +139,6 @@ def active_wip_eta_by_item(db: Session) -> Dict[int, List[Tuple[Optional[date], 
             ProductionOrderLineState.product_id == ProductionProduct.product_id,
         )
         .filter(ProductionOrder.deletion_mark.is_(False))
-        .filter(
-            func.lower(func.coalesce(ProductionOrder.order_state_key, "")) != _DONE_STATE_KEY
-        )
         .filter(func.coalesce(ProductionProduct.remaining_qty, 0.0) > 0)
         .all()
     )

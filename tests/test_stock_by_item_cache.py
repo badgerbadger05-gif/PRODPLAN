@@ -850,7 +850,7 @@ def test_active_supplier_remaining_filters_new_cancelled_deleted_and_missing_dat
     }
 
 
-def test_get_active_1c_remaining_by_item_filters_done_deleted_and_nonpositive(db_session):
+def test_get_active_1c_remaining_by_item_includes_done_but_filters_deleted_and_nonpositive(db_session):
     db = db_session
 
     item = Item(
@@ -903,16 +903,15 @@ def test_get_active_1c_remaining_by_item_filters_done_deleted_and_nonpositive(db
     db.commit()
 
     rem = _get_active_1c_remaining_by_item(db)
-    assert rem.get(item.item_id) == 5.0
+    assert rem.get(item.item_id) == 12.0
 
 
 def test_active_remaining_counts_mrp_sourced_production_orders(db_session):
     """
     Plan rule: внутренние MRP-заказы (source='mrp') должны учитываться в
     следующих MRP-расчётах наравне с 1С-заказами. Their order_state_key is
-    NULL (we never set it for internal orders), so the same DONE_STATE_KEY
-    filter that lets active 1C orders through must also let MRP-source ones
-    through. Verify both via the new generic name and the legacy alias.
+    NULL (we never set it for internal orders). Verify both via the new
+    generic name and the legacy alias.
     """
     db = db_session
 

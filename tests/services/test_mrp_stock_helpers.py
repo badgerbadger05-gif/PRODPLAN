@@ -172,13 +172,13 @@ def test_active_wip_eta_includes_remaining_and_finish_date(db_session):
     assert entries == [(None, 6.0), (date(2026, 8, 1), 4.0)]
 
 
-def test_active_wip_eta_skips_deleted_and_done_orders(db_session):
+def test_active_wip_eta_skips_deleted_but_includes_done_orders(db_session):
     db = db_session
     item = _mk_item(db, code="WIP-FILT", stock=0.0)
     _mk_active_wip(db, item, remaining=4.0, planned_finish=date(2026, 8, 1))
     # deleted — must not appear
     _mk_active_wip(db, item, remaining=100.0, planned_finish=None, deletion_mark=True)
-    # done — must not appear
+    # done — still counts as supply for repeated MRP calculations
     _mk_active_wip(
         db, item, remaining=50.0, planned_finish=None,
         order_state_key="ad28565a-991b-11eb-e39a-fa163e61326a",
@@ -187,7 +187,7 @@ def test_active_wip_eta_skips_deleted_and_done_orders(db_session):
 
     result = active_wip_eta_by_item(db)
     entries = result.get(item.item_id, [])
-    assert entries == [(date(2026, 8, 1), 4.0)]
+    assert entries == [(None, 50.0), (date(2026, 8, 1), 4.0)]
 
 
 def test_active_wip_eta_skips_zero_remaining(db_session):

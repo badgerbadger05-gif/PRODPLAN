@@ -179,12 +179,6 @@ def _active_production_qty_by_item(db: Session, item_ids: List[int]) -> Dict[int
         )
         .filter(ProductionProduct.item_id.in_([int(iid) for iid in item_ids]))
         .filter(ProductionOrder.deletion_mark == False)
-        .filter(
-            or_(
-                ProductionOrder.order_state_key.is_(None),
-                func.lower(ProductionOrder.order_state_key) != DONE_STATE_KEY,
-            )
-        )
         .filter(func.coalesce(ProductionProduct.remaining_qty, 0.0) > 0)
         .filter(func.coalesce(ProductionOrderLineState.status, "shortage").notin_(("completed", "cancelled")))
         .group_by(ProductionProduct.item_id)

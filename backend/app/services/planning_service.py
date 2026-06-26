@@ -2415,9 +2415,9 @@ def _get_active_production_remaining_by_item(db: Session) -> Dict[int, float]:
 
     Active filter:
     - deletion_mark == false
-    - order_state_key != DONE_STATE_KEY (1C-side completion);
-      MRP-source orders have NULL order_state_key, which passes the filter
-      via COALESCE('') != DONE_STATE_KEY
+    - completed 1C orders are included intentionally: some direct 1C orders
+      only become visible to PRODPLAN after completion, but still must reduce
+      the net requirement of subsequent MRP runs.
     - production_products.remaining_qty > 0
     """
     try:
@@ -2428,7 +2428,6 @@ def _get_active_production_remaining_by_item(db: Session) -> Dict[int, float]:
             )
             .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
             .filter(ProductionOrder.deletion_mark.is_(False))
-            .filter(func.lower(func.coalesce(ProductionOrder.order_state_key, "")) != DONE_STATE_KEY)
             .filter(func.coalesce(ProductionProduct.remaining_qty, 0.0) > 0)
             .group_by(ProductionProduct.item_id)
             .all()
@@ -2632,7 +2631,6 @@ def _build_component_reservations_from_active_1c(
             )
             .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
             .filter(ProductionOrder.deletion_mark.is_(False))
-            .filter(func.lower(func.coalesce(ProductionOrder.order_state_key, "")) != DONE_STATE_KEY)
             .filter(func.coalesce(ProductionProduct.remaining_qty, 0.0) > 0)
             .group_by(ProductionProduct.item_id)
             .all()
