@@ -1220,13 +1220,17 @@ def get_specification_quality(
             issues.append(_quality_issue(warning, severity, warning, item=current))
     checked_specs = sorted({int(sid) for sid in (_resolve_spec_id_for_item_id(db, int(iid)) for iid in seen_item_ids) if sid})
     for sid in checked_specs:
-        component_seen: Dict[int, int] = {}
+        # Дубль считаем по полному ключу строки (item + закреплённая спека):
+        # один и тот же компонент с разными Спецификация_Key (Сборка/Узел) —
+        # это легальная многоуровневость 1С, а не ошибка.
+        component_seen: Dict[Tuple[int, Optional[str]], int] = {}
         for comp in db.query(SpecComponent).filter(SpecComponent.spec_id == sid).all():
             if _to_float(comp.quantity) <= 0:
                 comp_item = db.query(Item).filter(Item.item_id == comp.item_id).first()
                 issues.append(_quality_issue("NON_POSITIVE_QTY", "error", "Нулевая или отрицательная норма компонента", item=comp_item, spec_id=sid))
-            component_seen[int(comp.item_id)] = component_seen.get(int(comp.item_id), 0) + 1
-        for component_item_id, count in component_seen.items():
+            comp_key = (int(comp.item_id), comp.component_spec_ref1c)
+            component_seen[comp_key] = component_seen.get(comp_key, 0) + 1
+        for (component_item_id, _spec_ref), count in component_seen.items():
             if count > 1:
                 comp_item = db.query(Item).filter(Item.item_id == component_item_id).first()
                 issues.append(_quality_issue("DUPLICATE_COMPONENT", "warning", "Компонент повторяется в одной спецификации", item=comp_item, spec_id=sid))

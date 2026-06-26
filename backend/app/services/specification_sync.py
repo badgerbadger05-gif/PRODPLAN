@@ -9,6 +9,21 @@ from sqlalchemy.orm import Session
 from ..models import Specification, SpecComponent, Operation, SpecOperation, Item, ProductionStage, ProductionKind
 from ..schemas import ODataSyncRequest
 
+_ZERO_GUID = "00000000-0000-0000-0000-000000000000"
+
+
+def _norm_component_spec_ref(value) -> Optional[str]:
+    """
+    Нормализует Спецификация_Key строки состава 1С к каноничному виду.
+
+    Пустая строка и нулевой GUID -> None (компонент идёт по основной спецификации).
+    Иначе — guid в нижнем регистре. Значимо только для строк типа Сборка/Узел.
+    """
+    raw = str(value or "").strip().lower()
+    if not raw or raw == _ZERO_GUID:
+        return None
+    return raw
+
 
 @dataclass
 class SpecificationSyncStats:
@@ -194,8 +209,11 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                 if not current_spec:
                     continue
 
-                # Обрабатываем компоненты спецификации
-                seen_component_item_ids: set[int] = set()
+                # Обрабатываем компоненты спецификации.
+                # Естественный ключ строки состава — тройка (spec_id, item_id, закреплённая спека),
+                # потому что один и тот же компонент может присутствовать в одной спецификации
+                # несколько раз с разными Спецификация_Key (тип Сборка/Узел).
+                seen_component_keys: set[tuple[int, Optional[str]]] = set()
                 for comp_data in components_data:
                     try:
                         comp_ref_key = comp_data.get('Ref_Key', '').strip()
@@ -206,6 +224,7 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                         quantity = comp_data.get('Количество', 0.0)
                         stage_key = comp_data.get('Этап_Key', '').strip()
                         component_type = comp_data.get('ТипСтрокиСостава', 'Материал')
+                        component_spec_ref1c = _norm_component_spec_ref(comp_data.get('Спецификация_Key'))
 
                         # Находим связанные объекты
                         item = existing_items.get(item_key)
@@ -214,12 +233,13 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                         if not item:
                             continue
 
-                        seen_component_item_ids.add(int(item.item_id))
+                        seen_component_keys.add((int(item.item_id), component_spec_ref1c))
 
-                        # Создаем или обновляем компонент
+                        # Создаем или обновляем компонент по полному естественному ключу
                         existing_comp = db.query(SpecComponent).filter_by(
                             spec_id=current_spec.spec_id,
-                            item_id=item.item_id
+                            item_id=item.item_id,
+                            component_spec_ref1c=component_spec_ref1c
                         ).first()
 
                         if existing_comp:
@@ -240,7 +260,8 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                                 item_id=item.item_id,
                                 quantity=quantity,
                                 stage_id=stage.stage_id if stage else None,
-                                component_type=component_type
+                                component_type=component_type,
+                                component_spec_ref1c=component_spec_ref1c
                             )
                             db.add(new_comp)
                             components_created += 1
@@ -249,17 +270,22 @@ def sync_specifications_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                         print(f"Ошибка обработки компонента спецификации {ref_key}: {e}")
                         continue
 
-                # Reconcile: удалить компоненты, которые больше не присутствуют в 1С (только если поле 'Состав' реально выгружено)
+                # Reconcile: удалить строки состава, которых больше нет в 1С
+                # (только если поле 'Состав' реально выгружено). Сверяем по полному
+                # естественному ключу (item_id, закреплённая спека), а не только item_id,
+                # иначе легальные дубли «один компонент с разными спеками» удалялись бы.
                 if can_reconcile_components:
                     try:
-                        q_del = db.query(SpecComponent).filter(SpecComponent.spec_id == current_spec.spec_id)
-                        if seen_component_item_ids:
-                            deleted = (
-                                q_del.filter(~SpecComponent.item_id.in_(list(seen_component_item_ids)))
-                                .delete(synchronize_session=False)
-                            )
-                        else:
-                            deleted = q_del.delete(synchronize_session=False)
+                        deleted = 0
+                        existing_rows = (
+                            db.query(SpecComponent)
+                            .filter(SpecComponent.spec_id == current_spec.spec_id)
+                            .all()
+                        )
+                        for row in existing_rows:
+                            if (int(row.item_id), row.component_spec_ref1c) not in seen_component_keys:
+                                db.delete(row)
+                                deleted += 1
                         if deleted:
                             components_deleted += int(deleted)
                     except Exception as e:

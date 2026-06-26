@@ -69,6 +69,8 @@ PRODUCTION_ORDER_ENTITY = "Document_ЗаказНаПроизводство"
 BASIS_TYPE = "StandardODATA.Document_СборкаЗапасов"
 ORDER_TYPE = "StandardODATA.Document_ЗаказНаПроизводство"
 DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
+PIECEWORK_PRICE_REGISTER = "InformationRegister_ЦеныНоменклатуры"
+DEFAULT_ACCOUNTING_PRICE_TYPE_REF1C = "81c4a02c-991b-11eb-e39a-fa163e61326a"
 
 
 @dataclass
@@ -120,6 +122,131 @@ class PieceworkOperationDefaults:
     stage_ref1c: Optional[str] = None
     operation_lines: Tuple[PieceworkOperationLine, ...] = ()
     structural_unit_ref1c: Optional[str] = None
+
+
+def _piecework_price_type_ref(config: Dict[str, Any]) -> str:
+    return (
+        _config_ref1c(config, "piecework_price_type_ref1c")
+        or _config_ref1c(config, "default_piecework_price_type_ref1c")
+        or _config_ref1c(config, "default_accounting_price_type_ref1c")
+        or DEFAULT_ACCOUNTING_PRICE_TYPE_REF1C
+    )
+
+
+def _datetime_literal_1c(value: Optional[str]) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return _current_1c_datetime()
+    if text.endswith("Z"):
+        text = text[:-1]
+    if "+" in text:
+        text = text.split("+", 1)[0]
+    elif len(text) > 10 and "-" in text[10:]:
+        text = text.rsplit("-", 1)[0]
+    return text
+
+
+def _extract_price_register_value(response: Dict[str, Any]) -> Optional[float]:
+    rows = response.get("value")
+    if isinstance(rows, list):
+        candidates = rows
+    else:
+        candidates = [response]
+    for row in candidates:
+        if not isinstance(row, dict):
+            continue
+        if row.get("Актуальность") is False:
+            continue
+        try:
+            price = float(row.get("Цена") or 0)
+        except (TypeError, ValueError):
+            continue
+        if price > 0:
+            return price
+    return None
+
+
+def _lookup_piecework_operation_price(
+    client: OData1CClient,
+    *,
+    operation_ref: str,
+    price_type_ref: str,
+    at_datetime: str,
+) -> Optional[float]:
+    operation_ref = _clean_ref1c(operation_ref)
+    price_type_ref = _clean_ref1c(price_type_ref)
+    if not operation_ref or not price_type_ref:
+        return None
+    response = client._make_request(
+        f"{PIECEWORK_PRICE_REGISTER}/SliceLast(Period=datetime'{_datetime_literal_1c(at_datetime)}')",
+        params={
+            "$select": "Period,ВидЦен_Key,Номенклатура_Key,Цена,Актуальность",
+            "$filter": (
+                f"Номенклатура_Key eq guid'{operation_ref}' "
+                f"and ВидЦен_Key eq guid'{price_type_ref}'"
+            ),
+            "$top": "1",
+            "$format": "json",
+        },
+        timeout=60,
+        retries=1,
+    )
+    return _extract_price_register_value(response)
+
+
+def _enrich_payload_prices_from_1c(
+    client: OData1CClient,
+    entry: PieceworkExportEntry,
+    payload: Dict[str, Any],
+    *,
+    price_type_ref: str,
+) -> Dict[str, Any]:
+    lookups: List[Dict[str, Any]] = []
+    cache: Dict[str, Optional[float]] = {}
+    at_datetime = str(payload.get("Date") or entry.document_datetime or _current_1c_datetime())
+    for row in payload.get("Операции") or []:
+        operation_ref = _clean_ref1c(row.get("Операция_Key"))
+        if not operation_ref:
+            continue
+        price: Optional[float]
+        error: Optional[str] = None
+        if operation_ref in cache:
+            price = cache[operation_ref]
+        else:
+            try:
+                price = _lookup_piecework_operation_price(
+                    client,
+                    operation_ref=operation_ref,
+                    price_type_ref=price_type_ref,
+                    at_datetime=at_datetime,
+                )
+            except Exception as exc:
+                price = None
+                error = str(exc)
+            cache[operation_ref] = price
+        if price and price > 0:
+            row["Расценка"] = price
+            row["Стоимость"] = float(row.get("КоличествоФакт") or 0) * price
+            source = PIECEWORK_PRICE_REGISTER
+        else:
+            try:
+                existing_price = float(row.get("Расценка") or 0)
+            except (TypeError, ValueError):
+                existing_price = 0.0
+            source = "payload" if existing_price > 0 else "missing"
+        lookups.append({
+            "operation_ref1c": operation_ref,
+            "price_type_ref1c": price_type_ref,
+            "price": price,
+            "source": source,
+            **({"error": error} if error else {}),
+        })
+    payload["ВидЦен_Key"] = price_type_ref
+    return {
+        "manufacture_id": entry.manufacture_id,
+        "number": entry.number,
+        "lookups": lookups,
+    }
 
 
 def _short_piecework_number(manufacture_id: int) -> str:
@@ -676,6 +803,7 @@ def export_piecework_to_1c(
         "skipped_rows": skipped,
         "entries": [],
         "parent_manufactures_export": parent_export,
+        "piecework_price_lookup": [],
     }
 
     config = _load_odata_config()
@@ -685,6 +813,7 @@ def export_piecework_to_1c(
     structural_unit_ref = structural_unit_ref or _config_ref1c(
         config, "default_production_structural_unit_ref1c", DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C
     )
+    price_type_ref = _piecework_price_type_ref(config)
 
     payloads: List[Dict[str, Any]] = []
     for entry in eligible:
@@ -711,6 +840,13 @@ def export_piecework_to_1c(
         require_demo_base=True,
     )
     for entry, payload_envelope in zip(eligible, payloads):
+        price_lookup = _enrich_payload_prices_from_1c(
+            client,
+            entry,
+            payload_envelope["payload"],
+            price_type_ref=price_type_ref,
+        )
+        summary["piecework_price_lookup"].append(price_lookup)
         _add_brigade_composition_to_payload(client, entry, payload_envelope["payload"])
 
     def _mark_success(entry: PieceworkExportEntry, ref_key: str) -> None:
