@@ -276,9 +276,10 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
         # Загружаем ВСЕ строки продукции ОДНИМ запросом (пакетная загрузка)
         # Фильтр: Ref_Key IN (список всех GUID заказов)
         if order_keys:
-            # 1С OData поддерживает фильтр с множеством OR, но есть лимит на длину URL.
-            # Разбиваем на пакеты по 100 заказов (безопасный лимит для 1С)
-            BATCH_SIZE = 100
+            # 1С OData поддерживает фильтр с множеством OR, но быстро упирается
+            # во внутренний лимит вложенности выражений. Держим пачку небольшой:
+            # 20 Ref_Key дают запас и по URL, и по глубине OR-дерева.
+            BATCH_SIZE = 20
             for i in range(0, len(order_keys), BATCH_SIZE):
                 batch_keys = order_keys[i:i + BATCH_SIZE]
                 or_filter = " or ".join([f"Ref_Key eq guid'{k}'" for k in batch_keys])
