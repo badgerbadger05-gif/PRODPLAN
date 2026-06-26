@@ -239,7 +239,7 @@ def test_execution_journal_counts_direct_completed_1c_order_by_item(db_session):
     db_session.flush()
     order = ProductionOrder(
         order_number="1C-DIRECT-DONE",
-        order_date=datetime.datetime(2026, 6, 15, 12, 0),
+        order_date=datetime.datetime(2026, 5, 20, 12, 0),
         order_ref1c="direct-1c-done-ref",
         is_posted=True,
         deletion_mark=False,

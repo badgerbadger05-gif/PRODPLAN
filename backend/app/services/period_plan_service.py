@@ -58,6 +58,7 @@ PLAN_STATUSES = {"draft", "fixed", "archived"}
 
 # Matches planning_service.DONE_STATE_KEY — 1C state for completed production orders.
 _DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
+_DIRECT_1C_PRODUCTION_HORIZON = date(2026, 5, 1)
 _SUPPLIER_ORDER_DONE_STATES = {"принят на склад"}
 
 
@@ -1539,10 +1540,10 @@ def get_period_plan_execution_journal(
         .filter(ProductionOrder.order_ref1c.isnot(None))
         .filter(ProductionOrder.deletion_mark.is_(False))
     )
-    if plan.period_from:
-        direct_query = direct_query.filter(
-            ProductionOrder.order_date >= datetime.combine(plan.period_from, datetime.min.time())
-        )
+    direct_from = min(plan.period_from, _DIRECT_1C_PRODUCTION_HORIZON) if plan.period_from else _DIRECT_1C_PRODUCTION_HORIZON
+    direct_query = direct_query.filter(
+        ProductionOrder.order_date >= datetime.combine(direct_from, datetime.min.time())
+    )
     if plan.period_to:
         direct_query = direct_query.filter(
             ProductionOrder.order_date < datetime.combine(plan.period_to + timedelta(days=1), datetime.min.time())
