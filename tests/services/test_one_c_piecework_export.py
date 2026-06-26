@@ -88,12 +88,20 @@ def _mk_manufacture(
 
 
 class _FakeClient:
-    def __init__(self, *, ref_key: str = "pw-ref-key", fail: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        ref_key: str = "pw-ref-key",
+        fail: bool = False,
+        prices: dict[str, float] | None = None,
+    ) -> None:
         self.ref_key = ref_key
         self.fail = fail
+        self.prices = prices or {}
         self.posts: list = []
         self.patches: list = []
         self.operations: list = []
+        self.requests: list = []
 
     def post(self, entity, payload, **_):
         self.posts.append((entity, payload))
@@ -111,6 +119,23 @@ class _FakeClient:
         self.operations.append(operation_path)
 
     def _make_request(self, endpoint, params=None, **_):
+        self.requests.append((endpoint, params or {}))
+        if "InformationRegister_ЦеныНоменклатуры" in endpoint:
+            query = str((params or {}).get("$filter") or "")
+            for operation_ref, price in self.prices.items():
+                if f"guid'{operation_ref}'" in query:
+                    return {
+                        "value": [
+                            {
+                                "Period": "2025-03-25T00:00:00",
+                                "Номенклатура_Key": operation_ref,
+                                "ВидЦен_Key": exporter.DEFAULT_ACCOUNTING_PRICE_TYPE_REF1C,
+                                "Цена": price,
+                                "Актуальность": True,
+                            }
+                        ]
+                    }
+            return {"value": []}
         if "Catalog_Бригады" in endpoint:
             return {
                 "Состав": [
@@ -265,6 +290,39 @@ def test_zero_price_is_not_sent_as_piecework_rate(db_session):
     assert "Расценка" not in op
     assert "Стоимость" not in op
     assert op["Нормочасы"] == pytest.approx(2.0)
+
+
+def test_live_export_fills_piecework_rate_from_1c_price_register(db_session, monkeypatch):
+    db = db_session
+    item = _mk_item(db, code="PW-PRICE-REG", ref1c="item-ref-price-reg")
+    m = _mk_manufacture(db, item, qty=18.0, exported_ref1c="ref-price-reg")
+
+    fake = _FakeClient(ref_key="pw-price-reg-ref", prices={"op-ref-price-reg": 10.0})
+    _stub_config(monkeypatch, base_url="http://mtzw7/unf_demo/odata/standard.odata")
+    monkeypatch.setattr(exporter, "_create_odata_client", lambda *a, **kw: fake)
+
+    result = exporter.export_piecework_to_1c(
+        db,
+        [m.manufacture_id],
+        operation_ref="op-ref-price-reg",
+        time_norm=0.004,
+        price=0.0,
+        dry_run=False,
+    )
+
+    assert result["manufactures_created"] == 1
+    payload = fake.posts[0][1]
+    op = payload["Операции"][0]
+    assert payload["ВидЦен_Key"] == exporter.DEFAULT_ACCOUNTING_PRICE_TYPE_REF1C
+    assert op["Расценка"] == 10.0
+    assert op["Стоимость"] == pytest.approx(180.0)
+    assert result["piecework_price_lookup"][0]["lookups"][0]["source"] == "InformationRegister_ЦеныНоменклатуры"
+    assert result["piecework_price_lookup"][0]["lookups"][0]["price"] == 10.0
+
+    price_request = next(req for req in fake.requests if "ЦеныНоменклатуры" in req[0])
+    assert "SliceLast" in price_request[0]
+    assert "guid'op-ref-price-reg'" in price_request[1]["$filter"]
+    assert "item-ref-price-reg" not in price_request[1]["$filter"]
 
 
 def test_brigade_executor_uses_brigade_type_and_composition(db_session, monkeypatch):
