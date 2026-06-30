@@ -8,6 +8,7 @@ from app.models import (
     SupplierOrder,
     SupplierOrderItem,
     SyncLink,
+    Unit,
 )
 from app.services.one_c_purchase_order_export import PURCHASE_ORDER_ENTITY
 from app.services.purchase_control_journal import get_order_card, list_filters, list_journal
@@ -204,6 +205,37 @@ def test_list_journal_includes_unordered_mrp_purchases(db_session):
 
     without = list_journal(db_session, include_to_order=False, today=TODAY)
     assert all(r["line_status"] != "to_order" for r in without["rows"])
+
+
+def test_list_journal_resolves_unit_guid_to_label(db_session):
+    unit_ref = "aae0017c-991b-11eb-e39a-fa163e61326a"
+    db_session.add(
+        Unit(
+            unit_ref1c=unit_ref,
+            unit_code="796",
+            unit_name="шт",
+            short_name="шт",
+        )
+    )
+    run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={})
+    db_session.add(run)
+    db_session.flush()
+    supplier = _make_supplier(db_session, "s-ref-1", "ООО Метиз")
+    item = _make_item(db_session, "M-1", "Болт М10", supplier_ref="s-ref-1")
+    item.unit = unit_ref
+    order = _make_order(db_session, "ЗП-001", supplier)
+    _make_line(db_session, order, item, qty=5, delivery=date(2026, 6, 20))
+    pending = PlannedPurchase(
+        run_id=run.run_id, item_id=item.item_id, requested_qty=7, planned_qty=7, qty=7,
+        need_date=date(2026, 6, 30), order_date=date(2026, 6, 20), lead_time_days=10,
+        bucket_date=date(2026, 6, 30), supplier_ref1c="s-ref-1",
+    )
+    db_session.add(pending)
+    db_session.commit()
+
+    result = list_journal(db_session, today=TODAY)
+
+    assert {row["unit"] for row in result["rows"]} == {"шт"}
 
 
 def test_list_journal_marks_mrp_origin_orders(db_session):

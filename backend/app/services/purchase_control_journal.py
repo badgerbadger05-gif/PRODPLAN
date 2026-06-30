@@ -23,6 +23,7 @@ from ..models import (
     SupplierOrder,
     SupplierOrderItem,
     SyncLink,
+    Unit,
 )
 from .one_c_purchase_order_export import PURCHASE_ORDER_ENTITY
 from .supplier_order_status import (
@@ -149,6 +150,30 @@ def _suppliers_by_ref(db: Session) -> Dict[str, str]:
     }
 
 
+def _units_by_ref(db: Session) -> Dict[str, str]:
+    result: Dict[str, str] = {}
+    for unit in db.query(Unit).all():
+        ref = str(unit.unit_ref1c or "").strip().lower()
+        if not ref:
+            continue
+        label = (
+            str(unit.short_name or "").strip()
+            or str(unit.unit_name or "").strip()
+            or str(unit.iso_code or "").strip()
+            or str(unit.unit_code or "").strip()
+        )
+        if label:
+            result[ref] = label
+    return result
+
+
+def _unit_label(units_by_ref: Dict[str, str], value: Optional[str]) -> Optional[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    return units_by_ref.get(raw.lower(), raw)
+
+
 def _supplier_order_rows(
     db: Session,
     *,
@@ -183,6 +208,7 @@ def _supplier_order_rows(
         )
 
     mrp_refs = _mrp_origin_order_refs(db)
+    units_by_ref = _units_by_ref(db)
     rows: List[Dict[str, Any]] = []
     for line, order, item, supplier in query.all():
         order_active = _order_is_active(order)
@@ -218,7 +244,7 @@ def _supplier_order_rows(
                 "item_code": str(item.item_code or ""),
                 "item_article": item.item_article,
                 "item_name": str(item.item_name or ""),
-                "unit": item.unit,
+                "unit": _unit_label(units_by_ref, item.unit),
                 "quantity": _to_float(line.quantity),
                 "received_qty": received,
                 "remaining_qty": remaining,
@@ -246,6 +272,7 @@ def _to_order_rows(
         return []
     exported = _exported_purchase_ids(db)
     suppliers_by_ref = _suppliers_by_ref(db)
+    units_by_ref = _units_by_ref(db)
     supplier_ids_by_ref: Dict[str, int] = {
         str(s.supplier_ref1c).lower(): int(s.supplier_id)
         for s in db.query(Supplier).all()
@@ -296,7 +323,7 @@ def _to_order_rows(
                 "item_code": str(item.item_code or ""),
                 "item_article": item.item_article,
                 "item_name": str(item.item_name or ""),
-                "unit": item.unit,
+                "unit": _unit_label(units_by_ref, item.unit),
                 "quantity": qty,
                 "received_qty": 0.0,
                 "remaining_qty": qty,
