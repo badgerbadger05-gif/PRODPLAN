@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Tuple
 from datetime import datetime
 
 from sqlalchemy.orm import Session
@@ -59,6 +60,10 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return float(value or 0.0)
     except Exception:
         return default
+
+
+def _is_zero_guid(value: Any) -> bool:
+    return _norm_guid(value) == "00000000-0000-0000-0000-000000000000"
 
 
 def _extract_state_name(record: Dict[str, Any]) -> str:
@@ -189,6 +194,73 @@ def _load_supplier_names(client: Any, supplier_refs: set[str]) -> Dict[str, str]
     return supplier_names
 
 
+ReceiptKey = Tuple[str, str, str]
+
+
+def _load_receipts_by_supplier_order(client: Any, known_order_refs: set[str]) -> Dict[ReceiptKey, float]:
+    """
+    Posted incoming invoices carry the actual receipt against supplier orders.
+    In UNF the supplier order is a polymorphic string field (`Заказ`) on the
+    invoice header and usually repeated on each stock line.
+    """
+    known = {_norm_guid(ref) for ref in known_order_refs if _norm_guid(ref)}
+    if not known:
+        return {}
+
+    try:
+        receipt_docs = client.get_all(
+            "Document_ПриходнаяНакладная",
+            filter_query="Posted eq true and DeletionMark eq false",
+            select_fields=[
+                "Ref_Key",
+                "Posted",
+                "DeletionMark",
+                "Заказ",
+                "Заказ_Type",
+                "Запасы",
+            ],
+            top=1000,
+            max_pages=1000,
+            order_by="Ref_Key",
+        )
+    except Exception as e:
+        print(f"Не удалось загрузить приходные накладные для заказов поставщику: {e}")
+        return {}
+
+    receipts: Dict[ReceiptKey, float] = defaultdict(float)
+    for doc in receipt_docs or []:
+        if not _parse_1c_bool(doc.get("Posted"), False) or _parse_1c_bool(doc.get("DeletionMark"), False):
+            continue
+        header_order_ref = _norm_guid(doc.get("Заказ"))
+        header_order_type = str(doc.get("Заказ_Type") or "")
+        header_is_supplier_order = "ЗаказПоставщику" in header_order_type or not header_order_type
+        rows = doc.get("Запасы") or []
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_order_ref = _norm_guid(row.get("Заказ")) or header_order_ref
+            if not row_order_ref or _is_zero_guid(row_order_ref) or row_order_ref not in known:
+                continue
+            row_order_type = str(row.get("Заказ_Type") or header_order_type or "")
+            if row_order_type and "ЗаказПоставщику" not in row_order_type:
+                continue
+            if not row_order_type and not header_is_supplier_order:
+                continue
+            item_key = _norm_guid(row.get("Номенклатура_Key"))
+            if not item_key:
+                continue
+            characteristic_ref1c = _norm_guid(
+                row.get("Характеристика_Key") or row.get("Characteristic_Key")
+            )
+            qty = _to_float(row.get("Количество"), 0.0)
+            if qty <= 0:
+                continue
+            receipts[(row_order_ref, item_key, characteristic_ref1c)] += qty
+    return dict(receipts)
+
+
 @dataclass
 class SupplierOrderSyncStats:
     """Статистика синхронизации заказов поставщикам"""
@@ -201,6 +273,7 @@ class SupplierOrderSyncStats:
     suppliers_created: int = 0
     suppliers_updated: int = 0
     orders_skipped_by_organization: int = 0
+    receipt_rows_applied: int = 0
     dry_run: bool = False
     odata_url: str = ""
     odata_entity: str = ""
@@ -260,6 +333,14 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
             return asdict(stats)
 
         stats.orders_total = len(order_data)
+        receipt_remaining_by_order_item = _load_receipts_by_supplier_order(
+            client,
+            {
+                str(record.get("Ref_Key") or "").strip()
+                for record in order_data
+                if str(record.get("Ref_Key") or "").strip()
+            },
+        )
 
         # Получаем существующие записи для сопоставления
         existing_orders = {order.order_ref1c: order for order in db.query(SupplierOrder).all() if order.order_ref1c}
@@ -282,6 +363,7 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
         suppliers_created = 0
         suppliers_updated = 0
         skipped_by_organization = 0
+        receipt_rows_applied = 0
 
         # Обрабатываем каждый заказ
         for record in order_data:
@@ -420,6 +502,18 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                             or item_data.get("Поступило"),
                             0.0,
                         )
+                        receipt_key = (_norm_guid(ref_key), _norm_guid(item_key), characteristic_ref1c or "")
+                        received_from_receipts = 0.0
+                        if quantity > 0 and receipt_remaining_by_order_item.get(receipt_key, 0.0) > 0:
+                            available_receipt_qty = receipt_remaining_by_order_item.get(receipt_key, 0.0)
+                            received_from_receipts = min(quantity, available_receipt_qty)
+                            receipt_remaining_by_order_item[receipt_key] = max(
+                                available_receipt_qty - received_from_receipts,
+                                0.0,
+                            )
+                        if received_from_receipts > received_qty:
+                            received_qty = received_from_receipts
+                            receipt_rows_applied += 1
                         remaining_qty = max(quantity - received_qty, 0.0)
                         price = _to_float(item_data.get('Цена'), 0.0)
                         amount = _to_float(item_data.get('Сумма'), 0.0)
@@ -509,6 +603,7 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
         stats.suppliers_created = suppliers_created
         stats.suppliers_updated = suppliers_updated
         stats.orders_skipped_by_organization = skipped_by_organization
+        stats.receipt_rows_applied = receipt_rows_applied
 
         if req.dry_run:
             db.rollback()
