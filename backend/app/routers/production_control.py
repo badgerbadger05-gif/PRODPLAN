@@ -11,6 +11,7 @@ from ..database import get_db
 from ..models import DefaultSpecification, Employee, Operation, ProductionProduct, ProductionStage, Specification, SpecOperation
 from ..schemas import ODataSyncRequest
 from ..services.one_c_manufacture_export import export_manufactures_to_1c
+from ..services.one_c_order_completion_repair import repair_prodplan_order_completion_success
 from ..services.one_c_piecework_export import export_piecework_to_1c
 from ..services.one_c_posted_transfer_sync import sync_posted_transfers
 from ..services.one_c_production_order_export import export_production_orders_to_1c
@@ -216,6 +217,14 @@ class ExportPieceworkPayload(BaseModel):
     business_operation_ref: Optional[str] = None
     dry_run: bool = True
     allow_production: bool = False
+
+
+class OrderCompletionRepairPayload(BaseModel):
+    dry_run: bool = True
+    allow_production: bool = False
+    number_prefix: str = "PP"
+    date_from: str = "2026-05-01T00:00:00"
+    max_records: int = 5000
 
 
 @router.get("/orders", response_model=dict)
@@ -437,6 +446,28 @@ def post_export_piecework_to_1c(
             business_operation_ref=payload.business_operation_ref,
             dry_run=bool(payload.dry_run),
             allow_production=bool(payload.allow_production) or not bool(payload.dry_run),
+        )
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/repair/order-completion-success", response_model=dict)
+def post_repair_order_completion_success(payload: OrderCompletionRepairPayload):
+    """
+    Backfill 1C Document_ЗаказНаПроизводство.ВариантЗавершения='Успешно'
+    for completed PRODPLAN-created orders (by Number prefix, default PP).
+    """
+    try:
+        return repair_prodplan_order_completion_success(
+            dry_run=bool(payload.dry_run),
+            allow_production=bool(payload.allow_production),
+            number_prefix=payload.number_prefix,
+            date_from=payload.date_from,
+            max_records=int(payload.max_records),
         )
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e))

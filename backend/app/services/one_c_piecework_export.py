@@ -69,6 +69,7 @@ PRODUCTION_ORDER_ENTITY = "Document_ЗаказНаПроизводство"
 BASIS_TYPE = "StandardODATA.Document_СборкаЗапасов"
 ORDER_TYPE = "StandardODATA.Document_ЗаказНаПроизводство"
 DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
+ORDER_COMPLETION_SUCCESS = "Успешно"
 PIECEWORK_PRICE_REGISTER = "InformationRegister_ЦеныНоменклатуры"
 DEFAULT_ACCOUNTING_PRICE_TYPE_REF1C = "81c4a02c-991b-11eb-e39a-fa163e61326a"
 
@@ -874,7 +875,10 @@ def export_piecework_to_1c(
                 raise RuntimeError("OData client cannot patch production order completion state")
             patch(
                 f"{PRODUCTION_ORDER_ENTITY}(guid'{order_ref}')",
-                {"СостояниеЗаказа_Key": DONE_STATE_KEY},
+                {
+                    "СостояниеЗаказа_Key": DONE_STATE_KEY,
+                    "ВариантЗавершения": ORDER_COMPLETION_SUCCESS,
+                },
             )
             order = (
                 db.query(ProductionOrder)

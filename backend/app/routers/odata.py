@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from ..services.odata_config import (
@@ -16,6 +18,14 @@ from ..services.odata_config import (
 )
 from ..services.odata_client import OData1CClient
 from ..services.nomenclature_groups_sync import GROUPS_JSON, OUTPUT_DIR, refresh_nomenclature_groups
+from ..services.operation_norm_exports import (
+    OPERATION_RATE_FIELDS,
+    RELEASE_FACT_FIELDS,
+    default_date_from,
+    export_operation_rates,
+    export_release_facts,
+    rows_to_csv,
+)
 
 router = APIRouter(prefix="/v1/odata", tags=["odata"])
 
@@ -49,6 +59,26 @@ def _config_from_request(cfg: Optional["ODataConfig"]) -> Dict[str, Any]:
     return resolve_config_secrets(cfg.model_dump())
 
 
+def _client_from_config(data: Dict[str, Any]) -> OData1CClient:
+    base_url = data.get("base_url")
+    if not base_url:
+        raise HTTPException(status_code=400, detail="base_url is required")
+    return OData1CClient(
+        base_url=sanitize_base_url(base_url),
+        username=data.get("username") or None,
+        password=data.get("password") or None,
+        token=data.get("token") or None,
+    )
+
+
+def _csv_response(csv_text: str, filename: str) -> StreamingResponse:
+    return StreamingResponse(
+        iter([csv_text]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.get("/config")
 def get_config():
     """Возвращает сохранённую конфигурацию OData (секреты замаскированы)."""
@@ -66,15 +96,7 @@ def save_config(cfg: ODataConfig):
 def test_connection(cfg: Optional[ODataConfig] = None):
     """Проверка подключения к OData ($metadata)."""
     data = _config_from_request(cfg)
-    base_url = data.get("base_url")
-    if not base_url:
-        raise HTTPException(status_code=400, detail="base_url is required")
-    client = OData1CClient(
-        base_url=sanitize_base_url(base_url),
-        username=data.get("username") or None,
-        password=data.get("password") or None,
-        token=data.get("token") or None,
-    )
+    client = _client_from_config(data)
     try:
         resp = client._make_request("$metadata")
         if isinstance(resp, dict) and "_raw" in resp:
@@ -91,15 +113,7 @@ def test_connection(cfg: Optional[ODataConfig] = None):
 def fetch_metadata(cfg: Optional[ODataConfig] = None):
     """Выгружает $metadata в output/odata_metadata.xml и краткое summary в output/odata_metadata_summary.json."""
     data = _config_from_request(cfg)
-    base_url = data.get("base_url")
-    if not base_url:
-        raise HTTPException(status_code=400, detail="base_url is required")
-    client = OData1CClient(
-        base_url=sanitize_base_url(base_url),
-        username=data.get("username") or None,
-        password=data.get("password") or None,
-        token=data.get("token") or None,
-    )
+    client = _client_from_config(data)
     try:
         resp = client._make_request("$metadata")
         if isinstance(resp, dict) and "_raw" in resp:
@@ -146,6 +160,61 @@ def export_groups(cfg: Optional[ODataConfig] = None):
         return refresh_nomenclature_groups(data)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Export groups failed: {e}")
+
+
+@router.post("/exports/operation-rates.csv")
+def export_operation_rates_csv(
+    cfg: Optional[ODataConfig] = None,
+    max_rows: Optional[int] = Query(None, ge=1),
+    page_size: int = Query(1000, ge=1, le=5000),
+):
+    """
+    Read-only export of 1C specification operation rows with operation rates.
+
+    Uses the saved OData config when request body is empty/null. Secrets are
+    never returned in the response.
+    """
+    data = _config_from_request(cfg)
+    client = _client_from_config(data)
+    try:
+        rows = export_operation_rates(client, max_rows=max_rows, page_size=page_size)
+        return _csv_response(rows_to_csv(rows, OPERATION_RATE_FIELDS), "operation_rates_1c.csv")
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Operation rates export failed: {e}")
+
+
+@router.post("/exports/release-facts.csv")
+def export_release_facts_csv(
+    cfg: Optional[ODataConfig] = None,
+    date_from: Optional[date] = Query(None),
+    date_to: Optional[date] = Query(None),
+    max_rows: Optional[int] = Query(None, ge=1),
+    page_size: int = Query(1000, ge=1, le=5000),
+):
+    """
+    Read-only export of factual production release from
+    AccumulationRegister_ВыпускПродукции_RecordType, aggregated by
+    item/characteristic/specification for the selected period.
+    """
+    effective_to = date_to or date.today()
+    effective_from = date_from or default_date_from(effective_to)
+    if effective_from > effective_to:
+        raise HTTPException(status_code=400, detail="date_from must be before or equal to date_to")
+
+    data = _config_from_request(cfg)
+    client = _client_from_config(data)
+    try:
+        rows = export_release_facts(
+            client,
+            date_from=effective_from,
+            date_to=effective_to,
+            max_rows=max_rows,
+            page_size=page_size,
+        )
+        filename = f"release_facts_1c_{effective_from.isoformat()}_{effective_to.isoformat()}.csv"
+        return _csv_response(rows_to_csv(rows, RELEASE_FACT_FIELDS), filename)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Release facts export failed: {e}")
 
 
 @router.get("/groups")

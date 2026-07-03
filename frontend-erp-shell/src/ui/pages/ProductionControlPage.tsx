@@ -18,7 +18,7 @@ import {
 } from '../../domain/productionControl'
 import type { ProductionResource } from '../../domain/resources'
 import { api } from '../../lib/api'
-import { getPeriodPlanMatrix } from '../../services/periodPlan'
+import { getPeriodPlanMatrix, listPeriodPlans } from '../../services/periodPlan'
 import { listResources } from '../../services/resources'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { RootProductFilterDialog, rootProductLabel, type RootProductOption } from '../RootProductFilterDialog'
@@ -64,7 +64,6 @@ export function ProductionControlPage() {
   const [error, setError] = useState('')
   const [total, setTotal] = useState(0)
   const [runId, setRunId] = useState<number | null>(null)
-  const [sourcePlanId, setSourcePlanId] = useState<number | null>(null)
   const [rootOptions, setRootOptions] = useState<RootProductOption[]>([])
   const [rootDialogOpen, setRootDialogOpen] = useState(false)
   const [offset, setOffset] = useState(0)
@@ -147,7 +146,6 @@ export function ProductionControlPage() {
       setRows(data.rows ?? [])
       setTotal(data.total ?? 0)
       setRunId(data.latest_run_id ?? null)
-      setSourcePlanId(data.latest_source_plan_id ?? null)
       setOffset(data.offset ?? nextOffset)
       setActiveId((current) => {
         const focusedProductId = Number(focusProductId || 0)
@@ -172,24 +170,44 @@ export function ProductionControlPage() {
 
   useEffect(() => {
     let cancelled = false
-    async function loadRootOptions(planId: number) {
+    async function loadRootOptions() {
       try {
-        const data = await getPeriodPlanMatrix(planId)
+        const plansData = await listPeriodPlans({
+          status: 'fixed',
+          limit: 500,
+          sort_by: 'period_from',
+          sort_dir: 'desc',
+        })
+        const matrices = await Promise.all(
+          (plansData.rows ?? []).map((plan) => getPeriodPlanMatrix(plan.id).catch(() => null)),
+        )
         if (cancelled) return
-        setRootOptions((data.rows ?? []).map((row) => ({
-          item_id: row.item_id,
-          item_name: row.item_name,
-          item_article: row.item_article,
-          item_code: row.item_code,
-        })))
+        const byItemId = new Map<number, RootProductOption>()
+        matrices.forEach((data) => {
+          ;(data?.rows ?? []).forEach((row) => {
+            if (!byItemId.has(row.item_id)) {
+              byItemId.set(row.item_id, {
+                item_id: row.item_id,
+                item_name: row.item_name,
+                item_article: row.item_article,
+                item_code: row.item_code,
+              })
+            }
+          })
+        })
+        setRootOptions(Array.from(byItemId.values()).sort((a, b) => (
+          (a.item_article || a.item_name || a.item_code || '').localeCompare(
+            b.item_article || b.item_name || b.item_code || '',
+            'ru',
+          )
+        )))
       } catch {
         if (!cancelled) setRootOptions([])
       }
     }
-    if (sourcePlanId) void loadRootOptions(sourcePlanId)
-    else setRootOptions([])
+    void loadRootOptions()
     return () => { cancelled = true }
-  }, [sourcePlanId])
+  }, [runId])
 
   const loadEmployees = useCallback(async () => {
     setEmployeesLoading(true)

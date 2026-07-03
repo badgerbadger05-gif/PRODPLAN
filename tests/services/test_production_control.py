@@ -18,6 +18,8 @@ from app.models import (
     PlannedOrder,
     PlannedPurchase,
     PlanningRun,
+    ProductionPlanHeader,
+    ProductionPlanLine,
     ProductionMaterialIssue,
     ProductionMaterialIssueLine,
     ProductionOrder,
@@ -1415,6 +1417,85 @@ def test_journal_status_shortage_filter_is_exact(db_session):
 
     assert journal["total"] == 1
     assert [row["order_number"] for row in journal["rows"]] == ["STAT-1"]
+
+
+def test_journal_root_filter_uses_all_active_plan_snapshot_scopes(db_session):
+    root = Item(item_code="ROOT-M", item_name="Root machine", unit="шт", stock_qty=0, status="active")
+    component = Item(item_code="COMP-M", item_name="Shared component", unit="шт", stock_qty=0, status="active")
+    db_session.add_all([root, component])
+    db_session.flush()
+
+    spec = Specification(spec_name="Root spec")
+    db_session.add(spec)
+    db_session.flush()
+    db_session.add(DefaultSpecification(item_id=root.item_id, spec_id=spec.spec_id))
+    db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=component.item_id, quantity=1))
+
+    plan_a = ProductionPlanHeader(
+        name="Current plan A",
+        period_from=_dt.date(2026, 6, 1),
+        period_to=_dt.date(2026, 6, 30),
+        status="fixed",
+    )
+    plan_b = ProductionPlanHeader(
+        name="Current plan B",
+        period_from=_dt.date(2026, 7, 1),
+        period_to=_dt.date(2026, 7, 31),
+        status="fixed",
+    )
+    archived_plan = ProductionPlanHeader(
+        name="Archived plan",
+        period_from=_dt.date(2026, 5, 1),
+        period_to=_dt.date(2026, 5, 31),
+        status="archived",
+    )
+    db_session.add_all([plan_a, plan_b, archived_plan])
+    db_session.flush()
+    db_session.add_all([
+        ProductionPlanLine(plan_id=plan_a.id, item_id=root.item_id, bucket_date=_dt.date(2026, 6, 1), qty=1),
+        ProductionPlanLine(plan_id=plan_b.id, item_id=root.item_id, bucket_date=_dt.date(2026, 7, 1), qty=1),
+        ProductionPlanLine(plan_id=archived_plan.id, item_id=root.item_id, bucket_date=_dt.date(2026, 5, 1), qty=1),
+    ])
+    old_run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={}, source_plan_id=plan_a.id)
+    latest_run_a = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={}, source_plan_id=plan_a.id)
+    latest_run_b = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={}, source_plan_id=plan_b.id)
+    archived_run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={}, source_plan_id=archived_plan.id)
+    db_session.add_all([old_run, latest_run_a, latest_run_b, archived_run])
+    db_session.flush()
+
+    for run, number in [
+        (old_run, "OLD-RUN"),
+        (latest_run_a, "LATEST-RUN-A"),
+        (latest_run_b, "LATEST-RUN-B"),
+        (archived_run, "ARCHIVED-RUN"),
+    ]:
+        order = ProductionOrder(
+            order_number=number,
+            order_date=datetime(2026, 5, 20),
+            is_posted=True,
+            deletion_mark=False,
+            source="mrp",
+            source_run_id=run.run_id,
+        )
+        db_session.add(order)
+        db_session.flush()
+        product = ProductionProduct(
+            order_id=order.order_id,
+            item_id=component.item_id,
+            line_number=1,
+            quantity=1,
+            produced_qty=0,
+            remaining_qty=1,
+        )
+        db_session.add(product)
+        db_session.flush()
+        db_session.add(ProductionOrderLineState(product_id=product.product_id, status="shortage"))
+    db_session.commit()
+
+    journal = list_journal(db_session, root_item_id=root.item_id)
+
+    assert journal["total"] == 2
+    assert {row["order_number"] for row in journal["rows"]} == {"LATEST-RUN-A", "LATEST-RUN-B"}
 
 
 def test_journal_without_coverage_filter_does_not_reuse_last_row_status(db_session):

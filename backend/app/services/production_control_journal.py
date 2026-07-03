@@ -13,6 +13,7 @@ from ..models import (
     PlannedOrder,
     PlanningRun,
     ProductionPlanHeader,
+    ProductionPlanLine,
     ProductionManufacture,
     ProductionMaterialIssue,
     ProductionOrder,
@@ -429,6 +430,21 @@ def _bom_descendant_ids_for_root(db: Session, root_item_id: int) -> set[int]:
 
     visit(int(root_item_id), set())
     return result
+
+
+def _active_plan_snapshot_run_ids_for_root(db: Session, root_item_id: int) -> set[int]:
+    rows = (
+        db.query(PlanningRun.source_plan_id, func.max(PlanningRun.run_id).label("run_id"))
+        .join(ProductionPlanHeader, ProductionPlanHeader.id == PlanningRun.source_plan_id)
+        .join(ProductionPlanLine, ProductionPlanLine.plan_id == ProductionPlanHeader.id)
+        .filter(ProductionPlanHeader.status == "fixed")
+        .filter(ProductionPlanLine.item_id == int(root_item_id))
+        .filter(PlanningRun.status == "FIXED_SNAPSHOT")
+        .filter(PlanningRun.source_plan_id.isnot(None))
+        .group_by(PlanningRun.source_plan_id)
+        .all()
+    )
+    return {int(row.run_id) for row in rows if row.run_id is not None}
 
 
 def _forecast_payload(forecast_date: Optional[date], due_date: Optional[date]) -> Dict[str, Any]:
@@ -891,6 +907,8 @@ def list_journal(
     if root_item_id is not None:
         related_ids = _bom_descendant_ids_for_root(db, int(root_item_id))
         query = query.filter(ProductionProduct.item_id.in_(related_ids))
+        active_run_ids = _active_plan_snapshot_run_ids_for_root(db, int(root_item_id))
+        query = query.filter(ProductionOrder.source_run_id.in_(sorted(active_run_ids) or [-1]))
     if status:
         status_values = STATUS_FILTER_GROUPS.get(str(status), (str(status),))
         query = query.filter(func.coalesce(ProductionOrderLineState.status, "shortage").in_(status_values))
