@@ -114,6 +114,98 @@ def _latest_active_snapshot_run_ids(db: Session) -> List[int]:
     return [int(run_id) for _plan_id, run_id in rows if run_id is not None]
 
 
+def _trim_unexported_planned_purchases(
+    db: Session,
+    *,
+    run_id: int,
+    item_id: int,
+    target_qty: float,
+    dry_run: bool,
+) -> Optional[Dict[str, Any]]:
+    """Remove or shrink stale local MRP purchase recommendations down to target."""
+    purchases = (
+        db.query(PlannedPurchase)
+        .filter(PlannedPurchase.run_id == int(run_id), PlannedPurchase.item_id == int(item_id))
+        .order_by(PlannedPurchase.need_date.desc(), PlannedPurchase.purchase_id.desc())
+        .all()
+    )
+    if not purchases:
+        return None
+
+    purchase_ids = [int(pp.purchase_id) for pp in purchases]
+    exported_ids = {
+        int(source_id)
+        for (source_id,) in (
+            db.query(SyncLink.source_id)
+            .filter(
+                SyncLink.source_system == "PRODPLAN",
+                SyncLink.source_doctype == "planned_purchase",
+                SyncLink.source_id.in_(purchase_ids),
+                SyncLink.target_entity == "Document_ЗаказПоставщику",
+                SyncLink.status == "success",
+                SyncLink.target_ref_key.isnot(None),
+            )
+            .all()
+        )
+    }
+
+    current_total = sum(_to_float(pp.qty) for pp in purchases)
+    surplus = current_total - max(_to_float(target_qty), 0.0)
+    if surplus <= EPS:
+        return None
+
+    removed_qty = 0.0
+    removed_purchase_ids: List[int] = []
+    reduced: List[Dict[str, Any]] = []
+
+    for purchase in purchases:
+        if surplus <= EPS:
+            break
+        purchase_id = int(purchase.purchase_id)
+        if purchase_id in exported_ids:
+            continue
+        qty = _to_float(purchase.qty)
+        if qty <= EPS:
+            continue
+
+        delta = min(qty, surplus)
+        next_qty = max(qty - delta, 0.0)
+        if next_qty <= EPS:
+            removed_purchase_ids.append(purchase_id)
+            if not dry_run:
+                db.delete(purchase)
+        else:
+            reduced.append(
+                {
+                    "purchase_id": purchase_id,
+                    "from_qty": round(qty, 6),
+                    "to_qty": round(next_qty, 6),
+                }
+            )
+            if not dry_run:
+                purchase.qty = next_qty
+                purchase.planned_qty = max(_to_float(purchase.planned_qty) - delta, 0.0)
+                purchase.requested_qty = max(_to_float(purchase.requested_qty) - delta, 0.0)
+
+        removed_qty += delta
+        surplus -= delta
+
+    if removed_qty <= EPS:
+        return None
+
+    return {
+        "item_id": int(item_id),
+        "target_qty": round(max(_to_float(target_qty), 0.0), 6),
+        "removed_qty": round(removed_qty, 6),
+        "removed_purchase_ids": removed_purchase_ids,
+        "reduced": reduced,
+        "exported_qty": round(
+            sum(_to_float(pp.qty) for pp in purchases if int(pp.purchase_id) in exported_ids),
+            6,
+        ),
+    }
+
+
 def _rebuild_plan_demands(db: Session, plan_id: int) -> Dict[int, Dict[date, float]]:
     """Level-0 demand buckets per item from the plan lines (mirrors snapshot)."""
     demands: Dict[int, Dict[date, float]] = {}
@@ -581,6 +673,7 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
             "dry_run": bool(dry_run),
             "production_added": [],
             "purchase_added": [],
+            "purchase_pruned": [],
             "note": "в плане нет положительной потребности",
         }
 
@@ -637,6 +730,7 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
 
     production_added: List[Dict[str, Any]] = []
     purchase_added: List[Dict[str, Any]] = []
+    purchase_pruned: List[Dict[str, Any]] = []
     now = datetime.now(timezone.utc)
 
     for iid in sorted(current_net_by_item.keys()):
@@ -649,6 +743,21 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
 
         if req is not None:
             req.net_required_qty = current_net
+
+        if flow != REPLENISHMENT_FLOW_PURCHASE and existing_planned_purchase.get(iid, 0.0) > EPS:
+            pruned = _trim_unexported_planned_purchases(
+                db,
+                run_id=int(run.run_id),
+                item_id=iid,
+                target_qty=0.0,
+                dry_run=dry_run,
+            )
+            if pruned:
+                purchase_pruned.append(pruned)
+                existing_planned_purchase[iid] = max(
+                    existing_planned_purchase.get(iid, 0.0) - _to_float(pruned.get("removed_qty")),
+                    0.0,
+                )
 
         if flow == REPLENISHMENT_FLOW_PRODUCTION:
             open_qty = _to_float(active_production_by_item.get(iid, 0.0))
@@ -690,6 +799,19 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
                 if req is not None:
                     req.covered_qty = 0.0
                     req.remaining_qty = 0.0
+                pruned = _trim_unexported_planned_purchases(
+                    db,
+                    run_id=int(run.run_id),
+                    item_id=iid,
+                    target_qty=0.0,
+                    dry_run=dry_run,
+                )
+                if pruned:
+                    purchase_pruned.append(pruned)
+                    existing_planned_purchase[iid] = max(
+                        existing_planned_purchase.get(iid, 0.0) - _to_float(pruned.get("removed_qty")),
+                        0.0,
+                    )
                 continue
             target = current_net
             for sup_row in supplier_work.get(iid, []):
@@ -702,6 +824,17 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
                 sup_row["remaining_qty"] = max(avail - used, 0.0)
                 target -= used
             already = existing_planned_purchase.get(iid, 0.0)
+            pruned = _trim_unexported_planned_purchases(
+                db,
+                run_id=int(run.run_id),
+                item_id=iid,
+                target_qty=target,
+                dry_run=dry_run,
+            )
+            if pruned:
+                purchase_pruned.append(pruned)
+                already = max(already - _to_float(pruned.get("removed_qty")), 0.0)
+                existing_planned_purchase[iid] = already
             gap = target - already
             if req is not None:
                 req.covered_qty = min(current_net - max(gap, 0.0), current_net)
@@ -766,6 +899,7 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
         "dry_run": bool(dry_run),
         "production_added": production_added,
         "purchase_added": purchase_added,
+        "purchase_pruned": purchase_pruned,
         "rescheduled": reschedule,
         "mrp_order_repair": mrp_order_repair,
         "mrp_batch_repair": batch_repair,
@@ -950,11 +1084,13 @@ def reconcile_all_active(db: Session, *, dry_run: bool = False) -> Dict[str, Any
     results: List[Dict[str, Any]] = []
     total_production = 0
     total_purchase = 0
+    total_purchase_pruned = 0
     for rid in run_ids:
         try:
             res = reconcile_snapshot(db, rid, dry_run=dry_run)
             total_production += len(res.get("production_added", []))
             total_purchase += len(res.get("purchase_added", []))
+            total_purchase_pruned += len(res.get("purchase_pruned", []))
             results.append(res)
         except Exception as exc:  # noqa: BLE001 — isolate one bad run from the rest
             db.rollback()
@@ -965,5 +1101,6 @@ def reconcile_all_active(db: Session, *, dry_run: bool = False) -> Dict[str, Any
         "runs_checked": len(run_ids),
         "production_lines_added": total_production,
         "purchase_lines_added": total_purchase,
+        "purchase_lines_pruned": total_purchase_pruned,
         "results": results,
     }

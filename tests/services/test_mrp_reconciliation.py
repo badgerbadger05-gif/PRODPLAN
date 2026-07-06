@@ -8,6 +8,7 @@ from app.models import (
     DefaultSpecification,
     Item,
     MrpRequirement,
+    PlannedPurchase,
     PlanningRun,
     ProductionOrder,
     ProductionOrderLineState,
@@ -49,6 +50,22 @@ def _make_production_item(db, code: str, stock: float = 0.0) -> Item:
         stock_qty=stock,
         replenishment_method="Производство",
         replenishment_time=0,
+        status="active",
+    )
+    db.add(item)
+    db.flush()
+    return item
+
+
+def _make_purchased_item(db, code: str, stock: float = 0.0) -> Item:
+    item = Item(
+        item_code=code,
+        item_name=f"Закупаемая деталь {code}",
+        item_article=code,
+        unit="шт",
+        stock_qty=stock,
+        replenishment_method="Покупка",
+        replenishment_time=3,
         status="active",
     )
     db.add(item)
@@ -250,6 +267,47 @@ def test_repair_clean_mrp_line_blocks_after_production_order_export(db_session):
     assert product.spec_id == old_spec.spec_id
     assert stats["spec_updated"] == 0
     assert stats["blocked"]["order_in_1c"] == 1
+
+
+def test_reconcile_prunes_stale_purchase_when_current_net_is_zero(db_session):
+    item = _make_purchased_item(db_session, "BUY-STALE", stock=0.0)
+    plan = ProductionPlanHeader(
+        name="План июнь",
+        period_from=date(2026, 6, 1),
+        period_to=date(2026, 6, 30),
+        status="fixed",
+        created_by="test",
+    )
+    db_session.add(plan)
+    db_session.flush()
+    db_session.add(
+        ProductionPlanLine(
+            plan_id=plan.id,
+            item_id=item.item_id,
+            bucket_date=date(2026, 6, 15),
+            qty=50,
+        )
+    )
+    db_session.commit()
+
+    snap = create_mrp_snapshot_from_period_plan(db_session, plan.id)
+    run_id = snap["run_id"]
+    purchase = db_session.query(PlannedPurchase).filter_by(run_id=run_id, item_id=item.item_id).one()
+    assert float(purchase.qty) == 50.0
+
+    item.stock_qty = 50.0
+    db_session.commit()
+
+    res = reconcile_snapshot(db_session, run_id)
+
+    assert len(res["purchase_pruned"]) == 1
+    assert res["purchase_pruned"][0]["item_id"] == item.item_id
+    assert res["purchase_pruned"][0]["removed_qty"] == 50.0
+    assert db_session.query(PlannedPurchase).filter_by(run_id=run_id, item_id=item.item_id).count() == 0
+    req = db_session.query(MrpRequirement).filter_by(run_id=run_id, item_id=item.item_id).one()
+    assert float(req.net_required_qty) == 0.0
+    assert float(req.covered_qty) == 0.0
+    assert float(req.remaining_qty) == 0.0
 
 
 # ---------------------------------------------------------------------------
