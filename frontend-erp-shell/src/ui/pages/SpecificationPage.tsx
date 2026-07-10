@@ -7,8 +7,10 @@ import type {
   SpecFlatRow,
   SpecNode,
 } from '../../domain/specification'
+import { downloadBase64File } from '../../lib/download'
 import { qty } from '../../lib/format'
 import {
+  exportSpecificationXlsx,
   getSpecificationFlattened,
   getSpecificationFull,
   getSpecificationQuality,
@@ -105,6 +107,7 @@ export function SpecificationPage() {
   const [selectedNode, setSelectedNode] = useState<SpecFlatRow | null>(null)
   const [selectedFlat, setSelectedFlat] = useState<BomFlattenedItem | null>(null)
   const [loading, setLoading] = useState(false)
+  const [exporting, setExporting] = useState(false)
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
   const [repairAction, setRepairAction] = useState<RepairAction | null>(null)
@@ -201,6 +204,25 @@ export function SpecificationPage() {
     })
   }
 
+  async function exportXlsx() {
+    if (!loaded) return
+    setExporting(true)
+    setError('')
+    try {
+      const response = await exportSpecificationXlsx({
+        item_id: loaded.item.item_id,
+        root_qty: rootQty,
+        max_depth: 20,
+        replenishment_method: methodFilter || undefined,
+      })
+      downloadBase64File(response, `specification_${loaded.item.item_article || loaded.item.item_code}.xlsx`)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setExporting(false)
+    }
+  }
+
   const selectedTitle = selectedNode ? nodeTitle(selectedNode) : selectedFlat?.name ?? itemTitle(loaded?.item)
 
   return (
@@ -258,6 +280,7 @@ export function SpecificationPage() {
             </select>
           </label>
           <div className="commandBarSpacer" />
+          {loaded && <button onClick={() => void exportXlsx()} disabled={loading || exporting}>XLSX</button>}
           {loaded && <button onClick={() => void loadItem(loaded.item)} disabled={loading}>Обновить</button>}
         </div>
 

@@ -7,6 +7,13 @@ import type {
 } from '../domain/specification'
 import { api } from '../lib/api'
 
+type ExportResponse = {
+  data_base64?: string
+  filename?: string
+  content_type?: string
+  format?: string
+}
+
 export function getSpecificationFull(params: { item_code?: string; item_id?: number; root_qty?: number; max_depth?: number }) {
   const search = new URLSearchParams()
   if (params.item_id != null) search.set('item_id', String(params.item_id))
@@ -48,4 +55,14 @@ export function getSpecificationQuality(params: { item_id?: number; item_code?: 
   if (params.item_code) search.set('item_code', params.item_code)
   search.set('max_depth', String(params.max_depth ?? 15))
   return api<BomQualityResponse>(`/v1/specification/quality?${search.toString()}`)
+}
+
+export function exportSpecificationXlsx(params: { item_id?: number; item_code?: string; root_qty?: number; max_depth?: number; replenishment_method?: string }) {
+  const search = new URLSearchParams()
+  if (params.item_id != null) search.set('item_id', String(params.item_id))
+  if (params.item_code) search.set('item_code', params.item_code)
+  search.set('root_qty', String(params.root_qty ?? 1))
+  search.set('max_depth', String(params.max_depth ?? 20))
+  if (params.replenishment_method) search.set('replenishment_method', params.replenishment_method)
+  return api<ExportResponse>(`/v1/specification/export?${search.toString()}`)
 }
