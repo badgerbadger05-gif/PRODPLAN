@@ -70,11 +70,17 @@ function qualitySeverityClass(severity: string) {
   return 'ready'
 }
 
-function useFilteredRows(rows: SpecFlatRow[], query: string) {
+function normalizeFilterValue(value?: string | null) {
+  return String(value || '').trim().toLowerCase()
+}
+
+function useFilteredRows(rows: SpecFlatRow[], query: string, replenishmentMethod: string) {
   return useMemo(() => {
     const text = query.trim().toLowerCase()
-    if (!text) return rows
+    const method = normalizeFilterValue(replenishmentMethod)
+    if (!text && !method) return rows
     return rows.filter((row) => {
+      if (method && normalizeFilterValue(row.replenishmentMethod) !== method) return false
       const haystack = [
         nodeTitle(row),
         row.article,
@@ -83,14 +89,15 @@ function useFilteredRows(rows: SpecFlatRow[], query: string) {
         row.replenishmentMethod,
         ...(row.warnings ?? []),
       ].filter(Boolean).join(' ').toLowerCase()
-      return haystack.includes(text)
+      return !text || haystack.includes(text)
     })
-  }, [rows, query])
+  }, [rows, query, replenishmentMethod])
 }
 
 export function SpecificationPage() {
   const [query, setQuery] = useState('')
   const [treeFilter, setTreeFilter] = useState('')
+  const [methodFilter, setMethodFilter] = useState('')
   const [rootQty, setRootQty] = useState(1)
   const [tab, setTab] = useState<BomTab>('tree')
   const [searchItems, setSearchItems] = useState<BomItem[]>([])
@@ -104,7 +111,22 @@ export function SpecificationPage() {
   const [picking, setPicking] = useState(false)
 
   const rows = useMemo(() => flatten(loaded?.nodes ?? []), [loaded])
-  const filteredRows = useFilteredRows(rows, treeFilter)
+  const filteredRows = useFilteredRows(rows, treeFilter, methodFilter)
+  const methodOptions = useMemo(() => {
+    const methods = new Set<string>()
+    rows.forEach((row) => {
+      if (row.type === 'item' && row.replenishmentMethod) methods.add(row.replenishmentMethod)
+    })
+    ;(loaded?.flattened ?? []).forEach((row) => {
+      if (row.replenishment_method) methods.add(row.replenishment_method)
+    })
+    return Array.from(methods).sort((a, b) => a.localeCompare(b, 'ru'))
+  }, [rows, loaded?.flattened])
+  const filteredFlattened = useMemo(() => {
+    const method = normalizeFilterValue(methodFilter)
+    if (!method) return loaded?.flattened ?? []
+    return (loaded?.flattened ?? []).filter((row) => normalizeFilterValue(row.replenishment_method) === method)
+  }, [loaded?.flattened, methodFilter])
   const itemRows = rows.filter((row) => row.type === 'item')
   const operationRows = rows.filter((row) => row.type === 'operation')
   const warningsCount = rows.reduce((sum, row) => sum + (row.warnings?.length ?? 0), 0)
@@ -226,6 +248,15 @@ export function SpecificationPage() {
             <span>Фильтр дерева</span>
             <input value={treeFilter} onChange={(e) => setTreeFilter(e.target.value)} placeholder="Узел, этап, проблема" />
           </label>
+          <label className="inlineControl">
+            <span>Метод</span>
+            <select value={methodFilter} onChange={(e) => setMethodFilter(e.target.value)} disabled={!loaded}>
+              <option value="">Все</option>
+              {methodOptions.map((method) => (
+                <option key={method} value={method}>{method}</option>
+              ))}
+            </select>
+          </label>
           <div className="commandBarSpacer" />
           {loaded && <button onClick={() => void loadItem(loaded.item)} disabled={loading}>Обновить</button>}
         </div>
@@ -335,6 +366,7 @@ export function SpecificationPage() {
                       <tr>
                         <th>Компонент</th>
                         <th>Артикул</th>
+                        <th>Метод</th>
                         <th>Итого</th>
                         <th>Ед.</th>
                         <th>Вхождений</th>
@@ -343,10 +375,11 @@ export function SpecificationPage() {
                       </tr>
                     </thead>
                     <tbody>
-                      {loaded.flattened.map((row) => (
+                      {filteredFlattened.map((row) => (
                         <tr key={row.item_id} className={selectedFlat?.item_id === row.item_id ? 'activeRow' : ''} onClick={() => setSelectedFlat(row)}>
                           <td className="itemCell"><strong>{row.name}</strong><span>{row.item_code}</span></td>
                           <td>{row.article || ''}</td>
+                          <td>{row.replenishment_method || ''}</td>
                           <td className="numCell"><strong>{qty(row.total_qty)}</strong></td>
                           <td>{row.unit || ''}</td>
                           <td className="numCell"><strong>{row.occurrences}</strong></td>
