@@ -1,4 +1,5 @@
 import {
+  purchaseIdsForRow,
   purchaseLineStatusLabel,
   purchaseLineStatusPillClass,
   supplyPhaseLabel,
@@ -12,14 +13,14 @@ import { purchaseOrderColumns, type PurchaseOrderSortKey } from './purchaseOrder
 type Props = {
   rows: PurchaseRow[]
   activeRow: PurchaseRow | null
-  selectedPurchaseIds: Set<number>
+  selectedPurchaseRowKeys: Set<string>
   sort: TableSortState<PurchaseOrderSortKey>
-  onSelectPurchaseIds: (ids: Set<number>) => void
+  onSelectPurchaseRowKeys: (rowKeys: Set<string>) => void
   onActivate: (rowKey: string) => void
   onToggleSort: (key: PurchaseOrderSortKey) => void
 }
 
-export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseIds, sort, onSelectPurchaseIds, onActivate, onToggleSort }: Props) {
+export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseRowKeys, sort, onSelectPurchaseRowKeys, onActivate, onToggleSort }: Props) {
   return (
     <table className="journalTable productionOrdersTable" style={{ minWidth: tableMinWidth(purchaseOrderColumns) }}>
       <colgroup>
@@ -41,18 +42,21 @@ export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseIds, sort
         </tr>
       </thead>
       <tbody>
-        {rows.map((row) => (
+        {rows.map((row) => {
+          const purchaseIds = purchaseIdsForRow(row)
+          const purchaseTitle = purchaseIds.map((id) => `MRP #${id}`).join(', ')
+          return (
           <tr key={row.row_key} className={row.row_key === activeRow?.row_key ? 'activeRow' : ''} onClick={() => onActivate(row.row_key)}>
             <td className="checkCol">
-              {row.line_status === 'to_order' && row.purchase_id !== null && (
+              {row.line_status === 'to_order' && purchaseIds.length > 0 && (
                 <input
                   type="checkbox"
-                  checked={selectedPurchaseIds.has(row.purchase_id)}
+                  checked={selectedPurchaseRowKeys.has(row.row_key)}
                   onChange={(e) => {
-                    const next = new Set(selectedPurchaseIds)
-                    if (e.target.checked) next.add(row.purchase_id as number)
-                    else next.delete(row.purchase_id as number)
-                    onSelectPurchaseIds(next)
+                    const next = new Set(selectedPurchaseRowKeys)
+                    if (e.target.checked) next.add(row.row_key)
+                    else next.delete(row.row_key)
+                    onSelectPurchaseRowKeys(next)
                   }}
                   onClick={(e) => e.stopPropagation()}
                 />
@@ -61,7 +65,9 @@ export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseIds, sort
             <td className={`orderCell ${row.order_ref1c ? 'oneCOrderCell' : ''}`}>
               {row.line_status === 'to_order' ? (
                 <>
-                  <strong title={`MRP #${row.purchase_id}`}>MRP #{row.purchase_id}</strong>
+                  <strong title={purchaseTitle}>
+                    MRP #{row.purchase_id ?? purchaseIds[0]}{purchaseIds.length > 1 ? ` +${purchaseIds.length - 1}` : ''}
+                  </strong>
                   <span title={`заказ ${dateRu(row.order_date) || '—'}`}>заказ {dateRu(row.order_date) || '—'}</span>
                 </>
               ) : (
@@ -116,7 +122,8 @@ export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseIds, sort
               {row.amount > 0 ? qty(row.amount) : <span className="muted">—</span>}
             </td>
           </tr>
-        ))}
+          )
+        })}
       </tbody>
     </table>
   )

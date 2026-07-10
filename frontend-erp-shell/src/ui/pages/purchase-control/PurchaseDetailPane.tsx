@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import {
+  purchaseIdsForRow,
   purchaseLineStatusLabel,
   purchaseLineStatusPillClass,
   supplyPhaseLabel,
@@ -46,6 +47,7 @@ export function PurchaseDetailPane({ activeRow }: Props) {
   const mrpHref = activeRow.run_id && activeRow.purchase_id
     ? `#/mrp-runs/${activeRow.run_id}?tab=purchases&purchase_id=${activeRow.purchase_id}`
     : null
+  const purchaseIds = purchaseIdsForRow(activeRow)
 
   return (
     <aside className="detailPane">
@@ -55,7 +57,7 @@ export function PurchaseDetailPane({ activeRow }: Props) {
       <div className="detailGrid">
         {activeRow.line_status === 'to_order' ? (
           <>
-            <span>Закупка MRP</span><strong>#{activeRow.purchase_id}</strong>
+            <span>Закупка MRP</span><strong>{purchaseIds.map((id) => `#${id}`).join(', ') || '—'}</strong>
             <span>Дата заказа</span><strong>{dateRu(activeRow.order_date) || '—'}</strong>
             <span>Дата потребности</span><strong>{dateRu(activeRow.need_date) || '—'}</strong>
           </>

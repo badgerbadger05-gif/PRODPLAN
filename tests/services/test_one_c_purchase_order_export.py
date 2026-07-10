@@ -311,3 +311,199 @@ def test_purchase_order_export_stamps_sync_links_for_source_purchases(db_session
     assert {link.target_ref_key for link in links} == {"purchase-order-ref"}
     assert {link.target_entity for link in links} == {"Document_ЗаказПоставщику"}
     assert {link.status for link in links} == {"success"}
+
+
+def test_purchase_order_export_creates_delta_order_after_old_filled_order(db_session, monkeypatch):
+    db = db_session
+    item = Item(
+        item_code="PO-1C-DELTA",
+        item_name="Дозаявка",
+        item_article="DELTA",
+        item_ref1c="item-ref-delta",
+        supplier_ref1c="supplier-delta",
+        replenishment_method="Покупка",
+        status="active",
+    )
+    db.add(item)
+    db.flush()
+    run = _mk_run(db)
+    purchase = PlannedPurchase(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        requested_qty=7,
+        planned_qty=7,
+        qty=7,
+        need_date=datetime.date(2026, 5, 25),
+        order_date=datetime.date(2026, 5, 20),
+        lead_time_days=5,
+        bucket_date=datetime.date(2026, 5, 25),
+    )
+    db.add(purchase)
+    db.commit()
+
+    first_number = exporter._short_order_number(run.run_id, 1)
+    second_number = exporter._short_order_number(run.run_id, 2)
+
+    class FakeClient:
+        posted_payload = None
+
+        def __init__(self, **kwargs):
+            pass
+
+        def get_all(self, *args, **kwargs):
+            number = first_number if first_number in kwargs["filter_query"] else second_number
+            if number == first_number:
+                return [{
+                    "Ref_Key": "old-order-ref",
+                    "Number": first_number,
+                    "Контрагент_Key": "supplier-delta",
+                    "Комментарий": (
+                        f"PRODPLAN source=planned_purchase/run:{run.run_id}; "
+                        f"number={first_number}"
+                    ),
+                    "Запасы": [{"Количество": 3}],
+                }]
+            return []
+
+        def post(self, entity, payload):
+            # A success link must not be recorded until the delta is in the
+            # document payload and 1C has accepted the POST.
+            assert db.query(SyncLink).filter_by(
+                source_doctype="planned_purchase", source_id=purchase.purchase_id
+            ).count() == 0
+            assert payload["Number"] == second_number
+            assert payload["Запасы"][0]["Количество"] == 7.0
+            self.__class__.posted_payload = payload
+            return {"Ref_Key": "delta-order-ref"}
+
+    monkeypatch.setattr(exporter, "_load_odata_config", lambda: {
+        "base_url": "http://mtzdock/unf_demo/odata/standard.odata"
+    })
+    monkeypatch.setattr(exporter, "OData1CClient", FakeClient)
+
+    result = export_planned_purchases_to_1c(db, run.run_id, dry_run=False)
+
+    assert result["status"] == "ok"
+    assert result["orders_created"] == 1
+    assert result["orders"][0]["number"] == second_number
+    assert FakeClient.posted_payload["Запасы"][0]["Количество"] == 7.0
+    link = db.query(SyncLink).filter_by(
+        source_doctype="planned_purchase", source_id=purchase.purchase_id
+    ).one()
+    assert link.status == "success"
+    assert link.target_ref_key == "delta-order-ref"
+
+
+def test_purchase_order_export_recovers_exact_posted_batch_without_duplicate(db_session, monkeypatch):
+    db = db_session
+    item = Item(
+        item_code="PO-1C-RETRY",
+        item_name="Повтор экспорта",
+        item_article="RETRY",
+        item_ref1c="item-ref-retry",
+        supplier_ref1c="supplier-retry",
+        replenishment_method="Покупка",
+        status="active",
+    )
+    db.add(item)
+    db.flush()
+    run = _mk_run(db)
+    purchase = PlannedPurchase(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        requested_qty=11,
+        planned_qty=11,
+        qty=11,
+        need_date=datetime.date(2026, 6, 1),
+        order_date=datetime.date(2026, 5, 27),
+        lead_time_days=5,
+        bucket_date=datetime.date(2026, 6, 1),
+    )
+    db.add(purchase)
+    db.commit()
+
+    class FakeClient:
+        stored_doc = None
+        post_count = 0
+
+        def __init__(self, **kwargs):
+            pass
+
+        def get_all(self, *args, **kwargs):
+            return [self.__class__.stored_doc] if self.__class__.stored_doc else []
+
+        def post(self, entity, payload):
+            self.__class__.post_count += 1
+            self.__class__.stored_doc = {
+                **payload,
+                "Ref_Key": "retry-order-ref",
+                "Контрагент_Key": payload["Контрагент_Key"],
+            }
+            return {"Ref_Key": "retry-order-ref"}
+
+    monkeypatch.setattr(exporter, "_load_odata_config", lambda: {
+        "base_url": "http://mtzdock/unf_demo/odata/standard.odata"
+    })
+    monkeypatch.setattr(exporter, "OData1CClient", FakeClient)
+
+    first = export_planned_purchases_to_1c(db, run.run_id, dry_run=False)
+    assert first["orders_created"] == 1
+    assert FakeClient.post_count == 1
+
+    # Simulate the narrow failure window: 1C kept the POST, while the local
+    # transaction (including its success link) was lost.
+    db.query(SyncLink).filter_by(
+        source_doctype="planned_purchase", source_id=purchase.purchase_id
+    ).delete()
+    db.commit()
+
+    second = export_planned_purchases_to_1c(db, run.run_id, dry_run=False)
+
+    assert second["status"] == "ok"
+    assert second["orders_created"] == 0
+    assert second["orders_existing"] == 1
+    assert FakeClient.post_count == 1
+    link = db.query(SyncLink).filter_by(
+        source_doctype="planned_purchase", source_id=purchase.purchase_id
+    ).one()
+    assert link.status == "success"
+    assert link.target_ref_key == "retry-order-ref"
+
+
+def test_purchase_order_batch_token_is_independent_of_line_order():
+    first = exporter.PurchaseOrderExportLine(
+        purchase_ids=[12, 10],
+        item_id=2,
+        item_ref1c="item-b",
+        item_name="Одинаковое имя",
+        item_article="SAME",
+        unit_ref1c="unit-ref",
+        unit_name="шт",
+        qty=5,
+        need_date="2026-06-01",
+        order_date="2026-05-27",
+    )
+    second = exporter.PurchaseOrderExportLine(
+        purchase_ids=[11],
+        item_id=1,
+        item_ref1c="item-a",
+        item_name="Одинаковое имя",
+        item_article="SAME",
+        unit_ref1c="unit-ref",
+        unit_name="шт",
+        qty=7,
+        need_date="2026-06-01",
+        order_date="2026-05-27",
+    )
+    forward = exporter.PurchaseOrderExportGroup(
+        supplier_ref1c="supplier-token",
+        number="PP-1",
+        lines=[first, second],
+    )
+    reversed_group = exporter.PurchaseOrderExportGroup(
+        supplier_ref1c="supplier-token",
+        number="PP-99",
+        lines=[second, first],
+    )
+
+    assert exporter._group_batch_token(forward) == exporter._group_batch_token(reversed_group)

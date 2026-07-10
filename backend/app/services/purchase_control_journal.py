@@ -9,6 +9,7 @@ via supplier order sync. See .docs/purchase_journal_plan.md.
 """
 from __future__ import annotations
 
+import hashlib
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -25,6 +26,7 @@ from ..models import (
     SyncLink,
     Unit,
 )
+from .one_c_export_common import clean_ref1c as _clean_ref1c
 from .one_c_purchase_order_export import PURCHASE_ORDER_ENTITY
 from .supplier_order_status import (
     normalize_state as _normalize_state,
@@ -174,6 +176,12 @@ def _unit_label(units_by_ref: Dict[str, str], value: Optional[str]) -> Optional[
     return units_by_ref.get(raw.lower(), raw)
 
 
+def _to_order_row_key(run_id: int, group_key: tuple) -> str:
+    """Return an id stable across top-ups to the same purchase need."""
+    digest = hashlib.sha256(repr((int(run_id), group_key)).encode("utf-8")).hexdigest()[:16]
+    return f"purchase-group:{int(run_id)}:{int(group_key[0])}:{digest}"
+
+
 def _supplier_order_rows(
     db: Session,
     *,
@@ -230,6 +238,7 @@ def _supplier_order_rows(
                 "row_key": f"line:{int(line.item_id)}",
                 "line_id": int(line.item_id),
                 "purchase_id": None,
+                "source_purchase_ids": [],
                 "order_id": int(order.order_id),
                 "order_number": str(order.order_number or ""),
                 "order_date": _date_to_iso(order.order_date),
@@ -286,15 +295,22 @@ def _to_order_rows(
         .filter(PlannedPurchase.run_id == int(run_id))
         .filter(PlannedPurchase.qty > 0)
     )
-    rows: List[Dict[str, Any]] = []
+    # Reconciliation can append several PlannedPurchase rows for the same
+    # business need.  They must remain separate database records (each one can
+    # have its own SyncLink), but the purchase journal presents the outstanding
+    # need as one row.  Keep every source id in the read model so callers can
+    # expand a selected journal row back to the records required by the 1C
+    # export endpoint.
+    grouped_rows: Dict[tuple, Dict[str, Any]] = {}
     for purchase, item in query.all():
         if int(purchase.purchase_id) in exported:
             continue
-        supplier_ref = str(purchase.supplier_ref1c or item.supplier_ref1c or "").lower()
-        row_supplier_id = supplier_ids_by_ref.get(supplier_ref)
+        supplier_ref = _clean_ref1c(purchase.supplier_ref1c or item.supplier_ref1c)
+        supplier_lookup_ref = supplier_ref.lower()
+        row_supplier_id = supplier_ids_by_ref.get(supplier_lookup_ref)
         if supplier_id is not None and row_supplier_id != int(supplier_id):
             continue
-        supplier_name = suppliers_by_ref.get(supplier_ref, "")
+        supplier_name = suppliers_by_ref.get(supplier_lookup_ref, "")
         if needle:
             haystack = " ".join(
                 str(v or "").lower()
@@ -304,11 +320,24 @@ def _to_order_rows(
                 continue
         need = _to_date(purchase.need_date)
         qty = _to_float(purchase.qty)
-        rows.append(
-            {
-                "row_key": f"purchase:{int(purchase.purchase_id)}",
+        purchase_id = int(purchase.purchase_id)
+        need_iso = need.isoformat() if need else None
+        unit = _unit_label(units_by_ref, item.unit)
+        group_key = (
+            int(item.item_id),
+            supplier_ref,
+            need_iso,
+            _clean_ref1c(item.unit) or str(unit or "").strip(),
+        )
+        row = grouped_rows.get(group_key)
+        if row is None:
+            grouped_rows[group_key] = {
+                "row_key": _to_order_row_key(int(run_id), group_key),
                 "line_id": None,
-                "purchase_id": int(purchase.purchase_id),
+                # Retained for backwards compatibility and deep links.  New
+                # consumers should use source_purchase_ids for export.
+                "purchase_id": purchase_id,
+                "source_purchase_ids": [purchase_id],
                 "order_id": None,
                 "order_number": "",
                 "order_date": _date_to_iso(purchase.order_date),
@@ -323,19 +352,32 @@ def _to_order_rows(
                 "item_code": str(item.item_code or ""),
                 "item_article": item.item_article,
                 "item_name": str(item.item_name or ""),
-                "unit": _unit_label(units_by_ref, item.unit),
+                "unit": unit,
                 "quantity": qty,
                 "received_qty": 0.0,
                 "remaining_qty": qty,
                 "delivery_date": None,
-                "need_date": need.isoformat() if need else None,
+                "need_date": need_iso,
                 "overdue_days": (today - need).days if need and need < today else 0,
                 "line_status": "to_order",
                 "price": 0.0,
                 "amount": 0.0,
                 "run_id": int(run_id),
             }
-        )
+            continue
+
+        row["source_purchase_ids"].append(purchase_id)
+        row["quantity"] += qty
+        row["remaining_qty"] += qty
+        order_date = _date_to_iso(purchase.order_date)
+        if order_date and (not row["order_date"] or order_date < row["order_date"]):
+            row["order_date"] = order_date
+
+    rows = list(grouped_rows.values())
+    for row in rows:
+        source_ids = sorted(set(row["source_purchase_ids"]))
+        row["source_purchase_ids"] = source_ids
+        row["purchase_id"] = source_ids[0]
     return rows
 
 

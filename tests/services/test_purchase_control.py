@@ -196,6 +196,7 @@ def test_list_journal_includes_unordered_mrp_purchases(db_session):
     assert len(to_order) == 1
     row = to_order[0]
     assert row["purchase_id"] == pending.purchase_id
+    assert row["source_purchase_ids"] == [pending.purchase_id]
     assert row["quantity"] == 7
     assert row["need_date"] == "2026-06-30"
     assert row["supplier_name"] == "ООО Метиз"
@@ -205,6 +206,86 @@ def test_list_journal_includes_unordered_mrp_purchases(db_session):
 
     without = list_journal(db_session, include_to_order=False, today=TODAY)
     assert all(r["line_status"] != "to_order" for r in without["rows"])
+
+
+def test_list_journal_aggregates_duplicate_unordered_mrp_purchases(db_session):
+    run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={})
+    db_session.add(run)
+    db_session.flush()
+    _make_supplier(db_session, "s-ref-1", "ООО Метиз")
+    _make_supplier(db_session, "s-ref-2", "ООО Сталь")
+    item = _make_item(db_session, "M-1", "Болт М10", supplier_ref="s-ref-1")
+
+    def _purchase(qty, need_date, order_date, supplier_ref="s-ref-1"):
+        purchase = PlannedPurchase(
+            run_id=run.run_id,
+            item_id=item.item_id,
+            requested_qty=qty,
+            planned_qty=qty,
+            qty=qty,
+            need_date=need_date,
+            order_date=order_date,
+            lead_time_days=10,
+            bucket_date=need_date,
+            supplier_ref1c=supplier_ref,
+        )
+        db_session.add(purchase)
+        db_session.flush()
+        return purchase
+
+    first = _purchase(1.032, date(2026, 8, 31), date(2026, 8, 18))
+    second = _purchase(1.032, date(2026, 8, 31), date(2026, 8, 17))
+    exported = _purchase(9, date(2026, 8, 31), date(2026, 8, 16))
+    other_date = _purchase(3, date(2026, 9, 1), date(2026, 8, 19))
+    other_supplier = _purchase(4, date(2026, 8, 31), date(2026, 8, 18), "s-ref-2")
+    db_session.add(
+        SyncLink(
+            source_doctype="planned_purchase",
+            source_id=exported.purchase_id,
+            target_entity=PURCHASE_ORDER_ENTITY,
+            target_ref_key="ref-po-exported",
+            status="success",
+        )
+    )
+    db_session.commit()
+
+    result = list_journal(db_session, today=TODAY)
+
+    assert result["total"] == 3
+    assert result["summary"]["to_order"] == 3
+    aggregated = next(
+        row
+        for row in result["rows"]
+        if row["need_date"] == "2026-08-31" and row["supplier_name"] == "ООО Метиз"
+    )
+    assert aggregated["purchase_id"] == min(first.purchase_id, second.purchase_id)
+    assert aggregated["source_purchase_ids"] == sorted([first.purchase_id, second.purchase_id])
+    assert aggregated["quantity"] == 2.064
+    assert aggregated["remaining_qty"] == 2.064
+    assert aggregated["order_date"] == "2026-08-17"
+    row_key = aggregated["row_key"]
+    assert row_key.startswith(f"purchase-group:{run.run_id}:{item.item_id}:")
+
+    separate_ids = {
+        tuple(row["source_purchase_ids"])
+        for row in result["rows"]
+        if row is not aggregated
+    }
+    assert separate_ids == {(other_date.purchase_id,), (other_supplier.purchase_id,)}
+
+    top_up = _purchase(1, date(2026, 8, 31), date(2026, 8, 20))
+    db_session.commit()
+    refreshed = list_journal(db_session, today=TODAY)
+    refreshed_aggregate = next(
+        row
+        for row in refreshed["rows"]
+        if row["need_date"] == "2026-08-31" and row["supplier_name"] == "ООО Метиз"
+    )
+    assert refreshed_aggregate["row_key"] == row_key
+    assert refreshed_aggregate["source_purchase_ids"] == sorted(
+        [first.purchase_id, second.purchase_id, top_up.purchase_id]
+    )
+    assert refreshed_aggregate["quantity"] == 3.064
 
 
 def test_list_journal_resolves_unit_guid_to_label(db_session):

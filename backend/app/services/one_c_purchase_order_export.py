@@ -116,6 +116,7 @@ def _collect_purchase_groups(
     selected_ids = sorted({int(pid) for pid in (purchase_ids or []) if int(pid) > 0})
     if selected_ids:
         q = q.filter(PlannedPurchase.purchase_id.in_(selected_ids))
+    q = q.order_by(PlannedPurchase.purchase_id.asc())
 
     missing: List[Dict[str, Any]] = []
     grouped: Dict[str, Dict[Tuple[int, str, Optional[str]], PurchaseOrderExportLine]] = {}
@@ -250,6 +251,53 @@ def _has_stock_lines(doc: Dict[str, Any]) -> bool:
     return isinstance(lines, list) and len(lines) > 0
 
 
+def _group_batch_token(group: PurchaseOrderExportGroup) -> str:
+    """Identify the exact delta independently of the 1C document number.
+
+    The token lets a retry recover after 1C accepted the document but the local
+    SyncLink transaction did not commit.  Source purchase ids are intentionally
+    included: a later delta with the same item and quantity is still a distinct
+    export batch.
+    """
+    lines = [
+        {
+            "purchase_ids": sorted(int(pid) for pid in line.purchase_ids),
+            "item_id": int(line.item_id),
+            "item_ref1c": line.item_ref1c,
+            "unit_ref1c": line.unit_ref1c,
+            "unit_name": line.unit_name,
+            "qty": float(line.qty or 0.0),
+            "need_date": line.need_date,
+            "order_date": line.order_date,
+        }
+        for line in group.lines
+    ]
+    lines.sort(
+        key=lambda line: (
+            line["item_id"],
+            line["item_ref1c"] or "",
+            line["unit_ref1c"] or "",
+            line["unit_name"] or "",
+            line["need_date"] or "",
+            line["order_date"] or "",
+            tuple(line["purchase_ids"]),
+        )
+    )
+    return _payload_hash({"supplier_ref1c": group.supplier_ref1c, "lines": lines})
+
+
+def _order_comment(run_id: int, group: PurchaseOrderExportGroup) -> str:
+    return (
+        f"PRODPLAN source=planned_purchase/run:{int(run_id)}; "
+        f"number={group.number}; batch={_group_batch_token(group)}"
+    )
+
+
+def _has_batch_token(doc: Dict[str, Any], group: PurchaseOrderExportGroup) -> bool:
+    comment = str(doc.get("Комментарий") or "")
+    return f"batch={_group_batch_token(group)}" in comment
+
+
 def _is_prodplan_order_for_run(doc: Dict[str, Any], run_id: int) -> bool:
     comment = str(doc.get("Комментарий") or "")
     return f"PRODPLAN source=planned_purchase/run:{int(run_id)}" in comment
@@ -272,7 +320,12 @@ def _ensure_free_or_reusable_number(
             existing_supplier == group.supplier_ref1c
             and _is_prodplan_order_for_run(existing, run_id)
         ):
-            return existing
+            # An empty header is safe to reuse.  A filled document is reusable
+            # only when it is the exact same delta: this is the recovery path
+            # for "POST succeeded, local SyncLink commit failed".  A filled
+            # older batch must never be treated as if it contained new qty.
+            if not _has_stock_lines(existing) or _has_batch_token(existing, group):
+                return existing
         index += 1
     raise RuntimeError(f"Не удалось подобрать свободный номер заказа для поставщика {group.supplier_ref1c}")
 
@@ -324,7 +377,10 @@ def export_planned_purchases_to_1c(
                 if not _has_stock_lines(existing_doc):
                     if not group.target_ref_key:
                         raise RuntimeError(f"1C did not return Ref_Key for existing {group.number}")
-                    patch_payload = {"Запасы": _order_lines_payload(group.target_ref_key, group)}
+                    patch_payload = {
+                        "Комментарий": _order_comment(run_id, group),
+                        "Запасы": _order_lines_payload(group.target_ref_key, group),
+                    }
                     client.patch(_doc_endpoint(group.target_ref_key), patch_payload)
                     group.status = "created"
                     created += 1
@@ -348,7 +404,7 @@ def export_planned_purchases_to_1c(
                 "Posted": False,
                 "Контрагент_Key": group.supplier_ref1c,
                 "ДатаПоступления": _fmt_1c_datetime(min_need),
-                "Комментарий": f"PRODPLAN source=planned_purchase/run:{int(run_id)}; number={group.number}",
+                "Комментарий": _order_comment(run_id, group),
                 "Запасы": [],
             }
             header_payload["Запасы"] = _order_lines_payload("", group)

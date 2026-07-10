@@ -14,6 +14,7 @@ export type PurchaseRow = {
   row_key: string
   line_id: number | null
   purchase_id: number | null
+  source_purchase_ids?: number[]
   order_id: number | null
   order_number: string
   order_date: string | null
@@ -39,6 +40,14 @@ export type PurchaseRow = {
   price: number
   amount: number
   run_id: number | null
+}
+
+export function purchaseIdsForRow(row: Pick<PurchaseRow, 'purchase_id' | 'source_purchase_ids'>): number[] {
+  const ids = [
+    ...(row.purchase_id === null ? [] : [row.purchase_id]),
+    ...(row.source_purchase_ids ?? []),
+  ]
+  return [...new Set(ids.filter((id) => Number.isInteger(id) && id > 0))]
 }
 
 export type PurchaseJournalSummary = {

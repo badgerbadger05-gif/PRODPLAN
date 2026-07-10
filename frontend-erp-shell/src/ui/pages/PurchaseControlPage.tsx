@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import {
+  purchaseIdsForRow,
   purchaseLineStatusLabel,
   supplyPhaseLabel,
   type PurchaseFilters,
@@ -25,7 +26,9 @@ import type { PurchaseOrderSortKey } from './purchase-control/purchaseOrdersDoct
 const limit = 100
 
 const csvColumns: Array<[string, (row: PurchaseRow) => string | number]> = [
-  ['Заказ', (row) => row.line_status === 'to_order' ? `MRP #${row.purchase_id}` : row.order_number],
+  ['Заказ', (row) => row.line_status === 'to_order'
+    ? purchaseIdsForRow(row).map((id) => `MRP #${id}`).join(', ')
+    : row.order_number],
   ['Дата заказа', (row) => row.order_date ?? ''],
   ['Поставщик', (row) => row.supplier_name],
   ['Артикул', (row) => row.item_article ?? row.item_code],
@@ -47,7 +50,7 @@ export function PurchaseControlPage() {
   const focusSearch = searchParams.get('search')
   const [rows, setRows] = useState<PurchaseRow[]>([])
   const [summary, setSummary] = useState<PurchaseJournalSummary | null>(null)
-  const [selectedPurchaseIds, setSelectedPurchaseIds] = useState<Set<number>>(new Set())
+  const [selectedPurchaseRowKeys, setSelectedPurchaseRowKeys] = useState<Set<string>>(new Set())
   const [activeKey, setActiveKey] = useState<string | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -74,7 +77,10 @@ export function PurchaseControlPage() {
   }, [filters])
 
   const activeRow = useMemo(() => rows.find((row) => row.row_key === activeKey) ?? rows[0] ?? null, [rows, activeKey])
-  const toOrderRows = useMemo(() => rows.filter((row) => row.line_status === 'to_order' && row.purchase_id !== null), [rows])
+  const toOrderRows = useMemo(
+    () => rows.filter((row) => row.line_status === 'to_order' && purchaseIdsForRow(row).length > 0),
+    [rows],
+  )
 
   const load = useCallback(async (nextOffset: number) => {
     setLoading(true)
@@ -97,13 +103,13 @@ export function PurchaseControlPage() {
       const data = await listPurchaseJournal(params)
       const nextRows = data.rows ?? []
       setRows(nextRows)
-      const visibleIds = new Set(
+      const visibleRowKeys = new Set(
         nextRows
-          .filter((row) => row.line_status === 'to_order' && row.purchase_id !== null)
-          .map((row) => row.purchase_id as number),
+          .filter((row) => row.line_status === 'to_order' && purchaseIdsForRow(row).length > 0)
+          .map((row) => row.row_key),
       )
-      setSelectedPurchaseIds((current) => {
-        const pruned = new Set([...current].filter((id) => visibleIds.has(id)))
+      setSelectedPurchaseRowKeys((current) => {
+        const pruned = new Set([...current].filter((rowKey) => visibleRowKeys.has(rowKey)))
         return pruned.size === current.size ? current : pruned
       })
       setTotal(data.total ?? 0)
@@ -170,8 +176,11 @@ export function PurchaseControlPage() {
       setError('Нет зафиксированного MRP-прогона: нечего заказывать')
       return
     }
-    const visibleIds = new Set(toOrderRows.map((row) => row.purchase_id as number))
-    const ids = Array.from(selectedPurchaseIds).filter((id) => visibleIds.has(id))
+    const ids = [...new Set(
+      toOrderRows
+        .filter((row) => selectedPurchaseRowKeys.has(row.row_key))
+        .flatMap(purchaseIdsForRow),
+    )]
     if (!ids.length) return
     setLoading(true)
     setError('')
@@ -180,7 +189,7 @@ export function PurchaseControlPage() {
       const created = Number(result.orders_created ?? 0)
       const existing = Number(result.orders_existing ?? 0)
       setMessage(`Заказы поставщику: создано ${created}, уже было ${existing}`)
-      setSelectedPurchaseIds(new Set())
+      setSelectedPurchaseRowKeys(new Set())
       await syncSupplierOrdersFrom1C().catch(() => undefined)
       await load(offset)
     } catch (e) {
@@ -239,7 +248,7 @@ export function PurchaseControlPage() {
             visibleFrom={visibleFrom}
             visibleTo={visibleTo}
             total={total}
-            selectedCount={selectedPurchaseIds.size}
+            selectedCount={selectedPurchaseRowKeys.size}
             canPrev={offset > 0}
             canNext={offset + rows.length < total}
             onPrev={() => void load(Math.max(0, offset - limit))}
@@ -248,7 +257,7 @@ export function PurchaseControlPage() {
         )}
       >
         <PurchaseCommandBar
-          selectedCount={selectedPurchaseIds.size}
+          selectedCount={selectedPurchaseRowKeys.size}
           toOrderCount={toOrderRows.length}
           summary={summary}
           activePhase={filters.phase}
@@ -257,8 +266,8 @@ export function PurchaseControlPage() {
           onSyncFrom1C={() => void syncFrom1C()}
           onDownloadCsv={downloadCsv}
           onRefresh={() => void load(offset)}
-          onSelectAllToOrder={() => setSelectedPurchaseIds(new Set(toOrderRows.map((row) => row.purchase_id as number)))}
-          onClearSelection={() => setSelectedPurchaseIds(new Set())}
+          onSelectAllToOrder={() => setSelectedPurchaseRowKeys(new Set(toOrderRows.map((row) => row.row_key)))}
+          onClearSelection={() => setSelectedPurchaseRowKeys(new Set())}
           onShowStatus={showStatus}
           onShowPhase={showPhase}
         />
@@ -278,9 +287,9 @@ export function PurchaseControlPage() {
             <PurchaseOrdersTable
               rows={rows}
               activeRow={activeRow}
-              selectedPurchaseIds={selectedPurchaseIds}
+              selectedPurchaseRowKeys={selectedPurchaseRowKeys}
               sort={{ sortBy: filters.sort_by === 'order_date' ? 'order' : 'delivery_date', sortDir: filters.sort_dir }}
-              onSelectPurchaseIds={setSelectedPurchaseIds}
+              onSelectPurchaseRowKeys={setSelectedPurchaseRowKeys}
               onActivate={setActiveKey}
               onToggleSort={toggleSort}
             />
