@@ -1526,10 +1526,13 @@ def get_period_plan_execution_journal(
         })
 
     # Production: direct 1C orders are not linked to a specific MRP
-    # requirement, but they still execute the same period-plan item demand.
-    direct_prods_by_item: Dict[int, List[Dict[str, Any]]] = {}
-    direct_prod_ordered_by_item: Dict[int, float] = {}
-    direct_prod_done_by_item: Dict[int, float] = {}
+    # requirement.  Allocate them FIFO between period plans, otherwise the
+    # same output is counted in every plan that contains the item and newer
+    # plans can look completed while older ones remain open.
+    direct_prods_by_req_id: Dict[int, List[Dict[str, Any]]] = {}
+    direct_prod_ordered_by_req_id: Dict[int, float] = {}
+    direct_prod_done_by_req_id: Dict[int, float] = {}
+    direct_items_by_item: Dict[int, List[Dict[str, Any]]] = {}
     direct_query = (
         db.query(ProductionProduct, ProductionOrder, ProductionOrderLineState)
         .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
@@ -1544,10 +1547,6 @@ def get_period_plan_execution_journal(
     direct_query = direct_query.filter(
         ProductionOrder.order_date >= datetime.combine(direct_from, datetime.min.time())
     )
-    if plan.period_to:
-        direct_query = direct_query.filter(
-            ProductionOrder.order_date < datetime.combine(plan.period_to + timedelta(days=1), datetime.min.time())
-        )
     direct_prod_rows = direct_query.all()
     for pp, po, state in direct_prod_rows:
         if state and str(state.status or "").lower() in {"cancelled"}:
@@ -1560,10 +1559,8 @@ def get_period_plan_execution_journal(
         done_value = min(qty_value, produced_value)
         if is_done_state and done_value <= 1e-9:
             done_value = qty_value
-        direct_prod_ordered_by_item[item_id] = direct_prod_ordered_by_item.get(item_id, 0.0) + qty_value
-        direct_prod_done_by_item[item_id] = direct_prod_done_by_item.get(item_id, 0.0) + done_value
         planned_finish = state.planned_finish_date if state and state.planned_finish_date else None
-        direct_prods_by_item.setdefault(item_id, []).append({
+        direct_items_by_item.setdefault(item_id, []).append({
             "type": "production_order",
             "product_id": int(pp.product_id),
             "order_id": int(po.order_id),
@@ -1578,6 +1575,89 @@ def get_period_plan_execution_journal(
             "remaining_qty": remaining_value,
             **_forecast_payload(planned_finish, plan.period_to or planned_finish),
         })
+
+    # The target plan and every earlier fixed plan compete for the same direct
+    # 1C output.  Use the newest fixed snapshot of every other plan, while
+    # preserving the explicitly requested snapshot for the target plan.
+    latest_run_by_plan: Dict[int, PlanningRun] = {}
+    for candidate in (
+        db.query(PlanningRun)
+        .join(ProductionPlanHeader, ProductionPlanHeader.id == PlanningRun.source_plan_id)
+        .filter(
+            PlanningRun.status == "FIXED_SNAPSHOT",
+            PlanningRun.source_plan_id.isnot(None),
+            ProductionPlanHeader.period_from <= plan.period_from,
+        )
+        .order_by(PlanningRun.source_plan_id.asc(), PlanningRun.run_id.desc())
+        .all()
+    ):
+        latest_run_by_plan.setdefault(int(candidate.source_plan_id), candidate)
+    latest_run_by_plan[int(plan.id)] = run
+
+    fifo_requirements: Dict[int, List[Tuple[MrpRequirement, ProductionPlanHeader]]] = {}
+    fifo_run_ids = [int(candidate.run_id) for candidate in latest_run_by_plan.values()]
+    if fifo_run_ids:
+        for candidate_req, candidate_plan in (
+            db.query(MrpRequirement, ProductionPlanHeader)
+            .join(PlanningRun, PlanningRun.run_id == MrpRequirement.run_id)
+            .join(ProductionPlanHeader, ProductionPlanHeader.id == PlanningRun.source_plan_id)
+            .filter(
+                MrpRequirement.run_id.in_(fifo_run_ids),
+                MrpRequirement.item_id.in_(item_ids),
+            )
+            .all()
+        ):
+            fifo_requirements.setdefault(int(candidate_req.item_id), []).append((candidate_req, candidate_plan))
+
+    for item_id, direct_items in direct_items_by_item.items():
+        demands = sorted(
+            fifo_requirements.get(item_id, []),
+            key=lambda entry: (
+                entry[1].period_from,
+                entry[1].period_to,
+                int(entry[1].id),
+                int(entry[0].bom_level or 0),
+                int(entry[0].id),
+            ),
+        )
+        for metric, linked_by_req, destination in (
+            ("qty", prod_ordered_by_req_id, direct_prod_ordered_by_req_id),
+            ("completed_qty", prod_done_by_req_id, direct_prod_done_by_req_id),
+        ):
+            available = sum(_to_float(direct_item[metric]) for direct_item in direct_items)
+            for demand, _ in demands:
+                req_id = int(demand.id)
+                capacity = max(0.0, _to_float(demand.net_required_qty) - linked_by_req.get(req_id, 0.0))
+                allocated = min(available, capacity)
+                if allocated > 1e-9:
+                    destination[req_id] = destination.get(req_id, 0.0) + allocated
+                    available -= allocated
+                if available <= 1e-9:
+                    break
+
+        # Keep the order details visible on the plan that received the FIFO
+        # allocation. Quantities in the displayed work item are clipped to the
+        # amount allocated to that requirement.
+        for demand, _ in demands:
+            req_id = int(demand.id)
+            ordered_left = direct_prod_ordered_by_req_id.get(req_id, 0.0)
+            completed_left = direct_prod_done_by_req_id.get(req_id, 0.0)
+            if ordered_left <= 1e-9 and completed_left <= 1e-9:
+                continue
+            for direct_item in direct_items:
+                item_qty = _to_float(direct_item["qty"])
+                item_done = _to_float(direct_item["completed_qty"])
+                allocated_qty = min(ordered_left, item_qty)
+                allocated_done = min(completed_left, item_done, allocated_qty)
+                if allocated_qty <= 1e-9 and allocated_done <= 1e-9:
+                    continue
+                allocated_item = dict(direct_item)
+                allocated_item["qty"] = allocated_qty
+                allocated_item["completed_qty"] = allocated_done
+                allocated_item["remaining_qty"] = max(0.0, allocated_qty - allocated_done)
+                direct_prods_by_req_id.setdefault(req_id, []).append(allocated_item)
+                ordered_left -= allocated_qty
+                completed_left -= allocated_done
 
     # Production: planned MRP tasks. They are the live work queue before real
     # 1C production orders are created, so the execution journal must show them.
@@ -1740,14 +1820,14 @@ def get_period_plan_execution_journal(
 
         if item_flow == REPLENISHMENT_FLOW_PRODUCTION:
             actual_items = prods_by_req_id.get(req_id, [])
-            direct_items = direct_prods_by_item.get(item_id, [])
+            direct_items = direct_prods_by_req_id.get(req_id, [])
             planned_items = planned_orders_by_req_id.get(req_id, [])
-            work_items = actual_items or direct_items or planned_items
+            work_items = actual_items + direct_items or planned_items
             # "В заказах" is the quantity placed into real production orders.
             # Planned MRP tasks remain visible in work_items and in "К запуску",
             # but they are not actual orders yet.
-            ordered_qty = prod_ordered_by_req_id.get(req_id, 0.0) + direct_prod_ordered_by_item.get(item_id, 0.0)
-            completed_qty = prod_done_by_req_id.get(req_id, 0.0) + direct_prod_done_by_item.get(item_id, 0.0)
+            ordered_qty = prod_ordered_by_req_id.get(req_id, 0.0) + direct_prod_ordered_by_req_id.get(req_id, 0.0)
+            completed_qty = prod_done_by_req_id.get(req_id, 0.0) + direct_prod_done_by_req_id.get(req_id, 0.0)
         elif item_flow == REPLENISHMENT_FLOW_PURCHASE:
             work_items = purchases_by_req_id.get(req_id, []) or purchases_by_item_fallback.get(item_id, [])
             ordered_qty = purchase_ordered_by_req_id.get(req_id, purchase_ordered_by_item_fallback.get(item_id, 0.0))

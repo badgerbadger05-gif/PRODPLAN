@@ -272,6 +272,86 @@ def test_execution_journal_counts_direct_completed_1c_order_by_item(db_session):
     assert row["work_items"][0]["order_number"] == "1C-DIRECT-DONE"
 
 
+def test_execution_journal_allocates_direct_1c_output_to_oldest_plan_first(db_session):
+    item = Item(
+        item_code="MAKE-DIRECT-FIFO",
+        item_name="Выпуск по планам FIFO",
+        unit="шт",
+        stock_qty=0,
+        replenishment_method="Производство",
+        status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+    june_plan = _make_fixed_plan(
+        db_session, item, date(2026, 6, 1), qty=20,
+        period_from=date(2026, 6, 1), period_to=date(2026, 6, 30),
+    )
+    july_plan = _make_fixed_plan(
+        db_session, item, date(2026, 7, 1), qty=20,
+        period_from=date(2026, 7, 1), period_to=date(2026, 7, 31),
+    )
+    runs_and_reqs = []
+    for plan in (june_plan, july_plan):
+        run = PlanningRun(
+            status="FIXED_SNAPSHOT",
+            source_plan_id=plan.id,
+            period_from=plan.period_from,
+            period_to=plan.period_to,
+            started_at=datetime.datetime(2026, 6, 1),
+            finished_at=datetime.datetime(2026, 6, 1),
+        )
+        db_session.add(run)
+        db_session.flush()
+        req = MrpRequirement(
+            run_id=run.run_id,
+            item_id=item.item_id,
+            total_required_qty=20,
+            net_required_qty=20,
+            covered_qty=0,
+            remaining_qty=20,
+            period_from=plan.period_from,
+            period_to=plan.period_to,
+            bom_level=0,
+        )
+        db_session.add(req)
+        runs_and_reqs.append((run, req))
+    db_session.flush()
+    order = ProductionOrder(
+        order_number="1C-DIRECT-FIFO",
+        order_date=datetime.datetime(2026, 7, 10),
+        order_ref1c="direct-fifo-ref",
+        is_posted=True,
+        deletion_mark=False,
+        source="1c",
+        order_state_key="ad28565a-991b-11eb-e39a-fa163e61326a",
+        order_state_name="Завершен",
+    )
+    db_session.add(order)
+    db_session.flush()
+    db_session.add(ProductionProduct(
+        order_id=order.order_id,
+        item_id=item.item_id,
+        line_number=1,
+        quantity=25,
+        produced_qty=25,
+        remaining_qty=0,
+    ))
+    db_session.commit()
+
+    june_row = get_period_plan_execution_journal(
+        db_session, june_plan.id, run_id=runs_and_reqs[0][0].run_id,
+    )["rows"][0]
+    july_row = get_period_plan_execution_journal(
+        db_session, july_plan.id, run_id=runs_and_reqs[1][0].run_id,
+    )["rows"][0]
+
+    assert june_row["completed_qty"] == 20
+    assert june_row["remaining_qty"] == 0
+    assert july_row["completed_qty"] == 5
+    assert july_row["remaining_qty"] == 15
+
+
 def test_execution_journal_does_not_count_planned_task_as_ordered(db_session):
     bucket = date(2026, 6, 2)
     item = Item(
