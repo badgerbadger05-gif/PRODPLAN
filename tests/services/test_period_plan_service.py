@@ -193,6 +193,58 @@ def test_execution_journal_marks_production_order_opened_in_1c(db_session):
     assert work_item["one_c_opened"] is True
 
 
+def test_root_production_plan_is_not_netted_by_finished_goods_stock_or_wip(db_session):
+    """A fixed release plan must create the full top-level production task."""
+    bucket = date(2026, 9, 4)
+    finished_good = Item(
+        item_code="FG-PLAN-FULL",
+        item_name="Готовая техника по плану",
+        item_article="FG-PLAN-FULL",
+        unit="шт",
+        stock_qty=20.0,
+        replenishment_method="Производство",
+        status="active",
+    )
+    db_session.add(finished_good)
+    db_session.flush()
+    plan = _make_fixed_plan(db_session, finished_good, bucket, qty=75.0)
+
+    # An open order from an earlier period must not reduce this period's
+    # approved production programme either.
+    old_order = ProductionOrder(
+        order_number="OLD-FG-ORDER",
+        order_date=datetime.datetime(2026, 8, 15),
+        is_posted=True,
+        deletion_mark=False,
+        source="1c",
+    )
+    db_session.add(old_order)
+    db_session.flush()
+    db_session.add(
+        ProductionProduct(
+            order_id=old_order.order_id,
+            item_id=finished_good.item_id,
+            line_number=1,
+            quantity=10.0,
+            produced_qty=0.0,
+            remaining_qty=10.0,
+        )
+    )
+    db_session.flush()
+
+    result = create_mrp_snapshot_from_period_plan(db_session, plan.id)
+
+    req = db_session.query(MrpRequirement).filter_by(
+        run_id=result["run_id"], item_id=finished_good.item_id,
+    ).one()
+    proposal = db_session.query(PlannedOrder).filter_by(
+        run_id=result["run_id"], item_id=finished_good.item_id,
+    ).one()
+    assert float(req.total_required_qty) == pytest.approx(75.0)
+    assert float(req.net_required_qty) == pytest.approx(75.0)
+    assert float(proposal.qty) == pytest.approx(75.0)
+
+
 def test_execution_journal_counts_direct_completed_1c_order_by_item(db_session):
     bucket = date(2026, 6, 19)
     item = Item(
@@ -239,7 +291,7 @@ def test_execution_journal_counts_direct_completed_1c_order_by_item(db_session):
     db_session.flush()
     order = ProductionOrder(
         order_number="1C-DIRECT-DONE",
-        order_date=datetime.datetime(2026, 5, 20, 12, 0),
+        order_date=datetime.datetime(2026, 6, 19, 12, 0),
         order_ref1c="direct-1c-done-ref",
         is_posted=True,
         deletion_mark=False,
@@ -272,7 +324,7 @@ def test_execution_journal_counts_direct_completed_1c_order_by_item(db_session):
     assert row["work_items"][0]["order_number"] == "1C-DIRECT-DONE"
 
 
-def test_execution_journal_allocates_direct_1c_output_to_oldest_plan_first(db_session):
+def test_execution_journal_does_not_allocate_direct_1c_output_to_past_plan(db_session):
     item = Item(
         item_code="MAKE-DIRECT-FIFO",
         item_name="Выпуск по планам FIFO",
@@ -346,10 +398,10 @@ def test_execution_journal_allocates_direct_1c_output_to_oldest_plan_first(db_se
         db_session, july_plan.id, run_id=runs_and_reqs[1][0].run_id,
     )["rows"][0]
 
-    assert june_row["completed_qty"] == 20
-    assert june_row["remaining_qty"] == 0
-    assert july_row["completed_qty"] == 5
-    assert july_row["remaining_qty"] == 15
+    assert june_row["completed_qty"] == 0
+    assert june_row["remaining_qty"] == 20
+    assert july_row["completed_qty"] == 20
+    assert july_row["remaining_qty"] == 0
 
 
 def test_execution_journal_does_not_count_planned_task_as_ordered(db_session):

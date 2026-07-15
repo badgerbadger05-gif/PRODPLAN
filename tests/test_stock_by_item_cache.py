@@ -850,7 +850,7 @@ def test_active_supplier_remaining_filters_new_cancelled_deleted_and_missing_dat
     }
 
 
-def test_get_active_1c_remaining_by_item_includes_done_but_filters_deleted_and_nonpositive(db_session):
+def test_get_active_1c_remaining_by_item_excludes_done_deleted_and_nonpositive(db_session):
     db = db_session
 
     item = Item(
@@ -903,7 +903,9 @@ def test_get_active_1c_remaining_by_item_includes_done_but_filters_deleted_and_n
     db.commit()
 
     rem = _get_active_1c_remaining_by_item(db)
-    assert rem.get(item.item_id) == 8.0
+    # The completed order's factual output must be covered by synced stock,
+    # not treated as future production supply.
+    assert rem.get(item.item_id) == 5.0
 
 
 def test_active_remaining_counts_mrp_sourced_production_orders(db_session):
@@ -1019,6 +1021,44 @@ def test_recursive_component_reservation_with_cycle_guard(db_session):
     assert reserved.get(c.item_id) == 12.0
     assert not reserved.get(a.item_id)
     assert any(w.get("code") == "ACTIVE_1C_BOM_CYCLE_SKIPPED" for w in warnings)
+
+
+def test_completed_1c_order_does_not_reserve_components(db_session):
+    db = db_session
+    parent = Item(item_code="DONE-PARENT", item_name="Done parent", item_article="DONE-PARENT", replenishment_method="Производство", unit="u", stock_qty=0, status="active")
+    component = Item(item_code="DONE-COMP", item_name="Done component", item_article="DONE-COMP", replenishment_method="Производство", unit="u", stock_qty=0, status="active")
+    spec = Specification(spec_code="DONE-SPEC", spec_name="Done spec")
+    db.add_all([parent, component, spec])
+    db.flush()
+    db.add_all([
+        DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id),
+        SpecComponent(spec_id=spec.spec_id, item_id=component.item_id, quantity=2.0),
+    ])
+    order = ProductionOrder(
+        order_number="DONE-RESERVE",
+        order_date=datetime.datetime(2026, 1, 1),
+        order_ref1c="DONE-RESERVE-ref",
+        deletion_mark=False,
+        order_state_key="ad28565a-991b-11eb-e39a-fa163e61326a",
+        is_posted=True,
+    )
+    db.add(order)
+    db.flush()
+    db.add(ProductionProduct(
+        order_id=order.order_id, item_id=parent.item_id,
+        quantity=10.0, produced_qty=10.0, remaining_qty=0.0,
+    ))
+    db.commit()
+
+    reserved, warnings = _build_component_reservations_from_active_1c(
+        db=db,
+        default_spec_map={parent.item_id: spec.spec_id},
+        components_loader=lambda spec_id: db.query(SpecComponent).filter(SpecComponent.spec_id == spec_id).all(),
+        max_depth=20,
+    )
+
+    assert reserved == {}
+    assert warnings == []
 
 
 def test_rework_flow_creates_full_order_when_components_are_sufficient(db_session):

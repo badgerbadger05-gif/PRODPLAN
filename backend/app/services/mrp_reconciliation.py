@@ -25,7 +25,8 @@ Idempotency
 The snapshot's gross demand is re-derived from its anchored level-0 roots
 through current stock (``_current_snapshot_gross_by_item``), then the gap is
 sized as ``net - effective production supply`` (open local/1C lines by
-``remaining_qty`` plus completed 1C lines by actual produced quantity). So
+``remaining_qty``). Completed 1C output is counted only after it arrives in
+synced warehouse stock. So
 once this service materialises a catch-up production
 order, that order becomes open WIP and the next run nets it out — the gap
 returns to zero and no duplicate is created. For purchases, the gap is
@@ -37,7 +38,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import case, func, or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from ..models import (
@@ -82,18 +83,8 @@ DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
 
 
 def _production_supply_qty_expr():
-    done_state = func.lower(func.coalesce(ProductionOrder.order_state_key, "")) == DONE_STATE_KEY
-    produced_qty = func.coalesce(ProductionProduct.produced_qty, 0.0)
-    return case(
-        (
-            done_state,
-            case(
-                (produced_qty > 0, produced_qty),
-                else_=func.coalesce(ProductionProduct.quantity, 0.0),
-            ),
-        ),
-        else_=func.coalesce(ProductionProduct.remaining_qty, 0.0),
-    )
+    """Quantity still expected from an open production line."""
+    return func.coalesce(ProductionProduct.remaining_qty, 0.0)
 
 
 def _latest_active_snapshot_run_ids(db: Session) -> List[int]:
@@ -276,7 +267,6 @@ def _active_production_qty_by_item(db: Session, item_ids: List[int]) -> Dict[int
     if not item_ids:
         return {}
     supply_qty = _production_supply_qty_expr()
-    done_state = func.lower(func.coalesce(ProductionOrder.order_state_key, "")) == DONE_STATE_KEY
     rows = (
         db.query(
             ProductionProduct.item_id,
@@ -289,13 +279,9 @@ def _active_production_qty_by_item(db: Session, item_ids: List[int]) -> Dict[int
         )
         .filter(ProductionProduct.item_id.in_([int(iid) for iid in item_ids]))
         .filter(ProductionOrder.deletion_mark == False)
+        .filter(func.lower(func.coalesce(ProductionOrder.order_state_key, "")) != DONE_STATE_KEY)
         .filter(supply_qty > 0)
-        .filter(
-            or_(
-                done_state,
-                func.coalesce(ProductionOrderLineState.status, "shortage").notin_(("completed", "cancelled")),
-            )
-        )
+        .filter(func.coalesce(ProductionOrderLineState.status, "shortage").notin_(("completed", "cancelled")))
         .group_by(ProductionProduct.item_id)
         .all()
     )
@@ -474,6 +460,7 @@ def _current_snapshot_gross_by_item(
     db: Session,
     requirements: List[MrpRequirement],
     stock_by_item: Dict[int, float],
+    root_production_item_ids: set[int],
 ) -> tuple[Dict[int, float], Dict[int, int]]:
     """
     Recompute fixed-snapshot gross demand from its level-0 roots through
@@ -481,10 +468,11 @@ def _current_snapshot_gross_by_item(
 
     Roots (bom_level 0) stay anchored to the frozen snapshot gross — the plan
     is not re-read. Each deeper node's gross is re-derived top-down as the sum
-    of parent explode quantities, where a parent explodes
-    ``max(gross - stock, 0)``: only physical stock stops the BOM explosion,
-    open WIP does not — producing an open parent order still consumes its
-    components (same rule as ``_explode_bom_net_first``'s explode_buckets).
+    of parent explode quantities. A level-0 production root always explodes
+    its full frozen programme; lower levels use ``max(gross - stock, 0)``.
+    Open WIP does not stop the explosion — producing an open parent order
+    still consumes its components (same rule as ``_explode_bom_net_first``'s
+    explode_buckets).
 
     The previous implementation kept each child's frozen gross and added the
     parent's drift versus the snapshot bucket *net* — a stock+WIP-netted
@@ -543,9 +531,11 @@ def _current_snapshot_gross_by_item(
             children = components_by_spec.get(spec_id, [])
             if not children:
                 continue
-            parent_explode_qty = max(
-                _to_float(current_gross.get(parent_id, 0.0)) - _to_float(stock_by_item.get(parent_id, 0.0)),
-                0.0,
+            parent_gross = _to_float(current_gross.get(parent_id, 0.0))
+            parent_explode_qty = (
+                parent_gross
+                if parent_id in root_production_item_ids
+                else max(parent_gross - _to_float(stock_by_item.get(parent_id, 0.0)), 0.0)
             )
             if parent_explode_qty <= EPS:
                 continue
@@ -685,12 +675,29 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
     # local MRP orders were reduced/cancelled. Re-anchor only the net side of the
     # frozen snapshot to current effective stock, then compare it with open WIP.
     stock_by_item = effective_stock_by_item_all(db)
-    current_gross_by_item, bom_level_by_item = _current_snapshot_gross_by_item(db, snapshot_requirements, stock_by_item)
+    root_item_ids = [
+        int(req.item_id)
+        for req in snapshot_requirements
+        if int(req.bom_level or 0) == 0
+    ]
+    root_production_item_ids = {
+        int(item_id)
+        for item_id, replenishment_method in (
+            db.query(Item.item_id, Item.replenishment_method)
+            .filter(Item.item_id.in_(root_item_ids))
+            .all()
+        )
+        if classify_replenishment_flow(replenishment_method) == REPLENISHMENT_FLOW_PRODUCTION
+    }
+    current_gross_by_item, bom_level_by_item = _current_snapshot_gross_by_item(
+        db, snapshot_requirements, stock_by_item, root_production_item_ids,
+    )
     current_net_by_item: Dict[int, float] = {}
     for iid in sorted(current_gross_by_item):
-        current_net_by_item[iid] = max(
-            _to_float(current_gross_by_item.get(iid, 0.0)) - _to_float(stock_by_item.get(iid, 0.0)),
-            0.0,
+        gross = _to_float(current_gross_by_item.get(iid, 0.0))
+        current_net_by_item[iid] = (
+            gross if iid in root_production_item_ids
+            else max(gross - _to_float(stock_by_item.get(iid, 0.0)), 0.0)
         )
 
     req_by_item = _ensure_reconciled_requirements(

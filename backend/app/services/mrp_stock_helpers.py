@@ -19,7 +19,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Dict, List, Optional, Tuple
 
-from sqlalchemy import case, func
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..models import (
@@ -37,18 +37,12 @@ _DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
 
 
 def _production_supply_qty_expr():
-    done_state = func.lower(func.coalesce(ProductionOrder.order_state_key, "")) == _DONE_STATE_KEY
-    produced_qty = func.coalesce(ProductionProduct.produced_qty, 0.0)
-    return case(
-        (
-            done_state,
-            case(
-                (produced_qty > 0, produced_qty),
-                else_=func.coalesce(ProductionProduct.quantity, 0.0),
-            ),
-        ),
-        else_=func.coalesce(ProductionProduct.remaining_qty, 0.0),
-    )
+    """Quantity still expected from an open production line.
+
+    Completed 1C orders never provide future supply. Their factual output is
+    available to MRP only after the stock sync has put it into warehouse stock.
+    """
+    return func.coalesce(ProductionProduct.remaining_qty, 0.0)
 
 
 def effective_stock_by_item_all(db: Session) -> Dict[int, float]:
@@ -132,8 +126,8 @@ def active_wip_eta_by_item(db: Session) -> Dict[int, List[Tuple[Optional[date], 
 
     Active filter:
       - production_orders.deletion_mark = false
-      - completed 1C orders are included intentionally: for them supply is
-        produced_qty (or quantity if fact was not linked), not remaining_qty.
+      - completed 1C orders are excluded: their output is covered only by
+        synced warehouse stock, never by a production-order fallback.
       - effective supply qty > 0
 
     ETA source:
@@ -157,6 +151,7 @@ def active_wip_eta_by_item(db: Session) -> Dict[int, List[Tuple[Optional[date], 
             ProductionOrderLineState.product_id == ProductionProduct.product_id,
         )
         .filter(ProductionOrder.deletion_mark.is_(False))
+        .filter(func.lower(func.coalesce(ProductionOrder.order_state_key, "")) != _DONE_STATE_KEY)
         .filter(supply_qty > 0)
         .all()
     )

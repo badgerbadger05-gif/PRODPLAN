@@ -4,7 +4,7 @@ from datetime import datetime, date, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple, Set, DefaultDict, Callable
 
 from sqlalchemy.orm import Session, load_only
-from sqlalchemy import case, func, and_, asc, desc
+from sqlalchemy import func, and_, asc, desc
 from collections import defaultdict
 import json
 import re
@@ -319,18 +319,12 @@ DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
 
 
 def _production_supply_qty_expr():
-    done_state = func.lower(func.coalesce(ProductionOrder.order_state_key, "")) == DONE_STATE_KEY
-    produced_qty = func.coalesce(ProductionProduct.produced_qty, 0.0)
-    return case(
-        (
-            done_state,
-            case(
-                (produced_qty > 0, produced_qty),
-                else_=func.coalesce(ProductionProduct.quantity, 0.0),
-            ),
-        ),
-        else_=func.coalesce(ProductionProduct.remaining_qty, 0.0),
-    )
+    """Quantity still expected from an open production line.
+
+    A completed 1C order is historical execution, not future supply. Its
+    output becomes MRP coverage only through the synced warehouse balance.
+    """
+    return func.coalesce(ProductionProduct.remaining_qty, 0.0)
 # Состояния заказа поставщику, НЕ учитываемые как ожидаемое поступление в MRP.
 # Производная от канонической карты фаз (см. supplier_order_status): всё, что не
 # относится к фазам «в пути» / «на складе». Сохранена для обратной совместимости
@@ -2430,11 +2424,9 @@ def _get_active_production_remaining_by_item(db: Session) -> Dict[int, float]:
 
     Active filter:
     - deletion_mark == false
-    - completed 1C orders are included intentionally: some direct 1C orders
-      only become visible to PRODPLAN after completion, but still must reduce
-      the net requirement of subsequent MRP runs.
-    - effective supply qty > 0; completed 1C orders use produced_qty (or
-      quantity if fact was not linked), other orders use remaining_qty.
+    - completed 1C orders are excluded. Their factual output must be present
+      in synced warehouse stock before it can cover new MRP demand.
+    - remaining_qty > 0.
     """
     try:
         supply_qty = _production_supply_qty_expr()
@@ -2445,6 +2437,7 @@ def _get_active_production_remaining_by_item(db: Session) -> Dict[int, float]:
             )
             .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
             .filter(ProductionOrder.deletion_mark.is_(False))
+            .filter(func.lower(func.coalesce(ProductionOrder.order_state_key, "")) != DONE_STATE_KEY)
             .filter(supply_qty > 0)
             .group_by(ProductionProduct.item_id)
             .all()
@@ -2633,8 +2626,9 @@ def _build_component_reservations_from_active_1c(
     """
     Build recursive component reservation map from active 1C orders.
 
-    For each active 1C order line with effective supply qty > 0:
-      reserve(component) += supply_qty * qty_per_unit
+    For each open 1C order line with remaining qty > 0:
+      reserve(component) += remaining_qty * qty_per_unit
+    Completed 1C orders reserve no components; they are historical execution.
     with recursive BOM explosion and cycle protection.
     """
     warnings: List[Dict[str, Any]] = []
@@ -2649,6 +2643,7 @@ def _build_component_reservations_from_active_1c(
             )
             .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
             .filter(ProductionOrder.deletion_mark.is_(False))
+            .filter(func.lower(func.coalesce(ProductionOrder.order_state_key, "")) != DONE_STATE_KEY)
             .filter(supply_qty > 0)
             .group_by(ProductionProduct.item_id)
             .all()

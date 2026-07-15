@@ -440,19 +440,20 @@ def test_reconcile_tops_up_after_partial_close(db_session):
     item.stock_qty = 10
     db_session.commit()
 
-    # Now reconciliation must create a catch-up order for the residual 30.
+    # Finished-goods stock does not replace the approved release programme.
+    # With the original order cancelled, reconciliation recreates all 40.
     res = reconcile_snapshot(db_session, run_id)
     added = res["production_added"]
     assert len(added) == 1
     assert added[0]["item_id"] == item.item_id
-    assert abs(added[0]["qty"] - 30.0) < 1e-6
+    assert abs(added[0]["qty"] - 40.0) < 1e-6
 
     # Running again is idempotent: the new order is open WIP, so no further gap.
     res = reconcile_snapshot(db_session, run_id)
     assert res["production_added"] == []
 
 
-def test_reconcile_counts_completed_1c_zero_remaining_as_supply(db_session):
+def test_reconcile_creates_catchup_when_done_1c_output_is_not_in_stock(db_session):
     item = _make_production_item(db_session, "P-DONE-1C", stock=0.0)
     plan = ProductionPlanHeader(
         name="План июнь",
@@ -514,7 +515,8 @@ def test_reconcile_counts_completed_1c_zero_remaining_as_supply(db_session):
 
     res = reconcile_snapshot(db_session, run_id)
 
-    assert res["production_added"] == []
+    assert len(res["production_added"]) == 1
+    assert res["production_added"][0]["qty"] == 40.0
     db_session.refresh(req)
     assert float(req.covered_qty) == 40.0
     assert float(req.remaining_qty) == 0.0
@@ -546,7 +548,7 @@ def test_reconcile_tops_up_when_stock_drops_after_snapshot(db_session):
         .one()
     )
     assert float(req.total_required_qty) == 34.0
-    assert float(req.net_required_qty) == 2.0
+    assert float(req.net_required_qty) == 34.0
 
     create_production_orders_from_mrp_requirements(db_session, [req.id])
     item.stock_qty = 17.0
@@ -554,13 +556,10 @@ def test_reconcile_tops_up_when_stock_drops_after_snapshot(db_session):
 
     res = reconcile_snapshot(db_session, run_id)
 
-    added = res["production_added"]
-    assert len(added) == 1
-    assert added[0]["item_id"] == item.item_id
-    assert abs(added[0]["qty"] - 15.0) < 1e-6
+    assert res["production_added"] == []
     db_session.refresh(req)
-    assert float(req.net_required_qty) == 17.0
-    assert float(req.covered_qty) == 17.0
+    assert float(req.net_required_qty) == 34.0
+    assert float(req.covered_qty) == 34.0
     assert float(req.remaining_qty) == 0.0
 
     res = reconcile_snapshot(db_session, run_id)
@@ -621,13 +620,13 @@ def test_reconcile_grows_existing_catchup_order_when_stock_drops(db_session):
 
     added = res["production_added"]
     assert len(added) == 1
-    assert abs(added[0]["qty"] - 15.0) < 1e-6
+    assert abs(added[0]["qty"] - 32.0) < 1e-6
     db_session.refresh(product)
     db_session.refresh(req)
-    assert float(product.quantity) == 17.0
-    assert float(product.remaining_qty) == 17.0
-    assert float(req.net_required_qty) == 17.0
-    assert float(req.covered_qty) == 17.0
+    assert float(product.quantity) == 34.0
+    assert float(product.remaining_qty) == 34.0
+    assert float(req.net_required_qty) == 34.0
+    assert float(req.covered_qty) == 34.0
     assert float(req.remaining_qty) == 0.0
 
 
@@ -664,9 +663,7 @@ def test_reconcile_splits_catchup_order_by_optimal_batch(db_session):
     res = reconcile_snapshot(db_session, run_id)
 
     added = res["production_added"]
-    assert len(added) == 1
-    assert abs(added[0]["qty"] - 32.0) < 1e-6
-    assert [entry["qty"] for entry in added[0]["orders"]] == [15.0, 15.0, 2.0]
+    assert added == []
     products = (
         db_session.query(ProductionProduct)
         .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
@@ -674,7 +671,7 @@ def test_reconcile_splits_catchup_order_by_optimal_batch(db_session):
         .order_by(ProductionProduct.product_id.asc())
         .all()
     )
-    assert [float(product.quantity) for product in products] == [2.0, 15.0, 15.0, 2.0]
+    assert [float(product.quantity) for product in products] == [15.0, 15.0, 4.0]
 
 
 def test_reconcile_repairs_oversized_catchup_order_by_optimal_batch(db_session):
@@ -770,9 +767,9 @@ def test_reconcile_propagates_parent_stock_drop_to_component(db_session):
         int(r.item_id): r
         for r in db_session.query(MrpRequirement).filter(MrpRequirement.run_id == run_id).all()
     }
-    assert float(reqs[painted.item_id].net_required_qty) == 2.0
-    assert float(reqs[welded.item_id].total_required_qty) == 2.0
-    assert float(reqs[welded.item_id].net_required_qty) == 0.0
+    assert float(reqs[painted.item_id].net_required_qty) == 34.0
+    assert float(reqs[welded.item_id].total_required_qty) == 34.0
+    assert float(reqs[welded.item_id].net_required_qty) == 27.0
 
     create_production_orders_from_mrp_requirements(db_session, [reqs[painted.item_id].id])
     painted.stock_qty = 17.0
@@ -781,13 +778,13 @@ def test_reconcile_propagates_parent_stock_drop_to_component(db_session):
     res = reconcile_snapshot(db_session, run_id)
 
     added = {entry["item_id"]: entry["qty"] for entry in res["production_added"]}
-    assert abs(added[painted.item_id] - 15.0) < 1e-6
-    assert abs(added[welded.item_id] - 10.0) < 1e-6
+    assert painted.item_id not in added
+    assert abs(added[welded.item_id] - 27.0) < 1e-6
     db_session.refresh(reqs[painted.item_id])
     db_session.refresh(reqs[welded.item_id])
-    assert float(reqs[painted.item_id].net_required_qty) == 17.0
-    assert float(reqs[welded.item_id].net_required_qty) == 10.0
-    assert float(reqs[welded.item_id].covered_qty) == 10.0
+    assert float(reqs[painted.item_id].net_required_qty) == 34.0
+    assert float(reqs[welded.item_id].net_required_qty) == 27.0
+    assert float(reqs[welded.item_id].covered_qty) == 27.0
     assert float(reqs[welded.item_id].remaining_qty) == 0.0
 
 
@@ -834,11 +831,11 @@ def test_reconcile_uses_bucket_net_baseline_after_parent_requirement_was_updated
     res = reconcile_snapshot(db_session, run_id)
 
     added = {entry["item_id"]: entry["qty"] for entry in res["production_added"]}
-    assert painted.item_id not in added
-    assert abs(added[welded.item_id] - 10.0) < 1e-6
+    assert abs(added[painted.item_id] - 17.0) < 1e-6
+    assert abs(added[welded.item_id] - 27.0) < 1e-6
     db_session.refresh(reqs[welded.item_id])
-    assert float(reqs[welded.item_id].net_required_qty) == 10.0
-    assert float(reqs[welded.item_id].covered_qty) == 10.0
+    assert float(reqs[welded.item_id].net_required_qty) == 27.0
+    assert float(reqs[welded.item_id].covered_qty) == 27.0
     assert float(reqs[welded.item_id].remaining_qty) == 0.0
 
 
@@ -870,7 +867,7 @@ def test_reconcile_adds_component_requirement_missing_from_snapshot(db_session):
         for r in db_session.query(MrpRequirement).filter(MrpRequirement.run_id == run_id).all()
     }
     assert painted.item_id in reqs
-    assert welded.item_id not in reqs
+    assert welded.item_id in reqs
 
     order = ProductionOrder(
         order_number=f"MRP-RC-{run_id}-{welded.item_id}",
@@ -1051,8 +1048,8 @@ def test_reconcile_does_not_reinflate_components_covered_by_parent_wip_at_snapsh
         int(r.item_id): r
         for r in db_session.query(MrpRequirement).filter(MrpRequirement.run_id == run_id).all()
     }
-    # Parent's net is WIP-netted to 0; the child's gross exploded through WIP.
-    assert float(reqs[painted.item_id].net_required_qty) == 0.0
+    # An open order does not replace the approved top-level release plan.
+    assert float(reqs[painted.item_id].net_required_qty) == 32.0
     assert float(reqs[welded.item_id].total_required_qty) == 32.0
     assert float(reqs[welded.item_id].net_required_qty) == 32.0
 

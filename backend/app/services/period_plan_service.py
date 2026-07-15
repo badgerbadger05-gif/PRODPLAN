@@ -428,6 +428,19 @@ def _explode_bom_net_first(
     # control then refuses as a material-issue source.
     stock_by_item: Dict[int, float] = _effective_stock_by_item_all(db)
 
+    # A top-level production item represents the approved release programme
+    # (finished goods), unlike a top-level purchased item which is still a
+    # replenishment request and may be netted against stock.
+    root_production_item_ids = {
+        int(item_id)
+        for item_id, replenishment_method in (
+            db.query(Item.item_id, Item.replenishment_method)
+            .filter(Item.item_id.in_(list(plan_demands)))
+            .all()
+        )
+        if classify_replenishment_flow(replenishment_method) == REPLENISHMENT_FLOW_PRODUCTION
+    }
+
     default_spec_map: Dict[int, int] = {
         int(ds.item_id): int(ds.spec_id)
         for ds in db.query(DefaultSpecification).all()
@@ -543,8 +556,15 @@ def _explode_bom_net_first(
             for bucket_date, qty in buckets.items():
                 gross_map[iid][bucket_date] = gross_map[iid].get(bucket_date, 0.0) + float(qty)
 
-            # Net demand chronologically: first against the immediate stock
-            # pool, then against WIP whose ETA is at or before the bucket.
+            # Level-0 production entries are the approved release programme.
+            # They must always become production assignments in full: existing
+            # finished-goods stock and earlier/open production orders are not
+            # a substitute for the quantity explicitly scheduled in this
+            # period plan. Purchased root entries still net normally.
+            #
+            # Components, in contrast, are netted chronologically: first
+            # against the immediate stock pool, then against WIP whose ETA is
+            # at or before the bucket.
             # WIP entries with eta > bucket_date can't cover that bucket but
             # may cover a later one, so the per-item WIP list is mutated in
             # place across the bucket loop.
@@ -570,6 +590,13 @@ def _explode_bom_net_first(
             for bucket_date, bucket_qty in sorted(buckets.items()):
                 q = float(bucket_qty or 0.0)
                 if q <= 1e-9:
+                    continue
+                if depth == 0 and iid in root_production_item_ids:
+                    # The plan is a release obligation, not a sales-demand
+                    # forecast.  Do not let stock/WIP from a previous period
+                    # shrink the top-level production task.
+                    net_buckets.append((bucket_date, q))
+                    explode_buckets.append((bucket_date, q))
                     continue
                 # 1) Consume free stock first (always available).
                 if stock_left >= q:
@@ -775,9 +802,9 @@ def create_mrp_snapshot_from_period_plan(
         run.started_at = now
         run.finished_at = now
     db.flush()
-    # Rebuilding a plan-bound snapshot reuses the same run_id. Keep
-    # MrpRequirement rows so existing ProductionProduct links remain valid, but
-    # rebuild all derived bucket/proposal rows from the current plan.
+    # A plan keeps one fixed run. Rebuilding it retains MrpRequirement ids so
+    # already created production orders stay linked to this plan and visible
+    # in its execution journal; only derived bucket/proposal rows are rebuilt.
     existing_req_by_item: Dict[int, MrpRequirement] = {
         int(req.item_id): req
         for req in db.query(MrpRequirement).filter(MrpRequirement.run_id == int(run.run_id)).all()
@@ -1543,10 +1570,16 @@ def get_period_plan_execution_journal(
         .filter(ProductionOrder.order_ref1c.isnot(None))
         .filter(ProductionOrder.deletion_mark.is_(False))
     )
-    direct_from = min(plan.period_from, _DIRECT_1C_PRODUCTION_HORIZON) if plan.period_from else _DIRECT_1C_PRODUCTION_HORIZON
+    # A direct 1C order belongs only to the period in which it was opened.
+    # It must never close the execution of a future release programme.
+    direct_from = plan.period_from or _DIRECT_1C_PRODUCTION_HORIZON
     direct_query = direct_query.filter(
         ProductionOrder.order_date >= datetime.combine(direct_from, datetime.min.time())
     )
+    if plan.period_to:
+        direct_query = direct_query.filter(
+            ProductionOrder.order_date < datetime.combine(plan.period_to + timedelta(days=1), datetime.min.time())
+        )
     direct_prod_rows = direct_query.all()
     for pp, po, state in direct_prod_rows:
         if state and str(state.status or "").lower() in {"cancelled"}:
@@ -1576,38 +1609,12 @@ def get_period_plan_execution_journal(
             **_forecast_payload(planned_finish, plan.period_to or planned_finish),
         })
 
-    # The target plan and every earlier fixed plan compete for the same direct
-    # 1C output.  Use the newest fixed snapshot of every other plan, while
-    # preserving the explicitly requested snapshot for the target plan.
-    latest_run_by_plan: Dict[int, PlanningRun] = {}
-    for candidate in (
-        db.query(PlanningRun)
-        .join(ProductionPlanHeader, ProductionPlanHeader.id == PlanningRun.source_plan_id)
-        .filter(
-            PlanningRun.status == "FIXED_SNAPSHOT",
-            PlanningRun.source_plan_id.isnot(None),
-            ProductionPlanHeader.period_from <= plan.period_from,
-        )
-        .order_by(PlanningRun.source_plan_id.asc(), PlanningRun.run_id.desc())
-        .all()
-    ):
-        latest_run_by_plan.setdefault(int(candidate.source_plan_id), candidate)
-    latest_run_by_plan[int(plan.id)] = run
-
+    # Each journal is self-contained.  Period filtering above already makes a
+    # direct order unique to its period, so allocating it to older plans would
+    # incorrectly let a past programme consume current execution.
     fifo_requirements: Dict[int, List[Tuple[MrpRequirement, ProductionPlanHeader]]] = {}
-    fifo_run_ids = [int(candidate.run_id) for candidate in latest_run_by_plan.values()]
-    if fifo_run_ids:
-        for candidate_req, candidate_plan in (
-            db.query(MrpRequirement, ProductionPlanHeader)
-            .join(PlanningRun, PlanningRun.run_id == MrpRequirement.run_id)
-            .join(ProductionPlanHeader, ProductionPlanHeader.id == PlanningRun.source_plan_id)
-            .filter(
-                MrpRequirement.run_id.in_(fifo_run_ids),
-                MrpRequirement.item_id.in_(item_ids),
-            )
-            .all()
-        ):
-            fifo_requirements.setdefault(int(candidate_req.item_id), []).append((candidate_req, candidate_plan))
+    for candidate_req, _item in reqs_with_items:
+        fifo_requirements.setdefault(int(candidate_req.item_id), []).append((candidate_req, plan))
 
     for item_id, direct_items in direct_items_by_item.items():
         demands = sorted(
