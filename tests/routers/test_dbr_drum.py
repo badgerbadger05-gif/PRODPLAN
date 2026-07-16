@@ -27,6 +27,7 @@ from app.models import (
     StockWarehouse,
 )
 from app.routers.dbr import router as dbr_router
+from app.services.dbr import feeder_signal_service
 
 W2 = "REF-W2"
 W3 = "REF-W3"
@@ -303,3 +304,37 @@ def test_feeder_positions_preview_rebuild_and_list(client, db_session, seed):
         )
     ]
     assert after == before
+
+
+def test_feeder_signal_preview_and_refresh_routes(client, monkeypatch):
+    monkeypatch.setattr(
+        feeder_signal_service,
+        "preview_signals",
+        lambda db: {"schedule_id": 7, "positions": 1, "actionable": 1, "rows": []},
+    )
+    monkeypatch.setattr(
+        feeder_signal_service,
+        "refresh_signals",
+        lambda db, expected: {"schedule_id": expected, "created": 1, "rows": []},
+    )
+    assert client.post("/api/v1/dbr/feeder/signals/preview").json()["actionable"] == 1
+    response = client.post(
+        "/api/v1/dbr/feeder/signals/refresh", json={"expected_schedule_id": 7}
+    )
+    assert response.status_code == 200 and response.json()["created"] == 1
+
+
+def test_feeder_signal_refresh_schedule_conflict_is_409(client, monkeypatch):
+    def conflict(db, expected):
+        raise ValueError("активный график изменился")
+
+    monkeypatch.setattr(feeder_signal_service, "refresh_signals", conflict)
+    response = client.post(
+        "/api/v1/dbr/feeder/signals/refresh", json={"expected_schedule_id": 99}
+    )
+    assert response.status_code == 409
+
+
+def test_feeder_signal_detail_not_found(client):
+    response = client.get("/api/v1/dbr/feeder/signals/999999")
+    assert response.status_code == 404

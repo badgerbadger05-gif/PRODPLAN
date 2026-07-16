@@ -1075,7 +1075,7 @@ class DbrSettings(Base):
     batch_days_paint_black = Column(Integer, nullable=False, default=2, server_default="2")
     batch_days_paint_color = Column(Integer, nullable=False, default=3, server_default="3")
     # Feeder chain
-    feeder_chain_enabled = Column(Boolean, nullable=False, default=True, server_default=text("true"))
+    feeder_chain_enabled = Column(Boolean, nullable=False, default=False, server_default=text("false"))
     feeder_load_horizon_weeks = Column(Integer, nullable=False, default=4, server_default="4")
     # Shelf warehouses (roles): №2 (mechshop WIP), №3 (painted), №4 (hull #2).
     # FK-semantics on stock_warehouses.warehouse_ref1c, but no hard FK.
@@ -1189,6 +1189,48 @@ class DbrSupermarketPosition(Base):
     created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
 
+    item = relationship("Item")
+    source_schedule = relationship("DbrDrumSchedule")
+
+
+class DbrFeederSignal(Base):
+    """Advisory replenishment signal; never an order or a launch command."""
+
+    __tablename__ = "dbr_feeder_signal"
+    __table_args__ = (
+        UniqueConstraint("dedup_key", name="ux_dbr_feeder_signal_dedup_key"),
+        CheckConstraint("signal_type = 'Пополнение'", name="ck_dbr_feeder_signal_type"),
+        CheckConstraint("status IN ('Open', 'Cancelled')", name="ck_dbr_feeder_signal_status"),
+        CheckConstraint("suggested_qty >= 0", name="ck_dbr_feeder_signal_qty_nonnegative"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    dedup_key = Column(String(66), nullable=False, index=True)
+    signal_type = Column(String(30), nullable=False, default="Пополнение", server_default="Пополнение")
+    supermarket_position_id = Column(
+        Integer,
+        ForeignKey("dbr_supermarket_position.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    item_id = Column(Integer, ForeignKey("items.item_id", ondelete="CASCADE"), nullable=False, index=True)
+    warehouse_ref1c = Column(String(36), nullable=False, index=True)
+    status = Column(String(20), nullable=False, default="Open", server_default="Open", index=True)
+    suggested_qty = Column(DECIMAL(16, 3), nullable=False, default=0, server_default="0")
+    priority = Column(DECIMAL(16, 6), nullable=False, default=0, server_default="0", index=True)
+    zone = Column(String(20), nullable=True, index=True)
+    nfp_snapshot = Column(DECIMAL(16, 3), nullable=True)
+    target_qty_snapshot = Column(DECIMAL(16, 3), nullable=True)
+    kit_force = Column(Boolean, nullable=False, default=False, server_default="false")
+    kit_shortage_qty = Column(DECIMAL(16, 3), nullable=False, default=0, server_default="0")
+    source_schedule_id = Column(Integer, ForeignKey("dbr_drum_schedule.id", ondelete="SET NULL"), nullable=True, index=True)
+    reason_json = Column(CrossPlatformJSON, nullable=False, default=dict, server_default=text("'{}'"))
+    refreshed_at = Column(TIMESTAMP, nullable=False, default=func.now(), server_default=func.now())
+    cancelled_at = Column(TIMESTAMP, nullable=True)
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    position = relationship("DbrSupermarketPosition")
     item = relationship("Item")
     source_schedule = relationship("DbrDrumSchedule")
 

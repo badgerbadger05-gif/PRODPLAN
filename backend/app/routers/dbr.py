@@ -26,6 +26,7 @@ from ..services.dbr import (
     board_service,
     drum_service,
     feeder_position_service,
+    feeder_signal_service,
     gate_service,
     program_service,
     settings_service,
@@ -138,6 +139,10 @@ class PositionPreviewRequest(BaseModel):
 
 class PositionRebuildRequest(BaseModel):
     schedule_id: Optional[int] = None
+    expected_schedule_id: Optional[int] = None
+
+
+class SignalRefreshRequest(BaseModel):
     expected_schedule_id: Optional[int] = None
 
 
@@ -295,6 +300,49 @@ def get_feeder_position(
     )
     if result is None:
         raise HTTPException(status_code=404, detail="supermarket position not found")
+    return result
+
+
+# --------------------------------------------------------------------------
+# Phase-2 advisory replenishment signals (no launches/orders/1C writes)
+# --------------------------------------------------------------------------
+
+
+@router.post("/feeder/signals/preview")
+def preview_feeder_signals(db: Session = Depends(get_db)):
+    return feeder_signal_service.preview_signals(db)
+
+
+@router.post("/feeder/signals/refresh")
+def refresh_feeder_signals(
+    payload: SignalRefreshRequest,
+    db: Session = Depends(get_dbr_write_db, scope="function"),
+):
+    try:
+        return feeder_signal_service.refresh_signals(db, payload.expected_schedule_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+
+
+@router.get("/feeder/signals")
+def get_feeder_signals(
+    status: Optional[str] = None,
+    zone: Optional[str] = None,
+    search: Optional[str] = None,
+    limit: int = Query(default=1000, ge=1, le=5000),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
+):
+    return feeder_signal_service.list_signals(
+        db, status=status, zone=zone, search=search, limit=limit, offset=offset
+    )
+
+
+@router.get("/feeder/signals/{signal_id}")
+def get_feeder_signal(signal_id: int, db: Session = Depends(get_db)):
+    result = feeder_signal_service.get_signal(db, signal_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="feeder signal not found")
     return result
 
 

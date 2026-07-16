@@ -82,7 +82,7 @@ def test_get_settings_returns_defaults(client):
     assert data["batch_days_welding"] == 5
     assert data["batch_days_paint_black"] == 2
     assert data["batch_days_paint_color"] == 3
-    assert data["feeder_chain_enabled"] is True
+    assert data["feeder_chain_enabled"] is False
     assert data["feeder_load_horizon_weeks"] == 4
     assert str(data["shelf_threshold_qty"]) in ("5", "5.0", "5.000")
     assert data["w2_warehouse_ref1c"] is None
