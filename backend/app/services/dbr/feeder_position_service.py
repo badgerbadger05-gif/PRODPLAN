@@ -356,8 +356,12 @@ def query_position_views(
         else {}
     )
     if zone:
+        requested_zone = zone.strip().casefold()
         positions = [
-            row for row in positions if live_by_id[int(row.id)]["zone"] == zone
+            row
+            for row in positions
+            if str(live_by_id[int(row.id)]["zone"]).strip().casefold()
+            == requested_zone
         ]
     positions = positions[offset : offset + limit]
     return [

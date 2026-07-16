@@ -136,6 +136,23 @@ def test_rebuild_expected_schedule_guard(db_session):
         )
 
 
+def test_query_positions_zone_filter_is_case_insensitive(db_session):
+    schedule, *_ = _scenario(db_session)
+    feeder_position_service.rebuild_positions(db_session, schedule.id)
+    db_session.flush()
+
+    lowercase = feeder_position_service.query_position_views(
+        db_session, active_only=True, zone="red", include_live_nfp=True
+    )
+    mixed_case = feeder_position_service.query_position_views(
+        db_session, active_only=True, zone="ReD", include_live_nfp=True
+    )
+
+    assert lowercase
+    assert [row["id"] for row in lowercase] == [row["id"] for row in mixed_case]
+    assert {row["live_nfp"]["zone"] for row in lowercase} == {"Red"}
+
+
 def test_preview_fails_whole_on_bom_cycle(db_session):
     schedule, root, middle, _painted = _scenario(db_session)
     middle_spec_id = db_session.query(DefaultSpecification.spec_id).filter_by(

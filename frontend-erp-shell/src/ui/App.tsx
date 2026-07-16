@@ -1,6 +1,7 @@
 import { Link, NavLink, Route, Routes } from 'react-router-dom'
 import { ErrorBoundary } from './ErrorBoundary'
 import { DbrDrumBoardPage } from './pages/DbrDrumBoardPage'
+import { DbrFeederPage } from './pages/DbrFeederPage'
 import { DbrProgramsPage } from './pages/DbrProgramsPage'
 import { DbrSettingsPage } from './pages/DbrSettingsPage'
 import { HomePage } from './pages/HomePage'
@@ -66,6 +67,7 @@ export function App() {
         <Route path="/period-plan/:planId" element={<PeriodPlanPage />} />
         <Route path="/dbr" element={<DbrDrumBoardPage />} />
         <Route path="/dbr/programs" element={<DbrProgramsPage />} />
+        <Route path="/dbr/feeder" element={<DbrFeederPage />} />
         <Route path="/dbr/settings" element={<DbrSettingsPage />} />
         <Route path="/production-control" element={<ProductionControlPage />} />
         <Route path="/purchase-control" element={<PurchaseControlPage />} />

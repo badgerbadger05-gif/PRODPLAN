@@ -218,3 +218,68 @@ export type DbrReleaseResult = {
   stub: boolean
   note?: string
 }
+
+// ── Feeder-chain supermarket positions ──────────────────────────────────────
+
+export type DbrFeederZone = 'green' | 'yellow' | 'red' | string
+
+export type DbrFeederLiveNfp = {
+  stock_qty: number
+  open_supply_qty: number
+  qualified_demand_qty: number
+  nfp: number
+  zone: DbrFeederZone
+  penetration: number
+  is_complete: boolean
+  missing_reasons: string[]
+  data_quality: string[]
+  formula: string
+  timestamps: {
+    stock_as_of?: string | null
+    supply_as_of?: string | null
+    position_calculated_at?: string | null
+    live_calculated_at?: string | null
+  }
+}
+
+export type DbrFeederPosition = {
+  id: number
+  item_id: number
+  item_code: string
+  item_name: string
+  warehouse_ref1c: string
+  supply_type: 'purchase' | 'manufacture' | string
+  mode: 'shelf' | 'under_schedule' | string
+  adu: number | string
+  commonality: number
+  route_class?: string | null
+  red_qty: number | string
+  yellow_qty: number | string
+  green_qty: number | string
+  target_qty: number | string
+  data_quality: string[]
+  source_schedule_id: number
+  is_active: boolean
+  is_stale: boolean
+  calculated_at?: string | null
+  live_nfp?: DbrFeederLiveNfp
+}
+
+export type DbrFeederPreview = {
+  schedule_id: number
+  positions: DbrFeederPosition[]
+  warnings: string[]
+  created?: number
+  updated?: number
+  deactivated?: number
+}
+
+export type DbrFeederFilters = {
+  active_only?: boolean
+  mode?: string
+  supply?: string
+  zone?: string
+  search?: string
+  limit?: number
+  offset?: number
+}

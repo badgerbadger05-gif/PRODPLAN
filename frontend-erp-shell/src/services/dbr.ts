@@ -6,6 +6,9 @@ import type {
   DbrCategoryRisk,
   DbrCategoryRiskIn,
   DbrGateResult,
+  DbrFeederFilters,
+  DbrFeederPosition,
+  DbrFeederPreview,
   DbrMoveResult,
   DbrProgram,
   DbrProgramCreate,
@@ -149,5 +152,33 @@ export function moveDbrSlot(slotId: number, newDate: string, newResourceId?: num
 export function releaseDbrSlot(slotId: number) {
   return api<DbrReleaseResult>(`/v1/dbr/drum/slots/${slotId}/release`, {
     method: 'POST',
+  })
+}
+
+// ── Feeder-chain positions (read/preview + explicit safe rebuild) ─────────────
+
+export function listDbrFeederPositions(filters: DbrFeederFilters = {}) {
+  const search = new URLSearchParams({ include_live_nfp: 'true' })
+  if (filters.active_only !== undefined) search.set('active_only', String(filters.active_only))
+  if (filters.mode) search.set('mode', filters.mode)
+  if (filters.supply) search.set('supply', filters.supply)
+  if (filters.zone) search.set('zone', filters.zone)
+  if (filters.search?.trim()) search.set('search', filters.search.trim())
+  if (filters.limit !== undefined) search.set('limit', String(filters.limit))
+  if (filters.offset !== undefined) search.set('offset', String(filters.offset))
+  return api<DbrFeederPosition[]>(`/v1/dbr/feeder/positions?${search.toString()}`)
+}
+
+export function previewDbrFeederPositions(scheduleId?: number) {
+  return api<DbrFeederPreview>('/v1/dbr/feeder/positions/preview', {
+    method: 'POST',
+    body: JSON.stringify({ schedule_id: scheduleId ?? null }),
+  })
+}
+
+export function rebuildDbrFeederPositions(expectedScheduleId: number) {
+  return api<DbrFeederPreview>('/v1/dbr/feeder/positions/rebuild', {
+    method: 'POST',
+    body: JSON.stringify({ schedule_id: expectedScheduleId, expected_schedule_id: expectedScheduleId }),
   })
 }

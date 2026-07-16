@@ -3,6 +3,7 @@ import { NavLink } from 'react-router-dom'
 const tabs = [
   { to: '/dbr', title: 'Барабан', end: true },
   { to: '/dbr/programs', title: 'Программы' },
+  { to: '/dbr/feeder', title: 'Питающий контур' },
   { to: '/dbr/settings', title: 'Настройки' },
 ]
 
