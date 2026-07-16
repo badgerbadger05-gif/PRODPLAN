@@ -20,6 +20,9 @@ import {
 import { listResources } from '../../services/resources'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
+import { DbrNav } from '../dbr/DbrNav'
+import { ItemPicker } from '../dbr/ItemPicker'
+import type { PickedItem } from '../dbr/ItemPicker'
 
 // Local editable copy of the settings singleton. Kept as strings-or-numbers is
 // avoided — everything numeric is normalized to a number on save.
@@ -46,7 +49,7 @@ function toForm(s: DbrSettings): SettingsForm {
   }
 }
 
-const emptyRateDraft = { resource_id: '', item_id: '', qty_per_capacity: '' }
+const emptyRateDraft = { resource_id: '', qty_per_capacity: '' }
 
 export function DbrSettingsPage() {
   const [form, setForm] = useState<SettingsForm | null>(null)
@@ -55,6 +58,7 @@ export function DbrSettingsPage() {
   const [resources, setResources] = useState<ProductionResource[]>([])
 
   const [rateDraft, setRateDraft] = useState(emptyRateDraft)
+  const [rateItem, setRateItem] = useState<PickedItem | null>(null)
 
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -116,10 +120,10 @@ export function DbrSettingsPage() {
 
   async function addRate() {
     const resourceId = Number(rateDraft.resource_id)
-    const itemId = Number(rateDraft.item_id)
+    const itemId = rateItem?.item_id
     const qtyPer = Number(rateDraft.qty_per_capacity)
     if (!resourceId || !itemId) {
-      setError('Укажите участок и номенклатуру (ID)')
+      setError('Укажите участок и номенклатуру')
       return
     }
     setSaving(true)
@@ -129,6 +133,7 @@ export function DbrSettingsPage() {
       await upsertDbrAssemblyRate({ resource_id: resourceId, item_id: itemId, qty_per_capacity: qtyPer })
       setRates(await listDbrAssemblyRates())
       setRateDraft(emptyRateDraft)
+      setRateItem(null)
       setMessage('Такт сборки сохранён')
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -214,6 +219,7 @@ export function DbrSettingsPage() {
           />
         )}
       >
+        <DbrNav />
         <div className="commandBar">
           <button className="primary" onClick={() => void saveSettings()} disabled={saving || loading || !form}>Сохранить настройки</button>
           <button onClick={() => void load()} disabled={loading}>Обновить</button>
@@ -310,12 +316,7 @@ export function DbrSettingsPage() {
                     </select>
                   </td>
                   <td className="itemCell">
-                    <input
-                      type="number"
-                      placeholder="ID номенклатуры"
-                      value={rateDraft.item_id}
-                      onChange={(e) => setRateDraft((d) => ({ ...d, item_id: e.target.value }))}
-                    />
+                    <ItemPicker value={rateItem} onChange={setRateItem} />
                   </td>
                   <td className="numCell">
                     <input

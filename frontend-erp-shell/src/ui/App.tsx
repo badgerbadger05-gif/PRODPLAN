@@ -1,5 +1,7 @@
 import { Link, NavLink, Route, Routes } from 'react-router-dom'
 import { ErrorBoundary } from './ErrorBoundary'
+import { DbrDrumBoardPage } from './pages/DbrDrumBoardPage'
+import { DbrProgramsPage } from './pages/DbrProgramsPage'
 import { DbrSettingsPage } from './pages/DbrSettingsPage'
 import { HomePage } from './pages/HomePage'
 import { MrpResultPage } from './pages/MrpResultPage'
@@ -62,7 +64,9 @@ export function App() {
         <Route path="/" element={<HomePage />} />
         <Route path="/period-plan" element={<PeriodPlanPage />} />
         <Route path="/period-plan/:planId" element={<PeriodPlanPage />} />
-        <Route path="/dbr" element={<DbrSettingsPage />} />
+        <Route path="/dbr" element={<DbrDrumBoardPage />} />
+        <Route path="/dbr/programs" element={<DbrProgramsPage />} />
+        <Route path="/dbr/settings" element={<DbrSettingsPage />} />
         <Route path="/production-control" element={<ProductionControlPage />} />
         <Route path="/purchase-control" element={<PurchaseControlPage />} />
         <Route path="/transfer-requests" element={<TransferRequestsPage />} />
