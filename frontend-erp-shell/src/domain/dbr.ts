@@ -283,3 +283,70 @@ export type DbrFeederFilters = {
   limit?: number
   offset?: number
 }
+
+// Advisory only: these records describe replenishment demand but never launch
+// production, create purchase orders, or write to 1C.
+export type DbrFeederSignalStatus = 'Open' | 'Cancelled' | string
+
+export type DbrFeederSignal = {
+  id: number
+  dedup_key: string
+  signal_type: string
+  position_id: number
+  item_id: number
+  item_code?: string | null
+  item_name?: string | null
+  warehouse_ref1c: string
+  status: DbrFeederSignalStatus
+  suggested_qty: number
+  priority: number
+  zone: DbrFeederZone
+  nfp_snapshot?: number | null
+  target_qty_snapshot?: number | null
+  kit_force: boolean
+  kit_shortage_qty: number
+  source_schedule_id?: number | null
+  reason_json?: {
+    is_complete?: boolean
+    missing_reasons?: string[]
+    generator?: string
+  } | null
+  refreshed_at?: string | null
+  cancelled_at?: string | null
+}
+
+export type DbrFeederSignalPreviewRow = {
+  position_id: number
+  item_id: number
+  item_code: string
+  warehouse_ref1c: string
+  zone: DbrFeederZone
+  priority: number
+  nfp: number
+  target_qty: number
+  kit_force: boolean
+  kit_shortage_qty: number
+  suggested_qty: number
+  is_complete: boolean
+  missing_reasons: string[]
+  action: 'open' | 'update' | 'cancel' | 'none' | string
+}
+
+export type DbrFeederSignalPreview = {
+  schedule_id?: number | null
+  positions: number
+  actionable: number
+  rows: DbrFeederSignalPreviewRow[]
+  created?: number
+  updated?: number
+  reopened?: number
+  cancelled?: number
+}
+
+export type DbrFeederSignalFilters = {
+  status?: string
+  zone?: string
+  search?: string
+  limit?: number
+  offset?: number
+}

@@ -9,6 +9,9 @@ import type {
   DbrFeederFilters,
   DbrFeederPosition,
   DbrFeederPreview,
+  DbrFeederSignal,
+  DbrFeederSignalFilters,
+  DbrFeederSignalPreview,
   DbrMoveResult,
   DbrProgram,
   DbrProgramCreate,
@@ -181,4 +184,34 @@ export function rebuildDbrFeederPositions(expectedScheduleId: number) {
     method: 'POST',
     body: JSON.stringify({ schedule_id: expectedScheduleId, expected_schedule_id: expectedScheduleId }),
   })
+}
+
+// ── Feeder-chain advisory signals (preview + explicit refresh, read-only use) ─
+
+export function previewDbrFeederSignals() {
+  return api<DbrFeederSignalPreview>('/v1/dbr/feeder/signals/preview', {
+    method: 'POST',
+  })
+}
+
+export function refreshDbrFeederSignals(expectedScheduleId: number) {
+  return api<DbrFeederSignalPreview>('/v1/dbr/feeder/signals/refresh', {
+    method: 'POST',
+    body: JSON.stringify({ expected_schedule_id: expectedScheduleId }),
+  })
+}
+
+export function listDbrFeederSignals(filters: DbrFeederSignalFilters = {}) {
+  const search = new URLSearchParams()
+  if (filters.status) search.set('status', filters.status)
+  if (filters.zone) search.set('zone', filters.zone)
+  if (filters.search?.trim()) search.set('search', filters.search.trim())
+  if (filters.limit !== undefined) search.set('limit', String(filters.limit))
+  if (filters.offset !== undefined) search.set('offset', String(filters.offset))
+  const query = search.toString()
+  return api<DbrFeederSignal[]>(`/v1/dbr/feeder/signals${query ? `?${query}` : ''}`)
+}
+
+export function getDbrFeederSignal(signalId: number) {
+  return api<DbrFeederSignal>(`/v1/dbr/feeder/signals/${signalId}`)
 }

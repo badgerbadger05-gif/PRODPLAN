@@ -1,10 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import type { DbrFeederPosition, DbrFeederPreview } from '../../domain/dbr'
+import type { DbrFeederPosition, DbrFeederPreview, DbrFeederSignal, DbrFeederSignalPreview } from '../../domain/dbr'
 import { dateTimeRu, qty } from '../../lib/format'
 import {
   listDbrFeederPositions,
+  getDbrFeederSignal,
+  listDbrFeederSignals,
   previewDbrFeederPositions,
+  previewDbrFeederSignals,
   rebuildDbrFeederPositions,
+  refreshDbrFeederSignals,
 } from '../../services/dbr'
 import { DbrNav } from '../dbr/DbrNav'
 import { DocumentWindow } from '../layout/DocumentWindow'
@@ -20,6 +24,8 @@ const REASON_LABEL: Record<string, string> = {
 
 type Filters = { search: string; zone: string; mode: string; supply: string }
 const EMPTY_FILTERS: Filters = { search: '', zone: '', mode: '', supply: '' }
+type SignalFilters = { search: string; zone: string; status: string }
+const EMPTY_SIGNAL_FILTERS: SignalFilters = { search: '', zone: '', status: 'Open' }
 
 function zoneKey(value?: string | null) {
   return String(value ?? 'unknown').trim().toLowerCase()
@@ -34,6 +40,12 @@ export function DbrFeederPage() {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
+  const [signals, setSignals] = useState<DbrFeederSignal[]>([])
+  const [signalFilters, setSignalFilters] = useState<SignalFilters>(EMPTY_SIGNAL_FILTERS)
+  const [appliedSignalFilters, setAppliedSignalFilters] = useState<SignalFilters>(EMPTY_SIGNAL_FILTERS)
+  const [signalPreview, setSignalPreview] = useState<DbrFeederSignalPreview | null>(null)
+  const [selectedSignal, setSelectedSignal] = useState<DbrFeederSignal | null>(null)
+  const [signalsLoading, setSignalsLoading] = useState(false)
 
   const load = useCallback(async (next: Filters = applied) => {
     setLoading(true)
@@ -55,6 +67,20 @@ export function DbrFeederPage() {
   }, [applied])
 
   useEffect(() => { void load() }, [load])
+
+  const loadSignals = useCallback(async (next: SignalFilters = appliedSignalFilters) => {
+    setSignalsLoading(true)
+    setError('')
+    try {
+      setSignals(await listDbrFeederSignals({ ...next, limit: 5000 }))
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSignalsLoading(false)
+    }
+  }, [appliedSignalFilters])
+
+  useEffect(() => { void loadSignals() }, [loadSignals])
 
   const summary = useMemo(() => rows.reduce((acc, row) => {
     const zone = zoneKey(row.live_nfp?.zone)
@@ -91,6 +117,53 @@ export function DbrFeederPage() {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
       setSaving(false)
+    }
+  }
+
+  async function calculateSignalPreview() {
+    setSaving(true)
+    setError('')
+    setMessage('')
+    setSignalPreview(null)
+    try {
+      setSignalPreview(await previewDbrFeederSignals())
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function refreshSignals() {
+    if (!signalPreview?.schedule_id) {
+      setError('Нельзя обновить сигналы без активного графика')
+      return
+    }
+    setSaving(true)
+    setError('')
+    setMessage('')
+    try {
+      const result = await refreshDbrFeederSignals(signalPreview.schedule_id)
+      setSignalPreview(null)
+      setSelectedSignal(null)
+      setMessage(`Advisory-очередь обновлена по графику №${result.schedule_id ?? 'нет'}: создано ${result.created ?? 0}, обновлено ${result.updated ?? 0}, переоткрыто ${result.reopened ?? 0}, отменено ${result.cancelled ?? 0}`)
+      await loadSignals(appliedSignalFilters)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function selectSignal(signalId: number) {
+    setSignalsLoading(true)
+    setError('')
+    try {
+      setSelectedSignal(await getDbrFeederSignal(signalId))
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSignalsLoading(false)
     }
   }
 
@@ -158,6 +231,86 @@ export function DbrFeederPage() {
             </div>
           </section>
         )}
+
+        <section className="dbrSignalSection" aria-label="Advisory-сигналы пополнения">
+          <div className="dbrSignalHeader">
+            <div>
+              <h2>Advisory-очередь пополнения</h2>
+              <p>Расчётные сигналы для анализа. KIT показывает дефицит комплекта активного графика и всегда поднимается наверх.</p>
+            </div>
+            <button onClick={() => void calculateSignalPreview()} disabled={saving}>Предпросмотр сигналов</button>
+          </div>
+
+          {signalPreview && (
+            <div className="dbrFeederPreview dbrSignalPreview" aria-label="Предпросмотр обновления сигналов">
+              <div>
+                <strong>График №{signalPreview.schedule_id ?? 'не активен'}: {signalPreview.actionable} актуальных сигналов</strong>
+                <span>Позиций проверено: {signalPreview.positions}; открыть: {signalPreview.rows.filter((row) => row.action === 'open').length}, обновить: {signalPreview.rows.filter((row) => row.action === 'update').length}, отменить: {signalPreview.rows.filter((row) => row.action === 'cancel').length}</span>
+                <span>Это обновит только advisory-проекцию DBR.</span>
+              </div>
+              <div className="dbrFeederPreviewActions">
+                <button onClick={() => setSignalPreview(null)} disabled={saving}>Отмена</button>
+                <button className="primary" onClick={() => void refreshSignals()} disabled={saving || !signalPreview.schedule_id}>Обновить по графику №{signalPreview.schedule_id ?? 'нет'}</button>
+              </div>
+            </div>
+          )}
+
+          <div className="commandBar dbrFeederBar dbrSignalFilters">
+            <input className="dbrFeederSearch" value={signalFilters.search} placeholder="Сигнал: код или наименование" onChange={(e) => setSignalFilters({ ...signalFilters, search: e.target.value })} onKeyDown={(e) => { if (e.key === 'Enter') setAppliedSignalFilters(signalFilters) }} />
+            <select aria-label="Статус сигнала" value={signalFilters.status} onChange={(e) => setSignalFilters({ ...signalFilters, status: e.target.value })}>
+              <option value="Open">Открытые</option><option value="Cancelled">Отменённые</option><option value="">Все статусы</option>
+            </select>
+            <select aria-label="Зона сигнала" value={signalFilters.zone} onChange={(e) => setSignalFilters({ ...signalFilters, zone: e.target.value })}>
+              <option value="">Все зоны</option><option value="red">Красная</option><option value="yellow">Жёлтая</option><option value="green">Зелёная</option>
+            </select>
+            <button onClick={() => setAppliedSignalFilters(signalFilters)} disabled={signalsLoading}>Применить</button>
+            <button onClick={() => { setSignalFilters(EMPTY_SIGNAL_FILTERS); setAppliedSignalFilters(EMPTY_SIGNAL_FILTERS) }} disabled={signalsLoading}>Сбросить</button>
+            <div className="commandBarSpacer" />
+            <span className="dbrSignalCount">Сигналов: {signals.length}</span>
+          </div>
+
+          <div className="dbrSignalLayout">
+            <div className="dbrFeederTableWrap">
+              <table className="journalTable dbrTable dbrSignalTable">
+                <thead><tr><th>KIT</th><th>Приоритет</th><th>Зона</th><th>Номенклатура</th><th>Склад</th><th className="numCell">Количество</th><th>Статус</th><th>Обновлён</th></tr></thead>
+                <tbody>
+                  {!signalsLoading && !signals.length && <tr><td colSpan={8} className="emptyCell">Сигналы не найдены. Выполните предпросмотр и явное обновление.</td></tr>}
+                  {signals.map((signal) => {
+                    const normalizedZone = zoneKey(signal.zone)
+                    return (
+                      <tr key={signal.id} className={`${selectedSignal?.id === signal.id ? 'selected' : ''} ${signal.kit_force ? 'dbrSignalKitRow' : ''}`} onClick={() => void selectSignal(signal.id)}>
+                        <td>{signal.kit_force ? <span className="dbrKitForce">KIT</span> : '—'}</td>
+                        <td className="numCell"><strong>{Number(signal.priority).toFixed(2)}</strong></td>
+                        <td><span className={`dbrZoneBadge ${normalizedZone}`}><span className={`dbrDot ${normalizedZone.slice(0, 1)}`} />{ZONE_LABEL[normalizedZone] ?? signal.zone}</span></td>
+                        <td><strong>{signal.item_code ?? `#${signal.item_id}`}</strong><span className="dbrFeederItemName">{signal.item_name}</span></td>
+                        <td title={signal.warehouse_ref1c}>{signal.warehouse_ref1c}</td>
+                        <td className="numCell"><strong>{qty(signal.suggested_qty)}</strong></td>
+                        <td>{signal.status === 'Open' ? 'Открыт' : signal.status === 'Cancelled' ? 'Отменён' : signal.status}</td>
+                        <td>{dateTimeRu(signal.refreshed_at) || '—'}</td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+            {selectedSignal && (
+              <aside className="dbrSignalDetail" aria-label="Карточка сигнала">
+                <div className="dbrSignalDetailTitle"><strong>Сигнал #{selectedSignal.id}</strong><button aria-label="Закрыть карточку" onClick={() => setSelectedSignal(null)}>×</button></div>
+                <dl>
+                  <dt>Номенклатура</dt><dd>{selectedSignal.item_code}<small>{selectedSignal.item_name}</small></dd>
+                  <dt>Склад</dt><dd>{selectedSignal.warehouse_ref1c}</dd>
+                  <dt>Предложено</dt><dd>{qty(selectedSignal.suggested_qty)}</dd>
+                  <dt>NFP / цель</dt><dd>{qty(selectedSignal.nfp_snapshot)} / {qty(selectedSignal.target_qty_snapshot)}</dd>
+                  <dt>KIT-дефицит</dt><dd>{selectedSignal.kit_force ? qty(selectedSignal.kit_shortage_qty) : 'нет'}</dd>
+                  <dt>График</dt><dd>№{selectedSignal.source_schedule_id ?? 'нет'}</dd>
+                  <dt>Источник</dt><dd>{selectedSignal.reason_json?.generator ?? '—'}</dd>
+                  <dt>Качество</dt><dd>{selectedSignal.reason_json?.missing_reasons?.length ? selectedSignal.reason_json.missing_reasons.map((reason) => REASON_LABEL[reason] ?? reason).join(', ') : 'Полные данные'}</dd>
+                </dl>
+                <div className="dbrSignalReadonly">Только просмотр: исполнительные действия отсутствуют.</div>
+              </aside>
+            )}
+          </div>
+        </section>
 
         <div className="dbrKpis dbrFeederKpis">
           <div className="dbrKpi"><div className="dbrKpiLabel">Позиции</div><div className="dbrKpiValue">{rows.length}</div><div className="dbrKpiSub">активные, по фильтру</div></div>

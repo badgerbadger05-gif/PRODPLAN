@@ -2155,6 +2155,32 @@ input:focus, select:focus {
 .dbrFeederTable td:nth-child(3) { max-width: 160px; overflow-wrap: anywhere; font-family: monospace; font-size: 11px; }
 .dbrFeederIncomplete { background: #fff7ed; }
 .dbrFeederItemName { display: block; max-width: 320px; color: #64748b; font-size: 11px; margin-top: 2px; }
+.dbrSignalSection { margin: 12px 0 4px; border: 1px solid #b8c5d6; background: #f8fafc; }
+.dbrSignalHeader { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 10px 12px; background: #e8eff7; border-bottom: 1px solid #c5d1df; }
+.dbrSignalHeader h2 { margin: 0; font-size: 15px; }
+.dbrSignalHeader p { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+.dbrSignalPreview { margin: 10px; }
+.dbrSignalFilters { border-top: 1px solid #d7e0ea; border-bottom: 1px solid #c5d1df; }
+.dbrSignalCount { color: var(--muted); font-size: 12px; }
+.dbrSignalLayout { display: flex; align-items: stretch; min-height: 180px; max-height: 430px; }
+.dbrSignalLayout > .dbrFeederTableWrap { min-width: 0; }
+.dbrSignalTable { min-width: 1050px; }
+.dbrSignalTable tbody tr { cursor: pointer; }
+.dbrSignalTable tbody tr.selected { background: #dbeafe; }
+.dbrSignalKitRow { box-shadow: inset 4px 0 #dc2626; }
+.dbrKitForce { display: inline-block; padding: 2px 5px; border-radius: 2px; background: #991b1b; color: #fff; font-size: 10px; font-weight: 800; letter-spacing: .04em; }
+.dbrSignalDetail { width: 300px; flex: 0 0 300px; padding: 10px 12px; overflow: auto; border-left: 1px solid #b8c5d6; background: #fff; }
+.dbrSignalDetailTitle { display: flex; justify-content: space-between; align-items: center; padding-bottom: 8px; border-bottom: 1px solid var(--line2); }
+.dbrSignalDetailTitle button { border: 0; background: transparent; font-size: 20px; line-height: 1; cursor: pointer; }
+.dbrSignalDetail dl { display: grid; grid-template-columns: 105px minmax(0, 1fr); gap: 7px 8px; margin: 10px 0; font-size: 12px; }
+.dbrSignalDetail dt { color: var(--muted); }
+.dbrSignalDetail dd { margin: 0; overflow-wrap: anywhere; }
+.dbrSignalDetail dd small { display: block; margin-top: 2px; color: var(--muted); }
+.dbrSignalReadonly { margin-top: 12px; padding: 7px; border: 1px solid #cbd5e1; background: #f1f5f9; color: #475569; font-size: 11px; }
+@media (max-width: 1050px) {
+  .dbrSignalLayout { display: block; max-height: none; }
+  .dbrSignalDetail { width: auto; border-top: 1px solid #b8c5d6; border-left: 0; }
+}
 .dbrZoneBadge { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; font-weight: 600; }
 .dbrZoneBadge.green { color: #047857; }
 .dbrZoneBadge.yellow { color: #a16207; }
