@@ -16,24 +16,33 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column(
-        "production_products",
-        sa.Column("destination_warehouse_ref1c", sa.String(length=36), nullable=True),
-    )
-    op.create_index(
-        "ix_production_products_destination_warehouse_ref1c",
-        "production_products",
-        ["destination_warehouse_ref1c"],
-    )
-    op.add_column(
-        "supplier_order_items",
-        sa.Column("destination_warehouse_ref1c", sa.String(length=36), nullable=True),
-    )
-    op.create_index(
-        "ix_supplier_order_items_destination_warehouse_ref1c",
-        "supplier_order_items",
-        ["destination_warehouse_ref1c"],
-    )
+    bind = op.get_bind()
+    offline = op.get_context().as_sql
+    for table in ("production_products", "supplier_order_items"):
+        inspector = None if offline else sa.inspect(bind)
+        columns = (
+            set()
+            if inspector is None
+            else {row["name"] for row in inspector.get_columns(table)}
+        )
+        if "destination_warehouse_ref1c" not in columns:
+            op.add_column(
+                table,
+                sa.Column(
+                    "destination_warehouse_ref1c",
+                    sa.String(length=36),
+                    nullable=True,
+                ),
+            )
+        inspector = None if offline else sa.inspect(bind)
+        indexes = (
+            set()
+            if inspector is None
+            else {row["name"] for row in inspector.get_indexes(table)}
+        )
+        name = f"ix_{table}_destination_warehouse_ref1c"
+        if name not in indexes:
+            op.create_index(name, table, ["destination_warehouse_ref1c"])
 
 
 def downgrade() -> None:

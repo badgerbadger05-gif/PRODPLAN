@@ -17,6 +17,7 @@ from sqlalchemy.pool import StaticPool
 from app.database import Base, get_db
 from app.models import (
     DbrAssemblyRate,
+    DbrSupermarketPosition,
     DefaultSpecification,
     Item,
     ItemWarehouseStock,
@@ -236,3 +237,28 @@ def test_roll_forward_endpoint(client, seed):
     resp = client.post(f"/api/v1/dbr/drum/{schedule_id}/roll-forward")
     assert resp.status_code == 200
     assert "moved" in resp.json()
+
+
+def test_feeder_positions_preview_rebuild_and_list(client, db_session, seed):
+    _, schedule_id = _create_and_activate(client, seed["sled_id"])
+
+    preview = client.post(
+        "/api/v1/dbr/feeder/positions/preview", json={"schedule_id": schedule_id}
+    )
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["positions"]
+    assert db_session.query(DbrSupermarketPosition).count() == 0
+
+    rebuilt = client.post(
+        "/api/v1/dbr/feeder/positions/rebuild",
+        json={
+            "schedule_id": schedule_id,
+            "expected_schedule_id": schedule_id,
+        },
+    )
+    assert rebuilt.status_code == 200, rebuilt.text
+    assert rebuilt.json()["created"] >= 1
+
+    listed = client.get("/api/v1/dbr/feeder/positions?active_only=true")
+    assert listed.status_code == 200
+    assert len(listed.json()) == rebuilt.json()["created"]

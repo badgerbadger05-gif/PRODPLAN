@@ -25,6 +25,7 @@ from ..database import get_db
 from ..services.dbr import (
     board_service,
     drum_service,
+    feeder_position_service,
     gate_service,
     program_service,
     settings_service,
@@ -131,6 +132,15 @@ class CategoryRisksReplace(BaseModel):
     rows: list[CategoryRiskIn]
 
 
+class PositionPreviewRequest(BaseModel):
+    schedule_id: Optional[int] = None
+
+
+class PositionRebuildRequest(BaseModel):
+    schedule_id: Optional[int] = None
+    expected_schedule_id: Optional[int] = None
+
+
 # --------------------------------------------------------------------------
 # Settings
 # --------------------------------------------------------------------------
@@ -209,6 +219,47 @@ def put_category_risks(
         db, [row.model_dump() for row in payload.rows]
     )
     return settings_service.list_category_risks(db)
+
+
+# --------------------------------------------------------------------------
+# Phase-2 static supermarket positions
+# --------------------------------------------------------------------------
+
+
+@router.post("/feeder/positions/preview")
+def preview_feeder_positions(
+    payload: PositionPreviewRequest, db: Session = Depends(get_db)
+):
+    try:
+        return feeder_position_service.preview_positions(db, payload.schedule_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/feeder/positions/rebuild")
+def rebuild_feeder_positions(
+    payload: PositionRebuildRequest,
+    db: Session = Depends(get_dbr_write_db, scope="function"),
+):
+    try:
+        return feeder_position_service.rebuild_positions(
+            db,
+            schedule_id=payload.schedule_id,
+            expected_schedule_id=payload.expected_schedule_id,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/feeder/positions")
+def get_feeder_positions(
+    active_only: bool = False, db: Session = Depends(get_db)
+):
+    return feeder_position_service.list_positions(db, active_only=active_only)
 
 
 # --------------------------------------------------------------------------

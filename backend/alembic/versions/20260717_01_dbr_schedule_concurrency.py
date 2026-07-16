@@ -17,6 +17,8 @@ depends_on = None
 
 def upgrade() -> None:
     bind = op.get_bind()
+    offline = op.get_context().as_sql
+    inspector = None if offline else sa.inspect(bind)
 
     # Repair any pre-existing invariant violation deterministically before the
     # partial unique index is installed: keep the newest active schedule.
@@ -32,52 +34,61 @@ def upgrade() -> None:
             """
         )
     )
-    op.create_index(
-        "ux_dbr_drum_schedule_one_active",
-        "dbr_drum_schedule",
-        ["status"],
-        unique=True,
-        postgresql_where=sa.text("status = 'active'"),
-        sqlite_where=sa.text("status = 'active'"),
+    schedule_indexes = (
+        set()
+        if inspector is None
+        else {row["name"] for row in inspector.get_indexes("dbr_drum_schedule")}
     )
+    if "ux_dbr_drum_schedule_one_active" not in schedule_indexes:
+        op.create_index(
+            "ux_dbr_drum_schedule_one_active",
+            "dbr_drum_schedule",
+            ["status"],
+            unique=True,
+            postgresql_where=sa.text("status = 'active'"),
+            sqlite_where=sa.text("status = 'active'"),
+        )
 
-    op.create_table(
-        "dbr_drum_schedule_program",
-        sa.Column("id", sa.Integer(), nullable=False),
-        sa.Column("schedule_id", sa.Integer(), nullable=False),
-        sa.Column("program_id", sa.Integer(), nullable=False),
-        sa.Column(
-            "created_at",
-            sa.TIMESTAMP(),
-            nullable=False,
-            server_default=sa.text("CURRENT_TIMESTAMP"),
-        ),
-        sa.ForeignKeyConstraint(
-            ["schedule_id"], ["dbr_drum_schedule.id"], ondelete="CASCADE"
-        ),
-        sa.ForeignKeyConstraint(
-            ["program_id"], ["dbr_production_program.id"], ondelete="CASCADE"
-        ),
-        sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint(
-            "schedule_id", "program_id", name="ux_dbr_drum_schedule_program"
-        ),
+    marker_exists = bool(
+        inspector is not None
+        and "dbr_drum_schedule_program" in inspector.get_table_names()
     )
-    op.create_index(
-        "ix_dbr_drum_schedule_program_id",
-        "dbr_drum_schedule_program",
-        ["id"],
+    if not marker_exists:
+        op.create_table(
+            "dbr_drum_schedule_program",
+            sa.Column("id", sa.Integer(), nullable=False),
+            sa.Column("schedule_id", sa.Integer(), nullable=False),
+            sa.Column("program_id", sa.Integer(), nullable=False),
+            sa.Column(
+                "created_at",
+                sa.TIMESTAMP(),
+                nullable=False,
+                server_default=sa.text("CURRENT_TIMESTAMP"),
+            ),
+            sa.ForeignKeyConstraint(
+                ["schedule_id"], ["dbr_drum_schedule.id"], ondelete="CASCADE"
+            ),
+            sa.ForeignKeyConstraint(
+                ["program_id"], ["dbr_production_program.id"], ondelete="CASCADE"
+            ),
+            sa.PrimaryKeyConstraint("id"),
+            sa.UniqueConstraint(
+                "schedule_id", "program_id", name="ux_dbr_drum_schedule_program"
+            ),
+        )
+    inspector = None if offline else sa.inspect(bind)
+    marker_indexes = (
+        set()
+        if inspector is None
+        else {
+            row["name"]
+            for row in inspector.get_indexes("dbr_drum_schedule_program")
+        }
     )
-    op.create_index(
-        "ix_dbr_drum_schedule_program_schedule_id",
-        "dbr_drum_schedule_program",
-        ["schedule_id"],
-    )
-    op.create_index(
-        "ix_dbr_drum_schedule_program_program_id",
-        "dbr_drum_schedule_program",
-        ["program_id"],
-    )
+    for column in ("id", "schedule_id", "program_id"):
+        name = f"ix_dbr_drum_schedule_program_{column}"
+        if name not in marker_indexes:
+            op.create_index(name, "dbr_drum_schedule_program", [column])
 
     # Backfill build/extend provenance already represented by slots. This also
     # makes repeat extend calls idempotent immediately after deployment.
@@ -89,6 +100,7 @@ def upgrade() -> None:
               FROM dbr_drum_slot
              WHERE source_program_id IS NOT NULL
              GROUP BY schedule_id, source_program_id
+            ON CONFLICT (schedule_id, program_id) DO NOTHING
             """
         )
     )

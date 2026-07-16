@@ -1140,6 +1140,59 @@ class DbrCategorySupplyRisk(Base):
     updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
 
 
+class DbrSupermarketPosition(Base):
+    """Static Phase-2 buffer sizing for one item at one destination shelf."""
+
+    __tablename__ = "dbr_supermarket_position"
+    __table_args__ = (
+        UniqueConstraint(
+            "item_id", "warehouse_ref1c", name="ux_dbr_supermarket_position_item_warehouse"
+        ),
+        CheckConstraint("adu >= 0", name="ck_dbr_supermarket_position_adu_nonnegative"),
+        CheckConstraint("commonality >= 0", name="ck_dbr_supermarket_position_commonality_nonnegative"),
+        CheckConstraint("rt_days >= 0", name="ck_dbr_supermarket_position_rt_nonnegative"),
+        CheckConstraint("batch_days >= 0", name="ck_dbr_supermarket_position_batch_nonnegative"),
+        CheckConstraint("q_batch >= 0", name="ck_dbr_supermarket_position_q_batch_nonnegative"),
+        CheckConstraint("k_var >= 0", name="ck_dbr_supermarket_position_k_var_nonnegative"),
+        CheckConstraint("k_var <= 1", name="ck_dbr_supermarket_position_k_var_bounded"),
+        CheckConstraint("supply_risk_pct >= 0", name="ck_dbr_supermarket_position_supply_risk_nonnegative"),
+        CheckConstraint("supply_type IN ('manufacture', 'purchase')", name="ck_dbr_supermarket_position_supply_type_allowed"),
+        CheckConstraint("mode IN ('shelf', 'under_schedule')", name="ck_dbr_supermarket_position_mode_allowed"),
+        CheckConstraint("rt_source IN ('class', 'lead_time')", name="ck_dbr_supermarket_position_rt_source_allowed"),
+        CheckConstraint("red_qty >= 0 AND yellow_qty >= 0 AND green_qty >= 0 AND target_qty >= 0", name="ck_dbr_supermarket_position_zones_nonnegative"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    item_id = Column(Integer, ForeignKey("items.item_id", ondelete="CASCADE"), nullable=False, index=True)
+    warehouse_ref1c = Column(String(36), nullable=False, index=True)
+    supply_type = Column(String(20), nullable=False)
+    mode = Column(String(20), nullable=False)
+    is_active = Column(Boolean, nullable=False, default=True, server_default="true", index=True)
+    is_stale = Column(Boolean, nullable=False, default=False, server_default="false", index=True)
+    adu = Column(DECIMAL(16, 4), nullable=False)
+    commonality = Column(Integer, nullable=False)
+    route_class = Column(String(40), nullable=True)
+    rt_days = Column(DECIMAL(10, 3), nullable=False)
+    rt_source = Column(String(20), nullable=False, default="class", server_default="class")
+    batch_days = Column(DECIMAL(10, 3), nullable=False)
+    q_batch = Column(DECIMAL(16, 3), nullable=False)
+    k_var = Column(DECIMAL(6, 3), nullable=False)
+    supply_risk_pct = Column(DECIMAL(8, 3), nullable=False, default=0, server_default="0")
+    red_qty = Column(DECIMAL(16, 3), nullable=False)
+    yellow_qty = Column(DECIMAL(16, 3), nullable=False)
+    green_qty = Column(DECIMAL(16, 3), nullable=False)
+    target_qty = Column(DECIMAL(16, 3), nullable=False)
+    source_schedule_id = Column(Integer, ForeignKey("dbr_drum_schedule.id", ondelete="SET NULL"), nullable=True, index=True)
+    data_quality = Column(CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'"))
+    calculation_snapshot = Column(CrossPlatformJSON, nullable=False, default=dict, server_default=text("'{}'"))
+    calculated_at = Column(TIMESTAMP, nullable=False, default=func.now(), server_default=func.now())
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    item = relationship("Item")
+    source_schedule = relationship("DbrDrumSchedule")
+
+
 # --------------------------------------------------------------------------
 # DBR Phase 1 — production program, drum schedule, slots, capacity gaps
 # --------------------------------------------------------------------------

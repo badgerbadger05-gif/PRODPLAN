@@ -21,17 +21,58 @@ from ...models import (
     IgnoredWarehouse,
     Item,
     ItemWarehouseStock,
+    Operation,
+    ProductionStage,
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
     ProductionResource,
     SpecComponent,
+    SpecOperation,
     StockWarehouse,
     SupplierOrder,
     SupplierOrderItem,
     WorkCalendarDay,
 )
 from .core.drum import assembly
+
+
+def item_route_text_map(db: Session) -> dict[str, str]:
+    """Normalized operation + stage text for each item's default specification."""
+    default_specs: dict[int, int] = {}
+    for row in db.query(DefaultSpecification).order_by(DefaultSpecification.id).all():
+        default_specs.setdefault(int(row.item_id), int(row.spec_id))
+    if not default_specs:
+        return {}
+    item_codes = {
+        int(item_id): str(code)
+        for item_id, code in db.query(Item.item_id, Item.item_code)
+        .filter(Item.item_id.in_(default_specs))
+        .all()
+    }
+    spec_to_items: dict[int, list[int]] = {}
+    for item_id, spec_id in default_specs.items():
+        spec_to_items.setdefault(spec_id, []).append(item_id)
+    text_by_spec: dict[int, list[str]] = {}
+    rows = (
+        db.query(SpecOperation.spec_id, Operation.operation_name, ProductionStage.stage_name)
+        .join(Operation, Operation.operation_id == SpecOperation.operation_id)
+        .outerjoin(ProductionStage, ProductionStage.stage_id == SpecOperation.stage_id)
+        .filter(SpecOperation.spec_id.in_(spec_to_items))
+        .order_by(SpecOperation.spec_id, SpecOperation.spec_operation_id)
+        .all()
+    )
+    for spec_id, operation_name, stage_name in rows:
+        parts = [str(value or "").strip().casefold() for value in (operation_name, stage_name)]
+        text_by_spec.setdefault(int(spec_id), []).extend(part for part in parts if part)
+    result: dict[str, str] = {}
+    for spec_id, item_ids in spec_to_items.items():
+        normalized = " ".join(" ".join(text_by_spec.get(spec_id, [])).split())
+        for item_id in item_ids:
+            code = item_codes.get(item_id)
+            if code:
+                result[code] = normalized
+    return result
 
 
 # --------------------------------------------------------------------------
