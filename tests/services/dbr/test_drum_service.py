@@ -4,15 +4,22 @@ from datetime import date
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import sessionmaker
 
 from app.models import (
     DbrAssemblyRate,
+    DbrDrumCapacityGap,
     DbrDrumSchedule,
+    DbrDrumScheduleProgram,
     DbrDrumSlot,
+    DbrProductionProgram,
     Item,
     ProductionResource,
     WorkCalendarDay,
 )
+from app.database import Base
 from app.services.dbr import drum_service, program_service
 
 
@@ -125,11 +132,86 @@ def test_extend_is_idempotent(db_session):
     drum_service.activate(db, schedule.id)
     db.flush()
 
-    p2 = _approved_program(db, item, 6)
+    p2 = _approved_program(db, item, 300)
     _, meta1 = drum_service.extend(db, schedule.id, p2.id)
     assert meta1["extended"] is True and meta1["slots_added"] > 0
     n_after = db.query(DbrDrumSlot).filter(DbrDrumSlot.schedule_id == schedule.id).count()
+    gaps_after = (
+        db.query(DbrDrumCapacityGap)
+        .filter(DbrDrumCapacityGap.schedule_id == schedule.id)
+        .count()
+    )
+    assert gaps_after > 0
 
     _, meta2 = drum_service.extend(db, schedule.id, p2.id)
     assert meta2["extended"] is False
     assert db.query(DbrDrumSlot).filter(DbrDrumSlot.schedule_id == schedule.id).count() == n_after
+    assert (
+        db.query(DbrDrumCapacityGap)
+        .filter(DbrDrumCapacityGap.schedule_id == schedule.id)
+        .count()
+        == gaps_after
+    )
+    assert (
+        db.query(DbrDrumScheduleProgram)
+        .filter_by(schedule_id=schedule.id, program_id=p2.id)
+        .count()
+        == 1
+    )
+
+
+def test_database_rejects_two_active_schedules_across_independent_sessions(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'active-invariant.db'}")
+    Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    first = session_factory()
+    second = session_factory()
+    try:
+        first.add(
+            DbrDrumSchedule(
+                period_from=date(2026, 8, 1),
+                period_to=date(2026, 8, 31),
+                status="active",
+            )
+        )
+        first.commit()
+        second.add(
+            DbrDrumSchedule(
+                period_from=date(2026, 9, 1),
+                period_to=date(2026, 9, 30),
+                status="active",
+            )
+        )
+        with pytest.raises(IntegrityError):
+            second.commit()
+        second.rollback()
+        assert first.query(DbrDrumSchedule).filter_by(status="active").count() == 1
+    finally:
+        first.close()
+        second.close()
+        engine.dispose()
+
+
+def test_database_rejects_duplicate_schedule_program_marker(db_session):
+    program = DbrProductionProgram(
+        from_date=date(2026, 8, 1),
+        to_date=date(2026, 8, 31),
+        status="approved",
+    )
+    schedule = DbrDrumSchedule(
+        period_from=program.from_date,
+        period_to=program.to_date,
+        status="draft",
+    )
+    db_session.add_all([program, schedule])
+    db_session.flush()
+    db_session.add(
+        DbrDrumScheduleProgram(schedule_id=schedule.id, program_id=program.id)
+    )
+    db_session.flush()
+    db_session.add(
+        DbrDrumScheduleProgram(schedule_id=schedule.id, program_id=program.id)
+    )
+
+    with pytest.raises(IntegrityError):
+        db_session.flush()

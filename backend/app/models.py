@@ -1196,6 +1196,15 @@ class DbrDrumSchedule(Base):
     """
 
     __tablename__ = "dbr_drum_schedule"
+    __table_args__ = (
+        Index(
+            "ux_dbr_drum_schedule_one_active",
+            "status",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+            sqlite_where=text("status = 'active'"),
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     period_from = Column(Date, nullable=False)
@@ -1223,6 +1232,44 @@ class DbrDrumSchedule(Base):
         cascade="all, delete-orphan",
     )
     source_program = relationship("DbrProductionProgram")
+    covered_programs = relationship(
+        "DbrDrumScheduleProgram",
+        back_populates="schedule",
+        cascade="all, delete-orphan",
+    )
+
+
+class DbrDrumScheduleProgram(Base):
+    """Idempotency marker for programs materialized into one drum schedule."""
+
+    __tablename__ = "dbr_drum_schedule_program"
+    __table_args__ = (
+        UniqueConstraint(
+            "schedule_id",
+            "program_id",
+            name="ux_dbr_drum_schedule_program",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    schedule_id = Column(
+        Integer,
+        ForeignKey("dbr_drum_schedule.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    program_id = Column(
+        Integer,
+        ForeignKey("dbr_production_program.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    created_at = Column(
+        TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False
+    )
+
+    schedule = relationship("DbrDrumSchedule", back_populates="covered_programs")
+    program = relationship("DbrProductionProgram")
 
 
 class DbrDrumSlot(Base):

@@ -9,11 +9,13 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ...models import (
     DbrDrumCapacityGap,
     DbrDrumSchedule,
+    DbrDrumScheduleProgram,
     DbrDrumSlot,
     DbrProductionProgram,
 )
@@ -31,6 +33,8 @@ DRAFT = "draft"
 ACTIVE = "active"
 SUPERSEDED = "superseded"
 CANCELLED = "cancelled"
+
+_ACTIVATE_ADVISORY_LOCK = 0x4442524143544956
 
 _SNAPSHOT_FIELDS = (
     "frozen_days",
@@ -169,6 +173,7 @@ def build_schedule(db: Session, program_id: int) -> tuple[DbrDrumSchedule, dict[
     )
     db.add(schedule)
     db.flush()
+    db.add(DbrDrumScheduleProgram(schedule_id=schedule.id, program_id=program.id))
     added = _append_result(db, schedule, result, program.id, name_to_rid, code_to_id)
     db.flush()
     return schedule, {"slots_added": added, "carried_over": carried, "calendar_fallback": fallback}
@@ -176,7 +181,17 @@ def build_schedule(db: Session, program_id: int) -> tuple[DbrDrumSchedule, dict[
 
 def activate(db: Session, schedule_id: int) -> DbrDrumSchedule:
     """Make a schedule Active; any other Active schedule becomes Superseded."""
-    schedule = db.get(DbrDrumSchedule, schedule_id)
+    if db.get_bind().dialect.name == "postgresql":
+        db.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_key)"),
+            {"lock_key": _ACTIVATE_ADVISORY_LOCK},
+        )
+    schedule = (
+        db.query(DbrDrumSchedule)
+        .filter(DbrDrumSchedule.id == schedule_id)
+        .with_for_update()
+        .one_or_none()
+    )
     if schedule is None:
         raise LookupError("schedule not found")
     if schedule.status in (SUPERSEDED, CANCELLED):
@@ -184,6 +199,7 @@ def activate(db: Session, schedule_id: int) -> DbrDrumSchedule:
     for other in (
         db.query(DbrDrumSchedule)
         .filter(DbrDrumSchedule.status == ACTIVE, DbrDrumSchedule.id != schedule.id)
+        .with_for_update()
         .all()
     ):
         other.status = SUPERSEDED
@@ -198,7 +214,12 @@ def extend(db: Session, schedule_id: int, program_id: int) -> tuple[DbrDrumSched
     Idempotent on source_program_id: re-extending with the same program adds
     nothing (extended=False).
     """
-    schedule = db.get(DbrDrumSchedule, schedule_id)
+    schedule = (
+        db.query(DbrDrumSchedule)
+        .filter(DbrDrumSchedule.id == schedule_id)
+        .with_for_update()
+        .one_or_none()
+    )
     if schedule is None:
         raise LookupError("schedule not found")
     if schedule.status not in (DRAFT, ACTIVE):
@@ -212,11 +233,25 @@ def extend(db: Session, schedule_id: int, program_id: int) -> tuple[DbrDrumSched
     if not program.items:
         raise ValueError("в программе нет строк")
 
-    existing_sources = {s.source_program_id for s in schedule.slots if s.source_program_id is not None}
-    if program_id in existing_sources:
+    covered = (
+        db.query(DbrDrumScheduleProgram.id)
+        .filter(
+            DbrDrumScheduleProgram.schedule_id == schedule.id,
+            DbrDrumScheduleProgram.program_id == program_id,
+        )
+        .first()
+    )
+    # Compatibility for schedules extended before the coverage-marker table
+    # existed: their slots still carry source_program_id.
+    covered_by_legacy_slot = any(
+        slot.source_program_id == program_id for slot in schedule.slots
+    )
+    if covered is not None or covered_by_legacy_slot:
         return schedule, {"extended": False, "reason": "already_covered", "slots_added": 0, "carried_over": []}
 
     result, name_to_rid, code_to_id, carried, fallback = _level_program(db, program)
+    db.add(DbrDrumScheduleProgram(schedule_id=schedule.id, program_id=program.id))
+    db.flush()
     added = _append_result(db, schedule, result, program.id, name_to_rid, code_to_id)
     if program.to_date > schedule.period_to:
         schedule.period_to = program.to_date
