@@ -262,18 +262,37 @@ def open_inbound(
     - purchase: supplier_order_items.remaining_qty > 0; eta = delivery_date,
       else order_date.
 
-    Each item's open qty is attributed to the shelf warehouse(s) the kit asks
-    for it at (one shelf per item in practice), so the gate's cumulative
-    netting can turn a RED into YELLOW when replenishment covers the shortage.
+    Only lines with an exact persisted destination are counted. Unknown
+    destinations are excluded conservatively and one line is never fanned out
+    across multiple requested shelves for the same item.
     """
+    inbound, _diagnostics = open_inbound_with_diagnostics(
+        db, pairs, code_to_id, id_to_code
+    )
+    return inbound
+
+
+def open_inbound_with_diagnostics(
+    db: Session,
+    pairs: set[tuple[str, str]],
+    code_to_id: dict[str, int],
+    id_to_code: dict[int, str],
+) -> tuple[list[tuple[str, str, date, float]], dict[str, int]]:
+    """Return exact-destination inbound plus aggregated exclusion diagnostics."""
+    diagnostics = {
+        "included": 0,
+        "excluded_null_destination": 0,
+        "excluded_destination_not_needed": 0,
+        "excluded_missing_eta": 0,
+    }
     if not pairs:
-        return []
-    wh_by_code: dict[str, set[str]] = {}
+        return [], diagnostics
+    wh_by_code: dict[str, dict[str, str]] = {}
     for code, wh in pairs:
-        wh_by_code.setdefault(code, set()).add(wh)
+        wh_by_code.setdefault(code, {})[str(wh).strip().lower()] = wh
     ids = sorted({code_to_id[c] for c in wh_by_code if c in code_to_id})
     if not ids:
-        return []
+        return [], diagnostics
 
     inbound: list[tuple[str, str, date, float]] = []
 
@@ -296,15 +315,24 @@ def open_inbound(
         rem = float(prod.remaining_qty or 0)
         if rem <= 0:
             continue
+        destination = str(prod.destination_warehouse_ref1c or "").strip()
+        if not destination:
+            diagnostics["excluded_null_destination"] += 1
+            continue
+        requested_wh = wh_by_code.get(code, {}).get(destination.lower())
+        if requested_wh is None:
+            diagnostics["excluded_destination_not_needed"] += 1
+            continue
         eta = None
         if state is not None and state.planned_finish_date:
             eta = state.planned_finish_date
         elif order.order_date is not None:
             eta = order.order_date.date() if hasattr(order.order_date, "date") else order.order_date
         if eta is None:
+            diagnostics["excluded_missing_eta"] += 1
             continue
-        for wh in wh_by_code.get(code, ()):
-            inbound.append((code, wh, eta, rem))
+        inbound.append((code, requested_wh, eta, rem))
+        diagnostics["included"] += 1
 
     # --- purchase ---
     po_rows = (
@@ -324,11 +352,20 @@ def open_inbound(
         rem = float(line.remaining_qty or 0)
         if rem <= 0:
             continue
+        destination = str(line.destination_warehouse_ref1c or "").strip()
+        if not destination:
+            diagnostics["excluded_null_destination"] += 1
+            continue
+        requested_wh = wh_by_code.get(code, {}).get(destination.lower())
+        if requested_wh is None:
+            diagnostics["excluded_destination_not_needed"] += 1
+            continue
         raw = line.delivery_date or order.order_date
         if raw is None:
+            diagnostics["excluded_missing_eta"] += 1
             continue
         eta = raw.date() if hasattr(raw, "date") else raw
-        for wh in wh_by_code.get(code, ()):
-            inbound.append((code, wh, eta, rem))
+        inbound.append((code, requested_wh, eta, rem))
+        diagnostics["included"] += 1
 
-    return inbound
+    return inbound, diagnostics

@@ -253,6 +253,7 @@ class ProductionProduct(Base):
     # 1C line normalization
     line_number = Column(Integer, nullable=True, index=True)
     characteristic_ref1c = Column(String(36), nullable=True)
+    destination_warehouse_ref1c = Column(String(36), nullable=True, index=True)
     quantity = Column(DECIMAL(10, 3), nullable=False)
     # Fact tracking (from 1C Assembly/Сборка запасов)
     produced_qty = Column(DECIMAL(10, 3), default=0.0, nullable=False)
@@ -565,6 +566,7 @@ class SupplierOrderItem(Base):
     item_id_ref = Column(Integer, ForeignKey('items.item_id'), nullable=False)
     line_number = Column(Integer, nullable=True, index=True)
     characteristic_ref1c = Column(String(36), nullable=True)
+    destination_warehouse_ref1c = Column(String(36), nullable=True, index=True)
     quantity = Column(DECIMAL(10, 3), nullable=False)
     received_qty = Column(DECIMAL(10, 3), default=0.0, nullable=False)
     remaining_qty = Column(DECIMAL(10, 3), nullable=False)

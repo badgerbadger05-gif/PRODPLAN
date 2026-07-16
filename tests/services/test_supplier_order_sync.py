@@ -2,7 +2,10 @@ import datetime
 
 from app.models import Item, SupplierOrder, SupplierOrderItem
 from app.schemas import ODataSyncRequest
-from app.services.supplier_order_sync import sync_supplier_orders_from_odata
+from app.services.supplier_order_sync import (
+    _resolve_supplier_destination,
+    sync_supplier_orders_from_odata,
+)
 
 
 def test_supplier_order_sync_stores_state_deletion_and_item_rows(db_session, monkeypatch):
@@ -35,6 +38,8 @@ def test_supplier_order_sync_stores_state_deletion_and_item_rows(db_session, mon
             assert "DeletionMark" in select_fields
             assert "СостояниеЗаказа_Key" in select_fields
             assert "Организация_Key" in select_fields
+            assert "СтруктурнаяЕдиницаРезерв_Key" in select_fields
+            assert "УчетПотребностиПоСкладам" in select_fields
             return [
                 {
                     "Ref_Key": "order-ref-1",
@@ -47,6 +52,8 @@ def test_supplier_order_sync_stores_state_deletion_and_item_rows(db_session, mon
                     "Контрагент_Key": "supplier-ref-1",
                     "Контрагент": {"Description": "Supplier One"},
                     "СуммаДокумента": 120.0,
+                    "СтруктурнаяЕдиницаРезерв_Key": "warehouse-header",
+                    "УчетПотребностиПоСкладам": "true",
                     "Запасы": [
                         {
                             "LineNumber": 1,
@@ -56,6 +63,8 @@ def test_supplier_order_sync_stores_state_deletion_and_item_rows(db_session, mon
                             "Цена": 12.0,
                             "Сумма": 120.0,
                             "ДатаПоступления": "2026-05-12T00:00:00",
+                            "СтруктурнаяЕдиницаРезерв_Key": "00000000-0000-0000-0000-000000000000",
+                            "СтруктурнаяЕдиница_Key": "generic-must-not-be-used",
                         }
                     ],
                 }
@@ -87,6 +96,82 @@ def test_supplier_order_sync_stores_state_deletion_and_item_rows(db_session, mon
     assert float(row.received_qty) == 3.0
     assert float(row.remaining_qty) == 7.0
     assert row.delivery_date == datetime.datetime(2026, 5, 12)
+    assert row.destination_warehouse_ref1c == "warehouse-header"
+
+
+def test_supplier_destination_never_uses_generic_structural_unit():
+    destination, source = _resolve_supplier_destination(
+        {
+            "СтруктурнаяЕдиницаРезерв_Key": "00000000-0000-0000-0000-000000000000",
+            "СтруктурнаяЕдиница_Key": "generic-ref",
+        },
+        {"СтруктурнаяЕдиницаРезерв_Key": None},
+    )
+
+    assert destination is None
+    assert source == "unresolved"
+
+
+def test_supplier_destination_line_precedes_header():
+    destination, source = _resolve_supplier_destination(
+        {"СтруктурнаяЕдиницаРезерв_Key": "line-ref"},
+        {
+            "СтруктурнаяЕдиницаРезерв_Key": "header-ref",
+            "УчетПотребностиПоСкладам": False,
+        },
+    )
+
+    assert (destination, source) == ("line-ref", "line")
+
+
+def test_supplier_destination_header_requires_warehouse_demand_flag():
+    item_row = {
+        "СтруктурнаяЕдиницаРезерв_Key": "00000000-0000-0000-0000-000000000000"
+    }
+
+    for truthy in (
+        True,
+        1,
+        "true",
+        "1",
+        "да",
+        "истина",
+        {"value": True},
+        {"Value": "true"},
+    ):
+        destination, source = _resolve_supplier_destination(
+            item_row,
+            {
+                "СтруктурнаяЕдиницаРезерв_Key": "header-ref",
+                "УчетПотребностиПоСкладам": truthy,
+            },
+        )
+        assert (destination, source) == ("header-ref", "header")
+
+
+def test_supplier_destination_ignores_header_when_warehouse_demand_disabled():
+    item_row = {"СтруктурнаяЕдиницаРезерв_Key": None}
+
+    for disabled in (
+        False,
+        0,
+        "false",
+        "0",
+        "нет",
+        "ложь",
+        None,
+        {"value": False},
+        {"Boolean": "false"},
+    ):
+        destination, source = _resolve_supplier_destination(
+            item_row,
+            {
+                "СтруктурнаяЕдиницаРезерв_Key": "header-ref",
+                "УчетПотребностиПоСкладам": disabled,
+            },
+        )
+        assert destination is None
+        assert source == "unresolved"
 
 
 def test_supplier_order_sync_skips_non_zsm_organization_and_deactivates_existing(db_session, monkeypatch):

@@ -1,9 +1,17 @@
 import datetime
 
-from app.models import Item, ProductionOrder, ProductionProduct
+from app.models import (
+    Item,
+    ProductionOrder,
+    ProductionOrderLineState,
+    ProductionProduct,
+    ProductionResource,
+    WorkshopWarehouseBinding,
+)
 from app.schemas import ODataSyncRequest
 from app.services.production_order_sync import (
     PRODUCTION_ORDER_SYNC_FROM_1C,
+    _resolve_product_destination,
     sync_production_orders_from_odata,
 )
 
@@ -37,6 +45,7 @@ def test_production_order_sync_includes_completed_orders(db_session, monkeypatch
                 assert filter_query == f"Date ge datetime'{PRODUCTION_ORDER_SYNC_FROM_1C}' and Posted eq true"
                 assert "DeletionMark" in select_fields
                 assert "СостояниеЗаказа_Key" in select_fields
+                assert "СтруктурнаяЕдиницаПродукции_Key" in select_fields
                 return [
                     {
                         "Ref_Key": "order-ref-done",
@@ -45,15 +54,18 @@ def test_production_order_sync_includes_completed_orders(db_session, monkeypatch
                         "Posted": True,
                         "DeletionMark": False,
                         "СостояниеЗаказа_Key": DONE_STATE_KEY,
+                        "СтруктурнаяЕдиницаПродукции_Key": "warehouse-header",
                     }
                 ]
             if entity_name == "Document_ЗаказНаПроизводство_Продукция":
+                assert "СтруктурнаяЕдиница_Key" in select_fields
                 return [
                     {
                         "Ref_Key": "order-ref-done",
                         "LineNumber": 1,
                         "Номенклатура_Key": "item-ref-1",
                         "Количество": 2.0,
+                        "СтруктурнаяЕдиница_Key": "00000000-0000-0000-0000-000000000000",
                     }
                 ]
             if entity_name == "Document_СборкаЗапасов":
@@ -86,6 +98,7 @@ def test_production_order_sync_includes_completed_orders(db_session, monkeypatch
     assert product.item_id == item.item_id
     assert product.line_number == 1
     assert float(product.quantity) == 2.0
+    assert product.destination_warehouse_ref1c == "warehouse-header"
 
 
 def test_production_order_sync_closes_missing_orders_only_inside_sync_horizon(db_session, monkeypatch):
@@ -144,3 +157,58 @@ def test_production_order_sync_closes_missing_orders_only_inside_sync_horizon(db
     db.refresh(may_order)
     assert old_order.deletion_mark is False
     assert may_order.deletion_mark is True
+
+
+def test_production_destination_falls_back_to_existing_workshop_binding(db_session):
+    item = Item(item_code="BIND", item_name="Binding item")
+    order = ProductionOrder(
+        order_number="BIND-1",
+        order_date=datetime.datetime(2026, 8, 1),
+        order_ref1c="bind-order",
+    )
+    workshop = ProductionResource(resource_name="Binding workshop")
+    db_session.add_all([item, order, workshop])
+    db_session.flush()
+    product = ProductionProduct(
+        order_id=order.order_id,
+        item_id=item.item_id,
+        quantity=1,
+        produced_qty=0,
+        remaining_qty=1,
+    )
+    db_session.add(product)
+    db_session.flush()
+    db_session.add_all(
+        [
+            ProductionOrderLineState(
+                product_id=product.product_id, workshop_id=workshop.resource_id
+            ),
+            WorkshopWarehouseBinding(
+                workshop_id=workshop.resource_id,
+                warehouse_ref1c="reserve-ref",
+                production_warehouse_ref1c="production-ref",
+            ),
+        ]
+    )
+    db_session.flush()
+
+    destination, source = _resolve_product_destination(
+        db_session,
+        {"СтруктурнаяЕдиница_Key": "00000000-0000-0000-0000-000000000000"},
+        {
+            "СтруктурнаяЕдиницаПродукции_Key": "00000000-0000-0000-0000-000000000000"
+        },
+        product,
+    )
+
+    assert (destination, source) == ("production-ref", "binding")
+
+
+def test_production_destination_line_precedes_header(db_session):
+    destination, source = _resolve_product_destination(
+        db_session,
+        {"СтруктурнаяЕдиница_Key": "line-ref"},
+        {"СтруктурнаяЕдиницаПродукции_Key": "header-ref"},
+    )
+
+    assert (destination, source) == ("line-ref", "line")

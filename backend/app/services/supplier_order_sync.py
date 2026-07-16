@@ -14,12 +14,21 @@ ALLOWED_ORGANIZATION_NAMES = {"зсм", "ооо зсм"}
 
 
 def _parse_1c_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, dict):
+        for key in ("value", "Value", "val", "boolean", "Boolean"):
+            if key in value:
+                return _parse_1c_bool(value.get(key), default)
+        return default
     if isinstance(value, bool):
         return value
     if value is None:
         return default
     if isinstance(value, (int, float)):
-        return bool(value)
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+        return default
     if isinstance(value, str):
         v = value.strip().lower()
         if v in ("true", "1", "yes", "y", "on", "истина", "да"):
@@ -64,6 +73,27 @@ def _to_float(value: Any, default: float = 0.0) -> float:
 
 def _is_zero_guid(value: Any) -> bool:
     return _norm_guid(value) == "00000000-0000-0000-0000-000000000000"
+
+
+def _nonzero_guid(value: Any) -> Optional[str]:
+    normalized = _norm_guid(value)
+    if not normalized or _is_zero_guid(normalized):
+        return None
+    return normalized
+
+
+def _resolve_supplier_destination(
+    item_row: Dict[str, Any], order_row: Dict[str, Any]
+) -> tuple[Optional[str], str]:
+    """Resolve reserve destination without using generic structural-unit keys."""
+    line_ref = _nonzero_guid(item_row.get("СтруктурнаяЕдиницаРезерв_Key"))
+    if line_ref:
+        return line_ref, "line"
+    if _parse_1c_bool(order_row.get("УчетПотребностиПоСкладам"), False):
+        header_ref = _nonzero_guid(order_row.get("СтруктурнаяЕдиницаРезерв_Key"))
+        if header_ref:
+            return header_ref, "header"
+    return None, "unresolved"
 
 
 def _extract_state_name(record: Dict[str, Any]) -> str:
@@ -314,6 +344,8 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
             "Организация_Key",
             "Контрагент_Key",
             "СуммаДокумента",
+            "СтруктурнаяЕдиницаРезерв_Key",
+            "УчетПотребностиПоСкладам",
             "Запасы",
         ]
         effective_select_fields = list(req.select_fields or orders_select_default)
@@ -518,6 +550,9 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                         price = _to_float(item_data.get('Цена'), 0.0)
                         amount = _to_float(item_data.get('Сумма'), 0.0)
                         delivery_date_str = item_data.get('ДатаПоступления', '')
+                        destination_ref, _destination_source = _resolve_supplier_destination(
+                            item_data, record
+                        )
 
                         if not item_key:
                             continue
@@ -552,7 +587,8 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                                 existing_order_item.amount != amount or
                                 existing_order_item.delivery_date != delivery_date or
                                 existing_order_item.item_id_ref != item.item_id or
-                                existing_order_item.characteristic_ref1c != characteristic_ref1c):
+                                existing_order_item.characteristic_ref1c != characteristic_ref1c or
+                                existing_order_item.destination_warehouse_ref1c != destination_ref):
                                 existing_order_item.item_id_ref = item.item_id
                                 existing_order_item.line_number = line_number
                                 existing_order_item.characteristic_ref1c = characteristic_ref1c
@@ -562,6 +598,7 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                                 existing_order_item.price = price
                                 existing_order_item.amount = amount
                                 existing_order_item.delivery_date = delivery_date
+                                existing_order_item.destination_warehouse_ref1c = destination_ref
                                 items_updated += 1
                         else:
                             new_order_item = SupplierOrderItem(
@@ -569,6 +606,7 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                                 item_id_ref=item.item_id,
                                 line_number=line_number,
                                 characteristic_ref1c=characteristic_ref1c,
+                                destination_warehouse_ref1c=destination_ref,
                                 quantity=quantity,
                                 received_qty=received_qty,
                                 remaining_qty=remaining_qty,
