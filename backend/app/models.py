@@ -1080,6 +1080,10 @@ class DbrSettings(Base):
     w2_warehouse_ref1c = Column(String(36), nullable=True)
     w3_warehouse_ref1c = Column(String(36), nullable=True)
     w4_warehouse_ref1c = Column(String(36), nullable=True)
+    # Fastener (метизы) item-category names excluded from the kit as free-issue.
+    # JSON list of ItemCategory.category_name values; empty list = nobody is a
+    # fastener. Mirrors ERPNext prodflow FASTENER_ITEM_GROUPS.
+    fastener_categories = Column(CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'"))
     created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -1132,3 +1136,159 @@ class DbrCategorySupplyRisk(Base):
     supply_risk_pct = Column(DECIMAL(6, 2), nullable=True)
     created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+# --------------------------------------------------------------------------
+# DBR Phase 1 — production program, drum schedule, slots, capacity gaps
+# --------------------------------------------------------------------------
+
+
+class DbrProductionProgram(Base):
+    """Производственная программа выпуска (аналог ERPNext prodflow
+    `ProdFlow Production Program`). Строки в dbr_production_program_item."""
+
+    __tablename__ = "dbr_production_program"
+
+    id = Column(Integer, primary_key=True, index=True)
+    company = Column(String(255), nullable=True)
+    title = Column(String(255), nullable=True)
+    from_date = Column(Date, nullable=False)
+    to_date = Column(Date, nullable=False)
+    # draft / approved / closed / cancelled
+    status = Column(String(20), nullable=False, default="draft", server_default="draft", index=True)
+    created_by = Column(String(100), nullable=True)
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    items = relationship(
+        "DbrProductionProgramItem",
+        back_populates="program",
+        cascade="all, delete-orphan",
+    )
+
+
+class DbrProductionProgramItem(Base):
+    __tablename__ = "dbr_production_program_item"
+
+    id = Column(Integer, primary_key=True, index=True)
+    program_id = Column(
+        Integer,
+        ForeignKey("dbr_production_program.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
+    program_date = Column(Date, nullable=False, index=True)
+    qty = Column(DECIMAL(14, 3), nullable=False)
+    comment = Column(TEXT, nullable=True)
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    program = relationship("DbrProductionProgram", back_populates="items")
+    item = relationship("Item")
+
+
+class DbrDrumSchedule(Base):
+    """Катящийся график барабана (аналог `ProdFlow Drum Schedule`).
+
+    config_snapshot фиксирует настройки DBR на момент расчёта, чтобы результат
+    был воспроизводим независимо от последующих правок dbr_settings.
+    """
+
+    __tablename__ = "dbr_drum_schedule"
+
+    id = Column(Integer, primary_key=True, index=True)
+    period_from = Column(Date, nullable=False)
+    period_to = Column(Date, nullable=False)
+    source_program_id = Column(
+        Integer,
+        ForeignKey("dbr_production_program.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # draft / active / superseded / cancelled
+    status = Column(String(20), nullable=False, default="draft", server_default="draft", index=True)
+    config_snapshot = Column(CrossPlatformJSON, nullable=True)
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    slots = relationship(
+        "DbrDrumSlot",
+        back_populates="schedule",
+        cascade="all, delete-orphan",
+    )
+    capacity_gaps = relationship(
+        "DbrDrumCapacityGap",
+        back_populates="schedule",
+        cascade="all, delete-orphan",
+    )
+    source_program = relationship("DbrProductionProgram")
+
+
+class DbrDrumSlot(Base):
+    """Плитка барабана: одно изделие × участок × день.
+
+    planned_date фиксируется при рождении плитки и не меняется; slot_date
+    подвижна (перенос/roll-forward). Границы жизненного цикла — release_status.
+    """
+
+    __tablename__ = "dbr_drum_slot"
+
+    id = Column(Integer, primary_key=True, index=True)
+    schedule_id = Column(
+        Integer,
+        ForeignKey("dbr_drum_schedule.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    slot_date = Column(Date, nullable=False, index=True)
+    planned_date = Column(Date, nullable=False)
+    resource_id = Column(Integer, ForeignKey("production_resources.resource_id"), nullable=False, index=True)
+    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
+    qty = Column(DECIMAL(14, 3), nullable=False)
+    produced_qty = Column(DECIMAL(14, 3), nullable=False, default=0, server_default="0")
+    # green / yellow / red / unknown
+    kit_status = Column(String(10), nullable=False, default="unknown", server_default="unknown", index=True)
+    shortage_json = Column(CrossPlatformJSON, nullable=True)
+    # pending / released / completed
+    release_status = Column(String(12), nullable=False, default="pending", server_default="pending", index=True)
+    source_program_id = Column(
+        Integer,
+        ForeignKey("dbr_production_program.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    position = Column(Integer, nullable=False, default=0, server_default="0")
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    schedule = relationship("DbrDrumSchedule", back_populates="slots")
+    resource = relationship("ProductionResource")
+    item = relationship("Item")
+
+
+class DbrDrumCapacityGap(Base):
+    """Разрыв мощности: сколько штук изделия не влезло в такт участка в день."""
+
+    __tablename__ = "dbr_drum_capacity_gap"
+
+    id = Column(Integer, primary_key=True, index=True)
+    schedule_id = Column(
+        Integer,
+        ForeignKey("dbr_drum_schedule.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    gap_date = Column(Date, nullable=True, index=True)
+    resource_id = Column(Integer, ForeignKey("production_resources.resource_id"), nullable=True, index=True)
+    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=True, index=True)
+    required_qty = Column(DECIMAL(14, 3), nullable=False)
+    takt_qty = Column(DECIMAL(14, 3), nullable=False)
+    gap_qty = Column(DECIMAL(14, 3), nullable=False)
+    resolution = Column(String(64), nullable=True)
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    schedule = relationship("DbrDrumSchedule", back_populates="capacity_gaps")
+    resource = relationship("ProductionResource")
+    item = relationship("Item")

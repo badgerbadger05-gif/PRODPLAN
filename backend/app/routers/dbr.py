@@ -13,15 +13,23 @@ Endpoints:
 
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal
-from typing import Optional
+from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
 from ..database import get_db
-from ..services.dbr import settings_service
+from ..services.dbr import (
+    board_service,
+    drum_service,
+    gate_service,
+    program_service,
+    settings_service,
+    slot_service,
+)
 
 router = APIRouter(prefix="/v1/dbr", tags=["dbr"])
 
@@ -51,6 +59,7 @@ class SettingsOut(BaseModel):
     w2_warehouse_ref1c: Optional[str] = None
     w3_warehouse_ref1c: Optional[str] = None
     w4_warehouse_ref1c: Optional[str] = None
+    fastener_categories: list[str] = []
 
 
 class SettingsUpdate(BaseModel):
@@ -72,6 +81,7 @@ class SettingsUpdate(BaseModel):
     w2_warehouse_ref1c: Optional[str] = None
     w3_warehouse_ref1c: Optional[str] = None
     w4_warehouse_ref1c: Optional[str] = None
+    fastener_categories: Optional[list[str]] = None
 
 
 class AssemblyRateOut(BaseModel):
@@ -175,3 +185,212 @@ def put_category_risks(payload: CategoryRisksReplace, db: Session = Depends(get_
         db, [row.model_dump() for row in payload.rows]
     )
     return settings_service.list_category_risks(db)
+
+
+# --------------------------------------------------------------------------
+# Production program
+# --------------------------------------------------------------------------
+
+
+class ProgramItemIn(BaseModel):
+    item_id: int
+    program_date: date
+    qty: Decimal
+    comment: Optional[str] = None
+
+
+class ProgramCreate(BaseModel):
+    from_date: date
+    to_date: date
+    company: Optional[str] = None
+    title: Optional[str] = None
+    created_by: Optional[str] = None
+    items: list[ProgramItemIn] = []
+
+
+class ProgramUpdate(BaseModel):
+    from_date: Optional[date] = None
+    to_date: Optional[date] = None
+    company: Optional[str] = None
+    title: Optional[str] = None
+    items: Optional[list[ProgramItemIn]] = None
+
+
+def _program_out(program) -> dict[str, Any]:
+    return {
+        "id": program.id,
+        "company": program.company,
+        "title": program.title,
+        "from_date": program.from_date,
+        "to_date": program.to_date,
+        "status": program.status,
+        "created_by": program.created_by,
+        "items": [
+            {
+                "id": it.id,
+                "item_id": it.item_id,
+                "program_date": it.program_date,
+                "qty": float(it.qty or 0),
+                "comment": it.comment,
+            }
+            for it in sorted(program.items, key=lambda i: (i.program_date, i.id))
+        ],
+    }
+
+
+@router.post("/programs")
+def create_program(payload: ProgramCreate, db: Session = Depends(get_db)):
+    try:
+        program = program_service.create_program(
+            db,
+            from_date=payload.from_date,
+            to_date=payload.to_date,
+            company=payload.company,
+            title=payload.title,
+            created_by=payload.created_by,
+            items=[it.model_dump() for it in payload.items],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return _program_out(program)
+
+
+@router.get("/programs")
+def list_programs(status: Optional[str] = None, db: Session = Depends(get_db)):
+    return [_program_out(p) for p in program_service.list_programs(db, status=status)]
+
+
+@router.get("/programs/{program_id}")
+def get_program(program_id: int, db: Session = Depends(get_db)):
+    program = program_service.get_program(db, program_id)
+    if program is None:
+        raise HTTPException(status_code=404, detail="program not found")
+    return _program_out(program)
+
+
+@router.put("/programs/{program_id}")
+def update_program(program_id: int, payload: ProgramUpdate, db: Session = Depends(get_db)):
+    data = payload.model_dump(exclude_unset=True)
+    if "items" in data and data["items"] is not None:
+        data["items"] = [dict(it) for it in data["items"]]
+    try:
+        program = program_service.update_program(db, program_id, data)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="program not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return _program_out(program)
+
+
+@router.post("/programs/{program_id}/approve")
+def approve_program(program_id: int, db: Session = Depends(get_db)):
+    try:
+        program = program_service.approve_program(db, program_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="program not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return _program_out(program)
+
+
+# --------------------------------------------------------------------------
+# Drum schedule
+# --------------------------------------------------------------------------
+
+
+class DrumBuild(BaseModel):
+    program_id: int
+
+
+class DrumExtend(BaseModel):
+    program_id: int
+
+
+class SlotMove(BaseModel):
+    new_date: date
+    new_resource_id: Optional[int] = None
+
+
+def _schedule_out(schedule) -> dict[str, Any]:
+    return {
+        "id": schedule.id,
+        "period_from": schedule.period_from,
+        "period_to": schedule.period_to,
+        "source_program_id": schedule.source_program_id,
+        "status": schedule.status,
+        "config_snapshot": schedule.config_snapshot,
+    }
+
+
+@router.post("/drum/build")
+def drum_build(payload: DrumBuild, db: Session = Depends(get_db)):
+    try:
+        schedule, meta = drum_service.build_schedule(db, payload.program_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="program not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"schedule": _schedule_out(schedule), **meta}
+
+
+@router.post("/drum/{schedule_id}/activate")
+def drum_activate(schedule_id: int, db: Session = Depends(get_db)):
+    try:
+        schedule = drum_service.activate(db, schedule_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="schedule not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return _schedule_out(schedule)
+
+
+@router.post("/drum/{schedule_id}/extend")
+def drum_extend(schedule_id: int, payload: DrumExtend, db: Session = Depends(get_db)):
+    try:
+        schedule, meta = drum_service.extend(db, schedule_id, payload.program_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="schedule or program not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"schedule": _schedule_out(schedule), **meta}
+
+
+@router.get("/drum/active/board")
+def drum_board(
+    date_from: Optional[date] = Query(default=None),
+    date_to: Optional[date] = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    return board_service.get_board(db, date_from=date_from, date_to=date_to)
+
+
+@router.post("/drum/{schedule_id}/refresh-gate")
+def drum_refresh_gate(schedule_id: int, db: Session = Depends(get_db)):
+    return gate_service.refresh_gate(db, schedule_id=schedule_id)
+
+
+@router.post("/drum/{schedule_id}/roll-forward")
+def drum_roll_forward(schedule_id: int, db: Session = Depends(get_db)):
+    return slot_service.roll_forward(db, schedule_id=schedule_id)
+
+
+@router.post("/drum/slots/{slot_id}/move")
+def drum_move_slot(slot_id: int, payload: SlotMove, db: Session = Depends(get_db)):
+    try:
+        return slot_service.move_slot(
+            db, slot_id, payload.new_date, new_resource_id=payload.new_resource_id
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="slot not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/drum/slots/{slot_id}/release")
+def drum_release_slot(slot_id: int, db: Session = Depends(get_db)):
+    try:
+        return slot_service.release_slot(db, slot_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="slot not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))

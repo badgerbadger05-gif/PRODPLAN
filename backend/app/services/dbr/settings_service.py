@@ -41,6 +41,7 @@ _SETTINGS_FIELDS = {
     "w2_warehouse_ref1c",
     "w3_warehouse_ref1c",
     "w4_warehouse_ref1c",
+    "fastener_categories",
 }
 
 
