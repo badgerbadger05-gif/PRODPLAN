@@ -321,6 +321,15 @@ input:focus, select:focus {
   text-overflow: ellipsis;
 }
 
+.warningLine {
+  margin: 8px 12px;
+  padding: 8px 10px;
+  color: #6b4b00;
+  background: #fff4ce;
+  border: 1px solid #e5c365;
+  border-radius: 4px;
+}
+
 .hintLine {
   padding: 6px 9px;
   border-bottom: 1px solid #d7dce3;

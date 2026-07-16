@@ -176,6 +176,7 @@ export type DbrBoard = {
   slots: DbrBoardSlot[]
   gaps: DbrBoardGap[]
   kpi: DbrBoardKpi
+  calendar_fallback?: boolean
 }
 
 export type DbrBuildResult = {

@@ -173,6 +173,7 @@ def test_build_activate_board(client, seed):
     assert body["slots"], "board should carry slots"
     assert sum(round(s["qty"]) for s in body["slots"]) == 12
     assert body["kpi"]["plan_qty"] == 12.0
+    assert body["calendar_fallback"] is True
 
 
 def test_refresh_gate_endpoint(client, seed):

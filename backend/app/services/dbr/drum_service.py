@@ -164,12 +164,14 @@ def build_schedule(db: Session, program_id: int) -> tuple[DbrDrumSchedule, dict[
     result, name_to_rid, code_to_id, carried, fallback = _level_program(db, program)
     settings = settings_service.get_or_create_settings(db)
 
+    config_snapshot = _config_snapshot(settings)
+    config_snapshot["calendar_fallback"] = fallback
     schedule = DbrDrumSchedule(
         period_from=program.from_date,
         period_to=program.to_date,
         source_program_id=program.id,
         status=DRAFT,
-        config_snapshot=_config_snapshot(settings),
+        config_snapshot=config_snapshot,
     )
     db.add(schedule)
     db.flush()
@@ -250,6 +252,11 @@ def extend(db: Session, schedule_id: int, program_id: int) -> tuple[DbrDrumSched
         return schedule, {"extended": False, "reason": "already_covered", "slots_added": 0, "carried_over": []}
 
     result, name_to_rid, code_to_id, carried, fallback = _level_program(db, program)
+    config_snapshot = dict(schedule.config_snapshot or {})
+    config_snapshot["calendar_fallback"] = bool(
+        config_snapshot.get("calendar_fallback") or fallback
+    )
+    schedule.config_snapshot = config_snapshot
     db.add(DbrDrumScheduleProgram(schedule_id=schedule.id, program_id=program.id))
     db.flush()
     added = _append_result(db, schedule, result, program.id, name_to_rid, code_to_id)

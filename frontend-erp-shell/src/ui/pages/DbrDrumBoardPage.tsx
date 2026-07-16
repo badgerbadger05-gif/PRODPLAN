@@ -261,6 +261,11 @@ export function DbrDrumBoardPage() {
 
         {error && <div className="errorLine">{error}</div>}
         {message && <div className="successLine">{message}</div>}
+        {board?.calendar_fallback && (
+          <div className="warningLine">
+            Календарь работ не покрывает весь горизонт графика. Для непокрытых дат использован график пн–пт.
+          </div>
+        )}
 
         {/* ── KPI header ─────────────────────────────────────────────── */}
         <div className="dbrKpis">

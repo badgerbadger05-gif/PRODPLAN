@@ -68,7 +68,21 @@ def test_build_schedule_creates_slots(db_session):
     assert all(s.resource_id == res.resource_id for s in slots)
     assert all(s.release_status == "pending" and s.kit_status == "unknown" for s in slots)
     assert schedule.config_snapshot is not None
+    # Only five dates are present in the calendar; the rest of the monthly
+    # horizon is intentionally filled by the Mon-Fri fallback.
+    assert schedule.config_snapshot["calendar_fallback"] is True
     assert meta["slots_added"] == len(slots)
+
+
+def test_build_persists_calendar_fallback_when_calendar_is_missing(db_session):
+    db = db_session
+    _res, item = _setup_assembly(db)
+    program = _approved_program(db, item, 20)
+
+    schedule, meta = drum_service.build_schedule(db, program.id)
+
+    assert meta["calendar_fallback"] is True
+    assert schedule.config_snapshot["calendar_fallback"] is True
 
 
 def test_build_requires_approved_program(db_session):

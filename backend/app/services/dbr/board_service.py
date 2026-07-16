@@ -52,6 +52,16 @@ def get_board(
             },
         }
 
+    config_snapshot = schedule.config_snapshot or {}
+    if "calendar_fallback" in config_snapshot:
+        calendar_fallback = bool(config_snapshot["calendar_fallback"])
+    else:
+        # Compatibility for schedules built before this data-quality marker
+        # was persisted: report current calendar coverage for their horizon.
+        _, calendar_fallback = adapters.load_workdays(
+            db, schedule.period_from, schedule.period_to
+        )
+
     resource_names = adapters.resource_name_map(db)
     item_rows = {int(i.item_id): (i.item_code, i.item_name) for i in db.query(Item).all()}
 
@@ -126,4 +136,5 @@ def get_board(
         "slots": slots_out,
         "gaps": gaps_out,
         "kpi": kpi,
+        "calendar_fallback": calendar_fallback,
     }
