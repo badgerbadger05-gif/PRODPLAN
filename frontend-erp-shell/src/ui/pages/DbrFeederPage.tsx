@@ -259,7 +259,7 @@ export function DbrFeederPage() {
               <div>
                 <strong>График №{signalPreview.schedule_id ?? 'не активен'}: {signalPreview.actionable} актуальных сигналов</strong>
                 <span>Пополнение: {signalPreviewSummary.replenish}; под график: {signalPreviewSummary.underSchedule}</span>
-                <span>Позиций проверено: {signalPreview.positions}; открыть: {signalPreview.rows.filter((row) => row.action === 'open').length}, обновить: {signalPreview.rows.filter((row) => row.action === 'update').length}, отменить: {signalPreview.rows.filter((row) => row.action === 'cancel').length}</span>
+                <span>Позиций проверено: {signalPreview.positions}; открыть: {signalPreview.rows.filter((row) => row.action === 'open').length}, обновить: {signalPreview.rows.filter((row) => row.action === 'update').length}, диагностика: {signalPreview.diagnostic ?? 0}, отменить: {signalPreview.rows.filter((row) => row.action === 'cancel').length}</span>
                 <span>Это обновит только advisory-проекцию DBR.</span>
               </div>
               <div className="dbrFeederPreviewActions">
@@ -272,7 +272,7 @@ export function DbrFeederPage() {
           <div className="commandBar dbrFeederBar dbrSignalFilters">
             <input className="dbrFeederSearch" value={signalFilters.search} placeholder="Сигнал: код или наименование" onChange={(e) => setSignalFilters({ ...signalFilters, search: e.target.value })} onKeyDown={(e) => { if (e.key === 'Enter') setAppliedSignalFilters(signalFilters) }} />
             <select aria-label="Статус сигнала" value={signalFilters.status} onChange={(e) => setSignalFilters({ ...signalFilters, status: e.target.value })}>
-              <option value="Open">Открытые</option><option value="Cancelled">Отменённые</option><option value="">Все статусы</option>
+              <option value="Open">Открытые</option><option value="Diagnostic">Диагностические</option><option value="Cancelled">Отменённые</option><option value="">Все статусы</option>
             </select>
             <select aria-label="Зона сигнала" value={signalFilters.zone} onChange={(e) => setSignalFilters({ ...signalFilters, zone: e.target.value })}>
               <option value="">Все зоны</option><option value="red">Красная</option><option value="yellow">Жёлтая</option><option value="green">Зелёная</option>
@@ -289,9 +289,9 @@ export function DbrFeederPage() {
           <div className="dbrSignalLayout">
             <div className="dbrFeederTableWrap">
               <table className="journalTable dbrTable dbrSignalTable">
-                <thead><tr><th>Тип</th><th>KIT</th><th>Приоритет</th><th>Зона</th><th>Номенклатура</th><th>Склад</th><th>Крайний срок запуска</th><th>Дата потребности / слота</th><th className="numCell">Спрос</th><th className="numCell">Дефицит</th><th className="numCell">Количество</th><th>Слот</th><th>Качество</th><th>Статус</th><th>Обновлён</th></tr></thead>
+                <thead><tr><th>Тип</th><th>KIT</th><th>Приоритет</th><th>Зона</th><th>Номенклатура</th><th>Склад</th><th>Крайний срок запуска</th><th>Дата потребности / слота</th><th className="numCell">Спрос</th><th className="numCell">Дефицит</th><th className="numCell">Количество</th><th className="numCell">Расчётная партия</th><th>Слот</th><th>Качество</th><th>Статус</th><th>Обновлён</th></tr></thead>
                 <tbody>
-                  {!signalsLoading && !signals.length && <tr><td colSpan={15} className="emptyCell">Сигналы не найдены. Выполните предпросмотр и явное обновление.</td></tr>}
+                  {!signalsLoading && !signals.length && <tr><td colSpan={16} className="emptyCell">Сигналы не найдены. Выполните предпросмотр и явное обновление.</td></tr>}
                   {signals.map((signal) => {
                     const normalizedZone = zoneKey(signal.zone)
                     return (
@@ -307,9 +307,10 @@ export function DbrFeederPage() {
                         <td className="numCell">{signal.signal_type === 'Под график' ? qty(signal.raw_demand_qty) : '—'}</td>
                         <td className="numCell">{signal.signal_type === 'Под график' ? qty(signal.raw_shortage_qty) : '—'}</td>
                         <td className="numCell"><strong>{qty(signal.suggested_qty)}</strong></td>
+                        <td className="numCell">{signal.status === 'Diagnostic' ? qty(signal.calculated_batch_qty) : '—'}</td>
                         <td>{signal.drum_slot_id ? `№${signal.drum_slot_id}` : '—'}</td>
                         <td>{signal.is_incomplete ? <span className="dbrQualityWarning" title={(signal.data_quality ?? []).map((reason) => REASON_LABEL[reason] ?? reason).join(', ')}>⚠ Неполные данные</span> : <span className="dbrQualityOk">Полные</span>}</td>
-                        <td>{signal.status === 'Open' ? 'Открыт' : signal.status === 'Cancelled' ? 'Отменён' : signal.status}</td>
+                        <td>{signal.status === 'Open' ? 'Открыт' : signal.status === 'Diagnostic' ? 'Диагностика' : signal.status === 'Cancelled' ? 'Отменён' : signal.status}</td>
                         <td>{dateTimeRu(signal.refreshed_at) || '—'}</td>
                       </tr>
                     )
@@ -325,6 +326,7 @@ export function DbrFeederPage() {
                   <dt>Склад</dt><dd>{selectedSignal.warehouse_ref1c}</dd>
                   <dt>Тип</dt><dd><span className={`dbrSignalTypeBadge ${selectedSignal.signal_type === 'Под график' ? 'schedule' : 'replenish'}`}>{SIGNAL_TYPE_LABEL[selectedSignal.signal_type] ?? selectedSignal.signal_type}</span></dd>
                   <dt>Предложено</dt><dd>{qty(selectedSignal.suggested_qty)}</dd>
+                  {selectedSignal.status === 'Diagnostic' && <><dt>Расчётная партия</dt><dd>{qty(selectedSignal.calculated_batch_qty)} <small>не рекомендация</small></dd></>}
                   {selectedSignal.signal_type === 'Под график' && <>
                     <dt>Крайний срок запуска</dt><dd>{dateRu(selectedSignal.need_date) || '—'}</dd>
                     <dt>Дата потребности / слота</dt><dd>{dateRu(selectedSignal.required_date) || '—'}</dd>

@@ -286,7 +286,7 @@ export type DbrFeederFilters = {
 
 // Advisory only: these records describe replenishment demand but never launch
 // production, create purchase orders, or write to 1C.
-export type DbrFeederSignalStatus = 'Open' | 'Cancelled' | string
+export type DbrFeederSignalStatus = 'Open' | 'Diagnostic' | 'Cancelled' | string
 
 export type DbrFeederSignal = {
   id: number
@@ -311,6 +311,7 @@ export type DbrFeederSignal = {
   required_date?: string | null
   raw_demand_qty?: number | null
   raw_shortage_qty?: number | null
+  calculated_batch_qty?: number | null
   data_quality?: string[]
   is_incomplete?: boolean
   reason_json?: {
@@ -343,6 +344,7 @@ export type DbrFeederSignalPreviewRow = {
   required_date?: string | null
   raw_demand_qty?: number | null
   raw_shortage_qty?: number | null
+  calculated_batch_qty?: number | null
   action: 'open' | 'update' | 'cancel' | 'none' | string
 }
 
@@ -350,12 +352,14 @@ export type DbrFeederSignalPreview = {
   schedule_id?: number | null
   positions: number
   actionable: number
+  diagnostic?: number
   under_schedule_demands?: number
   rows: DbrFeederSignalPreviewRow[]
   created?: number
   updated?: number
   reopened?: number
   cancelled?: number
+  diagnostic_persisted?: number
 }
 
 export type DbrFeederSignalFilters = {

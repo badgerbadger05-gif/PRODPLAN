@@ -19,6 +19,7 @@ ORDER_CREATED = "Order Created"
 IN_WORK = "In Work"
 DONE = "Done"
 CANCELLED = "Cancelled"
+DIAGNOSTIC = "Diagnostic"
 
 LIVE_STATUSES = (OPEN, ORDER_CREATED, IN_WORK)
 

@@ -182,6 +182,10 @@ def test_list_orders_kit_force_then_priority_and_zone_is_case_insensitive(db_ses
     rows = feeder_signal_service.list_signals(db, zone="yElLoW")
     assert [row["id"] for row in rows] == [forced.id, ordinary.id, lower.id]
     assert rows[0]["priority"] == 0.1 and rows[0]["kit_force"] is True
+    lower.status = "Diagnostic"
+    db.flush()
+    diagnostic = feeder_signal_service.list_signals(db, status="Diagnostic")
+    assert [row["id"] for row in diagnostic] == [lower.id]
 
 
 def _under_schedule_scenario(db, monkeypatch):
@@ -291,8 +295,40 @@ def test_under_schedule_eta_reservations_and_incomplete_inbound(db_session, monk
 
     assert rows[0]["available_before"] == 5  # stock 5 - reservation 4 + dated inbound 4
     assert rows[0]["raw_shortage_qty"] == 1
-    assert rows[0]["suggested_qty"] == 10  # advisory signal survives incomplete data
+    assert rows[0]["suggested_qty"] == 0  # incomplete data is never actionable
+    assert rows[0]["calculated_batch_qty"] == 10
     assert rows[0]["is_complete"] is False
     assert set(rows[0]["data_quality"]) >= {
         "supplier_inbound_eta_missing", "supplier_inbound_destination_missing"
     }
+
+    first = feeder_signal_service.refresh_signals(db, expected_schedule_id=schedule.id)
+    earliest = min(
+        (row for row in first["rows"] if row["signal_type"] == "Под график"),
+        key=lambda row: (row["required_date"], row["slot_id"]),
+    )["slot_id"]
+    signal = db.query(DbrFeederSignal).filter(
+        DbrFeederSignal.drum_slot_id == earliest,
+        DbrFeederSignal.signal_type == "Под график",
+    ).one()
+    assert signal.status == "Diagnostic"
+    assert float(signal.suggested_qty) == 0
+    assert float(signal.calculated_batch_qty) == 10
+    assert float(signal.raw_shortage_qty) > 0
+    assert first["diagnostic"] >= 1 and first["actionable"] == 0
+
+    # Once exact destination and ETA become complete, the same stable row
+    # reopens as an advisory Open signal.
+    for line in db.query(SupplierOrderItem).filter(SupplierOrderItem.order_id == order.order_id):
+        line.destination_warehouse_ref1c = "W4"
+        line.delivery_date = datetime(2026, 8, 1)
+    db.flush()
+    completed = feeder_signal_service.refresh_signals(db, expected_schedule_id=schedule.id)
+    assert completed["reopened"] >= 1
+    assert signal.status == "Open" and float(signal.suggested_qty) == 10
+
+    db.query(ItemWarehouseStock).filter(ItemWarehouseStock.item_id == part.item_id).one().qty = 100
+    db.flush()
+    cancelled = feeder_signal_service.refresh_signals(db, expected_schedule_id=schedule.id)
+    assert cancelled["cancelled"] >= 1
+    assert signal.status == "Cancelled" and float(signal.suggested_qty) == 0

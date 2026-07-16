@@ -1200,7 +1200,7 @@ class DbrFeederSignal(Base):
     __table_args__ = (
         UniqueConstraint("dedup_key", name="ux_dbr_feeder_signal_dedup_key"),
         CheckConstraint("signal_type IN ('Пополнение', 'Под график')", name="ck_dbr_feeder_signal_type"),
-        CheckConstraint("status IN ('Open', 'Cancelled')", name="ck_dbr_feeder_signal_status"),
+        CheckConstraint("status IN ('Open', 'Diagnostic', 'Cancelled')", name="ck_dbr_feeder_signal_status"),
         CheckConstraint("suggested_qty >= 0", name="ck_dbr_feeder_signal_qty_nonnegative"),
     )
 
@@ -1229,6 +1229,7 @@ class DbrFeederSignal(Base):
     required_date = Column(Date, nullable=True, index=True)
     raw_demand_qty = Column(DECIMAL(16, 3), nullable=True)
     raw_shortage_qty = Column(DECIMAL(16, 3), nullable=True)
+    calculated_batch_qty = Column(DECIMAL(16, 3), nullable=True)
     data_quality = Column(CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'"))
     is_incomplete = Column(Boolean, nullable=False, default=False, server_default="false", index=True)
     reason_json = Column(CrossPlatformJSON, nullable=False, default=dict, server_default=text("'{}'"))

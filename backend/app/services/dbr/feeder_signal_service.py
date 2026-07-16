@@ -167,13 +167,14 @@ def _under_schedule_rows(
         available_before = pool[key]
         shortage = max(demand - available_before, 0.0)
         generated = zones.round_up(shortage, float(position.q_batch or 1)) if shortage else 0.0
-        # Generated batch becomes available to this and later chronological demand.
-        pool[key] += generated - demand
+        quality = sorted(set(classifier_notes + incomplete_by_key.get(key, [])))
+        # Only an actionable recommendation may cover later demand.  A
+        # diagnostic batch is hypothetical and must not mask later shortages.
+        pool[key] += (generated if not quality else 0.0) - demand
         rt_days = float(position.rt_days or 0)
         need_date = slot.slot_date - timedelta(days=int(round(rt_days)))
         slack = (need_date - today).days
         priority = min(2.0, 1.0 - slack / rt_days) if rt_days > 0 else (2.0 if slack <= 0 else 0.0)
-        quality = sorted(set(classifier_notes + incomplete_by_key.get(key, [])))
         item_code = id_to_code.get(int(position.item_id), "")
         output.append({
             "position_id": int(position.id), "item_id": int(position.item_id),
@@ -181,7 +182,9 @@ def _under_schedule_rows(
             "signal_type": "Под график", "slot_id": int(slot.id),
             "required_date": slot.slot_date, "need_date": need_date,
             "raw_demand_qty": demand, "raw_shortage_qty": shortage,
-            "suggested_qty": generated, "priority": priority,
+            "suggested_qty": generated if not quality else 0.0,
+            "calculated_batch_qty": generated,
+            "priority": priority,
             "is_complete": not quality, "data_quality": quality,
             "dedup_key": signal_identity.build_dedup_key(
                 "Под график", drum_slot=str(slot.id), item=item_code,
@@ -301,9 +304,11 @@ def preview_signals(db: Session) -> dict[str, Any]:
     }
     for row in schedule_rows:
         current = existing_schedule.get(row["dedup_key"])
-        if row["suggested_qty"] > 0:
+        if row["raw_shortage_qty"] > 0 and not row["is_complete"]:
+            row["action"] = "diagnostic"
+        elif row["suggested_qty"] > 0:
             row["action"] = "update" if current and current.status == signal_identity.OPEN else "open"
-        elif current and current.status == signal_identity.OPEN:
+        elif current and current.status in (signal_identity.OPEN, signal_identity.DIAGNOSTIC):
             row["action"] = "cancel"
         else:
             row["action"] = "none"
@@ -313,6 +318,7 @@ def preview_signals(db: Session) -> dict[str, Any]:
         "positions": len(positions),
         "under_schedule_demands": len(schedule_rows),
         "actionable": sum(row["action"] in ("open", "update") for row in rows),
+        "diagnostic": sum(row["action"] == "diagnostic" for row in rows),
         "rows": rows,
     }
 
@@ -330,7 +336,7 @@ def refresh_signals(db: Session, expected_schedule_id: Optional[int] = None) -> 
         for row in db.query(DbrFeederSignal).with_for_update().all()
     }
     now = datetime.now()
-    created = updated = reopened = cancelled = 0
+    created = updated = reopened = cancelled = diagnostic = 0
     seen: set[str] = set()
     for data in preview["rows"]:
         position_id = data["position_id"]
@@ -338,7 +344,9 @@ def refresh_signals(db: Session, expected_schedule_id: Optional[int] = None) -> 
         seen.add(dedup_key)
         signal = current.get(dedup_key)
         actionable = data["action"] in ("open", "update")
-        if signal is None and not actionable:
+        diagnostic_action = data["action"] == "diagnostic"
+        desired = actionable or diagnostic_action
+        if signal is None and not desired:
             continue
         if signal is None:
             signal = DbrFeederSignal(
@@ -349,7 +357,7 @@ def refresh_signals(db: Session, expected_schedule_id: Optional[int] = None) -> 
             )
             db.add(signal)
             created += 1
-        elif actionable and signal.status == signal_identity.CANCELLED:
+        elif actionable and signal.status in (signal_identity.CANCELLED, signal_identity.DIAGNOSTIC):
             reopened += 1
         elif actionable:
             updated += 1
@@ -357,8 +365,13 @@ def refresh_signals(db: Session, expected_schedule_id: Optional[int] = None) -> 
             signal.status = signal_identity.OPEN
             signal.cancelled_at = None
             signal.suggested_qty = data["suggested_qty"]
+        elif diagnostic_action:
+            signal.status = signal_identity.DIAGNOSTIC
+            signal.cancelled_at = None
+            signal.suggested_qty = 0
+            diagnostic += 1
         else:
-            if signal.status == signal_identity.OPEN:
+            if signal.status in (signal_identity.OPEN, signal_identity.DIAGNOSTIC):
                 cancelled += 1
             signal.status = signal_identity.CANCELLED
             signal.cancelled_at = now
@@ -376,6 +389,7 @@ def refresh_signals(db: Session, expected_schedule_id: Optional[int] = None) -> 
         signal.required_date = data.get("required_date")
         signal.raw_demand_qty = data.get("raw_demand_qty")
         signal.raw_shortage_qty = data.get("raw_shortage_qty")
+        signal.calculated_batch_qty = data.get("calculated_batch_qty")
         signal.data_quality = data.get("data_quality", [])
         signal.is_incomplete = not data.get("is_complete", True)
         signal.reason_json = {
@@ -388,7 +402,7 @@ def refresh_signals(db: Session, expected_schedule_id: Optional[int] = None) -> 
 
     # Signals whose source position/slot ceased to be active must not remain live.
     for dedup_key, signal in current.items():
-        if dedup_key not in seen and signal.status == signal_identity.OPEN:
+        if dedup_key not in seen and signal.status in (signal_identity.OPEN, signal_identity.DIAGNOSTIC):
             signal.status = signal_identity.CANCELLED
             signal.suggested_qty = 0
             signal.cancelled_at = now
@@ -397,7 +411,10 @@ def refresh_signals(db: Session, expected_schedule_id: Optional[int] = None) -> 
             signal.reason_json = {"missing_reasons": [reason], "generator": "chronological_under_schedule" if signal.signal_type == "Под график" else "bulk_live_nfp"}
             cancelled += 1
     db.flush()
-    return {**preview, "created": created, "updated": updated, "reopened": reopened, "cancelled": cancelled}
+    return {
+        **preview, "created": created, "updated": updated, "reopened": reopened,
+        "cancelled": cancelled, "diagnostic_persisted": diagnostic,
+    }
 
 
 def signal_out(signal: DbrFeederSignal) -> dict[str, Any]:
@@ -424,6 +441,7 @@ def signal_out(signal: DbrFeederSignal) -> dict[str, Any]:
         "required_date": signal.required_date,
         "raw_demand_qty": float(signal.raw_demand_qty) if signal.raw_demand_qty is not None else None,
         "raw_shortage_qty": float(signal.raw_shortage_qty) if signal.raw_shortage_qty is not None else None,
+        "calculated_batch_qty": float(signal.calculated_batch_qty) if signal.calculated_batch_qty is not None else None,
         "data_quality": signal.data_quality,
         "is_incomplete": signal.is_incomplete,
         "reason_json": signal.reason_json,
