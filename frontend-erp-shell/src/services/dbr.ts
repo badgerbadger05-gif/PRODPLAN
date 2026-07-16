@@ -205,6 +205,7 @@ export function listDbrFeederSignals(filters: DbrFeederSignalFilters = {}) {
   const search = new URLSearchParams()
   if (filters.status) search.set('status', filters.status)
   if (filters.zone) search.set('zone', filters.zone)
+  if (filters.signal_type) search.set('signal_type', filters.signal_type)
   if (filters.search?.trim()) search.set('search', filters.search.trim())
   if (filters.limit !== undefined) search.set('limit', String(filters.limit))
   if (filters.offset !== undefined) search.set('offset', String(filters.offset))

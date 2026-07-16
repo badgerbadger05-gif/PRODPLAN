@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { DbrFeederPosition, DbrFeederPreview, DbrFeederSignal, DbrFeederSignalPreview } from '../../domain/dbr'
-import { dateTimeRu, qty } from '../../lib/format'
+import { dateRu, dateTimeRu, qty } from '../../lib/format'
 import {
   listDbrFeederPositions,
   getDbrFeederSignal,
@@ -20,12 +20,17 @@ const SUPPLY_LABEL: Record<string, string> = { purchase: 'Закупка', manuf
 const REASON_LABEL: Record<string, string> = {
   open_supply_destination_missing: 'не указан склад открытого прихода',
   stale_schedule: 'позиция рассчитана не по активному графику',
+  production_inbound_destination_missing: 'не указан склад производственного прихода',
+  production_inbound_eta_missing: 'не указана дата производственного прихода',
+  supplier_inbound_destination_missing: 'не указан склад прихода поставщика',
+  supplier_inbound_eta_missing: 'не указана дата прихода поставщика',
 }
+const SIGNAL_TYPE_LABEL: Record<string, string> = { 'Пополнение': 'Пополнение', 'Под график': 'Под график' }
 
 type Filters = { search: string; zone: string; mode: string; supply: string }
 const EMPTY_FILTERS: Filters = { search: '', zone: '', mode: '', supply: '' }
-type SignalFilters = { search: string; zone: string; status: string }
-const EMPTY_SIGNAL_FILTERS: SignalFilters = { search: '', zone: '', status: 'Open' }
+type SignalFilters = { search: string; zone: string; status: string; signal_type: string }
+const EMPTY_SIGNAL_FILTERS: SignalFilters = { search: '', zone: '', status: 'Open', signal_type: '' }
 
 function zoneKey(value?: string | null) {
   return String(value ?? 'unknown').trim().toLowerCase()
@@ -88,6 +93,14 @@ export function DbrFeederPage() {
     if (!row.live_nfp?.is_complete) acc.incomplete = (acc.incomplete ?? 0) + 1
     return acc
   }, {} as Record<string, number>), [rows])
+
+  const signalPreviewSummary = useMemo(() => {
+    const actionable = signalPreview?.rows.filter((row) => row.action === 'open' || row.action === 'update') ?? []
+    return {
+      replenish: actionable.filter((row) => row.signal_type === 'Пополнение').length,
+      underSchedule: actionable.filter((row) => row.signal_type === 'Под график').length,
+    }
+  }, [signalPreview])
 
   async function calculatePreview() {
     setSaving(true)
@@ -232,11 +245,11 @@ export function DbrFeederPage() {
           </section>
         )}
 
-        <section className="dbrSignalSection" aria-label="Advisory-сигналы пополнения">
+        <section className="dbrSignalSection" aria-label="Advisory-сигналы питающего контура">
           <div className="dbrSignalHeader">
             <div>
-              <h2>Advisory-очередь пополнения</h2>
-              <p>Расчётные сигналы для анализа. KIT показывает дефицит комплекта активного графика и всегда поднимается наверх.</p>
+              <h2>Advisory-очередь питающего контура</h2>
+              <p>«Пополнение» управляет полкой, «Под график» показывает дефицит к конкретному слоту. Отрицательный приоритет означает, что срок запуска ещё не наступил.</p>
             </div>
             <button onClick={() => void calculateSignalPreview()} disabled={saving}>Предпросмотр сигналов</button>
           </div>
@@ -245,6 +258,7 @@ export function DbrFeederPage() {
             <div className="dbrFeederPreview dbrSignalPreview" aria-label="Предпросмотр обновления сигналов">
               <div>
                 <strong>График №{signalPreview.schedule_id ?? 'не активен'}: {signalPreview.actionable} актуальных сигналов</strong>
+                <span>Пополнение: {signalPreviewSummary.replenish}; под график: {signalPreviewSummary.underSchedule}</span>
                 <span>Позиций проверено: {signalPreview.positions}; открыть: {signalPreview.rows.filter((row) => row.action === 'open').length}, обновить: {signalPreview.rows.filter((row) => row.action === 'update').length}, отменить: {signalPreview.rows.filter((row) => row.action === 'cancel').length}</span>
                 <span>Это обновит только advisory-проекцию DBR.</span>
               </div>
@@ -263,6 +277,9 @@ export function DbrFeederPage() {
             <select aria-label="Зона сигнала" value={signalFilters.zone} onChange={(e) => setSignalFilters({ ...signalFilters, zone: e.target.value })}>
               <option value="">Все зоны</option><option value="red">Красная</option><option value="yellow">Жёлтая</option><option value="green">Зелёная</option>
             </select>
+            <select aria-label="Тип сигнала" value={signalFilters.signal_type} onChange={(e) => setSignalFilters({ ...signalFilters, signal_type: e.target.value })}>
+              <option value="">Все типы</option><option value="Пополнение">Пополнение</option><option value="Под график">Под график</option>
+            </select>
             <button onClick={() => setAppliedSignalFilters(signalFilters)} disabled={signalsLoading}>Применить</button>
             <button onClick={() => { setSignalFilters(EMPTY_SIGNAL_FILTERS); setAppliedSignalFilters(EMPTY_SIGNAL_FILTERS) }} disabled={signalsLoading}>Сбросить</button>
             <div className="commandBarSpacer" />
@@ -272,19 +289,26 @@ export function DbrFeederPage() {
           <div className="dbrSignalLayout">
             <div className="dbrFeederTableWrap">
               <table className="journalTable dbrTable dbrSignalTable">
-                <thead><tr><th>KIT</th><th>Приоритет</th><th>Зона</th><th>Номенклатура</th><th>Склад</th><th className="numCell">Количество</th><th>Статус</th><th>Обновлён</th></tr></thead>
+                <thead><tr><th>Тип</th><th>KIT</th><th>Приоритет</th><th>Зона</th><th>Номенклатура</th><th>Склад</th><th>Крайний срок запуска</th><th>Дата потребности / слота</th><th className="numCell">Спрос</th><th className="numCell">Дефицит</th><th className="numCell">Количество</th><th>Слот</th><th>Качество</th><th>Статус</th><th>Обновлён</th></tr></thead>
                 <tbody>
-                  {!signalsLoading && !signals.length && <tr><td colSpan={8} className="emptyCell">Сигналы не найдены. Выполните предпросмотр и явное обновление.</td></tr>}
+                  {!signalsLoading && !signals.length && <tr><td colSpan={15} className="emptyCell">Сигналы не найдены. Выполните предпросмотр и явное обновление.</td></tr>}
                   {signals.map((signal) => {
                     const normalizedZone = zoneKey(signal.zone)
                     return (
-                      <tr key={signal.id} className={`${selectedSignal?.id === signal.id ? 'selected' : ''} ${signal.kit_force ? 'dbrSignalKitRow' : ''}`} onClick={() => void selectSignal(signal.id)}>
+                      <tr key={signal.id} className={`${selectedSignal?.id === signal.id ? 'selected' : ''} ${signal.kit_force ? 'dbrSignalKitRow' : ''} ${signal.is_incomplete ? 'dbrFeederIncomplete' : ''}`} onClick={() => void selectSignal(signal.id)}>
+                        <td><span className={`dbrSignalTypeBadge ${signal.signal_type === 'Под график' ? 'schedule' : 'replenish'}`}>{SIGNAL_TYPE_LABEL[signal.signal_type] ?? signal.signal_type}</span></td>
                         <td>{signal.kit_force ? <span className="dbrKitForce">KIT</span> : '—'}</td>
                         <td className="numCell"><strong>{Number(signal.priority).toFixed(2)}</strong></td>
                         <td><span className={`dbrZoneBadge ${normalizedZone}`}><span className={`dbrDot ${normalizedZone.slice(0, 1)}`} />{ZONE_LABEL[normalizedZone] ?? signal.zone}</span></td>
                         <td><strong>{signal.item_code ?? `#${signal.item_id}`}</strong><span className="dbrFeederItemName">{signal.item_name}</span></td>
                         <td title={signal.warehouse_ref1c}>{signal.warehouse_ref1c}</td>
+                        <td>{signal.signal_type === 'Под график' ? dateRu(signal.need_date) || '—' : '—'}</td>
+                        <td>{signal.signal_type === 'Под график' ? dateRu(signal.required_date) || '—' : '—'}</td>
+                        <td className="numCell">{signal.signal_type === 'Под график' ? qty(signal.raw_demand_qty) : '—'}</td>
+                        <td className="numCell">{signal.signal_type === 'Под график' ? qty(signal.raw_shortage_qty) : '—'}</td>
                         <td className="numCell"><strong>{qty(signal.suggested_qty)}</strong></td>
+                        <td>{signal.drum_slot_id ? `№${signal.drum_slot_id}` : '—'}</td>
+                        <td>{signal.is_incomplete ? <span className="dbrQualityWarning" title={(signal.data_quality ?? []).map((reason) => REASON_LABEL[reason] ?? reason).join(', ')}>⚠ Неполные данные</span> : <span className="dbrQualityOk">Полные</span>}</td>
                         <td>{signal.status === 'Open' ? 'Открыт' : signal.status === 'Cancelled' ? 'Отменён' : signal.status}</td>
                         <td>{dateTimeRu(signal.refreshed_at) || '—'}</td>
                       </tr>
@@ -299,12 +323,19 @@ export function DbrFeederPage() {
                 <dl>
                   <dt>Номенклатура</dt><dd>{selectedSignal.item_code}<small>{selectedSignal.item_name}</small></dd>
                   <dt>Склад</dt><dd>{selectedSignal.warehouse_ref1c}</dd>
+                  <dt>Тип</dt><dd><span className={`dbrSignalTypeBadge ${selectedSignal.signal_type === 'Под график' ? 'schedule' : 'replenish'}`}>{SIGNAL_TYPE_LABEL[selectedSignal.signal_type] ?? selectedSignal.signal_type}</span></dd>
                   <dt>Предложено</dt><dd>{qty(selectedSignal.suggested_qty)}</dd>
+                  {selectedSignal.signal_type === 'Под график' && <>
+                    <dt>Крайний срок запуска</dt><dd>{dateRu(selectedSignal.need_date) || '—'}</dd>
+                    <dt>Дата потребности / слота</dt><dd>{dateRu(selectedSignal.required_date) || '—'}</dd>
+                    <dt>Спрос / дефицит</dt><dd>{qty(selectedSignal.raw_demand_qty)} / {qty(selectedSignal.raw_shortage_qty)}</dd>
+                    <dt>Барабанный слот</dt><dd>№{selectedSignal.drum_slot_id ?? '—'}</dd>
+                  </>}
                   <dt>NFP / цель</dt><dd>{qty(selectedSignal.nfp_snapshot)} / {qty(selectedSignal.target_qty_snapshot)}</dd>
                   <dt>KIT-дефицит</dt><dd>{selectedSignal.kit_force ? qty(selectedSignal.kit_shortage_qty) : 'нет'}</dd>
                   <dt>График</dt><dd>№{selectedSignal.source_schedule_id ?? 'нет'}</dd>
                   <dt>Источник</dt><dd>{selectedSignal.reason_json?.generator ?? '—'}</dd>
-                  <dt>Качество</dt><dd>{selectedSignal.reason_json?.missing_reasons?.length ? selectedSignal.reason_json.missing_reasons.map((reason) => REASON_LABEL[reason] ?? reason).join(', ') : 'Полные данные'}</dd>
+                  <dt>Качество</dt><dd>{selectedSignal.is_incomplete || selectedSignal.data_quality?.length || selectedSignal.reason_json?.missing_reasons?.length ? <span className="dbrQualityWarning">⚠ {[...(selectedSignal.data_quality ?? []), ...(selectedSignal.reason_json?.missing_reasons ?? [])].filter((reason, index, all) => all.indexOf(reason) === index).map((reason) => REASON_LABEL[reason] ?? reason).join(', ') || 'Неполные данные'}</span> : 'Полные данные'}</dd>
                 </dl>
                 <div className="dbrSignalReadonly">Только просмотр: исполнительные действия отсутствуют.</div>
               </aside>

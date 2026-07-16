@@ -306,6 +306,13 @@ export type DbrFeederSignal = {
   kit_force: boolean
   kit_shortage_qty: number
   source_schedule_id?: number | null
+  drum_slot_id?: number | null
+  need_date?: string | null
+  required_date?: string | null
+  raw_demand_qty?: number | null
+  raw_shortage_qty?: number | null
+  data_quality?: string[]
+  is_incomplete?: boolean
   reason_json?: {
     is_complete?: boolean
     missing_reasons?: string[]
@@ -316,6 +323,7 @@ export type DbrFeederSignal = {
 }
 
 export type DbrFeederSignalPreviewRow = {
+  signal_type: string
   position_id: number
   item_id: number
   item_code: string
@@ -328,7 +336,13 @@ export type DbrFeederSignalPreviewRow = {
   kit_shortage_qty: number
   suggested_qty: number
   is_complete: boolean
-  missing_reasons: string[]
+  missing_reasons?: string[]
+  data_quality?: string[]
+  slot_id?: number | null
+  need_date?: string | null
+  required_date?: string | null
+  raw_demand_qty?: number | null
+  raw_shortage_qty?: number | null
   action: 'open' | 'update' | 'cancel' | 'none' | string
 }
 
@@ -336,6 +350,7 @@ export type DbrFeederSignalPreview = {
   schedule_id?: number | null
   positions: number
   actionable: number
+  under_schedule_demands?: number
   rows: DbrFeederSignalPreviewRow[]
   created?: number
   updated?: number
@@ -346,6 +361,7 @@ export type DbrFeederSignalPreview = {
 export type DbrFeederSignalFilters = {
   status?: string
   zone?: string
+  signal_type?: string
   search?: string
   limit?: number
   offset?: number
