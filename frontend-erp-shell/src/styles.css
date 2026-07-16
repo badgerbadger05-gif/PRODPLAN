@@ -1814,3 +1814,98 @@ input:focus, select:focus {
   color: #253040;
   line-height: 1.25;
 }
+
+/* ── DBR planning module ─────────────────────────────────────────────────── */
+.dbrScroll {
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.dbrSection {
+  border: 1px solid var(--line);
+  background: #fff;
+  padding: 10px;
+}
+
+.dbrSection > h2 {
+  margin: 0 0 8px;
+  font-size: 15px;
+  font-weight: 600;
+  color: #222b36;
+}
+
+.dbrSectionHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.dbrSectionHead > h2 {
+  margin: 0 0 8px;
+  font-size: 15px;
+  font-weight: 600;
+  color: #222b36;
+}
+
+.dbrFormGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 7px 10px;
+  align-items: end;
+}
+
+.dbrField {
+  display: grid;
+  gap: 2px;
+}
+
+.dbrField span {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.dbrGroupLabel {
+  grid-column: 1 / -1;
+  margin-top: 6px;
+  padding-bottom: 2px;
+  border-bottom: 1px solid var(--line2);
+  color: #253040;
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.dbrCheckField {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.dbrCheckField input {
+  min-height: auto;
+  width: auto;
+}
+
+.dbrTable {
+  min-width: 640px;
+}
+
+.dbrTable input,
+.dbrTable select {
+  width: 100%;
+}
+
+.dbrActionCol {
+  width: 96px;
+  text-align: center;
+}
+
+.dbrAddRow td {
+  background: #f7f8fa;
+}
