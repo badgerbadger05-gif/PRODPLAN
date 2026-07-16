@@ -1,0 +1,24 @@
+field	value
+batch_days_bending	7
+batch_days_paint_black	2
+batch_days_paint_color	3
+batch_days_turning	10
+batch_days_welding	5
+creation	NULL
+docstatus	0
+feeder_chain_enabled	1
+feeder_load_horizon_weeks	4
+feeder_wip_warehouse	НФ-000092 - Склад №2 - склад механического цеха - ООО "ЗСМ"
+frozen_days	3
+gate_horizon_workdays	10
+idx	0
+modified	2026-07-10 14:01:33.738522
+modified_by	Administrator
+name	ProdFlow Planning Settings
+owner	Administrator
+rt_machining_days	7
+rt_painting_days	21
+rt_welding_days	15
+shelf_threshold_qty	5
+w3_warehouse	НФ-000112 - Склад №3 - склад покрашенных деталей - ООО "ЗСМ"
+w4_warehouse	НФ-000102 - Склад №4 - склад корпуса №2 - ООО "ЗСМ"

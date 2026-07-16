@@ -1038,3 +1038,97 @@ class SyncLink(Base):
     last_synced_at = Column(TIMESTAMP, nullable=True)
     created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+# ---------------------------------------------------------------------------
+# DBR (Drum-Buffer-Rope) parallel planning module — settings/config tables.
+# Ported from ERPNext prodflow (ProdFlow Planning Settings / Assembly Rate /
+# child supply-risk settings). See .docs/dbr_parallel_module_roadmap.md §3.
+# Read-only against shared tables; only these dbr_* tables are module-owned.
+# ---------------------------------------------------------------------------
+
+
+class DbrSettings(Base):
+    """
+    Singleton row (id=1) of DBR planning settings. Mirrors ERPNext prodflow
+    `ProdFlow Planning Settings`. Warehouse roles reference
+    stock_warehouses.warehouse_ref1c by value (no hard FK — warehouses are
+    synced from 1C and may be (re)created independently).
+    """
+    __tablename__ = "dbr_settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    # Barabar / gate horizon
+    frozen_days = Column(Integer, nullable=False, default=3, server_default="3")
+    gate_horizon_workdays = Column(Integer, nullable=False, default=10, server_default="10")
+    shelf_threshold_qty = Column(DECIMAL(12, 3), nullable=False, default=5, server_default="5")
+    # Replenishment-time classes (days)
+    rt_machining_days = Column(Integer, nullable=False, default=7, server_default="7")
+    rt_welding_days = Column(Integer, nullable=False, default=15, server_default="15")
+    rt_painting_days = Column(Integer, nullable=False, default=21, server_default="21")
+    # Batch (green-zone) days per operation kind
+    batch_days_turning = Column(Integer, nullable=False, default=10, server_default="10")
+    batch_days_bending = Column(Integer, nullable=False, default=7, server_default="7")
+    batch_days_welding = Column(Integer, nullable=False, default=5, server_default="5")
+    batch_days_paint_black = Column(Integer, nullable=False, default=2, server_default="2")
+    batch_days_paint_color = Column(Integer, nullable=False, default=3, server_default="3")
+    # Feeder chain
+    feeder_chain_enabled = Column(Boolean, nullable=False, default=True, server_default=text("true"))
+    feeder_load_horizon_weeks = Column(Integer, nullable=False, default=4, server_default="4")
+    # Shelf warehouses (roles): №2 (mechshop WIP), №3 (painted), №4 (hull #2).
+    # FK-semantics on stock_warehouses.warehouse_ref1c, but no hard FK.
+    w2_warehouse_ref1c = Column(String(36), nullable=True)
+    w3_warehouse_ref1c = Column(String(36), nullable=True)
+    w4_warehouse_ref1c = Column(String(36), nullable=True)
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class DbrAssemblyRate(Base):
+    """
+    Assembly takt: how many units of an SKU one unit of resource capacity
+    yields per day. Mirrors ERPNext prodflow `ProdFlow Assembly Rate`.
+    """
+    __tablename__ = "dbr_assembly_rate"
+    __table_args__ = (
+        UniqueConstraint("resource_id", "item_id", name="ux_dbr_assembly_rate_resource_item"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    resource_id = Column(
+        Integer,
+        ForeignKey("production_resources.resource_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    item_id = Column(
+        Integer,
+        ForeignKey("items.item_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    qty_per_capacity = Column(DECIMAL(12, 3), nullable=False)
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    resource = relationship("ProductionResource")
+    item = relationship("Item")
+
+
+class DbrCategorySupplyRisk(Base):
+    """
+    Per-category (1С item group) supply-risk safety percentage and the
+    warehouse where the category is received. Mirrors ERPNext prodflow child
+    "category supply risk" settings.
+    """
+    __tablename__ = "dbr_category_supply_risk"
+    __table_args__ = (
+        UniqueConstraint("item_group", name="ux_dbr_category_supply_risk_group"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    item_group = Column(String(255), nullable=False, index=True)
+    receipt_warehouse_ref1c = Column(String(36), nullable=True)
+    supply_risk_pct = Column(DECIMAL(6, 2), nullable=True)
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
