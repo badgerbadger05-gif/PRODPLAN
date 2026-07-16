@@ -8,6 +8,7 @@ transaction), matching the convention of other services in this project.
 
 from __future__ import annotations
 
+from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
 
 from sqlalchemy.orm import Session
@@ -110,6 +111,13 @@ def upsert_assembly_rate(
     qty_per_capacity: Any,
 ) -> DbrAssemblyRate:
     """Insert or update the takt for a (resource_id, item_id) pair."""
+    try:
+        normalized_qty = Decimal(str(qty_per_capacity))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError("qty_per_capacity must be a positive number") from exc
+    if not normalized_qty.is_finite() or normalized_qty <= 0:
+        raise ValueError("qty_per_capacity must be greater than zero")
+
     rate = (
         db.query(DbrAssemblyRate)
         .filter(
@@ -122,11 +130,11 @@ def upsert_assembly_rate(
         rate = DbrAssemblyRate(
             resource_id=resource_id,
             item_id=item_id,
-            qty_per_capacity=qty_per_capacity,
+            qty_per_capacity=normalized_qty,
         )
         db.add(rate)
     else:
-        rate.qty_per_capacity = qty_per_capacity
+        rate.qty_per_capacity = normalized_qty
     db.flush()
     return rate
 
@@ -158,19 +166,15 @@ def list_category_risks(db: Session) -> list[DbrCategorySupplyRisk]:
 def replace_category_risks(
     db: Session, rows: Iterable[dict[str, Any]]
 ) -> list[DbrCategorySupplyRisk]:
-    """Idempotent upsert of category supply-risk rows keyed by item_group.
-
-    Existing groups are updated in place; new groups are inserted. Groups not
-    present in ``rows`` are left untouched (this is an upsert, not a full
-    replace) — pass an explicit ``prune`` at the caller if wholesale
-    replacement is ever needed.
-    """
+    """Replace category supply-risk rows, preserving IDs for retained groups."""
     existing = {r.item_group: r for r in db.query(DbrCategorySupplyRisk).all()}
     touched: list[DbrCategorySupplyRisk] = []
+    retained_groups: set[str] = set()
     for row in rows:
         group = row.get("item_group")
         if not group:
             continue
+        retained_groups.add(group)
         receipt = row.get("receipt_warehouse_ref1c")
         risk = row.get("supply_risk_pct")
         obj = existing.get(group)
@@ -186,5 +190,8 @@ def replace_category_risks(
             obj.receipt_warehouse_ref1c = receipt
             obj.supply_risk_pct = risk
         touched.append(obj)
+    for group, obj in existing.items():
+        if group not in retained_groups:
+            db.delete(obj)
     db.flush()
     return touched

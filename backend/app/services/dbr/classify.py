@@ -15,16 +15,18 @@ Boundaries in PRODPLAN terms:
   == settings.w2_warehouse_ref1c). Checked before purchase/№3/№4 — the mechshop
   blank is the priority decoupling point.
 - W4 — закупное: replenishment_method is a purchase flow (is_purchase_replenishment).
-- W3 — окрашенная деталь: manufactured item that has stock on the Склад №3
-  warehouse (item_warehouse_stock row with qty>0) — v1 "по фактическим Bin".
+- W3 — окрашенная деталь: manufactured item that has a stock row on the
+  Склад №3 warehouse.  The row itself represents the configured shelf; its
+  current quantity may be zero (matching prodflow Bin-existence semantics).
 - W4 (узел) — manufactured item without a №3 shelf → Склад №4 sub-assembly.
 - UNDER_SCHEDULE — деталь без полки: leaf detail (no spec, not purchased) → kit
   with the "под график" mark, sourced from Склад №4.
 
 The pure decision (classify_meta) is unit-tested on fixture ItemMeta; the
-DB-backed build_classifier assembles ItemMeta from shared tables. Disputable
-cases (missing shelf warehouse, unresolvable item) are collected as notes and
-never raise — the kit build must not fall over on messy master data.
+DB-backed build_classifier assembles ItemMeta from shared tables. Unresolvable
+items are collected as notes. Missing required warehouse-role configuration is
+a validation error: silently dropping such components could make the gate
+falsely green.
 """
 
 from __future__ import annotations
@@ -78,36 +80,32 @@ def classify_meta(
     if meta.is_w2_blank:
         if w2_wh:
             return kit_mod.W2, w2_wh, None
-        return (
-            kit_mod.FASTENER,
-            None,
-            f"{meta.item_code}: заготовка мехцеха, но склад №2 не настроен — исключена из кита",
+        raise ValueError(
+            f"{meta.item_code}: не настроена обязательная роль склад №2 (W2)"
         )
     if meta.is_purchase:
         if w4_wh:
             return kit_mod.W4, w4_wh, None
-        return (
-            kit_mod.FASTENER,
-            None,
-            f"{meta.item_code}: закупное, но склад №4 не настроен — исключено из кита",
+        raise ValueError(
+            f"{meta.item_code}: не настроена обязательная роль склад №4 (W4)"
         )
     if meta.has_spec:
-        if meta.has_w3_shelf and w3_wh:
-            return kit_mod.W3, w3_wh, None
+        if meta.has_w3_shelf:
+            if w3_wh:
+                return kit_mod.W3, w3_wh, None
+            raise ValueError(
+                f"{meta.item_code}: не настроена обязательная роль склад №3 (W3)"
+            )
         if w4_wh:
             return kit_mod.W4, w4_wh, None
-        return (
-            kit_mod.FASTENER,
-            None,
-            f"{meta.item_code}: сборка без полки, склад №4 не настроен — исключена из кита",
+        raise ValueError(
+            f"{meta.item_code}: не настроена обязательная роль склад №4 (W4)"
         )
     # leaf detail «без полки» — into the kit under schedule (W4 shelf)
     if w4_wh:
         return kit_mod.UNDER_SCHEDULE, w4_wh, None
-    return (
-        kit_mod.FASTENER,
-        None,
-        f"{meta.item_code}: деталь без полки, склад №4 не настроен — исключена из кита",
+    raise ValueError(
+        f"{meta.item_code}: не настроена обязательная роль склад №4 (W4)"
     )
 
 
@@ -120,6 +118,20 @@ def build_classifier(db: Session, settings):
     w2 = settings.w2_warehouse_ref1c
     w3 = settings.w3_warehouse_ref1c
     w4 = settings.w4_warehouse_ref1c
+    missing_roles = [
+        label
+        for label, warehouse in (
+            ("склад №2 (W2)", w2),
+            ("склад №3 (W3)", w3),
+            ("склад №4 (W4)", w4),
+        )
+        if not warehouse
+    ]
+    if missing_roles:
+        raise ValueError(
+            "Не настроены обязательные роли складов DBR: "
+            + ", ".join(missing_roles)
+        )
     fastener_names = set(settings.fastener_categories or [])
 
     items = {i.item_code: i for i in db.query(Item).all()}
@@ -147,7 +159,7 @@ def build_classifier(db: Session, settings):
     if w3:
         for (iid,) in (
             db.query(ItemWarehouseStock.item_id)
-            .filter(ItemWarehouseStock.warehouse_ref1c == w3, ItemWarehouseStock.qty > 0)
+            .filter(ItemWarehouseStock.warehouse_ref1c == w3)
             .all()
         ):
             w3_items.add(int(iid))

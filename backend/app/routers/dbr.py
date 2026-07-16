@@ -15,10 +15,10 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
-from typing import Any, Optional
+from typing import Any, Generator, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
 from ..database import get_db
@@ -32,6 +32,18 @@ from ..services.dbr import (
 )
 
 router = APIRouter(prefix="/v1/dbr", tags=["dbr"])
+
+
+def get_dbr_write_db(
+    db: Session = Depends(get_db),
+) -> Generator[Session, None, None]:
+    """Commit successful DBR mutations and roll back every failed request."""
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
 
 # --------------------------------------------------------------------------
@@ -97,7 +109,7 @@ class AssemblyRateOut(BaseModel):
 class AssemblyRateUpsert(BaseModel):
     resource_id: int
     item_id: int
-    qty_per_capacity: Decimal
+    qty_per_capacity: Decimal = Field(gt=0)
 
 
 class CategoryRiskOut(BaseModel):
@@ -130,7 +142,10 @@ def get_settings(db: Session = Depends(get_db)):
 
 
 @router.put("/settings", response_model=SettingsOut)
-def put_settings(payload: SettingsUpdate, db: Session = Depends(get_db)):
+def put_settings(
+    payload: SettingsUpdate,
+    db: Session = Depends(get_dbr_write_db, scope="function"),
+):
     # Only apply fields the caller actually sent (so omitted warehouse roles
     # keep their value rather than being cleared to null).
     data = payload.model_dump(exclude_unset=True)
@@ -148,7 +163,10 @@ def get_assembly_rates(db: Session = Depends(get_db)):
 
 
 @router.put("/assembly-rates", response_model=AssemblyRateOut)
-def put_assembly_rate(payload: AssemblyRateUpsert, db: Session = Depends(get_db)):
+def put_assembly_rate(
+    payload: AssemblyRateUpsert,
+    db: Session = Depends(get_dbr_write_db, scope="function"),
+):
     rate = settings_service.upsert_assembly_rate(
         db,
         resource_id=payload.resource_id,
@@ -163,7 +181,10 @@ def put_assembly_rate(payload: AssemblyRateUpsert, db: Session = Depends(get_db)
 
 
 @router.delete("/assembly-rates/{rate_id}")
-def delete_assembly_rate(rate_id: int, db: Session = Depends(get_db)):
+def delete_assembly_rate(
+    rate_id: int,
+    db: Session = Depends(get_dbr_write_db, scope="function"),
+):
     if not settings_service.delete_assembly_rate(db, rate_id):
         raise HTTPException(status_code=404, detail="assembly rate not found")
     return {"deleted": rate_id}
@@ -180,7 +201,10 @@ def get_category_risks(db: Session = Depends(get_db)):
 
 
 @router.put("/category-risks", response_model=list[CategoryRiskOut])
-def put_category_risks(payload: CategoryRisksReplace, db: Session = Depends(get_db)):
+def put_category_risks(
+    payload: CategoryRisksReplace,
+    db: Session = Depends(get_dbr_write_db, scope="function"),
+):
     settings_service.replace_category_risks(
         db, [row.model_dump() for row in payload.rows]
     )
@@ -229,6 +253,8 @@ def _program_out(program) -> dict[str, Any]:
             {
                 "id": it.id,
                 "item_id": it.item_id,
+                "item_code": it.item.item_code if it.item else None,
+                "item_name": it.item.item_name if it.item else None,
                 "program_date": it.program_date,
                 "qty": float(it.qty or 0),
                 "comment": it.comment,
@@ -239,7 +265,10 @@ def _program_out(program) -> dict[str, Any]:
 
 
 @router.post("/programs")
-def create_program(payload: ProgramCreate, db: Session = Depends(get_db)):
+def create_program(
+    payload: ProgramCreate,
+    db: Session = Depends(get_dbr_write_db, scope="function"),
+):
     try:
         program = program_service.create_program(
             db,
@@ -269,7 +298,11 @@ def get_program(program_id: int, db: Session = Depends(get_db)):
 
 
 @router.put("/programs/{program_id}")
-def update_program(program_id: int, payload: ProgramUpdate, db: Session = Depends(get_db)):
+def update_program(
+    program_id: int,
+    payload: ProgramUpdate,
+    db: Session = Depends(get_dbr_write_db, scope="function"),
+):
     data = payload.model_dump(exclude_unset=True)
     if "items" in data and data["items"] is not None:
         data["items"] = [dict(it) for it in data["items"]]
@@ -283,7 +316,10 @@ def update_program(program_id: int, payload: ProgramUpdate, db: Session = Depend
 
 
 @router.post("/programs/{program_id}/approve")
-def approve_program(program_id: int, db: Session = Depends(get_db)):
+def approve_program(
+    program_id: int,
+    db: Session = Depends(get_dbr_write_db, scope="function"),
+):
     try:
         program = program_service.approve_program(db, program_id)
     except LookupError:
@@ -323,7 +359,10 @@ def _schedule_out(schedule) -> dict[str, Any]:
 
 
 @router.post("/drum/build")
-def drum_build(payload: DrumBuild, db: Session = Depends(get_db)):
+def drum_build(
+    payload: DrumBuild,
+    db: Session = Depends(get_dbr_write_db, scope="function"),
+):
     try:
         schedule, meta = drum_service.build_schedule(db, payload.program_id)
     except LookupError:
@@ -334,7 +373,10 @@ def drum_build(payload: DrumBuild, db: Session = Depends(get_db)):
 
 
 @router.post("/drum/{schedule_id}/activate")
-def drum_activate(schedule_id: int, db: Session = Depends(get_db)):
+def drum_activate(
+    schedule_id: int,
+    db: Session = Depends(get_dbr_write_db, scope="function"),
+):
     try:
         schedule = drum_service.activate(db, schedule_id)
     except LookupError:
@@ -345,7 +387,11 @@ def drum_activate(schedule_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/drum/{schedule_id}/extend")
-def drum_extend(schedule_id: int, payload: DrumExtend, db: Session = Depends(get_db)):
+def drum_extend(
+    schedule_id: int,
+    payload: DrumExtend,
+    db: Session = Depends(get_dbr_write_db, scope="function"),
+):
     try:
         schedule, meta = drum_service.extend(db, schedule_id, payload.program_id)
     except LookupError:
@@ -365,17 +411,30 @@ def drum_board(
 
 
 @router.post("/drum/{schedule_id}/refresh-gate")
-def drum_refresh_gate(schedule_id: int, db: Session = Depends(get_db)):
-    return gate_service.refresh_gate(db, schedule_id=schedule_id)
+def drum_refresh_gate(
+    schedule_id: int,
+    db: Session = Depends(get_dbr_write_db, scope="function"),
+):
+    try:
+        return gate_service.refresh_gate(db, schedule_id=schedule_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 @router.post("/drum/{schedule_id}/roll-forward")
-def drum_roll_forward(schedule_id: int, db: Session = Depends(get_db)):
+def drum_roll_forward(
+    schedule_id: int,
+    db: Session = Depends(get_dbr_write_db, scope="function"),
+):
     return slot_service.roll_forward(db, schedule_id=schedule_id)
 
 
 @router.post("/drum/slots/{slot_id}/move")
-def drum_move_slot(slot_id: int, payload: SlotMove, db: Session = Depends(get_db)):
+def drum_move_slot(
+    slot_id: int,
+    payload: SlotMove,
+    db: Session = Depends(get_dbr_write_db, scope="function"),
+):
     try:
         return slot_service.move_slot(
             db, slot_id, payload.new_date, new_resource_id=payload.new_resource_id
@@ -387,7 +446,10 @@ def drum_move_slot(slot_id: int, payload: SlotMove, db: Session = Depends(get_db
 
 
 @router.post("/drum/slots/{slot_id}/release")
-def drum_release_slot(slot_id: int, db: Session = Depends(get_db)):
+def drum_release_slot(
+    slot_id: int,
+    db: Session = Depends(get_dbr_write_db, scope="function"),
+):
     try:
         return slot_service.release_slot(db, slot_id)
     except LookupError:

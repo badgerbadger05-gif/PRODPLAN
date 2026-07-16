@@ -38,6 +38,37 @@ def test_create_rejects_inverted_period(db_session):
         program_service.create_program(db_session, from_date=date(2026, 8, 31), to_date=date(2026, 8, 1))
 
 
+@pytest.mark.parametrize(
+    ("program_date", "qty", "message"),
+    [
+        (date(2026, 7, 31), Decimal("1"), "вне периода"),
+        (date(2026, 8, 3), Decimal("0"), "больше нуля"),
+        (date(2026, 8, 3), Decimal("-1"), "больше нуля"),
+    ],
+)
+def test_create_rejects_invalid_items(db_session, program_date, qty, message):
+    it = _item(db_session)
+    with pytest.raises(ValueError, match=message):
+        program_service.create_program(
+            db_session,
+            from_date=date(2026, 8, 1),
+            to_date=date(2026, 8, 31),
+            items=[{"item_id": it.item_id, "program_date": program_date, "qty": qty}],
+        )
+
+
+def test_create_rejects_duplicate_item_and_date(db_session):
+    it = _item(db_session)
+    row = {"item_id": it.item_id, "program_date": date(2026, 8, 3), "qty": Decimal("1")}
+    with pytest.raises(ValueError, match="дубликат строки"):
+        program_service.create_program(
+            db_session,
+            from_date=date(2026, 8, 1),
+            to_date=date(2026, 8, 31),
+            items=[row, {**row, "qty": Decimal("2")}],
+        )
+
+
 def test_update_replaces_items_only_in_draft(db_session):
     db = db_session
     it = _item(db)
@@ -57,6 +88,50 @@ def test_update_replaces_items_only_in_draft(db_session):
     assert program.title == "new"
     assert len(program.items) == 1
     assert float(program.items[0].qty) == 9.0
+
+
+def test_update_revalidates_existing_items_when_period_changes(db_session):
+    db = db_session
+    it = _item(db)
+    program = program_service.create_program(
+        db,
+        from_date=date(2026, 8, 1),
+        to_date=date(2026, 8, 31),
+        items=[{"item_id": it.item_id, "program_date": date(2026, 8, 20), "qty": 1}],
+    )
+    with pytest.raises(ValueError, match="вне периода"):
+        program_service.update_program(db, program.id, {"to_date": date(2026, 8, 10)})
+    assert program.to_date == date(2026, 8, 31)
+
+
+def test_update_rejects_non_positive_and_duplicate_replacement(db_session):
+    db = db_session
+    it = _item(db)
+    program = program_service.create_program(
+        db, from_date=date(2026, 8, 1), to_date=date(2026, 8, 31)
+    )
+    row = {"item_id": it.item_id, "program_date": date(2026, 8, 3), "qty": 1}
+
+    with pytest.raises(ValueError, match="больше нуля"):
+        program_service.update_program(db, program.id, {"items": [{**row, "qty": 0}]})
+    with pytest.raises(ValueError, match="дубликат строки"):
+        program_service.update_program(db, program.id, {"items": [row, row]})
+    assert program.items == []
+
+
+def test_approve_revalidates_persisted_items(db_session):
+    db = db_session
+    it = _item(db)
+    program = program_service.create_program(
+        db,
+        from_date=date(2026, 8, 1),
+        to_date=date(2026, 8, 31),
+        items=[{"item_id": it.item_id, "program_date": date(2026, 8, 3), "qty": 1}],
+    )
+    program.items[0].qty = 0
+    with pytest.raises(ValueError, match="больше нуля"):
+        program_service.approve_program(db, program.id)
+    assert program.status == "draft"
 
 
 def test_approve_requires_items(db_session):

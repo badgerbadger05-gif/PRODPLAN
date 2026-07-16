@@ -20,6 +20,7 @@ export type DbrSettings = {
   w2_warehouse_ref1c?: string | null
   w3_warehouse_ref1c?: string | null
   w4_warehouse_ref1c?: string | null
+  fastener_categories: string[]
 }
 
 // All fields optional — the backend patches only what is sent (exclude_unset).
@@ -61,6 +62,8 @@ export type DbrProgramStatus = 'draft' | 'approved' | string
 export type DbrProgramItem = {
   id: number
   item_id: number
+  item_code?: string | null
+  item_name?: string | null
   program_date: string
   qty: number
   comment?: string | null

@@ -46,6 +46,7 @@ function toForm(s: DbrSettings): SettingsForm {
     w2_warehouse_ref1c: s.w2_warehouse_ref1c ?? '',
     w3_warehouse_ref1c: s.w3_warehouse_ref1c ?? '',
     w4_warehouse_ref1c: s.w4_warehouse_ref1c ?? '',
+    fastener_categories: s.fastener_categories ?? [],
   }
 }
 
@@ -107,6 +108,9 @@ export function DbrSettingsPage() {
         w2_warehouse_ref1c: form.w2_warehouse_ref1c?.trim() || null,
         w3_warehouse_ref1c: form.w3_warehouse_ref1c?.trim() || null,
         w4_warehouse_ref1c: form.w4_warehouse_ref1c?.trim() || null,
+        fastener_categories: Array.from(
+          new Set(form.fastener_categories.map((name) => name.trim()).filter(Boolean)),
+        ),
       }
       const saved = await updateDbrSettings(payload)
       setForm(toForm(saved))
@@ -124,6 +128,10 @@ export function DbrSettingsPage() {
     const qtyPer = Number(rateDraft.qty_per_capacity)
     if (!resourceId || !itemId) {
       setError('Укажите участок и номенклатуру')
+      return
+    }
+    if (!Number.isFinite(qtyPer) || qtyPer <= 0) {
+      setError('Такт сборки должен быть больше нуля')
       return
     }
     setSaving(true)
@@ -265,6 +273,17 @@ export function DbrSettingsPage() {
                 <TextField label="Склад №2" value={form.w2_warehouse_ref1c ?? ''} onChange={(v) => patch({ w2_warehouse_ref1c: v })} />
                 <TextField label="Склад №3" value={form.w3_warehouse_ref1c ?? ''} onChange={(v) => patch({ w3_warehouse_ref1c: v })} />
                 <TextField label="Склад №4" value={form.w4_warehouse_ref1c ?? ''} onChange={(v) => patch({ w4_warehouse_ref1c: v })} />
+
+                <FieldGroupLabel>Классификация комплекта</FieldGroupLabel>
+                <label className="dbrField">
+                  <span>Категории метизов (по одной в строке)</span>
+                  <textarea
+                    rows={4}
+                    value={form.fastener_categories.join('\n')}
+                    onChange={(e) => patch({ fastener_categories: e.target.value.split('\n') })}
+                    placeholder={'Болты\nГайки\nШайбы'}
+                  />
+                </label>
               </div>
             ) : (
               <div className="emptyDetail">{loading ? 'Загрузка...' : 'Настройки недоступны'}</div>
@@ -321,6 +340,7 @@ export function DbrSettingsPage() {
                   <td className="numCell">
                     <input
                       type="number"
+                      min="0.001"
                       step="0.001"
                       placeholder="шт/сутки"
                       value={rateDraft.qty_per_capacity}

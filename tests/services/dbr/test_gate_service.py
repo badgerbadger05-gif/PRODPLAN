@@ -15,6 +15,8 @@ from app.models import (
 )
 from app.services.dbr import drum_service, gate_service, program_service, settings_service
 
+W2 = "REF-W2"
+W3 = "REF-W3"
 W4 = "REF-W4"
 BUILD_DAY = date(2026, 8, 3)
 
@@ -22,6 +24,8 @@ BUILD_DAY = date(2026, 8, 3)
 def _scenario(db, bolt_stock):
     # Settings: W4 shelf configured, no fasteners.
     settings = settings_service.get_or_create_settings(db)
+    settings.w2_warehouse_ref1c = W2
+    settings.w3_warehouse_ref1c = W3
     settings.w4_warehouse_ref1c = W4
     settings.gate_horizon_workdays = 10
     db.add(StockWarehouse(warehouse_ref1c=W4, warehouse_name="Склад №4", is_selected=True))
@@ -76,6 +80,23 @@ def test_gate_red_and_shortage_when_missing(db_session):
     assert reds
     shortage = reds[0].shortage_json
     assert shortage and shortage[0]["item"] == "BOLT"
+
+
+def test_gate_fails_closed_when_required_warehouse_role_is_missing(db_session):
+    db = db_session
+    schedule = _scenario(db, bolt_stock=100)
+    settings = settings_service.get_or_create_settings(db)
+    settings.w3_warehouse_ref1c = None
+    statuses_before = [s.kit_status for s in schedule.slots]
+
+    try:
+        gate_service.refresh_gate(db, schedule.id, today=BUILD_DAY)
+    except ValueError as exc:
+        assert "склад №3 (W3)" in str(exc)
+    else:
+        raise AssertionError("gate must not evaluate with missing warehouse roles")
+
+    assert [s.kit_status for s in schedule.slots] == statuses_before
 
 
 def test_gate_no_slots_in_horizon_is_noop(db_session):

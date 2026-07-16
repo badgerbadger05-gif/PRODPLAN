@@ -4,6 +4,8 @@ Pure classify_meta cases on fixture ItemMeta, plus one DB-backed integration
 that assembles ItemMeta from the shared tables.
 """
 
+import pytest
+
 from app.models import (
     DefaultSpecification,
     Item,
@@ -63,14 +65,30 @@ def test_leaf_detail_under_schedule():
     assert d == kit_mod.UNDER_SCHEDULE and wh == W4 and note is None
 
 
-def test_missing_w4_drops_purchase_with_note():
-    d, wh, note = classify_meta(ItemMeta("BUY", is_purchase=True), W2, W3, None)
-    assert d == kit_mod.FASTENER and wh is None and note and "склад №4" in note
+def test_missing_w4_rejects_purchase_classification():
+    with pytest.raises(ValueError, match=r"склад №4 \(W4\)"):
+        classify_meta(ItemMeta("BUY", is_purchase=True), W2, W3, None)
 
 
-def test_missing_w2_drops_blank_with_note():
-    d, wh, note = classify_meta(ItemMeta("FRAME", is_w2_blank=True, has_spec=True), None, W3, W4)
-    assert d == kit_mod.FASTENER and note and "склад №2" in note
+def test_missing_w2_rejects_blank_classification():
+    with pytest.raises(ValueError, match=r"склад №2 \(W2\)"):
+        classify_meta(
+            ItemMeta("FRAME", is_w2_blank=True, has_spec=True), None, W3, W4
+        )
+
+
+def test_missing_w3_rejects_configured_shelf_classification():
+    with pytest.raises(ValueError, match=r"склад №3 \(W3\)"):
+        classify_meta(
+            ItemMeta("PAINTED", has_spec=True, has_w3_shelf=True), W2, None, W4
+        )
+
+
+def test_fastener_remains_intentionally_excluded_even_without_roles():
+    decision, warehouse, note = classify_meta(
+        ItemMeta("BOLT", is_fastener=True), None, None, None
+    )
+    assert (decision, warehouse, note) == (kit_mod.FASTENER, None, None)
 
 
 # --------------------------------------------------------------------------
@@ -109,7 +127,7 @@ def test_build_classifier_from_db(db_session):
     db.add(DefaultSpecification(item_id=frame.item_id, spec_id=spec_frame.spec_id))
     db.add(DefaultSpecification(item_id=painted.item_id, spec_id=spec_paint.spec_id))
     # PAINT has a shelf on W3
-    db.add(ItemWarehouseStock(item_id=painted.item_id, warehouse_ref1c=W3, qty=7))
+    db.add(ItemWarehouseStock(item_id=painted.item_id, warehouse_ref1c=W3, qty=0))
     db.commit()
 
     class _Settings:
@@ -124,3 +142,22 @@ def test_build_classifier_from_db(db_session):
     assert classify("FRAME") == (kit_mod.W2, W2)
     assert classify("PAINT") == (kit_mod.W3, W3)
     assert notes == []
+
+
+def test_build_classifier_rejects_missing_required_warehouse_roles(db_session):
+    class _Settings:
+        w2_warehouse_ref1c = None
+        w3_warehouse_ref1c = ""
+        w4_warehouse_ref1c = None
+        fastener_categories = ["Метизы"]
+
+    try:
+        classify_mod.build_classifier(db_session, _Settings())
+    except ValueError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("missing warehouse roles must fail closed")
+
+    assert "склад №2 (W2)" in message
+    assert "склад №3 (W3)" in message
+    assert "склад №4 (W4)" in message

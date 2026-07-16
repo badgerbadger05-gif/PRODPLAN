@@ -6,8 +6,9 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database import Base, get_db
-from app.models import Item, ProductionResource
+from app.models import DbrAssemblyRate, Item, ProductionResource
 from app.routers.dbr import router as dbr_router
+from app.services.dbr import settings_service
 
 
 @pytest.fixture()
@@ -85,6 +86,7 @@ def test_get_settings_returns_defaults(client):
     assert data["feeder_load_horizon_weeks"] == 4
     assert str(data["shelf_threshold_qty"]) in ("5", "5.0", "5.000")
     assert data["w2_warehouse_ref1c"] is None
+    assert data["fastener_categories"] == []
 
 
 def test_put_settings_patches_fields(client):
@@ -95,6 +97,7 @@ def test_put_settings_patches_fields(client):
             "feeder_chain_enabled": False,
             "w2_warehouse_ref1c": "WH-2-REF",
             "w3_warehouse_ref1c": "WH-3-REF",
+            "fastener_categories": ["Болты", "Гайки"],
         },
     )
     assert resp.status_code == 200
@@ -103,6 +106,7 @@ def test_put_settings_patches_fields(client):
     assert data["feeder_chain_enabled"] is False
     assert data["w2_warehouse_ref1c"] == "WH-2-REF"
     assert data["w3_warehouse_ref1c"] == "WH-3-REF"
+    assert data["fastener_categories"] == ["Болты", "Гайки"]
     # untouched defaults remain
     assert data["gate_horizon_workdays"] == 10
 
@@ -110,6 +114,81 @@ def test_put_settings_patches_fields(client):
     again = client.get("/api/v1/dbr/settings").json()
     assert again["frozen_days"] == 5
     assert again["w2_warehouse_ref1c"] == "WH-2-REF"
+
+
+def test_put_settings_persists_across_independent_request_sessions(tmp_path):
+    """A shared-session dependency must not mask a missing request commit."""
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'dbr-router.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(bind=engine)
+    testing_session = sessionmaker(
+        autocommit=False, autoflush=False, bind=engine
+    )
+    request_sessions = []
+
+    def override_get_db():
+        db = testing_session()
+        request_sessions.append(db)
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app = FastAPI()
+    app.include_router(dbr_router, prefix="/api")
+    app.dependency_overrides[get_db] = override_get_db
+
+    try:
+        with TestClient(app) as independent_client:
+            response = independent_client.put(
+                "/api/v1/dbr/settings", json={"frozen_days": 17}
+            )
+            assert response.status_code == 200
+
+            response = independent_client.get("/api/v1/dbr/settings")
+            assert response.status_code == 200
+            assert response.json()["frozen_days"] == 17
+
+        assert len(request_sessions) == 2
+        assert request_sessions[0] is not request_sessions[1]
+    finally:
+        app.dependency_overrides.clear()
+        engine.dispose()
+
+
+def test_put_settings_commit_failure_is_not_reported_as_success(db_session):
+    rollback_called = False
+    original_rollback = db_session.rollback
+
+    def fail_commit():
+        raise RuntimeError("controlled commit failure")
+
+    def track_rollback():
+        nonlocal rollback_called
+        rollback_called = True
+        original_rollback()
+
+    db_session.commit = fail_commit
+    db_session.rollback = track_rollback
+
+    def override_get_db():
+        yield db_session
+
+    app = FastAPI()
+    app.include_router(dbr_router, prefix="/api")
+    app.dependency_overrides[get_db] = override_get_db
+
+    try:
+        with TestClient(app, raise_server_exceptions=False) as failing_client:
+            response = failing_client.put(
+                "/api/v1/dbr/settings", json={"frozen_days": 19}
+            )
+        assert response.status_code == 500
+        assert rollback_called is True
+    finally:
+        app.dependency_overrides.clear()
 
 
 def test_put_settings_omitted_warehouse_not_cleared(client):
@@ -169,12 +248,44 @@ def test_assembly_rate_crud(client, db_session):
     assert client.delete(f"/api/v1/dbr/assembly-rates/{rate_id}").status_code == 404
 
 
+@pytest.mark.parametrize("qty_per_capacity", [0, -1, "-0.001"])
+def test_assembly_rate_rejects_non_positive_qty(client, db_session, qty_per_capacity):
+    resource = _mk_resource(db_session)
+    item = _mk_item(db_session)
+    db_session.commit()
+
+    resp = client.put(
+        "/api/v1/dbr/assembly-rates",
+        json={
+            "resource_id": resource.resource_id,
+            "item_id": item.item_id,
+            "qty_per_capacity": qty_per_capacity,
+        },
+    )
+
+    assert resp.status_code == 422
+    assert db_session.query(DbrAssemblyRate).count() == 0
+
+
+def test_assembly_rate_service_rejects_non_positive_qty(db_session):
+    resource = _mk_resource(db_session)
+    item = _mk_item(db_session)
+
+    with pytest.raises(ValueError, match="greater than zero"):
+        settings_service.upsert_assembly_rate(
+            db_session,
+            resource_id=resource.resource_id,
+            item_id=item.item_id,
+            qty_per_capacity=0,
+        )
+
+
 # --------------------------------------------------------------------------
 # Category risks
 # --------------------------------------------------------------------------
 
 
-def test_category_risks_upsert(client):
+def test_category_risks_replace(client):
     resp = client.put(
         "/api/v1/dbr/category-risks",
         json={
@@ -190,7 +301,7 @@ def test_category_risks_upsert(client):
     groups = {r["item_group"] for r in rows}
     assert groups == {"Трубы круглые", "Болт"}
 
-    # idempotent update of one, add another
+    # update one, add another, and delete the omitted row
     resp = client.put(
         "/api/v1/dbr/category-risks",
         json={
@@ -201,6 +312,9 @@ def test_category_risks_upsert(client):
         },
     )
     rows = {r["item_group"]: r for r in resp.json()}
-    # Трубы круглые updated in place, Болт retained, Гайка added
-    assert set(rows) == {"Трубы круглые", "Болт", "Гайка"}
+    assert set(rows) == {"Трубы круглые", "Гайка"}
     assert rows["Трубы круглые"]["receipt_warehouse_ref1c"] == "WH-9"
+
+    resp = client.put("/api/v1/dbr/category-risks", json={"rows": []})
+    assert resp.status_code == 200
+    assert resp.json() == []

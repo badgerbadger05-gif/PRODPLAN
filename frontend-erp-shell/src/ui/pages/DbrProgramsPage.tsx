@@ -6,6 +6,7 @@ import {
   createDbrProgram,
   getDbrProgram,
   listDbrPrograms,
+  updateDbrProgram,
 } from '../../services/dbr'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
@@ -33,9 +34,52 @@ function statusLabel(status: string) {
   return status
 }
 
+function programRows(program: DbrProgram): DraftRow[] {
+  return program.items.map((row) => ({
+    key: `saved-${row.id}`,
+    item: {
+      item_id: row.item_id,
+      item_code: row.item_code || String(row.item_id),
+      item_name: row.item_name || row.item_code || `ID ${row.item_id}`,
+    },
+    program_date: row.program_date,
+    qty: String(row.qty),
+    comment: row.comment || '',
+  }))
+}
+
+function validatedItems(rows: DraftRow[], fromDate: string, toDate: string): DbrProgramItemIn[] {
+  if (!fromDate || !toDate || fromDate > toDate) {
+    throw new Error('Проверьте период программы')
+  }
+  if (!rows.length) throw new Error('Добавьте хотя бы одну строку программы')
+  const seen = new Set<string>()
+  return rows.map((row) => {
+    const quantity = Number(row.qty)
+    if (!row.item || !row.program_date || !Number.isFinite(quantity) || quantity <= 0) {
+      throw new Error('В каждой строке укажите номенклатуру, дату и количество больше нуля')
+    }
+    if (row.program_date < fromDate || row.program_date > toDate) {
+      throw new Error(`Дата ${row.program_date} находится вне периода программы`)
+    }
+    const key = `${row.item.item_id}:${row.program_date}`
+    if (seen.has(key)) {
+      throw new Error(`Номенклатура ${row.item.item_code} повторяется на дату ${row.program_date}`)
+    }
+    seen.add(key)
+    return {
+      item_id: row.item.item_id,
+      program_date: row.program_date,
+      qty: quantity,
+      comment: row.comment.trim() || null,
+    }
+  })
+}
+
 export function DbrProgramsPage() {
   const [programs, setPrograms] = useState<DbrProgram[]>([])
   const [selected, setSelected] = useState<DbrProgram | null>(null)
+  const [editRows, setEditRows] = useState<DraftRow[]>([])
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
@@ -68,7 +112,9 @@ export function DbrProgramsPage() {
     setError('')
     setMessage('')
     try {
-      setSelected(await getDbrProgram(id))
+      const program = await getDbrProgram(id)
+      setSelected(program)
+      setEditRows(programRows(program))
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
@@ -87,16 +133,11 @@ export function DbrProgramsPage() {
   }
 
   async function submit() {
-    const items: DbrProgramItemIn[] = rows
-      .filter((r) => r.item && Number(r.qty) > 0)
-      .map((r) => ({
-        item_id: r.item!.item_id,
-        program_date: r.program_date,
-        qty: Number(r.qty),
-        comment: r.comment.trim() || null,
-      }))
-    if (!items.length) {
-      setError('Добавьте хотя бы одну строку: номенклатура + дата + количество')
+    let items: DbrProgramItemIn[]
+    try {
+      items = validatedItems(rows, fromDate, toDate)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
       return
     }
     setSaving(true)
@@ -112,6 +153,7 @@ export function DbrProgramsPage() {
       })
       setMessage(`Программа №${created.id} создана (${items.length} строк)`)
       setSelected(created)
+      setEditRows(programRows(created))
       setRows([newRow(fromDate)])
       setTitle('')
       await load()
@@ -130,6 +172,36 @@ export function DbrProgramsPage() {
       const approved = await approveDbrProgram(id)
       setMessage(`Программа №${id} утверждена`)
       setSelected(approved)
+      setEditRows(programRows(approved))
+      await load()
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  function patchEditRow(key: string, next: Partial<DraftRow>) {
+    setEditRows((prev) => prev.map((row) => (row.key === key ? { ...row, ...next } : row)))
+  }
+
+  async function saveDraftItems() {
+    if (!selected || selected.status !== 'draft') return
+    let items: DbrProgramItemIn[]
+    try {
+      items = validatedItems(editRows, selected.from_date, selected.to_date)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+      return
+    }
+    setSaving(true)
+    setError('')
+    setMessage('')
+    try {
+      const saved = await updateDbrProgram(selected.id, { items })
+      setSelected(saved)
+      setEditRows(programRows(saved))
+      setMessage(`Строки программы №${saved.id} сохранены`)
       await load()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -221,8 +293,8 @@ export function DbrProgramsPage() {
                     <td className="numCell">
                       <input
                         type="number"
-                        step="1"
-                        min="0"
+                        step="0.001"
+                        min="0.001"
                         value={row.qty}
                         placeholder="шт"
                         onChange={(e) => patchRow(row.key, { qty: e.target.value })}
@@ -284,7 +356,7 @@ export function DbrProgramsPage() {
                       </span>
                     </td>
                     <td className="dbrActionCol">
-                      {program.status !== 'approved' && (
+                      {program.status === 'draft' && (
                         <button
                           className="primary"
                           onClick={(e) => { e.stopPropagation(); void approve(program.id) }}
@@ -309,8 +381,17 @@ export function DbrProgramsPage() {
               <div className="dbrSectionHead">
                 <h2>Программа №{selected.id}: {selected.title || '(без названия)'}</h2>
                 <div className="commandBar">
-                  {selected.status !== 'approved' && (
-                    <button className="primary" onClick={() => void approve(selected.id)} disabled={saving}>Утвердить</button>
+                  {selected.status === 'draft' && (
+                    <>
+                      <button
+                        onClick={() => setEditRows((prev) => [...prev, newRow(selected.from_date)])}
+                        disabled={saving}
+                      >
+                        Добавить строку
+                      </button>
+                      <button className="primary" onClick={() => void saveDraftItems()} disabled={saving}>Сохранить строки</button>
+                      <button onClick={() => void approve(selected.id)} disabled={saving}>Утвердить</button>
+                    </>
                   )}
                 </div>
               </div>
@@ -318,21 +399,40 @@ export function DbrProgramsPage() {
                 <thead>
                   <tr>
                     <th className="dateCol">Дата</th>
-                    <th className="numCell">item_id</th>
+                    <th className="itemCell">Номенклатура</th>
                     <th className="numCell">Кол-во</th>
                     <th className="itemCell">Комментарий</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {selected.items.map((item) => (
+                  {selected.status === 'draft' ? editRows.map((row) => (
+                    <tr key={row.key}>
+                      <td className="dateCol">
+                        <input type="date" value={row.program_date} onChange={(e) => patchEditRow(row.key, { program_date: e.target.value })} />
+                      </td>
+                      <td className="itemCell">
+                        <ItemPicker value={row.item} onChange={(item) => patchEditRow(row.key, { item })} />
+                      </td>
+                      <td className="numCell">
+                        <input type="number" min="0.001" step="0.001" value={row.qty} onChange={(e) => patchEditRow(row.key, { qty: e.target.value })} />
+                      </td>
+                      <td className="itemCell">
+                        <input value={row.comment} onChange={(e) => patchEditRow(row.key, { comment: e.target.value })} />
+                        <button onClick={() => setEditRows((prev) => prev.filter((item) => item.key !== row.key))} disabled={saving}>Удалить</button>
+                      </td>
+                    </tr>
+                  )) : selected.items.map((item) => (
                     <tr key={item.id}>
                       <td className="dateCol">{dateRu(item.program_date)}</td>
-                      <td className="numCell">{item.item_id}</td>
+                      <td className="itemCell">
+                        <strong>{item.item_name || item.item_code || `ID ${item.item_id}`}</strong>
+                        <span>{item.item_code || `ID ${item.item_id}`}</span>
+                      </td>
                       <td className="numCell"><strong>{qty(item.qty)}</strong></td>
                       <td className="itemCell">{item.comment || ''}</td>
                     </tr>
                   ))}
-                  {!selected.items.length && (
+                  {!(selected.status === 'draft' ? editRows : selected.items).length && (
                     <tr><td colSpan={4} className="emptyDetail">В программе нет строк</td></tr>
                   )}
                 </tbody>

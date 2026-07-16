@@ -13,7 +13,7 @@ from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
-from ...models import DbrDrumSchedule, DbrDrumSlot
+from ...models import DbrAssemblyRate, DbrDrumSchedule, DbrDrumSlot
 from . import adapters
 from . import settings_service
 from .core.drum import rollforward
@@ -63,6 +63,20 @@ def move_slot(
     old_date = slot.slot_date
     if new_date == old_date and target_resource == slot.resource_id:
         return {"ok": True, "moved": False}
+
+    if target_resource != slot.resource_id:
+        assigned = (
+            db.query(DbrAssemblyRate.id)
+            .filter(
+                DbrAssemblyRate.item_id == slot.item_id,
+                DbrAssemblyRate.resource_id == target_resource,
+            )
+            .first()
+        )
+        if assigned is None:
+            raise ValueError(
+                "изделие слота не назначено на выбранный производственный ресурс"
+            )
 
     if not (schedule.period_from <= new_date <= schedule.period_to):
         raise ValueError(f"дата {new_date} вне периода графика {schedule.period_from}—{schedule.period_to}")
