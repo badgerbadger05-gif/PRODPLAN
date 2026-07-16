@@ -1199,7 +1199,7 @@ class DbrFeederSignal(Base):
     __tablename__ = "dbr_feeder_signal"
     __table_args__ = (
         UniqueConstraint("dedup_key", name="ux_dbr_feeder_signal_dedup_key"),
-        CheckConstraint("signal_type = 'Пополнение'", name="ck_dbr_feeder_signal_type"),
+        CheckConstraint("signal_type IN ('Пополнение', 'Под график')", name="ck_dbr_feeder_signal_type"),
         CheckConstraint("status IN ('Open', 'Cancelled')", name="ck_dbr_feeder_signal_status"),
         CheckConstraint("suggested_qty >= 0", name="ck_dbr_feeder_signal_qty_nonnegative"),
     )
@@ -1224,6 +1224,13 @@ class DbrFeederSignal(Base):
     kit_force = Column(Boolean, nullable=False, default=False, server_default="false")
     kit_shortage_qty = Column(DECIMAL(16, 3), nullable=False, default=0, server_default="0")
     source_schedule_id = Column(Integer, ForeignKey("dbr_drum_schedule.id", ondelete="SET NULL"), nullable=True, index=True)
+    drum_slot_id = Column(Integer, ForeignKey("dbr_drum_slot.id", ondelete="CASCADE"), nullable=True, index=True)
+    need_date = Column(Date, nullable=True, index=True)
+    required_date = Column(Date, nullable=True, index=True)
+    raw_demand_qty = Column(DECIMAL(16, 3), nullable=True)
+    raw_shortage_qty = Column(DECIMAL(16, 3), nullable=True)
+    data_quality = Column(CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'"))
+    is_incomplete = Column(Boolean, nullable=False, default=False, server_default="false", index=True)
     reason_json = Column(CrossPlatformJSON, nullable=False, default=dict, server_default=text("'{}'"))
     refreshed_at = Column(TIMESTAMP, nullable=False, default=func.now(), server_default=func.now())
     cancelled_at = Column(TIMESTAMP, nullable=True)
@@ -1233,6 +1240,7 @@ class DbrFeederSignal(Base):
     position = relationship("DbrSupermarketPosition")
     item = relationship("Item")
     source_schedule = relationship("DbrDrumSchedule")
+    drum_slot = relationship("DbrDrumSlot")
 
 
 # --------------------------------------------------------------------------

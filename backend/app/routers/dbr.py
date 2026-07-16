@@ -328,13 +328,15 @@ def refresh_feeder_signals(
 def get_feeder_signals(
     status: Optional[str] = None,
     zone: Optional[str] = None,
+    signal_type: Optional[str] = None,
     search: Optional[str] = None,
     limit: int = Query(default=1000, ge=1, le=5000),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ):
     return feeder_signal_service.list_signals(
-        db, status=status, zone=zone, search=search, limit=limit, offset=offset
+        db, status=status, zone=zone, signal_type=signal_type,
+        search=search, limit=limit, offset=offset
     )
 
 

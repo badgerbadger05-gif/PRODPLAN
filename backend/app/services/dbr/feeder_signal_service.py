@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Optional
 
 from sqlalchemy import func, or_, text
@@ -14,8 +14,18 @@ from ...models import (
     DbrDrumSlot,
     DbrFeederSignal,
     DbrSupermarketPosition,
+    DbrSettings,
+    ItemWarehouseStock,
     Item,
+    ProductionOrder,
+    ProductionOrderLineState,
+    ProductionProduct,
+    SupplierOrder,
+    SupplierOrderItem,
 )
+from ..production_control_reservations import load_reservation_state
+from . import adapters, classify as classify_mod
+from .core.drum.kit import build_kit
 from . import feeder_nfp_service
 from .core.feeder import signal_identity, zones
 
@@ -32,6 +42,155 @@ def _active_schedule(db: Session) -> Optional[DbrDrumSchedule]:
         .filter(DbrDrumSchedule.status == "active")
         .one_or_none()
     )
+
+
+def _under_schedule_rows(
+    db: Session, schedule: Optional[DbrDrumSchedule], *, today: Optional[date] = None,
+) -> list[dict[str, Any]]:
+    """Chronological netting for under-schedule boundaries of future slots.
+
+    Position membership is authoritative.  ``KitLine.under_schedule`` is only
+    classifier provenance and deliberately is not used as the membership gate.
+    """
+    if schedule is None:
+        return []
+    today = today or datetime.now().date()
+    positions = (
+        db.query(DbrSupermarketPosition)
+        .filter(
+            DbrSupermarketPosition.is_active.is_(True),
+            DbrSupermarketPosition.mode == "under_schedule",
+        )
+        .all()
+    )
+    if not positions:
+        return []
+    item_rows = db.query(Item.item_id, Item.item_code).all()
+    id_to_code = {int(item_id): code for item_id, code in item_rows}
+    position_by_key = {
+        (id_to_code.get(int(p.item_id), ""), _norm(p.warehouse_ref1c)): p
+        for p in positions
+    }
+    slots = (
+        db.query(DbrDrumSlot)
+        .filter(
+            DbrDrumSlot.schedule_id == schedule.id,
+            DbrDrumSlot.release_status == "pending",
+            DbrDrumSlot.slot_date >= today,
+        )
+        .order_by(DbrDrumSlot.slot_date, DbrDrumSlot.position, DbrDrumSlot.id)
+        .all()
+    )
+    settings = db.get(DbrSettings, 1)
+    if settings is None:
+        raise ValueError("настройки DBR не созданы")
+    classify, classifier_notes = classify_mod.build_classifier(db, settings)
+    components_of = adapters.build_components_provider(db)
+    kits: dict[str, list] = {}
+    demand_rows: list[tuple[DbrDrumSlot, DbrSupermarketPosition, float]] = []
+    for slot in slots:
+        sku = id_to_code.get(int(slot.item_id))
+        if not sku:
+            continue
+        if sku not in kits:
+            kits[sku] = build_kit(sku, components_of, classify)
+        aggregated: dict[int, float] = defaultdict(float)
+        for line in kits[sku]:
+            # Membership, not line.under_schedule, defines this signal family.
+            position = position_by_key.get((line.item, _norm(line.source_warehouse)))
+            if position is not None:
+                aggregated[int(position.id)] += float(line.qty_per_unit) * float(slot.qty or 0)
+        by_id = {int(p.id): p for p in positions}
+        for position_id, demand in sorted(aggregated.items()):
+            demand_rows.append((slot, by_id[position_id], demand))
+
+    item_ids = {int(p.item_id) for p in positions}
+    pool: dict[tuple[int, str], float] = defaultdict(float)
+    for item_id, warehouse, qty in db.query(
+        ItemWarehouseStock.item_id, ItemWarehouseStock.warehouse_ref1c, ItemWarehouseStock.qty
+    ).filter(ItemWarehouseStock.item_id.in_(item_ids)).all():
+        pool[(int(item_id), _norm(warehouse))] += float(qty or 0)
+    reservation_state = load_reservation_state(db, item_ids=item_ids)
+    reservations: dict[tuple[int, str], float] = defaultdict(float)
+    for (warehouse, item_id), qty in reservation_state.by_warehouse_item.items():
+        reservations[(int(item_id), _norm(warehouse))] += float(qty or 0)
+    for key, qty in reservations.items():
+        pool[key] -= qty
+
+    inbound: dict[tuple[int, str], list[tuple[date, float]]] = defaultdict(list)
+    incomplete_by_key: dict[tuple[int, str], list[str]] = defaultdict(list)
+    prod_rows = db.query(ProductionProduct, ProductionOrder, ProductionOrderLineState).join(
+        ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id
+    ).outerjoin(ProductionOrderLineState, ProductionOrderLineState.product_id == ProductionProduct.product_id).filter(
+        ProductionProduct.item_id.in_(item_ids), ProductionProduct.remaining_qty > 0,
+        ProductionOrder.deletion_mark.is_(False),
+    ).all()
+    for line, _order, state in prod_rows:
+        key = (int(line.item_id), _norm(line.destination_warehouse_ref1c))
+        if not key[1]:
+            for p in positions:
+                if int(p.item_id) == key[0]:
+                    incomplete_by_key[(key[0], _norm(p.warehouse_ref1c))].append("production_inbound_destination_missing")
+        elif state is None or state.planned_finish_date is None:
+            incomplete_by_key[key].append("production_inbound_eta_missing")
+        else:
+            inbound[key].append((state.planned_finish_date, float(line.remaining_qty or 0)))
+    supplier_rows = db.query(SupplierOrderItem, SupplierOrder).join(
+        SupplierOrder, SupplierOrder.order_id == SupplierOrderItem.order_id
+    ).filter(
+        SupplierOrderItem.item_id_ref.in_(item_ids), SupplierOrderItem.remaining_qty > 0,
+        SupplierOrder.deletion_mark.is_(False),
+    ).all()
+    for line, _order in supplier_rows:
+        key = (int(line.item_id_ref), _norm(line.destination_warehouse_ref1c))
+        if not key[1]:
+            for p in positions:
+                if int(p.item_id) == key[0]:
+                    incomplete_by_key[(key[0], _norm(p.warehouse_ref1c))].append("supplier_inbound_destination_missing")
+        elif line.delivery_date is None:
+            incomplete_by_key[key].append("supplier_inbound_eta_missing")
+        else:
+            inbound[key].append((line.delivery_date.date(), float(line.remaining_qty or 0)))
+    for arrivals in inbound.values():
+        arrivals.sort(key=lambda row: row[0])
+    inbound_cursor: dict[tuple[int, str], int] = defaultdict(int)
+
+    output = []
+    for slot, position, demand in demand_rows:
+        key = (int(position.item_id), _norm(position.warehouse_ref1c))
+        arrivals = inbound.get(key, [])
+        cursor = inbound_cursor[key]
+        while cursor < len(arrivals) and arrivals[cursor][0] <= slot.slot_date:
+            pool[key] += arrivals[cursor][1]
+            cursor += 1
+        inbound_cursor[key] = cursor
+        available_before = pool[key]
+        shortage = max(demand - available_before, 0.0)
+        generated = zones.round_up(shortage, float(position.q_batch or 1)) if shortage else 0.0
+        # Generated batch becomes available to this and later chronological demand.
+        pool[key] += generated - demand
+        rt_days = float(position.rt_days or 0)
+        need_date = slot.slot_date - timedelta(days=int(round(rt_days)))
+        slack = (need_date - today).days
+        priority = min(2.0, 1.0 - slack / rt_days) if rt_days > 0 else (2.0 if slack <= 0 else 0.0)
+        quality = sorted(set(classifier_notes + incomplete_by_key.get(key, [])))
+        item_code = id_to_code.get(int(position.item_id), "")
+        output.append({
+            "position_id": int(position.id), "item_id": int(position.item_id),
+            "item_code": item_code, "warehouse_ref1c": position.warehouse_ref1c,
+            "signal_type": "Под график", "slot_id": int(slot.id),
+            "required_date": slot.slot_date, "need_date": need_date,
+            "raw_demand_qty": demand, "raw_shortage_qty": shortage,
+            "suggested_qty": generated, "priority": priority,
+            "is_complete": not quality, "data_quality": quality,
+            "dedup_key": signal_identity.build_dedup_key(
+                "Под график", drum_slot=str(slot.id), item=item_code,
+                warehouse=position.warehouse_ref1c,
+            ),
+            "action": "open" if shortage > 0 else "none",
+            "available_before": available_before,
+        })
+    return output
 
 
 def _kit_shortages(db: Session, schedule: Optional[DbrDrumSchedule]) -> dict[tuple[str, str], float]:
@@ -80,7 +239,8 @@ def preview_signals(db: Session) -> dict[str, Any]:
     shortages = _kit_shortages(db, schedule)
     existing = {
         row.supermarket_position_id: row
-        for row in db.query(DbrFeederSignal).all()
+        for row in db.query(DbrFeederSignal)
+        .filter(DbrFeederSignal.signal_type == "Пополнение").all()
     }
     rows = []
     for position in positions:
@@ -111,6 +271,7 @@ def preview_signals(db: Session) -> dict[str, Any]:
         else:
             action = "none"
         rows.append({
+            "signal_type": "Пополнение",
             "position_id": int(position.id),
             "item_id": int(position.item_id),
             "item_code": item_code,
@@ -132,9 +293,25 @@ def preview_signals(db: Session) -> dict[str, Any]:
             "missing_reasons": list(nfp["missing_reasons"]),
             "action": action,
         })
+    schedule_rows = _under_schedule_rows(db, schedule)
+    existing_schedule = {
+        row.dedup_key: row
+        for row in db.query(DbrFeederSignal)
+        .filter(DbrFeederSignal.signal_type == "Под график").all()
+    }
+    for row in schedule_rows:
+        current = existing_schedule.get(row["dedup_key"])
+        if row["suggested_qty"] > 0:
+            row["action"] = "update" if current and current.status == signal_identity.OPEN else "open"
+        elif current and current.status == signal_identity.OPEN:
+            row["action"] = "cancel"
+        else:
+            row["action"] = "none"
+    rows.extend(schedule_rows)
     return {
         "schedule_id": int(schedule.id) if schedule else None,
         "positions": len(positions),
+        "under_schedule_demands": len(schedule_rows),
         "actionable": sum(row["action"] in ("open", "update") for row in rows),
         "rows": rows,
     }
@@ -149,22 +326,23 @@ def refresh_signals(db: Session, expected_schedule_id: Optional[int] = None) -> 
             f"активный график изменился: ожидался {expected_schedule_id}, получен {preview['schedule_id']}"
         )
     current = {
-        row.supermarket_position_id: row
+        row.dedup_key: row
         for row in db.query(DbrFeederSignal).with_for_update().all()
     }
     now = datetime.now()
     created = updated = reopened = cancelled = 0
-    seen: set[int] = set()
+    seen: set[str] = set()
     for data in preview["rows"]:
         position_id = data["position_id"]
-        seen.add(position_id)
-        signal = current.get(position_id)
+        dedup_key = data["dedup_key"]
+        seen.add(dedup_key)
+        signal = current.get(dedup_key)
         actionable = data["action"] in ("open", "update")
         if signal is None and not actionable:
             continue
         if signal is None:
             signal = DbrFeederSignal(
-                dedup_key=data["dedup_key"],
+                dedup_key=dedup_key,
                 supermarket_position_id=position_id,
                 item_id=data["item_id"],
                 warehouse_ref1c=data["warehouse_ref1c"],
@@ -185,28 +363,38 @@ def refresh_signals(db: Session, expected_schedule_id: Optional[int] = None) -> 
             signal.status = signal_identity.CANCELLED
             signal.cancelled_at = now
             signal.suggested_qty = 0
-        signal.zone = data["zone"]
+        signal.zone = data.get("zone")
         signal.priority = data["priority"]
-        signal.nfp_snapshot = data["nfp"]
-        signal.target_qty_snapshot = data["target_qty"]
-        signal.kit_force = data["kit_force"]
-        signal.kit_shortage_qty = data["kit_shortage_qty"]
+        signal.signal_type = data["signal_type"]
+        signal.nfp_snapshot = data.get("nfp")
+        signal.target_qty_snapshot = data.get("target_qty")
+        signal.kit_force = data.get("kit_force", False)
+        signal.kit_shortage_qty = data.get("kit_shortage_qty", 0)
         signal.source_schedule_id = preview["schedule_id"]
+        signal.drum_slot_id = data.get("slot_id")
+        signal.need_date = data.get("need_date")
+        signal.required_date = data.get("required_date")
+        signal.raw_demand_qty = data.get("raw_demand_qty")
+        signal.raw_shortage_qty = data.get("raw_shortage_qty")
+        signal.data_quality = data.get("data_quality", [])
+        signal.is_incomplete = not data.get("is_complete", True)
         signal.reason_json = {
-            "is_complete": data["is_complete"],
-            "missing_reasons": data["missing_reasons"],
-            "generator": "bulk_live_nfp",
+            "is_complete": data.get("is_complete", True),
+            "missing_reasons": data.get("missing_reasons", data.get("data_quality", [])),
+            "generator": "chronological_under_schedule" if data["signal_type"] == "Под график" else "bulk_live_nfp",
+            "available_before": data.get("available_before"),
         }
         signal.refreshed_at = now
 
-    # A signal whose position ceased to be an active shelf must not remain live.
-    for position_id, signal in current.items():
-        if position_id not in seen and signal.status == signal_identity.OPEN:
+    # Signals whose source position/slot ceased to be active must not remain live.
+    for dedup_key, signal in current.items():
+        if dedup_key not in seen and signal.status == signal_identity.OPEN:
             signal.status = signal_identity.CANCELLED
             signal.suggested_qty = 0
             signal.cancelled_at = now
             signal.refreshed_at = now
-            signal.reason_json = {"missing_reasons": ["position_not_active_shelf"], "generator": "bulk_live_nfp"}
+            reason = "slot_or_position_not_active" if signal.signal_type == "Под график" else "position_not_active_shelf"
+            signal.reason_json = {"missing_reasons": [reason], "generator": "chronological_under_schedule" if signal.signal_type == "Под график" else "bulk_live_nfp"}
             cancelled += 1
     db.flush()
     return {**preview, "created": created, "updated": updated, "reopened": reopened, "cancelled": cancelled}
@@ -231,6 +419,13 @@ def signal_out(signal: DbrFeederSignal) -> dict[str, Any]:
         "kit_force": signal.kit_force,
         "kit_shortage_qty": float(signal.kit_shortage_qty or 0),
         "source_schedule_id": signal.source_schedule_id,
+        "drum_slot_id": signal.drum_slot_id,
+        "need_date": signal.need_date,
+        "required_date": signal.required_date,
+        "raw_demand_qty": float(signal.raw_demand_qty) if signal.raw_demand_qty is not None else None,
+        "raw_shortage_qty": float(signal.raw_shortage_qty) if signal.raw_shortage_qty is not None else None,
+        "data_quality": signal.data_quality,
+        "is_incomplete": signal.is_incomplete,
         "reason_json": signal.reason_json,
         "refreshed_at": signal.refreshed_at,
         "cancelled_at": signal.cancelled_at,
@@ -239,11 +434,14 @@ def signal_out(signal: DbrFeederSignal) -> dict[str, Any]:
 
 def list_signals(
     db: Session, *, status: Optional[str] = None, zone: Optional[str] = None,
-    search: Optional[str] = None, limit: int = 1000, offset: int = 0,
+    search: Optional[str] = None, signal_type: Optional[str] = None,
+    limit: int = 1000, offset: int = 0,
 ) -> list[dict[str, Any]]:
     query = db.query(DbrFeederSignal).join(Item)
     if status:
         query = query.filter(DbrFeederSignal.status == status)
+    if signal_type:
+        query = query.filter(DbrFeederSignal.signal_type == signal_type)
     if zone:
         query = query.filter(func.lower(DbrFeederSignal.zone) == zone.strip().lower())
     if search:
