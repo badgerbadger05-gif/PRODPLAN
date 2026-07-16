@@ -257,9 +257,45 @@ def rebuild_feeder_positions(
 
 @router.get("/feeder/positions")
 def get_feeder_positions(
-    active_only: bool = False, db: Session = Depends(get_db)
+    include_live_nfp: bool = False,
+    active: Optional[bool] = None,
+    active_only: bool = False,
+    mode: Optional[str] = None,
+    supply: Optional[str] = None,
+    warehouse: Optional[str] = None,
+    zone: Optional[str] = None,
+    search: Optional[str] = None,
+    limit: int = Query(default=1000, ge=1, le=5000),
+    offset: int = Query(default=0, ge=0),
+    db: Session = Depends(get_db),
 ):
-    return feeder_position_service.list_positions(db, active_only=active_only)
+    return feeder_position_service.query_position_views(
+        db,
+        include_live_nfp=include_live_nfp,
+        active=active,
+        active_only=active_only,
+        mode=mode,
+        supply=supply,
+        warehouse=warehouse,
+        zone=zone,
+        search=search,
+        limit=limit,
+        offset=offset,
+    )
+
+
+@router.get("/feeder/positions/{position_id}")
+def get_feeder_position(
+    position_id: int,
+    include_live_nfp: bool = True,
+    db: Session = Depends(get_db),
+):
+    result = feeder_position_service.get_position_view(
+        db, position_id, include_live_nfp=include_live_nfp
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="supermarket position not found")
+    return result
 
 
 # --------------------------------------------------------------------------

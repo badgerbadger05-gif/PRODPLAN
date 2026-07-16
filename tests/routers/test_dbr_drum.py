@@ -262,3 +262,43 @@ def test_feeder_positions_preview_rebuild_and_list(client, db_session, seed):
     listed = client.get("/api/v1/dbr/feeder/positions?active_only=true")
     assert listed.status_code == 200
     assert len(listed.json()) == rebuilt.json()["created"]
+
+    before = [
+        (row.id, row.updated_at, row.is_active, row.is_stale)
+        for row in db_session.query(DbrSupermarketPosition).order_by(
+            DbrSupermarketPosition.id
+        )
+    ]
+    live_list = client.get(
+        "/api/v1/dbr/feeder/positions",
+        params={
+            "include_live_nfp": "true",
+            "active": "true",
+            "supply": "purchase",
+            "warehouse": W4,
+            "zone": "Green",
+            "search": "BOLT",
+            "limit": 10,
+            "offset": 0,
+        },
+    )
+    assert live_list.status_code == 200, live_list.text
+    assert len(live_list.json()) == 1
+    live = live_list.json()[0]["live_nfp"]
+    assert live["nfp"] == 100
+    assert live["zone"] == "Green"
+    position_id = live_list.json()[0]["id"]
+
+    detail = client.get(f"/api/v1/dbr/feeder/positions/{position_id}")
+    assert detail.status_code == 200
+    assert detail.json()["live_nfp"]["formula"] == (
+        "stock_qty + open_supply_qty - qualified_demand_qty"
+    )
+    db_session.expire_all()
+    after = [
+        (row.id, row.updated_at, row.is_active, row.is_stale)
+        for row in db_session.query(DbrSupermarketPosition).order_by(
+            DbrSupermarketPosition.id
+        )
+    ]
+    assert after == before

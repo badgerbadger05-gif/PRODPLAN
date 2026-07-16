@@ -6,7 +6,7 @@ from collections import defaultdict
 from datetime import datetime
 from typing import Any, Optional
 
-from sqlalchemy import text
+from sqlalchemy import or_, text
 from sqlalchemy.orm import Session
 
 from ...models import (
@@ -301,3 +301,82 @@ def list_positions(db: Session, active_only: bool = False):
     if active_only:
         query = query.filter(DbrSupermarketPosition.is_active.is_(True))
     return query.order_by(DbrSupermarketPosition.item_id, DbrSupermarketPosition.warehouse_ref1c).all()
+
+
+def position_out(position: DbrSupermarketPosition, live: Optional[dict] = None) -> dict[str, Any]:
+    data = {
+        column.name: getattr(position, column.name)
+        for column in DbrSupermarketPosition.__table__.columns
+    }
+    data["item_code"] = position.item.item_code
+    data["item_name"] = position.item.item_name
+    if live is not None:
+        data["live_nfp"] = live
+    return data
+
+
+def query_position_views(
+    db: Session,
+    *,
+    include_live_nfp: bool = False,
+    active: Optional[bool] = None,
+    active_only: bool = False,
+    mode: Optional[str] = None,
+    supply: Optional[str] = None,
+    warehouse: Optional[str] = None,
+    zone: Optional[str] = None,
+    search: Optional[str] = None,
+    limit: int = 1000,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    from . import feeder_nfp_service
+
+    query = db.query(DbrSupermarketPosition).join(Item)
+    effective_active = True if active_only and active is None else active
+    if effective_active is not None:
+        query = query.filter(DbrSupermarketPosition.is_active.is_(effective_active))
+    if mode:
+        query = query.filter(DbrSupermarketPosition.mode == mode)
+    if supply:
+        query = query.filter(DbrSupermarketPosition.supply_type == supply)
+    if warehouse:
+        query = query.filter(DbrSupermarketPosition.warehouse_ref1c == warehouse)
+    if search:
+        pattern = f"%{search.strip()}%"
+        query = query.filter(
+            or_(Item.item_code.ilike(pattern), Item.item_name.ilike(pattern))
+        )
+    positions = query.order_by(
+        DbrSupermarketPosition.item_id,
+        DbrSupermarketPosition.warehouse_ref1c,
+    ).all()
+    live_by_id = (
+        feeder_nfp_service.live_nfp_rows(db, positions)
+        if include_live_nfp or zone
+        else {}
+    )
+    if zone:
+        positions = [
+            row for row in positions if live_by_id[int(row.id)]["zone"] == zone
+        ]
+    positions = positions[offset : offset + limit]
+    return [
+        position_out(row, live_by_id.get(int(row.id)) if include_live_nfp else None)
+        for row in positions
+    ]
+
+
+def get_position_view(
+    db: Session, position_id: int, *, include_live_nfp: bool = True
+) -> Optional[dict[str, Any]]:
+    from . import feeder_nfp_service
+
+    position = db.get(DbrSupermarketPosition, position_id)
+    if position is None:
+        return None
+    live = (
+        feeder_nfp_service.live_nfp_rows(db, [position])[position_id]
+        if include_live_nfp
+        else None
+    )
+    return position_out(position, live)
