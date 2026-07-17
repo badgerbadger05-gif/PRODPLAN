@@ -19,6 +19,7 @@ from typing import Any, Generator, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..database import get_db
@@ -520,6 +521,14 @@ def drum_activate(
         raise HTTPException(status_code=404, detail="schedule not found")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    except IntegrityError:
+        # Race with a concurrent activation of another schedule — the
+        # partial-unique ux_dbr_drum_schedule_one_active fired. Surface a clear
+        # conflict instead of a 500 so the client can retry.
+        raise HTTPException(
+            status_code=409,
+            detail="другой график активируется параллельно — повторите попытку",
+        )
     return _schedule_out(schedule)
 
 

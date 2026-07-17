@@ -137,6 +137,33 @@ def test_activate_supersedes_previous(db_session):
     assert db.get(DbrDrumSchedule, s2.id).status == "active"
 
 
+def test_activate_lower_id_schedule_over_higher_id_active(db_session):
+    # Regression: activating a schedule with a SMALLER id than the current
+    # active one must not momentarily produce two active rows. SQLAlchemy
+    # flushes UPDATEs in ascending-PK order, so setting the new row active
+    # before superseding the old one trips ux_dbr_drum_schedule_one_active.
+    db = db_session
+    res, item = _setup_assembly(db)
+    _workweek(db)
+    p1 = _approved_program(db, item, 10)
+    s1, _ = drum_service.build_schedule(db, p1.id)
+    p2 = _approved_program(db, item, 10)
+    s2, _ = drum_service.build_schedule(db, p2.id)
+    db.flush()
+    assert s1.id < s2.id
+
+    # Activate the higher-id schedule first, then the lower-id one.
+    drum_service.activate(db, s2.id)
+    db.flush()
+    drum_service.activate(db, s1.id)
+    db.commit()
+
+    assert db.get(DbrDrumSchedule, s1.id).status == "active"
+    assert db.get(DbrDrumSchedule, s2.id).status == "superseded"
+    active = db.query(DbrDrumSchedule).filter(DbrDrumSchedule.status == "active").all()
+    assert len(active) == 1
+
+
 def test_extend_is_idempotent(db_session):
     db = db_session
     res, item = _setup_assembly(db)

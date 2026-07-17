@@ -31,6 +31,10 @@ from .core.feeder import signal_identity, zones
 
 _REFRESH_LOCK = 0x4442525349474E4C
 
+# PRODPLAN-specific signal lifecycle state (not part of the prodflow core port
+# in core/feeder/signal_identity.py, which stays a verbatim port).
+DIAGNOSTIC = "Diagnostic"
+
 
 def _norm(value: Any) -> str:
     return str(value or "").strip().casefold()
@@ -308,7 +312,7 @@ def preview_signals(db: Session) -> dict[str, Any]:
             row["action"] = "diagnostic"
         elif row["suggested_qty"] > 0:
             row["action"] = "update" if current and current.status == signal_identity.OPEN else "open"
-        elif current and current.status in (signal_identity.OPEN, signal_identity.DIAGNOSTIC):
+        elif current and current.status in (signal_identity.OPEN, DIAGNOSTIC):
             row["action"] = "cancel"
         else:
             row["action"] = "none"
@@ -357,7 +361,7 @@ def refresh_signals(db: Session, expected_schedule_id: Optional[int] = None) -> 
             )
             db.add(signal)
             created += 1
-        elif actionable and signal.status in (signal_identity.CANCELLED, signal_identity.DIAGNOSTIC):
+        elif actionable and signal.status in (signal_identity.CANCELLED, DIAGNOSTIC):
             reopened += 1
         elif actionable:
             updated += 1
@@ -366,12 +370,12 @@ def refresh_signals(db: Session, expected_schedule_id: Optional[int] = None) -> 
             signal.cancelled_at = None
             signal.suggested_qty = data["suggested_qty"]
         elif diagnostic_action:
-            signal.status = signal_identity.DIAGNOSTIC
+            signal.status = DIAGNOSTIC
             signal.cancelled_at = None
             signal.suggested_qty = 0
             diagnostic += 1
         else:
-            if signal.status in (signal_identity.OPEN, signal_identity.DIAGNOSTIC):
+            if signal.status in (signal_identity.OPEN, DIAGNOSTIC):
                 cancelled += 1
             signal.status = signal_identity.CANCELLED
             signal.cancelled_at = now
@@ -402,7 +406,7 @@ def refresh_signals(db: Session, expected_schedule_id: Optional[int] = None) -> 
 
     # Signals whose source position/slot ceased to be active must not remain live.
     for dedup_key, signal in current.items():
-        if dedup_key not in seen and signal.status in (signal_identity.OPEN, signal_identity.DIAGNOSTIC):
+        if dedup_key not in seen and signal.status in (signal_identity.OPEN, DIAGNOSTIC):
             signal.status = signal_identity.CANCELLED
             signal.suggested_qty = 0
             signal.cancelled_at = now

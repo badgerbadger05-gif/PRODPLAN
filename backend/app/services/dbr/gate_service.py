@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Any, Optional
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ...models import DbrDrumSchedule
@@ -20,6 +21,8 @@ from .core.drum import kit_gate
 from .core.drum.kit import build_kit
 
 _STATUS_BUCKET = {kit_gate.GREEN: "green", kit_gate.YELLOW: "yellow", kit_gate.RED: "red"}
+
+_GATE_LOCK = 0x44425247415445
 
 
 def _resolve_schedule(db: Session, schedule_id: Optional[int]) -> Optional[DbrDrumSchedule]:
@@ -34,6 +37,8 @@ def refresh_gate(db: Session, schedule_id: Optional[int] = None, today: Optional
     Uses the active schedule when schedule_id is omitted. Returns counts plus
     the deduplicated classifier notes (disputable items).
     """
+    if db.get_bind().dialect.name == "postgresql":
+        db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _GATE_LOCK})
     empty = {"updated": 0, "green": 0, "yellow": 0, "red": 0, "notes": []}
     schedule = _resolve_schedule(db, schedule_id)
     if schedule is None:

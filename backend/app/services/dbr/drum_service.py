@@ -198,13 +198,21 @@ def activate(db: Session, schedule_id: int) -> DbrDrumSchedule:
         raise LookupError("schedule not found")
     if schedule.status in (SUPERSEDED, CANCELLED):
         raise ValueError(f"график в статусе «{schedule.status}» активировать нельзя")
-    for other in (
+    # Supersede any current Active row(s) and flush that UPDATE *before* setting
+    # this schedule Active. Otherwise SQLAlchemy orders both UPDATEs by ascending
+    # PK in one flush, and when this schedule has the smaller id it turns Active
+    # while the old one is still Active — two active rows momentarily trip the
+    # partial-unique ux_dbr_drum_schedule_one_active.
+    others = (
         db.query(DbrDrumSchedule)
         .filter(DbrDrumSchedule.status == ACTIVE, DbrDrumSchedule.id != schedule.id)
         .with_for_update()
         .all()
-    ):
+    )
+    for other in others:
         other.status = SUPERSEDED
+    if others:
+        db.flush()
     schedule.status = ACTIVE
     db.flush()
     return schedule
