@@ -288,6 +288,33 @@ export type DbrFeederFilters = {
 // production, create purchase orders, or write to 1C.
 export type DbrFeederSignalStatus = 'Open' | 'Diagnostic' | 'Cancelled' | string
 
+// ── Material readiness (Фаза 3.1) ─────────────────────────────────────────────
+// Kit-line class: 'ok' (Готов), 'part' (Частично), 'no' (Дефицит), 'q' (Расписан выше).
+export type DbrKitLineCls = 'ok' | 'part' | 'no' | 'q' | string
+// Boundary kind of a kit line: 'make' (производимая) / 'buy' (закупная).
+export type DbrKitBoundaryKind = 'make' | 'buy' | string
+// Material status of a queue signal.
+export type DbrMaterialStatus = 'Готов' | 'Частично' | 'Дефицит' | 'Расписан выше' | string
+
+export type DbrKitLine = {
+  item: string
+  item_name: string
+  article: string
+  need: number
+  have: number
+  gross: number
+  kind: DbrKitBoundaryKind
+  level: string
+  cls: DbrKitLineCls
+  buffered: boolean
+}
+
+export type DbrRootItem = {
+  item: string
+  item_name: string
+  article: string
+}
+
 export type DbrFeederSignal = {
   id: number
   dedup_key: string
@@ -305,6 +332,10 @@ export type DbrFeederSignal = {
   target_qty_snapshot?: number | null
   kit_force: boolean
   kit_shortage_qty: number
+  // Chain pegging (Фаза 3.2): a chain child points at its parent signal and
+  // carries a depth > 0; queue heads have chain_depth 0 and no parent.
+  parent_signal_id?: number | null
+  chain_depth?: number
   source_schedule_id?: number | null
   drum_slot_id?: number | null
   need_date?: string | null
@@ -314,10 +345,19 @@ export type DbrFeederSignal = {
   calculated_batch_qty?: number | null
   data_quality?: string[]
   is_incomplete?: boolean
+  // Material readiness annotations (Фаза 3.1), present on the queue listing.
+  material_status?: DbrMaterialStatus | null
+  kit_cls?: DbrKitLineCls | null
+  can_launch?: boolean
+  deficit_lines?: DbrKitLine[]
+  root_items?: DbrRootItem[]
   reason_json?: {
     is_complete?: boolean
     missing_reasons?: string[]
     generator?: string
+    parent_signal_id?: number
+    chain_depth?: number
+    shortfall?: number
   } | null
   refreshed_at?: string | null
   cancelled_at?: string | null
@@ -369,4 +409,51 @@ export type DbrFeederSignalFilters = {
   search?: string
   limit?: number
   offset?: number
+}
+
+// ── Material deficits aggregate (Фаза 3.1, design §5) ─────────────────────────
+export type DbrFeederDeficit = {
+  item: string
+  item_name: string
+  article: string
+  source: 'make' | 'buy' | string
+  short_qty: number
+  need_sum: number
+  gross: number
+  blocks_signals: number
+  nearest_due?: string | null
+}
+
+export type DbrFeederDeficitsResult = {
+  deficits: DbrFeederDeficit[]
+  kpis: {
+    deficit_materials: number
+    queue_open: number
+    stock_source: string
+  }
+}
+
+// ── Chain explosion (Фаза 3.2) ────────────────────────────────────────────────
+export type DbrChainPreviewItem = {
+  item: string
+  parents: number
+  qty_sum: number
+}
+
+export type DbrChainPreview = {
+  enabled: boolean
+  open_signals: number
+  level1_children: number
+  distinct_items: number
+  top_items: DbrChainPreviewItem[]
+}
+
+export type DbrChainRefresh = {
+  created: number
+  updated: number
+  reopened: number
+  revoked: number
+  no_warehouse: number
+  passes: number
+  disabled?: boolean
 }

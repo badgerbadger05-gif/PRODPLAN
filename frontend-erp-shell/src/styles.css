@@ -2195,6 +2195,57 @@ input:focus, select:focus {
 .dbrQuality small { color: #64748b; }
 .dbrQualityOk { color: #047857; font-size: 12px; }
 
+/* ── Feeder material readiness + chain + deficits (Фаза 3) ─────────────────── */
+.dbrSignalHeaderActions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.dbrSignalTypeBadge.chain { border-color: #b45309; background: #fef3c7; color: #92400e; }
+
+.dbrMatBadge { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; font-weight: 600; font-size: 12px; }
+.dbrMatBadge.green { color: #047857; }
+.dbrMatBadge.yellow { color: #a16207; }
+.dbrMatBadge.red { color: #b91c1c; }
+.dbrMatBadge.gray { color: #64748b; }
+
+.dbrChainMark { display: block; margin-top: 3px; color: #92400e; font-size: 11px; white-space: nowrap; }
+.dbrChainParent { margin-left: 6px; padding: 0 4px; border: 1px solid #c5d1df; border-radius: 3px; background: #f1f5f9; color: #1d4ed8; font-size: 11px; cursor: pointer; }
+.dbrChainParent:hover { background: #e0e7ff; }
+.dbrChainIndent { padding-left: 16px; box-shadow: inset 3px 0 #f59e0b; }
+
+.dbrExpandCell { width: 22px; text-align: center; padding: 0; }
+.dbrExpandBtn { width: 18px; height: 18px; padding: 0; border: 1px solid #c5d1df; border-radius: 3px; background: #f1f5f9; color: #334155; font-size: 11px; line-height: 1; cursor: pointer; }
+.dbrExpandBtn.open { background: #dbeafe; border-color: #93c5fd; }
+
+.dbrDeficitExpand > td { background: #fff7ed; padding: 8px 10px; }
+.dbrDeficitLines { max-width: 720px; }
+.dbrDeficitLinesTitle { font-weight: 700; font-size: 12px; color: #9a3412; margin-bottom: 6px; }
+.dbrDeficitLinesTable { width: 100%; border-collapse: collapse; font-size: 12px; background: #fff; }
+.dbrDeficitLinesTable th, .dbrDeficitLinesTable td { border: 1px solid #e5d3bf; padding: 4px 8px; text-align: left; vertical-align: top; }
+.dbrDeficitLinesTable th { background: #fdf1e3; color: #7c4a1e; font-weight: 700; }
+.dbrDeficitLinesTable th.numCell, .dbrDeficitLinesTable td.numCell { text-align: right; }
+.dbrRootItems { margin-top: 6px; color: #64748b; font-size: 11px; }
+
+.dbrDeficitChip { padding: 2px 8px; border: 1px solid #f59e0b; border-radius: 12px; background: #fef3c7; color: #92400e; font-size: 12px; cursor: pointer; }
+.dbrDeficitChip:hover { background: #fde68a; }
+
+.dbrDeficitSection { margin-top: 12px; }
+.dbrDeficitTableWrap { max-height: 320px; }
+.dbrDeficitTable { min-width: 900px; }
+.dbrDeficitRow { cursor: pointer; }
+.dbrDeficitRow:hover { background: #f1f5f9; }
+.dbrDeficitRow.selected { background: #dbeafe; }
+.dbrSortable { cursor: pointer; user-select: none; white-space: nowrap; }
+.dbrSortable:hover { text-decoration: underline; }
+.dbrSortable.active { color: #1d4ed8; }
+.dbrSortable.active::after { content: ' ▾'; }
+
+.dbrSourceBadge { display: inline-block; padding: 1px 6px; border: 1px solid #94a3b8; border-radius: 10px; font-size: 11px; white-space: nowrap; }
+.dbrSourceBadge.make { border-color: #7c3aed; background: #ede9fe; color: #5b21b6; }
+.dbrSourceBadge.buy { border-color: #0284c7; background: #e0f2fe; color: #075985; }
+
+.dbrChainSummary { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 16px; }
+.dbrChainSummary > div { display: flex; justify-content: space-between; gap: 10px; padding: 6px 8px; border: 1px solid var(--line2); background: #f8fafc; }
+.dbrChainSummaryLabel { color: var(--muted); font-size: 12px; }
+.dbrChainEmpty { color: var(--muted); font-size: 13px; padding: 8px 0; }
+
 .dbrGridWrap {
   margin: 0 8px 12px;
   border: 1px solid var(--line);

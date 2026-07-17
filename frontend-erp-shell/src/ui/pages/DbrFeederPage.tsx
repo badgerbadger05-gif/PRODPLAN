@@ -1,13 +1,25 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
-import type { DbrFeederPosition, DbrFeederPreview, DbrFeederSignal, DbrFeederSignalPreview } from '../../domain/dbr'
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
+import type {
+  DbrChainPreview,
+  DbrFeederDeficit,
+  DbrFeederDeficitsResult,
+  DbrFeederPosition,
+  DbrFeederPreview,
+  DbrFeederSignal,
+  DbrFeederSignalPreview,
+} from '../../domain/dbr'
 import { dateRu, dateTimeRu, qty } from '../../lib/format'
 import {
+  getDbrFeederDeficits,
+  getDbrSettings,
   listDbrFeederPositions,
   getDbrFeederSignal,
   listDbrFeederSignals,
+  previewDbrFeederChain,
   previewDbrFeederPositions,
   previewDbrFeederSignals,
   rebuildDbrFeederPositions,
+  refreshDbrFeederChain,
   refreshDbrFeederSignals,
 } from '../../services/dbr'
 import { DbrNav } from '../dbr/DbrNav'
@@ -26,6 +38,16 @@ const REASON_LABEL: Record<string, string> = {
   supplier_inbound_eta_missing: 'не указана дата прихода поставщика',
 }
 const SIGNAL_TYPE_LABEL: Record<string, string> = { 'Пополнение': 'Пополнение', 'Под график': 'Под график' }
+// Material readiness: kit_cls → badge colour class (green/yellow/red/gray).
+const MATERIAL_CLASS: Record<string, string> = { ok: 'green', part: 'yellow', no: 'red', q: 'gray' }
+const MATERIAL_TITLE: Record<string, string> = {
+  'Готов': 'Комплект обеспечен запасом предприятия',
+  'Частично': 'Обеспечена часть комплекта',
+  'Дефицит': 'Не хватает материала на комплект',
+  'Расписан выше': 'Материал забран сигналами выше по очереди',
+}
+const SOURCE_LABEL: Record<string, string> = { make: 'Производство', buy: 'Закупка' }
+type DeficitSortKey = 'blocks_signals' | 'short_qty' | 'nearest_due' | 'item'
 
 type Filters = { search: string; zone: string; mode: string; supply: string }
 const EMPTY_FILTERS: Filters = { search: '', zone: '', mode: '', supply: '' }
@@ -51,6 +73,13 @@ export function DbrFeederPage() {
   const [signalPreview, setSignalPreview] = useState<DbrFeederSignalPreview | null>(null)
   const [selectedSignal, setSelectedSignal] = useState<DbrFeederSignal | null>(null)
   const [signalsLoading, setSignalsLoading] = useState(false)
+  const [expandedSignalId, setExpandedSignalId] = useState<number | null>(null)
+  const [deficitFilter, setDeficitFilter] = useState('')
+  const [chainEnabled, setChainEnabled] = useState(false)
+  const [deficits, setDeficits] = useState<DbrFeederDeficitsResult | null>(null)
+  const [deficitsLoading, setDeficitsLoading] = useState(false)
+  const [deficitSort, setDeficitSort] = useState<DeficitSortKey>('blocks_signals')
+  const [chainPreview, setChainPreview] = useState<DbrChainPreview | null>(null)
 
   const load = useCallback(async (next: Filters = applied) => {
     setLoading(true)
@@ -86,6 +115,48 @@ export function DbrFeederPage() {
   }, [appliedSignalFilters])
 
   useEffect(() => { void loadSignals() }, [loadSignals])
+
+  const loadDeficits = useCallback(async () => {
+    setDeficitsLoading(true)
+    try {
+      setDeficits(await getDbrFeederDeficits())
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setDeficitsLoading(false)
+    }
+  }, [])
+
+  useEffect(() => { void loadDeficits() }, [loadDeficits])
+
+  useEffect(() => {
+    let cancelled = false
+    void getDbrSettings()
+      .then((settings) => { if (!cancelled) setChainEnabled(Boolean(settings.feeder_chain_enabled)) })
+      .catch(() => { if (!cancelled) setChainEnabled(false) })
+    return () => { cancelled = true }
+  }, [])
+
+  // Queue shown after the deficit drill-down: only signals blocked by the
+  // clicked component keep visible when a deficit filter is active.
+  const visibleSignals = useMemo(() => {
+    if (!deficitFilter) return signals
+    return signals.filter((signal) => (signal.deficit_lines ?? []).some((line) => line.item === deficitFilter))
+  }, [signals, deficitFilter])
+
+  const sortedDeficits = useMemo(() => {
+    const list = [...(deficits?.deficits ?? [])]
+    list.sort((a, b) => {
+      switch (deficitSort) {
+        case 'short_qty': return b.short_qty - a.short_qty
+        case 'nearest_due': return (a.nearest_due || '9999') < (b.nearest_due || '9999') ? -1 : 1
+        case 'item': return a.item.localeCompare(b.item)
+        case 'blocks_signals':
+        default: return b.blocks_signals - a.blocks_signals
+      }
+    })
+    return list
+  }, [deficits, deficitSort])
 
   const summary = useMemo(() => rows.reduce((acc, row) => {
     const zone = zoneKey(row.live_nfp?.zone)
@@ -160,12 +231,52 @@ export function DbrFeederPage() {
       setSignalPreview(null)
       setSelectedSignal(null)
       setMessage(`Advisory-очередь обновлена по графику №${result.schedule_id ?? 'нет'}: создано ${result.created ?? 0}, обновлено ${result.updated ?? 0}, переоткрыто ${result.reopened ?? 0}, отменено ${result.cancelled ?? 0}`)
-      await loadSignals(appliedSignalFilters)
+      await Promise.all([loadSignals(appliedSignalFilters), loadDeficits()])
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
       setSaving(false)
     }
+  }
+
+  async function calculateChainPreview() {
+    setSaving(true)
+    setError('')
+    setMessage('')
+    setChainPreview(null)
+    try {
+      setChainPreview(await previewDbrFeederChain())
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function runChainRefresh() {
+    setSaving(true)
+    setError('')
+    setMessage('')
+    try {
+      const result = await refreshDbrFeederChain()
+      setChainPreview(null)
+      if (result.disabled) {
+        setMessage('Цепочка отключена в настройках DBR — обновление не выполнено.')
+      } else {
+        setMessage(`Цепочка обновлена: создано ${result.created}, обновлено ${result.updated}, переоткрыто ${result.reopened}, отозвано ${result.revoked}, проходов ${result.passes}${result.no_warehouse ? `, без склада ${result.no_warehouse}` : ''}`)
+      }
+      await Promise.all([loadSignals(appliedSignalFilters), loadDeficits()])
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  function filterByDeficit(deficit: DbrFeederDeficit) {
+    setDeficitFilter((current) => (current === deficit.item ? '' : deficit.item))
+    setExpandedSignalId(null)
+    setSelectedSignal(null)
   }
 
   async function selectSignal(signalId: number) {
@@ -251,7 +362,13 @@ export function DbrFeederPage() {
               <h2>Advisory-очередь питающего контура</h2>
               <p>«Пополнение» управляет полкой, «Под график» показывает дефицит к конкретному слоту. Отрицательный приоритет означает, что срок запуска ещё не наступил.</p>
             </div>
-            <button onClick={() => void calculateSignalPreview()} disabled={saving}>Предпросмотр сигналов</button>
+            <div className="dbrSignalHeaderActions">
+              <button onClick={() => void calculateSignalPreview()} disabled={saving}>Предпросмотр сигналов</button>
+              {chainEnabled && <>
+                <button onClick={() => void calculateChainPreview()} disabled={saving}>Цепочка: предпросмотр</button>
+                <button onClick={() => void runChainRefresh()} disabled={saving}>Цепочка: обновить</button>
+              </>}
+            </div>
           </div>
 
           {signalPreview && (
@@ -282,25 +399,52 @@ export function DbrFeederPage() {
             </select>
             <button onClick={() => setAppliedSignalFilters(signalFilters)} disabled={signalsLoading}>Применить</button>
             <button onClick={() => { setSignalFilters(EMPTY_SIGNAL_FILTERS); setAppliedSignalFilters(EMPTY_SIGNAL_FILTERS) }} disabled={signalsLoading}>Сбросить</button>
+            {deficitFilter && (
+              <button className="dbrDeficitChip" onClick={() => setDeficitFilter('')} title="Сбросить фильтр по дефициту">
+                Дефицит: {deficitFilter} ✕
+              </button>
+            )}
             <div className="commandBarSpacer" />
-            <span className="dbrSignalCount">Сигналов: {signals.length}</span>
+            <span className="dbrSignalCount">Сигналов: {visibleSignals.length}{deficitFilter ? ` из ${signals.length}` : ''}</span>
           </div>
 
           <div className="dbrSignalLayout">
             <div className="dbrFeederTableWrap">
               <table className="journalTable dbrTable dbrSignalTable">
-                <thead><tr><th>Тип</th><th>KIT</th><th>Приоритет</th><th>Зона</th><th>Номенклатура</th><th>Склад</th><th>Крайний срок запуска</th><th>Дата потребности / слота</th><th className="numCell">Спрос</th><th className="numCell">Дефицит</th><th className="numCell">Количество</th><th className="numCell">Расчётная партия</th><th>Слот</th><th>Качество</th><th>Статус</th><th>Обновлён</th></tr></thead>
+                <thead><tr><th aria-label="Раскрытие" /><th>Тип</th><th>Материал</th><th>KIT</th><th>Приоритет</th><th>Зона</th><th>Номенклатура</th><th>Склад</th><th>Крайний срок запуска</th><th>Дата потребности / слота</th><th className="numCell">Спрос</th><th className="numCell">Дефицит</th><th className="numCell">Количество</th><th className="numCell">Расчётная партия</th><th>Слот</th><th>Качество</th><th>Статус</th><th>Обновлён</th></tr></thead>
                 <tbody>
-                  {!signalsLoading && !signals.length && <tr><td colSpan={16} className="emptyCell">Сигналы не найдены. Выполните предпросмотр и явное обновление.</td></tr>}
-                  {signals.map((signal) => {
+                  {!signalsLoading && !visibleSignals.length && <tr><td colSpan={18} className="emptyCell">{deficitFilter ? 'Нет сигналов, заблокированных этой позицией.' : 'Сигналы не найдены. Выполните предпросмотр и явное обновление.'}</td></tr>}
+                  {visibleSignals.map((signal) => {
                     const normalizedZone = zoneKey(signal.zone)
+                    const deficitLines = signal.deficit_lines ?? []
+                    const hasDeficit = deficitLines.length > 0
+                    const isExpanded = expandedSignalId === signal.id
+                    const matCls = signal.kit_cls ? MATERIAL_CLASS[signal.kit_cls] ?? 'gray' : ''
+                    const chainDepth = signal.chain_depth ?? 0
                     return (
-                      <tr key={signal.id} className={`${selectedSignal?.id === signal.id ? 'selected' : ''} ${signal.kit_force ? 'dbrSignalKitRow' : ''} ${signal.is_incomplete ? 'dbrFeederIncomplete' : ''}`} onClick={() => void selectSignal(signal.id)}>
-                        <td><span className={`dbrSignalTypeBadge ${signal.signal_type === 'Под график' ? 'schedule' : 'replenish'}`}>{SIGNAL_TYPE_LABEL[signal.signal_type] ?? signal.signal_type}</span></td>
+                      <Fragment key={signal.id}>
+                      <tr className={`${selectedSignal?.id === signal.id ? 'selected' : ''} ${signal.kit_force ? 'dbrSignalKitRow' : ''} ${signal.is_incomplete ? 'dbrFeederIncomplete' : ''}`} onClick={() => void selectSignal(signal.id)}>
+                        <td className="dbrExpandCell">
+                          {hasDeficit
+                            ? <button className={`dbrExpandBtn ${isExpanded ? 'open' : ''}`} aria-label={isExpanded ? 'Свернуть дефицит' : 'Показать дефицит'} aria-expanded={isExpanded} onClick={(e) => { e.stopPropagation(); setExpandedSignalId(isExpanded ? null : signal.id) }}>{isExpanded ? '▾' : '▸'}</button>
+                            : null}
+                        </td>
+                        <td>
+                          <span className={`dbrSignalTypeBadge ${signal.signal_type === 'Под график' ? 'schedule' : signal.signal_type === 'Цепочка' ? 'chain' : 'replenish'}`}>{SIGNAL_TYPE_LABEL[signal.signal_type] ?? signal.signal_type}</span>
+                          {chainDepth > 0 && (
+                            <span className="dbrChainMark" title={`Цепочка, уровень ${chainDepth}`}>
+                              ⤷ цепочка
+                              {signal.parent_signal_id != null && (
+                                <button className="dbrChainParent" onClick={(e) => { e.stopPropagation(); void selectSignal(signal.parent_signal_id as number) }} title="Открыть родительский сигнал">→ #{signal.parent_signal_id}</button>
+                              )}
+                            </span>
+                          )}
+                        </td>
+                        <td>{signal.material_status ? <span className={`dbrMatBadge ${matCls}`} title={MATERIAL_TITLE[signal.material_status] ?? signal.material_status}><span className={`dbrDot ${matCls === 'green' ? 'g' : matCls === 'yellow' ? 'y' : matCls === 'red' ? 'r' : 'n'}`} />{signal.material_status}</span> : '—'}</td>
                         <td>{signal.kit_force ? <span className="dbrKitForce">KIT</span> : '—'}</td>
                         <td className="numCell"><strong>{Number(signal.priority).toFixed(2)}</strong></td>
                         <td><span className={`dbrZoneBadge ${normalizedZone}`}><span className={`dbrDot ${normalizedZone.slice(0, 1)}`} />{ZONE_LABEL[normalizedZone] ?? signal.zone}</span></td>
-                        <td><strong>{signal.item_code ?? `#${signal.item_id}`}</strong><span className="dbrFeederItemName">{signal.item_name}</span></td>
+                        <td className={chainDepth > 0 ? 'dbrChainIndent' : undefined}><strong>{signal.item_code ?? `#${signal.item_id}`}</strong><span className="dbrFeederItemName">{signal.item_name}</span></td>
                         <td title={signal.warehouse_ref1c}>{signal.warehouse_ref1c}</td>
                         <td>{signal.signal_type === 'Под график' ? dateRu(signal.need_date) || '—' : '—'}</td>
                         <td>{signal.signal_type === 'Под график' ? dateRu(signal.required_date) || '—' : '—'}</td>
@@ -313,6 +457,34 @@ export function DbrFeederPage() {
                         <td>{signal.status === 'Open' ? 'Открыт' : signal.status === 'Diagnostic' ? 'Диагностика' : signal.status === 'Cancelled' ? 'Отменён' : signal.status}</td>
                         <td>{dateTimeRu(signal.refreshed_at) || '—'}</td>
                       </tr>
+                      {isExpanded && hasDeficit && (
+                        <tr className="dbrDeficitExpand">
+                          <td />
+                          <td colSpan={17}>
+                            <div className="dbrDeficitLines">
+                              <div className="dbrDeficitLinesTitle">Дефицит комплекта</div>
+                              <table className="dbrDeficitLinesTable">
+                                <thead><tr><th>Позиция</th><th className="numCell">Нужно</th><th className="numCell">Есть</th><th className="numCell">Не хватает</th><th>Тип</th></tr></thead>
+                                <tbody>
+                                  {deficitLines.map((line) => (
+                                    <tr key={line.item}>
+                                      <td><strong>{line.item}</strong><span className="dbrFeederItemName">{line.item_name}</span></td>
+                                      <td className="numCell">{qty(line.need)}</td>
+                                      <td className="numCell">{qty(line.have)}</td>
+                                      <td className="numCell"><strong>{qty(Math.max(line.need - line.have, 0))}</strong></td>
+                                      <td>{SOURCE_LABEL[line.kind] ?? line.kind}{line.level ? ` · ${line.level}` : ''}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                              {(signal.root_items?.length ?? 0) > 0 && (
+                                <div className="dbrRootItems">Изделия-потребители: {signal.root_items!.map((r) => r.item).join(', ')}</div>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                      </Fragment>
                     )
                   })}
                 </tbody>
@@ -344,6 +516,79 @@ export function DbrFeederPage() {
             )}
           </div>
         </section>
+
+        <section className="dbrSignalSection dbrDeficitSection" aria-label="Материальные дефициты очереди">
+          <div className="dbrSignalHeader">
+            <div>
+              <h2>Дефициты очереди</h2>
+              <p>Блокирующие позиции комплектов открытой очереди: чего и на сколько не хватает, сколько сигналов держит нехватка. Клик по позиции оставляет в очереди только заблокированные ею сигналы.</p>
+            </div>
+            <div className="dbrSignalHeaderActions">
+              {deficits && <span className="dbrSignalCount">Дефицитных позиций: {deficits.kpis.deficit_materials}; открытых сигналов: {deficits.kpis.queue_open}</span>}
+              <button onClick={() => void loadDeficits()} disabled={deficitsLoading}>Обновить</button>
+            </div>
+          </div>
+
+          <div className="dbrFeederTableWrap dbrDeficitTableWrap">
+            <table className="journalTable dbrTable dbrDeficitTable">
+              <thead><tr>
+                <th className={`dbrSortable ${deficitSort === 'item' ? 'active' : ''}`} onClick={() => setDeficitSort('item')}>Позиция</th>
+                <th>Тип</th>
+                <th className={`numCell dbrSortable ${deficitSort === 'short_qty' ? 'active' : ''}`} onClick={() => setDeficitSort('short_qty')}>Не хватает</th>
+                <th className="numCell">Потребность</th>
+                <th className="numCell">Есть</th>
+                <th className={`numCell dbrSortable ${deficitSort === 'blocks_signals' ? 'active' : ''}`} onClick={() => setDeficitSort('blocks_signals')}>Держит сигналов</th>
+                <th className={`dbrSortable ${deficitSort === 'nearest_due' ? 'active' : ''}`} onClick={() => setDeficitSort('nearest_due')}>Ближайший срок</th>
+              </tr></thead>
+              <tbody>
+                {!deficitsLoading && !sortedDeficits.length && <tr><td colSpan={7} className="emptyCell">Дефицитов в открытой очереди нет.</td></tr>}
+                {sortedDeficits.map((deficit) => (
+                  <tr key={deficit.item} className={`dbrDeficitRow ${deficitFilter === deficit.item ? 'selected' : ''}`} onClick={() => filterByDeficit(deficit)} title="Отфильтровать очередь по этой позиции">
+                    <td><strong>{deficit.item}</strong><span className="dbrFeederItemName">{deficit.item_name}</span></td>
+                    <td><span className={`dbrSourceBadge ${deficit.source}`}>{SOURCE_LABEL[deficit.source] ?? deficit.source}</span></td>
+                    <td className="numCell"><strong>{qty(deficit.short_qty)}</strong></td>
+                    <td className="numCell">{qty(deficit.need_sum)}</td>
+                    <td className="numCell">{qty(deficit.gross)}</td>
+                    <td className="numCell">{deficit.blocks_signals}</td>
+                    <td>{dateRu(deficit.nearest_due) || '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="dbrSignalReadonly">Только просмотр: запас считается «выбранные − игнорируемые» склады ({deficits?.kpis.stock_source ?? 'selected − ignored'}), без запуска производства и заказов.</div>
+        </section>
+
+        {chainPreview && (
+          <div className="dialogOverlay" role="dialog" aria-modal="true" aria-label="Предпросмотр цепочки" onClick={() => setChainPreview(null)}>
+            <div className="dialogBox" onClick={(e) => e.stopPropagation()}>
+              <div className="dialogHeader">Цепочка: предпросмотр первого уровня</div>
+              <div className="dialogBody">
+                <div className="dbrChainSummary">
+                  <div><span className="dbrChainSummaryLabel">Состояние</span><strong>{chainPreview.enabled ? 'включена' : 'выключена'}</strong></div>
+                  <div><span className="dbrChainSummaryLabel">Открытых сигналов</span><strong>{chainPreview.open_signals}</strong></div>
+                  <div><span className="dbrChainSummaryLabel">Дочерних (1-й уровень)</span><strong>{chainPreview.level1_children}</strong></div>
+                  <div><span className="dbrChainSummaryLabel">Уникальных заготовок</span><strong>{chainPreview.distinct_items}</strong></div>
+                </div>
+                {chainPreview.top_items.length > 0 ? (
+                  <table className="dbrDeficitLinesTable">
+                    <thead><tr><th>Заготовка</th><th className="numCell">Родителей</th><th className="numCell">Сумма кол-ва</th></tr></thead>
+                    <tbody>
+                      {chainPreview.top_items.map((item) => (
+                        <tr key={item.item}><td><strong>{item.item}</strong></td><td className="numCell">{item.parents}</td><td className="numCell">{qty(item.qty_sum)}</td></tr>
+                      ))}
+                    </tbody>
+                  </table>
+                ) : <div className="dbrChainEmpty">Дочерних заготовок первого уровня нет.</div>}
+                <div className="dbrSignalReadonly">Предпросмотр не создаёт сигналы. Глубокие уровни видны только после «Цепочка: обновить».</div>
+              </div>
+              <div className="dialogFooter">
+                <button onClick={() => setChainPreview(null)}>Закрыть</button>
+                {chainEnabled && <button className="primary" onClick={() => void runChainRefresh()} disabled={saving}>Цепочка: обновить</button>}
+              </div>
+            </div>
+          </div>
+        )}
 
         <div className="dbrKpis dbrFeederKpis">
           <div className="dbrKpi"><div className="dbrKpiLabel">Позиции</div><div className="dbrKpiValue">{rows.length}</div><div className="dbrKpiSub">активные, по фильтру</div></div>

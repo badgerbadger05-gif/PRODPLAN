@@ -5,6 +5,9 @@ import type {
   DbrBuildResult,
   DbrCategoryRisk,
   DbrCategoryRiskIn,
+  DbrChainPreview,
+  DbrChainRefresh,
+  DbrFeederDeficitsResult,
   DbrGateResult,
   DbrFeederFilters,
   DbrFeederPosition,
@@ -215,4 +218,22 @@ export function listDbrFeederSignals(filters: DbrFeederSignalFilters = {}) {
 
 export function getDbrFeederSignal(signalId: number) {
   return api<DbrFeederSignal>(`/v1/dbr/feeder/signals/${signalId}`)
+}
+
+// ── Feeder material readiness + chain explosion (advisory, no 1С writes) ──────
+
+export function getDbrFeederDeficits() {
+  return api<DbrFeederDeficitsResult>('/v1/dbr/feeder/deficits')
+}
+
+export function previewDbrFeederChain() {
+  return api<DbrChainPreview>('/v1/dbr/feeder/chain/preview', {
+    method: 'POST',
+  })
+}
+
+export function refreshDbrFeederChain() {
+  return api<DbrChainRefresh>('/v1/dbr/feeder/chain/refresh', {
+    method: 'POST',
+  })
 }
