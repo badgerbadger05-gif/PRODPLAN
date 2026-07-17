@@ -33,6 +33,7 @@ from ..services.dbr import (
     gate_service,
     materialize_service,
     program_service,
+    purchase_materialize_service,
     settings_service,
     slot_service,
 )
@@ -157,6 +158,18 @@ class ReleaseDayRequest(BaseModel):
 
 
 class SignalLaunchRequest(BaseModel):
+    dry_run: bool = True
+
+
+class PurchaseLaunchRequest(BaseModel):
+    signal_ids: Optional[list[int]] = None
+    dry_run: bool = True
+
+
+class PurchasePlanMaterializeRequest(BaseModel):
+    program_id: Optional[int] = None
+    active: bool = False
+    threshold_days: int = 60
     dry_run: bool = True
 
 
@@ -695,6 +708,79 @@ def feeder_launch_signal(
         raise HTTPException(status_code=404, detail="feeder signal not found")
     except MaterializeConflict as exc:
         raise HTTPException(status_code=409, detail={"message": exc.detail, **exc.payload})
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+# --------------------------------------------------------------------------
+# Phase-3 purchasing materialization (Document_ЗаказПоставщику)
+# --------------------------------------------------------------------------
+
+
+@router.post("/feeder/purchase/launch")
+def feeder_launch_purchase(
+    payload: PurchaseLaunchRequest,
+    db: Session = Depends(get_dbr_write_db, scope="function"),
+):
+    """Launch open «Пополнение» signals of purchased items into supplier orders.
+
+    Lines are grouped by supplier (items.supplier_ref1c); signals with no
+    supplier are returned under `unresolved`, never blocking the batch.
+    dry_run=true (default) returns the grouped payload preview and writes nothing.
+    """
+    try:
+        return purchase_materialize_service.launch_purchase_signals(
+            db, signal_ids=payload.signal_ids, dry_run=payload.dry_run
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/purchase-plan/preview")
+def purchase_plan_preview(
+    program_id: Optional[int] = Query(default=None),
+    active: bool = Query(default=False),
+    threshold_days: int = Query(default=60, ge=0),
+    db: Session = Depends(get_db),
+):
+    """Pure net-requirement preview (no writes) for a program or active schedule."""
+    try:
+        return purchase_materialize_service.purchase_plan_preview(
+            db,
+            program_id=program_id,
+            active_schedule=active,
+            lead_time_threshold_days=threshold_days,
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="program not found")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/purchase-plan/materialize")
+def purchase_plan_materialize(
+    payload: PurchasePlanMaterializeRequest,
+    db: Session = Depends(get_dbr_write_db, scope="function"),
+):
+    """Materialize the net purchase plan into supplier orders (same export path).
+
+    dry_run=true (default) previews only; unresolved rows (no supplier) are
+    reported and never block the batch.
+    """
+    try:
+        return purchase_materialize_service.materialize_purchase_plan(
+            db,
+            program_id=payload.program_id,
+            active_schedule=payload.active,
+            lead_time_threshold_days=payload.threshold_days,
+            dry_run=payload.dry_run,
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="program not found")
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc))
     except ValueError as exc:
