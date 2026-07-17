@@ -139,6 +139,10 @@ export type DbrBoardSlot = {
   produced_qty: number
   kit_status: DbrKitStatus
   release_status?: string | null
+  // Emitted once a slot is materialized into a 1С order (may be absent if the
+  // board projection does not surface it — fall back to release_status).
+  one_c_order_number?: string | null
+  one_c_order_ref?: string | null
   shortage?: DbrShortage[] | null
   position: number
 }
@@ -210,13 +214,150 @@ export type DbrMoveResult = {
   to?: string
 }
 
+// ── Materialization into 1С (Фаза 3) ─────────────────────────────────────────
+// The 1С document payload is an opaque dict of 1С field names — shown only as a
+// collapsible raw preview; the human summary is built from the slot/signal.
+export type DbrOneCPayload = Record<string, unknown>
+
+// Result of POST /drum/slots/{id}/release (dry_run preview or real write).
 export type DbrReleaseResult = {
   ok: boolean
+  dry_run: boolean
+  kind: 'drum_slot' | string
   slot_id: number
-  release_status: string
-  already_released: boolean
-  stub: boolean
+  entity: string
+  number: string
+  payload?: DbrOneCPayload
+  created: boolean
+  already_released?: boolean
+  release_status?: string
+  one_c_order_ref?: string | null
+  error?: string | null
   note?: string
+}
+
+// Per-slot entry inside a release-day report: either a full release result or a
+// refusal (conflict / error) that never rolled back the slots that succeeded.
+export type DbrReleaseDaySlotResult = DbrReleaseResult & {
+  conflict?: string
+  detail?: unknown
+  error?: string | null
+}
+
+export type DbrReleaseDayResult = {
+  ok: boolean
+  dry_run: boolean
+  schedule_id: number
+  day: string
+  slots_total: number
+  released: number
+  previews: number
+  errors: number
+  results: DbrReleaseDaySlotResult[]
+}
+
+// Result of POST /feeder/signals/{id}/launch (dry_run preview or real write).
+export type DbrSignalLaunchResult = {
+  ok: boolean
+  dry_run: boolean
+  kind: 'feeder_signal' | string
+  signal_id: number
+  entity: string
+  number: string
+  payload?: DbrOneCPayload
+  created: boolean
+  already_launched?: boolean
+  status?: string
+  one_c_order_ref?: string | null
+  error?: string | null
+  note?: string
+}
+
+// Structured 409 body carried by ApiError.detail when a launch is blocked by a
+// material deficit.
+export type DbrLaunchConflictDetail = {
+  message?: string
+  material_status?: string | null
+  deficit_lines?: DbrKitLine[]
+}
+
+// ── Purchasing materialization (Document_ЗаказПоставщику) ─────────────────────
+export type DbrPurchaseOrderLine = {
+  item_id: number
+  item_ref1c: string
+  item_name: string
+  qty: number
+  need_date?: string | null
+  order_date?: string | null
+  source_ids: number[]
+}
+
+export type DbrPurchaseOrderGroup = {
+  supplier_ref1c: string
+  number: string
+  status?: string | null
+  target_ref_key?: string | null
+  error?: string | null
+  lines: DbrPurchaseOrderLine[]
+}
+
+export type DbrPurchaseUnresolved = {
+  signal_id?: number
+  item_id: number
+  item_name?: string | null
+  missing_supplier: boolean
+  missing_item_ref1c: boolean
+}
+
+export type DbrPurchaseAlreadyExported = {
+  signal_id?: number
+  item_id?: number
+  one_c_order_ref?: string | null
+  one_c_order_number?: string | null
+}
+
+// Shared shape of /feeder/purchase/launch and /purchase-plan/materialize.
+export type DbrPurchaseLaunchResult = {
+  ok: boolean
+  dry_run: boolean
+  kind: string
+  entity: string
+  source?: { kind: string; program_id?: number }
+  orders_planned: number
+  signals_total?: number
+  items_total?: number
+  unresolved: DbrPurchaseUnresolved[]
+  already_exported: DbrPurchaseAlreadyExported[]
+  orders_created: number
+  errors?: number
+  orders: DbrPurchaseOrderGroup[]
+  note?: string
+}
+
+export type DbrPurchasePlanRow = {
+  item_id: number
+  item_code: string
+  item_name: string
+  supplier_ref1c?: string | null
+  demand_qty: number
+  stock_qty: number
+  open_order_qty: number
+  available_qty: number
+  to_order_qty: number
+  need_date?: string | null
+  replenishment_time: number
+  order_before?: string | null
+  within_lead_time_threshold: boolean
+}
+
+export type DbrPurchasePlanPreview = {
+  ok: boolean
+  source: { kind: string; program_id?: number }
+  lead_time_threshold_days: number
+  rows: DbrPurchasePlanRow[]
+  rows_to_order: number
+  items_total: number
+  warnings: string[]
 }
 
 // ── Feeder-chain supermarket positions ──────────────────────────────────────

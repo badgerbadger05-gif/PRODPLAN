@@ -4,6 +4,7 @@ const tabs = [
   { to: '/dbr', title: 'Барабан', end: true },
   { to: '/dbr/programs', title: 'Программы' },
   { to: '/dbr/feeder', title: 'Питающий контур' },
+  { to: '/dbr/purchase', title: 'Закупка' },
   { to: '/dbr/settings', title: 'Настройки' },
 ]
 

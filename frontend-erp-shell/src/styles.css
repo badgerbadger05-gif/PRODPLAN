@@ -2428,3 +2428,170 @@ input:focus, select:focus {
 .dbrShortageTable {
   min-width: 0;
 }
+
+/* ── Фаза 3: подтверждение записи в живую 1С ─────────────────────────────── */
+
+/* Red confirm button used everywhere a write to live 1С happens. */
+button.dbrDanger {
+  border-color: #a4231f;
+  background: linear-gradient(#e5645f, #c0362f 52%, #a4231f);
+  color: #fff;
+  font-weight: 700;
+}
+
+button.dbrDanger:hover:not(:disabled) {
+  border-color: #8c1a17;
+  background: linear-gradient(#e0524d, #ab2a24 52%, #8c1a17);
+}
+
+.dbrConfirmBox {
+  width: min(680px, calc(100vw - 48px));
+}
+
+.dbrDayBox {
+  width: min(820px, calc(100vw - 48px));
+}
+
+.dbrLiveWarn {
+  border: 1px solid #d99;
+  background: #fff5f5;
+  color: #8b1e1e;
+  padding: 8px 10px;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.35;
+}
+
+.dbrDoneBanner {
+  border: 1px solid #0f6b3d;
+  background: #ecfdf3;
+  color: #0f5a36;
+  padding: 8px 10px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.dialogHeader.dbrDoneHeader {
+  background: linear-gradient(180deg, #d6f2e1, #c3ead4);
+  color: #0f5a36;
+}
+
+.dbrDocSummary {
+  display: grid;
+  gap: 4px;
+  border: 1px solid var(--line2);
+  background: #f8fafc;
+  padding: 10px;
+}
+
+.dbrDocSummary > div {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  gap: 8px;
+  font-size: 13px;
+}
+
+.dbrDocSummary > div > span {
+  color: var(--muted);
+  font-weight: 700;
+}
+
+.dbrResultBox {
+  border: 1px solid #0f6b3d;
+  background: #f2fdf6;
+  padding: 10px;
+  font-size: 14px;
+}
+
+.dbrResultBox .dbrResultError {
+  color: #8b1e1e;
+}
+
+.dbrRefKey {
+  color: var(--muted);
+  font-size: 12px;
+  font-family: Consolas, 'Courier New', monospace;
+}
+
+.dbrPayloadDetails {
+  font-size: 12px;
+}
+
+.dbrPayloadDetails summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-weight: 700;
+  padding: 4px 0;
+}
+
+.dbrDaySummaryLine {
+  font-size: 13px;
+  font-weight: 700;
+  padding: 4px 0;
+}
+
+/* Board tile badge: order created in 1С. */
+.dbrSlotOrderBadge {
+  display: block;
+  margin-top: 2px;
+  font-size: 10px;
+  font-weight: 700;
+  color: #0f5a36;
+}
+
+/* Feeder queue: selection checkbox + launch action columns. */
+.dbrCheckCell,
+.dbrActionCell {
+  text-align: center;
+  white-space: nowrap;
+}
+
+button.dbrLaunchBtn {
+  height: 24px;
+  padding: 2px 8px;
+  font-size: 12px;
+  border-color: #a4231f;
+  background: linear-gradient(#e5645f, #c0362f 52%, #a4231f);
+  color: #fff;
+  font-weight: 700;
+}
+
+.dbrSignalActions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+/* Supplier order groups in the purchase preview/result body. */
+.dbrPoGroup {
+  border: 1px solid var(--line2);
+  margin-bottom: 8px;
+}
+
+.dbrPoGroup.created { border-color: #0f6b3d; }
+.dbrPoGroup.error { border-color: #a4231f; }
+
+.dbrPoGroupHead {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 6px 8px;
+  background: #f2f5f9;
+  font-size: 13px;
+}
+
+.dbrPoGroupHead span {
+  color: var(--muted);
+}
+
+.dbrPlainList {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  font-size: 12px;
+}
+
+.dbrPurchaseTable .dbrPurchaseUrgent > td {
+  background: #fdf3f3;
+}

@@ -3,6 +3,7 @@ import { ErrorBoundary } from './ErrorBoundary'
 import { DbrDrumBoardPage } from './pages/DbrDrumBoardPage'
 import { DbrFeederPage } from './pages/DbrFeederPage'
 import { DbrProgramsPage } from './pages/DbrProgramsPage'
+import { DbrPurchasePage } from './pages/DbrPurchasePage'
 import { DbrSettingsPage } from './pages/DbrSettingsPage'
 import { HomePage } from './pages/HomePage'
 import { MrpResultPage } from './pages/MrpResultPage'
@@ -68,6 +69,7 @@ export function App() {
         <Route path="/dbr" element={<DbrDrumBoardPage />} />
         <Route path="/dbr/programs" element={<DbrProgramsPage />} />
         <Route path="/dbr/feeder" element={<DbrFeederPage />} />
+        <Route path="/dbr/purchase" element={<DbrPurchasePage />} />
         <Route path="/dbr/settings" element={<DbrSettingsPage />} />
         <Route path="/production-control" element={<ProductionControlPage />} />
         <Route path="/purchase-control" element={<PurchaseControlPage />} />

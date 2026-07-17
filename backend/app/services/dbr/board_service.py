@@ -96,6 +96,7 @@ def get_board(
                 "produced_qty": float(slot.produced_qty or 0),
                 "kit_status": status,
                 "release_status": slot.release_status,
+                "one_c_order_number": slot.one_c_order_number,
                 "shortage": slot.shortage_json,
                 "position": slot.position,
             }

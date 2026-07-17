@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import type { DbrBoard, DbrBoardSlot, DbrProgram } from '../../domain/dbr'
+import type {
+  DbrBoard,
+  DbrBoardSlot,
+  DbrProgram,
+  DbrReleaseDayResult,
+  DbrReleaseResult,
+} from '../../domain/dbr'
 import { dateRu, isoToday, qty, shiftIsoDate } from '../../lib/format'
 import {
   activateDbrDrum,
@@ -9,11 +15,13 @@ import {
   listDbrPrograms,
   moveDbrSlot,
   refreshDbrGate,
+  releaseDbrDay,
   releaseDbrSlot,
   rollForwardDbrDrum,
 } from '../../services/dbr'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
+import { DbrConfirmDialog } from '../dbr/DbrConfirmDialog'
 import { DbrNav } from '../dbr/DbrNav'
 
 const KIT_CLASS: Record<string, string> = {
@@ -52,6 +60,25 @@ export function DbrDrumBoardPage() {
   const [approvedPrograms, setApprovedPrograms] = useState<DbrProgram[]>([])
   const [buildProgramId, setBuildProgramId] = useState<string>('')
 
+  // Two-step release of a single slot: dry-run preview → confirmed write.
+  const [releaseFlow, setReleaseFlow] = useState<{
+    slot: DbrBoardSlot
+    preview: DbrReleaseResult
+    result?: DbrReleaseResult
+  } | null>(null)
+  const [releaseBusy, setReleaseBusy] = useState(false)
+  const [releaseError, setReleaseError] = useState('')
+
+  // Two-step batch release of one day: pick day → dry-run summary → confirm.
+  const [dayModal, setDayModal] = useState<{
+    phase: 'pick' | 'preview' | 'done'
+    day: string
+    preview?: DbrReleaseDayResult
+    result?: DbrReleaseDayResult
+  } | null>(null)
+  const [dayBusy, setDayBusy] = useState(false)
+  const [dayError, setDayError] = useState('')
+
   const load = useCallback(async () => {
     setLoading(true)
     setError('')
@@ -79,6 +106,12 @@ export function DbrDrumBoardPage() {
       if (bucket) bucket.push(slot)
       else map.set(key, [slot])
     }
+    return map
+  }, [board])
+
+  const slotById = useMemo(() => {
+    const map = new Map<number, DbrBoardSlot>()
+    for (const slot of board?.slots ?? []) map.set(slot.id, slot)
     return map
   }, [board])
 
@@ -188,24 +221,74 @@ export function DbrDrumBoardPage() {
     }
   }
 
-  async function doRelease() {
+  // Step 1: dry-run preview of a single slot release, opens the confirm dialog.
+  async function startRelease() {
     if (!selectedSlot) return
     setSaving(true)
     setError('')
     setMessage('')
+    setReleaseError('')
     try {
-      const res = await releaseDbrSlot(selectedSlot.id)
-      setMessage(
-        res.stub
-          ? 'Тестовый режим: статус изменён на «релиз», в 1С не пишется'
-          : `Плитка релизнута (${res.release_status})`,
-      )
-      setSelectedSlot(null)
-      await load()
+      const preview = await releaseDbrSlot(selectedSlot.id, true)
+      setReleaseFlow({ slot: selectedSlot, preview })
     } catch (e) {
+      // 409 (non-green / not pending) surfaces here as a human message.
       setError(e instanceof Error ? e.message : String(e))
     } finally {
       setSaving(false)
+    }
+  }
+
+  // Step 2: confirmed write to live 1С.
+  async function confirmRelease() {
+    if (!releaseFlow) return
+    setReleaseBusy(true)
+    setReleaseError('')
+    try {
+      const result = await releaseDbrSlot(releaseFlow.slot.id, false)
+      setReleaseFlow((prev) => (prev ? { ...prev, result } : prev))
+      await load()
+    } catch (e) {
+      setReleaseError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setReleaseBusy(false)
+    }
+  }
+
+  function closeReleaseFlow() {
+    const wasDone = Boolean(releaseFlow?.result)
+    setReleaseFlow(null)
+    if (wasDone) setSelectedSlot(null)
+  }
+
+  // Batch release of one day — step 1: dry-run summary of every green+pending slot.
+  async function runDayPreview(day: string) {
+    if (!schedule) return
+    setDayBusy(true)
+    setDayError('')
+    try {
+      const preview = await releaseDbrDay(schedule.id, day, true)
+      setDayModal({ phase: 'preview', day, preview })
+    } catch (e) {
+      setDayError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setDayBusy(false)
+    }
+  }
+
+  // Batch release — step 2: confirmed write, per-slot report.
+  async function confirmDay() {
+    if (!schedule || !dayModal) return
+    setDayBusy(true)
+    setDayError('')
+    try {
+      const result = await releaseDbrDay(schedule.id, dayModal.day, false)
+      setDayModal((prev) => (prev ? { ...prev, phase: 'done', result } : prev))
+      await load()
+    } catch (e) {
+      setDayError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setDayBusy(false)
     }
   }
 
@@ -255,6 +338,12 @@ export function DbrDrumBoardPage() {
           <div className="barSeparator" />
           <button onClick={() => void refreshGate()} disabled={saving || !schedule}>Обновить гейт</button>
           <button onClick={() => void rollForward()} disabled={saving || !schedule}>Перенести невыполненное</button>
+          <button
+            onClick={() => { setDayError(''); setDayModal({ phase: 'pick', day: isoToday() }) }}
+            disabled={saving || !schedule}
+          >
+            Релиз дня…
+          </button>
           <div className="commandBarSpacer" />
           <button className="primary" onClick={() => void openBuild()} disabled={saving}>Построить из программы…</button>
         </div>
@@ -350,6 +439,11 @@ export function DbrDrumBoardPage() {
                                   <span className="dbrSlotName">{slot.item_name || slot.item_code || `#${slot.item_id}`}</span>
                                   {slot.item_code && slot.item_code !== slot.item_name && (
                                     <span className="dbrSlotCode">{slot.item_code}</span>
+                                  )}
+                                  {released && (
+                                    <span className="dbrSlotOrderBadge" title="Заказ создан в 1С">
+                                      ✓ заказ 1С{slot.one_c_order_number ? ` № ${slot.one_c_order_number}` : ''}
+                                    </span>
                                   )}
                                 </button>
                               )
@@ -453,11 +547,33 @@ export function DbrDrumBoardPage() {
                 </div>
               </div>
 
-              <div className="fieldHint">Релиз в тестовом режиме: статус меняется, запись в 1С не выполняется.</div>
+              {(() => {
+                const status = selectedSlot.release_status || 'pending'
+                const alreadyReleased = status === 'released' || status === 'completed'
+                const canRelease = selectedSlot.kit_status === 'green' && status === 'pending'
+                return (
+                  <div className="fieldHint">
+                    {alreadyReleased
+                      ? 'Плитка уже релизнута — заказ в 1С создан.'
+                      : canRelease
+                        ? 'Релиз создаёт заказ на производство в живой 1С. Сначала откроется предпросмотр документа.'
+                        : 'Релиз доступен только для зелёных (green) плиток в статусе «pending». Обновите гейт комплектности.'}
+                  </div>
+                )
+              })()}
             </div>
             <div className="dialogFooter">
               <button onClick={() => setSelectedSlot(null)}>Закрыть</button>
-              <button onClick={() => void doRelease()} disabled={saving}>Релиз (тест)</button>
+              <button
+                onClick={() => void startRelease()}
+                disabled={
+                  saving ||
+                  selectedSlot.kit_status !== 'green' ||
+                  (selectedSlot.release_status || 'pending') !== 'pending'
+                }
+              >
+                Релиз…
+              </button>
               <button className="primary" onClick={() => void doMove()} disabled={saving}>Перенести</button>
             </div>
           </div>
@@ -494,6 +610,163 @@ export function DbrDrumBoardPage() {
               <button className="primary" onClick={() => void runBuild()} disabled={saving || !approvedPrograms.length}>
                 Построить и активировать
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Single-slot release: preview → confirm → 1С order number ──── */}
+      {releaseFlow && (
+        <DbrConfirmDialog
+          title={`Релиз плитки — ${releaseFlow.slot.item_name || releaseFlow.slot.item_code}`}
+          phase={releaseFlow.result ? 'done' : 'preview'}
+          busy={releaseBusy}
+          error={releaseError}
+          onClose={closeReleaseFlow}
+          onConfirm={() => void confirmRelease()}
+        >
+          {(() => {
+            const { slot, preview, result } = releaseFlow
+            return (
+              <>
+                <div className="dbrDocSummary">
+                  <div><span>Документ</span><strong>Заказ на производство · № {preview.number}</strong></div>
+                  <div><span>Изделие</span><strong>{slot.item_code} — {slot.item_name}</strong></div>
+                  <div><span>Количество</span><strong>{qty(slot.qty)} шт</strong></div>
+                  <div><span>Участок</span><strong>{slot.resource_name || `#${slot.resource_id}`}</strong></div>
+                  <div><span>Дата запуска / выпуска</span><strong>{dateRu(slot.date)}</strong></div>
+                </div>
+                {result && (
+                  <div className="dbrResultBox">
+                    {result.created ? (
+                      <p>Заказ создан в 1С: <strong>№ {result.number}</strong>{result.one_c_order_ref ? <span className="dbrRefKey"> · ref {result.one_c_order_ref}</span> : null}</p>
+                    ) : result.already_released ? (
+                      <p>Заказ уже был создан ранее: <strong>№ {result.number}</strong>{result.one_c_order_ref ? <span className="dbrRefKey"> · ref {result.one_c_order_ref}</span> : null}</p>
+                    ) : result.error ? (
+                      <p className="dbrResultError">Ошибка записи в 1С: {result.error}</p>
+                    ) : (
+                      <p>{result.note}</p>
+                    )}
+                  </div>
+                )}
+                {preview.payload && (
+                  <details className="dbrPayloadDetails">
+                    <summary>Показать payload документа 1С</summary>
+                    <pre className="dialogPreview">{JSON.stringify(preview.payload, null, 2)}</pre>
+                  </details>
+                )}
+              </>
+            )
+          })()}
+        </DbrConfirmDialog>
+      )}
+
+      {/* ── Batch release of one day: pick → dry-run summary → confirm ── */}
+      {dayModal && (
+        <div
+          className="dialogOverlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Релиз дня"
+          onClick={dayBusy ? undefined : () => setDayModal(null)}
+        >
+          <div className="dialogBox dbrConfirmBox dbrDayBox" onClick={(e) => e.stopPropagation()}>
+            <div className={`dialogHeader${dayModal.phase === 'done' ? ' dbrDoneHeader' : ''}`}>
+              Релиз дня — {dateRu(dayModal.day)}
+            </div>
+            <div className="dialogBody">
+              {dayModal.phase === 'preview' && (
+                <div className="dbrLiveWarn">
+                  ⚠ Будет создан заказ в живой 1С по каждому зелёному слоту этого дня.
+                </div>
+              )}
+              {dayModal.phase === 'done' && (
+                <div className="dbrDoneBanner">✓ Проведено в живой 1С. Это уже не предпросмотр.</div>
+              )}
+              {dayError && <div className="dialogError">{dayError}</div>}
+
+              {dayModal.phase === 'pick' && (
+                <div className="dialogField">
+                  <label>День для релиза</label>
+                  <input
+                    type="date"
+                    value={dayModal.day}
+                    onChange={(e) => setDayModal({ phase: 'pick', day: e.target.value })}
+                  />
+                  <div className="fieldHint">
+                    Будут релизнуты все зелёные плитки этого дня по активному графику №{schedule?.id}.
+                  </div>
+                </div>
+              )}
+
+              {(dayModal.phase === 'preview' || dayModal.phase === 'done') && (() => {
+                const report = dayModal.result ?? dayModal.preview
+                if (!report) return null
+                return (
+                  <>
+                    <div className="dbrDaySummaryLine">
+                      Слотов: {report.slots_total} ·{' '}
+                      {dayModal.phase === 'done'
+                        ? `создано заказов: ${report.released}`
+                        : `к релизу: ${report.previews}`}{' '}
+                      · отказов/ошибок: {report.errors}
+                    </div>
+                    <div className="dbrFeederTableWrap">
+                      <table className="journalTable dbrTable">
+                        <thead>
+                          <tr><th>Слот</th><th>Изделие</th><th className="numCell">Кол-во</th><th>Результат</th></tr>
+                        </thead>
+                        <tbody>
+                          {!report.results.length && (
+                            <tr><td colSpan={4} className="emptyCell">Нет зелёных плиток к релизу в этот день.</td></tr>
+                          )}
+                          {report.results.map((r) => {
+                            const s = slotById.get(r.slot_id)
+                            const fail = Boolean(r.conflict || r.error)
+                            let text: string
+                            if (r.conflict) text = `Отказ: ${r.conflict}`
+                            else if (r.error) text = `Ошибка: ${r.error}`
+                            else if (dayModal.phase === 'done') {
+                              text = r.created
+                                ? `Заказ № ${r.number}`
+                                : r.already_released
+                                  ? `Уже создан № ${r.number}`
+                                  : (r.note ?? 'готово')
+                            } else text = 'готов к релизу'
+                            return (
+                              <tr key={r.slot_id} className={fail ? 'dbrGapRow' : undefined}>
+                                <td>№{r.slot_id}</td>
+                                <td>{s ? `${s.item_code} — ${s.item_name}` : '—'}</td>
+                                <td className="numCell">{s ? qty(s.qty) : '—'}</td>
+                                <td>{text}</td>
+                              </tr>
+                            )
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </>
+                )
+              })()}
+            </div>
+            <div className="dialogFooter">
+              <button onClick={() => setDayModal(null)} disabled={dayBusy}>
+                {dayModal.phase === 'done' ? 'Закрыть' : 'Отмена'}
+              </button>
+              {dayModal.phase === 'pick' && (
+                <button className="primary" onClick={() => void runDayPreview(dayModal.day)} disabled={dayBusy}>
+                  {dayBusy ? 'Загрузка…' : 'Предпросмотр'}
+                </button>
+              )}
+              {dayModal.phase === 'preview' && (
+                <button
+                  className="dbrDanger"
+                  onClick={() => void confirmDay()}
+                  disabled={dayBusy || !dayModal.preview?.slots_total}
+                >
+                  {dayBusy ? 'Отправка…' : 'Провести в 1С'}
+                </button>
+              )}
             </div>
           </div>
         </div>

@@ -19,9 +19,13 @@ import type {
   DbrProgram,
   DbrProgramCreate,
   DbrProgramUpdate,
+  DbrPurchaseLaunchResult,
+  DbrPurchasePlanPreview,
+  DbrReleaseDayResult,
   DbrReleaseResult,
   DbrRollForwardResult,
   DbrSchedule,
+  DbrSignalLaunchResult,
   DbrSettings,
   DbrSettingsUpdate,
 } from '../domain/dbr'
@@ -155,9 +159,17 @@ export function moveDbrSlot(slotId: number, newDate: string, newResourceId?: num
   })
 }
 
-export function releaseDbrSlot(slotId: number) {
-  return api<DbrReleaseResult>(`/v1/dbr/drum/slots/${slotId}/release`, {
+export function releaseDbrSlot(slotId: number, dryRun: boolean) {
+  return api<DbrReleaseResult>(
+    `/v1/dbr/drum/slots/${slotId}/release?dry_run=${dryRun ? 'true' : 'false'}`,
+    { method: 'POST' },
+  )
+}
+
+export function releaseDbrDay(scheduleId: number, day: string, dryRun: boolean) {
+  return api<DbrReleaseDayResult>(`/v1/dbr/drum/${scheduleId}/release-day`, {
     method: 'POST',
+    body: JSON.stringify({ day, dry_run: dryRun }),
   })
 }
 
@@ -235,5 +247,52 @@ export function previewDbrFeederChain() {
 export function refreshDbrFeederChain() {
   return api<DbrChainRefresh>('/v1/dbr/feeder/chain/refresh', {
     method: 'POST',
+  })
+}
+
+// ── Materialization into 1С (Фаза 3): launch production / purchase orders ──────
+
+export function launchDbrSignal(signalId: number, dryRun: boolean) {
+  return api<DbrSignalLaunchResult>(`/v1/dbr/feeder/signals/${signalId}/launch`, {
+    method: 'POST',
+    body: JSON.stringify({ dry_run: dryRun }),
+  })
+}
+
+export function launchDbrPurchase(signalIds: number[] | undefined, dryRun: boolean) {
+  return api<DbrPurchaseLaunchResult>('/v1/dbr/feeder/purchase/launch', {
+    method: 'POST',
+    body: JSON.stringify({ signal_ids: signalIds ?? null, dry_run: dryRun }),
+  })
+}
+
+// ── Net purchase plan (preview + materialize supplier orders) ──────────────────
+
+export function previewDbrPurchasePlan(params: {
+  programId?: number
+  active?: boolean
+  thresholdDays: number
+}) {
+  const search = new URLSearchParams()
+  if (params.programId != null) search.set('program_id', String(params.programId))
+  if (params.active) search.set('active', 'true')
+  search.set('threshold_days', String(params.thresholdDays))
+  return api<DbrPurchasePlanPreview>(`/v1/dbr/purchase-plan/preview?${search.toString()}`)
+}
+
+export function materializeDbrPurchasePlan(params: {
+  programId?: number
+  active?: boolean
+  thresholdDays: number
+  dryRun: boolean
+}) {
+  return api<DbrPurchaseLaunchResult>('/v1/dbr/purchase-plan/materialize', {
+    method: 'POST',
+    body: JSON.stringify({
+      program_id: params.programId ?? null,
+      active: params.active ?? false,
+      threshold_days: params.thresholdDays,
+      dry_run: params.dryRun,
+    }),
   })
 }

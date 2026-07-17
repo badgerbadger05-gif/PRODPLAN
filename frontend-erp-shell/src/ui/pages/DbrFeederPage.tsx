@@ -7,11 +7,18 @@ import type {
   DbrFeederPreview,
   DbrFeederSignal,
   DbrFeederSignalPreview,
+  DbrKitLine,
+  DbrLaunchConflictDetail,
+  DbrPurchaseLaunchResult,
+  DbrSignalLaunchResult,
 } from '../../domain/dbr'
+import { ApiError } from '../../lib/api'
 import { dateRu, dateTimeRu, qty } from '../../lib/format'
 import {
   getDbrFeederDeficits,
   getDbrSettings,
+  launchDbrPurchase,
+  launchDbrSignal,
   listDbrFeederPositions,
   getDbrFeederSignal,
   listDbrFeederSignals,
@@ -22,7 +29,9 @@ import {
   refreshDbrFeederChain,
   refreshDbrFeederSignals,
 } from '../../services/dbr'
+import { DbrConfirmDialog } from '../dbr/DbrConfirmDialog'
 import { DbrNav } from '../dbr/DbrNav'
+import { DbrPurchaseResultBody } from '../dbr/DbrPurchaseResultBody'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
 
@@ -80,6 +89,26 @@ export function DbrFeederPage() {
   const [deficitsLoading, setDeficitsLoading] = useState(false)
   const [deficitSort, setDeficitSort] = useState<DeficitSortKey>('blocks_signals')
   const [chainPreview, setChainPreview] = useState<DbrChainPreview | null>(null)
+
+  // Two-step launch of one make signal into a 1С production order.
+  const [launchFlow, setLaunchFlow] = useState<{
+    signal: DbrFeederSignal
+    preview?: DbrSignalLaunchResult
+    result?: DbrSignalLaunchResult
+    deficit?: DbrKitLine[]
+  } | null>(null)
+  const [launchBusy, setLaunchBusy] = useState(false)
+  const [launchError, setLaunchError] = useState('')
+
+  // Mass supplier order for selected «Пополнение» signals.
+  const [selectedPurchase, setSelectedPurchase] = useState<Set<number>>(new Set())
+  const [purchaseFlow, setPurchaseFlow] = useState<{
+    signalIds?: number[]
+    preview?: DbrPurchaseLaunchResult
+    result?: DbrPurchaseLaunchResult
+  } | null>(null)
+  const [purchaseBusy, setPurchaseBusy] = useState(false)
+  const [purchaseError, setPurchaseError] = useState('')
 
   const load = useCallback(async (next: Filters = applied) => {
     setLoading(true)
@@ -143,6 +172,18 @@ export function DbrFeederPage() {
     if (!deficitFilter) return signals
     return signals.filter((signal) => (signal.deficit_lines ?? []).some((line) => line.item === deficitFilter))
   }, [signals, deficitFilter])
+
+  // «Пополнение» signals are the ones the supplier-order launch can target; only
+  // open ones are checkbox-selectable.
+  const purchaseSelectableIds = useMemo(
+    () => visibleSignals.filter((s) => s.signal_type === 'Пополнение' && s.status === 'Open').map((s) => s.id),
+    [visibleSignals],
+  )
+  const purchaseSelectedIds = useMemo(
+    () => purchaseSelectableIds.filter((id) => selectedPurchase.has(id)),
+    [purchaseSelectableIds, selectedPurchase],
+  )
+  const allPurchaseSelected = purchaseSelectableIds.length > 0 && purchaseSelectedIds.length === purchaseSelectableIds.length
 
   const sortedDeficits = useMemo(() => {
     const list = [...(deficits?.deficits ?? [])]
@@ -291,6 +332,95 @@ export function DbrFeederPage() {
     }
   }
 
+  // ── Launch one signal into a 1С production order (preview → confirm) ────────
+  async function startLaunch(signal: DbrFeederSignal) {
+    setLaunchFlow({ signal })
+    setLaunchBusy(true)
+    setLaunchError('')
+    try {
+      // The dry-run already runs the material gate, so a deficit 409s here.
+      const preview = await launchDbrSignal(signal.id, true)
+      setLaunchFlow({ signal, preview })
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        const detail = e.detail as DbrLaunchConflictDetail | undefined
+        setLaunchFlow({ signal, deficit: detail?.deficit_lines ?? [] })
+        setLaunchError(e.message)
+      } else {
+        setLaunchFlow(null)
+        setError(e instanceof Error ? e.message : String(e))
+      }
+    } finally {
+      setLaunchBusy(false)
+    }
+  }
+
+  async function confirmLaunch() {
+    if (!launchFlow?.signal) return
+    setLaunchBusy(true)
+    setLaunchError('')
+    try {
+      const result = await launchDbrSignal(launchFlow.signal.id, false)
+      setLaunchFlow((prev) => (prev ? { ...prev, result } : prev))
+      await Promise.all([loadSignals(appliedSignalFilters), loadDeficits()])
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        const detail = e.detail as DbrLaunchConflictDetail | undefined
+        setLaunchFlow((prev) => (prev ? { ...prev, deficit: detail?.deficit_lines ?? [] } : prev))
+      }
+      setLaunchError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setLaunchBusy(false)
+    }
+  }
+
+  function closeLaunch() {
+    setLaunchFlow(null)
+    setLaunchError('')
+  }
+
+  // ── Mass supplier order (preview → confirm) ─────────────────────────────────
+  function togglePurchase(signalId: number) {
+    setSelectedPurchase((prev) => {
+      const next = new Set(prev)
+      if (next.has(signalId)) next.delete(signalId)
+      else next.add(signalId)
+      return next
+    })
+  }
+
+  async function startPurchase(ids?: number[]) {
+    const selected = ids && ids.length ? ids : undefined
+    setPurchaseFlow({ signalIds: selected })
+    setPurchaseBusy(true)
+    setPurchaseError('')
+    try {
+      const preview = await launchDbrPurchase(selected, true)
+      setPurchaseFlow({ signalIds: selected, preview })
+    } catch (e) {
+      setPurchaseFlow(null)
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setPurchaseBusy(false)
+    }
+  }
+
+  async function confirmPurchase() {
+    if (!purchaseFlow) return
+    setPurchaseBusy(true)
+    setPurchaseError('')
+    try {
+      const result = await launchDbrPurchase(purchaseFlow.signalIds, false)
+      setPurchaseFlow((prev) => (prev ? { ...prev, result } : prev))
+      setSelectedPurchase(new Set())
+      await Promise.all([loadSignals(appliedSignalFilters), loadDeficits()])
+    } catch (e) {
+      setPurchaseError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setPurchaseBusy(false)
+    }
+  }
+
   function applyFilters() {
     setApplied(filters)
   }
@@ -340,7 +470,7 @@ export function DbrFeederPage() {
 
         {error && <div className="errorLine">{error}</div>}
         {message && <div className="successLine">{message}</div>}
-        <div className="dbrFeederNotice">Экран не создаёт заказы, не запускает производство и не отправляет данные в 1С.</div>
+        <div className="dbrFeederNotice">Пересчёт позиций и предпросмотр сигналов — только чтение. Запуск сигнала и заказ поставщику создают документы в живой 1С и всегда требуют подтверждения в отдельном окне.</div>
 
         {preview && (
           <section className="dbrFeederPreview" aria-label="Предпросмотр пересчёта">
@@ -364,6 +494,14 @@ export function DbrFeederPage() {
             </div>
             <div className="dbrSignalHeaderActions">
               <button onClick={() => void calculateSignalPreview()} disabled={saving}>Предпросмотр сигналов</button>
+              <button
+                className="dbrDanger"
+                onClick={() => void startPurchase(purchaseSelectedIds)}
+                disabled={saving || purchaseBusy}
+                title="Создать заказы поставщику по выбранным сигналам «Пополнение» (или по всем открытым закупочным, если ничего не выбрано)"
+              >
+                Заказать поставщику…{purchaseSelectedIds.length ? ` (${purchaseSelectedIds.length})` : ''}
+              </button>
               {chainEnabled && <>
                 <button onClick={() => void calculateChainPreview()} disabled={saving}>Цепочка: предпросмотр</button>
                 <button onClick={() => void runChainRefresh()} disabled={saving}>Цепочка: обновить</button>
@@ -411,9 +549,9 @@ export function DbrFeederPage() {
           <div className="dbrSignalLayout">
             <div className="dbrFeederTableWrap">
               <table className="journalTable dbrTable dbrSignalTable">
-                <thead><tr><th aria-label="Раскрытие" /><th>Тип</th><th>Материал</th><th>KIT</th><th>Приоритет</th><th>Зона</th><th>Номенклатура</th><th>Склад</th><th>Крайний срок запуска</th><th>Дата потребности / слота</th><th className="numCell">Спрос</th><th className="numCell">Дефицит</th><th className="numCell">Количество</th><th className="numCell">Расчётная партия</th><th>Слот</th><th>Качество</th><th>Статус</th><th>Обновлён</th></tr></thead>
+                <thead><tr><th className="dbrCheckCell"><input type="checkbox" aria-label="Выбрать все закупочные сигналы" checked={allPurchaseSelected} disabled={!purchaseSelectableIds.length} onChange={(e) => setSelectedPurchase(e.target.checked ? new Set(purchaseSelectableIds) : new Set())} /></th><th aria-label="Раскрытие" /><th>Тип</th><th>Материал</th><th>KIT</th><th>Приоритет</th><th>Зона</th><th>Номенклатура</th><th>Склад</th><th>Крайний срок запуска</th><th>Дата потребности / слота</th><th className="numCell">Спрос</th><th className="numCell">Дефицит</th><th className="numCell">Количество</th><th className="numCell">Расчётная партия</th><th>Слот</th><th>Качество</th><th>Статус</th><th>Обновлён</th><th aria-label="Действие" /></tr></thead>
                 <tbody>
-                  {!signalsLoading && !visibleSignals.length && <tr><td colSpan={18} className="emptyCell">{deficitFilter ? 'Нет сигналов, заблокированных этой позицией.' : 'Сигналы не найдены. Выполните предпросмотр и явное обновление.'}</td></tr>}
+                  {!signalsLoading && !visibleSignals.length && <tr><td colSpan={20} className="emptyCell">{deficitFilter ? 'Нет сигналов, заблокированных этой позицией.' : 'Сигналы не найдены. Выполните предпросмотр и явное обновление.'}</td></tr>}
                   {visibleSignals.map((signal) => {
                     const normalizedZone = zoneKey(signal.zone)
                     const deficitLines = signal.deficit_lines ?? []
@@ -424,6 +562,11 @@ export function DbrFeederPage() {
                     return (
                       <Fragment key={signal.id}>
                       <tr className={`${selectedSignal?.id === signal.id ? 'selected' : ''} ${signal.kit_force ? 'dbrSignalKitRow' : ''} ${signal.is_incomplete ? 'dbrFeederIncomplete' : ''}`} onClick={() => void selectSignal(signal.id)}>
+                        <td className="dbrCheckCell" onClick={(e) => e.stopPropagation()}>
+                          {signal.signal_type === 'Пополнение' && signal.status === 'Open' && (
+                            <input type="checkbox" aria-label={`Выбрать сигнал ${signal.item_code ?? signal.id} для заказа поставщику`} checked={selectedPurchase.has(signal.id)} onChange={() => togglePurchase(signal.id)} />
+                          )}
+                        </td>
                         <td className="dbrExpandCell">
                           {hasDeficit
                             ? <button className={`dbrExpandBtn ${isExpanded ? 'open' : ''}`} aria-label={isExpanded ? 'Свернуть дефицит' : 'Показать дефицит'} aria-expanded={isExpanded} onClick={(e) => { e.stopPropagation(); setExpandedSignalId(isExpanded ? null : signal.id) }}>{isExpanded ? '▾' : '▸'}</button>
@@ -456,11 +599,17 @@ export function DbrFeederPage() {
                         <td>{signal.is_incomplete ? <span className="dbrQualityWarning" title={(signal.data_quality ?? []).map((reason) => REASON_LABEL[reason] ?? reason).join(', ')}>⚠ Неполные данные</span> : <span className="dbrQualityOk">Полные</span>}</td>
                         <td>{signal.status === 'Open' ? 'Открыт' : signal.status === 'Diagnostic' ? 'Диагностика' : signal.status === 'Cancelled' ? 'Отменён' : signal.status}</td>
                         <td>{dateTimeRu(signal.refreshed_at) || '—'}</td>
+                        <td className="dbrActionCell" onClick={(e) => e.stopPropagation()}>
+                          {signal.can_launch && signal.status === 'Open' && (
+                            <button className="dbrLaunchBtn" onClick={() => void startLaunch(signal)} disabled={launchBusy} title="Запустить в производство (создать заказ в 1С)">Запустить…</button>
+                          )}
+                        </td>
                       </tr>
                       {isExpanded && hasDeficit && (
                         <tr className="dbrDeficitExpand">
                           <td />
-                          <td colSpan={17}>
+                          <td />
+                          <td colSpan={18}>
                             <div className="dbrDeficitLines">
                               <div className="dbrDeficitLinesTitle">Дефицит комплекта</div>
                               <table className="dbrDeficitLinesTable">
@@ -510,8 +659,20 @@ export function DbrFeederPage() {
                   <dt>График</dt><dd>№{selectedSignal.source_schedule_id ?? 'нет'}</dd>
                   <dt>Источник</dt><dd>{selectedSignal.reason_json?.generator ?? '—'}</dd>
                   <dt>Качество</dt><dd>{selectedSignal.is_incomplete || selectedSignal.data_quality?.length || selectedSignal.reason_json?.missing_reasons?.length ? <span className="dbrQualityWarning">⚠ {[...(selectedSignal.data_quality ?? []), ...(selectedSignal.reason_json?.missing_reasons ?? [])].filter((reason, index, all) => all.indexOf(reason) === index).map((reason) => REASON_LABEL[reason] ?? reason).join(', ') || 'Неполные данные'}</span> : 'Полные данные'}</dd>
+                  {selectedSignal.material_status && <><dt>Материал</dt><dd>{selectedSignal.material_status}</dd></>}
                 </dl>
-                <div className="dbrSignalReadonly">Только просмотр: исполнительные действия отсутствуют.</div>
+                {selectedSignal.status === 'Open' && selectedSignal.can_launch ? (
+                  <div className="dbrSignalActions">
+                    <button className="dbrDanger" onClick={() => void startLaunch(selectedSignal)} disabled={launchBusy}>Запустить в производство…</button>
+                    <div className="fieldHint">Создаст заказ на производство в живой 1С. Сначала откроется предпросмотр документа.</div>
+                  </div>
+                ) : (
+                  <div className="dbrSignalReadonly">
+                    {selectedSignal.status !== 'Open'
+                      ? 'Запуск доступен только для открытых сигналов.'
+                      : 'Запуск заблокирован: материальная готовность не подтверждена (см. дефицит комплекта).'}
+                  </div>
+                )}
               </aside>
             )}
           </div>
@@ -588,6 +749,106 @@ export function DbrFeederPage() {
               </div>
             </div>
           </div>
+        )}
+
+        {/* ── Launch one signal into a 1С production order ──────────────── */}
+        {launchFlow && (
+          <DbrConfirmDialog
+            title={`Запуск сигнала — ${launchFlow.signal.item_code ?? `#${launchFlow.signal.id}`}`}
+            phase={launchFlow.result ? 'done' : launchFlow.deficit ? 'blocked' : 'preview'}
+            busy={launchBusy}
+            confirmLabel="Провести в 1С"
+            error={launchError}
+            onClose={closeLaunch}
+            onConfirm={() => void confirmLaunch()}
+          >
+            {(() => {
+              const { signal, preview, result, deficit } = launchFlow
+              if (deficit) {
+                return (
+                  <div className="dbrDeficitLines">
+                    <div className="dbrDeficitLinesTitle">Запуск заблокирован материальным дефицитом</div>
+                    {deficit.length ? (
+                      <table className="dbrDeficitLinesTable">
+                        <thead><tr><th>Позиция</th><th className="numCell">Нужно</th><th className="numCell">Есть</th><th className="numCell">Не хватает</th><th>Тип</th></tr></thead>
+                        <tbody>
+                          {deficit.map((line) => (
+                            <tr key={line.item}>
+                              <td><strong>{line.item}</strong><span className="dbrFeederItemName">{line.item_name}</span></td>
+                              <td className="numCell">{qty(line.need)}</td>
+                              <td className="numCell">{qty(line.have)}</td>
+                              <td className="numCell"><strong>{qty(Math.max(line.need - line.have, 0))}</strong></td>
+                              <td>{SOURCE_LABEL[line.kind] ?? line.kind}{line.level ? ` · ${line.level}` : ''}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    ) : <div className="fieldHint">Детализация дефицита недоступна.</div>}
+                  </div>
+                )
+              }
+              const doc = result ?? preview
+              return (
+                <>
+                  <div className="dbrDocSummary">
+                    <div><span>Документ</span><strong>Заказ на производство{doc ? ` · № ${doc.number}` : ''}</strong></div>
+                    <div><span>Изделие</span><strong>{signal.item_code} — {signal.item_name}</strong></div>
+                    <div><span>Количество</span><strong>{qty(signal.suggested_qty)} шт</strong></div>
+                    <div><span>Склад-приёмник</span><strong>{signal.warehouse_ref1c}</strong></div>
+                    {signal.required_date && <div><span>Дата потребности</span><strong>{dateRu(signal.required_date)}</strong></div>}
+                  </div>
+                  {result && (
+                    <div className="dbrResultBox">
+                      {result.created ? (
+                        <p>Заказ создан в 1С: <strong>№ {result.number}</strong>{result.one_c_order_ref ? <span className="dbrRefKey"> · ref {result.one_c_order_ref}</span> : null}</p>
+                      ) : result.already_launched ? (
+                        <p>Заказ уже был создан ранее: <strong>№ {result.number}</strong>{result.one_c_order_ref ? <span className="dbrRefKey"> · ref {result.one_c_order_ref}</span> : null}</p>
+                      ) : result.error ? (
+                        <p className="dbrResultError">Ошибка записи в 1С: {result.error}</p>
+                      ) : (
+                        <p>{result.note}</p>
+                      )}
+                    </div>
+                  )}
+                  {!preview && !result && <div className="fieldHint">Загрузка предпросмотра…</div>}
+                  {preview?.payload && (
+                    <details className="dbrPayloadDetails">
+                      <summary>Показать payload документа 1С</summary>
+                      <pre className="dialogPreview">{JSON.stringify(preview.payload, null, 2)}</pre>
+                    </details>
+                  )}
+                </>
+              )
+            })()}
+          </DbrConfirmDialog>
+        )}
+
+        {/* ── Mass supplier order for «Пополнение» signals ──────────────── */}
+        {purchaseFlow && (
+          <DbrConfirmDialog
+            title="Заказ поставщику по сигналам питателя"
+            phase={purchaseFlow.result ? 'done' : 'preview'}
+            busy={purchaseBusy}
+            confirmLabel="Провести в 1С"
+            error={purchaseError}
+            onClose={() => setPurchaseFlow(null)}
+            onConfirm={() => void confirmPurchase()}
+          >
+            {(() => {
+              const data = purchaseFlow.result ?? purchaseFlow.preview
+              if (!data) return <div className="fieldHint">Загрузка предпросмотра…</div>
+              return (
+                <>
+                  <div className="fieldHint">
+                    {purchaseFlow.signalIds?.length
+                      ? `Выбрано сигналов: ${purchaseFlow.signalIds.length}.`
+                      : 'Выбраны все открытые закупочные сигналы «Пополнение».'}
+                  </div>
+                  <DbrPurchaseResultBody data={data} />
+                </>
+              )
+            })()}
+          </DbrConfirmDialog>
         )}
 
         <div className="dbrKpis dbrFeederKpis">
