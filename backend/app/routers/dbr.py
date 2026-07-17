@@ -31,10 +31,12 @@ from ..services.dbr import (
     feeder_position_service,
     feeder_signal_service,
     gate_service,
+    materialize_service,
     program_service,
     settings_service,
     slot_service,
 )
+from ..services.dbr.materialize_service import MaterializeConflict
 
 router = APIRouter(prefix="/v1/dbr", tags=["dbr"])
 
@@ -147,6 +149,15 @@ class PositionRebuildRequest(BaseModel):
 
 class SignalRefreshRequest(BaseModel):
     expected_schedule_id: Optional[int] = None
+
+
+class ReleaseDayRequest(BaseModel):
+    day: date
+    dry_run: bool = True
+
+
+class SignalLaunchRequest(BaseModel):
+    dry_run: bool = True
 
 
 # --------------------------------------------------------------------------
@@ -627,11 +638,64 @@ def drum_move_slot(
 @router.post("/drum/slots/{slot_id}/release")
 def drum_release_slot(
     slot_id: int,
+    dry_run: bool = Query(default=True),
     db: Session = Depends(get_dbr_write_db, scope="function"),
 ):
+    """Materialize a green+pending slot into a 1С production order (Фаза 3).
+
+    dry_run=true (default) returns the payload preview and writes nothing;
+    dry_run=false writes to 1С and marks the slot released.
+    """
     try:
-        return slot_service.release_slot(db, slot_id)
+        return materialize_service.release_slot(db, slot_id, dry_run=dry_run)
     except LookupError:
         raise HTTPException(status_code=404, detail="slot not found")
+    except MaterializeConflict as exc:
+        raise HTTPException(status_code=409, detail={"message": exc.detail, **exc.payload})
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/drum/{schedule_id}/release-day")
+def drum_release_day(
+    schedule_id: int,
+    payload: ReleaseDayRequest,
+    db: Session = Depends(get_dbr_write_db, scope="function"),
+):
+    """Batch-release every green+pending slot of one day. Partial failures do
+    not roll back the slots that already succeeded (per-slot isolation)."""
+    try:
+        return materialize_service.release_day(
+            db, schedule_id, payload.day, dry_run=payload.dry_run
+        )
+    except LookupError:
+        raise HTTPException(status_code=404, detail="schedule not found")
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/feeder/signals/{signal_id}/launch")
+def feeder_launch_signal(
+    signal_id: int,
+    payload: SignalLaunchRequest,
+    db: Session = Depends(get_dbr_write_db, scope="function"),
+):
+    """Launch an Open+complete feeder signal into a 1С production order (Фаза 3).
+
+    Gated by material readiness: a deficit returns 409 with deficit_lines.
+    dry_run=true (default) returns the payload preview and writes nothing.
+    """
+    try:
+        return materialize_service.launch_signal(db, signal_id, dry_run=payload.dry_run)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="feeder signal not found")
+    except MaterializeConflict as exc:
+        raise HTTPException(status_code=409, detail={"message": exc.detail, **exc.payload})
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

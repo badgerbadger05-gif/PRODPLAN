@@ -1,9 +1,9 @@
-"""DBR slot operations — manual move, roll-forward, release stub.
+"""DBR slot operations — manual move and roll-forward.
 
 move_slot is a local correction over the auto-leveled schedule (validated for
 workday / period / past / load limit). roll_forward wraps core/rollforward.
-release_slot is a Phase-1 STUB: it only flips release_status to "released" and
-reports it — no write to 1C or anywhere else.
+Release/materialization (slot → 1С production order) lives in
+services/dbr/materialize_service.py (Фаза 3).
 """
 
 from __future__ import annotations
@@ -207,27 +207,3 @@ def roll_forward(db: Session, schedule_id: Optional[int] = None, today: Optional
             overloaded += 1
     db.flush()
     return {"moved": moved, "closed": closed, "overloaded": overloaded}
-
-
-def release_slot(db: Session, slot_id: int) -> dict[str, Any]:
-    """PHASE-1 STUB: flip a pending slot to Released. No 1C / external write.
-
-    Materialization (production order in 1C) lands in Phase 3; here the slot is
-    only marked and the response says so explicitly.
-    """
-    slot = db.get(DbrDrumSlot, slot_id)
-    if slot is None:
-        raise LookupError("slot not found")
-    if slot.release_status == COMPLETED:
-        raise ValueError("плитка закрыта выпуском")
-    already = slot.release_status == RELEASED
-    slot.release_status = RELEASED
-    db.flush()
-    return {
-        "ok": True,
-        "slot_id": slot_id,
-        "release_status": RELEASED,
-        "already_released": already,
-        "stub": True,
-        "note": "Phase 1 stub: статус изменён на released, запись в 1С не выполнялась",
-    }

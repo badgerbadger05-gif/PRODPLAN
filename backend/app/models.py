@@ -1200,7 +1200,10 @@ class DbrFeederSignal(Base):
     __table_args__ = (
         UniqueConstraint("dedup_key", name="ux_dbr_feeder_signal_dedup_key"),
         CheckConstraint("signal_type IN ('Пополнение', 'Под график', 'Цепочка')", name="ck_dbr_feeder_signal_type"),
-        CheckConstraint("status IN ('Open', 'Diagnostic', 'Cancelled')", name="ck_dbr_feeder_signal_status"),
+        CheckConstraint(
+            "status IN ('Open', 'Diagnostic', 'Order Created', 'In Work', 'Done', 'Cancelled')",
+            name="ck_dbr_feeder_signal_status",
+        ),
         CheckConstraint("suggested_qty >= 0", name="ck_dbr_feeder_signal_qty_nonnegative"),
     )
 
@@ -1241,6 +1244,10 @@ class DbrFeederSignal(Base):
     data_quality = Column(CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'"))
     is_incomplete = Column(Boolean, nullable=False, default=False, server_default="false", index=True)
     reason_json = Column(CrossPlatformJSON, nullable=False, default=dict, server_default=text("'{}'"))
+    # Materialization (Фаза 3): the 1С Document_ЗаказНаПроизводство created when
+    # this signal was launched. Stamped by services/dbr/materialize_service.
+    one_c_order_ref = Column(String(36), nullable=True, index=True)
+    one_c_order_number = Column(String(50), nullable=True)
     refreshed_at = Column(TIMESTAMP, nullable=False, default=func.now(), server_default=func.now())
     cancelled_at = Column(TIMESTAMP, nullable=True)
     created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
@@ -1414,6 +1421,10 @@ class DbrDrumSlot(Base):
     shortage_json = Column(CrossPlatformJSON, nullable=True)
     # pending / released / completed
     release_status = Column(String(12), nullable=False, default="pending", server_default="pending", index=True)
+    # Materialization (Фаза 3): the 1С Document_ЗаказНаПроизводство created when
+    # this slot was released. Stamped by services/dbr/materialize_service.
+    one_c_order_ref = Column(String(36), nullable=True, index=True)
+    one_c_order_number = Column(String(50), nullable=True)
     source_program_id = Column(
         Integer,
         ForeignKey("dbr_production_program.id", ondelete="SET NULL"),

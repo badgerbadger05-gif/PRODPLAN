@@ -224,14 +224,15 @@ def test_move_slot_rejects_resource_not_assigned_to_sku(client, seed):
     assert unchanged["resource_id"] == slot["resource_id"]
 
 
-def test_release_is_stub(client, seed):
+def test_release_requires_green_slot(client, seed):
+    # Фаза 3: release materializes into 1С and only green+pending slots qualify.
+    # A freshly built slot has kit_status='unknown' (gate not refreshed) → 409.
     _, schedule_id = _create_and_activate(client, seed["sled_id"])
     slots = client.get("/api/v1/dbr/drum/active/board").json()["slots"]
     slot_id = slots[0]["id"]
     resp = client.post(f"/api/v1/dbr/drum/slots/{slot_id}/release")
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["stub"] is True and body["release_status"] == "released"
+    assert resp.status_code == 409
+    assert "message" in resp.json()["detail"]
 
 
 def test_roll_forward_endpoint(client, seed):

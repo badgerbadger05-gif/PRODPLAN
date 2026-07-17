@@ -347,6 +347,15 @@ def refresh_signals(db: Session, expected_schedule_id: Optional[int] = None) -> 
         dedup_key = data["dedup_key"]
         seen.add(dedup_key)
         signal = current.get(dedup_key)
+        # A signal that has already been materialized into a 1С order (Фаза 3)
+        # is owned by materialize_service/feedback_service — the advisory refresh
+        # must not revert its lifecycle status back to Open/Cancelled.
+        if signal is not None and signal.status in (
+            signal_identity.ORDER_CREATED,
+            signal_identity.IN_WORK,
+            signal_identity.DONE,
+        ):
+            continue
         actionable = data["action"] in ("open", "update")
         diagnostic_action = data["action"] == "diagnostic"
         desired = actionable or diagnostic_action
