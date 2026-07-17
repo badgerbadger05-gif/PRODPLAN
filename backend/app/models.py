@@ -1199,7 +1199,7 @@ class DbrFeederSignal(Base):
     __tablename__ = "dbr_feeder_signal"
     __table_args__ = (
         UniqueConstraint("dedup_key", name="ux_dbr_feeder_signal_dedup_key"),
-        CheckConstraint("signal_type IN ('Пополнение', 'Под график')", name="ck_dbr_feeder_signal_type"),
+        CheckConstraint("signal_type IN ('Пополнение', 'Под график', 'Цепочка')", name="ck_dbr_feeder_signal_type"),
         CheckConstraint("status IN ('Open', 'Diagnostic', 'Cancelled')", name="ck_dbr_feeder_signal_status"),
         CheckConstraint("suggested_qty >= 0", name="ck_dbr_feeder_signal_qty_nonnegative"),
     )
@@ -1207,10 +1207,12 @@ class DbrFeederSignal(Base):
     id = Column(Integer, primary_key=True, index=True)
     dedup_key = Column(String(66), nullable=False, index=True)
     signal_type = Column(String(30), nullable=False, default="Пополнение", server_default="Пополнение")
+    # Chain signals ("Цепочка") are pegged to a parent signal, not to a shelf
+    # position — hence the position is nullable for that family.
     supermarket_position_id = Column(
         Integer,
         ForeignKey("dbr_supermarket_position.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
         index=True,
     )
     item_id = Column(Integer, ForeignKey("items.item_id", ondelete="CASCADE"), nullable=False, index=True)
@@ -1223,6 +1225,12 @@ class DbrFeederSignal(Base):
     target_qty_snapshot = Column(DECIMAL(16, 3), nullable=True)
     kit_force = Column(Boolean, nullable=False, default=False, server_default="false")
     kit_shortage_qty = Column(DECIMAL(16, 3), nullable=False, default=0, server_default="0")
+    # Chain pegging (Фаза 3.2): child "Цепочка" signal points at the signal whose
+    # kit deficit spawned it; chain_depth guards against pathological BOM trees.
+    parent_signal_id = Column(
+        Integer, ForeignKey("dbr_feeder_signal.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    chain_depth = Column(Integer, nullable=False, default=0, server_default="0")
     source_schedule_id = Column(Integer, ForeignKey("dbr_drum_schedule.id", ondelete="SET NULL"), nullable=True, index=True)
     drum_slot_id = Column(Integer, ForeignKey("dbr_drum_slot.id", ondelete="CASCADE"), nullable=True, index=True)
     need_date = Column(Date, nullable=True, index=True)
@@ -1242,6 +1250,7 @@ class DbrFeederSignal(Base):
     item = relationship("Item")
     source_schedule = relationship("DbrDrumSchedule")
     drum_slot = relationship("DbrDrumSlot")
+    parent_signal = relationship("DbrFeederSignal", remote_side=[id])
 
 
 # --------------------------------------------------------------------------

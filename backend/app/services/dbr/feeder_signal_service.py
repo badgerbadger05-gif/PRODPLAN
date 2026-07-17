@@ -26,7 +26,7 @@ from ...models import (
 from ..production_control_reservations import load_reservation_state
 from . import adapters, classify as classify_mod
 from .core.drum.kit import build_kit
-from . import feeder_nfp_service
+from . import feeder_material_service, feeder_nfp_service
 from .core.feeder import signal_identity, zones
 
 _REFRESH_LOCK = 0x4442525349474E4C
@@ -405,7 +405,10 @@ def refresh_signals(db: Session, expected_schedule_id: Optional[int] = None) -> 
         signal.refreshed_at = now
 
     # Signals whose source position/slot ceased to be active must not remain live.
+    # Chain signals are owned by feeder_chain_service and never swept here.
     for dedup_key, signal in current.items():
+        if signal.signal_type == "Цепочка":
+            continue
         if dedup_key not in seen and signal.status in (signal_identity.OPEN, DIAGNOSTIC):
             signal.status = signal_identity.CANCELLED
             signal.suggested_qty = 0
@@ -439,6 +442,8 @@ def signal_out(signal: DbrFeederSignal) -> dict[str, Any]:
         "target_qty_snapshot": float(signal.target_qty_snapshot) if signal.target_qty_snapshot is not None else None,
         "kit_force": signal.kit_force,
         "kit_shortage_qty": float(signal.kit_shortage_qty or 0),
+        "parent_signal_id": signal.parent_signal_id,
+        "chain_depth": int(signal.chain_depth or 0),
         "source_schedule_id": signal.source_schedule_id,
         "drum_slot_id": signal.drum_slot_id,
         "need_date": signal.need_date,
@@ -454,10 +459,22 @@ def signal_out(signal: DbrFeederSignal) -> dict[str, Any]:
     }
 
 
+_MATERIAL_KEYS = ("material_status", "kit_cls", "can_launch", "deficit_lines", "root_items")
+
+
+def _material_annotations(db: Session) -> dict[int, dict[str, Any]]:
+    """Material readiness per signal id, degrading to {} if DBR is unconfigured."""
+    try:
+        signals = feeder_material_service.live_queue(db)
+        return feeder_material_service.annotate_queue(db, signals, with_roots=True)["annotations"]
+    except Exception:
+        return {}
+
+
 def list_signals(
     db: Session, *, status: Optional[str] = None, zone: Optional[str] = None,
     search: Optional[str] = None, signal_type: Optional[str] = None,
-    limit: int = 1000, offset: int = 0,
+    limit: int = 1000, offset: int = 0, include_material: bool = True,
 ) -> list[dict[str, Any]]:
     query = db.query(DbrFeederSignal).join(Item)
     if status:
@@ -474,7 +491,17 @@ def list_signals(
         DbrFeederSignal.priority.desc(),
         DbrFeederSignal.id,
     ).offset(offset).limit(limit).all()
-    return [signal_out(row) for row in rows]
+    out = [signal_out(row) for row in rows]
+    if include_material:
+        annotations = _material_annotations(db)
+        for row in out:
+            note = annotations.get(row["id"], {})
+            row["material_status"] = note.get("material_status")
+            row["kit_cls"] = note.get("kit_cls")
+            row["can_launch"] = bool(note.get("can_launch", False))
+            row["deficit_lines"] = note.get("deficit_lines", [])
+            row["root_items"] = note.get("root_items", [])
+    return out
 
 
 def get_signal(db: Session, signal_id: int) -> Optional[dict[str, Any]]:

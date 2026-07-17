@@ -26,6 +26,8 @@ from ..database import get_db
 from ..services.dbr import (
     board_service,
     drum_service,
+    feeder_chain_service,
+    feeder_material_service,
     feeder_position_service,
     feeder_signal_service,
     gate_service,
@@ -347,6 +349,37 @@ def get_feeder_signal(signal_id: int, db: Session = Depends(get_db)):
     if result is None:
         raise HTTPException(status_code=404, detail="feeder signal not found")
     return result
+
+
+# --------------------------------------------------------------------------
+# Phase-3 material readiness and chain explosion (advisory, no 1С writes)
+# --------------------------------------------------------------------------
+
+
+@router.get("/feeder/deficits")
+def get_feeder_deficits(db: Session = Depends(get_db)):
+    try:
+        return feeder_material_service.get_deficits(db)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/feeder/chain/preview")
+def preview_feeder_chain(db: Session = Depends(get_db)):
+    try:
+        return feeder_chain_service.preview_chain_signals(db)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/feeder/chain/refresh")
+def refresh_feeder_chain(
+    db: Session = Depends(get_dbr_write_db, scope="function"),
+):
+    try:
+        return feeder_chain_service.refresh_chain_signals(db)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 # --------------------------------------------------------------------------
