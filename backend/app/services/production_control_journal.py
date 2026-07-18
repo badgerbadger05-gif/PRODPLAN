@@ -38,6 +38,7 @@ from .production_control_domain import (
 )
 from .production_control_material_issues import refresh_existing_material_issues_for_product
 from .replenishment import REPLENISHMENT_FLOW_PRODUCTION, classify_replenishment_flow
+from .paint_weld_pairs import is_welded_blocked
 
 
 DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
@@ -546,6 +547,7 @@ def create_orders_from_mrp(
     """
     created: List[Dict[str, Any]] = []
     reused: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
     errors: List[str] = []
 
     today = datetime.now(timezone.utc)
@@ -564,6 +566,16 @@ def create_orders_from_mrp(
         item = db.query(Item).filter(Item.item_id == int(planned.item_id)).first()
         if not item:
             errors.append(f"planned_order_id={pid}: номенклатура {planned.item_id} не найдена")
+            continue
+
+        # Сварная деталь активной пары «окраска↔сварка» заказывается по цепочке
+        # от окраски, не самостоятельно. Сироты (без активной пары) не блокируются.
+        if is_welded_blocked(db, [int(planned.item_id)]):
+            skipped.append({
+                "planned_order_id": pid,
+                "item_id": int(planned.item_id),
+                "reason": "заказывается по цепочке от окраски",
+            })
             continue
 
         # Idempotency check at the application layer (cheap, friendly error)
@@ -647,7 +659,7 @@ def create_orders_from_mrp(
         )
 
     db.commit()
-    return {"status": "ok", "created": created, "reused": reused, "errors": errors, "initiated_by": initiated_by}
+    return {"status": "ok", "created": created, "reused": reused, "skipped": skipped, "errors": errors, "initiated_by": initiated_by}
 
 
 def create_production_orders_from_mrp_requirements(
@@ -701,6 +713,17 @@ def create_production_orders_from_mrp_requirements(
                 "requirement_id": rid,
                 "item_id": int(req.item_id),
                 "reason": f"flow={flow}",
+            })
+            continue
+
+        # Сварная деталь активной пары «окраска↔сварка» не заказывается
+        # самостоятельно — она пойдёт по цепочке от окрасочного заказа.
+        # Сироты (нет активной пары) не блокируются — их надо заказывать вручную.
+        if is_welded_blocked(db, [int(req.item_id)]):
+            skipped.append({
+                "requirement_id": rid,
+                "item_id": int(req.item_id),
+                "reason": "заказывается по цепочке от окраски",
             })
             continue
 

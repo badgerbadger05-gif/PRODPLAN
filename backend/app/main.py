@@ -15,6 +15,7 @@ from app.routers import production_control as production_control_router
 from app.routers import purchase_control as purchase_control_router
 from app.routers import workshop_binding_review as workshop_binding_review_router
 from app.routers import dbr as dbr_router
+from app.routers import paint_weld as paint_weld_router
 
 import os
 import logging
@@ -52,6 +53,7 @@ app.include_router(production_control_router.router, prefix="/api")
 app.include_router(purchase_control_router.router, prefix="/api")
 app.include_router(workshop_binding_review_router.router, prefix="/api")
 app.include_router(dbr_router.router, prefix="/api")
+app.include_router(paint_weld_router.router, prefix="/api")
 
 @app.get("/")
 async def root():
