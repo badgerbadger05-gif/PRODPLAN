@@ -9,6 +9,7 @@ import type {
   DbrFeederSignalPreview,
   DbrKitLine,
   DbrLaunchConflictDetail,
+  DbrProcessingBoard,
   DbrPurchaseLaunchResult,
   DbrSignalLaunchResult,
 } from '../../domain/dbr'
@@ -16,6 +17,7 @@ import { ApiError } from '../../lib/api'
 import { dateRu, dateTimeRu, qty } from '../../lib/format'
 import {
   getDbrFeederDeficits,
+  getDbrProcessingBoard,
   getDbrSettings,
   launchDbrPurchase,
   launchDbrSignal,
@@ -109,6 +111,8 @@ export function DbrFeederPage() {
   } | null>(null)
   const [purchaseBusy, setPurchaseBusy] = useState(false)
   const [purchaseError, setPurchaseError] = useState('')
+  const [processingBoard, setProcessingBoard] = useState<DbrProcessingBoard | null>(null)
+  const [processingLoading, setProcessingLoading] = useState(false)
 
   const load = useCallback(async (next: Filters = applied) => {
     setLoading(true)
@@ -157,6 +161,19 @@ export function DbrFeederPage() {
   }, [])
 
   useEffect(() => { void loadDeficits() }, [loadDeficits])
+
+  const loadProcessingBoard = useCallback(async () => {
+    setProcessingLoading(true)
+    try {
+      setProcessingBoard(await getDbrProcessingBoard())
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setProcessingLoading(false)
+    }
+  }, [])
+
+  useEffect(() => { void loadProcessingBoard() }, [loadProcessingBoard])
 
   useEffect(() => {
     let cancelled = false
@@ -718,6 +735,62 @@ export function DbrFeederPage() {
             </table>
           </div>
           <div className="dbrSignalReadonly">Только просмотр: запас считается «выбранные − игнорируемые» склады ({deficits?.kpis.stock_source ?? 'selected − ignored'}), без запуска производства и заказов.</div>
+        </section>
+
+        <section className="dbrSignalSection dbrProcessingSection" aria-label="Давальческий контур переработки">
+          <div className="dbrSignalHeader">
+            <div>
+              <h2>Переработка (давальческий контур)</h2>
+              <p>Полка покрытой детали: NFP = остаток + труба переработчика + голая (остаток и в работе). Возраст партии считается от даты заказа переработчику — дата фактической отправки в 1С не синхронизируется.</p>
+            </div>
+            <div className="dbrSignalHeaderActions">
+              {processingBoard && (
+                <span className={`dbrSignalCount ${processingBoard.overdue_positions ? 'dbrOverdueBadge' : ''}`}>
+                  Позиций: {processingBoard.positions_total}; просрочен кругорейс (&gt;{processingBoard.roundtrip_limit_days} дн): {processingBoard.overdue_positions}
+                </span>
+              )}
+              <button onClick={() => void loadProcessingBoard()} disabled={processingLoading}>Обновить</button>
+            </div>
+          </div>
+
+          <div className="dbrFeederTableWrap">
+            <table className="journalTable dbrTable">
+              <thead><tr>
+                <th>Позиция</th><th>Зона</th>
+                <th className="numCell">NFP</th><th className="numCell">Полка</th>
+                <th className="numCell">У переработчика</th><th className="numCell">Голая (остаток+WIP)</th>
+                <th className="numCell">Target</th><th className="numCell">ADU</th>
+                <th>Открытые заказы переработчику</th>
+              </tr></thead>
+              <tbody>
+                {!processingLoading && !(processingBoard?.positions.length) && (
+                  <tr><td colSpan={9} className="emptyCell">Processing-позиций нет — пересчитайте позиции по активному графику.</td></tr>
+                )}
+                {(processingBoard?.positions ?? []).map((row) => (
+                  <tr key={row.position_id} className={row.has_overdue ? 'dbrProcessingOverdueRow' : ''}>
+                    <td><strong>{row.item_article || row.item_code}</strong><span className="dbrFeederItemName">{row.item_name}</span></td>
+                    <td>{row.zone ? <span className={`dbrZoneBadge ${String(row.zone).toLowerCase()}`}>{ZONE_LABEL[String(row.zone).toLowerCase()] ?? row.zone}</span> : '—'}</td>
+                    <td className="numCell"><strong>{row.nfp != null ? qty(row.nfp) : '—'}</strong></td>
+                    <td className="numCell">{row.stock_qty != null ? qty(row.stock_qty) : '—'}</td>
+                    <td className="numCell">{row.open_supply_qty != null ? qty(row.open_supply_qty) : '—'}</td>
+                    <td className="numCell">{row.chain_supply_qty != null ? qty(row.chain_supply_qty) : '—'}</td>
+                    <td className="numCell">{qty(row.target_qty)}</td>
+                    <td className="numCell">{qty(row.adu)}</td>
+                    <td>
+                      {row.open_orders.length
+                        ? row.open_orders.map((order) => (
+                          <div key={order.order_number} className={order.overdue ? 'dbrOverdueOrder' : ''} title={order.overdue ? `Партия у подрядчика дольше ${processingBoard?.roundtrip_limit_days} дн` : undefined}>
+                            {order.order_number} · {qty(order.remaining_qty)} шт · {order.age_days != null ? `${order.age_days} дн` : '—'}{order.overdue ? ' ⚠' : ''}
+                          </div>
+                        ))
+                        : '—'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="dbrSignalReadonly">Только просмотр: сигналы переработки advisory, заказ переработчику создаётся вручную (материализация — после смоука вида операции в 1С).</div>
         </section>
 
         {chainPreview && (

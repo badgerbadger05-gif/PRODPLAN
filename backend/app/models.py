@@ -1082,6 +1082,9 @@ class DbrSettings(Base):
     # партии = ADU × интервал). См. питатель-3-гальваника-round-trip.md.
     rt_processing_days = Column(Integer, nullable=False, default=25, server_default="25")
     processing_trip_interval_days = Column(Integer, nullable=False, default=7, server_default="7")
+    # Порог алерта просроченного кругорейса: открытый заказ переработчику
+    # старше N дней = партия у подрядчика дольше нормы (дока §5).
+    processing_roundtrip_days = Column(Integer, nullable=False, default=14, server_default="14")
     # Shelf warehouses (roles): №2 (mechshop WIP), №3 (painted), №4 (hull #2).
     # FK-semantics on stock_warehouses.warehouse_ref1c, but no hard FK.
     w2_warehouse_ref1c = Column(String(36), nullable=True)

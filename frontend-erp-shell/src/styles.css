@@ -2595,3 +2595,8 @@ button.dbrLaunchBtn {
 .dbrPurchaseTable .dbrPurchaseUrgent > td {
   background: #fdf3f3;
 }
+
+/* Давальческий контур переработки (питатель №3, фаза 4) */
+.dbrProcessingOverdueRow > td { background: #fdf3f3; }
+.dbrOverdueOrder { color: #b91c1c; font-weight: 600; white-space: nowrap; }
+.dbrOverdueBadge { color: #b91c1c; font-weight: 700; }

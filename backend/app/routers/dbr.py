@@ -32,6 +32,7 @@ from ..services.dbr import (
     feeder_signal_service,
     gate_service,
     materialize_service,
+    processing_board_service,
     program_service,
     purchase_materialize_service,
     settings_service,
@@ -384,6 +385,16 @@ def get_feeder_signal(signal_id: int, db: Session = Depends(get_db)):
 def get_feeder_deficits(db: Session = Depends(get_db)):
     try:
         return feeder_material_service.get_deficits(db)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/feeder/processing/board")
+def get_processing_board(db: Session = Depends(get_db)):
+    """Борд давальческого контура (питатель №3): NFP-разложение processing-
+    позиций, открытые заказы переработчику и алерты просроченного кругорейса."""
+    try:
+        return processing_board_service.processing_board(db)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 

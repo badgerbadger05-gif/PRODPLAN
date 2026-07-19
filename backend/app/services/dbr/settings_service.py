@@ -41,6 +41,7 @@ _SETTINGS_FIELDS = {
     "feeder_load_horizon_weeks",
     "rt_processing_days",
     "processing_trip_interval_days",
+    "processing_roundtrip_days",
     "w2_warehouse_ref1c",
     "w3_warehouse_ref1c",
     "w4_warehouse_ref1c",

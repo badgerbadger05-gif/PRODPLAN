@@ -574,6 +574,47 @@ export type DbrFeederDeficitsResult = {
   }
 }
 
+// ── Давальческий контур переработки (питатель №3, фаза 4) ───────────────────
+export type DbrProcessingOrder = {
+  order_number: string
+  order_date?: string | null
+  remaining_qty: number
+  age_days?: number | null
+  overdue: boolean
+}
+
+export type DbrProcessingRow = {
+  position_id: number
+  item_id: number
+  item_code: string
+  item_article: string
+  item_name: string
+  adu: number
+  rt_days: number
+  trip_interval_days: number
+  red_qty: number
+  yellow_qty: number
+  target_qty: number
+  nfp?: number | null
+  zone?: string | null
+  penetration?: number | null
+  stock_qty?: number | null
+  open_supply_qty?: number | null
+  chain_supply_qty?: number | null
+  is_complete?: boolean | null
+  missing_reasons: string[]
+  open_orders: DbrProcessingOrder[]
+  has_overdue: boolean
+}
+
+export type DbrProcessingBoard = {
+  roundtrip_limit_days: number
+  positions: DbrProcessingRow[]
+  positions_total: number
+  overdue_positions: number
+  generated_at: string
+}
+
 // ── Chain explosion (Фаза 3.2) ────────────────────────────────────────────────
 export type DbrChainPreviewItem = {
   item: string

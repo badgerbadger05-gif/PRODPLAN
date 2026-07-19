@@ -8,6 +8,7 @@ import type {
   DbrChainPreview,
   DbrChainRefresh,
   DbrFeederDeficitsResult,
+  DbrProcessingBoard,
   DbrGateResult,
   DbrFeederFilters,
   DbrFeederPosition,
@@ -185,6 +186,10 @@ export function listDbrFeederPositions(filters: DbrFeederFilters = {}) {
   if (filters.limit !== undefined) search.set('limit', String(filters.limit))
   if (filters.offset !== undefined) search.set('offset', String(filters.offset))
   return api<DbrFeederPosition[]>(`/v1/dbr/feeder/positions?${search.toString()}`)
+}
+
+export function getDbrProcessingBoard() {
+  return api<DbrProcessingBoard>('/v1/dbr/feeder/processing/board')
 }
 
 export function previewDbrFeederPositions(scheduleId?: number) {

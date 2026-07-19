@@ -234,6 +234,55 @@ def test_processing_nfp_includes_pipe_and_bare_chain(db_session):
     assert live["is_complete"] is True
 
 
+def test_processing_board_overdue_roundtrip_alert(db_session):
+    db = db_session
+    schedule, coated, bare = _processing_scenario(db)
+    position = _processing_position(db, coated, schedule)
+    db.add(StockWarehouse(warehouse_ref1c=W4, warehouse_name="Полка 4", is_selected=True))
+    fresh = SupplierOrder(
+        order_number="ЗП-СВЕЖИЙ", order_date=datetime(2026, 8, 1),
+        order_ref1c="proc-fresh", deletion_mark=False,
+    )
+    stale = SupplierOrder(
+        order_number="ЗП-ПРОСРОЧЕН", order_date=datetime(2026, 6, 20),
+        order_ref1c="proc-stale", deletion_mark=False,
+    )
+    db.add_all([fresh, stale])
+    db.flush()
+    db.add_all(
+        [
+            SupplierOrderItem(
+                order_id=fresh.order_id, item_id_ref=coated.item_id, quantity=10,
+                received_qty=0, remaining_qty=10, destination_warehouse_ref1c=None,
+            ),
+            SupplierOrderItem(
+                order_id=stale.order_id, item_id_ref=coated.item_id, quantity=20,
+                received_qty=0, remaining_qty=20, destination_warehouse_ref1c=None,
+            ),
+        ]
+    )
+    db.flush()
+
+    from app.services.dbr import processing_board_service
+
+    board = processing_board_service.processing_board(db, today=date(2026, 8, 5))
+
+    assert board["roundtrip_limit_days"] == 14
+    assert board["positions_total"] == 1
+    assert board["overdue_positions"] == 1
+    row = board["positions"][0]
+    assert row["item_code"] == "COATED"
+    assert row["has_overdue"] is True
+    orders = {order["order_number"]: order for order in row["open_orders"]}
+    assert orders["ЗП-СВЕЖИЙ"]["overdue"] is False
+    assert orders["ЗП-СВЕЖИЙ"]["age_days"] == 4
+    assert orders["ЗП-ПРОСРОЧЕН"]["overdue"] is True
+    assert orders["ЗП-ПРОСРОЧЕН"]["age_days"] == 46
+    # NFP-разложение присутствует на борде
+    assert row["open_supply_qty"] == 30
+    assert row["zone"] is not None
+
+
 def test_processing_nfp_flags_unresolved_bare_component(db_session):
     db = db_session
     schedule, coated, bare = _processing_scenario(db)
