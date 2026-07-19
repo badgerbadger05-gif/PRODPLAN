@@ -1,9 +1,15 @@
-"""Справочник пар «окрашенная ↔ сварная» (окраска ↔ сварка), этап 1.
+"""Справочник пар «окрашенная ↔ предшественник» (окраска ↔ сварка/др.), этап 1.
 
-Семейство «… после покраски»: в 1С окрашенная деталь = двухуровневый BOM, где
-default-спека окрашенной содержит ровно один компонент типа «Сборка» — сварную
-(неокрашенную) деталь. Пары строятся автоматически из спек (source='auto'),
-ручные правки допустимы (source='manual').
+Окрашенная деталь определяется ПО ВИДУ ПРОИЗВОДСТВА: у её default-спеки
+production_kind — красящий (имя содержит «покрас»/«окрас»/«маляр»). В такой
+спеке ровно один компонент типа «Сборка» — это деталь-предшественник (после
+любой обработки: сварка, гибка, токарка, сборка). Дополнительные НЕ-«Сборка»
+компоненты (расходники: резинки, трафареты) пару не ломают. Имя предшественника
+НЕ фильтруется.
+
+Пары строятся автоматически (source='auto'), ручные правки допустимы
+(source='manual'). В welded-блокировку (серость) попадают только предшественники
+с методом снабжения «Производство».
 
 См. .docs/paint_weld_chain_logic.md — утверждённое ТЗ. Этап 1 без записи в 1С:
 только справочник, серость журнала/MRP, гард открытия и фильтр reconcile.
@@ -11,7 +17,8 @@ default-спека окрашенной содержит ровно один к�
 
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Optional, Set
+from collections import defaultdict
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -20,21 +27,23 @@ from ..models import (
     DefaultSpecification,
     Item,
     PaintWeldPair,
+    ProductionKind,
     ProductionOrder,
     ProductionProduct,
     SpecComponent,
+    Specification,
 )
 from .replenishment import REPLENISHMENT_FLOW_PRODUCTION, classify_replenishment_flow
 
-# Признаки семейства по данным разведки (2026-07-18):
-#   - окрашенная деталь: имя содержит «после покраски» (46 позиций);
-#   - сварная (неокрашенная) деталь: имя содержит «после сварки» либо
-#     «без покраски» (219 сварных в Производстве).
-PAINTED_MARKER = "после покраски"
-WELDED_MARKERS = ("после сварки", "без покраски")
-ORPHAN_MARKER = "после сварки"
+# Красящий вид производства: имя production_kind содержит любой из маркеров.
+# «окрас» — подстрока «покраска», поэтому ловит и «Узел (покраска)».
+PAINT_KIND_MARKERS = ("покрас", "окрас", "маляр")
 
 ASSEMBLY_COMPONENT_TYPE = "Сборка"
+
+# Причины, по которым красящаяся позиция не даёт пары (для отчёта rebuild).
+UNPAIRED_NO_ASSEMBLY = "no_assembly_component"
+UNPAIRED_MULTIPLE_ASSEMBLY = "multiple_assembly_components"
 
 
 def _to_float(value: Any) -> float:
@@ -49,85 +58,137 @@ def _name_has(name: Optional[str], markers: Iterable[str]) -> bool:
     return any(marker in lowered for marker in markers)
 
 
-def _default_spec_id(db: Session, item_id: int) -> Optional[int]:
-    row = (
-        db.query(DefaultSpecification.spec_id)
-        .filter(DefaultSpecification.item_id == int(item_id))
-        .order_by(DefaultSpecification.id.asc())
-        .first()
-    )
-    return int(row[0]) if row else None
+def _paint_kind_ids(db: Session) -> Set[int]:
+    """id красящих видов производства (имя содержит покрас/окрас/маляр)."""
+    return {
+        int(kind_id)
+        for kind_id, name in db.query(ProductionKind.id, ProductionKind.name).all()
+        if _name_has(name, PAINT_KIND_MARKERS)
+    }
 
 
-def _detect_auto_pairs(db: Session) -> Dict[int, int]:
+def _painted_specs(db: Session) -> Dict[int, int]:
     """
-    Вернуть {painted_item_id: welded_item_id} для семейства «после покраски».
-
-    Пара образуется, когда у окрашенной детали есть default-спека, в которой
-    ровно один компонент типа «Сборка», и имя этого компонента содержит
-    «после сварки»/«без покраски».
+    {painted_item_id: spec_id} — позиции, чья DEFAULT-спека (минимальный
+    default_specifications.id для позиции) имеет красящий production_kind.
     """
-    painted_items = (
-        db.query(Item.item_id)
-        .filter(func.lower(Item.item_name).like(f"%{PAINTED_MARKER}%"))
+    paint_kind_ids = _paint_kind_ids(db)
+    if not paint_kind_ids:
+        return {}
+    rows = (
+        db.query(
+            DefaultSpecification.item_id,
+            DefaultSpecification.spec_id,
+            Specification.production_kind_id,
+        )
+        .join(Specification, Specification.spec_id == DefaultSpecification.spec_id)
+        .order_by(DefaultSpecification.item_id.asc(), DefaultSpecification.id.asc())
         .all()
     )
     result: Dict[int, int] = {}
-    for (painted_id,) in painted_items:
-        painted_id = int(painted_id)
-        spec_id = _default_spec_id(db, painted_id)
-        if spec_id is None:
-            continue
-        assembly_rows = (
-            db.query(SpecComponent.item_id, Item.item_name)
-            .join(Item, Item.item_id == SpecComponent.item_id)
-            .filter(SpecComponent.spec_id == spec_id)
-            .filter(SpecComponent.component_type == ASSEMBLY_COMPONENT_TYPE)
-            .all()
-        )
-        # Ровно один компонент-«Сборка».
-        if len(assembly_rows) != 1:
-            continue
-        welded_id, welded_name = assembly_rows[0]
-        if not _name_has(welded_name, WELDED_MARKERS):
-            continue
-        result[painted_id] = int(welded_id)
+    seen: Set[int] = set()
+    for item_id, spec_id, kind_id in rows:
+        iid = int(item_id)
+        if iid in seen:
+            continue  # только default-спека (первая по id)
+        seen.add(iid)
+        if kind_id is not None and int(kind_id) in paint_kind_ids:
+            result[iid] = int(spec_id)
     return result
 
 
-def _orphan_welded(db: Session, paired_welded: Set[int]) -> Dict[str, Any]:
+def _detect_auto_pairs(db: Session) -> Tuple[Dict[int, int], Dict[int, str]]:
     """
-    Сварные «после сварки» (Производство) БЕЗ окрашенного родителя (не входят
-    активной парой). Для таких серость снимать нельзя — иначе их не заказать.
+    Разобрать красящиеся позиции на пары и «сирот» (unpaired).
+
+    Возвращает (pairs, unpaired):
+      - pairs: {painted_item_id: predecessor_item_id} — спека с ровно одним
+        компонентом-«Сборка» (предшественник после любой обработки);
+      - unpaired: {painted_item_id: reason} — спека с 0 или >1 «Сборка».
     """
-    rows = (
-        db.query(Item.item_id, Item.item_code, Item.item_name, Item.replenishment_method)
-        .filter(func.lower(Item.item_name).like(f"%{ORPHAN_MARKER}%"))
+    painted_specs = _painted_specs(db)
+    pairs: Dict[int, int] = {}
+    unpaired: Dict[int, str] = {}
+    if not painted_specs:
+        return pairs, unpaired
+
+    spec_ids = set(painted_specs.values())
+    assembly_by_spec: Dict[int, List[int]] = defaultdict(list)
+    for spec_id, comp_item_id in (
+        db.query(SpecComponent.spec_id, SpecComponent.item_id)
+        .filter(SpecComponent.spec_id.in_(spec_ids))
+        .filter(SpecComponent.component_type == ASSEMBLY_COMPONENT_TYPE)
         .all()
-    )
-    orphans: List[Dict[str, Any]] = []
-    for item_id, item_code, item_name, method in rows:
-        if classify_replenishment_flow(method) != REPLENISHMENT_FLOW_PRODUCTION:
-            continue
-        if int(item_id) in paired_welded:
-            continue
-        orphans.append(
+    ):
+        assembly_by_spec[int(spec_id)].append(int(comp_item_id))
+
+    for painted_id, spec_id in painted_specs.items():
+        assemblies = assembly_by_spec.get(spec_id, [])
+        if len(assemblies) == 1:
+            pairs[painted_id] = assemblies[0]
+        elif len(assemblies) == 0:
+            unpaired[painted_id] = UNPAIRED_NO_ASSEMBLY
+        else:
+            unpaired[painted_id] = UNPAIRED_MULTIPLE_ASSEMBLY
+    return pairs, unpaired
+
+
+def _unpaired_report(db: Session, unpaired: Dict[int, str]) -> Dict[str, Any]:
+    """
+    Сироты: красящиеся по виду производства позиции БЕЗ пары (0 или несколько
+    компонентов-«Сборка»). Их серость снимать нельзя. Позиции, закрытые ручной
+    активной парой, из отчёта исключаются.
+    """
+    if not unpaired:
+        return {"count": 0, "by_reason": {}, "examples": []}
+
+    manually_paired = {
+        int(pid)
+        for (pid,) in db.query(PaintWeldPair.painted_item_id)
+        .filter(PaintWeldPair.is_active.is_(True))
+        .filter(PaintWeldPair.painted_item_id.in_(list(unpaired.keys())))
+        .distinct()
+        .all()
+    }
+    remaining = {pid: reason for pid, reason in unpaired.items() if pid not in manually_paired}
+
+    names: Dict[int, Tuple[str, str]] = {}
+    if remaining:
+        for iid, code, name in (
+            db.query(Item.item_id, Item.item_code, Item.item_name)
+            .filter(Item.item_id.in_(list(remaining.keys())))
+            .all()
+        ):
+            names[int(iid)] = (str(code or ""), str(name or ""))
+
+    by_reason: Dict[str, int] = defaultdict(int)
+    examples: List[Dict[str, Any]] = []
+    for pid in sorted(remaining):
+        reason = remaining[pid]
+        by_reason[reason] += 1
+        code, name = names.get(pid, ("", ""))
+        examples.append(
             {
-                "item_id": int(item_id),
-                "item_code": str(item_code or ""),
-                "item_name": str(item_name or ""),
+                "item_id": pid,
+                "item_code": code,
+                "item_name": name,
+                "reason": reason,
             }
         )
-    orphans.sort(key=lambda row: row["item_id"])
-    return {"count": len(orphans), "examples": orphans[:20]}
+    return {
+        "count": len(remaining),
+        "by_reason": dict(by_reason),
+        "examples": examples[:20],
+    }
 
 
 def rebuild_auto_pairs(db: Session) -> Dict[str, Any]:
     """
     Пересобрать auto-пары из спек: upsert обнаруженных, деактивация исчезнувших.
-    Ручные (source='manual') пары не трогаются. Возвращает сводку + сироты.
+    Ручные (source='manual') пары не трогаются. Возвращает сводку + сироты
+    (красящиеся позиции без пары, с разбивкой по причинам).
     """
-    detected = _detect_auto_pairs(db)
+    detected, unpaired = _detect_auto_pairs(db)
 
     existing = {
         int(pair.painted_item_id): pair
@@ -181,11 +242,8 @@ def rebuild_auto_pairs(db: Session) -> Dict[str, Any]:
 
     db.commit()
 
-    active_pairs = (
-        db.query(PaintWeldPair).filter(PaintWeldPair.is_active.is_(True)).all()
-    )
-    paired_welded = {int(p.welded_item_id) for p in active_pairs}
-    orphans = _orphan_welded(db, paired_welded)
+    active_pairs = db.query(PaintWeldPair).filter(PaintWeldPair.is_active.is_(True)).all()
+    orphans = _unpaired_report(db, unpaired)
 
     return {
         "status": "ok",
@@ -195,23 +253,19 @@ def rebuild_auto_pairs(db: Session) -> Dict[str, Any]:
         "reactivated": reactivated,
         "deactivated": deactivated,
         "active_pairs": len(active_pairs),
+        "unpaired": orphans,
         "orphans": orphans,
     }
 
 
 def list_orphans(db: Session) -> Dict[str, Any]:
     """
-    Сироты: сварные «после сварки» (Производство) без активной пары (нет
-    окрашенного родителя). Для UI/замера — счёт и примеры.
+    Сироты: красящиеся по виду производства позиции БЕЗ пары (спека с 0 или
+    несколькими компонентами-«Сборка»). Для UI/замера — счёт, разбивка по
+    причинам и примеры.
     """
-    paired_welded = {
-        int(r[0])
-        for r in db.query(PaintWeldPair.welded_item_id)
-        .filter(PaintWeldPair.is_active.is_(True))
-        .distinct()
-        .all()
-    }
-    return _orphan_welded(db, paired_welded)
+    _detected, unpaired = _detect_auto_pairs(db)
+    return _unpaired_report(db, unpaired)
 
 
 def list_pairs(db: Session, *, active_only: bool = True) -> List[Dict[str, Any]]:
@@ -256,20 +310,27 @@ def list_pairs(db: Session, *, active_only: bool = True) -> List[Dict[str, Any]]
 
 def is_welded_blocked(db: Session, item_ids: Iterable[int]) -> Set[int]:
     """
-    Вернуть подмножество item_ids, которые являются сварной деталью активной
-    пары (серые/недоступные к самостоятельному заказу).
+    Вернуть подмножество item_ids, которые являются предшественником активной
+    пары И снабжаются «Производством» (серые/недоступные к самостоятельному
+    заказу). Предшественники-закупки/переработки НЕ блокируются — их надо
+    заказывать своим потоком.
     """
     ids = [int(x) for x in item_ids if x is not None]
     if not ids:
         return set()
     rows = (
-        db.query(PaintWeldPair.welded_item_id)
+        db.query(PaintWeldPair.welded_item_id, Item.replenishment_method)
+        .join(Item, Item.item_id == PaintWeldPair.welded_item_id)
         .filter(PaintWeldPair.is_active.is_(True))
         .filter(PaintWeldPair.welded_item_id.in_(ids))
         .distinct()
         .all()
     )
-    return {int(r[0]) for r in rows}
+    return {
+        int(welded_id)
+        for welded_id, method in rows
+        if classify_replenishment_flow(method) == REPLENISHMENT_FLOW_PRODUCTION
+    }
 
 
 def upsert_manual_pair(

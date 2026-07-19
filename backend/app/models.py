@@ -1499,3 +1499,32 @@ class PaintWeldPair(Base):
 
     painted_item = relationship("Item", foreign_keys=[painted_item_id])
     welded_item = relationship("Item", foreign_keys=[welded_item_id])
+
+
+class PaintWeldChainLink(Base):
+    """
+    Локальная связь «окрасочный → сварочный» заказ (цепочка открытия, этап 2).
+
+    В 1С сварочный документ несёт штатное основание
+    (`ЗаказНаПроизводствоОснование_Key` + `ДокументОснование`/`_Type`,
+    см. .docs/odata.md). Локальная запись — источник истины на стороне
+    PRODPLAN и якорь идемпотентности повторного открытия цепочки.
+
+    Один окрасочный заказ = один сварочный (painted_order_id UNIQUE) — это якорь
+    идемпотентности повторного открытия цепочки.
+    """
+
+    __tablename__ = "paint_weld_chain_links"
+    __table_args__ = (
+        UniqueConstraint("painted_order_id", name="ux_paint_weld_chain_links_painted_order"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    painted_order_id = Column(
+        Integer, ForeignKey("production_orders.order_id"), nullable=False
+    )
+    welded_order_id = Column(
+        Integer, ForeignKey("production_orders.order_id"), nullable=False, index=True
+    )
+    pair_id = Column(Integer, ForeignKey("paint_weld_pairs.id"), nullable=False)
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
