@@ -340,7 +340,9 @@ def test_route_sheet_printing_batches_multiple_products(db_session):
     assert "MRP-BATCH-3" in html
     assert "Материал пакетной печати" in html
     assert "Собрать" in html
-    assert len(statements) <= 10
+    # 10 запросов пакетной печати + 1 константная проверка цепочек
+    # «окраска↔сварка» (paint_weld_chain_links, этап 3).
+    assert len(statements) <= 11
 
 
 def _route_spec_to_workshop(db, spec, suffix: str) -> None:
