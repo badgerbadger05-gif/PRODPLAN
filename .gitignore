@@ -22,6 +22,10 @@ config/odata_config.local.json
 config-test/odata_config.json
 config-test/odata_config.local.json
 
+# Runtime state of the sync scheduler (written by the backend on each run)
+config/sync_schedule.json
+config-test/sync_schedule.json
+
 # Docker compose local override (machine-specific networking, hostnames)
 docker-compose.override.yml
 
