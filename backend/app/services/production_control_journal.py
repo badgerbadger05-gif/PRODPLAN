@@ -10,6 +10,7 @@ from ..models import (
     DefaultSpecification,
     Item,
     MrpRequirement,
+    PaintWeldChainLink,
     PlannedOrder,
     PlanningRun,
     ProductionPlanHeader,
@@ -1097,6 +1098,52 @@ def list_journal(
             failed_manufacture_by_product.setdefault(int(manufacture.product_id), manufacture)
     unit_by_raw = _unit_display_by_raw(db, [getattr(product.item, "unit", None) for product in rows if product.item])
 
+    # Цепочки «окраска↔сварка» (этап 4): признак роли строки и вторая сторона —
+    # для кнопки «закрыть цепочку» и подсветки в журнале.
+    chain_by_order_id: Dict[int, Dict[str, Any]] = {}
+    page_order_ids = sorted({int(product.order_id) for product in rows if product.order_id is not None})
+    if page_order_ids:
+        chain_links = (
+            db.query(PaintWeldChainLink)
+            .filter(
+                (PaintWeldChainLink.painted_order_id.in_(page_order_ids))
+                | (PaintWeldChainLink.welded_order_id.in_(page_order_ids))
+            )
+            .all()
+        )
+        if chain_links:
+            counterpart_order_ids = sorted(
+                {int(link.painted_order_id) for link in chain_links}
+                | {int(link.welded_order_id) for link in chain_links}
+            )
+            product_by_order: Dict[int, int] = {}
+            for pid, oid in (
+                db.query(ProductionProduct.product_id, ProductionProduct.order_id)
+                .filter(ProductionProduct.order_id.in_(counterpart_order_ids))
+                .order_by(
+                    ProductionProduct.order_id.asc(),
+                    ProductionProduct.line_number.asc(),
+                    ProductionProduct.product_id.asc(),
+                )
+                .all()
+            ):
+                product_by_order.setdefault(int(oid), int(pid))
+            for link in chain_links:
+                painted_oid = int(link.painted_order_id)
+                welded_oid = int(link.welded_order_id)
+                chain_by_order_id[painted_oid] = {
+                    "role": "painted",
+                    "link_id": int(link.id),
+                    "counterpart_order_id": welded_oid,
+                    "counterpart_product_id": product_by_order.get(welded_oid),
+                }
+                chain_by_order_id[welded_oid] = {
+                    "role": "welded",
+                    "link_id": int(link.id),
+                    "counterpart_order_id": painted_oid,
+                    "counterpart_product_id": product_by_order.get(painted_oid),
+                }
+
     result: List[Dict[str, Any]] = []
     for product in rows:
         state = getattr(product, "control_state", None)
@@ -1207,6 +1254,7 @@ def list_journal(
                 "mrp_req_net_qty": req_meta.get("net_required_qty"),
                 "mrp_req_covered_qty": req_meta.get("covered_qty"),
                 "mrp_req_remaining_qty": req_meta.get("remaining_qty"),
+                "paint_weld_chain": chain_by_order_id.get(int(product.order_id)),
             }
         )
 

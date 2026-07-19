@@ -98,6 +98,15 @@ export function ProductionControlPage() {
   const [produceError, setProduceError] = useState('')
   const [produceDryRunPayload, setProduceDryRunPayload] = useState<string | null>(null)
   const [produceProductId, setProduceProductId] = useState<number | null>(null)
+  const [chainOpen, setChainOpen] = useState(false)
+  const [chainRowId, setChainRowId] = useState<number | null>(null)
+  const [chainPreview, setChainPreview] = useState<Record<string, any> | null>(null)
+  const [chainWeldOps, setChainWeldOps] = useState<ProductionOperationOption[]>([])
+  const [chainPaintOps, setChainPaintOps] = useState<ProductionOperationOption[]>([])
+  const [chainOperationEmployees, setChainOperationEmployees] = useState<Record<number, string>>({})
+  const [chainLoading, setChainLoading] = useState(false)
+  const [chainSaving, setChainSaving] = useState(false)
+  const [chainError, setChainError] = useState('')
   const [warehousePickerOpen, setWarehousePickerOpen] = useState(false)
   const [warehousePickerCandidates, setWarehousePickerCandidates] = useState<WarehouseCandidate[]>([])
   const [warehousePickerComponents, setWarehousePickerComponents] = useState<Array<{ item_name: string; item_article?: string | null; required_qty: number }>>([])
@@ -563,6 +572,91 @@ export function ProductionControlPage() {
     void loadProduceOperations(row.product_id)
   }
 
+  async function openChainDialog() {
+    if (selectedRows.length !== 1 || !selectedRows[0].paint_weld_chain) {
+      setError('Выберите одну строку цепочки окраска↔сварка.')
+      return
+    }
+    const row = selectedRows[0]
+    setActiveId(row.product_id)
+    setChainRowId(row.product_id)
+    setChainPreview(null)
+    setChainWeldOps([])
+    setChainPaintOps([])
+    setChainOperationEmployees({})
+    setChainError('')
+    setChainOpen(true)
+    setChainLoading(true)
+    try {
+      const preview = await api<Record<string, any>>('/v1/paint-weld/chain/close', {
+        method: 'POST',
+        body: JSON.stringify({ product_id: row.product_id, dry_run: true }),
+      })
+      setChainPreview(preview)
+      void loadEmployees()
+      const weldProductId = Number(preview?.weld?.product_id)
+      const paintProductId = Number(preview?.paint?.product_id)
+      const [weldOps, paintOps] = await Promise.all([
+        weldProductId && Number(preview?.weld?.qty_to_produce ?? 0) > 0
+          ? api<ProductionOperationsResponse>(`/v1/production-control/orders/${weldProductId}/operations`)
+          : Promise.resolve({ rows: [], total: 0 } as ProductionOperationsResponse),
+        paintProductId && Number(preview?.paint?.qty_to_produce ?? 0) > 0
+          ? api<ProductionOperationsResponse>(`/v1/production-control/orders/${paintProductId}/operations`)
+          : Promise.resolve({ rows: [], total: 0 } as ProductionOperationsResponse),
+      ])
+      setChainWeldOps(weldOps.rows ?? [])
+      setChainPaintOps(paintOps.rows ?? [])
+    } catch (e) {
+      setChainError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setChainLoading(false)
+    }
+  }
+
+  function chainExecutorRows(operations: ProductionOperationOption[]) {
+    return operations.map((operation) => ({
+      line_number: operation.line_number,
+      spec_operation_id: operation.spec_operation_id,
+      operation_id: operation.operation_id,
+      employee_ref1c: chainOperationEmployees[operation.spec_operation_id] || '',
+    }))
+  }
+
+  async function submitChainClose() {
+    if (!chainRowId) return
+    setChainSaving(true)
+    setChainError('')
+    try {
+      const result = await api<Record<string, any>>('/v1/paint-weld/chain/close', {
+        method: 'POST',
+        body: JSON.stringify({
+          product_id: chainRowId,
+          dry_run: false,
+          allow_production: true,
+          weld_operation_executors: chainWeldOps.length ? chainExecutorRows(chainWeldOps) : undefined,
+          paint_operation_executors: chainPaintOps.length ? chainExecutorRows(chainPaintOps) : undefined,
+          initiated_by: 'erp-shell-chain-close',
+        }),
+      })
+      const piecework = (result.piecework_export ?? {}) as Record<string, any>
+      if (result.status !== 'ok' || (piecework.status && !['ok', 'existing'].includes(String(piecework.status)))) {
+        const detail = String(piecework.error ?? '') || firstExportProblem(piecework, result.manufactures_export as Record<string, unknown>)
+        throw new Error(`Цепочка закрыта частично.${detail ? ` ${detail}` : ''}`)
+      }
+      const ref = String(piecework.target_ref_key ?? '')
+      setMessage(
+        `Цепочка закрыта: комбинированный сдельный${ref ? ` (${ref.slice(0, 8)}…)` : ''}, оба заказа завершены в 1С.`,
+      )
+      setChainOpen(false)
+      setSelectedIds(new Set())
+      await load(offsetRef.current)
+    } catch (e) {
+      setChainError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setChainSaving(false)
+    }
+  }
+
   async function submitProduce() {
     if (!produceRow) return
     if (Number(produceRow.remaining_qty ?? 0) <= 0) {
@@ -901,6 +995,7 @@ export function ProductionControlPage() {
           onExportTo1C={() => void exportTo1C()}
           onSyncFrom1C={() => void syncFrom1C()}
           onProduce={() => openProduceDialog()}
+          onCloseChain={() => void openChainDialog()}
           onPrintSelected={() => printRows(Array.from(selectedIds))}
           onDeleteSelected={() => void deleteSelectedLocalOrders()}
           onOpenSettings={() => void openSettings()}
@@ -1060,6 +1155,83 @@ export function ProductionControlPage() {
                 disabled={!canProduceRow || produceSaving || employeesLoading || produceOperationsLoading || (employees.length > 0 && (produceOperations.length ? !allOperationExecutorsSelected : !produceEmployeeRef))}
               >
                 {produceSaving ? 'Создаём...' : produceDryRun ? 'Показать payload' : 'Создать в 1С'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {chainOpen && (
+        <div className="dialogOverlay" onClick={(e) => { if (e.target === e.currentTarget && !chainSaving) setChainOpen(false) }}>
+          <div className="dialogBox">
+            <div className="dialogHeader">Закрыть цепочку окраска↔сварка</div>
+            <div className="dialogBody">
+              {chainError && <div className="dialogError">{chainError}</div>}
+              {chainLoading && <div className="fieldHint">Загрузка предпросмотра...</div>}
+              {chainPreview && (
+                <>
+                  <div className="fieldHint">
+                    Будут созданы выпуски по обеим строкам, СборкаЗапасов обоих заказов и один
+                    комбинированный сдельный наряд (основание — окрасочная сборка). Оба заказа
+                    будут завершены в 1С.
+                  </div>
+                  {([
+                    ['Сварка', chainPreview.weld, chainWeldOps],
+                    ['Окраска', chainPreview.paint, chainPaintOps],
+                  ] as Array<[string, Record<string, any>, ProductionOperationOption[]]>).map(([label, side, ops]) => (
+                    <div className="dialogField" key={label}>
+                      <label>
+                        {label}: {Number(side?.qty_to_produce ?? 0) > 0
+                          ? `выпуск ${Number(side.qty_to_produce).toLocaleString('ru-RU')} шт`
+                          : `выпуск уже создан (№${side?.existing_manufacture_id ?? '—'})`}
+                      </label>
+                      {ops.length > 0 && (
+                        <div className="operationExecutorList">
+                          {ops.map((operation) => (
+                            <div className="operationExecutorRow" key={operation.spec_operation_id}>
+                              <div className="operationExecutorMeta">
+                                <strong>{operation.line_number}. {operation.operation_name || 'Операция'}</strong>
+                                <span>{operation.stage_name || 'Этап не указан'} · норма {Number(operation.time_norm ?? 0).toLocaleString('ru-RU')}</span>
+                              </div>
+                              <select
+                                value={chainOperationEmployees[operation.spec_operation_id] || ''}
+                                onChange={(e) => setChainOperationEmployees((current) => ({
+                                  ...current,
+                                  [operation.spec_operation_id]: e.target.value,
+                                }))}
+                                disabled={chainSaving || employeesLoading}
+                              >
+                                <option value="">{employeesLoading ? 'Загрузка сотрудников...' : 'Выберите сотрудника'}</option>
+                                {employees.map((employee) => (
+                                  <option key={employee.employee_ref1c} value={employee.employee_ref1c}>
+                                    {employee.employee_name}{employee.employee_type === 'brigade' ? ' [бригада]' : ''}{employee.employee_code ? ` (${employee.employee_code})` : ''}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </>
+              )}
+            </div>
+            <div className="dialogFooter">
+              <button onClick={() => setChainOpen(false)} disabled={chainSaving}>Отмена</button>
+              <button
+                className="primary"
+                onClick={() => void submitChainClose()}
+                disabled={
+                  chainSaving
+                  || chainLoading
+                  || !chainPreview
+                  || (employees.length > 0
+                    && [...chainWeldOps, ...chainPaintOps].some(
+                      (operation) => !chainOperationEmployees[operation.spec_operation_id],
+                    ))
+                }
+              >
+                {chainSaving ? 'Закрываем...' : 'Закрыть оба заказа в 1С'}
               </button>
             </div>
           </div>

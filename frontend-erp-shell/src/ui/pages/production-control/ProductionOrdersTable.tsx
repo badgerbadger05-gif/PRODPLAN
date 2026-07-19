@@ -82,7 +82,19 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
               className={`itemCell ${row.route_sheet_printed_at ? 'printedRouteSheetCell' : ''}`}
               title={row.route_sheet_printed_at ? `Маршрутный лист печатался ${dateRu(row.route_sheet_printed_at)}` : undefined}
             >
-              <strong title={row.item_name}>{row.item_name}</strong>
+              <strong title={row.item_name}>
+                {row.item_name}
+                {row.paint_weld_chain && (
+                  <span
+                    className="muted"
+                    title={row.paint_weld_chain.role === 'painted'
+                      ? 'Цепочка окраска↔сварка: окрасочный (родительский) заказ'
+                      : 'Цепочка окраска↔сварка: сварочный заказ (на основании окрасочного)'}
+                  >
+                    {row.paint_weld_chain.role === 'painted' ? ' ⛓🎨' : ' ⛓⚙'}
+                  </span>
+                )}
+              </strong>
               <span title={row.item_article || row.item_code || ''}>{row.item_article || row.item_code || ''}</span>
             </td>
             <td className="numCell">

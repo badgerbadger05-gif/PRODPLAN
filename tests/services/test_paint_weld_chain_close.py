@@ -352,6 +352,40 @@ def test_close_chain_live_exports_combined_and_closes_orders(db_session, monkeyp
     assert ctx["paint"]["order"].order_state_name == "Завершен"
 
 
+def test_journal_rows_carry_chain_info(db_session):
+    ctx = _setup_chain(db_session)
+    # вернуть строки в журнал: цепочка ещё не произведена/не закрыта
+    for side in ("weld", "paint"):
+        product = ctx[side]["product"]
+        product.remaining_qty = product.quantity
+        product.produced_qty = 0
+        state = (
+            db_session.query(ProductionOrderLineState)
+            .filter(ProductionOrderLineState.product_id == product.product_id)
+            .one()
+        )
+        state.status = "shortage"
+    db_session.commit()
+
+    from app.services.production_control_journal import list_journal
+
+    rows = list_journal(db_session)["rows"]
+    by_pid = {row["product_id"]: row for row in rows}
+    weld_row = by_pid[int(ctx["weld"]["product"].product_id)]
+    paint_row = by_pid[int(ctx["paint"]["product"].product_id)]
+
+    assert weld_row["paint_weld_chain"]["role"] == "welded"
+    assert weld_row["paint_weld_chain"]["counterpart_product_id"] == paint_row["product_id"]
+    assert paint_row["paint_weld_chain"]["role"] == "painted"
+    assert paint_row["paint_weld_chain"]["counterpart_product_id"] == weld_row["product_id"]
+    # строка вне цепочки — None
+    assert all(
+        row["paint_weld_chain"] is None
+        for row in rows
+        if row["product_id"] not in (weld_row["product_id"], paint_row["product_id"])
+    )
+
+
 def test_close_chain_without_link_raises(db_session):
     ctx = _setup_chain(db_session)
     solo_item = Item(
