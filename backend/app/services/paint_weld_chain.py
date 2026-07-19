@@ -566,3 +566,186 @@ def _active_pair(db: Session, painted_item_id: int) -> PaintWeldPair:
     if pair is None:
         raise ValueError(f"painted_item_id={painted_item_id}: активная пара не найдена")
     return pair
+
+
+# ---------------------------------------------------------------------------
+# Этап 4: одновременное закрытие обоих заказов цепочки из одного окна журнала.
+# Выпуски обоих строк → СборкаЗапасов обоих заказов → ОДИН комбинированный
+# СдельныйНаряд (см. one_c_piecework_export.export_chain_piecework_to_1c),
+# который закрывает оба заказа.
+# ---------------------------------------------------------------------------
+
+
+def _chain_link_for_product(
+    db: Session, product_id: int
+) -> Tuple[PaintWeldChainLink, ProductionProduct, ProductionProduct]:
+    """Найти цепочку по строке журнала (любая сторона) и оба продукта."""
+    product = (
+        db.query(ProductionProduct)
+        .filter(ProductionProduct.product_id == int(product_id))
+        .one_or_none()
+    )
+    if product is None:
+        raise ValueError(f"product_id={product_id}: строка заказа не найдена")
+    link = (
+        db.query(PaintWeldChainLink)
+        .filter(
+            (PaintWeldChainLink.painted_order_id == int(product.order_id))
+            | (PaintWeldChainLink.welded_order_id == int(product.order_id))
+        )
+        .first()
+    )
+    if link is None:
+        raise ValueError(
+            f"product_id={product_id}: цепочка окраска↔сварка для этой строки не найдена"
+        )
+
+    def _first_product(order_id: int) -> ProductionProduct:
+        row = (
+            db.query(ProductionProduct)
+            .filter(ProductionProduct.order_id == int(order_id))
+            .order_by(ProductionProduct.line_number.asc(), ProductionProduct.product_id.asc())
+            .first()
+        )
+        if row is None:
+            raise ValueError(f"order_id={order_id}: в заказе цепочки нет строк")
+        return row
+
+    return (
+        link,
+        _first_product(int(link.painted_order_id)),
+        _first_product(int(link.welded_order_id)),
+    )
+
+
+def _latest_manufacture(db: Session, product_id: int) -> Optional["ProductionManufacture"]:
+    from ..models import ProductionManufacture
+
+    return (
+        db.query(ProductionManufacture)
+        .filter(ProductionManufacture.product_id == int(product_id))
+        .filter(ProductionManufacture.status != "cancelled")
+        .order_by(ProductionManufacture.manufacture_id.desc())
+        .first()
+    )
+
+
+def close_paint_chain(
+    db: Session,
+    *,
+    product_id: int,
+    weld_qty: Optional[float] = None,
+    paint_qty: Optional[float] = None,
+    executor: Optional[str] = None,
+    weld_operation_executors: Optional[Any] = None,
+    paint_operation_executors: Optional[Any] = None,
+    comment: Optional[str] = None,
+    dry_run: bool = True,
+    allow_production: bool = False,
+    initiated_by: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Закрыть цепочку «окраска↔сварка» одним действием из окна журнала.
+
+    Порядок (dry_run=False): выпуск сварочной строки → выпуск окрасочной →
+    экспорт обеих СборкаЗапасов → один комбинированный СдельныйНаряд
+    (основание — окрасочная СборкаЗапасов), закрывающий оба заказа.
+
+    Количества по умолчанию — remaining_qty строк; если сторона уже
+    произведена полностью, переиспользуется её последний выпуск. Требования
+    штатного produce_line (проведённые перемещения материалов) сохраняются.
+
+    dry_run=True — предпросмотр: что будет произведено и, если оба выпуска уже
+    существуют, payload комбинированного сдельного.
+    """
+    from .one_c_manufacture_export import export_manufactures_to_1c
+    from .one_c_piecework_export import export_chain_piecework_to_1c
+
+    link, paint_product, weld_product = _chain_link_for_product(db, product_id)
+
+    def _plan_side(
+        product: ProductionProduct, qty: Optional[float]
+    ) -> Dict[str, Any]:
+        remaining = _to_float(product.remaining_qty)
+        planned = _to_float(qty) if qty is not None else remaining
+        existing = _latest_manufacture(db, int(product.product_id))
+        if planned <= 0 and existing is None:
+            raise ValueError(
+                f"product_id={product.product_id}: нечего закрывать — "
+                "ничего не произведено и количество к выпуску 0"
+            )
+        return {
+            "product_id": int(product.product_id),
+            "order_id": int(product.order_id),
+            "remaining_qty": remaining,
+            "qty_to_produce": planned if remaining > 0 and planned > 0 else 0.0,
+            "existing_manufacture_id": int(existing.manufacture_id) if existing else None,
+        }
+
+    weld_plan = _plan_side(weld_product, weld_qty)
+    paint_plan = _plan_side(paint_product, paint_qty)
+
+    result: Dict[str, Any] = {
+        "status": "ok",
+        "dry_run": bool(dry_run),
+        "initiated_by": initiated_by,
+        "chain_link_id": int(link.id),
+        "weld": weld_plan,
+        "paint": paint_plan,
+    }
+
+    if dry_run:
+        # Предпросмотр сдельного возможен, только если оба выпуска уже есть.
+        if weld_plan["existing_manufacture_id"] and paint_plan["existing_manufacture_id"]:
+            result["piecework_preview"] = export_chain_piecework_to_1c(
+                db,
+                weld_manufacture_id=weld_plan["existing_manufacture_id"],
+                paint_manufacture_id=paint_plan["existing_manufacture_id"],
+                dry_run=True,
+                allow_production=allow_production,
+            )
+        else:
+            result["piecework_preview"] = None
+        return result
+
+    from .production_control_production_flow import produce_line
+
+    def _ensure_manufacture(plan: Dict[str, Any], operation_executors: Any) -> int:
+        if plan["qty_to_produce"] > 0:
+            produced = produce_line(
+                db,
+                plan["product_id"],
+                qty=plan["qty_to_produce"],
+                executor=executor,
+                operation_executors=operation_executors,
+                comment=comment,
+            )
+            plan["produce"] = produced
+            return int(produced["manufacture_id"])
+        plan["produce"] = None
+        return int(plan["existing_manufacture_id"])
+
+    # Сварка первой: её выпуск — вход окраски.
+    weld_manufacture_id = _ensure_manufacture(weld_plan, weld_operation_executors)
+    paint_manufacture_id = _ensure_manufacture(paint_plan, paint_operation_executors)
+
+    manufactures_export = export_manufactures_to_1c(
+        db,
+        [weld_manufacture_id, paint_manufacture_id],
+        dry_run=False,
+        allow_production=allow_production,
+    )
+    result["manufactures_export"] = manufactures_export
+
+    piecework_export = export_chain_piecework_to_1c(
+        db,
+        weld_manufacture_id=weld_manufacture_id,
+        paint_manufacture_id=paint_manufacture_id,
+        dry_run=False,
+        allow_production=allow_production,
+    )
+    result["piecework_export"] = piecework_export
+    if piecework_export.get("status") not in ("ok", "existing"):
+        result["status"] = "partial_error"
+    db.commit()
+    return result

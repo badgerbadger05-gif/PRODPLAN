@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..services import paint_weld_pairs as service
-from ..services.paint_weld_chain import open_paint_chain
+from ..services.paint_weld_chain import close_paint_chain, open_paint_chain
 
 router = APIRouter(prefix="/v1/paint-weld", tags=["paint-weld"])
 
@@ -33,6 +33,21 @@ class ChainPreviewPayload(BaseModel):
 
 class ChainOpenPayload(ChainPreviewPayload):
     # Preview/confirm pattern as in DBR materialization: dry_run defaults to True.
+    dry_run: bool = True
+    allow_production: bool = False
+    initiated_by: Optional[str] = None
+
+
+class ChainClosePayload(BaseModel):
+    """Закрытие цепочки из окна журнала (этап 4): любая сторона цепочки."""
+
+    product_id: int
+    weld_qty: Optional[float] = None
+    paint_qty: Optional[float] = None
+    executor: Optional[str] = None
+    weld_operation_executors: Optional[list] = None
+    paint_operation_executors: Optional[list] = None
+    comment: Optional[str] = None
     dry_run: bool = True
     allow_production: bool = False
     initiated_by: Optional[str] = None
@@ -111,6 +126,31 @@ async def chain_open(payload: ChainOpenPayload, db: Session = Depends(get_db)):
             qty=payload.qty,
             planned_start=payload.planned_start,
             planned_finish=payload.planned_finish,
+            dry_run=bool(payload.dry_run),
+            allow_production=bool(payload.allow_production) or not bool(payload.dry_run),
+            initiated_by=payload.initiated_by,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/chain/close", response_model=dict)
+async def chain_close(payload: ChainClosePayload, db: Session = Depends(get_db)):
+    """Закрыть цепочку «окраска↔сварка» одним действием: выпуски обеих строк,
+    СборкаЗапасов обоих заказов и один комбинированный сдельный наряд,
+    закрывающий оба заказа. dry_run=true — предпросмотр."""
+    try:
+        return close_paint_chain(
+            db,
+            product_id=int(payload.product_id),
+            weld_qty=payload.weld_qty,
+            paint_qty=payload.paint_qty,
+            executor=payload.executor,
+            weld_operation_executors=payload.weld_operation_executors,
+            paint_operation_executors=payload.paint_operation_executors,
+            comment=payload.comment,
             dry_run=bool(payload.dry_run),
             allow_production=bool(payload.allow_production) or not bool(payload.dry_run),
             initiated_by=payload.initiated_by,

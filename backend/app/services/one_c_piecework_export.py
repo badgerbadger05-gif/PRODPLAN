@@ -908,3 +908,268 @@ def export_piecework_to_1c(
     summary["entries"] = [asdict(e) for e in entries]
     summary["status"] = "ok" if errored == 0 else "partial_error"
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Комбинированный сдельный цепочки «окраска↔сварка» (этап 4).
+# См. .docs/paint_weld_chain_logic.md п.6: бумага одна, операции сварки и
+# окраски в одном документе, у каждой строки свой ЗаказНаПроизводство_Key и
+# участок, основание — окрасочная СборкаЗапасов, оба заказа закрываются
+# одновременно этим же экспортом.
+# ---------------------------------------------------------------------------
+
+
+def _merge_chain_payloads(
+    *, weld_payload: Dict[str, Any], paint_payload: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Слить два штатных payload'а СдельныйНаряд в один комбинированный.
+
+    Шапка (Number, Date, основание-СборкаЗапасов, ЗаказНаПроизводство_Key,
+    организация) — от окрасочного. Операции — сварочный блок, затем окрасочный;
+    каждая строка сохраняет свои заказ/участок/номенклатуру/этап. Исполнители:
+    если после слияния есть построчные — документ переводится в
+    «ВТабличнойЧасти», исполнитель из шапки каждого блока опускается в его
+    строки.
+    """
+
+    def _rows_of(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        rows = [dict(row) for row in payload.get("Операции") or []]
+        header_executor = _clean_ref1c(payload.get("Исполнитель"))
+        if payload.get("ПоложениеИсполнителя") == "ВШапке" and header_executor:
+            for row in rows:
+                row.setdefault("Исполнитель", header_executor)
+                row.setdefault(
+                    "Исполнитель_Type",
+                    payload.get("Исполнитель_Type") or "StandardODATA.Catalog_Сотрудники",
+                )
+        return rows
+
+    combined = {
+        key: value
+        for key, value in paint_payload.items()
+        if key not in ("Операции", "СоставБригады")
+    }
+    rows = _rows_of(weld_payload) + _rows_of(paint_payload)
+    for idx, row in enumerate(rows, start=1):
+        row["LineNumber"] = idx
+    combined["Операции"] = rows
+
+    has_row_executor = any(_clean_ref1c(row.get("Исполнитель")) for row in rows)
+    if has_row_executor:
+        combined["Исполнитель"] = EMPTY_REF1C
+        combined["Исполнитель_Type"] = "StandardODATA.Catalog_Сотрудники"
+        combined["ПоложениеИсполнителя"] = "ВТабличнойЧасти"
+    else:
+        brigade_rows: List[Dict[str, Any]] = []
+        seen_employees: set = set()
+        for row in (weld_payload.get("СоставБригады") or []) + (
+            paint_payload.get("СоставБригады") or []
+        ):
+            employee_key = _clean_ref1c(row.get("Сотрудник_Key"))
+            if not employee_key or employee_key in seen_employees:
+                continue
+            seen_employees.add(employee_key)
+            brigade_rows.append({**dict(row), "LineNumber": len(brigade_rows) + 1})
+        if brigade_rows:
+            combined["СоставБригады"] = brigade_rows
+
+    weld_comment = str(weld_payload.get("Комментарий") or "")
+    paint_comment = str(paint_payload.get("Комментарий") or "")
+    combined["Комментарий"] = (
+        f"{paint_comment}; {weld_comment}; комбинированный сдельный цепочки окраска↔сварка"
+    )
+    return combined
+
+
+def export_chain_piecework_to_1c(
+    db: Session,
+    *,
+    weld_manufacture_id: int,
+    paint_manufacture_id: int,
+    organization_ref: Optional[str] = None,
+    business_operation_ref: Optional[str] = None,
+    dry_run: bool = True,
+    allow_production: bool = False,
+) -> Dict[str, Any]:
+    """
+    Один комбинированный Document_СдельныйНаряд на цепочку «окраска↔сварка».
+
+    Основание — окрасочная СборкаЗапасов; строки сварки и окраски несут каждая
+    свой ЗаказНаПроизводство_Key, участок и номенклатуру. Успешный экспорт
+    закрывает ОБА заказа («Успешно», Завершен) — одно закрытие из одного окна.
+    Идемпотентно: sync_link 'piecework' пишется на оба manufacture с одним
+    target_ref_key, повтор — no-op.
+    """
+    parent_export = _chain_export_parent_manufactures(
+        db,
+        [int(weld_manufacture_id), int(paint_manufacture_id)],
+        dry_run=dry_run,
+        allow_production=allow_production,
+    )
+    entries, skipped = _collect_export_entries(
+        db, [int(weld_manufacture_id), int(paint_manufacture_id)]
+    )
+    entries_by_id = {int(entry.manufacture_id): entry for entry in entries}
+    weld_entry = entries_by_id.get(int(weld_manufacture_id))
+    paint_entry = entries_by_id.get(int(paint_manufacture_id))
+
+    summary: Dict[str, Any] = {
+        "status": "ok",
+        "dry_run": bool(dry_run),
+        "entity": PIECEWORK_ENTITY,
+        "combined": True,
+        "weld_manufacture_id": int(weld_manufacture_id),
+        "paint_manufacture_id": int(paint_manufacture_id),
+        "skipped_rows": skipped,
+        "parent_manufactures_export": parent_export,
+        "piecework_price_lookup": [],
+    }
+    if weld_entry is None or paint_entry is None:
+        summary["status"] = "error"
+        summary["error"] = "не собраны данные по обоим выпускам цепочки (см. skipped_rows)"
+        return summary
+
+    paint_link = _existing_link(db, paint_entry.manufacture_id)
+    weld_link = _existing_link(db, weld_entry.manufacture_id)
+    if paint_link and paint_link.status == "success" and (paint_link.target_ref_key or ""):
+        summary["status"] = "existing"
+        summary["target_ref_key"] = str(paint_link.target_ref_key)
+        summary["reason"] = "комбинированный сдельный уже выгружен (sync_link)"
+        return summary
+    if weld_link and weld_link.status == "success" and (weld_link.target_ref_key or ""):
+        summary["status"] = "error"
+        summary["error"] = "сварочный выпуск уже закрыт отдельным сдельным нарядом"
+        return summary
+    if paint_link and _clean_ref1c(paint_link.target_ref_key):
+        paint_entry.target_ref_key = _clean_ref1c(paint_link.target_ref_key)
+        paint_entry.reason = (
+            "повторная отправка: 1С-документ уже был создан, обновляем реквизиты и проводим"
+        )
+
+    config = _load_odata_config()
+    organization_ref = organization_ref or _config_ref1c(
+        config, "default_organization_ref1c", DEFAULT_ORGANIZATION_REF1C
+    )
+    default_structural_unit = _config_ref1c(
+        config, "default_production_structural_unit_ref1c", DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C
+    )
+    price_type_ref = _piecework_price_type_ref(config)
+
+    # Один документ — один момент времени для обоих блоков.
+    when = _current_1c_datetime()
+    weld_entry.document_datetime = when
+    paint_entry.document_datetime = when
+
+    weld_payload = _build_header_payload(
+        weld_entry,
+        operation_ref="",
+        organization_ref=organization_ref,
+        # участок построчно: сварочный блок — участок сварки
+        structural_unit_ref=weld_entry.structural_unit_ref1c or default_structural_unit,
+        business_operation_ref=business_operation_ref,
+    )
+    paint_payload = _build_header_payload(
+        paint_entry,
+        operation_ref="",
+        organization_ref=organization_ref,
+        structural_unit_ref=paint_entry.structural_unit_ref1c or default_structural_unit,
+        business_operation_ref=business_operation_ref,
+    )
+    combined = _merge_chain_payloads(weld_payload=weld_payload, paint_payload=paint_payload)
+    payload_envelope = {
+        "manufacture_id": paint_entry.manufacture_id,
+        "number": paint_entry.number,
+        "payload": combined,
+    }
+
+    if dry_run:
+        summary["entries"] = [asdict(weld_entry), asdict(paint_entry)]
+        summary["payloads"] = [payload_envelope]
+        return summary
+
+    client = _create_odata_client(
+        config,
+        OData1CClient,
+        allow_production=allow_production,
+        require_demo_base=True,
+    )
+    summary["piecework_price_lookup"].append(
+        _enrich_payload_prices_from_1c(client, paint_entry, combined, price_type_ref=price_type_ref)
+    )
+    _add_brigade_composition_to_payload(client, paint_entry, combined)
+
+    def _upsert_links(*, entry: PieceworkExportEntry, payload_hash: str, target_ref_key: Optional[str], status: str, last_error: Optional[str]) -> None:
+        # Один 1С-документ на оба выпуска: линк на каждый manufacture, чтобы
+        # штатный export_piecework_to_1c не создал дубль ни по одной стороне.
+        for manufacture_id in (int(weld_entry.manufacture_id), int(paint_entry.manufacture_id)):
+            _upsert_sync_link(
+                db,
+                SyncLink,
+                source_doctype="piecework",
+                source_id=manufacture_id,
+                target_entity=PIECEWORK_ENTITY,
+                target_number=paint_entry.number,
+                payload_hash=payload_hash,
+                target_ref_key=target_ref_key,
+                status=status,
+                last_error=last_error,
+            )
+
+    def _mark_success(entry: PieceworkExportEntry, ref_key: str) -> None:
+        _post_document_operational(
+            client,
+            entity=PIECEWORK_ENTITY,
+            ref_key=ref_key,
+            unpost_first=False,
+        )
+        patch = getattr(client, "patch", None)
+        if patch is not None and when:
+            patch(
+                f"{PIECEWORK_ENTITY}(guid'{ref_key}')",
+                {"Date": when, "Закрыт": True, "ДатаЗакрытия": when},
+            )
+        # Закрытие обоих заказов цепочки — одним действием.
+        for chain_entry in (weld_entry, paint_entry):
+            order_ref = _clean_ref1c(chain_entry.order_ref1c)
+            if not order_ref:
+                continue
+            if patch is None:
+                raise RuntimeError("OData client cannot patch production order completion state")
+            patch(
+                f"{PRODUCTION_ORDER_ENTITY}(guid'{order_ref}')",
+                {
+                    "СостояниеЗаказа_Key": DONE_STATE_KEY,
+                    "ВариантЗавершения": ORDER_COMPLETION_SUCCESS,
+                },
+            )
+            order = (
+                db.query(ProductionOrder)
+                .filter(ProductionOrder.order_id == int(chain_entry.order_id))
+                .one_or_none()
+            )
+            if order is not None:
+                order.order_state_key = DONE_STATE_KEY
+                order.order_state_name = "Завершен"
+
+    created, errored = _post_export_entries(
+        db,
+        entries=[(paint_entry, payload_envelope)],
+        client=client,
+        target_entity=PIECEWORK_ENTITY,
+        missing_ref_error=f"1C did not return Ref_Key for new {PIECEWORK_ENTITY}",
+        upsert_link=_upsert_links,
+        on_success=_mark_success,
+        on_error=lambda entry, error: None,
+        log_error=lambda entry: (
+            f"[1C chain piecework export] manufactures=({weld_manufacture_id},{paint_manufacture_id}) "
+            f"failed: {entry.error}"
+        ),
+    )
+
+    summary["created"] = created
+    summary["errored"] = errored
+    summary["entries"] = [asdict(weld_entry), asdict(paint_entry)]
+    summary["target_ref_key"] = paint_entry.target_ref_key
+    summary["status"] = "ok" if errored == 0 else "partial_error"
+    return summary
