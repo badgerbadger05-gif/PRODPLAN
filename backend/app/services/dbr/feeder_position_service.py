@@ -17,7 +17,12 @@ from ...models import (
     Item,
     ItemCategory,
 )
-from ..replenishment import is_purchase_replenishment
+from ..replenishment import (
+    REPLENISHMENT_FLOW_PRODUCTION,
+    REPLENISHMENT_FLOW_PURCHASE,
+    REPLENISHMENT_FLOW_REWORK,
+    classify_replenishment_flow,
+)
 from . import adapters, classify as classify_mod
 from .core.drum import kit as kit_mod
 from .core.feeder import adu, demand_explosion, zones
@@ -118,7 +123,11 @@ def preview_positions(db: Session, schedule_id: Optional[int] = None) -> dict[st
             node = demand_explosion.Node(demand_explosion.RECURSE)
         else:
             item = items.get(code)
-            make = bool(item and not is_purchase_replenishment(item.replenishment_method))
+            # Сквозной разворот — только для собственного производства:
+            # закупка и переработка (давальческая) — глухие границы, голая
+            # деталь под покрытой в ADU-спрос не попадает (под сигнал).
+            flow = classify_replenishment_flow(item.replenishment_method) if item else REPLENISHMENT_FLOW_PRODUCTION
+            make = flow == REPLENISHMENT_FLOW_PRODUCTION
             node = demand_explosion.Node(
                 demand_explosion.BOUNDARY,
                 warehouse,
@@ -153,7 +162,9 @@ def preview_positions(db: Session, schedule_id: Optional[int] = None) -> dict[st
         item = items.get(code)
         if item is None:
             raise ValueError(f"номенклатура {code} не найдена")
-        purchase = is_purchase_replenishment(item.replenishment_method)
+        flow = classify_replenishment_flow(item.replenishment_method)
+        purchase = flow == REPLENISHMENT_FLOW_PURCHASE
+        processing = flow == REPLENISHMENT_FLOW_REWORK
         category = category_names.get(item.category_id)
         risk = risks.get(category)
         warehouse = boundary_wh
@@ -162,7 +173,19 @@ def preview_positions(db: Session, schedule_id: Optional[int] = None) -> dict[st
         k_var = 0.25 if row.commonality >= 2 else 0.5
         optimal = float(item.optimal_batch or 0)
 
-        if purchase:
+        if processing:
+            # Питатель №3 (давальческая переработка): RT покрывает всю цепочку
+            # (мехцех → ожидание рейса → кругорейс → приёмка), квант партии —
+            # ADU × рейс-интервал (optimal_batch у этих позиций не бывает).
+            # Карточному сроку 1С не доверяем — мусор (дока §6, находка 1).
+            rt = float(settings.rt_processing_days or 0)
+            batch = float(settings.processing_trip_interval_days or 0)
+            computed = zones.compute_purchase_zones(
+                row.adu, rt, batch, k_var=k_var, supply_risk_pct=risk_pct
+            )
+            route_class = None
+            supply_type = "processing"
+        elif purchase:
             if risk and risk.receipt_warehouse_ref1c:
                 warehouse = risk.receipt_warehouse_ref1c
             rt = float(item.replenishment_time or 0)
@@ -210,7 +233,7 @@ def preview_positions(db: Session, schedule_id: Optional[int] = None) -> dict[st
                 "commonality": row.commonality,
                 "route_class": route_class,
                 "rt_days": rt,
-                "rt_source": "lead_time" if purchase else "class",
+                "rt_source": "chain" if processing else ("lead_time" if purchase else "class"),
                 "batch_days": batch,
                 "q_batch": computed.green,
                 "k_var": k_var,

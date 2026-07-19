@@ -37,7 +37,7 @@ import { StatusBar } from '../layout/StatusBar'
 
 const ZONE_LABEL: Record<string, string> = { green: 'Зелёная', yellow: 'Жёлтая', red: 'Красная' }
 const MODE_LABEL: Record<string, string> = { shelf: 'Полка', under_schedule: 'Под график' }
-const SUPPLY_LABEL: Record<string, string> = { purchase: 'Закупка', manufacture: 'Производство' }
+const SUPPLY_LABEL: Record<string, string> = { purchase: 'Закупка', manufacture: 'Производство', processing: 'Переработка' }
 const REASON_LABEL: Record<string, string> = {
   open_supply_destination_missing: 'не указан склад открытого прихода',
   stale_schedule: 'позиция рассчитана не по активному графику',
@@ -460,7 +460,7 @@ export function DbrFeederPage() {
             <option value="">Все режимы</option><option value="shelf">Полка</option><option value="under_schedule">Под график</option>
           </select>
           <select aria-label="Тип снабжения" value={filters.supply} onChange={(e) => setFilters({ ...filters, supply: e.target.value })}>
-            <option value="">Все типы</option><option value="purchase">Закупка</option><option value="manufacture">Производство</option>
+            <option value="">Все типы</option><option value="purchase">Закупка</option><option value="manufacture">Производство</option><option value="processing">Переработка</option>
           </select>
           <button onClick={applyFilters} disabled={loading}>Применить</button>
           <button onClick={resetFilters} disabled={loading}>Сбросить</button>

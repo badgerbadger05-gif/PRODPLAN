@@ -10,16 +10,27 @@ from sqlalchemy.orm import Session
 from ...models import (
     DbrDrumSchedule,
     DbrSupermarketPosition,
+    DefaultSpecification,
     IgnoredWarehouse,
     ItemWarehouseStock,
     ProductionOrder,
     ProductionProduct,
+    SpecComponent,
     StockWarehouse,
     SupplierOrder,
     SupplierOrderItem,
 )
 from ..production_control_reservations import load_reservation_state
 from .core.feeder import zones
+
+# Тип «переработка» (давальческий питатель №3) в NFP считается закупной
+# механикой: общезаводской остаток покрытой + открытые заказы переработчику
+# (штатные «Заказ поставщику» 1С — «в трубе» целиком: у подрядчика + в пути),
+# ПЛЮС цепочечное слагаемое голой детали (§4.1 питатель-3-гальваника):
+# остаток голой на выбранных складах + голая в работе (открытые заказы на
+# производство). Голая — единственный компонент «Сборка» default-спеки покрытой.
+_PURCHASE_LIKE = ("purchase", "processing")
+_BARE_COMPONENT_TYPE = "Сборка"
 
 
 def _normalize_ref(value: Any) -> str:
@@ -75,7 +86,7 @@ def _stock_by_position(
     values = {
         int(position.id): (
             enterprise.get(int(position.item_id), 0.0)
-            if position.supply_type == "purchase"
+            if position.supply_type in _PURCHASE_LIKE
             else exact.get((int(position.item_id), _normalize_ref(position.warehouse_ref1c)), 0.0)
         )
         for position in positions
@@ -83,7 +94,7 @@ def _stock_by_position(
     as_of = {
         int(position.id): (
             enterprise_as_of.get(int(position.item_id))
-            if position.supply_type == "purchase"
+            if position.supply_type in _PURCHASE_LIKE
             else exact_as_of.get(
                 (int(position.item_id), _normalize_ref(position.warehouse_ref1c))
             )
@@ -131,6 +142,10 @@ def _open_supply(
     purchase_as_of: dict[tuple[int, str], datetime | None] = {}
     purchase_null: dict[int, int] = {}
     purchase_null_as_of: dict[int, datetime | None] = {}
+    # Итог по позиции без разреза склада-назначения: для переработки «в трубе»
+    # считается весь открытый заказ переработчику, куда бы он ни приходовался.
+    purchase_total: dict[int, float] = {}
+    purchase_total_as_of: dict[int, datetime | None] = {}
     for line, order in (
         db.query(SupplierOrderItem, SupplierOrder)
         .join(SupplierOrder, SupplierOrder.order_id == SupplierOrderItem.order_id)
@@ -146,6 +161,8 @@ def _open_supply(
         item_id = int(line.item_id_ref)
         destination = _normalize_ref(line.destination_warehouse_ref1c)
         source_as_of = _latest(line.updated_at, order.updated_at)
+        purchase_total[item_id] = purchase_total.get(item_id, 0.0) + float(line.remaining_qty or 0)
+        purchase_total_as_of[item_id] = _latest(purchase_total_as_of.get(item_id), source_as_of)
         if not destination:
             purchase_null[item_id] = purchase_null.get(item_id, 0) + 1
             purchase_null_as_of[item_id] = _latest(
@@ -163,7 +180,13 @@ def _open_supply(
         position_id = int(position.id)
         item_id = int(position.item_id)
         key = (item_id, _normalize_ref(position.warehouse_ref1c))
-        if position.supply_type == "purchase":
+        if position.supply_type == "processing":
+            # Вся труба переработчика, без привязки к складу-назначению;
+            # NULL-назначения не считаются деградацией данных.
+            values[position_id] = purchase_total.get(item_id, 0.0)
+            null_counts[position_id] = 0
+            as_of[position_id] = purchase_total_as_of.get(item_id)
+        elif position.supply_type == "purchase":
             values[position_id] = purchase.get(key, 0.0)
             null_counts[position_id] = purchase_null.get(item_id, 0)
             as_of[position_id] = _latest(
@@ -178,6 +201,94 @@ def _open_supply(
     return values, null_counts, as_of
 
 
+def _bare_chain_supply(
+    db: Session,
+    positions: Iterable[DbrSupermarketPosition],
+    selected: set[str],
+) -> tuple[dict[int, float], dict[int, list[str]]]:
+    """
+    Цепочечное слагаемое NFP переработки: голая деталь (единственный компонент
+    «Сборка» default-спеки покрытой) — остаток на выбранных складах + открытые
+    производственные заказы. Возвращает (qty по position_id, заметки качества).
+    """
+    processing = [row for row in positions if row.supply_type == "processing"]
+    if not processing:
+        return {}, {}
+    item_ids = sorted({int(row.item_id) for row in processing})
+
+    default_spec: dict[int, int] = {}
+    for ds in (
+        db.query(DefaultSpecification)
+        .filter(DefaultSpecification.item_id.in_(item_ids))
+        .order_by(DefaultSpecification.id.asc())
+        .all()
+    ):
+        default_spec.setdefault(int(ds.item_id), int(ds.spec_id))
+
+    assemblies_by_spec: dict[int, list[int]] = {}
+    spec_ids = sorted(set(default_spec.values()))
+    if spec_ids:
+        for spec_id, comp_item_id in (
+            db.query(SpecComponent.spec_id, SpecComponent.item_id)
+            .filter(SpecComponent.spec_id.in_(spec_ids))
+            .filter(SpecComponent.component_type == _BARE_COMPONENT_TYPE)
+            .all()
+        ):
+            assemblies_by_spec.setdefault(int(spec_id), []).append(int(comp_item_id))
+
+    bare_by_item: dict[int, int] = {}
+    notes_by_item: dict[int, list[str]] = {}
+    for item_id in item_ids:
+        spec_id = default_spec.get(item_id)
+        assemblies = assemblies_by_spec.get(spec_id or -1, [])
+        if len(assemblies) == 1:
+            bare_by_item[item_id] = assemblies[0]
+        else:
+            notes_by_item[item_id] = [
+                "processing_bare_component_unresolved: "
+                f"{len(assemblies)} компонент(ов) «Сборка» в default-спеке"
+            ]
+
+    bare_ids = sorted(set(bare_by_item.values()))
+    bare_stock: dict[int, float] = {}
+    bare_wip: dict[int, float] = {}
+    if bare_ids:
+        for item_id, warehouse, qty in (
+            db.query(
+                ItemWarehouseStock.item_id,
+                ItemWarehouseStock.warehouse_ref1c,
+                ItemWarehouseStock.qty,
+            )
+            .filter(ItemWarehouseStock.item_id.in_(bare_ids))
+            .all()
+        ):
+            if _normalize_ref(warehouse) in selected:
+                bare_stock[int(item_id)] = bare_stock.get(int(item_id), 0.0) + float(qty or 0)
+        for (item_id, remaining) in (
+            db.query(ProductionProduct.item_id, ProductionProduct.remaining_qty)
+            .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+            .filter(
+                ProductionProduct.item_id.in_(bare_ids),
+                ProductionProduct.remaining_qty > 0,
+                ProductionOrder.deletion_mark.is_(False),
+            )
+            .all()
+        ):
+            bare_wip[int(item_id)] = bare_wip.get(int(item_id), 0.0) + float(remaining or 0)
+
+    chain_qty: dict[int, float] = {}
+    chain_notes: dict[int, list[str]] = {}
+    for row in processing:
+        item_id = int(row.item_id)
+        bare_id = bare_by_item.get(item_id)
+        if bare_id is None:
+            chain_qty[int(row.id)] = 0.0
+            chain_notes[int(row.id)] = notes_by_item.get(item_id, [])
+            continue
+        chain_qty[int(row.id)] = bare_stock.get(bare_id, 0.0) + bare_wip.get(bare_id, 0.0)
+    return chain_qty, chain_notes
+
+
 def live_nfp_rows(db: Session, positions: Iterable[DbrSupermarketPosition]) -> dict[int, dict[str, Any]]:
     positions = list(positions)
     if not positions:
@@ -185,6 +296,7 @@ def live_nfp_rows(db: Session, positions: Iterable[DbrSupermarketPosition]) -> d
     item_ids = {int(row.item_id) for row in positions}
     stocks, stock_as_of, selected_warehouses = _stock_by_position(db, positions)
     supplies, null_supply, supply_as_of = _open_supply(db, positions)
+    chain_supply, chain_notes = _bare_chain_supply(db, positions, selected_warehouses)
     reservation_state = load_reservation_state(db, item_ids=item_ids)
     reservations: dict[tuple[str, int], float] = {}
     for (warehouse, item_id), qty in reservation_state.by_warehouse_item.items():
@@ -201,8 +313,9 @@ def live_nfp_rows(db: Session, positions: Iterable[DbrSupermarketPosition]) -> d
         position_id = int(position.id)
         stock = stocks.get(position_id, 0.0)
         open_supply = supplies.get(position_id, 0.0)
+        chain_qty = chain_supply.get(position_id, 0.0)
         item_id = int(position.item_id)
-        if position.supply_type == "purchase":
+        if position.supply_type in _PURCHASE_LIKE:
             qualified_demand = sum(
                 qty
                 for (warehouse, reserved_item_id), qty in reservations.items()
@@ -212,7 +325,7 @@ def live_nfp_rows(db: Session, positions: Iterable[DbrSupermarketPosition]) -> d
             qualified_demand = reservations.get(
                 (_normalize_ref(position.warehouse_ref1c), item_id), 0.0
             )
-        nfp = stock + open_supply - qualified_demand
+        nfp = stock + open_supply + chain_qty - qualified_demand
         position_zones = zones.Zones(
             red=float(position.red_qty or 0),
             yellow=float(position.yellow_qty or 0),
@@ -220,6 +333,9 @@ def live_nfp_rows(db: Session, positions: Iterable[DbrSupermarketPosition]) -> d
         )
         missing_reasons: list[str] = []
         quality = list(position.data_quality or [])
+        if chain_notes.get(position_id):
+            missing_reasons.append("processing_bare_component_unresolved")
+            quality.extend(chain_notes[position_id])
         if null_supply.get(position_id, 0):
             missing_reasons.append("open_supply_destination_missing")
             quality.append(
@@ -234,6 +350,7 @@ def live_nfp_rows(db: Session, positions: Iterable[DbrSupermarketPosition]) -> d
         result[position_id] = {
             "stock_qty": stock,
             "open_supply_qty": open_supply,
+            "chain_supply_qty": chain_qty,
             "qualified_demand_qty": qualified_demand,
             "nfp": nfp,
             "zone": zones.nfp_zone(nfp, position_zones),
@@ -241,7 +358,11 @@ def live_nfp_rows(db: Session, positions: Iterable[DbrSupermarketPosition]) -> d
             "is_complete": not missing_reasons,
             "missing_reasons": missing_reasons,
             "data_quality": quality,
-            "formula": "stock_qty + open_supply_qty - qualified_demand_qty",
+            "formula": (
+                "stock_qty + open_supply_qty + chain_supply_qty - qualified_demand_qty"
+                if position.supply_type == "processing"
+                else "stock_qty + open_supply_qty - qualified_demand_qty"
+            ),
             "timestamps": {
                 "stock_as_of": stock_as_of.get(position_id),
                 "supply_as_of": supply_as_of.get(position_id),

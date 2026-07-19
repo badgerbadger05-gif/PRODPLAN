@@ -1077,6 +1077,11 @@ class DbrSettings(Base):
     # Feeder chain
     feeder_chain_enabled = Column(Boolean, nullable=False, default=False, server_default=text("false"))
     feeder_load_horizon_weeks = Column(Integer, nullable=False, default=4, server_default="4")
+    # Давальческая переработка (питатель №3, фаза 4): RT всей цепочки
+    # (мехцех → ожидание рейса → кругорейс → приёмка) и рейс-интервал (квант
+    # партии = ADU × интервал). См. питатель-3-гальваника-round-trip.md.
+    rt_processing_days = Column(Integer, nullable=False, default=25, server_default="25")
+    processing_trip_interval_days = Column(Integer, nullable=False, default=7, server_default="7")
     # Shelf warehouses (roles): №2 (mechshop WIP), №3 (painted), №4 (hull #2).
     # FK-semantics on stock_warehouses.warehouse_ref1c, but no hard FK.
     w2_warehouse_ref1c = Column(String(36), nullable=True)
@@ -1156,9 +1161,9 @@ class DbrSupermarketPosition(Base):
         CheckConstraint("k_var >= 0", name="ck_dbr_supermarket_position_k_var_nonnegative"),
         CheckConstraint("k_var <= 1", name="ck_dbr_supermarket_position_k_var_bounded"),
         CheckConstraint("supply_risk_pct >= 0", name="ck_dbr_supermarket_position_supply_risk_nonnegative"),
-        CheckConstraint("supply_type IN ('manufacture', 'purchase')", name="ck_dbr_supermarket_position_supply_type_allowed"),
+        CheckConstraint("supply_type IN ('manufacture', 'purchase', 'processing')", name="ck_dbr_supermarket_position_supply_type_allowed"),
         CheckConstraint("mode IN ('shelf', 'under_schedule')", name="ck_dbr_supermarket_position_mode_allowed"),
-        CheckConstraint("rt_source IN ('class', 'lead_time')", name="ck_dbr_supermarket_position_rt_source_allowed"),
+        CheckConstraint("rt_source IN ('class', 'lead_time', 'chain')", name="ck_dbr_supermarket_position_rt_source_allowed"),
         CheckConstraint("red_qty >= 0 AND yellow_qty >= 0 AND green_qty >= 0 AND target_qty >= 0", name="ck_dbr_supermarket_position_zones_nonnegative"),
     )
 

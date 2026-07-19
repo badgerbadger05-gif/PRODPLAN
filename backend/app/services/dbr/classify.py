@@ -44,7 +44,11 @@ from ...models import (
     Specification,
     WorkshopWarehouseBinding,
 )
-from ..replenishment import is_purchase_replenishment
+from ..replenishment import (
+    REPLENISHMENT_FLOW_PURCHASE,
+    REPLENISHMENT_FLOW_REWORK,
+    classify_replenishment_flow,
+)
 from .core.drum import kit as kit_mod
 
 
@@ -55,6 +59,7 @@ class ItemMeta:
     item_code: str
     is_fastener: bool = False
     is_purchase: bool = False
+    is_processing: bool = False
     is_w2_blank: bool = False
     has_w3_shelf: bool = False
     has_spec: bool = False
@@ -83,7 +88,10 @@ def classify_meta(
         raise ValueError(
             f"{meta.item_code}: не настроена обязательная роль склад №2 (W2)"
         )
-    if meta.is_purchase:
+    if meta.is_purchase or meta.is_processing:
+        # Переработка (давальческая, питатель №3): покрытая деталь оседает на
+        # полке №4, как закупная — кит останавливается на границе, голая деталь
+        # под ней в спрос не разворачивается (изготавливается под сигнал).
         if w4_wh:
             return kit_mod.W4, w4_wh, None
         raise ValueError(
@@ -170,7 +178,9 @@ def build_classifier(db: Session, settings):
             return ItemMeta(code)
         iid = int(item.item_id)
         is_fastener = bool(item.category_id is not None and cat_name.get(item.category_id) in fastener_names)
-        is_purchase = is_purchase_replenishment(item.replenishment_method)
+        flow = classify_replenishment_flow(item.replenishment_method)
+        is_purchase = flow == REPLENISHMENT_FLOW_PURCHASE
+        is_processing = flow == REPLENISHMENT_FLOW_REWORK
         spec_id = default_spec.get(iid)
         has_spec = spec_id is not None
         kind = spec_kind.get(spec_id) if spec_id is not None else None
@@ -180,6 +190,7 @@ def build_classifier(db: Session, settings):
             item_code=code,
             is_fastener=is_fastener,
             is_purchase=is_purchase,
+            is_processing=is_processing,
             is_w2_blank=is_w2,
             has_w3_shelf=has_w3,
             has_spec=has_spec,
