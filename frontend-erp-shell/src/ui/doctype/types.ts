@@ -136,7 +136,7 @@ export type CsvExportConfig<Row> = {
   visibleColumnsOnly?: boolean
 }
 
-export type Doctype<Row, Filters, Detail = never> = {
+export type Doctype<Row, Filters extends object, Detail = never> = {
   meta: {
     name: string
     title: string
@@ -145,13 +145,17 @@ export type Doctype<Row, Filters, Detail = never> = {
     idField: keyof Row
     selectionMode?: 'none' | 'single' | 'multiple'
     exportCsv?: boolean | CsvExportConfig<Row>
+    emptyLabel?: string | ((context: {
+      filters: Filters
+      listMeta: Record<string, unknown>
+    }) => string)
   }
   initialFilters: Filters
   dataSource: {
     list(params: ListParams<Filters>, signal?: AbortSignal): Promise<ListResult<Row>>
     detail?(id: RowId, signal?: AbortSignal): Promise<Detail>
   }
-  columns: Array<DoctypeColumn<Row>>
+  columns: Array<DoctypeColumn<Row, Filters>>
   filters?: Array<FilterDef<Filters>>
   actions?: Array<ActionDef<Row>>
   detail?: DetailLayout<Detail | Row>

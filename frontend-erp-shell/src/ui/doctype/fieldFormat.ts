@@ -58,7 +58,10 @@ export function formatField(
   }
 }
 
-export function columnValue<Row>(column: DoctypeColumn<Row>, row: Row) {
+export function columnValue<Row>(
+  column: Pick<DoctypeColumn<Row>, 'key' | 'value'>,
+  row: Row,
+) {
   if (column.value) return column.value(row)
   return (row as Record<string, unknown>)[column.key]
 }

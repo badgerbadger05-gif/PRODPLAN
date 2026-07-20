@@ -54,9 +54,13 @@ export function DoctypePage<Row, Filters extends object, Detail>({
   const [searchParams, setSearchParams] = useSearchParams()
   const columnOptions = useMemo(
     () => doctype.columns
+      .filter((column) => column.visible?.({
+        filters: state.filters,
+        listMeta: state.listMeta,
+      }) !== false)
       .filter((column) => canViewField(doctype.permissions, column.key, access))
       .map(({ key, title }) => ({ key, title })),
-    [access, doctype.columns, doctype.permissions],
+    [access, doctype.columns, doctype.permissions, state.filters, state.listMeta],
   )
   const allColumnKeys = useMemo(() => columnOptions.map(({ key }) => key), [columnOptions])
   const [visibleColumns, setVisibleColumns] = useState<readonly string[]>(allColumnKeys)
@@ -83,12 +87,19 @@ export function DoctypePage<Row, Filters extends object, Detail>({
     const rows = config.rows === 'current-page'
       ? state.rows
       : state.selection.length ? state.selection : state.rows
-    const csv = buildDoctypeCsv({ doctype, rows, visibleColumns, access })
+    const csv = buildDoctypeCsv({
+      doctype,
+      rows,
+      visibleColumns,
+      access,
+      filters: state.filters,
+      listMeta: state.listMeta,
+    })
     const configuredName = typeof doctype.meta.exportCsv === 'object'
       ? doctype.meta.exportCsv.filename
       : undefined
     downloadCsv(csv, configuredName ?? `${doctype.meta.name}.csv`)
-  }, [access, doctype, state.rows, state.selection, visibleColumns])
+  }, [access, doctype, state.filters, state.listMeta, state.rows, state.selection, visibleColumns])
   const resourceShortcuts = useMemo<KeyboardShortcut[]>(() => [
     {
       id: `${doctype.meta.name}-reload`,

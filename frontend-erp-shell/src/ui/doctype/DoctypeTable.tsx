@@ -50,9 +50,17 @@ export function DoctypeTable<Row, Filters extends object, Detail>({
   access,
 }: Props<Row, Filters, Detail>) {
   const idOf = (row: Row) => row[doctype.meta.idField] as string | number
+  const presentationContext = { filters: state.filters, listMeta: state.listMeta }
   const columns = visibleColumns
-    ? doctype.columns.filter((column) => visibleColumns.includes(column.key) && canViewField(doctype.permissions, column.key, access))
-    : doctype.columns.filter((column) => canViewField(doctype.permissions, column.key, access))
+    ? doctype.columns.filter((column) => (
+      visibleColumns.includes(column.key)
+      && column.visible?.(presentationContext) !== false
+      && canViewField(doctype.permissions, column.key, access)
+    ))
+    : doctype.columns.filter((column) => (
+      column.visible?.(presentationContext) !== false
+      && canViewField(doctype.permissions, column.key, access)
+    ))
   const rows = state.rows.filter((row) => canViewRecord(doctype.permissions, row, access))
   const visibleIds = rows
     .filter((row) => doctype.selectable?.(row) !== false)
@@ -105,6 +113,15 @@ export function DoctypeTable<Row, Filters extends object, Detail>({
           </tr>
         </thead>
         <tbody>
+          {!rows.length && (
+            <tr>
+              <td colSpan={Math.max(1, columns.length)} className="emptyDetail">
+                {typeof doctype.meta.emptyLabel === 'function'
+                  ? doctype.meta.emptyLabel(presentationContext)
+                  : doctype.meta.emptyLabel ?? 'Нет данных'}
+              </td>
+            </tr>
+          )}
           {rows.map((row, rowIndex) => {
             const id = idOf(row)
             const active = state.activeRow ? idOf(state.activeRow) === id : false

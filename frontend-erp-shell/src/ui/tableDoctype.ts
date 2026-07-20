@@ -34,11 +34,15 @@ export type TableColumnDoctype = {
   sortable?: boolean
 }
 
-export type DoctypeColumn<Row> = TableColumnDoctype & {
+export type DoctypeColumn<Row, Filters extends object = Record<string, unknown>> = TableColumnDoctype & {
   type?: FieldType
   value?: (row: Row) => unknown
   options?: Record<string, FieldOption>
   render?: (row: Row) => ReactNode
+  visible?: (context: {
+    filters: Filters
+    listMeta: Record<string, unknown>
+  }) => boolean
 }
 
 export type TableSortState<TKey extends string = string> = {

@@ -19,11 +19,15 @@ export function buildDoctypeCsv<Row, Filters extends object, Detail>({
   rows,
   visibleColumns,
   access,
+  filters,
+  listMeta,
 }: {
   doctype: Doctype<Row, Filters, Detail>
   rows: readonly Row[]
   visibleColumns: readonly string[]
   access: AccessSubject
+  filters?: Filters
+  listMeta?: Record<string, unknown>
 }) {
   const config = typeof doctype.meta.exportCsv === 'object' ? doctype.meta.exportCsv : {}
   const delimiter = config.delimiter ?? ','
@@ -41,6 +45,10 @@ export function buildDoctypeCsv<Row, Filters extends object, Detail>({
       .filter((column) => (
         column.type !== 'select-checkbox'
         && visibleColumns.includes(column.key)
+        && column.visible?.({
+          filters: filters ?? doctype.initialFilters,
+          listMeta: listMeta ?? {},
+        }) !== false
         && canViewField(doctype.permissions, column.key, access)
       ))
       .map((column) => ({
