@@ -799,6 +799,10 @@ class PlanningRun(Base):
     period_to = Column(Date, nullable=True, index=True)
     fixed_at = Column(TIMESTAMP, nullable=True)
     prior_run_id = Column(Integer, ForeignKey("planning_run.run_id", ondelete="SET NULL"), nullable=True, index=True)
+    # Ledger v2 (Increment 1, additive) — currently active baseline version for
+    # this run. Default-1 semantics arrive with the freeze writer (later
+    # increment); nullable now so existing rows are untouched.
+    active_freeze_version = Column(Integer, nullable=True)
 
     prior_run = relationship("PlanningRun", remote_side=[run_id])
 
@@ -894,11 +898,22 @@ class MrpRequirement(Base):
     period_from = Column(Date, nullable=False, index=True)
     period_to = Column(Date, nullable=False, index=True)
     bom_level = Column(Integer, nullable=False, default=0)
+    # Phase-1 execution-ledger columns. NB (ledger v2): executed_qty and
+    # initial_snapshot_stock become *derived caches* in later increments
+    # (executed_qty = Σ mrp_execution_allocation rows with kind='execution');
+    # no behavior change here, kept as-is for backward compatibility.
     executed_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
     carried_remaining = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
     initial_snapshot_stock = Column(DECIMAL(15, 3), nullable=True)
     status = Column(String(20), nullable=False, default="open", server_default="open", index=True)
     closed_at = Column(TIMESTAMP, nullable=True)
+    # Ledger v2 (Increment 1, additive) — freeze/pool qualification. Unread by
+    # logic yet; defaults keep existing rows/behavior unchanged.
+    freeze_version = Column(Integer, nullable=True)
+    drift_adjustment_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    characteristic_ref = Column(String(36), nullable=True)
+    organization_ref = Column(String(36), nullable=True)
+    planning_stock_pool = Column(String(64), nullable=True)
     created_at = Column(TIMESTAMP, default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -1548,3 +1563,283 @@ class PaintWeldChainLink(Base):
     )
     pair_id = Column(Integer, ForeignKey("paint_weld_pairs.id"), nullable=False)
     created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+
+
+# ---------------------------------------------------------------------------
+# MRP Execution Ledger v2 — Increment 1 (ADDITIVE SCHEMA ONLY).
+#
+# See mrp-ledger-blueprint-v2.md §3. These tables model the frozen-plan
+# baseline, its allocations/BOM snapshot, the rebuilt-each-cycle execution
+# ledger, the carry trace and the drift-event log. NO logic reads them yet;
+# creating them changes zero behavior. Persisted-immutable tables (baseline /
+# freeze_allocation / freeze_component / carry) capture the moment-of-freeze
+# snapshot; the rebuildable ones (execution_allocation / drift_event) are
+# derived caches restored each cycle.
+#
+# Pool qualification (v2 §2): pool_key = (item_id, characteristic_ref,
+# organization_ref, planning_stock_pool). Pool columns are nullable here for
+# additive consistency with MrpRequirement's new pool columns; an empty
+# characteristic is a distinct key value, not a wildcard (v2 §2). See the
+# INCREMENT-1 report note on normalizing empty pool keys before these tables
+# carry data (owner decision).
+# ---------------------------------------------------------------------------
+
+
+class MrpFreezeBaseline(Base):
+    """Run-scoped, versioned frozen snapshot of a pool's supply position at
+    freeze time (v2 §3). Immutable versions: refreeze = INSERT version+1;
+    refreezing run A never touches run B."""
+
+    __tablename__ = "mrp_freeze_baseline"
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id",
+            "freeze_version",
+            "item_id",
+            "characteristic_ref",
+            "organization_ref",
+            "planning_stock_pool",
+            name="ux_mrp_freeze_baseline_pool_version",
+        ),
+        Index("ix_mrp_freeze_baseline_run_version", "run_id", "freeze_version"),
+        Index(
+            "ix_mrp_freeze_baseline_pool",
+            "item_id",
+            "characteristic_ref",
+            "organization_ref",
+            "planning_stock_pool",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(Integer, ForeignKey("planning_run.run_id", ondelete="CASCADE"), nullable=False, index=True)
+    freeze_version = Column(Integer, nullable=False)
+    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
+    characteristic_ref = Column(String(36), nullable=True)
+    organization_ref = Column(String(36), nullable=True)
+    planning_stock_pool = Column(String(64), nullable=True)
+    frozen_at = Column(TIMESTAMP, nullable=False, default=func.now(), server_default=func.now())
+    stock_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    produced_total = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    received_total = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    unit_coef = Column(DECIMAL(15, 3), nullable=False, default=1.0, server_default="1")
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+
+    run = relationship("PlanningRun")
+    item = relationship("Item")
+
+
+class MrpFreezeAllocation(Base):
+    """Coverage-carrying frozen allocation (v2 §3): binds a requirement to a
+    supply source (stock / supplier_order / wip_order). alloc_qty and source
+    are immutable; realized_qty / evaporated_qty are rewritten each cycle by
+    verify_frozen_supply. Prevents double net deduction."""
+
+    __tablename__ = "mrp_freeze_allocation"
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id",
+            "freeze_version",
+            "requirement_id",
+            "source_type",
+            "source_ref",
+            "source_line_ref",
+            name="ux_mrp_freeze_allocation_source",
+        ),
+        Index("ix_mrp_freeze_allocation_run_version", "run_id", "freeze_version"),
+        Index("ix_mrp_freeze_allocation_requirement", "requirement_id"),
+        Index(
+            "ix_mrp_freeze_allocation_pool",
+            "item_id",
+            "characteristic_ref",
+            "organization_ref",
+            "planning_stock_pool",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(Integer, ForeignKey("planning_run.run_id", ondelete="CASCADE"), nullable=False, index=True)
+    freeze_version = Column(Integer, nullable=False)
+    requirement_id = Column(Integer, ForeignKey("mrp_requirement.id", ondelete="CASCADE"), nullable=False, index=True)
+    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
+    characteristic_ref = Column(String(36), nullable=True)
+    organization_ref = Column(String(36), nullable=True)
+    planning_stock_pool = Column(String(64), nullable=True)
+    # source_type ∈ {stock, supplier_order, wip_order}. Empty string = distinct
+    # key value (not wildcard); NOT NULL keeps the UNIQUE key deterministic.
+    source_type = Column(String(32), nullable=False, server_default="")
+    source_ref = Column(String(64), nullable=False, server_default="")
+    source_line_ref = Column(String(64), nullable=False, server_default="")
+    alloc_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    fact_at_freeze = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    realized_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    evaporated_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+
+    run = relationship("PlanningRun")
+    item = relationship("Item")
+    requirement = relationship("MrpRequirement")
+
+
+class MrpFreezeComponent(Base):
+    """Frozen BOM / consumption norms (v2 §3). Writer = freeze; reader = drift
+    only (a spec/norm change after freeze does NOT create drift)."""
+
+    __tablename__ = "mrp_freeze_component"
+    __table_args__ = (
+        UniqueConstraint(
+            "run_id",
+            "freeze_version",
+            "parent_item_id",
+            "component_item_id",
+            "spec_ref",
+            name="ux_mrp_freeze_component_spec",
+        ),
+        Index("ix_mrp_freeze_component_run_version", "run_id", "freeze_version"),
+        Index("ix_mrp_freeze_component_parent", "parent_item_id"),
+        Index("ix_mrp_freeze_component_component", "component_item_id"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    run_id = Column(Integer, ForeignKey("planning_run.run_id", ondelete="CASCADE"), nullable=False, index=True)
+    freeze_version = Column(Integer, nullable=False)
+    parent_item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
+    parent_characteristic_ref = Column(String(36), nullable=True)
+    parent_organization_ref = Column(String(36), nullable=True)
+    parent_planning_stock_pool = Column(String(64), nullable=True)
+    component_item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
+    component_characteristic_ref = Column(String(36), nullable=True)
+    component_organization_ref = Column(String(36), nullable=True)
+    component_planning_stock_pool = Column(String(64), nullable=True)
+    spec_ref = Column(String(36), nullable=False, server_default="")
+    spec_version = Column(String(50), nullable=True)
+    norm_qty_per_unit = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    unit_coef = Column(DECIMAL(15, 3), nullable=False, default=1.0, server_default="1")
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+
+    run = relationship("PlanningRun")
+    parent_item = relationship("Item", foreign_keys=[parent_item_id])
+    component_item = relationship("Item", foreign_keys=[component_item_id])
+
+
+class MrpExecutionAllocation(Base):
+    """Explainable read-ledger: fact → requirement (v2 §3). Fully rebuilt each
+    cycle. kind='execution' consumes net (Σ over buckets = executed_qty);
+    kind='coverage_realization' (a fact reshaping already-counted coverage,
+    e.g. supplier→stock) does NOT count toward executed."""
+
+    __tablename__ = "mrp_execution_allocation"
+    __table_args__ = (
+        UniqueConstraint(
+            "requirement_id",
+            "bucket_id",
+            "fact_type",
+            "fact_ref",
+            "fact_line_ref",
+            "allocation_kind",
+            name="ux_mrp_execution_allocation_fact",
+        ),
+        Index("ix_mrp_execution_allocation_cycle", "cycle_id"),
+        Index("ix_mrp_execution_allocation_requirement", "requirement_id"),
+        Index("ix_mrp_execution_allocation_bucket", "bucket_id"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    cycle_id = Column(String(64), nullable=False, server_default="")
+    requirement_id = Column(Integer, ForeignKey("mrp_requirement.id", ondelete="CASCADE"), nullable=False, index=True)
+    bucket_id = Column(Integer, ForeignKey("mrp_requirement_bucket.id", ondelete="CASCADE"), nullable=True, index=True)
+    # fact_type ∈ {linked_production, unlinked_production, supplier_receipt,
+    # carry, manual_surplus, drift_surplus}; allocation_kind ∈ {execution,
+    # coverage_realization}. Empty string = distinct key value (not wildcard).
+    fact_type = Column(String(32), nullable=False, server_default="")
+    allocation_kind = Column(String(32), nullable=False, server_default="")
+    fact_ref = Column(String(64), nullable=False, server_default="")
+    fact_line_ref = Column(String(64), nullable=False, server_default="")
+    fact_date = Column(TIMESTAMP, nullable=True)
+    allocated_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    freeze_allocation_id = Column(
+        Integer, ForeignKey("mrp_freeze_allocation.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    origin_requirement_id = Column(
+        Integer, ForeignKey("mrp_requirement.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    calculated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+
+    requirement = relationship("MrpRequirement", foreign_keys=[requirement_id])
+    bucket = relationship("MrpRequirementBucket")
+    freeze_allocation = relationship("MrpFreezeAllocation")
+    origin_requirement = relationship("MrpRequirement", foreign_keys=[origin_requirement_id])
+
+
+class MrpRequirementCarry(Base):
+    """Carry trace (v2 §3): source_requirement → target_requirement. UNIQUE on
+    source_requirement_id enforces once-only + idempotent carry."""
+
+    __tablename__ = "mrp_requirement_carry"
+    __table_args__ = (
+        UniqueConstraint("source_requirement_id", name="ux_mrp_requirement_carry_source"),
+        Index("ix_mrp_requirement_carry_target", "target_requirement_id"),
+        Index(
+            "ix_mrp_requirement_carry_pool",
+            "item_id",
+            "characteristic_ref",
+            "organization_ref",
+            "planning_stock_pool",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    source_requirement_id = Column(Integer, ForeignKey("mrp_requirement.id", ondelete="CASCADE"), nullable=False)
+    target_requirement_id = Column(Integer, ForeignKey("mrp_requirement.id", ondelete="CASCADE"), nullable=False, index=True)
+    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
+    characteristic_ref = Column(String(36), nullable=True)
+    organization_ref = Column(String(36), nullable=True)
+    planning_stock_pool = Column(String(64), nullable=True)
+    carried_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    carried_at = Column(TIMESTAMP, nullable=True)
+    operator = Column(String(100), nullable=True)
+    source_run_id = Column(Integer, ForeignKey("planning_run.run_id", ondelete="SET NULL"), nullable=True, index=True)
+    target_run_id = Column(Integer, ForeignKey("planning_run.run_id", ondelete="SET NULL"), nullable=True, index=True)
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+
+    source_requirement = relationship("MrpRequirement", foreign_keys=[source_requirement_id])
+    target_requirement = relationship("MrpRequirement", foreign_keys=[target_requirement_id])
+    item = relationship("Item")
+
+
+class MrpDriftEvent(Base):
+    """Explainability of drift (v2 §3), rewritten each cycle. matured=false =
+    pending_drift (visible, not materialized)."""
+
+    __tablename__ = "mrp_drift_event"
+    __table_args__ = (
+        Index("ix_mrp_drift_event_cycle", "cycle_id"),
+        Index(
+            "ix_mrp_drift_event_pool",
+            "item_id",
+            "characteristic_ref",
+            "organization_ref",
+            "planning_stock_pool",
+        ),
+        Index("ix_mrp_drift_event_requirement", "requirement_id"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    cycle_id = Column(String(64), nullable=False, server_default="", index=True)
+    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
+    characteristic_ref = Column(String(36), nullable=True)
+    organization_ref = Column(String(36), nullable=True)
+    planning_stock_pool = Column(String(64), nullable=True)
+    # kind ∈ {shortfall, surplus, evaporation}.
+    kind = Column(String(32), nullable=False, server_default="")
+    drift_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    expected_stock = Column(DECIMAL(15, 3), nullable=True)
+    actual_stock = Column(DECIMAL(15, 3), nullable=True)
+    matured = Column(Boolean, nullable=False, default=False, server_default="false")
+    first_seen_cycle_id = Column(String(64), nullable=True)
+    requirement_id = Column(Integer, ForeignKey("mrp_requirement.id", ondelete="SET NULL"), nullable=True, index=True)
+    details = Column(CrossPlatformJSON, nullable=True)
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+
+    item = relationship("Item")
+    requirement = relationship("MrpRequirement")
