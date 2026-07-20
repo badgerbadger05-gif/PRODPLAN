@@ -21,8 +21,22 @@ import { DocumentWindow } from '../layout/DocumentWindow'
 import { RootProductFilterDialog } from '../RootProductFilterDialog'
 import { rootProductLabel, type RootProductOption } from '../rootProductOptions'
 import { StatusBar } from '../layout/StatusBar'
+import {
+  filterPurchaseRows,
+  formatActionResult,
+  isProductionRowSelectable,
+  mrpResultTotals,
+  parseMrpResultTab,
+  parsePositiveId,
+  productionSourceIds,
+  purchaseFilterOptions,
+  purchaseSourceIds,
+  supplierDisplayName,
+  toggleMany,
+  type MrpResultTab,
+} from './mrp-result/model'
 
-type Tab = 'production' | 'purchases' | 'rework' | 'capacity'
+type Tab = MrpResultTab
 
 const limit = 200
 
@@ -32,24 +46,6 @@ function emptyTabFlags(): Record<Tab, boolean> {
 
 function emptyTabOffsets(): Record<Tab, number> {
   return { production: 0, purchases: 0, rework: 0, capacity: 0 }
-}
-
-function parseTab(value: string | null): Tab | null {
-  if (value === 'production' || value === 'purchases' || value === 'rework' || value === 'capacity') return value
-  return null
-}
-
-function parseId(value: string | null) {
-  const id = Number(value)
-  return Number.isFinite(id) && id > 0 ? id : null
-}
-
-function supplierDisplayName(row: MrpPurchaseRow) {
-  return (row.supplier_name || '').trim() || 'Без наименования'
-}
-
-function supplierFilterKey(row: MrpPurchaseRow) {
-  return (row.supplier_name || '').trim() ? (row.supplier_ref1c || row.supplier_name || '') : '__missing_supplier_name'
 }
 
 function ForecastShift({ forecast }: { forecast?: { forecast_date?: string | null; forecast_shift_days?: number | null; forecast_reason?: string | null } | null }) {
@@ -68,10 +64,10 @@ export function MrpResultPage() {
   const runId = Number(runIdParam)
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
-  const queryTab = parseTab(searchParams.get('tab'))
-  const highlightedProductionId = parseId(searchParams.get('planned_order_id'))
-  const highlightedPurchaseId = parseId(searchParams.get('purchase_id'))
-  const highlightedReworkId = parseId(searchParams.get('rework_id'))
+  const queryTab = parseMrpResultTab(searchParams.get('tab'))
+  const highlightedProductionId = parsePositiveId(searchParams.get('planned_order_id'))
+  const highlightedPurchaseId = parsePositiveId(searchParams.get('purchase_id'))
+  const highlightedReworkId = parsePositiveId(searchParams.get('rework_id'))
   const [summary, setSummary] = useState<MrpSummary | null>(null)
   const [tab, setTab] = useState<Tab>(() => queryTab ?? 'production')
   const [loadedTabs, setLoadedTabs] = useState<Record<Tab, boolean>>(() => emptyTabFlags())
@@ -100,38 +96,17 @@ export function MrpResultPage() {
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
   const loadSeq = useRef(0)
+  const summarySeq = useRef(0)
+  const mutationInFlight = useRef(false)
+  const previousRunId = useRef(runId)
 
-  const purchaseSupplierOptions = useMemo(() => {
-    const map = new Map<string, string>()
-    purchaseRows.forEach((row) => {
-      const key = supplierFilterKey(row)
-      if (!key) return
-      map.set(key, supplierDisplayName(row))
-    })
-    return Array.from(map.entries()).map(([value, label]) => ({ value, label })).sort((a, b) => a.label.localeCompare(b.label, 'ru'))
-  }, [purchaseRows])
-  const purchaseCategoryOptions = useMemo(() => {
-    const map = new Map<string, string>()
-    purchaseRows.forEach((row) => {
-      const key = row.category_id !== null && row.category_id !== undefined
-        ? String(row.category_id)
-        : (row.category_ref1c || row.category_name || '')
-      if (!key) return
-      map.set(key, row.category_name || 'Без товарной группы')
-    })
-    return Array.from(map.entries()).map(([value, label]) => ({ value, label })).sort((a, b) => a.label.localeCompare(b.label, 'ru'))
-  }, [purchaseRows])
-  const filteredPurchaseRows = useMemo(() => (
-    purchaseRows.filter((row) => {
-      const supplierKey = supplierFilterKey(row)
-      const categoryKey = row.category_id !== null && row.category_id !== undefined
-        ? String(row.category_id)
-        : (row.category_ref1c || row.category_name || '')
-      if (purchaseSupplierFilter && supplierKey !== purchaseSupplierFilter) return false
-      if (purchaseCategoryFilter && categoryKey !== purchaseCategoryFilter) return false
-      return true
-    })
-  ), [purchaseCategoryFilter, purchaseRows, purchaseSupplierFilter])
+  const purchaseOptions = useMemo(() => purchaseFilterOptions(purchaseRows), [purchaseRows])
+  const purchaseSupplierOptions = purchaseOptions.suppliers
+  const purchaseCategoryOptions = purchaseOptions.categories
+  const filteredPurchaseRows = useMemo(
+    () => filterPurchaseRows(purchaseRows, purchaseSupplierFilter, purchaseCategoryFilter),
+    [purchaseCategoryFilter, purchaseRows, purchaseSupplierFilter],
+  )
   const activeOffset = offsets[tab]
   const activeTotal = tab === 'production' ? productionTotal : tab === 'purchases' ? purchaseTotal : tab === 'rework' ? reworkTotal : capacityTotal
   const activeRowsLength = tab === 'production' ? productionRows.length : tab === 'purchases' ? purchaseRows.length : tab === 'rework' ? reworkRows.length : capacityRows.length
@@ -139,22 +114,22 @@ export function MrpResultPage() {
   const activeVisibleTo = activeTotal && activeRowsLength ? Math.min(activeOffset + activeRowsLength, activeTotal) : 0
   const selectedCount = tab === 'production' ? selectedProductionIds.size : tab === 'purchases' ? selectedPurchaseIds.size : 0
 
-  const totals = useMemo(() => ({
-    productionQty: productionRows.reduce((sum, row) => sum + Number(row.qty || 0), 0),
-    purchaseQty: purchaseRows.reduce((sum, row) => sum + Number(row.qty || 0), 0),
-    reworkQty: reworkRows.reduce((sum, row) => sum + Number(row.qty || 0), 0),
-    overloadHours: capacityRows.reduce((sum, row) => sum + Number(row.overload_hours || 0), 0),
-  }), [productionRows, purchaseRows, reworkRows, capacityRows])
+  const totals = useMemo(
+    () => mrpResultTotals(productionRows, purchaseRows, reworkRows, capacityRows),
+    [productionRows, purchaseRows, reworkRows, capacityRows],
+  )
 
   useEffect(() => {
     if (queryTab) setTab(queryTab)
   }, [queryTab])
 
   const loadSummary = useCallback(async () => {
+    const seq = ++summarySeq.current
     try {
-      setSummary(await getPlanningRunSummary(runId))
+      const nextSummary = await getPlanningRunSummary(runId)
+      if (seq === summarySeq.current) setSummary(nextSummary)
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      if (seq === summarySeq.current) setError(e instanceof Error ? e.message : String(e))
     }
   }, [runId])
 
@@ -440,58 +415,13 @@ function Metric({ title, value, hint }: { title: string; value: string; hint?: s
   )
 }
 
-function formatActionResult(title: string, result: Record<string, unknown>) {
-  const created = numberValue(result.created ?? result.created_count ?? result.orders_created ?? result.exported ?? result.exported_count)
-  const existing = numberValue(result.existing ?? result.existing_count ?? result.orders_existing)
-  const skipped = countValue(result.skipped ?? result.skipped_count ?? result.skipped_rows)
-  const errors = countValue(result.errors ?? result.error_count)
-  const parts = [`${title}: выполнено`]
-  if (created) parts.push(`новых ${created}`)
-  if (existing) parts.push(`уже было ${existing}`)
-  if (skipped) parts.push(`пропущено ${skipped}`)
-  if (errors) parts.push(`ошибок ${errors}`)
-  if (parts.length > 1) return parts.join(', ')
-  return `${title}: ${JSON.stringify(result).slice(0, 220)}`
-}
-
-function numberValue(value: unknown) {
-  const number = Number(value ?? 0)
-  return Number.isFinite(number) ? number : 0
-}
-
-function countValue(value: unknown) {
-  if (Array.isArray(value)) return value.length
-  return numberValue(value)
-}
-
-function toggleMany(set: Set<number>, ids: number[], checked: boolean) {
-  const next = new Set(set)
-  ids.forEach((id) => {
-    if (checked) next.add(id)
-    else next.delete(id)
-  })
-  return next
-}
-
-function rowOrderIds(row: MrpProductionRow) {
-  return row.source_order_ids?.length ? row.source_order_ids : [row.order_id]
-}
-
-function isProductionRowSelectable(row: MrpProductionRow) {
-  return Number(row.qty || 0) > 0
-}
-
-function rowPurchaseIds(row: MrpPurchaseRow) {
-  return row.source_purchase_ids?.length ? row.source_purchase_ids : [row.purchase_id]
-}
-
 function ProductionResultTable({ rows, selectedIds, highlightedId, onSelectedIdsChange }: {
   rows: MrpProductionRow[]
   selectedIds: Set<number>
   highlightedId: number | null
   onSelectedIdsChange: (ids: Set<number>) => void
 }) {
-  const visibleIds = rows.filter(isProductionRowSelectable).flatMap(rowOrderIds)
+  const visibleIds = rows.filter(isProductionRowSelectable).flatMap(productionSourceIds)
   const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id))
 
   return (
@@ -518,13 +448,13 @@ function ProductionResultTable({ rows, selectedIds, highlightedId, onSelectedIds
       </thead>
       <tbody>
         {rows.map((row) => (
-          <tr key={row.order_id} className={highlightedId && rowOrderIds(row).includes(highlightedId) ? 'activeRow' : undefined}>
+          <tr key={row.order_id} className={highlightedId && productionSourceIds(row).includes(highlightedId) ? 'activeRow' : undefined}>
             <td className="checkCol">
               <input
                 type="checkbox"
-                checked={rowOrderIds(row).every((id) => selectedIds.has(id))}
+                checked={productionSourceIds(row).every((id) => selectedIds.has(id))}
                 disabled={!isProductionRowSelectable(row)}
-                onChange={(e) => onSelectedIdsChange(toggleMany(selectedIds, rowOrderIds(row), e.target.checked))}
+                onChange={(e) => onSelectedIdsChange(toggleMany(selectedIds, productionSourceIds(row), e.target.checked))}
                 aria-label={`Выбрать ${row.item_name || row.item_article || row.order_id}`}
               />
             </td>
@@ -568,7 +498,7 @@ function PurchaseResultTable({
   onCategoryFilterChange: (value: string) => void
   onSelectedIdsChange: (ids: Set<number>) => void
 }) {
-  const visibleIds = rows.flatMap(rowPurchaseIds)
+  const visibleIds = rows.flatMap(purchaseSourceIds)
   const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id))
 
   return (
@@ -640,12 +570,12 @@ function PurchaseResultTable({
             ? `${qty(covered)} / ${qty(requested)} ${row.unit || ''} (${coveragePct}%)`
             : '—'
           return (
-          <tr key={row.purchase_id} className={highlightedId && rowPurchaseIds(row).includes(highlightedId) ? 'activeRow' : undefined}>
+          <tr key={row.purchase_id} className={highlightedId && purchaseSourceIds(row).includes(highlightedId) ? 'activeRow' : undefined}>
             <td className="checkCol">
               <input
                 type="checkbox"
-                checked={rowPurchaseIds(row).every((id) => selectedIds.has(id))}
-                onChange={(e) => onSelectedIdsChange(toggleMany(selectedIds, rowPurchaseIds(row), e.target.checked))}
+                checked={purchaseSourceIds(row).every((id) => selectedIds.has(id))}
+                onChange={(e) => onSelectedIdsChange(toggleMany(selectedIds, purchaseSourceIds(row), e.target.checked))}
                 aria-label={`Выбрать ${row.item_name || row.item_article || row.purchase_id}`}
               />
             </td>
