@@ -798,6 +798,9 @@ class PlanningRun(Base):
     period_from = Column(Date, nullable=True, index=True)
     period_to = Column(Date, nullable=True, index=True)
     fixed_at = Column(TIMESTAMP, nullable=True)
+    prior_run_id = Column(Integer, ForeignKey("planning_run.run_id", ondelete="SET NULL"), nullable=True, index=True)
+
+    prior_run = relationship("PlanningRun", remote_side=[run_id])
 
 
 class PlannedOrder(Base):
@@ -891,6 +894,11 @@ class MrpRequirement(Base):
     period_from = Column(Date, nullable=False, index=True)
     period_to = Column(Date, nullable=False, index=True)
     bom_level = Column(Integer, nullable=False, default=0)
+    executed_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    carried_remaining = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    initial_snapshot_stock = Column(DECIMAL(15, 3), nullable=True)
+    status = Column(String(20), nullable=False, default="open", server_default="open", index=True)
+    closed_at = Column(TIMESTAMP, nullable=True)
     created_at = Column(TIMESTAMP, default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now(), nullable=False)
 
