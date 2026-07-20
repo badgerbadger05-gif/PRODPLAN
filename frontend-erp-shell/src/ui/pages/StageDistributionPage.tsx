@@ -1,24 +1,10 @@
 import { useMemo, useState } from 'react'
-import type { DistributedComponent, ResourceDistributionResult } from '../../domain/stageDistribution'
+import type { ResourceDistributionResult } from '../../domain/stageDistribution'
 import { dateTimeRu, qty } from '../../lib/format'
 import { calculateResourceDistribution } from '../../services/stageDistribution'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
-
-function aggregateComponents(rows: DistributedComponent[]) {
-  const map = new Map<string, DistributedComponent>()
-  rows.forEach((row) => {
-    const key = `${row.item_id}:${row.stage_id ?? 'null'}`
-    const existing = map.get(key)
-    if (!existing) {
-      map.set(key, { ...row })
-      return
-    }
-    existing.qty_per_unit = Number(existing.qty_per_unit || 0) + Number(row.qty_per_unit || 0)
-    existing.norm_hours_total = Number(existing.norm_hours_total || 0) + Number(row.norm_hours_total || 0)
-  })
-  return Array.from(map.values())
-}
+import { aggregateComponents, flattenResourceComponents } from './stage-distribution/model'
 
 export function StageDistributionPage() {
   const [resources, setResources] = useState<ResourceDistributionResult[]>([])
@@ -31,7 +17,7 @@ export function StageDistributionPage() {
 
   const active = useMemo(() => resources.find((row) => row.resource_id === activeId) ?? resources[0] ?? null, [resources, activeId])
   const components = useMemo(() => {
-    const rows = (active?.products ?? []).flatMap((product) => product.components.map((component) => ({ ...component, root: product.root_item_name })))
+    const rows = flattenResourceComponents(active)
     return aggregate ? aggregateComponents(rows) : rows
   }, [active, aggregate])
 
