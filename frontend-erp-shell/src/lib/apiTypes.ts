@@ -1032,28 +1032,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/plan/anchor": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get Planning Anchor
-         * @description Якорная дата для отображения планового окна.
-         *
-         *     Семантика: первый НЕ закрытый рабочий день после последнего закрытого.
-         */
-        get: operations["get_planning_anchor_api_v1_plan_anchor_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/plan/bulk_upsert": {
         parameters: {
             query?: never;
@@ -1547,70 +1525,6 @@ export interface paths {
         put?: never;
         /** Period Plans Unarchive */
         post: operations["period_plans_unarchive_api_v1_plan_period_plans__plan_id__unarchive_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/plan/production_report/day/close": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Close Production Report Day
-         * @description Закрыть предыдущий рабочий день: перенос остатка (carry) на D_target.
-         *
-         *     Поддерживает re-run (повторное закрытие) с откатом предыдущего переноса.
-         */
-        post: operations["close_production_report_day_api_v1_plan_production_report_day_close_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/plan/production_report/fact/bulk_upsert": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Bulk Upsert Production Report Fact
-         * @description Пакетное сохранение факта выпуска (completed_qty).
-         *
-         *     Важно: закрытые дни read-only.
-         */
-        post: operations["bulk_upsert_production_report_fact_api_v1_plan_production_report_fact_bulk_upsert_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/plan/production_report/week": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Get Production Report Week
-         * @description Недельный отчёт о выпуске техники (Пн–Вс), включая статусы закрытия дней.
-         */
-        post: operations["get_production_report_week_api_v1_plan_production_report_week_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4617,39 +4531,6 @@ export interface components {
              */
             updated_at: string;
         };
-        /** ProductionReportDayCloseRequest */
-        ProductionReportDayCloseRequest: {
-            /** Close Date */
-            close_date?: string | null;
-            /** Closed By */
-            closed_by?: string | null;
-        };
-        /** ProductionReportFactBulkUpsertRequest */
-        ProductionReportFactBulkUpsertRequest: {
-            /**
-             * Entries
-             * @default []
-             */
-            entries: components["schemas"]["ProductionReportFactEntry"][];
-            /** Rerun Editable Date */
-            rerun_editable_date?: string | null;
-        };
-        /** ProductionReportFactEntry */
-        ProductionReportFactEntry: {
-            /** Date */
-            date: string;
-            /** Fact Qty */
-            fact_qty: number;
-            /** Item Id */
-            item_id: number;
-        };
-        /** ProductionReportWeekRequest */
-        ProductionReportWeekRequest: {
-            /** Any Date In Week */
-            any_date_in_week?: string | null;
-            /** Week Start */
-            week_start?: string | null;
-        };
         /** ProductionResource */
         ProductionResource: {
             /**
@@ -7360,26 +7241,6 @@ export interface operations {
             };
         };
     };
-    get_planning_anchor_api_v1_plan_anchor_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-        };
-    };
     bulk_upsert_plan_api_v1_plan_bulk_upsert_post: {
         parameters: {
             query?: never;
@@ -8368,105 +8229,6 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    close_production_report_day_api_v1_plan_production_report_day_close_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ProductionReportDayCloseRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    bulk_upsert_production_report_fact_api_v1_plan_production_report_fact_bulk_upsert_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ProductionReportFactBulkUpsertRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    get_production_report_week_api_v1_plan_production_report_week_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ProductionReportWeekRequest"];
-            };
-        };
         responses: {
             /** @description Successful Response */
             200: {
@@ -10463,8 +10225,6 @@ export interface operations {
                 date_to?: string | null;
                 active_only?: boolean;
                 include_to_order?: boolean;
-                /** @description Горизонт формирования заказов: показывать 'to_order'-строки только по активным прогонам, чей план заканчивается не позже этой даты (ISO). None = весь горизонт (все активные прогоны). */
-                horizon_period_to?: string | null;
                 sort_by?: string | null;
                 sort_dir?: string | null;
                 limit?: number;

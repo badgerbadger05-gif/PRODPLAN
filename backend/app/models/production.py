@@ -24,7 +24,6 @@ class ProductionOrder(Base):
     source_run_id = Column(Integer, ForeignKey('planning_run.run_id', ondelete="SET NULL"), nullable=True, index=True)
     created_at = Column(TIMESTAMP, default=func.now())
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
-
     # Relationship для загрузки продукции заказа
     products = relationship("ProductionProduct", back_populates="order", lazy="select")
 
@@ -327,43 +326,3 @@ class ProductionOperation(Base):
     stage_id = Column(Integer, ForeignKey('production_stages.stage_id'), nullable=True)
     created_at = Column(TIMESTAMP, default=func.now())
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
-
-
-class ProductionDayClose(Base):
-    __tablename__ = "production_day_close"
-    __table_args__ = (
-        UniqueConstraint("close_date", name="ux_production_day_close_close_date"),
-    )
-
-    id = Column(Integer, primary_key=True, index=True)
-    close_date = Column(Date, nullable=False, index=True)
-    status = Column(String(20), nullable=False, default="OPEN")  # OPEN | CLOSED
-    target_date = Column(Date, nullable=True)
-    closed_at = Column(TIMESTAMP, nullable=True)
-    closed_by = Column(String(100), nullable=True)
-    created_at = Column(TIMESTAMP, default=func.now(), nullable=False)
-    updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now(), nullable=False)
-
-
-class ProductionDayCloseItem(Base):
-    __tablename__ = "production_day_close_item"
-    __table_args__ = (
-        UniqueConstraint("day_close_id", "item_id", name="ux_production_day_close_item_day_item"),
-    )
-
-    id = Column(Integer, primary_key=True, index=True)
-    day_close_id = Column(Integer, ForeignKey("production_day_close.id", ondelete="CASCADE"), nullable=False)
-    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False)
-
-    planned_qty_snapshot = Column(DECIMAL(15, 3), nullable=False, default=0.0)
-    fact_qty_snapshot = Column(DECIMAL(15, 3), nullable=False, default=0.0)
-    carry_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0)
-    applied_to_date = Column(Date, nullable=True)
-    # Additional fields for improved carry tracking
-    original_planned_qty_before_carry = Column(DECIMAL(15, 3), nullable=True)
-    planned_qty_after_carry = Column(DECIMAL(15, 3), nullable=True)
-    carry_status = Column(String(20), nullable=True)
-
-    # Связи
-    day_close = relationship("ProductionDayClose")
-    item = relationship("Item")

@@ -4,7 +4,7 @@
 
 ## 0. Источник истины по эндпоинтам
 
-`docs/api/openapi.json` — **авто-сгенерирован** из FastAPI (`app.openapi()`), OpenAPI 3.1, 187 путей / 103 схемы. Это машинная истина по request/response каждого эндпоинта; регенерируется backend'ом при изменениях. Фронт **генерирует TS-типы из него** (`npx openapi-typescript docs/api/openapi.json -o src/lib/apiTypes.ts`) и строит на моках, пока backend дописывается. Ручные типы, дублирующие openapi, запрещены.
+`docs/api/openapi.json` — **авто-сгенерирован** из FastAPI (`app.openapi()`), OpenAPI 3.1, 183 пути / 99 схем. Это машинная истина по request/response каждого эндпоинта; регенерируется backend'ом при изменениях. Фронт **генерирует TS-типы из него** (`npx openapi-typescript docs/api/openapi.json -o src/lib/apiTypes.ts`) и строит на моках, пока backend дописывается. Ручные типы, дублирующие openapi, запрещены.
 
 Этот документ фиксирует то, чего в openapi нет: сквозные конвенции, модель авторизации/прав, правила владения, потребление.
 
@@ -120,4 +120,5 @@ export const productionOrderDoctype: Doctype<OrderRow, ProductionFilters, OrderD
 ```
 
 ## CHANGELOG
+- 2026-07-20 v2: удалён недельный выпуск, ввод факта и закрытие дня; openapi.json сокращён до 183 путей / 99 схем.
 - 2026-07-20 v1: первичный контракт — openapi.json (187 путей), сквозные конвенции, целевая модель авторизации/прав, правила владения, пример production_order.

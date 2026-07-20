@@ -74,8 +74,6 @@ from .production import (
     ProductionManufactureOperation,
     ProductionComponent,
     ProductionOperation,
-    ProductionDayClose,
-    ProductionDayCloseItem,
 )
 from .suppliers import (
     SupplierOrder,
@@ -185,8 +183,6 @@ __all__ = [
     "PlanningConfigVersion",
     "PlanningRun",
     "ProductionComponent",
-    "ProductionDayClose",
-    "ProductionDayCloseItem",
     "ProductionKind",
     "ProductionManufacture",
     "ProductionManufactureOperation",
