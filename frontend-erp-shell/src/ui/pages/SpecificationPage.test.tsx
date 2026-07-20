@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -47,6 +47,16 @@ const reducer: BomItem = {
   item_name: 'Редуктор',
   item_article: 'РЕД-01',
   spec_id: 11,
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
 }
 
 const nodes: SpecNode[] = [{
@@ -257,5 +267,74 @@ describe('SpecificationPage characterization', () => {
     await user.click(screen.getByRole('button', { name: 'Найти' }))
     expect(await screen.findByText('Загружено: НАС-01 · Насос ГА-1')).toBeVisible()
     expect(getSpecificationFull).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps the newest selected BOM when an older parallel load resolves last', async () => {
+    const user = userEvent.setup()
+    vi.mocked(searchSpecificationItems).mockResolvedValue({
+      items: [pump, reducer],
+      meta: { count: 2 },
+    })
+
+    type FullResult = Awaited<ReturnType<typeof getSpecificationFull>>
+    type FlatResult = Awaited<ReturnType<typeof getSpecificationFlattened>>
+    type WhereResult = Awaited<ReturnType<typeof getSpecificationWhereUsed>>
+    type QualityResult = Awaited<ReturnType<typeof getSpecificationQuality>>
+    const pending = {
+      [pump.item_id]: {
+        full: deferred<FullResult>(),
+        flat: deferred<FlatResult>(),
+        where: deferred<WhereResult>(),
+        quality: deferred<QualityResult>(),
+      },
+      [reducer.item_id]: {
+        full: deferred<FullResult>(),
+        flat: deferred<FlatResult>(),
+        where: deferred<WhereResult>(),
+        quality: deferred<QualityResult>(),
+      },
+    }
+    vi.mocked(getSpecificationFull).mockImplementation(({ item_id }) => pending[item_id as 100 | 101].full.promise)
+    vi.mocked(getSpecificationFlattened).mockImplementation(({ item_id }) => pending[item_id as 100 | 101].flat.promise)
+    vi.mocked(getSpecificationWhereUsed).mockImplementation(({ item_id }) => pending[item_id as 100 | 101].where.promise)
+    vi.mocked(getSpecificationQuality).mockImplementation(({ item_id }) => pending[item_id as 100 | 101].quality.promise)
+    renderPage()
+
+    await searchFor(user, 'узел')
+    const pumpRow = screen.getByRole('row', { name: /Насос ГА-1/ })
+    const reducerRow = screen.getByRole('row', { name: /Редуктор/ })
+    fireEvent.doubleClick(pumpRow)
+    fireEvent.doubleClick(reducerRow)
+    expect(vi.mocked(getSpecificationFull).mock.calls.map(([params]) => params.item_id)).toEqual([100, 101])
+
+    await act(async () => {
+      pending[reducer.item_id].full.resolve({ nodes, meta: {} })
+      pending[reducer.item_id].flat.resolve({ items: [], meta: {} })
+      pending[reducer.item_id].where.resolve({ items: [], meta: {} })
+      pending[reducer.item_id].quality.resolve({ issues: [], meta: {} })
+      await Promise.all([
+        pending[reducer.item_id].full.promise,
+        pending[reducer.item_id].flat.promise,
+        pending[reducer.item_id].where.promise,
+        pending[reducer.item_id].quality.promise,
+      ])
+    })
+    expect(await screen.findByText('Загружено: РЕД-01 · Редуктор')).toBeVisible()
+
+    await act(async () => {
+      pending[pump.item_id].full.resolve({ nodes, meta: {} })
+      pending[pump.item_id].flat.resolve({ items: [], meta: {} })
+      pending[pump.item_id].where.resolve({ items: [], meta: {} })
+      pending[pump.item_id].quality.resolve({ issues: [], meta: {} })
+      await Promise.all([
+        pending[pump.item_id].full.promise,
+        pending[pump.item_id].flat.promise,
+        pending[pump.item_id].where.promise,
+        pending[pump.item_id].quality.promise,
+      ])
+    })
+
+    expect(screen.getByText('Загружено: РЕД-01 · Редуктор')).toBeVisible()
+    expect(screen.queryByText('Загружено: НАС-01 · Насос ГА-1')).not.toBeInTheDocument()
   })
 })
