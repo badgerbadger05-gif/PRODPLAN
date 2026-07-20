@@ -61,3 +61,67 @@ describe('DoctypeTable accessibility', () => {
     expect(open).toHaveBeenCalledWith(expect.objectContaining({ id: 1 }))
   })
 })
+
+describe('DoctypeTable bulk selection', () => {
+  const multipleDoctype: Doctype<Row, Filters> = {
+    ...doctype,
+    meta: { ...doctype.meta, selectionMode: 'multiple' },
+    columns: [
+      { key: 'select', title: '', type: 'select-checkbox' },
+      ...doctype.columns,
+    ],
+  }
+
+  it('selects and clears every row visible on the current page from the header', () => {
+    const setVisibleSelection = vi.fn()
+    const { rerender } = render(
+      <DoctypeTable
+        doctype={multipleDoctype}
+        state={state({ setVisibleSelection })}
+        access={{ roles: [], permissions: [] }}
+      />,
+    )
+
+    const selectAll = screen.getByRole('checkbox', { name: 'Выбрать все видимые строки' })
+    expect(selectAll).not.toBeChecked()
+
+    fireEvent.click(selectAll)
+    expect(setVisibleSelection).toHaveBeenCalledWith(true)
+
+    rerender(
+      <DoctypeTable
+        doctype={multipleDoctype}
+        state={state({
+          selectedIds: new Set([1, 2]),
+          setVisibleSelection,
+        })}
+        access={{ roles: [], permissions: [] }}
+      />,
+    )
+
+    expect(screen.getByRole('checkbox', { name: 'Выбрать все видимые строки' })).toBeChecked()
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Выбрать все видимые строки' }))
+    expect(setVisibleSelection).toHaveBeenLastCalledWith(false)
+  })
+
+  it('marks the header checkbox as indeterminate for a partial visible selection', () => {
+    render(
+      <DoctypeTable
+        doctype={multipleDoctype}
+        state={state({
+          selectedIds: new Set([1]),
+          setVisibleSelection: vi.fn(),
+        })}
+        access={{ roles: [], permissions: [] }}
+      />,
+    )
+
+    expect(screen.getByRole('checkbox', { name: 'Выбрать все видимые строки' })).toHaveProperty('indeterminate', true)
+  })
+
+  it('does not render the bulk checkbox for single-selection doctypes', () => {
+    render(<DoctypeTable doctype={doctype} state={state()} access={{ roles: [], permissions: [] }} />)
+
+    expect(screen.queryByRole('checkbox', { name: 'Выбрать все видимые строки' })).not.toBeInTheDocument()
+  })
+})
