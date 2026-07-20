@@ -252,4 +252,40 @@ describe('ResourcesPage characterization', () => {
     expect(resourcesTable().queryByText('Механический участок')).not.toBeInTheDocument()
     expect(screen.getByText('Выберите участок')).toBeVisible()
   })
+
+  it('announces a service error as an alert', async () => {
+    vi.mocked(listResources).mockRejectedValueOnce(new Error('Ресурсы недоступны'))
+
+    render(<ResourcesPage />)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Ресурсы недоступны')
+  })
+
+  it('announces a successful save as a status', async () => {
+    const user = userEvent.setup()
+    render(<ResourcesPage />)
+    await resourcesTable().findByText('Механический участок')
+
+    await user.click(screen.getByRole('button', { name: 'Добавить участок' }))
+    await user.type(screen.getByLabelText('Название участка'), 'Новый участок')
+    await user.click(screen.getByRole('button', { name: 'Сохранить карточку' }))
+
+    expect(await screen.findByRole('status')).toHaveTextContent('Участок создан')
+  })
+
+  it('gives the production-kind combobox a descriptive accessible name', async () => {
+    render(<ResourcesPage />)
+    await screen.findByText('Токарная обработка')
+
+    expect(screen.getByRole('combobox', { name: 'Добавить вид производства' })).toBeVisible()
+  })
+
+  it('names a remove-kind button with the affected production kind', async () => {
+    render(<ResourcesPage />)
+    await screen.findByText('Мехобработка')
+
+    expect(screen.getByRole('button', {
+      name: 'Удалить вид производства Мехобработка',
+    })).toBeVisible()
+  })
 })
