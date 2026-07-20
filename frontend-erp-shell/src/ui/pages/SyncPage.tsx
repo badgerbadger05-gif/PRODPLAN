@@ -99,20 +99,20 @@ export function SyncPage() {
       const result = await runner()
       addLog({ title, status: 'ok', details: shortResult(result) })
       setMessage(`${title}: выполнено`)
-      return result
+      return true
     } catch (e) {
       const text = e instanceof Error ? e.message : String(e)
       addLog({ title, status: 'error', details: text })
       setError(text)
-      throw e
+      return false
     } finally {
       setRunning('')
     }
   }
 
   async function runAction(action: SyncAction) {
-    await runNamed(action.title, () => runSyncAction(config, action))
-    if (action.id === 'warehouses') await loadWarehouses()
+    const succeeded = await runNamed(action.title, () => runSyncAction(config, action))
+    if (succeeded && action.id === 'warehouses') await loadWarehouses()
   }
 
   async function runFullSync() {

@@ -151,7 +151,20 @@ describe('SyncPage characterization', () => {
     expect(within(log).getByText(/"created":1/)).toBeVisible()
   })
 
-  it.todo('records a failed single sync command without an unhandled promise rejection')
+  it('records a failed single sync command without an unhandled promise rejection', async () => {
+    const user = userEvent.setup()
+    const action = syncActions.find((item) => item.id === 'warehouses')!
+    vi.mocked(runSyncAction).mockRejectedValueOnce(new Error('Склады 1С недоступны'))
+    render(<SyncPage />)
+    await screen.findByDisplayValue(config.base_url)
+
+    await user.click(screen.getByRole('button', { name: action.title }))
+
+    expect((await screen.findAllByText('Склады 1С недоступны')).length).toBe(2)
+    const log = screen.getByRole('heading', { name: 'Журнал операций' }).parentElement!
+    expect(within(log).getByText('error')).toBeVisible()
+    expect(listWarehouses).toHaveBeenCalledOnce()
+  })
 
   it('runs the full sync in the declared sequence', async () => {
     const user = userEvent.setup()
