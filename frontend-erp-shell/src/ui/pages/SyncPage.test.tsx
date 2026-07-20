@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { fullSyncOrder, syncActions } from '../../domain/sync'
@@ -220,6 +220,27 @@ describe('SyncPage characterization', () => {
     expect(within(log).getByText(/"created":1/)).toBeVisible()
   })
 
+  it('admits only the first of two commands dispatched before the busy render', async () => {
+    const pending = deferred<Awaited<ReturnType<typeof runSyncAction>>>()
+    vi.mocked(runSyncAction).mockImplementationOnce(() => pending.promise)
+    render(<SyncPage />)
+    await screen.findByDisplayValue(config.base_url)
+
+    const first = screen.getByRole('button', { name: 'Номенклатура + ЕИ' })
+    const second = screen.getByRole('button', { name: 'Виды производства' })
+    act(() => {
+      first.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      second.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+
+    expect(runSyncAction).toHaveBeenCalledOnce()
+    expect(vi.mocked(runSyncAction).mock.calls[0][1].id).toBe('nomenclature')
+
+    pending.resolve({ status: 'ok' })
+    expect(await screen.findByText('Номенклатура + ЕИ: выполнено')).toBeVisible()
+    expect(screen.queryByText('Виды производства: выполнено')).not.toBeInTheDocument()
+  })
+
   it('records a failed single sync command without an unhandled promise rejection', async () => {
     const user = userEvent.setup()
     const action = syncActions.find((item) => item.id === 'warehouses')!
@@ -247,6 +268,39 @@ describe('SyncPage characterization', () => {
     expect(screen.getByText(`${fullSyncOrder.length} из ${fullSyncOrder.length} · 100%`)).toBeVisible()
     expect(listWarehouses).toHaveBeenCalledTimes(2)
     expect(listNomenclatureGroups).toHaveBeenCalledTimes(2)
+  })
+
+  it('serializes full-sync steps and ignores a concurrent second launch', async () => {
+    const firstAction = deferred<Awaited<ReturnType<typeof runSyncAction>>>()
+    let inFlight = 0
+    let maxInFlight = 0
+    vi.mocked(runSyncAction).mockImplementationOnce(async () => {
+      inFlight += 1
+      maxInFlight = Math.max(maxInFlight, inFlight)
+      const result = await firstAction.promise
+      inFlight -= 1
+      return result
+    }).mockImplementation(async () => {
+      inFlight += 1
+      maxInFlight = Math.max(maxInFlight, inFlight)
+      await Promise.resolve()
+      inFlight -= 1
+      return { status: 'ok' }
+    })
+    render(<SyncPage />)
+    await screen.findByDisplayValue(config.base_url)
+
+    const launch = screen.getByRole('button', { name: 'Запустить полную синхронизацию' })
+    act(() => {
+      launch.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+      launch.dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    })
+    expect(runSyncAction).toHaveBeenCalledOnce()
+
+    firstAction.resolve({ status: 'ok' })
+    expect(await screen.findByText('Полная синхронизация завершена')).toBeVisible()
+    expect(runSyncAction).toHaveBeenCalledTimes(fullSyncOrder.length)
+    expect(maxInFlight).toBe(1)
   })
 
   it('stops the full sync on the first failed command and keeps failure evidence', async () => {

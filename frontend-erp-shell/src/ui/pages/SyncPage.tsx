@@ -1,15 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
-import { fullSyncOrder, syncActions, type NomenclatureGroupItem, type ODataConfig, type SyncAction, type SyncLogEntry, type WarehouseItem } from '../../domain/sync'
-import { downloadBase64File } from '../../lib/download'
+import { syncActions, type NomenclatureGroupItem, type ODataConfig, type SyncAction, type WarehouseItem } from '../../domain/sync'
 import {
-  exportProductionOrdersReport,
-  exportSupplierOrdersReport,
   fetchODataMetadata,
   getODataConfig,
   listNomenclatureGroups,
   listWarehouses,
-  runSyncAction,
   saveNomenclatureGroupSelection,
   saveODataConfig,
   saveWarehouseSelection,
@@ -17,20 +13,9 @@ import {
 } from '../../services/sync'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
+import { useSyncRunner } from './sync/useSyncRunner'
 
 const emptyConfig: ODataConfig = { base_url: '', username: '', password: '', token: '' }
-
-function shortResult(value: unknown) {
-  try {
-    return JSON.stringify(value).slice(0, 260)
-  } catch {
-    return String(value).slice(0, 260)
-  }
-}
-
-function nowTime() {
-  return new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-}
 
 export function SyncPage() {
   const [config, setConfig] = useState<ODataConfig>(emptyConfig)
@@ -38,11 +23,6 @@ export function SyncPage() {
   const [selectedWarehouses, setSelectedWarehouses] = useState<Set<string>>(new Set())
   const [groups, setGroups] = useState<NomenclatureGroupItem[]>([])
   const [selectedGroups, setSelectedGroups] = useState<Set<string>>(new Set())
-  const [running, setRunning] = useState<string>('')
-  const [log, setLog] = useState<SyncLogEntry[]>([])
-  const [progress, setProgress] = useState({ done: 0, total: 0, title: '' })
-  const [error, setError] = useState('')
-  const [message, setMessage] = useState('')
 
   const groupedActions = useMemo(() => {
     const map = new Map<string, SyncAction[]>()
@@ -53,19 +33,12 @@ export function SyncPage() {
     return Array.from(map.entries())
   }, [])
 
-  const busy = Boolean(running)
-  const progressPercent = progress.total ? Math.round((progress.done / progress.total) * 100) : 0
-
-  function addLog(entry: Omit<SyncLogEntry, 'at'>) {
-    setLog((current) => [{ ...entry, at: nowTime() }, ...current].slice(0, 40))
-  }
-
   async function loadConfig() {
     try {
       const data = await getODataConfig()
       setConfig({ ...emptyConfig, ...data })
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      reportError(e instanceof Error ? e.message : String(e))
     }
   }
 
@@ -75,7 +48,7 @@ export function SyncPage() {
       setWarehouses(data.rows ?? [])
       setSelectedWarehouses(new Set((data.rows ?? []).filter((row) => row.is_selected).map((row) => row.warehouse_ref1c)))
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      reportError(e instanceof Error ? e.message : String(e))
     }
   }
 
@@ -86,70 +59,34 @@ export function SyncPage() {
       setGroups(rows)
       setSelectedGroups(new Set(data.selected_ids ?? []))
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      reportError(e instanceof Error ? e.message : String(e))
     }
   }
 
-  async function runNamed(title: string, runner: () => Promise<unknown>) {
-    setRunning(title)
-    setError('')
-    setMessage('')
-    addLog({ title, status: 'running' })
-    try {
-      const result = await runner()
-      addLog({ title, status: 'ok', details: shortResult(result) })
-      setMessage(`${title}: выполнено`)
-      return true
-    } catch (e) {
-      const text = e instanceof Error ? e.message : String(e)
-      addLog({ title, status: 'error', details: text })
-      setError(text)
-      return false
-    } finally {
-      setRunning('')
-    }
-  }
-
-  async function runAction(action: SyncAction) {
-    const succeeded = await runNamed(action.title, () => runSyncAction(config, action))
-    if (succeeded && action.id === 'warehouses') await loadWarehouses()
-  }
-
-  async function runFullSync() {
-    setRunning('Полная синхронизация')
-    setError('')
-    setMessage('')
-    setProgress({ done: 0, total: fullSyncOrder.length, title: 'Полная синхронизация' })
-    try {
-      for (const id of fullSyncOrder) {
-        const action = syncActions.find((item) => item.id === id)
-        if (!action) continue
-        addLog({ title: action.title, status: 'running' })
-        const result = await runSyncAction(config, action)
-        addLog({ title: action.title, status: 'ok', details: shortResult(result) })
-        setProgress((current) => ({ ...current, done: current.done + 1 }))
-      }
-      setMessage('Полная синхронизация завершена')
+  const {
+    error,
+    exportReport,
+    log,
+    message,
+    progress,
+    reportError,
+    runAction,
+    runFullSync,
+    runNamed,
+    running,
+  } = useSyncRunner({
+    config,
+    refreshWarehouses: loadWarehouses,
+    refreshSelections: async () => {
       await Promise.all([loadWarehouses(), loadGroups()])
-    } catch (e) {
-      const text = e instanceof Error ? e.message : String(e)
-      setError(text)
-      addLog({ title: 'Полная синхронизация', status: 'error', details: text })
-    } finally {
-      setRunning('')
-    }
-  }
+    },
+  })
+
+  const busy = Boolean(running)
+  const progressPercent = progress.total ? Math.round((progress.done / progress.total) * 100) : 0
 
   async function saveConfig() {
     await runNamed('Сохранить настройки', () => saveODataConfig(config))
-  }
-
-  async function exportReport(kind: 'production' | 'supplier') {
-    await runNamed(kind === 'production' ? 'Excel: заказы на производство' : 'Excel: заказы поставщику', async () => {
-      const result = kind === 'production' ? await exportProductionOrdersReport() : await exportSupplierOrdersReport()
-      downloadBase64File(result, kind === 'production' ? 'production_orders.xlsx' : 'supplier_orders.xlsx')
-      return result
-    })
   }
 
   useEffect(() => {
@@ -209,14 +146,22 @@ export function SyncPage() {
             </div>
 
             {progress.total > 0 && (
-              <div className="syncProgress">
+              <div
+                className="syncProgress"
+                role="progressbar"
+                aria-label={progress.title}
+                aria-valuemin={0}
+                aria-valuemax={progress.total}
+                aria-valuenow={progress.done}
+                aria-valuetext={`${progress.done} из ${progress.total}`}
+              >
                 <div><strong>{progress.title}</strong><span>{progress.done} из {progress.total} · {progressPercent}%</span></div>
                 <div className="progressTrack"><div style={{ width: `${progressPercent}%` }} /></div>
               </div>
             )}
 
-            {error && <div className="errorLine">{error}</div>}
-            {message && <div className="successLine">{message}</div>}
+            {error && <div className="errorLine" role="alert">{error}</div>}
+            {message && <div className="successLine" role="status">{message}</div>}
 
             <div className="syncGroups">
               {groupedActions.map(([group, actions]) => (
@@ -244,6 +189,7 @@ export function SyncPage() {
               title="Склады для остатков"
               count={warehouses.length}
               selected={selectedWarehouses.size}
+              disabled={busy}
               onSelectAll={() => setSelectedWarehouses(new Set(warehouses.map((row) => row.warehouse_ref1c)))}
               onClear={() => setSelectedWarehouses(new Set())}
               onSave={() => void runNamed('Сохранить выбор складов', () => saveWarehouseSelection(Array.from(selectedWarehouses)))}
@@ -252,6 +198,7 @@ export function SyncPage() {
                 <label className="selectionRow" key={w.warehouse_ref1c}>
                   <input
                     type="checkbox"
+                    disabled={busy}
                     checked={selectedWarehouses.has(w.warehouse_ref1c)}
                     onChange={(e) => {
                       const next = new Set(selectedWarehouses)
@@ -269,6 +216,7 @@ export function SyncPage() {
               title="Группы номенклатуры"
               count={groups.length}
               selected={selectedGroups.size}
+              disabled={busy}
               onSelectAll={() => setSelectedGroups(new Set(groups.map((row) => row.id)))}
               onClear={() => setSelectedGroups(new Set())}
               onSave={() => void runNamed('Сохранить выбор групп', () => saveNomenclatureGroupSelection(Array.from(selectedGroups)))}
@@ -283,6 +231,7 @@ export function SyncPage() {
                 <label className="selectionRow" key={g.id}>
                   <input
                     type="checkbox"
+                    disabled={busy}
                     checked={selectedGroups.has(g.id)}
                     onChange={(e) => {
                       const next = new Set(selectedGroups)
@@ -315,10 +264,11 @@ export function SyncPage() {
   )
 }
 
-function SelectionPanel({ title, count, selected, onSelectAll, onClear, onSave, children }: {
+function SelectionPanel({ title, count, selected, disabled, onSelectAll, onClear, onSave, children }: {
   title: string
   count: number
   selected: number
+  disabled: boolean
   onSelectAll: () => void
   onClear: () => void
   onSave: () => void
@@ -329,9 +279,9 @@ function SelectionPanel({ title, count, selected, onSelectAll, onClear, onSave, 
       <h2>{title}</h2>
       <div className="selectionMeta">Всего: {count} · Выбрано: {selected}</div>
       <div className="syncActionsRow">
-        <button onClick={onSelectAll}>Все</button>
-        <button onClick={onClear}>Снять</button>
-        <button className="primary" onClick={onSave}>Сохранить</button>
+        <button onClick={onSelectAll} disabled={disabled}>Все</button>
+        <button onClick={onClear} disabled={disabled}>Снять</button>
+        <button className="primary" onClick={onSave} disabled={disabled}>Сохранить</button>
       </div>
       <div className="selectionList">{children || <div className="emptyDetail">Список пуст</div>}</div>
     </div>
