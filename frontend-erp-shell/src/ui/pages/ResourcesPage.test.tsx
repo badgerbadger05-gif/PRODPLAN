@@ -319,7 +319,7 @@ describe('ResourcesPage characterization', () => {
     render(<ResourcesPage />)
     await screen.findByText('Мехобработка')
 
-    expect(screen.getByRole('button', {
+    expect(await screen.findByRole('button', {
       name: 'Удалить вид производства Мехобработка',
     })).toBeVisible()
   })
