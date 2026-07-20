@@ -1,6 +1,7 @@
 import { render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { MemoryRouter } from 'react-router-dom'
 import type { BindingReviewItem, BindingReviewLine } from '../../domain/workshopBindingReview'
 import { addResourceProductionKind, listResources } from '../../services/resources'
 import {
@@ -74,6 +75,14 @@ function response(item: BindingReviewItem, scope: 'active' | 'catalog' = 'active
   }
 }
 
+function renderPage() {
+  return render(
+    <MemoryRouter>
+      <WorkshopBindingReviewPage />
+    </MemoryRouter>,
+  )
+}
+
 describe('WorkshopBindingReviewPage characterization', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -99,7 +108,7 @@ describe('WorkshopBindingReviewPage characterization', () => {
   })
 
   it('loads the active list, reason counts and selected item detail', async () => {
-    render(<WorkshopBindingReviewPage />)
+    renderPage()
 
     expect((await screen.findAllByText('Подшипник ведущего вала')).length).toBeGreaterThan(0)
     expect(screen.getByRole('button', { name: 'Вид не привязан к участку (1)' })).toBeVisible()
@@ -115,9 +124,22 @@ describe('WorkshopBindingReviewPage characterization', () => {
     expect(listReviewItemLines).toHaveBeenCalledWith(41)
   })
 
+  it('uses the shared Doctype chrome while preserving review-specific filters', async () => {
+    renderPage()
+    await screen.findAllByText('Подшипник ведущего вала')
+
+    expect(screen.getByRole('heading', { name: 'Разбор привязок' })).toBeVisible()
+    expect(screen.getByLabelText('Сохранённое представление')).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Колонки' })).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Скопировать ссылку' })).toBeVisible()
+    expect(screen.getByPlaceholderText('Поиск: наименование / артикул')).toBeVisible()
+    expect(screen.getByRole('button', { name: 'В производстве' })).toHaveClass('primary')
+    expect(screen.getByRole('columnheader', { name: 'Строк' })).toBeVisible()
+  })
+
   it('submits search explicitly and applies reason and scope controls', async () => {
     const user = userEvent.setup()
-    render(<WorkshopBindingReviewPage />)
+    renderPage()
     await screen.findAllByText('Подшипник ведущего вала')
 
     const search = screen.getByPlaceholderText('Поиск: наименование / артикул')
@@ -141,11 +163,12 @@ describe('WorkshopBindingReviewPage characterization', () => {
       reasonCode: undefined,
     })))
     expect((await screen.findAllByText('Деталь из справочника')).length).toBeGreaterThan(0)
+    expect(screen.queryByRole('columnheader', { name: 'Строк' })).not.toBeInTheDocument()
   })
 
   it('does not load order lines for a catalog item without active lines', async () => {
     const user = userEvent.setup()
-    render(<WorkshopBindingReviewPage />)
+    renderPage()
     await screen.findByText(/ЗСНФ-000700 · 4 шт/)
 
     await user.click(screen.getByRole('button', { name: 'Весь справочник' }))
@@ -159,7 +182,7 @@ describe('WorkshopBindingReviewPage characterization', () => {
 
   it('binds the production kind and assigns an order line workshop', async () => {
     const user = userEvent.setup()
-    render(<WorkshopBindingReviewPage />)
+    renderPage()
     await screen.findByText(/ЗСНФ-000700 · 4 шт/)
 
     await user.click(screen.getByRole('button', { name: 'Привязать вид → участок' }))
@@ -170,5 +193,35 @@ describe('WorkshopBindingReviewPage characterization', () => {
     await waitFor(() => expect(assignLineWorkshop).toHaveBeenCalledWith(900, 1))
     expect(await screen.findByText('Строке заказа ЗСНФ-000700 назначен участок вручную.')).toBeVisible()
     expect(listReviewItems).toHaveBeenCalledTimes(3)
+  })
+
+  it('renders the review-specific empty state through the common table', async () => {
+    vi.mocked(listReviewItems).mockResolvedValue({
+      items: [],
+      total: 0,
+      limit: 100,
+      offset: 0,
+      scope: 'active',
+      counts_by_reason: {},
+    })
+
+    renderPage()
+
+    expect(await screen.findByText('Все детали привязаны автоматически — разбирать нечего.')).toBeVisible()
+    expect(screen.getByText('Все детали привязаны автоматически — разбирать нечего.').closest('td'))
+      .toHaveAttribute('colspan', '6')
+  })
+
+  it('announces a failed binding mutation and does not reload the list', async () => {
+    const user = userEvent.setup()
+    vi.mocked(addResourceProductionKind).mockRejectedValueOnce(new Error('Не удалось сохранить привязку'))
+    renderPage()
+    await screen.findByText(/ЗСНФ-000700 · 4 шт/)
+
+    await user.click(screen.getByRole('button', { name: 'Привязать вид → участок' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Не удалось сохранить привязку')
+    expect(listReviewItems).toHaveBeenCalledTimes(1)
+    expect(assignLineWorkshop).not.toHaveBeenCalled()
   })
 })
