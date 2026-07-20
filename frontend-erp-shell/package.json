@@ -7,10 +7,12 @@
     "dev": "vite --host 0.0.0.0 --port 9300",
     "lint": "eslint .",
     "smoke": "playwright test",
-    "test": "vitest run",
+    "test": "vitest run && npm run test:bundle-budget",
+    "test:bundle-budget": "node --test scripts/check-bundle-budget.test.mjs",
     "test:watch": "vitest",
     "api:types": "openapi-typescript ../docs/api/openapi.json -o src/lib/apiTypes.ts",
     "build": "tsc -b && vite build",
+    "bundle:check": "node scripts/check-bundle-budget.mjs",
     "preview": "vite preview --host 0.0.0.0 --port 9301"
   },
   "dependencies": {

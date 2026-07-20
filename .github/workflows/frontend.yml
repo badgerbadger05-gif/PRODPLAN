@@ -57,3 +57,6 @@ jobs:
 
       - name: Production build
         run: npm run build
+
+      - name: Enforce production bundle budgets
+        run: npm run bundle:check
