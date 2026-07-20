@@ -3,7 +3,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from ..database import get_db
-from ..models import ProductionResource, ResourceStage, ProductionStage, ResourceProductionKind, ProductionKind
 from ..schemas import (
     ProductionResource as ProductionResourceSchema,
     ProductionResourceCreate,
@@ -16,6 +15,7 @@ from ..schemas import (
     ProductionKind as ProductionKindSchema,
 )
 from ..services.resource_calculator import calculate_resource_distribution
+from ..services import resources_service
 
 router = APIRouter(prefix="/v1/resources", tags=["resources"])
 
@@ -34,27 +34,14 @@ def get_resource_distribution(db: Session = Depends(get_db)):
 @router.get("/", response_model=List[ProductionResourceSchema])
 def get_resources(db: Session = Depends(get_db)):
     """Получить список всех производственных участков"""
-    resources = db.query(ProductionResource).offset(0).limit(100).all()
-    return resources
+    return resources_service.list_resources(db)
 
 
 @router.post("/", response_model=ProductionResourceSchema)
 def create_resource(resource: ProductionResourceCreate, db: Session = Depends(get_db)):
     """Создать новый производственный участок"""
     try:
-        db_resource = ProductionResource(
-            resource_name=resource.resource_name,
-            shift_offset=resource.shift_offset,
-            planning_range=resource.planning_range,
-            capacity=resource.capacity,
-            work_schedule=resource.work_schedule,
-            daily_work_hours=resource.daily_work_hours,
-            buffer_days=resource.buffer_days,
-        )
-        db.add(db_resource)
-        db.commit()
-        db.refresh(db_resource)
-        return db_resource
+        return resources_service.create_resource(db, resource)
     except IntegrityError:
         db.rollback()
         raise HTTPException(status_code=400, detail="Resource with this name already exists")
@@ -67,22 +54,12 @@ def update_resource(
     db: Session = Depends(get_db)
 ):
     """Обновить информацию о производственном участке"""
-    db_resource = db.query(ProductionResource).filter(ProductionResource.resource_id == resource_id).first()
+    db_resource = resources_service.get_resource_by_id(db, resource_id)
     if not db_resource:
         raise HTTPException(status_code=404, detail="Resource not found")
-    
+
     try:
-        db_resource.resource_name = resource.resource_name
-        db_resource.shift_offset = resource.shift_offset
-        db_resource.planning_range = resource.planning_range
-        db_resource.capacity = resource.capacity
-        db_resource.work_schedule = resource.work_schedule
-        db_resource.daily_work_hours = resource.daily_work_hours
-        db_resource.buffer_days = resource.buffer_days
-        
-        db.commit()
-        db.refresh(db_resource)
-        return db_resource
+        return resources_service.update_resource(db, db_resource, resource)
     except IntegrityError:
         db.rollback()
         raise HTTPException(status_code=400, detail="Resource with this name already exists")
@@ -91,45 +68,24 @@ def update_resource(
 @router.delete("/{resource_id}")
 def delete_resource(resource_id: int, db: Session = Depends(get_db)):
     """Удалить производственный участок"""
-    db_resource = db.query(ProductionResource).filter(ProductionResource.resource_id == resource_id).first()
+    db_resource = resources_service.get_resource_by_id(db, resource_id)
     if not db_resource:
         raise HTTPException(status_code=404, detail="Resource not found")
-    
-    # Удаляем связанные этапы
-    db.query(ResourceStage).filter(ResourceStage.resource_id == resource_id).delete()
-    
-    db.delete(db_resource)
-    db.commit()
+
+    resources_service.delete_resource(db, db_resource)
     return {"status": "success"}
 
 
 @router.get("/{resource_id}/stages", response_model=List[ResourceStageWithName])
 def get_resource_stages(resource_id: int, db: Session = Depends(get_db)):
     """Получить список этапов, привязанных к участку, с именем этапа"""
-    rows = (
-        db.query(ResourceStage, ProductionStage.stage_name)
-        .outerjoin(ProductionStage, ProductionStage.stage_id == ResourceStage.stage_id)
-        .filter(ResourceStage.resource_id == resource_id)
-        .all()
-    )
-    return [
-        {
-            "id": int(rs.id),
-            "resource_id": int(rs.resource_id),
-            "stage_id": int(rs.stage_id),
-            "stage_name": (stage_name or None),
-            "created_at": getattr(rs, "created_at", None),
-            "updated_at": getattr(rs, "updated_at", None),
-        }
-        for (rs, stage_name) in rows
-    ]
+    return resources_service.get_resource_stages_with_names(db, resource_id)
 
 
 @router.get("/production-kinds", response_model=List[ProductionKindSchema])
 def list_production_kinds(db: Session = Depends(get_db)):
     """Получить список всех видов производства"""
-    kinds = db.query(ProductionKind).order_by(ProductionKind.name.asc()).all()
-    return kinds
+    return resources_service.list_production_kinds(db)
 
 
 @router.post("/{resource_id}/stages", response_model=ResourceStageSchema)
@@ -140,33 +96,22 @@ def add_stage_to_resource(
 ):
     """Привязать этап производства к участку"""
     # Проверяем существование участка и этапа
-    resource = db.query(ProductionResource).filter(ProductionResource.resource_id == resource_id).first()
+    resource = resources_service.get_resource_by_id(db, resource_id)
     if not resource:
         raise HTTPException(status_code=404, detail="Resource not found")
-    
-    stage = db.query(ProductionStage).filter(ProductionStage.stage_id == resource_stage.stage_id).first()
+
+    stage = resources_service.get_stage_by_id(db, resource_stage.stage_id)
     if not stage:
         raise HTTPException(status_code=404, detail="Stage not found")
-    
+
     # Проверяем, что связь не существует
-    existing = db.query(ResourceStage).filter(
-        ResourceStage.resource_id == resource_id,
-        ResourceStage.stage_id == resource_stage.stage_id
-    ).first()
-    
+    existing = resources_service.find_resource_stage(db, resource_id, resource_stage.stage_id)
+
     if existing:
         raise HTTPException(status_code=400, detail="Stage already assigned to this resource")
-    
+
     try:
-        # Жёстко используем resource_id из URL, игнорируя поле из payload для предотвращения несоответствий
-        db_resource_stage = ResourceStage(
-            resource_id=resource_id,
-            stage_id=resource_stage.stage_id
-        )
-        db.add(db_resource_stage)
-        db.commit()
-        db.refresh(db_resource_stage)
-        return db_resource_stage
+        return resources_service.create_resource_stage(db, resource_id, resource_stage.stage_id)
     except IntegrityError:
         db.rollback()
         raise HTTPException(status_code=400, detail="Error assigning stage to resource")
@@ -175,16 +120,12 @@ def add_stage_to_resource(
 @router.delete("/{resource_id}/stages/{stage_id}")
 def remove_stage_from_resource(resource_id: int, stage_id: int, db: Session = Depends(get_db)):
     """Удалить привязку этапа производства к участку"""
-    resource_stage = db.query(ResourceStage).filter(
-        ResourceStage.resource_id == resource_id,
-        ResourceStage.stage_id == stage_id
-    ).first()
-    
+    resource_stage = resources_service.find_resource_stage(db, resource_id, stage_id)
+
     if not resource_stage:
         raise HTTPException(status_code=404, detail="Stage assignment not found")
-    
-    db.delete(resource_stage)
-    db.commit()
+
+    resources_service.delete_resource_stage(db, resource_stage)
     return {"status": "success"}
 
 
@@ -193,12 +134,7 @@ def remove_stage_from_resource(resource_id: int, stage_id: int, db: Session = De
 @router.get("/{resource_id}/production-kinds", response_model=List[ResourceProductionKindSchema])
 def get_resource_production_kinds(resource_id: int, db: Session = Depends(get_db)):
     """Список видов производства, привязанных к участку"""
-    rows = (
-        db.query(ResourceProductionKind)
-        .filter(ResourceProductionKind.resource_id == resource_id)
-        .all()
-    )
-    return rows
+    return resources_service.get_resource_production_kinds(db, resource_id)
 
 
 @router.post("/{resource_id}/production-kinds", response_model=ResourceProductionKindSchema)
@@ -209,46 +145,34 @@ def add_production_kind_to_resource(
 ):
     """Привязать вид производства к участку"""
     # Проверяем существование участка
-    res = db.query(ProductionResource).filter(ProductionResource.resource_id == resource_id).first()
+    res = resources_service.get_resource_by_id(db, resource_id)
     if not res:
         raise HTTPException(status_code=404, detail="Resource not found")
 
     # Проверяем существование вида производства
-    pk = db.query(ProductionKind).filter(ProductionKind.id == payload.production_kind_id).first()
+    pk = resources_service.get_production_kind_by_id(db, payload.production_kind_id)
     if not pk:
         raise HTTPException(status_code=404, detail="Production kind not found")
 
     # Глобальная защита от дублей:
     # Если вид производства уже назначен на ЛЮБОЙ другой участок — запрещаем повторное назначение
-    existing_global = (
-        db.query(ResourceProductionKind)
-        .filter(ResourceProductionKind.production_kind_id == payload.production_kind_id)
-        .first()
+    existing_global = resources_service.find_production_kind_assignment_global(
+        db, payload.production_kind_id
     )
     if existing_global and int(existing_global.resource_id) != int(resource_id):
         raise HTTPException(status_code=400, detail="Production kind already assigned to another resource")
 
     # Проверяем уникальность связи для текущего участка (idempotent)
-    existing = (
-        db.query(ResourceProductionKind)
-        .filter(
-            ResourceProductionKind.resource_id == resource_id,
-            ResourceProductionKind.production_kind_id == payload.production_kind_id,
-        )
-        .first()
+    existing = resources_service.find_resource_production_kind(
+        db, resource_id, payload.production_kind_id
     )
     if existing:
         raise HTTPException(status_code=400, detail="Production kind already assigned to this resource")
 
     try:
-        rec = ResourceProductionKind(
-            resource_id=resource_id,
-            production_kind_id=payload.production_kind_id,
+        return resources_service.create_resource_production_kind(
+            db, resource_id, payload.production_kind_id
         )
-        db.add(rec)
-        db.commit()
-        db.refresh(rec)
-        return rec
     except IntegrityError:
         db.rollback()
         # Может сработать на уровне БД при уникальном индексе production_kind_id
@@ -258,26 +182,18 @@ def add_production_kind_to_resource(
 @router.delete("/{resource_id}/production-kinds/{production_kind_id}")
 def remove_production_kind_from_resource(resource_id: int, production_kind_id: int, db: Session = Depends(get_db)):
     """Удалить привязку вида производства к участку"""
-    rec = (
-        db.query(ResourceProductionKind)
-        .filter(
-            ResourceProductionKind.resource_id == resource_id,
-            ResourceProductionKind.production_kind_id == production_kind_id,
-        )
-        .first()
-    )
+    rec = resources_service.find_resource_production_kind(db, resource_id, production_kind_id)
     if not rec:
         raise HTTPException(status_code=404, detail="Production kind assignment not found")
 
-    db.delete(rec)
-    db.commit()
+    resources_service.delete_resource_production_kind(db, rec)
     return {"status": "success"}
 
 
 @router.get("/{resource_id}", response_model=ProductionResourceSchema)
 def get_resource(resource_id: int, db: Session = Depends(get_db)):
     """Получить информацию о конкретном участке"""
-    resource = db.query(ProductionResource).filter(ProductionResource.resource_id == resource_id).first()
+    resource = resources_service.get_resource_by_id(db, resource_id)
     if not resource:
         raise HTTPException(status_code=404, detail="Resource not found")
     return resource
