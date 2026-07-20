@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -173,6 +173,14 @@ const purchaseResult: DbrPurchaseLaunchResult = {
   orders: [{ ...purchasePreview.orders[0], number: 'PO-001', status: 'created' }],
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise
+  })
+  return { promise, resolve }
+}
+
 function renderPage() {
   return render(
     <MemoryRouter>
@@ -276,6 +284,52 @@ describe('DbrFeederPage characterization', () => {
       signal_type: 'Под график',
       limit: 5000,
     }))
+  })
+
+  it('keeps the newest signal filter result when an older request resolves last', async () => {
+    const openSignals = deferred<DbrFeederSignal[]>()
+    const diagnosticSignal: DbrFeederSignal = {
+      ...productionSignal,
+      id: 303,
+      dedup_key: 'diagnostic-303',
+      item_code: 'DIAG-01',
+      item_name: 'Диагностическая позиция',
+      status: 'Diagnostic',
+    }
+    vi.mocked(listDbrFeederSignals).mockImplementation(({ status }) => (
+      status === 'Open' ? openSignals.promise : Promise.resolve([diagnosticSignal])
+    ))
+    const user = userEvent.setup()
+    renderPage()
+
+    const signalBar = document.querySelector('.dbrSignalFilters') as HTMLElement
+    await user.selectOptions(
+      within(signalBar).getByRole('combobox', { name: 'Статус сигнала' }),
+      'Diagnostic',
+    )
+    await user.click(within(signalBar).getByPlaceholderText('Сигнал: код или наименование'))
+    await user.keyboard('{Enter}')
+
+    const signalTable = document.querySelector('.dbrSignalTable') as HTMLElement
+    expect(await within(signalTable).findByText('DIAG-01')).toBeVisible()
+    expect(listDbrFeederSignals).toHaveBeenLastCalledWith({
+      search: '',
+      zone: '',
+      status: 'Diagnostic',
+      signal_type: '',
+      limit: 5000,
+    })
+
+    await act(async () => {
+      openSignals.resolve([purchaseSignal, productionSignal])
+      await openSignals.promise
+    })
+
+    await waitFor(() => {
+      expect(within(signalTable).getByText('DIAG-01')).toBeVisible()
+      expect(within(signalTable).queryByText('PUMP-01')).not.toBeInTheDocument()
+    })
+    expect(screen.getByText('Сигналов: 1')).toBeVisible()
   })
 
   it('requires a dry-run preview before confirming a production launch', async () => {
