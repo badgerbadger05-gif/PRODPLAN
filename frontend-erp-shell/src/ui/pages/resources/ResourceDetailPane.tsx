@@ -63,13 +63,23 @@ export function ResourceDetailPane({
                 {kinds.map((kind) => (
                   <span className="resourceTag removableTag" key={kind.id}>
                     {kind.production_kind_name || productionKindName(allKinds, kind.production_kind_id)}
-                    <button onClick={() => onRemoveKind(kind)} disabled={saving}>x</button>
+                    <button
+                      aria-label={`Удалить вид производства ${kind.production_kind_name || productionKindName(allKinds, kind.production_kind_id)}`}
+                      onClick={() => onRemoveKind(kind)}
+                      disabled={saving}
+                    >
+                      x
+                    </button>
                   </span>
                 ))}
                 {!kinds.length && <div className="emptyDetail">Нет привязок видов производства</div>}
               </div>
               <div className="resourceKindAdder">
-                <select value={selectedKind} onChange={(event) => onSelectedKindChange(event.target.value)}>
+                <select
+                  aria-label="Добавить вид производства"
+                  value={selectedKind}
+                  onChange={(event) => onSelectedKindChange(event.target.value)}
+                >
                   <option value="">Добавить вид производства</option>
                   {availableKinds(allKinds, kinds).map((kind) => (
                     <option key={kind.id} value={kind.id}>{kind.name}</option>

@@ -1,106 +1,42 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import type { KeyboardEvent } from 'react'
-import type { ProductionKind, ProductionResource, ProductionResourcePayload, ResourceProductionKind, ResourceStage } from '../../domain/resources'
 import { qty } from '../../lib/format'
-import {
-  addResourceProductionKind,
-  createResource,
-  listProductionKinds,
-  listResourceProductionKinds,
-  listResources,
-  listResourceStages,
-  removeResourceProductionKind,
-  updateResource,
-} from '../../services/resources'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
-import {
-  emptyResourceForm,
-  normalizeResourcePayload,
-  resourceToForm,
-} from './resources/resourceForm'
 import { ResourceDetailPane } from './resources/ResourceDetailPane'
+import { useResourceEditor } from './resources/useResourceEditor'
 
 export function ResourcesPage() {
-  const [rows, setRows] = useState<ProductionResource[]>([])
-  const [activeId, setActiveId] = useState<number | null>(null)
-  const [stages, setStages] = useState<ResourceStage[]>([])
-  const [kinds, setKinds] = useState<ResourceProductionKind[]>([])
-  const [allKinds, setAllKinds] = useState<ProductionKind[]>([])
-  const [selectedKind, setSelectedKind] = useState('')
   const [search, setSearch] = useState('')
-  const [loading, setLoading] = useState(false)
-  const [saving, setSaving] = useState(false)
-  const [creating, setCreating] = useState(false)
-  const [form, setForm] = useState<ProductionResourcePayload>(emptyResourceForm)
-  const [error, setError] = useState('')
-  const [message, setMessage] = useState('')
+  const {
+    active,
+    addKind,
+    allKinds,
+    beginCreate,
+    creating,
+    error,
+    form,
+    kinds,
+    load,
+    loadDetails,
+    loading,
+    message,
+    removeKind,
+    rows,
+    saveResource,
+    saving,
+    selectedKind,
+    selectResource,
+    setForm,
+    setSelectedKind,
+    stages,
+  } = useResourceEditor()
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()
     if (!q) return rows
     return rows.filter((row) => row.resource_name.toLowerCase().includes(q))
   }, [rows, search])
-
-  const active = useMemo(() => creating ? null : rows.find((row) => row.resource_id === activeId) ?? filtered[0] ?? null, [rows, filtered, activeId, creating])
-
-  const load = useCallback(async () => {
-    setLoading(true)
-    setError('')
-    setMessage('')
-    try {
-      const data = await listResources()
-      setRows(data)
-      setActiveId((current) => current && data.some((row) => row.resource_id === current) ? current : data[0]?.resource_id ?? null)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setLoading(false)
-    }
-  }, [])
-
-  const loadProductionKindsCatalog = useCallback(async () => {
-    try {
-      setAllKinds(await listProductionKinds())
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    }
-  }, [])
-
-  const loadDetails = useCallback(async (resource: ProductionResource) => {
-    if (creating) return
-    setActiveId(resource.resource_id)
-    setForm(resourceToForm(resource))
-    setStages([])
-    setKinds([])
-    try {
-      const [nextStages, nextKinds] = await Promise.all([
-        listResourceStages(resource.resource_id),
-        listResourceProductionKinds(resource.resource_id),
-      ])
-      setStages(nextStages)
-      setKinds(nextKinds)
-      setSelectedKind('')
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    }
-  }, [creating])
-
-  function beginCreate() {
-    setCreating(true)
-    setActiveId(null)
-    setStages([])
-    setKinds([])
-    setForm(emptyResourceForm())
-    setError('')
-    setMessage('')
-  }
-
-  function selectResource(resource: ProductionResource) {
-    setCreating(false)
-    setActiveId(resource.resource_id)
-    setForm(resourceToForm(resource))
-  }
 
   function handleResourceKeyDown(event: KeyboardEvent<HTMLTableRowElement>, index: number) {
     if (event.target !== event.currentTarget) return
@@ -125,76 +61,6 @@ export function ResourcesPage() {
       ?.querySelector<HTMLTableRowElement>(`tr[data-resource-id="${nextResource.resource_id}"]`)
       ?.focus()
   }
-
-  async function saveResource() {
-    const payload = normalizeResourcePayload(form)
-    if (!payload.resource_name) {
-      setError('Введите название участка')
-      return
-    }
-    setSaving(true)
-    setError('')
-    setMessage('')
-    try {
-      const saved = creating
-        ? await createResource(payload)
-        : active
-          ? await updateResource(active.resource_id, payload)
-          : null
-      await load()
-      if (saved) {
-        setCreating(false)
-        setActiveId(saved.resource_id)
-        setForm(resourceToForm(saved))
-        setMessage(creating ? 'Участок создан' : 'Участок сохранен')
-      }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  async function addKind() {
-    if (!active || !selectedKind) return
-    setSaving(true)
-    setError('')
-    setMessage('')
-    try {
-      await addResourceProductionKind(active.resource_id, Number(selectedKind))
-      await loadDetails(active)
-      setMessage('Вид производства привязан к участку')
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  async function removeKind(kind: ResourceProductionKind) {
-    if (!active) return
-    setSaving(true)
-    setError('')
-    setMessage('')
-    try {
-      await removeResourceProductionKind(active.resource_id, kind.production_kind_id)
-      await loadDetails(active)
-      setMessage('Привязка вида производства снята')
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  useEffect(() => {
-    void load()
-    void loadProductionKindsCatalog()
-  }, [load, loadProductionKindsCatalog])
-
-  useEffect(() => {
-    if (active) void loadDetails(active)
-  }, [active, loadDetails])
 
   return (
     <main className="workArea">
@@ -232,8 +98,8 @@ export function ResourcesPage() {
           </label>
         </div>
 
-        {error && <div className="errorLine">{error}</div>}
-        {message && <div className="successLine">{message}</div>}
+        {error && <div className="errorLine" role="alert">{error}</div>}
+        {message && <div className="successLine" role="status">{message}</div>}
 
         <div className="split">
           <div className="tablePane">

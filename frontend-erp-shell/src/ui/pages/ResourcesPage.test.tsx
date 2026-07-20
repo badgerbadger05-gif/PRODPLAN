@@ -177,6 +177,41 @@ describe('ResourcesPage characterization', () => {
     expect(screen.getByLabelText('Название участка')).toHaveValue('Сборочный участок')
   })
 
+  it('ignores stale detail responses after selecting another resource', async () => {
+    let resolveFirstStages!: (value: ResourceStage[]) => void
+    let resolveFirstKinds!: (value: ResourceProductionKind[]) => void
+    const firstStages = new Promise<ResourceStage[]>((resolve) => {
+      resolveFirstStages = resolve
+    })
+    const firstKinds = new Promise<ResourceProductionKind[]>((resolve) => {
+      resolveFirstKinds = resolve
+    })
+    vi.mocked(listResourceStages).mockImplementation((resourceId) => (
+      resourceId === 1 ? firstStages : Promise.resolve(stagesByResource[resourceId] ?? [])
+    ))
+    vi.mocked(listResourceProductionKinds).mockImplementation((resourceId) => (
+      resourceId === 1 ? firstKinds : Promise.resolve(kindsByResource[resourceId] ?? [])
+    ))
+
+    const user = userEvent.setup()
+    render(<ResourcesPage />)
+    await resourcesTable().findByText('Сборочный участок')
+    await user.click(resourcesTable().getByText('Сборочный участок'))
+
+    expect(await screen.findByText('Сборка')).toBeVisible()
+    resolveFirstStages(stagesByResource[1])
+    resolveFirstKinds(kindsByResource[1])
+
+    await waitFor(() => {
+      expect(screen.queryByText('Токарная обработка')).not.toBeInTheDocument()
+      expect(screen.queryByRole('button', {
+        name: 'Удалить вид производства Мехобработка',
+      })).not.toBeInTheDocument()
+    })
+    expect(screen.getByText('Сборка')).toBeVisible()
+    expect(screen.getByLabelText('Название участка')).toHaveValue('Сборочный участок')
+  })
+
   it('validates and creates a resource with normalized defaults', async () => {
     const user = userEvent.setup()
     render(<ResourcesPage />)
@@ -232,12 +267,12 @@ describe('ResourcesPage characterization', () => {
     render(<ResourcesPage />)
     await screen.findByText('Токарная обработка')
 
-    await user.selectOptions(screen.getByRole('combobox', { name: '' }), '11')
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Добавить вид производства' }), '11')
     await user.click(screen.getByRole('button', { name: /^Добавить$/ }))
     await waitFor(() => expect(addResourceProductionKind).toHaveBeenCalledWith(1, 11))
     expect(await screen.findByText('Вид производства привязан к участку')).toBeVisible()
 
-    await user.click(screen.getByRole('button', { name: 'x' }))
+    await user.click(screen.getByRole('button', { name: 'Удалить вид производства Мехобработка' }))
     await waitFor(() => expect(removeResourceProductionKind).toHaveBeenCalledWith(1, 10))
     expect(await screen.findByText('Привязка вида производства снята')).toBeVisible()
     expect(listResourceProductionKinds).toHaveBeenCalledTimes(3)
