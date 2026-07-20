@@ -62,7 +62,7 @@ export function PurchaseControlPage() {
   )
   const journal = useDoctypeList(doctype, { limit, access })
   const rows = journal.rows
-  const [summary, setSummary] = useState<PurchaseJournalSummary | null>(null)
+  const summary = (journal.listMeta.summary as PurchaseJournalSummary | undefined) ?? null
   const [selectedPurchaseRowKeys, setSelectedPurchaseRowKeys] = useState<Set<string>>(new Set())
   const [commandLoading, setCommandLoading] = useState(false)
   const loading = journal.loading || commandLoading
@@ -82,7 +82,6 @@ export function PurchaseControlPage() {
   )
 
   useEffect(() => {
-    setSummary((journal.listMeta.summary as PurchaseJournalSummary | undefined) ?? null)
     const visibleRowKeys = new Set(
       rows
         .filter((row) => row.line_status === 'to_order' && purchaseIdsForRow(row).length > 0)
@@ -92,7 +91,7 @@ export function PurchaseControlPage() {
       const pruned = new Set([...current].filter((rowKey) => visibleRowKeys.has(rowKey)))
       return pruned.size === current.size ? current : pruned
     })
-  }, [journal.listMeta.summary, rows])
+  }, [rows])
 
   const loadFilters = useCallback(async () => {
     try {

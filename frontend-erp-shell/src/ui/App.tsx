@@ -1,6 +1,7 @@
-import { lazy, Suspense } from 'react'
-import { Link, NavLink, Route, Routes } from 'react-router-dom'
+import { lazy, Suspense, useMemo } from 'react'
+import { Link, NavLink, Route, Routes, useNavigate } from 'react-router-dom'
 import { ErrorBoundary } from './ErrorBoundary'
+import { KeyboardShortcutShell, type KeyboardShortcut } from './platform'
 import { frontendResources } from './resourceRegistry'
 
 const DbrDrumBoardPage = lazy(() => import('./pages/DbrDrumBoardPage').then((module) => ({ default: module.DbrDrumBoardPage })))
@@ -27,8 +28,21 @@ function RouteLoading() {
 }
 
 export function App() {
+  const navigate = useNavigate()
+  const navigationShortcuts = useMemo<KeyboardShortcut[]>(
+    () => frontendResources
+      .filter((resource) => resource.shortcut)
+      .map((resource) => ({
+        id: `navigate-${resource.name}`,
+        keys: resource.shortcut!,
+        run: () => navigate(resource.to),
+      })),
+    [navigate],
+  )
+
   return (
     <div className="app">
+      <KeyboardShortcutShell shortcuts={navigationShortcuts} />
       <aside className="nav">
         <div className="brand">
           <div className="brandMark">P</div>
@@ -45,6 +59,7 @@ export function App() {
             className={({ isActive }) => `navItem${isActive ? ' active' : ''}`}
           >
             {resource.title}
+            {resource.shortcut && <span className="navShortcut">{resource.shortcut}</span>}
           </NavLink>
         ))}
         <div className="navLogoSlot" aria-label="Логотип компании ЗСМ">

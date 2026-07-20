@@ -143,14 +143,23 @@ input:focus, select:focus {
 }
 
 .navItem {
+  display: flex;
+  align-items: center;
   height: 32px;
   margin: 0 6px;
   border: 1px solid transparent;
   background: transparent;
   color: #d9e0e8;
   text-align: left;
-  padding-left: 14px;
+  padding: 0 10px 0 14px;
   box-shadow: none;
+}
+
+.navShortcut {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 400;
 }
 
 .navItem.active {
