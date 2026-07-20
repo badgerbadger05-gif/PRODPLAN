@@ -4,6 +4,7 @@ import { CommandBar } from './CommandBar'
 import { DoctypeTable } from './DoctypeTable'
 import { FilterBar } from './FilterBar'
 import { FormRenderer } from './FormRenderer'
+import { DialogHost, type DialogRegistry } from '../platform'
 import type { Doctype } from './types'
 import type { DoctypeListState } from './useDoctypeList'
 import type { AccessSubject } from './permissions'
@@ -17,6 +18,7 @@ type Props<Row, Filters extends object, Detail> = {
   access: AccessSubject
   renderDetail?: (value: Detail | Row, state: DoctypeListState<Row, Filters, Detail>) => ReactNode
   renderDialog?: (dialog: NonNullable<DoctypeListState<Row, Filters, Detail>['dialog']>, close: () => void) => ReactNode
+  dialogRegistry?: DialogRegistry
   onRowDoubleClick?: (row: Row) => void
   renderFilters?: (state: DoctypeListState<Row, Filters, Detail>) => ReactNode
 }
@@ -28,6 +30,7 @@ export function DoctypePage<Row, Filters extends object, Detail>({
   access,
   renderDetail,
   renderDialog,
+  dialogRegistry = {},
   onRowDoubleClick,
   renderFilters,
 }: Props<Row, Filters, Detail>) {
@@ -81,7 +84,27 @@ export function DoctypePage<Row, Filters extends object, Detail>({
             </aside>
           )}
         </div>
-        {state.dialog && renderDialog?.(state.dialog, state.closeDialog)}
+        {state.dialog && (
+          renderDialog
+            ? renderDialog(state.dialog, state.closeDialog)
+            : (
+                <DialogHost
+                  dialog={{
+                    name: state.dialog.dialog,
+                    props: (
+                      state.dialog.payload !== null
+                      && typeof state.dialog.payload === 'object'
+                      && !Array.isArray(state.dialog.payload)
+                    )
+                      ? state.dialog.payload
+                      : { payload: state.dialog.payload },
+                    accessibleName: state.dialog.accessibleName ?? state.dialog.dialog,
+                  } as never}
+                  registry={dialogRegistry}
+                  onClose={state.closeDialog}
+                />
+              )
+        )}
       </DocumentWindow>
     </main>
   )

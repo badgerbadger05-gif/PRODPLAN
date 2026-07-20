@@ -57,6 +57,7 @@ export type FilterDef<Filters> =
 export type DialogRequest = {
   dialog: string
   payload?: unknown
+  accessibleName?: string
 }
 
 export type ActionResult = {
