@@ -42,9 +42,8 @@ from .one_c_export_common import (
     config_ref1c as _config_ref1c,
     create_odata_client as _create_odata_client,
     current_1c_datetime as _current_1c_datetime,
-    find_sync_link as _find_sync_link,
+    make_sync_link_helpers as _make_sync_link_helpers,
     post_export_entries as _post_export_entries,
-    upsert_sync_link as _upsert_sync_link,
 )
 from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
@@ -242,18 +241,15 @@ def _export_defaults(config: Dict[str, Any]) -> StockTransferExportDefaults:
     )
 
 
-def _existing_link(db: Session, issue_id: int) -> Optional[SyncLink]:
-    return _find_sync_link(
-        db,
-        SyncLink,
-        source_doctype="material_issue",
-        source_id=int(issue_id),
-        target_entity=STOCK_TRANSFER_ENTITY,
-    )
-
-
-def _short_transfer_number(issue_id: int) -> str:
-    return f"MT{int(issue_id) % 1_000_000_000:09d}"
+# Sync-link lookup / write bound to this document family. Shared factory lives
+# in one_c_export_common; only doctype, entity and the entry accessors differ.
+_existing_link, _upsert_link = _make_sync_link_helpers(
+    SyncLink,
+    source_doctype="material_issue",
+    target_entity=STOCK_TRANSFER_ENTITY,
+    entry_source_id=lambda entry: entry.issue_id,
+    entry_number=lambda entry: entry.document_number,
+)
 
 
 def _guid_or_empty(value: Optional[str]) -> str:
@@ -467,29 +463,6 @@ def _build_header_payload(
     payload["ДокументОснование"] = entry.order_ref1c
     payload["ДокументОснование_Type"] = "StandardODATA.Document_ЗаказНаПроизводство"
     return payload
-
-
-def _upsert_link(
-    db: Session,
-    *,
-    entry: StockTransferExportEntry,
-    payload_hash: str,
-    target_ref_key: Optional[str],
-    status: str,
-    last_error: Optional[str],
-) -> None:
-    _upsert_sync_link(
-        db,
-        SyncLink,
-        source_doctype="material_issue",
-        source_id=int(entry.issue_id),
-        target_entity=STOCK_TRANSFER_ENTITY,
-        target_number=entry.document_number,
-        payload_hash=payload_hash,
-        target_ref_key=target_ref_key,
-        status=status,
-        last_error=last_error,
-    )
 
 
 def _mark_issue_exported(

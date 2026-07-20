@@ -55,10 +55,9 @@ from .one_c_export_common import (
     config_ref1c as _config_ref1c,
     create_odata_client as _create_odata_client,
     current_1c_datetime as _current_1c_datetime,
-    find_sync_link as _find_sync_link,
+    make_sync_link_helpers as _make_sync_link_helpers,
     post_document_operational as _post_document_operational,
     post_export_entries as _post_export_entries,
-    upsert_sync_link as _upsert_sync_link,
 )
 from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
@@ -97,19 +96,15 @@ class ManufactureExportEntry:
     reason: Optional[str] = None
 
 
-def _short_manufacture_number(manufacture_id: int) -> str:
-    """Short, recognizable, unique number that fits 1C's Number column."""
-    return f"PM{int(manufacture_id) % 1_000_000_000:09d}"
-
-
-def _existing_link(db: Session, manufacture_id: int) -> Optional[SyncLink]:
-    return _find_sync_link(
-        db,
-        SyncLink,
-        source_doctype="manufacture",
-        source_id=int(manufacture_id),
-        target_entity=MANUFACTURE_ENTITY,
-    )
+# Sync-link lookup / write bound to this document family. Shared factory lives
+# in one_c_export_common; only doctype, entity and the entry accessors differ.
+_existing_link, _upsert_link = _make_sync_link_helpers(
+    SyncLink,
+    source_doctype="manufacture",
+    target_entity=MANUFACTURE_ENTITY,
+    entry_source_id=lambda entry: entry.manufacture_id,
+    entry_number=lambda entry: entry.number,
+)
 
 
 def _binding_for_product(db: Session, product: ProductionProduct) -> Optional[WorkshopWarehouseBinding]:
@@ -614,29 +609,6 @@ def _build_header_payload(entry: ManufactureExportEntry, config: Optional[Dict[s
     assert entry.order_ref1c, "manufacture export requires order_ref1c basis"
     payload["ЗаказНаПроизводство_Key"] = entry.order_ref1c
     return payload
-
-
-def _upsert_link(
-    db: Session,
-    *,
-    entry: ManufactureExportEntry,
-    payload_hash: str,
-    target_ref_key: Optional[str],
-    status: str,
-    last_error: Optional[str],
-) -> None:
-    _upsert_sync_link(
-        db,
-        SyncLink,
-        source_doctype="manufacture",
-        source_id=int(entry.manufacture_id),
-        target_entity=MANUFACTURE_ENTITY,
-        target_number=entry.number,
-        payload_hash=payload_hash,
-        target_ref_key=target_ref_key,
-        status=status,
-        last_error=last_error,
-    )
 
 
 def _chain_export_parent_orders(

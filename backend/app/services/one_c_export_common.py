@@ -150,6 +150,69 @@ def upsert_sync_link(
         existing.last_synced_at = synced_at
 
 
+def make_sync_link_helpers(
+    sync_link_model: Any,
+    *,
+    source_doctype: str,
+    target_entity: str,
+    entry_source_id: Callable[[Any], Any],
+    entry_number: Callable[[Any], str],
+) -> Tuple[Callable[..., Any], Callable[..., None]]:
+    """
+    Build the (find_existing_link, upsert_link) pair shared by every
+    single-document 1C export service (manufacture / production order /
+    stock transfer / piecework).
+
+    Each of those families historically carried its own byte-identical
+    `_existing_link` / `_upsert_link` wrappers. They differ in only three
+    things: the sync_link `source_doctype`, the 1C `target_entity`, and which
+    attributes on the family's export entry hold the source id and the document
+    number. Everything else — the lookup query and the create-or-update write —
+    already lives in find_sync_link / upsert_sync_link. This factory captures
+    the three differing bits once so the services stop re-implementing the same
+    two wrappers.
+
+    The returned callables keep the historical signatures exactly:
+        find_existing_link(db, source_id) -> sync_link_model | None
+        upsert_link(db, *, entry, payload_hash, target_ref_key,
+                    status, last_error) -> None
+    so existing call sites are unchanged.
+    """
+
+    def find_existing_link(db: Any, source_id: Any) -> Any:
+        return find_sync_link(
+            db,
+            sync_link_model,
+            source_doctype=source_doctype,
+            source_id=int(source_id),
+            target_entity=target_entity,
+        )
+
+    def upsert_link(
+        db: Any,
+        *,
+        entry: Any,
+        payload_hash: str,
+        target_ref_key: Optional[str],
+        status: str,
+        last_error: Optional[str],
+    ) -> None:
+        upsert_sync_link(
+            db,
+            sync_link_model,
+            source_doctype=source_doctype,
+            source_id=int(entry_source_id(entry)),
+            target_entity=target_entity,
+            target_number=entry_number(entry),
+            payload_hash=payload_hash,
+            target_ref_key=target_ref_key,
+            status=status,
+            last_error=last_error,
+        )
+
+    return find_existing_link, upsert_link
+
+
 def post_document_operational(
     client: Any,
     *,

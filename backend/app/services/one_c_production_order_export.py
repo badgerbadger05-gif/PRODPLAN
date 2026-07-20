@@ -53,11 +53,10 @@ from .one_c_export_common import (
     config_ref1c as _config_ref1c,
     create_odata_client as _create_odata_client,
     current_1c_datetime as _current_1c_datetime,
-    find_sync_link as _find_sync_link,
     fmt_1c_datetime as _fmt_1c_datetime,
+    make_sync_link_helpers as _make_sync_link_helpers,
     post_document_operational as _post_document_operational,
     post_export_entries as _post_export_entries,
-    upsert_sync_link as _upsert_sync_link,
 )
 from .one_c_document_numbers import production_order_number
 from .odata_config import load_odata_config as _load_odata_config
@@ -159,18 +158,6 @@ def _export_defaults(config: Dict[str, Any]) -> ProductionOrderExportDefaults:
     )
 
 
-def _short_order_number(order_id: int, run_id: Optional[int]) -> str:
-    """
-    Short, recognizable, unique-per-MRP-order number that fits 1C's Number
-    column (per plan: 1C truncates long strings).
-    Format: PP{run_id:04d}{order_id:05d}. Total length 11 chars, well under
-    1C's typical Number limit. Collisions impossible while order_id is < 10^5
-    within a single run_id.
-    """
-    run_part = (int(run_id) if run_id is not None else 0) % 10000
-    return f"PP{run_part:04d}{int(order_id) % 100000:05d}"
-
-
 def _workshop_warehouse_refs(db: Session, workshop_id: Optional[int]) -> Tuple[Optional[str], Optional[str]]:
     binding = warehouse_binding_for_workshop(db, workshop_id)
     if not binding:
@@ -269,14 +256,15 @@ def _operations_for_spec(
     return result
 
 
-def _existing_link(db: Session, order_id: int) -> Optional[SyncLink]:
-    return _find_sync_link(
-        db,
-        SyncLink,
-        source_doctype="production_order",
-        source_id=int(order_id),
-        target_entity=PRODUCTION_ORDER_ENTITY,
-    )
+# Sync-link lookup / write bound to this document family. Shared factory lives
+# in one_c_export_common; only doctype, entity and the entry accessors differ.
+_existing_link, _upsert_link = _make_sync_link_helpers(
+    SyncLink,
+    source_doctype="production_order",
+    target_entity=PRODUCTION_ORDER_ENTITY,
+    entry_source_id=lambda entry: entry.order_id,
+    entry_number=lambda entry: entry.number,
+)
 
 
 def _combine_planned_date_with_time(value: Optional[Any], time_source: str) -> Optional[str]:
@@ -564,29 +552,6 @@ def _build_header_payload(
         payload["СтруктурнаяЕдиницаОпераций_Key"] = defaults.operation_structural_unit_ref1c
     payload["СтруктурнаяЕдиницаРезерв_Key"] = entry.reserve_structural_unit_ref1c or EMPTY_REF1C
     return payload
-
-
-def _upsert_link(
-    db: Session,
-    *,
-    entry: ProductionOrderExportEntry,
-    payload_hash: str,
-    target_ref_key: Optional[str],
-    status: str,
-    last_error: Optional[str],
-) -> None:
-    _upsert_sync_link(
-        db,
-        SyncLink,
-        source_doctype="production_order",
-        source_id=int(entry.order_id),
-        target_entity=PRODUCTION_ORDER_ENTITY,
-        target_number=entry.number,
-        payload_hash=payload_hash,
-        target_ref_key=target_ref_key,
-        status=status,
-        last_error=last_error,
-    )
 
 
 def export_production_orders_to_1c(
