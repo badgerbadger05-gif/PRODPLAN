@@ -204,6 +204,35 @@ describe('SpecificationPage characterization', () => {
     expect(await screen.findByText('Загружено: НАС-01 · Насос ГА-1')).toBeVisible()
   })
 
+  it('keeps the picker modal and returns focus to its search trigger', async () => {
+    const user = userEvent.setup()
+    vi.mocked(searchSpecificationItems)
+      .mockResolvedValueOnce({ items: [pump], meta: { count: 1 } })
+      .mockResolvedValueOnce({ items: [pump, reducer], meta: { count: 2 } })
+    renderPage()
+
+    await searchFor(user, 'НАС-01')
+    expect(await screen.findByText('Загружено: НАС-01 · Насос ГА-1')).toBeVisible()
+
+    await searchFor(user, 'узел')
+    const searchTrigger = screen.getByRole('button', { name: 'Найти' })
+    const dialog = await screen.findByRole('dialog', { name: 'Найдено позиций: 2 — выберите' })
+    expect(dialog).toHaveAttribute('aria-modal', 'true')
+
+    const firstAction = within(dialog).getAllByRole('button', { name: 'Открыть' })[0]
+    const closeAction = within(dialog).getByRole('button', { name: 'Закрыть' })
+    await waitFor(() => expect(firstAction).toHaveFocus())
+
+    await user.tab({ shift: true })
+    expect(closeAction).toHaveFocus()
+    await user.tab()
+    expect(firstAction).toHaveFocus()
+
+    await user.keyboard('{Escape}')
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(searchTrigger).toHaveFocus()
+  })
+
   it('auto-loads a single result through all four BOM endpoints in parallel', async () => {
     const user = userEvent.setup()
     vi.mocked(searchSpecificationItems).mockResolvedValue({ items: [pump], meta: { count: 1 } })
