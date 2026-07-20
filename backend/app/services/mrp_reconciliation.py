@@ -36,7 +36,7 @@ additionally deduped against supplier orders already arriving and
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
@@ -75,6 +75,7 @@ from .replenishment import (
     REPLENISHMENT_FLOW_PURCHASE,
     classify_replenishment_flow,
 )
+from .paint_weld_pairs import is_welded_blocked
 
 EPS = 1e-9
 FIXED_SNAPSHOT_STATUS = "FIXED_SNAPSHOT"
@@ -359,6 +360,7 @@ def _split_oversized_catchup_batches(
     *,
     dry_run: bool,
     now: datetime,
+    exclude_item_ids: Optional[Set[int]] = None,
 ) -> Dict[str, Any]:
     rows = (
         db.query(ProductionProduct, ProductionOrder, ProductionOrderLineState, Item, MrpRequirement)
@@ -384,6 +386,8 @@ def _split_oversized_catchup_batches(
     repaired: List[Dict[str, Any]] = []
     created_count = 0
     for product, order, state, item, req in rows:
+        if exclude_item_ids and int(product.item_id) in exclude_item_ids:
+            continue
         total = _to_float(product.remaining_qty)
         batch = _to_float(item.optimal_batch)
         if total <= batch + EPS:
@@ -710,6 +714,10 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
     )
     orphan_link_repair = _link_orphan_mrp_products_to_requirements(db, run, req_by_item)
     item_ids = sorted(current_net_by_item)
+    # Сварные детали активных пар «окраска↔сварка»: догоняющие заказы на них не
+    # материализуются (заказываются по цепочке от окраски). Сироты (нет активной
+    # пары) не входят и материализуются как раньше.
+    welded_blocked = is_welded_blocked(db, item_ids)
     active_production_by_item = _active_production_qty_by_item(db, item_ids)
     items_by_id: Dict[int, Item] = {
         int(r.item_id): r
@@ -771,6 +779,11 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
             if req is not None:
                 req.covered_qty = min(open_qty, current_net)
                 req.remaining_qty = max(current_net - _to_float(req.covered_qty), 0.0)
+            if iid in welded_blocked:
+                # Сварная деталь активной пары: остаток и открытые заказы уже
+                # учтены выше (нетто/covered), догоняющий заказ не создаём —
+                # потребность закроется цепочкой от окрасочного заказа.
+                continue
             gap = max(current_net - open_qty, 0.0)
             if gap <= EPS:
                 continue
@@ -880,7 +893,9 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
             purchase_added.append(entry)
         # rework flow is intentionally not auto-topped-up in v1.
 
-    batch_repair = _split_oversized_catchup_batches(db, run, dry_run=dry_run, now=now)
+    batch_repair = _split_oversized_catchup_batches(
+        db, run, dry_run=dry_run, now=now, exclude_item_ids=welded_blocked
+    )
     binding_repair = (
         {"checked": 0, "spec_updated": 0, "workshop_auto_cleared": 0, "local_issues_deleted": 0, "blocked": {}}
         if dry_run
@@ -890,7 +905,9 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
     # Re-anchor every production line that is NOT yet open in 1C to a fresh
     # capacity-aware, child→parent-aware schedule starting today. Lines already
     # open in 1C stay where they are and pre-book their capacity.
-    reschedule = _reschedule_run_journal(db, run, dry_run=dry_run)
+    reschedule = _reschedule_run_journal(
+        db, run, dry_run=dry_run, exclude_item_ids=welded_blocked
+    )
 
     if dry_run:
         db.rollback()
@@ -962,7 +979,13 @@ def _stage_hours_and_areas(
     return stage_hours, stage_areas
 
 
-def _reschedule_run_journal(db: Session, run: PlanningRun, *, dry_run: bool) -> Dict[str, Any]:
+def _reschedule_run_journal(
+    db: Session,
+    run: PlanningRun,
+    *,
+    dry_run: bool,
+    exclude_item_ids: Optional[Set[int]] = None,
+) -> Dict[str, Any]:
     """
     Recompute planned start/finish for the run's production journal lines.
 
@@ -988,6 +1011,8 @@ def _reschedule_run_journal(db: Session, run: PlanningRun, *, dry_run: bool) -> 
         .filter(ProductionProduct.source_mrp_requirement_id.in_(req_ids))
         .all()
     )
+    if exclude_item_ids:
+        rows = [row for row in rows if int(row[0].item_id) not in exclude_item_ids]
     if not rows:
         return {"floating": 0, "fixed": 0, "warnings": []}
 

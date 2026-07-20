@@ -48,6 +48,15 @@ export type OrderRow = {
   mrp_req_remaining_qty?: number | null
   failed_manufacture_id?: number | null
   failed_manufacture_error?: string | null
+  paint_weld_chain?: PaintWeldChainInfo | null
+}
+
+// Цепочка «окраска↔сварка»: строка входит в связанную пару заказов.
+export type PaintWeldChainInfo = {
+  role: 'painted' | 'welded'
+  link_id: number
+  counterpart_order_id?: number | null
+  counterpart_product_id?: number | null
 }
 
 export type MaterialRow = {

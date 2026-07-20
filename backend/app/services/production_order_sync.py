@@ -8,7 +8,13 @@ from collections import defaultdict
 
 from sqlalchemy.orm import Session
 
-from ..models import ProductionOrder, ProductionProduct, Item
+from ..models import (
+    Item,
+    ProductionOrder,
+    ProductionOrderLineState,
+    ProductionProduct,
+    WorkshopWarehouseBinding,
+)
 from ..schemas import ODataSyncRequest
 
 
@@ -104,6 +110,47 @@ def _norm_guid(val) -> str:
     return s
 
 
+def _nonzero_guid(val) -> Optional[str]:
+    normalized = _norm_guid(val)
+    if not normalized or normalized == "00000000-0000-0000-0000-000000000000":
+        return None
+    return normalized
+
+
+def _resolve_product_destination(
+    db: Session,
+    product_row: Dict,
+    order_row: Dict,
+    existing_product: Optional[ProductionProduct] = None,
+) -> tuple[Optional[str], str]:
+    """Resolve exact production inbound destination and its diagnostic source."""
+    line_ref = _nonzero_guid(product_row.get("СтруктурнаяЕдиница_Key"))
+    if line_ref:
+        return line_ref, "line"
+    header_ref = _nonzero_guid(
+        order_row.get("СтруктурнаяЕдиницаПродукции_Key")
+    )
+    if header_ref:
+        return header_ref, "header"
+    if existing_product is not None and existing_product.product_id is not None:
+        binding_ref = (
+            db.query(WorkshopWarehouseBinding.production_warehouse_ref1c)
+            .join(
+                ProductionOrderLineState,
+                ProductionOrderLineState.workshop_id
+                == WorkshopWarehouseBinding.workshop_id,
+            )
+            .filter(
+                ProductionOrderLineState.product_id == existing_product.product_id
+            )
+            .scalar()
+        )
+        binding_ref = _nonzero_guid(binding_ref)
+        if binding_ref:
+            return binding_ref, "binding"
+    return None, "unresolved"
+
+
 def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
     """
     Синхронизация заказов на производство из 1С через OData.
@@ -140,6 +187,7 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
             "Posted",
             "DeletionMark",
             "СостояниеЗаказа_Key",
+            "СтруктурнаяЕдиницаПродукции_Key",
         ]
         
         # Фильтр заказов для расчёта:
@@ -161,7 +209,12 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
         # Даже если клиент прислал кастомный select_fields, принудительно добавляем
         # поля, нужные для корректной фильтрации активных заказов.
         effective_select_fields = list(req.select_fields or orders_select_default)
-        for required_field in ("Posted", "DeletionMark", "СостояниеЗаказа_Key"):
+        for required_field in (
+            "Posted",
+            "DeletionMark",
+            "СостояниеЗаказа_Key",
+            "СтруктурнаяЕдиницаПродукции_Key",
+        ):
             if required_field not in effective_select_fields:
                 effective_select_fields.append(required_field)
 
@@ -264,6 +317,7 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
             "LineNumber",
             "Номенклатура_Key",
             "Количество",
+            "СтруктурнаяЕдиница_Key",
         ]
         order_keys: List[str] = []
         for r in order_data:
@@ -409,17 +463,23 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
                                 item_id=item.item_id,
                             ).first()
 
+                        destination_ref, _destination_source = _resolve_product_destination(
+                            db, prod_data, record, existing_product
+                        )
+
                         if existing_product:
                             if (existing_product.quantity != quantity or
                                 existing_product.spec_id != (spec.spec_id if spec else None) or
                                 existing_product.stage_id != (stage.stage_id if stage else None) or
                                 getattr(existing_product, "line_number", None) != line_number or
-                                getattr(existing_product, "characteristic_ref1c", None) != characteristic_key):
+                                getattr(existing_product, "characteristic_ref1c", None) != characteristic_key or
+                                existing_product.destination_warehouse_ref1c != destination_ref):
                                 existing_product.quantity = quantity
                                 existing_product.spec_id = spec.spec_id if spec else None
                                 existing_product.stage_id = stage.stage_id if stage else None
                                 existing_product.line_number = line_number
                                 existing_product.characteristic_ref1c = characteristic_key
+                                existing_product.destination_warehouse_ref1c = destination_ref
                                 products_updated += 1
                         else:
                             # Создаём новую строку продукции
@@ -429,6 +489,7 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
                                 item_id=item.item_id,
                                 line_number=line_number,
                                 characteristic_ref1c=characteristic_key,
+                                destination_warehouse_ref1c=destination_ref,
                                 quantity=quantity,
                                 produced_qty=0.0,
                                 remaining_qty=quantity,
@@ -487,6 +548,24 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
             except Exception as e:
                 print(f"[FACT SYNC WARNING] {e}")
                 # Не прерываем основную синхронизацию из-за ошибки факта
+
+            # DBR feedback (Фаза 3): двигаем статусы слотов/сигналов по факту
+            # выпуска материализованных заказов. Best-effort — сбой обратной
+            # связи НЕ должен ронять синк заказов (общий несущий сервис).
+            try:
+                from .dbr.feedback_service import apply_order_feedback
+
+                fb_stats = apply_order_feedback(db)
+                print(
+                    f"[DBR FEEDBACK] slots_updated={fb_stats.get('slots_updated', 0)}, "
+                    f"signals_updated={fb_stats.get('signals_updated', 0)}"
+                )
+            except Exception as e:
+                print(f"[DBR FEEDBACK WARNING] {e}")
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
 
     except Exception as e:
         db.rollback()

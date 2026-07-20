@@ -4,6 +4,7 @@ import html
 from datetime import date, datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
@@ -13,6 +14,7 @@ from ..models import (
     ItemWarehouseStock,
     MrpRequirement,
     Operation,
+    PaintWeldChainLink,
     PlanningRun,
     ProductionPlanHeader,
     ProductionPlanLine,
@@ -35,7 +37,9 @@ def mark_route_sheets_printed(db: Session, product_ids: Iterable[int]) -> int:
     if not ids:
         return 0
 
-    unique_ids = sorted(set(ids))
+    # Строки цепочки «окраска↔сварка» штампуются вместе: лист один на оба заказа.
+    render_ids, weld_pid_by_paint_pid = _paint_weld_chain_for_ids(db, ids)
+    unique_ids = sorted(set(ids) | set(render_ids) | set(weld_pid_by_paint_pid.values()))
     existing_ids = {
         int(row.product_id)
         for row in db.query(ProductionProduct.product_id)
@@ -505,6 +509,89 @@ def _material_transfer_rows_for_products(
     return result
 
 
+def _paint_weld_chain_for_ids(
+    db: Session, product_ids: Sequence[int]
+) -> Tuple[List[int], Dict[int, int]]:
+    """
+    Схлопнуть строки цепочки «окраска↔сварка» (paint_weld_chain_links) в один
+    лист: печать с любой стороны цепочки даёт лист окрасочного (родительского)
+    заказа, выбор обеих строк не даёт дубля.
+
+    Возвращает (render_ids, weld_pid_by_paint_pid): render_ids — product_id к
+    печати в исходном порядке (сварная сторона заменена окрасочным якорем);
+    weld_pid_by_paint_pid — {окрасочный product_id: сварочный product_id}.
+    """
+    ids = [int(pid) for pid in product_ids]
+    if not ids:
+        return [], {}
+    # Один запрос в обычном (нецепочечном) случае: подзапрос по заказам
+    # выбранных продуктов вместо отдельной выборки order_id.
+    order_subquery = (
+        select(ProductionProduct.order_id)
+        .where(ProductionProduct.product_id.in_(sorted(set(ids))))
+        .scalar_subquery()
+    )
+    links = (
+        db.query(PaintWeldChainLink)
+        .filter(
+            (PaintWeldChainLink.painted_order_id.in_(order_subquery))
+            | (PaintWeldChainLink.welded_order_id.in_(order_subquery))
+        )
+        .all()
+    )
+    if not links:
+        return ids, {}
+
+    order_by_pid = {
+        int(pid): int(oid)
+        for pid, oid in db.query(ProductionProduct.product_id, ProductionProduct.order_id)
+        .filter(ProductionProduct.product_id.in_(sorted(set(ids))))
+        .all()
+        if oid is not None
+    }
+
+    chain_order_ids = sorted(
+        {int(link.painted_order_id) for link in links}
+        | {int(link.welded_order_id) for link in links}
+    )
+    pid_by_order: Dict[int, int] = {}
+    for pid, oid in (
+        db.query(ProductionProduct.product_id, ProductionProduct.order_id)
+        .filter(ProductionProduct.order_id.in_(chain_order_ids))
+        .order_by(
+            ProductionProduct.order_id.asc(),
+            ProductionProduct.line_number.asc(),
+            ProductionProduct.product_id.asc(),
+        )
+        .all()
+    ):
+        pid_by_order.setdefault(int(oid), int(pid))
+
+    weld_pid_by_paint_pid: Dict[int, int] = {}
+    paint_pid_by_order: Dict[int, int] = {}
+    for link in links:
+        paint_pid = pid_by_order.get(int(link.painted_order_id))
+        weld_pid = pid_by_order.get(int(link.welded_order_id))
+        if paint_pid is None or weld_pid is None:
+            continue
+        weld_pid_by_paint_pid[paint_pid] = weld_pid
+        paint_pid_by_order[int(link.painted_order_id)] = paint_pid
+        paint_pid_by_order[int(link.welded_order_id)] = paint_pid
+
+    render_ids: List[int] = []
+    seen_anchors: set[int] = set()
+    for pid in ids:
+        anchor = paint_pid_by_order.get(order_by_pid.get(pid, -1))
+        if anchor is None:
+            render_ids.append(pid)  # вне цепочки — прежнее поведение
+            continue
+        if anchor in seen_anchors:
+            continue
+        seen_anchors.add(anchor)
+        render_ids.append(anchor)
+    return render_ids, weld_pid_by_paint_pid
+
+
 def _route_sheet_print_data(
     db: Session,
     product_ids: Sequence[int],
@@ -515,11 +602,14 @@ def _route_sheet_print_data(
     Dict[int, Dict[str, str]],
     Dict[int, List[Dict[str, str]]],
     Dict[str, str],
+    Dict[int, Dict[str, Any]],
 ]:
     ids = [int(product_id) for product_id in product_ids]
     if not ids:
-        return [], {}, {}, {}, {}, {}
+        return [], {}, {}, {}, {}, {}, {}
 
+    render_ids, weld_pid_by_paint_pid = _paint_weld_chain_for_ids(db, ids)
+    fetch_ids = sorted(set(render_ids) | set(weld_pid_by_paint_pid.values()))
     products = (
         db.query(ProductionProduct)
         .options(
@@ -527,11 +617,11 @@ def _route_sheet_print_data(
             joinedload(ProductionProduct.item),
             joinedload(ProductionProduct.control_state).joinedload(ProductionOrderLineState.workshop),
         )
-        .filter(ProductionProduct.product_id.in_(sorted(set(ids))))
+        .filter(ProductionProduct.product_id.in_(fetch_ids))
         .all()
     )
     product_map = {int(product.product_id): product for product in products}
-    ordered = [product_map[product_id] for product_id in ids if product_id in product_map]
+    ordered = [product_map[product_id] for product_id in render_ids if product_id in product_map]
 
     default_spec_by_item = _first_default_specs(
         db,
@@ -589,7 +679,55 @@ def _route_sheet_print_data(
     transfer_rows = _material_transfer_rows_for_products(db, products)
     unit_by_raw = _unit_display_by_raw(db, [product.item.unit for product in products if product.item])
 
-    return ordered, components_by_product_id, operations_by_product_id, route_contexts, transfer_rows, unit_by_raw
+    # Цепочка «окраска↔сварка»: лист один, якорь — окрасочный продукт.
+    # Состав («Материалы и заготовки») — от сварной детали, перемещения — обоих
+    # заказов (сначала сварка), операции — двумя блоками (см. renderer).
+    chain_info_by_product_id: Dict[int, Dict[str, Any]] = {}
+    for paint_pid, weld_pid in weld_pid_by_paint_pid.items():
+        weld_product = product_map.get(weld_pid)
+        if paint_pid not in product_map or weld_product is None:
+            continue
+        components_by_product_id[paint_pid] = components_by_product_id.get(weld_pid, [])
+        transfer_rows[paint_pid] = (
+            transfer_rows.get(weld_pid, []) + transfer_rows.get(paint_pid, [])
+        )
+        chain_info_by_product_id[paint_pid] = {
+            "weld_product_id": weld_pid,
+            "weld_qty": _to_float(weld_product.remaining_qty) or _to_float(weld_product.quantity),
+            "weld_one_c": (route_contexts.get(weld_pid) or {}).get("one_c_number", ""),
+            "weld_order_number": str(weld_product.order.order_number or "") if weld_product.order else "",
+        }
+
+    return (
+        ordered,
+        components_by_product_id,
+        operations_by_product_id,
+        route_contexts,
+        transfer_rows,
+        unit_by_raw,
+        chain_info_by_product_id,
+    )
+
+
+def _operation_rows_html(operations: Sequence[Dict[str, Any]]) -> str:
+    return "".join(
+        "<tr>"
+        f"<td class='num'>{op['number']}</td>"
+        f"<td class='text strong-value'>{html.escape(op['stage_name'])}</td>"
+        f"<td colspan='2' class='text'>{html.escape(op['operation_name'] or op['stage_name'] or 'Операция')}</td>"
+        f"<td class='num'>{op['time_norm']:.3f}</td>"
+        "<td class='signature'>ФИО, подпись, дата</td>"
+        "<td></td>"
+        "<td></td>"
+        "<td></td>"
+        "<td class='signature'>Клеймо, ФИО, подпись, дата</td>"
+        "</tr>"
+        for op in operations
+    )
+
+
+def _operation_block_header_html(label: str) -> str:
+    return f"<tr><td colspan='10' class='op-block'><b>{html.escape(label)}</b></td></tr>"
 
 
 def render_route_sheets_html(db: Session, product_ids: Sequence[int], *, auto_print: bool = False) -> str:
@@ -600,6 +738,7 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int], *, auto_pr
         route_contexts,
         transfer_rows_by_product_id,
         unit_by_raw,
+        chain_info_by_product_id,
     ) = _route_sheet_print_data(db, product_ids)
     now = datetime.now().strftime("%d.%m.%Y")
     sheets: List[str] = []
@@ -633,20 +772,27 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int], *, auto_pr
             "</tr>"
             for c in components
         ) or "<tr><td colspan='10'>Материалы по спецификации не найдены</td></tr>"
-        op_rows = "".join(
-            "<tr>"
-            f"<td class='num'>{op['number']}</td>"
-            f"<td class='text strong-value'>{html.escape(op['stage_name'])}</td>"
-            f"<td colspan='2' class='text'>{html.escape(op['operation_name'] or op['stage_name'] or 'Операция')}</td>"
-            f"<td class='num'>{op['time_norm']:.3f}</td>"
-            "<td class='signature'>ФИО, подпись, дата</td>"
-            "<td></td>"
-            "<td></td>"
-            "<td></td>"
-            "<td class='signature'>Клеймо, ФИО, подпись, дата</td>"
-            "</tr>"
-            for op in operations
-        ) or "<tr><td colspan='10'>Операции по спецификации не найдены</td></tr>"
+        empty_ops_row = "<tr><td colspan='10'>Операции по спецификации не найдены</td></tr>"
+        chain = chain_info_by_product_id.get(int(product.product_id))
+        if chain:
+            # Цепочка «окраска↔сварка»: два блока операций, каждый со своим
+            # 1С-заказом; количество сварки может отличаться (частичный остаток).
+            weld_ops = operations_by_product_id.get(int(chain["weld_product_id"]), [])
+            weld_no = chain["weld_one_c"] or chain["weld_order_number"] or "—"
+            paint_no = route_ctx.get("one_c_number") or str(product.order.order_number or "") or "—"
+            paint_qty = _to_float(product.remaining_qty) or _to_float(product.quantity)
+            op_rows = (
+                _operation_block_header_html(
+                    f"Сварка — заказ 1С №{weld_no} · {chain['weld_qty']:g} {product_unit}".rstrip()
+                )
+                + (_operation_rows_html(weld_ops) or empty_ops_row)
+                + _operation_block_header_html(
+                    f"Окраска — заказ 1С №{paint_no} · {paint_qty:g} {product_unit}".rstrip()
+                )
+                + (_operation_rows_html(operations) or empty_ops_row)
+            )
+        else:
+            op_rows = _operation_rows_html(operations) or empty_ops_row
         sheets.append(
             f"""
             <section class="sheet">
@@ -734,6 +880,7 @@ def render_route_sheets_html(db: Session, product_ids: Sequence[int], *, auto_pr
     .warehouse-warning {{ margin-left: 6px; white-space: nowrap; }}
     .signature {{ height: 20px; color: #555; font-size: 8.5px; line-height: 1.05; text-align: center; vertical-align: bottom; }}
     .material-signoff {{ height: 18px; font-size: 10.5px; vertical-align: middle; }}
+    .op-block {{ background: #eee; font-size: 11px; }}
     .notes {{ height: 45px; }}
     @media print {{ .toolbar {{ display: none; }} .sheet {{ padding: 0; }} }}
   </style>

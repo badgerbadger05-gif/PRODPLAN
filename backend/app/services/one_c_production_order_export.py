@@ -595,6 +595,8 @@ def export_production_orders_to_1c(
     *,
     dry_run: bool = True,
     allow_production: bool = False,
+    comment_suffixes: Optional[Dict[int, str]] = None,
+    basis_order_refs: Optional[Dict[int, str]] = None,
 ) -> Dict[str, Any]:
     """
     Export the given internal MRP production_orders to 1C as
@@ -651,9 +653,27 @@ def export_production_orders_to_1c(
     defaults = _export_defaults(config)
 
     # Build payloads for the dry-run preview.
+    # `comment_suffixes` lets a caller annotate a specific order's Комментарий
+    # without cloning the payload builder. `basis_order_refs` (order_id ->
+    # Ref_Key заказа-основания) sets the native 1С basis fields on the payload:
+    # Document_ЗаказНаПроизводство carries a dedicated typed reference
+    # ЗаказНаПроизводствоОснование_Key plus the generic composite
+    # ДокументОснование/_Type. Used by the paint→weld chain to open the
+    # сварка-заказ «на основании» окраска-заказа. Default None for both =>
+    # byte-for-byte prior behaviour.
+    suffixes = comment_suffixes or {}
+    basis_refs = basis_order_refs or {}
     payloads: List[Dict[str, Any]] = []
     for entry in eligible:
         payload = _build_header_payload(entry, defaults)
+        suffix = suffixes.get(int(entry.order_id))
+        if suffix:
+            payload["Комментарий"] = f"{payload['Комментарий']}; {suffix}"
+        basis_ref = _clean_ref1c(basis_refs.get(int(entry.order_id)))
+        if basis_ref:
+            payload["ЗаказНаПроизводствоОснование_Key"] = basis_ref
+            payload["ДокументОснование"] = basis_ref
+            payload["ДокументОснование_Type"] = f"StandardODATA.{PRODUCTION_ORDER_ENTITY}"
         payloads.append({"order_id": entry.order_id, "number": entry.number, "payload": payload})
 
     if dry_run:

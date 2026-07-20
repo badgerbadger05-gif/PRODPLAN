@@ -14,12 +14,21 @@ ALLOWED_ORGANIZATION_NAMES = {"зсм", "ооо зсм"}
 
 
 def _parse_1c_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, dict):
+        for key in ("value", "Value", "val", "boolean", "Boolean"):
+            if key in value:
+                return _parse_1c_bool(value.get(key), default)
+        return default
     if isinstance(value, bool):
         return value
     if value is None:
         return default
     if isinstance(value, (int, float)):
-        return bool(value)
+        if value == 1:
+            return True
+        if value == 0:
+            return False
+        return default
     if isinstance(value, str):
         v = value.strip().lower()
         if v in ("true", "1", "yes", "y", "on", "истина", "да"):
@@ -66,6 +75,27 @@ def _is_zero_guid(value: Any) -> bool:
     return _norm_guid(value) == "00000000-0000-0000-0000-000000000000"
 
 
+def _nonzero_guid(value: Any) -> Optional[str]:
+    normalized = _norm_guid(value)
+    if not normalized or _is_zero_guid(normalized):
+        return None
+    return normalized
+
+
+def _resolve_supplier_destination(
+    item_row: Dict[str, Any], order_row: Dict[str, Any]
+) -> tuple[Optional[str], str]:
+    """Resolve reserve destination without using generic structural-unit keys."""
+    line_ref = _nonzero_guid(item_row.get("СтруктурнаяЕдиницаРезерв_Key"))
+    if line_ref:
+        return line_ref, "line"
+    if _parse_1c_bool(order_row.get("УчетПотребностиПоСкладам"), False):
+        header_ref = _nonzero_guid(order_row.get("СтруктурнаяЕдиницаРезерв_Key"))
+        if header_ref:
+            return header_ref, "header"
+    return None, "unresolved"
+
+
 def _extract_state_name(record: Dict[str, Any]) -> str:
     state_raw = record.get("СостояниеЗаказа")
     if isinstance(state_raw, dict):
@@ -78,6 +108,19 @@ def _extract_state_name(record: Dict[str, Any]) -> str:
     if state_raw:
         return str(state_raw).strip()
     return str(record.get("СостояниеЗаказа_Name") or record.get("СостояниеЗаказа_Description") or "").strip()
+
+
+def _extract_operation_kind(record: Dict[str, Any]) -> Optional[str]:
+    value = record.get("ВидОперации")
+    if isinstance(value, dict):
+        value = (
+            value.get("value")
+            or value.get("Value")
+            or value.get("Description")
+            or value.get("Name")
+        )
+    normalized = str(value or "").strip()
+    return normalized or None
 
 
 def _normalize_organization_name(value: Any) -> str:
@@ -196,6 +239,156 @@ def _load_supplier_names(client: Any, supplier_refs: set[str]) -> Dict[str, str]
 
 ReceiptKey = Tuple[str, str, str]
 
+PROCESSING_TRANSFER_OPERATION_KEY = "8d970138-9934-11eb-e39a-fa163e61326a"
+PROCESSING_REPORT_OPERATION_KEY = "8d96ffe4-9934-11eb-e39a-fa163e61326a"
+PROCESSING_ORDER_OPERATION_KEY = "8d96f6a2-9934-11eb-e39a-fa163e61326a"
+
+
+def _is_supplier_order_type(value: Any) -> bool:
+    return "ЗаказПоставщику" in str(value or "")
+
+
+@dataclass
+class ProcessingDocumentLoadResult:
+    transfer_available: bool
+    report_available: bool
+    transfer_dates: Dict[str, datetime]
+    report_dates: Dict[str, datetime]
+    report_qty: Dict[ReceiptKey, float]
+
+
+def _load_processing_document_dates(
+    client: Any, known_order_refs: set[str]
+) -> ProcessingDocumentLoadResult:
+    """Load the first material transfer and latest contractor report per order.
+
+    Availability is tracked independently: a report failure must not discard a
+    successfully loaded transfer date (and vice versa).
+    """
+    known = {_norm_guid(ref) for ref in known_order_refs if _norm_guid(ref)}
+    if not known:
+        return ProcessingDocumentLoadResult(True, True, {}, {}, {})
+    try:
+        transfers = client.get_all(
+            "Document_РасходнаяНакладная",
+            filter_query=(
+                "Posted eq true and DeletionMark eq false and "
+                f"ХозяйственнаяОперация_Key eq guid'{PROCESSING_TRANSFER_OPERATION_KEY}'"
+            ),
+            select_fields=[
+                "Ref_Key",
+                "Date",
+                "Posted",
+                "DeletionMark",
+                "ХозяйственнаяОперация_Key",
+                "ДокументОснование",
+                "ДокументОснование_Type",
+                "Заказ",
+                "Заказ_Type",
+            ],
+            top=1000,
+            max_pages=1000,
+            order_by="Date",
+        )
+        transfer_available = True
+    except Exception as e:
+        print(f"Не удалось загрузить передачи в переработку: {e}")
+        transfers = []
+        transfer_available = False
+    try:
+        reports = client.get_all(
+            "Document_ОтчетПереработчика",
+            filter_query=(
+                "Posted eq true and DeletionMark eq false and "
+                f"ХозяйственнаяОперация_Key eq guid'{PROCESSING_REPORT_OPERATION_KEY}'"
+            ),
+            select_fields=[
+                "Ref_Key",
+                "Date",
+                "Posted",
+                "DeletionMark",
+                "ХозяйственнаяОперация_Key",
+                "ДокументОснование_Key",
+                "Продукция",
+            ],
+            top=1000,
+            max_pages=1000,
+            order_by="Date",
+        )
+        report_available = True
+    except Exception as e:
+        print(f"Не удалось загрузить отчеты переработчика: {e}")
+        reports = []
+        report_available = False
+
+    first_transfer: Dict[str, datetime] = {}
+    for doc in transfers or []:
+        if (
+            not _parse_1c_bool(doc.get("Posted"), False)
+            or _parse_1c_bool(doc.get("DeletionMark"), False)
+            or _norm_guid(doc.get("ХозяйственнаяОперация_Key"))
+            != PROCESSING_TRANSFER_OPERATION_KEY
+        ):
+            continue
+        basis_ref = _norm_guid(doc.get("ДокументОснование"))
+        basis_type = doc.get("ДокументОснование_Type")
+        if not basis_ref:
+            basis_ref = _norm_guid(doc.get("Заказ"))
+            basis_type = doc.get("Заказ_Type")
+        if (
+            basis_ref not in known
+            or not _is_supplier_order_type(basis_type)
+        ):
+            continue
+        value = _parse_datetime(doc.get("Date"))
+        if value is not None and (
+            basis_ref not in first_transfer or value < first_transfer[basis_ref]
+        ):
+            first_transfer[basis_ref] = value
+
+    latest_report: Dict[str, datetime] = {}
+    report_qty: Dict[ReceiptKey, float] = defaultdict(float)
+    for doc in reports or []:
+        if (
+            not _parse_1c_bool(doc.get("Posted"), False)
+            or _parse_1c_bool(doc.get("DeletionMark"), False)
+            or _norm_guid(doc.get("ХозяйственнаяОперация_Key"))
+            != PROCESSING_REPORT_OPERATION_KEY
+        ):
+            continue
+        basis_ref = _norm_guid(doc.get("ДокументОснование_Key"))
+        if basis_ref not in known:
+            continue
+        products = doc.get("Продукция") or []
+        if not isinstance(products, list):
+            continue
+        valid_product_found = False
+        for row in products:
+            if not isinstance(row, dict):
+                continue
+            item_ref = _norm_guid(row.get("Номенклатура_Key"))
+            characteristic_ref = _norm_guid(
+                row.get("Характеристика_Key") or row.get("Characteristic_Key")
+            )
+            quantity = _to_float(row.get("Количество"), 0.0)
+            if item_ref and quantity > 0:
+                valid_product_found = True
+                report_qty[(basis_ref, item_ref, characteristic_ref)] += quantity
+        if not valid_product_found:
+            continue
+        value = _parse_datetime(doc.get("Date"))
+        if value is not None and (
+            basis_ref not in latest_report or value > latest_report[basis_ref]
+        ):
+            latest_report[basis_ref] = value
+    return ProcessingDocumentLoadResult(
+        transfer_available,
+        report_available,
+        first_transfer,
+        latest_report,
+        dict(report_qty),
+    )
+
 
 def _load_receipts_by_supplier_order(client: Any, known_order_refs: set[str]) -> Dict[ReceiptKey, float]:
     """
@@ -310,10 +503,14 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
             "Date",
             "Posted",
             "DeletionMark",
+            "ВидОперации",
+            "ХозяйственнаяОперация_Key",
             "СостояниеЗаказа_Key",
             "Организация_Key",
             "Контрагент_Key",
             "СуммаДокумента",
+            "СтруктурнаяЕдиницаРезерв_Key",
+            "УчетПотребностиПоСкладам",
             "Запасы",
         ]
         effective_select_fields = list(req.select_fields or orders_select_default)
@@ -341,6 +538,17 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                 if str(record.get("Ref_Key") or "").strip()
             },
         )
+        processing_dates = _load_processing_document_dates(
+            client,
+            {
+                str(record.get("Ref_Key") or "").strip()
+                for record in order_data
+                if str(record.get("Ref_Key") or "").strip()
+            },
+        )
+        processing_transfer_dates = processing_dates.transfer_dates
+        processing_report_dates = processing_dates.report_dates
+        processing_report_remaining_by_order_item = dict(processing_dates.report_qty)
 
         # Получаем существующие записи для сопоставления
         existing_orders = {order.order_ref1c: order for order in db.query(SupplierOrder).all() if order.order_ref1c}
@@ -386,6 +594,22 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                 date_str = record.get('Date', '')
                 is_posted = _parse_1c_bool(record.get('Posted'), False)
                 deletion_mark = _parse_1c_bool(record.get('DeletionMark'), False)
+                operation_name = _extract_operation_kind(record)
+                operation_key = _nonzero_guid(
+                    record.get("ХозяйственнаяОперация_Key")
+                )
+                normalized_order_ref = _norm_guid(ref_key)
+                processing_transfer_date = processing_transfer_dates.get(
+                    normalized_order_ref
+                )
+                processing_report_date = processing_report_dates.get(
+                    normalized_order_ref
+                )
+                is_processing_order = (
+                    operation_key == PROCESSING_ORDER_OPERATION_KEY
+                    or str(operation_name or "").strip().casefold()
+                    == "заказнапереработку"
+                )
                 order_state_key = _norm_guid(record.get('СостояниеЗаказа_Key')) or None
                 order_state_name = _extract_state_name(record) or (
                     state_names_by_key.get(order_state_key or "") if order_state_key else ""
@@ -413,6 +637,18 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                         existing_order.order_date != order_date or
                         existing_order.is_posted != is_posted or
                         existing_order.document_amount != document_amount or
+                        existing_order.operation_name != operation_name or
+                        existing_order.operation_key != operation_key or
+                        (
+                            processing_dates.transfer_available
+                            and existing_order.processing_transfer_date
+                            != processing_transfer_date
+                        ) or
+                        (
+                            processing_dates.report_available
+                            and existing_order.processing_report_date
+                            != processing_report_date
+                        ) or
                         existing_order.order_state_key != order_state_key or
                         existing_order.order_state_name != order_state_name or
                         existing_order.deletion_mark != deletion_mark
@@ -423,6 +659,12 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                         existing_order.order_date = order_date
                         existing_order.is_posted = is_posted
                         existing_order.document_amount = document_amount
+                        existing_order.operation_name = operation_name
+                        existing_order.operation_key = operation_key
+                        if processing_dates.transfer_available:
+                            existing_order.processing_transfer_date = processing_transfer_date
+                        if processing_dates.report_available:
+                            existing_order.processing_report_date = processing_report_date
                         existing_order.order_state_key = order_state_key
                         existing_order.order_state_name = order_state_name
                         existing_order.deletion_mark = deletion_mark
@@ -437,6 +679,10 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                         order_ref1c=ref_key,
                         document_amount=document_amount,
                         is_posted=is_posted,
+                        operation_name=operation_name,
+                        operation_key=operation_key,
+                        processing_transfer_date=processing_transfer_date,
+                        processing_report_date=processing_report_date,
                         order_state_key=order_state_key,
                         order_state_name=order_state_name,
                         deletion_mark=deletion_mark,
@@ -496,28 +742,44 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                             item_data.get("Характеристика_Key") or item_data.get("Characteristic_Key")
                         ) or None
                         quantity = _to_float(item_data.get('Количество'), 0.0)
-                        received_qty = _to_float(
-                            item_data.get("КоличествоПоступило")
-                            or item_data.get("Получено")
-                            or item_data.get("Поступило"),
-                            0.0,
-                        )
                         receipt_key = (_norm_guid(ref_key), _norm_guid(item_key), characteristic_ref1c or "")
-                        received_from_receipts = 0.0
-                        if quantity > 0 and receipt_remaining_by_order_item.get(receipt_key, 0.0) > 0:
-                            available_receipt_qty = receipt_remaining_by_order_item.get(receipt_key, 0.0)
-                            received_from_receipts = min(quantity, available_receipt_qty)
-                            receipt_remaining_by_order_item[receipt_key] = max(
-                                available_receipt_qty - received_from_receipts,
+                        if is_processing_order:
+                            available_report_qty = (
+                                processing_report_remaining_by_order_item.get(
+                                    receipt_key, 0.0
+                                )
+                            )
+                            received_qty = min(
+                                max(quantity, 0.0), max(available_report_qty, 0.0)
+                            )
+                            processing_report_remaining_by_order_item[receipt_key] = max(
+                                available_report_qty - received_qty, 0.0
+                            )
+                        else:
+                            received_qty = _to_float(
+                                item_data.get("КоличествоПоступило")
+                                or item_data.get("Получено")
+                                or item_data.get("Поступило"),
                                 0.0,
                             )
-                        if received_from_receipts > received_qty:
-                            received_qty = received_from_receipts
-                            receipt_rows_applied += 1
+                            received_from_receipts = 0.0
+                            if quantity > 0 and receipt_remaining_by_order_item.get(receipt_key, 0.0) > 0:
+                                available_receipt_qty = receipt_remaining_by_order_item.get(receipt_key, 0.0)
+                                received_from_receipts = min(quantity, available_receipt_qty)
+                                receipt_remaining_by_order_item[receipt_key] = max(
+                                    available_receipt_qty - received_from_receipts,
+                                    0.0,
+                                )
+                            if received_from_receipts > received_qty:
+                                received_qty = received_from_receipts
+                                receipt_rows_applied += 1
                         remaining_qty = max(quantity - received_qty, 0.0)
                         price = _to_float(item_data.get('Цена'), 0.0)
                         amount = _to_float(item_data.get('Сумма'), 0.0)
                         delivery_date_str = item_data.get('ДатаПоступления', '')
+                        destination_ref, _destination_source = _resolve_supplier_destination(
+                            item_data, record
+                        )
 
                         if not item_key:
                             continue
@@ -544,6 +806,21 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                                 line_number=None,
                             ).first()
 
+                        if (
+                            is_processing_order
+                            and not processing_dates.report_available
+                            and existing_order_item is not None
+                        ):
+                            # A report endpoint failure is unknown state, not
+                            # proof of zero production. Preserve synchronized
+                            # progress until reports are readable again, while
+                            # keeping the quantity invariant if the order changed.
+                            received_qty = min(
+                                max(float(existing_order_item.received_qty or 0), 0.0),
+                                max(quantity, 0.0),
+                            )
+                            remaining_qty = max(quantity - received_qty, 0.0)
+
                         if existing_order_item:
                             if (existing_order_item.quantity != quantity or
                                 existing_order_item.received_qty != received_qty or
@@ -552,7 +829,8 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                                 existing_order_item.amount != amount or
                                 existing_order_item.delivery_date != delivery_date or
                                 existing_order_item.item_id_ref != item.item_id or
-                                existing_order_item.characteristic_ref1c != characteristic_ref1c):
+                                existing_order_item.characteristic_ref1c != characteristic_ref1c or
+                                existing_order_item.destination_warehouse_ref1c != destination_ref):
                                 existing_order_item.item_id_ref = item.item_id
                                 existing_order_item.line_number = line_number
                                 existing_order_item.characteristic_ref1c = characteristic_ref1c
@@ -562,6 +840,7 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                                 existing_order_item.price = price
                                 existing_order_item.amount = amount
                                 existing_order_item.delivery_date = delivery_date
+                                existing_order_item.destination_warehouse_ref1c = destination_ref
                                 items_updated += 1
                         else:
                             new_order_item = SupplierOrderItem(
@@ -569,6 +848,7 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                                 item_id_ref=item.item_id,
                                 line_number=line_number,
                                 characteristic_ref1c=characteristic_ref1c,
+                                destination_warehouse_ref1c=destination_ref,
                                 quantity=quantity,
                                 received_qty=received_qty,
                                 remaining_qty=remaining_qty,
@@ -609,6 +889,22 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
             db.rollback()
         else:
             db.commit()
+            # DBR feedback (Фаза 3): двигаем статусы закупных сигналов по факту
+            # поступления материализованных заказов поставщику. Best-effort —
+            # сбой обратной связи НЕ должен ронять синк (общий несущий сервис).
+            try:
+                from .dbr.feedback_service import apply_purchase_order_feedback
+
+                fb_stats = apply_purchase_order_feedback(db)
+                print(
+                    f"[DBR PURCHASE FEEDBACK] signals_updated={fb_stats.get('signals_updated', 0)}"
+                )
+            except Exception as fb_exc:
+                print(f"[DBR PURCHASE FEEDBACK WARNING] {fb_exc}")
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
 
     except Exception as e:
         db.rollback()

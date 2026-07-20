@@ -10,6 +10,7 @@ from ..models import (
     DefaultSpecification,
     Item,
     MrpRequirement,
+    PaintWeldChainLink,
     PlannedOrder,
     PlanningRun,
     ProductionPlanHeader,
@@ -38,6 +39,7 @@ from .production_control_domain import (
 )
 from .production_control_material_issues import refresh_existing_material_issues_for_product
 from .replenishment import REPLENISHMENT_FLOW_PRODUCTION, classify_replenishment_flow
+from .paint_weld_pairs import is_welded_blocked
 
 
 DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
@@ -546,6 +548,7 @@ def create_orders_from_mrp(
     """
     created: List[Dict[str, Any]] = []
     reused: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
     errors: List[str] = []
 
     today = datetime.now(timezone.utc)
@@ -564,6 +567,16 @@ def create_orders_from_mrp(
         item = db.query(Item).filter(Item.item_id == int(planned.item_id)).first()
         if not item:
             errors.append(f"planned_order_id={pid}: номенклатура {planned.item_id} не найдена")
+            continue
+
+        # Сварная деталь активной пары «окраска↔сварка» заказывается по цепочке
+        # от окраски, не самостоятельно. Сироты (без активной пары) не блокируются.
+        if is_welded_blocked(db, [int(planned.item_id)]):
+            skipped.append({
+                "planned_order_id": pid,
+                "item_id": int(planned.item_id),
+                "reason": "заказывается по цепочке от окраски",
+            })
             continue
 
         # Idempotency check at the application layer (cheap, friendly error)
@@ -647,7 +660,7 @@ def create_orders_from_mrp(
         )
 
     db.commit()
-    return {"status": "ok", "created": created, "reused": reused, "errors": errors, "initiated_by": initiated_by}
+    return {"status": "ok", "created": created, "reused": reused, "skipped": skipped, "errors": errors, "initiated_by": initiated_by}
 
 
 def create_production_orders_from_mrp_requirements(
@@ -701,6 +714,17 @@ def create_production_orders_from_mrp_requirements(
                 "requirement_id": rid,
                 "item_id": int(req.item_id),
                 "reason": f"flow={flow}",
+            })
+            continue
+
+        # Сварная деталь активной пары «окраска↔сварка» не заказывается
+        # самостоятельно — она пойдёт по цепочке от окрасочного заказа.
+        # Сироты (нет активной пары) не блокируются — их надо заказывать вручную.
+        if is_welded_blocked(db, [int(req.item_id)]):
+            skipped.append({
+                "requirement_id": rid,
+                "item_id": int(req.item_id),
+                "reason": "заказывается по цепочке от окраски",
             })
             continue
 
@@ -1074,6 +1098,52 @@ def list_journal(
             failed_manufacture_by_product.setdefault(int(manufacture.product_id), manufacture)
     unit_by_raw = _unit_display_by_raw(db, [getattr(product.item, "unit", None) for product in rows if product.item])
 
+    # Цепочки «окраска↔сварка» (этап 4): признак роли строки и вторая сторона —
+    # для кнопки «закрыть цепочку» и подсветки в журнале.
+    chain_by_order_id: Dict[int, Dict[str, Any]] = {}
+    page_order_ids = sorted({int(product.order_id) for product in rows if product.order_id is not None})
+    if page_order_ids:
+        chain_links = (
+            db.query(PaintWeldChainLink)
+            .filter(
+                (PaintWeldChainLink.painted_order_id.in_(page_order_ids))
+                | (PaintWeldChainLink.welded_order_id.in_(page_order_ids))
+            )
+            .all()
+        )
+        if chain_links:
+            counterpart_order_ids = sorted(
+                {int(link.painted_order_id) for link in chain_links}
+                | {int(link.welded_order_id) for link in chain_links}
+            )
+            product_by_order: Dict[int, int] = {}
+            for pid, oid in (
+                db.query(ProductionProduct.product_id, ProductionProduct.order_id)
+                .filter(ProductionProduct.order_id.in_(counterpart_order_ids))
+                .order_by(
+                    ProductionProduct.order_id.asc(),
+                    ProductionProduct.line_number.asc(),
+                    ProductionProduct.product_id.asc(),
+                )
+                .all()
+            ):
+                product_by_order.setdefault(int(oid), int(pid))
+            for link in chain_links:
+                painted_oid = int(link.painted_order_id)
+                welded_oid = int(link.welded_order_id)
+                chain_by_order_id[painted_oid] = {
+                    "role": "painted",
+                    "link_id": int(link.id),
+                    "counterpart_order_id": welded_oid,
+                    "counterpart_product_id": product_by_order.get(welded_oid),
+                }
+                chain_by_order_id[welded_oid] = {
+                    "role": "welded",
+                    "link_id": int(link.id),
+                    "counterpart_order_id": painted_oid,
+                    "counterpart_product_id": product_by_order.get(painted_oid),
+                }
+
     result: List[Dict[str, Any]] = []
     for product in rows:
         state = getattr(product, "control_state", None)
@@ -1184,6 +1254,7 @@ def list_journal(
                 "mrp_req_net_qty": req_meta.get("net_required_qty"),
                 "mrp_req_covered_qty": req_meta.get("covered_qty"),
                 "mrp_req_remaining_qty": req_meta.get("remaining_qty"),
+                "paint_weld_chain": chain_by_order_id.get(int(product.order_id)),
             }
         )
 
