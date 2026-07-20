@@ -6,7 +6,7 @@
 
 - Doctype runtime реализован и используется `MRP Runs`, `Transfer Requests`,
   `Purchase Control` и `Workshop Binding Review`; остальные журналы инвентаризируются.
-- OpenAPI-типы генерируются, lint чистый, frontend CI добавлен, 152 frontend-теста проходят.
+- OpenAPI-типы генерируются, lint чистый, frontend CI добавлен, 156 frontend-тестов проходят.
 - Прямые API-вызовы страниц вынесены в services-слой.
 - Route-level code splitting снизил initial JS bundle примерно с 592 до 242 КБ.
 - Mock session shell и resource/action/record/field gates реализованы, но Auth/RBAC нельзя считать закрытым до появления backend-сессии и `/auth/me`.
@@ -43,7 +43,7 @@
 ## P1 — Тестовое покрытие критичных экранов
 
 **Текущее состояние.** Общий runtime, transport, session/RBAC, saved views,
-Ledger и критичные custom pages покрыты 152 Vitest-тестами; есть hermetic
+Ledger и критичные custom pages покрыты 156 Vitest-тестами; есть hermetic
 Playwright smoke и стабильные Linux visual baselines Ledger, Purchase Control,
 Production Control, Period Plan (list/detail), Workshop Binding Review и
 Stage Distribution. Не хватает отдельного
