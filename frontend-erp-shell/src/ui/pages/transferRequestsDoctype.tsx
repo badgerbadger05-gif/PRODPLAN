@@ -73,6 +73,7 @@ export const transferRequestsDoctype: Doctype<
     hotkeys: 'F5 Обновить · Enter Детали',
     idField: 'issue_id',
     selectionMode: 'single',
+    exportCsv: { filename: 'material_transfers.csv' },
   },
   initialFilters: { search: '', status: '', sourceWarehouseRef: '' },
   dataSource: {

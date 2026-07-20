@@ -30,6 +30,7 @@ export function createPurchaseOrdersDoctype(
       hotkeys: 'F5 Обновить · Enter Детали',
       idField: 'row_key',
       selectionMode: 'multiple',
+      exportCsv: { filename: 'purchase_orders.csv' },
     },
     initialFilters: {
       search: focus.search ?? '',

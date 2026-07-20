@@ -5,6 +5,33 @@ import { sortGlyph, tableColumnStyle, tableMinWidth } from '../tableDoctype'
 import type { AccessSubject } from './permissions'
 import { canViewField, canViewRecord } from './permissions'
 
+function BulkSelectionCheckbox({
+  checked,
+  indeterminate,
+  disabled,
+  onChange,
+}: {
+  checked: boolean
+  indeterminate: boolean
+  disabled: boolean
+  onChange: (checked: boolean) => void
+}) {
+  const ref = useRef<HTMLInputElement>(null)
+  useEffect(() => {
+    if (ref.current) ref.current.indeterminate = indeterminate
+  }, [indeterminate])
+  return (
+    <input
+      ref={ref}
+      type="checkbox"
+      checked={checked}
+      disabled={disabled}
+      onChange={(event) => onChange(event.target.checked)}
+      aria-label="Выбрать все видимые строки"
+    />
+  )
+}
+
 type Props<Row, Filters extends object, Detail> = {
   doctype: Doctype<Row, Filters, Detail>
   state: DoctypeListState<Row, Filters, Detail>
@@ -27,6 +54,9 @@ export function DoctypeTable<Row, Filters extends object, Detail>({
     ? doctype.columns.filter((column) => visibleColumns.includes(column.key) && canViewField(doctype.permissions, column.key, access))
     : doctype.columns.filter((column) => canViewField(doctype.permissions, column.key, access))
   const rows = state.rows.filter((row) => canViewRecord(doctype.permissions, row, access))
+  const visibleIds = rows.map(idOf)
+  const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => state.selectedIds.has(id))
+  const someVisibleSelected = visibleIds.some((id) => state.selectedIds.has(id))
   const activateRow = (index: number, tableRow: HTMLTableRowElement) => {
     const nextIndex = Math.max(0, Math.min(index, rows.length - 1))
     const next = rows[nextIndex]
@@ -56,7 +86,14 @@ export function DoctypeTable<Row, Filters extends object, Detail>({
                   ? (state.sort.sortDir === 'asc' ? 'ascending' : 'descending')
                   : undefined}
               >
-                {column.sortable ? (
+                {column.type === 'select-checkbox' && doctype.meta.selectionMode === 'multiple' ? (
+                  <BulkSelectionCheckbox
+                    checked={allVisibleSelected}
+                    indeterminate={!allVisibleSelected && someVisibleSelected}
+                    disabled={!visibleIds.length}
+                    onChange={state.setVisibleSelection}
+                  />
+                ) : column.sortable ? (
                   <button className="tableSortButton" onClick={() => state.setSort(column.key)}>
                     {column.title}{state.sort ? sortGlyph(state.sort, column.key) : ''}
                   </button>
@@ -135,3 +172,4 @@ export function DoctypeTable<Row, Filters extends object, Detail>({
     </div>
   )
 }
+import { useEffect, useRef } from 'react'

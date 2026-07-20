@@ -221,6 +221,10 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
     setActiveId(id)
   }, [])
 
+  const setVisibleSelection = useCallback((checked: boolean) => {
+    setSelectedIds(checked ? new Set(rows.map(rowId)) : new Set())
+  }, [rowId, rows])
+
   const reload = useCallback(() => setReloadKey((current) => current + 1), [])
 
   const runAction = useCallback(async (key: string) => {
@@ -276,6 +280,7 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
     selection,
     selectedIds,
     toggleSelection,
+    setVisibleSelection,
     paging: {
       limit,
       offset,

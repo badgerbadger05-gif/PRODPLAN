@@ -13,6 +13,7 @@ import { canView, canViewField } from './permissions'
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { decodeViewState, encodeViewState, type ViewFilterValue, type ViewState } from '../views'
+import { buildDoctypeCsv, downloadCsv } from './csvExport'
 
 type Props<Row, Filters extends object, Detail> = {
   doctype: Doctype<Row, Filters, Detail>
@@ -63,6 +64,15 @@ export function DoctypePage<Row, Filters extends object, Detail>({
     visibleColumns,
     density,
   }), [density, state.filters, state.sort, visibleColumns])
+  const exportCsv = useCallback(() => {
+    if (!doctype.meta.exportCsv) return
+    const rows = state.selection.length ? state.selection : state.rows
+    const csv = buildDoctypeCsv({ doctype, rows, visibleColumns, access })
+    const configuredName = typeof doctype.meta.exportCsv === 'object'
+      ? doctype.meta.exportCsv.filename
+      : undefined
+    downloadCsv(csv, configuredName ?? `${doctype.meta.name}.csv`)
+  }, [access, doctype, state.rows, state.selection, visibleColumns])
 
   useEffect(() => {
     const token = searchParams.get('view')
@@ -134,7 +144,7 @@ export function DoctypePage<Row, Filters extends object, Detail>({
           />
         )}
       >
-        <CommandBar doctype={doctype} state={state} access={access} />
+        <CommandBar doctype={doctype} state={state} access={access} onExportCsv={exportCsv} />
         <SavedViewsBar
           resource={doctype.meta.name}
           initialFilters={doctype.initialFilters}

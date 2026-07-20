@@ -28,6 +28,7 @@ export const mrpRunsDoctype: Doctype<PlanningRunRow, MrpRunsFilters, never> = {
     hotkeys: 'Enter Детали',
     idField: 'run_id',
     selectionMode: 'single',
+    exportCsv: { filename: 'mrp_runs.csv' },
   },
   initialFilters: {},
   dataSource: {
@@ -93,4 +94,3 @@ export const mrpRunsDoctype: Doctype<PlanningRunRow, MrpRunsFilters, never> = {
   detail: { sections: [] },
   permissions: { view: ['viewer', 'planner', 'admin'] },
 }
-

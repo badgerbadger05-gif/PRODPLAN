@@ -125,6 +125,7 @@ export type Doctype<Row, Filters, Detail = never> = {
     hotkeys?: string
     idField: keyof Row
     selectionMode?: 'none' | 'single' | 'multiple'
+    exportCsv?: boolean | { filename?: string }
   }
   initialFilters: Filters
   dataSource: {

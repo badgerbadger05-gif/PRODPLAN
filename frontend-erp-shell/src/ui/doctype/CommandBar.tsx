@@ -6,9 +6,10 @@ type Props<Row, Filters extends object, Detail> = {
   doctype: Doctype<Row, Filters, Detail>
   state: DoctypeListState<Row, Filters, Detail>
   access: AccessSubject
+  onExportCsv?: () => void
 }
 
-export function CommandBar<Row, Filters extends object, Detail>({ doctype, state, access }: Props<Row, Filters, Detail>) {
+export function CommandBar<Row, Filters extends object, Detail>({ doctype, state, access, onExportCsv }: Props<Row, Filters, Detail>) {
   const actions = (doctype.actions ?? []).filter(
     (action) => action.visible?.(state.actionContext) !== false
       && canRunAction(doctype.permissions, action.key, access),
@@ -32,6 +33,11 @@ export function CommandBar<Row, Filters extends object, Detail>({ doctype, state
           {action.label}
         </button>
       ))}
+      {doctype.meta.exportCsv && (
+        <button onClick={onExportCsv} disabled={state.loading || !state.rows.length}>
+          CSV (текущая страница)
+        </button>
+      )}
       <button onClick={state.reload} disabled={state.loading}>Обновить</button>
       {doctype.renderExtraToolbar?.(state.actionContext)}
     </div>
