@@ -194,10 +194,11 @@ describe('DbrDrumBoardPage characterization', () => {
     await screen.findByText('Насос ГА-1')
 
     await user.click(screen.getByRole('button', { name: 'Построить из программы…' }))
-    const dialog = await screen.findByText('Построить график из программы')
-    expect(dialog).toBeInTheDocument()
-    expect(screen.getByRole('option', { name: /№25 · Июльская программа/ })).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: 'Построить и активировать' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Построить график из программы' })
+    const programSelect = within(dialog).getByLabelText('Утверждённая программа')
+    expect(programSelect).toHaveFocus()
+    expect(within(dialog).getByRole('option', { name: /№25 · Июльская программа/ })).toBeInTheDocument()
+    await user.click(within(dialog).getByRole('button', { name: 'Построить и активировать' }))
 
     expect(buildDbrDrum).toHaveBeenCalledWith(25)
     expect(activateDbrDrum).toHaveBeenCalledWith(8)
@@ -210,9 +211,10 @@ describe('DbrDrumBoardPage characterization', () => {
     renderPage()
     await user.click(await screen.findByRole('button', { name: /2\/10 Насос ГА-1/ }))
 
-    const dialog = screen.getByText('Плитка: Насос ГА-1').closest('.dialogBox')!
-    const date = dialog.querySelector<HTMLInputElement>('input[type="date"]')!
-    const resource = dialog.querySelector<HTMLSelectElement>('select')!
+    const dialog = screen.getByRole('dialog', { name: 'Плитка: Насос ГА-1' })
+    const date = within(dialog).getByLabelText('Перенести на дату')
+    const resource = within(dialog).getByLabelText('Участок')
+    expect(date).toHaveFocus()
     await user.clear(date)
     await user.type(date, '2026-07-21')
     await user.selectOptions(resource, '12')
@@ -229,6 +231,7 @@ describe('DbrDrumBoardPage characterization', () => {
     await user.click(screen.getByRole('button', { name: 'Релиз…' }))
 
     const confirm = await screen.findByRole('dialog', { name: 'Релиз плитки — Насос ГА-1' })
+    expect(screen.getAllByRole('dialog')).toHaveLength(1)
     expect(releaseDbrSlot).toHaveBeenNthCalledWith(1, 101, true)
     expect(within(confirm).getByText(/Будет создан документ в живой 1С/)).toBeInTheDocument()
     expect(within(confirm).getByText(/PREVIEW-101/)).toBeInTheDocument()
@@ -246,7 +249,8 @@ describe('DbrDrumBoardPage characterization', () => {
 
     await user.click(screen.getByRole('button', { name: 'Релиз дня…' }))
     const dialog = screen.getByRole('dialog', { name: 'Релиз дня' })
-    const date = dialog.querySelector<HTMLInputElement>('input[type="date"]')!
+    const date = within(dialog).getByLabelText('День для релиза')
+    expect(date).toHaveFocus()
     await user.clear(date)
     await user.type(date, '2026-07-20')
     await user.click(within(dialog).getByRole('button', { name: 'Предпросмотр' }))

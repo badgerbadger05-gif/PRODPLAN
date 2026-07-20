@@ -472,8 +472,14 @@ export function DbrDrumBoardPage() {
       </DocumentWindow>
 
       {/* ── Slot detail panel ────────────────────────────────────────── */}
-      {selectedSlot && (
-        <div className="dialogOverlay" onClick={() => setSelectedSlot(null)}>
+      {selectedSlot && !releaseFlow && (
+        <div
+          className="dialogOverlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Плитка: ${selectedSlot.item_name || selectedSlot.item_code}`}
+          onClick={() => setSelectedSlot(null)}
+        >
           <div className="dialogBox" onClick={(e) => e.stopPropagation()}>
             <div className="dialogHeader">Плитка: {selectedSlot.item_name || selectedSlot.item_code}</div>
             <div className="dialogBody">
@@ -514,12 +520,22 @@ export function DbrDrumBoardPage() {
 
               <div className="dbrMoveRow">
                 <div className="dialogField">
-                  <label>Перенести на дату</label>
-                  <input type="date" value={moveDate} onChange={(e) => setMoveDate(e.target.value)} />
+                  <label htmlFor="dbr-move-date">Перенести на дату</label>
+                  <input
+                    id="dbr-move-date"
+                    type="date"
+                    value={moveDate}
+                    onChange={(e) => setMoveDate(e.target.value)}
+                    autoFocus
+                  />
                 </div>
                 <div className="dialogField">
-                  <label>Участок</label>
-                  <select value={moveResource} onChange={(e) => setMoveResource(e.target.value)}>
+                  <label htmlFor="dbr-move-resource">Участок</label>
+                  <select
+                    id="dbr-move-resource"
+                    value={moveResource}
+                    onChange={(e) => setMoveResource(e.target.value)}
+                  >
                     {resources.map((r) => (
                       <option key={r.id} value={r.id}>{r.name || `Участок ${r.id}`}</option>
                     ))}
@@ -560,14 +576,25 @@ export function DbrDrumBoardPage() {
 
       {/* ── Build dialog ─────────────────────────────────────────────── */}
       {buildOpen && (
-        <div className="dialogOverlay" onClick={() => setBuildOpen(false)}>
+        <div
+          className="dialogOverlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Построить график из программы"
+          onClick={() => setBuildOpen(false)}
+        >
           <div className="dialogBox" onClick={(e) => e.stopPropagation()}>
             <div className="dialogHeader">Построить график из программы</div>
             <div className="dialogBody">
               {approvedPrograms.length ? (
                 <div className="dialogField">
-                  <label>Утверждённая программа</label>
-                  <select value={buildProgramId} onChange={(e) => setBuildProgramId(e.target.value)}>
+                  <label htmlFor="dbr-build-program">Утверждённая программа</label>
+                  <select
+                    id="dbr-build-program"
+                    value={buildProgramId}
+                    onChange={(e) => setBuildProgramId(e.target.value)}
+                    autoFocus
+                  >
                     {approvedPrograms.map((p) => (
                       <option key={p.id} value={p.id}>
                         №{p.id} · {p.title || 'без названия'} · {dateRu(p.from_date)}—{dateRu(p.to_date)} · {p.items.length} строк
@@ -665,11 +692,13 @@ export function DbrDrumBoardPage() {
 
               {dayModal.phase === 'pick' && (
                 <div className="dialogField">
-                  <label>День для релиза</label>
+                  <label htmlFor="dbr-release-day">День для релиза</label>
                   <input
+                    id="dbr-release-day"
                     type="date"
                     value={dayModal.day}
                     onChange={(e) => setDayModal({ phase: 'pick', day: e.target.value })}
+                    autoFocus
                   />
                   <div className="fieldHint">
                     Будут релизнуты все зелёные плитки этого дня по активному графику №{schedule?.id}.
