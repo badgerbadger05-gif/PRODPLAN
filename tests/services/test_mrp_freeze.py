@@ -410,24 +410,30 @@ def test_dry_run_writes_nothing(db_session):
 
 
 # --------------------------------------------------------------------------- 13
-def test_reconcile_guard_holds_for_frozen_run(db_session):
+def test_reconcile_frozen_run_does_not_rewrite_net_or_trim(db_session):
+    # Increment 4: the temporary freeze_guard is gone; the drift-only reconcile
+    # is idempotent by construction. A top-level (bom level 0) purchased item is
+    # out of drift, so a post-freeze stock rise does not move its frozen net and
+    # its purchase is not trimmed.
     item = _purchased(db_session, "GUARD", stock=0.0)
     plan = _plan(db_session, "Авг", AUG, item, 60)
     run_id = _snapshot(db_session, plan)["run_id"]
-    # Stock rises after freeze — a legacy reconcile would collapse net & trim.
     item.stock_qty = 60.0
     db_session.commit()
 
     res = reconcile_snapshot(db_session, run_id)
-    assert res["freeze_guard"] is True
+    assert "freeze_guard" not in res
+    assert res["status"] == "ok"
     assert res["purchase_pruned"] == []
     # Frozen net is NOT rewritten; the purchase is NOT trimmed.
     assert float(_req(db_session, run_id, item.item_id).net_required_qty) == pytest.approx(60.0)
     assert db_session.query(PlannedPurchase).filter_by(run_id=run_id, item_id=item.item_id).count() == 1
 
 
-def test_reconcile_unfrozen_run_still_trims(db_session):
-    # A run without an active freeze version keeps the legacy reconcile behaviour.
+def test_reconcile_unfrozen_run_is_needs_freeze(db_session):
+    # A run without an active freeze version has no authoritative net to size
+    # against: reconcile returns needs_freeze and runs only repairs — it does NOT
+    # rewrite net nor trim purchases (the old legacy re-explosion trim is gone).
     item = _purchased(db_session, "UNFROZEN", stock=0.0)
     plan = _plan(db_session, "Авг", AUG, item, 60)
     run_id = _snapshot(db_session, plan)["run_id"]
@@ -437,9 +443,10 @@ def test_reconcile_unfrozen_run_still_trims(db_session):
     db_session.commit()
 
     res = reconcile_snapshot(db_session, run_id)
-    assert res["freeze_guard"] is False
-    assert len(res["purchase_pruned"]) == 1
-    assert db_session.query(PlannedPurchase).filter_by(run_id=run_id, item_id=item.item_id).count() == 0
+    assert res["status"] == "needs_freeze"
+    assert "freeze_guard" not in res
+    assert res["purchase_pruned"] == []
+    assert db_session.query(PlannedPurchase).filter_by(run_id=run_id, item_id=item.item_id).count() == 1
 
 
 # --------------------------------------------------------------------------- 14

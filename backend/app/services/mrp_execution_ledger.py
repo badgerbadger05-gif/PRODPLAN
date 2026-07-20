@@ -36,6 +36,7 @@ with the freeze serialises the maintenance operation on PostgreSQL.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -48,6 +49,7 @@ from ..models import (
     MrpExecutionAllocation,
     MrpFreezeAllocation,
     MrpFreezeBaseline,
+    MrpFreezeComponent,
     MrpRequirement,
     MrpRequirementBucket,
     PlannedPurchase,
@@ -60,6 +62,7 @@ from ..models import (
     SyncLink,
 )
 from .mrp_freeze import MRP_LEDGER_LOCK_KEY, PoolKey, pool_key_for
+from .mrp_stock_helpers import effective_stock_by_item_all
 from .period_plan_service import _to_float
 from .supplier_order_status import (
     state_counts_in_mrp as _supplier_order_counts_in_mrp,
@@ -72,6 +75,34 @@ FIXED_SNAPSHOT_STATUS = "FIXED_SNAPSHOT"
 CLOSED_STATUS = "CLOSED"
 DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
 PURCHASE_ORDER_ENTITY = "Document_ЗаказПоставщику"
+
+# Drift maturity window (v2 §7.1). A shortfall/surplus pool must persist across
+# ≥2 cycles AND for at least this many hours before it materialises. Overridable
+# via MRP_DRIFT_MATURITY_HOURS (tests / validation set 0 for an immediate top-up).
+DRIFT_MATURITY_WINDOW_HOURS = 48.0
+
+
+def _drift_maturity_window_hours() -> float:
+    raw = os.environ.get("MRP_DRIFT_MATURITY_HOURS")
+    if raw is None or str(raw).strip() == "":
+        return DRIFT_MATURITY_WINDOW_HOURS
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return DRIFT_MATURITY_WINDOW_HOURS
+
+
+def _coerce_dt(value: Any) -> Optional[datetime]:
+    """Best-effort parse of a stored timestamp into a tz-aware datetime (UTC)."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    try:
+        dt = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 # fact_type by physical source class.
 _PRODUCTION_CLASS = "production"
@@ -539,6 +570,8 @@ def _build_execution_allocations(
     scope: LedgerScope,
     verify: VerifyResult,
     cycle_id: str,
+    produced_now: Dict[int, float],
+    received_now: Dict[int, float],
 ) -> Tuple[List[MrpExecutionAllocation], Dict[int, float], int, int]:
     """Rebuild ``mrp_execution_allocation`` for the scope. Returns
     (row objects, executed_by_req, execution_row_count, coverage_row_count)."""
@@ -558,30 +591,10 @@ def _build_execution_allocations(
     if not scope.open_req_ids:
         return rows, exec_by_req, 0, 0
 
-    # 5.1 — Δ-from-baseline budget per pool (mirrors _write_freeze_baseline's
-    # exact filters: join order, deletion_mark=false, NO status/source filter).
-    produced_now: Dict[int, float] = {
-        int(iid): _to_float(qty)
-        for iid, qty in (
-            db.query(ProductionProduct.item_id, func.sum(ProductionProduct.produced_qty))
-            .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
-            .filter(ProductionProduct.item_id.in_(scope.pool_items))
-            .filter(ProductionOrder.deletion_mark.is_(False))
-            .group_by(ProductionProduct.item_id)
-            .all()
-        )
-    }
-    received_now: Dict[int, float] = {
-        int(iid): _to_float(qty)
-        for iid, qty in (
-            db.query(SupplierOrderItem.item_id_ref, func.sum(SupplierOrderItem.received_qty))
-            .join(SupplierOrder, SupplierOrder.order_id == SupplierOrderItem.order_id)
-            .filter(SupplierOrderItem.item_id_ref.in_(scope.pool_items))
-            .filter(SupplierOrder.deletion_mark.is_(False))
-            .group_by(SupplierOrderItem.item_id_ref)
-            .all()
-        )
-    }
+    # 5.1 — Δ-from-baseline budget per pool. ``produced_now`` / ``received_now``
+    # are computed ONCE at cycle level (mirroring _write_freeze_baseline's exact
+    # filters: deletion_mark=false, NO status/source filter) and shared with
+    # compute_stock_drift so the two steps see the identical fact aggregate.
     budget_remaining: Dict[PoolKey, Dict[str, float]] = {}
     for pk, reqs in scope.reqs_by_pool.items():
         item_id = int(reqs[0].item_id)
@@ -645,6 +658,16 @@ def _build_execution_allocations(
                         sort_key=(bdate, pf, ptv, int(req.run_id), req_id, int(b.id)),
                     )
                 )
+            # Bucket-cap extension (§4): the frozen bucket nets sum to net, so a
+            # positive drift_adjustment must widen a bucket cap or the drift
+            # top-up could never execute to effective_net. Give the whole
+            # positive adjustment to the earliest (first) bucket. Σ caps then
+            # equals effective_net. A negative adjustment is handled by the
+            # room_req clamp in _place (effective_net − executed), never by
+            # cutting bucket caps.
+            adj = max(_to_float(req.drift_adjustment_qty), 0.0)
+            if adj > EPS and slots:
+                slots[0].net_qty += adj
         else:
             bdate = ptv
             slots.append(
@@ -970,6 +993,376 @@ def _aggregate_executed_qty(scope: LedgerScope, exec_by_req: Dict[int, float]) -
 
 
 # ---------------------------------------------------------------------------
+# §4 (increment 4) — stock drift: reconcile reality against the frozen position
+# ---------------------------------------------------------------------------
+@dataclass
+class DriftResult:
+    adjust_by_req: Dict[int, float]
+    matured_shortfall_total: float
+    matured_surplus_total: float
+    evap_adjust_total: float
+    unattributed_total: float
+    events_written: int
+    pending_pools: int
+
+
+def _produced_received_now(
+    db: Session, item_ids: Set[int]
+) -> Tuple[Dict[int, float], Dict[int, float]]:
+    """Cumulative produced / received per item, aggregated with the SAME filters
+    as ``mrp_freeze._write_freeze_baseline`` (deletion_mark=false only, no status
+    filter) so the Δ against the frozen baseline is not skewed."""
+    if not item_ids:
+        return {}, {}
+    ids = [int(i) for i in item_ids]
+    produced_now: Dict[int, float] = {
+        int(iid): _to_float(qty)
+        for iid, qty in (
+            db.query(ProductionProduct.item_id, func.sum(ProductionProduct.produced_qty))
+            .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+            .filter(ProductionProduct.item_id.in_(ids))
+            .filter(ProductionOrder.deletion_mark.is_(False))
+            .group_by(ProductionProduct.item_id)
+            .all()
+        )
+    }
+    received_now: Dict[int, float] = {
+        int(iid): _to_float(qty)
+        for iid, qty in (
+            db.query(SupplierOrderItem.item_id_ref, func.sum(SupplierOrderItem.received_qty))
+            .join(SupplierOrder, SupplierOrder.order_id == SupplierOrderItem.order_id)
+            .filter(SupplierOrderItem.item_id_ref.in_(ids))
+            .filter(SupplierOrder.deletion_mark.is_(False))
+            .group_by(SupplierOrderItem.item_id_ref)
+            .all()
+        )
+    }
+    return produced_now, received_now
+
+
+def _frozen_component_rows(db: Session, scope: LedgerScope) -> List[MrpFreezeComponent]:
+    """Frozen BOM norm rows for the scope at each run's active freeze version,
+    restricted to components that are pool items (the drift subjects)."""
+    if not scope.pool_items or not scope.version_by_run:
+        return []
+    rows: List[MrpFreezeComponent] = []
+    for row in (
+        db.query(MrpFreezeComponent)
+        .filter(MrpFreezeComponent.run_id.in_(scope.run_ids))
+        .filter(MrpFreezeComponent.component_item_id.in_(scope.pool_items))
+        .all()
+    ):
+        if scope.version_by_run.get(int(row.run_id)) != int(row.freeze_version):
+            continue
+        rows.append(row)
+    return rows
+
+
+def _drift_parent_items(db: Session, scope: LedgerScope) -> Set[int]:
+    """Parent items that consume a pool item under the frozen norms — their
+    produced-Δ drives the expected consumption of their components."""
+    return {int(r.parent_item_id) for r in _frozen_component_rows(db, scope)}
+
+
+def _drift_anchor_by_item(
+    db: Session, scope: LedgerScope, item_ids: Set[int]
+) -> Dict[int, Tuple[float, float, float, int]]:
+    """Per-item frozen anchor (stock S0, produced_total, received_total, donor
+    run_id) = the baseline of the pool with max(frozen_at, run_id) among the
+    scope runs at their active version. Same selection pattern as the ledger
+    scope's pool anchor, extended to parent items (level-0 / closed included)."""
+    if not item_ids:
+        return {}
+    best: Dict[int, Tuple[Tuple[Any, int], Tuple[float, float, float, int]]] = {}
+    for row in (
+        db.query(MrpFreezeBaseline)
+        .filter(MrpFreezeBaseline.run_id.in_(scope.run_ids))
+        .filter(MrpFreezeBaseline.item_id.in_([int(i) for i in item_ids]))
+        .all()
+    ):
+        if scope.version_by_run.get(int(row.run_id)) != int(row.freeze_version):
+            continue
+        iid = int(row.item_id)
+        rank = (row.frozen_at or datetime.min, int(row.run_id))
+        prev = best.get(iid)
+        if prev is None or rank > prev[0]:
+            best[iid] = (
+                rank,
+                (
+                    _to_float(row.stock_qty),
+                    _to_float(row.produced_total),
+                    _to_float(row.received_total),
+                    int(row.run_id),
+                ),
+            )
+    return {iid: payload for iid, (_rank, payload) in best.items()}
+
+
+def _req_queue_key(req: MrpRequirement, run: Optional[PlanningRun]) -> tuple:
+    period_from = (run.period_from if run else None) or date.min
+    period_to = (run.period_to if run else None) or date.max
+    return (period_from, period_to, int(req.run_id), int(req.id))
+
+
+def compute_stock_drift(
+    db: Session,
+    scope: LedgerScope,
+    verify: VerifyResult,
+    produced_now: Dict[int, float],
+    received_now: Dict[int, float],
+    cycle_id: str,
+) -> DriftResult:
+    """Recompute per-pool stock drift from scratch (v2 §5/§7.1).
+
+    drift is a PURE function of the immutable baseline (S0 / produced_total /
+    received_total), the frozen BOM norms (``mrp_freeze_component``, NEVER the
+    current ``SpecComponent``), the current mirrored facts (produced/received/
+    stock) and executed_qty. It never reads its own prior value; the only
+    inter-cycle state is the debounce chain carried in the shortfall/surplus
+    ``mrp_drift_event`` rows.
+
+    Returns the per-req ``drift_adjustment`` to materialise (matured shortfall +
+    immediate evaporation − matured surplus).
+    """
+    now = datetime.now(timezone.utc)
+    window_hours = _drift_maturity_window_hours()
+
+    # --- evaporation adjustment (req-scoped, applied immediately, no W) ---
+    evap_by_req: Dict[int, float] = {}
+    for alloc in scope.freeze_allocs:
+        ev = verify.evaporated_by_alloc_id.get(int(alloc.id), 0.0)
+        if ev > EPS:
+            rid = int(alloc.requirement_id)
+            evap_by_req[rid] = evap_by_req.get(rid, 0.0) + ev
+
+    adjust_by_req: Dict[int, float] = {
+        rid: round(v, 6) for rid, v in evap_by_req.items()
+    }
+    evap_adjust_total = round(sum(evap_by_req.values()), 6)
+
+    if not scope.reqs_by_pool:
+        return DriftResult(
+            adjust_by_req=adjust_by_req,
+            matured_shortfall_total=0.0,
+            matured_surplus_total=0.0,
+            evap_adjust_total=evap_adjust_total,
+            unattributed_total=0.0,
+            events_written=0,
+            pending_pools=0,
+        )
+
+    # --- frozen norms + anchors ---
+    comp_rows = _frozen_component_rows(db, scope)
+    parent_items = {int(r.parent_item_id) for r in comp_rows}
+    norm_by_key: Dict[Tuple[int, int, int], float] = {}
+    created_by_key: Dict[Tuple[int, int, int], datetime] = {}
+    parents_by_component: Dict[int, Set[int]] = {}
+    for r in comp_rows:
+        key = (int(r.run_id), int(r.parent_item_id), int(r.component_item_id))
+        norm_by_key[key] = norm_by_key.get(key, 0.0) + _to_float(r.norm_qty_per_unit)
+        created = _coerce_dt(r.created_at) or datetime.min.replace(tzinfo=timezone.utc)
+        if key not in created_by_key or created > created_by_key[key]:
+            created_by_key[key] = created
+        parents_by_component.setdefault(int(r.component_item_id), set()).add(int(r.parent_item_id))
+
+    anchor_by_item = _drift_anchor_by_item(db, scope, set(scope.pool_items) | parent_items)
+
+    def _frozen_norm(parent: int, component: int, donor_run: int) -> Optional[float]:
+        key = (int(donor_run), int(parent), int(component))
+        if key in norm_by_key:
+            return norm_by_key[key]
+        candidates = [
+            (created_by_key[(r, parent, component)], r)
+            for r in scope.run_ids
+            if (r, parent, component) in norm_by_key
+        ]
+        if not candidates:
+            return None
+        best_run = max(candidates)[1]
+        return norm_by_key[(best_run, parent, component)]
+
+    actual_stock_by_item = effective_stock_by_item_all(db)
+
+    # --- debounce chain: snapshot prior first_seen, then rebuild globally ---
+    prior_first_seen: Dict[Tuple[int, str, str, str, str], Tuple[str, Optional[datetime]]] = {}
+    for ev in (
+        db.query(MrpDriftEvent)
+        .filter(MrpDriftEvent.kind.in_(("shortfall", "surplus")))
+        .all()
+    ):
+        details = ev.details or {}
+        key = (
+            int(ev.item_id),
+            str(ev.characteristic_ref or ""),
+            str(ev.organization_ref or ""),
+            str(ev.planning_stock_pool or ""),
+            str(ev.kind or ""),
+        )
+        seen_at = _coerce_dt(details.get("first_seen_at")) or _coerce_dt(ev.created_at)
+        prior_first_seen[key] = (ev.first_seen_cycle_id or ev.cycle_id or cycle_id, seen_at)
+
+    db.query(MrpDriftEvent).filter(
+        MrpDriftEvent.kind.in_(("shortfall", "surplus"))
+    ).delete(synchronize_session=False)
+
+    matured_shortfall_total = 0.0
+    matured_surplus_total = 0.0
+    unattributed_total = 0.0
+    events_written = 0
+    pending_pools = 0
+
+    for pk, reqs in scope.reqs_by_pool.items():
+        item_id = int(reqs[0].item_id)
+        anchor = anchor_by_item.get(item_id)
+        if anchor is None:
+            continue  # pool without an anchor is out of drift (§5)
+        bom_level_min = min(int(req.bom_level or 0) for req in reqs)
+        if bom_level_min == 0:
+            continue  # finished-goods shipping is not drift (§5, conservative)
+
+        s0, produced_total, received_total, _donor = anchor
+        delta_produced_in = max(0.0, produced_now.get(item_id, 0.0) - produced_total)
+        delta_received = max(0.0, received_now.get(item_id, 0.0) - received_total)
+
+        expected_consumption = 0.0
+        parents_used: List[Dict[str, Any]] = []
+        for parent in sorted(parents_by_component.get(item_id, set())):
+            p_anchor = anchor_by_item.get(parent)
+            if p_anchor is None:
+                # Parent without an anchor contributes 0 (a (0,0) fallback would
+                # imply a false, huge consumption). Diagnostic only.
+                parents_used.append({"parent_item_id": parent, "no_anchor": True})
+                continue
+            norm = _frozen_norm(parent, item_id, int(p_anchor[3]))
+            if norm is None or norm <= EPS:
+                continue
+            delta_p = max(0.0, produced_now.get(parent, 0.0) - p_anchor[1])
+            expected_consumption += delta_p * norm
+            parents_used.append(
+                {"parent_item_id": parent, "delta_produced": round(delta_p, 3), "norm": round(norm, 6)}
+            )
+
+        expected_stock = s0 + delta_produced_in + delta_received - expected_consumption
+        actual_stock = actual_stock_by_item.get(item_id, 0.0)
+        drift = actual_stock - expected_stock
+
+        if abs(drift) <= EPS:
+            continue
+
+        kind = "shortfall" if drift < 0 else "surplus"
+        chain_key = (
+            item_id,
+            pk.characteristic_ref,
+            pk.organization_ref,
+            pk.planning_stock_pool,
+            kind,
+        )
+        prior = prior_first_seen.get(chain_key)
+        if prior is not None:
+            first_seen_cycle_id, first_seen_at = prior
+            if first_seen_at is None:
+                first_seen_at = now
+        else:
+            first_seen_cycle_id, first_seen_at = cycle_id, now
+        matured = (
+            first_seen_cycle_id != cycle_id
+            and (now - first_seen_at).total_seconds() >= window_hours * 3600.0
+        )
+
+        reqs_sorted = sorted(
+            reqs, key=lambda r: _req_queue_key(r, scope.runs_by_id.get(int(r.run_id)))
+        )
+        initial_by_req = {
+            int(r.id): max(_to_float(r.initial_snapshot_stock), 0.0) for r in reqs_sorted
+        }
+        per_req_shares: Dict[int, float] = {}
+
+        if drift < 0:
+            total_short = -drift
+            sum_initial = sum(initial_by_req.values())
+            shortfall_pool = min(total_short, sum_initial)
+            unattributed_total += max(0.0, total_short - shortfall_pool)
+            remaining = shortfall_pool
+            for r in reqs_sorted:
+                share = min(remaining, initial_by_req[int(r.id)])
+                if share > EPS:
+                    per_req_shares[int(r.id)] = round(share, 6)
+                remaining = max(0.0, remaining - share)
+                if matured and share > EPS:
+                    adjust_by_req[int(r.id)] = round(
+                        adjust_by_req.get(int(r.id), 0.0) + share, 6
+                    )
+                    matured_shortfall_total += share
+        else:
+            remaining = drift
+            for r in reqs_sorted:
+                rid = int(r.id)
+                net = _to_float(r.net_required_qty)
+                executed = _to_float(r.executed_qty)
+                evap_share = evap_by_req.get(rid, 0.0)
+                open_deficit = max(net + evap_share - executed, 0.0)
+                take = min(remaining, open_deficit)
+                if take > EPS:
+                    per_req_shares[rid] = round(-take, 6)
+                remaining = max(0.0, remaining - take)
+                if matured and take > EPS:
+                    adjust_by_req[rid] = round(adjust_by_req.get(rid, 0.0) - take, 6)
+                    matured_surplus_total += take
+
+        if not matured:
+            pending_pools += 1
+
+        db.add(
+            MrpDriftEvent(
+                cycle_id=cycle_id,
+                item_id=item_id,
+                characteristic_ref=pk.characteristic_ref,
+                organization_ref=pk.organization_ref,
+                planning_stock_pool=pk.planning_stock_pool,
+                kind=kind,
+                drift_qty=round(abs(drift), 3),
+                expected_stock=round(expected_stock, 3),
+                actual_stock=round(actual_stock, 3),
+                matured=bool(matured),
+                first_seen_cycle_id=first_seen_cycle_id,
+                requirement_id=None,
+                details={
+                    "per_req_shares": per_req_shares,
+                    "unattributed": round(max(0.0, -drift) - sum(
+                        v for v in per_req_shares.values() if v > 0
+                    ), 6) if drift < 0 else 0.0,
+                    "parents": parents_used,
+                    "first_seen_at": (first_seen_at or now).isoformat(),
+                },
+            )
+        )
+        events_written += 1
+
+    return DriftResult(
+        adjust_by_req={rid: round(v, 6) for rid, v in adjust_by_req.items()},
+        matured_shortfall_total=round(matured_shortfall_total, 6),
+        matured_surplus_total=round(matured_surplus_total, 6),
+        evap_adjust_total=evap_adjust_total,
+        unattributed_total=round(unattributed_total, 6),
+        events_written=events_written,
+        pending_pools=pending_pools,
+    )
+
+
+def _materialize_drift_adjustment(scope: LedgerScope, drift: DriftResult) -> int:
+    """Write ``drift_adjustment_qty`` onto every open requirement from scratch
+    (missing → 0). This is the ONLY writer of the column besides the freeze
+    (which zeroes it). It never reads its own prior value (G5)."""
+    touched = 0
+    for req in scope.open_reqs:
+        value = round(drift.adjust_by_req.get(int(req.id), 0.0), 3)
+        req.drift_adjustment_qty = value
+        if abs(value) > EPS:
+            touched += 1
+    return touched
+
+
+# ---------------------------------------------------------------------------
 # §2 — the cycle
 # ---------------------------------------------------------------------------
 def run_ledger_cycle(db: Session) -> Dict[str, Any]:
@@ -998,14 +1391,25 @@ def run_ledger_cycle(db: Session) -> Dict[str, Any]:
             "evaporation_events": 0,
         }
 
+    # produced/received facts are aggregated ONCE for the whole cycle over the
+    # pool items plus the drift parent items, and shared by the execution-budget
+    # step and compute_stock_drift so both see the identical Δ-from-baseline.
+    parent_items = _drift_parent_items(db, scope)
+    drift_item_ids: Set[int] = set(scope.pool_items) | parent_items
+    produced_now, received_now = _produced_received_now(db, drift_item_ids)
+
     verify = verify_frozen_supply(db, scope, cycle_id)
     _rows, exec_by_req, execution_rows, coverage_rows = _build_execution_allocations(
-        db, scope, verify, cycle_id
+        db, scope, verify, cycle_id, produced_now, received_now
     )
     items_touched, total_executed = _aggregate_executed_qty(scope, exec_by_req)
 
-    # [increment-4 slot] compute_stock_drift / drift materialisation.
+    # §4 (increment 4): drift AFTER executed aggregation (a surplus cap needs
+    # executed; shortfall caps = frozen initial_snapshot_stock). Then materialise
+    # drift_adjustment_qty (the reconcile sizer reads it next cycle / this run).
     # [increment-5 slot] requirement closure / released routing.
+    drift = compute_stock_drift(db, scope, verify, produced_now, received_now, cycle_id)
+    _materialize_drift_adjustment(scope, drift)
 
     realized_total = round(sum(verify.realized_by_alloc_id.values()), 6)
     evaporated_total = round(sum(verify.evaporated_by_alloc_id.values()), 6)
@@ -1021,6 +1425,12 @@ def run_ledger_cycle(db: Session) -> Dict[str, Any]:
         "realized_total": realized_total,
         "evaporated_total": evaporated_total,
         "evaporation_events": evaporation_events,
+        "drift_events": drift.events_written,
+        "drift_pending_pools": drift.pending_pools,
+        "drift_matured_shortfall": drift.matured_shortfall_total,
+        "drift_matured_surplus": drift.matured_surplus_total,
+        "drift_evap_adjust": drift.evap_adjust_total,
+        "drift_unattributed": drift.unattributed_total,
     }
 
 

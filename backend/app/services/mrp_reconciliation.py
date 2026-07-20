@@ -1,49 +1,52 @@
-"""Periodic MRP reconciliation — top up residual demand on fixed snapshots.
+"""Periodic MRP reconciliation — drift-correction + repair on fixed snapshots.
 
 Why this exists
 ---------------
-A period plan is fixed and an MRP snapshot is taken; production orders and
-supplier orders are issued from it. Reality then drifts:
+A period plan is fixed, an MRP snapshot is taken and frozen; production and
+supplier orders are issued from it. From then on ``net_required_qty`` is the
+single, immutable source of demand — the freeze owns it, reconcile never writes
+it. Reconcile has exactly two jobs:
 
-* a production order is closed with an un-produced remainder (the components
-  came back to stock, but the demand is still open and the order is gone);
-* a stock count changes the on-hand quantity of items that were part of the MRP.
+* **drift-correction sizing** — read the ledger the cycle persisted
+  (``effective_net = max(net_required_qty + drift_adjustment_qty, 0)`` and
+  ``executed_qty``) and top up / trim each requirement's OWN outstanding supply
+  to ``desired_outstanding = max(effective_net − executed, 0)``:
+    - production-flow items → a fresh internal catch-up order (journal line);
+    - purchase-flow items → a fresh ``PlannedPurchase`` row in the same run.
+* **repair** — dedupe, optimal-batch split, capacity reschedule, binding repair,
+  orphan-link — structural hygiene independent of sizing.
 
-The snapshot's `net_required_qty` is frozen at snapshot time and never reflects
-this drift. This service recomputes the *current* net demand for each active
-snapshot and tops up the missing coverage:
-
-* production-flow items → a fresh internal production order (journal line) the
-  user can push to 1C with the usual button;
-* purchase-flow items → a fresh ``PlannedPurchase`` row in the same snapshot run.
+There is NO re-explosion here: reconcile never re-derives gross demand from the
+current ``SpecComponent`` / plan lines. Reality corrections flow ONLY through
+``drift_adjustment_qty`` (a pure function of the immutable freeze baseline +
+frozen norms + current facts, recomputed from scratch each ledger cycle).
 
 Nothing is sent to 1C here — that stays a user action (see
 ``.docs/one_c_export_from_prodplan.md``).
 
-Idempotency
------------
-The snapshot's gross demand is re-derived from its anchored level-0 roots
-through current stock (``_current_snapshot_gross_by_item``), then the gap is
-sized as ``net - effective production supply`` (open local/1C lines by
-``remaining_qty``). Completed 1C output is counted only after it arrives in
-synced warehouse stock. So
-once this service materialises a catch-up production
-order, that order becomes open WIP and the next run nets it out — the gap
-returns to zero and no duplicate is created. For purchases, the gap is
-additionally deduped against supplier orders already arriving and
-``PlannedPurchase`` rows already present in the run.
+Idempotency / anti-reinflation
+------------------------------
+The class of reinflation bugs is structurally impossible now: (1) re-explosion
+is physically removed; (2) ``net_required_qty`` has no writer in reconcile;
+(3) drift is a pure function that never reads its own result; (4) a first
+reconcile materialises a gap G, which becomes own_open_coverage +G, so a second
+reconcile over unchanged facts sees gap 0 → zero order churn (proposals never
+enter drift, which is computed from stock/produced/received facts). A surplus is
+capped by the open deficit (effective_net ≥ executed); a shortfall top-up is
+capped by the frozen ``initial_snapshot_stock``.
 """
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set
 
-from sqlalchemy import func, or_
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from ..models import (
     DefaultSpecification,
     Item,
+    MrpFreezeAllocation,
     MrpRequirement,
     MrpRequirementBucket,
     Operation,
@@ -51,16 +54,16 @@ from ..models import (
     PlanningRun,
     ProductionOrder,
     ProductionOrderLineState,
-    ProductionPlanLine,
     ProductionProduct,
     SyncLink,
     SpecComponent,
     SpecOperation,
     Specification,
+    SupplierOrder,
+    SupplierOrderItem,
 )
 from .capacity_scheduler import CapacityScheduler
 from .period_plan_service import (
-    _load_purchase_supplier_remaining,
     _to_float,
 )
 from .production_control_journal import (
@@ -70,7 +73,7 @@ from .production_control_journal import (
 )
 from .production_binding_repair import repair_clean_mrp_bindings
 from .mrp_execution_ledger import run_ledger_cycle
-from .mrp_stock_helpers import effective_stock_by_item_all
+from .supplier_order_status import state_is_terminal as _supplier_order_is_terminal
 from .replenishment import (
     REPLENISHMENT_FLOW_PRODUCTION,
     REPLENISHMENT_FLOW_PURCHASE,
@@ -81,6 +84,7 @@ from .paint_weld_pairs import is_welded_blocked
 EPS = 1e-9
 FIXED_SNAPSHOT_STATUS = "FIXED_SNAPSHOT"
 PRODUCTION_ORDER_ENTITY = "Document_ЗаказНаПроизводство"
+PURCHASE_ORDER_ENTITY = "Document_ЗаказПоставщику"
 DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
 
 
@@ -199,34 +203,6 @@ def _trim_unexported_planned_purchases(
     }
 
 
-def _rebuild_plan_demands(db: Session, plan_id: int) -> Dict[int, Dict[date, float]]:
-    """Level-0 demand buckets per item from the plan lines (mirrors snapshot)."""
-    demands: Dict[int, Dict[date, float]] = {}
-    lines = (
-        db.query(ProductionPlanLine)
-        .filter(ProductionPlanLine.plan_id == int(plan_id))
-        .filter(ProductionPlanLine.qty > 0)
-        .all()
-    )
-    for line in lines:
-        qty = _to_float(line.qty)
-        if qty <= 0:
-            continue
-        item_demands = demands.setdefault(int(line.item_id), {})
-        item_demands[line.bucket_date] = item_demands.get(line.bucket_date, 0.0) + qty
-    return demands
-
-
-def _bump_requirement_coverage(req: Optional[MrpRequirement], added_qty: float) -> None:
-    """Mirror the materialisation coverage bump, clamped to net_required_qty."""
-    if req is None or added_qty <= EPS:
-        return
-    net_qty = _to_float(req.net_required_qty)
-    new_covered = min(_to_float(req.covered_qty) + float(added_qty), net_qty)
-    req.covered_qty = new_covered
-    req.remaining_qty = max(net_qty - new_covered, 0.0)
-
-
 def _existing_open_catchup_product(db: Session, *, run_id: int, item_id: int) -> Optional[ProductionProduct]:
     order_number = f"MRP-RC-{int(run_id)}-{int(item_id)}"
     linked_order_ids = {
@@ -264,30 +240,68 @@ def _existing_open_catchup_product(db: Session, *, run_id: int, item_id: int) ->
     return None
 
 
-def _active_production_qty_by_item(db: Session, item_ids: List[int]) -> Dict[int, float]:
-    """Open production/WIP quantity per item, including 1C and local rows."""
-    if not item_ids:
-        return {}
+def _own_open_production_by_item(
+    db: Session,
+    run: PlanningRun,
+    open_req_ids: Set[int],
+) -> Dict[int, float]:
+    """Open production supply this run OWNS, per item (v2 §5).
+
+    Own = a line linked to one of the run's open requirements
+    (``source_mrp_requirement_id`` ∈ open_req_ids) OR a fresh MRP catch-up order
+    of this run (``ProductionOrder.source == 'mrp'`` and
+    ``source_run_id == run_id``). The frozen-WIP allocations of the active
+    version (G2 set: ``source_type='wip_order'`` product lines) are EXCLUDED —
+    their qty is already netted into ``net_required_qty`` at freeze time, so
+    counting them here would double-cover the net and trim genuine catch-ups.
+
+    The old ``_active_production_qty_by_item`` summed the WHOLE WIP for an item
+    globally (every plan's orders) = a double count; this counts only own supply.
+    """
     supply_qty = _production_supply_qty_expr()
+
+    g2_product_ids: Set[int] = set()
+    if run.active_freeze_version is not None:
+        g2_product_ids = {
+            int(pid)
+            for (pid,) in (
+                db.query(MrpFreezeAllocation.source_line_ref)
+                .filter(MrpFreezeAllocation.run_id == int(run.run_id))
+                .filter(MrpFreezeAllocation.freeze_version == int(run.active_freeze_version))
+                .filter(MrpFreezeAllocation.source_type == "wip_order")
+                .all()
+            )
+            if pid is not None and str(pid).isdigit()
+        }
+
+    own_filter = or_(
+        ProductionProduct.source_mrp_requirement_id.in_(open_req_ids) if open_req_ids else False,
+        and_(ProductionOrder.source == "mrp", ProductionOrder.source_run_id == int(run.run_id)),
+    )
     rows = (
         db.query(
             ProductionProduct.item_id,
-            func.sum(supply_qty).label("qty"),
+            ProductionProduct.product_id,
+            supply_qty.label("qty"),
         )
         .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
         .outerjoin(
             ProductionOrderLineState,
             ProductionOrderLineState.product_id == ProductionProduct.product_id,
         )
-        .filter(ProductionProduct.item_id.in_([int(iid) for iid in item_ids]))
+        .filter(own_filter)
         .filter(ProductionOrder.deletion_mark == False)
         .filter(func.lower(func.coalesce(ProductionOrder.order_state_key, "")) != DONE_STATE_KEY)
         .filter(supply_qty > 0)
         .filter(func.coalesce(ProductionOrderLineState.status, "shortage").notin_(("completed", "cancelled")))
-        .group_by(ProductionProduct.item_id)
         .all()
     )
-    return {int(iid): _to_float(qty) for iid, qty in rows}
+    result: Dict[int, float] = {}
+    for item_id, product_id, qty in rows:
+        if int(product_id) in g2_product_ids:
+            continue
+        result[int(item_id)] = result.get(int(item_id), 0.0) + _to_float(qty)
+    return result
 
 
 def _next_catchup_order_number(db: Session, *, run_id: int, item_id: int) -> str:
@@ -461,151 +475,6 @@ def _materialize_catchup_gap(
     return created
 
 
-def _current_snapshot_gross_by_item(
-    db: Session,
-    requirements: List[MrpRequirement],
-    stock_by_item: Dict[int, float],
-    root_production_item_ids: set[int],
-) -> tuple[Dict[int, float], Dict[int, int]]:
-    """
-    Recompute fixed-snapshot gross demand from its level-0 roots through
-    current stock.
-
-    Roots (bom_level 0) stay anchored to the frozen snapshot gross — the plan
-    is not re-read. Each deeper node's gross is re-derived top-down as the sum
-    of parent explode quantities. A level-0 production root always explodes
-    its full frozen programme; lower levels use ``max(gross - stock, 0)``.
-    Open WIP does not stop the explosion — producing an open parent order
-    still consumes its components (same rule as ``_explode_bom_net_first``'s
-    explode_buckets).
-
-    The previous implementation kept each child's frozen gross and added the
-    parent's drift versus the snapshot bucket *net* — a stock+WIP-netted
-    baseline. Comparing an after-stock current value against an after-stock-
-    and-WIP baseline counted everything covered by open parent orders at
-    snapshot time as new demand, inflating the whole component subtree of any
-    WIP-covered parent on every reconcile cycle.
-
-    Requirements the explosion no longer reaches get gross 0, so their net
-    (and hence local order coverage) is zeroed downstream.
-    """
-    bom_level_by_item = {
-        int(req.item_id): int(req.bom_level or 0)
-        for req in requirements
-    }
-    current_gross = {
-        int(req.item_id): _to_float(req.total_required_qty)
-        for req in requirements
-        if int(req.bom_level or 0) == 0
-    }
-
-    processed: set[int] = set()
-    while True:
-        pending_parent_ids = [
-            int(item_id)
-            for item_id in sorted(current_gross, key=lambda iid: (bom_level_by_item.get(int(iid), 0), int(iid)))
-            if int(item_id) not in processed
-        ]
-        if not pending_parent_ids:
-            break
-        spec_by_parent = {
-            int(row.item_id): int(row.spec_id)
-            for row in (
-                db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
-                .filter(DefaultSpecification.item_id.in_(pending_parent_ids))
-                .all()
-            )
-        }
-        if not spec_by_parent:
-            processed.update(pending_parent_ids)
-            continue
-        component_rows = (
-            db.query(SpecComponent.spec_id, SpecComponent.item_id, SpecComponent.quantity)
-            .filter(SpecComponent.spec_id.in_(list(spec_by_parent.values())))
-            .all()
-        )
-        components_by_spec: Dict[int, List[tuple[int, float]]] = {}
-        for spec_id, component_id, qty in component_rows:
-            components_by_spec.setdefault(int(spec_id), []).append((int(component_id), _to_float(qty)))
-
-        for parent_id in pending_parent_ids:
-            processed.add(parent_id)
-            spec_id = spec_by_parent.get(parent_id)
-            if spec_id is None:
-                continue
-            children = components_by_spec.get(spec_id, [])
-            if not children:
-                continue
-            parent_gross = _to_float(current_gross.get(parent_id, 0.0))
-            parent_explode_qty = (
-                parent_gross
-                if parent_id in root_production_item_ids
-                else max(parent_gross - _to_float(stock_by_item.get(parent_id, 0.0)), 0.0)
-            )
-            if parent_explode_qty <= EPS:
-                continue
-            parent_level = bom_level_by_item.get(parent_id, 0)
-            for child_id, qty_per_unit in children:
-                if qty_per_unit <= EPS:
-                    continue
-                child_level = bom_level_by_item.get(child_id)
-                if child_level is not None and child_level <= parent_level:
-                    continue
-                if child_level is None:
-                    bom_level_by_item[child_id] = parent_level + 1
-                current_gross[child_id] = (
-                    _to_float(current_gross.get(child_id, 0.0)) + parent_explode_qty * qty_per_unit
-                )
-
-    for req in requirements:
-        current_gross.setdefault(int(req.item_id), 0.0)
-
-    return current_gross, bom_level_by_item
-
-
-def _ensure_reconciled_requirements(
-    db: Session,
-    run: PlanningRun,
-    existing_requirements: List[MrpRequirement],
-    current_gross_by_item: Dict[int, float],
-    current_net_by_item: Dict[int, float],
-    bom_level_by_item: Dict[int, int],
-) -> Dict[int, MrpRequirement]:
-    req_by_item: Dict[int, MrpRequirement] = {int(req.item_id): req for req in existing_requirements}
-    for item_id in sorted(current_gross_by_item):
-        if item_id in req_by_item:
-            continue
-        gross = _to_float(current_gross_by_item.get(item_id, 0.0))
-        net = _to_float(current_net_by_item.get(item_id, 0.0))
-        if gross <= EPS and net <= EPS:
-            continue
-        req = MrpRequirement(
-            run_id=int(run.run_id),
-            item_id=int(item_id),
-            total_required_qty=gross,
-            net_required_qty=net,
-            covered_qty=0.0,
-            remaining_qty=net,
-            period_from=run.period_from,
-            period_to=run.period_to,
-            bom_level=bom_level_by_item.get(item_id, 0),
-        )
-        db.add(req)
-        db.flush()
-        db.add(
-            MrpRequirementBucket(
-                requirement_id=int(req.id),
-                run_id=int(run.run_id),
-                item_id=int(item_id),
-                bucket_date=run.period_to or run.period_from or date.today(),
-                gross_qty=gross,
-                net_qty=net,
-            )
-        )
-        req_by_item[item_id] = req
-    return req_by_item
-
-
 def _link_orphan_mrp_products_to_requirements(
     db: Session,
     run: PlanningRun,
@@ -629,7 +498,10 @@ def _link_orphan_mrp_products_to_requirements(
         if req is None:
             continue
         product.source_mrp_requirement_id = int(req.id)
-        req_qty = _to_float(req.net_required_qty)
+        # Cap an oversized orphan line to the requirement's OUTSTANDING demand
+        # (effective_net − executed), not to raw net: executed output already
+        # satisfies part of the net, and drift_adjustment moves the target.
+        req_qty = max(_effective_net(req) - _to_float(req.executed_qty), 0.0)
         if (
             req_qty > EPS
             and not order.order_ref1c
@@ -641,11 +513,245 @@ def _link_orphan_mrp_products_to_requirements(
         linked_items.add(int(product.item_id))
     return {"linked": len(rows), "items": sorted(linked_items)}
 
-def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Dict[str, Any]:
-    """
-    Recompute current net demand for one FIXED_SNAPSHOT run and top up the gap.
 
-    Returns a per-item summary of what was (or, in dry-run, would be) added.
+def _effective_net(req: MrpRequirement) -> float:
+    """Frozen net demand corrected by drift (v2 §8). The single demand target
+    for sizing; reconcile never writes ``net_required_qty`` itself."""
+    return max(_to_float(req.net_required_qty) + _to_float(req.drift_adjustment_qty), 0.0)
+
+def _trim_unexported_catchup_production(
+    db: Session,
+    *,
+    run: PlanningRun,
+    item_id: int,
+    target_qty: float,
+    welded_blocked: Set[int],
+    dry_run: bool,
+) -> Optional[Dict[str, Any]]:
+    """Shrink / delete this run's OWN unexported catch-up production down to
+    ``target_qty`` (v2 §8, drift-driven surplus). Only own MRP lines that are not
+    in 1C (``order_ref1c`` NULL, no success production-order SyncLink) and not
+    yet produced (``produced_qty`` ≤ EPS) are touched, newest first
+    (``product_id`` desc). A line fully removed drops its order+product+state; a
+    partially trimmed line has its qty reduced. Welded-pair items are skipped."""
+    if int(item_id) in welded_blocked:
+        return None
+    rows = (
+        db.query(ProductionProduct, ProductionOrder, ProductionOrderLineState)
+        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+        .outerjoin(
+            ProductionOrderLineState,
+            ProductionOrderLineState.product_id == ProductionProduct.product_id,
+        )
+        .filter(ProductionOrder.source == "mrp")
+        .filter(ProductionOrder.source_run_id == int(run.run_id))
+        .filter(ProductionProduct.item_id == int(item_id))
+        .filter(ProductionOrder.deletion_mark == False)
+        .filter(ProductionOrder.order_ref1c.is_(None))
+        .filter(func.coalesce(ProductionProduct.produced_qty, 0) <= EPS)
+        .filter(func.coalesce(ProductionProduct.remaining_qty, 0) > EPS)
+        .filter(func.coalesce(ProductionOrderLineState.status, "shortage").notin_(("completed", "cancelled")))
+        .order_by(ProductionProduct.product_id.desc())
+        .all()
+    )
+    if not rows:
+        return None
+
+    order_ids = [int(o.order_id) for _p, o, _s in rows]
+    exported_order_ids = {
+        int(source_id)
+        for (source_id,) in (
+            db.query(SyncLink.source_id)
+            .filter(
+                SyncLink.source_system == "PRODPLAN",
+                SyncLink.source_doctype == "production_order",
+                SyncLink.source_id.in_(order_ids),
+                SyncLink.target_entity == PRODUCTION_ORDER_ENTITY,
+                SyncLink.status == "success",
+                SyncLink.target_ref_key.isnot(None),
+            )
+            .all()
+        )
+    }
+    trimmable = [
+        (pp, order, state)
+        for pp, order, state in rows
+        if int(order.order_id) not in exported_order_ids
+    ]
+    current_total = sum(_to_float(pp.remaining_qty) for pp, _o, _s in trimmable)
+    surplus = current_total - max(_to_float(target_qty), 0.0)
+    if surplus <= EPS:
+        return None
+
+    removed_qty = 0.0
+    removed_product_ids: List[int] = []
+    reduced: List[Dict[str, Any]] = []
+    for pp, order, state in trimmable:
+        if surplus <= EPS:
+            break
+        qty = _to_float(pp.remaining_qty)
+        if qty <= EPS:
+            continue
+        delta = min(qty, surplus)
+        next_qty = max(qty - delta, 0.0)
+        if next_qty <= EPS:
+            removed_product_ids.append(int(pp.product_id))
+            if not dry_run:
+                if state is not None:
+                    db.delete(state)
+                db.delete(pp)
+                db.flush()
+                remaining_lines = (
+                    db.query(func.count(ProductionProduct.product_id))
+                    .filter(ProductionProduct.order_id == int(order.order_id))
+                    .scalar()
+                )
+                if not remaining_lines:
+                    db.delete(order)
+        else:
+            reduced.append(
+                {
+                    "product_id": int(pp.product_id),
+                    "from_qty": round(qty, 6),
+                    "to_qty": round(next_qty, 6),
+                }
+            )
+            if not dry_run:
+                pp.quantity = next_qty
+                pp.remaining_qty = next_qty
+        removed_qty += delta
+        surplus -= delta
+
+    if removed_qty <= EPS:
+        return None
+    return {
+        "item_id": int(item_id),
+        "target_qty": round(max(_to_float(target_qty), 0.0), 6),
+        "removed_qty": round(removed_qty, 6),
+        "removed_product_ids": removed_product_ids,
+        "reduced": reduced,
+    }
+
+
+def _own_purchase_coverage(
+    db: Session, run: PlanningRun
+) -> tuple[Set[int], Dict[int, float], Dict[int, float]]:
+    """Own purchase coverage for a run (v2 §5).
+
+    Returns ``(exported_pp_ids, unexported_pp_qty, own_exported_outstanding)``:
+
+    * ``exported_pp_ids`` — PlannedPurchase ids of this run pushed to 1C
+      (success SyncLink);
+    * ``unexported_pp_qty[item_id]`` — Σ qty of this run's PlannedPurchase rows
+      NOT yet exported (still trimmable local recommendations);
+    * ``own_exported_outstanding[item_id]`` — Σ max(quantity − received, 0) over
+      the non-terminal, non-deleted supplier orders those exported rows created.
+      Received is already counted in executed (direct), so coverage+executed does
+      not double-count.
+    """
+    purchases = (
+        db.query(PlannedPurchase)
+        .filter(PlannedPurchase.run_id == int(run.run_id))
+        .all()
+    )
+    unexported_pp_qty: Dict[int, float] = {}
+    own_exported_outstanding: Dict[int, float] = {}
+    if not purchases:
+        return set(), unexported_pp_qty, own_exported_outstanding
+
+    purchase_ids = [int(pp.purchase_id) for pp in purchases]
+    ref_by_purchase: Dict[int, str] = {
+        int(source_id): str(ref_key)
+        for source_id, ref_key in (
+            db.query(SyncLink.source_id, SyncLink.target_ref_key)
+            .filter(
+                SyncLink.source_system == "PRODPLAN",
+                SyncLink.source_doctype == "planned_purchase",
+                SyncLink.source_id.in_(purchase_ids),
+                SyncLink.target_entity == PURCHASE_ORDER_ENTITY,
+                SyncLink.status == "success",
+                SyncLink.target_ref_key.isnot(None),
+            )
+            .all()
+        )
+        if ref_key
+    }
+    exported_pp_ids = set(ref_by_purchase)
+    for pp in purchases:
+        if int(pp.purchase_id) in exported_pp_ids:
+            continue
+        iid = int(pp.item_id)
+        unexported_pp_qty[iid] = unexported_pp_qty.get(iid, 0.0) + _to_float(pp.qty)
+
+    refs = {ref for ref in ref_by_purchase.values() if ref}
+    if refs:
+        for soi, order in (
+            db.query(SupplierOrderItem, SupplierOrder)
+            .join(SupplierOrder, SupplierOrder.order_id == SupplierOrderItem.order_id)
+            .filter(SupplierOrder.order_ref1c.in_(list(refs)))
+            .filter(SupplierOrder.deletion_mark == False)
+            .all()
+        ):
+            if _supplier_order_is_terminal(order.order_state_name):
+                continue
+            iid = int(soi.item_id_ref)
+            outstanding = max(_to_float(soi.quantity) - _to_float(soi.received_qty), 0.0)
+            if outstanding > EPS:
+                own_exported_outstanding[iid] = own_exported_outstanding.get(iid, 0.0) + outstanding
+    return exported_pp_ids, unexported_pp_qty, own_exported_outstanding
+
+
+def _run_repairs(
+    db: Session,
+    run: PlanningRun,
+    *,
+    dry_run: bool,
+    manage_tx: bool,
+    welded_blocked: Set[int],
+    now: datetime,
+) -> Dict[str, Any]:
+    """Structural repairs (independent of drift sizing): optimal-batch split,
+    binding repair, capacity reschedule, then commit/rollback (if this call owns
+    the transaction) and the cross-run dedupe."""
+    batch_repair = _split_oversized_catchup_batches(
+        db, run, dry_run=dry_run, now=now, exclude_item_ids=welded_blocked
+    )
+    binding_repair = (
+        {"checked": 0, "spec_updated": 0, "workshop_auto_cleared": 0, "local_issues_deleted": 0, "blocked": {}}
+        if dry_run
+        else repair_clean_mrp_bindings(db, run_id=int(run.run_id))
+    )
+    reschedule = _reschedule_run_journal(
+        db, run, dry_run=dry_run, exclude_item_ids=welded_blocked
+    )
+    if manage_tx:
+        if dry_run:
+            db.rollback()
+        else:
+            db.commit()
+    mrp_order_repair = dedupe_mrp_production_orders(db, dry_run=dry_run)
+    return {
+        "rescheduled": reschedule,
+        "mrp_order_repair": mrp_order_repair,
+        "mrp_batch_repair": batch_repair,
+        "binding_repair": binding_repair,
+    }
+
+
+def reconcile_snapshot(
+    db: Session,
+    run_id: int,
+    *,
+    dry_run: bool = False,
+    ledger_cycle_ran: bool = False,
+    manage_tx: bool = True,
+) -> Dict[str, Any]:
+    """Drift-correct one FIXED_SNAPSHOT run and repair its journal (v2 §8).
+
+    Reads the ledger the cycle persisted (``effective_net`` = frozen net + drift
+    adjustment, ``executed_qty``) and sizes each requirement's OWN outstanding
+    supply to ``desired_outstanding``. Never re-explodes demand, never writes
+    ``net_required_qty``. Returns a per-item summary of what was added / trimmed.
     """
     run = db.query(PlanningRun).filter(PlanningRun.run_id == int(run_id)).one_or_none()
     if run is None:
@@ -655,21 +761,15 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
     if run.source_plan_id is None:
         raise ValueError(f"run_id={run_id}: прогон не привязан к плану периода")
 
-    # Freeze v2 guard (§11, temporary — the drift increment removes the
-    # re-explosion entirely). Once a run carries an active freeze version its
-    # net_required_qty is the authoritative frozen value; the legacy re-explosion
-    # here re-credits the FULL shared stock per run and would collapse later
-    # runs' net to ~0 and trim their (correct) purchases. Under the guard we do
-    # NOT persist the re-derived net and do NOT trim planned purchases; the
-    # production/purchase top-up for genuine gaps is kept.
-    freeze_guard = run.active_freeze_version is not None
-
-    snapshot_requirements = (
+    now = datetime.now(timezone.utc)
+    open_reqs = (
         db.query(MrpRequirement)
         .filter(MrpRequirement.run_id == int(run.run_id))
+        .filter(MrpRequirement.status == "open")
+        .order_by(MrpRequirement.item_id.asc())
         .all()
     )
-    if not snapshot_requirements:
+    if not open_reqs:
         return {
             "run_id": int(run.run_id),
             "source_plan_id": int(run.source_plan_id),
@@ -678,274 +778,204 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
             "production_added": [],
             "purchase_added": [],
             "purchase_pruned": [],
-            "note": "в плане нет положительной потребности",
+            "production_trimmed": [],
+            "note": "в плане нет открытой потребности",
         }
 
-    period_to = run.period_to or max((req.period_to for req in snapshot_requirements), default=date.today())
-
-    # A fixed snapshot already contains the BOM explosion result in
-    # MrpRequirement.total_required_qty. Reconciliation must not explode the
-    # current plan again: doing so can reintroduce obsolete gross demand after
-    # local MRP orders were reduced/cancelled. Re-anchor only the net side of the
-    # frozen snapshot to current effective stock, then compare it with open WIP.
-    stock_by_item = effective_stock_by_item_all(db)
-    root_item_ids = [
-        int(req.item_id)
-        for req in snapshot_requirements
-        if int(req.bom_level or 0) == 0
-    ]
-    root_production_item_ids = {
-        int(item_id)
-        for item_id, replenishment_method in (
-            db.query(Item.item_id, Item.replenishment_method)
-            .filter(Item.item_id.in_(root_item_ids))
-            .all()
-        )
-        if classify_replenishment_flow(replenishment_method) == REPLENISHMENT_FLOW_PRODUCTION
-    }
-    current_gross_by_item, bom_level_by_item = _current_snapshot_gross_by_item(
-        db, snapshot_requirements, stock_by_item, root_production_item_ids,
-    )
-    current_net_by_item: Dict[int, float] = {}
-    for iid in sorted(current_gross_by_item):
-        gross = _to_float(current_gross_by_item.get(iid, 0.0))
-        current_net_by_item[iid] = (
-            gross if iid in root_production_item_ids
-            else max(gross - _to_float(stock_by_item.get(iid, 0.0)), 0.0)
-        )
-
-    req_by_item = _ensure_reconciled_requirements(
-        db,
-        run,
-        snapshot_requirements,
-        current_gross_by_item,
-        current_net_by_item,
-        bom_level_by_item,
-    )
-    orphan_link_repair = _link_orphan_mrp_products_to_requirements(db, run, req_by_item)
-    item_ids = sorted(current_net_by_item)
-    # Сварные детали активных пар «окраска↔сварка»: догоняющие заказы на них не
-    # материализуются (заказываются по цепочке от окраски). Сироты (нет активной
-    # пары) не входят и материализуются как раньше.
-    welded_blocked = is_welded_blocked(db, item_ids)
-    active_production_by_item = _active_production_qty_by_item(db, item_ids)
+    req_by_item: Dict[int, MrpRequirement] = {int(r.item_id): r for r in open_reqs}
+    open_req_ids: Set[int] = {int(r.id) for r in open_reqs}
+    item_ids = sorted(req_by_item)
     items_by_id: Dict[int, Item] = {
         int(r.item_id): r
         for r in db.query(Item).filter(Item.item_id.in_(item_ids)).all()
-    } if item_ids else {}
+    }
+    welded_blocked = is_welded_blocked(db, item_ids)
+    orphan_link_repair = _link_orphan_mrp_products_to_requirements(db, run, req_by_item)
 
-    purchase_item_ids = [
-        iid for iid in item_ids
-        if classify_replenishment_flow(getattr(items_by_id.get(iid), "replenishment_method", None))
-        == REPLENISHMENT_FLOW_PURCHASE
-    ]
-    supplier_work: Dict[int, List[Dict[str, Any]]] = {
-        iid: [dict(row) for row in rows]
-        for iid, rows in _load_purchase_supplier_remaining(db, purchase_item_ids, period_to).items()
-    }
-    existing_planned_purchase: Dict[int, float] = {
-        int(iid): _to_float(total)
-        for iid, total in (
-            db.query(PlannedPurchase.item_id, func.sum(PlannedPurchase.qty))
-            .filter(PlannedPurchase.run_id == int(run.run_id))
-            .group_by(PlannedPurchase.item_id)
-            .all()
+    # needs_freeze: an un-frozen run has no authoritative net to size against —
+    # run only the structural repairs (a deploy prerequisite is a full-area
+    # refreeze). No sizing, no trim.
+    if run.active_freeze_version is None:
+        repairs = _run_repairs(
+            db, run, dry_run=dry_run, manage_tx=manage_tx,
+            welded_blocked=welded_blocked, now=now,
         )
-    }
+        return {
+            "run_id": int(run.run_id),
+            "source_plan_id": int(run.source_plan_id),
+            "status": "needs_freeze",
+            "dry_run": bool(dry_run),
+            "production_added": [],
+            "purchase_added": [],
+            "purchase_pruned": [],
+            "production_trimmed": [],
+            "orphan_link_repair": orphan_link_repair,
+            "effective_net_total": 0.0,
+            "drift_adjust_total": 0.0,
+            **repairs,
+        }
+
+    # The ledger cycle populates executed_qty + drift_adjustment_qty; run it now
+    # unless the caller (reconcile_all_active) already ran it for the whole scope.
+    if not ledger_cycle_ran:
+        run_ledger_cycle(db)
+
+    period_to = run.period_to or max((r.period_to for r in open_reqs), default=date.today())
+    own_open_production = _own_open_production_by_item(db, run, open_req_ids)
+    _exported_pp_ids, unexported_pp_qty, own_exported_outstanding = _own_purchase_coverage(db, run)
 
     production_added: List[Dict[str, Any]] = []
     purchase_added: List[Dict[str, Any]] = []
     purchase_pruned: List[Dict[str, Any]] = []
-    now = datetime.now(timezone.utc)
+    production_trimmed: List[Dict[str, Any]] = []
+    effective_net_total = 0.0
+    drift_adjust_total = 0.0
 
-    for iid in sorted(current_net_by_item.keys()):
+    for iid in item_ids:
         item = items_by_id.get(iid)
-        if item is None:
+        req = req_by_item.get(iid)
+        if item is None or req is None:
             continue
         flow = classify_replenishment_flow(getattr(item, "replenishment_method", None))
-        req = req_by_item.get(iid)
-        current_net = _to_float(current_net_by_item.get(iid, 0.0))
+        eff_net = _effective_net(req)
+        executed = _to_float(req.executed_qty)
+        desired = max(eff_net - executed, 0.0)
+        effective_net_total += eff_net
+        drift_adjust_total += _to_float(req.drift_adjustment_qty)
 
-        if req is not None and not freeze_guard:
-            req.net_required_qty = current_net
-
-        if (
-            not freeze_guard
-            and flow != REPLENISHMENT_FLOW_PURCHASE
-            and existing_planned_purchase.get(iid, 0.0) > EPS
-        ):
+        # A production/rework-flow item must not carry planned purchases — trim
+        # any stale local purchase recommendation to zero (kept unconditionally).
+        if flow != REPLENISHMENT_FLOW_PURCHASE and unexported_pp_qty.get(iid, 0.0) > EPS:
             pruned = _trim_unexported_planned_purchases(
-                db,
-                run_id=int(run.run_id),
-                item_id=iid,
-                target_qty=0.0,
-                dry_run=dry_run,
+                db, run_id=int(run.run_id), item_id=iid, target_qty=0.0, dry_run=dry_run,
             )
             if pruned:
                 purchase_pruned.append(pruned)
-                existing_planned_purchase[iid] = max(
-                    existing_planned_purchase.get(iid, 0.0) - _to_float(pruned.get("removed_qty")),
-                    0.0,
+                unexported_pp_qty[iid] = max(
+                    unexported_pp_qty.get(iid, 0.0) - _to_float(pruned.get("removed_qty")), 0.0
                 )
 
         if flow == REPLENISHMENT_FLOW_PRODUCTION:
-            open_qty = _to_float(active_production_by_item.get(iid, 0.0))
-            if req is not None:
-                req.covered_qty = min(open_qty, current_net)
-                req.remaining_qty = max(current_net - _to_float(req.covered_qty), 0.0)
+            own_cov = _to_float(own_open_production.get(iid, 0.0))
+            gap = desired - own_cov
             if iid in welded_blocked:
-                # Сварная деталь активной пары: остаток и открытые заказы уже
-                # учтены выше (нетто/covered), догоняющий заказ не создаём —
-                # потребность закроется цепочкой от окрасочного заказа.
-                continue
-            gap = max(current_net - open_qty, 0.0)
-            if gap <= EPS:
-                continue
-            entry = {
-                "item_id": int(iid),
-                "item_code": str(item.item_code or ""),
-                "item_name": str(item.item_name or ""),
-                "qty": round(gap, 6),
-                "requirement_id": int(req.id) if req else None,
-            }
-            if not dry_run:
-                products = _materialize_catchup_gap(db, run=run, item=item, req=req, gap=gap, now=now)
-                _bump_requirement_coverage(req, gap)
-                active_production_by_item[iid] = open_qty + gap
-                entry["orders"] = [
-                    {
-                        "order_id": int(order.order_id),
-                        "order_number": order.order_number,
-                        "product_id": int(product.product_id),
-                        "qty": round(_to_float(qty), 6),
-                    }
-                    for order, product, qty in products
-                ]
-                if products:
-                    order, product, _qty = products[0]
-                    entry["order_id"] = int(order.order_id)
-                    entry["order_number"] = order.order_number
-                    entry["product_id"] = int(product.product_id)
-            production_added.append(entry)
+                # Welded pair: catch-up is issued through the paint chain, not
+                # here. No materialise / no trim.
+                pass
+            elif gap > EPS:
+                entry = {
+                    "item_id": int(iid),
+                    "item_code": str(item.item_code or ""),
+                    "item_name": str(item.item_name or ""),
+                    "qty": round(gap, 6),
+                    "requirement_id": int(req.id),
+                }
+                if not dry_run:
+                    products = _materialize_catchup_gap(
+                        db, run=run, item=item, req=req, gap=gap, now=now
+                    )
+                    own_cov += gap
+                    own_open_production[iid] = own_cov
+                    entry["orders"] = [
+                        {
+                            "order_id": int(order.order_id),
+                            "order_number": order.order_number,
+                            "product_id": int(product.product_id),
+                            "qty": round(_to_float(qty), 6),
+                        }
+                        for order, product, qty in products
+                    ]
+                    if products:
+                        order, product, _qty = products[0]
+                        entry["order_id"] = int(order.order_id)
+                        entry["order_number"] = order.order_number
+                        entry["product_id"] = int(product.product_id)
+                production_added.append(entry)
+            elif gap < -EPS:
+                trimmed = _trim_unexported_catchup_production(
+                    db, run=run, item_id=iid, target_qty=desired,
+                    welded_blocked=welded_blocked, dry_run=dry_run,
+                )
+                if trimmed:
+                    production_trimmed.append(trimmed)
+                    own_cov = max(own_cov - _to_float(trimmed.get("removed_qty")), 0.0)
+                    own_open_production[iid] = own_cov
+            covered = min(executed + own_cov, eff_net)
+            req.covered_qty = covered
+            req.remaining_qty = max(eff_net - covered, 0.0)
 
         elif flow == REPLENISHMENT_FLOW_PURCHASE:
-            if current_net <= EPS:
-                if req is not None:
-                    req.covered_qty = 0.0
-                    req.remaining_qty = 0.0
-                if not freeze_guard:
-                    pruned = _trim_unexported_planned_purchases(
-                        db,
-                        run_id=int(run.run_id),
-                        item_id=iid,
-                        target_qty=0.0,
-                        dry_run=dry_run,
-                    )
-                    if pruned:
-                        purchase_pruned.append(pruned)
-                        existing_planned_purchase[iid] = max(
-                            existing_planned_purchase.get(iid, 0.0) - _to_float(pruned.get("removed_qty")),
-                            0.0,
+            own_cov = _to_float(unexported_pp_qty.get(iid, 0.0)) + _to_float(
+                own_exported_outstanding.get(iid, 0.0)
+            )
+            gap = desired - own_cov
+            if gap > EPS:
+                lead_time = int(getattr(item, "replenishment_time", 0) or 0)
+                need_date = period_to
+                order_date = max(date.today(), need_date - timedelta(days=lead_time))
+                entry = {
+                    "item_id": int(iid),
+                    "item_code": str(item.item_code or ""),
+                    "item_name": str(item.item_name or ""),
+                    "qty": round(gap, 6),
+                    "requirement_id": int(req.id),
+                }
+                if not dry_run:
+                    db.add(
+                        PlannedPurchase(
+                            run_id=int(run.run_id),
+                            item_id=int(iid),
+                            requested_qty=gap,
+                            planned_qty=gap,
+                            qty=gap,
+                            need_date=need_date,
+                            order_date=order_date,
+                            lead_time_days=lead_time,
+                            bucket_date=need_date,
+                            supplier_ref1c=getattr(item, "supplier_ref1c", None),
+                            source_mrp_requirement_id=int(req.id),
                         )
-                continue
-            target = current_net
-            for sup_row in supplier_work.get(iid, []):
-                if target <= EPS:
-                    break
-                avail = _to_float(sup_row.get("remaining_qty"))
-                if avail <= EPS:
-                    continue
-                used = min(avail, target)
-                sup_row["remaining_qty"] = max(avail - used, 0.0)
-                target -= used
-            already = existing_planned_purchase.get(iid, 0.0)
-            if not freeze_guard:
+                    )
+                    unexported_pp_qty[iid] = _to_float(unexported_pp_qty.get(iid, 0.0)) + gap
+                    own_cov += gap
+                purchase_added.append(entry)
+            elif gap < -EPS:
+                target = max(desired - _to_float(own_exported_outstanding.get(iid, 0.0)), 0.0)
                 pruned = _trim_unexported_planned_purchases(
-                    db,
-                    run_id=int(run.run_id),
-                    item_id=iid,
-                    target_qty=target,
-                    dry_run=dry_run,
+                    db, run_id=int(run.run_id), item_id=iid, target_qty=target, dry_run=dry_run,
                 )
                 if pruned:
                     purchase_pruned.append(pruned)
-                    already = max(already - _to_float(pruned.get("removed_qty")), 0.0)
-                    existing_planned_purchase[iid] = already
-            gap = target - already
-            if req is not None:
-                req.covered_qty = min(current_net - max(gap, 0.0), current_net)
-                req.remaining_qty = max(current_net - _to_float(req.covered_qty), 0.0)
-            if gap <= EPS:
-                continue
-            lead_time = int(getattr(item, "replenishment_time", 0) or 0)
-            need_date = period_to
-            order_date = max(date.today(), need_date - timedelta(days=lead_time))
-            entry = {
-                "item_id": int(iid),
-                "item_code": str(item.item_code or ""),
-                "item_name": str(item.item_name or ""),
-                "qty": round(gap, 6),
-                "requirement_id": int(req.id) if req else None,
-            }
-            if not dry_run:
-                db.add(
-                    PlannedPurchase(
-                        run_id=int(run.run_id),
-                        item_id=int(iid),
-                        requested_qty=gap,
-                        planned_qty=gap,
-                        qty=gap,
-                        need_date=need_date,
-                        order_date=order_date,
-                        lead_time_days=lead_time,
-                        bucket_date=need_date,
-                        supplier_ref1c=getattr(item, "supplier_ref1c", None),
-                        source_mrp_requirement_id=int(req.id) if req else None,
+                    unexported_pp_qty[iid] = max(
+                        _to_float(unexported_pp_qty.get(iid, 0.0)) - _to_float(pruned.get("removed_qty")),
+                        0.0,
                     )
-                )
-                # Track so a second item with the same id in this loop won't
-                # double-add (defensive; net_map keys are unique).
-                existing_planned_purchase[iid] = already + gap
-            purchase_added.append(entry)
-        # rework flow is intentionally not auto-topped-up in v1.
+                    own_cov = _to_float(unexported_pp_qty.get(iid, 0.0)) + _to_float(
+                        own_exported_outstanding.get(iid, 0.0)
+                    )
+            covered = min(executed + own_cov, eff_net)
+            req.covered_qty = covered
+            req.remaining_qty = max(eff_net - covered, 0.0)
+        # rework flow is intentionally not auto-topped-up.
 
-    batch_repair = _split_oversized_catchup_batches(
-        db, run, dry_run=dry_run, now=now, exclude_item_ids=welded_blocked
+    repairs = _run_repairs(
+        db, run, dry_run=dry_run, manage_tx=manage_tx,
+        welded_blocked=welded_blocked, now=now,
     )
-    binding_repair = (
-        {"checked": 0, "spec_updated": 0, "workshop_auto_cleared": 0, "local_issues_deleted": 0, "blocked": {}}
-        if dry_run
-        else repair_clean_mrp_bindings(db, run_id=int(run.run_id))
-    )
-
-    # Re-anchor every production line that is NOT yet open in 1C to a fresh
-    # capacity-aware, child→parent-aware schedule starting today. Lines already
-    # open in 1C stay where they are and pre-book their capacity.
-    reschedule = _reschedule_run_journal(
-        db, run, dry_run=dry_run, exclude_item_ids=welded_blocked
-    )
-
-    if dry_run:
-        db.rollback()
-    else:
-        db.commit()
-
-    mrp_order_repair = dedupe_mrp_production_orders(db, dry_run=dry_run)
 
     return {
         "run_id": int(run.run_id),
         "source_plan_id": int(run.source_plan_id),
         "status": "ok",
         "dry_run": bool(dry_run),
-        "freeze_guard": bool(freeze_guard),
         "production_added": production_added,
         "purchase_added": purchase_added,
         "purchase_pruned": purchase_pruned,
-        "rescheduled": reschedule,
-        "mrp_order_repair": mrp_order_repair,
-        "mrp_batch_repair": batch_repair,
-        "binding_repair": binding_repair,
+        "production_trimmed": production_trimmed,
         "orphan_link_repair": orphan_link_repair,
+        "effective_net_total": round(effective_net_total, 6),
+        "drift_adjust_total": round(drift_adjust_total, 6),
+        **repairs,
     }
 
 
@@ -1128,38 +1158,53 @@ def _reschedule_run_journal(
 
 
 def reconcile_all_active(db: Session, *, dry_run: bool = False) -> Dict[str, Any]:
-    """Reconcile the latest snapshot of every plan whose period is still open."""
+    """Reconcile the latest snapshot of every plan whose period is still open.
+
+    Composite cycle (v2 §6): the execution ledger (verify → executed → drift →
+    drift_adjustment) is rebuilt ONCE for the whole canonical scope BEFORE the
+    per-run sizing loop, so every run sizes against a freshly persisted
+    executed/drift ledger. The scope is re-derived inside run_ledger_cycle (last
+    FIXED_SNAPSHOT per plan, NO period filter, plus CLOSED-with-open-req), so it
+    is not parameterised by ``run_ids`` here.
+    """
+    # 1) Ledger cycle first — persist executed_qty + drift_adjustment_qty for the
+    # scope. On a non-dry run commit it so the per-run sizers read committed
+    # facts; a dry run keeps it in the session and rolls the whole thing back at
+    # the end.
+    execution_ledger: Dict[str, Any]
+    try:
+        execution_ledger = run_ledger_cycle(db)
+        if not dry_run:
+            db.commit()
+    except Exception as exc:  # noqa: BLE001 — never let ledger population break reconcile
+        db.rollback()
+        execution_ledger = {"status": "error", "error": str(exc)}
+
+    # 2) Per-run drift-correction sizing. The ledger already ran, so pass
+    # ledger_cycle_ran=True; on a non-dry run each snapshot owns its own commit,
+    # on a dry run the outer rollback below is authoritative (manage_tx=False).
     run_ids = _latest_active_snapshot_run_ids(db)
     results: List[Dict[str, Any]] = []
     total_production = 0
     total_purchase = 0
     total_purchase_pruned = 0
+    total_production_trimmed = 0
     for rid in run_ids:
         try:
-            res = reconcile_snapshot(db, rid, dry_run=dry_run)
+            res = reconcile_snapshot(
+                db, rid, dry_run=dry_run, ledger_cycle_ran=True, manage_tx=not dry_run
+            )
             total_production += len(res.get("production_added", []))
             total_purchase += len(res.get("purchase_added", []))
             total_purchase_pruned += len(res.get("purchase_pruned", []))
+            total_production_trimmed += len(res.get("production_trimmed", []))
             results.append(res)
         except Exception as exc:  # noqa: BLE001 — isolate one bad run from the rest
             db.rollback()
             results.append({"run_id": int(rid), "status": "error", "error": str(exc)})
 
-    # Execution ledger (increment 3): rebuild the explainable allocation ledger
-    # and the derived executed_qty for the canonical scope in one cycle. The
-    # scope is re-derived inside run_ledger_cycle (last FIXED_SNAPSHOT per plan,
-    # no period filter, plus CLOSED-with-open-req), so it is not parameterised by
-    # run_ids here. Respect dry_run like reconcile_snapshot.
-    execution_ledger: Dict[str, Any]
-    try:
-        execution_ledger = run_ledger_cycle(db)
-        if dry_run:
-            db.rollback()
-        else:
-            db.commit()
-    except Exception as exc:  # noqa: BLE001 — never let ledger population break reconcile
+    if dry_run:
         db.rollback()
-        execution_ledger = {"status": "error", "error": str(exc)}
 
     return {
         "status": "ok",
@@ -1168,6 +1213,7 @@ def reconcile_all_active(db: Session, *, dry_run: bool = False) -> Dict[str, Any
         "production_lines_added": total_production,
         "purchase_lines_added": total_purchase,
         "purchase_lines_pruned": total_purchase_pruned,
+        "production_lines_trimmed": total_production_trimmed,
         "execution_ledger": execution_ledger,
         "results": results,
     }

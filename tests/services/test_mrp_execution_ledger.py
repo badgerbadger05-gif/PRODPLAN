@@ -22,6 +22,7 @@ from app.models import (
     MrpExecutionAllocation,
     MrpFreezeAllocation,
     MrpFreezeBaseline,
+    MrpFreezeComponent,
     MrpRequirement,
     MrpRequirementBucket,
     PlanningRun,
@@ -29,6 +30,8 @@ from app.models import (
     ProductionOrderLineState,
     ProductionPlanHeader,
     ProductionProduct,
+    SpecComponent,
+    Specification,
     SupplierOrder,
     SupplierOrderItem,
 )
@@ -260,6 +263,34 @@ def _make_freeze_alloc(
     db.add(alloc)
     db.flush()
     return alloc
+
+
+def _make_freeze_component(db, run, parent, component, *, norm, version=1):
+    row = MrpFreezeComponent(
+        run_id=run.run_id,
+        freeze_version=version,
+        parent_item_id=parent.item_id,
+        parent_characteristic_ref="",
+        parent_organization_ref="",
+        parent_planning_stock_pool="default",
+        component_item_id=component.item_id,
+        component_characteristic_ref="",
+        component_organization_ref="",
+        component_planning_stock_pool="default",
+        spec_ref=f"spec-{parent.item_code}",
+        norm_qty_per_unit=norm,
+        unit_coef=1.0,
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def _drift_events(db, item, kind=None):
+    q = db.query(MrpDriftEvent).filter(MrpDriftEvent.item_id == item.item_id)
+    if kind is not None:
+        q = q.filter(MrpDriftEvent.kind == kind)
+    return q.all()
 
 
 def _exec_rows(db, req):
@@ -531,7 +562,9 @@ def test_i3_realization_with_surplus_execution(db_session):
 
 
 def test_i3_evaporation_terminal_order(db_session):
-    """Cancelled supplier order: realized 10, evaporated 40 → drift_event, no drift adj."""
+    """Cancelled supplier order: realized 10, evaporated 40 → drift_event, and
+    (increment 4) an immediate drift_adjustment of 40 on the requirement — an
+    evaporation is not subject to the maturity window W."""
     item = _make_purchased_item(db_session, "E-1")
     run = _make_run(db_session, period_from=date(2026, 6, 1), period_to=date(2026, 6, 30), freeze_version=1)
     req = _make_req(db_session, run, item, net=100)
@@ -554,7 +587,7 @@ def test_i3_evaporation_terminal_order(db_session):
     assert float(alloc.realized_qty) == 10.0
     assert float(alloc.evaporated_qty) == 40.0
     assert float(req.executed_qty) == 0.0
-    assert float(req.drift_adjustment_qty) == 0.0
+    assert float(req.drift_adjustment_qty) == 40.0
     events = (
         db_session.query(MrpDriftEvent)
         .filter(MrpDriftEvent.kind == "evaporation")
@@ -847,3 +880,241 @@ def test_i3_cancelled_line_not_a_candidate(db_session):
     db_session.refresh(req)
     assert float(req.executed_qty) == 0.0
     assert _exec_rows(db_session, req) == []
+
+
+# ===========================================================================
+# Increment-4 tests — stock drift (compute_stock_drift + materialisation)
+# ===========================================================================
+
+def _drift_component(db, *, comp_stock, parent_produced, norm, comp_s0, net, initial):
+    """A parent→component drift fixture: one frozen run whose component (bom
+    level 1) has baseline S0=comp_s0 and a frozen norm ``norm`` from the parent.
+    ``comp_stock`` is the component's CURRENT effective stock; the parent's
+    produced_now is ``parent_produced``."""
+    parent = _make_production_item(db, f"DP-PARENT-{net}-{comp_s0}-{comp_stock}", stock=0.0)
+    component = _make_production_item(db, f"DP-COMP-{net}-{comp_s0}-{comp_stock}", stock=comp_stock)
+    run = _make_run(db, period_from=date(2026, 6, 1), period_to=date(2026, 6, 30), freeze_version=1)
+    comp_req = _make_req(db, run, component, net=net, bom_level=1)
+    comp_req.initial_snapshot_stock = initial
+    db.flush()
+    _make_baseline(db, run, component, produced_total=0.0, received_total=0.0, stock=comp_s0, version=1)
+    _make_baseline(db, run, parent, produced_total=0.0, received_total=0.0, stock=0.0, version=1)
+    _make_freeze_component(db, run, parent, component, norm=norm, version=1)
+    if parent_produced > 0:
+        _make_production_line(db, parent, quantity=parent_produced, produced=parent_produced, req=None, source="1c")
+    return run, parent, component, comp_req
+
+
+def test_i4_planned_parent_production_zero_component_drift(db_session):
+    """Producing the parent consumes the component by Δproduced×frozen_norm, so
+    the component drift is ≈0 and no adjustment / event is raised."""
+    # S0=100, parent produced 10 at norm 2 → expected consumption 20 →
+    # expected stock 80; current component stock is exactly 80.
+    _run, _p, comp, req = _drift_component(
+        db_session, comp_stock=80.0, parent_produced=10, norm=2.0, comp_s0=100.0, net=100, initial=100
+    )
+    db_session.commit()
+
+    run_ledger_cycle(db_session)
+    db_session.commit()
+
+    db_session.refresh(req)
+    assert float(req.drift_adjustment_qty) == 0.0
+    assert _drift_events(db_session, comp, kind="shortfall") == []
+    assert _drift_events(db_session, comp, kind="surplus") == []
+
+
+def test_i4_offplan_stock_drop_first_cycle_pending(db_session):
+    """An off-plan stock decrease on cycle 1 is a pending shortfall (matured
+    False), so no drift_adjustment is materialised yet."""
+    _run, _p, comp, req = _drift_component(
+        db_session, comp_stock=90.0, parent_produced=0, norm=1.0, comp_s0=100.0, net=100, initial=100
+    )
+    db_session.commit()
+
+    run_ledger_cycle(db_session)
+    db_session.commit()
+
+    db_session.refresh(req)
+    assert float(req.drift_adjustment_qty) == 0.0
+    events = _drift_events(db_session, comp, kind="shortfall")
+    assert len(events) == 1
+    assert float(events[0].drift_qty) == 10.0
+    assert bool(events[0].matured) is False
+
+
+def test_i4_matured_shortfall_after_second_cycle(db_session, monkeypatch):
+    """With W=0, the shortfall matures on cycle 2 (≥2 cycles) and materialises as
+    a drift_adjustment, oldest-first, capped by initial_snapshot_stock."""
+    monkeypatch.setenv("MRP_DRIFT_MATURITY_HOURS", "0")
+    _run, _p, comp, req = _drift_component(
+        db_session, comp_stock=90.0, parent_produced=0, norm=1.0, comp_s0=100.0, net=100, initial=100
+    )
+    db_session.commit()
+
+    run_ledger_cycle(db_session)
+    db_session.commit()
+    db_session.refresh(req)
+    assert float(req.drift_adjustment_qty) == 0.0  # cycle 1: pending
+
+    run_ledger_cycle(db_session)
+    db_session.commit()
+    db_session.refresh(req)
+    assert float(req.drift_adjustment_qty) == 10.0  # cycle 2: matured
+
+
+def test_i4_shortfall_over_initial_is_unattributed(db_session, monkeypatch):
+    """A shortfall larger than Σ initial_snapshot_stock is capped; the excess is
+    unattributed (never materialised)."""
+    monkeypatch.setenv("MRP_DRIFT_MATURITY_HOURS", "0")
+    _run, _p, comp, req = _drift_component(
+        db_session, comp_stock=90.0, parent_produced=0, norm=1.0, comp_s0=100.0, net=100, initial=5
+    )
+    db_session.commit()
+
+    run_ledger_cycle(db_session)
+    db_session.commit()
+    run_ledger_cycle(db_session)
+    db_session.commit()
+
+    db_session.refresh(req)
+    assert float(req.drift_adjustment_qty) == 5.0  # capped at initial
+    event = _drift_events(db_session, comp, kind="shortfall")[0]
+    assert float((event.details or {}).get("unattributed")) == 5.0
+
+
+def test_i4_surplus_reduces_adjustment_capped_at_open_deficit(db_session, monkeypatch):
+    """A matured surplus becomes a NEGATIVE adjustment, capped by the open
+    deficit (net + evap − executed)."""
+    monkeypatch.setenv("MRP_DRIFT_MATURITY_HOURS", "0")
+    _run, _p, comp, req = _drift_component(
+        db_session, comp_stock=130.0, parent_produced=0, norm=1.0, comp_s0=100.0, net=100, initial=100
+    )
+    db_session.commit()
+
+    run_ledger_cycle(db_session)
+    db_session.commit()
+    run_ledger_cycle(db_session)
+    db_session.commit()
+
+    db_session.refresh(req)
+    assert float(req.drift_adjustment_qty) == -30.0
+
+
+def test_i4_frozen_bom_norm_survives_spec_change(db_session):
+    """Drift uses the FROZEN component norm, never the current SpecComponent: a
+    changed SpecComponent qty does not move the drift."""
+    _run, parent, comp, req = _drift_component(
+        db_session, comp_stock=80.0, parent_produced=10, norm=2.0, comp_s0=100.0, net=100, initial=100
+    )
+    # Current SpecComponent says 5/unit — if drift read it, expected consumption
+    # would be 50 and a +30 surplus would appear. It must NOT.
+    spec = Specification(spec_name="cur", spec_ref1c="cur-ref")
+    db_session.add(spec)
+    db_session.flush()
+    db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=5))
+    db_session.commit()
+
+    run_ledger_cycle(db_session)
+    db_session.commit()
+
+    db_session.refresh(req)
+    assert float(req.drift_adjustment_qty) == 0.0
+    assert _drift_events(db_session, comp, kind="surplus") == []
+
+
+def test_i4_three_cycles_adjustment_stable(db_session, monkeypatch):
+    """Drift recomputes from scratch each cycle — the adjustment does not
+    accumulate across repeated cycles over unchanged facts."""
+    monkeypatch.setenv("MRP_DRIFT_MATURITY_HOURS", "0")
+    _run, _p, _comp, req = _drift_component(
+        db_session, comp_stock=90.0, parent_produced=0, norm=1.0, comp_s0=100.0, net=100, initial=100
+    )
+    db_session.commit()
+
+    values = []
+    for _ in range(3):
+        run_ledger_cycle(db_session)
+        db_session.commit()
+        db_session.refresh(req)
+        values.append(float(req.drift_adjustment_qty))
+    # cycle1 pending (0), cycles 2 and 3 matured and identical (no accumulation).
+    assert values[0] == 0.0
+    assert values[1] == 10.0
+    assert values[2] == 10.0
+
+
+def test_i4_bom_level_zero_out_of_drift(db_session, monkeypatch):
+    """A pool whose minimum bom_level is 0 (a shipped finished good) is excluded
+    from drift even when its stock drops."""
+    monkeypatch.setenv("MRP_DRIFT_MATURITY_HOURS", "0")
+    item = _make_production_item(db_session, "D0-1", stock=90.0)
+    run = _make_run(db_session, period_from=date(2026, 6, 1), period_to=date(2026, 6, 30), freeze_version=1)
+    req = _make_req(db_session, run, item, net=100, bom_level=0)
+    req.initial_snapshot_stock = 100
+    _make_baseline(db_session, run, item, stock=100.0, version=1)
+    db_session.commit()
+
+    run_ledger_cycle(db_session)
+    db_session.commit()
+    run_ledger_cycle(db_session)
+    db_session.commit()
+
+    db_session.refresh(req)
+    assert float(req.drift_adjustment_qty) == 0.0
+    assert _drift_events(db_session, item) == []
+
+
+def test_i4_chain_reset_on_recovery(db_session, monkeypatch):
+    """A shortfall chain that recovers (drift returns to 0) resets: a later
+    shortfall is pending again, not immediately matured."""
+    monkeypatch.setenv("MRP_DRIFT_MATURITY_HOURS", "0")
+    _run, _p, comp, req = _drift_component(
+        db_session, comp_stock=90.0, parent_produced=0, norm=1.0, comp_s0=100.0, net=100, initial=100
+    )
+    db_session.commit()
+
+    run_ledger_cycle(db_session)  # cycle 1: shortfall pending
+    db_session.commit()
+    # Recovery: stock back to expected 100 → drift 0, chain broken.
+    comp.stock_qty = 100.0
+    db_session.commit()
+    run_ledger_cycle(db_session)  # cycle 2: no event
+    db_session.commit()
+    assert _drift_events(db_session, comp, kind="shortfall") == []
+    # New shortfall.
+    comp.stock_qty = 90.0
+    db_session.commit()
+    run_ledger_cycle(db_session)  # cycle 3: fresh chain → pending again
+    db_session.commit()
+
+    db_session.refresh(req)
+    assert float(req.drift_adjustment_qty) == 0.0
+    events = _drift_events(db_session, comp, kind="shortfall")
+    assert len(events) == 1
+    assert bool(events[0].matured) is False
+
+
+def test_i4_bucket_cap_extension_lets_drift_topup_execute(db_session):
+    """The first bucket cap is widened by a positive drift_adjustment so the
+    drift top-up can execute to the full effective_net (§4 bucket-cap)."""
+    item = _make_production_item(db_session, "BK-1")
+    run = _make_run(db_session, period_from=date(2026, 6, 1), period_to=date(2026, 6, 30), freeze_version=1)
+    req = _make_req(db_session, run, item, net=40, bom_level=1)
+    b1 = _make_bucket(db_session, req, bucket_date=date(2026, 6, 10), net_qty=20)
+    b2 = _make_bucket(db_session, req, bucket_date=date(2026, 6, 20), net_qty=20)
+    # A prior cycle materialised a +20 drift_adjustment (effective_net = 60).
+    req.drift_adjustment_qty = 20
+    # Unlinked 1C production of 60 for the item (no baseline → full-history Δ).
+    _make_production_line(db_session, item, quantity=60, produced=60, req=None, source="1c")
+    db_session.commit()
+
+    run_ledger_cycle(db_session)
+    db_session.commit()
+
+    db_session.refresh(req)
+    # The extended first bucket (20+20=40) plus the second (20) absorb all 60.
+    assert float(req.executed_qty) == 60.0
+    by_bucket = {r.bucket_id: float(r.allocated_qty) for r in _exec_rows(db_session, req)}
+    assert by_bucket.get(b1.id) == 40.0
+    assert by_bucket.get(b2.id) == 20.0
