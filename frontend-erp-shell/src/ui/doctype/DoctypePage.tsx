@@ -160,8 +160,9 @@ export function DoctypePage<Row, Filters extends object, Detail>({
           onCopyLink={() => void navigator.clipboard?.writeText(window.location.href)}
         />
         {renderFilters ? renderFilters(state) : <FilterBar doctype={doctype} state={state} />}
-        {state.error && <div className="errorLine">{state.error}</div>}
-        {state.message && <div className="successLine">{state.message}</div>}
+        {state.listLoading && <div className="srOnly" role="status">Загрузка...</div>}
+        {state.error && <div className="errorLine" role="alert">{state.error}</div>}
+        {state.message && <div className="successLine" role="status">{state.message}</div>}
         <div className={doctype.detail ? 'split' : undefined}>
           <DoctypeTable
             doctype={doctype}

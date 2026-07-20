@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 import { LedgerPostingTable } from './LedgerPostingTable'
 import { ProvenanceTimeline } from './ProvenanceTimeline'
 import { ReconciliationIssuesTable } from './ReconciliationIssuesTable'
+import { AuditTimeline } from './AuditTimeline'
 
 describe('ledger presentation primitives', () => {
   it('renders immutable posting provenance and supports keyboard activation', () => {
@@ -60,5 +61,24 @@ describe('ledger presentation primitives', () => {
     expect(screen.getByText('Документ 1С прочитан')).toBeInTheDocument()
     expect(screen.getByText('+2')).toBeInTheDocument()
     expect(screen.getByText('Предупреждение')).toBeInTheDocument()
+  })
+
+  it('shows audit actor, source, correlation and field-level diff', () => {
+    render(<AuditTimeline events={[{
+      id: 'audit-1',
+      occurredAt: '2026-07-20T10:00:00',
+      actor: 'ledger-worker',
+      action: 'Проекция пересчитана',
+      source: 'Проводка P-1',
+      correlationId: 'cycle-42',
+      changes: [{ field: 'balance', before: '8', after: '12' }],
+    }]} />)
+
+    expect(screen.getByRole('list', { name: 'Аудит изменений' })).toBeInTheDocument()
+    expect(screen.getByText(/ledger-worker/)).toBeInTheDocument()
+    expect(screen.getByText('Источник: Проводка P-1')).toBeInTheDocument()
+    expect(screen.getByText('cycle-42')).toBeInTheDocument()
+    expect(screen.getByText('8')).toHaveProperty('tagName', 'DEL')
+    expect(screen.getByText('12')).toHaveProperty('tagName', 'INS')
   })
 })

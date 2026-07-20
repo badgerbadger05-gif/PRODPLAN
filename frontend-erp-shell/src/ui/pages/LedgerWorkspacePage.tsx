@@ -9,6 +9,7 @@ import {
   type LedgerWorkspaceSnapshot,
 } from '../../services/ledger'
 import {
+  AuditTimeline,
   LedgerPostingTable,
   ProvenanceTimeline,
   ReconciliationIssuesTable,
@@ -176,6 +177,8 @@ export function LedgerWorkspacePage({
                     <ProvenanceTimeline steps={detail.provenance} />
                     <h2>Цепочка сторно</h2>
                     <LedgerPostingTable rows={detail.reversalChain} activeId={detail.posting.id} onActivate={activate} />
+                    <h2>Аудит</h2>
+                    <AuditTimeline events={detail.auditTrail} />
                   </>
                 )}
               </aside>

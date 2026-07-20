@@ -1,4 +1,5 @@
 import type {
+  AuditEventView,
   LedgerBalanceView,
   LedgerPostingView,
   ProvenanceStepView,
@@ -16,6 +17,7 @@ export type LedgerPostingDetailView = {
   balance: LedgerBalanceView
   provenance: ProvenanceStepView[]
   reversalChain: LedgerPostingView[]
+  auditTrail: AuditEventView[]
 }
 
 export type LedgerWorkspaceSnapshot = {
@@ -135,6 +137,29 @@ function detailFor(posting: LedgerPostingView): LedgerPostingDetailView {
     reversalChain: isReversal
       ? postings.filter((row) => row.id === 'P-1043' || row.id === 'P-1044')
       : postings.filter((row) => row.id === posting.id || row.reversalOf === posting.id),
+    auditTrail: [
+      {
+        id: `${posting.id}-accepted`,
+        occurredAt: posting.occurredAt,
+        actor: 'ledger-worker',
+        action: 'Команда принята',
+        source: posting.sourceDocument,
+        correlationId: posting.correlationId,
+        changes: [
+          { field: 'quantity', before: null, after: String(posting.quantityDelta) },
+          { field: 'posting_created', before: 'нет', after: 'да' },
+        ],
+      },
+      {
+        id: `${posting.id}-projected`,
+        occurredAt: '2026-07-20T12:00:00Z',
+        actor: 'projection-worker',
+        action: 'Проекция пересчитана',
+        source: posting.poolKey,
+        correlationId: posting.correlationId,
+        changes: [{ field: 'balance', before: '8', after: '12' }],
+      },
+    ],
   }
 }
 

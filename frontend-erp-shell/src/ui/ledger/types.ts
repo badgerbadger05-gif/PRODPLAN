@@ -45,3 +45,16 @@ export type ReconciliationIssueView = {
   detectedAt: string
 }
 
+export type AuditEventView = {
+  id: string
+  occurredAt: string
+  actor: string
+  action: string
+  source: string
+  correlationId?: string | null
+  changes: Array<{
+    field: string
+    before?: string | null
+    after?: string | null
+  }>
+}
