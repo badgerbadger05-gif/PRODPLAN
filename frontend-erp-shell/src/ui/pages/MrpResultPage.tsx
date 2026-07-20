@@ -18,7 +18,8 @@ import {
 } from '../../services/planning'
 import { getPeriodPlanMatrix } from '../../services/periodPlan'
 import { DocumentWindow } from '../layout/DocumentWindow'
-import { RootProductFilterDialog, rootProductLabel, type RootProductOption } from '../RootProductFilterDialog'
+import { RootProductFilterDialog } from '../RootProductFilterDialog'
+import { rootProductLabel, type RootProductOption } from '../rootProductOptions'
 import { StatusBar } from '../layout/StatusBar'
 
 type Tab = 'production' | 'purchases' | 'rework' | 'capacity'

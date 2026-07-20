@@ -1,0 +1,53 @@
+name: Frontend
+
+on:
+  pull_request:
+    paths:
+      - "frontend-erp-shell/**"
+      - "docs/api/**"
+      - ".github/workflows/frontend.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "frontend-erp-shell/**"
+      - "docs/api/**"
+      - ".github/workflows/frontend.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend-erp-shell
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend-erp-shell/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify generated API types
+        run: |
+          npm run api:types
+          git diff --exit-code -- src/lib/apiTypes.ts
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit and characterization tests
+        run: npm test
+
+      - name: Production build
+        run: npm run build

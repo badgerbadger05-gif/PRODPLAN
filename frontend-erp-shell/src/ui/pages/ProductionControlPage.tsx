@@ -38,10 +38,12 @@ import {
   updateItem,
   updateOrderQuantity,
   updateOrderStatus,
+  type PaintWeldChainResult,
 } from '../../services/productionControl'
 import { listResources } from '../../services/resources'
 import { DocumentWindow } from '../layout/DocumentWindow'
-import { RootProductFilterDialog, rootProductLabel, type RootProductOption } from '../RootProductFilterDialog'
+import { RootProductFilterDialog } from '../RootProductFilterDialog'
+import { rootProductLabel, type RootProductOption } from '../rootProductOptions'
 import { StatusBar } from '../layout/StatusBar'
 import { ProductionCommandBar } from './production-control/ProductionCommandBar'
 import { ProductionDetailPane } from './production-control/ProductionDetailPane'
@@ -102,7 +104,7 @@ export function ProductionControlPage() {
   const [produceProductId, setProduceProductId] = useState<number | null>(null)
   const [chainOpen, setChainOpen] = useState(false)
   const [chainRowId, setChainRowId] = useState<number | null>(null)
-  const [chainPreview, setChainPreview] = useState<Record<string, any> | null>(null)
+  const [chainPreview, setChainPreview] = useState<PaintWeldChainResult | null>(null)
   const [chainWeldOps, setChainWeldOps] = useState<ProductionOperationOption[]>([])
   const [chainPaintOps, setChainPaintOps] = useState<ProductionOperationOption[]>([])
   const [chainOperationEmployees, setChainOperationEmployees] = useState<Record<number, string>>({})
@@ -605,7 +607,7 @@ export function ProductionControlPage() {
         paint_operation_executors: chainPaintOps.length ? chainExecutorRows(chainPaintOps) : undefined,
         initiated_by: 'erp-shell-chain-close',
       })
-      const piecework = (result.piecework_export ?? {}) as Record<string, any>
+      const piecework = result.piecework_export ?? {}
       if (result.status !== 'ok' || (piecework.status && !['ok', 'existing'].includes(String(piecework.status)))) {
         const detail = String(piecework.error ?? '') || firstExportProblem(piecework, result.manufactures_export as Record<string, unknown>)
         throw new Error(`Цепочка закрыта частично.${detail ? ` ${detail}` : ''}`)

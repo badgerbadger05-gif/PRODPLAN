@@ -1,9 +1,4 @@
-export type RootProductOption = {
-  item_id: number
-  item_name: string
-  item_article?: string | null
-  item_code?: string | null
-}
+import { rootProductOptionLabel, type RootProductOption } from './rootProductOptions'
 
 type Props = {
   open: boolean
@@ -12,18 +7,6 @@ type Props = {
   value: number | null
   onApply: (value: number | null) => void
   onClose: () => void
-}
-
-function optionLabel(option?: RootProductOption | null) {
-  if (!option) return 'Все изделия плана'
-  return option.item_article
-    ? `${option.item_name} · ${option.item_article}`
-    : option.item_name || option.item_code || `Номенклатура #${option.item_id}`
-}
-
-export function rootProductLabel(options: RootProductOption[], value: number | null) {
-  if (!options.length) return 'Нет строк плана'
-  return optionLabel(options.find((option) => option.item_id === value) ?? null)
 }
 
 export function RootProductFilterDialog({ open, title = 'Корневое изделие плана', options, value, onApply, onClose }: Props) {
@@ -38,7 +21,7 @@ export function RootProductFilterDialog({ open, title = 'Корневое изд
             <select value={value ?? ''} onChange={(e) => onApply(e.target.value ? Number(e.target.value) : null)}>
               <option value="">Все изделия плана</option>
               {options.map((option) => (
-                <option key={option.item_id} value={option.item_id}>{optionLabel(option)}</option>
+                <option key={option.item_id} value={option.item_id}>{rootProductOptionLabel(option)}</option>
               ))}
             </select>
           </div>

@@ -1,12 +1,13 @@
 import type { Dispatch, SetStateAction } from 'react'
 import type { EmployeeOption, ProductionOperationOption } from '../../../domain/productionControl'
+import type { PaintWeldChainResult, PaintWeldChainSide } from '../../../services/productionControl'
 
 type Props = {
   chainSaving: boolean
   setChainOpen: Dispatch<SetStateAction<boolean>>
   chainError: string
   chainLoading: boolean
-  chainPreview: Record<string, unknown> | null
+  chainPreview: PaintWeldChainResult | null
   chainWeldOps: ProductionOperationOption[]
   chainPaintOps: ProductionOperationOption[]
   chainOperationEmployees: Record<number, string>
@@ -47,11 +48,11 @@ export function ChainCloseDialog({
               {([
                 ['Сварка', chainPreview.weld, chainWeldOps],
                 ['Окраска', chainPreview.paint, chainPaintOps],
-              ] as Array<[string, Record<string, any>, ProductionOperationOption[]]>).map(([label, side, ops]) => (
+              ] as Array<[string, PaintWeldChainSide | undefined, ProductionOperationOption[]]>).map(([label, side, ops]) => (
                 <div className="dialogField" key={label}>
                   <label>
                     {label}: {Number(side?.qty_to_produce ?? 0) > 0
-                      ? `выпуск ${Number(side.qty_to_produce).toLocaleString('ru-RU')} шт`
+                      ? `выпуск ${Number(side?.qty_to_produce).toLocaleString('ru-RU')} шт`
                       : `выпуск уже создан (№${side?.existing_manufacture_id ?? '—'})`}
                   </label>
                   {ops.length > 0 && (

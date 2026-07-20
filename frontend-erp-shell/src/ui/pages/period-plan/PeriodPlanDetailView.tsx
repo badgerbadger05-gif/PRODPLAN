@@ -35,7 +35,8 @@ import {
   updatePeriodPlanHeader,
 } from '../../../services/periodPlan'
 import { DocumentWindow } from '../../layout/DocumentWindow'
-import { RootProductFilterDialog, rootProductLabel, type RootProductOption } from '../../RootProductFilterDialog'
+import { RootProductFilterDialog } from '../../RootProductFilterDialog'
+import { rootProductLabel, type RootProductOption } from '../../rootProductOptions'
 import { StatusBar } from '../../layout/StatusBar'
 import { tableColumnStyle, tableMinWidth, type TableColumnDoctype } from '../../tableDoctype'
 import { bucketLabel, type SortDir } from './helpers'
@@ -123,6 +124,11 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   const [deletingItemId, setDeletingItemId] = useState<number | null>(null)
 
   const searchInputRef = useRef<HTMLInputElement | null>(null)
+  const searchBlurTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => () => {
+    if (searchBlurTimerRef.current) clearTimeout(searchBlurTimerRef.current)
+  }, [])
   const matrixInputRefs = useRef<Record<string, HTMLInputElement | null>>({})
 
   const isDraft = plan?.status === 'draft'
@@ -843,7 +849,10 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 onFocus={() => { if (searchRows.length) setSuggestOpen(true) }}
-                onBlur={() => setTimeout(() => setSuggestOpen(false), 150)}
+                onBlur={() => {
+                  if (searchBlurTimerRef.current) clearTimeout(searchBlurTimerRef.current)
+                  searchBlurTimerRef.current = setTimeout(() => setSuggestOpen(false), 150)
+                }}
                 onKeyDown={(e) => {
                   if (e.key === 'ArrowDown') {
                     e.preventDefault()
