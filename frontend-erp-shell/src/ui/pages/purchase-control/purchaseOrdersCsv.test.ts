@@ -73,4 +73,48 @@ describe('purchase journal CSV schema', () => {
     expect(csv).not.toContain('"ART-42"')
     expect(csv).not.toContain('"Лист стальной"')
   })
+
+  it('does not export sibling fields derived from other RBAC-hidden composite columns', () => {
+    const doctype = createPurchaseOrdersDoctype()
+    doctype.permissions = {
+      ...doctype.permissions,
+      fields: {
+        order: 'purchase.order.view',
+        quantity: 'purchase.quantity.view',
+        delivery_date: 'purchase.delivery.view',
+        state: 'purchase.state.view',
+      },
+    }
+    const orderedRow: PurchaseRow = {
+      ...row,
+      row_key: 'order-line:52',
+      line_id: 52,
+      purchase_id: null,
+      source_purchase_ids: [],
+      order_id: 8,
+      order_number: 'ЗП-000008',
+      order_state_name: 'К поступлению',
+      remaining_qty: 37,
+      delivery_date: '2026-07-24',
+      overdue_days: 5,
+      line_status: 'overdue',
+      supply_phase: 'in_transit',
+    }
+
+    const csv = buildDoctypeCsv({
+      doctype,
+      rows: [orderedRow],
+      visibleColumns: doctype.columns.map((column) => column.key),
+      access: { roles: ['buyer'], permissions: [] },
+    })
+
+    expect(csv).not.toContain('"Дата заказа"')
+    expect(csv).not.toContain('"Осталось"')
+    expect(csv).not.toContain('"Просрочка, дн"')
+    expect(csv).not.toContain('"Фаза"')
+    expect(csv).not.toContain('"ЗП-000008"')
+    expect(csv).not.toContain('"37"')
+    expect(csv).not.toContain('"5"')
+    expect(csv).not.toContain('"Товар в пути"')
+  })
 })
