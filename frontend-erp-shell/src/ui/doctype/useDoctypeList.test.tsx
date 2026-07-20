@@ -105,4 +105,28 @@ describe('useDoctypeList', () => {
 
     expect(result.current.detail?.description).toBe('Актуальная')
   })
+
+  it('selects and clears only selectable rows from the visible page', async () => {
+    const doctype = createDoctype()
+    doctype.meta.selectionMode = 'multiple'
+    doctype.selectable = (row) => row.id !== 2
+    doctype.dataSource.list = vi.fn(async () => ({
+      rows: [
+        { id: 1, title: 'Доступная' },
+        { id: 2, title: 'Уже заказана' },
+        { id: 3, title: 'Доступная вторая' },
+      ],
+      total: 3,
+    }))
+    const { result } = renderHook(() => useDoctypeList(doctype, { access }))
+    await waitFor(() => expect(result.current.rows).toHaveLength(3))
+
+    act(() => result.current.setVisibleSelection(true))
+    expect([...result.current.selectedIds]).toEqual([1, 3])
+    expect(result.current.selection.map((row) => row.id)).toEqual([1, 3])
+
+    act(() => result.current.setVisibleSelection(false))
+    expect([...result.current.selectedIds]).toEqual([])
+    expect(result.current.selection).toEqual([])
+  })
 })

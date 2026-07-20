@@ -124,4 +124,54 @@ describe('DoctypeTable bulk selection', () => {
 
     expect(screen.queryByRole('checkbox', { name: 'Выбрать все видимые строки' })).not.toBeInTheDocument()
   })
+
+  it('counts only selectable rows and explains why another row is disabled', () => {
+    const constrainedDoctype: Doctype<Row, Filters> = {
+      ...multipleDoctype,
+      selectable: (row) => row.id === 1,
+      selectionDisabledReason: (row) => `Строка ${row.id} уже обработана`,
+    }
+    const toggleSelection = vi.fn()
+    render(
+      <DoctypeTable
+        doctype={constrainedDoctype}
+        state={state({
+          selectedIds: new Set([1]),
+          toggleSelection,
+          setVisibleSelection: vi.fn(),
+        })}
+        access={{ roles: [], permissions: [] }}
+      />,
+    )
+
+    expect(screen.getByRole('checkbox', { name: 'Выбрать все видимые строки' })).toBeChecked()
+    expect(screen.getByRole('checkbox', { name: 'Выбрать строку 1' })).toBeEnabled()
+
+    const unavailable = screen.getByRole('checkbox', { name: 'Выбрать строку 2' })
+    expect(unavailable).toBeDisabled()
+    expect(unavailable).toHaveAttribute('title', 'Строка 2 уже обработана')
+    fireEvent.click(unavailable)
+    expect(toggleSelection).not.toHaveBeenCalledWith(2)
+  })
+
+  it('does not mark select-all as indeterminate for selected non-selectable rows', () => {
+    const constrainedDoctype: Doctype<Row, Filters> = {
+      ...multipleDoctype,
+      selectable: (row) => row.id === 1,
+    }
+    render(
+      <DoctypeTable
+        doctype={constrainedDoctype}
+        state={state({
+          selectedIds: new Set([2]),
+          setVisibleSelection: vi.fn(),
+        })}
+        access={{ roles: [], permissions: [] }}
+      />,
+    )
+
+    const selectAll = screen.getByRole('checkbox', { name: 'Выбрать все видимые строки' })
+    expect(selectAll).not.toBeChecked()
+    expect(selectAll).toHaveProperty('indeterminate', false)
+  })
 })
