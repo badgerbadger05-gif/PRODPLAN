@@ -9,7 +9,7 @@ import { DialogHost, type DialogRegistry } from '../platform'
 import type { Doctype } from './types'
 import type { DoctypeListState } from './useDoctypeList'
 import type { AccessSubject } from './permissions'
-import { canView } from './permissions'
+import { canView, canViewField } from './permissions'
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import { decodeViewState, encodeViewState, type ViewFilterValue, type ViewState } from '../views'
@@ -39,8 +39,10 @@ export function DoctypePage<Row, Filters extends object, Detail>({
 }: Props<Row, Filters, Detail>) {
   const [searchParams, setSearchParams] = useSearchParams()
   const columnOptions = useMemo(
-    () => doctype.columns.map(({ key, title }) => ({ key, title })),
-    [doctype.columns],
+    () => doctype.columns
+      .filter((column) => canViewField(doctype.permissions, column.key, access))
+      .map(({ key, title }) => ({ key, title })),
+    [access, doctype.columns, doctype.permissions],
   )
   const allColumnKeys = useMemo(() => columnOptions.map(({ key }) => key), [columnOptions])
   const [visibleColumns, setVisibleColumns] = useState<readonly string[]>(allColumnKeys)
@@ -157,6 +159,7 @@ export function DoctypePage<Row, Filters extends object, Detail>({
             onRowDoubleClick={onRowDoubleClick}
             visibleColumns={visibleColumns}
             density={density}
+            access={access}
           />
           {doctype.detail && (
             <aside className="detailPane">
@@ -164,7 +167,7 @@ export function DoctypePage<Row, Filters extends object, Detail>({
               {!state.detailLoading && detailValue && (
                 renderDetail
                   ? renderDetail(detailValue, state)
-                  : <FormRenderer value={detailValue} layout={doctype.detail} />
+                  : <FormRenderer value={detailValue} layout={doctype.detail} access={access} permissions={doctype.permissions} />
               )}
             </aside>
           )}

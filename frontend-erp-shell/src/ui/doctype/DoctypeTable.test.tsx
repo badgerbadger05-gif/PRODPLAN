@@ -40,7 +40,7 @@ function state(overrides: Partial<DoctypeListState<Row, Filters, never>> = {}) {
 
 describe('DoctypeTable accessibility', () => {
   it('announces sorting and active row state', () => {
-    render(<DoctypeTable doctype={doctype} state={state()} />)
+    render(<DoctypeTable doctype={doctype} state={state()} access={{ roles: [], permissions: [] }} />)
 
     expect(screen.getByRole('columnheader', { name: /Наименование/ })).toHaveAttribute('aria-sort', 'descending')
     expect(screen.getByRole('row', { name: /Первая/ })).toHaveAttribute('aria-selected', 'true')
@@ -50,7 +50,7 @@ describe('DoctypeTable accessibility', () => {
   it('moves the active row with arrows and opens it with Enter', () => {
     const setActiveId = vi.fn()
     const open = vi.fn()
-    render(<DoctypeTable doctype={doctype} state={state({ setActiveId })} onRowDoubleClick={open} />)
+    render(<DoctypeTable doctype={doctype} state={state({ setActiveId })} access={{ roles: [], permissions: [] }} onRowDoubleClick={open} />)
 
     const first = screen.getByRole('row', { name: /Первая/ })
     fireEvent.keyDown(first, { key: 'ArrowDown' })

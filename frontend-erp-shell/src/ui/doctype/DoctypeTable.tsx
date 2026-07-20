@@ -2,6 +2,8 @@ import type { Doctype } from './types'
 import type { DoctypeListState } from './useDoctypeList'
 import { columnValue, formatField } from './fieldFormat'
 import { sortGlyph, tableColumnStyle, tableMinWidth } from '../tableDoctype'
+import type { AccessSubject } from './permissions'
+import { canViewField, canViewRecord } from './permissions'
 
 type Props<Row, Filters extends object, Detail> = {
   doctype: Doctype<Row, Filters, Detail>
@@ -9,6 +11,7 @@ type Props<Row, Filters extends object, Detail> = {
   onRowDoubleClick?: (row: Row) => void
   visibleColumns?: readonly string[]
   density?: 'compact' | 'comfortable'
+  access: AccessSubject
 }
 
 export function DoctypeTable<Row, Filters extends object, Detail>({
@@ -17,14 +20,16 @@ export function DoctypeTable<Row, Filters extends object, Detail>({
   onRowDoubleClick,
   visibleColumns,
   density = 'compact',
+  access,
 }: Props<Row, Filters, Detail>) {
   const idOf = (row: Row) => row[doctype.meta.idField] as string | number
   const columns = visibleColumns
-    ? doctype.columns.filter((column) => visibleColumns.includes(column.key))
-    : doctype.columns
+    ? doctype.columns.filter((column) => visibleColumns.includes(column.key) && canViewField(doctype.permissions, column.key, access))
+    : doctype.columns.filter((column) => canViewField(doctype.permissions, column.key, access))
+  const rows = state.rows.filter((row) => canViewRecord(doctype.permissions, row, access))
   const activateRow = (index: number, tableRow: HTMLTableRowElement) => {
-    const nextIndex = Math.max(0, Math.min(index, state.rows.length - 1))
-    const next = state.rows[nextIndex]
+    const nextIndex = Math.max(0, Math.min(index, rows.length - 1))
+    const next = rows[nextIndex]
     if (!next) return
     state.setActiveId(idOf(next))
     const body = tableRow.parentElement
@@ -61,7 +66,7 @@ export function DoctypeTable<Row, Filters extends object, Detail>({
           </tr>
         </thead>
         <tbody>
-          {state.rows.map((row, rowIndex) => {
+          {rows.map((row, rowIndex) => {
             const id = idOf(row)
             const active = state.activeRow ? idOf(state.activeRow) === id : false
             return (
@@ -84,7 +89,7 @@ export function DoctypeTable<Row, Filters extends object, Detail>({
                     activateRow(0, event.currentTarget)
                   } else if (event.key === 'End') {
                     event.preventDefault()
-                    activateRow(state.rows.length - 1, event.currentTarget)
+                    activateRow(rows.length - 1, event.currentTarget)
                   } else if (event.key === 'Enter') {
                     onRowDoubleClick?.(row)
                   }

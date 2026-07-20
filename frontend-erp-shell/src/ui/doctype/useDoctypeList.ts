@@ -6,7 +6,7 @@ import type {
   RowId,
   SortState,
 } from './types'
-import { canRunAction, canView, type AccessSubject } from './permissions'
+import { canRunAction, canView, canViewRecord, type AccessSubject } from './permissions'
 import type { ViewState } from '../views'
 
 const DEFAULT_LIMIT = 100
@@ -21,6 +21,10 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
 ) {
   const limit = options.limit ?? DEFAULT_LIMIT
   const enabled = canView(doctype.permissions, options.access)
+  const accessKey = JSON.stringify({
+    roles: [...options.access.roles].sort(),
+    permissions: [...options.access.permissions].sort(),
+  })
   const [rows, setRows] = useState<Row[]>([])
   const [filters, setFilters] = useState<Filters>(doctype.initialFilters)
   const [appliedFilters, setAppliedFilters] = useState<Filters>(doctype.initialFilters)
@@ -72,10 +76,14 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
       setRows([])
       setTotal(0)
       setListMeta({})
+      setActiveId(null)
+      setSelectedIds(new Set())
+      setDetail(null)
       return
     }
     const controller = new AbortController()
     const sequence = ++loadSequence.current
+    const access = JSON.parse(accessKey) as AccessSubject
     setListLoading(true)
     setError('')
     setListMeta({})
@@ -93,8 +101,10 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
       )
       .then((result) => {
         if (sequence !== loadSequence.current) return
-        setRows(result.rows ?? [])
-        setTotal(result.total ?? 0)
+        const resultRows = result.rows ?? []
+        const permittedRows = resultRows.filter((row) => canViewRecord(doctype.permissions, row, access))
+        setRows(permittedRows)
+        setTotal(Math.max(0, (result.total ?? 0) - (resultRows.length - permittedRows.length)))
         const {
           rows: _rows,
           total: _total,
@@ -108,12 +118,12 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
         void _offset
         setListMeta(meta)
         setSelectedIds((current) => {
-          const visible = new Set((result.rows ?? []).map(rowId))
+          const visible = new Set(permittedRows.map(rowId))
           return new Set([...current].filter((id) => visible.has(id)))
         })
         setActiveId((current) => {
-          if (current != null && result.rows?.some((row) => rowId(row) === current)) return current
-          return result.rows?.[0] ? rowId(result.rows[0]) : null
+          if (current != null && permittedRows.some((row) => rowId(row) === current)) return current
+          return permittedRows[0] ? rowId(permittedRows[0]) : null
         })
       })
       .catch((loadError: unknown) => {
@@ -126,7 +136,7 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
       })
 
     return () => controller.abort()
-  }, [appliedFilters, doctype.dataSource, enabled, limit, offset, reloadKey, rowId, sort])
+  }, [accessKey, appliedFilters, doctype.dataSource, doctype.permissions, enabled, limit, offset, reloadKey, rowId, sort])
 
   useEffect(() => {
     if (!activeRow || !doctype.dataSource.detail) {

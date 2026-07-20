@@ -4,6 +4,10 @@ import type { DoctypeColumn, FieldOption, FieldType } from '../tableDoctype'
 export type RowId = string | number
 export type Role = 'admin' | 'planner' | 'buyer' | 'shopfloor' | 'viewer' | (string & {})
 export type Permission = string
+export type AccessSubject = {
+  roles: Role[]
+  permissions: Permission[]
+}
 
 export type ListParams<Filters> = {
   limit: number
@@ -106,9 +110,11 @@ export type DetailLayout<T> = {
   sections: Array<DetailSection<T>>
 }
 
-export type DoctypePermissions = {
+export type DoctypePermissions<Row = unknown> = {
   view?: Array<Role | Permission>
   actions?: Record<string, Role | Permission | Array<Role | Permission>>
+  fields?: Record<string, Role | Permission | Array<Role | Permission>>
+  recordView?: (row: Row, subject: AccessSubject) => boolean
 }
 
 export type Doctype<Row, Filters, Detail = never> = {
@@ -129,7 +135,7 @@ export type Doctype<Row, Filters, Detail = never> = {
   filters?: Array<FilterDef<Filters>>
   actions?: Array<ActionDef<Row>>
   detail?: DetailLayout<Detail | Row>
-  permissions: DoctypePermissions
+  permissions: DoctypePermissions<Row>
   renderExtraToolbar?: (context: ActionContext<Row>) => ReactNode
   rowClassName?: (row: Row) => string
 }
