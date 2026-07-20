@@ -141,6 +141,42 @@ describe('ResourcesPage characterization', () => {
     expect(screen.getByLabelText('Название участка')).toHaveValue('Механический участок')
   })
 
+  it('supports roving keyboard selection without leaking row shortcuts into the form', async () => {
+    const user = userEvent.setup()
+    render(<ResourcesPage />)
+    await resourcesTable().findByText('Механический участок')
+    await waitFor(() => expect(listResourceStages).toHaveBeenCalledWith(1))
+
+    const first = resourcesTable().getByRole('row', { name: /Механический участок/ })
+    const second = resourcesTable().getByRole('row', { name: /Сборочный участок/ })
+    expect(first).toHaveAttribute('tabindex', '0')
+    expect(first).toHaveAttribute('aria-selected', 'true')
+    expect(second).toHaveAttribute('tabindex', '-1')
+    expect(second).toHaveAttribute('aria-selected', 'false')
+
+    first.focus()
+    await user.keyboard('{ArrowDown}')
+
+    expect(second).toHaveFocus()
+    expect(first).toHaveAttribute('aria-selected', 'false')
+    expect(second).toHaveAttribute('aria-selected', 'true')
+    await waitFor(() => expect(screen.getByLabelText('Название участка')).toHaveValue('Сборочный участок'))
+    await waitFor(() => expect(listResourceStages).toHaveBeenCalledWith(2))
+
+    vi.mocked(listResourceStages).mockClear()
+    vi.mocked(listResourceProductionKinds).mockClear()
+    await user.keyboard('{Enter}')
+    expect(listResourceStages).not.toHaveBeenCalled()
+    expect(listResourceProductionKinds).not.toHaveBeenCalled()
+
+    const nameInput = screen.getByLabelText('Название участка')
+    nameInput.focus()
+    await user.keyboard('{ArrowUp}')
+    expect(nameInput).toHaveFocus()
+    expect(second).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByLabelText('Название участка')).toHaveValue('Сборочный участок')
+  })
+
   it('validates and creates a resource with normalized defaults', async () => {
     const user = userEvent.setup()
     render(<ResourcesPage />)
