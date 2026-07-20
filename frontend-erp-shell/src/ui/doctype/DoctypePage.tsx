@@ -10,8 +10,9 @@ import type { Doctype } from './types'
 import type { DoctypeListState } from './useDoctypeList'
 import type { AccessSubject } from './permissions'
 import { canView } from './permissions'
-import { useCallback, useMemo, useState, type ReactNode } from 'react'
-import type { ViewState } from '../views'
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useSearchParams } from 'react-router-dom'
+import { decodeViewState, encodeViewState, type ViewFilterValue, type ViewState } from '../views'
 
 type Props<Row, Filters extends object, Detail> = {
   doctype: Doctype<Row, Filters, Detail>
@@ -36,6 +37,7 @@ export function DoctypePage<Row, Filters extends object, Detail>({
   onRowDoubleClick,
   renderFilters,
 }: Props<Row, Filters, Detail>) {
+  const [searchParams, setSearchParams] = useSearchParams()
   const columnOptions = useMemo(
     () => doctype.columns.map(({ key, title }) => ({ key, title })),
     [doctype.columns],
@@ -43,6 +45,8 @@ export function DoctypePage<Row, Filters extends object, Detail>({
   const allColumnKeys = useMemo(() => columnOptions.map(({ key }) => key), [columnOptions])
   const [visibleColumns, setVisibleColumns] = useState<readonly string[]>(allColumnKeys)
   const [density, setDensity] = useState<'compact' | 'comfortable'>('compact')
+  const [urlHydrated, setUrlHydrated] = useState(false)
+  const [hasUrlView, setHasUrlView] = useState(false)
   const applyViewState = state.applyViewState
   const applyView = useCallback((view: ViewState) => {
     applyViewState(view)
@@ -51,6 +55,51 @@ export function DoctypePage<Row, Filters extends object, Detail>({
     setDensity(view.density)
   }, [allColumnKeys, applyViewState])
   const detailValue = doctype.dataSource.detail ? state.detail : state.activeRow
+  const currentView = useMemo<ViewState>(() => ({
+    filters: state.filters as ViewState['filters'],
+    sort: state.sort ? [{ field: state.sort.sortBy, direction: state.sort.sortDir }] : [],
+    visibleColumns,
+    density,
+  }), [density, state.filters, state.sort, visibleColumns])
+
+  useEffect(() => {
+    const token = searchParams.get('view')
+    const decoded = token && token.length <= 4096 ? decodeViewState(token) : null
+    if (decoded) {
+      const filterKeys = new Set(Object.keys(doctype.initialFilters))
+      const columnKeys = new Set(allColumnKeys)
+      const filters = Object.fromEntries(
+        Object.entries(decoded.filters).filter(([key, value]) => (
+          filterKeys.has(key)
+          && (typeof value !== 'string' || value.length <= 512)
+          && (!Array.isArray(value) || value.length <= 100)
+        )),
+      ) as Record<string, ViewFilterValue>
+      const sort = decoded.sort
+        .filter((item) => columnKeys.has(item.field))
+        .slice(0, 1)
+      const columns = [...new Set(decoded.visibleColumns.filter((key) => columnKeys.has(key)))]
+      applyView({
+        filters: { ...doctype.initialFilters, ...filters } as ViewState['filters'],
+        sort,
+        visibleColumns: columns.length ? columns : allColumnKeys,
+        density: decoded.density,
+      })
+      setHasUrlView(true)
+    }
+    setUrlHydrated(true)
+    // URL hydration is intentionally one-shot for this mounted resource.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    if (!urlHydrated) return
+    const token = encodeViewState(currentView)
+    if (searchParams.get('view') === token) return
+    const next = new URLSearchParams(searchParams)
+    next.set('view', token)
+    setSearchParams(next, { replace: true })
+  }, [currentView, searchParams, setSearchParams, urlHydrated])
   if (!canView(doctype.permissions, access)) {
     return (
       <main className="workArea">
@@ -95,6 +144,8 @@ export function DoctypePage<Row, Filters extends object, Detail>({
           onApply={applyView}
           onVisibleColumnsChange={setVisibleColumns}
           onDensityChange={setDensity}
+          suppressDefaultApply={hasUrlView}
+          onCopyLink={() => void navigator.clipboard?.writeText(window.location.href)}
         />
         {renderFilters ? renderFilters(state) : <FilterBar doctype={doctype} state={state} />}
         {state.error && <div className="errorLine">{state.error}</div>}

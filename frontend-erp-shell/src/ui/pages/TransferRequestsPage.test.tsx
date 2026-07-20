@@ -1,5 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { MemoryRouter } from 'react-router-dom'
 import {
   getMaterialIssue,
   listMaterialIssues,
@@ -74,7 +75,7 @@ describe('TransferRequestsPage Doctype migration', () => {
   })
 
   it('preserves two-line rows, dynamic warehouse filter and component detail', async () => {
-    render(<TransferRequestsPage />)
+    render(<MemoryRouter><TransferRequestsPage /></MemoryRouter>)
 
     expect(await screen.findByText('ПМ-000005')).toBeInTheDocument()
     expect(screen.getByText('Корпус редуктора')).toBeInTheDocument()
@@ -85,7 +86,7 @@ describe('TransferRequestsPage Doctype migration', () => {
   })
 
   it('keeps explicit search submit and the assembled action', async () => {
-    render(<TransferRequestsPage />)
+    render(<MemoryRouter><TransferRequestsPage /></MemoryRouter>)
     await screen.findByText('ПМ-000005')
 
     fireEvent.change(screen.getByLabelText('Поиск'), { target: { value: 'редуктор' } })

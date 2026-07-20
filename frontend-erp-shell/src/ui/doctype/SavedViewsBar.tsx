@@ -12,6 +12,8 @@ type Props = {
   onApply: (state: ViewState) => void
   onVisibleColumnsChange: (columns: readonly string[]) => void
   onDensityChange: (density: 'compact' | 'comfortable') => void
+  suppressDefaultApply?: boolean
+  onCopyLink?: () => void
 }
 
 export function SavedViewsBar(props: Props) {
@@ -36,7 +38,7 @@ export function SavedViewsBar(props: Props) {
 
   useEffect(() => setSavedState(currentState), [currentState, setSavedState])
   useEffect(() => {
-    if (saved.loading || !saved.activeViewId || defaultApplied.current === saved.activeViewId) return
+    if (props.suppressDefaultApply || saved.loading || !saved.activeViewId || defaultApplied.current === saved.activeViewId) return
     defaultApplied.current = saved.activeViewId
     props.onApply(saved.state)
   }, [props, saved.activeViewId, saved.loading, saved.state])
@@ -91,6 +93,7 @@ export function SavedViewsBar(props: Props) {
       </button>
       <button type="button" disabled={!saved.activeViewId} onClick={() => void remove()}>Удалить</button>
       <button type="button" aria-expanded={columnsOpen} onClick={() => setColumnsOpen((value) => !value)}>Колонки</button>
+      {props.onCopyLink && <button type="button" onClick={props.onCopyLink}>Скопировать ссылку</button>}
       <label>
         <span>Плотность</span>
         <select aria-label="Плотность таблицы" value={props.density} onChange={(event) => props.onDensityChange(event.target.value as Props['density'])}>

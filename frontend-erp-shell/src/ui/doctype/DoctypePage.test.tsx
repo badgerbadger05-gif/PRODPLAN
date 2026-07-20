@@ -1,7 +1,9 @@
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { beforeEach, describe, expect, it } from 'vitest'
+import { MemoryRouter } from 'react-router-dom'
 import type { DialogComponentProps } from '../platform'
+import { encodeViewState } from '../views'
 import { DoctypePage } from './DoctypePage'
 import type { Doctype } from './types'
 import { useDoctypeList } from './useDoctypeList'
@@ -66,12 +68,16 @@ function Harness() {
   )
 }
 
+function renderHarness(entry = '/') {
+  return render(<MemoryRouter initialEntries={[entry]}><Harness /></MemoryRouter>)
+}
+
 describe('DoctypePage dialogs', () => {
   beforeEach(() => localStorage.clear())
 
   it('renders an action DialogRequest through DialogHost and closes it accessibly', async () => {
     const user = userEvent.setup()
-    render(<Harness />)
+    renderHarness()
     const trigger = screen.getByRole('button', { name: 'Открыть' })
     await user.click(trigger)
 
@@ -86,7 +92,7 @@ describe('DoctypePage dialogs', () => {
 
   it('shows a safe modal fallback when a dialog is not registered', async () => {
     const user = userEvent.setup()
-    render(<Harness />)
+    renderHarness()
     await user.click(screen.getByRole('button', { name: 'Открыть' }))
 
     // The registry is intentionally changed after opening only at the host
@@ -96,7 +102,7 @@ describe('DoctypePage dialogs', () => {
 
   it('saves and reapplies visible columns and table density', async () => {
     const user = userEvent.setup()
-    render(<Harness />)
+    renderHarness()
     await screen.findByText('Строка')
 
     await user.click(screen.getByRole('button', { name: 'Колонки' }))
@@ -113,6 +119,20 @@ describe('DoctypePage dialogs', () => {
     expect(document.querySelector('.doctypeTable--compact')).toBeInTheDocument()
 
     await user.selectOptions(screen.getByRole('combobox', { name: 'Сохранённое представление' }), screen.getByRole('option', { name: 'Мой вид' }))
+    expect(screen.queryByRole('columnheader', { name: 'Название' })).not.toBeInTheDocument()
+    expect(document.querySelector('.doctypeTable--comfortable')).toBeInTheDocument()
+  })
+
+  it('hydrates a validated view from the URL', async () => {
+    const token = encodeViewState({
+      filters: {},
+      sort: [{ field: 'id', direction: 'desc' }],
+      visibleColumns: ['id', 'missing-column'],
+      density: 'comfortable',
+    })
+    renderHarness(`/?view=${token}`)
+
+    expect(await screen.findByRole('columnheader', { name: 'ID' })).toBeVisible()
     expect(screen.queryByRole('columnheader', { name: 'Название' })).not.toBeInTheDocument()
     expect(document.querySelector('.doctypeTable--comfortable')).toBeInTheDocument()
   })
