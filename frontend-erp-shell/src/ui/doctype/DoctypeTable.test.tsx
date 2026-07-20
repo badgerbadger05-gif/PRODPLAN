@@ -27,6 +27,8 @@ function state(overrides: Partial<DoctypeListState<Row, Filters, never>> = {}) {
   const rows = [{ id: 1, name: 'Первая' }, { id: 2, name: 'Вторая' }]
   return {
     rows,
+    filters: { search: '' },
+    listMeta: {},
     activeRow: rows[0],
     activeId: 1,
     setActiveId: vi.fn(),
@@ -59,6 +61,95 @@ describe('DoctypeTable accessibility', () => {
 
     fireEvent.keyDown(first, { key: 'Enter' })
     expect(open).toHaveBeenCalledWith(expect.objectContaining({ id: 1 }))
+  })
+})
+
+describe('DoctypeTable contextual presentation', () => {
+  const contextualDoctype: Doctype<Row, Filters> = {
+    ...doctype,
+    meta: {
+      ...doctype.meta,
+      emptyLabel: ({ filters, listMeta }: {
+        filters: Filters
+        listMeta: Record<string, unknown>
+      }) => filters.search
+        ? `По запросу «${filters.search}» ничего не найдено`
+        : String(listMeta.emptyLabel ?? 'Нет позиций'),
+    },
+    columns: [
+      { key: 'id', title: 'ID' },
+      {
+        key: 'name',
+        title: 'Наименование',
+        visible: ({ filters, listMeta }: {
+          filters: Filters
+          listMeta: Record<string, unknown>
+        }) => filters.search === 'подробно' && listMeta.mode === 'detailed',
+      },
+    ],
+  }
+
+  it('shows a conditional column only when filters and list metadata allow it', () => {
+    const { rerender } = render(
+      <DoctypeTable
+        doctype={contextualDoctype}
+        state={state({
+          filters: { search: '' },
+          listMeta: { mode: 'compact' },
+        })}
+        access={{ roles: [], permissions: [] }}
+      />,
+    )
+
+    expect(screen.getByRole('columnheader', { name: 'ID' })).toBeVisible()
+    expect(screen.queryByRole('columnheader', { name: 'Наименование' })).not.toBeInTheDocument()
+    expect(screen.queryByText('Первая')).not.toBeInTheDocument()
+
+    rerender(
+      <DoctypeTable
+        doctype={contextualDoctype}
+        state={state({
+          filters: { search: 'подробно' },
+          listMeta: { mode: 'detailed' },
+        })}
+        access={{ roles: [], permissions: [] }}
+      />,
+    )
+
+    expect(screen.getByRole('columnheader', { name: 'Наименование' })).toBeVisible()
+    expect(screen.getByText('Первая')).toBeVisible()
+  })
+
+  it('renders a context-aware empty label across the currently visible columns', () => {
+    render(
+      <DoctypeTable
+        doctype={contextualDoctype}
+        state={state({
+          rows: [],
+          activeRow: null,
+          activeId: null,
+          filters: { search: 'редуктор' },
+          listMeta: { mode: 'compact' },
+        })}
+        access={{ roles: [], permissions: [] }}
+      />,
+    )
+
+    const empty = screen.getByText('По запросу «редуктор» ничего не найдено')
+    expect(empty).toBeVisible()
+    expect(empty.closest('td')).toHaveAttribute('colspan', '1')
+  })
+
+  it('uses the standard empty label when a doctype does not override it', () => {
+    render(
+      <DoctypeTable
+        doctype={doctype}
+        state={state({ rows: [], activeRow: null, activeId: null })}
+        access={{ roles: [], permissions: [] }}
+      />,
+    )
+
+    expect(screen.getByText('Нет данных')).toBeVisible()
   })
 })
 
