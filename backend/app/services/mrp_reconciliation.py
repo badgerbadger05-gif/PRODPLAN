@@ -69,6 +69,7 @@ from .production_control_journal import (
     dedupe_mrp_production_orders,
 )
 from .production_binding_repair import repair_clean_mrp_bindings
+from .mrp_execution_ledger import populate_executed_qty
 from .mrp_stock_helpers import effective_stock_by_item_all
 from .replenishment import (
     REPLENISHMENT_FLOW_PRODUCTION,
@@ -1127,6 +1128,21 @@ def reconcile_all_active(db: Session, *, dry_run: bool = False) -> Dict[str, Any
         except Exception as exc:  # noqa: BLE001 — isolate one bad run from the rest
             db.rollback()
             results.append({"run_id": int(rid), "status": "error", "error": str(exc)})
+
+    # Execution ledger (PHASE 2): recompute executed_qty from actual production
+    # and receipt facts, ONCE across all active runs — the unlinked FIFO pool is
+    # per-item and must see every plan. Respect dry_run like reconcile_snapshot.
+    execution_ledger: Dict[str, Any]
+    try:
+        execution_ledger = populate_executed_qty(db, run_ids)
+        if dry_run:
+            db.rollback()
+        else:
+            db.commit()
+    except Exception as exc:  # noqa: BLE001 — never let ledger population break reconcile
+        db.rollback()
+        execution_ledger = {"status": "error", "error": str(exc)}
+
     return {
         "status": "ok",
         "dry_run": bool(dry_run),
@@ -1134,5 +1150,6 @@ def reconcile_all_active(db: Session, *, dry_run: bool = False) -> Dict[str, Any
         "production_lines_added": total_production,
         "purchase_lines_added": total_purchase,
         "purchase_lines_pruned": total_purchase_pruned,
+        "execution_ledger": execution_ledger,
         "results": results,
     }
