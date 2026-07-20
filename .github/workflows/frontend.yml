@@ -49,5 +49,11 @@ jobs:
       - name: Unit and characterization tests
         run: npm test
 
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Hermetic browser smoke
+        run: npm run smoke
+
       - name: Production build
         run: npm run build
