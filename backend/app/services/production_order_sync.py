@@ -515,6 +515,7 @@ def sync_production_fact_from_odata(db: Session, req: ODataSyncRequest) -> Dict[
         "assemblies_loaded": 0,
         "assembly_products_loaded": 0,
         "products_updated": 0,
+        "orders_skipped_missing_ref": 0,
         "errors": [],
         "dry_run": bool(req.dry_run),
     }
@@ -523,12 +524,22 @@ def sync_production_fact_from_odata(db: Session, req: ODataSyncRequest) -> Dict[
         client = OData1CClient(req.base_url, req.username, req.password, req.token)
 
         # --- 1) Загружаем все активные заказы из БД для маппинга ---
-        orders_by_ref1c = {
-            order.order_ref1c: order
-            for order in db.query(ProductionOrder).filter(
-                ProductionOrder.deletion_mark == False
-            ).all()
-        }
+        active_orders = db.query(ProductionOrder).filter(
+            ProductionOrder.deletion_mark == False
+        ).all()
+        orders_by_ref1c = {}
+        for order in active_orders:
+            order_ref1c = str(order.order_ref1c or "").strip()
+            if not order_ref1c:
+                stats["orders_skipped_missing_ref"] += 1
+                continue
+            orders_by_ref1c[order_ref1c] = order
+
+        if stats["orders_skipped_missing_ref"]:
+            print(
+                "[FACT SYNC] Skipping "
+                f"{stats['orders_skipped_missing_ref']} active orders without order_ref1c"
+            )
 
         if not orders_by_ref1c:
             stats["dry_run"] = True

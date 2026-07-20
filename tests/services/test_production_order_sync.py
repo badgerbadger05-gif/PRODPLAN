@@ -4,6 +4,7 @@ from app.models import Item, ProductionOrder, ProductionProduct
 from app.schemas import ODataSyncRequest
 from app.services.production_order_sync import (
     PRODUCTION_ORDER_SYNC_FROM_1C,
+    sync_production_fact_from_odata,
     sync_production_orders_from_odata,
 )
 
@@ -144,3 +145,54 @@ def test_production_order_sync_closes_missing_orders_only_inside_sync_horizon(db
     db.refresh(may_order)
     assert old_order.deletion_mark is False
     assert may_order.deletion_mark is True
+
+
+def test_production_fact_sync_skips_orders_without_1c_reference(
+    db_session, monkeypatch
+):
+    db_session.add_all(
+        [
+            ProductionOrder(
+                order_number="LOCAL-ONLY",
+                order_date=datetime.datetime(2026, 7, 20),
+                order_ref1c=None,
+                deletion_mark=False,
+            ),
+            ProductionOrder(
+                order_number="SYNCED",
+                order_date=datetime.datetime(2026, 7, 20),
+                order_ref1c="valid-order-ref",
+                deletion_mark=False,
+            ),
+        ]
+    )
+    db_session.commit()
+
+    seen_filters = []
+
+    class FakeODataClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def get_all(self, entity_name, filter_query=None, **_kwargs):
+            seen_filters.append((entity_name, filter_query))
+            return []
+
+    monkeypatch.setattr("app.services.odata_client.OData1CClient", FakeODataClient)
+
+    stats = sync_production_fact_from_odata(
+        db_session,
+        ODataSyncRequest(
+            base_url="http://1c.example/odata",
+            entity_name="Document_ЗаказНаПроизводство",
+        ),
+    )
+
+    assert stats["orders_skipped_missing_ref"] == 1
+    assert seen_filters == [
+        (
+            "Document_СборкаЗапасов",
+            "ЗаказНаПроизводство_Key eq guid'valid-order-ref' and Posted eq true",
+        )
+    ]
+    assert all("None" not in (filter_query or "") for _, filter_query in seen_filters)
