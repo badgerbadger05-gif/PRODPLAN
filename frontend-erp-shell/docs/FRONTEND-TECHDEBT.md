@@ -44,7 +44,7 @@
 
 **Текущее состояние.** Общий runtime, transport, session/RBAC, saved views,
 Ledger и критичные custom pages покрыты 137 Vitest-тестами; есть hermetic
-Playwright smoke и стабильные Linux visual baselines Ledger, Purchase Control
+Playwright smoke и стабильные Linux visual baselines Ledger, Purchase Control,
 Production Control, Period Plan (list/detail) и Workshop Binding Review. Не хватает отдельного
 backend-contract E2E.
 

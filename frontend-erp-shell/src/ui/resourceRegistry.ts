@@ -20,7 +20,7 @@ export const frontendResources: FrontendResource[] = [
   { name: 'material_transfer', to: '/transfer-requests', title: 'Заявки перемещений', view: ['viewer', 'planner', 'shopfloor', 'admin'], kind: 'doctype', shortcut: 'Alt+7' },
   { name: 'ledger', to: '/ledger', title: 'Ledger', view: ['viewer', 'planner', 'buyer', 'admin'], kind: 'custom', shortcut: 'Alt+8' },
   { name: 'resources', to: '/resources', title: 'Ресурсы', view: ['viewer', 'planner', 'admin'], kind: 'custom', shortcut: 'Alt+9' },
-  { name: 'workshop_binding', to: '/workshop-binding-review', title: 'Разбор привязок', view: ['planner', 'admin'], kind: 'custom' },
+  { name: 'workshop_binding', to: '/workshop-binding-review', title: 'Разбор привязок', view: ['planner', 'admin'], kind: 'doctype' },
   { name: 'stage_distribution', to: '/stage-distribution', title: 'Распределение этапов', view: ['planner', 'admin'], kind: 'custom' },
   { name: 'specification', to: '/specification', title: 'Спецификации', view: ['viewer', 'planner', 'admin'], kind: 'custom' },
   { name: 'sync', to: '/sync', title: 'Синхронизация', view: ['admin'], kind: 'custom' },
