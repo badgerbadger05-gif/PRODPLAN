@@ -20,9 +20,16 @@ describe('Doctype permissions', () => {
     )).toBe(false)
   })
 
+  it('allows an explicit administrative wildcard', () => {
+    expect(canRunAction(
+      { actions: { export: 'purchase.export_1c' } },
+      'export',
+      { roles: ['admin'], permissions: ['*'] },
+    )).toBe(true)
+  })
+
   it('keeps unspecified gates backwards compatible', () => {
     expect(canView({}, planner)).toBe(true)
     expect(canRunAction({}, 'refresh', planner)).toBe(true)
   })
 })
-

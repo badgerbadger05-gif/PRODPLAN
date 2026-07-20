@@ -3,6 +3,7 @@ import { planningStatusLabel, type PlanningRunRow } from '../../domain/planning'
 import { dateTimeRu, qty } from '../../lib/format'
 import { DoctypePage, useDoctypeList } from '../doctype'
 import type { AccessSubject } from '../doctype/permissions'
+import { useOptionalSession } from '../session'
 import { mrpPeriodLabel, mrpPlanLabel, mrpRunsDoctype } from './mrpRunsDoctype'
 
 function MrpRunDetail({ run, open }: { run: PlanningRunRow; open: () => void }) {
@@ -30,7 +31,8 @@ function MrpRunDetail({ run, open }: { run: PlanningRunRow; open: () => void }) 
 
 export function MrpRunsPage() {
   const navigate = useNavigate()
-  const access: AccessSubject = { roles: ['viewer'], permissions: [] }
+  const session = useOptionalSession()
+  const access: AccessSubject = session?.user ?? { roles: ['viewer'], permissions: [] }
   const state = useDoctypeList(mrpRunsDoctype, { limit: 30, access })
   const openRun = (run: PlanningRunRow) => navigate(`/mrp-runs/${run.run_id}`)
 

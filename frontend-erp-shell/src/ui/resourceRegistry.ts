@@ -25,3 +25,7 @@ export const frontendResources: FrontendResource[] = [
   { name: 'specification', to: '/specification', title: 'Спецификации', view: ['viewer', 'planner', 'admin'], kind: 'custom' },
   { name: 'sync', to: '/sync', title: 'Синхронизация', view: ['admin'], kind: 'custom' },
 ]
+
+export function canAccessResource(resource: FrontendResource, roles: Role[]) {
+  return resource.view.some((role) => roles.includes(role))
+}

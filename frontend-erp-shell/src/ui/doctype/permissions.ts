@@ -6,7 +6,9 @@ export type AccessSubject = {
 }
 
 function hasGrant(subject: AccessSubject, grant: Role | Permission) {
-  return subject.roles.includes(grant as Role) || subject.permissions.includes(grant)
+  return subject.roles.includes(grant as Role)
+    || subject.permissions.includes('*')
+    || subject.permissions.includes(grant)
 }
 
 export function canView(permissions: DoctypePermissions, subject: AccessSubject) {

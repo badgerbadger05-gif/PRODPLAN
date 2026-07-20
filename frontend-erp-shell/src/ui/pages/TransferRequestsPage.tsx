@@ -6,6 +6,7 @@ import {
 import { qty } from '../../lib/format'
 import { DoctypePage, useDoctypeList } from '../doctype'
 import type { AccessSubject } from '../doctype/permissions'
+import { useOptionalSession } from '../session'
 import type { DoctypeListState } from '../doctype/useDoctypeList'
 import { tableColumnStyle, tableMinWidth } from '../tableDoctype'
 import {
@@ -18,7 +19,7 @@ import {
 
 type TransferState = DoctypeListState<TransferIssueRow, TransferRequestFilters, MaterialIssueDetail>
 
-const access: AccessSubject = {
+const transitionalAccess: AccessSubject = {
   roles: ['shopfloor'],
   permissions: ['material_issue.assemble_post_1c', 'production.propose'],
 }
@@ -131,6 +132,8 @@ function TransferDetail({ detail }: { detail: MaterialIssueDetail }) {
 }
 
 export function TransferRequestsPage() {
+  const session = useOptionalSession()
+  const access = session?.user ?? transitionalAccess
   const state = useDoctypeList(transferRequestsDoctype, { access })
 
   return (

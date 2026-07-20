@@ -1,8 +1,10 @@
-import { lazy, Suspense, useMemo } from 'react'
+import { lazy, Suspense, useMemo, type ReactNode } from 'react'
 import { Link, NavLink, Route, Routes, useNavigate } from 'react-router-dom'
 import { ErrorBoundary } from './ErrorBoundary'
 import { KeyboardShortcutShell, type KeyboardShortcut } from './platform'
 import { frontendResources } from './resourceRegistry'
+import { canAccessResource } from './resourceRegistry'
+import { LoginPage, useSession } from './session'
 
 const DbrDrumBoardPage = lazy(() => import('./pages/DbrDrumBoardPage').then((module) => ({ default: module.DbrDrumBoardPage })))
 const DbrFeederPage = lazy(() => import('./pages/DbrFeederPage').then((module) => ({ default: module.DbrFeederPage })))
@@ -28,17 +30,29 @@ function RouteLoading() {
 }
 
 export function App() {
+  const session = useSession()
   const navigate = useNavigate()
+  const accessibleResources = useMemo(
+    () => frontendResources.filter((resource) => session.user && canAccessResource(resource, session.user.roles)),
+    [session.user],
+  )
   const navigationShortcuts = useMemo<KeyboardShortcut[]>(
-    () => frontendResources
+    () => accessibleResources
       .filter((resource) => resource.shortcut)
       .map((resource) => ({
         id: `navigate-${resource.name}`,
         keys: resource.shortcut!,
         run: () => navigate(resource.to),
       })),
-    [navigate],
+    [accessibleResources, navigate],
   )
+
+  if (session.loading) return <main className="workArea"><div className="hintLine">Загрузка сессии...</div></main>
+  if (!session.user) return <LoginPage />
+
+  const guard = (name: string, content: ReactNode) => accessibleResources.some((resource) => resource.name === name)
+    ? content
+    : <main className="workArea"><div className="errorLine" role="alert">Нет доступа к разделу</div></main>
 
   return (
     <div className="app">
@@ -51,7 +65,7 @@ export function App() {
             <span>ERP shell</span>
           </div>
         </div>
-        {frontendResources.map((resource) => (
+        {accessibleResources.map((resource) => (
           <NavLink
             key={resource.name}
             to={resource.to}
@@ -63,6 +77,10 @@ export function App() {
           </NavLink>
         ))}
         <div className="navLogoSlot" aria-label="Логотип компании ЗСМ">
+          <div className="sessionBadge">
+            <strong>{session.user.name}</strong>
+            <button onClick={() => void session.logout()}>Выйти</button>
+          </div>
           <img src="/zsm-logo-sidebar.png" alt="ЗСМ" />
         </div>
       </aside>
@@ -71,24 +89,24 @@ export function App() {
         <Suspense fallback={<RouteLoading />}>
           <Routes>
             <Route path="/" element={<HomePage />} />
-            <Route path="/period-plan" element={<PeriodPlanPage />} />
-            <Route path="/period-plan/:planId" element={<PeriodPlanPage />} />
-            <Route path="/dbr" element={<DbrDrumBoardPage />} />
-            <Route path="/dbr/programs" element={<DbrProgramsPage />} />
-            <Route path="/dbr/feeder" element={<DbrFeederPage />} />
-            <Route path="/dbr/purchase" element={<DbrPurchasePage />} />
-            <Route path="/dbr/settings" element={<DbrSettingsPage />} />
-            <Route path="/production-control" element={<ProductionControlPage />} />
-            <Route path="/purchase-control" element={<PurchaseControlPage />} />
-            <Route path="/transfer-requests" element={<TransferRequestsPage />} />
-            <Route path="/mrp-runs" element={<MrpRunsPage />} />
-            <Route path="/mrp-runs/:runId" element={<MrpResultPage />} />
-            <Route path="/ledger" element={<LedgerWorkspacePage />} />
-            <Route path="/resources" element={<ResourcesPage />} />
-            <Route path="/workshop-binding-review" element={<WorkshopBindingReviewPage />} />
-            <Route path="/stage-distribution" element={<StageDistributionPage />} />
-            <Route path="/specification" element={<SpecificationPage />} />
-            <Route path="/sync" element={<SyncPage />} />
+            <Route path="/period-plan" element={guard('period_plan', <PeriodPlanPage />)} />
+            <Route path="/period-plan/:planId" element={guard('period_plan', <PeriodPlanPage />)} />
+            <Route path="/dbr" element={guard('dbr', <DbrDrumBoardPage />)} />
+            <Route path="/dbr/programs" element={guard('dbr', <DbrProgramsPage />)} />
+            <Route path="/dbr/feeder" element={guard('dbr', <DbrFeederPage />)} />
+            <Route path="/dbr/purchase" element={guard('dbr', <DbrPurchasePage />)} />
+            <Route path="/dbr/settings" element={guard('dbr', <DbrSettingsPage />)} />
+            <Route path="/production-control" element={guard('production_order', <ProductionControlPage />)} />
+            <Route path="/purchase-control" element={guard('purchase_order', <PurchaseControlPage />)} />
+            <Route path="/transfer-requests" element={guard('material_transfer', <TransferRequestsPage />)} />
+            <Route path="/mrp-runs" element={guard('plan_run', <MrpRunsPage />)} />
+            <Route path="/mrp-runs/:runId" element={guard('plan_run', <MrpResultPage />)} />
+            <Route path="/ledger" element={guard('ledger', <LedgerWorkspacePage />)} />
+            <Route path="/resources" element={guard('resources', <ResourcesPage />)} />
+            <Route path="/workshop-binding-review" element={guard('workshop_binding', <WorkshopBindingReviewPage />)} />
+            <Route path="/stage-distribution" element={guard('stage_distribution', <StageDistributionPage />)} />
+            <Route path="/specification" element={guard('specification', <SpecificationPage />)} />
+            <Route path="/sync" element={guard('sync', <SyncPage />)} />
             <Route
               path="*"
               element={(

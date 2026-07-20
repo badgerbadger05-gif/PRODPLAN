@@ -16,6 +16,7 @@ import {
 } from '../../services/purchaseControl'
 import { useDoctypeList } from '../doctype'
 import type { AccessSubject } from '../doctype/permissions'
+import { useOptionalSession } from '../session'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
 import { PurchaseCommandBar } from './purchase-control/PurchaseCommandBar'
@@ -28,7 +29,7 @@ import {
 } from './purchase-control/purchaseOrdersDoctype'
 
 const limit = 100
-const access: AccessSubject = {
+const transitionalAccess: AccessSubject = {
   roles: ['buyer'],
   permissions: ['purchase.export_1c', 'purchase.sync_1c'],
 }
@@ -53,6 +54,8 @@ const csvColumns: Array<[string, (row: PurchaseRow) => string | number]> = [
 ]
 
 export function PurchaseControlPage() {
+  const session = useOptionalSession()
+  const access = session?.user ?? transitionalAccess
   const [searchParams] = useSearchParams()
   const focusOrderId = searchParams.get('order_id')
   const focusSearch = searchParams.get('search')
