@@ -36,48 +36,31 @@ import { DbrNav } from '../dbr/DbrNav'
 import { DbrPurchaseResultBody } from '../dbr/DbrPurchaseResultBody'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
-
-const ZONE_LABEL: Record<string, string> = { green: 'Зелёная', yellow: 'Жёлтая', red: 'Красная' }
-const MODE_LABEL: Record<string, string> = { shelf: 'Полка', under_schedule: 'Под график' }
-const SUPPLY_LABEL: Record<string, string> = { purchase: 'Закупка', manufacture: 'Производство', processing: 'Переработка' }
-const REASON_LABEL: Record<string, string> = {
-  open_supply_destination_missing: 'не указан склад открытого прихода',
-  stale_schedule: 'позиция рассчитана не по активному графику',
-  production_inbound_destination_missing: 'не указан склад производственного прихода',
-  production_inbound_eta_missing: 'не указана дата производственного прихода',
-  supplier_inbound_destination_missing: 'не указан склад прихода поставщика',
-  supplier_inbound_eta_missing: 'не указана дата прихода поставщика',
-}
-const SIGNAL_TYPE_LABEL: Record<string, string> = { 'Пополнение': 'Пополнение', 'Под график': 'Под график' }
-// Material readiness: kit_cls → badge colour class (green/yellow/red/gray).
-const MATERIAL_CLASS: Record<string, string> = { ok: 'green', part: 'yellow', no: 'red', q: 'gray' }
-const MATERIAL_TITLE: Record<string, string> = {
-  'Готов': 'Комплект обеспечен запасом предприятия',
-  'Частично': 'Обеспечена часть комплекта',
-  'Дефицит': 'Не хватает материала на комплект',
-  'Расписан выше': 'Материал забран сигналами выше по очереди',
-}
-const SOURCE_LABEL: Record<string, string> = { make: 'Производство', buy: 'Закупка' }
-const PROCESSING_STAGE_LABEL: Record<string, string> = {
-  ordered: 'Заказан',
-  transferred: 'Передан переработчику',
-  reported: 'Есть выпуск по отчёту',
-}
-type DeficitSortKey = 'blocks_signals' | 'short_qty' | 'nearest_due' | 'item'
-
-type Filters = { search: string; zone: string; mode: string; supply: string }
-const EMPTY_FILTERS: Filters = { search: '', zone: '', mode: '', supply: '' }
-type SignalFilters = { search: string; zone: string; status: string; signal_type: string }
-const EMPTY_SIGNAL_FILTERS: SignalFilters = { search: '', zone: '', status: 'Open', signal_type: '' }
-
-function zoneKey(value?: string | null) {
-  return String(value ?? 'unknown').trim().toLowerCase()
-}
+import {
+  EMPTY_FILTERS,
+  EMPTY_SIGNAL_FILTERS,
+  MATERIAL_CLASS,
+  MATERIAL_TITLE,
+  MODE_LABEL,
+  PROCESSING_STAGE_LABEL,
+  purchaseSignalSelection,
+  REASON_LABEL,
+  SIGNAL_TYPE_LABEL,
+  sortFeederDeficits,
+  SOURCE_LABEL,
+  summarizeFeederPositions,
+  summarizeSignalPreview,
+  SUPPLY_LABEL,
+  visibleFeederSignals,
+  ZONE_LABEL,
+  zoneKey,
+} from './dbr-feeder/model'
+import type { DeficitSortKey, FeederFilters, SignalFilters } from './dbr-feeder/model'
 
 export function DbrFeederPage() {
   const [rows, setRows] = useState<DbrFeederPosition[]>([])
-  const [filters, setFilters] = useState<Filters>(EMPTY_FILTERS)
-  const [applied, setApplied] = useState<Filters>(EMPTY_FILTERS)
+  const [filters, setFilters] = useState<FeederFilters>(EMPTY_FILTERS)
+  const [applied, setApplied] = useState<FeederFilters>(EMPTY_FILTERS)
   const [preview, setPreview] = useState<DbrFeederPreview | null>(null)
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -118,24 +101,30 @@ export function DbrFeederPage() {
   const [purchaseError, setPurchaseError] = useState('')
   const [processingBoard, setProcessingBoard] = useState<DbrProcessingBoard | null>(null)
   const [processingLoading, setProcessingLoading] = useState(false)
+  const positionsLoadSequence = useRef(0)
   const signalsLoadSequence = useRef(0)
+  const signalDetailLoadSequence = useRef(0)
 
-  const load = useCallback(async (next: Filters = applied) => {
+  const load = useCallback(async (next: FeederFilters = applied) => {
+    const sequence = ++positionsLoadSequence.current
     setLoading(true)
     setError('')
     try {
-      setRows(await listDbrFeederPositions({
+      const nextRows = await listDbrFeederPositions({
         active_only: true,
         search: next.search,
         zone: next.zone,
         mode: next.mode,
         supply: next.supply,
         limit: 5000,
-      }))
+      })
+      if (sequence !== positionsLoadSequence.current) return
+      setRows(nextRows)
     } catch (e) {
+      if (sequence !== positionsLoadSequence.current) return
       setError(e instanceof Error ? e.message : String(e))
     } finally {
-      setLoading(false)
+      if (sequence === positionsLoadSequence.current) setLoading(false)
     }
   }, [applied])
 
@@ -195,51 +184,29 @@ export function DbrFeederPage() {
 
   // Queue shown after the deficit drill-down: only signals blocked by the
   // clicked component keep visible when a deficit filter is active.
-  const visibleSignals = useMemo(() => {
-    if (!deficitFilter) return signals
-    return signals.filter((signal) => (signal.deficit_lines ?? []).some((line) => line.item === deficitFilter))
-  }, [signals, deficitFilter])
+  const visibleSignals = useMemo(
+    () => visibleFeederSignals(signals, deficitFilter),
+    [signals, deficitFilter],
+  )
 
   // «Пополнение» signals are the ones the supplier-order launch can target; only
   // open ones are checkbox-selectable.
-  const purchaseSelectableIds = useMemo(
-    () => visibleSignals.filter((s) => s.signal_type === 'Пополнение' && s.status === 'Open').map((s) => s.id),
-    [visibleSignals],
+  const purchaseSelection = useMemo(
+    () => purchaseSignalSelection(visibleSignals, selectedPurchase),
+    [visibleSignals, selectedPurchase],
   )
-  const purchaseSelectedIds = useMemo(
-    () => purchaseSelectableIds.filter((id) => selectedPurchase.has(id)),
-    [purchaseSelectableIds, selectedPurchase],
+  const purchaseSelectableIds = purchaseSelection.selectableIds
+  const purchaseSelectedIds = purchaseSelection.selectedIds
+  const allPurchaseSelected = purchaseSelection.allSelected
+
+  const sortedDeficits = useMemo(
+    () => sortFeederDeficits(deficits?.deficits ?? [], deficitSort),
+    [deficits, deficitSort],
   )
-  const allPurchaseSelected = purchaseSelectableIds.length > 0 && purchaseSelectedIds.length === purchaseSelectableIds.length
 
-  const sortedDeficits = useMemo(() => {
-    const list = [...(deficits?.deficits ?? [])]
-    list.sort((a, b) => {
-      switch (deficitSort) {
-        case 'short_qty': return b.short_qty - a.short_qty
-        case 'nearest_due': return (a.nearest_due || '9999') < (b.nearest_due || '9999') ? -1 : 1
-        case 'item': return a.item.localeCompare(b.item)
-        case 'blocks_signals':
-        default: return b.blocks_signals - a.blocks_signals
-      }
-    })
-    return list
-  }, [deficits, deficitSort])
+  const summary = useMemo(() => summarizeFeederPositions(rows), [rows])
 
-  const summary = useMemo(() => rows.reduce((acc, row) => {
-    const zone = zoneKey(row.live_nfp?.zone)
-    acc[zone] = (acc[zone] ?? 0) + 1
-    if (!row.live_nfp?.is_complete) acc.incomplete = (acc.incomplete ?? 0) + 1
-    return acc
-  }, {} as Record<string, number>), [rows])
-
-  const signalPreviewSummary = useMemo(() => {
-    const actionable = signalPreview?.rows.filter((row) => row.action === 'open' || row.action === 'update') ?? []
-    return {
-      replenish: actionable.filter((row) => row.signal_type === 'Пополнение').length,
-      underSchedule: actionable.filter((row) => row.signal_type === 'Под график').length,
-    }
-  }, [signalPreview])
+  const signalPreviewSummary = useMemo(() => summarizeSignalPreview(signalPreview), [signalPreview])
 
   async function calculatePreview() {
     setSaving(true)
@@ -348,14 +315,18 @@ export function DbrFeederPage() {
   }
 
   async function selectSignal(signalId: number) {
+    const sequence = ++signalDetailLoadSequence.current
     setSignalsLoading(true)
     setError('')
     try {
-      setSelectedSignal(await getDbrFeederSignal(signalId))
+      const signal = await getDbrFeederSignal(signalId)
+      if (sequence !== signalDetailLoadSequence.current) return
+      setSelectedSignal(signal)
     } catch (e) {
+      if (sequence !== signalDetailLoadSequence.current) return
       setError(e instanceof Error ? e.message : String(e))
     } finally {
-      setSignalsLoading(false)
+      if (sequence === signalDetailLoadSequence.current) setSignalsLoading(false)
     }
   }
 

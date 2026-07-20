@@ -605,7 +605,7 @@ describe('DbrFeederPage characterization', () => {
     vi.mocked(listDbrFeederPositions)
       .mockReset()
       .mockResolvedValueOnce([position])
-      .mockImplementation(({ search }) => search === 'старый' ? stale.promise : latest.promise)
+      .mockImplementation((params) => params?.search === 'старый' ? stale.promise : latest.promise)
     renderPage()
 
     const positionsTable = document.querySelector('.dbrFeederTable') as HTMLElement
