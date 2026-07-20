@@ -9,6 +9,7 @@
     "smoke": "playwright test",
     "test": "vitest run",
     "test:watch": "vitest",
+    "api:types": "openapi-typescript ../docs/api/openapi.json -o src/lib/apiTypes.ts",
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 0.0.0.0 --port 9301"
   },
@@ -34,6 +35,7 @@
     "eslint-plugin-react-refresh": "^0.5.2",
     "globals": "^17.6.0",
     "jsdom": "^25.0.1",
+    "openapi-typescript": "^7.13.0",
     "typescript-eslint": "^8.46.0",
     "vitest": "^3.2.7"
   },

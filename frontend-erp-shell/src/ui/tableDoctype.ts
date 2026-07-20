@@ -1,4 +1,24 @@
-import type { CSSProperties } from 'react'
+import type { CSSProperties, ReactNode } from 'react'
+
+export type FieldType =
+  | 'text'
+  | 'number'
+  | 'qty'
+  | 'money'
+  | 'date'
+  | 'datetime'
+  | 'enum'
+  | 'ref'
+  | 'status'
+  | 'bool'
+  | 'select-checkbox'
+
+export type FieldTone = 'ok' | 'warn' | 'danger' | 'info' | 'muted'
+
+export type FieldOption = {
+  label: string
+  tone?: FieldTone
+}
 
 export type TableColumnDoctype = {
   key: string
@@ -12,6 +32,13 @@ export type TableColumnDoctype = {
   grow?: boolean
   align?: 'left' | 'right' | 'center'
   sortable?: boolean
+}
+
+export type DoctypeColumn<Row> = TableColumnDoctype & {
+  type?: FieldType
+  value?: (row: Row) => unknown
+  options?: Record<string, FieldOption>
+  render?: (row: Row) => ReactNode
 }
 
 export type TableSortState<TKey extends string = string> = {
