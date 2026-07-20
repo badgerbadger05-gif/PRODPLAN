@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useState } from 'react'
-import type { ReactNode } from 'react'
 import { syncActions, type NomenclatureGroupItem, type ODataConfig, type SyncAction, type WarehouseItem } from '../../domain/sync'
 import {
   fetchODataMetadata,
@@ -13,6 +12,14 @@ import {
 } from '../../services/sync'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
+import {
+  ConnectionPanel,
+  FullSyncPanel,
+  SelectionPanel,
+  SyncActionGroups,
+  SyncOperationLog,
+  SyncProgress,
+} from './sync/components'
 import { useSyncRunner } from './sync/useSyncRunner'
 
 const emptyConfig: ODataConfig = { base_url: '', username: '', password: '', token: '' }
@@ -122,66 +129,28 @@ export function SyncPage() {
       >
         <div className="syncLayout">
           <section className="syncMain">
-            <div className="syncPanel">
-              <h2>Подключение</h2>
-              <label><span>Базовый URL</span><input value={config.base_url} onChange={(e) => setConfig({ ...config, base_url: e.target.value })} /></label>
-              <div className="syncFormGrid">
-                <label><span>Пользователь</span><input value={config.username || ''} onChange={(e) => setConfig({ ...config, username: e.target.value })} /></label>
-                <label><span>Пароль</span><input type="password" value={config.password || ''} onChange={(e) => setConfig({ ...config, password: e.target.value })} /></label>
-                <label><span>Bearer token</span><input value={config.token || ''} onChange={(e) => setConfig({ ...config, token: e.target.value })} /></label>
-              </div>
-              <div className="syncActionsRow">
-                <button className="primary" onClick={() => void saveConfig()} disabled={busy}>Сохранить настройки</button>
-                <button onClick={() => void runNamed('Тест подключения', () => testODataConnection(config))} disabled={busy}>Тест подключения</button>
-                <button onClick={() => void runNamed('Выгрузить метаданные', () => fetchODataMetadata(config))} disabled={busy}>Выгрузить метаданные</button>
-              </div>
-            </div>
+            <ConnectionPanel
+              config={config}
+              busy={busy}
+              onConfigChange={setConfig}
+              onSave={() => void saveConfig()}
+              onTest={() => void runNamed('Тест подключения', () => testODataConnection(config))}
+              onFetchMetadata={() => void runNamed('Выгрузить метаданные', () => fetchODataMetadata(config))}
+            />
 
-            <div className="syncPanel syncFull">
-              <div>
-                <h2>Полная синхронизация</h2>
-                <p>Очередность: справочники, структура производства, склады, остатки, производственные и поставщицкие заказы.</p>
-              </div>
-              <button className="primary" onClick={() => void runFullSync()} disabled={busy}>Запустить полную синхронизацию</button>
-            </div>
+            <FullSyncPanel busy={busy} onRun={() => void runFullSync()} />
 
-            {progress.total > 0 && (
-              <div
-                className="syncProgress"
-                role="progressbar"
-                aria-label={progress.title}
-                aria-valuemin={0}
-                aria-valuemax={progress.total}
-                aria-valuenow={progress.done}
-                aria-valuetext={`${progress.done} из ${progress.total}`}
-              >
-                <div><strong>{progress.title}</strong><span>{progress.done} из {progress.total} · {progressPercent}%</span></div>
-                <div className="progressTrack"><div style={{ width: `${progressPercent}%` }} /></div>
-              </div>
-            )}
+            <SyncProgress {...progress} percent={progressPercent} />
 
             {error && <div className="errorLine" role="alert">{error}</div>}
             {message && <div className="successLine" role="status">{message}</div>}
 
-            <div className="syncGroups">
-              {groupedActions.map(([group, actions]) => (
-                <div className="syncPanel" key={group}>
-                  <h2>{group}</h2>
-                  <div className="syncButtonGrid">
-                    {actions.map((action) => (
-                      <button key={action.id} onClick={() => void runAction(action)} disabled={busy}>{action.title}</button>
-                    ))}
-                  </div>
-                </div>
-              ))}
-              <div className="syncPanel">
-                <h2>Excel-отчёты</h2>
-                <div className="syncButtonGrid">
-                  <button onClick={() => void exportReport('production')} disabled={busy}>Заказы на производство</button>
-                  <button onClick={() => void exportReport('supplier')} disabled={busy}>Учитываемые заказы поставщику</button>
-                </div>
-              </div>
-            </div>
+            <SyncActionGroups
+              groups={groupedActions}
+              busy={busy}
+              onRunAction={(action) => void runAction(action)}
+              onExport={(kind) => void exportReport(kind)}
+            />
           </section>
 
           <aside className="syncSide">
@@ -189,7 +158,7 @@ export function SyncPage() {
               title="Склады для остатков"
               count={warehouses.length}
               selected={selectedWarehouses.size}
-              disabled={busy}
+              busy={busy}
               onSelectAll={() => setSelectedWarehouses(new Set(warehouses.map((row) => row.warehouse_ref1c)))}
               onClear={() => setSelectedWarehouses(new Set())}
               onSave={() => void runNamed('Сохранить выбор складов', () => saveWarehouseSelection(Array.from(selectedWarehouses)))}
@@ -216,7 +185,7 @@ export function SyncPage() {
               title="Группы номенклатуры"
               count={groups.length}
               selected={selectedGroups.size}
-              disabled={busy}
+              busy={busy}
               onSelectAll={() => setSelectedGroups(new Set(groups.map((row) => row.id)))}
               onClear={() => setSelectedGroups(new Set())}
               onSave={() => void runNamed('Сохранить выбор групп', () => saveNomenclatureGroupSelection(Array.from(selectedGroups)))}
@@ -246,44 +215,9 @@ export function SyncPage() {
             </SelectionPanel>
           </aside>
 
-          <section className="syncLog">
-            <h2>Журнал операций</h2>
-            {log.map((entry, index) => (
-              <div className={`logRow ${entry.status}`} key={`${entry.at}-${index}`}>
-                <strong>{entry.at}</strong>
-                <span>{entry.title}</span>
-                <em>{entry.status}</em>
-                {entry.details && <small>{entry.details}</small>}
-              </div>
-            ))}
-            {!log.length && <div className="emptyDetail">Операций пока не было</div>}
-          </section>
+          <SyncOperationLog entries={log} />
         </div>
       </DocumentWindow>
     </main>
-  )
-}
-
-function SelectionPanel({ title, count, selected, disabled, onSelectAll, onClear, onSave, children }: {
-  title: string
-  count: number
-  selected: number
-  disabled: boolean
-  onSelectAll: () => void
-  onClear: () => void
-  onSave: () => void
-  children: ReactNode
-}) {
-  return (
-    <div className="syncPanel selectionPanel">
-      <h2>{title}</h2>
-      <div className="selectionMeta">Всего: {count} · Выбрано: {selected}</div>
-      <div className="syncActionsRow">
-        <button onClick={onSelectAll} disabled={disabled}>Все</button>
-        <button onClick={onClear} disabled={disabled}>Снять</button>
-        <button className="primary" onClick={onSave} disabled={disabled}>Сохранить</button>
-      </div>
-      <div className="selectionList">{children || <div className="emptyDetail">Список пуст</div>}</div>
-    </div>
   )
 }
