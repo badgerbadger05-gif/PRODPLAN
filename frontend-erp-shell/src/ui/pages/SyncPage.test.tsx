@@ -65,6 +65,14 @@ const groups = [
   { id: 'group-parts', code: 'КМП', name: 'Комплектующие' },
 ]
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise
+  })
+  return { promise, resolve }
+}
+
 function panel(title: string) {
   const heading = screen.getByRole('heading', { name: title })
   const element = heading.closest('.syncPanel')
@@ -134,6 +142,67 @@ describe('SyncPage characterization', () => {
     await user.click(screen.getByRole('button', { name: 'Выгрузить метаданные' }))
     await waitFor(() => expect(fetchODataMetadata).toHaveBeenCalledWith(config))
     expect(await screen.findByText('Выгрузить метаданные: выполнено')).toBeVisible()
+  })
+
+  it('announces successful and failed sync outcomes to assistive technology', async () => {
+    const user = userEvent.setup()
+    vi.mocked(testODataConnection)
+      .mockResolvedValueOnce({ status: 'ok' })
+      .mockRejectedValueOnce(new Error('Учетная система недоступна'))
+    render(<SyncPage />)
+    await screen.findByDisplayValue(config.base_url)
+
+    await user.click(screen.getByRole('button', { name: 'Тест подключения' }))
+    expect(await screen.findByRole('status')).toHaveTextContent('Тест подключения: выполнено')
+
+    await user.click(screen.getByRole('button', { name: 'Тест подключения' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Учетная система недоступна')
+  })
+
+  it('exposes full-sync progress and locks selection mutations while busy', async () => {
+    const user = userEvent.setup()
+    const firstAction = deferred<Awaited<ReturnType<typeof runSyncAction>>>()
+    vi.mocked(runSyncAction).mockImplementationOnce(() => firstAction.promise)
+    render(<SyncPage />)
+    await screen.findByDisplayValue(config.base_url)
+
+    await user.click(screen.getByRole('button', { name: 'Запустить полную синхронизацию' }))
+
+    const progressbar = await screen.findByRole('progressbar', { name: 'Полная синхронизация' })
+    expect(progressbar).toHaveAttribute('aria-valuemin', '0')
+    expect(progressbar).toHaveAttribute('aria-valuemax', String(fullSyncOrder.length))
+    expect(progressbar).toHaveAttribute('aria-valuenow', '0')
+    expect(progressbar).toHaveAttribute('aria-valuetext', `0 из ${fullSyncOrder.length}`)
+
+    for (const title of ['Склады для остатков', 'Группы номенклатуры']) {
+      const selection = panel(title)
+      expect(selection.getByRole('button', { name: 'Все' })).toBeDisabled()
+      expect(selection.getByRole('button', { name: 'Снять' })).toBeDisabled()
+      expect(selection.getByRole('button', { name: 'Сохранить' })).toBeDisabled()
+    }
+
+    firstAction.resolve({ status: 'ok' })
+    expect(await screen.findByText('Полная синхронизация завершена')).toBeVisible()
+  })
+
+  it('never copies connection credentials into operation results', async () => {
+    const user = userEvent.setup()
+    const password = 'PASSWORD-MUST-NOT-RENDER'
+    const token = 'TOKEN-MUST-NOT-RENDER'
+    vi.mocked(getODataConfig).mockResolvedValue({ ...config, password, token })
+    vi.mocked(saveODataConfig).mockResolvedValue({
+      status: 'ok',
+      config: { ...config, password, token },
+    })
+    render(<SyncPage />)
+    await screen.findByDisplayValue(config.base_url)
+
+    await user.click(screen.getByRole('button', { name: 'Сохранить настройки' }))
+    expect(await screen.findByText('Сохранить настройки: выполнено')).toBeVisible()
+
+    const operationLog = screen.getByRole('heading', { name: 'Журнал операций' }).parentElement!
+    expect(operationLog).not.toHaveTextContent(password)
+    expect(operationLog).not.toHaveTextContent(token)
   })
 
   it('runs a single sync command and records its result', async () => {
