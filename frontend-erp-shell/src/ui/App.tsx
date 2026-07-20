@@ -13,7 +13,6 @@ const MrpResultPage = lazy(() => import('./pages/MrpResultPage').then((module) =
 const MrpRunsPage = lazy(() => import('./pages/MrpRunsPage').then((module) => ({ default: module.MrpRunsPage })))
 const PeriodPlanPage = lazy(() => import('./pages/PeriodPlanPage').then((module) => ({ default: module.PeriodPlanPage })))
 const ProductionControlPage = lazy(() => import('./pages/ProductionControlPage').then((module) => ({ default: module.ProductionControlPage })))
-const ProductionReportWeekPage = lazy(() => import('./pages/ProductionReportWeekPage').then((module) => ({ default: module.ProductionReportWeekPage })))
 const PurchaseControlPage = lazy(() => import('./pages/PurchaseControlPage').then((module) => ({ default: module.PurchaseControlPage })))
 const ResourcesPage = lazy(() => import('./pages/ResourcesPage').then((module) => ({ default: module.ResourcesPage })))
 const SpecificationPage = lazy(() => import('./pages/SpecificationPage').then((module) => ({ default: module.SpecificationPage })))
@@ -66,7 +65,6 @@ export function App() {
             <Route path="/production-control" element={<ProductionControlPage />} />
             <Route path="/purchase-control" element={<PurchaseControlPage />} />
             <Route path="/transfer-requests" element={<TransferRequestsPage />} />
-            <Route path="/production-report-week" element={<ProductionReportWeekPage />} />
             <Route path="/mrp-runs" element={<MrpRunsPage />} />
             <Route path="/mrp-runs/:runId" element={<MrpResultPage />} />
             <Route path="/resources" element={<ResourcesPage />} />
