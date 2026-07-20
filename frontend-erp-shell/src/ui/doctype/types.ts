@@ -137,6 +137,8 @@ export type Doctype<Row, Filters, Detail = never> = {
   actions?: Array<ActionDef<Row>>
   detail?: DetailLayout<Detail | Row>
   permissions: DoctypePermissions<Row>
+  selectable?: (row: Row) => boolean
+  selectionDisabledReason?: (row: Row) => string
   renderExtraToolbar?: (context: ActionContext<Row>) => ReactNode
   rowClassName?: (row: Row) => string
 }

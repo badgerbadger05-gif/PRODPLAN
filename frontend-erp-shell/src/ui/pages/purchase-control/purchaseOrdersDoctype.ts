@@ -1,4 +1,4 @@
-import type { PurchaseFilters, PurchaseRow } from '../../../domain/purchaseControl'
+import { purchaseIdsForRow, type PurchaseFilters, type PurchaseRow } from '../../../domain/purchaseControl'
 import { listPurchaseJournal } from '../../../services/purchaseControl'
 import type { Doctype } from '../../doctype'
 import type { TableColumnDoctype } from '../../tableDoctype'
@@ -81,5 +81,7 @@ export function createPurchaseOrdersDoctype(
         sync_1c: 'purchase.sync_1c',
       },
     },
+    selectable: (row) => row.line_status === 'to_order' && purchaseIdsForRow(row).length > 0,
+    selectionDisabledReason: () => 'Заказывать можно только строки «К заказу» с MRP-потребностью',
   }
 }

@@ -54,7 +54,9 @@ export function DoctypeTable<Row, Filters extends object, Detail>({
     ? doctype.columns.filter((column) => visibleColumns.includes(column.key) && canViewField(doctype.permissions, column.key, access))
     : doctype.columns.filter((column) => canViewField(doctype.permissions, column.key, access))
   const rows = state.rows.filter((row) => canViewRecord(doctype.permissions, row, access))
-  const visibleIds = rows.map(idOf)
+  const visibleIds = rows
+    .filter((row) => doctype.selectable?.(row) !== false)
+    .map(idOf)
   const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => state.selectedIds.has(id))
   const someVisibleSelected = visibleIds.some((id) => state.selectedIds.has(id))
   const activateRow = (index: number, tableRow: HTMLTableRowElement) => {
@@ -134,6 +136,7 @@ export function DoctypeTable<Row, Filters extends object, Detail>({
               >
                 {columns.map((column) => {
                   if (column.type === 'select-checkbox') {
+                    const selectable = doctype.selectable?.(row) !== false
                     const checked = doctype.meta.selectionMode === 'single'
                       ? active
                       : state.selectedIds.has(id)
@@ -142,7 +145,12 @@ export function DoctypeTable<Row, Filters extends object, Detail>({
                         <input
                           type="checkbox"
                           checked={checked}
+                          disabled={!selectable}
+                          title={!selectable
+                            ? doctype.selectionDisabledReason?.(row) ?? 'Строка недоступна для выбора'
+                            : undefined}
                           onChange={() => {
+                            if (!selectable) return
                             if (doctype.meta.selectionMode === 'single') state.setActiveId(id)
                             else state.toggleSelection(id)
                           }}

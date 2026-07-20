@@ -20,6 +20,7 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
   options: { limit?: number; access: AccessSubject },
 ) {
   const limit = options.limit ?? DEFAULT_LIMIT
+  const isSelectable = doctype.selectable
   const enabled = canView(doctype.permissions, options.access)
   const accessKey = JSON.stringify({
     roles: [...options.access.roles].sort(),
@@ -63,8 +64,8 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
     [activeId, rowId, rows],
   )
   const selection = useMemo(
-    () => rows.filter((row) => selectedIds.has(rowId(row))),
-    [rowId, rows, selectedIds],
+    () => rows.filter((row) => selectedIds.has(rowId(row)) && isSelectable?.(row) !== false),
+    [isSelectable, rowId, rows, selectedIds],
   )
   const actionContext = useMemo<ActionContext<Row>>(
     () => ({ rows, activeRow, selection }),
@@ -212,6 +213,8 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
   }, [doctype.initialFilters])
 
   const toggleSelection = useCallback((id: RowId) => {
+    const row = rows.find((candidate) => rowId(candidate) === id)
+    if (!row || isSelectable?.(row) === false) return
     setSelectedIds((current) => {
       const next = new Set(current)
       if (next.has(id)) next.delete(id)
@@ -219,11 +222,21 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
       return next
     })
     setActiveId(id)
-  }, [])
+  }, [isSelectable, rowId, rows])
 
   const setVisibleSelection = useCallback((checked: boolean) => {
-    setSelectedIds(checked ? new Set(rows.map(rowId)) : new Set())
-  }, [rowId, rows])
+    const selectableIds = rows
+      .filter((row) => isSelectable?.(row) !== false)
+      .map(rowId)
+    setSelectedIds((current) => {
+      if (!checked) {
+        const next = new Set(current)
+        selectableIds.forEach((id) => next.delete(id))
+        return next
+      }
+      return new Set([...current, ...selectableIds])
+    })
+  }, [isSelectable, rowId, rows])
 
   const reload = useCallback(() => setReloadKey((current) => current + 1), [])
 
