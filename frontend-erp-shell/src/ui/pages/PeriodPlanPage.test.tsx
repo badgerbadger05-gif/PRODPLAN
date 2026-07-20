@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import { PeriodPlanPage } from './PeriodPlanPage'
@@ -230,6 +230,53 @@ describe('PeriodPlanPage — list view', () => {
     await waitFor(() => expect(periodPlanSvc.getPeriodPlanMatrix).toHaveBeenCalledWith(101))
     expect(await screen.findByText('Код')).toBeInTheDocument()
   })
+
+  it('opens the selected plan with Enter exactly once', async () => {
+    const user = userEvent.setup()
+    renderAt('/period-plan')
+    const plan = await screen.findByText('АПРЕЛЬ 2026')
+    await user.click(plan)
+
+    const event = new KeyboardEvent('keydown', {
+      key: 'Enter',
+      bubbles: true,
+      cancelable: true,
+    })
+    fireEvent(document, event)
+
+    await waitFor(() => expect(periodPlanSvc.getPeriodPlanMatrix).toHaveBeenCalledWith(101))
+    expect(event.defaultPrevented).toBe(true)
+
+    // The list shortcut listener must be gone after the route switches to detail.
+    await screen.findByText('Код')
+    vi.mocked(periodPlanSvc.getPeriodPlanMatrix).mockClear()
+    fireEvent.keyDown(document, { key: 'Enter' })
+    expect(periodPlanSvc.getPeriodPlanMatrix).not.toHaveBeenCalled()
+  })
+
+  it('keeps Enter local to inputs while F5 still reloads from an input', async () => {
+    const user = userEvent.setup()
+    renderAt('/period-plan')
+    const plan = await screen.findByText('АПРЕЛЬ 2026')
+    await user.click(plan)
+    const author = screen.getByPlaceholderText('любая часть имени')
+    author.focus()
+    vi.mocked(periodPlanSvc.listPeriodPlans).mockClear()
+
+    fireEvent.keyDown(author, { key: 'Enter' })
+    expect(periodPlanSvc.getPeriodPlanMatrix).not.toHaveBeenCalled()
+
+    const refresh = new KeyboardEvent('keydown', {
+      key: 'F5',
+      bubbles: true,
+      cancelable: true,
+    })
+    fireEvent(author, refresh)
+
+    await waitFor(() => expect(periodPlanSvc.listPeriodPlans).toHaveBeenCalledTimes(1))
+    expect(refresh.defaultPrevented).toBe(true)
+    expect(screen.getByText('Планирование / Планирование выпуска')).toBeInTheDocument()
+  })
 })
 
 // ── Detail view ───────────────────────────────────────────────────────────────
@@ -322,5 +369,65 @@ describe('PeriodPlanPage — detail view', () => {
     // List view chrome reappears after navigation.
     expect(await screen.findByRole('button', { name: 'Новый план' })).toBeInTheDocument()
     expect(screen.getByText('Планирование / Планирование выпуска')).toBeInTheDocument()
+  })
+
+  it('keeps Escape local to an input and navigates back from a neutral target', async () => {
+    renderAt('/period-plan/123')
+    const search = await screen.findByPlaceholderText(/поиск по мере ввода/)
+
+    fireEvent.keyDown(search, { key: 'Escape' })
+    expect(screen.getByRole('button', { name: 'К списку планов' })).toBeInTheDocument()
+
+    const back = new KeyboardEvent('keydown', {
+      key: 'Escape',
+      bubbles: true,
+      cancelable: true,
+    })
+    fireEvent(document, back)
+
+    expect(await screen.findByRole('button', { name: 'Новый план' })).toBeInTheDocument()
+    expect(back.defaultPrevented).toBe(true)
+  })
+
+  it('reloads only the active detail tab with F5 and refreshes runs', async () => {
+    const user = userEvent.setup()
+    renderAt('/period-plan/123')
+    const search = await screen.findByPlaceholderText(/поиск по мере ввода/)
+    await waitFor(() => expect(periodPlanSvc.listPeriodPlanRuns).toHaveBeenCalled())
+    vi.mocked(periodPlanSvc.getPeriodPlanMatrix).mockClear()
+    vi.mocked(periodPlanSvc.getExecutionJournal).mockClear()
+    vi.mocked(periodPlanSvc.listPeriodPlanRuns).mockClear()
+
+    const matrixRefresh = new KeyboardEvent('keydown', {
+      key: 'F5',
+      bubbles: true,
+      cancelable: true,
+    })
+    fireEvent(search, matrixRefresh)
+
+    await waitFor(() => {
+      expect(periodPlanSvc.getPeriodPlanMatrix).toHaveBeenCalledTimes(1)
+      expect(periodPlanSvc.listPeriodPlanRuns).toHaveBeenCalledTimes(1)
+    })
+    expect(periodPlanSvc.getExecutionJournal).not.toHaveBeenCalled()
+    expect(matrixRefresh.defaultPrevented).toBe(true)
+
+    await user.click(screen.getByRole('button', { name: 'Журнал исполнения' }))
+    await waitFor(() => expect(periodPlanSvc.getExecutionJournal).toHaveBeenCalled())
+    vi.mocked(periodPlanSvc.getPeriodPlanMatrix).mockClear()
+    vi.mocked(periodPlanSvc.getExecutionJournal).mockClear()
+    vi.mocked(periodPlanSvc.listPeriodPlanRuns).mockClear()
+
+    fireEvent(document, new KeyboardEvent('keydown', {
+      key: 'F5',
+      bubbles: true,
+      cancelable: true,
+    }))
+
+    await waitFor(() => {
+      expect(periodPlanSvc.getExecutionJournal).toHaveBeenCalledTimes(1)
+      expect(periodPlanSvc.listPeriodPlanRuns).toHaveBeenCalledTimes(1)
+    })
+    expect(periodPlanSvc.getPeriodPlanMatrix).not.toHaveBeenCalled()
   })
 })
