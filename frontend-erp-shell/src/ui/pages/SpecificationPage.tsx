@@ -1,4 +1,4 @@
-import { useMemo, useState, type CSSProperties } from 'react'
+import { useMemo, useRef, useState, type CSSProperties } from 'react'
 import type {
   BomFlattenedItem,
   BomItem,
@@ -58,6 +58,7 @@ export function SpecificationPage() {
   const [message, setMessage] = useState('')
   const [repairAction, setRepairAction] = useState<RepairAction | null>(null)
   const [picking, setPicking] = useState(false)
+  const loadSequence = useRef(0)
 
   const rows = useMemo(() => flattenSpecNodes(loaded?.nodes ?? []), [loaded])
   const filteredRows = useMemo(
@@ -104,6 +105,7 @@ export function SpecificationPage() {
   }
 
   async function loadItem(item: BomItem) {
+    const sequence = ++loadSequence.current
     setLoading(true)
     setError('')
     setMessage('')
@@ -115,6 +117,7 @@ export function SpecificationPage() {
         getSpecificationWhereUsed({ item_id: item.item_id, max_depth: 10 }),
         getSpecificationQuality({ item_id: item.item_id, max_depth: 20 }),
       ])
+      if (sequence !== loadSequence.current) return
       setLoaded({
         item,
         nodes: tree.nodes ?? [],
@@ -126,9 +129,10 @@ export function SpecificationPage() {
       setSelectedFlat(null)
       setMessage(`Загружено: ${itemTitle(item)}`)
     } catch (e) {
+      if (sequence !== loadSequence.current) return
       setError(e instanceof Error ? e.message : String(e))
     } finally {
-      setLoading(false)
+      if (sequence === loadSequence.current) setLoading(false)
     }
   }
 
