@@ -2,10 +2,16 @@ import { columnValue } from './fieldFormat'
 import { canViewField, canViewRecord } from './permissions'
 import type { AccessSubject, Doctype } from './types'
 
-function csvCell(value: unknown) {
+function csvCell(
+  value: unknown,
+  delimiter: ',' | ';',
+  quote: 'minimal' | 'all',
+) {
   let text = value == null ? '' : String(value)
   if (/^[\t\r ]*[=+\-@]/.test(text)) text = `'${text}`
-  return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text
+  return quote === 'all' || text.includes(delimiter) || /["\r\n]/.test(text)
+    ? `"${text.replaceAll('"', '""')}"`
+    : text
 }
 
 export function buildDoctypeCsv<Row, Filters extends object, Detail>({
@@ -19,17 +25,34 @@ export function buildDoctypeCsv<Row, Filters extends object, Detail>({
   visibleColumns: readonly string[]
   access: AccessSubject
 }) {
-  const columns = doctype.columns.filter((column) => (
-    column.type !== 'select-checkbox'
-    && visibleColumns.includes(column.key)
-    && canViewField(doctype.permissions, column.key, access)
-  ))
+  const config = typeof doctype.meta.exportCsv === 'object' ? doctype.meta.exportCsv : {}
+  const delimiter = config.delimiter ?? ','
+  const quote = config.quote ?? 'minimal'
+  const lineEnding = config.lineEnding ?? '\r\n'
+  const explicitColumns = config.columns
+  const columns = explicitColumns
+    ? explicitColumns
+      .filter((column) => (
+        (config.visibleColumnsOnly !== true || visibleColumns.includes(column.key))
+        && canViewField(doctype.permissions, column.permissionField ?? column.key, access)
+      ))
+      .map((column) => ({ ...column, cellValue: column.value }))
+    : doctype.columns
+      .filter((column) => (
+        column.type !== 'select-checkbox'
+        && visibleColumns.includes(column.key)
+        && canViewField(doctype.permissions, column.key, access)
+      ))
+      .map((column) => ({
+        ...column,
+        cellValue: (row: Row) => columnValue(column, row),
+      }))
   const permittedRows = rows.filter((row) => canViewRecord(doctype.permissions, row, access))
   const lines = [
-    columns.map((column) => csvCell(column.title)).join(','),
-    ...permittedRows.map((row) => columns.map((column) => csvCell(columnValue(column, row))).join(',')),
+    columns.map((column) => csvCell(column.title, delimiter, quote)).join(delimiter),
+    ...permittedRows.map((row) => columns.map((column) => csvCell(column.cellValue(row), delimiter, quote)).join(delimiter)),
   ]
-  return `${lines.join('\r\n')}\r\n`
+  return `${lines.join(lineEnding)}${lineEnding}`
 }
 
 function safeFilename(value: string) {

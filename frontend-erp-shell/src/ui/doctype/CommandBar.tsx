@@ -30,7 +30,7 @@ export function CommandBar<Row, Filters extends object, Detail>({ doctype, state
           }
           onClick={() => void state.runAction(action.key)}
         >
-          {action.label}
+          {typeof action.label === 'function' ? action.label(state.actionContext) : action.label}
         </button>
       ))}
       {doctype.meta.exportCsv && (

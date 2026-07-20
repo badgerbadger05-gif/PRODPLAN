@@ -25,6 +25,9 @@ type Props<Row, Filters extends object, Detail> = {
   dialogRegistry?: DialogRegistry
   onRowDoubleClick?: (row: Row) => void
   renderFilters?: (state: DoctypeListState<Row, Filters, Detail>) => ReactNode
+  renderTopBadge?: (state: DoctypeListState<Row, Filters, Detail>) => ReactNode
+  renderToolbarAfter?: (state: DoctypeListState<Row, Filters, Detail>) => ReactNode
+  renderTable?: (state: DoctypeListState<Row, Filters, Detail>) => ReactNode
 }
 
 export function DoctypePage<Row, Filters extends object, Detail>({
@@ -37,6 +40,9 @@ export function DoctypePage<Row, Filters extends object, Detail>({
   dialogRegistry = {},
   onRowDoubleClick,
   renderFilters,
+  renderTopBadge,
+  renderToolbarAfter,
+  renderTable,
 }: Props<Row, Filters, Detail>) {
   const [searchParams, setSearchParams] = useSearchParams()
   const columnOptions = useMemo(
@@ -66,7 +72,10 @@ export function DoctypePage<Row, Filters extends object, Detail>({
   }), [density, state.filters, state.sort, visibleColumns])
   const exportCsv = useCallback(() => {
     if (!doctype.meta.exportCsv) return
-    const rows = state.selection.length ? state.selection : state.rows
+    const config = typeof doctype.meta.exportCsv === 'object' ? doctype.meta.exportCsv : {}
+    const rows = config.rows === 'current-page'
+      ? state.rows
+      : state.selection.length ? state.selection : state.rows
     const csv = buildDoctypeCsv({ doctype, rows, visibleColumns, access })
     const configuredName = typeof doctype.meta.exportCsv === 'object'
       ? doctype.meta.exportCsv.filename
@@ -124,7 +133,9 @@ export function DoctypePage<Row, Filters extends object, Detail>({
     <main className="workArea">
       <div className="topLine">
         <div className="breadcrumbs">{breadcrumbs ?? doctype.meta.title}</div>
-        <div className="runBadge">строк: {state.paging.total}</div>
+        <div className="runBadge">
+          {renderTopBadge ? renderTopBadge(state) : `строк: ${state.paging.total}`}
+        </div>
       </div>
       <DocumentWindow
         title={doctype.meta.title}
@@ -145,6 +156,7 @@ export function DoctypePage<Row, Filters extends object, Detail>({
         )}
       >
         <CommandBar doctype={doctype} state={state} access={access} onExportCsv={exportCsv} />
+        {renderToolbarAfter?.(state)}
         <SavedViewsBar
           resource={doctype.meta.name}
           initialFilters={doctype.initialFilters}
@@ -163,22 +175,28 @@ export function DoctypePage<Row, Filters extends object, Detail>({
         {state.listLoading && <div className="srOnly" role="status">Загрузка...</div>}
         {state.error && <div className="errorLine" role="alert">{state.error}</div>}
         {state.message && <div className="successLine" role="status">{state.message}</div>}
-        <div className={doctype.detail ? 'split' : undefined}>
-          <DoctypeTable
-            doctype={doctype}
-            state={state}
-            onRowDoubleClick={onRowDoubleClick}
-            visibleColumns={visibleColumns}
-            density={density}
-            access={access}
-          />
-          {doctype.detail && (
+        <div className={doctype.detail || renderDetail ? 'split' : undefined}>
+          {renderTable
+            ? renderTable(state)
+            : (
+                <DoctypeTable
+                  doctype={doctype}
+                  state={state}
+                  onRowDoubleClick={onRowDoubleClick}
+                  visibleColumns={visibleColumns}
+                  density={density}
+                  access={access}
+                />
+              )}
+          {(doctype.detail || renderDetail) && (
             <aside className="detailPane">
               {state.detailLoading && <div>Загрузка...</div>}
               {!state.detailLoading && detailValue && (
                 renderDetail
                   ? renderDetail(detailValue, state)
-                  : <FormRenderer value={detailValue} layout={doctype.detail} access={access} permissions={doctype.permissions} />
+                  : doctype.detail
+                    ? <FormRenderer value={detailValue} layout={doctype.detail} access={access} permissions={doctype.permissions} />
+                    : null
               )}
             </aside>
           )}

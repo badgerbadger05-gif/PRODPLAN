@@ -1,5 +1,15 @@
-import { purchaseIdsForRow, type PurchaseFilters, type PurchaseRow } from '../../../domain/purchaseControl'
-import { listPurchaseJournal } from '../../../services/purchaseControl'
+import {
+  purchaseIdsForRow,
+  purchaseLineStatusLabel,
+  supplyPhaseLabel,
+  type PurchaseFilters,
+  type PurchaseRow,
+} from '../../../domain/purchaseControl'
+import {
+  exportPurchasesTo1C,
+  listPurchaseJournal,
+  syncSupplierOrdersFrom1C,
+} from '../../../services/purchaseControl'
 import type { Doctype } from '../../doctype'
 import type { TableColumnDoctype } from '../../tableDoctype'
 
@@ -30,7 +40,36 @@ export function createPurchaseOrdersDoctype(
       hotkeys: 'F5 Обновить · Enter Детали',
       idField: 'row_key',
       selectionMode: 'multiple',
-      exportCsv: { filename: 'purchase_orders.csv' },
+      exportCsv: {
+        filename: 'purchase-journal.csv',
+        delimiter: ';',
+        quote: 'all',
+        lineEnding: '\n',
+        rows: 'current-page',
+        visibleColumnsOnly: false,
+        columns: [
+          {
+            key: 'order',
+            title: 'Заказ',
+            value: (row) => row.line_status === 'to_order'
+              ? purchaseIdsForRow(row).map((id) => `MRP #${id}`).join(', ')
+              : row.order_number,
+          },
+          { key: 'order_date', title: 'Дата заказа', value: (row) => row.order_date ?? '' },
+          { key: 'supplier', title: 'Поставщик', value: (row) => row.supplier_name },
+          { key: 'article', title: 'Артикул', value: (row) => row.item_article ?? row.item_code },
+          { key: 'item', title: 'Номенклатура', value: (row) => row.item_name },
+          { key: 'quantity', title: 'Заказано', value: (row) => row.quantity },
+          { key: 'received', title: 'Поступило', value: (row) => row.received_qty },
+          { key: 'remaining', title: 'Осталось', value: (row) => row.remaining_qty },
+          { key: 'delivery_date', title: 'Дата поставки', value: (row) => row.delivery_date ?? row.need_date ?? '' },
+          { key: 'overdue', title: 'Просрочка, дн', value: (row) => row.overdue_days || '' },
+          { key: 'state', title: 'Статус 1С', value: (row) => row.order_state_name ?? '' },
+          { key: 'phase', title: 'Фаза', value: (row) => supplyPhaseLabel(row.supply_phase) },
+          { key: 'line_status', title: 'Статус', value: (row) => purchaseLineStatusLabel(row.line_status) },
+          { key: 'amount', title: 'Сумма', value: (row) => row.amount || '' },
+        ],
+      },
     },
     initialFilters: {
       search: focus.search ?? '',
@@ -73,6 +112,44 @@ export function createPurchaseOrdersDoctype(
       { kind: 'toggle', field: 'active_only', label: 'Активные' },
       { kind: 'select', field: 'state', label: 'Статус 1С', options: [], allowEmpty: true },
       { kind: 'select', field: 'line_status', label: 'Статус', options: [], allowEmpty: true },
+    ],
+    actions: [
+      {
+        key: 'export_1c',
+        label: ({ selection }) => `Заказать в 1С${selection.length ? ` (${selection.length})` : ''}`,
+        scope: 'selection',
+        tone: 'primary',
+        disabledReason: ({ selection }) => selection.length
+          ? ''
+          : 'Выберите строки «К заказу»',
+        async run({ selection, listMeta }) {
+          const runId = Number(listMeta.run_id ?? 0)
+          if (!runId) return { error: 'Нет зафиксированного MRP-прогона: нечего заказывать' }
+          const purchaseIds = [...new Set(selection.flatMap(purchaseIdsForRow))]
+          if (!purchaseIds.length) return { error: 'В выбранных строках нет MRP-потребностей' }
+          const result = await exportPurchasesTo1C(runId, purchaseIds)
+          const created = Number(result.orders_created ?? 0)
+          const existing = Number(result.orders_existing ?? 0)
+          await syncSupplierOrdersFrom1C().catch(() => undefined)
+          return {
+            message: `Заказы поставщику: создано ${created}, уже было ${existing}`,
+            clearSelection: true,
+            reload: true,
+          }
+        },
+      },
+      {
+        key: 'sync_1c',
+        label: 'Синхронизировать',
+        scope: 'global',
+        async run() {
+          const stats = await syncSupplierOrdersFrom1C()
+          return {
+            message: `Синхронизация: новых заказов ${Number(stats.orders_created ?? 0)}, обновлено ${Number(stats.orders_updated ?? 0)}`,
+            reload: true,
+          }
+        },
+      },
     ],
     permissions: {
       view: ['viewer', 'buyer', 'planner', 'admin'],

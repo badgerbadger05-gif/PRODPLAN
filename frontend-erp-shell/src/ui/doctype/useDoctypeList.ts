@@ -68,8 +68,8 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
     [isSelectable, rowId, rows, selectedIds],
   )
   const actionContext = useMemo<ActionContext<Row>>(
-    () => ({ rows, activeRow, selection }),
-    [activeRow, rows, selection],
+    () => ({ rows, activeRow, selection, listMeta }),
+    [activeRow, listMeta, rows, selection],
   )
 
   useEffect(() => {
@@ -238,6 +238,14 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
     })
   }, [isSelectable, rowId, rows])
 
+  const setSelection = useCallback((ids: ReadonlySet<RowId>) => {
+    setSelectedIds(new Set(
+      rows
+        .filter((row) => isSelectable?.(row) !== false && ids.has(rowId(row)))
+        .map(rowId),
+    ))
+  }, [isSelectable, rowId, rows])
+
   const reload = useCallback(() => setReloadKey((current) => current + 1), [])
 
   const runAction = useCallback(async (key: string) => {
@@ -265,6 +273,7 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
       setMessage(result.message ?? '')
       setError(result.error ?? '')
       setDialog(result.open ?? null)
+      if (result.clearSelection) setSelectedIds(new Set())
       if (result.reload) reload()
     } catch (actionError) {
       if (mounted.current) setError(errorMessage(actionError))
@@ -294,6 +303,7 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
     selectedIds,
     toggleSelection,
     setVisibleSelection,
+    setSelection,
     paging: {
       limit,
       offset,

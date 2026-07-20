@@ -69,17 +69,19 @@ export type ActionResult = {
   error?: string
   reload?: boolean
   open?: DialogRequest
+  clearSelection?: boolean
 }
 
 export type ActionContext<Row> = {
   rows: Row[]
   activeRow: Row | null
   selection: Row[]
+  listMeta: Record<string, unknown>
 }
 
 export type ActionDef<Row> = {
   key: string
-  label: string
+  label: string | ((context: ActionContext<Row>) => string)
   scope: 'global' | 'selection' | 'row'
   tone?: 'primary' | 'default' | 'danger'
   enabled?: (context: ActionContext<Row>) => boolean
@@ -117,6 +119,23 @@ export type DoctypePermissions<Row = unknown> = {
   recordView?: (row: Row, subject: AccessSubject) => boolean
 }
 
+export type CsvExportColumn<Row> = {
+  key: string
+  title: string
+  value: (row: Row) => unknown
+  permissionField?: string
+}
+
+export type CsvExportConfig<Row> = {
+  filename?: string
+  columns?: readonly CsvExportColumn<Row>[]
+  delimiter?: ',' | ';'
+  quote?: 'minimal' | 'all'
+  lineEnding?: '\r\n' | '\n'
+  rows?: 'selection-or-page' | 'current-page'
+  visibleColumnsOnly?: boolean
+}
+
 export type Doctype<Row, Filters, Detail = never> = {
   meta: {
     name: string
@@ -125,7 +144,7 @@ export type Doctype<Row, Filters, Detail = never> = {
     hotkeys?: string
     idField: keyof Row
     selectionMode?: 'none' | 'single' | 'multiple'
-    exportCsv?: boolean | { filename?: string }
+    exportCsv?: boolean | CsvExportConfig<Row>
   }
   initialFilters: Filters
   dataSource: {

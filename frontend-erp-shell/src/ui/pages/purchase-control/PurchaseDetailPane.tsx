@@ -13,9 +13,10 @@ import { getPurchaseOrderCard } from '../../../services/purchaseControl'
 
 type Props = {
   activeRow: PurchaseRow | null
+  embedded?: boolean
 }
 
-export function PurchaseDetailPane({ activeRow }: Props) {
+export function PurchaseDetailPane({ activeRow, embedded = false }: Props) {
   const [card, setCard] = useState<PurchaseOrderCard | null>(null)
   const [cardError, setCardError] = useState('')
   const [cardLoading, setCardLoading] = useState(false)
@@ -36,12 +37,13 @@ export function PurchaseDetailPane({ activeRow }: Props) {
   }, [orderId])
 
   if (!activeRow) {
-    return (
-      <aside className="detailPane">
+    const empty = (
+      <>
         <h2>Карточка строки</h2>
         <div className="emptyDetail">Выберите строку журнала</div>
-      </aside>
+      </>
     )
+    return embedded ? empty : <aside className="detailPane">{empty}</aside>
   }
 
   const mrpHref = activeRow.run_id && activeRow.purchase_id
@@ -49,8 +51,8 @@ export function PurchaseDetailPane({ activeRow }: Props) {
     : null
   const purchaseIds = purchaseIdsForRow(activeRow)
 
-  return (
-    <aside className="detailPane">
+  const content = (
+    <>
       <h2>{activeRow.line_status === 'to_order' ? 'MRP-потребность' : 'Карточка строки'}</h2>
       <div className="detailTitle">{activeRow.item_name}</div>
       <div className="detailMeta">{activeRow.item_article || activeRow.item_code}</div>
@@ -127,6 +129,7 @@ export function PurchaseDetailPane({ activeRow }: Props) {
           )}
         </>
       )}
-    </aside>
+    </>
   )
+  return embedded ? content : <aside className="detailPane">{content}</aside>
 }
