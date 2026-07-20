@@ -5,6 +5,8 @@ import { DoctypePage } from './DoctypePage'
 import type { Doctype } from './types'
 import type { DoctypeListState } from './useDoctypeList'
 
+vi.mock('./SavedViewsBar', () => ({ SavedViewsBar: () => null }))
+
 type Row = { id: number; name: string }
 type Filters = Record<string, never>
 
