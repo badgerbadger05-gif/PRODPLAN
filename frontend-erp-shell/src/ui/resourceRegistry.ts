@@ -16,7 +16,7 @@ export const frontendResources: FrontendResource[] = [
   { name: 'dbr', to: '/dbr', title: 'Планирование DBR', view: ['planner', 'admin'], kind: 'custom', shortcut: 'Alt+3' },
   { name: 'plan_run', to: '/mrp-runs', title: 'MRP прогоны', view: ['viewer', 'planner', 'admin'], kind: 'doctype', shortcut: 'Alt+4' },
   { name: 'production_order', to: '/production-control', title: 'Журнал заказов', view: ['planner', 'shopfloor', 'admin'], kind: 'custom', shortcut: 'Alt+5' },
-  { name: 'purchase_order', to: '/purchase-control', title: 'Журнал закупок', view: ['planner', 'buyer', 'admin'], kind: 'custom', shortcut: 'Alt+6' },
+  { name: 'purchase_order', to: '/purchase-control', title: 'Журнал закупок', view: ['planner', 'buyer', 'admin'], kind: 'doctype', shortcut: 'Alt+6' },
   { name: 'material_transfer', to: '/transfer-requests', title: 'Заявки перемещений', view: ['viewer', 'planner', 'shopfloor', 'admin'], kind: 'doctype', shortcut: 'Alt+7' },
   { name: 'ledger', to: '/ledger', title: 'Ledger', view: ['viewer', 'planner', 'buyer', 'admin'], kind: 'custom', shortcut: 'Alt+8' },
   { name: 'resources', to: '/resources', title: 'Ресурсы', view: ['viewer', 'planner', 'admin'], kind: 'custom', shortcut: 'Alt+9' },
