@@ -249,6 +249,102 @@ def test_journal_aggregates_active_runs(db_session):
     assert result["summary"]["to_order"] == 2
 
 
+def _make_horizon_runs(db):
+    """Two active FIXED_SNAPSHOT runs (Aug + Sep 2026), one PlannedPurchase each."""
+    _make_supplier(db, "s-ref-1", "ООО Метиз")
+    item = _make_item(db, "M-HZ", "Болт М10", supplier_ref="s-ref-1")
+
+    run_aug = PlanningRun(
+        status="FIXED_SNAPSHOT", config_snapshot={},
+        source_plan_id=911, period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
+    )
+    run_sep = PlanningRun(
+        status="FIXED_SNAPSHOT", config_snapshot={},
+        source_plan_id=912, period_from=date(2026, 9, 1), period_to=date(2026, 9, 30),
+    )
+    db.add_all([run_aug, run_sep])
+    db.flush()
+
+    db.add(
+        PlannedPurchase(
+            run_id=run_aug.run_id, item_id=item.item_id, requested_qty=5, planned_qty=5, qty=5,
+            need_date=date(2026, 8, 20), order_date=date(2026, 8, 10), lead_time_days=10,
+            bucket_date=date(2026, 8, 20), supplier_ref1c="s-ref-1",
+        )
+    )
+    db.add(
+        PlannedPurchase(
+            run_id=run_sep.run_id, item_id=item.item_id, requested_qty=7, planned_qty=7, qty=7,
+            need_date=date(2026, 9, 20), order_date=date(2026, 9, 10), lead_time_days=10,
+            bucket_date=date(2026, 9, 20), supplier_ref1c="s-ref-1",
+        )
+    )
+    db.commit()
+    return run_aug, run_sep
+
+
+def test_to_order_rows_carry_horizon_and_by_period_summary(db_session):
+    run_aug, run_sep = _make_horizon_runs(db_session)
+
+    result = list_journal(db_session, today=TODAY)
+    to_order = [row for row in result["rows"] if row["line_status"] == "to_order"]
+
+    by_run = {row["run_id"]: row for row in to_order}
+    assert by_run[run_aug.run_id]["plan_period_to"] == "2026-08-31"
+    assert by_run[run_aug.run_id]["plan_period_from"] == "2026-08-01"
+    assert by_run[run_aug.run_id]["period_label"] == "Август 2026"
+    assert by_run[run_sep.run_id]["plan_period_to"] == "2026-09-30"
+    assert by_run[run_sep.run_id]["period_label"] == "Сентябрь 2026"
+
+    buckets = result["to_order_by_period"]
+    assert [b["period_to"] for b in buckets] == ["2026-08-31", "2026-09-30"]
+    assert buckets[0] == {
+        "period_to": "2026-08-31",
+        "period_label": "Август 2026",
+        "item_count": 1,
+        "total_qty": 5.0,
+    }
+    assert buckets[1] == {
+        "period_to": "2026-09-30",
+        "period_label": "Сентябрь 2026",
+        "item_count": 1,
+        "total_qty": 7.0,
+    }
+
+
+def test_horizon_period_to_filter_restricts_to_order_rows(db_session):
+    run_aug, run_sep = _make_horizon_runs(db_session)
+
+    # Horizon = end of August → only the August run's to_order rows are shown.
+    filtered = list_journal(db_session, horizon_period_to=date(2026, 8, 31), today=TODAY)
+    to_order = [row for row in filtered["rows"] if row["line_status"] == "to_order"]
+    assert {row["run_id"] for row in to_order} == {run_aug.run_id}
+    assert [row["plan_period_to"] for row in to_order] == ["2026-08-31"]
+
+    # Full need stays visible in the by-period breakdown even when narrowed.
+    assert [b["period_to"] for b in filtered["to_order_by_period"]] == [
+        "2026-08-31",
+        "2026-09-30",
+    ]
+
+    # None → both runs (current behavior).
+    full = list_journal(db_session, horizon_period_to=None, today=TODAY)
+    full_to_order = [row for row in full["rows"] if row["line_status"] == "to_order"]
+    assert {row["run_id"] for row in full_to_order} == {run_aug.run_id, run_sep.run_id}
+
+
+def test_full_need_visible_without_horizon_filter(db_session):
+    _make_horizon_runs(db_session)
+
+    result = list_journal(db_session, today=TODAY)
+    to_order = [row for row in result["rows"] if row["line_status"] == "to_order"]
+
+    # No regression: aggregate to_order qty == sum across all active runs.
+    assert sum(row["quantity"] for row in to_order) == 12
+    assert sum(b["total_qty"] for b in result["to_order_by_period"]) == 12
+    assert result["summary"]["to_order"] == 2
+
+
 def test_list_journal_aggregates_duplicate_unordered_mrp_purchases(db_session):
     run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={})
     db_session.add(run)

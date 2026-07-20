@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -23,6 +24,14 @@ def get_orders(
     date_to: Optional[str] = None,
     active_only: bool = True,
     include_to_order: bool = True,
+    horizon_period_to: Optional[date] = Query(
+        None,
+        description=(
+            "Горизонт формирования заказов: показывать 'to_order'-строки только "
+            "по активным прогонам, чей план заканчивается не позже этой даты "
+            "(ISO). None = весь горизонт (все активные прогоны)."
+        ),
+    ),
     sort_by: Optional[str] = None,
     sort_dir: Optional[str] = None,
     limit: int = Query(100, ge=1, le=500),
@@ -46,6 +55,7 @@ def get_orders(
             date_to=date_to,
             active_only=active_only,
             include_to_order=include_to_order,
+            horizon_period_to=horizon_period_to,
             sort_by=sort_by,
             sort_dir=sort_dir,
             limit=limit,

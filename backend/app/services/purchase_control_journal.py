@@ -43,6 +43,29 @@ LINE_STATUSES = ("to_order", "overdue", "no_date", "expected", "partial", "recei
 # Фазы движения товара, по которым строится сводка журнала (см. supplier_order_status).
 SUPPLY_PHASES = ("no_goods", "in_transit", "in_stock")
 
+# Русские названия месяцев (именительный падеж) для человекочитаемых меток горизонта.
+_RU_MONTHS = {
+    1: "Январь",
+    2: "Февраль",
+    3: "Март",
+    4: "Апрель",
+    5: "Май",
+    6: "Июнь",
+    7: "Июль",
+    8: "Август",
+    9: "Сентябрь",
+    10: "Октябрь",
+    11: "Ноябрь",
+    12: "Декабрь",
+}
+
+
+def _period_label(period_to: Optional[date]) -> Optional[str]:
+    """Human-readable horizon label derived from a plan period end, e.g. "Сентябрь 2026"."""
+    if period_to is None:
+        return None
+    return f"{_RU_MONTHS[period_to.month]} {period_to.year}"
+
 
 def _order_is_active(order: SupplierOrder) -> bool:
     # Закрытым считаем заказ только при удалении или терминальном состоянии 1С
@@ -276,9 +299,14 @@ def _to_order_rows(
     supplier_id: Optional[int],
     search: Optional[str],
     today: date,
+    plan_period_from: Optional[date] = None,
+    plan_period_to: Optional[date] = None,
 ) -> List[Dict[str, Any]]:
     if not run_id:
         return []
+    plan_period_from_iso = plan_period_from.isoformat() if plan_period_from else None
+    plan_period_to_iso = plan_period_to.isoformat() if plan_period_to else None
+    period_label = _period_label(plan_period_to)
     exported = _exported_purchase_ids(db)
     suppliers_by_ref = _suppliers_by_ref(db)
     units_by_ref = _units_by_ref(db)
@@ -363,6 +391,9 @@ def _to_order_rows(
                 "price": 0.0,
                 "amount": 0.0,
                 "run_id": int(run_id),
+                "plan_period_from": plan_period_from_iso,
+                "plan_period_to": plan_period_to_iso,
+                "period_label": period_label,
             }
             continue
 
@@ -415,6 +446,52 @@ def _summary(rows: List[Dict[str, Any]], today: date) -> Dict[str, Any]:
     }
 
 
+def _run_periods(db: Session, run_ids: List[int]) -> Dict[int, Dict[str, Optional[date]]]:
+    """Map run_id → its owning plan period ({"from": date, "to": date})."""
+    if not run_ids:
+        return {}
+    result: Dict[int, Dict[str, Optional[date]]] = {}
+    for row in (
+        db.query(PlanningRun.run_id, PlanningRun.period_from, PlanningRun.period_to)
+        .filter(PlanningRun.run_id.in_([int(r) for r in run_ids]))
+        .all()
+    ):
+        result[int(row[0])] = {"from": _to_date(row[1]), "to": _to_date(row[2])}
+    return result
+
+
+def _to_order_by_period(to_order_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Aggregate the not-yet-ordered need by plan period (horizon).
+
+    Always computed over the FULL set of active-run to-order rows so procurement
+    keeps seeing the whole purchase need broken down by horizon, even while the
+    journal is narrowed to a single horizon for order formation.
+    """
+    buckets: Dict[Optional[str], Dict[str, Any]] = {}
+    for row in to_order_rows:
+        if row.get("line_status") != "to_order":
+            continue
+        period_to = row.get("plan_period_to")
+        bucket = buckets.get(period_to)
+        if bucket is None:
+            bucket = {
+                "period_to": period_to,
+                "period_label": row.get("period_label"),
+                "item_count": 0,
+                "total_qty": 0.0,
+            }
+            buckets[period_to] = bucket
+        bucket["item_count"] += 1
+        bucket["total_qty"] += _to_float(row.get("quantity"))
+    ordered = sorted(
+        buckets.values(),
+        key=lambda b: (b["period_to"] is None, b["period_to"] or ""),
+    )
+    for bucket in ordered:
+        bucket["total_qty"] = round(bucket["total_qty"], 6)
+    return ordered
+
+
 def list_journal(
     db: Session,
     *,
@@ -428,6 +505,7 @@ def list_journal(
     date_to: Optional[str] = None,
     active_only: bool = True,
     include_to_order: bool = True,
+    horizon_period_to: Optional[date] = None,
     sort_by: Optional[str] = None,
     sort_dir: Optional[str] = None,
     limit: int = 100,
@@ -450,6 +528,10 @@ def list_journal(
     if run_id is not None and run_id not in to_order_run_ids:
         to_order_run_ids.append(run_id)
 
+    # run_id → owning plan period, so every to-order row can carry its horizon
+    # (plan_period_from/to + a human label) and be bucketed by plan period.
+    run_periods = _run_periods(db, to_order_run_ids)
+
     rows = _supplier_order_rows(
         db,
         order_id=order_id,
@@ -458,11 +540,40 @@ def list_journal(
         active_only=active_only,
         today=today,
     )
+
+    to_order_rows: List[Dict[str, Any]] = []
     if include_to_order and order_id is None:
         for rid in to_order_run_ids:
-            rows.extend(
-                _to_order_rows(db, run_id=rid, supplier_id=supplier_id, search=search, today=today)
+            period = run_periods.get(rid, {})
+            to_order_rows.extend(
+                _to_order_rows(
+                    db,
+                    run_id=rid,
+                    supplier_id=supplier_id,
+                    search=search,
+                    today=today,
+                    plan_period_from=period.get("from"),
+                    plan_period_to=period.get("to"),
+                )
             )
+
+    # Full purchase need broken down by horizon — computed BEFORE the horizon
+    # filter so the breakdown always reflects the complete need.
+    to_order_by_period = _to_order_by_period(to_order_rows)
+
+    # Horizon selector: "form orders for need through this horizon". Restrict the
+    # to-order rows to active runs whose plan period ends on/before the chosen
+    # horizon. None = full horizon (all active runs, current behavior). Received
+    # / in-transit supplier order rows (actuals) are never touched.
+    if horizon_period_to is not None:
+        horizon_iso = horizon_period_to.isoformat()
+        to_order_rows = [
+            r
+            for r in to_order_rows
+            if r.get("plan_period_to") is not None and r["plan_period_to"] <= horizon_iso
+        ]
+
+    rows.extend(to_order_rows)
 
     if state:
         state_norm = _normalize_state(state)
@@ -510,6 +621,7 @@ def list_journal(
         "offset": effective_offset,
         "run_id": run_id,
         "summary": summary,
+        "to_order_by_period": to_order_by_period,
     }
 
 
