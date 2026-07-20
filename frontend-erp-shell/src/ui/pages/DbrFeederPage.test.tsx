@@ -349,4 +349,196 @@ describe('DbrFeederPage characterization', () => {
     expect(listDbrFeederSignals).toHaveBeenCalledTimes(2)
     expect(getDbrFeederDeficits).toHaveBeenCalledTimes(2)
   })
+
+  it('keeps a positions preview after a failed rebuild and lets the user retry it', async () => {
+    const user = userEvent.setup()
+    vi.mocked(previewDbrFeederPositions).mockResolvedValue({
+      schedule_id: 77,
+      positions: [position],
+      warnings: ['У позиции отсутствует норматив'],
+    })
+    vi.mocked(rebuildDbrFeederPositions)
+      .mockRejectedValueOnce(new Error('График изменился'))
+      .mockResolvedValueOnce({
+        schedule_id: 77,
+        positions: [position],
+        warnings: [],
+        created: 1,
+        updated: 2,
+        deactivated: 3,
+      })
+    renderPage()
+
+    await user.click(await screen.findByRole('button', { name: 'Предпросмотр пересчёта' }))
+    const preview = await screen.findByRole('region', { name: 'Предпросмотр пересчёта' })
+    expect(within(preview).getByText('График №77: 1 позиций')).toBeVisible()
+    await user.click(within(preview).getByText('Показать предупреждения'))
+    expect(within(preview).getByText('У позиции отсутствует норматив')).toBeVisible()
+
+    const rebuild = within(preview).getByRole('button', { name: 'Перестроить по графику №77' })
+    await user.click(rebuild)
+    expect(await screen.findByText('График изменился')).toBeVisible()
+    expect(preview).toBeVisible()
+    expect(rebuildDbrFeederPositions).toHaveBeenNthCalledWith(1, 77)
+
+    await user.click(rebuild)
+    expect(await screen.findByText('Позиции обновлены по графику №77: создано 1, обновлено 2, отключено 3')).toBeVisible()
+    expect(rebuildDbrFeederPositions).toHaveBeenNthCalledWith(2, 77)
+    expect(screen.queryByRole('region', { name: 'Предпросмотр пересчёта' })).not.toBeInTheDocument()
+    expect(listDbrFeederPositions).toHaveBeenCalledTimes(2)
+  })
+
+  it('previews advisory changes before refreshing signals for that schedule', async () => {
+    const user = userEvent.setup()
+    vi.mocked(previewDbrFeederSignals).mockResolvedValue({
+      schedule_id: 88,
+      positions: 3,
+      actionable: 2,
+      diagnostic: 1,
+      rows: [
+        {
+          signal_type: 'Пополнение',
+          position_id: 1,
+          item_id: 100,
+          item_code: 'PUMP-01',
+          warehouse_ref1c: 'MAIN',
+          zone: 'red',
+          priority: 2,
+          nfp: 1,
+          target_qty: 8,
+          kit_force: false,
+          kit_shortage_qty: 0,
+          suggested_qty: 7,
+          is_complete: true,
+          action: 'open',
+        },
+        {
+          signal_type: 'Под график',
+          position_id: 2,
+          item_id: 101,
+          item_code: 'GEAR-01',
+          warehouse_ref1c: 'MAIN',
+          zone: 'yellow',
+          priority: 1,
+          nfp: 2,
+          target_qty: 5,
+          kit_force: false,
+          kit_shortage_qty: 0,
+          suggested_qty: 3,
+          is_complete: true,
+          action: 'update',
+        },
+      ],
+    })
+    vi.mocked(refreshDbrFeederSignals).mockResolvedValue({
+      schedule_id: 88,
+      positions: 3,
+      actionable: 2,
+      rows: [],
+      created: 1,
+      updated: 1,
+      reopened: 0,
+      cancelled: 0,
+    })
+    renderPage()
+
+    await user.click(await screen.findByRole('button', { name: 'Предпросмотр сигналов' }))
+    const previewTitle = await screen.findByText('График №88: 2 актуальных сигналов')
+    const preview = previewTitle.closest('.dbrSignalPreview') as HTMLElement
+    expect(preview).not.toBeNull()
+    expect(within(preview).getByText('График №88: 2 актуальных сигналов')).toBeVisible()
+    expect(within(preview).getByText('Пополнение: 1; под график: 1')).toBeVisible()
+
+    await user.click(within(preview).getByRole('button', { name: 'Обновить по графику №88' }))
+    expect(await screen.findByText(/Advisory-очередь обновлена по графику №88/)).toBeVisible()
+    expect(refreshDbrFeederSignals).toHaveBeenCalledWith(88)
+    expect(listDbrFeederSignals).toHaveBeenCalledTimes(2)
+    expect(getDbrFeederDeficits).toHaveBeenCalledTimes(2)
+  })
+
+  it('opens signal details and drills from a deficit into the blocked queue', async () => {
+    const user = userEvent.setup()
+    const deficitLine: NonNullable<DbrFeederSignal['deficit_lines']>[number] = {
+      item: 'BEARING-01',
+      item_name: 'Подшипник',
+      article: 'ПД-01',
+      need: 4,
+      have: 1,
+      gross: 1,
+      kind: 'buy',
+      level: '1',
+      cls: 'no',
+      buffered: false,
+    }
+    const blockedSignal: DbrFeederSignal = {
+      ...purchaseSignal,
+      deficit_lines: [deficitLine],
+      material_status: 'Дефицит',
+      kit_cls: 'no',
+    }
+    vi.mocked(listDbrFeederSignals).mockResolvedValue([blockedSignal, productionSignal])
+    vi.mocked(getDbrFeederSignal).mockResolvedValue(productionSignal)
+    vi.mocked(getDbrFeederDeficits).mockResolvedValue({
+      deficits: [{
+        item: 'BEARING-01',
+        item_name: 'Подшипник',
+        article: 'ПД-01',
+        source: 'buy',
+        short_qty: 3,
+        need_sum: 4,
+        gross: 1,
+        blocks_signals: 1,
+        nearest_due: '2026-07-22',
+      }],
+      kpis: { deficit_materials: 1, queue_open: 2, stock_source: 'selected - ignored' },
+    })
+    renderPage()
+
+    const signalTable = document.querySelector('.dbrSignalTable') as HTMLElement
+    const productionRow = await within(signalTable).findByRole('row', { name: /GEAR-01/ })
+    await user.click(productionRow)
+    const detail = await screen.findByRole('complementary', { name: 'Карточка сигнала' })
+    expect(within(detail).getByText(`Сигнал #${productionSignal.id}`)).toBeVisible()
+    expect(getDbrFeederSignal).toHaveBeenCalledWith(productionSignal.id)
+
+    const deficitTable = document.querySelector('.dbrDeficitTable') as HTMLElement
+    await user.click(await within(deficitTable).findByRole('row', { name: /BEARING-01/ }))
+    expect(await within(signalTable).findByText('PUMP-01')).toBeVisible()
+    expect(within(signalTable).queryByText('GEAR-01')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Дефицит: BEARING-01 ✕' })).toBeVisible()
+    expect(screen.queryByRole('complementary', { name: 'Карточка сигнала' })).not.toBeInTheDocument()
+  })
+
+  it('gates chain controls by settings and refreshes from its read-only preview', async () => {
+    const user = userEvent.setup()
+    vi.mocked(getDbrSettings).mockResolvedValue({ feeder_chain_enabled: true } as Awaited<ReturnType<typeof getDbrSettings>>)
+    vi.mocked(previewDbrFeederChain).mockResolvedValue({
+      enabled: true,
+      open_signals: 4,
+      level1_children: 2,
+      distinct_items: 1,
+      top_items: [{ item: 'BLANK-01', parents: 2, qty_sum: 6 }],
+    })
+    vi.mocked(refreshDbrFeederChain).mockResolvedValue({
+      created: 2,
+      updated: 1,
+      reopened: 0,
+      revoked: 0,
+      no_warehouse: 0,
+      passes: 1,
+    })
+    renderPage()
+
+    const previewButton = await screen.findByRole('button', { name: 'Цепочка: предпросмотр' })
+    await user.click(previewButton)
+    const dialog = await screen.findByRole('dialog', { name: 'Предпросмотр цепочки' })
+    expect(within(dialog).getByText('BLANK-01')).toBeVisible()
+    expect(within(dialog).getByText(/Предпросмотр не создаёт сигналы/)).toBeVisible()
+
+    await user.click(within(dialog).getByRole('button', { name: 'Цепочка: обновить' }))
+    expect(await screen.findByText(/Цепочка обновлена: создано 2, обновлено 1/)).toBeVisible()
+    expect(refreshDbrFeederChain).toHaveBeenCalledOnce()
+    expect(listDbrFeederSignals).toHaveBeenCalledTimes(2)
+    expect(getDbrFeederDeficits).toHaveBeenCalledTimes(2)
+  })
 })
