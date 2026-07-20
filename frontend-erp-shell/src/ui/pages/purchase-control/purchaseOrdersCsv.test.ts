@@ -51,4 +51,26 @@ describe('purchase journal CSV schema', () => {
       + '"MRP #11, MRP #12";"2026-07-20";"ООО Металл";"ART-42";"Лист стальной";"100";"0";"100";"2026-07-25";"";"";"Нет товара";"К заказу";""\n',
     )
   })
+
+  it('does not export either field derived from an RBAC-hidden composite item column', () => {
+    const doctype = createPurchaseOrdersDoctype()
+    doctype.permissions = {
+      ...doctype.permissions,
+      fields: {
+        item: 'purchase.item.view',
+      },
+    }
+
+    const csv = buildDoctypeCsv({
+      doctype,
+      rows: [row],
+      visibleColumns: doctype.columns.map((column) => column.key),
+      access: { roles: ['buyer'], permissions: [] },
+    })
+
+    expect(csv).not.toContain('"Артикул"')
+    expect(csv).not.toContain('"Номенклатура"')
+    expect(csv).not.toContain('"ART-42"')
+    expect(csv).not.toContain('"Лист стальной"')
+  })
 })
