@@ -13,16 +13,13 @@ import {
 } from '../../services/resources'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
-
-const emptyForm: ProductionResourcePayload = {
-  resource_name: '',
-  shift_offset: 0,
-  planning_range: 30,
-  capacity: 0,
-  work_schedule: '5/2',
-  daily_work_hours: 8,
-  buffer_days: 0,
-}
+import {
+  availableKinds,
+  emptyResourceForm,
+  normalizeResourcePayload,
+  productionKindName,
+  resourceToForm,
+} from './resources/resourceForm'
 
 export function ResourcesPage() {
   const [rows, setRows] = useState<ProductionResource[]>([])
@@ -35,7 +32,7 @@ export function ResourcesPage() {
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [creating, setCreating] = useState(false)
-  const [form, setForm] = useState<ProductionResourcePayload>(emptyForm)
+  const [form, setForm] = useState<ProductionResourcePayload>(emptyResourceForm)
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
 
@@ -94,7 +91,7 @@ export function ResourcesPage() {
     setActiveId(null)
     setStages([])
     setKinds([])
-    setForm(emptyForm)
+    setForm(emptyResourceForm())
     setError('')
     setMessage('')
   }
@@ -337,39 +334,4 @@ function ResourceForm({ form, onChange, onSave, saving, creating }: {
       </div>
     </div>
   )
-}
-
-function resourceToForm(resource: ProductionResource): ProductionResourcePayload {
-  return {
-    resource_name: resource.resource_name || '',
-    shift_offset: Number(resource.shift_offset ?? 0),
-    planning_range: Number(resource.planning_range ?? 30),
-    capacity: Number(resource.capacity ?? 0),
-    work_schedule: resource.work_schedule || '5/2',
-    daily_work_hours: Number(resource.daily_work_hours ?? 8),
-    buffer_days: Number(resource.buffer_days ?? 0),
-  }
-}
-
-function normalizeResourcePayload(form: ProductionResourcePayload): ProductionResourcePayload {
-  return {
-    resource_name: String(form.resource_name || '').trim(),
-    shift_offset: Number(form.shift_offset ?? 0),
-    planning_range: Number(form.planning_range ?? 30),
-    capacity: Number(form.capacity ?? 0),
-    work_schedule: form.work_schedule || '5/2',
-    daily_work_hours: Number(form.daily_work_hours ?? 8),
-    buffer_days: Number(form.buffer_days ?? 0),
-  }
-}
-
-function productionKindName(kinds: ProductionKind[], id: number) {
-  return kinds.find((kind) => kind.id === id)?.name || `ID ${id}`
-}
-
-function availableKinds(kinds: ProductionKind[], assigned: ResourceProductionKind[]) {
-  const assignedIds = new Set(assigned.map((kind) => kind.production_kind_id))
-  return kinds
-    .filter((kind) => kind.id > 0 && !assignedIds.has(kind.id))
-    .sort((a, b) => a.name.localeCompare(b.name, 'ru'))
 }
