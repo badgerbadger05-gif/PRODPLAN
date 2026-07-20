@@ -25,6 +25,8 @@ export type FilterOption = {
   label: string
 }
 
+export type ListMeta = Record<string, unknown>
+
 export type FilterDef<Filters> =
   | {
       kind: 'search'
@@ -36,7 +38,7 @@ export type FilterDef<Filters> =
       kind: 'select'
       field: keyof Filters
       label: string
-      options: FilterOption[]
+      options: FilterOption[] | ((meta: ListMeta) => FilterOption[])
       allowEmpty?: boolean
     }
   | {
@@ -113,6 +115,7 @@ export type Doctype<Row, Filters, Detail = never> = {
     subtitle: string
     hotkeys?: string
     idField: keyof Row
+    selectionMode?: 'none' | 'single' | 'multiple'
   }
   initialFilters: Filters
   dataSource: {
@@ -125,10 +128,10 @@ export type Doctype<Row, Filters, Detail = never> = {
   detail?: DetailLayout<Detail | Row>
   permissions: DoctypePermissions
   renderExtraToolbar?: (context: ActionContext<Row>) => ReactNode
+  rowClassName?: (row: Row) => string
 }
 
 export type SortState = {
   sortBy: string
   sortDir: 'asc' | 'desc'
 }
-

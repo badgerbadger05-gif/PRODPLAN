@@ -25,6 +25,9 @@ export function FilterBar<Row, Filters extends object, Detail>({ doctype, state 
           )
         }
         if (filter.kind === 'select') {
+          const options = typeof filter.options === 'function'
+            ? filter.options(state.listMeta)
+            : filter.options
           return (
             <label className="columnFilterControl" key={`${String(filter.field)}-${index}`}>
               <span>{filter.label}</span>
@@ -33,7 +36,7 @@ export function FilterBar<Row, Filters extends object, Detail>({ doctype, state 
                 onChange={(event) => state.setFilter(filter.field, event.target.value as never)}
               >
                 {filter.allowEmpty && <option value="">Все</option>}
-                {filter.options.map((option) => (
+                {options.map((option) => (
                   <option key={option.value} value={option.value}>{option.label}</option>
                 ))}
               </select>
@@ -73,4 +76,3 @@ export function FilterBar<Row, Filters extends object, Detail>({ doctype, state 
     </div>
   )
 }
-

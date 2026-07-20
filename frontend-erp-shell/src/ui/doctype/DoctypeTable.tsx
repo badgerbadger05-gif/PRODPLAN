@@ -6,9 +6,10 @@ import { sortGlyph, tableColumnStyle, tableMinWidth } from '../tableDoctype'
 type Props<Row, Filters extends object, Detail> = {
   doctype: Doctype<Row, Filters, Detail>
   state: DoctypeListState<Row, Filters, Detail>
+  onRowDoubleClick?: (row: Row) => void
 }
 
-export function DoctypeTable<Row, Filters extends object, Detail>({ doctype, state }: Props<Row, Filters, Detail>) {
+export function DoctypeTable<Row, Filters extends object, Detail>({ doctype, state, onRowDoubleClick }: Props<Row, Filters, Detail>) {
   const idOf = (row: Row) => row[doctype.meta.idField] as string | number
 
   return (
@@ -37,7 +38,12 @@ export function DoctypeTable<Row, Filters extends object, Detail>({ doctype, sta
             const id = idOf(row)
             const active = state.activeRow ? idOf(state.activeRow) === id : false
             return (
-              <tr key={id} className={active ? 'activeRow' : ''} onClick={() => state.setActiveId(id)}>
+              <tr
+                key={id}
+                className={`${active ? 'activeRow' : ''} ${doctype.rowClassName?.(row) ?? ''}`.trim()}
+                onClick={() => state.setActiveId(id)}
+                onDoubleClick={() => onRowDoubleClick?.(row)}
+              >
                 {doctype.columns.map((column) => {
                   if (column.type === 'select-checkbox') {
                     return (
@@ -72,4 +78,3 @@ export function DoctypeTable<Row, Filters extends object, Detail>({ doctype, sta
     </div>
   )
 }
-

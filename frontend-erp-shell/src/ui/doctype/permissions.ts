@@ -24,4 +24,3 @@ export function canRunAction(
   const grants = Array.isArray(required) ? required : [required]
   return grants.some((grant) => hasGrant(subject, grant))
 }
-

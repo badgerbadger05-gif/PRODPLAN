@@ -1,6 +1,7 @@
 import { act, renderHook, waitFor } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import type { Doctype } from './types'
+import type { AccessSubject } from './permissions'
 import { useDoctypeList } from './useDoctypeList'
 
 type Row = { id: number; title: string }
@@ -30,10 +31,12 @@ function createDoctype(): Doctype<Row, Filters, Detail> {
   }
 }
 
+const access: AccessSubject = { roles: ['viewer'], permissions: [] }
+
 describe('useDoctypeList', () => {
   it('loads rows and detail, then resets paging when a filter changes', async () => {
     const doctype = createDoctype()
-    const { result } = renderHook(() => useDoctypeList(doctype))
+    const { result } = renderHook(() => useDoctypeList(doctype, { access }))
 
     await waitFor(() => expect(result.current.rows).toHaveLength(1))
     await waitFor(() => expect(result.current.detail?.id).toBe(1))
@@ -55,7 +58,7 @@ describe('useDoctypeList', () => {
       scope: 'global',
       run: action,
     }]
-    const { result } = renderHook(() => useDoctypeList(doctype))
+    const { result } = renderHook(() => useDoctypeList(doctype, { access }))
     await waitFor(() => expect(result.current.rows).toHaveLength(1))
 
     await act(async () => result.current.runAction('run'))
@@ -64,5 +67,42 @@ describe('useDoctypeList', () => {
     expect(result.current.message).toBe('Готово')
     await waitFor(() => expect(doctype.dataSource.list).toHaveBeenCalledTimes(2))
   })
-})
 
+  it('does not load or run protected resources without access', async () => {
+    const doctype = createDoctype()
+    doctype.permissions = {
+      view: ['planner'],
+      actions: { run: 'plan.run' },
+    }
+    const action = vi.fn(async () => ({ message: 'Нельзя' }))
+    doctype.actions = [{ key: 'run', label: 'Запуск', scope: 'global', run: action }]
+    const denied: AccessSubject = { roles: ['viewer'], permissions: [] }
+
+    const { result } = renderHook(() => useDoctypeList(doctype, { access: denied }))
+    await act(async () => result.current.runAction('run'))
+
+    expect(doctype.dataSource.list).not.toHaveBeenCalled()
+    expect(action).not.toHaveBeenCalled()
+  })
+
+  it('ignores a late detail response for the previously active row', async () => {
+    const doctype = createDoctype()
+    let resolveFirst: ((value: Detail) => void) | undefined
+    doctype.dataSource.list = vi.fn(async () => ({
+      rows: [{ id: 1, title: 'Первая' }, { id: 2, title: 'Вторая' }],
+      total: 2,
+    }))
+    doctype.dataSource.detail = vi.fn((id) => {
+      if (id === 1) return new Promise<Detail>((resolve) => { resolveFirst = resolve })
+      return Promise.resolve({ id: 2, description: 'Актуальная' })
+    })
+    const { result } = renderHook(() => useDoctypeList(doctype, { access }))
+    await waitFor(() => expect(result.current.activeId).toBe(1))
+
+    act(() => result.current.setActiveId(2))
+    await waitFor(() => expect(result.current.detail?.description).toBe('Актуальная'))
+    await act(async () => resolveFirst?.({ id: 1, description: 'Устаревшая' }))
+
+    expect(result.current.detail?.description).toBe('Актуальная')
+  })
+})

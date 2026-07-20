@@ -6,6 +6,7 @@ import type {
   RowId,
   SortState,
 } from './types'
+import { canRunAction, canView, type AccessSubject } from './permissions'
 
 const DEFAULT_LIMIT = 100
 
@@ -15,23 +16,37 @@ function errorMessage(error: unknown) {
 
 export function useDoctypeList<Row, Filters extends object, Detail>(
   doctype: Doctype<Row, Filters, Detail>,
-  limit = DEFAULT_LIMIT,
+  options: { limit?: number; access: AccessSubject },
 ) {
+  const limit = options.limit ?? DEFAULT_LIMIT
+  const enabled = canView(doctype.permissions, options.access)
   const [rows, setRows] = useState<Row[]>([])
   const [filters, setFilters] = useState<Filters>(doctype.initialFilters)
+  const [appliedFilters, setAppliedFilters] = useState<Filters>(doctype.initialFilters)
   const [sort, setSortState] = useState<SortState | null>(null)
   const [offset, setOffset] = useState(0)
   const [total, setTotal] = useState(0)
+  const [listMeta, setListMeta] = useState<Record<string, unknown>>({})
   const [activeId, setActiveId] = useState<RowId | null>(null)
   const [selectedIds, setSelectedIds] = useState<Set<RowId>>(() => new Set())
   const [detail, setDetail] = useState<Detail | null>(null)
-  const [loading, setLoading] = useState(false)
+  const [listLoading, setListLoading] = useState(false)
   const [detailLoading, setDetailLoading] = useState(false)
+  const [actionLoading, setActionLoading] = useState(false)
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
   const [dialog, setDialog] = useState<DialogRequest | null>(null)
   const [reloadKey, setReloadKey] = useState(0)
   const loadSequence = useRef(0)
+  const detailSequence = useRef(0)
+  const actionInFlight = useRef(false)
+  const mounted = useRef(true)
+  const filterTimers = useRef<Map<keyof Filters, ReturnType<typeof setTimeout>>>(new Map())
+
+  useEffect(() => () => {
+    mounted.current = false
+    filterTimers.current.forEach(clearTimeout)
+  }, [])
 
   const rowId = useCallback(
     (row: Row) => (row[doctype.meta.idField] as RowId),
@@ -52,17 +67,24 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
   )
 
   useEffect(() => {
+    if (!enabled) {
+      setRows([])
+      setTotal(0)
+      setListMeta({})
+      return
+    }
     const controller = new AbortController()
     const sequence = ++loadSequence.current
-    setLoading(true)
+    setListLoading(true)
     setError('')
+    setListMeta({})
 
     void doctype.dataSource
       .list(
         {
           limit,
           offset,
-          filters,
+          filters: appliedFilters,
           sortBy: sort?.sortBy,
           sortDir: sort?.sortDir,
         },
@@ -72,6 +94,18 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
         if (sequence !== loadSequence.current) return
         setRows(result.rows ?? [])
         setTotal(result.total ?? 0)
+        const {
+          rows: _rows,
+          total: _total,
+          limit: _limit,
+          offset: _offset,
+          ...meta
+        } = result
+        void _rows
+        void _total
+        void _limit
+        void _offset
+        setListMeta(meta)
         setSelectedIds((current) => {
           const visible = new Set((result.rows ?? []).map(rowId))
           return new Set([...current].filter((id) => visible.has(id)))
@@ -87,11 +121,11 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
         }
       })
       .finally(() => {
-        if (sequence === loadSequence.current) setLoading(false)
+        if (sequence === loadSequence.current) setListLoading(false)
       })
 
     return () => controller.abort()
-  }, [doctype.dataSource, filters, limit, offset, reloadKey, rowId, sort])
+  }, [appliedFilters, doctype.dataSource, enabled, limit, offset, reloadKey, rowId, sort])
 
   useEffect(() => {
     if (!activeRow || !doctype.dataSource.detail) {
@@ -100,16 +134,20 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
     }
 
     const controller = new AbortController()
+    const sequence = ++detailSequence.current
+    setDetail(null)
     setDetailLoading(true)
     setError('')
     void doctype.dataSource
       .detail(rowId(activeRow), controller.signal)
-      .then(setDetail)
+      .then((result) => {
+        if (!controller.signal.aborted && sequence === detailSequence.current) setDetail(result)
+      })
       .catch((detailError: unknown) => {
         if (!controller.signal.aborted) setError(errorMessage(detailError))
       })
       .finally(() => {
-        if (!controller.signal.aborted) setDetailLoading(false)
+        if (!controller.signal.aborted && sequence === detailSequence.current) setDetailLoading(false)
       })
     return () => controller.abort()
   }, [activeRow, doctype.dataSource, rowId])
@@ -117,7 +155,23 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
   const setFilter = useCallback(<Key extends keyof Filters>(key: Key, value: Filters[Key]) => {
     setFilters((current) => ({ ...current, [key]: value }))
     setOffset(0)
-  }, [])
+    const definition = doctype.filters?.find(
+      (filter) => filter.kind !== 'dateRange'
+        ? filter.field === key
+        : filter.fieldFrom === key || filter.fieldTo === key,
+    )
+    const debounceMs = definition?.kind === 'search' ? (definition.debounceMs ?? 300) : 0
+    const currentTimer = filterTimers.current.get(key)
+    if (currentTimer) clearTimeout(currentTimer)
+    if (!debounceMs) {
+      setAppliedFilters((current) => ({ ...current, [key]: value }))
+      return
+    }
+    filterTimers.current.set(key, setTimeout(() => {
+      setAppliedFilters((current) => ({ ...current, [key]: value }))
+      filterTimers.current.delete(key)
+    }, debounceMs))
+  }, [doctype.filters])
 
   const setSort = useCallback((sortBy: string) => {
     setSortState((current) => ({
@@ -141,24 +195,34 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
 
   const runAction = useCallback(async (key: string) => {
     const action = doctype.actions?.find((candidate) => candidate.key === key)
-    if (!action || action.enabled?.(actionContext) === false) return
+    if (
+      !action
+      || actionInFlight.current
+      || !canRunAction(doctype.permissions, key, options.access)
+      || action.enabled?.(actionContext) === false
+      || (action.scope === 'selection' && actionContext.selection.length === 0)
+      || (action.scope === 'row' && !actionContext.activeRow)
+    ) return
     if (action.confirm && !window.confirm(action.confirm)) return
 
-    setLoading(true)
+    actionInFlight.current = true
+    setActionLoading(true)
     setError('')
     setMessage('')
     try {
       const result = await action.run(actionContext)
+      if (!mounted.current) return
       setMessage(result.message ?? '')
       setError(result.error ?? '')
       setDialog(result.open ?? null)
       if (result.reload) reload()
     } catch (actionError) {
-      setError(errorMessage(actionError))
+      if (mounted.current) setError(errorMessage(actionError))
     } finally {
-      setLoading(false)
+      actionInFlight.current = false
+      if (mounted.current) setActionLoading(false)
     }
-  }, [actionContext, doctype.actions, reload])
+  }, [actionContext, doctype.actions, doctype.permissions, options.access, reload])
 
   const visibleFrom = total ? offset + 1 : 0
   const visibleTo = Math.min(offset + rows.length, total)
@@ -169,6 +233,7 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
     activeId,
     setActiveId,
     detail,
+    listMeta,
     filters,
     setFilter,
     sort,
@@ -187,7 +252,9 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
       prev: () => setOffset((current) => Math.max(0, current - limit)),
       next: () => setOffset((current) => current + limit),
     },
-    loading,
+    loading: listLoading || actionLoading,
+    listLoading,
+    actionLoading,
     detailLoading,
     error,
     message,
@@ -202,4 +269,3 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
 export type DoctypeListState<Row, Filters extends object, Detail> = ReturnType<
   typeof useDoctypeList<Row, Filters, Detail>
 >
-
