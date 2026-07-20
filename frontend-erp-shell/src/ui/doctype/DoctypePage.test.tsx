@@ -49,6 +49,11 @@ const doctype: Doctype<Row, Filters> = {
         accessibleName: 'Подтверждение',
       },
     }),
+  }, {
+    key: 'dynamic',
+    label: ({ rows }) => `Обработать (${rows.length})`,
+    scope: 'global',
+    run: async () => ({}),
   }],
   permissions: {},
 }
@@ -65,6 +70,26 @@ function Harness() {
         dialogRegistry={{ confirm: ConfirmDialog }}
       />
     </>
+  )
+}
+
+function ExtensionPointsHarness() {
+  const state = useDoctypeList(doctype, { access: { roles: [], permissions: [] } })
+  return (
+    <DoctypePage
+      doctype={doctype}
+      state={state}
+      access={{ roles: [], permissions: [] }}
+      renderTopBadge={(current) => (
+        <div data-testid="custom-top-badge">Загружено: {current.rows.length}</div>
+      )}
+      renderToolbarAfter={(current) => (
+        <div data-testid="toolbar-after">Действий: {current.actionContext.rows.length}</div>
+      )}
+      renderDetail={(value) => (
+        <div data-testid="custom-detail">Карточка: {(value as Row).name}</div>
+      )}
+    />
   )
 }
 
@@ -88,6 +113,12 @@ describe('DoctypePage dialogs', () => {
     await user.keyboard('{Escape}')
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
     expect(trigger).toHaveFocus()
+  })
+
+  it('renders an action label from the current action context', async () => {
+    renderHarness()
+
+    expect(await screen.findByRole('button', { name: 'Обработать (1)' })).toBeVisible()
   })
 
   it('shows a safe modal fallback when a dialog is not registered', async () => {
@@ -135,5 +166,25 @@ describe('DoctypePage dialogs', () => {
     expect(await screen.findByRole('columnheader', { name: 'ID' })).toBeVisible()
     expect(screen.queryByRole('columnheader', { name: 'Название' })).not.toBeInTheDocument()
     expect(document.querySelector('.doctypeTable--comfortable')).toBeInTheDocument()
+  })
+})
+
+describe('DoctypePage extension points', () => {
+  beforeEach(() => localStorage.clear())
+
+  it('renders a custom top badge and toolbar extension with the current state', async () => {
+    render(<MemoryRouter><ExtensionPointsHarness /></MemoryRouter>)
+
+    expect(await screen.findByTestId('custom-top-badge')).toHaveTextContent('Загружено: 1')
+    expect(screen.getByTestId('toolbar-after')).toHaveTextContent('Действий: 1')
+    expect(screen.getByTestId('toolbar-after').previousElementSibling).toHaveClass('commandBar')
+  })
+
+  it('creates a split detail pane for renderDetail without a declarative detail layout', async () => {
+    const { container } = render(<MemoryRouter><ExtensionPointsHarness /></MemoryRouter>)
+
+    expect(await screen.findByTestId('custom-detail')).toHaveTextContent('Карточка: Строка')
+    expect(screen.getByTestId('custom-detail').closest('aside')).toHaveClass('detailPane')
+    expect(container.querySelector('.split')).toBeInTheDocument()
   })
 })
