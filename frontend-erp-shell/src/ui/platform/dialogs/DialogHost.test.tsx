@@ -20,7 +20,17 @@ function ConfirmDialog({
   );
 }
 
-const registry = { confirm: ConfirmDialog };
+function FocusDialog({ close }: DialogComponentProps<object>) {
+  return (
+    <section>
+      <button>Первое действие</button>
+      <input aria-label="Комментарий" />
+      <button onClick={close}>Последнее действие</button>
+    </section>
+  );
+}
+
+const registry = { confirm: ConfirmDialog, focus: FocusDialog };
 type Request = DialogRequest<typeof registry>;
 
 function Harness({ onClose = () => undefined }: { onClose?: () => void }) {
@@ -73,6 +83,42 @@ describe("DialogHost", () => {
     expect(onClose).toHaveBeenCalledOnce();
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(trigger).toHaveFocus();
+  });
+
+  it("traps Tab and Shift+Tab focus inside the dialog", async () => {
+    const user = userEvent.setup();
+    render(
+      <DialogHost
+        dialog={{ name: "focus", props: {}, accessibleName: "Проверка фокуса" }}
+        registry={registry}
+        onClose={() => undefined}
+      />,
+    );
+
+    const first = screen.getByRole("button", { name: "Первое действие" });
+    const last = screen.getByRole("button", { name: "Последнее действие" });
+    expect(first).toHaveFocus();
+
+    await user.keyboard("{Shift>}{Tab}{/Shift}");
+    expect(last).toHaveFocus();
+
+    await user.keyboard("{Tab}");
+    expect(first).toHaveFocus();
+  });
+
+  it("closes only when the backdrop itself is clicked", async () => {
+    const user = userEvent.setup();
+    const onClose = vi.fn();
+    render(<Harness onClose={onClose} />);
+    await user.click(screen.getByRole("button", { name: "Открыть" }));
+
+    await user.click(screen.getByText("Продолжить операцию?"));
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog")).toBeVisible();
+
+    await user.click(screen.getByTestId("dialog-backdrop"));
+    expect(onClose).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
   it("uses the fallback for a registry miss at runtime", () => {
