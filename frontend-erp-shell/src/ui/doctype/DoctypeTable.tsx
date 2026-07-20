@@ -130,6 +130,7 @@ export function DoctypeTable<Row, Filters extends object, Detail>({
                     event.preventDefault()
                     activateRow(rows.length - 1, event.currentTarget)
                   } else if (event.key === 'Enter') {
+                    event.preventDefault()
                     onRowDoubleClick?.(row)
                   }
                 }}

@@ -5,7 +5,12 @@ import { DoctypeTable } from './DoctypeTable'
 import { FilterBar } from './FilterBar'
 import { FormRenderer } from './FormRenderer'
 import { SavedViewsBar } from './SavedViewsBar'
-import { DialogHost, type DialogRegistry } from '../platform'
+import {
+  DialogHost,
+  KeyboardShortcutShell,
+  type DialogRegistry,
+  type KeyboardShortcut,
+} from '../platform'
 import type { Doctype } from './types'
 import type { DoctypeListState } from './useDoctypeList'
 import type { AccessSubject } from './permissions'
@@ -24,6 +29,7 @@ type Props<Row, Filters extends object, Detail> = {
   renderDialog?: (dialog: NonNullable<DoctypeListState<Row, Filters, Detail>['dialog']>, close: () => void) => ReactNode
   dialogRegistry?: DialogRegistry
   onRowDoubleClick?: (row: Row) => void
+  onBack?: () => void
   renderFilters?: (state: DoctypeListState<Row, Filters, Detail>) => ReactNode
   renderTopBadge?: (state: DoctypeListState<Row, Filters, Detail>) => ReactNode
   renderToolbarAfter?: (state: DoctypeListState<Row, Filters, Detail>) => ReactNode
@@ -39,6 +45,7 @@ export function DoctypePage<Row, Filters extends object, Detail>({
   renderDialog,
   dialogRegistry = {},
   onRowDoubleClick,
+  onBack,
   renderFilters,
   renderTopBadge,
   renderToolbarAfter,
@@ -82,6 +89,30 @@ export function DoctypePage<Row, Filters extends object, Detail>({
       : undefined
     downloadCsv(csv, configuredName ?? `${doctype.meta.name}.csv`)
   }, [access, doctype, state.rows, state.selection, visibleColumns])
+  const resourceShortcuts = useMemo<KeyboardShortcut[]>(() => [
+    {
+      id: `${doctype.meta.name}-reload`,
+      keys: 'F5',
+      scope: 'resource',
+      allowInEditable: true,
+      run: state.reload,
+    },
+    ...onRowDoubleClick ? [{
+      id: `${doctype.meta.name}-open`,
+      keys: 'Enter',
+      scope: 'resource' as const,
+      enabled: () => Boolean(state.activeRow) && !state.loading,
+      run: () => {
+        if (state.activeRow) onRowDoubleClick(state.activeRow)
+      },
+    }] : [],
+    ...onBack ? [{
+      id: `${doctype.meta.name}-back`,
+      keys: 'Escape',
+      scope: 'resource' as const,
+      run: onBack,
+    }] : [],
+  ], [doctype.meta.name, onBack, onRowDoubleClick, state.activeRow, state.loading, state.reload])
 
   useEffect(() => {
     const token = searchParams.get('view')
@@ -131,6 +162,7 @@ export function DoctypePage<Row, Filters extends object, Detail>({
 
   return (
     <main className="workArea">
+      <KeyboardShortcutShell shortcuts={resourceShortcuts} />
       <div className="topLine">
         <div className="breadcrumbs">{breadcrumbs ?? doctype.meta.title}</div>
         <div className="runBadge">

@@ -4,14 +4,21 @@ export interface KeyboardShortcut {
   run: () => void;
   enabled?: () => boolean;
   allowInEditable?: boolean;
+  allowInInteractive?: boolean;
+  allowRepeat?: boolean;
+  scope?: "global" | "resource" | "modal";
   preventDefault?: boolean;
 }
 
 function isEditable(target: EventTarget | null): boolean {
-  return (
-    target instanceof HTMLElement &&
-    (target.isContentEditable ||
-      target.matches("input, textarea, select, [role='textbox']"))
+  return target instanceof HTMLElement && Boolean(
+    target.closest("input, textarea, select, [contenteditable='true'], [role='textbox']"),
+  );
+}
+
+function isInteractive(target: EventTarget | null): boolean {
+  return target instanceof HTMLElement && Boolean(
+    target.closest("button, a[href], [role='button'], [role='menuitem']"),
   );
 }
 
@@ -55,12 +62,17 @@ export class KeyboardShortcutController {
   private target: Document | null = null;
 
   private readonly handleKeyDown = (event: KeyboardEvent) => {
+    if (event.defaultPrevented || event.isComposing || event.keyCode === 229) return;
     const pressed = shortcutFromEvent(event);
+    const modalOpen = Boolean(document.querySelector('[role="dialog"][aria-modal="true"]'));
     const shortcut = this.shortcuts.find(
       (candidate) =>
         normalizeShortcut(candidate.keys) === pressed &&
+        (!event.repeat || candidate.allowRepeat) &&
+        (modalOpen ? candidate.scope === "modal" : candidate.scope !== "modal") &&
         (candidate.enabled?.() ?? true) &&
-        (candidate.allowInEditable || !isEditable(event.target)),
+        (candidate.allowInEditable || !isEditable(event.target)) &&
+        (candidate.allowInInteractive || !isInteractive(event.target)),
     );
     if (!shortcut) return;
     if (shortcut.preventDefault !== false) event.preventDefault();
