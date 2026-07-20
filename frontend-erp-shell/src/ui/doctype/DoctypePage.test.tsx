@@ -1,6 +1,6 @@
 import { render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it } from 'vitest'
 import type { DialogComponentProps } from '../platform'
 import { DoctypePage } from './DoctypePage'
 import type { Doctype } from './types'
@@ -32,7 +32,10 @@ const doctype: Doctype<Row, Filters> = {
   dataSource: {
     list: async () => ({ rows: [{ id: 1, name: 'Строка' }], total: 1 }),
   },
-  columns: [{ key: 'name', title: 'Название' }],
+  columns: [
+    { key: 'id', title: 'ID' },
+    { key: 'name', title: 'Название' },
+  ],
   actions: [{
     key: 'confirm',
     label: 'Открыть',
@@ -64,6 +67,8 @@ function Harness() {
 }
 
 describe('DoctypePage dialogs', () => {
+  beforeEach(() => localStorage.clear())
+
   it('renders an action DialogRequest through DialogHost and closes it accessibly', async () => {
     const user = userEvent.setup()
     render(<Harness />)
@@ -87,5 +92,28 @@ describe('DoctypePage dialogs', () => {
     // The registry is intentionally changed after opening only at the host
     // boundary in production; DialogHost itself covers that runtime miss.
     expect(screen.getByRole('dialog', { name: 'Подтверждение' })).toBeVisible()
+  })
+
+  it('saves and reapplies visible columns and table density', async () => {
+    const user = userEvent.setup()
+    render(<Harness />)
+    await screen.findByText('Строка')
+
+    await user.click(screen.getByRole('button', { name: 'Колонки' }))
+    await user.click(screen.getByRole('checkbox', { name: 'Название' }))
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Плотность таблицы' }), 'comfortable')
+    await user.type(screen.getByRole('textbox', { name: 'Название представления' }), 'Мой вид')
+    await user.click(screen.getByRole('button', { name: 'Сохранить' }))
+
+    expect(screen.queryByRole('columnheader', { name: 'Название' })).not.toBeInTheDocument()
+    expect(document.querySelector('.doctypeTable--comfortable')).toBeInTheDocument()
+
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Сохранённое представление' }), '')
+    expect(screen.getByRole('columnheader', { name: 'Название' })).toBeVisible()
+    expect(document.querySelector('.doctypeTable--compact')).toBeInTheDocument()
+
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Сохранённое представление' }), screen.getByRole('option', { name: 'Мой вид' }))
+    expect(screen.queryByRole('columnheader', { name: 'Название' })).not.toBeInTheDocument()
+    expect(document.querySelector('.doctypeTable--comfortable')).toBeInTheDocument()
   })
 })

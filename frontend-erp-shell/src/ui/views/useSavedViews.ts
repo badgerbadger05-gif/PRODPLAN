@@ -10,7 +10,7 @@ export interface SavedViewsController {
   error: string | null
   setState: (state: ViewState) => void
   apply: (id: string | null) => void
-  save: (name: string, options?: { id?: string; makeDefault?: boolean }) => Promise<SavedView>
+  save: (name: string, options?: { id?: string; makeDefault?: boolean; state?: ViewState }) => Promise<SavedView>
   remove: (id: string) => Promise<void>
   setDefault: (id: string | null) => Promise<void>
   reload: () => Promise<void>
@@ -85,14 +85,14 @@ export function useSavedViews(
 
   const save = useCallback(async (
     name: string,
-    options: { id?: string; makeDefault?: boolean } = {},
+    options: { id?: string; makeDefault?: boolean; state?: ViewState } = {},
   ) => {
     setError(null)
     try {
       const view = await repository.save({
         resource,
         name,
-        state,
+        state: options.state ?? state,
         id: options.id,
         makeDefault: options.makeDefault,
       })

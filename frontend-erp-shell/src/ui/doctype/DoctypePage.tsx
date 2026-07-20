@@ -4,12 +4,14 @@ import { CommandBar } from './CommandBar'
 import { DoctypeTable } from './DoctypeTable'
 import { FilterBar } from './FilterBar'
 import { FormRenderer } from './FormRenderer'
+import { SavedViewsBar } from './SavedViewsBar'
 import { DialogHost, type DialogRegistry } from '../platform'
 import type { Doctype } from './types'
 import type { DoctypeListState } from './useDoctypeList'
 import type { AccessSubject } from './permissions'
 import { canView } from './permissions'
-import type { ReactNode } from 'react'
+import { useCallback, useMemo, useState, type ReactNode } from 'react'
+import type { ViewState } from '../views'
 
 type Props<Row, Filters extends object, Detail> = {
   doctype: Doctype<Row, Filters, Detail>
@@ -34,6 +36,20 @@ export function DoctypePage<Row, Filters extends object, Detail>({
   onRowDoubleClick,
   renderFilters,
 }: Props<Row, Filters, Detail>) {
+  const columnOptions = useMemo(
+    () => doctype.columns.map(({ key, title }) => ({ key, title })),
+    [doctype.columns],
+  )
+  const allColumnKeys = useMemo(() => columnOptions.map(({ key }) => key), [columnOptions])
+  const [visibleColumns, setVisibleColumns] = useState<readonly string[]>(allColumnKeys)
+  const [density, setDensity] = useState<'compact' | 'comfortable'>('compact')
+  const applyViewState = state.applyViewState
+  const applyView = useCallback((view: ViewState) => {
+    applyViewState(view)
+    const available = view.visibleColumns.filter((key) => allColumnKeys.includes(key))
+    setVisibleColumns(available.length ? available : allColumnKeys)
+    setDensity(view.density)
+  }, [allColumnKeys, applyViewState])
   const detailValue = doctype.dataSource.detail ? state.detail : state.activeRow
   if (!canView(doctype.permissions, access)) {
     return (
@@ -68,11 +84,29 @@ export function DoctypePage<Row, Filters extends object, Detail>({
         )}
       >
         <CommandBar doctype={doctype} state={state} access={access} />
+        <SavedViewsBar
+          resource={doctype.meta.name}
+          initialFilters={doctype.initialFilters}
+          filters={state.filters}
+          sort={state.sort}
+          columns={columnOptions}
+          visibleColumns={visibleColumns}
+          density={density}
+          onApply={applyView}
+          onVisibleColumnsChange={setVisibleColumns}
+          onDensityChange={setDensity}
+        />
         {renderFilters ? renderFilters(state) : <FilterBar doctype={doctype} state={state} />}
         {state.error && <div className="errorLine">{state.error}</div>}
         {state.message && <div className="successLine">{state.message}</div>}
         <div className={doctype.detail ? 'split' : undefined}>
-          <DoctypeTable doctype={doctype} state={state} onRowDoubleClick={onRowDoubleClick} />
+          <DoctypeTable
+            doctype={doctype}
+            state={state}
+            onRowDoubleClick={onRowDoubleClick}
+            visibleColumns={visibleColumns}
+            density={density}
+          />
           {doctype.detail && (
             <aside className="detailPane">
               {state.detailLoading && <div>Загрузка...</div>}

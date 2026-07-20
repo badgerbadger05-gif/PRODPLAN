@@ -7,10 +7,21 @@ type Props<Row, Filters extends object, Detail> = {
   doctype: Doctype<Row, Filters, Detail>
   state: DoctypeListState<Row, Filters, Detail>
   onRowDoubleClick?: (row: Row) => void
+  visibleColumns?: readonly string[]
+  density?: 'compact' | 'comfortable'
 }
 
-export function DoctypeTable<Row, Filters extends object, Detail>({ doctype, state, onRowDoubleClick }: Props<Row, Filters, Detail>) {
+export function DoctypeTable<Row, Filters extends object, Detail>({
+  doctype,
+  state,
+  onRowDoubleClick,
+  visibleColumns,
+  density = 'compact',
+}: Props<Row, Filters, Detail>) {
   const idOf = (row: Row) => row[doctype.meta.idField] as string | number
+  const columns = visibleColumns
+    ? doctype.columns.filter((column) => visibleColumns.includes(column.key))
+    : doctype.columns
   const activateRow = (index: number, tableRow: HTMLTableRowElement) => {
     const nextIndex = Math.max(0, Math.min(index, state.rows.length - 1))
     const next = state.rows[nextIndex]
@@ -21,16 +32,16 @@ export function DoctypeTable<Row, Filters extends object, Detail>({ doctype, sta
   }
 
   return (
-    <div className="tablePane">
-      <table className="journalTable" style={{ minWidth: tableMinWidth(doctype.columns) }}>
+    <div className={`tablePane doctypeTable--${density}`}>
+      <table className="journalTable" style={{ minWidth: tableMinWidth(columns) }}>
         <colgroup>
-          {doctype.columns.map((column) => (
+          {columns.map((column) => (
             <col key={column.key} style={tableColumnStyle(column)} />
           ))}
         </colgroup>
         <thead>
           <tr>
-            {doctype.columns.map((column) => (
+            {columns.map((column) => (
               <th
                 key={column.key}
                 className={column.className}
@@ -79,7 +90,7 @@ export function DoctypeTable<Row, Filters extends object, Detail>({ doctype, sta
                   }
                 }}
               >
-                {doctype.columns.map((column) => {
+                {columns.map((column) => {
                   if (column.type === 'select-checkbox') {
                     const checked = doctype.meta.selectionMode === 'single'
                       ? active

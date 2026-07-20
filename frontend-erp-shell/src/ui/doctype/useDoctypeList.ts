@@ -7,6 +7,7 @@ import type {
   SortState,
 } from './types'
 import { canRunAction, canView, type AccessSubject } from './permissions'
+import type { ViewState } from '../views'
 
 const DEFAULT_LIMIT = 100
 
@@ -189,6 +190,17 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
     setOffset(0)
   }, [])
 
+  const applyViewState = useCallback((view: Pick<ViewState, 'filters' | 'sort'>) => {
+    filterTimers.current.forEach(clearTimeout)
+    filterTimers.current.clear()
+    const nextFilters = { ...doctype.initialFilters, ...view.filters } as Filters
+    setFilters(nextFilters)
+    setAppliedFilters(nextFilters)
+    const nextSort = view.sort[0]
+    setSortState(nextSort ? { sortBy: nextSort.field, sortDir: nextSort.direction } : null)
+    setOffset(0)
+  }, [doctype.initialFilters])
+
   const toggleSelection = useCallback((id: RowId) => {
     setSelectedIds((current) => {
       const next = new Set(current)
@@ -250,6 +262,7 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
     applyFilters,
     sort,
     setSort,
+    applyViewState,
     selection,
     selectedIds,
     toggleSelection,
