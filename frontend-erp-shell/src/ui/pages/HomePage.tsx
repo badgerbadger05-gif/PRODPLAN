@@ -7,9 +7,19 @@ import { listResources } from '../../services/resources'
 import { listWarehouses } from '../../services/sync'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
+import { canAccessResource, frontendResources } from '../resourceRegistry'
+import { mockUser } from '../session'
+import { useOptionalSession } from '../session'
 
 export function HomePage() {
   const navigate = useNavigate()
+  const session = useOptionalSession()
+  const user = session?.user ?? mockUser()
+  const available = new Set(
+    frontendResources
+      .filter((resource) => canAccessResource(resource, user.roles))
+      .map((resource) => resource.name),
+  )
   const [latestRun, setLatestRun] = useState<PlanningRunRow | null>(null)
   const [resourceCount, setResourceCount] = useState(0)
   const [warehouseTotal, setWarehouseTotal] = useState(0)
@@ -79,13 +89,14 @@ export function HomePage() {
           <section className="homePanel">
             <h2>Рабочие разделы</h2>
             <div className="homeActions">
-              <button className="primary" onClick={() => navigate('/period-plan')}>Планирование выпуска</button>
-              <button onClick={() => navigate('/production-control')}>Журнал заказов</button>
-              <button onClick={() => navigate('/mrp-runs')}>MRP прогоны</button>
-              <button onClick={() => navigate('/sync')}>Синхронизация</button>
-              <button onClick={() => navigate('/resources')}>Ресурсы</button>
-              <button onClick={() => navigate('/stage-distribution')}>Распределение этапов</button>
-              <button onClick={() => navigate('/specification')}>Спецификации</button>
+              {available.has('period_plan') && <button className="primary" onClick={() => navigate('/period-plan')}>Планирование выпуска</button>}
+              {available.has('production_order') && <button onClick={() => navigate('/production-control')}>Журнал заказов</button>}
+              {available.has('plan_run') && <button onClick={() => navigate('/mrp-runs')}>MRP прогоны</button>}
+              {available.has('ledger') && <button onClick={() => navigate('/ledger')}>Ledger</button>}
+              {available.has('sync') && <button onClick={() => navigate('/sync')}>Синхронизация</button>}
+              {available.has('resources') && <button onClick={() => navigate('/resources')}>Ресурсы</button>}
+              {available.has('stage_distribution') && <button onClick={() => navigate('/stage-distribution')}>Распределение этапов</button>}
+              {available.has('specification') && <button onClick={() => navigate('/specification')}>Спецификации</button>}
             </div>
           </section>
         </div>

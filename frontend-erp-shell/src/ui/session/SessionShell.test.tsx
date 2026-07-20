@@ -23,6 +23,7 @@ describe('session-aware ERP shell', () => {
     expect(screen.getByRole('link', { name: /Ledger/ })).toBeInTheDocument()
     expect(screen.queryByRole('link', { name: /Синхронизация/ })).not.toBeInTheDocument()
     expect(screen.queryByRole('link', { name: /Журнал закупок/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Синхронизация/ })).not.toBeInTheDocument()
   })
 
   it('denies a direct route that is absent from the current grants', async () => {
