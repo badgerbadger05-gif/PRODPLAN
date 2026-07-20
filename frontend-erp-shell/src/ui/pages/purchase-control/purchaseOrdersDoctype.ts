@@ -57,7 +57,12 @@ export function createPurchaseOrdersDoctype(
           },
           { key: 'order_date', title: 'Дата заказа', value: (row) => row.order_date ?? '' },
           { key: 'supplier', title: 'Поставщик', value: (row) => row.supplier_name },
-          { key: 'article', title: 'Артикул', value: (row) => row.item_article ?? row.item_code },
+          {
+            key: 'article',
+            title: 'Артикул',
+            value: (row) => row.item_article ?? row.item_code,
+            permissionField: 'item',
+          },
           { key: 'item', title: 'Номенклатура', value: (row) => row.item_name },
           { key: 'quantity', title: 'Заказано', value: (row) => row.quantity },
           { key: 'received', title: 'Поступило', value: (row) => row.received_qty },
