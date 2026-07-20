@@ -63,8 +63,9 @@ ERP shell
 
 ### 1. Purchase Control
 
-- Статус: частично мигрирован на `useDoctypeList`; полный переход на
-  `DoctypePage` и удаление старой механики остаются ближайшей frontend-задачей.
+- Статус: мигрирован на `DoctypePage`; плотная таблица, column filters,
+  summary shortcuts и карточка сохранены через extension slots. Selection,
+  действия 1С, loading/error/message, paging и CSV обслуживает общий runtime.
 - typed list metadata: summary, phases, suppliers, states, latest run;
 - URL/deep-link filters;
 - selection predicate и select-all только для допустимых строк;

@@ -4,8 +4,9 @@
 
 Состояние на 2026-07-20:
 
-- Doctype runtime реализован и используется `MRP Runs` и `Transfer Requests`; Purchase Control частично мигрирован, остальные журналы инвентаризируются.
-- OpenAPI-типы генерируются, lint чистый, frontend CI добавлен, 105 frontend-тестов проходят.
+- Doctype runtime реализован и используется `MRP Runs`, `Transfer Requests` и
+  `Purchase Control`; остальные журналы инвентаризируются.
+- OpenAPI-типы генерируются, lint чистый, frontend CI добавлен, 115 frontend-тестов проходят.
 - Прямые API-вызовы страниц вынесены в services-слой.
 - Route-level code splitting снизил initial JS bundle примерно с 592 до 242 КБ.
 - Mock session shell и resource/action/record/field gates реализованы, но Auth/RBAC нельзя считать закрытым до появления backend-сессии и `/auth/me`.
