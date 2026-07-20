@@ -581,6 +581,9 @@ export type DbrProcessingOrder = {
   line_number?: number | null
   order_number: string
   order_date?: string | null
+  transfer_date?: string | null
+  report_date?: string | null
+  stage: 'ordered' | 'transferred' | 'reported'
   remaining_qty: number
   age_days?: number | null
   overdue: boolean

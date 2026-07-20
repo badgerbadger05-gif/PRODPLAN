@@ -58,6 +58,11 @@ const MATERIAL_TITLE: Record<string, string> = {
   'Расписан выше': 'Материал забран сигналами выше по очереди',
 }
 const SOURCE_LABEL: Record<string, string> = { make: 'Производство', buy: 'Закупка' }
+const PROCESSING_STAGE_LABEL: Record<string, string> = {
+  ordered: 'Заказан',
+  transferred: 'Передан переработчику',
+  reported: 'Есть выпуск по отчёту',
+}
 type DeficitSortKey = 'blocks_signals' | 'short_qty' | 'nearest_due' | 'item'
 
 type Filters = { search: string; zone: string; mode: string; supply: string }
@@ -741,7 +746,7 @@ export function DbrFeederPage() {
           <div className="dbrSignalHeader">
             <div>
               <h2>Переработка (давальческий контур)</h2>
-              <p>Полка покрытой детали: NFP = остаток + труба переработчика + голая (остаток и в работе). Возраст партии считается от даты заказа переработчику — дата фактической отправки в 1С не синхронизируется.</p>
+              <p>Полка покрытой детали: NFP = остаток + труба переработчика + голая (остаток и в работе). Возраст партии считается от фактической передачи переработчику, а до неё — от даты заказа.</p>
             </div>
             <div className="dbrSignalHeaderActions">
               {processingBoard && (
@@ -780,7 +785,10 @@ export function DbrFeederPage() {
                       {row.open_orders.length
                         ? row.open_orders.map((order) => (
                           <div key={`${order.order_id}:${order.line_id}`} className={order.overdue ? 'dbrOverdueOrder' : ''} title={order.overdue ? `Партия у подрядчика дольше ${processingBoard?.roundtrip_limit_days} дн` : undefined}>
-                            {order.order_number} · {qty(order.remaining_qty)} шт · {order.age_days != null ? `${order.age_days} дн` : '—'}{order.overdue ? ' ⚠' : ''}
+                            <strong>{order.order_number}</strong> · {qty(order.remaining_qty)} шт · {PROCESSING_STAGE_LABEL[order.stage] ?? order.stage}
+                            <span className="dbrFeederItemName">
+                              Передача: {dateRu(order.transfer_date) || '—'} · Отчёт: {dateRu(order.report_date) || '—'} · Возраст: {order.age_days != null ? `${order.age_days} дн` : '—'}{order.overdue ? ' ⚠' : ''}
+                            </span>
                           </div>
                         ))
                         : '—'}

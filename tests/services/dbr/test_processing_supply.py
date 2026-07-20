@@ -206,6 +206,7 @@ def test_processing_nfp_includes_pipe_and_bare_chain(db_session):
     supplier = SupplierOrder(
         order_number="ЗП-1", order_date=datetime(2026, 8, 1),
         order_ref1c="proc-1", supplier_id=supplier_row.supplier_id,
+        operation_name="ЗаказНаПереработку",
         is_posted=True, deletion_mark=False,
     )
     db.add(supplier)
@@ -256,11 +257,16 @@ def test_processing_board_overdue_roundtrip_alert(db_session):
     fresh = SupplierOrder(
         order_number="ЗП-СВЕЖИЙ", order_date=datetime(2026, 8, 1),
         order_ref1c="proc-fresh", supplier_id=supplier.supplier_id,
+        operation_name="ЗаказНаПереработку",
+        processing_transfer_date=datetime(2026, 8, 3),
         is_posted=True, deletion_mark=False,
     )
     stale = SupplierOrder(
         order_number="ЗП-ПРОСРОЧЕН", order_date=datetime(2026, 6, 20),
         order_ref1c="proc-stale", supplier_id=supplier.supplier_id,
+        operation_name="ЗаказНаПереработку",
+        processing_transfer_date=datetime(2026, 7, 1),
+        processing_report_date=datetime(2026, 8, 4),
         is_posted=True, deletion_mark=False,
     )
     db.add_all([fresh, stale])
@@ -273,7 +279,7 @@ def test_processing_board_overdue_roundtrip_alert(db_session):
             ),
             SupplierOrderItem(
                 order_id=stale.order_id, item_id_ref=coated.item_id, quantity=20,
-                received_qty=0, remaining_qty=20, destination_warehouse_ref1c=None,
+                received_qty=5, remaining_qty=15, destination_warehouse_ref1c=None,
             ),
         ]
     )
@@ -291,13 +297,19 @@ def test_processing_board_overdue_roundtrip_alert(db_session):
     assert row["has_overdue"] is True
     orders = {order["order_number"]: order for order in row["open_orders"]}
     assert orders["ЗП-СВЕЖИЙ"]["overdue"] is False
-    assert orders["ЗП-СВЕЖИЙ"]["age_days"] == 4
+    assert orders["ЗП-СВЕЖИЙ"]["age_days"] == 2
+    assert orders["ЗП-СВЕЖИЙ"]["stage"] == "transferred"
+    assert orders["ЗП-СВЕЖИЙ"]["transfer_date"] == "2026-08-03T00:00:00"
+    assert orders["ЗП-СВЕЖИЙ"]["report_date"] is None
     assert orders["ЗП-ПРОСРОЧЕН"]["overdue"] is True
-    assert orders["ЗП-ПРОСРОЧЕН"]["age_days"] == 46
+    assert orders["ЗП-ПРОСРОЧЕН"]["age_days"] == 35
+    assert orders["ЗП-ПРОСРОЧЕН"]["stage"] == "reported"
+    assert orders["ЗП-ПРОСРОЧЕН"]["transfer_date"] == "2026-07-01T00:00:00"
+    assert orders["ЗП-ПРОСРОЧЕН"]["report_date"] == "2026-08-04T00:00:00"
     assert isinstance(orders["ЗП-ПРОСРОЧЕН"]["order_id"], int)
     assert isinstance(orders["ЗП-ПРОСРОЧЕН"]["line_id"], int)
     # NFP-разложение присутствует на борде
-    assert row["open_supply_qty"] == 30
+    assert row["open_supply_qty"] == 25
     assert row["zone"] is not None
 
 
@@ -315,21 +327,31 @@ def test_processing_pipe_excludes_draft_and_wrong_supplier(db_session):
         SupplierOrder(
             order_number="VALID", order_date=datetime(2026, 8, 1),
             order_ref1c="proc-valid", supplier_id=expected_supplier.supplier_id,
+            operation_name="ЗаказНаПереработку",
+            is_posted=True, deletion_mark=False,
+        ),
+        SupplierOrder(
+            order_number="ORDINARY", order_date=datetime(2026, 8, 1),
+            order_ref1c="ordinary-valid", supplier_id=expected_supplier.supplier_id,
+            operation_name="ЗаказПоставщику",
             is_posted=True, deletion_mark=False,
         ),
         SupplierOrder(
             order_number="DRAFT", order_date=datetime(2026, 8, 1),
             order_ref1c="proc-draft", supplier_id=expected_supplier.supplier_id,
+            operation_name="ЗаказНаПереработку",
             is_posted=False, deletion_mark=False,
         ),
         SupplierOrder(
             order_number="WRONG", order_date=datetime(2026, 8, 1),
             order_ref1c="proc-wrong", supplier_id=wrong_supplier.supplier_id,
+            operation_name="ЗаказНаПереработку",
             is_posted=True, deletion_mark=False,
         ),
         SupplierOrder(
             order_number="CLOSED", order_date=datetime(2026, 8, 1),
             order_ref1c="proc-closed", supplier_id=expected_supplier.supplier_id,
+            operation_name="ЗаказНаПереработку",
             is_posted=True, deletion_mark=False, order_state_name="Завершён",
         ),
     ]
@@ -352,6 +374,8 @@ def test_processing_pipe_excludes_draft_and_wrong_supplier(db_session):
     assert live["open_supply_qty"] == 10
     assert [row["order_number"] for row in board["positions"][0]["open_orders"]] == ["VALID"]
     assert board["positions"][0]["open_orders"][0]["line_number"] == 1
+    assert board["positions"][0]["open_orders"][0]["stage"] == "ordered"
+    assert board["positions"][0]["open_orders"][0]["age_days"] == 4
 
 
 def test_processing_pipe_without_configured_supplier_is_incomplete(db_session):

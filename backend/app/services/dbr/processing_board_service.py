@@ -6,9 +6,9 @@ Read-only мониторинг для снабжения/ПДО (дока §5 п
 возрастом и алертом просроченного кругорейса (старше
 settings.processing_roundtrip_days).
 
-Дата отправки давальческого сырья в 1С не синхронизируется (регистр
-ЗапасыПереданные вне синка), поэтому возраст партии у подрядчика считается от
-даты заказа переработчику — консервативная верхняя оценка кругорейса.
+Возраст партии считается от фактической передачи в переработку, а пока её нет
+— от даты заказа. Дата отчёта переработчика определяет завершённый этап
+документооборота, но открытая строка остаётся видна на борде до закрытия трубы.
 """
 
 from __future__ import annotations
@@ -53,7 +53,16 @@ def processing_board(db: Session, *, today: date | None = None) -> dict[str, Any
     orders_by_item: dict[int, list[dict[str, Any]]] = {}
     if item_ids:
         for line, order in processing_order_rows(db, item_ids):
-            age = _age_days(order.order_date, today)
+            age = _age_days(
+                order.processing_transfer_date or order.order_date,
+                today,
+            )
+            if order.processing_report_date and float(line.received_qty or 0) > 0:
+                stage = "reported"
+            elif order.processing_transfer_date:
+                stage = "transferred"
+            else:
+                stage = "ordered"
             orders_by_item.setdefault(int(line.item_id_ref), []).append(
                 {
                     "order_id": int(order.order_id),
@@ -61,6 +70,17 @@ def processing_board(db: Session, *, today: date | None = None) -> dict[str, Any
                     "line_number": int(line.line_number) if line.line_number is not None else None,
                     "order_number": str(order.order_number or ""),
                     "order_date": order.order_date.isoformat() if order.order_date else None,
+                    "transfer_date": (
+                        order.processing_transfer_date.isoformat()
+                        if order.processing_transfer_date
+                        else None
+                    ),
+                    "report_date": (
+                        order.processing_report_date.isoformat()
+                        if order.processing_report_date
+                        else None
+                    ),
+                    "stage": stage,
                     "remaining_qty": float(line.remaining_qty or 0),
                     "age_days": age,
                     "overdue": bool(age is not None and age > limit_days),

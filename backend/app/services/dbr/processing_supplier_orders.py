@@ -1,13 +1,8 @@
 """Canonical selection of supplier-order lines for the processing pipe.
 
-The 1C business-operation kind is not synchronized. The strongest currently
-available attribution is the preferred supplier stored on the processing item.
 Callers must only pass items already classified as ``supply_type=processing``.
-
 Items without a configured supplier, drafts, deleted documents, terminal
-orders and fully received lines are excluded. A posted ordinary purchase from
-the same configured contractor remains indistinguishable until operation kind
-is added to the synchronized model.
+orders, fully received lines and ordinary supplier orders are excluded.
 """
 
 from __future__ import annotations
@@ -19,6 +14,20 @@ from sqlalchemy.orm import Session
 
 from ...models import Item, Supplier, SupplierOrder, SupplierOrderItem
 from ..supplier_order_status import state_is_terminal
+
+
+PROCESSING_OPERATION_KEY = "8d96f6a2-9934-11eb-e39a-fa163e61326a"
+
+
+def _is_processing_operation(order: SupplierOrder) -> bool:
+    operation_key = str(order.operation_key or "").strip().lower()
+    operation_name = "".join(
+        char for char in str(order.operation_name or "").casefold() if char.isalnum()
+    )
+    return (
+        operation_key == PROCESSING_OPERATION_KEY
+        or operation_name == "заказнапереработку"
+    )
 
 
 def processing_order_rows(
@@ -51,5 +60,6 @@ def processing_order_rows(
     return [
         (line, order)
         for line, order in rows
-        if not state_is_terminal(order.order_state_name)
+        if _is_processing_operation(order)
+        and not state_is_terminal(order.order_state_name)
     ]
