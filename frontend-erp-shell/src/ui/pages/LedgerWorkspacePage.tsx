@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { useNavigate, useParams } from 'react-router-dom'
 import { dateTimeRu, qty } from '../../lib/format'
 import {
   mockLedgerDataProvider,
@@ -17,7 +18,17 @@ import { DocumentWindow } from '../layout/DocumentWindow'
 
 const initialFilters: LedgerPostingFilters = { search: '', eventType: '', direction: '' }
 
-export function LedgerWorkspacePage({ provider = mockLedgerDataProvider }: { provider?: LedgerDataProvider }) {
+type Props = {
+  provider?: LedgerDataProvider
+  initialPostingId?: string | null
+  onActiveIdChange?: (id: string) => void
+}
+
+export function LedgerWorkspacePage({
+  provider = mockLedgerDataProvider,
+  initialPostingId = null,
+  onActiveIdChange,
+}: Props) {
   const [filters, setFilters] = useState(initialFilters)
   const [appliedFilters, setAppliedFilters] = useState(initialFilters)
   const [snapshot, setSnapshot] = useState<LedgerWorkspaceSnapshot | null>(null)
@@ -26,15 +37,24 @@ export function LedgerWorkspacePage({ provider = mockLedgerDataProvider }: { pro
   const [tab, setTab] = useState<'postings' | 'reconciliation'>('postings')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  const snapshotSequence = useRef(0)
+  const detailSequence = useRef(0)
 
   useEffect(() => {
     const controller = new AbortController()
+    const sequence = ++snapshotSequence.current
     setLoading(true)
     setError('')
     void provider.loadSnapshot(appliedFilters, controller.signal)
       .then((next) => {
+        if (sequence !== snapshotSequence.current) return
         setSnapshot(next)
-        setActiveId((current) => next.postings.some((row) => row.id === current) ? current : next.postings[0]?.id ?? null)
+        setActiveId((current) => {
+          const preferred = initialPostingId && next.postings.some((row) => row.id === initialPostingId)
+            ? initialPostingId
+            : current
+          return next.postings.some((row) => row.id === preferred) ? preferred : next.postings[0]?.id ?? null
+        })
       })
       .catch((reason: unknown) => {
         if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : String(reason))
@@ -43,7 +63,7 @@ export function LedgerWorkspacePage({ provider = mockLedgerDataProvider }: { pro
         if (!controller.signal.aborted) setLoading(false)
       })
     return () => controller.abort()
-  }, [appliedFilters, provider])
+  }, [appliedFilters, initialPostingId, provider])
 
   useEffect(() => {
     if (!activeId) {
@@ -51,8 +71,12 @@ export function LedgerWorkspacePage({ provider = mockLedgerDataProvider }: { pro
       return
     }
     const controller = new AbortController()
+    const sequence = ++detailSequence.current
+    setDetail(null)
     void provider.loadPosting(activeId, controller.signal)
-      .then(setDetail)
+      .then((next) => {
+        if (!controller.signal.aborted && sequence === detailSequence.current) setDetail(next)
+      })
       .catch((reason: unknown) => {
         if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : String(reason))
       })
@@ -63,7 +87,10 @@ export function LedgerWorkspacePage({ provider = mockLedgerDataProvider }: { pro
     () => [...new Set(snapshot?.postings.map((row) => row.eventType) ?? [])],
     [snapshot?.postings],
   )
-  const activate = (posting: LedgerPostingView) => setActiveId(posting.id)
+  const activate = (posting: LedgerPostingView) => {
+    setActiveId(posting.id)
+    onActiveIdChange?.(posting.id)
+  }
 
   return (
     <main className="workArea">
@@ -163,5 +190,16 @@ export function LedgerWorkspacePage({ provider = mockLedgerDataProvider }: { pro
         )}
       </DocumentWindow>
     </main>
+  )
+}
+
+export function LedgerWorkspaceRoute() {
+  const { postingId } = useParams()
+  const navigate = useNavigate()
+  return (
+    <LedgerWorkspacePage
+      initialPostingId={postingId}
+      onActiveIdChange={(id) => navigate(`/ledger/postings/${encodeURIComponent(id)}`)}
+    />
   )
 }

@@ -12,7 +12,7 @@ const DbrProgramsPage = lazy(() => import('./pages/DbrProgramsPage').then((modul
 const DbrPurchasePage = lazy(() => import('./pages/DbrPurchasePage').then((module) => ({ default: module.DbrPurchasePage })))
 const DbrSettingsPage = lazy(() => import('./pages/DbrSettingsPage').then((module) => ({ default: module.DbrSettingsPage })))
 const HomePage = lazy(() => import('./pages/HomePage').then((module) => ({ default: module.HomePage })))
-const LedgerWorkspacePage = lazy(() => import('./pages/LedgerWorkspacePage').then((module) => ({ default: module.LedgerWorkspacePage })))
+const LedgerWorkspaceRoute = lazy(() => import('./pages/LedgerWorkspacePage').then((module) => ({ default: module.LedgerWorkspaceRoute })))
 const MrpResultPage = lazy(() => import('./pages/MrpResultPage').then((module) => ({ default: module.MrpResultPage })))
 const MrpRunsPage = lazy(() => import('./pages/MrpRunsPage').then((module) => ({ default: module.MrpRunsPage })))
 const PeriodPlanPage = lazy(() => import('./pages/PeriodPlanPage').then((module) => ({ default: module.PeriodPlanPage })))
@@ -101,7 +101,8 @@ export function App() {
             <Route path="/transfer-requests" element={guard('material_transfer', <TransferRequestsPage />)} />
             <Route path="/mrp-runs" element={guard('plan_run', <MrpRunsPage />)} />
             <Route path="/mrp-runs/:runId" element={guard('plan_run', <MrpResultPage />)} />
-            <Route path="/ledger" element={guard('ledger', <LedgerWorkspacePage />)} />
+            <Route path="/ledger" element={guard('ledger', <LedgerWorkspaceRoute />)} />
+            <Route path="/ledger/postings/:postingId" element={guard('ledger', <LedgerWorkspaceRoute />)} />
             <Route path="/resources" element={guard('resources', <ResourcesPage />)} />
             <Route path="/workshop-binding-review" element={guard('workshop_binding', <WorkshopBindingReviewPage />)} />
             <Route path="/stage-distribution" element={guard('stage_distribution', <StageDistributionPage />)} />

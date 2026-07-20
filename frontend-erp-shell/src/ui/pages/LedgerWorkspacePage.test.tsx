@@ -36,4 +36,20 @@ describe('LedgerWorkspacePage', () => {
     expect(await screen.findByText('Подшипник ведущего вала')).toBeInTheDocument()
     expect(screen.getByText(/всю каноническую область/)).toBeInTheDocument()
   })
+
+  it('opens a requested posting and ignores an older detail response', async () => {
+    let resolveFirst!: (value: Awaited<ReturnType<LedgerDataProvider['loadPosting']>>) => void
+    const first = new Promise<Awaited<ReturnType<LedgerDataProvider['loadPosting']>>>((resolve) => { resolveFirst = resolve })
+    const provider: LedgerDataProvider = {
+      loadSnapshot: mockLedgerDataProvider.loadSnapshot,
+      loadPosting: vi.fn((id) => id === 'P-1042' ? first : mockLedgerDataProvider.loadPosting(id)),
+    }
+    render(<LedgerWorkspacePage provider={provider} initialPostingId="P-1042" />)
+    await screen.findByRole('row', { name: /Сторно резерва/ })
+    fireEvent.click(screen.getByRole('row', { name: /Сторно резерва/ }))
+    expect(await screen.findByText('Команда сторнирования')).toBeInTheDocument()
+
+    resolveFirst(await mockLedgerDataProvider.loadPosting('P-1042'))
+    await waitFor(() => expect(screen.queryByText('Проверка идемпотентности')).not.toBeInTheDocument())
+  })
 })
