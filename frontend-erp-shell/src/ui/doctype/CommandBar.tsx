@@ -1,6 +1,7 @@
 import type { Doctype } from './types'
 import type { DoctypeListState } from './useDoctypeList'
 import { canRunAction, type AccessSubject } from './permissions'
+import { Button } from '../kit'
 
 type Props<Row, Filters extends object, Detail> = {
   doctype: Doctype<Row, Filters, Detail>
@@ -18,9 +19,9 @@ export function CommandBar<Row, Filters extends object, Detail>({ doctype, state
   return (
     <div className="commandBar">
       {actions.map((action) => (
-        <button
+        <Button
           key={action.key}
-          className={action.tone === 'primary' ? 'primary' : undefined}
+          variant={action.tone === 'primary' ? 'primary' : 'default'}
           title={action.disabledReason?.(state.actionContext)}
           disabled={
             state.loading
@@ -31,14 +32,14 @@ export function CommandBar<Row, Filters extends object, Detail>({ doctype, state
           onClick={() => void state.runAction(action.key)}
         >
           {typeof action.label === 'function' ? action.label(state.actionContext) : action.label}
-        </button>
+        </Button>
       ))}
       {doctype.meta.exportCsv && (
-        <button onClick={onExportCsv} disabled={state.loading || !state.rows.length}>
+        <Button onClick={onExportCsv} disabled={state.loading || !state.rows.length}>
           CSV (текущая страница)
-        </button>
+        </Button>
       )}
-      <button onClick={state.reload} disabled={state.loading}>Обновить</button>
+      <Button onClick={state.reload} disabled={state.loading}>Обновить</Button>
       {doctype.renderExtraToolbar?.(state.actionContext)}
     </div>
   )

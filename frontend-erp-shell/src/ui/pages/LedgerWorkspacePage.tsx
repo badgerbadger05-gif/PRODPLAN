@@ -16,6 +16,7 @@ import {
   type LedgerPostingView,
 } from '../ledger'
 import { DocumentWindow } from '../layout/DocumentWindow'
+import { Button } from '../kit'
 
 const initialFilters: LedgerPostingFilters = { search: '', eventType: '', direction: '' }
 
@@ -111,12 +112,12 @@ export function LedgerWorkspacePage({
         )}
       >
         <div className="toolbar ledgerToolbar">
-          <button className={tab === 'postings' ? 'primary' : ''} onClick={() => setTab('postings')}>Проводки</button>
-          <button className={tab === 'reconciliation' ? 'primary' : ''} onClick={() => setTab('reconciliation')}>
+          <Button variant={tab === 'postings' ? 'primary' : 'default'} onClick={() => setTab('postings')}>Проводки</Button>
+          <Button variant={tab === 'reconciliation' ? 'primary' : 'default'} onClick={() => setTab('reconciliation')}>
             Сверка {snapshot?.issues.length ? `(${snapshot.issues.length})` : ''}
-          </button>
+          </Button>
           <span className="toolbarSpacer" />
-          <button onClick={() => setAppliedFilters({ ...filters })}>Обновить</button>
+          <Button onClick={() => setAppliedFilters({ ...filters })}>Обновить</Button>
         </div>
         {tab === 'postings' && (
           <>
@@ -154,7 +155,7 @@ export function LedgerWorkspacePage({
                   <option value="issue">Расход</option>
                 </select>
               </label>
-              <button type="submit">Найти</button>
+              <Button type="submit">Найти</Button>
             </form>
             {error && <div className="errorLine" role="alert">{error}</div>}
             <div className="ledgerSplit">

@@ -1,5 +1,6 @@
 import { dateTimeRu, qty } from '../../lib/format'
 import type { ReconciliationIssueView } from './types'
+import { StatusBadge } from '../kit'
 
 const severityLabels = {
   info: 'Информация',
@@ -31,7 +32,7 @@ export function ReconciliationIssuesTable({ rows }: { rows: ReconciliationIssueV
       <tbody>
         {rows.map((row) => (
           <tr key={row.id}>
-            <td><span className={`pill ${row.severity === 'error' ? 'shortage' : row.severity === 'warning' ? 'to_move' : ''}`}>{severityLabels[row.severity]}</span></td>
+            <td><StatusBadge tone={row.severity === 'error' ? 'shortage' : row.severity === 'warning' ? 'to_move' : ''}>{severityLabels[row.severity]}</StatusBadge></td>
             <td>{row.itemLabel}</td>
             <td><code>{row.poolKey}</code></td>
             <td className="numCell">{qty(row.ledgerQuantity)}</td>
@@ -48,4 +49,3 @@ export function ReconciliationIssuesTable({ rows }: { rows: ReconciliationIssueV
     </table>
   )
 }
-
