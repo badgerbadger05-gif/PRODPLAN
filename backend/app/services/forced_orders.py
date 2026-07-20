@@ -23,6 +23,9 @@ from .order_quantity_calculator import OrderQuantityCalculator
 from .planning_service import DEFAULT_PLANNING_CONFIG, get_active_planning_config
 
 
+# NOTE: kept local (not app.utils.dates.to_date): this variant RAISES on bad
+# input instead of returning None, does not handle datetime, and parses the
+# full string (no [:10] truncation). Different contract; preserved as-is.
 def _to_date(val: Any) -> dt_date:
     if isinstance(val, dt_date):
         return val

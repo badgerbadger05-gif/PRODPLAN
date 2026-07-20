@@ -54,24 +54,8 @@ from .workshop_resolution import default_spec_ids_for_items, resolve_workshop_fo
 WELD_RESOURCE_ID_FALLBACK = 2
 
 
-def _to_float(value: Any) -> float:
-    try:
-        return float(value or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _parse_date(value: Any) -> Optional[date]:
-    if value is None or value == "":
-        return None
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    try:
-        return date.fromisoformat(str(value)[:10])
-    except Exception:
-        return None
+from app.utils.numeric import to_float as _to_float
+from app.utils.dates import parse_date as _parse_date
 
 
 def _default_spec_id(db: Session, item_id: int) -> Optional[int]:

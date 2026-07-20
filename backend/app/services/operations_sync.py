@@ -14,6 +14,9 @@ def _s(val: Any) -> str:
     return str(val or "").strip()
 
 
+# NOTE: kept local (not app.utils.numeric.to_float): this variant strips RU
+# locale separators (comma decimal + nbsp/space thousands) before parsing, so
+# it accepts "1 234,56" -> 1234.56 where the shared to_float would fall back.
 def _to_float(val: Any, default: float = 0.0) -> float:
     if val is None:
         return default

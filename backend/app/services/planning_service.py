@@ -544,6 +544,9 @@ def get_active_planning_config_full(db: Session) -> Dict[str, Any]:
         "created_at": rec.created_at.isoformat() if getattr(rec, "created_at", None) else None,
     }
 
+# NOTE: kept local (not app.utils.dates.to_date): this variant RAISES on bad
+# input instead of returning None and handles a trailing "Z" UTC suffix.
+# Different contract; preserved as-is.
 def _to_date(val: Any) -> date:
     """Robustly convert string/datetime to date object"""
     if isinstance(val, date):

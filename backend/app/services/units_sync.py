@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, Optional
-from decimal import Decimal, InvalidOperation
 
 from sqlalchemy.orm import Session
 
@@ -14,15 +13,7 @@ UNIT_CLASSIFIER_ENTITY = "Catalog_КлассификаторЕдиницИзме
 UNIT_ENTITY = "Catalog_ЕдиницыИзмерения"
 
 
-def _to_float(val: Any, default: float = 0.0) -> float:
-    try:
-        if val is None:
-            return float(default)
-        if isinstance(val, (int, float)):
-            return float(val)
-        return float(Decimal(str(val)))
-    except (InvalidOperation, ValueError, TypeError):
-        return float(default)
+from app.utils.numeric import to_float as _to_float
 
 
 def _to_int(val: Any, default: Optional[int] = None) -> Optional[int]:

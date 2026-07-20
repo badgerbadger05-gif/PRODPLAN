@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import or_
 import logging
 logger = logging.getLogger("specification")
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 import base64
 import io
 import re
@@ -28,15 +28,7 @@ router = APIRouter(prefix="/v1/specification", tags=["specification"])
 
 # ------- helpers
 
-def _to_float(val: Any, default: float = 0.0) -> float:
-    try:
-        if val is None:
-            return float(default)
-        if isinstance(val, (int, float)):
-            return float(val)
-        return float(Decimal(str(val)))
-    except (InvalidOperation, ValueError, TypeError):
-        return float(default)
+from app.utils.numeric import to_float as _to_float
 
 
 def _round_qty(val: float, places: int = 3) -> float:

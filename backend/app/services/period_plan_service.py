@@ -62,6 +62,9 @@ _DIRECT_1C_PRODUCTION_HORIZON = date(2026, 5, 1)
 _SUPPLIER_ORDER_DONE_STATES = {"принят на склад"}
 
 
+# NOTE: kept local (not app.utils.dates.parse_date): this variant RAISES
+# ValueError("Invalid {field}") on bad input instead of returning None, and
+# returns a non-optional date. Different contract; preserved as-is.
 def _parse_date(value: Any, field: str = "date") -> date:
     if isinstance(value, date) and not isinstance(value, datetime):
         return value
@@ -73,11 +76,7 @@ def _parse_date(value: Any, field: str = "date") -> date:
         raise ValueError(f"Invalid {field}") from exc
 
 
-def _to_float(value: Any) -> float:
-    try:
-        return float(value or 0.0)
-    except Exception:
-        return 0.0
+from app.utils.numeric import to_float as _to_float
 
 
 def _date_to_iso(value: Any) -> Optional[str]:

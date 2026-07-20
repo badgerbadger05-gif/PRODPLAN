@@ -53,24 +53,8 @@ def _order_is_active(order: SupplierOrder) -> bool:
     return not _supplier_order_state_is_terminal(order.order_state_name)
 
 
-def _to_float(value: Any) -> float:
-    try:
-        return float(value or 0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _to_date(value: Any) -> Optional[date]:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    try:
-        return date.fromisoformat(str(value)[:10])
-    except ValueError:
-        return None
+from app.utils.numeric import to_float as _to_float
+from app.utils.dates import to_date as _to_date
 
 
 def _date_to_iso(value: Any) -> Optional[str]:
@@ -78,13 +62,7 @@ def _date_to_iso(value: Any) -> Optional[str]:
     return d.isoformat() if d else None
 
 
-def _parse_date(value: Optional[str]) -> Optional[date]:
-    if not value:
-        return None
-    try:
-        return date.fromisoformat(str(value)[:10])
-    except ValueError:
-        return None
+from app.utils.dates import parse_date as _parse_date
 
 
 def _line_status(

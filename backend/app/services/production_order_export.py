@@ -15,6 +15,9 @@ from sqlalchemy.orm import Session, joinedload
 from ..models import ProductionOrder, ProductionProduct, Item
 
 
+# NOTE: kept local (not app.utils.guid.norm_guid): this variant intentionally
+# does NOT strip surrounding single quotes, so it diverges from the shared
+# norm_guid. Preserved as-is to keep export output identical.
 def _norm_guid(val) -> str:
     """Нормализация GUID для сравнения (lowercase, без фигурных скобок и обёрток)."""
     s = str(val or "").strip().lower()

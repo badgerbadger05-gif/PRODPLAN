@@ -38,17 +38,7 @@ def _parse_1c_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
-def _norm_guid(value: Any) -> str:
-    s = str(value or "").strip().lower()
-    if not s:
-        return ""
-    if s.startswith("{") and s.endswith("}"):
-        s = s[1:-1].strip()
-    if s.startswith("guid'") and s.endswith("'"):
-        s = s[len("guid'") : -1].strip()
-    if s.startswith("'") and s.endswith("'"):
-        s = s[1:-1].strip()
-    return s
+from app.utils.guid import norm_guid as _norm_guid
 
 
 def _parse_datetime(value: Any) -> Optional[datetime]:
@@ -64,11 +54,7 @@ def _parse_datetime(value: Any) -> Optional[datetime]:
     return None
 
 
-def _to_float(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value or 0.0)
-    except Exception:
-        return default
+from app.utils.numeric import to_float as _to_float
 
 
 def _is_zero_guid(value: Any) -> bool:

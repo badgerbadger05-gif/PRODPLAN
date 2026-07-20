@@ -66,11 +66,7 @@ def _week_dates(week_start: date) -> List[date]:
     return [date.fromordinal(week_start.toordinal() + i) for i in range(7)]
 
 
-def _to_float(v: Any) -> float:
-    try:
-        return float(v or 0.0)
-    except Exception:
-        return 0.0
+from app.utils.numeric import to_float as _to_float
 
 
 def _strip_carry_notes(notes: Optional[str]) -> Optional[str]:

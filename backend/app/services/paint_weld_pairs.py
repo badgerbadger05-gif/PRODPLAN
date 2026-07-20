@@ -46,11 +46,7 @@ UNPAIRED_NO_ASSEMBLY = "no_assembly_component"
 UNPAIRED_MULTIPLE_ASSEMBLY = "multiple_assembly_components"
 
 
-def _to_float(value: Any) -> float:
-    try:
-        return float(value or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
+from app.utils.numeric import to_float as _to_float
 
 
 def _name_has(name: Optional[str], markers: Iterable[str]) -> bool:

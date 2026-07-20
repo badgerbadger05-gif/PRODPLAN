@@ -93,21 +93,7 @@ def _parse_1c_bool(val, default: bool = False) -> bool:
     return default
 
 
-def _norm_guid(val) -> str:
-    """Нормализация GUID для сравнения (lowercase, без фигурных скобок, кавычек и обёрток)."""
-    s = str(val or "").strip().lower()
-    if not s:
-        return ""
-    # {xxxxxxxx-xxxx-...}
-    if s.startswith("{") and s.endswith("}"):
-        s = s[1:-1].strip()
-    # guid'xxxxxxxx-xxxx-...'
-    if s.startswith("guid'") and s.endswith("'"):
-        s = s[len("guid'") : -1].strip()
-    # 'xxxxxxxx-xxxx-...' (1С возвращает GUID в одинарных кавычках)
-    if s.startswith("'") and s.endswith("'"):
-        s = s[1:-1].strip()
-    return s
+from app.utils.guid import norm_guid as _norm_guid
 
 
 def _nonzero_guid(val) -> Optional[str]:
