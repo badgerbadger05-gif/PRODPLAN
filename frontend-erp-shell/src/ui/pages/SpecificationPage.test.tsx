@@ -248,6 +248,41 @@ describe('SpecificationPage characterization', () => {
     expect(getSpecificationQuality).toHaveBeenCalledWith({ item_id: 100, max_depth: 20 })
   })
 
+  it('supports roving keyboard selection across the specification tree', async () => {
+    const user = userEvent.setup()
+    vi.mocked(searchSpecificationItems).mockResolvedValue({ items: [pump], meta: { count: 1 } })
+    renderPage()
+
+    await searchFor(user, 'НАС-01')
+    expect(await screen.findByText('Загружено: НАС-01 · Насос ГА-1')).toBeVisible()
+
+    const tree = document.querySelector('.bomTreeTable')
+    expect(tree).not.toBeNull()
+    const [rootRow, bearingRow, operationRow] = within(tree as HTMLElement).getAllByRole('row').slice(1)
+
+    expect(rootRow).toHaveAttribute('tabindex', '0')
+    expect(rootRow).toHaveAttribute('aria-selected', 'true')
+    expect(bearingRow).toHaveAttribute('tabindex', '-1')
+    expect(operationRow).toHaveAttribute('tabindex', '-1')
+
+    rootRow.focus()
+    await user.keyboard('{ArrowDown}')
+    expect(bearingRow).toHaveFocus()
+    expect(bearingRow).toHaveAttribute('aria-selected', 'true')
+    expect(rootRow).toHaveAttribute('aria-selected', 'false')
+    expect(screen.getByRole('heading', { name: 'ПД-01 · Подшипник' })).toBeVisible()
+
+    await user.keyboard('{End}')
+    expect(operationRow).toHaveFocus()
+    expect(operationRow).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByRole('heading', { name: 'Токарная операция' })).toBeVisible()
+
+    await user.keyboard('{Home}')
+    expect(rootRow).toHaveFocus()
+    expect(rootRow).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByRole('heading', { name: 'НАС-01 · Насос ГА-1' })).toBeVisible()
+  })
+
   it('preserves tab, tree and replenishment-method filters and exports XLSX', async () => {
     const user = userEvent.setup()
     vi.mocked(searchSpecificationItems).mockResolvedValue({ items: [pump], meta: { count: 1 } })
