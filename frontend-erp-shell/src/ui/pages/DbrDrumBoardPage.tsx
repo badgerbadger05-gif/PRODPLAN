@@ -23,25 +23,16 @@ import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
 import { DbrConfirmDialog } from '../dbr/DbrConfirmDialog'
 import { DbrNav } from '../dbr/DbrNav'
-
-const KIT_CLASS: Record<string, string> = {
-  green: 'kitGreen',
-  yellow: 'kitYellow',
-  red: 'kitRed',
-  unknown: 'kitUnknown',
-}
-
-function isWeekend(iso: string) {
-  const day = new Date(`${iso}T00:00:00`).getDay()
-  return day === 0 || day === 6
-}
-
-function dayLabel(iso: string) {
-  const date = new Date(`${iso}T00:00:00`)
-  const weekday = date.toLocaleDateString('ru-RU', { weekday: 'short' })
-  const parts = iso.split('-')
-  return `${parts[2]}.${parts[1]} ${weekday}`
-}
+import {
+  dayLabel,
+  drumSlotReleaseState,
+  drumSlotShortageTitle,
+  groupDrumSlotsByCell,
+  indexDrumSlotsById,
+  isWeekend,
+  KIT_CLASS,
+  releaseResultText,
+} from './dbr-drum-board/model'
 
 export function DbrDrumBoardPage() {
   const [board, setBoard] = useState<DbrBoard | null>(null)
@@ -99,20 +90,11 @@ export function DbrDrumBoardPage() {
   const today = isoToday()
 
   const slotsByCell = useMemo(() => {
-    const map = new Map<string, DbrBoardSlot[]>()
-    for (const slot of board?.slots ?? []) {
-      const key = `${slot.resource_id}::${slot.date}`
-      const bucket = map.get(key)
-      if (bucket) bucket.push(slot)
-      else map.set(key, [slot])
-    }
-    return map
+    return groupDrumSlotsByCell(board?.slots ?? [])
   }, [board])
 
   const slotById = useMemo(() => {
-    const map = new Map<number, DbrBoardSlot>()
-    for (const slot of board?.slots ?? []) map.set(slot.id, slot)
-    return map
+    return indexDrumSlotsById(board?.slots ?? [])
   }, [board])
 
   function openSlot(slot: DbrBoardSlot) {
@@ -421,10 +403,8 @@ export function DbrDrumBoardPage() {
                         <td key={day} className={`dbrDayCol${isWeekend(day) ? ' weekend' : ''}${day === today ? ' today' : ''}`}>
                           <div className="dbrCell">
                             {slots.map((slot) => {
-                              const shortageText = (slot.shortage ?? [])
-                                .map((s) => `${s.item}: нужно ${qty(s.required)}, есть ${qty(s.available)}${s.warehouse ? ` (${s.warehouse})` : ''}`)
-                                .join('\n')
-                              const released = slot.release_status === 'released' || slot.release_status === 'completed'
+                              const shortageText = drumSlotShortageTitle(slot)
+                              const released = drumSlotReleaseState(slot).alreadyReleased
                               return (
                                 <button
                                   type="button"
@@ -548,9 +528,7 @@ export function DbrDrumBoardPage() {
               </div>
 
               {(() => {
-                const status = selectedSlot.release_status || 'pending'
-                const alreadyReleased = status === 'released' || status === 'completed'
-                const canRelease = selectedSlot.kit_status === 'green' && status === 'pending'
+                const { alreadyReleased, canRelease } = drumSlotReleaseState(selectedSlot)
                 return (
                   <div className="fieldHint">
                     {alreadyReleased
@@ -723,16 +701,7 @@ export function DbrDrumBoardPage() {
                           {report.results.map((r) => {
                             const s = slotById.get(r.slot_id)
                             const fail = Boolean(r.conflict || r.error)
-                            let text: string
-                            if (r.conflict) text = `Отказ: ${r.conflict}`
-                            else if (r.error) text = `Ошибка: ${r.error}`
-                            else if (dayModal.phase === 'done') {
-                              text = r.created
-                                ? `Заказ № ${r.number}`
-                                : r.already_released
-                                  ? `Уже создан № ${r.number}`
-                                  : (r.note ?? 'готово')
-                            } else text = 'готов к релизу'
+                            const text = releaseResultText(r, dayModal.phase === 'done')
                             return (
                               <tr key={r.slot_id} className={fail ? 'dbrGapRow' : undefined}>
                                 <td>№{r.slot_id}</td>
