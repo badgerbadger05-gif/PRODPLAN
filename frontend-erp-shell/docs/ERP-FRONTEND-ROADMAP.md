@@ -47,11 +47,24 @@ ERP shell
 - Resource registry для shell и route-level lazy loading.
 - Frontend CI: generated API drift, lint, tests, production build.
 - Lint приведён к нулю; устранён незакрытый timer в тестах Period Plan.
+- Добавлены mock-first session shell, lazy resource registry и frontend-гейты
+  resource/action/record/field; реальная безопасность ожидает backend auth/RBAC.
+- Реализованы personal/default saved views, выбор колонок, плотность и
+  версионированные URL-представления; shared views ожидают backend storage.
+- Добавлены bulk actions текущей страницы и RBAC-aware CSV с защитой от formula
+  injection; полный отфильтрованный export остаётся серверной операцией.
+- Ledger workspace покрывает mock/provider-контракт проводок, provenance,
+  сторно, сверку и аудит; реальные данные ожидают ledger API.
+- DialogHost поддерживает Escape, возврат и циклическое удержание фокуса;
+  таблицы и сообщения имеют keyboard/ARIA-контракты.
+- Hermetic Playwright smoke и route bundle budgets включены в quality gates.
 
 ## Следующие вертикальные срезы
 
 ### 1. Purchase Control
 
+- Статус: частично мигрирован на `useDoctypeList`; полный переход на
+  `DoctypePage` и удаление старой механики остаются ближайшей frontend-задачей.
 - typed list metadata: summary, phases, suppliers, states, latest run;
 - URL/deep-link filters;
 - selection predicate и select-all только для допустимых строк;
@@ -92,6 +105,9 @@ ERP shell
 - reconciliation cycles and discrepancies;
 - reversal chain;
 - audit timeline with actor, time, action, diff, source and correlation id.
+
+Frontend-компоненты и mock/provider boundary для этих представлений уже есть;
+срез не считается продуктово завершённым до подключения backend-контракта.
 
 ### 5. Production hardening
 
