@@ -68,6 +68,46 @@ describe('useDoctypeList', () => {
     await waitFor(() => expect(doctype.dataSource.list).toHaveBeenCalledTimes(2))
   })
 
+  it('passes list metadata to actions and clears selection on request', async () => {
+    const doctype = createDoctype()
+    doctype.meta.selectionMode = 'multiple'
+    doctype.dataSource.list = vi.fn(async () => ({
+      rows: [
+        { id: 1, title: 'Первая' },
+        { id: 2, title: 'Вторая' },
+      ],
+      total: 2,
+      run_id: 17,
+    }))
+    const action = vi.fn(async () => ({
+      message: 'Обработано',
+      clearSelection: true,
+    }))
+    doctype.actions = [{
+      key: 'process',
+      label: 'Обработать',
+      scope: 'selection',
+      run: action,
+    }]
+    const { result } = renderHook(() => useDoctypeList(doctype, { access }))
+    await waitFor(() => expect(result.current.listMeta.run_id).toBe(17))
+
+    act(() => result.current.setVisibleSelection(true))
+    expect(result.current.selection.map((row) => row.id)).toEqual([1, 2])
+
+    await act(async () => result.current.runAction('process'))
+
+    expect(action).toHaveBeenCalledWith(expect.objectContaining({
+      listMeta: expect.objectContaining({ run_id: 17 }),
+      selection: [
+        expect.objectContaining({ id: 1 }),
+        expect.objectContaining({ id: 2 }),
+      ],
+    }))
+    expect(result.current.selectedIds.size).toBe(0)
+    expect(result.current.selection).toEqual([])
+  })
+
   it('does not load or run protected resources without access', async () => {
     const doctype = createDoctype()
     doctype.permissions = {
