@@ -55,8 +55,10 @@ dist/
 /test_export.json
 /test_output.txt
 /0
-/output/pdf/
+/output/
 /outputs/
+/screenshots/
+/config/odata_config.json
 
 # OS generated files
 .DS_Store
