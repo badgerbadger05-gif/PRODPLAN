@@ -1,3 +1,6 @@
+import type { PurchaseFilters, PurchaseRow } from '../../../domain/purchaseControl'
+import { listPurchaseJournal } from '../../../services/purchaseControl'
+import type { Doctype } from '../../doctype'
 import type { TableColumnDoctype } from '../../tableDoctype'
 
 export const purchaseOrderColumns = [
@@ -15,3 +18,67 @@ export const purchaseOrderColumns = [
 
 export type PurchaseOrderColumnKey = typeof purchaseOrderColumns[number]['key']
 export type PurchaseOrderSortKey = Extract<PurchaseOrderColumnKey, 'delivery_date' | 'order'>
+
+export function createPurchaseOrdersDoctype(
+  focus: { orderId?: string | null; search?: string | null } = {},
+): Doctype<PurchaseRow, PurchaseFilters> {
+  return {
+    meta: {
+      name: 'purchase_order',
+      title: 'Журнал закупок',
+      subtitle: 'Заказы поставщику из 1С и незаказанные MRP-потребности: сроки, поступления, просрочка',
+      hotkeys: 'F5 Обновить · Enter Детали',
+      idField: 'row_key',
+      selectionMode: 'multiple',
+    },
+    initialFilters: {
+      search: focus.search ?? '',
+      supplier_id: '',
+      line_status: '',
+      state: '',
+      phase: '',
+      active_only: true,
+      sort_by: 'delivery_date',
+      sort_dir: 'asc',
+    },
+    dataSource: {
+      async list({ limit, offset, filters, sortBy, sortDir }) {
+        const params = new URLSearchParams({
+          limit: String(limit),
+          offset: String(offset),
+          active_only: filters.active_only ? 'true' : 'false',
+          sort_by: sortBy === 'order' ? 'order_date' : sortBy === 'delivery_date' ? 'delivery_date' : filters.sort_by,
+          sort_dir: sortDir ?? filters.sort_dir,
+        })
+        if (focus.orderId) params.set('order_id', focus.orderId)
+        if (filters.search) params.set('search', filters.search)
+        if (filters.supplier_id) params.set('supplier_id', filters.supplier_id)
+        if (filters.line_status) params.set('line_status', filters.line_status)
+        if (filters.state) params.set('state', filters.state)
+        if (filters.phase) params.set('phase', filters.phase)
+        return listPurchaseJournal(params)
+      },
+    },
+    // The journal keeps its proven dense table renderer. These declarations remain
+    // the shared sizing/sorting contract and make the resource discoverable by the ERP registry.
+    columns: purchaseOrderColumns.map((column) => ({
+      ...column,
+      type: column.key === 'select' ? 'select-checkbox' as const : undefined,
+    })),
+    filters: [
+      { kind: 'search', field: 'search', mode: 'submit' },
+      { kind: 'select', field: 'supplier_id', label: 'Поставщик', options: [], allowEmpty: true },
+      { kind: 'select', field: 'phase', label: 'Фаза', options: [], allowEmpty: true },
+      { kind: 'toggle', field: 'active_only', label: 'Активные' },
+      { kind: 'select', field: 'state', label: 'Статус 1С', options: [], allowEmpty: true },
+      { kind: 'select', field: 'line_status', label: 'Статус', options: [], allowEmpty: true },
+    ],
+    permissions: {
+      view: ['viewer', 'buyer', 'planner', 'admin'],
+      actions: {
+        export_1c: 'purchase.export_1c',
+        sync_1c: 'purchase.sync_1c',
+      },
+    },
+  }
+}
