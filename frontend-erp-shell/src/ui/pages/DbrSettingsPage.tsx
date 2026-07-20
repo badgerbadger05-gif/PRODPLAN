@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type {
   DbrAssemblyRate,
@@ -65,8 +65,11 @@ export function DbrSettingsPage() {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
+  const loadSequence = useRef(0)
+  const mutationInFlight = useRef(false)
 
   const load = useCallback(async () => {
+    const sequence = ++loadSequence.current
     setLoading(true)
     setError('')
     setMessage('')
@@ -77,14 +80,16 @@ export function DbrSettingsPage() {
         listDbrCategoryRisks(),
         listResources(),
       ])
+      if (sequence !== loadSequence.current) return
       setForm(toForm(settings))
       setRates(rateRows)
       setRisks(riskRows)
       setResources(resourceRows)
     } catch (e) {
+      if (sequence !== loadSequence.current) return
       setError(e instanceof Error ? e.message : String(e))
     } finally {
-      setLoading(false)
+      if (sequence === loadSequence.current) setLoading(false)
     }
   }, [])
 
@@ -96,11 +101,23 @@ export function DbrSettingsPage() {
     setForm((prev) => (prev ? { ...prev, ...next } : prev))
   }
 
-  async function saveSettings() {
-    if (!form) return
+  function beginMutation() {
+    if (mutationInFlight.current) return false
+    mutationInFlight.current = true
     setSaving(true)
     setError('')
     setMessage('')
+    return true
+  }
+
+  function endMutation() {
+    mutationInFlight.current = false
+    setSaving(false)
+  }
+
+  async function saveSettings() {
+    if (!form) return
+    if (!beginMutation()) return
     try {
       const payload: DbrSettingsUpdate = {
         ...form,
@@ -118,7 +135,7 @@ export function DbrSettingsPage() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
-      setSaving(false)
+      endMutation()
     }
   }
 
@@ -134,9 +151,7 @@ export function DbrSettingsPage() {
       setError('Такт сборки должен быть больше нуля')
       return
     }
-    setSaving(true)
-    setError('')
-    setMessage('')
+    if (!beginMutation()) return
     try {
       await upsertDbrAssemblyRate({ resource_id: resourceId, item_id: itemId, qty_per_capacity: qtyPer })
       setRates(await listDbrAssemblyRates())
@@ -146,14 +161,12 @@ export function DbrSettingsPage() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
-      setSaving(false)
+      endMutation()
     }
   }
 
   async function removeRate(id: number) {
-    setSaving(true)
-    setError('')
-    setMessage('')
+    if (!beginMutation()) return
     try {
       await deleteDbrAssemblyRate(id)
       setRates((prev) => prev.filter((r) => r.id !== id))
@@ -161,7 +174,7 @@ export function DbrSettingsPage() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
-      setSaving(false)
+      endMutation()
     }
   }
 
@@ -178,9 +191,7 @@ export function DbrSettingsPage() {
   }
 
   async function saveRisks() {
-    setSaving(true)
-    setError('')
-    setMessage('')
+    if (!beginMutation()) return
     try {
       const rows = risks
         .map((r) => ({
@@ -198,7 +209,7 @@ export function DbrSettingsPage() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
-      setSaving(false)
+      endMutation()
     }
   }
 

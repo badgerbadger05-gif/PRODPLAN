@@ -1,5 +1,6 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { StrictMode } from 'react'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { DbrAssemblyRate, DbrCategoryRisk, DbrSettings } from '../../domain/dbr'
@@ -86,6 +87,14 @@ function renderPage() {
   )
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise
+  })
+  return { promise, resolve }
+}
+
 describe('DbrSettingsPage characterization', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -151,6 +160,61 @@ describe('DbrSettingsPage characterization', () => {
     expect(listDbrCategoryRisks).toHaveBeenCalledTimes(2)
     expect(listResources).toHaveBeenCalledTimes(2)
     expect(screen.queryByText('settings unavailable')).not.toBeInTheDocument()
+  })
+
+  it('keeps the newest load when StrictMode starts two reads and the older one resolves last', async () => {
+    const oldSettings = deferred<DbrSettings>()
+    const newSettings = deferred<DbrSettings>()
+    vi.mocked(getDbrSettings)
+      .mockReturnValueOnce(oldSettings.promise)
+      .mockReturnValueOnce(newSettings.promise)
+    vi.mocked(listDbrAssemblyRates)
+      .mockResolvedValueOnce([{ ...rate, id: 1, item_name: 'Старый такт' }])
+      .mockResolvedValueOnce([{ ...rate, id: 2, item_name: 'Новый такт' }])
+
+    render(
+      <StrictMode>
+        <MemoryRouter>
+          <DbrSettingsPage />
+        </MemoryRouter>
+      </StrictMode>,
+    )
+
+    await waitFor(() => expect(getDbrSettings).toHaveBeenCalledTimes(2))
+    await act(async () => {
+      newSettings.resolve({ ...settings, shelf_threshold_qty: 99 })
+    })
+    expect(await screen.findByDisplayValue('99')).toBeInTheDocument()
+    expect(screen.getByText('Новый такт')).toBeInTheDocument()
+
+    await act(async () => {
+      oldSettings.resolve({ ...settings, shelf_threshold_qty: 1 })
+    })
+    await waitFor(() => expect(screen.getByDisplayValue('99')).toBeInTheDocument())
+    expect(screen.getByText('Новый такт')).toBeInTheDocument()
+    expect(screen.queryByText('Старый такт')).not.toBeInTheDocument()
+  })
+
+  it('allows only one settings mutation while competing commands are fired together', async () => {
+    const pendingSave = deferred<DbrSettings>()
+    vi.mocked(updateDbrSettings).mockReturnValueOnce(pendingSave.promise)
+    renderPage()
+    await screen.findByDisplayValue('12.5')
+
+    act(() => {
+      fireEvent.click(screen.getByRole('button', { name: 'Сохранить настройки' }))
+      fireEvent.click(screen.getAllByRole('button', { name: 'Удалить' })[0])
+      fireEvent.click(screen.getByRole('button', { name: 'Сохранить риски' }))
+    })
+
+    expect(updateDbrSettings).toHaveBeenCalledOnce()
+    expect(deleteDbrAssemblyRate).not.toHaveBeenCalled()
+    expect(replaceDbrCategoryRisks).not.toHaveBeenCalled()
+
+    await act(async () => {
+      pendingSave.resolve(settings)
+    })
+    expect(await screen.findByText('Настройки сохранены')).toBeInTheDocument()
   })
 
   it('validates and saves an assembly rate, then refreshes the rate list', async () => {
