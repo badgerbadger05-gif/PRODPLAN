@@ -576,6 +576,9 @@ export type DbrFeederDeficitsResult = {
 
 // ── Давальческий контур переработки (питатель №3, фаза 4) ───────────────────
 export type DbrProcessingOrder = {
+  order_id: number
+  line_id: number
+  line_number?: number | null
   order_number: string
   order_date?: string | null
   remaining_qty: number

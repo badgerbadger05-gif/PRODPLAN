@@ -12,6 +12,7 @@ from ...models import (
     DbrSupermarketPosition,
     DefaultSpecification,
     IgnoredWarehouse,
+    Item,
     ItemWarehouseStock,
     ProductionOrder,
     ProductionProduct,
@@ -22,6 +23,7 @@ from ...models import (
 )
 from ..production_control_reservations import load_reservation_state
 from .core.feeder import zones
+from .processing_supplier_orders import processing_order_rows
 
 # Тип «переработка» (давальческий питатель №3) в NFP считается закупной
 # механикой: общезаводской остаток покрытой + открытые заказы переработчику
@@ -142,8 +144,7 @@ def _open_supply(
     purchase_as_of: dict[tuple[int, str], datetime | None] = {}
     purchase_null: dict[int, int] = {}
     purchase_null_as_of: dict[int, datetime | None] = {}
-    # Итог по позиции без разреза склада-назначения: для переработки «в трубе»
-    # считается весь открытый заказ переработчику, куда бы он ни приходовался.
+    # Итог по processing-позиции без разреза склада-назначения.
     purchase_total: dict[int, float] = {}
     purchase_total_as_of: dict[int, datetime | None] = {}
     for line, order in (
@@ -161,8 +162,6 @@ def _open_supply(
         item_id = int(line.item_id_ref)
         destination = _normalize_ref(line.destination_warehouse_ref1c)
         source_as_of = _latest(line.updated_at, order.updated_at)
-        purchase_total[item_id] = purchase_total.get(item_id, 0.0) + float(line.remaining_qty or 0)
-        purchase_total_as_of[item_id] = _latest(purchase_total_as_of.get(item_id), source_as_of)
         if not destination:
             purchase_null[item_id] = purchase_null.get(item_id, 0) + 1
             purchase_null_as_of[item_id] = _latest(
@@ -172,6 +171,20 @@ def _open_supply(
         key = (item_id, destination)
         purchase[key] = purchase.get(key, 0.0) + float(line.remaining_qty or 0)
         purchase_as_of[key] = _latest(purchase_as_of.get(key), source_as_of)
+
+    processing_item_ids = {
+        int(position.item_id)
+        for position in positions
+        if position.supply_type == "processing"
+    }
+    for line, order in processing_order_rows(db, processing_item_ids):
+        item_id = int(line.item_id_ref)
+        purchase_total[item_id] = purchase_total.get(item_id, 0.0) + float(
+            line.remaining_qty or 0
+        )
+        purchase_total_as_of[item_id] = _latest(
+            purchase_total_as_of.get(item_id), _latest(line.updated_at, order.updated_at)
+        )
 
     values: dict[int, float] = {}
     null_counts: dict[int, int] = {}
@@ -308,6 +321,22 @@ def live_nfp_rows(db: Session, positions: Iterable[DbrSupermarketPosition]) -> d
         .scalar()
     )
     now = datetime.now()
+    processing_item_ids = {
+        int(position.item_id)
+        for position in positions
+        if position.supply_type == "processing"
+    }
+    processing_items_without_supplier = {
+        int(item_id)
+        for item_id, supplier_ref in (
+            db.query(Item.item_id, Item.supplier_ref1c)
+            .filter(Item.item_id.in_(processing_item_ids))
+            .all()
+            if processing_item_ids
+            else []
+        )
+        if not str(supplier_ref or "").strip()
+    }
     result: dict[int, dict[str, Any]] = {}
     for position in positions:
         position_id = int(position.id)
@@ -333,6 +362,14 @@ def live_nfp_rows(db: Session, positions: Iterable[DbrSupermarketPosition]) -> d
         )
         missing_reasons: list[str] = []
         quality = list(position.data_quality or [])
+        if (
+            position.supply_type == "processing"
+            and item_id in processing_items_without_supplier
+        ):
+            missing_reasons.append("processing_supplier_missing")
+            quality.append(
+                "processing item has no supplier_ref1c; supplier orders are excluded"
+            )
         if chain_notes.get(position_id):
             missing_reasons.append("processing_bare_component_unresolved")
             quality.extend(chain_notes[position_id])

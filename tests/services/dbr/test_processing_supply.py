@@ -23,6 +23,7 @@ from app.models import (
     SpecComponent,
     Specification,
     StockWarehouse,
+    Supplier,
     SupplierOrder,
     SupplierOrderItem,
 )
@@ -66,6 +67,7 @@ def _processing_scenario(db):
     coated = Item(
         item_code="COATED",
         item_name="Замок, гальваника",
+        supplier_ref1c="CONTRACTOR-1",
         replenishment_method="Переработка",
     )
     bare = Item(item_code="BARE", item_name="Замок голый", replenishment_method="Производство")
@@ -175,10 +177,20 @@ def _processing_position(db, item, source_schedule):
     return row
 
 
+def _processing_supplier(db):
+    supplier = Supplier(
+        supplier_ref1c="CONTRACTOR-1", supplier_name="Гальванический подрядчик"
+    )
+    db.add(supplier)
+    db.flush()
+    return supplier
+
+
 def test_processing_nfp_includes_pipe_and_bare_chain(db_session):
     db = db_session
     schedule, coated, bare = _processing_scenario(db)
     position = _processing_position(db, coated, schedule)
+    supplier_row = _processing_supplier(db)
     db.add_all(
         [
             StockWarehouse(warehouse_ref1c=W4, warehouse_name="Полка 4", is_selected=True),
@@ -193,7 +205,8 @@ def test_processing_nfp_includes_pipe_and_bare_chain(db_session):
     # труба переработчика: 25 с назначением куда угодно + 15 без назначения
     supplier = SupplierOrder(
         order_number="ЗП-1", order_date=datetime(2026, 8, 1),
-        order_ref1c="proc-1", deletion_mark=False,
+        order_ref1c="proc-1", supplier_id=supplier_row.supplier_id,
+        is_posted=True, deletion_mark=False,
     )
     db.add(supplier)
     db.flush()
@@ -238,14 +251,17 @@ def test_processing_board_overdue_roundtrip_alert(db_session):
     db = db_session
     schedule, coated, bare = _processing_scenario(db)
     position = _processing_position(db, coated, schedule)
+    supplier = _processing_supplier(db)
     db.add(StockWarehouse(warehouse_ref1c=W4, warehouse_name="Полка 4", is_selected=True))
     fresh = SupplierOrder(
         order_number="ЗП-СВЕЖИЙ", order_date=datetime(2026, 8, 1),
-        order_ref1c="proc-fresh", deletion_mark=False,
+        order_ref1c="proc-fresh", supplier_id=supplier.supplier_id,
+        is_posted=True, deletion_mark=False,
     )
     stale = SupplierOrder(
         order_number="ЗП-ПРОСРОЧЕН", order_date=datetime(2026, 6, 20),
-        order_ref1c="proc-stale", deletion_mark=False,
+        order_ref1c="proc-stale", supplier_id=supplier.supplier_id,
+        is_posted=True, deletion_mark=False,
     )
     db.add_all([fresh, stale])
     db.flush()
@@ -278,9 +294,92 @@ def test_processing_board_overdue_roundtrip_alert(db_session):
     assert orders["ЗП-СВЕЖИЙ"]["age_days"] == 4
     assert orders["ЗП-ПРОСРОЧЕН"]["overdue"] is True
     assert orders["ЗП-ПРОСРОЧЕН"]["age_days"] == 46
+    assert isinstance(orders["ЗП-ПРОСРОЧЕН"]["order_id"], int)
+    assert isinstance(orders["ЗП-ПРОСРОЧЕН"]["line_id"], int)
     # NFP-разложение присутствует на борде
     assert row["open_supply_qty"] == 30
     assert row["zone"] is not None
+
+
+def test_processing_pipe_excludes_draft_and_wrong_supplier(db_session):
+    db = db_session
+    schedule, coated, _bare = _processing_scenario(db)
+    position = _processing_position(db, coated, schedule)
+    expected_supplier = _processing_supplier(db)
+    wrong_supplier = Supplier(
+        supplier_ref1c="ORDINARY-SUPPLIER", supplier_name="Обычный поставщик"
+    )
+    db.add(wrong_supplier)
+    db.flush()
+    orders = [
+        SupplierOrder(
+            order_number="VALID", order_date=datetime(2026, 8, 1),
+            order_ref1c="proc-valid", supplier_id=expected_supplier.supplier_id,
+            is_posted=True, deletion_mark=False,
+        ),
+        SupplierOrder(
+            order_number="DRAFT", order_date=datetime(2026, 8, 1),
+            order_ref1c="proc-draft", supplier_id=expected_supplier.supplier_id,
+            is_posted=False, deletion_mark=False,
+        ),
+        SupplierOrder(
+            order_number="WRONG", order_date=datetime(2026, 8, 1),
+            order_ref1c="proc-wrong", supplier_id=wrong_supplier.supplier_id,
+            is_posted=True, deletion_mark=False,
+        ),
+        SupplierOrder(
+            order_number="CLOSED", order_date=datetime(2026, 8, 1),
+            order_ref1c="proc-closed", supplier_id=expected_supplier.supplier_id,
+            is_posted=True, deletion_mark=False, order_state_name="Завершён",
+        ),
+    ]
+    db.add_all(orders)
+    db.flush()
+    for index, order in enumerate(orders, start=1):
+        db.add(
+            SupplierOrderItem(
+                order_id=order.order_id, item_id_ref=coated.item_id,
+                line_number=index, quantity=10, received_qty=0, remaining_qty=10,
+            )
+        )
+    db.flush()
+
+    from app.services.dbr import processing_board_service
+
+    live = feeder_nfp_service.live_nfp_rows(db, [position])[position.id]
+    board = processing_board_service.processing_board(db, today=date(2026, 8, 5))
+
+    assert live["open_supply_qty"] == 10
+    assert [row["order_number"] for row in board["positions"][0]["open_orders"]] == ["VALID"]
+    assert board["positions"][0]["open_orders"][0]["line_number"] == 1
+
+
+def test_processing_pipe_without_configured_supplier_is_incomplete(db_session):
+    db = db_session
+    schedule, coated, _bare = _processing_scenario(db)
+    coated.supplier_ref1c = None
+    position = _processing_position(db, coated, schedule)
+    supplier = _processing_supplier(db)
+    order = SupplierOrder(
+        order_number="UNATTRIBUTED", order_date=datetime(2026, 8, 1),
+        order_ref1c="proc-unattributed", supplier_id=supplier.supplier_id,
+        is_posted=True, deletion_mark=False,
+    )
+    db.add(order)
+    db.flush()
+    db.add(
+        SupplierOrderItem(
+            order_id=order.order_id, item_id_ref=coated.item_id,
+            quantity=10, received_qty=0, remaining_qty=10,
+        )
+    )
+    db.flush()
+
+    live = feeder_nfp_service.live_nfp_rows(db, [position])[position.id]
+
+    assert live["open_supply_qty"] == 0
+    assert "processing_supplier_missing" in live["missing_reasons"]
+    assert live["is_complete"] is False
 
 
 def test_processing_nfp_flags_unresolved_bare_component(db_session):

@@ -21,10 +21,9 @@ from sqlalchemy.orm import Session, joinedload
 from ...models import (
     DbrSupermarketPosition,
     Item,
-    SupplierOrder,
-    SupplierOrderItem,
 )
 from . import feeder_nfp_service
+from .processing_supplier_orders import processing_order_rows
 from .settings_service import get_or_create_settings
 
 
@@ -53,20 +52,13 @@ def processing_board(db: Session, *, today: date | None = None) -> dict[str, Any
     item_ids = sorted({int(row.item_id) for row in positions})
     orders_by_item: dict[int, list[dict[str, Any]]] = {}
     if item_ids:
-        for line, order in (
-            db.query(SupplierOrderItem, SupplierOrder)
-            .join(SupplierOrder, SupplierOrder.order_id == SupplierOrderItem.order_id)
-            .filter(
-                SupplierOrderItem.item_id_ref.in_(item_ids),
-                SupplierOrderItem.remaining_qty > 0,
-                SupplierOrder.deletion_mark.is_(False),
-            )
-            .order_by(SupplierOrder.order_date.asc())
-            .all()
-        ):
+        for line, order in processing_order_rows(db, item_ids):
             age = _age_days(order.order_date, today)
             orders_by_item.setdefault(int(line.item_id_ref), []).append(
                 {
+                    "order_id": int(order.order_id),
+                    "line_id": int(line.item_id),
+                    "line_number": int(line.line_number) if line.line_number is not None else None,
                     "order_number": str(order.order_number or ""),
                     "order_date": order.order_date.isoformat() if order.order_date else None,
                     "remaining_qty": float(line.remaining_qty or 0),

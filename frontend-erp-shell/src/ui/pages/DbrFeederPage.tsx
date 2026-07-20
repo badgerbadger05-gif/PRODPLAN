@@ -779,7 +779,7 @@ export function DbrFeederPage() {
                     <td>
                       {row.open_orders.length
                         ? row.open_orders.map((order) => (
-                          <div key={order.order_number} className={order.overdue ? 'dbrOverdueOrder' : ''} title={order.overdue ? `Партия у подрядчика дольше ${processingBoard?.roundtrip_limit_days} дн` : undefined}>
+                          <div key={`${order.order_id}:${order.line_id}`} className={order.overdue ? 'dbrOverdueOrder' : ''} title={order.overdue ? `Партия у подрядчика дольше ${processingBoard?.roundtrip_limit_days} дн` : undefined}>
                             {order.order_number} · {qty(order.remaining_qty)} шт · {order.age_days != null ? `${order.age_days} дн` : '—'}{order.overdue ? ' ⚠' : ''}
                           </div>
                         ))
