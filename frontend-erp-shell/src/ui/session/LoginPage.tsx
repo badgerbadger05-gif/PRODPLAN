@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useSession } from './SessionContext'
 
 export function LoginPage() {
-  const { login, loading } = useSession()
+  const { login, loading, reason } = useSession()
   const [name, setName] = useState('viewer')
   const [password, setPassword] = useState('')
 
@@ -18,6 +18,7 @@ export function LoginPage() {
         <div className="brandMark">P</div>
         <h1>PRODPLAN</h1>
         <p>Вход в ERP shell</p>
+        {reason && <div className="errorLine" role="alert">{reason}</div>}
         <label>Логин<input value={name} onChange={(event) => setName(event.target.value)} autoFocus /></label>
         <label>Пароль<input type="password" value={password} onChange={(event) => setPassword(event.target.value)} /></label>
         <button className="primary" type="submit" disabled={loading}>{loading ? 'Вход...' : 'Войти'}</button>

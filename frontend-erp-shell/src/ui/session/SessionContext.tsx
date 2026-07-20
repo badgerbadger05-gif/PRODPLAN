@@ -2,10 +2,12 @@
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { mockSessionProvider } from './mockSessionProvider'
 import type { SessionProvider, SessionUser } from './types'
+import { onApiUnauthorized } from '../../lib/api'
 
 type SessionState = {
   user: SessionUser | null
   loading: boolean
+  reason: string
   login(login: string, password: string): Promise<void>
   logout(): Promise<void>
 }
@@ -21,6 +23,7 @@ export function SessionRoot({
 }) {
   const [user, setUser] = useState<SessionUser | null>(null)
   const [loading, setLoading] = useState(true)
+  const [reason, setReason] = useState('')
 
   useEffect(() => {
     const controller = new AbortController()
@@ -35,11 +38,18 @@ export function SessionRoot({
     return () => controller.abort()
   }, [provider])
 
+  useEffect(() => onApiUnauthorized(() => {
+    setReason('Сессия истекла. Войдите снова.')
+    setUser(null)
+  }), [])
+
   const value = useMemo<SessionState>(() => ({
     user,
     loading,
+    reason,
     async login(login, password) {
       setLoading(true)
+      setReason('')
       try {
         setUser(await provider.login(login, password))
       } finally {
@@ -48,9 +58,10 @@ export function SessionRoot({
     },
     async logout() {
       await provider.logout()
+      setReason('')
       setUser(null)
     },
-  }), [loading, provider, user])
+  }), [loading, provider, reason, user])
 
   return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>
 }

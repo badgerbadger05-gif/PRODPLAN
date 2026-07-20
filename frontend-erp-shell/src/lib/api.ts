@@ -13,10 +13,47 @@ export class ApiError extends Error {
   }
 }
 
-export async function api<T>(path: string, init?: RequestInit, signal?: AbortSignal): Promise<T> {
+type UnauthorizedListener = () => void
+type AccessTokenProvider = () => string | null | undefined
+
+const unauthorizedListeners = new Set<UnauthorizedListener>()
+let accessTokenProvider: AccessTokenProvider | null = null
+
+export function setApiAccessTokenProvider(provider: AccessTokenProvider | null) {
+  accessTokenProvider = provider
+}
+
+export function onApiUnauthorized(listener: UnauthorizedListener) {
+  unauthorizedListeners.add(listener)
+  return () => {
+    unauthorizedListeners.delete(listener)
+  }
+}
+
+function notifyUnauthorized() {
+  unauthorizedListeners.forEach((listener) => {
+    try {
+      listener()
+    } catch {
+      // A UI subscriber must never swallow the original HTTP error.
+    }
+  })
+}
+
+async function request<T>(
+  path: string,
+  init: RequestInit | undefined,
+  signal: AbortSignal | undefined,
+  responseMode: 'auto' | 'text',
+): Promise<T> {
+  const token = accessTokenProvider?.()
   const res = await fetch(`/api${path}`, {
-    headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
     ...init,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(init?.headers ?? {}),
+    },
     signal: signal ?? init?.signal,
   })
 
@@ -38,8 +75,22 @@ export async function api<T>(path: string, init?: RequestInit, signal?: AbortSig
     } catch {
       // Keep the original response text when it is not JSON.
     }
+    if (res.status === 401) notifyUnauthorized()
     throw new ApiError(message, res.status, detail)
   }
 
-  return res.json()
+  if (res.status === 204) return undefined as T
+  const text = await res.text()
+  if (!text) return undefined as T
+  if (responseMode === 'text') return text as T
+  const contentType = res.headers.get('content-type') ?? ''
+  return (contentType.includes('json') ? JSON.parse(text) : text) as T
+}
+
+export function api<T>(path: string, init?: RequestInit, signal?: AbortSignal): Promise<T> {
+  return request<T>(path, init, signal, 'auto')
+}
+
+export function apiText(path: string, init?: RequestInit, signal?: AbortSignal): Promise<string> {
+  return request<string>(path, init, signal, 'text')
 }

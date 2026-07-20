@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import { ApiError, api, onApiUnauthorized, setApiAccessTokenProvider } from './api'
+import { ApiError, api, apiText, onApiUnauthorized, setApiAccessTokenProvider } from './api'
 
 describe('api transport', () => {
   afterEach(() => {
@@ -32,6 +32,17 @@ describe('api transport', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status: 204 })))
 
     await expect(api<void>('/session', { method: 'DELETE' })).resolves.toBeUndefined()
+  })
+
+  it('returns text through the shared transport', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+      new Response('<html>Маршрутный лист</html>', {
+        status: 200,
+        headers: { 'Content-Type': 'text/html' },
+      }),
+    ))
+
+    await expect(apiText('/print')).resolves.toContain('Маршрутный лист')
   })
 
   it('preserves structured error detail in ApiError', async () => {
@@ -96,6 +107,16 @@ describe('api transport', () => {
     try {
       await expect(api('/admin-only')).rejects.toMatchObject({ status: 403 })
       expect(unauthorized).not.toHaveBeenCalled()
+    } finally {
+      unsubscribe()
+    }
+  })
+
+  it('still throws the ApiError when an unauthorized listener fails', async () => {
+    const unsubscribe = onApiUnauthorized(() => { throw new Error('listener failure') })
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('unauthorized', { status: 401 })))
+    try {
+      await expect(api('/protected')).rejects.toMatchObject({ status: 401 })
     } finally {
       unsubscribe()
     }

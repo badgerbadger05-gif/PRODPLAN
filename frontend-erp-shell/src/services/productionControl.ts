@@ -8,7 +8,7 @@ import type {
   ProductionOperationsResponse,
   TransferIssuesResponse,
 } from '../domain/productionControl'
-import { api } from '../lib/api'
+import { api, apiText } from '../lib/api'
 
 // Executor row shared by the produce dialog and the paint↔weld chain close.
 export type OperationExecutorInput = {
@@ -114,17 +114,11 @@ export function postMaterialIssues(productIds: number[], initiatedBy: string, so
   })
 }
 
-// Route-sheet print returns HTML (not JSON), so it bypasses the api() wrapper
-// and stays a raw fetch. Resolves with the HTML body; throws on a non-2xx.
-export async function fetchRouteSheetsPrintHtml(productIds: number[]): Promise<string> {
-  const response = await fetch('/api/v1/production-control/route-sheets/print', {
+export function fetchRouteSheetsPrintHtml(productIds: number[]): Promise<string> {
+  return apiText('/v1/production-control/route-sheets/print', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ product_ids: productIds, mark_printed: true, auto_print: true }),
   })
-  const html = await response.text()
-  if (!response.ok) throw new Error(html || response.statusText)
-  return html
 }
 
 export function exportMaterialIssuesTo1C(issueIds: number[]) {
