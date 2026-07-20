@@ -6,7 +6,7 @@
 
 - Doctype runtime реализован и используется `MRP Runs`, `Transfer Requests`,
   `Purchase Control` и `Workshop Binding Review`; остальные журналы инвентаризируются.
-- OpenAPI-типы генерируются, lint чистый, frontend CI добавлен, 184 frontend-теста проходят.
+- OpenAPI-типы генерируются, lint чистый, frontend CI добавлен, 210 frontend-тестов проходят.
 - Прямые API-вызовы страниц вынесены в services-слой.
 - Route-level code splitting снизил initial JS bundle примерно с 592 до 242 КБ.
 - Mock session shell и resource/action/record/field gates реализованы, но Auth/RBAC нельзя считать закрытым до появления backend-сессии и `/auth/me`.
@@ -43,10 +43,10 @@
 ## P1 — Тестовое покрытие критичных экранов
 
 **Текущее состояние.** Общий runtime, transport, session/RBAC, saved views,
-Ledger и критичные custom pages покрыты 184 Vitest-тестами; есть hermetic
+Ledger и критичные custom pages покрыты 210 Vitest-тестами; есть hermetic
 Playwright smoke и стабильные Linux visual baselines Ledger, Purchase Control,
 Production Control, Period Plan (list/detail), Workshop Binding Review и
-Stage Distribution, Resources и Specification. Не хватает отдельного
+Stage Distribution, Resources, Specification и Sync. Не хватает отдельного
 backend-contract E2E.
 
 **Цель.** На каждый Doctype — характеристический vitest-тест (рендер + 1–2 флоу, мок сервисов), по образцу `ProductionControlPage.test.tsx`. Прогон в CI (см. P3). `useDoctypeList`/`DoctypePage` покрыть юнит-тестами один раз — это защитит все страницы разом.
@@ -67,6 +67,13 @@ backend-contract E2E.
 `StatusBadge` с сохранением прежних DOM и классов; на них переведены Doctype
 CommandBar и Ledger. Остальные custom pages мигрируются только после visual
 baseline, без массового редизайна.
+
+Sync разделён на controller и presentation-компоненты: операции сериализованы,
+полная синхронизация выполняется последовательно, ошибки не создают unhandled
+rejection, а диагностические данные рекурсивно очищаются от учётных данных. DBR
+Feeder получил characterization-покрытие, чистую модель и latest-wins защиту
+для позиций и сигналов. Критические сценарии MRP Result зафиксированы тестами
+до дальнейшей декомпозиции страницы.
 
 ## P2 — Протечки прямых `api()`/`fetch` мимо сервисов
 
