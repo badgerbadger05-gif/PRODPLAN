@@ -55,7 +55,12 @@ export function createPurchaseOrdersDoctype(
               ? purchaseIdsForRow(row).map((id) => `MRP #${id}`).join(', ')
               : row.order_number,
           },
-          { key: 'order_date', title: 'Дата заказа', value: (row) => row.order_date ?? '' },
+          {
+            key: 'order_date',
+            title: 'Дата заказа',
+            value: (row) => row.order_date ?? '',
+            permissionField: 'order',
+          },
           { key: 'supplier', title: 'Поставщик', value: (row) => row.supplier_name },
           {
             key: 'article',
@@ -66,11 +71,26 @@ export function createPurchaseOrdersDoctype(
           { key: 'item', title: 'Номенклатура', value: (row) => row.item_name },
           { key: 'quantity', title: 'Заказано', value: (row) => row.quantity },
           { key: 'received', title: 'Поступило', value: (row) => row.received_qty },
-          { key: 'remaining', title: 'Осталось', value: (row) => row.remaining_qty },
+          {
+            key: 'remaining',
+            title: 'Осталось',
+            value: (row) => row.remaining_qty,
+            permissionField: 'quantity',
+          },
           { key: 'delivery_date', title: 'Дата поставки', value: (row) => row.delivery_date ?? row.need_date ?? '' },
-          { key: 'overdue', title: 'Просрочка, дн', value: (row) => row.overdue_days || '' },
+          {
+            key: 'overdue',
+            title: 'Просрочка, дн',
+            value: (row) => row.overdue_days || '',
+            permissionField: 'delivery_date',
+          },
           { key: 'state', title: 'Статус 1С', value: (row) => row.order_state_name ?? '' },
-          { key: 'phase', title: 'Фаза', value: (row) => supplyPhaseLabel(row.supply_phase) },
+          {
+            key: 'phase',
+            title: 'Фаза',
+            value: (row) => supplyPhaseLabel(row.supply_phase),
+            permissionField: 'state',
+          },
           { key: 'line_status', title: 'Статус', value: (row) => purchaseLineStatusLabel(row.line_status) },
           { key: 'amount', title: 'Сумма', value: (row) => row.amount || '' },
         ],
