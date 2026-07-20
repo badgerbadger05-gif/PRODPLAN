@@ -1,4 +1,4 @@
-import type { DbrBoardSlot, DbrReleaseResult } from '../../../domain/dbr'
+import type { DbrBoardSlot, DbrReleaseDaySlotResult } from '../../../domain/dbr'
 import { qty } from '../../../lib/format'
 
 export const KIT_CLASS: Record<string, string> = {
@@ -54,7 +54,7 @@ export function drumSlotReleaseState(slot: DbrBoardSlot) {
   }
 }
 
-export function releaseResultText(result: DbrReleaseResult, done: boolean) {
+export function releaseResultText(result: DbrReleaseDaySlotResult, done: boolean) {
   if (result.conflict) return `Отказ: ${result.conflict}`
   if (result.error) return `Ошибка: ${result.error}`
   if (!done) return 'готов к релизу'

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import type { DbrBoardSlot, DbrReleaseResult } from '../../../domain/dbr'
+import type { DbrBoardSlot, DbrReleaseDaySlotResult } from '../../../domain/dbr'
 import {
   dayLabel,
   drumSlotReleaseState,
@@ -72,7 +72,7 @@ describe('DBR drum board model', () => {
   })
 
   it('formats preview, success, duplicate, conflict and error report rows', () => {
-    const result = { number: 'ERP-101' } as DbrReleaseResult
+    const result = { number: 'ERP-101' } as DbrReleaseDaySlotResult
     expect(releaseResultText(result, false)).toBe('готов к релизу')
     expect(releaseResultText({ ...result, created: true }, true)).toBe('Заказ № ERP-101')
     expect(releaseResultText({ ...result, already_released: true }, true)).toBe('Уже создан № ERP-101')
