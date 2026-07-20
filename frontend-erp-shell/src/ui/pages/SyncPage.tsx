@@ -100,6 +100,8 @@ export function SyncPage() {
     void loadConfig()
     void loadWarehouses()
     void loadGroups()
+    // Bootstrap is intentionally one-shot; later refreshes are explicit runner callbacks.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   return (
