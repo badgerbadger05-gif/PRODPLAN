@@ -95,6 +95,7 @@ export function DoctypePage<Row, Filters extends object, Detail>({
       keys: 'F5',
       scope: 'resource',
       allowInEditable: true,
+      allowInInteractive: true,
       run: state.reload,
     },
     ...onRowDoubleClick ? [{

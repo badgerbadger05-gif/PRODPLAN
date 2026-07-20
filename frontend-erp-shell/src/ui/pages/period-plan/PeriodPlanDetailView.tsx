@@ -38,6 +38,7 @@ import { DocumentWindow } from '../../layout/DocumentWindow'
 import { RootProductFilterDialog } from '../../RootProductFilterDialog'
 import { rootProductLabel, type RootProductOption } from '../../rootProductOptions'
 import { StatusBar } from '../../layout/StatusBar'
+import { KeyboardShortcutShell, type KeyboardShortcut } from '../../platform'
 import { tableColumnStyle, tableMinWidth, type TableColumnDoctype } from '../../tableDoctype'
 import { bucketLabel, type SortDir } from './helpers'
 import { ForecastShift } from './ForecastShift'
@@ -198,26 +199,26 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     }
   }, [tab, isDraft])
 
-  // Hotkeys: Esc back, F5 refresh
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      const target = e.target as HTMLElement | null
-      const inInput = !!target && /^(INPUT|TEXTAREA|SELECT)$/i.test(target.tagName)
-      if (e.key === 'Escape' && !inInput) {
-        e.preventDefault()
-        onBack()
-        return
-      }
-      if (e.key === 'F5') {
-        e.preventDefault()
+  const shortcuts = useMemo<KeyboardShortcut[]>(() => [
+    {
+      id: 'period-plan-detail-back',
+      keys: 'Escape',
+      scope: 'resource',
+      run: onBack,
+    },
+    {
+      id: 'period-plan-detail-reload',
+      keys: 'F5',
+      scope: 'resource',
+      allowInEditable: true,
+      allowInInteractive: true,
+      run: () => {
         if (tab === 'matrix') void loadMatrix()
         else void loadJournal(journalFlow, activeRunId ?? undefined, journalRootItemId)
         void loadRuns()
-      }
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onBack, tab, loadMatrix, loadJournal, loadRuns, journalFlow, activeRunId, journalRootItemId])
+      },
+    },
+  ], [activeRunId, journalFlow, journalRootItemId, loadJournal, loadMatrix, loadRuns, onBack, tab])
 
   function nonEmptyMatrix() {
     if (!matrix) return false
@@ -713,6 +714,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
 
   return (
     <main className="workArea">
+      <KeyboardShortcutShell shortcuts={shortcuts} />
       <div className="topLine">
         <div className="breadcrumbs">Планирование / Планирование выпуска / {planTitle}</div>
         {plan && <div className="runBadge">{periodPlanStatusLabel(plan.status)}</div>}

@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { PeriodPlan } from '../../../domain/planning'
 import { periodPlanStatusClass, periodPlanStatusLabel } from '../../../domain/planning'
 import { dateRu, dateTimeRu } from '../../../lib/format'
 import { createPeriodPlan, deletePeriodPlan, listPeriodPlans } from '../../../services/periodPlan'
 import { DocumentWindow } from '../../layout/DocumentWindow'
 import { StatusBar } from '../../layout/StatusBar'
+import { KeyboardShortcutShell, type KeyboardShortcut } from '../../platform'
 import { tableColumnStyle, tableMinWidth, type TableColumnDoctype } from '../../tableDoctype'
 import { nextFriday, type SortDir } from './helpers'
 
@@ -82,24 +83,25 @@ export function PeriodPlanListView({ onOpenPlan }: ListViewProps) {
 
   useEffect(() => { void loadList(0) }, [loadList])
 
-  // Keyboard hotkeys: F5 refresh, Enter open
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      const target = e.target as HTMLElement | null
-      const inInput = !!target && /^(INPUT|TEXTAREA|SELECT)$/i.test(target.tagName)
-      if (e.key === 'F5') {
-        e.preventDefault()
-        void loadList(offset)
-        return
-      }
-      if (e.key === 'Enter' && !inInput && selected) {
-        e.preventDefault()
-        onOpenPlan(selected.id)
-      }
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [loadList, offset, selected, onOpenPlan])
+  const shortcuts = useMemo<KeyboardShortcut[]>(() => [
+    {
+      id: 'period-plan-list-reload',
+      keys: 'F5',
+      scope: 'resource',
+      allowInEditable: true,
+      allowInInteractive: true,
+      run: () => { void loadList(offset) },
+    },
+    {
+      id: 'period-plan-list-open',
+      keys: 'Enter',
+      scope: 'resource',
+      enabled: () => Boolean(selected),
+      run: () => {
+        if (selected) onOpenPlan(selected.id)
+      },
+    },
+  ], [loadList, offset, onOpenPlan, selected])
 
   async function handleCreate() {
     if (!newName.trim() || !newFrom || !newTo) return
@@ -165,6 +167,7 @@ export function PeriodPlanListView({ onOpenPlan }: ListViewProps) {
 
   return (
     <main className="workArea">
+      <KeyboardShortcutShell shortcuts={shortcuts} />
       <div className="topLine">
         <div className="breadcrumbs">Планирование / Планирование выпуска</div>
         <div className="runBadge">Планов: {total}</div>
