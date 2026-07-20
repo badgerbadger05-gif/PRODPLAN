@@ -11,6 +11,14 @@ type Props<Row, Filters extends object, Detail> = {
 
 export function DoctypeTable<Row, Filters extends object, Detail>({ doctype, state, onRowDoubleClick }: Props<Row, Filters, Detail>) {
   const idOf = (row: Row) => row[doctype.meta.idField] as string | number
+  const activateRow = (index: number, tableRow: HTMLTableRowElement) => {
+    const nextIndex = Math.max(0, Math.min(index, state.rows.length - 1))
+    const next = state.rows[nextIndex]
+    if (!next) return
+    state.setActiveId(idOf(next))
+    const body = tableRow.parentElement
+    ;(body?.children[nextIndex] as HTMLTableRowElement | undefined)?.focus()
+  }
 
   return (
     <div className="tablePane">
@@ -23,7 +31,15 @@ export function DoctypeTable<Row, Filters extends object, Detail>({ doctype, sta
         <thead>
           <tr>
             {doctype.columns.map((column) => (
-              <th key={column.key} className={column.className} style={tableColumnStyle(column)} title={column.tooltip}>
+              <th
+                key={column.key}
+                className={column.className}
+                style={tableColumnStyle(column)}
+                title={column.tooltip}
+                aria-sort={column.sortable && state.sort?.sortBy === column.key
+                  ? (state.sort.sortDir === 'asc' ? 'ascending' : 'descending')
+                  : undefined}
+              >
                 {column.sortable ? (
                   <button className="tableSortButton" onClick={() => state.setSort(column.key)}>
                     {column.title}{state.sort ? sortGlyph(state.sort, column.key) : ''}
@@ -34,7 +50,7 @@ export function DoctypeTable<Row, Filters extends object, Detail>({ doctype, sta
           </tr>
         </thead>
         <tbody>
-          {state.rows.map((row) => {
+          {state.rows.map((row, rowIndex) => {
             const id = idOf(row)
             const active = state.activeRow ? idOf(state.activeRow) === id : false
             return (
@@ -43,6 +59,25 @@ export function DoctypeTable<Row, Filters extends object, Detail>({ doctype, sta
                 className={`${active ? 'activeRow' : ''} ${doctype.rowClassName?.(row) ?? ''}`.trim()}
                 onClick={() => state.setActiveId(id)}
                 onDoubleClick={() => onRowDoubleClick?.(row)}
+                aria-selected={active}
+                tabIndex={active ? 0 : -1}
+                onKeyDown={(event) => {
+                  if (event.key === 'ArrowDown') {
+                    event.preventDefault()
+                    activateRow(rowIndex + 1, event.currentTarget)
+                  } else if (event.key === 'ArrowUp') {
+                    event.preventDefault()
+                    activateRow(rowIndex - 1, event.currentTarget)
+                  } else if (event.key === 'Home') {
+                    event.preventDefault()
+                    activateRow(0, event.currentTarget)
+                  } else if (event.key === 'End') {
+                    event.preventDefault()
+                    activateRow(state.rows.length - 1, event.currentTarget)
+                  } else if (event.key === 'Enter') {
+                    onRowDoubleClick?.(row)
+                  }
+                }}
               >
                 {doctype.columns.map((column) => {
                   if (column.type === 'select-checkbox') {
