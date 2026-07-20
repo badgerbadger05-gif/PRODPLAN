@@ -298,16 +298,25 @@ def test_reconcile_prunes_stale_purchase_when_current_net_is_zero(db_session):
     item.stock_qty = 50.0
     db_session.commit()
 
+    # Freeze v2 guard (§11): the snapshot carries an active freeze version, so
+    # reconcile must NOT trim its purchases nor rewrite the frozen net — that is
+    # a refreeze's job now. The stale purchase survives, net stays frozen at 50.
     res = reconcile_snapshot(db_session, run_id)
+    assert res["freeze_guard"] is True
+    assert res["purchase_pruned"] == []
+    assert db_session.query(PlannedPurchase).filter_by(run_id=run_id, item_id=item.item_id).count() == 1
+    req = db_session.query(MrpRequirement).filter_by(run_id=run_id, item_id=item.item_id).one()
+    assert float(req.net_required_qty) == 50.0
 
-    assert len(res["purchase_pruned"]) == 1
-    assert res["purchase_pruned"][0]["item_id"] == item.item_id
-    assert res["purchase_pruned"][0]["removed_qty"] == 50.0
+    # A refreeze re-nets against the raised stock and drops the stale purchase.
+    # (The plan's period is already past, so it is pulled into the queue via
+    # include_plan_id — exactly as the create-snapshot entry point does.)
+    from app.services.mrp_freeze import refreeze_active_snapshots
+
+    refreeze_active_snapshots(db_session, include_plan_id=plan.id)
     assert db_session.query(PlannedPurchase).filter_by(run_id=run_id, item_id=item.item_id).count() == 0
     req = db_session.query(MrpRequirement).filter_by(run_id=run_id, item_id=item.item_id).one()
     assert float(req.net_required_qty) == 0.0
-    assert float(req.covered_qty) == 0.0
-    assert float(req.remaining_qty) == 0.0
 
 
 # ---------------------------------------------------------------------------

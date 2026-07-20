@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+
+if TYPE_CHECKING:  # pragma: no cover - typing only; runtime import is mrp_freeze→here
+    from .mrp_freeze import FreezeSharedPools, FreezeTrace
 
 from ..models import (
     DefaultSpecification,
@@ -44,6 +47,7 @@ from .capacity_scheduler import CapacityScheduler
 from .mrp_stock_helpers import (
     active_wip_eta_by_item as _active_wip_eta_by_item,
     consume_wip_at_or_before as _consume_wip_at_or_before,
+    consume_wip_detailed as _consume_wip_detailed,
     effective_stock_by_item_all as _effective_stock_by_item_all,
 )
 from .replenishment import (
@@ -399,8 +403,21 @@ def delete_period_plan(db: Session, plan_id: int) -> Dict[str, Any]:
 def _explode_bom_net_first(
     db: Session,
     plan_demands: Dict[int, Dict[date, float]],
+    shared_pools: Optional["FreezeSharedPools"] = None,
+    trace: Optional["FreezeTrace"] = None,
 ) -> Tuple[Dict[int, Dict[date, float]], Dict[int, Dict[date, float]], Dict[int, int]]:
     """Net-first multi-level BOM explosion with WIP netting and lead-time shifting.
+
+    ``shared_pools`` — when provided (freeze v2), the effective-stock and WIP
+    pools are NOT re-read here: they are *aliased* from the queue-wide, mutable
+    ``FreezeSharedPools`` so a physical unit consumed by one run is invisible to
+    the next. ``trace`` (freeze v2) records, per item, how much stock / which WIP
+    lines / (later) which supplier lines covered its net, plus the BOM norms —
+    written in place, only when both ``shared_pools`` and ``trace`` are set.
+
+    ``shared_pools=None`` (every non-freeze caller and the byte-for-byte legacy
+    path) re-reads both pools fresh and mutates nothing shared — behaviour is
+    identical to before these params existed.
 
     For each plan item (level 0), explode the BOM tree level by level.
     At each level:
@@ -426,7 +443,13 @@ def _explode_bom_net_first(
     # Effective stock with ignored warehouses (e.g., brak isolator) excluded;
     # using Item.stock_qty directly would let MRP "see" stock that production
     # control then refuses as a material-issue source.
-    stock_by_item: Dict[int, float] = _effective_stock_by_item_all(db)
+    #
+    # Freeze v2: alias the queue-wide consume-once stock ledger instead of
+    # re-reading, so an earlier run's consumption persists to this one.
+    if shared_pools is not None:
+        stock_by_item: Dict[int, float] = shared_pools.stock
+    else:
+        stock_by_item = _effective_stock_by_item_all(db)
 
     # A top-level production item represents the approved release programme
     # (finished goods), unlike a top-level purchased item which is still a
@@ -456,10 +479,15 @@ def _explode_bom_net_first(
     # finishes in September does NOT cover a July demand bucket; previously
     # we collapsed all WIP into one timeless pool, which over-credited early
     # buckets and under-planned production.
-    try:
-        wip_eta_by_item: Dict[int, list] = _active_wip_eta_by_item(db)
-    except Exception:
-        wip_eta_by_item = {}
+    # Freeze v2: alias the queue-wide WIP pool (identity-carrying, self-excluded)
+    # so its greedy consumption persists across runs; else read fresh per call.
+    if shared_pools is not None:
+        wip_eta_by_item: Dict[int, list] = shared_pools.wip
+    else:
+        try:
+            wip_eta_by_item = _active_wip_eta_by_item(db)
+        except Exception:
+            wip_eta_by_item = {}
 
     # --- Buffer-days lookup: item → default spec → production_kind → resource.buffer_days ---
     all_spec_ids: set = set(default_spec_map.values())
@@ -517,12 +545,18 @@ def _explode_bom_net_first(
     net_map: Dict[int, Dict[date, float]] = {}
     bom_level_map: Dict[int, int] = {}
     # Stock pool (immediate, no ETA) — consumed before WIP for each bucket.
-    avail_stock: Dict[int, float] = dict(stock_by_item)
-    # WIP pool with per-item ETA list; mutated as buckets are netted so the
-    # same WIP line can't cover two different demand buckets.
-    avail_wip: Dict[int, list] = {
-        int(iid): list(entries) for iid, entries in wip_eta_by_item.items()
-    }
+    # Freeze v2 aliases the shared ledgers (NOT copies): run N's consumption
+    # must be visible to run N+1. The None path keeps private copies.
+    if shared_pools is not None:
+        avail_stock: Dict[int, float] = shared_pools.stock
+        avail_wip: Dict[int, list] = shared_pools.wip
+    else:
+        avail_stock = dict(stock_by_item)
+        # WIP pool with per-item ETA list; mutated as buckets are netted so the
+        # same WIP line can't cover two different demand buckets.
+        avail_wip = {
+            int(iid): list(entries) for iid, entries in wip_eta_by_item.items()
+        }
     # Prevent cycles: track items already exploded as parents
     exploded_parents: set = set()
 
@@ -583,6 +617,7 @@ def _explode_bom_net_first(
             #     top-ups). An open order already covers this, so no duplicate
             #     parent order is created.
             stock_left = avail_stock.get(iid, 0.0)
+            stock_before = stock_left  # freeze v2: how much stock this item ate
             wip_list = avail_wip.setdefault(iid, [])
             net_buckets: List[Tuple[date, float]] = []      # after stock + WIP → orders
             explode_buckets: List[Tuple[date, float]] = []  # after stock only → children
@@ -608,12 +643,21 @@ def _explode_bom_net_first(
                 # so it propagates to components regardless of existing WIP.
                 explode_buckets.append((bucket_date, after_stock))
                 # 2) Consume WIP whose ETA <= bucket_date to size NEW orders only.
-                after_wip = _consume_wip_at_or_before(wip_list, bucket_date, after_stock)
+                if shared_pools is not None:
+                    after_wip, wip_used = _consume_wip_detailed(wip_list, bucket_date, after_stock)
+                    if trace is not None and wip_used:
+                        trace.by_item[iid].wip_allocs.extend(wip_used)
+                else:
+                    after_wip = _consume_wip_at_or_before(wip_list, bucket_date, after_stock)
                 if after_wip <= 1e-9:
                     continue
                 net_buckets.append((bucket_date, after_wip))
 
             avail_stock[iid] = stock_left
+            if shared_pools is not None and trace is not None:
+                consumed_stock = stock_before - stock_left
+                if consumed_stock > 1e-12:
+                    trace.by_item[iid].stock_alloc += consumed_stock
 
             # Accumulate net demand (after stock + WIP) — sizes orders for THIS item.
             if net_buckets:
@@ -670,6 +714,24 @@ def _explode_bom_net_first(
 
         demand_map = next_demand
 
+    # Freeze v2: record the frozen BOM norms for EVERY parent that carries gross
+    # demand and has a default spec — including stock-covered parents whose
+    # explosion was skipped (empty explode_buckets). The writer aggregates dups.
+    if shared_pools is not None and trace is not None:
+        for iid, gross_buckets in gross_map.items():
+            if sum(float(q) for q in gross_buckets.values()) <= 1e-9:
+                continue
+            spec_id = default_spec_map.get(int(iid))
+            if not spec_id:
+                continue
+            for comp in components_by_spec.get(int(spec_id), []):
+                try:
+                    child_id = int(comp.item_id)
+                    per_unit = float(comp.quantity or 0.0)
+                except Exception:
+                    continue
+                trace.component_norms.append((int(iid), child_id, int(spec_id), per_unit))
+
     return gross_map, net_map, bom_level_map
 
 
@@ -677,6 +739,8 @@ def _load_purchase_supplier_remaining(
     db: Session,
     item_ids: List[int],
     period_to: date,
+    *,
+    exclude_order_ids: Optional[Iterable[int]] = None,
 ) -> Dict[int, List[Dict[str, Any]]]:
     """
     Batch-load open supplier-order lines for the given purchased item IDs where
@@ -689,9 +753,19 @@ def _load_purchase_supplier_remaining(
       «Нет товара» (Новый заказ / В закупку / Бухгалтерия) и терминальные — пропускаются.
     - Lines without a delivery_date are skipped.
     - Lines with remaining_qty <= 0 are skipped.
+
+    Each row additionally carries identity — ``order_id`` / ``order_ref1c`` /
+    ``line_id`` (SupplierOrderItem PK) / ``line_number`` / ``fact_at_freeze`` —
+    for the freeze allocation writer. Existing callers read only ``delivery_date``
+    / ``remaining_qty``; the extra keys are inert. ``exclude_order_ids`` drops a
+    run's OWN already-exported supplier orders (self-exclusion). Both the extra
+    keys and the deterministic ``(delivery_date, order_id, line_id)`` tie-break
+    are additive — with ``exclude_order_ids=None`` and no same-date ties the
+    result is the prior behaviour.
     """
     if not item_ids:
         return {}
+    exclude = {int(o) for o in (exclude_order_ids or [])}
 
     try:
         rows = (
@@ -701,6 +775,10 @@ def _load_purchase_supplier_remaining(
                 SupplierOrder.order_state_key,
                 SupplierOrder.order_state_name,
                 SupplierOrderItem.remaining_qty,
+                SupplierOrder.order_id,
+                SupplierOrder.order_ref1c,
+                SupplierOrderItem.item_id,
+                SupplierOrderItem.line_number,
             )
             .join(SupplierOrder, SupplierOrder.order_id == SupplierOrderItem.order_id)
             .filter(SupplierOrderItem.item_id_ref.in_(item_ids))
@@ -708,16 +786,32 @@ def _load_purchase_supplier_remaining(
             .filter(SupplierOrderItem.delivery_date.isnot(None))
             .filter(SupplierOrderItem.delivery_date < period_to + timedelta(days=1))
             .filter(func.coalesce(SupplierOrderItem.remaining_qty, 0.0) > 0)
-            .order_by(SupplierOrderItem.delivery_date.asc())
+            .order_by(
+                SupplierOrderItem.delivery_date.asc(),
+                SupplierOrder.order_id.asc(),
+                SupplierOrderItem.item_id.asc(),
+            )
             .all()
         )
     except Exception:
         rows = []
 
     result: Dict[int, List[Dict[str, Any]]] = {}
-    for iid, delivery_dt, state_key, state_name, qty in rows:
+    for (
+        iid,
+        delivery_dt,
+        state_key,
+        state_name,
+        qty,
+        order_id,
+        order_ref1c,
+        line_id,
+        line_number,
+    ) in rows:
         try:
             if not _supplier_order_counts_in_mrp(state_name):
+                continue
+            if order_id is not None and int(order_id) in exclude:
                 continue
             item_id = int(iid)
             delivery_date = (
@@ -729,7 +823,15 @@ def _load_purchase_supplier_remaining(
         if remaining <= 1e-12:
             continue
         result.setdefault(item_id, []).append(
-            {"delivery_date": delivery_date, "remaining_qty": remaining}
+            {
+                "delivery_date": delivery_date,
+                "remaining_qty": remaining,
+                "order_id": int(order_id) if order_id is not None else None,
+                "order_ref1c": (str(order_ref1c) if order_ref1c else None),
+                "line_id": int(line_id) if line_id is not None else None,
+                "line_number": int(line_number) if line_number is not None else None,
+                "fact_at_freeze": remaining,
+            }
         )
     return result
 
@@ -740,18 +842,60 @@ def create_mrp_snapshot_from_period_plan(
     *,
     started_by: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Freeze v2 entry point: creating a plan's snapshot re-freezes the whole
+    active area (every open FIXED_SNAPSHOT plan) against one shared supply pool,
+    so a physical unit is credited to at most one plan. Thin wrapper over
+    :func:`mrp_freeze.refreeze_active_snapshots` — the external contract
+    (router ``:389``) is unchanged: the include plan's per-run counters plus the
+    additive ``freeze_version``.
+    """
+    # Local import breaks the module cycle (mrp_freeze imports this module).
+    from .mrp_freeze import refreeze_active_snapshots
+
+    report = refreeze_active_snapshots(
+        db, include_plan_id=int(plan_id), started_by=started_by
+    )
+    result = next(
+        (r for r in report.get("results", []) if int(r.get("plan_id", -1)) == int(plan_id)),
+        None,
+    )
+    if result is None:
+        raise ValueError("MRP-снимок не создан для плана")
+    return {
+        "status": "ok",
+        "run_id": int(result["run_id"]),
+        "plan_id": int(result["plan_id"]),
+        "requirement_count": int(result.get("requirement_count", 0)),
+        "bucket_count": int(result.get("bucket_count", 0)),
+        "production_count": int(result.get("production_count", 0)),
+        "stage_count": int(result.get("stage_count", 0)),
+        "purchase_count": int(result.get("purchase_count", 0)),
+        "rework_count": int(result.get("rework_count", 0)),
+        "freeze_version": int(result.get("freeze_version", 0)),
+    }
+
+
+def _prepare_include_run(
+    db: Session,
+    plan_id: int,
+    started_by: Optional[str],
+    now: datetime,
+) -> PlanningRun:
+    """Validate the include plan and get-or-create/refresh ONLY its run header
+    (v2 §6.2). Every other run's header is left untouched by a refreeze.
+    Validation errors carry the same texts as the legacy snapshot entry point
+    and fire before any pool is built or row written.
+    """
     plan = _get_plan(db, plan_id)
     if plan.status != "fixed":
         raise ValueError("MRP-снимок можно создать только из зафиксированного плана")
-
-    lines = (
-        db.query(ProductionPlanLine)
+    has_line = (
+        db.query(ProductionPlanLine.id)
         .filter(ProductionPlanLine.plan_id == int(plan.id))
         .filter(ProductionPlanLine.qty > 0)
-        .order_by(ProductionPlanLine.item_id.asc(), ProductionPlanLine.bucket_date.asc())
-        .all()
+        .first()
     )
-    if not lines:
+    if not has_line:
         raise ValueError("В плане нет положительной потребности для MRP")
 
     try:
@@ -768,7 +912,6 @@ def create_mrp_snapshot_from_period_plan(
         "period_to": plan.period_to.isoformat(),
     }
 
-    now = datetime.now(timezone.utc)
     run = _latest_fixed_run_for_plan(db, int(plan.id))
     if run is None:
         run = PlanningRun(
@@ -802,6 +945,45 @@ def create_mrp_snapshot_from_period_plan(
         run.started_at = now
         run.finished_at = now
     db.flush()
+    return run
+
+
+def _freeze_one_run(
+    db: Session,
+    run: PlanningRun,
+    plan: ProductionPlanHeader,
+    *,
+    shared_pools: "FreezeSharedPools",
+    trace: "FreezeTrace",
+    now: datetime,
+    new_version: int,
+    is_include: bool = True,
+) -> Dict[str, Any]:
+    """Freeze ONE active run against the shared queue-wide pool (v2 §5/§6.5).
+
+    The legacy single-snapshot body, extended so the BOM explosion consumes the
+    shared pools once (``shared_pools``/``trace``); requirements are stamped with
+    the new freeze version, pool key, zeroed drift and ``initial_snapshot_stock``;
+    own already-exported PlannedPurchase survive the rebuild as self-coverage;
+    and the freeze baseline/allocation/component tables are written. Requirement
+    ids are preserved through the ``(run_id,item_id)`` upsert. No commit here —
+    the orchestrator owns the transaction.
+    """
+    from .mrp_freeze import (
+        pool_key_for,
+        _write_freeze_baseline,
+        _write_freeze_allocation,
+        _write_freeze_component,
+    )
+
+    lines = (
+        db.query(ProductionPlanLine)
+        .filter(ProductionPlanLine.plan_id == int(plan.id))
+        .filter(ProductionPlanLine.qty > 0)
+        .order_by(ProductionPlanLine.item_id.asc(), ProductionPlanLine.bucket_date.asc())
+        .all()
+    )
+
     # A plan keeps one fixed run. Rebuilding it retains MrpRequirement ids so
     # already created production orders stay linked to this plan and visible
     # in its execution journal; only derived bucket/proposal rows are rebuilt.
@@ -809,10 +991,41 @@ def create_mrp_snapshot_from_period_plan(
         int(req.item_id): req
         for req in db.query(MrpRequirement).filter(MrpRequirement.run_id == int(run.run_id)).all()
     }
+    # Own already-exported PlannedPurchase survive the rebuild (v2 §5): their 1C
+    # supplier order is self-excluded from the pool, so the exported qty is this
+    # run's own coverage — consume it before booking any fresh purchase, and do
+    # not delete it. Unexported local recommendations are rebuilt as before.
+    own_exported_left: Dict[int, float] = {}
     if existing_req_by_item:
+        exported_purchase_ids = {
+            int(source_id)
+            for (source_id,) in (
+                db.query(SyncLink.source_id)
+                .join(PlannedPurchase, PlannedPurchase.purchase_id == SyncLink.source_id)
+                .filter(PlannedPurchase.run_id == int(run.run_id))
+                .filter(SyncLink.source_system == "PRODPLAN")
+                .filter(SyncLink.source_doctype == "planned_purchase")
+                .filter(SyncLink.target_entity == "Document_ЗаказПоставщику")
+                .filter(SyncLink.status == "success")
+                .filter(SyncLink.target_ref_key.isnot(None))
+                .all()
+            )
+        }
+        if exported_purchase_ids:
+            for iid, total in (
+                db.query(PlannedPurchase.item_id, func.sum(PlannedPurchase.qty))
+                .filter(PlannedPurchase.run_id == int(run.run_id))
+                .filter(PlannedPurchase.purchase_id.in_(exported_purchase_ids))
+                .group_by(PlannedPurchase.item_id)
+                .all()
+            ):
+                own_exported_left[int(iid)] = _to_float(total)
         db.query(PlannedOrderStage).filter(PlannedOrderStage.run_id == int(run.run_id)).delete(synchronize_session=False)
         db.query(PlannedOrder).filter(PlannedOrder.run_id == int(run.run_id)).delete(synchronize_session=False)
-        db.query(PlannedPurchase).filter(PlannedPurchase.run_id == int(run.run_id)).delete(synchronize_session=False)
+        purchase_delete = db.query(PlannedPurchase).filter(PlannedPurchase.run_id == int(run.run_id))
+        if exported_purchase_ids:
+            purchase_delete = purchase_delete.filter(PlannedPurchase.purchase_id.notin_(exported_purchase_ids))
+        purchase_delete.delete(synchronize_session=False)
         db.query(PlannedRework).filter(PlannedRework.run_id == int(run.run_id)).delete(synchronize_session=False)
         db.query(MrpRequirementBucket).filter(MrpRequirementBucket.run_id == int(run.run_id)).delete(synchronize_session=False)
 
@@ -833,7 +1046,9 @@ def create_mrp_snapshot_from_period_plan(
     # gross_map[item_id][bucket_date] = gross qty (before stock)
     # net_map[item_id][bucket_date]   = net qty  (after stock)
     # bom_level_map[item_id]          = 0 for plan items, 1+ for components
-    gross_map, net_map, bom_level_map = _explode_bom_net_first(db, buckets_by_item)
+    gross_map, net_map, bom_level_map = _explode_bom_net_first(
+        db, buckets_by_item, shared_pools, trace
+    )
 
     # --- Persist MrpRequirement + MrpRequirementBucket for every item with demand ---
     req_count = 0
@@ -849,6 +1064,9 @@ def create_mrp_snapshot_from_period_plan(
         total_net = sum(float(q) for q in net_buckets.values()) if net_buckets else 0.0
         bom_lvl = bom_level_map.get(item_id, 0)
 
+        pk = pool_key_for(int(item_id))
+        item_trace = trace.by_item.get(int(item_id))
+        initial_stock = float(item_trace.stock_alloc) if item_trace else 0.0
         req = existing_req_by_item.get(int(item_id))
         if req is None:
             req = MrpRequirement(
@@ -871,6 +1089,13 @@ def create_mrp_snapshot_from_period_plan(
             req.period_from = plan.period_from
             req.period_to = plan.period_to
             req.bom_level = bom_lvl
+        # Freeze v2 stamps: version, zeroed drift, pool key, frozen stock alloc.
+        req.freeze_version = int(new_version)
+        req.drift_adjustment_qty = 0.0
+        req.characteristic_ref = pk.characteristic_ref
+        req.organization_ref = pk.organization_ref
+        req.planning_stock_pool = pk.planning_stock_pool
+        req.initial_snapshot_stock = initial_stock
         db.flush()
         req_by_item[item_id] = req
         seen_requirement_item_ids.add(int(item_id))
@@ -898,12 +1123,20 @@ def create_mrp_snapshot_from_period_plan(
     for item_id, req in existing_req_by_item.items():
         if item_id in seen_requirement_item_ids:
             continue
+        pk = pool_key_for(int(item_id))
         req.total_required_qty = 0.0
         req.net_required_qty = 0.0
         req.covered_qty = 0.0
         req.remaining_qty = 0.0
         req.period_from = plan.period_from
         req.period_to = plan.period_to
+        # Dropped item: still re-stamp the freeze version (initial stock = 0).
+        req.freeze_version = int(new_version)
+        req.drift_adjustment_qty = 0.0
+        req.characteristic_ref = pk.characteristic_ref
+        req.organization_ref = pk.organization_ref
+        req.planning_stock_pool = pk.planning_stock_pool
+        req.initial_snapshot_stock = 0.0
 
     # --- Allocate PlannedOrder / PlannedPurchase / PlannedRework by replenishment flow ---
     allocatable_item_ids = [
@@ -914,6 +1147,7 @@ def create_mrp_snapshot_from_period_plan(
     rework_count = 0
     production_count = 0
     stage_count = 0
+    frozen_schedule_warnings: List[Dict[str, Any]] = []
     created_production_orders: List[PlannedOrder] = []
     if allocatable_item_ids:
         items_by_id: Dict[int, Item] = {
@@ -928,23 +1162,11 @@ def create_mrp_snapshot_from_period_plan(
             .all()
         }
 
-        # Identify purchased items and pre-load active supplier orders for them.
-        # Supplier orders with delivery_date <= plan.period_to reduce the net
-        # demand that we need to issue PlannedPurchase for.
-        purchase_item_ids = [
-            iid for iid in allocatable_item_ids
-            if classify_replenishment_flow(
-                getattr(items_by_id.get(iid), "replenishment_method", None)
-            ) == REPLENISHMENT_FLOW_PURCHASE
-        ]
-        # Mutable working copy: {item_id: [{"delivery_date": date, "remaining_qty": float}, ...]}
-        # Already sorted by delivery_date ascending — consumed greedily per bucket.
-        supplier_work: Dict[int, List[Dict[str, Any]]] = {
-            iid: [dict(row) for row in rows]
-            for iid, rows in _load_purchase_supplier_remaining(
-                db, purchase_item_ids, plan.period_to
-            ).items()
-        }
+        # Freeze v2: the supplier pool is the queue-wide, consume-once ledger
+        # (built once with max-cutoff and own orders self-excluded). Alias it —
+        # NOT a copy — so this run's greedy consumption persists to the next run.
+        # Per-bucket phasing (delivery_date <= bucket_date) is preserved below.
+        supplier_work: Dict[int, List[Dict[str, Any]]] = shared_pools.supplier
 
         for iid in allocatable_item_ids:
             item = items_by_id.get(iid)
@@ -977,6 +1199,17 @@ def create_mrp_snapshot_from_period_plan(
                         used = min(avail, remaining_need)
                         sup_row["remaining_qty"] = max(avail - used, 0.0)
                         remaining_need = max(remaining_need - used, 0.0)
+                        trace.by_item[int(iid)].supplier_allocs.append((sup_row, used))
+
+                    # Own already-exported PlannedPurchase (kept over the rebuild)
+                    # is this run's own coverage — consume it before booking any
+                    # fresh purchase. It is NOT written to freeze_allocation (its
+                    # 1C order is self-excluded from the shared supplier pool).
+                    if remaining_need > 1e-9 and own_exported_left.get(int(iid), 0.0) > 1e-12:
+                        avail_own = own_exported_left.get(int(iid), 0.0)
+                        used_own = min(avail_own, remaining_need)
+                        own_exported_left[int(iid)] = avail_own - used_own
+                        remaining_need = max(remaining_need - used_own, 0.0)
 
                     # Full bucket demand is considered covered (by supplier or planned purchase).
                     alloc_total_qty += net_qty
@@ -1194,20 +1427,44 @@ def create_mrp_snapshot_from_period_plan(
                 elif isinstance(finish_dt, date):
                     order.finish_date = finish_dt
 
-            if schedule_warnings:
+            frozen_schedule_warnings = schedule_warnings
+            # Only the include run records scheduler warnings on run.warnings
+            # (legacy single-snapshot behaviour). Other runs report them in the
+            # refreeze result only, never mutating their own header (v2 §6.5d).
+            if schedule_warnings and is_include:
                 run.warnings = list(run.warnings or []) + schedule_warnings
 
-    db.commit()
+    # --- Freeze v2 ledger writers (per-run, per-version, frozen_at=now) ---
+    frozen_item_ids = sorted(
+        int(iid)
+        for iid, gross_buckets in gross_map.items()
+        if sum(float(q) for q in gross_buckets.values()) > 1e-9
+    )
+    baseline_rows = _write_freeze_baseline(
+        db, run, new_version, frozen_item_ids, shared_pools.stock_initial, now
+    )
+    allocation_rows = _write_freeze_allocation(
+        db, run, new_version, trace, req_by_item, shared_pools.stock_initial, now
+    )
+    component_rows = _write_freeze_component(db, run, new_version, trace, now)
+    run.active_freeze_version = int(new_version)
+
+    # No commit here — the orchestrator owns the queue transaction.
     return {
         "status": "ok",
         "run_id": int(run.run_id),
         "plan_id": int(plan.id),
+        "freeze_version": int(new_version),
         "requirement_count": int(req_count),
         "bucket_count": int(bucket_count),
         "production_count": int(production_count),
         "stage_count": int(stage_count),
         "purchase_count": int(purchase_count),
         "rework_count": int(rework_count),
+        "baseline_rows": int(baseline_rows),
+        "allocation_rows": int(allocation_rows),
+        "component_rows": int(component_rows),
+        "schedule_warnings": len(frozen_schedule_warnings),
     }
 
 

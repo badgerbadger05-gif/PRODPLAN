@@ -655,6 +655,15 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
     if run.source_plan_id is None:
         raise ValueError(f"run_id={run_id}: прогон не привязан к плану периода")
 
+    # Freeze v2 guard (§11, temporary — the drift increment removes the
+    # re-explosion entirely). Once a run carries an active freeze version its
+    # net_required_qty is the authoritative frozen value; the legacy re-explosion
+    # here re-credits the FULL shared stock per run and would collapse later
+    # runs' net to ~0 and trim their (correct) purchases. Under the guard we do
+    # NOT persist the re-derived net and do NOT trim planned purchases; the
+    # production/purchase top-up for genuine gaps is kept.
+    freeze_guard = run.active_freeze_version is not None
+
     snapshot_requirements = (
         db.query(MrpRequirement)
         .filter(MrpRequirement.run_id == int(run.run_id))
@@ -757,10 +766,14 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
         req = req_by_item.get(iid)
         current_net = _to_float(current_net_by_item.get(iid, 0.0))
 
-        if req is not None:
+        if req is not None and not freeze_guard:
             req.net_required_qty = current_net
 
-        if flow != REPLENISHMENT_FLOW_PURCHASE and existing_planned_purchase.get(iid, 0.0) > EPS:
+        if (
+            not freeze_guard
+            and flow != REPLENISHMENT_FLOW_PURCHASE
+            and existing_planned_purchase.get(iid, 0.0) > EPS
+        ):
             pruned = _trim_unexported_planned_purchases(
                 db,
                 run_id=int(run.run_id),
@@ -820,19 +833,20 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
                 if req is not None:
                     req.covered_qty = 0.0
                     req.remaining_qty = 0.0
-                pruned = _trim_unexported_planned_purchases(
-                    db,
-                    run_id=int(run.run_id),
-                    item_id=iid,
-                    target_qty=0.0,
-                    dry_run=dry_run,
-                )
-                if pruned:
-                    purchase_pruned.append(pruned)
-                    existing_planned_purchase[iid] = max(
-                        existing_planned_purchase.get(iid, 0.0) - _to_float(pruned.get("removed_qty")),
-                        0.0,
+                if not freeze_guard:
+                    pruned = _trim_unexported_planned_purchases(
+                        db,
+                        run_id=int(run.run_id),
+                        item_id=iid,
+                        target_qty=0.0,
+                        dry_run=dry_run,
                     )
+                    if pruned:
+                        purchase_pruned.append(pruned)
+                        existing_planned_purchase[iid] = max(
+                            existing_planned_purchase.get(iid, 0.0) - _to_float(pruned.get("removed_qty")),
+                            0.0,
+                        )
                 continue
             target = current_net
             for sup_row in supplier_work.get(iid, []):
@@ -845,17 +859,18 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
                 sup_row["remaining_qty"] = max(avail - used, 0.0)
                 target -= used
             already = existing_planned_purchase.get(iid, 0.0)
-            pruned = _trim_unexported_planned_purchases(
-                db,
-                run_id=int(run.run_id),
-                item_id=iid,
-                target_qty=target,
-                dry_run=dry_run,
-            )
-            if pruned:
-                purchase_pruned.append(pruned)
-                already = max(already - _to_float(pruned.get("removed_qty")), 0.0)
-                existing_planned_purchase[iid] = already
+            if not freeze_guard:
+                pruned = _trim_unexported_planned_purchases(
+                    db,
+                    run_id=int(run.run_id),
+                    item_id=iid,
+                    target_qty=target,
+                    dry_run=dry_run,
+                )
+                if pruned:
+                    purchase_pruned.append(pruned)
+                    already = max(already - _to_float(pruned.get("removed_qty")), 0.0)
+                    existing_planned_purchase[iid] = already
             gap = target - already
             if req is not None:
                 req.covered_qty = min(current_net - max(gap, 0.0), current_net)
@@ -922,6 +937,7 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
         "source_plan_id": int(run.source_plan_id),
         "status": "ok",
         "dry_run": bool(dry_run),
+        "freeze_guard": bool(freeze_guard),
         "production_added": production_added,
         "purchase_added": purchase_added,
         "purchase_pruned": purchase_pruned,

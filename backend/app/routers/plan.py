@@ -1498,6 +1498,32 @@ class ReconcileRequest(BaseModel):
     dry_run: bool = False
 
 
+class RefreezeRequest(BaseModel):
+    dry_run: bool = False
+    plan_id: Optional[int] = None
+
+
+@router.post("/mrp-snapshot/refreeze")
+async def refreeze_mrp_snapshots(
+    req: RefreezeRequest = RefreezeRequest(),
+    db: Session = Depends(get_db),
+):
+    """Заморозка v2: пере-заморозить остаточный нетто-расчёт всей активной
+    области MRP (все открытые FIXED_SNAPSHOT-планы) против ОДНОГО общего пула
+    запасов/поставок/WIP — физическая единица кредитуется не более чем одному
+    плану. ``plan_id`` включает конкретный план в область (создаёт/обновляет его
+    прогон). ``dry_run=true`` считает и откатывает, ничего не записывая.
+    """
+    from ..services.mrp_freeze import refreeze_active_snapshots
+
+    try:
+        return refreeze_active_snapshots(
+            db, include_plan_id=req.plan_id, dry_run=bool(req.dry_run)
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.post("/reconcile")
 async def reconcile_active_snapshots(
     req: ReconcileRequest = ReconcileRequest(),
