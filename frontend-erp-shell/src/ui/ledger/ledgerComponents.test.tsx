@@ -20,12 +20,15 @@ describe('ledger presentation primitives', () => {
           sourceDocument: 'СборкаЗапасов ПТ-5',
           correlationId: 'cycle-42',
         }]}
+        activeId="posting-1"
         onActivate={activate}
       />,
     )
 
     expect(screen.getByText('+4')).toBeInTheDocument()
-    fireEvent.keyDown(screen.getByRole('row', { name: /Выпуск/ }), { key: 'Enter' })
+    const row = screen.getByRole('row', { name: /Выпуск/ })
+    expect(row).toHaveAttribute('tabindex', '0')
+    fireEvent.keyDown(row, { key: 'Enter' })
     expect(activate).toHaveBeenCalledOnce()
   })
 
@@ -59,4 +62,3 @@ describe('ledger presentation primitives', () => {
     expect(screen.getByText('Предупреждение')).toBeInTheDocument()
   })
 })
-

@@ -10,6 +10,7 @@ const DbrProgramsPage = lazy(() => import('./pages/DbrProgramsPage').then((modul
 const DbrPurchasePage = lazy(() => import('./pages/DbrPurchasePage').then((module) => ({ default: module.DbrPurchasePage })))
 const DbrSettingsPage = lazy(() => import('./pages/DbrSettingsPage').then((module) => ({ default: module.DbrSettingsPage })))
 const HomePage = lazy(() => import('./pages/HomePage').then((module) => ({ default: module.HomePage })))
+const LedgerWorkspacePage = lazy(() => import('./pages/LedgerWorkspacePage').then((module) => ({ default: module.LedgerWorkspacePage })))
 const MrpResultPage = lazy(() => import('./pages/MrpResultPage').then((module) => ({ default: module.MrpResultPage })))
 const MrpRunsPage = lazy(() => import('./pages/MrpRunsPage').then((module) => ({ default: module.MrpRunsPage })))
 const PeriodPlanPage = lazy(() => import('./pages/PeriodPlanPage').then((module) => ({ default: module.PeriodPlanPage })))
@@ -82,6 +83,7 @@ export function App() {
             <Route path="/transfer-requests" element={<TransferRequestsPage />} />
             <Route path="/mrp-runs" element={<MrpRunsPage />} />
             <Route path="/mrp-runs/:runId" element={<MrpResultPage />} />
+            <Route path="/ledger" element={<LedgerWorkspacePage />} />
             <Route path="/resources" element={<ResourcesPage />} />
             <Route path="/workshop-binding-review" element={<WorkshopBindingReviewPage />} />
             <Route path="/stage-distribution" element={<StageDistributionPage />} />

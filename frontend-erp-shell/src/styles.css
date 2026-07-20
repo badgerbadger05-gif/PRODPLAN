@@ -2660,3 +2660,101 @@ button.dbrLaunchBtn {
 .dbrProcessingOverdueRow > td { background: #fdf3f3; }
 .dbrOverdueOrder { color: #b91c1c; font-weight: 600; white-space: nowrap; }
 .dbrOverdueBadge { color: #b91c1c; font-weight: 700; }
+.ledgerStatus {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+}
+
+.ledgerToolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.toolbarSpacer {
+  flex: 1;
+}
+
+.ledgerFilters {
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) 220px 160px auto;
+  gap: 8px;
+  align-items: end;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel2);
+}
+
+.ledgerFilters label {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.ledgerSplit {
+  display: grid;
+  grid-template-columns: minmax(620px, 1.45fr) minmax(420px, 1fr);
+  min-height: 0;
+  flex: 1;
+}
+
+.ledgerDetail {
+  overflow: auto;
+  min-width: 0;
+}
+
+.ledgerDetail .ledgerPostingTable {
+  font-size: 12px;
+}
+
+.ledgerPostingTable td > span,
+.ledgerPostingTable td > strong {
+  display: block;
+}
+
+.ledgerTimeline {
+  display: grid;
+  gap: 8px;
+  margin: 8px 0 18px;
+  padding: 0;
+  list-style: none;
+}
+
+.ledgerTimelineStep {
+  border-left: 3px solid var(--line);
+  padding: 7px 10px;
+  background: var(--panel2);
+}
+
+.ledgerTimelineStep.posting {
+  border-left-color: var(--blue);
+}
+
+.ledgerTimelineStep.reversal {
+  border-left-color: var(--red);
+}
+
+.ledgerTimelineStep > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.ledgerTimelineStep span,
+.ledgerTimelineStep p {
+  color: var(--muted);
+}
+
+.ledgerTimelineStep p {
+  margin: 5px 0;
+}
+
+@media (max-width: 1100px) {
+  .ledgerFilters,
+  .ledgerSplit {
+    grid-template-columns: 1fr;
+  }
+}
