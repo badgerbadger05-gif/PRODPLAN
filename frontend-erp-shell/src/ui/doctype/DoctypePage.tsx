@@ -32,6 +32,7 @@ type Props<Row, Filters extends object, Detail> = {
   onBack?: () => void
   renderFilters?: (state: DoctypeListState<Row, Filters, Detail>) => ReactNode
   renderTopBadge?: (state: DoctypeListState<Row, Filters, Detail>) => ReactNode
+  renderCommandBar?: (state: DoctypeListState<Row, Filters, Detail>) => ReactNode
   renderToolbarAfter?: (state: DoctypeListState<Row, Filters, Detail>) => ReactNode
   renderTable?: (state: DoctypeListState<Row, Filters, Detail>) => ReactNode
 }
@@ -48,6 +49,7 @@ export function DoctypePage<Row, Filters extends object, Detail>({
   onBack,
   renderFilters,
   renderTopBadge,
+  renderCommandBar,
   renderToolbarAfter,
   renderTable,
 }: Props<Row, Filters, Detail>) {
@@ -199,7 +201,9 @@ export function DoctypePage<Row, Filters extends object, Detail>({
           />
         )}
       >
-        <CommandBar doctype={doctype} state={state} access={access} onExportCsv={exportCsv} />
+        {renderCommandBar
+          ? renderCommandBar(state)
+          : <CommandBar doctype={doctype} state={state} access={access} onExportCsv={exportCsv} />}
         {renderToolbarAfter?.(state)}
         <SavedViewsBar
           resource={doctype.meta.name}

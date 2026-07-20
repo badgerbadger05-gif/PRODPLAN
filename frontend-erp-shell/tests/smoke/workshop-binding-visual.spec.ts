@@ -83,7 +83,7 @@ test.use({
   timezoneId: 'Europe/Moscow',
 })
 
-test('workshop binding review visual fixture', async ({ page }, testInfo) => {
+test('workshop binding review visual baseline', async ({ page }) => {
   await page.clock.setFixedTime(new Date('2026-07-20T12:00:00Z'))
   await mockWorkshopBindingApi(page)
 
@@ -105,14 +105,9 @@ test('workshop binding review visual fixture', async ({ page }, testInfo) => {
   await expect(page.getByRole('button', { name: 'Вид не привязан к участку (1)' })).toBeVisible()
   await expect(page.locator('.statusBar')).toContainText('Строки 1-1 из 1')
 
-  // Keep a deterministic candidate artifact, but intentionally do not create a
-  // repository baseline until the product migration has landed.
-  await testInfo.attach('workshop-binding-review-candidate', {
-    body: await page.locator('.app').screenshot({
-      animations: 'disabled',
-      caret: 'hide',
-      scale: 'css',
-    }),
-    contentType: 'image/png',
+  await expect(page.locator('.app')).toHaveScreenshot('workshop-binding-review.png', {
+    animations: 'disabled',
+    caret: 'hide',
+    scale: 'css',
   })
 })
