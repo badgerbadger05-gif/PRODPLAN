@@ -49,28 +49,10 @@ import { ProductionFilterBar } from './production-control/ProductionFilterBar'
 import { ProductionOrdersTable } from './production-control/ProductionOrdersTable'
 import { ProductionSettingsPane } from './production-control/ProductionSettingsPane'
 import type { ProductionOrderSortKey } from './production-control/productionOrdersDoctype'
-
-const limit = 100
-const coverageDrivenStatuses = new Set(['shortage', 'partial', 'ready'])
-
-function recordArray(value: unknown): Array<Record<string, unknown>> {
-  return Array.isArray(value) ? value.filter((row): row is Record<string, unknown> => Boolean(row) && typeof row === 'object') : []
-}
-
-function firstExportProblem(...summaries: Array<Record<string, unknown> | null | undefined>) {
-  for (const summary of summaries) {
-    if (!summary) continue
-    for (const entry of recordArray(summary.entries)) {
-      const problem = entry.error || entry.reason
-      if (problem) return String(problem)
-    }
-    for (const row of recordArray(summary.skipped_rows)) {
-      const problem = row.error || row.reason
-      if (problem) return String(problem)
-    }
-  }
-  return ''
-}
+import { ChainCloseDialog } from './production-control/ChainCloseDialog'
+import { ProduceDialog } from './production-control/ProduceDialog'
+import { WarehousePickerDialog } from './production-control/WarehousePickerDialog'
+import { coverageDrivenStatuses, firstExportProblem, issueIdsFromCreateResult, limit, recordArray } from './production-control/helpers'
 
 export function ProductionControlPage() {
   const [searchParams] = useSearchParams()
@@ -369,13 +351,6 @@ export function ProductionControlPage() {
     setWarehousePickerMode(mode)
     setWarehousePickerOpen(true)
     return true
-  }
-
-  function issueIdsFromCreateResult(result: MaterialIssueCreateResponse) {
-    return [
-      ...(result.created ?? []).map((row) => row.issue_id),
-      ...(result.reused ?? []).map((row) => row.issue_id),
-    ].filter(Boolean)
   }
 
   function prepareRouteSheetWindow() {
@@ -1000,183 +975,46 @@ export function ProductionControlPage() {
       </DocumentWindow>
 
       {produceOpen && produceRow && (
-        <div className="dialogOverlay" onClick={(e) => { if (e.target === e.currentTarget) setProduceOpen(false) }}>
-          <div className="dialogBox">
-            <div className="dialogHeader">Произвести - {produceRow.item_name}</div>
-            <div className="dialogBody">
-              {produceError && <div className="dialogError">{produceError}</div>}
-              {!canProduceRow && (
-                <div className="fieldHint danger">Эта строка уже произведена полностью.</div>
-              )}
-              <div className="dialogField">
-                <label>Количество ({produceRow.unit || 'шт'})</label>
-                <input
-                  type="number"
-                  min={0}
-                  step={1}
-                  value={produceQty}
-                  onChange={(e) => setProduceQty(e.target.value)}
-                  disabled={produceSaving}
-                />
-                {produceOverageQty > 0.000001 && (
-                  <div className="fieldHint">
-                    Больше плана на {produceOverageQty.toLocaleString('ru-RU')}: будет создано дополнительное перемещение материалов.
-                  </div>
-                )}
-              </div>
-              {produceOperations.length > 0 ? (
-                <div className="dialogField">
-                  <label>Исполнители операций</label>
-                  <div className="operationExecutorList">
-                    {produceOperations.map((operation) => (
-                      <div className="operationExecutorRow" key={operation.spec_operation_id}>
-                        <div className="operationExecutorMeta">
-                          <strong>{operation.line_number}. {operation.operation_name || 'Операция'}</strong>
-                          <span>{operation.stage_name || 'Этап не указан'} · норма {Number(operation.time_norm ?? 0).toLocaleString('ru-RU')}</span>
-                        </div>
-                        <select
-                          value={produceOperationEmployees[operation.spec_operation_id] || ''}
-                          onChange={(e) => setProduceOperationEmployees((current) => ({
-                            ...current,
-                            [operation.spec_operation_id]: e.target.value,
-                          }))}
-                          disabled={produceSaving || employeesLoading || produceOperationsLoading}
-                        >
-                          <option value="">{employeesLoading ? 'Загрузка сотрудников...' : 'Выберите сотрудника'}</option>
-                          {employees.map((employee) => (
-                            <option key={employee.employee_ref1c} value={employee.employee_ref1c}>
-                              {employee.employee_name}{employee.employee_type === 'brigade' ? ' [бригада]' : ''}{employee.employee_code ? ` (${employee.employee_code})` : ''}
-                            </option>
-                          ))}
-                        </select>
-                      </div>
-                    ))}
-                  </div>
-                  {!employeesLoading && employees.length === 0 && (
-                    <div className="fieldHint">Список пуст. Запустите синхронизацию сотрудников в разделе «Синхронизация».</div>
-                  )}
-                </div>
-              ) : (
-                <div className="dialogField">
-                  <label>Исполнитель</label>
-                  <select
-                    value={produceEmployeeRef}
-                    onChange={(e) => setProduceEmployeeRef(e.target.value)}
-                    disabled={produceSaving || employeesLoading || produceOperationsLoading}
-                  >
-                    <option value="">{produceOperationsLoading || employeesLoading ? 'Загрузка...' : 'Выберите сотрудника'}</option>
-                    {employees.map((employee) => (
-                      <option key={employee.employee_ref1c} value={employee.employee_ref1c}>
-                        {employee.employee_name}{employee.employee_type === 'brigade' ? ' [бригада]' : ''}{employee.employee_code ? ` (${employee.employee_code})` : ''}
-                      </option>
-                    ))}
-                  </select>
-                  {!employeesLoading && employees.length === 0 && (
-                    <div className="fieldHint">Список пуст. Запустите синхронизацию сотрудников в разделе «Синхронизация».</div>
-                  )}
-                </div>
-              )}
-              <div className="dialogCheckRow">
-                <input
-                  type="checkbox"
-                  id="produceDryRun"
-                  checked={produceDryRun}
-                  onChange={(e) => { setProduceDryRun(e.target.checked); setProduceDryRunPayload(null) }}
-                  disabled={produceSaving}
-                />
-                <label htmlFor="produceDryRun">dry_run - показать payload, не отправлять в 1С</label>
-              </div>
-              {produceDryRunPayload && <div className="dialogPreview">{produceDryRunPayload}</div>}
-            </div>
-            <div className="dialogFooter">
-              <button onClick={() => setProduceOpen(false)} disabled={produceSaving}>Отмена</button>
-              <button
-                className="primary"
-                onClick={() => void submitProduce()}
-                disabled={!canProduceRow || produceSaving || employeesLoading || produceOperationsLoading || (employees.length > 0 && (produceOperations.length ? !allOperationExecutorsSelected : !produceEmployeeRef))}
-              >
-                {produceSaving ? 'Создаём...' : produceDryRun ? 'Показать payload' : 'Создать в 1С'}
-              </button>
-            </div>
-          </div>
-        </div>
+        <ProduceDialog
+          produceRow={produceRow}
+          produceError={produceError}
+          canProduceRow={canProduceRow}
+          produceQty={produceQty}
+          setProduceQty={setProduceQty}
+          produceSaving={produceSaving}
+          produceOverageQty={produceOverageQty}
+          produceOperations={produceOperations}
+          produceOperationEmployees={produceOperationEmployees}
+          setProduceOperationEmployees={setProduceOperationEmployees}
+          employees={employees}
+          employeesLoading={employeesLoading}
+          produceOperationsLoading={produceOperationsLoading}
+          produceEmployeeRef={produceEmployeeRef}
+          setProduceEmployeeRef={setProduceEmployeeRef}
+          produceDryRun={produceDryRun}
+          setProduceDryRun={setProduceDryRun}
+          setProduceDryRunPayload={setProduceDryRunPayload}
+          produceDryRunPayload={produceDryRunPayload}
+          allOperationExecutorsSelected={allOperationExecutorsSelected}
+          setProduceOpen={setProduceOpen}
+          submitProduce={submitProduce}
+        />
       )}
       {chainOpen && (
-        <div className="dialogOverlay" onClick={(e) => { if (e.target === e.currentTarget && !chainSaving) setChainOpen(false) }}>
-          <div className="dialogBox">
-            <div className="dialogHeader">Закрыть цепочку окраска↔сварка</div>
-            <div className="dialogBody">
-              {chainError && <div className="dialogError">{chainError}</div>}
-              {chainLoading && <div className="fieldHint">Загрузка предпросмотра...</div>}
-              {chainPreview && (
-                <>
-                  <div className="fieldHint">
-                    Будут созданы выпуски по обеим строкам, СборкаЗапасов обоих заказов и один
-                    комбинированный сдельный наряд (основание — окрасочная сборка). Оба заказа
-                    будут завершены в 1С.
-                  </div>
-                  {([
-                    ['Сварка', chainPreview.weld, chainWeldOps],
-                    ['Окраска', chainPreview.paint, chainPaintOps],
-                  ] as Array<[string, Record<string, any>, ProductionOperationOption[]]>).map(([label, side, ops]) => (
-                    <div className="dialogField" key={label}>
-                      <label>
-                        {label}: {Number(side?.qty_to_produce ?? 0) > 0
-                          ? `выпуск ${Number(side.qty_to_produce).toLocaleString('ru-RU')} шт`
-                          : `выпуск уже создан (№${side?.existing_manufacture_id ?? '—'})`}
-                      </label>
-                      {ops.length > 0 && (
-                        <div className="operationExecutorList">
-                          {ops.map((operation) => (
-                            <div className="operationExecutorRow" key={operation.spec_operation_id}>
-                              <div className="operationExecutorMeta">
-                                <strong>{operation.line_number}. {operation.operation_name || 'Операция'}</strong>
-                                <span>{operation.stage_name || 'Этап не указан'} · норма {Number(operation.time_norm ?? 0).toLocaleString('ru-RU')}</span>
-                              </div>
-                              <select
-                                value={chainOperationEmployees[operation.spec_operation_id] || ''}
-                                onChange={(e) => setChainOperationEmployees((current) => ({
-                                  ...current,
-                                  [operation.spec_operation_id]: e.target.value,
-                                }))}
-                                disabled={chainSaving || employeesLoading}
-                              >
-                                <option value="">{employeesLoading ? 'Загрузка сотрудников...' : 'Выберите сотрудника'}</option>
-                                {employees.map((employee) => (
-                                  <option key={employee.employee_ref1c} value={employee.employee_ref1c}>
-                                    {employee.employee_name}{employee.employee_type === 'brigade' ? ' [бригада]' : ''}{employee.employee_code ? ` (${employee.employee_code})` : ''}
-                                  </option>
-                                ))}
-                              </select>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  ))}
-                </>
-              )}
-            </div>
-            <div className="dialogFooter">
-              <button onClick={() => setChainOpen(false)} disabled={chainSaving}>Отмена</button>
-              <button
-                className="primary"
-                onClick={() => void submitChainClose()}
-                disabled={
-                  chainSaving
-                  || chainLoading
-                  || !chainPreview
-                  || (employees.length > 0
-                    && [...chainWeldOps, ...chainPaintOps].some(
-                      (operation) => !chainOperationEmployees[operation.spec_operation_id],
-                    ))
-                }
-              >
-                {chainSaving ? 'Закрываем...' : 'Закрыть оба заказа в 1С'}
-              </button>
-            </div>
-          </div>
-        </div>
+        <ChainCloseDialog
+          chainSaving={chainSaving}
+          setChainOpen={setChainOpen}
+          chainError={chainError}
+          chainLoading={chainLoading}
+          chainPreview={chainPreview}
+          chainWeldOps={chainWeldOps}
+          chainPaintOps={chainPaintOps}
+          chainOperationEmployees={chainOperationEmployees}
+          setChainOperationEmployees={setChainOperationEmployees}
+          employees={employees}
+          employeesLoading={employeesLoading}
+          submitChainClose={submitChainClose}
+        />
       )}
       <RootProductFilterDialog
         open={rootDialogOpen}
@@ -1192,52 +1030,15 @@ export function ProductionControlPage() {
         onClose={() => setRootDialogOpen(false)}
       />
       {warehousePickerOpen && warehousePickerCandidates.length > 0 && (
-        <div className="dialogOverlay" onClick={(e) => { if (e.target === e.currentTarget) setWarehousePickerOpen(false) }}>
-          <div className="dialogBox">
-            <div className="dialogHeader">Выберите склад-источник материалов</div>
-            <div className="dialogBody">
-              <p>Найдено несколько складов с остатком ({warehousePickerProductIds.length} поз.). Выберите склад отправитель:</p>
-              {warehousePickerComponents.length > 0 && (
-                <div className="dialogField">
-                  <label>Детали</label>
-                  <div className="fieldHint">
-                    {warehousePickerComponents.map((component, index) => (
-                      <div key={`${component.item_name}-${component.item_article ?? ''}-${index}`}>
-                        {component.item_name}{component.item_article ? ` (${component.item_article})` : ''} · нужно {component.required_qty.toLocaleString('ru-RU')}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-              {warehousePickerCandidates.map((c) => (
-                <div key={c.ref1c} className="dialogField" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <input
-                    type="radio"
-                    id={`wh-${c.ref1c}`}
-                    name="warehousePicker"
-                    value={c.ref1c}
-                    checked={warehousePickerSelected === c.ref1c}
-                    onChange={() => setWarehousePickerSelected(c.ref1c)}
-                  />
-                  <label htmlFor={`wh-${c.ref1c}`}>
-                    {c.name}
-                    {typeof c.qty === 'number'
-                      ? ` (${c.qty.toLocaleString('ru-RU')})`
-                      : typeof c.components_covered === 'number' && typeof c.total_components === 'number'
-                        ? ` (${c.components_covered}/${c.total_components} компонентов)`
-                        : ''}
-                  </label>
-                </div>
-              ))}
-            </div>
-            <div className="dialogFooter">
-              <button onClick={() => setWarehousePickerOpen(false)}>Отмена</button>
-              <button className="primary" onClick={() => void confirmWarehousePicker()} disabled={!warehousePickerSelected}>
-                Подтвердить
-              </button>
-            </div>
-          </div>
-        </div>
+        <WarehousePickerDialog
+          warehousePickerCandidates={warehousePickerCandidates}
+          warehousePickerComponents={warehousePickerComponents}
+          warehousePickerProductIds={warehousePickerProductIds}
+          warehousePickerSelected={warehousePickerSelected}
+          setWarehousePickerOpen={setWarehousePickerOpen}
+          setWarehousePickerSelected={setWarehousePickerSelected}
+          confirmWarehousePicker={confirmWarehousePicker}
+        />
       )}
     </main>
   )
