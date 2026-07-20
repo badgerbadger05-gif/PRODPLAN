@@ -5,8 +5,13 @@ import {
   type TransferIssueRow,
   type TransferIssuesResponse,
 } from '../../domain/productionControl'
-import { api } from '../../lib/api'
 import { dateRu, qty } from '../../lib/format'
+import {
+  deleteMaterialIssue,
+  getMaterialIssue,
+  listMaterialIssues,
+  markMaterialIssueAssembled,
+} from '../../services/productionControl'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
 import { tableColumnStyle, tableMinWidth } from '../tableDoctype'
@@ -73,7 +78,7 @@ export function TransferRequestsPage() {
       if (status) params.set('status', status)
       if (sourceWarehouseRef) params.set('source_warehouse_ref1c', sourceWarehouseRef)
       if (search.trim()) params.set('search', search.trim())
-      const data = await api<TransferIssuesResponse>(`/v1/production-control/material-issues?${params.toString()}`)
+      const data = await listMaterialIssues(params)
       setRows(data.rows ?? [])
       setSourceWarehouses(data.source_warehouses ?? [])
       setTotal(data.total ?? 0)
@@ -92,7 +97,7 @@ export function TransferRequestsPage() {
   const loadDetail = useCallback(async (issueId: number) => {
     setDetail(null)
     try {
-      setDetail(await api<MaterialIssueDetail>(`/v1/production-control/material-issues/${issueId}`))
+      setDetail(await getMaterialIssue(issueId))
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
@@ -104,10 +109,7 @@ export function TransferRequestsPage() {
     setError('')
     setMessage('')
     try {
-      await api(`/v1/production-control/material-issues/${activeRow.issue_id}/assembled`, {
-        method: 'POST',
-        body: JSON.stringify({ allow_production: true }),
-      })
+      await markMaterialIssueAssembled(activeRow.issue_id)
       setMessage(`Перемещение ${activeRow.one_c_number || activeRow.document_number} проведено, обеспечение обновлено: собрано`)
       await load(offsetRef.current)
     } catch (e) {
@@ -124,7 +126,7 @@ export function TransferRequestsPage() {
     setError('')
     setMessage('')
     try {
-      await api(`/v1/production-control/material-issues/${activeRow.issue_id}`, { method: 'DELETE' })
+      await deleteMaterialIssue(activeRow.issue_id)
       setMessage(`Удалена локальная заявка ${activeRow.document_number}`)
       await load(offsetRef.current)
     } catch (e) {

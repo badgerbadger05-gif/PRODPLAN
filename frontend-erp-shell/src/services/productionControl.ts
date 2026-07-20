@@ -1,10 +1,12 @@
 import type {
   ControlSettings,
   EmployeesResponse,
+  MaterialIssueDetail,
   MaterialIssueCreateResponse,
   MaterialsResponse,
   OrdersResponse,
   ProductionOperationsResponse,
+  TransferIssuesResponse,
 } from '../domain/productionControl'
 import { api } from '../lib/api'
 
@@ -137,6 +139,18 @@ export function markMaterialIssueAssembled(issueId: number) {
     method: 'POST',
     body: JSON.stringify({ allow_production: true }),
   })
+}
+
+export function listMaterialIssues(params: URLSearchParams) {
+  return api<TransferIssuesResponse>(`/v1/production-control/material-issues?${params.toString()}`)
+}
+
+export function getMaterialIssue(issueId: number) {
+  return api<MaterialIssueDetail>(`/v1/production-control/material-issues/${issueId}`)
+}
+
+export function deleteMaterialIssue(issueId: number) {
+  return api(`/v1/production-control/material-issues/${issueId}`, { method: 'DELETE' })
 }
 
 export function syncPostedTransfers() {
