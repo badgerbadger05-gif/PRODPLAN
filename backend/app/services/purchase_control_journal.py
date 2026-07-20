@@ -437,6 +437,19 @@ def list_journal(
     today = today or date.today()
     run_id = latest_fixed_run_id(db)
 
+    # The journal's not-yet-ordered ("to order") rows come from the union of ALL
+    # active FIXED_SNAPSHOT runs (one per open plan), not just the latest run.
+    # Each run owns its own PlannedPurchase rows (reconciliation consumes the
+    # shared pools once across the queue), and _to_order_row_key namespaces by
+    # run_id so multi-run grouping stays correct. The latest fixed run is folded
+    # in as a fallback so legacy runs without a source_plan_id (which the active
+    # filter skips) keep appearing exactly as before.
+    from .mrp_reconciliation import _latest_active_snapshot_run_ids
+
+    to_order_run_ids: List[int] = list(_latest_active_snapshot_run_ids(db))
+    if run_id is not None and run_id not in to_order_run_ids:
+        to_order_run_ids.append(run_id)
+
     rows = _supplier_order_rows(
         db,
         order_id=order_id,
@@ -446,9 +459,10 @@ def list_journal(
         today=today,
     )
     if include_to_order and order_id is None:
-        rows.extend(
-            _to_order_rows(db, run_id=run_id, supplier_id=supplier_id, search=search, today=today)
-        )
+        for rid in to_order_run_ids:
+            rows.extend(
+                _to_order_rows(db, run_id=rid, supplier_id=supplier_id, search=search, today=today)
+            )
 
     if state:
         state_norm = _normalize_state(state)

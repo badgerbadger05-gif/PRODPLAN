@@ -208,6 +208,47 @@ def test_list_journal_includes_unordered_mrp_purchases(db_session):
     assert all(r["line_status"] != "to_order" for r in without["rows"])
 
 
+def test_journal_aggregates_active_runs(db_session):
+    # Two active FIXED_SNAPSHOT runs (one per open plan), each owning its own
+    # PlannedPurchase → the journal's "to order" rows must come from BOTH runs.
+    supplier = _make_supplier(db_session, "s-ref-1", "ООО Метиз")
+    item = _make_item(db_session, "M-AGG", "Болт М10", supplier_ref="s-ref-1")
+
+    run_a = PlanningRun(
+        status="FIXED_SNAPSHOT", config_snapshot={},
+        source_plan_id=901, period_to=date(2026, 8, 31),
+    )
+    run_b = PlanningRun(
+        status="FIXED_SNAPSHOT", config_snapshot={},
+        source_plan_id=902, period_to=date(2026, 9, 30),
+    )
+    db_session.add_all([run_a, run_b])
+    db_session.flush()
+
+    db_session.add(
+        PlannedPurchase(
+            run_id=run_a.run_id, item_id=item.item_id, requested_qty=5, planned_qty=5, qty=5,
+            need_date=date(2026, 8, 20), order_date=date(2026, 8, 10), lead_time_days=10,
+            bucket_date=date(2026, 8, 20), supplier_ref1c="s-ref-1",
+        )
+    )
+    db_session.add(
+        PlannedPurchase(
+            run_id=run_b.run_id, item_id=item.item_id, requested_qty=7, planned_qty=7, qty=7,
+            need_date=date(2026, 9, 20), order_date=date(2026, 9, 10), lead_time_days=10,
+            bucket_date=date(2026, 9, 20), supplier_ref1c="s-ref-1",
+        )
+    )
+    db_session.commit()
+
+    result = list_journal(db_session, today=TODAY)
+
+    to_order = [row for row in result["rows"] if row["line_status"] == "to_order"]
+    assert {row["run_id"] for row in to_order} == {run_a.run_id, run_b.run_id}
+    assert sorted(row["quantity"] for row in to_order) == [5, 7]
+    assert result["summary"]["to_order"] == 2
+
+
 def test_list_journal_aggregates_duplicate_unordered_mrp_purchases(db_session):
     run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={})
     db_session.add(run)

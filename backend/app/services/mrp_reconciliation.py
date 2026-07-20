@@ -35,6 +35,7 @@ additionally deduped against supplier orders already arriving and
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set
 
@@ -79,6 +80,30 @@ from .paint_weld_pairs import is_welded_blocked
 
 EPS = 1e-9
 FIXED_SNAPSHOT_STATUS = "FIXED_SNAPSHOT"
+
+
+@dataclass
+class SharedPools:
+    """Mutable, consume-once ledgers shared across the active-run reconcile queue.
+
+    Each ledger is built ONCE for all active runs and mutated in place as every
+    run nets its demand against it, so the same physical stock / open supplier
+    supply / open WIP is credited to at most one run.
+
+    * ``stock`` — ``{item_id: remaining effective stock}``.
+    * ``supplier`` — ``{item_id: [supplier-remaining rows]}`` (rows mutated in
+      place via ``remaining_qty``; same list objects reused for every run).
+    * ``prodsupply`` — ``{item_id: remaining open production/WIP qty}``.
+
+    When ``reconcile_snapshot`` is called WITHOUT a ``SharedPools`` (the default
+    ``shared_pools=None``) it re-reads the full pools per run exactly as before —
+    single-run callers are unaffected.
+    """
+
+    stock: Dict[int, float]
+    supplier: Dict[int, List[Dict[str, Any]]]
+    prodsupply: Dict[int, float]
+
 PRODUCTION_ORDER_ENTITY = "Document_ЗаказНаПроизводство"
 DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
 
@@ -640,11 +665,24 @@ def _link_orphan_mrp_products_to_requirements(
         linked_items.add(int(product.item_id))
     return {"linked": len(rows), "items": sorted(linked_items)}
 
-def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Dict[str, Any]:
+def reconcile_snapshot(
+    db: Session,
+    run_id: int,
+    *,
+    dry_run: bool = False,
+    shared_pools: Optional[SharedPools] = None,
+) -> Dict[str, Any]:
     """
     Recompute current net demand for one FIXED_SNAPSHOT run and top up the gap.
 
     Returns a per-item summary of what was (or, in dry-run, would be) added.
+
+    When ``shared_pools`` is provided, the three shared pools (effective stock,
+    open supplier supply, open production/WIP) are consumed from the passed-in
+    mutable ledgers instead of being re-read in full — so a physical unit is
+    credited to at most one run across the active-run queue. When it is ``None``
+    (the default) the behaviour is byte-for-byte identical to before: each pool
+    is re-read fresh for this run.
     """
     run = db.query(PlanningRun).filter(PlanningRun.run_id == int(run_id)).one_or_none()
     if run is None:
@@ -699,10 +737,23 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
     current_net_by_item: Dict[int, float] = {}
     for iid in sorted(current_gross_by_item):
         gross = _to_float(current_gross_by_item.get(iid, 0.0))
-        current_net_by_item[iid] = (
-            gross if iid in root_production_item_ids
-            else max(gross - _to_float(stock_by_item.get(iid, 0.0)), 0.0)
-        )
+        if iid in root_production_item_ids:
+            # Root production items consume no stock (net == gross), exactly as
+            # in the single-run path.
+            current_net_by_item[iid] = gross
+        elif shared_pools is not None:
+            # Consume-once against the shared stock ledger so a physical unit is
+            # netted by at most one run. For a single visit this is arithmetically
+            # identical to ``max(gross - stock, 0)``; the mutation only matters
+            # for the NEXT run in the shared queue.
+            available = _to_float(shared_pools.stock.get(iid, 0.0))
+            consumed = min(available, gross)
+            shared_pools.stock[iid] = available - consumed
+            current_net_by_item[iid] = gross - consumed
+        else:
+            current_net_by_item[iid] = max(
+                gross - _to_float(stock_by_item.get(iid, 0.0)), 0.0
+            )
 
     req_by_item = _ensure_reconciled_requirements(
         db,
@@ -718,7 +769,14 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
     # материализуются (заказываются по цепочке от окраски). Сироты (нет активной
     # пары) не входят и материализуются как раньше.
     welded_blocked = is_welded_blocked(db, item_ids)
-    active_production_by_item = _active_production_qty_by_item(db, item_ids)
+    # WIP supply: the shared ledger (built once for all active items) is aliased
+    # in the shared path so run N's consumption persists to run N+1; otherwise a
+    # fresh per-run read (single-run behaviour unchanged).
+    active_production_by_item = (
+        shared_pools.prodsupply
+        if shared_pools is not None
+        else _active_production_qty_by_item(db, item_ids)
+    )
     items_by_id: Dict[int, Item] = {
         int(r.item_id): r
         for r in db.query(Item).filter(Item.item_id.in_(item_ids)).all()
@@ -729,10 +787,15 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
         if classify_replenishment_flow(getattr(items_by_id.get(iid), "replenishment_method", None))
         == REPLENISHMENT_FLOW_PURCHASE
     ]
-    supplier_work: Dict[int, List[Dict[str, Any]]] = {
-        iid: [dict(row) for row in rows]
-        for iid, rows in _load_purchase_supplier_remaining(db, purchase_item_ids, period_to).items()
-    }
+    if shared_pools is not None:
+        # Shared path: consume the queue-wide supplier ledger directly (no copy)
+        # so this run's greedy consumption persists to the next run.
+        supplier_work: Dict[int, List[Dict[str, Any]]] = shared_pools.supplier
+    else:
+        supplier_work = {
+            iid: [dict(row) for row in rows]
+            for iid, rows in _load_purchase_supplier_remaining(db, purchase_item_ids, period_to).items()
+        }
     existing_planned_purchase: Dict[int, float] = {
         int(iid): _to_float(total)
         for iid, total in (
@@ -785,6 +848,12 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
                 # потребность закроется цепочкой от окрасочного заказа.
                 continue
             gap = max(current_net - open_qty, 0.0)
+            if shared_pools is not None:
+                # Consume-once: this run took min(open_qty, net) of the shared
+                # open-WIP; the leftover carries to the next run. The newly
+                # materialised catch-up gap belongs to THIS run and is not
+                # credited to later runs (rebuilt fresh next cycle).
+                active_production_by_item[iid] = open_qty - min(open_qty, current_net)
             if gap <= EPS:
                 continue
             entry = {
@@ -797,7 +866,10 @@ def reconcile_snapshot(db: Session, run_id: int, *, dry_run: bool = False) -> Di
             if not dry_run:
                 products = _materialize_catchup_gap(db, run=run, item=item, req=req, gap=gap, now=now)
                 _bump_requirement_coverage(req, gap)
-                active_production_by_item[iid] = open_qty + gap
+                if shared_pools is None:
+                    # Single-run defensive bookkeeping (unique keys — no double add).
+                    # In the shared path the WIP ledger was already decremented above.
+                    active_production_by_item[iid] = open_qty + gap
                 entry["orders"] = [
                     {
                         "order_id": int(order.order_id),
@@ -1111,15 +1183,69 @@ def _reschedule_run_journal(
 
 
 def reconcile_all_active(db: Session, *, dry_run: bool = False) -> Dict[str, Any]:
-    """Reconcile the latest snapshot of every plan whose period is still open."""
+    """Reconcile the latest snapshot of every plan whose period is still open.
+
+    The three shared pools — effective stock, open supplier supply and open
+    production/WIP — are built ONCE and consumed exactly once across the whole
+    active-run queue, so the same physical unit is never credited to more than
+    one plan. Runs are processed earliest-need-first (``period_to`` ASC, then
+    ``run_id`` ASC) so the plan that needs a unit soonest claims it first. The
+    ledgers are rebuilt fresh every cycle and the order is fixed, so the run is
+    deterministic and idempotent.
+    """
     run_ids = _latest_active_snapshot_run_ids(db)
+
+    # Deterministic order: earliest period_to first, run_id as tie-break.
+    period_to_by_run: Dict[int, Optional[date]] = {}
+    if run_ids:
+        for rid, period_to in (
+            db.query(PlanningRun.run_id, PlanningRun.period_to)
+            .filter(PlanningRun.run_id.in_(run_ids))
+            .all()
+        ):
+            period_to_by_run[int(rid)] = period_to
+        run_ids = sorted(
+            run_ids,
+            key=lambda rid: (period_to_by_run.get(int(rid)) or date.max, int(rid)),
+        )
+
+    # Build the three shared ledgers ONCE for the union of all active items.
+    req_rows = (
+        db.query(MrpRequirement.item_id, MrpRequirement.period_to)
+        .filter(MrpRequirement.run_id.in_(run_ids))
+        .all()
+        if run_ids
+        else []
+    )
+    all_item_ids = sorted({int(iid) for iid, _pt in req_rows})
+    purchase_item_ids = [
+        int(item_id)
+        for item_id, method in (
+            db.query(Item.item_id, Item.replenishment_method)
+            .filter(Item.item_id.in_(all_item_ids))
+            .all()
+        )
+        if classify_replenishment_flow(method) == REPLENISHMENT_FLOW_PURCHASE
+    ] if all_item_ids else []
+    # Supplier cutoff spans the whole queue; each run still consumes greedily
+    # earliest-delivery-first, and runs are ordered earliest-need-first.
+    period_candidates = [pt for pt in period_to_by_run.values() if pt is not None]
+    period_candidates += [pt for _iid, pt in req_rows if pt is not None]
+    max_period_to = max(period_candidates) if period_candidates else date.today()
+
+    pools = SharedPools(
+        stock=effective_stock_by_item_all(db),
+        supplier=_load_purchase_supplier_remaining(db, purchase_item_ids, max_period_to),
+        prodsupply=_active_production_qty_by_item(db, all_item_ids),
+    )
+
     results: List[Dict[str, Any]] = []
     total_production = 0
     total_purchase = 0
     total_purchase_pruned = 0
     for rid in run_ids:
         try:
-            res = reconcile_snapshot(db, rid, dry_run=dry_run)
+            res = reconcile_snapshot(db, rid, dry_run=dry_run, shared_pools=pools)
             total_production += len(res.get("production_added", []))
             total_purchase += len(res.get("purchase_added", []))
             total_purchase_pruned += len(res.get("purchase_pruned", []))

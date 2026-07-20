@@ -1,6 +1,6 @@
 """Tests for MRP reconciliation and the covered_qty rollback that feeds it."""
 
-from datetime import date
+from datetime import date, datetime
 
 import pytest
 
@@ -22,9 +22,13 @@ from app.models import (
     ResourceProductionKind,
     SpecComponent,
     Specification,
+    Supplier,
+    SupplierOrder,
+    SupplierOrderItem,
     SyncLink,
 )
-from app.services.mrp_reconciliation import reconcile_snapshot
+from app.services.mrp_reconciliation import reconcile_all_active, reconcile_snapshot
+from app.services.one_c_purchase_order_export import PURCHASE_ORDER_ENTITY
 from app.services.period_plan_service import create_mrp_snapshot_from_period_plan
 from app.services.production_binding_repair import repair_clean_mrp_bindings
 from app.services.production_control_journal import (
@@ -1073,3 +1077,215 @@ def test_reconcile_does_not_reinflate_components_covered_by_parent_wip_at_snapsh
         .one()
     )
     assert float(child_product.remaining_qty) == 32.0
+
+
+# ---------------------------------------------------------------------------
+# Part 3 — Step A: consume the shared pools ONCE across the active-run queue
+# ---------------------------------------------------------------------------
+
+def _make_purchase_plan_snapshot(
+    db, item, *, name, period_from, period_to, qty, bucket_date
+) -> int:
+    """Fixed period plan with a single purchase-item line, snapshotted."""
+    plan = ProductionPlanHeader(
+        name=name,
+        period_from=period_from,
+        period_to=period_to,
+        status="fixed",
+        created_by="test",
+    )
+    db.add(plan)
+    db.flush()
+    db.add(
+        ProductionPlanLine(
+            plan_id=plan.id, item_id=item.item_id, bucket_date=bucket_date, qty=qty
+        )
+    )
+    db.commit()
+    snap = create_mrp_snapshot_from_period_plan(db, plan.id)
+    return int(snap["run_id"])
+
+
+def _planned_purchase_sum(db, run_id: int) -> float:
+    rows = db.query(PlannedPurchase.qty).filter(PlannedPurchase.run_id == int(run_id)).all()
+    return sum(float(q or 0.0) for (q,) in rows)
+
+
+def _purchase_signature(db):
+    rows = db.query(
+        PlannedPurchase.run_id, PlannedPurchase.item_id, PlannedPurchase.qty
+    ).all()
+    return sorted((int(r), int(i), round(float(q or 0.0), 6)) for r, i, q in rows)
+
+
+def test_two_active_runs_share_stock_once(db_session):
+    # One physical pile of 335.144 must be credited across the two active plans
+    # exactly once, earliest-need-first.
+    item = _make_purchased_item(db_session, "SHARE-STOCK", stock=335.144)
+    aug = _make_purchase_plan_snapshot(
+        db_session, item, name="Август",
+        period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
+        qty=300, bucket_date=date(2026, 8, 15),
+    )
+    sep = _make_purchase_plan_snapshot(
+        db_session, item, name="Сентябрь",
+        period_from=date(2026, 9, 1), period_to=date(2026, 9, 30),
+        qty=226.218, bucket_date=date(2026, 9, 15),
+    )
+
+    reconcile_all_active(db_session)
+
+    aug_sum = _planned_purchase_sum(db_session, aug)
+    sep_sum = _planned_purchase_sum(db_session, sep)
+    # Aug (earliest need) eats 300 of 335.144 → net 0. Sep gets the 35.144 left
+    # → 226.218 − 35.144 = 191.074.
+    assert aug_sum == pytest.approx(0.0, abs=1e-6)
+    assert sep_sum == pytest.approx(191.074, abs=1e-4)
+    assert (aug_sum + sep_sum) == pytest.approx(191.074, abs=1e-4)
+
+
+def test_single_run_no_regression(db_session):
+    # Locks the shared_pools=None path: single-run reconcile, stock >= demand.
+    item = _make_purchased_item(db_session, "SINGLE-NOREG", stock=100.0)
+    run_id = _make_purchase_plan_snapshot(
+        db_session, item, name="Единый",
+        period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
+        qty=50, bucket_date=date(2026, 8, 15),
+    )
+
+    res = reconcile_snapshot(db_session, run_id)
+
+    assert res["purchase_added"] == []
+    assert _planned_purchase_sum(db_session, run_id) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_overlapping_stock_zero_no_double_count(db_session):
+    # Zero stock: neither run may borrow the other's coverage — each carries its
+    # own full gross and the aggregate is the plain sum.
+    item = _make_purchased_item(db_session, "OVERLAP-ZERO", stock=0.0)
+    aug = _make_purchase_plan_snapshot(
+        db_session, item, name="Август",
+        period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
+        qty=300, bucket_date=date(2026, 8, 15),
+    )
+    sep = _make_purchase_plan_snapshot(
+        db_session, item, name="Сентябрь",
+        period_from=date(2026, 9, 1), period_to=date(2026, 9, 30),
+        qty=226.218, bucket_date=date(2026, 9, 15),
+    )
+
+    reconcile_all_active(db_session)
+
+    aug_sum = _planned_purchase_sum(db_session, aug)
+    sep_sum = _planned_purchase_sum(db_session, sep)
+    assert aug_sum == pytest.approx(300.0)
+    assert sep_sum == pytest.approx(226.218)
+    assert (aug_sum + sep_sum) == pytest.approx(526.218)
+
+
+def test_partial_supplier_coverage_shared(db_session):
+    # In-transit supplier supply (counts in MRP, delivery <= Sep period_to) is
+    # consumed once, by the run that still has a deficit after stock.
+    item = _make_purchased_item(db_session, "SUP-SHARE", stock=335.144)
+    supplier = Supplier(supplier_ref1c="sup-1", supplier_name="ООО Поставка")
+    db_session.add(supplier)
+    db_session.flush()
+    order = SupplierOrder(
+        order_number="ЗП-SUP",
+        order_date=datetime(2026, 7, 1),
+        supplier_id=supplier.supplier_id,
+        order_state_name="В пути",
+        deletion_mark=False,
+    )
+    db_session.add(order)
+    db_session.flush()
+    db_session.add(
+        SupplierOrderItem(
+            order_id=order.order_id,
+            item_id_ref=item.item_id,
+            quantity=100,
+            received_qty=0,
+            remaining_qty=100,
+            delivery_date=datetime(2026, 9, 20),
+        )
+    )
+    db_session.commit()
+
+    aug = _make_purchase_plan_snapshot(
+        db_session, item, name="Август",
+        period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
+        qty=300, bucket_date=date(2026, 8, 15),
+    )
+    sep = _make_purchase_plan_snapshot(
+        db_session, item, name="Сентябрь",
+        period_from=date(2026, 9, 1), period_to=date(2026, 9, 30),
+        qty=226.218, bucket_date=date(2026, 9, 15),
+    )
+
+    reconcile_all_active(db_session)
+
+    assert _planned_purchase_sum(db_session, aug) == pytest.approx(0.0, abs=1e-6)
+    # 226.218 − 35.144 (leftover stock) − 100 (supplier) = 91.074.
+    assert _planned_purchase_sum(db_session, sep) == pytest.approx(91.074, abs=1e-4)
+
+
+def test_idempotent_across_repeated_reconcile(db_session):
+    item = _make_purchased_item(db_session, "IDEMPOTENT", stock=335.144)
+    _make_purchase_plan_snapshot(
+        db_session, item, name="Август",
+        period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
+        qty=300, bucket_date=date(2026, 8, 15),
+    )
+    _make_purchase_plan_snapshot(
+        db_session, item, name="Сентябрь",
+        period_from=date(2026, 9, 1), period_to=date(2026, 9, 30),
+        qty=226.218, bucket_date=date(2026, 9, 15),
+    )
+
+    reconcile_all_active(db_session)
+    sig1 = _purchase_signature(db_session)
+
+    reconcile_all_active(db_session)
+    sig2 = _purchase_signature(db_session)
+
+    assert sig1 == sig2
+    assert len(sig1) == 1  # only Sep carries a deficit
+
+
+def test_exported_purchase_not_double_ordered(db_session):
+    item = _make_purchased_item(db_session, "EXPORTED", stock=335.144)
+    _make_purchase_plan_snapshot(
+        db_session, item, name="Август",
+        period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
+        qty=300, bucket_date=date(2026, 8, 15),
+    )
+    sep = _make_purchase_plan_snapshot(
+        db_session, item, name="Сентябрь",
+        period_from=date(2026, 9, 1), period_to=date(2026, 9, 30),
+        qty=226.218, bucket_date=date(2026, 9, 15),
+    )
+
+    reconcile_all_active(db_session)
+    sep_purchase = (
+        db_session.query(PlannedPurchase).filter(PlannedPurchase.run_id == sep).one()
+    )
+    db_session.add(
+        SyncLink(
+            source_system="PRODPLAN",
+            source_doctype="planned_purchase",
+            source_id=sep_purchase.purchase_id,
+            target_entity=PURCHASE_ORDER_ENTITY,
+            target_ref_key="po-ref-1",
+            status="success",
+        )
+    )
+    db_session.commit()
+
+    reconcile_all_active(db_session)
+
+    remaining = (
+        db_session.query(PlannedPurchase).filter(PlannedPurchase.run_id == sep).all()
+    )
+    assert len(remaining) == 1
+    assert int(remaining[0].purchase_id) == int(sep_purchase.purchase_id)
+    assert float(remaining[0].qty) == pytest.approx(191.074, abs=1e-4)
