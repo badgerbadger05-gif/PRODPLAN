@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -594,5 +594,72 @@ describe('DbrFeederPage characterization', () => {
     expect(refreshDbrFeederChain).toHaveBeenCalledOnce()
     expect(listDbrFeederSignals).toHaveBeenCalledTimes(2)
     expect(getDbrFeederDeficits).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps the latest positions filter when an older request resolves last', async () => {
+    const user = userEvent.setup()
+    const stale = deferred<DbrFeederPosition[]>()
+    const latest = deferred<DbrFeederPosition[]>()
+    const stalePosition = { ...position, id: 11, item_code: 'STALE-01', item_name: 'Старый результат' }
+    const latestPosition = { ...position, id: 12, item_code: 'LATEST-02', item_name: 'Новый результат' }
+    vi.mocked(listDbrFeederPositions)
+      .mockReset()
+      .mockResolvedValueOnce([position])
+      .mockImplementation(({ search }) => search === 'старый' ? stale.promise : latest.promise)
+    renderPage()
+
+    const positionsTable = document.querySelector('.dbrFeederTable') as HTMLElement
+    expect(await within(positionsTable).findByText('PUMP-01')).toBeVisible()
+    const search = screen.getByPlaceholderText('Код или наименование')
+    await user.clear(search)
+    await user.type(search, 'старый{Enter}')
+    await user.clear(search)
+    await user.type(search, 'новый{Enter}')
+    await waitFor(() => expect(listDbrFeederPositions).toHaveBeenCalledTimes(3))
+
+    await act(async () => {
+      latest.resolve([latestPosition])
+      await latest.promise
+    })
+    expect(await within(positionsTable).findByText('LATEST-02')).toBeVisible()
+
+    await act(async () => {
+      stale.resolve([stalePosition])
+      await stale.promise
+    })
+    expect(within(positionsTable).getByText('LATEST-02')).toBeVisible()
+    expect(within(positionsTable).queryByText('STALE-01')).not.toBeInTheDocument()
+  })
+
+  it('keeps the latest selected signal when an older detail request resolves last', async () => {
+    const stale = deferred<DbrFeederSignal>()
+    const latest = deferred<DbrFeederSignal>()
+    vi.mocked(getDbrFeederSignal)
+      .mockReset()
+      .mockImplementation((id) => id === purchaseSignal.id ? stale.promise : latest.promise)
+    renderPage()
+
+    const signalTable = document.querySelector('.dbrSignalTable') as HTMLElement
+    const staleRow = await within(signalTable).findByRole('row', { name: /PUMP-01/ })
+    const latestRow = within(signalTable).getByRole('row', { name: /GEAR-01/ })
+    fireEvent.click(staleRow)
+    fireEvent.click(latestRow)
+    expect(vi.mocked(getDbrFeederSignal).mock.calls.map(([id]) => id)).toEqual([
+      purchaseSignal.id,
+      productionSignal.id,
+    ])
+
+    await act(async () => {
+      latest.resolve(productionSignal)
+      await latest.promise
+    })
+    expect(await screen.findByText(`Сигнал #${productionSignal.id}`)).toBeVisible()
+
+    await act(async () => {
+      stale.resolve(purchaseSignal)
+      await stale.promise
+    })
+    expect(screen.getByText(`Сигнал #${productionSignal.id}`)).toBeVisible()
+    expect(screen.queryByText(`Сигнал #${purchaseSignal.id}`)).not.toBeInTheDocument()
   })
 })
