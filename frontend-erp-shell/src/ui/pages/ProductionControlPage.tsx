@@ -2,14 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import {
   coverageLabels,
-  type ControlSettings,
   type ControlWarehouse,
   type EmployeeOption,
-  type EmployeesResponse,
   type MaterialIssueCreateResponse,
   type MaterialsResponse,
   type OrderRow,
-  type OrdersResponse,
   type ProductionOperationOption,
   type ProductionOperationsResponse,
   type ProductionFilters,
@@ -17,8 +14,31 @@ import {
   type WorkshopWarehouse,
 } from '../../domain/productionControl'
 import type { ProductionResource } from '../../domain/resources'
-import { api } from '../../lib/api'
 import { getPeriodPlanMatrix, listPeriodPlans } from '../../services/periodPlan'
+import {
+  closePaintWeldChain,
+  createOrdersFromMrpRequirements,
+  deleteProductionOrder,
+  exportManufacturesPieceworkTo1C,
+  exportManufacturesTo1C,
+  exportMaterialIssuesTo1C,
+  fetchRouteSheetsPrintHtml,
+  getItem,
+  getOrderMaterials,
+  getProductionControlSettings,
+  listProductionEmployees,
+  listProductionOperations,
+  listProductionOrders,
+  markMaterialIssueAssembled,
+  postMaterialIssues,
+  produceOrder,
+  rollbackManufactureLocal,
+  saveProductionControlSettings,
+  syncPostedTransfers,
+  updateItem,
+  updateOrderQuantity,
+  updateOrderStatus,
+} from '../../services/productionControl'
 import { listResources } from '../../services/resources'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { RootProductFilterDialog, rootProductLabel, type RootProductOption } from '../RootProductFilterDialog'
@@ -151,7 +171,7 @@ export function ProductionControlPage() {
       Object.entries(filtersRef.current).forEach(([key, value]) => {
         if (value) params.set(key, value)
       })
-      const data = await api<OrdersResponse>(`/v1/production-control/orders?${params.toString()}`)
+      const data = await listProductionOrders(params)
       setRows(data.rows ?? [])
       setTotal(data.total ?? 0)
       setRunId(data.latest_run_id ?? null)
@@ -221,7 +241,7 @@ export function ProductionControlPage() {
   const loadEmployees = useCallback(async () => {
     setEmployeesLoading(true)
     try {
-      const data = await api<EmployeesResponse>('/v1/production-control/employees')
+      const data = await listProductionEmployees()
       setEmployees(data.rows ?? [])
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -233,7 +253,7 @@ export function ProductionControlPage() {
   const loadProduceOperations = useCallback(async (productId: number) => {
     setProduceOperationsLoading(true)
     try {
-      const data = await api<ProductionOperationsResponse>(`/v1/production-control/orders/${productId}/operations`)
+      const data = await listProductionOperations(productId)
       setProduceOperations(data.rows ?? [])
       setProduceOperationEmployees({})
     } catch (e) {
@@ -251,7 +271,7 @@ export function ProductionControlPage() {
     setError('')
     try {
       const [settingsData, resourcesData] = await Promise.all([
-        api<ControlSettings>('/v1/production-control/settings'),
+        getProductionControlSettings(),
         resources.length ? Promise.resolve(resources) : listResources(),
       ])
       setResources(resourcesData)
@@ -269,19 +289,16 @@ export function ProductionControlPage() {
     setSettingsSaving(true)
     setError('')
     try {
-      const saved = await api<ControlSettings>('/v1/production-control/settings', {
-        method: 'POST',
-        body: JSON.stringify({
-          workshop_warehouses: workshopRows
-            .map((row) => ({
-              resource_id: row.resource_id ?? row.workshop_id,
-              workshop_id: row.workshop_id ?? row.resource_id,
-              warehouse_ref1c: row.warehouse_ref1c,
-              production_warehouse_ref1c: row.production_warehouse_ref1c ?? '',
-            }))
-            .filter((row) => row.resource_id && row.warehouse_ref1c),
-          ignored_warehouses: Array.from(ignoredRefs).map((warehouse_ref1c) => ({ warehouse_ref1c })),
-        }),
+      const saved = await saveProductionControlSettings({
+        workshop_warehouses: workshopRows
+          .map((row) => ({
+            resource_id: row.resource_id ?? row.workshop_id,
+            workshop_id: row.workshop_id ?? row.resource_id,
+            warehouse_ref1c: row.warehouse_ref1c,
+            production_warehouse_ref1c: row.production_warehouse_ref1c ?? '',
+          }))
+          .filter((row) => row.resource_id && row.warehouse_ref1c),
+        ignored_warehouses: Array.from(ignoredRefs).map((warehouse_ref1c) => ({ warehouse_ref1c })),
       })
       setWarehouses(saved.warehouses ?? [])
       setWorkshopRows(saved.workshop_warehouses ?? [])
@@ -299,7 +316,7 @@ export function ProductionControlPage() {
     setActiveId(productId)
     setMaterials(null)
     try {
-      const data = await api<MaterialsResponse>(`/v1/production-control/orders/${productId}/materials${refresh ? '?refresh=true' : ''}`)
+      const data = await getOrderMaterials(productId, refresh)
       setMaterials(data)
       const coverageStatus = String(data.coverage_status || '')
       if (refresh && coverageStatus) {
@@ -325,23 +342,15 @@ export function ProductionControlPage() {
     const previous = row.status
     setRows((list) => list.map((item) => item.product_id === row.product_id ? { ...item, status } : item))
     try {
-      await api(`/v1/production-control/orders/${row.product_id}/state`, {
-        method: 'PATCH',
-        body: JSON.stringify({ status }),
-      })
+      await updateOrderStatus(row.product_id, status)
     } catch (e) {
       setRows((list) => list.map((item) => item.product_id === row.product_id ? { ...item, status: previous } : item))
       setError(e instanceof Error ? e.message : String(e))
     }
   }
 
-  async function requestMaterialIssues(sourceWarehouseRef: string | undefined, productIds: number[]) {
-    const body: Record<string, unknown> = { product_ids: productIds, initiated_by: 'erp-shell' }
-    if (sourceWarehouseRef) body.source_warehouse_ref1c = sourceWarehouseRef
-    return api<MaterialIssueCreateResponse>('/v1/production-control/material-issues', {
-      method: 'POST',
-      body: JSON.stringify(body),
-    })
+  function requestMaterialIssues(sourceWarehouseRef: string | undefined, productIds: number[]) {
+    return postMaterialIssues(productIds, 'erp-shell', sourceWarehouseRef)
   }
 
   function showWarehousePicker(result: MaterialIssueCreateResponse, mode: 'issues' | 'export', productIds?: number[]) {
@@ -385,14 +394,8 @@ export function ProductionControlPage() {
 
   function renderRouteSheets(ids: number[], printWindow: Window | null) {
     if (!ids.length || !printWindow || printWindow.closed) return
-    void fetch('/api/v1/production-control/route-sheets/print', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ product_ids: ids, mark_printed: true, auto_print: true }),
-    })
-      .then(async (response) => {
-        const html = await response.text()
-        if (!response.ok) throw new Error(html || response.statusText)
+    void fetchRouteSheetsPrintHtml(ids)
+      .then((html) => {
         printWindow.document.open()
         printWindow.document.write(html)
         printWindow.document.close()
@@ -479,10 +482,7 @@ export function ProductionControlPage() {
         await load(offsetRef.current)
         return
       }
-      const result = await api<Record<string, unknown>>('/v1/production-control/material-issues/export-to-1c', {
-        method: 'POST',
-        body: JSON.stringify({ issue_ids: issueIds, dry_run: false, allow_production: true }),
-      })
+      const result = await exportMaterialIssuesTo1C(issueIds)
       const parent = (result.parent_orders_export ?? {}) as Record<string, unknown>
       const ordersCreated = Number(parent.orders_created ?? 0)
       const ordersExisting = Number(parent.orders_already_linked ?? 0)
@@ -523,9 +523,7 @@ export function ProductionControlPage() {
     try {
       // Pulls Posted=true flag from 1C for previously exported transfers and
       // advances local status: К перемещению → Собран.
-      const result = await api<Record<string, unknown>>('/v1/production-control/sync-posted-transfers', {
-        method: 'POST',
-      })
+      const result = await syncPostedTransfers()
       const candidates = Number(result.candidates ?? 0)
       const advanced = Number(result.advanced ?? 0)
       const errors = Array.isArray(result.errors) ? result.errors.length : 0
@@ -588,20 +586,17 @@ export function ProductionControlPage() {
     setChainOpen(true)
     setChainLoading(true)
     try {
-      const preview = await api<Record<string, any>>('/v1/paint-weld/chain/close', {
-        method: 'POST',
-        body: JSON.stringify({ product_id: row.product_id, dry_run: true }),
-      })
+      const preview = await closePaintWeldChain({ product_id: row.product_id, dry_run: true })
       setChainPreview(preview)
       void loadEmployees()
       const weldProductId = Number(preview?.weld?.product_id)
       const paintProductId = Number(preview?.paint?.product_id)
       const [weldOps, paintOps] = await Promise.all([
         weldProductId && Number(preview?.weld?.qty_to_produce ?? 0) > 0
-          ? api<ProductionOperationsResponse>(`/v1/production-control/orders/${weldProductId}/operations`)
+          ? listProductionOperations(weldProductId)
           : Promise.resolve({ rows: [], total: 0 } as ProductionOperationsResponse),
         paintProductId && Number(preview?.paint?.qty_to_produce ?? 0) > 0
-          ? api<ProductionOperationsResponse>(`/v1/production-control/orders/${paintProductId}/operations`)
+          ? listProductionOperations(paintProductId)
           : Promise.resolve({ rows: [], total: 0 } as ProductionOperationsResponse),
       ])
       setChainWeldOps(weldOps.rows ?? [])
@@ -627,16 +622,13 @@ export function ProductionControlPage() {
     setChainSaving(true)
     setChainError('')
     try {
-      const result = await api<Record<string, any>>('/v1/paint-weld/chain/close', {
-        method: 'POST',
-        body: JSON.stringify({
-          product_id: chainRowId,
-          dry_run: false,
-          allow_production: true,
-          weld_operation_executors: chainWeldOps.length ? chainExecutorRows(chainWeldOps) : undefined,
-          paint_operation_executors: chainPaintOps.length ? chainExecutorRows(chainPaintOps) : undefined,
-          initiated_by: 'erp-shell-chain-close',
-        }),
+      const result = await closePaintWeldChain({
+        product_id: chainRowId,
+        dry_run: false,
+        allow_production: true,
+        weld_operation_executors: chainWeldOps.length ? chainExecutorRows(chainWeldOps) : undefined,
+        paint_operation_executors: chainPaintOps.length ? chainExecutorRows(chainPaintOps) : undefined,
+        initiated_by: 'erp-shell-chain-close',
       })
       const piecework = (result.piecework_export ?? {}) as Record<string, any>
       if (result.status !== 'ok' || (piecework.status && !['ok', 'existing'].includes(String(piecework.status)))) {
@@ -684,14 +676,8 @@ export function ProductionControlPage() {
           throw new Error('dry_run для выпуска больше плана пока недоступен: сначала нужно создать и провести дополнительное перемещение.')
         }
         const targetQuantity = Number(produceRow.produced_qty ?? 0) + requestedQty
-        await api(`/v1/production-control/orders/${produceRow.product_id}/quantity`, {
-          method: 'PATCH',
-          body: JSON.stringify({ quantity: targetQuantity }),
-        })
-        const issueResult = await api<MaterialIssueCreateResponse>('/v1/production-control/material-issues', {
-          method: 'POST',
-          body: JSON.stringify({ product_ids: [produceRow.product_id], initiated_by: 'erp-shell-overproduction' }),
-        })
+        await updateOrderQuantity(produceRow.product_id, targetQuantity)
+        const issueResult = await postMaterialIssues([produceRow.product_id], 'erp-shell-overproduction')
         const selectionRequired = issueResult.selection_required ?? []
         if (selectionRequired.length > 0) {
           throw new Error('Для дополнительного перемещения на разницу нужно выбрать склад-источник материалов.')
@@ -709,10 +695,7 @@ export function ProductionControlPage() {
           throw new Error(`Не удалось создать дополнительное перемещение на разницу ${overageQty}.${detail ? ` ${detail}` : ''}`)
         }
         if (issueIds.length) {
-          const transferResult = await api<Record<string, unknown>>('/v1/production-control/material-issues/export-to-1c', {
-            method: 'POST',
-            body: JSON.stringify({ issue_ids: issueIds, dry_run: false, allow_production: true }),
-          })
+          const transferResult = await exportMaterialIssuesTo1C(issueIds)
           const transferErrors = Number(transferResult.issues_error ?? 0)
           const transferCreated = Number(transferResult.issues_created ?? 0)
           const transferExisting = Number(transferResult.issues_already_linked ?? 0)
@@ -721,10 +704,7 @@ export function ProductionControlPage() {
             throw new Error(`Дополнительное перемещение на разницу не выгружено в 1С.${detail ? ` ${detail}` : ''}`)
           }
           for (const issueId of issueIds) {
-            await api(`/v1/production-control/material-issues/${issueId}/assembled`, {
-              method: 'POST',
-              body: JSON.stringify({ allow_production: true }),
-            })
+            await markMaterialIssueAssembled(issueId)
           }
         }
       }
@@ -740,42 +720,24 @@ export function ProductionControlPage() {
           employee_ref1c: employee?.employee_ref1c || employeeRef,
         }
       })
-      const localResult = await api<Record<string, unknown>>(
-        `/v1/production-control/orders/${produceRow.product_id}/produce`,
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            qty: requestedQty,
-            executor: produceOperations.length ? undefined : selectedEmployee?.employee_name || undefined,
-            operation_executors: produceOperations.length ? operationExecutors : undefined,
-          }),
-        },
-      )
+      const localResult = await produceOrder(produceRow.product_id, {
+        qty: requestedQty,
+        executor: produceOperations.length ? undefined : selectedEmployee?.employee_name || undefined,
+        operation_executors: produceOperations.length ? operationExecutors : undefined,
+      })
       const manufacture_id = Number(localResult.manufacture_id)
       manufactureIdToRollback = manufacture_id
 
       if (produceDryRun) {
-        const dryRunResult = await api<Record<string, unknown>>(
-          '/v1/production-control/manufactures/export-to-1c',
-          {
-            method: 'POST',
-            body: JSON.stringify({ manufacture_ids: [manufacture_id], dry_run: true, allow_production: false }),
-          },
-        )
-        await api(`/v1/production-control/manufactures/${manufacture_id}/rollback-local`, { method: 'POST' })
+        const dryRunResult = await exportManufacturesTo1C([manufacture_id], true, false)
+        await rollbackManufactureLocal(manufacture_id)
         setProduceDryRunPayload(JSON.stringify(dryRunResult, null, 2))
         await load(offsetRef.current)
         return
       }
 
       // Step 2: export the manufacture to 1C as Document_СборкаЗапасов (Posted=false).
-      const exportResult = await api<Record<string, unknown>>(
-        '/v1/production-control/manufactures/export-to-1c',
-        {
-          method: 'POST',
-          body: JSON.stringify({ manufacture_ids: [manufacture_id], dry_run: false, allow_production: true }),
-        },
-      )
+      const exportResult = await exportManufacturesTo1C([manufacture_id], false, true)
       const created1c = Number(exportResult.manufactures_created ?? 0)
       const errored = Number(exportResult.manufactures_error ?? 0)
       const exportEntry = recordArray(exportResult.entries)[0]
@@ -784,7 +746,7 @@ export function ProductionControlPage() {
       if (errored > 0 || created1c < 1 || !ref) {
         const exportError = exportEntry?.error || exportEntry?.reason || firstExportProblem(exportResult)
         if (!ref) {
-          await api(`/v1/production-control/manufactures/${manufacture_id}/rollback-local`, { method: 'POST' })
+          await rollbackManufactureLocal(manufacture_id)
           throw new Error(String(exportError || '1C не создала документ выпуска; локальный выпуск откатан'))
         }
         throw new Error(
@@ -792,13 +754,7 @@ export function ProductionControlPage() {
           `${String(exportError || 'ошибка проведения')}. Локальный выпуск оставлен для разбора.`,
         )
       }
-      const pieceworkResult = await api<Record<string, unknown>>(
-        '/v1/production-control/manufactures/export-piecework-to-1c',
-        {
-          method: 'POST',
-          body: JSON.stringify({ manufacture_ids: [manufacture_id], dry_run: false, allow_production: true }),
-        },
-      )
+      const pieceworkResult = await exportManufacturesPieceworkTo1C([manufacture_id])
       const pieceworkCreated = Number(pieceworkResult.manufactures_created ?? 0)
       const pieceworkErrored = Number(pieceworkResult.manufactures_error ?? 0)
       const pieceworkEntry = ((pieceworkResult.entries as Array<Record<string, unknown>>) ?? [])[0]
@@ -820,7 +776,7 @@ export function ProductionControlPage() {
     } catch (e) {
       if (manufactureIdToRollback && !manufactureExportedRef) {
         try {
-          await api(`/v1/production-control/manufactures/${manufactureIdToRollback}/rollback-local`, { method: 'POST' })
+          await rollbackManufactureLocal(manufactureIdToRollback)
           await load(offsetRef.current)
         } catch {
           // Keep the original 1C error visible to the operator.
@@ -843,10 +799,7 @@ export function ProductionControlPage() {
     setError('')
     setMessage('')
     try {
-      const result = await api<Record<string, unknown>>('/v1/production-control/orders/from-mrp-requirements', {
-        method: 'POST',
-        body: JSON.stringify({ requirement_ids: [requirementId], initiated_by: 'erp-shell' }),
-      })
+      const result = await createOrdersFromMrpRequirements([requirementId], 'erp-shell')
       const created = Number(result.created_count ?? (Array.isArray(result.created) ? result.created.length : 0))
       const existing = Number(result.existing_count ?? (Array.isArray(result.reused) ? result.reused.length : 0))
       const skipped = Number(Array.isArray(result.skipped) ? result.skipped.length : 0)
@@ -860,37 +813,25 @@ export function ProductionControlPage() {
   }
 
   async function saveOptimalBatch(itemId: number, value: number | null) {
-    const item = await api<Record<string, unknown>>(`/v1/items/${itemId}`)
-    await api(`/v1/items/${itemId}`, {
-      method: 'PUT',
-      body: JSON.stringify({
-        item_code: String(item.item_code ?? ''),
-        item_name: String(item.item_name ?? ''),
-        item_article: item.item_article ?? null,
-        item_ref1c: item.item_ref1c ?? null,
-        supplier_ref1c: item.supplier_ref1c ?? null,
-        replenishment_time: item.replenishment_time ?? null,
-        unit: item.unit ?? null,
-        category_id: item.category_id ?? null,
-        stock_qty: Number(item.stock_qty ?? 0),
-        optimal_batch: value,
-        status: String(item.status ?? 'active'),
-      }),
+    const item = await getItem(itemId)
+    await updateItem(itemId, {
+      item_code: String(item.item_code ?? ''),
+      item_name: String(item.item_name ?? ''),
+      item_article: item.item_article ?? null,
+      item_ref1c: item.item_ref1c ?? null,
+      supplier_ref1c: item.supplier_ref1c ?? null,
+      replenishment_time: item.replenishment_time ?? null,
+      unit: item.unit ?? null,
+      category_id: item.category_id ?? null,
+      stock_qty: Number(item.stock_qty ?? 0),
+      optimal_batch: value,
+      status: String(item.status ?? 'active'),
     })
     setRows((list) => list.map((row) => row.item_id === itemId ? { ...row, optimal_batch: value } : row))
   }
 
   async function saveOrderQuantity(productId: number, value: number) {
-    const result = await api<{
-      quantity: number
-      remaining_qty: number
-      mrp_req_net_qty?: number | null
-      mrp_req_covered_qty?: number | null
-      mrp_req_remaining_qty?: number | null
-    }>(`/v1/production-control/orders/${productId}/quantity`, {
-      method: 'PATCH',
-      body: JSON.stringify({ quantity: value }),
-    })
+    const result = await updateOrderQuantity(productId, value)
     setRows((list) => list.map((row) => row.product_id === productId ? {
       ...row,
       quantity: Number(result.quantity ?? value),
@@ -916,7 +857,7 @@ export function ProductionControlPage() {
     setMessage('')
     try {
       for (const row of deletable) {
-        await api(`/v1/production-control/orders/${row.product_id}`, { method: 'DELETE' })
+        await deleteProductionOrder(row.product_id)
       }
       setSelectedIds(new Set())
       setMessage(`Удалено локальных заказов: ${deletable.length}`)
