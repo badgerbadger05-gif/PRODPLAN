@@ -97,6 +97,14 @@ test.beforeEach(async ({ page }) => {
   await mockApi(page)
 })
 
+async function loginAs(page: Page, role: 'admin' | 'viewer') {
+  await page.getByRole('button', { name: 'Выйти' }).evaluate((button: HTMLButtonElement) => button.click())
+  await expect(page.getByRole('heading', { name: 'PRODPLAN' })).toBeVisible()
+  await page.getByLabel('Логин').fill(role)
+  await page.getByRole('button', { name: 'Войти' }).click()
+  await expect(page.getByText(`Демо · ${role}`)).toBeVisible()
+}
+
 test('opens the lazy ERP shell without a backend', async ({ page }) => {
   const consoleErrors: string[] = []
   page.on('console', (message) => {
@@ -119,4 +127,25 @@ test('opens the lazy ERP shell without a backend', async ({ page }) => {
   await expect(page.getByText('Втулка')).toBeVisible()
 
   expect(consoleErrors).toEqual([])
+})
+
+test('keeps admin navigation complete and filters viewer navigation', async ({ page }) => {
+  await page.goto('/')
+
+  await expect(page.getByText('Демо · admin')).toBeVisible()
+  await expect(page.getByRole('link', { name: /Планирование выпуска/ })).toBeVisible()
+  await expect(page.getByRole('link', { name: /Журнал закупок/ })).toBeVisible()
+  await expect(page.getByRole('link', { name: 'Синхронизация' })).toBeVisible()
+
+  await loginAs(page, 'viewer')
+
+  await expect(page.getByRole('link', { name: /MRP прогоны/ })).toBeVisible()
+  await expect(page.getByRole('link', { name: /Заявки перемещений/ })).toBeVisible()
+  await expect(page.getByRole('link', { name: /Ledger/ })).toBeVisible()
+  await expect(page.getByRole('link', { name: /Планирование выпуска/ })).toHaveCount(0)
+  await expect(page.getByRole('link', { name: /Журнал закупок/ })).toHaveCount(0)
+  await expect(page.getByRole('link', { name: 'Синхронизация' })).toHaveCount(0)
+
+  await page.evaluate(() => { window.location.hash = '/sync' })
+  await expect(page.getByRole('alert')).toHaveText('Нет доступа к разделу')
 })
