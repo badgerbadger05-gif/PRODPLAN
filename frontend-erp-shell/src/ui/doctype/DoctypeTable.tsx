@@ -46,12 +46,18 @@ export function DoctypeTable<Row, Filters extends object, Detail>({ doctype, sta
               >
                 {doctype.columns.map((column) => {
                   if (column.type === 'select-checkbox') {
+                    const checked = doctype.meta.selectionMode === 'single'
+                      ? active
+                      : state.selectedIds.has(id)
                     return (
                       <td key={column.key} className={column.className} style={tableColumnStyle(column)}>
                         <input
                           type="checkbox"
-                          checked={state.selectedIds.has(id)}
-                          onChange={() => state.toggleSelection(id)}
+                          checked={checked}
+                          onChange={() => {
+                            if (doctype.meta.selectionMode === 'single') state.setActiveId(id)
+                            else state.toggleSelection(id)
+                          }}
                           onClick={(event) => event.stopPropagation()}
                           aria-label={`Выбрать строку ${id}`}
                         />

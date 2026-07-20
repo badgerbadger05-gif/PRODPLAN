@@ -160,6 +160,7 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
         ? filter.field === key
         : filter.fieldFrom === key || filter.fieldTo === key,
     )
+    if (definition?.kind === 'search' && definition.mode === 'submit') return
     const debounceMs = definition?.kind === 'search' ? (definition.debounceMs ?? 300) : 0
     const currentTimer = filterTimers.current.get(key)
     if (currentTimer) clearTimeout(currentTimer)
@@ -172,6 +173,13 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
       filterTimers.current.delete(key)
     }, debounceMs))
   }, [doctype.filters])
+
+  const applyFilters = useCallback(() => {
+    filterTimers.current.forEach(clearTimeout)
+    filterTimers.current.clear()
+    setOffset(0)
+    setAppliedFilters(filters)
+  }, [filters])
 
   const setSort = useCallback((sortBy: string) => {
     setSortState((current) => ({
@@ -203,7 +211,10 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
       || (action.scope === 'selection' && actionContext.selection.length === 0)
       || (action.scope === 'row' && !actionContext.activeRow)
     ) return
-    if (action.confirm && !window.confirm(action.confirm)) return
+    const confirmation = typeof action.confirm === 'function'
+      ? action.confirm(actionContext)
+      : action.confirm
+    if (confirmation && !window.confirm(confirmation)) return
 
     actionInFlight.current = true
     setActionLoading(true)
@@ -236,6 +247,7 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
     listMeta,
     filters,
     setFilter,
+    applyFilters,
     sort,
     setSort,
     selection,

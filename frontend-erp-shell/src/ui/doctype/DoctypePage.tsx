@@ -18,6 +18,7 @@ type Props<Row, Filters extends object, Detail> = {
   renderDetail?: (value: Detail | Row, state: DoctypeListState<Row, Filters, Detail>) => ReactNode
   renderDialog?: (dialog: NonNullable<DoctypeListState<Row, Filters, Detail>['dialog']>, close: () => void) => ReactNode
   onRowDoubleClick?: (row: Row) => void
+  renderFilters?: (state: DoctypeListState<Row, Filters, Detail>) => ReactNode
 }
 
 export function DoctypePage<Row, Filters extends object, Detail>({
@@ -28,8 +29,9 @@ export function DoctypePage<Row, Filters extends object, Detail>({
   renderDetail,
   renderDialog,
   onRowDoubleClick,
+  renderFilters,
 }: Props<Row, Filters, Detail>) {
-  const detailValue = state.detail ?? state.activeRow
+  const detailValue = doctype.dataSource.detail ? state.detail : state.activeRow
   if (!canView(doctype.permissions, access)) {
     return (
       <main className="workArea">
@@ -63,7 +65,7 @@ export function DoctypePage<Row, Filters extends object, Detail>({
         )}
       >
         <CommandBar doctype={doctype} state={state} access={access} />
-        <FilterBar doctype={doctype} state={state} />
+        {renderFilters ? renderFilters(state) : <FilterBar doctype={doctype} state={state} />}
         {state.error && <div className="errorLine">{state.error}</div>}
         {state.message && <div className="successLine">{state.message}</div>}
         <div className={doctype.detail ? 'split' : undefined}>

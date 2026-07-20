@@ -33,6 +33,7 @@ export type FilterDef<Filters> =
       field: keyof Filters
       placeholder?: string
       debounceMs?: number
+      mode?: 'debounce' | 'submit'
     }
   | {
       kind: 'select'
@@ -77,8 +78,9 @@ export type ActionDef<Row> = {
   scope: 'global' | 'selection' | 'row'
   tone?: 'primary' | 'default' | 'danger'
   enabled?: (context: ActionContext<Row>) => boolean
+  disabledReason?: (context: ActionContext<Row>) => string
   visible?: (context: ActionContext<Row>) => boolean
-  confirm?: string
+  confirm?: string | ((context: ActionContext<Row>) => string)
   run(context: ActionContext<Row>): Promise<ActionResult>
 }
 

@@ -20,6 +20,9 @@ export function FilterBar<Row, Filters extends object, Detail>({ doctype, state 
                 value={String(state.filters[filter.field] ?? '')}
                 placeholder={filter.placeholder}
                 onChange={(event) => state.setFilter(filter.field, event.target.value as never)}
+                onKeyDown={(event) => {
+                  if (filter.mode === 'submit' && event.key === 'Enter') state.applyFilters()
+                }}
               />
             </label>
           )
@@ -73,6 +76,9 @@ export function FilterBar<Row, Filters extends object, Detail>({ doctype, state 
           </div>
         )
       })}
+      {doctype.filters.some((filter) => filter.kind === 'search' && filter.mode === 'submit') && (
+        <button onClick={state.applyFilters} disabled={state.loading}>Найти</button>
+      )}
     </div>
   )
 }

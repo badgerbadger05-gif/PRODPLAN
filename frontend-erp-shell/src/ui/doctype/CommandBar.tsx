@@ -20,6 +20,7 @@ export function CommandBar<Row, Filters extends object, Detail>({ doctype, state
         <button
           key={action.key}
           className={action.tone === 'primary' ? 'primary' : undefined}
+          title={action.disabledReason?.(state.actionContext)}
           disabled={
             state.loading
             || action.enabled?.(state.actionContext) === false
