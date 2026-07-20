@@ -84,4 +84,31 @@ describe('generic Doctype CSV export', () => {
       access: viewer,
     })).toBe('Позиция\r\n2: Шайба\r\n3: Болт\r\n')
   })
+
+  it('supports an explicit schema, delimiter, quote mode, and line ending', () => {
+    const configured: Doctype<Row, Filters> = {
+      ...doctype,
+      meta: {
+        ...doctype.meta,
+        exportCsv: {
+          delimiter: ';',
+          quote: 'all',
+          lineEnding: '\n',
+          visibleColumnsOnly: false,
+          columns: [
+            { key: 'label', title: 'Позиция', value: (row) => row.name },
+            { key: 'qty', title: 'Количество', value: (row) => row.quantity },
+          ],
+        },
+      },
+      permissions: {},
+    }
+
+    expect(buildDoctypeCsv({
+      doctype: configured,
+      rows: [{ id: 1, name: 'Гайка; "М8"', quantity: 12, confidential: '' }],
+      visibleColumns: ['name'],
+      access: viewer,
+    })).toBe('"Позиция";"Количество"\n"Гайка; ""М8""";"12"\n')
+  })
 })
