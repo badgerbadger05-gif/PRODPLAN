@@ -6,7 +6,7 @@
 
 - Doctype runtime реализован и используется `MRP Runs`, `Transfer Requests` и
   `Purchase Control`; остальные журналы инвентаризируются.
-- OpenAPI-типы генерируются, lint чистый, frontend CI добавлен, 123 frontend-теста проходят.
+- OpenAPI-типы генерируются, lint чистый, frontend CI добавлен, 134 frontend-теста проходят.
 - Прямые API-вызовы страниц вынесены в services-слой.
 - Route-level code splitting снизил initial JS bundle примерно с 592 до 242 КБ.
 - Mock session shell и resource/action/record/field gates реализованы, но Auth/RBAC нельзя считать закрытым до появления backend-сессии и `/auth/me`.
@@ -43,9 +43,9 @@
 ## P1 — Тестовое покрытие критичных экранов
 
 **Текущее состояние.** Общий runtime, transport, session/RBAC, saved views,
-Ledger и критичные custom pages покрыты 123 Vitest-тестами; есть hermetic
+Ledger и критичные custom pages покрыты 134 Vitest-тестами; есть hermetic
 Playwright smoke и стабильные Linux visual baselines Ledger, Purchase Control
-и Production Control. Не хватает visual baseline Period Plan и отдельного
+Production Control и Period Plan (list/detail). Не хватает отдельного
 backend-contract E2E.
 
 **Цель.** На каждый Doctype — характеристический vitest-тест (рендер + 1–2 флоу, мок сервисов), по образцу `ProductionControlPage.test.tsx`. Прогон в CI (см. P3). `useDoctypeList`/`DoctypePage` покрыть юнит-тестами один раз — это защитит все страницы разом.
