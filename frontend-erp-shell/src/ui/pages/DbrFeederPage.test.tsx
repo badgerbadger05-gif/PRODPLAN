@@ -296,8 +296,8 @@ describe('DbrFeederPage characterization', () => {
       item_name: 'Диагностическая позиция',
       status: 'Diagnostic',
     }
-    vi.mocked(listDbrFeederSignals).mockImplementation(({ status }) => (
-      status === 'Open' ? openSignals.promise : Promise.resolve([diagnosticSignal])
+    vi.mocked(listDbrFeederSignals).mockImplementation((filters) => (
+      filters?.status === 'Open' ? openSignals.promise : Promise.resolve([diagnosticSignal])
     ))
     const user = userEvent.setup()
     renderPage()

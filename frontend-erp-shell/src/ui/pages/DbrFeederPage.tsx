@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
   DbrChainPreview,
   DbrFeederDeficit,
@@ -118,6 +118,7 @@ export function DbrFeederPage() {
   const [purchaseError, setPurchaseError] = useState('')
   const [processingBoard, setProcessingBoard] = useState<DbrProcessingBoard | null>(null)
   const [processingLoading, setProcessingLoading] = useState(false)
+  const signalsLoadSequence = useRef(0)
 
   const load = useCallback(async (next: Filters = applied) => {
     setLoading(true)
@@ -141,14 +142,18 @@ export function DbrFeederPage() {
   useEffect(() => { void load() }, [load])
 
   const loadSignals = useCallback(async (next: SignalFilters = appliedSignalFilters) => {
+    const sequence = ++signalsLoadSequence.current
     setSignalsLoading(true)
     setError('')
     try {
-      setSignals(await listDbrFeederSignals({ ...next, limit: 5000 }))
+      const nextSignals = await listDbrFeederSignals({ ...next, limit: 5000 })
+      if (sequence !== signalsLoadSequence.current) return
+      setSignals(nextSignals)
     } catch (e) {
+      if (sequence !== signalsLoadSequence.current) return
       setError(e instanceof Error ? e.message : String(e))
     } finally {
-      setSignalsLoading(false)
+      if (sequence === signalsLoadSequence.current) setSignalsLoading(false)
     }
   }, [appliedSignalFilters])
 
