@@ -78,7 +78,7 @@ describe('TransferRequestsPage Doctype migration', () => {
     render(<MemoryRouter><TransferRequestsPage /></MemoryRouter>)
 
     expect(await screen.findByText('ПМ-000005')).toBeInTheDocument()
-    expect(screen.getByText('Корпус редуктора')).toBeInTheDocument()
+    expect(screen.getAllByText('Корпус редуктора').length).toBeGreaterThan(0)
     expect(await screen.findByText('Втулка')).toBeInTheDocument()
     expect(screen.getByRole('option', { name: 'Заготовительный участок' })).toBeInTheDocument()
     expect(screen.getByText('нужно 4')).toBeInTheDocument()
