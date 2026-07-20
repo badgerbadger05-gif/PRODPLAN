@@ -6,7 +6,7 @@
 
 - Doctype runtime реализован и используется `MRP Runs`, `Transfer Requests` и
   `Purchase Control`; остальные журналы инвентаризируются.
-- OpenAPI-типы генерируются, lint чистый, frontend CI добавлен, 121 frontend-тест проходит.
+- OpenAPI-типы генерируются, lint чистый, frontend CI добавлен, 123 frontend-теста проходят.
 - Прямые API-вызовы страниц вынесены в services-слой.
 - Route-level code splitting снизил initial JS bundle примерно с 592 до 242 КБ.
 - Mock session shell и resource/action/record/field gates реализованы, но Auth/RBAC нельзя считать закрытым до появления backend-сессии и `/auth/me`.
@@ -43,9 +43,9 @@
 ## P1 — Тестовое покрытие критичных экранов
 
 **Текущее состояние.** Общий runtime, transport, session/RBAC, saved views,
-Ledger и критичные custom pages покрыты 121 Vitest-тестом; есть hermetic
-Playwright smoke и первый стабильный Linux visual baseline Ledger. Не хватает
-визуальных эталонов остальных утверждённых плотных экранов и отдельного
+Ledger и критичные custom pages покрыты 123 Vitest-тестами; есть hermetic
+Playwright smoke и стабильные Linux visual baselines Ledger, Purchase Control
+и Production Control. Не хватает visual baseline Period Plan и отдельного
 backend-contract E2E.
 
 **Цель.** На каждый Doctype — характеристический vitest-тест (рендер + 1–2 флоу, мок сервисов), по образцу `ProductionControlPage.test.tsx`. Прогон в CI (см. P3). `useDoctypeList`/`DoctypePage` покрыть юнит-тестами один раз — это защитит все страницы разом.
@@ -61,6 +61,11 @@ backend-contract E2E.
 **Проблема.** Вся вёрстка на голых `div`/`table` + один `src/styles.css`; нет компонентов (кнопка/селект/бейдж/диалог/таблица), нет токенов (цвета/отступы/типографика), нет темизации. Отсюда визуальный разнобой между экранами.
 
 **Цель.** Минимальный внутренний UI-кит (Button/Select/Badge/Dialog/Table-ячейки) + токены; либо headless-библиотека без тяжёлого фреймворка. Doctype-рантайм рендерит через этот кит — единый вид «бесплатно». Не тащить тяжёлый UI-фреймворк без нужды.
+
+**Текущее состояние.** Добавлены semantic CSS tokens и тонкие `Button` /
+`StatusBadge` с сохранением прежних DOM и классов; на них переведены Doctype
+CommandBar и Ledger. Остальные custom pages мигрируются только после visual
+baseline, без массового редизайна.
 
 ## P2 — Протечки прямых `api()`/`fetch` мимо сервисов
 
