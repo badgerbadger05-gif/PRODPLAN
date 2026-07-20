@@ -283,6 +283,53 @@ describe('SpecificationPage characterization', () => {
     expect(screen.getByRole('heading', { name: 'НАС-01 · Насос ГА-1' })).toBeVisible()
   })
 
+  it('exposes and operates specification tabs with the ARIA tabs pattern', async () => {
+    const user = userEvent.setup()
+    vi.mocked(searchSpecificationItems).mockResolvedValue({ items: [pump], meta: { count: 1 } })
+    renderPage()
+
+    await searchFor(user, 'НАС-01')
+    expect(await screen.findByText('Загружено: НАС-01 · Насос ГА-1')).toBeVisible()
+
+    const tabList = screen.getByRole('tablist')
+    const tabs = within(tabList).getAllByRole('tab')
+    expect(tabs.map((tab) => tab.textContent)).toEqual([
+      'Дерево',
+      'Плоская развертка',
+      'Где используется',
+      'Качество',
+    ])
+    expect(tabs.filter((tab) => tab.getAttribute('aria-selected') === 'true')).toEqual([tabs[0]])
+    expect(tabs.filter((tab) => tab.tabIndex === 0)).toEqual([tabs[0]])
+
+    for (const tab of tabs) {
+      const panelId = tab.getAttribute('aria-controls')
+      expect(panelId).toBeTruthy()
+      expect(document.getElementById(panelId as string)).toHaveAttribute('role', 'tabpanel')
+    }
+
+    tabs[0].focus()
+    await user.keyboard('{ArrowRight}')
+    expect(tabs[1]).toHaveFocus()
+    expect(tabs[1]).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByRole('tabpanel')).toHaveAttribute('id', tabs[1].getAttribute('aria-controls'))
+
+    await user.keyboard('{End}')
+    expect(tabs[3]).toHaveFocus()
+    expect(tabs[3]).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByRole('tabpanel')).toHaveAttribute('id', tabs[3].getAttribute('aria-controls'))
+
+    await user.keyboard('{ArrowLeft}')
+    expect(tabs[2]).toHaveFocus()
+    expect(tabs[2]).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByRole('tabpanel')).toHaveAttribute('id', tabs[2].getAttribute('aria-controls'))
+
+    await user.keyboard('{Home}')
+    expect(tabs[0]).toHaveFocus()
+    expect(tabs[0]).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByRole('tabpanel')).toHaveAttribute('id', tabs[0].getAttribute('aria-controls'))
+  })
+
   it('preserves tab, tree and replenishment-method filters and exports XLSX', async () => {
     const user = userEvent.setup()
     vi.mocked(searchSpecificationItems).mockResolvedValue({ items: [pump], meta: { count: 1 } })
