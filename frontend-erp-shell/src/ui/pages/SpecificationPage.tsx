@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, type CSSProperties } from 'react'
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
 import type {
   BomFlattenedItem,
   BomItem,
@@ -59,6 +59,47 @@ export function SpecificationPage() {
   const [repairAction, setRepairAction] = useState<RepairAction | null>(null)
   const [picking, setPicking] = useState(false)
   const loadSequence = useRef(0)
+  const pickerRef = useRef<HTMLDivElement>(null)
+  const pickerReturnFocus = useRef<HTMLElement | null>(null)
+
+  useEffect(() => {
+    if (!picking) return
+    pickerReturnFocus.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null
+    const selector = 'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    pickerRef.current?.querySelector<HTMLElement>(selector)?.focus()
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        setPicking(false)
+        return
+      }
+      if (event.key !== 'Tab' || !pickerRef.current) return
+      const focusable = [...pickerRef.current.querySelectorAll<HTMLElement>(selector)]
+      if (!focusable.length) {
+        event.preventDefault()
+        pickerRef.current.focus()
+        return
+      }
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (event.shiftKey && (document.activeElement === first || !pickerRef.current.contains(document.activeElement))) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && (document.activeElement === last || !pickerRef.current.contains(document.activeElement))) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('keydown', onKeyDown)
+      pickerReturnFocus.current?.focus()
+      pickerReturnFocus.current = null
+    }
+  }, [picking])
 
   const rows = useMemo(() => flattenSpecNodes(loaded?.nodes ?? []), [loaded])
   const filteredRows = useMemo(
@@ -495,8 +536,15 @@ export function SpecificationPage() {
         )}
 
         {loaded && picking && searchItems.length > 0 && (
-          <div className="dialogOverlay" onClick={(e) => e.target === e.currentTarget && setPicking(false)}>
-            <div className="dialogBox bomPickerBox">
+          <div className="dialogOverlay" onMouseDown={(e) => e.target === e.currentTarget && setPicking(false)}>
+            <div
+              ref={pickerRef}
+              className="dialogBox bomPickerBox"
+              role="dialog"
+              aria-modal="true"
+              aria-label={`Найдено позиций: ${searchItems.length} — выберите`}
+              tabIndex={-1}
+            >
               <div className="dialogHeader">Найдено позиций: {searchItems.length} — выберите</div>
               <div className="dialogBody">
                 <table className="journalTable bomSearchTable">
