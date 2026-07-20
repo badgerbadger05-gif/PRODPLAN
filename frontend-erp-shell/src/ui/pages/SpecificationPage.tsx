@@ -20,6 +20,17 @@ import {
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
 import { SpecRepairDialog, type RepairAction } from './specification/SpecRepairDialog'
+import {
+  filterFlattenedRows,
+  filterSpecRows,
+  flattenSpecNodes,
+  getMethodOptions,
+  itemTitle,
+  nodeItemId,
+  nodeTitle,
+  qualitySeverityClass,
+  warningSeverity,
+} from './specification/model'
 
 type BomTab = 'tree' | 'flat' | 'where-used' | 'quality'
 
@@ -29,71 +40,6 @@ type LoadedBom = {
   flattened: BomFlattenedItem[]
   whereUsed: BomWhereUsedItem[]
   quality: BomQualityIssue[]
-}
-
-function flatten(nodes: SpecNode[], level = 0, path: string[] = []): SpecFlatRow[] {
-  return nodes.flatMap((node) => {
-    const title = nodeTitle(node)
-    const nextPath = node.type === 'item' ? [...path, title] : path
-    return [
-      { ...node, level, path: nextPath },
-      ...flatten(node.children ?? [], level + 1, nextPath),
-    ]
-  })
-}
-
-function nodeTitle(node: SpecNode) {
-  return node.type === 'operation'
-    ? node.operation?.name || 'Операция'
-    : node.name || 'Номенклатура'
-}
-
-function nodeItemId(node: SpecNode) {
-  const payload = (node as SpecNode & { item?: { id?: number | string } }).item
-  if (payload?.id == null) return null
-  const parsed = Number(payload.id)
-  return Number.isFinite(parsed) ? parsed : null
-}
-
-function itemTitle(item?: BomItem | null) {
-  if (!item) return ''
-  return [item.item_article, item.item_name].filter(Boolean).join(' · ') || item.item_code
-}
-
-function warningSeverity(warnings?: string[]) {
-  if ((warnings ?? []).includes('CYCLE_DETECTED')) return 'failed'
-  if ((warnings ?? []).length) return 'partial'
-  return 'ready'
-}
-
-function qualitySeverityClass(severity: string) {
-  if (severity === 'error') return 'failed'
-  if (severity === 'warning') return 'partial'
-  return 'ready'
-}
-
-function normalizeFilterValue(value?: string | null) {
-  return String(value || '').trim().toLowerCase()
-}
-
-function useFilteredRows(rows: SpecFlatRow[], query: string, replenishmentMethod: string) {
-  return useMemo(() => {
-    const text = query.trim().toLowerCase()
-    const method = normalizeFilterValue(replenishmentMethod)
-    if (!text && !method) return rows
-    return rows.filter((row) => {
-      if (method && normalizeFilterValue(row.replenishmentMethod) !== method) return false
-      const haystack = [
-        nodeTitle(row),
-        row.article,
-        row.stage?.name,
-        row.operation?.name,
-        row.replenishmentMethod,
-        ...(row.warnings ?? []),
-      ].filter(Boolean).join(' ').toLowerCase()
-      return !text || haystack.includes(text)
-    })
-  }, [rows, query, replenishmentMethod])
 }
 
 export function SpecificationPage() {
@@ -113,23 +59,19 @@ export function SpecificationPage() {
   const [repairAction, setRepairAction] = useState<RepairAction | null>(null)
   const [picking, setPicking] = useState(false)
 
-  const rows = useMemo(() => flatten(loaded?.nodes ?? []), [loaded])
-  const filteredRows = useFilteredRows(rows, treeFilter, methodFilter)
-  const methodOptions = useMemo(() => {
-    const methods = new Set<string>()
-    rows.forEach((row) => {
-      if (row.type === 'item' && row.replenishmentMethod) methods.add(row.replenishmentMethod)
-    })
-    ;(loaded?.flattened ?? []).forEach((row) => {
-      if (row.replenishment_method) methods.add(row.replenishment_method)
-    })
-    return Array.from(methods).sort((a, b) => a.localeCompare(b, 'ru'))
-  }, [rows, loaded?.flattened])
-  const filteredFlattened = useMemo(() => {
-    const method = normalizeFilterValue(methodFilter)
-    if (!method) return loaded?.flattened ?? []
-    return (loaded?.flattened ?? []).filter((row) => normalizeFilterValue(row.replenishment_method) === method)
-  }, [loaded?.flattened, methodFilter])
+  const rows = useMemo(() => flattenSpecNodes(loaded?.nodes ?? []), [loaded])
+  const filteredRows = useMemo(
+    () => filterSpecRows(rows, treeFilter, methodFilter),
+    [rows, treeFilter, methodFilter],
+  )
+  const methodOptions = useMemo(
+    () => getMethodOptions(rows, loaded?.flattened ?? []),
+    [rows, loaded?.flattened],
+  )
+  const filteredFlattened = useMemo(
+    () => filterFlattenedRows(loaded?.flattened ?? [], methodFilter),
+    [loaded?.flattened, methodFilter],
+  )
   const itemRows = rows.filter((row) => row.type === 'item')
   const operationRows = rows.filter((row) => row.type === 'operation')
   const warningsCount = rows.reduce((sum, row) => sum + (row.warnings?.length ?? 0), 0)
