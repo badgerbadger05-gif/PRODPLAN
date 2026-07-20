@@ -6,7 +6,7 @@
 
 - Doctype runtime реализован и используется `MRP Runs`, `Transfer Requests`,
   `Purchase Control` и `Workshop Binding Review`; остальные журналы инвентаризируются.
-- OpenAPI-типы генерируются, lint чистый, frontend CI добавлен, 210 frontend-тестов проходят.
+- OpenAPI-типы генерируются, lint чистый, frontend CI добавлен, 240 frontend-тестов проходят.
 - Прямые API-вызовы страниц вынесены в services-слой.
 - Route-level code splitting снизил initial JS bundle примерно с 592 до 242 КБ.
 - Mock session shell и resource/action/record/field gates реализованы, но Auth/RBAC нельзя считать закрытым до появления backend-сессии и `/auth/me`.
@@ -43,10 +43,10 @@
 ## P1 — Тестовое покрытие критичных экранов
 
 **Текущее состояние.** Общий runtime, transport, session/RBAC, saved views,
-Ledger и критичные custom pages покрыты 210 Vitest-тестами; есть hermetic
+Ledger и критичные custom pages покрыты 240 Vitest-тестами; есть hermetic
 Playwright smoke и стабильные Linux visual baselines Ledger, Purchase Control,
 Production Control, Period Plan (list/detail), Workshop Binding Review и
-Stage Distribution, Resources, Specification и Sync. Не хватает отдельного
+Stage Distribution, Resources, Specification, Sync и MRP Result. Не хватает отдельного
 backend-contract E2E.
 
 **Цель.** На каждый Doctype — характеристический vitest-тест (рендер + 1–2 флоу, мок сервисов), по образцу `ProductionControlPage.test.tsx`. Прогон в CI (см. P3). `useDoctypeList`/`DoctypePage` покрыть юнит-тестами один раз — это защитит все страницы разом.
@@ -74,6 +74,12 @@ rejection, а диагностические данные рекурсивно �
 Feeder получил characterization-покрытие, чистую модель и latest-wins защиту
 для позиций и сигналов. Критические сценарии MRP Result зафиксированы тестами
 до дальнейшей декомпозиции страницы.
+
+MRP Result получил чистую модель, latest-wins защиту при смене прогона, mutex
+production/purchase-команд и visual baseline. DBR Drum Board покрыт рабочими
+сценариями и модельными тестами; его диалоги имеют связанные подписи, доступные
+имена и управляемый фокус. DBR Settings покрыт загрузкой и командами, защищён
+от поздних ответов и повторных конкурентных сохранений.
 
 ## P2 — Протечки прямых `api()`/`fetch` мимо сервисов
 
