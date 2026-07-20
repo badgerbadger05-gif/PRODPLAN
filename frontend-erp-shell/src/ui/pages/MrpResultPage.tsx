@@ -69,6 +69,7 @@ export function MrpResultPage() {
   const highlightedPurchaseId = parsePositiveId(searchParams.get('purchase_id'))
   const highlightedReworkId = parsePositiveId(searchParams.get('rework_id'))
   const [summary, setSummary] = useState<MrpSummary | null>(null)
+  const [dataRunId, setDataRunId] = useState(runId)
   const [tab, setTab] = useState<Tab>(() => queryTab ?? 'production')
   const [loadedTabs, setLoadedTabs] = useState<Record<Tab, boolean>>(() => emptyTabFlags())
   const [offsets, setOffsets] = useState<Record<Tab, number>>(() => emptyTabOffsets())
@@ -193,12 +194,21 @@ export function MrpResultPage() {
   }, [loadTab, offsets, tab])
 
   useEffect(() => {
+    if (previousRunId.current === runId) return
+    previousRunId.current = runId
+    summarySeq.current += 1
+    setSummary(null)
+    invalidateTabs()
+    setDataRunId(runId)
+  }, [invalidateTabs, runId])
+
+  useEffect(() => {
     void loadSummary()
   }, [loadSummary])
 
   useEffect(() => {
-    if (!loadedTabs[tab]) void loadTab(tab, offsets[tab])
-  }, [loadedTabs, loadTab, offsets, tab])
+    if (dataRunId === runId && !loadedTabs[tab]) void loadTab(tab, offsets[tab])
+  }, [dataRunId, loadedTabs, loadTab, offsets, runId, tab])
 
   useEffect(() => {
     let cancelled = false
@@ -241,7 +251,8 @@ export function MrpResultPage() {
   }
 
   async function createSelectedProductionOrders() {
-    if (!selectedProductionIds.size) return
+    if (!selectedProductionIds.size || mutationInFlight.current) return
+    mutationInFlight.current = true
     setExporting(true)
     setError('')
     setMessage('')
@@ -259,12 +270,14 @@ export function MrpResultPage() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
+      mutationInFlight.current = false
       setExporting(false)
     }
   }
 
   async function exportSelectedPurchasesTo1C() {
-    if (!selectedPurchaseIds.size) return
+    if (!selectedPurchaseIds.size || mutationInFlight.current) return
+    mutationInFlight.current = true
     setExporting(true)
     setError('')
     setMessage('')
@@ -281,6 +294,7 @@ export function MrpResultPage() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
+      mutationInFlight.current = false
       setExporting(false)
     }
   }

@@ -1,6 +1,6 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { MemoryRouter, Route, Routes } from 'react-router-dom'
+import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type {
   MrpCapacityRow,
@@ -143,15 +143,31 @@ function paged<T>(rows: T[], total = rows.length, offset = 0) {
   return { rows, total, limit: 200, offset }
 }
 
-function renderPage(entry = '/mrp-runs/41') {
+function RouteSwitchingMrpResultPage() {
+  const navigate = useNavigate()
+  return (
+    <>
+      <button onClick={() => navigate('/mrp-runs/42')}>Открыть прогон 42</button>
+      <MrpResultPage />
+    </>
+  )
+}
+
+function renderPage(entry = '/mrp-runs/41', routeSwitch = false) {
   return render(
     <MemoryRouter initialEntries={[entry]}>
       <Routes>
-        <Route path="/mrp-runs/:runId" element={<MrpResultPage />} />
+        <Route path="/mrp-runs/:runId" element={routeSwitch ? <RouteSwitchingMrpResultPage /> : <MrpResultPage />} />
         <Route path="/mrp-runs" element={<div>Список прогонов</div>} />
       </Routes>
     </MemoryRouter>,
   )
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((next) => { resolve = next })
+  return { promise, resolve }
 }
 
 describe('MrpResultPage characterization', () => {
@@ -341,5 +357,73 @@ describe('MrpResultPage characterization', () => {
     await user.click(screen.getByRole('button', { name: 'Мощности' }))
     await screen.findByText('Участок #9')
     expect(screen.queryByRole('button', { name: 'XLSX' })).not.toBeInTheDocument()
+  })
+
+  it('keeps the newest summary and tab data when the run route changes mid-load', async () => {
+    const oldSummary = deferred<MrpSummary>()
+    const newSummary = deferred<MrpSummary>()
+    const oldRows = deferred<ReturnType<typeof paged<MrpProductionRow>>>()
+    const newRows = deferred<ReturnType<typeof paged<MrpProductionRow>>>()
+    vi.mocked(getPlanningRunSummary)
+      .mockImplementationOnce(() => oldSummary.promise)
+      .mockImplementationOnce(() => newSummary.promise)
+    vi.mocked(getPlanningResultProduction)
+      .mockImplementationOnce(() => oldRows.promise)
+      .mockImplementationOnce(() => newRows.promise)
+
+    const user = userEvent.setup()
+    renderPage('/mrp-runs/41', true)
+    await waitFor(() => expect(getPlanningResultProduction).toHaveBeenCalledWith(41, expect.any(Object)))
+    await user.click(screen.getByRole('button', { name: 'Открыть прогон 42' }))
+    await waitFor(() => expect(getPlanningResultProduction).toHaveBeenCalledWith(42, expect.any(Object)))
+
+    newSummary.resolve({
+      ...summary,
+      run: { ...summary.run, run_id: 42, horizon_days: 99 },
+    })
+    newRows.resolve(paged([{ ...productionRows[0], order_id: 4201, item_name: 'Новый прогон' }]))
+    expect(await screen.findByText('Новый прогон')).toBeVisible()
+    expect(screen.getByText('99 дн.')).toBeVisible()
+
+    oldSummary.resolve(summary)
+    oldRows.resolve(paged(productionRows))
+    await waitFor(() => {
+      expect(screen.queryByText('Насос ГА-1')).not.toBeInTheDocument()
+      expect(screen.getByText('99 дн.')).toBeVisible()
+    })
+  })
+
+  it('allows only one production mutation while the first request is pending', async () => {
+    const pending = deferred<Record<string, unknown>>()
+    vi.mocked(createProductionControlOrdersFromMrp).mockImplementation(() => pending.promise)
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findByText('Насос ГА-1')
+    await user.click(screen.getByRole('checkbox', { name: 'Выбрать Насос ГА-1' }))
+
+    const action = screen.getByRole('button', { name: 'Создать заказы (2)' })
+    fireEvent.click(action)
+    fireEvent.click(action)
+    expect(createProductionControlOrdersFromMrp).toHaveBeenCalledTimes(1)
+
+    pending.resolve({ created: 2 })
+    expect(await screen.findByText('Создание заказов: выполнено, новых 2')).toBeVisible()
+  })
+
+  it('allows only one purchase mutation while the first request is pending', async () => {
+    const pending = deferred<Record<string, unknown>>()
+    vi.mocked(exportPurchasesTo1C).mockImplementation(() => pending.promise)
+    const user = userEvent.setup()
+    renderPage('/mrp-runs/41?tab=purchases')
+    await screen.findByText('Подшипник')
+    await user.click(screen.getByRole('checkbox', { name: 'Выбрать Подшипник' }))
+
+    const action = screen.getByRole('button', { name: 'Выгрузить в 1С (2)' })
+    fireEvent.click(action)
+    fireEvent.click(action)
+    expect(exportPurchasesTo1C).toHaveBeenCalledTimes(1)
+
+    pending.resolve({ exported: 2 })
+    expect(await screen.findByText('Выгрузка закупок в 1С: выполнено, новых 2')).toBeVisible()
   })
 })
