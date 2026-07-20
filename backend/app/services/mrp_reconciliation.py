@@ -490,7 +490,8 @@ def _current_snapshot_gross_by_item(
     requirements: List[MrpRequirement],
     stock_by_item: Dict[int, float],
     root_production_item_ids: set[int],
-) -> tuple[Dict[int, float], Dict[int, int]]:
+    shared_pools: Optional["SharedPools"] = None,
+) -> tuple[Dict[int, float], Dict[int, int], Dict[int, float]]:
     """
     Recompute fixed-snapshot gross demand from its level-0 roots through
     current stock.
@@ -512,6 +513,22 @@ def _current_snapshot_gross_by_item(
 
     Requirements the explosion no longer reaches get gross 0, so their net
     (and hence local order coverage) is zeroed downstream.
+
+    ``shared_pools`` — consume-once across the active-run queue (Step B).
+    When ``None`` (the default single-run path) this function behaves exactly
+    as before: it reads the full per-run ``stock_by_item`` read-only, mutates
+    nothing, and the returned ``produced_net`` is empty and ignored.
+
+    When a ``SharedPools`` is passed, every PRODUCED (non-root) item's stock is
+    consumed ONCE here, at its own BOM level, from the shared ``stock`` ledger:
+    ``consumed = min(ledger[P], P_gross); ledger[P] -= consumed;
+    P_net = P_gross - consumed``. The explosion of P uses ``P_net`` and the
+    value is recorded in the returned ``produced_net`` dict. The item-net loop
+    in ``reconcile_snapshot`` then reuses ``produced_net[P]`` for P and does NOT
+    touch the ledger again — so P's stock is netted exactly once (explosion XOR
+    item-net), never double-credited across runs. Level-0 production roots still
+    explode the full frozen programme and consume no stock. PURCHASED items are
+    left untouched here and consume the shared ledger in the item-net loop.
     """
     bom_level_by_item = {
         int(req.item_id): int(req.bom_level or 0)
@@ -523,6 +540,10 @@ def _current_snapshot_gross_by_item(
         if int(req.bom_level or 0) == 0
     }
 
+    # Step B: net PRODUCED (non-root) stock once, at the explosion level, from
+    # the shared ledger. Populated only when ``shared_pools`` is not None.
+    produced_net: Dict[int, float] = {}
+
     processed: set[int] = set()
     while True:
         pending_parent_ids = [
@@ -532,6 +553,22 @@ def _current_snapshot_gross_by_item(
         ]
         if not pending_parent_ids:
             break
+        # Classify each pending parent produced/purchased so a produced parent
+        # consumes its stock ONCE here while a purchased parent (degenerate: a
+        # bought item that still carries a spec) only peeks and lets the
+        # item-net loop consume it. Read-only on the None path (never queried).
+        parent_is_produced: Dict[int, bool] = {}
+        if shared_pools is not None:
+            parent_is_produced = {
+                int(iid): (
+                    classify_replenishment_flow(method) == REPLENISHMENT_FLOW_PRODUCTION
+                )
+                for iid, method in (
+                    db.query(Item.item_id, Item.replenishment_method)
+                    .filter(Item.item_id.in_(pending_parent_ids))
+                    .all()
+                )
+            }
         spec_by_parent = {
             int(row.item_id): int(row.spec_id)
             for row in (
@@ -561,11 +598,30 @@ def _current_snapshot_gross_by_item(
             if not children:
                 continue
             parent_gross = _to_float(current_gross.get(parent_id, 0.0))
-            parent_explode_qty = (
-                parent_gross
-                if parent_id in root_production_item_ids
-                else max(parent_gross - _to_float(stock_by_item.get(parent_id, 0.0)), 0.0)
-            )
+            if parent_id in root_production_item_ids:
+                # Level-0 production root: always explode the full frozen
+                # programme, consume no stock (net == gross downstream).
+                parent_explode_qty = parent_gross
+            elif shared_pools is not None:
+                available = _to_float(shared_pools.stock.get(parent_id, 0.0))
+                if parent_is_produced.get(parent_id, True):
+                    # Produced parent: consume stock ONCE from the shared ledger
+                    # and record the net so the item-net loop reuses it without
+                    # touching the ledger again.
+                    consumed = min(available, parent_gross)
+                    shared_pools.stock[parent_id] = available - consumed
+                    parent_net = parent_gross - consumed
+                    produced_net[parent_id] = parent_net
+                    parent_explode_qty = parent_net
+                else:
+                    # Purchased parent (degenerate): peek only. The item-net loop
+                    # consumes this item's shared stock — no double-consume, and
+                    # nothing else touches it between here and there.
+                    parent_explode_qty = max(parent_gross - available, 0.0)
+            else:
+                parent_explode_qty = max(
+                    parent_gross - _to_float(stock_by_item.get(parent_id, 0.0)), 0.0
+                )
             if parent_explode_qty <= EPS:
                 continue
             parent_level = bom_level_by_item.get(parent_id, 0)
@@ -584,7 +640,41 @@ def _current_snapshot_gross_by_item(
     for req in requirements:
         current_gross.setdefault(int(req.item_id), 0.0)
 
-    return current_gross, bom_level_by_item
+    if shared_pools is not None:
+        # Produced non-root items that never consumed stock as an explosion
+        # parent — produced leaves (no BOM children) and produced parents whose
+        # spec had no components — must still net their stock ONCE. Skip roots
+        # (net == gross) and anything already netted in the explosion above.
+        remaining_ids = [
+            iid
+            for iid in current_gross
+            if iid not in produced_net and iid not in root_production_item_ids
+        ]
+        if remaining_ids:
+            method_by_item = {
+                int(iid): method
+                for iid, method in (
+                    db.query(Item.item_id, Item.replenishment_method)
+                    .filter(Item.item_id.in_(remaining_ids))
+                    .all()
+                )
+            }
+            for iid in sorted(
+                remaining_ids,
+                key=lambda i: (bom_level_by_item.get(int(i), 0), int(i)),
+            ):
+                if (
+                    classify_replenishment_flow(method_by_item.get(iid))
+                    != REPLENISHMENT_FLOW_PRODUCTION
+                ):
+                    continue
+                gross = _to_float(current_gross.get(iid, 0.0))
+                available = _to_float(shared_pools.stock.get(iid, 0.0))
+                consumed = min(available, gross)
+                shared_pools.stock[iid] = available - consumed
+                produced_net[iid] = gross - consumed
+
+    return current_gross, bom_level_by_item, produced_net
 
 
 def _ensure_reconciled_requirements(
@@ -731,8 +821,8 @@ def reconcile_snapshot(
         )
         if classify_replenishment_flow(replenishment_method) == REPLENISHMENT_FLOW_PRODUCTION
     }
-    current_gross_by_item, bom_level_by_item = _current_snapshot_gross_by_item(
-        db, snapshot_requirements, stock_by_item, root_production_item_ids,
+    current_gross_by_item, bom_level_by_item, produced_net_by_item = _current_snapshot_gross_by_item(
+        db, snapshot_requirements, stock_by_item, root_production_item_ids, shared_pools,
     )
     current_net_by_item: Dict[int, float] = {}
     for iid in sorted(current_gross_by_item):
@@ -742,14 +832,21 @@ def reconcile_snapshot(
             # in the single-run path.
             current_net_by_item[iid] = gross
         elif shared_pools is not None:
-            # Consume-once against the shared stock ledger so a physical unit is
-            # netted by at most one run. For a single visit this is arithmetically
-            # identical to ``max(gross - stock, 0)``; the mutation only matters
-            # for the NEXT run in the shared queue.
-            available = _to_float(shared_pools.stock.get(iid, 0.0))
-            consumed = min(available, gross)
-            shared_pools.stock[iid] = available - consumed
-            current_net_by_item[iid] = gross - consumed
+            if iid in produced_net_by_item:
+                # PRODUCED (non-root) item: its stock was already consumed ONCE
+                # from the shared ledger during the explosion pass. Reuse the
+                # recorded net — do NOT touch the ledger again (explosion XOR
+                # item-net guarantees a single consumption per item).
+                current_net_by_item[iid] = _to_float(produced_net_by_item.get(iid, 0.0))
+            else:
+                # PURCHASED item: consume the shared stock ledger ONCE here so a
+                # physical unit is netted by at most one run. For a single visit
+                # this is identical to ``max(gross - stock, 0)``; the mutation
+                # only matters for the NEXT run in the shared queue.
+                available = _to_float(shared_pools.stock.get(iid, 0.0))
+                consumed = min(available, gross)
+                shared_pools.stock[iid] = available - consumed
+                current_net_by_item[iid] = gross - consumed
         else:
             current_net_by_item[iid] = max(
                 gross - _to_float(stock_by_item.get(iid, 0.0)), 0.0

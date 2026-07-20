@@ -27,7 +27,14 @@ from app.models import (
     SupplierOrderItem,
     SyncLink,
 )
-from app.services.mrp_reconciliation import reconcile_all_active, reconcile_snapshot
+from app.services.mrp_reconciliation import (
+    SharedPools,
+    _active_production_qty_by_item,
+    _load_purchase_supplier_remaining,
+    reconcile_all_active,
+    reconcile_snapshot,
+)
+from app.services.mrp_stock_helpers import effective_stock_by_item_all
 from app.services.one_c_purchase_order_export import PURCHASE_ORDER_ENTITY
 from app.services.period_plan_service import create_mrp_snapshot_from_period_plan
 from app.services.production_binding_repair import repair_clean_mrp_bindings
@@ -1289,3 +1296,121 @@ def test_exported_purchase_not_double_ordered(db_session):
     assert len(remaining) == 1
     assert int(remaining[0].purchase_id) == int(sep_purchase.purchase_id)
     assert float(remaining[0].qty) == pytest.approx(191.074, abs=1e-4)
+
+
+# ---------------------------------------------------------------------------
+# Part 4 — Step B: net PRODUCED sub-assembly stock ONCE across the queue,
+# at the explosion level, without double-consuming within a run.
+# ---------------------------------------------------------------------------
+
+def _make_purchase_plan_snapshot_prod(
+    db, item, *, name, period_from, period_to, qty, bucket_date
+) -> int:
+    """Fixed period plan with a single PRODUCTION top-level line, snapshotted."""
+    plan = ProductionPlanHeader(
+        name=name,
+        period_from=period_from,
+        period_to=period_to,
+        status="fixed",
+        created_by="test",
+    )
+    db.add(plan)
+    db.flush()
+    db.add(
+        ProductionPlanLine(
+            plan_id=plan.id, item_id=item.item_id, bucket_date=bucket_date, qty=qty
+        )
+    )
+    db.commit()
+    snap = create_mrp_snapshot_from_period_plan(db, plan.id)
+    return int(snap["run_id"])
+
+
+def test_produced_subassembly_stock_netted_once(db_session):
+    # BOM: root R (produced) -> sub-assembly S (produced, HOLDS STOCK) -> leaf L
+    # (purchased). qty_per_unit = 1 throughout. Two active runs (Aug, Sep) each
+    # release 100 of R, so aggregate demand for S and L across the queue is 200.
+    #
+    # S carries 100 of stock — exactly one run's worth. Its stock must reduce the
+    # explosion for EXACTLY ONE run (earliest-need-first = Aug), so the purchased
+    # leaf L's aggregate deficit is 200 - 100 = 100, NOT 0 (which is what a
+    # per-run re-credit of S's full stock at the explosion level would give).
+    root = _make_production_item(db_session, "STEPB-ROOT", stock=0.0)
+    sub = _make_production_item(db_session, "STEPB-SUB", stock=100.0)
+    leaf = _make_purchased_item(db_session, "STEPB-LEAF", stock=0.0)
+    _link_bom(db_session, root, sub, qty_per_unit=1.0)
+    _link_bom(db_session, sub, leaf, qty_per_unit=1.0)
+
+    aug = _make_purchase_plan_snapshot_prod(
+        db_session, root, name="Август",
+        period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
+        qty=100, bucket_date=date(2026, 8, 15),
+    )
+    sep = _make_purchase_plan_snapshot_prod(
+        db_session, root, name="Сентябрь",
+        period_from=date(2026, 9, 1), period_to=date(2026, 9, 30),
+        qty=100, bucket_date=date(2026, 9, 15),
+    )
+
+    reconcile_all_active(db_session)
+
+    aug_leaf = _planned_purchase_sum(db_session, aug)
+    sep_leaf = _planned_purchase_sum(db_session, sep)
+    # Aug (earliest need) consumes all 100 of S's stock at the explosion level →
+    # S_net(Aug)=0 → L_gross(Aug)=0 → no purchase. Sep sees a depleted S ledger →
+    # S_net(Sep)=100 → L_gross(Sep)=100 → purchase 100.
+    assert aug_leaf == pytest.approx(0.0, abs=1e-6)
+    assert sep_leaf == pytest.approx(100.0, abs=1e-6)
+    # S's 100 of stock is subtracted from the leaf deficit ONCE, not once per run.
+    assert (aug_leaf + sep_leaf) == pytest.approx(100.0, abs=1e-6)
+
+
+def test_produced_node_single_run_no_regression(db_session):
+    # A single active run with a produced sub-assembly holding stock must give a
+    # byte-identical result on the shared path and the None (single-run) path.
+    # Two mirrored, isolated scenarios: A reconciled via the None path, B via a
+    # SharedPools of exactly one run. R->S->L, qty R->S = 2, S->L = 3.
+    #   R net = 50 (root). S gross = 100, S stock 30 → S net = 70.
+    #   L gross = 70*3 = 210 → L purchase = 210.
+    def _build(tag):
+        root = _make_production_item(db_session, f"NOREG-ROOT-{tag}", stock=0.0)
+        sub = _make_production_item(db_session, f"NOREG-SUB-{tag}", stock=30.0)
+        leaf = _make_purchased_item(db_session, f"NOREG-LEAF-{tag}", stock=0.0)
+        _link_bom(db_session, root, sub, qty_per_unit=2.0)
+        _link_bom(db_session, sub, leaf, qty_per_unit=3.0)
+        run_id = _make_purchase_plan_snapshot_prod(
+            db_session, root, name=f"План-{tag}",
+            period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
+            qty=50, bucket_date=date(2026, 8, 15),
+        )
+        return root, sub, leaf, run_id
+
+    root_a, sub_a, leaf_a, run_a = _build("A")
+    root_b, sub_b, leaf_b, run_b = _build("B")
+
+    # Scenario A: the None (single-run) path.
+    res_a = reconcile_snapshot(db_session, run_a)
+    added_a = {int(e["item_id"]): e["qty"] for e in res_a["production_added"]}
+    leaf_a_purchase = _planned_purchase_sum(db_session, run_a)
+
+    # Scenario B: the shared path with a SharedPools scoped to this one run only.
+    b_item_ids = [root_b.item_id, sub_b.item_id, leaf_b.item_id]
+    pools = SharedPools(
+        stock=effective_stock_by_item_all(db_session),
+        supplier=_load_purchase_supplier_remaining(
+            db_session, [leaf_b.item_id], date(2026, 8, 31)
+        ),
+        prodsupply=_active_production_qty_by_item(db_session, b_item_ids),
+    )
+    res_b = reconcile_snapshot(db_session, run_b, shared_pools=pools)
+    added_b = {int(e["item_id"]): e["qty"] for e in res_b["production_added"]}
+    leaf_b_purchase = _planned_purchase_sum(db_session, run_b)
+
+    # Same numbers on both paths (only the item codes differ).
+    assert added_a[root_a.item_id] == pytest.approx(50.0)
+    assert added_a[sub_a.item_id] == pytest.approx(70.0)
+    assert leaf_a_purchase == pytest.approx(210.0)
+
+    assert added_b[root_b.item_id] == pytest.approx(added_a[root_a.item_id])
+    assert added_b[sub_b.item_id] == pytest.approx(added_a[sub_a.item_id])
+    assert leaf_b_purchase == pytest.approx(leaf_a_purchase)
