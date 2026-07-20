@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import type {
   BomFlattenedItem,
   BomItem,
@@ -21,6 +21,10 @@ import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
 import { SpecRepairDialog, type RepairAction } from './specification/SpecRepairDialog'
 import {
+  SpecificationResults,
+  type SpecificationTab,
+} from './specification/SpecificationResults'
+import {
   filterFlattenedRows,
   filterSpecRows,
   flattenSpecNodes,
@@ -28,11 +32,7 @@ import {
   itemTitle,
   nodeItemId,
   nodeTitle,
-  qualitySeverityClass,
-  warningSeverity,
 } from './specification/model'
-
-type BomTab = 'tree' | 'flat' | 'where-used' | 'quality'
 
 type LoadedBom = {
   item: BomItem
@@ -47,7 +47,7 @@ export function SpecificationPage() {
   const [treeFilter, setTreeFilter] = useState('')
   const [methodFilter, setMethodFilter] = useState('')
   const [rootQty, setRootQty] = useState(1)
-  const [tab, setTab] = useState<BomTab>('tree')
+  const [tab, setTab] = useState<SpecificationTab>('tree')
   const [searchItems, setSearchItems] = useState<BomItem[]>([])
   const [loaded, setLoaded] = useState<LoadedBom | null>(null)
   const [selectedNode, setSelectedNode] = useState<SpecFlatRow | null>(null)
@@ -210,7 +210,30 @@ export function SpecificationPage() {
     }
   }
 
+  function handleTabKeyDown(
+    event: ReactKeyboardEvent<HTMLSpanElement>,
+    index: number,
+  ) {
+    const tabs: SpecificationTab[] = ['tree', 'flat', 'where-used', 'quality']
+    let nextIndex = index
+    if (event.key === 'ArrowRight') nextIndex = (index + 1) % tabs.length
+    else if (event.key === 'ArrowLeft') nextIndex = (index - 1 + tabs.length) % tabs.length
+    else if (event.key === 'Home') nextIndex = 0
+    else if (event.key === 'End') nextIndex = tabs.length - 1
+    else return
+
+    event.preventDefault()
+    setTab(tabs[nextIndex])
+    const tabList = event.currentTarget.parentElement
+    ;(tabList?.children[nextIndex] as HTMLElement | undefined)?.focus()
+  }
+
   const selectedTitle = selectedNode ? nodeTitle(selectedNode) : selectedFlat?.name ?? itemTitle(loaded?.item)
+  const selectedAccessibleTitle = selectedNode
+    ? selectedNode.type === 'item'
+      ? [selectedNode.article, nodeTitle(selectedNode)].filter(Boolean).join(' · ')
+      : nodeTitle(selectedNode)
+    : selectedTitle
 
   return (
     <main className="workArea">
@@ -323,152 +346,47 @@ export function SpecificationPage() {
               <div className="metricCell"><span>Проблемы</span><strong>{loaded.quality.length || warningsCount}</strong><em>quality</em></div>
             </div>
 
-            <div className="tabsBar bomTabs">
-              <button className={tab === 'tree' ? 'activeTab' : ''} onClick={() => setTab('tree')}>Дерево</button>
-              <button className={tab === 'flat' ? 'activeTab' : ''} onClick={() => setTab('flat')}>Плоская развертка</button>
-              <button className={tab === 'where-used' ? 'activeTab' : ''} onClick={() => setTab('where-used')}>Где используется</button>
-              <button className={tab === 'quality' ? 'activeTab' : ''} onClick={() => setTab('quality')}>Качество</button>
+            <div className="tabsBar bomTabs" role="tablist">
+              {([
+                ['tree', 'Дерево'],
+                ['flat', 'Плоская развертка'],
+                ['where-used', 'Где используется'],
+                ['quality', 'Качество'],
+              ] as const).map(([value, label], index) => (
+                <span
+                  key={value}
+                  id={`specification-tab-${value}`}
+                  role="tab"
+                  aria-controls={`specification-panel-${value}`}
+                  aria-selected={tab === value}
+                  tabIndex={tab === value ? 0 : -1}
+                  onKeyDown={(event) => handleTabKeyDown(event, index)}
+                  style={{ display: 'contents' }}
+                >
+                  <button
+                    className={tab === value ? 'activeTab' : ''}
+                    onClick={() => setTab(value)}
+                    tabIndex={-1}
+                  >{label}</button>
+                </span>
+              ))}
             </div>
 
             <div className="split bomCockpitSplit">
-              <div className="tablePane resultTablePane">
-                {tab === 'tree' && (
-                  <table className="journalTable bomTreeTable">
-                    <thead>
-                      <tr>
-                        <th>Узел</th>
-                        <th>Артикул</th>
-                        <th>Этап</th>
-                        <th>Метод</th>
-                        <th>Кол-во</th>
-                        <th>Ед./Норма</th>
-                        <th>Итого</th>
-                        <th>Проблемы</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {filteredRows.map((row, index) => (
-                        <tr
-                          key={`${row.id}-${index}`}
-                          className={`${row.type === 'operation' ? 'operationRow' : ''}${selectedNode?.id === row.id ? ' activeRow' : ''}`}
-                          onClick={() => setSelectedNode(row)}
-                        >
-                          <td className="itemCell bomNameCell" style={{ '--level': row.level } as CSSProperties}>
-                            <strong>{nodeTitle(row)}</strong>
-                            <span>{row.type === 'operation' ? 'операция' : `уровень ${row.level}`}</span>
-                          </td>
-                          <td>{row.article || ''}</td>
-                          <td>{row.stage?.name || ''}</td>
-                          <td>{row.type === 'operation' ? '' : row.replenishmentMethod || ''}</td>
-                          <td className="numCell"><strong>{row.qtyPerParent == null ? '' : qty(row.qtyPerParent)}</strong></td>
-                          <td>{row.type === 'operation' ? `${qty(row.timeNormNh)} н/ч` : row.unit || ''}</td>
-                          <td className="numCell"><strong>{row.computed?.treeQty == null ? '' : qty(row.computed.treeQty)}</strong></td>
-                          <td><span className={`miniPill ${warningSeverity(row.warnings)}`}>{(row.warnings ?? []).length || 'ok'}</span></td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                )}
-
-                {tab === 'flat' && (
-                  <table className="journalTable bomFlatTable">
-                    <thead>
-                      <tr>
-                        <th>Компонент</th>
-                        <th>Артикул</th>
-                        <th>Метод</th>
-                        <th>Итого</th>
-                        <th>Ед.</th>
-                        <th>Вхождений</th>
-                        <th>Уровни</th>
-                        <th>Этапы</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {filteredFlattened.map((row) => (
-                        <tr key={row.item_id} className={selectedFlat?.item_id === row.item_id ? 'activeRow' : ''} onClick={() => setSelectedFlat(row)}>
-                          <td className="itemCell"><strong>{row.name}</strong><span>{row.item_code}</span></td>
-                          <td>{row.article || ''}</td>
-                          <td>{row.replenishment_method || ''}</td>
-                          <td className="numCell"><strong>{qty(row.total_qty)}</strong></td>
-                          <td>{row.unit || ''}</td>
-                          <td className="numCell"><strong>{row.occurrences}</strong></td>
-                          <td>{row.levels.join(', ')}</td>
-                          <td>{row.stages.join(', ')}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                )}
-
-                {tab === 'where-used' && (
-                  <table className="journalTable bomWhereTable">
-                    <colgroup>
-                      <col className="bomWhereParentCol" />
-                      <col className="bomWhereSpecCol" />
-                      <col className="bomWhereSmallCol" />
-                      <col className="bomWhereSmallCol" />
-                      <col className="bomWhereQtyCol" />
-                      <col className="bomWhereStageCol" />
-                    </colgroup>
-                    <thead>
-                      <tr>
-                        <th>Родитель</th>
-                        <th>Спецификация</th>
-                        <th>Уровень вверх</th>
-                        <th>Кол-во</th>
-                        <th>Итого к цели</th>
-                        <th>Этап</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {loaded.whereUsed.map((row, index) => (
-                        <tr key={`${row.parent.item_id}-${index}`}>
-                          <td className="itemCell bomWhereParentCell">
-                            <strong title={row.parent.item_name}>{row.parent.item_name}</strong>
-                            <span title={row.parent.item_article || row.parent.item_code}>{row.parent.item_article || row.parent.item_code}</span>
-                          </td>
-                          <td className="bomWhereSpecCell" title={row.spec.spec_name || row.spec.spec_code || `#${row.spec.spec_id}`}>
-                            {row.spec.spec_name || row.spec.spec_code || `#${row.spec.spec_id}`}
-                          </td>
-                          <td className="numCell"><strong>{row.level_up}</strong></td>
-                          <td className="numCell"><strong>{qty(row.qty_per_parent)}</strong></td>
-                          <td className="numCell"><strong>{qty(row.total_qty_to_target)}</strong></td>
-                          <td className="bomWhereStageCell" title={row.stage?.name || ''}>{row.stage?.name || ''}</td>
-                        </tr>
-                      ))}
-                      {!loaded.whereUsed.length && <tr><td colSpan={6} className="emptyDetail">В родительских спецификациях не найдено</td></tr>}
-                    </tbody>
-                  </table>
-                )}
-
-                {tab === 'quality' && (
-                  <table className="journalTable bomQualityTable">
-                    <thead>
-                      <tr>
-                        <th>Проблема</th>
-                        <th>Серьезность</th>
-                        <th>Номенклатура</th>
-                        <th>Спецификация</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {loaded.quality.map((issue, index) => (
-                        <tr key={`${issue.code}-${issue.spec_id ?? ''}-${issue.item?.item_id ?? ''}-${index}`}>
-                          <td className="itemCell"><strong>{issue.message}</strong><span>{issue.code}</span></td>
-                          <td><span className={`miniPill ${qualitySeverityClass(issue.severity)}`}>{issue.severity}</span></td>
-                          <td>{issue.item ? [issue.item.item_article, issue.item.item_name].filter(Boolean).join(' · ') : ''}</td>
-                          <td>{issue.spec_id ? `#${issue.spec_id}` : ''}</td>
-                        </tr>
-                      ))}
-                      {!loaded.quality.length && <tr><td colSpan={4} className="emptyDetail">Критичных проблем не найдено</td></tr>}
-                    </tbody>
-                  </table>
-                )}
-              </div>
+              <SpecificationResults
+                tab={tab}
+                treeRows={filteredRows}
+                selectedNode={selectedNode}
+                onSelectNode={setSelectedNode}
+                flattenedRows={filteredFlattened}
+                selectedFlat={selectedFlat}
+                onSelectFlat={setSelectedFlat}
+                whereUsed={loaded.whereUsed}
+                quality={loaded.quality}
+              />
 
               <aside className="detailPane bomDetailPane">
-                <h2>{selectedTitle || 'BOM'}</h2>
+                <h2 aria-label={selectedAccessibleTitle || 'BOM'}>{selectedTitle || 'BOM'}</h2>
                 <div className="detailMeta">
                   <span>{loaded.item.item_code}</span>
                   <span>{loaded.item.spec_id ? `Спецификация #${loaded.item.spec_id}` : 'Спецификация не найдена'}</span>
