@@ -69,7 +69,7 @@ from .production_control_journal import (
     dedupe_mrp_production_orders,
 )
 from .production_binding_repair import repair_clean_mrp_bindings
-from .mrp_execution_ledger import populate_executed_qty
+from .mrp_execution_ledger import run_ledger_cycle
 from .mrp_stock_helpers import effective_stock_by_item_all
 from .replenishment import (
     REPLENISHMENT_FLOW_PRODUCTION,
@@ -1145,12 +1145,14 @@ def reconcile_all_active(db: Session, *, dry_run: bool = False) -> Dict[str, Any
             db.rollback()
             results.append({"run_id": int(rid), "status": "error", "error": str(exc)})
 
-    # Execution ledger (PHASE 2): recompute executed_qty from actual production
-    # and receipt facts, ONCE across all active runs — the unlinked FIFO pool is
-    # per-item and must see every plan. Respect dry_run like reconcile_snapshot.
+    # Execution ledger (increment 3): rebuild the explainable allocation ledger
+    # and the derived executed_qty for the canonical scope in one cycle. The
+    # scope is re-derived inside run_ledger_cycle (last FIXED_SNAPSHOT per plan,
+    # no period filter, plus CLOSED-with-open-req), so it is not parameterised by
+    # run_ids here. Respect dry_run like reconcile_snapshot.
     execution_ledger: Dict[str, Any]
     try:
-        execution_ledger = populate_executed_qty(db, run_ids)
+        execution_ledger = run_ledger_cycle(db)
         if dry_run:
             db.rollback()
         else:
