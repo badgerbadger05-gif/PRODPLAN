@@ -36,6 +36,7 @@ with the freeze serialises the maintenance operation on PostgreSQL.
 """
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
@@ -450,6 +451,19 @@ def verify_frozen_supply(db: Session, scope: LedgerScope, cycle_id: str) -> Veri
     for alloc in scope.freeze_allocs:
         alloc.realized_qty = round(realized_by_alloc_id.get(int(alloc.id), 0.0), 3)
         alloc.evaporated_qty = round(evaporated_by_alloc_id.get(int(alloc.id), 0.0), 3)
+
+    # Inc4 (PURE SHADOW, dual-write §2.6): the old table (MrpFreezeAllocation)
+    # stays the read source; ALSO mirror the freshly-computed realized/evaporated
+    # onto the reservation_coverage frozen pins. Wrapped so a shadow failure
+    # never changes verify_frozen_supply's legacy result.
+    try:
+        from .item_ledger.reservation_ledger import mirror_verify_realized
+
+        mirror_verify_realized(db, scope.freeze_allocs)
+    except Exception:  # noqa: BLE001 — shadow must never break verify
+        logging.getLogger(__name__).exception(
+            "Inc4 frozen-pin verify mirror failed; continuing (verify unaffected)"
+        )
 
     _rebuild_evaporation_events(db, scope, cycle_id, evaporated_by_alloc_id)
 
@@ -1516,6 +1530,19 @@ def run_ledger_cycle(db: Session) -> Dict[str, Any]:
     # closes once none of its requirements remain open.
     requirement_closure = apply_requirement_closure(db, scope)
     runs_closed = apply_run_closure(db, scope)
+
+    # Inc4 (PURE SHADOW, ADDITIVE): materialize the reservation ledger from the
+    # same scope + the live SLE substrate. Wrapped so any failure logs and never
+    # breaks the cycle — the executed/drift/closure result below is returned
+    # unchanged whether this block runs or errors (no reader consults it yet).
+    try:
+        from .item_ledger.reservation_ledger import run_reservation_shadow
+
+        run_reservation_shadow(db, scope, cycle_id)
+    except Exception:  # noqa: BLE001 — shadow must never break the ledger cycle
+        logging.getLogger(__name__).exception(
+            "Inc4 reservation shadow block failed; continuing (ledger cycle unaffected)"
+        )
 
     realized_total = round(sum(verify.realized_by_alloc_id.values()), 6)
     evaporated_total = round(sum(verify.evaporated_by_alloc_id.values()), 6)

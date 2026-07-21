@@ -100,6 +100,21 @@ def stock_ledger_shadow_report(include_all: bool = False, db: Session = Depends(
         raise HTTPException(status_code=500, detail=f"Shadow report error: {e}")
 
 
+@router.get("/reservation-ledger/shadow-report", response_model=dict)
+def reservation_ledger_shadow_report(db: Session = Depends(get_db)):
+    """Item-ledger reservation shadow diagnostic (design §11 Инк4): per
+    requirement the reservation world (uncovered / outstanding / produced) laid
+    beside the inc1–5 world (remaining_qty / covered_qty / executed_qty), and per
+    pool reserved_soft vs Σ remaining. Read-only; no behavior change (Inc4 is
+    pure shadow — no reader consults the reservation ledger yet)."""
+    from ..services.item_ledger.reservation_ledger import reservation_shadow_report
+
+    try:
+        return reservation_shadow_report(db)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Reservation shadow report error: {e}")
+
+
 @router.get("/warehouses", response_model=dict)
 def get_stock_warehouses(db: Session = Depends(get_db)):
     rows = (

@@ -678,6 +678,23 @@ def refreeze_active_snapshots(
         )
         results.append(res)
 
+    # Inc4 (PURE SHADOW, §2.6 / §11): every _write_freeze_allocation has now run,
+    # so mirror the fresh MrpFreezeAllocation rows into the reservation ledger —
+    # materialize reservation_entry + open/amend events and copy the frozen pins
+    # into reservation_coverage (pin_kind='frozen'). Dual-write only: the old
+    # table stays the read source. Wrapped so any failure logs and NEVER breaks
+    # the freeze (the freeze result above is unchanged whether this runs or not).
+    try:
+        from .item_ledger.reservation_ledger import materialize_reservations_for_freeze
+
+        materialize_reservations_for_freeze(db, active_run_ids)
+    except Exception:  # noqa: BLE001 — shadow must never break the freeze
+        import logging
+
+        logging.getLogger(__name__).exception(
+            "Inc4 reservation shadow (freeze) failed; continuing (freeze unaffected)"
+        )
+
     if dry_run:
         db.rollback()
     else:
