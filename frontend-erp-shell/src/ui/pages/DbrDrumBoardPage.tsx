@@ -1,24 +1,5 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import type {
-  DbrBoard,
-  DbrBoardSlot,
-  DbrProgram,
-  DbrReleaseDayResult,
-  DbrReleaseResult,
-} from '../../domain/dbr'
-import { dateRu, isoToday, qty, shiftIsoDate } from '../../lib/format'
-import {
-  activateDbrDrum,
-  buildDbrDrum,
-  getDbrBoard,
-  listDbrPrograms,
-  moveDbrSlot,
-  refreshDbrGate,
-  releaseDbrDay,
-  releaseDbrSlot,
-  rollForwardDbrDrum,
-} from '../../services/dbr'
+import { dateRu, isoToday, qty } from '../../lib/format'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
 import { DbrConfirmDialog } from '../dbr/DbrConfirmDialog'
@@ -27,252 +8,23 @@ import {
   dayLabel,
   drumSlotReleaseState,
   drumSlotShortageTitle,
-  groupDrumSlotsByCell,
-  indexDrumSlotsById,
   isWeekend,
   KIT_CLASS,
   releaseResultText,
 } from './dbr-drum-board/model'
+import { useDbrDrumBoardController } from './dbr-drum-board/useDbrDrumBoardController'
 
 export function DbrDrumBoardPage() {
-  const [board, setBoard] = useState<DbrBoard | null>(null)
-  const [dateFrom, setDateFrom] = useState(shiftIsoDate(isoToday(), -2))
-  const [dateTo, setDateTo] = useState(shiftIsoDate(isoToday(), 14))
-  const [loading, setLoading] = useState(false)
-  const [saving, setSaving] = useState(false)
-  const [error, setError] = useState('')
-  const [message, setMessage] = useState('')
-
-  const [selectedSlot, setSelectedSlot] = useState<DbrBoardSlot | null>(null)
-  const [moveDate, setMoveDate] = useState('')
-  const [moveResource, setMoveResource] = useState<string>('')
-
-  const [buildOpen, setBuildOpen] = useState(false)
-  const [approvedPrograms, setApprovedPrograms] = useState<DbrProgram[]>([])
-  const [buildProgramId, setBuildProgramId] = useState<string>('')
-
-  // Two-step release of a single slot: dry-run preview → confirmed write.
-  const [releaseFlow, setReleaseFlow] = useState<{
-    slot: DbrBoardSlot
-    preview: DbrReleaseResult
-    result?: DbrReleaseResult
-  } | null>(null)
-  const [releaseBusy, setReleaseBusy] = useState(false)
-  const [releaseError, setReleaseError] = useState('')
-
-  // Two-step batch release of one day: pick day → dry-run summary → confirm.
-  const [dayModal, setDayModal] = useState<{
-    phase: 'pick' | 'preview' | 'done'
-    day: string
-    preview?: DbrReleaseDayResult
-    result?: DbrReleaseDayResult
-  } | null>(null)
-  const [dayBusy, setDayBusy] = useState(false)
-  const [dayError, setDayError] = useState('')
-
-  const load = useCallback(async () => {
-    setLoading(true)
-    setError('')
-    try {
-      setBoard(await getDbrBoard({ date_from: dateFrom, date_to: dateTo }))
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setLoading(false)
-    }
-  }, [dateFrom, dateTo])
-
-  useEffect(() => {
-    void load()
-  }, [load])
-
-  const schedule = board?.schedule ?? null
+  const controller = useDbrDrumBoardController()
+  const {
+    board, dateFrom, dateTo, loading, saving, error, message, selectedSlot, moveDate, moveResource,
+    buildOpen, approvedPrograms, buildProgramId, releaseFlow, releaseBusy, releaseError,
+    dayModal, dayBusy, dayError, schedule, slotsByCell, slotById,
+    setDateFrom, setDateTo, setSelectedSlot, setMoveDate, setMoveResource, setBuildOpen,
+    setBuildProgramId, setDayModal, load, openSlot, refreshGate, rollForward, openBuild, runBuild,
+    doMove, startRelease, confirmRelease, closeReleaseFlow, openDayRelease, runDayPreview, confirmDay,
+  } = controller
   const today = isoToday()
-
-  const slotsByCell = useMemo(() => {
-    return groupDrumSlotsByCell(board?.slots ?? [])
-  }, [board])
-
-  const slotById = useMemo(() => {
-    return indexDrumSlotsById(board?.slots ?? [])
-  }, [board])
-
-  function openSlot(slot: DbrBoardSlot) {
-    setSelectedSlot(slot)
-    setMoveDate(slot.date)
-    setMoveResource(String(slot.resource_id))
-    setMessage('')
-    setError('')
-  }
-
-  async function refreshGate() {
-    if (!schedule) return
-    setSaving(true)
-    setError('')
-    setMessage('')
-    try {
-      const res = await refreshDbrGate(schedule.id)
-      setMessage(`Гейт обновлён: 🟢 ${res.green} · 🟡 ${res.yellow} · 🔴 ${res.red} (изменено ${res.updated})`)
-      await load()
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  async function rollForward() {
-    if (!schedule) return
-    setSaving(true)
-    setError('')
-    setMessage('')
-    try {
-      const res = await rollForwardDbrDrum(schedule.id)
-      if (res.horizon_exhausted) {
-        setMessage('Горизонт графика исчерпан — постройте новый период')
-      } else {
-        let msg = `Перенесено плиток: ${res.moved} · закрыто выпуском: ${res.closed}`
-        if (res.overloaded) msg += ` · с перегрузом: ${res.overloaded}`
-        setMessage(msg)
-      }
-      await load()
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  async function openBuild() {
-    setBuildOpen(true)
-    setError('')
-    try {
-      const list = await listDbrPrograms('approved')
-      setApprovedPrograms(list)
-      setBuildProgramId(list.length ? String(list[0].id) : '')
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    }
-  }
-
-  async function runBuild() {
-    const programId = Number(buildProgramId)
-    if (!programId) {
-      setError('Выберите утверждённую программу')
-      return
-    }
-    setSaving(true)
-    setError('')
-    setMessage('')
-    try {
-      const built = await buildDbrDrum(programId)
-      await activateDbrDrum(built.schedule.id)
-      const carried = built.carried_over?.length ?? 0
-      setMessage(
-        `График №${built.schedule.id} построен и активирован` +
-          (carried ? ` · перенесено на след. период: ${carried}` : ''),
-      )
-      setBuildOpen(false)
-      await load()
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  async function doMove() {
-    if (!selectedSlot) return
-    const resourceId = Number(moveResource)
-    setSaving(true)
-    setError('')
-    setMessage('')
-    try {
-      const res = await moveDbrSlot(
-        selectedSlot.id,
-        moveDate,
-        resourceId !== selectedSlot.resource_id ? resourceId : undefined,
-      )
-      setMessage(res.moved ? `Плитка перенесена на ${dateRu(res.to)}` : 'Плитка осталась на месте')
-      setSelectedSlot(null)
-      await load()
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  // Step 1: dry-run preview of a single slot release, opens the confirm dialog.
-  async function startRelease() {
-    if (!selectedSlot) return
-    setSaving(true)
-    setError('')
-    setMessage('')
-    setReleaseError('')
-    try {
-      const preview = await releaseDbrSlot(selectedSlot.id, true)
-      setReleaseFlow({ slot: selectedSlot, preview })
-    } catch (e) {
-      // 409 (non-green / not pending) surfaces here as a human message.
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  // Step 2: confirmed write to live 1С.
-  async function confirmRelease() {
-    if (!releaseFlow) return
-    setReleaseBusy(true)
-    setReleaseError('')
-    try {
-      const result = await releaseDbrSlot(releaseFlow.slot.id, false)
-      setReleaseFlow((prev) => (prev ? { ...prev, result } : prev))
-      await load()
-    } catch (e) {
-      setReleaseError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setReleaseBusy(false)
-    }
-  }
-
-  function closeReleaseFlow() {
-    const wasDone = Boolean(releaseFlow?.result)
-    setReleaseFlow(null)
-    if (wasDone) setSelectedSlot(null)
-  }
-
-  // Batch release of one day — step 1: dry-run summary of every green+pending slot.
-  async function runDayPreview(day: string) {
-    if (!schedule) return
-    setDayBusy(true)
-    setDayError('')
-    try {
-      const preview = await releaseDbrDay(schedule.id, day, true)
-      setDayModal({ phase: 'preview', day, preview })
-    } catch (e) {
-      setDayError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setDayBusy(false)
-    }
-  }
-
-  // Batch release — step 2: confirmed write, per-slot report.
-  async function confirmDay() {
-    if (!schedule || !dayModal) return
-    setDayBusy(true)
-    setDayError('')
-    try {
-      const result = await releaseDbrDay(schedule.id, dayModal.day, false)
-      setDayModal((prev) => (prev ? { ...prev, phase: 'done', result } : prev))
-      await load()
-    } catch (e) {
-      setDayError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setDayBusy(false)
-    }
-  }
 
   const kpi = board?.kpi
   const days = board?.days ?? []
@@ -321,7 +73,7 @@ export function DbrDrumBoardPage() {
           <button onClick={() => void refreshGate()} disabled={saving || !schedule}>Обновить гейт</button>
           <button onClick={() => void rollForward()} disabled={saving || !schedule}>Перенести невыполненное</button>
           <button
-            onClick={() => { setDayError(''); setDayModal({ phase: 'pick', day: isoToday() }) }}
+            onClick={openDayRelease}
             disabled={saving || !schedule}
           >
             Релиз дня…
