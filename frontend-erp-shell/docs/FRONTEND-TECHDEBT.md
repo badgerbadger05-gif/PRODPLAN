@@ -6,7 +6,7 @@
 
 - Doctype runtime реализован и используется `MRP Runs`, `Transfer Requests`,
   `Purchase Control` и `Workshop Binding Review`; остальные журналы инвентаризируются.
-- OpenAPI-типы генерируются, lint чистый, frontend CI добавлен, 278 frontend-тестов проходят.
+- OpenAPI-типы генерируются, lint чистый, frontend CI добавлен, 289 frontend-тестов проходят.
 - Прямые API-вызовы страниц вынесены в services-слой.
 - Route-level code splitting снизил initial JS bundle примерно с 592 до 242 КБ.
 - Mock session shell и resource/action/record/field gates реализованы, но Auth/RBAC нельзя считать закрытым до появления backend-сессии и `/auth/me`.
@@ -43,7 +43,7 @@
 ## P1 — Тестовое покрытие критичных экранов
 
 **Текущее состояние.** Общий runtime, transport, session/RBAC, saved views,
-Ledger и критичные custom pages покрыты 278 Vitest-тестами; есть hermetic
+Ledger и критичные custom pages покрыты 289 Vitest-тестами; есть hermetic
 Playwright smoke и стабильные Linux visual baselines Ledger, Purchase Control,
 Production Control, Period Plan (list/detail), Workshop Binding Review и
 Stage Distribution, Resources, Specification, Sync, MRP Result и весь DBR-контур.
@@ -87,6 +87,12 @@ DBR Programs, Purchase, Settings, Drum Board и Feeder разделены на �
 добавлены детерминированные visual baselines. Асинхронные чтения защищены от
 поздних ответов, мутирующие команды — от повторного запуска; общие DBR-диалоги,
 таблицы и ItemPicker получили keyboard/ARIA-контракты без изменения рабочего UX.
+
+Production Control получил чистую модель фильтров, сортировки, selection и
+payload, latest-wins защиту списка и material detail, а также единый mutex для
+опасных операций выпуска, удаления, синхронизации и записи в 1С. Таблица и
+рабочие диалоги поддерживают keyboard/ARIA и live-регионы без смены визуального
+контракта.
 
 ## P2 — Протечки прямых `api()`/`fetch` мимо сервисов
 
