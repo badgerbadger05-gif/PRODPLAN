@@ -52,8 +52,8 @@ export function DbrProgramsPage() {
 
         <div className="dbrScroll">
           {/* ── Create program ─────────────────────────────────────────── */}
-          <section className="dbrSection">
-            <h2>Новая программа</h2>
+          <section className="dbrSection" aria-labelledby="dbr-new-program-heading">
+            <h2 id="dbr-new-program-heading">Новая программа</h2>
             <div className="dbrProgramHead">
               <label className="dbrField">
                 <span>Период с</span>
@@ -77,7 +77,7 @@ export function DbrProgramsPage() {
               </label>
             </div>
 
-            <table className="journalTable dbrTable dbrProgramTable">
+            <table className="journalTable dbrTable dbrProgramTable" aria-label="Строки новой программы">
               <thead>
                 <tr>
                   <th className="itemCell">Номенклатура</th>
@@ -96,6 +96,7 @@ export function DbrProgramsPage() {
                     <td className="dateCol">
                       <input
                         type="date"
+                        aria-label={`Дата, строка ${rows.indexOf(row) + 1}`}
                         value={row.program_date}
                         onChange={(e) => patchRow(row.key, { program_date: e.target.value, dateEdited: true })}
                       />
@@ -103,6 +104,7 @@ export function DbrProgramsPage() {
                     <td className="numCell">
                       <input
                         type="number"
+                        aria-label={`Количество, строка ${rows.indexOf(row) + 1}`}
                         step="0.001"
                         min="0.001"
                         value={row.qty}
@@ -112,6 +114,7 @@ export function DbrProgramsPage() {
                     </td>
                     <td className="itemCell">
                       <input
+                        aria-label={`Комментарий, строка ${rows.indexOf(row) + 1}`}
                         value={row.comment}
                         onChange={(e) => patchRow(row.key, { comment: e.target.value })}
                         placeholder="необязательно"
@@ -151,7 +154,16 @@ export function DbrProgramsPage() {
                   <tr
                     key={program.id}
                     className={selected?.id === program.id ? 'selectedRow' : ''}
+                    tabIndex={0}
+                    aria-label={`Открыть программу №${program.id}: ${program.title || 'без названия'}`}
                     onClick={() => void openProgram(program.id)}
+                    onKeyDown={(event) => {
+                      if (event.target !== event.currentTarget) return
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault()
+                        void openProgram(program.id)
+                      }
+                    }}
                   >
                     <td className="numCell"><strong>{program.id}</strong></td>
                     <td className="itemCell">

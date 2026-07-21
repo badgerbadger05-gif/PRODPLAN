@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import type { BomItem } from '../../domain/specification'
 import { searchSpecificationItems } from '../../services/specification'
 
@@ -27,7 +27,10 @@ export function ItemPicker({ value, onChange, placeholder, disabled }: Props) {
   const [results, setResults] = useState<BomItem[]>([])
   const [open, setOpen] = useState(false)
   const [loading, setLoading] = useState(false)
+  const [activeIndex, setActiveIndex] = useState(-1)
   const boxRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
+  const listboxId = useId()
 
   useEffect(() => {
     const text = query.trim()
@@ -40,7 +43,10 @@ export function ItemPicker({ value, onChange, placeholder, disabled }: Props) {
     const handle = window.setTimeout(async () => {
       try {
         const res = await searchSpecificationItems({ q: text, limit: 20 })
-        if (!cancelled) setResults(res.items)
+        if (!cancelled) {
+          setResults(res.items)
+          setActiveIndex(-1)
+        }
       } catch {
         if (!cancelled) setResults([])
       } finally {
@@ -96,6 +102,13 @@ export function ItemPicker({ value, onChange, placeholder, disabled }: Props) {
   return (
     <div className="dbrPicker" ref={boxRef}>
       <input
+        ref={inputRef}
+        role="combobox"
+        aria-label={placeholder ?? 'Номенклатура'}
+        aria-expanded={open && query.trim().length >= 2}
+        aria-controls={listboxId}
+        aria-autocomplete="list"
+        aria-activedescendant={activeIndex >= 0 ? `${listboxId}-${activeIndex}` : undefined}
         value={query}
         disabled={disabled}
         placeholder={placeholder ?? 'Артикул, код или название'}
@@ -104,14 +117,34 @@ export function ItemPicker({ value, onChange, placeholder, disabled }: Props) {
           setOpen(true)
         }}
         onFocus={() => setOpen(true)}
+        onKeyDown={(e) => {
+          if (e.key === 'Escape') {
+            e.preventDefault()
+            setOpen(false)
+            setActiveIndex(-1)
+            inputRef.current?.focus()
+          } else if (e.key === 'ArrowDown' && results.length) {
+            e.preventDefault()
+            setActiveIndex((prev) => Math.min(prev + 1, results.length - 1))
+          } else if (e.key === 'ArrowUp' && results.length) {
+            e.preventDefault()
+            setActiveIndex((prev) => Math.max(prev - 1, 0))
+          } else if (e.key === 'Enter' && activeIndex >= 0) {
+            e.preventDefault()
+            pick(results[activeIndex])
+          }
+        }}
       />
       {open && query.trim().length >= 2 && (
-        <div className="dbrPickerDrop">
+        <div id={listboxId} className="dbrPickerDrop" role="listbox" aria-label="Результаты поиска номенклатуры">
           {loading && <div className="dbrPickerEmpty">Поиск…</div>}
           {!loading && !results.length && <div className="dbrPickerEmpty">Ничего не найдено</div>}
           {results.map((item) => (
             <button
               type="button"
+              id={`${listboxId}-${results.indexOf(item)}`}
+              role="option"
+              aria-selected={activeIndex === results.indexOf(item)}
               key={item.item_id}
               className="dbrPickerOption"
               onClick={() => pick(item)}

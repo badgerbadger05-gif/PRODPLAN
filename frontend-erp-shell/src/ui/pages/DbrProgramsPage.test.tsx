@@ -94,6 +94,23 @@ describe('DbrProgramsPage characterization', () => {
     expect(screen.getByDisplayValue('Первая партия')).toBeInTheDocument()
   })
 
+  it('labels program forms and activates list rows from the keyboard', async () => {
+    const user = userEvent.setup()
+    renderPage()
+    const title = await screen.findByText('Июльский план')
+    const row = title.closest('tr')
+    if (!row) throw new Error('program row not found')
+
+    expect(screen.getByRole('region', { name: 'Новая программа' })).toBeInTheDocument()
+    expect(screen.getByRole('table', { name: 'Строки новой программы' })).toBeInTheDocument()
+    expect(screen.getByLabelText('Количество, строка 1')).toBeInTheDocument()
+    expect(row).toHaveAttribute('tabindex', '0')
+    row.focus()
+    await user.keyboard('{Enter}')
+    expect(await screen.findByRole('heading', { name: 'Программа №11: Июльский план' })).toBeInTheDocument()
+    expect(getDbrProgram).toHaveBeenCalledOnce()
+  })
+
   it('validates a new program and sends normalized optional fields and items', async () => {
     const user = userEvent.setup()
     renderPage()
