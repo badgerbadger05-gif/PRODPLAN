@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { DbrProgram, DbrProgramItemIn } from '../../domain/dbr'
+import type { DbrProgram } from '../../domain/dbr'
 import { dateRu, isoToday, qty, shiftIsoDate } from '../../lib/format'
 import {
   approveDbrProgram,
@@ -12,70 +12,20 @@ import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
 import { DbrNav } from '../dbr/DbrNav'
 import { ItemPicker } from '../dbr/ItemPicker'
-import type { PickedItem } from '../dbr/ItemPicker'
-
-type DraftRow = {
-  key: string
-  item: PickedItem | null
-  program_date: string
-  dateEdited: boolean
-  qty: string
-  comment: string
-}
+import {
+  alignFirstDraftDate,
+  buildProgramCreatePayload,
+  createDraftProgramRow,
+  programStatusLabel,
+  programToDraftRows,
+  validateProgramItems,
+} from './dbr-programs/model'
+import type { DraftProgramRow } from './dbr-programs/model'
 
 let rowSeq = 0
-function newRow(dateDefault: string): DraftRow {
+function newRow(dateDefault: string): DraftProgramRow {
   rowSeq += 1
-  return { key: `r${rowSeq}`, item: null, program_date: dateDefault, dateEdited: false, qty: '', comment: '' }
-}
-
-function statusLabel(status: string) {
-  if (status === 'approved') return 'Утверждена'
-  if (status === 'draft') return 'Черновик'
-  return status
-}
-
-function programRows(program: DbrProgram): DraftRow[] {
-  return program.items.map((row) => ({
-    key: `saved-${row.id}`,
-    item: {
-      item_id: row.item_id,
-      item_code: row.item_code || String(row.item_id),
-      item_name: row.item_name || row.item_code || `ID ${row.item_id}`,
-    },
-    program_date: row.program_date,
-    dateEdited: true,
-    qty: String(row.qty),
-    comment: row.comment || '',
-  }))
-}
-
-function validatedItems(rows: DraftRow[], fromDate: string, toDate: string): DbrProgramItemIn[] {
-  if (!fromDate || !toDate || fromDate > toDate) {
-    throw new Error('Проверьте период программы')
-  }
-  if (!rows.length) throw new Error('Добавьте хотя бы одну строку программы')
-  const seen = new Set<string>()
-  return rows.map((row) => {
-    const quantity = Number(row.qty)
-    if (!row.item || !row.program_date || !Number.isFinite(quantity) || quantity <= 0) {
-      throw new Error('В каждой строке укажите номенклатуру, дату и количество больше нуля')
-    }
-    if (row.program_date < fromDate || row.program_date > toDate) {
-      throw new Error(`Дата ${row.program_date} находится вне периода программы`)
-    }
-    const key = `${row.item.item_id}:${row.program_date}`
-    if (seen.has(key)) {
-      throw new Error(`Номенклатура ${row.item.item_code} повторяется на дату ${row.program_date}`)
-    }
-    seen.add(key)
-    return {
-      item_id: row.item.item_id,
-      program_date: row.program_date,
-      qty: quantity,
-      comment: row.comment.trim() || null,
-    }
-  })
+  return createDraftProgramRow(`r${rowSeq}`, dateDefault)
 }
 
 export function DbrProgramsPage() {
@@ -83,7 +33,7 @@ export function DbrProgramsPage() {
   const mutationLocked = useRef(false)
   const [programs, setPrograms] = useState<DbrProgram[]>([])
   const [selected, setSelected] = useState<DbrProgram | null>(null)
-  const [editRows, setEditRows] = useState<DraftRow[]>([])
+  const [editRows, setEditRows] = useState<DraftProgramRow[]>([])
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
@@ -94,7 +44,7 @@ export function DbrProgramsPage() {
   const [toDate, setToDate] = useState(shiftIsoDate(isoToday(), 14))
   const [title, setTitle] = useState('')
   const [company, setCompany] = useState('')
-  const [rows, setRows] = useState<DraftRow[]>(() => [newRow(isoToday())])
+  const [rows, setRows] = useState<DraftProgramRow[]>(() => [newRow(isoToday())])
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -120,14 +70,14 @@ export function DbrProgramsPage() {
       const program = await getDbrProgram(id)
       if (requestSeq !== detailRequestSeq.current) return
       setSelected(program)
-      setEditRows(programRows(program))
+      setEditRows(programToDraftRows(program))
     } catch (e) {
       if (requestSeq !== detailRequestSeq.current) return
       setError(e instanceof Error ? e.message : String(e))
     }
   }
 
-  function patchRow(key: string, next: Partial<DraftRow>) {
+  function patchRow(key: string, next: Partial<DraftProgramRow>) {
     setRows((prev) => prev.map((r) => (r.key === key ? { ...r, ...next } : r)))
   }
 
@@ -140,9 +90,9 @@ export function DbrProgramsPage() {
   }
 
   async function submit() {
-    let items: DbrProgramItemIn[]
+    let payload
     try {
-      items = validatedItems(rows, fromDate, toDate)
+      payload = buildProgramCreatePayload(rows, fromDate, toDate, title, company)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
       return
@@ -153,16 +103,10 @@ export function DbrProgramsPage() {
     setError('')
     setMessage('')
     try {
-      const created = await createDbrProgram({
-        from_date: fromDate,
-        to_date: toDate,
-        title: title.trim() || null,
-        company: company.trim() || null,
-        items,
-      })
-      setMessage(`Программа №${created.id} создана (${items.length} строк)`)
+      const created = await createDbrProgram(payload)
+      setMessage(`Программа №${created.id} создана (${payload.items.length} строк)`)
       setSelected(created)
-      setEditRows(programRows(created))
+      setEditRows(programToDraftRows(created))
       setRows([newRow(fromDate)])
       setTitle('')
       await load()
@@ -184,7 +128,7 @@ export function DbrProgramsPage() {
       const approved = await approveDbrProgram(id)
       setMessage(`Программа №${id} утверждена`)
       setSelected(approved)
-      setEditRows(programRows(approved))
+      setEditRows(programToDraftRows(approved))
       await load()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -194,15 +138,15 @@ export function DbrProgramsPage() {
     }
   }
 
-  function patchEditRow(key: string, next: Partial<DraftRow>) {
+  function patchEditRow(key: string, next: Partial<DraftProgramRow>) {
     setEditRows((prev) => prev.map((row) => (row.key === key ? { ...row, ...next } : row)))
   }
 
   async function saveDraftItems() {
     if (!selected || selected.status !== 'draft') return
-    let items: DbrProgramItemIn[]
+    let items: ReturnType<typeof validateProgramItems>
     try {
-      items = validatedItems(editRows, selected.from_date, selected.to_date)
+      items = validateProgramItems(editRows, selected.from_date, selected.to_date)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
       return
@@ -215,7 +159,7 @@ export function DbrProgramsPage() {
     try {
       const saved = await updateDbrProgram(selected.id, { items })
       setSelected(saved)
-      setEditRows(programRows(saved))
+      setEditRows(programToDraftRows(saved))
       setMessage(`Строки программы №${saved.id} сохранены`)
       await load()
     } catch (e) {
@@ -273,9 +217,7 @@ export function DbrProgramsPage() {
                   onChange={(e) => {
                     const nextDate = e.target.value
                     setFromDate(nextDate)
-                    setRows((prev) => prev.map((row, index) => (
-                      index === 0 && !row.dateEdited ? { ...row, program_date: nextDate } : row
-                    )))
+                    setRows((prev) => alignFirstDraftDate(prev, nextDate))
                   }}
                 />
               </label>
@@ -378,7 +320,7 @@ export function DbrProgramsPage() {
                     <td className="numCell">{program.items.length}</td>
                     <td className="itemCell">
                       <span className={`miniPill ${program.status === 'approved' ? 'ready' : ''}`}>
-                        {statusLabel(program.status)}
+                        {programStatusLabel(program.status)}
                       </span>
                     </td>
                     <td className="dbrActionCol">
