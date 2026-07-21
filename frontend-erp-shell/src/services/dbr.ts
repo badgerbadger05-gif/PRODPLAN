@@ -30,7 +30,11 @@ import type {
   DbrSettings,
   DbrSettingsUpdate,
 } from '../domain/dbr'
-import { api } from '../lib/api'
+import { api, ApiError } from '../lib/api'
+
+export function isDbrConflict(error: unknown): error is ApiError {
+  return error instanceof ApiError && error.status === 409
+}
 
 // ── Settings ────────────────────────────────────────────────────────────────
 

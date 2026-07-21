@@ -13,11 +13,11 @@ import type {
   DbrPurchaseLaunchResult,
   DbrSignalLaunchResult,
 } from '../../../domain/dbr'
-import { ApiError } from '../../../lib/api'
 import {
   getDbrFeederDeficits,
   getDbrProcessingBoard,
   getDbrSettings,
+  isDbrConflict,
   launchDbrPurchase,
   launchDbrSignal,
   listDbrFeederPositions,
@@ -324,7 +324,7 @@ export function useDbrFeederController() {
       const preview = await launchDbrSignal(signal.id, true)
       setLaunchFlow({ signal, preview })
     } catch (e) {
-      if (e instanceof ApiError && e.status === 409) {
+      if (isDbrConflict(e)) {
         const detail = e.detail as DbrLaunchConflictDetail | undefined
         setLaunchFlow({ signal, deficit: detail?.deficit_lines ?? [] })
         setLaunchError(e.message)
@@ -346,7 +346,7 @@ export function useDbrFeederController() {
       setLaunchFlow((prev) => (prev ? { ...prev, result } : prev))
       await Promise.all([loadSignals(appliedSignalFilters), loadDeficits()])
     } catch (e) {
-      if (e instanceof ApiError && e.status === 409) {
+      if (isDbrConflict(e)) {
         const detail = e.detail as DbrLaunchConflictDetail | undefined
         setLaunchFlow((prev) => (prev ? { ...prev, deficit: detail?.deficit_lines ?? [] } : prev))
       }
