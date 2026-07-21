@@ -865,6 +865,55 @@ def run_reservation_shadow(db: Session, scope, cycle_id: str) -> Dict[str, Any]:
     }
 
 
+def effective_net_bin(db: Session, req: "models.MrpRequirement") -> Optional[float]:
+    """Inc6 (б) — effective_net derived from the reservation ledger (design §3/§3.1).
+
+    ``effective_net(r) = uncovered(consume) + Σ (supplier pin alloc_qty − realized_qty)``
+
+    The supplier term reconstructs today's ``net_required`` from ``uncovered``:
+    ``net_required`` historically INCLUDES the quantity an existing supplier order
+    already covers, whereas ``uncovered`` EXCLUDES it (design §3 counter-example,
+    review Finding A). Adding back the still-outstanding frozen supplier
+    commitment (``alloc − realized``) makes the closure threshold identical to
+    legacy ``net_required`` at freeze — WITH or WITHOUT a supplier pin.
+
+    Finding D (single-source evaporation): a dead supplier pin raises
+    ``evaporated_qty`` → ``uncovered`` rises by that amount (redistribute drops
+    its coverage), while the supplier term (``alloc − realized``, NOT
+    ``alloc − evaporated − realized``) is UNCHANGED — so effective_net rises by
+    the evaporated qty EXACTLY ONCE. Subtracting evaporation here (pin_live) would
+    cancel the uncovered rise and lose the signal; that is why the term excludes
+    evaporation. Its atomic partner is the removal of the evaporation term from
+    ``compute_stock_drift`` under bin (Finding D — otherwise it would count twice).
+
+    Returns ``None`` when the requirement has NO consume reservation (make-only,
+    e.g. a finished good) so the caller falls back to the legacy net+drift target.
+    """
+    entry = (
+        db.query(models.ReservationEntry)
+        .filter(
+            models.ReservationEntry.requirement_id == int(req.id),
+            models.ReservationEntry.realization_mode == CONSUME,
+        )
+        .one_or_none()
+    )
+    if entry is None:
+        return None
+    uncovered = float(entry.uncovered_qty or 0.0)
+    supplier_term = 0.0
+    for p in (
+        db.query(models.ReservationCoverage)
+        .filter(
+            models.ReservationCoverage.reservation_id == int(entry.id),
+            models.ReservationCoverage.pin_kind == "frozen",
+            models.ReservationCoverage.source_kind == _SUPPLIER,
+        )
+        .all()
+    ):
+        supplier_term += max(float(p.alloc_qty or 0.0) - float(p.realized_qty or 0.0), 0.0)
+    return max(uncovered + supplier_term, 0.0)
+
+
 def materialize_reservations_for_freeze(db: Session, active_run_ids: Sequence[int]) -> Dict[str, Any]:
     """Freeze-time hook (design §2.6 / §11): after refreeze wrote every
     MrpFreezeAllocation, materialize reservations + mirror the frozen pins so

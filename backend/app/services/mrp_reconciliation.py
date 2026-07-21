@@ -503,7 +503,7 @@ def _link_orphan_mrp_products_to_requirements(
         # Cap an oversized orphan line to the requirement's OUTSTANDING demand
         # (effective_net − executed), not to raw net: executed output already
         # satisfies part of the net, and drift_adjustment moves the target.
-        req_qty = max(_effective_net(req) - _to_float(req.executed_qty), 0.0)
+        req_qty = max(_effective_net(req, db) - _to_float(req.executed_qty), 0.0)
         if (
             req_qty > EPS
             and not order.order_ref1c
@@ -516,9 +516,24 @@ def _link_orphan_mrp_products_to_requirements(
     return {"linked": len(rows), "items": sorted(linked_items)}
 
 
-def _effective_net(req: MrpRequirement) -> float:
+def _effective_net(req: MrpRequirement, db: Optional[Session] = None) -> float:
     """Frozen net demand corrected by drift (v2 §8). The single demand target
-    for sizing; reconcile never writes ``net_required_qty`` itself."""
+    for sizing; reconcile never writes ``net_required_qty`` itself.
+
+    Inc6 (design §11б): under STOCK_SOURCE=bin the demand target derives from the
+    reservation ledger's ``uncovered`` + supplier term (same source as closure —
+    :func:`item_ledger.reservation_ledger.effective_net_bin`) so an evaporated
+    supply re-surfaces as a proposal exactly once (§7 ex4). Legacy stays
+    byte-identical: with ``db`` None (or the flag off) the formula is unchanged."""
+    if db is not None:
+        from .item_ledger.config import use_bin_stock
+
+        if use_bin_stock():
+            from .item_ledger.reservation_ledger import effective_net_bin
+
+            val = effective_net_bin(db, req)
+            if val is not None:
+                return val
     return max(_to_float(req.net_required_qty) + _to_float(req.drift_adjustment_qty), 0.0)
 
 def _trim_unexported_catchup_production(
@@ -839,7 +854,7 @@ def reconcile_snapshot(
         if item is None or req is None:
             continue
         flow = classify_replenishment_flow(getattr(item, "replenishment_method", None))
-        eff_net = _effective_net(req)
+        eff_net = _effective_net(req, db)
         executed = _to_float(req.executed_qty)
         desired = max(eff_net - executed, 0.0)
         effective_net_total += eff_net

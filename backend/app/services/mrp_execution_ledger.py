@@ -58,6 +58,7 @@ from ..models import (
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
+    StockLedgerEntry,
     SupplierOrder,
     SupplierOrderItem,
     SyncLink,
@@ -80,7 +81,17 @@ PURCHASE_ORDER_ENTITY = "Document_ЗаказПоставщику"
 # Drift maturity window (v2 §7.1). A shortfall/surplus pool must persist across
 # ≥2 cycles AND for at least this many hours before it materialises. Overridable
 # via MRP_DRIFT_MATURITY_HOURS (tests / validation set 0 for an immediate top-up).
+# Inc6 (design §11а): under STOCK_SOURCE=bin the window is REMOVED — paired
+# production + write-off arrive on ONE registrar (inc0), so a shortfall is no
+# longer a timing artefact and matures immediately. The legacy path keeps W.
 DRIFT_MATURITY_WINDOW_HOURS = 48.0
+
+# Inc6 (design §11а / §2.1): SLE movement kinds that consume the pool contour —
+# the actual component consumption read from ledger-1 under STOCK_SOURCE=bin,
+# REPLACING the frozen-norm model ``Σ(Δproduced_parent × frozen_norm)``. An
+# adjustment/reconcile SLE is deliberately EXCLUDED: it is the out-of-band
+# residual, already folded into on_hand (actual_stock), so it surfaces as drift.
+_DRIFT_CONSUMPTION_KINDS = ("assembly_out", "writeoff", "transfer_out")
 
 
 def _drift_maturity_window_hours() -> float:
@@ -575,7 +586,19 @@ class _Slot:
     sort_key: tuple
 
 
-def _effective_net(req: MrpRequirement) -> float:
+def _effective_net(
+    req: MrpRequirement, eff_net_by_req: Optional[Dict[int, float]] = None
+) -> float:
+    """Closure / bucket-cap demand target. DEFAULT (legacy) = frozen net + drift.
+
+    Inc6 (design §11б): under STOCK_SOURCE=bin the caller passes ``eff_net_by_req``
+    (built once per cycle from the reservation ledger's ``uncovered`` + supplier
+    term — :func:`item_ledger.reservation_ledger.effective_net_bin`). Legacy stays
+    byte-identical: with ``eff_net_by_req`` None the formula is unchanged."""
+    if eff_net_by_req is not None:
+        val = eff_net_by_req.get(int(req.id))
+        if val is not None:
+            return val
     return max(_to_float(req.net_required_qty) + _to_float(req.drift_adjustment_qty), 0.0)
 
 
@@ -586,9 +609,13 @@ def _build_execution_allocations(
     cycle_id: str,
     produced_now: Dict[int, float],
     received_now: Dict[int, float],
+    eff_net_by_req: Optional[Dict[int, float]] = None,
 ) -> Tuple[List[MrpExecutionAllocation], Dict[int, float], int, int]:
     """Rebuild ``mrp_execution_allocation`` for the scope. Returns
-    (row objects, executed_by_req, execution_row_count, coverage_row_count)."""
+    (row objects, executed_by_req, execution_row_count, coverage_row_count).
+
+    Inc6: ``eff_net_by_req`` (bin only) overrides the frozen-net demand target so
+    the bucket caps / room clamps track the reservation-ledger effective_net."""
     now = datetime.now(timezone.utc)
     rows: List[MrpExecutionAllocation] = []
     exec_by_req: Dict[int, float] = {int(rid): 0.0 for rid in scope.open_req_ids}
@@ -689,7 +716,7 @@ def _build_execution_allocations(
                     req_id=req_id,
                     bucket_id=None,
                     bucket_date=bdate,
-                    net_qty=_effective_net(req),
+                    net_qty=_effective_net(req, eff_net_by_req),
                     sort_key=(bdate, pf, ptv, int(req.run_id), req_id, -1),
                 )
             )
@@ -711,7 +738,7 @@ def _build_execution_allocations(
                 break
             req = scope.reqs_by_id[slot.req_id]
             room_bucket = slot.net_qty - exec_in_bucket.get((slot.req_id, slot.bucket_id), 0.0)
-            room_req = _effective_net(req) - exec_by_req.get(slot.req_id, 0.0)
+            room_req = _effective_net(req, eff_net_by_req) - exec_by_req.get(slot.req_id, 0.0)
             room_budget = budget_remaining[pk][cand.fact_class]
             take = min(qty, room_bucket, room_req, room_budget)
             if take <= EPS:
@@ -797,7 +824,7 @@ def _build_execution_allocations(
                 if cand_rem <= EPS:
                     continue
                 room_bucket = slot.net_qty - exec_in_bucket.get((slot.req_id, slot.bucket_id), 0.0)
-                room_req = _effective_net(req) - exec_by_req.get(slot.req_id, 0.0)
+                room_req = _effective_net(req, eff_net_by_req) - exec_by_req.get(slot.req_id, 0.0)
                 room_budget = budget_remaining[pk][cand.fact_class]
                 take = min(cand_rem, room_bucket, room_req, room_budget)
                 if take <= EPS:
@@ -1080,14 +1107,15 @@ def _drift_parent_items(db: Session, scope: LedgerScope) -> Set[int]:
 
 def _drift_anchor_by_item(
     db: Session, scope: LedgerScope, item_ids: Set[int]
-) -> Dict[int, Tuple[float, float, float, int]]:
+) -> Dict[int, Tuple[float, float, float, int, Optional[datetime]]]:
     """Per-item frozen anchor (stock S0, produced_total, received_total, donor
-    run_id) = the baseline of the pool with max(frozen_at, run_id) among the
-    scope runs at their active version. Same selection pattern as the ledger
-    scope's pool anchor, extended to parent items (level-0 / closed included)."""
+    run_id, frozen_at) = the baseline of the pool with max(frozen_at, run_id)
+    among the scope runs at their active version. Same selection pattern as the
+    ledger scope's pool anchor, extended to parent items (level-0 / closed
+    included). ``frozen_at`` (Inc6) bounds the SLE consumption window under bin."""
     if not item_ids:
         return {}
-    best: Dict[int, Tuple[Tuple[Any, int], Tuple[float, float, float, int]]] = {}
+    best: Dict[int, Tuple[Tuple[Any, int], Tuple[float, float, float, int, Optional[datetime]]]] = {}
     for row in (
         db.query(MrpFreezeBaseline)
         .filter(MrpFreezeBaseline.run_id.in_(scope.run_ids))
@@ -1107,9 +1135,48 @@ def _drift_anchor_by_item(
                     _to_float(row.produced_total),
                     _to_float(row.received_total),
                     int(row.run_id),
+                    _coerce_dt(row.frozen_at),
                 ),
             )
     return {iid: payload for iid, (_rank, payload) in best.items()}
+
+
+def _actual_consumption_by_item_from_sle(
+    db: Session,
+    item_ids: Set[int],
+    frozen_at_by_item: Dict[int, Optional[datetime]],
+) -> Dict[int, float]:
+    """Inc6 (design §11а) — actual pool consumption READ from ledger-1 (SLE).
+
+    Σ of ``|qty|`` over active SLE rows with ``qty < 0`` and
+    ``movement_kind ∈ {assembly_out, writeoff, transfer_out}`` since the freeze
+    anchor (``posting_at >= frozen_at``), per item. This REPLACES the frozen-norm
+    consumption model under STOCK_SOURCE=bin — one registrar carries both the
+    parent Receipt and the component Expense (inc0), so consumption is a fact, not
+    an inference. Adjustment/reconcile SLE are excluded (out-of-band residual)."""
+    if not item_ids:
+        return {}
+    ids = [int(i) for i in item_ids]
+    result: Dict[int, float] = {}
+    for iid, qty, posting_at in (
+        db.query(
+            StockLedgerEntry.item_id,
+            StockLedgerEntry.qty,
+            StockLedgerEntry.posting_at,
+        )
+        .filter(StockLedgerEntry.item_id.in_(ids))
+        .filter(StockLedgerEntry.active.is_(True))
+        .filter(StockLedgerEntry.qty < 0)
+        .filter(StockLedgerEntry.movement_kind.in_(_DRIFT_CONSUMPTION_KINDS))
+        .all()
+    ):
+        item_id = int(iid)
+        fa = frozen_at_by_item.get(item_id)
+        pat = _coerce_dt(posting_at)
+        if fa is not None and pat is not None and pat < fa:
+            continue
+        result[item_id] = result.get(item_id, 0.0) + (-_to_float(qty))
+    return result
 
 
 def _req_queue_key(req: MrpRequirement, run: Optional[PlanningRun]) -> tuple:
@@ -1138,16 +1205,25 @@ def compute_stock_drift(
     Returns the per-req ``drift_adjustment`` to materialise (matured shortfall +
     immediate evaporation − matured surplus).
     """
+    from .item_ledger.config import use_bin_stock
+
     now = datetime.now(timezone.utc)
     window_hours = _drift_maturity_window_hours()
+    use_bin = use_bin_stock()
 
     # --- evaporation adjustment (req-scoped, applied immediately, no W) ---
+    # Inc6 (design §11г, review Finding D) — under bin the evaporation term is
+    # REMOVED from drift: a dead supplier pin already raises the reservation
+    # ledger's ``uncovered`` (which feeds effective_net under §11б). Keeping it
+    # here too would count the evaporated qty TWICE. (б)+(г) flip together on this
+    # same flag — never one without the other.
     evap_by_req: Dict[int, float] = {}
-    for alloc in scope.freeze_allocs:
-        ev = verify.evaporated_by_alloc_id.get(int(alloc.id), 0.0)
-        if ev > EPS:
-            rid = int(alloc.requirement_id)
-            evap_by_req[rid] = evap_by_req.get(rid, 0.0) + ev
+    if not use_bin:
+        for alloc in scope.freeze_allocs:
+            ev = verify.evaporated_by_alloc_id.get(int(alloc.id), 0.0)
+            if ev > EPS:
+                rid = int(alloc.requirement_id)
+                evap_by_req[rid] = evap_by_req.get(rid, 0.0) + ev
 
     adjust_by_req: Dict[int, float] = {
         rid: round(v, 6) for rid, v in evap_by_req.items()
@@ -1197,6 +1273,19 @@ def compute_stock_drift(
 
     actual_stock_by_item = effective_stock_by_item_all(db)
 
+    # Inc6 (design §11а) — under bin, actual consumption is READ from ledger-1
+    # (Σ issue-kind SLE since the freeze anchor), REPLACING the norm model. The
+    # frozen norms (mrp_freeze_component) STAY the BOM-explosion/netting source;
+    # they simply no longer feed drift.
+    actual_consumption_by_item: Dict[int, float] = {}
+    if use_bin:
+        frozen_at_by_item = {
+            iid: payload[4] for iid, payload in anchor_by_item.items()
+        }
+        actual_consumption_by_item = _actual_consumption_by_item_from_sle(
+            db, set(scope.pool_items), frozen_at_by_item
+        )
+
     # --- debounce chain: snapshot prior first_seen, then rebuild globally ---
     prior_first_seen: Dict[Tuple[int, str, str, str, str], Tuple[str, Optional[datetime]]] = {}
     for ev in (
@@ -1234,13 +1323,17 @@ def compute_stock_drift(
         if bom_level_min == 0:
             continue  # finished-goods shipping is not drift (§5, conservative)
 
-        s0, produced_total, received_total, _donor = anchor
+        s0, produced_total, received_total, _donor, _frozen_at = anchor
         delta_produced_in = max(0.0, produced_now.get(item_id, 0.0) - produced_total)
         delta_received = max(0.0, received_now.get(item_id, 0.0) - received_total)
 
         expected_consumption = 0.0
         parents_used: List[Dict[str, Any]] = []
-        for parent in sorted(parents_by_component.get(item_id, set())):
+        if use_bin:
+            # Inc6 (§11а): consumption is the SLE fact, not the norm inference.
+            expected_consumption = actual_consumption_by_item.get(item_id, 0.0)
+            parents_used.append({"source": "sle", "actual_consumption": round(expected_consumption, 3)})
+        for parent in sorted(parents_by_component.get(item_id, set())) if not use_bin else ():
             p_anchor = anchor_by_item.get(parent)
             if p_anchor is None:
                 # Parent without an anchor contributes 0 (a (0,0) fallback would
@@ -1278,7 +1371,9 @@ def compute_stock_drift(
                 first_seen_at = now
         else:
             first_seen_cycle_id, first_seen_at = cycle_id, now
-        matured = (
+        # Inc6 (design §11а): under bin the W=48h maturity window + debounce are
+        # REMOVED — a shortfall (the out-of-band residual) matures immediately.
+        matured = use_bin or (
             first_seen_cycle_id != cycle_id
             and (now - first_seen_at).total_seconds() >= window_hours * 3600.0
         )
@@ -1379,7 +1474,9 @@ def _materialize_drift_adjustment(scope: LedgerScope, drift: DriftResult) -> int
 # ---------------------------------------------------------------------------
 # §5 (increment 5) — plan closure by execution
 # ---------------------------------------------------------------------------
-def apply_requirement_closure(db: Session, scope: LedgerScope) -> Dict[str, Any]:
+def apply_requirement_closure(
+    db: Session, scope: LedgerScope, eff_net_by_req: Optional[Dict[int, float]] = None
+) -> Dict[str, Any]:
     """Auto-close every open requirement whose REAL deficit has been executed.
 
     Runs in the ledger cycle right AFTER ``_materialize_drift_adjustment``, so
@@ -1405,9 +1502,7 @@ def apply_requirement_closure(db: Session, scope: LedgerScope) -> Dict[str, Any]
     now = datetime.now(timezone.utc)
     closed = 0
     for req in scope.open_reqs:
-        effective_net = max(
-            _to_float(req.net_required_qty) + _to_float(req.drift_adjustment_qty), 0.0
-        )
+        effective_net = _effective_net(req, eff_net_by_req)
         if effective_net > EPS and _to_float(req.executed_qty) + EPS >= effective_net:
             req.status = "closed"
             req.closed_at = now
@@ -1416,7 +1511,9 @@ def apply_requirement_closure(db: Session, scope: LedgerScope) -> Dict[str, Any]
     return {"requirements_closed": closed}
 
 
-def apply_run_closure(db: Session, scope: LedgerScope) -> List[int]:
+def apply_run_closure(
+    db: Session, scope: LedgerScope, eff_net_by_req: Optional[Dict[int, float]] = None
+) -> List[int]:
     """Auto-close every FIXED_SNAPSHOT run that has NO OPEN DEFICIT left.
 
     Runs right after :func:`apply_requirement_closure` (its closures are already
@@ -1444,20 +1541,35 @@ def apply_run_closure(db: Session, scope: LedgerScope) -> List[int]:
         ) or 0
         if total <= 0:
             continue
-        open_deficit = (
-            db.query(func.count(MrpRequirement.id))
-            .filter(MrpRequirement.run_id == rid)
-            .filter(MrpRequirement.status == "open")
-            .filter(
-                (
-                    func.coalesce(MrpRequirement.net_required_qty, 0.0)
-                    + func.coalesce(MrpRequirement.drift_adjustment_qty, 0.0)
-                    - func.coalesce(MrpRequirement.executed_qty, 0.0)
-                )
-                > EPS
+        if eff_net_by_req is not None:
+            # Inc6 (bin): the effective_net source is the reservation ledger, not
+            # net+drift — count the open deficit in Python over the same target.
+            open_reqs_of_run = (
+                db.query(MrpRequirement)
+                .filter(MrpRequirement.run_id == rid)
+                .filter(MrpRequirement.status == "open")
+                .all()
             )
-            .scalar()
-        ) or 0
+            open_deficit = sum(
+                1
+                for r in open_reqs_of_run
+                if _effective_net(r, eff_net_by_req) - _to_float(r.executed_qty) > EPS
+            )
+        else:
+            open_deficit = (
+                db.query(func.count(MrpRequirement.id))
+                .filter(MrpRequirement.run_id == rid)
+                .filter(MrpRequirement.status == "open")
+                .filter(
+                    (
+                        func.coalesce(MrpRequirement.net_required_qty, 0.0)
+                        + func.coalesce(MrpRequirement.drift_adjustment_qty, 0.0)
+                        - func.coalesce(MrpRequirement.executed_qty, 0.0)
+                    )
+                    > EPS
+                )
+                .scalar()
+            ) or 0
         if open_deficit == 0:
             # Sweep the remaining open-but-zero (net=0) tail, then close the run.
             (
@@ -1512,15 +1624,42 @@ def run_ledger_cycle(db: Session) -> Dict[str, Any]:
     drift_item_ids: Set[int] = set(scope.pool_items) | parent_items
     produced_now, received_now = _produced_received_now(db, drift_item_ids)
 
+    from .item_ledger.config import use_bin_stock
+
+    use_bin = use_bin_stock()
+
     verify = verify_frozen_supply(db, scope, cycle_id)
+
+    # Inc6 (design §11б): under bin the reservation ledger is LOAD-BEARING — it is
+    # materialized/redistributed EARLY (before execution allocation + closure) so
+    # ``effective_net`` can derive from its ``uncovered`` + supplier term for the
+    # whole cycle. Under legacy it stays PURE SHADOW at the end (byte-identical).
+    eff_net_by_req: Optional[Dict[int, float]] = None
+    if use_bin:
+        from .item_ledger.reservation_ledger import (
+            effective_net_bin,
+            run_reservation_shadow,
+        )
+
+        run_reservation_shadow(db, scope, cycle_id)
+        eff_net_by_req = {}
+        for req in scope.open_reqs:
+            val = effective_net_bin(db, req)
+            eff_net_by_req[int(req.id)] = (
+                val
+                if val is not None
+                else max(_to_float(req.net_required_qty) + _to_float(req.drift_adjustment_qty), 0.0)
+            )
+
     _rows, exec_by_req, execution_rows, coverage_rows = _build_execution_allocations(
-        db, scope, verify, cycle_id, produced_now, received_now
+        db, scope, verify, cycle_id, produced_now, received_now, eff_net_by_req
     )
     items_touched, total_executed = _aggregate_executed_qty(scope, exec_by_req)
 
     # §4 (increment 4): drift AFTER executed aggregation (a surplus cap needs
     # executed; shortfall caps = frozen initial_snapshot_stock). Then materialise
     # drift_adjustment_qty (the reconcile sizer reads it next cycle / this run).
+    # Under bin the drift is shrunk (SLE consumption, no W, no evaporation term).
     drift = compute_stock_drift(db, scope, verify, produced_now, received_now, cycle_id)
     _materialize_drift_adjustment(scope, drift)
 
@@ -1528,21 +1667,24 @@ def run_ledger_cycle(db: Session) -> Dict[str, Any]:
     # effective_net accounts for drift_adjustment (an evaporated supply can
     # re-open / keep-open a requirement). Requirements close first, then a run
     # closes once none of its requirements remain open.
-    requirement_closure = apply_requirement_closure(db, scope)
-    runs_closed = apply_run_closure(db, scope)
+    requirement_closure = apply_requirement_closure(db, scope, eff_net_by_req)
+    runs_closed = apply_run_closure(db, scope, eff_net_by_req)
 
-    # Inc4 (PURE SHADOW, ADDITIVE): materialize the reservation ledger from the
-    # same scope + the live SLE substrate. Wrapped so any failure logs and never
-    # breaks the cycle — the executed/drift/closure result below is returned
-    # unchanged whether this block runs or errors (no reader consults it yet).
-    try:
-        from .item_ledger.reservation_ledger import run_reservation_shadow
+    # Inc4 (PURE SHADOW, ADDITIVE) — LEGACY ONLY: materialize the reservation
+    # ledger from the same scope + the live SLE substrate. Wrapped so any failure
+    # logs and never breaks the cycle (no reader consults it under legacy). Under
+    # bin it already ran early (above) as the load-bearing effective_net source.
+    # NB (Inc6в, DEFERRED): MrpFreezeAllocation → SQL-VIEW cleanup stays for Inc7;
+    # the Inc4 dual-write persists and MrpFreezeAllocation remains the read source.
+    if not use_bin:
+        try:
+            from .item_ledger.reservation_ledger import run_reservation_shadow
 
-        run_reservation_shadow(db, scope, cycle_id)
-    except Exception:  # noqa: BLE001 — shadow must never break the ledger cycle
-        logging.getLogger(__name__).exception(
-            "Inc4 reservation shadow block failed; continuing (ledger cycle unaffected)"
-        )
+            run_reservation_shadow(db, scope, cycle_id)
+        except Exception:  # noqa: BLE001 — shadow must never break the ledger cycle
+            logging.getLogger(__name__).exception(
+                "Inc4 reservation shadow block failed; continuing (ledger cycle unaffected)"
+            )
 
     realized_total = round(sum(verify.realized_by_alloc_id.values()), 6)
     evaporated_total = round(sum(verify.evaporated_by_alloc_id.values()), 6)
