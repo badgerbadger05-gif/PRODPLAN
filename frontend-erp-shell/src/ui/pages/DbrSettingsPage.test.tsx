@@ -162,6 +162,40 @@ describe('DbrSettingsPage characterization', () => {
     expect(screen.queryByText('settings unavailable')).not.toBeInTheDocument()
   })
 
+  it('reloads all settings reads with F5 from editable controls but not from interactive controls', async () => {
+    renderPage()
+    const field = await screen.findByLabelText('Порог полки, шт')
+
+    fireEvent.keyDown(field, { key: 'F5' })
+    await waitFor(() => expect(getDbrSettings).toHaveBeenCalledTimes(2))
+
+    fireEvent.keyDown(screen.getByRole('button', { name: 'Сохранить настройки' }), { key: 'F5' })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(getDbrSettings).toHaveBeenCalledTimes(2)
+    expect(listDbrAssemblyRates).toHaveBeenCalledTimes(2)
+    expect(listDbrCategoryRisks).toHaveBeenCalledTimes(2)
+    expect(listResources).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps successful settings sections when independent reads fail and retries accessibly', async () => {
+    vi.mocked(listDbrAssemblyRates).mockRejectedValueOnce(new Error('rates unavailable'))
+    vi.mocked(listResources).mockRejectedValueOnce(new Error('resources unavailable'))
+    renderPage()
+
+    expect(await screen.findByDisplayValue('12.5')).toBeInTheDocument()
+    expect(screen.getByDisplayValue('Подшипники')).toBeInTheDocument()
+    expect(screen.getByText('Тактов: 0 · Рисков: 1')).toBeInTheDocument()
+    const errors = screen.getByRole('alert', { name: 'Ошибки загрузки' })
+    expect(within(errors).getByText('Такты сборки: rates unavailable')).toBeInTheDocument()
+    expect(within(errors).getByText('Участки: resources unavailable')).toBeInTheDocument()
+
+    await userEvent.click(within(errors).getByRole('button', { name: 'Повторить загрузку' }))
+
+    expect(await screen.findByText('ITEM-77 · ID 77')).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: 'Сборка' })).toBeInTheDocument()
+    expect(screen.queryByRole('alert', { name: 'Ошибки загрузки' })).not.toBeInTheDocument()
+  })
+
   it('keeps the newest load when StrictMode starts two reads and the older one resolves last', async () => {
     const oldSettings = deferred<DbrSettings>()
     const newSettings = deferred<DbrSettings>()

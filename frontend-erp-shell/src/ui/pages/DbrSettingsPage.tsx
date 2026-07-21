@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
 import type {
   DbrAssemblyRate,
@@ -23,6 +23,7 @@ import { StatusBar } from '../layout/StatusBar'
 import { DbrNav } from '../dbr/DbrNav'
 import { ItemPicker } from '../dbr/ItemPicker'
 import type { PickedItem } from '../dbr/ItemPicker'
+import { KeyboardShortcutShell, type KeyboardShortcut } from '../platform'
 
 // Local editable copy of the settings singleton. Kept as strings-or-numbers is
 // avoided — everything numeric is normalized to a number on save.
@@ -52,6 +53,9 @@ function toForm(s: DbrSettings): SettingsForm {
 
 const emptyRateDraft = { resource_id: '', qty_per_capacity: '' }
 
+const loadLabels = ['Параметры модуля', 'Такты сборки', 'Категорийные риски', 'Участки'] as const
+type LoadError = { label: typeof loadLabels[number]; message: string }
+
 export function DbrSettingsPage() {
   const [form, setForm] = useState<SettingsForm | null>(null)
   const [rates, setRates] = useState<DbrAssemblyRate[]>([])
@@ -64,6 +68,7 @@ export function DbrSettingsPage() {
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
+  const [loadErrors, setLoadErrors] = useState<LoadError[]>([])
   const [message, setMessage] = useState('')
   const loadSequence = useRef(0)
   const mutationInFlight = useRef(false)
@@ -74,20 +79,29 @@ export function DbrSettingsPage() {
     setError('')
     setMessage('')
     try {
-      const [settings, rateRows, riskRows, resourceRows] = await Promise.all([
+      const results = await Promise.allSettled([
         getDbrSettings(),
         listDbrAssemblyRates(),
         listDbrCategoryRisks(),
         listResources(),
       ])
       if (sequence !== loadSequence.current) return
-      setForm(toForm(settings))
-      setRates(rateRows)
-      setRisks(riskRows)
-      setResources(resourceRows)
-    } catch (e) {
-      if (sequence !== loadSequence.current) return
-      setError(e instanceof Error ? e.message : String(e))
+      const failures: LoadError[] = []
+      results.forEach((result, index) => {
+        if (result.status === 'rejected') {
+          failures.push({
+            label: loadLabels[index],
+            message: result.reason instanceof Error ? result.reason.message : String(result.reason),
+          })
+        }
+      })
+      const [settingsResult, ratesResult, risksResult, resourcesResult] = results
+      if (settingsResult.status === 'fulfilled') setForm(toForm(settingsResult.value))
+      if (ratesResult.status === 'fulfilled') setRates(ratesResult.value)
+      if (risksResult.status === 'fulfilled') setRisks(risksResult.value)
+      if (resourcesResult.status === 'fulfilled') setResources(resourcesResult.value)
+      setLoadErrors(failures)
+      setError(failures[0]?.message ?? '')
     } finally {
       if (sequence === loadSequence.current) setLoading(false)
     }
@@ -96,6 +110,14 @@ export function DbrSettingsPage() {
   useEffect(() => {
     void load()
   }, [load])
+
+  const shortcuts = useMemo<KeyboardShortcut[]>(() => [{
+    id: 'dbr-settings-refresh',
+    keys: 'F5',
+    run: () => void load(),
+    allowInEditable: true,
+    scope: 'resource',
+  }], [load])
 
   function patch(next: Partial<SettingsForm>) {
     setForm((prev) => (prev ? { ...prev, ...next } : prev))
@@ -215,6 +237,7 @@ export function DbrSettingsPage() {
 
   return (
     <main className="workArea">
+      <KeyboardShortcutShell shortcuts={shortcuts} />
       <div className="topLine">
         <div className="breadcrumbs">Планирование DBR / Настройки модуля</div>
         <div className="runBadge">Тактов: {rates.length} · Рисков: {risks.length}</div>
@@ -245,6 +268,14 @@ export function DbrSettingsPage() {
         </div>
 
         {error && <div className="errorLine">{error}</div>}
+        {loadErrors.length > 0 && (
+          <div className="errorLine" role="alert" aria-label="Ошибки загрузки">
+            <ul>
+              {loadErrors.map((item) => <li key={item.label}>{item.label}: {item.message}</li>)}
+            </ul>
+            <button onClick={() => void load()} disabled={loading}>Повторить загрузку</button>
+          </div>
+        )}
         {message && <div className="successLine">{message}</div>}
 
         <div className="dbrScroll">
