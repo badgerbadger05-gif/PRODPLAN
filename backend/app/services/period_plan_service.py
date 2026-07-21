@@ -400,6 +400,31 @@ def delete_period_plan(db: Session, plan_id: int) -> Dict[str, Any]:
     return {"status": "deleted", "id": plan_id, "name": name}
 
 
+def material_availability_positions(
+    db: Session,
+    item_ids: Optional[Iterable[int]] = None,
+) -> Dict[int, Dict[str, float]]:
+    """Inc5 (design §2.5 / §11): expose the ledger pool projection
+    (``on_hand`` / ``incoming`` / ``reserved_soft`` / ``available`` /
+    ``projected`` / ``uncovered``) per item for the period-plan
+    material-availability readers, behind the ``STOCK_SOURCE=bin`` flag.
+
+    Additive and read-only: under the default legacy flag this returns ``{}`` and
+    nothing in the planning pipeline consults it — the netting path
+    (``_explode_bom_net_first``) is NOT rewired onto the reservation ledger here
+    (that is Inc6). Only the stock ON-HAND source of the netting is flipped, via
+    ``effective_stock_by_item_all``.
+    """
+    from .item_ledger.config import use_bin_stock
+
+    if not use_bin_stock():
+        return {}
+    from .item_ledger import item_ledger_position
+
+    ids = list(item_ids) if item_ids is not None else None
+    return item_ledger_position(db, ids)
+
+
 def _explode_bom_net_first(
     db: Session,
     plan_demands: Dict[int, Dict[date, float]],

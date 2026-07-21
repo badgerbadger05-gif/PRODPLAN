@@ -59,6 +59,7 @@ from .reservation import (  # noqa: F401
     uncovered_pool,
 )
 from .reservation_ledger import (  # noqa: F401
+    item_ledger_position,
     materialize_reservations,
     materialize_reservations_for_freeze,
     mirror_frozen_pins,
@@ -68,4 +69,10 @@ from .reservation_ledger import (  # noqa: F401
     redistribute_pool,
     reservation_shadow_report,
     run_reservation_shadow,
+)
+from .config import (  # noqa: F401
+    STOCK_SOURCE_BIN,
+    STOCK_SOURCE_LEGACY,
+    stock_source,
+    use_bin_stock,
 )

@@ -353,21 +353,32 @@ def run_balance_reconcile_after_sweep(
 
 
 def ledger_on_hand_by_item(session: Session) -> Dict[int, float]:
-    """``{item_id: Σ stock_bin.on_hand}`` over the same contour as the legacy
-    ``effective_stock_by_item_all`` (selected warehouses, ignored excluded).
+    """``{item_id: Σ stock_bin.on_hand}`` over the planning contour (design §2.5
+    pool on_hand): selected warehouses, ignored excluded, **finished_goods
+    (ГП) warehouses excluded** — the pool never sums stock parked on a
+    finished-goods warehouse (§2.5: ГП выпускается напрямую на ГП-склад вне
+    контура).
 
-    This is the ledger-world stock source (design §2.5 pool on_hand) rendered
-    per item so it can be laid beside the legacy world for the shadow report.
-    Read-only. If no warehouse settings exist, sums every bin (legacy fallback).
+    This is the ledger-world stock source rendered per item so it can be laid
+    beside the legacy world (shadow report) and, from Inc5, feed the flipped
+    ``effective_stock_by_item_all`` bin path. Read-only. If no warehouse
+    settings exist, sums every bin (legacy fallback).
     """
     ignored_refs = {
         str(r[0]) for r in session.query(models.IgnoredWarehouse.warehouse_ref1c).all()
         if r and r[0]
     }
     warehouse_rows = session.query(
-        models.StockWarehouse.warehouse_ref1c, models.StockWarehouse.is_selected
+        models.StockWarehouse.warehouse_ref1c,
+        models.StockWarehouse.is_selected,
+        models.StockWarehouse.is_finished_goods,
     ).all()
-    selected_refs = {str(ref) for ref, sel in warehouse_rows if ref and bool(sel)}
+    # selected minus finished_goods — a ГП склад is out of the planning contour
+    # even if it is (also) flagged selected (§2.5).
+    selected_refs = {
+        str(ref) for ref, sel, fg in warehouse_rows if ref and bool(sel) and not bool(fg)
+    }
+    finished_goods_refs = {str(ref) for ref, _sel, fg in warehouse_rows if ref and bool(fg)}
     has_settings = bool(warehouse_rows)
 
     q = session.query(
@@ -380,6 +391,8 @@ def ledger_on_hand_by_item(session: Session) -> Dict[int, float]:
             q = q.filter(False)
     if ignored_refs:
         q = q.filter(~models.StockBin.warehouse_ref1c.in_(ignored_refs))
+    if finished_goods_refs:
+        q = q.filter(~models.StockBin.warehouse_ref1c.in_(finished_goods_refs))
     rows = q.group_by(models.StockBin.item_id).all()
     return {int(iid): float(qty or 0.0) for iid, qty in rows}
 

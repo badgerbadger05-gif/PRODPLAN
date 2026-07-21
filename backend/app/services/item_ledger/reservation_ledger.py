@@ -23,7 +23,7 @@ Design references: §2.2 (mode assignment), §2.6 (map to inc1–5), §3.1 (make
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -996,3 +996,110 @@ def reservation_shadow_report(db: Session) -> Dict[str, Any]:
         "requirements": items_out,
         "pools": pools_out,
     }
+
+
+# ---------------------------------------------------------------------------
+# §2.5 pool projection — item_ledger_position (Inc5 reader surface)
+# ---------------------------------------------------------------------------
+def item_ledger_position(
+    db: Session,
+    item_ids: Optional[Sequence[int]] = None,
+) -> Dict[int, Dict[str, float]]:
+    """The design §2.5 pool projection rendered ``{item_id: position}``.
+
+    Per item (default pool): ``on_hand`` (Σ stock_bin over the planning contour,
+    ГП excluded), ``incoming_supplier`` / ``incoming_wip`` (existing OData
+    mirrors), ``reserved_soft`` (Σ outstanding over ACTIVE consume reservations —
+    make contributes exactly 0, §3.1/INV-RES-make-zero), and the derived
+    ``available`` / ``projected`` / ``uncovered`` by the §3 formulas::
+
+        available  = on_hand − reserved_soft            # MAY be < 0 (surfaced)
+        projected  = on_hand + incoming − reserved_soft
+        uncovered  = max(reserved_soft − on_hand⁺ − incoming, 0)
+
+    Read-only, additive. This is the projection the material-availability readers
+    consult behind the ``STOCK_SOURCE=bin`` flag (Inc5, design §11); the legacy
+    path is untouched. ``on_hand`` is the negatives-preserved raw pool sum (§4a):
+    ``available``/``projected`` are computed from it honestly, while
+    ``uncovered`` uses ``on_hand⁺`` so a transient mirror negative never inflates
+    a purchase proposal.
+
+    If ``item_ids`` is given, the result is restricted to those items (items with
+    no ledger footprint resolve to an all-zero position).
+    """
+    want: Optional[Set[int]] = (
+        {int(i) for i in item_ids if i is not None} if item_ids is not None else None
+    )
+
+    on_hand_all = ledger_on_hand_by_item(db)
+
+    # reserved_soft per item — Σ outstanding over active consume reservations.
+    reserved_soft: Dict[int, float] = {}
+    res_rows = (
+        db.query(
+            models.ReservationEntry.item_id,
+            models.ReservationEntry.reserved_qty,
+            models.ReservationEntry.realized_qty,
+        )
+        .filter(
+            models.ReservationEntry.realization_mode == CONSUME,
+            models.ReservationEntry.lifecycle_status == "active",
+        )
+        .all()
+    )
+    for iid, reserved, realized in res_rows:
+        outstanding = max(float(reserved or 0.0) - float(realized or 0.0), 0.0)
+        if outstanding <= 0.0:
+            continue
+        reserved_soft[int(iid)] = reserved_soft.get(int(iid), 0.0) + outstanding
+
+    # incoming — existing loaders (wip identity loader + supplier remaining).
+    from ..mrp_stock_helpers import active_wip_supply_by_item
+
+    incoming_wip: Dict[int, float] = {
+        int(iid): float(sum(float(l.remaining) for l in lines))
+        for iid, lines in active_wip_supply_by_item(db).items()
+    }
+
+    incoming_supplier: Dict[int, float] = {}
+    supplier_item_ids = [
+        int(iid)
+        for (iid,) in db.query(models.SupplierOrderItem.item_id_ref).distinct().all()
+        if iid is not None
+    ]
+    if want is not None:
+        supplier_item_ids = [i for i in supplier_item_ids if i in want]
+    if supplier_item_ids:
+        from ..period_plan_service import _load_purchase_supplier_remaining
+
+        supplier = _load_purchase_supplier_remaining(
+            db, supplier_item_ids, date.max - timedelta(days=1)
+        )
+        for iid, lines in supplier.items():
+            incoming_supplier[int(iid)] = float(
+                sum(float(l.get("remaining_qty") or 0.0) for l in lines)
+            )
+
+    keys: Set[int] = set(on_hand_all) | set(reserved_soft) | set(incoming_wip) | set(incoming_supplier)
+    if want is not None:
+        keys = set(want)
+
+    result: Dict[int, Dict[str, float]] = {}
+    for iid in keys:
+        oh = float(on_hand_all.get(iid, 0.0))
+        oh_pos = oh if oh > 0.0 else 0.0
+        inc_s = float(incoming_supplier.get(iid, 0.0))
+        inc_w = float(incoming_wip.get(iid, 0.0))
+        inc = inc_s + inc_w
+        soft = float(reserved_soft.get(iid, 0.0))
+        result[iid] = {
+            "on_hand": oh,
+            "incoming_supplier": inc_s,
+            "incoming_wip": inc_w,
+            "incoming": inc,
+            "reserved_soft": soft,
+            "available": oh - soft,
+            "projected": oh + inc - soft,
+            "uncovered": max(soft - oh_pos - inc, 0.0),
+        }
+    return result

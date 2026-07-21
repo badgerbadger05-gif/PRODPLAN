@@ -30,6 +30,7 @@ from ..models import (
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
+    StockBin,
     StockWarehouse,
 )
 
@@ -61,7 +62,23 @@ def effective_stock_by_item_all(db: Session) -> Dict[int, float]:
       3. Items without any breakdown row fall back to `Item.stock_qty` so a
          partially-synced DB doesn't blank coverage. After a full re-sync
          the breakdown path becomes authoritative for everything.
+
+    Inc5 (design §11): behind the ``STOCK_SOURCE`` feature flag the STOCK
+    on-hand source switches from the warehouse tables to the physical ledger's
+    ``stock_bin`` pool. The DEFAULT (``STOCK_SOURCE=legacy``) is byte-identical
+    to the historical behaviour — the branch below is inert. Only the internal
+    source changes; the ``{item_id: qty}`` signature is unchanged. When
+    ``stock_bin`` is seeded from the same snapshot that feeds
+    ``item_warehouse_stock`` the two sources return identical dicts over the
+    same contour (the Inc5 equivalence property).
     """
+    # Lazy import: item_ledger.config triggers the item_ledger package __init__,
+    # which (via reservation_ledger → mrp_freeze) imports THIS module — a
+    # top-level import would be a cycle. The flag is read fresh at call time.
+    from .item_ledger.config import use_bin_stock
+
+    if use_bin_stock():
+        return _effective_stock_by_item_all_from_bin(db)
     ignored_refs = {
         str(r[0]) for r in db.query(IgnoredWarehouse.warehouse_ref1c).all() if r and r[0]
     }
@@ -100,6 +117,79 @@ def effective_stock_by_item_all(db: Session) -> Dict[int, float]:
     has_any_rows = {
         int(iid)
         for (iid,) in db.query(ItemWarehouseStock.item_id).distinct().all()
+    }
+
+    result: Dict[int, float] = {}
+    for iid, qty in db.query(Item.item_id, Item.stock_qty).all():
+        iid_int = int(iid)
+        if iid_int in has_any_rows:
+            result[iid_int] = breakdown_stocks.get(iid_int, 0.0)
+        else:
+            result[iid_int] = float(qty or 0.0)
+    return result
+
+
+def _effective_stock_by_item_all_from_bin(db: Session) -> Dict[int, float]:
+    """Inc5 ledger-sourced twin of :func:`effective_stock_by_item_all`.
+
+    Structurally identical to the legacy function — same 3-tier resolution, same
+    ``{item_id: qty}`` shape, same authoritative/fallback semantics — but the
+    authoritative per-item breakdown is summed from ``stock_bin.on_hand``
+    instead of ``item_warehouse_stock.qty``, and the contour additionally
+    excludes ``is_finished_goods`` warehouses (design §2.5: ГП-склады are out of
+    the planning pool).
+
+    Equivalence: when ``stock_bin`` is seeded from the same snapshot that feeds
+    ``item_warehouse_stock`` (one bin per warehouse row) and no selected,
+    non-ignored finished-goods warehouse holds stock, this returns a dict
+    identical to the legacy path item-for-item (within EPS).
+
+    The tier-1 (no settings) and tier-3 (item without any breakdown row)
+    fallbacks read ``Item.stock_qty`` — the same "partially-synced DB" safety
+    nets as legacy — so the dict KEYS match legacy regardless of source.
+    """
+    ignored_refs = {
+        str(r[0]) for r in db.query(IgnoredWarehouse.warehouse_ref1c).all() if r and r[0]
+    }
+    warehouse_rows = db.query(
+        StockWarehouse.warehouse_ref1c,
+        StockWarehouse.is_selected,
+        StockWarehouse.is_finished_goods,
+    ).all()
+    # selected minus finished_goods — ГП stays out of the pool even if selected.
+    selected_refs = {
+        str(ref) for ref, sel, fg in warehouse_rows if ref and bool(sel) and not bool(fg)
+    }
+    finished_goods_refs = {str(ref) for ref, _sel, fg in warehouse_rows if ref and bool(fg)}
+    has_warehouse_settings = bool(warehouse_rows)
+
+    if not has_warehouse_settings and not ignored_refs:
+        return {
+            int(iid): float(qty or 0.0)
+            for iid, qty in db.query(Item.item_id, Item.stock_qty).all()
+        }
+
+    sum_query = db.query(StockBin.item_id, func.sum(StockBin.on_hand))
+    if has_warehouse_settings:
+        if selected_refs:
+            sum_query = sum_query.filter(StockBin.warehouse_ref1c.in_(selected_refs))
+        else:
+            sum_query = sum_query.filter(False)
+    if ignored_refs:
+        sum_query = sum_query.filter(~StockBin.warehouse_ref1c.in_(ignored_refs))
+    if finished_goods_refs:
+        sum_query = sum_query.filter(~StockBin.warehouse_ref1c.in_(finished_goods_refs))
+    sum_rows = sum_query.group_by(StockBin.item_id).all()
+    breakdown_stocks: Dict[int, float] = {
+        int(iid): float(qty or 0.0) for iid, qty in sum_rows
+    }
+
+    # An item is "authoritative via the breakdown" if it has ANY bin row at all
+    # (even in an unselected/ignored/finished_goods warehouse) — mirrors the
+    # legacy ItemWarehouseStock rule so the two worlds agree on which items fall
+    # through to the stock_qty tier-3 fallback.
+    has_any_rows = {
+        int(iid) for (iid,) in db.query(StockBin.item_id).distinct().all()
     }
 
     result: Dict[int, float] = {}

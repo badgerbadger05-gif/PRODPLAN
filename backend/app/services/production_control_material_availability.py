@@ -477,6 +477,18 @@ def preview_materials(db: Session, product_id: int, *, refresh_state: bool = Fal
         reservation_state,
         exclude_product_id=int(product.product_id),
     )
+    # Inc5 (design §2.5 / §11): behind STOCK_SOURCE=bin, additively expose the
+    # ledger pool projection (available / projected / uncovered) per component.
+    # Purely additive — the legacy availability path above is untouched, and the
+    # block is inert under the default legacy flag.
+    from .item_ledger.config import use_bin_stock
+
+    ledger_positions: Dict[int, Dict[str, float]] = {}
+    if use_bin_stock():
+        from .item_ledger import item_ledger_position
+
+        ledger_positions = item_ledger_position(db, comp_ids)
+
     run_id = _latest_run_id(db)
     supplier_eta = _supplier_eta_by_item(db, comp_ids)
     production_eta = _production_eta_by_item(db, comp_ids)
@@ -514,6 +526,12 @@ def preview_materials(db: Session, product_id: int, *, refresh_state: bool = Fal
         comp["availability_status"] = _ui_coverage_status(label)
         comp["coverage_status"] = _ui_coverage_status(label)
         comp["coverage_label"] = _ui_coverage_label(label)
+        if ledger_positions:
+            pos = ledger_positions.get(iid)
+            if pos is not None:
+                comp["ledger_available"] = pos["available"]
+                comp["ledger_projected"] = pos["projected"]
+                comp["ledger_uncovered"] = pos["uncovered"]
         if label == "ok":
             comp["eta_dates"] = []
             comp["expected_dates"] = []
