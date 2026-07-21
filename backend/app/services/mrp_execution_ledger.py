@@ -1158,6 +1158,7 @@ def _actual_consumption_by_item_from_sle(
         return {}
     ids = [int(i) for i in item_ids]
     result: Dict[int, float] = {}
+    skipped_no_anchor: Set[int] = set()
     for iid, qty, posting_at in (
         db.query(
             StockLedgerEntry.item_id,
@@ -1172,8 +1173,21 @@ def _actual_consumption_by_item_from_sle(
     ):
         item_id = int(iid)
         fa = frozen_at_by_item.get(item_id)
+        # Robustness (finding #2): NEVER sum the whole SLE history without a lower
+        # bound. A missing/NULL freeze anchor for an anchored item would otherwise
+        # fold in every issue-kind row ever posted (an unbounded, wrong drift). If
+        # the anchor is absent, skip the item (consumption = 0) with a diagnostic.
+        if fa is None:
+            if item_id not in skipped_no_anchor:
+                skipped_no_anchor.add(item_id)
+                logging.getLogger(__name__).warning(
+                    "drift: skipping SLE consumption for item %s — no freeze "
+                    "anchor (frozen_at is NULL); refusing unbounded history sum",
+                    item_id,
+                )
+            continue
         pat = _coerce_dt(posting_at)
-        if fa is not None and pat is not None and pat < fa:
+        if pat is not None and pat < fa:
             continue
         result[item_id] = result.get(item_id, 0.0) + (-_to_float(qty))
     return result
@@ -1212,14 +1226,24 @@ def compute_stock_drift(
     use_bin = use_bin_stock()
 
     # --- evaporation adjustment (req-scoped, applied immediately, no W) ---
-    # Inc6 (design §11г, review Finding D) — under bin the evaporation term is
-    # REMOVED from drift: a dead supplier pin already raises the reservation
-    # ledger's ``uncovered`` (which feeds effective_net under §11б). Keeping it
-    # here too would count the evaporated qty TWICE. (б)+(г) flip together on this
-    # same flag — never one without the other.
+    # Single-channel evaporation (corrected Finding D). Each coverage source
+    # resurfaces its evaporation through EXACTLY ONE channel:
+    #   * ``supplier_order`` pins are ``own_open_coverage`` in the sizer (via
+    #     ``own_exported_outstanding``) and are NOT netted into ``net_required``,
+    #     so their evaporation resurfaces ONLY as own_open_coverage dropping — it
+    #     must NOT ALSO inflate the drift/effective_net. Folding it here as well
+    #     over-orders by the dead pin's alloc. EXCLUDED from the drift term.
+    #   * ``wip_order`` pins WERE netted into ``net_required`` at freeze and are
+    #     NOT in own_open_coverage, so their evaporation must resurface via the
+    #     drift/effective_net term — KEPT here.
+    # Under bin the whole term is REMOVED: a dead supplier pin already raises the
+    # reservation ledger's ``uncovered``/``pin_live`` (which feed effective_net
+    # under §11б), and WIP evaporation likewise surfaces via ``uncovered`` there.
     evap_by_req: Dict[int, float] = {}
     if not use_bin:
         for alloc in scope.freeze_allocs:
+            if str(alloc.source_type or "") == "supplier_order":
+                continue
             ev = verify.evaporated_by_alloc_id.get(int(alloc.id), 0.0)
             if ev > EPS:
                 rid = int(alloc.requirement_id)

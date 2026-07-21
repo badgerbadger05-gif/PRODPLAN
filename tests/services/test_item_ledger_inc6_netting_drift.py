@@ -4,10 +4,14 @@ substrate, gated by STOCK_SOURCE=bin.
 Three atomic parts flip on the SAME flag as Inc5:
   (а) drift shrink — actual consumption READ from the SLE (Σ issue-kind qty<0
       since the freeze anchor), the frozen-norm model + W=48h window REMOVED;
-  (б) effective_net = uncovered(consume) + Σ supplier-pin (alloc − realized) —
-      reconstructs today's net_required from the reservation ledger (Finding A);
-  (г) the evaporation term is REMOVED from compute_stock_drift, since (б) already
-      surfaces a dead supplier pin via uncovered — counted EXACTLY ONCE (Finding D).
+  (б) effective_net = uncovered(consume) + Σ supplier-pin pin_live
+      (alloc − evaporated − realized) — reconstructs today's net_required from the
+      reservation ledger (Finding A) while keeping evaporation single-channel;
+  (г) supplier_order evaporation is EXCLUDED from compute_stock_drift (it
+      resurfaces via own_open_coverage in the sizer); WIP-pin evaporation is KEPT
+      (it WAS netted into net_required and is not own_open_coverage). A dead
+      supplier pin thus surfaces EXACTLY ONCE — never as both a drift/effective_net
+      rise AND a coverage loss (corrected Finding D).
 
 DEFAULT (STOCK_SOURCE=legacy / unset) is byte-identical to Inc5 — asserted here
 too (norm model + W window still in force). The whole 1144-test baseline stays
@@ -19,10 +23,13 @@ from datetime import date, datetime
 import pytest
 
 from app import models
+from decimal import Decimal
+
 from app.models import (
     MrpDriftEvent,
     MrpFreezeBaseline,
     ReservationEntry,
+    StockBin,
     StockLedgerEntry,
 )
 from app.services.item_ledger.reservation_ledger import effective_net_bin
@@ -248,11 +255,14 @@ def test_bin_finding_a_supplier_order_keeps_same_closure_threshold(db_session, m
     assert eff == legacy_eff == 10.0
 
 
-def test_bin_finding_d_evaporation_raises_effective_net_exactly_once(db_session, monkeypatch):
-    """(г) Finding D regression: an evaporating supplier pin raises effective_net
-    by the pin qty EXACTLY ONCE. A dead pin lifts uncovered by 4 (6→10) while the
-    supplier term stays 4 (alloc − realized, NOT alloc − evaporated) → 14, i.e.
-    net_required(10) + evaporated(4). NOT 18 (double count)."""
+def test_bin_finding_d_evaporation_stays_single_channel_via_own_coverage(db_session, monkeypatch):
+    """(г) corrected Finding D: an evaporating supplier pin must resurface through
+    EXACTLY ONE channel — own_open_coverage dropping in the sizer — and must NOT
+    also inflate effective_net. A supplier pin is own_open_coverage and is NOT
+    netted into net_required, so a dead pin lifts uncovered by 4 (6→10) while
+    pin_live drops by 4 (alloc − evaporated − realized = 4 − 4 − 0 = 0); the two
+    moves cancel → effective_net stays at the true demand 10, NOT 14 (which would
+    over-order by the dead pin's alloc of 4 = the double count)."""
     monkeypatch.setenv("STOCK_SOURCE", "bin")
     _run, item, req = _purchased_req_with_pool(db_session, "P-PIND", net=10)
     # a CANCELLED (terminal) supplier order that never delivered → evaporates 4
@@ -272,15 +282,144 @@ def test_bin_finding_d_evaporation_raises_effective_net_exactly_once(db_session,
     entry = _consume_entry(db_session, req)
     assert float(entry.uncovered_qty) == 10.0            # uncovered rose by 4
     eff = effective_net_bin(db_session, req)
-    assert eff == 14.0                                   # ONCE: 10 + 4, not 18
+    assert eff == 10.0                                   # single-channel: NOT 14
     # (г): the evaporation was NOT ALSO folded into drift_adjustment under bin
     assert float(req.drift_adjustment_qty) == 0.0
 
 
+def test_bin_finding_d_partial_delivery_then_cancel(db_session, monkeypatch):
+    """(г) partial supplier pin: alloc=4, 1 delivered (realized, now in stock),
+    3 cancelled (evaporated). The 1 delivered counts (on_hand covers 1 → uncovered
+    9); nothing else is incoming (pin_live = max(4 − 3 − 1, 0) = 0). effective_net
+    = 9 + 0 = 9 → proposal 9, NOT 12 (pre-fix: uncovered 9 + (alloc − realized 3) =
+    12, double-counting the dead 3)."""
+    monkeypatch.setenv("STOCK_SOURCE", "bin")
+    _run, item, req = _purchased_req_with_pool(db_session, "P-PINP", net=10)
+    # the 1 delivered unit is now physically on hand
+    db_session.add(StockBin(item_id=item.item_id, warehouse_ref1c="WH", on_hand=Decimal("1")))
+    # partially received (1), remainder cancelled (order terminal) → evaporates 3
+    line = _make_receipt(db_session, item, received=1, quantity=4, state_name="Отменён", order_ref1c="SUP-P")
+    alloc = _make_freeze_alloc(
+        db_session, _run, req, item,
+        source_type="supplier_order", source_ref="SUP-P",
+        source_line_ref=line.item_id_ref, alloc_qty=4, fact_at_freeze=4,
+    )
+    db_session.commit()
+
+    run_ledger_cycle(db_session)
+    db_session.commit()
+
+    db_session.refresh(alloc)
+    assert float(alloc.realized_qty) == 1.0
+    assert float(alloc.evaporated_qty) == 3.0
+    entry = _consume_entry(db_session, req)
+    assert float(entry.uncovered_qty) == 9.0             # on_hand 1 covers 1 of 10
+    # pin_live = max(4 − 3 − 1, 0) = 0 → effective_net = uncovered 9 + 0 = 9 (not 12)
+    assert effective_net_bin(db_session, req) == 9.0
+    assert float(req.drift_adjustment_qty) == 0.0
+
+
+def _legacy_effective_net(db, req):
+    """Legacy closure target = net_required + drift_adjustment (drift folds in the
+    KEPT evaporation channel — WIP pins only, post-fix)."""
+    db.refresh(req)
+    return max(float(req.net_required_qty) + float(req.drift_adjustment_qty), 0.0)
+
+
+def test_legacy_supplier_evaporation_excluded_from_drift_matches_bin(db_session, monkeypatch):
+    """Legacy path (default): a CANCELLED supplier pin no longer folds into
+    drift_adjustment (single-channel — it resurfaces via own_open_coverage in the
+    sizer). So legacy effective_net stays at the true demand 10, IDENTICAL to bin
+    post-cancellation — both were 14 before the fix. This is the legacy-vs-bin
+    equality the fix restores."""
+    monkeypatch.setenv("STOCK_SOURCE", "legacy")
+    _run, item, req = _purchased_req_with_pool(db_session, "P-LEGD", net=10)
+    line = _make_receipt(db_session, item, received=0, quantity=4, state_name="Отменён", order_ref1c="SUP-LD")
+    alloc = _make_freeze_alloc(
+        db_session, _run, req, item,
+        source_type="supplier_order", source_ref="SUP-LD",
+        source_line_ref=line.item_id, alloc_qty=4, fact_at_freeze=4,
+    )
+    db_session.commit()
+
+    run_ledger_cycle(db_session)
+    db_session.commit()
+
+    db_session.refresh(alloc)
+    assert float(alloc.evaporated_qty) == 4.0            # pin died
+    # supplier evaporation excluded from drift → effective_net holds at 10, not 14
+    assert float(req.drift_adjustment_qty) == 0.0
+    assert _legacy_effective_net(db_session, req) == 10.0
+    # legacy == bin post-cancellation (both correct at 10, was 14 in both)
+    monkeypatch.setenv("STOCK_SOURCE", "bin")
+    run_ledger_cycle(db_session)
+    db_session.commit()
+    assert effective_net_bin(db_session, req) == 10.0
+
+
+def test_legacy_wip_evaporation_still_raises_effective_net(db_session, monkeypatch):
+    """WIP-path guard: a WIP pin WAS netted into net_required at freeze and is NOT
+    own_open_coverage, so its evaporation MUST still resurface via drift/
+    effective_net. The fix filters ONLY supplier_order pins out of the drift
+    evaporation term — WIP evaporation is KEPT: drift_adjustment == evaporated,
+    effective_net = net_required + evaporated (10 + 4 = 14)."""
+    monkeypatch.setenv("STOCK_SOURCE", "legacy")
+    _run, item, req = _purchased_req_with_pool(db_session, "P-LWIP", net=10)
+    # a WIP pin covering 4 whose product line is gone → terminal → evaporates 4
+    alloc = _make_freeze_alloc(
+        db_session, _run, req, item,
+        source_type="wip_order", source_ref="WIP-L",
+        source_line_ref="987654", alloc_qty=4, fact_at_freeze=4,
+    )
+    db_session.commit()
+
+    run_ledger_cycle(db_session)
+    db_session.commit()
+
+    db_session.refresh(alloc)
+    assert float(alloc.evaporated_qty) == 4.0            # WIP pin died
+    # WIP evaporation is KEPT in drift → effective_net rises by the evaporated qty
+    assert float(req.drift_adjustment_qty) == 4.0
+    assert _legacy_effective_net(db_session, req) == 14.0
+
+
+def test_legacy_partial_supplier_evaporation_excluded_from_drift(db_session, monkeypatch):
+    """Legacy partial: alloc=4, realized 1, evaporated 3. Post-fix the supplier
+    evaporation (3) is EXCLUDED from drift → drift_adjustment 0, so legacy
+    effective_net = net_required (10) with NO evaporation inflation. (Pre-fix it
+    folded the 3 → drift 3 → effective_net 13, the double count.)
+
+    Parity note: legacy ``net_required`` is frozen and does not see the 1 now in
+    stock, so this isolated test reads 10; in a real cycle net_required is
+    recomputed to 9 (stock nets the delivery), matching bin's live uncovered=9 →
+    both paths propose 9. The FIX's contribution — removing the evaporation
+    double-count — is what is asserted here (13 → 10)."""
+    monkeypatch.setenv("STOCK_SOURCE", "legacy")
+    _run, item, req = _purchased_req_with_pool(db_session, "P-LEGP", net=10)
+    line = _make_receipt(db_session, item, received=1, quantity=4, state_name="Отменён", order_ref1c="SUP-LP")
+    alloc = _make_freeze_alloc(
+        db_session, _run, req, item,
+        source_type="supplier_order", source_ref="SUP-LP",
+        source_line_ref=line.item_id, alloc_qty=4, fact_at_freeze=4,
+    )
+    db_session.commit()
+
+    run_ledger_cycle(db_session)
+    db_session.commit()
+
+    db_session.refresh(alloc)
+    assert float(alloc.realized_qty) == 1.0
+    assert float(alloc.evaporated_qty) == 3.0
+    # supplier evaporation excluded → NO drift inflation (pre-fix would be 3)
+    assert float(req.drift_adjustment_qty) == 0.0
+    assert _legacy_effective_net(db_session, req) == 10.0
+
+
 def test_bin_evaporation_removed_from_drift_under_bin(db_session, monkeypatch):
     """(г) bin: compute_stock_drift no longer folds evaporation into
-    drift_adjustment (that channel now lives on uncovered). Contrast the legacy
-    test_i3_evaporation_terminal_order where drift_adjustment == evaporated."""
+    drift_adjustment (that channel now lives on uncovered/pin_live). Under legacy
+    too, supplier_order evaporation is excluded from drift (single-channel via
+    own_open_coverage) — see test_i3_evaporation_terminal_order."""
     monkeypatch.setenv("STOCK_SOURCE", "bin")
     item = _make_purchased_item(db_session, "E-BIN")
     run = _make_run(db_session, period_from=date(2026, 6, 1), period_to=date(2026, 6, 30), freeze_version=1)

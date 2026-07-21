@@ -28,16 +28,153 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func
 from sqlalchemy.orm import Session
+from pydantic import BaseModel, ConfigDict
 
 from .. import models
 from ..database import get_db
-from ..services.item_ledger.reconcile import ledger_on_hand_by_item
 from ..services.item_ledger.reservation_ledger import item_ledger_position
 from ..services.mrp_freeze import pool_key_for
 
 router = APIRouter(prefix="/v1/item-ledger", tags=["item-ledger"])
 
 EPS = 1e-9
+
+
+class ItemLedgerPositionWarehouse(BaseModel):
+    warehouse_ref1c: str
+    warehouse_name: str
+    qty: float
+    qty_negative: bool
+
+
+class ItemLedgerPositionFlags(BaseModel):
+    on_hand_negative: bool
+    has_uncovered: bool
+    reconcile_pending: bool
+
+
+class ItemLedgerPositionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    item_id: int
+    item_code: str
+    item_name: str
+    pool_key: str
+    on_hand: float
+    on_hand_by_warehouse: List[ItemLedgerPositionWarehouse]
+    incoming_supplier: float
+    incoming_wip: float
+    incoming: float
+    reserved_soft: float
+    available: float
+    projected: float
+    uncovered: float
+    flags: ItemLedgerPositionFlags
+
+
+class ItemLedgerMovement(BaseModel):
+    id: int
+    posting_at: Optional[str]
+    warehouse_ref1c: str
+    warehouse_name: str
+    qty: float
+    qty_after: float
+    movement_kind: str
+    record_type: str
+    recorder_type: str
+    recorder_ref: str
+    line_no: str
+    ingest_source: str
+    characteristic_ref: str
+    organization_ref: str
+
+
+class ItemLedgerMovementsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    total: int
+    limit: int
+    offset: int
+    rows: List[ItemLedgerMovement]
+
+
+class ItemLedgerReservationPriority(BaseModel):
+    period_from: Optional[str]
+    period_to: Optional[str]
+
+
+class ItemLedgerReservationCovered(BaseModel):
+    on_hand: float
+    incoming_supplier: float
+    incoming_wip: float
+
+
+class ItemLedgerReservationRow(BaseModel):
+    reservation_id: int
+    run_id: Optional[int]
+    plan_id: Optional[int]
+    plan_name: Optional[str]
+    requirement_id: int
+    realization_mode: str
+    priority: ItemLedgerReservationPriority
+    reserved_qty: float
+    realized_qty: float
+    outstanding: float
+    covered: ItemLedgerReservationCovered
+    uncovered_qty: float
+    lifecycle_status: str
+    coverage_state: str
+
+
+class ItemLedgerReservationsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rows: List[ItemLedgerReservationRow]
+
+
+class ItemLedgerReservationEventRow(BaseModel):
+    id: int
+    event_at: Optional[str]
+    event_kind: str
+    reserved_delta: float
+    realized_delta: float
+    sle_id: Optional[int]
+    fact_ref: str
+    fact_line_ref: str
+    match_rule: str
+    cycle_id: str
+
+
+class ItemLedgerReservationEventsResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reservation_id: int
+    rows: List[ItemLedgerReservationEventRow]
+
+
+class ItemLedgerDriftRow(BaseModel):
+    id: int
+    cycle_id: str
+    kind: str
+    drift_qty: float
+    expected_stock: Optional[float]
+    actual_stock: Optional[float]
+    at: Optional[str]
+    cause: Optional[str]
+    adjustment_sle_id: Optional[int]
+    matured: bool
+    first_seen_cycle_id: Optional[str]
+    requirement_id: Optional[int]
+    details: Optional[Any]
+
+
+class ItemLedgerDriftResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    total: int
+    limit: int
+    offset: int
+    rows: List[ItemLedgerDriftRow]
 
 
 # ---------------------------------------------------------------------------
@@ -100,8 +237,8 @@ def _in_contour(ref: str, selected, finished_goods, ignored, has_settings) -> bo
 # ---------------------------------------------------------------------------
 # §1 — position (card header / summary)
 # ---------------------------------------------------------------------------
-@router.get("/{item_id}/position")
-def get_position(item_id: int, db: Session = Depends(get_db)) -> Dict[str, Any]:
+@router.get("/{item_id}/position", response_model=ItemLedgerPositionResponse)
+def get_position(item_id: int, db: Session = Depends(get_db)) -> ItemLedgerPositionResponse:
     """The §1 pool projection for one item — the ledger's own view (read the
     ledger tables directly, never gated by STOCK_SOURCE). on_hand / available /
     projected / uncovered follow the §2.5 formulas; ``available`` and
@@ -172,7 +309,7 @@ def get_position(item_id: int, db: Session = Depends(get_db)) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 # §2 — movements (physical ledger tape)
 # ---------------------------------------------------------------------------
-@router.get("/{item_id}/movements")
+@router.get("/{item_id}/movements", response_model=ItemLedgerMovementsResponse)
 def get_movements(
     item_id: int,
     date_from: Optional[date] = Query(None),
@@ -181,7 +318,7 @@ def get_movements(
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
-) -> Dict[str, Any]:
+) -> ItemLedgerMovementsResponse:
     """§2 — the signed physical movement tape (active StockLedgerEntry rows),
     sorted ``(posting_at, id)``, paginated (total + rows). ``qty_after`` is the
     running balance the ledger carried — "how it computed"."""
@@ -237,13 +374,13 @@ def get_movements(
 # ---------------------------------------------------------------------------
 # §3 — reservations (soft reservation tape)
 # ---------------------------------------------------------------------------
-@router.get("/{item_id}/reservations")
+@router.get("/{item_id}/reservations", response_model=ItemLedgerReservationsResponse)
 def get_reservations(
     item_id: int,
     status: Optional[str] = Query(None, description="lifecycle_status filter"),
     run_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
-) -> Dict[str, Any]:
+) -> ItemLedgerReservationsResponse:
     """§3 — the per-item soft reservation tape: on which runs/plans the item hangs
     in reservations, what covers each and how much is uncovered. ``make`` rows
     contribute 0 to reserved_soft (surfaced separately as production)."""
@@ -307,12 +444,15 @@ def get_reservations(
 # ---------------------------------------------------------------------------
 # §4 — reservation events (provenance journal)
 # ---------------------------------------------------------------------------
-@router.get("/{item_id}/reservations/{reservation_id}/events")
+@router.get(
+    "/{item_id}/reservations/{reservation_id}/events",
+    response_model=ItemLedgerReservationEventsResponse,
+)
 def get_reservation_events(
     item_id: int,
     reservation_id: int,
     db: Session = Depends(get_db),
-) -> Dict[str, Any]:
+) -> ItemLedgerReservationEventsResponse:
     """§4 — the append-only journal of one reservation (open/amend/realize/…).
     ``sle_id`` links an event to the physical movement that closed it — the debug
     thread. 404 unless the reservation belongs to the item."""
@@ -366,13 +506,13 @@ _CAUSE_BY_KIND = {
 }
 
 
-@router.get("/{item_id}/drift")
+@router.get("/{item_id}/drift", response_model=ItemLedgerDriftResponse)
 def get_drift(
     item_id: int,
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
-) -> Dict[str, Any]:
+) -> ItemLedgerDriftResponse:
     """§5 — MrpDriftEvent rows for the item (where reality diverged from plan).
     ``cause`` is derived from ``kind`` and ``adjustment_sle_id`` is not tracked on
     the drift row (returned null); ``details`` carries the raw provenance."""

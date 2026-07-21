@@ -868,23 +868,31 @@ def run_reservation_shadow(db: Session, scope, cycle_id: str) -> Dict[str, Any]:
 def effective_net_bin(db: Session, req: "models.MrpRequirement") -> Optional[float]:
     """Inc6 (б) — effective_net derived from the reservation ledger (design §3/§3.1).
 
-    ``effective_net(r) = uncovered(consume) + Σ (supplier pin alloc_qty − realized_qty)``
+    ``effective_net(r) = uncovered(consume) + Σ pin_live``
+    where ``pin_live = max(alloc_qty − evaporated_qty − realized_qty, 0)`` (design
+    §11 "живых supplier-пинов").
 
     The supplier term reconstructs today's ``net_required`` from ``uncovered``:
     ``net_required`` historically INCLUDES the quantity an existing supplier order
     already covers, whereas ``uncovered`` EXCLUDES it (design §3 counter-example,
-    review Finding A). Adding back the still-outstanding frozen supplier
-    commitment (``alloc − realized``) makes the closure threshold identical to
-    legacy ``net_required`` at freeze — WITH or WITHOUT a supplier pin.
+    review Finding A). Adding back the still-live frozen supplier commitment
+    (``pin_live``) makes the closure threshold identical to legacy ``net_required``
+    at freeze — WITH or WITHOUT a supplier pin (evap=0 ⇒ pin_live=alloc−realized).
 
-    Finding D (single-source evaporation): a dead supplier pin raises
-    ``evaporated_qty`` → ``uncovered`` rises by that amount (redistribute drops
-    its coverage), while the supplier term (``alloc − realized``, NOT
-    ``alloc − evaporated − realized``) is UNCHANGED — so effective_net rises by
-    the evaporated qty EXACTLY ONCE. Subtracting evaporation here (pin_live) would
-    cancel the uncovered rise and lose the signal; that is why the term excludes
-    evaporation. Its atomic partner is the removal of the evaporation term from
-    ``compute_stock_drift`` under bin (Finding D — otherwise it would count twice).
+    Single-channel evaporation (corrected Finding D): a supplier pin is
+    ``own_open_coverage`` in the sizer (via ``own_exported_outstanding``) and is
+    NOT netted into ``net_required``, so its evaporation MUST resurface through
+    exactly ONE channel — ``own_open_coverage`` dropping — and must NOT also
+    inflate ``effective_net``. A dead pin raises ``evaporated_qty`` → ``uncovered``
+    rises by that amount (redistribute drops its coverage); ``pin_live``
+    simultaneously drops by the SAME amount, so ``effective_net`` stays at the true
+    demand (the two moves cancel) while the sizer's ``own_open_coverage`` falls to
+    0 and sizes the proposal correctly. Using ``alloc − realized`` here (no
+    evaporation term) would count the evaporated qty TWICE — once as an
+    ``effective_net`` rise and once as the coverage loss — over-ordering by the
+    dead pin's alloc. Its atomic partner is the exclusion of ``supplier_order``
+    evaporation from ``compute_stock_drift`` (WIP-pin evaporation, which WAS netted
+    into ``net_required`` and is NOT own_open_coverage, still resurfaces via drift).
 
     Returns ``None`` when the requirement has NO consume reservation (make-only,
     e.g. a finished good) so the caller falls back to the legacy net+drift target.
@@ -910,7 +918,18 @@ def effective_net_bin(db: Session, req: "models.MrpRequirement") -> Optional[flo
         )
         .all()
     ):
-        supplier_term += max(float(p.alloc_qty or 0.0) - float(p.realized_qty or 0.0), 0.0)
+        # pin_live: a live supplier pin still commits alloc − evaporated −
+        # realized. Excluding evaporated here (vs alloc − realized) keeps the
+        # evaporation single-channel — it resurfaces via own_open_coverage in the
+        # sizer, NOT via effective_net. At freeze (evap=0) pin_live=alloc−realized
+        # so Finding A is preserved; on cancel pin_live drops to cancel the
+        # uncovered rise, holding effective_net at the true demand.
+        supplier_term += max(
+            float(p.alloc_qty or 0.0)
+            - float(p.evaporated_qty or 0.0)
+            - float(p.realized_qty or 0.0),
+            0.0,
+        )
     return max(uncovered + supplier_term, 0.0)
 
 

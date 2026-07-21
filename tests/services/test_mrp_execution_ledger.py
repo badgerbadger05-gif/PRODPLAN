@@ -563,9 +563,12 @@ def test_i3_realization_with_surplus_execution(db_session):
 
 
 def test_i3_evaporation_terminal_order(db_session):
-    """Cancelled supplier order: realized 10, evaporated 40 → drift_event, and
-    (increment 4) an immediate drift_adjustment of 40 on the requirement — an
-    evaporation is not subject to the maturity window W."""
+    """Cancelled supplier order: realized 10, evaporated 40 → drift_event is still
+    written (the audit signal), but a supplier_order pin's evaporation is NO LONGER
+    folded into drift_adjustment (single-channel — it resurfaces via
+    own_open_coverage in the sizer; folding it here too over-orders by the dead
+    pin's alloc). So drift_adjustment == 0, while the matured evaporation event
+    still records 40."""
     item = _make_purchased_item(db_session, "E-1")
     run = _make_run(db_session, period_from=date(2026, 6, 1), period_to=date(2026, 6, 30), freeze_version=1)
     req = _make_req(db_session, run, item, net=100)
@@ -588,7 +591,8 @@ def test_i3_evaporation_terminal_order(db_session):
     assert float(alloc.realized_qty) == 10.0
     assert float(alloc.evaporated_qty) == 40.0
     assert float(req.executed_qty) == 0.0
-    assert float(req.drift_adjustment_qty) == 40.0
+    # supplier_order evaporation is single-channel (own_open_coverage), NOT drift
+    assert float(req.drift_adjustment_qty) == 0.0
     events = (
         db_session.query(MrpDriftEvent)
         .filter(MrpDriftEvent.kind == "evaporation")

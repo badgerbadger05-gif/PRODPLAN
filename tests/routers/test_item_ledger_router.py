@@ -19,7 +19,14 @@ from sqlalchemy.pool import StaticPool
 
 from app import models
 from app.database import Base, get_db
-from app.routers.item_ledger import router
+from app.routers.item_ledger import (
+    ItemLedgerDriftResponse,
+    ItemLedgerMovementsResponse,
+    ItemLedgerPositionResponse,
+    ItemLedgerReservationEventsResponse,
+    ItemLedgerReservationsResponse,
+    router,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +71,20 @@ def _item(db, code, method="Производство"):
     db.add(it)
     db.flush()
     return it
+
+
+def test_openapi_exposes_strict_response_models(client):
+    schema = client.app.openapi()
+    expected = {
+        "/api/v1/item-ledger/{item_id}/position": "ItemLedgerPositionResponse",
+        "/api/v1/item-ledger/{item_id}/movements": "ItemLedgerMovementsResponse",
+        "/api/v1/item-ledger/{item_id}/reservations": "ItemLedgerReservationsResponse",
+        "/api/v1/item-ledger/{item_id}/reservations/{reservation_id}/events": "ItemLedgerReservationEventsResponse",
+        "/api/v1/item-ledger/{item_id}/drift": "ItemLedgerDriftResponse",
+    }
+    for path, model in expected.items():
+        response_schema = schema["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+        assert response_schema == {"$ref": f"#/components/schemas/{model}"}
 
 
 def _wh(db, ref, name, *, selected=True, finished_goods=False, ignored=False):
@@ -176,6 +197,7 @@ def test_position_math_and_shape(client, seeded):
     r = client.get(f"/api/v1/item-ledger/{seeded['a']}/position")
     assert r.status_code == 200
     d = r.json()
+    ItemLedgerPositionResponse.model_validate(d)
     assert d["item_id"] == seeded["a"]
     assert d["item_code"] == "00000063"
     assert d["pool_key"] == f"{seeded['a']}::default"
@@ -201,6 +223,7 @@ def test_position_unknown_item_404(client, seeded):
 # ---------------------------------------------------------------------------
 def test_movements_sorted_and_scoped(client, seeded):
     d = client.get(f"/api/v1/item-ledger/{seeded['a']}/movements").json()
+    ItemLedgerMovementsResponse.model_validate(d)
     assert d["total"] == 3  # item B's row excluded
     ats = [row["posting_at"] for row in d["rows"]]
     assert ats == sorted(ats)  # (posting_at, id) ascending
@@ -214,13 +237,16 @@ def test_movements_sorted_and_scoped(client, seeded):
 
 def test_movements_pagination(client, seeded):
     d = client.get(f"/api/v1/item-ledger/{seeded['a']}/movements?limit=2&offset=0").json()
+    ItemLedgerMovementsResponse.model_validate(d)
     assert d["total"] == 3 and len(d["rows"]) == 2
     d2 = client.get(f"/api/v1/item-ledger/{seeded['a']}/movements?limit=2&offset=2").json()
+    ItemLedgerMovementsResponse.model_validate(d2)
     assert d2["total"] == 3 and len(d2["rows"]) == 1
 
 
 def test_movements_warehouse_filter(client, seeded):
     d = client.get(f"/api/v1/item-ledger/{seeded['a']}/movements?warehouse_ref1c=W2").json()
+    ItemLedgerMovementsResponse.model_validate(d)
     assert d["total"] == 1
     assert d["rows"][0]["warehouse_ref1c"] == "W2"
     assert d["rows"][0]["ingest_source"] == "balance_reconcile"
@@ -230,6 +256,7 @@ def test_movements_date_filter(client, seeded):
     d = client.get(
         f"/api/v1/item-ledger/{seeded['a']}/movements?date_from=2026-07-21&date_to=2026-07-21"
     ).json()
+    ItemLedgerMovementsResponse.model_validate(d)
     assert d["total"] == 1
     assert d["rows"][0]["recorder_ref"] == "rec-2"
 
@@ -243,6 +270,7 @@ def test_movements_unknown_item_404(client, seeded):
 # ---------------------------------------------------------------------------
 def test_reservations_shape_and_coverage(client, seeded):
     d = client.get(f"/api/v1/item-ledger/{seeded['a']}/reservations").json()
+    ItemLedgerReservationsResponse.model_validate(d)
     assert len(d["rows"]) == 3  # 2 consume + 1 make
     by_req = {row["requirement_id"]: row for row in d["rows"]}
     r1 = by_req[55831]
@@ -261,10 +289,13 @@ def test_reservations_shape_and_coverage(client, seeded):
 
 def test_reservations_status_and_run_filters(client, seeded):
     d = client.get(f"/api/v1/item-ledger/{seeded['a']}/reservations?status=active").json()
+    ItemLedgerReservationsResponse.model_validate(d)
     assert len(d["rows"]) == 3
     d0 = client.get(f"/api/v1/item-ledger/{seeded['a']}/reservations?status=closed").json()
+    ItemLedgerReservationsResponse.model_validate(d0)
     assert d0["rows"] == []
     dr = client.get(f"/api/v1/item-ledger/{seeded['a']}/reservations?run_id=999").json()
+    ItemLedgerReservationsResponse.model_validate(dr)
     assert dr["rows"] == []
 
 
@@ -279,6 +310,7 @@ def test_events_thread(client, seeded):
     d = client.get(
         f"/api/v1/item-ledger/{seeded['a']}/reservations/{seeded['r1']}/events"
     ).json()
+    ItemLedgerReservationEventsResponse.model_validate(d)
     kinds = [e["event_kind"] for e in d["rows"]]
     assert kinds == ["open", "realize"]
     realize = d["rows"][1]
@@ -306,6 +338,7 @@ def test_events_unknown_reservation_404(client, seeded):
 # ---------------------------------------------------------------------------
 def test_drift_rows(client, seeded):
     d = client.get(f"/api/v1/item-ledger/{seeded['a']}/drift").json()
+    ItemLedgerDriftResponse.model_validate(d)
     assert d["total"] == 1
     row = d["rows"][0]
     assert row["kind"] == "evaporation"
@@ -319,6 +352,7 @@ def test_drift_rows(client, seeded):
 
 def test_drift_empty_for_other_item(client, seeded):
     d = client.get(f"/api/v1/item-ledger/{seeded['b']}/drift").json()
+    ItemLedgerDriftResponse.model_validate(d)
     assert d["total"] == 0 and d["rows"] == []
 
 
