@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -51,6 +51,12 @@ const approvedList: DbrProgram = { ...approved, id: 12, title: 'Августов
 
 function renderPage() {
   return render(<MemoryRouter><DbrProgramsPage /></MemoryRouter>)
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise })
+  return { promise, resolve }
 }
 
 describe('DbrProgramsPage characterization', () => {
@@ -123,6 +129,24 @@ describe('DbrProgramsPage characterization', () => {
     expect(listDbrPrograms).toHaveBeenCalledTimes(2)
   })
 
+  it('keeps the first new row date aligned with period start until that date is edited', async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findByText('Июльский план')
+    const section = screen.getByRole('heading', { name: 'Новая программа' }).closest('section')
+    if (!section) throw new Error('new program section not found')
+    const dates = section.querySelectorAll<HTMLInputElement>('input[type="date"]')
+
+    fireEvent.change(screen.getByLabelText('Период с'), { target: { value: '2026-08-01' } })
+    expect(dates[2]).toHaveValue('2026-08-01')
+
+    fireEvent.change(dates[2], { target: { value: '2026-08-03' } })
+    fireEvent.change(screen.getByLabelText('Период с'), { target: { value: '2026-08-02' } })
+    expect(dates[2]).toHaveValue('2026-08-03')
+    await user.click(screen.getByRole('button', { name: 'Добавить строку' }))
+    expect(section.querySelectorAll<HTMLInputElement>('input[type="date"]')[3]).toHaveValue('2026-08-02')
+  })
+
   it('updates draft items and refreshes the list', async () => {
     const user = userEvent.setup()
     renderPage()
@@ -178,6 +202,43 @@ describe('DbrProgramsPage characterization', () => {
     expect(await screen.findByText('approve rejected')).toBeInTheDocument()
   })
 
-  it.todo('keeps the newest program detail when an older open request resolves last')
-  it.todo('allows only one create, update, or approve mutation while a command is pending')
+  it('keeps the newest program detail when an older open request resolves last', async () => {
+    const oldDetail = deferred<DbrProgram>()
+    const newDetail = deferred<DbrProgram>()
+    vi.mocked(getDbrProgram)
+      .mockReturnValueOnce(oldDetail.promise)
+      .mockReturnValueOnce(newDetail.promise)
+    renderPage()
+    await screen.findByText('Июльский план')
+
+    fireEvent.click(screen.getByText('Июльский план'))
+    fireEvent.click(screen.getByText('Августовский план'))
+    await act(async () => { newDetail.resolve(approvedList) })
+    expect(await screen.findByRole('heading', { name: 'Программа №12: Августовский план' })).toBeInTheDocument()
+
+    await act(async () => { oldDetail.resolve(draft) })
+    await waitFor(() => expect(screen.getByRole('heading', { name: 'Программа №12: Августовский план' })).toBeInTheDocument())
+    expect(screen.queryByRole('heading', { name: 'Программа №11: Июльский план' })).not.toBeInTheDocument()
+  })
+
+  it('allows only one mutation while competing program commands are fired together', async () => {
+    const pending = deferred<DbrProgram>()
+    vi.mocked(approveDbrProgram).mockReturnValueOnce(pending.promise)
+    renderPage()
+    const title = await screen.findByText('Июльский план')
+    const row = title.closest('tr')
+    if (!row) throw new Error('program row not found')
+    const approveButton = within(row).getByRole('button', { name: 'Утвердить' })
+
+    act(() => {
+      fireEvent.click(approveButton)
+      fireEvent.click(approveButton)
+      fireEvent.click(screen.getByRole('button', { name: 'Создать программу' }))
+    })
+
+    expect(approveDbrProgram).toHaveBeenCalledOnce()
+    expect(createDbrProgram).not.toHaveBeenCalled()
+    await act(async () => { pending.resolve(approved) })
+    expect(await screen.findByText('Программа №11 утверждена')).toBeInTheDocument()
+  })
 })

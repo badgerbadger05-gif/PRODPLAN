@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { DbrProgram, DbrProgramItemIn } from '../../domain/dbr'
 import { dateRu, isoToday, qty, shiftIsoDate } from '../../lib/format'
 import {
@@ -18,6 +18,7 @@ type DraftRow = {
   key: string
   item: PickedItem | null
   program_date: string
+  dateEdited: boolean
   qty: string
   comment: string
 }
@@ -25,7 +26,7 @@ type DraftRow = {
 let rowSeq = 0
 function newRow(dateDefault: string): DraftRow {
   rowSeq += 1
-  return { key: `r${rowSeq}`, item: null, program_date: dateDefault, qty: '', comment: '' }
+  return { key: `r${rowSeq}`, item: null, program_date: dateDefault, dateEdited: false, qty: '', comment: '' }
 }
 
 function statusLabel(status: string) {
@@ -43,6 +44,7 @@ function programRows(program: DbrProgram): DraftRow[] {
       item_name: row.item_name || row.item_code || `ID ${row.item_id}`,
     },
     program_date: row.program_date,
+    dateEdited: true,
     qty: String(row.qty),
     comment: row.comment || '',
   }))
@@ -77,6 +79,8 @@ function validatedItems(rows: DraftRow[], fromDate: string, toDate: string): Dbr
 }
 
 export function DbrProgramsPage() {
+  const detailRequestSeq = useRef(0)
+  const mutationLocked = useRef(false)
   const [programs, setPrograms] = useState<DbrProgram[]>([])
   const [selected, setSelected] = useState<DbrProgram | null>(null)
   const [editRows, setEditRows] = useState<DraftRow[]>([])
@@ -109,13 +113,16 @@ export function DbrProgramsPage() {
   }, [load])
 
   async function openProgram(id: number) {
+    const requestSeq = ++detailRequestSeq.current
     setError('')
     setMessage('')
     try {
       const program = await getDbrProgram(id)
+      if (requestSeq !== detailRequestSeq.current) return
       setSelected(program)
       setEditRows(programRows(program))
     } catch (e) {
+      if (requestSeq !== detailRequestSeq.current) return
       setError(e instanceof Error ? e.message : String(e))
     }
   }
@@ -140,6 +147,8 @@ export function DbrProgramsPage() {
       setError(e instanceof Error ? e.message : String(e))
       return
     }
+    if (mutationLocked.current) return
+    mutationLocked.current = true
     setSaving(true)
     setError('')
     setMessage('')
@@ -160,11 +169,14 @@ export function DbrProgramsPage() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
+      mutationLocked.current = false
       setSaving(false)
     }
   }
 
   async function approve(id: number) {
+    if (mutationLocked.current) return
+    mutationLocked.current = true
     setSaving(true)
     setError('')
     setMessage('')
@@ -177,6 +189,7 @@ export function DbrProgramsPage() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
+      mutationLocked.current = false
       setSaving(false)
     }
   }
@@ -194,6 +207,8 @@ export function DbrProgramsPage() {
       setError(e instanceof Error ? e.message : String(e))
       return
     }
+    if (mutationLocked.current) return
+    mutationLocked.current = true
     setSaving(true)
     setError('')
     setMessage('')
@@ -206,6 +221,7 @@ export function DbrProgramsPage() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
+      mutationLocked.current = false
       setSaving(false)
     }
   }
@@ -251,7 +267,17 @@ export function DbrProgramsPage() {
             <div className="dbrProgramHead">
               <label className="dbrField">
                 <span>Период с</span>
-                <input type="date" value={fromDate} onChange={(e) => setFromDate(e.target.value)} />
+                <input
+                  type="date"
+                  value={fromDate}
+                  onChange={(e) => {
+                    const nextDate = e.target.value
+                    setFromDate(nextDate)
+                    setRows((prev) => prev.map((row, index) => (
+                      index === 0 && !row.dateEdited ? { ...row, program_date: nextDate } : row
+                    )))
+                  }}
+                />
               </label>
               <label className="dbrField">
                 <span>Период по</span>
@@ -287,7 +313,7 @@ export function DbrProgramsPage() {
                       <input
                         type="date"
                         value={row.program_date}
-                        onChange={(e) => patchRow(row.key, { program_date: e.target.value })}
+                        onChange={(e) => patchRow(row.key, { program_date: e.target.value, dateEdited: true })}
                       />
                     </td>
                     <td className="numCell">
