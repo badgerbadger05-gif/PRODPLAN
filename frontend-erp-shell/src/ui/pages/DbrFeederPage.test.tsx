@@ -34,6 +34,9 @@ vi.mock('../../services/dbr', () => ({
   getDbrFeederSignal: vi.fn(),
   getDbrProcessingBoard: vi.fn(),
   getDbrSettings: vi.fn(),
+  isDbrConflict: (error: unknown) => (
+    typeof error === 'object' && error !== null && 'status' in error && error.status === 409
+  ),
   launchDbrPurchase: vi.fn(),
   launchDbrSignal: vi.fn(),
   listDbrFeederPositions: vi.fn(),
