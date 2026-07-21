@@ -337,4 +337,44 @@ describe('DbrPurchasePage characterization', () => {
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
     expect(opener).toHaveFocus()
   })
+
+  it('exposes the purchase table and sortable columns to keyboard users', async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await calculate(user)
+
+    const table = screen.getByRole('table', { name: 'План закупки по чистой потребности' })
+    const deadline = within(table).getByRole('columnheader', { name: 'Заказать до' })
+    const quantity = within(table).getByRole('columnheader', { name: 'Заказать' })
+    expect(deadline).toHaveAttribute('aria-sort', 'ascending')
+    expect(quantity).toHaveAttribute('aria-sort', 'none')
+
+    quantity.focus()
+    await user.keyboard('{Enter}')
+    expect(quantity).toHaveAttribute('aria-sort', 'descending')
+    expect(within(table).getAllByRole('row')[1]).toHaveTextContent('ITEM-1')
+
+    deadline.focus()
+    await user.keyboard(' ')
+    expect(deadline).toHaveAttribute('aria-sort', 'ascending')
+  })
+
+  it('announces loading and request failures without moving focus', async () => {
+    const user = userEvent.setup()
+    const pending = deferred<DbrPurchasePlanPreview>()
+    vi.mocked(previewDbrPurchasePlan).mockReset().mockReturnValue(pending.promise)
+    renderPage()
+    const calculateButton = screen.getByRole('button', { name: 'Рассчитать' })
+
+    await user.click(calculateButton)
+    expect(screen.getByRole('status')).toHaveTextContent('Загрузка плана закупки')
+    expect(calculateButton).toHaveFocus()
+    pending.resolve(activePreview)
+    expect(await screen.findByText('ITEM-1')).toBeVisible()
+
+    vi.mocked(previewDbrPurchasePlan).mockRejectedValueOnce(new Error('Сервис расчёта недоступен'))
+    await user.click(calculateButton)
+    expect(await screen.findByRole('alert')).toHaveTextContent('Сервис расчёта недоступен')
+    expect(calculateButton).toHaveFocus()
+  })
 })

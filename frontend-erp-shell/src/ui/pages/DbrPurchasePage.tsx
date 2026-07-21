@@ -1,3 +1,4 @@
+import type { KeyboardEvent } from 'react'
 import { dateRu, qty } from '../../lib/format'
 import { DbrConfirmDialog } from '../dbr/DbrConfirmDialog'
 import { DbrNav } from '../dbr/DbrNav'
@@ -5,6 +6,7 @@ import { DbrPurchaseResultBody } from '../dbr/DbrPurchaseResultBody'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
 import {
+  type DbrPurchaseSortKey,
   purchaseRowClass,
   purchaseSortableClass,
 } from './dbr-purchase/model'
@@ -17,6 +19,20 @@ export function DbrPurchasePage() {
     flow, flowBusy, flowError, rows, toOrderCount, withinHorizon,
     loadPreview, startMaterialize, confirmMaterialize, closeFlow,
   } = useDbrPurchaseController()
+
+  function handleSortKeyDown(
+    event: KeyboardEvent<HTMLTableCellElement>,
+    key: DbrPurchaseSortKey,
+  ) {
+    if (event.key !== 'Enter' && event.key !== ' ') return
+    event.preventDefault()
+    setSort(key)
+  }
+
+  function ariaSort(key: DbrPurchaseSortKey): 'ascending' | 'descending' | 'none' {
+    if (sort !== key) return 'none'
+    return key === 'to_order_qty' ? 'descending' : 'ascending'
+  }
 
   return (
     <main className="workArea">
@@ -45,7 +61,7 @@ export function DbrPurchasePage() {
       >
         <DbrNav />
 
-        <div className="commandBar dbrFeederBar">
+        <div className="commandBar dbrFeederBar" role="group" aria-label="Параметры расчёта закупки">
           <label className="inlineControl">
             <span>Источник</span>
             <select value={sourceKey} onChange={(e) => setSourceKey(e.target.value)}>
@@ -83,7 +99,8 @@ export function DbrPurchasePage() {
           </button>
         </div>
 
-        {error && <div className="errorLine">{error}</div>}
+        {loading && <div className="srOnly" role="status">Загрузка плана закупки…</div>}
+        {error && <div className="errorLine" role="alert">{error}</div>}
         <div className="dbrFeederNotice">Расчёт потребности — только чтение. Формирование заказов создаёт документы «Заказ поставщику» в живой 1С и требует подтверждения.</div>
 
         {preview && (
@@ -102,19 +119,20 @@ export function DbrPurchasePage() {
         )}
 
         <div className="dbrFeederTableWrap">
-          <table className="journalTable dbrTable dbrPurchaseTable">
+          <table className="journalTable dbrTable dbrPurchaseTable" aria-busy={loading}>
+            <caption className="srOnly">План закупки по чистой потребности</caption>
             <thead>
               <tr>
-                <th className={purchaseSortableClass(sort, 'item_code')} onClick={() => setSort('item_code')}>Позиция</th>
-                <th className="numCell">Потребность</th>
-                <th className="numCell">Запас</th>
-                <th className="numCell">Открытый заказ</th>
-                <th className="numCell">Доступно</th>
-                <th className={`numCell ${purchaseSortableClass(sort, 'to_order_qty')}`} onClick={() => setSort('to_order_qty')}>Заказать</th>
-                <th className={purchaseSortableClass(sort, 'order_before')} onClick={() => setSort('order_before')}>Заказать до</th>
-                <th>Дата потребности</th>
-                <th>Поставщик</th>
-                <th>В горизонте</th>
+                <th scope="col" tabIndex={0} aria-sort={ariaSort('item_code')} className={purchaseSortableClass(sort, 'item_code')} onClick={() => setSort('item_code')} onKeyDown={(event) => handleSortKeyDown(event, 'item_code')}>Позиция</th>
+                <th scope="col" className="numCell">Потребность</th>
+                <th scope="col" className="numCell">Запас</th>
+                <th scope="col" className="numCell">Открытый заказ</th>
+                <th scope="col" className="numCell">Доступно</th>
+                <th scope="col" tabIndex={0} aria-sort={ariaSort('to_order_qty')} className={`numCell ${purchaseSortableClass(sort, 'to_order_qty')}`} onClick={() => setSort('to_order_qty')} onKeyDown={(event) => handleSortKeyDown(event, 'to_order_qty')}>Заказать</th>
+                <th scope="col" tabIndex={0} aria-sort={ariaSort('order_before')} className={purchaseSortableClass(sort, 'order_before')} onClick={() => setSort('order_before')} onKeyDown={(event) => handleSortKeyDown(event, 'order_before')}>Заказать до</th>
+                <th scope="col">Дата потребности</th>
+                <th scope="col">Поставщик</th>
+                <th scope="col">В горизонте</th>
               </tr>
             </thead>
             <tbody>
