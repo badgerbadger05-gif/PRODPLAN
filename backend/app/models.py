@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DECIMAL, TIMESTAMP, ForeignKey, TEXT, Boolean, DateTime, Date, CheckConstraint, JSON, UniqueConstraint, Index
+from sqlalchemy import Column, Integer, BigInteger, String, DECIMAL, TIMESTAMP, ForeignKey, TEXT, Boolean, DateTime, Date, CheckConstraint, JSON, UniqueConstraint, Index
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func, text
 from sqlalchemy.dialects.postgresql import JSONB
@@ -20,6 +20,12 @@ class CrossPlatformJSON(TypeDecorator):
 @compiles(CrossPlatformJSON, 'postgresql')
 def compile_jsonb(element, compiler, **kw):
     return "JSONB"
+
+
+# BIGSERIAL on Postgres, but SQLite only autoincrements INTEGER PRIMARY KEY —
+# so ledger primary keys resolve to INTEGER under SQLite (test DB) and bigint
+# under Postgres. Used by the item-ledger append-only tables.
+BigIntPK = BigInteger().with_variant(Integer(), "sqlite")
 
 
 class ProductionStage(Base):
@@ -88,6 +94,12 @@ class StockWarehouse(Base):
     warehouse_code = Column(String(50), nullable=True, index=True)
     warehouse_name = Column(String(255), nullable=False)
     is_selected = Column(Boolean, nullable=False, default=True)
+    # Item-ledger §2.5: third warehouse-policy label. A finished-goods warehouse
+    # is a legitimate 1С warehouse whose SLE are mirrored and whose bin is kept,
+    # but the planning pool never sums it (on_hand(P) excludes it) — finished
+    # goods are produced straight onto it, outside the planning contour. Additive
+    # in Inc1: no reader consults it yet (pool exclusion lands with ingest, inc2+).
+    is_finished_goods = Column(Boolean, nullable=False, default=False, server_default="false")
     created_at = Column(TIMESTAMP, default=func.now())
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
 
@@ -1843,3 +1855,307 @@ class MrpDriftEvent(Base):
 
     item = relationship("Item")
     requirement = relationship("MrpRequirement")
+
+
+# ---------------------------------------------------------------------------
+# ITEM-LEDGER (item-центричный двойной леджер) — Increment 1, additive schema.
+#
+# Two append-only ledgers whose fold gives an item's state (design §1–§2):
+#   Ledger-1 (physical movements, mirror of 1С AccumulationRegister): keyed
+#     physically (item, characteristic, organization, warehouse) — stock_ledger_
+#     entry (signed qty + running qty_after), stock_bin (on_hand fold),
+#     stock_recorder_pull (pull idempotency), stock_ledger_anchor (seed/S0).
+#   Ledger-2 (soft reservations, PRODPLAN-owned): keyed by planning pool —
+#     reservation_entry (materialized fold, per requirement×mode),
+#     reservation_event (append-only journal, idempotency_key), reservation_
+#     coverage (frozen pins + floating distribution projection).
+#
+# Inc1 is schema + pure fold/redistribute functions only: NO writer is wired
+# into freeze/cycle/reconcile, and no reader consults these tables — zero
+# behavior change. Pool/key columns are NOT NULL default '' (design §2.2): an
+# empty characteristic/organization is a distinct key value, never a wildcard.
+# ---------------------------------------------------------------------------
+
+
+class StockLedgerEntry(Base):
+    """Ledger-1 append-only physical movement (design §2.1 / stock-doc §2.1).
+    Signed ``qty`` (receipt > 0, expense < 0, base UoM); ``qty_after`` is the
+    running balance projection (R-A). One row per (recorder, line); replacement
+    is by-recorder (delete+reinsert), never UPDATE of an applied row (И5)."""
+
+    __tablename__ = "stock_ledger_entry"
+    __table_args__ = (
+        UniqueConstraint(
+            "recorder_type",
+            "recorder_ref",
+            "line_no",
+            name="ux_stock_ledger_entry_recorder_line",
+        ),
+        Index(
+            "ix_stock_ledger_entry_ledger_key",
+            "item_id",
+            "characteristic_ref",
+            "organization_ref",
+            "warehouse_ref1c",
+            "posting_at",
+        ),
+        Index("ix_stock_ledger_entry_posting_at", "posting_at"),
+        Index("ix_stock_ledger_entry_recorder", "recorder_type", "recorder_ref"),
+    )
+
+    id = Column(BigIntPK, primary_key=True, index=True)
+    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
+    characteristic_ref = Column(String(36), nullable=False, server_default="")
+    organization_ref = Column(String(36), nullable=False, server_default="")
+    warehouse_ref1c = Column(String(36), nullable=False, server_default="")
+    # Signed quantity in base UoM (RecordType Receipt → +, Expense → −).
+    qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    # Running balance after this row within its ledger key (rebuild_running_balance).
+    qty_after = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    posting_at = Column(TIMESTAMP, nullable=False, default=func.now(), server_default=func.now())
+    # RecordType raw ∈ {Receipt, Expense} from 1С (sign source, kept for trace).
+    record_type = Column(String(16), nullable=False, server_default="")
+    # movement_kind ∈ {receipt, expense, assembly_in, assembly_out, transfer_in,
+    # transfer_out, writeoff, adjustment, seed}. Empty = distinct key value.
+    movement_kind = Column(String(32), nullable=False, server_default="")
+    # recorder identity: 1С document type / GUID / LineNumber (string, inc0).
+    recorder_type = Column(String(64), nullable=False, server_default="")
+    recorder_ref = Column(String(64), nullable=False, server_default="")
+    line_no = Column(String(32), nullable=False, server_default="")
+    # ingest_source ∈ {pull, balance_reconcile, seed, adjustment}.
+    ingest_source = Column(String(32), nullable=False, server_default="")
+    active = Column(Boolean, nullable=False, default=True, server_default="true")
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+
+    item = relationship("Item")
+
+
+class StockBin(Base):
+    """Ledger-1 fold cache: on_hand per physical key (design §2.1). on_hand =
+    Σ qty over the key's SLE (= last qty_after). reconcile_pending_qty holds a
+    debounced Balance-vs-ledger delta (written by the reconcile step, inc3)."""
+
+    __tablename__ = "stock_bin"
+    __table_args__ = (
+        UniqueConstraint(
+            "item_id",
+            "characteristic_ref",
+            "organization_ref",
+            "warehouse_ref1c",
+            name="ux_stock_bin_ledger_key",
+        ),
+        Index(
+            "ix_stock_bin_ledger_key",
+            "item_id",
+            "characteristic_ref",
+            "organization_ref",
+            "warehouse_ref1c",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
+    characteristic_ref = Column(String(36), nullable=False, server_default="")
+    organization_ref = Column(String(36), nullable=False, server_default="")
+    warehouse_ref1c = Column(String(36), nullable=False, server_default="")
+    on_hand = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    reconcile_pending_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    last_entry_id = Column(BigInteger, nullable=True)
+    updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now(), server_default=func.now(), nullable=False)
+
+    item = relationship("Item")
+
+
+class StockRecorderPull(Base):
+    """Ledger-1 pull idempotency ledger (design §2.1). One row per 1С recorder
+    already mirrored, so a re-pull of the same document is a no-op (inc2)."""
+
+    __tablename__ = "stock_recorder_pull"
+    __table_args__ = (
+        UniqueConstraint("recorder_type", "recorder_ref", name="ux_stock_recorder_pull_recorder"),
+        Index("ix_stock_recorder_pull_pulled_at", "pulled_at"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    recorder_type = Column(String(64), nullable=False, server_default="")
+    recorder_ref = Column(String(64), nullable=False, server_default="")
+    line_count = Column(Integer, nullable=False, default=0, server_default="0")
+    status = Column(String(20), nullable=False, server_default="pulled")
+    pulled_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+
+
+class StockLedgerAnchor(Base):
+    """Ledger-1 anchor (design §2.1 / stock-doc §5): a per-key seed/S0 point.
+    After the anchor the running balance is authoritative; the anchor records
+    the Balance-derived opening quantity and the period it belongs to."""
+
+    __tablename__ = "stock_ledger_anchor"
+    __table_args__ = (
+        UniqueConstraint(
+            "item_id",
+            "characteristic_ref",
+            "organization_ref",
+            "warehouse_ref1c",
+            "anchor_period",
+            name="ux_stock_ledger_anchor_key_period",
+        ),
+        Index(
+            "ix_stock_ledger_anchor_ledger_key",
+            "item_id",
+            "characteristic_ref",
+            "organization_ref",
+            "warehouse_ref1c",
+        ),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
+    characteristic_ref = Column(String(36), nullable=False, server_default="")
+    organization_ref = Column(String(36), nullable=False, server_default="")
+    warehouse_ref1c = Column(String(36), nullable=False, server_default="")
+    anchor_period = Column(Date, nullable=False)
+    anchor_at = Column(TIMESTAMP, nullable=False, default=func.now(), server_default=func.now())
+    balance_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    # source ∈ {balance_seed, s0_freeze}.
+    source = Column(String(32), nullable=False, server_default="balance_seed")
+    entry_id = Column(BigInteger, nullable=True)
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+
+    item = relationship("Item")
+
+
+class ReservationEntry(Base):
+    """Ledger-2 materialized reservation (design §2.2): one row per requirement
+    × realization_mode. Caches (reserved_qty/realized_qty) are the fold of
+    reservation_event; covered_*/uncovered_qty/coverage_state are the
+    redistribute() projection. reserved_qty is the plan's draw on the pool, NOT
+    the shortfall — shortfall is the derived uncovered_qty."""
+
+    __tablename__ = "reservation_entry"
+    __table_args__ = (
+        UniqueConstraint("requirement_id", "realization_mode", name="ux_reservation_entry_req_mode"),
+        Index(
+            "ix_reservation_entry_pool",
+            "item_id",
+            "characteristic_ref",
+            "organization_ref",
+            "planning_stock_pool",
+            "lifecycle_status",
+        ),
+        Index("ix_reservation_entry_run_version", "run_id", "freeze_version"),
+        Index("ix_reservation_entry_requirement", "requirement_id"),
+    )
+
+    id = Column(BigIntPK, primary_key=True, index=True)
+    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
+    characteristic_ref = Column(String(36), nullable=False, server_default="")
+    organization_ref = Column(String(36), nullable=False, server_default="")
+    planning_stock_pool = Column(String(64), nullable=False, server_default="default")
+    run_id = Column(Integer, ForeignKey("planning_run.run_id", ondelete="CASCADE"), nullable=True, index=True)
+    freeze_version = Column(Integer, nullable=False, server_default="0")
+    requirement_id = Column(Integer, ForeignKey("mrp_requirement.id", ondelete="CASCADE"), nullable=False)
+    priority_period_from = Column(Date, nullable=False)
+    priority_period_to = Column(Date, nullable=False)
+    # realization_mode ∈ {consume, make} — the axis of realization (§3, §6).
+    # consume outstanding drives reserved_soft; make contributes exactly 0.
+    realization_mode = Column(String(10), nullable=False, server_default="consume")
+    reserved_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    realized_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    covered_on_hand_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    covered_incoming_supplier_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    covered_incoming_wip_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    uncovered_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    # lifecycle_status ∈ {active, closed, released, carried, cancelled} (§6.2).
+    lifecycle_status = Column(String(20), nullable=False, server_default="active")
+    # coverage_state ∈ {covered, partial, uncovered} — derived from uncovered_qty.
+    coverage_state = Column(String(20), nullable=False, server_default="uncovered")
+    opened_at = Column(TIMESTAMP, nullable=True)
+    closed_at = Column(TIMESTAMP, nullable=True)
+    updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now(), server_default=func.now(), nullable=False)
+
+    item = relationship("Item")
+    run = relationship("PlanningRun")
+    requirement = relationship("MrpRequirement")
+
+
+class ReservationEvent(Base):
+    """Ledger-2 append-only reservation journal (design §2.3). Fold by
+    reservation gives reserved_qty/realized_qty; fold by item-key gives the
+    pool's reserved_soft. Never UPDATE/DELETE (analogue of И5). idempotency_key
+    makes a re-run non-duplicating."""
+
+    __tablename__ = "reservation_event"
+    __table_args__ = (
+        UniqueConstraint("idempotency_key", name="ux_reservation_event_idempotency"),
+        Index("ix_reservation_event_reservation", "reservation_id"),
+        Index(
+            "ix_reservation_event_pool",
+            "item_id",
+            "characteristic_ref",
+            "organization_ref",
+            "planning_stock_pool",
+        ),
+        Index("ix_reservation_event_sle", "sle_id"),
+    )
+
+    id = Column(BigIntPK, primary_key=True, index=True)
+    reservation_id = Column(BigInteger, ForeignKey("reservation_entry.id", ondelete="CASCADE"), nullable=False)
+    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
+    characteristic_ref = Column(String(36), nullable=False, server_default="")
+    organization_ref = Column(String(36), nullable=False, server_default="")
+    planning_stock_pool = Column(String(64), nullable=False, server_default="default")
+    # event_kind ∈ {open, amend, realize, unrealize, cancel, release,
+    # carry_out, carry_in, close, reopen} (§6.2).
+    event_kind = Column(String(20), nullable=False, server_default="")
+    reserved_delta = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    realized_delta = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    sle_id = Column(BigInteger, ForeignKey("stock_ledger_entry.id", ondelete="SET NULL"), nullable=True)
+    fact_ref = Column(String(64), nullable=False, server_default="")
+    fact_line_ref = Column(String(64), nullable=False, server_default="")
+    # match_rule ∈ {pegged, fifo, manual} (§6.3).
+    match_rule = Column(String(20), nullable=False, server_default="")
+    cycle_id = Column(String(64), nullable=False, server_default="")
+    idempotency_key = Column(String(120), nullable=False)
+    event_at = Column(TIMESTAMP, nullable=False, default=func.now(), server_default=func.now())
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+
+    reservation = relationship("ReservationEntry")
+    item = relationship("Item")
+
+
+class ReservationCoverage(Base):
+    """Ledger-2 coverage projection (design §2.4): who covers a reservation.
+    frozen pins (pin_kind='frozen') carry the immutable freeze allocation (=
+    MrpFreezeAllocation), realized/evaporated rewritten by verify_frozen_supply;
+    floating rows (pin_kind='floating') are (re)written ONLY by redistribute()."""
+
+    __tablename__ = "reservation_coverage"
+    __table_args__ = (
+        UniqueConstraint(
+            "reservation_id",
+            "source_kind",
+            "source_ref",
+            "source_line_ref",
+            "pin_kind",
+            name="ux_reservation_coverage_source",
+        ),
+        Index("ix_reservation_coverage_reservation", "reservation_id"),
+    )
+
+    id = Column(BigIntPK, primary_key=True, index=True)
+    reservation_id = Column(BigInteger, ForeignKey("reservation_entry.id", ondelete="CASCADE"), nullable=False)
+    # source_kind ∈ {on_hand, supplier_order, wip_order}.
+    source_kind = Column(String(20), nullable=False, server_default="")
+    source_ref = Column(String(64), nullable=False, server_default="")
+    source_line_ref = Column(String(64), nullable=False, server_default="")
+    # pin_kind ∈ {frozen, floating}.
+    pin_kind = Column(String(10), nullable=False, server_default="floating")
+    alloc_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    fact_at_freeze = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    covered_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    realized_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    evaporated_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    cycle_id = Column(String(64), nullable=False, server_default="")
+    computed_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+
+    reservation = relationship("ReservationEntry")
