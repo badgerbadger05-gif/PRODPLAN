@@ -693,11 +693,24 @@ def convert_1c_stock_to_records(
         )
         ref_out = _extract_ref_key(ref_out_val)
 
+        # Organization dimension (Balance is taken with Dimensions including
+        # Организация). Surfaced additively so the item-ledger Balance-reconcile
+        # (inc3) can align on the full physical key (item, org, warehouse); a
+        # zero GUID collapses to '' to match the ledger key convention.
+        org_ref = _extract_ref_key(
+            record.get("Организация_Key")
+            or record.get("ОрганизацияRef_Key")
+            or record.get("Организация")
+        )
+        if org_ref == "00000000-0000-0000-0000-000000000000":
+            org_ref = ""
+
         converted.append({
             "code": str(item_code).strip() if item_code else "",
             "name": str(item_name).strip() if item_name else "",
             "qty": qty,
             "ref": ref_out,
+            "organization_ref": org_ref,
             "warehouse_ref": warehouse_ref,
             "warehouse_code": str(warehouse_code).strip() if warehouse_code else "",
             "warehouse_name": str(warehouse_name).strip() if warehouse_name else "",

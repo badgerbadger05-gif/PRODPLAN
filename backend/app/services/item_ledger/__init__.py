@@ -26,6 +26,16 @@ from .ingest import (  # noqa: F401
     process_pending_pulls,
     pull_recorder_movements,
 )
+from .reconcile import (  # noqa: F401
+    RECONCILE_SOURCE,
+    ReconcileEvent,
+    ReconcileResult,
+    build_balance_snapshot,
+    ledger_on_hand_by_item,
+    reconcile_balance_snapshot,
+    run_balance_reconcile_after_sweep,
+    stock_shadow_report,
+)
 from .reservation import (  # noqa: F401
     Coverage,
     IncomingLine,

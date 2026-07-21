@@ -1959,7 +1959,12 @@ class StockBin(Base):
     organization_ref = Column(String(36), nullable=False, server_default="")
     warehouse_ref1c = Column(String(36), nullable=False, server_default="")
     on_hand = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    # Debounced Balance-vs-ledger delta (inc3 §3б step 3): a non-zero value means
+    # a drift was seen last sweep and is awaiting a confirming second sweep.
     reconcile_pending_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    # When this key was last confirmed reconciled against 1С /Balance (|delta|≤EPS
+    # matched, or an adjustment-SLE applied). NULL = never reconciled (inc3).
+    last_reconciled_at = Column(TIMESTAMP, nullable=True)
     last_entry_id = Column(BigInteger, nullable=True)
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now(), server_default=func.now(), nullable=False)
 

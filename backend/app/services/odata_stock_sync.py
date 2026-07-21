@@ -365,6 +365,12 @@ def sync_stock_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                 pass
         return asdict(stats)
 
+    # Full (pre-warehouse-filter) Balance snapshot for the inc3 reconcile
+    # after-step: bins in any known warehouse must reconcile against 1С
+    # regardless of the planning-selection contour, so capture before the
+    # selected-warehouse filter reassigns stock_data below.
+    full_balance_rows = list(stock_data)
+
     # 1) Обновляем справочник складов из ответа 1С
     _upsert_warehouses_from_stock_rows(db, stock_data)
     db.flush()
@@ -527,6 +533,23 @@ def sync_stock_from_odata(db: Session, req: ODataSyncRequest) -> dict:
         stats.unmatched_zeroed = zeroed_count
         stats.items_updated = updated
         stats.items_unchanged = unchanged
+
+        # inc3 after-step (design §3б): Balance-reconcile the ledger bins against
+        # the full snapshot + shadow diagnostics. SHADOW — feeds only the unread
+        # stock_bin/SLE; the ItemWarehouseStock refresh above is untouched (dual
+        # write). Guarded: a reconcile failure must never break the legacy sweep.
+        try:
+            from .item_ledger.reconcile import run_balance_reconcile_after_sweep
+
+            rec = run_balance_reconcile_after_sweep(db, full_balance_rows)
+            print(
+                f"[OData][stock] balance-reconcile: compared={rec.compared} "
+                f"matched={rec.matched} pending={rec.pending} held={rec.held} "
+                f"adjusted={rec.adjusted}",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[OData][stock] balance-reconcile skipped: {e}", flush=True)
 
         if req.dry_run:
             db.rollback()
