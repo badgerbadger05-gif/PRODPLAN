@@ -778,6 +778,16 @@ def export_manufactures_to_1c(
         m_row.exported_ref1c = ref_key
         m_row.exported_at = datetime.now(timezone.utc)
         m_row.export_error = None
+        # Item-ledger inc2 (§3а step 1, §6.1): fire-and-forget enqueue of a
+        # pull-by-document for the just-posted Document_СборкаЗапасов. NEVER let
+        # this raise into the export flow — the reconcile Balance-sweep (inc3) is
+        # the safety net. No OData here: enqueue only writes a 'pending' row.
+        try:
+            from .item_ledger.ingest import enqueue_recorder_pull
+
+            enqueue_recorder_pull(db, MANUFACTURE_ENTITY, ref_key, source="manufacture_export")
+        except Exception as _exc:  # noqa: BLE001
+            print(f"[item-ledger] enqueue pull failed for {MANUFACTURE_ENTITY} {ref_key}: {_exc}")
 
     def _mark_error(entry: ManufactureExportEntry, error: str) -> None:
         m_row = (

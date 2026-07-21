@@ -1980,8 +1980,17 @@ class StockRecorderPull(Base):
     recorder_type = Column(String(64), nullable=False, server_default="")
     recorder_ref = Column(String(64), nullable=False, server_default="")
     line_count = Column(Integer, nullable=False, default=0, server_default="0")
+    # status ∈ {pending, done, empty, error} (inc2). A hook enqueues 'pending';
+    # the puller sets done/empty/error. 'pulled' remains the inc1 legacy default.
     status = Column(String(20), nullable=False, server_default="pulled")
+    # What put the recorder on the queue (e.g. 'manufacture_export',
+    # 'stock_transfer_export', 'reconcile'); diagnostic only.
+    source = Column(String(64), nullable=False, default="", server_default="")
+    # Retry bookkeeping for process_pending_pulls (attempt cap) + last error text.
+    attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    last_error = Column(TEXT, nullable=True)
     pulled_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now(), server_default=func.now(), nullable=False)
 
 
 class StockLedgerAnchor(Base):

@@ -511,6 +511,16 @@ def _mark_issue_exported(
     )
     if state:
         state.issue_status = "exported"
+    # Item-ledger inc2 (§3а step 1, §6.1): fire-and-forget enqueue of a
+    # pull-by-document for the just-posted Document_ПеремещениеЗапасов. NEVER let
+    # this raise into the export flow — the reconcile Balance-sweep (inc3) is the
+    # safety net. No OData here: enqueue only writes a 'pending' row.
+    try:
+        from .item_ledger.ingest import enqueue_recorder_pull
+
+        enqueue_recorder_pull(db, STOCK_TRANSFER_ENTITY, ref_key, source="stock_transfer_export")
+    except Exception as _exc:  # noqa: BLE001
+        print(f"[item-ledger] enqueue pull failed for {STOCK_TRANSFER_ENTITY} {ref_key}: {_exc}")
 
 
 def _mark_issue_error(db: Session, issue_id: int, error: str) -> None:
