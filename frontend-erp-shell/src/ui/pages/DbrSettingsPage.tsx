@@ -3,8 +3,6 @@ import type { ReactNode } from 'react'
 import type {
   DbrAssemblyRate,
   DbrCategoryRisk,
-  DbrSettings,
-  DbrSettingsUpdate,
 } from '../../domain/dbr'
 import type { ProductionResource } from '../../domain/resources'
 import { qty } from '../../lib/format'
@@ -24,32 +22,12 @@ import { DbrNav } from '../dbr/DbrNav'
 import { ItemPicker } from '../dbr/ItemPicker'
 import type { PickedItem } from '../dbr/ItemPicker'
 import { KeyboardShortcutShell, type KeyboardShortcut } from '../platform'
-
-// Local editable copy of the settings singleton. Kept as strings-or-numbers is
-// avoided — everything numeric is normalized to a number on save.
-type SettingsForm = Omit<DbrSettings, 'id'>
-
-function toForm(s: DbrSettings): SettingsForm {
-  return {
-    frozen_days: s.frozen_days,
-    gate_horizon_workdays: s.gate_horizon_workdays,
-    shelf_threshold_qty: Number(s.shelf_threshold_qty ?? 0),
-    rt_machining_days: s.rt_machining_days,
-    rt_welding_days: s.rt_welding_days,
-    rt_painting_days: s.rt_painting_days,
-    batch_days_turning: s.batch_days_turning,
-    batch_days_bending: s.batch_days_bending,
-    batch_days_welding: s.batch_days_welding,
-    batch_days_paint_black: s.batch_days_paint_black,
-    batch_days_paint_color: s.batch_days_paint_color,
-    feeder_chain_enabled: s.feeder_chain_enabled,
-    feeder_load_horizon_weeks: s.feeder_load_horizon_weeks,
-    w2_warehouse_ref1c: s.w2_warehouse_ref1c ?? '',
-    w3_warehouse_ref1c: s.w3_warehouse_ref1c ?? '',
-    w4_warehouse_ref1c: s.w4_warehouse_ref1c ?? '',
-    fastener_categories: s.fastener_categories ?? [],
-  }
-}
+import {
+  normalizeCategoryRiskRows,
+  toSettingsForm,
+  toSettingsUpdate,
+  type SettingsForm,
+} from './dbr-settings/model'
 
 const emptyRateDraft = { resource_id: '', qty_per_capacity: '' }
 
@@ -96,7 +74,7 @@ export function DbrSettingsPage() {
         }
       })
       const [settingsResult, ratesResult, risksResult, resourcesResult] = results
-      if (settingsResult.status === 'fulfilled') setForm(toForm(settingsResult.value))
+      if (settingsResult.status === 'fulfilled') setForm(toSettingsForm(settingsResult.value))
       if (ratesResult.status === 'fulfilled') setRates(ratesResult.value)
       if (risksResult.status === 'fulfilled') setRisks(risksResult.value)
       if (resourcesResult.status === 'fulfilled') setResources(resourcesResult.value)
@@ -141,18 +119,9 @@ export function DbrSettingsPage() {
     if (!form) return
     if (!beginMutation()) return
     try {
-      const payload: DbrSettingsUpdate = {
-        ...form,
-        shelf_threshold_qty: Number(form.shelf_threshold_qty ?? 0),
-        w2_warehouse_ref1c: form.w2_warehouse_ref1c?.trim() || null,
-        w3_warehouse_ref1c: form.w3_warehouse_ref1c?.trim() || null,
-        w4_warehouse_ref1c: form.w4_warehouse_ref1c?.trim() || null,
-        fastener_categories: Array.from(
-          new Set(form.fastener_categories.map((name) => name.trim()).filter(Boolean)),
-        ),
-      }
+      const payload = toSettingsUpdate(form)
       const saved = await updateDbrSettings(payload)
-      setForm(toForm(saved))
+      setForm(toSettingsForm(saved))
       setMessage('Настройки сохранены')
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -215,16 +184,7 @@ export function DbrSettingsPage() {
   async function saveRisks() {
     if (!beginMutation()) return
     try {
-      const rows = risks
-        .map((r) => ({
-          item_group: String(r.item_group ?? '').trim(),
-          receipt_warehouse_ref1c: (r.receipt_warehouse_ref1c ?? '').toString().trim() || null,
-          supply_risk_pct:
-            r.supply_risk_pct === '' || r.supply_risk_pct === null || r.supply_risk_pct === undefined
-              ? null
-              : Number(r.supply_risk_pct),
-        }))
-        .filter((r) => r.item_group)
+      const rows = normalizeCategoryRiskRows(risks)
       const saved = await replaceDbrCategoryRisks(rows)
       setRisks(saved)
       setMessage('Категорийные риски сохранены')
