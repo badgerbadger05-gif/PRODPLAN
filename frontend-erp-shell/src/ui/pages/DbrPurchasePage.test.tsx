@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -130,7 +130,7 @@ async function calculate(user: ReturnType<typeof userEvent.setup>) {
 
 describe('DbrPurchasePage characterization', () => {
   beforeEach(() => {
-    vi.clearAllMocks()
+    vi.resetAllMocks()
     vi.mocked(listDbrPrograms).mockResolvedValue([program])
     vi.mocked(previewDbrPurchasePlan).mockResolvedValue(activePreview)
     vi.mocked(materializeDbrPurchasePlan)
@@ -271,7 +271,70 @@ describe('DbrPurchasePage characterization', () => {
     expect(previewDbrPurchasePlan).toHaveBeenCalledWith({ active: true, thresholdDays: 60 })
   })
 
-  it.todo('keeps the newest calculation when an older preview request resolves last')
-  it.todo('locks confirmation synchronously against duplicate write requests')
-  it.todo('traps focus, restores the opener, and closes the confirmation dialog with Escape')
+  it('keeps the newest calculation when an older preview request resolves last', async () => {
+    const oldRequest = deferred<DbrPurchasePlanPreview>()
+    const newestPreview = {
+      ...activePreview,
+      rows: [{ ...activePreview.rows[0], item_id: 91, item_code: 'LATEST-ITEM' }],
+    }
+    vi.mocked(previewDbrPurchasePlan)
+      .mockReset()
+      .mockReturnValueOnce(oldRequest.promise)
+      .mockResolvedValueOnce(newestPreview)
+    renderPage()
+
+    const calculateButton = screen.getByRole('button', { name: 'Рассчитать' })
+    act(() => {
+      calculateButton.click()
+      calculateButton.click()
+    })
+    expect(await screen.findByText('LATEST-ITEM')).toBeVisible()
+    oldRequest.resolve(activePreview)
+
+    await waitFor(() => expect(screen.queryByText('ITEM-1')).not.toBeInTheDocument())
+    expect(screen.getByText('LATEST-ITEM')).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Рассчитать' })).toBeEnabled()
+  })
+
+  it('locks confirmation synchronously against duplicate write requests', async () => {
+    const user = userEvent.setup()
+    const pending = deferred<DbrPurchaseLaunchResult>()
+    vi.mocked(materializeDbrPurchasePlan)
+      .mockReset()
+      .mockResolvedValueOnce(dryRun)
+      .mockReturnValueOnce(pending.promise)
+    renderPage()
+    await calculate(user)
+    await user.click(screen.getByRole('button', { name: 'Сформировать заказы…' }))
+    const confirm = await screen.findByRole('button', { name: 'Провести в 1С' })
+
+    fireEvent.click(confirm)
+    fireEvent.click(confirm)
+    expect(materializeDbrPurchasePlan).toHaveBeenCalledTimes(2)
+    expect(confirm).toBeDisabled()
+
+    pending.resolve(committed)
+    expect(await screen.findByText(/Документ проведён в живой 1С/)).toBeVisible()
+  })
+
+  it('traps focus, restores the opener, and closes the confirmation dialog with Escape', async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await calculate(user)
+    const opener = screen.getByRole('button', { name: 'Сформировать заказы…' })
+    await user.click(opener)
+    const dialog = await screen.findByRole('dialog')
+    const cancel = within(dialog).getByRole('button', { name: 'Отмена' })
+    const confirm = within(dialog).getByRole('button', { name: 'Провести в 1С' })
+
+    expect(cancel).toHaveFocus()
+    await user.keyboard('{Shift>}{Tab}{/Shift}')
+    expect(confirm).toHaveFocus()
+    await user.keyboard('{Tab}')
+    expect(cancel).toHaveFocus()
+    await user.keyboard('{Escape}')
+
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(opener).toHaveFocus()
+  })
 })

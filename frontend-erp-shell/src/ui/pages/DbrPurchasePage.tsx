@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
   DbrProgram,
   DbrPurchaseLaunchResult,
@@ -45,6 +45,8 @@ export function DbrPurchasePage() {
   } | null>(null)
   const [flowBusy, setFlowBusy] = useState(false)
   const [flowError, setFlowError] = useState('')
+  const previewRequestRef = useRef(0)
+  const confirmBusyRef = useRef(false)
 
   const source: Source = useMemo(
     () => (sourceKey === 'active' ? { kind: 'active' } : { kind: 'program', programId: Number(sourceKey) }),
@@ -60,15 +62,19 @@ export function DbrPurchasePage() {
   }, [])
 
   const loadPreview = useCallback(async () => {
+    const request = ++previewRequestRef.current
     setLoading(true)
     setError('')
     setPreview(null)
     try {
-      setPreview(await previewDbrPurchasePlan(sourceParams(source, thresholdDays)))
+      const nextPreview = await previewDbrPurchasePlan(sourceParams(source, thresholdDays))
+      if (request === previewRequestRef.current) setPreview(nextPreview)
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      if (request === previewRequestRef.current) {
+        setError(e instanceof Error ? e.message : String(e))
+      }
     } finally {
-      setLoading(false)
+      if (request === previewRequestRef.current) setLoading(false)
     }
   }, [source, thresholdDays])
 
@@ -101,6 +107,8 @@ export function DbrPurchasePage() {
   }
 
   async function confirmMaterialize() {
+    if (confirmBusyRef.current) return
+    confirmBusyRef.current = true
     setFlowBusy(true)
     setFlowError('')
     try {
@@ -110,6 +118,7 @@ export function DbrPurchasePage() {
     } catch (e) {
       setFlowError(e instanceof Error ? e.message : String(e))
     } finally {
+      confirmBusyRef.current = false
       setFlowBusy(false)
     }
   }

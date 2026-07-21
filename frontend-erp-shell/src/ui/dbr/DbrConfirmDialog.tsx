@@ -1,4 +1,13 @@
-import type { ReactNode } from 'react'
+import { type ReactNode, useEffect, useRef } from 'react'
+
+const focusableSelector = [
+  'button:not([disabled])',
+  '[href]',
+  'input:not([disabled])',
+  'select:not([disabled])',
+  'textarea:not([disabled])',
+  '[tabindex]:not([tabindex="-1"])',
+].join(',')
 
 // Two-step "preview → confirm" modal shared by every DBR flow that writes to 1С.
 //
@@ -26,6 +35,59 @@ export function DbrConfirmDialog({
   onClose: () => void
   onConfirm: () => void
 }) {
+  const panelRef = useRef<HTMLDivElement>(null)
+  const onCloseRef = useRef(onClose)
+  const busyRef = useRef(busy)
+
+  useEffect(() => {
+    onCloseRef.current = onClose
+    busyRef.current = busy
+  }, [busy, onClose])
+
+  useEffect(() => {
+    const returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    const panel = panelRef.current
+    const firstFocusable = panel?.querySelector<HTMLElement>(focusableSelector)
+    ;(firstFocusable ?? panel)?.focus()
+
+    function onKeyDown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        if (busyRef.current) return
+        event.preventDefault()
+        onCloseRef.current()
+        return
+      }
+      if (event.key !== 'Tab' || !panel) return
+      const focusable = [...panel.querySelectorAll<HTMLElement>(focusableSelector)]
+      if (!focusable.length) {
+        event.preventDefault()
+        panel.focus()
+        return
+      }
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      const active = document.activeElement
+      if (event.shiftKey && (active === first || !panel.contains(active))) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && (active === last || !panel.contains(active))) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('keydown', onKeyDown)
+      returnFocus?.focus()
+    }
+  }, [])
+
+  useEffect(() => {
+    if (busy || document.activeElement !== panelRef.current) return
+    panelRef.current?.querySelector<HTMLElement>(focusableSelector)?.focus()
+  }, [busy])
+
   return (
     <div
       className="dialogOverlay"
@@ -34,7 +96,12 @@ export function DbrConfirmDialog({
       aria-label={title}
       onClick={busy ? undefined : onClose}
     >
-      <div className="dialogBox dbrConfirmBox" onClick={(e) => e.stopPropagation()}>
+      <div
+        ref={panelRef}
+        className="dialogBox dbrConfirmBox"
+        tabIndex={-1}
+        onClick={(e) => e.stopPropagation()}
+      >
         <div className={`dialogHeader${phase === 'done' ? ' dbrDoneHeader' : ''}`}>{title}</div>
         <div className="dialogBody">
           {phase === 'preview' && (
