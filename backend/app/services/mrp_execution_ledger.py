@@ -1363,6 +1363,106 @@ def _materialize_drift_adjustment(scope: LedgerScope, drift: DriftResult) -> int
 
 
 # ---------------------------------------------------------------------------
+# §5 (increment 5) — plan closure by execution
+# ---------------------------------------------------------------------------
+def apply_requirement_closure(db: Session, scope: LedgerScope) -> Dict[str, Any]:
+    """Auto-close every open requirement whose REAL deficit has been executed.
+
+    Runs in the ledger cycle right AFTER ``_materialize_drift_adjustment``, so
+    both ``executed_qty`` and ``drift_adjustment_qty`` are already persistent on
+    the open req. Closure rule per requirement (owner ruling 21.07 — close ONLY
+    on a real, executed deficit)::
+
+        effective_net = max(net_required_qty + drift_adjustment_qty, 0)
+        close ⟺ effective_net > EPS AND executed_qty + EPS >= effective_net
+
+    A requirement closed here had a REAL deficit met by realized production /
+    receipt, so an evaporation cannot resurface it — it is safe to leave the
+    scope. A net=0 requirement (``effective_net <= EPS``) is covered by frozen
+    STOCK, not by execution — that is NOT "executed", so it is NOT closed here.
+    It stays open-but-zero (in scope, visible to drift / evaporation, ordering
+    nothing); it is swept only when the whole run closes (§2). Closing it early
+    would drop it from scope and hide a deficit that an evaporated supply later
+    resurfaces (no auto-reopen this increment) — the project's cardinal bug.
+    A short deficit (труба 6092, june runs 13/14) stays open; no date closes it.
+    Reopening is the manual endpoint only (blueprint §7.3 pending_reopen →
+    operator).
+    """
+    now = datetime.now(timezone.utc)
+    closed = 0
+    for req in scope.open_reqs:
+        effective_net = max(
+            _to_float(req.net_required_qty) + _to_float(req.drift_adjustment_qty), 0.0
+        )
+        if effective_net > EPS and _to_float(req.executed_qty) + EPS >= effective_net:
+            req.status = "closed"
+            req.closed_at = now
+            closed += 1
+    db.flush()
+    return {"requirements_closed": closed}
+
+
+def apply_run_closure(db: Session, scope: LedgerScope) -> List[int]:
+    """Auto-close every FIXED_SNAPSHOT run that has NO OPEN DEFICIT left.
+
+    Runs right after :func:`apply_requirement_closure` (its closures are already
+    flushed). A run closes ONLY by execution — never by an overdue period. For
+    each scope run still at ``FIXED_SNAPSHOT`` that carries at least one
+    requirement (evidence): count the open reqs whose real deficit is still
+    positive (``net_required_qty + drift_adjustment_qty - executed_qty > EPS``;
+    correct even when net+drift ≤ 0, then the term is ≤ -executed ≤ 0 and not
+    counted). If NONE remain, the plan is done and its frozen stock is realized —
+    batch-close the remaining open reqs (this sweeps the open-but-zero net=0
+    tail), then stamp ``status='CLOSED'``, ``finished_at=now``. A closed run
+    drops out of ``_scope_run_ids`` next cycle (no open req) → out of freeze (its
+    stock is released on refreeze) and out of the sizing loop.
+    """
+    now = datetime.now(timezone.utc)
+    closed_run_ids: List[int] = []
+    for rid in scope.run_ids:
+        run = scope.runs_by_id.get(rid)
+        if run is None or str(run.status or "") != FIXED_SNAPSHOT_STATUS:
+            continue
+        total = (
+            db.query(func.count(MrpRequirement.id))
+            .filter(MrpRequirement.run_id == rid)
+            .scalar()
+        ) or 0
+        if total <= 0:
+            continue
+        open_deficit = (
+            db.query(func.count(MrpRequirement.id))
+            .filter(MrpRequirement.run_id == rid)
+            .filter(MrpRequirement.status == "open")
+            .filter(
+                (
+                    func.coalesce(MrpRequirement.net_required_qty, 0.0)
+                    + func.coalesce(MrpRequirement.drift_adjustment_qty, 0.0)
+                    - func.coalesce(MrpRequirement.executed_qty, 0.0)
+                )
+                > EPS
+            )
+            .scalar()
+        ) or 0
+        if open_deficit == 0:
+            # Sweep the remaining open-but-zero (net=0) tail, then close the run.
+            (
+                db.query(MrpRequirement)
+                .filter(MrpRequirement.run_id == rid)
+                .filter(MrpRequirement.status == "open")
+                .update(
+                    {"status": "closed", "closed_at": now},
+                    synchronize_session=False,
+                )
+            )
+            run.status = CLOSED_STATUS
+            run.finished_at = now
+            closed_run_ids.append(rid)
+    db.flush()
+    return closed_run_ids
+
+
+# ---------------------------------------------------------------------------
 # §2 — the cycle
 # ---------------------------------------------------------------------------
 def run_ledger_cycle(db: Session) -> Dict[str, Any]:
@@ -1407,9 +1507,15 @@ def run_ledger_cycle(db: Session) -> Dict[str, Any]:
     # §4 (increment 4): drift AFTER executed aggregation (a surplus cap needs
     # executed; shortfall caps = frozen initial_snapshot_stock). Then materialise
     # drift_adjustment_qty (the reconcile sizer reads it next cycle / this run).
-    # [increment-5 slot] requirement closure / released routing.
     drift = compute_stock_drift(db, scope, verify, produced_now, received_now, cycle_id)
     _materialize_drift_adjustment(scope, drift)
+
+    # §5 (increment 5): plan closure by execution. Closure runs AFTER drift so
+    # effective_net accounts for drift_adjustment (an evaporated supply can
+    # re-open / keep-open a requirement). Requirements close first, then a run
+    # closes once none of its requirements remain open.
+    requirement_closure = apply_requirement_closure(db, scope)
+    runs_closed = apply_run_closure(db, scope)
 
     realized_total = round(sum(verify.realized_by_alloc_id.values()), 6)
     evaporated_total = round(sum(verify.evaporated_by_alloc_id.values()), 6)
@@ -1431,6 +1537,8 @@ def run_ledger_cycle(db: Session) -> Dict[str, Any]:
         "drift_matured_surplus": drift.matured_surplus_total,
         "drift_evap_adjust": drift.evap_adjust_total,
         "drift_unattributed": drift.unattributed_total,
+        "requirements_closed": requirement_closure["requirements_closed"],
+        "runs_closed": runs_closed,
     }
 
 

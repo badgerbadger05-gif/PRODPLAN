@@ -1558,6 +1558,50 @@ async def reconcile_single_snapshot(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.post("/mrp/run/{run_id}/force-close")
+async def force_close_mrp_run(
+    run_id: int,
+    req: ReconcileRequest = ReconcileRequest(),
+    db: Session = Depends(get_db),
+):
+    """Принудительно закрыть недовыполненный FIXED_SNAPSHOT-прогон (бизнес-решение).
+
+    Остаток НЕ переносится: открытые требования закрываются, их неэкспортированные
+    закупочные предложения усыхают до нуля (экспортированные в 1С не трогаем —
+    отмена вручную). Идемпотентно на уже закрытом прогоне. `dry_run=true` считает
+    и откатывает.
+    """
+    from ..services.mrp_reconciliation import force_close_run
+
+    try:
+        return force_close_run(db, int(run_id), dry_run=bool(req.dry_run))
+    except ValueError as e:
+        detail = str(e)
+        raise HTTPException(status_code=404 if "не найден" in detail else 400, detail=detail)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/mrp/run/{run_id}/reopen")
+async def reopen_mrp_run(
+    run_id: int,
+    req: ReconcileRequest = ReconcileRequest(),
+    db: Session = Depends(get_db),
+):
+    """Отменить закрытие прогона: CLOSED → FIXED_SNAPSHOT, закрытые требования
+    снова открываются и возвращаются в область расчёта. `dry_run=true` откатывает.
+    """
+    from ..services.mrp_reconciliation import reopen_run
+
+    try:
+        return reopen_run(db, int(run_id), dry_run=bool(req.dry_run))
+    except ValueError as e:
+        detail = str(e)
+        raise HTTPException(status_code=404 if "не найден" in detail else 400, detail=detail)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @router.get("/results/{run_id}/rework/export")
 async def export_planning_result_rework(
     run_id: int,

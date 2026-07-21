@@ -28,7 +28,14 @@ from app.models import (
     SupplierOrderItem,
     SyncLink,
 )
-from app.services.mrp_reconciliation import reconcile_all_active, reconcile_snapshot
+from app.services.mrp_execution_ledger import _scope_run_ids
+from app.services.mrp_reconciliation import (
+    _latest_active_snapshot_run_ids,
+    force_close_run,
+    reconcile_all_active,
+    reconcile_snapshot,
+    reopen_run,
+)
 from app.services.period_plan_service import create_mrp_snapshot_from_period_plan
 from app.services.production_binding_repair import repair_clean_mrp_bindings
 from app.services.production_control_journal import (
@@ -986,3 +993,207 @@ def test_reconcile_repairs_still_run(db_session):
     res = reconcile_snapshot(db_session, run_id)
     for key in ("rescheduled", "mrp_order_repair", "mrp_batch_repair", "binding_repair", "orphan_link_repair"):
         assert key in res
+
+
+# ---------------------------------------------------------------------------
+# Part 4 — increment-5: manual force-close / reopen + activity-by-status
+# ---------------------------------------------------------------------------
+
+def _force_close_fixture(db):
+    """A frozen run whose purchased component carries an unexported PlannedPurchase
+    plus a second EXPORTED one. Returns (run_id, comp, comp_req, unexp, exported)."""
+    parent = _make_production_item(db, "FC-PARENT", stock=0.0)
+    comp = _make_purchased_component(db, "FC-COMP", stock=0.0)
+    _link_bom(db, parent, comp, qty_per_unit=1.0)
+    plan = _fixed_plan(db)
+    _plan_line(db, plan, parent, 10)
+    db.commit()
+
+    run_id = create_mrp_snapshot_from_period_plan(db, plan.id)["run_id"]
+    comp_req = (
+        db.query(MrpRequirement)
+        .filter(MrpRequirement.run_id == run_id, MrpRequirement.item_id == comp.item_id)
+        .one()
+    )
+    unexp = db.query(PlannedPurchase).filter_by(run_id=run_id, item_id=comp.item_id).one()
+    assert float(unexp.qty) > 0.0
+
+    exported = PlannedPurchase(
+        run_id=run_id, item_id=comp.item_id, requested_qty=5, planned_qty=5, qty=5,
+        need_date=date(2026, 8, 30), order_date=date(2026, 8, 1), lead_time_days=3,
+        bucket_date=date(2026, 8, 30),
+    )
+    db.add(exported)
+    db.flush()
+    db.add(
+        SyncLink(
+            source_system="PRODPLAN", source_doctype="planned_purchase",
+            source_id=exported.purchase_id, target_system="1C",
+            target_entity="Document_ЗаказПоставщику",
+            target_ref_key="FC-EXP-REF", status="success",
+        )
+    )
+    db.commit()
+    return run_id, comp, comp_req, unexp, exported
+
+
+def test_i5_force_close_flips_trims_unexported_keeps_exported_and_drops_active(db_session):
+    """I6: force-close flips FIXED_SNAPSHOT→CLOSED, closes open reqs, trims the
+    run's UNexported purchases to 0 while leaving exported ones intact, and drops
+    the run from the active set."""
+    run_id, comp, comp_req, unexp, exported = _force_close_fixture(db_session)
+    unexp_id = unexp.purchase_id
+    exported_id = exported.purchase_id
+
+    assert run_id in _latest_active_snapshot_run_ids(db_session)
+
+    res = force_close_run(db_session, run_id)
+    assert res["status"] == "closed"
+    assert res["requirements_closed"] >= 1
+    assert res["purchases_pruned"]
+
+    db_session.expire_all()
+    run = db_session.get(PlanningRun, run_id)
+    assert run.status == "CLOSED"
+    assert run.finished_at is not None
+    reqs = db_session.query(MrpRequirement).filter_by(run_id=run_id).all()
+    assert reqs and all(r.status == "closed" for r in reqs)
+    assert all(r.closed_at is not None for r in reqs)
+
+    remaining = {
+        int(pp.purchase_id): float(pp.qty)
+        for pp in db_session.query(PlannedPurchase).filter_by(run_id=run_id).all()
+    }
+    assert remaining.get(exported_id) == 5.0   # exported survives
+    assert unexp_id not in remaining           # unexported abandoned
+    assert run_id not in _latest_active_snapshot_run_ids(db_session)
+
+
+def test_i5_force_close_is_idempotent(db_session):
+    """I7: a second force-close returns already_closed and changes nothing."""
+    run_id, comp, comp_req, unexp, exported = _force_close_fixture(db_session)
+    force_close_run(db_session, run_id)
+    db_session.expire_all()
+    before = _all_dump(db_session)
+
+    res = force_close_run(db_session, run_id)
+    assert res["status"] == "already_closed"
+    assert res["requirements_closed"] == 0
+    assert res["purchases_pruned"] == []
+    db_session.expire_all()
+    assert _all_dump(db_session) == before
+
+
+def test_i5_force_close_dry_run_writes_nothing(db_session):
+    """I12: a dry-run force-close reports the effect but persists nothing."""
+    run_id, comp, comp_req, unexp, exported = _force_close_fixture(db_session)
+    before = _all_dump(db_session)
+
+    res = force_close_run(db_session, run_id, dry_run=True)
+    assert res["status"] == "closed"
+    assert res["dry_run"] is True
+
+    db_session.expire_all()
+    run = db_session.get(PlanningRun, run_id)
+    assert run.status == "FIXED_SNAPSHOT"
+    assert db_session.get(MrpRequirement, comp_req.id).status == "open"
+    assert _all_dump(db_session) == before
+    assert run_id in _latest_active_snapshot_run_ids(db_session)
+
+
+def test_i5_reopen_restores_run_and_requirements(db_session):
+    """I8: reopen flips CLOSED→FIXED_SNAPSHOT, reopens the closed reqs and puts
+    the run back into the active set and the ledger scope."""
+    run_id, comp, comp_req, unexp, exported = _force_close_fixture(db_session)
+    force_close_run(db_session, run_id)
+    db_session.expire_all()
+    assert db_session.get(PlanningRun, run_id).status == "CLOSED"
+
+    res = reopen_run(db_session, run_id)
+    assert res["status"] == "reopened"
+    assert res["requirements_reopened"] >= 1
+
+    db_session.expire_all()
+    run = db_session.get(PlanningRun, run_id)
+    assert run.status == "FIXED_SNAPSHOT"
+    assert run.finished_at is None
+    reqs = db_session.query(MrpRequirement).filter_by(run_id=run_id).all()
+    assert reqs and all(r.status == "open" for r in reqs)
+    assert all(r.closed_at is None for r in reqs)
+    assert run_id in _latest_active_snapshot_run_ids(db_session)
+    assert run_id in _scope_run_ids(db_session)
+
+
+def test_i5_reopen_dry_run_writes_nothing(db_session):
+    """I12: a dry-run reopen reports the effect but persists nothing."""
+    run_id, comp, comp_req, unexp, exported = _force_close_fixture(db_session)
+    force_close_run(db_session, run_id)
+    db_session.expire_all()
+    before_status = db_session.get(PlanningRun, run_id).status
+    assert before_status == "CLOSED"
+
+    res = reopen_run(db_session, run_id, dry_run=True)
+    assert res["status"] == "reopened"
+    assert res["dry_run"] is True
+
+    db_session.expire_all()
+    assert db_session.get(PlanningRun, run_id).status == "CLOSED"
+    assert db_session.get(MrpRequirement, comp_req.id).status == "closed"
+
+
+def test_i5_force_close_rejects_missing_and_non_fixed(db_session):
+    """force-close raises on an unknown run (→404 at the router) and on a run
+    that is not FIXED_SNAPSHOT (→400)."""
+    with pytest.raises(ValueError, match="не найден"):
+        force_close_run(db_session, 999999)
+
+    plan = _fixed_plan(db_session)
+    run = PlanningRun(
+        status="PENDING", config_snapshot={}, pinned=True,
+        source_plan_id=plan.id, period_from=plan.period_from, period_to=plan.period_to,
+    )
+    db_session.add(run)
+    db_session.commit()
+    with pytest.raises(ValueError, match="FIXED_SNAPSHOT"):
+        force_close_run(db_session, run.run_id)
+
+
+def test_i5_reopen_rejects_non_closed(db_session):
+    """reopen raises on a run that is not CLOSED."""
+    run_id, comp, comp_req, unexp, exported = _force_close_fixture(db_session)
+    with pytest.raises(ValueError, match="CLOSED"):
+        reopen_run(db_session, run_id)
+
+
+def test_i5_activity_is_status_based_overdue_snapshot_stays_active(db_session):
+    """I9: with the period filter removed, an overdue FIXED_SNAPSHOT (period_to
+    in the past) is still returned by _latest_active_snapshot_run_ids — activity
+    is status-based, aligned with the ledger scope."""
+    item = _make_purchased_item(db_session, "OVERDUE-ACT", stock=0.0)
+    plan = ProductionPlanHeader(
+        name="Просроченный план",
+        period_from=date(2020, 1, 1),
+        period_to=date(2020, 2, 1),
+        status="fixed",
+        created_by="test",
+    )
+    db_session.add(plan)
+    db_session.flush()
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT", config_snapshot={}, pinned=True,
+        source_plan_id=plan.id, period_from=date(2020, 1, 1), period_to=date(2020, 2, 1),
+        active_freeze_version=1,
+    )
+    db_session.add(run)
+    db_session.flush()
+    db_session.add(
+        MrpRequirement(
+            run_id=run.run_id, item_id=item.item_id, total_required_qty=40,
+            net_required_qty=40, covered_qty=0, remaining_qty=40,
+            period_from=date(2020, 1, 1), period_to=date(2020, 2, 1), bom_level=0,
+        )
+    )
+    db_session.commit()
+
+    active = _latest_active_snapshot_run_ids(db_session)
+    assert run.run_id in active  # overdue but still active (status-based)

@@ -36,6 +36,7 @@ from app.models import (
     SupplierOrderItem,
 )
 from app.services.mrp_execution_ledger import (
+    _scope_run_ids,
     populate_executed_qty,
     run_ledger_cycle,
 )
@@ -1118,3 +1119,215 @@ def test_i4_bucket_cap_extension_lets_drift_topup_execute(db_session):
     by_bucket = {r.bucket_id: float(r.allocated_qty) for r in _exec_rows(db_session, req)}
     assert by_bucket.get(b1.id) == 40.0
     assert by_bucket.get(b2.id) == 20.0
+
+
+# ===========================================================================
+# Increment-5 tests — plan closure by execution
+# ===========================================================================
+
+def test_i5_satisfied_requirement_and_run_auto_close(db_session):
+    """I1/I4: executed ≥ effective_net → req status='closed', closed_at set; a
+    run whose every requirement is closed becomes CLOSED with finished_at, and
+    drops out of the ledger scope."""
+    item = _make_production_item(db_session, "I5-SAT")
+    run = _make_run(db_session, period_from=date(2026, 6, 1), period_to=date(2026, 6, 30))
+    req = _make_req(db_session, run, item, net=40)
+    _make_production_line(db_session, item, quantity=40, produced=40, req=req)
+    db_session.commit()
+
+    summary = run_ledger_cycle(db_session)
+    db_session.commit()
+
+    db_session.refresh(req)
+    db_session.refresh(run)
+    assert req.status == "closed"
+    assert req.closed_at is not None
+    assert float(req.executed_qty) == 40.0
+    assert run.status == "CLOSED"
+    assert run.finished_at is not None
+    assert summary["requirements_closed"] == 1
+    assert summary["runs_closed"] == [run.run_id]
+    # Closed run (no open req) drops out of the canonical scope next cycle.
+    assert run.run_id not in _scope_run_ids(db_session)
+
+
+def test_i5_short_requirement_stays_open(db_session):
+    """I2: executed < effective_net → requirement stays open, run stays
+    FIXED_SNAPSHOT. No date closes it."""
+    item = _make_production_item(db_session, "I5-SHORT")
+    run = _make_run(db_session, period_from=date(2026, 6, 1), period_to=date(2026, 6, 30))
+    req = _make_req(db_session, run, item, net=40)
+    _make_production_line(db_session, item, quantity=40, produced=25, req=req)
+    db_session.commit()
+
+    summary = run_ledger_cycle(db_session)
+    db_session.commit()
+
+    db_session.refresh(req)
+    db_session.refresh(run)
+    assert req.status == "open"
+    assert req.closed_at is None
+    assert run.status == "FIXED_SNAPSHOT"
+    assert summary["requirements_closed"] == 0
+    assert summary["runs_closed"] == []
+
+
+def test_i5_net_zero_alongside_deficit_stays_open(db_session):
+    """I3 (owner ruling 21.07): a net=0 requirement (covered by frozen stock, not
+    by execution) sitting ALONGSIDE an open real deficit in the SAME run is NOT
+    closed individually — it stays open-but-zero, in scope, visible to
+    drift/evaporation. It closes only when the whole run closes."""
+    zero_item = _make_production_item(db_session, "I5-ZERO")
+    deficit_item = _make_production_item(db_session, "I5-DEFICIT")
+    run = _make_run(db_session, period_from=date(2026, 6, 1), period_to=date(2026, 6, 30))
+    zero_req = _make_req(db_session, run, zero_item, net=0)
+    deficit_req = _make_req(db_session, run, deficit_item, net=40)
+    _make_production_line(db_session, deficit_item, quantity=40, produced=10, req=deficit_req)
+    db_session.commit()
+
+    summary = run_ledger_cycle(db_session)
+    db_session.commit()
+
+    db_session.refresh(zero_req)
+    db_session.refresh(deficit_req)
+    db_session.refresh(run)
+    # The open deficit keeps the run alive → the net=0 tail is NOT swept.
+    assert zero_req.status == "open"
+    assert zero_req.closed_at is None
+    assert deficit_req.status == "open"
+    assert run.status == "FIXED_SNAPSHOT"
+    assert summary["requirements_closed"] == 0
+    assert summary["runs_closed"] == []
+    assert run.run_id in _scope_run_ids(db_session)
+
+
+def test_i5_run_with_mixed_reqs_stays_open(db_session):
+    """A run auto-closes ONLY when every requirement is closed; one still-open
+    req keeps the run FIXED_SNAPSHOT."""
+    done_item = _make_production_item(db_session, "I5-MIX-DONE")
+    open_item = _make_production_item(db_session, "I5-MIX-OPEN")
+    run = _make_run(db_session, period_from=date(2026, 6, 1), period_to=date(2026, 6, 30))
+    done_req = _make_req(db_session, run, done_item, net=40)
+    open_req = _make_req(db_session, run, open_item, net=40)
+    _make_production_line(db_session, done_item, quantity=40, produced=40, req=done_req)
+    _make_production_line(db_session, open_item, quantity=40, produced=10, req=open_req)
+    db_session.commit()
+
+    summary = run_ledger_cycle(db_session)
+    db_session.commit()
+
+    db_session.refresh(done_req)
+    db_session.refresh(open_req)
+    db_session.refresh(run)
+    assert done_req.status == "closed"
+    assert open_req.status == "open"
+    assert run.status == "FIXED_SNAPSHOT"
+    assert summary["requirements_closed"] == 1
+    assert summary["runs_closed"] == []
+    assert run.run_id in _scope_run_ids(db_session)
+
+
+def test_i5_run_closes_and_sweeps_net_zero_tail(db_session):
+    """I4 (extended): a run with one real deficit (net>0) + one net=0 req. While
+    the deficit is short the run stays FIXED_SNAPSHOT and BOTH reqs open; once the
+    deficit is executed to net, the run→CLOSED and BOTH reqs close — the net=0
+    tail is swept by the run closure."""
+    deficit_item = _make_production_item(db_session, "I5-TAIL-DEF")
+    zero_item = _make_production_item(db_session, "I5-TAIL-ZERO")
+    run = _make_run(db_session, period_from=date(2026, 6, 1), period_to=date(2026, 6, 30))
+    deficit_req = _make_req(db_session, run, deficit_item, net=40)
+    zero_req = _make_req(db_session, run, zero_item, net=0)
+    product = _make_production_line(db_session, deficit_item, quantity=40, produced=10, req=deficit_req)
+    db_session.commit()
+
+    # Cycle 1: deficit short → run open, both reqs open.
+    s1 = run_ledger_cycle(db_session)
+    db_session.commit()
+    db_session.refresh(deficit_req)
+    db_session.refresh(zero_req)
+    db_session.refresh(run)
+    assert deficit_req.status == "open"
+    assert zero_req.status == "open"
+    assert run.status == "FIXED_SNAPSHOT"
+    assert s1["runs_closed"] == []
+
+    # Execute the deficit to its full net.
+    product.produced_qty = 40
+    product.remaining_qty = 0
+    db_session.commit()
+
+    # Cycle 2: no open deficit → run CLOSED, both reqs closed (net=0 tail swept).
+    s2 = run_ledger_cycle(db_session)
+    db_session.commit()
+    db_session.refresh(deficit_req)
+    db_session.refresh(zero_req)
+    db_session.refresh(run)
+    assert deficit_req.status == "closed"
+    assert zero_req.status == "closed"
+    assert zero_req.closed_at is not None
+    assert run.status == "CLOSED"
+    assert run.finished_at is not None
+    assert s2["runs_closed"] == [run.run_id]
+    assert run.run_id not in _scope_run_ids(db_session)
+
+
+def test_i5_overdue_but_short_run_stays_active(db_session):
+    """I5: an overdue FIXED_SNAPSHOT with an open under-executed req (june runs
+    13/14 with executed=0) is NOT closed by the passed period — it stays
+    FIXED_SNAPSHOT and in the scope. Only execution closes a plan."""
+    item = _make_production_item(db_session, "I5-OVERDUE")
+    # Period fully in the past relative to the test date (2026-07-20).
+    run = _make_run(db_session, period_from=date(2020, 1, 1), period_to=date(2020, 2, 1))
+    req = _make_req(db_session, run, item, net=40)
+    # executed 0 (no production) → deficit stays visible.
+    db_session.commit()
+
+    summary = run_ledger_cycle(db_session)
+    db_session.commit()
+
+    db_session.refresh(req)
+    db_session.refresh(run)
+    assert req.status == "open"
+    assert run.status == "FIXED_SNAPSHOT"
+    assert summary["requirements_closed"] == 0
+    assert summary["runs_closed"] == []
+    assert run.run_id in _scope_run_ids(db_session)
+
+
+def test_i5_empty_scope_returns_identical_shape_no_closure(db_session):
+    """I10: with no open requirements in scope, run_ledger_cycle returns the
+    byte-identical early shape — it never writes a closure key."""
+    summary = run_ledger_cycle(db_session)
+    assert summary["items_touched"] == 0
+    assert summary["runs"] == []
+    # The empty-scope early return does not thread the closure keys.
+    assert "requirements_closed" not in summary
+    assert "runs_closed" not in summary
+
+
+def test_i5_closure_is_idempotent(db_session):
+    """I11: a second cycle over unchanged facts closes nothing more and does not
+    thrash the already-closed requirement / run."""
+    item = _make_production_item(db_session, "I5-IDEM")
+    run = _make_run(db_session, period_from=date(2026, 6, 1), period_to=date(2026, 6, 30))
+    req = _make_req(db_session, run, item, net=40)
+    _make_production_line(db_session, item, quantity=40, produced=40, req=req)
+    db_session.commit()
+
+    first = run_ledger_cycle(db_session)
+    db_session.commit()
+    db_session.refresh(req)
+    first_closed_at = req.closed_at
+
+    second = run_ledger_cycle(db_session)
+    db_session.commit()
+    db_session.refresh(req)
+
+    assert first["requirements_closed"] == 1
+    assert first["runs_closed"] == [run.run_id]
+    # The closed run drops out of scope → the second cycle sees no open req at
+    # all and returns the byte-identical empty-scope shape (no closure keys).
+    assert second["runs"] == []
+    assert "requirements_closed" not in second
+    assert req.status == "closed"
+    assert req.closed_at == first_closed_at  # not re-stamped

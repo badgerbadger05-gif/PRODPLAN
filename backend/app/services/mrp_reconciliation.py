@@ -83,6 +83,7 @@ from .paint_weld_pairs import is_welded_blocked
 
 EPS = 1e-9
 FIXED_SNAPSHOT_STATUS = "FIXED_SNAPSHOT"
+CLOSED_STATUS = "CLOSED"
 PRODUCTION_ORDER_ENTITY = "Document_ЗаказНаПроизводство"
 PURCHASE_ORDER_ENTITY = "Document_ЗаказПоставщику"
 DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
@@ -95,16 +96,17 @@ def _production_supply_qty_expr():
 
 def _latest_active_snapshot_run_ids(db: Session) -> List[int]:
     """
-    Latest FIXED_SNAPSHOT run per source plan whose period has not fully passed
-    (``period_to`` is null or >= today). There must be only one active fixed
-    snapshot per plan; max(run_id) is a defensive fallback for legacy duplicates.
+    Latest FIXED_SNAPSHOT run per source plan. Activity is status-based, NOT
+    period-gated: an overdue-but-open snapshot (june runs 13/14 with executed=0)
+    stays active, aligned with the ledger scope (``_scope_run_ids`` is
+    period-agnostic). A CLOSED run is excluded naturally (the ==FIXED_SNAPSHOT
+    filter). There must be only one active fixed snapshot per plan; max(run_id)
+    is a defensive fallback for legacy duplicates.
     """
-    today = date.today()
     rows = (
         db.query(PlanningRun.source_plan_id, func.max(PlanningRun.run_id))
         .filter(PlanningRun.status == FIXED_SNAPSHOT_STATUS)
         .filter(PlanningRun.source_plan_id.isnot(None))
-        .filter((PlanningRun.period_to.is_(None)) | (PlanningRun.period_to >= today))
         .group_by(PlanningRun.source_plan_id)
         .all()
     )
@@ -1216,4 +1218,122 @@ def reconcile_all_active(db: Session, *, dry_run: bool = False) -> Dict[str, Any
         "production_lines_trimmed": total_production_trimmed,
         "execution_ledger": execution_ledger,
         "results": results,
+    }
+
+
+# ---------------------------------------------------------------------------
+# §5 (increment 5) — manual force-close / reopen
+# ---------------------------------------------------------------------------
+def force_close_run(db: Session, run_id: int, *, dry_run: bool = False) -> Dict[str, Any]:
+    """Manually close an under-executed FIXED_SNAPSHOT run (business decision).
+
+    The remaining demand is ABANDONED, never carried: each open requirement is
+    stamped closed and its OWN unexported MRP purchase proposals are trimmed to
+    zero. Exported-to-1C proposals (a successful ``SyncLink``) are left intact —
+    the operator cancels those in 1C (the boundary: proposals go out, cancellation
+    is manual). Production lines are 1C-owned / journal-driven and are NOT touched
+    here (shop-floor risk; a separate operation). Idempotent on an already-CLOSED
+    run. Owns its own transaction: commit on success, rollback on dry_run.
+    """
+    run = db.query(PlanningRun).filter(PlanningRun.run_id == int(run_id)).one_or_none()
+    if run is None:
+        raise ValueError(f"run_id={run_id}: прогон не найден")
+
+    if str(run.status or "") == CLOSED_STATUS:
+        return {
+            "status": "already_closed",
+            "run_id": int(run.run_id),
+            "dry_run": bool(dry_run),
+            "requirements_closed": 0,
+            "purchases_pruned": [],
+        }
+    if str(run.status or "") != FIXED_SNAPSHOT_STATUS:
+        raise ValueError(
+            f"run_id={run_id}: нельзя force-close (status={run.status}, ожидался FIXED_SNAPSHOT)"
+        )
+
+    now = datetime.now(timezone.utc)
+    open_reqs = (
+        db.query(MrpRequirement)
+        .filter(MrpRequirement.run_id == int(run.run_id))
+        .filter(MrpRequirement.status == "open")
+        .order_by(MrpRequirement.id.asc())
+        .all()
+    )
+
+    # Abandon the unexported purchase proposals of every open requirement's item.
+    purchases_pruned: List[Dict[str, Any]] = []
+    for req in open_reqs:
+        pruned = _trim_unexported_planned_purchases(
+            db,
+            run_id=int(run.run_id),
+            item_id=int(req.item_id),
+            target_qty=0.0,
+            dry_run=dry_run,
+        )
+        if pruned is not None:
+            purchases_pruned.append(pruned)
+
+    # Forced closure: the remainder is dropped, not carried.
+    for req in open_reqs:
+        req.status = "closed"
+        req.closed_at = now
+    run.status = CLOSED_STATUS
+    run.finished_at = now
+
+    if dry_run:
+        db.rollback()
+    else:
+        db.commit()
+
+    return {
+        "status": "closed",
+        "run_id": int(run_id),
+        "dry_run": bool(dry_run),
+        "requirements_closed": len(open_reqs),
+        "purchases_pruned": purchases_pruned,
+    }
+
+
+def reopen_run(db: Session, run_id: int, *, dry_run: bool = False) -> Dict[str, Any]:
+    """Undo an erroneous / premature closure — the operator will keep executing.
+
+    A CLOSED run is flipped back to FIXED_SNAPSHOT (``finished_at`` cleared) and
+    its closed requirements are explicitly reopened so they return to the ledger
+    scope; the next ledger cycle recomputes their executed/drift and re-closes
+    any that are still satisfied (auto-reopen in §1 is off by design). Without a
+    carry there is no successor holding an overlapping claim, so reopen is safe.
+    Owns its own transaction: commit on success, rollback on dry_run.
+    """
+    run = db.query(PlanningRun).filter(PlanningRun.run_id == int(run_id)).one_or_none()
+    if run is None:
+        raise ValueError(f"run_id={run_id}: прогон не найден")
+    if str(run.status or "") != CLOSED_STATUS:
+        raise ValueError(
+            f"run_id={run_id}: не CLOSED (status={run.status}), реопен невозможен"
+        )
+
+    run.status = FIXED_SNAPSHOT_STATUS
+    run.finished_at = None
+
+    closed_reqs = (
+        db.query(MrpRequirement)
+        .filter(MrpRequirement.run_id == int(run.run_id))
+        .filter(MrpRequirement.status == "closed")
+        .all()
+    )
+    for req in closed_reqs:
+        req.status = "open"
+        req.closed_at = None
+
+    if dry_run:
+        db.rollback()
+    else:
+        db.commit()
+
+    return {
+        "status": "reopened",
+        "run_id": int(run_id),
+        "dry_run": bool(dry_run),
+        "requirements_reopened": len(closed_reqs),
     }
