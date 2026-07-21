@@ -1,116 +1,22 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type {
-  DbrProgram,
-  DbrPurchaseLaunchResult,
-  DbrPurchasePlanPreview,
-} from '../../domain/dbr'
 import { dateRu, qty } from '../../lib/format'
-import {
-  listDbrPrograms,
-  materializeDbrPurchasePlan,
-  previewDbrPurchasePlan,
-} from '../../services/dbr'
 import { DbrConfirmDialog } from '../dbr/DbrConfirmDialog'
 import { DbrNav } from '../dbr/DbrNav'
 import { DbrPurchaseResultBody } from '../dbr/DbrPurchaseResultBody'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
 import {
-  countPurchaseRowsWithinHorizon,
-  type DbrPurchaseSortKey,
   purchaseRowClass,
   purchaseSortableClass,
-  purchaseSourceFromKey,
-  purchaseSourceParams,
-  selectPurchaseRows,
 } from './dbr-purchase/model'
+import { useDbrPurchaseController } from './dbr-purchase/useDbrPurchaseController'
 
 export function DbrPurchasePage() {
-  const [programs, setPrograms] = useState<DbrProgram[]>([])
-  const [sourceKey, setSourceKey] = useState<string>('active')
-  const [thresholdDays, setThresholdDays] = useState(60)
-  const [preview, setPreview] = useState<DbrPurchasePlanPreview | null>(null)
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState('')
-  const [sort, setSort] = useState<DbrPurchaseSortKey>('order_before')
-  const [onlyToOrder, setOnlyToOrder] = useState(true)
-
-  // Two-step supplier-order materialization: dry-run preview → confirmed write.
-  const [flow, setFlow] = useState<{
-    preview?: DbrPurchaseLaunchResult
-    result?: DbrPurchaseLaunchResult
-  } | null>(null)
-  const [flowBusy, setFlowBusy] = useState(false)
-  const [flowError, setFlowError] = useState('')
-  const previewRequestRef = useRef(0)
-  const confirmBusyRef = useRef(false)
-
-  const source = useMemo(() => purchaseSourceFromKey(sourceKey), [sourceKey])
-
-  useEffect(() => {
-    let cancelled = false
-    void listDbrPrograms()
-      .then((list) => { if (!cancelled) setPrograms(list) })
-      .catch(() => { if (!cancelled) setPrograms([]) })
-    return () => { cancelled = true }
-  }, [])
-
-  const loadPreview = useCallback(async () => {
-    const request = ++previewRequestRef.current
-    setLoading(true)
-    setError('')
-    setPreview(null)
-    try {
-      const nextPreview = await previewDbrPurchasePlan(purchaseSourceParams(source, thresholdDays))
-      if (request === previewRequestRef.current) setPreview(nextPreview)
-    } catch (e) {
-      if (request === previewRequestRef.current) {
-        setError(e instanceof Error ? e.message : String(e))
-      }
-    } finally {
-      if (request === previewRequestRef.current) setLoading(false)
-    }
-  }, [source, thresholdDays])
-
-  const rows = useMemo(
-    () => selectPurchaseRows(preview?.rows ?? [], onlyToOrder, sort),
-    [preview, sort, onlyToOrder],
-  )
-
-  async function startMaterialize() {
-    setFlow({})
-    setFlowBusy(true)
-    setFlowError('')
-    try {
-      const res = await materializeDbrPurchasePlan({ ...purchaseSourceParams(source, thresholdDays), dryRun: true })
-      setFlow({ preview: res })
-    } catch (e) {
-      setFlow(null)
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setFlowBusy(false)
-    }
-  }
-
-  async function confirmMaterialize() {
-    if (confirmBusyRef.current) return
-    confirmBusyRef.current = true
-    setFlowBusy(true)
-    setFlowError('')
-    try {
-      const res = await materializeDbrPurchasePlan({ ...purchaseSourceParams(source, thresholdDays), dryRun: false })
-      setFlow((prev) => (prev ? { ...prev, result: res } : prev))
-      await loadPreview()
-    } catch (e) {
-      setFlowError(e instanceof Error ? e.message : String(e))
-    } finally {
-      confirmBusyRef.current = false
-      setFlowBusy(false)
-    }
-  }
-
-  const toOrderCount = preview?.rows_to_order ?? 0
-  const withinHorizon = useMemo(() => countPurchaseRowsWithinHorizon(preview?.rows ?? []), [preview])
+  const {
+    programs, sourceKey, setSourceKey, thresholdDays, setThresholdDays,
+    preview, loading, error, sort, setSort, onlyToOrder, setOnlyToOrder,
+    flow, flowBusy, flowError, rows, toOrderCount, withinHorizon,
+    loadPreview, startMaterialize, confirmMaterialize, closeFlow,
+  } = useDbrPurchaseController()
 
   return (
     <main className="workArea">
@@ -241,7 +147,7 @@ export function DbrPurchasePage() {
           busy={flowBusy}
           confirmLabel="Провести в 1С"
           error={flowError}
-          onClose={() => setFlow(null)}
+          onClose={closeFlow}
           onConfirm={() => void confirmMaterialize()}
         >
           {(() => {
