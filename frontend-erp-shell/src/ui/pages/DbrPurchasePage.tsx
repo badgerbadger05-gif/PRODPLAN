@@ -3,7 +3,6 @@ import type {
   DbrProgram,
   DbrPurchaseLaunchResult,
   DbrPurchasePlanPreview,
-  DbrPurchasePlanRow,
 } from '../../domain/dbr'
 import { dateRu, qty } from '../../lib/format'
 import {
@@ -16,17 +15,15 @@ import { DbrNav } from '../dbr/DbrNav'
 import { DbrPurchaseResultBody } from '../dbr/DbrPurchaseResultBody'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
-
-type SortKey = 'order_before' | 'to_order_qty' | 'item_code'
-
-// Source of the net purchase plan: the active drum schedule or a chosen program.
-type Source = { kind: 'active' } | { kind: 'program'; programId: number }
-
-function sourceParams(source: Source, thresholdDays: number) {
-  return source.kind === 'active'
-    ? { active: true, thresholdDays }
-    : { programId: source.programId, thresholdDays }
-}
+import {
+  countPurchaseRowsWithinHorizon,
+  type DbrPurchaseSortKey,
+  purchaseRowClass,
+  purchaseSortableClass,
+  purchaseSourceFromKey,
+  purchaseSourceParams,
+  selectPurchaseRows,
+} from './dbr-purchase/model'
 
 export function DbrPurchasePage() {
   const [programs, setPrograms] = useState<DbrProgram[]>([])
@@ -35,7 +32,7 @@ export function DbrPurchasePage() {
   const [preview, setPreview] = useState<DbrPurchasePlanPreview | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
-  const [sort, setSort] = useState<SortKey>('order_before')
+  const [sort, setSort] = useState<DbrPurchaseSortKey>('order_before')
   const [onlyToOrder, setOnlyToOrder] = useState(true)
 
   // Two-step supplier-order materialization: dry-run preview → confirmed write.
@@ -48,10 +45,7 @@ export function DbrPurchasePage() {
   const previewRequestRef = useRef(0)
   const confirmBusyRef = useRef(false)
 
-  const source: Source = useMemo(
-    () => (sourceKey === 'active' ? { kind: 'active' } : { kind: 'program', programId: Number(sourceKey) }),
-    [sourceKey],
-  )
+  const source = useMemo(() => purchaseSourceFromKey(sourceKey), [sourceKey])
 
   useEffect(() => {
     let cancelled = false
@@ -67,7 +61,7 @@ export function DbrPurchasePage() {
     setError('')
     setPreview(null)
     try {
-      const nextPreview = await previewDbrPurchasePlan(sourceParams(source, thresholdDays))
+      const nextPreview = await previewDbrPurchasePlan(purchaseSourceParams(source, thresholdDays))
       if (request === previewRequestRef.current) setPreview(nextPreview)
     } catch (e) {
       if (request === previewRequestRef.current) {
@@ -78,25 +72,17 @@ export function DbrPurchasePage() {
     }
   }, [source, thresholdDays])
 
-  const rows = useMemo(() => {
-    const list = [...(preview?.rows ?? [])].filter((r) => (onlyToOrder ? r.to_order_qty > 0 : true))
-    list.sort((a, b) => {
-      switch (sort) {
-        case 'to_order_qty': return b.to_order_qty - a.to_order_qty
-        case 'item_code': return a.item_code.localeCompare(b.item_code)
-        case 'order_before':
-        default: return (a.order_before || '9999-12-31').localeCompare(b.order_before || '9999-12-31')
-      }
-    })
-    return list
-  }, [preview, sort, onlyToOrder])
+  const rows = useMemo(
+    () => selectPurchaseRows(preview?.rows ?? [], onlyToOrder, sort),
+    [preview, sort, onlyToOrder],
+  )
 
   async function startMaterialize() {
     setFlow({})
     setFlowBusy(true)
     setFlowError('')
     try {
-      const res = await materializeDbrPurchasePlan({ ...sourceParams(source, thresholdDays), dryRun: true })
+      const res = await materializeDbrPurchasePlan({ ...purchaseSourceParams(source, thresholdDays), dryRun: true })
       setFlow({ preview: res })
     } catch (e) {
       setFlow(null)
@@ -112,7 +98,7 @@ export function DbrPurchasePage() {
     setFlowBusy(true)
     setFlowError('')
     try {
-      const res = await materializeDbrPurchasePlan({ ...sourceParams(source, thresholdDays), dryRun: false })
+      const res = await materializeDbrPurchasePlan({ ...purchaseSourceParams(source, thresholdDays), dryRun: false })
       setFlow((prev) => (prev ? { ...prev, result: res } : prev))
       await loadPreview()
     } catch (e) {
@@ -124,19 +110,7 @@ export function DbrPurchasePage() {
   }
 
   const toOrderCount = preview?.rows_to_order ?? 0
-  const withinHorizon = useMemo(
-    () => (preview?.rows ?? []).filter((r) => r.to_order_qty > 0 && r.within_lead_time_threshold).length,
-    [preview],
-  )
-
-  function sortableClass(key: SortKey) {
-    return `dbrSortable ${sort === key ? 'active' : ''}`
-  }
-
-  function rowClass(row: DbrPurchasePlanRow) {
-    if (row.to_order_qty <= 0) return ''
-    return row.within_lead_time_threshold ? 'dbrPurchaseUrgent' : ''
-  }
+  const withinHorizon = useMemo(() => countPurchaseRowsWithinHorizon(preview?.rows ?? []), [preview])
 
   return (
     <main className="workArea">
@@ -225,13 +199,13 @@ export function DbrPurchasePage() {
           <table className="journalTable dbrTable dbrPurchaseTable">
             <thead>
               <tr>
-                <th className={sortableClass('item_code')} onClick={() => setSort('item_code')}>Позиция</th>
+                <th className={purchaseSortableClass(sort, 'item_code')} onClick={() => setSort('item_code')}>Позиция</th>
                 <th className="numCell">Потребность</th>
                 <th className="numCell">Запас</th>
                 <th className="numCell">Открытый заказ</th>
                 <th className="numCell">Доступно</th>
-                <th className={`numCell ${sortableClass('to_order_qty')}`} onClick={() => setSort('to_order_qty')}>Заказать</th>
-                <th className={sortableClass('order_before')} onClick={() => setSort('order_before')}>Заказать до</th>
+                <th className={`numCell ${purchaseSortableClass(sort, 'to_order_qty')}`} onClick={() => setSort('to_order_qty')}>Заказать</th>
+                <th className={purchaseSortableClass(sort, 'order_before')} onClick={() => setSort('order_before')}>Заказать до</th>
                 <th>Дата потребности</th>
                 <th>Поставщик</th>
                 <th>В горизонте</th>
@@ -241,7 +215,7 @@ export function DbrPurchasePage() {
               {!loading && !preview && <tr><td colSpan={10} className="emptyCell">Выберите источник и нажмите «Рассчитать».</td></tr>}
               {!loading && preview && !rows.length && <tr><td colSpan={10} className="emptyCell">Нет позиций{onlyToOrder ? ' к заказу' : ''}.</td></tr>}
               {rows.map((row) => (
-                <tr key={row.item_id} className={rowClass(row)}>
+                <tr key={row.item_id} className={purchaseRowClass(row)}>
                   <td><strong>{row.item_code}</strong><span className="dbrFeederItemName">{row.item_name}</span></td>
                   <td className="numCell">{qty(row.demand_qty)}</td>
                   <td className="numCell">{qty(row.stock_qty)}</td>
