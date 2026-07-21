@@ -54,9 +54,25 @@ import type { ProductionOrderSortKey } from './production-control/productionOrde
 import { ChainCloseDialog } from './production-control/ChainCloseDialog'
 import { ProduceDialog } from './production-control/ProduceDialog'
 import { WarehousePickerDialog } from './production-control/WarehousePickerDialog'
-import { coverageDrivenStatuses, firstExportProblem, issueIdsFromCreateResult, limit, recordArray } from './production-control/helpers'
+import { firstExportProblem, issueIdsFromCreateResult, limit, recordArray } from './production-control/helpers'
+import {
+  activeProductionRow,
+  areAllOperationExecutorsSelected,
+  applyMaterialCoverage,
+  buildOperationExecutors,
+  buildProductionOrderParams,
+  buildProductionSettingsPayload,
+  deletableProductionRows,
+  nextProductionSort,
+  productionPagination,
+  productionRow,
+  selectedProductionRows,
+} from './production-control/model'
 
 export function ProductionControlPage() {
+  const listRequestSeq = useRef(0)
+  const materialsRequestSeq = useRef(0)
+  const dangerousMutationLocked = useRef(false)
   const [searchParams] = useSearchParams()
   const focusProductId = searchParams.get('product_id')
   const focusOrderId = searchParams.get('order_id')
@@ -126,15 +142,15 @@ export function ProductionControlPage() {
     offsetRef.current = offset
   }, [offset])
 
-  const activeRow = useMemo(() => rows.find((row) => row.product_id === activeId) ?? rows[0] ?? null, [rows, activeId])
-  const selectedRows = useMemo(() => rows.filter((row) => selectedIds.has(row.product_id)), [rows, selectedIds])
-  const produceRow = useMemo(() => rows.find((row) => row.product_id === produceProductId) ?? null, [rows, produceProductId])
+  const activeRow = useMemo(() => activeProductionRow(rows, activeId), [rows, activeId])
+  const selectedRows = useMemo(() => selectedProductionRows(rows, selectedIds), [rows, selectedIds])
+  const produceRow = useMemo(() => productionRow(rows, produceProductId), [rows, produceProductId])
   const selectedEmployee = useMemo(
     () => employees.find((employee) => employee.employee_ref1c === produceEmployeeRef) ?? null,
     [employees, produceEmployeeRef],
   )
   const allOperationExecutorsSelected = useMemo(
-    () => produceOperations.length === 0 || produceOperations.every((operation) => Boolean(produceOperationEmployees[operation.spec_operation_id])),
+    () => areAllOperationExecutorsSelected(produceOperations, produceOperationEmployees),
     [produceOperations, produceOperationEmployees],
   )
   const produceRemainingQty = Number(produceRow?.remaining_qty ?? 0)
@@ -143,19 +159,20 @@ export function ProductionControlPage() {
   const canProduceRow = Boolean(produceRow && produceRemainingQty > 0)
 
   const load = useCallback(async (nextOffset: number) => {
+    const requestSeq = ++listRequestSeq.current
     setLoading(true)
     setError('')
     setMessage('')
     try {
-      const params = new URLSearchParams()
-      params.set('limit', String(limit))
-      params.set('offset', String(nextOffset))
-      if (focusProductId) params.set('product_id', focusProductId)
-      if (focusOrderId) params.set('order_id', focusOrderId)
-      Object.entries(filtersRef.current).forEach(([key, value]) => {
-        if (value) params.set(key, value)
+      const params = buildProductionOrderParams({
+        filters: filtersRef.current,
+        offset: nextOffset,
+        limit,
+        focusProductId,
+        focusOrderId,
       })
       const data = await listProductionOrders(params)
+      if (requestSeq !== listRequestSeq.current) return
       setRows(data.rows ?? [])
       setTotal(data.total ?? 0)
       setRunId(data.latest_run_id ?? null)
@@ -167,9 +184,10 @@ export function ProductionControlPage() {
         return data.rows?.[0]?.product_id ?? null
       })
     } catch (e) {
+      if (requestSeq !== listRequestSeq.current) return
       setError(e instanceof Error ? e.message : String(e))
     } finally {
-      setLoading(false)
+      if (requestSeq === listRequestSeq.current) setLoading(false)
     }
   }, [focusOrderId, focusProductId])
 
@@ -273,17 +291,7 @@ export function ProductionControlPage() {
     setSettingsSaving(true)
     setError('')
     try {
-      const saved = await saveProductionControlSettings({
-        workshop_warehouses: workshopRows
-          .map((row) => ({
-            resource_id: row.resource_id ?? row.workshop_id,
-            workshop_id: row.workshop_id ?? row.resource_id,
-            warehouse_ref1c: row.warehouse_ref1c,
-            production_warehouse_ref1c: row.production_warehouse_ref1c ?? '',
-          }))
-          .filter((row) => row.resource_id && row.warehouse_ref1c),
-        ignored_warehouses: Array.from(ignoredRefs).map((warehouse_ref1c) => ({ warehouse_ref1c })),
-      })
+      const saved = await saveProductionControlSettings(buildProductionSettingsPayload(workshopRows, ignoredRefs))
       setWarehouses(saved.warehouses ?? [])
       setWorkshopRows(saved.workshop_warehouses ?? [])
       setIgnoredRefs(new Set((saved.ignored_warehouses ?? []).map((row) => row.warehouse_ref1c).filter(Boolean)))
@@ -297,30 +305,32 @@ export function ProductionControlPage() {
   }
 
   const loadMaterials = useCallback(async (productId: number, refresh = true) => {
+    const requestSeq = ++materialsRequestSeq.current
     setActiveId(productId)
     setMaterials(null)
     try {
       const data = await getOrderMaterials(productId, refresh)
+      if (requestSeq !== materialsRequestSeq.current) return
       setMaterials(data)
       const coverageStatus = String(data.coverage_status || '')
       if (refresh && coverageStatus) {
-        setRows((list) => list.map((item) => {
-          if (item.product_id !== productId) return item
-          const canApplyMaterialCoverage = (!item.issue_status || item.issue_status === 'not_requested')
-            && coverageDrivenStatuses.has(String(item.coverage_status || item.status || ''))
-          if (!canApplyMaterialCoverage) return item
-          return {
-            ...item,
-            status: coverageDrivenStatuses.has(String(item.status || '')) ? coverageStatus : item.status,
-            coverage_status: coverageStatus,
-            coverage_label: data.coverage_label || coverageLabels[coverageStatus] || coverageStatus,
-          }
-        }))
+        setRows((list) => applyMaterialCoverage(list, productId, coverageStatus, data.coverage_label))
       }
     } catch (e) {
+      if (requestSeq !== materialsRequestSeq.current) return
       setError(e instanceof Error ? e.message : String(e))
     }
   }, [])
+
+  function beginDangerousMutation() {
+    if (dangerousMutationLocked.current) return false
+    dangerousMutationLocked.current = true
+    return true
+  }
+
+  function endDangerousMutation() {
+    dangerousMutationLocked.current = false
+  }
 
   async function changeStatus(row: OrderRow, status: string) {
     const previous = row.status
@@ -392,6 +402,7 @@ export function ProductionControlPage() {
   async function createMaterialIssues(sourceWarehouseRef?: string, productIds?: number[]) {
     const ids = productIds ?? Array.from(selectedIds)
     if (!ids.length) return
+    if (!beginDangerousMutation()) return
     setLoading(true)
     setError('')
     setMessage('')
@@ -412,6 +423,7 @@ export function ProductionControlPage() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
+      endDangerousMutation()
       setLoading(false)
     }
   }
@@ -436,6 +448,7 @@ export function ProductionControlPage() {
   async function exportTo1C(sourceWarehouseRef?: string, productIds?: number[]) {
     const ids = productIds ?? Array.from(selectedIds)
     if (!ids.length) return
+    if (!beginDangerousMutation()) return
     setLoading(true)
     setError('')
     setMessage('')
@@ -489,11 +502,13 @@ export function ProductionControlPage() {
       closeRouteSheetWindow(printWindow)
       setError(e instanceof Error ? e.message : String(e))
     } finally {
+      endDangerousMutation()
       setLoading(false)
     }
   }
 
   async function syncFrom1C() {
+    if (!beginDangerousMutation()) return
     setLoading(true)
     setError('')
     setMessage('')
@@ -511,6 +526,7 @@ export function ProductionControlPage() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
+      endDangerousMutation()
       setLoading(false)
     }
   }
@@ -586,16 +602,12 @@ export function ProductionControlPage() {
   }
 
   function chainExecutorRows(operations: ProductionOperationOption[]) {
-    return operations.map((operation) => ({
-      line_number: operation.line_number,
-      spec_operation_id: operation.spec_operation_id,
-      operation_id: operation.operation_id,
-      employee_ref1c: chainOperationEmployees[operation.spec_operation_id] || '',
-    }))
+    return buildOperationExecutors(operations, chainOperationEmployees)
   }
 
   async function submitChainClose() {
     if (!chainRowId) return
+    if (!beginDangerousMutation()) return
     setChainSaving(true)
     setChainError('')
     try {
@@ -622,6 +634,7 @@ export function ProductionControlPage() {
     } catch (e) {
       setChainError(e instanceof Error ? e.message : String(e))
     } finally {
+      endDangerousMutation()
       setChainSaving(false)
     }
   }
@@ -638,6 +651,7 @@ export function ProductionControlPage() {
       setProduceOpen(false)
       return
     }
+    if (!beginDangerousMutation()) return
     setProduceSaving(true)
     setError('')
     setProduceError('')
@@ -687,16 +701,7 @@ export function ProductionControlPage() {
       }
 
       // Step 1: record manufacture locally (bumps produced_qty / remaining_qty).
-      const operationExecutors = produceOperations.map((operation) => {
-        const employeeRef = produceOperationEmployees[operation.spec_operation_id]
-        const employee = employees.find((row) => row.employee_ref1c === employeeRef)
-        return {
-          line_number: operation.line_number,
-          spec_operation_id: operation.spec_operation_id,
-          operation_id: operation.operation_id,
-          employee_ref1c: employee?.employee_ref1c || employeeRef,
-        }
-      })
+      const operationExecutors = buildOperationExecutors(produceOperations, produceOperationEmployees, employees)
       const localResult = await produceOrder(produceRow.product_id, {
         qty: requestedQty,
         executor: produceOperations.length ? undefined : selectedEmployee?.employee_name || undefined,
@@ -767,6 +772,7 @@ export function ProductionControlPage() {
         await load(offsetRef.current)
       }
     } finally {
+      endDangerousMutation()
       setProduceSaving(false)
     }
   }
@@ -824,11 +830,14 @@ export function ProductionControlPage() {
   }
 
   async function deleteSelectedLocalOrders() {
-    const selected = rows.filter((row) => selectedIds.has(row.product_id))
-    const deletable = selected.filter((row) => !row.order_ref1c)
+    const deletable = deletableProductionRows(rows, selectedIds)
     if (!deletable.length) return
+    if (!beginDangerousMutation()) return
     const names = deletable.map((row) => row.order_prodplan_number || row.order_number).join(', ')
-    if (!window.confirm(`Удалить локальные заказы без 1С: ${names}?`)) return
+    if (!window.confirm(`Удалить локальные заказы без 1С: ${names}?`)) {
+      endDangerousMutation()
+      return
+    }
     setLoading(true)
     setError('')
     setMessage('')
@@ -842,17 +851,14 @@ export function ProductionControlPage() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
+      endDangerousMutation()
       setLoading(false)
     }
   }
 
   function toggleSort(key: ProductionOrderSortKey) {
     const current = filtersRef.current
-    const next = {
-      ...current,
-      sort_by: key,
-      sort_dir: current.sort_by === key && current.sort_dir === 'asc' ? 'desc' : 'asc',
-    } satisfies ProductionFilters
+    const next = nextProductionSort(current, key)
     filtersRef.current = next
     setFilters(next)
     void load(0)
@@ -878,8 +884,7 @@ export function ProductionControlPage() {
     if (productId) void loadMaterials(productId, false)
   }, [activeRow?.product_id, loadMaterials])
 
-  const visibleFrom = total ? offset + 1 : 0
-  const visibleTo = Math.min(offset + rows.length, total)
+  const { visibleFrom, visibleTo } = productionPagination(offset, rows.length, total)
 
   return (
     <main className="workArea">
@@ -924,8 +929,8 @@ export function ProductionControlPage() {
           onOpenRootProductFilter={() => setRootDialogOpen(true)}
         />
 
-        {error && <div className="errorLine">{error}</div>}
-        {message && <div className="successLine">{message}</div>}
+        {error && <div className="errorLine" role="alert">{error}</div>}
+        {message && <div className="successLine" role="status">{message}</div>}
 
         <div className="split">
           <div className="tablePane">

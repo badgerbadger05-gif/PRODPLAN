@@ -32,12 +32,12 @@ export function ChainCloseDialog({
   submitChainClose,
 }: Props) {
   return (
-    <div className="dialogOverlay" onClick={(e) => { if (e.target === e.currentTarget && !chainSaving) setChainOpen(false) }}>
+    <div className="dialogOverlay" role="dialog" aria-modal="true" aria-labelledby="chain-close-dialog-title" onClick={(e) => { if (e.target === e.currentTarget && !chainSaving) setChainOpen(false) }}>
       <div className="dialogBox">
-        <div className="dialogHeader">Закрыть цепочку окраска↔сварка</div>
+        <div className="dialogHeader" id="chain-close-dialog-title">Закрыть цепочку окраска↔сварка</div>
         <div className="dialogBody">
-          {chainError && <div className="dialogError">{chainError}</div>}
-          {chainLoading && <div className="fieldHint">Загрузка предпросмотра...</div>}
+          {chainError && <div className="dialogError" role="alert">{chainError}</div>}
+          {chainLoading && <div className="fieldHint" role="status">Загрузка предпросмотра...</div>}
           {chainPreview && (
             <>
               <div className="fieldHint">

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
-import { render, screen, within, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, within, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 
@@ -153,6 +153,12 @@ function filterTable(container: HTMLElement): HTMLElement {
   return el as HTMLElement
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise })
+  return { promise, resolve }
+}
+
 // Scope to the orders table: item names (e.g. 'Кронштейн') also appear in the
 // detail pane, so an unscoped getByText would match multiple elements.
 function rowFor(name: string): HTMLElement {
@@ -284,6 +290,36 @@ describe('ProductionControlPage — characterization', () => {
     await waitFor(() => expect(getOrderMaterials).toHaveBeenCalledWith(101, true))
   })
 
+  it('keeps the newest list response when an older refresh resolves last', async () => {
+    const oldList = deferred<Awaited<ReturnType<typeof listProductionOrders>>>()
+    const newList = deferred<Awaited<ReturnType<typeof listProductionOrders>>>()
+    vi.mocked(listProductionOrders).mockReturnValueOnce(oldList.promise).mockReturnValueOnce(newList.promise)
+    renderPage()
+    fireEvent.click(screen.getByRole('button', { name: 'Сформировать' }))
+
+    await act(async () => { newList.resolve({ rows: [fakeRows()[1]], total: 1, limit: 100, offset: 0, latest_run_id: 88 }) })
+    expect(await within(ordersTable(document.body)).findByText('Вал')).toBeInTheDocument()
+    expect(screen.getByText('MRP run: 88')).toBeInTheDocument()
+    await act(async () => { oldList.resolve({ rows: [fakeRows()[0]], total: 1, limit: 100, offset: 0, latest_run_id: 77 }) })
+    expect(screen.queryByText('Кронштейн')).not.toBeInTheDocument()
+    expect(screen.getByText('MRP run: 88')).toBeInTheDocument()
+  })
+
+  it('keeps materials for the newest selected order when an older detail resolves last', async () => {
+    const oldMaterials = deferred<MaterialsResponse>()
+    const newMaterials = deferred<MaterialsResponse>()
+    vi.mocked(getOrderMaterials).mockReturnValueOnce(oldMaterials.promise).mockReturnValue(newMaterials.promise)
+    renderPage()
+    await waitFor(() => expect(within(ordersTable(document.body)).getByText('Вал')).toBeInTheDocument())
+    await waitFor(() => expect(getOrderMaterials).toHaveBeenCalledWith(101, false))
+    fireEvent.doubleClick(rowFor('Вал'))
+    await act(async () => { newMaterials.resolve({ ...fakeMaterials(), order_number: 'ORD-2', item_name: 'Вал', components: [{ ...fakeMaterials().components[0], item_name: 'Новый материал' }] }) })
+    expect(await screen.findByText('Новый материал')).toBeInTheDocument()
+    await act(async () => { oldMaterials.resolve({ ...fakeMaterials(), components: [{ ...fakeMaterials().components[0], item_name: 'Старый материал' }] }) })
+    expect(screen.queryByText('Старый материал')).not.toBeInTheDocument()
+    expect(screen.getByText('Новый материал')).toBeInTheDocument()
+  })
+
   it('changing a row status calls updateOrderStatus with product_id and new status', async () => {
     const user = userEvent.setup()
     renderPage()
@@ -327,7 +363,8 @@ describe('ProductionControlPage — characterization', () => {
 
     await user.click(produceBtn)
 
-    expect(await screen.findByText('Произвести - Кронштейн')).toBeInTheDocument()
+    expect(await screen.findByRole('dialog', { name: 'Произвести - Кронштейн' })).toBeInTheDocument()
+    expect(screen.getByLabelText('Количество (шт)')).toBeInTheDocument()
     // Dialog bootstraps operations + employees for the selected product.
     await waitFor(() => expect(listProductionOperations).toHaveBeenCalledWith(101))
     expect(listProductionEmployees).toHaveBeenCalled()
@@ -344,6 +381,24 @@ describe('ProductionControlPage — characterization', () => {
     expect(await screen.findByText(/Синхронизация: проверено 2/)).toBeInTheDocument()
   })
 
+  it('exposes sortable state and supports keyboard activation and selection of order rows', async () => {
+    const { container } = renderPage()
+    await screen.findByText('Вал')
+    const table = ordersTable(container)
+    expect(table).toHaveAccessibleName('Заказы на производство')
+    expect(within(table).getByRole('columnheader', { name: /План/ })).toHaveAttribute('aria-sort', 'ascending')
+
+    const shaftRow = rowFor('Вал')
+    shaftRow.focus()
+    fireEvent.keyDown(shaftRow, { key: ' ' })
+    expect(within(shaftRow).getByRole('checkbox', { name: 'Выбрать заказ ORD-2' })).toBeChecked()
+
+    fireEvent.keyDown(shaftRow, { key: 'Enter' })
+    await waitFor(() => expect(getOrderMaterials).toHaveBeenCalledWith(102, true))
+    expect(shaftRow).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByRole('combobox', { name: 'Статус заказа ORD-2' })).toBeInTheDocument()
+  })
+
   it('deleting a selected local order confirms then calls deleteProductionOrder', async () => {
     const user = userEvent.setup()
     renderPage()
@@ -358,6 +413,22 @@ describe('ProductionControlPage — characterization', () => {
 
     expect(window.confirm).toHaveBeenCalled()
     await waitFor(() => expect(deleteProductionOrder).toHaveBeenCalledWith(101))
+  })
+
+  it('runs only one dangerous delete mutation when the command is double-clicked', async () => {
+    const pendingDelete = deferred<Awaited<ReturnType<typeof deleteProductionOrder>>>()
+    vi.mocked(deleteProductionOrder).mockReturnValueOnce(pendingDelete.promise)
+    renderPage()
+    await screen.findByText('Вал')
+    fireEvent.click(within(rowFor('Кронштейн')).getByRole('checkbox'))
+    const deleteBtn = screen.getByRole('button', { name: 'Удалить' })
+    act(() => {
+      fireEvent.click(deleteBtn)
+      fireEvent.click(deleteBtn)
+    })
+    expect(window.confirm).toHaveBeenCalledOnce()
+    expect(deleteProductionOrder).toHaveBeenCalledOnce()
+    await act(async () => { pendingDelete.resolve({} as never) })
   })
 
   it('changing the status filter re-requests orders with the status param', async () => {
@@ -391,6 +462,6 @@ describe('ProductionControlPage — characterization', () => {
     vi.mocked(listProductionOrders).mockRejectedValue(new Error('boom-load-failed'))
     renderPage()
 
-    expect(await screen.findByText('boom-load-failed')).toBeInTheDocument()
+    expect(await screen.findByRole('alert')).toHaveTextContent('boom-load-failed')
   })
 })

@@ -39,7 +39,7 @@ function orderMainLine(row: OrderRow) {
 
 export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSelectIds, onActivate, onOpenMaterials, onChangeStatus, onToggleSort }: Props) {
   return (
-    <table className="journalTable productionOrdersTable" style={{ minWidth: tableMinWidth(productionOrderColumns) }}>
+    <table aria-label="Заказы на производство" className="journalTable productionOrdersTable" style={{ minWidth: tableMinWidth(productionOrderColumns) }}>
       <colgroup>
         {productionOrderColumns.map((column) => (
           <col key={column.key} className={column.grow ? 'growCol' : undefined} style={tableColumnStyle(column)} />
@@ -48,7 +48,12 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
       <thead>
         <tr>
           {productionOrderColumns.map((column) => (
-            <th key={column.key} className={column.className} style={tableColumnStyle(column)}>
+            <th
+              key={column.key}
+              className={column.className}
+              style={tableColumnStyle(column)}
+              aria-sort={column.sortable && sort.sortBy === column.key ? (sort.sortDir === 'asc' ? 'ascending' : 'descending') : undefined}
+            >
               {column.sortable ? (
                 <button type="button" className="tableSortButton" onClick={() => onToggleSort(column.key as ProductionOrderSortKey)}>
                   {column.title}{sortGlyph(sort, column.key as ProductionOrderSortKey)}
@@ -60,10 +65,32 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
       </thead>
       <tbody>
         {rows.map((row) => (
-          <tr key={row.product_id} className={row.product_id === activeRow?.product_id ? 'activeRow' : ''} onClick={() => onActivate(row.product_id)} onDoubleClick={() => onOpenMaterials(row)}>
+          <tr
+            key={row.product_id}
+            className={row.product_id === activeRow?.product_id ? 'activeRow' : ''}
+            tabIndex={0}
+            aria-selected={row.product_id === activeRow?.product_id}
+            onClick={() => onActivate(row.product_id)}
+            onDoubleClick={() => onOpenMaterials(row)}
+            onKeyDown={(event) => {
+              if (event.target !== event.currentTarget) return
+              if (event.key === 'Enter') {
+                event.preventDefault()
+                onActivate(row.product_id)
+                onOpenMaterials(row)
+              } else if (event.key === ' ') {
+                event.preventDefault()
+                const next = new Set(selectedIds)
+                if (next.has(row.product_id)) next.delete(row.product_id)
+                else next.add(row.product_id)
+                onSelectIds(next)
+              }
+            }}
+          >
             <td className="checkCol">
               <input
                 type="checkbox"
+                aria-label={`Выбрать заказ ${orderMainLine(row)}`}
                 checked={selectedIds.has(row.product_id)}
                 onChange={(e) => {
                   const next = new Set(selectedIds)
@@ -111,7 +138,7 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
               <span className="muted">{row.stage_name || ''}</span>
             </td>
             <td>
-              <select value={productionStatusSelectValue(row.status)} onChange={(e) => onChangeStatus(row, e.target.value)} onClick={(e) => e.stopPropagation()}>
+              <select aria-label={`Статус заказа ${orderMainLine(row)}`} value={productionStatusSelectValue(row.status)} onChange={(e) => onChangeStatus(row, e.target.value)} onClick={(e) => e.stopPropagation()}>
                 {manualProductionStatusOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
               </select>
             </td>

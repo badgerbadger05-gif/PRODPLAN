@@ -51,17 +51,18 @@ export function ProduceDialog({
   submitProduce,
 }: Props) {
   return (
-    <div className="dialogOverlay" onClick={(e) => { if (e.target === e.currentTarget) setProduceOpen(false) }}>
+    <div className="dialogOverlay" role="dialog" aria-modal="true" aria-labelledby="produce-dialog-title" onClick={(e) => { if (e.target === e.currentTarget) setProduceOpen(false) }}>
       <div className="dialogBox">
-        <div className="dialogHeader">Произвести - {produceRow.item_name}</div>
+        <div className="dialogHeader" id="produce-dialog-title">Произвести - {produceRow.item_name}</div>
         <div className="dialogBody">
-          {produceError && <div className="dialogError">{produceError}</div>}
+          {produceError && <div className="dialogError" role="alert">{produceError}</div>}
           {!canProduceRow && (
             <div className="fieldHint danger">Эта строка уже произведена полностью.</div>
           )}
           <div className="dialogField">
             <label>Количество ({produceRow.unit || 'шт'})</label>
             <input
+              aria-label={`Количество (${produceRow.unit || 'шт'})`}
               type="number"
               min={0}
               step={1}
