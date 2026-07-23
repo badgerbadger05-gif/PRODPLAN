@@ -84,15 +84,24 @@ export function PurchaseDetailPane({ activeRow, embedded = false }: Props) {
         )}
         <span>Поставщик</span><strong>{activeRow.supplier_name || 'Не указан'}</strong>
         <span>Заказано</span><strong>{qty(activeRow.quantity)} {activeRow.unit || ''}</strong>
-        <span>Поступило</span><strong>{qty(activeRow.received_qty)} {activeRow.unit || ''}</strong>
+        <span>Поступило</span>
+        <strong>
+          {activeRow.received_qty === null
+            ? <span className="muted" title="Факт поступления отсутствует в снимке">н/д</span>
+            : `${qty(activeRow.received_qty)} ${activeRow.unit || ''}`}
+        </strong>
         <span>Осталось</span><strong>{qty(activeRow.remaining_qty)} {activeRow.unit || ''}</strong>
-        {activeRow.price > 0 && (<><span>Цена</span><strong>{qty(activeRow.price)}</strong></>)}
-        {activeRow.amount > 0 && (<><span>Сумма</span><strong>{qty(activeRow.amount)}</strong></>)}
+        {activeRow.price !== null && activeRow.price > 0 && (<><span>Цена</span><strong>{qty(activeRow.price)}</strong></>)}
+        {activeRow.amount !== null && activeRow.amount > 0 && (<><span>Сумма</span><strong>{qty(activeRow.amount)}</strong></>)}
         <span>Статус</span>
         <strong>
-          <span className={`pill ${purchaseLineStatusPillClass(activeRow.line_status)}`}>
-            {purchaseLineStatusLabel(activeRow.line_status)}
-          </span>
+          {activeRow.line_status === 'unavailable'
+            ? <span className="muted">н/д — факт поступления недоступен</span>
+            : (
+              <span className={`pill ${purchaseLineStatusPillClass(activeRow.line_status)}`}>
+                {purchaseLineStatusLabel(activeRow.line_status)}
+              </span>
+            )}
         </strong>
         {mrpHref && (
           <>
@@ -118,10 +127,14 @@ export function PurchaseDetailPane({ activeRow, embedded = false }: Props) {
                 {card.lines.map((line) => (
                   <div key={line.row_key} className="detailListRow" title={`${line.item_article || line.item_code || ''}`}>
                     <span className="detailListName">{line.item_name}</span>
-                    <span>{qty(line.received_qty)} / {qty(line.quantity)}</span>
-                    <span className={`miniPill ${purchaseLineStatusPillClass(line.line_status)}`}>
-                      {purchaseLineStatusLabel(line.line_status)}
-                    </span>
+                    <span>{line.received_qty === null ? 'н/д' : qty(line.received_qty)} / {qty(line.quantity)}</span>
+                    {line.line_status === 'unavailable'
+                      ? <span className="muted">н/д</span>
+                      : (
+                        <span className={`miniPill ${purchaseLineStatusPillClass(line.line_status)}`}>
+                          {purchaseLineStatusLabel(line.line_status)}
+                        </span>
+                      )}
                   </div>
                 ))}
               </div>

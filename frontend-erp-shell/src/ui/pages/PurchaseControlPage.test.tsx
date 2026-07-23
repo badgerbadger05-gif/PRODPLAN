@@ -49,6 +49,8 @@ const purchaseRow: PurchaseRow = {
   price: 100,
   amount: 1200,
   run_id: 17,
+  fact_status: 'available',
+  fact_source: 'mrp',
 }
 
 const orderedRow: PurchaseRow = {
@@ -61,8 +63,11 @@ const orderedRow: PurchaseRow = {
   order_number: 'ЗП-000008',
   order_ref1c: 'order-ref',
   order_state_name: 'К поступлению',
-  line_status: 'expected',
+  received_qty: null,
+  line_status: 'unavailable',
   supply_phase: 'in_transit',
+  fact_status: 'unavailable',
+  fact_source: 'ledger_future_supply',
 }
 
 function renderPage(url = '/purchase-control') {
@@ -82,14 +87,29 @@ describe('PurchaseControlPage Doctype migration', () => {
       limit: 100,
       offset: 0,
       run_id: 17,
+      run_ids: [17],
+      truth_status: 'accepted',
+      ledger_generation_id: 23,
+      meta: {
+        snapshot_id: 51,
+        ledger_generation: 23,
+        ledger_generation_id: 23,
+        cutoff: '2026-07-23T12:00:00+00:00',
+        truth_status: 'accepted',
+        truth_reason: null,
+        fact_source: 'ledger',
+        received_qty_status: 'unavailable',
+        read_only: true,
+      },
       summary: {
         total_rows: 2,
-        by_status: { to_order: 1, expected: 1 },
+        by_status: { to_order: 1, unavailable: 1 },
         by_phase: { no_goods: 1, in_transit: 1 },
         to_order: 1,
         overdue: 0,
         expected_7d: 2,
         in_transit_amount: 1200,
+        fact_status: 'unavailable',
       },
     })
     vi.mocked(getPurchaseFilters).mockResolvedValue({
@@ -114,6 +134,15 @@ describe('PurchaseControlPage Doctype migration', () => {
         supplier_name: 'Промснаб',
       },
       lines: [orderedRow],
+      meta: {
+        snapshot_id: 51,
+        ledger_generation: 23,
+        cutoff: '2026-07-23T12:00:00+00:00',
+        truth_status: 'accepted',
+        fact_source: 'ledger',
+        received_qty_status: 'unavailable',
+        read_only: true,
+      },
     })
     vi.mocked(exportPurchasesTo1C).mockResolvedValue({ orders_created: 1, orders_existing: 0 })
     vi.mocked(syncSupplierOrdersFrom1C).mockResolvedValue({ orders_created: 0, orders_updated: 1 })
@@ -127,6 +156,8 @@ describe('PurchaseControlPage Doctype migration', () => {
     expect(screen.getByText('ЗП-000008')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Нет товара: 1' })).toBeInTheDocument()
     expect(screen.getByRole('option', { name: 'Промснаб' })).toBeInTheDocument()
+    expect(screen.getAllByText('н/д').length).toBeGreaterThan(0)
+    expect(screen.getByText('Факт поступления: н/д')).toBeInTheDocument()
 
     expect(vi.mocked(listPurchaseJournal).mock.calls[0]?.[0].get('order_id')).toBe('8')
     expect(vi.mocked(listPurchaseJournal).mock.calls[0]?.[0].get('search')).toBe('вал')

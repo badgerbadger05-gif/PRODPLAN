@@ -70,7 +70,7 @@ export function createPurchaseOrdersDoctype(
           },
           { key: 'item', title: 'Номенклатура', value: (row) => row.item_name },
           { key: 'quantity', title: 'Заказано', value: (row) => row.quantity },
-          { key: 'received', title: 'Поступило', value: (row) => row.received_qty },
+          { key: 'received', title: 'Поступило', value: (row) => row.received_qty ?? 'н/д' },
           {
             key: 'remaining',
             title: 'Осталось',

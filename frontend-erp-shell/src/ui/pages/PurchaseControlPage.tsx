@@ -66,7 +66,10 @@ export function PurchaseControlPage() {
       state={journal}
       access={access}
       breadcrumbs="Закупки / Журнал закупок"
-      renderTopBadge={(state) => <>MRP run: {Number(state.listMeta.run_id) || '—'}</>}
+      renderTopBadge={(state) => {
+        const meta = state.listMeta.meta as { ledger_generation?: number } | undefined
+        return <>Ledger: {Number(meta?.ledger_generation ?? state.listMeta.ledger_generation_id) || '—'}</>
+      }}
       renderFilters={() => null}
       renderTable={(state) => (
         <div className="tablePane">
@@ -129,6 +132,11 @@ export function PurchaseControlPage() {
                   Просрочено: {summary.overdue}
                 </button>
                 <span className="toolbarText">Ожидается за 7 дн: {summary.expected_7d}</span>
+                {summary.fact_status === 'unavailable' && (
+                  <span className="toolbarText" title="Снимок не содержит подтверждённый факт поступления">
+                    Факт поступления: н/д
+                  </span>
+                )}
               </>
             )}
           </div>

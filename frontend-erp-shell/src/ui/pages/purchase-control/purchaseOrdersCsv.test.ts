@@ -33,6 +33,8 @@ const row: PurchaseRow = {
   price: 50,
   amount: 0,
   run_id: 3,
+  fact_status: 'available',
+  fact_source: 'mrp',
 }
 
 describe('purchase journal CSV schema', () => {

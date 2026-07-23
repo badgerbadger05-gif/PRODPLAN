@@ -89,7 +89,9 @@ export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseRowKeys, 
               <span>/ {qty(row.quantity)} {row.unit || ''}</span>
             </td>
             <td className="numCell">
-              {row.received_qty > 0 ? qty(row.received_qty) : <span className="muted">—</span>}
+              {row.received_qty === null
+                ? <span className="muted" title="Факт поступления отсутствует в снимке">н/д</span>
+                : row.received_qty > 0 ? qty(row.received_qty) : <span className="muted">—</span>}
             </td>
             <td className="dateCell">
               {row.line_status === 'to_order' ? (
@@ -97,7 +99,7 @@ export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseRowKeys, 
               ) : (
                 <span>{dateRu(row.delivery_date) || '—'}</span>
               )}
-              {row.overdue_days > 0 && (
+              {row.overdue_days !== null && row.overdue_days > 0 && (
                 <span className="forecastShift late" title="Дней просрочки от плановой даты">+{row.overdue_days} дн</span>
               )}
             </td>
@@ -114,12 +116,16 @@ export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseRowKeys, 
               )}
             </td>
             <td>
-              <span className={`pill ${purchaseLineStatusPillClass(row.line_status)}`}>
-                {purchaseLineStatusLabel(row.line_status)}
-              </span>
+              {row.line_status === 'unavailable'
+                ? <span className="muted" title="Статус зависит от недоступного факта поступления">н/д</span>
+                : (
+                  <span className={`pill ${purchaseLineStatusPillClass(row.line_status)}`}>
+                    {purchaseLineStatusLabel(row.line_status)}
+                  </span>
+                )}
             </td>
             <td className="numCell">
-              {row.amount > 0 ? qty(row.amount) : <span className="muted">—</span>}
+              {row.amount !== null && row.amount > 0 ? qty(row.amount) : <span className="muted">—</span>}
             </td>
           </tr>
           )
