@@ -653,4 +653,36 @@ describe('DbrFeederPage characterization', () => {
     renderPage()
     expect(await screen.findByText(/dbr_cockpit_snapshot_unavailable/)).toBeVisible()
   })
+
+  it('keeps a read-only Ledger snapshot inspectable while exposing no legacy or live actions', async () => {
+    vi.mocked(getDbrFeederCockpit).mockResolvedValue({
+      ...cockpit,
+      meta: { ...cockpit.meta, read_only: true, chain_enabled: true },
+    })
+    const user = userEvent.setup()
+    renderPage()
+
+    expect(await screen.findByRole('note')).toHaveTextContent('Режим только чтение')
+    expect(screen.getByRole('note')).toHaveTextContent('снимок Item Ledger')
+    expect(screen.queryByRole('button', { name: 'Предпросмотр пересчёта' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Предпросмотр сигналов' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Заказать поставщику/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Запустить…' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Цепочка:/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Рейс:/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('checkbox', { name: /закупочн|поставщик/i })).not.toBeInTheDocument()
+
+    const signalTable = document.querySelector('.dbrSignalTable') as HTMLElement
+    await user.click(await within(signalTable).findByRole('row', { name: /GEAR-01/ }))
+    expect(await screen.findByRole('complementary', { name: 'Карточка сигнала' })).toHaveTextContent('Действия отключены')
+    expect(previewDbrFeederPositions).not.toHaveBeenCalled()
+    expect(previewDbrFeederSignals).not.toHaveBeenCalled()
+    expect(refreshDbrFeederSignals).not.toHaveBeenCalled()
+    expect(refreshDbrFeederChain).not.toHaveBeenCalled()
+    expect(previewDbrProcessingChain).not.toHaveBeenCalled()
+    expect(previewDbrProcessingOrder).not.toHaveBeenCalled()
+    expect(getDbrProcessingTripManifest).not.toHaveBeenCalled()
+    expect(launchDbrSignal).not.toHaveBeenCalled()
+    expect(launchDbrPurchase).not.toHaveBeenCalled()
+  })
 })

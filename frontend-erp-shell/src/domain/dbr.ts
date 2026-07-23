@@ -593,6 +593,7 @@ export type DbrFeederCockpitMeta = {
   truth_status?: string | null
   truth_reason?: string | null
   chain_enabled?: boolean
+  read_only?: boolean
   unavailable_sections?: DbrCockpitUnavailableSections
 }
 

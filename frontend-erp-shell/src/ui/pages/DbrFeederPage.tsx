@@ -43,6 +43,7 @@ export function DbrFeederPage() {
   const signalsUnavailable = sectionUnavailableReason('signals')
   const deficitsUnavailable = sectionUnavailableReason('deficits')
   const processingUnavailable = sectionUnavailableReason('processing_board')
+  const readOnly = cockpitMeta?.read_only === true
   const processingItemIds = new Set((processingBoard?.positions ?? []).map((row) => row.item_id))
   const processingSignals = signals.filter((signal) => signal.status === 'Open' && processingItemIds.has(signal.item_id))
   return (
@@ -84,7 +85,7 @@ export function DbrFeederPage() {
           <button onClick={applyFilters} disabled={loading || Boolean(positionsUnavailable)}>Применить</button>
           <button onClick={resetFilters} disabled={loading || Boolean(positionsUnavailable)}>Сбросить</button>
           <div className="commandBarSpacer" />
-          <button onClick={() => void calculatePreview()} disabled={saving || Boolean(positionsUnavailable)}>Предпросмотр пересчёта</button>
+          {!readOnly && <button onClick={() => void calculatePreview()} disabled={saving || Boolean(positionsUnavailable)}>Предпросмотр пересчёта</button>}
         </div>
 
         {error && <div className="errorLine">{error}</div>}
@@ -92,10 +93,13 @@ export function DbrFeederPage() {
         {cockpitMeta && <div className="dbrFeederNotice" role="status">
           Сохранённый снимок #{cockpitMeta.snapshot_id ?? '—'} · поколение Ledger #{cockpitMeta.ledger_generation ?? '—'} · cutoff {dateTimeRu(cockpitMeta.cutoff) || '—'}.
         </div>}
+        {readOnly && <div className="dbrFeederNotice" role="note">
+          Режим только чтение: показан зафиксированный снимок Item Ledger. Пересчёты, обновление проекций и создание документов отключены.
+        </div>}
         {positionsUnavailable && <div className="errorLine">Позиции супермаркета недоступны: {positionsUnavailable}</div>}
-        <div className="dbrFeederNotice">Пересчёт позиций и предпросмотр сигналов — только чтение. Запуск сигнала и заказ поставщику создают документы в живой 1С и всегда требуют подтверждения в отдельном окне.</div>
+        {!readOnly && <div className="dbrFeederNotice">Пересчёт позиций и предпросмотр сигналов — только чтение. Запуск сигнала и заказ поставщику создают документы в живой 1С и всегда требуют подтверждения в отдельном окне.</div>}
 
-        {preview && (
+        {!readOnly && preview && (
           <section className="dbrFeederPreview" aria-label="Предпросмотр пересчёта">
             <div>
               <strong>График №{preview.schedule_id}: {preview.positions.length} позиций</strong>
@@ -115,7 +119,7 @@ export function DbrFeederPage() {
               <h2>Advisory-очередь питающего контура</h2>
               <p>«Пополнение» управляет полкой, «Под график» показывает дефицит к конкретному слоту. Отрицательный приоритет означает, что срок запуска ещё не наступил.</p>
             </div>
-            <div className="dbrSignalHeaderActions">
+            {!readOnly && <div className="dbrSignalHeaderActions">
               <button onClick={() => void calculateSignalPreview()} disabled={saving || Boolean(signalsUnavailable)}>Предпросмотр сигналов</button>
               <button
                 className="dbrDanger"
@@ -129,10 +133,10 @@ export function DbrFeederPage() {
                 <button onClick={() => void calculateChainPreview()} disabled={saving || Boolean(signalsUnavailable)}>Цепочка: предпросмотр</button>
                 <button onClick={() => void runChainRefresh()} disabled={saving || Boolean(signalsUnavailable)}>Цепочка: обновить</button>
               </>}
-            </div>
+            </div>}
           </div>
 
-          {signalPreview && (
+          {!readOnly && signalPreview && (
             <div className="dbrFeederPreview dbrSignalPreview" aria-label="Предпросмотр обновления сигналов">
               <div>
                 <strong>График №{signalPreview.schedule_id ?? 'не активен'}: {signalPreview.actionable} актуальных сигналов</strong>
@@ -173,7 +177,7 @@ export function DbrFeederPage() {
           <div className="dbrSignalLayout">
             <div className="dbrFeederTableWrap">
               <table className="journalTable dbrTable dbrSignalTable">
-                <thead><tr><th className="dbrCheckCell"><input type="checkbox" aria-label="Выбрать все закупочные сигналы" checked={allPurchaseSelected} disabled={!purchaseSelectableIds.length} onChange={(e) => setSelectedPurchase(e.target.checked ? new Set(purchaseSelectableIds) : new Set())} /></th><th aria-label="Раскрытие" /><th>Тип</th><th>Материал</th><th>KIT</th><th>Приоритет</th><th>Зона</th><th>Номенклатура</th><th>Склад</th><th>Крайний срок запуска</th><th>Дата потребности / слота</th><th className="numCell">Спрос</th><th className="numCell">Дефицит</th><th className="numCell">Количество</th><th className="numCell">Расчётная партия</th><th>Слот</th><th>Качество</th><th>Статус</th><th>Обновлён</th><th aria-label="Действие" /></tr></thead>
+                <thead><tr><th className="dbrCheckCell">{!readOnly && <input type="checkbox" aria-label="Выбрать все закупочные сигналы" checked={allPurchaseSelected} disabled={!purchaseSelectableIds.length} onChange={(e) => setSelectedPurchase(e.target.checked ? new Set(purchaseSelectableIds) : new Set())} />}</th><th aria-label="Раскрытие" /><th>Тип</th><th>Материал</th><th>KIT</th><th>Приоритет</th><th>Зона</th><th>Номенклатура</th><th>Склад</th><th>Крайний срок запуска</th><th>Дата потребности / слота</th><th className="numCell">Спрос</th><th className="numCell">Дефицит</th><th className="numCell">Количество</th><th className="numCell">Расчётная партия</th><th>Слот</th><th>Качество</th><th>Статус</th><th>Обновлён</th><th aria-label="Действие" /></tr></thead>
                 <tbody>
                   {!signalsLoading && !visibleSignals.length && <tr><td colSpan={20} className="emptyCell">{deficitFilter ? 'Нет сигналов, заблокированных этой позицией.' : 'Сигналы не найдены. Выполните предпросмотр и явное обновление.'}</td></tr>}
                   {visibleSignals.map((signal) => {
@@ -187,7 +191,7 @@ export function DbrFeederPage() {
                       <Fragment key={signal.id}>
                       <tr className={`${selectedSignal?.id === signal.id ? 'selected' : ''} ${signal.kit_force ? 'dbrSignalKitRow' : ''} ${signal.is_incomplete ? 'dbrFeederIncomplete' : ''}`} onClick={() => void selectSignal(signal.id)}>
                         <td className="dbrCheckCell" onClick={(e) => e.stopPropagation()}>
-                          {signal.signal_type === 'Пополнение' && signal.status === 'Open' && (
+                          {!readOnly && signal.signal_type === 'Пополнение' && signal.status === 'Open' && (
                             <input type="checkbox" aria-label={`Выбрать сигнал ${signal.item_code ?? signal.id} для заказа поставщику`} checked={selectedPurchase.has(signal.id)} onChange={() => togglePurchase(signal.id)} />
                           )}
                         </td>
@@ -224,7 +228,7 @@ export function DbrFeederPage() {
                         <td>{signal.status === 'Open' ? 'Открыт' : signal.status === 'Diagnostic' ? 'Диагностика' : signal.status === 'Cancelled' ? 'Отменён' : signal.status}</td>
                         <td>{dateTimeRu(signal.refreshed_at) || '—'}</td>
                         <td className="dbrActionCell" onClick={(e) => e.stopPropagation()}>
-                          {signal.can_launch && signal.status === 'Open' && (
+                          {!readOnly && signal.can_launch && signal.status === 'Open' && (
                             <button className="dbrLaunchBtn" onClick={() => void startLaunch(signal)} disabled={launchBusy} title="Запустить в производство (создать заказ в 1С)">Запустить…</button>
                           )}
                         </td>
@@ -285,14 +289,16 @@ export function DbrFeederPage() {
                   <dt>Качество</dt><dd>{selectedSignal.is_incomplete || selectedSignal.data_quality?.length || selectedSignal.reason_json?.missing_reasons?.length ? <span className="dbrQualityWarning">⚠ {[...(selectedSignal.data_quality ?? []), ...(selectedSignal.reason_json?.missing_reasons ?? [])].filter((reason, index, all) => all.indexOf(reason) === index).map((reason) => REASON_LABEL[reason] ?? reason).join(', ') || 'Неполные данные'}</span> : 'Полные данные'}</dd>
                   {selectedSignal.material_status && <><dt>Материал</dt><dd>{selectedSignal.material_status}</dd></>}
                 </dl>
-                {selectedSignal.status === 'Open' && selectedSignal.can_launch ? (
+                {!readOnly && selectedSignal.status === 'Open' && selectedSignal.can_launch ? (
                   <div className="dbrSignalActions">
                     <button className="dbrDanger" onClick={() => void startLaunch(selectedSignal)} disabled={launchBusy}>Запустить в производство…</button>
                     <div className="fieldHint">Создаст заказ на производство в живой 1С. Сначала откроется предпросмотр документа.</div>
                   </div>
                 ) : (
                   <div className="dbrSignalReadonly">
-                    {selectedSignal.status !== 'Open'
+                    {readOnly
+                      ? 'Действия отключены: открыт сохранённый снимок Item Ledger только для чтения.'
+                      : selectedSignal.status !== 'Open'
                       ? 'Запуск доступен только для открытых сигналов.'
                       : 'Запуск заблокирован: материальная готовность не подтверждена (см. дефицит комплекта).'}
                   </div>
@@ -310,7 +316,7 @@ export function DbrFeederPage() {
             </div>
             <div className="dbrSignalHeaderActions">
               {deficits && <span className="dbrSignalCount">Дефицитных позиций: {deficits.kpis.deficit_materials}; открытых сигналов: {deficits.kpis.queue_open}</span>}
-              <button onClick={() => void loadDeficits()} disabled={deficitsLoading || Boolean(deficitsUnavailable)}>Обновить снимок</button>
+              {!readOnly && <button onClick={() => void loadDeficits()} disabled={deficitsLoading || Boolean(deficitsUnavailable)}>Обновить снимок</button>}
             </div>
           </div>
 
@@ -358,10 +364,12 @@ export function DbrFeederPage() {
                   Позиций: {processingBoard.positions_total}; просрочен кругорейс (&gt;{processingBoard.roundtrip_limit_days} дн): {processingBoard.overdue_positions}
                 </span>
               )}
-              <button onClick={() => void loadProcessingBoard()} disabled={processingLoading || Boolean(processingUnavailable)}>Обновить снимок</button>
-              <button onClick={() => void calculateProcessingChainPreview()} disabled={processingLoading || Boolean(processingUnavailable)}>Цепочка: проверить</button>
-              <button onClick={() => void loadProcessingManifest()} disabled={processingLoading || Boolean(processingUnavailable)}>Рейс: предпросмотр</button>
-              <button onClick={() => void printProcessingManifest()} disabled={processingLoading || Boolean(processingUnavailable)}>Рейс: печать</button>
+              {!readOnly && <>
+                <button onClick={() => void loadProcessingBoard()} disabled={processingLoading || Boolean(processingUnavailable)}>Обновить снимок</button>
+                <button onClick={() => void calculateProcessingChainPreview()} disabled={processingLoading || Boolean(processingUnavailable)}>Цепочка: проверить</button>
+                <button onClick={() => void loadProcessingManifest()} disabled={processingLoading || Boolean(processingUnavailable)}>Рейс: предпросмотр</button>
+                <button onClick={() => void printProcessingManifest()} disabled={processingLoading || Boolean(processingUnavailable)}>Рейс: печать</button>
+              </>}
             </div>
           </div>
 
@@ -431,18 +439,18 @@ export function DbrFeederPage() {
               ))}
             </div>
           )}
-          <div className="dbrProcessingPreviewActions">
+          {!readOnly && <div className="dbrProcessingPreviewActions">
             <label>Предпросмотр заказа:
               <select defaultValue="" onChange={(event) => { if (event.target.value) void calculateProcessingOrderPreview(Number(event.target.value)) }} disabled={processingLoading}>
                 <option value="">Выберите открытый сигнал</option>
                 {processingSignals.map((signal) => <option key={signal.id} value={signal.id}>#{signal.id} · {signal.item_code}</option>)}
               </select>
             </label>
-          </div>
-          <div className="dbrSignalReadonly">Только предпросмотр: запись заказа переработчику в 1С отключена до demo-smoke контракта вида операции.</div>
+          </div>}
+          {!readOnly && <div className="dbrSignalReadonly">Только предпросмотр: запись заказа переработчику в 1С отключена до demo-smoke контракта вида операции.</div>}
         </section>
 
-        {processingChainPreview && (
+        {!readOnly && processingChainPreview && (
           <div className="dialogOverlay" role="dialog" aria-modal="true" aria-label="Проверка цепочки переработки">
             <div className="dialogBox">
               <div className="dialogHeader">Цепочка переработки — только предпросмотр</div>
@@ -463,7 +471,7 @@ export function DbrFeederPage() {
           </div>
         )}
 
-        {processingOrderPreview && (
+        {!readOnly && processingOrderPreview && (
           <div className="dialogOverlay" role="dialog" aria-modal="true" aria-label="Предпросмотр заказа переработчику">
             <div className="dialogBox">
               <div className="dialogHeader">Заказ переработчику — сигнал #{processingOrderPreview.signal_id}</div>
@@ -473,7 +481,7 @@ export function DbrFeederPage() {
           </div>
         )}
 
-        {processingManifest && (
+        {!readOnly && processingManifest && (
           <div className="dialogOverlay" role="dialog" aria-modal="true" aria-label="Предпросмотр рейса переработки">
             <div className="dialogBox dbrManifestDialog">
               <div className="dialogHeader">Рейс на переработку — предпросмотр</div>
@@ -486,7 +494,7 @@ export function DbrFeederPage() {
           </div>
         )}
 
-        {chainPreview && (
+        {!readOnly && chainPreview && (
           <div className="dialogOverlay" role="dialog" aria-modal="true" aria-label="Предпросмотр цепочки" onClick={() => setChainPreview(null)}>
             <div className="dialogBox" onClick={(e) => e.stopPropagation()}>
               <div className="dialogHeader">Цепочка: предпросмотр первого уровня</div>
