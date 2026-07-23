@@ -83,6 +83,13 @@ from .historical_import_orchestration import (  # noqa: F401
     HistoricalImportResult,
     run_historical_physical_import,
 )
+from .generation_bootstrap import (  # noqa: F401
+    GenerationBootstrapError,
+    GenerationBootstrapResult,
+    create_historical_generation,
+    historical_generation_status,
+    resume_historical_generation_import,
+)
 from .historical_obligations import (  # noqa: F401
     HistoricalObligationAmbiguity,
     materialize_historical_obligations,
