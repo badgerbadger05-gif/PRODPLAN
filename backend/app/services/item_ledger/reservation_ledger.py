@@ -431,11 +431,14 @@ def mirror_frozen_pins(
     frozen pins (pin_kind='frozen'; copy alloc_qty/fact_at_freeze/source). The
     old table stays the read source (dual-write only, design §2.6 / decision #10).
 
-    Idempotent per requirement: delete the requirement's existing frozen pins,
-    then re-insert from the current allocations (a refreeze re-derives them).
+    Idempotent per requirement: delete the existing frozen pins of EVERY scope
+    requirement's entries — including entries whose allocations vanished at
+    refreeze (orphan pins, Д6: a requirement left without allocations, or a
+    refreeze with no allocations at all, must not keep stale pins feeding
+    Pass A / effective_net_bin) — then re-insert from the current allocations.
     Returns the number of frozen pins written.
     """
-    if not freeze_allocs:
+    if not reqs:
         return 0
     reqs_by_id = {int(r.id): r for r in reqs}
     if items is None:
@@ -445,44 +448,28 @@ def mirror_frozen_pins(
     for a in freeze_allocs:
         allocs_by_req.setdefault(int(a.requirement_id), []).append(a)
 
-    # resolve which entry each requirement's pins attach to (by mode)
+    # resolve which entry each requirement's pins attach to (by mode) — over
+    # ALL scope requirements, not only those still carrying allocations.
     entries_by_req_mode: Dict[Tuple[int, str], models.ReservationEntry] = {}
-    for rid in allocs_by_req:
-        for e in (
-            db.query(models.ReservationEntry)
-            .filter(models.ReservationEntry.requirement_id == int(rid))
-            .all()
-        ):
-            entries_by_req_mode[(int(rid), str(e.realization_mode))] = e
+    scope_entry_ids: List[int] = []
+    for e in (
+        db.query(models.ReservationEntry)
+        .filter(models.ReservationEntry.requirement_id.in_(list(reqs_by_id.keys())))
+        .all()
+    ):
+        entries_by_req_mode[(int(e.requirement_id), str(e.realization_mode))] = e
+        scope_entry_ids.append(int(e.id))
 
-    written = 0
-    touched_entries: Set[int] = set()
-    for rid, allocs in allocs_by_req.items():
-        req = reqs_by_id.get(int(rid))
-        if req is None:
-            continue
-        item = items.get(int(req.item_id))
-        has_consume = int(req.bom_level or 0) >= 1
-        has_make = _is_produced(item)
-        for a in allocs:
-            source_type = str(a.source_type or "")
-            source_kind = _SOURCE_KIND_BY_ALLOC_TYPE.get(source_type)
-            if source_kind is None:
-                continue
-            mode = _pin_mode_for_alloc(source_type, has_consume, has_make)
-            if mode is None:
-                continue
-            entry = entries_by_req_mode.get((int(rid), mode))
-            if entry is None:
-                continue
-            touched_entries.add(int(entry.id))
-    # rewrite: clear existing frozen pins for the touched entries, then insert.
-    if touched_entries:
+    # rewrite: clear the frozen pins of every scope entry (orphans included),
+    # then insert from the fresh allocations.
+    if scope_entry_ids:
         db.query(models.ReservationCoverage).filter(
-            models.ReservationCoverage.reservation_id.in_(list(touched_entries)),
+            models.ReservationCoverage.reservation_id.in_(scope_entry_ids),
             models.ReservationCoverage.pin_kind == "frozen",
         ).delete(synchronize_session="fetch")
         db.flush()
+
+    written = 0
 
     seen: Set[Tuple[int, str, str, str]] = set()
     for rid, allocs in allocs_by_req.items():
