@@ -37,6 +37,7 @@ from app.models import (
 from app.services.item_ledger.reservation import CONSUME, MAKE
 from app.services.item_ledger.reservation_ledger import (
     materialize_reservations,
+    materialize_reservations_for_freeze,
     mirror_frozen_pins,
     mode_targets,
     realize_from_sle,
@@ -728,6 +729,48 @@ def test_accepted_generation_is_immutable_for_reservation_writers(db_session):
     assert db.query(ReservationEntry).filter(
         ReservationEntry.requirement_id == req.id,
     ).count() == 0
+
+
+def test_freeze_materialization_rejects_accepted_generation_and_writes_building_target(
+    db_session,
+):
+    """Freeze obligations are Ledger writes: target must be an explicit BUILDING fork."""
+    db = db_session
+    accepted = db.get(models.PlanningTruthState, 1).current_generation
+    accepted.status = "accepted"
+    accepted.cutoff = datetime(2026, 7, 23)
+    accepted.accepted_at = datetime(2026, 7, 23)
+    run = _run(db, date(2026, 7, 1), date(2026, 7, 15))
+    item = _item(db, "FREEZE-GEN", produced=True)
+    req = _req(db, run, item, gross=4, net=4, bom_level=0)
+    db.flush()
+
+    with pytest.raises(ValueError, match="writes require building"):
+        materialize_reservations_for_freeze(
+            db, [run.run_id], ledger_generation_id=accepted.id,
+        )
+    assert db.query(ReservationEntry).filter(
+        ReservationEntry.requirement_id == req.id,
+    ).count() == 0
+
+    building = models.LedgerGeneration(
+        generation_key="test-freeze-obligation-target",
+        status="building",
+        source_watermarks={},
+        capabilities={},
+        physical_import_batch_id=accepted.physical_import_batch_id,
+        algorithm_version="tests/obligation-target",
+    )
+    db.add(building)
+    db.flush()
+
+    result = materialize_reservations_for_freeze(
+        db, [run.run_id], ledger_generation_id=building.id,
+    )
+    assert result == {"reservations": 1, "frozen_pins": 0}
+    entry = _entry(db, req, MAKE)
+    assert entry is not None
+    assert entry.ledger_generation_id == building.id
 
 
 # ---------------------------------------------------------------------------

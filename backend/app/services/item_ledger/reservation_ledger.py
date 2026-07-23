@@ -704,7 +704,11 @@ def materialize_reservations(
     """
     if not reqs:
         return []
-    generation_id = _resolve_generation_id(db, ledger_generation_id)
+    generation_id = _resolve_generation_id(
+        db,
+        ledger_generation_id,
+        for_write=True,
+    )
     items = _load_items(db, {int(r.item_id) for r in reqs})
     touched: List[int] = []
     for req in reqs:
@@ -814,7 +818,11 @@ def mirror_frozen_pins(
     """
     if not reqs:
         return 0
-    generation_id = _resolve_generation_id(db, ledger_generation_id)
+    generation_id = _resolve_generation_id(
+        db,
+        ledger_generation_id,
+        for_write=True,
+    )
     reqs_by_id = {int(r.id): r for r in reqs}
     if items is None:
         items = _load_items(db, {int(r.item_id) for r in reqs})
@@ -1866,15 +1874,18 @@ def materialize_reservations_for_freeze(
     *,
     ledger_generation_id: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Freeze-time hook (design §2.6 / §11): after refreeze wrote every
-    MrpFreezeAllocation, materialize reservations + mirror the frozen pins so
-    the reservation ledger tracks the fresh freeze. PURE SHADOW, wrapped by the
-    caller so a failure never breaks the freeze.
+    """Materialize obligations into the explicit BUILDING target generation.
+
+    A freeze must have forked that target from the accepted physical prefix
+    before calling this hook.  Reservation rows and frozen pins are Ledger
+    writes, therefore the accepted generation is never a valid target.
     """
     run_ids = [int(r) for r in active_run_ids]
     if not run_ids:
         return {"reservations": 0, "frozen_pins": 0}
-    generation_id = _resolve_generation_id(db, ledger_generation_id)
+    generation_id = _resolve_generation_id(
+        db, ledger_generation_id, for_write=True,
+    )
     reqs = (
         db.query(models.MrpRequirement)
         .filter(models.MrpRequirement.run_id.in_(run_ids))
