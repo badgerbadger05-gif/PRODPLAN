@@ -117,6 +117,54 @@ def test_unaddressed_make_fifo_uses_due_plan_run_requirement_bucket_order():
     ]
 
 
+def test_july_unaddressed_output_cannot_close_august_reserve():
+    august = reserve("august", 8, qty="4", due=date(2026, 8, 31))
+
+    result = allocate_historical_facts([fact("july-output", "4")], [august])
+
+    assert result.allocations == ()
+    assert result.unplanned_qty == Decimal("4")
+
+
+def test_exact_august_identity_may_deliberately_match_early_output():
+    august = reserve(
+        "august",
+        8,
+        qty="4",
+        due=date(2026, 8, 31),
+        order_refs=("PO-AUG",),
+    )
+
+    by_requirement = allocate_historical_facts(
+        [fact("july-owned", "4", requirement_id=8)],
+        [august],
+    )
+    by_order = allocate_historical_facts(
+        [fact("july-order", "4", order_ref="PO-AUG")],
+        [august],
+    )
+
+    assert by_requirement.allocations[0].match_rule == "requirement"
+    assert by_order.allocations[0].match_rule == "order"
+    assert by_requirement.unplanned_qty == by_order.unplanned_qty == Decimal("0")
+
+
+def test_unaddressed_output_still_uses_oldest_prior_period_reserve():
+    may = reserve("may", 5, qty="2", due=date(2026, 5, 31))
+    june = reserve("june", 6, qty="2", due=date(2026, 6, 30))
+    august = reserve("august", 8, qty="2", due=date(2026, 8, 31))
+
+    result = allocate_historical_facts(
+        [fact("july-output", "3")],
+        [august, june, may],
+    )
+
+    assert [(row.reserve_id, row.qty) for row in result.allocations] == [
+        ("may", Decimal("2")),
+        ("june", Decimal("1")),
+    ]
+
+
 def test_unaddressed_consume_is_unplanned_and_never_global_fifo():
     result = allocate_historical_facts(
         [fact("expense", "4", mode="consume")],

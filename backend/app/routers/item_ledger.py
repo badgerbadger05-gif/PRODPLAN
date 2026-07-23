@@ -26,6 +26,7 @@ from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, ConfigDict
@@ -36,6 +37,7 @@ from ..services.item_ledger.physical_visibility import visible_sle_query
 from ..services.item_ledger.reservation_ledger import item_ledger_position
 from ..services.mrp_freeze import pool_key_for
 from ..services.planning_truth import (
+    CAPABILITY_EXECUTION_ALLOCATIONS,
     CAPABILITY_PHYSICAL_LEDGER,
     CAPABILITY_RESERVATION_REPLAY,
     PlanningTruthUnavailable,
@@ -60,7 +62,10 @@ def _accepted_generation(
             required_capabilities=capabilities,
         )
     except PlanningTruthUnavailable as exc:
-        raise HTTPException(status_code=409, detail=exc.as_dict()) from exc
+        raise HTTPException(
+            status_code=409,
+            detail=jsonable_encoder(exc.as_dict()),
+        ) from exc
     return int(truth.generation_id)
 
 
@@ -580,7 +585,15 @@ def get_drift(
     ``cause`` is derived from ``kind`` and ``adjustment_sle_id`` is not tracked on
     the drift row (returned null); ``details`` carries the raw provenance."""
     _get_item_or_404(db, item_id)
-    q = db.query(models.MrpDriftEvent).filter(models.MrpDriftEvent.item_id == int(item_id))
+    generation_id = _accepted_generation(
+        db,
+        consumer="item_ledger.drift",
+        capabilities=(CAPABILITY_EXECUTION_ALLOCATIONS,),
+    )
+    q = db.query(models.MrpDriftEvent).filter(
+        models.MrpDriftEvent.item_id == int(item_id),
+        models.MrpDriftEvent.ledger_generation_id == generation_id,
+    )
     total = q.count()
     rows = (
         q.order_by(

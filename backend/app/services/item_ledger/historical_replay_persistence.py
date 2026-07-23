@@ -20,6 +20,7 @@ from app.models import (
     ReservationEvent,
     StockLedgerEntry,
 )
+from app import models
 
 from .historical_replay_core import Fact, Reserve, allocate_historical_facts
 from .physical_visibility import visible_sles_for_generation
@@ -43,7 +44,101 @@ def _fact_mode(row: StockLedgerEntry) -> str:
     return "make" if str(row.movement_kind or "") == "assembly_in" else "consume"
 
 
-def run_historical_replay(db: Session, ledger_generation_id: int) -> dict[str, Any]:
+def _as_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None) if value.tzinfo else value
+    if isinstance(value, str) and value.strip():
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=None) if parsed.tzinfo else parsed
+    return None
+
+
+def _replay_lower_bound(
+    generation: LedgerGeneration,
+    replay_from: datetime | None,
+) -> datetime:
+    if replay_from is not None:
+        return _as_datetime(replay_from)  # type: ignore[return-value]
+    watermarks = dict(generation.source_watermarks or {})
+    batch_watermarks = dict(
+        generation.physical_import_batch.source_watermarks or {}
+    ) if generation.physical_import_batch is not None else {}
+    for key in ("replay_from", "from_exclusive", "anchor_at"):
+        value = _as_datetime(watermarks.get(key) or batch_watermarks.get(key))
+        if value is not None:
+            return value
+    raise ValueError("historical replay requires explicit replay_from lower bound")
+
+
+def _identity_for_sle(
+    db: Session,
+    row: StockLedgerEntry,
+) -> tuple[int | None, str | None, bool]:
+    """Resolve recorder to one unambiguous production requirement/order."""
+    recorder = str(row.recorder_ref or "").strip()
+    if not recorder:
+        return None, None, False
+    order_refs = {
+        str(value).strip()
+        for (value,) in db.query(models.StockRecorderPull.order_ref).filter(
+            models.StockRecorderPull.recorder_ref == recorder,
+            models.StockRecorderPull.order_ref.isnot(None),
+        ).all()
+        if str(value or "").strip()
+    }
+    if db.query(models.ProductionOrder.order_id).filter(
+        models.ProductionOrder.order_ref1c == recorder
+    ).first():
+        order_refs.add(recorder)
+
+    # Relevant successful export links may identify the local source document.
+    links = db.query(models.SyncLink).filter(
+        models.SyncLink.target_ref_key == recorder,
+        models.SyncLink.status == "success",
+        models.SyncLink.source_doctype.in_(("manufacture", "material_issue")),
+    ).all()
+    order_ids: set[int] = set()
+    for link in links:
+        if link.source_doctype == "manufacture":
+            source = db.get(models.ProductionManufacture, int(link.source_id))
+        else:
+            source = db.get(models.ProductionMaterialIssue, int(link.source_id))
+        if source is not None:
+            order_ids.add(int(source.order_id))
+    if order_refs:
+        order_ids.update(
+            int(value)
+            for (value,) in db.query(models.ProductionOrder.order_id).filter(
+                models.ProductionOrder.order_ref1c.in_(sorted(order_refs))
+            ).all()
+        )
+    if len(order_ids) != 1:
+        return None, None, len(order_ids) > 1
+    order_id = next(iter(order_ids))
+    order = db.get(models.ProductionOrder, order_id)
+    candidates = {
+        int(req_id)
+        for (req_id,) in db.query(models.ProductionProduct.source_mrp_requirement_id).filter(
+            models.ProductionProduct.order_id == order_id,
+            models.ProductionProduct.item_id == int(row.item_id),
+            models.ProductionProduct.source_mrp_requirement_id.isnot(None),
+        ).all()
+    }
+    if len(candidates) != 1:
+        return (
+            None,
+            None if len(candidates) > 1 else (str(order.order_ref1c or "") or None),
+            len(candidates) > 1,
+        )
+    return next(iter(candidates)), str(order.order_ref1c or "") or None, False
+
+
+def run_historical_replay(
+    db: Session,
+    ledger_generation_id: int,
+    *,
+    replay_from: datetime | None = None,
+) -> dict[str, Any]:
     """Replay one explicit BUILDING generation and persist only scoped output."""
     generation = db.get(LedgerGeneration, int(ledger_generation_id))
     if generation is None:
@@ -54,6 +149,7 @@ def run_historical_replay(db: Session, ledger_generation_id: int) -> dict[str, A
         raise ValueError("historical replay requires generation cutoff")
     if generation.physical_import_batch_id is None:
         raise ValueError("historical replay requires physical_import_batch_id")
+    lower_bound = _replay_lower_bound(generation, replay_from)
 
     entries = (
         db.query(ReservationEntry)
@@ -65,7 +161,7 @@ def run_historical_replay(db: Session, ledger_generation_id: int) -> dict[str, A
         .all()
     )
     requirement_ids = [int(row.requirement_id) for row in entries]
-    bucket_by_requirement: dict[int, MrpRequirementBucket] = {}
+    buckets_by_requirement: dict[int, list[MrpRequirementBucket]] = {}
     if requirement_ids:
         for bucket in (
             db.query(MrpRequirementBucket)
@@ -77,7 +173,32 @@ def run_historical_replay(db: Session, ledger_generation_id: int) -> dict[str, A
             )
             .all()
         ):
-            bucket_by_requirement.setdefault(int(bucket.requirement_id), bucket)
+            buckets_by_requirement.setdefault(int(bucket.requirement_id), []).append(bucket)
+
+    order_refs_by_requirement: dict[int, tuple[str, ...]] = {}
+    if requirement_ids:
+        rows = (
+            db.query(
+                models.ProductionProduct.source_mrp_requirement_id,
+                models.ProductionOrder.order_ref1c,
+            )
+            .join(
+                models.ProductionOrder,
+                models.ProductionOrder.order_id == models.ProductionProduct.order_id,
+            )
+            .filter(
+                models.ProductionProduct.source_mrp_requirement_id.in_(requirement_ids),
+                models.ProductionOrder.order_ref1c.isnot(None),
+            )
+            .all()
+        )
+        refs: dict[int, set[str]] = {}
+        for requirement_id, order_ref in rows:
+            refs.setdefault(int(requirement_id), set()).add(str(order_ref))
+        order_refs_by_requirement = {
+            requirement_id: tuple(sorted(values))
+            for requirement_id, values in refs.items()
+        }
 
     reserves: list[Reserve] = []
     entry_by_core_id: dict[str, ReservationEntry] = {}
@@ -86,7 +207,8 @@ def run_historical_replay(db: Session, ledger_generation_id: int) -> dict[str, A
         if row.run_id is None:
             raise ValueError(f"reservation {row.id} has no run lineage")
         core_id = str(int(row.id))
-        bucket = bucket_by_requirement.get(int(row.requirement_id))
+        buckets = buckets_by_requirement.get(int(row.requirement_id), [])
+        bucket = buckets[0] if buckets else None
         reserve = Reserve(
             reserve_id=core_id,
             item_id=int(row.item_id),
@@ -102,6 +224,7 @@ def run_historical_replay(db: Session, ledger_generation_id: int) -> dict[str, A
             characteristic_ref=str(row.characteristic_ref or ""),
             organization_ref=str(row.organization_ref or ""),
             planning_stock_pool=str(row.planning_stock_pool or ""),
+            order_refs=order_refs_by_requirement.get(int(row.requirement_id), ()),
         )
         reserves.append(reserve)
         entry_by_core_id[core_id] = row
@@ -115,7 +238,7 @@ def run_historical_replay(db: Session, ledger_generation_id: int) -> dict[str, A
             set(),
         ).add(reserve.planning_stock_pool)
 
-    candidate_rows = [
+    visible_candidates = [
         row
         for row in visible_sles_for_generation(db, int(generation.id))
         if str(row.movement_kind or "") in (
@@ -123,6 +246,8 @@ def run_historical_replay(db: Session, ledger_generation_id: int) -> dict[str, A
         )
         and _decimal(row.qty) != 0
     ]
+    candidate_rows = [row for row in visible_candidates if row.posting_at > lower_bound]
+    excluded_pre_replay = len(visible_candidates) - len(candidate_rows)
     physical_rows = [
         row for row in candidate_rows
         if str(row.movement_kind or "") in _SAFE_REALIZATION_KINDS
@@ -133,7 +258,9 @@ def run_historical_replay(db: Session, ledger_generation_id: int) -> dict[str, A
     ]
     facts: list[Fact] = []
     sle_by_core_id: dict[str, StockLedgerEntry] = {}
+    identity_by_core_id: dict[str, tuple[int | None, str | None]] = {}
     ambiguous_pool_facts = 0
+    ambiguous_identity_facts = 0
     for row in physical_rows:
         mode = _fact_mode(row)
         key = (
@@ -149,6 +276,9 @@ def run_historical_replay(db: Session, ledger_generation_id: int) -> dict[str, A
             pool = f"__unresolved_pool__:{row.id}"
             ambiguous_pool_facts += 1
         core_id = str(int(row.id))
+        requirement_id, order_ref, ambiguous_identity = _identity_for_sle(db, row)
+        if ambiguous_identity:
+            ambiguous_identity_facts += 1
         facts.append(Fact(
             fact_id=core_id,
             item_id=int(row.item_id),
@@ -158,13 +288,17 @@ def run_historical_replay(db: Session, ledger_generation_id: int) -> dict[str, A
             characteristic_ref=str(row.characteristic_ref or ""),
             organization_ref=str(row.organization_ref or ""),
             planning_stock_pool=pool,
+            requirement_id=requirement_id,
+            order_ref=order_ref,
         ))
         sle_by_core_id[core_id] = row
+        identity_by_core_id[core_id] = (requirement_id, order_ref)
 
     result = allocate_historical_facts(facts, reserves)
     cycle_id = f"historical-replay:g{generation.id}"
     inserted_events = 0
     inserted_allocations = 0
+    bucket_used: dict[tuple[int, str], Decimal] = {}
     allocation_rows_for_checksum: list[dict[str, Any]] = []
     for allocation in result.allocations:
         entry = entry_by_core_id[allocation.reserve_id]
@@ -200,38 +334,103 @@ def run_historical_replay(db: Session, ledger_generation_id: int) -> dict[str, A
             db.add(event)
             inserted_events += 1
 
-        bucket = bucket_by_requirement.get(int(entry.requirement_id))
         fact_ref = str(sle.recorder_ref or f"sle:{sle.id}")
         fact_line_ref = str(sle.line_no or "")
-        execution = (
+        resolved_requirement_id, _resolved_order_ref = identity_by_core_id[allocation.fact_id]
+        fact_type = (
+            (
+                "linked_production"
+                if resolved_requirement_id is not None
+                else "unlinked_production"
+            )
+            if _fact_mode(sle) == "make"
+            else "component_consumption"
+        )
+        buckets = buckets_by_requirement.get(int(entry.requirement_id), [])
+        existing_slices = (
             db.query(MrpExecutionAllocation)
             .filter(
                 MrpExecutionAllocation.ledger_generation_id == generation.id,
                 MrpExecutionAllocation.requirement_id == entry.requirement_id,
-                MrpExecutionAllocation.bucket_id == (bucket.id if bucket else None),
-                MrpExecutionAllocation.fact_type == (
-                    "unlinked_production" if _fact_mode(sle) == "make" else "component_consumption"
-                ),
+                MrpExecutionAllocation.fact_type == fact_type,
                 MrpExecutionAllocation.fact_ref == fact_ref,
                 MrpExecutionAllocation.fact_line_ref == fact_line_ref,
                 MrpExecutionAllocation.allocation_kind == "execution",
             )
-            .one_or_none()
+            .all()
         )
-        if execution is None:
-            db.add(MrpExecutionAllocation(
-                ledger_generation_id=generation.id,
-                cycle_id=cycle_id,
-                requirement_id=entry.requirement_id,
-                bucket_id=bucket.id if bucket else None,
-                fact_type="unlinked_production" if _fact_mode(sle) == "make" else "component_consumption",
-                allocation_kind="execution",
-                fact_ref=fact_ref,
-                fact_line_ref=fact_line_ref,
-                fact_date=sle.posting_at,
-                allocated_qty=allocation.qty,
-            ))
-            inserted_allocations += 1
+        if existing_slices:
+            if sum(
+                (_decimal(row.allocated_qty) for row in existing_slices),
+                Decimal("0"),
+            ) != _decimal(allocation.qty):
+                raise ValueError(
+                    f"existing allocation slices disagree for fact {fact_ref}/{fact_line_ref}"
+                )
+            for existing in existing_slices:
+                if existing.bucket_id is not None:
+                    used_key = (int(existing.bucket_id), _fact_mode(sle))
+                    bucket_used[used_key] = (
+                        bucket_used.get(used_key, Decimal("0"))
+                        + _decimal(existing.allocated_qty)
+                    )
+            slices = []
+        else:
+            slices: list[tuple[int | None, Decimal]] = []
+            left = _decimal(allocation.qty)
+            if buckets:
+                for bucket in buckets:
+                    capacity = max(_decimal(bucket.net_qty), Decimal("0"))
+                    used_key = (int(bucket.id), _fact_mode(sle))
+                    take = min(
+                        left,
+                        max(
+                            capacity - bucket_used.get(used_key, Decimal("0")),
+                            Decimal("0"),
+                        ),
+                    )
+                    if take > 0:
+                        slices.append((int(bucket.id), take))
+                        bucket_used[used_key] = (
+                            bucket_used.get(used_key, Decimal("0")) + take
+                        )
+                        left -= take
+                    if left <= 0:
+                        break
+                if left > 0:
+                    raise ValueError(
+                        f"requirement {entry.requirement_id} bucket capacity is below realization"
+                    )
+            else:
+                slices.append((None, left))
+        for bucket_id, slice_qty in slices:
+            execution = (
+                db.query(MrpExecutionAllocation)
+                .filter(
+                    MrpExecutionAllocation.ledger_generation_id == generation.id,
+                    MrpExecutionAllocation.requirement_id == entry.requirement_id,
+                    MrpExecutionAllocation.bucket_id == bucket_id,
+                    MrpExecutionAllocation.fact_type == fact_type,
+                    MrpExecutionAllocation.fact_ref == fact_ref,
+                    MrpExecutionAllocation.fact_line_ref == fact_line_ref,
+                    MrpExecutionAllocation.allocation_kind == "execution",
+                )
+                .one_or_none()
+            )
+            if execution is None:
+                db.add(MrpExecutionAllocation(
+                    ledger_generation_id=generation.id,
+                    cycle_id=cycle_id,
+                    requirement_id=entry.requirement_id,
+                    bucket_id=bucket_id,
+                    fact_type=fact_type,
+                    allocation_kind="execution",
+                    fact_ref=fact_ref,
+                    fact_line_ref=fact_line_ref,
+                    fact_date=sle.posting_at,
+                    allocated_qty=slice_qty,
+                ))
+                inserted_allocations += 1
         allocation_rows_for_checksum.append({
             "sle_id": int(sle.id),
             "reservation_id": int(entry.id),
@@ -274,6 +473,9 @@ def run_historical_replay(db: Session, ledger_generation_id: int) -> dict[str, A
         "unplanned_qty": str(result.unplanned_qty),
         "unplanned_facts": len(result.unplanned),
         "ambiguous_pool_facts": ambiguous_pool_facts,
+        "ambiguous_identity_facts": ambiguous_identity_facts,
+        "excluded_pre_replay_facts": excluded_pre_replay,
+        "replay_from": lower_bound.isoformat(),
         "input_checksum": _checksum(input_rows),
         "allocation_checksum": _checksum(allocation_rows_for_checksum),
     }

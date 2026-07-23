@@ -7,6 +7,9 @@ etc.). No business logic is exercised — only defaults from create_all + insert
 
 import datetime
 
+import pytest
+from sqlalchemy.exc import IntegrityError
+
 from app import models
 
 
@@ -169,3 +172,44 @@ def test_drift_event_defaults(db_session):
     assert row.first_seen_cycle_id is None
     assert row.requirement_id is None
     assert row.details is None
+    assert row.ledger_generation_id is None
+
+
+def test_drift_event_accepts_generation_lineage(db_session):
+    generation = _generation(db_session)
+    item, _run, _req = _mk_item_run_req(db_session)
+    row = models.MrpDriftEvent(
+        ledger_generation_id=generation.id,
+        item_id=item.item_id,
+    )
+    db_session.add(row)
+    db_session.commit()
+    db_session.refresh(row)
+    assert row.ledger_generation_id == generation.id
+
+
+def test_ledger_build_batch_accepts_reservation_materialize_stage(db_session):
+    generation = _generation(db_session)
+    row = models.LedgerBuildBatch(
+        ledger_generation_id=generation.id,
+        stage="reservation_materialize",
+        batch_key="materialize:test",
+        status="completed",
+        algorithm_version="tests/1",
+        metrics={},
+    )
+    db_session.add(row)
+    db_session.commit()
+    assert row.stage == "reservation_materialize"
+
+    db_session.add(models.LedgerBuildBatch(
+        ledger_generation_id=generation.id,
+        stage="unknown_stage",
+        batch_key="invalid:test",
+        status="completed",
+        algorithm_version="tests/1",
+        metrics={},
+    ))
+    with pytest.raises(IntegrityError):
+        db_session.commit()
+    db_session.rollback()

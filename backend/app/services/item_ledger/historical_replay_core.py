@@ -211,6 +211,10 @@ def allocate_historical_facts(
             reserve
             for reserve in ordered_reserves
             if _pool_key(reserve) == _pool_key(fact)
+            # Unaddressed output may satisfy only an obligation that already
+            # existed when the fact was posted. Exact requirement/order claims
+            # above are deliberately exempt: they are explicit early output.
+            and reserve.plan_period_from <= fact.posting_at.date()
         ]
         if left > 0 and fact.mode == "make":
             # Exact surplus and genuinely unaddressed output may satisfy the

@@ -83,3 +83,8 @@ from .historical_import_orchestration import (  # noqa: F401
     HistoricalImportResult,
     run_historical_physical_import,
 )
+from .historical_obligations import (  # noqa: F401
+    HistoricalObligationAmbiguity,
+    materialize_historical_obligations,
+    select_historical_obligation_runs,
+)

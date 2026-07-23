@@ -12,7 +12,7 @@ The first eight tests are the migrated phase-2 tests: the FIXTURES/input change
 asserted VALUES are unchanged (no baseline → Δ = full history = phase-2 parity).
 """
 
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -1032,11 +1032,55 @@ def test_i4_matured_shortfall_after_second_cycle(db_session, monkeypatch):
     db_session.commit()
     db_session.refresh(req)
     assert float(req.drift_adjustment_qty) == 0.0  # cycle 1: pending
+    first_event = _drift_events(db_session, comp, kind="shortfall")[0]
+    assert first_event.ledger_generation_id is not None
+    current_generation_id = first_event.ledger_generation_id
+
+    other_batch = models.PhysicalImportBatch(
+        batch_key="drift-lineage-other",
+        status="completed",
+        source_watermarks={},
+        completed_at=datetime.now(timezone.utc),
+    )
+    other_generation = models.LedgerGeneration(
+        generation_key="drift-lineage-other",
+        status="rejected",
+        cutoff=datetime.now(timezone.utc),
+        physical_import_batch=other_batch,
+        algorithm_version="tests/other",
+        source_watermarks={},
+        capabilities={},
+    )
+    db_session.add(other_generation)
+    db_session.flush()
+    foreign_event = models.MrpDriftEvent(
+        ledger_generation_id=other_generation.id,
+        cycle_id="foreign-generation",
+        item_id=comp.item_id,
+        kind="shortfall",
+        drift_qty=777,
+        matured=True,
+    )
+    db_session.add(foreign_event)
+    db_session.commit()
+    foreign_event_id = foreign_event.id
 
     run_ledger_cycle(db_session)
     db_session.commit()
     db_session.refresh(req)
     assert float(req.drift_adjustment_qty) == 10.0  # cycle 2: matured
+    assert db_session.get(models.MrpDriftEvent, foreign_event_id) is not None
+    current_events = (
+        db_session.query(models.MrpDriftEvent)
+        .filter(
+                models.MrpDriftEvent.item_id == comp.item_id,
+                models.MrpDriftEvent.ledger_generation_id == current_generation_id,
+            models.MrpDriftEvent.kind == "shortfall",
+        )
+        .all()
+    )
+    assert len(current_events) == 1
+    assert bool(current_events[0].matured) is True
 
 
 def test_i4_shortfall_over_initial_is_unattributed(db_session, monkeypatch):

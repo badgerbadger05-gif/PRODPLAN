@@ -321,7 +321,13 @@ def _freeze_queue_key(alloc: MrpFreezeAllocation, run: Optional[PlanningRun]) ->
     return (period_from, period_to, int(alloc.run_id), int(alloc.requirement_id), int(alloc.id))
 
 
-def verify_frozen_supply(db: Session, scope: LedgerScope, cycle_id: str) -> VerifyResult:
+def verify_frozen_supply(
+    db: Session,
+    scope: LedgerScope,
+    cycle_id: str,
+    *,
+    ledger_generation_id: int,
+) -> VerifyResult:
     """Recompute realized/evaporated for every active freeze allocation from
     scratch and rebuild the ``kind='evaporation'`` drift events."""
     realized_by_alloc_id: Dict[int, float] = {}
@@ -478,7 +484,13 @@ def verify_frozen_supply(db: Session, scope: LedgerScope, cycle_id: str) -> Veri
             "Inc4 frozen-pin verify mirror failed; continuing (verify unaffected)"
         )
 
-    _rebuild_evaporation_events(db, scope, cycle_id, evaporated_by_alloc_id)
+    _rebuild_evaporation_events(
+        db,
+        scope,
+        cycle_id,
+        evaporated_by_alloc_id,
+        ledger_generation_id=ledger_generation_id,
+    )
 
     return VerifyResult(
         realized_by_alloc_id=realized_by_alloc_id,
@@ -494,6 +506,8 @@ def _rebuild_evaporation_events(
     scope: LedgerScope,
     cycle_id: str,
     evaporated_by_alloc_id: Dict[int, float],
+    *,
+    ledger_generation_id: int,
 ) -> int:
     """Rebuild ``mrp_drift_event`` kind='evaporation' rows for the scope's
     requirements (DELETE by req scope + INSERT per evaporated allocation).
@@ -508,6 +522,7 @@ def _rebuild_evaporation_events(
     prior_first_seen: Dict[Tuple[int, str, str, str], str] = {}
     for ev in (
         db.query(MrpDriftEvent)
+        .filter(MrpDriftEvent.ledger_generation_id == ledger_generation_id)
         .filter(MrpDriftEvent.kind == "evaporation")
         .filter(MrpDriftEvent.requirement_id.in_(scope.open_req_ids))
         .all()
@@ -522,6 +537,8 @@ def _rebuild_evaporation_events(
         prior_first_seen[key] = ev.first_seen_cycle_id or ev.cycle_id or cycle_id
 
     db.query(MrpDriftEvent).filter(
+        MrpDriftEvent.ledger_generation_id == ledger_generation_id
+    ).filter(
         MrpDriftEvent.kind == "evaporation"
     ).filter(
         MrpDriftEvent.requirement_id.in_(scope.open_req_ids)
@@ -544,6 +561,7 @@ def _rebuild_evaporation_events(
         first_seen = prior_first_seen.get(key, cycle_id)
         db.add(
             MrpDriftEvent(
+                ledger_generation_id=ledger_generation_id,
                 cycle_id=cycle_id,
                 item_id=int(alloc.item_id),
                 characteristic_ref=pk.characteristic_ref,
@@ -1213,6 +1231,8 @@ def compute_stock_drift(
     produced_now: Dict[int, float],
     received_now: Dict[int, float],
     cycle_id: str,
+    *,
+    ledger_generation_id: int,
 ) -> DriftResult:
     """Recompute per-pool stock drift from scratch (v2 §5/§7.1).
 
@@ -1321,6 +1341,7 @@ def compute_stock_drift(
     prior_first_seen: Dict[Tuple[int, str, str, str, str], Tuple[str, Optional[datetime]]] = {}
     for ev in (
         db.query(MrpDriftEvent)
+        .filter(MrpDriftEvent.ledger_generation_id == ledger_generation_id)
         .filter(MrpDriftEvent.kind.in_(("shortfall", "surplus")))
         .all()
     ):
@@ -1336,6 +1357,8 @@ def compute_stock_drift(
         prior_first_seen[key] = (ev.first_seen_cycle_id or ev.cycle_id or cycle_id, seen_at)
 
     db.query(MrpDriftEvent).filter(
+        MrpDriftEvent.ledger_generation_id == ledger_generation_id
+    ).filter(
         MrpDriftEvent.kind.in_(("shortfall", "surplus"))
     ).delete(synchronize_session=False)
 
@@ -1454,6 +1477,7 @@ def compute_stock_drift(
 
         db.add(
             MrpDriftEvent(
+                ledger_generation_id=ledger_generation_id,
                 cycle_id=cycle_id,
                 item_id=item_id,
                 characteristic_ref=pk.characteristic_ref,
@@ -1716,7 +1740,12 @@ def _run_legacy_ledger_cycle_diagnostic(db: Session) -> Dict[str, Any]:
 
     use_bin = use_bin_stock()
 
-    verify = verify_frozen_supply(db, scope, cycle_id)
+    verify = verify_frozen_supply(
+        db,
+        scope,
+        cycle_id,
+        ledger_generation_id=ledger_generation_id,
+    )
 
     # Inc6 (design §11б): under bin the reservation ledger is LOAD-BEARING — it is
     # materialized/redistributed EARLY (before execution allocation + closure) so
@@ -1749,7 +1778,15 @@ def _run_legacy_ledger_cycle_diagnostic(db: Session) -> Dict[str, Any]:
     # executed; shortfall caps = frozen initial_snapshot_stock). Then materialise
     # drift_adjustment_qty (the reconcile sizer reads it next cycle / this run).
     # Under bin the drift is shrunk (SLE consumption, no W, no evaporation term).
-    drift = compute_stock_drift(db, scope, verify, produced_now, received_now, cycle_id)
+    drift = compute_stock_drift(
+        db,
+        scope,
+        verify,
+        produced_now,
+        received_now,
+        cycle_id,
+        ledger_generation_id=ledger_generation_id,
+    )
     _materialize_drift_adjustment(scope, drift)
 
     # §5 (increment 5): plan closure by execution. Closure runs AFTER drift so

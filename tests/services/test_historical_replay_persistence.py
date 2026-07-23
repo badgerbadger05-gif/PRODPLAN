@@ -1,18 +1,24 @@
 from datetime import date, datetime
 from decimal import Decimal
 
+import pytest
+
 from app.models import (
     Item,
     LedgerBuildBatch,
     LedgerGeneration,
     MrpExecutionAllocation,
     MrpRequirement,
+    MrpRequirementBucket,
     PhysicalImportBatch,
     PlanningRun,
+    ProductionOrder,
+    ProductionProduct,
     ReservationEntry,
     ReservationEvent,
     StockLedgerFactSupersession,
     StockLedgerEntry,
+    StockRecorderPull,
 )
 from app.services.item_ledger.historical_replay_persistence import run_historical_replay
 
@@ -39,7 +45,7 @@ def _generation_scope(
         physical_import_batch_id=batch.id,
         algorithm_version="test/1",
         replay_version="test-replay/1",
-        source_watermarks={},
+        source_watermarks={"replay_from": "2026-07-01T00:00:00"},
         capabilities={},
     )
     run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={})
@@ -264,7 +270,7 @@ def test_later_supersession_does_not_change_generation_replay(db_session):
         batch_key="physical-supersession-later",
         status="completed",
         cutoff=generation.cutoff,
-        source_watermarks={},
+        source_watermarks={"replay_from": "2026-07-01T00:00:00"},
     )
     db_session.add(later_batch)
     db_session.flush()
@@ -304,3 +310,184 @@ def test_later_supersession_does_not_change_generation_replay(db_session):
     assert second["unplanned_qty"] == first["unplanned_qty"]
     assert second["input_checksum"] == first["input_checksum"]
     assert second["allocation_checksum"] == first["allocation_checksum"]
+
+
+def test_replay_excludes_facts_at_or_before_lower_bound(db_session):
+    generation, reservation = _generation_scope(
+        db_session, "LOWER-BOUND", fact_qty="5", reserve_qty="5"
+    )
+
+    result = run_historical_replay(
+        db_session,
+        generation.id,
+        replay_from=datetime(2026, 7, 20, 10, 0),
+    )
+
+    assert result["facts"] == 0
+    assert result["excluded_pre_replay_facts"] == 1
+    db_session.refresh(reservation)
+    assert reservation.realized_qty == Decimal("0")
+
+
+def test_replay_refuses_unbounded_history(db_session):
+    generation, _reservation = _generation_scope(
+        db_session, "NO-LOWER-BOUND", fact_qty="5", reserve_qty="5"
+    )
+    generation.source_watermarks = {}
+    generation.physical_import_batch.source_watermarks = {}
+    db_session.flush()
+
+    with pytest.raises(ValueError, match="requires explicit replay_from"):
+        run_historical_replay(db_session, generation.id)
+
+
+def test_realization_is_split_across_all_requirement_buckets(db_session):
+    generation, reservation = _generation_scope(
+        db_session, "BUCKET-SPLIT", fact_qty="5", reserve_qty="5"
+    )
+    for bucket_date, qty in (
+        (date(2026, 7, 10), Decimal("2")),
+        (date(2026, 7, 20), Decimal("3")),
+    ):
+        db_session.add(MrpRequirementBucket(
+            requirement_id=reservation.requirement_id,
+            run_id=reservation.run_id,
+            item_id=reservation.item_id,
+            bucket_date=bucket_date,
+            gross_qty=qty,
+            net_qty=qty,
+        ))
+    db_session.commit()
+
+    first = run_historical_replay(db_session, generation.id)
+    db_session.commit()
+    second = run_historical_replay(db_session, generation.id)
+    rows = (
+        db_session.query(MrpExecutionAllocation)
+        .filter_by(ledger_generation_id=generation.id)
+        .order_by(MrpExecutionAllocation.bucket_id.asc())
+        .all()
+    )
+
+    assert [row.allocated_qty for row in rows] == [Decimal("2"), Decimal("3")]
+    assert sum((row.allocated_qty for row in rows), Decimal("0")) == Decimal("5")
+    assert first["execution_allocations_inserted"] == 2
+    assert second["execution_allocations_inserted"] == 0
+
+
+def test_recorder_order_identity_addresses_consume_exactly(db_session):
+    generation, reservation = _generation_scope(
+        db_session,
+        "EXACT-CONSUME",
+        fact_qty="4",
+        reserve_qty="4",
+        realization_mode="consume",
+        movement_kind="assembly_out",
+    )
+    sle = db_session.query(StockLedgerEntry).filter_by(
+        ingest_batch_id=generation.physical_import_batch_id
+    ).one()
+    order = ProductionOrder(
+        order_number="EXACT",
+        order_date=datetime(2026, 7, 1),
+        order_ref1c="ORDER-EXACT",
+        deletion_mark=False,
+        source="1c",
+    )
+    db_session.add(order)
+    db_session.flush()
+    db_session.add(ProductionProduct(
+        order_id=order.order_id,
+        item_id=reservation.item_id,
+        line_number=1,
+        quantity=4,
+        produced_qty=0,
+        remaining_qty=4,
+        source_mrp_requirement_id=reservation.requirement_id,
+    ))
+    db_session.add(StockRecorderPull(
+        recorder_type=sle.recorder_type,
+        recorder_ref=sle.recorder_ref,
+        status="done",
+        order_ref=order.order_ref1c,
+    ))
+    db_session.commit()
+
+    result = run_historical_replay(db_session, generation.id)
+
+    assert Decimal(result["allocated_qty"]) == Decimal("4")
+    assert Decimal(result["unplanned_qty"]) == Decimal("0")
+    event = db_session.query(ReservationEvent).filter_by(
+        ledger_generation_id=generation.id
+    ).one()
+    assert event.match_rule == "pegged"
+
+
+def test_ambiguous_order_identity_leaves_consume_unplanned(db_session):
+    generation, reservation = _generation_scope(
+        db_session,
+        "AMBIGUOUS-CONSUME",
+        fact_qty="4",
+        reserve_qty="4",
+        realization_mode="consume",
+        movement_kind="assembly_out",
+    )
+    sle = db_session.query(StockLedgerEntry).filter_by(
+        ingest_batch_id=generation.physical_import_batch_id
+    ).one()
+    order = ProductionOrder(
+        order_number="AMBIGUOUS",
+        order_date=datetime(2026, 7, 1),
+        order_ref1c="ORDER-AMBIGUOUS",
+        deletion_mark=False,
+        source="1c",
+    )
+    other_run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={})
+    db_session.add_all([order, other_run])
+    db_session.flush()
+    other_requirement = MrpRequirement(
+        run_id=other_run.run_id,
+        item_id=reservation.item_id,
+        total_required_qty=4,
+        net_required_qty=4,
+        covered_qty=0,
+        remaining_qty=4,
+        period_from=date(2026, 7, 1),
+        period_to=date(2026, 7, 31),
+        bom_level=0,
+    )
+    db_session.add(other_requirement)
+    db_session.flush()
+    db_session.add_all([
+        ProductionProduct(
+            order_id=order.order_id,
+            item_id=reservation.item_id,
+            line_number=1,
+            quantity=2,
+            produced_qty=0,
+            remaining_qty=2,
+            source_mrp_requirement_id=reservation.requirement_id,
+        ),
+        ProductionProduct(
+            order_id=order.order_id,
+            item_id=reservation.item_id,
+            line_number=2,
+            quantity=2,
+            produced_qty=0,
+            remaining_qty=2,
+            source_mrp_requirement_id=other_requirement.id,
+        ),
+        StockRecorderPull(
+            recorder_type=sle.recorder_type,
+            recorder_ref=sle.recorder_ref,
+            status="done",
+            order_ref=order.order_ref1c,
+        ),
+    ])
+    db_session.commit()
+
+    result = run_historical_replay(db_session, generation.id)
+
+    assert Decimal(result["allocated_qty"]) == Decimal("0")
+    assert Decimal(result["unplanned_qty"]) == Decimal("4")
+    assert result["ambiguous_identity_facts"] == 1

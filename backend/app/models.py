@@ -95,6 +95,7 @@ class LedgerBuildBatch(Base):
     __table_args__ = (
         CheckConstraint(
             "stage IN ('physical_import', 'reservation_replay', "
+            "'reservation_materialize', "
             "'execution_allocation', 'snapshot_build')",
             name="ck_ledger_build_batch_stage",
         ),
@@ -2186,6 +2187,12 @@ class MrpDriftEvent(Base):
     )
 
     id = Column(Integer, primary_key=True, index=True)
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     cycle_id = Column(String(64), nullable=False, server_default="", index=True)
     item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
     characteristic_ref = Column(String(36), nullable=True)
@@ -2204,6 +2211,7 @@ class MrpDriftEvent(Base):
 
     item = relationship("Item")
     requirement = relationship("MrpRequirement")
+    ledger_generation = relationship("LedgerGeneration")
 
 
 # ---------------------------------------------------------------------------

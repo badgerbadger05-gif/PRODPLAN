@@ -174,7 +174,9 @@ def _event(db, res, kind, *, reserved_delta=0.0, realized_delta=0.0, sle_id=None
 
 
 def _drift(db, item_id, kind, drift_qty, *, expected=None, actual=None, cycle_id="cyc-1"):
-    db.add(models.MrpDriftEvent(cycle_id=cycle_id, item_id=item_id, kind=kind,
+    generation_id = db.get(models.PlanningTruthState, 1).current_generation_id
+    db.add(models.MrpDriftEvent(ledger_generation_id=generation_id,
+                                cycle_id=cycle_id, item_id=item_id, kind=kind,
                                 drift_qty=drift_qty, expected_stock=expected,
                                 actual_stock=actual, matured=True))
     db.flush()
@@ -392,6 +394,68 @@ def test_drift_empty_for_other_item(client, seeded):
     d = client.get(f"/api/v1/item-ledger/{seeded['b']}/drift").json()
     ItemLedgerDriftResponse.model_validate(d)
     assert d["total"] == 0 and d["rows"] == []
+
+
+def test_drift_excludes_legacy_and_other_generation_rows(client, db_session, seeded):
+    item_id = seeded["a"]
+    imported = models.PhysicalImportBatch(
+        batch_key="router-other-physical",
+        status="completed",
+        source_watermarks={},
+        completed_at=dt.datetime(2026, 7, 22),
+    )
+    other = models.LedgerGeneration(
+        generation_key="router-other-generation",
+        status="rejected",
+        cutoff=dt.datetime(2026, 7, 22, 23, 59),
+        source_watermarks={},
+        capabilities={"execution_allocations": True},
+        physical_import_batch=imported,
+        algorithm_version="tests/other",
+    )
+    db_session.add_all([
+        imported,
+        other,
+        models.MrpDriftEvent(
+            item_id=item_id,
+            cycle_id="legacy-null",
+            kind="shortfall",
+            drift_qty=99,
+            matured=True,
+        ),
+    ])
+    db_session.flush()
+    db_session.add(models.MrpDriftEvent(
+        ledger_generation_id=other.id,
+        item_id=item_id,
+        cycle_id="other-generation",
+        kind="surplus",
+        drift_qty=88,
+        matured=True,
+    ))
+    db_session.commit()
+
+    d = client.get(f"/api/v1/item-ledger/{item_id}/drift").json()
+    assert d["total"] == 1
+    assert [row["cycle_id"] for row in d["rows"]] == ["cyc-1"]
+
+
+def test_drift_fails_closed_without_execution_capability(client, db_session, seeded):
+    generation = db_session.get(
+        models.LedgerGeneration,
+        db_session.get(models.PlanningTruthState, 1).current_generation_id,
+    )
+    generation.capabilities = {
+        "physical_ledger": True,
+        "reservation_replay": True,
+        "execution_allocations": False,
+    }
+    db_session.commit()
+
+    response = client.get(f"/api/v1/item-ledger/{seeded['a']}/drift")
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "planning_truth_unavailable"
+    assert response.json()["detail"]["consumer"] == "item_ledger.drift"
 
 
 def test_drift_unknown_item_404(client, seeded):
