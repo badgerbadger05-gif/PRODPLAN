@@ -283,6 +283,13 @@ def _policy_items(
                 "item_id": int(item.item_id),
                 "item_code": item.item_code,
                 "item_name": item.item_name,
+                # A purchase cockpit is a saved read model too.  Capture the
+                # document-facing master identifiers here, rather than letting
+                # its reader re-open mutable Item rows after publication.
+                "supplier_ref1c": item.supplier_ref1c,
+                "item_ref1c": item.item_ref1c,
+                "article": item.item_article,
+                "unit": item.unit,
                 "replenishment_method": item.replenishment_method,
                 "replenishment_time": item.replenishment_time,
                 "optimal_batch": _json_value(item.optimal_batch),

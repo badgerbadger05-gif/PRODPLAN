@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 import json
 from typing import Any, Mapping
@@ -47,7 +48,13 @@ _DBR_POLICY_CONSUMER = "dbr_policy_input"
 _DBR_POLICY_KEY = "policy:v1"
 _DBR_COCKPIT_CONSUMER = "dbr_feeder_cockpit"
 _DBR_COCKPIT_KEY = "cockpit:v1"
+_DBR_PURCHASE_CONSUMER = "dbr_purchase_cockpit"
+_DBR_PURCHASE_KEY = "purchase:v1"
+_DBR_DRUM_CONSUMER = "dbr_drum_board"
+_DBR_DRUM_KEY = "board:v1"
 _DBR_CAPABILITY = "dbr_feeder_cockpit"
+_DBR_PURCHASE_CAPABILITY = "dbr_purchase_cockpit"
+_DBR_DRUM_CAPABILITY = "dbr_drum_board"
 _MRP_ROW_KINDS = frozenset({"production", "purchase", "rework", "capacity"})
 _REQUIRED_PUBLISHED_CAPABILITIES = frozenset({
     "physical_ledger",
@@ -454,15 +461,20 @@ def _require_candidate_dbr_snapshots(
     truth_status: str,
     accepted_at: datetime | None,
 ) -> list[models.PlanningReadSnapshot]:
-    """Validate the optional DBR policy/cockpit pair all-or-nothing."""
+    """Validate DBR policy/feeder/purchase plus an optional exact drum board."""
     rows = _lock(db.query(models.PlanningReadSnapshot)).filter(
         models.PlanningReadSnapshot.ledger_generation_id == int(target.id),
         models.PlanningReadSnapshot.consumer.in_(
-            (_DBR_POLICY_CONSUMER, _DBR_COCKPIT_CONSUMER)
+            (_DBR_POLICY_CONSUMER, _DBR_COCKPIT_CONSUMER, _DBR_PURCHASE_CONSUMER, _DBR_DRUM_CONSUMER)
         ),
     ).all()
-    if capabilities.get(_DBR_CAPABILITY) is not True:
-        if snapshot_metrics.get("dbr_cockpit_ready") is not False:
+    feeder_enabled = capabilities.get(_DBR_CAPABILITY) is True
+    purchase_enabled = capabilities.get(_DBR_PURCHASE_CAPABILITY) is True
+    drum_enabled = capabilities.get(_DBR_DRUM_CAPABILITY) is True
+    if not feeder_enabled and not purchase_enabled:
+        if (snapshot_metrics.get("dbr_cockpit_ready") is not False
+                or snapshot_metrics.get("dbr_purchase_ready") is not False
+                or snapshot_metrics.get("dbr_drum_ready") is not False):
             raise ObligationRefreshPublishError(
                 "snapshot_build lacks explicit DBR readiness"
             )
@@ -472,53 +484,81 @@ def _require_candidate_dbr_snapshots(
             )
         return []
 
-    if snapshot_metrics.get("dbr_cockpit_ready") is not True:
+    if not feeder_enabled or not purchase_enabled:
+        raise ObligationRefreshPublishError("DBR feeder and purchase capabilities must publish together")
+
+    if (snapshot_metrics.get("dbr_cockpit_ready") is not True
+            or snapshot_metrics.get("dbr_purchase_ready") is not True):
         raise ObligationRefreshPublishError(
             "DBR capability conflicts with snapshot readiness"
         )
+    if snapshot_metrics.get("dbr_drum_ready") is not drum_enabled:
+        raise ObligationRefreshPublishError("DBR drum capability conflicts with snapshot readiness")
     try:
         policy_id = int(snapshot_metrics["dbr_policy_snapshot_id"])
         cockpit_id = int(snapshot_metrics["dbr_cockpit_snapshot_id"])
+        purchase_id = int(snapshot_metrics["dbr_purchase_snapshot_id"])
     except (KeyError, TypeError, ValueError) as exc:
         raise ObligationRefreshPublishError(
             "snapshot_build DBR snapshot identities are malformed"
         ) from exc
+    drum_id = None
+    if drum_enabled:
+        try:
+            drum_id = int(snapshot_metrics["dbr_drum_snapshot_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ObligationRefreshPublishError("snapshot_build DBR drum snapshot identity is malformed") from exc
+    expected_ids = {policy_id, cockpit_id, purchase_id} | ({drum_id} if drum_id is not None else set())
     by_id = {int(row.id): row for row in rows}
-    if set(by_id) != {policy_id, cockpit_id} or policy_id == cockpit_id:
+    if set(by_id) != expected_ids or len(expected_ids) != len(by_id):
         raise ObligationRefreshPublishError(
             "target has missing or extra DBR candidate snapshots"
         )
     policy = by_id[policy_id]
     cockpit = by_id[cockpit_id]
+    purchase = by_id[purchase_id]
+    drum = by_id[drum_id] if drum_id is not None else None
     expected_cutoff = _utc(target.cutoff, "target cutoff")
     if (
         policy.consumer != _DBR_POLICY_CONSUMER
         or policy.snapshot_key != _DBR_POLICY_KEY
         or cockpit.consumer != _DBR_COCKPIT_CONSUMER
         or cockpit.snapshot_key != _DBR_COCKPIT_KEY
+        or purchase.consumer != _DBR_PURCHASE_CONSUMER
+        or purchase.snapshot_key != _DBR_PURCHASE_KEY
+        or (drum is not None and (drum.consumer != _DBR_DRUM_CONSUMER or drum.snapshot_key != _DBR_DRUM_KEY))
         or str(policy.truth_status) != truth_status
         or str(cockpit.truth_status) != truth_status
+        or str(purchase.truth_status) != truth_status
+        or (drum is not None and str(drum.truth_status) != truth_status)
         or _utc(policy.cutoff, "DBR policy cutoff") != expected_cutoff
         or _utc(cockpit.cutoff, "DBR cockpit cutoff") != expected_cutoff
+        or _utc(purchase.cutoff, "DBR purchase cutoff") != expected_cutoff
+        or (drum is not None and _utc(drum.cutoff, "DBR drum cutoff") != expected_cutoff)
     ):
         raise ObligationRefreshPublishError(
             "DBR candidate snapshot lineage conflicts"
         )
     if accepted_at is None:
-        if policy.reason is None or cockpit.reason is None:
+        if policy.reason is None or cockpit.reason is None or purchase.reason is None or (drum is not None and drum.reason is None):
             raise ObligationRefreshPublishError(
                 "unpublished DBR candidate snapshot lacks reason"
             )
     elif (
         policy.reason is not None
         or cockpit.reason is not None
+        or purchase.reason is not None
+        or (drum is not None and drum.reason is not None)
         or _utc(policy.published_at, "DBR policy published_at") != accepted_at
         or _utc(cockpit.published_at, "DBR cockpit published_at") != accepted_at
+        or _utc(purchase.published_at, "DBR purchase published_at") != accepted_at
+        or (drum is not None and _utc(drum.published_at, "DBR drum published_at") != accepted_at)
     ):
         raise ObligationRefreshPublishError(
             "accepted DBR snapshot publication state conflicts"
         )
     meta = cockpit.payload.get("meta") if isinstance(cockpit.payload, dict) else None
+    purchase_meta = purchase.payload.get("meta") if isinstance(purchase.payload, dict) else None
     policy_runs = policy.payload.get("runs") if isinstance(policy.payload, dict) else None
     if not isinstance(policy_runs, list):
         raise ObligationRefreshPublishError("DBR policy run manifest is malformed")
@@ -540,11 +580,56 @@ def _require_candidate_dbr_snapshots(
         or int(meta.get("policy_snapshot_id") or -1) != policy_id
         or meta.get("runs") != cockpit_runs
         or declared_runs != sorted(candidate_ids)
+        or not isinstance(purchase_meta, dict)
+        or int(purchase_meta.get("policy_snapshot_id") or -1) != policy_id
+        or purchase_meta.get("runs") != cockpit_runs
     ):
         raise ObligationRefreshPublishError(
             "DBR cockpit policy/run manifest conflicts"
         )
-    return [policy, cockpit]
+    if (
+        int(purchase_meta.get("ledger_generation") or -1) != int(target.id)
+        or int(purchase_meta.get("ledger_generation_id") or -1) != int(target.id)
+        or purchase_meta.get("read_only") is not True
+        or not isinstance(purchase.payload.get("rows"), list)
+    ):
+        raise ObligationRefreshPublishError("DBR purchase snapshot meta conflicts")
+    seen_reservations: set[int] = set()
+    seen_axes: set[tuple[str, str]] = set()
+    for row in purchase.payload["rows"]:
+        if not isinstance(row, dict):
+            raise ObligationRefreshPublishError("DBR purchase snapshot row is malformed")
+        reservation_ids = row.get("reservation_ids")
+        if not isinstance(reservation_ids, list) or not reservation_ids:
+            raise ObligationRefreshPublishError("DBR purchase row lacks reservation identities")
+        try:
+            ids = [int(value) for value in reservation_ids]
+            to_order = Decimal(str(row["to_order_qty"]))
+            uncovered = Decimal(str(row["uncovered_qty"]))
+        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+            raise ObligationRefreshPublishError("DBR purchase row has invalid quantities") from exc
+        if (len(ids) != len(set(ids)) or any(value <= 0 for value in ids)
+                or seen_reservations.intersection(ids)):
+            raise ObligationRefreshPublishError("DBR purchase reservation identity is duplicated")
+        if to_order < 0 or uncovered < 0 or to_order != uncovered:
+            raise ObligationRefreshPublishError("DBR purchase to_order must equal nonnegative uncovered")
+        axis = (str(row.get("item_code") or "").strip(), str(row.get("planning_stock_pool") or "").strip())
+        if not axis[0] or not axis[1] or axis in seen_axes:
+            raise ObligationRefreshPublishError("DBR purchase row axis is malformed or duplicated")
+        seen_reservations.update(ids)
+        seen_axes.add(axis)
+    if drum is not None:
+        drum_meta = drum.payload.get("meta") if isinstance(drum.payload, dict) else None
+        if (
+            not isinstance(drum_meta, dict)
+            or int(drum_meta.get("ledger_generation") or -1) != int(target.id)
+            or int(drum_meta.get("ledger_generation_id") or -1) != int(target.id)
+            or drum_meta.get("read_only") is not True
+            or not isinstance(drum.payload.get("slots"), list)
+            or not isinstance(drum.payload.get("gaps"), list)
+        ):
+            raise ObligationRefreshPublishError("DBR drum snapshot meta conflicts")
+    return [row for row in (policy, cockpit, purchase, drum) if row is not None]
 
 
 def _exact_retry(

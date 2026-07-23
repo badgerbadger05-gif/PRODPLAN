@@ -24,6 +24,8 @@ CAPABILITY_RESERVATION_REPLAY = "reservation_replay"
 CAPABILITY_EXECUTION_ALLOCATIONS = "execution_allocations"
 CAPABILITY_PLANNING_SNAPSHOTS = "planning_snapshots"
 CAPABILITY_DBR_FEEDER_COCKPIT = "dbr_feeder_cockpit"
+CAPABILITY_DBR_PURCHASE_COCKPIT = "dbr_purchase_cockpit"
+CAPABILITY_DBR_DRUM_BOARD = "dbr_drum_board"
 
 
 @dataclass(frozen=True)

@@ -36,6 +36,8 @@ def _capabilities():
         "reservation_replay": True,
         "execution_allocations": True,
         "planning_snapshots": True,
+        "dbr_feeder_cockpit": False,
+        "dbr_purchase_cockpit": False,
     }
 
 
@@ -51,6 +53,7 @@ def _seal_build(db, target, candidates, cutoff):
                 },
                 "future_supply_captured": True,
                 "dbr_cockpit_ready": False,
+                "dbr_purchase_ready": False,
             }
         db.add(models.LedgerBuildBatch(
             ledger_generation_id=target.id, stage=stage, batch_key=f"{target.id}:{stage}",

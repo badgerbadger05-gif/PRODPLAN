@@ -69,11 +69,13 @@ def test_add_only_builds_real_checkpoints_and_promotes_persisted_read_snapshot(d
         "physical_ledger": True, "reservation_replay": True,
         "execution_allocations": True, "planning_snapshots": True,
         "dbr_feeder_cockpit": False,
+        "dbr_purchase_cockpit": False,
     }
     assert {"physical_import", "reservation_materialize", "reservation_replay", "snapshot_build"} == set(by_stage)
     assert all(row.status == "completed" for row in by_stage.values())
     assert by_stage["snapshot_build"].metrics["future_supply_captured"] is True
     assert by_stage["snapshot_build"].metrics["dbr_cockpit_ready"] is False
+    assert by_stage["snapshot_build"].metrics["dbr_purchase_ready"] is False
     snapshot_id = by_stage["snapshot_build"].metrics["candidate_read_snapshot_ids"][str(candidate.run_id)]
     assert db_session.get(models.PlanningReadSnapshot, snapshot_id).truth_status == "accepted"
     # This public read function consumes the stored snapshot; it does not run MRP.
@@ -116,12 +118,19 @@ def test_configured_dbr_policy_and_cockpit_publish_atomically(db_session):
         models.PlanningReadSnapshot,
         checkpoint.metrics["dbr_cockpit_snapshot_id"],
     )
+    purchase = db_session.get(
+        models.PlanningReadSnapshot,
+        checkpoint.metrics["dbr_purchase_snapshot_id"],
+    )
 
     assert target.capabilities["dbr_feeder_cockpit"] is True
+    assert target.capabilities["dbr_purchase_cockpit"] is True
     assert checkpoint.metrics["dbr_cockpit_ready"] is True
-    assert policy.truth_status == cockpit.truth_status == "accepted"
-    assert policy.reason is None and cockpit.reason is None
+    assert checkpoint.metrics["dbr_purchase_ready"] is True
+    assert policy.truth_status == cockpit.truth_status == purchase.truth_status == "accepted"
+    assert policy.reason is None and cockpit.reason is None and purchase.reason is None
     assert cockpit.payload["meta"]["policy_snapshot_id"] == policy.id
+    assert purchase.payload["meta"]["policy_snapshot_id"] == policy.id
     assert cockpit.payload["meta"]["ledger_generation"] == target.id
     db_session.commit()
 
@@ -133,12 +142,33 @@ def test_configured_dbr_policy_and_cockpit_publish_atomically(db_session):
         pool_mapping={"W2": "w2", "W3": "w3", "W4": "default"},
     )
     assert retry.published is False
-    cockpit.reason = "tampered"
+    # The exact retry must reject a saved purchase snapshot that no longer
+    # proves Ledger identity/read-only semantics; it may not silently reuse
+    # the other two DBR snapshots.
+    purchase.payload = {
+        **purchase.payload,
+        "meta": {**purchase.payload["meta"], "read_only": False},
+    }
     db_session.flush()
     with pytest.raises(
         ObligationRefreshPublishError,
         match="mixed or partial",
     ):
+        _run(
+            db_session,
+            accepted,
+            "orch-add-dbr",
+            add=[plan.id],
+            pool_mapping={"W2": "w2", "W3": "w3", "W4": "default"},
+        )
+    db_session.rollback()
+    missing_purchase = db_session.get(
+        models.PlanningReadSnapshot,
+        checkpoint.metrics["dbr_purchase_snapshot_id"],
+    )
+    db_session.delete(missing_purchase)
+    db_session.flush()
+    with pytest.raises(ObligationRefreshPublishError, match="mixed or partial"):
         _run(
             db_session,
             accepted,

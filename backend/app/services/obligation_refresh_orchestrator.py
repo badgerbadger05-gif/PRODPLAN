@@ -29,6 +29,14 @@ from app.services.dbr.policy_snapshot import (
     DbrPolicySnapshotError,
     build_policy_candidate_snapshot,
 )
+from app.services.dbr.purchase_candidate import (
+    DbrPurchaseCandidateError,
+    build_purchase_candidate_snapshot,
+)
+from app.services.dbr.drum_board_snapshot import (
+    DbrDrumBoardCandidateError,
+    build_drum_board_candidate_snapshot,
+)
 from app.services.mrp_freeze import MRP_LEDGER_LOCK_KEY, freeze_candidate_snapshots
 from app.services.mrp_result_snapshot import build_mrp_result_candidate_snapshot
 from app.services.obligation_refresh_manifest import (
@@ -47,6 +55,8 @@ _CORE_CAPABILITIES = {
     "planning_snapshots": True,
 }
 _DBR_CAPABILITY = "dbr_feeder_cockpit"
+_DBR_PURCHASE_CAPABILITY = "dbr_purchase_cockpit"
+_DBR_DRUM_CAPABILITY = "dbr_drum_board"
 
 
 class ObligationRefreshOrchestratorError(RuntimeError):
@@ -297,7 +307,12 @@ def run_obligation_refresh(
     db.flush()
 
     dbr_metrics: dict[str, Any]
-    capabilities = {**_CORE_CAPABILITIES, _DBR_CAPABILITY: False}
+    capabilities = {
+        **_CORE_CAPABILITIES,
+        _DBR_CAPABILITY: False,
+        _DBR_PURCHASE_CAPABILITY: False,
+        _DBR_DRUM_CAPABILITY: False,
+    }
     dbr_configured = (
         db.get(models.DbrSettings, 1) is not None
         and bool(planning_pool_by_warehouse)
@@ -306,7 +321,9 @@ def run_obligation_refresh(
         try:
             policy_snapshot = build_policy_candidate_snapshot(db, target_id)
             cockpit_snapshot = build_cockpit_candidate_snapshot(db, target_id)
-        except (DbrPolicySnapshotError, DbrCockpitCandidateError) as exc:
+            purchase_snapshot = build_purchase_candidate_snapshot(db, target_id)
+            drum_snapshot = build_drum_board_candidate_snapshot(db, target_id)
+        except (DbrPolicySnapshotError, DbrCockpitCandidateError, DbrPurchaseCandidateError, DbrDrumBoardCandidateError) as exc:
             raise ObligationRefreshOrchestratorError(
                 f"configured DBR candidate build failed: {exc}"
             ) from exc
@@ -315,18 +332,32 @@ def run_obligation_refresh(
         ).hexdigest()
         dbr_metrics = {
             "dbr_cockpit_ready": True,
+            "dbr_purchase_ready": True,
             "dbr_policy_snapshot_id": int(policy_snapshot.id),
             "dbr_cockpit_snapshot_id": int(cockpit_snapshot.id),
+            "dbr_purchase_snapshot_id": int(purchase_snapshot.id),
+            "dbr_drum_ready": drum_snapshot is not None,
             "dbr_policy_hash": policy_hash,
         }
         capabilities[_DBR_CAPABILITY] = True
+        capabilities[_DBR_PURCHASE_CAPABILITY] = True
+        if drum_snapshot is not None:
+            dbr_metrics["dbr_drum_snapshot_id"] = int(drum_snapshot.id)
+            capabilities[_DBR_DRUM_CAPABILITY] = True
+        else:
+            dbr_metrics["dbr_drum_unavailable_reason"] = (
+                "No active drum schedule with exact target Ledger generation and frozen run lineage"
+            )
     else:
         dbr_metrics = {
             "dbr_cockpit_ready": False,
+            "dbr_purchase_ready": False,
+            "dbr_drum_ready": False,
             "dbr_unavailable_reason": (
                 "DBR settings and an exact planning_pool_by_warehouse mapping "
                 "are required"
             ),
+            "dbr_drum_unavailable_reason": "DBR policy is not configured",
         }
     snapshot_metrics = {
         "candidate_run_ids": list(candidate_ids),

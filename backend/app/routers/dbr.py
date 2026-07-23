@@ -26,8 +26,8 @@ from sqlalchemy.orm import Session
 from ..database import get_db
 from ..services import planning_truth
 from ..services.dbr import (
-    board_service,
     cockpit_snapshot_service,
+    drum_board_snapshot,
     drum_service,
     feeder_chain_service,
     feeder_material_service,
@@ -40,6 +40,7 @@ from ..services.dbr import (
     processing_trip_manifest,
     program_service,
     purchase_materialize_service,
+    purchase_snapshot_service,
     settings_service,
     slot_service,
 )
@@ -731,7 +732,12 @@ def drum_board(
     date_to: Optional[date] = Query(default=None),
     db: Session = Depends(get_db),
 ):
-    return board_service.get_board(db, date_from=date_from, date_to=date_to)
+    try:
+        return drum_board_snapshot.read_drum_board_snapshot(
+            db, date_from=date_from, date_to=date_to,
+        )
+    except drum_board_snapshot.DbrDrumBoardSnapshotUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
 
 
 @router.post("/drum/{schedule_id}/refresh-gate")
@@ -739,10 +745,13 @@ def drum_refresh_gate(
     schedule_id: int,
     db: Session = Depends(get_dbr_write_db, scope="function"),
 ):
-    try:
-        return gate_service.refresh_gate(db, schedule_id=schedule_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    # This mutation recalculates gates from mutable stock mirrors.  It is
+    # deliberately retired while the accepted path is Ledger-snapshot only.
+    raise HTTPException(status_code=503, detail={
+        "code": "dbr_drum_legacy_mutation_retired", "consumer": "dbr_drum_refresh_gate",
+        "status": "unavailable", "read_only": True,
+        "reason": "refresh-gate recalculates from mutable legacy facts; publish a new Ledger generation instead",
+    })
 
 
 @router.post("/drum/{schedule_id}/roll-forward")
@@ -750,7 +759,11 @@ def drum_roll_forward(
     schedule_id: int,
     db: Session = Depends(get_dbr_write_db, scope="function"),
 ):
-    return slot_service.roll_forward(db, schedule_id=schedule_id)
+    raise HTTPException(status_code=503, detail={
+        "code": "dbr_drum_legacy_mutation_retired", "consumer": "dbr_drum_roll_forward",
+        "status": "unavailable", "read_only": True,
+        "reason": "roll-forward mutates legacy schedule facts; build a Ledger-bound successor schedule instead",
+    })
 
 
 @router.post("/drum/slots/{slot_id}/move")
@@ -859,6 +872,15 @@ def feeder_processing_order_preview(
 # --------------------------------------------------------------------------
 
 
+@router.get("/purchase/cockpit")
+def get_purchase_cockpit(db: Session = Depends(get_db)):
+    """Read the immutable purchase obligations of the accepted Ledger only."""
+    try:
+        return purchase_snapshot_service.read_purchase_snapshot(db)
+    except purchase_snapshot_service.DbrPurchaseSnapshotUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+
+
 @router.post("/feeder/purchase/launch")
 def feeder_launch_purchase(
     payload: PurchaseLaunchRequest,
@@ -889,18 +911,12 @@ def purchase_plan_preview(
     threshold_days: int = Query(default=60, ge=0),
     db: Session = Depends(get_db),
 ):
-    """Pure net-requirement preview (no writes) for a program or active schedule."""
-    try:
-        return purchase_materialize_service.purchase_plan_preview(
-            db,
-            program_id=program_id,
-            active_schedule=active,
-            lead_time_threshold_days=threshold_days,
-        )
-    except LookupError:
-        raise HTTPException(status_code=404, detail="program not found")
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    """Retired: use the saved Ledger purchase cockpit instead."""
+    raise HTTPException(status_code=503, detail={
+        "code": "dbr_purchase_legacy_preview_retired",
+        "consumer": "dbr_purchase_cockpit",
+        "reason": "Legacy purchase preview reads mutable program and stock facts; use /purchase/cockpit",
+    })
 
 
 @router.post("/purchase-plan/materialize")
@@ -908,22 +924,10 @@ def purchase_plan_materialize(
     payload: PurchasePlanMaterializeRequest,
     db: Session = Depends(get_dbr_write_db, scope="function"),
 ):
-    """Materialize the net purchase plan into supplier orders (same export path).
-
-    dry_run=true (default) previews only; unresolved rows (no supplier) are
-    reported and never block the batch.
-    """
-    try:
-        return purchase_materialize_service.materialize_purchase_plan(
-            db,
-            program_id=payload.program_id,
-            active_schedule=payload.active,
-            lead_time_threshold_days=payload.threshold_days,
-            dry_run=payload.dry_run,
-        )
-    except LookupError:
-        raise HTTPException(status_code=404, detail="program not found")
-    except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    """Retired until a Ledger-native purchase materializer is implemented."""
+    raise HTTPException(status_code=503, detail={
+        "code": "dbr_purchase_legacy_materialize_retired",
+        "consumer": "dbr_purchase_cockpit",
+        "reason": "Legacy materialization is disabled; the purchase cockpit is read-only",
+        "read_only": True,
+    })

@@ -19,6 +19,7 @@ from app.services.dbr import (
     feeder_position_service,
     feeder_signal_service,
     processing_board_service,
+    purchase_snapshot_service,
 )
 
 
@@ -72,6 +73,7 @@ def _accepted_generation(db, suffix: str = "one"):
             planning_truth.CAPABILITY_RESERVATION_REPLAY: True,
             planning_truth.CAPABILITY_PLANNING_SNAPSHOTS: True,
             planning_truth.CAPABILITY_DBR_FEEDER_COCKPIT: True,
+            planning_truth.CAPABILITY_DBR_PURCHASE_COCKPIT: True,
         },
     )
     db.add(generation)
@@ -123,6 +125,19 @@ def _publish_cockpit(db):
     db.commit()
 
 
+def _publish_purchase(db):
+    planning_truth.publish_read_snapshot(
+        db,
+        consumer=purchase_snapshot_service.CONSUMER,
+        snapshot_key="test-purchase",
+        payload={"meta": {"read_only": True}, "rows": [{
+            "item_code": "BUY-1", "reservation_ids": [41], "to_order_qty": 7,
+        }]},
+        required_capabilities=purchase_snapshot_service.REQUIRED_CAPABILITIES,
+    )
+    db.commit()
+
+
 def test_mount_gets_read_snapshot_without_invoking_live_calculators(
     client,
     db_session,
@@ -158,6 +173,20 @@ def test_mount_gets_read_snapshot_without_invoking_live_calculators(
     assert cockpit.json()["meta"]["truth_status"] == "accepted"
     assert cockpit.json()["meta"]["ledger_generation"] is not None
     assert cockpit.json()["meta"]["snapshot_id"] is not None
+
+
+def test_purchase_cockpit_reads_saved_rows_and_legacy_endpoints_are_retired(client, db_session):
+    _accepted_generation(db_session, "purchase")
+    _publish_purchase(db_session)
+    response = client.get("/api/v1/dbr/purchase/cockpit")
+    assert response.status_code == 200
+    assert response.json()["rows"][0]["to_order_qty"] == 7
+    assert response.json()["meta"]["truth_status"] == "accepted"
+    preview = client.get("/api/v1/dbr/purchase-plan/preview")
+    materialize = client.post("/api/v1/dbr/purchase-plan/materialize", json={"dry_run": True})
+    assert preview.status_code == materialize.status_code == 503
+    assert preview.json()["detail"]["code"] == "dbr_purchase_legacy_preview_retired"
+    assert materialize.json()["detail"]["read_only"] is True
 
 
 @pytest.mark.parametrize("signal_ids", [None, []])
