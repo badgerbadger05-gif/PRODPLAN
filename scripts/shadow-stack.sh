@@ -168,7 +168,7 @@ restore_db() {
     "restore разрешён только из ${backup_root}, получен ${source_real}"
   [[ "${CONFIRM_RESTORE:-}" == "${PROJECT_NAME}" ]] || die \
     "restore удалит ТОЛЬКО shadow-базу; повторите с CONFIRM_RESTORE=${PROJECT_NAME}"
-  compose --profile automation stop frontend backend sync-worker reconcile-worker 2>/dev/null || true
+  compose --profile automation stop frontend backend sync-worker 2>/dev/null || true
   compose up -d db
   wait_for_db
   compose exec -T db sh -c \
@@ -183,8 +183,8 @@ restore_db() {
 
 start_workers() {
   require_env
-  compose --profile automation up -d sync-worker reconcile-worker
-  info "shadow-воркеры включены с разнесёнными задержками"
+  compose --profile automation up -d sync-worker
+  info "shadow sync-worker включён; legacy MRP reconcile-worker удалён"
 }
 
 stop_stack() {

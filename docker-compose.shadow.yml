@@ -111,23 +111,5 @@ services:
       backend:
         condition: service_healthy
 
-  reconcile-worker:
-    profiles: ["automation"]
-    build:
-      context: ./backend
-      args:
-        INSTALL_DEV: "false"
-    restart: unless-stopped
-    command: ["python", "reconcile_worker.py"]
-    environment:
-      TZ: Europe/Moscow
-      RECONCILE_BASE_URL: http://backend:8000
-      RECONCILE_INTERVAL_SECONDS: ${PRODPLAN_SHADOW_RECONCILE_INTERVAL_SECONDS:-21600}
-      RECONCILE_STARTUP_DELAY_SECONDS: ${PRODPLAN_SHADOW_RECONCILE_STARTUP_DELAY_SECONDS:-900}
-      PRODPLAN_DEPLOYMENT_CONTOUR: parallel
-    depends_on:
-      backend:
-        condition: service_healthy
-
 volumes:
   prodplan_shadow_postgres_data:

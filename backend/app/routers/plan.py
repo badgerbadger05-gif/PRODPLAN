@@ -23,7 +23,6 @@ from ..services.production_report_service import (
 )
 
 from ..services.planning_service import (
-    run_planning_run,
     list_planning_runs,
     get_run_summary,
     get_run_production,
@@ -35,8 +34,6 @@ from ..services.planning_service import (
     get_run_rework_grouped_by_category,
     get_run_capacity,
     get_run_pegging,
-    compute_planning_preview,
-    compute_gross_requirements,
     # retention & pin control
     # Config management
     list_planning_configs,
@@ -59,7 +56,6 @@ from ..services.mrp_result_snapshot import (
     read_mrp_result_rows,
 )
 from ..services.one_c_purchase_order_export import export_planned_purchases_to_1c
-from ..services.mrp_reconciliation import reconcile_all_active, reconcile_snapshot
 from ..services.period_plan_service import (
     add_item_to_period_plan,
     archive_period_plan,
@@ -79,6 +75,22 @@ from ..services.period_plan_service import (
 )
 
 router = APIRouter(prefix="/v1/plan", tags=["plan"])
+
+
+def _retire_legacy_live_mrp(operation: str) -> None:
+    """Fail closed for calculators outside the Ledger candidate/publish flow."""
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "code": "legacy_live_mrp_retired",
+            "operation": operation,
+            "truth_status": "unavailable",
+            "truth_reason": (
+                "Live MRP calculation and mutation are retired. Build an "
+                "immutable Item Ledger candidate and publish its saved snapshots."
+            ),
+        },
+    )
 
 
 def _reject_legacy_mrp_result_read(run_id: int) -> None:
@@ -296,6 +308,7 @@ class PeriodPlanFixRequest(BaseModel):
 
 
 class PeriodPlanMrpSnapshotRequest(BaseModel):
+    generation_key: str
     started_by: Optional[str] = None
 
 
@@ -498,8 +511,16 @@ async def period_plans_mrp_snapshot(
     db: Session = Depends(get_db),
 ):
     try:
-        return create_mrp_snapshot_from_period_plan(db, plan_id, started_by=req.started_by or "api")
+        result = create_mrp_snapshot_from_period_plan(
+            db,
+            plan_id,
+            generation_key=req.generation_key,
+            started_by=req.started_by or "api",
+        )
+        db.commit()
+        return result
     except Exception as e:
+        db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -721,22 +742,8 @@ async def start_planning_run(
     req: CalcRequest,
     db: Session = Depends(get_db)
 ):
-    """
-    Полный расчёт планирования и сохранение результатов прогона.
-    Создаёт RUN с конфигурацией (RUNNING) → выполняет расчёт предпросмотра (gross+net),
-    классифицирует потоки (production/purchase), сохраняет planned_order/planned_purchase,
-    завершает статусом SUCCESS/FAILED и возвращает run_id.
-    """
-    try:
-        run_id = run_planning_run(
-            db=db,
-            horizon_days=req.horizon_days,
-            config_overrides=req.config_overrides or {},
-            started_by=req.started_by or "api",
-        )
-        return {"status": "ok", "run_id": int(run_id)}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    """Retired: live runs bypass immutable Ledger candidates and snapshots."""
+    _retire_legacy_live_mrp("calc")
 
 
 @router.post("/calc_preview")
@@ -744,19 +751,8 @@ async def calc_preview(
     req: CalcRequest,
     db: Session = Depends(get_db)
 ):
-    """
-    Предпросчёт валовой и чистой потребности (без записи результатов в БД).
-    Политики и горизонты берутся из активной конфигурации с учётом overrides.
-    """
-    try:
-        result = compute_planning_preview(
-            db=db,
-            horizon_days=req.horizon_days,
-            config_overrides=req.config_overrides or {},
-        )
-        return {"status": "ok", "preview": result}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    """Retired: previews must be persisted by the background refresh flow."""
+    _retire_legacy_live_mrp("calc_preview")
 
 
 @router.post("/calc_gross")
@@ -764,18 +760,8 @@ async def calc_gross(
     req: CalcRequest,
     db: Session = Depends(get_db)
 ):
-    """
-    Валовая потребность (BOM-развёртка) без неттинга и без записи в БД.
-    """
-    try:
-        result = compute_gross_requirements(
-            db=db,
-            horizon_days=req.horizon_days,
-            config_overrides=req.config_overrides or {},
-        )
-        return {"status": "ok", "gross": result}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    """Retired: gross demand is part of a sealed Ledger-bound snapshot."""
+    _retire_legacy_live_mrp("calc_gross")
 
 
 # ===== Planning configuration management API =====
@@ -1604,20 +1590,8 @@ async def refreeze_mrp_snapshots(
     req: RefreezeRequest = RefreezeRequest(),
     db: Session = Depends(get_db),
 ):
-    """Заморозка v2: пере-заморозить остаточный нетто-расчёт всей активной
-    области MRP (все открытые FIXED_SNAPSHOT-планы) против ОДНОГО общего пула
-    запасов/поставок/WIP — физическая единица кредитуется не более чем одному
-    плану. ``plan_id`` включает конкретный план в область (создаёт/обновляет его
-    прогон). ``dry_run=true`` считает и откатывает, ничего не записывая.
-    """
-    from ..services.mrp_freeze import refreeze_active_snapshots
-
-    try:
-        return refreeze_active_snapshots(
-            db, include_plan_id=req.plan_id, dry_run=bool(req.dry_run)
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    """Retired destructive endpoint; use the period-plan snapshot contract."""
+    _retire_legacy_live_mrp("mrp_snapshot_refreeze")
 
 
 @router.post("/reconcile")
@@ -1625,18 +1599,8 @@ async def reconcile_active_snapshots(
     req: ReconcileRequest = ReconcileRequest(),
     db: Session = Depends(get_db),
 ):
-    """
-    Регламентная сверка остаточной потребности: пересчитать текущий нетто-расчёт
-    для каждого активного MRP-снимка и добрать недопокрытие (заказы на
-    производство в журнал, строки закупок в MRP). В 1С ничего не уходит —
-    только по кнопке пользователя.
-
-    `dry_run=true` считает и возвращает дельту, ничего не записывая.
-    """
-    try:
-        return reconcile_all_active(db, dry_run=bool(req.dry_run))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    """Retired: proposal mutations belong to obligation-refresh publish."""
+    _retire_legacy_live_mrp("reconcile")
 
 
 @router.post("/results/{run_id}/reconcile")
@@ -1645,13 +1609,8 @@ async def reconcile_single_snapshot(
     req: ReconcileRequest = ReconcileRequest(),
     db: Session = Depends(get_db),
 ):
-    """Сверка одного FIXED_SNAPSHOT-прогона. См. POST /reconcile."""
-    try:
-        return reconcile_snapshot(db, int(run_id), dry_run=bool(req.dry_run))
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    """Retired: a published run is immutable and cannot be reconciled live."""
+    _retire_legacy_live_mrp("run_reconcile")
 
 
 @router.post("/mrp/run/{run_id}/force-close")

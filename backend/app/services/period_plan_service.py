@@ -13,6 +13,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only; runtime import is mrp_freez
 from ..models import (
     DefaultSpecification,
     Item,
+    LedgerGeneration,
     MrpRequirement,
     MrpRequirementBucket,
     Operation,
@@ -28,6 +29,7 @@ from ..models import (
     ProductionPlanLine,
     ProductionResource,
     ResourceProductionKind,
+    PlanningTruthState,
     SpecComponent,
     SpecOperation,
     Specification,
@@ -353,11 +355,21 @@ def update_period_plan_header(
 
 
 def list_mrp_runs_for_plan(db: Session, plan_id: int, *, limit: int = 50) -> Dict[str, Any]:
-    """Return MRP runs whose source_plan_id matches this plan, newest first."""
+    """Return only published snapshots from the exact current Ledger truth."""
     _get_plan(db, plan_id)  # validates existence
+    truth = db.get(PlanningTruthState, 1)
+    if truth is None or truth.current_generation_id is None:
+        raise ValueError("Current accepted Ledger truth is unavailable")
+    generation = db.get(LedgerGeneration, int(truth.current_generation_id))
+    if generation is None or str(generation.status) != "accepted":
+        raise ValueError("Current accepted Ledger truth is unavailable")
     runs = (
         db.query(PlanningRun)
-        .filter(PlanningRun.source_plan_id == int(plan_id))
+        .filter(
+            PlanningRun.source_plan_id == int(plan_id),
+            PlanningRun.ledger_generation_id == int(truth.current_generation_id),
+            PlanningRun.status == "FIXED_SNAPSHOT",
+        )
         .order_by(PlanningRun.run_id.desc())
         .limit(max(1, min(int(limit or 50), 200)))
         .all()
@@ -379,14 +391,13 @@ def list_mrp_runs_for_plan(db: Session, plan_id: int, *, limit: int = 50) -> Dic
 
 
 def delete_period_plan(db: Session, plan_id: int) -> Dict[str, Any]:
-    """Delete a period plan. Only allowed if no fixed (non-draft) MRP runs exist for this plan."""
-    from ..models import PlanningRun
+    """Delete a plan only when it has no snapshot in current published truth."""
     plan = _get_plan(db, plan_id)
     fixed_runs = (
         db.query(PlanningRun)
         .filter(
             PlanningRun.source_plan_id == plan_id,
-            PlanningRun.status == "SUCCESS",
+            PlanningRun.status.in_(("FIXED_SNAPSHOT", "BUILDING_SNAPSHOT")),
         )
         .count()
     )
@@ -865,38 +876,63 @@ def create_mrp_snapshot_from_period_plan(
     db: Session,
     plan_id: int,
     *,
+    generation_key: str,
     started_by: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Freeze v2 entry point: creating a plan's snapshot re-freezes the whole
-    active area (every open FIXED_SNAPSHOT plan) against one shared supply pool,
-    so a physical unit is credited to at most one plan. Thin wrapper over
-    :func:`mrp_freeze.refreeze_active_snapshots` — the external contract
-    (router ``:389``) is unchanged: the include plan's per-run counters plus the
-    additive ``freeze_version``.
-    """
-    # Local import breaks the module cycle (mrp_freeze imports this module).
-    from .mrp_freeze import refreeze_active_snapshots
+    """Publish this fixed plan through the atomic Ledger obligation refresh.
 
-    report = refreeze_active_snapshots(
-        db, include_plan_id=int(plan_id), started_by=started_by
+    Transaction ownership deliberately remains with the caller.  This service
+    neither commits nor rolls back, so a failed refresh cannot expose a partial
+    candidate generation.
+    """
+    key = str(generation_key or "").strip()
+    if not key:
+        raise ValueError("generation_key is required")
+    plan = _get_plan(db, int(plan_id))
+    if plan.status != "fixed":
+        raise ValueError("MRP-снимок можно создать только из зафиксированного плана")
+    if not db.query(ProductionPlanLine.id).filter(
+        ProductionPlanLine.plan_id == int(plan.id),
+        ProductionPlanLine.qty > 0,
+    ).first():
+        raise ValueError("В плане нет положительной потребности для MRP")
+    truth = db.get(PlanningTruthState, 1)
+    if truth is None or truth.current_generation_id is None:
+        raise ValueError("Current accepted Ledger truth is unavailable")
+    parent = db.get(LedgerGeneration, int(truth.current_generation_id))
+    if parent is None or str(parent.status) != "accepted":
+        raise ValueError("Current accepted Ledger truth is unavailable")
+    try:
+        cfg_id, cfg = get_active_planning_config(db)
+    except Exception:
+        cfg_id, cfg = None, dict(DEFAULT_PLANNING_CONFIG)
+
+    from .obligation_refresh_orchestrator import run_obligation_refresh
+    report = run_obligation_refresh(
+        db,
+        parent_generation_id=int(parent.id),
+        generation_key=key,
+        add_plan_ids=(int(plan.id),),
+        started_by=started_by or "api",
+        horizon_days=max(1, (plan.period_to - plan.period_from).days + 1),
+        config_version_id=cfg_id,
+        config_snapshot=dict(cfg),
     )
-    result = next(
-        (r for r in report.get("results", []) if int(r.get("plan_id", -1)) == int(plan_id)),
-        None,
-    )
-    if result is None:
+    run = db.query(PlanningRun).filter(
+        PlanningRun.run_id.in_(report.candidate_run_ids),
+        PlanningRun.source_plan_id == int(plan.id),
+        PlanningRun.ledger_generation_id == int(report.target_generation_id),
+        PlanningRun.status == "FIXED_SNAPSHOT",
+    ).one_or_none()
+    if run is None:
         raise ValueError("MRP-снимок не создан для плана")
     return {
         "status": "ok",
-        "run_id": int(result["run_id"]),
-        "plan_id": int(result["plan_id"]),
-        "requirement_count": int(result.get("requirement_count", 0)),
-        "bucket_count": int(result.get("bucket_count", 0)),
-        "production_count": int(result.get("production_count", 0)),
-        "stage_count": int(result.get("stage_count", 0)),
-        "purchase_count": int(result.get("purchase_count", 0)),
-        "rework_count": int(result.get("rework_count", 0)),
-        "freeze_version": int(result.get("freeze_version", 0)),
+        "generation_key": key,
+        "ledger_generation_id": int(report.target_generation_id),
+        "run_id": int(run.run_id),
+        "plan_id": int(plan.id),
+        "published": bool(report.published),
     }
 
 
