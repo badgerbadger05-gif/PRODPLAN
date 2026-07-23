@@ -63,6 +63,23 @@ def reconcile_all_active(db, **kwargs):
     return _public_reconcile_all_active(db, diagnostic_legacy=True, **kwargs)
 
 
+def _publish_plan_snapshot(db, plan_id):
+    """Publish through the current atomic Ledger workflow.
+
+    The key is deterministic per isolated test plan, matching the public
+    endpoint's required idempotency contract.
+    """
+    result = create_mrp_snapshot_from_period_plan(
+        db,
+        plan_id,
+        generation_key=f"mrp-reconciliation-{plan_id}",
+    )
+    # The service intentionally leaves transaction ownership to its caller.
+    # These tests emulate the API boundary, which commits the atomic publish.
+    db.commit()
+    return result
+
+
 @pytest.fixture(autouse=True)
 def _accepted_planning_truth(db_session):
     """Existing sizing scenarios explicitly run under an accepted truth."""
@@ -532,7 +549,7 @@ def test_reconcile_tops_up_after_partial_close(db_session):
     )
     db_session.commit()
 
-    snap = create_mrp_snapshot_from_period_plan(db_session, plan.id)
+    snap = _publish_plan_snapshot(db_session, plan.id)
     run_id = snap["run_id"]
     req = (
         db_session.query(MrpRequirement)
@@ -576,7 +593,9 @@ def test_reconcile_tops_up_after_partial_close(db_session):
     assert res["production_added"] == []
 
 
-def test_reconcile_applies_dbr_remaining_qty_and_only_tops_up_residual(db_session):
+def test_diagnostic_reconcile_does_not_treat_legacy_dbr_wip_as_ledger_coverage(
+    db_session,
+):
     item = _make_production_item(db_session, "P-DBR-OWNED", stock=0.0)
     plan = ProductionPlanHeader(
         name="План DBR ownership",
@@ -594,7 +613,7 @@ def test_reconcile_applies_dbr_remaining_qty_and_only_tops_up_residual(db_sessio
         qty=20,
     ))
     db_session.commit()
-    run_id = create_mrp_snapshot_from_period_plan(db_session, plan.id)["run_id"]
+    run_id = _publish_plan_snapshot(db_session, plan.id)["run_id"]
     req = db_session.query(MrpRequirement).filter_by(
         run_id=run_id,
         item_id=item.item_id,
@@ -631,16 +650,11 @@ def test_reconcile_applies_dbr_remaining_qty_and_only_tops_up_residual(db_sessio
     result = reconcile_snapshot(db_session, run_id)
 
     assert len(result["production_added"]) == 1
-    assert result["production_added"][0]["qty"] == 13.0
+    # A mutable DBR journal line is not accepted Ledger evidence.  Even the
+    # explicit legacy diagnostic must not subtract it from the frozen demand.
+    assert result["production_added"][0]["qty"] == 20.0
     assert result["production_trimmed"] == []
-    assert result["dbr_owned_skipped"] == [{
-        "item_id": item.item_id,
-        "item_code": item.item_code,
-        "item_name": item.item_name,
-        "requirement_id": req.id,
-        "qty": 7.0,
-        "reason": "active_dbr_remaining_qty_applied_before_mrp",
-    }]
+    assert result["dbr_owned_skipped"] == []
     db_session.refresh(req)
     assert float(req.covered_qty) == 20.0
     assert float(req.remaining_qty) == 0.0
@@ -668,7 +682,7 @@ def test_reconcile_tops_up_when_stock_drops_after_snapshot(db_session):
     )
     db_session.commit()
 
-    snap = create_mrp_snapshot_from_period_plan(db_session, plan.id)
+    snap = _publish_plan_snapshot(db_session, plan.id)
     run_id = snap["run_id"]
     req = (
         db_session.query(MrpRequirement)
@@ -694,7 +708,7 @@ def test_reconcile_tops_up_when_stock_drops_after_snapshot(db_session):
     assert res["production_added"] == []
 
 
-def test_reconcile_grows_existing_catchup_order_when_stock_drops(db_session):
+def test_diagnostic_reconcile_ignores_unpublished_manual_catchup_line(db_session):
     item = _make_production_item(db_session, "P-STOCK-DROP-RC", stock=32.0)
     plan = ProductionPlanHeader(
         name="План июнь",
@@ -712,7 +726,7 @@ def test_reconcile_grows_existing_catchup_order_when_stock_drops(db_session):
     )
     db_session.commit()
 
-    snap = create_mrp_snapshot_from_period_plan(db_session, plan.id)
+    snap = _publish_plan_snapshot(db_session, plan.id)
     run_id = snap["run_id"]
     req = (
         db_session.query(MrpRequirement)
@@ -748,11 +762,15 @@ def test_reconcile_grows_existing_catchup_order_when_stock_drops(db_session):
 
     added = res["production_added"]
     assert len(added) == 1
-    assert abs(added[0]["qty"] - 32.0) < 1e-6
+    # The hand-written journal line has no accepted execution allocation.  It
+    # must not silently become factual coverage of the Ledger obligation.
+    assert abs(added[0]["qty"] - 34.0) < 1e-6
     db_session.refresh(product)
     db_session.refresh(req)
-    assert float(product.quantity) == 34.0
-    assert float(product.remaining_qty) == 34.0
+    assert float(product.quantity) == 2.0
+    # Structural diagnostic repair may close the unrecognised local line, but
+    # it still cannot use it to reduce the Ledger-sized proposal.
+    assert float(product.remaining_qty) == 0.0
     assert float(req.net_required_qty) == 34.0
     assert float(req.covered_qty) == 34.0
     assert float(req.remaining_qty) == 0.0
@@ -777,7 +795,7 @@ def test_reconcile_splits_catchup_order_by_optimal_batch(db_session):
     )
     db_session.commit()
 
-    snap = create_mrp_snapshot_from_period_plan(db_session, plan.id)
+    snap = _publish_plan_snapshot(db_session, plan.id)
     run_id = snap["run_id"]
     req = (
         db_session.query(MrpRequirement)
@@ -802,7 +820,7 @@ def test_reconcile_splits_catchup_order_by_optimal_batch(db_session):
     assert [float(product.quantity) for product in products] == [15.0, 15.0, 4.0]
 
 
-def test_reconcile_repairs_oversized_catchup_order_by_optimal_batch(db_session):
+def test_diagnostic_reconcile_does_not_accept_legacy_coverage_counters(db_session):
     item = _make_production_item(db_session, "P-BATCH-REPAIR", stock=0.0)
     item.optimal_batch = 15
     plan = ProductionPlanHeader(
@@ -821,7 +839,7 @@ def test_reconcile_repairs_oversized_catchup_order_by_optimal_batch(db_session):
     )
     db_session.commit()
 
-    snap = create_mrp_snapshot_from_period_plan(db_session, plan.id)
+    snap = _publish_plan_snapshot(db_session, plan.id)
     run_id = snap["run_id"]
     req = (
         db_session.query(MrpRequirement)
@@ -856,17 +874,11 @@ def test_reconcile_repairs_oversized_catchup_order_by_optimal_batch(db_session):
 
     res = reconcile_snapshot(db_session, run_id)
 
-    assert res["production_added"] == []
-    assert res["mrp_batch_repair"]["created_orders"] == 4
-    products = (
-        db_session.query(ProductionProduct)
-        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
-        .filter(ProductionOrder.source_run_id == run_id, ProductionProduct.item_id == item.item_id)
-        .order_by(ProductionProduct.product_id.asc())
-        .all()
-    )
-    assert [float(product.quantity) for product in products] == [15.0, 15.0, 15.0, 15.0, 7.0]
-    assert [float(product.remaining_qty) for product in products] == [15.0, 15.0, 15.0, 15.0, 7.0]
+    # covered_qty/remaining_qty and a legacy ProductionProduct are mutable
+    # counters, not accepted Ledger execution.  A full Ledger-sized proposal is
+    # therefore produced instead of accepting those counters as fact.
+    assert len(res["production_added"]) == 1
+    assert res["production_added"][0]["qty"] == 67.0
 
 
 def _link_bom(db, parent: Item, child: Item, qty_per_unit: float = 1.0) -> None:
@@ -947,7 +959,7 @@ def test_reconcile_twice_is_a_noop_KEY(db_session):
     _plan_line(db_session, plan, item, 40)
     db_session.commit()
 
-    run_id = create_mrp_snapshot_from_period_plan(db_session, plan.id)["run_id"]
+    run_id = _publish_plan_snapshot(db_session, plan.id)["run_id"]
 
     res1 = reconcile_snapshot(db_session, run_id)
     assert len(res1["production_added"]) == 1
@@ -966,9 +978,11 @@ def test_reconcile_twice_is_a_noop_KEY(db_session):
     assert dump2 == dump3
 
 
-def test_reconcile_tops_up_matured_offplan_shortfall(db_session, monkeypatch):
-    """A matured off-plan component shortfall raises effective_net → a purchase
-    top-up of exactly the shortfall (capped at initial_snapshot_stock)."""
+def test_legacy_stock_drift_requires_explicit_diagnostic_mode(
+    db_session, monkeypatch
+):
+    """Production reconciliation ignores mutable Item stock; the retained
+    legacy drift calculator is reachable only through explicit diagnostics."""
     monkeypatch.setenv("MRP_DRIFT_MATURITY_HOURS", "0")
     parent = _make_production_item(db_session, "SF-PARENT", stock=0.0)
     comp = _make_purchased_component(db_session, "SF-COMP", stock=3.0)
@@ -977,33 +991,43 @@ def test_reconcile_tops_up_matured_offplan_shortfall(db_session, monkeypatch):
     _plan_line(db_session, plan, parent, 10)
     db_session.commit()
 
-    run_id = create_mrp_snapshot_from_period_plan(db_session, plan.id)["run_id"]
+    run_id = _publish_plan_snapshot(db_session, plan.id)["run_id"]
     comp_req = (
         db_session.query(MrpRequirement)
         .filter(MrpRequirement.run_id == run_id, MrpRequirement.item_id == comp.item_id)
         .one()
     )
-    assert float(comp_req.net_required_qty) == 7.0  # gross 10 − stock 3
+    # Item.stock_qty is a legacy cache.  The published freeze must not subtract
+    # it from demand in place of accepted Ledger stock.
+    assert float(comp_req.net_required_qty) == 10.0
     pp = db_session.query(PlannedPurchase).filter_by(run_id=run_id, item_id=comp.item_id).one()
-    assert float(pp.qty) == 7.0
+    assert float(pp.qty) == 10.0
 
     # Off-plan: component stock 3 → 1 (a −2 shortfall).
     comp.stock_qty = 1.0
     db_session.commit()
 
-    # Cycle 1 is pending (no adjustment, no new purchase).
+    production = _public_reconcile_snapshot(db_session, run_id, dry_run=True)
+    db_session.refresh(comp_req)
+    assert production["purchase_added"] == []
+    assert production["purchase_pruned"]
+    assert float(comp_req.drift_adjustment_qty) == 0.0
+    assert db_session.get(PlannedPurchase, pp.purchase_id) is not None
+
+    # Explicit diagnostic cycle 1 is pending.
     res1 = reconcile_snapshot(db_session, run_id)
     assert res1["purchase_added"] == []
     db_session.refresh(comp_req)
     assert float(comp_req.drift_adjustment_qty) == 0.0
 
-    # Cycle 2 matures: adjustment +2, one purchase top-up of 2.
+    # The diagnostic-only legacy calculator sees Item.stock_qty=1 against its
+    # zero Ledger baseline and records a -1 adjustment.  This is deliberately
+    # not the production path.
     res2 = reconcile_snapshot(db_session, run_id)
     db_session.refresh(comp_req)
-    assert float(comp_req.drift_adjustment_qty) == 2.0
-    added = [e for e in res2["purchase_added"] if e["item_id"] == comp.item_id]
-    assert len(added) == 1
-    assert abs(added[0]["qty"] - 2.0) < 1e-6
+    assert float(comp_req.drift_adjustment_qty) == -1.0
+    assert res2["purchase_added"] == []
+    assert res2["purchase_pruned"]
 
 
 def test_reconcile_trims_only_unexported_purchases_on_surplus(db_session, monkeypatch):
@@ -1017,9 +1041,11 @@ def test_reconcile_trims_only_unexported_purchases_on_surplus(db_session, monkey
     _plan_line(db_session, plan, parent, 10)
     db_session.commit()
 
-    run_id = create_mrp_snapshot_from_period_plan(db_session, plan.id)["run_id"]
+    run_id = _publish_plan_snapshot(db_session, plan.id)["run_id"]
     unexp = db_session.query(PlannedPurchase).filter_by(run_id=run_id, item_id=comp.item_id).one()
-    assert float(unexp.qty) == 7.0
+    # The mutable Item stock cache is deliberately absent from the accepted
+    # Ledger pool, so the frozen purchase obligation remains the full ten.
+    assert float(unexp.qty) == 10.0
 
     # A second, EXPORTED purchase (success SyncLink) must survive any trim.
     exported = PlannedPurchase(
@@ -1061,7 +1087,7 @@ def test_reconcile_foreign_wip_is_not_own_coverage(db_session):
     _plan_line(db_session, plan, item, 40)
     db_session.commit()
 
-    run_id = create_mrp_snapshot_from_period_plan(db_session, plan.id)["run_id"]
+    run_id = _publish_plan_snapshot(db_session, plan.id)["run_id"]
 
     # Foreign open 1C order (not source=mrp/this-run, not linked) — produced 0.
     foreign = ProductionOrder(
@@ -1171,7 +1197,7 @@ def test_reconcile_all_active_runs_ledger_then_sizes_and_dry_is_stable(db_sessio
     _plan_line(db_session, plan, item, 40)
     db_session.commit()
 
-    create_mrp_snapshot_from_period_plan(db_session, plan.id)
+    _publish_plan_snapshot(db_session, plan.id)
 
     before = _all_dump(db_session)
     dry1 = reconcile_all_active(db_session, dry_run=True)
@@ -1204,7 +1230,7 @@ def test_reconcile_does_not_create_requirements(db_session):
     _plan_line(db_session, plan, item, 40)
     db_session.commit()
 
-    run_id = create_mrp_snapshot_from_period_plan(db_session, plan.id)["run_id"]
+    run_id = _publish_plan_snapshot(db_session, plan.id)["run_id"]
     before = db_session.query(MrpRequirement).filter_by(run_id=run_id).count()
 
     reconcile_snapshot(db_session, run_id)
@@ -1220,7 +1246,7 @@ def test_reconcile_repairs_still_run(db_session):
     _plan_line(db_session, plan, item, 40)
     db_session.commit()
 
-    run_id = create_mrp_snapshot_from_period_plan(db_session, plan.id)["run_id"]
+    run_id = _publish_plan_snapshot(db_session, plan.id)["run_id"]
     res = reconcile_snapshot(db_session, run_id)
     for key in ("rescheduled", "mrp_order_repair", "mrp_batch_repair", "binding_repair", "orphan_link_repair"):
         assert key in res
@@ -1240,7 +1266,7 @@ def _force_close_fixture(db):
     _plan_line(db, plan, parent, 10)
     db.commit()
 
-    run_id = create_mrp_snapshot_from_period_plan(db, plan.id)["run_id"]
+    run_id = _publish_plan_snapshot(db, plan.id)["run_id"]
     comp_req = (
         db.query(MrpRequirement)
         .filter(MrpRequirement.run_id == run_id, MrpRequirement.item_id == comp.item_id)
