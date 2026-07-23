@@ -7,7 +7,11 @@ from app.services.obligation_refresh_publish import (
     ObligationRefreshPublishError,
     publish_obligation_refresh_batch,
 )
-from app.services.planning_run_candidate import create_candidate_run
+from app.services.obligation_refresh_manifest import (
+    MANIFEST_HASH_KEY,
+    MANIFEST_KEY,
+    create_obligation_refresh_manifest,
+)
 
 
 def _generation(db, *, key, status, cutoff, watermarks=None):
@@ -47,7 +51,7 @@ def _seal_build(db, target, candidates, cutoff):
     db.flush()
 
 
-def _batch(db, count=2):
+def _batch(db, count=2, add_count=0):
     cutoff = datetime(2026, 7, 23, 12, tzinfo=timezone.utc)
     parent_generation = _generation(db, key="accepted", status="accepted", cutoff=cutoff)
     db.add(models.PlanningTruthState(id=1, current_generation_id=parent_generation.id))
@@ -75,7 +79,23 @@ def _batch(db, count=2):
     # An obligation refresh reuses the accepted immutable physical prefix.
     target.physical_import_batch_id = parent_generation.physical_import_batch_id
     db.flush()
-    candidates = [create_candidate_run(db, row.run_id, target.id, "test") for row in parents]
+    additions = []
+    for index in range(add_count):
+        plan = models.ProductionPlanHeader(
+            name=f"added {index}", period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
+            status="fixed",
+        )
+        db.add(plan)
+        db.flush()
+        additions.append(plan)
+    manifest = create_obligation_refresh_manifest(
+        db, parent_generation.id, target.id, [row.id for row in additions],
+        started_by="test", horizon_days=90, config_version_id=None,
+        config_snapshot={"added": True},
+    )
+    candidates = [db_session_row for db_session_row in db.query(models.PlanningRun).filter(
+        models.PlanningRun.run_id.in_([int(entry["candidate_run_id"]) for entry in manifest.entries])
+    ).all()]
     _seal_build(db, target, candidates, cutoff)
     db.commit()
     return cutoff, parent_generation, target, parents, candidates
@@ -88,12 +108,19 @@ def _publish(db, parent, target, cutoff):
     )
 
 
+def _line_item(db, suffix):
+    item = models.Item(item_code=f"publish-item-{suffix}", item_name="publish item")
+    db.add(item)
+    db.flush()
+    return item
+
+
 def test_publish_requires_candidate_for_every_active_source_plan(db_session):
     cutoff, parent, target, _parents, candidates = _batch(db_session)
     db_session.delete(candidates[-1])
     db_session.flush()
 
-    with pytest.raises(ObligationRefreshPublishError, match="complete candidate batch"):
+    with pytest.raises(ObligationRefreshPublishError, match="missing or extra candidates"):
         _publish(db_session, parent, target, cutoff)
 
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == parent.id
@@ -186,3 +213,147 @@ def test_exact_retry_allows_legitimate_export_after_publication(db_session):
     db_session.commit()
 
     assert _publish(db_session, parent, target, cutoff).published is False
+
+
+def test_publish_allows_first_add_only_and_exact_retry(db_session):
+    cutoff, parent, target, parents, candidates = _batch(db_session, count=0, add_count=1)
+
+    result = _publish(db_session, parent, target, cutoff)
+    assert result.published is True
+    assert result.parent_run_ids == ()
+    assert result.candidate_run_ids == (candidates[0].run_id,)
+    assert candidates[0].status == "FIXED_SNAPSHOT"
+    assert db_session.get(models.PlanningTruthState, 1).current_generation_id == target.id
+    db_session.commit()
+
+    # Publication was the only point that forbade external links.  A later
+    # legitimate export must not make an exact retry look like a partial batch.
+    db_session.add(models.ProductionOrder(
+        order_number="post-publish-add", order_date=cutoff,
+        order_ref1c="post-publish-add-ref", source="mrp",
+        source_run_id=candidates[0].run_id,
+    ))
+    db_session.commit()
+    assert _publish(db_session, parent, target, cutoff).published is False
+
+
+def test_publish_allows_refresh_and_add_together(db_session):
+    cutoff, parent, target, parents, candidates = _batch(db_session, count=1, add_count=1)
+
+    result = _publish(db_session, parent, target, cutoff)
+    assert result.published is True
+    assert result.parent_run_ids == (parents[0].run_id,)
+    assert set(result.candidate_run_ids) == {row.run_id for row in candidates}
+    assert parents[0].status == "SUPERSEDED"
+    assert all(row.status == "FIXED_SNAPSHOT" for row in candidates)
+
+
+def test_publish_transfers_refresh_locks_and_acquires_add_locks(db_session):
+    cutoff, parent, target, parents, candidates = _batch(db_session, count=1, add_count=1)
+    refresh_candidate = next(row for row in candidates if row.prior_run_id is not None)
+    add_candidate = next(row for row in candidates if row.prior_run_id is None)
+    item = _line_item(db_session, "locks")
+    refresh_line = models.ProductionPlanLine(
+        plan_id=parents[0].source_plan_id, item_id=item.item_id,
+        bucket_date=date(2026, 7, 1), qty=1, locked_by_run_id=parents[0].run_id,
+    )
+    add_line = models.ProductionPlanLine(
+        plan_id=add_candidate.source_plan_id, item_id=item.item_id,
+        bucket_date=date(2026, 8, 1), qty=1,
+    )
+    db_session.add_all([refresh_line, add_line])
+    db_session.flush()
+
+    _publish(db_session, parent, target, cutoff)
+
+    assert refresh_line.locked_by_run_id == refresh_candidate.run_id
+    assert add_line.locked_by_run_id == add_candidate.run_id
+
+
+def test_publish_rejects_prelocked_add_plan(db_session):
+    cutoff, parent, target, _parents, candidates = _batch(db_session, count=0, add_count=1)
+    item = _line_item(db_session, "prelocked")
+    line = models.ProductionPlanLine(
+        plan_id=candidates[0].source_plan_id, item_id=item.item_id,
+        bucket_date=date(2026, 8, 1), qty=1, locked_by_run_id=candidates[0].run_id,
+    )
+    db_session.add(line)
+    db_session.flush()
+
+    with pytest.raises(ObligationRefreshPublishError, match="already locked"):
+        _publish(db_session, parent, target, cutoff)
+
+
+@pytest.mark.parametrize("mutation, error", [
+    ("period", "period conflicts"),
+    ("config", "config conflicts"),
+    ("lifecycle", "terminal lifecycle"),
+])
+def test_publish_rejects_tampered_added_candidate_lineage(db_session, mutation, error):
+    cutoff, parent, target, _parents, candidates = _batch(db_session, count=0, add_count=1)
+    candidate = candidates[0]
+    if mutation == "period":
+        candidate.period_to = date(2026, 9, 1)
+    elif mutation == "config":
+        candidate.config_snapshot = {"not": "sealed"}
+    else:
+        candidate.pinned = True
+        candidate.fixed_at = cutoff
+        candidate.finished_at = cutoff
+    db_session.flush()
+
+    with pytest.raises(ObligationRefreshPublishError, match=error):
+        _publish(db_session, parent, target, cutoff)
+
+
+@pytest.mark.parametrize("mutation", ["period", "config", "lifecycle"])
+def test_exact_retry_rejects_tampered_published_add_lineage(db_session, mutation):
+    cutoff, parent, target, _parents, candidates = _batch(db_session, count=0, add_count=1)
+    _publish(db_session, parent, target, cutoff)
+    db_session.commit()
+    candidate = db_session.get(models.PlanningRun, candidates[0].run_id)
+    if mutation == "period":
+        candidate.period_from = date(2026, 7, 31)
+    elif mutation == "config":
+        candidate.config_snapshot = {"changed": True}
+    else:
+        candidate.pinned = False
+    db_session.flush()
+
+    with pytest.raises(ObligationRefreshPublishError, match="mixed or partial"):
+        _publish(db_session, parent, target, cutoff)
+
+
+@pytest.mark.parametrize("mutation, error", [
+    ("omitted", "missing or extra candidates"),
+    ("extra", "missing or extra candidates"),
+    ("tampered_hash", "hash conflicts"),
+])
+def test_publish_requires_intact_sealed_obligation_manifest(db_session, mutation, error):
+    cutoff, parent, target, _parents, candidates = _batch(db_session, count=1)
+    manifest = target.source_watermarks[MANIFEST_KEY]
+    if mutation == "omitted":
+        manifest["entries"] = []
+        # Deliberately recompute the stored hash: this is a valid JSON shape
+        # but it no longer describes the target candidate set.
+        import hashlib
+        import json
+        target.source_watermarks[MANIFEST_HASH_KEY] = hashlib.sha256(json.dumps(
+            manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()).hexdigest()
+    elif mutation == "extra":
+        manifest["entries"].append({
+            "action": "add", "plan_id": 999999, "parent_run_id": None,
+            "candidate_run_id": candidates[0].run_id + 1000,
+        })
+        import hashlib
+        import json
+        target.source_watermarks[MANIFEST_HASH_KEY] = hashlib.sha256(json.dumps(
+            manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode()).hexdigest()
+    else:
+        target.source_watermarks[MANIFEST_HASH_KEY] = "0" * 64
+    db_session.flush()
+
+    with pytest.raises(ObligationRefreshPublishError, match=error):
+        _publish(db_session, parent, target, cutoff)
