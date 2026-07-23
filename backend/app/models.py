@@ -2134,6 +2134,12 @@ class StockRecorderPull(Base):
     # Retry bookkeeping for process_pending_pulls (attempt cap) + last error text.
     attempts = Column(Integer, nullable=False, default=0, server_default="0")
     last_error = Column(TEXT, nullable=True)
+    # Producing-order GUID captured from the recorder's document HEADER at pull
+    # time (СборкаЗапасов.ЗаказНаПроизводство_Key / ПеремещениеЗапасов.
+    # ДокументОснование of type ЗаказНаПроизводство). Second source for the
+    # SLE→reservation matching chain (after sync_link); NULL = header carried
+    # no order basis. Migration 20260723_01.
+    order_ref = Column(String(36), nullable=True)
     pulled_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now(), server_default=func.now(), nullable=False)
 
