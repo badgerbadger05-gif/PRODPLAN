@@ -99,6 +99,13 @@ def test_snapshot_uses_current_truth_and_returns_published_plan_candidate(
         "run_id": published.run_id,
         "plan_id": plan.id,
         "published": True,
+        "requirement_count": 0,
+        "bucket_count": 0,
+        "production_count": 0,
+        "stage_count": 0,
+        "purchase_count": 0,
+        "rework_count": 0,
+        "freeze_version": 0,
     }
 
 

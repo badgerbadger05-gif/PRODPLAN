@@ -926,13 +926,23 @@ def create_mrp_snapshot_from_period_plan(
     ).one_or_none()
     if run is None:
         raise ValueError("MRP-снимок не создан для плана")
+    run_id = int(run.run_id)
     return {
         "status": "ok",
         "generation_key": key,
         "ledger_generation_id": int(report.target_generation_id),
-        "run_id": int(run.run_id),
+        "run_id": run_id,
         "plan_id": int(plan.id),
         "published": bool(report.published),
+        # Compatibility counters are reads of the just-published immutable
+        # rows.  They do not trigger another planning calculation.
+        "requirement_count": db.query(MrpRequirement).filter_by(run_id=run_id).count(),
+        "bucket_count": db.query(MrpRequirementBucket).filter_by(run_id=run_id).count(),
+        "production_count": db.query(PlannedOrder).filter_by(run_id=run_id).count(),
+        "stage_count": db.query(PlannedOrderStage).filter_by(run_id=run_id).count(),
+        "purchase_count": db.query(PlannedPurchase).filter_by(run_id=run_id).count(),
+        "rework_count": db.query(PlannedRework).filter_by(run_id=run_id).count(),
+        "freeze_version": int(run.active_freeze_version or 0),
     }
 
 
