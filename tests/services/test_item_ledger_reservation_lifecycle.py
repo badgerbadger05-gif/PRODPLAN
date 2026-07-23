@@ -151,20 +151,26 @@ def test_repull_same_recorder_does_not_double_realized(db_session):
     assert Decimal(str(entry.realized_qty)) == Decimal("4")
     assert entry.lifecycle_status == "closed"
 
-    # replace-by-recorder: same document re-pulled (identical lines, new SLE ids)
+    # replace-by-recorder: same document re-pulled (identical lines, new SLE ids).
+    # UPDATED for trigger т1: the pull now compensates (unrealize + reopen) AND
+    # eagerly re-matches the fresh rows within the SAME pull (redistribute_after_
+    # ledger_apply). Pre-т1 the re-match was deferred to the next explicit
+    # realize_from_sle, so this asserted the transient realized=0 / active state;
+    # now the observable post-pull state is the correct single-count realized=4
+    # (compensated then re-realized — NOT doubled to 8), reserve re-closed.
     _sle_id_spacer(db)
     pull_recorder_movements(db, ASSEMBLY, "DOC-G", client=client)
     db.refresh(entry)
-    # compensated: realized folded back to 0, closed reserve re-opened
-    assert Decimal(str(entry.realized_qty)) == Decimal("0")
-    assert entry.lifecycle_status == "active"
-    assert _kinds(db, entry) == ["open", "realize", "unrealize", "reopen"]
+    assert Decimal(str(entry.realized_qty)) == Decimal("4")
+    assert Decimal(str(entry.reserved_qty)) == Decimal("4")
+    assert entry.lifecycle_status == "closed"
+    assert _kinds(db, entry) == ["open", "realize", "unrealize", "reopen", "realize"]
 
-    # штатный re-match of the fresh SLE rows: realized 4 again — NOT 8
+    # the explicit re-match is now a no-op (т1 already applied it in the pull) —
+    # still realized 4, never 8.
     realize_from_sle(db, _ledger_scope(db), "cyc2")
     db.refresh(entry)
     assert Decimal(str(entry.realized_qty)) == Decimal("4")
-    assert Decimal(str(entry.reserved_qty)) == Decimal("4")
     assert entry.lifecycle_status == "closed"
     assert _kinds(db, entry) == ["open", "realize", "unrealize", "reopen", "realize"]
 
