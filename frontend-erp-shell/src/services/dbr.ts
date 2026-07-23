@@ -160,12 +160,8 @@ export function extendDbrDrum(scheduleId: number, programId: number) {
   )
 }
 
-export function getDbrBoard(params?: { date_from?: string; date_to?: string }) {
-  const search = new URLSearchParams()
-  if (params?.date_from) search.set('date_from', params.date_from)
-  if (params?.date_to) search.set('date_to', params.date_to)
-  const query = search.toString()
-  return api<DbrBoard>(`/v1/dbr/drum/active/board${query ? `?${query}` : ''}`)
+export function getDbrBoard() {
+  return api<DbrBoard>('/v1/dbr/drum/active/board')
 }
 
 export function refreshDbrGate(scheduleId: number) {

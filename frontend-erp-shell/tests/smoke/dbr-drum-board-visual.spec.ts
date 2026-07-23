@@ -7,12 +7,10 @@ async function mockDbrDrumBoardApi(page: Page) {
     const key = `${request.method()} ${url.pathname}`
 
     if (key === 'GET /api/v1/dbr/drum/active/board') {
-      expect(Object.fromEntries(url.searchParams)).toEqual({
-        date_from: '2026-07-19',
-        date_to: '2026-08-04',
-      })
+      expect(Object.fromEntries(url.searchParams)).toEqual({})
       await route.fulfill({
         json: {
+          meta: { snapshot_id: 83, ledger_generation: 42, cutoff: '2026-07-21T09:00:00Z', runs: [{ run_id: 31, freeze_version: 9 }], read_only: true, unavailable_sections: ['kit_gate', 'execution'] },
           schedule: {
             id: 47,
             period_from: '2026-07-20',
@@ -35,8 +33,8 @@ async function mockDbrDrumBoardApi(page: Page) {
               item_code: 'РЕД-100.00',
               item_name: 'Редуктор приводной',
               qty: 10,
-              produced_qty: 2,
-              kit_status: 'green',
+              produced_qty: null,
+              kit_status: 'unknown', kit_gate_status: 'unavailable', execution_status: 'unavailable',
               release_status: 'pending',
               shortage: [],
               position: 1,
@@ -50,8 +48,8 @@ async function mockDbrDrumBoardApi(page: Page) {
               item_code: 'НАС-220.00',
               item_name: 'Насос промышленный',
               qty: 8,
-              produced_qty: 0,
-              kit_status: 'yellow',
+              produced_qty: null,
+              kit_status: 'unknown', kit_gate_status: 'unavailable', execution_status: 'unavailable',
               release_status: 'pending',
               shortage: [{ item: 'Электродвигатель', required: 8, available: 5, warehouse: 'Склад комплектации' }],
               position: 2,
@@ -65,8 +63,8 @@ async function mockDbrDrumBoardApi(page: Page) {
               item_code: 'СТ-410.00',
               item_name: 'Станция гидравлическая',
               qty: 6,
-              produced_qty: 0,
-              kit_status: 'red',
+              produced_qty: null,
+              kit_status: 'unknown', kit_gate_status: 'unavailable', execution_status: 'unavailable',
               release_status: 'pending',
               shortage: [{ item: 'Гидрораспределитель', required: 6, available: 1, warehouse: 'Основной склад' }],
               position: 3,
@@ -80,8 +78,8 @@ async function mockDbrDrumBoardApi(page: Page) {
               item_code: 'БЛ-150.00',
               item_name: 'Блок управления',
               qty: 12,
-              produced_qty: 12,
-              kit_status: 'green',
+              produced_qty: null,
+              kit_status: 'unknown', kit_gate_status: 'unavailable', execution_status: 'unavailable',
               release_status: 'released',
               one_c_order_number: 'ЗП-000047',
               shortage: [],
@@ -102,7 +100,7 @@ async function mockDbrDrumBoardApi(page: Page) {
               gap_qty: 2,
             },
           ],
-          kpi: { green: 2, yellow: 1, red: 1, unknown: 0, slots: 4, plan_qty: 36, fact_qty: 14 },
+          kpi: { green: null, yellow: null, red: null, unknown: null, slots: 4, plan_qty: 36, fact_qty: null, kit_gate_status: 'unavailable', execution_status: 'unavailable' },
           calendar_fallback: true,
         },
       })
@@ -142,9 +140,9 @@ test('DBR active drum board visual baseline', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'Барабан сборки' })).toBeVisible()
   await expect(page.locator('.runBadge')).toHaveText('График №47 · active')
   await expect(page.getByText(/Календарь работ не покрывает/)).toBeVisible()
-  await expect(page.getByRole('button', { name: /2\/10.*Редуктор приводной/ })).toBeVisible()
-  await expect(page.getByRole('button', { name: /0\/6.*Станция гидравлическая/ })).toBeVisible()
-  await expect(page.getByText('✓ заказ 1С № ЗП-000047')).toBeVisible()
+  await expect(page.getByRole('button', { name: /—\/10.*Редуктор приводной/ })).toBeVisible()
+  await expect(page.getByRole('button', { name: /—\/6.*Станция гидравлическая/ })).toBeVisible()
+  await expect(page.getByTestId('drum-snapshot-lineage')).toContainText('Ledger-поколение #42')
   await expect(page.getByRole('heading', { name: 'Разрывы мощности' })).toBeVisible()
   await expect(page.locator('.statusBar')).toContainText('Строки 1-4 из 4')
   await expect(page.locator('.statusBar')).not.toContainText('Загрузка')

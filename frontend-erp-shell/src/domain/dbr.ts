@@ -142,8 +142,10 @@ export type DbrBoardSlot = {
   item_code?: string | null
   item_name?: string | null
   qty: number
-  produced_qty: number
+  produced_qty?: number | null
   kit_status: DbrKitStatus
+  kit_gate_status?: string | null
+  execution_status?: string | null
   release_status?: string | null
   // Emitted once a slot is materialized into a 1С order (may be absent if the
   // board projection does not surface it — fall back to release_status).
@@ -170,16 +172,30 @@ export type DbrBoardGap = {
 export type DbrBoardResource = { id: number; name?: string | null }
 
 export type DbrBoardKpi = {
-  green: number
-  yellow: number
-  red: number
-  unknown: number
+  green: number | null
+  yellow: number | null
+  red: number | null
+  unknown: number | null
   slots: number
   plan_qty: number
-  fact_qty: number
+  fact_qty: number | null
+  kit_gate_status?: string | null
+  execution_status?: string | null
+}
+
+export type DbrBoardMeta = {
+  snapshot_id?: number | null
+  ledger_generation?: number | null
+  cutoff?: string | null
+  runs: Array<{ run_id: number; freeze_version: number }>
+  read_only?: boolean
+  unavailable_sections?: string[] | Record<string, string | null | undefined>
+  truth_status?: string | null
+  truth_reason?: string | null
 }
 
 export type DbrBoard = {
+  meta: DbrBoardMeta
   schedule: DbrSchedule | null
   days: string[]
   resources: DbrBoardResource[]
