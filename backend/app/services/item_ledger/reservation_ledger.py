@@ -67,6 +67,16 @@ _SOURCE_KIND_BY_ALLOC_TYPE = {
 _ISSUE_KINDS = {"assembly_out", "expense", "writeoff", "transfer_out"}
 # SLE movement kinds that REALIZE a make reservation (production receipt, qty>0).
 _MAKE_RECEIPT_KINDS = {"assembly_in"}
+# A transfer receipt REALIZES a make reservation only when it lands on a
+# finished-goods (ГП) warehouse — приход ГП на склад ГП по перемещению с
+# основанием-заказом. Ordinary transfer_in (materials moved to a workshop)
+# stays out of make matching.
+_MAKE_TRANSFER_KIND = "transfer_in"
+
+# sync_link doctypes/entities written by OUR document exports (chain source 1):
+# one_c_manufacture_export (СборкаЗапасов) and one_c_stock_transfer_export
+# (ПеремещениеЗапасов). target_ref_key is exactly the SLE recorder GUID.
+_LINK_DOCTYPES = ("manufacture", "material_issue")
 
 
 def _dec(value: Any) -> Decimal:
@@ -484,7 +494,26 @@ def mirror_verify_realized(
 # §6.3 — SLE → reservation matching (realize / unrealize)
 # ---------------------------------------------------------------------------
 class _MatchIndex:
-    """Precomputed indexes for SLE→reservation pegging within a scope."""
+    """Precomputed indexes for SLE→reservation pegging within a scope.
+
+    The recorder GUID (СборкаЗапасов / ПеремещениеЗапасов document) is NEVER
+    the order GUID, so the producing ProductionOrder is resolved through a
+    chain (tech-debt п.1, decision #11 owner steps preserved):
+
+      1. ``sync_link`` — the document was created by OUR export
+         (source_doctype ∈ {manufacture, material_issue}, target_ref_key =
+         recorder GUID) → ProductionManufacture / ProductionMaterialIssue →
+         local order + production line (exact pegging).
+      2. ``stock_recorder_pull.order_ref`` — the document was created in 1С
+         directly; the pull captured the producing-order GUID from the
+         document header (ЗаказНаПроизводство_Key / ДокументОснование) →
+         ``ProductionOrder.order_ref1c``.
+      3. Degenerate direct hit — the recorder IS an order GUID (an order
+         document acting as its own recorder); exact, kept last.
+
+    No chain hit → run-scoped FIFO is impossible (no run anchor) → the issue
+    is honest ``unplanned_consumption`` — NEVER a silent global FIFO.
+    """
 
     def __init__(self, db: Session, scope_run_ids: List[int], open_req_ids: Set[int]):
         self.res_by_req_mode: Dict[Tuple[int, str], models.ReservationEntry] = {}
@@ -505,18 +534,18 @@ class _MatchIndex:
 
         # order_ref1c → ProductionOrder (peg anchor); (order_id,item_id)→source_req
         self.order_by_ref: Dict[str, models.ProductionOrder] = {}
+        self.order_by_id: Dict[int, models.ProductionOrder] = {}
         self.order_run: Dict[int, Optional[int]] = {}
         self.prod_source_req: Dict[Tuple[int, int], int] = {}
-        orders = (
-            db.query(models.ProductionOrder)
-            .filter(models.ProductionOrder.order_ref1c.isnot(None))
-            .all()
-        )
+        # product_id → (item_id, source_mrp_requirement_id) for line-exact pegging
+        self.product_line: Dict[int, Tuple[int, Optional[int]]] = {}
+        orders = db.query(models.ProductionOrder).all()
         order_ids = [int(o.order_id) for o in orders]
         for o in orders:
             ref = str(o.order_ref1c or "").strip()
             if ref:
                 self.order_by_ref[ref] = o
+            self.order_by_id[int(o.order_id)] = o
             self.order_run[int(o.order_id)] = (
                 int(o.source_run_id) if o.source_run_id is not None else None
             )
@@ -526,10 +555,14 @@ class _MatchIndex:
                 .filter(models.ProductionProduct.order_id.in_(order_ids))
                 .all()
             ):
-                if pp.source_mrp_requirement_id is not None:
-                    self.prod_source_req[(int(pp.order_id), int(pp.item_id))] = int(
-                        pp.source_mrp_requirement_id
-                    )
+                src_req = (
+                    int(pp.source_mrp_requirement_id)
+                    if pp.source_mrp_requirement_id is not None
+                    else None
+                )
+                self.product_line[int(pp.product_id)] = (int(pp.item_id), src_req)
+                if src_req is not None:
+                    self.prod_source_req[(int(pp.order_id), int(pp.item_id))] = src_req
         # (run_id, item_id) via any product's source req → run (for run-scoped)
         req_run = {int(r.id): int(r.run_id) for r in (
             db.query(models.MrpRequirement.id, models.MrpRequirement.run_id)
@@ -538,6 +571,94 @@ class _MatchIndex:
         for (oid, _iid), rid in self.prod_source_req.items():
             if self.order_run.get(int(oid)) is None and rid in req_run:
                 self.order_run[int(oid)] = req_run[rid]
+
+        # ---- chain source 1: sync_link (documents created by OUR export) ----
+        # recorder GUID → (order_id, product_id) via the local source document.
+        self.link_doc: Dict[str, Tuple[int, Optional[int]]] = {}
+        links = (
+            db.query(
+                models.SyncLink.source_doctype,
+                models.SyncLink.source_id,
+                models.SyncLink.target_ref_key,
+            )
+            .filter(
+                models.SyncLink.source_doctype.in_(_LINK_DOCTYPES),
+                models.SyncLink.target_ref_key.isnot(None),
+            )
+            .all()
+        )
+        man_ids = {int(sid) for dt, sid, ref in links if dt == "manufacture" and str(ref or "").strip()}
+        issue_ids = {int(sid) for dt, sid, ref in links if dt == "material_issue" and str(ref or "").strip()}
+        man_src: Dict[int, Tuple[int, Optional[int]]] = {}
+        if man_ids:
+            man_src = {
+                int(mid): (int(oid), int(pid) if pid is not None else None)
+                for mid, oid, pid in db.query(
+                    models.ProductionManufacture.manufacture_id,
+                    models.ProductionManufacture.order_id,
+                    models.ProductionManufacture.product_id,
+                )
+                .filter(models.ProductionManufacture.manufacture_id.in_(list(man_ids)))
+                .all()
+            }
+        issue_src: Dict[int, Tuple[int, Optional[int]]] = {}
+        if issue_ids:
+            issue_src = {
+                int(iid): (int(oid), int(pid) if pid is not None else None)
+                for iid, oid, pid in db.query(
+                    models.ProductionMaterialIssue.issue_id,
+                    models.ProductionMaterialIssue.order_id,
+                    models.ProductionMaterialIssue.product_id,
+                )
+                .filter(models.ProductionMaterialIssue.issue_id.in_(list(issue_ids)))
+                .all()
+            }
+        for dt, sid, ref in links:
+            recorder = str(ref or "").strip()
+            if not recorder:
+                continue
+            src = man_src.get(int(sid)) if dt == "manufacture" else issue_src.get(int(sid))
+            if src is not None:
+                self.link_doc[recorder] = src
+
+        # ---- chain source 2: stock_recorder_pull.order_ref (1С-created docs) ----
+        # recorder GUID → producing-order GUID captured from the document header.
+        self.pull_order_ref: Dict[str, str] = {
+            str(rref).strip(): str(oref).strip()
+            for rref, oref in db.query(
+                models.StockRecorderPull.recorder_ref,
+                models.StockRecorderPull.order_ref,
+            )
+            .filter(models.StockRecorderPull.order_ref.isnot(None))
+            .all()
+            if str(rref or "").strip() and str(oref or "").strip()
+        }
+
+    def _resolve_order(
+        self, recorder: str
+    ) -> Tuple[Optional[models.ProductionOrder], Optional[int], str]:
+        """Resolve the producing order for a recorder GUID via the chain.
+
+        Returns ``(order, product_id, source)`` where ``product_id`` is the
+        exact local production line (sync_link path only) and ``source`` ∈
+        {``sync_link``, ``order_ref``, ``direct``, ``""``}.
+        """
+        if not recorder:
+            return None, None, ""
+        linked = self.link_doc.get(recorder)
+        if linked is not None:
+            order = self.order_by_id.get(int(linked[0]))
+            if order is not None:
+                return order, linked[1], "sync_link"
+        order_ref = self.pull_order_ref.get(recorder)
+        if order_ref:
+            order = self.order_by_ref.get(order_ref)
+            if order is not None:
+                return order, None, "order_ref"
+        order = self.order_by_ref.get(recorder)
+        if order is not None:
+            return order, None, "direct"
+        return None, None, ""
 
     def _key_of(self, entry: models.ReservationEntry) -> Tuple:
         return (
@@ -556,12 +677,14 @@ class _MatchIndex:
     def match_issue(self, sle: models.StockLedgerEntry) -> Tuple[Optional[models.ReservationEntry], str]:
         """Match a physical issue (qty<0) to a CONSUME reservation (design §6.3).
 
-        (1) pegged: recorder → ProductionOrder(order_ref1c) → run → consume
-            reservation of (run, issued item); (2) run-scoped FIFO: oldest active
-            consume reserve of that run/item; (3) STOP → unplanned_consumption.
+        (1) pegged: recorder → resolution chain (sync_link →
+            stock_recorder_pull.order_ref → direct) → ProductionOrder → run →
+            consume reservation of (run, issued item); (2) run-scoped FIFO:
+            oldest active consume reserve of that run/item; (3) STOP →
+            unplanned_consumption.
         """
         recorder = str(sle.recorder_ref or "").strip()
-        order = self.order_by_ref.get(recorder)
+        order, _product_id, _source = self._resolve_order(recorder)
         if order is None:
             return None, "unplanned"
         run_id = self.order_run.get(int(order.order_id))
@@ -587,14 +710,23 @@ class _MatchIndex:
         return sorted(active, key=self._key_of)[0]
 
     def match_receipt(self, sle: models.StockLedgerEntry) -> Tuple[Optional[models.ReservationEntry], str]:
-        """Match a production receipt (qty>0, assembly_in) to a MAKE reservation
-        (design §3.1/§6.3): recorder → ProductionOrder → produced line
+        """Match a make receipt (qty>0: assembly_in, or transfer_in onto a
+        ГП-склад) to a MAKE reservation (design §3.1/§6.3): recorder →
+        resolution chain → ProductionOrder → produced line
         source_mrp_requirement_id → make reservation; fallback run-scoped."""
         recorder = str(sle.recorder_ref or "").strip()
-        order = self.order_by_ref.get(recorder)
+        order, product_id, _source = self._resolve_order(recorder)
         if order is None:
             return None, "unplanned"
-        req_id = self.prod_source_req.get((int(order.order_id), int(sle.item_id)))
+        req_id: Optional[int] = None
+        # line-exact pegging (sync_link path): the local production line the
+        # document was created for, when it is the received item's line.
+        if product_id is not None:
+            line = self.product_line.get(int(product_id))
+            if line is not None and line[0] == int(sle.item_id):
+                req_id = line[1]
+        if req_id is None:
+            req_id = self.prod_source_req.get((int(order.order_id), int(sle.item_id)))
         if req_id is not None:
             entry = self.res_by_req_mode.get((int(req_id), MAKE))
             if entry is not None and str(entry.lifecycle_status) == "active":
@@ -613,10 +745,12 @@ def realize_from_sle(db: Session, scope, cycle_id: str) -> Dict[str, Any]:
     """Append realize events from physical SLE not yet applied (design §6.1/§6.3).
 
     Issue (qty<0) → consume-reservation realize, CAPPED at outstanding (Finding
-    B: residual → unplanned_consumption, no realize). Production receipt (qty>0
-    assembly_in) pegged → make-reservation realize. An unmatched issue is
-    ``unplanned_consumption`` (decision #11): NEVER a silent global FIFO.
-    idempotency_key ``realize:{reservation_id}:{sle_id}``.
+    B: residual → unplanned_consumption, no realize). Make receipt (qty>0
+    assembly_in, or transfer_in landing on a finished-goods (ГП) warehouse —
+    приход ГП по перемещению с основанием-заказом) pegged → make-reservation
+    realize. An unmatched issue is ``unplanned_consumption`` (decision #11):
+    NEVER a silent global FIFO. idempotency_key
+    ``realize:{reservation_id}:{sle_id}``.
     """
     summary = {
         "realized_consume": 0,
@@ -627,6 +761,16 @@ def realize_from_sle(db: Session, scope, cycle_id: str) -> Dict[str, Any]:
     if not scope.pool_items:
         return summary
     index = _MatchIndex(db, scope.run_ids, scope.open_req_ids)
+
+    # finished-goods (ГП) warehouses: a transfer_in landing on one of these is
+    # a make receipt (перемещение ГП на склад ГП), not a material movement.
+    fg_warehouse_refs = {
+        str(ref)
+        for (ref,) in db.query(models.StockWarehouse.warehouse_ref1c)
+        .filter(models.StockWarehouse.is_finished_goods.is_(True))
+        .all()
+        if ref
+    }
 
     # SLE already applied (any reservation_event carrying that sle_id).
     applied_sle_ids = {
@@ -676,7 +820,13 @@ def realize_from_sle(db: Session, scope, cycle_id: str) -> Dict[str, Any]:
             if residual > EPS:
                 summary["unplanned_consumption"] += 1
                 summary["unplanned_qty"] += float(residual)
-        elif qty > 0 and mk in _MAKE_RECEIPT_KINDS:
+        elif qty > 0 and (
+            mk in _MAKE_RECEIPT_KINDS
+            or (
+                mk == _MAKE_TRANSFER_KIND
+                and str(sle.warehouse_ref1c or "") in fg_warehouse_refs
+            )
+        ):
             entry, rule = index.match_receipt(sle)
             if entry is None:
                 continue  # supplier/receipt not pegged to make → coverage, not realize
