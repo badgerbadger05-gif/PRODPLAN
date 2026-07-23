@@ -9,6 +9,9 @@ import type {
   DbrChainRefresh,
   DbrFeederDeficitsResult,
   DbrProcessingBoard,
+  DbrProcessingChainPreview,
+  DbrProcessingOrderPreview,
+  DbrProcessingTripManifest,
   DbrGateResult,
   DbrFeederFilters,
   DbrFeederPosition,
@@ -30,7 +33,7 @@ import type {
   DbrSettings,
   DbrSettingsUpdate,
 } from '../domain/dbr'
-import { api, ApiError } from '../lib/api'
+import { api, apiText, ApiError } from '../lib/api'
 
 export function isDbrConflict(error: unknown): error is ApiError {
   return error instanceof ApiError && error.status === 409
@@ -194,6 +197,22 @@ export function listDbrFeederPositions(filters: DbrFeederFilters = {}) {
 
 export function getDbrProcessingBoard() {
   return api<DbrProcessingBoard>('/v1/dbr/feeder/processing/board')
+}
+
+export function previewDbrProcessingChain() {
+  return api<DbrProcessingChainPreview>('/v1/dbr/feeder/processing/chain/preview', { method: 'POST' })
+}
+
+export function previewDbrProcessingOrder(signalId: number) {
+  return api<DbrProcessingOrderPreview>(`/v1/dbr/feeder/signals/${signalId}/processing-order-preview`)
+}
+
+export function getDbrProcessingTripManifest() {
+  return api<DbrProcessingTripManifest>('/v1/dbr/feeder/processing/trip-manifest')
+}
+
+export function getDbrProcessingTripManifestPrint() {
+  return apiText('/v1/dbr/feeder/processing/trip-manifest/print')
 }
 
 export function previewDbrFeederPositions(scheduleId?: number) {

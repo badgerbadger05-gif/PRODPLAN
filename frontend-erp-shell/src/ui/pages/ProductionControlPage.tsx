@@ -50,6 +50,7 @@ import { ProductionDetailPane } from './production-control/ProductionDetailPane'
 import { ProductionFilterBar } from './production-control/ProductionFilterBar'
 import { ProductionOrdersTable } from './production-control/ProductionOrdersTable'
 import { ProductionSettingsPane } from './production-control/ProductionSettingsPane'
+import { ProductionViewBar } from './production-control/ProductionViewBar'
 import type { ProductionOrderSortKey } from './production-control/productionOrdersDoctype'
 import { ChainCloseDialog } from './production-control/ChainCloseDialog'
 import { ProduceDialog } from './production-control/ProduceDialog'
@@ -93,6 +94,7 @@ export function ProductionControlPage() {
     workshop_id: '',
     coverage_status: '',
     root_item_id: '',
+    planning_contour: '',
     sort_by: 'planned_start_date',
     sort_dir: 'asc',
   })
@@ -932,6 +934,8 @@ export function ProductionControlPage() {
         {error && <div className="errorLine" role="alert">{error}</div>}
         {message && <div className="successLine" role="status">{message}</div>}
 
+        <ProductionViewBar filters={filters} onChange={changeFilters} />
+
         <div className="split">
           <div className="tablePane">
             <ProductionFilterBar
@@ -945,7 +949,10 @@ export function ProductionControlPage() {
               rows={rows}
               activeRow={activeRow}
               selectedIds={selectedIds}
-              sort={{ sortBy: filters.sort_by, sortDir: filters.sort_dir }}
+              sort={{
+                sortBy: filters.sort_by === 'planned_start_date' ? filters.sort_by : null,
+                sortDir: filters.sort_dir,
+              }}
               onSelectIds={setSelectedIds}
               onActivate={setActiveId}
           onOpenMaterials={(row) => void loadMaterials(row.product_id)}

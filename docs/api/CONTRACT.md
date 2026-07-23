@@ -120,5 +120,11 @@ export const productionOrderDoctype: Doctype<OrderRow, ProductionFilters, OrderD
 ```
 
 ## CHANGELOG
+- 2026-07-23 v4: `GET /api/v1/production-control/orders` получил строгий envelope
+  `ProductionOrderJournalResponse`. Для представления «Очередь мехцеха» используется
+  query `planning_contour=dbr_feeder`; это те же реальные строки журнала, а DBR-происхождение
+  приходит в `source_dbr_signal_id` и `planning` (приоритет, слот, даты, состояние очереди).
+  Фронт не объединяет ответы `/dbr/feeder/signals` и журнала.
+- 2026-07-21 v3: добавлены пять read-only Item Ledger endpoints со строгими Pydantic response-моделями; openapi.json расширен до 188 путей / 112 схем.
 - 2026-07-20 v2: удалён недельный выпуск, ввод факта и закрытие дня; openapi.json сокращён до 183 путей / 99 схем.
 - 2026-07-20 v1: первичный контракт — openapi.json (187 путей), сквозные конвенции, целевая модель авторизации/прав, правила владения, пример production_order.

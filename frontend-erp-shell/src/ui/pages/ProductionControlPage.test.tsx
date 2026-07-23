@@ -272,6 +272,53 @@ describe('ProductionControlPage — characterization', () => {
     expect(screen.getByText('MRP run: 77')).toBeInTheDocument()
   })
 
+  it('uses the existing journal endpoint for the mechshop DBR view', async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findByText('Вал')
+
+    expect(screen.getByRole('button', { name: 'Все заказы' })).toHaveAttribute('aria-pressed', 'true')
+    await user.click(screen.getByRole('button', { name: 'Очередь мехцеха' }))
+
+    await waitFor(() => expect(listProductionOrders).toHaveBeenCalledTimes(2))
+    const params = vi.mocked(listProductionOrders).mock.calls[1][0]
+    expect(params.get('planning_contour')).toBe('dbr_feeder')
+    expect(params.get('sort_by')).toBe('dbr_priority')
+    expect(params.get('sort_dir')).toBe('desc')
+    expect(screen.getByRole('button', { name: 'Очередь мехцеха' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.getByText('Приоритет DBR · единый журнал запуска')).toBeInTheDocument()
+  })
+
+  it('shows DBR priority in a journal row and planning provenance in its card', async () => {
+    vi.mocked(listProductionOrders).mockResolvedValue({
+      rows: [{
+        ...fakeRows()[0],
+        source: 'dbr',
+        source_dbr_signal_id: 431,
+        planning: {
+          contour: 'dbr_feeder',
+          slot_id: 912,
+          signal_type: 'Цепочка',
+          priority: 1.42,
+          zone: 'red',
+          required_date: '2026-07-24',
+          queue_state: 'ready',
+          reason: 'Запуск по слоту барабана',
+        },
+      }],
+      total: 1,
+      limit: 100,
+      offset: 0,
+    })
+    renderPage()
+
+    expect(await screen.findByText('DBR 1.42')).toBeInTheDocument()
+    expect(screen.getByText('Планирование DBR')).toBeInTheDocument()
+    expect(screen.getByText('#431')).toBeInTheDocument()
+    expect(screen.getByText('#912')).toBeInTheDocument()
+    expect(screen.getByText('Запуск по слоту барабана')).toBeInTheDocument()
+  })
+
   it('auto-loads materials for the first (active) row into the detail pane', async () => {
     renderPage()
     await screen.findByText('Вал')

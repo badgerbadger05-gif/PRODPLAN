@@ -15,7 +15,7 @@ import {
 } from './model'
 
 const filters: ProductionFilters = {
-  search: 'насос', status: 'ready', workshop_id: '', coverage_status: '', root_item_id: '',
+  search: 'насос', status: 'ready', workshop_id: '', coverage_status: '', root_item_id: '', planning_contour: '',
   sort_by: 'planned_start_date', sort_dir: 'asc',
 }
 const rows = [

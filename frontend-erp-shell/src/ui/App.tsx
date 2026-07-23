@@ -5,6 +5,7 @@ import { KeyboardShortcutShell, type KeyboardShortcut } from './platform'
 import { frontendResources } from './resourceRegistry'
 import { canAccessResource } from './resourceRegistry'
 import { LoginPage, useSession } from './session'
+import { DeploymentContourBanner } from './DeploymentContourBanner'
 
 const DbrDrumBoardPage = lazy(() => import('./pages/DbrDrumBoardPage').then((module) => ({ default: module.DbrDrumBoardPage })))
 const DbrFeederPage = lazy(() => import('./pages/DbrFeederPage').then((module) => ({ default: module.DbrFeederPage })))
@@ -16,6 +17,7 @@ const LedgerWorkspaceRoute = lazy(() => import('./pages/LedgerWorkspacePage').th
 const MrpResultPage = lazy(() => import('./pages/MrpResultPage').then((module) => ({ default: module.MrpResultPage })))
 const MrpRunsPage = lazy(() => import('./pages/MrpRunsPage').then((module) => ({ default: module.MrpRunsPage })))
 const PeriodPlanPage = lazy(() => import('./pages/PeriodPlanPage').then((module) => ({ default: module.PeriodPlanPage })))
+const PlanningComparisonPage = lazy(() => import('./pages/PlanningComparisonPage').then((module) => ({ default: module.PlanningComparisonPage })))
 const ProductionControlPage = lazy(() => import('./pages/ProductionControlPage').then((module) => ({ default: module.ProductionControlPage })))
 const PurchaseControlPage = lazy(() => import('./pages/PurchaseControlPage').then((module) => ({ default: module.PurchaseControlPage })))
 const ResourcesPage = lazy(() => import('./pages/ResourcesPage').then((module) => ({ default: module.ResourcesPage })))
@@ -56,6 +58,7 @@ export function App() {
 
   return (
     <div className="app">
+      <DeploymentContourBanner />
       <KeyboardShortcutShell shortcuts={navigationShortcuts} />
       <aside className="nav">
         <div className="brand">
@@ -77,13 +80,14 @@ export function App() {
           </NavLink>
         ))}
         <div className="navLogoSlot" aria-label="Логотип компании ЗСМ">
-          <div className="sessionBadge">
-            <strong>{session.user.name}</strong>
-            <button onClick={() => void session.logout()}>Выйти</button>
-          </div>
           <img src="/zsm-logo-sidebar.png" alt="ЗСМ" />
         </div>
       </aside>
+
+      <div className="sessionBadge sessionBadgeTop">
+        <strong>{session.user.name}</strong>
+        <button onClick={() => void session.logout()}>Выйти</button>
+      </div>
 
       <ErrorBoundary>
         <Suspense fallback={<RouteLoading />}>
@@ -91,6 +95,7 @@ export function App() {
             <Route path="/" element={<HomePage />} />
             <Route path="/period-plan" element={guard('period_plan', <PeriodPlanPage />)} />
             <Route path="/period-plan/:planId" element={guard('period_plan', <PeriodPlanPage />)} />
+            <Route path="/planning-comparison" element={guard('planning_comparison', <PlanningComparisonPage />)} />
             <Route path="/dbr" element={guard('dbr', <DbrDrumBoardPage />)} />
             <Route path="/dbr/programs" element={guard('dbr', <DbrProgramsPage />)} />
             <Route path="/dbr/feeder" element={guard('dbr', <DbrFeederPage />)} />
@@ -102,7 +107,7 @@ export function App() {
             <Route path="/mrp-runs" element={guard('plan_run', <MrpRunsPage />)} />
             <Route path="/mrp-runs/:runId" element={guard('plan_run', <MrpResultPage />)} />
             <Route path="/ledger" element={guard('ledger', <LedgerWorkspaceRoute />)} />
-            <Route path="/ledger/postings/:postingId" element={guard('ledger', <LedgerWorkspaceRoute />)} />
+            <Route path="/ledger/items/:itemId" element={guard('ledger', <LedgerWorkspaceRoute />)} />
             <Route path="/resources" element={guard('resources', <ResourcesPage />)} />
             <Route path="/workshop-binding-review" element={guard('workshop_binding', <WorkshopBindingReviewPage />)} />
             <Route path="/stage-distribution" element={guard('stage_distribution', <StageDistributionPage />)} />

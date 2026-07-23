@@ -10,12 +10,17 @@ import type {
   DbrKitLine,
   DbrLaunchConflictDetail,
   DbrProcessingBoard,
+  DbrProcessingChainPreview,
+  DbrProcessingOrderPreview,
+  DbrProcessingTripManifest,
   DbrPurchaseLaunchResult,
   DbrSignalLaunchResult,
 } from '../../../domain/dbr'
 import {
   getDbrFeederDeficits,
   getDbrProcessingBoard,
+  getDbrProcessingTripManifest,
+  getDbrProcessingTripManifestPrint,
   getDbrSettings,
   isDbrConflict,
   launchDbrPurchase,
@@ -26,6 +31,8 @@ import {
   previewDbrFeederChain,
   previewDbrFeederPositions,
   previewDbrFeederSignals,
+  previewDbrProcessingChain,
+  previewDbrProcessingOrder,
   rebuildDbrFeederPositions,
   refreshDbrFeederChain,
   refreshDbrFeederSignals,
@@ -85,6 +92,9 @@ export function useDbrFeederController() {
   const [purchaseError, setPurchaseError] = useState('')
   const [processingBoard, setProcessingBoard] = useState<DbrProcessingBoard | null>(null)
   const [processingLoading, setProcessingLoading] = useState(false)
+  const [processingChainPreview, setProcessingChainPreview] = useState<DbrProcessingChainPreview | null>(null)
+  const [processingOrderPreview, setProcessingOrderPreview] = useState<DbrProcessingOrderPreview | null>(null)
+  const [processingManifest, setProcessingManifest] = useState<DbrProcessingTripManifest | null>(null)
   const positionsLoadSequence = useRef(0)
   const signalsLoadSequence = useRef(0)
   const signalDetailLoadSequence = useRef(0)
@@ -157,6 +167,57 @@ export function useDbrFeederController() {
   }, [])
 
   useEffect(() => { void loadProcessingBoard() }, [loadProcessingBoard])
+
+  async function calculateProcessingChainPreview() {
+    setProcessingLoading(true)
+    setError('')
+    try {
+      setProcessingChainPreview(await previewDbrProcessingChain())
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setProcessingLoading(false)
+    }
+  }
+
+  async function calculateProcessingOrderPreview(signalId: number) {
+    setProcessingLoading(true)
+    setError('')
+    try {
+      setProcessingOrderPreview(await previewDbrProcessingOrder(signalId))
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setProcessingLoading(false)
+    }
+  }
+
+  async function loadProcessingManifest() {
+    setProcessingLoading(true)
+    setError('')
+    try {
+      setProcessingManifest(await getDbrProcessingTripManifest())
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setProcessingLoading(false)
+    }
+  }
+
+  async function printProcessingManifest() {
+    setProcessingLoading(true)
+    setError('')
+    try {
+      const html = await getDbrProcessingTripManifestPrint()
+      const url = URL.createObjectURL(new Blob([html], { type: 'text/html;charset=utf-8' }))
+      window.open(url, '_blank', 'noopener,noreferrer')
+      window.setTimeout(() => URL.revokeObjectURL(url), 60_000)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setProcessingLoading(false)
+    }
+  }
 
   useEffect(() => {
     let cancelled = false
@@ -420,10 +481,14 @@ export function useDbrFeederController() {
     deficitsLoading, deficitSort, setDeficitSort, chainPreview, setChainPreview,
     launchFlow, launchBusy, launchError, purchaseFlow, setPurchaseFlow, purchaseBusy, purchaseError,
     selectedPurchase, setSelectedPurchase, processingBoard, processingLoading,
+    processingChainPreview, setProcessingChainPreview, processingOrderPreview, setProcessingOrderPreview,
+    processingManifest, setProcessingManifest,
     visibleSignals, purchaseSelectableIds, purchaseSelectedIds, allPurchaseSelected, sortedDeficits,
     summary, signalPreviewSummary, calculatePreview, rebuild, calculateSignalPreview,
     refreshSignals, calculateChainPreview, runChainRefresh, filterByDeficit, selectSignal,
     startLaunch, confirmLaunch, closeLaunch, togglePurchase, startPurchase, confirmPurchase,
     applyFilters, resetFilters, loadDeficits, loadProcessingBoard,
+    calculateProcessingChainPreview, calculateProcessingOrderPreview, loadProcessingManifest,
+    printProcessingManifest,
   }
 }

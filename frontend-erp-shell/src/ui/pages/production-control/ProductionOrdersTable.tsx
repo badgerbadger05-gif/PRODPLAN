@@ -7,7 +7,7 @@ type Props = {
   rows: OrderRow[]
   activeRow: OrderRow | null
   selectedIds: Set<number>
-  sort: TableSortState<ProductionOrderSortKey>
+  sort: { sortBy: ProductionOrderSortKey | null; sortDir: 'asc' | 'desc' }
   onSelectIds: (ids: Set<number>) => void
   onActivate: (id: number) => void
   onOpenMaterials: (row: OrderRow) => void
@@ -37,6 +37,13 @@ function orderMainLine(row: OrderRow) {
   return row.order_prodplan_number || row.order_number
 }
 
+function planningZoneLabel(zone?: string | null) {
+  if (zone === 'red') return 'Красная зона'
+  if (zone === 'yellow') return 'Жёлтая зона'
+  if (zone === 'green') return 'Зелёная зона'
+  return zone || 'DBR'
+}
+
 export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSelectIds, onActivate, onOpenMaterials, onChangeStatus, onToggleSort }: Props) {
   return (
     <table aria-label="Заказы на производство" className="journalTable productionOrdersTable" style={{ minWidth: tableMinWidth(productionOrderColumns) }}>
@@ -56,7 +63,9 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
             >
               {column.sortable ? (
                 <button type="button" className="tableSortButton" onClick={() => onToggleSort(column.key as ProductionOrderSortKey)}>
-                  {column.title}{sortGlyph(sort, column.key as ProductionOrderSortKey)}
+                  {column.title}{sort.sortBy === column.key
+                    ? sortGlyph(sort as TableSortState<ProductionOrderSortKey>, column.key as ProductionOrderSortKey)
+                    : ''}
                 </button>
               ) : column.title}
             </th>
@@ -122,14 +131,30 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
                   </span>
                 )}
               </strong>
-              <span title={row.item_article || row.item_code || ''}>{row.item_article || row.item_code || ''}</span>
+              <span title={row.item_article || row.item_code || ''}>
+                {row.item_article || row.item_code || ''}
+                {row.planning?.contour === 'dbr_feeder' && (
+                  <span
+                    className={`planningBadge ${row.planning.zone || 'dbr'}`}
+                    title={[
+                      planningZoneLabel(row.planning.zone),
+                      row.planning.priority != null ? `приоритет ${row.planning.priority}` : null,
+                      row.planning.signal_type,
+                    ].filter(Boolean).join(' · ')}
+                  >
+                    DBR{row.planning.priority != null ? ` ${row.planning.priority}` : ''}
+                  </span>
+                )}
+              </span>
             </td>
             <td className="numCell">
               <strong>{qty(row.remaining_qty)}</strong>
               <span>/ {qty(row.quantity)} {row.unit || ''}</span>
             </td>
             <td className="dateCell">
-              <span>С: {dateRu(row.planned_start_date) || '—'}</span>
+              <span>
+                {row.planning?.contour === 'dbr_feeder' ? 'Нужно' : 'С'}: {dateRu(row.planning?.required_date || row.planned_start_date) || '—'}
+              </span>
               <span>По: {dateRu(row.planned_finish_date) || '—'}</span>
               <ForecastShift row={row} />
             </td>

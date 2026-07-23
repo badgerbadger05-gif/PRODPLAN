@@ -49,6 +49,25 @@ export type OrderRow = {
   failed_manufacture_id?: number | null
   failed_manufacture_error?: string | null
   paint_weld_chain?: PaintWeldChainInfo | null
+  source_dbr_signal_id?: number | null
+  planning?: ProductionPlanningInfo | null
+}
+
+export type ProductionPlanningInfo = {
+  contour?: 'mrp' | 'dbr_drum' | 'dbr_feeder' | 'manual' | '1c' | string | null
+  source_id?: number | null
+  program_id?: number | null
+  schedule_id?: number | null
+  slot_id?: number | null
+  signal_type?: string | null
+  priority?: number | null
+  zone?: 'red' | 'yellow' | 'green' | string | null
+  need_date?: string | null
+  required_date?: string | null
+  queue_state?: 'ready' | 'blocked' | 'not_due' | 'diagnostic' | string | null
+  chain_depth?: number | null
+  parent_signal_id?: number | null
+  reason?: string | null
 }
 
 // Цепочка «окраска↔сварка»: строка входит в связанную пару заказов.
@@ -318,7 +337,8 @@ export type ProductionFilters = {
   workshop_id: string
   coverage_status: string
   root_item_id: string
-  sort_by: 'planned_start_date'
+  planning_contour: string
+  sort_by: 'planned_start_date' | 'dbr_priority'
   sort_dir: 'asc' | 'desc'
 }
 

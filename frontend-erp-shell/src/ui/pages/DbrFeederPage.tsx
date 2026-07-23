@@ -29,12 +29,18 @@ export function DbrFeederPage() {
     deficitsLoading, deficitSort, setDeficitSort, chainPreview, setChainPreview,
     launchFlow, launchBusy, launchError, purchaseFlow, setPurchaseFlow, purchaseBusy, purchaseError,
     selectedPurchase, setSelectedPurchase, processingBoard, processingLoading,
+    processingChainPreview, setProcessingChainPreview, processingOrderPreview, setProcessingOrderPreview,
+    processingManifest, setProcessingManifest,
     visibleSignals, purchaseSelectableIds, purchaseSelectedIds, allPurchaseSelected, sortedDeficits,
     summary, signalPreviewSummary, calculatePreview, rebuild, calculateSignalPreview,
     refreshSignals, calculateChainPreview, runChainRefresh, filterByDeficit, selectSignal,
     startLaunch, confirmLaunch, closeLaunch, togglePurchase, startPurchase, confirmPurchase,
     applyFilters, resetFilters, loadDeficits, loadProcessingBoard,
+    calculateProcessingChainPreview, calculateProcessingOrderPreview, loadProcessingManifest,
+    printProcessingManifest,
   } = useDbrFeederController()
+  const processingItemIds = new Set((processingBoard?.positions ?? []).map((row) => row.item_id))
+  const processingSignals = signals.filter((signal) => signal.status === 'Open' && processingItemIds.has(signal.item_id))
   return (
     <main className="workArea">
       <div className="topLine">
@@ -338,21 +344,35 @@ export function DbrFeederPage() {
                 </span>
               )}
               <button onClick={() => void loadProcessingBoard()} disabled={processingLoading}>Обновить</button>
+              <button onClick={() => void calculateProcessingChainPreview()} disabled={processingLoading}>Цепочка: проверить</button>
+              <button onClick={() => void loadProcessingManifest()} disabled={processingLoading}>Рейс: предпросмотр</button>
+              <button onClick={() => void printProcessingManifest()} disabled={processingLoading}>Рейс: печать</button>
             </div>
           </div>
+
+          {processingBoard?.processing_stock && (
+            <div className={`dbrProcessingHealth ${processingBoard.processing_stock.status === 'ok' ? 'ok' : 'warn'}`}>
+              Точный остаток у переработчика: {processingBoard.processing_stock.status === 'ok' ? 'синхронизирован' : `статус ${processingBoard.processing_stock.status ?? 'неизвестен'}`}
+              {' · '}строк {processingBoard.processing_stock.rows_stored ?? 0}
+              {' · '}всего {qty(processingBoard.processing_stock.total_qty ?? 0)}
+              {' · '}последний успех {dateTimeRu(processingBoard.processing_stock.last_success_at) || 'ещё не было'}
+              {processingBoard.processing_stock.unmatched_items ? ` · не сопоставлено ${processingBoard.processing_stock.unmatched_items}` : ''}
+              {processingBoard.processing_stock.last_error ? ` · ошибка: ${processingBoard.processing_stock.last_error}` : ''}
+            </div>
+          )}
 
           <div className="dbrFeederTableWrap">
             <table className="journalTable dbrTable">
               <thead><tr>
                 <th>Позиция</th><th>Зона</th>
                 <th className="numCell">NFP</th><th className="numCell">Полка</th>
-                <th className="numCell">У переработчика</th><th className="numCell">Голая (остаток+WIP)</th>
+                <th className="numCell">Открытая труба</th><th className="numCell">Точно у переработчика</th><th className="numCell">Голая (остаток+WIP)</th>
                 <th className="numCell">Target</th><th className="numCell">ADU</th>
-                <th>Открытые заказы переработчику</th>
+                <th>Кругорейс (proxy)</th><th>Открытые заказы переработчику</th>
               </tr></thead>
               <tbody>
                 {!processingLoading && !(processingBoard?.positions.length) && (
-                  <tr><td colSpan={9} className="emptyCell">Processing-позиций нет — пересчитайте позиции по активному графику.</td></tr>
+                  <tr><td colSpan={11} className="emptyCell">Processing-позиций нет — пересчитайте позиции по активному графику.</td></tr>
                 )}
                 {(processingBoard?.positions ?? []).map((row) => (
                   <tr key={row.position_id} className={row.has_overdue ? 'dbrProcessingOverdueRow' : ''}>
@@ -361,9 +381,14 @@ export function DbrFeederPage() {
                     <td className="numCell"><strong>{row.nfp != null ? qty(row.nfp) : '—'}</strong></td>
                     <td className="numCell">{row.stock_qty != null ? qty(row.stock_qty) : '—'}</td>
                     <td className="numCell">{row.open_supply_qty != null ? qty(row.open_supply_qty) : '—'}</td>
+                    <td className="numCell"><strong>{row.at_contractor_qty != null ? qty(row.at_contractor_qty) : '—'}</strong></td>
                     <td className="numCell">{row.chain_supply_qty != null ? qty(row.chain_supply_qty) : '—'}</td>
                     <td className="numCell">{qty(row.target_qty)}</td>
                     <td className="numCell">{qty(row.adu)}</td>
+                    <td title="Прокси по датам документов 1С: отчёт минус передача, взвешено по принятому количеству">
+                      {row.roundtrip_kpi?.weighted_avg_days != null ? `${row.roundtrip_kpi.weighted_avg_days} дн` : '—'}
+                      <span className="dbrFeederItemName">{row.roundtrip_kpi?.completed_qty ? `${qty(row.roundtrip_kpi.completed_qty)} шт · max ${row.roundtrip_kpi.max_days ?? '—'} дн` : 'Нет завершённых строк'}</span>
+                    </td>
                     <td>
                       {row.open_orders.length
                         ? row.open_orders.map((order) => (
@@ -381,8 +406,68 @@ export function DbrFeederPage() {
               </tbody>
             </table>
           </div>
-          <div className="dbrSignalReadonly">Только просмотр: сигналы переработки advisory, заказ переработчику создаётся вручную (материализация — после смоука вида операции в 1С).</div>
+          {!!processingBoard?.contractors?.length && (
+            <div className="dbrProcessingContractors">
+              <strong>Кругорейс по подрядчикам (proxy по датам документов 1С)</strong>
+              {processingBoard.contractors.map((contractor) => (
+                <span key={contractor.supplier_id}>{contractor.supplier_name || contractor.supplier_ref1c}: {contractor.roundtrip_kpi.weighted_avg_days != null ? `${contractor.roundtrip_kpi.weighted_avg_days} дн` : 'нет данных'}</span>
+              ))}
+            </div>
+          )}
+          <div className="dbrProcessingPreviewActions">
+            <label>Предпросмотр заказа:
+              <select defaultValue="" onChange={(event) => { if (event.target.value) void calculateProcessingOrderPreview(Number(event.target.value)) }} disabled={processingLoading}>
+                <option value="">Выберите открытый сигнал</option>
+                {processingSignals.map((signal) => <option key={signal.id} value={signal.id}>#{signal.id} · {signal.item_code}</option>)}
+              </select>
+            </label>
+          </div>
+          <div className="dbrSignalReadonly">Только предпросмотр: запись заказа переработчику в 1С отключена до demo-smoke контракта вида операции.</div>
         </section>
+
+        {processingChainPreview && (
+          <div className="dialogOverlay" role="dialog" aria-modal="true" aria-label="Проверка цепочки переработки">
+            <div className="dialogBox">
+              <div className="dialogHeader">Цепочка переработки — только предпросмотр</div>
+              <div className="dialogBody">
+                <div className="dbrChainSummary">
+                  <div><span className="dbrChainSummaryLabel">Открытых сигналов</span><strong>{processingChainPreview.processing_open_signals}</strong></div>
+                  <div><span className="dbrChainSummaryLabel">Покрыто расчётом</span><strong>{processingChainPreview.netted_signals}</strong></div>
+                  <div><span className="dbrChainSummaryLabel">Дочерних заготовок</span><strong>{processingChainPreview.desired_children}</strong></div>
+                  <div><span className="dbrChainSummaryLabel">Нерешённых строк</span><strong>{processingChainPreview.unresolved_count}</strong></div>
+                </div>
+                <table className="dbrDeficitLinesTable"><thead><tr><th>Сигнал</th><th>Покрытая</th><th>Голая</th><th className="numCell">Кол-во</th><th>Проблемы</th></tr></thead>
+                  <tbody>{processingChainPreview.children.map((row) => <tr key={`${row.parent_signal_id}:${row.component_item}`}><td>#{row.parent_signal_id}</td><td>{row.parent_item || '—'}</td><td>{row.component_item || '—'}</td><td className="numCell">{row.suggested_qty != null ? qty(row.suggested_qty) : '—'}</td><td>{row.unresolved_reasons.join(', ') || '—'}</td></tr>)}</tbody>
+                </table>
+                <div className="dbrSignalReadonly">Расчёт read-only: сигналы и заказы не создаются.</div>
+              </div>
+              <div className="dialogFooter"><button onClick={() => setProcessingChainPreview(null)}>Закрыть</button></div>
+            </div>
+          </div>
+        )}
+
+        {processingOrderPreview && (
+          <div className="dialogOverlay" role="dialog" aria-modal="true" aria-label="Предпросмотр заказа переработчику">
+            <div className="dialogBox">
+              <div className="dialogHeader">Заказ переработчику — сигнал #{processingOrderPreview.signal_id}</div>
+              <div className="dialogBody"><pre className="dbrPayloadPreview">{JSON.stringify(processingOrderPreview.payload, null, 2)}</pre><div className="dbrSignalReadonly">Запись в 1С отключена до demo-smoke. Этот экран ничего не проводит.</div></div>
+              <div className="dialogFooter"><button onClick={() => setProcessingOrderPreview(null)}>Закрыть</button></div>
+            </div>
+          </div>
+        )}
+
+        {processingManifest && (
+          <div className="dialogOverlay" role="dialog" aria-modal="true" aria-label="Предпросмотр рейса переработки">
+            <div className="dialogBox dbrManifestDialog">
+              <div className="dialogHeader">Рейс на переработку — предпросмотр</div>
+              <div className="dialogBody">
+                <p>Сигналов: {processingManifest.signals_total}; подрядчиков: {processingManifest.contractors_total}; проблемных строк: {processingManifest.unresolved_count}</p>
+                {processingManifest.contractors.map((contractor, index) => <div key={contractor.contractor_ref1c || index}><h3>{contractor.contractor_name || 'Подрядчик не определён'}</h3>{contractor.lines.map((line) => <div key={line.signal_id}>#{line.signal_id} · {line.covered_item_code} → {line.bare_item_code || '—'} · {qty(line.tolling_qty ?? 0)} шт {line.unresolved_reasons.length ? `⚠ ${line.unresolved_reasons.join(', ')}` : ''}</div>)}</div>)}
+              </div>
+              <div className="dialogFooter"><button onClick={() => setProcessingManifest(null)}>Закрыть</button><button className="primary" onClick={() => void printProcessingManifest()} disabled={processingLoading}>Открыть печать</button></div>
+            </div>
+          </div>
+        )}
 
         {chainPreview && (
           <div className="dialogOverlay" role="dialog" aria-modal="true" aria-label="Предпросмотр цепочки" onClick={() => setChainPreview(null)}>

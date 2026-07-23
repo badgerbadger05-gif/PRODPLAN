@@ -607,18 +607,113 @@ export type DbrProcessingRow = {
   stock_qty?: number | null
   open_supply_qty?: number | null
   chain_supply_qty?: number | null
+  at_contractor_qty?: number | null
   is_complete?: boolean | null
   missing_reasons: string[]
   open_orders: DbrProcessingOrder[]
   has_overdue: boolean
+  roundtrip_kpi?: DbrProcessingRoundtripKpi
+}
+
+export type DbrProcessingRoundtripKpi = {
+  semantics: string
+  eligible_rows: number
+  completed_rows: number
+  completed_orders: number
+  completed_qty: number
+  weighted_avg_days?: number | null
+  max_days?: number | null
+  within_roundtrip_rows: number
+  within_roundtrip_qty: number
+  invalid_date_rows: number
+}
+
+export type DbrProcessingContractorKpi = {
+  supplier_id: number
+  supplier_ref1c: string
+  supplier_name: string
+  roundtrip_kpi: DbrProcessingRoundtripKpi
+}
+
+export type DbrProcessingStockHealth = {
+  status?: string
+  last_attempt_at?: string | null
+  last_success_at?: string | null
+  last_error?: string | null
+  rows_seen?: number
+  rows_stored?: number
+  unmatched_items?: number
+  total_qty?: number
+  [key: string]: unknown
 }
 
 export type DbrProcessingBoard = {
   roundtrip_limit_days: number
+  roundtrip_kpi_semantics?: string
   positions: DbrProcessingRow[]
+  contractors?: DbrProcessingContractorKpi[]
+  processing_stock?: DbrProcessingStockHealth
   positions_total: number
   overdue_positions: number
   generated_at: string
+}
+
+export type DbrProcessingChainRow = {
+  parent_signal_id: number
+  parent_item?: string | null
+  component_item?: string | null
+  suggested_qty?: number | null
+  shortage_qty?: number | null
+  warehouse_ref1c?: string | null
+  unresolved_reasons: string[]
+}
+
+export type DbrProcessingChainPreview = {
+  read_only: true
+  processing_open_signals: number
+  netted_signals: number
+  desired_children: number
+  distinct_components: number
+  parents_with_children: number
+  children: DbrProcessingChainRow[]
+  unresolved: DbrProcessingChainRow[]
+  unresolved_count: number
+}
+
+export type DbrProcessingOrderPreview = {
+  dry_run: true
+  write_capable: false
+  live_contract_confirmed: false
+  gate: string
+  entity: string
+  signal_id: number
+  payload: Record<string, unknown>
+}
+
+export type DbrProcessingTripManifestLine = {
+  signal_id: number
+  covered_item_code: string
+  covered_item_name: string
+  suggested_qty: number
+  need_date?: string | null
+  required_date?: string | null
+  bare_item_code?: string | null
+  bare_item_name?: string | null
+  tolling_qty?: number | null
+  unresolved_reasons: string[]
+}
+
+export type DbrProcessingTripManifest = {
+  read_only: true
+  processing_trip_interval_days: number
+  signals_total: number
+  contractors_total: number
+  unresolved_count: number
+  contractors: Array<{
+    contractor_ref1c?: string | null
+    contractor_name?: string | null
+    lines: DbrProcessingTripManifestLine[]
+  }>
 }
 
 // ── Chain explosion (Фаза 3.2) ────────────────────────────────────────────────

@@ -15,12 +15,16 @@ import {
   getDbrFeederDeficits,
   getDbrFeederSignal,
   getDbrProcessingBoard,
+  getDbrProcessingTripManifest,
+  getDbrProcessingTripManifestPrint,
   getDbrSettings,
   launchDbrPurchase,
   launchDbrSignal,
   listDbrFeederPositions,
   listDbrFeederSignals,
   previewDbrFeederChain,
+  previewDbrProcessingChain,
+  previewDbrProcessingOrder,
   previewDbrFeederPositions,
   previewDbrFeederSignals,
   rebuildDbrFeederPositions,
@@ -33,6 +37,8 @@ vi.mock('../../services/dbr', () => ({
   getDbrFeederDeficits: vi.fn(),
   getDbrFeederSignal: vi.fn(),
   getDbrProcessingBoard: vi.fn(),
+  getDbrProcessingTripManifest: vi.fn(),
+  getDbrProcessingTripManifestPrint: vi.fn(),
   getDbrSettings: vi.fn(),
   isDbrConflict: (error: unknown) => (
     typeof error === 'object' && error !== null && 'status' in error && error.status === 409
@@ -42,6 +48,8 @@ vi.mock('../../services/dbr', () => ({
   listDbrFeederPositions: vi.fn(),
   listDbrFeederSignals: vi.fn(),
   previewDbrFeederChain: vi.fn(),
+  previewDbrProcessingChain: vi.fn(),
+  previewDbrProcessingOrder: vi.fn(),
   previewDbrFeederPositions: vi.fn(),
   previewDbrFeederSignals: vi.fn(),
   rebuildDbrFeederPositions: vi.fn(),
@@ -597,6 +605,54 @@ describe('DbrFeederPage characterization', () => {
     expect(refreshDbrFeederChain).toHaveBeenCalledOnce()
     expect(listDbrFeederSignals).toHaveBeenCalledTimes(2)
     expect(getDbrFeederDeficits).toHaveBeenCalledTimes(2)
+  })
+
+  it('separates exact contractor stock and keeps processing actions read-only', async () => {
+    const user = userEvent.setup()
+    vi.mocked(getDbrProcessingBoard).mockResolvedValue({
+      roundtrip_limit_days: 14,
+      positions_total: 1,
+      overdue_positions: 0,
+      generated_at: '2026-07-20T08:00:00Z',
+      processing_stock: { status: 'ok', rows_stored: 2, total_qty: 7, last_success_at: '2026-07-20T07:00:00Z' },
+      contractors: [{
+        supplier_id: 3,
+        supplier_ref1c: 'SUP-3',
+        supplier_name: 'Гальваника',
+        roundtrip_kpi: { semantics: 'proxy', eligible_rows: 1, completed_rows: 1, completed_orders: 1, completed_qty: 5, weighted_avg_days: 6, max_days: 6, within_roundtrip_rows: 1, within_roundtrip_qty: 5, invalid_date_rows: 0 },
+      }],
+      positions: [{
+        position_id: 9, item_id: purchaseSignal.item_id, item_code: 'PUMP-01', item_article: '', item_name: 'Насос',
+        adu: 1, rt_days: 14, trip_interval_days: 7, red_qty: 2, yellow_qty: 2, target_qty: 6,
+        nfp: 4, zone: 'yellow', stock_qty: 1, open_supply_qty: 11, at_contractor_qty: 7, chain_supply_qty: 2,
+        missing_reasons: [], open_orders: [], has_overdue: false,
+        roundtrip_kpi: { semantics: 'proxy', eligible_rows: 1, completed_rows: 1, completed_orders: 1, completed_qty: 5, weighted_avg_days: 6, max_days: 6, within_roundtrip_rows: 1, within_roundtrip_qty: 5, invalid_date_rows: 0 },
+      }],
+    })
+    vi.mocked(previewDbrProcessingChain).mockResolvedValue({
+      read_only: true, processing_open_signals: 1, netted_signals: 1, desired_children: 1,
+      distinct_components: 1, parents_with_children: 1, unresolved_count: 0, unresolved: [],
+      children: [{ parent_signal_id: purchaseSignal.id, parent_item: 'PUMP-01', component_item: 'BARE-01', suggested_qty: 3, shortage_qty: 3, warehouse_ref1c: 'WH', unresolved_reasons: [] }],
+    })
+    vi.mocked(previewDbrProcessingOrder).mockResolvedValue({
+      dry_run: true, write_capable: false, live_contract_confirmed: false, gate: 'blocked_until_1c_contract_confirmation',
+      entity: 'Document_ЗаказПоставщику', signal_id: purchaseSignal.id, payload: { ВидОперации: 'ЗаказНаПереработку' },
+    })
+    renderPage()
+
+    expect(await screen.findByText(/Точный остаток у переработчика: синхронизирован/)).toBeVisible()
+    expect(screen.getByRole('columnheader', { name: 'Открытая труба' })).toBeVisible()
+    expect(screen.getByRole('columnheader', { name: 'Точно у переработчика' })).toBeVisible()
+    expect(screen.getByText(/Кругорейс по подрядчикам/)).toBeVisible()
+    expect(screen.getByText(/запись заказа переработчику в 1С отключена до demo-smoke/i)).toBeVisible()
+
+    await user.click(screen.getByRole('button', { name: 'Цепочка: проверить' }))
+    expect(await screen.findByRole('dialog', { name: 'Проверка цепочки переработки' })).toHaveTextContent('BARE-01')
+    await user.click(screen.getByRole('button', { name: 'Закрыть' }))
+
+    await user.selectOptions(screen.getByRole('combobox', { name: /Предпросмотр заказа/ }), String(purchaseSignal.id))
+    expect(await screen.findByRole('dialog', { name: 'Предпросмотр заказа переработчику' })).toHaveTextContent('ЗаказНаПереработку')
+    expect(screen.getByText(/Запись в 1С отключена до demo-smoke/)).toBeVisible()
   })
 
   it('keeps the latest positions filter when an older request resolves last', async () => {

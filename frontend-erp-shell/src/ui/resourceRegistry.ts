@@ -13,6 +13,7 @@ export type FrontendResource = {
 export const frontendResources: FrontendResource[] = [
   { name: 'home', to: '/', title: 'Главная', end: true, view: ['viewer', 'planner', 'buyer', 'shopfloor', 'admin'], kind: 'custom', shortcut: 'Alt+1' },
   { name: 'period_plan', to: '/period-plan', title: 'Планирование выпуска', view: ['planner', 'admin'], kind: 'custom', shortcut: 'Alt+2' },
+  { name: 'planning_comparison', to: '/planning-comparison', title: 'Сравнение планирования', view: ['planner', 'admin'], kind: 'custom' },
   { name: 'dbr', to: '/dbr', title: 'Планирование DBR', view: ['planner', 'admin'], kind: 'custom', shortcut: 'Alt+3' },
   { name: 'plan_run', to: '/mrp-runs', title: 'MRP прогоны', view: ['viewer', 'planner', 'admin'], kind: 'doctype', shortcut: 'Alt+4' },
   { name: 'production_order', to: '/production-control', title: 'Журнал заказов', view: ['planner', 'shopfloor', 'admin'], kind: 'custom', shortcut: 'Alt+5' },

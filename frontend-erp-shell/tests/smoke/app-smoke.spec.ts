@@ -98,7 +98,7 @@ test.beforeEach(async ({ page }) => {
 })
 
 async function loginAs(page: Page, role: 'admin' | 'viewer') {
-  await page.getByRole('button', { name: 'Выйти' }).evaluate((button: HTMLButtonElement) => button.click())
+  await page.getByRole('button', { name: 'Выйти' }).click()
   await expect(page.getByRole('heading', { name: 'PRODPLAN' })).toBeVisible()
   await page.getByLabel('Логин').fill(role)
   await page.getByRole('button', { name: 'Войти' }).click()
@@ -116,6 +116,13 @@ test('opens the lazy ERP shell without a backend', async ({ page }) => {
   await expect(page.locator('.brand').getByText('PRODPLAN', { exact: true })).toBeVisible()
   await expect(page.getByRole('heading', { name: 'Главная' })).toBeVisible()
   await expect(page.getByText('#42')).toBeVisible()
+
+  const sessionBox = await page.locator('.sessionBadgeTop').boundingBox()
+  const logoBox = await page.locator('.navLogoSlot img').boundingBox()
+  expect(sessionBox).not.toBeNull()
+  expect(logoBox).not.toBeNull()
+  expect(sessionBox!.y).toBeLessThan(34)
+  expect(sessionBox!.x).toBeGreaterThan(logoBox!.x + logoBox!.width)
 
   await page.getByRole('link', { name: 'MRP прогоны' }).click()
   await expect(page.getByRole('heading', { name: 'MRP планирование' })).toBeVisible()

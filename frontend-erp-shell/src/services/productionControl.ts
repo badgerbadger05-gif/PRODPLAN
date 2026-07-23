@@ -9,6 +9,9 @@ import type {
   TransferIssuesResponse,
 } from '../domain/productionControl'
 import { api, apiText } from '../lib/api'
+import type { components } from '../lib/apiTypes'
+
+type ApiSchemas = components['schemas']
 
 // Executor row shared by the produce dialog and the paint↔weld chain close.
 export type OperationExecutorInput = {
@@ -86,9 +89,10 @@ export function getProductionControlSettings() {
 }
 
 export function saveProductionControlSettings(payload: ControlSettingsUpdate) {
+  const request: ApiSchemas['SettingsPayload'] = payload
   return api<ControlSettings>('/v1/production-control/settings', {
     method: 'POST',
-    body: JSON.stringify(payload),
+    body: JSON.stringify(request),
   })
 }
 
@@ -106,8 +110,11 @@ export function updateOrderStatus(productId: number, status: string) {
 }
 
 export function postMaterialIssues(productIds: number[], initiatedBy: string, sourceWarehouseRef?: string) {
-  const body: Record<string, unknown> = { product_ids: productIds, initiated_by: initiatedBy }
-  if (sourceWarehouseRef) body.source_warehouse_ref1c = sourceWarehouseRef
+  const body: ApiSchemas['MaterialIssueCreatePayload'] = {
+    product_ids: productIds,
+    initiated_by: initiatedBy,
+    ...(sourceWarehouseRef ? { source_warehouse_ref1c: sourceWarehouseRef } : {}),
+  }
   return api<MaterialIssueCreateResponse>('/v1/production-control/material-issues', {
     method: 'POST',
     body: JSON.stringify(body),
@@ -122,9 +129,14 @@ export function fetchRouteSheetsPrintHtml(productIds: number[]): Promise<string>
 }
 
 export function exportMaterialIssuesTo1C(issueIds: number[]) {
+  const payload: ApiSchemas['ExportMaterialIssuesPayload'] = {
+    issue_ids: issueIds,
+    dry_run: false,
+    allow_production: true,
+  }
   return api<Record<string, unknown>>('/v1/production-control/material-issues/export-to-1c', {
     method: 'POST',
-    body: JSON.stringify({ issue_ids: issueIds, dry_run: false, allow_production: true }),
+    body: JSON.stringify(payload),
   })
 }
 
@@ -154,37 +166,55 @@ export function syncPostedTransfers() {
 }
 
 export function closePaintWeldChain(payload: PaintWeldChainCloseRequest) {
+  const request: ApiSchemas['ChainClosePayload'] = {
+    allow_production: false,
+    ...payload,
+  }
   return api<PaintWeldChainResult>('/v1/paint-weld/chain/close', {
     method: 'POST',
-    body: JSON.stringify(payload),
+    body: JSON.stringify(request),
   })
 }
 
 export function updateOrderQuantity(productId: number, quantity: number) {
+  const payload: ApiSchemas['UpdateQuantityPayload'] = { quantity }
   return api<OrderQuantityUpdateResult>(`/v1/production-control/orders/${productId}/quantity`, {
     method: 'PATCH',
-    body: JSON.stringify({ quantity }),
+    body: JSON.stringify(payload),
   })
 }
 
 export function produceOrder(productId: number, payload: ProduceOrderRequest) {
+  const request: ApiSchemas['ProduceLinePayload'] = payload
   return api<Record<string, unknown>>(`/v1/production-control/orders/${productId}/produce`, {
+    method: 'POST',
+    body: JSON.stringify(request),
+  })
+}
+
+export function exportManufacturesTo1C(manufactureIds: number[], dryRun: boolean, allowProduction: boolean) {
+  const payload: ApiSchemas['ExportManufacturesPayload'] = {
+    manufacture_ids: manufactureIds,
+    dry_run: dryRun,
+    allow_production: allowProduction,
+  }
+  return api<Record<string, unknown>>('/v1/production-control/manufactures/export-to-1c', {
     method: 'POST',
     body: JSON.stringify(payload),
   })
 }
 
-export function exportManufacturesTo1C(manufactureIds: number[], dryRun: boolean, allowProduction: boolean) {
-  return api<Record<string, unknown>>('/v1/production-control/manufactures/export-to-1c', {
-    method: 'POST',
-    body: JSON.stringify({ manufacture_ids: manufactureIds, dry_run: dryRun, allow_production: allowProduction }),
-  })
-}
-
 export function exportManufacturesPieceworkTo1C(manufactureIds: number[]) {
+  const payload: ApiSchemas['ExportPieceworkPayload'] = {
+    manufacture_ids: manufactureIds,
+    dry_run: false,
+    allow_production: true,
+    price: 0,
+    time_norm: 0,
+  }
   return api<Record<string, unknown>>('/v1/production-control/manufactures/export-piecework-to-1c', {
     method: 'POST',
-    body: JSON.stringify({ manufacture_ids: manufactureIds, dry_run: false, allow_production: true }),
+    body: JSON.stringify(payload),
   })
 }
 
@@ -193,9 +223,13 @@ export function rollbackManufactureLocal(manufactureId: number) {
 }
 
 export function createOrdersFromMrpRequirements(requirementIds: number[], initiatedBy: string) {
+  const payload: ApiSchemas['OrdersFromMrpRequirementsPayload'] = {
+    requirement_ids: requirementIds,
+    initiated_by: initiatedBy,
+  }
   return api<Record<string, unknown>>('/v1/production-control/orders/from-mrp-requirements', {
     method: 'POST',
-    body: JSON.stringify({ requirement_ids: requirementIds, initiated_by: initiatedBy }),
+    body: JSON.stringify(payload),
   })
 }
 
