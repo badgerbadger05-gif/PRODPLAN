@@ -570,12 +570,16 @@ def _chain_export_parent_orders(
         .all()
     )
     mrp_order_ids = [int(row.order_id) for row in parent_rows if str(row.source or "").lower() != "dbr"]
-    dbr_signal_ids = [
-        int(row.source_dbr_signal_id)
-        for row in parent_rows
-        if str(row.source or "").lower() == "dbr" and row.source_dbr_signal_id is not None
-    ]
-    if not mrp_order_ids and not dbr_signal_ids:
+    dbr_order_ids = [int(row.order_id) for row in parent_rows if str(row.source or "").lower() == "dbr"]
+    if dbr_order_ids:
+        # A material-issue export must never resurrect DBR's retired live
+        # materializer as an implicit side effect.  The DBR order needs an
+        # immutable-Ledger-authorized 1C reference before this chain may run.
+        raise ValueError(
+            "dbr_parent_order_materialization_retired: DBR parent production order has no 1C reference "
+            "(" + ", ".join(str(value) for value in sorted(dbr_order_ids)) + ")"
+        )
+    if not mrp_order_ids:
         return None
     mrp_summary = (
         export_production_orders_to_1c(
@@ -587,32 +591,15 @@ def _chain_export_parent_orders(
         if mrp_order_ids
         else {}
     )
-    dbr_results: List[Dict[str, Any]] = []
-    if dbr_signal_ids:
-        # Local import avoids a module cycle: DBR materialization reuses the
-        # production-order payload primitives imported by this module.
-        from .dbr.materialize_service import launch_signal
-
-        for signal_id in dbr_signal_ids:
-            dbr_results.append(
-                launch_signal(
-                    db,
-                    signal_id,
-                    dry_run=dry_run,
-                    allow_production=allow_production,
-                )
-            )
-    dbr_created = sum(bool(row.get("created")) for row in dbr_results)
-    dbr_existing = sum(bool(row.get("already_launched")) for row in dbr_results)
     return {
         **mrp_summary,
         "status": str(mrp_summary.get("status") or "ok"),
         "dry_run": bool(dry_run),
-        "orders_requested": len(mrp_order_ids) + len(dbr_signal_ids),
-        "orders_created": int(mrp_summary.get("orders_created") or 0) + dbr_created,
-        "orders_already_linked": int(mrp_summary.get("orders_already_linked") or 0) + dbr_existing,
+        "orders_requested": len(mrp_order_ids),
+        "orders_created": int(mrp_summary.get("orders_created") or 0),
+        "orders_already_linked": int(mrp_summary.get("orders_already_linked") or 0),
         "orders_error": int(mrp_summary.get("orders_error") or 0),
-        "dbr_entries": dbr_results,
+        "dbr_entries": [],
     }
 
 

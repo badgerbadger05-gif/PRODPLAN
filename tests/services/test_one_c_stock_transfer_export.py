@@ -5,7 +5,10 @@ import json
 from datetime import date, datetime, timezone
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
+from app.database import get_db
 from app.models import (
     DefaultSpecification,
     Item,
@@ -25,6 +28,7 @@ from app.models import (
     Unit,
 )
 from app.services import one_c_stock_transfer_export as exporter
+from app.routers.production_control import router as production_control_router
 from app.services.one_c_document_numbers import material_issue_number
 
 
@@ -394,7 +398,7 @@ def test_chain_auto_exports_parent_order_in_dry_run(db_session):
     assert result["issues_eligible"] == 0
 
 
-def test_dbr_parent_chain_threads_allow_production(db_session, monkeypatch):
+def test_dbr_parent_chain_is_retired_without_invoking_live_materializer(db_session, monkeypatch):
     db = db_session
     parent = _mk_item(db, code="TR-DBR-GUARD", ref1c="parent-dbr-guard")
     comp = _mk_item(db, code="TR-DBR-GUARD-C", ref1c="comp-dbr-guard")
@@ -403,24 +407,62 @@ def test_dbr_parent_chain_threads_allow_production(db_session, monkeypatch):
     issue.order.source = "dbr"
     issue.product.source_dbr_signal_id = 987
     db.flush()
-    calls = []
+    from app.services.dbr import materialize_service
+
+    monkeypatch.setattr(
+        materialize_service,
+        "launch_signal",
+        lambda *_args, **_kwargs: pytest.fail("DBR live materializer must not be invoked by issue export"),
+    )
+    before_links = db.query(SyncLink).count()
+
+    with pytest.raises(ValueError, match="^dbr_parent_order_materialization_retired:"):
+        exporter._chain_export_parent_orders(
+            db,
+            [issue.issue_id],
+            dry_run=False,
+            allow_production=False,
+        )
+
+    assert issue.order.order_ref1c is None
+    assert db.query(SyncLink).count() == before_links
+
+
+def test_bulk_material_issue_router_rejects_dbr_parent_without_external_side_effects(db_session, monkeypatch):
+    db = db_session
+    parent = _mk_item(db, code="TR-DBR-ROUTER", ref1c="parent-dbr-router")
+    comp = _mk_item(db, code="TR-DBR-ROUTER-C", ref1c="comp-dbr-router")
+    issue = _mk_issue(db, parent=parent, component=comp)
+    issue.order.order_ref1c = None
+    issue.order.source = "dbr"
+    issue.product.source_dbr_signal_id = 876
+    db.commit()
 
     from app.services.dbr import materialize_service
 
-    def fake_launch(_db, signal_id, *, dry_run, allow_production):
-        calls.append((signal_id, dry_run, allow_production))
-        return {"created": False, "already_launched": False}
-
-    monkeypatch.setattr(materialize_service, "launch_signal", fake_launch)
-
-    exporter._chain_export_parent_orders(
-        db,
-        [issue.issue_id],
-        dry_run=False,
-        allow_production=False,
+    monkeypatch.setattr(
+        materialize_service,
+        "launch_signal",
+        lambda *_args, **_kwargs: pytest.fail("public bulk export must not invoke DBR materializer"),
     )
+    before_links = db.query(SyncLink).count()
+    app = FastAPI()
+    app.include_router(production_control_router, prefix="/api")
 
-    assert calls == [(987, False, False)]
+    def override_get_db():
+        yield db
+
+    app.dependency_overrides[get_db] = override_get_db
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/production-control/material-issues/export-to-1c",
+            json={"issue_ids": [issue.issue_id], "dry_run": False, "allow_production": True},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"].startswith("dbr_parent_order_materialization_retired:")
+    assert issue.order.order_ref1c is None
+    assert db.query(SyncLink).count() == before_links
 
 
 def test_chain_full_apply_exports_order_then_transfer(db_session, monkeypatch):
