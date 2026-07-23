@@ -139,38 +139,19 @@ def test_processing_chain_preview_endpoint_is_read_only(client):
 
     response = client.post("/api/v1/dbr/feeder/processing/chain/preview")
 
-    assert response.status_code == 200
-    assert response.json() == {
-        "read_only": True,
-        "processing_open_signals": 0,
-        "netted_signals": 0,
-        "desired_children": 0,
-        "distinct_components": 0,
-        "parents_with_children": 0,
-        "children": [],
-        "unresolved": [],
-        "unresolved_count": 0,
-    }
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "dbr_feeder_live_read_retired"
 
 
 def test_processing_trip_manifest_endpoints_are_read_only_and_printable(client):
     response = client.get("/api/v1/dbr/feeder/processing/trip-manifest")
 
-    assert response.status_code == 200
-    assert response.json() == {
-        "read_only": True,
-        "processing_trip_interval_days": 7,
-        "signals_total": 0,
-        "contractors_total": 0,
-        "unresolved_count": 0,
-        "contractors": [],
-    }
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "dbr_feeder_live_read_retired"
 
     printable = client.get("/api/v1/dbr/feeder/processing/trip-manifest/print")
-    assert printable.status_code == 200
-    assert printable.headers["content-type"].startswith("text/html")
-    assert "Рейс на переработку" in printable.text
-    assert "window.print()" in printable.text
+    assert printable.status_code == 503
+    assert printable.json()["detail"]["operation"] == "processing_trip_manifest_print"
 
 
 def test_put_settings_persists_across_independent_request_sessions(tmp_path):

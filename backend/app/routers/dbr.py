@@ -23,21 +23,19 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from .. import models
 from ..database import get_db
 from ..services import planning_truth
 from ..services.dbr import (
     cockpit_snapshot_service,
     drum_board_snapshot,
     drum_service,
-    feeder_chain_service,
     feeder_material_service,
     feeder_position_service,
     feeder_signal_service,
     gate_service,
     materialize_service,
     processing_board_service,
-    processing_materialize_preview,
-    processing_trip_manifest,
     program_service,
     purchase_materialize_service,
     purchase_snapshot_service,
@@ -46,7 +44,6 @@ from ..services.dbr import (
 )
 from ..services.dbr.materialize_service import MaterializeConflict
 from ..services.dbr.generation import DbrProjectionUnavailable
-from ..services.dbr.processing_materialize_preview import ProcessingPreviewConflict
 
 router = APIRouter(prefix="/v1/dbr", tags=["dbr"])
 
@@ -368,14 +365,14 @@ def get_feeder_positions(
 @router.get("/feeder/positions/{position_id}")
 def get_feeder_position(
     position_id: int,
-    include_live_nfp: bool = True,
     db: Session = Depends(get_db),
 ):
-    result = feeder_position_service.get_position_view(
-        db, position_id, include_live_nfp=include_live_nfp
-    )
+    try:
+        result = cockpit_snapshot_service.get_position_snapshot(db, position_id)
+    except cockpit_snapshot_service.DbrCockpitSnapshotUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
     if result is None:
-        raise HTTPException(status_code=404, detail="supermarket position not found")
+        raise HTTPException(status_code=404, detail="position not found in current accepted DBR cockpit snapshot")
     return result
 
 
@@ -384,12 +381,20 @@ def get_feeder_position(
 # --------------------------------------------------------------------------
 
 
+def _retired_live_feeder_read(operation: str) -> None:
+    raise HTTPException(status_code=503, detail={
+        "code": "dbr_feeder_live_read_retired",
+        "consumer": cockpit_snapshot_service.CONSUMER,
+        "operation": operation,
+        "status": "unavailable",
+        "read_only": True,
+        "reason": "Live feeder calculation is retired; wait for a snapshot-native implementation",
+    })
+
+
 @router.post("/feeder/signals/preview")
 def preview_feeder_signals(db: Session = Depends(get_db)):
-    truth = planning_truth.require_accepted_truth(db, "dbr_signals_preview")
-    return feeder_signal_service.preview_signals(
-        db, ledger_generation_id=int(truth.generation_id)
-    )
+    _retired_live_feeder_read("signals_preview")
 
 
 @router.post("/feeder/signals/refresh")
@@ -436,9 +441,12 @@ def get_feeder_signals(
 
 @router.get("/feeder/signals/{signal_id}")
 def get_feeder_signal(signal_id: int, db: Session = Depends(get_db)):
-    result = feeder_signal_service.get_signal(db, signal_id)
+    try:
+        result = cockpit_snapshot_service.get_signal_snapshot(db, signal_id)
+    except cockpit_snapshot_service.DbrCockpitSnapshotUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
     if result is None:
-        raise HTTPException(status_code=404, detail="feeder signal not found")
+        raise HTTPException(status_code=404, detail="signal not found in current accepted DBR cockpit snapshot")
     return result
 
 
@@ -468,7 +476,7 @@ def get_processing_board(db: Session = Depends(get_db)):
 @router.get("/feeder/processing/trip-manifest")
 def get_processing_trip_manifest(db: Session = Depends(get_db)):
     """Read-only manifest preview grouped by toll-processing contractor."""
-    return processing_trip_manifest.build_manifest(db)
+    _retired_live_feeder_read("processing_trip_manifest")
 
 
 @router.get(
@@ -477,35 +485,25 @@ def get_processing_trip_manifest(db: Session = Depends(get_db)):
 )
 def print_processing_trip_manifest(db: Session = Depends(get_db)):
     """Simple printable HTML view of the same manifest preview."""
-    manifest = processing_trip_manifest.build_manifest(db)
-    return HTMLResponse(processing_trip_manifest.render_manifest_html(manifest))
+    _retired_live_feeder_read("processing_trip_manifest_print")
 
 
 @router.post("/feeder/chain/preview")
 def preview_feeder_chain(db: Session = Depends(get_db)):
-    try:
-        return feeder_chain_service.preview_chain_signals(db)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    _retired_live_feeder_read("chain_preview")
 
 
 @router.post("/feeder/processing/chain/preview")
 def preview_processing_feeder_chain(db: Session = Depends(get_db)):
     """Read-only chain preview limited to processing supermarket signals."""
-    try:
-        return feeder_chain_service.preview_processing_chain_signals(db)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    _retired_live_feeder_read("processing_chain_preview")
 
 
 @router.post("/feeder/chain/refresh")
 def refresh_feeder_chain(
-    db: Session = Depends(get_dbr_write_db, scope="function"),
+    db: Session = Depends(get_db),
 ):
-    try:
-        return feeder_chain_service.refresh_chain_signals(db)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    _retired_live_feeder_read("chain_refresh")
 
 
 # --------------------------------------------------------------------------
@@ -695,9 +693,26 @@ def drum_activate(
     db: Session = Depends(get_dbr_write_db, scope="function"),
 ):
     try:
+        truth = planning_truth.require_accepted_truth(db, "dbr_drum_activate")
         schedule = drum_service.activate(db, schedule_id)
+        if int(schedule.ledger_generation_id or -1) != int(truth.generation_id or -2):
+            raise ValueError("schedule Ledger generation is not current accepted planning truth")
+        drum_board_snapshot.build_drum_board_candidate_snapshot(db, int(truth.generation_id))
+        generation = db.get(models.LedgerGeneration, int(truth.generation_id))
+        if generation is None:
+            raise ValueError("accepted Ledger generation disappeared")
+        generation.capabilities = {
+            **dict(generation.capabilities or {}),
+            planning_truth.CAPABILITY_DBR_DRUM_BOARD: True,
+        }
     except LookupError:
         raise HTTPException(status_code=404, detail="schedule not found")
+    except planning_truth.PlanningTruthUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+    except drum_board_snapshot.DbrDrumBoardCandidateError as exc:
+        raise HTTPException(status_code=409, detail={
+            "code": "dbr_drum_snapshot_lineage_conflict", "reason": str(exc),
+        }) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except IntegrityError:
@@ -718,6 +733,12 @@ def drum_extend(
     db: Session = Depends(get_dbr_write_db, scope="function"),
 ):
     try:
+        schedule = db.get(models.DbrDrumSchedule, schedule_id)
+        if schedule is not None and schedule.status == "active":
+            raise HTTPException(status_code=503, detail={
+                "code": "dbr_drum_published_schedule_immutable", "read_only": True,
+                "reason": "active Ledger-published schedule is immutable; build a successor draft",
+            })
         schedule, meta = drum_service.extend(db, schedule_id, payload.program_id)
     except LookupError:
         raise HTTPException(status_code=404, detail="schedule or program not found")
@@ -773,6 +794,13 @@ def drum_move_slot(
     db: Session = Depends(get_dbr_write_db, scope="function"),
 ):
     try:
+        slot = db.get(models.DbrDrumSlot, slot_id)
+        schedule = db.get(models.DbrDrumSchedule, slot.schedule_id) if slot is not None else None
+        if schedule is not None and schedule.status == "active":
+            raise HTTPException(status_code=503, detail={
+                "code": "dbr_drum_published_schedule_immutable", "read_only": True,
+                "reason": "active Ledger-published schedule is immutable; move a draft before activation",
+            })
         return slot_service.move_slot(
             db, slot_id, payload.new_date, new_resource_id=payload.new_resource_id
         )
@@ -859,12 +887,7 @@ def feeder_processing_order_preview(
     db: Session = Depends(get_db),
 ):
     """Preview a toll-processing supplier order; this endpoint can never write to 1C."""
-    try:
-        return processing_materialize_preview.preview_processing_signal(db, signal_id)
-    except LookupError:
-        raise HTTPException(status_code=404, detail="feeder signal not found")
-    except ProcessingPreviewConflict as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
+    _retired_live_feeder_read("processing_order_preview")
 
 
 # --------------------------------------------------------------------------

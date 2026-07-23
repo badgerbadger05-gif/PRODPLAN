@@ -33,10 +33,7 @@ from app.services.dbr.purchase_candidate import (
     DbrPurchaseCandidateError,
     build_purchase_candidate_snapshot,
 )
-from app.services.dbr.drum_board_snapshot import (
-    DbrDrumBoardCandidateError,
-    build_drum_board_candidate_snapshot,
-)
+from app.services.purchase_control_snapshot import build_candidate_snapshot as build_purchase_journal_candidate
 from app.services.mrp_freeze import MRP_LEDGER_LOCK_KEY, freeze_candidate_snapshots
 from app.services.mrp_result_snapshot import build_mrp_result_candidate_snapshot
 from app.services.obligation_refresh_manifest import (
@@ -53,10 +50,10 @@ _CORE_CAPABILITIES = {
     "reservation_replay": True,
     "execution_allocations": True,
     "planning_snapshots": True,
+    "purchase_control_journal": True,
 }
 _DBR_CAPABILITY = "dbr_feeder_cockpit"
 _DBR_PURCHASE_CAPABILITY = "dbr_purchase_cockpit"
-_DBR_DRUM_CAPABILITY = "dbr_drum_board"
 
 
 class ObligationRefreshOrchestratorError(RuntimeError):
@@ -296,6 +293,7 @@ def run_obligation_refresh(
     _complete(reservation_batch, reservation_metrics)
     replay = replay_candidate_realizations(db, target_id)
     snapshots = {str(run_id): int(build_mrp_result_candidate_snapshot(db, run_id).id) for run_id in candidate_ids}
+    purchase_journal_snapshot = build_purchase_journal_candidate(db, target_id)
     target = db.get(models.LedgerGeneration, target_id)
     if target is None or str(target.status) != "building":
         raise ObligationRefreshOrchestratorError(
@@ -311,7 +309,6 @@ def run_obligation_refresh(
         **_CORE_CAPABILITIES,
         _DBR_CAPABILITY: False,
         _DBR_PURCHASE_CAPABILITY: False,
-        _DBR_DRUM_CAPABILITY: False,
     }
     dbr_configured = (
         db.get(models.DbrSettings, 1) is not None
@@ -322,8 +319,7 @@ def run_obligation_refresh(
             policy_snapshot = build_policy_candidate_snapshot(db, target_id)
             cockpit_snapshot = build_cockpit_candidate_snapshot(db, target_id)
             purchase_snapshot = build_purchase_candidate_snapshot(db, target_id)
-            drum_snapshot = build_drum_board_candidate_snapshot(db, target_id)
-        except (DbrPolicySnapshotError, DbrCockpitCandidateError, DbrPurchaseCandidateError, DbrDrumBoardCandidateError) as exc:
+        except (DbrPolicySnapshotError, DbrCockpitCandidateError, DbrPurchaseCandidateError) as exc:
             raise ObligationRefreshOrchestratorError(
                 f"configured DBR candidate build failed: {exc}"
             ) from exc
@@ -336,28 +332,18 @@ def run_obligation_refresh(
             "dbr_policy_snapshot_id": int(policy_snapshot.id),
             "dbr_cockpit_snapshot_id": int(cockpit_snapshot.id),
             "dbr_purchase_snapshot_id": int(purchase_snapshot.id),
-            "dbr_drum_ready": drum_snapshot is not None,
             "dbr_policy_hash": policy_hash,
         }
         capabilities[_DBR_CAPABILITY] = True
         capabilities[_DBR_PURCHASE_CAPABILITY] = True
-        if drum_snapshot is not None:
-            dbr_metrics["dbr_drum_snapshot_id"] = int(drum_snapshot.id)
-            capabilities[_DBR_DRUM_CAPABILITY] = True
-        else:
-            dbr_metrics["dbr_drum_unavailable_reason"] = (
-                "No active drum schedule with exact target Ledger generation and frozen run lineage"
-            )
     else:
         dbr_metrics = {
             "dbr_cockpit_ready": False,
             "dbr_purchase_ready": False,
-            "dbr_drum_ready": False,
             "dbr_unavailable_reason": (
                 "DBR settings and an exact planning_pool_by_warehouse mapping "
                 "are required"
             ),
-            "dbr_drum_unavailable_reason": "DBR policy is not configured",
         }
     snapshot_metrics = {
         "candidate_run_ids": list(candidate_ids),
@@ -366,6 +352,7 @@ def run_obligation_refresh(
         "future_supply_capture": _json_value(capture),
         "freeze_summary": _json_value(freeze),
         "replay_summary": _json_value(replay),
+        "purchase_control_journal_snapshot_id": int(purchase_journal_snapshot.id),
         **dbr_metrics,
     }
     _complete(snapshot_batch, snapshot_metrics)

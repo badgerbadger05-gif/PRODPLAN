@@ -7,6 +7,7 @@ intended for a worker or an explicit command.
 
 from __future__ import annotations
 
+from hashlib import sha256
 from typing import Any, Optional
 
 from fastapi.encoders import jsonable_encoder
@@ -111,6 +112,111 @@ def _matches(value: Any, expected: Optional[str]) -> bool:
     return expected is None or str(value or "").strip().casefold() == expected.strip().casefold()
 
 
+def _position_snapshot_id(row: dict[str, Any]) -> int:
+    """Return the immutable identifier of one captured position axis.
+
+    Older snapshots carry the legacy position ``id``.  Ledger-native cockpit
+    candidates do not persist a mutable ``DbrSupermarketPosition`` row, so
+    their stable identity is the captured item/warehouse/pool axis.
+    """
+    explicit = row.get("id")
+    if explicit is not None:
+        try:
+            value = int(explicit)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("snapshot position id is invalid") from exc
+        if value <= 0:
+            raise ValueError("snapshot position id is invalid")
+        return value
+    parts = (
+        str(row.get("item_id") or "").strip(),
+        str(row.get("warehouse_ref1c") or "").strip(),
+        str(row.get("planning_stock_pool") or "").strip(),
+    )
+    if not all(parts[:2]):
+        raise ValueError("snapshot position has no stable item/warehouse identity")
+    digest = sha256("\x1f".join(parts).encode("utf-8")).digest()
+    # Keep the route identifier exactly representable by JavaScript Number.
+    return int.from_bytes(digest[:8], "big") & ((1 << 53) - 1) or 1
+
+
+def _snapshot_positions(db: Session, cockpit: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for captured in cockpit["positions"]:
+        row = dict(captured)
+        try:
+            identifier = _position_snapshot_id(row)
+        except ValueError as exc:
+            raise _unavailable(db, reason=f"Invalid DBR cockpit position identity: {exc}") from exc
+        if identifier in seen:
+            raise _unavailable(db, reason="DBR cockpit positions have duplicate stable identifiers")
+        seen.add(identifier)
+        row["id"] = identifier
+        rows.append(row)
+    return rows
+
+
+def get_position_snapshot(db: Session, position_id: int) -> Optional[dict[str, Any]]:
+    """Read one position only from the current accepted cockpit snapshot."""
+    cockpit = read_cockpit_snapshot(db)
+    for row in _snapshot_positions(db, cockpit):
+        if int(row["id"]) == int(position_id):
+            result = dict(row)
+            result["snapshot_meta"] = dict(cockpit["meta"])
+            return result
+    return None
+
+
+def _signal_snapshot_id(row: dict[str, Any]) -> int:
+    explicit = row.get("id")
+    if explicit is not None:
+        try:
+            value = int(explicit)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("snapshot signal id is invalid") from exc
+        if value > 0:
+            return value
+    identity = str(row.get("dedup_key") or "").strip()
+    if not identity:
+        identity = "\x1f".join((
+            str(row.get("signal_type") or "").strip(),
+            str(row.get("item_id") or "").strip(),
+            str(row.get("warehouse_ref1c") or "").strip(),
+        ))
+    if not identity.strip("\x1f"):
+        raise ValueError("snapshot signal has no stable identity")
+    digest = sha256(identity.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") & ((1 << 53) - 1) or 1
+
+
+def _snapshot_signals(db: Session, cockpit: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for captured in cockpit["signals"]:
+        row = dict(captured)
+        try:
+            identifier = _signal_snapshot_id(row)
+        except ValueError as exc:
+            raise _unavailable(db, reason=f"Invalid DBR cockpit signal identity: {exc}") from exc
+        if identifier in seen:
+            raise _unavailable(db, reason="DBR cockpit signals have duplicate stable identifiers")
+        seen.add(identifier)
+        row["id"] = identifier
+        rows.append(row)
+    return rows
+
+
+def get_signal_snapshot(db: Session, signal_id: int) -> Optional[dict[str, Any]]:
+    cockpit = read_cockpit_snapshot(db)
+    for row in _snapshot_signals(db, cockpit):
+        if int(row["id"]) == int(signal_id):
+            result = dict(row)
+            result["snapshot_meta"] = dict(cockpit["meta"])
+            return result
+    return None
+
+
 def query_positions(
     db: Session,
     *,
@@ -125,7 +231,7 @@ def query_positions(
     limit: int = 1000,
     offset: int = 0,
 ) -> list[dict[str, Any]]:
-    rows = [dict(row) for row in read_cockpit_snapshot(db)["positions"]]
+    rows = _snapshot_positions(db, read_cockpit_snapshot(db))
     effective_active = True if active_only and active is None else active
     needle = (search or "").strip().casefold()
     filtered = [
@@ -161,7 +267,8 @@ def query_signals(
     limit: int = 1000,
     offset: int = 0,
 ) -> list[dict[str, Any]]:
-    rows = [dict(row) for row in read_cockpit_snapshot(db)["signals"]]
+    cockpit = read_cockpit_snapshot(db)
+    rows = _snapshot_signals(db, cockpit)
     needle = (search or "").strip().casefold()
     filtered = [
         row

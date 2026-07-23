@@ -70,6 +70,7 @@ def test_add_only_builds_real_checkpoints_and_promotes_persisted_read_snapshot(d
         "execution_allocations": True, "planning_snapshots": True,
         "dbr_feeder_cockpit": False,
         "dbr_purchase_cockpit": False,
+        "purchase_control_journal": True,
     }
     assert {"physical_import", "reservation_materialize", "reservation_replay", "snapshot_build"} == set(by_stage)
     assert all(row.status == "completed" for row in by_stage.values())

@@ -38,6 +38,7 @@ def _capabilities():
         "planning_snapshots": True,
         "dbr_feeder_cockpit": False,
         "dbr_purchase_cockpit": False,
+        "purchase_control_journal": True,
     }
 
 
@@ -54,6 +55,7 @@ def _seal_build(db, target, candidates, cutoff):
                 "future_supply_captured": True,
                 "dbr_cockpit_ready": False,
                 "dbr_purchase_ready": False,
+                "purchase_control_journal_snapshot_id": target._test_purchase_journal_snapshot_id,
             }
         db.add(models.LedgerBuildBatch(
             ledger_generation_id=target.id, stage=stage, batch_key=f"{target.id}:{stage}",
@@ -82,6 +84,31 @@ def _candidate_read_snapshots(db, target, candidates, cutoff):
         db.flush()
         # Test-only transient marker avoids widening the production contract.
         candidate._test_read_snapshot_id = snapshot.id
+    purchase_journal = models.PlanningReadSnapshot(
+        consumer="purchase_control_journal",
+        snapshot_key="journal:v1",
+        ledger_generation_id=target.id,
+        cutoff=cutoff,
+        truth_status="building",
+        reason="unpublished Ledger-native purchase journal",
+        payload={
+            "meta": {
+                "ledger_generation": target.id,
+                "ledger_generation_id": target.id,
+                "cutoff": cutoff.isoformat(),
+                "truth_status": "building",
+                "fact_source": "ledger",
+                "received_qty_status": "unavailable",
+                "read_only": True,
+            },
+            "rows": [],
+            "cards": {},
+        },
+        published_at=cutoff,
+    )
+    db.add(purchase_journal)
+    db.flush()
+    target._test_purchase_journal_snapshot_id = purchase_journal.id
 
 
 def _batch(db, count=2, add_count=0):
@@ -312,7 +339,7 @@ def test_publish_allows_refresh_and_add_together(db_session):
     assert all(row.status == "FIXED_SNAPSHOT" for row in candidates)
     assert db_session.query(models.PlanningReadSnapshot).filter_by(
         ledger_generation_id=target.id, truth_status="accepted"
-    ).count() == 2
+        ).count() == 3
 
 
 @pytest.mark.parametrize("mutation, error", [

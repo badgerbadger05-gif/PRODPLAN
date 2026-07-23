@@ -14,9 +14,13 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app import models
 from app.database import Base, get_db
 from app.models import (
     DbrAssemblyRate,
+    DbrDrumSchedule,
+    DbrDrumScheduleProgram,
+    DbrDrumSlot,
     DbrSupermarketPosition,
     DefaultSpecification,
     Item,
@@ -60,6 +64,7 @@ def db_session():
             "physical_ledger": True,
             "reservation_replay": True,
             "execution_allocations": True,
+            "planning_snapshots": True,
         },
         physical_import_batch=batch,
         algorithm_version="test/diagnostic",
@@ -223,12 +228,59 @@ def test_build_activate_board(client, seed):
     assert body["calendar_fallback"] is True
 
 
+def test_board_fails_closed_when_capability_claims_ready_but_snapshot_is_missing(client, db_session):
+    generation = db_session.query(LedgerGeneration).one()
+    generation.capabilities = {**generation.capabilities, "planning_snapshots": True, "dbr_drum_board": True}
+    db_session.commit()
+    response = client.get("/api/v1/dbr/drum/active/board")
+    assert response.status_code == 503
+    detail = response.json()["detail"]
+    assert detail["code"] == "dbr_drum_board_snapshot_unavailable"
+    assert detail["status"] == "unavailable"
+
+
+def test_successor_activation_publishes_new_immutable_board_snapshot(client, db_session, seed):
+    _first, first_id = _create_and_activate(client, seed["sled_id"])
+    first = client.get("/api/v1/dbr/drum/active/board").json()
+    run = db_session.query(PlanningRun).one()
+    resource = db_session.query(ProductionResource).filter_by(resource_name="Сборка").one()
+    item = db_session.get(Item, seed["sled_id"])
+    old_schedule = db_session.get(DbrDrumSchedule, first_id)
+    successor = DbrDrumSchedule(
+        ledger_generation_id=run.ledger_generation_id,
+        period_from=date(2026, 9, 1), period_to=date(2026, 9, 30),
+        source_program_id=old_schedule.source_program_id, status="draft", config_snapshot={},
+    )
+    db_session.add(successor); db_session.flush()
+    db_session.add(DbrDrumScheduleProgram(
+        schedule_id=successor.id, program_id=old_schedule.source_program_id,
+        source_run_id=run.run_id, ledger_generation_id=run.ledger_generation_id,
+        freeze_version=run.active_freeze_version,
+    ))
+    db_session.add(DbrDrumSlot(
+        schedule_id=successor.id, slot_date=date(2026, 9, 2), planned_date=date(2026, 9, 2),
+        resource_id=resource.resource_id, item_id=item.item_id, qty=3, source_run_id=run.run_id,
+        ledger_generation_id=run.ledger_generation_id, freeze_version=run.active_freeze_version,
+    ))
+    db_session.commit()
+    activated = client.post(f"/api/v1/dbr/drum/{successor.id}/activate")
+    assert activated.status_code == 200, activated.text
+    current = client.get("/api/v1/dbr/drum/active/board").json()
+    assert current["schedule"]["id"] == successor.id
+    assert current["meta"]["snapshot_id"] != first["meta"]["snapshot_id"]
+    snapshots = db_session.query(models.PlanningReadSnapshot).filter_by(
+        consumer="dbr_drum_board",
+    ).order_by(models.PlanningReadSnapshot.id).all()
+    assert len(snapshots) == 2
+    assert snapshots[0].payload["schedule"]["id"] == first_id
+    assert snapshots[1].payload["schedule"]["id"] == successor.id
+
+
 def test_refresh_gate_endpoint(client, seed):
     _, schedule_id = _create_and_activate(client, seed["sled_id"])
     resp = client.post(f"/api/v1/dbr/drum/{schedule_id}/refresh-gate")
-    assert resp.status_code == 200
-    body = resp.json()
-    assert set(body) >= {"updated", "green", "yellow", "red", "notes"}
+    assert resp.status_code == 503
+    assert resp.json()["detail"]["code"] == "dbr_drum_legacy_mutation_retired"
 
 
 def test_refresh_gate_rejects_missing_required_warehouse_role(client, seed):
@@ -239,8 +291,8 @@ def test_refresh_gate_rejects_missing_required_warehouse_role(client, seed):
 
     response = client.post(f"/api/v1/dbr/drum/{schedule_id}/refresh-gate")
 
-    assert response.status_code == 400
-    assert "склад №3 (W3)" in response.json()["detail"]
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "dbr_drum_legacy_mutation_retired"
 
 
 def test_move_slot(client, seed):
@@ -248,8 +300,8 @@ def test_move_slot(client, seed):
     slots = client.get("/api/v1/dbr/drum/active/board").json()["slots"]
     slot_id = slots[0]["id"]
     resp = client.post(f"/api/v1/dbr/drum/slots/{slot_id}/move", json={"new_date": "2026-08-10"})
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["moved"] is True
+    assert resp.status_code == 503, resp.text
+    assert resp.json()["detail"]["code"] == "dbr_drum_published_schedule_immutable"
 
 
 def test_move_slot_rejects_resource_not_assigned_to_sku(client, seed):
@@ -264,8 +316,8 @@ def test_move_slot_rejects_resource_not_assigned_to_sku(client, seed):
         },
     )
 
-    assert response.status_code == 400
-    assert "не назначено" in response.json()["detail"]
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "dbr_drum_published_schedule_immutable"
     unchanged = client.get("/api/v1/dbr/drum/active/board").json()["slots"][0]
     assert unchanged["resource_id"] == slot["resource_id"]
 
@@ -284,8 +336,8 @@ def test_release_requires_green_slot(client, seed):
 def test_roll_forward_endpoint(client, seed):
     _, schedule_id = _create_and_activate(client, seed["sled_id"])
     resp = client.post(f"/api/v1/dbr/drum/{schedule_id}/roll-forward")
-    assert resp.status_code == 200
-    assert "moved" in resp.json()
+    assert resp.status_code == 503
+    assert resp.json()["detail"]["code"] == "dbr_drum_legacy_mutation_retired"
 
 
 def test_feeder_positions_preview_rebuild_and_list(client, db_session, seed):
@@ -345,13 +397,11 @@ def test_feeder_positions_preview_rebuild_and_list(client, db_session, seed):
     assert live_list.status_code == 503, live_list.text
     position_id = db_session.query(DbrSupermarketPosition.id).scalar()
 
-    # The single-position detail endpoint is not one of the four page-mount
-    # reads and retains its explicit live diagnostic behavior for now.
+    # Detail is the same accepted-snapshot boundary as the list; no live
+    # diagnostic bypass remains.
     detail = client.get(f"/api/v1/dbr/feeder/positions/{position_id}")
-    assert detail.status_code == 200
-    assert detail.json()["live_nfp"]["formula"] == (
-        "stock_qty + open_supply_qty - qualified_demand_qty"
-    )
+    assert detail.status_code == 503
+    assert detail.json()["detail"]["code"] == "dbr_cockpit_snapshot_unavailable"
     db_session.expire_all()
     after = [
         (row.id, row.updated_at, row.is_active, row.is_stale)
@@ -373,7 +423,9 @@ def test_feeder_signal_preview_and_refresh_routes(client, monkeypatch):
         "refresh_signals",
         lambda db, expected, **kwargs: {"schedule_id": expected, "created": 1, "rows": []},
     )
-    assert client.post("/api/v1/dbr/feeder/signals/preview").json()["actionable"] == 1
+    preview = client.post("/api/v1/dbr/feeder/signals/preview")
+    assert preview.status_code == 503
+    assert preview.json()["detail"]["code"] == "dbr_feeder_live_read_retired"
     response = client.post(
         "/api/v1/dbr/feeder/signals/refresh", json={"expected_schedule_id": 7}
     )
@@ -393,4 +445,5 @@ def test_feeder_signal_refresh_schedule_conflict_is_409(client, monkeypatch):
 
 def test_feeder_signal_detail_not_found(client):
     response = client.get("/api/v1/dbr/feeder/signals/999999")
-    assert response.status_code == 404
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "dbr_cockpit_snapshot_unavailable"

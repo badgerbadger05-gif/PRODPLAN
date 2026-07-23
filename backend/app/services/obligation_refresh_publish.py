@@ -50,11 +50,8 @@ _DBR_COCKPIT_CONSUMER = "dbr_feeder_cockpit"
 _DBR_COCKPIT_KEY = "cockpit:v1"
 _DBR_PURCHASE_CONSUMER = "dbr_purchase_cockpit"
 _DBR_PURCHASE_KEY = "purchase:v1"
-_DBR_DRUM_CONSUMER = "dbr_drum_board"
-_DBR_DRUM_KEY = "board:v1"
 _DBR_CAPABILITY = "dbr_feeder_cockpit"
 _DBR_PURCHASE_CAPABILITY = "dbr_purchase_cockpit"
-_DBR_DRUM_CAPABILITY = "dbr_drum_board"
 _MRP_ROW_KINDS = frozenset({"production", "purchase", "rework", "capacity"})
 _REQUIRED_PUBLISHED_CAPABILITIES = frozenset({
     "physical_ledger",
@@ -461,20 +458,18 @@ def _require_candidate_dbr_snapshots(
     truth_status: str,
     accepted_at: datetime | None,
 ) -> list[models.PlanningReadSnapshot]:
-    """Validate DBR policy/feeder/purchase plus an optional exact drum board."""
+    """Validate the DBR policy/feeder/purchase trio all-or-nothing."""
     rows = _lock(db.query(models.PlanningReadSnapshot)).filter(
         models.PlanningReadSnapshot.ledger_generation_id == int(target.id),
         models.PlanningReadSnapshot.consumer.in_(
-            (_DBR_POLICY_CONSUMER, _DBR_COCKPIT_CONSUMER, _DBR_PURCHASE_CONSUMER, _DBR_DRUM_CONSUMER)
+            (_DBR_POLICY_CONSUMER, _DBR_COCKPIT_CONSUMER, _DBR_PURCHASE_CONSUMER)
         ),
     ).all()
     feeder_enabled = capabilities.get(_DBR_CAPABILITY) is True
     purchase_enabled = capabilities.get(_DBR_PURCHASE_CAPABILITY) is True
-    drum_enabled = capabilities.get(_DBR_DRUM_CAPABILITY) is True
     if not feeder_enabled and not purchase_enabled:
         if (snapshot_metrics.get("dbr_cockpit_ready") is not False
-                or snapshot_metrics.get("dbr_purchase_ready") is not False
-                or snapshot_metrics.get("dbr_drum_ready") is not False):
+                or snapshot_metrics.get("dbr_purchase_ready") is not False):
             raise ObligationRefreshPublishError(
                 "snapshot_build lacks explicit DBR readiness"
             )
@@ -492,8 +487,6 @@ def _require_candidate_dbr_snapshots(
         raise ObligationRefreshPublishError(
             "DBR capability conflicts with snapshot readiness"
         )
-    if snapshot_metrics.get("dbr_drum_ready") is not drum_enabled:
-        raise ObligationRefreshPublishError("DBR drum capability conflicts with snapshot readiness")
     try:
         policy_id = int(snapshot_metrics["dbr_policy_snapshot_id"])
         cockpit_id = int(snapshot_metrics["dbr_cockpit_snapshot_id"])
@@ -502,13 +495,7 @@ def _require_candidate_dbr_snapshots(
         raise ObligationRefreshPublishError(
             "snapshot_build DBR snapshot identities are malformed"
         ) from exc
-    drum_id = None
-    if drum_enabled:
-        try:
-            drum_id = int(snapshot_metrics["dbr_drum_snapshot_id"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ObligationRefreshPublishError("snapshot_build DBR drum snapshot identity is malformed") from exc
-    expected_ids = {policy_id, cockpit_id, purchase_id} | ({drum_id} if drum_id is not None else set())
+    expected_ids = {policy_id, cockpit_id, purchase_id}
     by_id = {int(row.id): row for row in rows}
     if set(by_id) != expected_ids or len(expected_ids) != len(by_id):
         raise ObligationRefreshPublishError(
@@ -517,7 +504,6 @@ def _require_candidate_dbr_snapshots(
     policy = by_id[policy_id]
     cockpit = by_id[cockpit_id]
     purchase = by_id[purchase_id]
-    drum = by_id[drum_id] if drum_id is not None else None
     expected_cutoff = _utc(target.cutoff, "target cutoff")
     if (
         policy.consumer != _DBR_POLICY_CONSUMER
@@ -526,21 +512,18 @@ def _require_candidate_dbr_snapshots(
         or cockpit.snapshot_key != _DBR_COCKPIT_KEY
         or purchase.consumer != _DBR_PURCHASE_CONSUMER
         or purchase.snapshot_key != _DBR_PURCHASE_KEY
-        or (drum is not None and (drum.consumer != _DBR_DRUM_CONSUMER or drum.snapshot_key != _DBR_DRUM_KEY))
         or str(policy.truth_status) != truth_status
         or str(cockpit.truth_status) != truth_status
         or str(purchase.truth_status) != truth_status
-        or (drum is not None and str(drum.truth_status) != truth_status)
         or _utc(policy.cutoff, "DBR policy cutoff") != expected_cutoff
         or _utc(cockpit.cutoff, "DBR cockpit cutoff") != expected_cutoff
         or _utc(purchase.cutoff, "DBR purchase cutoff") != expected_cutoff
-        or (drum is not None and _utc(drum.cutoff, "DBR drum cutoff") != expected_cutoff)
     ):
         raise ObligationRefreshPublishError(
             "DBR candidate snapshot lineage conflicts"
         )
     if accepted_at is None:
-        if policy.reason is None or cockpit.reason is None or purchase.reason is None or (drum is not None and drum.reason is None):
+        if policy.reason is None or cockpit.reason is None or purchase.reason is None:
             raise ObligationRefreshPublishError(
                 "unpublished DBR candidate snapshot lacks reason"
             )
@@ -548,11 +531,9 @@ def _require_candidate_dbr_snapshots(
         policy.reason is not None
         or cockpit.reason is not None
         or purchase.reason is not None
-        or (drum is not None and drum.reason is not None)
         or _utc(policy.published_at, "DBR policy published_at") != accepted_at
         or _utc(cockpit.published_at, "DBR cockpit published_at") != accepted_at
         or _utc(purchase.published_at, "DBR purchase published_at") != accepted_at
-        or (drum is not None and _utc(drum.published_at, "DBR drum published_at") != accepted_at)
     ):
         raise ObligationRefreshPublishError(
             "accepted DBR snapshot publication state conflicts"
@@ -618,18 +599,7 @@ def _require_candidate_dbr_snapshots(
             raise ObligationRefreshPublishError("DBR purchase row axis is malformed or duplicated")
         seen_reservations.update(ids)
         seen_axes.add(axis)
-    if drum is not None:
-        drum_meta = drum.payload.get("meta") if isinstance(drum.payload, dict) else None
-        if (
-            not isinstance(drum_meta, dict)
-            or int(drum_meta.get("ledger_generation") or -1) != int(target.id)
-            or int(drum_meta.get("ledger_generation_id") or -1) != int(target.id)
-            or drum_meta.get("read_only") is not True
-            or not isinstance(drum.payload.get("slots"), list)
-            or not isinstance(drum.payload.get("gaps"), list)
-        ):
-            raise ObligationRefreshPublishError("DBR drum snapshot meta conflicts")
-    return [row for row in (policy, cockpit, purchase, drum) if row is not None]
+    return [policy, cockpit, purchase]
 
 
 def _exact_retry(
@@ -668,6 +638,45 @@ def _exact_retry(
         )
     except ObligationRefreshPublishError:
         return None
+    snapshot_batch = _lock(db.query(models.LedgerBuildBatch)).filter(
+        models.LedgerBuildBatch.ledger_generation_id == int(target.id),
+        models.LedgerBuildBatch.stage == "snapshot_build",
+        models.LedgerBuildBatch.status == "completed",
+    ).one_or_none()
+    if snapshot_batch is None:
+        return None
+    try:
+        journal_id = int(dict(snapshot_batch.metrics or {})["purchase_control_journal_snapshot_id"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    journal = db.get(models.PlanningReadSnapshot, journal_id)
+    if (journal is None or journal.consumer != "purchase_control_journal" or journal.snapshot_key != "journal:v1"
+            or journal.ledger_generation_id != target.id or journal.truth_status != "accepted"
+            or journal.reason is not None
+            or _utc(journal.published_at, "purchase journal published_at") != accepted_at):
+        return None
+    journal_payload = journal.payload if isinstance(journal.payload, dict) else None
+    journal_meta = journal_payload.get("meta") if journal_payload else None
+    journal_rows = journal_payload.get("rows") if journal_payload else None
+    journal_cards = journal_payload.get("cards") if journal_payload else None
+    if (not isinstance(journal_meta, dict) or journal_meta.get("read_only") is not True
+            or journal_meta.get("fact_source") != "ledger"
+            or int(journal_meta.get("ledger_generation_id") or -1) != int(target.id)
+            or not isinstance(journal_rows, list) or not isinstance(journal_cards, dict)):
+        return None
+    seen_journal_rows: set[str] = set()
+    for row in journal_rows:
+        try:
+            key = str(row["row_key"])
+            ordered = Decimal(str(row["quantity"]))
+            open_qty = Decimal(str(row["remaining_qty"]))
+        except (KeyError, TypeError, ValueError, InvalidOperation):
+            return None
+        if (not key.startswith("ledger-supply:") or key in seen_journal_rows
+                or ordered < 0 or open_qty < 0 or open_qty > ordered
+                or row.get("received_qty") is not None):
+            return None
+        seen_journal_rows.add(key)
     by_parent = {int(old.run_id): candidate for old, candidate in refreshes}
     if len(by_parent) != len(refreshes):
         return None
@@ -690,13 +699,6 @@ def _exact_retry(
     ).first() is not None:
         return None
     candidate_ids = [int(row.run_id) for row in candidates]
-    snapshot_batch = _lock(db.query(models.LedgerBuildBatch)).filter(
-        models.LedgerBuildBatch.ledger_generation_id == int(target.id),
-        models.LedgerBuildBatch.stage == "snapshot_build",
-        models.LedgerBuildBatch.status == "completed",
-    ).one_or_none()
-    if snapshot_batch is None:
-        return None
     try:
         _require_candidate_read_snapshots(
             db,
@@ -824,6 +826,36 @@ def publish_obligation_refresh_batch(
         truth_status="building",
         accepted_at=None,
     )
+    try:
+        purchase_journal_id = int(dict(snapshot_batch.metrics or {})["purchase_control_journal_snapshot_id"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ObligationRefreshPublishError("snapshot_build lacks purchase control journal snapshot") from exc
+    candidate_purchase_journal = _lock(db.query(models.PlanningReadSnapshot)).filter(
+        models.PlanningReadSnapshot.id == purchase_journal_id,
+        models.PlanningReadSnapshot.consumer == "purchase_control_journal",
+        models.PlanningReadSnapshot.snapshot_key == "journal:v1",
+        models.PlanningReadSnapshot.ledger_generation_id == int(target.id),
+        models.PlanningReadSnapshot.truth_status == "building",
+        models.PlanningReadSnapshot.cutoff == target.cutoff,
+    ).one_or_none()
+    journal_payload = candidate_purchase_journal.payload if candidate_purchase_journal is not None else None
+    journal_meta = journal_payload.get("meta") if isinstance(journal_payload, dict) else None
+    journal_rows = journal_payload.get("rows") if isinstance(journal_payload, dict) else None
+    journal_cards = journal_payload.get("cards") if isinstance(journal_payload, dict) else None
+    if (candidate_purchase_journal is None or not isinstance(journal_meta, dict)
+            or journal_meta.get("read_only") is not True or journal_meta.get("fact_source") != "ledger"
+            or int(journal_meta.get("ledger_generation_id") or -1) != int(target.id)
+            or not isinstance(journal_rows, list) or not isinstance(journal_cards, dict)):
+        raise ObligationRefreshPublishError("purchase control journal candidate is missing or stale")
+    seen_supply_rows: set[str] = set()
+    for row in journal_rows:
+        try:
+            key, ordered, open_qty = str(row["row_key"]), Decimal(str(row["quantity"])), Decimal(str(row["remaining_qty"]))
+        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+            raise ObligationRefreshPublishError("purchase control journal row is malformed") from exc
+        if not key.startswith("ledger-supply:") or key in seen_supply_rows or ordered < 0 or open_qty < 0 or open_qty > ordered or row.get("received_qty") is not None:
+            raise ObligationRefreshPublishError("purchase control journal row violates Ledger fact contract")
+        seen_supply_rows.add(key)
     if _source_export_links_exist(db, candidate_ids):
         raise ObligationRefreshPublishError("candidate has external export links")
 
@@ -867,7 +899,7 @@ def publish_obligation_refresh_batch(
         candidate.pinned = True
         candidate.fixed_at = accepted_at
         candidate.finished_at = accepted_at
-    for snapshot in [*candidate_read_snapshots, *candidate_dbr_snapshots]:
+    for snapshot in [*candidate_read_snapshots, *candidate_dbr_snapshots, candidate_purchase_journal]:
         snapshot.truth_status = "accepted"
         snapshot.reason = None
         snapshot.published_at = accepted_at

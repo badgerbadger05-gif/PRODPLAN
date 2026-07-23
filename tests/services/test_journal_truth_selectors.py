@@ -8,6 +8,7 @@ from app import models
 from app.services.planning_truth import PlanningTruthUnavailable
 from app.services.production_control_journal import list_journal as production_journal
 from app.services.purchase_control_journal import list_journal as purchase_journal
+from app.services.purchase_control_snapshot import PurchaseJournalSnapshotUnavailable
 
 
 def _generation(db, key: str):
@@ -61,17 +62,40 @@ def test_purchase_journal_uses_only_exact_published_generation_and_fixed_plan(db
             bucket_date=date(2026, 8, 20), supplier_ref1c=supplier.supplier_ref1c,
             ledger_generation_id=run.ledger_generation_id,
         ))
+    current.capabilities = {
+        "physical_ledger": True,
+        "reservation_replay": True,
+        "planning_snapshots": True,
+        "purchase_control_journal": True,
+    }
+    db_session.add(models.PlanningReadSnapshot(
+        consumer="purchase_control_journal",
+        snapshot_key="journal:v1",
+        ledger_generation_id=current.id,
+        cutoff=current.cutoff,
+        truth_status="accepted",
+        reason=None,
+        payload={
+            "meta": {
+                "ledger_generation_id": current.id,
+                "fact_source": "ledger",
+                "read_only": True,
+            },
+            "rows": [],
+            "cards": {},
+        },
+        published_at=current.accepted_at,
+    ))
     db_session.commit()
 
     result = purchase_journal(db_session, today=date(2026, 7, 23))
-    to_order = [row for row in result["rows"] if row["line_status"] == "to_order"]
-    assert [(row["run_id"], row["quantity"] ) for row in to_order] == [(exact.run_id, 11.0)]
-    assert result["run_ids"] == [exact.run_id]
+    assert result["rows"] == []
+    assert result["run_ids"] == []
     assert result["ledger_generation_id"] == current.id
 
 
 def test_purchase_journal_is_explicitly_unavailable_without_published_pointer(db_session):
-    with pytest.raises(PlanningTruthUnavailable, match="No Item Ledger generation"):
+    with pytest.raises(PurchaseJournalSnapshotUnavailable, match="No Item Ledger generation"):
         purchase_journal(db_session)
 
 

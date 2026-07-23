@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..services.purchase_control_journal import get_order_card, list_filters, list_journal
+from ..services.purchase_control_snapshot import PurchaseJournalSnapshotUnavailable
 
 router = APIRouter(prefix="/v1/purchase-control", tags=["purchase-control"])
 
@@ -61,6 +62,8 @@ def get_orders(
             limit=limit,
             offset=offset,
         )
+    except PurchaseJournalSnapshotUnavailable as e:
+        raise HTTPException(status_code=503, detail=e.as_dict())
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -70,6 +73,8 @@ def get_order(order_id: int, db: Session = Depends(get_db)):
     """Карточка заказа поставщику со всеми строками (для detail pane)."""
     try:
         return get_order_card(db, int(order_id))
+    except PurchaseJournalSnapshotUnavailable as e:
+        raise HTTPException(status_code=503, detail=e.as_dict())
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
@@ -81,5 +86,7 @@ def get_filters(db: Session = Depends(get_db)):
     """Справочники для фильтров журнала: поставщики и состояния заказов 1С."""
     try:
         return list_filters(db)
+    except PurchaseJournalSnapshotUnavailable as e:
+        raise HTTPException(status_code=503, detail=e.as_dict())
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

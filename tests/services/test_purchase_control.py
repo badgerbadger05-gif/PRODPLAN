@@ -1,3 +1,12 @@
+"""Diagnostic contract for the retired live purchase-journal calculator.
+
+These tests deliberately exercise ``_legacy_*`` helpers so historical status,
+grouping and horizon calculations remain inspectable during migration.  They
+must never be used to bypass the public snapshot-only read boundary.  The final
+filter assertion is a public-contract test and therefore publishes a frozen
+snapshot explicitly.
+"""
+
 from datetime import date, datetime
 
 import pytest
@@ -15,9 +24,14 @@ from app.models import (
     SupplierOrderItem,
     SyncLink,
     Unit,
+    PlanningReadSnapshot,
 )
 from app.services.one_c_purchase_order_export import PURCHASE_ORDER_ENTITY
-from app.services.purchase_control_journal import get_order_card, list_filters, list_journal
+from app.services.purchase_control_journal import (
+    _legacy_get_order_card,
+    _legacy_list_journal,
+    list_filters,
+)
 
 TODAY = date(2026, 6, 11)
 
@@ -122,7 +136,7 @@ def test_list_journal_line_statuses(db_session):
     _make_line(db_session, order, item_no_date, qty=10)
     db_session.commit()
 
-    result = list_journal(db_session, today=TODAY)
+    result = _legacy_list_journal(db_session, today=TODAY)
 
     by_code = {row["item_code"]: row for row in result["rows"]}
     assert by_code["M-1"]["line_status"] == "overdue"
@@ -134,7 +148,7 @@ def test_list_journal_line_statuses(db_session):
     assert result["summary"]["overdue"] == 1
     assert result["summary"]["total_rows"] == 5
 
-    overdue_only = list_journal(db_session, line_status="overdue", today=TODAY)
+    overdue_only = _legacy_list_journal(db_session, line_status="overdue", today=TODAY)
     assert [row["item_code"] for row in overdue_only["rows"]] == ["M-1"]
     # summary считается до фильтра по line_status
     assert overdue_only["summary"]["total_rows"] == 5
@@ -150,10 +164,10 @@ def test_list_journal_active_only_excludes_closed_orders(db_session):
         _make_line(db_session, order, item, qty=5, delivery=date(2026, 6, 20))
     db_session.commit()
 
-    result = list_journal(db_session, today=TODAY)
+    result = _legacy_list_journal(db_session, today=TODAY)
     assert [row["order_number"] for row in result["rows"]] == ["ЗП-001"]
 
-    everything = list_journal(db_session, active_only=False, today=TODAY)
+    everything = _legacy_list_journal(db_session, active_only=False, today=TODAY)
     numbers = {row["order_number"] for row in everything["rows"]}
     assert numbers == {"ЗП-001", "ЗП-002"}  # deletion_mark отфильтрован и при active_only=False
     closed = [row for row in everything["rows"] if row["line_status"] == "closed"]
@@ -173,7 +187,7 @@ def test_list_journal_phase_grouping_and_active_no_goods(db_session):
         _make_line(db_session, order, item, qty=5, delivery=date(2026, 6, 20))
     db_session.commit()
 
-    result = list_journal(db_session, today=TODAY)
+    result = _legacy_list_journal(db_session, today=TODAY)
     by_number = {row["order_number"]: row for row in result["rows"]}
 
     # терминальный «Завершен» скрыт при active_only, фазовые — видны
@@ -186,7 +200,7 @@ def test_list_journal_phase_grouping_and_active_no_goods(db_session):
 
     assert result["summary"]["by_phase"] == {"no_goods": 2, "in_transit": 1, "in_stock": 1}
 
-    only_transit = list_journal(db_session, phase="in_transit", today=TODAY)
+    only_transit = _legacy_list_journal(db_session, phase="in_transit", today=TODAY)
     assert [r["order_number"] for r in only_transit["rows"]] == ["ЗП-WAY"]
     # summary считается до фильтра по фазе
     assert only_transit["summary"]["by_phase"]["no_goods"] == 2
@@ -201,7 +215,7 @@ def test_list_journal_closed_only_on_terminal_states(db_session):
         _make_line(db_session, order, item, qty=5, delivery=date(2026, 6, 20))
     db_session.commit()
 
-    everything = list_journal(db_session, active_only=False, today=TODAY)
+    everything = _legacy_list_journal(db_session, active_only=False, today=TODAY)
     by_number = {row["order_number"]: row for row in everything["rows"]}
     # «Бухгалтерия» активна (не закрыта), «Отменён» — closed
     assert by_number["ЗП-ACC"]["line_status"] != "closed"
@@ -235,7 +249,7 @@ def test_list_journal_includes_unordered_mrp_purchases(db_session):
     )
     db_session.commit()
 
-    result = list_journal(db_session, today=TODAY)
+    result = _legacy_list_journal(db_session, today=TODAY)
 
     to_order = [row for row in result["rows"] if row["line_status"] == "to_order"]
     assert len(to_order) == 1
@@ -249,7 +263,7 @@ def test_list_journal_includes_unordered_mrp_purchases(db_session):
     assert result["run_id"] == run.run_id
     assert result["summary"]["to_order"] == 1
 
-    without = list_journal(db_session, include_to_order=False, today=TODAY)
+    without = _legacy_list_journal(db_session, include_to_order=False, today=TODAY)
     assert all(r["line_status"] != "to_order" for r in without["rows"])
 
 
@@ -282,7 +296,7 @@ def test_journal_aggregates_active_runs(db_session):
     )
     db_session.commit()
 
-    result = list_journal(db_session, today=TODAY)
+    result = _legacy_list_journal(db_session, today=TODAY)
 
     to_order = [row for row in result["rows"] if row["line_status"] == "to_order"]
     assert {row["run_id"] for row in to_order} == {run_a.run_id, run_b.run_id}
@@ -323,7 +337,7 @@ def _make_horizon_runs(db):
 def test_to_order_rows_carry_horizon_and_by_period_summary(db_session):
     run_aug, run_sep = _make_horizon_runs(db_session)
 
-    result = list_journal(db_session, today=TODAY)
+    result = _legacy_list_journal(db_session, today=TODAY)
     to_order = [row for row in result["rows"] if row["line_status"] == "to_order"]
 
     by_run = {row["run_id"]: row for row in to_order}
@@ -353,7 +367,7 @@ def test_horizon_period_to_filter_restricts_to_order_rows(db_session):
     run_aug, run_sep = _make_horizon_runs(db_session)
 
     # Horizon = end of August → only the August run's to_order rows are shown.
-    filtered = list_journal(db_session, horizon_period_to=date(2026, 8, 31), today=TODAY)
+    filtered = _legacy_list_journal(db_session, horizon_period_to=date(2026, 8, 31), today=TODAY)
     to_order = [row for row in filtered["rows"] if row["line_status"] == "to_order"]
     assert {row["run_id"] for row in to_order} == {run_aug.run_id}
     assert [row["plan_period_to"] for row in to_order] == ["2026-08-31"]
@@ -365,7 +379,7 @@ def test_horizon_period_to_filter_restricts_to_order_rows(db_session):
     ]
 
     # None → both runs (current behavior).
-    full = list_journal(db_session, horizon_period_to=None, today=TODAY)
+    full = _legacy_list_journal(db_session, horizon_period_to=None, today=TODAY)
     full_to_order = [row for row in full["rows"] if row["line_status"] == "to_order"]
     assert {row["run_id"] for row in full_to_order} == {run_aug.run_id, run_sep.run_id}
 
@@ -373,7 +387,7 @@ def test_horizon_period_to_filter_restricts_to_order_rows(db_session):
 def test_full_need_visible_without_horizon_filter(db_session):
     _make_horizon_runs(db_session)
 
-    result = list_journal(db_session, today=TODAY)
+    result = _legacy_list_journal(db_session, today=TODAY)
     to_order = [row for row in result["rows"] if row["line_status"] == "to_order"]
 
     # No regression: aggregate to_order qty == sum across all active runs.
@@ -421,7 +435,7 @@ def test_list_journal_aggregates_duplicate_unordered_mrp_purchases(db_session):
     )
     db_session.commit()
 
-    result = list_journal(db_session, today=TODAY)
+    result = _legacy_list_journal(db_session, today=TODAY)
 
     assert result["total"] == 3
     assert result["summary"]["to_order"] == 3
@@ -447,7 +461,7 @@ def test_list_journal_aggregates_duplicate_unordered_mrp_purchases(db_session):
 
     top_up = _purchase(1, date(2026, 8, 31), date(2026, 8, 20))
     db_session.commit()
-    refreshed = list_journal(db_session, today=TODAY)
+    refreshed = _legacy_list_journal(db_session, today=TODAY)
     refreshed_aggregate = next(
         row
         for row in refreshed["rows"]
@@ -484,7 +498,7 @@ def test_list_journal_resolves_unit_guid_to_label(db_session):
     db_session.add(pending)
     db_session.commit()
 
-    result = list_journal(db_session, today=TODAY)
+    result = _legacy_list_journal(db_session, today=TODAY)
 
     assert {row["unit"] for row in result["rows"]} == {"шт"}
 
@@ -507,7 +521,7 @@ def test_list_journal_marks_mrp_origin_orders(db_session):
     )
     db_session.commit()
 
-    result = list_journal(db_session, today=TODAY)
+    result = _legacy_list_journal(db_session, today=TODAY)
     by_number = {row["order_number"]: row for row in result["rows"]}
     assert by_number["PO00001001"]["source"] == "mrp"
     assert by_number["ЗП-002"]["source"] == "1c"
@@ -522,31 +536,64 @@ def test_list_journal_search_pagination_and_sort(db_session):
     _make_line(db_session, order, early, qty=1, delivery=date(2026, 6, 15))
     db_session.commit()
 
-    result = list_journal(db_session, today=TODAY)
+    result = _legacy_list_journal(db_session, today=TODAY)
     assert [row["item_code"] for row in result["rows"]] == ["M-1", "M-2"]
 
-    page = list_journal(db_session, limit=1, offset=1, today=TODAY)
+    page = _legacy_list_journal(db_session, limit=1, offset=1, today=TODAY)
     assert page["total"] == 2
     assert [row["item_code"] for row in page["rows"]] == ["M-2"]
 
-    found = list_journal(db_session, search="АРТ-77", today=TODAY)
+    found = _legacy_list_journal(db_session, search="АРТ-77", today=TODAY)
     assert [row["item_code"] for row in found["rows"]] == ["M-1"]
 
 
-def test_get_order_card_and_filters(db_session):
+def test_legacy_get_order_card_and_public_snapshot_filters(db_session):
     supplier = _make_supplier(db_session, "s-ref-1", "ООО Метиз")
     order = _make_order(db_session, "ЗП-001", supplier, state="В закупку")
     item = _make_item(db_session, "M-1", "Болт М10")
     _make_line(db_session, order, item, qty=10, received=4, delivery=date(2026, 6, 20), price=12)
     db_session.commit()
 
-    card = get_order_card(db_session, order.order_id, today=TODAY)
+    card = _legacy_get_order_card(db_session, order.order_id, today=TODAY)
     assert card["order"]["order_number"] == "ЗП-001"
     assert card["order"]["supplier_name"] == "ООО Метиз"
     assert card["order"]["active"] is True
     assert len(card["lines"]) == 1
     assert card["lines"][0]["line_status"] == "partial"
 
+    generation = db_session.get(
+        LedgerGeneration,
+        db_session.info["accepted_journal_generation_id"],
+    )
+    generation.capabilities = {
+        "physical_ledger": True,
+        "reservation_replay": True,
+        "planning_snapshots": True,
+        "purchase_control_journal": True,
+    }
+    db_session.add(PlanningReadSnapshot(
+        consumer="purchase_control_journal",
+        snapshot_key="journal:v1",
+        ledger_generation_id=generation.id,
+        cutoff=generation.cutoff,
+        truth_status="accepted",
+        reason=None,
+        payload={
+            "meta": {
+                "ledger_generation_id": generation.id,
+                "fact_source": "ledger",
+                "read_only": True,
+            },
+            "rows": [{
+                "supplier_id": supplier.supplier_id,
+                "supplier_name": "ООО Метиз",
+                "order_state_name": "В закупку",
+            }],
+            "cards": {},
+        },
+        published_at=generation.accepted_at,
+    ))
+    db_session.commit()
     filters = list_filters(db_session)
     assert filters["suppliers"] == [{"supplier_id": supplier.supplier_id, "supplier_name": "ООО Метиз"}]
     assert filters["states"] == ["В закупку"]

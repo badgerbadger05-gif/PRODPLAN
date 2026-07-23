@@ -15,10 +15,14 @@ from app.routers.dbr import router as dbr_router
 from app.services import planning_truth
 from app.services.dbr import (
     cockpit_snapshot_service,
+    feeder_chain_service,
     feeder_material_service,
+    feeder_nfp_service,
     feeder_position_service,
     feeder_signal_service,
     processing_board_service,
+    processing_materialize_preview,
+    processing_trip_manifest,
     purchase_snapshot_service,
 )
 
@@ -83,18 +87,22 @@ def _accepted_generation(db, suffix: str = "one"):
     return generation
 
 
-def _publish_cockpit(db):
+def _publish_cockpit(db, *, include_position_id: bool = True):
+    position = {
+        "item_id": 501,
+        "planning_stock_pool": "main",
+        "item_code": "P-11",
+        "item_name": "Position",
+        "is_active": True,
+        "mode": "shelf",
+        "supply_type": "purchase",
+        "warehouse_ref1c": "WH",
+        "live_nfp": {"zone": "red", "nfp": 2},
+    }
+    if include_position_id:
+        position["id"] = 11
     payload = {
-        "positions": [{
-            "id": 11,
-            "item_code": "P-11",
-            "item_name": "Position",
-            "is_active": True,
-            "mode": "shelf",
-            "supply_type": "purchase",
-            "warehouse_ref1c": "WH",
-            "live_nfp": {"zone": "red", "nfp": 2},
-        }],
+        "positions": [position],
         "signals": [{
             "id": 21,
             "item_code": "S-21",
@@ -173,6 +181,120 @@ def test_mount_gets_read_snapshot_without_invoking_live_calculators(
     assert cockpit.json()["meta"]["truth_status"] == "accepted"
     assert cockpit.json()["meta"]["ledger_generation"] is not None
     assert cockpit.json()["meta"]["snapshot_id"] is not None
+
+
+def test_position_detail_reads_immutable_current_snapshot_and_ignores_live_query(
+    client, db_session, monkeypatch,
+):
+    _accepted_generation(db_session, "position-detail")
+    _publish_cockpit(db_session, include_position_id=False)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("legacy position or live NFP calculator called")
+
+    monkeypatch.setattr(feeder_position_service, "get_position_view", forbidden)
+    monkeypatch.setattr(feeder_nfp_service, "live_nfp_rows", forbidden)
+
+    listed = client.get("/api/v1/dbr/feeder/positions", params={"include_live_nfp": "true"})
+    assert listed.status_code == 200, listed.text
+    stable_id = listed.json()[0]["id"]
+    assert isinstance(stable_id, int) and stable_id > 0
+    assert stable_id <= (2**53 - 1)
+
+    detail = client.get(
+        f"/api/v1/dbr/feeder/positions/{stable_id}",
+        params={"include_live_nfp": "false"},
+    )
+    assert detail.status_code == 200, detail.text
+    payload = detail.json()
+    assert payload["id"] == stable_id
+    assert payload["item_code"] == "P-11"
+    assert payload["live_nfp"] == {"zone": "red", "nfp": 2}
+    assert payload["snapshot_meta"]["truth_status"] == "accepted"
+    assert payload["snapshot_meta"]["ledger_generation"] is not None
+    assert payload["snapshot_meta"]["snapshot_id"] is not None
+    persisted = db_session.query(models.PlanningReadSnapshot).filter(
+        models.PlanningReadSnapshot.consumer == cockpit_snapshot_service.CONSUMER,
+    ).one()
+    assert "snapshot_id" not in persisted.payload["meta"]
+    assert "id" not in persisted.payload["positions"][0]
+
+
+def test_position_detail_404_only_after_exact_snapshot_is_available(client, db_session):
+    _accepted_generation(db_session, "position-missing")
+    _publish_cockpit(db_session)
+    response = client.get("/api/v1/dbr/feeder/positions/999999")
+    assert response.status_code == 404
+    assert "current accepted DBR cockpit snapshot" in response.json()["detail"]
+
+
+def test_position_detail_snapshot_unavailable_is_structured_503(
+    client, monkeypatch,
+):
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("legacy position calculator called")
+
+    monkeypatch.setattr(feeder_position_service, "get_position_view", forbidden)
+    monkeypatch.setattr(feeder_nfp_service, "live_nfp_rows", forbidden)
+    response = client.get("/api/v1/dbr/feeder/positions/11")
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "dbr_cockpit_snapshot_unavailable"
+
+
+def test_signal_detail_reads_exact_snapshot_and_never_calls_live_service(
+    client, db_session, monkeypatch,
+):
+    _accepted_generation(db_session, "signal-detail")
+    _publish_cockpit(db_session)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("live signal service called")
+
+    monkeypatch.setattr(feeder_signal_service, "get_signal", forbidden)
+    response = client.get("/api/v1/dbr/feeder/signals/21")
+    assert response.status_code == 200, response.text
+    assert response.json()["item_code"] == "S-21"
+    assert response.json()["snapshot_meta"]["truth_status"] == "accepted"
+    missing = client.get("/api/v1/dbr/feeder/signals/999999")
+    assert missing.status_code == 404
+
+
+@pytest.mark.parametrize(("method", "path", "operation"), [
+    ("post", "/api/v1/dbr/feeder/signals/preview", "signals_preview"),
+    ("get", "/api/v1/dbr/feeder/processing/trip-manifest", "processing_trip_manifest"),
+    ("get", "/api/v1/dbr/feeder/processing/trip-manifest/print", "processing_trip_manifest_print"),
+    ("post", "/api/v1/dbr/feeder/chain/preview", "chain_preview"),
+    ("post", "/api/v1/dbr/feeder/processing/chain/preview", "processing_chain_preview"),
+    ("post", "/api/v1/dbr/feeder/chain/refresh", "chain_refresh"),
+    ("get", "/api/v1/dbr/feeder/signals/21/processing-order-preview", "processing_order_preview"),
+])
+def test_retired_live_feeder_reads_are_stable_503_without_service_calls(
+    client, db_session, monkeypatch, method, path, operation,
+):
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("retired live feeder service called")
+
+    monkeypatch.setattr(feeder_signal_service, "preview_signals", forbidden)
+    monkeypatch.setattr(feeder_chain_service, "preview_chain_signals", forbidden)
+    monkeypatch.setattr(feeder_chain_service, "preview_processing_chain_signals", forbidden)
+    monkeypatch.setattr(feeder_chain_service, "refresh_chain_signals", forbidden)
+    monkeypatch.setattr(processing_trip_manifest, "build_manifest", forbidden)
+    monkeypatch.setattr(processing_trip_manifest, "render_manifest_html", forbidden)
+    monkeypatch.setattr(processing_materialize_preview, "preview_processing_signal", forbidden)
+    before = db_session.query(models.DbrFeederSignal).count()
+
+    response = getattr(client, method)(path)
+
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"] == {
+        "code": "dbr_feeder_live_read_retired",
+        "consumer": cockpit_snapshot_service.CONSUMER,
+        "operation": operation,
+        "status": "unavailable",
+        "read_only": True,
+        "reason": "Live feeder calculation is retired; wait for a snapshot-native implementation",
+    }
+    assert db_session.query(models.DbrFeederSignal).count() == before
 
 
 def test_purchase_cockpit_reads_saved_rows_and_legacy_endpoints_are_retired(client, db_session):

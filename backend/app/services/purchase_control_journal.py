@@ -28,6 +28,7 @@ from ..models import (
     Unit,
 )
 from .planning_truth import require_accepted_truth
+from .purchase_control_snapshot import read_snapshot
 from .one_c_export_common import clean_ref1c as _clean_ref1c
 from .one_c_purchase_order_export import PURCHASE_ORDER_ENTITY
 from .supplier_order_status import (
@@ -503,7 +504,7 @@ def _to_order_by_period(to_order_rows: List[Dict[str, Any]]) -> List[Dict[str, A
     return ordered
 
 
-def list_journal(
+def _legacy_list_journal(
     db: Session,
     *,
     order_id: Optional[int] = None,
@@ -633,7 +634,7 @@ def list_journal(
     }
 
 
-def get_order_card(db: Session, order_id: int, *, today: Optional[date] = None) -> Dict[str, Any]:
+def _legacy_get_order_card(db: Session, order_id: int, *, today: Optional[date] = None) -> Dict[str, Any]:
     today = today or date.today()
     order = db.query(SupplierOrder).filter(SupplierOrder.order_id == int(order_id)).first()
     if order is None:
@@ -674,23 +675,55 @@ def get_order_card(db: Session, order_id: int, *, today: Optional[date] = None) 
 
 
 def list_filters(db: Session) -> Dict[str, Any]:
-    suppliers = [
-        {"supplier_id": int(s.supplier_id), "supplier_name": str(s.supplier_name or "")}
-        for s in (
-            db.query(Supplier)
-            .join(SupplierOrder, SupplierOrder.supplier_id == Supplier.supplier_id)
-            .filter(SupplierOrder.deletion_mark == False)  # noqa: E712
-            .distinct()
-            .order_by(Supplier.supplier_name.asc())
-            .all()
-        )
-    ]
-    state_rows = (
-        db.query(SupplierOrder.order_state_name)
-        .filter(SupplierOrder.deletion_mark == False)  # noqa: E712
-        .filter(SupplierOrder.order_state_name.isnot(None))
-        .distinct()
-        .all()
+    rows = read_snapshot(db)["rows"]
+    suppliers = sorted(
+        {
+            (int(row["supplier_id"]), str(row.get("supplier_name") or ""))
+            for row in rows if row.get("supplier_id") is not None
+        },
+        key=lambda row: (row[1].casefold(), row[0]),
     )
-    states = sorted({str(r[0]) for r in state_rows if r[0]})
+    suppliers = [{"supplier_id": supplier_id, "supplier_name": name} for supplier_id, name in suppliers]
+    states = sorted({str(row["order_state_name"]) for row in rows if row.get("order_state_name")})
     return {"suppliers": suppliers, "states": states}
+
+
+def list_journal(db: Session, **kwargs: Any) -> Dict[str, Any]:
+    """Filter only the current immutable purchase-journal snapshot."""
+    snapshot = read_snapshot(db); rows = [dict(row) for row in snapshot["rows"]]
+    order_id, supplier_id, search, line_status = (kwargs.get(k) for k in ("order_id", "supplier_id", "search", "line_status"))
+    if order_id is not None: rows = [r for r in rows if r.get("order_id") == int(order_id)]
+    if supplier_id is not None: rows = [r for r in rows if r.get("supplier_id") == int(supplier_id)]
+    if line_status: rows = [r for r in rows if r.get("line_status") == str(line_status)]
+    if kwargs.get("state"): rows = [r for r in rows if r.get("order_state_name") == str(kwargs["state"])]
+    if kwargs.get("phase"): rows = [r for r in rows if r.get("supply_phase") == str(kwargs["phase"])]
+    if kwargs.get("active_only", True): rows = [r for r in rows if float(r.get("remaining_qty") or 0) > 0]
+    if kwargs.get("date_from"): rows = [r for r in rows if r.get("delivery_date") is not None and str(r["delivery_date"]) >= str(kwargs["date_from"])]
+    if kwargs.get("date_to"): rows = [r for r in rows if r.get("delivery_date") is not None and str(r["delivery_date"]) <= str(kwargs["date_to"])]
+    if search:
+        needle = str(search).casefold(); rows = [r for r in rows if needle in " ".join(str(r.get(k) or "") for k in ("order_number","item_name","item_code","supplier_name")).casefold()]
+    sort_by = str(kwargs.get("sort_by") or "delivery_date")
+    if sort_by not in {"delivery_date", "order_date", "order_number", "item_code", "remaining_qty"}:
+        sort_by = "delivery_date"
+    reverse = str(kwargs.get("sort_dir") or "asc").casefold() == "desc"
+    rows.sort(key=lambda r: (r.get(sort_by) is None, r.get(sort_by) if r.get(sort_by) is not None else "", r.get("row_key")), reverse=reverse)
+    by_status: dict[str, int] = {}
+    by_phase: dict[str, int] = {}
+    for row in rows:
+        status = str(row.get("line_status") or "unavailable")
+        phase = str(row.get("supply_phase") or "unavailable")
+        by_status[status] = by_status.get(status, 0) + 1
+        by_phase[phase] = by_phase.get(phase, 0) + 1
+    summary = {"total_rows": len(rows), "by_status": by_status, "by_phase": by_phase,
+               "to_order": by_status.get("to_order", 0), "overdue": by_status.get("overdue", 0),
+               "expected_7d": 0, "in_transit_amount": 0.0,
+               "fact_status": "unavailable"}
+    limit, offset = max(1, min(int(kwargs.get("limit") or 100), 500)), max(0, int(kwargs.get("offset") or 0))
+    return {"rows": rows[offset:offset + limit], "total": len(rows), "limit": limit, "offset": offset,
+            "run_id": None, "run_ids": [], "truth_status": snapshot["meta"]["truth_status"], "ledger_generation_id": snapshot["meta"]["ledger_generation"], "summary": summary, "to_order_by_period": [], "meta": snapshot["meta"]}
+
+
+def get_order_card(db: Session, order_id: int, *, today: Optional[date] = None) -> Dict[str, Any]:
+    snapshot = read_snapshot(db); card = (snapshot.get("cards") or {}).get(str(int(order_id)))
+    if card is None: raise ValueError(f"Supplier order {order_id} not found in current purchase journal snapshot")
+    return {**card, "meta": snapshot["meta"]}
