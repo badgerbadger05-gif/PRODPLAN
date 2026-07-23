@@ -1,0 +1,340 @@
+"""Build, validate and atomically publish one explicit Ledger generation.
+
+No external reads happen here.  Every input is an already persisted physical
+prefix or frozen planning obligation.
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from datetime import datetime, timezone
+from decimal import Decimal
+from typing import Any
+
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+from app import models
+from app.services.planning_truth import publish_generation
+
+from .historical_obligations import (
+    ALGORITHM_VERSION as OBLIGATION_ALGORITHM_VERSION,
+    materialize_historical_obligations,
+)
+from .historical_replay_persistence import (
+    _ALGORITHM_VERSION as REPLAY_ALGORITHM_VERSION,
+    run_historical_replay,
+)
+from .physical_visibility import visible_sles_for_generation
+
+
+CAPABILITIES = {
+    "physical_ledger": True,
+    "reservation_replay": True,
+    "execution_allocations": True,
+    "planning_snapshots": True,
+}
+_SAFE_FACT_MODE = {
+    "linked_production": "make",
+    "unlinked_production": "make",
+    "component_consumption": "consume",
+}
+
+
+class GenerationValidationError(ValueError):
+    pass
+
+
+def _d(value: Any) -> Decimal:
+    return Decimal(str(value or 0))
+
+
+def _building_generation(db: Session, generation_id: int) -> models.LedgerGeneration:
+    generation = db.get(models.LedgerGeneration, int(generation_id))
+    if generation is None:
+        raise GenerationValidationError(f"LedgerGeneration {generation_id} not found")
+    if str(generation.status or "") != "building":
+        raise GenerationValidationError("generation lifecycle requires explicit BUILDING generation")
+    if generation.cutoff is None or generation.physical_import_batch_id is None:
+        raise GenerationValidationError("building generation requires cutoff and physical prefix")
+    return generation
+
+
+def materialize_generation_stock_bins(
+    db: Session, generation_id: int
+) -> dict[str, Any]:
+    """Fold the immutable visible prefix without reading SLE.active/qty_after."""
+    generation = _building_generation(db, generation_id)
+    rows = visible_sles_for_generation(db, int(generation.id))
+    grouped: dict[tuple[int, str, str, str], dict[str, Any]] = {}
+    for row in rows:
+        key = (
+            int(row.item_id),
+            str(row.characteristic_ref or ""),
+            str(row.organization_ref or ""),
+            str(row.warehouse_ref1c or ""),
+        )
+        state = grouped.setdefault(key, {"on_hand": Decimal("0"), "last_entry_id": None})
+        state["on_hand"] += _d(row.qty)
+        state["last_entry_id"] = int(row.id)
+
+    existing = {
+        (
+            int(row.item_id),
+            str(row.characteristic_ref or ""),
+            str(row.organization_ref or ""),
+            str(row.warehouse_ref1c or ""),
+        ): row
+        for row in db.query(models.StockBin).filter(
+            models.StockBin.ledger_generation_id == int(generation.id)
+        ).all()
+    }
+    for key, state in grouped.items():
+        bin_row = existing.pop(key, None)
+        if bin_row is None:
+            bin_row = models.StockBin(
+                ledger_generation_id=int(generation.id),
+                item_id=key[0],
+                characteristic_ref=key[1],
+                organization_ref=key[2],
+                warehouse_ref1c=key[3],
+            )
+            db.add(bin_row)
+        bin_row.on_hand = state["on_hand"]
+        bin_row.last_entry_id = state["last_entry_id"]
+        bin_row.reconcile_pending_qty = Decimal("0")
+    for stale in existing.values():
+        db.delete(stale)
+    db.flush()
+    return {
+        "physical_facts": len(rows),
+        "stock_bins": len(grouped),
+        "on_hand_total": str(
+            sum((state["on_hand"] for state in grouped.values()), Decimal("0"))
+        ),
+    }
+
+
+def _completed_stage(
+    db: Session, generation_id: int, stage: str
+) -> models.LedgerBuildBatch:
+    rows = (
+        db.query(models.LedgerBuildBatch)
+        .filter(
+            models.LedgerBuildBatch.ledger_generation_id == int(generation_id),
+            models.LedgerBuildBatch.stage == stage,
+        )
+        .order_by(models.LedgerBuildBatch.id.asc())
+        .all()
+    )
+    completed = [row for row in rows if str(row.status) == "completed"]
+    if len(completed) != 1 or any(str(row.status) != "completed" for row in rows):
+        raise GenerationValidationError(
+            f"generation requires one completed {stage} checkpoint and no partial checkpoint"
+        )
+    return completed[0]
+
+
+def validate_generation_build(
+    db: Session,
+    generation_id: int,
+    *,
+    explicit_empty_physical: bool = False,
+) -> dict[str, Any]:
+    """Dry, read-only validation.  Raises before truth publication on any gap."""
+    generation = _building_generation(db, generation_id)
+    physical_batch = db.get(
+        models.PhysicalImportBatch, int(generation.physical_import_batch_id)
+    )
+    if physical_batch is None or str(physical_batch.status) != "completed":
+        raise GenerationValidationError("physical import boundary is not completed")
+    if physical_batch.cutoff and physical_batch.cutoff > generation.cutoff:
+        raise GenerationValidationError("physical import boundary exceeds generation cutoff")
+    partial_physical = db.query(models.LedgerBuildBatch.id).filter(
+        models.LedgerBuildBatch.ledger_generation_id == int(generation.id),
+        models.LedgerBuildBatch.stage == "physical_import",
+        models.LedgerBuildBatch.status != "completed",
+    ).first()
+    if partial_physical:
+        raise GenerationValidationError("physical import has incomplete checkpoints")
+
+    visible = visible_sles_for_generation(db, int(generation.id))
+    empty_declared = bool(
+        explicit_empty_physical
+        or (generation.source_watermarks or {}).get("explicit_empty_prefix")
+        or (physical_batch.source_watermarks or {}).get("explicit_empty_prefix")
+    )
+    if not visible and not empty_declared:
+        raise GenerationValidationError("empty physical prefix must be explicit")
+
+    obligation_batch = _completed_stage(
+        db, int(generation.id), "reservation_materialize"
+    )
+    replay_batch = _completed_stage(db, int(generation.id), "reservation_replay")
+    obligation_metrics = dict(obligation_batch.metrics or {})
+    replay_metrics = dict(replay_batch.metrics or {})
+    if obligation_batch.algorithm_version != OBLIGATION_ALGORITHM_VERSION:
+        raise GenerationValidationError("unexpected historical obligation algorithm")
+    if replay_batch.algorithm_version != REPLAY_ALGORITHM_VERSION:
+        raise GenerationValidationError("unexpected historical replay algorithm")
+    selected_requirement_ids = {
+        int(value) for value in obligation_metrics.get("selected_requirement_ids", [])
+    }
+    entries = db.query(models.ReservationEntry).filter(
+        models.ReservationEntry.ledger_generation_id == int(generation.id)
+    ).all()
+    represented = {int(row.requirement_id) for row in entries}
+    missing = sorted(selected_requirement_ids - represented)
+    if missing:
+        raise GenerationValidationError(
+            f"selected requirements lack reservations: {missing[:10]}"
+        )
+
+    entry_by_id = {int(row.id): row for row in entries}
+    event_sums: dict[int, tuple[Decimal, Decimal]] = {
+        entry_id: (Decimal("0"), Decimal("0")) for entry_id in entry_by_id
+    }
+    events = db.query(models.ReservationEvent).filter(
+        models.ReservationEvent.ledger_generation_id == int(generation.id)
+    ).all()
+    for event in events:
+        if int(event.reservation_id) not in entry_by_id:
+            raise GenerationValidationError("reservation event escapes generation")
+        if not str(event.cycle_id or "").startswith(
+            ("historical-obligations:g", "historical-replay:g")
+        ):
+            raise GenerationValidationError("legacy reservation event entered generation build")
+        reserved, realized = event_sums[int(event.reservation_id)]
+        event_sums[int(event.reservation_id)] = (
+            reserved + _d(event.reserved_delta),
+            realized + _d(event.realized_delta),
+        )
+    realized_by_req_mode: dict[tuple[int, str], Decimal] = defaultdict(Decimal)
+    for entry in entries:
+        reserved, realized = event_sums[int(entry.id)]
+        if reserved != _d(entry.reserved_qty) or realized != _d(entry.realized_qty):
+            raise GenerationValidationError(
+                f"reservation {entry.id} cache differs from event fold"
+            )
+        realized_by_req_mode[
+            (int(entry.requirement_id), str(entry.realization_mode))
+        ] += realized
+
+    bucket_by_id = {
+        int(row.id): row
+        for row in db.query(models.MrpRequirementBucket).filter(
+            models.MrpRequirementBucket.requirement_id.in_(
+                sorted(selected_requirement_ids)
+            )
+        ).all()
+    } if selected_requirement_ids else {}
+    allocation_by_req_mode: dict[tuple[int, str], Decimal] = defaultdict(Decimal)
+    bucket_mode_qty: dict[tuple[int, str], Decimal] = defaultdict(Decimal)
+    allocations = db.query(models.MrpExecutionAllocation).filter(
+        models.MrpExecutionAllocation.ledger_generation_id == int(generation.id)
+    ).all()
+    for allocation in allocations:
+        if not str(allocation.cycle_id or "").startswith("historical-replay:g"):
+            raise GenerationValidationError("legacy execution allocation entered generation build")
+        mode = _SAFE_FACT_MODE.get(str(allocation.fact_type or ""))
+        if mode is None or str(allocation.allocation_kind or "") != "execution":
+            raise GenerationValidationError("unsafe or legacy execution allocation")
+        requirement_id = int(allocation.requirement_id)
+        if requirement_id not in selected_requirement_ids:
+            raise GenerationValidationError("execution allocation escapes selected obligations")
+        qty = _d(allocation.allocated_qty)
+        allocation_by_req_mode[(requirement_id, mode)] += qty
+        if allocation.bucket_id is not None:
+            bucket = bucket_by_id.get(int(allocation.bucket_id))
+            if bucket is None or int(bucket.requirement_id) != requirement_id:
+                raise GenerationValidationError("allocation bucket escapes requirement")
+            bucket_mode_qty[(int(bucket.id), mode)] += qty
+    if dict(allocation_by_req_mode) != {
+        key: qty for key, qty in realized_by_req_mode.items() if qty != 0
+    }:
+        raise GenerationValidationError("bucket allocation sums differ from realized events")
+    for (bucket_id, _mode), qty in bucket_mode_qty.items():
+        if qty > max(_d(bucket_by_id[bucket_id].net_qty), Decimal("0")):
+            raise GenerationValidationError("bucket allocation exceeds frozen capacity")
+
+    fact_qty = _d(replay_metrics.get("fact_qty"))
+    allocated_qty = _d(replay_metrics.get("allocated_qty"))
+    unplanned_qty = _d(replay_metrics.get("unplanned_qty"))
+    if fact_qty != allocated_qty + unplanned_qty:
+        raise GenerationValidationError("historical replay violates fact conservation")
+    if allocated_qty != sum(allocation_by_req_mode.values(), Decimal("0")):
+        raise GenerationValidationError("replay metrics disagree with persisted allocations")
+
+    expected_bins: dict[tuple[int, str, str, str], tuple[Decimal, int]] = {}
+    for row in visible:
+        key = (
+            int(row.item_id),
+            str(row.characteristic_ref or ""),
+            str(row.organization_ref or ""),
+            str(row.warehouse_ref1c or ""),
+        )
+        qty, _last = expected_bins.get(key, (Decimal("0"), int(row.id)))
+        expected_bins[key] = (qty + _d(row.qty), int(row.id))
+    bins = db.query(models.StockBin).filter(
+        models.StockBin.ledger_generation_id == int(generation.id)
+    ).all()
+    actual_bins = {
+        (
+            int(row.item_id),
+            str(row.characteristic_ref or ""),
+            str(row.organization_ref or ""),
+            str(row.warehouse_ref1c or ""),
+        ): (_d(row.on_hand), int(row.last_entry_id) if row.last_entry_id else None)
+        for row in bins
+    }
+    if actual_bins != expected_bins:
+        raise GenerationValidationError("StockBin differs from immutable physical fold")
+    bin_count = len(bins)
+    return {
+        "ledger_generation_id": int(generation.id),
+        "physical_facts": len(visible),
+        "stock_bins": bin_count,
+        "selected_requirements": len(selected_requirement_ids),
+        "reservation_entries": len(entries),
+        "reservation_events": len(events),
+        "execution_allocations": len(allocations),
+        "fact_qty": str(fact_qty),
+        "allocated_qty": str(allocated_qty),
+        "unplanned_qty": str(unplanned_qty),
+        "valid": True,
+    }
+
+
+def accept_generation_build(
+    db: Session,
+    generation_id: int,
+    *,
+    replay_from: datetime,
+    explicit_empty_physical: bool = False,
+) -> dict[str, Any]:
+    """Build all local projections and publish only after every gate succeeds."""
+    with db.begin_nested():
+        generation = _building_generation(db, generation_id)
+        physical = materialize_generation_stock_bins(db, int(generation.id))
+        obligations = materialize_historical_obligations(db, int(generation.id))
+        replay = run_historical_replay(
+            db, int(generation.id), replay_from=replay_from
+        )
+        validation = validate_generation_build(
+            db,
+            int(generation.id),
+            explicit_empty_physical=explicit_empty_physical,
+        )
+        generation.capabilities = dict(CAPABILITIES)
+        generation.status = "accepted"
+        generation.accepted_at = datetime.now(timezone.utc)
+        generation.reason = None
+        publish_generation(db, generation)
+    return {
+        **validation,
+        "status": "accepted",
+        "capabilities": dict(CAPABILITIES),
+        "physical": physical,
+        "obligations": obligations,
+        "replay": replay,
+    }

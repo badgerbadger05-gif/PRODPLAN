@@ -220,6 +220,8 @@ def publish_read_snapshot(
         select(models.PlanningReadSnapshot).where(
             models.PlanningReadSnapshot.consumer == consumer,
             models.PlanningReadSnapshot.snapshot_key == snapshot_key,
+            models.PlanningReadSnapshot.ledger_generation_id
+            == truth.generation_id,
         ),
     ).scalar_one_or_none()
     immutable_payload = dict(payload)

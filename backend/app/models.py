@@ -155,8 +155,8 @@ class PlanningReadSnapshot(Base):
     __tablename__ = "planning_read_snapshot"
     __table_args__ = (
         UniqueConstraint(
-            "consumer", "snapshot_key",
-            name="uq_planning_read_snapshot_consumer_key",
+            "consumer", "snapshot_key", "ledger_generation_id",
+            name="uq_planning_read_snapshot_consumer_key_generation",
         ),
         Index(
             "ix_planning_read_snapshot_latest",
@@ -182,6 +182,108 @@ class PlanningReadSnapshot(Base):
     published_at = Column(DateTime(timezone=True), nullable=False)
 
     ledger_generation = relationship("LedgerGeneration")
+    rows = relationship(
+        "PlanningReadRow",
+        back_populates="snapshot",
+        cascade="all, delete-orphan",
+    )
+    root_members = relationship(
+        "PlanningReadRootMember",
+        back_populates="snapshot",
+        cascade="all, delete-orphan",
+    )
+
+
+class PlanningReadRow(Base):
+    """Generic immutable row belonging to one planning read snapshot."""
+
+    __tablename__ = "planning_read_row"
+    __table_args__ = (
+        UniqueConstraint(
+            "snapshot_id", "row_key",
+            name="uq_planning_read_row_snapshot_key",
+        ),
+        Index(
+            "ix_planning_read_row_snapshot_kind",
+            "snapshot_id", "row_kind",
+        ),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    snapshot_id = Column(
+        BigInteger,
+        ForeignKey("planning_read_snapshot.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    row_key = Column(String(256), nullable=False)
+    row_kind = Column(String(64), nullable=False, server_default="")
+    item_id = Column(
+        Integer,
+        ForeignKey("items.item_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    sort_key = Column(String(256), nullable=True)
+    payload = Column(CrossPlatformJSON, nullable=False, default=dict)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+    snapshot = relationship("PlanningReadSnapshot", back_populates="rows")
+    item = relationship("Item")
+    root_members = relationship(
+        "PlanningReadRootMember",
+        back_populates="row",
+        cascade="all, delete-orphan",
+    )
+
+
+class PlanningReadRootMember(Base):
+    """Generic row-to-root membership for hierarchy and root filters."""
+
+    __tablename__ = "planning_read_root_member"
+    __table_args__ = (
+        UniqueConstraint(
+            "snapshot_id", "row_id", "root_key",
+            name="uq_planning_read_root_member",
+        ),
+        Index(
+            "ix_planning_read_root_member_snapshot_root",
+            "snapshot_id", "root_key",
+        ),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    snapshot_id = Column(
+        BigInteger,
+        ForeignKey("planning_read_snapshot.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    row_id = Column(
+        BigInteger,
+        ForeignKey("planning_read_row.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    root_key = Column(String(256), nullable=False)
+    root_item_id = Column(
+        Integer,
+        ForeignKey("items.item_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    payload = Column(CrossPlatformJSON, nullable=False, default=dict)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+    snapshot = relationship(
+        "PlanningReadSnapshot", back_populates="root_members"
+    )
+    row = relationship("PlanningReadRow", back_populates="root_members")
+    root_item = relationship("Item")
 
 
 class PlanningComparisonBatch(Base):
@@ -1120,8 +1222,16 @@ class PlanningRun(Base):
     # this run. Default-1 semantics arrive with the freeze writer (later
     # increment); nullable now so existing rows are untouched.
     active_freeze_version = Column(Integer, nullable=True)
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    ledger_cutoff = Column(DateTime(timezone=True), nullable=True)
 
     prior_run = relationship("PlanningRun", remote_side=[run_id])
+    ledger_generation = relationship("LedgerGeneration")
 
 
 class PlannedOrder(Base):
