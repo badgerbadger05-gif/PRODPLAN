@@ -328,13 +328,27 @@ describe('ProductionControlPage — characterization', () => {
     expect(await screen.findByText('Болт М8')).toBeInTheDocument()
   })
 
-  it('double-clicking a row refetches its materials with refresh=true', async () => {
+  it('double-clicking a row opens saved materials without requesting a refresh', async () => {
     const user = userEvent.setup()
     renderPage()
     await screen.findByText('Вал')
 
     await user.dblClick(rowFor('Кронштейн'))
-    await waitFor(() => expect(getOrderMaterials).toHaveBeenCalledWith(101, true))
+    await waitFor(() => expect(getOrderMaterials).toHaveBeenCalledWith(101, false))
+    expect(getOrderMaterials).not.toHaveBeenCalledWith(101, true)
+  })
+
+  it('refreshes material coverage only from the explicit action', async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findByText('Вал')
+    await waitFor(() => expect(getOrderMaterials).toHaveBeenCalledWith(101, false))
+
+    vi.mocked(getOrderMaterials).mockClear()
+    await user.click(screen.getByRole('button', { name: 'Обновить обеспечение' }))
+
+    await waitFor(() => expect(getOrderMaterials).toHaveBeenCalledTimes(1))
+    expect(getOrderMaterials).toHaveBeenCalledWith(101, true)
   })
 
   it('keeps the newest list response when an older refresh resolves last', async () => {
@@ -441,7 +455,8 @@ describe('ProductionControlPage — characterization', () => {
     expect(within(shaftRow).getByRole('checkbox', { name: 'Выбрать заказ ORD-2' })).toBeChecked()
 
     fireEvent.keyDown(shaftRow, { key: 'Enter' })
-    await waitFor(() => expect(getOrderMaterials).toHaveBeenCalledWith(102, true))
+    await waitFor(() => expect(getOrderMaterials).toHaveBeenCalledWith(102, false))
+    expect(getOrderMaterials).not.toHaveBeenCalledWith(102, true)
     expect(shaftRow).toHaveAttribute('aria-selected', 'true')
     expect(screen.getByRole('combobox', { name: 'Статус заказа ORD-2' })).toBeInTheDocument()
   })

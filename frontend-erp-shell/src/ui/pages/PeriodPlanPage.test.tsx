@@ -80,6 +80,9 @@ function makeMatrix(plan: PeriodPlan): PeriodPlanMatrix {
 const journalResponse: ExecutionJournalResponse = {
   plan: fixedPlan,
   run_id: 900,
+  truth_status: 'accepted',
+  ledger_generation: 7,
+  cutoff: '2026-05-31T23:59:59Z',
   rows: [
     {
       req_id: 1,
@@ -332,6 +335,28 @@ describe('PeriodPlanPage — detail view', () => {
     expect(vi.mocked(periodPlanSvc.getExecutionJournal).mock.calls[0][0]).toBe(123)
     // Journal-specific column header appears.
     expect(await screen.findByText('Тип')).toBeInTheDocument()
+  })
+
+  it('fails closed when execution truth is unavailable', async () => {
+    vi.mocked(periodPlanSvc.getExecutionJournal).mockResolvedValue({
+      ...journalResponse,
+      truth_status: 'uninitialized',
+      truth_reason: 'Исторические движения Ledger не загружены',
+      ledger_generation: null,
+      cutoff: null,
+    })
+    const user = userEvent.setup()
+    renderAt('/period-plan/123')
+    await screen.findByText('Насос ГА-1')
+
+    await user.click(screen.getByRole('button', { name: 'Журнал исполнения' }))
+
+    expect(await screen.findByText(/Исполнение не рассчитано\/недоступно/)).toBeInTheDocument()
+    expect(screen.getByText(/Исторические движения Ledger не загружены/)).toBeInTheDocument()
+    expect(screen.queryByText(/Общее выполнение:/)).not.toBeInTheDocument()
+    expect(screen.queryByText('20%')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Создать заказы производства' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'CSV' })).toBeDisabled()
   })
 
   it('deletes a matrix row (draft) via deleteItemFromPeriodPlan after confirm', async () => {

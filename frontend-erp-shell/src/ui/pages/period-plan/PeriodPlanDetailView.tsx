@@ -13,6 +13,7 @@ import {
   journalRowStatus,
   journalRowStatusClass,
   journalRowStatusLabel,
+  isPlanningTruthAccepted,
   periodPlanStatusClass,
   periodPlanStatusLabel,
 } from '../../../domain/planning'
@@ -589,7 +590,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   }, [journal])
 
   const journalExecutionPct = useMemo(() => {
-    if (!journal) return null
+    if (!journal || !isPlanningTruthAccepted(journal)) return null
     if (typeof journal.summary.execution_pct === 'number') return journal.summary.execution_pct
     const base = journal.rows.reduce((sum, row) => sum + (row.progress_base_qty ?? row.net_qty ?? 0), 0)
     if (base <= 1e-9) return 100
@@ -598,7 +599,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   }, [journal])
 
   const journalExecutionByFlow = useMemo(() => {
-    if (!journal) return [] as Array<{ flow: string; label: string; pct: number; base: number }>
+    if (!journal || !isPlanningTruthAccepted(journal)) return [] as Array<{ flow: string; label: string; pct: number; base: number }>
     const source = journal.summary.execution_by_flow
     if (source) {
       return ['purchase', 'production', 'rework']
@@ -627,6 +628,9 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
       })
       .filter((row) => row.base > 1e-9)
   }, [journal])
+
+  const journalTruthAccepted = isPlanningTruthAccepted(journal)
+  const journalTruthReason = journal?.truth_reason || journal?.reason
 
   const rootOptions = useMemo<RootProductOption[]>(() => (
     (matrix?.rows ?? []).map((row) => ({
@@ -1060,11 +1064,11 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
           <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
             <div className="commandBar">
               <button onClick={() => void loadJournal(journalFlow, activeRunId ?? undefined, journalRootItemId)} disabled={journalLoading}>Обновить</button>
-              <button onClick={downloadJournalCsv} disabled={!journal || journalLoading}>CSV</button>
+              <button onClick={downloadJournalCsv} disabled={!journal || !journalTruthAccepted || journalLoading}>CSV</button>
               <div className="barSeparator" />
               <button
                 onClick={() => void handleCreateProductionOrders()}
-                disabled={acting || !journal || !journal.rows.some((r) => r.flow === 'production' && r.remaining_qty > 1e-9)}
+                disabled={acting || !journal || !journalTruthAccepted || !journal.rows.some((r) => r.flow === 'production' && r.remaining_qty > 1e-9)}
                 title="Создать заказы производства для незакрытых строк производственного потока"
               >
                 Создать заказы производства
@@ -1118,6 +1122,22 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                 </>
               )}
             </div>
+
+            {journal && !journalTruthAccepted && (
+              <div
+                role="status"
+                style={{
+                  padding: '10px 12px',
+                  borderBottom: '1px solid #d6b45f',
+                  background: '#fff4cf',
+                  color: '#5f4700',
+                  fontWeight: 700,
+                }}
+              >
+                Исполнение не рассчитано/недоступно
+                {journalTruthReason ? <span style={{ fontWeight: 400 }}> — {journalTruthReason}</span> : null}
+              </div>
+            )}
 
             {journalLoading && <div className="hintLine">Загрузка журнала…</div>}
             {journalError && <div className="errorLine">{journalError}</div>}
@@ -1234,21 +1254,25 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                           >
                             {row.ordered_qty > 0 || (row.unassigned_qty ?? 0) > 0 ? qty(row.ordered_qty) : <span className="muted">—</span>}
                           </td>
-                          <td className="numCell">{row.completed_qty > 0 ? qty(row.completed_qty) : <span className="muted">—</span>}</td>
+                          <td className="numCell">{journalTruthAccepted && row.completed_qty > 0 ? qty(row.completed_qty) : <span className="muted">—</span>}</td>
                           <td className="numCell" style={{ color: row.remaining_qty > 0 ? 'var(--red)' : undefined }}>
-                            {row.remaining_qty > 0 ? qty(row.remaining_qty) : '—'}
+                            {journalTruthAccepted && row.remaining_qty > 0 ? qty(row.remaining_qty) : '—'}
                           </td>
                           <td style={{ textAlign: 'center' }}>
                             {row.need_date ? dateRu(row.need_date) : '—'}
                             <ForecastShift forecast={row} />
                           </td>
                           <td style={{ textAlign: 'center' }}>
-                            <span className={`miniPill ${journalRowStatusClass(journalRowStatus(row))}`}>
-                              {journalRowStatusLabel(journalRowStatus(row))}
-                            </span>
+                            {journalTruthAccepted
+                              ? <span className={`miniPill ${journalRowStatusClass(journalRowStatus(row))}`}>
+                                  {journalRowStatusLabel(journalRowStatus(row))}
+                                </span>
+                              : <span className="muted">Недоступно</span>}
                           </td>
                           <td style={{ textAlign: 'center' }}>
-                            <span className={`miniPill ${coverageClass(row.coverage_pct)}`}>{row.coverage_pct}%</span>
+                            {journalTruthAccepted
+                              ? <span className={`miniPill ${coverageClass(row.coverage_pct)}`}>{row.coverage_pct}%</span>
+                              : <span className="muted">—</span>}
                           </td>
                           <td style={{ textAlign: 'center' }}>
                             {row.work_items.length ? (

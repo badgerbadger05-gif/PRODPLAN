@@ -33,6 +33,16 @@ docker compose -f docker-compose.test.yml exec -T backend alembic upgrade head
 
 Python uses 4-space indentation, type hints where useful, and snake_case for modules, functions, and variables. Keep service logic in `backend/app/services`, request routing in `backend/app/routers`, and database shape changes in Alembic migrations. TypeScript/React uses 2-space indentation, PascalCase components, camelCase values, and domain types under `frontend-erp-shell/src/domain`. Prefer existing helpers and DTO shapes over ad hoc duplicates.
 
+## Planning Truth Invariant
+
+The normative contract is
+[`../repo/.docs/planning-truth-contract.md`](../repo/.docs/planning-truth-contract.md).
+Accepted Item Ledger generation is the only source of factual stock, movement,
+execution and reservation realization/coverage. Plan snapshots are obligations,
+not facts. Empty, stale or unaccepted Ledger means unavailable: the UI must not
+show zero or legacy-derived facts and must block dependent actions. Pages open
+saved backend snapshots; navigation must not trigger heavy recalculation.
+
 ## Testing Guidelines
 
 Pytest is configured by `pytest.ini` to discover `test_*.py` under `tests`, with `backend` on `pythonpath`. Add or update focused service tests for backend behavior changes, especially sync, planning, reservations, and 1C export flows. For UI changes, run `npm run build`; add Playwright coverage when behavior spans navigation or critical user workflows.

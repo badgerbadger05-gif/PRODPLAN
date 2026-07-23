@@ -306,7 +306,7 @@ export function ProductionControlPage() {
     }
   }
 
-  const loadMaterials = useCallback(async (productId: number, refresh = true) => {
+  const loadMaterials = useCallback(async (productId: number, refresh = false) => {
     const requestSeq = ++materialsRequestSeq.current
     setActiveId(productId)
     setMaterials(null)
@@ -955,7 +955,7 @@ export function ProductionControlPage() {
               }}
               onSelectIds={setSelectedIds}
               onActivate={setActiveId}
-          onOpenMaterials={(row) => void loadMaterials(row.product_id)}
+              onOpenMaterials={(row) => void loadMaterials(row.product_id, false)}
               onChangeStatus={(row, status) => void changeStatus(row, status)}
               onToggleSort={toggleSort}
             />
@@ -978,7 +978,7 @@ export function ProductionControlPage() {
               activeRow={activeRow}
               materials={materials}
               coverageLabels={coverageLabels}
-              onLoadMaterials={() => activeRow && void loadMaterials(activeRow.product_id)}
+              onLoadMaterials={() => activeRow && void loadMaterials(activeRow.product_id, true)}
               onPrint={() => activeRow && printRows([activeRow.product_id])}
               onOptimalBatchSave={(itemId, value) => saveOptimalBatch(itemId, value)}
               onQuantitySave={(productId, value) => saveOrderQuantity(productId, value)}

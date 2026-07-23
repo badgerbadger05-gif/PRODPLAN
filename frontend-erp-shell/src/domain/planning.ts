@@ -286,17 +286,28 @@ export type ExecutionJournalSummary = {
   partially_covered: number
   not_covered: number
   net_zero: number
-  execution_completed_qty?: number
-  execution_base_qty?: number
-  execution_pct?: number
-  execution_by_flow?: Record<string, { completed_qty: number; base_qty: number; execution_pct: number }>
+  execution_completed_qty?: number | null
+  execution_base_qty?: number | null
+  execution_pct?: number | null
+  execution_by_flow?: Record<string, { completed_qty: number; base_qty: number; execution_pct: number }> | null
 }
+
+export type PlanningTruthStatus = 'accepted' | 'unavailable' | 'stale' | 'uninitialized' | 'rejected'
 
 export type ExecutionJournalResponse = {
   plan: PeriodPlan
   run_id: number
   rows: ExecutionJournalRow[]
   summary: ExecutionJournalSummary
+  truth_status?: PlanningTruthStatus | string
+  ledger_generation?: string | number | null
+  cutoff?: string | null
+  truth_reason?: string | null
+  reason?: string | null
+}
+
+export function isPlanningTruthAccepted(value: Pick<ExecutionJournalResponse, 'truth_status'> | null | undefined) {
+  return value?.truth_status === 'accepted'
 }
 
 export function periodPlanStatusLabel(status: string) {

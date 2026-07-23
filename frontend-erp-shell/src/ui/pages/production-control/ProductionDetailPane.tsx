@@ -283,7 +283,7 @@ export function ProductionDetailPane({
             </div>
           )}
           <div className="detailActions">
-            <button onClick={onLoadMaterials}>Обновить материалы</button>
+            <button onClick={onLoadMaterials}>Обновить обеспечение</button>
             <button onClick={onPrint}>Печать листа</button>
           </div>
           <h3>Комплектующие</h3>
