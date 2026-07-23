@@ -113,6 +113,25 @@ def test_filter_dates_are_converted_to_naive_moscow_time():
     )
 
 
+def test_scanner_treats_naive_1c_period_as_moscow_for_aware_utc_window():
+    start = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 6, 2, tzinfo=timezone.utc)
+    row = _row(datetime(2026, 6, 1, 15, 0, 0), "rec-1", 1)  # naive Moscow from 1C
+    result = scan_historical_register_range(
+        FakeRangeClient([row]),
+        from_exclusive=start,
+        to_inclusive=end,
+        window_size=timedelta(days=1),
+    )
+
+    assert result.rows_read == 1
+    assert result.recorders[0].identity.recorder_ref == "rec-1"
+    assert (
+        result.recorders[0].first_period
+        == datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+    )
+
+
 def test_resume_starts_at_last_completed_window_and_rereads_unfinished_from_zero():
     start = datetime(2026, 1, 1)
     rows = [

@@ -18,6 +18,7 @@ from typing import Any, Mapping, Sequence
 REGISTER_RECORD_ENTITY = "AccumulationRegister_ЗапасыНаСкладах_RecordType"
 REGISTER_ORDER_BY = "Period,Recorder_Type,Recorder,LineNumber"
 REGISTER_SELECT_FIELDS = ("Period", "Recorder", "Recorder_Type", "LineNumber")
+_MOSCOW = ZoneInfo("Europe/Moscow")
 
 
 class HistoricalRegisterScanError(ValueError):
@@ -63,18 +64,32 @@ def _odata_datetime(value: datetime) -> str:
     return value.replace(tzinfo=None, microsecond=0).isoformat()
 
 
-def _strict_period(value: Any) -> datetime:
+def _strict_period(value: Any, *, range_anchor: datetime) -> datetime:
     if isinstance(value, datetime):
-        return value
-    raw = str(value or "").strip()
-    if not raw:
-        raise HistoricalRegisterScanError("register row has no Period")
-    try:
-        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
-    except (TypeError, ValueError) as exc:
-        raise HistoricalRegisterScanError(
-            f"register row has malformed Period: {raw!r}"
-        ) from exc
+        parsed = value
+    else:
+        raw = str(value or "").strip()
+        if not raw:
+            raise HistoricalRegisterScanError("register row has no Period")
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except (TypeError, ValueError) as exc:
+            raise HistoricalRegisterScanError(
+                f"register row has malformed Period: {raw!r}"
+            ) from exc
+
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        # 1C historical register returns naive datetimes for registry rows.
+        # Treat them as Europe/Moscow local values (aligned with historical read
+        # path and acceptance windows).
+        parsed = parsed.replace(tzinfo=_MOSCOW)
+    elif range_anchor.tzinfo is not None and parsed.tzinfo is not None:
+        parsed = parsed.astimezone(range_anchor.tzinfo)
+
+    if range_anchor.tzinfo is None or range_anchor.utcoffset() is None:
+        # Keep backward-compatible naive behaviour for fully naive callers.
+        return parsed.replace(tzinfo=None)
+    return parsed
 
 
 def _normalize_recorder_type(value: Any) -> str:
@@ -161,7 +176,7 @@ def _scan_window(
         pages_read += 1
 
         for row in rows:
-            period = _strict_period(row.get("Period"))
+            period = _strict_period(row.get("Period"), range_anchor=from_exclusive)
             try:
                 in_bounds = from_exclusive < period <= to_inclusive
             except TypeError as exc:
