@@ -152,7 +152,8 @@ def test_pull_assembly_signed_rows_and_bin(db_session):
     assert _f(bin1.on_hand) == 5 and _f(bin2.on_hand) == -3  # INV-fold
 
     pull = db_session.query(models.StockRecorderPull).filter_by(recorder_ref="asm-1").one()
-    assert pull.status == "done" and pull.line_count == 2 and pull.attempts == 1
+    # attempts counts FAILED attempts only — a successful pull does not bump it.
+    assert pull.status == "done" and pull.line_count == 2 and pull.attempts == 0
 
 
 def test_pull_transfer_expense_receipt(db_session):
@@ -296,7 +297,8 @@ def test_pull_empty_status(db_session):
     db_session.commit()
     assert res.status == "empty" and res.inserted == 0
     pull = db_session.query(models.StockRecorderPull).filter_by(recorder_ref="asm-empty").one()
-    assert pull.status == "empty" and pull.attempts == 1
+    # empty is a SUCCESS outcome — attempts (failed-attempt counter) stays 0.
+    assert pull.status == "empty" and pull.attempts == 0
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +359,58 @@ def test_process_pending_pulls_records_error_and_attempt_cap(db_session):
     # attempt cap: with max_attempts=1 the row (attempts==1) is no longer drained.
     results2 = process_pending_pulls(db_session, client=BoomClient(), max_attempts=1)
     assert results2 == []
+
+
+def test_attempts_counts_failures_only(db_session):
+    """Д5: attempts = number of FAILED pull attempts. Success never bumps it,
+    every error bumps it by one, and a success after failures leaves the failed
+    count untouched (status alone decides drain eligibility)."""
+    item1, _ = _setup(db_session)
+    enqueue_recorder_pull(db_session, ASSEMBLY, "asm-flap", source="x")
+    db_session.commit()
+
+    # two failing drains → attempts 1, then 2.
+    process_pending_pulls(db_session, client=BoomClient())
+    process_pending_pulls(db_session, client=BoomClient())
+    pull = db_session.query(models.StockRecorderPull).filter_by(recorder_ref="asm-flap").one()
+    assert pull.status == "error" and pull.attempts == 2
+
+    # third drain succeeds → done, attempts unchanged (no success bump).
+    ok_client = FakeODataClient({"asm-flap": [_line("1", "Receipt", "ref-item-1", "wh-1", 5)]})
+    results = process_pending_pulls(db_session, client=ok_client)
+    assert [r.status for r in results] == ["done"]
+    db_session.expire_all()
+    pull = db_session.query(models.StockRecorderPull).filter_by(recorder_ref="asm-flap").one()
+    assert pull.status == "done" and pull.attempts == 2
+
+    # a repeated direct re-pull (replace-by-recorder) also never bumps attempts.
+    pull_recorder_movements(db_session, ASSEMBLY, "asm-flap", client=ok_client)
+    db_session.commit()
+    db_session.expire_all()
+    pull = db_session.query(models.StockRecorderPull).filter_by(recorder_ref="asm-flap").one()
+    assert pull.attempts == 2
+
+
+def test_exhausted_error_not_drained_until_reenqueued(db_session):
+    """Д5: an error row at the attempt cap is skipped by the drain, and a fresh
+    enqueue (attempts reset) resurrects it into the queue."""
+    item1, _ = _setup(db_session)
+    row = enqueue_recorder_pull(db_session, ASSEMBLY, "asm-dead", source="x")
+    row.status = "error"
+    row.attempts = 5  # == DEFAULT_MAX_ATTEMPTS → exhausted
+    row.last_error = "1C down"
+    db_session.commit()
+
+    ok_client = FakeODataClient({"asm-dead": [_line("1", "Receipt", "ref-item-1", "wh-1", 3)]})
+    assert process_pending_pulls(db_session, client=ok_client) == []
+
+    # re-enqueue resets attempts → next drain pulls it successfully.
+    enqueue_recorder_pull(db_session, ASSEMBLY, "asm-dead")
+    db_session.commit()
+    results = process_pending_pulls(db_session, client=ok_client)
+    assert [r.status for r in results] == ["done"]
+    pull = db_session.query(models.StockRecorderPull).filter_by(recorder_ref="asm-dead").one()
+    assert pull.status == "done" and pull.attempts == 0
 
 
 # ---------------------------------------------------------------------------

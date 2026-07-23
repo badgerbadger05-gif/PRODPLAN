@@ -43,7 +43,32 @@ INGEST_SOURCE = "document_pull"
 EMPTY_GUID = "00000000-0000-0000-0000-000000000000"
 
 # Retry cap for process_pending_pulls (attempts beyond this are not re-tried).
+# ``attempts`` counts FAILED pull attempts only (since the last enqueue):
+# success paths (done/empty) never bump it, the error path does, and
+# enqueue_recorder_pull resets it — so the cap always means "N failures in a
+# row", never "N pulls total".
 DEFAULT_MAX_ATTEMPTS = 5
+
+
+def is_retryable_error(status: Any, attempts: Any, max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> bool:
+    """True for a failed pull that is still under the retry cap.
+
+    THE shared predicate for "this error row will be retried": used by the
+    queue drain filter (process_pending_pulls), the reconcile in-flight guard
+    (reconcile._has_inflight_pull) and the orchestrator's pull_queue_health —
+    keep them in lock-step by changing only this function.
+    """
+    return str(status) == "error" and int(attempts or 0) < int(max_attempts)
+
+
+def is_inflight_pull(status: Any, attempts: Any, max_attempts: int = DEFAULT_MAX_ATTEMPTS) -> bool:
+    """True while a queued recorder can still mutate the ledger.
+
+    in-flight = pending OR (error AND attempts < cap). Exhausted errors and
+    drained pulls (done/empty) are terminal — they will not insert movements
+    unless explicitly re-enqueued (which resets attempts).
+    """
+    return str(status) == "pending" or is_retryable_error(status, attempts, max_attempts)
 
 
 @dataclass
@@ -390,6 +415,8 @@ def pull_recorder_movements(
     result.touched_keys = list(touched.keys())
 
     # --- pull-status transition (§2.3) ---
+    # Success paths (done/empty) do NOT bump attempts: attempts counts failed
+    # pull attempts only (the error path in process_pending_pulls bumps it).
     result.status = "done" if result.inserted > 0 else "empty"
     pull_row = _upsert_pull_row(
         session,
@@ -398,7 +425,6 @@ def pull_recorder_movements(
         status=result.status,
         line_count=result.inserted,
         source=source,
-        bump_attempt=True,
         last_error=None,
     )
     # Refresh the captured header order ref on every (re-)pull; keep the last
