@@ -312,6 +312,37 @@ def test_pull_anchor_guard_skips_pre_t0(db_session):
     assert _f(bin1.on_hand) == 12  # seed 10 + kept 2
 
 
+def test_pull_recorder_respects_naive_period_for_aware_cutoff(db_session):
+    _setup(db_session)
+    client = FakeODataClient({
+        "asm-1": [
+            _line("1", "Receipt", "ref-item-1", "wh-1", 5, period="2026-07-10T14:00:00"),  # Moscow naive
+        ]
+    })
+    with pytest.raises(ValueError, match="exceeds historical cutoff"):
+        pull_recorder_movements(
+            db_session,
+            ASSEMBLY,
+            "asm-1",
+            client=client,
+            max_posting_at=datetime.datetime(
+                2026, 7, 10, 10, 0, tzinfo=datetime.timezone.utc
+            ),
+        )
+
+    pull_recorder_movements(
+        db_session,
+        ASSEMBLY,
+        "asm-1",
+        client=client,
+        max_posting_at=datetime.datetime(
+            2026, 7, 10, 12, 0, tzinfo=datetime.timezone.utc
+        ),
+    )
+    db_session.commit()
+    assert db_session.query(models.StockLedgerEntry).count() == 1
+
+
 # ---------------------------------------------------------------------------
 # pull-status transitions (§2.3)
 # ---------------------------------------------------------------------------

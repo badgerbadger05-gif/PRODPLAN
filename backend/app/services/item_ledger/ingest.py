@@ -29,6 +29,7 @@ import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from sqlalchemy import func, text
@@ -48,6 +49,7 @@ from .physical import (
 REGISTER_ENTITY = "AccumulationRegister_ЗапасыНаСкладах"
 INGEST_SOURCE = "document_pull"
 EMPTY_GUID = "00000000-0000-0000-0000-000000000000"
+_MOSCOW = ZoneInfo("Europe/Moscow")
 
 # Retry cap for process_pending_pulls (attempts beyond this are not re-tried).
 # ``attempts`` counts FAILED pull attempts only (since the last enqueue):
@@ -129,6 +131,15 @@ def _parse_period(value: Any) -> Optional[datetime]:
         except Exception:
             continue
     return None
+
+
+def _coerce_period(value: Optional[datetime]) -> Optional[datetime]:
+    """Return the Ledger's canonical naive Europe/Moscow timestamp."""
+    if value is None:
+        return None
+    if value.tzinfo is not None and value.utcoffset() is not None:
+        value = value.astimezone(_MOSCOW).replace(tzinfo=None)
+    return value
 
 
 def _movement_kind(recorder_type: str, record_type: str) -> str:
@@ -357,19 +368,16 @@ def pull_recorder_movements(
     # --- normalize (dirt filter + anchor guard) ---
     normalized: List[Tuple[LedgerKey, Decimal, str, str, datetime]] = []
     for line in lines:
-        parsed_period = _parse_period(line.get("Period"))
+        parsed_period = _coerce_period(_parse_period(line.get("Period")))
         if parsed_period is None and (strict_historical or max_posting_at is not None):
             raise HistoricalPullValidationError(
                 f"malformed Period in {recorder_type} {recorder_ref} "
                 f"line {line.get('LineNumber')}: {line.get('Period')!r}"
             )
         if parsed_period is not None and max_posting_at is not None:
-            try:
-                beyond_cutoff = parsed_period > max_posting_at
-            except TypeError as exc:
-                raise HistoricalPullValidationError(
-                    "recorder Period timezone does not match historical cutoff"
-                ) from exc
+            cutoff_period = _coerce_period(max_posting_at)
+            assert cutoff_period is not None
+            beyond_cutoff = parsed_period > cutoff_period
             if beyond_cutoff:
                 raise HistoricalPullValidationError(
                     f"recorder movement {parsed_period.isoformat()} exceeds "

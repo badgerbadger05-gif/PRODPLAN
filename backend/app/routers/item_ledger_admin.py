@@ -48,6 +48,9 @@ from ..services.item_ledger.generation_bootstrap import (
     historical_generation_status,
     resume_historical_generation_import,
 )
+from ..services.item_ledger.historical_import_orchestration import (
+    HistoricalImportError,
+)
 from ..services.item_ledger.historical_bootstrap_phase0 import (
     Phase0BootstrapError,
     evaluate_historical_balance_convergence,
@@ -309,6 +312,16 @@ def import_historical_generation(
     except (ValueError, GenerationBootstrapError) as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except HistoricalImportError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except URLError as exc:
+        db.rollback()
+        reason = getattr(exc, "reason", exc)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Historical import OData request failed: {reason}",
+        ) from exc
 
 
 @router.get("/historical-generations/{generation_id}", response_model=dict)

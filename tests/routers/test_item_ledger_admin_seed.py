@@ -12,6 +12,7 @@
 
 import pytest
 from datetime import datetime, timezone
+from urllib.error import URLError
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -21,6 +22,7 @@ from sqlalchemy.pool import StaticPool
 from app import models
 from app.database import Base, get_db
 import app.routers.item_ledger_admin as admin_mod
+from app.services.item_ledger.historical_import_orchestration import HistoricalImportError
 
 
 @pytest.fixture()
@@ -404,6 +406,48 @@ def test_historical_phase0_e2e_bootstrap_import_verify_and_accept(
         db_session.get(models.PlanningTruthState, 1).current_generation_id
         == generation_id
     )
+
+
+def test_historical_import_endpoint_returns_409_for_historical_import_error(db_session, monkeypatch):
+    def _raise_import_error(*_args, **_kwargs):
+        raise HistoricalImportError("historical import failed")
+
+    monkeypatch.setattr(
+        admin_mod,
+        "resume_historical_generation_import",
+        _raise_import_error,
+    )
+    monkeypatch.setattr(admin_mod, "_odata_client_if_configured", lambda: object())
+    client = _client(db_session)
+
+    response = client.post(
+        "/api/v1/item-ledger/admin/historical-generations/17/import",
+        json={"max_windows": 1},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "historical import failed"
+
+
+def test_historical_import_endpoint_returns_502_for_urLError(db_session, monkeypatch):
+    def _raise_urLError(*_args, **_kwargs):
+        raise URLError("network is down")
+
+    monkeypatch.setattr(
+        admin_mod,
+        "resume_historical_generation_import",
+        _raise_urLError,
+    )
+    monkeypatch.setattr(admin_mod, "_odata_client_if_configured", lambda: object())
+    client = _client(db_session)
+
+    response = client.post(
+        "/api/v1/item-ledger/admin/historical-generations/17/import",
+        json={"max_windows": 1},
+    )
+
+    assert response.status_code == 502
+    assert "network is down" in response.json()["detail"]
 
 
 def test_operator_accept_endpoint_returns_conflict_and_rolls_back(
