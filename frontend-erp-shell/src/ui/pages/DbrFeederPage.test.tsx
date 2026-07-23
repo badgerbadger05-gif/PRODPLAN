@@ -266,6 +266,23 @@ describe('DbrFeederPage characterization', () => {
     expect(getDbrFeederDeficits).toHaveBeenCalledOnce()
     expect(getDbrProcessingBoard).toHaveBeenCalledOnce()
     expect(getDbrSettings).toHaveBeenCalledOnce()
+    expect(listDbrFeederPositions).toHaveBeenCalledOnce()
+    expect(listDbrFeederSignals).toHaveBeenCalledOnce()
+
+    // Mount is a snapshot-read boundary. Calculations, projection refreshes
+    // and 1C materialization must remain explicit user actions.
+    expect(previewDbrFeederPositions).not.toHaveBeenCalled()
+    expect(rebuildDbrFeederPositions).not.toHaveBeenCalled()
+    expect(previewDbrFeederSignals).not.toHaveBeenCalled()
+    expect(refreshDbrFeederSignals).not.toHaveBeenCalled()
+    expect(previewDbrFeederChain).not.toHaveBeenCalled()
+    expect(refreshDbrFeederChain).not.toHaveBeenCalled()
+    expect(previewDbrProcessingChain).not.toHaveBeenCalled()
+    expect(previewDbrProcessingOrder).not.toHaveBeenCalled()
+    expect(getDbrProcessingTripManifest).not.toHaveBeenCalled()
+    expect(getDbrProcessingTripManifestPrint).not.toHaveBeenCalled()
+    expect(launchDbrSignal).not.toHaveBeenCalled()
+    expect(launchDbrPurchase).not.toHaveBeenCalled()
 
     const positionBar = document.querySelector('.dbrFeederBar:not(.dbrSignalFilters)') as HTMLElement
     await user.type(within(positionBar).getByPlaceholderText('Код или наименование'), 'насос')
