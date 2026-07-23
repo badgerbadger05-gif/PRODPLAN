@@ -848,10 +848,23 @@ def test_run_ledger_cycle_result_unchanged_with_reservation_block(db_session):
         "drift_matured_surplus", "drift_evap_adjust", "drift_unattributed",
         "requirements_closed", "runs_closed",
     }
-    # The quarantined diagnostic can reproduce arithmetic, but accepted Ledger
-    # generations are immutable: it must not materialize reservation side effects.
-    entry = _entry(db, req, MAKE)
-    assert entry is None
+    # The quarantined diagnostic reproduces arithmetic only in its isolated
+    # BUILDING generation; accepted Ledger truth remains immutable.
+    diagnostic = db.query(models.LedgerGeneration).filter_by(
+        generation_key="legacy-ledger-diagnostic",
+    ).one()
+    diagnostic_entry = db.query(ReservationEntry).filter_by(
+        requirement_id=req.id,
+        realization_mode=MAKE,
+        ledger_generation_id=diagnostic.id,
+    ).one_or_none()
+    assert diagnostic_entry is not None
+    accepted_id = db.get(models.PlanningTruthState, 1).current_generation_id
+    assert db.query(ReservationEntry).filter_by(
+        requirement_id=req.id,
+        realization_mode=MAKE,
+        ledger_generation_id=accepted_id,
+    ).count() == 0
 
     # shadow report is read-only and consistent
     report = reservation_shadow_report(db)

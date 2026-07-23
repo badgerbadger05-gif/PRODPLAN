@@ -37,6 +37,7 @@ from app.models import (
 )
 from app.services.item_ledger.reservation_ledger import effective_net_bin
 from app.services.mrp_execution_ledger import (
+    _ensure_legacy_diagnostic_generation,
     _ledger_scope,
     run_ledger_cycle as _public_run_ledger_cycle,
 )
@@ -94,7 +95,19 @@ def _bin(flag):
 
 
 def _generation_id(db):
-    return db.get(models.PlanningTruthState, 1).current_generation_id
+    return (
+        db.query(models.LedgerGeneration.id)
+        .filter(models.LedgerGeneration.generation_key == "legacy-ledger-diagnostic")
+        .scalar()
+    )
+
+
+def _assert_accepted_generation_untouched(db, requirement):
+    accepted_id = db.get(models.PlanningTruthState, 1).current_generation_id
+    assert db.query(ReservationEntry).filter(
+        ReservationEntry.requirement_id == requirement.id,
+        ReservationEntry.ledger_generation_id == accepted_id,
+    ).count() == 0
 
 
 def _add_sle(db, item, *, qty, movement_kind, posting_at, recorder="R-1", line="1"):
@@ -130,11 +143,14 @@ def _drift_adj(db, req):
 
 
 def _consume_entry(db, req):
+    diagnostic_id = _generation_id(db)
+    assert diagnostic_id is not None
     return (
         db.query(ReservationEntry)
         .filter(
             ReservationEntry.requirement_id == req.id,
             ReservationEntry.realization_mode == "consume",
+            ReservationEntry.ledger_generation_id == diagnostic_id,
         )
         .one_or_none()
     )
@@ -277,6 +293,7 @@ def test_bin_effective_net_equals_net_required_without_supplier_pins(db_session,
     assert effective_net_bin(
         db_session, req, ledger_generation_id=_generation_id(db_session),
     ) == float(req.net_required_qty)
+    _assert_accepted_generation_untouched(db_session, req)
 
 
 def test_bin_finding_a_supplier_order_keeps_same_closure_threshold(db_session, monkeypatch):
@@ -307,6 +324,7 @@ def test_bin_finding_a_supplier_order_keeps_same_closure_threshold(db_session, m
     # identical to the legacy closure threshold (net_required + drift, drift 0)
     legacy_eff = max(float(req.net_required_qty) + float(req.drift_adjustment_qty), 0.0)
     assert eff == legacy_eff == 10.0
+    _assert_accepted_generation_untouched(db_session, req)
 
 
 def test_bin_finding_d_evaporation_stays_single_channel_via_own_coverage(db_session, monkeypatch):
@@ -341,6 +359,7 @@ def test_bin_finding_d_evaporation_stays_single_channel_via_own_coverage(db_sess
     assert eff == 10.0                                   # single-channel: NOT 14
     # (г): the evaporation was NOT ALSO folded into drift_adjustment under bin
     assert float(req.drift_adjustment_qty) == 0.0
+    _assert_accepted_generation_untouched(db_session, req)
 
 
 def test_bin_finding_d_partial_delivery_then_cancel(db_session, monkeypatch):
@@ -352,9 +371,7 @@ def test_bin_finding_d_partial_delivery_then_cancel(db_session, monkeypatch):
     monkeypatch.setenv("STOCK_SOURCE", "bin")
     _run, item, req = _purchased_req_with_pool(db_session, "P-PINP", net=10)
     # the 1 delivered unit is now physically on hand
-    generation_id = db_session.get(
-        models.PlanningTruthState, 1,
-    ).current_generation_id
+    generation_id = _ensure_legacy_diagnostic_generation(db_session)
     db_session.add(StockBin(
         ledger_generation_id=generation_id,
         item_id=item.item_id, warehouse_ref1c="WH", on_hand=Decimal("1"),
@@ -381,6 +398,7 @@ def test_bin_finding_d_partial_delivery_then_cancel(db_session, monkeypatch):
         db_session, req, ledger_generation_id=_generation_id(db_session),
     ) == 9.0
     assert float(req.drift_adjustment_qty) == 0.0
+    _assert_accepted_generation_untouched(db_session, req)
 
 
 def _legacy_effective_net(db, req):
@@ -421,6 +439,7 @@ def test_legacy_supplier_evaporation_excluded_from_drift_matches_bin(db_session,
     assert effective_net_bin(
         db_session, req, ledger_generation_id=_generation_id(db_session),
     ) == 10.0
+    _assert_accepted_generation_untouched(db_session, req)
 
 
 def test_legacy_wip_evaporation_still_raises_effective_net(db_session, monkeypatch):

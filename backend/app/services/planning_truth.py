@@ -26,6 +26,7 @@ CAPABILITY_PLANNING_SNAPSHOTS = "planning_snapshots"
 CAPABILITY_DBR_FEEDER_COCKPIT = "dbr_feeder_cockpit"
 CAPABILITY_DBR_PURCHASE_COCKPIT = "dbr_purchase_cockpit"
 CAPABILITY_DBR_DRUM_BOARD = "dbr_drum_board"
+CAPABILITY_PURCHASE_CONTROL_JOURNAL = "purchase_control_journal"
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,12 @@ class PlanningSnapshotConflict(RuntimeError):
     """A snapshot key was reused with different immutable content."""
 
     code = "planning_snapshot_conflict"
+
+
+class PlanningTruthInvalidationConflict(RuntimeError):
+    """The requested invalidation does not match the current truth pointer."""
+
+    code = "planning_truth_invalidation_conflict"
 
 
 def get_readiness(db: Session) -> PlanningTruthReadiness:
@@ -194,6 +201,71 @@ def publish_generation(
     db.flush()
     # A long-lived worker session may already have resolved the relationship to
     # the previous generation. Force the readiness read to follow the new FK.
+    db.expire(pointer, ["current_generation"])
+    return get_readiness(db)
+
+
+def invalidate_current_generation(
+    db: Session,
+    *,
+    expected_generation_id: int,
+    status: str,
+    reason: str,
+) -> PlanningTruthReadiness:
+    """Fail-close the current accepted generation without moving its pointer.
+
+    The caller owns the surrounding transaction.  An exact repeat is
+    idempotent; changing status or reason after invalidation is a conflict.
+    Keeping the pointer on the invalid generation prevents accidental fallback
+    to an older accepted generation while a replacement is being built.
+    """
+    target_status = str(status or "").strip().casefold()
+    if target_status not in {"stale", "rejected"}:
+        raise ValueError("invalidation status must be stale or rejected")
+    normalized_reason = str(reason or "").strip()
+    if not normalized_reason:
+        raise ValueError("invalidation reason must be nonblank")
+    try:
+        target_id = int(expected_generation_id)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("expected_generation_id must be a positive integer") from exc
+    if target_id <= 0:
+        raise ValueError("expected_generation_id must be a positive integer")
+
+    pointer = db.execute(
+        select(models.PlanningTruthState)
+        .where(models.PlanningTruthState.id == 1)
+        .with_for_update(),
+    ).scalar_one_or_none()
+    if pointer is None or pointer.current_generation_id is None:
+        raise PlanningTruthInvalidationConflict("planning truth has no current generation")
+    if int(pointer.current_generation_id) != target_id:
+        raise PlanningTruthInvalidationConflict(
+            f"current generation is {pointer.current_generation_id}, expected {target_id}"
+        )
+    generation = db.execute(
+        select(models.LedgerGeneration)
+        .where(models.LedgerGeneration.id == target_id)
+        .with_for_update(),
+    ).scalar_one_or_none()
+    if generation is None:
+        raise PlanningTruthInvalidationConflict("current generation row is missing")
+
+    if generation.status in {"stale", "rejected"}:
+        if generation.status == target_status and str(generation.reason or "").strip() == normalized_reason:
+            db.expire(pointer, ["current_generation"])
+            return get_readiness(db)
+        raise PlanningTruthInvalidationConflict(
+            f"generation {target_id} is already {generation.status} for a different invalidation"
+        )
+    if generation.status != "accepted":
+        raise PlanningTruthInvalidationConflict(
+            f"current generation {target_id} is {generation.status}, not accepted"
+        )
+
+    generation.status = target_status
+    generation.reason = normalized_reason
+    db.flush()
     db.expire(pointer, ["current_generation"])
     return get_readiness(db)
 

@@ -1768,7 +1768,12 @@ def _run_legacy_ledger_cycle_diagnostic(db: Session) -> Dict[str, Any]:
             run_reservation_shadow,
         )
 
-        run_reservation_shadow(db, scope, cycle_id)
+        run_reservation_shadow(
+            db,
+            scope,
+            cycle_id,
+            ledger_generation_id=ledger_generation_id,
+        )
         eff_net_by_req = {}
         for req in scope.open_reqs:
             val = effective_net_bin(db, req)
@@ -1816,7 +1821,12 @@ def _run_legacy_ledger_cycle_diagnostic(db: Session) -> Dict[str, Any]:
         try:
             from .item_ledger.reservation_ledger import run_reservation_shadow
 
-            run_reservation_shadow(db, scope, cycle_id)
+            run_reservation_shadow(
+                db,
+                scope,
+                cycle_id,
+                ledger_generation_id=ledger_generation_id,
+            )
         except Exception:  # noqa: BLE001 — shadow must never break the ledger cycle
             logging.getLogger(__name__).exception(
                 "Inc4 reservation shadow block failed; continuing (ledger cycle unaffected)"
