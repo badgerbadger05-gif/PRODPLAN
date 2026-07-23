@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 from app import models
 from app.services.planning_truth import publish_generation
 
+from .generation_bootstrap import ALGORITHM_VERSION, _utc
 from .historical_obligations import (
     ALGORITHM_VERSION as OBLIGATION_ALGORITHM_VERSION,
     materialize_historical_obligations,
@@ -57,6 +58,76 @@ class GenerationValidationError(ValueError):
 
 def _d(value: Any) -> Decimal:
     return Decimal(str(value or 0))
+
+
+def _parse_iso_datetime(value: Any, field: str) -> datetime:
+    if isinstance(value, datetime):
+        return _utc(value, field)
+    if not isinstance(value, str):
+        raise GenerationValidationError(f"{field} must be ISO timestamp")
+    try:
+        return _utc(datetime.fromisoformat(value.replace("Z", "+00:00")), field)
+    except ValueError as exc:
+        raise GenerationValidationError(f"{field} must be ISO timestamp") from exc
+
+
+def _validate_historical_bootstrap_watermarks(
+    generation: models.LedgerGeneration,
+) -> None:
+    if str(generation.algorithm_version or "") != ALGORITHM_VERSION:
+        return
+
+    source_watermarks = generation.source_watermarks
+    if not isinstance(source_watermarks, dict):
+        raise GenerationValidationError(
+            "historical bootstrap requires source_watermarks mapping"
+        )
+
+    if "opening_balance" not in source_watermarks:
+        raise GenerationValidationError("source_watermarks.opening_balance is required")
+    if source_watermarks.get("opening_balance") is None:
+        raise GenerationValidationError(
+            "source_watermarks.opening_balance must be present"
+        )
+
+    cutoff = _utc(generation.cutoff, "generation cutoff")
+    historical_import_completed_through = _parse_iso_datetime(
+        source_watermarks.get("historical_import_completed_through"),
+        "source_watermarks.historical_import_completed_through",
+    )
+    if historical_import_completed_through != cutoff:
+        raise GenerationValidationError(
+            "historical_import_completed_through must equal generation cutoff"
+        )
+
+    convergence = source_watermarks.get("balance_convergence")
+    if not isinstance(convergence, dict):
+        raise GenerationValidationError(
+            "source_watermarks.balance_convergence must be present"
+        )
+    if convergence.get("valid") is not True:
+        raise GenerationValidationError(
+            "source_watermarks.balance_convergence.valid must be true"
+        )
+
+    convergence_cutoff = _parse_iso_datetime(
+        convergence.get("cutoff"),
+        "source_watermarks.balance_convergence.cutoff",
+    )
+    if convergence_cutoff != cutoff:
+        raise GenerationValidationError(
+            "balance_convergence.cutoff must equal generation cutoff"
+        )
+    try:
+        convergence_batch_id = int(convergence.get("physical_import_batch_id"))
+    except (TypeError, ValueError) as exc:
+        raise GenerationValidationError(
+            "balance_convergence.physical_import_batch_id must match generation physical boundary"
+        ) from exc
+    if convergence_batch_id != int(generation.physical_import_batch_id):
+        raise GenerationValidationError(
+            "balance_convergence.physical_import_batch_id must match generation physical boundary"
+        )
 
 
 def _building_generation(db: Session, generation_id: int) -> models.LedgerGeneration:
@@ -169,6 +240,7 @@ def validate_generation_build(
         raise GenerationValidationError("physical import boundary is not completed")
     if physical_batch.cutoff and physical_batch.cutoff > generation.cutoff:
         raise GenerationValidationError("physical import boundary exceeds generation cutoff")
+    _validate_historical_bootstrap_watermarks(generation)
     partial_physical = db.query(models.LedgerBuildBatch.id).filter(
         models.LedgerBuildBatch.ledger_generation_id == int(generation.id),
         models.LedgerBuildBatch.stage == "physical_import",

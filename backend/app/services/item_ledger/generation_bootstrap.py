@@ -120,9 +120,9 @@ def create_historical_generation(
     )
     replay_at = _utc(replay_from, "replay_from")
     cutoff_at = _utc(cutoff, "cutoff")
-    if not historical_from < replay_at <= cutoff_at:
+    if not historical_from <= replay_at <= cutoff_at:
         raise ValueError(
-            "expected historical_from_exclusive < replay_from <= cutoff"
+            "expected historical_from_exclusive <= replay_from <= cutoff"
         )
 
     try:

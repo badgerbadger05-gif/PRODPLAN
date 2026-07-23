@@ -4,10 +4,15 @@ from decimal import Decimal
 import pytest
 
 from app import models
+from app.services.item_ledger.generation_bootstrap import (
+    ALGORITHM_VERSION as BOOTSTRAP_ALGORITHM_VERSION,
+)
 from app.services.item_ledger.generation_lifecycle import (
     GenerationValidationError,
     accept_generation_build,
+    OBLIGATION_ALGORITHM_VERSION,
     validate_generation_build,
+    REPLAY_ALGORITHM_VERSION,
 )
 from app.services.item_ledger.supplier_receipt_odata import (
     SupplierEvidenceDiagnostic,
@@ -19,7 +24,14 @@ from app.services.item_ledger.supplier_receipt_allocation import (
 )
 
 
-def _generation(db, key: str, *, empty: bool = False):
+def _generation(
+    db,
+    key: str,
+    *,
+    empty: bool = False,
+    algorithm_version: str = "test",
+    source_watermarks: dict | None = None,
+):
     cutoff = datetime(2026, 7, 31, 23, 59)
     batch = models.PhysicalImportBatch(
         batch_key=f"physical-{key}",
@@ -28,19 +40,77 @@ def _generation(db, key: str, *, empty: bool = False):
         completed_at=cutoff,
         source_watermarks={"explicit_empty_prefix": True} if empty else {},
     )
+    source_watermarks = dict(source_watermarks or {})
+    if empty:
+        source_watermarks.setdefault("explicit_empty_prefix", True)
     generation = models.LedgerGeneration(
         generation_key=f"generation-{key}",
         status="building",
         cutoff=cutoff,
         physical_import_batch=batch,
-        algorithm_version="test",
+        algorithm_version=algorithm_version,
         replay_version="test",
-        source_watermarks={"explicit_empty_prefix": True} if empty else {},
+        source_watermarks=source_watermarks,
         capabilities={},
     )
     db.add(generation)
     db.flush()
     return generation
+
+
+def _add_checkpoint_stages(db_session, generation: models.LedgerGeneration) -> None:
+    batch_cutoff = datetime(2026, 7, 31, 23, 58)
+    for stage, algorithm_version in (
+        ("reservation_materialize", OBLIGATION_ALGORITHM_VERSION),
+        ("reservation_replay", REPLAY_ALGORITHM_VERSION),
+    ):
+        db_session.add(models.LedgerBuildBatch(
+            ledger_generation_id=int(generation.id),
+            stage=stage,
+            batch_key=f"{stage}-{generation.id}",
+            status="completed",
+            algorithm_version=algorithm_version,
+            metrics={},
+            completed_at=batch_cutoff,
+        ))
+    db_session.flush()
+
+
+def _bootstrap_gate_watermarks(
+    generation: models.LedgerGeneration,
+    *,
+    opening_balance=True,
+    historical_import_completed_through=None,
+    convergence_valid=True,
+    convergence_cutoff=None,
+    convergence_batch_id=None,
+) -> dict[str, object]:
+    return {
+        **dict(generation.source_watermarks or {}),
+        **(
+            {"opening_balance": {}}
+            if opening_balance
+            else {}
+        ),
+        "historical_import_completed_through": (
+            historical_import_completed_through
+            if historical_import_completed_through is not None
+            else generation.cutoff.isoformat()
+        ),
+        "balance_convergence": {
+            "valid": convergence_valid,
+            "cutoff": (
+                convergence_cutoff.isoformat()
+                if convergence_cutoff is not None
+                else generation.cutoff.isoformat()
+            ),
+            "physical_import_batch_id": (
+                generation.physical_import_batch_id
+                if convergence_batch_id is None
+                else convergence_batch_id
+            ),
+        },
+    }
 
 
 def _synthetic(db, key: str = "ok"):
@@ -234,6 +304,85 @@ def test_empty_prefix_requires_explicit_declaration(db_session):
 
     assert result["physical_facts"] == 0
     assert result["status"] == "accepted"
+
+
+def test_bootstrap_validation_gate_requires_opening_balance_and_convergence_fields(
+    db_session,
+):
+    generation = _generation(
+        db_session,
+        "bootstrap-gate-ok",
+        empty=True,
+        algorithm_version=BOOTSTRAP_ALGORITHM_VERSION,
+    )
+    _add_checkpoint_stages(db_session, generation)
+    generation.source_watermarks = _bootstrap_gate_watermarks(generation)
+    db_session.commit()
+
+    result = validate_generation_build(db_session, generation.id, explicit_empty_physical=True)
+
+    assert result["valid"] is True
+
+
+def test_bootstrap_validation_gate_rejects_missing_opening_balance(
+    db_session,
+):
+    generation = _generation(
+        db_session,
+        "bootstrap-gate-missing-open",
+        empty=True,
+        algorithm_version=BOOTSTRAP_ALGORITHM_VERSION,
+    )
+    _add_checkpoint_stages(db_session, generation)
+    generation.source_watermarks = {
+        "historical_import_completed_through": generation.cutoff.isoformat(),
+        "balance_convergence": {
+            "valid": True,
+            "cutoff": generation.cutoff.isoformat(),
+            "physical_import_batch_id": generation.physical_import_batch_id,
+        },
+    }
+    db_session.commit()
+
+    with pytest.raises(
+        GenerationValidationError, match="source_watermarks.opening_balance"
+    ):
+        validate_generation_build(db_session, generation.id, explicit_empty_physical=True)
+
+
+def test_bootstrap_validation_gate_rejects_misaligned_convergence_batch(
+    db_session,
+):
+    generation = _generation(
+        db_session,
+        "bootstrap-gate-misaligned",
+        empty=True,
+        algorithm_version=BOOTSTRAP_ALGORITHM_VERSION,
+    )
+    _add_checkpoint_stages(db_session, generation)
+    generation.source_watermarks = _bootstrap_gate_watermarks(
+        generation,
+        convergence_batch_id=generation.physical_import_batch_id + 1,
+    )
+    db_session.commit()
+
+    with pytest.raises(
+        GenerationValidationError,
+        match="balance_convergence.physical_import_batch_id",
+    ):
+        validate_generation_build(db_session, generation.id, explicit_empty_physical=True)
+
+
+def test_non_bootstrap_generation_is_not_subject_to_bootstrap_gate(
+    db_session,
+):
+    generation = _generation(db_session, "regular-generation", empty=True)
+    _add_checkpoint_stages(db_session, generation)
+    db_session.commit()
+
+    result = validate_generation_build(db_session, generation.id, explicit_empty_physical=True)
+
+    assert result["valid"] is True
 
 
 def test_structural_supplier_evidence_diagnostic_blocks_before_fifo_and_acceptance(

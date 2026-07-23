@@ -19,17 +19,23 @@ def reserve(
     qty: str = "10",
     due: date = date(2026, 6, 30),
     run_id: int = 1,
+    plan_period_from: date | None = None,
+    plan_period_to: date | None = None,
     bucket_id: int = 1,
     order_refs: tuple[str, ...] = (),
 ) -> Reserve:
+    _plan_period_from = plan_period_from or due.replace(day=1)
+    _plan_period_to = plan_period_to or due
+    if _plan_period_to < _plan_period_from:
+        raise ValueError("plan_period_to must be >= plan_period_from")
     return Reserve(
         reserve_id=reserve_id,
         item_id=7,
         mode=mode,  # type: ignore[arg-type]
         reserved_qty=Decimal(qty),
         due_date=due,
-        plan_period_from=due.replace(day=1),
-        plan_period_to=due,
+        plan_period_from=_plan_period_from,
+        plan_period_to=_plan_period_to,
         run_id=run_id,
         requirement_id=requirement_id,
         bucket_date=due,
@@ -45,13 +51,14 @@ def fact(
     mode: str = "make",
     requirement_id: int | None = None,
     order_ref: str | None = None,
+    posting_at: datetime = datetime(2026, 7, 1, tzinfo=timezone.utc),
 ) -> Fact:
     return Fact(
         fact_id=fact_id,
         item_id=7,
         mode=mode,  # type: ignore[arg-type]
         qty=Decimal(qty),
-        posting_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        posting_at=posting_at,
         requirement_id=requirement_id,
         order_ref=order_ref,
     )
@@ -117,13 +124,19 @@ def test_unaddressed_make_fifo_uses_due_plan_run_requirement_bucket_order():
     ]
 
 
-def test_july_unaddressed_output_cannot_close_august_reserve():
-    august = reserve("august", 8, qty="4", due=date(2026, 8, 31))
+def test_unaddressed_output_next_year_closes_oldest_reserve():
+    old_reserve = reserve("old", 1, qty="2", due=date(2026, 12, 31))
+    newer_reserve = reserve("new", 2, qty="4", due=date(2027, 1, 31))
 
-    result = allocate_historical_facts([fact("july-output", "4")], [august])
+    result = allocate_historical_facts(
+        [fact("next-year-output", "5", posting_at=datetime(2027, 7, 1, tzinfo=timezone.utc))],
+        [newer_reserve, old_reserve],
+    )
 
-    assert result.allocations == ()
-    assert result.unplanned_qty == Decimal("4")
+    assert [(a.reserve_id, a.qty, a.match_rule) for a in result.allocations] == [
+        ("old", Decimal("2"), "fifo"),
+        ("new", Decimal("3"), "fifo"),
+    ]
 
 
 def test_exact_august_identity_may_deliberately_match_early_output():
@@ -162,6 +175,37 @@ def test_unaddressed_output_still_uses_oldest_prior_period_reserve():
     assert [(row.reserve_id, row.qty) for row in result.allocations] == [
         ("may", Decimal("2")),
         ("june", Decimal("1")),
+    ]
+
+
+def test_fifo_ordering_respects_overlapping_plan_periods():
+    older_window = reserve(
+        "older-window",
+        1,
+        qty="2",
+        due=date(2026, 7, 31),
+        plan_period_from=date(2026, 5, 1),
+        plan_period_to=date(2026, 6, 30),
+        bucket_id=2,
+    )
+    younger_window = reserve(
+        "younger-window",
+        1,
+        qty="3",
+        due=date(2026, 6, 30),
+        plan_period_from=date(2026, 6, 1),
+        plan_period_to=date(2026, 7, 31),
+        bucket_id=1,
+    )
+
+    result = allocate_historical_facts(
+        [fact("output", "4")],
+        [younger_window, older_window],
+    )
+
+    assert [(row.reserve_id, row.qty) for row in result.allocations] == [
+        ("older-window", Decimal("2")),
+        ("younger-window", Decimal("2")),
     ]
 
 

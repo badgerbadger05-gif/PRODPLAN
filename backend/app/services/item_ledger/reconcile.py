@@ -689,6 +689,8 @@ def _resolve_item_maps(session: Session) -> Tuple[Dict[str, int], Dict[str, int]
 def build_balance_snapshot(
     session: Session,
     balance_rows: Sequence[Mapping[str, Any]],
+    *,
+    strict: bool = False,
 ) -> Dict[LedgerKey, Decimal]:
     """Normalize converted Balance rows → ``{LedgerKey(char=''): qty}``.
 
@@ -710,6 +712,11 @@ def build_balance_snapshot(
             norm = _norm_code(str(row.get("code") or ""))
             item_id = by_code.get(norm) if norm else None
         if item_id is None:
+            if strict and abs(_dec(row.get("qty") or 0)) > EPS:
+                identity = ref or str(row.get("code") or "").strip() or "<missing>"
+                raise ValueError(
+                    f"Balance row item cannot be resolved locally: {identity}"
+                )
             continue
         org = str(row.get("organization_ref") or "").strip()
         key = LedgerKey(int(item_id), "", org, wh)

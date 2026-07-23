@@ -238,3 +238,19 @@ def test_bootstrap_rejects_ambiguous_dates(
             replay_from=replay_from,
             cutoff=cutoff,
         )
+
+
+def test_bootstrap_allows_opening_and_replay_to_share_exact_boundary(db_session):
+    opening = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    cutoff = datetime(2026, 7, 24, tzinfo=timezone.utc)
+
+    created = create_historical_generation(
+        db_session,
+        generation_key="same-opening-replay-boundary",
+        historical_from_exclusive=opening,
+        replay_from=opening,
+        cutoff=cutoff,
+    )
+
+    assert created.historical_from_exclusive == opening
+    assert created.replay_from == opening

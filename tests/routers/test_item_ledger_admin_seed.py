@@ -11,6 +11,7 @@
 """
 
 import pytest
+from datetime import datetime, timezone
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -236,3 +237,238 @@ def test_no_odata_config_400(db_session, monkeypatch):
     monkeypatch.setattr(admin_mod, "load_odata_config", lambda: {})
     client = _client(db_session)
     assert client.post("/api/v1/item-ledger/admin/seed").status_code == 400
+
+
+def test_operator_accept_endpoint_wires_explicit_generation_and_commits(
+    db_session, monkeypatch
+):
+    observed = {}
+
+    def fake_accept(db, generation_id, **kwargs):
+        observed.update(generation_id=generation_id, **kwargs)
+        return {"status": "accepted", "valid": True}
+
+    fake_client = object()
+    monkeypatch.setattr(admin_mod, "accept_generation_build", fake_accept)
+    monkeypatch.setattr(admin_mod, "_odata_client_if_configured", lambda: fake_client)
+    client = _client(db_session)
+
+    response = client.post(
+        "/api/v1/item-ledger/admin/generations/accept",
+        json={
+            "generation_id": 17,
+            "replay_from": "2026-07-01T00:00:00Z",
+            "explicit_empty_physical": False,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["ledger_generation"] == 17
+    assert response.json()["truth_status"] == "accepted"
+    assert response.json()["ready"] is True
+    assert observed == {
+        "generation_id": 17,
+        "replay_from": datetime(2026, 7, 1, tzinfo=timezone.utc),
+        "odata_client": fake_client,
+        "explicit_empty_physical": False,
+    }
+
+
+def test_seeded_generation_reaches_first_accepted_truth_through_operator_endpoint(
+    db_session, seeded_odata, monkeypatch
+):
+    _setup_items(db_session)
+    monkeypatch.setattr(admin_mod, "_odata_client_if_configured", lambda: None)
+    client = _client(db_session)
+    seeded = client.post(
+        "/api/v1/item-ledger/admin/seed",
+        params={"dry_run": "false"},
+    )
+    assert seeded.status_code == 200
+    generation_id = seeded.json()["ledger_generation_id"]
+
+    accepted = client.post(
+        "/api/v1/item-ledger/admin/generations/accept",
+        json={
+            "generation_id": generation_id,
+            "replay_from": seeded.json()["posting_at"],
+        },
+    )
+
+    assert accepted.status_code == 200
+    assert accepted.json()["truth_status"] == "accepted"
+    assert accepted.json()["ledger_generation"] == generation_id
+    db_session.expire_all()
+    assert db_session.get(models.LedgerGeneration, generation_id).status == "accepted"
+    assert (
+        db_session.get(models.PlanningTruthState, 1).current_generation_id
+        == generation_id
+    )
+
+
+def test_historical_phase0_e2e_bootstrap_import_verify_and_accept(
+    db_session, monkeypatch
+):
+    _setup_items(db_session)
+    balance_rows = _rows()
+
+    class EmptyHistoricalOData:
+        def _make_request(self, _entity, _params):
+            return {"value": []}
+
+    monkeypatch.setattr(
+        admin_mod,
+        "load_odata_config",
+        lambda: {"base_url": "http://1c/odata"},
+    )
+    monkeypatch.setattr(
+        admin_mod,
+        "_fetch_balance_at",
+        lambda _config, _at: balance_rows,
+    )
+    monkeypatch.setattr(
+        admin_mod,
+        "_odata_client_if_configured",
+        lambda: EmptyHistoricalOData(),
+    )
+    client = _client(db_session)
+
+    bootstrapped = client.post(
+        "/api/v1/item-ledger/admin/historical-generations/bootstrap",
+        json={
+            "generation_key": "historical-phase0-e2e",
+            "opening_at": "2026-06-01T00:00:00Z",
+            "replay_from": "2026-06-01T00:00:00Z",
+            "cutoff": "2026-06-02T00:00:00Z",
+        },
+    )
+    assert bootstrapped.status_code == 200
+    generation_id = bootstrapped.json()["ledger_generation_id"]
+    assert bootstrapped.json()["opening"]["entries_created"] == 2
+
+    imported = client.post(
+        f"/api/v1/item-ledger/admin/historical-generations/{generation_id}/import",
+        json={"max_windows": 1, "window_hours": 24},
+    )
+    assert imported.status_code == 200, imported.json()
+    assert imported.json()["complete"] is True
+    assert imported.json()["windows_completed"] == 1
+
+    verified = client.post(
+        f"/api/v1/item-ledger/admin/historical-generations/"
+        f"{generation_id}/verify-balance",
+    )
+    assert verified.status_code == 200
+    assert verified.json()["valid"] is True
+    assert verified.json()["mismatched"] == 0
+
+    wrong_lineage = client.post(
+        "/api/v1/item-ledger/admin/generations/accept",
+        json={
+            "generation_id": generation_id,
+            "replay_from": "2026-06-01T00:00:01Z",
+        },
+    )
+    assert wrong_lineage.status_code == 409
+    assert "sealed bootstrap lineage" in wrong_lineage.json()["detail"]
+
+    accepted = client.post(
+        "/api/v1/item-ledger/admin/generations/accept",
+        json={
+            "generation_id": generation_id,
+            "replay_from": "2026-06-01T00:00:00Z",
+        },
+    )
+    assert accepted.status_code == 200
+    assert accepted.json()["truth_status"] == "accepted"
+    assert (
+        db_session.get(models.PlanningTruthState, 1).current_generation_id
+        == generation_id
+    )
+
+
+def test_operator_accept_endpoint_returns_conflict_and_rolls_back(
+    db_session, monkeypatch
+):
+    def fail_accept(*_args, **_kwargs):
+        raise admin_mod.GenerationValidationError("candidate is incomplete")
+
+    monkeypatch.setattr(admin_mod, "accept_generation_build", fail_accept)
+    monkeypatch.setattr(admin_mod, "_odata_client_if_configured", lambda: None)
+    client = _client(db_session)
+
+    response = client.post(
+        "/api/v1/item-ledger/admin/generations/accept",
+        json={
+            "generation_id": 17,
+            "replay_from": "2026-07-01T00:00:00Z",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "candidate is incomplete"
+
+
+def test_operator_invalidate_endpoint_fail_closes_current_truth(db_session):
+    cutoff = datetime(2026, 7, 24, tzinfo=timezone.utc)
+    generation = models.LedgerGeneration(
+        generation_key="operator-invalidate",
+        status="accepted",
+        cutoff=cutoff,
+        accepted_at=cutoff,
+        source_watermarks={},
+        capabilities={},
+        physical_import_batch=models.PhysicalImportBatch(
+            batch_key="operator-invalidate-batch",
+            status="completed",
+            cutoff=cutoff,
+            source_watermarks={},
+        ),
+        algorithm_version="test",
+    )
+    db_session.add(generation)
+    db_session.flush()
+    db_session.add(models.PlanningTruthState(
+        id=1, current_generation_id=generation.id,
+    ))
+    db_session.commit()
+    client = _client(db_session)
+
+    response = client.post(
+        "/api/v1/item-ledger/admin/generations/invalidate",
+        json={
+            "expected_generation_id": generation.id,
+            "status": "stale",
+            "reason": "operator freshness decision",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ledger_generation": generation.id,
+        "truth_status": "stale",
+        "ready": False,
+        "reason": "operator freshness decision",
+    }
+    db_session.expire_all()
+    assert db_session.get(models.LedgerGeneration, generation.id).status == "stale"
+    assert (
+        db_session.get(models.PlanningTruthState, 1).current_generation_id
+        == generation.id
+    )
+
+
+def test_operator_invalidate_endpoint_rejects_wrong_generation(db_session):
+    client = _client(db_session)
+
+    response = client.post(
+        "/api/v1/item-ledger/admin/generations/invalidate",
+        json={
+            "expected_generation_id": 999,
+            "status": "rejected",
+            "reason": "wrong target",
+        },
+    )
+
+    assert response.status_code == 409
+    assert "no current generation" in response.json()["detail"]

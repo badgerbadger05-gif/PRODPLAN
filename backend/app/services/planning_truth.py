@@ -6,8 +6,9 @@ an accepted generation identity or stop their calculation with
 """
 
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from collections.abc import Iterable
+import os
 from typing import Any, Mapping
 
 from sqlalchemy.orm import Session
@@ -27,6 +28,7 @@ CAPABILITY_DBR_FEEDER_COCKPIT = "dbr_feeder_cockpit"
 CAPABILITY_DBR_PURCHASE_COCKPIT = "dbr_purchase_cockpit"
 CAPABILITY_DBR_DRUM_BOARD = "dbr_drum_board"
 CAPABILITY_PURCHASE_CONTROL_JOURNAL = "purchase_control_journal"
+TRUTH_MAX_AGE_SECONDS_ENV = "PLANNING_TRUTH_MAX_AGE_SECONDS"
 
 
 @dataclass(frozen=True)
@@ -94,7 +96,34 @@ class PlanningTruthInvalidationConflict(RuntimeError):
     code = "planning_truth_invalidation_conflict"
 
 
-def get_readiness(db: Session) -> PlanningTruthReadiness:
+def _configured_max_age() -> timedelta | None:
+    raw = str(os.environ.get(TRUTH_MAX_AGE_SECONDS_ENV) or "").strip()
+    if not raw:
+        return None
+    try:
+        seconds = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"{TRUTH_MAX_AGE_SECONDS_ENV} must be a positive integer"
+        ) from exc
+    if seconds <= 0:
+        raise RuntimeError(
+            f"{TRUTH_MAX_AGE_SECONDS_ENV} must be a positive integer"
+        )
+    return timedelta(seconds=seconds)
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def get_readiness(
+    db: Session,
+    *,
+    now: datetime | None = None,
+) -> PlanningTruthReadiness:
     """Return current truth state without guessing or consulting legacy facts."""
     pointer = db.get(models.PlanningTruthState, 1)
     generation = pointer.current_generation if pointer is not None else None
@@ -122,6 +151,23 @@ def get_readiness(db: Session) -> PlanningTruthReadiness:
     reason = generation.reason
     if status == "accepted" and not structurally_accepted:
         reason = reason or "Accepted generation is missing cutoff or accepted_at"
+    freshness_limit = _configured_max_age()
+    if structurally_accepted and freshness_limit is not None:
+        checked_at = _as_utc(now or datetime.now(timezone.utc))
+        freshness_reference = min(
+            _as_utc(generation.cutoff),
+            _as_utc(generation.accepted_at),
+        )
+        age = checked_at - freshness_reference
+        if age > freshness_limit:
+            status = "stale"
+            structurally_accepted = False
+            reason = (
+                "Accepted generation exceeded freshness threshold: "
+                f"reference={freshness_reference.isoformat()}, "
+                f"age_seconds={int(age.total_seconds())}, "
+                f"max_age_seconds={int(freshness_limit.total_seconds())}"
+            )
     return PlanningTruthReadiness(
         truth_status=status if structurally_accepted or status != "accepted" else "rejected",
         ready=structurally_accepted,

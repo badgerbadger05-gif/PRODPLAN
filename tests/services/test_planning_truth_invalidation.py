@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -162,3 +162,36 @@ def test_later_accepted_publication_replaces_invalidated_pointer(db_session):
     assert state.ledger_generation == replacement.id
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == replacement.id
     assert db_session.get(models.LedgerGeneration, generation.id).status == "rejected"
+
+
+def test_configured_freshness_threshold_returns_stale_without_mutating_history(
+    db_session, monkeypatch
+):
+    generation, _ = _published_truth(db_session)
+    monkeypatch.setenv(planning_truth.TRUTH_MAX_AGE_SECONDS_ENV, "3600")
+
+    state = planning_truth.get_readiness(
+        db_session,
+        now=generation.accepted_at.replace(tzinfo=timezone.utc)
+        + timedelta(seconds=3601),
+    )
+
+    assert state.truth_status == "stale"
+    assert state.ready is False
+    assert state.ledger_generation == generation.id
+    assert "max_age_seconds=3600" in state.reason
+    assert generation.status == "accepted"
+    with pytest.raises(planning_truth.PlanningTruthUnavailable) as unavailable:
+        planning_truth.require_accepted_truth(db_session, "freshness-test")
+    assert unavailable.value.as_dict()["truth_status"] == "stale"
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "not-a-number"])
+def test_invalid_freshness_threshold_fails_closed_configuration(
+    db_session, monkeypatch, raw
+):
+    _published_truth(db_session)
+    monkeypatch.setenv(planning_truth.TRUTH_MAX_AGE_SECONDS_ENV, raw)
+
+    with pytest.raises(RuntimeError, match="positive integer"):
+        planning_truth.get_readiness(db_session)

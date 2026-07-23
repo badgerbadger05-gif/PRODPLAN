@@ -95,7 +95,6 @@ def _pool_key(value: Fact | Reserve) -> tuple[int, str, str, str, Mode]:
 
 def _reserve_key(reserve: Reserve) -> tuple:
     return (
-        reserve.due_date,
         reserve.plan_period_from,
         reserve.plan_period_to,
         int(reserve.run_id),
@@ -139,8 +138,11 @@ def allocate_historical_facts(
     """Allocate accepted historical facts without mutating either input.
 
     Matching order is exact requirement, exact exported/source order, then
-    canonical FIFO for unaddressed ``make`` facts only.  Unaddressed ``consume``
-    facts remain explicitly unplanned.
+    canonical FIFO for unaddressed ``make`` facts only.  Canonical FIFO priority
+    follows reserve plan periods and run identity before any posting date
+    consideration.
+
+    Unaddressed ``consume`` facts remain explicitly unplanned.
     """
 
     fact_rows = tuple(facts)
@@ -211,10 +213,6 @@ def allocate_historical_facts(
             reserve
             for reserve in ordered_reserves
             if _pool_key(reserve) == _pool_key(fact)
-            # Unaddressed output may satisfy only an obligation that already
-            # existed when the fact was posted. Exact requirement/order claims
-            # above are deliberately exempt: they are explicit early output.
-            and reserve.plan_period_from <= fact.posting_at.date()
         ]
         if left > 0 and fact.mode == "make":
             # Exact surplus and genuinely unaddressed output may satisfy the

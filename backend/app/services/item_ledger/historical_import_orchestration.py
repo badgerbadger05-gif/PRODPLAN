@@ -149,7 +149,17 @@ def _validate_generation(
         )
     if generation.cutoff is None:
         raise ValueError("historical import requires a fixed generation cutoff")
-    if generation.cutoff != to_inclusive:
+    persisted_cutoff = (
+        generation.cutoff.replace(tzinfo=timezone.utc)
+        if generation.cutoff.tzinfo is None
+        else generation.cutoff.astimezone(timezone.utc)
+    )
+    requested_cutoff = (
+        to_inclusive.replace(tzinfo=timezone.utc)
+        if to_inclusive.tzinfo is None
+        else to_inclusive.astimezone(timezone.utc)
+    )
+    if persisted_cutoff != requested_cutoff:
         raise ValueError(
             "to_inclusive must exactly match the BUILDING generation cutoff"
         )

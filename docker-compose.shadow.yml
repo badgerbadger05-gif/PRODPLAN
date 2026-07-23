@@ -38,6 +38,7 @@ services:
     restart: unless-stopped
     environment:
       DATABASE_URL: postgresql://${PRODPLAN_SHADOW_POSTGRES_USER:-prodplan_shadow}:${PRODPLAN_SHADOW_POSTGRES_PASSWORD:?Set PRODPLAN_SHADOW_POSTGRES_PASSWORD in .env.shadow}@db:5432/${PRODPLAN_SHADOW_POSTGRES_DB:-prodplan_shadow}
+      PLANNING_TRUTH_MAX_AGE_SECONDS: "${PRODPLAN_TRUTH_MAX_AGE_SECONDS:-86400}"
       TZ: Europe/Moscow
       PRODPLAN_DEPLOYMENT_CONTOUR: parallel
       PRODPLAN_STABLE_URL: ${PRODPLAN_STABLE_URL:-http://mtzdock.lan:9010}
