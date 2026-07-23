@@ -2522,6 +2522,11 @@ class StockLedgerSupplierReceiptProvenance(Base):
             name="ck_supplier_receipt_provenance_match_status",
         ),
         CheckConstraint(
+            "operation_kind IN ('supplier_receipt', 'correction', "
+            "'supplier_return', 'transfer', 'unknown')",
+            name="ck_supplier_receipt_provenance_operation_kind",
+        ),
+        CheckConstraint(
             "ambiguity_count >= 0",
             name="ck_supplier_receipt_provenance_ambiguity_count",
         ),
@@ -2543,6 +2548,11 @@ class StockLedgerSupplierReceiptProvenance(Base):
             "ix_supplier_receipt_provenance_generation_status",
             "ledger_generation_id",
             "match_status",
+        ),
+        Index(
+            "ix_supplier_receipt_provenance_generation_kind",
+            "ledger_generation_id",
+            "operation_kind",
         ),
         Index(
             "ix_supplier_receipt_provenance_receipt_line",
@@ -2571,6 +2581,19 @@ class StockLedgerSupplierReceiptProvenance(Base):
     receipt_doc_line_no = Column(String(32), nullable=False)
     supplier_order_ref = Column(String(64), nullable=True)
     supplier_order_line_no = Column(String(32), nullable=True)
+    operation_kind = Column(
+        String(32), nullable=False, default="unknown", server_default="unknown"
+    )
+    operation_key = Column(String(128), nullable=True)
+    operation_name = Column(String(128), nullable=True)
+    correction_receipt_ref = Column(String(64), nullable=True)
+    evidence_hash = Column(String(64), nullable=False, default="", server_default="")
+    evidence_payload = Column(
+        CrossPlatformJSON,
+        nullable=False,
+        default=dict,
+        server_default=text("'{}'"),
+    )
     match_rule = Column(String(64), nullable=False)
     match_status = Column(String(16), nullable=False)
     ambiguity_count = Column(Integer, nullable=False, server_default="0")

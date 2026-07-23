@@ -329,6 +329,15 @@ def test_persistence_ignores_legacy_received_qty_and_cross_generation_pin(db_ses
     assert [(row.requirement_id, row.allocated_qty) for row in rows] == [
         (req.id, Decimal("3.000"))
     ]
+    provenance = db_session.query(
+        models.StockLedgerSupplierReceiptProvenance
+    ).one()
+    assert provenance.operation_kind == "supplier_receipt"
+    assert provenance.operation_key == RECEIPT_OPERATION
+    assert provenance.operation_name == "Приобретение у поставщика"
+    assert provenance.correction_receipt_ref is None
+    assert len(provenance.evidence_hash) == 64
+    assert provenance.evidence_payload["signed_qty"] == "3"
 
 
 def test_live_basis_line_zero_resolves_unique_canonical_order_line(db_session):
@@ -454,6 +463,15 @@ def test_correction_of_multi_sle_receipt_aggregates_negative_pin_row(db_session)
     assert [row.allocated_qty for row in rows] == [
         Decimal("-4.000"), Decimal("2.000"), Decimal("3.000")
     ]
+    correction_rows = db_session.query(
+        models.StockLedgerSupplierReceiptProvenance
+    ).filter_by(operation_kind="correction").all()
+    assert correction_rows
+    assert {row.correction_receipt_ref for row in correction_rows} == {"doc"}
+    assert all(
+        row.evidence_payload["correction_receipt_ref"] == "doc"
+        for row in correction_rows
+    )
 
 
 def test_rebuild_preserves_other_generation_rows(db_session):

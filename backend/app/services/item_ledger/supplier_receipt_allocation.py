@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from app import models
 
+from .physical import canonical_content_hash, canonical_decimal
 from .physical_visibility import visible_sles_for_generation
 
 
@@ -45,6 +46,13 @@ _OPERATION_NAMES = {
         "перемещение запасов",
         "перемещение",
     }),
+}
+
+_OPERATION_KINDS = {
+    RECEIPT_OPERATION: "supplier_receipt",
+    CORRECTION_OPERATION: "correction",
+    SUPPLIER_RETURN_OPERATION: "supplier_return",
+    TRANSFER_OPERATION: "transfer",
 }
 
 
@@ -426,15 +434,29 @@ def _rebuild_supplier_receipt_coverage_unsafe(
             "multiple exact supplier order lines" if status == "ambiguous"
             else "no exact typed supplier order line"
         )
-        if status == "exact" and row.correction_receipt_ref:
-            # The current additive schema has no dedicated correction FK; keep
-            # the normalized source identity auditable in the provenance row.
-            reason = f"correction_receipt_ref={_text(row.correction_receipt_ref)}"
         operation_rule = {
             RECEIPT_OPERATION: "supplier-receipt-exact-line",
             CORRECTION_OPERATION: "supplier-receipt-correction",
             SUPPLIER_RETURN_OPERATION: "supplier-return-exact-line",
         }[operation]
+        evidence_payload = {
+            "receipt_doc_type": _text(row.receipt_doc_type)[:64],
+            "receipt_doc_ref": _text(row.receipt_doc_ref)[:64],
+            "receipt_doc_line_no": _text(row.receipt_doc_line_no)[:32],
+            "operation_key": _text(row.operation_key)[:128],
+            "operation_name": _text(row.operation_name)[:128],
+            "supplier_order_type": _normalized_type(row.supplier_order_type)[:64],
+            "supplier_order_ref": _text(row.supplier_order_ref)[:64],
+            "supplier_order_line_no": _text(row.supplier_order_line_no)[:32],
+            "item_id": int(row.item_id),
+            "characteristic_ref": _text(row.characteristic_ref)[:64],
+            "warehouse_ref1c": _text(row.warehouse_ref1c)[:64],
+            "signed_qty": canonical_decimal(row.signed_qty),
+            "correction_receipt_ref": (
+                _text(row.correction_receipt_ref)[:64] or None
+            ),
+        }
+        evidence_hash = canonical_content_hash(evidence_payload)
         canonical_line_no = (
             str(exact_candidate.line_number)
             if exact_candidate is not None else None
@@ -452,6 +474,12 @@ def _rebuild_supplier_receipt_coverage_unsafe(
                 supplier_order_line_no=(
                     canonical_line_no if status == "exact" else None
                 ),
+                operation_kind=_OPERATION_KINDS[operation],
+                operation_key=evidence_payload["operation_key"],
+                operation_name=evidence_payload["operation_name"],
+                correction_receipt_ref=evidence_payload["correction_receipt_ref"],
+                evidence_hash=evidence_hash,
+                evidence_payload=evidence_payload,
                 match_rule=operation_rule,
                 match_status=status,
                 ambiguity_count=len(candidates) if status == "ambiguous" else 0,

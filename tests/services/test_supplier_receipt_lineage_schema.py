@@ -195,6 +195,19 @@ def test_supplier_lineage_migration_follows_planning_storage_head():
     assert module.down_revision == "20260723_10"
 
 
+def test_supplier_receipt_evidence_migration_follows_lineage_head():
+    path = (
+        Path(__file__).resolve().parents[2]
+        / "backend/alembic/versions/20260723_12_supplier_receipt_evidence.py"
+    )
+    spec = spec_from_file_location("supplier_receipt_evidence_migration", path)
+    assert spec and spec.loader
+    module = module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert module.revision == "20260723_12"
+    assert module.down_revision == "20260723_11"
+
+
 def test_all_planning_proposals_expose_generation_lineage():
     for model in (
         models.PlannedOrder,
