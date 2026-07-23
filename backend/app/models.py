@@ -587,6 +587,15 @@ class ProductionProduct(Base):
     # Opaque idempotency key for period-plan order allocation. Added by
     # migration 20260522_06.
     source_mrp_allocation_key = Column(String(100), nullable=True, index=True)
+    # Generation that owned creation of this planning proposal. NULL is kept
+    # only for migrated/legacy and unrelated writers; Ledger readers must
+    # always filter by an explicit generation id.
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     created_at = Column(TIMESTAMP, default=func.now())
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
 
@@ -1166,6 +1175,14 @@ class PlannedPurchase(Base):
         nullable=True,
         index=True,
     )
+    # Nullable for migration compatibility; mandatory for every new
+    # Ledger-driven reconciliation proposal.
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
 
 
 class PlannedRework(Base):
@@ -1488,7 +1505,10 @@ class DbrSupermarketPosition(Base):
     __tablename__ = "dbr_supermarket_position"
     __table_args__ = (
         UniqueConstraint(
-            "item_id", "warehouse_ref1c", name="ux_dbr_supermarket_position_item_warehouse"
+            "ledger_generation_id",
+            "item_id",
+            "warehouse_ref1c",
+            name="ux_dbr_supermarket_position_generation_item_warehouse",
         ),
         CheckConstraint("adu >= 0", name="ck_dbr_supermarket_position_adu_nonnegative"),
         CheckConstraint("commonality >= 0", name="ck_dbr_supermarket_position_commonality_nonnegative"),
@@ -1505,6 +1525,12 @@ class DbrSupermarketPosition(Base):
     )
 
     id = Column(Integer, primary_key=True, index=True)
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     item_id = Column(Integer, ForeignKey("items.item_id", ondelete="CASCADE"), nullable=False, index=True)
     warehouse_ref1c = Column(String(36), nullable=False, index=True)
     supply_type = Column(String(20), nullable=False)
@@ -1532,6 +1558,7 @@ class DbrSupermarketPosition(Base):
     updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
 
     item = relationship("Item")
+    ledger_generation = relationship("LedgerGeneration")
     source_schedule = relationship("DbrDrumSchedule")
 
 
@@ -1540,7 +1567,11 @@ class DbrFeederSignal(Base):
 
     __tablename__ = "dbr_feeder_signal"
     __table_args__ = (
-        UniqueConstraint("dedup_key", name="ux_dbr_feeder_signal_dedup_key"),
+        UniqueConstraint(
+            "ledger_generation_id",
+            "dedup_key",
+            name="ux_dbr_feeder_signal_generation_dedup_key",
+        ),
         CheckConstraint("signal_type IN ('Пополнение', 'Под график', 'Цепочка')", name="ck_dbr_feeder_signal_type"),
         CheckConstraint(
             "status IN ('Open', 'Diagnostic', 'Order Created', 'In Work', 'Done', 'Cancelled')",
@@ -1550,6 +1581,12 @@ class DbrFeederSignal(Base):
     )
 
     id = Column(Integer, primary_key=True, index=True)
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     dedup_key = Column(String(66), nullable=False, index=True)
     signal_type = Column(String(30), nullable=False, default="Пополнение", server_default="Пополнение")
     # Chain signals ("Цепочка") are pegged to a parent signal, not to a shelf
@@ -1596,6 +1633,7 @@ class DbrFeederSignal(Base):
     updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
 
     position = relationship("DbrSupermarketPosition")
+    ledger_generation = relationship("LedgerGeneration")
     item = relationship("Item")
     source_schedule = relationship("DbrDrumSchedule")
     drum_slot = relationship("DbrDrumSlot")
@@ -1663,6 +1701,7 @@ class DbrDrumSchedule(Base):
     __table_args__ = (
         Index(
             "ux_dbr_drum_schedule_one_active",
+            "ledger_generation_id",
             "status",
             unique=True,
             postgresql_where=text("status = 'active'"),
@@ -1671,6 +1710,12 @@ class DbrDrumSchedule(Base):
     )
 
     id = Column(Integer, primary_key=True, index=True)
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     period_from = Column(Date, nullable=False)
     period_to = Column(Date, nullable=False)
     source_program_id = Column(
@@ -1696,6 +1741,7 @@ class DbrDrumSchedule(Base):
         cascade="all, delete-orphan",
     )
     source_program = relationship("DbrProductionProgram")
+    ledger_generation = relationship("LedgerGeneration")
     covered_programs = relationship(
         "DbrDrumScheduleProgram",
         back_populates="schedule",

@@ -4,7 +4,7 @@ Uses a StaticPool in-memory engine (same rationale as test_dbr_settings): sync
 endpoints run in a worker thread and must see the same in-memory DB.
 """
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 import pytest
@@ -21,6 +21,9 @@ from app.models import (
     DefaultSpecification,
     Item,
     ItemWarehouseStock,
+    LedgerGeneration,
+    PhysicalImportBatch,
+    PlanningTruthState,
     ProductionResource,
     SpecComponent,
     Specification,
@@ -40,6 +43,27 @@ def db_session():
     Base.metadata.create_all(bind=engine)
     TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     db = TestingSessionLocal()
+    batch = PhysicalImportBatch(
+        batch_key="dbr-router-diagnostic",
+        status="completed",
+        cutoff=datetime(2026, 7, 23),
+        source_watermarks={},
+        completed_at=datetime(2026, 7, 23),
+    )
+    generation = LedgerGeneration(
+        generation_key="dbr-router-diagnostic",
+        status="accepted",
+        cutoff=datetime(2026, 7, 23),
+        source_watermarks={},
+        capabilities={},
+        physical_import_batch=batch,
+        algorithm_version="test/diagnostic",
+        accepted_at=datetime(2026, 7, 23),
+    )
+    db.add(generation)
+    db.flush()
+    db.add(PlanningTruthState(id=1, current_generation_id=generation.id))
+    db.commit()
     try:
         yield db
     finally:
@@ -248,8 +272,11 @@ def test_feeder_positions_preview_rebuild_and_list(client, db_session, seed):
     preview = client.post(
         "/api/v1/dbr/feeder/positions/preview", json={"schedule_id": schedule_id}
     )
-    assert preview.status_code == 200, preview.text
-    assert preview.json()["positions"]
+    assert preview.status_code == 503, preview.text
+    assert (
+        preview.json()["detail"]["code"]
+        == "dbr_ledger_projection_unavailable"
+    )
     assert db_session.query(DbrSupermarketPosition).count() == 0
 
     rebuilt = client.post(
@@ -259,12 +286,20 @@ def test_feeder_positions_preview_rebuild_and_list(client, db_session, seed):
             "expected_schedule_id": schedule_id,
         },
     )
-    assert rebuilt.status_code == 200, rebuilt.text
-    assert rebuilt.json()["created"] >= 1
+    assert rebuilt.status_code == 503, rebuilt.text
+    assert (
+        rebuilt.json()["detail"]["code"]
+        == "dbr_ledger_projection_unavailable"
+    )
+    assert db_session.query(DbrSupermarketPosition).count() == 0
+    return
 
+    # Rebuild changes the mutable DBR projection only.  The mount GET must not
+    # calculate a live view and remains unavailable until a Ledger-bound
+    # cockpit snapshot is published by the explicit builder/worker.
     listed = client.get("/api/v1/dbr/feeder/positions?active_only=true")
-    assert listed.status_code == 200
-    assert len(listed.json()) == rebuilt.json()["created"]
+    assert listed.status_code == 503
+    assert listed.json()["detail"]["code"] == "dbr_cockpit_snapshot_unavailable"
 
     before = [
         (row.id, row.updated_at, row.is_active, row.is_stale)
@@ -285,13 +320,11 @@ def test_feeder_positions_preview_rebuild_and_list(client, db_session, seed):
             "offset": 0,
         },
     )
-    assert live_list.status_code == 200, live_list.text
-    assert len(live_list.json()) == 1
-    live = live_list.json()[0]["live_nfp"]
-    assert live["nfp"] == 100
-    assert live["zone"] == "Green"
-    position_id = live_list.json()[0]["id"]
+    assert live_list.status_code == 503, live_list.text
+    position_id = db_session.query(DbrSupermarketPosition.id).scalar()
 
+    # The single-position detail endpoint is not one of the four page-mount
+    # reads and retains its explicit live diagnostic behavior for now.
     detail = client.get(f"/api/v1/dbr/feeder/positions/{position_id}")
     assert detail.status_code == 200
     assert detail.json()["live_nfp"]["formula"] == (
@@ -311,12 +344,12 @@ def test_feeder_signal_preview_and_refresh_routes(client, monkeypatch):
     monkeypatch.setattr(
         feeder_signal_service,
         "preview_signals",
-        lambda db: {"schedule_id": 7, "positions": 1, "actionable": 1, "rows": []},
+        lambda db, **kwargs: {"schedule_id": 7, "positions": 1, "actionable": 1, "rows": []},
     )
     monkeypatch.setattr(
         feeder_signal_service,
         "refresh_signals",
-        lambda db, expected: {"schedule_id": expected, "created": 1, "rows": []},
+        lambda db, expected, **kwargs: {"schedule_id": expected, "created": 1, "rows": []},
     )
     assert client.post("/api/v1/dbr/feeder/signals/preview").json()["actionable"] == 1
     response = client.post(
@@ -326,7 +359,7 @@ def test_feeder_signal_preview_and_refresh_routes(client, monkeypatch):
 
 
 def test_feeder_signal_refresh_schedule_conflict_is_409(client, monkeypatch):
-    def conflict(db, expected):
+    def conflict(db, expected, **kwargs):
         raise ValueError("активный график изменился")
 
     monkeypatch.setattr(feeder_signal_service, "refresh_signals", conflict)

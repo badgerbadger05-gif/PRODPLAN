@@ -74,6 +74,10 @@ from .production_control_journal import (
 )
 from .production_binding_repair import repair_clean_mrp_bindings
 from .mrp_execution_ledger import run_ledger_cycle
+from .generation_reconciliation import (
+    GenerationReconciliationMismatch,
+    build_generation_targets,
+)
 from .supplier_order_status import state_is_terminal as _supplier_order_is_terminal
 from .replenishment import (
     REPLENISHMENT_FLOW_PRODUCTION,
@@ -114,6 +118,43 @@ def _latest_active_snapshot_run_ids(db: Session) -> List[int]:
     return [int(run_id) for _plan_id, run_id in rows if run_id is not None]
 
 
+def _validated_run_generation_targets(
+    db: Session,
+    *,
+    run_id: int,
+    ledger_generation_id: int,
+) -> dict:
+    targets = build_generation_targets(
+        db,
+        ledger_generation_id=ledger_generation_id,
+        run_id=run_id,
+    )
+    rows = (
+        db.query(MrpRequirement, Item)
+        .join(Item, Item.item_id == MrpRequirement.item_id)
+        .filter(
+            MrpRequirement.run_id == int(run_id),
+            MrpRequirement.status == "open",
+        )
+        .all()
+    )
+    for req, item in rows:
+        flow = classify_replenishment_flow(getattr(item, "replenishment_method", None))
+        expected_mode = (
+            "make"
+            if flow == REPLENISHMENT_FLOW_PRODUCTION
+            else "consume"
+            if flow == REPLENISHMENT_FLOW_PURCHASE
+            else None
+        )
+        if expected_mode and (int(req.id), expected_mode) not in targets:
+            raise GenerationReconciliationMismatch(
+                f"requirement {req.id} has no {expected_mode} reservation "
+                f"in accepted generation {ledger_generation_id}"
+            )
+    return targets
+
+
 def _trim_unexported_planned_purchases(
     db: Session,
     *,
@@ -121,11 +162,20 @@ def _trim_unexported_planned_purchases(
     item_id: int,
     target_qty: float,
     dry_run: bool,
+    ledger_generation_id: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """Remove or shrink stale local MRP purchase recommendations down to target."""
-    purchases = (
+    query = (
         db.query(PlannedPurchase)
         .filter(PlannedPurchase.run_id == int(run_id), PlannedPurchase.item_id == int(item_id))
+    )
+    if ledger_generation_id is not None:
+        query = query.filter(
+            PlannedPurchase.ledger_generation_id
+            == int(ledger_generation_id)
+        )
+    purchases = (
+        query
         .order_by(PlannedPurchase.need_date.desc(), PlannedPurchase.purchase_id.desc())
         .all()
     )
@@ -206,7 +256,13 @@ def _trim_unexported_planned_purchases(
     }
 
 
-def _existing_open_catchup_product(db: Session, *, run_id: int, item_id: int) -> Optional[ProductionProduct]:
+def _existing_open_catchup_product(
+    db: Session,
+    *,
+    run_id: int,
+    item_id: int,
+    ledger_generation_id: int,
+) -> Optional[ProductionProduct]:
     order_number = f"MRP-RC-{int(run_id)}-{int(item_id)}"
     linked_order_ids = {
         int(row.source_id)
@@ -230,6 +286,10 @@ def _existing_open_catchup_product(db: Session, *, run_id: int, item_id: int) ->
         .filter(ProductionOrder.source_run_id == int(run_id))
         .filter(ProductionOrder.order_number == order_number)
         .filter(ProductionProduct.item_id == int(item_id))
+        .filter(
+            ProductionProduct.ledger_generation_id
+            == int(ledger_generation_id)
+        )
         .filter(ProductionOrder.deletion_mark == False)
         .filter(or_(ProductionOrder.order_state_key.is_(None), func.lower(ProductionOrder.order_state_key) != DONE_STATE_KEY))
         .filter(func.coalesce(ProductionProduct.remaining_qty, 0) > 0)
@@ -247,6 +307,9 @@ def _own_open_production_by_item(
     db: Session,
     run: PlanningRun,
     open_req_ids: Set[int],
+    *,
+    ledger_generation_id: int,
+    generation_truth: bool = False,
 ) -> Dict[int, float]:
     """Open production supply this run OWNS, per item (v2 §5).
 
@@ -261,7 +324,11 @@ def _own_open_production_by_item(
     The old ``_active_production_qty_by_item`` summed the WHOLE WIP for an item
     globally (every plan's orders) = a double count; this counts only own supply.
     """
-    supply_qty = _production_supply_qty_expr()
+    supply_qty = (
+        func.coalesce(ProductionProduct.quantity, 0.0)
+        if generation_truth
+        else _production_supply_qty_expr()
+    )
 
     g2_product_ids: Set[int] = set()
     if run.active_freeze_version is not None:
@@ -293,6 +360,10 @@ def _own_open_production_by_item(
             ProductionOrderLineState.product_id == ProductionProduct.product_id,
         )
         .filter(own_filter)
+        .filter(
+            ProductionProduct.ledger_generation_id
+            == int(ledger_generation_id)
+        )
         .filter(ProductionOrder.deletion_mark == False)
         .filter(func.lower(func.coalesce(ProductionOrder.order_state_key, "")) != DONE_STATE_KEY)
         .filter(supply_qty > 0)
@@ -312,6 +383,7 @@ def _dbr_owned_qty(
     item_ids: Sequence[int],
     *,
     period_to: date,
+    ledger_generation_id: int,
 ) -> Dict[int, float]:
     """Open DBR journal quantity that may cover this MRP horizon.
 
@@ -345,6 +417,10 @@ def _dbr_owned_qty(
             ProductionOrderLineState.product_id == ProductionProduct.product_id,
         )
         .filter(ProductionProduct.item_id.in_(ids))
+        .filter(
+            ProductionProduct.ledger_generation_id
+            == int(ledger_generation_id)
+        )
         .filter(DbrFeederSignal.status.in_(("Open", "Order Created", "In Work")))
         .filter(remaining_qty > 0)
         .filter(or_(signal_due.is_(None), signal_due <= period_to))
@@ -388,6 +464,7 @@ def _create_catchup_product(
     qty: float,
     req: Optional[MrpRequirement],
     now: datetime,
+    ledger_generation_id: int,
 ) -> tuple[ProductionOrder, ProductionProduct]:
     order = ProductionOrder(
         order_number=_next_catchup_order_number(db, run_id=int(run.run_id), item_id=int(item_id)),
@@ -409,6 +486,7 @@ def _create_catchup_product(
         remaining_qty=qty,
         spec_id=_default_spec_id_for_item(db, int(item_id)),
         source_mrp_requirement_id=int(req.id) if req else None,
+        ledger_generation_id=int(ledger_generation_id),
     )
     db.add(product)
     db.flush()
@@ -445,6 +523,7 @@ def _split_oversized_catchup_batches(
         .filter(ProductionOrder.deletion_mark == False)
         .filter(or_(ProductionOrder.order_state_key.is_(None), func.lower(ProductionOrder.order_state_key) != DONE_STATE_KEY))
         .filter(func.coalesce(ProductionProduct.remaining_qty, 0) > 0)
+        .filter(ProductionProduct.ledger_generation_id.isnot(None))
         .filter(func.coalesce(ProductionProduct.produced_qty, 0) <= EPS)
         .filter(Item.optimal_batch.isnot(None))
         .filter(Item.optimal_batch > 0)
@@ -490,6 +569,7 @@ def _split_oversized_catchup_batches(
                 qty=_to_float(qty),
                 req=req,
                 now=now,
+                ledger_generation_id=int(product.ledger_generation_id),
             )
             created_count += 1
             payload.setdefault("created_order_numbers", []).append(str(new_order.order_number or ""))
@@ -508,23 +588,45 @@ def _materialize_catchup_gap(
     req: Optional[MrpRequirement],
     gap: float,
     now: datetime,
+    ledger_generation_id: int,
 ) -> List[tuple[ProductionOrder, ProductionProduct, float]]:
     item_id = int(item.item_id)
     batch = _to_float(getattr(item, "optimal_batch", None))
     if batch <= EPS:
-        existing_product = _existing_open_catchup_product(db, run_id=int(run.run_id), item_id=item_id)
+        existing_product = _existing_open_catchup_product(
+            db,
+            run_id=int(run.run_id),
+            item_id=item_id,
+            ledger_generation_id=ledger_generation_id,
+        )
         if existing_product is not None:
             existing_product.quantity = _to_float(existing_product.quantity) + gap
             existing_product.remaining_qty = _to_float(existing_product.remaining_qty) + gap
             return [(existing_product.order, existing_product, gap)]
-        order, product = _create_catchup_product(db, run=run, item_id=item_id, qty=gap, req=req, now=now)
+        order, product = _create_catchup_product(
+            db,
+            run=run,
+            item_id=item_id,
+            qty=gap,
+            req=req,
+            now=now,
+            ledger_generation_id=ledger_generation_id,
+        )
         return [(order, product, gap)]
 
     created: List[tuple[ProductionOrder, ProductionProduct, float]] = []
     remaining_gap = _to_float(gap)
     while remaining_gap > EPS:
         qty = min(batch, remaining_gap)
-        order, product = _create_catchup_product(db, run=run, item_id=item_id, qty=qty, req=req, now=now)
+        order, product = _create_catchup_product(
+            db,
+            run=run,
+            item_id=item_id,
+            qty=qty,
+            req=req,
+            now=now,
+            ledger_generation_id=ledger_generation_id,
+        )
         created.append((order, product, qty))
         remaining_gap = max(remaining_gap - qty, 0.0)
     return created
@@ -597,6 +699,7 @@ def _trim_unexported_catchup_production(
     target_qty: float,
     welded_blocked: Set[int],
     dry_run: bool,
+    ledger_generation_id: int,
 ) -> Optional[Dict[str, Any]]:
     """Shrink / delete this run's OWN unexported catch-up production down to
     ``target_qty`` (v2 §8, drift-driven surplus). Only own MRP lines that are not
@@ -616,6 +719,10 @@ def _trim_unexported_catchup_production(
         .filter(ProductionOrder.source == "mrp")
         .filter(ProductionOrder.source_run_id == int(run.run_id))
         .filter(ProductionProduct.item_id == int(item_id))
+        .filter(
+            ProductionProduct.ledger_generation_id
+            == int(ledger_generation_id)
+        )
         .filter(ProductionOrder.deletion_mark == False)
         .filter(ProductionOrder.order_ref1c.is_(None))
         .filter(func.coalesce(ProductionProduct.produced_qty, 0) <= EPS)
@@ -704,7 +811,11 @@ def _trim_unexported_catchup_production(
 
 
 def _own_purchase_coverage(
-    db: Session, run: PlanningRun
+    db: Session,
+    run: PlanningRun,
+    *,
+    ledger_generation_id: int,
+    generation_truth: bool = False,
 ) -> tuple[Set[int], Dict[int, float], Dict[int, float]]:
     """Own purchase coverage for a run (v2 §5).
 
@@ -722,6 +833,10 @@ def _own_purchase_coverage(
     purchases = (
         db.query(PlannedPurchase)
         .filter(PlannedPurchase.run_id == int(run.run_id))
+        .filter(
+            PlannedPurchase.ledger_generation_id
+            == int(ledger_generation_id)
+        )
         .all()
     )
     unexported_pp_qty: Dict[int, float] = {}
@@ -749,12 +864,21 @@ def _own_purchase_coverage(
     exported_pp_ids = set(ref_by_purchase)
     for pp in purchases:
         if int(pp.purchase_id) in exported_pp_ids:
+            if generation_truth:
+                # The accepted reservation projection already owns physical
+                # receipt/coverage truth. Keep the generation's exported
+                # proposal as proposal coverage; never consult mutable
+                # SupplierOrderItem.received_qty here.
+                iid = int(pp.item_id)
+                own_exported_outstanding[iid] = (
+                    own_exported_outstanding.get(iid, 0.0) + _to_float(pp.qty)
+                )
             continue
         iid = int(pp.item_id)
         unexported_pp_qty[iid] = unexported_pp_qty.get(iid, 0.0) + _to_float(pp.qty)
 
     refs = {ref for ref in ref_by_purchase.values() if ref}
-    if refs:
+    if refs and not generation_truth:
         for soi, order in (
             db.query(SupplierOrderItem, SupplierOrder)
             .join(SupplierOrder, SupplierOrder.order_id == SupplierOrderItem.order_id)
@@ -841,7 +965,7 @@ def reconcile_snapshot(
         require_accepted_truth,
     )
 
-    require_accepted_truth(
+    truth = require_accepted_truth(
         db,
         consumer="mrp_reconciliation",
         required_capabilities=(
@@ -850,12 +974,7 @@ def reconcile_snapshot(
             CAPABILITY_EXECUTION_ALLOCATIONS,
         ),
     )
-    if not diagnostic_legacy:
-        raise NotImplementedError(
-            "MRP reconciliation is blocked until generation-scoped execution "
-            "and sizing are implemented"
-        )
-
+    ledger_generation_id = int(truth.generation_id)
     now = datetime.now(timezone.utc)
     open_reqs = (
         db.query(MrpRequirement)
@@ -885,16 +1004,36 @@ def reconcile_snapshot(
         int(r.item_id): r
         for r in db.query(Item).filter(Item.item_id.in_(item_ids)).all()
     }
+    generation_targets = {}
+    if not diagnostic_legacy:
+        generation_targets = _validated_run_generation_targets(
+            db,
+            ledger_generation_id=ledger_generation_id,
+            run_id=int(run.run_id),
+        )
     welded_blocked = is_welded_blocked(db, item_ids)
-    orphan_link_repair = _link_orphan_mrp_products_to_requirements(db, run, req_by_item)
+    orphan_link_repair = (
+        _link_orphan_mrp_products_to_requirements(db, run, req_by_item)
+        if diagnostic_legacy
+        else {"linked": 0, "items": [], "note": "generation lineage only"}
+    )
 
     # needs_freeze: an un-frozen run has no authoritative net to size against —
     # run only the structural repairs (a deploy prerequisite is a full-area
     # refreeze). No sizing, no trim.
     if run.active_freeze_version is None:
-        repairs = _run_repairs(
-            db, run, dry_run=dry_run, manage_tx=manage_tx,
-            welded_blocked=welded_blocked, now=now,
+        repairs = (
+            _run_repairs(
+                db, run, dry_run=dry_run, manage_tx=manage_tx,
+                welded_blocked=welded_blocked, now=now,
+            )
+            if diagnostic_legacy
+            else {
+                "rescheduled": {"status": "skipped", "reason": "generation_strict"},
+                "mrp_order_repair": {"status": "skipped", "reason": "generation_strict"},
+                "mrp_batch_repair": {"status": "skipped", "reason": "generation_strict"},
+                "binding_repair": {"status": "skipped", "reason": "generation_strict"},
+            }
         )
         return {
             "run_id": int(run.run_id),
@@ -914,7 +1053,7 @@ def reconcile_snapshot(
 
     # The ledger cycle populates executed_qty + drift_adjustment_qty; run it now
     # unless the caller (reconcile_all_active) already ran it for the whole scope.
-    if not ledger_cycle_ran:
+    if diagnostic_legacy and not ledger_cycle_ran:
         # Let a ledger-cycle failure propagate. Continuing with the previous
         # executed_qty cache could create or trim real supply from stale facts.
         try:
@@ -924,9 +1063,33 @@ def reconcile_snapshot(
             raise
 
     period_to = run.period_to or max((r.period_to for r in open_reqs), default=date.today())
-    own_open_production = _own_open_production_by_item(db, run, open_req_ids)
-    dbr_owned_qty = _dbr_owned_qty(db, item_ids, period_to=period_to)
-    _exported_pp_ids, unexported_pp_qty, own_exported_outstanding = _own_purchase_coverage(db, run)
+    own_open_production = _own_open_production_by_item(
+        db,
+        run,
+        open_req_ids,
+        ledger_generation_id=ledger_generation_id,
+        generation_truth=not diagnostic_legacy,
+    )
+    dbr_owned_qty = (
+        _dbr_owned_qty(
+            db,
+            item_ids,
+            period_to=period_to,
+            ledger_generation_id=ledger_generation_id,
+        )
+        if diagnostic_legacy
+        else {}
+    )
+    (
+        _exported_pp_ids,
+        unexported_pp_qty,
+        own_exported_outstanding,
+    ) = _own_purchase_coverage(
+        db,
+        run,
+        ledger_generation_id=ledger_generation_id,
+        generation_truth=not diagnostic_legacy,
+    )
 
     production_added: List[Dict[str, Any]] = []
     purchase_added: List[Dict[str, Any]] = []
@@ -942,17 +1105,32 @@ def reconcile_snapshot(
         if item is None or req is None:
             continue
         flow = classify_replenishment_flow(getattr(item, "replenishment_method", None))
-        eff_net = _effective_net(req, db)
-        executed = _to_float(req.executed_qty)
-        desired = max(eff_net - executed, 0.0)
+        if diagnostic_legacy:
+            eff_net = _effective_net(req, db)
+            executed = _to_float(req.executed_qty)
+            desired = max(eff_net - executed, 0.0)
+        else:
+            expected_mode = (
+                "make"
+                if flow == REPLENISHMENT_FLOW_PRODUCTION
+                else "consume"
+                if flow == REPLENISHMENT_FLOW_PURCHASE
+                else None
+            )
+            target = generation_targets.get((int(req.id), expected_mode)) if expected_mode else None
+            desired = _to_float(target.target_qty) if target is not None else 0.0
+            executed = _to_float(target.realized_qty) if target is not None else 0.0
+            eff_net = _to_float(target.reserved_qty) if target is not None else 0.0
         effective_net_total += eff_net
-        drift_adjust_total += _to_float(req.drift_adjustment_qty)
+        if diagnostic_legacy:
+            drift_adjust_total += _to_float(req.drift_adjustment_qty)
 
         # A production/rework-flow item must not carry planned purchases — trim
         # any stale local purchase recommendation to zero (kept unconditionally).
         if flow != REPLENISHMENT_FLOW_PURCHASE and unexported_pp_qty.get(iid, 0.0) > EPS:
             pruned = _trim_unexported_planned_purchases(
                 db, run_id=int(run.run_id), item_id=iid, target_qty=0.0, dry_run=dry_run,
+                ledger_generation_id=ledger_generation_id,
             )
             if pruned:
                 purchase_pruned.append(pruned)
@@ -987,7 +1165,13 @@ def reconcile_snapshot(
                 }
                 if not dry_run:
                     products = _materialize_catchup_gap(
-                        db, run=run, item=item, req=req, gap=gap, now=now
+                        db,
+                        run=run,
+                        item=item,
+                        req=req,
+                        gap=gap,
+                        now=now,
+                        ledger_generation_id=ledger_generation_id,
                     )
                     own_cov += gap
                     own_open_production[iid] = own_cov
@@ -1006,18 +1190,20 @@ def reconcile_snapshot(
                         entry["order_number"] = order.order_number
                         entry["product_id"] = int(product.product_id)
                 production_added.append(entry)
-            elif gap < -EPS:
+            elif gap < -EPS and diagnostic_legacy:
                 trimmed = _trim_unexported_catchup_production(
                     db, run=run, item_id=iid, target_qty=max(desired - dbr_cov, 0.0),
                     welded_blocked=welded_blocked, dry_run=dry_run,
+                    ledger_generation_id=ledger_generation_id,
                 )
                 if trimmed:
                     production_trimmed.append(trimmed)
                     own_cov = max(own_cov - _to_float(trimmed.get("removed_qty")), 0.0)
                     own_open_production[iid] = own_cov
             covered = min(executed + dbr_cov + own_cov, eff_net)
-            req.covered_qty = covered
-            req.remaining_qty = max(eff_net - covered, 0.0)
+            if diagnostic_legacy:
+                req.covered_qty = covered
+                req.remaining_qty = max(eff_net - covered, 0.0)
 
         elif flow == REPLENISHMENT_FLOW_PURCHASE:
             own_cov = _to_float(unexported_pp_qty.get(iid, 0.0)) + _to_float(
@@ -1049,6 +1235,7 @@ def reconcile_snapshot(
                             bucket_date=need_date,
                             supplier_ref1c=getattr(item, "supplier_ref1c", None),
                             source_mrp_requirement_id=int(req.id),
+                            ledger_generation_id=ledger_generation_id,
                         )
                     )
                     unexported_pp_qty[iid] = _to_float(unexported_pp_qty.get(iid, 0.0)) + gap
@@ -1058,6 +1245,7 @@ def reconcile_snapshot(
                 target = max(desired - _to_float(own_exported_outstanding.get(iid, 0.0)), 0.0)
                 pruned = _trim_unexported_planned_purchases(
                     db, run_id=int(run.run_id), item_id=iid, target_qty=target, dry_run=dry_run,
+                    ledger_generation_id=ledger_generation_id,
                 )
                 if pruned:
                     purchase_pruned.append(pruned)
@@ -1069,14 +1257,30 @@ def reconcile_snapshot(
                         own_exported_outstanding.get(iid, 0.0)
                     )
             covered = min(executed + own_cov, eff_net)
-            req.covered_qty = covered
-            req.remaining_qty = max(eff_net - covered, 0.0)
+            if diagnostic_legacy:
+                req.covered_qty = covered
+                req.remaining_qty = max(eff_net - covered, 0.0)
         # rework flow is intentionally not auto-topped-up.
 
-    repairs = _run_repairs(
-        db, run, dry_run=dry_run, manage_tx=manage_tx,
-        welded_blocked=welded_blocked, now=now,
-    )
+    if diagnostic_legacy:
+        repairs = _run_repairs(
+            db, run, dry_run=dry_run, manage_tx=manage_tx,
+            welded_blocked=welded_blocked, now=now,
+        )
+    else:
+        # Structural repair predates generation lineage and scans global rows.
+        # It must not run as a side effect of strict Ledger reconciliation.
+        if manage_tx:
+            if dry_run:
+                db.rollback()
+            else:
+                db.commit()
+        repairs = {
+            "rescheduled": {"status": "skipped", "reason": "generation_strict"},
+            "mrp_order_repair": {"status": "skipped", "reason": "generation_strict"},
+            "mrp_batch_repair": {"status": "skipped", "reason": "generation_strict"},
+            "binding_repair": {"status": "skipped", "reason": "generation_strict"},
+        }
 
     return {
         "run_id": int(run.run_id),
@@ -1339,61 +1543,66 @@ def reconcile_all_active(
             "results": [],
         }
 
-    if not diagnostic_legacy:
-        return {
-            "status": "blocked",
-            "truth_status": truth_state.status,
-            "ledger_generation": truth_state.generation_id,
-            "cutoff": truth_state.cutoff.isoformat() if truth_state.cutoff else None,
-            "truth_reason": (
-                "generation-scoped reconciliation is not implemented; "
-                "legacy executed_qty is forbidden"
-            ),
-            "dry_run": bool(dry_run),
-            "runs_checked": 0,
-            "production_lines_added": 0,
-            "purchase_lines_added": 0,
-            "purchase_lines_pruned": 0,
-            "production_lines_trimmed": 0,
-            "execution_ledger": None,
-            "results": [],
-        }
-
     execution_ledger: Dict[str, Any]
-    try:
-        execution_ledger = run_ledger_cycle(db, diagnostic_legacy=True)
-        if not dry_run:
-            db.commit()
-    except Exception as exc:  # noqa: BLE001 — fail closed, never size from stale executed_qty
-        db.rollback()
-        return {
-            "status": "blocked",
-            "truth_status": "unavailable",
-            "truth_generation_id": (
-                truth_state.get("generation_id")
-                if isinstance(truth_state, dict)
-                else getattr(truth_state, "generation_id", None)
-            ),
-            "ledger_generation": (
-                truth_state.get("generation_id")
-                if isinstance(truth_state, dict)
-                else getattr(truth_state, "generation_id", None)
-            ),
-            "truth_reason": f"ledger_cycle_failed: {exc}",
-            "dry_run": bool(dry_run),
-            "runs_checked": 0,
-            "production_lines_added": 0,
-            "purchase_lines_added": 0,
-            "purchase_lines_pruned": 0,
-            "production_lines_trimmed": 0,
-            "execution_ledger": {"status": "error", "error": str(exc)},
-            "results": [],
+    if diagnostic_legacy:
+        try:
+            execution_ledger = run_ledger_cycle(db, diagnostic_legacy=True)
+            if not dry_run:
+                db.commit()
+        except Exception as exc:  # noqa: BLE001 — diagnostic path remains fail closed
+            db.rollback()
+            return {
+                "status": "blocked",
+                "truth_status": "unavailable",
+                "ledger_generation": truth_state.generation_id,
+                "truth_reason": f"ledger_cycle_failed: {exc}",
+                "dry_run": bool(dry_run),
+                "runs_checked": 0,
+                "production_lines_added": 0,
+                "purchase_lines_added": 0,
+                "purchase_lines_pruned": 0,
+                "production_lines_trimmed": 0,
+                "execution_ledger": {"status": "error", "error": str(exc)},
+                "results": [],
+            }
+    else:
+        execution_ledger = {
+            "status": "accepted",
+            "ledger_generation_id": int(truth_state.generation_id),
+            "source": "reservation_event+mrp_execution_allocation",
         }
 
     # 2) Per-run drift-correction sizing. The ledger already ran, so pass
     # ledger_cycle_ran=True; on a non-dry run each snapshot owns its own commit,
     # on a dry run the outer rollback below is authoritative (manage_tx=False).
     run_ids = _latest_active_snapshot_run_ids(db)
+    if not diagnostic_legacy:
+        try:
+            # Validate the complete action scope before the first proposal or
+            # repair mutation. Per-run validation below is then a defensive
+            # repeat inside the same transaction.
+            for rid in run_ids:
+                _validated_run_generation_targets(
+                    db,
+                    ledger_generation_id=int(truth_state.generation_id),
+                    run_id=int(rid),
+                )
+        except GenerationReconciliationMismatch as exc:
+            db.rollback()
+            return {
+                "status": "blocked",
+                "truth_status": "unavailable",
+                "ledger_generation": int(truth_state.generation_id),
+                "truth_reason": f"generation_reconciliation_mismatch: {exc}",
+                "dry_run": bool(dry_run),
+                "runs_checked": 0,
+                "production_lines_added": 0,
+                "purchase_lines_added": 0,
+                "purchase_lines_pruned": 0,
+                "production_lines_trimmed": 0,
+                "execution_ledger": execution_ledger,
+                "results": [],
+            }
     results: List[Dict[str, Any]] = []
     total_production = 0
     total_purchase = 0
@@ -1402,8 +1611,8 @@ def reconcile_all_active(
     for rid in run_ids:
         try:
             res = reconcile_snapshot(
-                db, rid, dry_run=dry_run, ledger_cycle_ran=True,
-                manage_tx=not dry_run, diagnostic_legacy=True,
+                db, rid, dry_run=dry_run, ledger_cycle_ran=diagnostic_legacy,
+                manage_tx=not dry_run, diagnostic_legacy=diagnostic_legacy,
             )
             total_production += len(res.get("production_added", []))
             total_purchase += len(res.get("purchase_added", []))

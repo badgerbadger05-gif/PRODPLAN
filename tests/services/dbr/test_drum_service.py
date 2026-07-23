@@ -210,6 +210,7 @@ def test_database_rejects_two_active_schedules_across_independent_sessions(tmp_p
     try:
         first.add(
             DbrDrumSchedule(
+                ledger_generation_id=1,
                 period_from=date(2026, 8, 1),
                 period_to=date(2026, 8, 31),
                 status="active",
@@ -218,6 +219,7 @@ def test_database_rejects_two_active_schedules_across_independent_sessions(tmp_p
         first.commit()
         second.add(
             DbrDrumSchedule(
+                ledger_generation_id=1,
                 period_from=date(2026, 9, 1),
                 period_to=date(2026, 9, 30),
                 status="active",

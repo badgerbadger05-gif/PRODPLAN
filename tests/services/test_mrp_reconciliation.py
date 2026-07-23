@@ -1,6 +1,6 @@
 """Tests for MRP reconciliation and the covered_qty rollback that feeds it."""
 
-from datetime import date
+from datetime import date, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -9,10 +9,12 @@ from app.models import (
     DefaultSpecification,
     DbrFeederSignal,
     Item,
+    LedgerGeneration,
     MrpFreezeAllocation,
     MrpRequirement,
     PaintWeldPair,
     PlannedPurchase,
+    PhysicalImportBatch,
     PlanningRun,
     ProductionOrder,
     ProductionOrderLineState,
@@ -51,24 +53,69 @@ DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
 
 
 def reconcile_snapshot(db, run_id, **kwargs):
+    _attach_diagnostic_proposal_lineage(db)
     return _public_reconcile_snapshot(
         db, run_id, diagnostic_legacy=True, **kwargs
     )
 
 
 def reconcile_all_active(db, **kwargs):
+    _attach_diagnostic_proposal_lineage(db)
     return _public_reconcile_all_active(db, diagnostic_legacy=True, **kwargs)
 
 
 @pytest.fixture(autouse=True)
-def _accepted_planning_truth(monkeypatch):
+def _accepted_planning_truth(db_session, monkeypatch):
     """Existing sizing scenarios explicitly run under an accepted truth."""
+    batch = PhysicalImportBatch(
+        batch_key="mrp-reconciliation-diagnostic",
+        status="completed",
+        cutoff=datetime(2026, 7, 23),
+        source_watermarks={"source": "test-diagnostic"},
+        completed_at=datetime(2026, 7, 23),
+    )
+    generation = LedgerGeneration(
+        generation_key="mrp-reconciliation-diagnostic",
+        status="accepted",
+        cutoff=datetime(2026, 7, 23),
+        source_watermarks={},
+        capabilities={},
+        physical_import_batch=batch,
+        algorithm_version="test/diagnostic",
+        accepted_at=datetime(2026, 7, 23),
+    )
+    db_session.add(generation)
+    db_session.flush()
+    db_session.info["diagnostic_ledger_generation_id"] = generation.id
     monkeypatch.setattr(
         "app.services.planning_truth.require_accepted_truth",
         lambda db, consumer, **kwargs: SimpleNamespace(
-            status="accepted", generation_id=1, cutoff=None, reason=None
+            status="accepted",
+            generation_id=generation.id,
+            cutoff=generation.cutoff,
+            reason=None,
         ),
     )
+
+
+def _attach_diagnostic_proposal_lineage(db):
+    """Every unlineaged proposal in this isolated legacy scenario is owned by
+    its explicit diagnostic generation. Production code never performs this
+    backfill and continues to exclude NULL lineage."""
+    generation_id = int(db.info["diagnostic_ledger_generation_id"])
+    db.query(ProductionProduct).filter(
+        ProductionProduct.ledger_generation_id.is_(None)
+    ).update(
+        {"ledger_generation_id": generation_id},
+        synchronize_session=False,
+    )
+    db.query(PlannedPurchase).filter(
+        PlannedPurchase.ledger_generation_id.is_(None)
+    ).update(
+        {"ledger_generation_id": generation_id},
+        synchronize_session=False,
+    )
+    db.flush()
 
 
 def test_reconcile_all_active_fails_closed_without_accepted_truth(
@@ -90,7 +137,7 @@ def test_reconcile_all_active_fails_closed_without_accepted_truth(
     assert result["execution_ledger"] is None
 
 
-def test_public_reconcile_is_blocked_even_with_accepted_truth_and_writes_nothing(
+def test_public_reconcile_uses_accepted_generation_and_writes_nothing_without_runs(
     db_session,
 ):
     before_products = db_session.query(ProductionProduct).count()
@@ -98,9 +145,11 @@ def test_public_reconcile_is_blocked_even_with_accepted_truth_and_writes_nothing
 
     result = _public_reconcile_all_active(db_session)
 
-    assert result["status"] == "blocked"
+    assert result["status"] == "ok"
     assert result["runs_checked"] == 0
-    assert result["execution_ledger"] is None
+    assert result["execution_ledger"]["source"] == (
+        "reservation_event+mrp_execution_allocation"
+    )
     assert db_session.query(ProductionProduct).count() == before_products
     assert db_session.query(PlannedPurchase).count() == before_purchases
 

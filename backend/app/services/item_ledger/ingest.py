@@ -98,6 +98,10 @@ class PullResult:
     error: Optional[str] = None
 
 
+class HistoricalPullValidationError(ValueError):
+    """A recorder cannot join a strict, cutoff-bounded historical prefix."""
+
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
@@ -311,6 +315,8 @@ def pull_recorder_movements(
     source: Optional[str] = None,
     import_batch: Optional[models.PhysicalImportBatch] = None,
     ledger_generation_id: Optional[int] = None,
+    max_posting_at: Optional[datetime] = None,
+    strict_historical: bool = False,
 ) -> PullResult:
     """Pull one 1С recorder's RecordSet → ledger-1 (design §3а steps 1–5).
 
@@ -351,12 +357,37 @@ def pull_recorder_movements(
     # --- normalize (dirt filter + anchor guard) ---
     normalized: List[Tuple[LedgerKey, Decimal, str, str, datetime]] = []
     for line in lines:
+        parsed_period = _parse_period(line.get("Period"))
+        if parsed_period is None and (strict_historical or max_posting_at is not None):
+            raise HistoricalPullValidationError(
+                f"malformed Period in {recorder_type} {recorder_ref} "
+                f"line {line.get('LineNumber')}: {line.get('Period')!r}"
+            )
+        if parsed_period is not None and max_posting_at is not None:
+            try:
+                beyond_cutoff = parsed_period > max_posting_at
+            except TypeError as exc:
+                raise HistoricalPullValidationError(
+                    "recorder Period timezone does not match historical cutoff"
+                ) from exc
+            if beyond_cutoff:
+                raise HistoricalPullValidationError(
+                    f"recorder movement {parsed_period.isoformat()} exceeds "
+                    f"historical cutoff {max_posting_at.isoformat()} in "
+                    f"{recorder_type} {recorder_ref}"
+                )
         if line.get("Active") is False:
             result.skipped_inactive += 1
             continue
 
         wh = _norm_ref(line.get("СтруктурнаяЕдиница_Key"))
         if wh not in warehouses:
+            if strict_historical:
+                raise HistoricalPullValidationError(
+                    f"unknown warehouse ref {wh or '<empty>'} "
+                    f"(line {line.get('LineNumber')}) in "
+                    f"{recorder_type} {recorder_ref}"
+                )
             result.skipped_non_warehouse += 1
             continue
 
@@ -372,6 +403,12 @@ def pull_recorder_movements(
         item_ref = _norm_ref(line.get("Номенклатура_Key"))
         item_id = item_by_ref.get(item_ref)
         if item_id is None:
+            if strict_historical:
+                raise HistoricalPullValidationError(
+                    f"unknown item ref {item_ref or '<empty>'} "
+                    f"(line {line.get('LineNumber')}) in "
+                    f"{recorder_type} {recorder_ref}"
+                )
             result.skipped_unknown_item += 1
             if len(result.diagnostics) < 50:
                 result.diagnostics.append(
@@ -388,7 +425,7 @@ def pull_recorder_movements(
         char = _norm_ref(line.get("Характеристика_Key"))
         org = _norm_ref(line.get("Организация_Key"))
         line_no = str(line.get("LineNumber") or "")
-        posting_at = _parse_period(line.get("Period")) or datetime.now()
+        posting_at = parsed_period or datetime.now()
 
         key = LedgerKey(int(item_id), char, org, wh)
 

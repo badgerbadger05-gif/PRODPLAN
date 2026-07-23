@@ -24,6 +24,7 @@ from ..replenishment import (
     classify_replenishment_flow,
 )
 from . import adapters, classify as classify_mod
+from .generation import DbrProjectionUnavailable, require_generation
 from .core.drum import kit as kit_mod
 from .core.feeder import adu, demand_explosion, zones
 
@@ -55,8 +56,12 @@ def _batch_days(route_text: str, *, is_w3: bool, settings) -> float:
     return float(settings.batch_days_turning or 0)
 
 
-def _resolve_schedule(db: Session, schedule_id: Optional[int]) -> DbrDrumSchedule:
-    query = db.query(DbrDrumSchedule)
+def _resolve_schedule(
+    db: Session, schedule_id: Optional[int], ledger_generation_id: int
+) -> DbrDrumSchedule:
+    query = db.query(DbrDrumSchedule).filter(
+        DbrDrumSchedule.ledger_generation_id == ledger_generation_id
+    )
     if schedule_id is not None:
         schedule = query.filter(DbrDrumSchedule.id == schedule_id).one_or_none()
     else:
@@ -98,9 +103,20 @@ def _assert_acyclic(roots, components_of, node_for) -> None:
         walk(root, ())
 
 
-def preview_positions(db: Session, schedule_id: Optional[int] = None) -> dict[str, Any]:
+def preview_positions(
+    db: Session,
+    schedule_id: Optional[int] = None,
+    *,
+    ledger_generation_id: int,
+    diagnostic_legacy: bool = False,
+) -> dict[str, Any]:
     """Calculate static positions without writing any database row."""
-    schedule = _resolve_schedule(db, schedule_id)
+    if not diagnostic_legacy:
+        raise DbrProjectionUnavailable(
+            "Ledger-native DBR position preview is not implemented; "
+            "legacy stock calculators cannot represent accepted truth"
+        )
+    schedule = _resolve_schedule(db, schedule_id, ledger_generation_id)
     settings = db.get(DbrSettings, 1)
     if settings is None:
         raise ValueError("настройки DBR не созданы")
@@ -269,17 +285,36 @@ def rebuild_positions(
     db: Session,
     schedule_id: Optional[int] = None,
     expected_schedule_id: Optional[int] = None,
+    *,
+    ledger_generation_id: int | None,
+    diagnostic_legacy: bool = False,
 ) -> dict[str, Any]:
+    generation_id = require_generation(
+        db, ledger_generation_id, consumer="dbr_positions_rebuild"
+    )
+    if not diagnostic_legacy:
+        raise DbrProjectionUnavailable(
+            "Ledger-native DBR position builder is not implemented; "
+            "legacy stock calculators cannot be stamped as accepted truth"
+        )
     if db.get_bind().dialect.name == "postgresql":
         db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _REBUILD_LOCK})
-    preview = preview_positions(db, schedule_id)
+    preview = preview_positions(
+        db,
+        schedule_id,
+        ledger_generation_id=generation_id,
+        diagnostic_legacy=True,
+    )
     if expected_schedule_id is not None and preview["schedule_id"] != expected_schedule_id:
         raise ValueError(
             f"активный график изменился: ожидался {expected_schedule_id}, получен {preview['schedule_id']}"
         )
     existing = {
         (row.item_id, row.warehouse_ref1c): row
-        for row in db.query(DbrSupermarketPosition).with_for_update().all()
+        for row in db.query(DbrSupermarketPosition)
+        .filter(DbrSupermarketPosition.ledger_generation_id == generation_id)
+        .with_for_update()
+        .all()
     }
     seen = set()
     created = updated = 0
@@ -294,7 +329,11 @@ def rebuild_positions(
         seen.add(key)
         obj = existing.get(key)
         if obj is None:
-            obj = DbrSupermarketPosition(item_id=key[0], warehouse_ref1c=key[1])
+            obj = DbrSupermarketPosition(
+                ledger_generation_id=generation_id,
+                item_id=key[0],
+                warehouse_ref1c=key[1],
+            )
             db.add(obj)
             created += 1
         else:

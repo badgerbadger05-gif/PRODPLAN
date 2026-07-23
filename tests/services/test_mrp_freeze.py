@@ -13,11 +13,44 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _accepted_planning_truth(monkeypatch):
+def _accepted_planning_truth(db_session, monkeypatch):
+    """Give legacy freeze scenarios one explicit mutable diagnostic lineage."""
+    from app.models import (
+        LedgerGeneration,
+        PhysicalImportBatch,
+        PlanningTruthState,
+    )
+
+    batch = PhysicalImportBatch(
+        batch_key="mrp-freeze-diagnostic",
+        status="completed",
+        cutoff=datetime(2026, 7, 23),
+        source_watermarks={"source": "test-diagnostic"},
+        completed_at=datetime(2026, 7, 23),
+    )
+    generation = LedgerGeneration(
+        generation_key="mrp-freeze-diagnostic",
+        status="building",
+        cutoff=datetime(2026, 7, 23),
+        source_watermarks={},
+        capabilities={},
+        physical_import_batch=batch,
+        algorithm_version="test/diagnostic",
+    )
+    db_session.add(generation)
+    db_session.flush()
+    db_session.add(
+        PlanningTruthState(id=1, current_generation_id=generation.id)
+    )
+    db_session.flush()
+    db_session.info["diagnostic_ledger_generation_id"] = generation.id
     monkeypatch.setattr(
         "app.services.planning_truth.require_accepted_truth",
         lambda db, consumer, **kwargs: SimpleNamespace(
-            status="accepted", generation_id=1, cutoff=None, reason=None
+            status="accepted",
+            generation_id=generation.id,
+            cutoff=generation.cutoff,
+            reason=None,
         ),
     )
 
@@ -49,7 +82,26 @@ from app.services.mrp_freeze import (
 from app.services.mrp_reconciliation import reconcile_snapshot as _public_reconcile_snapshot
 
 
+def _attach_diagnostic_proposal_lineage(db):
+    """Own legacy fixture proposals by this test's explicit generation."""
+    generation_id = int(db.info["diagnostic_ledger_generation_id"])
+    db.query(ProductionProduct).filter(
+        ProductionProduct.ledger_generation_id.is_(None)
+    ).update(
+        {"ledger_generation_id": generation_id},
+        synchronize_session=False,
+    )
+    db.query(PlannedPurchase).filter(
+        PlannedPurchase.ledger_generation_id.is_(None)
+    ).update(
+        {"ledger_generation_id": generation_id},
+        synchronize_session=False,
+    )
+    db.flush()
+
+
 def reconcile_snapshot(db, run_id, **kwargs):
+    _attach_diagnostic_proposal_lineage(db)
     return _public_reconcile_snapshot(
         db, run_id, diagnostic_legacy=True, **kwargs
     )

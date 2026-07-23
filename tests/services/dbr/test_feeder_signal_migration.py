@@ -12,7 +12,7 @@ def test_orm_schema_has_signal_constraints_and_safe_settings_default():
     Base.metadata.create_all(engine)
     columns = {row["name"]: row for row in inspect(engine).get_columns("dbr_feeder_signal")}
     unique = {tuple(row["column_names"]) for row in inspect(engine).get_unique_constraints("dbr_feeder_signal")}
-    assert ("dedup_key",) in unique
+    assert ("ledger_generation_id", "dedup_key") in unique
     assert columns["kit_force"]["nullable"] is False
     assert columns["priority"]["nullable"] is False
     assert columns["drum_slot_id"]["nullable"] is True

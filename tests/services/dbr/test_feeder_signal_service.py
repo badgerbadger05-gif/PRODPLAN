@@ -133,10 +133,15 @@ def test_postgres_refresh_locks_before_preview(monkeypatch):
         def execute(self, statement, params):
             events.append((str(statement), params))
 
-    def preview(db):
+    def preview(db, **_kwargs):
         assert events and "pg_advisory_xact_lock" in events[0][0]
         return {"schedule_id": 1, "positions": 0, "actionable": 0, "rows": []}
 
+    monkeypatch.setattr(
+        feeder_signal_service,
+        "require_generation",
+        lambda db, generation_id, **kwargs: int(generation_id),
+    )
     monkeypatch.setattr(feeder_signal_service, "preview_signals", preview)
     try:
         feeder_signal_service.refresh_signals(FakeDb(), expected_schedule_id=2)

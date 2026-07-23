@@ -28,6 +28,7 @@ from . import adapters, classify as classify_mod
 from .journal_bridge import sync_journal_rows
 from .core.drum.kit import build_kit
 from . import feeder_material_service, feeder_nfp_service
+from .generation import DbrProjectionUnavailable, require_generation
 from .core.feeder import signal_identity, zones
 
 _REFRESH_LOCK = 0x4442525349474E4C
@@ -41,10 +42,15 @@ def _norm(value: Any) -> str:
     return str(value or "").strip().casefold()
 
 
-def _active_schedule(db: Session) -> Optional[DbrDrumSchedule]:
+def _active_schedule(
+    db: Session, ledger_generation_id: int
+) -> Optional[DbrDrumSchedule]:
     return (
         db.query(DbrDrumSchedule)
-        .filter(DbrDrumSchedule.status == "active")
+        .filter(
+            DbrDrumSchedule.status == "active",
+            DbrDrumSchedule.ledger_generation_id == ledger_generation_id,
+        )
         .one_or_none()
     )
 
@@ -65,6 +71,8 @@ def _under_schedule_rows(
         .filter(
             DbrSupermarketPosition.is_active.is_(True),
             DbrSupermarketPosition.mode == "under_schedule",
+            DbrSupermarketPosition.ledger_generation_id
+            == schedule.ledger_generation_id,
         )
         .all()
     )
@@ -226,13 +234,24 @@ def _kit_shortages(db: Session, schedule: Optional[DbrDrumSchedule]) -> dict[tup
     return result
 
 
-def preview_signals(db: Session) -> dict[str, Any]:
-    schedule = _active_schedule(db)
+def preview_signals(
+    db: Session,
+    *,
+    ledger_generation_id: int,
+    diagnostic_legacy: bool = False,
+) -> dict[str, Any]:
+    if not diagnostic_legacy:
+        raise DbrProjectionUnavailable(
+            "Ledger-native DBR signal preview is not implemented; "
+            "legacy stock/WIP calculators cannot represent accepted truth"
+        )
+    schedule = _active_schedule(db, ledger_generation_id)
     positions = (
         db.query(DbrSupermarketPosition)
         .filter(
             DbrSupermarketPosition.is_active.is_(True),
             DbrSupermarketPosition.mode == "shelf",
+            DbrSupermarketPosition.ledger_generation_id == ledger_generation_id,
         )
         .order_by(DbrSupermarketPosition.id)
         .all()
@@ -248,7 +267,10 @@ def preview_signals(db: Session) -> dict[str, Any]:
     existing = {
         row.supermarket_position_id: row
         for row in db.query(DbrFeederSignal)
-        .filter(DbrFeederSignal.signal_type == "Пополнение").all()
+        .filter(
+            DbrFeederSignal.signal_type == "Пополнение",
+            DbrFeederSignal.ledger_generation_id == ledger_generation_id,
+        ).all()
     }
     rows = []
     for position in positions:
@@ -305,7 +327,10 @@ def preview_signals(db: Session) -> dict[str, Any]:
     existing_schedule = {
         row.dedup_key: row
         for row in db.query(DbrFeederSignal)
-        .filter(DbrFeederSignal.signal_type == "Под график").all()
+        .filter(
+            DbrFeederSignal.signal_type == "Под график",
+            DbrFeederSignal.ledger_generation_id == ledger_generation_id,
+        ).all()
     }
     for row in schedule_rows:
         current = existing_schedule.get(row["dedup_key"])
@@ -328,17 +353,38 @@ def preview_signals(db: Session) -> dict[str, Any]:
     }
 
 
-def refresh_signals(db: Session, expected_schedule_id: Optional[int] = None) -> dict[str, Any]:
+def refresh_signals(
+    db: Session,
+    expected_schedule_id: Optional[int] = None,
+    *,
+    ledger_generation_id: int | None,
+    diagnostic_legacy: bool = False,
+) -> dict[str, Any]:
+    generation_id = require_generation(
+        db, ledger_generation_id, consumer="dbr_signals_refresh"
+    )
+    if not diagnostic_legacy:
+        raise DbrProjectionUnavailable(
+            "Ledger-native DBR signal builder is not implemented; "
+            "legacy stock/WIP calculators cannot be stamped as accepted truth"
+        )
     if db.get_bind().dialect.name == "postgresql":
         db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _REFRESH_LOCK})
-    preview = preview_signals(db)
+    preview = preview_signals(
+        db,
+        ledger_generation_id=generation_id,
+        diagnostic_legacy=True,
+    )
     if expected_schedule_id is not None and preview["schedule_id"] != expected_schedule_id:
         raise ValueError(
             f"активный график изменился: ожидался {expected_schedule_id}, получен {preview['schedule_id']}"
         )
     current = {
         row.dedup_key: row
-        for row in db.query(DbrFeederSignal).with_for_update().all()
+        for row in db.query(DbrFeederSignal)
+        .filter(DbrFeederSignal.ledger_generation_id == generation_id)
+        .with_for_update()
+        .all()
     }
     now = datetime.now()
     created = updated = reopened = cancelled = diagnostic = 0
@@ -364,6 +410,7 @@ def refresh_signals(db: Session, expected_schedule_id: Optional[int] = None) -> 
             continue
         if signal is None:
             signal = DbrFeederSignal(
+                ledger_generation_id=generation_id,
                 dedup_key=dedup_key,
                 supermarket_position_id=position_id,
                 item_id=data["item_id"],
@@ -439,6 +486,7 @@ def refresh_signals(db: Session, expected_schedule_id: Optional[int] = None) -> 
 def signal_out(signal: DbrFeederSignal) -> dict[str, Any]:
     return {
         "id": signal.id,
+        "ledger_generation_id": signal.ledger_generation_id,
         "dedup_key": signal.dedup_key,
         "signal_type": signal.signal_type,
         "position_id": signal.supermarket_position_id,

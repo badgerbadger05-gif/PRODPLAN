@@ -48,10 +48,6 @@ from .processing_stock_sync import (
 )
 from .nomenclature_groups_sync import refresh_nomenclature_groups
 from .item_ledger.ingest import is_retryable_error, process_pending_pulls
-from .dbr.feeder_position_service import rebuild_positions
-from .dbr.feeder_signal_service import refresh_signals
-from .dbr.feeder_chain_service import refresh_chain_signals
-from .dbr.gate_service import refresh_gate
 from .. import models
 
 
@@ -271,22 +267,14 @@ def _dbr_full_due(state: Dict[str, Any], now: datetime) -> bool:
 
 def _run_dbr_maintenance(db: Session, *, full: bool) -> Dict[str, Any]:
     """Run one atomic DBR maintenance unit; commit only after every stage."""
-    summary: Dict[str, Any] = {}
-    try:
-        if full:
-            positions = rebuild_positions(db)
-            summary["positions"] = positions
-            expected_schedule_id = positions.get("schedule_id")
-            summary["signals"] = refresh_signals(db, expected_schedule_id=expected_schedule_id)
-        else:
-            summary["signals"] = refresh_signals(db)
-        summary["chain"] = refresh_chain_signals(db)
-        summary["gate"] = refresh_gate(db)
-        db.commit()
-    except Exception:
-        db.rollback()
-        raise
-    return summary
+    # Fail closed: these existing calculators read mutable legacy stock/WIP.
+    # Running them under an accepted generation would launder that data into
+    # Ledger lineage. Resume only after a Ledger-native builder exists.
+    return {
+        "status": "skipped",
+        "reason": "dbr_ledger_projection_unavailable",
+        "full": bool(full),
+    }
 
 
 def pull_queue_health(db: Optional[Session]) -> Dict[str, int]:

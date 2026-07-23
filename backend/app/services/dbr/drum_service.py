@@ -21,6 +21,7 @@ from ...models import (
 )
 from . import adapters
 from . import settings_service
+from .generation import require_generation
 from .core.drum.leveling import level
 from .core.drum.program_input import (
     ProgramRow,
@@ -147,12 +148,20 @@ def _append_result(db: Session, schedule: DbrDrumSchedule, result, program_id, n
     return added
 
 
-def build_schedule(db: Session, program_id: int) -> tuple[DbrDrumSchedule, dict[str, Any]]:
+def build_schedule(
+    db: Session,
+    program_id: int,
+    *,
+    ledger_generation_id: int | None,
+) -> tuple[DbrDrumSchedule, dict[str, Any]]:
     """Build a Draft drum schedule from an approved program.
 
     Returns (schedule, meta) where meta carries carried_over + calendar
     fallback flag (transient, not persisted — mirrors prodflow's _carried_over).
     """
+    generation_id = require_generation(
+        db, ledger_generation_id, consumer="dbr_drum_build"
+    )
     program = db.get(DbrProductionProgram, program_id)
     if program is None:
         raise LookupError("program not found")
@@ -167,6 +176,7 @@ def build_schedule(db: Session, program_id: int) -> tuple[DbrDrumSchedule, dict[
     config_snapshot = _config_snapshot(settings)
     config_snapshot["calendar_fallback"] = fallback
     schedule = DbrDrumSchedule(
+        ledger_generation_id=generation_id,
         period_from=program.from_date,
         period_to=program.to_date,
         source_program_id=program.id,

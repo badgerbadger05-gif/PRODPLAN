@@ -24,8 +24,10 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..database import get_db
+from ..services import planning_truth
 from ..services.dbr import (
     board_service,
+    cockpit_snapshot_service,
     drum_service,
     feeder_chain_service,
     feeder_material_service,
@@ -42,6 +44,7 @@ from ..services.dbr import (
     slot_service,
 )
 from ..services.dbr.materialize_service import MaterializeConflict
+from ..services.dbr.generation import DbrProjectionUnavailable
 from ..services.dbr.processing_materialize_preview import ProcessingPreviewConflict
 
 router = APIRouter(prefix="/v1/dbr", tags=["dbr"])
@@ -275,9 +278,21 @@ def preview_feeder_positions(
     payload: PositionPreviewRequest, db: Session = Depends(get_db)
 ):
     try:
-        return feeder_position_service.preview_positions(db, payload.schedule_id)
+        truth = planning_truth.require_accepted_truth(
+            db, "dbr_positions_preview"
+        )
+        return feeder_position_service.preview_positions(
+            db,
+            payload.schedule_id,
+            ledger_generation_id=int(truth.generation_id),
+        )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    except DbrProjectionUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": exc.code, "reason": str(exc)},
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -288,13 +303,22 @@ def rebuild_feeder_positions(
     db: Session = Depends(get_dbr_write_db, scope="function"),
 ):
     try:
+        truth = planning_truth.require_accepted_truth(
+            db, "dbr_positions_rebuild"
+        )
         return feeder_position_service.rebuild_positions(
             db,
             schedule_id=payload.schedule_id,
             expected_schedule_id=payload.expected_schedule_id,
+            ledger_generation_id=int(truth.generation_id),
         )
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    except DbrProjectionUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": exc.code, "reason": str(exc)},
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -313,19 +337,22 @@ def get_feeder_positions(
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ):
-    return feeder_position_service.query_position_views(
-        db,
-        include_live_nfp=include_live_nfp,
-        active=active,
-        active_only=active_only,
-        mode=mode,
-        supply=supply,
-        warehouse=warehouse,
-        zone=zone,
-        search=search,
-        limit=limit,
-        offset=offset,
-    )
+    try:
+        return cockpit_snapshot_service.query_positions(
+            db,
+            include_live_nfp=include_live_nfp,
+            active=active,
+            active_only=active_only,
+            mode=mode,
+            supply=supply,
+            warehouse=warehouse,
+            zone=zone,
+            search=search,
+            limit=limit,
+            offset=offset,
+        )
+    except cockpit_snapshot_service.DbrCockpitSnapshotUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
 
 
 @router.get("/feeder/positions/{position_id}")
@@ -349,7 +376,10 @@ def get_feeder_position(
 
 @router.post("/feeder/signals/preview")
 def preview_feeder_signals(db: Session = Depends(get_db)):
-    return feeder_signal_service.preview_signals(db)
+    truth = planning_truth.require_accepted_truth(db, "dbr_signals_preview")
+    return feeder_signal_service.preview_signals(
+        db, ledger_generation_id=int(truth.generation_id)
+    )
 
 
 @router.post("/feeder/signals/refresh")
@@ -358,7 +388,19 @@ def refresh_feeder_signals(
     db: Session = Depends(get_dbr_write_db, scope="function"),
 ):
     try:
-        return feeder_signal_service.refresh_signals(db, payload.expected_schedule_id)
+        truth = planning_truth.require_accepted_truth(
+            db, "dbr_signals_refresh"
+        )
+        return feeder_signal_service.refresh_signals(
+            db,
+            payload.expected_schedule_id,
+            ledger_generation_id=int(truth.generation_id),
+        )
+    except DbrProjectionUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": exc.code, "reason": str(exc)},
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
 
@@ -373,10 +415,13 @@ def get_feeder_signals(
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ):
-    return feeder_signal_service.list_signals(
-        db, status=status, zone=zone, signal_type=signal_type,
-        search=search, limit=limit, offset=offset
-    )
+    try:
+        return cockpit_snapshot_service.query_signals(
+            db, status=status, zone=zone, signal_type=signal_type,
+            search=search, limit=limit, offset=offset,
+        )
+    except cockpit_snapshot_service.DbrCockpitSnapshotUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
 
 
 @router.get("/feeder/signals/{signal_id}")
@@ -395,9 +440,9 @@ def get_feeder_signal(signal_id: int, db: Session = Depends(get_db)):
 @router.get("/feeder/deficits")
 def get_feeder_deficits(db: Session = Depends(get_db)):
     try:
-        return feeder_material_service.get_deficits(db)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        return cockpit_snapshot_service.get_deficits(db)
+    except cockpit_snapshot_service.DbrCockpitSnapshotUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
 
 
 @router.get("/feeder/processing/board")
@@ -405,9 +450,9 @@ def get_processing_board(db: Session = Depends(get_db)):
     """Борд давальческого контура (питатель №3): NFP-разложение processing-
     позиций, открытые заказы переработчику и алерты просроченного кругорейса."""
     try:
-        return processing_board_service.processing_board(db)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        return cockpit_snapshot_service.get_processing_board(db)
+    except cockpit_snapshot_service.DbrCockpitSnapshotUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
 
 
 @router.get("/feeder/processing/trip-manifest")
@@ -592,6 +637,7 @@ class SlotMove(BaseModel):
 def _schedule_out(schedule) -> dict[str, Any]:
     return {
         "id": schedule.id,
+        "ledger_generation_id": schedule.ledger_generation_id,
         "period_from": schedule.period_from,
         "period_to": schedule.period_to,
         "source_program_id": schedule.source_program_id,
@@ -606,7 +652,12 @@ def drum_build(
     db: Session = Depends(get_dbr_write_db, scope="function"),
 ):
     try:
-        schedule, meta = drum_service.build_schedule(db, payload.program_id)
+        truth = planning_truth.require_accepted_truth(db, "dbr_drum_build")
+        schedule, meta = drum_service.build_schedule(
+            db,
+            payload.program_id,
+            ledger_generation_id=int(truth.generation_id),
+        )
     except LookupError:
         raise HTTPException(status_code=404, detail="program not found")
     except ValueError as exc:

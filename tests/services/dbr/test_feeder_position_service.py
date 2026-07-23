@@ -177,6 +177,7 @@ def test_database_rejects_duplicate_position_from_independent_session(db_session
     try:
         fresh.add(
             DbrSupermarketPosition(
+                ledger_generation_id=original.ledger_generation_id,
                 item_id=original.item_id,
                 warehouse_ref1c=original.warehouse_ref1c,
                 supply_type="manufacture",
