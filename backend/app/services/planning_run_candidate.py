@@ -146,3 +146,160 @@ def create_candidate_run(
     db.add(candidate)
     db.flush()
     return candidate
+
+
+def _require_added_plan_and_target(
+    db: Session,
+    *,
+    source_plan_id: int,
+    target_generation_id: int,
+) -> tuple[models.ProductionPlanHeader, models.LedgerGeneration]:
+    """Validate the first-run (``add``) lineage without inventing a parent.
+
+    A production plan is an obligation only after it is fixed.  Unlike a
+    refresh, an add has no previous ``PlanningRun``; its parent is solely the
+    current accepted physical Ledger generation.
+    """
+    plan = db.get(models.ProductionPlanHeader, int(source_plan_id))
+    if plan is None:
+        raise PlanningRunCandidateError(f"ProductionPlanHeader {source_plan_id} not found")
+    if str(plan.status) != "fixed":
+        raise PlanningRunCandidateError("source production plan must be fixed")
+
+    pointer = db.get(models.PlanningTruthState, 1)
+    if pointer is None or pointer.current_generation_id is None:
+        raise PlanningRunCandidateError("accepted Ledger pointer is not set")
+    accepted = db.get(models.LedgerGeneration, int(pointer.current_generation_id))
+    if accepted is None or str(accepted.status) != "accepted":
+        raise PlanningRunCandidateError("current Ledger generation is not accepted")
+
+    # A plan that already has a published snapshot on the current truth
+    # generation is a refresh, never another add.  Historical/superseded runs
+    # deliberately do not participate in this decision.
+    current_fixed = db.query(models.PlanningRun.run_id).filter(
+        models.PlanningRun.ledger_generation_id == int(accepted.id),
+        models.PlanningRun.source_plan_id == int(plan.id),
+        models.PlanningRun.status == "FIXED_SNAPSHOT",
+    ).first()
+    if current_fixed is not None:
+        raise PlanningRunCandidateError(
+            "source production plan already has a FIXED_SNAPSHOT on current Ledger generation"
+        )
+
+    target = db.get(models.LedgerGeneration, int(target_generation_id))
+    if target is None:
+        raise PlanningRunCandidateError(
+            f"target LedgerGeneration {target_generation_id} not found"
+        )
+    if str(target.status) != "building":
+        raise PlanningRunCandidateError("target Ledger generation must be BUILDING")
+    if (target.source_watermarks or {}).get("generation_kind") != "obligation_refresh":
+        raise PlanningRunCandidateError("target generation is not an obligation_refresh")
+    if (target.source_watermarks or {}).get("parent_generation_id") != int(accepted.id):
+        raise PlanningRunCandidateError(
+            "target generation does not descend from current Ledger generation"
+        )
+    if int(target.physical_import_batch_id or -1) != int(
+        accepted.physical_import_batch_id or -1
+    ):
+        raise PlanningRunCandidateError(
+            "target generation does not reuse current physical import batch"
+        )
+    if _as_utc(target.cutoff, "target cutoff") != _as_utc(accepted.cutoff, "accepted cutoff"):
+        raise PlanningRunCandidateError("target generation cutoff differs from current Ledger generation")
+    return plan, target
+
+
+def _matches_added_plan(
+    candidate: models.PlanningRun,
+    plan: models.ProductionPlanHeader,
+    *,
+    horizon_days: int | None,
+    config_version_id: int | None,
+    config_snapshot: dict,
+) -> bool:
+    """Match only an exact retry of a first-plan candidate."""
+    return (
+        str(candidate.status) == "BUILDING_SNAPSHOT"
+        and candidate.prior_run_id is None
+        and candidate.source_plan_id == plan.id
+        and candidate.period_from == plan.period_from
+        and candidate.period_to == plan.period_to
+        and candidate.horizon_days == horizon_days
+        and candidate.config_version_id == config_version_id
+        and candidate.config_snapshot == config_snapshot
+        and candidate.finished_at is None
+        and candidate.fixed_at is None
+        and candidate.active_freeze_version is None
+        and candidate.pinned is False
+        and (candidate.warnings or {}) == {}
+        and (candidate.kpi or {}) == {}
+    )
+
+
+def create_added_candidate_run(
+    db: Session,
+    source_plan_id: int,
+    target_generation_id: int,
+    started_by: str | None,
+    *,
+    horizon_days: int | None,
+    config_version_id: int | None,
+    config_snapshot: dict,
+) -> models.PlanningRun:
+    """Create or return the exact first-run candidate for a fixed plan.
+
+    The supplied configuration is a sealed caller snapshot: it is copied into
+    the run rather than read from mutable global configuration.  ``flush``
+    exposes identity conflicts but transaction ownership remains with the
+    caller; this function never commits or rolls back.
+    """
+    if not isinstance(config_snapshot, dict):
+        raise PlanningRunCandidateError("config_snapshot must be a mapping")
+    plan, target = _require_added_plan_and_target(
+        db,
+        source_plan_id=source_plan_id,
+        target_generation_id=target_generation_id,
+    )
+    sealed_snapshot = deepcopy(config_snapshot)
+
+    existing = db.query(models.PlanningRun).filter(
+        models.PlanningRun.ledger_generation_id == int(target.id),
+        models.PlanningRun.source_plan_id == int(plan.id),
+        models.PlanningRun.status == "BUILDING_SNAPSHOT",
+    ).one_or_none()
+    if existing is not None:
+        if not _matches_added_plan(
+            existing,
+            plan,
+            horizon_days=horizon_days,
+            config_version_id=config_version_id,
+            config_snapshot=sealed_snapshot,
+        ):
+            raise PlanningRunCandidateError(
+                "candidate identity already exists with conflicting add lineage"
+            )
+        return existing
+
+    candidate = models.PlanningRun(
+        status="BUILDING_SNAPSHOT",
+        prior_run_id=None,
+        ledger_generation_id=int(target.id),
+        source_plan_id=int(plan.id),
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        horizon_days=horizon_days,
+        config_version_id=config_version_id,
+        config_snapshot=sealed_snapshot,
+        started_by=started_by,
+        started_at=datetime.now(timezone.utc),
+        finished_at=None,
+        fixed_at=None,
+        warnings={},
+        kpi={},
+        active_freeze_version=None,
+        pinned=False,
+    )
+    db.add(candidate)
+    db.flush()
+    return candidate

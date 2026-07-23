@@ -6,6 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from app import models
 from app.services.planning_run_candidate import (
     PlanningRunCandidateError,
+    create_added_candidate_run,
     create_candidate_run,
 )
 
@@ -49,6 +50,7 @@ def _parent_and_target(db):
         db, key="refresh", status="building", cutoff=cutoff,
         watermarks={"generation_kind": "obligation_refresh", "parent_generation_id": accepted.id},
     )
+    target.physical_import_batch_id = accepted.physical_import_batch_id
     db.commit()
     return parent, accepted, target
 
@@ -148,3 +150,106 @@ def test_create_candidate_is_removed_by_outer_rollback(db_session):
 
     assert db_session.get(models.PlanningRun, candidate_id) is None
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == accepted.id
+
+
+def test_create_added_candidate_for_first_fixed_plan_copies_sealed_config(db_session):
+    _parent, accepted, target = _parent_and_target(db_session)
+    # The helper fixture creates a refresh parent for a different source plan;
+    # this fixed plan has no run on the accepted generation yet.
+    plan = models.ProductionPlanHeader(
+        name="new source", period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
+        status="fixed",
+    )
+    db_session.add(plan)
+    db_session.commit()
+    supplied_config = {"sealed": {"pool": ["A"]}}
+
+    candidate = create_added_candidate_run(
+        db_session, plan.id, target.id, "add-worker",
+        horizon_days=45, config_version_id=None, config_snapshot=supplied_config,
+    )
+
+    assert candidate.status == "BUILDING_SNAPSHOT"
+    assert candidate.prior_run_id is None
+    assert candidate.ledger_generation_id == target.id
+    assert candidate.source_plan_id == plan.id
+    assert (candidate.period_from, candidate.period_to) == (plan.period_from, plan.period_to)
+    assert candidate.horizon_days == 45
+    assert candidate.config_snapshot == supplied_config
+    assert candidate.config_snapshot is not supplied_config
+    candidate.config_snapshot["sealed"]["pool"].append("B")
+    assert supplied_config == {"sealed": {"pool": ["A"]}}
+    assert candidate.started_by == "add-worker"
+    assert candidate.finished_at is None and candidate.fixed_at is None
+    assert candidate.warnings == {} and candidate.kpi == {}
+    assert candidate.active_freeze_version is None and candidate.pinned is False
+    assert db_session.get(models.PlanningTruthState, 1).current_generation_id == accepted.id
+
+
+def test_create_added_candidate_retries_exact_add_and_rejects_conflicts(db_session):
+    _parent, accepted, target = _parent_and_target(db_session)
+    plan = models.ProductionPlanHeader(
+        name="retry add", period_from=date(2026, 8, 1), period_to=date(2026, 8, 31), status="fixed",
+    )
+    db_session.add(plan)
+    db_session.commit()
+
+    first = create_added_candidate_run(
+        db_session, plan.id, target.id, "worker-a",
+        horizon_days=30, config_version_id=None, config_snapshot={"v": 1},
+    )
+    db_session.commit()
+    again = create_added_candidate_run(
+        db_session, plan.id, target.id, "worker-b",
+        horizon_days=30, config_version_id=None, config_snapshot={"v": 1},
+    )
+    assert again.run_id == first.run_id
+
+    with pytest.raises(PlanningRunCandidateError, match="conflicting add lineage"):
+        create_added_candidate_run(
+            db_session, plan.id, target.id, "worker-c",
+            horizon_days=31, config_version_id=None, config_snapshot={"v": 1},
+        )
+
+    # A refresh candidate has the same partial-index identity but is never a
+    # retry of an add candidate.
+    again.prior_run_id = 999
+    db_session.flush()
+    with pytest.raises(PlanningRunCandidateError, match="conflicting add lineage"):
+        create_added_candidate_run(
+            db_session, plan.id, target.id, "worker-c",
+            horizon_days=30, config_version_id=None, config_snapshot={"v": 1},
+        )
+    assert db_session.get(models.PlanningTruthState, 1).current_generation_id == accepted.id
+
+
+def test_create_added_candidate_rejects_duplicate_current_plan_and_outer_rollback(db_session):
+    _parent, accepted, target = _parent_and_target(db_session)
+    plan = models.ProductionPlanHeader(
+        name="already planned", period_from=date(2026, 8, 1), period_to=date(2026, 8, 31), status="fixed",
+    )
+    db_session.add(plan)
+    db_session.flush()
+    db_session.add(models.PlanningRun(
+        status="FIXED_SNAPSHOT", ledger_generation_id=accepted.id, source_plan_id=plan.id,
+        config_snapshot={},
+    ))
+    db_session.commit()
+    with pytest.raises(PlanningRunCandidateError, match="already has a FIXED_SNAPSHOT"):
+        create_added_candidate_run(
+            db_session, plan.id, target.id, "worker",
+            horizon_days=30, config_version_id=None, config_snapshot={},
+        )
+
+    first_plan = models.ProductionPlanHeader(
+        name="rollback add", period_from=date(2026, 9, 1), period_to=date(2026, 9, 30), status="fixed",
+    )
+    db_session.add(first_plan)
+    db_session.flush()
+    candidate = create_added_candidate_run(
+        db_session, first_plan.id, target.id, "worker",
+        horizon_days=30, config_version_id=None, config_snapshot={},
+    )
+    candidate_id = candidate.run_id
+    db_session.rollback()
+    assert db_session.get(models.PlanningRun, candidate_id) is None
