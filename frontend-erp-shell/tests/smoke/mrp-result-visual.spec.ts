@@ -9,6 +9,11 @@ async function mockMrpResultApi(page: Page) {
     if (key === 'GET /api/v1/plan/results/77') {
       await route.fulfill({
         json: {
+          snapshot_id: 901,
+          ledger_generation: 77,
+          cutoff: '2026-07-20T08:18:42+00:00',
+          truth_status: 'accepted',
+          truth_reason: null,
           run: {
             run_id: 77,
             status: 'SUCCESS',
@@ -39,6 +44,11 @@ async function mockMrpResultApi(page: Page) {
       expect(url.searchParams.get('offset')).toBe('0')
       await route.fulfill({
         json: {
+          snapshot_id: 901,
+          ledger_generation: 77,
+          cutoff: '2026-07-20T08:18:42+00:00',
+          truth_status: 'accepted',
+          truth_reason: null,
           rows: [
             {
               order_id: 701,
