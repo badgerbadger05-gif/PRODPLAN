@@ -831,6 +831,25 @@ def reconcile_snapshot(
     if run.source_plan_id is None:
         raise ValueError(f"run_id={run_id}: прогон не привязан к плану периода")
 
+    # Reconciliation sizes and trims real supply. It must fail closed before
+    # any repair or mutation when accepted Item Ledger truth is unavailable.
+    from .planning_truth import (
+        CAPABILITY_EXECUTION_ALLOCATIONS,
+        CAPABILITY_PHYSICAL_LEDGER,
+        CAPABILITY_RESERVATION_REPLAY,
+        require_accepted_truth,
+    )
+
+    require_accepted_truth(
+        db,
+        consumer="mrp_reconciliation",
+        required_capabilities=(
+            CAPABILITY_PHYSICAL_LEDGER,
+            CAPABILITY_RESERVATION_REPLAY,
+            CAPABILITY_EXECUTION_ALLOCATIONS,
+        ),
+    )
+
     now = datetime.now(timezone.utc)
     open_reqs = (
         db.query(MrpRequirement)
@@ -890,7 +909,13 @@ def reconcile_snapshot(
     # The ledger cycle populates executed_qty + drift_adjustment_qty; run it now
     # unless the caller (reconcile_all_active) already ran it for the whole scope.
     if not ledger_cycle_ran:
-        run_ledger_cycle(db)
+        # Let a ledger-cycle failure propagate. Continuing with the previous
+        # executed_qty cache could create or trim real supply from stale facts.
+        try:
+            run_ledger_cycle(db)
+        except Exception:
+            db.rollback()
+            raise
 
     period_to = run.period_to or max((r.period_to for r in open_reqs), default=date.today())
     own_open_production = _own_open_production_by_item(db, run, open_req_ids)
@@ -1256,14 +1281,83 @@ def reconcile_all_active(db: Session, *, dry_run: bool = False) -> Dict[str, Any
     # scope. On a non-dry run commit it so the per-run sizers read committed
     # facts; a dry run keeps it in the session and rolls the whole thing back at
     # the end.
+    from .planning_truth import (
+        CAPABILITY_EXECUTION_ALLOCATIONS,
+        CAPABILITY_PHYSICAL_LEDGER,
+        CAPABILITY_RESERVATION_REPLAY,
+        PlanningTruthUnavailable,
+        require_accepted_truth,
+    )
+
+    try:
+        truth_state = require_accepted_truth(
+            db,
+            consumer="mrp_reconciliation",
+            required_capabilities=(
+                CAPABILITY_PHYSICAL_LEDGER,
+                CAPABILITY_RESERVATION_REPLAY,
+                CAPABILITY_EXECUTION_ALLOCATIONS,
+            ),
+        )
+    except PlanningTruthUnavailable as exc:
+        db.rollback()
+        state = exc.state
+        value = (
+            (lambda name: state.get(name))
+            if isinstance(state, dict)
+            else (lambda name: getattr(state, name, None))
+        )
+        return {
+            "status": "blocked",
+            "truth_status": value("status") or "unavailable",
+            "truth_generation_id": value("generation_id"),
+            "ledger_generation": value("generation_id"),
+            "cutoff": (
+                value("cutoff").isoformat()
+                if hasattr(value("cutoff"), "isoformat")
+                else value("cutoff")
+            ),
+            "truth_reason": value("reason"),
+            "dry_run": bool(dry_run),
+            "runs_checked": 0,
+            "production_lines_added": 0,
+            "purchase_lines_added": 0,
+            "purchase_lines_pruned": 0,
+            "production_lines_trimmed": 0,
+            "execution_ledger": None,
+            "results": [],
+        }
+
     execution_ledger: Dict[str, Any]
     try:
         execution_ledger = run_ledger_cycle(db)
         if not dry_run:
             db.commit()
-    except Exception as exc:  # noqa: BLE001 — never let ledger population break reconcile
+    except Exception as exc:  # noqa: BLE001 — fail closed, never size from stale executed_qty
         db.rollback()
-        execution_ledger = {"status": "error", "error": str(exc)}
+        return {
+            "status": "blocked",
+            "truth_status": "unavailable",
+            "truth_generation_id": (
+                truth_state.get("generation_id")
+                if isinstance(truth_state, dict)
+                else getattr(truth_state, "generation_id", None)
+            ),
+            "ledger_generation": (
+                truth_state.get("generation_id")
+                if isinstance(truth_state, dict)
+                else getattr(truth_state, "generation_id", None)
+            ),
+            "truth_reason": f"ledger_cycle_failed: {exc}",
+            "dry_run": bool(dry_run),
+            "runs_checked": 0,
+            "production_lines_added": 0,
+            "purchase_lines_added": 0,
+            "purchase_lines_pruned": 0,
+            "production_lines_trimmed": 0,
+            "execution_ledger": {"status": "error", "error": str(exc)},
+            "results": [],
+        }
 
     # 2) Per-run drift-correction sizing. The ledger already ran, so pass
     # ledger_cycle_ran=True; on a non-dry run each snapshot owns its own commit,

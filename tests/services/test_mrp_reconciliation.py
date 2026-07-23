@@ -1,6 +1,7 @@
 """Tests for MRP reconciliation and the covered_qty rollback that feeds it."""
 
 from datetime import date
+from types import SimpleNamespace
 
 import pytest
 
@@ -47,6 +48,36 @@ from app.services.production_control_journal import (
 
 
 DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
+
+
+@pytest.fixture(autouse=True)
+def _accepted_planning_truth(monkeypatch):
+    """Existing sizing scenarios explicitly run under an accepted truth."""
+    monkeypatch.setattr(
+        "app.services.planning_truth.require_accepted_truth",
+        lambda db, consumer, **kwargs: SimpleNamespace(
+            status="accepted", generation_id=1, cutoff=None, reason=None
+        ),
+    )
+
+
+def test_reconcile_all_active_fails_closed_without_accepted_truth(
+    db_session, monkeypatch
+):
+    from app.services import planning_truth
+
+    monkeypatch.setattr(
+        planning_truth,
+        "require_accepted_truth",
+        lambda db, consumer, **kwargs: planning_truth.require_accepted(db),
+    )
+
+    result = reconcile_all_active(db_session)
+
+    assert result["status"] == "blocked"
+    assert result["truth_status"] == "uninitialized"
+    assert result["runs_checked"] == 0
+    assert result["execution_ledger"] is None
 
 
 # ---------------------------------------------------------------------------

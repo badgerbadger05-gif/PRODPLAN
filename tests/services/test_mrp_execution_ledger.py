@@ -13,8 +13,19 @@ asserted VALUES are unchanged (no baseline → Δ = full history = phase-2 parit
 """
 
 from datetime import date, datetime
+from types import SimpleNamespace
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _accepted_planning_truth(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.planning_truth.require_accepted_truth",
+        lambda db, consumer, **kwargs: SimpleNamespace(
+            status="accepted", generation_id=1, cutoff=None, reason=None
+        ),
+    )
 
 from app.models import (
     Item,

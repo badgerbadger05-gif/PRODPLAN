@@ -1732,7 +1732,172 @@ def get_period_plan_matrix(db: Session, plan_id: int) -> Dict[str, Any]:
     }
 
 
+def _execution_snapshot_key(
+    *,
+    plan_id: int,
+    run_id: int,
+    root_item_id: Optional[int],
+    bom_level: Optional[int],
+    flow: Optional[str],
+) -> str:
+    return (
+        f"plan={int(plan_id)};run={int(run_id)};"
+        f"root={int(root_item_id) if root_item_id is not None else '*'};"
+        f"level={int(bom_level) if bom_level is not None else '*'};"
+        f"flow={flow or '*'}"
+    )
+
+
+def _resolve_execution_run(db: Session, plan: ProductionPlanHeader, run_id: Optional[int]) -> PlanningRun:
+    if run_id is not None:
+        run = db.query(PlanningRun).filter(PlanningRun.run_id == int(run_id)).first()
+        if not run or int(run.source_plan_id or -1) != int(plan.id):
+            raise ValueError("Run not found for this plan")
+        return run
+    run = (
+        db.query(PlanningRun)
+        .filter(
+            PlanningRun.source_plan_id == int(plan.id),
+            PlanningRun.status == "FIXED_SNAPSHOT",
+        )
+        .order_by(PlanningRun.run_id.desc())
+        .first()
+    )
+    if not run:
+        raise ValueError("No FIXED_SNAPSHOT run found for this plan")
+    return run
+
+
+def _execution_unavailable_payload(
+    db: Session,
+    *,
+    plan: ProductionPlanHeader,
+    run: PlanningRun,
+    root_item_id: Optional[int],
+    bom_level: Optional[int],
+    flow: Optional[str],
+    truth_state: Any,
+    reason: Optional[str] = None,
+) -> Dict[str, Any]:
+    reqs_with_items = (
+        db.query(MrpRequirement, Item)
+        .join(Item, Item.item_id == MrpRequirement.item_id)
+        .filter(MrpRequirement.run_id == int(run.run_id))
+        .order_by(MrpRequirement.bom_level.asc(), Item.item_name.asc())
+        .all()
+    )
+    if root_item_id is not None:
+        related_ids = _bom_descendants_by_item(db, [int(root_item_id)]).get(
+            int(root_item_id), {int(root_item_id)}
+        )
+        reqs_with_items = [
+            (req, item) for req, item in reqs_with_items if int(req.item_id) in related_ids
+        ]
+    rows: List[Dict[str, Any]] = []
+    for req, item in reqs_with_items:
+        item_flow = classify_replenishment_flow(getattr(item, "replenishment_method", None))
+        if bom_level is not None and int(req.bom_level or 0) != bom_level:
+            continue
+        if flow is not None and item_flow != flow:
+            continue
+        rows.append({
+            "req_id": int(req.id),
+            "item_id": int(req.item_id),
+            "item_code": str(item.item_code or ""),
+            "item_article": str(item.item_article or "") if item.item_article else None,
+            "item_name": str(item.item_name or ""),
+            "flow": item_flow,
+            "bom_level": int(req.bom_level or 0),
+            "gross_qty": _to_float(req.total_required_qty),
+            "net_qty": _to_float(req.net_required_qty),
+            "completed_qty": None,
+            "covered_qty": None,
+            "remaining_qty": None,
+            "progress_base_qty": None,
+            "coverage_pct": None,
+            "status": "execution_unavailable",
+            "work_items": [],
+        })
+    state_value = lambda name: (
+        truth_state.get(name) if isinstance(truth_state, dict) else getattr(truth_state, name, None)
+    )
+    cutoff = state_value("cutoff")
+    cutoff_value = cutoff.isoformat() if hasattr(cutoff, "isoformat") else cutoff
+    truth_status = "unavailable" if reason else (state_value("status") or "unavailable")
+    generation = state_value("generation_id")
+    return {
+        "plan": _serialize_plan(plan),
+        "run_id": int(run.run_id),
+        "truth_status": truth_status,
+        "ledger_generation": generation,
+        "cutoff": cutoff_value,
+        "truth_reason": reason or state_value("reason") or "Execution snapshot is not published",
+        "rows": rows,
+        "summary": {
+            "truth_status": truth_status,
+            "total_items": len(rows),
+            "execution_completed_qty": None,
+            "execution_base_qty": None,
+            "execution_pct": None,
+            "execution_by_flow": None,
+        },
+    }
+
+
 def get_period_plan_execution_journal(
+    db: Session,
+    plan_id: int,
+    *,
+    run_id: Optional[int] = None,
+    root_item_id: Optional[int] = None,
+    bom_level: Optional[int] = None,
+    flow: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Read the immutable execution snapshot. Never computes or publishes."""
+    from .planning_truth import (
+        CAPABILITY_EXECUTION_ALLOCATIONS,
+        CAPABILITY_PHYSICAL_LEDGER,
+        CAPABILITY_PLANNING_SNAPSHOTS,
+        CAPABILITY_RESERVATION_REPLAY,
+        PlanningTruthUnavailable,
+        get_latest_read_snapshot,
+        get_truth_state,
+    )
+
+    plan = _get_plan(db, plan_id)
+    run = _resolve_execution_run(db, plan, run_id)
+    snapshot_key = _execution_snapshot_key(
+        plan_id=plan.id, run_id=run.run_id, root_item_id=root_item_id,
+        bom_level=bom_level, flow=flow,
+    )
+    capabilities = (
+        CAPABILITY_PHYSICAL_LEDGER,
+        CAPABILITY_RESERVATION_REPLAY,
+        CAPABILITY_EXECUTION_ALLOCATIONS,
+        CAPABILITY_PLANNING_SNAPSHOTS,
+    )
+    try:
+        snapshot = get_latest_read_snapshot(
+            db,
+            consumer="period_plan_execution",
+            snapshot_key=snapshot_key,
+            required_capabilities=capabilities,
+        )
+    except PlanningTruthUnavailable as exc:
+        return _execution_unavailable_payload(
+            db, plan=plan, run=run, root_item_id=root_item_id,
+            bom_level=bom_level, flow=flow, truth_state=exc.state,
+        )
+    if snapshot is None:
+        return _execution_unavailable_payload(
+            db, plan=plan, run=run, root_item_id=root_item_id,
+            bom_level=bom_level, flow=flow, truth_state=get_truth_state(db),
+            reason="Execution snapshot is missing for the accepted Ledger generation",
+        )
+    return dict(snapshot.payload)
+
+
+def _compute_legacy_period_plan_execution_journal(
     db: Session,
     plan_id: int,
     *,
@@ -1772,26 +1937,119 @@ def get_period_plan_execution_journal(
         reqs_with_items = [(req, item) for req, item in reqs_with_items if int(req.item_id) in related_ids]
 
     if not reqs_with_items:
+        from .planning_truth import get_truth_state
+
+        empty_truth = get_truth_state(db)
+        execution_available = bool(empty_truth.ready)
         return {
             "plan": _serialize_plan(plan),
             "run_id": int(run.run_id),
+            "truth_status": empty_truth.status,
+            "truth_generation_id": empty_truth.generation_id,
+            "ledger_generation": empty_truth.generation_id,
+            "truth_cutoff": empty_truth.cutoff.isoformat() if empty_truth.cutoff else None,
+            "cutoff": empty_truth.cutoff.isoformat() if empty_truth.cutoff else None,
+            "truth_reason": empty_truth.reason,
             "rows": [],
             "summary": {
+                "truth_status": empty_truth.status,
                 "total_items": 0,
                 "fully_covered": 0,
                 "partially_covered": 0,
                 "not_covered": 0,
                 "net_zero": 0,
-                "execution_completed_qty": 0.0,
-                "execution_base_qty": 0.0,
-                "execution_pct": 100.0,
-                "execution_by_flow": {},
+                "execution_completed_qty": 0.0 if execution_available else None,
+                "execution_base_qty": 0.0 if execution_available else None,
+                "execution_pct": 100.0 if execution_available else None,
+                "execution_by_flow": {} if execution_available else None,
             },
         }
 
     req_ids = [int(req.id) for req, _ in reqs_with_items]
     item_ids = [int(req.item_id) for req, _ in reqs_with_items]
     req_by_id = {int(req.id): req for req, _ in reqs_with_items}
+
+    # Execution is a fact, and accepted Item Ledger truth is its only source.
+    # Do this before touching any legacy order aggregates: an empty/unaccepted
+    # ledger must never be presented as apparently precise execution.
+    from .planning_truth import (
+        CAPABILITY_EXECUTION_ALLOCATIONS,
+        CAPABILITY_PHYSICAL_LEDGER,
+        CAPABILITY_RESERVATION_REPLAY,
+        PlanningTruthUnavailable,
+        require_accepted_truth,
+    )
+
+    try:
+        truth_state = require_accepted_truth(
+            db,
+            consumer="period_plan_execution",
+            required_capabilities=(
+                CAPABILITY_PHYSICAL_LEDGER,
+                CAPABILITY_RESERVATION_REPLAY,
+                CAPABILITY_EXECUTION_ALLOCATIONS,
+            ),
+        )
+    except PlanningTruthUnavailable as exc:
+        truth_state = exc.state
+
+        def _truth_value(name: str) -> Any:
+            if isinstance(truth_state, dict):
+                return truth_state.get(name)
+            return getattr(truth_state, name, None)
+
+        unavailable_rows: List[Dict[str, Any]] = []
+        for req, item in reqs_with_items:
+            item_flow = classify_replenishment_flow(getattr(item, "replenishment_method", None))
+            if bom_level is not None and int(req.bom_level or 0) != bom_level:
+                continue
+            if flow is not None and item_flow != flow:
+                continue
+            unavailable_rows.append({
+                "req_id": int(req.id),
+                "item_id": int(req.item_id),
+                "item_code": str(item.item_code or ""),
+                "item_article": str(item.item_article or "") if item.item_article else None,
+                "item_name": str(item.item_name or ""),
+                "flow": item_flow,
+                "bom_level": int(req.bom_level or 0),
+                "gross_qty": _to_float(req.total_required_qty),
+                "net_qty": _to_float(req.net_required_qty),
+                "completed_qty": None,
+                "covered_qty": None,
+                "remaining_qty": None,
+                "progress_base_qty": None,
+                "coverage_pct": None,
+                "status": "execution_unavailable",
+                "work_items": [],
+            })
+        return {
+            "plan": _serialize_plan(plan),
+            "run_id": int(run.run_id),
+            "truth_status": _truth_value("status") or "unavailable",
+            "truth_generation_id": _truth_value("generation_id"),
+            "ledger_generation": _truth_value("generation_id"),
+            "truth_cutoff": (
+                _truth_value("cutoff").isoformat()
+                if hasattr(_truth_value("cutoff"), "isoformat")
+                else _truth_value("cutoff")
+            ),
+            "cutoff": (
+                _truth_value("cutoff").isoformat()
+                if hasattr(_truth_value("cutoff"), "isoformat")
+                else _truth_value("cutoff")
+            ),
+            "truth_reason": _truth_value("reason"),
+            "rows": unavailable_rows,
+            "summary": {
+                "truth_status": _truth_value("status") or "unavailable",
+                "total_items": len(unavailable_rows),
+                "execution_completed_qty": None,
+                "execution_base_qty": None,
+                "execution_pct": None,
+                "execution_by_flow": None,
+            },
+        }
 
     # Production: actual production orders linked via source_mrp_requirement_id.
     prod_rows = (
@@ -2220,10 +2478,38 @@ def get_period_plan_execution_journal(
             else 100.0
         )
     summary["execution_by_flow"] = execution_by_flow
+    summary["truth_status"] = truth_state.status
 
     return {
         "plan": _serialize_plan(plan),
         "run_id": int(run.run_id),
+        "truth_status": truth_state.status,
+        "truth_generation_id": truth_state.generation_id,
+        "ledger_generation": truth_state.generation_id,
+        "truth_cutoff": truth_state.cutoff.isoformat() if truth_state.cutoff else None,
+        "cutoff": truth_state.cutoff.isoformat() if truth_state.cutoff else None,
+        "truth_reason": truth_state.reason,
         "rows": rows,
         "summary": summary,
     }
+
+
+def build_period_plan_execution_snapshot(
+    db: Session,
+    plan_id: int,
+    *,
+    run_id: Optional[int] = None,
+    root_item_id: Optional[int] = None,
+    bom_level: Optional[int] = None,
+    flow: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Reserved entry point for the future Ledger-allocation builder.
+
+    The retained legacy diagnostic reads produced/received order aggregates.
+    Those values are not accepted Item Ledger facts and must never be published
+    under an accepted Ledger generation, regardless of declared capabilities.
+    """
+    raise NotImplementedError(
+        "period-plan execution snapshot publication is blocked until a "
+        "generation-scoped Item Ledger allocation builder is implemented"
+    )

@@ -28,6 +28,94 @@ def compile_jsonb(element, compiler, **kw):
 BigIntPK = BigInteger().with_variant(Integer(), "sqlite")
 
 
+class LedgerGeneration(Base):
+    """A versioned build of the Item Ledger fact set.
+
+    A generation is not planning truth until its status is ``accepted`` and
+    ``PlanningTruthState`` points at it.
+    """
+    __tablename__ = "ledger_generation"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('uninitialized', 'building', 'accepted', 'stale', 'rejected')",
+            name="ck_ledger_generation_status",
+        ),
+        UniqueConstraint("generation_key", name="uq_ledger_generation_key"),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    generation_key = Column(String(128), nullable=False)
+    status = Column(String(16), nullable=False, server_default="building")
+    cutoff = Column(DateTime(timezone=True), nullable=True)
+    source_watermarks = Column(CrossPlatformJSON, nullable=False, default=dict)
+    capabilities = Column(CrossPlatformJSON, nullable=False, default=dict)
+    algorithm_version = Column(String(128), nullable=False)
+    replay_version = Column(String(128), nullable=True)
+    reason = Column(TEXT, nullable=True)
+    accepted_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+
+class PlanningTruthState(Base):
+    """Singleton pointer to the generation exposed to dependent calculations."""
+    __tablename__ = "planning_truth_state"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="ck_planning_truth_state_singleton"),
+    )
+
+    id = Column(Integer, primary_key=True, default=1)
+    current_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=True,
+        unique=True,
+    )
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    current_generation = relationship("LedgerGeneration")
+
+
+class PlanningReadSnapshot(Base):
+    """Immutable payload published for a UI/report consumer."""
+    __tablename__ = "planning_read_snapshot"
+    __table_args__ = (
+        UniqueConstraint(
+            "consumer", "snapshot_key",
+            name="uq_planning_read_snapshot_consumer_key",
+        ),
+        Index(
+            "ix_planning_read_snapshot_latest",
+            "consumer", "ledger_generation_id", "published_at",
+        ),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    consumer = Column(String(128), nullable=False)
+    snapshot_key = Column(String(256), nullable=False)
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    cutoff = Column(DateTime(timezone=True), nullable=False)
+    truth_status = Column(String(16), nullable=False)
+    payload = Column(CrossPlatformJSON, nullable=False)
+    reason = Column(TEXT, nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+    published_at = Column(DateTime(timezone=True), nullable=False)
+
+    ledger_generation = relationship("LedgerGeneration")
+
+
 class PlanningComparisonBatch(Base):
     """One immutable comparison attempt between stable and shadow contours."""
     __tablename__ = "planning_comparison_batch"

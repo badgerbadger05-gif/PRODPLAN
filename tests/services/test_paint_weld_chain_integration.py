@@ -10,8 +10,19 @@ Rules (see .docs/paint_weld_chain_logic.md, stage 1):
 from __future__ import annotations
 
 from datetime import date
+from types import SimpleNamespace
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _accepted_planning_truth(monkeypatch):
+    monkeypatch.setattr(
+        "app.services.planning_truth.require_accepted_truth",
+        lambda db, consumer, **kwargs: SimpleNamespace(
+            status="accepted", generation_id=1, cutoff=None, reason=None
+        ),
+    )
 
 from app.models import (
     Item,

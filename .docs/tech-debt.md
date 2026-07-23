@@ -2,6 +2,22 @@
 
 Живой список. Закрыл пункт — удали строку. История и контекст: `archive/review_fixes_status.md`, `archive/code_review_merged.md`.
 
+## P0 — нарушение единого источника истины
+
+Нормативный контракт: [`planning-truth-contract.md`](planning-truth-contract.md).
+До устранения перечисленного отчёты и планирование нельзя считать
+достоверными:
+
+- найти и удалить все чтения фактического исполнения, остатков, выпуска,
+  поступлений, списаний и покрытия из legacy-агрегатов вне reconciliation;
+- ввести единый `ledger_generation/cutoff/truth_status` для снимков и API;
+- реализовать fail-closed: пустой/stale/unaccepted Ledger — unavailable,
+  блокировка MRP, закупки, DBR и материализации, без нулей и fallback;
+- перевести пользовательские страницы на чтение сохранённых снимков, убрать
+  тяжёлые расчёты из GET/открытия страниц и выполнять их workers;
+- доказать тестами адресное Ledger-исполнение, отсутствие двойного зачёта и
+  отсутствие legacy-fallback.
+
 ## Инфраструктура (из код-ревью, осталось)
 
 - **B1 — несущий `create_all`.** `Base.metadata.create_all` на импорте `main.py` — единственное, что строит базовые таблицы: на чистой БД `alembic upgrade head` падает (`relation "items" does not exist`), alembic внедрён поверх готовой схемы (прод — `stamp head`). Лечение: baseline-миграция всей схемы (`down_revision=None`), перецепить `20250925_01`, сверить дрейф с продом, `alembic upgrade head` в entrypoint, убрать `create_all`. Протокол — `archive/review_fixes_status.md` §B1.

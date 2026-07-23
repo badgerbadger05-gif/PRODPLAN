@@ -4,6 +4,7 @@ with supplier-order netting.
 
 import datetime
 from datetime import date
+from types import SimpleNamespace
 
 import pytest
 
@@ -25,7 +26,23 @@ from app.models import (
     SupplierOrder,
     SupplierOrderItem,
 )
-from app.services.period_plan_service import create_mrp_snapshot_from_period_plan, get_period_plan_execution_journal
+from app.services.period_plan_service import (
+    _compute_legacy_period_plan_execution_journal,
+    build_period_plan_execution_snapshot,
+    create_mrp_snapshot_from_period_plan,
+    get_period_plan_execution_journal,
+)
+
+
+@pytest.fixture(autouse=True)
+def _accepted_planning_truth(monkeypatch):
+    """Legacy journal scenarios explicitly run under an accepted truth."""
+    monkeypatch.setattr(
+        "app.services.planning_truth.require_accepted_truth",
+        lambda db, consumer, **kwargs: SimpleNamespace(
+            status="accepted", generation_id=1, cutoff=None, reason=None
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +63,162 @@ def _make_purchased_item(db, code: str, stock: float = 0.0) -> Item:
     db.add(item)
     db.flush()
     return item
+
+
+def test_execution_journal_is_explicitly_unavailable_without_accepted_truth(
+    db_session, monkeypatch
+):
+    from app.services import planning_truth
+
+    monkeypatch.setattr(
+        planning_truth,
+        "require_accepted_truth",
+        lambda db, consumer, **kwargs: planning_truth.require_accepted(db),
+    )
+    item = _make_purchased_item(db_session, "TRUTH-GUARD")
+    plan = _make_fixed_plan(db_session, item, date(2026, 7, 1), qty=7.0)
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        source_plan_id=plan.id,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+    )
+    db_session.add(run)
+    db_session.flush()
+    db_session.add(MrpRequirement(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        total_required_qty=7,
+        net_required_qty=7,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        bom_level=0,
+    ))
+    db_session.commit()
+
+    result = get_period_plan_execution_journal(db_session, plan.id, run_id=run.run_id)
+
+    assert result["truth_status"] == "uninitialized"
+    assert result["summary"]["execution_pct"] is None
+    assert result["summary"]["execution_completed_qty"] is None
+    assert result["rows"][0]["completed_qty"] is None
+    assert result["rows"][0]["coverage_pct"] is None
+
+
+def test_execution_journal_repeated_get_reads_snapshot_without_computation_or_writes(
+    db_session, monkeypatch
+):
+    from app.services import period_plan_service, planning_truth
+
+    item = _make_purchased_item(db_session, "SNAPSHOT-READ")
+    plan = _make_fixed_plan(db_session, item, date(2026, 7, 1), qty=3.0)
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        source_plan_id=plan.id,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+    )
+    db_session.add(run)
+    db_session.commit()
+    payload = {
+        "plan": {"id": plan.id},
+        "run_id": run.run_id,
+        "truth_status": "accepted",
+        "ledger_generation": 7,
+        "cutoff": "2026-07-23T12:00:00",
+        "rows": [{"req_id": 11, "completed_qty": 2.0}],
+        "summary": {"execution_pct": 66.7},
+    }
+    monkeypatch.setattr(
+        planning_truth,
+        "get_latest_read_snapshot",
+        lambda *args, **kwargs: SimpleNamespace(payload=payload),
+    )
+    monkeypatch.setattr(
+        period_plan_service,
+        "_compute_legacy_period_plan_execution_journal",
+        lambda *args, **kwargs: pytest.fail("GET must not compute execution"),
+    )
+
+    before_new = set(db_session.new)
+    first = get_period_plan_execution_journal(db_session, plan.id, run_id=run.run_id)
+    second = get_period_plan_execution_journal(db_session, plan.id, run_id=run.run_id)
+
+    assert first == payload
+    assert second == payload
+    assert set(db_session.new) == before_new
+    assert not db_session.dirty
+
+
+def test_execution_journal_missing_current_snapshot_is_unavailable(
+    db_session, monkeypatch
+):
+    from app.services import planning_truth
+
+    item = _make_purchased_item(db_session, "SNAPSHOT-MISSING")
+    plan = _make_fixed_plan(db_session, item, date(2026, 7, 1), qty=4.0)
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        source_plan_id=plan.id,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+    )
+    db_session.add(run)
+    db_session.commit()
+    accepted = SimpleNamespace(
+        status="accepted",
+        generation_id=9,
+        cutoff=datetime.datetime(2026, 7, 23, 12, 0),
+        reason=None,
+    )
+    monkeypatch.setattr(
+        planning_truth, "get_latest_read_snapshot", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(planning_truth, "get_truth_state", lambda db: accepted)
+
+    result = get_period_plan_execution_journal(db_session, plan.id, run_id=run.run_id)
+
+    assert result["truth_status"] == "unavailable"
+    assert result["ledger_generation"] == 9
+    assert result["summary"]["execution_pct"] is None
+    assert "snapshot is missing" in result["truth_reason"]
+
+
+def test_legacy_nonzero_aggregates_cannot_publish_execution_snapshot(db_session):
+    from app import models
+
+    item = _make_purchased_item(db_session, "LEGACY-NOT-TRUTH")
+    plan = _make_fixed_plan(db_session, item, date(2026, 7, 1), qty=5.0)
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        source_plan_id=plan.id,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+    )
+    db_session.add(run)
+    db_session.flush()
+    order = ProductionOrder(
+        order_number="LEGACY-AGGREGATE",
+        order_date=datetime.datetime(2026, 7, 1),
+        order_ref1c="legacy-aggregate-ref",
+        source="1c",
+    )
+    db_session.add(order)
+    db_session.flush()
+    db_session.add(ProductionProduct(
+        order_id=order.order_id,
+        item_id=item.item_id,
+        line_number=1,
+        quantity=999,
+        produced_qty=999,
+        remaining_qty=0,
+    ))
+    db_session.commit()
+
+    with pytest.raises(NotImplementedError, match="Item Ledger allocation builder"):
+        build_period_plan_execution_snapshot(db_session, plan.id, run_id=run.run_id)
+
+    assert db_session.query(models.PlanningReadSnapshot).count() == 0
 
 
 def _make_fixed_plan(
@@ -180,7 +353,7 @@ def test_execution_journal_marks_production_order_opened_in_1c(db_session):
     db_session.add(ProductionOrderLineState(product_id=product.product_id, status="shortage"))
     db_session.commit()
 
-    journal = get_period_plan_execution_journal(db_session, plan.id, run_id=run.run_id)
+    journal = _compute_legacy_period_plan_execution_journal(db_session, plan.id, run_id=run.run_id)
 
     row = journal["rows"][0]
     assert row["ordered_qty"] == 12
@@ -313,7 +486,7 @@ def test_execution_journal_counts_direct_completed_1c_order_by_item(db_session):
     db_session.add(product)
     db_session.commit()
 
-    row = get_period_plan_execution_journal(db_session, plan.id, run_id=run.run_id)["rows"][0]
+    row = _compute_legacy_period_plan_execution_journal(db_session, plan.id, run_id=run.run_id)["rows"][0]
 
     assert row["ordered_qty"] == 20
     assert row["completed_qty"] == 20
@@ -391,10 +564,10 @@ def test_execution_journal_does_not_allocate_direct_1c_output_to_past_plan(db_se
     ))
     db_session.commit()
 
-    june_row = get_period_plan_execution_journal(
+    june_row = _compute_legacy_period_plan_execution_journal(
         db_session, june_plan.id, run_id=runs_and_reqs[0][0].run_id,
     )["rows"][0]
-    july_row = get_period_plan_execution_journal(
+    july_row = _compute_legacy_period_plan_execution_journal(
         db_session, july_plan.id, run_id=runs_and_reqs[1][0].run_id,
     )["rows"][0]
 
@@ -458,7 +631,7 @@ def test_execution_journal_does_not_count_planned_task_as_ordered(db_session):
     )
     db_session.commit()
 
-    row = get_period_plan_execution_journal(db_session, plan.id, run_id=run.run_id)["rows"][0]
+    row = _compute_legacy_period_plan_execution_journal(db_session, plan.id, run_id=run.run_id)["rows"][0]
 
     assert row["ordered_qty"] == 0
     assert row["completed_qty"] == 0
@@ -531,7 +704,7 @@ def test_execution_journal_uses_existing_orders_as_progress_base_when_net_is_zer
     db_session.add(ProductionOrderLineState(product_id=product.product_id, status="shortage"))
     db_session.commit()
 
-    row = get_period_plan_execution_journal(db_session, plan.id, run_id=run.run_id)["rows"][0]
+    row = _compute_legacy_period_plan_execution_journal(db_session, plan.id, run_id=run.run_id)["rows"][0]
 
     assert row["net_qty"] == 0
     assert row["ordered_qty"] == 65
@@ -622,7 +795,7 @@ def test_execution_journal_ignores_cancelled_and_unopened_production_rows(db_ses
     db_session.add(ProductionOrderLineState(product_id=cancelled_product.product_id, status="cancelled"))
     db_session.commit()
 
-    row = get_period_plan_execution_journal(db_session, plan.id, run_id=run.run_id)["rows"][0]
+    row = _compute_legacy_period_plan_execution_journal(db_session, plan.id, run_id=run.run_id)["rows"][0]
 
     assert row["gross_qty"] == 86
     assert row["net_qty"] == 81
@@ -698,7 +871,7 @@ def test_execution_journal_counts_supplier_order_accepted_to_stock_as_completed(
     )
     db_session.commit()
 
-    row = get_period_plan_execution_journal(db_session, plan.id, run_id=run.run_id)["rows"][0]
+    row = _compute_legacy_period_plan_execution_journal(db_session, plan.id, run_id=run.run_id)["rows"][0]
 
     assert row["ordered_qty"] == 10
     assert row["completed_qty"] == 10
