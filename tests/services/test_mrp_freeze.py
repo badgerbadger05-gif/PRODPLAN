@@ -1,549 +1,382 @@
-"""Increment-2 (freeze v2) tests — refreeze_active_snapshots and the shared pool.
+"""Contracts for freezing sealed, unpublished PlanningRun candidates.
 
-The matrix (spec §13): shared stock once, produced sub-assembly once, WIP &
-supplier self-exclusion, id preservation, idempotency, single-plan parity,
-freeze-table values, version isolation, dropped-item zeroing, drift reset,
-dry_run, reconcile guard, and the create-snapshot wrapper contract.
+The historical tests in this module exercised ``refreeze_active_snapshots``:
+that operation rewrote published runs from mutable ``Item.stock_qty`` and
+legacy order counters.  It is deliberately retired.  These tests retain the
+important arithmetic, FIFO/shared-pool, isolation and retry guards against the
+current BUILDING Ledger candidate contract.
 """
 
-from datetime import date, datetime
-from types import SimpleNamespace
+from datetime import date, datetime, timezone
+from hashlib import sha256
+import json
 
 import pytest
 
-
-@pytest.fixture(autouse=True)
-def _accepted_planning_truth(db_session, monkeypatch):
-    """Give legacy freeze scenarios one explicit mutable diagnostic lineage."""
-    from app.models import (
-        LedgerGeneration,
-        PhysicalImportBatch,
-        PlanningTruthState,
-    )
-
-    batch = PhysicalImportBatch(
-        batch_key="mrp-freeze-diagnostic",
-        status="completed",
-        cutoff=datetime(2026, 7, 23),
-        source_watermarks={"source": "test-diagnostic"},
-        completed_at=datetime(2026, 7, 23),
-    )
-    generation = LedgerGeneration(
-        generation_key="mrp-freeze-diagnostic",
-        status="building",
-        cutoff=datetime(2026, 7, 23),
-        source_watermarks={},
-        capabilities={},
-        physical_import_batch=batch,
-        algorithm_version="test/diagnostic",
-    )
-    db_session.add(generation)
-    db_session.flush()
-    db_session.add(
-        PlanningTruthState(id=1, current_generation_id=generation.id)
-    )
-    db_session.flush()
-    db_session.info["diagnostic_ledger_generation_id"] = generation.id
-    monkeypatch.setattr(
-        "app.services.planning_truth.require_accepted_truth",
-        lambda db, consumer, **kwargs: SimpleNamespace(
-            status="accepted",
-            generation_id=generation.id,
-            cutoff=generation.cutoff,
-            reason=None,
-        ),
-    )
-
-from app.models import (
-    DefaultSpecification,
-    Item,
-    MrpFreezeAllocation,
-    MrpFreezeBaseline,
-    MrpFreezeComponent,
-    MrpRequirement,
-    PlannedPurchase,
-    PlanningRun,
-    ProductionOrder,
-    ProductionPlanHeader,
-    ProductionPlanLine,
-    ProductionProduct,
-    SpecComponent,
-    Specification,
-    Supplier,
-    SupplierOrder,
-    SupplierOrderItem,
-    SyncLink,
-)
+from app import models
 from app.services.mrp_freeze import (
+    LedgerPoolUnavailable,
     build_shared_pools,
+    freeze_candidate_snapshots,
     pool_key_for,
     refreeze_active_snapshots,
 )
-from app.services.mrp_reconciliation import reconcile_snapshot as _public_reconcile_snapshot
 
 
-def _attach_diagnostic_proposal_lineage(db):
-    """Own legacy fixture proposals by this test's explicit generation."""
-    generation_id = int(db.info["diagnostic_ledger_generation_id"])
-    db.query(ProductionProduct).filter(
-        ProductionProduct.ledger_generation_id.is_(None)
-    ).update(
-        {"ledger_generation_id": generation_id},
-        synchronize_session=False,
+CUTOFF = datetime(2026, 7, 23, 12, tzinfo=timezone.utc)
+
+
+def _seal(target, parents, candidates):
+    entries = [
+        {
+            "action": "refresh",
+            "plan_id": int(parent.source_plan_id),
+            "parent_run_id": int(parent.run_id),
+            "candidate_run_id": int(candidate.run_id),
+        }
+        for parent, candidate in zip(parents, candidates)
+    ]
+    payload = {
+        "version": 1,
+        "entries": sorted(entries, key=lambda row: (row["plan_id"], row["action"])),
+        "add_request": {
+            "plan_ids": [],
+            "horizon_days": None,
+            "config_version_id": None,
+            "config_snapshot": {},
+        },
+    }
+    target.source_watermarks = {
+        **dict(target.source_watermarks or {}),
+        "obligation_refresh_manifest": payload,
+        "obligation_refresh_manifest_hash": sha256(
+            json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest(),
+    }
+
+
+def _item(db, code, *, method="Покупка"):
+    row = models.Item(
+        item_code=code,
+        item_name=code,
+        item_article=code,
+        unit="шт",
+        # Deliberately poisonous: candidate freeze must not read this legacy
+        # field.  Authoritative stock is written only to target StockBin below.
+        stock_qty=9999,
+        replenishment_method=method,
+        replenishment_time=3 if method == "Покупка" else 0,
+        status="active",
     )
-    db.query(PlannedPurchase).filter(
-        PlannedPurchase.ledger_generation_id.is_(None)
-    ).update(
-        {"ledger_generation_id": generation_id},
-        synchronize_session=False,
-    )
+    db.add(row)
     db.flush()
+    return row
 
 
-def reconcile_snapshot(db, run_id, **kwargs):
-    _attach_diagnostic_proposal_lineage(db)
-    return _public_reconcile_snapshot(
-        db, run_id, diagnostic_legacy=True, **kwargs
+def _bom(db, parent, child, qty=1):
+    spec = models.Specification(
+        spec_name=f"Spec {parent.item_code}",
+        spec_ref1c=f"spec-{parent.item_code}",
     )
-from app.services.one_c_purchase_order_export import PURCHASE_ORDER_ENTITY
-from app.services.period_plan_service import create_mrp_snapshot_from_period_plan
-
-# Future window so _latest_active_snapshot_run_ids keeps the runs "active".
-AUG = (date(2026, 8, 1), date(2026, 8, 31), date(2026, 8, 15))
-SEP = (date(2026, 9, 1), date(2026, 9, 30), date(2026, 9, 15))
-
-
-# --------------------------------------------------------------------------- helpers
-def _purchased(db, code, stock=0.0):
-    item = Item(
-        item_code=code, item_name=f"Куп {code}", item_article=code, unit="шт",
-        stock_qty=stock, replenishment_method="Покупка", replenishment_time=3, status="active",
-    )
-    db.add(item)
-    db.flush()
-    return item
-
-
-def _produced(db, code, stock=0.0):
-    item = Item(
-        item_code=code, item_name=f"Изд {code}", item_article=code, unit="шт",
-        stock_qty=stock, replenishment_method="Производство", replenishment_time=0, status="active",
-    )
-    db.add(item)
-    db.flush()
-    return item
-
-
-def _link_bom(db, parent, child, qty_per_unit=1.0):
-    spec = Specification(spec_name=f"Spec {parent.item_code}", spec_ref1c=f"spec-{parent.item_code}")
     db.add(spec)
     db.flush()
-    db.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
-    db.add(SpecComponent(spec_id=spec.spec_id, item_id=child.item_id, quantity=qty_per_unit))
-    db.flush()
-    return spec
-
-
-def _plan(db, name, window, item, qty):
-    pf, pt, bucket = window
-    plan = ProductionPlanHeader(name=name, period_from=pf, period_to=pt, status="fixed", created_by="t")
-    db.add(plan)
-    db.flush()
-    db.add(ProductionPlanLine(plan_id=plan.id, item_id=item.item_id, bucket_date=bucket, qty=qty))
-    db.commit()
-    return plan
-
-
-def _snapshot(db, plan):
-    return create_mrp_snapshot_from_period_plan(db, plan.id)
-
-
-def _req(db, run_id, item_id):
-    return db.query(MrpRequirement).filter_by(run_id=int(run_id), item_id=int(item_id)).one()
-
-
-def _purchase_qty(db, run_id, item_id):
-    rows = db.query(PlannedPurchase.qty).filter_by(run_id=int(run_id), item_id=int(item_id)).all()
-    return sum(float(q or 0.0) for (q,) in rows)
-
-
-# --------------------------------------------------------------------------- 1
-def test_two_active_runs_share_stock_once(db_session):
-    item = _purchased(db_session, "SHARE", stock=100.0)
-    pa = _plan(db_session, "Авг", AUG, item, 100)
-    pb = _plan(db_session, "Сен", SEP, item, 20)
-    run_a = _snapshot(db_session, pa)["run_id"]
-    run_b = _snapshot(db_session, pb)["run_id"]  # refreezes both
-
-    # Aug (earliest need) eats the whole 100 → net 0; Sep sees a depleted pool.
-    assert float(_req(db_session, run_a, item.item_id).net_required_qty) == pytest.approx(0.0)
-    assert float(_req(db_session, run_b, item.item_id).net_required_qty) == pytest.approx(20.0)
-    assert _purchase_qty(db_session, run_a, item.item_id) == pytest.approx(0.0)
-    assert _purchase_qty(db_session, run_b, item.item_id) == pytest.approx(20.0)
-
-    # baseline S0 == 100 for the pool in BOTH runs (latest version); Σ active
-    # stock allocation across the pool == 100 (consumed once).
-    def _active_version(run_id):
-        return int(db_session.query(PlanningRun).filter_by(run_id=run_id).one().active_freeze_version)
-
-    for run_id in (run_a, run_b):
-        base = db_session.query(MrpFreezeBaseline).filter_by(
-            run_id=run_id, item_id=item.item_id, freeze_version=_active_version(run_id)
-        ).one()
-        assert float(base.stock_qty) == pytest.approx(100.0)
-
-    stock_alloc = 0.0
-    for run_id in (run_a, run_b):
-        stock_alloc += sum(
-            float(a.alloc_qty)
-            for a in db_session.query(MrpFreezeAllocation).filter_by(
-                run_id=run_id, item_id=item.item_id, source_type="stock",
-                freeze_version=_active_version(run_id),
-            ).all()
+    db.add(models.DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
+    db.add(
+        models.SpecComponent(
+            spec_id=spec.spec_id, item_id=child.item_id, quantity=qty
         )
-    assert stock_alloc == pytest.approx(100.0)
-
-
-# --------------------------------------------------------------------------- 2
-def test_produced_subassembly_stock_netted_once(db_session):
-    root = _produced(db_session, "B-ROOT")
-    sub = _produced(db_session, "B-SUB", stock=100.0)
-    leaf = _purchased(db_session, "B-LEAF")
-    _link_bom(db_session, root, sub, 1.0)
-    _link_bom(db_session, sub, leaf, 1.0)
-    pa = _plan(db_session, "Авг", AUG, root, 100)
-    pb = _plan(db_session, "Сен", SEP, root, 100)
-    run_a = _snapshot(db_session, pa)["run_id"]
-    run_b = _snapshot(db_session, pb)["run_id"]
-
-    # S's 100 stock covers exactly one run's release → leaf deficit 200-100=100.
-    assert _purchase_qty(db_session, run_a, leaf.item_id) == pytest.approx(0.0)
-    assert _purchase_qty(db_session, run_b, leaf.item_id) == pytest.approx(100.0)
-
-
-# --------------------------------------------------------------------------- 3
-def test_wip_self_exclusion(db_session):
-    root = _produced(db_session, "W-ROOT")
-    sub = _produced(db_session, "W-SUB")
-    leaf = _purchased(db_session, "W-LEAF")
-    _link_bom(db_session, root, sub, 1.0)
-    _link_bom(db_session, sub, leaf, 1.0)
-    plan = _plan(db_session, "Авг", AUG, root, 100)
-    run_id = _snapshot(db_session, plan)["run_id"]
-    sub_req = _req(db_session, run_id, sub.item_id)
-    assert float(sub_req.net_required_qty) == pytest.approx(100.0)
-
-    # OWN materialised WIP on the sub (executes this net) — must NOT cover it.
-    own_order = ProductionOrder(
-        order_number="MRP-OWN", order_date=datetime(2026, 7, 1), deletion_mark=False,
-        source="mrp", source_run_id=run_id,
     )
-    db_session.add(own_order)
-    db_session.flush()
-    db_session.add(ProductionProduct(
-        order_id=own_order.order_id, item_id=sub.item_id, line_number=1,
-        quantity=50, produced_qty=0, remaining_qty=50, source_mrp_requirement_id=sub_req.id,
-    ))
-    # FOREIGN 1C WIP on the sub — legit coverage.
-    foreign = ProductionOrder(
-        order_number="1C-FOREIGN", order_date=datetime(2026, 7, 1), deletion_mark=False,
-        source="1c", order_ref1c="po-foreign",
+    db.flush()
+
+
+def _world(db, demands, *, root=None, stock=None, future=None):
+    physical = models.PhysicalImportBatch(
+        batch_key=f"freeze-physical-{id(demands)}",
+        status="completed",
+        cutoff=CUTOFF,
+        source_watermarks={},
+        completed_at=CUTOFF,
     )
-    db_session.add(foreign)
-    db_session.flush()
-    db_session.add(ProductionProduct(
-        order_id=foreign.order_id, item_id=sub.item_id, line_number=1,
-        quantity=30, produced_qty=0, remaining_qty=30,
-    ))
-    db_session.commit()
-
-    refreeze_active_snapshots(db_session)
-    net = float(_req(db_session, run_id, sub.item_id).net_required_qty)
-    assert net == pytest.approx(70.0)  # 100 - 30 foreign; own 50 excluded
-
-    # Second refreeze must not degrade the net further (own stays excluded).
-    refreeze_active_snapshots(db_session)
-    assert float(_req(db_session, run_id, sub.item_id).net_required_qty) == pytest.approx(70.0)
-
-
-# --------------------------------------------------------------------------- 4
-def test_supplier_self_exclusion_keeps_exported_purchase(db_session):
-    item = _purchased(db_session, "SUP-X")
-    plan = _plan(db_session, "Авг", AUG, item, 100)
-    run_id = _snapshot(db_session, plan)["run_id"]
-    purchase = db_session.query(PlannedPurchase).filter_by(run_id=run_id, item_id=item.item_id).one()
-    assert float(purchase.qty) == pytest.approx(100.0)
-
-    # Export the purchase to a 1C supplier order carrying the same 100 in transit.
-    supplier = Supplier(supplier_ref1c="s1", supplier_name="ООО")
-    db_session.add(supplier)
-    db_session.flush()
-    order = SupplierOrder(
-        order_number="ЗП-1", order_date=datetime(2026, 7, 1), order_ref1c="so-ref-1",
-        supplier_id=supplier.supplier_id, order_state_name="В пути", deletion_mark=False,
+    accepted = models.LedgerGeneration(
+        generation_key=f"freeze-parent-{id(demands)}",
+        status="accepted",
+        cutoff=CUTOFF,
+        source_watermarks={},
+        capabilities={"physical_ledger": True},
+        physical_import_batch=physical,
+        algorithm_version="tests",
+        accepted_at=CUTOFF,
     )
-    db_session.add(order)
-    db_session.flush()
-    db_session.add(SupplierOrderItem(
-        order_id=order.order_id, item_id_ref=item.item_id, quantity=100,
-        received_qty=0, remaining_qty=100, delivery_date=datetime(2026, 8, 10),
-    ))
-    db_session.add(SyncLink(
-        source_system="PRODPLAN", source_doctype="planned_purchase", source_id=purchase.purchase_id,
-        target_entity=PURCHASE_ORDER_ENTITY, target_ref_key="so-ref-1", status="success",
-    ))
-    db_session.commit()
+    target = models.LedgerGeneration(
+        generation_key=f"freeze-target-{id(demands)}",
+        status="building",
+        cutoff=CUTOFF,
+        source_watermarks={},
+        capabilities={},
+        physical_import_batch=physical,
+        algorithm_version="tests",
+    )
+    db.add_all([physical, accepted, target])
+    db.flush()
+    target.source_watermarks = {
+        "generation_kind": "obligation_refresh",
+        "parent_generation_id": accepted.id,
+    }
+    db.add(models.PlanningTruthState(id=1, current_generation_id=accepted.id))
+    db.flush()
 
-    refreeze_active_snapshots(db_session)
+    if root is None:
+        root = _item(db, "ROOT")
+    for item, qty in (stock or {}).items():
+        db.add(
+            models.StockBin(
+                ledger_generation_id=target.id,
+                item_id=item.item_id,
+                characteristic_ref="",
+                organization_ref="",
+                warehouse_ref1c="",
+                on_hand=qty,
+            )
+        )
+    capture = models.LedgerBuildBatch(
+        ledger_generation_id=target.id,
+        stage="snapshot_build",
+        batch_key=f"freeze-supply-{target.id}",
+        status="completed",
+        algorithm_version="tests",
+        metrics={},
+    )
+    db.add(capture)
+    db.flush()
+    for index, (item, qty) in enumerate((future or {}).items(), start=1):
+        db.add(
+            models.LedgerFutureSupply(
+                ledger_generation_id=target.id,
+                supply_kind="supplier_order",
+                item_id=item.item_id,
+                characteristic_ref="",
+                organization_ref="",
+                planning_stock_pool="default",
+                destination_warehouse_ref1c="WH",
+                source_ref=f"supply-{index}",
+                source_line_ref="1",
+                ordered_qty_at_cutoff=qty,
+                realized_qty_at_cutoff=0,
+                open_qty_at_cutoff=qty,
+                eta_date=date(2026, 8, 1),
+                source_state_key="open",
+                capture_cutoff=CUTOFF,
+                source_content_hash=f"{index:064d}",
+                capture_batch_id=capture.id,
+                evidence_status="exact",
+            )
+        )
 
-    # The exported purchase survives (own coverage), no duplicate is created, and
-    # its self-excluded supplier order is NOT written as a freeze allocation.
-    remaining = db_session.query(PlannedPurchase).filter_by(run_id=run_id, item_id=item.item_id).all()
-    assert len(remaining) == 1
-    assert int(remaining[0].purchase_id) == int(purchase.purchase_id)
-    assert db_session.query(MrpFreezeAllocation).filter_by(
-        run_id=run_id, item_id=item.item_id, source_type="supplier_order"
+    parents, candidates, lines = [], [], []
+    for index, qty in enumerate(demands, start=1):
+        month = 7 + index
+        plan = models.ProductionPlanHeader(
+            name=f"plan-{index}",
+            period_from=date(2026, month, 1),
+            period_to=date(2026, month, 28),
+            status="fixed",
+        )
+        db.add(plan)
+        db.flush()
+        line = models.ProductionPlanLine(
+            plan_id=plan.id,
+            item_id=root.item_id,
+            bucket_date=plan.period_from,
+            qty=qty,
+        )
+        parent = models.PlanningRun(
+            status="FIXED_SNAPSHOT",
+            ledger_generation_id=accepted.id,
+            source_plan_id=plan.id,
+            period_from=plan.period_from,
+            period_to=plan.period_to,
+            config_snapshot={},
+            started_at=CUTOFF,
+            fixed_at=CUTOFF,
+            finished_at=CUTOFF,
+            pinned=True,
+            active_freeze_version=7,
+        )
+        db.add_all([line, parent])
+        db.flush()
+        candidate = models.PlanningRun(
+            status="BUILDING_SNAPSHOT",
+            ledger_generation_id=target.id,
+            prior_run_id=parent.run_id,
+            source_plan_id=plan.id,
+            period_from=plan.period_from,
+            period_to=plan.period_to,
+            config_snapshot={},
+            started_at=CUTOFF,
+            pinned=False,
+        )
+        db.add(candidate)
+        db.flush()
+        parents.append(parent)
+        candidates.append(candidate)
+        lines.append(line)
+    _seal(target, parents, candidates)
+    db.flush()
+    return accepted, target, root, parents, candidates, lines
+
+
+def _freeze(db, accepted, target, candidates):
+    return freeze_candidate_snapshots(
+        db,
+        parent_generation_id=accepted.id,
+        target_generation_id=target.id,
+        candidate_run_ids=[row.run_id for row in candidates],
+    )
+
+
+def _req(db, run, item):
+    return db.query(models.MrpRequirement).filter_by(
+        run_id=run.run_id, item_id=item.item_id
+    ).one()
+
+
+def _purchase(db, run, item):
+    return sum(
+        float(row.qty)
+        for row in db.query(models.PlannedPurchase).filter_by(
+            run_id=run.run_id, item_id=item.item_id
+        )
+    )
+
+
+def test_candidates_consume_physical_and_future_shared_pool_once_in_fifo_order(db_session):
+    item = _item(db_session, "FIFO")
+    accepted, target, _, parents, candidates, lines = _world(
+        db_session, [10, 20], root=item, stock={item: 15}, future={item: 2}
+    )
+    parent_state = [(r.status, r.active_freeze_version) for r in parents]
+
+    report = _freeze(db_session, accepted, target, candidates)
+
+    assert report["order"] == [r.run_id for r in candidates]
+    assert [_req(db_session, r, item).net_required_qty for r in candidates] == pytest.approx([0, 15])
+    assert [_purchase(db_session, r, item) for r in candidates] == pytest.approx([0, 13])
+    assert [(r.status, r.active_freeze_version) for r in parents] == parent_state
+    assert [line.locked_by_run_id for line in lines] == [None, None]
+    assert db_session.get(models.PlanningTruthState, 1).current_generation_id == accepted.id
+
+
+def test_produced_subassembly_stock_is_consumed_once_across_candidates(db_session):
+    root = _item(db_session, "ASSEMBLY", method="Производство")
+    sub = _item(db_session, "SUB", method="Производство")
+    leaf = _item(db_session, "LEAF")
+    _bom(db_session, root, sub)
+    _bom(db_session, sub, leaf)
+    accepted, target, _, _parents, candidates, _lines = _world(
+        db_session, [100, 100], root=root, stock={sub: 100}
+    )
+
+    _freeze(db_session, accepted, target, candidates)
+
+    assert [_purchase(db_session, run, leaf) for run in candidates] == pytest.approx([0, 100])
+
+
+def test_freeze_uses_target_stockbin_not_legacy_item_stock_qty(db_session):
+    item = _item(db_session, "NO-LEGACY-STOCK")
+    accepted, target, _, _parents, candidates, _lines = _world(
+        db_session, [10], root=item, stock={item: 4}
+    )
+
+    _freeze(db_session, accepted, target, candidates)
+
+    assert float(_req(db_session, candidates[0], item).initial_snapshot_stock) == pytest.approx(4)
+    assert _purchase(db_session, candidates[0], item) == pytest.approx(6)
+
+
+def test_freeze_rows_are_target_scoped_and_published_parent_is_immutable(db_session):
+    item = _item(db_session, "ISOLATED")
+    accepted, target, _, parents, candidates, _lines = _world(
+        db_session, [8], root=item
+    )
+    parent = parents[0]
+    before = (parent.status, parent.fixed_at, parent.active_freeze_version)
+
+    _freeze(db_session, accepted, target, candidates)
+
+    assert (parent.status, parent.fixed_at, parent.active_freeze_version) == before
+    assert db_session.query(models.MrpRequirement).filter_by(run_id=parent.run_id).count() == 0
+    assert db_session.query(models.ReservationEntry).filter_by(
+        ledger_generation_id=accepted.id
     ).count() == 0
+    purchases = db_session.query(models.PlannedPurchase).filter_by(
+        ledger_generation_id=target.id, run_id=candidates[0].run_id
+    ).all()
+    assert purchases and sum(float(row.qty) for row in purchases) == pytest.approx(8)
 
 
-# --------------------------------------------------------------------------- 5
-def test_requirement_ids_preserved_across_refreeze(db_session):
-    root = _produced(db_session, "ID-ROOT")
-    leaf = _purchased(db_session, "ID-LEAF")
-    _link_bom(db_session, root, leaf, 2.0)
-    plan = _plan(db_session, "Авг", AUG, root, 10)
-    run_id = _snapshot(db_session, plan)["run_id"]
-    before = {int(r.item_id): int(r.id) for r in db_session.query(MrpRequirement).filter_by(run_id=run_id).all()}
+def test_candidate_freeze_rejects_retry_instead_of_partially_reusing_derived_rows(db_session):
+    item = _item(db_session, "RETRY")
+    accepted, target, _, _parents, candidates, _lines = _world(
+        db_session, [10], root=item
+    )
+    _freeze(db_session, accepted, target, candidates)
+    counts = (
+        db_session.query(models.MrpRequirement).count(),
+        db_session.query(models.ReservationEntry).count(),
+    )
 
-    refreeze_active_snapshots(db_session)
-    after = {int(r.item_id): int(r.id) for r in db_session.query(MrpRequirement).filter_by(run_id=run_id).all()}
-    assert before == after
+    with pytest.raises(LedgerPoolUnavailable, match="already has derived requirements"):
+        _freeze(db_session, accepted, target, candidates)
 
-    # A production order bound to the root req stays valid (no orphaned FK).
-    root_req_id = before[root.item_id]
-    order = ProductionOrder(order_number="X1", order_date=datetime(2026, 7, 1), deletion_mark=False, source="mrp", source_run_id=run_id)
-    db_session.add(order)
-    db_session.flush()
-    db_session.add(ProductionProduct(order_id=order.order_id, item_id=root.item_id, line_number=1, quantity=10, produced_qty=0, remaining_qty=10, source_mrp_requirement_id=root_req_id))
-    db_session.commit()
-    refreeze_active_snapshots(db_session)
-    pp = db_session.query(ProductionProduct).filter_by(order_id=order.order_id).one()
-    assert int(pp.source_mrp_requirement_id) == root_req_id
-    assert db_session.query(MrpRequirement).filter_by(id=root_req_id).count() == 1
+    assert (
+        db_session.query(models.MrpRequirement).count(),
+        db_session.query(models.ReservationEntry).count(),
+    ) == counts
 
 
-# --------------------------------------------------------------------------- 6
-def test_refreeze_is_value_idempotent(db_session):
-    item = _purchased(db_session, "IDEM", stock=30.0)
-    pa = _plan(db_session, "Авг", AUG, item, 100)
-    pb = _plan(db_session, "Сен", SEP, item, 40)
-    run_a = _snapshot(db_session, pa)["run_id"]
-    run_b = _snapshot(db_session, pb)["run_id"]
-
-    def _sig():
-        reqs = {
-            int(r.item_id): (round(float(r.net_required_qty), 6), round(float(r.initial_snapshot_stock or 0.0), 6), int(r.freeze_version or 0))
-            for r in db_session.query(MrpRequirement).filter(MrpRequirement.run_id.in_([run_a, run_b])).all()
-        }
-        return reqs
-
-    sig1 = _sig()
-    v_before = {b.run_id: b.freeze_version for b in db_session.query(MrpRequirement).filter(MrpRequirement.run_id.in_([run_a, run_b]))}
-
-    refreeze_active_snapshots(db_session)
-    sig2 = _sig()
-
-    # net + initial identical; only the version advances by 1.
-    assert {k: (v[0], v[1]) for k, v in sig1.items()} == {k: (v[0], v[1]) for k, v in sig2.items()}
-    assert all(sig2[k][2] == sig1[k][2] + 1 for k in sig1)
+def test_candidate_freeze_rejects_partial_manifest(db_session):
+    item = _item(db_session, "CLOSED-SET")
+    accepted, target, _, _parents, candidates, _lines = _world(
+        db_session, [2, 3], root=item
+    )
+    with pytest.raises(LedgerPoolUnavailable, match="ids differ from sealed"):
+        freeze_candidate_snapshots(
+            db_session,
+            parent_generation_id=accepted.id,
+            target_generation_id=target.id,
+            candidate_run_ids=[candidates[0].run_id],
+        )
+    assert db_session.query(models.MrpRequirement).count() == 0
 
 
-# --------------------------------------------------------------------------- 7
-def test_single_plan_parity_arithmetic(db_session):
-    # Purchase item, stock 30, demand 100 → net 70 → purchase 70 (legacy formula).
-    item = _purchased(db_session, "PAR", stock=30.0)
-    plan = _plan(db_session, "Авг", AUG, item, 100)
-    run_id = _snapshot(db_session, plan)["run_id"]
-    assert float(_req(db_session, run_id, item.item_id).net_required_qty) == pytest.approx(70.0)
-    assert _purchase_qty(db_session, run_id, item.item_id) == pytest.approx(70.0)
-    # Frozen stock allocation equals the netted 30.
-    assert float(_req(db_session, run_id, item.item_id).initial_snapshot_stock) == pytest.approx(30.0)
+def test_candidate_freeze_rejects_stale_parent_pointer(db_session):
+    item = _item(db_session, "STALE")
+    accepted, target, _, _parents, candidates, _lines = _world(
+        db_session, [2], root=item
+    )
+    db_session.get(models.PlanningTruthState, 1).current_generation_id = target.id
+    with pytest.raises(LedgerPoolUnavailable, match="current accepted"):
+        _freeze(db_session, accepted, target, candidates)
+    assert db_session.query(models.MrpRequirement).count() == 0
 
 
-# --------------------------------------------------------------------------- 8
-def test_freeze_table_values_and_pool_columns(db_session):
-    root = _produced(db_session, "T-ROOT")
-    sub = _produced(db_session, "T-SUB", stock=20.0)
-    leaf = _purchased(db_session, "T-LEAF", stock=5.0)
-    _link_bom(db_session, root, sub, 1.0)
-    _link_bom(db_session, sub, leaf, 2.0)
-    plan = _plan(db_session, "Авг", AUG, root, 50)
-    run_id = _snapshot(db_session, plan)["run_id"]
-
-    # baseline: unit_coef == 1, stock_qty == S0, pool columns never NULL.
-    for b in db_session.query(MrpFreezeBaseline).filter_by(run_id=run_id).all():
-        assert float(b.unit_coef) == pytest.approx(1.0)
-        assert b.characteristic_ref == "" and b.organization_ref == "" and b.planning_stock_pool == "default"
-    sub_base = db_session.query(MrpFreezeBaseline).filter_by(run_id=run_id, item_id=sub.item_id).one()
-    assert float(sub_base.stock_qty) == pytest.approx(20.0)
-
-    # component: norm captured, pool cols set, stock-covered parent included.
-    comp = db_session.query(MrpFreezeComponent).filter_by(run_id=run_id, parent_item_id=sub.item_id, component_item_id=leaf.item_id).one()
-    assert float(comp.norm_qty_per_unit) == pytest.approx(2.0)
-    assert comp.parent_planning_stock_pool == "default" and comp.component_planning_stock_pool == "default"
-    assert db_session.query(MrpFreezeComponent).filter_by(run_id=run_id, parent_item_id=root.item_id, component_item_id=sub.item_id).count() == 1
-
-    # allocation: stock source rows exist, fact == S0, pool cols never NULL.
-    stock_allocs = db_session.query(MrpFreezeAllocation).filter_by(run_id=run_id, source_type="stock").all()
-    assert stock_allocs
-    for a in db_session.query(MrpFreezeAllocation).filter_by(run_id=run_id).all():
-        assert a.characteristic_ref == "" and a.organization_ref == "" and a.planning_stock_pool == "default"
-
-    # per-req initial_snapshot_stock == Σ its stock allocations.
-    sub_req = _req(db_session, run_id, sub.item_id)
-    sub_stock_alloc = sum(float(a.alloc_qty) for a in stock_allocs if int(a.requirement_id) == int(sub_req.id))
-    assert float(sub_req.initial_snapshot_stock) == pytest.approx(sub_stock_alloc)
+def test_retired_destructive_refreeze_entrypoint_fails_closed(db_session):
+    with pytest.raises(LedgerPoolUnavailable, match="retired"):
+        refreeze_active_snapshots(db_session)
 
 
-# --------------------------------------------------------------------------- 9
-def test_prior_version_rows_immutable(db_session):
-    item = _purchased(db_session, "VER", stock=10.0)
-    plan = _plan(db_session, "Авг", AUG, item, 50)
-    run_id = _snapshot(db_session, plan)["run_id"]
-    v1 = [
-        (b.item_id, float(b.stock_qty), int(b.freeze_version))
-        for b in db_session.query(MrpFreezeBaseline).filter_by(run_id=run_id, freeze_version=1).all()
-    ]
-    assert v1  # version 1 exists
-
-    refreeze_active_snapshots(db_session, include_plan_id=plan.id)
-    # Version-1 rows are untouched; version 2 is a fresh INSERT.
-    v1_after = [
-        (b.item_id, float(b.stock_qty), int(b.freeze_version))
-        for b in db_session.query(MrpFreezeBaseline).filter_by(run_id=run_id, freeze_version=1).all()
-    ]
-    assert sorted(v1_after) == sorted(v1)
-    assert db_session.query(MrpFreezeBaseline).filter_by(run_id=run_id, freeze_version=2).count() >= 1
+def test_pool_key_normalises_to_default():
+    key = pool_key_for(123, characteristic_ref="legacy", organization_ref="legacy")
+    assert (
+        key.item_id,
+        key.characteristic_ref,
+        key.organization_ref,
+        key.planning_stock_pool,
+    ) == (123, "", "", "default")
 
 
-# --------------------------------------------------------------------------- 10
-def test_dropped_item_zeroed_and_stamped(db_session):
-    root = _produced(db_session, "D-ROOT")
-    sub = _produced(db_session, "D-SUB")
-    spec = _link_bom(db_session, root, sub, 1.0)
-    plan = _plan(db_session, "Авг", AUG, root, 40)
-    run_id = _snapshot(db_session, plan)["run_id"]
-    sub_req = _req(db_session, run_id, sub.item_id)
-    assert float(sub_req.net_required_qty) == pytest.approx(40.0)
-
-    # Remove the component so the sub is no longer reached by the explosion.
-    db_session.query(SpecComponent).filter_by(spec_id=spec.spec_id, item_id=sub.item_id).delete()
-    db_session.commit()
-
-    refreeze_active_snapshots(db_session, include_plan_id=plan.id)
-    sub_req = _req(db_session, run_id, sub.item_id)
-    assert float(sub_req.total_required_qty) == pytest.approx(0.0)
-    assert float(sub_req.net_required_qty) == pytest.approx(0.0)
-    assert float(sub_req.initial_snapshot_stock or 0.0) == pytest.approx(0.0)
-    assert int(sub_req.freeze_version) == 2
-    assert db_session.query(MrpFreezeAllocation).filter_by(run_id=run_id, item_id=sub.item_id).count() == 0
-
-
-# --------------------------------------------------------------------------- 11
-def test_drift_adjustment_reset_on_refreeze(db_session):
-    item = _purchased(db_session, "DRIFT", stock=0.0)
-    plan = _plan(db_session, "Авг", AUG, item, 10)
-    run_id = _snapshot(db_session, plan)["run_id"]
-    req = _req(db_session, run_id, item.item_id)
-    req.drift_adjustment_qty = 7.0
-    db_session.commit()
-
-    refreeze_active_snapshots(db_session)
-    assert float(_req(db_session, run_id, item.item_id).drift_adjustment_qty) == pytest.approx(0.0)
-
-
-# --------------------------------------------------------------------------- 12
-def test_dry_run_writes_nothing(db_session):
-    item = _purchased(db_session, "DRY", stock=0.0)
-    plan = _plan(db_session, "Авг", AUG, item, 10)
-    run_id = _snapshot(db_session, plan)["run_id"]
-    version_before = int(_req(db_session, run_id, item.item_id).freeze_version)
-    baseline_before = db_session.query(MrpFreezeBaseline).filter_by(run_id=run_id).count()
-
-    report = refreeze_active_snapshots(db_session, dry_run=True)
-    assert report["dry_run"] is True
-    assert report["results"]
-    # Nothing persisted: version and freeze rows are unchanged.
-    assert int(_req(db_session, run_id, item.item_id).freeze_version) == version_before
-    assert db_session.query(MrpFreezeBaseline).filter_by(run_id=run_id).count() == baseline_before
-
-
-# --------------------------------------------------------------------------- 13
-def test_reconcile_frozen_run_does_not_rewrite_net_or_trim(db_session):
-    # Increment 4: the temporary freeze_guard is gone; the drift-only reconcile
-    # is idempotent by construction. A top-level (bom level 0) purchased item is
-    # out of drift, so a post-freeze stock rise does not move its frozen net and
-    # its purchase is not trimmed.
-    item = _purchased(db_session, "GUARD", stock=0.0)
-    plan = _plan(db_session, "Авг", AUG, item, 60)
-    run_id = _snapshot(db_session, plan)["run_id"]
-    item.stock_qty = 60.0
-    db_session.commit()
-
-    res = reconcile_snapshot(db_session, run_id)
-    assert "freeze_guard" not in res
-    assert res["status"] == "ok"
-    assert res["purchase_pruned"] == []
-    # Frozen net is NOT rewritten; the purchase is NOT trimmed.
-    assert float(_req(db_session, run_id, item.item_id).net_required_qty) == pytest.approx(60.0)
-    assert db_session.query(PlannedPurchase).filter_by(run_id=run_id, item_id=item.item_id).count() == 1
-
-
-def test_reconcile_unfrozen_run_is_needs_freeze(db_session):
-    # A run without an active freeze version has no authoritative net to size
-    # against: reconcile returns needs_freeze and runs only repairs — it does NOT
-    # rewrite net nor trim purchases (the old legacy re-explosion trim is gone).
-    item = _purchased(db_session, "UNFROZEN", stock=0.0)
-    plan = _plan(db_session, "Авг", AUG, item, 60)
-    run_id = _snapshot(db_session, plan)["run_id"]
-    run = db_session.query(PlanningRun).filter_by(run_id=run_id).one()
-    run.active_freeze_version = None  # simulate a pre-freeze legacy run
-    item.stock_qty = 60.0
-    db_session.commit()
-
-    res = reconcile_snapshot(db_session, run_id)
-    assert res["status"] == "needs_freeze"
-    assert "freeze_guard" not in res
-    assert res["purchase_pruned"] == []
-    assert db_session.query(PlannedPurchase).filter_by(run_id=run_id, item_id=item.item_id).count() == 1
-
-
-# --------------------------------------------------------------------------- 14
-def test_wrapper_contract_and_report(db_session):
-    item = _purchased(db_session, "WRAP", stock=0.0)
-    plan = _plan(db_session, "Авг", AUG, item, 25)
-    result = _snapshot(db_session, plan)
-    for key in ("status", "run_id", "plan_id", "requirement_count", "bucket_count",
-                "production_count", "stage_count", "purchase_count", "rework_count", "freeze_version"):
-        assert key in result
-    assert result["freeze_version"] >= 1
-    assert result["purchase_count"] == 1
-
-    report = refreeze_active_snapshots(db_session, dry_run=True)
-    assert report["status"] == "ok" and report["dry_run"] is True
-    assert report["order"] and report["totals"]["runs"] >= 1
-
-
-# --------------------------------------------------------------------------- extra: pool key + build helper
-def test_pool_key_normalises_to_default(db_session):
-    pk = pool_key_for(123, characteristic_ref="abc", organization_ref="org")
-    assert (pk.characteristic_ref, pk.organization_ref, pk.planning_stock_pool) == ("", "", "default")
-
-
-def test_build_shared_pools_snapshots_initial_stock(db_session):
-    item = _purchased(db_session, "POOL", stock=42.0)
-    plan = _plan(db_session, "Авг", AUG, item, 10)
-    run_id = _snapshot(db_session, plan)["run_id"]
-    pools = build_shared_pools(db_session, [run_id])
-    assert pools.stock_initial.get(item.item_id) == pytest.approx(42.0)
-    assert pools.stock is not pools.stock_initial
+def test_build_shared_pools_requires_explicit_ledger_generation(db_session):
+    with pytest.raises(TypeError):
+        build_shared_pools(db_session, [])
