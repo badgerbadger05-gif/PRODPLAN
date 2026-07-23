@@ -1,23 +1,64 @@
-"""Ledger-1 Balance-reconcile (the shrunk drift) + shadow diagnostics — §3б.
+"""Ledger-1 Balance-reconcile v2 (сверка через документ-источник) — §3б + §7.4(д).
 
 The local materialized ``stock_bin.on_hand`` may drift from 1С for postings made
 OUTSIDE our documents (manual Списание, inventory counts, foreign transfers).
 The existing ~30-min stock sweep already pulls the 1С ``/Balance`` snapshot and
 full-refreshes ``ItemWarehouseStock``/``Item.stock_qty``; inc3 adds an
 after-step that compares that snapshot against the ledger bins and, for
-confirmed out-of-band deltas, writes a compensating adjustment-SLE.
+confirmed out-of-band deltas, recovers — v2: by *finding the missed document*
+first, and only then (register clean) by a compensating adjustment-SLE.
 
-This is the shrunk successor of today's drift model — NOT a re-implementation of
-the norm-model. The maturity window W=48h is not needed (one registrar); only a
-one-sweep debounce against snapshot races (§3б step 3):
+Comparison axis — Д7, characteristics (choice documented per the audit):
+    The Balance snapshot is pulled by ``get_stock_from_1c_odata`` with
+    ``Dimensions='Номенклатура,СтруктурнаяЕдиница,Организация'`` — WITHOUT
+    Характеристика — and ``convert_1c_stock_to_records`` does not surface a
+    characteristic either. Widening those Dimensions was rejected: the same
+    query feeds the legacy sweep consumers (``ItemWarehouseStock`` /
+    ``Item.stock_qty``), so per-characteristic rows would change the granularity
+    of a shared prod contract on unverified live-1С behavior (design Прил. A
+    §3б step 1 pins the current dims). Therefore the reconcile compares
+    **aggregates per (item, organization, warehouse)**: Σ ``stock_bin.on_hand``
+    over ALL characteristics of the key vs the Balance row(s) for that key
+    (variant «б»). Bins keyed by a real ``characteristic_ref`` (ingest keys bins
+    by the register's Характеристика_Key) are никогда not compared against a
+    char='' Balance row one-to-one — that produced a systematic false drift
+    where every ~2 sweeps an adjustment pair «переливала» stock from the
+    char-bin into the ''-bin. An adjustment (when it happens at all) is written
+    ONLY into the char='' bin and ONLY for a matured *aggregate* discrepancy;
+    per-char bins are never touched by the reconcile.
+
+Debounce (§3б step 3) is unchanged: the maturity window W=48h is not needed
+(one registrar); only a one-sweep debounce against snapshot races:
 
 * ``|delta| ≤ EPS``            → matched: ``last_reconciled_at``, clear pending.
 * ``|delta| > EPS`` 1st sweep  → store ``reconcile_pending_qty=delta``; DON'T apply.
-* ``|delta| > EPS`` 2nd sweep, same (±EPS) delta AND no in-flight pull touching
-  the item → apply: INSERT adjustment-SLE (qty=delta,
-  ingest_source='balance_reconcile', movement_kind='reconcile_adjustment',
-  recorder_type='reconcile', recorder_ref=<batch guid>, posting_at=snapshot
-  period), rebuild_running_balance + fold the bin, mark reconciled.
+* ``|delta| > EPS`` 2nd sweep, same (±EPS) delta AND no in-flight pull →
+  the v2 discovery→adjustment order below.
+
+Discovery→adjustment order (owner decision §7.4(д): «расхождение = мы
+пропустили документ, а не повод для анонимной поправки»):
+
+1. For a matured key, point-query the movements register
+   ``AccumulationRegister_ЗапасыНаСкладах`` by Номенклатура (+ склад) with
+   ``Period > последний якорь/последняя сверка`` (Инк0 mechanics) → recorders.
+2. Recorders unknown locally (no ``stock_recorder_pull`` row, no SLE) →
+   ``enqueue_recorder_pull(source='reconcile-discovery')`` and NO adjustment
+   this sweep — the key is held until the orchestrator drains the queue and the
+   staged pull-by-document replays the ledger with a real Recorder.
+3. Register returned nothing new but the delta persists → an honest anonymous
+   adjustment-SLE, counted as an ``anomaly`` (visible): qty=delta,
+   ingest_source='balance_reconcile', movement_kind='reconcile_adjustment',
+   recorder_type='reconcile', recorder_ref=<batch guid>, posting_at=snapshot
+   period, rebuild_running_balance + fold the bin, mark reconciled.
+
+Guards: the point query runs ONLY for matured discrepancies (never routinely);
+at most ``RECONCILE_DISCOVERY_LIMIT`` discovery queries per sweep (the rest are
+held, counted ``discovery_skipped``); an OData timeout/error holds the key
+without an adjustment and never fails the sweep. Known limits: a document
+backdated to ``Period ≤ since`` escapes the Period filter and ends as an
+anomaly-adjustment (accepted, same as the design's backdating compromise); an
+item without ``item_ref1c`` cannot be queried by name — the adjustment is its
+only recovery path.
 
 Everything here stays SHADOW: the adjustment-SLE feeds only the (still-unread)
 stock_bin — no reader is switched (inc5), no reservation side is wired (inc4),
@@ -46,6 +87,17 @@ RECONCILE_SOURCE = "balance_reconcile"
 RECONCILE_RECORDER_TYPE = "reconcile"
 RECONCILE_MOVEMENT_KIND = "reconcile_adjustment"
 
+# §7.4(д) discovery: the pull-queue source tag and the per-sweep cap on point
+# register queries (each matured key costs one OData round-trip; the rest are
+# held to the next sweep — bounded 1С load by construction).
+RECONCILE_DISCOVERY_SOURCE = "reconcile-discovery"
+RECONCILE_DISCOVERY_LIMIT = 20
+
+_ODATA_PREFIX = "StandardODATA."
+
+# Sentinel: "build the real OData client lazily" (run_balance_reconcile_after_sweep).
+_BUILD_CLIENT = object()
+
 
 # ---------------------------------------------------------------------------
 # results
@@ -54,7 +106,10 @@ RECONCILE_MOVEMENT_KIND = "reconcile_adjustment"
 
 @dataclass
 class ReconcileEvent:
-    """One decided key in a reconcile sweep (kept for the sync log / report)."""
+    """One decided key in a reconcile sweep (kept for the sync log / report).
+
+    ``key`` is the AGGREGATE ledger key (char='') — the Д7 comparison axis.
+    """
 
     key: LedgerKey
     balance_qty: Decimal
@@ -74,8 +129,12 @@ class ReconcileResult:
     compared: int = 0
     matched: int = 0
     pending: int = 0  # first-seen deltas stored, not applied
-    held: int = 0     # confirmed deltas held back by an in-flight pull
+    held: int = 0     # confirmed deltas held back (in-flight pull / discovery)
     adjusted: int = 0  # adjustment-SLEs written
+    # §7.4(д) discovery counters (sweep report):
+    discovered_recorders: int = 0  # missed recorders found + enqueued this sweep
+    discovery_skipped: int = 0     # matured keys not checked (limit / OData error)
+    anomalies: int = 0             # register clean, delta stayed → anonymous adjustment
     events: List[ReconcileEvent] = field(default_factory=list)
 
 
@@ -100,6 +159,10 @@ def _has_inflight_pull(session: Session) -> bool:
     terminally failed ones (error, past the attempt cap) are NOT in-flight and
     never block — an exhausted pull will not retry, so the reconcile adjustment
     IS the recovery path for its movements.
+
+    Evaluated ONCE at sweep start: recorders enqueued by the discovery step of
+    the same sweep do not retro-block other keys' decisions (each matured key
+    runs its own discovery anyway).
     """
     from .ingest import DEFAULT_MAX_ATTEMPTS  # single home of the retry cap
 
@@ -121,8 +184,165 @@ def _has_inflight_pull(session: Session) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# §7.4(д) discovery helpers
+# ---------------------------------------------------------------------------
+
+
+class _FailingDiscoveryClient:
+    """Stand-in when the real OData client could not be built.
+
+    Every discovery attempt raises, so matured deltas are HELD (§7.4д forbids
+    an anonymous adjustment that skipped the document search) and the sweep
+    itself never crashes.
+    """
+
+    def __init__(self, error: str) -> None:
+        self._error = str(error)
+
+    def get_all(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(f"discovery client unavailable: {self._error}")
+
+
+def _norm_recorder_type(value: Any) -> str:
+    """'StandardODATA.Document_X' / 'Document_X' → 'Document_X' (enqueue shape)."""
+    s = str(value or "").strip()
+    if s.startswith(_ODATA_PREFIX):
+        s = s[len(_ODATA_PREFIX):]
+    return s
+
+
+def _extract_guid(value: Any) -> str:
+    from .ingest import _norm_ref  # zero GUID → ''
+
+    if isinstance(value, dict):
+        value = value.get("Ref_Key") or value.get("RefKey") or value.get("ref_key") or ""
+    return _norm_ref(value)
+
+
+def _discover_register_recorders(
+    client: Any,
+    item_ref: str,
+    warehouse_ref: str,
+    since: Optional[datetime],
+) -> List[Tuple[str, str]]:
+    """Point-query the movements register: which recorders moved this item.
+
+    Инк0 mechanics (same entity ingest pulls, same client): filter by
+    ``Номенклатура_Key`` (+ ``СтруктурнаяЕдиница_Key`` when the key has a
+    warehouse) and ``Period gt`` the last anchor/reconcile stamp. Returns
+    unique ``(recorder_type, recorder_ref)`` pairs; raises on OData failure
+    (the caller holds the key). Tolerates both response shapes: recorder-rows
+    ``{Recorder, Recorder_Type, RecordSet}`` and flat movement lines carrying
+    Recorder fields.
+    """
+    from .ingest import REGISTER_ENTITY
+
+    parts = [f"Номенклатура_Key eq guid'{item_ref}'"]
+    if warehouse_ref:
+        parts.append(f"СтруктурнаяЕдиница_Key eq guid'{warehouse_ref}'")
+    if since is not None:
+        parts.append(
+            f"Period gt datetime'{since.replace(microsecond=0).isoformat()}'"
+        )
+    rows = client.get_all(
+        REGISTER_ENTITY, filter_query=" and ".join(parts), order_by=None
+    )
+
+    found: List[Tuple[str, str]] = []
+    seen: Set[str] = set()
+    for row in rows if isinstance(rows, list) else [rows]:
+        if not isinstance(row, dict):
+            continue
+        ref = _extract_guid(row.get("Recorder"))
+        rtype = _norm_recorder_type(row.get("Recorder_Type"))
+        if not ref or not rtype or ref in seen:
+            continue
+        seen.add(ref)
+        found.append((rtype, ref))
+    return found
+
+
+def _known_recorder_refs(session: Session, refs: Sequence[str]) -> Set[str]:
+    """Subset of ``refs`` already visible locally: a stock_recorder_pull row
+    (any status — pending/done/empty/error are all 'we know about it', so
+    discovery never re-enqueues in a loop) or SLE lines under that recorder."""
+    refs = [r for r in refs if r]
+    if not refs:
+        return set()
+    known = {
+        r[0]
+        for r in session.query(models.StockRecorderPull.recorder_ref)
+        .filter(models.StockRecorderPull.recorder_ref.in_(refs))
+        .all()
+    }
+    known |= {
+        r[0]
+        for r in session.query(models.StockLedgerEntry.recorder_ref)
+        .filter(models.StockLedgerEntry.recorder_ref.in_(refs))
+        .distinct()
+        .all()
+    }
+    return known
+
+
+def _discovery_since(
+    session: Session, key: LedgerKey, group: Sequence[models.StockBin]
+) -> Optional[datetime]:
+    """Lower Period bound for the point query: the last moment this aggregate
+    key was provably consistent — max(last_reconciled_at over the group's bins,
+    anchor_at over the key's anchors, any characteristic)."""
+    stamps = [b.last_reconciled_at for b in group if b.last_reconciled_at is not None]
+    anchor_at = (
+        session.query(func.max(models.StockLedgerAnchor.anchor_at))
+        .filter(
+            models.StockLedgerAnchor.item_id == key.item_id,
+            models.StockLedgerAnchor.organization_ref == key.organization_ref,
+            models.StockLedgerAnchor.warehouse_ref1c == key.warehouse_ref1c,
+        )
+        .scalar()
+    )
+    if anchor_at is not None:
+        stamps.append(anchor_at)
+    return max(stamps) if stamps else None
+
+
+# ---------------------------------------------------------------------------
 # core: compare a Balance snapshot against the ledger bins
 # ---------------------------------------------------------------------------
+
+
+def _aggregate_key(key: LedgerKey) -> LedgerKey:
+    """Д7 comparison axis: collapse the characteristic (Balance has none)."""
+    return LedgerKey(key.item_id, "", key.organization_ref, key.warehouse_ref1c)
+
+
+def _store_pending(
+    session: Session,
+    key: LedgerKey,
+    group: List[models.StockBin],
+    delta: Decimal,
+) -> models.StockBin:
+    """Keep the debounce alive on the aggregate's char='' bin (Д7).
+
+    The pending delta is stored on the ''-bin and cleared on the char-bins, so
+    Σ ``reconcile_pending_qty`` over the group always equals the last-seen
+    aggregate delta (also migrates any pre-Д7 per-char pending leftovers).
+    """
+    adj_bin = next((b for b in group if (b.characteristic_ref or "") == ""), None)
+    if adj_bin is None:
+        adj_bin = models.StockBin(
+            item_id=key.item_id,
+            characteristic_ref="",
+            organization_ref=key.organization_ref,
+            warehouse_ref1c=key.warehouse_ref1c,
+            on_hand=Decimal("0"),
+        )
+        session.add(adj_bin)
+        group.append(adj_bin)
+    for b in group:
+        b.reconcile_pending_qty = Decimal("0")
+    adj_bin.reconcile_pending_qty = delta
+    return adj_bin
 
 
 def reconcile_balance_snapshot(
@@ -134,70 +354,78 @@ def reconcile_balance_snapshot(
     eps: Decimal = EPS,
     now: Optional[datetime] = None,
     block_all_items: Optional[bool] = None,
+    discovery_client: Any = None,
+    discovery_limit: int = RECONCILE_DISCOVERY_LIMIT,
 ) -> ReconcileResult:
     """Compare a Balance snapshot ``{LedgerKey: qty}`` to the bins and reconcile.
 
-    ``snapshot`` is already normalized to ledger keys (char=''), summed per key.
-    Missing bin ⇒ on_hand 0; missing balance row ⇒ balance 0; keys that are zero
-    on both sides are not persisted. Debounce + apply per §3б step 3. Writes only
-    ledger-1 tables (stock_ledger_entry.qty_after via rebuild + stock_bin). No
-    OData, no INSERT outside ledger-1.
+    Snapshot keys are normalized to the AGGREGATE axis (char='', summed per
+    (item, org, warehouse) — Д7 variant «б»); bins are summed over all
+    characteristics of the same aggregate key. Missing bin ⇒ on_hand 0; missing
+    balance row ⇒ balance 0; keys that are zero on both sides are not
+    persisted. Debounce + apply per §3б step 3; a matured delta goes through
+    the §7.4(д) discovery order when ``discovery_client`` is set (the prod
+    sweep always sets it; ``None`` = legacy direct-adjustment mode for
+    unit-level callers). Writes only ledger-1 tables
+    (stock_ledger_entry.qty_after via rebuild + stock_bin) plus
+    ``stock_recorder_pull`` enqueues from discovery. No OData write.
     """
     now = now or datetime.now()
     snapshot_period = snapshot_period or now
     batch_ref = batch_ref or f"reconcile:{uuid.uuid4()}"
     result = ReconcileResult(batch_ref=batch_ref, snapshot_period=snapshot_period)
 
-    normalized_snapshot: Dict[LedgerKey, Decimal] = {
-        LedgerKey(*k): _dec(v) for k, v in snapshot.items()
-    }
+    normalized_snapshot: Dict[LedgerKey, Decimal] = {}
+    for k, v in snapshot.items():
+        agg = _aggregate_key(LedgerKey(*k))
+        normalized_snapshot[agg] = normalized_snapshot.get(agg, Decimal("0")) + _dec(v)
 
-    bins_by_key: Dict[LedgerKey, models.StockBin] = {}
+    groups: Dict[LedgerKey, List[models.StockBin]] = {}
     for b in session.query(models.StockBin).all():
-        bins_by_key[
-            LedgerKey(
-                int(b.item_id),
-                b.characteristic_ref or "",
-                b.organization_ref or "",
-                b.warehouse_ref1c or "",
-            )
-        ] = b
+        agg = LedgerKey(
+            int(b.item_id), "", b.organization_ref or "", b.warehouse_ref1c or ""
+        )
+        groups.setdefault(agg, []).append(b)
 
     if block_all_items is None:
         block_all_items = _has_inflight_pull(session)
 
-    keys: Set[LedgerKey] = set(bins_by_key.keys()) | set(normalized_snapshot.keys())
+    keys: Set[LedgerKey] = set(groups.keys()) | set(normalized_snapshot.keys())
     line_seq = 0
+    discovery_budget = max(0, int(discovery_limit))
 
     for key in sorted(keys):
-        bin_row = bins_by_key.get(key)
+        group = groups.get(key, [])
         balance_qty = normalized_snapshot.get(key, Decimal("0"))
-        on_hand = _dec(bin_row.on_hand) if bin_row is not None else Decimal("0")
+        on_hand = sum((_dec(b.on_hand) for b in group), Decimal("0"))
         delta = balance_qty - on_hand
 
-        # Both sides zero and no bin row → nothing to persist (§3б step 2).
-        if bin_row is None and abs(balance_qty) <= eps:
+        # Both sides zero and no bin rows → nothing to persist (§3б step 2).
+        if not group and abs(balance_qty) <= eps:
             continue
 
         result.compared += 1
 
         if abs(delta) <= eps:
-            # Matched: clear the debounce, stamp the reconcile time (§3б step 2).
-            if bin_row is not None:
-                bin_row.reconcile_pending_qty = Decimal("0")
-                bin_row.last_reconciled_at = now
+            # Matched: clear the debounce, stamp the reconcile time (§3б step 2)
+            # on every bin of the aggregate — they are jointly reconciled.
+            for b in group:
+                b.reconcile_pending_qty = Decimal("0")
+                b.last_reconciled_at = now
             result.matched += 1
             result.events.append(
                 ReconcileEvent(key, balance_qty, on_hand, delta, "matched")
             )
             continue
 
-        prior_pending = _dec(bin_row.reconcile_pending_qty) if bin_row is not None else Decimal("0")
+        prior_pending = sum(
+            (_dec(b.reconcile_pending_qty) for b in group), Decimal("0")
+        )
         same_as_prior = abs(prior_pending) > eps and abs(prior_pending - delta) <= eps
 
         if same_as_prior and block_all_items:
             # Confirmed delta but a pull is in-flight → hold (snapshot race).
-            bin_row.reconcile_pending_qty = delta
+            _store_pending(session, key, group, delta)
             result.held += 1
             result.events.append(
                 ReconcileEvent(key, balance_qty, on_hand, delta, "held",
@@ -206,7 +434,85 @@ def reconcile_balance_snapshot(
             continue
 
         if same_as_prior:
-            # Second consecutive sweep, same delta, no in-flight pull → APPLY.
+            # Second consecutive sweep, same delta, no in-flight pull. §7.4(д):
+            # a discrepancy means «we missed a document» — search the register
+            # for its recorder BEFORE resorting to an anonymous adjustment.
+            if discovery_client is not None:
+                if discovery_budget <= 0:
+                    result.discovery_skipped += 1
+                    _store_pending(session, key, group, delta)
+                    result.held += 1
+                    result.events.append(
+                        ReconcileEvent(key, balance_qty, on_hand, delta, "held",
+                                       note="discovery limit reached")
+                    )
+                    continue
+                discovery_budget -= 1
+                item_ref = (
+                    session.query(models.Item.item_ref1c)
+                    .filter(models.Item.item_id == key.item_id)
+                    .scalar()
+                )
+                item_ref = str(item_ref or "").strip()
+                if item_ref:
+                    try:
+                        recorders = _discover_register_recorders(
+                            discovery_client,
+                            item_ref,
+                            key.warehouse_ref1c,
+                            _discovery_since(session, key, group),
+                        )
+                    except Exception as exc:  # noqa: BLE001 — OData must not fail the sweep
+                        logger.warning(
+                            "balance_reconcile discovery failed for key=%s: %s",
+                            key, exc,
+                        )
+                        result.discovery_skipped += 1
+                        _store_pending(session, key, group, delta)
+                        result.held += 1
+                        result.events.append(
+                            ReconcileEvent(key, balance_qty, on_hand, delta, "held",
+                                           note=f"discovery error: {exc}")
+                        )
+                        continue
+                    known = _known_recorder_refs(
+                        session, [ref for _t, ref in recorders]
+                    )
+                    unknown = [(t, ref) for t, ref in recorders if ref not in known]
+                    if unknown:
+                        # Missed document(s): enqueue the staged pull and hold —
+                        # the orchestrator drains the queue; the replayed
+                        # movements carry a real Recorder (no anonymous SLE).
+                        from .ingest import enqueue_recorder_pull
+
+                        for rtype, rref in unknown:
+                            enqueue_recorder_pull(
+                                session, rtype, rref,
+                                source=RECONCILE_DISCOVERY_SOURCE,
+                            )
+                        result.discovered_recorders += len(unknown)
+                        _store_pending(session, key, group, delta)
+                        result.held += 1
+                        result.events.append(
+                            ReconcileEvent(
+                                key, balance_qty, on_hand, delta, "held",
+                                note=f"discovery: {len(unknown)} recorder(s) enqueued",
+                            )
+                        )
+                        logger.info(
+                            "balance_reconcile discovery enqueued %d recorder(s) "
+                            "for key=%s delta=%s batch=%s",
+                            len(unknown), key, delta, batch_ref,
+                        )
+                        continue
+                    # Register clean, delta persists → a true, visible anomaly.
+                    result.anomalies += 1
+                else:
+                    # No 1С ref → the register cannot be queried by name; the
+                    # adjustment is the only recovery path for this key.
+                    result.anomalies += 1
+
+            # APPLY: anonymous adjustment into the char='' bin (Д7 aggregate).
             line_seq += 1
             sle = _insert_adjustment_sle(
                 session, key, delta, snapshot_period, batch_ref, line_seq
@@ -223,8 +529,9 @@ def reconcile_balance_snapshot(
                 )
                 .one()
             )
-            applied_bin.reconcile_pending_qty = Decimal("0")
-            applied_bin.last_reconciled_at = now
+            for b in [*group, applied_bin]:
+                b.reconcile_pending_qty = Decimal("0")
+                b.last_reconciled_at = now
             result.adjusted += 1
             result.events.append(
                 ReconcileEvent(key, balance_qty, on_hand, delta, "adjusted", sle_id=sle.id)
@@ -238,16 +545,7 @@ def reconcile_balance_snapshot(
 
         # First sighting (or the delta changed / flipped sign → debounce reset):
         # store the pending delta, do NOT apply this sweep (§3б step 3).
-        if bin_row is None:
-            bin_row = models.StockBin(
-                item_id=key.item_id,
-                characteristic_ref=key.characteristic_ref,
-                organization_ref=key.organization_ref,
-                warehouse_ref1c=key.warehouse_ref1c,
-                on_hand=Decimal("0"),
-            )
-            session.add(bin_row)
-        bin_row.reconcile_pending_qty = delta
+        _store_pending(session, key, group, delta)
         result.pending += 1
         result.events.append(
             ReconcileEvent(key, balance_qty, on_hand, delta, "pending")
@@ -320,8 +618,10 @@ def build_balance_snapshot(
     """Normalize converted Balance rows → ``{LedgerKey(char=''): qty}``.
 
     ``balance_rows`` is the ``get_stock_from_1c_odata`` shape ({code, ref,
-    organization_ref, warehouse_ref, qty, ...}). Rows are summed per ledger key;
-    a row whose item cannot be resolved is dropped (it has no bin either).
+    organization_ref, warehouse_ref, qty, ...}) — aggregate per (item, org,
+    warehouse), no characteristic dimension (Д7 variant «б», see module
+    docstring). Rows are summed per ledger key; a row whose item cannot be
+    resolved is dropped (it has no bin either).
     """
     from ..odata_stock_sync import _norm_code
 
@@ -348,6 +648,8 @@ def run_balance_reconcile_after_sweep(
     *,
     snapshot_period: Optional[datetime] = None,
     batch_ref: Optional[str] = None,
+    discovery_client: Any = _BUILD_CLIENT,
+    discovery_limit: int = RECONCILE_DISCOVERY_LIMIT,
 ) -> ReconcileResult:
     """The stock-sweep after-step (§3б): reconcile bins vs the Balance snapshot.
 
@@ -355,13 +657,28 @@ def run_balance_reconcile_after_sweep(
     filter) converted Balance rows, so bins in any known warehouse reconcile
     against 1С regardless of the planning selection contour. Guarded by its
     caller — a failure here never breaks the legacy sweep.
+
+    Discovery (§7.4д) is ALWAYS on for this prod path: by default a read-only
+    OData client is built lazily (same config as ingest); if it cannot be built,
+    matured deltas are held rather than anonymously adjusted (never crash).
+    Tests inject ``discovery_client`` explicitly; passing ``None`` disables
+    discovery (legacy direct-adjustment mode).
     """
+    if discovery_client is _BUILD_CLIENT:
+        try:
+            from .ingest import _build_client
+
+            discovery_client = _build_client()
+        except Exception as exc:  # noqa: BLE001 — held, not crashed (§7.4д)
+            discovery_client = _FailingDiscoveryClient(str(exc))
     snapshot = build_balance_snapshot(session, balance_rows)
     return reconcile_balance_snapshot(
         session,
         snapshot,
         snapshot_period=snapshot_period,
         batch_ref=batch_ref,
+        discovery_client=discovery_client,
+        discovery_limit=discovery_limit,
     )
 
 

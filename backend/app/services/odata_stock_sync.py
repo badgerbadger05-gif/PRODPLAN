@@ -545,7 +545,10 @@ def sync_stock_from_odata(db: Session, req: ODataSyncRequest) -> dict:
             print(
                 f"[OData][stock] balance-reconcile: compared={rec.compared} "
                 f"matched={rec.matched} pending={rec.pending} held={rec.held} "
-                f"adjusted={rec.adjusted}",
+                f"adjusted={rec.adjusted} "
+                f"discovered_recorders={rec.discovered_recorders} "
+                f"discovery_skipped={rec.discovery_skipped} "
+                f"anomalies={rec.anomalies}",
                 flush=True,
             )
         except Exception as e:
