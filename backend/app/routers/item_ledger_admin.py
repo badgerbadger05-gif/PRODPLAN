@@ -27,6 +27,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 import time
 from typing import Any, Dict, List, Mapping, Optional
+from urllib.error import URLError
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
@@ -167,11 +168,14 @@ def _fetch_balance_at(
     base_url = sanitize_base_url(str(config.get("base_url") or ""))
     return get_stock_from_1c_odata(
         base_url=base_url,
-        entity_name=REGISTER_ENTITY,
+        entity_name=f"{REGISTER_ENTITY}/Balance",
         username=config.get("username") or None,
         password=config.get("password") or None,
         token=config.get("token") or None,
-        filter_query=f"Period le datetime'{at.replace(microsecond=0).isoformat()}'",
+        filter_query=(
+            "Period le datetime'"
+            f"{at.replace(tzinfo=None, microsecond=0).isoformat()}'"
+        ),
     )
 
 
@@ -250,6 +254,12 @@ def bootstrap_historical_generation(
         }
     except HTTPException:
         raise
+    except URLError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=502,
+            detail=f"Historical Balance OData request failed: {exc.reason}",
+        ) from exc
     except (ValueError, GenerationBootstrapError, Phase0BootstrapError) as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -370,6 +380,12 @@ def verify_historical_generation_balance(
         }
     except HTTPException:
         raise
+    except URLError as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=502,
+            detail=f"Cutoff Balance OData request failed: {exc.reason}",
+        ) from exc
     except (ValueError, GenerationBootstrapError, Phase0BootstrapError) as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from exc
