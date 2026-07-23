@@ -3,7 +3,7 @@ Purchase control journal ("Журнал закупок").
 
 Read model over supplier orders synced from 1C (Document_ЗаказПоставщику)
 plus not-yet-ordered MRP purchase needs (planned_purchase rows of the latest
-FIXED_SNAPSHOT run without a successful SyncLink). Ordering itself reuses
+accepted-generation FIXED_SNAPSHOT runs without a successful SyncLink). Ordering itself reuses
 POST /v1/plan/results/{run_id}/purchases/export-to-1c; receipts come from 1C
 via supplier order sync. See .docs/purchase_journal_plan.md.
 """
@@ -20,12 +20,14 @@ from ..models import (
     Item,
     PlannedPurchase,
     PlanningRun,
+    ProductionPlanHeader,
     Supplier,
     SupplierOrder,
     SupplierOrderItem,
     SyncLink,
     Unit,
 )
+from .planning_truth import require_accepted_truth
 from .one_c_export_common import clean_ref1c as _clean_ref1c
 from .one_c_purchase_order_export import PURCHASE_ORDER_ENTITY
 from .supplier_order_status import (
@@ -131,14 +133,23 @@ def _line_status(
     return "expected"
 
 
-def latest_fixed_run_id(db: Session) -> Optional[int]:
-    row = (
+def _accepted_fixed_run_ids(db: Session, *, ledger_generation_id: int) -> List[int]:
+    """Return only fixed UI plans bound to the published Ledger generation.
+
+    A run id is not a truth selector: a newer/foreign fixed run may still be
+    building a different Ledger generation.  Legacy runs without generation or
+    source-plan lineage are deliberately excluded instead of being guessed.
+    """
+    rows = (
         db.query(PlanningRun.run_id)
+        .join(ProductionPlanHeader, ProductionPlanHeader.id == PlanningRun.source_plan_id)
         .filter(PlanningRun.status == "FIXED_SNAPSHOT")
-        .order_by(PlanningRun.run_id.desc())
-        .first()
+        .filter(PlanningRun.ledger_generation_id == int(ledger_generation_id))
+        .filter(ProductionPlanHeader.status == "fixed")
+        .order_by(PlanningRun.run_id.asc())
+        .all()
     )
-    return int(row[0]) if row else None
+    return [int(row[0]) for row in rows]
 
 
 def _exported_purchase_ids(db: Session) -> set:
@@ -513,20 +524,11 @@ def list_journal(
     today: Optional[date] = None,
 ) -> Dict[str, Any]:
     today = today or date.today()
-    run_id = latest_fixed_run_id(db)
-
-    # The journal's not-yet-ordered ("to order") rows come from the union of ALL
-    # active FIXED_SNAPSHOT runs (one per open plan), not just the latest run.
-    # Each run owns its own PlannedPurchase rows (reconciliation consumes the
-    # shared pools once across the queue), and _to_order_row_key namespaces by
-    # run_id so multi-run grouping stays correct. The latest fixed run is folded
-    # in as a fallback so legacy runs without a source_plan_id (which the active
-    # filter skips) keep appearing exactly as before.
-    from .mrp_reconciliation import _latest_active_snapshot_run_ids
-
-    to_order_run_ids: List[int] = list(_latest_active_snapshot_run_ids(db))
-    if run_id is not None and run_id not in to_order_run_ids:
-        to_order_run_ids.append(run_id)
+    truth = require_accepted_truth(db, "purchase_control_journal")
+    to_order_run_ids = _accepted_fixed_run_ids(
+        db,
+        ledger_generation_id=int(truth.generation_id),
+    )
 
     # run_id → owning plan period, so every to-order row can carry its horizon
     # (plan_period_from/to + a human label) and be bucketed by plan period.
@@ -619,7 +621,13 @@ def list_journal(
         "total": total,
         "limit": effective_limit,
         "offset": effective_offset,
-        "run_id": run_id,
+        # A generation can legitimately contain several fixed plan snapshots;
+        # do not invent a "latest" one.  Keep the old scalar only when it is
+        # unambiguous and expose the full exact scope for dictionary clients.
+        "run_id": to_order_run_ids[0] if len(to_order_run_ids) == 1 else None,
+        "run_ids": to_order_run_ids,
+        "truth_status": truth.status,
+        "ledger_generation_id": int(truth.generation_id),
         "summary": summary,
         "to_order_by_period": to_order_by_period,
     }

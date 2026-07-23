@@ -1,9 +1,15 @@
 from datetime import date, datetime
 
+import pytest
+
 from app.models import (
     Item,
     PlannedPurchase,
+    PlanningTruthState,
     PlanningRun,
+    ProductionPlanHeader,
+    PhysicalImportBatch,
+    LedgerGeneration,
     Supplier,
     SupplierOrder,
     SupplierOrderItem,
@@ -14,6 +20,47 @@ from app.services.one_c_purchase_order_export import PURCHASE_ORDER_ENTITY
 from app.services.purchase_control_journal import get_order_card, list_filters, list_journal
 
 TODAY = date(2026, 6, 11)
+
+
+@pytest.fixture(autouse=True)
+def accepted_journal_truth(db_session):
+    """Every normal purchase-journal case reads an explicit published truth."""
+    cutoff = datetime(2026, 6, 1)
+    physical = PhysicalImportBatch(
+        batch_key="purchase-journal-test-physical",
+        status="completed", cutoff=cutoff, completed_at=cutoff, source_watermarks={},
+    )
+    generation = LedgerGeneration(
+        generation_key="purchase-journal-test-generation",
+        status="accepted", cutoff=cutoff, accepted_at=cutoff,
+        source_watermarks={}, capabilities={}, physical_import_batch=physical,
+        algorithm_version="tests/1",
+    )
+    db_session.add(generation)
+    db_session.flush()
+    db_session.add(PlanningTruthState(id=1, current_generation_id=generation.id))
+    db_session.flush()
+    db_session.info["accepted_journal_generation_id"] = generation.id
+    return generation
+
+
+def _make_mrp_run(db, *, period_from=None, period_to=None):
+    period_from = period_from or date(2026, 6, 1)
+    period_to = period_to or date(2026, 6, 30)
+    generation_id = db.info["accepted_journal_generation_id"]
+    plan = ProductionPlanHeader(
+        name=f"Purchase journal plan {period_from.isoformat()} {period_to.isoformat()} {generation_id}",
+        period_from=period_from, period_to=period_to, status="fixed",
+    )
+    db.add(plan)
+    db.flush()
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT", config_snapshot={}, source_plan_id=plan.id,
+        period_from=period_from, period_to=period_to, ledger_generation_id=generation_id,
+    )
+    db.add(run)
+    db.flush()
+    return run
 
 
 def _make_item(db, code, name, article=None, supplier_ref=None):
@@ -162,9 +209,7 @@ def test_list_journal_closed_only_on_terminal_states(db_session):
 
 
 def test_list_journal_includes_unordered_mrp_purchases(db_session):
-    run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={})
-    db_session.add(run)
-    db_session.flush()
+    run = _make_mrp_run(db_session)
     supplier = _make_supplier(db_session, "s-ref-1", "ООО Метиз")
     item = _make_item(db_session, "M-1", "Болт М10", supplier_ref="s-ref-1")
     exported = PlannedPurchase(
@@ -214,16 +259,12 @@ def test_journal_aggregates_active_runs(db_session):
     supplier = _make_supplier(db_session, "s-ref-1", "ООО Метиз")
     item = _make_item(db_session, "M-AGG", "Болт М10", supplier_ref="s-ref-1")
 
-    run_a = PlanningRun(
-        status="FIXED_SNAPSHOT", config_snapshot={},
-        source_plan_id=901, period_to=date(2026, 8, 31),
+    run_a = _make_mrp_run(
+        db_session, period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
     )
-    run_b = PlanningRun(
-        status="FIXED_SNAPSHOT", config_snapshot={},
-        source_plan_id=902, period_to=date(2026, 9, 30),
+    run_b = _make_mrp_run(
+        db_session, period_from=date(2026, 9, 1), period_to=date(2026, 9, 30),
     )
-    db_session.add_all([run_a, run_b])
-    db_session.flush()
 
     db_session.add(
         PlannedPurchase(
@@ -254,16 +295,12 @@ def _make_horizon_runs(db):
     _make_supplier(db, "s-ref-1", "ООО Метиз")
     item = _make_item(db, "M-HZ", "Болт М10", supplier_ref="s-ref-1")
 
-    run_aug = PlanningRun(
-        status="FIXED_SNAPSHOT", config_snapshot={},
-        source_plan_id=911, period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
+    run_aug = _make_mrp_run(
+        db, period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),
     )
-    run_sep = PlanningRun(
-        status="FIXED_SNAPSHOT", config_snapshot={},
-        source_plan_id=912, period_from=date(2026, 9, 1), period_to=date(2026, 9, 30),
+    run_sep = _make_mrp_run(
+        db, period_from=date(2026, 9, 1), period_to=date(2026, 9, 30),
     )
-    db.add_all([run_aug, run_sep])
-    db.flush()
 
     db.add(
         PlannedPurchase(
@@ -346,9 +383,7 @@ def test_full_need_visible_without_horizon_filter(db_session):
 
 
 def test_list_journal_aggregates_duplicate_unordered_mrp_purchases(db_session):
-    run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={})
-    db_session.add(run)
-    db_session.flush()
+    run = _make_mrp_run(db_session, period_from=date(2026, 8, 1), period_to=date(2026, 8, 31))
     _make_supplier(db_session, "s-ref-1", "ООО Метиз")
     _make_supplier(db_session, "s-ref-2", "ООО Сталь")
     item = _make_item(db_session, "M-1", "Болт М10", supplier_ref="s-ref-1")
@@ -435,9 +470,7 @@ def test_list_journal_resolves_unit_guid_to_label(db_session):
             short_name="шт",
         )
     )
-    run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={})
-    db_session.add(run)
-    db_session.flush()
+    run = _make_mrp_run(db_session)
     supplier = _make_supplier(db_session, "s-ref-1", "ООО Метиз")
     item = _make_item(db_session, "M-1", "Болт М10", supplier_ref="s-ref-1")
     item.unit = unit_ref

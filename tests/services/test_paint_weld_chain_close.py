@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import pytest
+
 from app.models import (
     DefaultSpecification,
     Item,
@@ -22,9 +24,30 @@ from app.models import (
     Specification,
     SpecOperation,
     SyncLink,
+    LedgerGeneration,
+    PhysicalImportBatch,
+    PlanningTruthState,
 )
 from app.services import one_c_piecework_export as exporter
 from app.services.paint_weld_chain import close_paint_chain
+
+
+@pytest.fixture(autouse=True)
+def _accepted_journal_truth(db_session):
+    cutoff = datetime(2026, 7, 18)
+    physical = PhysicalImportBatch(
+        batch_key="paint-weld-close-journal", status="completed", cutoff=cutoff,
+        completed_at=cutoff, source_watermarks={},
+    )
+    generation = LedgerGeneration(
+        generation_key="paint-weld-close-journal", status="accepted", cutoff=cutoff,
+        accepted_at=cutoff, source_watermarks={}, capabilities={},
+        physical_import_batch=physical, algorithm_version="tests/1",
+    )
+    db_session.add(generation)
+    db_session.flush()
+    db_session.add(PlanningTruthState(id=1, current_generation_id=generation.id))
+    db_session.flush()
 
 
 class _FakeClient:

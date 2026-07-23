@@ -93,6 +93,33 @@ def _accepted_mrp_context(db_session, *, key: str):
     return generation, cutoff
 
 
+@pytest.fixture(autouse=True)
+def accepted_production_journal_truth(db_session):
+    """Journal reads have a published Ledger pointer in ordinary test cases."""
+    generation, cutoff = _accepted_mrp_context(db_session, key="production-journal-default")
+    db_session.info["production_journal_generation_id"] = generation.id
+    return generation, cutoff
+
+
+def _journal_mrp_run(db_session, *, period_from=None, period_to=None):
+    period_from = period_from or _dt.date(2026, 6, 1)
+    period_to = period_to or _dt.date(2026, 6, 30)
+    plan = ProductionPlanHeader(
+        name=f"Production journal {period_from.isoformat()} {period_to.isoformat()}",
+        period_from=period_from, period_to=period_to, status="fixed",
+    )
+    db_session.add(plan)
+    db_session.flush()
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT", config_snapshot={}, source_plan_id=plan.id,
+        period_from=period_from, period_to=period_to,
+        ledger_generation_id=db_session.info["production_journal_generation_id"],
+    )
+    db_session.add(run)
+    db_session.flush()
+    return run
+
+
 def test_list_employees_returns_active_synced_employees(db_session):
     db_session.add_all([
         Employee(
@@ -540,6 +567,7 @@ def test_journal_exposes_prodplan_number_separately_from_1c_number(db_session):
     db_session.add(item)
     db_session.flush()
 
+    run = _journal_mrp_run(db_session)
     order = ProductionOrder(
         order_number="PP001204945",
         order_date=datetime(2026, 6, 4),
@@ -547,7 +575,7 @@ def test_journal_exposes_prodplan_number_separately_from_1c_number(db_session):
         is_posted=False,
         deletion_mark=False,
         source="mrp",
-        source_run_id=12,
+        source_run_id=run.run_id,
     )
     db_session.add(order)
     db_session.flush()
@@ -578,7 +606,7 @@ def test_journal_exposes_prodplan_number_separately_from_1c_number(db_session):
 
     assert row["order_number"] == "PP001204945"
     assert row["order_one_c_number"] == "PP001204945"
-    assert row["order_prodplan_number"] == f"MRP-RC-12-{item.item_id}-{order.order_id}"
+    assert row["order_prodplan_number"] == f"MRP-RC-{run.run_id}-{item.item_id}-{order.order_id}"
 
 
 def test_journal_prodplan_numbers_are_unique_for_same_item_and_run(db_session):
@@ -592,13 +620,14 @@ def test_journal_prodplan_numbers_are_unique_for_same_item_and_run(db_session):
     db_session.add(item)
     db_session.flush()
 
+    run = _journal_mrp_run(db_session)
     orders = [
         ProductionOrder(
             order_number=f"PP00130000{idx}",
             order_date=datetime(2026, 6, 5),
             deletion_mark=False,
             source="mrp",
-            source_run_id=13,
+            source_run_id=run.run_id,
         )
         for idx in range(2)
     ]
@@ -660,9 +689,7 @@ def test_journal_exposes_mrp_requirement_coverage_fields(db_session):
     db_session.add(item)
     db_session.flush()
 
-    run = PlanningRun(status="FIXED_SNAPSHOT", started_at=datetime(2026, 5, 27))
-    db_session.add(run)
-    db_session.flush()
+    run = _journal_mrp_run(db_session)
     req = MrpRequirement(
         run_id=run.run_id,
         item_id=item.item_id,
@@ -1505,10 +1532,14 @@ def test_journal_root_filter_uses_all_active_plan_snapshot_scopes(db_session):
         ProductionPlanLine(plan_id=plan_b.id, item_id=root.item_id, bucket_date=_dt.date(2026, 7, 1), qty=1),
         ProductionPlanLine(plan_id=archived_plan.id, item_id=root.item_id, bucket_date=_dt.date(2026, 5, 1), qty=1),
     ])
+    current_generation_id = db_session.info["production_journal_generation_id"]
+    # Older lineage is deliberately unbound; two active plan snapshots are
+    # bound to the published generation.  The archived plan is excluded by
+    # header status even when it carries that generation.
     old_run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={}, source_plan_id=plan_a.id)
-    latest_run_a = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={}, source_plan_id=plan_a.id)
-    latest_run_b = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={}, source_plan_id=plan_b.id)
-    archived_run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={}, source_plan_id=archived_plan.id)
+    latest_run_a = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={}, source_plan_id=plan_a.id, ledger_generation_id=current_generation_id)
+    latest_run_b = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={}, source_plan_id=plan_b.id, ledger_generation_id=current_generation_id)
+    archived_run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={}, source_plan_id=archived_plan.id, ledger_generation_id=current_generation_id)
     db_session.add_all([old_run, latest_run_a, latest_run_b, archived_run])
     db_session.flush()
 
@@ -2613,6 +2644,7 @@ def test_journal_uses_cached_material_coverage_for_coverage_band_rows(db_session
     )
     _order, product = _make_internal_order_for(db_session, parent, qty=2)
     _order.source = "mrp"
+    _order.source_run_id = _journal_mrp_run(db_session).run_id
     state = (
         db_session.query(ProductionOrderLineState)
         .filter_by(product_id=product.product_id)

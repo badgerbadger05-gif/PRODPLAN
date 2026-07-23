@@ -34,10 +34,8 @@ from .production_control_common import (
     parse_date as _parse_date,
     to_float as _to_float,
 )
-from .production_control_domain import (
-    ensure_state as _ensure_state,
-    latest_run_id as _latest_run_id,
-)
+from .production_control_domain import ensure_state as _ensure_state
+from .planning_truth import require_accepted_truth
 from .production_control_material_issues import refresh_existing_material_issues_for_product
 from .replenishment import REPLENISHMENT_FLOW_PRODUCTION, classify_replenishment_flow
 from .paint_weld_pairs import is_welded_blocked
@@ -455,19 +453,41 @@ def _bom_descendant_ids_for_root(db: Session, root_item_id: int) -> set[int]:
     return result
 
 
-def _active_plan_snapshot_run_ids_for_root(db: Session, root_item_id: int) -> set[int]:
+def _accepted_plan_snapshot_run_ids_for_root(
+    db: Session,
+    root_item_id: int,
+    *,
+    ledger_generation_id: int,
+) -> set[int]:
+    """Return fixed-plan snapshots from exactly the published Ledger generation.
+
+    No ``max(run_id)`` is used here.  Publication owns the generation pointer;
+    a fixed run from another (including newer) generation is not UI truth.
+    """
     rows = (
-        db.query(PlanningRun.source_plan_id, func.max(PlanningRun.run_id).label("run_id"))
+        db.query(PlanningRun.run_id)
         .join(ProductionPlanHeader, ProductionPlanHeader.id == PlanningRun.source_plan_id)
         .join(ProductionPlanLine, ProductionPlanLine.plan_id == ProductionPlanHeader.id)
         .filter(ProductionPlanHeader.status == "fixed")
         .filter(ProductionPlanLine.item_id == int(root_item_id))
         .filter(PlanningRun.status == "FIXED_SNAPSHOT")
-        .filter(PlanningRun.source_plan_id.isnot(None))
-        .group_by(PlanningRun.source_plan_id)
+        .filter(PlanningRun.ledger_generation_id == int(ledger_generation_id))
         .all()
     )
-    return {int(row.run_id) for row in rows if row.run_id is not None}
+    return {int(row[0]) for row in rows if row[0] is not None}
+
+
+def _accepted_fixed_run_ids(db: Session, *, ledger_generation_id: int) -> List[int]:
+    rows = (
+        db.query(PlanningRun.run_id)
+        .join(ProductionPlanHeader, ProductionPlanHeader.id == PlanningRun.source_plan_id)
+        .filter(PlanningRun.status == "FIXED_SNAPSHOT")
+        .filter(PlanningRun.ledger_generation_id == int(ledger_generation_id))
+        .filter(ProductionPlanHeader.status == "fixed")
+        .order_by(PlanningRun.run_id.asc())
+        .all()
+    )
+    return [int(row[0]) for row in rows]
 
 
 def _forecast_payload(forecast_date: Optional[date], due_date: Optional[date]) -> Dict[str, Any]:
@@ -927,10 +947,11 @@ def _default_spec_id_for_item(db: Session, item_id: int) -> Optional[int]:
 
 def _planned_dates_by_item(
     db: Session,
-    run_id: Optional[int],
+    run_ids: Sequence[int],
     item_ids: Optional[Sequence[int]] = None,
 ) -> Dict[int, Tuple[Optional[date], Optional[date]]]:
-    if not run_id:
+    ids_for_runs = sorted({int(value) for value in run_ids if value is not None})
+    if not ids_for_runs:
         return {}
     q = (
         db.query(
@@ -938,7 +959,7 @@ def _planned_dates_by_item(
             func.min(PlannedOrder.start_date).label("start_date"),
             func.max(PlannedOrder.finish_date).label("finish_date"),
         )
-        .filter(PlannedOrder.run_id == run_id)
+        .filter(PlannedOrder.run_id.in_(ids_for_runs))
     )
     ids = sorted({int(item_id) for item_id in (item_ids or []) if item_id is not None})
     if ids:
@@ -965,8 +986,15 @@ def list_journal(
     limit: int = 100,
     offset: int = 0,
 ) -> Dict[str, Any]:
-    run_id = _latest_run_id(db)
-    latest_run = db.query(PlanningRun).filter(PlanningRun.run_id == run_id).first() if run_id else None
+    truth = require_accepted_truth(db, "production_control_journal")
+    accepted_run_ids = _accepted_fixed_run_ids(
+        db,
+        ledger_generation_id=int(truth.generation_id),
+    )
+    # A scalar is retained only for an unambiguous scope.  Never choose the
+    # numerically latest run as that can belong to a foreign generation.
+    run_id = accepted_run_ids[0] if len(accepted_run_ids) == 1 else None
+    latest_run = db.query(PlanningRun).filter(PlanningRun.run_id == run_id).first() if run_id is not None else None
     requested_coverage_status = str(coverage_status) if coverage_status else None
     failed_manufacture_products = (
         select(ProductionManufacture.product_id)
@@ -995,6 +1023,18 @@ def list_journal(
         )
     )
 
+    # 1C/DBR work stays visible on its own factual lineage.  MRP-originated
+    # work, however, is an obligation projection and is valid only when its
+    # source snapshot belongs to the exact published generation and a fixed
+    # production plan.  A missing source_run_id is legacy/ambiguous, not a
+    # reason to show a made-up current MRP line.
+    query = query.filter(
+        or_(
+            func.lower(func.coalesce(ProductionOrder.source, "1c")) != "mrp",
+            ProductionOrder.source_run_id.in_(accepted_run_ids or [-1]),
+        )
+    )
+
     if product_id is not None:
         query = query.filter(ProductionProduct.product_id == int(product_id))
     if order_id is not None:
@@ -1002,7 +1042,11 @@ def list_journal(
     if root_item_id is not None:
         related_ids = _bom_descendant_ids_for_root(db, int(root_item_id))
         query = query.filter(ProductionProduct.item_id.in_(related_ids))
-        active_run_ids = _active_plan_snapshot_run_ids_for_root(db, int(root_item_id))
+        active_run_ids = _accepted_plan_snapshot_run_ids_for_root(
+            db,
+            int(root_item_id),
+            ledger_generation_id=int(truth.generation_id),
+        )
         query = query.filter(ProductionOrder.source_run_id.in_(sorted(active_run_ids) or [-1]))
     if status:
         status_values = STATUS_FILTER_GROUPS.get(str(status), (str(status),))
@@ -1080,7 +1124,7 @@ def list_journal(
         effective_offset = max(0, int(offset or 0))
 
     page_item_ids = sorted({int(product.item_id) for product in rows if product.item_id is not None})
-    plan_dates = _planned_dates_by_item(db, run_id, page_item_ids)
+    plan_dates = _planned_dates_by_item(db, accepted_run_ids, page_item_ids)
     order_ids = sorted({int(product.order_id) for product in rows})
     run_ids = sorted({
         int(product.order.source_run_id)
