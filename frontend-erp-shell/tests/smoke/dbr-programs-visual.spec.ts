@@ -11,6 +11,9 @@ async function mockDbrProgramsApi(page: Page) {
         json: [
           {
             id: 31,
+            source_run_id: 71,
+            ledger_generation_id: 14,
+            freeze_version: 2,
             title: 'Программа выпуска · август 2026',
             company: 'ООО ЗСМ',
             from_date: '2026-08-01',
@@ -39,6 +42,9 @@ async function mockDbrProgramsApi(page: Page) {
           },
           {
             id: 30,
+            source_run_id: 71,
+            ledger_generation_id: 14,
+            freeze_version: 2,
             title: 'Контрактный план · июль 2026',
             company: 'ООО ЗСМ',
             from_date: '2026-07-01',
@@ -58,6 +64,9 @@ async function mockDbrProgramsApi(page: Page) {
           },
           {
             id: 29,
+            source_run_id: 71,
+            ledger_generation_id: 14,
+            freeze_version: 2,
             title: 'Резерв мощностей · июль',
             company: null,
             from_date: '2026-07-15',
@@ -66,6 +75,27 @@ async function mockDbrProgramsApi(page: Page) {
             items: [],
           },
         ],
+      })
+      return
+    }
+
+    if (key === 'GET /api/v1/plan/runs?limit=200') {
+      await route.fulfill({
+        json: {
+          rows: [
+            {
+              run_id: 71,
+              status: 'FIXED_SNAPSHOT',
+              started_at: '2026-07-20T09:00:00Z',
+              finished_at: '2026-07-20T09:03:00Z',
+              source_plan_id: 8,
+              source_plan_name: 'Август 2026',
+            },
+          ],
+          total: 1,
+          limit: 200,
+          offset: 0,
+        },
       })
       return
     }
