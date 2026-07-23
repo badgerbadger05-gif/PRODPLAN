@@ -1251,6 +1251,16 @@ class PlannedOrder(Base):
     bucket_date = Column(Date, nullable=False)
     demand_ref = Column(TEXT, nullable=True)
     demand_date = Column(Date, nullable=True)
+    # Nullable for migration compatibility; Ledger-bound readers fail closed
+    # for new proposals without this immutable generation identity.
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+
+    ledger_generation = relationship("LedgerGeneration")
 
 
 class PlannedOrderStage(Base):
@@ -1295,6 +1305,66 @@ class PlannedPurchase(Base):
         index=True,
     )
 
+    ledger_generation = relationship("LedgerGeneration")
+
+
+class PurchaseExportLineAllocation(Base):
+    """Immutable split of one exported 1C supplier-order line across proposals.
+
+    Export may coalesce several ``planned_purchase`` rows into one 1C line.
+    This table preserves the exact reverse mapping instead of inferring it from
+    item/date/quantity after the document has been created.
+    """
+
+    __tablename__ = "purchase_export_line_allocation"
+    __table_args__ = (
+        UniqueConstraint(
+            "ledger_generation_id",
+            "supplier_order_ref",
+            "supplier_order_line_no",
+            "planned_purchase_id",
+            name="uq_purchase_export_line_allocation",
+        ),
+        CheckConstraint(
+            "allocated_qty > 0",
+            name="ck_purchase_export_line_allocation_qty_positive",
+        ),
+        Index(
+            "ix_purchase_export_line_order",
+            "supplier_order_ref",
+            "supplier_order_line_no",
+        ),
+        Index(
+            "ix_purchase_export_line_generation_order",
+            "ledger_generation_id",
+            "supplier_order_ref",
+            "supplier_order_line_no",
+        ),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    supplier_order_ref = Column(String(64), nullable=False)
+    supplier_order_line_no = Column(String(32), nullable=False)
+    planned_purchase_id = Column(
+        Integer,
+        ForeignKey("planned_purchase.purchase_id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    allocated_qty = Column(DECIMAL(15, 3), nullable=False)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    ledger_generation = relationship("LedgerGeneration")
+    planned_purchase = relationship("PlannedPurchase")
+
 
 class PlannedRework(Base):
     __tablename__ = "planned_rework"
@@ -1315,6 +1385,16 @@ class PlannedRework(Base):
     component_blocked = Column(Boolean, nullable=False, default=False)
     component_partial = Column(Boolean, nullable=False, default=False)
     shortage = Column(CrossPlatformJSON, nullable=True)
+    # Nullable for migration compatibility; mandatory for Ledger-derived
+    # proposals and verified by consumers before use.
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+
+    ledger_generation = relationship("LedgerGeneration")
 
 
 class MrpRequirement(Base):
@@ -2207,6 +2287,11 @@ class MrpExecutionAllocation(Base):
         Index("ix_mrp_execution_allocation_cycle", "cycle_id"),
         Index("ix_mrp_execution_allocation_requirement", "requirement_id"),
         Index("ix_mrp_execution_allocation_bucket", "bucket_id"),
+        Index(
+            "ix_mrp_execution_allocation_generation_sle",
+            "ledger_generation_id",
+            "stock_ledger_entry_id",
+        ),
     )
 
     id = Column(Integer, primary_key=True, index=True)
@@ -2228,6 +2313,14 @@ class MrpExecutionAllocation(Base):
     fact_line_ref = Column(String(64), nullable=False, server_default="")
     fact_date = Column(TIMESTAMP, nullable=True)
     allocated_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    # Exact physical fact identity. Nullable only for migration compatibility
+    # and non-physical allocation kinds (carry/manual/drift).
+    stock_ledger_entry_id = Column(
+        BigInteger,
+        ForeignKey("stock_ledger_entry.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     freeze_allocation_id = Column(
         Integer, ForeignKey("mrp_freeze_allocation.id", ondelete="SET NULL"), nullable=True, index=True
     )
@@ -2241,6 +2334,7 @@ class MrpExecutionAllocation(Base):
     freeze_allocation = relationship("MrpFreezeAllocation")
     origin_requirement = relationship("MrpRequirement", foreign_keys=[origin_requirement_id])
     ledger_generation = relationship("LedgerGeneration")
+    stock_ledger_entry = relationship("StockLedgerEntry")
 
 
 class MrpRequirementCarry(Base):
@@ -2405,6 +2499,88 @@ class StockLedgerEntry(Base):
 
     item = relationship("Item")
     ingest_batch = relationship("PhysicalImportBatch")
+
+
+class StockLedgerSupplierReceiptProvenance(Base):
+    """Generation-scoped, immutable business match for a supplier receipt.
+
+    The copied receipt identity makes the decision auditable without parsing a
+    mutable external document. ``match_status`` is deliberately explicit:
+    ambiguous and unmatched evidence is retained and cannot masquerade as an
+    exact supplier-order-line match.
+    """
+
+    __tablename__ = "stock_ledger_supplier_receipt_provenance"
+    __table_args__ = (
+        UniqueConstraint(
+            "ledger_generation_id",
+            "stock_ledger_entry_id",
+            name="uq_supplier_receipt_provenance_generation_sle",
+        ),
+        CheckConstraint(
+            "match_status IN ('exact', 'ambiguous', 'unmatched')",
+            name="ck_supplier_receipt_provenance_match_status",
+        ),
+        CheckConstraint(
+            "ambiguity_count >= 0",
+            name="ck_supplier_receipt_provenance_ambiguity_count",
+        ),
+        CheckConstraint(
+            "(match_status = 'exact' AND supplier_order_ref IS NOT NULL "
+            "AND supplier_order_line_no IS NOT NULL AND ambiguity_count = 0) "
+            "OR (match_status = 'ambiguous' AND ambiguity_count > 1 "
+            "AND reason IS NOT NULL) "
+            "OR (match_status = 'unmatched' AND ambiguity_count = 0 "
+            "AND reason IS NOT NULL)",
+            name="ck_supplier_receipt_provenance_match_evidence",
+        ),
+        Index(
+            "ix_supplier_receipt_provenance_order",
+            "supplier_order_ref",
+            "supplier_order_line_no",
+        ),
+        Index(
+            "ix_supplier_receipt_provenance_generation_status",
+            "ledger_generation_id",
+            "match_status",
+        ),
+        Index(
+            "ix_supplier_receipt_provenance_receipt_line",
+            "ledger_generation_id",
+            "receipt_doc_type",
+            "receipt_doc_ref",
+            "receipt_doc_line_no",
+        ),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    stock_ledger_entry_id = Column(
+        BigInteger,
+        ForeignKey("stock_ledger_entry.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    receipt_doc_type = Column(String(64), nullable=False)
+    receipt_doc_ref = Column(String(64), nullable=False)
+    receipt_doc_line_no = Column(String(32), nullable=False)
+    supplier_order_ref = Column(String(64), nullable=True)
+    supplier_order_line_no = Column(String(32), nullable=True)
+    match_rule = Column(String(64), nullable=False)
+    match_status = Column(String(16), nullable=False)
+    ambiguity_count = Column(Integer, nullable=False, server_default="0")
+    reason = Column(TEXT, nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    ledger_generation = relationship("LedgerGeneration")
+    stock_ledger_entry = relationship("StockLedgerEntry")
 
 
 class StockLedgerFactSupersession(Base):
