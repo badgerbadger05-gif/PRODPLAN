@@ -435,6 +435,20 @@ def pull_recorder_movements(
         rebuild_running_balance(session, key)
     result.touched_keys = list(touched.keys())
 
+    # Trigger т1 (design §5): event-driven incremental redistribute of the pools
+    # touched by this pull — realize/unrealize the fresh facts, THEN refresh the
+    # coverage caches, so uncovered / position стая current between full ledger
+    # cycles. Guarded internally: a failure logs and never breaks the pull (the
+    # cycle re-materializes the caches). The replace-by-recorder unrealize above
+    # already compensated the deleted rows; this re-matches the fresh ones.
+    touched_item_ids = {k.item_id for k in touched}
+    if touched_item_ids:
+        from .reservation_ledger import redistribute_after_ledger_apply
+
+        redistribute_after_ledger_apply(
+            session, touched_item_ids, f"pull:{recorder_ref}"[:64]
+        )
+
     # --- pull-status transition (§2.3) ---
     # Success paths (done/empty) do NOT bump attempts: attempts counts failed
     # pull attempts only (the error path in process_pending_pulls bumps it).

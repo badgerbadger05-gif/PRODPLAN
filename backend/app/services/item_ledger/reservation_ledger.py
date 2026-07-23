@@ -23,16 +23,17 @@ Design references: §2.2 (mode assignment), §2.6 (map to inc1–5), §3.1 (make
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from sqlalchemy.orm import Session
 
 from app import models
 from ..mrp_freeze import PoolKey, pool_key_for
 from ..replenishment import REPLENISHMENT_FLOW_PURCHASE, classify_replenishment_flow
-from .reconcile import ledger_on_hand_by_item
+from .reconcile import contour_warehouse_refs, ledger_on_hand_by_item
 from .reservation import (
     CONSUME,
     MAKE,
@@ -68,7 +69,18 @@ _SOURCE_KIND_BY_ALLOC_TYPE = {
 }
 
 # SLE movement kinds that CONSUME a reservation (physical issue, qty < 0).
+#
+# Task 2 (consume-realize semantics = ФАКТ ВЫХОДА из контура): assembly_out /
+# expense / writeoff realize consume ALWAYS (production/manual consumption).
+# ``transfer_out`` is CONDITIONAL — it realizes consume ONLY when the detail
+# LEAVES the contour (no paired transfer_in landing on a contour warehouse); a
+# transfer_out whose partner lands back in the contour is an internal pool move
+# and realizes NOTHING (the reserve still holds the pool). Classification is
+# resolved per-SLE in :func:`realize_from_sle` via :func:`_TRANSFER_OUT` +
+# ``internal_transfer_in`` (task 2) and ``_MatchIndex.return_recorders`` (task 3).
 _ISSUE_KINDS = {"assembly_out", "expense", "writeoff", "transfer_out"}
+_ALWAYS_CONSUME_KINDS = {"assembly_out", "expense", "writeoff"}
+_TRANSFER_OUT = "transfer_out"
 # SLE movement kinds that REALIZE a make reservation (production receipt, qty>0).
 _MAKE_RECEIPT_KINDS = {"assembly_in"}
 # A transfer receipt REALIZES a make reservation only when it lands on a
@@ -886,17 +898,20 @@ class _MatchIndex:
                 .all()
             }
         issue_src: Dict[int, Tuple[int, Optional[int]]] = {}
+        # material_issue direction per issue_id: 'issue' | 'return' (task 3).
+        issue_direction: Dict[int, str] = {}
         if issue_ids:
-            issue_src = {
-                int(iid): (int(oid), int(pid) if pid is not None else None)
-                for iid, oid, pid in db.query(
-                    models.ProductionMaterialIssue.issue_id,
-                    models.ProductionMaterialIssue.order_id,
-                    models.ProductionMaterialIssue.product_id,
-                )
-                .filter(models.ProductionMaterialIssue.issue_id.in_(list(issue_ids)))
-                .all()
-            }
+            for iid, oid, pid, direction in db.query(
+                models.ProductionMaterialIssue.issue_id,
+                models.ProductionMaterialIssue.order_id,
+                models.ProductionMaterialIssue.product_id,
+                models.ProductionMaterialIssue.direction,
+            ).filter(models.ProductionMaterialIssue.issue_id.in_(list(issue_ids))).all():
+                issue_src[int(iid)] = (int(oid), int(pid) if pid is not None else None)
+                issue_direction[int(iid)] = str(direction or "issue")
+        # recorder GUIDs whose source document is a RETURN (workshop → contour):
+        # its transfer_out must UNREALIZE the consume reserve, not realize it (§ task 3).
+        self.return_recorders: Set[str] = set()
         for dt, sid, ref in links:
             recorder = str(ref or "").strip()
             if not recorder:
@@ -904,6 +919,25 @@ class _MatchIndex:
             src = man_src.get(int(sid)) if dt == "manufacture" else issue_src.get(int(sid))
             if src is not None:
                 self.link_doc[recorder] = src
+            if dt == "material_issue" and issue_direction.get(int(sid)) == "return":
+                self.return_recorders.add(recorder)
+
+        # Returns may unrealize a consume reserve the outbound issue already
+        # CLOSED (realized ≥ reserved) — index active AND closed consume reserves
+        # of the scope by (run_id, item_id) so a return can find its target
+        # regardless of lifecycle. cancelled/released are terminal and excluded.
+        self.consume_all_by_run_item: Dict[Tuple[int, int], List[models.ReservationEntry]] = {}
+        if open_req_ids:
+            for e in (
+                db.query(models.ReservationEntry)
+                .filter(models.ReservationEntry.requirement_id.in_(list(open_req_ids)))
+                .filter(models.ReservationEntry.realization_mode == CONSUME)
+                .filter(models.ReservationEntry.lifecycle_status.in_(["active", "closed"]))
+                .all()
+            ):
+                self.consume_all_by_run_item.setdefault(
+                    (int(e.run_id), int(e.item_id)), []
+                ).append(e)
 
         # ---- chain source 2: stock_recorder_pull.order_ref (1С-created docs) ----
         # recorder GUID → producing-order GUID captured from the document header.
@@ -986,6 +1020,27 @@ class _MatchIndex:
             return fifo, "fifo"
         return None, "unplanned"
 
+    def match_return(self, sle: models.StockLedgerEntry) -> Tuple[Optional[models.ReservationEntry], str]:
+        """Match a RETURN transfer_out (workshop → contour, task 3) to the consume
+        reserve it must UNREALIZE: recorder → resolution chain → order → run →
+        consume reserve of (run, returned item), INCLUDING a reserve already
+        closed by the outbound issue (oldest by K with realized_qty > 0)."""
+        recorder = str(sle.recorder_ref or "").strip()
+        order, _product_id, _source = self._resolve_order(recorder)
+        if order is None:
+            return None, "unplanned"
+        run_id = self.order_run.get(int(order.order_id))
+        if run_id is None:
+            return None, "unplanned"
+        candidates = [
+            e
+            for e in self.consume_all_by_run_item.get((int(run_id), int(sle.item_id)), [])
+            if _dec(e.realized_qty) > EPS
+        ]
+        if not candidates:
+            return None, "unplanned"
+        return sorted(candidates, key=self._key_of)[0], "pegged"
+
     def res_by_req_mode_for_run_item(self, run_id: int, item_id: int, mode: str) -> Optional[models.ReservationEntry]:
         entries = self.res_by_run_item_mode.get((int(run_id), int(item_id), mode), [])
         active = [e for e in entries if str(e.lifecycle_status) == "active"]
@@ -1025,6 +1080,58 @@ class _MatchIndex:
         return None, "unplanned"
 
 
+def _apply_return_unrealize(
+    db: Session,
+    index: "_MatchIndex",
+    sle: models.StockLedgerEntry,
+    cycle_id: str,
+) -> bool:
+    """Task 3 — a material_issue ``direction='return'`` came BACK into the
+    contour: the leftover was NOT consumed, so DECREASE the consume reserve's
+    realized (unrealize toward the same reserve, capped at 0). If the outbound
+    issue had closed the reserve, reopen it (design §6.2, mirrors
+    :func:`unrealize_replaced_sle`). Idempotent by the return SLE id (its sle_id
+    is stamped → the top-level applied_sle_ids guard skips it on re-run).
+
+    Returns True when a compensating unrealize event was written.
+    """
+    entry, rule = index.match_return(sle)
+    if entry is None:
+        return False
+    _fold_entry(db, entry)  # refresh realized before the cap
+    realized = _dec(entry.realized_qty)
+    return_qty = -_dec(sle.qty)  # positive
+    unrealize_q = min(return_qty, realized)  # cap so realized never goes < 0
+    if unrealize_q <= EPS:
+        return False
+    wrote = _append_event(
+        db, entry,
+        event_kind="unrealize",
+        idempotency_key=f"unrealize:{int(entry.id)}:return:{int(sle.id)}",
+        realized_delta=-unrealize_q,
+        sle_id=int(sle.id),
+        fact_ref=str(sle.recorder_ref or ""),
+        fact_line_ref=str(sle.line_no or ""),
+        match_rule=rule,
+        cycle_id=cycle_id,
+    )
+    if not wrote:
+        return False
+    # reopen a reserve the outbound issue had closed but the return re-opened.
+    fold = fold_reservation_events(_entry_events(db, entry))
+    if str(entry.lifecycle_status) == "closed" and fold.realized_qty + EPS < fold.reserved_qty:
+        _append_event(
+            db, entry,
+            event_kind="reopen",
+            idempotency_key=f"reopen:{int(entry.id)}:return:{int(sle.id)}",
+            cycle_id=cycle_id,
+        )
+        entry.lifecycle_status = "active"
+        entry.closed_at = None
+    _fold_entry(db, entry)
+    return True
+
+
 def realize_from_sle(db: Session, scope, cycle_id: str) -> Dict[str, Any]:
     """Append realize events from physical SLE not yet applied (design §6.1/§6.3).
 
@@ -1035,12 +1142,25 @@ def realize_from_sle(db: Session, scope, cycle_id: str) -> Dict[str, Any]:
     realize. An unmatched issue is ``unplanned_consumption`` (decision #11):
     NEVER a silent global FIFO. idempotency_key
     ``realize:{reservation_id}:{sle_id}``.
+
+    ``transfer_out`` semantics (task 2 — consume-realize = ФАКТ ВЫХОДА из контура):
+    a ``transfer_out`` realizes consume ONLY when the detail leaves the contour.
+    * paired ``transfer_in`` of the same recorder landing on a CONTOUR warehouse
+      → INTERNAL pool move → realize NOTHING (counted ``internal_transfer``);
+    * source document is a material_issue ``direction='return'`` (workshop →
+      contour, task 3) → UNREALIZE the consume reserve the outbound realized
+      (capped at realized; reopen a reserve the return re-opens), counted
+      ``returned_unrealize``;
+    * otherwise (leaves the contour — workshop/external/ГП) → realize consume as
+      before. assembly_out/expense/writeoff always realize (production/manual use).
     """
     summary = {
         "realized_consume": 0,
         "realized_make": 0,
         "unplanned_consumption": 0,
         "unplanned_qty": 0.0,
+        "internal_transfer": 0,
+        "returned_unrealize": 0,
     }
     if not scope.pool_items:
         return summary
@@ -1055,6 +1175,9 @@ def realize_from_sle(db: Session, scope, cycle_id: str) -> Dict[str, Any]:
         .all()
         if ref
     }
+
+    # Task 2 contour axis: warehouses positively inside the planning contour.
+    contour_refs = contour_warehouse_refs(db)
 
     # SLE already applied (any reservation_event carrying that sle_id).
     applied_sle_ids = {
@@ -1071,12 +1194,42 @@ def realize_from_sle(db: Session, scope, cycle_id: str) -> Dict[str, Any]:
         .order_by(models.StockLedgerEntry.posting_at.asc(), models.StockLedgerEntry.id.asc())
         .all()
     )
+
+    # Task 2: (recorder_ref, item_id) of transfer_in lines landing on a CONTOUR
+    # warehouse — the paired half that makes a transfer_out an INTERNAL move.
+    # Same recorder + same item (a ПеремещениеЗапасов moves one item out of A and
+    # into B, both lines carry that item), built from the same SLE set (both
+    # halves share item_id ∈ pool_items).
+    internal_transfer_in: Set[Tuple[str, int]] = {
+        (str(s.recorder_ref or "").strip(), int(s.item_id))
+        for s in sles
+        if str(s.movement_kind or "") == _MAKE_TRANSFER_KIND
+        and _dec(s.qty) > 0
+        and str(s.warehouse_ref1c or "") in contour_refs
+    }
+
     for sle in sles:
         if int(sle.id) in applied_sle_ids:
             continue
         qty = _dec(sle.qty)
         mk = str(sle.movement_kind or "")
         if qty < 0 and mk in _ISSUE_KINDS:
+            if mk == _TRANSFER_OUT:
+                recorder = str(sle.recorder_ref or "").strip()
+                # task 3 — return of leftovers: the detail came BACK into the
+                # contour, consumption did NOT happen → unrealize the reserve the
+                # outbound issue realized (capped at realized; reopen if closed).
+                if recorder in index.return_recorders:
+                    if _apply_return_unrealize(db, index, sle, cycle_id):
+                        summary["returned_unrealize"] += 1
+                    continue
+                # task 2 — internal contour→contour move: the detail never left
+                # the pool → NOT a consumption, realize nothing.
+                if (recorder, int(sle.item_id)) in internal_transfer_in:
+                    summary["internal_transfer"] += 1
+                    continue
+                # else: transfer_out left the contour (workshop/external/ГП) →
+                # fall through to the normal consume realize below.
             entry, rule = index.match_issue(sle)
             if entry is None:
                 summary["unplanned_consumption"] += 1
@@ -1266,6 +1419,102 @@ def redistribute_pool(
         )
     db.flush()
     return pool
+
+
+# ---------------------------------------------------------------------------
+# §5 trigger т1 — event-driven incremental redistribute after a ledger-1 apply
+# ---------------------------------------------------------------------------
+@dataclass
+class _IncrementalScope:
+    """The minimal scope :func:`realize_from_sle` needs (pool_items / run_ids /
+    open_req_ids). Built from the reservations of the touched items only, so the
+    т1 trigger re-matches + redistributes JUST the affected pools."""
+
+    pool_items: Set[int] = field(default_factory=set)
+    run_ids: List[int] = field(default_factory=list)
+    open_req_ids: Set[int] = field(default_factory=set)
+
+
+def redistribute_after_ledger_apply(
+    db: Session,
+    item_ids: Iterable[int],
+    cycle_id: str,
+    *,
+    match: bool = True,
+) -> Dict[str, Any]:
+    """Trigger т1 (design §5): after ledger-1 is applied to some keys (a pull or
+    a reconcile adjustment) refresh JUST the touched pools, so position /
+    uncovered stay current BETWEEN full cycles («переписываем цифры при
+    поступлении»).
+
+    Order (design §5 / caller-note): the physical facts are matched FIRST
+    (realize new issues / make receipts, unrealize returns — outstanding must be
+    current) and only THEN the coverage caches are redistributed. Replace-by-
+    recorder unrealize already ran in the pull before the SLE delete; this pass
+    re-matches the fresh rows (idempotent by sle_id) — no double work.
+
+    ``match`` gates the realize/unrealize pass. The pull path leaves it True (a
+    new recorder carries fresh issues/receipts to match). The reconcile path
+    passes ``match=False``: an adjustment-SLE is anonymous (design §6.1 «adjustment
+    сверки → redistribute»), it has no reservation to realize, and the sweep must
+    not opportunistically match unrelated lingering SLE — that stays the cycle's job.
+
+    Cheap on empty changes: returns immediately when none of the touched items
+    carries a reservation. Idempotent: realize/unrealize are keyed by sle_id and
+    redistribute is a pure function of the current state — a repeat call is a
+    no-op / byte-identical. Fully guarded: any failure logs and returns a
+    partial summary WITHOUT raising, so it never breaks the pull / reconcile —
+    the next full cycle re-materializes the caches regardless. NOT called from
+    :func:`run_reservation_shadow` (the cycle already redistributes every pool;
+    duplicating it there would be wasted work).
+    """
+    summary: Dict[str, Any] = {
+        "pools_redistributed": 0,
+        "realized_consume": 0,
+        "realized_make": 0,
+        "returned_unrealize": 0,
+        "internal_transfer": 0,
+        "unplanned_consumption": 0,
+    }
+    ids = sorted({int(i) for i in item_ids if i is not None})
+    if not ids:
+        return summary
+    try:
+        # active/closed reservations of the touched items → minimal match scope.
+        rows = (
+            db.query(
+                models.ReservationEntry.item_id,
+                models.ReservationEntry.requirement_id,
+            )
+            .filter(models.ReservationEntry.item_id.in_(ids))
+            .filter(models.ReservationEntry.lifecycle_status.in_(["active", "closed"]))
+            .all()
+        )
+        pool_items = {int(iid) for iid, _rid in rows}
+        open_req_ids = {int(rid) for _iid, rid in rows if rid is not None}
+        if not pool_items:
+            return summary  # cheap no-op: touched items carry no reservation
+        # (1) realize/unrealize the physical facts (idempotent by sle_id) …
+        if match:
+            scope = _IncrementalScope(
+                pool_items=pool_items, run_ids=[], open_req_ids=open_req_ids
+            )
+            realize_summary = realize_from_sle(db, scope, cycle_id)
+            for k in ("realized_consume", "realized_make", "returned_unrealize",
+                      "internal_transfer", "unplanned_consumption"):
+                summary[k] = realize_summary.get(k, 0)
+        # (2) … THEN redistribute the coverage caches of the touched pools only.
+        on_hand = ledger_on_hand_by_item(db)
+        for iid in sorted(pool_items):
+            if redistribute_pool(db, iid, on_hand, cycle_id) is not None:
+                summary["pools_redistributed"] += 1
+        db.flush()
+    except Exception:  # noqa: BLE001 — т1 must never break the pull / reconcile
+        logger.exception(
+            "redistribute_after_ledger_apply failed for items=%s (cycle will recover)",
+            ids,
+        )
+    return summary
 
 
 # ---------------------------------------------------------------------------

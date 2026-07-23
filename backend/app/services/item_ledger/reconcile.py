@@ -541,6 +541,16 @@ def reconcile_balance_snapshot(
                 "(on_hand %s -> %s) batch=%s",
                 sle.id, key, delta, on_hand, balance_qty, batch_ref,
             )
+            # Trigger т1 (design §5 / §6.1 «adjustment сверки → redistribute»):
+            # the adjustment moved on_hand, so refresh the touched item's coverage
+            # caches (a negative delta may surface uncovered — пример 3). match=False
+            # — an anonymous adjustment has no reservation to realize; matching stays
+            # the cycle's job. Guarded internally: never breaks the sweep.
+            from .reservation_ledger import redistribute_after_ledger_apply
+
+            redistribute_after_ledger_apply(
+                session, [key.item_id], batch_ref[:64], match=False
+            )
             continue
 
         # First sighting (or the delta changed / flipped sign → debounce reset):
@@ -730,6 +740,38 @@ def ledger_on_hand_by_item(session: Session) -> Dict[int, float]:
         q = q.filter(~models.StockBin.warehouse_ref1c.in_(finished_goods_refs))
     rows = q.group_by(models.StockBin.item_id).all()
     return {int(iid): float(qty or 0.0) for iid, qty in rows}
+
+
+def contour_warehouse_refs(session: Session) -> Set[str]:
+    """Refs of warehouses INSIDE the planning contour (design §2.5): selected,
+    NOT ignored, NOT finished_goods — the same axis :func:`ledger_on_hand_by_item`
+    sums on_hand over.
+
+    Used to classify a ``ПеремещениеЗапасов`` (task 2): a ``transfer_out`` whose
+    paired ``transfer_in`` lands on one of THESE warehouses is an INTERNAL pool
+    move (the detail never left the contour) and must NOT realize a consume
+    reserve. A transfer leaving the contour (workshop / external / ГП) does.
+
+    Returns a POSITIVE set: only warehouses we can confirm are in-contour. When
+    no warehouse settings exist at all the set is empty — the internal-move
+    suppression then never fires and ``transfer_out`` keeps its legacy
+    realize-always behavior (conservative: суppress only on a proven contour
+    destination). ГП-склады are excluded even when also flagged selected (§2.5).
+    """
+    ignored_refs = {
+        str(r[0]) for r in session.query(models.IgnoredWarehouse.warehouse_ref1c).all()
+        if r and r[0]
+    }
+    rows = session.query(
+        models.StockWarehouse.warehouse_ref1c,
+        models.StockWarehouse.is_selected,
+        models.StockWarehouse.is_finished_goods,
+    ).all()
+    return {
+        str(ref)
+        for ref, sel, fg in rows
+        if ref and bool(sel) and not bool(fg) and str(ref) not in ignored_refs
+    }
 
 
 def stock_shadow_report(
