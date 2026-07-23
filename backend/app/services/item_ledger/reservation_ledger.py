@@ -346,6 +346,12 @@ def unrealize_replaced_sle(
         )
         if wrote:
             written += 1
+        # Detach the compensated realize from its (about to be deleted) SLE —
+        # exactly what the FK ON DELETE SET NULL does on PostgreSQL, made
+        # explicit so the applied-mark semantics do not depend on the dialect
+        # honoring FK actions (SQLite reuses rowids AND skips SET NULL, which
+        # would mask the fresh rows as already-applied).
+        ev.sle_id = None
         touched.add(int(entry.id))
         # closed by this realize and no longer satisfied → reopen (design §6.2).
         fold = fold_reservation_events(_entry_events(db, entry))
