@@ -10,8 +10,8 @@ export function DbrProgramsPage() {
   const controller = useDbrProgramsController()
   const {
     programs, selected, editRows, loading, saving, error, message,
-    fromDate, toDate, title, company, rows,
-    setToDate, setTitle, setCompany, changeFromDate,
+    fromDate, toDate, title, company, rows, planningRuns, sourceRunId,
+    setToDate, setTitle, setCompany, setSourceRunId, changeFromDate,
     load, openProgram, patchRow, addRow, removeRow, submit, approve,
     patchEditRow, addEditRow, removeEditRow, saveDraftItems,
   } = controller
@@ -75,6 +75,26 @@ export function DbrProgramsPage() {
                 <span>Компания</span>
                 <input value={company} onChange={(e) => setCompany(e.target.value)} placeholder="необязательно" />
               </label>
+              <label className="dbrField">
+                <span>Источник: зафиксированный MRP-прогон</span>
+                <select
+                  aria-label="Источник: зафиксированный MRP-прогон"
+                  value={sourceRunId ?? ''}
+                  onChange={(e) => setSourceRunId(e.target.value ? Number(e.target.value) : null)}
+                  disabled={loading}
+                  required
+                >
+                  <option value="">Выберите прогон</option>
+                  {planningRuns.map((run) => (
+                    <option key={run.run_id} value={run.run_id}>
+                      Прогон №{run.run_id}{run.source_plan_name ? ` — ${run.source_plan_name}` : ''}
+                    </option>
+                  ))}
+                </select>
+                {!loading && !planningRuns.length && (
+                  <small className="mutedText">Нет зафиксированных MRP-прогонов для привязки.</small>
+                )}
+              </label>
             </div>
 
             <table className="journalTable dbrTable dbrProgramTable" aria-label="Строки новой программы">
@@ -131,7 +151,7 @@ export function DbrProgramsPage() {
             <div className="commandBar">
               <button onClick={addRow} disabled={saving}>Добавить строку</button>
               <div className="commandBarSpacer" />
-              <button className="primary" onClick={() => void submit()} disabled={saving}>Создать программу</button>
+              <button className="primary" onClick={() => void submit()} disabled={saving || !sourceRunId}>Создать программу</button>
             </div>
           </section>
 
@@ -144,6 +164,7 @@ export function DbrProgramsPage() {
                   <th className="numCell">№</th>
                   <th className="itemCell">Название</th>
                   <th className="dateCol">Период</th>
+                  <th className="numCell">Источник MRP</th>
                   <th className="numCell">Строк</th>
                   <th className="itemCell">Статус</th>
                   <th className="dbrActionCol"></th>
@@ -171,6 +192,7 @@ export function DbrProgramsPage() {
                       <span>{program.company || ''}</span>
                     </td>
                     <td className="dateCol">{dateRu(program.from_date)} — {dateRu(program.to_date)}</td>
+                    <td className="numCell">{program.source_run_id ? `№${program.source_run_id}` : '—'}</td>
                     <td className="numCell">{program.items.length}</td>
                     <td className="itemCell">
                       <span className={`miniPill ${program.status === 'approved' ? 'ready' : ''}`}>
@@ -191,7 +213,7 @@ export function DbrProgramsPage() {
                   </tr>
                 ))}
                 {!programs.length && (
-                  <tr><td colSpan={6} className="emptyDetail">{loading ? 'Загрузка…' : 'Программы не созданы'}</td></tr>
+                  <tr><td colSpan={7} className="emptyDetail">{loading ? 'Загрузка…' : 'Программы не созданы'}</td></tr>
                 )}
               </tbody>
             </table>
@@ -217,6 +239,11 @@ export function DbrProgramsPage() {
                   )}
                 </div>
               </div>
+              <p className="mutedText">
+                Lineage: MRP-прогон {selected.source_run_id ? `№${selected.source_run_id}` : 'не указан'}
+                {selected.ledger_generation_id ? ` · поколение Ledger №${selected.ledger_generation_id}` : ''}
+                {selected.freeze_version ? ` · freeze v${selected.freeze_version}` : ''}
+              </p>
               <table className="journalTable dbrTable">
                 <thead>
                   <tr>

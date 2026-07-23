@@ -24,13 +24,19 @@ describe('dbr programs model', () => {
 
   it('normalizes a create payload and item quantities, comments, and optional fields', () => {
     const row = { ...createDraftProgramRow('r1', '2026-07-10'), item: picked, qty: '12.500', comment: '  срочно  ' }
-    expect(buildProgramCreatePayload([row], '2026-07-01', '2026-07-31', '  Июль  ', '   ')).toEqual({
+    expect(buildProgramCreatePayload([row], 42, '2026-07-01', '2026-07-31', '  Июль  ', '   ')).toEqual({
+      source_run_id: 42,
       from_date: '2026-07-01',
       to_date: '2026-07-31',
       title: 'Июль',
       company: null,
       items: [{ item_id: 77, program_date: '2026-07-10', qty: 12.5, comment: 'срочно' }],
     })
+  })
+
+  it('requires an explicit fixed MRP run instead of inferring latest', () => {
+    const row = { ...createDraftProgramRow('r1', '2026-07-10'), item: picked, qty: '1' }
+    expect(() => buildProgramCreatePayload([row], null, '2026-07-01', '2026-07-31', '', '')).toThrow('Выберите зафиксированный MRP-прогон')
   })
 
   it('rejects invalid periods, empty rows, invalid quantities, out-of-range dates, and duplicates', () => {

@@ -71,6 +71,10 @@ export type DbrProgramItem = {
 
 export type DbrProgram = {
   id: number
+  /** Immutable MRP/Ledger tuple captured when the program was created. */
+  source_run_id?: number | null
+  ledger_generation_id?: number | null
+  freeze_version?: number | null
   company?: string | null
   title?: string | null
   from_date: string
@@ -88,6 +92,8 @@ export type DbrProgramItemIn = {
 }
 
 export type DbrProgramCreate = {
+  /** Explicitly selected FIXED_SNAPSHOT MRP run; never inferred by the UI. */
+  source_run_id: number
   from_date: string
   to_date: string
   company?: string | null

@@ -65,12 +65,17 @@ export function validateProgramItems(
 
 export function buildProgramCreatePayload(
   rows: DraftProgramRow[],
+  sourceRunId: number | null,
   fromDate: string,
   toDate: string,
   title: string,
   company: string,
 ): DbrProgramCreate {
+  if (!Number.isInteger(sourceRunId) || Number(sourceRunId) <= 0) {
+    throw new Error('Выберите зафиксированный MRP-прогон — источник программы')
+  }
   return {
+    source_run_id: Number(sourceRunId),
     from_date: fromDate,
     to_date: toDate,
     title: title.trim() || null,

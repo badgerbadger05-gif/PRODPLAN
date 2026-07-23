@@ -10,6 +10,7 @@ import {
   listDbrPrograms,
   updateDbrProgram,
 } from '../../services/dbr'
+import { listPlanningRuns } from '../../services/planning'
 import { DbrProgramsPage } from './DbrProgramsPage'
 
 vi.mock('../../services/dbr', () => ({
@@ -18,6 +19,10 @@ vi.mock('../../services/dbr', () => ({
   getDbrProgram: vi.fn(),
   listDbrPrograms: vi.fn(),
   updateDbrProgram: vi.fn(),
+}))
+
+vi.mock('../../services/planning', () => ({
+  listPlanningRuns: vi.fn(),
 }))
 
 vi.mock('../dbr/ItemPicker', () => ({
@@ -30,6 +35,9 @@ vi.mock('../dbr/ItemPicker', () => ({
 
 const draft: DbrProgram = {
   id: 11,
+  source_run_id: 42,
+  ledger_generation_id: 8,
+  freeze_version: 3,
   title: 'Июльский план',
   company: 'ЗСМ',
   from_date: '2026-07-01',
@@ -48,6 +56,13 @@ const draft: DbrProgram = {
 
 const approved: DbrProgram = { ...draft, status: 'approved' }
 const approvedList: DbrProgram = { ...approved, id: 12, title: 'Августовский план' }
+const fixedRun = {
+  run_id: 42,
+  status: 'FIXED_SNAPSHOT',
+  started_at: '2026-07-01T08:00:00+00:00',
+  finished_at: '2026-07-01T08:02:00+00:00',
+  source_plan_name: 'Июль 2026',
+}
 
 function renderPage() {
   return render(<MemoryRouter><DbrProgramsPage /></MemoryRouter>)
@@ -67,6 +82,7 @@ describe('DbrProgramsPage characterization', () => {
     vi.mocked(createDbrProgram).mockResolvedValue(draft)
     vi.mocked(updateDbrProgram).mockResolvedValue(draft)
     vi.mocked(approveDbrProgram).mockResolvedValue(approved)
+    vi.mocked(listPlanningRuns).mockResolvedValue({ rows: [fixedRun], total: 1, limit: 200, offset: 0 })
   })
 
   it('loads and refreshes the program list with status and company metadata', async () => {
@@ -92,6 +108,7 @@ describe('DbrProgramsPage characterization', () => {
     expect(await screen.findByText('Программа №11: Июльский план')).toBeInTheDocument()
     expect(screen.getByDisplayValue('12')).toBeInTheDocument()
     expect(screen.getByDisplayValue('Первая партия')).toBeInTheDocument()
+    expect(screen.getByText('Lineage: MRP-прогон №42 · поколение Ledger №8 · freeze v3')).toBeInTheDocument()
   })
 
   it('labels program forms and activates list rows from the keyboard', async () => {
@@ -116,8 +133,8 @@ describe('DbrProgramsPage characterization', () => {
     renderPage()
     await screen.findByText('Июльский план')
 
-    await user.click(screen.getByRole('button', { name: 'Создать программу' }))
-    expect(screen.getByText('В каждой строке укажите номенклатуру, дату и количество больше нуля')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Создать программу' })).toBeDisabled()
+    expect(createDbrProgram).not.toHaveBeenCalled()
 
     await user.clear(screen.getByLabelText('Период с'))
     await user.type(screen.getByLabelText('Период с'), '2026-07-01')
@@ -125,6 +142,7 @@ describe('DbrProgramsPage characterization', () => {
     await user.type(screen.getByLabelText('Период по'), '2026-07-31')
     await user.type(screen.getByLabelText('Название'), '  Июльский план  ')
     await user.type(screen.getByLabelText('Компания'), '  ЗСМ  ')
+    await user.selectOptions(screen.getByLabelText('Источник: зафиксированный MRP-прогон'), '42')
     await user.click(screen.getAllByRole('button', { name: 'Выбрать корпус' })[0])
 
     const createSection = screen.getByRole('heading', { name: 'Новая программа' }).closest('section')
@@ -136,6 +154,7 @@ describe('DbrProgramsPage characterization', () => {
     await user.click(screen.getByRole('button', { name: 'Создать программу' }))
 
     await waitFor(() => expect(createDbrProgram).toHaveBeenCalledWith({
+      source_run_id: 42,
       from_date: '2026-07-01',
       to_date: '2026-07-31',
       title: 'Июльский план',
@@ -162,6 +181,32 @@ describe('DbrProgramsPage characterization', () => {
     expect(dates[2]).toHaveValue('2026-08-03')
     await user.click(screen.getByRole('button', { name: 'Добавить строку' }))
     expect(section.querySelectorAll<HTMLInputElement>('input[type="date"]')[3]).toHaveValue('2026-08-02')
+  })
+
+  it('does not submit a complete draft until a fixed MRP run is explicitly selected', async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findByText('Июльский план')
+    await user.click(screen.getAllByRole('button', { name: 'Выбрать корпус' })[0])
+    fireEvent.change(screen.getByPlaceholderText('шт'), { target: { value: '1' } })
+
+    expect(screen.getByRole('button', { name: 'Создать программу' })).toBeDisabled()
+    expect(createDbrProgram).not.toHaveBeenCalled()
+    expect(screen.getByText('Выберите прогон')).toBeInTheDocument()
+  })
+
+  it('shows the server stale-lineage rejection without choosing a replacement run', async () => {
+    const user = userEvent.setup()
+    vi.mocked(createDbrProgram).mockRejectedValueOnce(new Error('HTTP 422: MRP run 42 is stale'))
+    renderPage()
+    await screen.findByText('Июльский план')
+    await user.click(screen.getAllByRole('button', { name: 'Выбрать корпус' })[0])
+    fireEvent.change(screen.getByPlaceholderText('шт'), { target: { value: '1' } })
+    await user.selectOptions(screen.getByLabelText('Источник: зафиксированный MRP-прогон'), '42')
+    await user.click(screen.getByRole('button', { name: 'Создать программу' }))
+
+    expect(await screen.findByText('HTTP 422: MRP run 42 is stale')).toBeInTheDocument()
+    expect(createDbrProgram).toHaveBeenCalledWith(expect.objectContaining({ source_run_id: 42 }))
   })
 
   it('updates draft items and refreshes the list', async () => {

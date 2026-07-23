@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { DbrProgram } from '../../../domain/dbr'
+import type { PlanningRunRow } from '../../../domain/planning'
 import { isoToday, shiftIsoDate } from '../../../lib/format'
 import {
   approveDbrProgram,
@@ -8,6 +9,7 @@ import {
   listDbrPrograms,
   updateDbrProgram,
 } from '../../../services/dbr'
+import { listPlanningRuns } from '../../../services/planning'
 import {
   alignFirstDraftDate,
   buildProgramCreatePayload,
@@ -37,13 +39,22 @@ export function useDbrProgramsController() {
   const [toDate, setToDate] = useState(shiftIsoDate(isoToday(), 14))
   const [title, setTitle] = useState('')
   const [company, setCompany] = useState('')
+  const [planningRuns, setPlanningRuns] = useState<PlanningRunRow[]>([])
+  const [sourceRunId, setSourceRunId] = useState<number | null>(null)
   const [rows, setRows] = useState<DraftProgramRow[]>(() => [newRow(isoToday())])
 
   const load = useCallback(async () => {
     setLoading(true)
     setError('')
     try {
-      setPrograms(await listDbrPrograms())
+      const [programRows, runResponse] = await Promise.all([
+        listDbrPrograms(),
+        listPlanningRuns({ limit: 200 }),
+      ])
+      setPrograms(programRows)
+      // The server additionally validates current Ledger generation/cutoff and
+      // freeze. The UI must still never invent a source run from "latest".
+      setPlanningRuns(runResponse.rows.filter((run) => String(run.status).toUpperCase() === 'FIXED_SNAPSHOT'))
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -84,7 +95,7 @@ export function useDbrProgramsController() {
   async function submit() {
     let payload
     try {
-      payload = buildProgramCreatePayload(rows, fromDate, toDate, title, company)
+      payload = buildProgramCreatePayload(rows, sourceRunId, fromDate, toDate, title, company)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e)); return
     }
@@ -155,8 +166,8 @@ export function useDbrProgramsController() {
 
   return {
     programs, selected, editRows, loading, saving, error, message,
-    fromDate, toDate, title, company, rows,
-    setToDate, setTitle, setCompany, changeFromDate,
+    fromDate, toDate, title, company, rows, planningRuns, sourceRunId,
+    setToDate, setTitle, setCompany, setSourceRunId, changeFromDate,
     load, openProgram, patchRow, addRow, removeRow, submit, approve,
     patchEditRow, addEditRow, removeEditRow, saveDraftItems,
   }
