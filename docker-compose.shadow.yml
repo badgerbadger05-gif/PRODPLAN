@@ -1,0 +1,133 @@
+name: prodplan-shadow
+
+# Parallel evaluation stack. It is deliberately independent from the stable
+# `prodplan` compose project: its own database volume, ports, config and output.
+# Use scripts/shadow-stack.sh instead of invoking this file by hand.
+
+services:
+  db:
+    image: postgres:15
+    restart: unless-stopped
+    command: ["postgres", "-c", "timezone=Europe/Moscow"]
+    environment:
+      POSTGRES_DB: ${PRODPLAN_SHADOW_POSTGRES_DB:-prodplan_shadow}
+      POSTGRES_USER: ${PRODPLAN_SHADOW_POSTGRES_USER:-prodplan_shadow}
+      POSTGRES_PASSWORD: ${PRODPLAN_SHADOW_POSTGRES_PASSWORD:?Set PRODPLAN_SHADOW_POSTGRES_PASSWORD in .env.shadow}
+      TZ: Europe/Moscow
+      PGTZ: Europe/Moscow
+    volumes:
+      - prodplan_shadow_postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:${PRODPLAN_SHADOW_POSTGRES_HOST_PORT:-55434}:5432"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${PRODPLAN_SHADOW_POSTGRES_USER:-prodplan_shadow} -d ${PRODPLAN_SHADOW_POSTGRES_DB:-prodplan_shadow}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 15s
+
+  backend:
+    build:
+      context: ./backend
+      args:
+        INSTALL_DEV: "false"
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://${PRODPLAN_SHADOW_POSTGRES_USER:-prodplan_shadow}:${PRODPLAN_SHADOW_POSTGRES_PASSWORD:?Set PRODPLAN_SHADOW_POSTGRES_PASSWORD in .env.shadow}@db:5432/${PRODPLAN_SHADOW_POSTGRES_DB:-prodplan_shadow}
+      TZ: Europe/Moscow
+      PRODPLAN_DEPLOYMENT_CONTOUR: parallel
+      PRODPLAN_STABLE_URL: ${PRODPLAN_STABLE_URL:-http://mtzdock.lan:9010}
+      STABLE_PRODPLAN_API_URL: ${PRODPLAN_STABLE_API_URL:-http://mtzdock.lan:8010}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${PRODPLAN_SHADOW_BIND_ADDRESS:-0.0.0.0}:${PRODPLAN_SHADOW_BACKEND_PORT:-8020}:8000"
+    volumes:
+      # OData credentials live here, but the sync orchestrator also persists
+      # its independent shadow schedule in this directory.
+      - ./config-shadow:/app/config
+      - ./output-shadow:/app/output
+    extra_hosts:
+      - "mtzw7:10.36.0.6"
+      - "mtzw7.lan:10.36.0.6"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)\"",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+
+  frontend:
+    build:
+      # The finished UI may live in a separate checkout while the release is
+      # being assembled. Point this at that exact reviewed source tree.
+      context: ${PRODPLAN_FRONTEND_BUILD_CONTEXT:-./frontend-erp-shell}
+      args:
+        VITE_DEPLOYMENT_CONTOUR: parallel
+        VITE_STABLE_PRODPLAN_URL: ${PRODPLAN_STABLE_URL:-http://mtzdock.lan:9010}
+    restart: unless-stopped
+    environment:
+      TZ: Europe/Moscow
+      PRODPLAN_DEPLOYMENT_CONTOUR: parallel
+      PRODPLAN_STABLE_URL: ${PRODPLAN_STABLE_URL:-http://mtzdock.lan:9010}
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${PRODPLAN_SHADOW_BIND_ADDRESS:-0.0.0.0}:${PRODPLAN_SHADOW_FRONTEND_PORT:-9020}:80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+
+  # Workers are intentionally OFF during bootstrap. Start them after checking
+  # the OData load and selecting a cadence that does not collide with stable.
+  sync-worker:
+    profiles: ["automation"]
+    build:
+      context: ./backend
+      args:
+        INSTALL_DEV: "false"
+    restart: unless-stopped
+    command: ["python", "sync_worker.py"]
+    environment:
+      TZ: Europe/Moscow
+      SYNC_BASE_URL: http://backend:8000
+      SYNC_TICK_INTERVAL_SECONDS: ${PRODPLAN_SHADOW_SYNC_TICK_INTERVAL_SECONDS:-300}
+      SYNC_STARTUP_DELAY_SECONDS: ${PRODPLAN_SHADOW_SYNC_STARTUP_DELAY_SECONDS:-180}
+      PRODPLAN_DEPLOYMENT_CONTOUR: parallel
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  reconcile-worker:
+    profiles: ["automation"]
+    build:
+      context: ./backend
+      args:
+        INSTALL_DEV: "false"
+    restart: unless-stopped
+    command: ["python", "reconcile_worker.py"]
+    environment:
+      TZ: Europe/Moscow
+      RECONCILE_BASE_URL: http://backend:8000
+      RECONCILE_INTERVAL_SECONDS: ${PRODPLAN_SHADOW_RECONCILE_INTERVAL_SECONDS:-21600}
+      RECONCILE_STARTUP_DELAY_SECONDS: ${PRODPLAN_SHADOW_RECONCILE_STARTUP_DELAY_SECONDS:-900}
+      PRODPLAN_DEPLOYMENT_CONTOUR: parallel
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  prodplan_shadow_postgres_data:

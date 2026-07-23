@@ -17,6 +17,7 @@ from app.routers import workshop_binding_review as workshop_binding_review_route
 from app.routers import dbr as dbr_router
 from app.routers import paint_weld as paint_weld_router
 from app.routers import item_ledger as item_ledger_router
+from app.routers import planning_comparison as planning_comparison_router
 
 import os
 import logging
@@ -56,6 +57,7 @@ app.include_router(workshop_binding_review_router.router, prefix="/api")
 app.include_router(dbr_router.router, prefix="/api")
 app.include_router(paint_weld_router.router, prefix="/api")
 app.include_router(item_ledger_router.router, prefix="/api")
+app.include_router(planning_comparison_router.router, prefix="/api")
 
 @app.get("/")
 async def root():
