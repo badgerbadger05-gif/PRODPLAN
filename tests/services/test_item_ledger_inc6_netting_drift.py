@@ -19,6 +19,7 @@ green; these tests are additive.
 """
 
 from datetime import date, datetime
+from unittest.mock import patch
 
 import pytest
 
@@ -35,11 +36,43 @@ from app.models import (
     StockLedgerEntry,
 )
 from app.services.item_ledger.reservation_ledger import effective_net_bin
-from app.services.mrp_execution_ledger import run_ledger_cycle as _public_run_ledger_cycle
+from app.services.mrp_execution_ledger import (
+    _ledger_scope,
+    run_ledger_cycle as _public_run_ledger_cycle,
+)
 
 
 def run_ledger_cycle(db):
-    return _public_run_ledger_cycle(db, diagnostic_legacy=True)
+    generation = db.get(models.PlanningTruthState, 1).current_generation
+    old_status, old_cutoff, old_accepted_at = (
+        generation.status,
+        generation.cutoff,
+        generation.accepted_at,
+    )
+    generation.status = "accepted"
+    generation.cutoff = generation.cutoff or datetime(2026, 12, 31)
+    generation.accepted_at = generation.accepted_at or datetime(2026, 12, 31)
+    db.flush()
+    try:
+        scope = _ledger_scope(db)
+    finally:
+        generation.status = old_status
+        generation.cutoff = old_cutoff
+        generation.accepted_at = old_accepted_at
+        db.flush()
+    # Scope selection is accepted-only, while this low-level diagnostic must
+    # mutate its isolated BUILDING reservation context. Freeze the accepted
+    # scope, then run the retired arithmetic after restoring BUILDING.
+    with patch("app.services.mrp_execution_ledger._ledger_scope", return_value=scope):
+        return _public_run_ledger_cycle(db, diagnostic_legacy=True)
+
+
+@pytest.fixture(autouse=True)
+def _bind_legacy_helpers_to_building_generation(
+    db_session, building_ledger_generation
+):
+    # Imported low-level builders require an explicit generation identity.
+    db_session.info["accepted_ledger_generation_id"] = building_ledger_generation.id
 
 # reuse the battle-tested fixtures from the execution-ledger test module
 from tests.services.test_mrp_execution_ledger import (

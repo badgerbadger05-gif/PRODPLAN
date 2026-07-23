@@ -266,11 +266,8 @@ def test_bin_excludes_finished_goods_even_when_selected(db_session, monkeypatch)
 # ---------------------------------------------------------------------------
 # freeze S0 from the bin (design §11 Инк5 point 3; stock-doc инк4)
 # ---------------------------------------------------------------------------
-def test_freeze_s0_follows_bin_and_equals_legacy_when_seeded(db_session, monkeypatch):
-    """build_shared_pools.stock_initial is S0 (→ MrpFreezeBaseline.stock_qty).
-    Under the flag it is sourced from the bin: equal to legacy S0 when seeded
-    identically (item P), and following the bin when the bin diverges (item Q).
-    """
+def test_freeze_s0_always_follows_generation_scoped_ledger(db_session, monkeypatch):
+    """Freeze S0 never falls back to the mutable legacy warehouse cache."""
     db = db_session
     _wh(db, "wh-sel", selected=True)
     p = _item(db, "P")
@@ -281,14 +278,18 @@ def test_freeze_s0_follows_bin_and_equals_legacy_when_seeded(db_session, monkeyp
     _seed_bin(db, q.item_id, "wh-sel", 55.0)  # bin diverges
 
     monkeypatch.delenv("STOCK_SOURCE", raising=False)
-    legacy_s0 = dict(build_shared_pools(db, []).stock_initial)
+    generation_id = db.get(models.PlanningTruthState, 1).current_generation_id
+    legacy_s0 = dict(
+        build_shared_pools(db, [], ledger_generation_id=generation_id).stock_initial
+    )
 
     monkeypatch.setenv("STOCK_SOURCE", "bin")
-    bin_s0 = dict(build_shared_pools(db, []).stock_initial)
+    bin_s0 = dict(
+        build_shared_pools(db, [], ledger_generation_id=generation_id).stock_initial
+    )
 
-    assert bin_s0[p.item_id] == legacy_s0[p.item_id] == 30.0  # equal when seeded
-    assert legacy_s0[q.item_id] == 30.0  # legacy reads iws
-    assert bin_s0[q.item_id] == 55.0     # S0 followed the bin under the flag
+    assert bin_s0[p.item_id] == legacy_s0[p.item_id] == 30.0
+    assert bin_s0[q.item_id] == legacy_s0[q.item_id] == 55.0
 
 
 # ---------------------------------------------------------------------------

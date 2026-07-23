@@ -52,7 +52,56 @@ from app.services.mrp_execution_ledger import (
 
 
 def run_ledger_cycle(db):
-    return _public_run_ledger_cycle(db, diagnostic_legacy=True)
+    generation = db.get(models.PlanningTruthState, 1).current_generation
+    for run in db.query(PlanningRun).all():
+        if run.ledger_generation_id is None:
+            run.ledger_generation_id = generation.id
+    old_status, old_cutoff, old_accepted_at = (
+        generation.status,
+        generation.cutoff,
+        generation.accepted_at,
+    )
+    generation.status = "accepted"
+    generation.cutoff = generation.cutoff or datetime(2026, 12, 31)
+    generation.accepted_at = generation.accepted_at or datetime(2026, 12, 31)
+    db.flush()
+    try:
+        return _public_run_ledger_cycle(db, diagnostic_legacy=True)
+    finally:
+        generation.status = old_status
+        generation.cutoff = old_cutoff
+        generation.accepted_at = old_accepted_at
+        db.flush()
+
+
+def diagnostic_ledger_scope(db):
+    """Build the retired core's scope without weakening active fail-closed reads.
+
+    Reservation tests intentionally mutate a BUILDING generation.  The retired
+    execution core, however, now scopes only through an accepted pointer.  Give
+    that private scope builder a short-lived accepted view, then restore the
+    mutable test generation before any reservation writer runs.
+    """
+    generation = db.get(models.PlanningTruthState, 1).current_generation
+    for run in db.query(PlanningRun).all():
+        if run.ledger_generation_id is None:
+            run.ledger_generation_id = generation.id
+    old_status, old_cutoff, old_accepted_at = (
+        generation.status,
+        generation.cutoff,
+        generation.accepted_at,
+    )
+    generation.status = "accepted"
+    generation.cutoff = generation.cutoff or datetime(2026, 12, 31)
+    generation.accepted_at = generation.accepted_at or datetime(2026, 12, 31)
+    db.flush()
+    try:
+        return _ledger_scope(db)
+    finally:
+        generation.status = old_status
+        generation.cutoff = old_cutoff
+        generation.accepted_at = old_accepted_at
+        db.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -85,6 +134,7 @@ def _run(db, pf, pt, *, version=1):
         config_snapshot={},
         pinned=True,
         source_plan_id=plan.id,
+        ledger_generation_id=db.get(models.PlanningTruthState, 1).current_generation_id,
         period_from=pf,
         period_to=pt,
         active_freeze_version=version,
@@ -377,7 +427,7 @@ def test_pegged_issue_consume_realize_capped_residual_unplanned(db_session):
     # physical issue of 5: capped at outstanding 4, residual 1 unplanned
     _sle(db, comp, qty=-5, kind="assembly_out", recorder="DOC-GUID-1")
 
-    scope = _ledger_scope(db)
+    scope = diagnostic_ledger_scope(db)
     summary = realize_from_sle(db, scope, "cyc")
 
     entry = _entry(db, req, CONSUME)
@@ -416,7 +466,7 @@ def test_sync_link_material_issue_consume_realize(db_session):
     _sle(db, comp, qty=-3, kind="transfer_out", recorder="TRANSFER-GUID-2",
          recorder_type="Document_ПеремещениеЗапасов")
 
-    scope = _ledger_scope(db)
+    scope = diagnostic_ledger_scope(db)
     summary = realize_from_sle(db, scope, "cyc")
     entry = _entry(db, req, CONSUME)
     db.refresh(entry)
@@ -447,7 +497,7 @@ def test_pegged_production_receipt_make_realize(db_session):
           "Document_СборкаЗапасов", "ASSEMBLY-GUID-3")
     _sle(db, fg, qty=5, kind="assembly_in", recorder="ASSEMBLY-GUID-3")
 
-    scope = _ledger_scope(db)
+    scope = diagnostic_ledger_scope(db)
     summary = realize_from_sle(db, scope, "cyc")
 
     entry = _entry(db, req, MAKE)
@@ -476,7 +526,7 @@ def test_make_receipt_via_pull_order_ref(db_session):
     _pull(db, "ASSEMBLY-GUID-4", order_ref="ORD-GUID-4")
     _sle(db, fg, qty=5, kind="assembly_in", recorder="ASSEMBLY-GUID-4")
 
-    scope = _ledger_scope(db)
+    scope = diagnostic_ledger_scope(db)
     summary = realize_from_sle(db, scope, "cyc")
     entry = _entry(db, req, MAKE)
     db.refresh(entry)
@@ -504,7 +554,7 @@ def test_transfer_to_finished_goods_warehouse_closes_make(db_session):
     _sle(db, fg, qty=5, kind="transfer_in", recorder="TRANSFER-GUID-5",
          recorder_type="Document_ПеремещениеЗапасов", warehouse="PLAIN-WH",
          line_no="1")
-    scope = _ledger_scope(db)
+    scope = diagnostic_ledger_scope(db)
     summary = realize_from_sle(db, scope, "cyc")
     entry = _entry(db, req, MAKE)
     db.refresh(entry)
@@ -515,7 +565,7 @@ def test_transfer_to_finished_goods_warehouse_closes_make(db_session):
     _sle(db, fg, qty=5, kind="transfer_in", recorder="TRANSFER-GUID-5",
          recorder_type="Document_ПеремещениеЗапасов", warehouse="FG-WH",
          line_no="2")
-    summary = realize_from_sle(db, _ledger_scope(db), "cyc")
+    summary = realize_from_sle(db, diagnostic_ledger_scope(db), "cyc")
     db.refresh(entry)
     assert summary["realized_make"] == 1
     assert Decimal(str(entry.realized_qty)) == Decimal("5")
@@ -535,7 +585,7 @@ def test_unmatched_issue_is_unplanned_no_realize(db_session):
     _pull(db, "UNKNOWN-DOC")  # pulled, but the header carried no order basis
     _sle(db, comp, qty=-3, kind="assembly_out", recorder="UNKNOWN-DOC")
 
-    scope = _ledger_scope(db)
+    scope = diagnostic_ledger_scope(db)
     summary = realize_from_sle(db, scope, "cyc")
     entry = _entry(db, req, CONSUME)
     db.refresh(entry)
@@ -558,7 +608,7 @@ def test_pull_order_ref_to_unknown_order_is_unplanned(db_session):
     _pull(db, "DOC-GUID-7", order_ref="ORD-GUID-NOT-SYNCED")
     _sle(db, comp, qty=-2, kind="assembly_out", recorder="DOC-GUID-7")
 
-    summary = realize_from_sle(db, _ledger_scope(db), "cyc")
+    summary = realize_from_sle(db, diagnostic_ledger_scope(db), "cyc")
     assert summary["realized_consume"] == 0
     assert summary["unplanned_consumption"] == 1
 
@@ -630,14 +680,14 @@ def test_reservation_shadow_idempotent(db_session):
     ))
     db.flush()
 
-    scope = _ledger_scope(db)
+    scope = diagnostic_ledger_scope(db)
     run_reservation_shadow(db, scope, "cyc-1")
     entries_1 = db.query(ReservationEntry).count()
     events_1 = db.query(ReservationEvent).count()
     entry = _entry(db, req, CONSUME)
     realized_1 = Decimal(str(entry.realized_qty))
 
-    scope2 = _ledger_scope(db)
+    scope2 = diagnostic_ledger_scope(db)
     run_reservation_shadow(db, scope2, "cyc-2")
     assert db.query(ReservationEntry).count() == entries_1
     assert db.query(ReservationEvent).count() == events_1  # no double open / realize
@@ -798,24 +848,10 @@ def test_run_ledger_cycle_result_unchanged_with_reservation_block(db_session):
         "drift_matured_surplus", "drift_evap_adjust", "drift_unattributed",
         "requirements_closed", "runs_closed",
     }
-    # proof the shadow block ran: the make reservation was materialized (open
-    # +10), and — because this very cycle closed the run by execution — the Д3
-    # release sweep released it: outstanding → 0 (release −10), status released.
-    # realized stays 0 (no assembly_in SLE mirrored) — the shadow ledger does not
-    # feed executed/closure, which came from the legacy path.
+    # The quarantined diagnostic can reproduce arithmetic, but accepted Ledger
+    # generations are immutable: it must not materialize reservation side effects.
     entry = _entry(db, req, MAKE)
-    assert entry is not None
-    db.refresh(entry)
-    assert entry.lifecycle_status == "released"
-    assert Decimal(str(entry.reserved_qty)) == Decimal("0")
-    kinds = [
-        str(e.event_kind)
-        for e in db.query(ReservationEvent)
-        .filter(ReservationEvent.reservation_id == entry.id)
-        .order_by(ReservationEvent.id.asc())
-        .all()
-    ]
-    assert kinds == ["open", "release"]
+    assert entry is None
 
     # shadow report is read-only and consistent
     report = reservation_shadow_report(db)
