@@ -37,6 +37,8 @@ from app.models import (
     ItemWarehouseStock,
     IgnoredWarehouse,
     WorkshopWarehouseBinding,
+    LedgerGeneration,
+    PhysicalImportBatch,
 )
 from app.routers.production_control import (
     get_order_line_materials,
@@ -58,6 +60,37 @@ from app.services.production_control_material_availability import (
 from app.services.production_control_material_issues import create_material_issues, delete_local_material_issue, list_material_issues
 from app.services.production_control_printing import render_route_sheets_html
 from app.services.one_c_production_order_export import PRODUCTION_ORDER_ENTITY
+from app.services.planning_truth import publish_generation
+from app.services.mrp_mutation_guard import MrpMutationLineageError
+
+
+def _accepted_mrp_context(db_session, *, key: str):
+    cutoff = datetime(2026, 5, 31, 23, 59, tzinfo=_dt.timezone.utc)
+    batch = PhysicalImportBatch(
+        batch_key=f"{key}-batch",
+        status="completed",
+        cutoff=cutoff,
+        completed_at=cutoff,
+        source_watermarks={"explicit_empty_prefix": True},
+    )
+    generation = LedgerGeneration(
+        generation_key=f"{key}-generation",
+        status="accepted",
+        cutoff=cutoff,
+        accepted_at=cutoff,
+        source_watermarks={"explicit_empty_prefix": True},
+        capabilities={
+            "physical_ledger": True,
+            "reservation_replay": True,
+            "execution_allocations": True,
+        },
+        physical_import_batch=batch,
+        algorithm_version="test/1",
+        replay_version="test/1",
+    )
+    publish_generation(db_session, generation)
+    db_session.flush()
+    return generation, cutoff
 
 
 def test_list_employees_returns_active_synced_employees(db_session):
@@ -828,7 +861,8 @@ def test_update_product_quantity_reports_posted_material_issues_as_blocked(db_se
     assert result["material_issues_refresh"]["blocked"][0]["issue_id"] == issue_id
 
 
-def test_fill_remaining_creates_top_up_order_for_partially_covered_requirement(db_session):
+def test_requirement_materialization_does_not_top_up_from_legacy_remaining_qty(db_session):
+    generation, cutoff = _accepted_mrp_context(db_session, key="mrp-no-topup")
     item = Item(
         item_code="MRP-TOPUP",
         item_name="MRP top-up item",
@@ -840,7 +874,13 @@ def test_fill_remaining_creates_top_up_order_for_partially_covered_requirement(d
     db_session.add(item)
     db_session.flush()
 
-    run = PlanningRun(status="FIXED_SNAPSHOT", started_at=datetime(2026, 5, 27))
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        started_at=datetime(2026, 5, 27),
+        active_freeze_version=1,
+        ledger_generation_id=generation.id,
+        ledger_cutoff=cutoff,
+    )
     db_session.add(run)
     db_session.flush()
     req = MrpRequirement(
@@ -853,6 +893,7 @@ def test_fill_remaining_creates_top_up_order_for_partially_covered_requirement(d
         period_from=_dt.date(2026, 6, 1),
         period_to=_dt.date(2026, 6, 30),
         bom_level=0,
+        freeze_version=1,
     )
     db_session.add(req)
     db_session.flush()
@@ -875,28 +916,30 @@ def test_fill_remaining_creates_top_up_order_for_partially_covered_requirement(d
         remaining_qty=4,
         source_mrp_requirement_id=req.id,
         source_mrp_allocation_key=f"mrp_requirement:{req.id}:order:1",
+        ledger_generation_id=generation.id,
     )
     db_session.add(existing)
     db_session.commit()
 
     result = create_production_orders_from_mrp_requirements(db_session, [req.id])
 
-    assert len(result["created"]) == 1
-    assert result["created"][0]["qty"] == 23
-    assert result["reused"] == []
+    assert result["created"] == []
+    assert len(result["reused"]) == 1
+    assert result["skipped"][0]["reason"] == "already materialized for this Ledger generation"
     db_session.refresh(req)
-    assert float(req.covered_qty) == 27
-    assert float(req.remaining_qty) == 0
+    assert float(req.covered_qty) == 4
+    assert float(req.remaining_qty) == 23
     products = (
         db_session.query(ProductionProduct)
         .filter(ProductionProduct.source_mrp_requirement_id == req.id)
         .order_by(ProductionProduct.product_id.asc())
         .all()
     )
-    assert [float(p.quantity) for p in products] == [4, 23]
+    assert [float(p.quantity) for p in products] == [4]
 
 
 def test_fill_remaining_splits_requirement_by_optimal_batch(db_session):
+    generation, cutoff = _accepted_mrp_context(db_session, key="mrp-batch")
     item = Item(
         item_code="MRP-BATCH",
         item_name="MRP optimal batch item",
@@ -909,7 +952,13 @@ def test_fill_remaining_splits_requirement_by_optimal_batch(db_session):
     db_session.add(item)
     db_session.flush()
 
-    run = PlanningRun(status="FIXED_SNAPSHOT", started_at=datetime(2026, 6, 4))
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        started_at=datetime(2026, 6, 4),
+        active_freeze_version=1,
+        ledger_generation_id=generation.id,
+        ledger_cutoff=cutoff,
+    )
     db_session.add(run)
     db_session.flush()
     req = MrpRequirement(
@@ -922,6 +971,7 @@ def test_fill_remaining_splits_requirement_by_optimal_batch(db_session):
         period_from=_dt.date(2026, 6, 4),
         period_to=_dt.date(2026, 6, 8),
         bom_level=0,
+        freeze_version=1,
     )
     db_session.add(req)
     db_session.commit()
@@ -931,8 +981,10 @@ def test_fill_remaining_splits_requirement_by_optimal_batch(db_session):
     assert [float(row["qty"]) for row in result["created"]] == [12, 12, 12, 2]
     assert result["reused"] == []
     db_session.refresh(req)
-    assert float(req.covered_qty) == 38
-    assert float(req.remaining_qty) == 0
+    # Legacy requirement caches are immutable evidence; materialization is
+    # recorded by generation-bound products instead of rewriting these totals.
+    assert float(req.covered_qty) == 0
+    assert float(req.remaining_qty) == 38
 
     products = (
         db_session.query(ProductionProduct)
@@ -949,7 +1001,8 @@ def test_fill_remaining_splits_requirement_by_optimal_batch(db_session):
     ]
 
 
-def test_repeated_mrp_requirement_materialization_reuses_open_order_from_previous_run(db_session):
+def test_repeated_mrp_requirement_materialization_is_idempotent(db_session):
+    generation, cutoff = _accepted_mrp_context(db_session, key="mrp-retry")
     item = Item(
         item_code="MRP-RERUN",
         item_name="MRP rerun item",
@@ -961,7 +1014,13 @@ def test_repeated_mrp_requirement_materialization_reuses_open_order_from_previou
     db_session.add(item)
     db_session.flush()
 
-    run1 = PlanningRun(status="FIXED_SNAPSHOT", started_at=datetime(2026, 6, 4))
+    run1 = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        started_at=datetime(2026, 6, 4),
+        active_freeze_version=1,
+        ledger_generation_id=generation.id,
+        ledger_cutoff=cutoff,
+    )
     db_session.add(run1)
     db_session.flush()
     req1 = MrpRequirement(
@@ -974,6 +1033,7 @@ def test_repeated_mrp_requirement_materialization_reuses_open_order_from_previou
         period_from=_dt.date(2026, 6, 1),
         period_to=_dt.date(2026, 6, 30),
         bom_level=0,
+        freeze_version=1,
     )
     db_session.add(req1)
     db_session.commit()
@@ -981,30 +1041,10 @@ def test_repeated_mrp_requirement_materialization_reuses_open_order_from_previou
     first = create_production_orders_from_mrp_requirements(db_session, [req1.id])
     assert len(first["created"]) == 1
 
-    run2 = PlanningRun(status="FIXED_SNAPSHOT", started_at=datetime(2026, 6, 4))
-    db_session.add(run2)
-    db_session.flush()
-    req2 = MrpRequirement(
-        run_id=run2.run_id,
-        item_id=item.item_id,
-        total_required_qty=25,
-        net_required_qty=25,
-        covered_qty=0,
-        remaining_qty=25,
-        period_from=_dt.date(2026, 6, 1),
-        period_to=_dt.date(2026, 6, 30),
-        bom_level=0,
-    )
-    db_session.add(req2)
-    db_session.commit()
-
-    second = create_production_orders_from_mrp_requirements(db_session, [req2.id])
+    second = create_production_orders_from_mrp_requirements(db_session, [req1.id])
 
     assert second["created"] == []
     assert len(second["reused"]) == 1
-    db_session.refresh(req2)
-    assert float(req2.covered_qty) == 25
-    assert float(req2.remaining_qty) == 0
     assert db_session.query(ProductionProduct).filter(ProductionProduct.item_id == item.item_id).count() == 1
 
 
@@ -2245,6 +2285,7 @@ def test_create_orders_from_mrp_materializes_planned_orders(db_session):
     with the source_planned_order_id back-link and an initial line state.
     Second call for the same planned_orders is a no-op (reused).
     """
+    generation, cutoff = _accepted_mrp_context(db_session, key="planned-orders")
     item = Item(
         item_code="MRP-ITEM",
         item_name="Item from MRP",
@@ -2256,7 +2297,13 @@ def test_create_orders_from_mrp_materializes_planned_orders(db_session):
     db_session.add(item)
     db_session.flush()
 
-    run = PlanningRun(status="DONE", config_snapshot=json.dumps({}))
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot=json.dumps({}),
+        active_freeze_version=1,
+        ledger_generation_id=generation.id,
+        ledger_cutoff=cutoff,
+    )
     db_session.add(run)
     db_session.flush()
     planned_a = PlannedOrder(
@@ -2269,6 +2316,7 @@ def test_create_orders_from_mrp_materializes_planned_orders(db_session):
         start_date=_dt.date(2026, 5, 25),
         finish_date=_dt.date(2026, 5, 31),
         bucket_date=_dt.date(2026, 6, 1),
+        ledger_generation_id=generation.id,
     )
     planned_b = PlannedOrder(
         run_id=run.run_id,
@@ -2278,6 +2326,7 @@ def test_create_orders_from_mrp_materializes_planned_orders(db_session):
         qty=4,
         need_date=_dt.date(2026, 6, 5),
         bucket_date=_dt.date(2026, 6, 5),
+        ledger_generation_id=generation.id,
     )
     db_session.add_all([planned_a, planned_b])
     db_session.commit()
@@ -2337,11 +2386,12 @@ def test_create_orders_from_mrp_materializes_planned_orders(db_session):
     )
 
 
-def test_create_orders_from_mrp_skips_invalid_inputs(db_session):
+def test_create_orders_from_mrp_rejects_missing_selected_line_before_writes(db_session):
     """
     Bad planned_order ids and 0-qty rows must be reported as errors instead of
     aborting the whole batch.
     """
+    generation, cutoff = _accepted_mrp_context(db_session, key="missing-line")
     item = Item(
         item_code="MRP-SKIP",
         item_name="Skip item",
@@ -2352,7 +2402,13 @@ def test_create_orders_from_mrp_skips_invalid_inputs(db_session):
     )
     db_session.add(item)
     db_session.flush()
-    run = PlanningRun(status="DONE", config_snapshot=json.dumps({}))
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot=json.dumps({}),
+        active_freeze_version=1,
+        ledger_generation_id=generation.id,
+        ledger_cutoff=cutoff,
+    )
     db_session.add(run)
     db_session.flush()
     zero_qty = PlannedOrder(
@@ -2363,14 +2419,13 @@ def test_create_orders_from_mrp_skips_invalid_inputs(db_session):
         qty=0,
         need_date=_dt.date(2026, 6, 1),
         bucket_date=_dt.date(2026, 6, 1),
+        ledger_generation_id=generation.id,
     )
     db_session.add(zero_qty)
     db_session.commit()
 
-    result = create_orders_from_mrp(db_session, [zero_qty.order_id, 999_999])
-    assert result["created"] == []
-    assert result["reused"] == []
-    assert len(result["errors"]) == 2
+    with pytest.raises(MrpMutationLineageError, match="do not exist"):
+        create_orders_from_mrp(db_session, [zero_qty.order_id, 999_999])
     # Nothing committed for the invalid batch.
     assert (
         db_session.query(ProductionOrder).filter(ProductionOrder.source == "mrp").count() == 0

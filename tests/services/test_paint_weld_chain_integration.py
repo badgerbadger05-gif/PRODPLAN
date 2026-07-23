@@ -9,30 +9,24 @@ Rules (see .docs/paint_weld_chain_logic.md, stage 1):
 """
 from __future__ import annotations
 
-from datetime import date
-from types import SimpleNamespace
+from datetime import date, datetime, timezone
 
 import pytest
 
-
-@pytest.fixture(autouse=True)
-def _accepted_planning_truth(monkeypatch):
-    monkeypatch.setattr(
-        "app.services.planning_truth.require_accepted_truth",
-        lambda db, consumer, **kwargs: SimpleNamespace(
-            status="accepted", generation_id=1, cutoff=None, reason=None
-        ),
-    )
-
 from app.models import (
     Item,
+    LedgerGeneration,
     MrpRequirement,
     PaintWeldPair,
+    PhysicalImportBatch,
     PlanningRun,
+    PlanningTruthState,
     ProductionPlanHeader,
     ProductionPlanLine,
+    StockBin,
 )
 from app.services.mrp_reconciliation import reconcile_snapshot as _public_reconcile_snapshot
+from app.services.planning_truth import publish_generation
 
 
 def reconcile_snapshot(db, run_id, **kwargs):
@@ -43,6 +37,42 @@ from app.services.period_plan_service import create_mrp_snapshot_from_period_pla
 from app.services.production_control_journal import (
     create_production_orders_from_mrp_requirements,
 )
+
+
+@pytest.fixture(autouse=True)
+def _accepted_planning_truth(db_session):
+    cutoff = datetime(2026, 5, 31, 23, 59, tzinfo=timezone.utc)
+    batch = PhysicalImportBatch(
+        batch_key="paint-weld-integration",
+        status="completed",
+        cutoff=cutoff,
+        completed_at=cutoff,
+        source_watermarks={"explicit_empty_prefix": True},
+    )
+    generation = LedgerGeneration(
+        generation_key="paint-weld-integration",
+        status="accepted",
+        cutoff=cutoff,
+        accepted_at=cutoff,
+        source_watermarks={"explicit_empty_prefix": True},
+        capabilities={
+            "physical_ledger": True,
+            "reservation_replay": True,
+            "execution_allocations": True,
+        },
+        physical_import_batch=batch,
+        algorithm_version="test/1",
+        replay_version="test/1",
+    )
+    publish_generation(db_session, generation)
+    db_session.flush()
+    return generation
+
+
+def _accepted_generation(db) -> LedgerGeneration:
+    state = db.get(PlanningTruthState, 1)
+    assert state is not None and state.current_generation_id is not None
+    return db.get(LedgerGeneration, int(state.current_generation_id))
 
 
 def _welded_item(db, code: str, *, stock: float = 0.0) -> Item:
@@ -58,6 +88,19 @@ def _welded_item(db, code: str, *, stock: float = 0.0) -> Item:
     )
     db.add(item)
     db.flush()
+    if stock:
+        generation = _accepted_generation(db)
+        db.add(
+            StockBin(
+                ledger_generation_id=generation.id,
+                item_id=item.item_id,
+                characteristic_ref="",
+                organization_ref="",
+                warehouse_ref1c="WH",
+                on_hand=stock,
+            )
+        )
+        db.flush()
     return item
 
 
@@ -87,7 +130,15 @@ def _active_pair(db, welded: Item) -> PaintWeldPair:
 
 
 def _standalone_requirement(db, item: Item, *, net: float) -> MrpRequirement:
-    run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={}, pinned=True)
+    generation = _accepted_generation(db)
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot={},
+        pinned=True,
+        active_freeze_version=1,
+        ledger_generation_id=generation.id,
+        ledger_cutoff=generation.cutoff,
+    )
     db.add(run)
     db.flush()
     req = MrpRequirement(
@@ -100,6 +151,7 @@ def _standalone_requirement(db, item: Item, *, net: float) -> MrpRequirement:
         period_from=date(2026, 6, 1),
         period_to=date(2026, 6, 30),
         bom_level=0,
+        freeze_version=1,
     )
     db.add(req)
     db.flush()

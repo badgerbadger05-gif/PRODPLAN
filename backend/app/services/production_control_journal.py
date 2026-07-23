@@ -41,6 +41,12 @@ from .production_control_domain import (
 from .production_control_material_issues import refresh_existing_material_issues_for_product
 from .replenishment import REPLENISHMENT_FLOW_PRODUCTION, classify_replenishment_flow
 from .paint_weld_pairs import is_welded_blocked
+from .mrp_mutation_guard import (
+    MrpMutationLineageError,
+    require_current_run,
+    require_selected_proposals,
+    require_selected_requirements,
+)
 
 
 DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
@@ -149,49 +155,29 @@ def _journal_coverage_status(
 
 
 def _active_mrp_products_for_requirement(db: Session, req: MrpRequirement) -> List[Tuple[ProductionProduct, ProductionOrder]]:
-    """
-    Existing open MRP journal lines for the same item and planning scope.
+    """Exact same-generation materializations, independent of legacy state.
 
-    MRP snapshots are recreated during manual refreshes and autoruns, so a new
-    MrpRequirement.id can describe demand already covered by an older open
-    PRODPLAN order. Treat those open lines as coverage before materialising
-    another order.
+    ``remaining_qty``, 1C order state and journal status are projections, not
+    authorization.  Once this requirement was materialized in its generation,
+    a retry must reuse it even when those legacy fields are stale.
     """
     current_run = db.query(PlanningRun).filter(PlanningRun.run_id == int(req.run_id)).first()
-    source_plan_id = int(current_run.source_plan_id) if current_run and current_run.source_plan_id is not None else None
-
-    rows = (
-        db.query(ProductionProduct, ProductionOrder, ProductionOrderLineState, PlanningRun)
+    if current_run is None or current_run.ledger_generation_id is None:
+        return []
+    return [
+        (product, order)
+        for product, order in (
+        db.query(ProductionProduct, ProductionOrder)
         .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
-        .outerjoin(ProductionOrderLineState, ProductionOrderLineState.product_id == ProductionProduct.product_id)
-        .outerjoin(PlanningRun, PlanningRun.run_id == ProductionOrder.source_run_id)
-        .filter(ProductionProduct.item_id == int(req.item_id))
+        .filter(ProductionProduct.source_mrp_requirement_id == int(req.id))
+        .filter(
+            ProductionProduct.ledger_generation_id
+            == int(current_run.ledger_generation_id)
+        )
         .filter(ProductionOrder.source == "mrp")
-        .filter(ProductionOrder.deletion_mark == False)
-        .filter(or_(ProductionOrder.order_state_key.is_(None), func.lower(ProductionOrder.order_state_key) != DONE_STATE_KEY))
-        .filter(func.coalesce(ProductionProduct.remaining_qty, 0) > 0)
-        .filter(func.coalesce(ProductionOrderLineState.status, "shortage").notin_(tuple(_TERMINAL_LINE_STATUSES)))
         .all()
-    )
-
-    result: List[Tuple[ProductionProduct, ProductionOrder]] = []
-    for product, order, state, run in rows:
-        if source_plan_id is not None:
-            if run is not None and run.source_plan_id == source_plan_id:
-                result.append((product, order))
-            continue
-
-        start = state.planned_start_date if state and state.planned_start_date else None
-        finish = state.planned_finish_date if state and state.planned_finish_date else None
-        if start is None and finish is None:
-            if order.source_run_id == req.run_id or product.source_mrp_requirement_id == req.id:
-                result.append((product, order))
-            continue
-        interval_start = start or finish
-        interval_finish = finish or start
-        if interval_start and interval_finish and interval_start <= req.period_to and interval_finish >= req.period_from:
-            result.append((product, order))
-    return result
+        )
+    ]
 
 
 def _reused_product_payload(
@@ -581,6 +567,28 @@ def create_orders_from_mrp(
     equal to the planned_order's planned_qty, and a ProductionOrderLineState
     row in status='new' / issue_status='not_requested'.
     """
+    selected_ids = [int(value) for value in planned_order_ids]
+    selected = (
+        db.query(PlannedOrder)
+        .filter(PlannedOrder.order_id.in_(selected_ids))
+        .all()
+    )
+    if len({int(row.order_id) for row in selected}) != len(set(selected_ids)):
+        raise MrpMutationLineageError("one or more selected planned orders do not exist")
+    run_ids = {int(row.run_id) for row in selected}
+    if len(run_ids) != 1:
+        raise MrpMutationLineageError("selected planned orders have mixed or empty runs")
+    run, generation_id = require_current_run(
+        db, run_ids.pop(), consumer="production_control.create_orders_from_mrp"
+    )
+    require_selected_proposals(
+        db,
+        selected,
+        run=run,
+        generation_id=generation_id,
+        consumer="production_control.create_orders_from_mrp",
+    )
+
     created: List[Dict[str, Any]] = []
     reused: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
@@ -622,6 +630,13 @@ def create_orders_from_mrp(
             .first()
         )
         if existing_product is not None:
+            if (
+                existing_product.ledger_generation_id is None
+                or int(existing_product.ledger_generation_id) != generation_id
+            ):
+                raise MrpMutationLineageError(
+                    f"planned_order_id={pid}: existing materialization has stale Ledger lineage"
+                )
             existing_order = (
                 db.query(ProductionOrder)
                 .filter(ProductionOrder.order_id == existing_product.order_id)
@@ -669,6 +684,7 @@ def create_orders_from_mrp(
             remaining_qty=qty,
             spec_id=_default_spec_id_for_item(db, int(planned.item_id)),
             source_planned_order_id=pid,
+            ledger_generation_id=generation_id,
         )
         db.add(product)
         db.flush()
@@ -718,6 +734,24 @@ def create_production_orders_from_mrp_requirements(
     MrpRequirement.covered_qty / remaining_qty are updated to reflect newly
     created orders.
     """
+    selected_ids = [int(value) for value in requirement_ids]
+    selected = (
+        db.query(MrpRequirement)
+        .filter(MrpRequirement.id.in_(selected_ids))
+        .all()
+    )
+    if len({int(row.id) for row in selected}) != len(set(selected_ids)):
+        raise MrpMutationLineageError("one or more selected MRP requirements do not exist")
+    run_ids = {int(row.run_id) for row in selected}
+    if len(run_ids) != 1:
+        raise MrpMutationLineageError("selected MRP requirements have mixed or empty runs")
+    run, generation_id = require_current_run(
+        db,
+        run_ids.pop(),
+        consumer="production_control.create_production_orders_from_mrp_requirements",
+    )
+    require_selected_requirements(selected, run=run)
+
     created: List[Dict[str, Any]] = []
     reused: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
@@ -765,19 +799,23 @@ def create_production_orders_from_mrp_requirements(
 
         net_qty = _to_float(req.net_required_qty)
         active_products = _active_mrp_products_for_requirement(db, req)
-        active_open_qty = sum(_to_float(product.remaining_qty) for product, _order in active_products)
-        remaining = max(0.0, net_qty - active_open_qty)
-        if remaining <= 1e-9:
-            req.covered_qty = min(active_open_qty, net_qty)
-            req.remaining_qty = max(net_qty - _to_float(req.covered_qty), 0.0)
+        if active_products:
             for product, order in active_products:
+                if (
+                    product.ledger_generation_id is None
+                    or int(product.ledger_generation_id) != generation_id
+                ):
+                    raise MrpMutationLineageError(
+                        f"requirement_id={rid}: existing materialization has stale Ledger lineage"
+                    )
                 reused.append(_reused_product_payload(product, order, requirement_id=rid))
             skipped.append({
                 "requirement_id": rid,
                 "item_id": int(req.item_id),
-                "reason": "remaining_qty=0 (уже покрыто открытыми заказами)",
+                "reason": "already materialized for this Ledger generation",
             })
             continue
+        remaining = net_qty
 
         existing_count = (
             db.query(ProductionProduct)
@@ -796,8 +834,6 @@ def create_production_orders_from_mrp_requirements(
         planned_finish = max((task.finish_date or task.need_date for task in planned_tasks if task.finish_date or task.need_date), default=req.period_to)
         spec_id = _default_spec_id_for_item(db, int(req.item_id))
         batches = _split_qty_by_optimal_batch(remaining, getattr(item, "optimal_batch", None))
-        created_total = 0.0
-
         for index, qty in enumerate(batches, start=1):
             seq = existing_count + index
             order_number = f"MRP-R-{rid}" if seq == 1 and len(batches) == 1 else f"MRP-R-{rid}-{seq}"
@@ -823,6 +859,7 @@ def create_production_orders_from_mrp_requirements(
                 spec_id=spec_id,
                 source_mrp_requirement_id=rid,
                 source_mrp_allocation_key=f"mrp_requirement:{rid}:order:{seq}",
+                ledger_generation_id=generation_id,
             )
             db.add(product)
             db.flush()
@@ -836,7 +873,6 @@ def create_production_orders_from_mrp_requirements(
             )
             db.add(state)
 
-            created_total += _to_float(qty)
             created.append({
                 "requirement_id": rid,
                 "product_id": int(product.product_id),
@@ -847,10 +883,9 @@ def create_production_orders_from_mrp_requirements(
                 "qty": qty,
             })
 
-        # Reflect coverage in the requirement row
-        new_covered = min(active_open_qty + created_total, net_qty)
-        req.covered_qty = new_covered
-        req.remaining_qty = max(net_qty - new_covered, 0.0)
+        # Requirement coverage/execution is derived from the Ledger.  Do not
+        # authorize or stamp this mutation through legacy covered/remaining
+        # caches; the generation reconciliation worker owns projections.
 
     db.commit()
     return {
