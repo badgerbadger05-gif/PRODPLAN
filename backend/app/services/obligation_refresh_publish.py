@@ -43,6 +43,11 @@ _REQUIRED_BUILD_STAGES = (
 )
 
 _MRP_RESULT_CONSUMER = "mrp_result"
+_DBR_POLICY_CONSUMER = "dbr_policy_input"
+_DBR_POLICY_KEY = "policy:v1"
+_DBR_COCKPIT_CONSUMER = "dbr_feeder_cockpit"
+_DBR_COCKPIT_KEY = "cockpit:v1"
+_DBR_CAPABILITY = "dbr_feeder_cockpit"
 _MRP_ROW_KINDS = frozenset({"production", "purchase", "rework", "capacity"})
 _REQUIRED_PUBLISHED_CAPABILITIES = frozenset({
     "physical_ledger",
@@ -203,6 +208,21 @@ def _require_manifest(
         raise ObligationRefreshPublishError("obligation_refresh_manifest add_request conflicts with candidates")
     if not isinstance(add_request.get("config_snapshot"), dict):
         raise ObligationRefreshPublishError("obligation_refresh_manifest add config is malformed")
+    pool_mapping = add_request.get("planning_pool_by_warehouse")
+    if (
+        not isinstance(pool_mapping, dict)
+        or any(
+            not isinstance(key, str)
+            or not key.strip()
+            or not isinstance(value, str)
+            or not value.strip()
+            for key, value in pool_mapping.items()
+        )
+        or list(pool_mapping) != sorted(pool_mapping)
+    ):
+        raise ObligationRefreshPublishError(
+            "obligation_refresh_manifest planning pool mapping is malformed"
+        )
     for candidate in additions:
         if (
             candidate.horizon_days != add_request.get("horizon_days")
@@ -330,6 +350,15 @@ def _require_sealed_build(
         truth_status="building",
         accepted_at=None,
     )
+    _require_candidate_dbr_snapshots(
+        db,
+        target=target,
+        candidate_ids=candidate_ids,
+        snapshot_metrics=snapshot_metrics,
+        capabilities=capabilities,
+        truth_status="building",
+        accepted_at=None,
+    )
 
 
 def _require_candidate_read_snapshots(
@@ -415,6 +444,109 @@ def _require_candidate_read_snapshots(
     return [by_id[declared[run_id]] for run_id in sorted(declared)]
 
 
+def _require_candidate_dbr_snapshots(
+    db: Session,
+    *,
+    target: models.LedgerGeneration,
+    candidate_ids: list[int],
+    snapshot_metrics: Mapping[str, Any],
+    capabilities: Mapping[str, Any],
+    truth_status: str,
+    accepted_at: datetime | None,
+) -> list[models.PlanningReadSnapshot]:
+    """Validate the optional DBR policy/cockpit pair all-or-nothing."""
+    rows = _lock(db.query(models.PlanningReadSnapshot)).filter(
+        models.PlanningReadSnapshot.ledger_generation_id == int(target.id),
+        models.PlanningReadSnapshot.consumer.in_(
+            (_DBR_POLICY_CONSUMER, _DBR_COCKPIT_CONSUMER)
+        ),
+    ).all()
+    if capabilities.get(_DBR_CAPABILITY) is not True:
+        if snapshot_metrics.get("dbr_cockpit_ready") is not False:
+            raise ObligationRefreshPublishError(
+                "snapshot_build lacks explicit DBR readiness"
+            )
+        if rows:
+            raise ObligationRefreshPublishError(
+                "DBR-unavailable generation contains candidate DBR snapshots"
+            )
+        return []
+
+    if snapshot_metrics.get("dbr_cockpit_ready") is not True:
+        raise ObligationRefreshPublishError(
+            "DBR capability conflicts with snapshot readiness"
+        )
+    try:
+        policy_id = int(snapshot_metrics["dbr_policy_snapshot_id"])
+        cockpit_id = int(snapshot_metrics["dbr_cockpit_snapshot_id"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ObligationRefreshPublishError(
+            "snapshot_build DBR snapshot identities are malformed"
+        ) from exc
+    by_id = {int(row.id): row for row in rows}
+    if set(by_id) != {policy_id, cockpit_id} or policy_id == cockpit_id:
+        raise ObligationRefreshPublishError(
+            "target has missing or extra DBR candidate snapshots"
+        )
+    policy = by_id[policy_id]
+    cockpit = by_id[cockpit_id]
+    expected_cutoff = _utc(target.cutoff, "target cutoff")
+    if (
+        policy.consumer != _DBR_POLICY_CONSUMER
+        or policy.snapshot_key != _DBR_POLICY_KEY
+        or cockpit.consumer != _DBR_COCKPIT_CONSUMER
+        or cockpit.snapshot_key != _DBR_COCKPIT_KEY
+        or str(policy.truth_status) != truth_status
+        or str(cockpit.truth_status) != truth_status
+        or _utc(policy.cutoff, "DBR policy cutoff") != expected_cutoff
+        or _utc(cockpit.cutoff, "DBR cockpit cutoff") != expected_cutoff
+    ):
+        raise ObligationRefreshPublishError(
+            "DBR candidate snapshot lineage conflicts"
+        )
+    if accepted_at is None:
+        if policy.reason is None or cockpit.reason is None:
+            raise ObligationRefreshPublishError(
+                "unpublished DBR candidate snapshot lacks reason"
+            )
+    elif (
+        policy.reason is not None
+        or cockpit.reason is not None
+        or _utc(policy.published_at, "DBR policy published_at") != accepted_at
+        or _utc(cockpit.published_at, "DBR cockpit published_at") != accepted_at
+    ):
+        raise ObligationRefreshPublishError(
+            "accepted DBR snapshot publication state conflicts"
+        )
+    meta = cockpit.payload.get("meta") if isinstance(cockpit.payload, dict) else None
+    policy_runs = policy.payload.get("runs") if isinstance(policy.payload, dict) else None
+    if not isinstance(policy_runs, list):
+        raise ObligationRefreshPublishError("DBR policy run manifest is malformed")
+    try:
+        declared_runs = sorted(int(row["run_id"]) for row in policy_runs)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ObligationRefreshPublishError(
+            "DBR policy run manifest is malformed"
+        ) from exc
+    cockpit_runs = [
+        {
+            "run_id": int(row["run_id"]),
+            "freeze_version": int(row["freeze_version"]),
+        }
+        for row in policy_runs
+    ]
+    if (
+        not isinstance(meta, dict)
+        or int(meta.get("policy_snapshot_id") or -1) != policy_id
+        or meta.get("runs") != cockpit_runs
+        or declared_runs != sorted(candidate_ids)
+    ):
+        raise ObligationRefreshPublishError(
+            "DBR cockpit policy/run manifest conflicts"
+        )
+    return [policy, cockpit]
+
+
 def _exact_retry(
     db: Session, *, parent: models.LedgerGeneration, target: models.LedgerGeneration,
     pointer: models.PlanningTruthState, accepted_at: datetime, capabilities: dict[str, Any],
@@ -486,6 +618,15 @@ def _exact_retry(
             target=target,
             candidate_ids=candidate_ids,
             snapshot_metrics=dict(snapshot_batch.metrics or {}),
+            truth_status="accepted",
+            accepted_at=accepted_at,
+        )
+        _require_candidate_dbr_snapshots(
+            db,
+            target=target,
+            candidate_ids=candidate_ids,
+            snapshot_metrics=dict(snapshot_batch.metrics or {}),
+            capabilities=capabilities,
             truth_status="accepted",
             accepted_at=accepted_at,
         )
@@ -589,6 +730,15 @@ def publish_obligation_refresh_batch(
         truth_status="building",
         accepted_at=None,
     )
+    candidate_dbr_snapshots = _require_candidate_dbr_snapshots(
+        db,
+        target=target,
+        candidate_ids=candidate_ids,
+        snapshot_metrics=dict(snapshot_batch.metrics or {}),
+        capabilities=capability_snapshot,
+        truth_status="building",
+        accepted_at=None,
+    )
     if _source_export_links_exist(db, candidate_ids):
         raise ObligationRefreshPublishError("candidate has external export links")
 
@@ -632,7 +782,7 @@ def publish_obligation_refresh_batch(
         candidate.pinned = True
         candidate.fixed_at = accepted_at
         candidate.finished_at = accepted_at
-    for snapshot in candidate_read_snapshots:
+    for snapshot in [*candidate_read_snapshots, *candidate_dbr_snapshots]:
         snapshot.truth_status = "accepted"
         snapshot.reason = None
         snapshot.published_at = accepted_at

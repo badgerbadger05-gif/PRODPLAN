@@ -21,6 +21,14 @@ from app import models
 from app.services.item_ledger.candidate_future_supply import capture_candidate_future_supply
 from app.services.item_ledger.candidate_realization_replay import replay_candidate_realizations
 from app.services.item_ledger.obligation_generation import fork_obligation_generation
+from app.services.dbr.cockpit_candidate import (
+    DbrCockpitCandidateError,
+    build_cockpit_candidate_snapshot,
+)
+from app.services.dbr.policy_snapshot import (
+    DbrPolicySnapshotError,
+    build_policy_candidate_snapshot,
+)
 from app.services.mrp_freeze import MRP_LEDGER_LOCK_KEY, freeze_candidate_snapshots
 from app.services.mrp_result_snapshot import build_mrp_result_candidate_snapshot
 from app.services.obligation_refresh_manifest import (
@@ -38,6 +46,7 @@ _CORE_CAPABILITIES = {
     "execution_allocations": True,
     "planning_snapshots": True,
 }
+_DBR_CAPABILITY = "dbr_feeder_cockpit"
 
 
 class ObligationRefreshOrchestratorError(RuntimeError):
@@ -118,6 +127,7 @@ def _manifest_request_matches(
     target: models.LedgerGeneration,
     *, add_plan_ids: Iterable[int], horizon_days: int | None,
     config_version_id: int | None, config_snapshot: Mapping[str, Any],
+    planning_pool_by_warehouse: Mapping[str, str],
 ) -> None:
     marks = dict(target.source_watermarks or {})
     manifest = marks.get(MANIFEST_KEY)
@@ -133,6 +143,10 @@ def _manifest_request_matches(
             "horizon_days": horizon_days,
             "config_version_id": config_version_id,
             "config_snapshot": dict(config_snapshot),
+            "planning_pool_by_warehouse": {
+                str(key).strip(): str(value).strip()
+                for key, value in sorted(planning_pool_by_warehouse.items())
+            },
         }
     except (KeyError, TypeError, ValueError) as exc:
         raise ObligationRefreshOrchestratorError("published refresh manifest request is malformed") from exc
@@ -144,9 +158,11 @@ def _retry_published(
     db: Session, target: models.LedgerGeneration, *, parent_generation_id: int,
     add_plan_ids: Iterable[int], horizon_days: int | None,
     config_version_id: int | None, config_snapshot: Mapping[str, Any],
+    planning_pool_by_warehouse: Mapping[str, str],
 ) -> ObligationRefreshOrchestrationResult:
     _manifest_request_matches(target, add_plan_ids=add_plan_ids, horizon_days=horizon_days,
-                              config_version_id=config_version_id, config_snapshot=config_snapshot)
+                              config_version_id=config_version_id, config_snapshot=config_snapshot,
+                              planning_pool_by_warehouse=planning_pool_by_warehouse)
     marks = dict(target.source_watermarks or {})
     if int(marks.get("parent_generation_id") or -1) != int(parent_generation_id):
         raise ObligationRefreshOrchestratorError("published generation belongs to another parent")
@@ -220,6 +236,7 @@ def run_obligation_refresh(
         return _retry_published(
             db, existing, parent_generation_id=original_parent_id, add_plan_ids=add_ids,
             horizon_days=horizon_days, config_version_id=config_version_id, config_snapshot=config,
+            planning_pool_by_warehouse=dict(planning_pool_by_warehouse or {}),
         )
     if existing is not None and str(existing.status) != "building":
         raise ObligationRefreshOrchestratorError("generation_key exists in non-retryable state")
@@ -240,6 +257,7 @@ def run_obligation_refresh(
     manifest = create_obligation_refresh_manifest(
         db, int(parent_generation_id), target_id, add_ids, started_by=started_by,
         horizon_days=horizon_days, config_version_id=config_version_id, config_snapshot=config,
+        planning_pool_by_warehouse=dict(planning_pool_by_warehouse or {}),
     )
     candidate_ids = tuple(sorted(int(entry["candidate_run_id"]) for entry in manifest.entries))
     if not candidate_ids:
@@ -268,6 +286,48 @@ def run_obligation_refresh(
     _complete(reservation_batch, reservation_metrics)
     replay = replay_candidate_realizations(db, target_id)
     snapshots = {str(run_id): int(build_mrp_result_candidate_snapshot(db, run_id).id) for run_id in candidate_ids}
+    target = db.get(models.LedgerGeneration, target_id)
+    if target is None or str(target.status) != "building":
+        raise ObligationRefreshOrchestratorError(
+            "target generation disappeared during refresh"
+        )
+    # The candidate projection validates these capabilities even though the
+    # pointer is not switched until the publisher's final transaction step.
+    target.capabilities = dict(_CORE_CAPABILITIES)
+    db.flush()
+
+    dbr_metrics: dict[str, Any]
+    capabilities = {**_CORE_CAPABILITIES, _DBR_CAPABILITY: False}
+    dbr_configured = (
+        db.get(models.DbrSettings, 1) is not None
+        and bool(planning_pool_by_warehouse)
+    )
+    if dbr_configured:
+        try:
+            policy_snapshot = build_policy_candidate_snapshot(db, target_id)
+            cockpit_snapshot = build_cockpit_candidate_snapshot(db, target_id)
+        except (DbrPolicySnapshotError, DbrCockpitCandidateError) as exc:
+            raise ObligationRefreshOrchestratorError(
+                f"configured DBR candidate build failed: {exc}"
+            ) from exc
+        policy_hash = sha256(
+            _canonical(policy_snapshot.payload).encode("utf-8")
+        ).hexdigest()
+        dbr_metrics = {
+            "dbr_cockpit_ready": True,
+            "dbr_policy_snapshot_id": int(policy_snapshot.id),
+            "dbr_cockpit_snapshot_id": int(cockpit_snapshot.id),
+            "dbr_policy_hash": policy_hash,
+        }
+        capabilities[_DBR_CAPABILITY] = True
+    else:
+        dbr_metrics = {
+            "dbr_cockpit_ready": False,
+            "dbr_unavailable_reason": (
+                "DBR settings and an exact planning_pool_by_warehouse mapping "
+                "are required"
+            ),
+        }
     snapshot_metrics = {
         "candidate_run_ids": list(candidate_ids),
         "candidate_read_snapshot_ids": snapshots,
@@ -275,16 +335,14 @@ def run_obligation_refresh(
         "future_supply_capture": _json_value(capture),
         "freeze_summary": _json_value(freeze),
         "replay_summary": _json_value(replay),
+        **dbr_metrics,
     }
     _complete(snapshot_batch, snapshot_metrics)
-    target = db.get(models.LedgerGeneration, target_id)
-    if target is None or str(target.status) != "building":
-        raise ObligationRefreshOrchestratorError("target generation disappeared during refresh")
-    target.capabilities = dict(_CORE_CAPABILITIES)
+    target.capabilities = dict(capabilities)
     db.flush()
     published = publish_obligation_refresh_batch(
         db, parent_generation_id=int(parent_generation_id), target_generation_id=target_id,
-        accepted_at=_utc(accepted_at), capabilities=dict(_CORE_CAPABILITIES),
+        accepted_at=_utc(accepted_at), capabilities=dict(capabilities),
     )
     return ObligationRefreshOrchestrationResult(
         parent_generation_id=int(parent_generation_id), target_generation_id=target_id,

@@ -23,6 +23,7 @@ CAPABILITY_PHYSICAL_LEDGER = "physical_ledger"
 CAPABILITY_RESERVATION_REPLAY = "reservation_replay"
 CAPABILITY_EXECUTION_ALLOCATIONS = "execution_allocations"
 CAPABILITY_PLANNING_SNAPSHOTS = "planning_snapshots"
+CAPABILITY_DBR_FEEDER_COCKPIT = "dbr_feeder_cockpit"
 
 
 @dataclass(frozen=True)

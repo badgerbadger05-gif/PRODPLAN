@@ -1,7 +1,7 @@
 """Tests for produce_line + one_c_manufacture_export."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, timezone
 
 import pytest
 
@@ -18,6 +18,11 @@ from app.models import (
     ProductionOrderLineState,
     ProductionProduct,
     ProductionStage,
+    PhysicalImportBatch,
+    LedgerGeneration,
+    PlanningRun,
+    PlanningTruthState,
+    MrpRequirement,
     SpecComponent,
     SpecOperation,
     Specification,
@@ -97,6 +102,64 @@ def _mk_product(db, item: Item, *, qty: float = 10.0) -> ProductionProduct:
     )
     db.commit()
     return product
+
+
+def _attach_current_mrp_lineage(db, product: ProductionProduct) -> None:
+    cutoff = datetime(2026, 5, 20, tzinfo=timezone.utc)
+    physical = PhysicalImportBatch(
+        batch_key=f"manufacture-lineage-{product.product_id}",
+        status="completed",
+        cutoff=cutoff,
+        source_watermarks={},
+        completed_at=cutoff,
+    )
+    generation = LedgerGeneration(
+        generation_key=f"manufacture-lineage-{product.product_id}",
+        status="accepted",
+        cutoff=cutoff,
+        accepted_at=cutoff,
+        source_watermarks={},
+        capabilities={
+            "physical_ledger": True,
+            "reservation_replay": True,
+            "execution_allocations": True,
+        },
+        physical_import_batch=physical,
+        algorithm_version="tests/current-lineage",
+    )
+    db.add(generation)
+    db.flush()
+    db.add(PlanningTruthState(id=1, current_generation_id=generation.id))
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        ledger_generation_id=generation.id,
+        ledger_cutoff=cutoff,
+        active_freeze_version=1,
+        period_from=date(2026, 5, 1),
+        period_to=date(2026, 5, 31),
+        config_snapshot={},
+        pinned=True,
+        fixed_at=cutoff,
+        finished_at=cutoff,
+    )
+    db.add(run)
+    db.flush()
+    requirement = MrpRequirement(
+        run_id=run.run_id,
+        item_id=product.item_id,
+        freeze_version=1,
+        planning_stock_pool="default",
+        total_required_qty=product.quantity,
+        net_required_qty=product.quantity,
+        period_from=date(2026, 5, 1),
+        period_to=date(2026, 5, 31),
+    )
+    db.add(requirement)
+    db.flush()
+    product.order.source_run_id = run.run_id
+    product.ledger_generation_id = generation.id
+    product.source_mrp_requirement_id = requirement.id
+    db.commit()
 
 
 def _stock_kit_on_workshop(db, product: ProductionProduct, component: Item, qty: float) -> None:
@@ -763,7 +826,7 @@ def test_chain_auto_exports_parent_order_in_dry_run(db_session):
     m = db_session.query(ProductionManufacture).filter_by(manufacture_id=mid).one()
     m.order.order_ref1c = None
     m.order.source = "mrp"
-    db_session.commit()
+    _attach_current_mrp_lineage(db_session, product)
 
     result = exporter.export_manufactures_to_1c(db_session, [mid], dry_run=True)
 

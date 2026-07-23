@@ -323,6 +323,15 @@ def rebuild_feeder_positions(
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+@router.get("/feeder/cockpit")
+def get_feeder_cockpit(db: Session = Depends(get_db)):
+    """Return one coherent, saved DBR read model for the accepted Ledger."""
+    try:
+        return cockpit_snapshot_service.read_cockpit_snapshot(db)
+    except cockpit_snapshot_service.DbrCockpitSnapshotUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+
+
 @router.get("/feeder/positions")
 def get_feeder_positions(
     include_live_nfp: bool = False,

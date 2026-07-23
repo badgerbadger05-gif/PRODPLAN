@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import date, datetime, timezone
 
 import pytest
 
@@ -14,6 +14,11 @@ from app.models import (
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
+    PhysicalImportBatch,
+    LedgerGeneration,
+    PlanningRun,
+    PlanningTruthState,
+    MrpRequirement,
     SpecComponent,
     Specification,
     SyncLink,
@@ -105,6 +110,64 @@ def _mk_issue(
     )
     db.commit()
     return issue
+
+
+def _attach_current_mrp_lineage(db, product: ProductionProduct) -> None:
+    cutoff = datetime(2026, 5, 20, tzinfo=timezone.utc)
+    physical = PhysicalImportBatch(
+        batch_key=f"transfer-lineage-{product.product_id}",
+        status="completed",
+        cutoff=cutoff,
+        source_watermarks={},
+        completed_at=cutoff,
+    )
+    generation = LedgerGeneration(
+        generation_key=f"transfer-lineage-{product.product_id}",
+        status="accepted",
+        cutoff=cutoff,
+        accepted_at=cutoff,
+        source_watermarks={},
+        capabilities={
+            "physical_ledger": True,
+            "reservation_replay": True,
+            "execution_allocations": True,
+        },
+        physical_import_batch=physical,
+        algorithm_version="tests/current-lineage",
+    )
+    db.add(generation)
+    db.flush()
+    db.add(PlanningTruthState(id=1, current_generation_id=generation.id))
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        ledger_generation_id=generation.id,
+        ledger_cutoff=cutoff,
+        active_freeze_version=1,
+        period_from=date(2026, 5, 1),
+        period_to=date(2026, 5, 31),
+        config_snapshot={},
+        pinned=True,
+        fixed_at=cutoff,
+        finished_at=cutoff,
+    )
+    db.add(run)
+    db.flush()
+    requirement = MrpRequirement(
+        run_id=run.run_id,
+        item_id=product.item_id,
+        freeze_version=1,
+        planning_stock_pool="default",
+        total_required_qty=product.quantity,
+        net_required_qty=product.quantity,
+        period_from=date(2026, 5, 1),
+        period_to=date(2026, 5, 31),
+    )
+    db.add(requirement)
+    db.flush()
+    product.order.source_run_id = run.run_id
+    product.ledger_generation_id = generation.id
+    product.source_mrp_requirement_id = requirement.id
+    db.commit()
 
 
 class _FakeClient:
@@ -302,7 +365,7 @@ def test_chain_auto_exports_parent_order_in_dry_run(db_session):
     # Clear parent's order_ref1c and mark it MRP-source so it's eligible.
     issue.order.order_ref1c = None
     issue.order.source = "mrp"
-    db.commit()
+    _attach_current_mrp_lineage(db, issue.product)
 
     result = exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=True)
 
@@ -355,7 +418,7 @@ def test_chain_full_apply_exports_order_then_transfer(db_session, monkeypatch):
     issue = _mk_issue(db, parent=parent, component=comp, dest_wh="dst-wh")
     issue.order.order_ref1c = None
     issue.order.source = "mrp"
-    db.commit()
+    _attach_current_mrp_lineage(db, issue.product)
 
     fake = _FakeClient(ref_key="stub-key")
     # Both parent-order and transfer exports go through the same fake client.

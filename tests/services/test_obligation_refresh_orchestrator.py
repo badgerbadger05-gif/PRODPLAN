@@ -1,6 +1,6 @@
 """End-to-end contract tests for the caller-owned refresh orchestrator."""
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -8,6 +8,7 @@ import pytest
 from app import models
 from app.services import obligation_refresh_orchestrator as workflow
 from app.services.mrp_result_snapshot import read_mrp_result_manifest
+from app.services.obligation_refresh_publish import ObligationRefreshPublishError
 
 
 def _world(db, *, with_parent=True, qty=5, replenishment_method="Покупка", period_from=date(2026, 8, 1)):
@@ -42,11 +43,12 @@ def _world(db, *, with_parent=True, qty=5, replenishment_method="Покупка"
     return accepted, plan, line, item, parent, cutoff
 
 
-def _run(db, parent, key, *, add=(), config=None):
+def _run(db, parent, key, *, add=(), config=None, pool_mapping=None):
     return workflow.run_obligation_refresh(
         db, parent_generation_id=parent.id, generation_key=key, add_plan_ids=add,
         started_by="test", horizon_days=30, config_version_id=None,
-        config_snapshot=config or {}, planning_pool_by_warehouse={},
+        config_snapshot=config or {},
+        planning_pool_by_warehouse=pool_mapping or {},
         accepted_at=datetime(2026, 7, 24, tzinfo=timezone.utc),
     )
 
@@ -66,14 +68,84 @@ def test_add_only_builds_real_checkpoints_and_promotes_persisted_read_snapshot(d
     assert target.capabilities == {
         "physical_ledger": True, "reservation_replay": True,
         "execution_allocations": True, "planning_snapshots": True,
+        "dbr_feeder_cockpit": False,
     }
     assert {"physical_import", "reservation_materialize", "reservation_replay", "snapshot_build"} == set(by_stage)
     assert all(row.status == "completed" for row in by_stage.values())
     assert by_stage["snapshot_build"].metrics["future_supply_captured"] is True
+    assert by_stage["snapshot_build"].metrics["dbr_cockpit_ready"] is False
     snapshot_id = by_stage["snapshot_build"].metrics["candidate_read_snapshot_ids"][str(candidate.run_id)]
     assert db_session.get(models.PlanningReadSnapshot, snapshot_id).truth_status == "accepted"
     # This public read function consumes the stored snapshot; it does not run MRP.
     assert read_mrp_result_manifest(db_session, candidate.run_id)["run_id"] == candidate.run_id
+
+
+def test_configured_dbr_policy_and_cockpit_publish_atomically(db_session):
+    accepted, plan, _line, _item, _old, _cutoff = _world(
+        db_session, with_parent=False
+    )
+    db_session.add(models.DbrSettings(
+        id=1,
+        w2_warehouse_ref1c="W2",
+        w3_warehouse_ref1c="W3",
+        w4_warehouse_ref1c="W4",
+    ))
+    day = plan.period_from
+    while day <= plan.period_to:
+        db_session.add(models.WorkCalendarDay(date=day, is_workday=True))
+        day += timedelta(days=1)
+    db_session.commit()
+
+    result = _run(
+        db_session,
+        accepted,
+        "orch-add-dbr",
+        add=[plan.id],
+        pool_mapping={"W2": "w2", "W3": "w3", "W4": "default"},
+    )
+    target = db_session.get(models.LedgerGeneration, result.target_generation_id)
+    checkpoint = db_session.query(models.LedgerBuildBatch).filter_by(
+        ledger_generation_id=target.id,
+        stage="snapshot_build",
+    ).one()
+    policy = db_session.get(
+        models.PlanningReadSnapshot,
+        checkpoint.metrics["dbr_policy_snapshot_id"],
+    )
+    cockpit = db_session.get(
+        models.PlanningReadSnapshot,
+        checkpoint.metrics["dbr_cockpit_snapshot_id"],
+    )
+
+    assert target.capabilities["dbr_feeder_cockpit"] is True
+    assert checkpoint.metrics["dbr_cockpit_ready"] is True
+    assert policy.truth_status == cockpit.truth_status == "accepted"
+    assert policy.reason is None and cockpit.reason is None
+    assert cockpit.payload["meta"]["policy_snapshot_id"] == policy.id
+    assert cockpit.payload["meta"]["ledger_generation"] == target.id
+    db_session.commit()
+
+    retry = _run(
+        db_session,
+        accepted,
+        "orch-add-dbr",
+        add=[plan.id],
+        pool_mapping={"W2": "w2", "W3": "w3", "W4": "default"},
+    )
+    assert retry.published is False
+    cockpit.reason = "tampered"
+    db_session.flush()
+    with pytest.raises(
+        ObligationRefreshPublishError,
+        match="mixed or partial",
+    ):
+        _run(
+            db_session,
+            accepted,
+            "orch-add-dbr",
+            add=[plan.id],
+            pool_mapping={"W2": "w2", "W3": "w3", "W4": "default"},
+        )
 
 
 def test_refresh_plus_add_publishes_both_and_supersedes_only_parent(db_session):
@@ -145,6 +217,42 @@ def test_committed_exact_retry_is_publisher_noop_and_changed_request_is_rejected
     assert pointer_retry.published is False
     with pytest.raises(workflow.ObligationRefreshOrchestratorError, match="conflicting retry"):
         _run(db_session, accepted, "orch-retry", add=[plan.id], config={"v": 2})
+
+
+def test_committed_retry_rejects_changed_planning_pool_mapping(db_session):
+    accepted, plan, _line, _item, _old, _cutoff = _world(
+        db_session, with_parent=False
+    )
+    first = _run(
+        db_session,
+        accepted,
+        "orch-pool-retry",
+        add=[plan.id],
+        pool_mapping={"WH-1": "main"},
+    )
+    db_session.commit()
+
+    exact = _run(
+        db_session,
+        accepted,
+        "orch-pool-retry",
+        add=[plan.id],
+        pool_mapping={"WH-1": "main"},
+    )
+    assert exact.target_generation_id == first.target_generation_id
+    assert exact.published is False
+
+    with pytest.raises(
+        workflow.ObligationRefreshOrchestratorError,
+        match="conflicting retry",
+    ):
+        _run(
+            db_session,
+            accepted,
+            "orch-pool-retry",
+            add=[plan.id],
+            pool_mapping={"WH-1": "other"},
+        )
 
 
 def test_stale_parent_is_rejected_before_published_retry(db_session):

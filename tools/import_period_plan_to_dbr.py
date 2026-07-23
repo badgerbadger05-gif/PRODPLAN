@@ -23,15 +23,21 @@ from app.models import (  # noqa: E402
     Item,
     ProductionPlanHeader,
     ProductionPlanLine,
+    PlanningRun,
 )
-from app.services.dbr import program_service  # noqa: E402
+from app.services.dbr import planning_lineage, program_service  # noqa: E402
+from app.services.mrp_mutation_guard import MrpMutationLineageError  # noqa: E402
+from app.services.planning_truth import PlanningTruthUnavailable  # noqa: E402
 
 
-def _report(plan_id: int, *, dry_run: bool, approve: bool) -> dict[str, Any]:
+def _report(
+    plan_id: int, *, dry_run: bool, approve: bool, source_run_id: int | None = None
+) -> dict[str, Any]:
     return {
         "ok": False,
         "mode": "dry-run" if dry_run else "commit",
         "plan_id": plan_id,
+        "source_run_id": source_run_id,
         "approve_requested": approve,
         "existing": False,
         "approved": False,
@@ -82,12 +88,74 @@ def _program_signature(program: DbrProductionProgram) -> list[tuple[int, Any, De
     )
 
 
+def _resolve_source_lineage(
+    db: Session, *, plan_id: int, source_run_id: int | None
+) -> tuple[int, int, int]:
+    """Return one current, accepted fixed run for this exact period plan.
+
+    A legacy period plan is not enough to authorize a DBR program: it must be
+    attached to the current accepted Ledger generation and active freeze.  An
+    explicit run is preferred; implicit selection is allowed only when there
+    is exactly one current candidate for this plan.
+    """
+    if source_run_id is not None:
+        run = db.get(PlanningRun, int(source_run_id))
+        if run is None:
+            raise ValueError(f"source planning run {source_run_id} not found")
+        if int(run.source_plan_id or -1) != int(plan_id):
+            raise ValueError(
+                f"source planning run {source_run_id} belongs to another period plan"
+            )
+        return planning_lineage.current_tuple(
+            db, int(source_run_id), consumer="dbr_period_plan_import"
+        )
+
+    fixed_runs = (
+        db.query(PlanningRun)
+        .filter(
+            PlanningRun.source_plan_id == int(plan_id),
+            PlanningRun.status == "FIXED_SNAPSHOT",
+        )
+        .order_by(PlanningRun.run_id)
+        .all()
+    )
+    current: list[tuple[int, int, int]] = []
+    for run in fixed_runs:
+        try:
+            current.append(
+                planning_lineage.current_tuple(
+                    db, int(run.run_id), consumer="dbr_period_plan_import"
+                )
+            )
+        except (MrpMutationLineageError, PlanningTruthUnavailable):
+            # Historical, stale and incomplete runs are deliberately not a
+            # fallback.  If none (or more than one) match accepted truth the
+            # caller receives a fail-closed report below.
+            continue
+    if not current:
+        raise ValueError(
+            "period plan has no current accepted FIXED_SNAPSHOT; pass --source-run-id"
+        )
+    if len(current) != 1:
+        raise ValueError(
+            "period plan has ambiguous current accepted FIXED_SNAPSHOT runs; "
+            "pass --source-run-id"
+        )
+    return current[0]
+
+
 def import_period_plan(
-    db: Session, *, plan_id: int, dry_run: bool = False, approve: bool = False
+    db: Session,
+    *,
+    plan_id: int,
+    source_run_id: int | None = None,
+    dry_run: bool = False,
+    approve: bool = False,
 ) -> dict[str, Any]:
     """Import a fixed plan, owning commit/rollback and returning a JSON-safe report."""
-    report = _report(plan_id, dry_run=dry_run, approve=approve)
-    marker = f"shadow-import:period-plan:{plan_id}"
+    report = _report(
+        plan_id, dry_run=dry_run, approve=approve, source_run_id=source_run_id
+    )
     try:
         plan = db.get(ProductionPlanHeader, plan_id)
         if plan is None:
@@ -99,6 +167,20 @@ def import_period_plan(
         if plan.period_from is None or plan.period_to is None or plan.period_from > plan.period_to:
             db.rollback()
             return _fail(report, "period plan has invalid dates")
+        try:
+            run_id, generation_id, freeze_version = _resolve_source_lineage(
+                db, plan_id=plan_id, source_run_id=source_run_id
+            )
+        except (ValueError, MrpMutationLineageError, PlanningTruthUnavailable) as exc:
+            db.rollback()
+            return _fail(report, str(exc))
+        report["source_run_id"] = run_id
+        report["ledger_generation_id"] = generation_id
+        report["freeze_version"] = freeze_version
+        marker = (
+            f"shadow-import:period-plan:{plan_id}:run:{run_id}:"
+            f"generation:{generation_id}:freeze:{freeze_version}"
+        )
 
         all_lines = (
             db.query(ProductionPlanLine)
@@ -174,6 +256,9 @@ def import_period_plan(
                 program.title == plan.name
                 and program.from_date == plan.period_from
                 and program.to_date == plan.period_to
+                and int(program.source_run_id or -1) == run_id
+                and int(program.ledger_generation_id or -1) == generation_id
+                and int(program.freeze_version or -1) == freeze_version
             )
             if not same_header or _program_signature(program) != _row_signature(source_rows):
                 db.rollback()
@@ -189,6 +274,7 @@ def import_period_plan(
                 title=plan.name,
                 created_by=marker,
                 items=source_rows,
+                source_run_id=run_id,
             )
             report["counts"]["created_programs"] = 1
             if approve:
@@ -211,6 +297,11 @@ def import_period_plan(
 def main() -> int:
     parser = argparse.ArgumentParser(description="Import one fixed period plan into DBR")
     parser.add_argument("--plan-id", type=int, required=True)
+    parser.add_argument(
+        "--source-run-id",
+        type=int,
+        help="exact current accepted FIXED_SNAPSHOT for this period plan",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--approve", action="store_true")
     args = parser.parse_args()
@@ -218,10 +309,19 @@ def main() -> int:
     db = SessionLocal()
     try:
         report = import_period_plan(
-            db, plan_id=args.plan_id, dry_run=args.dry_run, approve=args.approve
+            db,
+            plan_id=args.plan_id,
+            source_run_id=args.source_run_id,
+            dry_run=args.dry_run,
+            approve=args.approve,
         )
     except Exception as exc:
-        report = _report(args.plan_id, dry_run=args.dry_run, approve=args.approve)
+        report = _report(
+            args.plan_id,
+            dry_run=args.dry_run,
+            approve=args.approve,
+            source_run_id=args.source_run_id,
+        )
         report["errors"].append(f"unexpected {type(exc).__name__}")
     finally:
         db.close()

@@ -237,6 +237,12 @@ def build_generation_projection(
         )
     ).all()
     item_id_by_code = {str(code): int(item_id) for item_id, code in items}
+    missing_item_codes = sorted(set(item_codes) - set(item_id_by_code))
+    if missing_item_codes:
+        raise ValueError(
+            "Ledger projection requested unknown item_code(s): "
+            + ", ".join(repr(code) for code in missing_item_codes)
+        )
     item_ids = sorted(item_id_by_code.values())
     warehouses = sorted(pool_by_warehouse)
 

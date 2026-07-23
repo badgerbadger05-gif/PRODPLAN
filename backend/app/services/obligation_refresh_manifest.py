@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
 import json
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from sqlalchemy.orm import Session
 
@@ -122,6 +122,7 @@ def _payload(
     horizon_days: int | None,
     config_version_id: int | None,
     config_snapshot: dict[str, Any],
+    planning_pool_by_warehouse: dict[str, str],
 ) -> dict[str, Any]:
     return {
         "version": MANIFEST_VERSION,
@@ -131,8 +132,30 @@ def _payload(
             "horizon_days": horizon_days,
             "config_version_id": config_version_id,
             "config_snapshot": config_snapshot,
+            "planning_pool_by_warehouse": planning_pool_by_warehouse,
         },
     }
+
+
+def _normalise_pool_mapping(
+    value: Mapping[str, str] | None,
+) -> dict[str, str]:
+    if value is None:
+        return {}
+    result: dict[str, str] = {}
+    for raw_warehouse, raw_pool in value.items():
+        warehouse = str(raw_warehouse).strip()
+        pool = str(raw_pool).strip()
+        if not warehouse or not pool:
+            raise ObligationRefreshManifestError(
+                "planning_pool_by_warehouse must contain non-empty names"
+            )
+        if warehouse in result and result[warehouse] != pool:
+            raise ObligationRefreshManifestError(
+                f"warehouse {warehouse!r} has conflicting planning pool mappings"
+            )
+        result[warehouse] = pool
+    return {key: result[key] for key in sorted(result)}
 
 
 def _existing_result(
@@ -210,6 +233,7 @@ def create_obligation_refresh_manifest(
     horizon_days: int | None,
     config_version_id: int | None,
     config_snapshot: dict[str, Any],
+    planning_pool_by_warehouse: Mapping[str, str] | None = None,
 ) -> ObligationRefreshManifestResult:
     """Create or exactly retry the sealed refresh/add run set.
 
@@ -220,6 +244,7 @@ def create_obligation_refresh_manifest(
     if not isinstance(config_snapshot, dict):
         raise ObligationRefreshManifestError("config_snapshot must be a mapping")
     add_ids = _normalise_add_ids(add_plan_ids)
+    pool_mapping = _normalise_pool_mapping(planning_pool_by_warehouse)
     parent, target = _require_target(db, parent_generation_id, target_generation_id)
     existing = _existing_result(db, target)
     if existing is not None:
@@ -230,6 +255,7 @@ def create_obligation_refresh_manifest(
             list(existing.entries), add_plan_ids=add_ids,
             horizon_days=horizon_days, config_version_id=config_version_id,
             config_snapshot=deepcopy(config_snapshot),
+            planning_pool_by_warehouse=pool_mapping,
         )
         if _hash(expected) != existing.content_hash:
             raise ObligationRefreshManifestError("conflicting retry of refresh manifest")
@@ -276,6 +302,7 @@ def create_obligation_refresh_manifest(
     payload = _payload(
         entries, add_plan_ids=add_ids, horizon_days=horizon_days,
         config_version_id=config_version_id, config_snapshot=deepcopy(config_snapshot),
+        planning_pool_by_warehouse=pool_mapping,
     )
     content_hash = _hash(payload)
     target.source_watermarks = {

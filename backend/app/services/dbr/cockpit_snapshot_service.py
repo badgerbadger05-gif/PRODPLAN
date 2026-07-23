@@ -17,6 +17,7 @@ from ..planning_truth import (
     CAPABILITY_PHYSICAL_LEDGER,
     CAPABILITY_PLANNING_SNAPSHOTS,
     CAPABILITY_RESERVATION_REPLAY,
+    CAPABILITY_DBR_FEEDER_COCKPIT,
     PlanningTruthUnavailable,
     get_latest_read_snapshot,
     get_truth_state,
@@ -29,6 +30,7 @@ REQUIRED_CAPABILITIES = (
     CAPABILITY_PHYSICAL_LEDGER,
     CAPABILITY_RESERVATION_REPLAY,
     CAPABILITY_PLANNING_SNAPSHOTS,
+    CAPABILITY_DBR_FEEDER_COCKPIT,
 )
 _PAYLOAD_KEYS = ("positions", "signals", "deficits", "processing_board")
 
@@ -90,7 +92,19 @@ def read_cockpit_snapshot(db: Session) -> dict[str, Any]:
             db,
             reason=f"DBR feeder cockpit snapshot {snapshot.id} has invalid payload",
         )
-    return dict(payload)
+    result = dict(payload)
+    meta = dict(result.get("meta") or {})
+    meta.update(
+        {
+            "snapshot_id": int(snapshot.id),
+            "ledger_generation": int(snapshot.ledger_generation_id),
+            "cutoff": snapshot.cutoff.isoformat(),
+            "truth_status": str(snapshot.truth_status),
+            "truth_reason": snapshot.reason,
+        }
+    )
+    result["meta"] = meta
+    return result
 
 
 def _matches(value: Any, expected: Optional[str]) -> bool:

@@ -267,21 +267,38 @@ def test_active_outstanding_reservation_and_coverage_are_ledger_derived(db_sessi
 
 def test_ready_empty_truth_is_zero_not_unavailable_and_order_is_deterministic(db_session):
     generation = _generation(db_session, "empty")
+    _item(db_session, "ITEM-A")
+    _item(db_session, "ITEM-B")
     _publish(db_session, generation)
 
     result = build_ledger_projection(
         db_session,
-        [("MISSING-B", "WH-2"), ("MISSING-A", "WH-1"), ("MISSING-A", "WH-1")],
+        [("ITEM-B", "WH-2"), ("ITEM-A", "WH-1"), ("ITEM-A", "WH-1")],
         {"WH-1": "main", "WH-2": "other"},
     )
 
     assert [row.key for row in result.rows] == [
-        LedgerProjectionKey("MISSING-A", "WH-1"),
-        LedgerProjectionKey("MISSING-B", "WH-2"),
+        LedgerProjectionKey("ITEM-A", "WH-1"),
+        LedgerProjectionKey("ITEM-B", "WH-2"),
     ]
     assert all(row.on_hand == Decimal("0") for row in result.rows)
     assert all(row.inbound == Decimal("0") for row in result.rows)
     assert all(row.obligations == () for row in result.rows)
+
+
+def test_unknown_item_code_fails_closed_before_returning_zero_projection(db_session):
+    generation = _generation(db_session, "unknown-item")
+    _item(db_session, "KNOWN")
+    _publish(db_session, generation)
+
+    with pytest.raises(ValueError, match="unknown item_code\\(s\\)") as raised:
+        build_ledger_projection(
+            db_session,
+            [("KNOWN", "WH-1"), ("MISSING-B", "WH-2"), ("MISSING-A", "WH-3")],
+            {"WH-1": "main", "WH-2": "other", "WH-3": "third"},
+        )
+
+    assert str(raised.value).endswith("'MISSING-A', 'MISSING-B'")
 
 
 def test_building_generation_is_projected_without_current_pointer(db_session):

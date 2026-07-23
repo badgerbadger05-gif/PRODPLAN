@@ -71,6 +71,7 @@ def _accepted_generation(db, suffix: str = "one"):
             planning_truth.CAPABILITY_PHYSICAL_LEDGER: True,
             planning_truth.CAPABILITY_RESERVATION_REPLAY: True,
             planning_truth.CAPABILITY_PLANNING_SNAPSHOTS: True,
+            planning_truth.CAPABILITY_DBR_FEEDER_COCKPIT: True,
         },
     )
     db.add(generation)
@@ -145,6 +146,7 @@ def test_mount_gets_read_snapshot_without_invoking_live_calculators(
     signals = client.get("/api/v1/dbr/feeder/signals", params={"status": "Open"})
     deficits = client.get("/api/v1/dbr/feeder/deficits")
     board = client.get("/api/v1/dbr/feeder/processing/board")
+    cockpit = client.get("/api/v1/dbr/feeder/cockpit")
 
     assert positions.status_code == signals.status_code == 200
     assert deficits.status_code == board.status_code == 200
@@ -152,6 +154,10 @@ def test_mount_gets_read_snapshot_without_invoking_live_calculators(
     assert signals.json()[0]["id"] == 21
     assert deficits.json()["deficits"][0]["short_qty"] == 4
     assert board.json()["positions"][0]["position_id"] == 31
+    assert cockpit.status_code == 200
+    assert cockpit.json()["meta"]["truth_status"] == "accepted"
+    assert cockpit.json()["meta"]["ledger_generation"] is not None
+    assert cockpit.json()["meta"]["snapshot_id"] is not None
 
 
 def test_explicit_builder_fails_closed_without_calling_legacy_calculators(

@@ -50,6 +50,7 @@ def _seal_build(db, target, candidates, cutoff):
                     str(row.run_id): row._test_read_snapshot_id for row in candidates
                 },
                 "future_supply_captured": True,
+                "dbr_cockpit_ready": False,
             }
         db.add(models.LedgerBuildBatch(
             ledger_generation_id=target.id, stage=stage, batch_key=f"{target.id}:{stage}",
