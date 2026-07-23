@@ -983,6 +983,7 @@ def _freeze_one_run(
     now: datetime,
     new_version: int,
     is_include: bool = True,
+    manage_plan_locks: bool = True,
 ) -> Dict[str, Any]:
     """Freeze ONE active run against the shared queue-wide pool (v2 §5/§6.5).
 
@@ -1020,7 +1021,6 @@ def _freeze_one_run(
     # supplier order is self-excluded from the pool, so the exported qty is this
     # run's own coverage — consume it before booking any fresh purchase, and do
     # not delete it. Unexported local recommendations are rebuilt as before.
-    own_exported_left: Dict[int, float] = {}
     if existing_req_by_item:
         exported_purchase_ids = {
             int(source_id)
@@ -1036,15 +1036,6 @@ def _freeze_one_run(
                 .all()
             )
         }
-        if exported_purchase_ids:
-            for iid, total in (
-                db.query(PlannedPurchase.item_id, func.sum(PlannedPurchase.qty))
-                .filter(PlannedPurchase.run_id == int(run.run_id))
-                .filter(PlannedPurchase.purchase_id.in_(exported_purchase_ids))
-                .group_by(PlannedPurchase.item_id)
-                .all()
-            ):
-                own_exported_left[int(iid)] = _to_float(total)
         db.query(PlannedOrderStage).filter(PlannedOrderStage.run_id == int(run.run_id)).delete(synchronize_session=False)
         db.query(PlannedOrder).filter(PlannedOrder.run_id == int(run.run_id)).delete(synchronize_session=False)
         purchase_delete = db.query(PlannedPurchase).filter(PlannedPurchase.run_id == int(run.run_id))
@@ -1065,7 +1056,11 @@ def _freeze_one_run(
         buckets_by_item[item_id][line.bucket_date] = (
             buckets_by_item[item_id].get(line.bucket_date, 0.0) + line_qty
         )
-        line.locked_by_run_id = int(run.run_id)
+        # Candidate snapshots are not published state.  Their source-plan
+        # locks are transferred only by the atomic publisher, never while a
+        # BUILDING_SNAPSHOT is being calculated.
+        if manage_plan_locks:
+            line.locked_by_run_id = int(run.run_id)
 
     # --- Multi-level net-first BOM explosion + stock netting ---
     # gross_map[item_id][bucket_date] = gross qty (before stock)
@@ -1226,16 +1221,6 @@ def _freeze_one_run(
                         remaining_need = max(remaining_need - used, 0.0)
                         trace.by_item[int(iid)].supplier_allocs.append((sup_row, used))
 
-                    # Own already-exported PlannedPurchase (kept over the rebuild)
-                    # is this run's own coverage — consume it before booking any
-                    # fresh purchase. It is NOT written to freeze_allocation (its
-                    # 1C order is self-excluded from the shared supplier pool).
-                    if remaining_need > 1e-9 and own_exported_left.get(int(iid), 0.0) > 1e-12:
-                        avail_own = own_exported_left.get(int(iid), 0.0)
-                        used_own = min(avail_own, remaining_need)
-                        own_exported_left[int(iid)] = avail_own - used_own
-                        remaining_need = max(remaining_need - used_own, 0.0)
-
                     # Full bucket demand is considered covered (by supplier or planned purchase).
                     alloc_total_qty += net_qty
 
@@ -1255,6 +1240,7 @@ def _freeze_one_run(
                             bucket_date=need_date,
                             supplier_ref1c=getattr(item, "supplier_ref1c", None),
                             source_mrp_requirement_id=req_id,
+                            ledger_generation_id=int(run.ledger_generation_id),
                         ))
                         purchase_count += 1
 
@@ -1279,6 +1265,7 @@ def _freeze_one_run(
                         bucket_date=need_date,
                         component_blocked=False,
                         component_partial=False,
+                        ledger_generation_id=int(run.ledger_generation_id),
                     ))
                     rework_count += 1
                     alloc_total_qty += net_qty
@@ -1301,6 +1288,7 @@ def _freeze_one_run(
                         bucket_date=bucket_date,
                         demand_ref=f"mrp_requirement:{req_id}" if req_id else None,
                         demand_date=bucket_date,
+                        ledger_generation_id=int(run.ledger_generation_id),
                     )
                     db.add(order)
                     created_production_orders.append(order)

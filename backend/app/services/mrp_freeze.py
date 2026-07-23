@@ -37,26 +37,38 @@ from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from ..models import (
+    DefaultSpecification,
+    IgnoredWarehouse,
     Item,
+    LedgerGeneration,
+    LedgerFutureSupply,
     MrpFreezeAllocation,
     MrpFreezeBaseline,
     MrpFreezeComponent,
     MrpRequirement,
     PlannedPurchase,
     PlanningRun,
+    PlanningTruthState,
     ProductionOrder,
     ProductionPlanHeader,
+    ProductionPlanLine,
     ProductionProduct,
+    SpecComponent,
     Specification,
+    StockBin,
+    StockWarehouse,
     SupplierOrder,
     SupplierOrderItem,
     SyncLink,
 )
-from .mrp_stock_helpers import (
-    WipSupplyLine,
-    active_wip_supply_by_item,
-    effective_stock_by_item_all,
+from .mrp_stock_helpers import WipSupplyLine
+from .planning_truth import (
+    CAPABILITY_EXECUTION_ALLOCATIONS,
+    CAPABILITY_PHYSICAL_LEDGER,
+    CAPABILITY_RESERVATION_REPLAY,
+    require_accepted_truth,
 )
+from .supplier_order_status import state_counts_in_mrp
 from .replenishment import (
     REPLENISHMENT_FLOW_PURCHASE,
     classify_replenishment_flow,
@@ -70,6 +82,7 @@ __all__ = [
     "ItemFreezeTrace",
     "FreezeTrace",
     "build_shared_pools",
+    "freeze_candidate_snapshots",
     "refreeze_active_snapshots",
 ]
 
@@ -83,6 +96,17 @@ EMPTY_REF = ""
 # Shared with the future run_ledger_cycle so the two never interleave. SQLite is
 # a no-op (single-writer); PG serialises the maintenance operation.
 MRP_LEDGER_LOCK_KEY = 0x4D52504C444752  # "MRPLDGR"
+MRP_REQUIRED_CAPABILITIES = (
+    CAPABILITY_PHYSICAL_LEDGER,
+    CAPABILITY_RESERVATION_REPLAY,
+    CAPABILITY_EXECUTION_ALLOCATIONS,
+)
+
+
+class LedgerPoolUnavailable(RuntimeError):
+    """MRP cannot safely construct a Ledger-native coverage pool."""
+
+    code = "ledger_pool_unavailable"
 
 
 # ---------------------------------------------------------------------------
@@ -252,60 +276,234 @@ def build_shared_pools(
     db: Session,
     active_run_ids: Iterable[int],
     *,
+    ledger_generation_id: int,
+    relevant_item_ids: Optional[Iterable[int]] = None,
+    wip_relevant_item_ids: Optional[Iterable[int]] = None,
     exclude_wip_product_ids: Optional[Iterable[int]] = None,
     exclude_supplier_order_ids: Optional[Iterable[int]] = None,
 ) -> FreezeSharedPools:
-    """Build the three consume-once pools once for the active-run queue.
+    """Build consume-once pools from one exact *candidate* generation only.
 
-    Stock is ``effective_stock_by_item_all`` (the existing pool contour: ignored
-    warehouses excluded); ``stock_initial`` snapshots S0. WIP is the identity
-    loader with own product ids excluded. Supplier supply is loaded for every
-    item that has any open supplier line (a safe superset — consumption only
-    touches purchase-flow items a run actually needs), with the queue-wide cutoff
-    ``max(period_to)`` and own orders excluded; phasing is re-applied per bucket
-    downstream.
+    ``StockBin`` is the copied immutable physical prefix.  WIP and supplier
+    availability is read exclusively from qualified ``LedgerFutureSupply``
+    rows captured for this candidate.  In particular, this function must not
+    look at ``ProductionProduct.remaining_qty`` or supplier-order counters:
+    those are source-system projections, never planning facts.
     """
-    run_ids = [int(r) for r in active_run_ids]
-    stock = effective_stock_by_item_all(db)
+    relevant_ids = {int(i) for i in (relevant_item_ids or ())}
+    stock = _ledger_stock_by_item_all(db, int(ledger_generation_id))
     stock_initial = dict(stock)
-    wip = active_wip_supply_by_item(db, exclude_product_ids=exclude_wip_product_ids)
-
-    supplier: Dict[int, List[Dict[str, Any]]] = {}
-    if run_ids:
-        # Import here to avoid a top-level cycle with period_plan_service.
-        from .period_plan_service import _load_purchase_supplier_remaining
-
-        supplier_item_ids = [
-            int(iid)
-            for (iid,) in db.query(SupplierOrderItem.item_id_ref).distinct().all()
-            if iid is not None
-        ]
-        period_tos = [
-            pt
-            for (pt,) in db.query(PlanningRun.period_to)
-            .filter(PlanningRun.run_id.in_(run_ids))
-            .all()
-            if pt is not None
-        ]
-        req_tos = [
-            pt
-            for (pt,) in db.query(MrpRequirement.period_to)
-            .filter(MrpRequirement.run_id.in_(run_ids))
-            .all()
-            if pt is not None
-        ]
-        candidates = period_tos + req_tos
-        max_period_to = max(candidates) if candidates else date.today()
-        if supplier_item_ids:
-            supplier = _load_purchase_supplier_remaining(
-                db,
-                supplier_item_ids,
-                max_period_to,
-                exclude_order_ids=exclude_supplier_order_ids,
-            )
-    return FreezeSharedPools(
-        stock=stock, stock_initial=stock_initial, wip=wip, supplier=supplier
+    _reject_incompatible_physical_pools(db, int(ledger_generation_id), relevant_ids)
+    future_rows = (
+        db.query(LedgerFutureSupply)
+        .filter(LedgerFutureSupply.ledger_generation_id == int(ledger_generation_id))
+        .filter(LedgerFutureSupply.evidence_status == "exact")
+        .filter(LedgerFutureSupply.open_qty_at_cutoff > EPS)
+        .order_by(
+            LedgerFutureSupply.item_id.asc(),
+            LedgerFutureSupply.eta_date.asc(),
+            LedgerFutureSupply.id.asc(),
+        )
+        .all()
     )
+    wip: Dict[int, List[WipSupplyLine]] = defaultdict(list)
+    supplier: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    for row in future_rows:
+        item_id = int(row.item_id)
+        if relevant_ids and item_id not in relevant_ids:
+            continue
+        # A line without stable source identities cannot be an allocation
+        # source.  The capture adapter should mark it rejected; fail closed if
+        # malformed data bypassed that boundary.
+        if not str(row.source_ref or "").strip() or not str(row.source_line_ref or "").strip():
+            raise LedgerPoolUnavailable(
+                "ledger_pool_unavailable: exact future supply lacks source identity"
+            )
+        if not str(row.planning_stock_pool or "").strip() or not str(row.destination_warehouse_ref1c or "").strip():
+            raise LedgerPoolUnavailable(
+                "ledger_pool_unavailable: exact future supply lacks pool or destination warehouse"
+            )
+        if str(row.planning_stock_pool) != DEFAULT_STOCK_POOL:
+            raise LedgerPoolUnavailable(
+                "ledger_pool_unavailable: MRP cannot mix non-default future-supply pools"
+            )
+        eta = row.eta_date
+        if row.supply_kind == "wip_order":
+            try:
+                local_id = int(row.source_local_id or row.id)
+            except (TypeError, ValueError):
+                local_id = int(row.id)
+            wip[item_id].append(WipSupplyLine(
+                eta=eta,
+                remaining=_to_float(row.open_qty_at_cutoff),
+                fact_at_freeze=_to_float(row.open_qty_at_cutoff),
+                order_id=local_id,
+                order_ref1c=str(row.source_ref),
+                product_id=int(row.id),
+            ))
+        elif row.supply_kind == "supplier_order":
+            supplier[item_id].append({
+                "order_ref1c": str(row.source_ref),
+                "order_id": None,
+                "line_id": int(row.id),
+                "delivery_date": eta or date.min,
+                "remaining_qty": _to_float(row.open_qty_at_cutoff),
+                "fact_at_freeze": _to_float(row.open_qty_at_cutoff),
+            })
+        else:
+            raise LedgerPoolUnavailable(
+                f"ledger_pool_unavailable: unknown future supply kind {row.supply_kind!r}"
+            )
+    for lines in wip.values():
+        lines.sort(key=lambda line: (line.eta or date.min, line.order_ref1c or "", line.product_id))
+    for lines in supplier.values():
+        lines.sort(key=lambda line: (line["delivery_date"], line["order_ref1c"], line["line_id"]))
+    return FreezeSharedPools(
+        stock=stock, stock_initial=stock_initial, wip=dict(wip), supplier=dict(supplier)
+    )
+
+
+def _ledger_stock_by_item_all(db: Session, ledger_generation_id: int) -> Dict[int, float]:
+    """Read planning stock from one exact accepted generation, with no fallback."""
+    ignored_refs = {
+        str(ref)
+        for (ref,) in db.query(IgnoredWarehouse.warehouse_ref1c).all()
+        if ref
+    }
+    warehouse_rows = db.query(
+        StockWarehouse.warehouse_ref1c,
+        StockWarehouse.is_selected,
+        StockWarehouse.is_finished_goods,
+    ).all()
+    selected_refs = {
+        str(ref)
+        for ref, selected, finished in warehouse_rows
+        if ref and bool(selected) and not bool(finished)
+    }
+    finished_refs = {
+        str(ref) for ref, _selected, finished in warehouse_rows if ref and bool(finished)
+    }
+    query = db.query(StockBin.item_id, func.sum(StockBin.on_hand)).filter(
+        StockBin.ledger_generation_id == int(ledger_generation_id)
+    )
+    if warehouse_rows:
+        query = (
+            query.filter(StockBin.warehouse_ref1c.in_(selected_refs))
+            if selected_refs
+            else query.filter(False)
+        )
+    if ignored_refs:
+        query = query.filter(~StockBin.warehouse_ref1c.in_(ignored_refs))
+    if finished_refs:
+        query = query.filter(~StockBin.warehouse_ref1c.in_(finished_refs))
+    return {
+        int(item_id): _to_float(qty)
+        for item_id, qty in query.group_by(StockBin.item_id).all()
+    }
+
+
+def _reject_incompatible_physical_pools(
+    db: Session,
+    ledger_generation_id: int,
+    relevant_item_ids: Set[int],
+) -> None:
+    if not relevant_item_ids:
+        return
+    rows = (
+        db.query(
+            StockBin.item_id,
+            StockBin.characteristic_ref,
+            StockBin.organization_ref,
+        )
+        .filter(
+            StockBin.ledger_generation_id == int(ledger_generation_id),
+            StockBin.item_id.in_(relevant_item_ids),
+            func.abs(StockBin.on_hand) > EPS,
+        )
+        .distinct()
+        .all()
+    )
+    pools: Dict[int, Set[Tuple[str, str]]] = defaultdict(set)
+    for item_id, characteristic_ref, organization_ref in rows:
+        pools[int(item_id)].add(
+            (str(characteristic_ref or ""), str(organization_ref or ""))
+        )
+    incompatible = sorted(
+        item_id
+        for item_id, keys in pools.items()
+        if len(keys) > 1 or any(characteristic or organization for characteristic, organization in keys)
+    )
+    if incompatible:
+        raise LedgerPoolUnavailable(
+            "ledger_pool_unavailable: MRP requirements cannot identify "
+            "characteristic/organization physical pools for items "
+            f"{incompatible}; rebuild with pool-aware obligation schema"
+        )
+
+
+def _reject_legacy_future_supply(
+    db: Session,
+    relevant_item_ids: Set[int],
+    *,
+    wip_item_ids: Optional[Set[int]] = None,
+) -> None:
+    """Until native pool loaders exist, legacy WIP/supplier candidates are unknown."""
+    if not relevant_item_ids:
+        return
+    wip_scope = wip_item_ids if wip_item_ids is not None else relevant_item_ids
+    wip = (
+        db.query(ProductionProduct.product_id)
+        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+        .filter(
+            ProductionProduct.item_id.in_(wip_scope),
+            ProductionOrder.deletion_mark.is_(False),
+            func.coalesce(ProductionProduct.remaining_qty, 0) > EPS,
+        )
+        .first()
+    )
+    supplier_rows = (
+        db.query(SupplierOrderItem.item_id, SupplierOrder.order_state_name)
+        .join(SupplierOrder, SupplierOrder.order_id == SupplierOrderItem.order_id)
+        .filter(
+            SupplierOrderItem.item_id_ref.in_(relevant_item_ids),
+            SupplierOrder.deletion_mark.is_(False),
+            func.coalesce(SupplierOrderItem.remaining_qty, 0) > EPS,
+        )
+        .all()
+    )
+    supplier = next(
+        (row for row in supplier_rows if state_counts_in_mrp(row.order_state_name)),
+        None,
+    )
+    exported = (
+        db.query(SyncLink.source_id)
+        .join(
+            PlannedPurchase,
+            PlannedPurchase.purchase_id == SyncLink.source_id,
+        )
+        .filter(
+            PlannedPurchase.item_id.in_(relevant_item_ids),
+            SyncLink.source_system == "PRODPLAN",
+            SyncLink.source_doctype == "planned_purchase",
+            SyncLink.target_entity == PURCHASE_ORDER_ENTITY,
+            SyncLink.status == "success",
+        )
+        .first()
+    )
+    if wip or supplier or exported:
+        kinds = ", ".join(
+            name
+            for name, candidate in (
+                ("wip", wip),
+                ("supplier", supplier),
+                ("exported_purchase", exported),
+            )
+            if candidate
+        )
+        raise LedgerPoolUnavailable(
+            "ledger_pool_unavailable: Ledger-native future supply loader is "
+            f"not implemented for candidate pools: {kinds}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -327,28 +525,6 @@ def _write_freeze_baseline(
     """
     if not item_ids:
         return 0
-    produced_by_item = {
-        int(iid): _to_float(qty)
-        for iid, qty in (
-            db.query(ProductionProduct.item_id, func.sum(ProductionProduct.produced_qty))
-            .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
-            .filter(ProductionProduct.item_id.in_(item_ids))
-            .filter(ProductionOrder.deletion_mark.is_(False))
-            .group_by(ProductionProduct.item_id)
-            .all()
-        )
-    }
-    received_by_item = {
-        int(iid): _to_float(qty)
-        for iid, qty in (
-            db.query(SupplierOrderItem.item_id_ref, func.sum(SupplierOrderItem.received_qty))
-            .join(SupplierOrder, SupplierOrder.order_id == SupplierOrderItem.order_id)
-            .filter(SupplierOrderItem.item_id_ref.in_(item_ids))
-            .filter(SupplierOrder.deletion_mark.is_(False))
-            .group_by(SupplierOrderItem.item_id_ref)
-            .all()
-        )
-    }
     count = 0
     for iid in item_ids:
         pk = pool_key_for(int(iid))
@@ -362,8 +538,10 @@ def _write_freeze_baseline(
                 planning_stock_pool=pk.planning_stock_pool,
                 frozen_at=now,
                 stock_qty=_to_float(stock_initial.get(int(iid), 0.0)),
-                produced_total=produced_by_item.get(int(iid), 0.0),
-                received_total=received_by_item.get(int(iid), 0.0),
+                # Deprecated diagnostic columns. They must never be populated
+                # from ProductionProduct/SupplierOrderItem legacy counters.
+                produced_total=0.0,
+                received_total=0.0,
                 unit_coef=1.0,
             )
         )
@@ -585,138 +763,167 @@ def refreeze_active_snapshots(
     dry_run: bool = False,
     started_by: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Re-freeze every open FIXED_SNAPSHOT run against one shared pool (v2 §6).
+    """Retired destructive entry point.
 
-    The queue is processed earliest-need-first, consuming stock / WIP / supplier
-    supply once. When ``include_plan_id`` is set (the create-snapshot entry
-    point) that plan's run header is created/refreshed and added to the queue;
-    other runs' headers are untouched. One commit per operation; ``dry_run``
-    rolls the whole queue back after building the report.
+    Recalculating published snapshots used to rewrite fixed runs and append
+    reservations into the accepted Ledger generation.  That is no longer a
+    valid operation.  The caller must first fork an obligation generation and
+    build explicit ``BUILDING_SNAPSHOT`` run headers, then call
+    :func:`freeze_candidate_snapshots`.
     """
-    if db.get_bind().dialect.name == "postgresql":
-        db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": MRP_LEDGER_LOCK_KEY})
+    raise LedgerPoolUnavailable(
+        "refreeze_active_snapshots is retired; freeze explicit BUILDING_SNAPSHOT candidates"
+    )
 
-    now = datetime.now(timezone.utc)
-    from .period_plan_service import _freeze_one_run, _prepare_include_run
 
-    active_run_ids: List[int] = [int(r) for r in _latest_active_snapshot_run_ids(db)]
-    include_run_id: Optional[int] = None
-    if include_plan_id is not None:
-        include_run = _prepare_include_run(db, int(include_plan_id), started_by, now)
-        include_run_id = int(include_run.run_id)
-        if include_run_id not in active_run_ids:
-            active_run_ids.append(include_run_id)
+def freeze_candidate_snapshots(
+    db: Session,
+    *,
+    parent_generation_id: int,
+    target_generation_id: int,
+    candidate_run_ids: Iterable[int],
+) -> Dict[str, Any]:
+    """Materialize fresh MRP rows only into an obligation-refresh candidate.
 
-    active_run_ids = sorted({int(r) for r in active_run_ids})
-    frozen_at = now.isoformat()
-    if not active_run_ids:
-        return {
-            "status": "ok",
-            "dry_run": bool(dry_run),
-            "frozen_at": frozen_at,
-            "order": [],
-            "results": [],
-            "totals": {},
-        }
+    Parents remain published and byte-for-byte untouched until the separate
+    publish transaction supersedes them.  This function owns no implicit
+    candidate discovery and performs no commit on failure; the refresh worker
+    supplies the exact parent/target/candidate manifest.
+    """
+    parent_id = int(parent_generation_id)
+    target_id = int(target_generation_id)
+    requested_ids = sorted({int(value) for value in candidate_run_ids})
+    if not requested_ids:
+        raise LedgerPoolUnavailable("candidate freeze requires candidate run ids")
+
+    parent = db.get(LedgerGeneration, parent_id)
+    target = db.get(LedgerGeneration, target_id)
+    truth = db.get(PlanningTruthState, 1)
+    if parent is None or str(parent.status) != "accepted" or truth is None or int(truth.current_generation_id or 0) != parent_id:
+        raise LedgerPoolUnavailable("candidate freeze parent is not the current accepted Ledger generation")
+    if target is None or str(target.status) != "building":
+        raise LedgerPoolUnavailable("candidate freeze target must be a BUILDING Ledger generation")
+    marks = dict(target.source_watermarks or {})
+    if marks.get("generation_kind") != "obligation_refresh" or marks.get("parent_generation_id") != parent_id:
+        raise LedgerPoolUnavailable("candidate freeze target does not descend from accepted generation")
+    if target.cutoff != parent.cutoff or target.physical_import_batch_id != parent.physical_import_batch_id:
+        raise LedgerPoolUnavailable("candidate freeze target does not share immutable physical prefix")
 
     runs = {
-        int(r.run_id): r
-        for r in db.query(PlanningRun).filter(PlanningRun.run_id.in_(active_run_ids)).all()
+        int(run.run_id): run
+        for run in db.query(PlanningRun).filter(PlanningRun.run_id.in_(requested_ids)).all()
     }
-    plan_ids = {
-        int(r.source_plan_id) for r in runs.values() if r.source_plan_id is not None
+    if set(runs) != set(requested_ids):
+        raise LedgerPoolUnavailable("candidate freeze manifest names missing PlanningRun rows")
+    parent_run_ids: Set[int] = set()
+    for run in runs.values():
+        if str(run.status) != "BUILDING_SNAPSHOT" or int(run.ledger_generation_id or 0) != target_id:
+            raise LedgerPoolUnavailable("candidate freeze runs must be BUILDING_SNAPSHOT rows on target")
+        if run.prior_run_id is None:
+            raise LedgerPoolUnavailable("candidate freeze run lacks fixed parent")
+        old = db.get(PlanningRun, int(run.prior_run_id))
+        if old is None or str(old.status) != FIXED_SNAPSHOT_STATUS or int(old.ledger_generation_id or 0) != parent_id:
+            raise LedgerPoolUnavailable("candidate freeze parent run is not a fixed current-generation snapshot")
+        if old.source_plan_id != run.source_plan_id:
+            raise LedgerPoolUnavailable("candidate freeze source plan differs from parent")
+        parent_run_ids.add(int(old.run_id))
+        # Rebuild is deliberately only for an empty candidate.  Retrying a
+        # partial candidate risks preserving stale derived rows.
+        if db.query(MrpRequirement.id).filter(MrpRequirement.run_id == int(run.run_id)).first():
+            raise LedgerPoolUnavailable("candidate freeze run already has derived requirements")
+
+    plans = {
+        int(plan.id): plan
+        for plan in db.query(ProductionPlanHeader)
+        .filter(ProductionPlanHeader.id.in_([int(run.source_plan_id) for run in runs.values()]))
+        .all()
     }
-    plans = (
-        {
-            int(p.id): p
-            for p in db.query(ProductionPlanHeader)
-            .filter(ProductionPlanHeader.id.in_(plan_ids))
+    if len(plans) != len(runs):
+        raise LedgerPoolUnavailable("candidate freeze source plan is missing")
+
+    relevant_item_ids = _relevant_item_ids_for_plans(db, set(plans))
+    pools = build_shared_pools(
+        db, requested_ids, ledger_generation_id=target_id,
+        relevant_item_ids=relevant_item_ids,
+    )
+    from .period_plan_service import _freeze_one_run
+    now = datetime.now(timezone.utc)
+    results: List[Dict[str, Any]] = []
+    for run_id in sorted(requested_ids, key=lambda rid: (runs[rid].period_from or date.min, runs[rid].period_to or date.max, rid)):
+        run = runs[run_id]
+        run.ledger_cutoff = target.cutoff
+        trace = FreezeTrace()
+        result = _freeze_one_run(
+            db, run, plans[int(run.source_plan_id)], shared_pools=pools,
+            trace=trace, now=now, new_version=1, is_include=True,
+            manage_plan_locks=False,
+        )
+        results.append(result)
+
+    from .item_ledger.reservation_ledger import materialize_reservations_for_freeze
+    materialize_reservations_for_freeze(
+        db, requested_ids, ledger_generation_id=target_id,
+    )
+    if int(db.get(PlanningTruthState, 1).current_generation_id or 0) != parent_id:
+        raise LedgerPoolUnavailable("accepted Ledger pointer changed during candidate freeze")
+    # The refresh coordinator owns the outer atomic transaction: this executor
+    # deliberately exposes its writes with flush but never commits or rolls
+    # back, including when a later publish validation fails.
+    db.flush()
+    return {
+        "status": "ok", "ledger_generation_id": target_id,
+        "parent_generation_id": parent_id, "order": requested_ids, "results": results,
+    }
+
+
+def _relevant_item_ids_for_plans(db: Session, plan_ids: Set[int]) -> Set[int]:
+    """Conservative BOM closure used only for pre-write pool validation."""
+    if not plan_ids:
+        return set()
+    relevant = {
+        int(item_id)
+        for (item_id,) in db.query(ProductionPlanLine.item_id)
+        .filter(
+            ProductionPlanLine.plan_id.in_(plan_ids),
+            ProductionPlanLine.qty > 0,
+        )
+        .distinct()
+        .all()
+    }
+    frontier = set(relevant)
+    while frontier:
+        spec_rows = (
+            db.query(DefaultSpecification.item_id, DefaultSpecification.spec_id)
+            .filter(DefaultSpecification.item_id.in_(frontier))
+            .all()
+        )
+        spec_ids = {int(spec_id) for _item_id, spec_id in spec_rows}
+        if not spec_ids:
+            break
+        children = {
+            int(item_id)
+            for (item_id,) in db.query(SpecComponent.item_id)
+            .filter(SpecComponent.spec_id.in_(spec_ids))
+            .distinct()
             .all()
         }
-        if plan_ids
-        else {}
-    )
+        frontier = children - relevant
+        relevant.update(children)
+    return relevant
 
-    ordered_ids = sorted(
-        active_run_ids,
-        key=lambda rid: (
-            runs[rid].period_from or date.min,
-            runs[rid].period_to or date.max,
-            int(rid),
-        ),
-    )
 
-    # Exclusion sets are built over the FULL active set BEFORE the pools.
-    own_wip = _own_wip_product_ids(db, active_run_ids)
-    own_sup = _own_supplier_order_ids(db, active_run_ids)
-    pools = build_shared_pools(
-        db,
-        active_run_ids,
-        exclude_wip_product_ids=own_wip,
-        exclude_supplier_order_ids=own_sup,
-    )
-
-    results: List[Dict[str, Any]] = []
-    for rid in ordered_ids:
-        run = runs[rid]
-        plan = (
-            plans.get(int(run.source_plan_id)) if run.source_plan_id is not None else None
-        )
-        if plan is None:
-            continue
-        new_version = _next_freeze_version(db, run)
-        trace = FreezeTrace()
-        res = _freeze_one_run(
-            db,
-            run,
-            plan,
-            shared_pools=pools,
-            trace=trace,
-            now=now,
-            new_version=new_version,
-            is_include=(rid == include_run_id),
-        )
-        results.append(res)
-
-    # Inc4 (PURE SHADOW, §2.6 / §11): every _write_freeze_allocation has now run,
-    # so mirror the fresh MrpFreezeAllocation rows into the reservation ledger —
-    # materialize reservation_entry + open/amend events and copy the frozen pins
-    # into reservation_coverage (pin_kind='frozen'). Dual-write only: the old
-    # table stays the read source. Wrapped so any failure logs and NEVER breaks
-    # the freeze (the freeze result above is unchanged whether this runs or not).
-    try:
-        from .item_ledger.reservation_ledger import materialize_reservations_for_freeze
-
-        materialize_reservations_for_freeze(db, active_run_ids)
-    except Exception:  # noqa: BLE001 — shadow must never break the freeze
-        import logging
-
-        logging.getLogger(__name__).exception(
-            "Inc4 reservation shadow (freeze) failed; continuing (freeze unaffected)"
-        )
-
-    if dry_run:
-        db.rollback()
-    else:
-        db.commit()
-
-    totals = {
-        "runs": len(results),
-        "requirement_count": sum(int(r.get("requirement_count", 0)) for r in results),
-        "production_count": sum(int(r.get("production_count", 0)) for r in results),
-        "purchase_count": sum(int(r.get("purchase_count", 0)) for r in results),
-        "rework_count": sum(int(r.get("rework_count", 0)) for r in results),
-        "baseline_rows": sum(int(r.get("baseline_rows", 0)) for r in results),
-        "allocation_rows": sum(int(r.get("allocation_rows", 0)) for r in results),
-        "component_rows": sum(int(r.get("component_rows", 0)) for r in results),
-    }
+def _root_item_ids_for_plans(db: Session, plan_ids: Set[int]) -> Set[int]:
+    if not plan_ids:
+        return set()
     return {
-        "status": "ok",
-        "dry_run": bool(dry_run),
-        "frozen_at": frozen_at,
-        "order": [int(r) for r in ordered_ids],
-        "results": results,
-        "totals": totals,
+        int(item_id)
+        for (item_id,) in db.query(ProductionPlanLine.item_id)
+        .filter(
+            ProductionPlanLine.plan_id.in_(plan_ids),
+            ProductionPlanLine.qty > 0,
+        )
+        .distinct()
+        .all()
     }
 
 
