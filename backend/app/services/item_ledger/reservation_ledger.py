@@ -259,6 +259,98 @@ def _fold_entry(db: Session, entry: models.ReservationEntry) -> Tuple[Decimal, D
     return fold.reserved_qty, fold.realized_qty, fold.outstanding
 
 
+def _entry_events(db: Session, entry: models.ReservationEntry) -> List[models.ReservationEvent]:
+    return (
+        db.query(models.ReservationEvent)
+        .filter(models.ReservationEvent.reservation_id == int(entry.id))
+        .order_by(models.ReservationEvent.id.asc())
+        .all()
+    )
+
+
+# ---------------------------------------------------------------------------
+# §6.1 (последняя строка матрицы) / §8 — unrealize-компенсация при
+# замене-по-регистратору (Д2)
+# ---------------------------------------------------------------------------
+def unrealize_replaced_sle(
+    db: Session,
+    sle_ids: Sequence[int],
+    recorder_ref: str = "",
+) -> int:
+    """Compensate realize events whose SLE rows are about to be REPLACED.
+
+    Replace-by-recorder (ingest §3а step 4) deletes the recorder's SLE rows and
+    inserts fresh ones with NEW ids; the FK ``reservation_event.sle_id`` is ON
+    DELETE SET NULL, so without compensation the applied-mark is lost and the
+    fresh rows would realize AGAIN — doubling ``realized_qty`` and closing the
+    reserve prematurely. Per design §6.1 (last matrix row) / §8 this appends a
+    compensating ``unrealize`` (realized_delta = −realize.realized_delta) for
+    every realize event referencing the replaced SLE ids; the fresh SLE rows are
+    then re-matched by the regular :func:`realize_from_sle` pass.
+
+    MUST be called BEFORE the SLE delete (while ``sle_id`` still resolves).
+    Idempotent: keyed by the compensated realize event's id (each generation of
+    the recorder's rows produces new realize events, so one compensation per
+    realize event is exactly the per-generation semantics). A reserve that was
+    closed by the compensated realize and whose fold no longer satisfies
+    realized ≥ reserved is re-opened (``reopen`` event, status → active).
+    Returns the number of unrealize events written.
+    """
+    ids = [int(i) for i in sle_ids or []]
+    if not ids:
+        return 0
+    realize_events = (
+        db.query(models.ReservationEvent)
+        .filter(
+            models.ReservationEvent.sle_id.in_(ids),
+            models.ReservationEvent.event_kind == "realize",
+        )
+        .order_by(models.ReservationEvent.id.asc())
+        .all()
+    )
+    if not realize_events:
+        return 0
+    written = 0
+    touched: Set[int] = set()
+    for ev in realize_events:
+        entry = db.get(models.ReservationEntry, int(ev.reservation_id))
+        if entry is None:
+            continue
+        wrote = _append_event(
+            db, entry,
+            event_kind="unrealize",
+            idempotency_key=f"unrealize:{int(ev.reservation_id)}:{int(ev.id)}",
+            realized_delta=-_dec(ev.realized_delta),
+            fact_ref=str(recorder_ref or ev.fact_ref or ""),
+            fact_line_ref=str(ev.fact_line_ref or ""),
+            match_rule=str(ev.match_rule or ""),
+            cycle_id=f"replace:{recorder_ref}"[:64],
+        )
+        if wrote:
+            written += 1
+        touched.add(int(entry.id))
+        # closed by this realize and no longer satisfied → reopen (design §6.2).
+        fold = fold_reservation_events(_entry_events(db, entry))
+        if (
+            str(entry.lifecycle_status) == "closed"
+            and fold.realized_qty + EPS < fold.reserved_qty
+        ):
+            _append_event(
+                db, entry,
+                event_kind="reopen",
+                idempotency_key=f"reopen:{int(entry.id)}:unrealize:{int(ev.id)}",
+                fact_ref=str(recorder_ref or ""),
+                cycle_id=f"replace:{recorder_ref}"[:64],
+            )
+            entry.lifecycle_status = "active"
+            entry.closed_at = None
+    for eid in touched:
+        entry = db.get(models.ReservationEntry, int(eid))
+        if entry is not None:
+            _fold_entry(db, entry)
+    return written
+
+
 # ---------------------------------------------------------------------------
 # §2.2/§11 — backfill: materialize entries + open/amend events
 # ---------------------------------------------------------------------------

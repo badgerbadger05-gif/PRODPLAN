@@ -378,6 +378,27 @@ def pull_recorder_movements(
         for r in existing_key_rows
     }
 
+    # Д2 (design §6.1 last matrix row / §8): the delete below replaces this
+    # recorder's SLE rows with fresh ids; realize events referencing the old
+    # rows lose their applied-mark (FK sle_id ON DELETE SET NULL) and the fresh
+    # rows would realize AGAIN — doubling realized_qty. Compensate with
+    # unrealize events BEFORE the delete, while sle_id still resolves; the new
+    # rows are then re-matched by the regular realize_from_sle pass.
+    replaced_sle_ids = [
+        int(sid)
+        for (sid,) in session.query(models.StockLedgerEntry.id)
+        .filter(
+            models.StockLedgerEntry.recorder_type == recorder_type,
+            models.StockLedgerEntry.recorder_ref == recorder_ref,
+            models.StockLedgerEntry.ingest_source == INGEST_SOURCE,
+        )
+        .all()
+    ]
+    if replaced_sle_ids:
+        from .reservation_ledger import unrealize_replaced_sle
+
+        unrealize_replaced_sle(session, replaced_sle_ids, recorder_ref)
+
     result.deleted = (
         session.query(models.StockLedgerEntry)
         .filter(
