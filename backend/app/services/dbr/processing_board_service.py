@@ -23,8 +23,9 @@ from ...models import (
     Item,
 )
 from . import feeder_nfp_service
-from .processing_supplier_orders import processing_order_rows
+from .processing_supplier_orders import processing_history_rows, processing_order_rows
 from .settings_service import get_or_create_settings
+from ..processing_stock_sync import processing_stock_status, processing_stock_totals
 
 
 def _age_days(order_date: Any, today: date) -> int | None:
@@ -32,6 +33,33 @@ def _age_days(order_date: Any, today: date) -> int | None:
         return None
     value = order_date.date() if isinstance(order_date, datetime) else order_date
     return (today - value).days
+
+
+def _roundtrip_kpi(rows: list[dict[str, Any]], limit_days: int) -> dict[str, Any]:
+    """Aggregate the document-date round-trip proxy, weighted by received qty."""
+    valid = [row for row in rows if row["duration_days"] is not None]
+    completed_qty = sum(float(row["received_qty"]) for row in valid)
+    weighted_days = sum(
+        float(row["duration_days"]) * float(row["received_qty"]) for row in valid
+    )
+    order_ids = {int(row["order_id"]) for row in valid}
+    within = [row for row in valid if int(row["duration_days"]) <= limit_days]
+    return {
+        "semantics": "processing_report_date - processing_transfer_date; received_qty weighted",
+        "eligible_rows": len(rows),
+        "completed_rows": len(valid),
+        "completed_orders": len(order_ids),
+        "completed_qty": round(completed_qty, 4),
+        "weighted_avg_days": (
+            round(weighted_days / completed_qty, 2) if completed_qty > 0 else None
+        ),
+        "max_days": max((int(row["duration_days"]) for row in valid), default=None),
+        "within_roundtrip_rows": len(within),
+        "within_roundtrip_qty": round(
+            sum(float(row["received_qty"]) for row in within), 4
+        ),
+        "invalid_date_rows": sum(bool(row["invalid_dates"]) for row in rows),
+    }
 
 
 def processing_board(db: Session, *, today: date | None = None) -> dict[str, Any]:
@@ -50,6 +78,7 @@ def processing_board(db: Session, *, today: date | None = None) -> dict[str, Any
     live = feeder_nfp_service.live_nfp_rows(db, positions)
 
     item_ids = sorted({int(row.item_id) for row in positions})
+    at_contractor_by_item = processing_stock_totals(db, set(item_ids))
     orders_by_item: dict[int, list[dict[str, Any]]] = {}
     if item_ids:
         for line, order in processing_order_rows(db, item_ids):
@@ -87,6 +116,36 @@ def processing_board(db: Session, *, today: date | None = None) -> dict[str, Any
                 }
             )
 
+    kpi_rows_by_item: dict[int, list[dict[str, Any]]] = {}
+    kpi_rows_by_contractor: dict[int, list[dict[str, Any]]] = {}
+    contractor_meta: dict[int, dict[str, Any]] = {}
+    for line, order, supplier in processing_history_rows(db, item_ids):
+        received_qty = float(line.received_qty or 0)
+        transfer = order.processing_transfer_date
+        report = order.processing_report_date
+        duration = None
+        invalid_dates = False
+        if received_qty > 0 and transfer is not None and report is not None:
+            duration = (report.date() - transfer.date()).days
+            if duration < 0:
+                duration = None
+                invalid_dates = True
+        metric_row = {
+            "order_id": int(order.order_id),
+            "received_qty": received_qty,
+            "duration_days": duration,
+            "invalid_dates": invalid_dates,
+        }
+        item_id = int(line.item_id_ref)
+        supplier_id = int(supplier.supplier_id)
+        kpi_rows_by_item.setdefault(item_id, []).append(metric_row)
+        kpi_rows_by_contractor.setdefault(supplier_id, []).append(metric_row)
+        contractor_meta[supplier_id] = {
+            "supplier_id": supplier_id,
+            "supplier_ref1c": str(supplier.supplier_ref1c or ""),
+            "supplier_name": str(supplier.supplier_name or ""),
+        }
+
     rows: list[dict[str, Any]] = []
     overdue_positions = 0
     for position in positions:
@@ -115,16 +174,48 @@ def processing_board(db: Session, *, today: date | None = None) -> dict[str, Any
                 "stock_qty": nfp.get("stock_qty"),
                 "open_supply_qty": nfp.get("open_supply_qty"),
                 "chain_supply_qty": nfp.get("chain_supply_qty"),
+                # Kept separate from NFP/open_supply_qty: supplier-order
+                # remaining quantity and the balance register can describe the
+                # same processing pipe and must not be added together.
+                "at_contractor_qty": at_contractor_by_item.get(
+                    int(position.item_id), 0.0
+                ),
                 "is_complete": nfp.get("is_complete"),
                 "missing_reasons": nfp.get("missing_reasons") or [],
                 "open_orders": orders,
                 "has_overdue": has_overdue,
+                "roundtrip_kpi": _roundtrip_kpi(
+                    kpi_rows_by_item.get(int(position.item_id), []), limit_days
+                ),
+            }
+        )
+
+    contractor_kpis = []
+    for supplier_id in sorted(
+        kpi_rows_by_contractor,
+        key=lambda value: (
+            contractor_meta[value]["supplier_name"].casefold(),
+            value,
+        ),
+    ):
+        contractor_kpis.append(
+            {
+                **contractor_meta[supplier_id],
+                "roundtrip_kpi": _roundtrip_kpi(
+                    kpi_rows_by_contractor[supplier_id], limit_days
+                ),
             }
         )
 
     return {
         "roundtrip_limit_days": limit_days,
+        "roundtrip_kpi_semantics": (
+            "Proxy from synced 1C document dates: processing_report_date minus "
+            "processing_transfer_date, weighted by positive received_qty"
+        ),
         "positions": rows,
+        "contractors": contractor_kpis,
+        "processing_stock": processing_stock_status(db),
         "positions_total": len(rows),
         "overdue_positions": overdue_positions,
         "generated_at": datetime.now().isoformat(),

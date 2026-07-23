@@ -28,6 +28,87 @@ def compile_jsonb(element, compiler, **kw):
 BigIntPK = BigInteger().with_variant(Integer(), "sqlite")
 
 
+class PlanningComparisonBatch(Base):
+    """One immutable comparison attempt between stable and shadow contours."""
+    __tablename__ = "planning_comparison_batch"
+    __table_args__ = (
+        UniqueConstraint("capture_key", name="uq_planning_comparison_batch_capture_key"),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    capture_key = Column(String(128), nullable=False)
+    stable_base_url = Column(String(512), nullable=False)
+    cutoff_grade = Column(String(16), nullable=False)
+    cutoff_reason = Column(TEXT, nullable=True)
+    stable_run_key = Column(String(128), nullable=True)
+    shadow_run_key = Column(String(128), nullable=True)
+    metrics = Column(CrossPlatformJSON, nullable=False, default=dict)
+    created_at = Column(TIMESTAMP, nullable=False, server_default=func.now())
+
+
+class PlanningComparisonEvent(Base):
+    """Append-only audit trail for capture lifecycle."""
+    __tablename__ = "planning_comparison_event"
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    batch_id = Column(BigInteger, ForeignKey("planning_comparison_batch.id", ondelete="RESTRICT"), nullable=False, index=True)
+    event_type = Column(String(64), nullable=False)
+    payload = Column(CrossPlatformJSON, nullable=False, default=dict)
+    created_at = Column(TIMESTAMP, nullable=False, server_default=func.now())
+
+
+class PlanningComparisonSnapshot(Base):
+    """Raw, hashed source payload retained for reproducibility."""
+    __tablename__ = "planning_comparison_snapshot"
+    __table_args__ = (
+        UniqueConstraint("batch_id", "contour", "snapshot_kind", name="uq_planning_comparison_snapshot_axis"),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    batch_id = Column(BigInteger, ForeignKey("planning_comparison_batch.id", ondelete="RESTRICT"), nullable=False, index=True)
+    contour = Column(String(16), nullable=False)
+    snapshot_kind = Column(String(32), nullable=False)
+    raw_payload_hash = Column(String(64), nullable=False)
+    payload = Column(CrossPlatformJSON, nullable=False)
+    captured_at = Column(TIMESTAMP, nullable=False, server_default=func.now())
+
+
+class PlanningComparisonRow(Base):
+    """Canonical result row; never uses a contour-local numeric identifier."""
+    __tablename__ = "planning_comparison_row"
+    __table_args__ = (
+        UniqueConstraint("batch_id", "contour", "result_kind", "canonical_key", name="uq_planning_comparison_row_axis"),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    batch_id = Column(BigInteger, ForeignKey("planning_comparison_batch.id", ondelete="RESTRICT"), nullable=False, index=True)
+    contour = Column(String(16), nullable=False)
+    result_kind = Column(String(16), nullable=False)
+    canonical_key = Column(String(768), nullable=False)
+    item_key = Column(String(128), nullable=False, index=True)
+    bucket_date = Column(Date, nullable=True)
+    quantity = Column(DECIMAL(24, 6), nullable=False)
+    raw_payload_hash = Column(String(64), nullable=False)
+    payload = Column(CrossPlatformJSON, nullable=False)
+
+
+class PlanningComparisonDiff(Base):
+    __tablename__ = "planning_comparison_diff"
+    __table_args__ = (
+        UniqueConstraint("batch_id", "result_kind", "canonical_key", name="uq_planning_comparison_diff_axis"),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    batch_id = Column(BigInteger, ForeignKey("planning_comparison_batch.id", ondelete="RESTRICT"), nullable=False, index=True)
+    result_kind = Column(String(16), nullable=False)
+    canonical_key = Column(String(768), nullable=False)
+    item_key = Column(String(128), nullable=False, index=True)
+    stable_quantity = Column(DECIMAL(24, 6), nullable=False)
+    shadow_quantity = Column(DECIMAL(24, 6), nullable=False)
+    delta_quantity = Column(DECIMAL(24, 6), nullable=False)
+    classification = Column(String(24), nullable=False)
+
+
 class ProductionStage(Base):
     __tablename__ = "production_stages"
 
@@ -127,6 +208,50 @@ class ItemWarehouseStock(Base):
         onupdate=func.now(),
         nullable=False,
     )
+
+
+class ProcessingContractorStock(Base):
+    """Current 1C balance of customer-owned stock held by a processor."""
+    __tablename__ = "processing_contractor_stock"
+    __table_args__ = (
+        UniqueConstraint(
+            "item_id",
+            "contractor_ref1c",
+            "order_ref1c",
+            "order_type",
+            "transfer_type",
+            name="uq_processing_contractor_stock_axis",
+        ),
+        CheckConstraint("qty >= 0", name="ck_processing_contractor_stock_qty_nonnegative"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    item_id = Column(
+        Integer,
+        ForeignKey("items.item_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    contractor_ref1c = Column(String(36), nullable=False, default="", server_default="", index=True)
+    order_ref1c = Column(String(36), nullable=False, default="", server_default="", index=True)
+    order_type = Column(String(255), nullable=False, default="", server_default="")
+    transfer_type = Column(String(255), nullable=False, default="", server_default="")
+    qty = Column(DECIMAL(15, 3), nullable=False, default=0, server_default="0")
+    synced_at = Column(TIMESTAMP, nullable=False, default=func.now(), server_default=func.now())
+
+
+class ProcessingStockSyncState(Base):
+    """One-row health record for the processing-stock snapshot."""
+    __tablename__ = "processing_stock_sync_state"
+
+    id = Column(Integer, primary_key=True, default=1)
+    status = Column(String(20), nullable=False, default="never", server_default="never")
+    last_attempt_at = Column(TIMESTAMP, nullable=True)
+    last_success_at = Column(TIMESTAMP, nullable=True)
+    rows_seen = Column(Integer, nullable=False, default=0, server_default="0")
+    rows_stored = Column(Integer, nullable=False, default=0, server_default="0")
+    unmatched_items = Column(Integer, nullable=False, default=0, server_default="0")
+    last_error = Column(TEXT, nullable=True)
 
 
 class Unit(Base):
@@ -257,6 +382,13 @@ class ProductionProduct(Base):
             postgresql_where=text("source_planned_order_id IS NOT NULL"),
             sqlite_where=text("source_planned_order_id IS NOT NULL"),
         ),
+        Index(
+            "ux_production_products_source_dbr_signal",
+            "source_dbr_signal_id",
+            unique=True,
+            postgresql_where=text("source_dbr_signal_id IS NOT NULL"),
+            sqlite_where=text("source_dbr_signal_id IS NOT NULL"),
+        ),
     )
 
     product_id = Column(Integer, primary_key=True, index=True)
@@ -279,6 +411,14 @@ class ProductionProduct(Base):
         Integer,
         ForeignKey('planned_order.order_id', ondelete="SET NULL"),
         nullable=True,
+    )
+    # DBR feeder signals materialize into the same local production journal.
+    # The partial unique index makes that projection idempotent.
+    source_dbr_signal_id = Column(
+        Integer,
+        ForeignKey('dbr_feeder_signal.id', ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
     # When this line was generated from a period-plan MRP snapshot, points to
     # the mrp_requirement row it satisfies. NULL for 1C-synced and legacy-MRP

@@ -313,6 +313,65 @@ def test_processing_board_overdue_roundtrip_alert(db_session):
     assert row["zone"] is not None
 
 
+def test_processing_board_roundtrip_kpi_is_received_qty_weighted_proxy(db_session):
+    db = db_session
+    schedule, coated, _bare = _processing_scenario(db)
+    _processing_position(db, coated, schedule)
+    supplier = _processing_supplier(db)
+    orders = [
+        SupplierOrder(
+            order_number="DONE-2", order_date=datetime(2026, 7, 1),
+            order_ref1c="done-2", supplier_id=supplier.supplier_id,
+            operation_name="ЗаказНаПереработку", is_posted=True, deletion_mark=False,
+            processing_transfer_date=datetime(2026, 7, 2),
+            processing_report_date=datetime(2026, 7, 4),
+            order_state_name="Завершён",
+        ),
+        SupplierOrder(
+            order_number="DONE-20", order_date=datetime(2026, 7, 1),
+            order_ref1c="done-20", supplier_id=supplier.supplier_id,
+            operation_name="ЗаказНаПереработку", is_posted=True, deletion_mark=False,
+            processing_transfer_date=datetime(2026, 7, 2),
+            processing_report_date=datetime(2026, 7, 22),
+            order_state_name="Завершён",
+        ),
+        SupplierOrder(
+            order_number="BAD-DATES", order_date=datetime(2026, 7, 1),
+            order_ref1c="bad-dates", supplier_id=supplier.supplier_id,
+            operation_name="ЗаказНаПереработку", is_posted=True, deletion_mark=False,
+            processing_transfer_date=datetime(2026, 7, 9),
+            processing_report_date=datetime(2026, 7, 8),
+        ),
+    ]
+    db.add_all(orders)
+    db.flush()
+    for order, qty in zip(orders, (10, 30, 5), strict=True):
+        db.add(
+            SupplierOrderItem(
+                order_id=order.order_id, item_id_ref=coated.item_id,
+                quantity=qty, received_qty=qty, remaining_qty=0,
+            )
+        )
+    db.flush()
+
+    from app.services.dbr import processing_board_service
+
+    board = processing_board_service.processing_board(db, today=date(2026, 8, 5))
+    kpi = board["positions"][0]["roundtrip_kpi"]
+    assert kpi["eligible_rows"] == 3
+    assert kpi["completed_rows"] == 2
+    assert kpi["completed_orders"] == 2
+    assert kpi["completed_qty"] == 40
+    assert kpi["weighted_avg_days"] == 15.5
+    assert kpi["max_days"] == 20
+    assert kpi["within_roundtrip_rows"] == 1
+    assert kpi["within_roundtrip_qty"] == 10
+    assert kpi["invalid_date_rows"] == 1
+    assert board["contractors"][0]["supplier_name"] == "Гальванический подрядчик"
+    assert board["contractors"][0]["roundtrip_kpi"] == kpi
+    assert "Proxy" in board["roundtrip_kpi_semantics"]
+
+
 def test_processing_pipe_excludes_draft_and_wrong_supplier(db_session):
     db = db_session
     schedule, coated, _bare = _processing_scenario(db)

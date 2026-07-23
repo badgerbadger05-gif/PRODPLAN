@@ -38,13 +38,14 @@ capped by the frozen ``initial_snapshot_stock``.
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from ..models import (
     DefaultSpecification,
+    DbrFeederSignal,
     Item,
     MrpFreezeAllocation,
     MrpRequirement,
@@ -304,6 +305,58 @@ def _own_open_production_by_item(
             continue
         result[int(item_id)] = result.get(int(item_id), 0.0) + _to_float(qty)
     return result
+
+
+def _dbr_owned_qty(
+    db: Session,
+    item_ids: Sequence[int],
+    *,
+    period_to: date,
+) -> Dict[int, float]:
+    """Open DBR journal quantity that may cover this MRP horizon.
+
+    This is a conservative item-level bridge until explicit DBR↔MRP allocations
+    exist: only positive, non-terminal remaining journal quantity linked to an
+    active signal due no later than the run horizon is counted.
+    """
+    ids = sorted({int(item_id) for item_id in item_ids})
+    if not ids:
+        return {}
+    remaining_qty = func.coalesce(
+        ProductionProduct.remaining_qty,
+        ProductionProduct.quantity - func.coalesce(ProductionProduct.produced_qty, 0),
+        0,
+    )
+    signal_due = func.coalesce(
+        DbrFeederSignal.required_date,
+        DbrFeederSignal.need_date,
+    )
+    rows = (
+        db.query(
+            ProductionProduct.item_id,
+            func.sum(remaining_qty).label("qty"),
+        )
+        .join(
+            DbrFeederSignal,
+            DbrFeederSignal.id == ProductionProduct.source_dbr_signal_id,
+        )
+        .outerjoin(
+            ProductionOrderLineState,
+            ProductionOrderLineState.product_id == ProductionProduct.product_id,
+        )
+        .filter(ProductionProduct.item_id.in_(ids))
+        .filter(DbrFeederSignal.status.in_(("Open", "Order Created", "In Work")))
+        .filter(remaining_qty > 0)
+        .filter(or_(signal_due.is_(None), signal_due <= period_to))
+        .filter(
+            func.coalesce(ProductionOrderLineState.status, "shortage").notin_(
+                ("completed", "cancelled")
+            )
+        )
+        .group_by(ProductionProduct.item_id)
+        .all()
+    )
+    return {int(item_id): _to_float(qty) for item_id, qty in rows}
 
 
 def _next_catchup_order_number(db: Session, *, run_id: int, item_id: int) -> str:
@@ -796,6 +849,7 @@ def reconcile_snapshot(
             "purchase_added": [],
             "purchase_pruned": [],
             "production_trimmed": [],
+            "dbr_owned_skipped": [],
             "note": "в плане нет открытой потребности",
         }
 
@@ -826,6 +880,7 @@ def reconcile_snapshot(
             "purchase_added": [],
             "purchase_pruned": [],
             "production_trimmed": [],
+            "dbr_owned_skipped": [],
             "orphan_link_repair": orphan_link_repair,
             "effective_net_total": 0.0,
             "drift_adjust_total": 0.0,
@@ -839,12 +894,14 @@ def reconcile_snapshot(
 
     period_to = run.period_to or max((r.period_to for r in open_reqs), default=date.today())
     own_open_production = _own_open_production_by_item(db, run, open_req_ids)
+    dbr_owned_qty = _dbr_owned_qty(db, item_ids, period_to=period_to)
     _exported_pp_ids, unexported_pp_qty, own_exported_outstanding = _own_purchase_coverage(db, run)
 
     production_added: List[Dict[str, Any]] = []
     purchase_added: List[Dict[str, Any]] = []
     purchase_pruned: List[Dict[str, Any]] = []
     production_trimmed: List[Dict[str, Any]] = []
+    dbr_owned_skipped: List[Dict[str, Any]] = []
     effective_net_total = 0.0
     drift_adjust_total = 0.0
 
@@ -873,8 +930,18 @@ def reconcile_snapshot(
                 )
 
         if flow == REPLENISHMENT_FLOW_PRODUCTION:
+            dbr_cov = min(_to_float(dbr_owned_qty.get(iid, 0.0)), desired)
+            if dbr_cov > EPS:
+                dbr_owned_skipped.append({
+                    "item_id": int(iid),
+                    "item_code": str(item.item_code or ""),
+                    "item_name": str(item.item_name or ""),
+                    "requirement_id": int(req.id),
+                    "qty": round(dbr_cov, 6),
+                    "reason": "active_dbr_remaining_qty_applied_before_mrp",
+                })
             own_cov = _to_float(own_open_production.get(iid, 0.0))
-            gap = desired - own_cov
+            gap = desired - dbr_cov - own_cov
             if iid in welded_blocked:
                 # Welded pair: catch-up is issued through the paint chain, not
                 # here. No materialise / no trim.
@@ -910,14 +977,14 @@ def reconcile_snapshot(
                 production_added.append(entry)
             elif gap < -EPS:
                 trimmed = _trim_unexported_catchup_production(
-                    db, run=run, item_id=iid, target_qty=desired,
+                    db, run=run, item_id=iid, target_qty=max(desired - dbr_cov, 0.0),
                     welded_blocked=welded_blocked, dry_run=dry_run,
                 )
                 if trimmed:
                     production_trimmed.append(trimmed)
                     own_cov = max(own_cov - _to_float(trimmed.get("removed_qty")), 0.0)
                     own_open_production[iid] = own_cov
-            covered = min(executed + own_cov, eff_net)
+            covered = min(executed + dbr_cov + own_cov, eff_net)
             req.covered_qty = covered
             req.remaining_qty = max(eff_net - covered, 0.0)
 
@@ -989,6 +1056,7 @@ def reconcile_snapshot(
         "purchase_added": purchase_added,
         "purchase_pruned": purchase_pruned,
         "production_trimmed": production_trimmed,
+        "dbr_owned_skipped": dbr_owned_skipped,
         "orphan_link_repair": orphan_link_repair,
         "effective_net_total": round(effective_net_total, 6),
         "drift_adjust_total": round(drift_adjust_total, 6),

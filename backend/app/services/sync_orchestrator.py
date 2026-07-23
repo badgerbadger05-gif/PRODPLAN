@@ -19,7 +19,7 @@ import json
 import threading
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -42,7 +42,17 @@ from .odata_stock_sync import sync_stock_from_odata, sync_stock_warehouses_from_
 from .production_order_sync import sync_production_orders_from_odata, sync_production_fact_from_odata
 from .production_control_material_availability import recalculate_production_coverage
 from .supplier_order_sync import sync_supplier_orders_from_odata
+from .processing_stock_sync import (
+    processing_stock_status,
+    sync_processing_stock_from_odata,
+)
 from .nomenclature_groups_sync import refresh_nomenclature_groups
+from .item_ledger.ingest import process_pending_pulls
+from .dbr.feeder_position_service import rebuild_positions
+from .dbr.feeder_signal_service import refresh_signals
+from .dbr.feeder_chain_service import refresh_chain_signals
+from .dbr.gate_service import refresh_gate
+from .. import models
 
 
 STATE_PATH = Path("config") / "sync_schedule.json"
@@ -132,10 +142,25 @@ SYNC_JOBS: List[SyncJob] = [
     SyncJob("productionOrders", "Заказы на производство", 3_600, _single("Document_ЗаказНаПроизводство", sync_production_orders_from_odata)),
     SyncJob("productionFacts", "Факт выпуска", 3_600, _single("Document_СборкаЗапасов", sync_production_fact_from_odata)),
     SyncJob("supplierOrders", "Заказы поставщику", 3_600, _single("Document_ЗаказПоставщику", sync_supplier_orders_from_odata)),
+    SyncJob(
+        "processingStock",
+        "Остатки у переработчиков",
+        3_600,
+        _single("AccumulationRegister_ЗапасыПереданные/Balance", sync_processing_stock_from_odata),
+    ),
 ]
 
 _JOB_BY_ID: Dict[str, SyncJob] = {j.id: j for j in SYNC_JOBS}
 _ORDER_INDEX: Dict[str, int] = {j.id: i for i, j in enumerate(SYNC_JOBS)}
+
+# DBR is deliberately maintained on a *following* tick after a source sync.
+# Keeping this state beside the sync schedule makes it durable without adding a
+# DB migration and preserves the one-unit-of-work-per-tick rate limit.
+_DBR_SOURCE_JOBS = {"stock", "productionOrders", "supplierOrders", "processingStock"}
+_DBR_RETRY_BASE_SECONDS = 300
+_DBR_RETRY_MAX_SECONDS = 3600
+_DBR_FULL_INTERVAL_SECONDS = 3600
+_LEDGER_PULL_LIMIT = 10
 
 
 # --- State persistence -------------------------------------------------------
@@ -216,6 +241,80 @@ def _pick_next(due: List[SyncJob], state: Dict[str, Any], now: datetime) -> Opti
     return sorted(due, key=lambda j: (_ORDER_INDEX[j.id], -overdue_seconds(j)))[0]
 
 
+def _dbr_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    return state.setdefault("dbr_maintenance", {})
+
+
+def _mark_dbr_dirty(state: Dict[str, Any], now: datetime, source_job: str) -> None:
+    maintenance = _dbr_state(state)
+    maintenance["dirty"] = True
+    maintenance.setdefault("dirty_since", now.isoformat())
+    maintenance["dirty_source"] = source_job
+    maintenance["next_retry_at"] = None
+
+
+def _dbr_dirty_due(state: Dict[str, Any], now: datetime) -> bool:
+    maintenance = _dbr_state(state)
+    if not maintenance.get("dirty"):
+        return False
+    retry_at = _parse_iso(maintenance.get("next_retry_at"))
+    return retry_at is None or now >= retry_at
+
+
+def _dbr_full_due(state: Dict[str, Any], now: datetime) -> bool:
+    last = _parse_iso(_dbr_state(state).get("last_full_at"))
+    # The first full rebuild follows a source-driven incremental run. Do not
+    # make an unconfigured/new installation run a costly DBR job before its
+    # first ordinary sync has completed.
+    return last is not None and (now - last).total_seconds() >= _DBR_FULL_INTERVAL_SECONDS
+
+
+def _run_dbr_maintenance(db: Session, *, full: bool) -> Dict[str, Any]:
+    """Run one atomic DBR maintenance unit; commit only after every stage."""
+    summary: Dict[str, Any] = {}
+    try:
+        if full:
+            positions = rebuild_positions(db)
+            summary["positions"] = positions
+            expected_schedule_id = positions.get("schedule_id")
+            summary["signals"] = refresh_signals(db, expected_schedule_id=expected_schedule_id)
+        else:
+            summary["signals"] = refresh_signals(db)
+        summary["chain"] = refresh_chain_signals(db)
+        summary["gate"] = refresh_gate(db)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return summary
+
+
+def pull_queue_health(db: Optional[Session]) -> Dict[str, int]:
+    """Small operational snapshot; no mutation and safe for status diagnostics."""
+    if db is None:
+        return {"pending": 0, "error_retryable": 0, "error_exhausted": 0, "ready": 0}
+    # Keep the scheduling unit testable with the tiny rollback-only session
+    # doubles used by legacy callers.
+    if not hasattr(db, "query"):
+        return {"pending": 0, "error_retryable": 0, "error_exhausted": 0, "ready": 0}
+    rows = db.query(models.StockRecorderPull.status, models.StockRecorderPull.attempts).all()
+    pending = sum(1 for status, _attempts in rows if status == "pending")
+    retryable = sum(1 for status, attempts in rows if status == "error" and int(attempts or 0) < 5)
+    exhausted = sum(1 for status, attempts in rows if status == "error" and int(attempts or 0) >= 5)
+    return {"pending": pending, "error_retryable": retryable, "error_exhausted": exhausted, "ready": pending + retryable}
+
+
+def _run_ledger_pulls(db: Session, config: Dict[str, Any]) -> Dict[str, Any]:
+    results = process_pending_pulls(db, config=config, limit=_LEDGER_PULL_LIMIT)
+    return {
+        "processed": len(results),
+        "done": sum(1 for result in results if result.status == "done"),
+        "empty": sum(1 for result in results if result.status == "empty"),
+        "error": sum(1 for result in results if result.status == "error"),
+        "queue": pull_queue_health(db),
+    }
+
+
 # --- Public API --------------------------------------------------------------
 
 def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
@@ -233,6 +332,66 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
     try:
         now = now or _now()
         state = _load_state()
+
+        # Maintenance has precedence over a new OData pull but is still exactly
+        # one unit per tick. A source job only marks DBR dirty; it never starts
+        # recalculation in the same tick.
+        ledger_health = pull_queue_health(db)
+        if ledger_health["ready"]:
+            started = time.time()
+            try:
+                summary = _run_ledger_pulls(db, config)
+                result = {"status": "ok", "job": "ledgerPulls", "summary": summary}
+            except Exception as exc:  # defensive: process_pending_pulls isolates rows itself
+                db.rollback()
+                result = {"status": "error", "job": "ledgerPulls", "error": str(exc)}
+            result["duration_ms"] = int((time.time() - started) * 1000)
+            _save_state(state)
+            return result
+
+        maintenance = _dbr_state(state)
+        dbr_mode = (
+            "full" if maintenance.get("full_pending") and _dbr_dirty_due(state, now)
+            else ("incremental" if _dbr_dirty_due(state, now) else ("full" if _dbr_full_due(state, now) else None))
+        )
+        if dbr_mode is not None:
+            started = time.time()
+            try:
+                summary = _run_dbr_maintenance(db, full=dbr_mode == "full")
+                maintenance["last_status"] = "ok"
+                maintenance["last_error"] = None
+                maintenance["failure_count"] = 0
+                maintenance["last_duration_ms"] = int((time.time() - started) * 1000)
+                if dbr_mode == "incremental":
+                    maintenance["dirty"] = False
+                    maintenance["dirty_since"] = None
+                    maintenance["next_retry_at"] = None
+                    maintenance["last_incremental_at"] = now.isoformat()
+                    # Establish the hourly full-rebuild cadence after the
+                    # first source-driven maintenance succeeds.
+                    maintenance.setdefault("last_full_at", now.isoformat())
+                else:
+                    maintenance["last_full_at"] = now.isoformat()
+                    maintenance["full_pending"] = False
+                result = {"status": "ok", "job": "dbrMaintenance", "mode": dbr_mode, "summary": summary}
+            except Exception as exc:  # noqa: BLE001 - keep the marker for retry
+                db.rollback()
+                failures = int(maintenance.get("failure_count") or 0) + 1
+                backoff = min(_DBR_RETRY_BASE_SECONDS * (2 ** (failures - 1)), _DBR_RETRY_MAX_SECONDS)
+                maintenance["dirty"] = True
+                maintenance.setdefault("dirty_since", now.isoformat())
+                maintenance["failure_count"] = failures
+                maintenance["next_retry_at"] = (now + timedelta(seconds=backoff)).isoformat()
+                maintenance["last_status"] = "error"
+                maintenance["last_error"] = str(exc)[:1000]
+                maintenance["last_duration_ms"] = int((time.time() - started) * 1000)
+                if dbr_mode == "full":
+                    maintenance["full_pending"] = True
+                result = {"status": "error", "job": "dbrMaintenance", "mode": dbr_mode, "error": str(exc)}
+            _save_state(state)
+            result["duration_ms"] = maintenance["last_duration_ms"]
+            return result
+
         due = _due_jobs(state, now)
         job = _pick_next(due, state, now)
         if job is None:
@@ -251,6 +410,8 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
             job_state["last_status"] = "ok"
             job_state["last_error"] = None
             result["summary"] = summary if isinstance(summary, dict) else {"result": str(summary)}
+            if job.id in _DBR_SOURCE_JOBS:
+                _mark_dbr_dirty(state, now, job.id)
         except Exception as exc:  # noqa: BLE001 — one job's failure must not kill the loop
             db.rollback()
             job_state["last_status"] = "error"
@@ -302,6 +463,20 @@ def status(db: Optional[Session] = None, *, now: Optional[datetime] = None) -> D
         "status": "ok",
         "configured": bool(str(config.get("base_url") or "").strip()),
         "jobs": jobs_out,
+        "dbr_maintenance": {
+            "dirty": bool(_dbr_state(state).get("dirty")),
+            "dirty_since": _dbr_state(state).get("dirty_since"),
+            "dirty_source": _dbr_state(state).get("dirty_source"),
+            "next_retry_at": _dbr_state(state).get("next_retry_at"),
+            "last_incremental_at": _dbr_state(state).get("last_incremental_at"),
+            "last_full_at": _dbr_state(state).get("last_full_at"),
+            "full_pending": bool(_dbr_state(state).get("full_pending")),
+            "last_status": _dbr_state(state).get("last_status"),
+            "last_error": _dbr_state(state).get("last_error"),
+            "last_duration_ms": _dbr_state(state).get("last_duration_ms"),
+        },
+        "ledger_pull_queue": pull_queue_health(db),
+        "processing_stock": processing_stock_status(db) if db is not None else None,
     }
 
 

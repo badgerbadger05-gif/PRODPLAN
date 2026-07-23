@@ -18,6 +18,7 @@ from decimal import Decimal
 from typing import Any, Generator, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -33,12 +34,15 @@ from ..services.dbr import (
     gate_service,
     materialize_service,
     processing_board_service,
+    processing_materialize_preview,
+    processing_trip_manifest,
     program_service,
     purchase_materialize_service,
     settings_service,
     slot_service,
 )
 from ..services.dbr.materialize_service import MaterializeConflict
+from ..services.dbr.processing_materialize_preview import ProcessingPreviewConflict
 
 router = APIRouter(prefix="/v1/dbr", tags=["dbr"])
 
@@ -75,6 +79,9 @@ class SettingsOut(BaseModel):
     batch_days_welding: int
     batch_days_paint_black: int
     batch_days_paint_color: int
+    rt_processing_days: int
+    processing_trip_interval_days: int
+    processing_roundtrip_days: int
     feeder_chain_enabled: bool
     feeder_load_horizon_weeks: int
     w2_warehouse_ref1c: Optional[str] = None
@@ -95,6 +102,9 @@ class SettingsUpdate(BaseModel):
     batch_days_welding: Optional[int] = None
     batch_days_paint_black: Optional[int] = None
     batch_days_paint_color: Optional[int] = None
+    rt_processing_days: Optional[int] = None
+    processing_trip_interval_days: Optional[int] = None
+    processing_roundtrip_days: Optional[int] = None
     feeder_chain_enabled: Optional[bool] = None
     feeder_load_horizon_weeks: Optional[int] = None
     # warehouse roles are explicitly nullable — use `model_fields_set` to tell
@@ -160,6 +170,7 @@ class ReleaseDayRequest(BaseModel):
 
 class SignalLaunchRequest(BaseModel):
     dry_run: bool = True
+    allow_production: bool = False
 
 
 class PurchaseLaunchRequest(BaseModel):
@@ -399,10 +410,35 @@ def get_processing_board(db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+@router.get("/feeder/processing/trip-manifest")
+def get_processing_trip_manifest(db: Session = Depends(get_db)):
+    """Read-only manifest preview grouped by toll-processing contractor."""
+    return processing_trip_manifest.build_manifest(db)
+
+
+@router.get(
+    "/feeder/processing/trip-manifest/print",
+    response_class=HTMLResponse,
+)
+def print_processing_trip_manifest(db: Session = Depends(get_db)):
+    """Simple printable HTML view of the same manifest preview."""
+    manifest = processing_trip_manifest.build_manifest(db)
+    return HTMLResponse(processing_trip_manifest.render_manifest_html(manifest))
+
+
 @router.post("/feeder/chain/preview")
 def preview_feeder_chain(db: Session = Depends(get_db)):
     try:
         return feeder_chain_service.preview_chain_signals(db)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.post("/feeder/processing/chain/preview")
+def preview_processing_feeder_chain(db: Session = Depends(get_db)):
+    """Read-only chain preview limited to processing supermarket signals."""
+    try:
+        return feeder_chain_service.preview_processing_chain_signals(db)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -714,7 +750,12 @@ def feeder_launch_signal(
     dry_run=true (default) returns the payload preview and writes nothing.
     """
     try:
-        return materialize_service.launch_signal(db, signal_id, dry_run=payload.dry_run)
+        return materialize_service.launch_signal(
+            db,
+            signal_id,
+            dry_run=payload.dry_run,
+            allow_production=payload.allow_production,
+        )
     except LookupError:
         raise HTTPException(status_code=404, detail="feeder signal not found")
     except MaterializeConflict as exc:
@@ -723,6 +764,20 @@ def feeder_launch_signal(
         raise HTTPException(status_code=403, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+
+
+@router.get("/feeder/signals/{signal_id}/processing-order-preview")
+def feeder_processing_order_preview(
+    signal_id: int,
+    db: Session = Depends(get_db),
+):
+    """Preview a toll-processing supplier order; this endpoint can never write to 1C."""
+    try:
+        return processing_materialize_preview.preview_processing_signal(db, signal_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail="feeder signal not found")
+    except ProcessingPreviewConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
 
 # --------------------------------------------------------------------------

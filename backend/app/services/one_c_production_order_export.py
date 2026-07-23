@@ -54,7 +54,10 @@ from .one_c_export_common import (
     create_odata_client as _create_odata_client,
     current_1c_datetime as _current_1c_datetime,
     find_sync_link as _find_sync_link,
+    find_document_by_origin as _find_document_by_origin,
     fmt_1c_datetime as _fmt_1c_datetime,
+    add_origin_marker as _add_origin_marker,
+    origin_token as _origin_token,
     post_document_operational as _post_document_operational,
     post_export_entries as _post_export_entries,
     upsert_sync_link as _upsert_sync_link,
@@ -123,6 +126,7 @@ class ProductionOrderExportEntry:
     status: str = "planned"  # planned | created | existing | error | skipped
     error: Optional[str] = None
     reason: Optional[str] = None  # human-readable explanation for skipped/error
+    origin_token: Optional[str] = None
 
 
 @dataclass
@@ -563,7 +567,39 @@ def _build_header_payload(
     if defaults.operation_structural_unit_ref1c:
         payload["СтруктурнаяЕдиницаОпераций_Key"] = defaults.operation_structural_unit_ref1c
     payload["СтруктурнаяЕдиницаРезерв_Key"] = entry.reserve_structural_unit_ref1c or EMPTY_REF1C
+    if entry.origin_token:
+        payload["Комментарий"] = _add_origin_marker(payload["Комментарий"], entry.origin_token)
     return payload
+
+
+def _entry_origin_token(db: Session, entry: ProductionOrderExportEntry) -> str:
+    products = (
+        db.query(ProductionProduct)
+        .filter(ProductionProduct.order_id == int(entry.order_id))
+        .order_by(ProductionProduct.line_number.asc(), ProductionProduct.product_id.asc())
+        .all()
+    )
+    durable_sources = [
+        str(p.source_mrp_allocation_key)
+        for p in products
+        if str(p.source_mrp_allocation_key or "").strip()
+    ]
+    identity = {
+        # Allocation keys are the preferred durable demand identity. Never put
+        # run/order ids in the marker: they diverge between instances.
+        "allocations": sorted(durable_sources),
+        "lines": [
+            {
+                "item_ref1c": line.item_ref1c,
+                "characteristic_ref1c": line.characteristic_ref1c or "",
+                "qty": float(line.qty),
+            }
+            for line in entry.lines
+        ],
+        "planned_start": str(entry.planned_start_date or ""),
+        "planned_finish": str(entry.planned_finish_date or ""),
+    }
+    return _origin_token("production_order", identity)
 
 
 def _upsert_link(
@@ -665,6 +701,7 @@ def export_production_orders_to_1c(
     basis_refs = basis_order_refs or {}
     payloads: List[Dict[str, Any]] = []
     for entry in eligible:
+        entry.origin_token = _entry_origin_token(db, entry)
         payload = _build_header_payload(entry, defaults)
         suffix = suffixes.get(int(entry.order_id))
         if suffix:
@@ -689,6 +726,42 @@ def export_production_orders_to_1c(
         require_demo_base=True,
     )
 
+    # Recover a POST performed by another PRODPLAN instance before creating
+    # anything new.  This intentionally happens after payload construction so
+    # every eligible entry carries its deterministic marker.
+    recovered: List[ProductionOrderExportEntry] = []
+    pending_payloads: List[Dict[str, Any]] = []
+    pending_entries: List[ProductionOrderExportEntry] = []
+    for entry, envelope in zip(eligible, payloads):
+        doc = _find_document_by_origin(
+            client,
+            entity=PRODUCTION_ORDER_ENTITY,
+            token=str(entry.origin_token),
+        )
+        ref_key = _clean_ref1c((doc or {}).get("Ref_Key"))
+        if not ref_key:
+            pending_entries.append(entry)
+            pending_payloads.append(envelope)
+            continue
+        entry.status = "existing"
+        entry.target_ref_key = ref_key
+        entry.reason = "найден существующий документ 1С по prodplan-origin"
+        _upsert_link(
+            db,
+            entry=entry,
+            payload_hash="recovered-by-origin",
+            target_ref_key=ref_key,
+            status="success",
+            last_error=None,
+        )
+        order_row = db.query(ProductionOrder).filter(
+            ProductionOrder.order_id == entry.order_id
+        ).one()
+        order_row.order_ref1c = ref_key
+        recovered.append(entry)
+    if recovered:
+        db.commit()
+
     def _mark_success(entry: ProductionOrderExportEntry, ref_key: str) -> None:
         _post_document_operational(
             client,
@@ -703,7 +776,7 @@ def export_production_orders_to_1c(
 
     created, errored = _post_export_entries(
         db,
-        entries=zip(eligible, payloads),
+        entries=zip(pending_entries, pending_payloads),
         client=client,
         target_entity=PRODUCTION_ORDER_ENTITY,
         missing_ref_error=f"1C did not return Ref_Key for the new {PRODUCTION_ORDER_ENTITY}",
@@ -713,6 +786,7 @@ def export_production_orders_to_1c(
     )
 
     summary["orders_created"] = created
+    summary["orders_recovered"] = len(recovered)
     summary["orders_error"] = errored
     summary["entries"] = [asdict(e) for e in entries]
     summary["status"] = "ok" if errored == 0 else "partial_error"

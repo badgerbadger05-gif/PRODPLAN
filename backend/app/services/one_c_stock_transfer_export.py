@@ -555,9 +555,10 @@ def _chain_export_parent_orders(
 
     Returns the parent-export summary (or None when no parents needed export).
     """
-    parent_ids_rows = (
-        db.query(ProductionOrder.order_id)
+    parent_rows = (
+        db.query(ProductionOrder.order_id, ProductionOrder.source, ProductionProduct.source_dbr_signal_id)
         .join(ProductionMaterialIssue, ProductionMaterialIssue.order_id == ProductionOrder.order_id)
+        .join(ProductionProduct, ProductionProduct.product_id == ProductionMaterialIssue.product_id)
         .filter(ProductionMaterialIssue.issue_id.in_(list(issue_ids)))
         .filter(
             (ProductionOrder.order_ref1c.is_(None))
@@ -567,15 +568,51 @@ def _chain_export_parent_orders(
         .distinct()
         .all()
     )
-    parent_ids = [int(r[0]) for r in parent_ids_rows]
-    if not parent_ids:
+    mrp_order_ids = [int(row.order_id) for row in parent_rows if str(row.source or "").lower() != "dbr"]
+    dbr_signal_ids = [
+        int(row.source_dbr_signal_id)
+        for row in parent_rows
+        if str(row.source or "").lower() == "dbr" and row.source_dbr_signal_id is not None
+    ]
+    if not mrp_order_ids and not dbr_signal_ids:
         return None
-    return export_production_orders_to_1c(
-        db,
-        parent_ids,
-        dry_run=dry_run,
-        allow_production=allow_production,
+    mrp_summary = (
+        export_production_orders_to_1c(
+            db,
+            mrp_order_ids,
+            dry_run=dry_run,
+            allow_production=allow_production,
+        )
+        if mrp_order_ids
+        else {}
     )
+    dbr_results: List[Dict[str, Any]] = []
+    if dbr_signal_ids:
+        # Local import avoids a module cycle: DBR materialization reuses the
+        # production-order payload primitives imported by this module.
+        from .dbr.materialize_service import launch_signal
+
+        for signal_id in dbr_signal_ids:
+            dbr_results.append(
+                launch_signal(
+                    db,
+                    signal_id,
+                    dry_run=dry_run,
+                    allow_production=allow_production,
+                )
+            )
+    dbr_created = sum(bool(row.get("created")) for row in dbr_results)
+    dbr_existing = sum(bool(row.get("already_launched")) for row in dbr_results)
+    return {
+        **mrp_summary,
+        "status": str(mrp_summary.get("status") or "ok"),
+        "dry_run": bool(dry_run),
+        "orders_requested": len(mrp_order_ids) + len(dbr_signal_ids),
+        "orders_created": int(mrp_summary.get("orders_created") or 0) + dbr_created,
+        "orders_already_linked": int(mrp_summary.get("orders_already_linked") or 0) + dbr_existing,
+        "orders_error": int(mrp_summary.get("orders_error") or 0),
+        "dbr_entries": dbr_results,
+    }
 
 
 def export_material_issues_to_1c(

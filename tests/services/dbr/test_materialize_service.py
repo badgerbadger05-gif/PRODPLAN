@@ -21,6 +21,8 @@ from app.models import (
     DefaultSpecification,
     Item,
     ItemWarehouseStock,
+    ProductionOrder,
+    ProductionProduct,
     ProductionResource,
     SpecComponent,
     Specification,
@@ -42,12 +44,16 @@ from app.services.dbr.core.feeder import signal_identity
 
 
 class _FakeClient:
-    def __init__(self, *, ref_key="dbr-1c-ref", fail=False):
+    def __init__(self, *, ref_key="dbr-1c-ref", fail=False, existing_docs=None):
         self.ref_key = ref_key
         self.fail = fail
         self.posts = []
         self.patches = []
         self.operations = []
+        self.existing_docs = existing_docs or []
+
+    def get_all(self, _entity, **_kwargs):
+        return list(self.existing_docs)
 
     def post(self, entity, payload, **_):
         self.posts.append((entity, payload))
@@ -221,6 +227,33 @@ def test_release_slot_second_call_is_idempotent(db_session, monkeypatch):
     assert len(fake.posts) == 1  # no second POST
 
 
+def test_release_slot_recovers_cross_instance_document_without_post(db_session, monkeypatch):
+    db = db_session
+    slot, _sch, _item, _comp = _slot_scenario(db)
+    preview = materialize_service.release_slot(db, slot.id, dry_run=True)
+    comment = preview["payload"]["Комментарий"]
+    assert "prodplan-origin=" in comment
+    fake = _FakeClient(
+        existing_docs=[
+            {
+                "Ref_Key": "parallel-slot-ref",
+                "Number": preview["number"],
+                "Комментарий": comment,
+                "Posted": True,
+            }
+        ]
+    )
+    _stub(monkeypatch, client=fake)
+
+    result = materialize_service.release_slot(db, slot.id, dry_run=False)
+
+    assert fake.posts == []
+    assert result["created"] is False
+    assert result["one_c_order_ref"] == "parallel-slot-ref"
+    db.refresh(slot)
+    assert slot.one_c_order_ref == "parallel-slot-ref"
+
+
 def test_release_slot_red_is_conflict(db_session, monkeypatch):
     db = db_session
     slot, _sch, _item, _comp = _slot_scenario(db, kit_status="red")
@@ -279,6 +312,23 @@ def test_launch_signal_real_write_moves_to_order_created(db_session, monkeypatch
     )
     fake = _FakeClient(ref_key="ref-sig-1")
     _stub(monkeypatch, client=fake)
+    local_order = ProductionOrder(
+        order_number=f"DBR-S{signal.id}",
+        order_date=date(2026, 8, 1),
+        source="dbr",
+    )
+    db.add(local_order)
+    db.flush()
+    db.add(ProductionProduct(
+        order_id=local_order.order_id,
+        item_id=signal.item_id,
+        line_number=1,
+        quantity=signal.suggested_qty,
+        remaining_qty=signal.suggested_qty,
+        produced_qty=0,
+        source_dbr_signal_id=signal.id,
+    ))
+    db.flush()
 
     res = materialize_service.launch_signal(db, signal.id, dry_run=False)
 
@@ -288,10 +338,33 @@ def test_launch_signal_real_write_moves_to_order_created(db_session, monkeypatch
     db.refresh(signal)
     assert signal.status == signal_identity.ORDER_CREATED
     assert signal.one_c_order_ref == "ref-sig-1"
+    db.refresh(local_order)
+    assert local_order.order_ref1c == "ref-sig-1"
+    assert local_order.order_number
     link = db.query(SyncLink).filter_by(
         source_system="dbr", source_doctype="feeder_signal", source_id=signal.id
     ).one()
     assert link.status == "success"
+
+
+def test_launch_signal_requires_explicit_production_override(db_session, monkeypatch):
+    db = db_session
+    signal, _item, _comp = _signal_scenario(db, kit_in_stock=True)
+    monkeypatch.setattr(
+        feeder_material_service, "build_kit",
+        lambda code, *_: [KitLine("COMP", 1, "W4", False)] if code == "PROD" else [],
+    )
+    fake = _FakeClient()
+    _stub(monkeypatch, base_url="http://prod/odata/unf", client=fake)
+
+    with pytest.raises(PermissionError):
+        materialize_service.launch_signal(db, signal.id, dry_run=False)
+    assert fake.posts == []
+
+    result = materialize_service.launch_signal(
+        db, signal.id, dry_run=False, allow_production=True
+    )
+    assert result["created"] is True
 
 
 def test_launch_signal_deficit_is_conflict_with_deficit_lines(db_session, monkeypatch):

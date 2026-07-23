@@ -316,6 +316,35 @@ def test_chain_auto_exports_parent_order_in_dry_run(db_session):
     assert result["issues_eligible"] == 0
 
 
+def test_dbr_parent_chain_threads_allow_production(db_session, monkeypatch):
+    db = db_session
+    parent = _mk_item(db, code="TR-DBR-GUARD", ref1c="parent-dbr-guard")
+    comp = _mk_item(db, code="TR-DBR-GUARD-C", ref1c="comp-dbr-guard")
+    issue = _mk_issue(db, parent=parent, component=comp)
+    issue.order.order_ref1c = None
+    issue.order.source = "dbr"
+    issue.product.source_dbr_signal_id = 987
+    db.flush()
+    calls = []
+
+    from app.services.dbr import materialize_service
+
+    def fake_launch(_db, signal_id, *, dry_run, allow_production):
+        calls.append((signal_id, dry_run, allow_production))
+        return {"created": False, "already_launched": False}
+
+    monkeypatch.setattr(materialize_service, "launch_signal", fake_launch)
+
+    exporter._chain_export_parent_orders(
+        db,
+        [issue.issue_id],
+        dry_run=False,
+        allow_production=False,
+    )
+
+    assert calls == [(987, False, False)]
+
+
 def test_chain_full_apply_exports_order_then_transfer(db_session, monkeypatch):
     """In apply mode the chain actually exports the parent order first,
     stamps order_ref1c, then exports the transfer with the correct

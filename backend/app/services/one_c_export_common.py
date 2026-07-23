@@ -11,6 +11,7 @@ EMPTY_REF1C = "00000000-0000-0000-0000-000000000000"
 DEFAULT_ORGANIZATION_REF1C = "c78bcd0e-81f0-11ee-9ce5-9ee51454587f"
 DEFAULT_PRODUCTION_STRUCTURAL_UNIT_REF1C = "c74ea54c-d1b2-11ef-9e01-9ee51454587f"
 UNIT_TYPE_1C = "StandardODATA.Catalog_КлассификаторЕдиницИзмерения"
+ORIGIN_MARKER = "prodplan-origin="
 
 
 def fmt_1c_datetime(value: Optional[date]) -> Optional[str]:
@@ -52,6 +53,66 @@ def payload_hash(payload: Dict[str, Any]) -> str:
     except Exception:
         normalized = str(payload)
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def origin_token(namespace: str, identity: Any) -> str:
+    """Stable, short identity shared by parallel PRODPLAN instances.
+
+    Unlike ``sync_link`` this marker lives in 1C, so a restored/cloned database
+    can recover a document that another instance (or a previous retry) already
+    created.  Callers must pass a durable business identity; volatile document
+    dates and DB connection-specific state do not belong here.
+    """
+    normalized = json.dumps(
+        {"namespace": str(namespace), "identity": identity},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:32]
+
+
+def add_origin_marker(comment: Any, token: str) -> str:
+    text = str(comment or "").strip()
+    marker = f"{ORIGIN_MARKER}{token}"
+    if marker in text:
+        return text
+    return f"{text}; {marker}" if text else marker
+
+
+def find_document_by_origin(
+    client: Any,
+    *,
+    entity: str,
+    token: str,
+    select_fields: Optional[list[str]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Find a 1C document previously created for ``token``.
+
+    OData ``substringof`` is supported by the target 1C endpoint and avoids
+    relying on a local ``sync_link``.  Older unit-test fakes without ``get_all``
+    simply exercise the historical POST path.
+    """
+    get_all = getattr(client, "get_all", None)
+    if get_all is None:
+        return None
+    marker = f"{ORIGIN_MARKER}{token}".replace("'", "''")
+    rows = get_all(
+        entity,
+        filter_query=f"substringof('{marker}', Комментарий)",
+        select_fields=select_fields or ["Ref_Key", "Number", "Комментарий", "Posted"],
+        top=2,
+        max_records=2,
+        max_pages=1,
+        order_by=None,
+    )
+    if len(rows) > 1:
+        raise RuntimeError(
+            f"В 1С найдено несколько документов с {ORIGIN_MARKER}{token}; "
+            "автоматическое восстановление небезопасно"
+        )
+    return rows[0] if rows else None
 
 
 def is_demo_base_url(base_url: str) -> bool:
@@ -262,4 +323,3 @@ def post_export_entries(
                 except Exception:
                     pass
     return created, errored
-

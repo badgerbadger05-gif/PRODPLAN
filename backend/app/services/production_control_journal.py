@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
     DefaultSpecification,
+    DbrFeederSignal,
     Item,
     MrpRequirement,
     PaintWeldChainLink,
@@ -87,6 +88,40 @@ STATUS_FILTER_GROUPS = {
 }
 
 ACTIVE_COVERAGE_STATUSES = {"shortage", "partial", "ready"}
+
+
+def _dbr_queue_state(signal: DbrFeederSignal) -> str:
+    if signal.status == "Diagnostic":
+        return "diagnostic"
+    if bool(signal.is_incomplete) or float(signal.kit_shortage_qty or 0) > 0:
+        return "blocked"
+    if signal.status == "Open":
+        return "ready"
+    return str(signal.status or "").strip().lower().replace(" ", "_") or "unknown"
+
+
+def _dbr_planning_payload(signal: DbrFeederSignal) -> Dict[str, Any]:
+    reason_json = signal.reason_json if isinstance(signal.reason_json, dict) else {}
+    missing_reasons = reason_json.get("missing_reasons")
+    if isinstance(missing_reasons, list) and missing_reasons:
+        reason = "; ".join(str(value) for value in missing_reasons)
+    else:
+        reason = str(reason_json.get("generator") or "")
+    return {
+        "contour": "dbr_feeder",
+        "source_id": int(signal.id),
+        "schedule_id": int(signal.source_schedule_id) if signal.source_schedule_id is not None else None,
+        "slot_id": int(signal.drum_slot_id) if signal.drum_slot_id is not None else None,
+        "signal_type": str(signal.signal_type or ""),
+        "priority": _to_float(signal.priority),
+        "zone": str(signal.zone or "") or None,
+        "need_date": _date_to_iso(signal.need_date),
+        "required_date": _date_to_iso(signal.required_date),
+        "queue_state": _dbr_queue_state(signal),
+        "chain_depth": int(signal.chain_depth or 0),
+        "parent_signal_id": int(signal.parent_signal_id) if signal.parent_signal_id is not None else None,
+        "reason": reason or None,
+    }
 
 
 def _journal_work_status(line_status: str) -> str:
@@ -886,6 +921,7 @@ def list_journal(
     workshop_id: Optional[int] = None,
     status: Optional[str] = None,
     coverage_status: Optional[str] = None,
+    planning_contour: Optional[str] = None,
     search: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
@@ -936,6 +972,17 @@ def list_journal(
     if status:
         status_values = STATUS_FILTER_GROUPS.get(str(status), (str(status),))
         query = query.filter(func.coalesce(ProductionOrderLineState.status, "shortage").in_(status_values))
+    if planning_contour:
+        contour = str(planning_contour).strip().lower()
+        if contour == "dbr_feeder":
+            query = query.join(
+                DbrFeederSignal,
+                DbrFeederSignal.id == ProductionProduct.source_dbr_signal_id,
+            )
+        elif contour in {"mrp", "1c", "dbr"}:
+            query = query.filter(ProductionOrder.source == contour)
+        else:
+            raise ValueError("unknown planning_contour")
     if search:
         like = f"%{search.strip()}%"
         query = query.filter(
@@ -961,7 +1008,13 @@ def list_journal(
         requested_offset = max(0, int(offset or 0))
         max_offset = max(0, ((total - 1) // effective_limit) * effective_limit) if total else 0
         effective_offset = min(requested_offset, max_offset)
-        if sort_field in {"planned_start_date", "planned_finish_date"}:
+        if sort_field == "dbr_priority" and str(planning_contour or "").strip().lower() == "dbr_feeder":
+            query = query.order_by(
+                DbrFeederSignal.kit_force.desc(),
+                DbrFeederSignal.priority.desc(),
+                DbrFeederSignal.id.asc(),
+            )
+        elif sort_field in {"planned_start_date", "planned_finish_date"}:
             planned_dates_sq = (
                 db.query(
                     PlannedOrder.item_id.label("item_id"),
@@ -1039,6 +1092,17 @@ def list_journal(
         for product in rows
         if getattr(product, "source_mrp_requirement_id", None) is not None
     })
+    dbr_signal_ids = sorted({
+        int(product.source_dbr_signal_id)
+        for product in rows
+        if getattr(product, "source_dbr_signal_id", None) is not None
+    })
+    dbr_by_id: Dict[int, DbrFeederSignal] = {}
+    if dbr_signal_ids:
+        dbr_by_id = {
+            int(signal.id): signal
+            for signal in db.query(DbrFeederSignal).filter(DbrFeederSignal.id.in_(dbr_signal_ids)).all()
+        }
     planned_due_by_id: Dict[int, date] = {}
     if planned_order_ids:
         for row in (
@@ -1171,6 +1235,8 @@ def list_journal(
         due_date = None
         source_planned_order_id = int(product.source_planned_order_id) if product.source_planned_order_id is not None else None
         source_mrp_requirement_id = int(product.source_mrp_requirement_id) if product.source_mrp_requirement_id is not None else None
+        source_dbr_signal_id = int(product.source_dbr_signal_id) if product.source_dbr_signal_id is not None else None
+        dbr_signal = dbr_by_id.get(source_dbr_signal_id or 0)
         if source_planned_order_id is not None:
             due_date = planned_due_by_id.get(source_planned_order_id)
         req_meta = req_meta_by_id.get(source_mrp_requirement_id or 0, {})
@@ -1249,6 +1315,8 @@ def list_journal(
                 "source_run_id": int(product.order.source_run_id) if product.order.source_run_id is not None else None,
                 **source_plan,
                 "source_planned_order_id": source_planned_order_id,
+                "source_dbr_signal_id": source_dbr_signal_id,
+                "planning": _dbr_planning_payload(dbr_signal) if dbr_signal else None,
                 "source_mrp_requirement_id": source_mrp_requirement_id,
                 "source_mrp_allocation_key": str(product.source_mrp_allocation_key or "") if product.source_mrp_allocation_key else None,
                 "mrp_req_net_qty": req_meta.get("net_required_qty"),

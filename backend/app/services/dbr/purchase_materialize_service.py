@@ -48,9 +48,12 @@ from ...models import (
 from ..odata_client import OData1CClient
 from ..odata_config import load_odata_config as _load_odata_config
 from ..one_c_export_common import (
+    add_origin_marker,
     clean_ref1c,
     create_odata_client,
+    find_document_by_origin,
     fmt_1c_datetime as _fmt_1c_datetime,
+    origin_token,
     payload_hash as _payload_hash,
 )
 from ..one_c_purchase_order_export import (
@@ -176,23 +179,68 @@ def _post_purchase_group(
         (date.fromisoformat(line.need_date) for line in group.lines if line.need_date),
         default=None,
     )
+    source_ids = sorted(
+        {
+            int(source_id)
+            for line in group.lines
+            for source_id in source_ids_of_line(line)
+        }
+    )
+    if source_doctype == SIGNAL_DOCTYPE:
+        durable_sources = sorted(
+            str(value)
+            for (value,) in db.query(DbrFeederSignal.dedup_key)
+            .filter(DbrFeederSignal.id.in_(source_ids))
+            .all()
+        )
+    else:
+        # Purchase-plan rows have no durable cross-instance delta UUID. Do not
+        # leak local ids into the marker; line/date/qty axes below are the best
+        # available identity and the identical-delta limitation is documented.
+        durable_sources = []
+    token = origin_token(
+        f"dbr-purchase:{source_doctype}",
+        {
+            "supplier_ref1c": group.supplier_ref1c,
+            "sources": durable_sources,
+            "lines": [
+                {
+                    "item_ref1c": line.item_ref1c,
+                    "qty": float(line.qty or 0),
+                    "need_date": line.need_date,
+                }
+                for line in group.lines
+            ],
+        },
+    )
+    comment = add_origin_marker(
+        f"PRODPLAN source={source_doctype}; dbr; number={group.number}",
+        token,
+    )
     header = {
         "Number": group.number,
         "Date": _fmt_1c_datetime(date.today()),
         "Posted": False,
         "Контрагент_Key": group.supplier_ref1c,
         "ДатаПоступления": _fmt_1c_datetime(min_need),
-        "Комментарий": f"PRODPLAN source={source_doctype}; dbr; number={group.number}",
+        "Комментарий": comment,
         "Запасы": _order_lines_payload("", group),
     }
-    created = client.post(PURCHASE_ORDER_ENTITY, header)
-    ref_key = clean_ref1c(created.get("Ref_Key"))
+    existing = find_document_by_origin(
+        client,
+        entity=PURCHASE_ORDER_ENTITY,
+        token=token,
+    )
+    ref_key = clean_ref1c((existing or {}).get("Ref_Key"))
+    if not ref_key:
+        created = client.post(PURCHASE_ORDER_ENTITY, header)
+        ref_key = clean_ref1c(created.get("Ref_Key"))
     if not ref_key:
         raise RuntimeError(
             f"1C did not return Ref_Key for the new {PURCHASE_ORDER_ENTITY}"
         )
     group.target_ref_key = ref_key
-    group.status = "created"
+    group.status = "existing" if existing else "created"
     phash = _payload_hash(header)
     for line in group.lines:
         for source_id in source_ids_of_line(line):

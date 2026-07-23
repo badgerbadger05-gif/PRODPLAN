@@ -8,9 +8,11 @@ from sqlalchemy.orm import Session
 
 from ..models import Item, PlannedPurchase, SyncLink, Unit
 from .one_c_export_common import (
+    add_origin_marker as _add_origin_marker,
     clean_ref1c as _clean_ref1c,
     create_odata_client as _create_odata_client,
     fmt_1c_datetime as _fmt_1c_datetime,
+    find_document_by_origin as _find_document_by_origin,
     payload_hash as _payload_hash,
     upsert_sync_link as _upsert_sync_link,
 )
@@ -255,14 +257,13 @@ def _group_batch_token(group: PurchaseOrderExportGroup) -> str:
     """Identify the exact delta independently of the 1C document number.
 
     The token lets a retry recover after 1C accepted the document but the local
-    SyncLink transaction did not commit.  Source purchase ids are intentionally
-    included: a later delta with the same item and quantity is still a distinct
-    export batch.
+    SyncLink transaction did not commit. Local ids are deliberately excluded:
+    independent databases assign different ids to the same planning delta. The
+    current schema has no durable delta UUID, so two genuinely separate deltas
+    with identical supplier/line/date/quantity axes remain indistinguishable.
     """
     lines = [
         {
-            "purchase_ids": sorted(int(pid) for pid in line.purchase_ids),
-            "item_id": int(line.item_id),
             "item_ref1c": line.item_ref1c,
             "unit_ref1c": line.unit_ref1c,
             "unit_name": line.unit_name,
@@ -274,22 +275,21 @@ def _group_batch_token(group: PurchaseOrderExportGroup) -> str:
     ]
     lines.sort(
         key=lambda line: (
-            line["item_id"],
             line["item_ref1c"] or "",
             line["unit_ref1c"] or "",
             line["unit_name"] or "",
             line["need_date"] or "",
             line["order_date"] or "",
-            tuple(line["purchase_ids"]),
         )
     )
     return _payload_hash({"supplier_ref1c": group.supplier_ref1c, "lines": lines})
 
 
 def _order_comment(run_id: int, group: PurchaseOrderExportGroup) -> str:
-    return (
+    return _add_origin_marker(
         f"PRODPLAN source=planned_purchase/run:{int(run_id)}; "
-        f"number={group.number}; batch={_group_batch_token(group)}"
+        f"number={group.number}; batch={_group_batch_token(group)}",
+        _group_batch_token(group)[:32],
     )
 
 
@@ -309,6 +309,17 @@ def _ensure_free_or_reusable_number(
     run_id: int,
     start_index: int,
 ) -> Optional[Dict[str, Any]]:
+    # Number is human-facing and may be reallocated by another planning run.
+    # The comment marker is the cross-instance recovery key.
+    by_origin = _find_document_by_origin(
+        client,
+        entity=PURCHASE_ORDER_ENTITY,
+        token=_group_batch_token(group)[:32],
+        select_fields=["Ref_Key", "Number", "Контрагент_Key", "Комментарий", "Запасы"],
+    )
+    if by_origin:
+        group.number = str(by_origin.get("Number") or group.number)
+        return by_origin
     index = start_index
     while index < start_index + 1000:
         group.number = _short_order_number(run_id, index)

@@ -27,8 +27,10 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from ...models import DbrFeederSignal, DbrSettings
+from ...models import DbrFeederSignal, DbrSettings, DbrSupermarketPosition
 from . import adapters, feeder_material_service
+from .journal_bridge import sync_journal_rows
+from .processing_trip_manifest import _assembly_component
 from .core.feeder import chain, signal_identity
 
 # Distinct advisory-lock key from the replenishment refresh ("DBRSIGNC").
@@ -60,6 +62,54 @@ def _desired_children(
     return desired
 
 
+def _processing_contract_filter(
+    db: Session,
+    signals: list[DbrFeederSignal],
+    desired: dict[tuple[int, str], tuple[DbrFeederSignal, chain.ChainDemand]],
+) -> tuple[
+    dict[tuple[int, str], tuple[DbrFeederSignal, chain.ChainDemand]],
+    dict[int, list[str]],
+]:
+    """Keep only the single tolling blank allowed by the processing contract."""
+    position_ids = {
+        int(signal.supermarket_position_id)
+        for signal in signals
+        if signal.supermarket_position_id is not None
+    }
+    processing_position_ids = {
+        int(row.id)
+        for row in db.query(DbrSupermarketPosition)
+        .filter(
+            DbrSupermarketPosition.id.in_(position_ids or [-1]),
+            DbrSupermarketPosition.supply_type == "processing",
+        )
+        .all()
+    }
+    allowed_by_parent: dict[int, str] = {}
+    invalid: dict[int, list[str]] = {}
+    for signal in signals:
+        if signal.supermarket_position_id is None or int(
+            signal.supermarket_position_id
+        ) not in processing_position_ids:
+            continue
+        bare, _ratio, reasons = _assembly_component(db, int(signal.item_id))
+        if reasons or bare is None:
+            invalid[int(signal.id)] = reasons or ["assembly_component_unresolved"]
+        else:
+            allowed_by_parent[int(signal.id)] = str(bare.item_code)
+
+    filtered = {
+        key: value
+        for key, value in desired.items()
+        if key[0] not in invalid
+        and (
+            key[0] not in allowed_by_parent
+            or key[1] == allowed_by_parent[key[0]]
+        )
+    }
+    return filtered, invalid
+
+
 def preview_chain_signals(db: Session) -> dict[str, Any]:
     """Dry-run: size the first chain level without creating anything (read-only).
 
@@ -74,6 +124,7 @@ def preview_chain_signals(db: Session) -> dict[str, Any]:
     aggregate = feeder_material_service.annotate_queue(db, signals, with_roots=False)
     id_to_code, _code_to_id = adapters.item_code_maps(db)
     desired = _desired_children(signals, aggregate["kits"], id_to_code)
+    desired, _invalid_contracts = _processing_contract_filter(db, signals, desired)
 
     parents_by_item: dict[str, int] = {}
     qty_by_item: dict[str, float] = {}
@@ -91,6 +142,103 @@ def preview_chain_signals(db: Session) -> dict[str, Any]:
             {"item": code, "parents": count, "qty_sum": round(qty_by_item[code], 4)}
             for code, count in top
         ],
+    }
+
+
+def preview_processing_chain_signals(db: Session) -> dict[str, Any]:
+    """Dry-run desired children for processing-buffer parent signals only.
+
+    This is deliberately read-only and shares ``_desired_children`` with the
+    common chain refresh, preventing a second set of BOM/coverage rules.
+    """
+    settings = db.get(DbrSettings, 1)
+    signals = (
+        db.query(DbrFeederSignal)
+        .join(
+            DbrSupermarketPosition,
+            DbrSupermarketPosition.id == DbrFeederSignal.supermarket_position_id,
+        )
+        .filter(
+            DbrFeederSignal.status == signal_identity.OPEN,
+            DbrSupermarketPosition.supply_type == "processing",
+            DbrSupermarketPosition.is_active.is_(True),
+        )
+        .order_by(
+            DbrFeederSignal.kit_force.desc(),
+            DbrFeederSignal.priority.desc(),
+            DbrFeederSignal.id,
+        )
+        .all()
+    )
+    aggregate = feeder_material_service.annotate_queue(db, signals, with_roots=False)
+    id_to_code, code_to_id = adapters.item_code_maps(db)
+    desired = _desired_children(signals, aggregate["kits"], id_to_code)
+    desired, invalid_contracts = _processing_contract_filter(db, signals, desired)
+    fallback_wh = settings.w2_warehouse_ref1c if settings is not None else None
+
+    children: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []
+    desired_parent_ids: set[int] = set()
+    for (parent_id, item_code), (parent, demand) in sorted(desired.items()):
+        desired_parent_ids.add(parent_id)
+        reasons: list[str] = []
+        if item_code not in code_to_id:
+            reasons.append("component_item_not_found")
+        if not (fallback_wh or parent.warehouse_ref1c):
+            reasons.append("receiving_warehouse_missing")
+        row = {
+            "parent_signal_id": parent_id,
+            "parent_item": id_to_code.get(int(parent.item_id)),
+            "component_item": item_code,
+            "suggested_qty": round(float(demand.qty), 4),
+            "shortage_qty": round(float(demand.shortfall), 4),
+            "warehouse_ref1c": fallback_wh or parent.warehouse_ref1c,
+            "unresolved_reasons": reasons,
+        }
+        children.append(row)
+        if reasons:
+            unresolved.append(row)
+
+    for signal in signals:
+        contract_reasons = invalid_contracts.get(int(signal.id))
+        if contract_reasons:
+            unresolved.append(
+                {
+                    "parent_signal_id": int(signal.id),
+                    "parent_item": id_to_code.get(int(signal.item_id)),
+                    "component_item": None,
+                    "suggested_qty": None,
+                    "shortage_qty": None,
+                    "warehouse_ref1c": fallback_wh or signal.warehouse_ref1c,
+                    "unresolved_reasons": contract_reasons,
+                }
+            )
+
+    netted_ids = set(aggregate["kits"])
+    for signal in signals:
+        if int(signal.id) not in netted_ids and int(signal.id) not in invalid_contracts:
+            unresolved.append(
+                {
+                    "parent_signal_id": int(signal.id),
+                    "parent_item": id_to_code.get(int(signal.item_id)),
+                    "component_item": None,
+                    "suggested_qty": None,
+                    "shortage_qty": None,
+                    "warehouse_ref1c": fallback_wh or signal.warehouse_ref1c,
+                    "unresolved_reasons": ["parent_bom_or_item_unresolved"],
+                }
+            )
+
+    return {
+        "read_only": True,
+        "processing_open_signals": len(signals),
+        "netted_signals": int(aggregate["netted"]),
+        "desired_children": len(children),
+        "distinct_components": len({row["component_item"] for row in children}),
+        "parents_with_children": len(desired_parent_ids),
+        "children": children,
+        "unresolved": unresolved,
+        "unresolved_count": len(unresolved),
     }
 
 
@@ -129,6 +277,7 @@ def refresh_chain_signals(db: Session, max_passes: int = 3) -> dict[str, Any]:
         open_ids = {int(s.id) for s in signals}
         netted_parent_ids = set(kits.keys())
         desired = _desired_children(signals, kits, id_to_code)
+        desired, _invalid_contracts = _processing_contract_filter(db, signals, desired)
 
         existing: dict[str, DbrFeederSignal] = {
             row.dedup_key: row
@@ -230,6 +379,7 @@ def refresh_chain_signals(db: Session, max_passes: int = 3) -> dict[str, Any]:
         if pass_created == 0:
             break  # no new links appeared — the chain converged
 
+    journal_bridge = sync_journal_rows(db)
     return {
         "created": created,
         "updated": updated,
@@ -237,4 +387,5 @@ def refresh_chain_signals(db: Session, max_passes: int = 3) -> dict[str, Any]:
         "revoked": revoked,
         "no_warehouse": no_warehouse,
         "passes": passes,
+        "journal_bridge": journal_bridge,
     }

@@ -115,3 +115,49 @@ def test_status_reports_all_jobs(tmp_state, monkeypatch):
     assert snap["configured"] is True
     assert len(snap["jobs"]) == len(orch.SYNC_JOBS)
     assert all("next_due_at" in j and "interval_seconds" in j for j in snap["jobs"])
+
+
+def test_source_sync_marks_dbr_dirty_and_next_tick_runs_maintenance(tmp_state, monkeypatch):
+    calls = []
+
+    def stock(db, config):
+        calls.append("stock")
+        return {"stock": "ok"}
+
+    job = SyncJob("stock", "Stock", 1800, stock)
+    monkeypatch.setattr(orch, "SYNC_JOBS", [job])
+    monkeypatch.setattr(orch, "_JOB_BY_ID", {"stock": job})
+    monkeypatch.setattr(orch, "_ORDER_INDEX", {"stock": 0})
+    monkeypatch.setattr(orch, "load_odata_config", lambda: {"base_url": "http://x/unf_demo/odata"})
+    monkeypatch.setattr(orch, "pull_queue_health", lambda db: {"pending": 0, "error_retryable": 0, "error_exhausted": 0, "ready": 0})
+    monkeypatch.setattr(orch, "_run_dbr_maintenance", lambda db, full: calls.append("dbr") or {"full": full})
+
+    now = datetime(2026, 7, 23, 12, 0, tzinfo=timezone.utc)
+    first = orch.tick(db=None, now=now)
+    assert first["job"] == "stock"
+    assert calls == ["stock"]  # never recalculate DBR in the source-sync tick
+    assert orch.status()["dbr_maintenance"]["dirty"] is True
+
+    second = orch.tick(db=None, now=now + timedelta(seconds=1))
+    assert second["job"] == "dbrMaintenance"
+    assert second["mode"] == "incremental"
+    assert calls == ["stock", "dbr"]
+    assert orch.status()["dbr_maintenance"]["dirty"] is False
+
+
+def test_dbr_maintenance_failure_keeps_dirty_marker_with_backoff(tmp_state, monkeypatch):
+    monkeypatch.setattr(orch, "load_odata_config", lambda: {"base_url": "http://x/unf_demo/odata"})
+    monkeypatch.setattr(orch, "pull_queue_health", lambda db: {"pending": 0, "error_retryable": 0, "error_exhausted": 0, "ready": 0})
+    monkeypatch.setattr(orch, "_run_dbr_maintenance", lambda db, full: (_ for _ in ()).throw(RuntimeError("broken")))
+    now = datetime(2026, 7, 23, 12, 0, tzinfo=timezone.utc)
+    orch._save_state({"dbr_maintenance": {"dirty": True}})
+
+    class _DB:
+        def rollback(self):
+            pass
+
+    result = orch.tick(db=_DB(), now=now)
+    assert result["status"] == "error"
+    maintenance = orch.status()["dbr_maintenance"]
+    assert maintenance["dirty"] is True
+    assert maintenance["next_retry_at"] is not None

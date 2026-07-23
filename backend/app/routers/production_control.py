@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from typing import Annotated, List, Optional
+from typing import Annotated, List, Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
 from ..database import get_db
@@ -227,7 +227,110 @@ class OrderCompletionRepairPayload(BaseModel):
     max_records: int = 5000
 
 
-@router.get("/orders", response_model=dict)
+class ProductionOrderPlanningResponse(BaseModel):
+    """DBR provenance for a journal line; absent for non-DBR contours."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    contour: str
+    source_id: int
+    schedule_id: Optional[int] = None
+    slot_id: Optional[int] = None
+    signal_type: str
+    priority: Optional[float] = None
+    zone: Optional[str] = None
+    need_date: Optional[str] = None
+    required_date: Optional[str] = None
+    queue_state: str
+    chain_depth: int = 0
+    parent_signal_id: Optional[int] = None
+    reason: Optional[str] = None
+
+
+class PaintWeldChainResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: str
+    link_id: int
+    counterpart_order_id: Optional[int] = None
+    counterpart_product_id: Optional[int] = None
+
+
+class ProductionOrderJournalRowResponse(BaseModel):
+    """One real production line in the unified production-control journal."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    product_id: int
+    order_id: int
+    order_number: str
+    order_prodplan_number: Optional[str] = None
+    order_date: Optional[str] = None
+    order_source: str
+    source: str
+    order_ref1c: Optional[str] = None
+    order_one_c_number: Optional[str] = None
+    line_number: Optional[Union[int, str]] = None
+    item_id: int
+    item_code: str
+    item_name: str
+    item_article: str
+    optimal_batch: Optional[float] = None
+    unit: str
+    quantity: float
+    produced_qty: float
+    remaining_qty: float
+    status: str
+    coverage_status: str
+    coverage_label: str
+    issue_status: str
+    material_coverage_status: Optional[str] = None
+    material_coverage_label: Optional[str] = None
+    material_coverage_calculated_at: Optional[str] = None
+    planned_start_date: Optional[str] = None
+    planned_finish_date: Optional[str] = None
+    forecast_date: Optional[str] = None
+    forecast_shift_days: Optional[int] = None
+    forecast_reason: Optional[str] = None
+    opened_at: Optional[str] = None
+    workshop_id: Optional[int] = None
+    workshop_name: Optional[str] = None
+    stage_id: Optional[int] = None
+    stage_name: Optional[str] = None
+    spec_id: Optional[int] = None
+    issue_count: int
+    route_sheet_printed_at: Optional[str] = None
+    comment: str
+    failed_manufacture_id: Optional[int] = None
+    failed_manufacture_error: Optional[str] = None
+    source_run_id: Optional[int] = None
+    source_plan_id: Optional[int] = None
+    source_plan_name: Optional[str] = None
+    source_plan_period_from: Optional[str] = None
+    source_plan_period_to: Optional[str] = None
+    source_planned_order_id: Optional[int] = None
+    source_mrp_requirement_id: Optional[int] = None
+    source_mrp_allocation_key: Optional[str] = None
+    mrp_req_net_qty: Optional[float] = None
+    mrp_req_covered_qty: Optional[float] = None
+    mrp_req_remaining_qty: Optional[float] = None
+    source_dbr_signal_id: Optional[int] = None
+    planning: Optional[ProductionOrderPlanningResponse] = None
+    paint_weld_chain: Optional[PaintWeldChainResponse] = None
+
+
+class ProductionOrderJournalResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rows: List[ProductionOrderJournalRowResponse]
+    total: int
+    limit: int
+    offset: int
+    latest_run_id: Optional[int] = None
+    latest_source_plan_id: Optional[int] = None
+
+
+@router.get("/orders", response_model=ProductionOrderJournalResponse)
 def get_orders_journal(
     product_id: Optional[int] = None,
     order_id: Optional[int] = None,
@@ -235,6 +338,10 @@ def get_orders_journal(
     workshop_id: Optional[int] = None,
     status: Optional[str] = None,
     coverage_status: Optional[str] = None,
+    planning_contour: Optional[str] = Query(
+        None,
+        description="Контур планирования: dbr_feeder для очереди мехцеха; mrp, dbr или 1c для источника заказа.",
+    ),
     search: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
@@ -253,6 +360,7 @@ def get_orders_journal(
             workshop_id=workshop_id,
             status=status,
             coverage_status=coverage_status,
+            planning_contour=planning_contour,
             search=search,
             date_from=date_from,
             date_to=date_to,

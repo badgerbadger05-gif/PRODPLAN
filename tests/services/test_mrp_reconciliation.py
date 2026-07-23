@@ -6,6 +6,7 @@ import pytest
 
 from app.models import (
     DefaultSpecification,
+    DbrFeederSignal,
     Item,
     MrpFreezeAllocation,
     MrpRequirement,
@@ -417,6 +418,80 @@ def test_reconcile_tops_up_after_partial_close(db_session):
     # Running again is idempotent: the new order is open WIP, so no further gap.
     res = reconcile_snapshot(db_session, run_id)
     assert res["production_added"] == []
+
+
+def test_reconcile_applies_dbr_remaining_qty_and_only_tops_up_residual(db_session):
+    item = _make_production_item(db_session, "P-DBR-OWNED", stock=0.0)
+    plan = ProductionPlanHeader(
+        name="План DBR ownership",
+        period_from=date(2026, 6, 1),
+        period_to=date(2026, 6, 30),
+        status="fixed",
+        created_by="test",
+    )
+    db_session.add(plan)
+    db_session.flush()
+    db_session.add(ProductionPlanLine(
+        plan_id=plan.id,
+        item_id=item.item_id,
+        bucket_date=date(2026, 6, 15),
+        qty=20,
+    ))
+    db_session.commit()
+    run_id = create_mrp_snapshot_from_period_plan(db_session, plan.id)["run_id"]
+    req = db_session.query(MrpRequirement).filter_by(
+        run_id=run_id,
+        item_id=item.item_id,
+    ).one()
+    signal = DbrFeederSignal(
+        dedup_key="R:P-DBR-OWNED",
+        signal_type="Пополнение",
+        item_id=item.item_id,
+        warehouse_ref1c="W2",
+        status="Open",
+        suggested_qty=7,
+        priority=1,
+    )
+    db_session.add(signal)
+    db_session.flush()
+    order = ProductionOrder(
+        order_number=f"DBR-S{signal.id}",
+        order_date=date(2026, 6, 1),
+        source="dbr",
+    )
+    db_session.add(order)
+    db_session.flush()
+    db_session.add(ProductionProduct(
+        order_id=order.order_id,
+        item_id=item.item_id,
+        line_number=1,
+        quantity=7,
+        produced_qty=0,
+        remaining_qty=7,
+        source_dbr_signal_id=signal.id,
+    ))
+    db_session.commit()
+
+    result = reconcile_snapshot(db_session, run_id)
+
+    assert len(result["production_added"]) == 1
+    assert result["production_added"][0]["qty"] == 13.0
+    assert result["production_trimmed"] == []
+    assert result["dbr_owned_skipped"] == [{
+        "item_id": item.item_id,
+        "item_code": item.item_code,
+        "item_name": item.item_name,
+        "requirement_id": req.id,
+        "qty": 7.0,
+        "reason": "active_dbr_remaining_qty_applied_before_mrp",
+    }]
+    db_session.refresh(req)
+    assert float(req.covered_qty) == 20.0
+    assert float(req.remaining_qty) == 0.0
+    assert db_session.query(ProductionOrder).filter(
+        ProductionOrder.source == "mrp",
+        ProductionOrder.source_run_id == run_id,
+    ).count() == 1
 
 
 def test_reconcile_tops_up_when_stock_drops_after_snapshot(db_session):

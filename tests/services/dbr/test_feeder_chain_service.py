@@ -8,6 +8,7 @@ from app.models import (
     DefaultSpecification,
     Item,
     ItemWarehouseStock,
+    SpecComponent,
     Specification,
 )
 from app.services.dbr import feeder_chain_service, feeder_material_service, settings_service
@@ -222,3 +223,150 @@ def test_preview_is_read_only_and_sizes_first_level(db_session, monkeypatch):
     assert preview["top_items"][0]["item"] == "MAKE1"
     # dry-run writes nothing
     assert db.query(DbrFeederSignal).filter(DbrFeederSignal.signal_type == "Цепочка").count() == 0
+
+
+def test_processing_preview_reuses_chain_rules_and_writes_nothing(db_session, monkeypatch):
+    db = db_session
+    prod, make = _base(db, monkeypatch)
+    spec = Specification(spec_ref1c="spec-PROD", spec_name="PROD")
+    db.add(spec)
+    db.flush()
+    db.add(DefaultSpecification(item_id=prod.item_id, spec_id=spec.spec_id))
+    db.add(
+        SpecComponent(
+            spec_id=spec.spec_id,
+            item_id=make.item_id,
+            quantity=1,
+            component_type="Сборка",
+        )
+    )
+    position = DbrSupermarketPosition(
+        item_id=prod.item_id, warehouse_ref1c="W4", supply_type="processing",
+        mode="shelf", is_active=True, is_stale=False, adu=1, commonality=1,
+        rt_days=1, rt_source="chain", batch_days=1, q_batch=1,
+        k_var=Decimal("0.5"), supply_risk_pct=0, red_qty=1, yellow_qty=1,
+        green_qty=1, target_qty=3, data_quality=[], calculation_snapshot={},
+    )
+    db.add(position)
+    db.flush()
+    parent = _parent(db, prod)
+    parent.supermarket_position_id = position.id
+    db.flush()
+
+    preview = feeder_chain_service.preview_processing_chain_signals(db)
+
+    assert preview["read_only"] is True
+    assert preview["processing_open_signals"] == 1
+    assert preview["desired_children"] == 1
+    assert preview["children"][0]["component_item"] == "MAKE1"
+    assert preview["unresolved_count"] == 0
+    assert db.query(DbrFeederSignal).filter(DbrFeederSignal.signal_type == "Цепочка").count() == 0
+
+
+def test_processing_preview_only_proposes_single_assembly_component(db_session, monkeypatch):
+    db = db_session
+    _settings(db)
+    covered = _item(db, "COVERED")
+    bare = _item(db, "BARE", spec=True)
+    other = _item(db, "OTHER", spec=True)
+    spec = Specification(spec_ref1c="spec-covered", spec_name="covered")
+    db.add(spec)
+    db.flush()
+    db.add(DefaultSpecification(item_id=covered.item_id, spec_id=spec.spec_id))
+    db.add_all(
+        [
+            SpecComponent(
+                spec_id=spec.spec_id,
+                item_id=bare.item_id,
+                quantity=1,
+                component_type="Сборка",
+            ),
+            SpecComponent(
+                spec_id=spec.spec_id,
+                item_id=other.item_id,
+                quantity=1,
+                component_type="Материал",
+            ),
+        ]
+    )
+    for item in (bare, other):
+        _stock(db, item, 0)
+    position = DbrSupermarketPosition(
+        item_id=covered.item_id, warehouse_ref1c="W4", supply_type="processing",
+        mode="shelf", is_active=True, is_stale=False, adu=1, commonality=1,
+        rt_days=1, rt_source="chain", batch_days=1, q_batch=1,
+        k_var=Decimal("0.5"), supply_risk_pct=0, red_qty=1, yellow_qty=1,
+        green_qty=1, target_qty=3, data_quality=[], calculation_snapshot={},
+    )
+    db.add(position)
+    db.flush()
+    parent = _parent(db, covered)
+    parent.supermarket_position_id = position.id
+    db.flush()
+    monkeypatch.setattr(
+        feeder_material_service,
+        "build_kit",
+        lambda code, *_: (
+            [
+                KitLine("BARE", 1, "W4", True),
+                KitLine("OTHER", 1, "W4", True),
+            ]
+            if code == "COVERED"
+            else []
+        ),
+    )
+
+    preview = feeder_chain_service.preview_processing_chain_signals(db)
+
+    assert [row["component_item"] for row in preview["children"]] == ["BARE"]
+
+
+def test_processing_refresh_never_creates_non_assembly_shortage(db_session, monkeypatch):
+    db = db_session
+    _settings(db)
+    covered = _item(db, "COVERED-REFRESH")
+    bare = _item(db, "BARE-REFRESH", spec=True)
+    other = _item(db, "OTHER-REFRESH", spec=True)
+    spec = Specification(spec_name="covered-refresh")
+    db.add(spec)
+    db.flush()
+    db.add(DefaultSpecification(item_id=covered.item_id, spec_id=spec.spec_id))
+    db.add_all(
+        [
+            SpecComponent(spec_id=spec.spec_id, item_id=bare.item_id, quantity=1, component_type="Сборка"),
+            SpecComponent(spec_id=spec.spec_id, item_id=other.item_id, quantity=1, component_type="Материал"),
+        ]
+    )
+    for item in (bare, other):
+        _stock(db, item, 0)
+    position = DbrSupermarketPosition(
+        item_id=covered.item_id, warehouse_ref1c="W4", supply_type="processing",
+        mode="shelf", is_active=True, is_stale=False, adu=1, commonality=1,
+        rt_days=1, rt_source="chain", batch_days=1, q_batch=1,
+        k_var=Decimal("0.5"), supply_risk_pct=0, red_qty=1, yellow_qty=1,
+        green_qty=1, target_qty=3, data_quality=[], calculation_snapshot={},
+    )
+    db.add(position)
+    db.flush()
+    parent = _parent(db, covered)
+    parent.supermarket_position_id = position.id
+    db.flush()
+    monkeypatch.setattr(
+        feeder_material_service,
+        "build_kit",
+        lambda code, *_: (
+            [
+                KitLine("BARE-REFRESH", 1, "W4", True),
+                KitLine("OTHER-REFRESH", 1, "W4", True),
+            ]
+            if code == "COVERED-REFRESH"
+            else []
+        ),
+    )
+
+    feeder_chain_service.refresh_chain_signals(db, max_passes=1)
+
+    children = db.query(DbrFeederSignal).filter(
+        DbrFeederSignal.signal_type == "Цепочка"
+    ).all()
+    assert [db.get(Item, row.item_id).item_code for row in children] == ["BARE-REFRESH"]

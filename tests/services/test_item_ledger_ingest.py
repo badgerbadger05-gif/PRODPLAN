@@ -316,6 +316,20 @@ def test_enqueue_recorder_pull_is_pending_no_odata(db_session):
     assert again.id == row.id and again.status == "pending"
 
 
+def test_reenqueue_resets_failed_pull_retry_bookkeeping(db_session):
+    _setup(db_session)
+    row = enqueue_recorder_pull(db_session, ASSEMBLY, "asm-retry", source="manufacture_export")
+    row.status = "error"
+    row.attempts = 5
+    row.last_error = "1C timeout"
+    db_session.commit()
+
+    again = enqueue_recorder_pull(db_session, ASSEMBLY, "asm-retry")
+    assert again.status == "pending"
+    assert again.attempts == 0
+    assert again.last_error is None
+
+
 def test_process_pending_pulls_happy(db_session):
     item1, _ = _setup(db_session)
     enqueue_recorder_pull(db_session, ASSEMBLY, "asm-1", source="manufacture_export")

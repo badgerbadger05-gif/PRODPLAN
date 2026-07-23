@@ -25,6 +25,7 @@ from ...models import (
 )
 from ..production_control_reservations import load_reservation_state
 from . import adapters, classify as classify_mod
+from .journal_bridge import sync_journal_rows
 from .core.drum.kit import build_kit
 from . import feeder_material_service, feeder_nfp_service
 from .core.feeder import signal_identity, zones
@@ -427,9 +428,11 @@ def refresh_signals(db: Session, expected_schedule_id: Optional[int] = None) -> 
             signal.reason_json = {"missing_reasons": [reason], "generator": "chronological_under_schedule" if signal.signal_type == "Под график" else "bulk_live_nfp"}
             cancelled += 1
     db.flush()
+    journal_bridge = sync_journal_rows(db)
     return {
         **preview, "created": created, "updated": updated, "reopened": reopened,
         "cancelled": cancelled, "diagnostic_persisted": diagnostic,
+        "journal_bridge": journal_bridge,
     }
 
 

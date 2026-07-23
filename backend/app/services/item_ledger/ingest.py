@@ -441,6 +441,11 @@ def enqueue_recorder_pull(
         session.add(row)
     else:
         row.status = "pending"
+        # A new export/reconcile event is a fresh request, not another retry of
+        # the old failed pull. Otherwise an exhausted row could never re-enter
+        # the bounded worker queue.
+        row.attempts = 0
+        row.last_error = None
         if source:
             row.source = source
     session.flush()

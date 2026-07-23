@@ -507,3 +507,23 @@ def test_purchase_order_batch_token_is_independent_of_line_order():
     )
 
     assert exporter._group_batch_token(forward) == exporter._group_batch_token(reversed_group)
+
+
+def test_purchase_order_batch_token_ignores_local_ids_but_separates_real_delta():
+    def group(*, purchase_id, item_id, qty):
+        return exporter.PurchaseOrderExportGroup(
+            supplier_ref1c="supplier-token", number="local-number",
+            lines=[exporter.PurchaseOrderExportLine(
+                purchase_ids=[purchase_id], item_id=item_id, item_ref1c="item-a",
+                item_name="A", item_article="A", unit_ref1c="unit-ref",
+                unit_name="шт", qty=qty, need_date="2026-06-01",
+                order_date="2026-05-27",
+            )],
+        )
+
+    assert exporter._group_batch_token(group(purchase_id=1, item_id=2, qty=5)) == (
+        exporter._group_batch_token(group(purchase_id=9001, item_id=8002, qty=5))
+    )
+    assert exporter._group_batch_token(group(purchase_id=1, item_id=2, qty=5)) != (
+        exporter._group_batch_token(group(purchase_id=1, item_id=2, qty=6))
+    )

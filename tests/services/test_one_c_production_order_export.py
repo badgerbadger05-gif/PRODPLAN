@@ -95,12 +95,24 @@ def _mk_mrp_order(db, item, *, run_id: int, qty=5, deletion=False) -> Production
 class _FakeClient:
     """Minimal stand-in for OData1CClient.post."""
 
-    def __init__(self, *, ref_key: str = "fake-1c-ref-key", fail: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        ref_key: str = "fake-1c-ref-key",
+        fail: bool = False,
+        existing_docs: list | None = None,
+    ) -> None:
         self.ref_key = ref_key
         self.fail = fail
         self.posts: list = []
         self.patches: list = []
         self.operations: list = []
+        self.existing_docs = existing_docs or []
+        self.get_calls: list = []
+
+    def get_all(self, entity, **kwargs):
+        self.get_calls.append((entity, kwargs))
+        return list(self.existing_docs)
 
     def post(self, entity, payload, **_kwargs):
         self.posts.append((entity, payload))
@@ -335,6 +347,42 @@ def test_second_export_is_noop_due_to_existing_link(db_session, monkeypatch):
     assert result["orders_created"] == 0
     assert result["orders_already_linked"] == 1
     assert len(fake.posts) == 1  # no additional POST
+
+
+def test_empty_local_link_recovers_document_from_1c_origin_marker(db_session, monkeypatch):
+    db = db_session
+    item = _mk_item(db, code="PX", ref1c="99999999-9999-9999-9999-999999999999")
+    run = _mk_run(db)
+    order = _mk_mrp_order(db, item, run_id=run.run_id, qty=7)
+    preview = exporter.export_production_orders_to_1c(db, [order.order_id], dry_run=True)
+    comment = preview["payloads"][0]["payload"]["Комментарий"]
+    assert "prodplan-origin=" in comment
+
+    _stub_odata_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    fake = _FakeClient(
+        existing_docs=[
+            {
+                "Ref_Key": "cross-instance-ref",
+                "Number": "OTHER",
+                "Комментарий": comment,
+                "Posted": True,
+            }
+        ]
+    )
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    result = exporter.export_production_orders_to_1c(
+        db, [order.order_id], dry_run=False
+    )
+
+    assert result["orders_created"] == 0
+    assert result["orders_recovered"] == 1
+    assert fake.posts == []
+    db.refresh(order)
+    assert order.order_ref1c == "cross-instance-ref"
+    assert db.query(SyncLink).filter_by(
+        source_doctype="production_order", source_id=order.order_id
+    ).one().target_ref_key == "cross-instance-ref"
 
 
 def test_existing_error_link_with_ref_patches_not_posts_duplicate(db_session, monkeypatch):

@@ -29,6 +29,7 @@ from ...models import (
     DbrDrumSlot,
     DbrFeederSignal,
     Item,
+    ProductionProduct,
     SyncLink,
 )
 from ..odata_client import OData1CClient
@@ -36,6 +37,9 @@ from ..odata_config import load_odata_config as _load_odata_config
 from ..one_c_export_common import (
     clean_ref1c,
     create_odata_client,
+    add_origin_marker,
+    find_document_by_origin,
+    origin_token,
     post_document_operational,
     post_export_entries,
 )
@@ -197,7 +201,12 @@ def _make_entry(
     )
 
 
-def _build_payload(entry: ProductionOrderExportEntry, source_doctype: str) -> dict[str, Any]:
+def _build_payload(
+    entry: ProductionOrderExportEntry,
+    source_doctype: str,
+    *,
+    durable_identity: Optional[str] = None,
+) -> dict[str, Any]:
     config = _load_odata_config()
     defaults = _export_defaults(config)
     payload = _build_header_payload(entry, defaults)
@@ -206,6 +215,22 @@ def _build_payload(entry: ProductionOrderExportEntry, source_doctype: str) -> di
     payload["Комментарий"] = (
         f"PRODPLAN source={source_doctype}/{entry.order_id}; dbr; number={entry.number}"
     )
+    entry.origin_token = origin_token(
+        f"dbr:{source_doctype}",
+        durable_identity or {
+            "lines": [
+                {
+                    "item_ref1c": line.item_ref1c,
+                    "characteristic_ref1c": line.characteristic_ref1c or "",
+                    "qty": float(line.qty),
+                }
+                for line in entry.lines
+            ],
+            "planned_start": str(entry.planned_start_date or ""),
+            "planned_finish": str(entry.planned_finish_date or ""),
+        },
+    )
+    payload["Комментарий"] = add_origin_marker(payload["Комментарий"], entry.origin_token)
     return payload
 
 
@@ -222,6 +247,38 @@ def _write_entry(
     client = create_odata_client(
         config, OData1CClient, allow_production=allow_production, require_demo_base=True
     )
+
+    existing_doc = find_document_by_origin(
+        client,
+        entity=PRODUCTION_ORDER_ENTITY,
+        token=str(entry.origin_token),
+    )
+    recovered_ref = clean_ref1c((existing_doc or {}).get("Ref_Key"))
+    if recovered_ref and not clean_ref1c(entry.target_ref_key):
+        entry.target_ref_key = recovered_ref
+        _upsert_dbr_link(
+            db,
+            source_doctype=source_doctype,
+            source_id=int(entry.order_id),
+            target_number=str((existing_doc or {}).get("Number") or entry.number),
+            payload_hash="recovered-by-origin",
+            target_ref_key=recovered_ref,
+            status="success",
+            last_error=None,
+        )
+        stamp(
+            recovered_ref,
+            str((existing_doc or {}).get("Number") or entry.number),
+        )
+        db.commit()
+        entry.status = "existing"
+        return {
+            "created": 0,
+            "errored": 0,
+            "target_ref_key": recovered_ref,
+            "status": "existing",
+            "error": None,
+        }
 
     def _on_success(export_entry: ProductionOrderExportEntry, ref_key: str) -> None:
         post_document_operational(
@@ -320,7 +377,22 @@ def release_slot(db: Session, slot_id: int, dry_run: bool = True) -> dict[str, A
     elif existing is not None and clean_ref1c(existing.target_ref_key):
         entry.target_ref_key = clean_ref1c(existing.target_ref_key)
 
-    payload = _build_payload(entry, SLOT_DOCTYPE)
+    slot_identity = {
+        "schedule_period": [
+            str(slot.schedule.period_from),
+            str(slot.schedule.period_to),
+        ],
+        "item_ref1c": clean_ref1c(slot.item.item_ref1c),
+        "resource": slot.resource.resource_name if slot.resource else None,
+        "planned_date": str(slot.planned_date),
+        "position": slot.position,
+        "qty": float(slot.qty or 0),
+    }
+    payload = _build_payload(
+        entry,
+        SLOT_DOCTYPE,
+        durable_identity=str(slot_identity),
+    )
 
     base = {
         "ok": True,
@@ -381,7 +453,12 @@ def _signal_can_launch(db: Session, signal: DbrFeederSignal) -> dict[str, Any]:
     return annotations.get(int(signal.id), {})
 
 
-def launch_signal(db: Session, signal_id: int, dry_run: bool = True) -> dict[str, Any]:
+def launch_signal(
+    db: Session,
+    signal_id: int,
+    dry_run: bool = True,
+    allow_production: bool = False,
+) -> dict[str, Any]:
     """Launch one Open + complete feeder signal → Document_ЗаказНаПроизводство in 1С.
 
     Gate: the signal must be Open, complete, and pass the material ``can_launch``
@@ -437,7 +514,11 @@ def launch_signal(db: Session, signal_id: int, dry_run: bool = True) -> dict[str
     if already or (existing is not None and clean_ref1c(existing.target_ref_key)):
         entry.target_ref_key = clean_ref1c(existing.target_ref_key)
 
-    payload = _build_payload(entry, SIGNAL_DOCTYPE)
+    payload = _build_payload(
+        entry,
+        SIGNAL_DOCTYPE,
+        durable_identity=str(signal.dedup_key),
+    )
 
     base = {
         "ok": True,
@@ -466,6 +547,15 @@ def launch_signal(db: Session, signal_id: int, dry_run: bool = True) -> dict[str
         signal.one_c_order_ref = ref_key
         signal.one_c_order_number = number
         signal.status = signal_identity.ORDER_CREATED
+        product = (
+            db.query(ProductionProduct)
+            .filter(ProductionProduct.source_dbr_signal_id == int(signal.id))
+            .one_or_none()
+        )
+        if product is not None:
+            product.order.order_ref1c = ref_key
+            if number:
+                product.order.order_number = number
 
     outcome = _write_entry(
         db,
@@ -473,7 +563,7 @@ def launch_signal(db: Session, signal_id: int, dry_run: bool = True) -> dict[str
         payload=payload,
         source_doctype=SIGNAL_DOCTYPE,
         stamp=_stamp,
-        allow_production=True,
+        allow_production=allow_production,
     )
     return {
         **base,

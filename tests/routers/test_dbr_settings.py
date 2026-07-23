@@ -82,6 +82,9 @@ def test_get_settings_returns_defaults(client):
     assert data["batch_days_welding"] == 5
     assert data["batch_days_paint_black"] == 2
     assert data["batch_days_paint_color"] == 3
+    assert data["rt_processing_days"] == 25
+    assert data["processing_trip_interval_days"] == 7
+    assert data["processing_roundtrip_days"] == 14
     assert data["feeder_chain_enabled"] is False
     assert data["feeder_load_horizon_weeks"] == 4
     assert str(data["shelf_threshold_qty"]) in ("5", "5.0", "5.000")
@@ -95,6 +98,9 @@ def test_put_settings_patches_fields(client):
         json={
             "frozen_days": 5,
             "feeder_chain_enabled": False,
+            "rt_processing_days": 20,
+            "processing_trip_interval_days": 5,
+            "processing_roundtrip_days": 12,
             "w2_warehouse_ref1c": "WH-2-REF",
             "w3_warehouse_ref1c": "WH-3-REF",
             "fastener_categories": ["Болты", "Гайки"],
@@ -104,6 +110,9 @@ def test_put_settings_patches_fields(client):
     data = resp.json()
     assert data["frozen_days"] == 5
     assert data["feeder_chain_enabled"] is False
+    assert data["rt_processing_days"] == 20
+    assert data["processing_trip_interval_days"] == 5
+    assert data["processing_roundtrip_days"] == 12
     assert data["w2_warehouse_ref1c"] == "WH-2-REF"
     assert data["w3_warehouse_ref1c"] == "WH-3-REF"
     assert data["fastener_categories"] == ["Болты", "Гайки"]
@@ -114,6 +123,53 @@ def test_put_settings_patches_fields(client):
     again = client.get("/api/v1/dbr/settings").json()
     assert again["frozen_days"] == 5
     assert again["w2_warehouse_ref1c"] == "WH-2-REF"
+    assert again["processing_roundtrip_days"] == 12
+
+
+def test_processing_chain_preview_endpoint_is_read_only(client):
+    client.put(
+        "/api/v1/dbr/settings",
+        json={
+            "w2_warehouse_ref1c": "W2",
+            "w3_warehouse_ref1c": "W3",
+            "w4_warehouse_ref1c": "W4",
+        },
+    )
+
+    response = client.post("/api/v1/dbr/feeder/processing/chain/preview")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "read_only": True,
+        "processing_open_signals": 0,
+        "netted_signals": 0,
+        "desired_children": 0,
+        "distinct_components": 0,
+        "parents_with_children": 0,
+        "children": [],
+        "unresolved": [],
+        "unresolved_count": 0,
+    }
+
+
+def test_processing_trip_manifest_endpoints_are_read_only_and_printable(client):
+    response = client.get("/api/v1/dbr/feeder/processing/trip-manifest")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "read_only": True,
+        "processing_trip_interval_days": 7,
+        "signals_total": 0,
+        "contractors_total": 0,
+        "unresolved_count": 0,
+        "contractors": [],
+    }
+
+    printable = client.get("/api/v1/dbr/feeder/processing/trip-manifest/print")
+    assert printable.status_code == 200
+    assert printable.headers["content-type"].startswith("text/html")
+    assert "Рейс на переработку" in printable.text
+    assert "window.print()" in printable.text
 
 
 def test_put_settings_persists_across_independent_request_sessions(tmp_path):
