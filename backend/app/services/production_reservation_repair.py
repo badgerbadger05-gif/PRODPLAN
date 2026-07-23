@@ -11,6 +11,7 @@ from .production_control_material_issues import (
     _components_for_product,
     _destination_warehouse_for_product,
 )
+from .planning_truth import require_accepted_truth
 from .production_control_reservations import load_reservation_state
 
 
@@ -29,6 +30,7 @@ def repair_in_place_reservations(
     and PRODPLAN only needs its reservation ledger to catch up. It never
     creates or posts 1C transfer documents.
     """
+    truth = require_accepted_truth(db, "production_reservation_repair")
     repaired: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
@@ -88,7 +90,8 @@ def repair_in_place_reservations(
             claims,
             spec_id=spec_id,
             destination_warehouse_ref1c=destination,
-            initiated_by=initiated_by or "reservation-repair",
+                initiated_by=initiated_by or "reservation-repair",
+                ledger_generation_id=int(truth.generation_id),
         )
         state = (
             product.control_state

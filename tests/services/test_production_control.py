@@ -39,6 +39,7 @@ from app.models import (
     WorkshopWarehouseBinding,
     LedgerGeneration,
     PhysicalImportBatch,
+    StockBin,
 )
 from app.routers.production_control import (
     get_order_line_materials,
@@ -91,6 +92,15 @@ def _accepted_mrp_context(db_session, *, key: str):
     publish_generation(db_session, generation)
     db_session.flush()
     return generation, cutoff
+
+
+def _accepted_stock_bin(db_session, item_id: int, warehouse_ref1c: str, qty: float) -> StockBin:
+    """Seed the exact accepted Ledger fold, never legacy ItemWarehouseStock."""
+    return StockBin(
+        ledger_generation_id=int(db_session.info["production_journal_generation_id"]),
+        item_id=int(item_id), characteristic_ref="", organization_ref="",
+        warehouse_ref1c=warehouse_ref1c, on_hand=qty,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -3168,8 +3178,8 @@ def test_create_material_issues_splits_components_by_source_warehouse(db_session
     # claimed in place (direction='in_place') instead of being transferred,
     # which is covered by test_section_stock_reservations.py.
     db_session.add_all([
-        ItemWarehouseStock(item_id=comp_a.item_id, warehouse_ref1c="WH-A", qty=5),
-        ItemWarehouseStock(item_id=comp_b.item_id, warehouse_ref1c="WH-B", qty=5),
+        _accepted_stock_bin(db_session, comp_a.item_id, "WH-A", 5),
+        _accepted_stock_bin(db_session, comp_b.item_id, "WH-B", 5),
     ])
     db_session.commit()
 
@@ -3216,7 +3226,7 @@ def test_create_material_issues_skips_component_already_on_destination_warehouse
     db_session.add(ProductionOrderLineState(product_id=product.product_id, workshop_id=workshop.resource_id))
     db_session.add(WorkshopWarehouseBinding(workshop_id=workshop.resource_id, warehouse_ref1c="WH-DEST"))
     db_session.add(StockWarehouse(warehouse_ref1c="WH-DEST", warehouse_code="DEST", warehouse_name="Участок", is_selected=True))
-    db_session.add(ItemWarehouseStock(item_id=comp.item_id, warehouse_ref1c="WH-DEST", qty=2))
+    db_session.add(_accepted_stock_bin(db_session, comp.item_id, "WH-DEST", 2))
     db_session.commit()
 
     result = create_material_issues(db_session, [product.product_id], initiated_by="op")
@@ -3263,8 +3273,8 @@ def test_create_material_issues_moves_only_missing_qty_when_partially_on_destina
         StockWarehouse(warehouse_ref1c="WH-SRC", warehouse_code="SRC", warehouse_name="Склад", is_selected=True),
     ])
     db_session.add_all([
-        ItemWarehouseStock(item_id=comp.item_id, warehouse_ref1c="WH-DEST", qty=2),
-        ItemWarehouseStock(item_id=comp.item_id, warehouse_ref1c="WH-SRC", qty=10),
+        _accepted_stock_bin(db_session, comp.item_id, "WH-DEST", 2),
+        _accepted_stock_bin(db_session, comp.item_id, "WH-SRC", 10),
     ])
     db_session.commit()
 
@@ -3313,8 +3323,8 @@ def test_create_material_issues_does_not_reuse_destination_stock_for_multiple_pr
         StockWarehouse(warehouse_ref1c="WH-SRC", warehouse_code="SRC", warehouse_name="Склад", is_selected=True),
     ])
     db_session.add_all([
-        ItemWarehouseStock(item_id=comp.item_id, warehouse_ref1c="WH-DEST", qty=2),
-        ItemWarehouseStock(item_id=comp.item_id, warehouse_ref1c="WH-SRC", qty=10),
+        _accepted_stock_bin(db_session, comp.item_id, "WH-DEST", 2),
+        _accepted_stock_bin(db_session, comp.item_id, "WH-SRC", 10),
     ])
     db_session.commit()
 
@@ -3370,8 +3380,8 @@ def test_create_material_issues_asks_when_component_has_multiple_source_warehous
     # No stock on WH-DEST (it would be claimed in place); the ambiguity is
     # between the two source warehouses only.
     db_session.add_all([
-        ItemWarehouseStock(item_id=comp.item_id, warehouse_ref1c="WH-A", qty=5),
-        ItemWarehouseStock(item_id=comp.item_id, warehouse_ref1c="WH-B", qty=7),
+        _accepted_stock_bin(db_session, comp.item_id, "WH-A", 5),
+        _accepted_stock_bin(db_session, comp.item_id, "WH-B", 7),
     ])
     db_session.commit()
 

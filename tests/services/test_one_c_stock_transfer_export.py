@@ -28,6 +28,16 @@ from app.services import one_c_stock_transfer_export as exporter
 from app.services.one_c_document_numbers import material_issue_number
 
 
+@pytest.fixture(autouse=True)
+def accepted_material_issue_truth(db_session):
+    cutoff = datetime(2026, 5, 20, tzinfo=timezone.utc)
+    batch = PhysicalImportBatch(batch_key="transfer-export-truth", status="completed", cutoff=cutoff, source_watermarks={}, completed_at=cutoff)
+    generation = LedgerGeneration(generation_key="transfer-export-truth", status="accepted", cutoff=cutoff, accepted_at=cutoff, source_watermarks={}, capabilities={"physical_ledger": True, "reservation_replay": True, "execution_allocations": True}, physical_import_batch=batch, algorithm_version="tests")
+    db_session.add_all((batch, generation)); db_session.flush()
+    db_session.add(PlanningTruthState(id=1, current_generation_id=generation.id)); db_session.commit()
+    return generation
+
+
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -89,6 +99,7 @@ def _mk_issue(
         status=status,
         warehouse_ref1c=dest_wh,
         source_warehouse_ref1c=source_wh,
+        ledger_generation_id=db.get(PlanningTruthState, 1).current_generation_id,
     )
     db.add(issue)
     db.flush()
@@ -113,15 +124,19 @@ def _mk_issue(
 
 
 def _attach_current_mrp_lineage(db, product: ProductionProduct) -> None:
+    existing = db.get(PlanningTruthState, 1)
     cutoff = datetime(2026, 5, 20, tzinfo=timezone.utc)
-    physical = PhysicalImportBatch(
+    if existing is not None:
+        generation = db.get(LedgerGeneration, existing.current_generation_id)
+    else:
+        physical = PhysicalImportBatch(
         batch_key=f"transfer-lineage-{product.product_id}",
         status="completed",
         cutoff=cutoff,
         source_watermarks={},
         completed_at=cutoff,
     )
-    generation = LedgerGeneration(
+        generation = LedgerGeneration(
         generation_key=f"transfer-lineage-{product.product_id}",
         status="accepted",
         cutoff=cutoff,
@@ -135,9 +150,9 @@ def _attach_current_mrp_lineage(db, product: ProductionProduct) -> None:
         physical_import_batch=physical,
         algorithm_version="tests/current-lineage",
     )
-    db.add(generation)
-    db.flush()
-    db.add(PlanningTruthState(id=1, current_generation_id=generation.id))
+        db.add(generation)
+        db.flush()
+        db.add(PlanningTruthState(id=1, current_generation_id=generation.id))
     run = PlanningRun(
         status="FIXED_SNAPSHOT",
         ledger_generation_id=generation.id,

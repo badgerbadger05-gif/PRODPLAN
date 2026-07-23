@@ -23,8 +23,13 @@ from app.models import (
     SpecComponent,
     Specification,
     StockWarehouse,
+    StockBin,
+    PhysicalImportBatch,
+    LedgerGeneration,
+    PlanningTruthState,
 )
 from app.services.production_control_material_issues import create_material_issues
+from app.services.planning_truth import publish_generation
 
 PAINT_WH = "wh-paint"      # склад-получатель окрасочного участка
 WELD_WH = "wh-weld-stock"  # склад сварных остатков («Участок сварочный»)
@@ -48,6 +53,10 @@ def _item(db, *, code: str, name: str) -> Item:
 
 def test_paint_order_pulls_welded_component_from_weld_stock_warehouse(db_session):
     db = db_session
+    cutoff = datetime(2026, 8, 1)
+    batch = PhysicalImportBatch(batch_key="paint-material-truth", status="completed", cutoff=cutoff, source_watermarks={})
+    generation = LedgerGeneration(generation_key="paint-material-truth", status="accepted", cutoff=cutoff, accepted_at=cutoff, physical_import_batch=batch, source_watermarks={}, capabilities={}, algorithm_version="test")
+    db.add_all((batch, generation)); db.flush(); publish_generation(db, generation)
     for idx, ref in enumerate((PAINT_WH, WELD_WH), start=1):
         db.add(StockWarehouse(warehouse_ref1c=ref, warehouse_code=f"W{idx}", warehouse_name=ref, is_selected=True))
     db.flush()
@@ -62,7 +71,7 @@ def test_paint_order_pulls_welded_component_from_weld_stock_warehouse(db_session
     db.add(SpecComponent(spec_id=paint_spec.spec_id, item_id=welded.item_id, quantity=1, component_type="Сборка"))
 
     # сварная деталь лежит только на складе сварных остатков
-    db.add(ItemWarehouseStock(item_id=welded.item_id, warehouse_ref1c=WELD_WH, qty=50))
+    db.add(StockBin(ledger_generation_id=generation.id, item_id=welded.item_id, characteristic_ref="", organization_ref="", warehouse_ref1c=WELD_WH, on_hand=50))
     welded.stock_qty = 50
 
     order = ProductionOrder(

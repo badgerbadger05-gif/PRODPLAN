@@ -910,6 +910,14 @@ class ProductionMaterialIssue(Base):
     # For direction='return': workshop warehouse (where leftover currently is).
     # Used as "СкладОтправитель_Key".
     source_warehouse_ref1c = Column(String(36), nullable=True, index=True)
+    # Nullable only for historical documents created before the Item Ledger
+    # boundary. New operational issues are always pinned to accepted truth.
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     initiated_by = Column(String(100), nullable=True)
     exported_ref1c = Column(String(36), nullable=True, index=True)
     exported_at = Column(TIMESTAMP, nullable=True)
@@ -919,6 +927,7 @@ class ProductionMaterialIssue(Base):
 
     product = relationship("ProductionProduct")
     order = relationship("ProductionOrder")
+    ledger_generation = relationship("LedgerGeneration")
     lines = relationship("ProductionMaterialIssueLine", back_populates="issue", cascade="all, delete-orphan")
 
 

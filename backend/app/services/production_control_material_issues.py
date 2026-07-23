@@ -11,7 +11,6 @@ from sqlalchemy.orm import Session, joinedload
 from ..models import (
     IgnoredWarehouse,
     Item,
-    ItemWarehouseStock,
     ProductionMaterialIssue,
     ProductionMaterialIssueLine,
     ProductionOrder,
@@ -19,6 +18,7 @@ from ..models import (
     ProductionProduct,
     SpecComponent,
     StockWarehouse,
+    StockBin,
     SyncLink,
     WorkshopWarehouseBinding,
 )
@@ -41,6 +41,7 @@ from .production_control_reservations import (
     is_product_reservation_active,
     load_reservation_state,
 )
+from .planning_truth import require_accepted_truth
 from .workshop_resolution import (
     diagnose_product,
     format_diagnosis_error,
@@ -78,6 +79,7 @@ def _auto_select_source_warehouse(
     component_item_ids: List[int],
     *,
     excluded_refs: Optional[set[str]] = None,
+    ledger_generation_id: Optional[int] = None,
 ) -> Tuple[Optional[str], List[Dict[str, Any]]]:
     """
     Given a list of component item_ids, find the best source warehouse.
@@ -110,11 +112,13 @@ def _auto_select_source_warehouse(
         .all()
     }
 
+    if ledger_generation_id is None:
+        raise ValueError("accepted Ledger generation is required for source stock selection")
     rows = (
-        db.query(ItemWarehouseStock.warehouse_ref1c, ItemWarehouseStock.item_id)
+        db.query(StockBin.warehouse_ref1c, StockBin.item_id)
         .filter(
-            ItemWarehouseStock.item_id.in_(component_item_ids),
-            ItemWarehouseStock.qty > 0,
+            StockBin.ledger_generation_id == int(ledger_generation_id),
+            StockBin.item_id.in_(component_item_ids), StockBin.on_hand > 0,
         )
         .all()
     )
@@ -161,6 +165,7 @@ def _source_warehouse_options(
     component_item_ids: List[int],
     *,
     excluded_refs: Optional[set[str]] = None,
+    ledger_generation_id: Optional[int] = None,
 ) -> Dict[int, List[Dict[str, Any]]]:
     if not component_item_ids:
         return {}
@@ -181,17 +186,17 @@ def _source_warehouse_options(
         for r in db.query(StockWarehouse.warehouse_ref1c, StockWarehouse.warehouse_name).all()
     }
 
+    if ledger_generation_id is None:
+        raise ValueError("accepted Ledger generation is required for source stock selection")
     rows = (
         db.query(
-            ItemWarehouseStock.item_id,
-            ItemWarehouseStock.warehouse_ref1c,
-            func.sum(ItemWarehouseStock.qty),
+            StockBin.item_id, StockBin.warehouse_ref1c, func.sum(StockBin.on_hand),
         )
         .filter(
-            ItemWarehouseStock.item_id.in_(component_item_ids),
-            ItemWarehouseStock.qty > 0,
+            StockBin.ledger_generation_id == int(ledger_generation_id),
+            StockBin.item_id.in_(component_item_ids), StockBin.on_hand > 0,
         )
-        .group_by(ItemWarehouseStock.item_id, ItemWarehouseStock.warehouse_ref1c)
+        .group_by(StockBin.item_id, StockBin.warehouse_ref1c)
         .all()
     )
 
@@ -220,6 +225,7 @@ def _allocate_components_by_source_warehouse(
     *,
     destination_warehouse_ref1c: Optional[str] = None,
     selected_source_warehouse_ref1c: Optional[str] = None,
+    ledger_generation_id: Optional[int] = None,
 ) -> Tuple[Dict[Optional[str], List[Dict[str, Any]]], List[Dict[str, Any]]]:
     component_item_ids = [int(c["component_item_id"]) for c in components]
     excluded = {str(destination_warehouse_ref1c)} if destination_warehouse_ref1c else set()
@@ -227,6 +233,7 @@ def _allocate_components_by_source_warehouse(
         db,
         component_item_ids,
         excluded_refs=excluded,
+        ledger_generation_id=ledger_generation_id,
     )
     selected_ref = _clean_ref1c(selected_source_warehouse_ref1c) or None
 
@@ -271,19 +278,22 @@ def _destination_stock_by_component(
     db: Session,
     components: List[Dict[str, Any]],
     destination_warehouse_ref1c: Optional[str],
+    ledger_generation_id: Optional[int] = None,
 ) -> Dict[int, float]:
     destination_ref = _clean_ref1c(destination_warehouse_ref1c)
     if not destination_ref or not components:
         return {}
     component_ids = sorted({int(comp["component_item_id"]) for comp in components})
+    if ledger_generation_id is None:
+        raise ValueError("accepted Ledger generation is required for destination stock selection")
     rows = (
-        db.query(ItemWarehouseStock.item_id, func.sum(ItemWarehouseStock.qty))
+        db.query(StockBin.item_id, func.sum(StockBin.on_hand))
         .filter(
-            ItemWarehouseStock.item_id.in_(component_ids),
-            ItemWarehouseStock.warehouse_ref1c == destination_ref,
-            ItemWarehouseStock.qty > 0,
+            StockBin.ledger_generation_id == int(ledger_generation_id),
+            StockBin.item_id.in_(component_ids), StockBin.warehouse_ref1c == destination_ref,
+            StockBin.on_hand > 0,
         )
-        .group_by(ItemWarehouseStock.item_id)
+        .group_by(StockBin.item_id)
         .all()
     )
     return {int(item_id): _to_float(qty) for item_id, qty in rows}
@@ -294,13 +304,16 @@ def _components_still_to_move(
     components: List[Dict[str, Any]],
     destination_warehouse_ref1c: Optional[str],
     consumed_destination_stock: Optional[Dict[Tuple[str, int], float]] = None,
+    ledger_generation_id: Optional[int] = None,
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Do not create a transfer for quantities that are already on the recipient
     workshop warehouse. If the workshop has a partial balance, move only the
     missing remainder.
     """
-    destination_stock = _destination_stock_by_component(db, components, destination_warehouse_ref1c)
+    destination_stock = _destination_stock_by_component(
+        db, components, destination_warehouse_ref1c, ledger_generation_id=ledger_generation_id,
+    )
     if not destination_stock:
         return components, []
 
@@ -548,6 +561,7 @@ def _free_destination_stock(
     component_item_ids: List[int],
     destination_warehouse_ref1c: Optional[str],
     reservation_state: ReservationState,
+    ledger_generation_id: Optional[int] = None,
 ) -> Dict[int, float]:
     """
     Free (unreserved by ANY order) component stock lying on the destination
@@ -567,13 +581,15 @@ def _free_destination_stock(
         selected = {str(ref) for ref, is_sel in selected_rows if ref and bool(is_sel)}
         if dest not in selected:
             return {}
+    if ledger_generation_id is None:
+        raise ValueError("accepted Ledger generation is required for destination stock selection")
     rows = (
-        db.query(ItemWarehouseStock.item_id, func.sum(ItemWarehouseStock.qty))
+        db.query(StockBin.item_id, func.sum(StockBin.on_hand))
         .filter(
-            ItemWarehouseStock.item_id.in_(component_item_ids),
-            ItemWarehouseStock.warehouse_ref1c == dest,
+            StockBin.ledger_generation_id == int(ledger_generation_id),
+            StockBin.item_id.in_(component_item_ids), StockBin.warehouse_ref1c == dest,
         )
-        .group_by(ItemWarehouseStock.item_id)
+        .group_by(StockBin.item_id)
         .all()
     )
     result: Dict[int, float] = {}
@@ -594,6 +610,7 @@ def _claim_components_in_place(
     spec_id: Optional[int],
     destination_warehouse_ref1c: Optional[str],
     initiated_by: Optional[str],
+    ledger_generation_id: int,
 ) -> Optional[ProductionMaterialIssue]:
     """
     Record that components already lying on the workshop warehouse are taken
@@ -624,6 +641,7 @@ def _claim_components_in_place(
             warehouse_ref1c=dest,
             source_warehouse_ref1c=dest,
             initiated_by=initiated_by,
+            ledger_generation_id=int(ledger_generation_id),
         )
         db.add(issue)
         db.flush()
@@ -776,6 +794,8 @@ def create_material_issues(
     existing documents in `reused`. After the order quantity shrinks, open
     (non-posted) reservations are released down to the requirement.
     """
+    truth = require_accepted_truth(db, "production_material_issue_create")
+    generation_id = int(truth.generation_id)
     # Hold a transaction-scoped lock for the whole read-modify-write below so
     # concurrent callers cannot both claim the same free workshop stock.
     _lock_material_issue_pool(db)
@@ -814,6 +834,15 @@ def create_material_issues(
             .order_by(ProductionMaterialIssue.issue_id.desc())
             .all()
         )
+        foreign_existing = [
+            row for row in existing_rows
+            if row.ledger_generation_id is None or int(row.ledger_generation_id) != generation_id
+        ]
+        if foreign_existing:
+            errors.append(
+                f"product_id={pid}: existing material issue is not bound to current accepted Ledger generation"
+            )
+            continue
 
         spec_id, components = _components_for_product(db, product)
         if not components:
@@ -877,6 +906,7 @@ def create_material_issues(
             [int(c["component_item_id"]) for c in outstanding_components],
             resolved_warehouse,
             reservation_state,
+            ledger_generation_id=generation_id,
         )
         destination_ref = _clean_ref1c(resolved_warehouse)
         if destination_ref:
@@ -909,6 +939,7 @@ def create_material_issues(
                 transfer_components,
                 destination_warehouse_ref1c=resolved_warehouse,
                 selected_source_warehouse_ref1c=source_warehouse_ref1c,
+                ledger_generation_id=generation_id,
             )
             if needed_selection:
                 selection_required.append(
@@ -953,6 +984,7 @@ def create_material_issues(
                 spec_id=spec_id,
                 destination_warehouse_ref1c=resolved_warehouse,
                 initiated_by=initiated_by,
+                ledger_generation_id=generation_id,
             )
             if claim_issue is not None:
                 created.append(
@@ -992,6 +1024,7 @@ def create_material_issues(
                 warehouse_ref1c=resolved_warehouse,
                 source_warehouse_ref1c=resolved_source_wh,
                 initiated_by=initiated_by,
+                ledger_generation_id=generation_id,
             )
             db.add(issue)
             db.flush()
@@ -1307,6 +1340,7 @@ def assemble_material_issue(
     *,
     allow_production: bool = False,
 ) -> Dict[str, Any]:
+    truth = require_accepted_truth(db, "production_material_issue_assemble")
     issue = (
         db.query(ProductionMaterialIssue)
         .options(
@@ -1319,6 +1353,8 @@ def assemble_material_issue(
     )
     if issue is None:
         raise ValueError("Заявка на перемещение не найдена")
+    if issue.ledger_generation_id is None or int(issue.ledger_generation_id) != int(truth.generation_id):
+        raise ValueError("material issue is not bound to current accepted Ledger generation")
     ref_key = _clean_ref1c(issue.exported_ref1c)
     if not ref_key:
         raise ValueError("Перемещение ещё не выгружено в 1С")
@@ -1442,9 +1478,12 @@ def build_issue_1c_payload(db: Session, issue_id: int) -> Dict[str, Any]:
 def export_issue_to_1c(db: Session, issue_id: int, req: ODataSyncRequest) -> Dict[str, Any]:
     from .one_c_export_common import clean_ref1c
 
+    truth = require_accepted_truth(db, "production_material_issue_export")
     issue = db.query(ProductionMaterialIssue).filter(ProductionMaterialIssue.issue_id == int(issue_id)).first()
     if not issue:
         raise ValueError("Документ выдачи не найден")
+    if issue.ledger_generation_id is None or int(issue.ledger_generation_id) != int(truth.generation_id):
+        raise ValueError("material issue is not bound to current accepted Ledger generation")
 
     # Idempotency: a document already created in 1C must not be POSTed again —
     # a repeat would create a duplicate Document_ПеремещениеЗапасов (a real

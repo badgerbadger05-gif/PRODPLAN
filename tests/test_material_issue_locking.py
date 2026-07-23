@@ -10,12 +10,15 @@ these tests verify the two things that matter and are not flaky:
 """
 
 import os
+from datetime import datetime
 
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+from app import models
 from app.services import production_control_material_issues as mi
+from app.services import planning_truth
 
 PG_URL = os.getenv(
     "PRODPLAN_TEST_PG_URL",
@@ -75,6 +78,18 @@ def test_lock_is_noop_on_sqlite(db_session):
 
 
 def test_create_material_issues_acquires_lock(db_session, monkeypatch):
+    cutoff = datetime(2026, 7, 23)
+    batch = models.PhysicalImportBatch(
+        batch_key="material-issue-locking", status="completed", cutoff=cutoff,
+        source_watermarks={}, completed_at=cutoff,
+    )
+    generation = models.LedgerGeneration(
+        generation_key="material-issue-locking", status="accepted", cutoff=cutoff,
+        accepted_at=cutoff, physical_import_batch=batch, source_watermarks={},
+        capabilities={}, algorithm_version="test",
+    )
+    db_session.add_all((batch, generation)); db_session.flush()
+    planning_truth.publish_generation(db_session, generation)
     calls = []
     monkeypatch.setattr(mi, "_lock_material_issue_pool", lambda db: calls.append(True))
     result = mi.create_material_issues(db_session, [])

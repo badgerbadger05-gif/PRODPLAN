@@ -23,6 +23,9 @@ from app.models import (
     SpecComponent,
     Specification,
     StockWarehouse,
+    StockBin,
+    PhysicalImportBatch,
+    LedgerGeneration,
 )
 from app.services.production_control_material_availability import preview_materials
 from app.services.production_control_material_issues import create_material_issues
@@ -35,9 +38,20 @@ from app.services.production_control_reservations import (
     open_reservations_by_item,
 )
 from app.services.production_reservation_repair import repair_in_place_reservations
+from app.services.planning_truth import publish_generation
 
 WORKSHOP_WH = "wh-weld"
 SOURCE_WH = "wh-metal"
+
+
+@pytest.fixture(autouse=True)
+def accepted_material_truth(db_session):
+    cutoff = datetime(2026, 6, 1)
+    batch = PhysicalImportBatch(batch_key="section-stock-truth", status="completed", cutoff=cutoff, source_watermarks={})
+    generation = LedgerGeneration(generation_key="section-stock-truth", status="accepted", cutoff=cutoff, accepted_at=cutoff, physical_import_batch=batch, source_watermarks={}, capabilities={}, algorithm_version="test")
+    db_session.add_all((batch, generation)); db_session.flush(); publish_generation(db_session, generation)
+    db_session.info["section_stock_generation"] = generation.id
+    return generation
 
 
 def _add_warehouses(db, *, selected=(WORKSHOP_WH, SOURCE_WH)):
@@ -54,10 +68,10 @@ def _add_warehouses(db, *, selected=(WORKSHOP_WH, SOURCE_WH)):
 
 
 def _set_stock(db, item: Item, breakdown: dict[str, float]):
-    db.query(ItemWarehouseStock).filter(ItemWarehouseStock.item_id == item.item_id).delete()
+    db.query(StockBin).filter(StockBin.ledger_generation_id == db.info["section_stock_generation"], StockBin.item_id == item.item_id).delete()
     total = 0.0
     for ref, qty in breakdown.items():
-        db.add(ItemWarehouseStock(item_id=item.item_id, warehouse_ref1c=ref, qty=qty))
+        db.add(StockBin(ledger_generation_id=db.info["section_stock_generation"], item_id=item.item_id, characteristic_ref="", organization_ref="", warehouse_ref1c=ref, on_hand=qty))
         total += qty
     item.stock_qty = total
     db.commit()

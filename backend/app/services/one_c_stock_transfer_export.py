@@ -50,6 +50,7 @@ from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
 from .one_c_document_numbers import material_issue_number
 from .one_c_production_order_export import export_production_orders_to_1c
+from .planning_truth import require_accepted_truth
 
 
 STOCK_TRANSFER_ENTITY = "Document_ПеремещениеЗапасов"
@@ -630,6 +631,21 @@ def export_material_issues_to_1c(
     is exported first (so the transfer can carry a valid ДокументОснование).
     The chain step's result is returned under summary['parent_orders_export'].
     """
+    truth = require_accepted_truth(db, "production_material_issue_export")
+    generation_id = int(truth.generation_id)
+    requested = [int(value) for value in issue_ids if value is not None]
+    issue_rows = db.query(ProductionMaterialIssue).filter(
+        ProductionMaterialIssue.issue_id.in_(requested)
+    ).all() if requested else []
+    invalid = [
+        int(issue.issue_id) for issue in issue_rows
+        if issue.ledger_generation_id is None or int(issue.ledger_generation_id) != generation_id
+    ]
+    if invalid:
+        raise ValueError(
+            "material issue Ledger generation is null or not current accepted truth: "
+            + ", ".join(str(value) for value in sorted(invalid))
+        )
     parent_export = _chain_export_parent_orders(
         db, list(issue_ids), dry_run=dry_run, allow_production=allow_production
     )

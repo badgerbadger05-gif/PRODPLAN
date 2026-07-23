@@ -3,19 +3,27 @@ that already has a 1C ref — a repeat would create a duplicate stock transfer.
 """
 
 from app.models import ProductionMaterialIssue
+from app import models
+from datetime import datetime
 from app.schemas import ODataSyncRequest
 from app.services import odata_client as odata_client_module
 from app.services.production_control_material_issues import export_issue_to_1c
+from app.services.planning_truth import publish_generation
 
 
 def test_already_exported_issue_is_not_reposted(db_session, monkeypatch):
     db = db_session
+    cutoff = datetime(2026, 7, 23)
+    batch = models.PhysicalImportBatch(batch_key="export-idempotency-truth", status="completed", cutoff=cutoff, source_watermarks={})
+    generation = models.LedgerGeneration(generation_key="export-idempotency-truth", status="accepted", cutoff=cutoff, accepted_at=cutoff, physical_import_batch=batch, source_watermarks={}, capabilities={}, algorithm_version="test")
+    db.add_all((batch, generation)); db.flush(); publish_generation(db, generation)
     issue = ProductionMaterialIssue(
         document_number="MI-DUP-1",
         product_id=1,
         order_id=1,
         status="exported",
         exported_ref1c="ref-already-in-1c",
+        ledger_generation_id=generation.id,
     )
     db.add(issue)
     db.flush()
