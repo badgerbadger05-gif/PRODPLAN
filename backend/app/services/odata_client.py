@@ -745,8 +745,13 @@ def get_stock_from_1c_odata(
     ):
         entity_name = str(entity_name).strip().rstrip("/") + "/Balance"
 
-    # Для Balance отключаем $orderby, иначе 1С может вернуть пусто/ошибку
-    use_order_by: Optional[str] = None if "/Balance" in (entity_name or "") else "Ref_Key"
+    # Для /Balance нужен стабильный order_by, иначе при пагинации ($skip)
+    # возможны дубли/пропуски между страницами.
+    use_order_by: Optional[str] = (
+        "Номенклатура_Key,СтруктурнаяЕдиница_Key,Организация_Key"
+        if "/Balance" in (entity_name or "")
+        else "Ref_Key"
+    )
 
     # Специальная обработка Balance: Period как параметр функции, а не через $filter
     effective_entity = entity_name

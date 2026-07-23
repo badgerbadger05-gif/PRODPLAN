@@ -156,3 +156,39 @@ def test_get_stock_default_balance_period_uses_moscow_time(monkeypatch):
 
     assert "Period=datetime'2026-06-04T15:10:00'" in captured["entity_name"]
     assert str(captured["tz"]) == "Europe/Moscow"
+
+
+def test_get_stock_balance_uses_stable_order_by(monkeypatch):
+    captured = {}
+
+    def _fake_get_all(self, entity_name, filter_query=None, select_fields=None, top=1000, max_records=None, max_pages=1000, order_by=None):
+        captured["order_by"] = order_by
+        return [
+            {
+                "Номенклатура_Key": "item-ref",
+                "СтруктурнаяЕдиница_Key": "warehouse-ref",
+                "КоличествоBalance": 7.0,
+            }
+        ]
+
+    def _fake_make_request(self, endpoint, params=None, timeout=60, retries=4, retry_backoff_sec=1.0):
+        return {"value": []}
+
+    monkeypatch.setattr(odata_client.OData1CClient, "get_all", _fake_get_all)
+    monkeypatch.setattr(odata_client.OData1CClient, "_make_request", _fake_make_request)
+
+    out = get_stock_from_1c_odata(
+        base_url="http://example.local/odata",
+        entity_name="AccumulationRegister_ЗапасыНаСкладах",
+        username=None,
+        password=None,
+        token=None,
+        filter_query=None,
+        select_fields=None,
+    )
+
+    assert len(out) == 1
+    assert (
+        captured["order_by"]
+        == "Номенклатура_Key,СтруктурнаяЕдиница_Key,Организация_Key"
+    )

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 import time
 from typing import Any, Dict, List, Mapping, Optional
 from urllib.error import URLError
@@ -169,6 +170,7 @@ def _fetch_balance_at(
     at: datetime,
 ) -> List[Dict[str, Any]]:
     base_url = sanitize_base_url(str(config.get("base_url") or ""))
+    at_for_period = at.astimezone(ZoneInfo("Europe/Moscow")) if at.tzinfo else at
     return get_stock_from_1c_odata(
         base_url=base_url,
         entity_name=f"{REGISTER_ENTITY}/Balance",
@@ -177,7 +179,7 @@ def _fetch_balance_at(
         token=config.get("token") or None,
         filter_query=(
             "Period le datetime'"
-            f"{at.replace(tzinfo=None, microsecond=0).isoformat()}'"
+            f"{at_for_period.replace(tzinfo=None, microsecond=0).isoformat()}'"
         ),
     )
 

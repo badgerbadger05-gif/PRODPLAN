@@ -241,7 +241,7 @@ def test_no_odata_config_400(db_session, monkeypatch):
     assert client.post("/api/v1/item-ledger/admin/seed").status_code == 400
 
 
-def test_historical_balance_uses_virtual_table_period_parameter(monkeypatch):
+def test_historical_balance_uses_virtual_table_period_parameter_aware_datetime(monkeypatch):
     captured = {}
 
     def fake_stock(**kwargs):
@@ -256,7 +256,25 @@ def test_historical_balance_uses_virtual_table_period_parameter(monkeypatch):
 
     assert captured["entity_name"].endswith("/Balance")
     assert captured["filter_query"] == (
-        "Period le datetime'2026-06-01T00:00:00'"
+        "Period le datetime'2026-06-01T03:00:00'"
+    )
+
+
+def test_historical_balance_keeps_naive_datetime_without_timezone_shift(monkeypatch):
+    captured = {}
+
+    def fake_stock(**kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(admin_mod, "get_stock_from_1c_odata", fake_stock)
+    admin_mod._fetch_balance_at(
+        {"base_url": "http://1c/odata"},
+        datetime(2026, 6, 1, 12, 34, 56, 123456),
+    )
+
+    assert captured["filter_query"] == (
+        "Period le datetime'2026-06-01T12:34:56'"
     )
 
 
