@@ -31,7 +31,12 @@ def _generation(db, *, key, status, cutoff, watermarks=None):
 
 
 def _capabilities():
-    return {"ledger": "complete", "mrp": "snapshot"}
+    return {
+        "physical_ledger": True,
+        "reservation_replay": True,
+        "execution_allocations": True,
+        "planning_snapshots": True,
+    }
 
 
 def _seal_build(db, target, candidates, cutoff):
@@ -41,6 +46,9 @@ def _seal_build(db, target, candidates, cutoff):
         if stage == "snapshot_build":
             metrics = {
                 "candidate_run_ids": [row.run_id for row in candidates],
+                "candidate_read_snapshot_ids": {
+                    str(row.run_id): row._test_read_snapshot_id for row in candidates
+                },
                 "future_supply_captured": True,
             }
         db.add(models.LedgerBuildBatch(
@@ -49,6 +57,27 @@ def _seal_build(db, target, candidates, cutoff):
             completed_at=cutoff,
         ))
     db.flush()
+
+
+def _candidate_read_snapshots(db, target, candidates, cutoff):
+    """Persist minimal MRP read snapshots; zero rows in every kind are valid."""
+    for candidate in candidates:
+        snapshot = models.PlanningReadSnapshot(
+            consumer="mrp_result", snapshot_key=f"run:{candidate.run_id}",
+            ledger_generation_id=target.id, cutoff=cutoff, truth_status="building",
+            reason="unpublished candidate snapshot",
+            payload={
+                "run_id": candidate.run_id,
+                "row_counts": {
+                    "production": 0, "purchase": 0, "rework": 0, "capacity": 0,
+                },
+            },
+            published_at=cutoff,
+        )
+        db.add(snapshot)
+        db.flush()
+        # Test-only transient marker avoids widening the production contract.
+        candidate._test_read_snapshot_id = snapshot.id
 
 
 def _batch(db, count=2, add_count=0):
@@ -96,15 +125,16 @@ def _batch(db, count=2, add_count=0):
     candidates = [db_session_row for db_session_row in db.query(models.PlanningRun).filter(
         models.PlanningRun.run_id.in_([int(entry["candidate_run_id"]) for entry in manifest.entries])
     ).all()]
+    _candidate_read_snapshots(db, target, candidates, cutoff)
     _seal_build(db, target, candidates, cutoff)
     db.commit()
     return cutoff, parent_generation, target, parents, candidates
 
 
-def _publish(db, parent, target, cutoff):
+def _publish(db, parent, target, cutoff, capabilities=None):
     return publish_obligation_refresh_batch(
         db, parent_generation_id=parent.id, target_generation_id=target.id,
-        accepted_at=cutoff, capabilities=_capabilities(),
+        accepted_at=cutoff, capabilities=capabilities or _capabilities(),
     )
 
 
@@ -135,6 +165,15 @@ def test_publish_is_atomic_under_caller_rollback(db_session):
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == target.id
     assert [row.status for row in parents] == ["SUPERSEDED", "SUPERSEDED"]
     assert [row.status for row in candidates] == ["FIXED_SNAPSHOT", "FIXED_SNAPSHOT"]
+    snapshots = db_session.query(models.PlanningReadSnapshot).filter_by(
+        ledger_generation_id=target.id, consumer="mrp_result"
+    ).all()
+    assert [row.truth_status for row in snapshots] == ["accepted", "accepted"]
+    assert all(
+        row.reason is None
+        and row.published_at.replace(tzinfo=timezone.utc) == cutoff
+        for row in snapshots
+    )
 
     db_session.rollback()
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == parent.id
@@ -145,6 +184,11 @@ def test_publish_is_atomic_under_caller_rollback(db_session):
     assert [db_session.get(models.PlanningRun, row.run_id).status for row in candidates] == [
         "BUILDING_SNAPSHOT", "BUILDING_SNAPSHOT"
     ]
+    snapshots = db_session.query(models.PlanningReadSnapshot).filter_by(
+        ledger_generation_id=target.id, consumer="mrp_result"
+    ).all()
+    assert [row.truth_status for row in snapshots] == ["building", "building"]
+    assert all(row.reason == "unpublished candidate snapshot" for row in snapshots)
 
 
 def test_publish_exact_retry_is_noop_but_mixed_state_is_rejected(db_session):
@@ -178,6 +222,7 @@ def test_publish_rejects_candidate_with_external_export_link(db_session):
 
 @pytest.mark.parametrize("mutation, error", [
     ("empty_capabilities", "pre-sealed"),
+    ("incomplete_capabilities", "capabilities are incomplete"),
     ("partial_checkpoint", "reservation_replay"),
     ("missing_manifest", "candidate manifest"),
 ])
@@ -185,6 +230,11 @@ def test_publish_requires_sealed_complete_build(db_session, mutation, error):
     cutoff, parent, target, _parents, _candidates = _batch(db_session)
     if mutation == "empty_capabilities":
         target.capabilities = {}
+    elif mutation == "incomplete_capabilities":
+        target.capabilities = {
+            **_capabilities(),
+            "planning_snapshots": False,
+        }
     elif mutation == "partial_checkpoint":
         row = db_session.query(models.LedgerBuildBatch).filter_by(
             ledger_generation_id=target.id, stage="reservation_replay"
@@ -199,7 +249,17 @@ def test_publish_requires_sealed_complete_build(db_session, mutation, error):
     db_session.flush()
 
     with pytest.raises(ObligationRefreshPublishError, match=error):
-        _publish(db_session, parent, target, cutoff)
+        _publish(
+            db_session,
+            parent,
+            target,
+            cutoff,
+            capabilities=(
+                dict(target.capabilities)
+                if mutation == "incomplete_capabilities"
+                else None
+            ),
+        )
 
 
 def test_exact_retry_allows_legitimate_export_after_publication(db_session):
@@ -246,6 +306,60 @@ def test_publish_allows_refresh_and_add_together(db_session):
     assert set(result.candidate_run_ids) == {row.run_id for row in candidates}
     assert parents[0].status == "SUPERSEDED"
     assert all(row.status == "FIXED_SNAPSHOT" for row in candidates)
+    assert db_session.query(models.PlanningReadSnapshot).filter_by(
+        ledger_generation_id=target.id, truth_status="accepted"
+    ).count() == 2
+
+
+@pytest.mark.parametrize("mutation, error", [
+    ("missing", "foreign or extra"),
+    ("extra", "foreign or extra"),
+    ("wrong_count", "persisted rows conflict"),
+    ("missing_kind", "row_counts are incomplete"),
+])
+def test_publish_rejects_incomplete_or_tampered_candidate_read_snapshots(
+    db_session, mutation, error
+):
+    cutoff, parent, target, _parents, candidates = _batch(db_session, count=1)
+    snapshot = db_session.query(models.PlanningReadSnapshot).filter_by(
+        ledger_generation_id=target.id, consumer="mrp_result"
+    ).one()
+    checkpoint = db_session.query(models.LedgerBuildBatch).filter_by(
+        ledger_generation_id=target.id, stage="snapshot_build"
+    ).one()
+    if mutation == "missing":
+        db_session.delete(snapshot)
+    elif mutation == "extra":
+        db_session.add(models.PlanningReadSnapshot(
+            consumer="mrp_result", snapshot_key="run:9999", ledger_generation_id=target.id,
+            cutoff=cutoff, truth_status="building", reason="unpublished candidate snapshot",
+            payload={"row_counts": {"production": 0, "purchase": 0, "rework": 0, "capacity": 0}},
+            published_at=cutoff,
+        ))
+    elif mutation == "wrong_count":
+        snapshot.payload = {**snapshot.payload, "row_counts": {
+            "production": 1, "purchase": 0, "rework": 0, "capacity": 0,
+        }}
+    else:
+        snapshot.payload = {**snapshot.payload, "row_counts": {"production": 0}}
+    db_session.flush()
+
+    with pytest.raises(ObligationRefreshPublishError, match=error):
+        _publish(db_session, parent, target, cutoff)
+
+
+def test_exact_retry_rejects_tampered_accepted_candidate_read_snapshot(db_session):
+    cutoff, parent, target, _parents, _candidates = _batch(db_session, count=1)
+    _publish(db_session, parent, target, cutoff)
+    db_session.commit()
+    snapshot = db_session.query(models.PlanningReadSnapshot).filter_by(
+        ledger_generation_id=target.id, consumer="mrp_result"
+    ).one()
+    snapshot.reason = "tampered"
+    db_session.flush()
+
+    with pytest.raises(ObligationRefreshPublishError, match="mixed or partial"):
+        _publish(db_session, parent, target, cutoff)
 
 
 def test_publish_transfers_refresh_locks_and_acquires_add_locks(db_session):

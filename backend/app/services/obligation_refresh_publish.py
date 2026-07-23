@@ -42,6 +42,15 @@ _REQUIRED_BUILD_STAGES = (
     "snapshot_build",
 )
 
+_MRP_RESULT_CONSUMER = "mrp_result"
+_MRP_ROW_KINDS = frozenset({"production", "purchase", "rework", "capacity"})
+_REQUIRED_PUBLISHED_CAPABILITIES = frozenset({
+    "physical_ledger",
+    "reservation_replay",
+    "execution_allocations",
+    "planning_snapshots",
+})
+
 
 def _utc(value: datetime | None, field: str) -> datetime:
     if value is None:
@@ -281,6 +290,15 @@ def _require_sealed_build(
         raise ObligationRefreshPublishError(
             "target capabilities must be a non-empty pre-sealed snapshot"
         )
+    missing_capabilities = sorted(
+        name
+        for name in _REQUIRED_PUBLISHED_CAPABILITIES
+        if capabilities.get(name) is not True
+    )
+    if missing_capabilities:
+        raise ObligationRefreshPublishError(
+            "target capabilities are incomplete: " + ", ".join(missing_capabilities)
+        )
     rows = _lock(db.query(models.LedgerBuildBatch)).filter(
         models.LedgerBuildBatch.ledger_generation_id == int(target.id),
         models.LedgerBuildBatch.stage.in_(_REQUIRED_BUILD_STAGES),
@@ -304,6 +322,97 @@ def _require_sealed_build(
         raise ObligationRefreshPublishError(
             "snapshot_build lacks a complete future-supply candidate manifest"
         )
+    _require_candidate_read_snapshots(
+        db,
+        target=target,
+        candidate_ids=candidate_ids,
+        snapshot_metrics=snapshot_metrics,
+        truth_status="building",
+        accepted_at=None,
+    )
+
+
+def _require_candidate_read_snapshots(
+    db: Session,
+    *,
+    target: models.LedgerGeneration,
+    candidate_ids: list[int],
+    snapshot_metrics: Mapping[str, Any],
+    truth_status: str,
+    accepted_at: datetime | None,
+) -> list[models.PlanningReadSnapshot]:
+    """Validate the sealed MRP read side before making a generation visible.
+
+    The snapshot builder is deliberately separate from publication, so its
+    persisted output is part of the publication manifest.  A candidate run
+    without an exact persisted read snapshot is not a usable MRP result.
+    """
+    raw_ids = snapshot_metrics.get("candidate_read_snapshot_ids")
+    if not isinstance(raw_ids, Mapping):
+        raise ObligationRefreshPublishError(
+            "snapshot_build lacks candidate_read_snapshot_ids"
+        )
+    try:
+        declared = {int(run_id): int(snapshot_id) for run_id, snapshot_id in raw_ids.items()}
+    except (TypeError, ValueError) as exc:
+        raise ObligationRefreshPublishError(
+            "snapshot_build candidate_read_snapshot_ids is malformed"
+        ) from exc
+    if set(declared) != set(candidate_ids) or len(set(declared.values())) != len(declared):
+        raise ObligationRefreshPublishError(
+            "snapshot_build candidate read snapshots conflict with candidates"
+        )
+
+    snapshots = _lock(db.query(models.PlanningReadSnapshot)).filter(
+        models.PlanningReadSnapshot.ledger_generation_id == int(target.id),
+        models.PlanningReadSnapshot.consumer == _MRP_RESULT_CONSUMER,
+    ).all()
+    by_id = {int(row.id): row for row in snapshots}
+    if set(by_id) != set(declared.values()):
+        raise ObligationRefreshPublishError(
+            "target has foreign or extra mrp_result snapshots"
+        )
+    expected_cutoff = _utc(target.cutoff, "target cutoff")
+    for run_id, snapshot_id in declared.items():
+        snapshot = by_id.get(snapshot_id)
+        if (
+            snapshot is None
+            or snapshot.snapshot_key != f"run:{run_id}"
+            or str(snapshot.truth_status) != truth_status
+            or _utc(snapshot.cutoff, "candidate snapshot cutoff") != expected_cutoff
+        ):
+            raise ObligationRefreshPublishError(
+                "candidate read snapshot identity or truth state conflicts"
+            )
+        if accepted_at is None:
+            if snapshot.reason is None:
+                raise ObligationRefreshPublishError("building candidate snapshot lacks unpublished reason")
+        elif snapshot.reason is not None or _utc(snapshot.published_at, "candidate snapshot published_at") != accepted_at:
+            raise ObligationRefreshPublishError(
+                "accepted candidate read snapshot publication conflicts"
+            )
+        row_counts = dict(snapshot.payload or {}).get("row_counts")
+        if not isinstance(row_counts, Mapping) or set(row_counts) != _MRP_ROW_KINDS:
+            raise ObligationRefreshPublishError("candidate read snapshot row_counts are incomplete")
+        try:
+            expected_counts = {kind: int(row_counts[kind]) for kind in _MRP_ROW_KINDS}
+        except (TypeError, ValueError) as exc:
+            raise ObligationRefreshPublishError("candidate read snapshot row_counts are malformed") from exc
+        if any(count < 0 for count in expected_counts.values()):
+            raise ObligationRefreshPublishError("candidate read snapshot row_counts are malformed")
+        actual_counts = {kind: 0 for kind in _MRP_ROW_KINDS}
+        rows = db.query(models.PlanningReadRow.row_kind).filter(
+            models.PlanningReadRow.snapshot_id == int(snapshot.id)
+        ).all()
+        for (kind,) in rows:
+            if kind not in _MRP_ROW_KINDS:
+                raise ObligationRefreshPublishError("candidate read snapshot has unsupported row kind")
+            actual_counts[str(kind)] += 1
+        if actual_counts != expected_counts:
+            raise ObligationRefreshPublishError(
+                "candidate read snapshot persisted rows conflict with row_counts"
+            )
+    return [by_id[declared[run_id]] for run_id in sorted(declared)]
 
 
 def _exact_retry(
@@ -364,6 +473,24 @@ def _exact_retry(
     ).first() is not None:
         return None
     candidate_ids = [int(row.run_id) for row in candidates]
+    snapshot_batch = _lock(db.query(models.LedgerBuildBatch)).filter(
+        models.LedgerBuildBatch.ledger_generation_id == int(target.id),
+        models.LedgerBuildBatch.stage == "snapshot_build",
+        models.LedgerBuildBatch.status == "completed",
+    ).one_or_none()
+    if snapshot_batch is None:
+        return None
+    try:
+        _require_candidate_read_snapshots(
+            db,
+            target=target,
+            candidate_ids=candidate_ids,
+            snapshot_metrics=dict(snapshot_batch.metrics or {}),
+            truth_status="accepted",
+            accepted_at=accepted_at,
+        )
+    except ObligationRefreshPublishError:
+        return None
     for parent_run, candidate in refreshes:
         locked_rows = _lock(db.query(models.ProductionPlanLine)).filter(
             models.ProductionPlanLine.plan_id == int(parent_run.source_plan_id),
@@ -450,6 +577,18 @@ def publish_obligation_refresh_batch(
         db, target=target, candidate_ids=candidate_ids,
         capabilities=capability_snapshot,
     )
+    snapshot_batch = _lock(db.query(models.LedgerBuildBatch)).filter(
+        models.LedgerBuildBatch.ledger_generation_id == int(target.id),
+        models.LedgerBuildBatch.stage == "snapshot_build",
+    ).one()
+    candidate_read_snapshots = _require_candidate_read_snapshots(
+        db,
+        target=target,
+        candidate_ids=candidate_ids,
+        snapshot_metrics=dict(snapshot_batch.metrics or {}),
+        truth_status="building",
+        accepted_at=None,
+    )
     if _source_export_links_exist(db, candidate_ids):
         raise ObligationRefreshPublishError("candidate has external export links")
 
@@ -493,6 +632,10 @@ def publish_obligation_refresh_batch(
         candidate.pinned = True
         candidate.fixed_at = accepted_at
         candidate.finished_at = accepted_at
+    for snapshot in candidate_read_snapshots:
+        snapshot.truth_status = "accepted"
+        snapshot.reason = None
+        snapshot.published_at = accepted_at
     db.flush()
     return ObligationRefreshPublishResult(
         parent_generation_id=int(parent.id), target_generation_id=int(target.id),
