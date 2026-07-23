@@ -1,7 +1,7 @@
 """stock_recorder_pull.order_ref — production-order GUID from the document header
 
-Revision ID: 20260723_01
-Revises: 20260721_03
+Revision ID: 20260723_04
+Revises: 20260723_03
 
 Additive, nullable. pull_recorder_movements (item_ledger/ingest.py) captures the
 producing order's GUID from the recorder document header at pull time:
@@ -18,8 +18,8 @@ from alembic import op
 import sqlalchemy as sa
 
 
-revision = "20260723_01"
-down_revision = "20260721_03"
+revision = "20260723_04"
+down_revision = "20260723_03"
 branch_labels = None
 depends_on = None
 
