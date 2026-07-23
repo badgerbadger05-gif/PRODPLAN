@@ -1,6 +1,6 @@
 """Router tests for the Фаза 3 materialization endpoints."""
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 
 import pytest
@@ -16,6 +16,10 @@ from app.models import (
     DbrDrumSlot,
     DefaultSpecification,
     Item,
+    LedgerGeneration,
+    PhysicalImportBatch,
+    PlanningRun,
+    PlanningTruthState,
     ProductionResource,
     SpecComponent,
     Specification,
@@ -31,6 +35,41 @@ def db_session():
     Base.metadata.create_all(bind=engine)
     TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     db = TestingSessionLocal()
+    cutoff = datetime(2026, 7, 23)
+    batch = PhysicalImportBatch(
+        batch_key="dbr-materialize-router",
+        status="completed",
+        cutoff=cutoff,
+        source_watermarks={},
+        completed_at=cutoff,
+    )
+    generation = LedgerGeneration(
+        generation_key="dbr-materialize-router",
+        status="accepted",
+        cutoff=cutoff,
+        accepted_at=cutoff,
+        source_watermarks={},
+        capabilities={
+            "physical_ledger": True,
+            "reservation_replay": True,
+            "execution_allocations": True,
+        },
+        physical_import_batch=batch,
+        algorithm_version="test/router",
+    )
+    db.add(generation)
+    db.flush()
+    db.add(PlanningTruthState(id=1, current_generation_id=generation.id))
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot={},
+        active_freeze_version=1,
+        ledger_generation_id=generation.id,
+        ledger_cutoff=cutoff,
+    )
+    db.add(run)
+    db.commit()
+    db.info["dbr_lineage"] = (run.run_id, generation.id, 1)
     try:
         yield db
     finally:
@@ -57,6 +96,7 @@ def client(db_session, monkeypatch):
 
 
 def _slot(db, *, kit_status="green"):
+    run_id, generation_id, freeze_version = db.info["dbr_lineage"]
     settings_service.get_or_create_settings(db)
     res = ProductionResource(resource_name="Сборка", capacity=1)
     item = Item(item_code="SLED", item_name="Снегоход", item_ref1c="item-ref", unit="unit-ref")
@@ -69,12 +109,20 @@ def _slot(db, *, kit_status="green"):
     db.add(WorkshopWarehouseBinding(
         workshop_id=res.resource_id, warehouse_ref1c="wip", production_warehouse_ref1c="prod"
     ))
-    schedule = DbrDrumSchedule(period_from=date(2026, 8, 1), period_to=date(2026, 8, 31), status="active")
+    schedule = DbrDrumSchedule(
+        ledger_generation_id=generation_id,
+        period_from=date(2026, 8, 1),
+        period_to=date(2026, 8, 31),
+        status="active",
+    )
     db.add(schedule)
     db.flush()
     slot = DbrDrumSlot(
         schedule_id=schedule.id, slot_date=date(2026, 8, 10), planned_date=date(2026, 8, 10),
         resource_id=res.resource_id, item_id=item.item_id, qty=Decimal("2"), kit_status=kit_status,
+        source_run_id=run_id,
+        ledger_generation_id=generation_id,
+        freeze_version=freeze_version,
     )
     db.add(slot)
     db.commit()

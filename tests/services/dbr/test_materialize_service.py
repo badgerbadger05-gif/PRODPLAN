@@ -21,6 +21,7 @@ from app.models import (
     DefaultSpecification,
     Item,
     ItemWarehouseStock,
+    PlanningRun,
     ProductionOrder,
     ProductionProduct,
     ProductionResource,
@@ -85,6 +86,11 @@ def _stub(monkeypatch, *, base_url="http://demo/odata/unf_demo", client=None):
 
 
 def _slot_scenario(db, *, kit_status="green", qty=2):
+    lineage = {
+        "source_run_id": db.info["dbr_test_run_id"],
+        "ledger_generation_id": db.info["dbr_test_generation_id"],
+        "freeze_version": db.info["dbr_test_freeze_version"],
+    }
     settings_service.get_or_create_settings(db)
     resource = ProductionResource(resource_name="Сборка A", capacity=1)
     item = Item(item_code="SLED", item_name="Снегоход", item_article="SLED",
@@ -105,6 +111,7 @@ def _slot_scenario(db, *, kit_status="green", qty=2):
         )
     )
     schedule = DbrDrumSchedule(
+        ledger_generation_id=lineage["ledger_generation_id"],
         period_from=date(2026, 8, 1), period_to=date(2026, 8, 31), status="active"
     )
     db.add(schedule)
@@ -117,6 +124,7 @@ def _slot_scenario(db, *, kit_status="green", qty=2):
         item_id=item.item_id,
         qty=Decimal(str(qty)),
         kit_status=kit_status,
+        **lineage,
     )
     db.add(slot)
     db.commit()
@@ -124,6 +132,11 @@ def _slot_scenario(db, *, kit_status="green", qty=2):
 
 
 def _signal_scenario(db, *, kit_in_stock=True, qty=3):
+    lineage = {
+        "source_run_id": db.info["dbr_test_run_id"],
+        "ledger_generation_id": db.info["dbr_test_generation_id"],
+        "freeze_version": db.info["dbr_test_freeze_version"],
+    }
     settings = settings_service.get_or_create_settings(db)
     settings.w2_warehouse_ref1c = "W2"
     settings.w3_warehouse_ref1c = "W3"
@@ -144,7 +157,7 @@ def _signal_scenario(db, *, kit_in_stock=True, qty=3):
                               qty=100 if kit_in_stock else 0))
     signal = DbrFeederSignal(
         dedup_key="R:PROD",
-        signal_type="Пополнение",
+        signal_type="Под график",
         item_id=item.item_id,
         warehouse_ref1c="W2",
         status=signal_identity.OPEN,
@@ -152,6 +165,7 @@ def _signal_scenario(db, *, kit_in_stock=True, qty=3):
         priority=Decimal("1.0"),
         need_date=date(2026, 8, 5),
         required_date=date(2026, 8, 12),
+        **lineage,
     )
     db.add(signal)
     db.commit()
@@ -180,10 +194,20 @@ def test_release_slot_dry_run_writes_nothing(db_session, monkeypatch):
     assert "dbr" in res["payload"]["Комментарий"]
     # no writes
     assert fake.posts == []
-    db.refresh(slot)
+
+
+def test_release_slot_dry_run_rejects_stale_freeze(db_session):
+    slot, _schedule, _item, _comp = _slot_scenario(db_session)
+    run = db_session.get(PlanningRun, slot.source_run_id)
+    run.active_freeze_version += 1
+    db_session.flush()
+
+    with pytest.raises(ValueError, match="current active freeze"):
+        materialize_service.release_slot(db_session, slot.id, dry_run=True)
+    db_session.refresh(slot)
     assert slot.release_status == "pending"
     assert slot.one_c_order_ref is None
-    assert db.query(SyncLink).count() == 0
+    assert db_session.query(SyncLink).count() == 0
 
 
 def test_release_slot_real_write_stamps_sync_link_and_slot(db_session, monkeypatch):
@@ -298,9 +322,20 @@ def test_launch_signal_dry_run_writes_nothing(db_session, monkeypatch):
     # produced part lands on the shelf warehouse
     assert res["payload"]["Продукция"][0]["СтруктурнаяЕдиница_Key"] == "W2"
     assert fake.posts == []
-    db.refresh(signal)
+
+
+def test_shelf_signal_without_exact_run_is_not_materializable(db_session):
+    signal, _item, _comp = _signal_scenario(db_session, kit_in_stock=True)
+    signal.signal_type = "Пополнение"
+    signal.source_run_id = None
+    signal.freeze_version = None
+    db_session.flush()
+
+    with pytest.raises(ValueError, match="explicit source_run_id"):
+        materialize_service.launch_signal(db_session, signal.id, dry_run=True)
+    db_session.refresh(signal)
     assert signal.status == signal_identity.OPEN
-    assert db.query(SyncLink).count() == 0
+    assert db_session.query(SyncLink).count() == 0
 
 
 def test_launch_signal_real_write_moves_to_order_created(db_session, monkeypatch):
@@ -414,6 +449,9 @@ def test_release_day_partial_failure_keeps_successes(db_session, monkeypatch):
         qty=Decimal("1"),
         kit_status="green",
         position=1,
+        source_run_id=slot_ok.source_run_id,
+        ledger_generation_id=slot_ok.ledger_generation_id,
+        freeze_version=slot_ok.freeze_version,
     )
     db.add(slot_bad)
     db.commit()

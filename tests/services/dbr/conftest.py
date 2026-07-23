@@ -4,11 +4,20 @@ from datetime import datetime
 
 import pytest
 
-from app.models import LedgerGeneration, PhysicalImportBatch, PlanningTruthState
+from app.models import (
+    DbrDrumScheduleProgram,
+    DbrDrumSlot,
+    DbrProductionProgram,
+    LedgerGeneration,
+    PhysicalImportBatch,
+    PlanningRun,
+    PlanningTruthState,
+)
 from app.services.dbr import (
     drum_service,
     feeder_position_service,
     feeder_signal_service,
+    program_service,
 )
 
 
@@ -26,7 +35,11 @@ def _diagnostic_dbr_generation(db_session, monkeypatch):
         status="accepted",
         cutoff=datetime(2026, 7, 23),
         source_watermarks={},
-        capabilities={},
+        capabilities={
+            "physical_ledger": True,
+            "reservation_replay": True,
+            "execution_allocations": True,
+        },
         physical_import_batch=batch,
         algorithm_version="test/diagnostic",
         accepted_at=datetime(2026, 7, 23),
@@ -36,7 +49,18 @@ def _diagnostic_dbr_generation(db_session, monkeypatch):
     db_session.add(
         PlanningTruthState(id=1, current_generation_id=generation.id)
     )
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot={},
+        active_freeze_version=1,
+        ledger_generation_id=generation.id,
+        ledger_cutoff=generation.cutoff,
+    )
+    db_session.add(run)
     db_session.flush()
+    db_session.info["dbr_test_run_id"] = run.run_id
+    db_session.info["dbr_test_generation_id"] = generation.id
+    db_session.info["dbr_test_freeze_version"] = run.active_freeze_version
 
     def attach_lineage(db):
         """Legacy fixtures belong to this explicit diagnostic generation."""
@@ -53,13 +77,47 @@ def _diagnostic_dbr_generation(db_session, monkeypatch):
                 {"ledger_generation_id": generation.id},
                 synchronize_session=False,
             )
+        for model in (
+            DbrProductionProgram,
+            DbrDrumScheduleProgram,
+            DbrDrumSlot,
+        ):
+            db.query(model).filter(model.source_run_id.is_(None)).update(
+                {
+                    "source_run_id": run.run_id,
+                    "ledger_generation_id": generation.id,
+                    "freeze_version": run.active_freeze_version,
+                },
+                synchronize_session=False,
+            )
+        db.query(feeder_signal_service.DbrFeederSignal).filter(
+            feeder_signal_service.DbrFeederSignal.source_run_id.is_(None)
+        ).update(
+            {
+                "source_run_id": run.run_id,
+                "freeze_version": run.active_freeze_version,
+            },
+            synchronize_session=False,
+        )
         db.flush()
+        db.expire_all()
 
     build_schedule = drum_service.build_schedule
     rebuild_positions = feeder_position_service.rebuild_positions
     preview_positions = feeder_position_service.preview_positions
     refresh_signals = feeder_signal_service.refresh_signals
     preview_signals = feeder_signal_service.preview_signals
+    create_program = program_service.create_program
+
+    monkeypatch.setattr(
+        program_service,
+        "create_program",
+        lambda db, **kwargs: create_program(
+            db,
+            source_run_id=kwargs.pop("source_run_id", run.run_id),
+            **kwargs,
+        ),
+    )
 
     monkeypatch.setattr(
         drum_service,

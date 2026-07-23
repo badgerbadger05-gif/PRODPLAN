@@ -313,6 +313,9 @@ def refresh_chain_signals(db: Session, max_passes: int = 3) -> dict[str, Any]:
             row = existing.get(dedup)
             if row is None:
                 row = DbrFeederSignal(
+                    ledger_generation_id=parent.ledger_generation_id,
+                    source_run_id=parent.source_run_id,
+                    freeze_version=parent.freeze_version,
                     dedup_key=dedup,
                     signal_type="Цепочка",
                     supermarket_position_id=None,
@@ -332,6 +335,9 @@ def refresh_chain_signals(db: Session, max_passes: int = 3) -> dict[str, Any]:
             ) != priority:
                 updated += 1
 
+            row.ledger_generation_id = parent.ledger_generation_id
+            row.source_run_id = parent.source_run_id
+            row.freeze_version = parent.freeze_version
             row.status = signal_identity.OPEN
             row.cancelled_at = None
             row.suggested_qty = demand.qty

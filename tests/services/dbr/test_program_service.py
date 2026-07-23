@@ -171,3 +171,22 @@ def test_approve_is_idempotent(db_session):
     program_service.approve_program(db, program.id)
     program_service.approve_program(db, program.id)  # no raise
     assert program.status == "approved"
+
+
+def test_legacy_null_lineage_program_is_viewable_but_not_approvable(db_session):
+    item = _item(db_session)
+    program = program_service.create_program(
+        db_session,
+        source_run_id=db_session.info["dbr_test_run_id"],
+        from_date=date(2026, 8, 1),
+        to_date=date(2026, 8, 31),
+        items=[{"item_id": item.item_id, "program_date": date(2026, 8, 3), "qty": 1}],
+    )
+    program.source_run_id = None
+    program.ledger_generation_id = None
+    program.freeze_version = None
+    db_session.flush()
+
+    assert program_service.get_program(db_session, program.id) is program
+    with pytest.raises(ValueError, match="explicit source_run_id"):
+        program_service.approve_program(db_session, program.id)

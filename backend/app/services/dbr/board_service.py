@@ -85,6 +85,9 @@ def get_board(
         slots_out.append(
             {
                 "id": slot.id,
+                "source_run_id": slot.source_run_id,
+                "ledger_generation_id": slot.ledger_generation_id,
+                "freeze_version": slot.freeze_version,
                 "date": slot.slot_date,
                 "planned_date": slot.planned_date,
                 "resource_id": slot.resource_id,

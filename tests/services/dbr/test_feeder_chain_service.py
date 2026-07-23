@@ -109,8 +109,32 @@ def test_spawn_only_for_make_without_shelf(db_session, monkeypatch):
     assert child.warehouse_ref1c == "W2"
     # priority inherited from the parent
     assert float(child.priority) == 1.5
+    assert child.source_run_id is None
+    assert child.freeze_version is None
     # shelf and purchased components never spawn a chain child
     assert {c.item_id for c in children} == {make.item_id}
+
+
+def test_chain_child_inherits_exact_parent_run_lineage(db_session, monkeypatch):
+    db = db_session
+    prod, _make = _base(db, monkeypatch)
+    parent = _parent(db, prod)
+    parent.signal_type = "Под график"
+    parent.source_run_id = db.info["dbr_test_run_id"]
+    parent.ledger_generation_id = db.info["dbr_test_generation_id"]
+    parent.freeze_version = db.info["dbr_test_freeze_version"]
+    db.flush()
+
+    feeder_chain_service.refresh_chain_signals(db)
+
+    child = (
+        db.query(DbrFeederSignal)
+        .filter(DbrFeederSignal.signal_type == "Цепочка")
+        .one()
+    )
+    assert child.source_run_id == parent.source_run_id
+    assert child.ledger_generation_id == parent.ledger_generation_id
+    assert child.freeze_version == parent.freeze_version
 
 
 def test_switch_off_creates_nothing(db_session, monkeypatch):

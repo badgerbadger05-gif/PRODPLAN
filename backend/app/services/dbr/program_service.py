@@ -13,6 +13,7 @@ from typing import Any, Iterable, Optional
 from sqlalchemy.orm import Session
 
 from ...models import DbrProductionProgram, DbrProductionProgramItem
+from . import planning_lineage
 
 DRAFT = "draft"
 APPROVED = "approved"
@@ -87,13 +88,20 @@ def create_program(
     title: Optional[str] = None,
     created_by: Optional[str] = None,
     items: Optional[Iterable[dict[str, Any]]] = None,
+    source_run_id: int | None = None,
 ) -> DbrProductionProgram:
+    run_id, generation_id, freeze_version = planning_lineage.current_tuple(
+        db, source_run_id, consumer="dbr_program_create"
+    )
     if from_date > to_date:
         raise ValueError("from_date позже to_date")
     normalized_items = _validate_items(
         items or [], from_date=from_date, to_date=to_date
     )
     program = DbrProductionProgram(
+        source_run_id=run_id,
+        ledger_generation_id=generation_id,
+        freeze_version=freeze_version,
         company=company,
         title=title,
         from_date=from_date,
@@ -164,6 +172,7 @@ def approve_program(db: Session, program_id: int) -> DbrProductionProgram:
         from_date=program.from_date,
         to_date=program.to_date,
     )
+    planning_lineage.require_row(db, program, consumer="dbr_program_approve")
     if program.status == APPROVED:
         return program
     program.status = APPROVED

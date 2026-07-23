@@ -16,6 +16,7 @@ from app.models import (
     DbrDrumSlot,
     DbrProductionProgram,
     Item,
+    PlanningRun,
     ProductionResource,
     WorkCalendarDay,
 )
@@ -199,6 +200,50 @@ def test_extend_is_idempotent(db_session):
         .count()
         == 1
     )
+
+
+def test_extend_preserves_per_program_run_lineage_across_rolling_periods(db_session):
+    db = db_session
+    _resource, item = _setup_assembly(db)
+    _workweek(db)
+    first = _approved_program(db, item, 10)
+    schedule, _ = drum_service.build_schedule(db, first.id)
+
+    first_run = db.get(PlanningRun, first.source_run_id)
+    second_run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot={},
+        active_freeze_version=2,
+        ledger_generation_id=first_run.ledger_generation_id,
+        ledger_cutoff=first_run.ledger_cutoff,
+    )
+    db.add(second_run)
+    db.flush()
+    second = program_service.create_program(
+        db,
+        source_run_id=second_run.run_id,
+        from_date=date(2026, 9, 1),
+        to_date=date(2026, 9, 30),
+        items=[{"item_id": item.item_id, "program_date": date(2026, 9, 1), "qty": 10}],
+    )
+    program_service.approve_program(db, second.id)
+
+    drum_service.extend(db, schedule.id, second.id)
+    drum_service.activate(db, schedule.id)
+
+    markers = {
+        marker.program_id: (marker.source_run_id, marker.freeze_version)
+        for marker in schedule.covered_programs
+    }
+    assert markers[first.id] == (first.source_run_id, first.freeze_version)
+    assert markers[second.id] == (second_run.run_id, 2)
+    assert {
+        (slot.source_program_id, slot.source_run_id, slot.freeze_version)
+        for slot in schedule.slots
+    } >= {
+        (first.id, first.source_run_id, first.freeze_version),
+        (second.id, second_run.run_id, 2),
+    }
 
 
 def test_database_rejects_two_active_schedules_across_independent_sessions(tmp_path):

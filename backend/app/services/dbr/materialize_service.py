@@ -58,6 +58,7 @@ from ..workshop_resolution import (
     resolve_workshop_for_spec,
 )
 from .core.feeder import signal_identity
+from . import planning_lineage
 
 SOURCE_SYSTEM = "dbr"
 SLOT_DOCTYPE = "drum_slot"
@@ -152,6 +153,9 @@ def _make_entry(
     reserve_ref: Optional[str],
     start_date: Optional[date],
     finish_date: Optional[date],
+    source_run_id: int,
+    ledger_generation_id: int,
+    freeze_version: int,
 ) -> ProductionOrderExportEntry:
     ref1c = clean_ref1c(item.item_ref1c)
     if not ref1c:
@@ -191,6 +195,9 @@ def _make_entry(
     return ProductionOrderExportEntry(
         order_id=int(source_id),
         number=number,
+        source_run_id=int(source_run_id),
+        ledger_generation_id=int(ledger_generation_id),
+        freeze_version=int(freeze_version),
         lines=[line],
         materials=materials,
         operations=operations,
@@ -198,6 +205,7 @@ def _make_entry(
         product_structural_unit_ref1c=product_destination_ref,
         planned_start_date=start_date,
         planned_finish_date=finish_date,
+        document_date=start_date or finish_date,
     )
 
 
@@ -342,6 +350,7 @@ def release_slot(db: Session, slot_id: int, dry_run: bool = True) -> dict[str, A
     slot = db.get(DbrDrumSlot, slot_id)
     if slot is None:
         raise LookupError("slot not found")
+    planning_lineage.require_row(db, slot, consumer="dbr_slot_release")
 
     existing = _find_dbr_link(db, source_doctype=SLOT_DOCTYPE, source_id=slot.id)
     already = existing is not None and existing.status == "success" and clean_ref1c(existing.target_ref_key)
@@ -371,6 +380,9 @@ def release_slot(db: Session, slot_id: int, dry_run: bool = True) -> dict[str, A
         reserve_ref=workshop_wh,
         start_date=slot.slot_date,
         finish_date=slot.slot_date,
+        source_run_id=int(slot.source_run_id),
+        ledger_generation_id=int(slot.ledger_generation_id),
+        freeze_version=int(slot.freeze_version),
     )
     if already:
         entry.target_ref_key = clean_ref1c(existing.target_ref_key)
@@ -469,6 +481,7 @@ def launch_signal(
     signal = db.get(DbrFeederSignal, signal_id)
     if signal is None:
         raise LookupError("signal not found")
+    planning_lineage.require_row(db, signal, consumer="dbr_signal_launch")
 
     existing = _find_dbr_link(db, source_doctype=SIGNAL_DOCTYPE, source_id=signal.id)
     already = existing is not None and existing.status == "success" and clean_ref1c(existing.target_ref_key)
@@ -510,6 +523,9 @@ def launch_signal(
         reserve_ref=workshop_wh,
         start_date=signal.need_date,
         finish_date=signal.required_date or signal.need_date,
+        source_run_id=int(signal.source_run_id),
+        ledger_generation_id=int(signal.ledger_generation_id),
+        freeze_version=int(signal.freeze_version),
     )
     if already or (existing is not None and clean_ref1c(existing.target_ref_key)):
         entry.target_ref_key = clean_ref1c(existing.target_ref_key)

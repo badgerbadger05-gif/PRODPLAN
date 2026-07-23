@@ -28,6 +28,7 @@ from . import adapters, classify as classify_mod
 from .journal_bridge import sync_journal_rows
 from .core.drum.kit import build_kit
 from . import feeder_material_service, feeder_nfp_service
+from . import planning_lineage
 from .generation import DbrProjectionUnavailable, require_generation
 from .core.feeder import signal_identity, zones
 
@@ -446,6 +447,21 @@ def refresh_signals(
         signal.kit_shortage_qty = data.get("kit_shortage_qty", 0)
         signal.source_schedule_id = preview["schedule_id"]
         signal.drum_slot_id = data.get("slot_id")
+        if data["signal_type"] == "Под график":
+            slot = db.get(DbrDrumSlot, int(data["slot_id"]))
+            if slot is None:
+                raise ValueError("under-schedule signal source slot is missing")
+            planning_lineage.require_row(
+                db, slot, consumer="dbr_under_schedule_signal_refresh"
+            )
+            signal.source_run_id = slot.source_run_id
+            signal.ledger_generation_id = slot.ledger_generation_id
+            signal.freeze_version = slot.freeze_version
+        else:
+            # Shelf replenishment has no exact planning obligation. It remains
+            # advisory and therefore deliberately cannot be materialized.
+            signal.source_run_id = None
+            signal.freeze_version = None
         signal.need_date = data.get("need_date")
         signal.required_date = data.get("required_date")
         signal.raw_demand_qty = data.get("raw_demand_qty")
@@ -487,6 +503,8 @@ def signal_out(signal: DbrFeederSignal) -> dict[str, Any]:
     return {
         "id": signal.id,
         "ledger_generation_id": signal.ledger_generation_id,
+        "source_run_id": signal.source_run_id,
+        "freeze_version": signal.freeze_version,
         "dedup_key": signal.dedup_key,
         "signal_type": signal.signal_type,
         "position_id": signal.supermarket_position_id,

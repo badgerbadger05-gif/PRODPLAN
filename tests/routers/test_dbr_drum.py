@@ -23,6 +23,7 @@ from app.models import (
     ItemWarehouseStock,
     LedgerGeneration,
     PhysicalImportBatch,
+    PlanningRun,
     PlanningTruthState,
     ProductionResource,
     SpecComponent,
@@ -55,7 +56,11 @@ def db_session():
         status="accepted",
         cutoff=datetime(2026, 7, 23),
         source_watermarks={},
-        capabilities={},
+        capabilities={
+            "physical_ledger": True,
+            "reservation_replay": True,
+            "execution_allocations": True,
+        },
         physical_import_batch=batch,
         algorithm_version="test/diagnostic",
         accepted_at=datetime(2026, 7, 23),
@@ -63,7 +68,16 @@ def db_session():
     db.add(generation)
     db.flush()
     db.add(PlanningTruthState(id=1, current_generation_id=generation.id))
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot={},
+        active_freeze_version=1,
+        ledger_generation_id=generation.id,
+        ledger_cutoff=generation.cutoff,
+    )
+    db.add(run)
     db.commit()
+    db.info["dbr_test_run_id"] = run.run_id
     try:
         yield db
     finally:
@@ -74,6 +88,7 @@ def db_session():
 @pytest.fixture()
 def client(db_session):
     app = FastAPI()
+    app.state.dbr_test_run_id = db_session.info["dbr_test_run_id"]
     app.include_router(dbr_router, prefix="/api")
 
     def override_get_db():
@@ -131,6 +146,7 @@ def _create_and_activate(client, sled_id):
     resp = client.post(
         "/api/v1/dbr/programs",
         json={
+            "source_run_id": client.app.state.dbr_test_run_id,
             "from_date": "2026-07-16",
             "to_date": "2026-08-31",
             "title": "Тест",
@@ -151,7 +167,12 @@ def _create_and_activate(client, sled_id):
 def test_program_crud_flow(client, seed):
     resp = client.post(
         "/api/v1/dbr/programs",
-        json={"from_date": "2026-08-01", "to_date": "2026-08-31", "items": []},
+        json={
+            "source_run_id": client.app.state.dbr_test_run_id,
+            "from_date": "2026-08-01",
+            "to_date": "2026-08-31",
+            "items": [],
+        },
     )
     assert resp.status_code == 200
     pid = resp.json()["id"]
@@ -170,6 +191,7 @@ def test_program_crud_flow(client, seed):
 
 def test_program_api_rejects_invalid_and_duplicate_items(client, seed):
     base = {
+        "source_run_id": client.app.state.dbr_test_run_id,
         "from_date": "2026-08-01",
         "to_date": "2026-08-31",
     }

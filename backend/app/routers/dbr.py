@@ -511,6 +511,7 @@ class ProgramItemIn(BaseModel):
 
 
 class ProgramCreate(BaseModel):
+    source_run_id: int
     from_date: date
     to_date: date
     company: Optional[str] = None
@@ -530,6 +531,9 @@ class ProgramUpdate(BaseModel):
 def _program_out(program) -> dict[str, Any]:
     return {
         "id": program.id,
+        "source_run_id": program.source_run_id,
+        "ledger_generation_id": program.ledger_generation_id,
+        "freeze_version": program.freeze_version,
         "company": program.company,
         "title": program.title,
         "from_date": program.from_date,
@@ -564,6 +568,7 @@ def create_program(
             company=payload.company,
             title=payload.title,
             created_by=payload.created_by,
+            source_run_id=payload.source_run_id,
             items=[it.model_dump() for it in payload.items],
         )
     except ValueError as exc:
@@ -643,6 +648,15 @@ def _schedule_out(schedule) -> dict[str, Any]:
         "source_program_id": schedule.source_program_id,
         "status": schedule.status,
         "config_snapshot": schedule.config_snapshot,
+        "covered_programs": [
+            {
+                "program_id": marker.program_id,
+                "source_run_id": marker.source_run_id,
+                "ledger_generation_id": marker.ledger_generation_id,
+                "freeze_version": marker.freeze_version,
+            }
+            for marker in schedule.covered_programs
+        ],
     }
 
 

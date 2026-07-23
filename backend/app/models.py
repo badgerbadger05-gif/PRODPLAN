@@ -1896,6 +1896,11 @@ class DbrFeederSignal(Base):
             name="ck_dbr_feeder_signal_status",
         ),
         CheckConstraint("suggested_qty >= 0", name="ck_dbr_feeder_signal_qty_nonnegative"),
+        CheckConstraint(
+            "(source_run_id IS NULL AND freeze_version IS NULL) OR "
+            "(source_run_id IS NOT NULL AND freeze_version IS NOT NULL)",
+            name="ck_dbr_feeder_signal_run_freeze_pair",
+        ),
     )
 
     id = Column(Integer, primary_key=True, index=True)
@@ -1905,6 +1910,13 @@ class DbrFeederSignal(Base):
         nullable=True,
         index=True,
     )
+    source_run_id = Column(
+        Integer,
+        ForeignKey("planning_run.run_id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    freeze_version = Column(Integer, nullable=True)
     dedup_key = Column(String(66), nullable=False, index=True)
     signal_type = Column(String(30), nullable=False, default="Пополнение", server_default="Пополнение")
     # Chain signals ("Цепочка") are pegged to a parent signal, not to a shelf
@@ -1952,6 +1964,7 @@ class DbrFeederSignal(Base):
 
     position = relationship("DbrSupermarketPosition")
     ledger_generation = relationship("LedgerGeneration")
+    source_run = relationship("PlanningRun")
     item = relationship("Item")
     source_schedule = relationship("DbrDrumSchedule")
     drum_slot = relationship("DbrDrumSlot")
@@ -1968,8 +1981,28 @@ class DbrProductionProgram(Base):
     `ProdFlow Production Program`). Строки в dbr_production_program_item."""
 
     __tablename__ = "dbr_production_program"
+    __table_args__ = (
+        CheckConstraint(
+            "(source_run_id IS NULL AND ledger_generation_id IS NULL AND freeze_version IS NULL) OR "
+            "(source_run_id IS NOT NULL AND ledger_generation_id IS NOT NULL AND freeze_version IS NOT NULL)",
+            name="ck_dbr_program_lineage_tuple",
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
+    source_run_id = Column(
+        Integer,
+        ForeignKey("planning_run.run_id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    freeze_version = Column(Integer, nullable=True)
     company = Column(String(255), nullable=True)
     title = Column(String(255), nullable=True)
     from_date = Column(Date, nullable=False)
@@ -1985,6 +2018,8 @@ class DbrProductionProgram(Base):
         back_populates="program",
         cascade="all, delete-orphan",
     )
+    source_run = relationship("PlanningRun")
+    ledger_generation = relationship("LedgerGeneration")
 
 
 class DbrProductionProgramItem(Base):
@@ -2077,6 +2112,11 @@ class DbrDrumScheduleProgram(Base):
             "program_id",
             name="ux_dbr_drum_schedule_program",
         ),
+        CheckConstraint(
+            "(source_run_id IS NULL AND ledger_generation_id IS NULL AND freeze_version IS NULL) OR "
+            "(source_run_id IS NOT NULL AND ledger_generation_id IS NOT NULL AND freeze_version IS NOT NULL)",
+            name="ck_dbr_schedule_program_lineage_tuple",
+        ),
     )
 
     id = Column(Integer, primary_key=True, index=True)
@@ -2092,12 +2132,27 @@ class DbrDrumScheduleProgram(Base):
         nullable=False,
         index=True,
     )
+    source_run_id = Column(
+        Integer,
+        ForeignKey("planning_run.run_id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    freeze_version = Column(Integer, nullable=True)
     created_at = Column(
         TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False
     )
 
     schedule = relationship("DbrDrumSchedule", back_populates="covered_programs")
     program = relationship("DbrProductionProgram")
+    source_run = relationship("PlanningRun")
+    ledger_generation = relationship("LedgerGeneration")
 
 
 class DbrDrumSlot(Base):
@@ -2108,6 +2163,13 @@ class DbrDrumSlot(Base):
     """
 
     __tablename__ = "dbr_drum_slot"
+    __table_args__ = (
+        CheckConstraint(
+            "(source_run_id IS NULL AND ledger_generation_id IS NULL AND freeze_version IS NULL) OR "
+            "(source_run_id IS NOT NULL AND ledger_generation_id IS NOT NULL AND freeze_version IS NOT NULL)",
+            name="ck_dbr_drum_slot_lineage_tuple",
+        ),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
     schedule_id = Column(
@@ -2137,6 +2199,19 @@ class DbrDrumSlot(Base):
         nullable=True,
         index=True,
     )
+    source_run_id = Column(
+        Integer,
+        ForeignKey("planning_run.run_id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
+    freeze_version = Column(Integer, nullable=True)
     position = Column(Integer, nullable=False, default=0, server_default="0")
     created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
     updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
@@ -2144,6 +2219,8 @@ class DbrDrumSlot(Base):
     schedule = relationship("DbrDrumSchedule", back_populates="slots")
     resource = relationship("ProductionResource")
     item = relationship("Item")
+    source_run = relationship("PlanningRun")
+    ledger_generation = relationship("LedgerGeneration")
 
 
 class DbrDrumCapacityGap(Base):

@@ -21,6 +21,7 @@ from ...models import (
 )
 from . import adapters
 from . import settings_service
+from . import planning_lineage
 from .generation import require_generation
 from .core.drum.leveling import level
 from .core.drum.program_input import (
@@ -102,7 +103,14 @@ def _level_program(db: Session, program: DbrProductionProgram):
     return result, name_to_rid, code_to_id, carried, fallback
 
 
-def _append_result(db: Session, schedule: DbrDrumSchedule, result, program_id, name_to_rid, code_to_id) -> int:
+def _append_result(
+    db: Session,
+    schedule: DbrDrumSchedule,
+    result,
+    program: DbrProductionProgram,
+    name_to_rid,
+    code_to_id,
+) -> int:
     # Continue day positions after any existing slots (extend appends).
     pos_by_day: dict[Any, int] = {}
     for existing in schedule.slots:
@@ -128,7 +136,10 @@ def _append_result(db: Session, schedule: DbrDrumSchedule, result, program_id, n
                 produced_qty=0,
                 kit_status="unknown",
                 release_status="pending",
-                source_program_id=program_id,
+                source_program_id=program.id,
+                source_run_id=program.source_run_id,
+                ledger_generation_id=program.ledger_generation_id,
+                freeze_version=program.freeze_version,
                 position=pos,
             )
         )
@@ -148,6 +159,24 @@ def _append_result(db: Session, schedule: DbrDrumSchedule, result, program_id, n
     return added
 
 
+def _require_schedule_lineage(
+    db: Session, schedule: DbrDrumSchedule, *, consumer: str
+) -> None:
+    if schedule.ledger_generation_id is None:
+        raise ValueError("legacy schedule has no Ledger generation lineage")
+    markers = list(schedule.covered_programs)
+    if not markers:
+        raise ValueError("schedule has no program lineage snapshots")
+    for marker in markers:
+        _run, generation_id = planning_lineage.require_row(
+            db, marker, consumer=consumer
+        )
+        if generation_id != int(schedule.ledger_generation_id):
+            raise ValueError("schedule contains mixed Ledger generations")
+    for slot in schedule.slots:
+        planning_lineage.require_row(db, slot, consumer=consumer)
+
+
 def build_schedule(
     db: Session,
     program_id: int,
@@ -159,7 +188,7 @@ def build_schedule(
     Returns (schedule, meta) where meta carries carried_over + calendar
     fallback flag (transient, not persisted — mirrors prodflow's _carried_over).
     """
-    generation_id = require_generation(
+    requested_generation_id = require_generation(
         db, ledger_generation_id, consumer="dbr_drum_build"
     )
     program = db.get(DbrProductionProgram, program_id)
@@ -169,6 +198,11 @@ def build_schedule(
         raise ValueError("барабан строится только из утверждённой программы (статус «approved»)")
     if not program.items:
         raise ValueError("в программе нет строк")
+    _run, generation_id = planning_lineage.require_row(
+        db, program, consumer="dbr_drum_build"
+    )
+    if requested_generation_id != generation_id:
+        raise ValueError("program and requested Ledger generation do not match")
 
     result, name_to_rid, code_to_id, carried, fallback = _level_program(db, program)
     settings = settings_service.get_or_create_settings(db)
@@ -185,8 +219,15 @@ def build_schedule(
     )
     db.add(schedule)
     db.flush()
-    db.add(DbrDrumScheduleProgram(schedule_id=schedule.id, program_id=program.id))
-    added = _append_result(db, schedule, result, program.id, name_to_rid, code_to_id)
+    schedule.covered_programs.append(
+        DbrDrumScheduleProgram(
+            program_id=program.id,
+            source_run_id=program.source_run_id,
+            ledger_generation_id=program.ledger_generation_id,
+            freeze_version=program.freeze_version,
+        )
+    )
+    added = _append_result(db, schedule, result, program, name_to_rid, code_to_id)
     db.flush()
     return schedule, {"slots_added": added, "carried_over": carried, "calendar_fallback": fallback}
 
@@ -208,6 +249,7 @@ def activate(db: Session, schedule_id: int) -> DbrDrumSchedule:
         raise LookupError("schedule not found")
     if schedule.status in (SUPERSEDED, CANCELLED):
         raise ValueError(f"график в статусе «{schedule.status}» активировать нельзя")
+    _require_schedule_lineage(db, schedule, consumer="dbr_drum_activate")
     # Supersede any current Active row(s) and flush that UPDATE *before* setting
     # this schedule Active. Otherwise SQLAlchemy orders both UPDATEs by ascending
     # PK in one flush, and when this schedule has the smaller id it turns Active
@@ -244,6 +286,7 @@ def extend(db: Session, schedule_id: int, program_id: int) -> tuple[DbrDrumSched
         raise LookupError("schedule not found")
     if schedule.status not in (DRAFT, ACTIVE):
         raise ValueError(f"график в статусе «{schedule.status}» не продлевается")
+    _require_schedule_lineage(db, schedule, consumer="dbr_drum_extend")
 
     program = db.get(DbrProductionProgram, program_id)
     if program is None:
@@ -252,6 +295,13 @@ def extend(db: Session, schedule_id: int, program_id: int) -> tuple[DbrDrumSched
         raise ValueError("продлевать можно только утверждённой программой")
     if not program.items:
         raise ValueError("в программе нет строк")
+    _run, generation_id = planning_lineage.require_row(
+        db, program, consumer="dbr_drum_extend"
+    )
+    if schedule.ledger_generation_id is None:
+        raise ValueError("legacy schedule has no Ledger generation lineage")
+    if generation_id != int(schedule.ledger_generation_id):
+        raise ValueError("cannot extend schedule across Ledger generations")
 
     covered = (
         db.query(DbrDrumScheduleProgram.id)
@@ -275,9 +325,16 @@ def extend(db: Session, schedule_id: int, program_id: int) -> tuple[DbrDrumSched
         config_snapshot.get("calendar_fallback") or fallback
     )
     schedule.config_snapshot = config_snapshot
-    db.add(DbrDrumScheduleProgram(schedule_id=schedule.id, program_id=program.id))
+    schedule.covered_programs.append(
+        DbrDrumScheduleProgram(
+            program_id=program.id,
+            source_run_id=program.source_run_id,
+            ledger_generation_id=program.ledger_generation_id,
+            freeze_version=program.freeze_version,
+        )
+    )
     db.flush()
-    added = _append_result(db, schedule, result, program.id, name_to_rid, code_to_id)
+    added = _append_result(db, schedule, result, program, name_to_rid, code_to_id)
     if program.to_date > schedule.period_to:
         schedule.period_to = program.to_date
     db.flush()
