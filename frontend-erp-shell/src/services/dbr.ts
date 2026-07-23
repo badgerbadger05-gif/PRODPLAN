@@ -25,6 +25,7 @@ import type {
   DbrProgramCreate,
   DbrProgramUpdate,
   DbrPurchaseLaunchResult,
+  DbrPurchaseCockpit,
   DbrPurchasePlanPreview,
   DbrReleaseDayResult,
   DbrReleaseResult,
@@ -51,6 +52,11 @@ export function dbrSnapshotUnavailableMessage(error: unknown): string | null {
 /** One saved, Ledger-bound read model for the complete feeder cockpit. */
 export function getDbrFeederCockpit() {
   return api<DbrFeederCockpit>('/v1/dbr/feeder/cockpit')
+}
+
+/** Immutable purchase obligations for one accepted Item Ledger generation. */
+export function getDbrPurchaseCockpit() {
+  return api<DbrPurchaseCockpit>('/v1/dbr/purchase/cockpit')
 }
 
 // ── Settings ────────────────────────────────────────────────────────────────

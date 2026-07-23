@@ -1,116 +1,36 @@
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { DbrProgram, DbrPurchaseLaunchResult, DbrPurchasePlanPreview } from '../../domain/dbr'
-import {
-  listDbrPrograms,
-  materializeDbrPurchasePlan,
-  previewDbrPurchasePlan,
-} from '../../services/dbr'
+import type { DbrPurchaseCockpit } from '../../domain/dbr'
+import { ApiError } from '../../lib/api'
+import { getDbrPurchaseCockpit } from '../../services/dbr'
 import { DbrPurchasePage } from './DbrPurchasePage'
 
 vi.mock('../../services/dbr', () => ({
-  listDbrPrograms: vi.fn(),
-  materializeDbrPurchasePlan: vi.fn(),
-  previewDbrPurchasePlan: vi.fn(),
+  getDbrPurchaseCockpit: vi.fn(),
+  dbrSnapshotUnavailableMessage: (error: unknown) => {
+    const candidate = error as { status?: number; detail?: { code?: string; reason?: string }; message?: string }
+    return candidate?.status === 503 && candidate.detail
+      ? `${candidate.detail.code ?? 'snapshot_unavailable'}: ${candidate.detail.reason ?? candidate.message ?? ''}`
+      : null
+  },
 }))
 
-const program: DbrProgram = {
-  id: 17,
-  title: 'Июльский план',
-  from_date: '2026-07-01',
-  to_date: '2026-07-31',
-  status: 'approved',
-  items: [],
-}
-
-const activePreview: DbrPurchasePlanPreview = {
-  ok: true,
-  source: { kind: 'active' },
-  lead_time_threshold_days: 60,
-  rows_to_order: 2,
-  items_total: 3,
-  warnings: ['Для ITEM-2 не назначен поставщик'],
+const cockpit: DbrPurchaseCockpit = {
+  meta: {
+    snapshot_id: 71,
+    ledger_generation: 42,
+    cutoff: '2026-07-23T10:00:00Z',
+    runs: [{ run_id: 17, freeze_version: 9 }, { run_id: 18, freeze_version: 4 }],
+    truth_status: 'accepted',
+    read_only: true,
+  },
   rows: [
-    {
-      item_id: 1,
-      item_code: 'ITEM-1',
-      item_name: 'Подшипник',
-      supplier_ref1c: 'SUPPLIER-1',
-      demand_qty: 10,
-      stock_qty: 2,
-      open_order_qty: 1,
-      available_qty: 3,
-      to_order_qty: 7,
-      need_date: '2026-08-20',
-      replenishment_time: 30,
-      order_before: '2026-07-21',
-      within_lead_time_threshold: true,
-    },
-    {
-      item_id: 2,
-      item_code: 'ITEM-2',
-      item_name: 'Редуктор',
-      supplier_ref1c: null,
-      demand_qty: 5,
-      stock_qty: 0,
-      open_order_qty: 0,
-      available_qty: 0,
-      to_order_qty: 5,
-      need_date: '2026-10-01',
-      replenishment_time: 20,
-      order_before: '2026-09-11',
-      within_lead_time_threshold: false,
-    },
-    {
-      item_id: 3,
-      item_code: 'ITEM-3',
-      item_name: 'Крепёж',
-      supplier_ref1c: 'SUPPLIER-2',
-      demand_qty: 1,
-      stock_qty: 4,
-      open_order_qty: 0,
-      available_qty: 4,
-      to_order_qty: 0,
-      replenishment_time: 5,
-      order_before: null,
-      within_lead_time_threshold: false,
-    },
+    { item_id: 1, item_code: 'ITEM-1', item_name: 'Подшипник', supplier_ref1c: 'SUPPLIER-1', warehouse_ref1c: 'W4', planning_stock_pool: 'main', reservation_ids: [101], obligations: [{ reservation_id: 101, priority_period_from: '2026-08-20', priority_period_to: '2026-08-20', outstanding_qty: 10, uncovered_qty: 7, coverage: [] }], outstanding_obligation_qty: 10, uncovered_qty: 7, to_order_qty: 7, stock_qty: 2, exact_future_supply_qty: 1, need_date: '2026-08-20' },
+    { item_id: 2, item_code: 'ITEM-2', item_name: 'Редуктор', supplier_ref1c: null, warehouse_ref1c: 'W4', planning_stock_pool: 'main', reservation_ids: [102], obligations: [{ reservation_id: 102, priority_period_from: '2026-10-01', priority_period_to: '2026-10-01', outstanding_qty: 5, uncovered_qty: 5, coverage: [] }], outstanding_obligation_qty: 5, uncovered_qty: 5, to_order_qty: 5, stock_qty: 0, exact_future_supply_qty: 0, need_date: '2026-10-01' },
+    { item_id: 3, item_code: 'ITEM-3', item_name: 'Крепёж', supplier_ref1c: 'SUPPLIER-2', warehouse_ref1c: 'W4', planning_stock_pool: 'main', reservation_ids: [103], obligations: [{ reservation_id: 103, outstanding_qty: 1, uncovered_qty: 0, coverage: [] }], outstanding_obligation_qty: 1, uncovered_qty: 0, to_order_qty: 0, stock_qty: 4, exact_future_supply_qty: 0, need_date: null },
   ],
-}
-
-const dryRun: DbrPurchaseLaunchResult = {
-  ok: true,
-  dry_run: true,
-  kind: 'purchase_plan',
-  entity: 'Document_ЗаказПоставщику',
-  source: { kind: 'active' },
-  orders_planned: 1,
-  items_total: 2,
-  unresolved: [{ item_id: 2, item_name: 'Редуктор', missing_supplier: true, missing_item_ref1c: false }],
-  already_exported: [],
-  orders_created: 0,
-  orders: [{
-    supplier_ref1c: 'SUPPLIER-1',
-    number: 'PREVIEW-1',
-    lines: [{
-      item_id: 1,
-      item_ref1c: 'ITEM-REF-1',
-      item_name: 'Подшипник',
-      qty: 7,
-      need_date: '2026-08-20',
-      order_date: '2026-07-21',
-      source_ids: [1],
-    }],
-  }],
-}
-
-const committed: DbrPurchaseLaunchResult = {
-  ...dryRun,
-  dry_run: false,
-  orders_created: 1,
-  orders: [{ ...dryRun.orders[0], number: 'PO-2026-001', status: 'created' }],
 }
 
 function deferred<T>() {
@@ -123,258 +43,134 @@ function renderPage() {
   return render(<MemoryRouter><DbrPurchasePage /></MemoryRouter>)
 }
 
-async function calculate(user: ReturnType<typeof userEvent.setup>) {
-  await user.click(screen.getByRole('button', { name: 'Рассчитать' }))
-  await screen.findByText('ITEM-1')
-}
-
-describe('DbrPurchasePage characterization', () => {
+describe('DbrPurchasePage saved-snapshot characterization', () => {
   beforeEach(() => {
     vi.resetAllMocks()
-    vi.mocked(listDbrPrograms).mockResolvedValue([program])
-    vi.mocked(previewDbrPurchasePlan).mockResolvedValue(activePreview)
-    vi.mocked(materializeDbrPurchasePlan)
-      .mockResolvedValueOnce(dryRun)
-      .mockResolvedValueOnce(committed)
+    vi.mocked(getDbrPurchaseCockpit).mockResolvedValue(cockpit)
   })
 
-  it('bootstraps programs and calculates the active schedule with the selected horizon', async () => {
-    const user = userEvent.setup()
+  it('loads exactly one immutable cockpit GET on mount', async () => {
     renderPage()
+    expect(await screen.findByText('ITEM-1')).toBeVisible()
+    expect(getDbrPurchaseCockpit).toHaveBeenCalledTimes(1)
+  })
 
-    expect(await screen.findByRole('option', { name: /Программа №17.*Июльский план/ })).toBeVisible()
-    await user.clear(screen.getByRole('spinbutton', { name: 'Горизонт заказа, дней' }))
-    await user.type(screen.getByRole('spinbutton', { name: 'Горизонт заказа, дней' }), '45')
-    await calculate(user)
+  it('does not render legacy source, threshold, calculation, or materialize controls', async () => {
+    renderPage()
+    await screen.findByText('ITEM-1')
+    expect(screen.queryByRole('combobox', { name: 'Источник' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('spinbutton', { name: 'Горизонт заказа, дней' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Рассчитать' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Сформировать заказы…' })).not.toBeInTheDocument()
+  })
 
-    expect(previewDbrPurchasePlan).toHaveBeenCalledWith({ active: true, thresholdDays: 45 })
-    expect(screen.getByText('Позиций в плане').parentElement).toHaveTextContent('3')
+  it('renders explicit ledger snapshot and frozen MRP lineage', async () => {
+    renderPage()
+    expect(await screen.findByTestId('purchase-snapshot-lineage')).toHaveTextContent('Снимок #71')
+    expect(screen.getByTestId('purchase-snapshot-lineage')).toHaveTextContent('Ledger-поколение #42')
+    expect(screen.getByTestId('purchase-snapshot-lineage')).toHaveTextContent('run #17')
+    expect(screen.getByTestId('purchase-snapshot-lineage')).toHaveTextContent('freeze 9')
+    expect(screen.getByTestId('purchase-snapshot-lineage')).toHaveTextContent('run #18')
+  })
+
+  it('derives read-only KPIs from captured rows', async () => {
+    renderPage()
+    await screen.findByText('ITEM-1')
+    expect(screen.getByText('Позиций в снимке').parentElement).toHaveTextContent('3')
     expect(screen.getByText('К заказу').parentElement).toHaveTextContent('2')
-    expect(screen.getByText('В горизонте 60 дн.').parentElement).toHaveTextContent('1')
-    expect(screen.getByText('Предупреждения качества: 1')).toBeVisible()
+    expect(screen.queryByText('Срочные')).not.toBeInTheDocument()
   })
 
-  it('uses program source parameters and applies row filtering and sorting locally', async () => {
+  it('keeps positive-obligation filtering local to the saved rows', async () => {
     const user = userEvent.setup()
     renderPage()
-    const source = await screen.findByRole('combobox', { name: 'Источник' })
-    await user.selectOptions(source, '17')
-    await calculate(user)
-
-    expect(previewDbrPurchasePlan).toHaveBeenCalledWith({ programId: 17, thresholdDays: 60 })
+    await screen.findByText('ITEM-1')
     expect(screen.queryByText('ITEM-3')).not.toBeInTheDocument()
     await user.click(screen.getByRole('checkbox', { name: 'Только к заказу' }))
     expect(screen.getByText('ITEM-3')).toBeVisible()
+    expect(getDbrPurchaseCockpit).toHaveBeenCalledTimes(1)
+  })
 
+  it('sorts snapshot rows locally by article', async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findByText('ITEM-1')
+    await user.click(screen.getByRole('checkbox', { name: 'Только к заказу' }))
+    await user.click(screen.getByRole('columnheader', { name: 'Позиция' }))
     const body = document.querySelector('.dbrPurchaseTable tbody')
-    expect(body).not.toBeNull()
-    await user.click(screen.getByText('Позиция'))
     expect(within(body as HTMLElement).getAllByRole('row').map((row) => row.textContent)).toEqual([
-      expect.stringContaining('ITEM-1'),
-      expect.stringContaining('ITEM-2'),
-      expect.stringContaining('ITEM-3'),
+      expect.stringContaining('ITEM-1'), expect.stringContaining('ITEM-2'), expect.stringContaining('ITEM-3'),
     ])
+    expect(getDbrPurchaseCockpit).toHaveBeenCalledTimes(1)
   })
 
-  it('clears the old result and presents a preview error without enabling materialization', async () => {
-    const user = userEvent.setup()
-    vi.mocked(previewDbrPurchasePlan)
-      .mockResolvedValueOnce(activePreview)
-      .mockRejectedValueOnce(new Error('Расчёт недоступен'))
-    renderPage()
-    await calculate(user)
-
-    await user.click(screen.getByRole('button', { name: 'Рассчитать' }))
-    expect(await screen.findByText('Расчёт недоступен')).toBeVisible()
-    expect(screen.queryByText('ITEM-1')).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Сформировать заказы…' })).toBeDisabled()
-  })
-
-  it('previews and confirms the exact source while refreshing the read model after the write', async () => {
+  it('sorts the captured rows by required quantity from the keyboard', async () => {
     const user = userEvent.setup()
     renderPage()
-    await calculate(user)
-
-    await user.click(screen.getByRole('button', { name: 'Сформировать заказы…' }))
-    const dialog = await screen.findByRole('dialog', { name: 'Формирование заказов поставщику' })
-    expect(dialog).toHaveAttribute('aria-modal', 'true')
-    expect(within(dialog).getByText(/Будет создан документ в живой 1С/)).toBeVisible()
-    expect(within(dialog).getByText('Документ № PREVIEW-1')).toBeVisible()
-    expect(materializeDbrPurchasePlan).toHaveBeenNthCalledWith(1, {
-      active: true, thresholdDays: 60, dryRun: true,
-    })
-
-    await user.click(within(dialog).getByRole('button', { name: 'Провести в 1С' }))
-    expect(await within(dialog).findByText(/Документ проведён в живой 1С/)).toBeVisible()
-    expect(within(dialog).getByText(/PO-2026-001/)).toBeVisible()
-    expect(materializeDbrPurchasePlan).toHaveBeenNthCalledWith(2, {
-      active: true, thresholdDays: 60, dryRun: false,
-    })
-    await waitFor(() => expect(previewDbrPurchasePlan).toHaveBeenCalledTimes(2))
-  })
-
-  it('closes the dialog and reports a dry-run failure on the page', async () => {
-    const user = userEvent.setup()
-    vi.mocked(materializeDbrPurchasePlan).mockReset().mockRejectedValue(new Error('Предпросмотр не выполнен'))
-    renderPage()
-    await calculate(user)
-
-    await user.click(screen.getByRole('button', { name: 'Сформировать заказы…' }))
-    expect(await screen.findByText('Предпросмотр не выполнен')).toBeVisible()
-    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
-  })
-
-  it('keeps a failed confirmation in the dialog and does not refresh the preview', async () => {
-    const user = userEvent.setup()
-    vi.mocked(materializeDbrPurchasePlan)
-      .mockReset()
-      .mockResolvedValueOnce(dryRun)
-      .mockRejectedValueOnce(new Error('1С отклонила документ'))
-    renderPage()
-    await calculate(user)
-    await user.click(screen.getByRole('button', { name: 'Сформировать заказы…' }))
-    const dialog = await screen.findByRole('dialog')
-    await user.click(within(dialog).getByRole('button', { name: 'Провести в 1С' }))
-
-    expect(await within(dialog).findByText('1С отклонила документ')).toBeVisible()
-    expect(within(dialog).getByRole('button', { name: 'Провести в 1С' })).toBeEnabled()
-    expect(previewDbrPurchasePlan).toHaveBeenCalledTimes(1)
-  })
-
-  it('locks preview materialization controls while the dry-run mutation is pending', async () => {
-    const user = userEvent.setup()
-    const pending = deferred<DbrPurchaseLaunchResult>()
-    vi.mocked(materializeDbrPurchasePlan).mockReset().mockReturnValue(pending.promise)
-    renderPage()
-    await calculate(user)
-
-    const launch = screen.getByRole('button', { name: 'Сформировать заказы…' })
-    fireEvent.click(launch)
-    fireEvent.click(launch)
-    expect(materializeDbrPurchasePlan).toHaveBeenCalledTimes(1)
-    expect(launch).toBeDisabled()
-    const dialog = screen.getByRole('dialog')
-    expect(within(dialog).getByRole('button', { name: 'Отмена' })).toBeDisabled()
-    expect(within(dialog).getByRole('button', { name: 'Отправка…' })).toBeDisabled()
-
-    pending.resolve(dryRun)
-    expect(await within(dialog).findByText('Документ № PREVIEW-1')).toBeVisible()
-  })
-
-  it('does not let a failed program bootstrap prevent active-plan calculation', async () => {
-    const user = userEvent.setup()
-    vi.mocked(listDbrPrograms).mockRejectedValue(new Error('Программы недоступны'))
-    renderPage()
-    await calculate(user)
-
-    expect(screen.getByText('ITEM-1')).toBeVisible()
-    expect(previewDbrPurchasePlan).toHaveBeenCalledWith({ active: true, thresholdDays: 60 })
-  })
-
-  it('keeps the newest calculation when an older preview request resolves last', async () => {
-    const oldRequest = deferred<DbrPurchasePlanPreview>()
-    const newestPreview = {
-      ...activePreview,
-      rows: [{ ...activePreview.rows[0], item_id: 91, item_code: 'LATEST-ITEM' }],
-    }
-    vi.mocked(previewDbrPurchasePlan)
-      .mockReset()
-      .mockReturnValueOnce(oldRequest.promise)
-      .mockResolvedValueOnce(newestPreview)
-    renderPage()
-
-    const calculateButton = screen.getByRole('button', { name: 'Рассчитать' })
-    act(() => {
-      calculateButton.click()
-      calculateButton.click()
-    })
-    expect(await screen.findByText('LATEST-ITEM')).toBeVisible()
-    oldRequest.resolve(activePreview)
-
-    await waitFor(() => expect(screen.queryByText('ITEM-1')).not.toBeInTheDocument())
-    expect(screen.getByText('LATEST-ITEM')).toBeVisible()
-    expect(screen.getByRole('button', { name: 'Рассчитать' })).toBeEnabled()
-  })
-
-  it('locks confirmation synchronously against duplicate write requests', async () => {
-    const user = userEvent.setup()
-    const pending = deferred<DbrPurchaseLaunchResult>()
-    vi.mocked(materializeDbrPurchasePlan)
-      .mockReset()
-      .mockResolvedValueOnce(dryRun)
-      .mockReturnValueOnce(pending.promise)
-    renderPage()
-    await calculate(user)
-    await user.click(screen.getByRole('button', { name: 'Сформировать заказы…' }))
-    const confirm = await screen.findByRole('button', { name: 'Провести в 1С' })
-
-    fireEvent.click(confirm)
-    fireEvent.click(confirm)
-    expect(materializeDbrPurchasePlan).toHaveBeenCalledTimes(2)
-    expect(confirm).toBeDisabled()
-
-    pending.resolve(committed)
-    expect(await screen.findByText(/Документ проведён в живой 1С/)).toBeVisible()
-  })
-
-  it('traps focus, restores the opener, and closes the confirmation dialog with Escape', async () => {
-    const user = userEvent.setup()
-    renderPage()
-    await calculate(user)
-    const opener = screen.getByRole('button', { name: 'Сформировать заказы…' })
-    await user.click(opener)
-    const dialog = await screen.findByRole('dialog')
-    const cancel = within(dialog).getByRole('button', { name: 'Отмена' })
-    const confirm = within(dialog).getByRole('button', { name: 'Провести в 1С' })
-
-    expect(cancel).toHaveFocus()
-    await user.keyboard('{Shift>}{Tab}{/Shift}')
-    expect(confirm).toHaveFocus()
-    await user.keyboard('{Tab}')
-    expect(cancel).toHaveFocus()
-    await user.keyboard('{Escape}')
-
-    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
-    expect(opener).toHaveFocus()
-  })
-
-  it('exposes the purchase table and sortable columns to keyboard users', async () => {
-    const user = userEvent.setup()
-    renderPage()
-    await calculate(user)
-
-    const table = screen.getByRole('table', { name: 'План закупки по чистой потребности' })
-    const deadline = within(table).getByRole('columnheader', { name: 'Заказать до' })
-    const quantity = within(table).getByRole('columnheader', { name: 'Заказать' })
-    expect(deadline).toHaveAttribute('aria-sort', 'ascending')
-    expect(quantity).toHaveAttribute('aria-sort', 'none')
-
+    const table = await screen.findByRole('table', { name: 'Сохранённые Ledger-обязательства закупки' })
+    const quantity = within(table).getByRole('columnheader', { name: 'Непокрыто / заказать' })
     quantity.focus()
     await user.keyboard('{Enter}')
     expect(quantity).toHaveAttribute('aria-sort', 'descending')
     expect(within(table).getAllByRole('row')[1]).toHaveTextContent('ITEM-1')
-
-    deadline.focus()
-    await user.keyboard(' ')
-    expect(deadline).toHaveAttribute('aria-sort', 'ascending')
   })
 
-  it('announces loading and request failures without moving focus', async () => {
-    const user = userEvent.setup()
-    const pending = deferred<DbrPurchasePlanPreview>()
-    vi.mocked(previewDbrPurchasePlan).mockReset().mockReturnValue(pending.promise)
+  it('renders Ledger-native quantities without legacy demand or available columns', async () => {
     renderPage()
-    const calculateButton = screen.getByRole('button', { name: 'Рассчитать' })
-
-    await user.click(calculateButton)
-    expect(screen.getByRole('status')).toHaveTextContent('Загрузка плана закупки')
-    expect(calculateButton).toHaveFocus()
-    pending.resolve(activePreview)
     expect(await screen.findByText('ITEM-1')).toBeVisible()
+    expect(screen.getByRole('columnheader', { name: 'Обязательство' })).toBeVisible()
+    expect(screen.getByRole('columnheader', { name: 'Ledger-запас' })).toBeVisible()
+    expect(screen.getByRole('columnheader', { name: 'Точное поступление' })).toBeVisible()
+    expect(screen.queryByRole('columnheader', { name: 'Потребность' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('columnheader', { name: 'Доступно' })).not.toBeInTheDocument()
+    expect(getDbrPurchaseCockpit).toHaveBeenCalledTimes(1)
+  })
 
-    vi.mocked(previewDbrPurchasePlan).mockRejectedValueOnce(new Error('Сервис расчёта недоступен'))
-    await user.click(calculateButton)
-    expect(await screen.findByRole('alert')).toHaveTextContent('Сервис расчёта недоступен')
-    expect(calculateButton).toHaveFocus()
+  it('shows the saved snapshot empty state', async () => {
+    vi.mocked(getDbrPurchaseCockpit).mockResolvedValue({ meta: { snapshot_id: 3, read_only: true, runs: [] }, rows: [] })
+    renderPage()
+    expect(await screen.findByText('Нет позиций к заказу.')).toBeVisible()
+  })
+
+  it('renders a structured 503 as snapshot-unavailable instead of fake zeroes', async () => {
+    vi.mocked(getDbrPurchaseCockpit).mockRejectedValue(new ApiError('not ready', 503, { code: 'ledger_not_accepted', reason: 'generation 42 is building' }))
+    renderPage()
+    expect(await screen.findByRole('alert')).toHaveTextContent('ledger_not_accepted: generation 42 is building')
+    expect(screen.getByText('Сохранённый снимок закупки недоступен.')).toBeVisible()
+    expect(screen.queryByText('Позиций в снимке')).not.toBeInTheDocument()
+  })
+
+  it('announces loading and preserves the read-only refresh action focus', async () => {
+    const pending = deferred<DbrPurchaseCockpit>()
+    vi.mocked(getDbrPurchaseCockpit).mockReturnValue(pending.promise)
+    renderPage()
+    expect(screen.getByRole('status')).toHaveTextContent('Загрузка сохранённого снимка закупки')
+    const refresh = screen.getByRole('button', { name: 'Обновить снимок' })
+    pending.resolve(cockpit)
+    await screen.findByText('ITEM-1')
+    await userEvent.setup().click(refresh)
+    expect(refresh).toHaveFocus()
+  })
+
+  it('refreshes the saved envelope only after an explicit read-only request', async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findByText('ITEM-1')
+    await user.click(screen.getByRole('button', { name: 'Обновить снимок' }))
+    await waitFor(() => expect(getDbrPurchaseCockpit).toHaveBeenCalledTimes(2))
+  })
+
+  it('keeps local filters while an explicit snapshot refresh is pending', async () => {
+    const pending = deferred<DbrPurchaseCockpit>()
+    vi.mocked(getDbrPurchaseCockpit).mockResolvedValueOnce(cockpit).mockReturnValueOnce(pending.promise)
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findByText('ITEM-1')
+    await user.click(screen.getByRole('checkbox', { name: 'Только к заказу' }))
+    await user.click(screen.getByRole('button', { name: 'Обновить снимок' }))
+    expect(screen.getByText('ITEM-3')).toBeVisible()
+    pending.resolve({ ...cockpit, rows: [{ ...cockpit.rows[0], item_id: 99, item_code: 'LATEST-ITEM' }] })
+    expect(await screen.findByText('LATEST-ITEM')).toBeVisible()
+    expect(screen.queryByText('ITEM-3')).not.toBeInTheDocument()
   })
 })

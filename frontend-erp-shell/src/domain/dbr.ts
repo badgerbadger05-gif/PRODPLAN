@@ -366,6 +366,78 @@ export type DbrPurchasePlanPreview = {
   warnings: string[]
 }
 
+// ── Saved purchase cockpit ─────────────────────────────────────────────────
+// A purchase page is a read model, not a client-triggered planning command.
+// The worker captures these rows together with one accepted Item Ledger
+// generation.  The optional lineage fields deliberately stay explicit so the
+// UI can show which frozen MRP input produced the obligation set.
+export type DbrPurchaseCockpitMeta = {
+  snapshot_id?: number | null
+  ledger_generation?: number | null
+  cutoff?: string | null
+  runs: Array<{ run_id: number; freeze_version: number }>
+  truth_status?: string | null
+  truth_reason?: string | null
+  read_only?: boolean
+  formula?: string | null
+}
+
+export type DbrPurchaseCockpitCoverage = {
+  source_kind: string
+  source_ref?: string | null
+  source_line_ref?: string | null
+  pin_kind?: string | null
+  alloc_qty: number
+  covered_qty: number
+  realized_qty: number
+  evaporated_qty: number
+}
+
+export type DbrPurchaseCockpitObligation = {
+  reservation_id: number
+  requirement_id?: number | null
+  priority_period_from?: string | null
+  priority_period_to?: string | null
+  outstanding_qty: number
+  uncovered_qty: number
+  coverage: DbrPurchaseCockpitCoverage[]
+}
+
+/** Ledger-native purchase axis.  Never substitute legacy plan demand or stock. */
+export type DbrPurchaseCockpitRow = {
+  item_id: number
+  item_code: string
+  item_name?: string | null
+  item_ref1c?: string | null
+  supplier_ref1c?: string | null
+  article?: string | null
+  unit?: string | null
+  replenishment_time?: number | null
+  warehouse_ref1c: string
+  planning_stock_pool: string
+  need_date?: string | null
+  reservation_ids: number[]
+  obligations: DbrPurchaseCockpitObligation[]
+  outstanding_obligation_qty: number
+  uncovered_qty: number
+  to_order_qty: number
+  stock_qty: number
+  exact_future_supply_qty: number
+  excluded_future_supply?: Array<{
+    supply_kind: string
+    source_ref?: string | null
+    source_line_ref?: string | null
+    evidence_status?: string | null
+    destination_warehouse_ref1c?: string | null
+    reason?: string | null
+  }>
+}
+
+export type DbrPurchaseCockpit = {
+  meta: DbrPurchaseCockpitMeta
+  rows: DbrPurchaseCockpitRow[]
+}
+
 // ── Feeder-chain supermarket positions ──────────────────────────────────────
 
 export type DbrFeederZone = 'green' | 'yellow' | 'red' | string
