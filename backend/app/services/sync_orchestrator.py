@@ -47,7 +47,7 @@ from .processing_stock_sync import (
     sync_processing_stock_from_odata,
 )
 from .nomenclature_groups_sync import refresh_nomenclature_groups
-from .item_ledger.ingest import process_pending_pulls
+from .item_ledger.ingest import is_retryable_error, process_pending_pulls
 from .dbr.feeder_position_service import rebuild_positions
 from .dbr.feeder_signal_service import refresh_signals
 from .dbr.feeder_chain_service import refresh_chain_signals
@@ -298,9 +298,15 @@ def pull_queue_health(db: Optional[Session]) -> Dict[str, int]:
     if not hasattr(db, "query"):
         return {"pending": 0, "error_retryable": 0, "error_exhausted": 0, "ready": 0}
     rows = db.query(models.StockRecorderPull.status, models.StockRecorderPull.attempts).all()
+    # Retryability comes from the single shared predicate (ingest.py), so this
+    # health snapshot, the drain filter and the reconcile in-flight guard can
+    # never disagree on which error rows still count.
     pending = sum(1 for status, _attempts in rows if status == "pending")
-    retryable = sum(1 for status, attempts in rows if status == "error" and int(attempts or 0) < 5)
-    exhausted = sum(1 for status, attempts in rows if status == "error" and int(attempts or 0) >= 5)
+    retryable = sum(1 for status, attempts in rows if is_retryable_error(status, attempts))
+    exhausted = sum(
+        1 for status, attempts in rows
+        if status == "error" and not is_retryable_error(status, attempts)
+    )
     return {"pending": pending, "error_retryable": retryable, "error_exhausted": exhausted, "ready": pending + retryable}
 
 

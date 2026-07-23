@@ -6,7 +6,8 @@ Exercises the inc3 after-step against a mocked Balance snapshot vs bin state:
 * first delta → reconcile_pending_qty stored, no SLE;
 * second consecutive same delta, no in-flight pull → adjustment-SLE written and
   the bin folded to the balance;
-* delta with an in-flight (pending) pull → held, no adjustment;
+* delta with an in-flight pull (pending OR retriable error) → held, no
+  adjustment; an exhausted error pull does NOT hold (Д8);
 * an out-of-band write-off (bin 10, balance 7 twice) → −3 adjustment-SLE, bin→7;
 * a sign-flip / zeroing resets the one-sweep debounce;
 * build_balance_snapshot aligns converted rows on the full key (org included);
@@ -172,6 +173,55 @@ def test_reconcile_held_by_inflight_pull(db_session):
     res3 = reconcile_balance_snapshot(db_session, {key: 7})
     db_session.commit()
     assert res3.adjusted == 1
+    assert _f(_bin(db_session, it.item_id, "wh-1").on_hand) == 7
+
+
+def test_reconcile_held_by_retryable_error_pull(db_session):
+    """Д8: a failed-but-retriable pull is in-flight — its retry may still insert
+    the very movements the delta reflects, so applying an adjustment now would
+    double-count them transiently. Must hold, same as pending."""
+    it = _item(db_session, "P1", "ref-1")
+    _seed_bin(db_session, it.item_id, "wh-1", 10)
+    key = LedgerKey(it.item_id, "", "", "wh-1")
+
+    reconcile_balance_snapshot(db_session, {key: 7})  # sweep 1 → pending
+    db_session.commit()
+
+    db_session.add(models.StockRecorderPull(
+        recorder_type="Document_СборкаЗапасов", recorder_ref="asm-err",
+        status="error", attempts=2, last_error="1C timeout",
+    ))
+    db_session.commit()
+
+    res = reconcile_balance_snapshot(db_session, {key: 7})  # sweep 2 → held
+    db_session.commit()
+
+    assert res.held == 1 and res.adjusted == 0
+    assert _adj_sles(db_session) == []
+    assert _f(_bin(db_session, it.item_id, "wh-1").reconcile_pending_qty) == -3
+
+
+def test_reconcile_not_held_by_exhausted_error_pull(db_session):
+    """Д8: an error pull past the attempt cap will never retry on its own —
+    it is terminal, and the reconcile adjustment IS the recovery path for its
+    movements. Must NOT hold the sweep."""
+    it = _item(db_session, "P1", "ref-1")
+    _seed_bin(db_session, it.item_id, "wh-1", 10)
+    key = LedgerKey(it.item_id, "", "", "wh-1")
+
+    reconcile_balance_snapshot(db_session, {key: 7})  # sweep 1 → pending
+    db_session.commit()
+
+    db_session.add(models.StockRecorderPull(
+        recorder_type="Document_СборкаЗапасов", recorder_ref="asm-dead",
+        status="error", attempts=5, last_error="1C down",  # == cap → exhausted
+    ))
+    db_session.commit()
+
+    res = reconcile_balance_snapshot(db_session, {key: 7})  # sweep 2 → apply
+    db_session.commit()
+
+    assert res.adjusted == 1 and res.held == 0
     assert _f(_bin(db_session, it.item_id, "wh-1").on_hand) == 7
 
 

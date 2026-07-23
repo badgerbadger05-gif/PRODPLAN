@@ -34,7 +34,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
-from sqlalchemy import func
+from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from app import models
@@ -85,18 +85,36 @@ class ReconcileResult:
 
 
 def _has_inflight_pull(session: Session) -> bool:
-    """True if any recorder pull is still queued (status='pending').
+    """True if any recorder pull can still mutate the ledger: status='pending'
+    OR a retriable error (status='error' AND attempts < cap) — the same
+    in-flight set process_pending_pulls will drain (ingest.is_inflight_pull).
 
     A queued document has moved 1С balance but its lines are not mirrored yet,
     so its item set is unknown until it drains — the exact snapshot race the
-    debounce protects against. We therefore treat ANY in-flight pull as
-    blocking every item this sweep (coarse but honest: we cannot attribute an
-    undrained pull to an item). Drained pulls (done/empty) and terminally failed
-    ones (error, past the attempt cap) are NOT in-flight and never block.
+    debounce protects against. A retriable error pull is the same race
+    stretched over retries: if reconcile applied the delta as an adjustment and
+    the retry then inserted the same movements, the quantity would be counted
+    twice until the next sweep compensated. We therefore treat ANY in-flight
+    pull as blocking every item this sweep (coarse but honest: we cannot
+    attribute an undrained pull to an item). Drained pulls (done/empty) and
+    terminally failed ones (error, past the attempt cap) are NOT in-flight and
+    never block — an exhausted pull will not retry, so the reconcile adjustment
+    IS the recovery path for its movements.
     """
+    from .ingest import DEFAULT_MAX_ATTEMPTS  # single home of the retry cap
+
     return (
         session.query(models.StockRecorderPull.id)
-        .filter(models.StockRecorderPull.status == "pending")
+        .filter(
+            or_(
+                models.StockRecorderPull.status == "pending",
+                and_(
+                    models.StockRecorderPull.status == "error",
+                    func.coalesce(models.StockRecorderPull.attempts, 0)
+                    < DEFAULT_MAX_ATTEMPTS,
+                ),
+            )
+        )
         .first()
         is not None
     )
