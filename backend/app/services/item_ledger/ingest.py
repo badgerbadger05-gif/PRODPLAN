@@ -179,6 +179,49 @@ def _anchor_t0(session: Session, key: LedgerKey, cache: Dict[LedgerKey, Optional
     return t0
 
 
+def _document_order_ref(client: Any, recorder_type: str, recorder_ref: str) -> str:
+    """Fetch the recorder DOCUMENT HEADER and extract its production-order GUID.
+
+    Variant-B substrate for the SLE→reservation matching chain (design §6.3):
+    * ``Document_СборкаЗапасов`` carries ``ЗаказНаПроизводство_Key`` (the field
+      our manufacture export fills and the 1C UI fills for hand-made docs);
+    * ``Document_ПеремещениеЗапасов`` carries the composite ``ДокументОснование``
+      — taken only when ``ДокументОснование_Type`` is ЗаказНаПроизводство.
+
+    Best-effort: any OData/parsing failure returns '' and NEVER breaks the pull
+    (the sync_link path and the reconcile Balance-sweep are the safety nets).
+    """
+    try:
+        if "СборкаЗапасов" in recorder_type:
+            select_fields = ["Ref_Key", "ЗаказНаПроизводство_Key"]
+        elif "Перемещение" in recorder_type:
+            select_fields = ["Ref_Key", "ДокументОснование", "ДокументОснование_Type"]
+        else:
+            return ""
+        rows = client.get_all(
+            recorder_type,
+            filter_query=f"Ref_Key eq guid'{recorder_ref}'",
+            select_fields=select_fields,
+            order_by=None,
+        )
+        for row in rows if isinstance(rows, list) else [rows]:
+            if not isinstance(row, dict):
+                continue
+            if "СборкаЗапасов" in recorder_type:
+                ref = _norm_ref(row.get("ЗаказНаПроизводство_Key"))
+                if ref:
+                    return ref
+            else:
+                basis_type = str(row.get("ДокументОснование_Type") or "")
+                if "ЗаказНаПроизводство" in basis_type:
+                    ref = _norm_ref(row.get("ДокументОснование"))
+                    if ref:
+                        return ref
+    except Exception:  # noqa: BLE001 — header capture is best-effort by design
+        return ""
+    return ""
+
+
 def _extract_record_set(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Flatten the RecordSet arrays across the returned recorder-row(s)."""
     lines: List[Dict[str, Any]] = []
@@ -227,6 +270,10 @@ def pull_recorder_movements(
     filter_query = f"Recorder eq cast(guid'{recorder_ref}', '{recorder_type}')"
     rows = client.get_all(REGISTER_ENTITY, filter_query=filter_query, order_by=None)
     lines = _extract_record_set(rows if isinstance(rows, list) else [rows])
+
+    # Variant-B header capture (design §6.3): remember the producing order's
+    # GUID alongside the recorder so matching pegs 1C-native documents too.
+    header_order_ref = _document_order_ref(client, recorder_type, recorder_ref)
 
     item_by_ref = _item_ref_map(session)
     warehouses = _warehouse_ref_set(session)
@@ -344,7 +391,7 @@ def pull_recorder_movements(
 
     # --- pull-status transition (§2.3) ---
     result.status = "done" if result.inserted > 0 else "empty"
-    _upsert_pull_row(
+    pull_row = _upsert_pull_row(
         session,
         recorder_type,
         recorder_ref,
@@ -354,6 +401,10 @@ def pull_recorder_movements(
         bump_attempt=True,
         last_error=None,
     )
+    # Refresh the captured header order ref on every (re-)pull; keep the last
+    # known value when the header fetch failed this time (best-effort).
+    if header_order_ref:
+        pull_row.order_ref = header_order_ref
     session.flush()
     return result
 
