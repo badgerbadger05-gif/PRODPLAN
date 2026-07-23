@@ -1,6 +1,8 @@
 from datetime import datetime, timezone
 from decimal import Decimal
 import asyncio
+from hashlib import sha256
+import json
 
 import pytest
 from fastapi import HTTPException
@@ -9,6 +11,7 @@ from app import models
 from app.routers import plan as plan_router
 from app.services import mrp_result_snapshot
 from app.services.mrp_result_snapshot import (
+    build_mrp_result_candidate_snapshot,
     build_mrp_result_snapshot,
     read_mrp_result_manifest,
     read_mrp_result_rows,
@@ -43,6 +46,88 @@ def _accepted_generation(db):
     db.add(models.PlanningTruthState(id=1, current_generation_id=generation.id))
     db.flush()
     return generation
+
+
+def _building_generation(db, *, cutoff):
+    physical = models.PhysicalImportBatch(
+        batch_key="mrp-result-candidate-physical",
+        status="completed",
+        cutoff=cutoff,
+        source_watermarks={},
+        completed_at=cutoff,
+    )
+    db.add(physical)
+    db.flush()
+    generation = models.LedgerGeneration(
+        generation_key="mrp-result-candidate-test",
+        status="building",
+        cutoff=cutoff,
+        capabilities={},
+        source_watermarks={"generation_kind": "obligation_refresh"},
+        physical_import_batch_id=physical.id,
+        algorithm_version="test",
+    )
+    db.add(generation)
+    db.flush()
+    return generation
+
+
+def _candidate_purchase_run(db, generation):
+    item = models.Item(item_code="CANDIDATE-PURCHASE", item_name="Candidate purchase")
+    db.add(item)
+    db.flush()
+    plan = models.ProductionPlanHeader(
+        name="Candidate snapshot plan",
+        period_from=datetime(2026, 8, 1).date(),
+        period_to=datetime(2026, 8, 31).date(),
+        status="fixed",
+    )
+    db.add(plan)
+    db.flush()
+    run = models.PlanningRun(
+        status="BUILDING_SNAPSHOT",
+        config_snapshot={},
+        ledger_generation_id=generation.id,
+        ledger_cutoff=generation.cutoff,
+        active_freeze_version=1,
+        source_plan_id=plan.id,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+    )
+    db.add(run)
+    db.flush()
+    db.add(models.PlannedPurchase(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        requested_qty=Decimal("5"), planned_qty=Decimal("5"), qty=Decimal("5"),
+        need_date=datetime(2026, 8, 1).date(),
+        order_date=datetime(2026, 7, 1).date(), lead_time_days=1,
+        bucket_date=datetime(2026, 8, 1).date(),
+        ledger_generation_id=generation.id,
+    ))
+    db.flush()
+    return run, item
+
+
+def _seal_candidate_manifest(generation, run):
+    payload = {
+        "version": 1,
+        "entries": [{
+            "action": "add", "plan_id": run.source_plan_id,
+            "parent_run_id": None, "candidate_run_id": run.run_id,
+        }],
+        "add_request": {
+            "plan_ids": [run.source_plan_id], "horizon_days": None,
+            "config_version_id": None, "config_snapshot": {},
+        },
+    }
+    generation.source_watermarks = {
+        **generation.source_watermarks,
+        "obligation_refresh_manifest": payload,
+        "obligation_refresh_manifest_hash": sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+    }
 
 
 def test_missing_snapshot_fails_closed_without_reading_planning_rows(db_session):
@@ -81,6 +166,126 @@ def test_missing_snapshot_fails_closed_without_reading_planning_rows(db_session)
     assert result["rows"] == []
     assert result["total"] == 0
     assert "missing" in result["truth_reason"]
+
+
+def test_candidate_builder_persists_unpublished_rows_but_current_reads_cannot_see_them(
+    db_session, monkeypatch
+):
+    accepted = _accepted_generation(db_session)
+    candidate_generation = _building_generation(db_session, cutoff=accepted.cutoff)
+    run, item = _candidate_purchase_run(db_session, candidate_generation)
+    _seal_candidate_manifest(candidate_generation, run)
+
+    snapshot = build_mrp_result_candidate_snapshot(db_session, run.run_id)
+
+    assert snapshot.truth_status == "building"
+    assert snapshot.ledger_generation_id == candidate_generation.id
+    assert db_session.query(models.PlanningReadRow).filter_by(snapshot_id=snapshot.id).count() == 1
+    # A normal GET follows the accepted pointer and must neither see this
+    # unpublished generation nor calculate a replacement.
+    monkeypatch.setattr(
+        mrp_result_snapshot.planning_service,
+        "get_run_purchases",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("GET calculated")),
+    )
+    result = read_mrp_result_rows(db_session, run.run_id, row_kind="purchase")
+
+    assert result["snapshot_id"] is None
+    assert result["rows"] == []
+    stored = db_session.query(models.PlanningReadRow).filter_by(snapshot_id=snapshot.id).one()
+    assert stored.payload["item_id"] == item.item_id
+
+
+def test_candidate_builder_is_idempotent_and_rejects_changed_persisted_snapshot(db_session):
+    accepted = _accepted_generation(db_session)
+    candidate_generation = _building_generation(db_session, cutoff=accepted.cutoff)
+    run, _ = _candidate_purchase_run(db_session, candidate_generation)
+    _seal_candidate_manifest(candidate_generation, run)
+
+    first = build_mrp_result_candidate_snapshot(db_session, run.run_id)
+    second = build_mrp_result_candidate_snapshot(db_session, run.run_id)
+
+    assert second.id == first.id
+    assert db_session.query(models.PlanningReadSnapshot).count() == 1
+    row = db_session.query(models.PlanningReadRow).filter_by(snapshot_id=first.id).one()
+    row.payload = {**row.payload, "qty": 999.0}
+    db_session.flush()
+    with pytest.raises(ValueError, match="conflicts"):
+        build_mrp_result_candidate_snapshot(db_session, run.run_id)
+
+
+def test_candidate_builder_savepoint_rolls_back_partial_snapshot(db_session, monkeypatch):
+    accepted = _accepted_generation(db_session)
+    candidate_generation = _building_generation(db_session, cutoff=accepted.cutoff)
+    run, item = _candidate_purchase_run(db_session, candidate_generation)
+    _seal_candidate_manifest(candidate_generation, run)
+    root = models.Item(item_code="CANDIDATE-ROOT", item_name="Candidate root")
+    db_session.add(root)
+    db_session.flush()
+    db_session.add(models.MrpFreezeComponent(
+        run_id=run.run_id,
+        freeze_version=1,
+        parent_item_id=root.item_id,
+        component_item_id=item.item_id,
+        spec_ref="candidate-spec",
+        norm_qty_per_unit=Decimal("1"),
+        unit_coef=Decimal("1"),
+    ))
+    db_session.flush()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            models,
+            "PlanningReadRootMember",
+            lambda **kwargs: (_ for _ in ()).throw(RuntimeError("membership failed")),
+        )
+        with pytest.raises(RuntimeError, match="membership failed"):
+            build_mrp_result_candidate_snapshot(db_session, run.run_id)
+
+    assert db_session.query(models.PlanningReadSnapshot).count() == 0
+    assert db_session.query(models.PlanningReadRow).count() == 0
+
+
+def test_candidate_builder_rejects_missing_or_tampered_sealed_manifest(db_session):
+    accepted = _accepted_generation(db_session)
+    candidate_generation = _building_generation(db_session, cutoff=accepted.cutoff)
+    run, _ = _candidate_purchase_run(db_session, candidate_generation)
+
+    with pytest.raises(ValueError, match="lacks a sealed"):
+        build_mrp_result_candidate_snapshot(db_session, run.run_id)
+
+    _seal_candidate_manifest(candidate_generation, run)
+    candidate_generation.source_watermarks = {
+        **candidate_generation.source_watermarks,
+        "obligation_refresh_manifest": {"version": 999, "entries": []},
+    }
+    with pytest.raises(ValueError, match="hash conflicts"):
+        build_mrp_result_candidate_snapshot(db_session, run.run_id)
+
+
+def test_candidate_builder_rejects_rogue_unsealed_building_run(db_session):
+    accepted = _accepted_generation(db_session)
+    candidate_generation = _building_generation(db_session, cutoff=accepted.cutoff)
+    run, _ = _candidate_purchase_run(db_session, candidate_generation)
+    _seal_candidate_manifest(candidate_generation, run)
+    rogue_plan = models.ProductionPlanHeader(
+        name="Rogue candidate plan",
+        period_from=datetime(2026, 9, 1).date(),
+        period_to=datetime(2026, 9, 30).date(), status="fixed",
+    )
+    db_session.add(rogue_plan)
+    db_session.flush()
+    db_session.add(models.PlanningRun(
+        status="BUILDING_SNAPSHOT", config_snapshot={},
+        ledger_generation_id=candidate_generation.id,
+        ledger_cutoff=candidate_generation.cutoff,
+        source_plan_id=rogue_plan.id,
+        period_from=rogue_plan.period_from, period_to=rogue_plan.period_to,
+    ))
+    db_session.flush()
+
+    with pytest.raises(ValueError, match="missing or extra candidates"):
+        build_mrp_result_candidate_snapshot(db_session, run.run_id)
 
 
 def test_builder_publishes_rows_and_frozen_root_membership(

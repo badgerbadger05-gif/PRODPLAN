@@ -8,8 +8,10 @@ must call :func:`read_mrp_result_rows` (or
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from datetime import date
-from typing import Any, Callable
+from datetime import date, datetime, timezone
+from hashlib import sha256
+import json
+from typing import Any, Callable, Mapping
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -158,6 +160,299 @@ def _validate_obligation_lineage(
             raise ValueError(
                 f"{model.__tablename__} contains NULL or foreign Ledger generation rows"
             )
+
+
+def _collect_snapshot_payload(
+    db: Session, run: models.PlanningRun
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
+    """Collect frozen MRP rows once for either an accepted or candidate build.
+
+    This is deliberately a builder-only helper.  Read handlers only query the
+    persisted ``PlanningRead*`` tables and must never call it.
+    """
+    run_id = int(run.run_id)
+    rows_by_kind = {
+        "production": _collect_all(planning_service.get_run_production, db, run_id),
+        "purchase": _collect_all(planning_service.get_run_purchases, db, run_id),
+        "rework": _collect_all(planning_service.get_run_rework, db, run_id),
+        "capacity": _collect_all(planning_service.get_run_capacity, db, run_id),
+    }
+    manifest = {
+        "run_id": run_id,
+        "summary": planning_service.get_run_summary(db, run_id),
+        "row_counts": {kind: len(rows) for kind, rows in rows_by_kind.items()},
+        "total_qty": {
+            kind: float(sum(float(row.get("qty") or 0) for row in rows))
+            for kind, rows in rows_by_kind.items()
+        },
+    }
+    return rows_by_kind, manifest
+
+
+def _row_specs(
+    rows_by_kind: dict[str, list[dict[str, Any]]],
+) -> list[tuple[str, str, int | None, str, dict[str, Any]]]:
+    """Create deterministic persisted row identities without writing them."""
+    specs: list[tuple[str, str, int | None, str, dict[str, Any]]] = []
+    for kind, rows in rows_by_kind.items():
+        for index, source_payload in enumerate(rows):
+            payload = dict(source_payload)
+            item_id = int(payload["item_id"]) if payload.get("item_id") is not None else None
+            identity = (
+                payload.get("order_id")
+                or payload.get("purchase_id")
+                or payload.get("rework_id")
+                or payload.get("agg_key")
+                or index
+            )
+            bucket = str(
+                payload.get("bucket_date")
+                or payload.get("need_date")
+                or payload.get("start_date")
+                or ""
+            )
+            specs.append(
+                (
+                    f"{kind}:{identity}:{index}",
+                    kind,
+                    item_id,
+                    f"{bucket}|{item_id or 0:012d}|{index:012d}",
+                    payload,
+                )
+            )
+    return specs
+
+
+def _candidate_snapshot_matches(
+    db: Session,
+    snapshot: models.PlanningReadSnapshot,
+    *,
+    manifest: dict[str, Any],
+    row_specs: list[tuple[str, str, int | None, str, dict[str, Any]]],
+    membership: dict[int, set[int]],
+) -> bool:
+    """An existing candidate is reusable only for the exact same frozen data."""
+    if dict(snapshot.payload or {}) != manifest:
+        return False
+    rows = (
+        db.query(models.PlanningReadRow)
+        .filter(models.PlanningReadRow.snapshot_id == int(snapshot.id))
+        .order_by(models.PlanningReadRow.id)
+        .all()
+    )
+    if len(rows) != len(row_specs):
+        return False
+    for row, (row_key, kind, item_id, sort_key, payload) in zip(rows, row_specs):
+        if (
+            row.row_key != row_key
+            or row.row_kind != kind
+            or row.item_id != item_id
+            or row.sort_key != sort_key
+            or dict(row.payload or {}) != payload
+        ):
+            return False
+        expected_roots = sorted(membership.get(item_id, ())) if item_id is not None else []
+        actual_roots = [
+            int(root_id)
+            for (root_id,) in db.query(models.PlanningReadRootMember.root_item_id)
+            .filter(
+                models.PlanningReadRootMember.snapshot_id == int(snapshot.id),
+                models.PlanningReadRootMember.row_id == int(row.id),
+            )
+            .order_by(models.PlanningReadRootMember.root_item_id)
+            .all()
+        ]
+        if actual_roots != expected_roots:
+            return False
+    return True
+
+
+def _require_sealed_candidate_manifest(
+    db: Session,
+    generation: models.LedgerGeneration,
+    run: models.PlanningRun,
+) -> None:
+    """Prove that ``run`` belongs to the closed refresh batch.
+
+    A BUILDING generation alone is intentionally insufficient: otherwise a
+    stray run could obtain persisted result rows and later look publishable.
+    The manifest hash, complete candidate set, and each action-specific run
+    lineage are checked before any snapshot rows are written.
+    """
+    marks = dict(generation.source_watermarks or {})
+    payload = marks.get("obligation_refresh_manifest")
+    content_hash = marks.get("obligation_refresh_manifest_hash")
+    if not isinstance(payload, Mapping) or not isinstance(content_hash, str):
+        raise ValueError("candidate snapshot target lacks a sealed obligation_refresh_manifest")
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    if sha256(canonical.encode("utf-8")).hexdigest() != content_hash:
+        raise ValueError("candidate snapshot obligation_refresh_manifest hash conflicts")
+    entries = payload.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("candidate snapshot obligation_refresh_manifest is malformed")
+
+    declared_ids: set[int] = set()
+    declared_plan_ids: set[int] = set()
+    requested_found = False
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            raise ValueError("candidate snapshot obligation_refresh_manifest entry is malformed")
+        try:
+            action = str(entry["action"])
+            candidate_id = int(entry["candidate_run_id"])
+            plan_id = int(entry["plan_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "candidate snapshot obligation_refresh_manifest entry identity is malformed"
+            ) from exc
+        if (
+            action not in {"refresh", "add"}
+            or candidate_id <= 0
+            or plan_id <= 0
+            or candidate_id in declared_ids
+            or plan_id in declared_plan_ids
+        ):
+            raise ValueError("candidate snapshot obligation_refresh_manifest has invalid entries")
+        candidate = db.get(models.PlanningRun, candidate_id)
+        if (
+            candidate is None
+            or str(candidate.status or "") != "BUILDING_SNAPSHOT"
+            or int(candidate.ledger_generation_id or -1) != int(generation.id)
+            or int(candidate.source_plan_id or -1) != plan_id
+        ):
+            raise ValueError("candidate snapshot manifest candidate lineage conflicts")
+        if action == "refresh":
+            try:
+                parent_id = int(entry["parent_run_id"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError("candidate snapshot refresh entry lacks parent run") from exc
+            parent = db.get(models.PlanningRun, parent_id)
+            expected_parent_generation = marks.get("parent_generation_id")
+            if (
+                int(candidate.prior_run_id or -1) != parent_id
+                or parent is None
+                or str(parent.status or "") != "FIXED_SNAPSHOT"
+                or int(parent.source_plan_id or -1) != plan_id
+                or int(parent.ledger_generation_id or -1)
+                != int(expected_parent_generation or -1)
+            ):
+                raise ValueError("candidate snapshot refresh candidate parent conflicts")
+        else:
+            plan = db.get(models.ProductionPlanHeader, plan_id)
+            if (
+                entry.get("parent_run_id") is not None
+                or candidate.prior_run_id is not None
+                or plan is None
+                or str(plan.status or "") != "fixed"
+                or candidate.period_from != plan.period_from
+                or candidate.period_to != plan.period_to
+            ):
+                raise ValueError("candidate snapshot add candidate parent conflicts")
+        declared_ids.add(candidate_id)
+        declared_plan_ids.add(plan_id)
+        requested_found = requested_found or candidate_id == int(run.run_id)
+
+    actual_ids = {
+        int(candidate_id)
+        for (candidate_id,) in db.query(models.PlanningRun.run_id).filter(
+            models.PlanningRun.ledger_generation_id == int(generation.id),
+            models.PlanningRun.status == "BUILDING_SNAPSHOT",
+        ).all()
+    }
+    if actual_ids != declared_ids:
+        raise ValueError("candidate snapshot manifest has missing or extra candidates")
+    if not requested_found:
+        raise ValueError("candidate run is absent from sealed obligation_refresh_manifest")
+
+
+def build_mrp_result_candidate_snapshot(
+    db: Session, run_id: int
+) -> models.PlanningReadSnapshot:
+    """Persist an unpublished MRP result snapshot for a building candidate.
+
+    Candidate snapshots are bound to their BUILDING ``obligation_refresh``
+    Ledger generation.  They intentionally bypass accepted-truth readiness and
+    ``publish_read_snapshot``: nothing built here is visible to normal GET
+    reads until the outer publish transaction promotes its run and generation.
+    The caller owns the transaction; this function never commits or rolls back.
+    """
+    run = db.get(models.PlanningRun, int(run_id))
+    if run is None:
+        raise ValueError(f"planning run {run_id} not found")
+    if str(run.status or "") != "BUILDING_SNAPSHOT":
+        raise ValueError("candidate MRP result snapshot requires a building run")
+    if run.ledger_generation_id is None:
+        raise ValueError("candidate run has no Ledger generation")
+    generation = db.get(models.LedgerGeneration, int(run.ledger_generation_id))
+    if generation is None or str(generation.status or "") != "building":
+        raise ValueError("candidate run is not bound to a BUILDING Ledger generation")
+    if (generation.source_watermarks or {}).get("generation_kind") != "obligation_refresh":
+        raise ValueError("candidate Ledger generation is not an obligation_refresh")
+    if run.ledger_cutoff is None or generation.cutoff is None or run.ledger_cutoff != generation.cutoff:
+        raise ValueError("candidate run cutoff differs from the BUILDING Ledger cutoff")
+    _require_sealed_candidate_manifest(db, generation, run)
+    _validate_obligation_lineage(db, int(run.run_id), int(generation.id))
+
+    rows_by_kind, manifest = _collect_snapshot_payload(db, run)
+    row_specs = _row_specs(rows_by_kind)
+    membership = _frozen_root_membership(
+        db, run, {item_id for _, _, item_id, _, _ in row_specs if item_id is not None}
+    )
+    existing = (
+        db.query(models.PlanningReadSnapshot)
+        .filter(
+            models.PlanningReadSnapshot.consumer == CONSUMER,
+            models.PlanningReadSnapshot.snapshot_key == _snapshot_key(run.run_id),
+            models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
+        )
+        .one_or_none()
+    )
+    if existing is not None:
+        if (
+            existing.cutoff != generation.cutoff
+            or existing.truth_status != "building"
+            or not _candidate_snapshot_matches(
+                db, existing, manifest=manifest, row_specs=row_specs, membership=membership
+            )
+        ):
+            raise ValueError("candidate MRP result snapshot conflicts with persisted data")
+        return existing
+
+    with db.begin_nested():
+        snapshot = models.PlanningReadSnapshot(
+            consumer=CONSUMER,
+            snapshot_key=_snapshot_key(run.run_id),
+            ledger_generation_id=int(generation.id),
+            cutoff=generation.cutoff,
+            truth_status="building",
+            reason="unpublished candidate snapshot",
+            payload=manifest,
+            published_at=datetime.now(timezone.utc),
+        )
+        db.add(snapshot)
+        db.flush()
+        persisted: list[tuple[models.PlanningReadRow, int | None]] = []
+        for row_key, kind, item_id, sort_key, payload in row_specs:
+            row = models.PlanningReadRow(
+                snapshot_id=int(snapshot.id), row_key=row_key, row_kind=kind,
+                item_id=item_id, sort_key=sort_key, payload=payload,
+            )
+            db.add(row)
+            persisted.append((row, item_id))
+        db.flush()
+        for row, item_id in persisted:
+            if item_id is None:
+                continue
+            for root_id in sorted(membership.get(item_id, ())):
+                db.add(models.PlanningReadRootMember(
+                    snapshot_id=int(snapshot.id), row_id=int(row.id),
+                    root_key=str(root_id), root_item_id=root_id,
+                    payload={"source": "mrp_freeze_component"},
+                ))
+        db.flush()
+    return snapshot
 
 
 def build_mrp_result_snapshot(db: Session, run_id: int) -> models.PlanningReadSnapshot:
