@@ -4,7 +4,8 @@
 
 Логика открытия окрасочного заказа с автоматической цепочкой на сварку:
 
-- гард (`paint_weld_pairs.guard_paint_order`) даёт вердикт по сварной детали:
+- Ledger-гард текущего принятого `MrpRequirement`/`ReservationEntry` даёт
+  вердикт по сварной детали:
   * ``stock_covers`` / ``order_open`` / ``no_pair`` — сварочный заказ НЕ создаётся,
     окрасочный заказ создаётся/выгружается штатно;
   * ``need_weld`` — создаётся ПАРА заказов: сначала окрасочный (штатный путь
@@ -12,8 +13,8 @@
     ``one_c_production_order_export``), затем сварочный НА ОСНОВАНИИ окрасочного.
 
 - сварочный заказ:
-  * qty = qty окраски за вычетом эффективного остатка сварной (если частично
-    покрыт);
+  * qty ограничено незакрытым `make`-обязательством Ledger за вычетом уже
+    материализованных из него сварочных строк;
   * финиш сварки = старт окраски, старт сварки = финиш − buffer_days сварочного
     участка;
   * связь «на основании»: сварочный 1С-документ выгружается со штатными полями
@@ -30,23 +31,32 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, Optional, Tuple
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..models import (
     Item,
+    MrpExecutionAllocation,
+    MrpRequirement,
     PaintWeldChainLink,
     PaintWeldPair,
+    PlanningRun,
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
     ProductionResource,
+    ReservationEntry,
+)
+from .mrp_mutation_guard import (
+    MrpMutationLineageError,
+    require_materialized_orders,
 )
 from .one_c_document_numbers import production_order_number
 from .one_c_production_order_export import export_production_orders_to_1c
-from .paint_weld_pairs import guard_paint_order
 from .workshop_resolution import default_spec_ids_for_items, resolve_workshop_for_spec
 
 # Fallback сварочного участка, если у сварной спеки не проставлен вид
@@ -90,23 +100,25 @@ def _weld_buffer_days(db: Session, welded_item_id: int) -> int:
     return int(resource.buffer_days or 0) if resource else 0
 
 
+@dataclass(frozen=True)
 class _PaintedContext:
-    __slots__ = ("item_id", "qty", "start", "finish", "order_id")
+    product: ProductionProduct
+    order: ProductionOrder
+    run: PlanningRun
+    generation_id: int
+    item_id: int
+    qty: float
+    start: Optional[date]
+    finish: Optional[date]
 
-    def __init__(
-        self,
-        *,
-        item_id: int,
-        qty: float,
-        start: Optional[date],
-        finish: Optional[date],
-        order_id: Optional[int],
-    ) -> None:
-        self.item_id = item_id
-        self.qty = qty
-        self.start = start
-        self.finish = finish
-        self.order_id = order_id
+
+@dataclass(frozen=True)
+class _WeldObligation:
+    requirement: MrpRequirement
+    reservation: ReservationEntry
+    available_qty: float
+    allocated_qty: float
+    open_orders: tuple[dict[str, Any], ...]
 
 
 def _resolve_painted_context(
@@ -121,172 +133,160 @@ def _resolve_painted_context(
     start = _parse_date(planned_start)
     finish = _parse_date(planned_finish)
 
-    if painted_product_id is not None:
-        product = (
-            db.query(ProductionProduct)
-            .filter(ProductionProduct.product_id == int(painted_product_id))
-            .first()
-        )
-        if product is None:
-            raise ValueError(f"painted_product_id={painted_product_id}: строка заказа не найдена")
-        state = (
-            db.query(ProductionOrderLineState)
-            .filter(ProductionOrderLineState.product_id == int(product.product_id))
-            .first()
-        )
-        resolved_qty = _to_float(qty) if qty else (_to_float(product.quantity) or _to_float(product.remaining_qty))
-        return _PaintedContext(
-            item_id=int(product.item_id),
-            qty=resolved_qty,
-            start=start or (state.planned_start_date if state else None),
-            finish=finish or (state.planned_finish_date if state else None),
-            order_id=int(product.order_id),
-        )
-
-    if painted_item_id is None:
-        raise ValueError("нужен painted_product_id или painted_item_id")
-    resolved_qty = _to_float(qty)
-    if resolved_qty <= 0:
-        raise ValueError("qty должен быть положительным")
-    return _PaintedContext(
-        item_id=int(painted_item_id),
-        qty=resolved_qty,
-        start=start,
-        finish=finish,
-        order_id=None,
-    )
-
-
-def _new_local_order(
-    db: Session,
-    *,
-    order_number: str,
-    item_id: int,
-    qty: float,
-    spec_id: Optional[int],
-    start: Optional[date],
-    finish: Optional[date],
-) -> ProductionOrder:
-    """Создать локальный заказ штатным для журнала способом (order/product/state).
-
-    Только flush — commit/rollback контролирует вызывающий (dry_run).
-    """
-    order = ProductionOrder(
-        order_number=order_number,
-        order_date=datetime.now(timezone.utc),
-        order_ref1c=None,
-        is_posted=False,
-        deletion_mark=False,
-        source="mrp",
-        source_run_id=None,
-    )
-    db.add(order)
-    db.flush()
-    product = ProductionProduct(
-        order_id=int(order.order_id),
-        item_id=int(item_id),
-        line_number=1,
-        quantity=qty,
-        produced_qty=0,
-        remaining_qty=qty,
-        spec_id=spec_id,
-    )
-    db.add(product)
-    db.flush()
-    db.add(
-        ProductionOrderLineState(
-            product_id=int(product.product_id),
-            status="shortage",
-            issue_status="not_requested",
-            planned_start_date=start,
-            planned_finish_date=finish,
-        )
-    )
-    db.flush()
-    return order
-
-
-def _sync_local_order(
-    db: Session,
-    order: ProductionOrder,
-    *,
-    qty: float,
-    start: Optional[date],
-    finish: Optional[date],
-) -> None:
-    """Обновить qty/даты повторно используемого локального заказа (идемпотентность)."""
-    product = (
-        db.query(ProductionProduct)
-        .filter(ProductionProduct.order_id == int(order.order_id))
-        .order_by(ProductionProduct.line_number.asc())
-        .first()
-    )
+    if painted_product_id is None:
+        if painted_item_id is not None:
+            raise ValueError(
+                "painted_item_id+qty is an unpublished demand; publish it through "
+                "the Ledger obligation refresh before opening the chain"
+            )
+        raise ValueError("painted_product_id is required")
+    product = db.get(ProductionProduct, int(painted_product_id))
     if product is None:
-        return
-    produced = _to_float(product.produced_qty)
-    product.quantity = max(qty, produced)
-    product.remaining_qty = max(qty - produced, 0.0)
+        raise ValueError(f"painted_product_id={painted_product_id}: строка заказа не найдена")
+    order = db.get(ProductionOrder, int(product.order_id))
+    if order is None:
+        raise ValueError(f"painted_product_id={painted_product_id}: заказ не найден")
+    try:
+        generation_id = require_materialized_orders(
+            db, [order], consumer="paint_weld_chain.open"
+        )
+    except MrpMutationLineageError as exc:
+        raise ValueError(str(exc)) from exc
+    run = db.get(PlanningRun, int(order.source_run_id))
+    if run is None:  # guarded above; keeps the context type total.
+        raise ValueError("accepted planning run is unavailable")
+    obligation_qty = _to_float(product.quantity)
+    if obligation_qty <= 0:
+        raise ValueError("painted obligation quantity must be positive")
+    if qty is not None and abs(_to_float(qty) - obligation_qty) > 1e-9:
+        raise ValueError(
+            "qty must match the published painted obligation quantity"
+        )
     state = (
         db.query(ProductionOrderLineState)
         .filter(ProductionOrderLineState.product_id == int(product.product_id))
-        .first()
+        .one_or_none()
     )
-    if state is not None:
-        if start is not None:
-            state.planned_start_date = start
-        if finish is not None:
-            state.planned_finish_date = finish
-    db.flush()
+    return _PaintedContext(
+        product=product,
+        order=order,
+        run=run,
+        generation_id=int(generation_id),
+        item_id=int(product.item_id),
+        qty=obligation_qty,
+        start=start or (state.planned_start_date if state else None),
+        finish=finish or (state.planned_finish_date if state else None),
+    )
+
+
+def _resolve_weld_obligation(
+    db: Session,
+    *,
+    ctx: _PaintedContext,
+    welded_item_id: int,
+) -> _WeldObligation:
+    requirement = (
+        db.query(MrpRequirement)
+        .filter(
+            MrpRequirement.run_id == int(ctx.run.run_id),
+            MrpRequirement.item_id == int(welded_item_id),
+            MrpRequirement.freeze_version == int(ctx.run.active_freeze_version),
+        )
+        .with_for_update()
+        .one_or_none()
+    )
+    if requirement is None:
+        raise ValueError(
+            "published welded obligation is unavailable for this paint order"
+        )
+    reservation = (
+        db.query(ReservationEntry)
+        .filter(
+            ReservationEntry.ledger_generation_id == int(ctx.generation_id),
+            ReservationEntry.requirement_id == int(requirement.id),
+            ReservationEntry.run_id == int(ctx.run.run_id),
+            ReservationEntry.freeze_version == int(ctx.run.active_freeze_version),
+            ReservationEntry.realization_mode == "make",
+        )
+        .one_or_none()
+    )
+    if reservation is None:
+        raise ValueError(
+            "published welded Ledger reservation is unavailable"
+        )
+    rows = (
+        db.query(ProductionProduct, ProductionOrder)
+        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+        .filter(
+            ProductionProduct.source_mrp_requirement_id == int(requirement.id),
+            ProductionProduct.ledger_generation_id == int(ctx.generation_id),
+            ProductionOrder.source_run_id == int(ctx.run.run_id),
+            ProductionOrder.deletion_mark.is_(False),
+        )
+        .with_for_update()
+        .all()
+    )
+    line_refs = [str(int(product.product_id)) for product, _order in rows]
+    realized_by_line: dict[str, float] = {}
+    if line_refs:
+        for line_ref, realized in (
+            db.query(
+                MrpExecutionAllocation.fact_line_ref,
+                func.sum(MrpExecutionAllocation.allocated_qty),
+            )
+            .filter(
+                MrpExecutionAllocation.ledger_generation_id
+                == int(ctx.generation_id),
+                MrpExecutionAllocation.requirement_id
+                == int(requirement.id),
+                MrpExecutionAllocation.fact_type == "linked_production",
+                MrpExecutionAllocation.allocation_kind == "execution",
+                MrpExecutionAllocation.fact_line_ref.in_(line_refs),
+            )
+            .group_by(MrpExecutionAllocation.fact_line_ref)
+            .all()
+        ):
+            realized_by_line[str(line_ref)] = _to_float(realized)
+    allocated = sum(
+        max(
+            _to_float(product.quantity)
+            - realized_by_line.get(str(int(product.product_id)), 0.0),
+            0.0,
+        )
+        for product, _order in rows
+    )
+    raw_outstanding = max(
+        _to_float(reservation.reserved_qty) - _to_float(reservation.realized_qty),
+        0.0,
+    )
+    available = max(raw_outstanding - allocated, 0.0)
+    open_orders = tuple(
+        {
+            "number": str(order.order_number or ""),
+            "qty": max(
+                _to_float(product.quantity)
+                - realized_by_line.get(str(int(product.product_id)), 0.0),
+                0.0,
+            ),
+            "product_id": int(product.product_id),
+        }
+        for product, order in rows
+    )
+    return _WeldObligation(
+        requirement=requirement,
+        reservation=reservation,
+        available_qty=available,
+        allocated_qty=allocated,
+        open_orders=open_orders,
+    )
 
 
 def _ensure_paint_order(
     db: Session, ctx: _PaintedContext
 ) -> Tuple[ProductionOrder, bool]:
-    """Вернуть (окрасочный заказ, reused?). painted_product_id → существующий;
-    ad-hoc (по item) → дедуп по номеру PWC-P-{item}, иначе создать."""
-    if ctx.order_id is not None:
-        order = (
-            db.query(ProductionOrder)
-            .filter(ProductionOrder.order_id == int(ctx.order_id))
-            .first()
-        )
-        if order is None:
-            raise ValueError(f"order_id={ctx.order_id}: заказ окраски не найден")
-        return order, True
-
-    order_number = f"PWC-P-{int(ctx.item_id)}"
-    existing = (
-        db.query(ProductionOrder)
-        .filter(
-            ProductionOrder.order_number == order_number,
-            ProductionOrder.source == "mrp",
-            ProductionOrder.deletion_mark.is_(False),
-        )
-        .order_by(ProductionOrder.order_id.desc())
-        .first()
-    )
-    if existing is not None:
-        _sync_local_order(db, existing, qty=ctx.qty, start=ctx.start, finish=ctx.finish)
-        ctx.order_id = int(existing.order_id)
-        return existing, True
-
-    order = _new_local_order(
-        db,
-        order_number=order_number,
-        item_id=ctx.item_id,
-        qty=ctx.qty,
-        spec_id=_default_spec_id(db, ctx.item_id),
-        start=ctx.start,
-        finish=ctx.finish,
-    )
-    ctx.order_id = int(order.order_id)
-    return order, False
-
-
-def _weld_qty(paint_qty: float, welded_stock_qty: float) -> float:
-    """qty сварки = qty окраски за вычетом эффективного остатка сварной."""
-    remaining = _to_float(paint_qty) - max(_to_float(welded_stock_qty), 0.0)
-    return round(max(remaining, 0.0), 3)
+    """The painted side must already be a current accepted materialization."""
+    del db
+    return ctx.order, True
 
 
 def _weld_dates(
@@ -304,6 +304,8 @@ def _weld_dates(
 def _ensure_weld_order(
     db: Session,
     *,
+    ctx: _PaintedContext,
+    obligation: _WeldObligation,
     pair: PaintWeldPair,
     painted_order: ProductionOrder,
     welded_item_id: int,
@@ -326,19 +328,74 @@ def _ensure_weld_order(
             .first()
         )
         if order is not None:
-            _sync_local_order(db, order, qty=weld_qty, start=weld_start, finish=weld_finish)
+            product = (
+                db.query(ProductionProduct)
+                .filter(ProductionProduct.order_id == int(order.order_id))
+                .one_or_none()
+            )
+            if (
+                product is None
+                or int(order.source_run_id or -1) != int(ctx.run.run_id)
+                or int(product.ledger_generation_id or -1) != int(ctx.generation_id)
+                or int(product.source_mrp_requirement_id or -1)
+                != int(obligation.requirement.id)
+            ):
+                raise ValueError("existing paint/weld chain has stale Ledger lineage")
             return order, True
 
-    order = _new_local_order(
-        db,
-        order_number=f"PWC-W-{int(painted_order.order_id)}",
-        item_id=int(welded_item_id),
-        qty=weld_qty,
-        spec_id=_default_spec_id(db, welded_item_id),
-        start=weld_start,
-        finish=weld_finish,
+    if weld_qty <= 1e-9 or weld_qty > obligation.available_qty + 1e-9:
+        raise ValueError("weld quantity exceeds the outstanding Ledger obligation")
+    # Exporting the painted parent may commit its own 1C sync state.  Re-lock
+    # and re-read the shared requirement immediately before allocating the
+    # welded slice so another painted order cannot spend the same quantity in
+    # that gap.
+    current = _resolve_weld_obligation(
+        db, ctx=ctx, welded_item_id=int(welded_item_id)
     )
-    # Локальная связь (источник истины) + локальный комментарий строки.
+    if (
+        int(current.requirement.id) != int(obligation.requirement.id)
+        or weld_qty > current.available_qty + 1e-9
+    ):
+        raise ValueError("weld quantity exceeds the outstanding Ledger obligation")
+    obligation = current
+    order = ProductionOrder(
+        order_number=f"PWC-W-{int(painted_order.order_id)}",
+        order_date=painted_order.order_date,
+        order_ref1c=None,
+        is_posted=False,
+        deletion_mark=False,
+        source="mrp",
+        source_run_id=int(ctx.run.run_id),
+    )
+    db.add(order)
+    db.flush()
+    product = ProductionProduct(
+        order_id=int(order.order_id),
+        item_id=int(welded_item_id),
+        line_number=1,
+        quantity=weld_qty,
+        produced_qty=0,
+        remaining_qty=weld_qty,
+        spec_id=_default_spec_id(db, welded_item_id),
+        source_mrp_requirement_id=int(obligation.requirement.id),
+        source_mrp_allocation_key=(
+            f"paint_weld:{int(painted_order.order_id)}:"
+            f"requirement:{int(obligation.requirement.id)}"
+        ),
+        ledger_generation_id=int(ctx.generation_id),
+    )
+    db.add(product)
+    db.flush()
+    db.add(
+        ProductionOrderLineState(
+            product_id=int(product.product_id),
+            status="shortage",
+            issue_status="not_requested",
+            planned_start_date=weld_start,
+            planned_finish_date=weld_finish,
+            comment=basis_comment,
+        )
+    )
     db.add(
         PaintWeldChainLink(
             painted_order_id=int(painted_order.order_id),
@@ -346,14 +403,6 @@ def _ensure_weld_order(
             pair_id=int(pair.id),
         )
     )
-    state = (
-        db.query(ProductionOrderLineState)
-        .join(ProductionProduct, ProductionProduct.product_id == ProductionOrderLineState.product_id)
-        .filter(ProductionProduct.order_id == int(order.order_id))
-        .first()
-    )
-    if state is not None:
-        state.comment = basis_comment
     db.flush()
     return order, False
 
@@ -398,8 +447,52 @@ def open_paint_chain(
         planned_start=planned_start,
         planned_finish=planned_finish,
     )
-    guard = guard_paint_order(db, ctx.item_id, ctx.qty)
-    verdict = str(guard["verdict"])
+    pair = (
+        db.query(PaintWeldPair)
+        .filter(
+            PaintWeldPair.painted_item_id == int(ctx.item_id),
+            PaintWeldPair.is_active.is_(True),
+        )
+        .one_or_none()
+    )
+    obligation: Optional[_WeldObligation] = None
+    if pair is None:
+        verdict = "no_pair"
+        guard = {
+            "painted_item_id": int(ctx.item_id),
+            "ledger_generation_id": int(ctx.generation_id),
+            "welded_item": None,
+            "outstanding_qty": 0.0,
+            "allocated_qty": 0.0,
+            "open_orders": [],
+            "verdict": verdict,
+        }
+    else:
+        obligation = _resolve_weld_obligation(
+            db, ctx=ctx, welded_item_id=int(pair.welded_item_id)
+        )
+        if obligation.available_qty > 1e-9:
+            verdict = "need_weld"
+        elif obligation.allocated_qty > 1e-9:
+            verdict = "order_open"
+        else:
+            verdict = "stock_covers"
+        welded_item = db.get(Item, int(pair.welded_item_id))
+        guard = {
+            "painted_item_id": int(ctx.item_id),
+            "ledger_generation_id": int(ctx.generation_id),
+            "requirement_id": int(obligation.requirement.id),
+            "reservation_id": int(obligation.reservation.id),
+            "welded_item": {
+                "item_id": int(pair.welded_item_id),
+                "item_code": str(welded_item.item_code or "") if welded_item else "",
+                "item_name": str(welded_item.item_name or "") if welded_item else "",
+            },
+            "outstanding_qty": round(obligation.available_qty, 3),
+            "allocated_qty": round(obligation.allocated_qty, 3),
+            "open_orders": list(obligation.open_orders),
+            "verdict": verdict,
+        }
 
     result: Dict[str, Any] = {
         "status": "ok",
@@ -428,14 +521,27 @@ def open_paint_chain(
         weld_needed = verdict == "need_weld" or existing_link is not None
         result["weld_needed"] = weld_needed
 
-        welded_item_id = (
-            int(guard["welded_item"]["item_id"]) if guard.get("welded_item") else None
-        )
+        welded_item_id = int(pair.welded_item_id) if pair is not None else None
         weld_qty = 0.0
         weld_start: Optional[date] = None
         weld_finish: Optional[date] = None
         if weld_needed and welded_item_id is not None:
-            weld_qty = _weld_qty(ctx.qty, guard.get("stock_qty", 0.0))
+            if existing_link is not None:
+                existing_product = (
+                    db.query(ProductionProduct)
+                    .filter(
+                        ProductionProduct.order_id
+                        == int(existing_link.welded_order_id)
+                    )
+                    .one_or_none()
+                )
+                if existing_product is None:
+                    raise ValueError("existing paint/weld chain has no welded product")
+                weld_qty = _to_float(existing_product.quantity)
+            else:
+                if obligation is None:
+                    raise ValueError("published welded obligation is unavailable")
+                weld_qty = min(ctx.qty, obligation.available_qty)
             weld_start, weld_finish = _weld_dates(db, welded_item_id, ctx.start)
 
         if dry_run:
@@ -456,6 +562,8 @@ def open_paint_chain(
                 pair = _active_pair(db, ctx.item_id)
                 weld_order, weld_reused = _ensure_weld_order(
                     db,
+                    ctx=ctx,
+                    obligation=obligation,
                     pair=pair,
                     painted_order=paint_order,
                     welded_item_id=welded_item_id,
@@ -517,6 +625,8 @@ def open_paint_chain(
             basis = _basis_comment(paint_order)
             weld_order, weld_reused = _ensure_weld_order(
                 db,
+                ctx=ctx,
+                obligation=obligation,
                 pair=pair,
                 painted_order=paint_order,
                 welded_item_id=welded_item_id,

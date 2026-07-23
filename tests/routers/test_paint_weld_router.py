@@ -162,7 +162,9 @@ def test_guard_endpoint(client, db_session):
     assert r.json()["verdict"] == "stock_covers"
 
 
-def test_chain_preview_endpoint_is_dry_run(client, db_session, monkeypatch):
+def test_chain_preview_rejects_unpublished_item_demand(
+    client, db_session, monkeypatch
+):
     from app.services import one_c_production_order_export as exporter
 
     painted, welded = _seed_pair(db_session)
@@ -182,19 +184,14 @@ def test_chain_preview_endpoint_is_dry_run(client, db_session, monkeypatch):
         "/api/v1/paint-weld/chain/preview",
         json={"painted_item_id": painted.item_id, "qty": 8, "planned_start": "2026-09-01"},
     )
-    assert r.status_code == 200
-    body = r.json()
-    assert body["dry_run"] is True
-    assert body["verdict"] == "need_weld"
-    assert body["welded"]["qty"] == 8.0
-    assert body["welded"]["planned_finish_date"] == "2026-09-01"
-    # dry-run ничего не пишет
+    assert r.status_code == 400
+    assert "unpublished demand" in r.json()["detail"]
     from app.models import ProductionOrder
 
     assert db_session.query(ProductionOrder).count() == 0
 
 
-def test_chain_open_defaults_to_dry_run(client, db_session):
+def test_chain_open_rejects_unpublished_item_demand(client, db_session):
     painted, welded = _seed_pair(db_session)
     painted.item_ref1c = "ref-p"
     welded.item_ref1c = "ref-w"
@@ -206,8 +203,8 @@ def test_chain_open_defaults_to_dry_run(client, db_session):
         "/api/v1/paint-weld/chain/open",
         json={"painted_item_id": painted.item_id, "qty": 5},
     )
-    assert r.status_code == 200
-    assert r.json()["dry_run"] is True
+    assert r.status_code == 400
+    assert "unpublished demand" in r.json()["detail"]
 
     from app.models import ProductionOrder
 
