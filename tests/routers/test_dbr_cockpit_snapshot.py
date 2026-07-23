@@ -160,6 +160,16 @@ def test_mount_gets_read_snapshot_without_invoking_live_calculators(
     assert cockpit.json()["meta"]["snapshot_id"] is not None
 
 
+@pytest.mark.parametrize("signal_ids", [None, []])
+def test_purchase_launch_http_rejects_null_or_empty_selection(client, signal_ids):
+    response = client.post(
+        "/api/v1/dbr/feeder/purchase/launch",
+        json={"signal_ids": signal_ids, "dry_run": True},
+    )
+
+    assert response.status_code == 422
+
+
 def test_explicit_builder_fails_closed_without_calling_legacy_calculators(
     db_session,
     monkeypatch,

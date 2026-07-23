@@ -65,6 +65,7 @@ from ..one_c_purchase_order_export import (
 from ..replenishment import is_purchase_replenishment
 from . import adapters
 from . import classify as classify_mod
+from . import cockpit_snapshot_service
 from . import settings_service
 from .core.drum import kit as kit_mod
 from .core.feeder import demand_explosion, signal_identity
@@ -267,6 +268,76 @@ def _is_purchase_signal(signal: DbrFeederSignal) -> bool:
     return bool(item and is_purchase_replenishment(item.replenishment_method))
 
 
+def _require_snapshot_signal_selection(
+    db: Session,
+    signal_ids: Optional[list[int]],
+) -> tuple[list[int], int, int]:
+    """Validate one explicit selection against the accepted cockpit snapshot."""
+    if signal_ids is None:
+        raise ValueError("signal_ids must be an explicit non-empty list")
+    try:
+        selected = [int(signal_id) for signal_id in signal_ids]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("signal_ids must contain positive integer IDs") from exc
+    if not selected:
+        raise ValueError("signal_ids must be an explicit non-empty list")
+    if any(signal_id <= 0 for signal_id in selected):
+        raise ValueError("signal_ids must contain positive integer IDs")
+    if len(selected) != len(set(selected)):
+        raise ValueError("signal_ids must not contain duplicates")
+
+    cockpit = cockpit_snapshot_service.read_cockpit_snapshot(db)
+    meta = cockpit.get("meta")
+    if not isinstance(meta, dict):
+        raise ValueError("current DBR cockpit snapshot has no lineage metadata")
+    try:
+        generation_id = int(meta["ledger_generation"])
+        snapshot_id = int(meta["snapshot_id"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("current DBR cockpit snapshot has invalid lineage metadata") from exc
+
+    snapshot_signal_ids: set[int] = set()
+    for row in cockpit.get("signals", []):
+        if not isinstance(row, dict):
+            continue
+        value = row.get("id")
+        if isinstance(value, bool):
+            continue
+        try:
+            signal_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        try:
+            row_generation_id = int(row.get("ledger_generation_id"))
+        except (TypeError, ValueError):
+            continue
+        if signal_id > 0 and row_generation_id == generation_id:
+            snapshot_signal_ids.add(signal_id)
+    absent = sorted(set(selected) - snapshot_signal_ids)
+    if absent:
+        raise ValueError(
+            "signal_ids are absent from current accepted DBR cockpit snapshot: "
+            + ", ".join(str(signal_id) for signal_id in absent)
+        )
+
+    exact_live_ids = {
+        int(signal_id)
+        for (signal_id,) in db.query(DbrFeederSignal.id)
+        .filter(
+            DbrFeederSignal.id.in_(selected),
+            DbrFeederSignal.ledger_generation_id == generation_id,
+        )
+        .all()
+    }
+    stale = sorted(set(selected) - exact_live_ids)
+    if stale:
+        raise ValueError(
+            "signal_ids have no live row in the snapshot Ledger generation: "
+            + ", ".join(str(signal_id) for signal_id in stale)
+        )
+    return sorted(selected), generation_id, snapshot_id
+
+
 def launch_purchase_signals(
     db: Session,
     signal_ids: Optional[list[int]] = None,
@@ -274,8 +345,8 @@ def launch_purchase_signals(
 ) -> dict[str, Any]:
     """Launch open «Пополнение» signals of purchased items → supplier orders.
 
-    - ``signal_ids`` selects specific signals; ``None`` means every open,
-      complete purchase signal (all_open_purchase).
+    - ``signal_ids`` is mandatory and must name exact rows from the current
+      accepted ``dbr_feeder_cockpit`` snapshot.
     - Lines are grouped by supplier (``items.supplier_ref1c``); qty is
       ``suggested_qty`` and the receipt date is ``today + replenishment_time``.
     - Signals without a supplier (or without item_ref1c) are reported under
@@ -284,15 +355,17 @@ def launch_purchase_signals(
     - dry_run=False: creates one Document_ЗаказПоставщику per supplier, stamps a
       sync_link per signal, and moves each signal to 'Order Created'.
     """
+    selected, generation_id, snapshot_id = _require_snapshot_signal_selection(
+        db, signal_ids
+    )
     q = db.query(DbrFeederSignal).filter(
+        DbrFeederSignal.id.in_(selected),
+        DbrFeederSignal.ledger_generation_id == generation_id,
         DbrFeederSignal.signal_type == "Пополнение",
         DbrFeederSignal.status == signal_identity.OPEN,
         DbrFeederSignal.is_incomplete.is_(False),
         DbrFeederSignal.suggested_qty > 0,
     )
-    selected = sorted({int(sid) for sid in (signal_ids or []) if int(sid) > 0})
-    if selected:
-        q = q.filter(DbrFeederSignal.id.in_(selected))
     q = q.order_by(DbrFeederSignal.id.asc())
 
     already = _already_exported_ids(db, SIGNAL_DOCTYPE)
@@ -379,6 +452,8 @@ def launch_purchase_signals(
         "dry_run": bool(dry_run),
         "kind": "feeder_purchase",
         "entity": PURCHASE_ORDER_ENTITY,
+        "snapshot_id": snapshot_id,
+        "ledger_generation": generation_id,
         "orders_planned": len(groups),
         "signals_total": sum(len(ln.purchase_ids) for g in groups for ln in g.lines),
         "unresolved": unresolved,

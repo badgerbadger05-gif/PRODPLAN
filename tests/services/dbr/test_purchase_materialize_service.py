@@ -12,6 +12,8 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
+import pytest
+
 from app.models import (
     DbrProductionProgram,
     DbrProductionProgramItem,
@@ -19,6 +21,7 @@ from app.models import (
     DefaultSpecification,
     Item,
     ItemWarehouseStock,
+    LedgerGeneration,
     SpecComponent,
     Specification,
     StockWarehouse,
@@ -28,10 +31,12 @@ from app.models import (
     SyncLink,
 )
 from app.services.dbr import (
+    cockpit_snapshot_service,
     feedback_service,
     purchase_materialize_service as pms,
     settings_service,
 )
+from app.services import planning_truth
 from app.services.dbr.core.feeder import signal_identity
 
 
@@ -88,6 +93,7 @@ def _purchase_item(db, *, code, supplier_ref, rt=7, ref_suffix=None):
 
 def _purchase_signal(db, item, *, qty=5, warehouse="W4"):
     signal = DbrFeederSignal(
+        ledger_generation_id=db.info["dbr_test_generation_id"],
         dedup_key=f"R:{item.item_code}",
         signal_type="Пополнение",
         item_id=item.item_id,
@@ -102,20 +108,110 @@ def _purchase_signal(db, item, *, qty=5, warehouse="W4"):
     return signal
 
 
+def _publish_signal_snapshot(db, *signals):
+    generation = db.get(LedgerGeneration, db.info["dbr_test_generation_id"])
+    generation.capabilities = {
+        **dict(generation.capabilities or {}),
+        planning_truth.CAPABILITY_PLANNING_SNAPSHOTS: True,
+        planning_truth.CAPABILITY_DBR_FEEDER_COCKPIT: True,
+    }
+    payload = {
+        "positions": [],
+        "signals": [
+            {
+                "id": int(signal.id),
+                "ledger_generation_id": int(signal.ledger_generation_id),
+                "item_id": int(signal.item_id),
+                "signal_type": str(signal.signal_type),
+                "status": str(signal.status),
+            }
+            for signal in signals
+        ],
+        "deficits": {"deficits": [], "kpis": {}},
+        "processing_board": {"status": "unavailable"},
+        "meta": {},
+    }
+    planning_truth.publish_read_snapshot(
+        db,
+        consumer=cockpit_snapshot_service.CONSUMER,
+        snapshot_key="purchase-materialize-test",
+        payload=payload,
+        required_capabilities=cockpit_snapshot_service.REQUIRED_CAPABILITIES,
+    )
+    db.commit()
+
+
 # ---------------------------------------------------------------------------
 # launch_purchase_signals
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("signal_ids", [None, []])
+def test_launch_purchase_requires_explicit_nonempty_signal_ids(
+    db_session, signal_ids
+):
+    with pytest.raises(ValueError, match="explicit non-empty"):
+        pms.launch_purchase_signals(
+            db_session, signal_ids=signal_ids, dry_run=True
+        )
+
+
+def test_launch_purchase_rejects_live_signal_absent_from_snapshot(db_session):
+    db = db_session
+    allowed_item = _purchase_item(db, code="ALLOWED", supplier_ref="sup-A")
+    live_only_item = _purchase_item(db, code="LIVE-ONLY", supplier_ref="sup-A")
+    allowed = _purchase_signal(db, allowed_item)
+    live_only = _purchase_signal(db, live_only_item)
+    _publish_signal_snapshot(db, allowed)
+
+    with pytest.raises(ValueError, match="absent from current accepted"):
+        pms.launch_purchase_signals(
+            db, signal_ids=[live_only.id], dry_run=True
+        )
+
+
+def test_launch_purchase_rejects_snapshot_id_with_stale_live_generation(db_session):
+    db = db_session
+    item = _purchase_item(db, code="STALE", supplier_ref="sup-A")
+    signal = _purchase_signal(db, item)
+    _publish_signal_snapshot(db, signal)
+    signal.ledger_generation_id = None
+    db.commit()
+
+    with pytest.raises(ValueError, match="no live row in the snapshot"):
+        pms.launch_purchase_signals(db, signal_ids=[signal.id], dry_run=True)
+
+
+def test_launch_purchase_materializes_only_explicit_snapshot_ids(
+    db_session, monkeypatch
+):
+    db = db_session
+    selected_item = _purchase_item(db, code="SELECTED", supplier_ref="sup-A")
+    other_item = _purchase_item(db, code="OTHER", supplier_ref="sup-B")
+    selected = _purchase_signal(db, selected_item)
+    other = _purchase_signal(db, other_item)
+    _publish_signal_snapshot(db, selected, other)
+    _stub(monkeypatch, client=_FakeClient())
+
+    result = pms.launch_purchase_signals(
+        db, signal_ids=[selected.id], dry_run=True
+    )
+
+    assert result["signals_total"] == 1
+    assert result["orders"][0]["lines"][0]["source_ids"] == [selected.id]
+    assert result["snapshot_id"] > 0
+    assert result["ledger_generation"] == db.info["dbr_test_generation_id"]
 
 
 def test_launch_purchase_dry_run_writes_nothing(db_session, monkeypatch):
     db = db_session
     item = _purchase_item(db, code="BOLT", supplier_ref="sup-A", rt=10)
     signal = _purchase_signal(db, item, qty=5)
-    db.commit()
+    _publish_signal_snapshot(db, signal)
     fake = _FakeClient()
     _stub(monkeypatch, client=fake)
 
-    res = pms.launch_purchase_signals(db, dry_run=True)
+    res = pms.launch_purchase_signals(db, signal_ids=[signal.id], dry_run=True)
 
     assert res["dry_run"] is True
     assert res["orders_planned"] == 1
@@ -135,11 +231,11 @@ def test_launch_purchase_real_write_stamps_link_and_signal(db_session, monkeypat
     db = db_session
     item = _purchase_item(db, code="BOLT", supplier_ref="sup-A")
     signal = _purchase_signal(db, item, qty=5)
-    db.commit()
+    _publish_signal_snapshot(db, signal)
     fake = _FakeClient(ref_key="ref-po")
     _stub(monkeypatch, client=fake)
 
-    res = pms.launch_purchase_signals(db, dry_run=False)
+    res = pms.launch_purchase_signals(db, signal_ids=[signal.id], dry_run=False)
 
     assert res["orders_created"] == 1
     assert len(fake.posts) == 1
@@ -162,16 +258,16 @@ def test_launch_purchase_second_call_is_idempotent(db_session, monkeypatch):
     db = db_session
     item = _purchase_item(db, code="BOLT", supplier_ref="sup-A")
     signal = _purchase_signal(db, item, qty=5)
-    db.commit()
+    _publish_signal_snapshot(db, signal)
     fake = _FakeClient()
     _stub(monkeypatch, client=fake)
 
-    pms.launch_purchase_signals(db, dry_run=False)
+    pms.launch_purchase_signals(db, signal_ids=[signal.id], dry_run=False)
     assert len(fake.posts) == 1
 
-    # Normal flow: the signal left Open (→ Order Created), so a second batch over
-    # "all open" finds nothing to launch and never re-POSTs.
-    res = pms.launch_purchase_signals(db, dry_run=False)
+    # Normal flow: the exact snapshotted signal left Open (→ Order Created), so
+    # a second call finds nothing to launch and never re-POSTs.
+    res = pms.launch_purchase_signals(db, signal_ids=[signal.id], dry_run=False)
     assert res["orders_planned"] == 0
     assert len(fake.posts) == 1
 
@@ -190,13 +286,14 @@ def test_launch_purchase_groups_by_supplier(db_session, monkeypatch):
     a1 = _purchase_item(db, code="A1", supplier_ref="sup-A")
     a2 = _purchase_item(db, code="A2", supplier_ref="sup-A")
     b1 = _purchase_item(db, code="B1", supplier_ref="sup-B")
-    for it in (a1, a2, b1):
-        _purchase_signal(db, it, qty=2)
-    db.commit()
+    signals = [_purchase_signal(db, it, qty=2) for it in (a1, a2, b1)]
+    _publish_signal_snapshot(db, *signals)
     fake = _FakeClient()
     _stub(monkeypatch, client=fake)
 
-    res = pms.launch_purchase_signals(db, dry_run=True)
+    res = pms.launch_purchase_signals(
+        db, signal_ids=[signal.id for signal in signals], dry_run=True
+    )
 
     assert res["orders_planned"] == 2  # two suppliers
     by_supplier = {o["supplier_ref1c"]: o for o in res["orders"]}
@@ -208,10 +305,10 @@ def test_launch_purchase_unresolved_without_supplier(db_session, monkeypatch):
     db = db_session
     item = _purchase_item(db, code="NOSUP", supplier_ref=None)
     signal = _purchase_signal(db, item, qty=4)
-    db.commit()
+    _publish_signal_snapshot(db, signal)
     _stub(monkeypatch, client=_FakeClient())
 
-    res = pms.launch_purchase_signals(db, dry_run=True)
+    res = pms.launch_purchase_signals(db, signal_ids=[signal.id], dry_run=True)
 
     assert res["orders_planned"] == 0
     assert res["unresolved"]
@@ -227,11 +324,11 @@ def test_launch_purchase_skips_non_purchase_signals(db_session, monkeypatch):
     )
     db.add(made)
     db.flush()
-    _purchase_signal(db, made, qty=3)
-    db.commit()
+    signal = _purchase_signal(db, made, qty=3)
+    _publish_signal_snapshot(db, signal)
     _stub(monkeypatch, client=_FakeClient())
 
-    res = pms.launch_purchase_signals(db, dry_run=True)
+    res = pms.launch_purchase_signals(db, signal_ids=[signal.id], dry_run=True)
     assert res["orders_planned"] == 0
     assert res["unresolved"] == []
 
@@ -244,10 +341,10 @@ def test_launch_purchase_skips_non_purchase_signals(db_session, monkeypatch):
 def _materialize_one_signal(db, monkeypatch, *, qty=5, ref="ref-po"):
     item = _purchase_item(db, code="BOLT", supplier_ref="sup-A")
     signal = _purchase_signal(db, item, qty=qty)
-    db.commit()
+    _publish_signal_snapshot(db, signal)
     fake = _FakeClient(ref_key=ref)
     _stub(monkeypatch, client=fake)
-    pms.launch_purchase_signals(db, dry_run=False)
+    pms.launch_purchase_signals(db, signal_ids=[signal.id], dry_run=False)
     db.refresh(signal)
     return signal, item
 

@@ -177,7 +177,7 @@ class SignalLaunchRequest(BaseModel):
 
 
 class PurchaseLaunchRequest(BaseModel):
-    signal_ids: Optional[list[int]] = None
+    signal_ids: list[int] = Field(min_length=1)
     dry_run: bool = True
 
 
@@ -874,6 +874,8 @@ def feeder_launch_purchase(
         return purchase_materialize_service.launch_purchase_signals(
             db, signal_ids=payload.signal_ids, dry_run=payload.dry_run
         )
+    except cockpit_snapshot_service.DbrCockpitSnapshotUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc))
     except ValueError as exc:
