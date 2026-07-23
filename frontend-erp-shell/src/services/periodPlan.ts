@@ -76,9 +76,19 @@ export function fixPeriodPlan(planId: number, fixedBy = 'erp-shell') {
 }
 
 export function createMrpSnapshot(planId: number) {
+  // The backend publishes an entire Ledger generation atomically.  Keep one
+  // idempotency key in this request body so transport-level retries cannot
+  // create a second generation for the same click.
+  const generationKey = `period-plan-${planId}-${crypto.randomUUID()}`
   return api<{ status: string; run_id: number; plan_id: number; requirement_count: number; purchase_count: number; rework_count: number }>(
     `/v1/plan/period-plans/${planId}/mrp-snapshot`,
-    { method: 'POST', body: JSON.stringify({ started_by: 'erp-shell' }) },
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        started_by: 'erp-shell',
+        generation_key: generationKey,
+      }),
+    },
   )
 }
 
