@@ -1536,7 +1536,10 @@ def apply_requirement_closure(
 
 
 def apply_run_closure(
-    db: Session, scope: LedgerScope, eff_net_by_req: Optional[Dict[int, float]] = None
+    db: Session,
+    scope: LedgerScope,
+    eff_net_by_req: Optional[Dict[int, float]] = None,
+    cycle_id: str = "",
 ) -> List[int]:
     """Auto-close every FIXED_SNAPSHOT run that has NO OPEN DEFICIT left.
 
@@ -1609,6 +1612,22 @@ def apply_run_closure(
             run.finished_at = now
             closed_run_ids.append(rid)
     db.flush()
+    # Д3а (design §6.2, решение №15): a closed run releases its reservations —
+    # otherwise they stay active forever, inflating reserved_soft and starving
+    # available/coverage of the surviving plans. Wrapped: a reservation-ledger
+    # failure must not undo the closure itself; the run_reservation_shadow
+    # sweep (release_closed_run_reservations) self-heals on the next cycle.
+    if closed_run_ids:
+        try:
+            from .item_ledger.reservation_ledger import release_run_reservations
+
+            release_run_reservations(db, closed_run_ids, cycle_id=cycle_id)
+        except Exception:  # noqa: BLE001 — closure must stand even if release fails
+            logging.getLogger(__name__).exception(
+                "release_run_reservations failed for closed runs %s "
+                "(ghost reserves will be swept next cycle)",
+                closed_run_ids,
+            )
     return closed_run_ids
 
 
@@ -1692,7 +1711,7 @@ def run_ledger_cycle(db: Session) -> Dict[str, Any]:
     # re-open / keep-open a requirement). Requirements close first, then a run
     # closes once none of its requirements remain open.
     requirement_closure = apply_requirement_closure(db, scope, eff_net_by_req)
-    runs_closed = apply_run_closure(db, scope, eff_net_by_req)
+    runs_closed = apply_run_closure(db, scope, eff_net_by_req, cycle_id=cycle_id)
 
     # Inc4 (PURE SHADOW, ADDITIVE) — LEGACY ONLY: materialize the reservation
     # ledger from the same scope + the live SLE substrate. Wrapped so any failure

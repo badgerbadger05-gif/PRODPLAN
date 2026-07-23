@@ -50,6 +50,10 @@ logger = logging.getLogger(__name__)
 
 EPS = Decimal("1e-9")
 
+# PlanningRun.status of a closed run (mrp_execution_ledger.CLOSED_STATUS;
+# duplicated as a literal to avoid a module cycle).
+_RUN_CLOSED_STATUS = "CLOSED"
+
 # ledger-2 coverage source kinds
 _ON_HAND = "on_hand"
 _SUPPLIER = "supplier_order"
@@ -259,6 +263,256 @@ def _fold_entry(db: Session, entry: models.ReservationEntry) -> Tuple[Decimal, D
     return fold.reserved_qty, fold.realized_qty, fold.outstanding
 
 
+def _entry_events(db: Session, entry: models.ReservationEntry) -> List[models.ReservationEvent]:
+    return (
+        db.query(models.ReservationEvent)
+        .filter(models.ReservationEvent.reservation_id == int(entry.id))
+        .order_by(models.ReservationEvent.id.asc())
+        .all()
+    )
+
+
+def _delete_floating_coverage(db: Session, entry_ids: Sequence[int]) -> None:
+    """Drop floating coverage rows of entries leaving the active set
+    (released/cancelled): redistribute only rewrites floating rows of ACTIVE
+    entries, so without this the stale rows would linger forever."""
+    ids = [int(i) for i in entry_ids]
+    if not ids:
+        return
+    db.query(models.ReservationCoverage).filter(
+        models.ReservationCoverage.reservation_id.in_(ids),
+        models.ReservationCoverage.pin_kind == "floating",
+    ).delete(synchronize_session="fetch")
+    db.flush()
+
+
+# ---------------------------------------------------------------------------
+# §6.1 (последняя строка матрицы) / §8 — unrealize-компенсация при
+# замене-по-регистратору (Д2)
+# ---------------------------------------------------------------------------
+def unrealize_replaced_sle(
+    db: Session,
+    sle_ids: Sequence[int],
+    recorder_ref: str = "",
+) -> int:
+    """Compensate realize events whose SLE rows are about to be REPLACED.
+
+    Replace-by-recorder (ingest §3а step 4) deletes the recorder's SLE rows and
+    inserts fresh ones with NEW ids; the FK ``reservation_event.sle_id`` is ON
+    DELETE SET NULL, so without compensation the applied-mark is lost and the
+    fresh rows would realize AGAIN — doubling ``realized_qty`` and closing the
+    reserve prematurely. Per design §6.1 (last matrix row) / §8 this appends a
+    compensating ``unrealize`` (realized_delta = −realize.realized_delta) for
+    every realize event referencing the replaced SLE ids; the fresh SLE rows are
+    then re-matched by the regular :func:`realize_from_sle` pass.
+
+    MUST be called BEFORE the SLE delete (while ``sle_id`` still resolves).
+    Idempotent: keyed by the compensated realize event's id (each generation of
+    the recorder's rows produces new realize events, so one compensation per
+    realize event is exactly the per-generation semantics). A reserve that was
+    closed by the compensated realize and whose fold no longer satisfies
+    realized ≥ reserved is re-opened (``reopen`` event, status → active).
+    Returns the number of unrealize events written.
+    """
+    ids = [int(i) for i in sle_ids or []]
+    if not ids:
+        return 0
+    realize_events = (
+        db.query(models.ReservationEvent)
+        .filter(
+            models.ReservationEvent.sle_id.in_(ids),
+            models.ReservationEvent.event_kind == "realize",
+        )
+        .order_by(models.ReservationEvent.id.asc())
+        .all()
+    )
+    if not realize_events:
+        return 0
+    written = 0
+    touched: Set[int] = set()
+    for ev in realize_events:
+        entry = db.get(models.ReservationEntry, int(ev.reservation_id))
+        if entry is None:
+            continue
+        wrote = _append_event(
+            db, entry,
+            event_kind="unrealize",
+            idempotency_key=f"unrealize:{int(ev.reservation_id)}:{int(ev.id)}",
+            realized_delta=-_dec(ev.realized_delta),
+            fact_ref=str(recorder_ref or ev.fact_ref or ""),
+            fact_line_ref=str(ev.fact_line_ref or ""),
+            match_rule=str(ev.match_rule or ""),
+            cycle_id=f"replace:{recorder_ref}"[:64],
+        )
+        if wrote:
+            written += 1
+        # Detach the compensated realize from its (about to be deleted) SLE —
+        # exactly what the FK ON DELETE SET NULL does on PostgreSQL, made
+        # explicit so the applied-mark semantics do not depend on the dialect
+        # honoring FK actions (SQLite reuses rowids AND skips SET NULL, which
+        # would mask the fresh rows as already-applied).
+        ev.sle_id = None
+        touched.add(int(entry.id))
+        # closed by this realize and no longer satisfied → reopen (design §6.2).
+        fold = fold_reservation_events(_entry_events(db, entry))
+        if (
+            str(entry.lifecycle_status) == "closed"
+            and fold.realized_qty + EPS < fold.reserved_qty
+        ):
+            _append_event(
+                db, entry,
+                event_kind="reopen",
+                idempotency_key=f"reopen:{int(entry.id)}:unrealize:{int(ev.id)}",
+                fact_ref=str(recorder_ref or ""),
+                cycle_id=f"replace:{recorder_ref}"[:64],
+            )
+            entry.lifecycle_status = "active"
+            entry.closed_at = None
+    for eid in touched:
+        entry = db.get(models.ReservationEntry, int(eid))
+        if entry is not None:
+            _fold_entry(db, entry)
+    return written
+
+
+# ---------------------------------------------------------------------------
+# §6.2 / §8 + решение №15 — release / reopen жизненного цикла прогона (Д3)
+# ---------------------------------------------------------------------------
+def release_run_reservations(
+    db: Session,
+    run_ids: Sequence[int],
+    cycle_id: str = "",
+    *,
+    redistribute_pools: bool = True,
+) -> int:
+    """run → CLOSED releases every still-active reservation of the run (§6.2,
+    решение владельца №15 / released-маршрутизация Прил. B §5).
+
+    Per active entry: append ``release`` (reserved_delta = −outstanding →
+    outstanding 0), stamp ``lifecycle_status='released'`` (terminal;
+    :func:`reopen_run_reservations` is the only way back). Released reserves
+    leave reserved_soft/available immediately; their floating coverage rows are
+    dropped and the touched pools redistributed so the freed coverage flows to
+    the surviving reserves. Late realizations do NOT resurrect them — an issue
+    against a released reserve is honest unplanned_consumption (surplus-пул).
+
+    Idempotent: the release key carries a per-entry generation (count of prior
+    release events, so release→reopen→release cycles stay unique); a repeat
+    call finds no active entries and is a no-op. Returns entries released.
+    """
+    ids = [int(r) for r in run_ids or []]
+    if not ids:
+        return 0
+    entries = (
+        db.query(models.ReservationEntry)
+        .filter(
+            models.ReservationEntry.run_id.in_(ids),
+            models.ReservationEntry.lifecycle_status == "active",
+        )
+        .all()
+    )
+    if not entries:
+        return 0
+    released = 0
+    touched_items: Set[int] = set()
+    released_ids: List[int] = []
+    for e in entries:
+        events = _entry_events(db, e)
+        fold = fold_reservation_events(events)
+        generation = sum(1 for ev in events if str(ev.event_kind) == "release")
+        _append_event(
+            db, e,
+            event_kind="release",
+            idempotency_key=f"release:{int(e.id)}:{generation}",
+            reserved_delta=-fold.outstanding,
+            cycle_id=cycle_id,
+        )
+        e.lifecycle_status = "released"
+        e.closed_at = _now()
+        _fold_entry(db, e)
+        released += 1
+        touched_items.add(int(e.item_id))
+        released_ids.append(int(e.id))
+    _delete_floating_coverage(db, released_ids)
+    if redistribute_pools and touched_items:
+        on_hand = ledger_on_hand_by_item(db)
+        for iid in sorted(touched_items):
+            redistribute_pool(db, int(iid), on_hand, cycle_id)
+    db.flush()
+    return released
+
+
+def release_closed_run_reservations(db: Session, cycle_id: str = "") -> int:
+    """Self-healing sweep (Д3а): release active reservations whose run is
+    already CLOSED — pre-fix ghosts, or a closure whose release hook failed.
+    Called from :func:`run_reservation_shadow` every cycle; idempotent (the
+    redistribute is left to the caller's own pool loop)."""
+    rows = (
+        db.query(models.ReservationEntry.run_id)
+        .join(models.PlanningRun, models.PlanningRun.run_id == models.ReservationEntry.run_id)
+        .filter(models.ReservationEntry.lifecycle_status == "active")
+        .filter(models.PlanningRun.status == _RUN_CLOSED_STATUS)
+        .distinct()
+        .all()
+    )
+    run_ids = [int(r) for (r,) in rows if r is not None]
+    if not run_ids:
+        return 0
+    return release_run_reservations(db, run_ids, cycle_id, redistribute_pools=False)
+
+
+def reopen_run_reservations(db: Session, run_ids: Sequence[int], cycle_id: str = "") -> int:
+    """reopen_run undoes a closure (Д3в): released reserves return to active
+    with a ``reopen`` event restoring the released outstanding (reserved_delta
+    = −release.reserved_delta). Keyed by the release event id → idempotent.
+    An entry whose fold already satisfies realized ≥ reserved re-closes in the
+    fold (correct: it was executed). Returns entries reopened."""
+    ids = [int(r) for r in run_ids or []]
+    if not ids:
+        return 0
+    entries = (
+        db.query(models.ReservationEntry)
+        .filter(
+            models.ReservationEntry.run_id.in_(ids),
+            models.ReservationEntry.lifecycle_status == "released",
+        )
+        .all()
+    )
+    if not entries:
+        return 0
+    reopened = 0
+    touched_items: Set[int] = set()
+    for e in entries:
+        last_release = (
+            db.query(models.ReservationEvent)
+            .filter(
+                models.ReservationEvent.reservation_id == int(e.id),
+                models.ReservationEvent.event_kind == "release",
+            )
+            .order_by(models.ReservationEvent.id.desc())
+            .first()
+        )
+        if last_release is not None:
+            _append_event(
+                db, e,
+                event_kind="reopen",
+                idempotency_key=f"reopen:{int(e.id)}:release:{int(last_release.id)}",
+                reserved_delta=-_dec(last_release.reserved_delta),
+                cycle_id=cycle_id,
+            )
+        e.lifecycle_status = "active"
+        e.closed_at = None
+        _fold_entry(db, e)
+        reopened += 1
+        touched_items.add(int(e.item_id))
+    if touched_items:
+        on_hand = ledger_on_hand_by_item(db)
+        for iid in sorted(touched_items):
+            redistribute_pool(db, int(iid), on_hand, cycle_id)
+    db.flush()
+    return reopened
+
+
 # ---------------------------------------------------------------------------
 # §2.2/§11 — backfill: materialize entries + open/amend events
 # ---------------------------------------------------------------------------
@@ -276,6 +530,15 @@ def materialize_reservations(
     second open — the entry survives as identity (design §8). Idempotent: a
     re-run at the same version, target unchanged → no event.
 
+    Lifecycle (design §8, Д3б): a requirement whose GROSS vanished at refreeze
+    (the ``(run_id,item_id)`` upsert keeps the row but zeroes
+    ``total_required_qty``) is a требование, снятое с плана → ``cancel``
+    (reserved_delta = −outstanding, status → cancelled, terminal). If a later
+    refreeze resurrects the demand, the cancelled entry is re-opened (``reopen``
+    event) and amended back — identity preserved. ``released`` entries (their
+    run was CLOSED) are never amended here — :func:`reopen_run_reservations`
+    is the only way back to active.
+
     Returns the list of touched reservation_entry ids.
     """
     if not reqs:
@@ -286,6 +549,7 @@ def materialize_reservations(
         run = runs_by_id.get(int(req.run_id))
         item = items.get(int(req.item_id))
         version = int(req.freeze_version if req.freeze_version is not None else (run.active_freeze_version if run and run.active_freeze_version is not None else 0))
+        vanished = _dec(req.total_required_qty) <= EPS
         for mode, target in mode_targets(req, item):
             entry = _get_or_create_entry(db, req, mode, run)
             touched.append(int(entry.id))
@@ -296,6 +560,39 @@ def materialize_reservations(
                 .all()
             )
             fold = fold_reservation_events(events)
+            status = str(entry.lifecycle_status)
+            if vanished:
+                # Д3б: gross demand dropped out of the plan at refreeze → cancel
+                # the reserve (only for a REALLY vanished requirement; a net=0
+                # covered-by-stock requirement keeps gross > 0 and stays active).
+                if status == "active" and events:
+                    _append_event(
+                        db, entry,
+                        event_kind="cancel",
+                        idempotency_key=f"cancel:{int(req.id)}:{mode}:{version}",
+                        reserved_delta=-fold.outstanding,
+                        cycle_id=cycle_id,
+                    )
+                    entry.lifecycle_status = "cancelled"
+                    entry.closed_at = _now()
+                    _delete_floating_coverage(db, [int(entry.id)])
+                    _fold_entry(db, entry)
+                continue
+            if status == "released":
+                # run was CLOSED → released is terminal for materialization;
+                # never amend the reserve back up (Д3а).
+                continue
+            if status == "cancelled":
+                # resurrection: the demand re-appeared at a later refreeze —
+                # re-open the identity, then amend below (design §8 / G6).
+                _append_event(
+                    db, entry,
+                    event_kind="reopen",
+                    idempotency_key=f"reopen:{int(req.id)}:{mode}:{version}",
+                    cycle_id=cycle_id,
+                )
+                entry.lifecycle_status = "active"
+                entry.closed_at = None
             has_open = any(str(e.event_kind) == "open" for e in events)
             if not has_open and not events:
                 _append_event(
@@ -339,11 +636,14 @@ def mirror_frozen_pins(
     frozen pins (pin_kind='frozen'; copy alloc_qty/fact_at_freeze/source). The
     old table stays the read source (dual-write only, design §2.6 / decision #10).
 
-    Idempotent per requirement: delete the requirement's existing frozen pins,
-    then re-insert from the current allocations (a refreeze re-derives them).
+    Idempotent per requirement: delete the existing frozen pins of EVERY scope
+    requirement's entries — including entries whose allocations vanished at
+    refreeze (orphan pins, Д6: a requirement left without allocations, or a
+    refreeze with no allocations at all, must not keep stale pins feeding
+    Pass A / effective_net_bin) — then re-insert from the current allocations.
     Returns the number of frozen pins written.
     """
-    if not freeze_allocs:
+    if not reqs:
         return 0
     reqs_by_id = {int(r.id): r for r in reqs}
     if items is None:
@@ -353,44 +653,28 @@ def mirror_frozen_pins(
     for a in freeze_allocs:
         allocs_by_req.setdefault(int(a.requirement_id), []).append(a)
 
-    # resolve which entry each requirement's pins attach to (by mode)
+    # resolve which entry each requirement's pins attach to (by mode) — over
+    # ALL scope requirements, not only those still carrying allocations.
     entries_by_req_mode: Dict[Tuple[int, str], models.ReservationEntry] = {}
-    for rid in allocs_by_req:
-        for e in (
-            db.query(models.ReservationEntry)
-            .filter(models.ReservationEntry.requirement_id == int(rid))
-            .all()
-        ):
-            entries_by_req_mode[(int(rid), str(e.realization_mode))] = e
+    scope_entry_ids: List[int] = []
+    for e in (
+        db.query(models.ReservationEntry)
+        .filter(models.ReservationEntry.requirement_id.in_(list(reqs_by_id.keys())))
+        .all()
+    ):
+        entries_by_req_mode[(int(e.requirement_id), str(e.realization_mode))] = e
+        scope_entry_ids.append(int(e.id))
 
-    written = 0
-    touched_entries: Set[int] = set()
-    for rid, allocs in allocs_by_req.items():
-        req = reqs_by_id.get(int(rid))
-        if req is None:
-            continue
-        item = items.get(int(req.item_id))
-        has_consume = int(req.bom_level or 0) >= 1
-        has_make = _is_produced(item)
-        for a in allocs:
-            source_type = str(a.source_type or "")
-            source_kind = _SOURCE_KIND_BY_ALLOC_TYPE.get(source_type)
-            if source_kind is None:
-                continue
-            mode = _pin_mode_for_alloc(source_type, has_consume, has_make)
-            if mode is None:
-                continue
-            entry = entries_by_req_mode.get((int(rid), mode))
-            if entry is None:
-                continue
-            touched_entries.add(int(entry.id))
-    # rewrite: clear existing frozen pins for the touched entries, then insert.
-    if touched_entries:
+    # rewrite: clear the frozen pins of every scope entry (orphans included),
+    # then insert from the fresh allocations.
+    if scope_entry_ids:
         db.query(models.ReservationCoverage).filter(
-            models.ReservationCoverage.reservation_id.in_(list(touched_entries)),
+            models.ReservationCoverage.reservation_id.in_(scope_entry_ids),
             models.ReservationCoverage.pin_kind == "frozen",
         ).delete(synchronize_session="fetch")
         db.flush()
+
+    written = 0
 
     seen: Set[Tuple[int, str, str, str]] = set()
     for rid, allocs in allocs_by_req.items():
@@ -996,6 +1280,12 @@ def run_reservation_shadow(db: Session, scope, cycle_id: str) -> Dict[str, Any]:
     reqs = list(scope.open_reqs)
     items = _load_items(db, set(scope.pool_items))
     materialize_reservations(db, reqs, scope.runs_by_id, cycle_id)
+    # Д3а self-heal: reservations of already-CLOSED runs must not stay active
+    # (ghost reserved_soft). Normally released by the closure hooks
+    # (apply_run_closure / force_close_run); this sweep catches pre-existing
+    # ghosts and hook failures. Runs BEFORE matching/redistribute so released
+    # reserves neither absorb realize events nor claim coverage this cycle.
+    released_swept = release_closed_run_reservations(db, cycle_id)
     pins_written = mirror_frozen_pins(db, reqs, scope.freeze_allocs, items)
     verify_mirrored = mirror_verify_realized(db, scope.freeze_allocs)
     realize_summary = realize_from_sle(db, scope, cycle_id)
@@ -1008,6 +1298,7 @@ def run_reservation_shadow(db: Session, scope, cycle_id: str) -> Dict[str, Any]:
 
     return {
         "reservations_materialized": len(reqs),
+        "reservations_released_swept": released_swept,
         "frozen_pins": pins_written,
         "verify_pins_mirrored": verify_mirrored,
         "pools_redistributed": pools_redistributed,

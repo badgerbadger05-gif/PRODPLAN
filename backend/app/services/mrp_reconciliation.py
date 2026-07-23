@@ -1307,6 +1307,23 @@ def reconcile_all_active(db: Session, *, dry_run: bool = False) -> Dict[str, Any
 # ---------------------------------------------------------------------------
 # §5 (increment 5) — manual force-close / reopen
 # ---------------------------------------------------------------------------
+def _release_run_reservations_safe(db: Session, run_id: int) -> int:
+    """Д3а: release the run's active reservations (reservation_ledger). Wrapped
+    so a reservation-ledger failure never blocks the business closure — the
+    ledger-cycle sweep (release_closed_run_reservations) self-heals next cycle."""
+    try:
+        from .item_ledger.reservation_ledger import release_run_reservations
+
+        return release_run_reservations(db, [int(run_id)], cycle_id=f"force-close:{int(run_id)}")
+    except Exception:  # noqa: BLE001 — closure must stand even if release fails
+        import logging
+
+        logging.getLogger(__name__).exception(
+            "release_run_reservations failed for run %s (ghosts swept next cycle)", run_id
+        )
+        return 0
+
+
 def force_close_run(db: Session, run_id: int, *, dry_run: bool = False) -> Dict[str, Any]:
     """Manually close an under-executed FIXED_SNAPSHOT run (business decision).
 
@@ -1323,11 +1340,19 @@ def force_close_run(db: Session, run_id: int, *, dry_run: bool = False) -> Dict[
         raise ValueError(f"run_id={run_id}: прогон не найден")
 
     if str(run.status or "") == CLOSED_STATUS:
+        # Idempotent repeat: the run is already closed, but heal any ghost
+        # reservations left active (Д3а) — release is a keyed no-op otherwise.
+        released = _release_run_reservations_safe(db, int(run.run_id))
+        if dry_run:
+            db.rollback()
+        else:
+            db.commit()
         return {
             "status": "already_closed",
             "run_id": int(run.run_id),
             "dry_run": bool(dry_run),
             "requirements_closed": 0,
+            "reservations_released": released,
             "purchases_pruned": [],
         }
     if str(run.status or "") != FIXED_SNAPSHOT_STATUS:
@@ -1364,6 +1389,10 @@ def force_close_run(db: Session, run_id: int, *, dry_run: bool = False) -> Dict[
     run.status = CLOSED_STATUS
     run.finished_at = now
 
+    # Д3а (design §6.2, решение №15): a closed run releases its reservations,
+    # otherwise they stay active forever (ghost reserved_soft).
+    released = _release_run_reservations_safe(db, int(run.run_id))
+
     if dry_run:
         db.rollback()
     else:
@@ -1374,6 +1403,7 @@ def force_close_run(db: Session, run_id: int, *, dry_run: bool = False) -> Dict[
         "run_id": int(run_id),
         "dry_run": bool(dry_run),
         "requirements_closed": len(open_reqs),
+        "reservations_released": released,
         "purchases_pruned": purchases_pruned,
     }
 
@@ -1409,6 +1439,23 @@ def reopen_run(db: Session, run_id: int, *, dry_run: bool = False) -> Dict[str, 
         req.status = "open"
         req.closed_at = None
 
+    # Д3в: reopen returns the run's released reservations to active (event
+    # ``reopen`` restores the released outstanding). Wrapped like release —
+    # a reservation-ledger failure never blocks the business reopen.
+    try:
+        from .item_ledger.reservation_ledger import reopen_run_reservations
+
+        reservations_reopened = reopen_run_reservations(
+            db, [int(run.run_id)], cycle_id=f"reopen:{int(run.run_id)}"
+        )
+    except Exception:  # noqa: BLE001 — reopen must stand even if this fails
+        import logging
+
+        logging.getLogger(__name__).exception(
+            "reopen_run_reservations failed for run %s", run_id
+        )
+        reservations_reopened = 0
+
     if dry_run:
         db.rollback()
     else:
@@ -1419,4 +1466,5 @@ def reopen_run(db: Session, run_id: int, *, dry_run: bool = False) -> Dict[str, 
         "run_id": int(run_id),
         "dry_run": bool(dry_run),
         "requirements_reopened": len(closed_reqs),
+        "reservations_reopened": reservations_reopened,
     }

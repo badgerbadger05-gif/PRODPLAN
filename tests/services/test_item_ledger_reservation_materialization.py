@@ -646,13 +646,24 @@ def test_run_ledger_cycle_result_unchanged_with_reservation_block(db_session):
         "drift_matured_surplus", "drift_evap_adjust", "drift_unattributed",
         "requirements_closed", "runs_closed",
     }
-    # proof the shadow block ran: the make reservation was materialized (reserved
-    # = net). realized stays 0 here (no assembly_in SLE mirrored yet) — proving the
-    # shadow ledger does not feed executed/closure, which came from the legacy path.
+    # proof the shadow block ran: the make reservation was materialized (open
+    # +10), and — because this very cycle closed the run by execution — the Д3
+    # release sweep released it: outstanding → 0 (release −10), status released.
+    # realized stays 0 (no assembly_in SLE mirrored) — the shadow ledger does not
+    # feed executed/closure, which came from the legacy path.
     entry = _entry(db, req, MAKE)
     assert entry is not None
     db.refresh(entry)
-    assert Decimal(str(entry.reserved_qty)) == Decimal("10")
+    assert entry.lifecycle_status == "released"
+    assert Decimal(str(entry.reserved_qty)) == Decimal("0")
+    kinds = [
+        str(e.event_kind)
+        for e in db.query(ReservationEvent)
+        .filter(ReservationEvent.reservation_id == entry.id)
+        .order_by(ReservationEvent.id.asc())
+        .all()
+    ]
+    assert kinds == ["open", "release"]
 
     # shadow report is read-only and consistent
     report = reservation_shadow_report(db)
