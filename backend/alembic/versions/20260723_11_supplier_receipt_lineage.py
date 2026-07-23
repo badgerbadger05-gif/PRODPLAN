@@ -154,13 +154,13 @@ def upgrade() -> None:
         ),
     )
     op.create_index(
-        "ix_stock_ledger_supplier_receipt_provenance_ledger_generation_id",
+        "ix_sl_srp_ledger_gen_id",
         "stock_ledger_supplier_receipt_provenance",
         ["ledger_generation_id"],
         unique=False,
     )
     op.create_index(
-        "ix_stock_ledger_supplier_receipt_provenance_stock_ledger_entry_id",
+        "ix_sl_srp_entry_id",
         "stock_ledger_supplier_receipt_provenance",
         ["stock_ledger_entry_id"],
         unique=False,
