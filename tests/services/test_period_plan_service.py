@@ -11,6 +11,7 @@ import pytest
 from app.models import (
     DefaultSpecification,
     Item,
+    LedgerGeneration,
     MrpRequirement,
     PlannedOrder,
     PlannedPurchase,
@@ -20,6 +21,9 @@ from app.models import (
     ProductionPlanHeader,
     ProductionPlanLine,
     ProductionProduct,
+    PhysicalImportBatch,
+    PlanningTruthState,
+    StockBin,
     SpecComponent,
     Specification,
     SyncLink,
@@ -32,17 +36,36 @@ from app.services.period_plan_service import (
     create_mrp_snapshot_from_period_plan,
     get_period_plan_execution_journal,
 )
-
-
 @pytest.fixture(autouse=True)
-def _accepted_planning_truth(monkeypatch):
-    """Legacy journal scenarios explicitly run under an accepted truth."""
-    monkeypatch.setattr(
-        "app.services.planning_truth.require_accepted_truth",
-        lambda db, consumer, **kwargs: SimpleNamespace(
-            status="accepted", generation_id=1, cutoff=None, reason=None
-        ),
+def _accepted_planning_truth(db_session):
+    """Planning calculations run against one explicit accepted Ledger."""
+    cutoff = datetime.datetime(2026, 7, 23)
+    batch = PhysicalImportBatch(
+        batch_key="period-plan-ledger",
+        status="completed",
+        cutoff=cutoff,
+        source_watermarks={},
+        completed_at=cutoff,
     )
+    generation = LedgerGeneration(
+        generation_key="period-plan-ledger",
+        status="accepted",
+        cutoff=cutoff,
+        accepted_at=cutoff,
+        source_watermarks={},
+        capabilities={
+            "physical_ledger": True,
+            "reservation_replay": True,
+            "execution_allocations": True,
+        },
+        physical_import_batch=batch,
+        algorithm_version="test",
+    )
+    db_session.add(generation)
+    db_session.flush()
+    db_session.add(PlanningTruthState(id=1, current_generation_id=generation.id))
+    db_session.flush()
+    db_session.info["period_plan_ledger_generation_id"] = int(generation.id)
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +85,30 @@ def _make_purchased_item(db, code: str, stock: float = 0.0) -> Item:
     )
     db.add(item)
     db.flush()
+    if stock:
+        db.add(StockBin(
+            ledger_generation_id=int(db.info["period_plan_ledger_generation_id"]),
+            item_id=item.item_id,
+            characteristic_ref="",
+            organization_ref="",
+            warehouse_ref1c="",
+            on_hand=stock,
+        ))
+        db.flush()
     return item
+
+
+def _publish_plan(db, plan: ProductionPlanHeader):
+    """Run the public atomic Ledger workflow with a deterministic retry key."""
+    return create_mrp_snapshot_from_period_plan(
+        db,
+        plan.id,
+        generation_key=f"period-plan-{plan.id}",
+    )
+
+
+def _planned_purchase(db, result):
+    return db.query(PlannedPurchase).filter_by(run_id=result["run_id"]).one()
 
 
 def test_execution_journal_is_explicitly_unavailable_without_accepted_truth(
@@ -75,6 +121,8 @@ def test_execution_journal_is_explicitly_unavailable_without_accepted_truth(
         "require_accepted_truth",
         lambda db, consumer, **kwargs: planning_truth.require_accepted(db),
     )
+    db_session.query(PlanningTruthState).delete()
+    db_session.flush()
     item = _make_purchased_item(db_session, "TRUTH-GUARD")
     plan = _make_fixed_plan(db_session, item, date(2026, 7, 1), qty=7.0)
     run = PlanningRun(
@@ -405,7 +453,7 @@ def test_root_production_plan_is_not_netted_by_finished_goods_stock_or_wip(db_se
     )
     db_session.flush()
 
-    result = create_mrp_snapshot_from_period_plan(db_session, plan.id)
+    result = _publish_plan(db_session, plan)
 
     req = db_session.query(MrpRequirement).filter_by(
         run_id=result["run_id"], item_id=finished_good.item_id,
@@ -887,23 +935,23 @@ def test_execution_journal_counts_supplier_order_accepted_to_stock_as_completed(
 class TestPurchaseAllocationNoSupplierOrders:
     """When no supplier orders exist, full net demand becomes PlannedPurchase."""
 
-    def test_reuses_existing_fixed_snapshot_for_plan_recalculation(self, db_session):
+    def test_exact_retry_keeps_published_snapshot_immutable(self, db_session):
         bucket = date(2026, 6, 2)
         item = _make_purchased_item(db_session, "BUY-RECALC", stock=0.0)
         plan = _make_fixed_plan(db_session, item, bucket, qty=30.0)
 
-        first = create_mrp_snapshot_from_period_plan(db_session, plan.id)
+        first = _publish_plan(db_session, plan)
         line = db_session.query(ProductionPlanLine).filter_by(plan_id=plan.id, item_id=item.item_id).one()
         line.qty = 45
         db_session.commit()
 
-        second = create_mrp_snapshot_from_period_plan(db_session, plan.id)
+        second = _publish_plan(db_session, plan)
 
         assert second["run_id"] == first["run_id"]
         assert db_session.query(PlanningRun).filter_by(source_plan_id=plan.id, status="FIXED_SNAPSHOT").count() == 1
         req = db_session.query(MrpRequirement).filter_by(run_id=first["run_id"], item_id=item.item_id).one()
-        assert float(req.total_required_qty) == pytest.approx(45.0)
-        assert float(req.net_required_qty) == pytest.approx(45.0)
+        assert float(req.total_required_qty) == pytest.approx(30.0)
+        assert float(req.net_required_qty) == pytest.approx(30.0)
         assert db_session.query(PlannedPurchase).filter_by(run_id=first["run_id"], item_id=item.item_id).count() == 1
 
     def test_creates_planned_purchase_for_full_net_qty(self, db_session):
@@ -911,11 +959,9 @@ class TestPurchaseAllocationNoSupplierOrders:
         item = _make_purchased_item(db_session, "BUY-001", stock=0.0)
         plan = _make_fixed_plan(db_session, item, bucket, qty=50.0)
 
-        result = create_mrp_snapshot_from_period_plan(db_session, plan.id)
+        result = _publish_plan(db_session, plan)
 
-        assert result["purchase_count"] == 1
-
-        pp = db_session.query(PlannedPurchase).filter_by(run_id=result["run_id"]).one()
+        pp = _planned_purchase(db_session, result)
         assert float(pp.requested_qty) == 50.0
         assert float(pp.planned_qty) == 50.0
         assert float(pp.qty) == 50.0
@@ -925,40 +971,37 @@ class TestPurchaseAllocationNoSupplierOrders:
         item = _make_purchased_item(db_session, "BUY-002")
         plan = _make_fixed_plan(db_session, item, bucket, qty=30.0)
 
-        result = create_mrp_snapshot_from_period_plan(db_session, plan.id)
+        result = _publish_plan(db_session, plan)
 
         pp = db_session.query(PlannedPurchase).filter_by(run_id=result["run_id"]).one()
         req = db_session.query(MrpRequirement).filter_by(run_id=result["run_id"]).one()
         assert pp.source_mrp_requirement_id == req.id
 
-    def test_stock_reduces_net_demand_and_planned_purchase(self, db_session):
+    def test_parent_generation_stock_is_not_reused_as_candidate_stock(self, db_session):
         bucket = date(2026, 6, 2)
         item = _make_purchased_item(db_session, "BUY-003", stock=15.0)
         plan = _make_fixed_plan(db_session, item, bucket, qty=50.0)
 
-        result = create_mrp_snapshot_from_period_plan(db_session, plan.id)
+        result = _publish_plan(db_session, plan)
 
-        assert result["purchase_count"] == 1
-        pp = db_session.query(PlannedPurchase).filter_by(run_id=result["run_id"]).one()
-        # net = 50 - 15 = 35; no supplier → planned_qty = 35
-        assert float(pp.planned_qty) == pytest.approx(35.0)
-        assert float(pp.requested_qty) == pytest.approx(35.0)
+        pp = _planned_purchase(db_session, result)
+        # The fixture's StockBin belongs to the accepted parent.  The new
+        # candidate may consume only rows stamped with its own generation.
+        assert float(pp.planned_qty) == pytest.approx(50.0)
+        assert float(pp.requested_qty) == pytest.approx(50.0)
 
 
-class TestPurchaseAllocationSupplierFullyCoversDemand:
-    """Supplier order fully covers bucket demand → no PlannedPurchase row."""
+class TestLegacySupplierFactsAreNotSupply:
+    """Mutable supplier-order counters never reduce Ledger obligations."""
 
     def test_no_planned_purchase_created(self, db_session):
         bucket = date(2026, 6, 2)
         item = _make_purchased_item(db_session, "BUY-FULL")
         plan = _make_fixed_plan(db_session, item, bucket, qty=20.0)
-        # Supplier delivers on or before the bucket date — covers all 20 units
         _make_supplier_order(db_session, item, remaining_qty=20.0, delivery_date=bucket)
 
-        result = create_mrp_snapshot_from_period_plan(db_session, plan.id)
-
-        assert result["purchase_count"] == 0
-        assert db_session.query(PlannedPurchase).filter_by(run_id=result["run_id"]).count() == 0
+        result = _publish_plan(db_session, plan)
+        assert float(_planned_purchase(db_session, result).planned_qty) == pytest.approx(20.0)
 
     def test_supplier_surplus_does_not_create_negative_purchase(self, db_session):
         bucket = date(2026, 6, 2)
@@ -966,9 +1009,8 @@ class TestPurchaseAllocationSupplierFullyCoversDemand:
         plan = _make_fixed_plan(db_session, item, bucket, qty=10.0)
         _make_supplier_order(db_session, item, remaining_qty=50.0, delivery_date=bucket)
 
-        result = create_mrp_snapshot_from_period_plan(db_session, plan.id)
-
-        assert result["purchase_count"] == 0
+        result = _publish_plan(db_session, plan)
+        assert float(_planned_purchase(db_session, result).planned_qty) == pytest.approx(10.0)
 
     def test_supplier_early_delivery_covers_demand(self, db_session):
         """Supplier arriving before bucket date still covers that bucket."""
@@ -977,9 +1019,8 @@ class TestPurchaseAllocationSupplierFullyCoversDemand:
         plan = _make_fixed_plan(db_session, item, bucket, qty=15.0)
         _make_supplier_order(db_session, item, remaining_qty=15.0, delivery_date=date(2026, 6, 2))
 
-        result = create_mrp_snapshot_from_period_plan(db_session, plan.id)
-
-        assert result["purchase_count"] == 0
+        result = _publish_plan(db_session, plan)
+        assert float(_planned_purchase(db_session, result).planned_qty) == pytest.approx(15.0)
 
     def test_supplier_late_delivery_does_not_cover(self, db_session):
         """Supplier arriving after bucket date cannot cover that bucket's demand."""
@@ -989,21 +1030,13 @@ class TestPurchaseAllocationSupplierFullyCoversDemand:
             db_session, item, bucket, qty=20.0,
             period_from=date(2026, 6, 2), period_to=date(2026, 6, 30),
         )
-        # Supplier delivers after the bucket → cannot cover week-1 demand
         _make_supplier_order(db_session, item, remaining_qty=20.0, delivery_date=date(2026, 6, 16))
 
-        result = create_mrp_snapshot_from_period_plan(db_session, plan.id)
-
-        # Week-1 demand unmet; supplier delivers outside period_to would be ignored,
-        # but delivery_date(June 16) <= period_to(June 30) so the order IS loaded —
-        # yet it cannot cover the June-2 bucket because delivery is June 16 > June 2.
-        assert result["purchase_count"] == 1
-        pp = db_session.query(PlannedPurchase).filter_by(run_id=result["run_id"]).one()
-        assert float(pp.planned_qty) == pytest.approx(20.0)
+        result = _publish_plan(db_session, plan)
+        assert float(_planned_purchase(db_session, result).planned_qty) == pytest.approx(20.0)
 
 
-class TestPurchaseAllocationSupplierPartiallyCoversDemand:
-    """Supplier order covers only part of demand → PlannedPurchase for remainder."""
+class TestLegacySupplierPartialFactsAreNotSupply:
 
     def test_planned_purchase_qty_is_remainder(self, db_session):
         bucket = date(2026, 6, 2)
@@ -1011,14 +1044,8 @@ class TestPurchaseAllocationSupplierPartiallyCoversDemand:
         plan = _make_fixed_plan(db_session, item, bucket, qty=30.0)
         _make_supplier_order(db_session, item, remaining_qty=10.0, delivery_date=bucket)
 
-        result = create_mrp_snapshot_from_period_plan(db_session, plan.id)
-
-        assert result["purchase_count"] == 1
-        pp = db_session.query(PlannedPurchase).filter_by(run_id=result["run_id"]).one()
-        # requested = full bucket net demand; planned = net after supplier
-        assert float(pp.requested_qty) == pytest.approx(30.0)
-        assert float(pp.planned_qty) == pytest.approx(20.0)
-        assert float(pp.qty) == pytest.approx(20.0)
+        result = _publish_plan(db_session, plan)
+        assert float(_planned_purchase(db_session, result).planned_qty) == pytest.approx(30.0)
 
     def test_coverage_qty_reflects_full_demand(self, db_session):
         """MrpRequirement.covered_qty must equal total net demand (supplier + planned purchase)."""
@@ -1027,8 +1054,7 @@ class TestPurchaseAllocationSupplierPartiallyCoversDemand:
         plan = _make_fixed_plan(db_session, item, bucket, qty=40.0)
         _make_supplier_order(db_session, item, remaining_qty=15.0, delivery_date=bucket)
 
-        result = create_mrp_snapshot_from_period_plan(db_session, plan.id)
-
+        result = _publish_plan(db_session, plan)
         req = db_session.query(MrpRequirement).filter_by(run_id=result["run_id"]).one()
         assert float(req.covered_qty) == pytest.approx(40.0)
         assert float(req.remaining_qty) == pytest.approx(0.0)
@@ -1047,11 +1073,9 @@ class TestPurchaseAllocationExcludedStates:
             state_name=state_name, state_key="exc-key",
         )
 
-        result = create_mrp_snapshot_from_period_plan(db_session, plan.id)
+        result = _publish_plan(db_session, plan)
 
-        # Excluded order → full demand still needs PlannedPurchase
-        assert result["purchase_count"] == 1
-        pp = db_session.query(PlannedPurchase).filter_by(run_id=result["run_id"]).one()
+        pp = _planned_purchase(db_session, result)
         assert float(pp.planned_qty) == pytest.approx(25.0)
 
     def test_deleted_order_not_consumed(self, db_session):
@@ -1082,19 +1106,16 @@ class TestPurchaseAllocationExcludedStates:
         )
         db_session.flush()
 
-        result = create_mrp_snapshot_from_period_plan(db_session, plan.id)
+        result = _publish_plan(db_session, plan)
 
-        assert result["purchase_count"] == 1
-        pp = db_session.query(PlannedPurchase).filter_by(run_id=result["run_id"]).one()
+        pp = _planned_purchase(db_session, result)
         assert float(pp.planned_qty) == pytest.approx(20.0)
 
 
-class TestPurchaseAllocationMultiBucket:
-    """Supplier quantity spans multiple demand buckets chronologically."""
+class TestLedgerOnlyMultiBucketAllocation:
 
     def test_supplier_consumed_across_buckets(self, db_session):
-        """Supplier with 25 units: covers week-1 (20 units) → 5 left for week-2.
-        Week-2 needs 30 → PlannedPurchase(25) for week-2."""
+        """Legacy supplier counters do not leak into either demand bucket."""
         period_from = date(2026, 6, 2)
         period_to = date(2026, 6, 16)
         item = _make_purchased_item(db_session, "BUY-MULTI")
@@ -1116,21 +1137,13 @@ class TestPurchaseAllocationMultiBucket:
         ])
         db_session.flush()
 
-        # Supplier delivers 25 units at week1 — covers all of week1 (20) and 5 of week2
         _make_supplier_order(db_session, item, remaining_qty=25.0, delivery_date=week1)
 
-        result = create_mrp_snapshot_from_period_plan(db_session, plan.id)
-
+        result = _publish_plan(db_session, plan)
         purchases = (
             db_session.query(PlannedPurchase)
             .filter_by(run_id=result["run_id"])
             .order_by(PlannedPurchase.need_date)
             .all()
         )
-        # Week-1: fully covered → no purchase; Week-2: 25 remaining, supplier gave 5 → buy 25
-        assert len(purchases) == 1
-        assert float(purchases[0].need_date.strftime("%Y-%m-%d").replace("-", "")) == pytest.approx(
-            float(week2.strftime("%Y-%m-%d").replace("-", ""))
-        )
-        assert float(purchases[0].requested_qty) == pytest.approx(30.0)
-        assert float(purchases[0].planned_qty) == pytest.approx(25.0)
+        assert [float(row.planned_qty) for row in purchases] == pytest.approx([20.0, 30.0])
