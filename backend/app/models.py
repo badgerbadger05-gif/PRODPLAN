@@ -1287,6 +1287,26 @@ class ProductionPlanLine(Base):
 
 class PlanningRun(Base):
     __tablename__ = "planning_run"
+    # A source plan may have only one *open candidate* for one immutable Ledger
+    # generation. Historical FIXED/SUPERSEDED rows intentionally retain the
+    # same lineage, so they must not participate in this identity. Both
+    # columns also stay nullable for legacy rows.
+    __table_args__ = (
+        Index(
+            "uq_planning_run_generation_source_plan",
+            "ledger_generation_id",
+            "source_plan_id",
+            unique=True,
+            postgresql_where=text(
+                "status = 'BUILDING_SNAPSHOT' AND ledger_generation_id IS NOT NULL "
+                "AND source_plan_id IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "status = 'BUILDING_SNAPSHOT' AND ledger_generation_id IS NOT NULL "
+                "AND source_plan_id IS NOT NULL"
+            ),
+        ),
+    )
 
     run_id = Column(Integer, primary_key=True, index=True)
     started_at = Column(TIMESTAMP, default=func.now(), nullable=False)
