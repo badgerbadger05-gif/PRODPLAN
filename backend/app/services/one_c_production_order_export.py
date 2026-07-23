@@ -20,6 +20,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
 from datetime import date, datetime
+from decimal import Decimal
+import hashlib
+import json
 from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -31,6 +34,7 @@ from ..models import (
     Operation,
     ProductionMaterialIssue,
     ProductionOrder,
+    PlanningRun,
     ProductionOrderLineState,
     ProductionProduct,
     SpecComponent,
@@ -58,11 +62,13 @@ from .one_c_export_common import (
     fmt_1c_datetime as _fmt_1c_datetime,
     add_origin_marker as _add_origin_marker,
     origin_token as _origin_token,
+    payload_hash as _payload_hash,
     post_document_operational as _post_document_operational,
     post_export_entries as _post_export_entries,
     upsert_sync_link as _upsert_sync_link,
 )
 from .one_c_document_numbers import production_order_number
+from .mrp_mutation_guard import MrpMutationLineageError, require_materialized_orders
 from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
 
@@ -115,6 +121,8 @@ class ProductionOrderExportEntry:
     number: str
     source_planned_order_id: Optional[int] = None
     source_run_id: Optional[int] = None
+    ledger_generation_id: Optional[int] = None
+    freeze_version: Optional[int] = None
     lines: List[ProductionOrderExportLine] = field(default_factory=list)
     materials: List[ProductionOrderExportMaterial] = field(default_factory=list)
     operations: List[ProductionOrderExportOperation] = field(default_factory=list)
@@ -122,6 +130,9 @@ class ProductionOrderExportEntry:
     product_structural_unit_ref1c: Optional[str] = None
     planned_start_date: Optional[Any] = None
     planned_finish_date: Optional[Any] = None
+    # The 1C document timestamp participates in the payload fingerprint.  It
+    # must therefore come from durable order data, never from the retry clock.
+    document_date: Optional[Any] = None
     target_ref_key: Optional[str] = None
     status: str = "planned"  # planned | created | existing | error | skipped
     error: Optional[str] = None
@@ -467,10 +478,40 @@ def _collect_export_entries(
                 product_structural_unit_ref1c=product_structural_unit_ref,
                 planned_start_date=min(start_dates) if start_dates else None,
                 planned_finish_date=max(finish_dates) if finish_dates else None,
+                document_date=order.order_date,
             )
         )
 
     return entries, skipped, warnings
+
+
+def _export_line_token(entry: ProductionOrderExportEntry, kind: str, axes: Dict[str, Any]) -> int:
+    """Versioned deterministic positive Int64 for 1C ``КлючСвязи``."""
+    if (
+        entry.ledger_generation_id is None or entry.source_run_id is None
+        or entry.freeze_version is None
+    ):
+        raise MrpMutationLineageError("production export has no accepted generation/run/freeze")
+    def norm(value: Any) -> Any:
+        if isinstance(value, Decimal):
+            return format(value.normalize(), "f") if value else "0"
+        if isinstance(value, (date, datetime)):
+            return value.isoformat()
+        if isinstance(value, float):
+            return format(Decimal(str(value)).normalize(), "f") if value else "0"
+        if isinstance(value, dict):
+            return {str(k): norm(v) for k, v in sorted(value.items())}
+        if isinstance(value, (list, tuple)):
+            return [norm(v) for v in value]
+        return value
+    payload = {
+        "v": 1, "kind": kind, "order": entry.order_id,
+        "generation": entry.ledger_generation_id, "run": entry.source_run_id,
+        "freeze": entry.freeze_version, "axes": axes,
+    }
+    canonical = json.dumps(norm(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    value = int.from_bytes(hashlib.sha256(canonical.encode("utf-8")).digest()[:8], "big") & ((1 << 63) - 1)
+    return value or 1
 
 
 def _build_header_payload(
@@ -484,9 +525,13 @@ def _build_header_payload(
     )
     products = []
     for ln in entry.lines:
-        product_link_key = int(ln.line_number or len(products) + 1)
+        product_link_key = _export_line_token(entry, "product", {
+            "item": ln.item_ref1c, "characteristic": ln.characteristic_ref1c or EMPTY_REF1C,
+            "unit": ln.unit_ref1c or "", "qty": ln.qty, "spec": ln.spec_ref1c or "",
+            "structural_unit": ln.structural_unit_ref1c or "",
+        })
         row: Dict[str, Any] = {
-            "LineNumber": product_link_key,
+            "LineNumber": int(ln.line_number or len(products) + 1),
             "Номенклатура_Key": ln.item_ref1c,
             "Количество": float(ln.qty),
             "КлючСвязи": product_link_key,
@@ -517,27 +562,50 @@ def _build_header_payload(
             row["Спецификация_Key"] = ln.spec_ref1c
         if ln.reserve_structural_unit_ref1c:
             row["СтруктурнаяЕдиница_Key"] = ln.reserve_structural_unit_ref1c
-        row["КлючСвязи"] = idx
+        row["КлючСвязи"] = _export_line_token(entry, "material", {
+            "item": ln.item_ref1c, "unit": ln.unit_ref1c or "", "qty": ln.qty,
+            "spec": ln.spec_ref1c or "", "reserve": ln.reserve_structural_unit_ref1c or "",
+        })
         stock_lines.append(row)
     operation_lines = []
     for idx, op in enumerate(entry.operations, start=1):
+        product_token = _export_line_token(entry, "product", {
+            "item": next((p.item_ref1c for p in entry.lines if int(p.line_number) == int(op.product_link_key or 0)), ""),
+            "characteristic": next((p.characteristic_ref1c or EMPTY_REF1C for p in entry.lines if int(p.line_number) == int(op.product_link_key or 0)), EMPTY_REF1C),
+            "unit": next((p.unit_ref1c or "" for p in entry.lines if int(p.line_number) == int(op.product_link_key or 0)), ""),
+            "qty": next((p.qty for p in entry.lines if int(p.line_number) == int(op.product_link_key or 0)), 0),
+            "spec": next((p.spec_ref1c or "" for p in entry.lines if int(p.line_number) == int(op.product_link_key or 0)), ""),
+            "structural_unit": next((p.structural_unit_ref1c or "" for p in entry.lines if int(p.line_number) == int(op.product_link_key or 0)), ""),
+        })
         row: Dict[str, Any] = {
             "LineNumber": idx,
             "Операция_Key": op.operation_ref1c,
             "КоличествоПлан": float(op.qty),
             "НормаВремени": float(op.time_norm),
             "Нормочасы": float(op.norm_hours),
-            "КлючСвязи": idx,
+            "КлючСвязи": _export_line_token(entry, "operation", {
+                "operation": op.operation_ref1c, "unit": op.unit_ref1c or "", "qty": op.qty,
+                "time_norm": op.time_norm, "norm_hours": op.norm_hours,
+                "structural_unit": op.structural_unit_ref1c or "", "product": product_token,
+            }),
         }
         if op.product_link_key:
-            row["КлючСвязиПродукция"] = int(op.product_link_key)
+            row["КлючСвязиПродукция"] = product_token
         _add_unit_payload(row, op.unit_ref1c)
         if op.structural_unit_ref1c:
             row["СтруктурнаяЕдиница_Key"] = op.structural_unit_ref1c
         elif defaults.operation_structural_unit_ref1c:
             row["СтруктурнаяЕдиница_Key"] = defaults.operation_structural_unit_ref1c
         operation_lines.append(row)
-    document_dt = _current_1c_datetime()
+    if entry.document_date is None:
+        raise MrpMutationLineageError(
+            "production order has no durable document date; export is blocked"
+        )
+    document_dt = _fmt_1c_datetime(entry.document_date)
+    if not document_dt:
+        raise MrpMutationLineageError(
+            "production order has no valid durable document date; export is blocked"
+        )
     payload: Dict[str, Any] = {
         "Number": entry.number,
         "Date": document_dt,
@@ -569,6 +637,12 @@ def _build_header_payload(
     payload["СтруктурнаяЕдиницаРезерв_Key"] = entry.reserve_structural_unit_ref1c or EMPTY_REF1C
     if entry.origin_token:
         payload["Комментарий"] = _add_origin_marker(payload["Комментарий"], entry.origin_token)
+    for table_name in ("Продукция", "Запасы", "Операции"):
+        tokens = [row.get("КлючСвязи") for row in payload.get(table_name, [])]
+        if any(not isinstance(token, int) or token <= 0 or token >= 2**63 for token in tokens):
+            raise MrpMutationLineageError(f"invalid 1C КлючСвязи in {table_name}")
+        if len(tokens) != len(set(tokens)):
+            raise MrpMutationLineageError(f"1C КлючСвязи collision in {table_name}")
     return payload
 
 
@@ -623,6 +697,53 @@ def _upsert_link(
         status=status,
         last_error=last_error,
     )
+    db.flush()
+    link = _existing_link(db, int(entry.order_id))
+    if link is None:
+        raise RuntimeError("production SyncLink upsert was not persisted")
+    if entry.ledger_generation_id is None:
+        raise MrpMutationLineageError("production SyncLink has no accepted Ledger generation")
+    if link.ledger_generation_id is not None and int(link.ledger_generation_id) != int(entry.ledger_generation_id):
+        raise RuntimeError("production SyncLink belongs to another Ledger generation")
+    link.ledger_generation_id = int(entry.ledger_generation_id)
+
+
+def _validate_existing_retry_link(
+    *,
+    entry: ProductionOrderExportEntry,
+    link: Optional[SyncLink],
+    expected_payload_hash: str,
+    order_ref1c: str,
+) -> Optional[str]:
+    """Return a verified 1C ref or fail before any client/DB mutation.
+
+    A legacy ``order_ref1c`` is not proof of what was sent to 1C.  Likewise a
+    SyncLink without the accepted generation or with another canonical payload
+    cannot safely be retried.  This deliberately refuses the tempting
+    "probably the same order" recovery path: the origin-marker recovery below
+    is the only network lookup allowed after this local proof succeeds.
+    """
+    if link is None:
+        if order_ref1c:
+            raise MrpMutationLineageError(
+                "production_orders.order_ref1c has no verifiable SyncLink; "
+                "legacy retry is blocked"
+            )
+        return None
+
+    link_ref = _clean_ref1c(link.target_ref_key)
+    # A link without a target ref is merely a prior failed attempt.  It cannot
+    # be accepted as an existing document, but its payload/generation still
+    # must agree before we can create or recover anything.
+    if link.ledger_generation_id is None:
+        raise MrpMutationLineageError("production SyncLink has no accepted Ledger generation")
+    if entry.ledger_generation_id is None or int(link.ledger_generation_id) != int(entry.ledger_generation_id):
+        raise MrpMutationLineageError("production SyncLink belongs to another Ledger generation")
+    if not link.payload_hash or str(link.payload_hash) != expected_payload_hash:
+        raise MrpMutationLineageError("production SyncLink payload does not match canonical export payload")
+    if order_ref1c and order_ref1c != link_ref:
+        raise MrpMutationLineageError("production_orders.order_ref1c disagrees with verified SyncLink")
+    return link_ref or None
 
 
 def export_production_orders_to_1c(
@@ -644,33 +765,90 @@ def export_production_orders_to_1c(
     base_url that doesn't look like a demo DB unless `allow_production=True`
     is also passed.
     """
+    selected_ids = sorted({int(order_id) for order_id in order_ids})
+    selected_orders = (
+        db.query(ProductionOrder)
+        .options(joinedload(ProductionOrder.products))
+        .filter(ProductionOrder.order_id.in_(selected_ids))
+        .all()
+    )
+    if {int(order.order_id) for order in selected_orders} != set(selected_ids):
+        raise MrpMutationLineageError(
+            "one or more selected production orders do not exist"
+        )
+    generation_id = require_materialized_orders(
+        db, selected_orders, consumer="one_c_production_order_export"
+    )
+    run_id = int(selected_orders[0].source_run_id) if selected_orders else None
+    run = db.get(PlanningRun, run_id) if run_id else None
+    if run is None or run.active_freeze_version is None:
+        raise MrpMutationLineageError("production export has no active planning freeze")
     entries, skipped, warnings = _collect_export_entries(db, list(order_ids))
+    for entry in entries:
+        entry.ledger_generation_id = int(generation_id)
+        entry.freeze_version = int(run.active_freeze_version)
 
-    # Pre-flight: split entries into eligible / already-linked.
+    config = _load_odata_config()
+    defaults = _export_defaults(config)
+
+    # Build every canonical payload *before* accepting any local success/no-op.
+    # A SyncLink is valid only for this exact immutable ledger generation and
+    # this exact full payload, including deterministic 1C line tokens.
+    # `comment_suffixes` lets a caller annotate a specific order's Комментарий
+    # without cloning the payload builder. `basis_order_refs` (order_id ->
+    # Ref_Key заказа-основания) sets the native 1С basis fields on the payload:
+    # Document_ЗаказНаПроизводство carries a dedicated typed reference
+    # ЗаказНаПроизводствоОснование_Key plus the generic composite
+    # ДокументОснование/_Type. Used by the paint→weld chain to open the
+    # сварка-заказ «на основании» окраска-заказа. Default None for both =>
+    # byte-for-byte prior behaviour.
+    suffixes = comment_suffixes or {}
+    basis_refs = basis_order_refs or {}
+    payloads_by_order: Dict[int, Dict[str, Any]] = {}
+    for entry in entries:
+        entry.origin_token = _entry_origin_token(db, entry)
+        payload = _build_header_payload(entry, defaults)
+        suffix = suffixes.get(int(entry.order_id))
+        if suffix:
+            payload["Комментарий"] = f"{payload['Комментарий']}; {suffix}"
+        basis_ref = _clean_ref1c(basis_refs.get(int(entry.order_id)))
+        if basis_ref:
+            payload["ЗаказНаПроизводствоОснование_Key"] = basis_ref
+            payload["ДокументОснование"] = basis_ref
+            payload["ДокументОснование_Type"] = f"StandardODATA.{PRODUCTION_ORDER_ENTITY}"
+        payloads_by_order[int(entry.order_id)] = {
+            "order_id": entry.order_id,
+            "number": entry.number,
+            "payload": payload,
+        }
+
+    # Pre-flight: no 1C client and no writes until every existing reference is
+    # proven to belong to the same accepted generation and canonical payload.
     eligible: List[ProductionOrderExportEntry] = []
     already_linked: List[ProductionOrderExportEntry] = []
     for entry in entries:
+        envelope = payloads_by_order[int(entry.order_id)]
+        expected_hash = _payload_hash(envelope["payload"])
         link = _existing_link(db, entry.order_id)
-        if link and link.status == "success" and (link.target_ref_key or ""):
-            entry.status = "existing"
-            entry.target_ref_key = str(link.target_ref_key)
-            entry.reason = "уже выгружен в 1С (sync_link)"
-            already_linked.append(entry)
-            continue
-        if link and _clean_ref1c(link.target_ref_key):
-            entry.target_ref_key = _clean_ref1c(link.target_ref_key)
-            entry.reason = "повторная отправка: 1С-документ уже был создан, обновляем реквизиты и проводим"
-        # Also treat orders with order_ref1c already set as existing — defensive
-        # for the case where sync_link wasn't populated by an older export.
         order_row = db.query(ProductionOrder).filter(ProductionOrder.order_id == entry.order_id).one()
-        if _clean_ref1c(order_row.order_ref1c):
+        verified_ref = _validate_existing_retry_link(
+            entry=entry,
+            link=link,
+            expected_payload_hash=expected_hash,
+            order_ref1c=_clean_ref1c(order_row.order_ref1c),
+        )
+        if link and link.status == "success" and verified_ref:
             entry.status = "existing"
-            entry.target_ref_key = _clean_ref1c(order_row.order_ref1c)
-            entry.reason = "production_orders.order_ref1c уже стоит"
+            entry.target_ref_key = verified_ref
+            entry.reason = "уже выгружен в 1С (проверенный sync_link)"
             already_linked.append(entry)
             continue
+        if verified_ref:
+            entry.target_ref_key = verified_ref
+            entry.reason = "повторная отправка: проверенный 1С-документ будет обновлён и проведён"
         eligible.append(entry)
 
+    payloads = [payloads_by_order[int(entry.order_id)] for entry in eligible]
     summary: Dict[str, Any] = {
         "status": "ok",
         "dry_run": bool(dry_run),
@@ -684,34 +862,6 @@ def export_production_orders_to_1c(
         "warnings": warnings,
         "entries": [],
     }
-
-    config = _load_odata_config()
-    defaults = _export_defaults(config)
-
-    # Build payloads for the dry-run preview.
-    # `comment_suffixes` lets a caller annotate a specific order's Комментарий
-    # without cloning the payload builder. `basis_order_refs` (order_id ->
-    # Ref_Key заказа-основания) sets the native 1С basis fields on the payload:
-    # Document_ЗаказНаПроизводство carries a dedicated typed reference
-    # ЗаказНаПроизводствоОснование_Key plus the generic composite
-    # ДокументОснование/_Type. Used by the paint→weld chain to open the
-    # сварка-заказ «на основании» окраска-заказа. Default None for both =>
-    # byte-for-byte prior behaviour.
-    suffixes = comment_suffixes or {}
-    basis_refs = basis_order_refs or {}
-    payloads: List[Dict[str, Any]] = []
-    for entry in eligible:
-        entry.origin_token = _entry_origin_token(db, entry)
-        payload = _build_header_payload(entry, defaults)
-        suffix = suffixes.get(int(entry.order_id))
-        if suffix:
-            payload["Комментарий"] = f"{payload['Комментарий']}; {suffix}"
-        basis_ref = _clean_ref1c(basis_refs.get(int(entry.order_id)))
-        if basis_ref:
-            payload["ЗаказНаПроизводствоОснование_Key"] = basis_ref
-            payload["ДокументОснование"] = basis_ref
-            payload["ДокументОснование_Type"] = f"StandardODATA.{PRODUCTION_ORDER_ENTITY}"
-        payloads.append({"order_id": entry.order_id, "number": entry.number, "payload": payload})
 
     if dry_run:
         summary["entries"] = [asdict(e) for e in entries]
@@ -749,7 +899,7 @@ def export_production_orders_to_1c(
         _upsert_link(
             db,
             entry=entry,
-            payload_hash="recovered-by-origin",
+            payload_hash=_payload_hash(envelope["payload"]),
             target_ref_key=ref_key,
             status="success",
             last_error=None,

@@ -1,15 +1,40 @@
 import datetime
 
 import pytest
+from sqlalchemy import event
 
+from app import models
 from app.models import Item, PlannedPurchase, PlanningRun, SyncLink, Unit
+from app.services.planning_truth import publish_generation
 import app.services.one_c_purchase_order_export as exporter
 from app.services.one_c_purchase_order_export import export_planned_purchases_to_1c
 
 
 def _mk_run(db) -> PlanningRun:
+    cutoff = datetime.datetime(2026, 5, 20, tzinfo=datetime.timezone.utc)
+    generation = models.LedgerGeneration(
+        generation_key=f"purchase-export-{id(db)}",
+        status="accepted",
+        cutoff=cutoff,
+        accepted_at=cutoff,
+        source_watermarks={},
+        capabilities={
+            "physical_ledger": True,
+            "reservation_replay": True,
+            "execution_allocations": True,
+        },
+        algorithm_version="test/1",
+        replay_version="test/1",
+        physical_import_batch=models.PhysicalImportBatch(
+            batch_key=f"purchase-export-batch-{id(db)}",
+            status="completed",
+            cutoff=cutoff,
+            source_watermarks={},
+        ),
+    )
+    publish_generation(db, generation)
     run = PlanningRun(
-        status="SUCCESS",
+        status="FIXED_SNAPSHOT",
         started_by="test",
         horizon_days=10,
         pinned=False,
@@ -19,9 +44,17 @@ def _mk_run(db) -> PlanningRun:
         kpi={},
         started_at=datetime.datetime.utcnow(),
         finished_at=datetime.datetime.utcnow(),
+        active_freeze_version=1,
+        ledger_generation_id=generation.id,
+        ledger_cutoff=cutoff,
     )
     db.add(run)
     db.flush()
+    def _stamp(_session, _flush_context, _instances):
+        for value in _session.new:
+            if isinstance(value, PlannedPurchase) and value.ledger_generation_id is None:
+                value.ledger_generation_id = generation.id
+    event.listen(db, "before_flush", _stamp)
     return run
 
 
@@ -292,7 +325,8 @@ def test_purchase_order_export_stamps_sync_links_for_source_purchases(db_session
             return []
 
         def post(self, *args, **kwargs):
-            return {"Ref_Key": "purchase-order-ref"}
+            payload = args[1] if len(args) > 1 else kwargs["payload"]
+            return {"Ref_Key": "purchase-order-ref", "Контрагент_Key": payload["Контрагент_Key"], "Запасы": payload["Запасы"]}
 
     monkeypatch.setattr(
         exporter,
@@ -305,6 +339,16 @@ def test_purchase_order_export_stamps_sync_links_for_source_purchases(db_session
 
     assert result["status"] == "ok"
     assert result["orders_created"] == 1
+    allocations = (
+        db.query(models.PurchaseExportLineAllocation)
+        .order_by(models.PurchaseExportLineAllocation.planned_purchase_id)
+        .all()
+    )
+    assert [row.planned_purchase_id for row in allocations] == [
+        first.purchase_id,
+        second.purchase_id,
+    ]
+    assert [float(row.allocated_qty) for row in allocations] == [2.0, 3.0]
     assert result["orders"][0]["lines"][0]["purchase_ids"] == [first.purchase_id, second.purchase_id]
     links = db.query(SyncLink).filter_by(source_doctype="planned_purchase").order_by(SyncLink.source_id).all()
     assert [link.source_id for link in links] == [first.purchase_id, second.purchase_id]
@@ -374,7 +418,7 @@ def test_purchase_order_export_creates_delta_order_after_old_filled_order(db_ses
             assert payload["Number"] == second_number
             assert payload["Запасы"][0]["Количество"] == 7.0
             self.__class__.posted_payload = payload
-            return {"Ref_Key": "delta-order-ref"}
+            return {"Ref_Key": "delta-order-ref", "Контрагент_Key": payload["Контрагент_Key"], "Запасы": payload["Запасы"]}
 
     monkeypatch.setattr(exporter, "_load_odata_config", lambda: {
         "base_url": "http://mtzdock/unf_demo/odata/standard.odata"
@@ -439,7 +483,7 @@ def test_purchase_order_export_recovers_exact_posted_batch_without_duplicate(db_
                 "Ref_Key": "retry-order-ref",
                 "Контрагент_Key": payload["Контрагент_Key"],
             }
-            return {"Ref_Key": "retry-order-ref"}
+            return {"Ref_Key": "retry-order-ref", "Контрагент_Key": payload["Контрагент_Key"], "Запасы": payload["Запасы"]}
 
     monkeypatch.setattr(exporter, "_load_odata_config", lambda: {
         "base_url": "http://mtzdock/unf_demo/odata/standard.odata"
@@ -506,6 +550,8 @@ def test_purchase_order_batch_token_is_independent_of_line_order():
         lines=[second, first],
     )
 
+    exporter._stamp_line_tokens(forward, run_id=10, generation_id=20, freeze_version=1)
+    exporter._stamp_line_tokens(reversed_group, run_id=10, generation_id=20, freeze_version=1)
     assert exporter._group_batch_token(forward) == exporter._group_batch_token(reversed_group)
 
 
@@ -521,9 +567,245 @@ def test_purchase_order_batch_token_ignores_local_ids_but_separates_real_delta()
             )],
         )
 
-    assert exporter._group_batch_token(group(purchase_id=1, item_id=2, qty=5)) == (
-        exporter._group_batch_token(group(purchase_id=9001, item_id=8002, qty=5))
+    first = group(purchase_id=1, item_id=2, qty=5)
+    other_local_id = group(purchase_id=9001, item_id=8002, qty=5)
+    changed_qty = group(purchase_id=1, item_id=2, qty=6)
+    for value in (first, other_local_id, changed_qty):
+        exporter._stamp_line_tokens(value, run_id=10, generation_id=20, freeze_version=1)
+    assert exporter._group_batch_token(first) == exporter._group_batch_token(other_local_id)
+    assert exporter._group_batch_token(first) != exporter._group_batch_token(changed_qty)
+
+
+def test_purchase_order_origin_batch_token_changes_with_generation():
+    def make_group():
+        return exporter.PurchaseOrderExportGroup(
+            supplier_ref1c="supplier-token", number="local-number",
+            lines=[exporter.PurchaseOrderExportLine(
+                purchase_ids=[1], item_id=2, item_ref1c="item-a", item_name="A",
+                item_article="A", unit_ref1c="unit-ref", unit_name="шт", qty=5,
+                need_date="2026-06-01", order_date="2026-05-27",
+            )],
+        )
+
+    first = make_group()
+    second = make_group()
+    exporter._stamp_line_tokens(first, run_id=10, generation_id=20, freeze_version=1)
+    exporter._stamp_line_tokens(second, run_id=10, generation_id=21, freeze_version=1)
+    assert exporter._group_batch_token(first) != exporter._group_batch_token(second)
+
+
+@pytest.mark.parametrize("mismatch", ["supplier", "date"])
+def test_exact_allocation_rejects_supplier_or_need_date_mismatch(db_session, mismatch):
+    group = exporter.PurchaseOrderExportGroup(
+        supplier_ref1c="supplier-exact", number="PP-1",
+        lines=[exporter.PurchaseOrderExportLine(
+            purchase_ids=[], item_id=1, item_ref1c="item-exact", item_name="A",
+            item_article="A", unit_ref1c="unit-exact", unit_name="шт", qty=5,
+            need_date="2026-06-01", order_date="2026-05-27",
+        )],
+        target_ref_key="exact-order-ref",
     )
-    assert exporter._group_batch_token(group(purchase_id=1, item_id=2, qty=5)) != (
-        exporter._group_batch_token(group(purchase_id=1, item_id=2, qty=6))
+    exporter._stamp_line_tokens(group, run_id=10, generation_id=20, freeze_version=1)
+    document = {
+        "Ref_Key": "exact-order-ref",
+        "Контрагент_Key": "supplier-exact",
+        "Запасы": [{
+            "LineNumber": 1,
+            "КлючСвязи": group.lines[0].request_line_token,
+            "Номенклатура_Key": "item-exact",
+            "Характеристика_Key": exporter.EMPTY_REF1C,
+            "ЕдиницаИзмерения": "unit-exact",
+            "Количество": 5,
+            "ДатаПоступления": "2026-06-01T00:00:00",
+        }],
+    }
+    if mismatch == "supplier":
+        document["Контрагент_Key"] = "supplier-other"
+        expected = "supplier header mismatch"
+    else:
+        document["Запасы"][0]["ДатаПоступления"] = "2026-06-02T00:00:00"
+        expected = "line payload mismatch"
+
+    with pytest.raises(RuntimeError, match=expected):
+        exporter._record_exact_line_allocations(
+            db_session, group=group, document=document, generation_id=20,
+        )
+
+
+def test_pending_sync_link_hash_mismatch_fails_before_client(db_session, monkeypatch):
+    db = db_session
+    item = Item(
+        item_code="PO-PENDING-LINK", item_name="A", item_article="A",
+        item_ref1c="item-pending", supplier_ref1c="supplier-pending",
+        replenishment_method="Покупка", status="active",
     )
+    db.add(item)
+    db.flush()
+    run = _mk_run(db)
+    purchase = PlannedPurchase(
+        run_id=run.run_id, item_id=item.item_id, requested_qty=5, planned_qty=5,
+        qty=5, need_date=datetime.date(2026, 6, 1), order_date=datetime.date(2026, 5, 27),
+        lead_time_days=5, bucket_date=datetime.date(2026, 6, 1),
+    )
+    db.add(purchase)
+    db.flush()
+    db.add(SyncLink(
+        source_doctype="planned_purchase", source_id=purchase.purchase_id,
+        target_entity=exporter.PURCHASE_ORDER_ENTITY, target_ref_key="possibly-posted",
+        payload_hash="bad" * 21 + "b", status="error",
+        ledger_generation_id=run.ledger_generation_id,
+    ))
+    db.commit()
+
+    class NoNetworkClient:
+        def __init__(self, **kwargs):
+            raise AssertionError("stale error link must fail before OData")
+
+    monkeypatch.setattr(exporter, "_load_odata_config", lambda: {
+        "base_url": "http://mtzdock/unf_demo/odata/standard.odata"
+    })
+    monkeypatch.setattr(exporter, "OData1CClient", NoNetworkClient)
+    with pytest.raises(RuntimeError, match="pending SyncLink payload changed"):
+        export_planned_purchases_to_1c(db, run.run_id, dry_run=False)
+
+
+def test_purchase_export_does_not_suppress_current_run_from_other_run_link(db_session):
+    db = db_session
+    item = Item(
+        item_code="PO-OTHER-RUN", item_name="A", item_article="A",
+        item_ref1c="item-other-run", supplier_ref1c="supplier-other-run",
+        replenishment_method="Покупка", status="active",
+    )
+    db.add(item)
+    db.flush()
+    other_run = _mk_run(db)
+    # Two runs can legitimately point at one accepted generation.  Do not add
+    # a second generation here: the test is about run scoping, not publication.
+    current_run = PlanningRun(
+        status="FIXED_SNAPSHOT", started_by="test", horizon_days=10, pinned=False,
+        config_snapshot={}, warnings=[], kpi={},
+        started_at=datetime.datetime.utcnow(), finished_at=datetime.datetime.utcnow(),
+        active_freeze_version=1, ledger_generation_id=other_run.ledger_generation_id,
+        ledger_cutoff=other_run.ledger_cutoff,
+    )
+    db.add(current_run)
+    db.flush()
+    other = PlannedPurchase(
+        run_id=other_run.run_id, item_id=item.item_id, requested_qty=3,
+        planned_qty=3, qty=3, need_date=datetime.date(2026, 6, 1),
+        order_date=datetime.date(2026, 5, 27), lead_time_days=5,
+        bucket_date=datetime.date(2026, 6, 1),
+    )
+    current = PlannedPurchase(
+        run_id=current_run.run_id, item_id=item.item_id, requested_qty=4,
+        planned_qty=4, qty=4, need_date=datetime.date(2026, 6, 2),
+        order_date=datetime.date(2026, 5, 28), lead_time_days=5,
+        bucket_date=datetime.date(2026, 6, 2),
+    )
+    db.add_all([other, current])
+    db.flush()
+    db.add(SyncLink(
+        source_doctype="planned_purchase", source_id=other.purchase_id,
+        target_entity=exporter.PURCHASE_ORDER_ENTITY, target_ref_key="other-ref",
+        payload_hash="x" * 64, status="success",
+        ledger_generation_id=other_run.ledger_generation_id,
+    ))
+    db.commit()
+
+    result = export_planned_purchases_to_1c(db, current_run.run_id, dry_run=True)
+
+    assert result["orders_planned"] == 1
+    assert result["already_exported_purchase_ids"] == []
+    assert result["orders"][0]["lines"][0]["purchase_ids"] == [current.purchase_id]
+
+
+def test_purchase_export_stable_success_retry_makes_no_client_calls(db_session, monkeypatch):
+    db = db_session
+    item = Item(
+        item_code="PO-STABLE-RETRY", item_name="A", item_article="A",
+        item_ref1c="item-stable", supplier_ref1c="supplier-stable",
+        replenishment_method="Покупка", status="active",
+    )
+    db.add(item)
+    db.flush()
+    run = _mk_run(db)
+    purchase = PlannedPurchase(
+        run_id=run.run_id, item_id=item.item_id, requested_qty=5, planned_qty=5,
+        qty=5, need_date=datetime.date(2026, 6, 1), order_date=datetime.date(2026, 5, 27),
+        lead_time_days=5, bucket_date=datetime.date(2026, 6, 1),
+    )
+    db.add(purchase)
+    db.commit()
+
+    class FirstClient:
+        def __init__(self, **kwargs):
+            pass
+        def get_all(self, *args, **kwargs):
+            return []
+        def post(self, entity, payload):
+            return {"Ref_Key": "stable-ref", "Контрагент_Key": payload["Контрагент_Key"], "Запасы": payload["Запасы"]}
+
+    monkeypatch.setattr(exporter, "_load_odata_config", lambda: {
+        "base_url": "http://mtzdock/unf_demo/odata/standard.odata"
+    })
+    monkeypatch.setattr(exporter, "OData1CClient", FirstClient)
+    export_planned_purchases_to_1c(db, run.run_id, dry_run=False)
+
+    class NoNetworkClient:
+        def __init__(self, **kwargs):
+            raise AssertionError("successful retry must not construct an OData client")
+
+    monkeypatch.setattr(exporter, "OData1CClient", NoNetworkClient)
+    result = export_planned_purchases_to_1c(db, run.run_id, dry_run=False)
+    assert result["orders_planned"] == 0
+    assert result["already_exported_purchase_ids"] == [purchase.purchase_id]
+
+
+@pytest.mark.parametrize("mutation", ["supplier", "item", "date"])
+def test_purchase_export_retry_mutated_axes_fail_before_client(db_session, monkeypatch, mutation):
+    db = db_session
+    item = Item(
+        item_code=f"PO-MUT-{mutation}", item_name="A", item_article="A",
+        item_ref1c="item-mutation", supplier_ref1c="supplier-mutation",
+        replenishment_method="Покупка", status="active",
+    )
+    db.add(item)
+    db.flush()
+    run = _mk_run(db)
+    purchase = PlannedPurchase(
+        run_id=run.run_id, item_id=item.item_id, requested_qty=5, planned_qty=5,
+        qty=5, need_date=datetime.date(2026, 6, 1), order_date=datetime.date(2026, 5, 27),
+        lead_time_days=5, bucket_date=datetime.date(2026, 6, 1),
+    )
+    db.add(purchase)
+    db.commit()
+
+    class FirstClient:
+        def __init__(self, **kwargs):
+            pass
+        def get_all(self, *args, **kwargs):
+            return []
+        def post(self, entity, payload):
+            return {"Ref_Key": f"mutation-{mutation}", "Контрагент_Key": payload["Контрагент_Key"], "Запасы": payload["Запасы"]}
+
+    monkeypatch.setattr(exporter, "_load_odata_config", lambda: {
+        "base_url": "http://mtzdock/unf_demo/odata/standard.odata"
+    })
+    monkeypatch.setattr(exporter, "OData1CClient", FirstClient)
+    export_planned_purchases_to_1c(db, run.run_id, dry_run=False)
+    if mutation == "supplier":
+        item.supplier_ref1c = "supplier-changed"
+    elif mutation == "item":
+        item.item_ref1c = "item-changed"
+    else:
+        purchase.need_date = datetime.date(2026, 6, 2)
+        purchase.bucket_date = datetime.date(2026, 6, 2)
+    db.commit()
+
+    class NoNetworkClient:
+        def __init__(self, **kwargs):
+            raise AssertionError("changed retry must fail before OData client construction")
+
+    monkeypatch.setattr(exporter, "OData1CClient", NoNetworkClient)
+    with pytest.raises(RuntimeError, match="payload changed|axes changed|reconstruct"):
+        export_planned_purchases_to_1c(db, run.run_id, dry_run=False)

@@ -1,19 +1,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
-from datetime import date
+from datetime import date, datetime
+from decimal import Decimal
+import hashlib
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
-from ..models import Item, PlannedPurchase, SyncLink, Unit
+from ..models import (
+    Item,
+    PlannedPurchase,
+    PurchaseExportLineAllocation,
+    SyncLink,
+    Unit,
+)
+from .mrp_mutation_guard import require_current_run, require_selected_proposals
 from .one_c_export_common import (
     add_origin_marker as _add_origin_marker,
     clean_ref1c as _clean_ref1c,
     create_odata_client as _create_odata_client,
     fmt_1c_datetime as _fmt_1c_datetime,
     find_document_by_origin as _find_document_by_origin,
-    payload_hash as _payload_hash,
     upsert_sync_link as _upsert_sync_link,
 )
 from .one_c_document_numbers import purchase_order_number
@@ -37,6 +46,9 @@ class PurchaseOrderExportLine:
     qty: float
     need_date: Optional[str]
     order_date: Optional[str]
+    purchase_qty_by_id: Dict[int, float] = field(default_factory=dict)
+    request_line_token: Optional[int] = None
+    export_line_payload_hash: Optional[str] = None
 
 
 @dataclass
@@ -73,23 +85,8 @@ def _collect_purchase_groups(
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     purchase_ids: Optional[List[int]] = None,
+    exclude_exported: bool = True,
 ) -> Tuple[List[PurchaseOrderExportGroup], List[Dict[str, Any]], List[int]]:
-    # Planned purchases already exported to 1C (successful SyncLink) must be
-    # excluded before grouping. Otherwise a later export of the full run
-    # regroups them and the positional numbering can hand a supplier a second
-    # order number — a duplicate supplier order in 1C. Their existing 1C order
-    # is left untouched.
-    already_exported: set[int] = {
-        int(pid)
-        for (pid,) in db.query(SyncLink.source_id)
-        .filter(
-            SyncLink.source_system == "PRODPLAN",
-            SyncLink.source_doctype == "planned_purchase",
-            SyncLink.target_entity == PURCHASE_ORDER_ENTITY,
-            SyncLink.status == "success",
-        )
-        .all()
-    }
     q = (
         db.query(
             PlannedPurchase.purchase_id,
@@ -119,6 +116,25 @@ def _collect_purchase_groups(
     if selected_ids:
         q = q.filter(PlannedPurchase.purchase_id.in_(selected_ids))
     q = q.order_by(PlannedPurchase.purchase_id.asc())
+
+    # Links are scoped to the exact candidate set.  A SyncLink is an external
+    # side effect, not a global suppression list: a link from another run or
+    # outside this requested window must not hide a proposal from this export.
+    candidate_ids = [int(row.purchase_id) for row in q.all()]
+    already_exported: set[int] = {
+        int(pid)
+        for (pid,) in db.query(SyncLink.source_id)
+        .join(PlannedPurchase, PlannedPurchase.purchase_id == SyncLink.source_id)
+        .filter(
+            SyncLink.source_system == "PRODPLAN",
+            SyncLink.source_doctype == "planned_purchase",
+            SyncLink.target_entity == PURCHASE_ORDER_ENTITY,
+            SyncLink.status == "success",
+            PlannedPurchase.run_id == int(run_id),
+            SyncLink.source_id.in_(candidate_ids or [-1]),
+        )
+        .all()
+    } if exclude_exported else set()
 
     missing: List[Dict[str, Any]] = []
     grouped: Dict[str, Dict[Tuple[int, str, Optional[str]], PurchaseOrderExportLine]] = {}
@@ -165,6 +181,7 @@ def _collect_purchase_groups(
             )
         supplier_bucket[key].purchase_ids.append(int(row.purchase_id))
         supplier_bucket[key].qty += qty
+        supplier_bucket[key].purchase_qty_by_id[int(row.purchase_id)] = qty
 
     groups: List[PurchaseOrderExportGroup] = []
     for idx, supplier_ref in enumerate(sorted(grouped.keys()), start=1):
@@ -180,6 +197,254 @@ def _collect_purchase_groups(
             )
         )
     return groups, missing, sorted(already_exported)
+
+
+def _verify_linked_retry_groups(
+    db: Session,
+    *,
+    run_id: int,
+    generation_id: int,
+    freeze_version: int,
+    exported_purchase_ids: List[int],
+) -> None:
+    """Fail closed before any OData call when a successful group is retried.
+
+    The current selected proposal may be only one member of a coalesced order,
+    so rebuild the *whole* saved target group from its SyncLinks.  Quantity is
+    not enough: supplier/item/unit/date and the immutable line token/hash must
+    all still describe the same obligation.
+    """
+    if not exported_purchase_ids:
+        return
+    seed_links = (
+        db.query(SyncLink)
+        .filter(
+            SyncLink.source_system == "PRODPLAN",
+            SyncLink.source_doctype == "planned_purchase",
+            SyncLink.target_entity == PURCHASE_ORDER_ENTITY,
+            SyncLink.status == "success",
+            SyncLink.source_id.in_(exported_purchase_ids),
+        )
+        .all()
+    )
+    by_target: Dict[str, List[SyncLink]] = {}
+    for link in seed_links:
+        target = _clean_ref1c(link.target_ref_key)
+        if not target or link.ledger_generation_id is None or not link.payload_hash:
+            raise RuntimeError("purchase export retry has legacy or incomplete SyncLink")
+        if int(link.ledger_generation_id) != int(generation_id):
+            raise RuntimeError("purchase export retry belongs to another Ledger generation")
+        by_target.setdefault(target, []).append(link)
+
+    for target_ref, seeds in by_target.items():
+        group_links = (
+            db.query(SyncLink)
+            .join(PlannedPurchase, PlannedPurchase.purchase_id == SyncLink.source_id)
+            .filter(
+                SyncLink.source_system == "PRODPLAN",
+                SyncLink.source_doctype == "planned_purchase",
+                SyncLink.target_entity == PURCHASE_ORDER_ENTITY,
+                SyncLink.status == "success",
+                SyncLink.target_ref_key == target_ref,
+                PlannedPurchase.run_id == int(run_id),
+            )
+            .all()
+        )
+        if not group_links:
+            raise RuntimeError("purchase export retry target has no current-run SyncLinks")
+        proposal_ids = sorted({int(link.source_id) for link in group_links})
+        groups, missing, _ = _collect_purchase_groups(
+            db, run_id, purchase_ids=proposal_ids, exclude_exported=False,
+        )
+        if missing or len(groups) != 1:
+            raise RuntimeError("purchase export retry cannot reconstruct one exact supplier group")
+        group = groups[0]
+        _stamp_line_tokens(
+            group, run_id=run_id, generation_id=generation_id, freeze_version=freeze_version,
+        )
+        expected_group_hash = _group_export_payload_hash(
+            group, run_id=run_id, generation_id=generation_id, freeze_version=freeze_version,
+        )
+        expected_by_purchase: Dict[int, PurchaseOrderExportLine] = {
+            int(purchase_id): line
+            for line in group.lines
+            for purchase_id in line.purchase_ids
+        }
+        if set(expected_by_purchase) != set(proposal_ids):
+            raise RuntimeError("purchase export retry has ambiguous proposal membership")
+        for link in group_links:
+            if (
+                link.ledger_generation_id is None
+                or int(link.ledger_generation_id) != int(generation_id)
+                or link.payload_hash != expected_group_hash
+                or _clean_ref1c(link.target_ref_key) != target_ref
+            ):
+                raise RuntimeError("purchase export retry group payload changed")
+            expected = expected_by_purchase[int(link.source_id)]
+            allocations = (
+                db.query(PurchaseExportLineAllocation)
+                .filter_by(
+                    ledger_generation_id=int(generation_id),
+                    planned_purchase_id=int(link.source_id),
+                )
+                .all()
+            )
+            if len(allocations) != 1:
+                raise RuntimeError("purchase export retry has ambiguous exact line allocation")
+            allocation = allocations[0]
+            expected_qty = expected.purchase_qty_by_id[int(link.source_id)]
+            if (
+                _clean_ref1c(allocation.supplier_order_ref) != target_ref
+                or abs(float(allocation.allocated_qty) - float(expected_qty)) > 1e-6
+                or allocation.request_line_token != expected.request_line_token
+                or allocation.export_line_payload_hash != expected.export_line_payload_hash
+            ):
+                raise RuntimeError("purchase export retry allocation axes changed")
+
+
+def _verify_pending_candidate_links(
+    db: Session,
+    *,
+    run_id: int,
+    generation_id: int,
+    freeze_version: int,
+    groups: List[PurchaseOrderExportGroup],
+) -> None:
+    """Reject stale planned/error links before they can reach 1C again."""
+    group_by_purchase = {
+        int(purchase_id): group
+        for group in groups
+        for line in group.lines
+        for purchase_id in line.purchase_ids
+    }
+    if not group_by_purchase:
+        return
+    links = (
+        db.query(SyncLink)
+        .join(PlannedPurchase, PlannedPurchase.purchase_id == SyncLink.source_id)
+        .filter(
+            SyncLink.source_system == "PRODPLAN",
+            SyncLink.source_doctype == "planned_purchase",
+            SyncLink.target_entity == PURCHASE_ORDER_ENTITY,
+            PlannedPurchase.run_id == int(run_id),
+            SyncLink.source_id.in_(list(group_by_purchase)),
+        )
+        .all()
+    )
+    for link in links:
+        # Successful links were removed from ``groups`` and are checked by the
+        # exact-allocation retry verifier.  Every other persisted state could
+        # be a post-success/local-failure window and must be equally immutable.
+        if link.status == "success":
+            continue
+        group = group_by_purchase[int(link.source_id)]
+        expected_hash = _group_export_payload_hash(
+            group, run_id=run_id, generation_id=generation_id, freeze_version=freeze_version,
+        )
+        if (
+            link.ledger_generation_id is None
+            or int(link.ledger_generation_id) != int(generation_id)
+            or not link.payload_hash
+            or link.payload_hash != expected_hash
+        ):
+            raise RuntimeError("purchase export pending SyncLink payload changed or is legacy")
+
+
+def _canonical_value(value: Any) -> Any:
+    """Canonical JSON primitive used for durable 1C line identity."""
+    if isinstance(value, Decimal):
+        return format(value.normalize(), "f") if value else "0"
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    if isinstance(value, float):
+        return format(Decimal(str(value)).normalize(), "f") if value else "0"
+    if isinstance(value, dict):
+        return {str(k): _canonical_value(v) for k, v in sorted(value.items())}
+    if isinstance(value, (list, tuple)):
+        return [_canonical_value(v) for v in value]
+    return value
+
+
+def _canonical_hash(payload: Dict[str, Any]) -> str:
+    encoded = json.dumps(_canonical_value(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _positive_63bit_token(payload: Dict[str, Any]) -> int:
+    value = int.from_bytes(hashlib.sha256(
+        json.dumps(_canonical_value(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).digest()[:8], "big") & ((1 << 63) - 1)
+    return value or 1
+
+
+def _canonical_group_payload(
+    group: PurchaseOrderExportGroup, *, run_id: int, generation_id: int, freeze_version: int,
+) -> Dict[str, Any]:
+    """The immutable business identity of one supplier-order delta.
+
+    Deliberately excludes document number/ref, SyncLink status and errors: all
+    of those change during retries and must never alter the obligation hash.
+    """
+    lines = [
+        {
+            "item": line.item_ref1c,
+            "characteristic": EMPTY_REF1C,
+            "unit": line.unit_ref1c or line.unit_name,
+            "qty": line.qty,
+            "need_date": line.need_date,
+            "order_date": line.order_date,
+        }
+        for line in group.lines
+    ]
+    lines.sort(key=lambda line: (
+        str(line["item"] or ""), str(line["unit"] or ""),
+        str(line["need_date"] or ""), str(line["order_date"] or ""), str(line["qty"]),
+    ))
+    return {
+        "v": 2,
+        "kind": "purchase_export_group",
+        "run": int(run_id),
+        "generation": int(generation_id),
+        "freeze": int(freeze_version),
+        "supplier": group.supplier_ref1c,
+        "lines": lines,
+    }
+
+
+def _group_export_payload_hash(
+    group: PurchaseOrderExportGroup, *, run_id: int, generation_id: int, freeze_version: int,
+) -> str:
+    return _canonical_hash(_canonical_group_payload(
+        group, run_id=run_id, generation_id=generation_id, freeze_version=freeze_version,
+    ))
+
+
+def _stamp_line_tokens(
+    group: PurchaseOrderExportGroup, *, run_id: int, generation_id: int, freeze_version: int,
+) -> None:
+    """Assign a versioned, deterministic positive Int64 to every outgoing 1C line.
+
+    A collision is a hard pre-network error: otherwise a supplier receipt can
+    never be reconciled to one exact planning obligation.
+    """
+    batch = _group_export_payload_hash(
+        group, run_id=run_id, generation_id=generation_id, freeze_version=freeze_version,
+    )
+    seen: set[int] = set()
+    for line in group.lines:
+        axes = {
+            "v": 2, "kind": "purchase_export_line", "group": batch,
+            "generation": generation_id, "run": run_id, "freeze": freeze_version,
+            "supplier": group.supplier_ref1c, "item": line.item_ref1c,
+            "characteristic": EMPTY_REF1C, "unit": line.unit_ref1c or line.unit_name,
+            "qty": line.qty, "need_date": line.need_date, "order_date": line.order_date,
+        }
+        token = _positive_63bit_token(axes)
+        if token in seen:
+            raise RuntimeError("1C КлючСвязи collision inside purchase export group")
+        seen.add(token)
+        line.request_line_token = token
+        line.export_line_payload_hash = _canonical_hash(axes)
 
 
 def _order_lines_payload(ref_key: str, group: PurchaseOrderExportGroup) -> List[Dict[str, Any]]:
@@ -203,7 +468,7 @@ def _order_lines_payload(ref_key: str, group: PurchaseOrderExportGroup) -> List[
             "ЗаказПокупателя_Key": EMPTY_REF1C,
             "СтруктурнаяЕдиницаРезерв_Key": EMPTY_REF1C,
             "НоменклатураПоставщика_Key": EMPTY_REF1C,
-            "КлючСвязи": 0,
+            "КлючСвязи": line.request_line_token,
         }
         if line.unit_ref1c:
             row["ЕдиницаИзмерения"] = line.unit_ref1c
@@ -232,6 +497,7 @@ def _upsert_purchase_links(
     target_ref_key: Optional[str],
     status: str,
     last_error: Optional[str],
+    generation_id: int,
 ) -> None:
     for purchase_id in _purchase_ids_for_group(group):
         _upsert_sync_link(
@@ -246,6 +512,103 @@ def _upsert_purchase_links(
             status=status,
             last_error=last_error,
         )
+        db.flush()
+        link = (
+            db.query(SyncLink)
+            .filter_by(source_system="PRODPLAN", source_doctype="planned_purchase",
+                       source_id=int(purchase_id), target_entity=PURCHASE_ORDER_ENTITY)
+            .one()
+        )
+        if link.ledger_generation_id is not None and int(link.ledger_generation_id) != int(generation_id):
+            raise RuntimeError("purchase SyncLink belongs to another Ledger generation")
+        link.ledger_generation_id = int(generation_id)
+
+
+def _record_exact_line_allocations(
+    db: Session,
+    *,
+    group: PurchaseOrderExportGroup,
+    document: Dict[str, Any],
+    generation_id: int,
+) -> None:
+    """Persist the exact 1C line identity; never infer it on a later sync."""
+    if _clean_ref1c(document.get("Контрагент_Key")) != group.supplier_ref1c:
+        raise RuntimeError("1C purchase export returned a supplier header mismatch")
+    returned = document.get("Запасы")
+    if not isinstance(returned, list) or len(returned) != len(group.lines):
+        raise RuntimeError(
+            "1C purchase export did not return exact order lines; "
+            "cannot persist PurchaseExportLineAllocation"
+        )
+    supplier_order_ref = _clean_ref1c(document.get("Ref_Key")) or group.target_ref_key
+    if not supplier_order_ref:
+        raise RuntimeError("1C purchase export did not return exact order Ref_Key")
+    expected_by_token = {line.request_line_token: line for line in group.lines}
+    if None in expected_by_token or len(expected_by_token) != len(group.lines):
+        raise RuntimeError("purchase export line token was not built uniquely")
+    exact_rows: List[Tuple[PurchaseOrderExportLine, str]] = []
+    for actual in returned:
+        token = actual.get("КлючСвязи")
+        try:
+            expected = expected_by_token.pop(int(token))
+        except (TypeError, ValueError, KeyError):
+            raise RuntimeError("1C purchase export returned unknown or duplicate КлючСвязи")
+        line_no = actual.get("LineNumber")
+        if line_no is None:
+            raise RuntimeError("1C purchase export line has no exact LineNumber")
+        actual_unit = _clean_ref1c(actual.get("ЕдиницаИзмерения"))
+        expected_unit = expected.unit_ref1c or expected.unit_name
+        raw_characteristic = str(actual.get("Характеристика_Key") or "").strip()
+        raw_need_date = str(actual.get("ДатаПоступления") or "").strip()
+        try:
+            actual_need_date = datetime.fromisoformat(
+                raw_need_date.replace("Z", "+00:00")
+            ).date().isoformat()
+        except ValueError:
+            actual_need_date = ""
+        if (
+            _clean_ref1c(actual.get("Номенклатура_Key")) != expected.item_ref1c
+            or raw_characteristic != EMPTY_REF1C
+            or abs(float(actual.get("Количество") or 0) - float(expected.qty)) > 1e-6
+            or actual_unit != expected_unit
+            or actual_need_date != (expected.need_date or "")
+        ):
+            raise RuntimeError("1C purchase export returned a line payload mismatch")
+        exact_rows.append((expected, str(line_no)))
+    if expected_by_token:
+        raise RuntimeError("1C purchase export did not return every request line token")
+
+    for expected, line_no in exact_rows:
+        for purchase_id, qty in expected.purchase_qty_by_id.items():
+            existing = (
+                db.query(PurchaseExportLineAllocation)
+                .filter_by(
+                    ledger_generation_id=generation_id,
+                    supplier_order_ref=supplier_order_ref,
+                    supplier_order_line_no=line_no,
+                    planned_purchase_id=int(purchase_id),
+                )
+                .one_or_none()
+            )
+            if existing is not None:
+                if (
+                    abs(float(existing.allocated_qty) - float(qty)) > 1e-6
+                    or existing.request_line_token != int(expected.request_line_token)
+                    or existing.export_line_payload_hash != expected.export_line_payload_hash
+                ):
+                    raise RuntimeError("purchase export allocation retry payload changed")
+                continue
+            db.add(
+                PurchaseExportLineAllocation(
+                    ledger_generation_id=generation_id,
+                    supplier_order_ref=supplier_order_ref,
+                    supplier_order_line_no=line_no,
+                    planned_purchase_id=int(purchase_id),
+                    allocated_qty=float(qty),
+                    request_line_token=int(expected.request_line_token),
+                    export_line_payload_hash=expected.export_line_payload_hash,
+                )
+            )
 
 
 def _has_stock_lines(doc: Dict[str, Any]) -> bool:
@@ -254,35 +617,16 @@ def _has_stock_lines(doc: Dict[str, Any]) -> bool:
 
 
 def _group_batch_token(group: PurchaseOrderExportGroup) -> str:
-    """Identify the exact delta independently of the 1C document number.
-
-    The token lets a retry recover after 1C accepted the document but the local
-    SyncLink transaction did not commit. Local ids are deliberately excluded:
-    independent databases assign different ids to the same planning delta. The
-    current schema has no durable delta UUID, so two genuinely separate deltas
-    with identical supplier/line/date/quantity axes remain indistinguishable.
-    """
-    lines = [
-        {
-            "item_ref1c": line.item_ref1c,
-            "unit_ref1c": line.unit_ref1c,
-            "unit_name": line.unit_name,
-            "qty": float(line.qty or 0.0),
-            "need_date": line.need_date,
-            "order_date": line.order_date,
-        }
-        for line in group.lines
-    ]
-    lines.sort(
-        key=lambda line: (
-            line["item_ref1c"] or "",
-            line["unit_ref1c"] or "",
-            line["unit_name"] or "",
-            line["need_date"] or "",
-            line["order_date"] or "",
-        )
-    )
-    return _payload_hash({"supplier_ref1c": group.supplier_ref1c, "lines": lines})
+    """Generation-bound 1C recovery key built from stamped line obligations."""
+    tokens = [line.request_line_token for line in group.lines]
+    if not tokens or any(token is None for token in tokens) or len(set(tokens)) != len(tokens):
+        raise RuntimeError("purchase origin batch requires uniquely stamped export lines")
+    return _canonical_hash({
+        "v": 3,
+        "kind": "purchase_origin_batch",
+        "supplier": group.supplier_ref1c,
+        "request_line_tokens": sorted(int(token) for token in tokens),
+    })
 
 
 def _order_comment(run_id: int, group: PurchaseOrderExportGroup) -> str:
@@ -351,12 +695,52 @@ def export_planned_purchases_to_1c(
     dry_run: bool = False,
     allow_production: bool = False,
 ) -> Dict[str, Any]:
+    run, generation_id = require_current_run(
+        db, int(run_id), consumer="one_c_purchase_order_export"
+    )
+    proposal_query = db.query(PlannedPurchase).filter(
+        PlannedPurchase.run_id == int(run_id)
+    )
+    selected_ids = sorted({int(pid) for pid in (purchase_ids or [])})
+    if selected_ids:
+        proposal_query = proposal_query.filter(
+            PlannedPurchase.purchase_id.in_(selected_ids)
+        )
+    proposals = proposal_query.all()
+    if selected_ids and {int(row.purchase_id) for row in proposals} != set(selected_ids):
+        raise ValueError("one or more selected planned purchases do not exist in the run")
+    require_selected_proposals(
+        db,
+        proposals,
+        run=run,
+        generation_id=generation_id,
+        consumer="one_c_purchase_order_export",
+    )
     groups, skipped_rows, already_exported_ids = _collect_purchase_groups(
         db,
         run_id,
         date_from=date_from,
         date_to=date_to,
         purchase_ids=purchase_ids,
+    )
+    for group in groups:
+        _stamp_line_tokens(
+            group, run_id=int(run.run_id), generation_id=int(generation_id),
+            freeze_version=int(run.active_freeze_version),
+        )
+    _verify_pending_candidate_links(
+        db,
+        run_id=int(run.run_id),
+        generation_id=int(generation_id),
+        freeze_version=int(run.active_freeze_version),
+        groups=groups,
+    )
+    _verify_linked_retry_groups(
+        db,
+        run_id=int(run.run_id),
+        generation_id=int(generation_id),
+        freeze_version=int(run.active_freeze_version),
+        exported_purchase_ids=already_exported_ids,
     )
     if dry_run:
         return {
@@ -369,6 +753,22 @@ def export_planned_purchases_to_1c(
             "skipped_rows": skipped_rows,
             "already_exported_purchase_ids": already_exported_ids,
             "orders": [asdict(g) for g in groups],
+        }
+
+    # All selected proposals already have an exact immutable allocation.  A
+    # no-op retry must not even construct an OData client (important over the
+    # remote tunnel, and proves this path cannot mutate 1C).
+    if not groups:
+        return {
+            "status": "ok",
+            "dry_run": False,
+            "orders_planned": 0,
+            "orders_created": 0,
+            "orders_existing": 0,
+            "lines_total": 0,
+            "skipped_rows": skipped_rows,
+            "already_exported_purchase_ids": already_exported_ids,
+            "orders": [],
         }
 
     client = _create_odata_client(
@@ -398,13 +798,29 @@ def export_planned_purchases_to_1c(
                 else:
                     group.status = "existing"
                     existing += 1
+                exact_doc = _find_document_by_origin(
+                    client,
+                    entity=PURCHASE_ORDER_ENTITY,
+                    token=_group_batch_token(group)[:32],
+                    select_fields=["Ref_Key", "Контрагент_Key", "Запасы"],
+                )
+                _record_exact_line_allocations(
+                    db,
+                    group=group,
+                    document=exact_doc or existing_doc,
+                    generation_id=generation_id,
+                )
                 _upsert_purchase_links(
                     db,
                     group,
-                    payload_hash=_payload_hash(asdict(group)),
+                    payload_hash=_group_export_payload_hash(
+                        group, run_id=int(run.run_id), generation_id=int(generation_id),
+                        freeze_version=int(run.active_freeze_version),
+                    ),
                     target_ref_key=group.target_ref_key,
                     status="success",
                     last_error=None,
+                    generation_id=generation_id,
                 )
                 continue
 
@@ -424,13 +840,34 @@ def export_planned_purchases_to_1c(
             if not ref_key:
                 raise RuntimeError(f"1C did not return Ref_Key for {group.number}")
             group.target_ref_key = ref_key
+            exact_doc = created_header
+            if not isinstance(exact_doc.get("Запасы"), list):
+                exact_doc = (
+                    _find_document_by_origin(
+                        client,
+                        entity=PURCHASE_ORDER_ENTITY,
+                        token=_group_batch_token(group)[:32],
+                        select_fields=["Ref_Key", "Контрагент_Key", "Запасы"],
+                    )
+                    or created_header
+                )
+            _record_exact_line_allocations(
+                db,
+                group=group,
+                document=exact_doc,
+                generation_id=generation_id,
+            )
             _upsert_purchase_links(
                 db,
                 group,
-                payload_hash=_payload_hash(header_payload),
+                payload_hash=_group_export_payload_hash(
+                    group, run_id=int(run.run_id), generation_id=int(generation_id),
+                    freeze_version=int(run.active_freeze_version),
+                ),
                 target_ref_key=ref_key,
                 status="success",
                 last_error=None,
+                generation_id=generation_id,
             )
 
             group.status = "created"
@@ -441,10 +878,14 @@ def export_planned_purchases_to_1c(
             _upsert_purchase_links(
                 db,
                 group,
-                payload_hash=_payload_hash(asdict(group)),
+                payload_hash=_group_export_payload_hash(
+                    group, run_id=int(run.run_id), generation_id=int(generation_id),
+                    freeze_version=int(run.active_freeze_version),
+                ),
                 target_ref_key=group.target_ref_key,
                 status="error",
                 last_error=group.error,
+                generation_id=generation_id,
             )
             try:
                 print(f"[1C purchase export] {group.number} failed: {group.error}")

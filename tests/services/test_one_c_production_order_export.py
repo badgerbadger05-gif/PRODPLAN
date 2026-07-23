@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from app import models
 from app.models import (
     DefaultSpecification,
     Item,
@@ -37,6 +38,7 @@ from app.models import (
     SyncLink,
 )
 from app.services import one_c_production_order_export as exporter
+from app.services.planning_truth import publish_generation
 
 
 # -----------------------------
@@ -45,7 +47,35 @@ from app.services import one_c_production_order_export as exporter
 
 
 def _mk_run(db) -> PlanningRun:
-    run = PlanningRun(status="DONE", config_snapshot=json.dumps({}))
+    cutoff = _dt.datetime(2026, 5, 20, tzinfo=_dt.timezone.utc)
+    generation = models.LedgerGeneration(
+        generation_key=f"production-export-{id(db)}",
+        status="accepted",
+        cutoff=cutoff,
+        accepted_at=cutoff,
+        source_watermarks={},
+        capabilities={
+            "physical_ledger": True,
+            "reservation_replay": True,
+            "execution_allocations": True,
+        },
+        algorithm_version="test/1",
+        replay_version="test/1",
+        physical_import_batch=models.PhysicalImportBatch(
+            batch_key=f"production-export-batch-{id(db)}",
+            status="completed",
+            cutoff=cutoff,
+            source_watermarks={},
+        ),
+    )
+    publish_generation(db, generation)
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot=json.dumps({}),
+        active_freeze_version=1,
+        ledger_generation_id=generation.id,
+        ledger_cutoff=cutoff,
+    )
     db.add(run)
     db.flush()
     return run
@@ -67,6 +97,19 @@ def _mk_item(db, *, code: str, ref1c: str) -> Item:
 
 
 def _mk_mrp_order(db, item, *, run_id: int, qty=5, deletion=False) -> ProductionOrder:
+    run = db.get(PlanningRun, run_id)
+    proposal = PlannedOrder(
+        run_id=run_id,
+        item_id=item.item_id,
+        requested_qty=qty,
+        planned_qty=qty,
+        qty=qty,
+        need_date=_dt.date(2026, 5, 25),
+        bucket_date=_dt.date(2026, 5, 25),
+        ledger_generation_id=run.ledger_generation_id,
+    )
+    db.add(proposal)
+    db.flush()
     order = ProductionOrder(
         order_number=f"MRP-{run_id}-{item.item_id}",
         order_date=datetime(2026, 5, 20),
@@ -86,6 +129,8 @@ def _mk_mrp_order(db, item, *, run_id: int, qty=5, deletion=False) -> Production
             quantity=qty,
             produced_qty=0,
             remaining_qty=qty,
+            source_planned_order_id=proposal.order_id,
+            ledger_generation_id=run.ledger_generation_id,
         )
     )
     db.commit()
@@ -242,15 +287,19 @@ def test_dry_run_payload_includes_materials_operations_and_reserve_warehouse(db_
     result = exporter.export_production_orders_to_1c(db, [order.order_id], dry_run=True)
     payload = result["payloads"][0]["payload"]
 
-    assert payload["Date"] == "2026-05-27T09:58:40"
+    # The document date is durable order data, so a retry produces the same
+    # canonical full payload rather than a new hash every second.
+    assert payload["Date"] == "2026-05-20T00:00:00"
     assert payload["Старт"] == "2026-06-12T10:58:40"
     assert payload["Финиш"] == "2026-06-13T10:58:40"
     assert payload["СтруктурнаяЕдиницаРезерв_Key"] == "workshop-warehouse-ref"
     assert payload["СтруктурнаяЕдиницаПродукции_Key"] == "production-warehouse-ref"
     [prod_row] = payload["Продукция"]
+    assert prod_row["LineNumber"] == 1
     assert prod_row["СтруктурнаяЕдиница_Key"] == "production-warehouse-ref"
     assert prod_row["Спецификация_Key"] == "spec-ref"
-    assert prod_row["КлючСвязи"] == 1
+    assert isinstance(prod_row["КлючСвязи"], int)
+    assert 0 < prod_row["КлючСвязи"] < 2**63
     [stock_row] = payload["Запасы"]
     assert stock_row["Номенклатура_Key"] == component.item_ref1c
     assert stock_row["Количество"] == 6.0
@@ -263,7 +312,7 @@ def test_dry_run_payload_includes_materials_operations_and_reserve_warehouse(db_
     assert operation_row["НормаВремени"] == 0.5
     assert operation_row["Нормочасы"] == 1.5
     assert operation_row["СтруктурнаяЕдиница_Key"] == "production-warehouse-ref"
-    assert operation_row["КлючСвязиПродукция"] == 1
+    assert operation_row["КлючСвязиПродукция"] == prod_row["КлючСвязи"]
     assert payload["ЗапланированыОперации"] is True
 
 
@@ -385,7 +434,7 @@ def test_empty_local_link_recovers_document_from_1c_origin_marker(db_session, mo
     ).one().target_ref_key == "cross-instance-ref"
 
 
-def test_existing_error_link_with_ref_patches_not_posts_duplicate(db_session, monkeypatch):
+def test_legacy_error_link_with_ref_fails_closed_before_network(db_session, monkeypatch):
     db = db_session
     item = _mk_item(db, code="P4R", ref1c="44444444-4444-4444-4444-44444444444a")
     run = _mk_run(db)
@@ -406,20 +455,67 @@ def test_existing_error_link_with_ref_patches_not_posts_duplicate(db_session, mo
     db.commit()
 
     _stub_odata_config(monkeypatch, base_url="http://demo/odata/unf_demo")
-    fake = _FakeClient(ref_key="new-ref-should-not-be-used")
-    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+    monkeypatch.setattr(
+        exporter,
+        "OData1CClient",
+        lambda **_: pytest.fail("legacy retry must fail before creating a network client"),
+    )
 
-    result = exporter.export_production_orders_to_1c(db, [order.order_id], dry_run=False)
+    with pytest.raises(exporter.MrpMutationLineageError, match="accepted Ledger generation"):
+        exporter.export_production_orders_to_1c(db, [order.order_id], dry_run=False)
 
-    assert result["orders_created"] == 1
-    assert fake.posts == []
-    assert len(fake.patches) == 1
-    assert fake.patches[0][0] == "Document_ЗаказНаПроизводство(guid'existing-order-ref')"
-    assert fake.operations == [
-        "Document_ЗаказНаПроизводство(guid'existing-order-ref')/Post?PostingModeOperational=true"
-    ]
+    db.refresh(order)
+    assert order.order_ref1c is None
+    assert db.query(SyncLink).filter_by(source_id=order.order_id).one().payload_hash == "old-hash"
+
+
+def test_mismatched_retry_payload_fails_closed_before_network(db_session, monkeypatch):
+    db = db_session
+    item = _mk_item(db, code="P4M", ref1c="44444444-4444-4444-4444-44444444444b")
+    run = _mk_run(db)
+    order = _mk_mrp_order(db, item, run_id=run.run_id)
+
+    db.add(SyncLink(
+        source_system="PRODPLAN",
+        source_doctype="production_order",
+        source_id=order.order_id,
+        target_system="1C",
+        target_entity=exporter.PRODUCTION_ORDER_ENTITY,
+        target_number="PP-MISMATCH",
+        payload_hash="not-the-canonical-payload",
+        target_ref_key="existing-order-ref",
+        status="success",
+        ledger_generation_id=run.ledger_generation_id,
+    ))
+    order.order_ref1c = "existing-order-ref"
+    db.commit()
+
+    _stub_odata_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    monkeypatch.setattr(
+        exporter,
+        "OData1CClient",
+        lambda **_: pytest.fail("mismatched retry must fail before creating a network client"),
+    )
+
+    with pytest.raises(exporter.MrpMutationLineageError, match="canonical export payload"):
+        exporter.export_production_orders_to_1c(db, [order.order_id], dry_run=False)
+
     db.refresh(order)
     assert order.order_ref1c == "existing-order-ref"
+
+
+def test_missing_durable_order_date_fails_before_payload_hash():
+    entry = exporter.ProductionOrderExportEntry(
+        order_id=1,
+        number="PP-MISSING-DATE",
+        source_run_id=1,
+        ledger_generation_id=1,
+        freeze_version=1,
+        document_date=None,
+    )
+
+    with pytest.raises(exporter.MrpMutationLineageError, match="durable document date"):
+        exporter._build_header_payload(entry)
 
 
 def test_skipped_rows_for_invalid_orders(db_session, monkeypatch):
@@ -470,18 +566,12 @@ def test_skipped_rows_for_invalid_orders(db_session, monkeypatch):
     fake = _FakeClient()
     monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
 
-    result = exporter.export_production_orders_to_1c(
-        db,
-        [order_1c.order_id, order_del.order_id, order_noref.order_id, 999_999],
-        dry_run=False,
-    )
-    assert result["orders_eligible"] == 0
-    assert result["orders_created"] == 0
-    skip_reasons = [r["reason"] for r in result["skipped_rows"]]
-    assert any("source='1c'" in s for s in skip_reasons)
-    assert any("deletion_mark" in s for s in skip_reasons)
-    assert any("item_ref1c" in s for s in skip_reasons)
-    assert any("не найден" in s for s in skip_reasons)
+    with pytest.raises(ValueError, match="do not exist"):
+        exporter.export_production_orders_to_1c(
+            db,
+            [order_1c.order_id, order_del.order_id, order_noref.order_id, 999_999],
+            dry_run=False,
+        )
     assert fake.posts == []
 
 

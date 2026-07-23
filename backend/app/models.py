@@ -128,6 +128,94 @@ class LedgerBuildBatch(Base):
     ledger_generation = relationship("LedgerGeneration")
 
 
+class LedgerFutureSupply(Base):
+    """Immutable, generation-scoped snapshot of supply available after cutoff.
+
+    This is deliberately a captured source fact, not an MRP proposal.  Future
+    WIP and supplier-order coverage therefore remains auditable against the
+    precise Ledger generation which consumed it.
+    """
+
+    __tablename__ = "ledger_future_supply"
+    __table_args__ = (
+        UniqueConstraint(
+            "ledger_generation_id",
+            "supply_kind",
+            "source_ref",
+            "source_line_ref",
+            name="uq_ledger_future_supply_generation_source_line",
+        ),
+        CheckConstraint(
+            "supply_kind IN ('wip_order', 'supplier_order')",
+            name="ck_ledger_future_supply_kind",
+        ),
+        CheckConstraint(
+            "evidence_status IN ('exact', 'ambiguous', 'unmatched', 'rejected')",
+            name="ck_ledger_future_supply_evidence_status",
+        ),
+        CheckConstraint(
+            "ordered_qty_at_cutoff >= 0 AND realized_qty_at_cutoff >= 0 "
+            "AND open_qty_at_cutoff >= 0",
+            name="ck_ledger_future_supply_quantities_nonnegative",
+        ),
+        CheckConstraint(
+            "capture_cutoff IS NOT NULL",
+            name="ck_ledger_future_supply_capture_cutoff",
+        ),
+        Index(
+            "ix_ledger_future_supply_generation_kind_item_eta",
+            "ledger_generation_id", "supply_kind", "item_id", "eta_date",
+        ),
+        Index(
+            "ix_ledger_future_supply_generation_item_eta",
+            "ledger_generation_id", "item_id", "eta_date",
+        ),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    supply_kind = Column(String(32), nullable=False)
+    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
+    characteristic_ref = Column(String(36), nullable=False, server_default="")
+    organization_ref = Column(String(36), nullable=False, server_default="")
+    planning_stock_pool = Column(String(128), nullable=False)
+    destination_warehouse_ref1c = Column(String(36), nullable=False, server_default="")
+    # Old 1C documents occasionally do not retain every external identity.
+    # Later capture services may accept an exact row only when its required
+    # identity evidence is actually present.
+    source_ref = Column(String(64), nullable=True)
+    source_line_ref = Column(String(64), nullable=True)
+    source_local_id = Column(String(128), nullable=True)
+    ordered_qty_at_cutoff = Column(DECIMAL(15, 3), nullable=False)
+    realized_qty_at_cutoff = Column(DECIMAL(15, 3), nullable=False)
+    open_qty_at_cutoff = Column(DECIMAL(15, 3), nullable=False)
+    eta_date = Column(Date, nullable=True)
+    source_state_key = Column(String(64), nullable=False)
+    source_updated_at = Column(DateTime(timezone=True), nullable=True)
+    capture_cutoff = Column(DateTime(timezone=True), nullable=False)
+    source_content_hash = Column(String(64), nullable=False)
+    capture_batch_id = Column(
+        BigInteger,
+        ForeignKey("ledger_build_batch.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    evidence_status = Column(String(16), nullable=False)
+    reason = Column(TEXT, nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    ledger_generation = relationship("LedgerGeneration")
+    item = relationship("Item")
+    capture_batch = relationship("LedgerBuildBatch")
+
+
 class PlanningTruthState(Base):
     """Singleton pointer to the generation exposed to dependent calculations."""
     __tablename__ = "planning_truth_state"
@@ -1340,6 +1428,13 @@ class PurchaseExportLineAllocation(Base):
             "supplier_order_ref",
             "supplier_order_line_no",
         ),
+        UniqueConstraint(
+            "ledger_generation_id",
+            "supplier_order_ref",
+            "request_line_token",
+            "planned_purchase_id",
+            name="uq_purchase_export_line_allocation_token",
+        ),
     )
 
     id = Column(BigIntPK, primary_key=True, autoincrement=True)
@@ -1358,6 +1453,10 @@ class PurchaseExportLineAllocation(Base):
         index=True,
     )
     allocated_qty = Column(DECIMAL(15, 3), nullable=False)
+    # Immutable 1C ``КлючСвязи`` and the canonical payload it represents.
+    # Both are nullable only for allocations written before migration 13.
+    request_line_token = Column(BigInteger, nullable=True)
+    export_line_payload_hash = Column(String(64), nullable=True)
     created_at = Column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -1576,6 +1675,14 @@ class SyncLink(Base):
     target_ref_key = Column(String(36), nullable=True, index=True)
     target_number = Column(String(50), nullable=True)
     payload_hash = Column(String(64), nullable=True)
+    # New planning exports are always tied to one accepted Ledger generation.
+    # Null is retained solely for historical links.
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     # planned | success | error | cancelled
     status = Column(String(20), nullable=False, default="planned", server_default="planned", index=True)
     last_error = Column(TEXT, nullable=True)
