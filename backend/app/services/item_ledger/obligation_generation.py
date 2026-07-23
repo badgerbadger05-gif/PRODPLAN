@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from hashlib import sha256
+import json
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -59,6 +61,7 @@ def _checkpoint_key(generation_key: str) -> str:
 def _reused_metrics(
     parent: models.LedgerGeneration,
     physical: models.PhysicalImportBatch,
+    provenance: dict[str, Any],
 ) -> dict[str, Any]:
     """Record the exact reused boundary rather than manufacturing an import."""
     return {
@@ -67,7 +70,86 @@ def _reused_metrics(
         "physical_import_batch_id": int(physical.id),
         "physical_batch_key": str(physical.batch_key),
         "physical_batch_metrics": dict(physical.source_watermarks or {}),
+        # Kept as explicit scalar metrics for operational audit/search, plus
+        # the grouped form for callers which consume the clone summary.
+        "supplier_receipt_provenance_count": int(provenance["count"]),
+        "supplier_receipt_provenance_checksum": str(provenance["checksum"]),
+        "supplier_receipt_provenance": dict(provenance),
     }
+
+
+_PROVENANCE_FIELDS = (
+    "stock_ledger_entry_id",
+    "receipt_doc_type",
+    "receipt_doc_ref",
+    "receipt_doc_line_no",
+    "supplier_order_ref",
+    "supplier_order_line_no",
+    "operation_kind",
+    "operation_key",
+    "operation_name",
+    "correction_receipt_ref",
+    "evidence_hash",
+    "evidence_payload",
+    "match_rule",
+    "match_status",
+    "ambiguity_count",
+    "reason",
+)
+
+
+def _provenance_rows(db: Session, generation_id: int) -> list[models.StockLedgerSupplierReceiptProvenance]:
+    return db.query(models.StockLedgerSupplierReceiptProvenance).filter(
+        models.StockLedgerSupplierReceiptProvenance.ledger_generation_id == int(generation_id)
+    ).order_by(
+        models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id,
+        models.StockLedgerSupplierReceiptProvenance.id,
+    ).all()
+
+
+def _provenance_value(row: models.StockLedgerSupplierReceiptProvenance) -> dict[str, Any]:
+    """Canonical immutable business evidence, excluding generation-local identity."""
+    return {
+        field: (dict(getattr(row, field) or {}) if field == "evidence_payload" else getattr(row, field))
+        for field in _PROVENANCE_FIELDS
+    }
+
+
+def _provenance_summary(rows: list[models.StockLedgerSupplierReceiptProvenance]) -> dict[str, Any]:
+    encoded = json.dumps(
+        [_provenance_value(row) for row in rows],
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return {"count": len(rows), "checksum": sha256(encoded).hexdigest()}
+
+
+def _clone_supplier_receipt_provenance(
+    db: Session,
+    *,
+    parent_generation_id: int,
+    target_generation_id: int,
+) -> dict[str, Any]:
+    """Copy all immutable receipt-match decisions into an obligation fork.
+
+    Evidence is generation scoped because later future-supply captures must be
+    reproducible from the accepted generation alone.  It is not recalculated
+    here: exact, ambiguous and unmatched decisions all travel with the shared
+    physical prefix.
+    """
+    parent_rows = _provenance_rows(db, parent_generation_id)
+    for source in parent_rows:
+        db.add(models.StockLedgerSupplierReceiptProvenance(
+            ledger_generation_id=int(target_generation_id),
+            **_provenance_value(source),
+        ))
+    db.flush()
+    target_rows = _provenance_rows(db, target_generation_id)
+    expected = _provenance_summary(parent_rows)
+    if _provenance_summary(target_rows) != expected:
+        raise ObligationGenerationError("cloned supplier receipt provenance conflicts")
+    return expected
 
 
 def _require_current_accepted_parent(
@@ -117,7 +199,12 @@ def _exact_existing(
         models.LedgerBuildBatch.ledger_generation_id == int(existing.id),
         models.LedgerBuildBatch.stage == "physical_import",
     ).all()
-    expected_metrics = _reused_metrics(parent, physical)
+    parent_provenance = _provenance_rows(db, int(parent.id))
+    expected_provenance = _provenance_summary(parent_provenance)
+    existing_provenance = _provenance_rows(db, int(existing.id))
+    if _provenance_summary(existing_provenance) != expected_provenance:
+        raise ObligationGenerationError("existing obligation provenance conflicts")
+    expected_metrics = _reused_metrics(parent, physical, expected_provenance)
     if len(checkpoints) != 1:
         raise ObligationGenerationError("existing obligation generation lacks one physical checkpoint")
     checkpoint = checkpoints[0]
@@ -174,13 +261,18 @@ def fork_obligation_generation(
     db.add(candidate)
     db.flush()
     materialize_generation_stock_bins(db, int(candidate.id))
+    provenance = _clone_supplier_receipt_provenance(
+        db,
+        parent_generation_id=int(parent.id),
+        target_generation_id=int(candidate.id),
+    )
     db.add(models.LedgerBuildBatch(
         ledger_generation_id=int(candidate.id),
         stage="physical_import",
         batch_key=_checkpoint_key(key),
         status="completed",
         algorithm_version=ALGORITHM_VERSION,
-        metrics=_reused_metrics(parent, physical),
+        metrics=_reused_metrics(parent, physical, provenance),
         completed_at=datetime.now(timezone.utc),
     ))
     db.flush()

@@ -32,6 +32,49 @@ def _accepted_parent(db, *, key="accepted", pointer=True, status="accepted"):
     return parent, physical
 
 
+def _supplier_provenance(db, parent, physical):
+    """Create the three immutable evidence outcomes that must survive a fork."""
+    item = models.Item(item_code="PROVENANCE-ITEM", item_name="Provenance item")
+    db.add(item)
+    db.flush()
+    rows = []
+    for line_no, status, operation_kind, extras in (
+        ("1", "exact", "supplier_receipt", {
+            "supplier_order_ref": "order-1", "supplier_order_line_no": "4",
+            "ambiguity_count": 0, "reason": None,
+        }),
+        ("2", "ambiguous", "correction", {
+            "supplier_order_ref": None, "supplier_order_line_no": None,
+            "ambiguity_count": 2, "reason": "two matching order lines",
+        }),
+        ("3", "unmatched", "supplier_return", {
+            "supplier_order_ref": None, "supplier_order_line_no": None,
+            "ambiguity_count": 0, "reason": "no supplier order link",
+        }),
+    ):
+        entry = models.StockLedgerEntry(
+            ingest_batch_id=physical.id, source_content_hash=(line_no * 64)[:64],
+            item_id=item.item_id, qty=Decimal("1"), posting_at=parent.cutoff,
+            recorder_type="Document_Receipt", recorder_ref="receipt-1", line_no=line_no,
+        )
+        db.add(entry)
+        db.flush()
+        rows.append(models.StockLedgerSupplierReceiptProvenance(
+            ledger_generation_id=parent.id,
+            stock_ledger_entry_id=entry.id,
+            receipt_doc_type="Document_Receipt", receipt_doc_ref="receipt-1",
+            receipt_doc_line_no=line_no, operation_kind=operation_kind,
+            operation_key=f"operation-{line_no}", operation_name=f"Operation {line_no}",
+            correction_receipt_ref="original-1" if line_no == "2" else None,
+            evidence_hash=("a" if line_no == "1" else "b" if line_no == "2" else "c") * 64,
+            evidence_payload={"line": line_no, "signed_qty": "1"},
+            match_rule="exact-document-line", match_status=status, **extras,
+        ))
+    db.add_all(rows)
+    db.commit()
+    return rows
+
+
 def test_fork_reuses_exact_prefix_and_materializes_bins_without_publishing(db_session):
     parent, physical = _accepted_parent(db_session)
     item = models.Item(item_code="FORK-ITEM", item_name="Fork item")
@@ -87,8 +130,43 @@ def test_fork_is_idempotent_only_for_exact_building_candidate(db_session):
         fork_obligation_generation(db_session, parent.id, "obligation-idempotent")
 
 
+def test_fork_clones_all_supplier_provenance_outcomes_and_checks_exact_retry(db_session):
+    parent, physical = _accepted_parent(db_session)
+    source_rows = _supplier_provenance(db_session, parent, physical)
+
+    first = fork_obligation_generation(db_session, parent.id, "provenance-copy")
+    db_session.commit()
+    copied = db_session.query(models.StockLedgerSupplierReceiptProvenance).filter_by(
+        ledger_generation_id=first.ledger_generation_id
+    ).order_by(models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id).all()
+
+    assert [row.match_status for row in copied] == ["exact", "ambiguous", "unmatched"]
+    assert [row.operation_kind for row in copied] == [
+        "supplier_receipt", "correction", "supplier_return",
+    ]
+    assert [row.evidence_hash for row in copied] == [row.evidence_hash for row in source_rows]
+    assert [row.evidence_payload for row in copied] == [row.evidence_payload for row in source_rows]
+    checkpoint = db_session.query(models.LedgerBuildBatch).filter_by(
+        ledger_generation_id=first.ledger_generation_id, stage="physical_import"
+    ).one()
+    assert checkpoint.metrics["supplier_receipt_provenance"]["count"] == 3
+    assert len(checkpoint.metrics["supplier_receipt_provenance"]["checksum"]) == 64
+
+    second = fork_obligation_generation(db_session, parent.id, "provenance-copy")
+    assert second.created is False
+    assert db_session.query(models.StockLedgerSupplierReceiptProvenance).filter_by(
+        ledger_generation_id=first.ledger_generation_id
+    ).count() == 3
+
+    copied[0].evidence_hash = "z" * 64
+    db_session.commit()
+    with pytest.raises(ObligationGenerationError, match="provenance conflicts"):
+        fork_obligation_generation(db_session, parent.id, "provenance-copy")
+
+
 def test_fork_is_removed_by_outer_rollback_and_reused_after_outer_commit(db_session):
-    parent, _physical = _accepted_parent(db_session)
+    parent, physical = _accepted_parent(db_session)
+    _supplier_provenance(db_session, parent, physical)
     rolled_back = fork_obligation_generation(db_session, parent.id, "outer-rollback")
     db_session.rollback()
 
@@ -98,6 +176,10 @@ def test_fork_is_removed_by_outer_rollback_and_reused_after_outer_commit(db_sess
     ).count() == 0
     assert db_session.query(models.StockBin).filter(
         models.StockBin.ledger_generation_id == rolled_back.ledger_generation_id
+    ).count() == 0
+    assert db_session.query(models.StockLedgerSupplierReceiptProvenance).filter(
+        models.StockLedgerSupplierReceiptProvenance.ledger_generation_id
+        == rolled_back.ledger_generation_id
     ).count() == 0
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == parent.id
 
