@@ -34,15 +34,12 @@ from ..services.dbr import (
     feeder_position_service,
     feeder_signal_service,
     gate_service,
-    materialize_service,
     processing_board_service,
     program_service,
-    purchase_materialize_service,
     purchase_snapshot_service,
     settings_service,
     slot_service,
 )
-from ..services.dbr.materialize_service import MaterializeConflict
 from ..services.dbr.generation import DbrProjectionUnavailable
 
 router = APIRouter(prefix="/v1/dbr", tags=["dbr"])
@@ -389,6 +386,17 @@ def _retired_live_feeder_read(operation: str) -> None:
         "status": "unavailable",
         "read_only": True,
         "reason": "Live feeder calculation is retired; wait for a snapshot-native implementation",
+    })
+
+
+def _retired_immutable_materialization(operation: str) -> None:
+    raise HTTPException(status_code=503, detail={
+        "code": "dbr_immutable_ledger_authorization_unavailable",
+        "consumer": "dbr_materialization",
+        "operation": operation,
+        "status": "unavailable",
+        "read_only": True,
+        "reason": "Immutable Ledger authorization for external materialization is unavailable",
     })
 
 
@@ -814,71 +822,39 @@ def drum_move_slot(
 def drum_release_slot(
     slot_id: int,
     dry_run: bool = Query(default=True),
-    db: Session = Depends(get_dbr_write_db, scope="function"),
+    db: Session = Depends(get_db),
 ):
     """Materialize a green+pending slot into a 1С production order (Фаза 3).
 
     dry_run=true (default) returns the payload preview and writes nothing;
     dry_run=false writes to 1С and marks the slot released.
     """
-    try:
-        return materialize_service.release_slot(db, slot_id, dry_run=dry_run)
-    except LookupError:
-        raise HTTPException(status_code=404, detail="slot not found")
-    except MaterializeConflict as exc:
-        raise HTTPException(status_code=409, detail={"message": exc.detail, **exc.payload})
-    except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    _retired_immutable_materialization("drum_slot_release")
 
 
 @router.post("/drum/{schedule_id}/release-day")
 def drum_release_day(
     schedule_id: int,
     payload: ReleaseDayRequest,
-    db: Session = Depends(get_dbr_write_db, scope="function"),
+    db: Session = Depends(get_db),
 ):
     """Batch-release every green+pending slot of one day. Partial failures do
     not roll back the slots that already succeeded (per-slot isolation)."""
-    try:
-        return materialize_service.release_day(
-            db, schedule_id, payload.day, dry_run=payload.dry_run
-        )
-    except LookupError:
-        raise HTTPException(status_code=404, detail="schedule not found")
-    except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    _retired_immutable_materialization("drum_day_release")
 
 
 @router.post("/feeder/signals/{signal_id}/launch")
 def feeder_launch_signal(
     signal_id: int,
     payload: SignalLaunchRequest,
-    db: Session = Depends(get_dbr_write_db, scope="function"),
+    db: Session = Depends(get_db),
 ):
     """Launch an Open+complete feeder signal into a 1С production order (Фаза 3).
 
     Gated by material readiness: a deficit returns 409 with deficit_lines.
     dry_run=true (default) returns the payload preview and writes nothing.
     """
-    try:
-        return materialize_service.launch_signal(
-            db,
-            signal_id,
-            dry_run=payload.dry_run,
-            allow_production=payload.allow_production,
-        )
-    except LookupError:
-        raise HTTPException(status_code=404, detail="feeder signal not found")
-    except MaterializeConflict as exc:
-        raise HTTPException(status_code=409, detail={"message": exc.detail, **exc.payload})
-    except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    _retired_immutable_materialization("feeder_signal_launch")
 
 
 @router.get("/feeder/signals/{signal_id}/processing-order-preview")
@@ -907,7 +883,7 @@ def get_purchase_cockpit(db: Session = Depends(get_db)):
 @router.post("/feeder/purchase/launch")
 def feeder_launch_purchase(
     payload: PurchaseLaunchRequest,
-    db: Session = Depends(get_dbr_write_db, scope="function"),
+    db: Session = Depends(get_db),
 ):
     """Launch open «Пополнение» signals of purchased items into supplier orders.
 
@@ -915,16 +891,7 @@ def feeder_launch_purchase(
     supplier are returned under `unresolved`, never blocking the batch.
     dry_run=true (default) returns the grouped payload preview and writes nothing.
     """
-    try:
-        return purchase_materialize_service.launch_purchase_signals(
-            db, signal_ids=payload.signal_ids, dry_run=payload.dry_run
-        )
-    except cockpit_snapshot_service.DbrCockpitSnapshotUnavailable as exc:
-        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
-    except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+    _retired_immutable_materialization("feeder_purchase_launch")
 
 
 @router.get("/purchase-plan/preview")

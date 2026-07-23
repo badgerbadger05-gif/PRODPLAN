@@ -329,8 +329,8 @@ def test_release_requires_green_slot(client, seed):
     slots = client.get("/api/v1/dbr/drum/active/board").json()["slots"]
     slot_id = slots[0]["id"]
     resp = client.post(f"/api/v1/dbr/drum/slots/{slot_id}/release")
-    assert resp.status_code == 409
-    assert "message" in resp.json()["detail"]
+    assert resp.status_code == 503
+    assert resp.json()["detail"]["code"] == "dbr_immutable_ledger_authorization_unavailable"
 
 
 def test_roll_forward_endpoint(client, seed):

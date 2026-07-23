@@ -20,7 +20,7 @@ from ..services.production_control_material_issues import (
     assemble_material_issue,
     create_material_issues,
     delete_local_material_issue,
-    export_issue_to_1c,
+    export_issue_to_1c,  # retained only so tests prove the retired route never calls it
     get_issue,
     list_material_issues,
 )
@@ -824,12 +824,12 @@ def post_material_issue_to_1c_legacy(
     Legacy: single-issue export. Kept for backwards-compatibility with
     existing clients. Prefer POST /material-issues/export-to-1c.
     """
-    try:
-        return export_issue_to_1c(db, int(issue_id), payload)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    raise HTTPException(status_code=503, detail={
+        "code": "material_issue_legacy_single_export_retired",
+        "consumer": "production_material_issue_export",
+        "status": "unavailable", "read_only": True,
+        "reason": "Deprecated single-document export is retired; immutable Ledger authorization is unavailable",
+    })
 
 
 @router.post("/sync-posted-transfers", response_model=dict)

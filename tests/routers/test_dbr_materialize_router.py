@@ -26,7 +26,7 @@ from app.models import (
     WorkshopWarehouseBinding,
 )
 from app.routers.dbr import router as dbr_router
-from app.services.dbr import materialize_service, settings_service
+from app.services.dbr import materialize_service, purchase_materialize_service, settings_service
 
 
 @pytest.fixture()
@@ -129,38 +129,57 @@ def _slot(db, *, kit_status="green"):
     return slot, schedule
 
 
-def test_release_endpoint_defaults_to_dry_run(client, db_session):
+def test_release_endpoint_is_retired_without_invoking_materializer(client, db_session, monkeypatch):
     slot, _sch = _slot(db_session)
+    monkeypatch.setattr(materialize_service, "release_slot", lambda *_a, **_k: pytest.fail("must not materialize"))
     resp = client.post(f"/api/v1/dbr/drum/slots/{slot.id}/release")
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["dry_run"] is True
-    assert body["created"] is False
-    assert "payload" in body
+    assert resp.status_code == 503
+    assert resp.json()["detail"]["code"] == "dbr_immutable_ledger_authorization_unavailable"
     db_session.refresh(slot)
     assert slot.release_status == "pending"
 
 
-def test_release_endpoint_red_slot_returns_409(client, db_session):
+def test_release_endpoint_red_slot_is_retired(client, db_session):
     slot, _sch = _slot(db_session, kit_status="red")
     resp = client.post(f"/api/v1/dbr/drum/slots/{slot.id}/release?dry_run=true")
-    assert resp.status_code == 409
-    assert "message" in resp.json()["detail"]
+    assert resp.status_code == 503
 
 
-def test_release_day_endpoint_dry_run(client, db_session):
+def test_release_day_endpoint_is_retired_without_invoking_materializer(client, db_session, monkeypatch):
     slot, schedule = _slot(db_session)
+    before = db_session.query(DbrDrumSlot).count()
+    monkeypatch.setattr(materialize_service, "release_day", lambda *_a, **_k: pytest.fail("must not materialize"))
     resp = client.post(
         f"/api/v1/dbr/drum/{schedule.id}/release-day",
         json={"day": "2026-08-10", "dry_run": True},
     )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["dry_run"] is True
-    assert body["previews"] == 1
-    assert body["slots_total"] == 1
+    assert resp.status_code == 503
+    assert db_session.query(DbrDrumSlot).count() == before
+    db_session.refresh(slot)
+    assert slot.release_status == "pending"
 
 
-def test_launch_endpoint_missing_signal_404(client):
+def test_launch_endpoint_is_retired_without_invoking_materializer(client, db_session, monkeypatch):
+    before = db_session.query(DbrDrumSlot).count()
+    monkeypatch.setattr(materialize_service, "launch_signal", lambda *_a, **_k: pytest.fail("must not materialize"))
     resp = client.post("/api/v1/dbr/feeder/signals/999999/launch", json={"dry_run": True})
-    assert resp.status_code == 404
+    assert resp.status_code == 503
+    assert db_session.query(DbrDrumSlot).count() == before
+
+
+def test_purchase_launch_is_retired_without_invoking_materializer(client, db_session, monkeypatch):
+    before = db_session.query(DbrDrumSlot).count()
+    monkeypatch.setattr(
+        purchase_materialize_service,
+        "launch_purchase_signals",
+        lambda *_a, **_k: pytest.fail("must not materialize purchase signals"),
+    )
+
+    response = client.post(
+        "/api/v1/dbr/feeder/purchase/launch",
+        json={"signal_ids": [1], "dry_run": False},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "dbr_immutable_ledger_authorization_unavailable"
+    assert db_session.query(DbrDrumSlot).count() == before
