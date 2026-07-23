@@ -224,7 +224,7 @@ export function MrpResultPage() {
     } finally {
       if (seq === loadSeq.current) setLoading(false)
     }
-  }, [dateFrom, dateTo, invalidateTabs, rootItemId, runId, snapshotId, summary?.cutoff, summary?.ledger_generation, truthAccepted])
+  }, [dateFrom, dateTo, invalidateTabs, rootItemId, runId, snapshotId, summary, truthAccepted])
 
   useEffect(() => {
     if (previousRunId.current === runId) return
