@@ -38,6 +38,41 @@ retry/attempts), `stock_ledger_anchor` (T0-якорь), `reservation_entry`,
 - `backend/app/routers/item_ledger_admin.py` — админ-операции:
   `POST /api/v1/item-ledger/admin/seed` (сид якоря T0, см. «Запуск»).
 
+## Balance-сверка v2: discovery → adjustment (решение §7.4д)
+
+`reconcile.py`, после-шаг стокового свипа (`run_balance_reconcile_after_sweep`).
+
+**Ось сравнения (Д7, характеристики).** Balance снимается без разреза
+Характеристика (общий `get_stock_from_1c_odata`, dims «Номенклатура,
+СтруктурнаяЕдиница,Организация» — контракт легаси-свипа), поэтому сверка
+сравнивает **агрегаты по (item, организация, склад)**: Σ `stock_bin.on_hand`
+по всем характеристикам ключа vs Balance. Дебаунс (`reconcile_pending_qty`)
+и adjustment живут только в бине `char=''`; per-char бины сверка никогда не
+трогает — ложный дрейф «переливания» остатка из char-бина в ''-бин устранён.
+
+**Порядок при созревшем расхождении** (дебаунс 1 свип, нет in-flight пуллов);
+принцип §7.4(д): «расхождение = мы пропустили документ, а не повод для
+анонимной поправки»:
+
+1. **Discovery** — точечный запрос регистра
+   `AccumulationRegister_ЗапасыНаСкладах` по `Номенклатура_Key` (+
+   `СтруктурнаяЕдиница_Key`) с `Period >` последнего якоря/последней сверки
+   (механика Инк0) → список recorder'ов.
+2. Recorder'ы, неизвестные локально (нет в `stock_recorder_pull` и в SLE) →
+   `enqueue_recorder_pull(source='reconcile-discovery')`, adjustment в этом
+   свипе **не пишется** (ключ held) — очередь дренит `sync_orchestrator.tick()`,
+   пропущенный документ переигрывается штатным pull-by-document с реальным
+   Recorder.
+3. Регистр не вернул новых документов, а расхождение осталось → честный
+   анонимный adjustment-SLE (истинная аномалия, счётчик `anomalies`).
+
+**Защита:** точечный запрос только по расхождению (не рутинно); максимум
+`RECONCILE_DISCOVERY_LIMIT` (=20) discovery-запросов за свип, остальные ключи
+held со счётчиком `discovery_skipped`; ошибка/таймаут OData → held без
+adjustment, свип не падает. Счётчики свипа: `discovered_recorders`,
+`discovery_skipped`, `anomalies` (в `ReconcileResult` и в лог
+`[OData][stock] balance-reconcile`).
+
 ## Феатюр-флаг
 
 `STOCK_SOURCE` ∈ {`legacy` (default), `bin`} — env, читается на каждый вызов
@@ -92,6 +127,6 @@ retry/attempts), `stock_ledger_anchor` (T0-якорь), `reservation_entry`,
 
 Shadow-режим: `STOCK_SOURCE` не выставлен ⇒ прод-поведение не изменено.
 **Включать `bin` в прод НЕЛЬЗЯ**, пока не закрыты блокеры из
-[`tech-debt.md`](tech-debt.md) (матчинг через SyncLink, unrealize при
-replace-by-recorder, release при закрытии прогона, дрен очереди pull'ов,
-характеристики в сверке и др.).
+[`tech-debt.md`](tech-debt.md) (unrealize при replace-by-recorder, release
+при закрытии прогона и др.; характеристики в сверке — закрыто, см. раздел
+«Balance-сверка v2»).
