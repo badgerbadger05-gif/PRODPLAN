@@ -157,17 +157,26 @@ class LedgerScope:
 
 
 def _scope_run_ids(db: Session) -> List[int]:
-    """Last FIXED_SNAPSHOT run per source_plan_id (NO period_to filter — an
-    overdue snapshot stays in scope; fixes runs 13/14) PLUS every CLOSED run
-    that still carries an open requirement."""
+    """Current accepted-generation fixed snapshots plus their open closures.
+
+    ``PlanningTruthState.current_generation_id`` is the only scope boundary.
+    A newer run from another build, a legacy NULL-lineage run, and an older
+    accepted generation are all deliberately invisible.  ``require_accepted``
+    raises :class:`PlanningTruthUnavailable` when the pointer is absent/stale;
+    callers must not turn that into an empty (zero-fact) cycle.
+    """
+    from .planning_truth import require_accepted_truth
+
+    truth = require_accepted_truth(db, consumer="mrp_execution_ledger")
+    generation_id = int(truth.generation_id)
     fixed_rows = (
-        db.query(PlanningRun.source_plan_id, func.max(PlanningRun.run_id))
+        db.query(PlanningRun.run_id)
         .filter(PlanningRun.status == FIXED_SNAPSHOT_STATUS)
+        .filter(PlanningRun.ledger_generation_id == generation_id)
         .filter(PlanningRun.source_plan_id.isnot(None))
-        .group_by(PlanningRun.source_plan_id)
         .all()
     )
-    run_ids: Set[int] = {int(rid) for _plan_id, rid in fixed_rows if rid is not None}
+    run_ids: Set[int] = {int(rid) for (rid,) in fixed_rows if rid is not None}
 
     # CLOSED runs that still carry an open requirement (empty today; the branch
     # is written now so a future closure increment needs no scope change).
@@ -175,6 +184,7 @@ def _scope_run_ids(db: Session) -> List[int]:
         db.query(PlanningRun.run_id)
         .join(MrpRequirement, MrpRequirement.run_id == PlanningRun.run_id)
         .filter(PlanningRun.status == CLOSED_STATUS)
+        .filter(PlanningRun.ledger_generation_id == generation_id)
         .filter(MrpRequirement.status == "open")
         .distinct()
         .all()

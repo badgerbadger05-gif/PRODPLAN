@@ -1,8 +1,6 @@
 """Tests for MRP reconciliation and the covered_qty rollback that feeds it."""
 
 from datetime import date, datetime
-from types import SimpleNamespace
-
 import pytest
 
 from app.models import (
@@ -15,6 +13,7 @@ from app.models import (
     PaintWeldPair,
     PlannedPurchase,
     PhysicalImportBatch,
+    PlanningTruthState,
     PlanningRun,
     ProductionOrder,
     ProductionOrderLineState,
@@ -65,7 +64,7 @@ def reconcile_all_active(db, **kwargs):
 
 
 @pytest.fixture(autouse=True)
-def _accepted_planning_truth(db_session, monkeypatch):
+def _accepted_planning_truth(db_session):
     """Existing sizing scenarios explicitly run under an accepted truth."""
     batch = PhysicalImportBatch(
         batch_key="mrp-reconciliation-diagnostic",
@@ -79,23 +78,23 @@ def _accepted_planning_truth(db_session, monkeypatch):
         status="accepted",
         cutoff=datetime(2026, 7, 23),
         source_watermarks={},
-        capabilities={},
+        capabilities={
+            "physical_ledger": True,
+            "reservation_replay": True,
+            "execution_allocations": True,
+        },
         physical_import_batch=batch,
         algorithm_version="test/diagnostic",
         accepted_at=datetime(2026, 7, 23),
     )
     db_session.add(generation)
     db_session.flush()
-    db_session.info["diagnostic_ledger_generation_id"] = generation.id
-    monkeypatch.setattr(
-        "app.services.planning_truth.require_accepted_truth",
-        lambda db, consumer, **kwargs: SimpleNamespace(
-            status="accepted",
-            generation_id=generation.id,
-            cutoff=generation.cutoff,
-            reason=None,
-        ),
+    db_session.add(
+        PlanningTruthState(id=1, current_generation_id=generation.id)
     )
+    db_session.flush()
+    db_session.info["diagnostic_ledger_generation_id"] = generation.id
+    db_session.info["accepted_ledger_generation_id"] = generation.id
 
 
 def _attach_diagnostic_proposal_lineage(db):
@@ -118,6 +117,56 @@ def _attach_diagnostic_proposal_lineage(db):
     db.flush()
 
 
+def test_reconciliation_selector_uses_only_current_pointer_generation(db_session):
+    plan = ProductionPlanHeader(
+        name="selector-plan", period_from=date(2026, 6, 1), period_to=date(2026, 6, 30),
+        status="fixed",
+    )
+    db_session.add(plan)
+    db_session.flush()
+    foreign_batch = PhysicalImportBatch(
+        batch_key="reconciliation-selector-foreign", status="completed",
+        cutoff=datetime(2026, 7, 22), source_watermarks={"test": True},
+    )
+    db_session.add(foreign_batch)
+    db_session.flush()
+    foreign_generation = LedgerGeneration(
+        generation_key="reconciliation-selector-foreign", status="accepted",
+        cutoff=foreign_batch.cutoff, accepted_at=foreign_batch.cutoff,
+        physical_import_batch_id=foreign_batch.id, algorithm_version="test", replay_version="test",
+        source_watermarks={"test": True}, capabilities={},
+    )
+    db_session.add(foreign_generation)
+    db_session.flush()
+    current = PlanningRun(
+        status="FIXED_SNAPSHOT", config_snapshot={}, pinned=True, source_plan_id=plan.id,
+        period_from=plan.period_from, period_to=plan.period_to,
+        ledger_generation_id=db_session.info["accepted_ledger_generation_id"],
+    )
+    foreign = PlanningRun(
+        status="FIXED_SNAPSHOT", config_snapshot={}, pinned=True, source_plan_id=plan.id,
+        period_from=plan.period_from, period_to=plan.period_to, ledger_generation_id=foreign_generation.id,
+    )
+    legacy = PlanningRun(
+        status="FIXED_SNAPSHOT", config_snapshot={}, pinned=True, source_plan_id=plan.id,
+        period_from=plan.period_from, period_to=plan.period_to, ledger_generation_id=None,
+    )
+    db_session.add_all([current, foreign, legacy])
+    db_session.flush()
+
+    assert _latest_active_snapshot_run_ids(db_session) == [current.run_id]
+
+
+def test_reconciliation_selector_fails_closed_without_truth_pointer(db_session):
+    from app.services.planning_truth import PlanningTruthUnavailable
+
+    db_session.delete(db_session.get(PlanningTruthState, 1))
+    db_session.flush()
+
+    with pytest.raises(PlanningTruthUnavailable, match="No Item Ledger generation"):
+        _latest_active_snapshot_run_ids(db_session)
+
+
 def test_reconcile_all_active_fails_closed_without_accepted_truth(
     db_session, monkeypatch
 ):
@@ -128,6 +177,8 @@ def test_reconcile_all_active_fails_closed_without_accepted_truth(
         "require_accepted_truth",
         lambda db, consumer, **kwargs: planning_truth.require_accepted(db),
     )
+    db_session.delete(db_session.get(PlanningTruthState, 1))
+    db_session.flush()
 
     result = reconcile_all_active(db_session)
 
@@ -1363,6 +1414,7 @@ def test_i5_activity_is_status_based_overdue_snapshot_stays_active(db_session):
         status="FIXED_SNAPSHOT", config_snapshot={}, pinned=True,
         source_plan_id=plan.id, period_from=date(2020, 1, 1), period_to=date(2020, 2, 1),
         active_freeze_version=1,
+        ledger_generation_id=db_session.info["accepted_ledger_generation_id"],
     )
     db_session.add(run)
     db_session.flush()

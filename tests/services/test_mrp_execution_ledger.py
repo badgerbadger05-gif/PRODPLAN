@@ -13,20 +13,41 @@ asserted VALUES are unchanged (no baseline → Δ = full history = phase-2 parit
 """
 
 from datetime import date, datetime, timezone
-from types import SimpleNamespace
-
 import pytest
 from app import models
 
 
 @pytest.fixture(autouse=True)
-def _accepted_planning_truth(monkeypatch):
-    monkeypatch.setattr(
-        "app.services.planning_truth.require_accepted_truth",
-        lambda db, consumer, **kwargs: SimpleNamespace(
-            status="accepted", generation_id=1, cutoff=None, reason=None
-        ),
+def _accepted_planning_truth(db_session):
+    """Every scope test has a real published pointer, not a mocked fallback."""
+    batch = models.PhysicalImportBatch(
+        batch_key="mrp-execution-scope-test",
+        status="completed",
+        cutoff=datetime(2026, 7, 1),
+        source_watermarks={"test": True},
     )
+    db_session.add(batch)
+    db_session.flush()
+    accepted = models.LedgerGeneration(
+        generation_key="mrp-execution-scope-test",
+        status="accepted",
+        cutoff=batch.cutoff,
+        accepted_at=datetime(2026, 7, 1),
+        physical_import_batch_id=batch.id,
+        algorithm_version="test",
+        replay_version="test",
+        source_watermarks={"test": True},
+        capabilities={
+            "physical_ledger": True,
+            "reservation_replay": True,
+            "execution_allocations": True,
+        },
+    )
+    db_session.add(accepted)
+    db_session.flush()
+    db_session.add(models.PlanningTruthState(id=1, current_generation_id=accepted.id))
+    db_session.flush()
+    db_session.info["accepted_ledger_generation_id"] = accepted.id
 
 from app.models import (
     Item,
@@ -79,30 +100,7 @@ def test_public_ledger_cycle_is_blocked_and_creates_no_allocations(db_session):
 
 
 def test_legacy_diagnostic_cycle_never_repoints_accepted_truth(db_session):
-    batch = models.PhysicalImportBatch(
-        batch_key="accepted-before-diagnostic",
-        status="completed",
-        cutoff=datetime(2026, 7, 1),
-        source_watermarks={"test": True},
-    )
-    db_session.add(batch)
-    db_session.flush()
-    accepted = models.LedgerGeneration(
-        generation_key="accepted-before-diagnostic",
-        status="accepted",
-        cutoff=batch.cutoff,
-        accepted_at=datetime(2026, 7, 1),
-        physical_import_batch_id=batch.id,
-        algorithm_version="test",
-        replay_version="test",
-        source_watermarks={"test": True},
-        capabilities={},
-    )
-    db_session.add(accepted)
-    db_session.flush()
-    db_session.add(
-        models.PlanningTruthState(id=1, current_generation_id=accepted.id)
-    )
+    accepted = db_session.get(models.PlanningTruthState, 1).current_generation
     db_session.commit()
 
     _public_run_ledger_cycle(db_session, diagnostic_legacy=True)
@@ -172,6 +170,7 @@ def _make_run(
         config_snapshot={},
         pinned=True,
         source_plan_id=plan.id,
+        ledger_generation_id=int(db.info["accepted_ledger_generation_id"]),
         period_from=period_from,
         period_to=period_to,
         active_freeze_version=freeze_version,
@@ -179,6 +178,46 @@ def _make_run(
     db.add(run)
     db.flush()
     return run
+
+
+def test_scope_uses_only_pointer_generation_and_never_null_or_foreign_runs(db_session):
+    plan = _make_plan(db_session, period_from=date(2026, 6, 1), period_to=date(2026, 6, 30))
+    current = _make_run(
+        db_session, plan=plan, period_from=plan.period_from, period_to=plan.period_to
+    )
+    batch = models.PhysicalImportBatch(
+        batch_key="mrp-execution-foreign-batch", status="completed",
+        cutoff=datetime(2026, 7, 2), source_watermarks={"test": True},
+    )
+    db_session.add(batch)
+    db_session.flush()
+    foreign = models.LedgerGeneration(
+        generation_key="mrp-execution-foreign-generation", status="accepted",
+        cutoff=batch.cutoff, accepted_at=batch.cutoff,
+        physical_import_batch_id=batch.id, algorithm_version="test", replay_version="test",
+        source_watermarks={"test": True}, capabilities={},
+    )
+    db_session.add(foreign)
+    db_session.flush()
+    for generation_id in (None, foreign.id):
+        db_session.add(PlanningRun(
+            status="FIXED_SNAPSHOT", config_snapshot={}, pinned=True,
+            source_plan_id=plan.id, period_from=plan.period_from, period_to=plan.period_to,
+            ledger_generation_id=generation_id,
+        ))
+    db_session.flush()
+
+    assert _scope_run_ids(db_session) == [current.run_id]
+
+
+def test_scope_fails_closed_when_published_truth_pointer_is_absent(db_session):
+    from app.services.planning_truth import PlanningTruthUnavailable
+
+    db_session.delete(db_session.get(models.PlanningTruthState, 1))
+    db_session.flush()
+
+    with pytest.raises(PlanningTruthUnavailable, match="No Item Ledger generation"):
+        _scope_run_ids(db_session)
 
 
 def _make_req(db, run, item, *, net, bom_level=0, status="open") -> MrpRequirement:

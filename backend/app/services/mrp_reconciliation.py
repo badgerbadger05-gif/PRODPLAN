@@ -101,21 +101,24 @@ def _production_supply_qty_expr():
 
 def _latest_active_snapshot_run_ids(db: Session) -> List[int]:
     """
-    Latest FIXED_SNAPSHOT run per source plan. Activity is status-based, NOT
-    period-gated: an overdue-but-open snapshot (june runs 13/14 with executed=0)
-    stays active, aligned with the ledger scope (``_scope_run_ids`` is
-    period-agnostic). A CLOSED run is excluded naturally (the ==FIXED_SNAPSHOT
-    filter). There must be only one active fixed snapshot per plan; max(run_id)
-    is a defensive fallback for legacy duplicates.
+    All FIXED_SNAPSHOT runs belonging to the current accepted Ledger generation.
+
+    The truth pointer is mandatory.  There is intentionally no ``max(run_id)``
+    selection and no legacy/NULL fallback: a run is a saved planning snapshot
+    only when its Ledger lineage exactly equals the published truth.
     """
+    from .planning_truth import require_accepted_truth
+
+    truth = require_accepted_truth(db, consumer="mrp_reconciliation")
     rows = (
-        db.query(PlanningRun.source_plan_id, func.max(PlanningRun.run_id))
+        db.query(PlanningRun.run_id)
         .filter(PlanningRun.status == FIXED_SNAPSHOT_STATUS)
+        .filter(PlanningRun.ledger_generation_id == int(truth.generation_id))
         .filter(PlanningRun.source_plan_id.isnot(None))
-        .group_by(PlanningRun.source_plan_id)
+        .order_by(PlanningRun.run_id.asc())
         .all()
     )
-    return [int(run_id) for _plan_id, run_id in rows if run_id is not None]
+    return [int(run_id) for (run_id,) in rows if run_id is not None]
 
 
 def _validated_run_generation_targets(
