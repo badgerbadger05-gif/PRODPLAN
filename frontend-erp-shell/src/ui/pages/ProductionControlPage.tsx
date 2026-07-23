@@ -32,6 +32,7 @@ import {
   markMaterialIssueAssembled,
   postMaterialIssues,
   produceOrder,
+  refreshOrderMaterials,
   rollbackManufactureLocal,
   saveProductionControlSettings,
   syncPostedTransfers,
@@ -306,16 +307,20 @@ export function ProductionControlPage() {
     }
   }
 
-  const loadMaterials = useCallback(async (productId: number, refresh = false) => {
+  const requestMaterials = useCallback(async (
+    productId: number,
+    request: (id: number) => Promise<MaterialsResponse>,
+    updateCoverage: boolean,
+  ) => {
     const requestSeq = ++materialsRequestSeq.current
     setActiveId(productId)
     setMaterials(null)
     try {
-      const data = await getOrderMaterials(productId, refresh)
+      const data = await request(productId)
       if (requestSeq !== materialsRequestSeq.current) return
       setMaterials(data)
       const coverageStatus = String(data.coverage_status || '')
-      if (refresh && coverageStatus) {
+      if (updateCoverage && coverageStatus) {
         setRows((list) => applyMaterialCoverage(list, productId, coverageStatus, data.coverage_label))
       }
     } catch (e) {
@@ -323,6 +328,16 @@ export function ProductionControlPage() {
       setError(e instanceof Error ? e.message : String(e))
     }
   }, [])
+
+  const loadMaterials = useCallback(
+    (productId: number) => requestMaterials(productId, getOrderMaterials, false),
+    [requestMaterials],
+  )
+
+  const refreshMaterials = useCallback(
+    (productId: number) => requestMaterials(productId, refreshOrderMaterials, true),
+    [requestMaterials],
+  )
 
   function beginDangerousMutation() {
     if (dangerousMutationLocked.current) return false
@@ -883,7 +898,7 @@ export function ProductionControlPage() {
 
   useEffect(() => {
     const productId = activeRow?.product_id
-    if (productId) void loadMaterials(productId, false)
+    if (productId) void loadMaterials(productId)
   }, [activeRow?.product_id, loadMaterials])
 
   const { visibleFrom, visibleTo } = productionPagination(offset, rows.length, total)
@@ -955,7 +970,7 @@ export function ProductionControlPage() {
               }}
               onSelectIds={setSelectedIds}
               onActivate={setActiveId}
-              onOpenMaterials={(row) => void loadMaterials(row.product_id, false)}
+              onOpenMaterials={(row) => void loadMaterials(row.product_id)}
               onChangeStatus={(row, status) => void changeStatus(row, status)}
               onToggleSort={toggleSort}
             />
@@ -978,7 +993,7 @@ export function ProductionControlPage() {
               activeRow={activeRow}
               materials={materials}
               coverageLabels={coverageLabels}
-              onLoadMaterials={() => activeRow && void loadMaterials(activeRow.product_id, true)}
+              onLoadMaterials={() => activeRow && void refreshMaterials(activeRow.product_id)}
               onPrint={() => activeRow && printRows([activeRow.product_id])}
               onOptimalBatchSave={(itemId, value) => saveOptimalBatch(itemId, value)}
               onQuantitySave={(productId, value) => saveOrderQuantity(productId, value)}

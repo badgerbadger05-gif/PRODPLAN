@@ -96,10 +96,14 @@ export function saveProductionControlSettings(payload: ControlSettingsUpdate) {
   })
 }
 
-export function getOrderMaterials(productId: number, refresh: boolean) {
-  return api<MaterialsResponse>(
-    `/v1/production-control/orders/${productId}/materials${refresh ? '?refresh=true' : ''}`,
-  )
+export function getOrderMaterials(productId: number) {
+  return api<MaterialsResponse>(`/v1/production-control/orders/${productId}/materials`)
+}
+
+export function refreshOrderMaterials(productId: number) {
+  return api<MaterialsResponse>(`/v1/production-control/orders/${productId}/materials/refresh`, {
+    method: 'POST',
+  })
 }
 
 export function updateOrderStatus(productId: number, status: string) {

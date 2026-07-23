@@ -18,6 +18,7 @@ vi.mock('../../services/productionControl', () => ({
   getProductionControlSettings: vi.fn(),
   saveProductionControlSettings: vi.fn(),
   getOrderMaterials: vi.fn(),
+  refreshOrderMaterials: vi.fn(),
   updateOrderStatus: vi.fn(),
   postMaterialIssues: vi.fn(),
   fetchRouteSheetsPrintHtml: vi.fn(),
@@ -50,6 +51,7 @@ import {
   listProductionEmployees,
   listProductionOperations,
   getOrderMaterials,
+  refreshOrderMaterials,
   updateOrderStatus,
   postMaterialIssues,
   exportMaterialIssuesTo1C,
@@ -182,6 +184,7 @@ beforeEach(() => {
     latest_run_id: 77,
   })
   vi.mocked(getOrderMaterials).mockResolvedValue(fakeMaterials())
+  vi.mocked(refreshOrderMaterials).mockResolvedValue(fakeMaterials())
   vi.mocked(listResources).mockResolvedValue(fakeResources)
   vi.mocked(listPeriodPlans).mockResolvedValue({ rows: [] } as never)
   vi.mocked(getPeriodPlanMatrix).mockResolvedValue({ rows: [] } as never)
@@ -323,8 +326,8 @@ describe('ProductionControlPage — characterization', () => {
     renderPage()
     await screen.findByText('Вал')
 
-    // Active row = first row => materials fetched with refresh=false on mount.
-    await waitFor(() => expect(getOrderMaterials).toHaveBeenCalledWith(101, false))
+    // Active row = first row => saved snapshot fetched with GET on mount.
+    await waitFor(() => expect(getOrderMaterials).toHaveBeenCalledWith(101))
     expect(await screen.findByText('Болт М8')).toBeInTheDocument()
   })
 
@@ -334,21 +337,22 @@ describe('ProductionControlPage — characterization', () => {
     await screen.findByText('Вал')
 
     await user.dblClick(rowFor('Кронштейн'))
-    await waitFor(() => expect(getOrderMaterials).toHaveBeenCalledWith(101, false))
-    expect(getOrderMaterials).not.toHaveBeenCalledWith(101, true)
+    await waitFor(() => expect(getOrderMaterials).toHaveBeenCalledWith(101))
+    expect(refreshOrderMaterials).not.toHaveBeenCalled()
   })
 
   it('refreshes material coverage only from the explicit action', async () => {
     const user = userEvent.setup()
     renderPage()
     await screen.findByText('Вал')
-    await waitFor(() => expect(getOrderMaterials).toHaveBeenCalledWith(101, false))
+    await waitFor(() => expect(getOrderMaterials).toHaveBeenCalledWith(101))
 
     vi.mocked(getOrderMaterials).mockClear()
     await user.click(screen.getByRole('button', { name: 'Обновить обеспечение' }))
 
-    await waitFor(() => expect(getOrderMaterials).toHaveBeenCalledTimes(1))
-    expect(getOrderMaterials).toHaveBeenCalledWith(101, true)
+    await waitFor(() => expect(refreshOrderMaterials).toHaveBeenCalledTimes(1))
+    expect(refreshOrderMaterials).toHaveBeenCalledWith(101)
+    expect(getOrderMaterials).not.toHaveBeenCalled()
   })
 
   it('keeps the newest list response when an older refresh resolves last', async () => {
@@ -372,7 +376,7 @@ describe('ProductionControlPage — characterization', () => {
     vi.mocked(getOrderMaterials).mockReturnValueOnce(oldMaterials.promise).mockReturnValue(newMaterials.promise)
     renderPage()
     await waitFor(() => expect(within(ordersTable(document.body)).getByText('Вал')).toBeInTheDocument())
-    await waitFor(() => expect(getOrderMaterials).toHaveBeenCalledWith(101, false))
+    await waitFor(() => expect(getOrderMaterials).toHaveBeenCalledWith(101))
     fireEvent.doubleClick(rowFor('Вал'))
     await act(async () => { newMaterials.resolve({ ...fakeMaterials(), order_number: 'ORD-2', item_name: 'Вал', components: [{ ...fakeMaterials().components[0], item_name: 'Новый материал' }] }) })
     expect(await screen.findByText('Новый материал')).toBeInTheDocument()
@@ -455,8 +459,8 @@ describe('ProductionControlPage — characterization', () => {
     expect(within(shaftRow).getByRole('checkbox', { name: 'Выбрать заказ ORD-2' })).toBeChecked()
 
     fireEvent.keyDown(shaftRow, { key: 'Enter' })
-    await waitFor(() => expect(getOrderMaterials).toHaveBeenCalledWith(102, false))
-    expect(getOrderMaterials).not.toHaveBeenCalledWith(102, true)
+    await waitFor(() => expect(getOrderMaterials).toHaveBeenCalledWith(102))
+    expect(refreshOrderMaterials).not.toHaveBeenCalled()
     expect(shaftRow).toHaveAttribute('aria-selected', 'true')
     expect(screen.getByRole('combobox', { name: 'Статус заказа ORD-2' })).toBeInTheDocument()
   })
