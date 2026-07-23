@@ -193,20 +193,32 @@ def run_obligation_refresh(
 
     existing = db.query(models.LedgerGeneration).filter_by(generation_key=key).one_or_none()
     if existing is not None and str(existing.status) == "accepted":
-        # A published retry names the historical parent (which is no longer
-        # the pointer), but the *target* must be today's truth.  Validate it
-        # before the publisher performs its no-op audit.
+        # A service-level retry normally resolves ``parent_generation_id`` from
+        # today's pointer, which is now this already-published target.  The
+        # publisher's exact-retry audit, however, needs the immutable historical
+        # parent recorded in the sealed generation manifest.  Accept either
+        # spelling and never trust the caller to reconstruct that lineage.
         pointer = db.get(models.PlanningTruthState, 1)
-        parent = db.get(models.LedgerGeneration, int(parent_generation_id))
+        marks = dict(existing.source_watermarks or {})
+        try:
+            original_parent_id = int(marks["parent_generation_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ObligationRefreshOrchestratorError(
+                "published refresh lacks parent lineage"
+            ) from exc
+        original_parent = db.get(models.LedgerGeneration, original_parent_id)
         if (
-            pointer is None or parent is None or str(parent.status) != "accepted"
+            pointer is None
+            or original_parent is None
+            or str(original_parent.status) != "accepted"
             or int(pointer.current_generation_id or -1) != int(existing.id)
+            or int(parent_generation_id) not in {int(existing.id), original_parent_id}
         ):
             raise ObligationRefreshOrchestratorError(
                 "published retry requires target to be current accepted planning truth"
             )
         return _retry_published(
-            db, existing, parent_generation_id=parent_generation_id, add_plan_ids=add_ids,
+            db, existing, parent_generation_id=original_parent_id, add_plan_ids=add_ids,
             horizon_days=horizon_days, config_version_id=config_version_id, config_snapshot=config,
         )
     if existing is not None and str(existing.status) != "building":

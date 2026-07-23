@@ -136,6 +136,13 @@ def test_committed_exact_retry_is_publisher_noop_and_changed_request_is_rejected
     second = _run(db_session, accepted, "orch-retry", add=[plan.id], config={"v": 1})
     assert second.target_generation_id == first.target_generation_id
     assert second.published is False
+    # Public callers resolve the parent from the current pointer after a
+    # transport timeout.  That pointer now names the published target; exact
+    # retry must recover the historical parent from sealed lineage.
+    current = db_session.get(models.LedgerGeneration, first.target_generation_id)
+    pointer_retry = _run(db_session, current, "orch-retry", add=[plan.id], config={"v": 1})
+    assert pointer_retry.target_generation_id == first.target_generation_id
+    assert pointer_retry.published is False
     with pytest.raises(workflow.ObligationRefreshOrchestratorError, match="conflicting retry"):
         _run(db_session, accepted, "orch-retry", add=[plan.id], config={"v": 2})
 
