@@ -1,6 +1,8 @@
 """The freeze executor may materialize only unpublished candidate snapshots."""
 
 from datetime import date, datetime, timezone
+from hashlib import sha256
+import json
 
 import pytest
 
@@ -13,7 +15,27 @@ from app.services.mrp_freeze import (
 )
 
 
-def _candidate_world(db):
+def _seal_manifest(target, entries, *, add_plan_ids=(), add_config=None, horizon_days=None, config_version_id=None):
+    payload = {
+        "version": 1,
+        "entries": sorted(entries, key=lambda row: (row["plan_id"], row["action"])),
+        "add_request": {
+            "plan_ids": sorted(add_plan_ids),
+            "horizon_days": horizon_days,
+            "config_version_id": config_version_id,
+            "config_snapshot": add_config or {},
+        },
+    }
+    target.source_watermarks = {
+        **target.source_watermarks,
+        "obligation_refresh_manifest": payload,
+        "obligation_refresh_manifest_hash": sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+    }
+
+
+def _candidate_world(db, quantities=(10, 20)):
     cutoff = datetime(2026, 7, 23, 12, tzinfo=timezone.utc)
     physical = models.PhysicalImportBatch(
         batch_key="candidate-freeze-physical", status="completed", cutoff=cutoff,
@@ -58,7 +80,7 @@ def _candidate_world(db):
     db.add(future("t", 2))
 
     parents, candidates, lines = [], [], []
-    for index, qty in enumerate((10, 20), start=1):
+    for index, qty in enumerate(quantities, start=1):
         plan = models.ProductionPlanHeader(
             name=f"candidate {index}", period_from=date(2026, 8, index), period_to=date(2026, 8, 31), status="fixed",
         )
@@ -77,7 +99,32 @@ def _candidate_world(db):
         )
         db.add(candidate); db.flush()
         parents.append(parent); candidates.append(candidate); lines.append(line)
+    _seal_manifest(target, [
+        {
+            "action": "refresh", "plan_id": parent.source_plan_id,
+            "parent_run_id": parent.run_id, "candidate_run_id": candidate.run_id,
+        }
+        for parent, candidate in zip(parents, candidates)
+    ])
     return accepted, target, item, parents, candidates, lines
+
+
+def _add_candidate(db, target, item, *, index=9):
+    plan = models.ProductionPlanHeader(
+        name="new candidate", period_from=date(2026, 9, index), period_to=date(2026, 9, 30), status="fixed",
+    )
+    db.add(plan); db.flush()
+    line = models.ProductionPlanLine(
+        plan_id=plan.id, item_id=item.item_id, bucket_date=plan.period_from, qty=3,
+    )
+    candidate = models.PlanningRun(
+        status="BUILDING_SNAPSHOT", ledger_generation_id=target.id, prior_run_id=None,
+        source_plan_id=plan.id, period_from=plan.period_from, period_to=plan.period_to,
+        horizon_days=45, config_version_id=None, config_snapshot={"first": True},
+        started_at=datetime.now(timezone.utc), pinned=False,
+    )
+    db.add_all([line, candidate]); db.flush()
+    return plan, line, candidate
 
 
 def test_candidate_freeze_preserves_published_state_and_consumes_exact_pool_once(db_session, monkeypatch):
@@ -120,6 +167,49 @@ def test_candidate_freeze_preserves_published_state_and_consumes_exact_pool_once
 def test_retired_refreeze_entrypoint_is_not_callable(db_session):
     with pytest.raises(LedgerPoolUnavailable, match="retired"):
         refreeze_active_snapshots(db_session)
+
+
+def test_candidate_freeze_supports_sealed_add_only(db_session):
+    accepted, target, item, _parents, _candidates, _lines = _candidate_world(db_session, ())
+    plan, line, candidate = _add_candidate(db_session, target, item)
+    _seal_manifest(
+        target,
+        [{"action": "add", "plan_id": plan.id, "parent_run_id": None, "candidate_run_id": candidate.run_id}],
+        add_plan_ids=[plan.id], add_config={"first": True}, horizon_days=45,
+    )
+
+    report = freeze_candidate_snapshots(
+        db_session, parent_generation_id=accepted.id, target_generation_id=target.id,
+        candidate_run_ids=[candidate.run_id],
+    )
+
+    assert report["order"] == [candidate.run_id]
+    assert db_session.get(models.ProductionPlanLine, line.id).locked_by_run_id is None
+    assert db_session.query(models.MrpRequirement).filter_by(run_id=candidate.run_id).count() == 1
+
+
+def test_candidate_freeze_supports_sealed_refresh_and_add(db_session):
+    accepted, target, item, parents, candidates, _lines = _candidate_world(db_session)
+    plan, line, added = _add_candidate(db_session, target, item)
+    _seal_manifest(
+        target,
+        [
+            {
+                "action": "refresh", "plan_id": parent.source_plan_id,
+                "parent_run_id": parent.run_id, "candidate_run_id": candidate.run_id,
+            }
+            for parent, candidate in zip(parents, candidates)
+        ] + [{"action": "add", "plan_id": plan.id, "parent_run_id": None, "candidate_run_id": added.run_id}],
+        add_plan_ids=[plan.id], add_config={"first": True}, horizon_days=45,
+    )
+
+    freeze_candidate_snapshots(
+        db_session, parent_generation_id=accepted.id, target_generation_id=target.id,
+        candidate_run_ids=[row.run_id for row in candidates] + [added.run_id],
+    )
+
+    assert db_session.get(models.ProductionPlanLine, line.id).locked_by_run_id is None
+    assert db_session.query(models.MrpRequirement).filter_by(run_id=added.run_id).count() == 1
 
 
 def test_candidate_freeze_rejects_non_building_target(db_session):

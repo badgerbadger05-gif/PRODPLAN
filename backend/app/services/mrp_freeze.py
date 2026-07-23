@@ -31,7 +31,9 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from hashlib import sha256
+import json
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 from sqlalchemy import func, text
 from sqlalchemy.orm import Session
@@ -809,6 +811,57 @@ def freeze_candidate_snapshots(
     if target.cutoff != parent.cutoff or target.physical_import_batch_id != parent.physical_import_batch_id:
         raise LedgerPoolUnavailable("candidate freeze target does not share immutable physical prefix")
 
+    # A build is a closed set.  Do this validation before deriving anything so
+    # a worker cannot select only the convenient candidates from a sealed
+    # refresh/add batch (or slip an unsealed candidate into it).
+    from .obligation_refresh_manifest import MANIFEST_HASH_KEY, MANIFEST_KEY
+
+    watermarks = dict(target.source_watermarks or {})
+    manifest = watermarks.get(MANIFEST_KEY)
+    manifest_hash = watermarks.get(MANIFEST_HASH_KEY)
+    if not isinstance(manifest, Mapping) or not isinstance(manifest_hash, str):
+        raise LedgerPoolUnavailable("candidate freeze target lacks a sealed obligation_refresh_manifest")
+    canonical_manifest = json.dumps(
+        manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    if sha256(canonical_manifest.encode("utf-8")).hexdigest() != manifest_hash:
+        raise LedgerPoolUnavailable("candidate freeze obligation_refresh_manifest hash conflicts")
+    entries = manifest.get("entries")
+    add_request = manifest.get("add_request")
+    if not isinstance(entries, list) or not isinstance(add_request, Mapping):
+        raise LedgerPoolUnavailable("candidate freeze obligation_refresh_manifest is malformed")
+    if not isinstance(add_request.get("config_snapshot"), Mapping):
+        raise LedgerPoolUnavailable("candidate freeze add config is malformed")
+
+    manifest_entries: Dict[int, Mapping[str, Any]] = {}
+    manifest_plan_ids: Set[int] = set()
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            raise LedgerPoolUnavailable("candidate freeze obligation_refresh_manifest entry is malformed")
+        try:
+            action = str(entry["action"])
+            plan_id = int(entry["plan_id"])
+            candidate_id = int(entry["candidate_run_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise LedgerPoolUnavailable("candidate freeze obligation_refresh_manifest entry identity is malformed") from exc
+        if action not in {"refresh", "add"} or plan_id <= 0 or candidate_id <= 0:
+            raise LedgerPoolUnavailable("candidate freeze obligation_refresh_manifest contains unsupported action")
+        if candidate_id in manifest_entries or plan_id in manifest_plan_ids:
+            raise LedgerPoolUnavailable("candidate freeze obligation_refresh_manifest has duplicate candidate or plan")
+        manifest_entries[candidate_id] = entry
+        manifest_plan_ids.add(plan_id)
+    if set(manifest_entries) != set(requested_ids):
+        raise LedgerPoolUnavailable("candidate freeze ids differ from sealed obligation_refresh_manifest")
+
+    all_target_candidate_ids = {
+        int(run_id) for (run_id,) in db.query(PlanningRun.run_id).filter(
+            PlanningRun.ledger_generation_id == target_id,
+            PlanningRun.status == "BUILDING_SNAPSHOT",
+        ).all()
+    }
+    if all_target_candidate_ids != set(manifest_entries):
+        raise LedgerPoolUnavailable("candidate freeze target has missing or extra sealed candidates")
+
     runs = {
         int(run.run_id): run
         for run in db.query(PlanningRun).filter(PlanningRun.run_id.in_(requested_ids)).all()
@@ -819,14 +872,42 @@ def freeze_candidate_snapshots(
     for run in runs.values():
         if str(run.status) != "BUILDING_SNAPSHOT" or int(run.ledger_generation_id or 0) != target_id:
             raise LedgerPoolUnavailable("candidate freeze runs must be BUILDING_SNAPSHOT rows on target")
-        if run.prior_run_id is None:
-            raise LedgerPoolUnavailable("candidate freeze run lacks fixed parent")
-        old = db.get(PlanningRun, int(run.prior_run_id))
-        if old is None or str(old.status) != FIXED_SNAPSHOT_STATUS or int(old.ledger_generation_id or 0) != parent_id:
-            raise LedgerPoolUnavailable("candidate freeze parent run is not a fixed current-generation snapshot")
-        if old.source_plan_id != run.source_plan_id:
-            raise LedgerPoolUnavailable("candidate freeze source plan differs from parent")
-        parent_run_ids.add(int(old.run_id))
+        entry = manifest_entries[int(run.run_id)]
+        action = str(entry["action"])
+        if int(run.source_plan_id or -1) != int(entry["plan_id"]):
+            raise LedgerPoolUnavailable("candidate freeze source plan conflicts with sealed manifest")
+        if action == "refresh":
+            try:
+                parent_run_id = int(entry["parent_run_id"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise LedgerPoolUnavailable("candidate freeze refresh manifest lacks parent run") from exc
+            if run.prior_run_id is None or int(run.prior_run_id) != parent_run_id:
+                raise LedgerPoolUnavailable("candidate freeze refresh candidate parent conflicts with manifest")
+            old = db.get(PlanningRun, parent_run_id)
+            if old is None or str(old.status) != FIXED_SNAPSHOT_STATUS or int(old.ledger_generation_id or 0) != parent_id:
+                raise LedgerPoolUnavailable("candidate freeze parent run is not a fixed current-generation snapshot")
+            if old.source_plan_id != run.source_plan_id:
+                raise LedgerPoolUnavailable("candidate freeze source plan differs from parent")
+            parent_run_ids.add(int(old.run_id))
+        else:
+            if entry.get("parent_run_id") is not None or run.prior_run_id is not None:
+                raise LedgerPoolUnavailable("candidate freeze add candidate must not have a parent run")
+            plan = db.get(ProductionPlanHeader, int(run.source_plan_id))
+            if plan is None or str(plan.status) != "fixed":
+                raise LedgerPoolUnavailable("candidate freeze add plan must be fixed")
+            if run.period_from != plan.period_from or run.period_to != plan.period_to:
+                raise LedgerPoolUnavailable("candidate freeze add candidate period conflicts with fixed plan")
+            if (
+                run.horizon_days != add_request.get("horizon_days")
+                or run.config_version_id != add_request.get("config_version_id")
+                or run.config_snapshot != add_request["config_snapshot"]
+            ):
+                raise LedgerPoolUnavailable("candidate freeze add candidate config conflicts with manifest")
+            if db.query(ProductionPlanLine.id).filter(
+                ProductionPlanLine.plan_id == int(plan.id),
+                ProductionPlanLine.locked_by_run_id.isnot(None),
+            ).first() is not None:
+                raise LedgerPoolUnavailable("candidate freeze add plan lines must be unlocked")
         # Rebuild is deliberately only for an empty candidate.  Retrying a
         # partial candidate risks preserving stale derived rows.
         if db.query(MrpRequirement.id).filter(MrpRequirement.run_id == int(run.run_id)).first():
