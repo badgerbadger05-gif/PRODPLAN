@@ -6,7 +6,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.database import Base, get_db
-from app.models import DbrAssemblyRate, Item, ProductionResource
+from app.models import DbrAssemblyRate, DbrSettings, Item, ProductionResource
 from app.routers.dbr import router as dbr_router
 from app.services.dbr import settings_service
 
@@ -67,7 +67,7 @@ def _mk_item(db, code="НФ-00009114", name="Снегоход"):
 # --------------------------------------------------------------------------
 
 
-def test_get_settings_returns_defaults(client):
+def test_get_settings_returns_defaults_without_creating_row(client, db_session):
     resp = client.get("/api/v1/dbr/settings")
     assert resp.status_code == 200
     data = resp.json()
@@ -90,6 +90,7 @@ def test_get_settings_returns_defaults(client):
     assert str(data["shelf_threshold_qty"]) in ("5", "5.0", "5.000")
     assert data["w2_warehouse_ref1c"] is None
     assert data["fastener_categories"] == []
+    assert db_session.query(DbrSettings).count() == 0
 
 
 def test_put_settings_patches_fields(client):

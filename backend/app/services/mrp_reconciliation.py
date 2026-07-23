@@ -815,6 +815,7 @@ def reconcile_snapshot(
     dry_run: bool = False,
     ledger_cycle_ran: bool = False,
     manage_tx: bool = True,
+    diagnostic_legacy: bool = False,
 ) -> Dict[str, Any]:
     """Drift-correct one FIXED_SNAPSHOT run and repair its journal (v2 §8).
 
@@ -849,6 +850,11 @@ def reconcile_snapshot(
             CAPABILITY_EXECUTION_ALLOCATIONS,
         ),
     )
+    if not diagnostic_legacy:
+        raise NotImplementedError(
+            "MRP reconciliation is blocked until generation-scoped execution "
+            "and sizing are implemented"
+        )
 
     now = datetime.now(timezone.utc)
     open_reqs = (
@@ -912,7 +918,7 @@ def reconcile_snapshot(
         # Let a ledger-cycle failure propagate. Continuing with the previous
         # executed_qty cache could create or trim real supply from stale facts.
         try:
-            run_ledger_cycle(db)
+            run_ledger_cycle(db, diagnostic_legacy=True)
         except Exception:
             db.rollback()
             raise
@@ -1267,7 +1273,12 @@ def _reschedule_run_journal(
     return {"floating": floating, "fixed": fixed, "warnings": warnings}
 
 
-def reconcile_all_active(db: Session, *, dry_run: bool = False) -> Dict[str, Any]:
+def reconcile_all_active(
+    db: Session,
+    *,
+    dry_run: bool = False,
+    diagnostic_legacy: bool = False,
+) -> Dict[str, Any]:
     """Reconcile the latest snapshot of every plan whose period is still open.
 
     Composite cycle (v2 §6): the execution ledger (verify → executed → drift →
@@ -1328,9 +1339,29 @@ def reconcile_all_active(db: Session, *, dry_run: bool = False) -> Dict[str, Any
             "results": [],
         }
 
+    if not diagnostic_legacy:
+        return {
+            "status": "blocked",
+            "truth_status": truth_state.status,
+            "ledger_generation": truth_state.generation_id,
+            "cutoff": truth_state.cutoff.isoformat() if truth_state.cutoff else None,
+            "truth_reason": (
+                "generation-scoped reconciliation is not implemented; "
+                "legacy executed_qty is forbidden"
+            ),
+            "dry_run": bool(dry_run),
+            "runs_checked": 0,
+            "production_lines_added": 0,
+            "purchase_lines_added": 0,
+            "purchase_lines_pruned": 0,
+            "production_lines_trimmed": 0,
+            "execution_ledger": None,
+            "results": [],
+        }
+
     execution_ledger: Dict[str, Any]
     try:
-        execution_ledger = run_ledger_cycle(db)
+        execution_ledger = run_ledger_cycle(db, diagnostic_legacy=True)
         if not dry_run:
             db.commit()
     except Exception as exc:  # noqa: BLE001 — fail closed, never size from stale executed_qty
@@ -1371,7 +1402,8 @@ def reconcile_all_active(db: Session, *, dry_run: bool = False) -> Dict[str, Any
     for rid in run_ids:
         try:
             res = reconcile_snapshot(
-                db, rid, dry_run=dry_run, ledger_cycle_ran=True, manage_tx=not dry_run
+                db, rid, dry_run=dry_run, ledger_cycle_ran=True,
+                manage_tx=not dry_run, diagnostic_legacy=True,
             )
             total_production += len(res.get("production_added", []))
             total_purchase += len(res.get("purchase_added", []))

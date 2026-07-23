@@ -7,11 +7,13 @@ No OData, no writes into any pre-existing table (INV-1way / INV-no-write).
 
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import date, datetime
 from decimal import Decimal
-from typing import Iterable, List, Mapping, NamedTuple, Optional, Tuple, Union
+from typing import Any, Iterable, List, Mapping, NamedTuple, Optional, Tuple, Union
 
-from sqlalchemy import and_
+from sqlalchemy import and_, text
 from sqlalchemy.orm import Session
 
 from app import models
@@ -34,6 +36,80 @@ class LedgerKey(NamedTuple):
     characteristic_ref: str = ""
     organization_ref: str = ""
     warehouse_ref1c: str = ""
+
+
+def canonical_content_hash(value: Any) -> str:
+    """SHA-256 of a stable JSON representation used for physical fact identity."""
+    payload = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def canonical_decimal(value: Number) -> str:
+    """Stable non-exponent decimal text (5, 5.0 and Decimal('5.000') match)."""
+    normalized = _dec(value).normalize()
+    if normalized == 0:
+        return "0"
+    return format(normalized, "f")
+
+
+def ensure_physical_import_batch(
+    session: Session,
+    *,
+    batch_key: str,
+    cutoff: Optional[datetime],
+    source_watermarks: Mapping[str, Any],
+    batch: Optional[models.PhysicalImportBatch] = None,
+) -> models.PhysicalImportBatch:
+    """Return an explicit physical import boundary, creating it idempotently."""
+    if batch is not None:
+        retained = dict(batch.source_watermarks or {})
+        retained.update(dict(source_watermarks))
+        batch.source_watermarks = retained
+        if batch.cutoff is None:
+            batch.cutoff = cutoff
+        session.add(batch)
+        session.flush()
+        return batch
+    existing = (
+        session.query(models.PhysicalImportBatch)
+        .filter(models.PhysicalImportBatch.batch_key == batch_key)
+        .one_or_none()
+    )
+    if existing is not None:
+        return existing
+    created = models.PhysicalImportBatch(
+        batch_key=batch_key,
+        status="completed",
+        cutoff=cutoff,
+        source_watermarks=dict(source_watermarks),
+        completed_at=datetime.now(),
+    )
+    session.add(created)
+    session.flush()
+    return created
+
+
+def _lock_ledger_key(session: Session, ledger_key: LedgerKey) -> None:
+    """Serialize projection rewrites for a physical key on PostgreSQL."""
+    try:
+        dialect = session.get_bind().dialect.name
+    except Exception:
+        dialect = ""
+    if dialect != "postgresql":
+        return
+    digest = hashlib.sha1(
+        "\x1f".join(map(str, LedgerKey(*ledger_key))).encode("utf-8")
+    ).digest()[:8]
+    session.execute(
+        text("SELECT pg_advisory_xact_lock(:k)"),
+        {"k": int.from_bytes(digest, "big", signed=True)},
+    )
 
 
 def fold_running_balance(
@@ -66,6 +142,8 @@ def rebuild_running_balance(
     session: Session,
     ledger_key: LedgerKey,
     from_posting_at: Optional[datetime] = None,
+    *,
+    ledger_generation_id: Optional[int] = None,
 ) -> Decimal:
     """Recompute qty_after forward for one ledger key and refold stock_bin.on_hand.
 
@@ -76,11 +154,13 @@ def rebuild_running_balance(
     stock_bin (both ledger-1 tables).
     """
     ledger_key = LedgerKey(*ledger_key)
+    _lock_ledger_key(session, ledger_key)
     base_filter = and_(
         models.StockLedgerEntry.item_id == ledger_key.item_id,
         models.StockLedgerEntry.characteristic_ref == ledger_key.characteristic_ref,
         models.StockLedgerEntry.organization_ref == ledger_key.organization_ref,
         models.StockLedgerEntry.warehouse_ref1c == ledger_key.warehouse_ref1c,
+        models.StockLedgerEntry.active.is_(True),
     )
 
     ordered = (
@@ -110,26 +190,29 @@ def rebuild_running_balance(
     on_hand = ordered[-1].qty_after if ordered else Decimal("0")
     on_hand = _dec(on_hand)
 
-    bin_row = (
-        session.query(models.StockBin)
-        .filter(
-            models.StockBin.item_id == ledger_key.item_id,
-            models.StockBin.characteristic_ref == ledger_key.characteristic_ref,
-            models.StockBin.organization_ref == ledger_key.organization_ref,
-            models.StockBin.warehouse_ref1c == ledger_key.warehouse_ref1c,
+    if ledger_generation_id is not None:
+        bin_row = (
+            session.query(models.StockBin)
+            .filter(
+                models.StockBin.ledger_generation_id == int(ledger_generation_id),
+                models.StockBin.item_id == ledger_key.item_id,
+                models.StockBin.characteristic_ref == ledger_key.characteristic_ref,
+                models.StockBin.organization_ref == ledger_key.organization_ref,
+                models.StockBin.warehouse_ref1c == ledger_key.warehouse_ref1c,
+            )
+            .one_or_none()
         )
-        .one_or_none()
-    )
-    if bin_row is None:
-        bin_row = models.StockBin(
-            item_id=ledger_key.item_id,
-            characteristic_ref=ledger_key.characteristic_ref,
-            organization_ref=ledger_key.organization_ref,
-            warehouse_ref1c=ledger_key.warehouse_ref1c,
-        )
-        session.add(bin_row)
-    bin_row.on_hand = on_hand
-    bin_row.last_entry_id = last_entry_id
+        if bin_row is None:
+            bin_row = models.StockBin(
+                ledger_generation_id=int(ledger_generation_id),
+                item_id=ledger_key.item_id,
+                characteristic_ref=ledger_key.characteristic_ref,
+                organization_ref=ledger_key.organization_ref,
+                warehouse_ref1c=ledger_key.warehouse_ref1c,
+            )
+            session.add(bin_row)
+        bin_row.on_hand = on_hand
+        bin_row.last_entry_id = last_entry_id
     session.flush()
     return on_hand
 
@@ -140,6 +223,9 @@ def seed_from_balance(
     anchor_period: date,
     posting_at: Optional[datetime] = None,
     ingest_source: str = "seed",
+    *,
+    import_batch: Optional[models.PhysicalImportBatch] = None,
+    ledger_generation_id: Optional[int] = None,
 ) -> List[models.StockLedgerEntry]:
     """Seed ledger-1 from a Balance dict {ledger_key: qty} (design §2.1 seed / §6).
 
@@ -151,6 +237,23 @@ def seed_from_balance(
     """
     posting_at = posting_at or datetime.combine(anchor_period, datetime.min.time())
     created: List[models.StockLedgerEntry] = []
+    snapshot_hash = canonical_content_hash(
+        [
+            [list(LedgerKey(*key)), canonical_decimal(qty)]
+            for key, qty in sorted(balance_snapshot.items(), key=lambda pair: tuple(pair[0]))
+        ]
+    )
+    import_batch = ensure_physical_import_batch(
+        session,
+        batch_key=f"seed:{anchor_period.isoformat()}:{snapshot_hash}",
+        cutoff=posting_at,
+        source_watermarks={
+            "source": ingest_source,
+            "anchor_period": anchor_period.isoformat(),
+            "content_hash": snapshot_hash,
+        },
+        batch=import_batch,
+    )
 
     for raw_key, raw_qty in balance_snapshot.items():
         key = LedgerKey(*raw_key)
@@ -175,6 +278,16 @@ def seed_from_balance(
             continue  # already seeded for this period/key — idempotent skip.
 
         entry = models.StockLedgerEntry(
+            ingest_batch_id=import_batch.id,
+            source_content_hash=canonical_content_hash(
+                {
+                    "recorder_type": "seed",
+                    "recorder_ref": recorder_ref,
+                    "line_no": "0",
+                    "qty": canonical_decimal(qty),
+                    "posting_at": posting_at.isoformat(),
+                }
+            ),
             item_id=key.item_id,
             characteristic_ref=key.characteristic_ref,
             organization_ref=key.organization_ref,
@@ -193,29 +306,14 @@ def seed_from_balance(
         session.flush()  # assign entry.id
         created.append(entry)
 
-        bin_row = (
-            session.query(models.StockBin)
-            .filter(
-                models.StockBin.item_id == key.item_id,
-                models.StockBin.characteristic_ref == key.characteristic_ref,
-                models.StockBin.organization_ref == key.organization_ref,
-                models.StockBin.warehouse_ref1c == key.warehouse_ref1c,
+        if ledger_generation_id is not None:
+            rebuild_running_balance(
+                session, key, ledger_generation_id=ledger_generation_id
             )
-            .one_or_none()
-        )
-        if bin_row is None:
-            bin_row = models.StockBin(
-                item_id=key.item_id,
-                characteristic_ref=key.characteristic_ref,
-                organization_ref=key.organization_ref,
-                warehouse_ref1c=key.warehouse_ref1c,
-            )
-            session.add(bin_row)
-        bin_row.on_hand = qty
-        bin_row.last_entry_id = entry.id
 
         session.add(
             models.StockLedgerAnchor(
+                ingest_batch_id=import_batch.id,
                 item_id=key.item_id,
                 characteristic_ref=key.characteristic_ref,
                 organization_ref=key.organization_ref,

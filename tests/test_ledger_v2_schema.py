@@ -10,6 +10,26 @@ import datetime
 from app import models
 
 
+def _generation(db_session):
+    imported = models.PhysicalImportBatch(
+        batch_key="ledger-v2-physical",
+        status="completed",
+        source_watermarks={"fixture": "ledger-v2"},
+        completed_at=datetime.datetime(2026, 1, 1),
+    )
+    generation = models.LedgerGeneration(
+        generation_key="ledger-v2-generation",
+        status="building",
+        source_watermarks={},
+        capabilities={},
+        physical_import_batch=imported,
+        algorithm_version="tests/1",
+    )
+    db_session.add(generation)
+    db_session.flush()
+    return generation
+
+
 def _mk_item_run_req(db_session):
     item = models.Item(item_code="LEDGER-V2", item_name="Ledger V2 Test")
     db_session.add(item)
@@ -96,7 +116,11 @@ def test_freeze_component_defaults(db_session):
 
 def test_execution_allocation_defaults(db_session):
     _item, _run, req = _mk_item_run_req(db_session)
-    row = models.MrpExecutionAllocation(requirement_id=req.id)
+    generation = _generation(db_session)
+    row = models.MrpExecutionAllocation(
+        ledger_generation_id=generation.id,
+        requirement_id=req.id,
+    )
     db_session.add(row)
     db_session.commit()
     db_session.refresh(row)

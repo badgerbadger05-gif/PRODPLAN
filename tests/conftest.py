@@ -30,3 +30,29 @@ def db_session():
     finally:
         db.close()
         Base.metadata.drop_all(bind=engine)
+
+
+@pytest.fixture
+def building_ledger_generation(db_session):
+    """Explicit mutable Ledger context for generation-aware writer tests."""
+    imported = models.PhysicalImportBatch(
+        batch_key="test-physical-import",
+        status="completed",
+        source_watermarks={},
+    )
+    generation = models.LedgerGeneration(
+        generation_key="test-building-generation",
+        status="building",
+        source_watermarks={},
+        capabilities={},
+        physical_import_batch=imported,
+        algorithm_version="tests/1",
+    )
+    db_session.add(generation)
+    db_session.flush()
+    db_session.add(models.PlanningTruthState(
+        id=1,
+        current_generation_id=generation.id,
+    ))
+    db_session.commit()
+    return generation

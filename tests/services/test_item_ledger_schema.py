@@ -10,6 +10,26 @@ import datetime
 from app import models
 
 
+def _lineage(db_session):
+    imported = models.PhysicalImportBatch(
+        batch_key="schema-physical",
+        status="completed",
+        source_watermarks={"fixture": "schema"},
+        completed_at=datetime.datetime(2026, 7, 1),
+    )
+    generation = models.LedgerGeneration(
+        generation_key="schema-generation",
+        status="building",
+        source_watermarks={},
+        capabilities={},
+        physical_import_batch=imported,
+        algorithm_version="tests/1",
+    )
+    db_session.add(generation)
+    db_session.flush()
+    return imported, generation
+
+
 def _mk_item(db_session, code="IL-SCHEMA"):
     item = models.Item(item_code=code, item_name=code)
     db_session.add(item)
@@ -27,7 +47,9 @@ def test_stock_warehouse_finished_goods_default(db_session):
 
 def test_stock_ledger_entry_defaults(db_session):
     item = _mk_item(db_session)
+    imported, _generation = _lineage(db_session)
     row = models.StockLedgerEntry(
+        ingest_batch_id=imported.id, source_content_hash="a" * 64,
         item_id=item.item_id, qty=1, recorder_type="Doc", recorder_ref="X", line_no="1",
         posting_at=datetime.datetime(2026, 7, 1),
     )
@@ -42,7 +64,11 @@ def test_stock_ledger_entry_defaults(db_session):
 
 def test_stock_bin_defaults(db_session):
     item = _mk_item(db_session, code="IL-BIN")
-    row = models.StockBin(item_id=item.item_id, warehouse_ref1c="WH1")
+    _imported, generation = _lineage(db_session)
+    row = models.StockBin(
+        ledger_generation_id=generation.id,
+        item_id=item.item_id, warehouse_ref1c="WH1",
+    )
     db_session.add(row)
     db_session.commit()
     db_session.refresh(row)
@@ -52,9 +78,11 @@ def test_stock_bin_defaults(db_session):
 
 def test_stock_recorder_pull_and_anchor_defaults(db_session):
     item = _mk_item(db_session, code="IL-PULL")
+    imported, _generation = _lineage(db_session)
     pull = models.StockRecorderPull(recorder_type="Doc", recorder_ref="R1")
     db_session.add(pull)
     anchor = models.StockLedgerAnchor(
+        ingest_batch_id=imported.id,
         item_id=item.item_id, warehouse_ref1c="WH1", anchor_period=datetime.date(2026, 7, 1),
     )
     db_session.add(anchor)
@@ -67,6 +95,7 @@ def test_stock_recorder_pull_and_anchor_defaults(db_session):
 
 def _mk_reservation_row(db_session):
     item = _mk_item(db_session, code="IL-RES")
+    _imported, generation = _lineage(db_session)
     run = models.PlanningRun(config_snapshot={})
     db_session.add(run)
     db_session.flush()
@@ -77,6 +106,7 @@ def _mk_reservation_row(db_session):
     db_session.add(req)
     db_session.flush()
     entry = models.ReservationEntry(
+        ledger_generation_id=generation.id,
         item_id=item.item_id, requirement_id=req.id,
         priority_period_from=datetime.date(2026, 7, 1), priority_period_to=datetime.date(2026, 7, 15),
     )
@@ -99,6 +129,7 @@ def test_reservation_entry_defaults(db_session):
 def test_reservation_event_and_coverage_defaults(db_session):
     item, entry = _mk_reservation_row(db_session)
     ev = models.ReservationEvent(
+        ledger_generation_id=entry.ledger_generation_id,
         reservation_id=entry.id, item_id=item.item_id, event_kind="open",
         reserved_delta=6, idempotency_key="open:1",
     )

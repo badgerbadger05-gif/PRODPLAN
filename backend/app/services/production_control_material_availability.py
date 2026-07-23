@@ -575,9 +575,8 @@ def preview_materials(db: Session, product_id: int, *, refresh_state: bool = Fal
     return payload
 
 
-def get_materials_snapshot(db: Session, product_id: int, *, refresh: bool = False) -> Dict[str, Any]:
-    if refresh:
-        return preview_materials(db, int(product_id), refresh_state=True)
+def get_materials_snapshot(db: Session, product_id: int) -> Dict[str, Any]:
+    """Read stored coverage only; missing snapshots use a read-only preview."""
     state = (
         db.query(ProductionOrderLineState)
         .filter(ProductionOrderLineState.product_id == int(product_id))
@@ -587,6 +586,11 @@ def get_materials_snapshot(db: Session, product_id: int, *, refresh: bool = Fals
     if isinstance(snapshot, dict):
         return dict(snapshot)
     return preview_materials(db, int(product_id), refresh_state=False)
+
+
+def refresh_materials_snapshot(db: Session, product_id: int) -> Dict[str, Any]:
+    """Explicit mutation path used by POST/background workers."""
+    return preview_materials(db, int(product_id), refresh_state=True)
 
 
 def _active_product_ids(db: Session, *, limit: int = 0) -> List[int]:

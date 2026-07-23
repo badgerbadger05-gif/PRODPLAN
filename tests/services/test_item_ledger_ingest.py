@@ -26,7 +26,7 @@ from app.services.item_ledger import (
     LedgerKey,
     enqueue_recorder_pull,
     process_pending_pulls,
-    pull_recorder_movements,
+    pull_recorder_movements as _pull_recorder_movements,
     seed_from_balance,
 )
 from app.services.item_ledger.ingest import EMPTY_GUID
@@ -104,7 +104,31 @@ def _setup(db):
         models.StockWarehouse(warehouse_ref1c="wh-2", warehouse_name="WH2"),
     ])
     db.flush()
+    batch = models.PhysicalImportBatch(
+        batch_key=f"ingest-test-{item1.item_id}",
+        status="completed",
+        cutoff=datetime.datetime(2026, 7, 31),
+        source_watermarks={},
+        completed_at=datetime.datetime(2026, 7, 31),
+    )
+    generation = models.LedgerGeneration(
+        generation_key=f"ingest-test-{item1.item_id}",
+        status="building",
+        cutoff=datetime.datetime(2026, 7, 31),
+        source_watermarks={},
+        capabilities={},
+        physical_import_batch=batch,
+        algorithm_version="test/ingest",
+    )
+    db.add(generation)
+    db.flush()
+    db.info["item_ledger_generation_id"] = generation.id
     return item1, item2
+
+
+def pull_recorder_movements(db, *args, **kwargs):
+    kwargs.setdefault("ledger_generation_id", db.info.get("item_ledger_generation_id"))
+    return _pull_recorder_movements(db, *args, **kwargs)
 
 
 def _snapshot(db, recorder_ref):
@@ -237,7 +261,7 @@ def test_pull_replace_by_recorder_idempotent(db_session):
     second = _snapshot(db_session, "asm-1")
 
     assert first == second  # INV-idem — identical row set on re-pull
-    assert res2.deleted == 2
+    assert res2.deleted == 0 and res2.inserted == 0
     assert db_session.query(models.StockLedgerEntry).count() == 2
 
 
@@ -251,8 +275,11 @@ def test_pull_replace_by_recorder_updates_qty(db_session):
     res = pull_recorder_movements(db_session, ASSEMBLY, "asm-1", client=c2)
     db_session.commit()
 
-    assert res.deleted == 1
-    assert db_session.query(models.StockLedgerEntry).filter_by(recorder_ref="asm-1").count() == 1
+    assert res.deleted == 0
+    assert db_session.query(models.StockLedgerEntry).filter_by(recorder_ref="asm-1").count() == 2
+    assert db_session.query(models.StockLedgerEntry).filter_by(
+        recorder_ref="asm-1", active=True
+    ).count() == 1
     assert _f(db_session.query(models.StockBin).filter_by(item_id=item1.item_id).one().on_hand) == 8
 
 
@@ -338,7 +365,11 @@ def test_process_pending_pulls_happy(db_session):
     db_session.commit()
 
     client = FakeODataClient({"asm-1": [_line("1", "Receipt", "ref-item-1", "wh-1", 5)]})
-    results = process_pending_pulls(db_session, client=client)
+    results = process_pending_pulls(
+        db_session,
+        client=client,
+        ledger_generation_id=db_session.info["item_ledger_generation_id"],
+    )
 
     assert len(results) == 1 and results[0].status == "done"
     pull = db_session.query(models.StockRecorderPull).filter_by(recorder_ref="asm-1").one()

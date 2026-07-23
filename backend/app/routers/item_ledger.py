@@ -32,12 +32,36 @@ from pydantic import BaseModel, ConfigDict
 
 from .. import models
 from ..database import get_db
+from ..services.item_ledger.physical_visibility import visible_sle_query
 from ..services.item_ledger.reservation_ledger import item_ledger_position
 from ..services.mrp_freeze import pool_key_for
+from ..services.planning_truth import (
+    CAPABILITY_PHYSICAL_LEDGER,
+    CAPABILITY_RESERVATION_REPLAY,
+    PlanningTruthUnavailable,
+    require_accepted_truth,
+)
 
 router = APIRouter(prefix="/v1/item-ledger", tags=["item-ledger"])
 
 EPS = 1e-9
+
+
+def _accepted_generation(
+    db: Session,
+    *,
+    consumer: str,
+    capabilities: tuple[str, ...],
+) -> int:
+    try:
+        truth = require_accepted_truth(
+            db,
+            consumer,
+            required_capabilities=capabilities,
+        )
+    except PlanningTruthUnavailable as exc:
+        raise HTTPException(status_code=409, detail=exc.as_dict()) from exc
+    return int(truth.generation_id)
 
 
 class ItemLedgerPositionWarehouse(BaseModel):
@@ -245,7 +269,16 @@ def get_position(item_id: int, db: Session = Depends(get_db)) -> ItemLedgerPosit
     ``uncovered`` are surfaced as-is (a negative available is a deficit signal,
     not clamped)."""
     item = _get_item_or_404(db, item_id)
-    pos = item_ledger_position(db, [int(item_id)]).get(int(item_id), {})
+    generation_id = _accepted_generation(
+        db,
+        consumer="item_ledger.position",
+        capabilities=(CAPABILITY_PHYSICAL_LEDGER, CAPABILITY_RESERVATION_REPLAY),
+    )
+    pos = item_ledger_position(
+        db,
+        [int(item_id)],
+        ledger_generation_id=generation_id,
+    ).get(int(item_id), {})
 
     on_hand = _f(pos.get("on_hand"))
     reserved_soft = _f(pos.get("reserved_soft"))
@@ -255,7 +288,10 @@ def get_position(item_id: int, db: Session = Depends(get_db)) -> ItemLedgerPosit
     name_by_ref, sel, fg, ign, has_settings = _contour(db)
     bin_rows = (
         db.query(models.StockBin.warehouse_ref1c, func.sum(models.StockBin.on_hand))
-        .filter(models.StockBin.item_id == int(item_id))
+        .filter(
+            models.StockBin.item_id == int(item_id),
+            models.StockBin.ledger_generation_id == generation_id,
+        )
         .group_by(models.StockBin.warehouse_ref1c)
         .all()
     )
@@ -277,6 +313,7 @@ def get_position(item_id: int, db: Session = Depends(get_db)) -> ItemLedgerPosit
         db.query(models.StockBin.id)
         .filter(
             models.StockBin.item_id == int(item_id),
+            models.StockBin.ledger_generation_id == generation_id,
             func.abs(models.StockBin.reconcile_pending_qty) > EPS,
         )
         .first()
@@ -323,12 +360,21 @@ def get_movements(
     sorted ``(posting_at, id)``, paginated (total + rows). ``qty_after`` is the
     running balance the ledger carried — "how it computed"."""
     _get_item_or_404(db, item_id)
+    generation_id = _accepted_generation(
+        db,
+        consumer="item_ledger.movements",
+        capabilities=(CAPABILITY_PHYSICAL_LEDGER,),
+    )
 
     name_by_ref, *_ = _contour(db)
 
-    q = db.query(models.StockLedgerEntry).filter(
+    generation = db.get(models.LedgerGeneration, generation_id)
+    q = visible_sle_query(
+        db,
+        physical_import_batch_id=int(generation.physical_import_batch_id),
+        cutoff=generation.cutoff,
+    ).filter(
         models.StockLedgerEntry.item_id == int(item_id),
-        models.StockLedgerEntry.active.is_(True),
     )
     if date_from is not None:
         q = q.filter(models.StockLedgerEntry.posting_at >= date_from)
@@ -385,9 +431,15 @@ def get_reservations(
     in reservations, what covers each and how much is uncovered. ``make`` rows
     contribute 0 to reserved_soft (surfaced separately as production)."""
     _get_item_or_404(db, item_id)
+    generation_id = _accepted_generation(
+        db,
+        consumer="item_ledger.reservations",
+        capabilities=(CAPABILITY_RESERVATION_REPLAY,),
+    )
 
     q = db.query(models.ReservationEntry).filter(
-        models.ReservationEntry.item_id == int(item_id)
+        models.ReservationEntry.item_id == int(item_id),
+        models.ReservationEntry.ledger_generation_id == generation_id,
     )
     if status is not None:
         q = q.filter(models.ReservationEntry.lifecycle_status == status)
@@ -457,9 +509,17 @@ def get_reservation_events(
     ``sle_id`` links an event to the physical movement that closed it — the debug
     thread. 404 unless the reservation belongs to the item."""
     _get_item_or_404(db, item_id)
+    generation_id = _accepted_generation(
+        db,
+        consumer="item_ledger.reservation_events",
+        capabilities=(CAPABILITY_RESERVATION_REPLAY,),
+    )
     entry = (
         db.query(models.ReservationEntry)
-        .filter(models.ReservationEntry.id == int(reservation_id))
+        .filter(
+            models.ReservationEntry.id == int(reservation_id),
+            models.ReservationEntry.ledger_generation_id == generation_id,
+        )
         .one_or_none()
     )
     if entry is None or int(entry.item_id) != int(item_id):
@@ -469,7 +529,10 @@ def get_reservation_events(
         )
     events = (
         db.query(models.ReservationEvent)
-        .filter(models.ReservationEvent.reservation_id == int(reservation_id))
+        .filter(
+            models.ReservationEvent.reservation_id == int(reservation_id),
+            models.ReservationEvent.ledger_generation_id == generation_id,
+        )
         .order_by(
             models.ReservationEvent.event_at.asc(),
             models.ReservationEvent.id.asc(),

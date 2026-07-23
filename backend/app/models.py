@@ -28,6 +28,27 @@ def compile_jsonb(element, compiler, **kw):
 BigIntPK = BigInteger().with_variant(Integer(), "sqlite")
 
 
+class PhysicalImportBatch(Base):
+    """One immutable import boundary for shared physical Ledger facts."""
+    __tablename__ = "physical_import_batch"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('building', 'completed', 'rejected')",
+            name="ck_physical_import_batch_status",
+        ),
+        UniqueConstraint("batch_key", name="uq_physical_import_batch_key"),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    batch_key = Column(String(128), nullable=False)
+    status = Column(String(16), nullable=False, server_default="building")
+    cutoff = Column(DateTime(timezone=True), nullable=True)
+    source_watermarks = Column(CrossPlatformJSON, nullable=False, default=dict)
+    reason = Column(TEXT, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
 class LedgerGeneration(Base):
     """A versioned build of the Item Ledger fact set.
 
@@ -49,6 +70,12 @@ class LedgerGeneration(Base):
     cutoff = Column(DateTime(timezone=True), nullable=True)
     source_watermarks = Column(CrossPlatformJSON, nullable=False, default=dict)
     capabilities = Column(CrossPlatformJSON, nullable=False, default=dict)
+    physical_import_batch_id = Column(
+        BigInteger,
+        ForeignKey("physical_import_batch.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
     algorithm_version = Column(String(128), nullable=False)
     replay_version = Column(String(128), nullable=True)
     reason = Column(TEXT, nullable=True)
@@ -58,6 +85,46 @@ class LedgerGeneration(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now(),
         onupdate=func.now(),
     )
+
+    physical_import_batch = relationship("PhysicalImportBatch")
+
+
+class LedgerBuildBatch(Base):
+    """Auditable stage execution while constructing one Ledger generation."""
+    __tablename__ = "ledger_build_batch"
+    __table_args__ = (
+        CheckConstraint(
+            "stage IN ('physical_import', 'reservation_replay', "
+            "'execution_allocation', 'snapshot_build')",
+            name="ck_ledger_build_batch_stage",
+        ),
+        CheckConstraint(
+            "status IN ('building', 'completed', 'rejected')",
+            name="ck_ledger_build_batch_status",
+        ),
+        UniqueConstraint(
+            "ledger_generation_id", "stage", "batch_key",
+            name="uq_ledger_build_batch_generation_stage_key",
+        ),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    stage = Column(String(32), nullable=False)
+    batch_key = Column(String(128), nullable=False)
+    status = Column(String(16), nullable=False, server_default="building")
+    algorithm_version = Column(String(128), nullable=False)
+    metrics = Column(CrossPlatformJSON, nullable=False, default=dict)
+    reason = Column(TEXT, nullable=True)
+    started_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+    ledger_generation = relationship("LedgerGeneration")
 
 
 class PlanningTruthState(Base):
@@ -1971,6 +2038,7 @@ class MrpExecutionAllocation(Base):
     __tablename__ = "mrp_execution_allocation"
     __table_args__ = (
         UniqueConstraint(
+            "ledger_generation_id",
             "requirement_id",
             "bucket_id",
             "fact_type",
@@ -1985,6 +2053,12 @@ class MrpExecutionAllocation(Base):
     )
 
     id = Column(Integer, primary_key=True, index=True)
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
     cycle_id = Column(String(64), nullable=False, server_default="")
     requirement_id = Column(Integer, ForeignKey("mrp_requirement.id", ondelete="CASCADE"), nullable=False, index=True)
     bucket_id = Column(Integer, ForeignKey("mrp_requirement_bucket.id", ondelete="CASCADE"), nullable=True, index=True)
@@ -2009,6 +2083,7 @@ class MrpExecutionAllocation(Base):
     bucket = relationship("MrpRequirementBucket")
     freeze_allocation = relationship("MrpFreezeAllocation")
     origin_requirement = relationship("MrpRequirement", foreign_keys=[origin_requirement_id])
+    ledger_generation = relationship("LedgerGeneration")
 
 
 class MrpRequirementCarry(Base):
@@ -2117,6 +2192,8 @@ class StockLedgerEntry(Base):
             "recorder_type",
             "recorder_ref",
             "line_no",
+            "source_content_hash",
+            "ingest_batch_id",
             name="ux_stock_ledger_entry_recorder_line",
         ),
         Index(
@@ -2132,6 +2209,13 @@ class StockLedgerEntry(Base):
     )
 
     id = Column(BigIntPK, primary_key=True, index=True)
+    ingest_batch_id = Column(
+        BigInteger,
+        ForeignKey("physical_import_batch.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    source_content_hash = Column(String(64), nullable=False)
     item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
     characteristic_ref = Column(String(36), nullable=False, server_default="")
     organization_ref = Column(String(36), nullable=False, server_default="")
@@ -2156,6 +2240,43 @@ class StockLedgerEntry(Base):
     created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
 
     item = relationship("Item")
+    ingest_batch = relationship("PhysicalImportBatch")
+
+
+class StockLedgerFactSupersession(Base):
+    """Append-only replacement edge preserving earlier accepted fact prefixes."""
+    __tablename__ = "stock_ledger_fact_supersession"
+    __table_args__ = (
+        UniqueConstraint(
+            "import_batch_id", "old_sle_id",
+            name="uq_stock_ledger_supersession_transition",
+        ),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    old_sle_id = Column(
+        BigInteger,
+        ForeignKey("stock_ledger_entry.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    new_sle_id = Column(
+        BigInteger,
+        ForeignKey("stock_ledger_entry.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    import_batch_id = Column(
+        BigInteger,
+        ForeignKey("physical_import_batch.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+    old_sle = relationship("StockLedgerEntry", foreign_keys=[old_sle_id])
+    new_sle = relationship("StockLedgerEntry", foreign_keys=[new_sle_id])
+    import_batch = relationship("PhysicalImportBatch")
 
 
 class StockBin(Base):
@@ -2166,6 +2287,7 @@ class StockBin(Base):
     __tablename__ = "stock_bin"
     __table_args__ = (
         UniqueConstraint(
+            "ledger_generation_id",
             "item_id",
             "characteristic_ref",
             "organization_ref",
@@ -2182,6 +2304,12 @@ class StockBin(Base):
     )
 
     id = Column(Integer, primary_key=True, index=True)
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
     item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
     characteristic_ref = Column(String(36), nullable=False, server_default="")
     organization_ref = Column(String(36), nullable=False, server_default="")
@@ -2197,6 +2325,7 @@ class StockBin(Base):
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now(), server_default=func.now(), nullable=False)
 
     item = relationship("Item")
+    ledger_generation = relationship("LedgerGeneration")
 
 
 class StockRecorderPull(Base):
@@ -2257,6 +2386,12 @@ class StockLedgerAnchor(Base):
     )
 
     id = Column(Integer, primary_key=True, index=True)
+    ingest_batch_id = Column(
+        BigInteger,
+        ForeignKey("physical_import_batch.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
     item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
     characteristic_ref = Column(String(36), nullable=False, server_default="")
     organization_ref = Column(String(36), nullable=False, server_default="")
@@ -2270,6 +2405,7 @@ class StockLedgerAnchor(Base):
     created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
 
     item = relationship("Item")
+    ingest_batch = relationship("PhysicalImportBatch")
 
 
 class ReservationEntry(Base):
@@ -2281,7 +2417,10 @@ class ReservationEntry(Base):
 
     __tablename__ = "reservation_entry"
     __table_args__ = (
-        UniqueConstraint("requirement_id", "realization_mode", name="ux_reservation_entry_req_mode"),
+        UniqueConstraint(
+            "ledger_generation_id", "requirement_id", "realization_mode",
+            name="ux_reservation_entry_req_mode",
+        ),
         Index(
             "ix_reservation_entry_pool",
             "item_id",
@@ -2295,6 +2434,12 @@ class ReservationEntry(Base):
     )
 
     id = Column(BigIntPK, primary_key=True, index=True)
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
     item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
     characteristic_ref = Column(String(36), nullable=False, server_default="")
     organization_ref = Column(String(36), nullable=False, server_default="")
@@ -2324,6 +2469,7 @@ class ReservationEntry(Base):
     item = relationship("Item")
     run = relationship("PlanningRun")
     requirement = relationship("MrpRequirement")
+    ledger_generation = relationship("LedgerGeneration")
 
 
 class ReservationEvent(Base):
@@ -2334,7 +2480,10 @@ class ReservationEvent(Base):
 
     __tablename__ = "reservation_event"
     __table_args__ = (
-        UniqueConstraint("idempotency_key", name="ux_reservation_event_idempotency"),
+        UniqueConstraint(
+            "ledger_generation_id", "idempotency_key",
+            name="ux_reservation_event_idempotency",
+        ),
         Index("ix_reservation_event_reservation", "reservation_id"),
         Index(
             "ix_reservation_event_pool",
@@ -2347,6 +2496,12 @@ class ReservationEvent(Base):
     )
 
     id = Column(BigIntPK, primary_key=True, index=True)
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
     reservation_id = Column(BigInteger, ForeignKey("reservation_entry.id", ondelete="CASCADE"), nullable=False)
     item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
     characteristic_ref = Column(String(36), nullable=False, server_default="")
@@ -2369,6 +2524,7 @@ class ReservationEvent(Base):
 
     reservation = relationship("ReservationEntry")
     item = relationship("Item")
+    ledger_generation = relationship("LedgerGeneration")
 
 
 class ReservationCoverage(Base):

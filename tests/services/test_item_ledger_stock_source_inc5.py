@@ -24,6 +24,8 @@ import datetime
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("building_ledger_generation")
+
 from app import models
 from app.services.item_ledger import (
     LedgerKey,
@@ -38,6 +40,10 @@ from app.services.mrp_freeze import build_shared_pools
 from app.services.period_plan_service import material_availability_positions
 
 EPS = 1e-9
+
+
+def _generation_id(db):
+    return db.get(models.PlanningTruthState, 1).current_generation_id
 
 
 # ---------------------------------------------------------------------------
@@ -72,13 +78,22 @@ def _iws(db, item_id, wh, qty):
 
 
 def _seed_bin(db, item_id, wh, qty, period=datetime.date(2026, 7, 1)):
-    seed_from_balance(db, {LedgerKey(item_id, "", "", wh): qty}, anchor_period=period)
+    generation = db.get(models.PlanningTruthState, 1).current_generation
+    seed_from_balance(
+        db,
+        {LedgerKey(item_id, "", "", wh): qty},
+        anchor_period=period,
+        import_batch=generation.physical_import_batch,
+        ledger_generation_id=generation.id,
+    )
     db.flush()
 
 
 def _res(db, item_id, req_id, reserved, *, mode="consume", realized=0.0, status="active"):
+    generation_id = db.get(models.PlanningTruthState, 1).current_generation_id
     db.add(
         models.ReservationEntry(
+            ledger_generation_id=generation_id,
             item_id=item_id,
             requirement_id=req_id,
             run_id=None,
@@ -290,7 +305,9 @@ def test_item_ledger_position_projection(db_session):
     _res(db, x.item_id, 9002, 5.0, mode="consume")
     _res(db, x.item_id, 9003, 100.0, mode="make")
 
-    pos = item_ledger_position(db)[x.item_id]
+    pos = item_ledger_position(
+        db, ledger_generation_id=_generation_id(db),
+    )[x.item_id]
     assert pos["on_hand"] == 10.0
     assert pos["reserved_soft"] == 11.0            # make excluded
     assert pos["incoming"] == 0.0
@@ -298,14 +315,33 @@ def test_item_ledger_position_projection(db_session):
     assert pos["projected"] == pytest.approx(-1.0)  # 10 + 0 − 11
     assert pos["uncovered"] == pytest.approx(1.0)   # max(11 − 10 − 0, 0)
 
-    # add an incoming WIP line of 4 → projected lifts, uncovered closes.
+    # A live legacy WIP mirror is not Ledger truth and cannot change the
+    # generation-bound position.
     _wip(db, x.item_id, 4.0)
-    pos2 = item_ledger_position(db)[x.item_id]
-    assert pos2["incoming_wip"] == 4.0
-    assert pos2["incoming"] == 4.0
-    assert pos2["available"] == pytest.approx(-1.0)  # available ignores incoming
-    assert pos2["projected"] == pytest.approx(3.0)   # 10 + 4 − 11
-    assert pos2["uncovered"] == pytest.approx(0.0)   # max(11 − 10 − 4, 0)
+    pos2 = item_ledger_position(
+        db, ledger_generation_id=_generation_id(db),
+    )[x.item_id]
+    assert pos2["incoming_wip"] == 0.0
+    assert pos2["projected"] == pytest.approx(-1.0)
+    assert pos2["uncovered"] == pytest.approx(1.0)
+
+    # The persisted coverage projection in this Ledger generation is the only
+    # source that lifts projected supply.
+    entry = db.query(models.ReservationEntry).filter(
+        models.ReservationEntry.ledger_generation_id == _generation_id(db),
+        models.ReservationEntry.requirement_id == 9002,
+        models.ReservationEntry.realization_mode == "consume",
+    ).one()
+    entry.covered_incoming_wip_qty = 4
+    db.flush()
+    pos3 = item_ledger_position(
+        db, ledger_generation_id=_generation_id(db),
+    )[x.item_id]
+    assert pos3["incoming_wip"] == 4.0
+    assert pos3["incoming"] == 4.0
+    assert pos3["available"] == pytest.approx(-1.0)  # available ignores incoming
+    assert pos3["projected"] == pytest.approx(3.0)   # 10 + 4 − 11
+    assert pos3["uncovered"] == pytest.approx(0.0)   # max(11 − 10 − 4, 0)
 
 
 def test_projection_ignores_realized_and_inactive_consume(db_session):
@@ -319,7 +355,9 @@ def test_projection_ignores_realized_and_inactive_consume(db_session):
     _res(db, y.item_id, 8002, 4.0, mode="consume", status="released")  # excluded
     _res(db, y.item_id, 8003, 9.0, mode="consume", realized=9.0)   # outstanding 0
 
-    pos = item_ledger_position(db)[y.item_id]
+    pos = item_ledger_position(
+        db, ledger_generation_id=_generation_id(db),
+    )[y.item_id]
     assert pos["reserved_soft"] == pytest.approx(3.0)
     assert pos["available"] == pytest.approx(5.0)  # 8 − 3
 

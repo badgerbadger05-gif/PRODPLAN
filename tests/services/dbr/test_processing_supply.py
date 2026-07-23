@@ -13,6 +13,7 @@ from decimal import Decimal
 from app.models import (
     DbrDrumSchedule,
     DbrDrumSlot,
+    DbrSettings,
     DbrSupermarketPosition,
     DefaultSpecification,
     Item,
@@ -32,6 +33,18 @@ from app.services.dbr.classify import ItemMeta, classify_meta
 from app.services.dbr.core.drum import kit as kit_mod
 
 W2, W3, W4 = "W2", "W3", "W4"
+
+
+def test_processing_board_uses_transient_defaults_without_creating_settings(db_session):
+    from app.services.dbr import processing_board_service
+
+    board = processing_board_service.processing_board(
+        db_session, today=date(2026, 8, 5)
+    )
+
+    assert board["positions"] == []
+    assert db_session.query(DbrSettings).count() == 0
+    assert not db_session.new
 
 
 # --------------------------------------------------------------------------

@@ -24,7 +24,7 @@ from ...models import (
 )
 from . import feeder_nfp_service
 from .processing_supplier_orders import processing_history_rows, processing_order_rows
-from .settings_service import get_or_create_settings
+from .settings_service import read_settings
 from ..processing_stock_sync import processing_stock_status, processing_stock_totals
 
 
@@ -63,7 +63,7 @@ def _roundtrip_kpi(rows: list[dict[str, Any]], limit_days: int) -> dict[str, Any
 
 
 def processing_board(db: Session, *, today: date | None = None) -> dict[str, Any]:
-    settings = get_or_create_settings(db)
+    settings = read_settings(db)
     limit_days = int(settings.processing_roundtrip_days or 14)
     today = today or date.today()
 

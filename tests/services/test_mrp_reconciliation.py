@@ -34,8 +34,8 @@ from app.services.mrp_execution_ledger import _scope_run_ids
 from app.services.mrp_reconciliation import (
     _latest_active_snapshot_run_ids,
     force_close_run,
-    reconcile_all_active,
-    reconcile_snapshot,
+    reconcile_all_active as _public_reconcile_all_active,
+    reconcile_snapshot as _public_reconcile_snapshot,
     reopen_run,
 )
 from app.services.period_plan_service import create_mrp_snapshot_from_period_plan
@@ -48,6 +48,16 @@ from app.services.production_control_journal import (
 
 
 DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
+
+
+def reconcile_snapshot(db, run_id, **kwargs):
+    return _public_reconcile_snapshot(
+        db, run_id, diagnostic_legacy=True, **kwargs
+    )
+
+
+def reconcile_all_active(db, **kwargs):
+    return _public_reconcile_all_active(db, diagnostic_legacy=True, **kwargs)
 
 
 @pytest.fixture(autouse=True)
@@ -78,6 +88,21 @@ def test_reconcile_all_active_fails_closed_without_accepted_truth(
     assert result["truth_status"] == "uninitialized"
     assert result["runs_checked"] == 0
     assert result["execution_ledger"] is None
+
+
+def test_public_reconcile_is_blocked_even_with_accepted_truth_and_writes_nothing(
+    db_session,
+):
+    before_products = db_session.query(ProductionProduct).count()
+    before_purchases = db_session.query(PlannedPurchase).count()
+
+    result = _public_reconcile_all_active(db_session)
+
+    assert result["status"] == "blocked"
+    assert result["runs_checked"] == 0
+    assert result["execution_ledger"] is None
+    assert db_session.query(ProductionProduct).count() == before_products
+    assert db_session.query(PlannedPurchase).count() == before_purchases
 
 
 # ---------------------------------------------------------------------------

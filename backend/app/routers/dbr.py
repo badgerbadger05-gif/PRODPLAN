@@ -192,7 +192,7 @@ class PurchasePlanMaterializeRequest(BaseModel):
 
 @router.get("/settings", response_model=SettingsOut)
 def get_settings(db: Session = Depends(get_db)):
-    return settings_service.get_or_create_settings(db)
+    return settings_service.read_settings(db)
 
 
 @router.put("/settings", response_model=SettingsOut)

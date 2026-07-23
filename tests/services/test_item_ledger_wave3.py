@@ -18,6 +18,10 @@ Covers:
 from datetime import date
 from decimal import Decimal
 
+import pytest
+
+pytestmark = pytest.mark.usefixtures("building_ledger_generation")
+
 from app import models
 from app.models import ReservationEvent
 from app.services.item_ledger.ingest import pull_recorder_movements
@@ -92,7 +96,11 @@ def _link(db, doctype, source_id, ref):
 
 
 def _rebuild(db, item, wh):
-    rebuild_running_balance(db, LedgerKey(item.item_id, "", "", wh))
+    generation_id = db.get(models.PlanningTruthState, 1).current_generation_id
+    rebuild_running_balance(
+        db, LedgerKey(item.item_id, "", "", wh),
+        ledger_generation_id=generation_id,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +126,11 @@ def test_t1_pull_receipt_refreshes_uncovered_without_cycle(db_session):
     client = FakeODataClient(
         {"RCPT-1": [_register_line("1", "Receipt", "ref-comp", "wh-1", 6)]}
     )
-    pull_recorder_movements(db, RECEIPT, "RCPT-1", client=client)
+    generation_id = db.get(models.PlanningTruthState, 1).current_generation_id
+    pull_recorder_movements(
+        db, RECEIPT, "RCPT-1", client=client,
+        ledger_generation_id=generation_id,
+    )
 
     db.refresh(entry)
     assert Decimal(str(entry.uncovered_qty)) == Decimal("0")  # т1 refreshed it
@@ -215,10 +227,17 @@ def test_t1_reconcile_adjustment_triggers_redistribute(db_session):
     # a manual списание happened in 1С → Balance snapshot shows 7 (delta -3).
     snapshot = {LedgerKey(comp.item_id, "", "", "wh-1"): Decimal("7")}
     # 1st sweep: debounce stores pending, no apply. 2nd sweep: apply + т1.
-    reconcile_balance_snapshot(db, snapshot, block_all_items=False, discovery_client=None)
+    generation_id = db.get(models.PlanningTruthState, 1).current_generation_id
+    reconcile_balance_snapshot(
+        db, snapshot, block_all_items=False, discovery_client=None,
+        ledger_generation_id=generation_id,
+    )
     db.refresh(entry)
     assert Decimal(str(entry.uncovered_qty)) == Decimal("0")  # not applied yet
-    reconcile_balance_snapshot(db, snapshot, block_all_items=False, discovery_client=None)
+    reconcile_balance_snapshot(
+        db, snapshot, block_all_items=False, discovery_client=None,
+        ledger_generation_id=generation_id,
+    )
 
     db.refresh(entry)
     assert ledger_on_hand_by_item(db)[comp.item_id] == 7.0

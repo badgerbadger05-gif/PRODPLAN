@@ -22,6 +22,14 @@ def _generation(**overrides):
         "replay_version": "historical/1",
     }
     values.update(overrides)
+    values.setdefault(
+        "physical_import_batch",
+        models.PhysicalImportBatch(
+            batch_key=f"physical-{values['generation_key']}",
+            status="completed",
+            source_watermarks={},
+        ),
+    )
     return models.LedgerGeneration(**values)
 
 

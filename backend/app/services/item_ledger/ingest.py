@@ -35,7 +35,14 @@ from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from app import models
-from .physical import LedgerKey, _dec, rebuild_running_balance
+from .physical import (
+    LedgerKey,
+    _dec,
+    canonical_content_hash,
+    canonical_decimal,
+    ensure_physical_import_batch,
+    rebuild_running_balance,
+)
 
 # Register + document-pull tags.
 REGISTER_ENTITY = "AccumulationRegister_ЗапасыНаСкладах"
@@ -129,13 +136,16 @@ def _movement_kind(recorder_type: str, record_type: str) -> str:
     return "receipt" if is_receipt else "expense"
 
 
-def _stable_lock_key(recorder_ref: str) -> int:
+def _stable_lock_key(recorder_type: str, recorder_ref: str) -> int:
     """Deterministic signed 64-bit key for pg_advisory_xact_lock(bigint)."""
-    digest = hashlib.sha1((recorder_ref or "").encode("utf-8")).digest()[:8]
+    identity = f"{recorder_type or ''}\x1f{recorder_ref or ''}"
+    digest = hashlib.sha1(identity.encode("utf-8")).digest()[:8]
     return int.from_bytes(digest, "big", signed=True)
 
 
-def _advisory_xact_lock(session: Session, recorder_ref: str) -> None:
+def _advisory_xact_lock(
+    session: Session, recorder_type: str, recorder_ref: str
+) -> None:
     """Per-recorder advisory lock on PostgreSQL; no-op elsewhere (e.g. SQLite)."""
     bind = session.get_bind()
     try:
@@ -145,7 +155,7 @@ def _advisory_xact_lock(session: Session, recorder_ref: str) -> None:
     if dialect == "postgresql":
         session.execute(
             text("SELECT pg_advisory_xact_lock(:k)"),
-            {"k": _stable_lock_key(recorder_ref)},
+            {"k": _stable_lock_key(recorder_type, recorder_ref)},
         )
 
 
@@ -202,6 +212,33 @@ def _anchor_t0(session: Session, key: LedgerKey, cache: Dict[LedgerKey, Optional
     )
     cache[key] = t0
     return t0
+
+
+def _latest_recorder_import_batch(
+    session: Session,
+    recorder_type: str,
+    recorder_ref: str,
+) -> Optional[models.PhysicalImportBatch]:
+    """Latest committed semantic state for one recorder.
+
+    The recorder advisory lock is held by the caller, so this boundary cannot
+    change between the state comparison and insertion of the next revision.
+    """
+    return (
+        session.query(models.PhysicalImportBatch)
+        .filter(
+            models.PhysicalImportBatch.source_watermarks[
+                "recorder_type"
+            ].as_string()
+            == recorder_type,
+            models.PhysicalImportBatch.source_watermarks[
+                "recorder_ref"
+            ].as_string()
+            == recorder_ref,
+        )
+        .order_by(models.PhysicalImportBatch.id.desc())
+        .first()
+    )
 
 
 def _document_order_ref(client: Any, recorder_type: str, recorder_ref: str) -> str:
@@ -272,6 +309,8 @@ def pull_recorder_movements(
     client: Any = None,
     config: Optional[Mapping[str, Any]] = None,
     source: Optional[str] = None,
+    import_batch: Optional[models.PhysicalImportBatch] = None,
+    ledger_generation_id: Optional[int] = None,
 ) -> PullResult:
     """Pull one 1С recorder's RecordSet → ledger-1 (design §3а steps 1–5).
 
@@ -291,6 +330,11 @@ def pull_recorder_movements(
 
     if client is None:
         client = _build_client(config)
+
+    # The lock must cover the remote read as well as the local apply. Otherwise
+    # two transactions may fetch different 1C revisions and apply them in the
+    # reverse order after waiting only at the write boundary.
+    _advisory_xact_lock(session, recorder_type, recorder_ref)
 
     filter_query = f"Recorder eq cast(guid'{recorder_ref}', '{recorder_type}')"
     rows = client.get_all(REGISTER_ENTITY, filter_query=filter_query, order_by=None)
@@ -355,8 +399,29 @@ def pull_recorder_movements(
 
         normalized.append((key, signed_qty, record_type, line_no, posting_at))
 
-    # --- replace-by-recorder under advisory lock (§3а step 4) ---
-    _advisory_xact_lock(session, recorder_ref)
+    normalized.sort(
+        key=lambda row: (
+            row[3],
+            row[4].isoformat(),
+            tuple(row[0]),
+            str(row[1]),
+            row[2],
+        )
+    )
+    normalized_payload = [
+        {
+            "item_id": key.item_id,
+            "characteristic_ref": key.characteristic_ref,
+            "organization_ref": key.organization_ref,
+            "warehouse_ref1c": key.warehouse_ref1c,
+            "qty": canonical_decimal(signed_qty),
+            "record_type": record_type,
+            "line_no": line_no,
+            "posting_at": posting_at.isoformat(),
+        }
+        for key, signed_qty, record_type, line_no, posting_at in normalized
+    ]
+    content_hash = canonical_content_hash(normalized_payload)
 
     existing_key_rows = (
         session.query(
@@ -369,6 +434,7 @@ def pull_recorder_movements(
             models.StockLedgerEntry.recorder_type == recorder_type,
             models.StockLedgerEntry.recorder_ref == recorder_ref,
             models.StockLedgerEntry.ingest_source == INGEST_SOURCE,
+            models.StockLedgerEntry.active.is_(True),
         )
         .distinct()
         .all()
@@ -378,40 +444,111 @@ def pull_recorder_movements(
         for r in existing_key_rows
     }
 
-    # Д2 (design §6.1 last matrix row / §8): the delete below replaces this
-    # recorder's SLE rows with fresh ids; realize events referencing the old
-    # rows lose their applied-mark (FK sle_id ON DELETE SET NULL) and the fresh
-    # rows would realize AGAIN — doubling realized_qty. Compensate with
-    # unrealize events BEFORE the delete, while sle_id still resolves; the new
-    # rows are then re-matched by the regular realize_from_sle pass.
-    replaced_sle_ids = [
-        int(sid)
-        for (sid,) in session.query(models.StockLedgerEntry.id)
-        .filter(
-            models.StockLedgerEntry.recorder_type == recorder_type,
-            models.StockLedgerEntry.recorder_ref == recorder_ref,
-            models.StockLedgerEntry.ingest_source == INGEST_SOURCE,
-        )
-        .all()
-    ]
-    if replaced_sle_ids:
-        from .reservation_ledger import unrealize_replaced_sle
-
-        unrealize_replaced_sle(session, replaced_sle_ids, recorder_ref)
-
-    result.deleted = (
+    active_rows = (
         session.query(models.StockLedgerEntry)
         .filter(
             models.StockLedgerEntry.recorder_type == recorder_type,
             models.StockLedgerEntry.recorder_ref == recorder_ref,
             models.StockLedgerEntry.ingest_source == INGEST_SOURCE,
+            models.StockLedgerEntry.active.is_(True),
         )
-        .delete(synchronize_session=False)
+        .all()
+    )
+    existing_hashes = {str(row.source_content_hash) for row in active_rows}
+    latest_batch = _latest_recorder_import_batch(
+        session, recorder_type, recorder_ref
+    )
+    latest_watermark = (
+        dict(latest_batch.source_watermarks or {})
+        if latest_batch is not None
+        else {}
+    )
+    expected_line_count = len(normalized)
+    active_state_matches = (
+        len(active_rows) == expected_line_count
+        and (
+            (expected_line_count == 0 and not existing_hashes)
+            or existing_hashes == {content_hash}
+        )
     )
 
+    # Exact re-pull: a true no-op. Preserve SLE ids and all event provenance.
+    # The batch watermark is essential for the empty-document state, which has
+    # no active SLE row of its own.
+    if (
+        latest_batch is not None
+        and latest_watermark.get("content_hash") == content_hash
+        and int(latest_watermark.get("line_count", -1)) == expected_line_count
+        and active_state_matches
+    ):
+        result.status = "done" if expected_line_count else "empty"
+        pull_row = _upsert_pull_row(
+            session,
+            recorder_type,
+            recorder_ref,
+            status=result.status,
+            line_count=expected_line_count,
+            source=source,
+            last_error=None,
+        )
+        if header_order_ref:
+            pull_row.order_ref = header_order_ref
+        result.touched_keys = []
+        session.flush()
+        return result
+
+    import_batch = ensure_physical_import_batch(
+        session,
+        batch_key=(
+            f"recorder:{canonical_content_hash([recorder_type, recorder_ref])[:24]}:"
+            f"after:{int(latest_batch.id) if latest_batch is not None else 0}:"
+            f"{content_hash[:32]}"
+        ),
+        cutoff=max((row[4] for row in normalized), default=datetime.now()),
+        source_watermarks={
+            "source": REGISTER_ENTITY,
+            "recorder_type": recorder_type,
+            "recorder_ref": recorder_ref,
+            "content_hash": content_hash,
+            "line_count": expected_line_count,
+            "previous_import_batch_id": (
+                int(latest_batch.id) if latest_batch is not None else None
+            ),
+        },
+        batch=import_batch,
+    )
+
+    replaced_sle_ids = [int(row.id) for row in active_rows]
+    if replaced_sle_ids and ledger_generation_id is not None:
+        from .reservation_ledger import unrealize_replaced_sle
+
+        provenance = {
+            int(event.id): int(event.sle_id)
+            for event in session.query(models.ReservationEvent)
+            .filter(models.ReservationEvent.sle_id.in_(replaced_sle_ids))
+            .all()
+            if event.sle_id is not None
+        }
+        unrealize_replaced_sle(
+            session,
+            replaced_sle_ids,
+            recorder_ref,
+            ledger_generation_id=ledger_generation_id,
+        )
+        if provenance:
+            for event in session.query(models.ReservationEvent).filter(
+                models.ReservationEvent.id.in_(list(provenance))
+            ):
+                event.sle_id = provenance[int(event.id)]
+
+    for old in active_rows:
+        old.active = False
+
+    new_by_line: Dict[str, models.StockLedgerEntry] = {}
     for key, signed_qty, record_type, line_no, posting_at in normalized:
-        session.add(
-            models.StockLedgerEntry(
+        entry = models.StockLedgerEntry(
+                ingest_batch_id=import_batch.id,
+                source_content_hash=content_hash,
                 item_id=key.item_id,
                 characteristic_ref=key.characteristic_ref,
                 organization_ref=key.organization_ref,
@@ -426,13 +563,26 @@ def pull_recorder_movements(
                 line_no=line_no,
                 ingest_source=INGEST_SOURCE,
             )
-        )
+        session.add(entry)
+        new_by_line[line_no] = entry
         touched[key] = None
     session.flush()
 
+    for old in active_rows:
+        new = new_by_line.get(str(old.line_no or ""))
+        session.add(
+            models.StockLedgerFactSupersession(
+                old_sle_id=old.id,
+                new_sle_id=new.id if new is not None else None,
+                import_batch_id=import_batch.id,
+            )
+        )
+
     result.inserted = len(normalized)
     for key in touched:
-        rebuild_running_balance(session, key)
+        rebuild_running_balance(
+            session, key, ledger_generation_id=ledger_generation_id
+        )
     result.touched_keys = list(touched.keys())
 
     # Trigger т1 (design §5): event-driven incremental redistribute of the pools
@@ -442,11 +592,14 @@ def pull_recorder_movements(
     # cycle re-materializes the caches). The replace-by-recorder unrealize above
     # already compensated the deleted rows; this re-matches the fresh ones.
     touched_item_ids = {k.item_id for k in touched}
-    if touched_item_ids:
+    if touched_item_ids and ledger_generation_id is not None:
         from .reservation_ledger import redistribute_after_ledger_apply
 
         redistribute_after_ledger_apply(
-            session, touched_item_ids, f"pull:{recorder_ref}"[:64]
+            session,
+            touched_item_ids,
+            f"pull:{recorder_ref}"[:64],
+            ledger_generation_id=ledger_generation_id,
         )
 
     # --- pull-status transition (§2.3) ---
@@ -571,6 +724,7 @@ def process_pending_pulls(
     config: Optional[Mapping[str, Any]] = None,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     limit: Optional[int] = None,
+    ledger_generation_id: Optional[int] = None,
 ) -> List[PullResult]:
     """Drain queued recorders (status in {pending, error}, under the attempt cap).
 
@@ -606,6 +760,7 @@ def process_pending_pulls(
                 recorder_ref,
                 client=client,
                 source=source,
+                ledger_generation_id=ledger_generation_id,
             )
             session.commit()
         except Exception as exc:  # noqa: BLE001 — isolate a bad recorder

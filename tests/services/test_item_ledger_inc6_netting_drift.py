@@ -22,6 +22,8 @@ from datetime import date, datetime
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("building_ledger_generation")
+
 from app import models
 from decimal import Decimal
 
@@ -33,7 +35,11 @@ from app.models import (
     StockLedgerEntry,
 )
 from app.services.item_ledger.reservation_ledger import effective_net_bin
-from app.services.mrp_execution_ledger import run_ledger_cycle
+from app.services.mrp_execution_ledger import run_ledger_cycle as _public_run_ledger_cycle
+
+
+def run_ledger_cycle(db):
+    return _public_run_ledger_cycle(db, diagnostic_legacy=True)
 
 # reuse the battle-tested fixtures from the execution-ledger test module
 from tests.services.test_mrp_execution_ledger import (
@@ -54,8 +60,17 @@ def _bin(flag):
     return {"STOCK_SOURCE": flag}
 
 
+def _generation_id(db):
+    return db.get(models.PlanningTruthState, 1).current_generation_id
+
+
 def _add_sle(db, item, *, qty, movement_kind, posting_at, recorder="R-1", line="1"):
+    generation = db.get(models.PlanningTruthState, 1).current_generation
     row = StockLedgerEntry(
+        ingest_batch_id=generation.physical_import_batch_id,
+        source_content_hash=(
+            f"inc6:{recorder}:{line}:{item.item_id}:{qty}:{movement_kind}"
+        )[:64],
         item_id=item.item_id,
         characteristic_ref="",
         organization_ref="",
@@ -223,8 +238,12 @@ def test_bin_effective_net_equals_net_required_without_supplier_pins(db_session,
     entry = _consume_entry(db_session, req)
     assert entry is not None
     assert float(entry.uncovered_qty) == 10.0  # uncovered == net (no coverage)
-    assert effective_net_bin(db_session, req) == 10.0
-    assert effective_net_bin(db_session, req) == float(req.net_required_qty)
+    assert effective_net_bin(
+        db_session, req, ledger_generation_id=_generation_id(db_session),
+    ) == 10.0
+    assert effective_net_bin(
+        db_session, req, ledger_generation_id=_generation_id(db_session),
+    ) == float(req.net_required_qty)
 
 
 def test_bin_finding_a_supplier_order_keeps_same_closure_threshold(db_session, monkeypatch):
@@ -248,7 +267,9 @@ def test_bin_finding_a_supplier_order_keeps_same_closure_threshold(db_session, m
 
     entry = _consume_entry(db_session, req)
     assert float(entry.uncovered_qty) == 6.0            # supplier pin covers 4
-    eff = effective_net_bin(db_session, req)
+    eff = effective_net_bin(
+        db_session, req, ledger_generation_id=_generation_id(db_session),
+    )
     assert eff == 10.0                                   # 6 + 4 (alloc)
     # identical to the legacy closure threshold (net_required + drift, drift 0)
     legacy_eff = max(float(req.net_required_qty) + float(req.drift_adjustment_qty), 0.0)
@@ -281,7 +302,9 @@ def test_bin_finding_d_evaporation_stays_single_channel_via_own_coverage(db_sess
     assert float(alloc.evaporated_qty) == 4.0            # pin died
     entry = _consume_entry(db_session, req)
     assert float(entry.uncovered_qty) == 10.0            # uncovered rose by 4
-    eff = effective_net_bin(db_session, req)
+    eff = effective_net_bin(
+        db_session, req, ledger_generation_id=_generation_id(db_session),
+    )
     assert eff == 10.0                                   # single-channel: NOT 14
     # (г): the evaporation was NOT ALSO folded into drift_adjustment under bin
     assert float(req.drift_adjustment_qty) == 0.0
@@ -296,7 +319,13 @@ def test_bin_finding_d_partial_delivery_then_cancel(db_session, monkeypatch):
     monkeypatch.setenv("STOCK_SOURCE", "bin")
     _run, item, req = _purchased_req_with_pool(db_session, "P-PINP", net=10)
     # the 1 delivered unit is now physically on hand
-    db_session.add(StockBin(item_id=item.item_id, warehouse_ref1c="WH", on_hand=Decimal("1")))
+    generation_id = db_session.get(
+        models.PlanningTruthState, 1,
+    ).current_generation_id
+    db_session.add(StockBin(
+        ledger_generation_id=generation_id,
+        item_id=item.item_id, warehouse_ref1c="WH", on_hand=Decimal("1"),
+    ))
     # partially received (1), remainder cancelled (order terminal) → evaporates 3
     line = _make_receipt(db_session, item, received=1, quantity=4, state_name="Отменён", order_ref1c="SUP-P")
     alloc = _make_freeze_alloc(
@@ -315,7 +344,9 @@ def test_bin_finding_d_partial_delivery_then_cancel(db_session, monkeypatch):
     entry = _consume_entry(db_session, req)
     assert float(entry.uncovered_qty) == 9.0             # on_hand 1 covers 1 of 10
     # pin_live = max(4 − 3 − 1, 0) = 0 → effective_net = uncovered 9 + 0 = 9 (not 12)
-    assert effective_net_bin(db_session, req) == 9.0
+    assert effective_net_bin(
+        db_session, req, ledger_generation_id=_generation_id(db_session),
+    ) == 9.0
     assert float(req.drift_adjustment_qty) == 0.0
 
 
@@ -354,7 +385,9 @@ def test_legacy_supplier_evaporation_excluded_from_drift_matches_bin(db_session,
     monkeypatch.setenv("STOCK_SOURCE", "bin")
     run_ledger_cycle(db_session)
     db_session.commit()
-    assert effective_net_bin(db_session, req) == 10.0
+    assert effective_net_bin(
+        db_session, req, ledger_generation_id=_generation_id(db_session),
+    ) == 10.0
 
 
 def test_legacy_wip_evaporation_still_raises_effective_net(db_session, monkeypatch):

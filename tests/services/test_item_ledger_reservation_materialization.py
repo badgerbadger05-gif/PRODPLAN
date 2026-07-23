@@ -12,6 +12,9 @@ from decimal import Decimal
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("building_ledger_generation")
+
+from app import models
 from app.models import (
     Item,
     MrpFreezeAllocation,
@@ -41,7 +44,14 @@ from app.services.item_ledger.reservation_ledger import (
     reservation_shadow_report,
     run_reservation_shadow,
 )
-from app.services.mrp_execution_ledger import _ledger_scope, run_ledger_cycle
+from app.services.mrp_execution_ledger import (
+    _ledger_scope,
+    run_ledger_cycle as _public_run_ledger_cycle,
+)
+
+
+def run_ledger_cycle(db):
+    return _public_run_ledger_cycle(db, diagnostic_legacy=True)
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +143,12 @@ def _prod_line(db, order, item, *, qty, produced=0.0, src_req=None):
 
 def _sle(db, item, *, qty, kind, recorder, line_no="1",
          recorder_type="Document_СборкаЗапасов", warehouse=""):
+    generation = db.get(models.PlanningTruthState, 1).current_generation
     e = StockLedgerEntry(
+        ingest_batch_id=generation.physical_import_batch_id,
+        source_content_hash=(
+            f"test:{recorder}:{line_no}:{item.item_id}:{qty}:{kind}"
+        )[:64],
         item_id=item.item_id,
         qty=Decimal(str(qty)),
         qty_after=Decimal("0"),
@@ -563,7 +578,11 @@ def test_redistribute_persists_floating_coverage_golden(db_session):
     materialize_reservations(db, [q1, q2, q3], runs, "cyc")
 
     # on_hand = 10 (no warehouse settings → sum all bins)
-    db.add(StockBin(item_id=it.item_id, warehouse_ref1c="WH", on_hand=Decimal("10")))
+    generation_id = db.get(models.PlanningTruthState, 1).current_generation_id
+    db.add(StockBin(
+        ledger_generation_id=generation_id,
+        item_id=it.item_id, warehouse_ref1c="WH", on_hand=Decimal("10"),
+    ))
     db.flush()
 
     redistribute_pool(db, it.item_id, {it.item_id: 10.0}, "cyc")
@@ -603,7 +622,11 @@ def test_reservation_shadow_idempotent(db_session):
     _order(db, "ORD-GUID-8", run=run)
     _pull(db, "DOC-GUID-8", order_ref="ORD-GUID-8")
     _sle(db, comp, qty=-2, kind="assembly_out", recorder="DOC-GUID-8")
-    db.add(StockBin(item_id=comp.item_id, warehouse_ref1c="WH", on_hand=Decimal("10")))
+    generation_id = db.get(models.PlanningTruthState, 1).current_generation_id
+    db.add(StockBin(
+        ledger_generation_id=generation_id,
+        item_id=comp.item_id, warehouse_ref1c="WH", on_hand=Decimal("10"),
+    ))
     db.flush()
 
     scope = _ledger_scope(db)
@@ -619,6 +642,92 @@ def test_reservation_shadow_idempotent(db_session):
     assert db.query(ReservationEvent).count() == events_1  # no double open / realize
     db.refresh(entry)
     assert Decimal(str(entry.realized_qty)) == realized_1
+
+
+def test_same_requirement_materializes_independently_per_generation(db_session):
+    db = db_session
+    first_generation = db.get(models.PlanningTruthState, 1).current_generation
+    run = _run(db, date(2026, 7, 1), date(2026, 7, 15))
+    item = _item(db, "GEN-ISO", produced=True)
+    req = _req(db, run, item, gross=4, net=4, bom_level=0)
+    materialize_reservations(
+        db, [req], {run.run_id: run}, "first",
+        ledger_generation_id=first_generation.id,
+    )
+    second_generation = models.LedgerGeneration(
+        generation_key="test-building-generation-two",
+        status="building",
+        source_watermarks={},
+        capabilities={},
+        physical_import_batch_id=first_generation.physical_import_batch_id,
+        algorithm_version="tests/2",
+    )
+    db.add(second_generation)
+    db.flush()
+    materialize_reservations(
+        db, [req], {run.run_id: run}, "second",
+        ledger_generation_id=second_generation.id,
+    )
+    db.commit()
+
+    entries = (
+        db.query(ReservationEntry)
+        .filter(
+            ReservationEntry.requirement_id == req.id,
+            ReservationEntry.realization_mode == MAKE,
+        )
+        .order_by(ReservationEntry.ledger_generation_id)
+        .all()
+    )
+    assert [e.ledger_generation_id for e in entries] == [
+        first_generation.id,
+        second_generation.id,
+    ]
+    open_events = db.query(ReservationEvent).filter(
+        ReservationEvent.event_kind == "open",
+        ReservationEvent.reservation_id.in_([e.id for e in entries]),
+    ).all()
+    assert {e.ledger_generation_id for e in open_events} == {
+        first_generation.id,
+        second_generation.id,
+    }
+    assert len({e.idempotency_key for e in open_events}) == 1
+
+
+def test_writer_without_generation_context_fails_before_insert(db_session):
+    db = db_session
+    run = _run(db, date(2026, 7, 1), date(2026, 7, 15))
+    item = _item(db, "GEN-MISSING", produced=True)
+    req = _req(db, run, item, gross=4, net=4, bom_level=0)
+    db.query(models.PlanningTruthState).delete()
+    db.flush()
+
+    with pytest.raises(ValueError, match="requires explicit"):
+        materialize_reservations(db, [req], {run.run_id: run}, "missing")
+
+    assert db.query(ReservationEntry).filter(
+        ReservationEntry.requirement_id == req.id,
+    ).count() == 0
+
+
+def test_accepted_generation_is_immutable_for_reservation_writers(db_session):
+    db = db_session
+    generation = db.get(models.PlanningTruthState, 1).current_generation
+    generation.status = "accepted"
+    run = _run(db, date(2026, 7, 1), date(2026, 7, 15))
+    item = _item(db, "GEN-ACCEPTED", produced=True)
+    req = _req(db, run, item, gross=4, net=4, bom_level=0)
+    db.flush()
+
+    with pytest.raises(ValueError, match="writes require building"):
+        materialize_reservations(
+            db, [req], {run.run_id: run}, "accepted",
+            ledger_generation_id=generation.id,
+        )
+
+    assert db.query(ReservationEntry).filter(
+        ReservationEntry.requirement_id == req.id,
+    ).count() == 0
 
 
 # ---------------------------------------------------------------------------

@@ -41,6 +41,32 @@ def db_session():
     )
     Base.metadata.create_all(bind=engine)
     session = sessionmaker(autocommit=False, autoflush=False, bind=engine)()
+    imported = models.PhysicalImportBatch(
+        batch_key="router-physical",
+        status="completed",
+        source_watermarks={"fixture": "item-ledger-router"},
+        completed_at=dt.datetime(2026, 7, 23),
+    )
+    generation = models.LedgerGeneration(
+        generation_key="router-generation",
+        status="accepted",
+        cutoff=dt.datetime(2026, 7, 23, 23, 59),
+        source_watermarks={},
+        capabilities={
+            "physical_ledger": True,
+            "reservation_replay": True,
+            "execution_allocations": True,
+        },
+        physical_import_batch=imported,
+        algorithm_version="tests/1",
+        accepted_at=dt.datetime(2026, 7, 23, 23, 59),
+    )
+    session.add(generation)
+    session.flush()
+    session.add(models.PlanningTruthState(
+        id=1, current_generation_id=generation.id,
+    ))
+    session.commit()
     try:
         yield session
     finally:
@@ -96,13 +122,18 @@ def _wh(db, ref, name, *, selected=True, finished_goods=False, ignored=False):
 
 
 def _bin(db, item_id, wh, qty, pending=0.0):
-    db.add(models.StockBin(item_id=item_id, warehouse_ref1c=wh, on_hand=qty,
+    generation_id = db.get(models.PlanningTruthState, 1).current_generation_id
+    db.add(models.StockBin(ledger_generation_id=generation_id,
+                           item_id=item_id, warehouse_ref1c=wh, on_hand=qty,
                            reconcile_pending_qty=pending))
     db.flush()
 
 
 def _sle(db, item_id, wh, qty, qty_after, posting_at, kind, rref, line, src="document_pull"):
+    generation = db.get(models.PlanningTruthState, 1).current_generation
     e = models.StockLedgerEntry(
+        ingest_batch_id=generation.physical_import_batch_id,
+        source_content_hash=f"router:{rref}:{line}:{item_id}:{qty}"[:64],
         item_id=item_id, warehouse_ref1c=wh, qty=qty, qty_after=qty_after,
         posting_at=posting_at, record_type="Receipt" if qty > 0 else "Expense",
         movement_kind=kind, recorder_type="Document_Test", recorder_ref=rref,
@@ -115,7 +146,9 @@ def _sle(db, item_id, wh, qty, qty_after, posting_at, kind, rref, line, src="doc
 
 def _res(db, item_id, req_id, reserved, *, mode="consume", realized=0.0, status="active",
          run_id=None, cov_oh=0.0, cov_sup=0.0, cov_wip=0.0, uncovered=0.0, cov_state="uncovered"):
+    generation_id = db.get(models.PlanningTruthState, 1).current_generation_id
     e = models.ReservationEntry(
+        ledger_generation_id=generation_id,
         item_id=item_id, requirement_id=req_id, run_id=run_id, freeze_version=0,
         priority_period_from=dt.date(2026, 8, 1), priority_period_to=dt.date(2026, 8, 31),
         realization_mode=mode, reserved_qty=reserved, realized_qty=realized,
@@ -131,6 +164,7 @@ def _res(db, item_id, req_id, reserved, *, mode="consume", realized=0.0, status=
 def _event(db, res, kind, *, reserved_delta=0.0, realized_delta=0.0, sle_id=None,
            fact_ref="", match_rule="", cycle_id="cyc-1", key=""):
     db.add(models.ReservationEvent(
+        ledger_generation_id=res.ledger_generation_id,
         reservation_id=res.id, item_id=res.item_id, event_kind=kind,
         reserved_delta=reserved_delta, realized_delta=realized_delta, sle_id=sle_id,
         fact_ref=fact_ref, match_rule=match_rule, cycle_id=cycle_id,
@@ -207,8 +241,12 @@ def test_position_math_and_shape(client, seeded):
     assert whs == pytest.approx({"W1": 300.0, "W2": 35.144})
     assert d["reserved_soft"] == pytest.approx(526.2)
     assert d["available"] == pytest.approx(335.144 - 526.2)
-    assert d["projected"] == pytest.approx(335.144 - 526.2)  # incoming 0
-    assert d["uncovered"] == pytest.approx(526.2 - 335.144)
+    # Incoming is persisted coverage from this accepted Ledger generation,
+    # never a live supplier/WIP mirror.
+    assert d["incoming_supplier"] == pytest.approx(71.07)
+    assert d["incoming_wip"] == pytest.approx(0.0)
+    assert d["projected"] == pytest.approx(335.144 + 71.07 - 526.2)
+    assert d["uncovered"] == pytest.approx(526.2 - 335.144 - 71.07)
     assert d["flags"]["on_hand_negative"] is False
     assert d["flags"]["has_uncovered"] is True
     assert d["flags"]["reconcile_pending"] is False

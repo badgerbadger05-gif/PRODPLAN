@@ -46,7 +46,13 @@ from app.services.mrp_freeze import (
     pool_key_for,
     refreeze_active_snapshots,
 )
-from app.services.mrp_reconciliation import reconcile_snapshot
+from app.services.mrp_reconciliation import reconcile_snapshot as _public_reconcile_snapshot
+
+
+def reconcile_snapshot(db, run_id, **kwargs):
+    return _public_reconcile_snapshot(
+        db, run_id, diagnostic_legacy=True, **kwargs
+    )
 from app.services.one_c_purchase_order_export import PURCHASE_ORDER_ENTITY
 from app.services.period_plan_service import create_mrp_snapshot_from_period_plan
 

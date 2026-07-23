@@ -4,8 +4,8 @@
 * боевой сид создаёт seed-SLE + stock_bin + stock_ledger_anchor на каждый
   ненулевой ключ Balance;
 * повторный сид при существующих якорях без force → 409 (идемпотентность);
-* force → пере-сид по A §4.5: DELETE stock_ledger_entry целиком, якоря/бины
-  сброшены, очередь пуллов очищена, сид заново от нового T0;
+* force не удаляет общую физическую историю и при повторном сиде возвращает
+  безопасный конфликт;
 * пустой Balance от 1С → 502 (не сеем нулевой леджер);
 * без OData-конфига → 400.
 """
@@ -101,7 +101,11 @@ def test_seed_dry_run_default_writes_nothing(db_session, seeded_odata):
     assert body["anchors_existing"] == 0
     assert body["anchors_created"] == 0 and body["entries_created"] == 0
     assert body["reseed"] is None
+    assert body["physical_import_batch_id"] is None
+    assert body["ledger_generation_id"] is None
     assert _counts(db_session) == (0, 0, 0)  # dry-run: БД не тронута
+    assert db_session.query(models.PhysicalImportBatch).count() == 0
+    assert db_session.query(models.LedgerGeneration).count() == 0
 
 
 def test_seed_real_creates_anchors_bins_entries(db_session, seeded_odata):
@@ -112,14 +116,29 @@ def test_seed_real_creates_anchors_bins_entries(db_session, seeded_odata):
     assert resp.status_code == 200
     body = resp.json()
     assert body["anchors_created"] == 2 and body["entries_created"] == 2
+    assert body["ledger_generation_status"] == "building"
     assert _counts(db_session) == (2, 2, 2)
+
+    batch = db_session.get(
+        models.PhysicalImportBatch, body["physical_import_batch_id"]
+    )
+    generation = db_session.get(
+        models.LedgerGeneration, body["ledger_generation_id"]
+    )
+    assert batch.status == "completed"
+    assert generation.status == "building"
+    assert generation.physical_import_batch_id == batch.id
+    assert db_session.get(models.PlanningTruthState, 1) is None
 
     sle = {r.item_id: r for r in db_session.query(models.StockLedgerEntry).all()}
     assert float(sle[i1.item_id].qty) == 10 and float(sle[i1.item_id].qty_after) == 10
     assert sle[i1.item_id].movement_kind == "seed" and sle[i1.item_id].ingest_source == "seed"
+    assert {row.ingest_batch_id for row in sle.values()} == {batch.id}
+    assert all(len(row.source_content_hash) == 64 for row in sle.values())
 
     b1 = db_session.query(models.StockBin).filter_by(item_id=i1.item_id).one()
     assert float(b1.on_hand) == 10
+    assert b1.ledger_generation_id == generation.id
 
     anchor = db_session.query(models.StockLedgerAnchor).filter_by(item_id=i2.item_id).one()
     assert float(anchor.balance_qty) == 4 and anchor.source == "balance_seed"
@@ -142,13 +161,25 @@ def test_repeat_seed_without_force_conflicts_409(db_session, seeded_odata):
     assert client.post("/api/v1/item-ledger/admin/seed").status_code == 409
 
 
-def test_force_reseed_rebuilds_ledger_and_resets_pull_queue(db_session, seeded_odata, monkeypatch):
+def test_force_reseed_is_non_destructive_conflict(
+    db_session, seeded_odata, monkeypatch
+):
     i1, i2 = _setup_items(db_session)
     client = _client(db_session)
     assert client.post("/api/v1/item-ledger/admin/seed", params={"dry_run": "false"}).status_code == 200
 
+    generation = db_session.query(models.LedgerGeneration).one()
+    generation.status = "accepted"
+    generation.accepted_at = generation.cutoff
+    db_session.add(models.PlanningTruthState(
+        id=1, current_generation_id=generation.id
+    ))
+
     # жизнь после сида: документ-пулл добавил движение и строку очереди
+    seed_sle = db_session.query(models.StockLedgerEntry).first()
     db_session.add(models.StockLedgerEntry(
+        ingest_batch_id=seed_sle.ingest_batch_id,
+        source_content_hash="f" * 64,
         item_id=i1.item_id, characteristic_ref="", organization_ref="ORG1",
         warehouse_ref1c="wh-1", qty=5, qty_after=15,
         record_type="Receipt", movement_kind="receipt",
@@ -160,28 +191,34 @@ def test_force_reseed_rebuilds_ledger_and_resets_pull_queue(db_session, seeded_o
     ))
     db_session.commit()
 
-    # 1С теперь отдаёт новый остаток (12 = 10 + 5 - что-то вне нас, неважно)
+    before = {
+        "entries": db_session.query(models.StockLedgerEntry).count(),
+        "anchors": db_session.query(models.StockLedgerAnchor).count(),
+        "bins": db_session.query(models.StockBin).count(),
+        "pulls": db_session.query(models.StockRecorderPull).count(),
+        "batches": db_session.query(models.PhysicalImportBatch).count(),
+        "generations": db_session.query(models.LedgerGeneration).count(),
+    }
+
     monkeypatch.setattr(admin_mod, "_fetch_balance_rows", lambda config: _rows(qty1=12, qty2=4))
 
     resp = client.post(
         "/api/v1/item-ledger/admin/seed", params={"dry_run": "false", "force": "true"}
     )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["reseed"] == {
-        "entries_deleted": 3,   # 2 seed + 1 document_pull — DELETE целиком (A §4.5)
-        "anchors_deleted": 2,
-        "bins_deleted": 2,
-        "pull_rows_deleted": 1,  # очередь пуллов сброшена
+    assert resp.status_code == 409
+    assert "не удаляются" in resp.json()["detail"]
+    after = {
+        "entries": db_session.query(models.StockLedgerEntry).count(),
+        "anchors": db_session.query(models.StockLedgerAnchor).count(),
+        "bins": db_session.query(models.StockBin).count(),
+        "pulls": db_session.query(models.StockRecorderPull).count(),
+        "batches": db_session.query(models.PhysicalImportBatch).count(),
+        "generations": db_session.query(models.LedgerGeneration).count(),
     }
-    assert body["anchors_created"] == 2 and body["total_qty"] == 16.0
-
-    # леджер пересобран с нуля от нового T0
-    assert _counts(db_session) == (2, 2, 2)
-    assert db_session.query(models.StockRecorderPull).count() == 0
-    only = db_session.query(models.StockLedgerEntry).filter_by(item_id=i1.item_id).all()
-    assert len(only) == 1 and only[0].ingest_source == "seed" and float(only[0].qty) == 12
-    assert float(db_session.query(models.StockBin).filter_by(item_id=i1.item_id).one().on_hand) == 12
+    assert after == before
+    assert db_session.query(models.StockLedgerEntry).filter_by(
+        recorder_ref="asm-1"
+    ).one().active is True
 
 
 def test_empty_balance_rejected_502(db_session, monkeypatch):

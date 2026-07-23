@@ -79,7 +79,14 @@ from sqlalchemy import and_, func, or_
 from sqlalchemy.orm import Session
 
 from app import models
-from .physical import EPS, LedgerKey, _dec, rebuild_running_balance
+from .physical import (
+    EPS,
+    LedgerKey,
+    _dec,
+    canonical_content_hash,
+    ensure_physical_import_batch,
+    rebuild_running_balance,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -321,6 +328,7 @@ def _store_pending(
     key: LedgerKey,
     group: List[models.StockBin],
     delta: Decimal,
+    ledger_generation_id: int,
 ) -> models.StockBin:
     """Keep the debounce alive on the aggregate's char='' bin (Д7).
 
@@ -331,6 +339,7 @@ def _store_pending(
     adj_bin = next((b for b in group if (b.characteristic_ref or "") == ""), None)
     if adj_bin is None:
         adj_bin = models.StockBin(
+            ledger_generation_id=int(ledger_generation_id),
             item_id=key.item_id,
             characteristic_ref="",
             organization_ref=key.organization_ref,
@@ -356,6 +365,8 @@ def reconcile_balance_snapshot(
     block_all_items: Optional[bool] = None,
     discovery_client: Any = None,
     discovery_limit: int = RECONCILE_DISCOVERY_LIMIT,
+    import_batch: Optional[models.PhysicalImportBatch] = None,
+    ledger_generation_id: Optional[int] = None,
 ) -> ReconcileResult:
     """Compare a Balance snapshot ``{LedgerKey: qty}`` to the bins and reconcile.
 
@@ -373,6 +384,19 @@ def reconcile_balance_snapshot(
     now = now or datetime.now()
     snapshot_period = snapshot_period or now
     batch_ref = batch_ref or f"reconcile:{uuid.uuid4()}"
+    if ledger_generation_id is None:
+        raise ValueError("reconcile requires explicit ledger_generation_id")
+    generation = session.get(
+        models.LedgerGeneration, int(ledger_generation_id)
+    )
+    if generation is None:
+        raise ValueError(
+            f"reconcile Ledger generation {ledger_generation_id} does not exist"
+        )
+    if str(generation.status) != "building":
+        raise ValueError(
+            "reconcile may mutate only an explicit building Ledger generation"
+        )
     result = ReconcileResult(batch_ref=batch_ref, snapshot_period=snapshot_period)
 
     normalized_snapshot: Dict[LedgerKey, Decimal] = {}
@@ -381,7 +405,9 @@ def reconcile_balance_snapshot(
         normalized_snapshot[agg] = normalized_snapshot.get(agg, Decimal("0")) + _dec(v)
 
     groups: Dict[LedgerKey, List[models.StockBin]] = {}
-    for b in session.query(models.StockBin).all():
+    for b in session.query(models.StockBin).filter(
+        models.StockBin.ledger_generation_id == int(ledger_generation_id)
+    ).all():
         agg = LedgerKey(
             int(b.item_id), "", b.organization_ref or "", b.warehouse_ref1c or ""
         )
@@ -425,7 +451,7 @@ def reconcile_balance_snapshot(
 
         if same_as_prior and block_all_items:
             # Confirmed delta but a pull is in-flight → hold (snapshot race).
-            _store_pending(session, key, group, delta)
+            _store_pending(session, key, group, delta, int(ledger_generation_id))
             result.held += 1
             result.events.append(
                 ReconcileEvent(key, balance_qty, on_hand, delta, "held",
@@ -440,7 +466,7 @@ def reconcile_balance_snapshot(
             if discovery_client is not None:
                 if discovery_budget <= 0:
                     result.discovery_skipped += 1
-                    _store_pending(session, key, group, delta)
+                    _store_pending(session, key, group, delta, int(ledger_generation_id))
                     result.held += 1
                     result.events.append(
                         ReconcileEvent(key, balance_qty, on_hand, delta, "held",
@@ -468,7 +494,7 @@ def reconcile_balance_snapshot(
                             key, exc,
                         )
                         result.discovery_skipped += 1
-                        _store_pending(session, key, group, delta)
+                        _store_pending(session, key, group, delta, int(ledger_generation_id))
                         result.held += 1
                         result.events.append(
                             ReconcileEvent(key, balance_qty, on_hand, delta, "held",
@@ -491,7 +517,7 @@ def reconcile_balance_snapshot(
                                 source=RECONCILE_DISCOVERY_SOURCE,
                             )
                         result.discovered_recorders += len(unknown)
-                        _store_pending(session, key, group, delta)
+                        _store_pending(session, key, group, delta, int(ledger_generation_id))
                         result.held += 1
                         result.events.append(
                             ReconcileEvent(
@@ -515,14 +541,28 @@ def reconcile_balance_snapshot(
             # APPLY: anonymous adjustment into the char='' bin (Д7 aggregate).
             line_seq += 1
             sle = _insert_adjustment_sle(
-                session, key, delta, snapshot_period, batch_ref, line_seq
+                session,
+                key,
+                delta,
+                snapshot_period,
+                batch_ref,
+                line_seq,
+                import_batch=import_batch,
             )
             session.flush()
-            rebuild_running_balance(session, key)
+            # A building generation advances to the newly imported physical
+            # boundary. Accepted generations are rejected above and therefore
+            # remain immutable and reproducible.
+            generation.physical_import_batch_id = int(sle.ingest_batch_id)
+            rebuild_running_balance(
+                session, key, ledger_generation_id=int(ledger_generation_id)
+            )
             applied_bin = (
                 session.query(models.StockBin)
                 .filter(
                     models.StockBin.item_id == key.item_id,
+                    models.StockBin.ledger_generation_id
+                    == int(ledger_generation_id),
                     models.StockBin.characteristic_ref == key.characteristic_ref,
                     models.StockBin.organization_ref == key.organization_ref,
                     models.StockBin.warehouse_ref1c == key.warehouse_ref1c,
@@ -555,7 +595,7 @@ def reconcile_balance_snapshot(
 
         # First sighting (or the delta changed / flipped sign → debounce reset):
         # store the pending delta, do NOT apply this sweep (§3б step 3).
-        _store_pending(session, key, group, delta)
+        _store_pending(session, key, group, delta, int(ledger_generation_id))
         result.pending += 1
         result.events.append(
             ReconcileEvent(key, balance_qty, on_hand, delta, "pending")
@@ -572,9 +612,34 @@ def _insert_adjustment_sle(
     snapshot_period: datetime,
     batch_ref: str,
     line_seq: int,
+    *,
+    import_batch: Optional[models.PhysicalImportBatch] = None,
 ) -> models.StockLedgerEntry:
     """INSERT the compensating adjustment-SLE (§3б step 3). Signed qty=delta."""
+    row_hash = canonical_content_hash(
+        {
+            "recorder_type": RECONCILE_RECORDER_TYPE,
+            "recorder_ref": batch_ref,
+            "line_no": str(line_seq),
+            "ledger_key": list(key),
+            "qty": str(delta.normalize()),
+            "posting_at": snapshot_period.isoformat(),
+        }
+    )
+    import_batch = ensure_physical_import_batch(
+        session,
+        batch_key=f"reconcile:{canonical_content_hash(batch_ref)[:24]}:{row_hash}",
+        cutoff=snapshot_period,
+        source_watermarks={
+            "source": RECONCILE_SOURCE,
+            "batch_ref": batch_ref,
+            "content_hash": row_hash,
+        },
+        batch=import_batch,
+    )
     entry = models.StockLedgerEntry(
+        ingest_batch_id=import_batch.id,
+        source_content_hash=row_hash,
         item_id=key.item_id,
         characteristic_ref=key.characteristic_ref,
         organization_ref=key.organization_ref,
@@ -660,6 +725,8 @@ def run_balance_reconcile_after_sweep(
     batch_ref: Optional[str] = None,
     discovery_client: Any = _BUILD_CLIENT,
     discovery_limit: int = RECONCILE_DISCOVERY_LIMIT,
+    import_batch: Optional[models.PhysicalImportBatch] = None,
+    ledger_generation_id: Optional[int] = None,
 ) -> ReconcileResult:
     """The stock-sweep after-step (§3б): reconcile bins vs the Balance snapshot.
 
@@ -689,6 +756,8 @@ def run_balance_reconcile_after_sweep(
         batch_ref=batch_ref,
         discovery_client=discovery_client,
         discovery_limit=discovery_limit,
+        import_batch=import_batch,
+        ledger_generation_id=ledger_generation_id,
     )
 
 

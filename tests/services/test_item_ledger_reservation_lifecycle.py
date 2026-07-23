@@ -21,6 +21,8 @@ from decimal import Decimal
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("building_ledger_generation")
+
 from app import models
 from app.models import (
     MrpFreezeAllocation,
@@ -135,15 +137,17 @@ def _sle_id_spacer(db):
 # Д2 — replace-by-recorder → unrealize compensation
 # ---------------------------------------------------------------------------
 def test_repull_same_recorder_does_not_double_realized(db_session):
-    """Перепроведение (identical re-pull): realized stays at the document qty,
-    compensation is visible as unrealize, the closed reserve is re-opened and
-    re-closed by the fresh rows — never doubled."""
+    """Identical re-pull is content-addressed no-op and never doubles fact."""
     db = db_session
     run, comp, req = _pegged_consume_setup(db, net=4)
     client = FakeODataClient(
         {"DOC-G": [_register_line("1", "Expense", "ref-comp", "wh-1", 4)]}
     )
-    pull_recorder_movements(db, ASSEMBLY, "DOC-G", client=client)
+    generation_id = db.get(models.PlanningTruthState, 1).current_generation_id
+    pull_recorder_movements(
+        db, ASSEMBLY, "DOC-G", client=client,
+        ledger_generation_id=generation_id,
+    )
     realize_from_sle(db, _ledger_scope(db), "cyc")
 
     entry = _entry(db, req, CONSUME)
@@ -151,20 +155,29 @@ def test_repull_same_recorder_does_not_double_realized(db_session):
     assert Decimal(str(entry.realized_qty)) == Decimal("4")
     assert entry.lifecycle_status == "closed"
 
-    # replace-by-recorder: same document re-pulled (identical lines, new SLE ids).
-    # UPDATED for trigger т1: the pull now compensates (unrealize + reopen) AND
-    # eagerly re-matches the fresh rows within the SAME pull (redistribute_after_
-    # ledger_apply). Pre-т1 the re-match was deferred to the next explicit
-    # realize_from_sle, so this asserted the transient realized=0 / active state;
-    # now the observable post-pull state is the correct single-count realized=4
-    # (compensated then re-realized — NOT doubled to 8), reserve re-closed.
+    # Identical recorder content is a true no-op: no replacement, compensation,
+    # or fresh realization is necessary, and the original SLE provenance stays.
+    original_sle_id = (
+        db.query(models.StockLedgerEntry.id)
+        .filter(models.StockLedgerEntry.recorder_ref == "DOC-G")
+        .scalar()
+    )
     _sle_id_spacer(db)
-    pull_recorder_movements(db, ASSEMBLY, "DOC-G", client=client)
+    pull_recorder_movements(
+        db, ASSEMBLY, "DOC-G", client=client,
+        ledger_generation_id=generation_id,
+    )
     db.refresh(entry)
     assert Decimal(str(entry.realized_qty)) == Decimal("4")
     assert Decimal(str(entry.reserved_qty)) == Decimal("4")
     assert entry.lifecycle_status == "closed"
-    assert _kinds(db, entry) == ["open", "realize", "unrealize", "reopen", "realize"]
+    assert _kinds(db, entry) == ["open", "realize"]
+    assert (
+        db.query(models.StockLedgerEntry.id)
+        .filter(models.StockLedgerEntry.recorder_ref == "DOC-G")
+        .scalar()
+        == original_sle_id
+    )
 
     # the explicit re-match is now a no-op (т1 already applied it in the pull) —
     # still realized 4, never 8.
@@ -172,7 +185,7 @@ def test_repull_same_recorder_does_not_double_realized(db_session):
     db.refresh(entry)
     assert Decimal(str(entry.realized_qty)) == Decimal("4")
     assert entry.lifecycle_status == "closed"
-    assert _kinds(db, entry) == ["open", "realize", "unrealize", "reopen", "realize"]
+    assert _kinds(db, entry) == ["open", "realize"]
 
 
 def test_repull_changed_qty_lands_on_new_document_qty(db_session):
@@ -182,14 +195,21 @@ def test_repull_changed_qty_lands_on_new_document_qty(db_session):
     client4 = FakeODataClient(
         {"DOC-G": [_register_line("1", "Expense", "ref-comp", "wh-1", 4)]}
     )
-    pull_recorder_movements(db, ASSEMBLY, "DOC-G", client=client4)
+    generation_id = db.get(models.PlanningTruthState, 1).current_generation_id
+    pull_recorder_movements(
+        db, ASSEMBLY, "DOC-G", client=client4,
+        ledger_generation_id=generation_id,
+    )
     realize_from_sle(db, _ledger_scope(db), "cyc")
 
     client3 = FakeODataClient(
         {"DOC-G": [_register_line("1", "Expense", "ref-comp", "wh-1", 3)]}
     )
     _sle_id_spacer(db)
-    pull_recorder_movements(db, ASSEMBLY, "DOC-G", client=client3)
+    pull_recorder_movements(
+        db, ASSEMBLY, "DOC-G", client=client3,
+        ledger_generation_id=generation_id,
+    )
     realize_from_sle(db, _ledger_scope(db), "cyc2")
 
     entry = _entry(db, req, CONSUME)

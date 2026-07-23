@@ -17,14 +17,16 @@ Exercises the inc3 after-step against a mocked Balance snapshot vs bin state:
 
 import datetime
 
+import pytest
+
 from app import models
 from app.services.item_ledger import (
     LedgerKey,
     build_balance_snapshot,
     ledger_on_hand_by_item,
-    process_pending_pulls,
-    reconcile_balance_snapshot,
-    seed_from_balance,
+    process_pending_pulls as _process_pending_pulls,
+    reconcile_balance_snapshot as _reconcile_balance_snapshot,
+    seed_from_balance as _seed_from_balance,
     stock_shadow_report,
 )
 from app.services.item_ledger.reconcile import (
@@ -35,6 +37,31 @@ from app.services.item_ledger.reconcile import (
 
 def _f(x):
     return float(x)
+
+
+@pytest.fixture(autouse=True)
+def _explicit_build_context(db_session, building_ledger_generation):
+    db_session.info["ledger_generation_id"] = building_ledger_generation.id
+    return building_ledger_generation
+
+
+def reconcile_balance_snapshot(db, *args, **kwargs):
+    kwargs.setdefault("ledger_generation_id", db.info["ledger_generation_id"])
+    return _reconcile_balance_snapshot(db, *args, **kwargs)
+
+
+def seed_from_balance(db, *args, **kwargs):
+    generation = db.get(
+        models.LedgerGeneration, db.info["ledger_generation_id"]
+    )
+    kwargs.setdefault("ledger_generation_id", generation.id)
+    kwargs.setdefault("import_batch", generation.physical_import_batch)
+    return _seed_from_balance(db, *args, **kwargs)
+
+
+def process_pending_pulls(db, *args, **kwargs):
+    kwargs.setdefault("ledger_generation_id", db.info["ledger_generation_id"])
+    return _process_pending_pulls(db, *args, **kwargs)
 
 
 def _item(db, code, ref, name=None, stock_qty=0.0):
@@ -61,7 +88,12 @@ def _adj_sles(db, item_id=None):
 def _bin(db, item_id, wh, org=""):
     return (
         db.query(models.StockBin)
-        .filter_by(item_id=item_id, warehouse_ref1c=wh, organization_ref=org)
+        .filter_by(
+            ledger_generation_id=db.info["ledger_generation_id"],
+            item_id=item_id,
+            warehouse_ref1c=wh,
+            organization_ref=org,
+        )
         .one()
     )
 
@@ -69,6 +101,37 @@ def _bin(db, item_id, wh, org=""):
 # ---------------------------------------------------------------------------
 # match / pending / apply (§3б steps 2–3)
 # ---------------------------------------------------------------------------
+
+
+def test_reconcile_fails_closed_without_generation(db_session):
+    with pytest.raises(ValueError, match="explicit ledger_generation_id"):
+        _reconcile_balance_snapshot(db_session, {})
+
+    assert db_session.query(models.StockBin).count() == 0
+    assert _adj_sles(db_session) == []
+
+
+def test_reconcile_rejects_accepted_generation_without_mutation(db_session):
+    generation = db_session.get(
+        models.LedgerGeneration, db_session.info["ledger_generation_id"]
+    )
+    generation.status = "accepted"
+    generation.accepted_at = datetime.datetime(2026, 7, 23)
+    db_session.flush()
+    it = _item(db_session, "IMMUTABLE", "immutable-ref")
+    key = LedgerKey(it.item_id, "", "", "wh-1")
+    batch_count = db_session.query(models.PhysicalImportBatch).count()
+
+    with pytest.raises(ValueError, match="only an explicit building"):
+        _reconcile_balance_snapshot(
+            db_session,
+            {key: 5},
+            ledger_generation_id=generation.id,
+        )
+
+    assert db_session.query(models.StockBin).count() == 0
+    assert _adj_sles(db_session) == []
+    assert db_session.query(models.PhysicalImportBatch).count() == batch_count
 
 
 def test_reconcile_match_sets_last_reconciled_no_sle(db_session):
@@ -105,6 +168,10 @@ def test_reconcile_second_same_delta_applies_adjustment_and_folds_bin(db_session
     it = _item(db_session, "P1", "ref-1")
     _seed_bin(db_session, it.item_id, "wh-1", 10)
     key = LedgerKey(it.item_id, "", "", "wh-1")
+    generation = db_session.get(
+        models.LedgerGeneration, db_session.info["ledger_generation_id"]
+    )
+    initial_boundary = generation.physical_import_batch_id
 
     # sweep 1 — store pending
     reconcile_balance_snapshot(db_session, {key: 7})
@@ -121,6 +188,9 @@ def test_reconcile_second_same_delta_applies_adjustment_and_folds_bin(db_session
     assert adj.movement_kind == "reconcile_adjustment"
     assert adj.record_type == "Expense"
     assert adj.recorder_type == "reconcile"
+    assert adj.ingest_batch_id != initial_boundary
+    assert generation.physical_import_batch_id == adj.ingest_batch_id
+    assert len(adj.source_content_hash) == 64
     b = _bin(db_session, it.item_id, "wh-1")
     assert _f(b.on_hand) == 7  # 10 seed + (-3) adjustment, folded
     assert _f(b.reconcile_pending_qty) == 0

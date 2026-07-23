@@ -14,11 +14,9 @@ POST /api/v1/item-ledger/admin/seed?dry_run=true&force=false
   строки с posting_at > T0 (anchor guard, A §4.3) — двойного учёта нет.
 * ``dry_run`` (default true) — только посчитать и показать сводку, БД не
   трогается.
-* Идемпотентность: повторный сид при уже существующих якорях без ``force`` →
-  409 с пояснением.
-* ``force`` — пере-сид по A §4.5: леджер — восстановимая производная (истина
-  в 1С), поэтому DELETE stock_ledger_entry целиком, якоря и бины сбрасываются,
-  очередь пуллов очищается, затем сид заново от нового T0.
+* Идемпотентность: повторный сид при уже существующих якорях, включая
+  ``force=true``, → 409. Shared physical history and accepted generations are
+  immutable; destructive reseed is intentionally unsupported.
 
 Отдельный файл (не item_ledger.py), чтобы не конфликтовать с параллельными
 правками read-API. Никаких записей в 1С (INV-1way / INV-no-write).
@@ -36,7 +34,12 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..database import get_db
 from ..services.item_ledger.ingest import REGISTER_ENTITY, is_inflight_pull
-from ..services.item_ledger.physical import EPS, LedgerKey, seed_from_balance
+from ..services.item_ledger.physical import (
+    EPS,
+    LedgerKey,
+    canonical_content_hash,
+    seed_from_balance,
+)
 from ..services.item_ledger.reconcile import build_balance_snapshot
 from ..services.odata_client import get_stock_from_1c_odata
 from ..services.odata_config import load_odata_config, sanitize_base_url
@@ -70,6 +73,9 @@ class SeedResponse(BaseModel):
     entries_created: int       # seed-SLE создано (== anchors_created)
     inflight_pulls: int        # pending / retriable error в очереди (справочно)
     reseed: Optional[SeedReseedStats]  # только при force и не-dry-run
+    physical_import_batch_id: Optional[int]
+    ledger_generation_id: Optional[int]
+    ledger_generation_status: Optional[str]
 
 
 def _fetch_balance_rows(config: Mapping[str, Any]) -> List[Dict[str, Any]]:
@@ -97,7 +103,13 @@ def _count_inflight_pulls(db: Session) -> int:
 @router.post("/seed", response_model=SeedResponse)
 def seed_ledger(
     dry_run: bool = Query(True, description="Только сводка, БД не трогается"),
-    force: bool = Query(False, description="Пере-сид по A §4.5 при существующих якорях"),
+    force: bool = Query(
+        False,
+        description=(
+            "Совместимый параметр; разрушительный пере-сид отключён и при "
+            "существующей истории возвращает 409"
+        ),
+    ),
     db: Session = Depends(get_db),
 ) -> SeedResponse:
     """Сид якоря T0 леджера-1 из свежего 1С /Balance (design Прил. A §4)."""
@@ -106,15 +118,14 @@ def seed_ledger(
         raise HTTPException(status_code=400, detail="OData connection is not configured (base_url missing)")
 
     anchors_existing = int(db.query(models.StockLedgerAnchor).count() or 0)
-    if anchors_existing > 0 and not force:
+    if anchors_existing > 0:
         raise HTTPException(
             status_code=409,
             detail=(
                 f"Леджер уже засеян: в stock_ledger_anchor {anchors_existing} якорей. "
-                "Повторный сид без force запрещён (идемпотентность). Если нужен "
-                "пере-сид (диагностика/развал, design Прил. A §4.5) — вызовите с "
-                "force=true: леджер будет удалён целиком и засеян заново от нового "
-                "T0 (леджер — восстановимая производная, истина в 1С)."
+                "Повторный сид запрещён: физические факты и принятые поколения "
+                "не удаляются. force=true также не стирает историю; создайте "
+                "отдельный контролируемый rebuild-процесс с новой lineage."
             ),
         )
 
@@ -153,32 +164,67 @@ def seed_ledger(
         entries_created=0,
         inflight_pulls=inflight,
         reseed=None,
+        physical_import_batch_id=None,
+        ledger_generation_id=None,
+        ledger_generation_status=None,
     )
 
     if dry_run:
         return SeedResponse(**summary)
 
-    reseed_stats: Optional[Dict[str, int]] = None
-    if force and anchors_existing > 0:
-        # Пере-сид (A §4.5): DELETE stock_ledger_entry целиком, якоря и бины
-        # сбрасываются (unique (key, period) не позволил бы пере-сид в тот же
-        # день поверх старых якорей), очередь пуллов очищается — все прежние
-        # движения либо уже в новом Balance (Period<=T0), либо придут пуллом
-        # с posting_at>T0.
-        reseed_stats = {
-            "bins_deleted": int(db.query(models.StockBin).delete(synchronize_session=False)),
-            "anchors_deleted": int(db.query(models.StockLedgerAnchor).delete(synchronize_session=False)),
-            "entries_deleted": int(db.query(models.StockLedgerEntry).delete(synchronize_session=False)),
-            "pull_rows_deleted": int(db.query(models.StockRecorderPull).delete(synchronize_session=False)),
-        }
-        db.flush()
+    content_hash = canonical_content_hash(
+        [
+            [list(key), str(qty.normalize())]
+            for key, qty in sorted(nonzero.items(), key=lambda pair: tuple(pair[0]))
+        ]
+    )
+    source_watermarks = {
+        "source": "admin_balance_seed",
+        "content_hash": content_hash,
+        "posting_at": posting_at.isoformat(),
+        "anchor_period": anchor_period.isoformat(),
+        "keys_nonzero": len(nonzero),
+    }
+    import_batch = models.PhysicalImportBatch(
+        batch_key=(
+            f"admin-seed:{posting_at.strftime('%Y%m%dT%H%M%S%f')}:"
+            f"{content_hash[:24]}"
+        ),
+        status="building",
+        cutoff=posting_at,
+        source_watermarks=source_watermarks,
+    )
+    generation = models.LedgerGeneration(
+        generation_key=(
+            f"admin-seed:{posting_at.strftime('%Y%m%dT%H%M%S%f')}:"
+            f"{content_hash[:24]}"
+        ),
+        status="building",
+        cutoff=posting_at,
+        source_watermarks=source_watermarks,
+        capabilities={"physical_ledger": True},
+        physical_import_batch=import_batch,
+        algorithm_version="admin-seed/1",
+    )
+    db.add(generation)
+    db.flush()
 
     created = seed_from_balance(
-        db, nonzero, anchor_period=anchor_period, posting_at=posting_at, ingest_source="seed"
+        db,
+        nonzero,
+        anchor_period=anchor_period,
+        posting_at=posting_at,
+        ingest_source="seed",
+        import_batch=import_batch,
+        ledger_generation_id=generation.id,
     )
+    import_batch.status = "completed"
+    import_batch.completed_at = datetime.now()
     db.commit()
 
     summary["anchors_created"] = len(created)
     summary["entries_created"] = len(created)
-    summary["reseed"] = reseed_stats
+    summary["physical_import_batch_id"] = int(import_batch.id)
+    summary["ledger_generation_id"] = int(generation.id)
+    summary["ledger_generation_status"] = str(generation.status)
     return SeedResponse(**summary)

@@ -62,6 +62,8 @@ from ..models import (
     SupplierOrder,
     SupplierOrderItem,
     SyncLink,
+    PhysicalImportBatch,
+    LedgerGeneration,
 )
 from .mrp_freeze import MRP_LEDGER_LOCK_KEY, PoolKey, pool_key_for
 from .mrp_stock_helpers import effective_stock_by_item_all
@@ -609,6 +611,7 @@ def _build_execution_allocations(
     cycle_id: str,
     produced_now: Dict[int, float],
     received_now: Dict[int, float],
+    ledger_generation_id: int,
     eff_net_by_req: Optional[Dict[int, float]] = None,
 ) -> Tuple[List[MrpExecutionAllocation], Dict[int, float], int, int]:
     """Rebuild ``mrp_execution_allocation`` for the scope. Returns
@@ -626,6 +629,7 @@ def _build_execution_allocations(
     # 5.0 — DELETE existing execution allocations for the open-req scope.
     if scope.open_req_ids:
         db.query(MrpExecutionAllocation).filter(
+            MrpExecutionAllocation.ledger_generation_id == ledger_generation_id,
             MrpExecutionAllocation.requirement_id.in_(scope.open_req_ids)
         ).delete(synchronize_session=False)
 
@@ -660,6 +664,7 @@ def _build_execution_allocations(
             continue
         rows.append(
             MrpExecutionAllocation(
+                ledger_generation_id=ledger_generation_id,
                 cycle_id=cycle_id,
                 requirement_id=int(alloc.requirement_id),
                 bucket_id=None,
@@ -745,6 +750,7 @@ def _build_execution_allocations(
                 continue
             rows.append(
                 MrpExecutionAllocation(
+                    ledger_generation_id=ledger_generation_id,
                     cycle_id=cycle_id,
                     requirement_id=int(slot.req_id),
                     bucket_id=slot.bucket_id,
@@ -831,6 +837,7 @@ def _build_execution_allocations(
                     continue
                 rows.append(
                     MrpExecutionAllocation(
+                        ledger_generation_id=ledger_generation_id,
                         cycle_id=cycle_id,
                         requirement_id=int(slot.req_id),
                         bucket_id=slot.bucket_id,
@@ -1634,13 +1641,51 @@ def apply_run_closure(
 # ---------------------------------------------------------------------------
 # §2 — the cycle
 # ---------------------------------------------------------------------------
-def run_ledger_cycle(db: Session) -> Dict[str, Any]:
-    """Rebuild the execution ledger for the canonical scope (increment 3).
+def _ensure_legacy_diagnostic_generation(db: Session) -> int:
+    """Create/reuse an isolated BUILDING context for explicit legacy tests."""
+    batch = (
+        db.query(PhysicalImportBatch)
+        .filter(PhysicalImportBatch.batch_key == "legacy-ledger-diagnostic")
+        .one_or_none()
+    )
+    if batch is None:
+        batch = PhysicalImportBatch(
+            batch_key="legacy-ledger-diagnostic",
+            status="completed",
+            cutoff=datetime.now(timezone.utc),
+            source_watermarks={},
+        )
+        db.add(batch)
+        db.flush()
+    generation = (
+        db.query(LedgerGeneration)
+        .filter(LedgerGeneration.generation_key == "legacy-ledger-diagnostic")
+        .one_or_none()
+    )
+    if generation is None:
+        generation = LedgerGeneration(
+            generation_key="legacy-ledger-diagnostic",
+            status="building",
+            cutoff=batch.cutoff,
+            physical_import_batch_id=batch.id,
+            algorithm_version="legacy-diagnostic/1",
+            replay_version="legacy-diagnostic/1",
+            source_watermarks={},
+            capabilities={},
+        )
+        db.add(generation)
+        db.flush()
+    return int(generation.id)
+
+
+def _run_legacy_ledger_cycle_diagnostic(db: Session) -> Dict[str, Any]:
+    """Legacy generation-unaware rebuild retained only for diagnostics/tests.
 
     Does NOT commit — the caller owns the transaction (matching how
     reconciliation persists / rolls back). Serialised against the freeze via the
     shared advisory lock on PostgreSQL (SQLite is a single-writer no-op).
     """
+    ledger_generation_id = _ensure_legacy_diagnostic_generation(db)
     if db.get_bind().dialect.name == "postgresql":
         db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": MRP_LEDGER_LOCK_KEY})
 
@@ -1695,7 +1740,8 @@ def run_ledger_cycle(db: Session) -> Dict[str, Any]:
             )
 
     _rows, exec_by_req, execution_rows, coverage_rows = _build_execution_allocations(
-        db, scope, verify, cycle_id, produced_now, received_now, eff_net_by_req
+        db, scope, verify, cycle_id, produced_now, received_now,
+        ledger_generation_id, eff_net_by_req,
     )
     items_touched, total_executed = _aggregate_executed_qty(scope, exec_by_req)
 
@@ -1754,9 +1800,30 @@ def run_ledger_cycle(db: Session) -> Dict[str, Any]:
     }
 
 
+def run_ledger_cycle(
+    db: Session,
+    *,
+    diagnostic_legacy: bool = False,
+) -> Dict[str, Any]:
+    """Public containment boundary.
+
+    Production callers may not create generation-less execution allocations.
+    The old algorithm is available only through an explicit diagnostic opt-in
+    while generation-scoped replay replaces it.
+    """
+    if not diagnostic_legacy:
+        raise NotImplementedError(
+            "generation-unaware run_ledger_cycle is retired; "
+            "use generation-scoped historical replay"
+        )
+    return _run_legacy_ledger_cycle_diagnostic(db)
+
+
 def populate_executed_qty(
     db: Session,
     run_ids: Optional[List[int]] = None,
+    *,
+    diagnostic_legacy: bool = False,
 ) -> Dict[str, Any]:
     """Retired phase-2 entry point (v2 §4). A partial recompute is no longer
     supported — the ledger cycle rebuilds the whole canonical scope. Kept as a
@@ -1766,4 +1833,4 @@ def populate_executed_qty(
         raise ValueError(
             "partial ledger recompute retired v2 §4; use run_ledger_cycle"
         )
-    return run_ledger_cycle(db)
+    return run_ledger_cycle(db, diagnostic_legacy=diagnostic_legacy)

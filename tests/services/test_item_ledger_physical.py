@@ -31,6 +31,28 @@ def _f(x):
     return float(x)
 
 
+def _generation(db_session, suffix):
+    batch = models.PhysicalImportBatch(
+        batch_key=f"physical-test-{suffix}",
+        status="completed",
+        cutoff=datetime.datetime(2026, 7, 31),
+        source_watermarks={},
+        completed_at=datetime.datetime(2026, 7, 31),
+    )
+    generation = models.LedgerGeneration(
+        generation_key=f"physical-test-{suffix}",
+        status="building",
+        cutoff=datetime.datetime(2026, 7, 31),
+        source_watermarks={},
+        capabilities={},
+        physical_import_batch=batch,
+        algorithm_version="test/physical",
+    )
+    db_session.add(generation)
+    db_session.flush()
+    return generation
+
+
 # ---------------------------------------------------------------------------
 # fold_running_balance — pure (§2.1 R-A)
 # ---------------------------------------------------------------------------
@@ -55,8 +77,14 @@ def test_fold_running_balance_allows_negative():
 
 def test_seed_from_balance_writes_sle_bin_anchor(db_session):
     item = _mk_item(db_session)
+    generation = _generation(db_session, "seed")
     key = LedgerKey(item.item_id, "", "", "WH1")
-    created = seed_from_balance(db_session, {key: 12}, anchor_period=datetime.date(2026, 7, 1))
+    created = seed_from_balance(
+        db_session,
+        {key: 12},
+        anchor_period=datetime.date(2026, 7, 1),
+        ledger_generation_id=generation.id,
+    )
     db_session.commit()
 
     assert len(created) == 1
@@ -92,11 +120,18 @@ def test_seed_from_balance_idempotent(db_session):
 
 def test_rebuild_running_balance_full(db_session):
     item = _mk_item(db_session, code="LK-RB")
+    generation = _generation(db_session, "full")
     key = LedgerKey(item.item_id, "", "", "WH1")
-    seed_from_balance(db_session, {key: 10}, anchor_period=datetime.date(2026, 7, 1))
+    seed = seed_from_balance(
+        db_session,
+        {key: 10},
+        anchor_period=datetime.date(2026, 7, 1),
+        ledger_generation_id=generation.id,
+    )
     # append two movements after the seed.
     db_session.add(
         models.StockLedgerEntry(
+            ingest_batch_id=seed[0].ingest_batch_id, source_content_hash="1" * 64,
             item_id=item.item_id, warehouse_ref1c="WH1", qty=D("8"), qty_after=D("0"),
             posting_at=datetime.datetime(2026, 7, 5), movement_kind="receipt",
             recorder_type="Doc", recorder_ref="R1", line_no="1",
@@ -104,6 +139,7 @@ def test_rebuild_running_balance_full(db_session):
     )
     db_session.add(
         models.StockLedgerEntry(
+            ingest_batch_id=seed[0].ingest_batch_id, source_content_hash="2" * 64,
             item_id=item.item_id, warehouse_ref1c="WH1", qty=D("-5"), qty_after=D("0"),
             posting_at=datetime.datetime(2026, 7, 6), movement_kind="assembly_out",
             recorder_type="Doc", recorder_ref="R2", line_no="1",
@@ -111,7 +147,9 @@ def test_rebuild_running_balance_full(db_session):
     )
     db_session.flush()
 
-    final = rebuild_running_balance(db_session, key)
+    final = rebuild_running_balance(
+        db_session, key, ledger_generation_id=generation.id
+    )
     assert _f(final) == 13  # 10 + 8 - 5
 
     rows = (
@@ -128,17 +166,29 @@ def test_rebuild_running_balance_full(db_session):
 
 def test_rebuild_running_balance_narrow_from_point(db_session):
     item = _mk_item(db_session, code="LK-NARROW")
+    generation = _generation(db_session, "narrow")
     key = LedgerKey(item.item_id, "", "", "WH1")
-    seed_from_balance(db_session, {key: 10}, anchor_period=datetime.date(2026, 7, 1))
+    seed = seed_from_balance(
+        db_session,
+        {key: 10},
+        anchor_period=datetime.date(2026, 7, 1),
+        ledger_generation_id=generation.id,
+    )
     db_session.add(
         models.StockLedgerEntry(
+            ingest_batch_id=seed[0].ingest_batch_id, source_content_hash="3" * 64,
             item_id=item.item_id, warehouse_ref1c="WH1", qty=D("4"), qty_after=D("999"),
             posting_at=datetime.datetime(2026, 7, 10), movement_kind="receipt",
             recorder_type="Doc", recorder_ref="RN", line_no="1",
         )
     )
     db_session.flush()
-    final = rebuild_running_balance(db_session, key, from_posting_at=datetime.datetime(2026, 7, 9))
+    final = rebuild_running_balance(
+        db_session,
+        key,
+        from_posting_at=datetime.datetime(2026, 7, 9),
+        ledger_generation_id=generation.id,
+    )
     assert _f(final) == 14  # opening 10 (seed) + 4
 
 
@@ -149,6 +199,7 @@ def test_rebuild_running_balance_narrow_from_point(db_session):
 
 def _mk_reservation(db_session):
     item = _mk_item(db_session, code="RES-FOLD")
+    generation = _generation(db_session, "reservation")
     run = models.PlanningRun(config_snapshot={})
     db_session.add(run)
     db_session.flush()
@@ -159,6 +210,7 @@ def _mk_reservation(db_session):
     db_session.add(req)
     db_session.flush()
     entry = models.ReservationEntry(
+        ledger_generation_id=generation.id,
         item_id=item.item_id, requirement_id=req.id, run_id=run.run_id, freeze_version=1,
         priority_period_from=datetime.date(2026, 7, 1), priority_period_to=datetime.date(2026, 7, 15),
         realization_mode="consume",
@@ -175,6 +227,7 @@ def test_fold_reservation_entry_materializes_cache(db_session):
     ):
         db_session.add(
             models.ReservationEvent(
+                ledger_generation_id=entry.ledger_generation_id,
                 reservation_id=entry.id, item_id=item.item_id, event_kind=kind,
                 reserved_delta=D(str(r_delta)), realized_delta=D(str(z_delta)),
                 idempotency_key=f"ev:{entry.id}:{i}",
@@ -197,14 +250,16 @@ def test_reservation_event_idempotency_key_unique(db_session):
     item, entry = _mk_reservation(db_session)
     db_session.add(
         models.ReservationEvent(
+            ledger_generation_id=entry.ledger_generation_id,
             reservation_id=entry.id, item_id=item.item_id, event_kind="open",
             reserved_delta=D("6"), idempotency_key="open:dup",
         )
     )
     db_session.flush()
     db_session.add(
-        models.ReservationEvent(
-            reservation_id=entry.id, item_id=item.item_id, event_kind="open",
+            models.ReservationEvent(
+                ledger_generation_id=entry.ledger_generation_id,
+                reservation_id=entry.id, item_id=item.item_id, event_kind="open",
             reserved_delta=D("6"), idempotency_key="open:dup",
         )
     )

@@ -32,7 +32,13 @@ from app.models import (
     ProductionPlanHeader,
     ProductionPlanLine,
 )
-from app.services.mrp_reconciliation import reconcile_snapshot
+from app.services.mrp_reconciliation import reconcile_snapshot as _public_reconcile_snapshot
+
+
+def reconcile_snapshot(db, run_id, **kwargs):
+    return _public_reconcile_snapshot(
+        db, run_id, diagnostic_legacy=True, **kwargs
+    )
 from app.services.period_plan_service import create_mrp_snapshot_from_period_plan
 from app.services.production_control_journal import (
     create_production_orders_from_mrp_requirements,

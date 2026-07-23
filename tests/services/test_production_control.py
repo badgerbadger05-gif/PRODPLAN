@@ -38,7 +38,11 @@ from app.models import (
     IgnoredWarehouse,
     WorkshopWarehouseBinding,
 )
-from app.routers.production_control import list_employees
+from app.routers.production_control import (
+    get_order_line_materials,
+    list_employees,
+    post_order_line_materials_refresh,
+)
 from app.services.production_control_journal import (
     create_orders_from_mrp,
     create_production_orders_from_mrp_requirements,
@@ -47,7 +51,10 @@ from app.services.production_control_journal import (
     list_journal,
     update_product_quantity,
 )
-from app.services.production_control_material_availability import preview_materials, recalculate_production_coverage
+from app.services.production_control_material_availability import (
+    preview_materials,
+    recalculate_production_coverage,
+)
 from app.services.production_control_material_issues import create_material_issues, delete_local_material_issue, list_material_issues
 from app.services.production_control_printing import render_route_sheets_html
 from app.services.one_c_production_order_export import PRODUCTION_ORDER_ENTITY
@@ -2430,6 +2437,33 @@ def _make_internal_order_for(db, parent, qty=2):
     db.add(product)
     db.commit()
     return order, product
+
+
+def test_materials_get_refresh_flag_is_read_only_and_post_persists(db_session):
+    parent, _spec, _components = _make_basic_spec(
+        db_session,
+        parent_name="PureGetParent",
+        child_specs=[("PURE-C", "Pure component", 10, 1)],
+    )
+    _order, product = _make_internal_order_for(db_session, parent, qty=2)
+
+    first = get_order_line_materials(product.product_id, refresh=True, db=db_session)
+    state = (
+        db_session.query(ProductionOrderLineState)
+        .filter_by(product_id=product.product_id)
+        .one_or_none()
+    )
+    assert first["coverage"] == "ready"
+    assert state is None
+
+    refreshed = post_order_line_materials_refresh(product.product_id, db=db_session)
+    state = (
+        db_session.query(ProductionOrderLineState)
+        .filter_by(product_id=product.product_id)
+        .one()
+    )
+    assert refreshed["coverage"] == "ready"
+    assert state.material_coverage_snapshot["coverage"] == "ready"
 
 
 def test_preview_materials_marks_ready_when_stock_covers_all(db_session):

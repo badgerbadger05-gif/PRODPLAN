@@ -22,6 +22,25 @@ from ...models import (
 )
 
 SETTINGS_ID = 1
+DEFAULT_SETTINGS: dict[str, Any] = {
+    "frozen_days": 3,
+    "gate_horizon_workdays": 10,
+    "shelf_threshold_qty": Decimal("5"),
+    "rt_machining_days": 7,
+    "rt_welding_days": 15,
+    "rt_painting_days": 21,
+    "batch_days_turning": 10,
+    "batch_days_bending": 7,
+    "batch_days_welding": 5,
+    "batch_days_paint_black": 2,
+    "batch_days_paint_color": 3,
+    "feeder_chain_enabled": False,
+    "feeder_load_horizon_weeks": 4,
+    "rt_processing_days": 25,
+    "processing_trip_interval_days": 7,
+    "processing_roundtrip_days": 14,
+    "fastener_categories": [],
+}
 
 # Scalar fields that update_settings accepts. warehouse refs and numeric/bool
 # fields are all plain assignments; unknown keys are ignored.
@@ -63,6 +82,16 @@ def get_or_create_settings(db: Session) -> DbrSettings:
         db.add(settings)
         db.flush()
     return settings
+
+
+def read_settings(db: Session) -> DbrSettings:
+    """Pure read for GET/board consumers; transient defaults are not persisted."""
+    settings = db.get(DbrSettings, SETTINGS_ID)
+    return (
+        settings
+        if settings is not None
+        else DbrSettings(id=SETTINGS_ID, **{**DEFAULT_SETTINGS, "fastener_categories": []})
+    )
 
 
 def update_settings(db: Session, payload: dict[str, Any]) -> DbrSettings:

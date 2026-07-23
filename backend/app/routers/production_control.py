@@ -33,7 +33,11 @@ from ..services.production_control_journal import (
     update_line_state,
     update_product_quantity,
 )
-from ..services.production_control_material_availability import get_materials_snapshot, preview_materials
+from ..services.production_control_material_availability import (
+    get_materials_snapshot,
+    preview_materials,
+    refresh_materials_snapshot,
+)
 from ..services.production_control_printing import mark_route_sheets_printed, render_route_sheets_html
 from ..services.production_control_production_flow import (
     produce_line,
@@ -426,11 +430,26 @@ def post_dedupe_mrp_orders(payload: DedupeMrpOrdersPayload, db: Session = Depend
 @router.get("/orders/{product_id}/materials", response_model=dict)
 def get_order_line_materials(
     product_id: int,
+    # Kept temporarily so old clients do not break. GET never honours this as
+    # a mutation; explicit recalculation moved to POST below.
     refresh: bool = False,
     db: Session = Depends(get_db),
 ):
     try:
-        return get_materials_snapshot(db, int(product_id), refresh=bool(refresh))
+        return get_materials_snapshot(db, int(product_id))
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/orders/{product_id}/materials/refresh", response_model=dict)
+def post_order_line_materials_refresh(
+    product_id: int,
+    db: Session = Depends(get_db),
+):
+    try:
+        return refresh_materials_snapshot(db, int(product_id))
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:

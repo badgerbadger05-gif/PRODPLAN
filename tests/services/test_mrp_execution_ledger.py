@@ -16,6 +16,7 @@ from datetime import date, datetime
 from types import SimpleNamespace
 
 import pytest
+from app import models
 
 
 @pytest.fixture(autouse=True)
@@ -48,14 +49,67 @@ from app.models import (
 )
 from app.services.mrp_execution_ledger import (
     _scope_run_ids,
-    populate_executed_qty,
-    run_ledger_cycle,
+    populate_executed_qty as _public_populate_executed_qty,
+    run_ledger_cycle as _public_run_ledger_cycle,
 )
+
+
+def run_ledger_cycle(db):
+    return _public_run_ledger_cycle(db, diagnostic_legacy=True)
+
+
+def populate_executed_qty(db, run_ids=None):
+    return _public_populate_executed_qty(
+        db, run_ids, diagnostic_legacy=run_ids is None
+    )
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def test_public_ledger_cycle_is_blocked_and_creates_no_allocations(db_session):
+    before = db_session.query(MrpExecutionAllocation).count()
+
+    with pytest.raises(NotImplementedError, match="generation-unaware"):
+        _public_run_ledger_cycle(db_session)
+
+    assert db_session.query(MrpExecutionAllocation).count() == before
+
+
+def test_legacy_diagnostic_cycle_never_repoints_accepted_truth(db_session):
+    batch = models.PhysicalImportBatch(
+        batch_key="accepted-before-diagnostic",
+        status="completed",
+        cutoff=datetime(2026, 7, 1),
+        source_watermarks={"test": True},
+    )
+    db_session.add(batch)
+    db_session.flush()
+    accepted = models.LedgerGeneration(
+        generation_key="accepted-before-diagnostic",
+        status="accepted",
+        cutoff=batch.cutoff,
+        accepted_at=datetime(2026, 7, 1),
+        physical_import_batch_id=batch.id,
+        algorithm_version="test",
+        replay_version="test",
+        source_watermarks={"test": True},
+        capabilities={},
+    )
+    db_session.add(accepted)
+    db_session.flush()
+    db_session.add(
+        models.PlanningTruthState(id=1, current_generation_id=accepted.id)
+    )
+    db_session.commit()
+
+    _public_run_ledger_cycle(db_session, diagnostic_legacy=True)
+    db_session.expire_all()
+
+    pointer = db_session.get(models.PlanningTruthState, 1)
+    assert pointer.current_generation_id == accepted.id
 
 def _make_production_item(db, code: str, stock: float = 0.0) -> Item:
     item = Item(
@@ -814,7 +868,9 @@ def test_i3_shim_raises_on_run_ids(db_session):
 
 def test_i3_reconcile_tail_runs_cycle_and_respects_dry_run(db_session):
     """reconcile_all_active's tail runs the ledger cycle; dry_run rolls it back."""
-    from app.services.mrp_reconciliation import reconcile_all_active
+    from app.services.mrp_reconciliation import (
+        reconcile_all_active as public_reconcile_all_active,
+    )
 
     item = _make_production_item(db_session, "RC-1")
     run = _make_run(db_session, period_from=date(2026, 6, 1), period_to=date(2026, 6, 30), freeze_version=1)
@@ -822,13 +878,17 @@ def test_i3_reconcile_tail_runs_cycle_and_respects_dry_run(db_session):
     _make_production_line(db_session, item, quantity=40, produced=40, req=req)
     db_session.commit()
 
-    dry = reconcile_all_active(db_session, dry_run=True)
+    dry = public_reconcile_all_active(
+        db_session, dry_run=True, diagnostic_legacy=True
+    )
     assert "execution_ledger" in dry
     assert "cycle_id" in dry["execution_ledger"]
     db_session.expire_all()
     assert float(db_session.get(MrpRequirement, req.id).executed_qty) == 0.0
 
-    reconcile_all_active(db_session, dry_run=False)
+    public_reconcile_all_active(
+        db_session, dry_run=False, diagnostic_legacy=True
+    )
     db_session.expire_all()
     assert float(db_session.get(MrpRequirement, req.id).executed_qty) == 40.0
 

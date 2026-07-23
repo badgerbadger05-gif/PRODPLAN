@@ -28,12 +28,13 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app import models
 from ..mrp_freeze import PoolKey, pool_key_for
 from ..replenishment import REPLENISHMENT_FLOW_PURCHASE, classify_replenishment_flow
-from .reconcile import contour_warehouse_refs, ledger_on_hand_by_item
+from .reconcile import contour_warehouse_refs
 from .reservation import (
     CONSUME,
     MAKE,
@@ -107,6 +108,101 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _resolve_generation_id(
+    db: Session,
+    ledger_generation_id: Optional[int] = None,
+    *,
+    for_write: bool = True,
+) -> int:
+    """Resolve only an explicit generation or explicit truth-state pointer.
+
+    There is deliberately no "latest generation" or legacy-row fallback.
+    Reservation mutations are allowed only while the generation is building;
+    accepted generations are immutable.
+    """
+    generation = (
+        db.get(models.LedgerGeneration, int(ledger_generation_id))
+        if ledger_generation_id is not None
+        else None
+    )
+    if generation is None and ledger_generation_id is None:
+        pointer = db.get(models.PlanningTruthState, 1)
+        generation = pointer.current_generation if pointer is not None else None
+    if generation is None:
+        raise ValueError(
+            "reservation Ledger requires explicit ledger_generation_id "
+            "or PlanningTruthState context"
+        )
+    if for_write and str(generation.status) != "building":
+        raise ValueError(
+            f"reservation Ledger generation {generation.id} is "
+            f"{generation.status}; writes require building"
+        )
+    if not for_write and str(generation.status) not in {"building", "accepted"}:
+        raise ValueError(
+            f"reservation Ledger generation {generation.id} is "
+            f"{generation.status}; readable context required"
+        )
+    if (
+        not for_write
+        and str(generation.status) == "accepted"
+        and (generation.cutoff is None or generation.accepted_at is None)
+    ):
+        raise ValueError(
+            f"reservation Ledger generation {generation.id} is malformed: "
+            "accepted reads require cutoff and accepted_at"
+        )
+    return int(generation.id)
+
+
+def _ledger_on_hand_by_generation(
+    db: Session,
+    ledger_generation_id: int,
+) -> Dict[int, float]:
+    """Generation-scoped StockBin fold with the planning-contour policy."""
+    ignored_refs = {
+        str(ref)
+        for (ref,) in db.query(models.IgnoredWarehouse.warehouse_ref1c).all()
+        if ref
+    }
+    warehouse_rows = db.query(
+        models.StockWarehouse.warehouse_ref1c,
+        models.StockWarehouse.is_selected,
+        models.StockWarehouse.is_finished_goods,
+    ).all()
+    selected_refs = {
+        str(ref)
+        for ref, selected, finished in warehouse_rows
+        if ref and bool(selected) and not bool(finished)
+    }
+    finished_refs = {
+        str(ref) for ref, _selected, finished in warehouse_rows
+        if ref and bool(finished)
+    }
+    query = db.query(
+        models.StockBin.item_id,
+        func.sum(models.StockBin.on_hand),
+    ).filter(models.StockBin.ledger_generation_id == ledger_generation_id)
+    if warehouse_rows:
+        query = (
+            query.filter(models.StockBin.warehouse_ref1c.in_(selected_refs))
+            if selected_refs
+            else query.filter(False)
+        )
+    if ignored_refs:
+        query = query.filter(
+            ~models.StockBin.warehouse_ref1c.in_(ignored_refs)
+        )
+    if finished_refs:
+        query = query.filter(
+            ~models.StockBin.warehouse_ref1c.in_(finished_refs)
+        )
+    return {
+        int(item_id): float(quantity or 0)
+        for item_id, quantity in query.group_by(models.StockBin.item_id).all()
+    }
+
+
 # ---------------------------------------------------------------------------
 # §2.2 — mode assignment (produced-vs-purchased classification REUSED from
 # app.services.replenishment.classify_replenishment_flow — the SAME classifier
@@ -168,12 +264,14 @@ def _get_or_create_entry(
     req: models.MrpRequirement,
     mode: str,
     run: Optional[models.PlanningRun],
+    ledger_generation_id: int,
 ) -> models.ReservationEntry:
     entry = (
         db.query(models.ReservationEntry)
         .filter(
             models.ReservationEntry.requirement_id == int(req.id),
             models.ReservationEntry.realization_mode == mode,
+            models.ReservationEntry.ledger_generation_id == ledger_generation_id,
         )
         .one_or_none()
     )
@@ -183,6 +281,7 @@ def _get_or_create_entry(
     pf, pt = _priority_key(req, run)
     freeze_version = int(req.freeze_version if req.freeze_version is not None else (run.active_freeze_version if run and run.active_freeze_version is not None else 0))
     entry = models.ReservationEntry(
+        ledger_generation_id=ledger_generation_id,
         item_id=int(req.item_id),
         characteristic_ref=pk.characteristic_ref,
         organization_ref=pk.organization_ref,
@@ -204,10 +303,17 @@ def _get_or_create_entry(
     return entry
 
 
-def _event_exists(db: Session, idempotency_key: str) -> bool:
+def _event_exists(
+    db: Session,
+    ledger_generation_id: int,
+    idempotency_key: str,
+) -> bool:
     return (
         db.query(models.ReservationEvent.id)
-        .filter(models.ReservationEvent.idempotency_key == idempotency_key)
+        .filter(
+            models.ReservationEvent.ledger_generation_id == ledger_generation_id,
+            models.ReservationEvent.idempotency_key == idempotency_key,
+        )
         .first()
         is not None
     )
@@ -229,10 +335,11 @@ def _append_event(
 ) -> bool:
     """Append one reservation_event, idempotent by idempotency_key. Returns True
     if a new row was written (design §2.3, append-only, never UPDATE/DELETE)."""
-    if _event_exists(db, idempotency_key):
+    if _event_exists(db, int(entry.ledger_generation_id), idempotency_key):
         return False
     db.add(
         models.ReservationEvent(
+            ledger_generation_id=int(entry.ledger_generation_id),
             reservation_id=int(entry.id),
             item_id=int(entry.item_id),
             characteristic_ref=entry.characteristic_ref,
@@ -260,6 +367,10 @@ def _fold_entry(db: Session, entry: models.ReservationEntry) -> Tuple[Decimal, D
     events = (
         db.query(models.ReservationEvent)
         .filter(models.ReservationEvent.reservation_id == int(entry.id))
+        .filter(
+            models.ReservationEvent.ledger_generation_id
+            == int(entry.ledger_generation_id)
+        )
         .order_by(models.ReservationEvent.id.asc())
         .all()
     )
@@ -279,6 +390,10 @@ def _entry_events(db: Session, entry: models.ReservationEntry) -> List[models.Re
     return (
         db.query(models.ReservationEvent)
         .filter(models.ReservationEvent.reservation_id == int(entry.id))
+        .filter(
+            models.ReservationEvent.ledger_generation_id
+            == int(entry.ledger_generation_id)
+        )
         .order_by(models.ReservationEvent.id.asc())
         .all()
     )
@@ -306,6 +421,8 @@ def unrealize_replaced_sle(
     db: Session,
     sle_ids: Sequence[int],
     recorder_ref: str = "",
+    *,
+    ledger_generation_id: Optional[int] = None,
 ) -> int:
     """Compensate realize events whose SLE rows are about to be REPLACED.
 
@@ -329,11 +446,13 @@ def unrealize_replaced_sle(
     ids = [int(i) for i in sle_ids or []]
     if not ids:
         return 0
+    generation_id = _resolve_generation_id(db, ledger_generation_id)
     realize_events = (
         db.query(models.ReservationEvent)
         .filter(
             models.ReservationEvent.sle_id.in_(ids),
             models.ReservationEvent.event_kind == "realize",
+            models.ReservationEvent.ledger_generation_id == generation_id,
         )
         .order_by(models.ReservationEvent.id.asc())
         .all()
@@ -396,6 +515,7 @@ def release_run_reservations(
     cycle_id: str = "",
     *,
     redistribute_pools: bool = True,
+    ledger_generation_id: Optional[int] = None,
 ) -> int:
     """run → CLOSED releases every still-active reservation of the run (§6.2,
     решение владельца №15 / released-маршрутизация Прил. B §5).
@@ -415,11 +535,13 @@ def release_run_reservations(
     ids = [int(r) for r in run_ids or []]
     if not ids:
         return 0
+    generation_id = _resolve_generation_id(db, ledger_generation_id)
     entries = (
         db.query(models.ReservationEntry)
         .filter(
             models.ReservationEntry.run_id.in_(ids),
             models.ReservationEntry.lifecycle_status == "active",
+            models.ReservationEntry.ledger_generation_id == generation_id,
         )
         .all()
     )
@@ -447,22 +569,32 @@ def release_run_reservations(
         released_ids.append(int(e.id))
     _delete_floating_coverage(db, released_ids)
     if redistribute_pools and touched_items:
-        on_hand = ledger_on_hand_by_item(db)
+        on_hand = _ledger_on_hand_by_generation(db, generation_id)
         for iid in sorted(touched_items):
-            redistribute_pool(db, int(iid), on_hand, cycle_id)
+            redistribute_pool(
+                db, int(iid), on_hand, cycle_id,
+                ledger_generation_id=generation_id,
+            )
     db.flush()
     return released
 
 
-def release_closed_run_reservations(db: Session, cycle_id: str = "") -> int:
+def release_closed_run_reservations(
+    db: Session,
+    cycle_id: str = "",
+    *,
+    ledger_generation_id: Optional[int] = None,
+) -> int:
     """Self-healing sweep (Д3а): release active reservations whose run is
     already CLOSED — pre-fix ghosts, or a closure whose release hook failed.
     Called from :func:`run_reservation_shadow` every cycle; idempotent (the
     redistribute is left to the caller's own pool loop)."""
+    generation_id = _resolve_generation_id(db, ledger_generation_id)
     rows = (
         db.query(models.ReservationEntry.run_id)
         .join(models.PlanningRun, models.PlanningRun.run_id == models.ReservationEntry.run_id)
         .filter(models.ReservationEntry.lifecycle_status == "active")
+        .filter(models.ReservationEntry.ledger_generation_id == generation_id)
         .filter(models.PlanningRun.status == _RUN_CLOSED_STATUS)
         .distinct()
         .all()
@@ -470,10 +602,19 @@ def release_closed_run_reservations(db: Session, cycle_id: str = "") -> int:
     run_ids = [int(r) for (r,) in rows if r is not None]
     if not run_ids:
         return 0
-    return release_run_reservations(db, run_ids, cycle_id, redistribute_pools=False)
+    return release_run_reservations(
+        db, run_ids, cycle_id, redistribute_pools=False,
+        ledger_generation_id=generation_id,
+    )
 
 
-def reopen_run_reservations(db: Session, run_ids: Sequence[int], cycle_id: str = "") -> int:
+def reopen_run_reservations(
+    db: Session,
+    run_ids: Sequence[int],
+    cycle_id: str = "",
+    *,
+    ledger_generation_id: Optional[int] = None,
+) -> int:
     """reopen_run undoes a closure (Д3в): released reserves return to active
     with a ``reopen`` event restoring the released outstanding (reserved_delta
     = −release.reserved_delta). Keyed by the release event id → idempotent.
@@ -482,11 +623,13 @@ def reopen_run_reservations(db: Session, run_ids: Sequence[int], cycle_id: str =
     ids = [int(r) for r in run_ids or []]
     if not ids:
         return 0
+    generation_id = _resolve_generation_id(db, ledger_generation_id)
     entries = (
         db.query(models.ReservationEntry)
         .filter(
             models.ReservationEntry.run_id.in_(ids),
             models.ReservationEntry.lifecycle_status == "released",
+            models.ReservationEntry.ledger_generation_id == generation_id,
         )
         .all()
     )
@@ -500,6 +643,7 @@ def reopen_run_reservations(db: Session, run_ids: Sequence[int], cycle_id: str =
             .filter(
                 models.ReservationEvent.reservation_id == int(e.id),
                 models.ReservationEvent.event_kind == "release",
+                models.ReservationEvent.ledger_generation_id == generation_id,
             )
             .order_by(models.ReservationEvent.id.desc())
             .first()
@@ -518,9 +662,12 @@ def reopen_run_reservations(db: Session, run_ids: Sequence[int], cycle_id: str =
         reopened += 1
         touched_items.add(int(e.item_id))
     if touched_items:
-        on_hand = ledger_on_hand_by_item(db)
+        on_hand = _ledger_on_hand_by_generation(db, generation_id)
         for iid in sorted(touched_items):
-            redistribute_pool(db, int(iid), on_hand, cycle_id)
+            redistribute_pool(
+                db, int(iid), on_hand, cycle_id,
+                ledger_generation_id=generation_id,
+            )
     db.flush()
     return reopened
 
@@ -533,6 +680,8 @@ def materialize_reservations(
     reqs: Sequence[models.MrpRequirement],
     runs_by_id: Dict[int, models.PlanningRun],
     cycle_id: str,
+    *,
+    ledger_generation_id: Optional[int] = None,
 ) -> List[int]:
     """Materialize reservation_entry + open/amend events for active requirements.
 
@@ -555,6 +704,7 @@ def materialize_reservations(
     """
     if not reqs:
         return []
+    generation_id = _resolve_generation_id(db, ledger_generation_id)
     items = _load_items(db, {int(r.item_id) for r in reqs})
     touched: List[int] = []
     for req in reqs:
@@ -563,11 +713,16 @@ def materialize_reservations(
         version = int(req.freeze_version if req.freeze_version is not None else (run.active_freeze_version if run and run.active_freeze_version is not None else 0))
         vanished = _dec(req.total_required_qty) <= EPS
         for mode, target in mode_targets(req, item):
-            entry = _get_or_create_entry(db, req, mode, run)
+            entry = _get_or_create_entry(
+                db, req, mode, run, generation_id,
+            )
             touched.append(int(entry.id))
             events = (
                 db.query(models.ReservationEvent)
                 .filter(models.ReservationEvent.reservation_id == int(entry.id))
+                .filter(
+                    models.ReservationEvent.ledger_generation_id == generation_id
+                )
                 .order_by(models.ReservationEvent.id.asc())
                 .all()
             )
@@ -643,6 +798,8 @@ def mirror_frozen_pins(
     reqs: Sequence[models.MrpRequirement],
     freeze_allocs: Sequence[models.MrpFreezeAllocation],
     items: Optional[Dict[int, models.Item]] = None,
+    *,
+    ledger_generation_id: Optional[int] = None,
 ) -> int:
     """Mirror the frozen MrpFreezeAllocation rows into reservation_coverage
     frozen pins (pin_kind='frozen'; copy alloc_qty/fact_at_freeze/source). The
@@ -657,6 +814,7 @@ def mirror_frozen_pins(
     """
     if not reqs:
         return 0
+    generation_id = _resolve_generation_id(db, ledger_generation_id)
     reqs_by_id = {int(r.id): r for r in reqs}
     if items is None:
         items = _load_items(db, {int(r.item_id) for r in reqs})
@@ -671,7 +829,10 @@ def mirror_frozen_pins(
     scope_entry_ids: List[int] = []
     for e in (
         db.query(models.ReservationEntry)
-        .filter(models.ReservationEntry.requirement_id.in_(list(reqs_by_id.keys())))
+        .filter(
+            models.ReservationEntry.requirement_id.in_(list(reqs_by_id.keys())),
+            models.ReservationEntry.ledger_generation_id == generation_id,
+        )
         .all()
     ):
         entries_by_req_mode[(int(e.requirement_id), str(e.realization_mode))] = e
@@ -735,6 +896,8 @@ def mirror_frozen_pins(
 def mirror_verify_realized(
     db: Session,
     freeze_allocs: Sequence[models.MrpFreezeAllocation],
+    *,
+    ledger_generation_id: Optional[int] = None,
 ) -> int:
     """Copy MrpFreezeAllocation.realized_qty/evaporated_qty onto the mirror
     frozen pins (design §2.6): where verify_frozen_supply updated the old table,
@@ -745,11 +908,15 @@ def mirror_verify_realized(
     """
     if not freeze_allocs:
         return 0
+    generation_id = _resolve_generation_id(db, ledger_generation_id)
     req_ids = {int(a.requirement_id) for a in freeze_allocs}
     # entry id → requirement_id, and (requirement_id) → its entry ids
     entry_rows = (
         db.query(models.ReservationEntry.id, models.ReservationEntry.requirement_id)
-        .filter(models.ReservationEntry.requirement_id.in_(list(req_ids)))
+        .filter(
+            models.ReservationEntry.requirement_id.in_(list(req_ids)),
+            models.ReservationEntry.ledger_generation_id == generation_id,
+        )
         .all()
     )
     entry_ids_by_req: Dict[int, List[int]] = {}
@@ -811,12 +978,22 @@ class _MatchIndex:
     is honest ``unplanned_consumption`` — NEVER a silent global FIFO.
     """
 
-    def __init__(self, db: Session, scope_run_ids: List[int], open_req_ids: Set[int]):
+    def __init__(
+        self,
+        db: Session,
+        scope_run_ids: List[int],
+        open_req_ids: Set[int],
+        ledger_generation_id: int,
+    ):
         self.res_by_req_mode: Dict[Tuple[int, str], models.ReservationEntry] = {}
         self.res_by_run_item_mode: Dict[Tuple[int, int, str], List[models.ReservationEntry]] = {}
         entries = (
             db.query(models.ReservationEntry)
             .filter(models.ReservationEntry.requirement_id.in_(list(open_req_ids)))
+            .filter(
+                models.ReservationEntry.ledger_generation_id
+                == ledger_generation_id
+            )
             .filter(models.ReservationEntry.lifecycle_status == "active")
             .all()
             if open_req_ids
@@ -931,6 +1108,10 @@ class _MatchIndex:
             for e in (
                 db.query(models.ReservationEntry)
                 .filter(models.ReservationEntry.requirement_id.in_(list(open_req_ids)))
+                .filter(
+                    models.ReservationEntry.ledger_generation_id
+                    == ledger_generation_id
+                )
                 .filter(models.ReservationEntry.realization_mode == CONSUME)
                 .filter(models.ReservationEntry.lifecycle_status.in_(["active", "closed"]))
                 .all()
@@ -1132,7 +1313,13 @@ def _apply_return_unrealize(
     return True
 
 
-def realize_from_sle(db: Session, scope, cycle_id: str) -> Dict[str, Any]:
+def realize_from_sle(
+    db: Session,
+    scope,
+    cycle_id: str,
+    *,
+    ledger_generation_id: Optional[int] = None,
+) -> Dict[str, Any]:
     """Append realize events from physical SLE not yet applied (design §6.1/§6.3).
 
     Issue (qty<0) → consume-reservation realize, CAPPED at outstanding (Finding
@@ -1164,7 +1351,10 @@ def realize_from_sle(db: Session, scope, cycle_id: str) -> Dict[str, Any]:
     }
     if not scope.pool_items:
         return summary
-    index = _MatchIndex(db, scope.run_ids, scope.open_req_ids)
+    generation_id = _resolve_generation_id(db, ledger_generation_id)
+    index = _MatchIndex(
+        db, scope.run_ids, scope.open_req_ids, generation_id,
+    )
 
     # finished-goods (ГП) warehouses: a transfer_in landing on one of these is
     # a make receipt (перемещение ГП на склад ГП), not a material movement.
@@ -1183,7 +1373,10 @@ def realize_from_sle(db: Session, scope, cycle_id: str) -> Dict[str, Any]:
     applied_sle_ids = {
         int(sid)
         for (sid,) in db.query(models.ReservationEvent.sle_id)
-        .filter(models.ReservationEvent.sle_id.isnot(None))
+        .filter(
+            models.ReservationEvent.sle_id.isnot(None),
+            models.ReservationEvent.ledger_generation_id == generation_id,
+        )
         .all()
     }
 
@@ -1296,6 +1489,8 @@ def redistribute_pool(
     item_id: int,
     on_hand_by_item: Dict[int, float],
     cycle_id: str,
+    *,
+    ledger_generation_id: Optional[int] = None,
 ) -> Optional[Pool]:
     """Read pool state from DB, run the pure ``redistribute`` (design §5), then
     PERSIST its floating reservation_coverage rows + covered_*/uncovered_qty/
@@ -1305,6 +1500,7 @@ def redistribute_pool(
     supplier/wip pins become per-reservation IncomingLines (remaining = pin_live)
     so Pass A gives each reserve its own promise and Pass C frees the surplus.
     """
+    generation_id = _resolve_generation_id(db, ledger_generation_id)
     pk = pool_key_for(int(item_id))
     entries = (
         db.query(models.ReservationEntry)
@@ -1315,6 +1511,7 @@ def redistribute_pool(
             models.ReservationEntry.planning_stock_pool == pk.planning_stock_pool,
             models.ReservationEntry.realization_mode == CONSUME,
             models.ReservationEntry.lifecycle_status == "active",
+            models.ReservationEntry.ledger_generation_id == generation_id,
         )
         .all()
     )
@@ -1441,6 +1638,7 @@ def redistribute_after_ledger_apply(
     cycle_id: str,
     *,
     match: bool = True,
+    ledger_generation_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Trigger т1 (design §5): after ledger-1 is applied to some keys (a pull or
     a reconcile adjustment) refresh JUST the touched pools, so position /
@@ -1479,6 +1677,7 @@ def redistribute_after_ledger_apply(
     ids = sorted({int(i) for i in item_ids if i is not None})
     if not ids:
         return summary
+    generation_id = _resolve_generation_id(db, ledger_generation_id)
     try:
         # active/closed reservations of the touched items → minimal match scope.
         rows = (
@@ -1487,6 +1686,7 @@ def redistribute_after_ledger_apply(
                 models.ReservationEntry.requirement_id,
             )
             .filter(models.ReservationEntry.item_id.in_(ids))
+            .filter(models.ReservationEntry.ledger_generation_id == generation_id)
             .filter(models.ReservationEntry.lifecycle_status.in_(["active", "closed"]))
             .all()
         )
@@ -1499,14 +1699,20 @@ def redistribute_after_ledger_apply(
             scope = _IncrementalScope(
                 pool_items=pool_items, run_ids=[], open_req_ids=open_req_ids
             )
-            realize_summary = realize_from_sle(db, scope, cycle_id)
+            realize_summary = realize_from_sle(
+                db, scope, cycle_id,
+                ledger_generation_id=generation_id,
+            )
             for k in ("realized_consume", "realized_make", "returned_unrealize",
                       "internal_transfer", "unplanned_consumption"):
                 summary[k] = realize_summary.get(k, 0)
         # (2) … THEN redistribute the coverage caches of the touched pools only.
-        on_hand = ledger_on_hand_by_item(db)
+        on_hand = _ledger_on_hand_by_generation(db, generation_id)
         for iid in sorted(pool_items):
-            if redistribute_pool(db, iid, on_hand, cycle_id) is not None:
+            if redistribute_pool(
+                db, iid, on_hand, cycle_id,
+                ledger_generation_id=generation_id,
+            ) is not None:
                 summary["pools_redistributed"] += 1
         db.flush()
     except Exception:  # noqa: BLE001 — т1 must never break the pull / reconcile
@@ -1520,29 +1726,51 @@ def redistribute_after_ledger_apply(
 # ---------------------------------------------------------------------------
 # orchestrators (wrapped by the caller in try/except)
 # ---------------------------------------------------------------------------
-def run_reservation_shadow(db: Session, scope, cycle_id: str) -> Dict[str, Any]:
+def run_reservation_shadow(
+    db: Session,
+    scope,
+    cycle_id: str,
+    *,
+    ledger_generation_id: Optional[int] = None,
+) -> Dict[str, Any]:
     """The Inc4 reservation block, called from run_ledger_cycle AFTER verify /
     executed / drift / closure. PURE SHADOW: writes only reservation_* tables,
     returns a diagnostic summary that the caller does NOT fold into its own
     (byte-identical) return dict.
     """
+    generation_id = _resolve_generation_id(db, ledger_generation_id)
     reqs = list(scope.open_reqs)
     items = _load_items(db, set(scope.pool_items))
-    materialize_reservations(db, reqs, scope.runs_by_id, cycle_id)
+    materialize_reservations(
+        db, reqs, scope.runs_by_id, cycle_id,
+        ledger_generation_id=generation_id,
+    )
     # Д3а self-heal: reservations of already-CLOSED runs must not stay active
     # (ghost reserved_soft). Normally released by the closure hooks
     # (apply_run_closure / force_close_run); this sweep catches pre-existing
     # ghosts and hook failures. Runs BEFORE matching/redistribute so released
     # reserves neither absorb realize events nor claim coverage this cycle.
-    released_swept = release_closed_run_reservations(db, cycle_id)
-    pins_written = mirror_frozen_pins(db, reqs, scope.freeze_allocs, items)
-    verify_mirrored = mirror_verify_realized(db, scope.freeze_allocs)
-    realize_summary = realize_from_sle(db, scope, cycle_id)
+    released_swept = release_closed_run_reservations(
+        db, cycle_id, ledger_generation_id=generation_id,
+    )
+    pins_written = mirror_frozen_pins(
+        db, reqs, scope.freeze_allocs, items,
+        ledger_generation_id=generation_id,
+    )
+    verify_mirrored = mirror_verify_realized(
+        db, scope.freeze_allocs, ledger_generation_id=generation_id,
+    )
+    realize_summary = realize_from_sle(
+        db, scope, cycle_id, ledger_generation_id=generation_id,
+    )
 
-    on_hand = ledger_on_hand_by_item(db)
+    on_hand = _ledger_on_hand_by_generation(db, generation_id)
     pools_redistributed = 0
     for item_id in sorted(scope.pool_items):
-        if redistribute_pool(db, int(item_id), on_hand, cycle_id) is not None:
+        if redistribute_pool(
+            db, int(item_id), on_hand, cycle_id,
+            ledger_generation_id=generation_id,
+        ) is not None:
             pools_redistributed += 1
 
     return {
@@ -1555,7 +1783,12 @@ def run_reservation_shadow(db: Session, scope, cycle_id: str) -> Dict[str, Any]:
     }
 
 
-def effective_net_bin(db: Session, req: "models.MrpRequirement") -> Optional[float]:
+def effective_net_bin(
+    db: Session,
+    req: "models.MrpRequirement",
+    *,
+    ledger_generation_id: Optional[int] = None,
+) -> Optional[float]:
     """Inc6 (б) — effective_net derived from the reservation ledger (design §3/§3.1).
 
     ``effective_net(r) = uncovered(consume) + Σ pin_live``
@@ -1587,11 +1820,15 @@ def effective_net_bin(db: Session, req: "models.MrpRequirement") -> Optional[flo
     Returns ``None`` when the requirement has NO consume reservation (make-only,
     e.g. a finished good) so the caller falls back to the legacy net+drift target.
     """
+    generation_id = _resolve_generation_id(
+        db, ledger_generation_id, for_write=False,
+    )
     entry = (
         db.query(models.ReservationEntry)
         .filter(
             models.ReservationEntry.requirement_id == int(req.id),
             models.ReservationEntry.realization_mode == CONSUME,
+            models.ReservationEntry.ledger_generation_id == generation_id,
         )
         .one_or_none()
     )
@@ -1623,7 +1860,12 @@ def effective_net_bin(db: Session, req: "models.MrpRequirement") -> Optional[flo
     return max(uncovered + supplier_term, 0.0)
 
 
-def materialize_reservations_for_freeze(db: Session, active_run_ids: Sequence[int]) -> Dict[str, Any]:
+def materialize_reservations_for_freeze(
+    db: Session,
+    active_run_ids: Sequence[int],
+    *,
+    ledger_generation_id: Optional[int] = None,
+) -> Dict[str, Any]:
     """Freeze-time hook (design §2.6 / §11): after refreeze wrote every
     MrpFreezeAllocation, materialize reservations + mirror the frozen pins so
     the reservation ledger tracks the fresh freeze. PURE SHADOW, wrapped by the
@@ -1632,6 +1874,7 @@ def materialize_reservations_for_freeze(db: Session, active_run_ids: Sequence[in
     run_ids = [int(r) for r in active_run_ids]
     if not run_ids:
         return {"reservations": 0, "frozen_pins": 0}
+    generation_id = _resolve_generation_id(db, ledger_generation_id)
     reqs = (
         db.query(models.MrpRequirement)
         .filter(models.MrpRequirement.run_id.in_(run_ids))
@@ -1656,15 +1899,25 @@ def materialize_reservations_for_freeze(db: Session, active_run_ids: Sequence[in
         if version_by_run.get(int(a.run_id)) == int(a.freeze_version)
     ]
     cycle_id = f"freeze-{_now().isoformat()}"
-    materialize_reservations(db, reqs, runs_by_id, cycle_id)
-    pins = mirror_frozen_pins(db, reqs, freeze_allocs)
+    materialize_reservations(
+        db, reqs, runs_by_id, cycle_id,
+        ledger_generation_id=generation_id,
+    )
+    pins = mirror_frozen_pins(
+        db, reqs, freeze_allocs,
+        ledger_generation_id=generation_id,
+    )
     return {"reservations": len(reqs), "frozen_pins": pins}
 
 
 # ---------------------------------------------------------------------------
 # §11 — shadow reconcile report (read-only) : reservation world vs inc1–5
 # ---------------------------------------------------------------------------
-def reservation_shadow_report(db: Session) -> Dict[str, Any]:
+def reservation_shadow_report(
+    db: Session,
+    *,
+    ledger_generation_id: Optional[int] = None,
+) -> Dict[str, Any]:
     """Read-only comparison of the two worlds (design §11 Инк4):
 
     * per requirement: reservation uncovered_qty vs inc1–5 remaining_qty /
@@ -1674,9 +1927,15 @@ def reservation_shadow_report(db: Session) -> Dict[str, Any]:
 
     So we can watch the two ledgers agree in shadow before Inc5/6. No writes.
     """
+    generation_id = _resolve_generation_id(
+        db, ledger_generation_id, for_write=False,
+    )
     entries = (
         db.query(models.ReservationEntry)
-        .filter(models.ReservationEntry.lifecycle_status == "active")
+        .filter(
+            models.ReservationEntry.lifecycle_status == "active",
+            models.ReservationEntry.ledger_generation_id == generation_id,
+        )
         .all()
     )
     req_ids = {int(e.requirement_id) for e in entries}
@@ -1762,13 +2021,16 @@ def reservation_shadow_report(db: Session) -> Dict[str, Any]:
 def item_ledger_position(
     db: Session,
     item_ids: Optional[Sequence[int]] = None,
+    *,
+    ledger_generation_id: Optional[int] = None,
 ) -> Dict[int, Dict[str, float]]:
     """The design §2.5 pool projection rendered ``{item_id: position}``.
 
     Per item (default pool): ``on_hand`` (Σ stock_bin over the planning contour,
-    ГП excluded), ``incoming_supplier`` / ``incoming_wip`` (existing OData
-    mirrors), ``reserved_soft`` (Σ outstanding over ACTIVE consume reservations —
-    make contributes exactly 0, §3.1/INV-RES-make-zero), and the derived
+    ГП excluded), generation-bound ``incoming_supplier`` / ``incoming_wip`` from
+    the accepted reservation projection, ``reserved_soft`` (Σ outstanding over
+    ACTIVE consume reservations — make contributes exactly 0,
+    §3.1/INV-RES-make-zero), and the derived
     ``available`` / ``projected`` / ``uncovered`` by the §3 formulas::
 
         available  = on_hand − reserved_soft            # MAY be < 0 (surfaced)
@@ -1785,58 +2047,50 @@ def item_ledger_position(
     If ``item_ids`` is given, the result is restricted to those items (items with
     no ledger footprint resolve to an all-zero position).
     """
+    generation_id = _resolve_generation_id(
+        db, ledger_generation_id, for_write=False,
+    )
     want: Optional[Set[int]] = (
         {int(i) for i in item_ids if i is not None} if item_ids is not None else None
     )
 
-    on_hand_all = ledger_on_hand_by_item(db)
+    on_hand_all = _ledger_on_hand_by_generation(db, generation_id)
 
-    # reserved_soft per item — Σ outstanding over active consume reservations.
+    # Reservation projection per item.  Incoming is deliberately read from the
+    # same generation-scoped materialization as reserved_soft.  Live
+    # ProductionProduct / SupplierOrderItem mirrors are evidence for a future
+    # build, not facts that may change an already-built Ledger position.
     reserved_soft: Dict[int, float] = {}
+    incoming_supplier: Dict[int, float] = {}
+    incoming_wip: Dict[int, float] = {}
     res_rows = (
         db.query(
             models.ReservationEntry.item_id,
             models.ReservationEntry.reserved_qty,
             models.ReservationEntry.realized_qty,
+            models.ReservationEntry.covered_incoming_supplier_qty,
+            models.ReservationEntry.covered_incoming_wip_qty,
         )
         .filter(
             models.ReservationEntry.realization_mode == CONSUME,
             models.ReservationEntry.lifecycle_status == "active",
+            models.ReservationEntry.ledger_generation_id == generation_id,
         )
         .all()
     )
-    for iid, reserved, realized in res_rows:
+    for iid, reserved, realized, covered_supplier, covered_wip in res_rows:
+        item_id = int(iid)
         outstanding = max(float(reserved or 0.0) - float(realized or 0.0), 0.0)
-        if outstanding <= 0.0:
-            continue
-        reserved_soft[int(iid)] = reserved_soft.get(int(iid), 0.0) + outstanding
-
-    # incoming — existing loaders (wip identity loader + supplier remaining).
-    from ..mrp_stock_helpers import active_wip_supply_by_item
-
-    incoming_wip: Dict[int, float] = {
-        int(iid): float(sum(float(l.remaining) for l in lines))
-        for iid, lines in active_wip_supply_by_item(db).items()
-    }
-
-    incoming_supplier: Dict[int, float] = {}
-    supplier_item_ids = [
-        int(iid)
-        for (iid,) in db.query(models.SupplierOrderItem.item_id_ref).distinct().all()
-        if iid is not None
-    ]
-    if want is not None:
-        supplier_item_ids = [i for i in supplier_item_ids if i in want]
-    if supplier_item_ids:
-        from ..period_plan_service import _load_purchase_supplier_remaining
-
-        supplier = _load_purchase_supplier_remaining(
-            db, supplier_item_ids, date.max - timedelta(days=1)
-        )
-        for iid, lines in supplier.items():
-            incoming_supplier[int(iid)] = float(
-                sum(float(l.get("remaining_qty") or 0.0) for l in lines)
+        if outstanding > 0.0:
+            reserved_soft[item_id] = reserved_soft.get(item_id, 0.0) + outstanding
+        supplier_qty = max(float(covered_supplier or 0.0), 0.0)
+        wip_qty = max(float(covered_wip or 0.0), 0.0)
+        if supplier_qty > 0.0:
+            incoming_supplier[item_id] = (
+                incoming_supplier.get(item_id, 0.0) + supplier_qty
             )
+        if wip_qty > 0.0:
+            incoming_wip[item_id] = incoming_wip.get(item_id, 0.0) + wip_qty
 
     keys: Set[int] = set(on_hand_all) | set(reserved_soft) | set(incoming_wip) | set(incoming_supplier)
     if want is not None:
