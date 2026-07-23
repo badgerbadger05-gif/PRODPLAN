@@ -54,9 +54,9 @@ from ..services.forced_orders import (
     export_forced_order_xlsx,
     export_shortage_report_for_run,
 )
-from ..services.mrp_result_export import (
-    export_purchases_results_xlsx,
-    export_rework_results_xlsx,
+from ..services.mrp_result_snapshot import (
+    read_mrp_result_manifest,
+    read_mrp_result_rows,
 )
 from ..services.one_c_purchase_order_export import export_planned_purchases_to_1c
 from ..services.mrp_reconciliation import reconcile_all_active, reconcile_snapshot
@@ -79,6 +79,111 @@ from ..services.period_plan_service import (
 )
 
 router = APIRouter(prefix="/v1/plan", tags=["plan"])
+
+
+def _reject_legacy_mrp_result_read(run_id: int) -> None:
+    """Do not expose non-snapshot result projections as planning truth."""
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "code": "mrp_result_snapshot_required",
+            "run_id": int(run_id),
+            "truth_status": "unavailable",
+            "truth_reason": (
+                "This result view has not been migrated to the accepted "
+                "Item Ledger snapshot"
+            ),
+            "rows": [],
+        },
+    )
+
+
+def _read_all_mrp_snapshot_rows(
+    db: Session,
+    run_id: int,
+    row_kind: str,
+    *,
+    snapshot_id: Optional[int],
+    root_item_id: Optional[int] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    sort_dir: Optional[str] = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Read all export rows while pinning every page to one snapshot id."""
+    rows: list[dict[str, Any]] = []
+    offset = 0
+    pinned_snapshot_id = snapshot_id
+    while True:
+        result = read_mrp_result_rows(
+            db=db,
+            run_id=int(run_id),
+            row_kind=row_kind,
+            snapshot_id=pinned_snapshot_id,
+            root_item_id=root_item_id,
+            date_from=date_from,
+            date_to=date_to,
+            limit=5000,
+            offset=offset,
+            sort_dir=sort_dir or "asc",
+        )
+        resolved_id = result.get("snapshot_id")
+        if resolved_id is None:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "mrp_result_snapshot_required",
+                    "run_id": int(run_id),
+                    "truth_status": result.get("truth_status") or "unavailable",
+                    "truth_reason": result.get("truth_reason")
+                    or "MRP result snapshot is unavailable",
+                    "rows": [],
+                },
+            )
+        if pinned_snapshot_id is None:
+            pinned_snapshot_id = int(resolved_id)
+        elif int(resolved_id) != int(pinned_snapshot_id):
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "mrp_result_snapshot_changed"},
+            )
+        page = list(result.get("rows") or [])
+        rows.extend(page)
+        offset += len(page)
+        if not page or offset >= int(result.get("total") or 0):
+            return rows, int(pinned_snapshot_id)
+
+
+def _xlsx_from_rows(
+    *,
+    headers: list[str],
+    data_rows: list[list[Any]],
+    filename: str,
+) -> dict[str, Any]:
+    import base64
+    import io
+
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"openpyxl not available: {exc}")
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "MRP"
+    sheet.append(headers)
+    for cell in sheet[1]:
+        cell.font = Font(bold=True)
+    for row in data_rows:
+        sheet.append(row)
+    stream = io.BytesIO()
+    workbook.save(stream)
+    return {
+        "status": "ok",
+        "format": "xlsx",
+        "data_base64": base64.b64encode(stream.getvalue()).decode("ascii"),
+        "filename": filename,
+        "total_rows": len(data_rows),
+    }
 
 
 # Pydantic модели
@@ -748,11 +853,14 @@ async def get_planning_runs(
 @router.get("/results/{run_id}")
 async def get_planning_result_summary(
     run_id: int,
+    snapshot_id: Optional[int] = None,
     db: Session = Depends(get_db)
 ):
-    """Сводка результатов прогона планирования (KPI, предупреждения, базовые счётчики)"""
+    """Сводка из сохранённого Ledger-bound снимка; расчёт не запускается."""
     try:
-        return get_run_summary(db=db, run_id=int(run_id))
+        return read_mrp_result_manifest(
+            db=db, run_id=int(run_id), snapshot_id=snapshot_id
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -769,21 +877,22 @@ async def get_planning_result_production(
     offset: int = 0,
     sort_by: Optional[str] = None,
     sort_dir: Optional[str] = None,
+    snapshot_id: Optional[int] = None,
     db: Session = Depends(get_db)
 ):
-    """Производственные заказы и этапы по прогону (с фильтрами и пагинацией)"""
+    """Производственные обязательства из сохранённого снимка."""
     try:
-        return get_run_production(
+        return read_mrp_result_rows(
             db=db,
             run_id=int(run_id),
+            row_kind="production",
+            snapshot_id=snapshot_id,
             item_id=item_id,
             root_item_id=root_item_id,
-            bucket_type=bucket_type,
             date_from=date_from,
             date_to=date_to,
             limit=limit,
             offset=offset,
-            sort_by=sort_by,
             sort_dir=sort_dir,
         )
     except Exception as e:
@@ -803,6 +912,7 @@ async def get_planning_result_production_grouped(
     db: Session = Depends(get_db)
 ):
     """Группированная по участкам выдача производственных заказов"""
+    _reject_legacy_mrp_result_read(run_id)
     try:
         return get_run_production_grouped(
             db=db,
@@ -832,21 +942,22 @@ async def get_planning_result_purchases(
     offset: int = 0,
     sort_by: Optional[str] = None,
     sort_dir: Optional[str] = None,
+    snapshot_id: Optional[int] = None,
     db: Session = Depends(get_db)
 ):
-    """Заявки на закупку по прогону (с фильтрами и пагинацией)"""
+    """Закупочные обязательства из сохранённого снимка."""
     try:
-        return get_run_purchases(
+        return read_mrp_result_rows(
             db=db,
             run_id=int(run_id),
+            row_kind="purchase",
+            snapshot_id=snapshot_id,
             item_id=item_id,
             root_item_id=root_item_id,
-            bucket_type=bucket_type,
             date_from=date_from,
             date_to=date_to,
             limit=limit,
             offset=offset,
-            sort_by=sort_by,
             sort_dir=sort_dir,
         )
     except Exception as e:
@@ -863,6 +974,7 @@ async def get_planning_result_purchases_grouped(
     db: Session = Depends(get_db),
 ):
     """Агрегированная выдача закупок по item_id+unit (для верхней таблицы UI)."""
+    _reject_legacy_mrp_result_read(run_id)
     try:
         # Используем существующую агрегацию/денормализацию из сервиса.
         # Берём большой лимит, затем режем пагинацией на уровне роутера.
@@ -919,21 +1031,22 @@ async def get_planning_result_rework(
     offset: int = 0,
     sort_by: Optional[str] = None,
     sort_dir: Optional[str] = None,
+    snapshot_id: Optional[int] = None,
     db: Session = Depends(get_db),
 ):
-    """Заказы на переработку по прогону (с фильтрами и пагинацией)."""
+    """Обязательства переработки из сохранённого снимка."""
     try:
-        return get_run_rework(
+        return read_mrp_result_rows(
             db=db,
             run_id=int(run_id),
+            row_kind="rework",
+            snapshot_id=snapshot_id,
             item_id=item_id,
             root_item_id=root_item_id,
-            bucket_type=bucket_type,
             date_from=date_from,
             date_to=date_to,
             limit=limit,
             offset=offset,
-            sort_by=sort_by,
             sort_dir=sort_dir,
         )
     except Exception as e:
@@ -953,6 +1066,7 @@ async def get_planning_result_rework_grouped(
     db: Session = Depends(get_db),
 ):
     """Группированная выдача заказов на переработку."""
+    _reject_legacy_mrp_result_read(run_id)
     try:
         return get_run_rework_grouped(
             db=db,
@@ -982,6 +1096,7 @@ async def get_planning_result_purchases_grouped_by_category(
     db: Session = Depends(get_db),
 ):
     """Группированная выдача закупок по товарным группам."""
+    _reject_legacy_mrp_result_read(run_id)
     try:
         return get_run_purchases_grouped_by_category(
             db=db,
@@ -1011,6 +1126,7 @@ async def get_planning_result_rework_grouped_by_category(
     db: Session = Depends(get_db),
 ):
     """Группированная выдача заказов на переработку по товарным группам."""
+    _reject_legacy_mrp_result_read(run_id)
     try:
         return get_run_rework_grouped_by_category(
             db=db,
@@ -1036,15 +1152,17 @@ async def get_planning_result_capacity(
     date_to: Optional[str] = None,
     limit: int = 200,
     offset: int = 0,
+    snapshot_id: Optional[int] = None,
     db: Session = Depends(get_db)
 ):
-    """Загрузка мощностей по участкам (фильтры и пагинация)"""
+    """Загрузка мощностей из сохранённого MRP-снимка."""
     try:
-        return get_run_capacity(
+        return read_mrp_result_rows(
             db=db,
             run_id=int(run_id),
+            row_kind="capacity",
+            snapshot_id=snapshot_id,
             area_id=area_id,
-            bucket_type=bucket_type,
             date_from=date_from,
             date_to=date_to,
             limit=limit,
@@ -1066,6 +1184,7 @@ async def get_planning_result_pegging(
     db: Session = Depends(get_db)
 ):
     """Трассируемость компонент → спрос (pegging) по прогону (с фильтрами и пагинацией)"""
+    _reject_legacy_mrp_result_read(run_id)
     try:
         return get_run_pegging(
             db=db,
@@ -1087,6 +1206,7 @@ async def get_shortage_report(
     db: Session = Depends(get_db),
 ):
     """XLSX отчёт по дефицитам комплектующих (blocked/partial) для прогона"""
+    _reject_legacy_mrp_result_read(run_id)
     try:
         return export_shortage_report_for_run(db=db, run_id=int(run_id))
     except Exception as e:
@@ -1195,6 +1315,7 @@ async def export_planning_result_production(
     date_to: Optional[str] = None,
     sort_by: Optional[str] = None,
     sort_dir: Optional[str] = None,
+    snapshot_id: Optional[int] = None,
     db: Session = Depends(get_db),
 ):
     """
@@ -1202,20 +1323,16 @@ async def export_planning_result_production(
     Колонки: Наименование, Артикул, Количество, Нормо-часы всего, Нормо-часы на ед., Дата потребности, Дата начала, Дата окончания, ЕИ
     """
     try:
-        res = get_run_production(
-            db=db,
-            run_id=int(run_id),
-            item_id=None,
+        rows, resolved_snapshot_id = _read_all_mrp_snapshot_rows(
+            db,
+            int(run_id),
+            "production",
+            snapshot_id=snapshot_id,
             root_item_id=root_item_id,
-            bucket_type=bucket_type,
             date_from=date_from,
             date_to=date_to,
-            limit=100000,
-            offset=0,
-            sort_by=sort_by,
             sort_dir=sort_dir,
         )
-        rows = res.get("rows", []) or []
 
         headers = [
             "Наименование",
@@ -1252,27 +1369,8 @@ async def export_planning_result_production(
             )
 
         if (format or "csv").lower() == "xlsx":
-            # Формируем XLSX с разбивкой по участкам (подзаголовки)
-            # Пытаемся получить серверную группировку; при ошибке/пусто — фолбэк к плоскому списку
-            if root_item_id is None:
-                try:
-                    grouped_res = get_run_production_grouped(
-                        db=db,
-                        run_id=int(run_id),
-                        item_id=None,
-                        date_from=date_from,
-                        date_to=date_to,
-                        area_id=None,
-                        limit=1000,
-                        offset=0,
-                        sort_by=sort_by,
-                        sort_dir=sort_dir,
-                    )
-                    groups = (grouped_res or {}).get("groups", []) or []
-                except Exception:
-                    groups = []
-            else:
-                groups = []
+            # Grouped legacy projections are intentionally not consulted.
+            groups = []
 
             import io, base64
             try:
@@ -1376,6 +1474,7 @@ async def export_planning_result_production(
                 "data_base64": b64,
                 "filename": f"mrp_production_run_{run_id}.xlsx",
                 "total_rows": len(data_rows) if not groups else sum(len((g.get("orders") or [])) for g in groups),
+                "snapshot_id": resolved_snapshot_id,
             }
         else:
             import io, csv
@@ -1390,6 +1489,7 @@ async def export_planning_result_production(
                 "data": output.getvalue(),
                 "filename": f"mrp_production_run_{run_id}.csv",
                 "total_rows": len(data_rows),
+                "snapshot_id": resolved_snapshot_id,
             }
     except HTTPException:
         raise
@@ -1405,6 +1505,7 @@ async def export_planning_result_purchases(
     date_to: Optional[str] = None,
     sort_by: Optional[str] = None,
     sort_dir: Optional[str] = None,
+    snapshot_id: Optional[int] = None,
     db: Session = Depends(get_db),
 ):
     """
@@ -1412,20 +1513,16 @@ async def export_planning_result_purchases(
     Колонки: Наименование, Артикул, Количество, ЕИ
     """
     try:
-        res = get_run_purchases(
-            db=db,
-            run_id=int(run_id),
-            item_id=None,
+        rows, resolved_snapshot_id = _read_all_mrp_snapshot_rows(
+            db,
+            int(run_id),
+            "purchase",
+            snapshot_id=snapshot_id,
             root_item_id=root_item_id,
-            bucket_type=bucket_type,
             date_from=date_from,
             date_to=date_to,
-            limit=100000,
-            offset=0,
-            sort_by=sort_by,
             sort_dir=sort_dir,
         )
-        rows = res.get("rows", []) or []
 
         headers = ["Наименование", "Артикул", "Поставщик", "Категория", "Количество", "ЕИ", "Пометка"]
         data_rows = []
@@ -1441,15 +1538,13 @@ async def export_planning_result_purchases(
             ])
 
         if (format or "csv").lower() == "xlsx":
-            return export_purchases_results_xlsx(
-                db=db,
-                run_id=int(run_id),
-                item_id=None,
-                date_from=date_from,
-                date_to=date_to,
-                sort_by=sort_by,
-                sort_dir=sort_dir,
+            result = _xlsx_from_rows(
+                headers=headers,
+                data_rows=data_rows,
+                filename=f"mrp_purchases_run_{run_id}.xlsx",
             )
+            result["snapshot_id"] = resolved_snapshot_id
+            return result
         else:
             import io, csv
             output = io.StringIO()
@@ -1463,6 +1558,7 @@ async def export_planning_result_purchases(
                 "data": output.getvalue(),
                 "filename": f"mrp_purchases_run_{run_id}.csv",
                 "total_rows": len(data_rows),
+                "snapshot_id": resolved_snapshot_id,
             }
     except HTTPException:
         raise
@@ -1612,6 +1708,7 @@ async def export_planning_result_rework(
     date_to: Optional[str] = None,
     sort_by: Optional[str] = None,
     sort_dir: Optional[str] = None,
+    snapshot_id: Optional[int] = None,
     db: Session = Depends(get_db),
 ):
     """
@@ -1619,20 +1716,16 @@ async def export_planning_result_rework(
     XLSX группируется по товарным группам.
     """
     try:
-        res = get_run_rework(
-            db=db,
-            run_id=int(run_id),
-            item_id=None,
+        rows, resolved_snapshot_id = _read_all_mrp_snapshot_rows(
+            db,
+            int(run_id),
+            "rework",
+            snapshot_id=snapshot_id,
             root_item_id=root_item_id,
-            bucket_type=bucket_type,
             date_from=date_from,
             date_to=date_to,
-            limit=100000,
-            offset=0,
-            sort_by=sort_by,
             sort_dir=sort_dir,
         )
-        rows = res.get("rows", []) or []
 
         headers = [
             "Наименование",
@@ -1673,15 +1766,13 @@ async def export_planning_result_rework(
             ])
 
         if (format or "csv").lower() == "xlsx":
-            return export_rework_results_xlsx(
-                db=db,
-                run_id=int(run_id),
-                item_id=None,
-                date_from=date_from,
-                date_to=date_to,
-                sort_by=sort_by,
-                sort_dir=sort_dir,
+            result = _xlsx_from_rows(
+                headers=headers,
+                data_rows=data_rows,
+                filename=f"mrp_rework_run_{run_id}.xlsx",
             )
+            result["snapshot_id"] = resolved_snapshot_id
+            return result
 
         import io, csv
         output = io.StringIO()
@@ -1695,6 +1786,7 @@ async def export_planning_result_rework(
             "data": output.getvalue(),
             "filename": f"mrp_rework_run_{run_id}.csv",
             "total_rows": len(data_rows),
+            "snapshot_id": resolved_snapshot_id,
         }
     except HTTPException:
         raise
