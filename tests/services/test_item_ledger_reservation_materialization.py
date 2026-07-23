@@ -17,6 +17,8 @@ from app.models import (
     MrpFreezeAllocation,
     MrpRequirement,
     PlanningRun,
+    ProductionManufacture,
+    ProductionMaterialIssue,
     ProductionOrder,
     ProductionPlanHeader,
     ProductionProduct,
@@ -25,6 +27,9 @@ from app.models import (
     ReservationEvent,
     StockBin,
     StockLedgerEntry,
+    StockRecorderPull,
+    StockWarehouse,
+    SyncLink,
 )
 from app.services.item_ledger.reservation import CONSUME, MAKE
 from app.services.item_ledger.reservation_ledger import (
@@ -126,7 +131,8 @@ def _prod_line(db, order, item, *, qty, produced=0.0, src_req=None):
     return pp
 
 
-def _sle(db, item, *, qty, kind, recorder, line_no="1"):
+def _sle(db, item, *, qty, kind, recorder, line_no="1",
+         recorder_type="Document_СборкаЗапасов", warehouse=""):
     e = StockLedgerEntry(
         item_id=item.item_id,
         qty=Decimal(str(qty)),
@@ -134,15 +140,81 @@ def _sle(db, item, *, qty, kind, recorder, line_no="1"):
         posting_at=datetime(2026, 7, 5),
         record_type="Receipt" if qty > 0 else "Expense",
         movement_kind=kind,
-        recorder_type="Document_СборкаЗапасов",
+        recorder_type=recorder_type,
         recorder_ref=recorder,
         line_no=line_no,
+        warehouse_ref1c=warehouse,
         ingest_source="document_pull",
         active=True,
     )
     db.add(e)
     db.flush()
     return e
+
+
+# --- real-topology link fixtures: the SLE recorder is the *document* GUID
+# (СборкаЗапасов / ПеремещениеЗапасов), NEVER the order GUID. The producing
+# order is reachable only via sync_link (our export) or via the pull-captured
+# header order_ref (document created in 1С directly). -----------------------
+def _pull(db, recorder, *, order_ref=None, recorder_type="Document_СборкаЗапасов"):
+    row = StockRecorderPull(
+        recorder_type=recorder_type,
+        recorder_ref=recorder,
+        status="done",
+        order_ref=order_ref,
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def _manufacture(db, order, product, *, qty):
+    m = ProductionManufacture(
+        product_id=product.product_id,
+        order_id=order.order_id,
+        qty=Decimal(str(qty)),
+        status="exported",
+    )
+    db.add(m)
+    db.flush()
+    return m
+
+
+def _material_issue(db, order, product):
+    mi = ProductionMaterialIssue(
+        document_number=f"MI-{order.order_id}-{product.product_id}",
+        product_id=product.product_id,
+        order_id=order.order_id,
+        status="exported",
+    )
+    db.add(mi)
+    db.flush()
+    return mi
+
+
+def _link(db, doctype, source_id, entity, ref):
+    l = SyncLink(
+        source_doctype=doctype,
+        source_id=int(source_id),
+        target_entity=entity,
+        target_ref_key=ref,
+        status="success",
+    )
+    db.add(l)
+    db.flush()
+    return l
+
+
+def _fg_warehouse(db, ref):
+    w = StockWarehouse(
+        warehouse_ref1c=ref,
+        warehouse_name=f"ГП {ref}",
+        is_selected=True,
+        is_finished_goods=True,
+    )
+    db.add(w)
+    db.flush()
+    return w
 
 
 def _entry(db, req, mode):
@@ -275,15 +347,19 @@ def test_frozen_pin_supplier_attaches_to_make_for_produced(db_session):
 # §6.1/§6.3 — SLE matching → realize
 # ---------------------------------------------------------------------------
 def test_pegged_issue_consume_realize_capped_residual_unplanned(db_session):
+    """1С-created document: recorder GUID ≠ order GUID; the producing order is
+    reachable only via the pull-captured header order_ref (chain source 2)."""
     db = db_session
     run = _run(db, date(2026, 7, 1), date(2026, 7, 15))
     comp = _item(db, "COMP", produced=False)
     req = _req(db, run, comp, gross=4, net=4, bom_level=1)  # consume reserved 4
     materialize_reservations(db, [req], {run.run_id: run}, "cyc")
 
-    _order(db, "REC1", run=run)  # recorder → run
+    _order(db, "ORD-GUID-1", run=run)
+    # СборкаЗапасов document GUID (recorder) ≠ order GUID; header carried the order
+    _pull(db, "DOC-GUID-1", order_ref="ORD-GUID-1")
     # physical issue of 5: capped at outstanding 4, residual 1 unplanned
-    _sle(db, comp, qty=-5, kind="assembly_out", recorder="REC1")
+    _sle(db, comp, qty=-5, kind="assembly_out", recorder="DOC-GUID-1")
 
     scope = _ledger_scope(db)
     summary = realize_from_sle(db, scope, "cyc")
@@ -304,16 +380,56 @@ def test_pegged_issue_consume_realize_capped_residual_unplanned(db_session):
     assert entry.lifecycle_status == "closed"
 
 
+def test_sync_link_material_issue_consume_realize(db_session):
+    """Our export: ПеремещениеЗапасов created by one_c_stock_transfer_export —
+    recorder resolves via sync_link (source_doctype='material_issue') to the
+    local issue → order → run (chain source 1). No pull order_ref needed."""
+    db = db_session
+    run = _run(db, date(2026, 7, 1), date(2026, 7, 15))
+    fg = _item(db, "FG", produced=True)
+    comp = _item(db, "COMP", produced=False)
+    make_req = _req(db, run, fg, gross=5, net=5, bom_level=0)
+    req = _req(db, run, comp, gross=3, net=3, bom_level=1)
+    materialize_reservations(db, [make_req, req], {run.run_id: run}, "cyc")
+
+    order = _order(db, "ORD-GUID-2", run=run)
+    line = _prod_line(db, order, fg, qty=5, src_req=make_req)
+    issue = _material_issue(db, order, line)
+    _link(db, "material_issue", issue.issue_id,
+          "Document_ПеремещениеЗапасов", "TRANSFER-GUID-2")
+    _sle(db, comp, qty=-3, kind="transfer_out", recorder="TRANSFER-GUID-2",
+         recorder_type="Document_ПеремещениеЗапасов")
+
+    scope = _ledger_scope(db)
+    summary = realize_from_sle(db, scope, "cyc")
+    entry = _entry(db, req, CONSUME)
+    db.refresh(entry)
+    assert summary["realized_consume"] == 1
+    assert summary["unplanned_consumption"] == 0
+    assert Decimal(str(entry.realized_qty)) == Decimal("3")
+    ev = db.query(ReservationEvent).filter(
+        ReservationEvent.reservation_id == entry.id,
+        ReservationEvent.event_kind == "realize",
+    ).one()
+    assert ev.match_rule == "pegged"
+
+
 def test_pegged_production_receipt_make_realize(db_session):
+    """Our export: СборкаЗапасов created by one_c_manufacture_export — recorder
+    resolves via sync_link (source_doctype='manufacture') to the local
+    manufacture → exact production line → make requirement (chain source 1)."""
     db = db_session
     run = _run(db, date(2026, 7, 1), date(2026, 7, 15))
     fg = _item(db, "FG", produced=True)
     req = _req(db, run, fg, gross=5, net=5, bom_level=0)  # make reserved 5
     materialize_reservations(db, [req], {run.run_id: run}, "cyc")
 
-    order = _order(db, "REC2", run=run)
-    _prod_line(db, order, fg, qty=5, produced=5, src_req=req)
-    _sle(db, fg, qty=5, kind="assembly_in", recorder="REC2")
+    order = _order(db, "ORD-GUID-3", run=run)
+    line = _prod_line(db, order, fg, qty=5, produced=5, src_req=req)
+    man = _manufacture(db, order, line, qty=5)
+    _link(db, "manufacture", man.manufacture_id,
+          "Document_СборкаЗапасов", "ASSEMBLY-GUID-3")
+    _sle(db, fg, qty=5, kind="assembly_in", recorder="ASSEMBLY-GUID-3")
 
     scope = _ledger_scope(db)
     summary = realize_from_sle(db, scope, "cyc")
@@ -323,6 +439,71 @@ def test_pegged_production_receipt_make_realize(db_session):
     assert summary["realized_make"] == 1
     assert Decimal(str(entry.realized_qty)) == Decimal("5")
     assert entry.lifecycle_status == "closed"  # produced 5 >= reserved 5
+    ev = db.query(ReservationEvent).filter(
+        ReservationEvent.reservation_id == entry.id,
+        ReservationEvent.event_kind == "realize",
+    ).one()
+    assert ev.match_rule == "pegged"
+
+
+def test_make_receipt_via_pull_order_ref(db_session):
+    """1С-created СборкаЗапасов: make receipt resolves via the pull-captured
+    ЗаказНаПроизводство_Key (chain source 2) → produced line → make."""
+    db = db_session
+    run = _run(db, date(2026, 7, 1), date(2026, 7, 15))
+    fg = _item(db, "FG", produced=True)
+    req = _req(db, run, fg, gross=5, net=5, bom_level=0)
+    materialize_reservations(db, [req], {run.run_id: run}, "cyc")
+
+    order = _order(db, "ORD-GUID-4", run=run)
+    _prod_line(db, order, fg, qty=5, produced=5, src_req=req)
+    _pull(db, "ASSEMBLY-GUID-4", order_ref="ORD-GUID-4")
+    _sle(db, fg, qty=5, kind="assembly_in", recorder="ASSEMBLY-GUID-4")
+
+    scope = _ledger_scope(db)
+    summary = realize_from_sle(db, scope, "cyc")
+    entry = _entry(db, req, MAKE)
+    db.refresh(entry)
+    assert summary["realized_make"] == 1
+    assert Decimal(str(entry.realized_qty)) == Decimal("5")
+
+
+def test_transfer_to_finished_goods_warehouse_closes_make(db_session):
+    """Перемещение ГП на склад ГП (basis = ЗаказНаПроизводство): transfer_in
+    landing on an is_finished_goods warehouse realizes the make reservation via
+    the same chain. A transfer_in onto an ordinary warehouse does NOT."""
+    db = db_session
+    run = _run(db, date(2026, 7, 1), date(2026, 7, 15))
+    fg = _item(db, "FG", produced=True)
+    req = _req(db, run, fg, gross=5, net=5, bom_level=0)
+    materialize_reservations(db, [req], {run.run_id: run}, "cyc")
+
+    order = _order(db, "ORD-GUID-5", run=run)
+    _prod_line(db, order, fg, qty=5, src_req=req)
+    _fg_warehouse(db, "FG-WH")
+    # transfer document created in 1С with ДокументОснование = the order
+    _pull(db, "TRANSFER-GUID-5", order_ref="ORD-GUID-5",
+          recorder_type="Document_ПеремещениеЗапасов")
+    # receipt onto an ORDINARY warehouse: not a make receipt → ignored
+    _sle(db, fg, qty=5, kind="transfer_in", recorder="TRANSFER-GUID-5",
+         recorder_type="Document_ПеремещениеЗапасов", warehouse="PLAIN-WH",
+         line_no="1")
+    scope = _ledger_scope(db)
+    summary = realize_from_sle(db, scope, "cyc")
+    entry = _entry(db, req, MAKE)
+    db.refresh(entry)
+    assert summary["realized_make"] == 0
+    assert Decimal(str(entry.realized_qty)) == Decimal("0")
+
+    # receipt onto the ГП склад: realizes make
+    _sle(db, fg, qty=5, kind="transfer_in", recorder="TRANSFER-GUID-5",
+         recorder_type="Document_ПеремещениеЗапасов", warehouse="FG-WH",
+         line_no="2")
+    summary = realize_from_sle(db, _ledger_scope(db), "cyc")
+    db.refresh(entry)
+    assert summary["realized_make"] == 1
+    assert Decimal(str(entry.realized_qty)) == Decimal("5")
+    assert entry.lifecycle_status == "closed"
 
 
 def test_unmatched_issue_is_unplanned_no_realize(db_session):
@@ -332,7 +513,10 @@ def test_unmatched_issue_is_unplanned_no_realize(db_session):
     req = _req(db, run, comp, gross=4, net=4, bom_level=1)
     materialize_reservations(db, [req], {run.run_id: run}, "cyc")
 
-    # recorder maps to NO order → unplanned, never a silent FIFO
+    # recorder has NO sync_link and NO pull order_ref → unplanned, never a
+    # silent FIFO (an order for the run exists, but nothing ties the doc to it)
+    _order(db, "ORD-GUID-6", run=run)
+    _pull(db, "UNKNOWN-DOC")  # pulled, but the header carried no order basis
     _sle(db, comp, qty=-3, kind="assembly_out", recorder="UNKNOWN-DOC")
 
     scope = _ledger_scope(db)
@@ -342,7 +526,25 @@ def test_unmatched_issue_is_unplanned_no_realize(db_session):
     assert Decimal(str(entry.realized_qty)) == Decimal("0")
     assert summary["realized_consume"] == 0
     assert summary["unplanned_consumption"] == 1
+    assert abs(summary["unplanned_qty"] - 3.0) < 1e-6
     assert db.query(ReservationEvent).filter(ReservationEvent.event_kind == "realize").count() == 0
+
+
+def test_pull_order_ref_to_unknown_order_is_unplanned(db_session):
+    """Header carried an order GUID, but no local ProductionOrder mirrors it
+    → the chain stops honestly at unplanned (no global FIFO)."""
+    db = db_session
+    run = _run(db, date(2026, 7, 1), date(2026, 7, 15))
+    comp = _item(db, "COMP", produced=False)
+    req = _req(db, run, comp, gross=4, net=4, bom_level=1)
+    materialize_reservations(db, [req], {run.run_id: run}, "cyc")
+
+    _pull(db, "DOC-GUID-7", order_ref="ORD-GUID-NOT-SYNCED")
+    _sle(db, comp, qty=-2, kind="assembly_out", recorder="DOC-GUID-7")
+
+    summary = realize_from_sle(db, _ledger_scope(db), "cyc")
+    assert summary["realized_consume"] == 0
+    assert summary["unplanned_consumption"] == 1
 
 
 # ---------------------------------------------------------------------------
@@ -398,8 +600,9 @@ def test_reservation_shadow_idempotent(db_session):
     run = _run(db, date(2026, 7, 1), date(2026, 7, 15))
     comp = _item(db, "COMP", produced=False)
     req = _req(db, run, comp, gross=4, net=4, bom_level=1)
-    _order(db, "REC1", run=run)
-    _sle(db, comp, qty=-2, kind="assembly_out", recorder="REC1")
+    _order(db, "ORD-GUID-8", run=run)
+    _pull(db, "DOC-GUID-8", order_ref="ORD-GUID-8")
+    _sle(db, comp, qty=-2, kind="assembly_out", recorder="DOC-GUID-8")
     db.add(StockBin(item_id=comp.item_id, warehouse_ref1c="WH", on_hand=Decimal("10")))
     db.flush()
 
