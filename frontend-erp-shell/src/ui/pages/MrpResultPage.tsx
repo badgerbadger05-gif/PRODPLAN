@@ -100,6 +100,11 @@ export function MrpResultPage() {
   const summarySeq = useRef(0)
   const mutationInFlight = useRef(false)
   const previousRunId = useRef(runId)
+  const snapshotId = summary?.snapshot_id ?? null
+  const truthAccepted = summary?.truth_status === 'accepted' && snapshotId !== null
+  const truthUnavailableReason = summary && !truthAccepted
+    ? summary.truth_reason || `Снимок MRP недоступен: ${summary.truth_status || 'unavailable'}`
+    : ''
 
   const purchaseOptions = useMemo(() => purchaseFilterOptions(purchaseRows), [purchaseRows])
   const purchaseSupplierOptions = purchaseOptions.suppliers
@@ -124,55 +129,9 @@ export function MrpResultPage() {
     if (queryTab) setTab(queryTab)
   }, [queryTab])
 
-  const loadSummary = useCallback(async () => {
-    const seq = ++summarySeq.current
-    try {
-      const nextSummary = await getPlanningRunSummary(runId)
-      if (seq === summarySeq.current) setSummary(nextSummary)
-    } catch (e) {
-      if (seq === summarySeq.current) setError(e instanceof Error ? e.message : String(e))
-    }
-  }, [runId])
-
-  const loadTab = useCallback(async (targetTab: Tab, nextOffset: number) => {
-    const seq = ++loadSeq.current
-    setLoading(true)
-    setError('')
-    setMessage('')
-    try {
-      const params = { date_from: dateFrom || undefined, date_to: dateTo || undefined, root_item_id: rootItemId, limit, offset: nextOffset }
-      if (targetTab === 'production') {
-        const data = await getPlanningResultProduction(runId, params)
-        if (seq !== loadSeq.current) return
-        setProductionRows(data.rows ?? [])
-        setProductionTotal(data.total ?? 0)
-      } else if (targetTab === 'purchases') {
-        const data = await getPlanningResultPurchases(runId, params)
-        if (seq !== loadSeq.current) return
-        setPurchaseRows(data.rows ?? [])
-        setPurchaseTotal(data.total ?? 0)
-      } else if (targetTab === 'rework') {
-        const data = await getPlanningResultRework(runId, params)
-        if (seq !== loadSeq.current) return
-        setReworkRows(data.rows ?? [])
-        setReworkTotal(data.total ?? 0)
-      } else {
-        const data = await getPlanningResultCapacity(runId, params)
-        if (seq !== loadSeq.current) return
-        setCapacityRows(data.rows ?? [])
-        setCapacityTotal(data.total ?? 0)
-      }
-      setOffsets((prev) => ({ ...prev, [targetTab]: nextOffset }))
-      setLoadedTabs((prev) => ({ ...prev, [targetTab]: true }))
-    } catch (e) {
-      if (seq === loadSeq.current) setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      if (seq === loadSeq.current) setLoading(false)
-    }
-  }, [dateFrom, dateTo, rootItemId, runId])
-
   const invalidateTabs = useCallback(() => {
     loadSeq.current += 1
+    setLoading(false)
     setLoadedTabs(emptyTabFlags())
     setOffsets(emptyTabOffsets())
     setProductionRows([])
@@ -189,9 +148,83 @@ export function MrpResultPage() {
     setPurchaseCategoryFilter('')
   }, [])
 
-  const refreshActiveTab = useCallback(() => {
-    void loadTab(tab, offsets[tab])
-  }, [loadTab, offsets, tab])
+  const loadSummary = useCallback(async () => {
+    const seq = ++summarySeq.current
+    invalidateTabs()
+    try {
+      const nextSummary = await getPlanningRunSummary(runId)
+      if (seq === summarySeq.current) {
+        setSummary(nextSummary)
+        if (nextSummary.truth_status !== 'accepted' || nextSummary.snapshot_id === null) {
+          setError(nextSummary.truth_reason || `Снимок MRP недоступен: ${nextSummary.truth_status || 'unavailable'}`)
+        } else {
+          setError('')
+        }
+      }
+    } catch (e) {
+      if (seq === summarySeq.current) {
+        setSummary(null)
+        setError(e instanceof Error ? e.message : String(e))
+      }
+    }
+  }, [invalidateTabs, runId])
+
+  const loadTab = useCallback(async (targetTab: Tab, nextOffset: number) => {
+    const seq = ++loadSeq.current
+    setLoading(true)
+    setError('')
+    if (!truthAccepted || snapshotId === null) {
+      invalidateTabs()
+      return
+    }
+    try {
+      const params = { snapshot_id: snapshotId, date_from: dateFrom || undefined, date_to: dateTo || undefined, root_item_id: rootItemId, limit, offset: nextOffset }
+      let data
+      if (targetTab === 'production') {
+        data = await getPlanningResultProduction(runId, params)
+        if (seq !== loadSeq.current) return
+        setProductionRows(data.rows ?? [])
+        setProductionTotal(data.total ?? 0)
+      } else if (targetTab === 'purchases') {
+        data = await getPlanningResultPurchases(runId, params)
+        if (seq !== loadSeq.current) return
+        setPurchaseRows(data.rows ?? [])
+        setPurchaseTotal(data.total ?? 0)
+      } else if (targetTab === 'rework') {
+        data = await getPlanningResultRework(runId, params)
+        if (seq !== loadSeq.current) return
+        setReworkRows(data.rows ?? [])
+        setReworkTotal(data.total ?? 0)
+      } else {
+        data = await getPlanningResultCapacity(runId, params)
+        if (seq !== loadSeq.current) return
+        setCapacityRows(data.rows ?? [])
+        setCapacityTotal(data.total ?? 0)
+      }
+      const identityMatches = data.truth_status === 'accepted'
+        && data.snapshot_id === snapshotId
+        && data.ledger_generation === summary?.ledger_generation
+        && data.cutoff === summary?.cutoff
+      if (!identityMatches) {
+        const mismatchReason = data.truth_reason || 'Ответ вкладки не соответствует зафиксированному снимку MRP'
+        setSummary((current) => current ? {
+          ...current,
+          snapshot_id: null,
+          truth_status: 'unavailable',
+          truth_reason: mismatchReason,
+        } : current)
+        invalidateTabs()
+        setError(mismatchReason)
+        return
+      }
+      setOffsets((prev) => ({ ...prev, [targetTab]: nextOffset }))
+      setLoadedTabs((prev) => ({ ...prev, [targetTab]: true }))
+    } catch (e) {
+      if (seq === loadSeq.current) setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      if (seq === loadSeq.current) setLoading(false)
+    }
+  }, [dateFrom, dateTo, invalidateTabs, rootItemId, runId, snapshotId, summary?.cutoff, summary?.ledger_generation, truthAccepted])
 
   useEffect(() => {
     if (previousRunId.current === runId) return
@@ -207,8 +240,8 @@ export function MrpResultPage() {
   }, [loadSummary])
 
   useEffect(() => {
-    if (dataRunId === runId && !loadedTabs[tab]) void loadTab(tab, offsets[tab])
-  }, [dataRunId, loadedTabs, loadTab, offsets, runId, tab])
+    if (dataRunId === runId && truthAccepted && !loadedTabs[tab]) void loadTab(tab, offsets[tab])
+  }, [dataRunId, loadedTabs, loadTab, offsets, runId, tab, truthAccepted])
 
   useEffect(() => {
     let cancelled = false
@@ -233,10 +266,11 @@ export function MrpResultPage() {
   }, [summary?.run?.source_plan_id])
 
   async function exportActive(format: 'csv' | 'xlsx') {
+    if (!truthAccepted || snapshotId === null) return
     setExporting(true)
     setError('')
     try {
-      const params = { format, date_from: dateFrom || undefined, date_to: dateTo || undefined, root_item_id: rootItemId }
+      const params = { snapshot_id: snapshotId, format, date_from: dateFrom || undefined, date_to: dateTo || undefined, root_item_id: rootItemId }
       const response = tab === 'production'
         ? await exportPlanningResultProduction(runId, params)
         : tab === 'purchases'
@@ -251,7 +285,7 @@ export function MrpResultPage() {
   }
 
   async function createSelectedProductionOrders() {
-    if (!selectedProductionIds.size || mutationInFlight.current) return
+    if (!truthAccepted || !selectedProductionIds.size || mutationInFlight.current) return
     mutationInFlight.current = true
     setExporting(true)
     setError('')
@@ -265,7 +299,6 @@ export function MrpResultPage() {
       })
       setSelectedProductionIds(new Set())
       await loadSummary()
-      await loadTab('production', offsets.production)
       setMessage(formatActionResult('Создание заказов', result))
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -276,7 +309,7 @@ export function MrpResultPage() {
   }
 
   async function exportSelectedPurchasesTo1C() {
-    if (!selectedPurchaseIds.size || mutationInFlight.current) return
+    if (!truthAccepted || !selectedPurchaseIds.size || mutationInFlight.current) return
     mutationInFlight.current = true
     setExporting(true)
     setError('')
@@ -327,7 +360,7 @@ export function MrpResultPage() {
     <main className="workArea">
       <div className="topLine">
         <div className="breadcrumbs">MRP / Результат прогона #{runId}</div>
-        <div className="runBadge">{summary?.run?.status ? planningStatusLabel(summary.run.status) : 'Загрузка'}</div>
+        <div className="runBadge">{truthUnavailableReason ? 'Данные недоступны' : summary?.run?.status ? planningStatusLabel(summary.run.status) : 'Загрузка'}</div>
       </div>
 
       <DocumentWindow
@@ -350,10 +383,10 @@ export function MrpResultPage() {
       >
         <div className="commandBar">
           <button onClick={() => navigate('/mrp-runs')}>К списку прогонов</button>
-          <button onClick={() => { void loadSummary(); refreshActiveTab() }} disabled={loading}>Обновить</button>
-          {tab !== 'capacity' && <button onClick={() => void exportActive('xlsx')} disabled={loading || exporting}>XLSX</button>}
-          {tab === 'production' && <button className="primary" onClick={() => void createSelectedProductionOrders()} disabled={!selectedProductionIds.size || loading || exporting}>Создать заказы ({selectedProductionIds.size})</button>}
-          {tab === 'purchases' && <button className="primary" onClick={() => void exportSelectedPurchasesTo1C()} disabled={!selectedPurchaseIds.size || loading || exporting}>Выгрузить в 1С ({selectedPurchaseIds.size})</button>}
+          <button onClick={() => { void loadSummary() }} disabled={loading}>Обновить</button>
+          {tab !== 'capacity' && <button onClick={() => void exportActive('xlsx')} disabled={!truthAccepted || loading || exporting}>XLSX</button>}
+          {tab === 'production' && <button className="primary" onClick={() => void createSelectedProductionOrders()} disabled={!truthAccepted || !selectedProductionIds.size || loading || exporting}>Создать заказы ({selectedProductionIds.size})</button>}
+          {tab === 'purchases' && <button className="primary" onClick={() => void exportSelectedPurchasesTo1C()} disabled={!truthAccepted || !selectedPurchaseIds.size || loading || exporting}>Выгрузить в 1С ({selectedPurchaseIds.size})</button>}
           <div className="barSeparator" />
           <button onClick={() => setRootDialogOpen(true)}>Корневое изделие</button>
           <span className="toolbarText">{rootProductLabel(rootOptions, rootItemId)}</span>
@@ -370,15 +403,16 @@ export function MrpResultPage() {
         </div>
 
         {error && <div className="errorLine">{error}</div>}
+        {truthUnavailableReason && !error && <div className="errorLine">{truthUnavailableReason}</div>}
         {message && <div className="successLine">{message}</div>}
 
         <div className="mrpSummaryStrip">
-          <Metric title="Старт" value={dateTimeRu(summary?.run?.started_at) || '—'} />
-          <Metric title="Горизонт" value={`${qty(summary?.run?.horizon_days)} дн.`} />
-          <Metric title="Производство" value={qty(summary?.counts?.production_orders ?? productionTotal)} hint={`${qty(totals.productionQty)} шт.`} />
-          <Metric title="Закупки" value={qty(summary?.counts?.purchase_requests ?? purchaseTotal)} hint={`${qty(totals.purchaseQty)} шт.`} />
-          <Metric title="Переработка" value={qty(summary?.counts?.rework_requests ?? reworkTotal)} hint={`${qty(totals.reworkQty)} шт.`} />
-          <Metric title="Перегрузы" value={qty(summary?.capacity?.overloaded_buckets)} hint={`${qty(totals.overloadHours)} н/ч`} />
+          <Metric title="Старт" value={truthAccepted ? dateTimeRu(summary?.run?.started_at) || '—' : 'Недоступно'} />
+          <Metric title="Горизонт" value={truthAccepted ? `${qty(summary?.run?.horizon_days)} дн.` : 'Недоступно'} />
+          <Metric title="Производство" value={truthAccepted ? qty(summary?.counts?.production_orders ?? productionTotal) : 'Недоступно'} hint={truthAccepted ? `${qty(totals.productionQty)} шт.` : undefined} />
+          <Metric title="Закупки" value={truthAccepted ? qty(summary?.counts?.purchase_requests ?? purchaseTotal) : 'Недоступно'} hint={truthAccepted ? `${qty(totals.purchaseQty)} шт.` : undefined} />
+          <Metric title="Переработка" value={truthAccepted ? qty(summary?.counts?.rework_requests ?? reworkTotal) : 'Недоступно'} hint={truthAccepted ? `${qty(totals.reworkQty)} шт.` : undefined} />
+          <Metric title="Перегрузы" value={truthAccepted ? qty(summary?.capacity?.overloaded_buckets) : 'Недоступно'} hint={truthAccepted ? `${qty(totals.overloadHours)} н/ч` : undefined} />
         </div>
 
         <div className="tabsBar">
@@ -389,6 +423,7 @@ export function MrpResultPage() {
         </div>
 
         <div className="tablePane resultTablePane">
+          {!truthAccepted && <div className="emptyState">Фактические данные MRP недоступны. Дождитесь принятого Ledger-снимка.</div>}
           {tab === 'production' && <ProductionResultTable rows={productionRows} selectedIds={selectedProductionIds} highlightedId={highlightedProductionId} onSelectedIdsChange={setSelectedProductionIds} />}
           {tab === 'purchases' && (
             <PurchaseResultTable

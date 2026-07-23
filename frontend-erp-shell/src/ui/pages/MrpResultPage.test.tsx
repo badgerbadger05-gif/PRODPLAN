@@ -41,6 +41,11 @@ vi.mock('../../services/planning', () => ({
 }))
 
 const summary: MrpSummary = {
+  snapshot_id: 901,
+  ledger_generation: 77,
+  cutoff: '2026-07-20T08:31:00+00:00',
+  truth_status: 'accepted',
+  truth_reason: null,
   run: {
     run_id: 41,
     status: 'SUCCESS',
@@ -140,7 +145,17 @@ const capacityRows: MrpCapacityRow[] = [{
 }]
 
 function paged<T>(rows: T[], total = rows.length, offset = 0) {
-  return { rows, total, limit: 200, offset }
+  return {
+    snapshot_id: 901,
+    ledger_generation: 77,
+    cutoff: '2026-07-20T08:31:00+00:00',
+    truth_status: 'accepted',
+    truth_reason: null,
+    rows,
+    total,
+    limit: 200,
+    offset,
+  }
 }
 
 function RouteSwitchingMrpResultPage() {
@@ -217,6 +232,7 @@ describe('MrpResultPage characterization', () => {
     expect(screen.getByText('Успешно')).toBeVisible()
     expect(getPlanningRunSummary).toHaveBeenCalledWith(41)
     expect(getPlanningResultProduction).toHaveBeenCalledWith(41, {
+      snapshot_id: 901,
       date_from: undefined,
       date_to: undefined,
       root_item_id: null,
@@ -227,6 +243,61 @@ describe('MrpResultPage characterization', () => {
 
     await userEvent.setup().click(screen.getByRole('button', { name: 'Корневое изделие' }))
     expect(screen.getByRole('option', { name: 'Насос ГА-1 · НАС-01' })).toBeVisible()
+  })
+
+  it('pins every tab to the snapshot returned by the summary without implicit mutations', async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await screen.findByText('Насос ГА-1')
+    await user.click(screen.getByRole('button', { name: 'Закупки' }))
+    await screen.findByText('Подшипник')
+    await user.click(screen.getByRole('button', { name: 'Переработка' }))
+    await screen.findByText('Корпус на доработку')
+    await user.click(screen.getByRole('button', { name: 'Мощности' }))
+    await screen.findByText('Участок #9')
+
+    for (const reader of [
+      getPlanningResultProduction,
+      getPlanningResultPurchases,
+      getPlanningResultRework,
+      getPlanningResultCapacity,
+    ]) {
+      expect(reader).toHaveBeenCalledWith(41, expect.objectContaining({ snapshot_id: 901 }))
+    }
+    expect(createProductionControlOrdersFromMrp).not.toHaveBeenCalled()
+    expect(exportPurchasesTo1C).not.toHaveBeenCalled()
+  })
+
+  it('shows unavailable instead of zeroes and does not request rows without an accepted snapshot', async () => {
+    vi.mocked(getPlanningRunSummary).mockResolvedValue({
+      snapshot_id: null,
+      ledger_generation: null,
+      cutoff: null,
+      truth_status: 'uninitialized',
+      truth_reason: 'Ledger ещё не принят',
+    })
+
+    renderPage()
+
+    expect(await screen.findByText('Ledger ещё не принят')).toBeVisible()
+    expect(screen.getAllByText('Недоступно')).toHaveLength(6)
+    expect(screen.queryByText('Насос ГА-1')).not.toBeInTheDocument()
+    expect(getPlanningResultProduction).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: 'XLSX' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: 'Создать заказы (0)' })).toBeDisabled()
+  })
+
+  it('clears rows when a tab response does not match the pinned snapshot', async () => {
+    vi.mocked(getPlanningResultProduction).mockResolvedValue({
+      ...paged(productionRows),
+      snapshot_id: 902,
+    })
+
+    renderPage()
+
+    expect(await screen.findByText('Ответ вкладки не соответствует зафиксированному снимку MRP')).toBeVisible()
+    expect(screen.queryByText('Насос ГА-1')).not.toBeInTheDocument()
+    expect(screen.getByText('Строки 0-0 из 0')).toBeVisible()
   })
 
   it('loads tabs lazily once and honors the query tab and highlighted row', async () => {
@@ -254,6 +325,7 @@ describe('MrpResultPage characterization', () => {
     await user.type(screen.getByLabelText('По'), '2026-07-31')
     await user.click(screen.getByRole('button', { name: 'Сформировать' }))
     await waitFor(() => expect(getPlanningResultProduction).toHaveBeenLastCalledWith(41, {
+      snapshot_id: 901,
       date_from: '2026-07-21',
       date_to: '2026-07-31',
       root_item_id: null,
@@ -264,6 +336,7 @@ describe('MrpResultPage characterization', () => {
     await user.click(screen.getByRole('button', { name: 'Корневое изделие' }))
     await user.selectOptions(screen.getByRole('combobox'), '501')
     await waitFor(() => expect(getPlanningResultProduction).toHaveBeenLastCalledWith(41, {
+      snapshot_id: 901,
       date_from: '2026-07-21',
       date_to: '2026-07-31',
       root_item_id: 501,
@@ -273,6 +346,7 @@ describe('MrpResultPage characterization', () => {
 
     await user.click(screen.getByRole('button', { name: 'Вперед' }))
     await waitFor(() => expect(getPlanningResultProduction).toHaveBeenLastCalledWith(41, {
+      snapshot_id: 901,
       date_from: '2026-07-21',
       date_to: '2026-07-31',
       root_item_id: 501,
@@ -337,6 +411,7 @@ describe('MrpResultPage characterization', () => {
 
     await user.click(screen.getByRole('button', { name: 'XLSX' }))
     expect(exportPlanningResultProduction).toHaveBeenCalledWith(41, {
+      snapshot_id: 901,
       format: 'xlsx',
       date_from: undefined,
       date_to: undefined,
@@ -362,31 +437,29 @@ describe('MrpResultPage characterization', () => {
   it('keeps the newest summary and tab data when the run route changes mid-load', async () => {
     const oldSummary = deferred<MrpSummary>()
     const newSummary = deferred<MrpSummary>()
-    const oldRows = deferred<ReturnType<typeof paged<MrpProductionRow>>>()
     const newRows = deferred<ReturnType<typeof paged<MrpProductionRow>>>()
     vi.mocked(getPlanningRunSummary)
       .mockImplementationOnce(() => oldSummary.promise)
       .mockImplementationOnce(() => newSummary.promise)
     vi.mocked(getPlanningResultProduction)
-      .mockImplementationOnce(() => oldRows.promise)
       .mockImplementationOnce(() => newRows.promise)
 
     const user = userEvent.setup()
     renderPage('/mrp-runs/41', true)
-    await waitFor(() => expect(getPlanningResultProduction).toHaveBeenCalledWith(41, expect.any(Object)))
+    expect(getPlanningResultProduction).not.toHaveBeenCalled()
     await user.click(screen.getByRole('button', { name: 'Открыть прогон 42' }))
-    await waitFor(() => expect(getPlanningResultProduction).toHaveBeenCalledWith(42, expect.any(Object)))
+    expect(getPlanningResultProduction).not.toHaveBeenCalled()
 
     newSummary.resolve({
       ...summary,
-      run: { ...summary.run, run_id: 42, horizon_days: 99 },
+      run: { ...summary.run!, run_id: 42, horizon_days: 99 },
     })
+    await waitFor(() => expect(getPlanningResultProduction).toHaveBeenCalledWith(42, expect.objectContaining({ snapshot_id: 901 })))
     newRows.resolve(paged([{ ...productionRows[0], order_id: 4201, item_name: 'Новый прогон' }]))
     expect(await screen.findByText('Новый прогон')).toBeVisible()
     expect(screen.getByText('99 дн.')).toBeVisible()
 
     oldSummary.resolve(summary)
-    oldRows.resolve(paged(productionRows))
     await waitFor(() => {
       expect(screen.queryByText('Насос ГА-1')).not.toBeInTheDocument()
       expect(screen.getByText('99 дн.')).toBeVisible()

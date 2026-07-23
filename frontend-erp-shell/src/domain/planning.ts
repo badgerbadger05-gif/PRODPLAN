@@ -28,7 +28,12 @@ export type StartPlanningRunResponse = {
 }
 
 export type MrpSummary = {
-  run: PlanningRunRow
+  snapshot_id: number | null
+  ledger_generation: number | null
+  cutoff: string | null
+  truth_status: string
+  truth_reason?: string | null
+  run?: PlanningRunRow
   counts?: {
     production_orders?: number
     purchase_requests?: number
@@ -127,6 +132,11 @@ export type MrpCapacityRow = {
 }
 
 export type MrpPagedResponse<T> = {
+  snapshot_id: number | null
+  ledger_generation: number | null
+  cutoff: string | null
+  truth_status: string
+  truth_reason?: string | null
   rows: T[]
   total: number
   total_qty?: number
