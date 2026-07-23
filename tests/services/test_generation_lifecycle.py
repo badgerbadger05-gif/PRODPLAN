@@ -9,6 +9,14 @@ from app.services.item_ledger.generation_lifecycle import (
     accept_generation_build,
     validate_generation_build,
 )
+from app.services.item_ledger.supplier_receipt_odata import (
+    SupplierEvidenceDiagnostic,
+    SupplierEvidenceExtractionResult,
+)
+from app.services.item_ledger.supplier_receipt_allocation import (
+    RECEIPT_OPERATION,
+    SupplierDocumentEvidence,
+)
 
 
 def _generation(db, key: str, *, empty: bool = False):
@@ -226,3 +234,165 @@ def test_empty_prefix_requires_explicit_declaration(db_session):
 
     assert result["physical_facts"] == 0
     assert result["status"] == "accepted"
+
+
+def test_structural_supplier_evidence_diagnostic_blocks_before_fifo_and_acceptance(
+    db_session, monkeypatch
+):
+    generation, requirement = _synthetic(db_session, "supplier-diagnostic")
+    db_session.add(models.StockLedgerEntry(
+        ingest_batch_id=generation.physical_import_batch_id,
+        source_content_hash="supplier-diagnostic",
+        item_id=requirement.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        warehouse_ref1c="WH",
+        qty=Decimal("1"),
+        posting_at=datetime(2026, 7, 21),
+        record_type="Receipt",
+        movement_kind="supplier_receipt",
+        recorder_type="Document_ПриходнаяНакладная",
+        recorder_ref="receipt-diagnostic",
+        line_no="1",
+        ingest_source="test",
+    ))
+    db_session.commit()
+    monkeypatch.setattr(
+        "app.services.item_ledger.generation_lifecycle."
+        "extract_supplier_document_evidence",
+        lambda *_args, **_kwargs: SupplierEvidenceExtractionResult(
+            evidence=(),
+            diagnostics=(SupplierEvidenceDiagnostic(
+                recorder_type="Document_ПриходнаяНакладная",
+                recorder_ref="receipt-diagnostic",
+                line_no="1",
+                code="item_mismatch",
+                detail="document item differs from Ledger row",
+            ),),
+            fetched_document_count=1,
+        ),
+    )
+
+    def fifo_must_not_run(*_args, **_kwargs):
+        raise AssertionError("supplier FIFO ran despite incomplete evidence")
+
+    monkeypatch.setattr(
+        "app.services.item_ledger.generation_lifecycle."
+        "rebuild_supplier_receipt_coverage",
+        fifo_must_not_run,
+    )
+
+    for _attempt in range(2):
+        with pytest.raises(
+            GenerationValidationError, match="item_mismatch"
+        ):
+            accept_generation_build(
+                db_session,
+                generation.id,
+                replay_from=datetime(2026, 7, 1),
+                odata_client=object(),
+            )
+
+    db_session.expire_all()
+    current = db_session.get(models.LedgerGeneration, generation.id)
+    assert current.status == "building"
+    assert current.capabilities == {}
+    assert db_session.get(models.PlanningTruthState, 1) is None
+    assert db_session.query(
+        models.StockLedgerSupplierReceiptProvenance
+    ).filter_by(ledger_generation_id=generation.id).count() == 0
+
+
+def test_supplier_candidates_require_explicit_odata_client(db_session):
+    generation, requirement = _synthetic(db_session, "supplier-client")
+    db_session.add(models.StockLedgerEntry(
+        ingest_batch_id=generation.physical_import_batch_id,
+        source_content_hash="supplier-client",
+        item_id=requirement.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        warehouse_ref1c="WH",
+        qty=Decimal("1"),
+        posting_at=datetime(2026, 7, 21),
+        record_type="Receipt",
+        movement_kind="supplier_receipt",
+        recorder_type="Document_ПриходнаяНакладная",
+        recorder_ref="receipt-client",
+        line_no="1",
+        ingest_source="test",
+    ))
+    db_session.commit()
+
+    with pytest.raises(GenerationValidationError, match="OData client"):
+        accept_generation_build(
+            db_session,
+            generation.id,
+            replay_from=datetime(2026, 7, 1),
+        )
+
+    db_session.expire_all()
+    assert db_session.get(models.LedgerGeneration, generation.id).status == "building"
+    assert db_session.get(models.PlanningTruthState, 1) is None
+
+
+def test_direct_supplier_receipt_is_explicitly_unplanned_but_does_not_block(
+    db_session, monkeypatch
+):
+    generation, requirement = _synthetic(db_session, "direct-receipt")
+    db_session.add(models.StockLedgerEntry(
+        ingest_batch_id=generation.physical_import_batch_id,
+        source_content_hash="direct-receipt",
+        item_id=requirement.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        warehouse_ref1c="WH",
+        qty=Decimal("3"),
+        posting_at=datetime(2026, 7, 21),
+        record_type="Receipt",
+        movement_kind="receipt",
+        recorder_type="Document_ПриходнаяНакладная",
+        recorder_ref="direct-receipt",
+        line_no="1",
+        ingest_source="test",
+    ))
+    db_session.commit()
+    evidence = SupplierDocumentEvidence(
+        receipt_doc_type="Document_ПриходнаяНакладная",
+        receipt_doc_ref="direct-receipt",
+        receipt_doc_line_no="1",
+        operation_key=RECEIPT_OPERATION,
+        operation_name="Приобретение у поставщика",
+        supplier_order_type="",
+        supplier_order_ref="",
+        supplier_order_line_no="0",
+        item_id=requirement.item_id,
+        characteristic_ref="",
+        warehouse_ref1c="WH",
+        signed_qty=Decimal("3"),
+    )
+    monkeypatch.setattr(
+        "app.services.item_ledger.generation_lifecycle."
+        "extract_supplier_document_evidence",
+        lambda *_args, **_kwargs: SupplierEvidenceExtractionResult(
+            evidence=(evidence,),
+            diagnostics=(),
+            fetched_document_count=1,
+        ),
+    )
+
+    result = accept_generation_build(
+        db_session,
+        generation.id,
+        replay_from=datetime(2026, 7, 1),
+        odata_client=object(),
+    )
+
+    assert result["status"] == "accepted"
+    assert result["supplier_receipts"]["unplanned_qty"] == "3.000"
+    assert result["supplier_receipt_unplanned_qty"] == "3.000"
+    assert result["supplier_receipts"]["status_counts"]["unmatched"] == 1
+    assert generation.capabilities["supplier_receipt_coverage"] is True
+    provenance = db_session.query(
+        models.StockLedgerSupplierReceiptProvenance
+    ).filter_by(ledger_generation_id=generation.id).one()
+    assert provenance.match_status == "unmatched"

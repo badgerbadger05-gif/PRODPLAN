@@ -394,6 +394,7 @@ def _rebuild_supplier_receipt_coverage_unsafe(
     ).delete(synchronize_session=False)
 
     facts: list[ReceiptFact] = []
+    explicitly_unplanned = Decimal("0")
     provenance_count = 0
     for row in rows:
         operation = _operation_prefix(row)
@@ -497,7 +498,14 @@ def _rebuild_supplier_receipt_coverage_unsafe(
                     receipt_line_no=_text(row.receipt_doc_line_no),
                     correction_receipt_ref=_text(row.correction_receipt_ref) or None,
                 ))
+            else:
+                explicitly_unplanned += _decimal(sle.qty)
 
+    # Make the normalized, generation-scoped evidence durable inside the
+    # current savepoint before FIFO is evaluated.  A later allocation failure
+    # still rolls the savepoint back atomically, while the allocator can never
+    # run ahead of its auditable provenance.
+    db.flush()
     keys = {(fact.supplier_order_ref, fact.supplier_order_line_no) for fact in facts}
     pins_by_order = {
         key: _pins_for_order(db, ledger_generation_id, key[0], key[1])
@@ -546,7 +554,7 @@ def _rebuild_supplier_receipt_coverage_unsafe(
         provenance_count=provenance_count,
         exact_fact_count=len(facts),
         allocation_count=sum(1 for qty in aggregate_qty.values() if qty != 0),
-        unplanned_qty=unplanned,
+        unplanned_qty=unplanned + explicitly_unplanned,
     )
 
 

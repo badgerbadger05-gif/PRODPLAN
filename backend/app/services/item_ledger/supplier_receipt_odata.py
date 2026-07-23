@@ -436,15 +436,20 @@ def extract_supplier_document_evidence(
                 ))
                 continue
             order_ref, order_type, order_line = _order(row, doc)
-            if recorder_type != "Document_ПеремещениеЗапасов" and (
-                _normalized_type(order_type) != SUPPLIER_ORDER_TYPE
-                or not order_ref
+            if (
+                recorder_type != "Document_ПеремещениеЗапасов"
+                and (
+                    _normalized_type(order_type) != SUPPLIER_ORDER_TYPE
+                    or not order_ref
+                )
             ):
-                diagnostics.append(_diagnostic(
-                    entry, "missing_supplier_order",
-                    "typed supplier-order evidence is absent",
-                ))
-                continue
+                # This is a valid physical supplier fact with no addressable
+                # frozen-order lineage (direct receipt/surplus).  Preserve it
+                # as normalized evidence; the generation-scoped provenance
+                # layer classifies it as explicitly unplanned.
+                order_ref = ""
+                order_type = ""
+                order_line = "0"
             evidence.append(SupplierDocumentEvidence(
                 receipt_doc_type=recorder_type,
                 receipt_doc_ref=recorder_ref,

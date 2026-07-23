@@ -26,14 +26,24 @@ from .historical_replay_persistence import (
     run_historical_replay,
 )
 from .physical_visibility import visible_sles_for_generation
+from .supplier_receipt_allocation import rebuild_supplier_receipt_coverage
+from .supplier_receipt_odata import extract_supplier_document_evidence
 
 
 CAPABILITIES = {
     "physical_ledger": True,
     "reservation_replay": True,
     "execution_allocations": True,
+    "supplier_receipt_coverage": True,
     "planning_snapshots": True,
 }
+_SUPPLIER_DOCUMENT_TYPES = frozenset({
+    "Document_ПриходнаяНакладная",
+    "Document_КорректировкаПоступления",
+    "Document_РасходнаяНакладная",
+    "Document_ПеремещениеЗапасов",
+})
+_TRANSFER_DOCUMENT_TYPE = "Document_ПеремещениеЗапасов"
 _SAFE_FACT_MODE = {
     "linked_production": "make",
     "unlinked_production": "make",
@@ -135,6 +145,15 @@ def _completed_stage(
     return completed[0]
 
 
+def _supplier_candidates(
+    db: Session, generation_id: int
+) -> tuple[models.StockLedgerEntry, ...]:
+    return tuple(
+        row for row in visible_sles_for_generation(db, generation_id)
+        if str(row.recorder_type or "") in _SUPPLIER_DOCUMENT_TYPES
+    )
+
+
 def validate_generation_build(
     db: Session,
     generation_id: int,
@@ -230,10 +249,27 @@ def validate_generation_build(
     } if selected_requirement_ids else {}
     allocation_by_req_mode: dict[tuple[int, str], Decimal] = defaultdict(Decimal)
     bucket_mode_qty: dict[tuple[int, str], Decimal] = defaultdict(Decimal)
+    supplier_allocated_qty = Decimal("0")
     allocations = db.query(models.MrpExecutionAllocation).filter(
         models.MrpExecutionAllocation.ledger_generation_id == int(generation.id)
     ).all()
     for allocation in allocations:
+        if (
+            str(allocation.fact_type or "") == "supplier_receipt"
+            and str(allocation.allocation_kind or "") == "coverage_realization"
+        ):
+            if not str(allocation.cycle_id or "").startswith(
+                f"historical-supplier:g{generation.id}:"
+            ):
+                raise GenerationValidationError(
+                    "supplier allocation lacks generation build lineage"
+                )
+            if int(allocation.requirement_id) not in selected_requirement_ids:
+                raise GenerationValidationError(
+                    "supplier allocation escapes selected obligations"
+                )
+            supplier_allocated_qty += _d(allocation.allocated_qty)
+            continue
         if not str(allocation.cycle_id or "").startswith("historical-replay:g"):
             raise GenerationValidationError("legacy execution allocation entered generation build")
         mode = _SAFE_FACT_MODE.get(str(allocation.fact_type or ""))
@@ -264,6 +300,45 @@ def validate_generation_build(
         raise GenerationValidationError("historical replay violates fact conservation")
     if allocated_qty != sum(allocation_by_req_mode.values(), Decimal("0")):
         raise GenerationValidationError("replay metrics disagree with persisted allocations")
+
+    supplier_candidates = _supplier_candidates(db, int(generation.id))
+    supplier_physical_ids = {
+        int(row.id) for row in supplier_candidates
+        if str(row.recorder_type or "") != _TRANSFER_DOCUMENT_TYPE
+    }
+    provenance = db.query(
+        models.StockLedgerSupplierReceiptProvenance
+    ).filter(
+        models.StockLedgerSupplierReceiptProvenance.ledger_generation_id
+        == int(generation.id)
+    ).all()
+    provenance_ids = {int(row.stock_ledger_entry_id) for row in provenance}
+    if provenance_ids != supplier_physical_ids:
+        raise GenerationValidationError(
+            "supplier receipt evidence does not cover every physical row"
+        )
+    allowed_supplier_statuses = {"exact", "unmatched", "ambiguous"}
+    if any(
+        str(row.match_status or "") not in allowed_supplier_statuses
+        for row in provenance
+    ):
+        raise GenerationValidationError(
+            "supplier receipt evidence has an invalid classification"
+        )
+    supplier_status_counts = {
+        status: sum(
+            1 for row in provenance if str(row.match_status or "") == status
+        )
+        for status in sorted(allowed_supplier_statuses)
+    }
+    supplier_physical_qty = sum(
+        (
+            _d(row.qty) for row in supplier_candidates
+            if str(row.recorder_type or "") != _TRANSFER_DOCUMENT_TYPE
+        ),
+        Decimal("0"),
+    )
+    supplier_unplanned_qty = supplier_physical_qty - supplier_allocated_qty
 
     expected_bins: dict[tuple[int, str, str, str], tuple[Decimal, int]] = {}
     for row in visible:
@@ -298,6 +373,9 @@ def validate_generation_build(
         "reservation_entries": len(entries),
         "reservation_events": len(events),
         "execution_allocations": len(allocations),
+        "supplier_receipt_evidence": len(provenance),
+        "supplier_receipt_status_counts": supplier_status_counts,
+        "supplier_receipt_unplanned_qty": str(supplier_unplanned_qty),
         "fact_qty": str(fact_qty),
         "allocated_qty": str(allocated_qty),
         "unplanned_qty": str(unplanned_qty),
@@ -310,6 +388,7 @@ def accept_generation_build(
     generation_id: int,
     *,
     replay_from: datetime,
+    odata_client: Any | None = None,
     explicit_empty_physical: bool = False,
 ) -> dict[str, Any]:
     """Build all local projections and publish only after every gate succeeds."""
@@ -319,6 +398,30 @@ def accept_generation_build(
         obligations = materialize_historical_obligations(db, int(generation.id))
         replay = run_historical_replay(
             db, int(generation.id), replay_from=replay_from
+        )
+        supplier_candidates = _supplier_candidates(db, int(generation.id))
+        if supplier_candidates and odata_client is None:
+            raise GenerationValidationError(
+                "supplier document evidence requires an OData client"
+            )
+        extraction = (
+            extract_supplier_document_evidence(
+                db, odata_client, supplier_candidates
+            )
+            if supplier_candidates else None
+        )
+        if extraction is not None and extraction.diagnostics:
+            first = extraction.diagnostics[0]
+            raise GenerationValidationError(
+                "supplier document evidence is incomplete: "
+                f"{first.code} at {first.recorder_type}/"
+                f"{first.recorder_ref}/{first.line_no}"
+            )
+        supplier = rebuild_supplier_receipt_coverage(
+            db,
+            ledger_generation_id=int(generation.id),
+            evidence=extraction.evidence if extraction is not None else (),
+            cycle_id=f"historical-supplier:g{generation.id}:accept",
         )
         validation = validate_generation_build(
             db,
@@ -337,4 +440,16 @@ def accept_generation_build(
         "physical": physical,
         "obligations": obligations,
         "replay": replay,
+        "supplier_receipts": {
+            "documents_fetched": (
+                extraction.fetched_document_count if extraction is not None else 0
+            ),
+            "evidence": (
+                len(extraction.evidence) if extraction is not None else 0
+            ),
+            "provenance": supplier.provenance_count,
+            "allocations": supplier.allocation_count,
+            "unplanned_qty": str(supplier.unplanned_qty),
+            "status_counts": validation["supplier_receipt_status_counts"],
+        },
     }

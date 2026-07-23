@@ -376,6 +376,33 @@ def test_duplicate_order_lines_persist_ambiguity_without_allocation(db_session):
     ).one()
     assert provenance.match_status == "ambiguous"
     assert provenance.ambiguity_count == 2
+    assert result.unplanned_qty == Decimal("3")
+    assert db_session.query(models.MrpExecutionAllocation).count() == 0
+
+
+def test_direct_receipt_is_persisted_unmatched_and_counted_unplanned(db_session):
+    generation, _req = _persistence_fixture(db_session)
+    row = _evidence(RECEIPT_OPERATION, 3)
+    row = SupplierDocumentEvidence(**{
+        **row.__dict__,
+        "supplier_order_type": "",
+        "supplier_order_ref": "",
+        "supplier_order_line_no": "0",
+    })
+
+    result = rebuild_supplier_receipt_coverage(
+        db_session,
+        ledger_generation_id=generation.id,
+        evidence=[row],
+        cycle_id="test",
+    )
+
+    provenance = db_session.query(
+        models.StockLedgerSupplierReceiptProvenance
+    ).one()
+    assert provenance.match_status == "unmatched"
+    assert result.exact_fact_count == 0
+    assert result.unplanned_qty == Decimal("3")
     assert db_session.query(models.MrpExecutionAllocation).count() == 0
 
 
@@ -539,3 +566,27 @@ def test_failure_after_delete_rolls_back_savepoint_and_preserves_projection(
     assert db_session.query(
         models.MrpExecutionAllocation
     ).count() == before_allocations
+
+
+def test_normalized_evidence_is_flushed_before_supplier_fifo(
+    db_session, monkeypatch
+):
+    generation, _req = _persistence_fixture(db_session)
+
+    def assert_provenance_then_allocate(*_args, **_kwargs):
+        assert db_session.query(
+            models.StockLedgerSupplierReceiptProvenance
+        ).filter_by(ledger_generation_id=generation.id).count() == 1
+        return (), Decimal("0")
+
+    monkeypatch.setattr(
+        receipt_service,
+        "allocate_supplier_receipts",
+        assert_provenance_then_allocate,
+    )
+    rebuild_supplier_receipt_coverage(
+        db_session,
+        ledger_generation_id=generation.id,
+        evidence=[_evidence(RECEIPT_OPERATION, 3)],
+        cycle_id="test",
+    )

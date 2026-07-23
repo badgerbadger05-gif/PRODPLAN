@@ -290,7 +290,9 @@ def test_missing_mismatch_and_duplicate_lines_fail_closed(db_session):
     ]
 
 
-def test_unknown_type_wrong_operation_and_missing_order_are_diagnostics(db_session):
+def test_unknown_type_wrong_operation_block_but_missing_order_is_unplanned_evidence(
+    db_session,
+):
     item = _item(db_session)
     unknown = extract_supplier_document_evidence(
         db_session, _Client({}),
@@ -321,4 +323,8 @@ def test_unknown_type_wrong_operation_and_missing_order_are_diagnostics(db_sessi
         }),
         [_sle(item)],
     )
-    assert no_order.diagnostics[0].code == "missing_supplier_order"
+    assert no_order.diagnostics == ()
+    assert len(no_order.evidence) == 1
+    assert no_order.evidence[0].supplier_order_ref == ""
+    assert no_order.evidence[0].supplier_order_type == ""
+    assert no_order.evidence[0].supplier_order_line_no == "0"
