@@ -258,9 +258,15 @@ def seed_from_balance(
     for raw_key, raw_qty in balance_snapshot.items():
         key = LedgerKey(*raw_key)
         qty = _dec(raw_qty)
+        recorder_identity_hash = canonical_content_hash({
+            "anchor_period": anchor_period.isoformat(),
+            "item_id": key.item_id,
+            "characteristic_ref": key.characteristic_ref,
+            "organization_ref": key.organization_ref,
+            "warehouse_ref1c": key.warehouse_ref1c,
+        })
         recorder_ref = (
-            f"{anchor_period.isoformat()}:{key.item_id}:{key.characteristic_ref}:"
-            f"{key.organization_ref}:{key.warehouse_ref1c}"
+            f"seed:{anchor_period.isoformat()}:{recorder_identity_hash[:40]}"
         )
 
         existing_anchor = (

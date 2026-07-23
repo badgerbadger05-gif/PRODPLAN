@@ -113,6 +113,25 @@ def test_seed_from_balance_idempotent(db_session):
     assert db_session.query(models.StockLedgerAnchor).filter_by(item_id=item.item_id).count() == 1
 
 
+def test_seed_recorder_ref_fits_postgresql_limit_for_guid_dimensions(db_session):
+    item = _mk_item(db_session, code="LK-GUID-SEED")
+    key = LedgerKey(
+        item.item_id,
+        "",
+        "00b75de6-d29e-11eb-498b-fa163e61326a",
+        "3e17b9e4-d404-11eb-cc81-fa163e61326a",
+    )
+
+    created = seed_from_balance(
+        db_session,
+        {key: 1},
+        anchor_period=datetime.date(2026, 6, 1),
+    )
+
+    assert len(created[0].recorder_ref) <= 64
+    assert created[0].recorder_ref.startswith("seed:2026-06-01:")
+
+
 # ---------------------------------------------------------------------------
 # rebuild_running_balance (§6 narrow rebuild + on_hand fold)
 # ---------------------------------------------------------------------------
