@@ -22,11 +22,15 @@ from app.services.item_ledger import (
     LedgerKey,
     build_balance_snapshot,
     ledger_on_hand_by_item,
+    process_pending_pulls,
     reconcile_balance_snapshot,
     seed_from_balance,
     stock_shadow_report,
 )
-from app.services.item_ledger.reconcile import RECONCILE_SOURCE
+from app.services.item_ledger.reconcile import (
+    RECONCILE_DISCOVERY_SOURCE,
+    RECONCILE_SOURCE,
+)
 
 
 def _f(x):
@@ -286,6 +290,304 @@ def test_reconcile_ignores_double_zero_keys(db_session):
     db_session.commit()
     assert res.compared == 0 and res.matched == 0 and res.pending == 0
     assert db_session.query(models.StockBin).count() == 0
+
+
+# ---------------------------------------------------------------------------
+# Д7 — characteristics: the aggregate comparison axis (variant «б»)
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_char_bin_matches_aggregate_balance_no_false_drift(db_session):
+    """Regression Д7: a bin keyed by a REAL characteristic must reconcile against
+    the char-less Balance row as one aggregate — previously the sweep saw two
+    mismatched keys (char-bin −10, ''-bin +10) and after the debounce «перелила»
+    the stock into the ''-bin with an adjustment pair."""
+    it = _item(db_session, "X1", "ref-x1")
+    seed_from_balance(
+        db_session,
+        {LedgerKey(it.item_id, "char-1", "", "wh-1"): 10},
+        anchor_period=datetime.date(2026, 7, 1),
+    )
+    agg = LedgerKey(it.item_id, "", "", "wh-1")
+
+    r1 = reconcile_balance_snapshot(db_session, {agg: 10})
+    db_session.commit()
+    r2 = reconcile_balance_snapshot(db_session, {agg: 10})
+    db_session.commit()
+
+    assert (r1.matched, r1.pending, r1.adjusted) == (1, 0, 0)
+    assert (r2.matched, r2.pending, r2.adjusted) == (1, 0, 0)
+    assert _adj_sles(db_session) == []
+    # the char-bin is untouched and stamped reconciled; no ''-bin was created
+    bins = db_session.query(models.StockBin).all()
+    assert len(bins) == 1
+    assert bins[0].characteristic_ref == "char-1"
+    assert _f(bins[0].on_hand) == 10
+    assert bins[0].last_reconciled_at is not None
+
+
+def test_reconcile_aggregate_discrepancy_adjusts_only_empty_char_bin(db_session):
+    """Aggregate (char-bin 10 + ''-bin 2 = 12) vs balance 9 → one −3 adjustment
+    into the ''-bin after the debounce; the char-bin is never touched."""
+    it = _item(db_session, "X2", "ref-x2")
+    seed_from_balance(
+        db_session,
+        {
+            LedgerKey(it.item_id, "char-1", "", "wh-1"): 10,
+            LedgerKey(it.item_id, "", "", "wh-1"): 2,
+        },
+        anchor_period=datetime.date(2026, 7, 1),
+    )
+    agg = LedgerKey(it.item_id, "", "", "wh-1")
+
+    r1 = reconcile_balance_snapshot(db_session, {agg: 9})
+    db_session.commit()
+    assert r1.pending == 1 and r1.adjusted == 0
+    # pending is stored on the ''-bin, char-bin stays clean
+    char_bin = (
+        db_session.query(models.StockBin)
+        .filter_by(item_id=it.item_id, characteristic_ref="char-1")
+        .one()
+    )
+    empty_bin = (
+        db_session.query(models.StockBin)
+        .filter_by(item_id=it.item_id, characteristic_ref="")
+        .one()
+    )
+    assert _f(empty_bin.reconcile_pending_qty) == -3
+    assert _f(char_bin.reconcile_pending_qty) == 0
+
+    r2 = reconcile_balance_snapshot(db_session, {agg: 9})
+    db_session.commit()
+    assert r2.adjusted == 1
+    sles = _adj_sles(db_session, it.item_id)
+    assert len(sles) == 1
+    assert _f(sles[0].qty) == -3 and sles[0].characteristic_ref == ""
+    assert _f(char_bin.on_hand) == 10  # untouched
+    assert _f(empty_bin.on_hand) == -1  # 2 + (−3); aggregate = 9 = balance
+
+    r3 = reconcile_balance_snapshot(db_session, {agg: 9})
+    db_session.commit()
+    assert r3.matched == 1 and r3.adjusted == 0
+    assert len(_adj_sles(db_session, it.item_id)) == 1  # no oscillation
+
+
+# ---------------------------------------------------------------------------
+# §7.4(д) — сверка v2: discovery of the missed source document
+# ---------------------------------------------------------------------------
+
+ASSEMBLY = "Document_СборкаЗапасов"
+
+
+class FakeRegisterClient:
+    """Discovery-side fake: returns recorder rows for the dimension-filtered
+    register query (Инк0 shape)."""
+
+    def __init__(self, recorder_rows):
+        self.recorder_rows = recorder_rows
+        self.calls = []
+
+    def get_all(self, entity_name, filter_query=None, order_by=None, **kwargs):
+        self.calls.append((entity_name, filter_query))
+        return list(self.recorder_rows)
+
+
+class BoomRegisterClient:
+    def get_all(self, *args, **kwargs):
+        raise RuntimeError("1C 504 gateway timeout")
+
+
+class FakePullClient:
+    """Ingest-side fake for emulating the queued pull draining: answers the
+    cast-Recorder filter with one recorder row of movement lines."""
+
+    def __init__(self, recorder_ref, lines):
+        self.recorder_ref = recorder_ref
+        self.lines = lines
+
+    def get_all(self, entity_name, filter_query=None, order_by=None, **kwargs):
+        if "Recorder eq cast" in (filter_query or ""):
+            return [{
+                "Recorder": self.recorder_ref,
+                "Recorder_Type": "AccumulationRecordType",
+                "RecordSet": list(self.lines),
+            }]
+        return []  # document-header fetch etc. — best-effort, empty is fine
+
+
+def _recorder_row(ref, rtype=f"StandardODATA.{ASSEMBLY}"):
+    return {"Recorder": ref, "Recorder_Type": rtype, "RecordSet": []}
+
+
+def _matured_delta(db, code, ref, wh="wh-1", on_hand=10, balance=7):
+    """Seed a bin and mature a (balance − on_hand) delta through sweep 1."""
+    it = _item(db, code, ref)
+    _seed_bin(db, it.item_id, wh, on_hand)
+    key = LedgerKey(it.item_id, "", "", wh)
+    reconcile_balance_snapshot(db, {key: balance})
+    db.commit()
+    return it, key
+
+
+def test_discovery_not_queried_for_first_sighting(db_session):
+    it = _item(db_session, "D0", "ref-d0")
+    _seed_bin(db_session, it.item_id, "wh-1", 10)
+    client = FakeRegisterClient([])
+
+    res = reconcile_balance_snapshot(
+        db_session, {LedgerKey(it.item_id, "", "", "wh-1"): 7},
+        discovery_client=client,
+    )
+    db_session.commit()
+
+    assert res.pending == 1 and res.adjusted == 0
+    assert client.calls == []  # point query ONLY for matured discrepancies
+
+
+def test_discovery_unknown_recorder_enqueued_and_held(db_session):
+    it, key = _matured_delta(db_session, "D1", "ref-d1")
+    client = FakeRegisterClient([_recorder_row("doc-miss-1")])
+
+    res = reconcile_balance_snapshot(db_session, {key: 7}, discovery_client=client)
+    db_session.commit()
+
+    assert res.held == 1 and res.adjusted == 0 and res.anomalies == 0
+    assert res.discovered_recorders == 1
+    assert _adj_sles(db_session) == []
+    pull = (
+        db_session.query(models.StockRecorderPull)
+        .filter_by(recorder_ref="doc-miss-1")
+        .one()
+    )
+    assert pull.status == "pending"
+    assert pull.recorder_type == ASSEMBLY  # StandardODATA. prefix stripped
+    assert pull.source == RECONCILE_DISCOVERY_SOURCE
+    # delta still debounced, awaiting the drain
+    assert _f(_bin(db_session, it.item_id, "wh-1").reconcile_pending_qty) == -3
+    # the point query is dimension-filtered with a Period lower bound
+    entity, flt = client.calls[0]
+    assert entity == "AccumulationRegister_ЗапасыНаСкладах"
+    assert "Номенклатура_Key eq guid'ref-d1'" in flt
+    assert "СтруктурнаяЕдиница_Key eq guid'wh-1'" in flt
+    assert "Period gt datetime'" in flt  # seed anchor provides the bound
+
+
+def test_discovery_then_drained_pull_converges_without_adjustment(db_session):
+    """The §7.4д happy path: discrepancy → recorder discovered + enqueued →
+    orchestrator drains the pull (emulated) → the ledger replays the movement
+    with a real Recorder and the next sweep matches. No anonymous SLE at all."""
+    db_session.add(models.StockWarehouse(warehouse_ref1c="wh-1", warehouse_name="WH1"))
+    db_session.flush()
+    it, key = _matured_delta(db_session, "D2", "ref-d2")
+    client = FakeRegisterClient([_recorder_row("doc-miss-2")])
+
+    res = reconcile_balance_snapshot(db_session, {key: 7}, discovery_client=client)
+    db_session.commit()
+    assert res.discovered_recorders == 1 and res.adjusted == 0
+
+    # emulate the orchestrator drain: the missed Списание −3 arrives by-document
+    pull_client = FakePullClient("doc-miss-2", [{
+        "Period": "2026-07-15T12:00:00",
+        "LineNumber": "1",
+        "Active": True,
+        "RecordType": "Expense",
+        "Организация_Key": "00000000-0000-0000-0000-000000000000",
+        "Номенклатура_Key": "ref-d2",
+        "Характеристика_Key": "00000000-0000-0000-0000-000000000000",
+        "СтруктурнаяЕдиница_Key": "wh-1",
+        "Количество": 3,
+    }])
+    results = process_pending_pulls(db_session, client=pull_client)
+    assert [r.status for r in results] == ["done"]
+    assert _f(_bin(db_session, it.item_id, "wh-1").on_hand) == 7
+
+    # next sweep: recorder is known, delta is gone → matched, still no adjustment
+    res2 = reconcile_balance_snapshot(db_session, {key: 7}, discovery_client=client)
+    db_session.commit()
+    assert res2.matched == 1 and res2.adjusted == 0 and res2.held == 0
+    assert _adj_sles(db_session) == []
+
+
+def test_discovery_clean_register_writes_anonymous_adjustment(db_session):
+    """Register returns no documents at all → the delta is a true anomaly and
+    the honest anonymous adjustment happens exactly as before v2."""
+    it, key = _matured_delta(db_session, "D3", "ref-d3")
+    client = FakeRegisterClient([])
+
+    res = reconcile_balance_snapshot(db_session, {key: 7}, discovery_client=client)
+    db_session.commit()
+
+    assert res.adjusted == 1 and res.anomalies == 1
+    assert res.held == 0 and res.discovered_recorders == 0
+    assert _f(_adj_sles(db_session, it.item_id)[0].qty) == -3
+    assert _f(_bin(db_session, it.item_id, "wh-1").on_hand) == 7
+
+
+def test_discovery_known_recorder_not_reenqueued_treated_as_anomaly(db_session):
+    """A recorder already pulled (done) is not the missed document — discovery
+    must not re-enqueue it in a loop; with nothing new the adjustment applies."""
+    it, key = _matured_delta(db_session, "D4", "ref-d4")
+    db_session.add(models.StockRecorderPull(
+        recorder_type=ASSEMBLY, recorder_ref="doc-known", status="done",
+    ))
+    db_session.commit()
+    client = FakeRegisterClient([_recorder_row("doc-known")])
+
+    res = reconcile_balance_snapshot(db_session, {key: 7}, discovery_client=client)
+    db_session.commit()
+
+    assert res.adjusted == 1 and res.anomalies == 1
+    assert res.discovered_recorders == 0
+    pull = (
+        db_session.query(models.StockRecorderPull)
+        .filter_by(recorder_ref="doc-known")
+        .one()
+    )
+    assert pull.status == "done"  # NOT reset to pending
+
+
+def test_discovery_limit_caps_point_queries_per_sweep(db_session):
+    it1 = _item(db_session, "D5", "ref-d5")
+    it2 = _item(db_session, "D6", "ref-d6")
+    _seed_bin(db_session, it1.item_id, "wh-1", 10)
+    _seed_bin(db_session, it2.item_id, "wh-2", 10)
+    key1 = LedgerKey(it1.item_id, "", "", "wh-1")
+    key2 = LedgerKey(it2.item_id, "", "", "wh-2")
+    client = FakeRegisterClient([])
+
+    reconcile_balance_snapshot(db_session, {key1: 7, key2: 7})  # sweep 1: pending
+    db_session.commit()
+    res = reconcile_balance_snapshot(
+        db_session, {key1: 7, key2: 7},
+        discovery_client=client, discovery_limit=1,
+    )
+    db_session.commit()
+
+    assert len(client.calls) == 1  # exactly one point query this sweep
+    assert res.adjusted == 1 and res.anomalies == 1  # the budgeted key resolved
+    assert res.discovery_skipped == 1 and res.held == 1  # the other held
+    assert len(_adj_sles(db_session)) == 1
+    # the held key keeps its debounce and resolves on a later sweep
+    res2 = reconcile_balance_snapshot(
+        db_session, {key1: 7, key2: 7},
+        discovery_client=client, discovery_limit=1,
+    )
+    db_session.commit()
+    assert res2.adjusted == 1 and res2.matched == 1
+
+
+def test_discovery_odata_error_holds_key_without_crash(db_session):
+    it, key = _matured_delta(db_session, "D7", "ref-d7")
+
+    res = reconcile_balance_snapshot(
+        db_session, {key: 7}, discovery_client=BoomRegisterClient(),
+    )
+    db_session.commit()
+
+    assert res.held == 1 and res.adjusted == 0
+    assert res.discovery_skipped == 1
+    assert _adj_sles(db_session) == []
+    assert _f(_bin(db_session, it.item_id, "wh-1").reconcile_pending_qty) == -3
 
 
 # ---------------------------------------------------------------------------
