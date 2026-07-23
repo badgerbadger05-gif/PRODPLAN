@@ -19,12 +19,14 @@ const orderedRow = {
   item_name: 'Подшипник ведущего вала',
   unit: 'шт',
   quantity: 12,
-  received_qty: 4,
+  received_qty: null,
   remaining_qty: 8,
   delivery_date: '2026-07-24',
   need_date: '2026-07-25',
   overdue_days: 0,
-  line_status: 'expected',
+  line_status: 'unavailable',
+  fact_status: 'unavailable',
+  fact_source: 'ledger_future_supply',
   supply_phase: 'in_transit',
   counts_in_mrp: true,
   price: 100,
@@ -42,7 +44,7 @@ const mrpRow = {
   order_number: '',
   order_ref1c: null,
   order_state_name: null,
-  received_qty: 0,
+  received_qty: null,
   remaining_qty: 12,
   delivery_date: null,
   line_status: 'to_order',
@@ -59,15 +61,29 @@ async function mockPurchaseApi(page: Page) {
           total: 2,
           limit: 100,
           offset: 0,
-          run_id: 17,
+          run_id: null,
+          run_ids: [],
+          truth_status: 'accepted',
+          ledger_generation_id: 23,
+          meta: {
+            snapshot_id: 91,
+            ledger_generation: 23,
+            cutoff: '2026-07-23T12:00:00+00:00',
+            truth_status: 'accepted',
+            truth_reason: null,
+            fact_source: 'ledger',
+            received_qty_status: 'unavailable',
+            read_only: true,
+          },
           summary: {
             total_rows: 2,
-            by_status: { expected: 1, to_order: 1 },
+            by_status: { unavailable: 1, to_order: 1 },
             by_phase: { in_transit: 1, no_goods: 1, in_stock: 0 },
             to_order: 1,
             overdue: 0,
             expected_7d: 1,
             in_transit_amount: 1200,
+            fact_status: 'unavailable',
           },
         },
       })
@@ -102,6 +118,16 @@ async function mockPurchaseApi(page: Page) {
             supplier_name: 'Промснаб',
           },
           lines: [orderedRow],
+          meta: {
+            snapshot_id: 91,
+            ledger_generation: 23,
+            cutoff: '2026-07-23T12:00:00+00:00',
+            truth_status: 'accepted',
+            truth_reason: null,
+            fact_source: 'ledger',
+            received_qty_status: 'unavailable',
+            read_only: true,
+          },
         },
       })
       return
@@ -134,7 +160,7 @@ test('purchase control visual contract', async ({ page }) => {
   })
 
   await expect(page.getByRole('heading', { name: 'Журнал закупок' })).toBeVisible()
-  await expect(page.getByText('MRP run: 17')).toBeVisible()
+  await expect(page.getByText('Ledger: 23')).toBeVisible()
   await expect(page.getByText('ЗП-000008', { exact: true }).first()).toBeVisible()
   await expect(page.getByRole('heading', { name: 'Заказ целиком' })).toBeVisible()
   await expect(page.getByText('Ожидается за 7 дн: 1')).toBeVisible()
