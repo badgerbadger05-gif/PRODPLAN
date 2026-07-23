@@ -580,6 +580,33 @@ export type DbrFeederDeficitsResult = {
   }
 }
 
+// ── Saved DBR feeder cockpit ────────────────────────────────────────────────
+// The feeder page has one read boundary.  All four sections below are captured
+// together by the backend worker for one accepted Item Ledger generation.
+export type DbrCockpitUnavailableSections = string[] | Record<string, string | null | undefined>
+
+export type DbrFeederCockpitMeta = {
+  snapshot_id?: number | null
+  policy_snapshot_id?: number | null
+  ledger_generation?: number | null
+  cutoff?: string | null
+  truth_status?: string | null
+  truth_reason?: string | null
+  chain_enabled?: boolean
+  unavailable_sections?: DbrCockpitUnavailableSections
+}
+
+export type DbrFeederCockpit = {
+  meta: DbrFeederCockpitMeta
+  positions?: DbrFeederPosition[]
+  signals?: DbrFeederSignal[]
+  deficits?: DbrFeederDeficitsResult | {
+    items?: unknown[]
+    source?: string
+  }
+  processing_board?: DbrProcessingBoard | { status: 'unavailable'; reason?: string }
+}
+
 // ── Давальческий контур переработки (питатель №3, фаза 4) ───────────────────
 export type DbrProcessingOrder = {
   order_id: number

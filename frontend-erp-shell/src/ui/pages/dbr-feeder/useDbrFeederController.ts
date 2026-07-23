@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
   DbrChainPreview,
+  DbrFeederCockpitMeta,
   DbrFeederDeficit,
   DbrFeederDeficitsResult,
   DbrFeederPosition,
@@ -17,17 +18,13 @@ import type {
   DbrSignalLaunchResult,
 } from '../../../domain/dbr'
 import {
-  getDbrFeederDeficits,
-  getDbrProcessingBoard,
+  getDbrFeederCockpit,
+  dbrSnapshotUnavailableMessage,
   getDbrProcessingTripManifest,
   getDbrProcessingTripManifestPrint,
-  getDbrSettings,
   isDbrConflict,
   launchDbrPurchase,
   launchDbrSignal,
-  listDbrFeederPositions,
-  getDbrFeederSignal,
-  listDbrFeederSignals,
   previewDbrFeederChain,
   previewDbrFeederPositions,
   previewDbrFeederSignals,
@@ -50,6 +47,7 @@ import type { DeficitSortKey, FeederFilters, SignalFilters } from './model'
 
 export function useDbrFeederController() {
   const [rows, setRows] = useState<DbrFeederPosition[]>([])
+  const [cockpitMeta, setCockpitMeta] = useState<DbrFeederCockpitMeta | null>(null)
   const [filters, setFilters] = useState<FeederFilters>(EMPTY_FILTERS)
   const [applied, setApplied] = useState<FeederFilters>(EMPTY_FILTERS)
   const [preview, setPreview] = useState<DbrFeederPreview | null>(null)
@@ -62,12 +60,12 @@ export function useDbrFeederController() {
   const [appliedSignalFilters, setAppliedSignalFilters] = useState<SignalFilters>(EMPTY_SIGNAL_FILTERS)
   const [signalPreview, setSignalPreview] = useState<DbrFeederSignalPreview | null>(null)
   const [selectedSignal, setSelectedSignal] = useState<DbrFeederSignal | null>(null)
-  const [signalsLoading, setSignalsLoading] = useState(false)
+  const [signalsLoading] = useState(false)
   const [expandedSignalId, setExpandedSignalId] = useState<number | null>(null)
   const [deficitFilter, setDeficitFilter] = useState('')
   const [chainEnabled, setChainEnabled] = useState(false)
   const [deficits, setDeficits] = useState<DbrFeederDeficitsResult | null>(null)
-  const [deficitsLoading, setDeficitsLoading] = useState(false)
+  const [deficitsLoading] = useState(false)
   const [deficitSort, setDeficitSort] = useState<DeficitSortKey>('blocks_signals')
   const [chainPreview, setChainPreview] = useState<DbrChainPreview | null>(null)
 
@@ -95,78 +93,40 @@ export function useDbrFeederController() {
   const [processingChainPreview, setProcessingChainPreview] = useState<DbrProcessingChainPreview | null>(null)
   const [processingOrderPreview, setProcessingOrderPreview] = useState<DbrProcessingOrderPreview | null>(null)
   const [processingManifest, setProcessingManifest] = useState<DbrProcessingTripManifest | null>(null)
-  const positionsLoadSequence = useRef(0)
-  const signalsLoadSequence = useRef(0)
-  const signalDetailLoadSequence = useRef(0)
+  const cockpitLoadSequence = useRef(0)
 
-  const load = useCallback(async (next: FeederFilters = applied) => {
-    const sequence = ++positionsLoadSequence.current
+  // The initial mount is intentionally a single GET.  Filtering is local over
+  // this immutable saved envelope; it must never re-run DBR calculations.
+  const loadCockpit = useCallback(async () => {
+    const sequence = ++cockpitLoadSequence.current
     setLoading(true)
     setError('')
     try {
-      const nextRows = await listDbrFeederPositions({
-        active_only: true,
-        search: next.search,
-        zone: next.zone,
-        mode: next.mode,
-        supply: next.supply,
-        limit: 5000,
-      })
-      if (sequence !== positionsLoadSequence.current) return
-      setRows(nextRows)
+      const cockpit = await getDbrFeederCockpit()
+      if (sequence !== cockpitLoadSequence.current) return
+      setRows(cockpit.positions ?? [])
+      setSignals(cockpit.signals ?? [])
+      // Candidate snapshots intentionally expose only obligation-level deficit
+      // rows.  They are not the material-readiness table, so do not turn their
+      // absent fields into deceptive zeroes.
+      const deficitPayload = cockpit.deficits
+      setDeficits(deficitPayload && 'deficits' in deficitPayload ? deficitPayload : null)
+      const processingPayload = cockpit.processing_board
+      setProcessingBoard(processingPayload && 'positions' in processingPayload ? processingPayload : null)
+      setCockpitMeta(cockpit.meta ?? {})
+      setChainEnabled(Boolean(cockpit.meta?.chain_enabled))
     } catch (e) {
-      if (sequence !== positionsLoadSequence.current) return
-      setError(e instanceof Error ? e.message : String(e))
+      if (sequence !== cockpitLoadSequence.current) return
+      setError(dbrSnapshotUnavailableMessage(e) ?? (e instanceof Error ? e.message : String(e)))
     } finally {
-      if (sequence === positionsLoadSequence.current) setLoading(false)
-    }
-  }, [applied])
-
-  useEffect(() => { void load() }, [load])
-
-  const loadSignals = useCallback(async (next: SignalFilters = appliedSignalFilters) => {
-    const sequence = ++signalsLoadSequence.current
-    setSignalsLoading(true)
-    setError('')
-    try {
-      const nextSignals = await listDbrFeederSignals({ ...next, limit: 5000 })
-      if (sequence !== signalsLoadSequence.current) return
-      setSignals(nextSignals)
-    } catch (e) {
-      if (sequence !== signalsLoadSequence.current) return
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      if (sequence === signalsLoadSequence.current) setSignalsLoading(false)
-    }
-  }, [appliedSignalFilters])
-
-  useEffect(() => { void loadSignals() }, [loadSignals])
-
-  const loadDeficits = useCallback(async () => {
-    setDeficitsLoading(true)
-    try {
-      setDeficits(await getDbrFeederDeficits())
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setDeficitsLoading(false)
+      if (sequence === cockpitLoadSequence.current) setLoading(false)
     }
   }, [])
 
-  useEffect(() => { void loadDeficits() }, [loadDeficits])
+  useEffect(() => { void loadCockpit() }, [loadCockpit])
 
-  const loadProcessingBoard = useCallback(async () => {
-    setProcessingLoading(true)
-    try {
-      setProcessingBoard(await getDbrProcessingBoard())
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setProcessingLoading(false)
-    }
-  }, [])
-
-  useEffect(() => { void loadProcessingBoard() }, [loadProcessingBoard])
+  const loadDeficits = loadCockpit
+  const loadProcessingBoard = loadCockpit
 
   async function calculateProcessingChainPreview() {
     setProcessingLoading(true)
@@ -219,19 +179,32 @@ export function useDbrFeederController() {
     }
   }
 
-  useEffect(() => {
-    let cancelled = false
-    void getDbrSettings()
-      .then((settings) => { if (!cancelled) setChainEnabled(Boolean(settings.feeder_chain_enabled)) })
-      .catch(() => { if (!cancelled) setChainEnabled(false) })
-    return () => { cancelled = true }
-  }, [])
+  const sortedDeficits = useMemo(
+    () => sortFeederDeficits(deficits?.deficits ?? [], deficitSort),
+    [deficits, deficitSort],
+  )
 
-  // Queue shown after the deficit drill-down: only signals blocked by the
-  // clicked component keep visible when a deficit filter is active.
+  const filteredRows = useMemo(() => rows.filter((row) => {
+    const search = applied.search.trim().toLocaleLowerCase()
+    const zone = row.live_nfp?.zone ?? ''
+    return row.is_active
+      && (!search || `${row.item_code} ${row.item_name}`.toLocaleLowerCase().includes(search))
+      && (!applied.zone || zone === applied.zone)
+      && (!applied.mode || row.mode === applied.mode)
+      && (!applied.supply || row.supply_type === applied.supply)
+  }), [applied, rows])
+
+  const filteredSignals = useMemo(() => signals.filter((signal) => {
+    const search = appliedSignalFilters.search.trim().toLocaleLowerCase()
+    return (!search || `${signal.item_code ?? ''} ${signal.item_name ?? ''}`.toLocaleLowerCase().includes(search))
+      && (!appliedSignalFilters.status || signal.status === appliedSignalFilters.status)
+      && (!appliedSignalFilters.zone || signal.zone === appliedSignalFilters.zone)
+      && (!appliedSignalFilters.signal_type || signal.signal_type === appliedSignalFilters.signal_type)
+  }), [appliedSignalFilters, signals])
+
   const visibleSignals = useMemo(
-    () => visibleFeederSignals(signals, deficitFilter),
-    [signals, deficitFilter],
+    () => visibleFeederSignals(filteredSignals, deficitFilter),
+    [filteredSignals, deficitFilter],
   )
 
   // «Пополнение» signals are the ones the supplier-order launch can target; only
@@ -244,12 +217,23 @@ export function useDbrFeederController() {
   const purchaseSelectedIds = purchaseSelection.selectedIds
   const allPurchaseSelected = purchaseSelection.allSelected
 
-  const sortedDeficits = useMemo(
-    () => sortFeederDeficits(deficits?.deficits ?? [], deficitSort),
-    [deficits, deficitSort],
-  )
+  const summary = useMemo(() => summarizeFeederPositions(filteredRows), [filteredRows])
 
-  const summary = useMemo(() => summarizeFeederPositions(rows), [rows])
+  const unavailableSections = useMemo(() => {
+    const raw = cockpitMeta?.unavailable_sections
+    if (Array.isArray(raw)) return Object.fromEntries(raw.map((section) => [section, 'Недоступно в сохранённом снимке']))
+    const sections: Record<string, string | null | undefined> = { ...(raw ?? {}) }
+    if (cockpitMeta && !deficits) sections.deficits ??= 'В снимке есть только дефицит открытых обязательств, без готовности комплектов'
+    if (cockpitMeta && !processingBoard) sections.processing_board ??= 'Точный контур переработки не зафиксирован в этом снимке'
+    return sections
+  }, [cockpitMeta, deficits, processingBoard])
+  const sectionUnavailableReason = useCallback(
+    (section: 'positions' | 'signals' | 'deficits' | 'processing_board') => {
+      const reason = unavailableSections[section]
+      return typeof reason === 'string' ? reason : null
+    },
+    [unavailableSections],
+  )
 
   const signalPreviewSummary = useMemo(() => summarizeSignalPreview(signalPreview), [signalPreview])
 
@@ -276,7 +260,7 @@ export function useDbrFeederController() {
       const result = await rebuildDbrFeederPositions(preview.schedule_id)
       setPreview(null)
       setMessage(`Позиции обновлены по графику №${result.schedule_id}: создано ${result.created ?? 0}, обновлено ${result.updated ?? 0}, отключено ${result.deactivated ?? 0}`)
-      await load(applied)
+      await loadCockpit()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -311,7 +295,7 @@ export function useDbrFeederController() {
       setSignalPreview(null)
       setSelectedSignal(null)
       setMessage(`Advisory-очередь обновлена по графику №${result.schedule_id ?? 'нет'}: создано ${result.created ?? 0}, обновлено ${result.updated ?? 0}, переоткрыто ${result.reopened ?? 0}, отменено ${result.cancelled ?? 0}`)
-      await Promise.all([loadSignals(appliedSignalFilters), loadDeficits()])
+      await loadCockpit()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -345,7 +329,7 @@ export function useDbrFeederController() {
       } else {
         setMessage(`Цепочка обновлена: создано ${result.created}, обновлено ${result.updated}, переоткрыто ${result.reopened}, отозвано ${result.revoked}, проходов ${result.passes}${result.no_warehouse ? `, без склада ${result.no_warehouse}` : ''}`)
       }
-      await Promise.all([loadSignals(appliedSignalFilters), loadDeficits()])
+      await loadCockpit()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -359,20 +343,10 @@ export function useDbrFeederController() {
     setSelectedSignal(null)
   }
 
-  async function selectSignal(signalId: number) {
-    const sequence = ++signalDetailLoadSequence.current
-    setSignalsLoading(true)
-    setError('')
-    try {
-      const signal = await getDbrFeederSignal(signalId)
-      if (sequence !== signalDetailLoadSequence.current) return
-      setSelectedSignal(signal)
-    } catch (e) {
-      if (sequence !== signalDetailLoadSequence.current) return
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      if (sequence === signalDetailLoadSequence.current) setSignalsLoading(false)
-    }
+  function selectSignal(signalId: number) {
+    // The detail is already in the same immutable cockpit snapshot.  A second
+    // GET here could mix it with another Ledger generation.
+    setSelectedSignal(signals.find((signal) => signal.id === signalId) ?? null)
   }
 
   // ── Launch one signal into a 1С production order (preview → confirm) ────────
@@ -405,7 +379,7 @@ export function useDbrFeederController() {
     try {
       const result = await launchDbrSignal(launchFlow.signal.id, false)
       setLaunchFlow((prev) => (prev ? { ...prev, result } : prev))
-      await Promise.all([loadSignals(appliedSignalFilters), loadDeficits()])
+      await loadCockpit()
     } catch (e) {
       if (isDbrConflict(e)) {
         const detail = e.detail as DbrLaunchConflictDetail | undefined
@@ -456,7 +430,7 @@ export function useDbrFeederController() {
       const result = await launchDbrPurchase(purchaseFlow.signalIds, false)
       setPurchaseFlow((prev) => (prev ? { ...prev, result } : prev))
       setSelectedPurchase(new Set())
-      await Promise.all([loadSignals(appliedSignalFilters), loadDeficits()])
+      await loadCockpit()
     } catch (e) {
       setPurchaseError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -474,7 +448,8 @@ export function useDbrFeederController() {
   }
 
   return {
-    rows, filters, setFilters, preview, setPreview, loading, saving, error, message,
+    rows: filteredRows, cockpitMeta, unavailableSections, sectionUnavailableReason,
+    filters, setFilters, preview, setPreview, loading, saving, error, message,
     signals, signalFilters, setSignalFilters, setAppliedSignalFilters, signalPreview,
     setSignalPreview, selectedSignal, setSelectedSignal, signalsLoading, expandedSignalId,
     setExpandedSignalId, deficitFilter, setDeficitFilter, chainEnabled, deficits,
@@ -487,7 +462,7 @@ export function useDbrFeederController() {
     summary, signalPreviewSummary, calculatePreview, rebuild, calculateSignalPreview,
     refreshSignals, calculateChainPreview, runChainRefresh, filterByDeficit, selectSignal,
     startLaunch, confirmLaunch, closeLaunch, togglePurchase, startPurchase, confirmPurchase,
-    applyFilters, resetFilters, loadDeficits, loadProcessingBoard,
+    applyFilters, resetFilters, loadDeficits, loadProcessingBoard, loadCockpit,
     calculateProcessingChainPreview, calculateProcessingOrderPreview, loadProcessingManifest,
     printProcessingManifest,
   }

@@ -8,6 +8,7 @@ import type {
   DbrChainPreview,
   DbrChainRefresh,
   DbrFeederDeficitsResult,
+  DbrFeederCockpit,
   DbrProcessingBoard,
   DbrProcessingChainPreview,
   DbrProcessingOrderPreview,
@@ -37,6 +38,19 @@ import { api, apiText, ApiError } from '../lib/api'
 
 export function isDbrConflict(error: unknown): error is ApiError {
   return error instanceof ApiError && error.status === 409
+}
+
+export function dbrSnapshotUnavailableMessage(error: unknown): string | null {
+  if (!(error instanceof ApiError) || error.status !== 503 || typeof error.detail !== 'object' || error.detail === null) return null
+  const detail = error.detail as Record<string, unknown>
+  const code = typeof detail.code === 'string' ? detail.code : 'snapshot_unavailable'
+  const reason = typeof detail.reason === 'string' ? detail.reason : error.message
+  return `${code}: ${reason}`
+}
+
+/** One saved, Ledger-bound read model for the complete feeder cockpit. */
+export function getDbrFeederCockpit() {
+  return api<DbrFeederCockpit>('/v1/dbr/feeder/cockpit')
 }
 
 // ── Settings ────────────────────────────────────────────────────────────────

@@ -54,38 +54,26 @@ async function mockDbrFeederApi(page: Page) {
     const url = new URL(request.url())
     const key = `${request.method()} ${url.pathname}`
 
-    if (key === 'GET /api/v1/dbr/feeder/positions') {
-      expect(Object.fromEntries(url.searchParams)).toEqual({ include_live_nfp: 'true', active_only: 'true', limit: '5000' })
-      await route.fulfill({ json: positions })
-      return
-    }
-    if (key === 'GET /api/v1/dbr/feeder/signals') {
-      expect(Object.fromEntries(url.searchParams)).toEqual({ status: 'Open', limit: '5000' })
-      await route.fulfill({ json: signals })
-      return
-    }
-    if (key === 'GET /api/v1/dbr/feeder/deficits') {
+    if (key === 'GET /api/v1/dbr/feeder/cockpit') {
       await route.fulfill({ json: {
-        deficits: [{ item: 'BEARING-6205', item_name: 'Подшипник 6205', article: '6205', source: 'buy', short_qty: 4, need_sum: 6, gross: 2, blocks_signals: 1, nearest_due: '2026-07-23' }],
-        kpis: { deficit_materials: 1, queue_open: 2, stock_source: 'selected - ignored' },
+        meta: { snapshot_id: 91, ledger_generation: 42, cutoff: '2026-07-21T08:30:00Z', truth_status: 'accepted', chain_enabled: false, unavailable_sections: [] },
+        positions,
+        signals,
+        deficits: {
+          deficits: [{ item: 'BEARING-6205', item_name: 'Подшипник 6205', article: '6205', source: 'buy', short_qty: 4, need_sum: 6, gross: 2, blocks_signals: 1, nearest_due: '2026-07-23' }],
+          kpis: { deficit_materials: 1, queue_open: 2, stock_source: 'selected - ignored' },
+        },
+        processing_board: {
+          roundtrip_limit_days: 14, positions_total: 1, overdue_positions: 1, generated_at: '2026-07-21T08:30:00Z',
+          positions: [{
+            position_id: 3, item_id: 102, item_code: 'SHAFT-01', item_article: 'ВАЛ-01', item_name: 'Вал приводной',
+            adu: 1, rt_days: 4, trip_interval_days: 7, red_qty: 2, yellow_qty: 3, target_qty: 9,
+            nfp: 4, zone: 'yellow', penetration: 0.55, stock_qty: 2, open_supply_qty: 1, chain_supply_qty: 1,
+            is_complete: true, missing_reasons: [], has_overdue: true,
+            open_orders: [{ order_id: 81, line_id: 811, order_number: 'ПР-000081', order_date: '2026-07-01', transfer_date: '2026-07-03', report_date: null, stage: 'transferred', remaining_qty: 5, age_days: 18, overdue: true }],
+          }],
+        },
       } })
-      return
-    }
-    if (key === 'GET /api/v1/dbr/feeder/processing/board') {
-      await route.fulfill({ json: {
-        roundtrip_limit_days: 14, positions_total: 1, overdue_positions: 1, generated_at: '2026-07-21T08:30:00Z',
-        positions: [{
-          position_id: 3, item_id: 102, item_code: 'SHAFT-01', item_article: 'ВАЛ-01', item_name: 'Вал приводной',
-          adu: 1, rt_days: 4, trip_interval_days: 7, red_qty: 2, yellow_qty: 3, target_qty: 9,
-          nfp: 4, zone: 'yellow', penetration: 0.55, stock_qty: 2, open_supply_qty: 1, chain_supply_qty: 1,
-          is_complete: true, missing_reasons: [], has_overdue: true,
-          open_orders: [{ order_id: 81, line_id: 811, order_number: 'ПР-000081', order_date: '2026-07-01', transfer_date: '2026-07-03', report_date: null, stage: 'transferred', remaining_qty: 5, age_days: 18, overdue: true }],
-        }],
-      } })
-      return
-    }
-    if (key === 'GET /api/v1/dbr/settings') {
-      await route.fulfill({ json: { feeder_chain_enabled: false } })
       return
     }
 

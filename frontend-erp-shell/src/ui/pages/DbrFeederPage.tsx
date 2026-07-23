@@ -22,7 +22,7 @@ import { useDbrFeederController } from './dbr-feeder/useDbrFeederController'
 
 export function DbrFeederPage() {
   const {
-    rows, filters, setFilters, preview, setPreview, loading, saving, error, message,
+    rows, cockpitMeta, sectionUnavailableReason, filters, setFilters, preview, setPreview, loading, saving, error, message,
     signals, signalFilters, setSignalFilters, setAppliedSignalFilters, signalPreview,
     setSignalPreview, selectedSignal, setSelectedSignal, signalsLoading, expandedSignalId,
     setExpandedSignalId, deficitFilter, setDeficitFilter, chainEnabled, deficits,
@@ -39,13 +39,21 @@ export function DbrFeederPage() {
     calculateProcessingChainPreview, calculateProcessingOrderPreview, loadProcessingManifest,
     printProcessingManifest,
   } = useDbrFeederController()
+  const positionsUnavailable = sectionUnavailableReason('positions')
+  const signalsUnavailable = sectionUnavailableReason('signals')
+  const deficitsUnavailable = sectionUnavailableReason('deficits')
+  const processingUnavailable = sectionUnavailableReason('processing_board')
   const processingItemIds = new Set((processingBoard?.positions ?? []).map((row) => row.item_id))
   const processingSignals = signals.filter((signal) => signal.status === 'Open' && processingItemIds.has(signal.item_id))
   return (
     <main className="workArea">
       <div className="topLine">
         <div className="breadcrumbs">Планирование DBR / Питающий контур</div>
-        <div className="runBadge">Только контроль запасов</div>
+        <div className="runBadge" title={cockpitMeta?.truth_reason ?? undefined}>
+          {cockpitMeta?.truth_status === 'accepted'
+            ? `Ledger #${cockpitMeta.ledger_generation ?? '—'} · ${dateTimeRu(cockpitMeta.cutoff) || 'без cutoff'}`
+            : cockpitMeta?.truth_status ? `Ledger: ${cockpitMeta.truth_status}` : 'Снимок Ledger загружается'}
+        </div>
       </div>
 
       <DocumentWindow
@@ -73,14 +81,18 @@ export function DbrFeederPage() {
           <select aria-label="Тип снабжения" value={filters.supply} onChange={(e) => setFilters({ ...filters, supply: e.target.value })}>
             <option value="">Все типы</option><option value="purchase">Закупка</option><option value="manufacture">Производство</option><option value="processing">Переработка</option>
           </select>
-          <button onClick={applyFilters} disabled={loading}>Применить</button>
-          <button onClick={resetFilters} disabled={loading}>Сбросить</button>
+          <button onClick={applyFilters} disabled={loading || Boolean(positionsUnavailable)}>Применить</button>
+          <button onClick={resetFilters} disabled={loading || Boolean(positionsUnavailable)}>Сбросить</button>
           <div className="commandBarSpacer" />
-          <button onClick={() => void calculatePreview()} disabled={saving}>Предпросмотр пересчёта</button>
+          <button onClick={() => void calculatePreview()} disabled={saving || Boolean(positionsUnavailable)}>Предпросмотр пересчёта</button>
         </div>
 
         {error && <div className="errorLine">{error}</div>}
         {message && <div className="successLine">{message}</div>}
+        {cockpitMeta && <div className="dbrFeederNotice" role="status">
+          Сохранённый снимок #{cockpitMeta.snapshot_id ?? '—'} · поколение Ledger #{cockpitMeta.ledger_generation ?? '—'} · cutoff {dateTimeRu(cockpitMeta.cutoff) || '—'}.
+        </div>}
+        {positionsUnavailable && <div className="errorLine">Позиции супермаркета недоступны: {positionsUnavailable}</div>}
         <div className="dbrFeederNotice">Пересчёт позиций и предпросмотр сигналов — только чтение. Запуск сигнала и заказ поставщику создают документы в живой 1С и всегда требуют подтверждения в отдельном окне.</div>
 
         {preview && (
@@ -104,18 +116,18 @@ export function DbrFeederPage() {
               <p>«Пополнение» управляет полкой, «Под график» показывает дефицит к конкретному слоту. Отрицательный приоритет означает, что срок запуска ещё не наступил.</p>
             </div>
             <div className="dbrSignalHeaderActions">
-              <button onClick={() => void calculateSignalPreview()} disabled={saving}>Предпросмотр сигналов</button>
+              <button onClick={() => void calculateSignalPreview()} disabled={saving || Boolean(signalsUnavailable)}>Предпросмотр сигналов</button>
               <button
                 className="dbrDanger"
                 onClick={() => void startPurchase(purchaseSelectedIds)}
-                disabled={saving || purchaseBusy}
+                disabled={saving || purchaseBusy || Boolean(signalsUnavailable)}
                 title="Создать заказы поставщику по выбранным сигналам «Пополнение» (или по всем открытым закупочным, если ничего не выбрано)"
               >
                 Заказать поставщику…{purchaseSelectedIds.length ? ` (${purchaseSelectedIds.length})` : ''}
               </button>
               {chainEnabled && <>
-                <button onClick={() => void calculateChainPreview()} disabled={saving}>Цепочка: предпросмотр</button>
-                <button onClick={() => void runChainRefresh()} disabled={saving}>Цепочка: обновить</button>
+                <button onClick={() => void calculateChainPreview()} disabled={saving || Boolean(signalsUnavailable)}>Цепочка: предпросмотр</button>
+                <button onClick={() => void runChainRefresh()} disabled={saving || Boolean(signalsUnavailable)}>Цепочка: обновить</button>
               </>}
             </div>
           </div>
@@ -135,6 +147,7 @@ export function DbrFeederPage() {
             </div>
           )}
 
+          {signalsUnavailable && <div className="errorLine">Advisory-очередь недоступна: {signalsUnavailable}</div>}
           <div className="commandBar dbrFeederBar dbrSignalFilters">
             <input className="dbrFeederSearch" value={signalFilters.search} placeholder="Сигнал: код или наименование" onChange={(e) => setSignalFilters({ ...signalFilters, search: e.target.value })} onKeyDown={(e) => { if (e.key === 'Enter') setAppliedSignalFilters(signalFilters) }} />
             <select aria-label="Статус сигнала" value={signalFilters.status} onChange={(e) => setSignalFilters({ ...signalFilters, status: e.target.value })}>
@@ -146,8 +159,8 @@ export function DbrFeederPage() {
             <select aria-label="Тип сигнала" value={signalFilters.signal_type} onChange={(e) => setSignalFilters({ ...signalFilters, signal_type: e.target.value })}>
               <option value="">Все типы</option><option value="Пополнение">Пополнение</option><option value="Под график">Под график</option>
             </select>
-            <button onClick={() => setAppliedSignalFilters(signalFilters)} disabled={signalsLoading}>Применить</button>
-            <button onClick={() => { setSignalFilters(EMPTY_SIGNAL_FILTERS); setAppliedSignalFilters(EMPTY_SIGNAL_FILTERS) }} disabled={signalsLoading}>Сбросить</button>
+            <button onClick={() => setAppliedSignalFilters(signalFilters)} disabled={signalsLoading || Boolean(signalsUnavailable)}>Применить</button>
+            <button onClick={() => { setSignalFilters(EMPTY_SIGNAL_FILTERS); setAppliedSignalFilters(EMPTY_SIGNAL_FILTERS) }} disabled={signalsLoading || Boolean(signalsUnavailable)}>Сбросить</button>
             {deficitFilter && (
               <button className="dbrDeficitChip" onClick={() => setDeficitFilter('')} title="Сбросить фильтр по дефициту">
                 Дефицит: {deficitFilter} ✕
@@ -297,9 +310,11 @@ export function DbrFeederPage() {
             </div>
             <div className="dbrSignalHeaderActions">
               {deficits && <span className="dbrSignalCount">Дефицитных позиций: {deficits.kpis.deficit_materials}; открытых сигналов: {deficits.kpis.queue_open}</span>}
-              <button onClick={() => void loadDeficits()} disabled={deficitsLoading}>Обновить</button>
+              <button onClick={() => void loadDeficits()} disabled={deficitsLoading || Boolean(deficitsUnavailable)}>Обновить снимок</button>
             </div>
           </div>
+
+          {deficitsUnavailable && <div className="errorLine">Готовность комплектов недоступна: {deficitsUnavailable}</div>}
 
           <div className="dbrFeederTableWrap dbrDeficitTableWrap">
             <table className="journalTable dbrTable dbrDeficitTable">
@@ -313,7 +328,7 @@ export function DbrFeederPage() {
                 <th className={`dbrSortable ${deficitSort === 'nearest_due' ? 'active' : ''}`} onClick={() => setDeficitSort('nearest_due')}>Ближайший срок</th>
               </tr></thead>
               <tbody>
-                {!deficitsLoading && !sortedDeficits.length && <tr><td colSpan={7} className="emptyCell">Дефицитов в открытой очереди нет.</td></tr>}
+                {!deficitsLoading && !sortedDeficits.length && <tr><td colSpan={7} className="emptyCell">{deficitsUnavailable ? 'Данные готовности комплектов не опубликованы для этого снимка.' : 'Дефицитов в открытой очереди нет.'}</td></tr>}
                 {sortedDeficits.map((deficit) => (
                   <tr key={deficit.item} className={`dbrDeficitRow ${deficitFilter === deficit.item ? 'selected' : ''}`} onClick={() => filterByDeficit(deficit)} title="Отфильтровать очередь по этой позиции">
                     <td><strong>{deficit.item}</strong><span className="dbrFeederItemName">{deficit.item_name}</span></td>
@@ -328,7 +343,7 @@ export function DbrFeederPage() {
               </tbody>
             </table>
           </div>
-          <div className="dbrSignalReadonly">Только просмотр: запас считается «выбранные − игнорируемые» склады ({deficits?.kpis.stock_source ?? 'selected − ignored'}), без запуска производства и заказов.</div>
+          {!deficitsUnavailable && <div className="dbrSignalReadonly">Только просмотр: запас считается «выбранные − игнорируемые» склады ({deficits?.kpis.stock_source ?? 'selected − ignored'}), без запуска производства и заказов.</div>}
         </section>
 
         <section className="dbrSignalSection dbrProcessingSection" aria-label="Давальческий контур переработки">
@@ -343,12 +358,14 @@ export function DbrFeederPage() {
                   Позиций: {processingBoard.positions_total}; просрочен кругорейс (&gt;{processingBoard.roundtrip_limit_days} дн): {processingBoard.overdue_positions}
                 </span>
               )}
-              <button onClick={() => void loadProcessingBoard()} disabled={processingLoading}>Обновить</button>
-              <button onClick={() => void calculateProcessingChainPreview()} disabled={processingLoading}>Цепочка: проверить</button>
-              <button onClick={() => void loadProcessingManifest()} disabled={processingLoading}>Рейс: предпросмотр</button>
-              <button onClick={() => void printProcessingManifest()} disabled={processingLoading}>Рейс: печать</button>
+              <button onClick={() => void loadProcessingBoard()} disabled={processingLoading || Boolean(processingUnavailable)}>Обновить снимок</button>
+              <button onClick={() => void calculateProcessingChainPreview()} disabled={processingLoading || Boolean(processingUnavailable)}>Цепочка: проверить</button>
+              <button onClick={() => void loadProcessingManifest()} disabled={processingLoading || Boolean(processingUnavailable)}>Рейс: предпросмотр</button>
+              <button onClick={() => void printProcessingManifest()} disabled={processingLoading || Boolean(processingUnavailable)}>Рейс: печать</button>
             </div>
           </div>
+
+          {processingUnavailable && <div className="errorLine">Давальческий контур недоступен: {processingUnavailable}</div>}
 
           {processingBoard?.processing_stock && (
             <div className={`dbrProcessingHealth ${processingBoard.processing_stock.status === 'ok' ? 'ok' : 'warn'}`}>

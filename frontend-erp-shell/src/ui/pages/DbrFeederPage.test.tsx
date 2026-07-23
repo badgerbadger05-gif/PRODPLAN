@@ -1,9 +1,10 @@
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type {
   DbrFeederDeficitsResult,
+  DbrFeederCockpit,
   DbrFeederPosition,
   DbrFeederSignal,
   DbrProcessingBoard,
@@ -12,6 +13,7 @@ import type {
 } from '../../domain/dbr'
 import { ApiError } from '../../lib/api'
 import {
+  getDbrFeederCockpit,
   getDbrFeederDeficits,
   getDbrFeederSignal,
   getDbrProcessingBoard,
@@ -34,6 +36,12 @@ import {
 import { DbrFeederPage } from './DbrFeederPage'
 
 vi.mock('../../services/dbr', () => ({
+  dbrSnapshotUnavailableMessage: (error: unknown) => (
+    error instanceof ApiError && error.status === 503
+      ? 'dbr_cockpit_snapshot_unavailable: No DBR feeder cockpit snapshot for current accepted Ledger'
+      : null
+  ),
+  getDbrFeederCockpit: vi.fn(),
   getDbrFeederDeficits: vi.fn(),
   getDbrFeederSignal: vi.fn(),
   getDbrProcessingBoard: vi.fn(),
@@ -136,6 +144,17 @@ const processingBoard: DbrProcessingBoard = {
   generated_at: '2026-07-20T08:00:00Z',
 }
 
+const cockpit: DbrFeederCockpit = {
+  meta: {
+    snapshot_id: 17, ledger_generation: 42, cutoff: '2026-07-23T12:30:00Z',
+    truth_status: 'accepted', chain_enabled: false, unavailable_sections: [],
+  },
+  positions: [position],
+  signals: [purchaseSignal, productionSignal],
+  deficits,
+  processing_board: processingBoard,
+}
+
 const productionPreview: DbrSignalLaunchResult = {
   ok: true,
   dry_run: true,
@@ -184,14 +203,6 @@ const purchaseResult: DbrPurchaseLaunchResult = {
   orders: [{ ...purchasePreview.orders[0], number: 'PO-001', status: 'created' }],
 }
 
-function deferred<T>() {
-  let resolve!: (value: T) => void
-  const promise = new Promise<T>((resolvePromise) => {
-    resolve = resolvePromise
-  })
-  return { promise, resolve }
-}
-
 function renderPage() {
   return render(
     <MemoryRouter>
@@ -203,6 +214,7 @@ function renderPage() {
 describe('DbrFeederPage characterization', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    vi.mocked(getDbrFeederCockpit).mockResolvedValue(cockpit)
     vi.mocked(listDbrFeederPositions).mockResolvedValue([position])
     vi.mocked(listDbrFeederSignals).mockResolvedValue([purchaseSignal, productionSignal])
     vi.mocked(getDbrFeederDeficits).mockResolvedValue(deficits)
@@ -239,35 +251,22 @@ describe('DbrFeederPage characterization', () => {
       .mockResolvedValueOnce(purchaseResult)
   })
 
-  it('bootstraps every feeder read model and applies both filter sets', async () => {
+  it('boots one saved cockpit envelope, shows its Ledger identity and filters locally', async () => {
     const user = userEvent.setup()
     renderPage()
 
     const positionsTable = document.querySelector('.dbrFeederTable')
     expect(positionsTable).not.toBeNull()
-    expect(await within(positionsTable as HTMLElement).findByText('PUMP-01')).toBeVisible()
+    expect((await within(positionsTable as HTMLElement).findAllByText('PUMP-01'))[0]).toBeVisible()
     expect(screen.getByText('Дефицитных позиций: 0; открытых сигналов: 2')).toBeVisible()
     expect(screen.getByText('Позиций: 0; просрочен кругорейс (>14 дн): 0')).toBeVisible()
-    expect(listDbrFeederPositions).toHaveBeenCalledWith({
-      active_only: true,
-      search: '',
-      zone: '',
-      mode: '',
-      supply: '',
-      limit: 5000,
-    })
-    expect(listDbrFeederSignals).toHaveBeenCalledWith({
-      search: '',
-      zone: '',
-      status: 'Open',
-      signal_type: '',
-      limit: 5000,
-    })
-    expect(getDbrFeederDeficits).toHaveBeenCalledOnce()
-    expect(getDbrProcessingBoard).toHaveBeenCalledOnce()
-    expect(getDbrSettings).toHaveBeenCalledOnce()
-    expect(listDbrFeederPositions).toHaveBeenCalledOnce()
-    expect(listDbrFeederSignals).toHaveBeenCalledOnce()
+    expect(screen.getByText(/Сохранённый снимок #17.*поколение Ledger #42.*cutoff/i)).toBeVisible()
+    expect(getDbrFeederCockpit).toHaveBeenCalledOnce()
+    expect(getDbrFeederDeficits).not.toHaveBeenCalled()
+    expect(getDbrProcessingBoard).not.toHaveBeenCalled()
+    expect(getDbrSettings).not.toHaveBeenCalled()
+    expect(listDbrFeederPositions).not.toHaveBeenCalled()
+    expect(listDbrFeederSignals).not.toHaveBeenCalled()
 
     // Mount is a snapshot-read boundary. Calculations, projection refreshes
     // and 1C materialization must remain explicit user actions.
@@ -290,14 +289,7 @@ describe('DbrFeederPage characterization', () => {
     await user.selectOptions(within(positionBar).getByRole('combobox', { name: 'Режим позиции' }), 'shelf')
     await user.selectOptions(within(positionBar).getByRole('combobox', { name: 'Тип снабжения' }), 'purchase')
     await user.click(within(positionBar).getByRole('button', { name: 'Применить' }))
-    await waitFor(() => expect(listDbrFeederPositions).toHaveBeenLastCalledWith({
-      active_only: true,
-      search: 'насос',
-      zone: 'red',
-      mode: 'shelf',
-      supply: 'purchase',
-      limit: 5000,
-    }))
+    expect(getDbrFeederCockpit).toHaveBeenCalledOnce()
 
     const signalBar = document.querySelector('.dbrSignalFilters') as HTMLElement
     await user.type(within(signalBar).getByPlaceholderText('Сигнал: код или наименование'), 'редуктор')
@@ -305,59 +297,24 @@ describe('DbrFeederPage characterization', () => {
     await user.selectOptions(within(signalBar).getByRole('combobox', { name: 'Зона сигнала' }), 'yellow')
     await user.selectOptions(within(signalBar).getByRole('combobox', { name: 'Тип сигнала' }), 'Под график')
     await user.click(within(signalBar).getByRole('button', { name: 'Применить' }))
-    await waitFor(() => expect(listDbrFeederSignals).toHaveBeenLastCalledWith({
-      search: 'редуктор',
-      zone: 'yellow',
-      status: 'Diagnostic',
-      signal_type: 'Под график',
-      limit: 5000,
-    }))
+    expect(getDbrFeederCockpit).toHaveBeenCalledOnce()
   })
 
-  it('keeps the newest signal filter result when an older request resolves last', async () => {
-    const openSignals = deferred<DbrFeederSignal[]>()
-    const diagnosticSignal: DbrFeederSignal = {
-      ...productionSignal,
-      id: 303,
-      dedup_key: 'diagnostic-303',
-      item_code: 'DIAG-01',
-      item_name: 'Диагностическая позиция',
-      status: 'Diagnostic',
-    }
-    vi.mocked(listDbrFeederSignals).mockImplementation((filters) => (
-      filters?.status === 'Open' ? openSignals.promise : Promise.resolve([diagnosticSignal])
-    ))
+  it('filters saved signals locally without another read request', async () => {
     const user = userEvent.setup()
     renderPage()
 
     const signalBar = document.querySelector('.dbrSignalFilters') as HTMLElement
     await user.selectOptions(
       within(signalBar).getByRole('combobox', { name: 'Статус сигнала' }),
-      'Diagnostic',
+      'Open',
     )
-    await user.click(within(signalBar).getByPlaceholderText('Сигнал: код или наименование'))
-    await user.keyboard('{Enter}')
+    await user.type(within(signalBar).getByPlaceholderText('Сигнал: код или наименование'), 'редуктор{Enter}')
 
     const signalTable = document.querySelector('.dbrSignalTable') as HTMLElement
-    expect(await within(signalTable).findByText('DIAG-01')).toBeVisible()
-    expect(listDbrFeederSignals).toHaveBeenLastCalledWith({
-      search: '',
-      zone: '',
-      status: 'Diagnostic',
-      signal_type: '',
-      limit: 5000,
-    })
-
-    await act(async () => {
-      openSignals.resolve([purchaseSignal, productionSignal])
-      await openSignals.promise
-    })
-
-    await waitFor(() => {
-      expect(within(signalTable).getByText('DIAG-01')).toBeVisible()
-      expect(within(signalTable).queryByText('PUMP-01')).not.toBeInTheDocument()
-    })
-    expect(screen.getByText('Сигналов: 1')).toBeVisible()
+    expect(await within(signalTable).findByText('GEAR-01')).toBeVisible()
+    expect(within(signalTable).queryByText('PUMP-01')).not.toBeInTheDocument()
+    expect(getDbrFeederCockpit).toHaveBeenCalledOnce()
   })
 
   it('requires a dry-run preview before confirming a production launch', async () => {
@@ -375,8 +332,7 @@ describe('DbrFeederPage characterization', () => {
     await waitFor(() => expect(launchDbrSignal).toHaveBeenNthCalledWith(2, productionSignal.id, false))
     expect(await within(dialog).findByText(/Заказ создан в 1С/)).toBeVisible()
     expect(dialog).toHaveTextContent('ERP-202')
-    expect(listDbrFeederSignals).toHaveBeenCalledTimes(2)
-    expect(getDbrFeederDeficits).toHaveBeenCalledTimes(2)
+    expect(getDbrFeederCockpit).toHaveBeenCalledTimes(2)
   })
 
   it('turns a material conflict into a blocked launch without a confirm action', async () => {
@@ -428,8 +384,7 @@ describe('DbrFeederPage characterization', () => {
     await waitFor(() => expect(launchDbrPurchase).toHaveBeenNthCalledWith(2, [purchaseSignal.id], false))
     expect(await within(dialog).findByText(/Заказов: 1 · создано: 1/)).toBeVisible()
     expect(selectSignal).not.toBeChecked()
-    expect(listDbrFeederSignals).toHaveBeenCalledTimes(2)
-    expect(getDbrFeederDeficits).toHaveBeenCalledTimes(2)
+    expect(getDbrFeederCockpit).toHaveBeenCalledTimes(2)
   })
 
   it('keeps a positions preview after a failed rebuild and lets the user retry it', async () => {
@@ -467,7 +422,7 @@ describe('DbrFeederPage characterization', () => {
     expect(await screen.findByText('Позиции обновлены по графику №77: создано 1, обновлено 2, отключено 3')).toBeVisible()
     expect(rebuildDbrFeederPositions).toHaveBeenNthCalledWith(2, 77)
     expect(screen.queryByRole('region', { name: 'Предпросмотр пересчёта' })).not.toBeInTheDocument()
-    expect(listDbrFeederPositions).toHaveBeenCalledTimes(2)
+    expect(getDbrFeederCockpit).toHaveBeenCalledTimes(2)
   })
 
   it('previews advisory changes before refreshing signals for that schedule', async () => {
@@ -534,8 +489,7 @@ describe('DbrFeederPage characterization', () => {
     await user.click(within(preview).getByRole('button', { name: 'Обновить по графику №88' }))
     expect(await screen.findByText(/Advisory-очередь обновлена по графику №88/)).toBeVisible()
     expect(refreshDbrFeederSignals).toHaveBeenCalledWith(88)
-    expect(listDbrFeederSignals).toHaveBeenCalledTimes(2)
-    expect(getDbrFeederDeficits).toHaveBeenCalledTimes(2)
+    expect(getDbrFeederCockpit).toHaveBeenCalledTimes(2)
   })
 
   it('opens signal details and drills from a deficit into the blocked queue', async () => {
@@ -558,9 +512,7 @@ describe('DbrFeederPage characterization', () => {
       material_status: 'Дефицит',
       kit_cls: 'no',
     }
-    vi.mocked(listDbrFeederSignals).mockResolvedValue([blockedSignal, productionSignal])
-    vi.mocked(getDbrFeederSignal).mockResolvedValue(productionSignal)
-    vi.mocked(getDbrFeederDeficits).mockResolvedValue({
+    const blockedDeficits: DbrFeederDeficitsResult = {
       deficits: [{
         item: 'BEARING-01',
         item_name: 'Подшипник',
@@ -573,7 +525,8 @@ describe('DbrFeederPage characterization', () => {
         nearest_due: '2026-07-22',
       }],
       kpis: { deficit_materials: 1, queue_open: 2, stock_source: 'selected - ignored' },
-    })
+    }
+    vi.mocked(getDbrFeederCockpit).mockResolvedValue({ ...cockpit, signals: [blockedSignal, productionSignal], deficits: blockedDeficits })
     renderPage()
 
     const signalTable = document.querySelector('.dbrSignalTable') as HTMLElement
@@ -581,7 +534,7 @@ describe('DbrFeederPage characterization', () => {
     await user.click(productionRow)
     const detail = await screen.findByRole('complementary', { name: 'Карточка сигнала' })
     expect(within(detail).getByText(`Сигнал #${productionSignal.id}`)).toBeVisible()
-    expect(getDbrFeederSignal).toHaveBeenCalledWith(productionSignal.id)
+    expect(getDbrFeederSignal).not.toHaveBeenCalled()
 
     const deficitTable = document.querySelector('.dbrDeficitTable') as HTMLElement
     await user.click(await within(deficitTable).findByRole('row', { name: /BEARING-01/ }))
@@ -593,7 +546,7 @@ describe('DbrFeederPage characterization', () => {
 
   it('gates chain controls by settings and refreshes from its read-only preview', async () => {
     const user = userEvent.setup()
-    vi.mocked(getDbrSettings).mockResolvedValue({ feeder_chain_enabled: true } as Awaited<ReturnType<typeof getDbrSettings>>)
+    vi.mocked(getDbrFeederCockpit).mockResolvedValue({ ...cockpit, meta: { ...cockpit.meta, chain_enabled: true } })
     vi.mocked(previewDbrFeederChain).mockResolvedValue({
       enabled: true,
       open_signals: 4,
@@ -620,13 +573,12 @@ describe('DbrFeederPage characterization', () => {
     await user.click(within(dialog).getByRole('button', { name: 'Цепочка: обновить' }))
     expect(await screen.findByText(/Цепочка обновлена: создано 2, обновлено 1/)).toBeVisible()
     expect(refreshDbrFeederChain).toHaveBeenCalledOnce()
-    expect(listDbrFeederSignals).toHaveBeenCalledTimes(2)
-    expect(getDbrFeederDeficits).toHaveBeenCalledTimes(2)
+    expect(getDbrFeederCockpit).toHaveBeenCalledTimes(2)
   })
 
   it('separates exact contractor stock and keeps processing actions read-only', async () => {
     const user = userEvent.setup()
-    vi.mocked(getDbrProcessingBoard).mockResolvedValue({
+    vi.mocked(getDbrFeederCockpit).mockResolvedValue({ ...cockpit, processing_board: {
       roundtrip_limit_days: 14,
       positions_total: 1,
       overdue_positions: 0,
@@ -645,7 +597,7 @@ describe('DbrFeederPage characterization', () => {
         missing_reasons: [], open_orders: [], has_overdue: false,
         roundtrip_kpi: { semantics: 'proxy', eligible_rows: 1, completed_rows: 1, completed_orders: 1, completed_qty: 5, weighted_avg_days: 6, max_days: 6, within_roundtrip_rows: 1, within_roundtrip_qty: 5, invalid_date_rows: 0 },
       }],
-    })
+    } })
     vi.mocked(previewDbrProcessingChain).mockResolvedValue({
       read_only: true, processing_open_signals: 1, netted_signals: 1, desired_children: 1,
       distinct_components: 1, parents_with_children: 1, unresolved_count: 0, unresolved: [],
@@ -672,70 +624,33 @@ describe('DbrFeederPage characterization', () => {
     expect(screen.getByText(/Запись в 1С отключена до demo-smoke/)).toBeVisible()
   })
 
-  it('keeps the latest positions filter when an older request resolves last', async () => {
+  it('filters positions locally without loading a new generation', async () => {
     const user = userEvent.setup()
-    const stale = deferred<DbrFeederPosition[]>()
-    const latest = deferred<DbrFeederPosition[]>()
-    const stalePosition = { ...position, id: 11, item_code: 'STALE-01', item_name: 'Старый результат' }
-    const latestPosition = { ...position, id: 12, item_code: 'LATEST-02', item_name: 'Новый результат' }
-    vi.mocked(listDbrFeederPositions)
-      .mockReset()
-      .mockResolvedValueOnce([position])
-      .mockImplementation((params) => params?.search === 'старый' ? stale.promise : latest.promise)
     renderPage()
 
     const positionsTable = document.querySelector('.dbrFeederTable') as HTMLElement
-    expect(await within(positionsTable).findByText('PUMP-01')).toBeVisible()
+    expect((await within(positionsTable).findAllByText('PUMP-01'))[0]).toBeVisible()
     const search = screen.getByPlaceholderText('Код или наименование')
-    await user.clear(search)
-    await user.type(search, 'старый{Enter}')
-    await user.clear(search)
-    await user.type(search, 'новый{Enter}')
-    await waitFor(() => expect(listDbrFeederPositions).toHaveBeenCalledTimes(3))
-
-    await act(async () => {
-      latest.resolve([latestPosition])
-      await latest.promise
-    })
-    expect(await within(positionsTable).findByText('LATEST-02')).toBeVisible()
-
-    await act(async () => {
-      stale.resolve([stalePosition])
-      await stale.promise
-    })
-    expect(within(positionsTable).getByText('LATEST-02')).toBeVisible()
-    expect(within(positionsTable).queryByText('STALE-01')).not.toBeInTheDocument()
+    await user.type(search, 'нет{Enter}')
+    expect(within(positionsTable).queryByText('PUMP-01')).not.toBeInTheDocument()
+    expect(getDbrFeederCockpit).toHaveBeenCalledOnce()
   })
 
-  it('keeps the latest selected signal when an older detail request resolves last', async () => {
-    const stale = deferred<DbrFeederSignal>()
-    const latest = deferred<DbrFeederSignal>()
-    vi.mocked(getDbrFeederSignal)
-      .mockReset()
-      .mockImplementation((id) => id === purchaseSignal.id ? stale.promise : latest.promise)
+  it('opens signal details from the same cockpit without an extra GET', async () => {
     renderPage()
 
     const signalTable = document.querySelector('.dbrSignalTable') as HTMLElement
-    const staleRow = await within(signalTable).findByRole('row', { name: /PUMP-01/ })
-    const latestRow = within(signalTable).getByRole('row', { name: /GEAR-01/ })
-    fireEvent.click(staleRow)
-    fireEvent.click(latestRow)
-    expect(vi.mocked(getDbrFeederSignal).mock.calls.map(([id]) => id)).toEqual([
-      purchaseSignal.id,
-      productionSignal.id,
-    ])
-
-    await act(async () => {
-      latest.resolve(productionSignal)
-      await latest.promise
-    })
+    fireEvent.click(await within(signalTable).findByRole('row', { name: /GEAR-01/ }))
     expect(await screen.findByText(`Сигнал #${productionSignal.id}`)).toBeVisible()
+    expect(getDbrFeederSignal).not.toHaveBeenCalled()
+    expect(getDbrFeederCockpit).toHaveBeenCalledOnce()
+  })
 
-    await act(async () => {
-      stale.resolve(purchaseSignal)
-      await stale.promise
-    })
-    expect(screen.getByText(`Сигнал #${productionSignal.id}`)).toBeVisible()
-    expect(screen.queryByText(`Сигнал #${purchaseSignal.id}`)).not.toBeInTheDocument()
+  it('renders structured 503 and unavailable sections without zero facts', async () => {
+    vi.mocked(getDbrFeederCockpit).mockRejectedValueOnce(new ApiError('No cockpit', 503, {
+      code: 'dbr_cockpit_snapshot_unavailable', reason: 'No DBR feeder cockpit snapshot for current accepted Ledger',
+    }))
+    renderPage()
+    expect(await screen.findByText(/dbr_cockpit_snapshot_unavailable/)).toBeVisible()
   })
 })
