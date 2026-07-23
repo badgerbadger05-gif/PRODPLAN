@@ -11,6 +11,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Any, Mapping, Sequence
 
 
@@ -57,7 +58,9 @@ class RegisterRangeScanResult:
 
 
 def _odata_datetime(value: datetime) -> str:
-    return value.replace(microsecond=0).isoformat()
+    if value.tzinfo is not None and value.utcoffset() is not None:
+        value = value.astimezone(ZoneInfo("Europe/Moscow"))
+    return value.replace(tzinfo=None, microsecond=0).isoformat()
 
 
 def _strict_period(value: Any) -> datetime:

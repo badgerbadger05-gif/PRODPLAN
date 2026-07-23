@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -83,6 +83,34 @@ def test_scans_more_than_1000_rows_with_period_ties_and_dedupes_recorders():
     assert all(call[1]["$orderby"] == REGISTER_ORDER_BY for call in client.calls)
     assert result.recorders[0].identity.recorder_ref == "rec-0000"
     assert result.recorders[-1].identity.recorder_ref == "rec-1252"
+
+
+def test_filter_dates_are_converted_to_naive_moscow_time():
+    start = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    end = datetime(2026, 6, 2, tzinfo=timezone.utc)
+
+    class CaptureFilterClient(FakeRangeClient):
+        def __init__(self):
+            super().__init__([])
+            self.filters = []
+
+        def _make_request(self, entity, params):
+            self.filters.append(params["$filter"])
+            return {"value": []}
+
+    client = CaptureFilterClient()
+    scan_historical_register_range(
+        client,
+        from_exclusive=start,
+        to_inclusive=end,
+        window_size=timedelta(days=1),
+    )
+
+    assert len(client.filters) == 1
+    assert client.filters[0] == (
+        "Period gt datetime'2026-06-01T03:00:00' and "
+        "Period le datetime'2026-06-02T03:00:00'"
+    )
 
 
 def test_resume_starts_at_last_completed_window_and_rereads_unfinished_from_zero():
