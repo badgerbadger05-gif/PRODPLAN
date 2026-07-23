@@ -25,13 +25,7 @@ from ..services.production_report_service import (
 from ..services.planning_service import (
     list_planning_runs,
     get_run_summary,
-    get_run_production,
-    get_run_production_grouped,
-    get_run_purchases,
-    get_run_purchases_grouped_by_category,
-    get_run_rework,
-    get_run_rework_grouped,
-    get_run_rework_grouped_by_category,
+    get_run_purchases,  # retained as a test guard; snapshot routes never call it
     get_run_capacity,
     get_run_pegging,
     # retention & pin control
@@ -54,6 +48,10 @@ from ..services.forced_orders import (
 from ..services.mrp_result_snapshot import (
     read_mrp_result_manifest,
     read_mrp_result_rows,
+)
+from ..services.mrp_result_export import (
+    export_purchases_snapshot_groups_xlsx,
+    export_rework_snapshot_groups_xlsx,
 )
 from ..services.one_c_purchase_order_export import export_planned_purchases_to_1c
 from ..services.period_plan_service import (
@@ -116,7 +114,9 @@ def _read_all_mrp_snapshot_rows(
     row_kind: str,
     *,
     snapshot_id: Optional[int],
+    item_id: Optional[int] = None,
     root_item_id: Optional[int] = None,
+    area_id: Optional[int] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
     sort_dir: Optional[str] = None,
@@ -131,7 +131,9 @@ def _read_all_mrp_snapshot_rows(
             run_id=int(run_id),
             row_kind=row_kind,
             snapshot_id=pinned_snapshot_id,
+            item_id=item_id,
             root_item_id=root_item_id,
+            area_id=area_id,
             date_from=date_from,
             date_to=date_to,
             limit=5000,
@@ -163,6 +165,152 @@ def _read_all_mrp_snapshot_rows(
         offset += len(page)
         if not page or offset >= int(result.get("total") or 0):
             return rows, int(pinned_snapshot_id)
+
+
+def _page_groups(
+    groups: list[dict[str, Any]],
+    *,
+    limit: int,
+    offset: int,
+    identity: dict[str, Any],
+) -> dict[str, Any]:
+    effective_limit = max(1, min(int(limit or 100), 5000))
+    effective_offset = max(0, int(offset or 0))
+    return {
+        "groups": groups[effective_offset : effective_offset + effective_limit],
+        "total_groups": len(groups),
+        "total_orders": sum(len(group.get("orders") or []) for group in groups),
+        "limit": effective_limit,
+        "offset": effective_offset,
+        **identity,
+    }
+
+
+def _mrp_snapshot_identity(
+    db: Session, run_id: int, snapshot_id: int
+) -> dict[str, Any]:
+    manifest = read_mrp_result_manifest(
+        db=db, run_id=int(run_id), snapshot_id=int(snapshot_id)
+    )
+    if manifest.get("snapshot_id") is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "mrp_result_snapshot_required",
+                "run_id": int(run_id),
+                "truth_status": manifest.get("truth_status") or "unavailable",
+                "truth_reason": manifest.get("truth_reason"),
+            },
+        )
+    if int(manifest["snapshot_id"]) != int(snapshot_id):
+        raise HTTPException(
+            status_code=409, detail={"code": "mrp_result_snapshot_changed"}
+        )
+    return {
+        "snapshot_id": int(manifest["snapshot_id"]),
+        "ledger_generation": int(manifest["ledger_generation"]),
+        "cutoff": str(manifest["cutoff"]),
+        "truth_status": str(manifest["truth_status"]),
+        "truth_reason": manifest.get("truth_reason"),
+    }
+
+
+def _category_groups_from_snapshot(
+    rows: list[dict[str, Any]], *, rework: bool
+) -> list[dict[str, Any]]:
+    groups: dict[Optional[int], dict[str, Any]] = {}
+    for source in rows:
+        row = dict(source)
+        group_id = row.get("category_id")
+        if group_id is not None:
+            group_id = int(group_id)
+        group_name = (row.get("category_name") or "").strip()
+        if not group_name:
+            group_name = "Без товарной группы"
+        group = groups.setdefault(
+            group_id,
+            {
+                "group_id": group_id,
+                "group_name": group_name,
+                "orders": [],
+                "sum_qty": 0.0,
+                **(
+                    {
+                        "sum_requested_qty": 0.0,
+                        "sum_planned_qty": 0.0,
+                        "blocked_orders": 0,
+                        "partial_orders": 0,
+                    }
+                    if rework
+                    else {}
+                ),
+            },
+        )
+        group["orders"].append(row)
+        group["sum_qty"] += float(row.get("qty") or 0)
+        if rework:
+            group["sum_requested_qty"] += float(row.get("requested_qty") or 0)
+            group["sum_planned_qty"] += float(row.get("planned_qty") or 0)
+            group["blocked_orders"] += int(bool(row.get("component_blocked")))
+            group["partial_orders"] += int(bool(row.get("component_partial")))
+    return sorted(
+        groups.values(),
+        key=lambda group: (
+            1 if group.get("group_id") is None else 0,
+            (group.get("group_name") or "").lower(),
+        ),
+    )
+
+
+def _production_groups_from_snapshot(
+    rows: list[dict[str, Any]],
+    capacity_rows: list[dict[str, Any]],
+    *,
+    area_id: Optional[int] = None,
+) -> list[dict[str, Any]]:
+    groups: dict[Optional[int], dict[str, Any]] = {}
+    for source in rows:
+        row = dict(source)
+        stages = list(row.get("stages") or [])
+        main = max(stages, key=lambda stage: float(stage.get("hours") or 0), default={})
+        main_area_id = main.get("area_id")
+        if main_area_id is not None:
+            main_area_id = int(main_area_id)
+        if area_id is not None and main_area_id != int(area_id):
+            continue
+        area_name = (main.get("area_name") or "").strip() or "Без участка"
+        group = groups.setdefault(
+            main_area_id,
+            {
+                "area_id": main_area_id,
+                "area_name": area_name,
+                "orders": [],
+                "norm_sum_hours": 0.0,
+                "min_days_to_need": None,
+                "cap_overload_hours": 0.0,
+                "cap_overloaded_buckets": 0,
+            },
+        )
+        row.setdefault(
+            "agg_key", f"{int(row.get('item_id') or 0)}|{row.get('unit') or ''}"
+        )
+        row.setdefault("order_id", None)
+        group["orders"].append(row)
+        group["norm_sum_hours"] += float(row.get("norm_hours_total") or 0)
+
+    for capacity in capacity_rows:
+        capacity_area = capacity.get("area_id")
+        if capacity_area is None:
+            continue
+        group = groups.get(int(capacity_area))
+        if group is None:
+            continue
+        overload = float(capacity.get("overload_hours") or 0)
+        group["cap_overload_hours"] += overload
+        group["cap_overloaded_buckets"] += int(overload > 1e-9)
+    return sorted(
+        groups.values(), key=lambda group: (group.get("area_name") or "").lower()
+    )
 
 
 def _xlsx_from_rows(
@@ -897,21 +1045,33 @@ async def get_planning_result_production_grouped(
     sort_dir: Optional[str] = None,
     db: Session = Depends(get_db)
 ):
-    """Группированная по участкам выдача производственных заказов"""
-    _reject_legacy_mrp_result_read(run_id)
+    """Группировка сохранённых производственных обязательств по участкам."""
     try:
-        return get_run_production_grouped(
-            db=db,
-            run_id=int(run_id),
+        rows, snapshot_id = _read_all_mrp_snapshot_rows(
+            db, int(run_id), "production",
+            snapshot_id=None,
             item_id=item_id,
             date_from=date_from,
             date_to=date_to,
-            area_id=area_id,
-            limit=limit,
-            offset=offset,
-            sort_by=sort_by,
             sort_dir=sort_dir,
         )
+        capacity_rows, _ = _read_all_mrp_snapshot_rows(
+            db, int(run_id), "capacity",
+            snapshot_id=snapshot_id,
+            date_from=date_from,
+            date_to=date_to,
+        )
+        groups = _production_groups_from_snapshot(
+            rows, capacity_rows, area_id=area_id
+        )
+        return _page_groups(
+            groups,
+            limit=limit,
+            offset=offset,
+            identity=_mrp_snapshot_identity(db, int(run_id), snapshot_id),
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -959,24 +1119,14 @@ async def get_planning_result_purchases_grouped(
     offset: int = 0,
     db: Session = Depends(get_db),
 ):
-    """Агрегированная выдача закупок по item_id+unit (для верхней таблицы UI)."""
-    _reject_legacy_mrp_result_read(run_id)
+    """Агрегированная выдача закупок из принятого снимка."""
     try:
-        # Используем существующую агрегацию/денормализацию из сервиса.
-        # Берём большой лимит, затем режем пагинацией на уровне роутера.
-        res = get_run_purchases(
-            db=db,
-            run_id=int(run_id),
-            item_id=None,
-            bucket_type=None,
+        base_rows, snapshot_id = _read_all_mrp_snapshot_rows(
+            db, int(run_id), "purchase",
+            snapshot_id=None,
             date_from=date_from,
             date_to=date_to,
-            limit=100000,
-            offset=0,
-            sort_by="item_name",
-            sort_dir="asc",
         )
-        base_rows = (res or {}).get("rows", []) or []
 
         mapped = []
         for r in base_rows:
@@ -1000,7 +1150,15 @@ async def get_planning_result_purchases_grouped(
         eff_limit = max(1, min(int(limit or 1000), 5000))
         eff_offset = max(0, int(offset or 0))
         page = mapped[eff_offset : eff_offset + eff_limit]
-        return {"rows": page, "total": total, "limit": eff_limit, "offset": eff_offset}
+        return {
+            "rows": page,
+            "total": total,
+            "limit": eff_limit,
+            "offset": eff_offset,
+            **_mrp_snapshot_identity(db, int(run_id), snapshot_id),
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1051,20 +1209,36 @@ async def get_planning_result_rework_grouped(
     sort_dir: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
-    """Группированная выдача заказов на переработку."""
-    _reject_legacy_mrp_result_read(run_id)
+    """Группированная выдача переработки из принятого снимка."""
     try:
-        return get_run_rework_grouped(
-            db=db,
-            run_id=int(run_id),
+        rows, snapshot_id = _read_all_mrp_snapshot_rows(
+            db, int(run_id), "rework",
+            snapshot_id=None,
             item_id=item_id,
             date_from=date_from,
             date_to=date_to,
-            limit=limit,
-            offset=offset,
-            sort_by=sort_by,
             sort_dir=sort_dir,
         )
+        groups = []
+        if rows:
+            groups = [{
+                "group_id": None,
+                "group_name": "Без товарной группы",
+                "orders": rows,
+                "sum_qty": sum(float(row.get("qty") or 0) for row in rows),
+                "sum_requested_qty": sum(float(row.get("requested_qty") or 0) for row in rows),
+                "sum_planned_qty": sum(float(row.get("planned_qty") or 0) for row in rows),
+                "blocked_orders": sum(int(bool(row.get("component_blocked"))) for row in rows),
+                "partial_orders": sum(int(bool(row.get("component_partial"))) for row in rows),
+            }]
+        return _page_groups(
+            groups,
+            limit=limit,
+            offset=offset,
+            identity=_mrp_snapshot_identity(db, int(run_id), snapshot_id),
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1081,20 +1255,24 @@ async def get_planning_result_purchases_grouped_by_category(
     sort_dir: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
-    """Группированная выдача закупок по товарным группам."""
-    _reject_legacy_mrp_result_read(run_id)
+    """Закупки по сохранённой в снимке товарной группе."""
     try:
-        return get_run_purchases_grouped_by_category(
-            db=db,
-            run_id=int(run_id),
+        rows, snapshot_id = _read_all_mrp_snapshot_rows(
+            db, int(run_id), "purchase",
+            snapshot_id=None,
             item_id=item_id,
             date_from=date_from,
             date_to=date_to,
-            limit=limit,
-            offset=offset,
-            sort_by=sort_by,
             sort_dir=sort_dir,
         )
+        return _page_groups(
+            _category_groups_from_snapshot(rows, rework=False),
+            limit=limit,
+            offset=offset,
+            identity=_mrp_snapshot_identity(db, int(run_id), snapshot_id),
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1111,20 +1289,24 @@ async def get_planning_result_rework_grouped_by_category(
     sort_dir: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
-    """Группированная выдача заказов на переработку по товарным группам."""
-    _reject_legacy_mrp_result_read(run_id)
+    """Переработка по сохранённой в снимке товарной группе."""
     try:
-        return get_run_rework_grouped_by_category(
-            db=db,
-            run_id=int(run_id),
+        rows, snapshot_id = _read_all_mrp_snapshot_rows(
+            db, int(run_id), "rework",
+            snapshot_id=None,
             item_id=item_id,
             date_from=date_from,
             date_to=date_to,
-            limit=limit,
-            offset=offset,
-            sort_by=sort_by,
             sort_dir=sort_dir,
         )
+        return _page_groups(
+            _category_groups_from_snapshot(rows, rework=True),
+            limit=limit,
+            offset=offset,
+            identity=_mrp_snapshot_identity(db, int(run_id), snapshot_id),
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1355,8 +1537,15 @@ async def export_planning_result_production(
             )
 
         if (format or "csv").lower() == "xlsx":
-            # Grouped legacy projections are intentionally not consulted.
-            groups = []
+            capacity_rows, _ = _read_all_mrp_snapshot_rows(
+                db,
+                int(run_id),
+                "capacity",
+                snapshot_id=resolved_snapshot_id,
+                date_from=date_from,
+                date_to=date_to,
+            )
+            groups = _production_groups_from_snapshot(rows, capacity_rows)
 
             import io, base64
             try:
@@ -1524,10 +1713,10 @@ async def export_planning_result_purchases(
             ])
 
         if (format or "csv").lower() == "xlsx":
-            result = _xlsx_from_rows(
-                headers=headers,
-                data_rows=data_rows,
-                filename=f"mrp_purchases_run_{run_id}.xlsx",
+            groups = _category_groups_from_snapshot(rows, rework=False)
+            result = export_purchases_snapshot_groups_xlsx(
+                run_id=int(run_id),
+                groups=groups,
             )
             result["snapshot_id"] = resolved_snapshot_id
             return result
@@ -1725,10 +1914,10 @@ async def export_planning_result_rework(
             ])
 
         if (format or "csv").lower() == "xlsx":
-            result = _xlsx_from_rows(
-                headers=headers,
-                data_rows=data_rows,
-                filename=f"mrp_rework_run_{run_id}.xlsx",
+            groups = _category_groups_from_snapshot(rows, rework=True)
+            result = export_rework_snapshot_groups_xlsx(
+                run_id=int(run_id),
+                groups=groups,
             )
             result["snapshot_id"] = resolved_snapshot_id
             return result

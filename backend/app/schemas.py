@@ -522,6 +522,11 @@ class ProductionGroup(BaseModel):
 
 
 class ProductionGroupedResponse(BaseModel):
+    snapshot_id: int
+    ledger_generation: int
+    cutoff: str
+    truth_status: str
+    truth_reason: Optional[str] = None
     groups: List[ProductionGroup]
     total_groups: int
     total_orders: int
@@ -565,6 +570,11 @@ class ReworkGroup(BaseModel):
 
 
 class ReworkGroupedResponse(BaseModel):
+    snapshot_id: int
+    ledger_generation: int
+    cutoff: str
+    truth_status: str
+    truth_reason: Optional[str] = None
     groups: List[ReworkGroup]
     total_groups: int
     total_orders: int
@@ -608,6 +618,11 @@ class PurchaseCategoryGroup(BaseModel):
 
 
 class PurchaseCategoryGroupedResponse(BaseModel):
+    snapshot_id: int
+    ledger_generation: int
+    cutoff: str
+    truth_status: str
+    truth_reason: Optional[str] = None
     groups: List[PurchaseCategoryGroup]
     total_groups: int
     total_orders: int

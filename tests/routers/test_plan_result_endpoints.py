@@ -1,6 +1,7 @@
 import base64
 import datetime
 import io
+from datetime import timezone
 
 import pytest
 from fastapi import FastAPI
@@ -12,22 +13,58 @@ from app.models import (
     CapacityLoad,
     Item,
     ItemCategory,
+    LedgerGeneration,
+    PhysicalImportBatch,
     PlannedOrder,
     PlannedOrderStage,
     PlannedPurchase,
     PlannedRework,
     PlanningRun,
+    PlanningReadSnapshot,
+    PlanningTruthState,
     ProductionResource,
     ProductionStage,
     Specification,
     Unit,
 )
 from app.routers.plan import router as plan_router
+from app.services.mrp_result_snapshot import build_mrp_result_snapshot
 
 
 def _mk_run(db) -> PlanningRun:
+    cutoff = datetime.datetime(2025, 1, 1, tzinfo=timezone.utc)
+    physical = PhysicalImportBatch(
+        batch_key="plan-result-endpoints-physical",
+        status="completed",
+        cutoff=cutoff,
+        source_watermarks={},
+        completed_at=cutoff,
+    )
+    db.add(physical)
+    db.flush()
+    generation = LedgerGeneration(
+        generation_key="plan-result-endpoints-accepted",
+        status="accepted",
+        cutoff=cutoff,
+        accepted_at=cutoff,
+        capabilities={
+            "execution_allocations": True,
+            "planning_snapshots": True,
+        },
+        source_watermarks={},
+        physical_import_batch_id=physical.id,
+        algorithm_version="tests/1",
+    )
+    db.add(generation)
+    db.flush()
+    # SQLite normalizes timezone-aware DateTime values on round-trip; bind the
+    # fixed run to that exact persisted cutoff rather than the Python input.
+    db.expire(generation, ["cutoff"])
+    persisted_cutoff = generation.cutoff
+    db.add(PlanningTruthState(id=1, current_generation_id=generation.id))
+
     run = PlanningRun(
-        status="SUCCESS",
+        status="FIXED_SNAPSHOT",
         started_by="test",
         horizon_days=10,
         pinned=False,
@@ -35,12 +72,21 @@ def _mk_run(db) -> PlanningRun:
         config_snapshot={},
         warnings=[],
         kpi={},
-        started_at=datetime.datetime.utcnow(),
-        finished_at=datetime.datetime.utcnow(),
+        started_at=datetime.datetime.now(timezone.utc),
+        finished_at=datetime.datetime.now(timezone.utc),
+        ledger_generation_id=generation.id,
+        ledger_cutoff=persisted_cutoff,
+        active_freeze_version=1,
     )
     db.add(run)
     db.flush()
     return run
+
+
+def _publish_result_snapshot(db, run: PlanningRun) -> PlanningReadSnapshot:
+    """Build the immutable payload explicitly; HTTP GETs only read it."""
+    db.flush()
+    return build_mrp_result_snapshot(db, run.run_id)
 
 
 @pytest.fixture()
@@ -97,8 +143,10 @@ def test_rework_list_endpoint_returns_rows_with_shortage_fields(client, db_sessi
             component_blocked=False,
             component_partial=True,
             shortage={"planned_qty": 5.0, "component_limit": 5.0},
+            ledger_generation_id=run.ledger_generation_id,
         )
     )
+    snapshot = _publish_result_snapshot(db, run)
     db.commit()
 
     response = client.get(f"/api/v1/plan/results/{run.run_id}/rework")
@@ -176,6 +224,7 @@ def test_grouped_by_category_endpoints_return_group_sums_and_flags(client, db_se
                 lead_time_days=5,
                 bucket_date=datetime.date(2025, 1, 10),
                 supplier_ref1c="supp-api-1",
+                ledger_generation_id=run.ledger_generation_id,
             ),
             PlannedPurchase(
                 run_id=run.run_id,
@@ -188,6 +237,7 @@ def test_grouped_by_category_endpoints_return_group_sums_and_flags(client, db_se
                 lead_time_days=5,
                 bucket_date=datetime.date(2025, 1, 11),
                 supplier_ref1c=None,
+                ledger_generation_id=run.ledger_generation_id,
             ),
             PlannedRework(
                 run_id=run.run_id,
@@ -204,6 +254,7 @@ def test_grouped_by_category_endpoints_return_group_sums_and_flags(client, db_se
                 component_blocked=False,
                 component_partial=False,
                 shortage={"planned_qty": 5},
+                ledger_generation_id=run.ledger_generation_id,
             ),
             PlannedRework(
                 run_id=run.run_id,
@@ -220,14 +271,19 @@ def test_grouped_by_category_endpoints_return_group_sums_and_flags(client, db_se
                 component_blocked=False,
                 component_partial=True,
                 shortage={"planned_qty": 4},
+                ledger_generation_id=run.ledger_generation_id,
             ),
         ]
     )
+    snapshot = _publish_result_snapshot(db, run)
     db.commit()
 
     purchase_response = client.get(f"/api/v1/plan/results/{run.run_id}/purchases/grouped-by-category")
     assert purchase_response.status_code == 200
     purchase_payload = purchase_response.json()
+    assert purchase_payload["snapshot_id"] == snapshot.id
+    assert purchase_payload["ledger_generation"] == run.ledger_generation_id
+    assert purchase_payload["truth_status"] == "accepted"
     assert purchase_payload["total_groups"] == 2
     assert purchase_payload["total_orders"] == 2
     purchase_groups = {group["group_name"]: group for group in purchase_payload["groups"]}
@@ -239,6 +295,9 @@ def test_grouped_by_category_endpoints_return_group_sums_and_flags(client, db_se
     rework_response = client.get(f"/api/v1/plan/results/{run.run_id}/rework/grouped-by-category")
     assert rework_response.status_code == 200
     rework_payload = rework_response.json()
+    assert rework_payload["snapshot_id"] == snapshot.id
+    assert rework_payload["ledger_generation"] == run.ledger_generation_id
+    assert rework_payload["truth_status"] == "accepted"
     assert rework_payload["total_groups"] == 1
     assert rework_payload["total_orders"] == 2
     group = rework_payload["groups"][0]
@@ -293,6 +352,7 @@ def test_export_endpoints_return_xlsx_payloads(client, db_session):
             lead_time_days=5,
             bucket_date=datetime.date(2025, 1, 10),
             supplier_ref1c="supp-exp-api",
+            ledger_generation_id=run.ledger_generation_id,
         )
     )
     db.add(
@@ -311,8 +371,10 @@ def test_export_endpoints_return_xlsx_payloads(client, db_session):
             component_blocked=False,
             component_partial=True,
             shortage={"planned_qty": 4},
+            ledger_generation_id=run.ledger_generation_id,
         )
     )
+    snapshot = _publish_result_snapshot(db, run)
     db.commit()
 
     purchase_response = client.get(f"/api/v1/plan/results/{run.run_id}/purchases/export?format=xlsx")
@@ -379,6 +441,7 @@ def test_production_result_endpoints_keep_grouping_flags_and_export_contract(cli
         bucket_date=datetime.date(2025, 1, 8),
         demand_ref="demand-api-prod",
         demand_date=datetime.date(2025, 1, 10),
+        ledger_generation_id=run.ledger_generation_id,
     )
     db.add(order)
     db.flush()
@@ -403,6 +466,7 @@ def test_production_result_endpoints_keep_grouping_flags_and_export_contract(cli
             overload_hours=4,
         )
     )
+    snapshot = _publish_result_snapshot(db, run)
     db.commit()
 
     production_response = client.get(f"/api/v1/plan/results/{run.run_id}/production")
@@ -423,6 +487,9 @@ def test_production_result_endpoints_keep_grouping_flags_and_export_contract(cli
     grouped_response = client.get(f"/api/v1/plan/results/{run.run_id}/production/grouped")
     assert grouped_response.status_code == 200
     grouped_payload = grouped_response.json()
+    assert grouped_payload["snapshot_id"] == snapshot.id
+    assert grouped_payload["ledger_generation"] == run.ledger_generation_id
+    assert grouped_payload["truth_status"] == "accepted"
     assert grouped_payload["total_groups"] == 1
     assert grouped_payload["total_orders"] == 1
     group = grouped_payload["groups"][0]
@@ -445,3 +512,28 @@ def test_production_result_endpoints_keep_grouping_flags_and_export_contract(cli
     assert ws["A3"].value == "Production API 1"
     assert ws["C3"].value == 6
     assert ws["D3"].value == 12
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "production/grouped",
+        "purchases/grouped",
+        "purchases/grouped-by-category",
+        "rework/grouped",
+        "rework/grouped-by-category",
+        "production/export?format=xlsx",
+        "purchases/export?format=xlsx",
+        "rework/export?format=xlsx",
+    ],
+)
+def test_grouped_and_export_endpoints_fail_closed_without_persisted_snapshot(
+    path, client, db_session
+):
+    run = _mk_run(db_session)
+    db_session.commit()
+
+    response = client.get(f"/api/v1/plan/results/{run.run_id}/{path}")
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "mrp_result_snapshot_required"

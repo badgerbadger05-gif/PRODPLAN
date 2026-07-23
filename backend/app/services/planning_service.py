@@ -1869,6 +1869,19 @@ def get_run_rework(
         date_from=date_from,
         date_to=date_to,
     )
+    # Category identity is part of the immutable result payload.  Grouped
+    # readers must not join mutable Item metadata when the HTTP request opens.
+    category_by_item = _load_item_category_meta(
+        db,
+        [int(row["item_id"]) for row in data if row.get("item_id") is not None],
+    )
+    for row in data:
+        category = category_by_item.get(int(row.get("item_id") or 0), {})
+        row["category_id"] = category.get("group_id")
+        row["category_name"] = (
+            category.get("group_name") or "Без товарной группы"
+        )
+        row["category_ref1c"] = category.get("group_ref1c")
 
     sort_map = {
         "item_name": lambda x: (x.get("item_name") or "").lower(),

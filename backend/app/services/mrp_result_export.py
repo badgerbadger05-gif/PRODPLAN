@@ -155,6 +155,21 @@ def export_purchases_results_xlsx(
         sort_dir=sort_dir,
     )
     groups = _sort_groups_for_export((grouped or {}).get("groups", []) or [])
+    return export_purchases_snapshot_groups_xlsx(
+        run_id=int(run_id),
+        groups=groups,
+        total_groups=int((grouped or {}).get("total_groups", 0) or 0),
+    )
+
+
+def export_purchases_snapshot_groups_xlsx(
+    *,
+    run_id: int,
+    groups: List[Dict[str, Any]],
+    total_groups: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Render already persisted snapshot payloads; performs no DB reads."""
+    groups = _sort_groups_for_export(groups)
 
     headers = [
         "Наименование",
@@ -198,7 +213,7 @@ def export_purchases_results_xlsx(
         "data_base64": data_base64,
         "filename": f"mrp_purchases_run_{int(run_id)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
         "total_rows": int(total_rows),
-        "total_groups": int((grouped or {}).get("total_groups", 0) or 0),
+        "total_groups": int(len(groups) if total_groups is None else total_groups),
     }
 
 
@@ -224,6 +239,21 @@ def export_rework_results_xlsx(
         sort_dir=sort_dir,
     )
     groups = _sort_groups_for_export((grouped or {}).get("groups", []) or [])
+    return export_rework_snapshot_groups_xlsx(
+        run_id=int(run_id),
+        groups=groups,
+        total_groups=int((grouped or {}).get("total_groups", 0) or 0),
+    )
+
+
+def export_rework_snapshot_groups_xlsx(
+    *,
+    run_id: int,
+    groups: List[Dict[str, Any]],
+    total_groups: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Render already persisted snapshot payloads; performs no DB reads."""
+    groups = _sort_groups_for_export(groups)
 
     headers = [
         "Наименование",
@@ -269,5 +299,5 @@ def export_rework_results_xlsx(
         "data_base64": data_base64,
         "filename": f"mrp_rework_run_{int(run_id)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
         "total_rows": int(total_rows),
-        "total_groups": int((grouped or {}).get("total_groups", 0) or 0),
+        "total_groups": int(len(groups) if total_groups is None else total_groups),
     }
