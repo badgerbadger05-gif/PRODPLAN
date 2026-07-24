@@ -100,22 +100,25 @@ def _require_target(
 
 
 def _current_parents(db: Session, parent_generation_id: int) -> list[models.PlanningRun]:
+    parent_generation_id = int(parent_generation_id)
     rows = db.query(models.PlanningRun).filter(
         models.PlanningRun.status == "FIXED_SNAPSHOT",
         models.PlanningRun.source_plan_id.isnot(None),
     ).order_by(models.PlanningRun.source_plan_id, models.PlanningRun.run_id).all()
     seen: set[int] = set()
+    selected: list[models.PlanningRun] = []
     for row in rows:
         plan_id = int(row.source_plan_id)
         resolved_generation = _resolve_parent_generation_id(db, row)
-        if resolved_generation != int(parent_generation_id):
+        if resolved_generation != parent_generation_id:
             continue
         if plan_id in seen:
             raise ObligationRefreshManifestError(
                 f"current generation has multiple FIXED_SNAPSHOT runs for plan {plan_id}"
             )
         seen.add(plan_id)
-    return rows
+        selected.append(row)
+    return selected
 
 
 def _payload(

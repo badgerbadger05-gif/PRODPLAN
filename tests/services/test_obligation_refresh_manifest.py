@@ -7,6 +7,7 @@ from app.services.obligation_refresh_manifest import (
     MANIFEST_HASH_KEY,
     MANIFEST_KEY,
     ObligationRefreshManifestError,
+    _current_parents,
     create_obligation_refresh_manifest,
 )
 
@@ -192,3 +193,71 @@ def test_manifest_retry_rejects_tampered_candidate_set(db_session):
         ObligationRefreshManifestError, match="candidate lineage conflicts"
     ):
         _create(db_session, accepted, target)
+
+
+def test_manifest_ignores_fixed_snapshot_runs_from_other_generation(db_session):
+    accepted, target, parents = _fixture(db_session, plans=2)
+    other = _generation(
+        db_session, "other-manifest-generation", "accepted", accepted.cutoff,
+        {"other_generation": True},
+        physical=accepted.physical_import_batch,
+    )
+    for index in range(3):
+        foreign_plan = models.ProductionPlanHeader(
+            name=f"foreign plan {index}", period_from=date(2026, 6, 1),
+            period_to=date(2026, 6, 30), status="fixed",
+        )
+        db_session.add(foreign_plan)
+        db_session.flush()
+        db_session.add(models.PlanningRun(
+            status="FIXED_SNAPSHOT", ledger_generation_id=other.id,
+            source_plan_id=foreign_plan.id, period_from=foreign_plan.period_from,
+            period_to=foreign_plan.period_to, horizon_days=30, config_snapshot={"parent": "other"},
+            fixed_at=accepted.cutoff, finished_at=accepted.cutoff,
+        ))
+    db_session.flush()
+
+    result = _create(db_session, accepted, target)
+    assert [(row["action"], row["plan_id"], row["parent_run_id"]) for row in result.entries] == [
+        ("refresh", parents[0][0].id, parents[0][1].run_id),
+        ("refresh", parents[1][0].id, parents[1][1].run_id),
+    ]
+
+
+def test_current_parent_duplicate_detection_applies_only_to_selected_lineage(db_session):
+    accepted, _target, parents = _fixture(db_session, plans=1)
+    other = _generation(
+        db_session, "other-duplicate-check-generation", "accepted", accepted.cutoff,
+        {"other_generation": True},
+        physical=accepted.physical_import_batch,
+    )
+    duplicate_plan = parents[0][0]
+    db_session.add(models.PlanningRun(
+        status="FIXED_SNAPSHOT", ledger_generation_id=other.id,
+        source_plan_id=duplicate_plan.id, period_from=duplicate_plan.period_from,
+        period_to=duplicate_plan.period_to, horizon_days=30, config_snapshot={"parent": "other"},
+        fixed_at=accepted.cutoff, finished_at=accepted.cutoff,
+    ))
+    db_session.add(models.PlanningRun(
+        status="FIXED_SNAPSHOT", ledger_generation_id=other.id,
+        source_plan_id=duplicate_plan.id, period_from=duplicate_plan.period_from,
+        period_to=duplicate_plan.period_to, horizon_days=30, config_snapshot={"parent": "other-duplicate"},
+        fixed_at=accepted.cutoff, finished_at=accepted.cutoff,
+    ))
+    db_session.flush()
+
+    selected = _current_parents(db_session, accepted.id)
+    assert [int(row.source_plan_id) for row in selected] == [duplicate_plan.id]
+
+    db_session.add(models.PlanningRun(
+        status="FIXED_SNAPSHOT", ledger_generation_id=accepted.id,
+        source_plan_id=duplicate_plan.id, period_from=duplicate_plan.period_from,
+        period_to=duplicate_plan.period_to, horizon_days=30, config_snapshot={"parent": "duplicate-current"},
+        fixed_at=accepted.cutoff, finished_at=accepted.cutoff,
+    ))
+    db_session.flush()
+
+    with pytest.raises(
+        ObligationRefreshManifestError, match="multiple FIXED_SNAPSHOT runs for plan"
+    ):
+        _current_parents(db_session, accepted.id)
