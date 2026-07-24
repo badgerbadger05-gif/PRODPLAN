@@ -460,7 +460,8 @@ def _reject_incompatible_physical_pools(
     incompatible = sorted(
         item_id
         for item_id, keys in pools.items()
-        if len(keys) > 1 or any(characteristic or organization for characteristic, organization in keys)
+        if len(keys) > 1
+        or any(characteristic for characteristic, _ in keys)
     )
     if incompatible:
         raise LedgerPoolUnavailable(

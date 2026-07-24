@@ -452,7 +452,7 @@ def test_build_shared_pools_ignores_ignored_and_unselected_warehouses(db_session
     assert pools.stock[item.item_id] == pytest.approx(10)
 
 
-def test_build_shared_pools_rejects_foreign_org_in_selected_warehouse(db_session):
+def test_build_shared_pools_allows_single_foreign_org_in_selected_warehouse(db_session):
     item = _item(db_session, "SCOPE-BLOCK")
     target = _freeze_candidate_generation(db_session, suffix="block")
     db_session.add(
@@ -466,6 +466,73 @@ def test_build_shared_pools_rejects_foreign_org_in_selected_warehouse(db_session
             item_id=item.item_id,
             characteristic_ref="",
             organization_ref="ORG-FOREIGN",
+            warehouse_ref1c="WH-SELECTED",
+            on_hand=10,
+        )
+    )
+    db_session.flush()
+
+    pools = build_shared_pools(
+        db_session,
+        [],
+        ledger_generation_id=target.id,
+        relevant_item_ids=[item.item_id],
+    )
+
+    assert pools.stock[item.item_id] == pytest.approx(10)
+
+
+def test_build_shared_pools_rejects_two_foreign_orgs_in_selected_warehouse(db_session):
+    item = _item(db_session, "SCOPE-BLOCK-MULTI")
+    target = _freeze_candidate_generation(db_session, suffix="block-multi")
+    db_session.add(
+        models.StockWarehouse(
+            warehouse_ref1c="WH-SELECTED", warehouse_name="Selected", is_selected=True
+        )
+    )
+    db_session.add_all([
+        models.StockBin(
+            ledger_generation_id=target.id,
+            item_id=item.item_id,
+            characteristic_ref="",
+            organization_ref="ORG-A",
+            warehouse_ref1c="WH-SELECTED",
+            on_hand=10,
+        ),
+        models.StockBin(
+            ledger_generation_id=target.id,
+            item_id=item.item_id,
+            characteristic_ref="",
+            organization_ref="ORG-B",
+            warehouse_ref1c="WH-SELECTED",
+            on_hand=5,
+        ),
+    ])
+    db_session.flush()
+
+    with pytest.raises(LedgerPoolUnavailable, match="characteristic/organization physical pools"):
+        build_shared_pools(
+            db_session,
+            [],
+            ledger_generation_id=target.id,
+            relevant_item_ids=[item.item_id],
+        )
+
+
+def test_build_shared_pools_rejects_characteristic_in_selected_warehouse(db_session):
+    item = _item(db_session, "SCOPE-CHAR")
+    target = _freeze_candidate_generation(db_session, suffix="char")
+    db_session.add(
+        models.StockWarehouse(
+            warehouse_ref1c="WH-SELECTED", warehouse_name="Selected", is_selected=True
+        )
+    )
+    db_session.add(
+        models.StockBin(
+            ledger_generation_id=target.id,
+            item_id=item.item_id,
+            characteristic_ref="CHARACTERISTIC",
+            organization_ref="",
             warehouse_ref1c="WH-SELECTED",
             on_hand=10,
         )
