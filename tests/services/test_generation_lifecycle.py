@@ -838,6 +838,54 @@ def test_supplier_candidates_require_explicit_odata_client(db_session):
     assert db_session.get(models.PlanningTruthState, 1) is None
 
 
+def test_internal_transfer_does_not_enter_supplier_evidence_gate(
+    db_session, monkeypatch
+):
+    generation, requirement = _synthetic(db_session, "internal-transfer")
+    for line_no, qty, warehouse, record_type, movement_kind in (
+        ("1", Decimal("-2"), "WH-FROM", "Expense", "transfer_out"),
+        ("2", Decimal("2"), "WH-TO", "Receipt", "transfer_in"),
+    ):
+        db_session.add(models.StockLedgerEntry(
+            ingest_batch_id=generation.physical_import_batch_id,
+            source_content_hash=f"internal-transfer-{line_no}",
+            item_id=requirement.item_id,
+            characteristic_ref="",
+            organization_ref="",
+            warehouse_ref1c=warehouse,
+            qty=qty,
+            posting_at=datetime(2026, 7, 21),
+            record_type=record_type,
+            movement_kind=movement_kind,
+            recorder_type="Document_ПеремещениеЗапасов",
+            recorder_ref="transfer-only",
+            line_no=line_no,
+            ingest_source="test",
+        ))
+    db_session.commit()
+
+    def extraction_must_not_run(*_args, **_kwargs):
+        raise AssertionError("internal transfer entered supplier evidence")
+
+    monkeypatch.setattr(
+        "app.services.item_ledger.generation_lifecycle."
+        "extract_supplier_document_evidence",
+        extraction_must_not_run,
+    )
+
+    result = accept_generation_build(
+        db_session,
+        generation.id,
+        replay_from=datetime(2026, 7, 1),
+    )
+
+    assert result["status"] == "accepted"
+    assert result["supplier_receipt_evidence"] == 0
+    assert db_session.query(
+        models.StockLedgerSupplierReceiptProvenance
+    ).filter_by(ledger_generation_id=generation.id).count() == 0
+
+
 def test_direct_supplier_receipt_is_explicitly_unplanned_but_does_not_block(
     db_session, monkeypatch
 ):

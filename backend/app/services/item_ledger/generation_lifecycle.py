@@ -42,9 +42,7 @@ _SUPPLIER_DOCUMENT_TYPES = frozenset({
     "Document_ПриходнаяНакладная",
     "Document_КорректировкаПоступления",
     "Document_РасходнаяНакладная",
-    "Document_ПеремещениеЗапасов",
 })
-_TRANSFER_DOCUMENT_TYPE = "Document_ПеремещениеЗапасов"
 _SAFE_FACT_MODE = {
     "linked_production": "make",
     "unlinked_production": "make",
@@ -409,10 +407,7 @@ def validate_generation_build(
         raise GenerationValidationError("replay metrics disagree with persisted allocations")
 
     supplier_candidates = _supplier_candidates(db, int(generation.id))
-    supplier_physical_ids = {
-        int(row.id) for row in supplier_candidates
-        if str(row.recorder_type or "") != _TRANSFER_DOCUMENT_TYPE
-    }
+    supplier_physical_ids = {int(row.id) for row in supplier_candidates}
     provenance = db.query(
         models.StockLedgerSupplierReceiptProvenance
     ).filter(
@@ -439,10 +434,7 @@ def validate_generation_build(
         for status in sorted(allowed_supplier_statuses)
     }
     supplier_physical_qty = sum(
-        (
-            _d(row.qty) for row in supplier_candidates
-            if str(row.recorder_type or "") != _TRANSFER_DOCUMENT_TYPE
-        ),
+        (_d(row.qty) for row in supplier_candidates),
         Decimal("0"),
     )
     supplier_unplanned_qty = supplier_physical_qty - supplier_allocated_qty
