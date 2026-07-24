@@ -19,9 +19,11 @@ import {
   periodPlanStatusClass,
   periodPlanStatusLabel,
 } from '../../../domain/planning'
+import type { PurchaseRow } from '../../../domain/purchaseControl'
 import type { NomenclatureSearchItem } from '../../../domain/productionPlan'
 import { dateRu, dateTimeRu, qty } from '../../../lib/format'
 import { ensurePlanItem, searchNomenclature } from '../../../services/productionPlan'
+import { listPurchaseJournal } from '../../../services/purchaseControl'
 import {
   addItemToPeriodPlan,
   reconcileRun,
@@ -84,6 +86,110 @@ const periodPlanJournalColumns = [
   { key: 'work_items', title: 'Заданий', width: 72, minWidth: 72, grow: false, align: 'center', sortable: false, tooltip: 'Число заказов/заданий по строке; клик по строке раскрывает список' },
 ] as const satisfies TableColumnDoctype[]
 
+const PURCHASE_JOURNAL_LIMIT = 500
+
+type PurchaseCoverageMetric = {
+  coveredPct: number
+  toOrderPct: number
+}
+
+function asNonNegativeNumber(value: unknown): number | null {
+  if (typeof value !== 'number' || Number.isNaN(value) || !Number.isFinite(value)) return null
+  if (value < 0) return null
+  return value
+}
+
+function roundPercent(value: number) {
+  const rounded = Math.round(value * 10) / 10
+  return Number.isInteger(rounded) ? rounded : Number(rounded.toFixed(1))
+}
+
+function uniquePurchaseRows(rows: PurchaseRow[]) {
+  const map = new Map<string, PurchaseRow>()
+  for (const row of rows) {
+    if (!map.has(row.row_key)) map.set(row.row_key, row)
+  }
+  return map
+}
+
+function buildLedgerPurchaseMetric(rows: PurchaseRow[]): PurchaseCoverageMetric | null {
+  const unique = uniquePurchaseRows(rows)
+  if (unique.size !== rows.length) return null
+  if (unique.size === 0) return null
+
+  let requiredQty = 0
+  let realizedQty = 0
+  let openOrderCoveredQty = 0
+  let toOrderQty = 0
+
+  const epsilon = 1e-6
+  for (const row of unique.values()) {
+    if (row.fact_source !== 'ledger' || row.fact_status !== 'available') return null
+
+    const required = asNonNegativeNumber(row.required_qty)
+    const realized = asNonNegativeNumber(row.realized_qty)
+    const openOrderCovered = asNonNegativeNumber(row.open_order_covered_qty)
+    const toOrder = asNonNegativeNumber(row.to_order_qty)
+
+    if (required === null || realized === null || openOrderCovered === null || toOrder === null) return null
+    if (Math.abs(required - (realized + openOrderCovered + toOrder)) > epsilon) return null
+
+    requiredQty += required
+    realizedQty += realized
+    openOrderCoveredQty += openOrderCovered
+    toOrderQty += toOrder
+  }
+
+  const coveredPct = requiredQty > 0 ? roundPercent(((realizedQty + openOrderCoveredQty) / requiredQty) * 100) : 100
+  const toOrderPct = requiredQty > 0 ? roundPercent((toOrderQty / requiredQty) * 100) : 0
+  return { coveredPct, toOrderPct }
+}
+
+async function loadLedgerPurchaseCoverage(planPeriodTo: string): Promise<PurchaseCoverageMetric | null> {
+  let offset = 0
+  let total: number | null = null
+  let totalPagesFetched = 0
+  let generation: string | number | null = null
+  const rows: PurchaseRow[] = []
+  const params = new URLSearchParams({
+    limit: String(PURCHASE_JOURNAL_LIMIT),
+    include_to_order: 'true',
+    horizon_period_to: planPeriodTo,
+  })
+
+  do {
+    params.set('offset', String(offset))
+    const data = await listPurchaseJournal(params)
+    if (
+      data.truth_status !== 'accepted'
+      || data.meta?.truth_status !== 'accepted'
+      || data.meta?.fact_source !== 'ledger'
+      || data.meta?.read_only !== true
+      || data.meta?.received_qty_status !== 'available'
+    ) return null
+    const responseGeneration = data.meta?.ledger_generation_id ?? data.meta?.ledger_generation
+    if (responseGeneration == null) return null
+    if (generation == null) generation = responseGeneration
+    else if (String(generation) !== String(responseGeneration)) return null
+
+    const responseTotal = typeof data.total === 'number' ? data.total : null
+    if (responseTotal == null || responseTotal < 0) return null
+    if (total == null) total = responseTotal
+    else if (total !== responseTotal) return null
+
+    if (data.summary?.fact_status !== 'available') return null
+    rows.push(...data.rows)
+
+    totalPagesFetched += data.rows.length
+    if (data.rows.length === 0) break
+    if (typeof data.limit !== 'number' || data.limit <= 0) return null
+    offset += data.limit
+  } while (offset < (total ?? 0))
+
+  if (total === null || totalPagesFetched !== total) return null
+  return buildLedgerPurchaseMetric(rows)
+}
+
 export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   const [plan, setPlan] = useState<PeriodPlan | null>(null)
   const [tab, setTab] = useState<Tab>('matrix')
@@ -101,6 +207,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   const [journalBomLevel, setJournalBomLevel] = useState<string>('')
   const [journalCoverage, setJournalCoverage] = useState<JournalCoverageFilter>('')
   const [journalShowNetZero, setJournalShowNetZero] = useState(false)
+  const [journalPurchaseMetric, setJournalPurchaseMetric] = useState<PurchaseCoverageMetric | null>(null)
   const [journalRootItemId, setJournalRootItemId] = useState<number | null>(null)
   const [journalRootDialogOpen, setJournalRootDialogOpen] = useState(false)
   const [journalSortBy, setJournalSortBy] = useState<JournalSortKey>('bom_level')
@@ -131,6 +238,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
 
   const searchInputRef = useRef<HTMLInputElement | null>(null)
   const searchBlurTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const journalPurchaseMetricRequest = useRef(0)
 
   useEffect(() => () => {
     if (searchBlurTimerRef.current) clearTimeout(searchBlurTimerRef.current)
@@ -175,15 +283,20 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   const loadJournal = useCallback(async (flow = journalFlow, runId?: number, rootItemId = journalRootItemId) => {
     setJournalLoading(true)
     setJournalError('')
+    setJournalPurchaseMetric(null)
+    const metricRequestId = ++journalPurchaseMetricRequest.current
     try {
       const data = await getExecutionJournal(planId, { flow: flow || undefined, run_id: runId, root_item_id: rootItemId })
       setJournal(data)
       setLastRunId(data.run_id)
       if (!selectedRunId) setSelectedRunId(data.run_id)
       setPlan(data.plan)
+      const metric = data.plan?.period_to ? await loadLedgerPurchaseCoverage(data.plan.period_to) : null
+      if (journalPurchaseMetricRequest.current === metricRequestId) setJournalPurchaseMetric(metric)
     } catch (e) {
       setJournalError(e instanceof Error ? e.message : String(e))
       setJournal(null)
+      if (journalPurchaseMetricRequest.current === metricRequestId) setJournalPurchaseMetric(null)
     } finally {
       setJournalLoading(false)
     }
@@ -611,19 +724,44 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   }, [journal])
 
   const journalExecutionByFlow = useMemo(() => {
-    if (!journal || !isPlanningTruthAccepted(journal)) return [] as Array<{ flow: string; label: string; pct: number | null; confirmedPct: number | null; base: number; available: boolean }>
+    const purchaseRowBase = {
+      flow: 'purchase',
+      label: flowLabel('purchase'),
+      pct: journalPurchaseMetric?.coveredPct ?? null,
+      confirmedPct: null,
+      toOrderPct: journalPurchaseMetric?.toOrderPct ?? null,
+      base: 0,
+      available: journalPurchaseMetric !== null,
+    } as const
+    if (!journal) return [] as Array<{
+      flow: string
+      label: string
+      pct: number | null
+      confirmedPct: number | null
+      toOrderPct: number | null
+      base: number
+      available: boolean
+    }>
+    if (!isPlanningTruthAccepted(journal)) {
+      return [purchaseRowBase]
+    }
     const source = journal.summary.execution_by_flow
     if (source) {
-      return ['purchase', 'production', 'rework']
+      const productionAndRework = ['production', 'rework']
         .map((flow) => ({
           flow,
           label: flowLabel(flow),
           pct: source[flow]?.execution_pct ?? null,
           confirmedPct: source[flow]?.confirmed_pct ?? null,
+          toOrderPct: null,
           base: source[flow]?.base_qty ?? 0,
           available: source[flow]?.available !== false,
         }))
-        .filter((row) => row.base > 1e-9 || !row.available)
+      const purchase = {
+        ...purchaseRowBase,
+        base: source.purchase?.base_qty ?? 0,
+      }
+      return [...productionAndRework, purchase].filter((row) => row.base > 1e-9 || row.flow === 'purchase' || !row.available)
     }
     const grouped = new Map<string, { completed: number; base: number }>()
     journal.rows.forEach((row) => {
@@ -633,15 +771,20 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
       entry.base += base
       grouped.set(row.flow, entry)
     })
-    return ['purchase', 'production', 'rework']
+    const productionAndRework = ['production', 'rework']
       .map((flow) => {
         const entry = grouped.get(flow)
         const base = entry?.base ?? 0
         const pct = base > 1e-9 ? Math.round(((entry?.completed ?? 0) / base) * 1000) / 10 : 100
-        return { flow, label: flowLabel(flow), pct, confirmedPct: pct, base, available: true }
+        return { flow, label: flowLabel(flow), pct, confirmedPct: pct, toOrderPct: null, base, available: true }
       })
       .filter((row) => row.base > 1e-9)
-  }, [journal])
+    const purchase = {
+      ...purchaseRowBase,
+      base: journal.rows.some((row) => row.flow === 'purchase') ? 1 : 0,
+    }
+    return [...productionAndRework, purchase].filter((row) => row.base > 1e-9 || row.flow === 'purchase' || !row.available)
+  }, [journal, journalPurchaseMetric])
 
   const journalTruthAccepted = isPlanningTruthAccepted(journal)
   const journalTruthReason = journal?.truth_reason || journal?.reason
@@ -1156,11 +1299,15 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                   )}
                   {journalExecutionByFlow.map((row) => (
                     <span key={row.flow} className="toolbarText">
-                      {row.label}: {row.available && row.pct !== null
-                        ? `${row.pct}%`
-                        : row.confirmedPct !== null
-                          ? `≥${row.confirmedPct}% · часть н/д`
-                          : 'недоступно'}
+                      {row.flow === 'purchase'
+                        ? row.available && row.pct !== null && row.toOrderPct !== null
+                          ? `покрыто ${row.pct}% · к заказу ${row.toOrderPct}%`
+                          : 'недоступно'
+                        : row.available && row.pct !== null
+                          ? `${row.pct}%`
+                          : row.confirmedPct !== null
+                            ? `≥${row.confirmedPct}% · часть н/д`
+                            : 'недоступно'}
                     </span>
                   ))}
                   <button
