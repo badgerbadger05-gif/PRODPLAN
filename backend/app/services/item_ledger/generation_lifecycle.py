@@ -71,6 +71,22 @@ def _parse_iso_datetime(value: Any, field: str) -> datetime:
         raise GenerationValidationError(f"{field} must be ISO timestamp") from exc
 
 
+def _parse_int_id_list(value: Any, field: str) -> set[int]:
+    if value is None:
+        return set()
+    if not isinstance(value, (list, tuple)):
+        raise GenerationValidationError(f"{field} must be a list of integer ids")
+    parsed: set[int] = set()
+    for raw_id in value:
+        try:
+            parsed.add(int(raw_id))
+        except (TypeError, ValueError) as exc:
+            raise GenerationValidationError(
+                f"{field} must contain integer ids"
+            ) from exc
+    return parsed
+
+
 def _validate_historical_bootstrap_watermarks(
     generation: models.LedgerGeneration,
 ) -> None:
@@ -268,9 +284,9 @@ def validate_generation_build(
         raise GenerationValidationError("unexpected historical obligation algorithm")
     if replay_batch.algorithm_version != REPLAY_ALGORITHM_VERSION:
         raise GenerationValidationError("unexpected historical replay algorithm")
-    selected_requirement_ids = {
-        int(value) for value in obligation_metrics.get("selected_requirement_ids", [])
-    }
+    selected_requirement_ids = _parse_int_id_list(
+        obligation_metrics.get("selected_requirement_ids"), "selected_requirement_ids"
+    )
     entries = db.query(models.ReservationEntry).filter(
         models.ReservationEntry.ledger_generation_id == int(generation.id)
     ).all()
@@ -319,6 +335,17 @@ def validate_generation_build(
             )
         ).all()
     } if selected_requirement_ids else {}
+    bucketed_requirement_ids = {int(row.requirement_id) for row in bucket_by_id.values()}
+    make_requirement_ids = {
+        int(entry.requirement_id)
+        for entry in entries
+        if str(entry.realization_mode).lower() == "make"
+    }
+    legacy_unphased_requirement_ids = _parse_int_id_list(
+        obligation_metrics.get("legacy_net_phasing_requirement_ids"),
+        "legacy_net_phasing_requirement_ids",
+    )
+    legacy_unphased_requirement_ids &= make_requirement_ids
     allocation_by_req_mode: dict[tuple[int, str], Decimal] = defaultdict(Decimal)
     bucket_mode_qty: dict[tuple[int, str], Decimal] = defaultdict(Decimal)
     supplier_allocated_qty = Decimal("0")
@@ -357,6 +384,14 @@ def validate_generation_build(
             if bucket is None or int(bucket.requirement_id) != requirement_id:
                 raise GenerationValidationError("allocation bucket escapes requirement")
             bucket_mode_qty[(int(bucket.id), mode)] += qty
+        else:
+            if requirement_id in bucketed_requirement_ids and (
+                mode != "make"
+                or requirement_id not in legacy_unphased_requirement_ids
+            ):
+                raise GenerationValidationError(
+                    "unphased execution allocation requires legacy net-phasing flag"
+                )
     if dict(allocation_by_req_mode) != {
         key: qty for key, qty in realized_by_req_mode.items() if qty != 0
     }:

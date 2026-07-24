@@ -70,6 +70,38 @@ def _replay_lower_bound(
     raise ValueError("historical replay requires explicit replay_from lower bound")
 
 
+def _legacy_unphased_requirement_ids(
+    db: Session, generation_id: int
+) -> set[int]:
+    batch = (
+        db.query(LedgerBuildBatch)
+        .filter(
+            LedgerBuildBatch.ledger_generation_id == generation_id,
+            LedgerBuildBatch.stage == "reservation_materialize",
+            LedgerBuildBatch.status == "completed",
+        )
+        .one_or_none()
+    )
+    if batch is None or not isinstance(batch.metrics, dict):
+        return set()
+    legacy_net_phasing_requirement_ids = batch.metrics.get(
+        "legacy_net_phasing_requirement_ids"
+    )
+    if legacy_net_phasing_requirement_ids is None:
+        return set()
+    if not isinstance(legacy_net_phasing_requirement_ids, (list, tuple)):
+        raise ValueError("legacy reservation batch has malformed legacy_net_phasing_requirement_ids")
+    ids: set[int] = set()
+    for value in legacy_net_phasing_requirement_ids:
+        try:
+            ids.add(int(value))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "legacy reservation batch legacy_net_phasing_requirement_ids must contain integer ids"
+            ) from exc
+    return ids
+
+
 def _identity_for_sle(
     db: Session,
     row: StockLedgerEntry,
@@ -161,6 +193,19 @@ def run_historical_replay(
         .all()
     )
     requirement_ids = [int(row.requirement_id) for row in entries]
+    legacy_unphased_requirement_ids = _legacy_unphased_requirement_ids(
+        db, int(generation.id)
+    )
+    legacy_unphased_requirement_ids = {
+        requirement_id
+        for requirement_id in legacy_unphased_requirement_ids
+        if requirement_id
+        in {
+            int(entry.requirement_id)
+            for entry in entries
+            if str(entry.realization_mode).lower() == "make"
+        }
+    }
     buckets_by_requirement: dict[int, list[MrpRequirementBucket]] = {}
     if requirement_ids:
         for bucket in (
@@ -379,28 +424,31 @@ def run_historical_replay(
             slices: list[tuple[int | None, Decimal]] = []
             left = _decimal(allocation.qty)
             if buckets:
-                for bucket in buckets:
-                    capacity = max(_decimal(bucket.net_qty), Decimal("0"))
-                    used_key = (int(bucket.id), _fact_mode(sle))
-                    take = min(
-                        left,
-                        max(
-                            capacity - bucket_used.get(used_key, Decimal("0")),
-                            Decimal("0"),
-                        ),
-                    )
-                    if take > 0:
-                        slices.append((int(bucket.id), take))
-                        bucket_used[used_key] = (
-                            bucket_used.get(used_key, Decimal("0")) + take
+                if int(entry.requirement_id) in legacy_unphased_requirement_ids:
+                    slices = [(None, left)]
+                else:
+                    for bucket in buckets:
+                        capacity = max(_decimal(bucket.net_qty), Decimal("0"))
+                        used_key = (int(bucket.id), _fact_mode(sle))
+                        take = min(
+                            left,
+                            max(
+                                capacity - bucket_used.get(used_key, Decimal("0")),
+                                Decimal("0"),
+                            ),
                         )
-                        left -= take
-                    if left <= 0:
-                        break
-                if left > 0:
-                    raise ValueError(
-                        f"requirement {entry.requirement_id} bucket capacity is below realization"
-                    )
+                        if take > 0:
+                            slices.append((int(bucket.id), take))
+                            bucket_used[used_key] = (
+                                bucket_used.get(used_key, Decimal("0")) + take
+                            )
+                            left -= take
+                        if left <= 0:
+                            break
+                    if left > 0:
+                        raise ValueError(
+                            f"requirement {entry.requirement_id} bucket capacity is below realization"
+                        )
             else:
                 slices.append((None, left))
         for bucket_id, slice_qty in slices:

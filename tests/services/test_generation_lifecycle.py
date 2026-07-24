@@ -11,6 +11,7 @@ from app.services.item_ledger.generation_lifecycle import (
     GenerationValidationError,
     accept_generation_build,
     OBLIGATION_ALGORITHM_VERSION,
+    materialize_generation_stock_bins,
     validate_generation_build,
     REPLAY_ALGORITHM_VERSION,
 )
@@ -113,12 +114,12 @@ def _bootstrap_gate_watermarks(
     }
 
 
-def _synthetic(db, key: str = "ok"):
+def _synthetic(db, key: str = "ok", replenishment_method: str = "Производство"):
     generation = _generation(db, key)
     item = models.Item(
         item_code=f"ITEM-{key}",
         item_name=key,
-        replenishment_method="Производство",
+        replenishment_method=replenishment_method,
     )
     plan = models.ProductionPlanHeader(
         name=f"Plan {key}",
@@ -183,6 +184,67 @@ def _synthetic(db, key: str = "ok"):
     ))
     db.commit()
     return generation, requirement
+
+
+def _configure_obligation_checkpoint(
+    db_session,
+    generation: models.LedgerGeneration,
+    requirement: models.MrpRequirement,
+    *,
+    allow_unphased: bool,
+    replay_allocated: Decimal | str = "5",
+):
+    _add_checkpoint_stages(db_session, generation)
+    obligation_batch = (
+        db_session.query(models.LedgerBuildBatch)
+        .filter(
+            models.LedgerBuildBatch.ledger_generation_id == generation.id,
+            models.LedgerBuildBatch.stage == "reservation_materialize",
+        )
+        .one()
+    )
+    obligation_batch.metrics = {
+        "selected_requirement_ids": [int(requirement.id)],
+        "legacy_net_phasing_requirement_ids": (
+            [int(requirement.id)] if allow_unphased else []
+        ),
+    }
+    replay_batch = (
+        db_session.query(models.LedgerBuildBatch)
+        .filter(
+            models.LedgerBuildBatch.ledger_generation_id == generation.id,
+            models.LedgerBuildBatch.stage == "reservation_replay",
+        )
+        .one()
+    )
+    replay_batch.metrics = {
+        "fact_qty": str(replay_allocated),
+        "allocated_qty": str(replay_allocated),
+        "unplanned_qty": "0",
+    }
+    materialize_generation_stock_bins(db_session, int(generation.id))
+    if not db_session.query(models.ReservationEntry).filter_by(
+        ledger_generation_id=generation.id
+    ).first():
+        db_session.add(models.ReservationEntry(
+            ledger_generation_id=generation.id,
+            item_id=requirement.item_id,
+            characteristic_ref="",
+            organization_ref="",
+            planning_stock_pool="selected",
+            run_id=requirement.run_id,
+            freeze_version=1,
+            requirement_id=requirement.id,
+            priority_period_from=requirement.period_from,
+            priority_period_to=requirement.period_to,
+            realization_mode=(
+                "make" if requirement.item.replenishment_method == "Производство" else "consume"
+            ),
+            reserved_qty=Decimal(replay_allocated),
+            realized_qty=Decimal(replay_allocated),
+            lifecycle_status="active",
+        ))
+    db_session.flush()
 
 
 def test_successful_synthetic_pipeline_publishes_only_after_validation(db_session):
@@ -282,6 +344,298 @@ def test_foreign_generation_rows_are_isolated(db_session):
 
     assert result["allocated_qty"] == "5.000"
     assert result["execution_allocations"] == 1
+
+
+def test_validation_rejects_unphased_allocation_for_nonlegacy_make_requirement(db_session):
+    generation, requirement = _synthetic(db_session, "no-legacy-unphased")
+    _configure_obligation_checkpoint(
+        db_session,
+        generation,
+        requirement,
+        allow_unphased=False,
+    )
+    reservation = db_session.query(models.ReservationEntry).filter_by(
+        ledger_generation_id=generation.id
+    ).one()
+    fact = db_session.query(models.StockLedgerEntry).filter_by(
+        ingest_batch_id=generation.physical_import_batch_id
+    ).one()
+    db_session.add(models.ReservationEvent(
+        ledger_generation_id=generation.id,
+        reservation_id=reservation.id,
+        item_id=reservation.item_id,
+        characteristic_ref=reservation.characteristic_ref,
+        organization_ref=reservation.organization_ref,
+        planning_stock_pool=reservation.planning_stock_pool,
+        event_kind="realize",
+        reserved_delta=Decimal("5"),
+        realized_delta=Decimal("5"),
+        sle_id=fact.id,
+        fact_ref=fact.recorder_ref,
+        fact_line_ref=fact.line_no,
+        match_rule="fifo",
+        cycle_id=f"historical-replay:g{generation.id}",
+        idempotency_key=f"hist:g{generation.id}:sle{fact.id}:r{reservation.id}",
+        event_at=fact.posting_at,
+    ))
+    db_session.add(models.MrpExecutionAllocation(
+        ledger_generation_id=generation.id,
+        cycle_id=f"historical-replay:g{generation.id}",
+        requirement_id=requirement.id,
+        bucket_id=None,
+        fact_type="linked_production",
+        allocation_kind="execution",
+        fact_ref=fact.recorder_ref,
+        fact_line_ref=fact.line_no,
+        fact_date=fact.posting_at,
+        allocated_qty=Decimal("5"),
+    ))
+    db_session.commit()
+
+    with pytest.raises(
+        GenerationValidationError,
+        match="unphased execution allocation requires legacy net-phasing flag",
+    ):
+        validate_generation_build(db_session, generation.id)
+
+
+def test_validation_allows_unphased_allocation_for_legacy_flagged_make_requirement(db_session):
+    generation, requirement = _synthetic(db_session, "legacy-unphased")
+    _configure_obligation_checkpoint(
+        db_session,
+        generation,
+        requirement,
+        allow_unphased=True,
+    )
+    reservation = db_session.query(models.ReservationEntry).filter_by(
+        ledger_generation_id=generation.id
+    ).one()
+    fact = db_session.query(models.StockLedgerEntry).filter_by(
+        ingest_batch_id=generation.physical_import_batch_id
+    ).one()
+    db_session.add(models.ReservationEvent(
+        ledger_generation_id=generation.id,
+        reservation_id=reservation.id,
+        item_id=reservation.item_id,
+        characteristic_ref=reservation.characteristic_ref,
+        organization_ref=reservation.organization_ref,
+        planning_stock_pool=reservation.planning_stock_pool,
+        event_kind="realize",
+        reserved_delta=Decimal("5"),
+        realized_delta=Decimal("5"),
+        sle_id=fact.id,
+        fact_ref=fact.recorder_ref,
+        fact_line_ref=fact.line_no,
+        match_rule="fifo",
+        cycle_id=f"historical-replay:g{generation.id}",
+        idempotency_key=f"legacy-hist:g{generation.id}:sle{fact.id}:r{reservation.id}",
+        event_at=fact.posting_at,
+    ))
+    db_session.add(models.MrpExecutionAllocation(
+        ledger_generation_id=generation.id,
+        cycle_id=f"historical-replay:g{generation.id}",
+        requirement_id=requirement.id,
+        bucket_id=None,
+        fact_type="linked_production",
+        allocation_kind="execution",
+        fact_ref=fact.recorder_ref,
+        fact_line_ref=fact.line_no,
+        fact_date=fact.posting_at,
+        allocated_qty=Decimal("5"),
+    ))
+    db_session.commit()
+
+    result = validate_generation_build(db_session, generation.id)
+
+    assert result["valid"] is True
+    assert result["execution_allocations"] == 1
+
+
+def test_validation_allows_bucketless_allocation_without_legacy_flag(
+    db_session,
+):
+    generation, requirement = _synthetic(
+        db_session,
+        "bucketless",
+        replenishment_method="Покупка",
+    )
+    db_session.query(models.MrpRequirementBucket).filter(
+        models.MrpRequirementBucket.requirement_id == requirement.id
+    ).delete()
+    _configure_obligation_checkpoint(
+        db_session,
+        generation,
+        requirement,
+        allow_unphased=False,
+    )
+    reservation = db_session.query(models.ReservationEntry).filter_by(
+        ledger_generation_id=generation.id
+    ).one()
+    fact = db_session.query(models.StockLedgerEntry).filter_by(
+        ingest_batch_id=generation.physical_import_batch_id
+    ).one()
+    db_session.add(models.ReservationEvent(
+        ledger_generation_id=generation.id,
+        reservation_id=reservation.id,
+        item_id=reservation.item_id,
+        characteristic_ref=reservation.characteristic_ref,
+        organization_ref=reservation.organization_ref,
+        planning_stock_pool=reservation.planning_stock_pool,
+        event_kind="realize",
+        reserved_delta=Decimal("5"),
+        realized_delta=Decimal("5"),
+        sle_id=fact.id,
+        fact_ref=fact.recorder_ref,
+        fact_line_ref=fact.line_no,
+        match_rule="fifo",
+        cycle_id=f"historical-replay:g{generation.id}",
+        idempotency_key="bucketless-hist:g{generation.id}:sle{fact.id}:r{reservation.id}",
+        event_at=fact.posting_at,
+    ))
+    db_session.add(models.MrpExecutionAllocation(
+        ledger_generation_id=generation.id,
+        cycle_id=f"historical-replay:g{generation.id}",
+        requirement_id=requirement.id,
+        bucket_id=None,
+        fact_type="component_consumption",
+        allocation_kind="execution",
+        fact_ref=fact.recorder_ref,
+        fact_line_ref=fact.line_no,
+        fact_date=fact.posting_at,
+        allocated_qty=Decimal("5"),
+    ))
+    db_session.commit()
+
+    result = validate_generation_build(db_session, generation.id)
+
+    assert result["valid"] is True
+    assert result["execution_allocations"] == 1
+
+
+def test_validation_rejects_non_make_legacy_bucketless_flag(
+    db_session,
+):
+    generation, requirement = _synthetic(
+        db_session,
+        "consume-legacy-flag",
+        replenishment_method="Покупка",
+    )
+    _configure_obligation_checkpoint(
+        db_session,
+        generation,
+        requirement,
+        allow_unphased=True,
+    )
+    reservation = db_session.query(models.ReservationEntry).filter_by(
+        ledger_generation_id=generation.id
+    ).one()
+    fact = db_session.query(models.StockLedgerEntry).filter_by(
+        ingest_batch_id=generation.physical_import_batch_id
+    ).one()
+    db_session.add(models.ReservationEvent(
+        ledger_generation_id=generation.id,
+        reservation_id=reservation.id,
+        item_id=reservation.item_id,
+        characteristic_ref=reservation.characteristic_ref,
+        organization_ref=reservation.organization_ref,
+        planning_stock_pool=reservation.planning_stock_pool,
+        event_kind="realize",
+        reserved_delta=Decimal("5"),
+        realized_delta=Decimal("5"),
+        sle_id=fact.id,
+        fact_ref=fact.recorder_ref,
+        fact_line_ref=fact.line_no,
+        match_rule="fifo",
+        cycle_id=f"historical-replay:g{generation.id}",
+        idempotency_key=f"consume-hist:g{generation.id}:sle{fact.id}:r{reservation.id}",
+        event_at=fact.posting_at,
+    ))
+    db_session.add(models.MrpExecutionAllocation(
+        ledger_generation_id=generation.id,
+        cycle_id=f"historical-replay:g{generation.id}",
+        requirement_id=requirement.id,
+        bucket_id=None,
+        fact_type="component_consumption",
+        allocation_kind="execution",
+        fact_ref=fact.recorder_ref,
+        fact_line_ref=fact.line_no,
+        fact_date=fact.posting_at,
+        allocated_qty=Decimal("5"),
+    ))
+    db_session.commit()
+
+    with pytest.raises(
+        GenerationValidationError,
+        match="unphased execution allocation requires legacy net-phasing flag",
+    ):
+        validate_generation_build(db_session, generation.id)
+
+
+def test_validation_rejects_malformed_legacy_metric_ids(db_session):
+    generation, requirement = _synthetic(
+        db_session,
+        "bad-metric-ids",
+        replenishment_method="Покупка",
+    )
+    _configure_obligation_checkpoint(
+        db_session,
+        generation,
+        requirement,
+        allow_unphased=False,
+    )
+    obligation_batch = (
+        db_session.query(models.LedgerBuildBatch)
+        .filter(
+            models.LedgerBuildBatch.ledger_generation_id == generation.id,
+            models.LedgerBuildBatch.stage == "reservation_materialize",
+        )
+        .one()
+    )
+    obligation_batch.metrics["legacy_net_phasing_requirement_ids"] = ["bad-id"]
+    db_session.flush()
+    reservation = db_session.query(models.ReservationEntry).filter_by(
+        ledger_generation_id=generation.id
+    ).one()
+    fact = db_session.query(models.StockLedgerEntry).filter_by(
+        ingest_batch_id=generation.physical_import_batch_id
+    ).one()
+    db_session.add(models.ReservationEvent(
+        ledger_generation_id=generation.id,
+        reservation_id=reservation.id,
+        item_id=reservation.item_id,
+        characteristic_ref=reservation.characteristic_ref,
+        organization_ref=reservation.organization_ref,
+        planning_stock_pool=reservation.planning_stock_pool,
+        event_kind="realize",
+        reserved_delta=Decimal("5"),
+        realized_delta=Decimal("5"),
+        sle_id=fact.id,
+        fact_ref=fact.recorder_ref,
+        fact_line_ref=fact.line_no,
+        match_rule="fifo",
+        cycle_id=f"historical-replay:g{generation.id}",
+        idempotency_key=f"malformed-hist:g{generation.id}:sle{fact.id}:r{reservation.id}",
+        event_at=fact.posting_at,
+    ))
+    db_session.add(models.MrpExecutionAllocation(
+        ledger_generation_id=generation.id,
+        cycle_id=f"historical-replay:g{generation.id}",
+        requirement_id=requirement.id,
+        bucket_id=None,
+        fact_type="component_consumption",
+        allocation_kind="execution",
+        fact_ref=fact.recorder_ref,
+        fact_line_ref=fact.line_no,
+        fact_date=fact.posting_at,
+        allocated_qty=Decimal("5"),
+    ))
+    db_session.flush()
+
+    with pytest.raises(
+        GenerationValidationError,
+        match="legacy_net_phasing_requirement_ids must contain integer ids",
+    ):
+        validate_generation_build(db_session, generation.id)
 
 
 def test_empty_prefix_requires_explicit_declaration(db_session):

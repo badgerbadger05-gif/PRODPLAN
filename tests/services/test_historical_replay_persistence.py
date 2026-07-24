@@ -21,6 +21,9 @@ from app.models import (
     StockRecorderPull,
 )
 from app.services.item_ledger.historical_replay_persistence import run_historical_replay
+from app.services.item_ledger.historical_obligations import (
+    ALGORITHM_VERSION as OBLIGATION_ALGORITHM_VERSION,
+)
 
 
 def _generation_scope(
@@ -29,6 +32,7 @@ def _generation_scope(
     *,
     fact_qty: str = "7",
     reserve_qty: str = "5",
+    add_default_bucket: bool = True,
     item: Item | None = None,
     realization_mode: str = "make",
     movement_kind: str = "assembly_in",
@@ -99,8 +103,42 @@ def _generation_scope(
         active=True,
     )
     db.add_all([reservation, fact])
+    if add_default_bucket:
+        db.add(MrpRequirementBucket(
+            requirement_id=requirement.id,
+            run_id=run.run_id,
+            item_id=item.item_id,
+            bucket_date=date(2026, 7, 20),
+            gross_qty=Decimal(reserve_qty),
+            net_qty=Decimal(reserve_qty),
+        ))
     db.commit()
     return generation, reservation
+
+
+def _append_obligation_batch(
+    db,
+    generation: LedgerGeneration,
+    *,
+    requirement_id: int,
+    allow_unphased: bool,
+):
+    row = LedgerBuildBatch(
+        ledger_generation_id=int(generation.id),
+        stage="reservation_materialize",
+        batch_key=f"seed-{generation.id}",
+        status="completed",
+        algorithm_version=OBLIGATION_ALGORITHM_VERSION,
+        metrics={
+            "selected_requirement_ids": [requirement_id],
+            "legacy_net_phasing_requirement_ids": [requirement_id]
+            if allow_unphased
+            else [],
+        },
+        completed_at=datetime(2026, 7, 23, 12, 0),
+    )
+    db.add(row)
+    db.flush()
 
 
 def test_replay_is_idempotent_and_folds_realized_cache(db_session):
@@ -343,7 +381,7 @@ def test_replay_refuses_unbounded_history(db_session):
 
 def test_realization_is_split_across_all_requirement_buckets(db_session):
     generation, reservation = _generation_scope(
-        db_session, "BUCKET-SPLIT", fact_qty="5", reserve_qty="5"
+        db_session, "BUCKET-SPLIT", fact_qty="5", reserve_qty="5", add_default_bucket=False
     )
     for bucket_date, qty in (
         (date(2026, 7, 10), Decimal("2")),
@@ -373,6 +411,122 @@ def test_realization_is_split_across_all_requirement_buckets(db_session):
     assert sum((row.allocated_qty for row in rows), Decimal("0")) == Decimal("5")
     assert first["execution_allocations_inserted"] == 2
     assert second["execution_allocations_inserted"] == 0
+
+
+def test_legacy_net_mismatch_uses_only_unphased_slice(db_session):
+    generation, reservation = _generation_scope(
+        db_session,
+        "LEGACY-UNPHASED",
+        fact_qty="6",
+        reserve_qty="6",
+        add_default_bucket=False,
+    )
+    db_session.add_all([
+        MrpRequirementBucket(
+            requirement_id=reservation.requirement_id,
+            run_id=reservation.run_id,
+            item_id=reservation.item_id,
+            bucket_date=date(2026, 7, 1),
+            gross_qty=Decimal("2"),
+            net_qty=Decimal("2"),
+        ),
+        MrpRequirementBucket(
+            requirement_id=reservation.requirement_id,
+            run_id=reservation.run_id,
+            item_id=reservation.item_id,
+            bucket_date=date(2026, 7, 2),
+            gross_qty=Decimal("2"),
+            net_qty=Decimal("2"),
+        ),
+    ])
+    db_session.commit()
+    _append_obligation_batch(
+        db_session,
+        generation,
+        requirement_id=int(reservation.requirement_id),
+        allow_unphased=True,
+    )
+
+    result = run_historical_replay(db_session, generation.id)
+    db_session.commit()
+
+    rows = (
+        db_session.query(MrpExecutionAllocation)
+        .filter_by(ledger_generation_id=generation.id)
+        .order_by(MrpExecutionAllocation.id.asc())
+        .all()
+    )
+    by_bucket = {row.bucket_id: row.allocated_qty for row in rows}
+
+    assert Decimal(result["allocated_qty"]) == Decimal("6")
+    assert len(by_bucket) == 1
+    assert by_bucket[None] == Decimal("6")
+
+
+def test_legacy_net_mismatch_ignores_stale_excess_bucket_capacity(db_session):
+    generation, reservation = _generation_scope(
+        db_session,
+        "LEGACY-HIGHER",
+        fact_qty="3",
+        reserve_qty="3",
+        add_default_bucket=False,
+    )
+    db_session.add(
+        MrpRequirementBucket(
+            requirement_id=reservation.requirement_id,
+            run_id=reservation.run_id,
+            item_id=reservation.item_id,
+            bucket_date=date(2026, 7, 5),
+            gross_qty=Decimal("10"),
+            net_qty=Decimal("10"),
+        )
+    )
+    db_session.commit()
+    _append_obligation_batch(
+        db_session,
+        generation,
+        requirement_id=int(reservation.requirement_id),
+        allow_unphased=True,
+    )
+
+    result = run_historical_replay(db_session, generation.id)
+    db_session.commit()
+
+    rows = (
+        db_session.query(MrpExecutionAllocation)
+        .filter_by(ledger_generation_id=generation.id)
+        .order_by(MrpExecutionAllocation.id.asc())
+        .all()
+    )
+
+    assert Decimal(result["allocated_qty"]) == Decimal("3")
+    assert len(rows) == 1
+    assert rows[0].bucket_id is None
+
+
+def test_replay_refuses_malformed_legacy_metric_ids(db_session):
+    generation, _reservation = _generation_scope(
+        db_session, "LEGACY-MALFORMED", fact_qty="4", reserve_qty="4"
+    )
+    db_session.add(LedgerBuildBatch(
+        ledger_generation_id=int(generation.id),
+        stage="reservation_materialize",
+        batch_key=f"seed-{generation.id}",
+        status="completed",
+        algorithm_version=OBLIGATION_ALGORITHM_VERSION,
+        metrics={
+            "selected_requirement_ids": [1],
+            "legacy_net_phasing_requirement_ids": ["bad-id"],
+        },
+        completed_at=datetime(2026, 7, 23, 12, 0),
+    ))
+    db_session.commit()
+
+    with pytest.raises(
+        ValueError,
+        match="legacy_net_phasing_requirement_ids must contain integer ids",
+    ):
+        run_historical_replay(db_session, generation.id)
 
 
 def test_recorder_order_identity_addresses_consume_exactly(db_session):

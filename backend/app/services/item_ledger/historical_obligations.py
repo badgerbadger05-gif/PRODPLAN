@@ -213,23 +213,39 @@ def materialize_historical_obligations(
         buckets_by_requirement.setdefault(int(req.id), []).append(bucket)
     for req in requirements:
         req_buckets = buckets_by_requirement.get(int(req.id), [])
-        if not req_buckets:
-            continue
         gross = sum(
             (Decimal(str(row.gross_qty or 0)) for row in req_buckets),
             Decimal("0"),
         )
-        net = sum(
-            (Decimal(str(row.net_qty or 0)) for row in req_buckets),
-            Decimal("0"),
-        )
-        if (
-            gross != Decimal(str(req.total_required_qty or 0))
-            or net != Decimal(str(req.net_required_qty or 0))
-        ):
+        if req_buckets and gross != Decimal(str(req.total_required_qty or 0)):
             raise HistoricalObligationAmbiguity(
                 f"requirement {req.id} disagrees with frozen bucket quantities"
             )
+
+    legacy_net_phasing_mismatches = [
+        {
+            "requirement_id": int(req.id),
+            "requirement_net": str(req.net_required_qty or 0),
+            "bucket_net": str(
+                sum(
+                    (Decimal(str(row.net_qty or 0)) for row in buckets_by_requirement.get(int(req.id), [])),
+                    Decimal("0"),
+                )
+            ),
+        }
+        for req in requirements
+        if buckets_by_requirement.get(int(req.id))
+        and (
+            sum(
+                (
+                    Decimal(str(row.net_qty or 0))
+                    for row in buckets_by_requirement.get(int(req.id), [])
+                ),
+                Decimal("0"),
+            )
+            != Decimal(str(req.net_required_qty or 0))
+        )
+    ]
 
     manifest = _manifest(runs, requirements, buckets)
     batch_key = (
@@ -300,6 +316,11 @@ def materialize_historical_obligations(
         "buckets": len(buckets),
         "reservation_entries": entries,
         "events_inserted": events,
+        "legacy_net_phasing_mismatch_count": len(legacy_net_phasing_mismatches),
+        "legacy_net_phasing_requirement_ids": [
+            row["requirement_id"] for row in legacy_net_phasing_mismatches
+        ],
+        "legacy_net_phasing_mismatch_details": legacy_net_phasing_mismatches,
         "input_checksum": manifest["input_checksum"],
         "selected_run_ids": run_ids,
         "selected_requirement_ids": requirement_ids,

@@ -102,6 +102,49 @@ def _requirement(db, run, *, status="open", gross=10, net=8):
     return req
 
 
+def _requirement_with_method(
+    db,
+    run,
+    *,
+    status="open",
+    gross=10,
+    net=8,
+    replenishment_method="Покупка",
+):
+    item = models.Item(
+        item_code=f"I-{run.run_id}-{status}-M",
+        item_name="Item",
+        replenishment_method=replenishment_method,
+    )
+    db.add(item)
+    db.flush()
+    req = models.MrpRequirement(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        total_required_qty=gross,
+        net_required_qty=net,
+        covered_qty=0,
+        remaining_qty=net,
+        period_from=run.period_from,
+        period_to=run.period_to,
+        bom_level=1,
+        freeze_version=3,
+        status=status,
+    )
+    db.add(req)
+    db.flush()
+    db.add(models.MrpRequirementBucket(
+        requirement_id=req.id,
+        run_id=run.run_id,
+        item_id=item.item_id,
+        bucket_date=run.period_to,
+        gross_qty=gross,
+        net_qty=net,
+    ))
+    db.flush()
+    return req
+
+
 def _set_bucket_date(req: models.MrpRequirement, bucket_date: date) -> models.MrpRequirementBucket:
     bucket = req.buckets[0]
     bucket.bucket_date = bucket_date
@@ -266,6 +309,79 @@ def test_legacy_bucket_outside_requirement_period_is_materialized(db_session):
     assert db_session.query(models.ReservationEntry).filter_by(
         requirement_id=req.id
     ).count() == 1
+
+
+def test_legacy_net_mismatch_is_audited_for_all_requirements(db_session):
+    generation = _generation(db_session)
+    plan = _plan(
+        db_session,
+        start=date(2026, 6, 1),
+        end=date(2026, 6, 30),
+    )
+    run = _run(db_session, plan)
+    req_make = _requirement_with_method(
+        db_session,
+        run,
+        gross=10,
+        net=4,
+        replenishment_method="Производство",
+    )
+    req_consume = _requirement_with_method(
+        db_session,
+        run,
+        gross=8,
+        net=3,
+        status="open-consume",
+        replenishment_method="Покупка",
+    )
+    req_make.buckets[0].net_qty = 7
+    req_consume.buckets[0].net_qty = 5
+    db_session.flush()
+
+    result = materialize_historical_obligations(db_session, generation.id)
+    batch = db_session.query(models.LedgerBuildBatch).filter_by(
+        id=result["batch_id"]
+    ).one()
+    details = batch.metrics["legacy_net_phasing_mismatch_details"]
+    detail_ids = [row["requirement_id"] for row in details]
+
+    assert batch.metrics["legacy_net_phasing_mismatch_count"] == 2
+    assert set(batch.metrics["legacy_net_phasing_requirement_ids"]) == {
+        int(req_make.id),
+        int(req_consume.id),
+    }
+    assert detail_ids == batch.metrics["legacy_net_phasing_requirement_ids"]
+    assert {
+        (row["requirement_id"], row["requirement_net"], row["bucket_net"])
+        for row in details
+    } == {
+        (int(req_make.id), "4", "7"),
+        (int(req_consume.id), "3", "5"),
+    }
+
+
+def test_gross_bucket_mismatch_still_fails(db_session):
+    generation = _generation(db_session)
+    plan = _plan(
+        db_session,
+        start=date(2026, 6, 1),
+        end=date(2026, 6, 30),
+    )
+    run = _run(db_session, plan)
+    req = _requirement_with_method(
+        db_session,
+        run,
+        gross=10,
+        net=10,
+        replenishment_method="Производство",
+    )
+    db_session.query(models.MrpRequirementBucket).filter(
+        models.MrpRequirementBucket.requirement_id == req.id
+    ).update({models.MrpRequirementBucket.gross_qty: 9})
+    db_session.flush()
+
+    with pytest.raises(HistoricalObligationAmbiguity):
+        materialize_historical_obligations(db_session, generation.id)
 
 
 def test_historical_obligation_manifest_preserves_bucket_dates(db_session):
