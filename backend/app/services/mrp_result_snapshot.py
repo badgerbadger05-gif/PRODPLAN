@@ -27,6 +27,7 @@ from app.services.planning_truth import (
     publish_read_snapshot,
     require_accepted_truth,
 )
+from app.services.planning_run_candidate import _resolve_parent_generation_id
 
 
 CONSUMER = "mrp_result"
@@ -335,7 +336,10 @@ def _require_sealed_candidate_manifest(
                 or parent is None
                 or str(parent.status or "") != "FIXED_SNAPSHOT"
                 or int(parent.source_plan_id or -1) != plan_id
-                or int(parent.ledger_generation_id or -1)
+            ):
+                raise ValueError("candidate snapshot refresh candidate parent conflicts")
+            if (
+                int(_resolve_parent_generation_id(db, parent) or -1)
                 != int(expected_parent_generation or -1)
             ):
                 raise ValueError("candidate snapshot refresh candidate parent conflicts")

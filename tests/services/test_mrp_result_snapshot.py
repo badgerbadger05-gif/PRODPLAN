@@ -214,6 +214,69 @@ def test_candidate_builder_is_idempotent_and_rejects_changed_persisted_snapshot(
         build_mrp_result_candidate_snapshot(db_session, run.run_id)
 
 
+def test_candidate_builder_resolves_legacy_parent_generation_in_manifest(db_session):
+    accepted = _accepted_generation(db_session)
+    candidate_generation = _building_generation(db_session, cutoff=accepted.cutoff)
+    candidate_generation.source_watermarks = {
+        **candidate_generation.source_watermarks,
+        "parent_generation_id": accepted.id,
+    }
+    run, item = _candidate_purchase_run(db_session, candidate_generation)
+    parent = models.PlanningRun(
+        status="FIXED_SNAPSHOT",
+        config_snapshot={},
+        ledger_generation_id=None,
+        ledger_cutoff=accepted.cutoff,
+        source_plan_id=run.source_plan_id,
+        period_from=run.period_from,
+        period_to=run.period_to,
+    )
+    db_session.add(parent)
+    db_session.flush()
+    run.prior_run_id = parent.run_id
+    requirement = models.MrpRequirement(
+        run_id=parent.run_id,
+        item_id=item.item_id,
+        total_required_qty=0,
+        net_required_qty=0,
+        period_from=parent.period_from,
+        period_to=parent.period_to,
+        bom_level=0,
+    )
+    db_session.add(requirement)
+    db_session.flush()
+    db_session.add(
+        models.ReservationEntry(
+            ledger_generation_id=accepted.id,
+            item_id=item.item_id,
+            run_id=parent.run_id,
+            freeze_version=0,
+            requirement_id=requirement.id,
+            priority_period_from=parent.period_from,
+            priority_period_to=parent.period_to,
+        )
+    )
+    payload = {
+        "version": 1,
+        "entries": [{
+            "action": "refresh", "plan_id": run.source_plan_id,
+            "parent_run_id": parent.run_id, "candidate_run_id": run.run_id,
+        }],
+    }
+    candidate_generation.source_watermarks = {
+        **candidate_generation.source_watermarks,
+        "obligation_refresh_manifest": payload,
+        "obligation_refresh_manifest_hash": sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest(),
+    }
+
+    snapshot = build_mrp_result_candidate_snapshot(db_session, run.run_id)
+
+    assert snapshot.ledger_generation_id == candidate_generation.id
+    assert snapshot.truth_status == "building"
+
+
 def test_candidate_builder_savepoint_rolls_back_partial_snapshot(db_session, monkeypatch):
     accepted = _accepted_generation(db_session)
     candidate_generation = _building_generation(db_session, cutoff=accepted.cutoff)
