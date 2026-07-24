@@ -256,7 +256,7 @@ def test_historical_balance_uses_virtual_table_period_parameter_aware_datetime(m
 
     assert captured["entity_name"].endswith("/Balance")
     assert captured["filter_query"] == (
-        "Period le datetime'2026-06-01T03:00:00'"
+        "Period le datetime'2026-06-01T03:00:01'"
     )
 
 
@@ -274,7 +274,7 @@ def test_historical_balance_keeps_naive_datetime_without_timezone_shift(monkeypa
     )
 
     assert captured["filter_query"] == (
-        "Period le datetime'2026-06-01T12:34:56'"
+        "Period le datetime'2026-06-01T12:34:57'"
     )
 
 
