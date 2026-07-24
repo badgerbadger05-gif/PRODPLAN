@@ -20,6 +20,9 @@ from app.services.item_ledger.supplier_receipt_allocation import (
 from app import models
 
 
+_ZERO_GUID = "00000000-0000-0000-0000-000000000000"
+
+
 def _fact(
     sle_id,
     qty,
@@ -346,17 +349,27 @@ def test_persistence_ignores_legacy_received_qty_and_cross_generation_pin(db_ses
     assert provenance.evidence_payload["signed_qty"] == "3"
 
 
-def test_zero_guid_matches_canonical_empty_characteristic_in_order_item(db_session):
+@pytest.mark.parametrize(
+    ("supplier_line_characteristic", "evidence_characteristic"),
+    [
+        (None, None),
+        ("", ""),
+        (_ZERO_GUID, _ZERO_GUID),
+        ("line-char-a", "line-char-b"),
+    ],
+)
+def test_supplier_line_characteristic_variants_are_ignored_for_exact_matching(
+    db_session,
+    supplier_line_characteristic,
+    evidence_characteristic,
+):
     generation, req = _persistence_fixture(
         db_session,
-        supplier_line_characteristic="00000000-0000-0000-0000-000000000000",
+        supplier_line_characteristic=supplier_line_characteristic,
     )
     evidence = _evidence(RECEIPT_OPERATION, 3)
     evidence = SupplierDocumentEvidence(
-        **{
-            **evidence.__dict__,
-            "characteristic_ref": "00000000-0000-0000-0000-000000000000",
-        }
+        **{**evidence.__dict__, "characteristic_ref": evidence_characteristic}
     )
     result = rebuild_supplier_receipt_coverage(
         db_session,
@@ -370,7 +383,43 @@ def test_zero_guid_matches_canonical_empty_characteristic_in_order_item(db_sessi
     ).one()
     assert result.exact_fact_count == 1
     assert provenance.match_status == "exact"
+    assert provenance.evidence_payload["characteristic_ref"] == (
+        "" if evidence_characteristic is None else evidence_characteristic
+    )
     assert db_session.query(models.MrpExecutionAllocation).one().requirement_id == req.id
+
+
+def test_duplicate_order_lines_with_different_characteristics_remain_ambiguous(db_session):
+    generation, _req = _persistence_fixture(db_session)
+    order = db_session.query(models.SupplierOrder).filter_by(order_ref1c="order-1").one()
+    item = db_session.query(models.Item).filter_by(item_code="SUP-CORE").one()
+    db_session.add(models.SupplierOrderItem(
+        order_id=order.order_id,
+        item_id_ref=item.item_id,
+        line_number=1,
+        characteristic_ref1c="line-char-b",
+        quantity=Decimal("5"),
+        received_qty=0,
+        remaining_qty=Decimal("5"),
+    ))
+    db_session.commit()
+
+    result = rebuild_supplier_receipt_coverage(
+        db_session,
+        ledger_generation_id=generation.id,
+        evidence=[_evidence(RECEIPT_OPERATION, 3)],
+        cycle_id="test",
+    )
+    db_session.commit()
+
+    assert result.exact_fact_count == 0
+    provenance = db_session.query(
+        models.StockLedgerSupplierReceiptProvenance
+    ).one()
+    assert provenance.match_status == "ambiguous"
+    assert provenance.ambiguity_count == 2
+    assert result.unplanned_qty == Decimal("3")
+    assert db_session.query(models.MrpExecutionAllocation).count() == 0
 
 
 def test_historical_receipt_falls_back_through_synced_purchase_requirement(

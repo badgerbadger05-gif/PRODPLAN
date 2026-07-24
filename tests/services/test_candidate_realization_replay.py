@@ -8,6 +8,7 @@ import pytest
 from sqlalchemy import text
 
 from app import models
+from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from app.services.item_ledger.candidate_realization_replay import (
     CandidateRealizationReplayError,
     replay_candidate_realizations,
@@ -151,7 +152,7 @@ def _world(
     ):
         db.add(models.StockLedgerEntry(
             ingest_batch_id=physical.id, source_content_hash=f"candidate-replay-{index}", item_id=item.item_id,
-            characteristic_ref="", organization_ref="", warehouse_ref1c="WH",
+            characteristic_ref="", organization_ref=DEFAULT_ORGANIZATION_REF1C, warehouse_ref1c="WH",
             qty=Decimal(qty), qty_after=Decimal(qty),
             posting_at=at, record_type="Receipt", movement_kind="assembly_in", recorder_type="Production",
             recorder_ref=f"REC-{index}", line_no="1", ingest_source="pull", active=True,

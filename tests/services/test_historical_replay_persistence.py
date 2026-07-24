@@ -22,6 +22,7 @@ from app.models import (
     StockLedgerEntry,
     StockRecorderPull,
 )
+from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from app.services.item_ledger.historical_replay_persistence import run_historical_replay
 from app.services.item_ledger.historical_obligations import (
     ALGORITHM_VERSION as OBLIGATION_ALGORITHM_VERSION,
@@ -32,6 +33,7 @@ def _generation_scope(
     db,
     key: str,
     *,
+    organization_ref: str = DEFAULT_ORGANIZATION_REF1C,
     fact_qty: str = "7",
     reserve_qty: str = "5",
     add_default_bucket: bool = True,
@@ -85,7 +87,7 @@ def _generation_scope(
         ledger_generation_id=generation.id,
         item_id=item.item_id,
         characteristic_ref="",
-        organization_ref="",
+        organization_ref=organization_ref,
         planning_stock_pool="selected",
         run_id=run.run_id,
         freeze_version=1,
@@ -102,7 +104,7 @@ def _generation_scope(
         source_content_hash=f"hash-{key}",
         item_id=item.item_id,
         characteristic_ref="",
-        organization_ref="",
+        organization_ref=organization_ref,
         warehouse_ref1c="WH",
         qty=Decimal(fact_qty),
         qty_after=Decimal(fact_qty),
@@ -273,7 +275,7 @@ def test_physical_import_watermark_includes_all_earlier_batches(db_session):
         source_content_hash="hash-prefix-newer",
         item_id=reservation.item_id,
         characteristic_ref="",
-        organization_ref="",
+        organization_ref=DEFAULT_ORGANIZATION_REF1C,
         warehouse_ref1c="WH",
         qty=Decimal("2"),
         qty_after=Decimal("5"),
@@ -364,7 +366,7 @@ def test_later_supersession_does_not_change_generation_replay(db_session):
         source_content_hash="hash-supersession-later",
         item_id=reservation.item_id,
         characteristic_ref="",
-        organization_ref="",
+        organization_ref=DEFAULT_ORGANIZATION_REF1C,
         warehouse_ref1c="WH",
         qty=Decimal("99"),
         qty_after=Decimal("99"),
@@ -694,28 +696,68 @@ def test_ambiguous_order_identity_leaves_consume_unplanned(db_session):
     assert result["ambiguous_identity_facts"] == 1
 
 
-def test_replay_collapses_singleton_fact_identity_to_legacy_blank_pool(db_session):
+def test_replay_allocates_multiple_characteristics_in_one_fifo_pool(db_session):
     generation, reservation = _generation_scope(
-        db_session, "ORG-COLLAPSE", fact_qty="5", reserve_qty="5"
+        db_session, "MULTI-CHAR", fact_qty="0", reserve_qty="7"
     )
-    fact = db_session.query(StockLedgerEntry).filter_by(
-        ingest_batch_id=generation.physical_import_batch_id
-    ).one()
-    fact.characteristic_ref = "CHAR-1"
-    fact.organization_ref = "ORG-1"
+    batch_id = generation.physical_import_batch_id
+    db_session.add_all([
+        StockLedgerEntry(
+            ingest_batch_id=batch_id,
+            source_content_hash="multi-char-a",
+            item_id=reservation.item_id,
+            characteristic_ref="CHAR-A",
+            organization_ref=DEFAULT_ORGANIZATION_REF1C,
+            warehouse_ref1c="WH",
+            qty=Decimal("3"),
+            qty_after=Decimal("3"),
+            posting_at=datetime(2026, 7, 20, 10, 0),
+            record_type="Receipt",
+            movement_kind="assembly_in",
+            recorder_type="Production",
+            recorder_ref="REC-MULTI-CHAR-A",
+            line_no="1",
+            ingest_source="test",
+            active=True,
+        ),
+        StockLedgerEntry(
+            ingest_batch_id=batch_id,
+            source_content_hash="multi-char-b",
+            item_id=reservation.item_id,
+            characteristic_ref="CHAR-B",
+            organization_ref=DEFAULT_ORGANIZATION_REF1C,
+            warehouse_ref1c="WH",
+            qty=Decimal("4"),
+            qty_after=Decimal("7"),
+            posting_at=datetime(2026, 7, 20, 11, 0),
+            record_type="Receipt",
+            movement_kind="assembly_in",
+            recorder_type="Production",
+            recorder_ref="REC-MULTI-CHAR-B",
+            line_no="1",
+            ingest_source="test",
+            active=True,
+        ),
+    ])
     db_session.flush()
+    db_session.refresh(reservation)
 
     result = run_historical_replay(db_session, generation.id)
 
-    assert Decimal(result["allocated_qty"]) == Decimal("5")
-    assert result["legacy_identity_collapsed_pool_facts"] == 1
-    assert result["ambiguous_pool_facts"] == 0
+    assert Decimal(result["facts"]) == Decimal("2")
+    assert result["allocations"] == 2
+    assert Decimal(result["allocated_qty"]) == Decimal("7")
     assert Decimal(result["unplanned_qty"]) == Decimal("0")
+    assert result["ambiguous_pool_facts"] == 0
+    assert result["legacy_identity_collapsed_pool_facts"] == 0
+    assert db_session.query(ReservationEvent).filter_by(
+        ledger_generation_id=generation.id
+    ).count() == 2
     db_session.refresh(reservation)
-    assert reservation.realized_qty == Decimal("5")
+    assert reservation.realized_qty == Decimal("7")
 
 
-def test_replay_treats_no_pool_facts_as_unplanned_without_ambiguity(db_session):
+def test_replay_ignores_non_zsm_facts_without_ambiguity(db_session):
     cutoff = datetime(2026, 7, 23, 12, 0)
     item = Item(item_code="ITEM-NO-POOL", item_name="Item No Pool")
     batch = PhysicalImportBatch(batch_key="physical-no-pool", status="completed", cutoff=cutoff)
@@ -764,11 +806,12 @@ def test_replay_treats_no_pool_facts_as_unplanned_without_ambiguity(db_session):
 
     result = run_historical_replay(db_session, generation.id)
 
-    assert Decimal(result["facts"]) == Decimal("1")
+    assert result["facts"] == 0
     assert result["allocations"] == 0
-    assert result["unplanned_facts"] == 1
-    assert Decimal(result["unplanned_qty"]) == Decimal("4")
+    assert result["unplanned_facts"] == 0
+    assert Decimal(result["unplanned_qty"]) == Decimal("0")
     assert result["ambiguous_pool_facts"] == 0
+    assert result["ignored_facts"] == 1
     assert db_session.query(ReservationEvent).filter_by(
         ledger_generation_id=generation.id
     ).count() == 0
@@ -873,10 +916,12 @@ def test_replay_multi_org_facts_do_not_fallback_to_blank_org(db_session):
 
     result = run_historical_replay(db_session, generation.id)
 
-    assert result["ambiguous_pool_facts"] == 2
+    assert result["facts"] == 0
+    assert result["ambiguous_pool_facts"] == 0
     assert result["legacy_identity_collapsed_pool_facts"] == 0
     assert Decimal(result["allocated_qty"]) == Decimal("0")
-    assert Decimal(result["unplanned_qty"]) == Decimal("8")
+    assert Decimal(result["unplanned_qty"]) == Decimal("0")
+    assert result["ignored_facts"] == 2
     assert db_session.query(ReservationEvent).filter_by(
         ledger_generation_id=generation.id
     ).count() == 0
@@ -884,68 +929,26 @@ def test_replay_multi_org_facts_do_not_fallback_to_blank_org(db_session):
     assert reservation.realized_qty == Decimal("0")
 
 
-def test_replay_exact_org_match_takes_precedence_over_blank_org_fallback(db_session):
-    generation, reserved_blank = _generation_scope(
+def test_replay_zsm_org_fact_is_processed_without_ambiguous_pool_split(db_session):
+    generation, reserved = _generation_scope(
         db_session, "ORG-EXACT", fact_qty="5", reserve_qty="5"
     )
-    exact_run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={})
-    db_session.add(exact_run)
-    db_session.flush()
-    exact_requirement = MrpRequirement(
-        run_id=exact_run.run_id,
-        item_id=reserved_blank.item_id,
-        total_required_qty=Decimal("5"),
-        net_required_qty=Decimal("5"),
-        covered_qty=0,
-        remaining_qty=Decimal("5"),
-        period_from=date(2026, 7, 1),
-        period_to=date(2026, 7, 31),
-        bom_level=0,
-    )
-    db_session.add(exact_requirement)
-    db_session.flush()
-    db_session.add(MrpRequirementBucket(
-        requirement_id=exact_requirement.id,
-        run_id=exact_run.run_id,
-        item_id=reserved_blank.item_id,
-        bucket_date=date(2026, 7, 20),
-        gross_qty=Decimal("5"),
-        net_qty=Decimal("5"),
-    ))
-    exact_reservation = ReservationEntry(
-        ledger_generation_id=generation.id,
-        item_id=reserved_blank.item_id,
-        characteristic_ref="",
-        organization_ref="ORG-1",
-        planning_stock_pool="legacy",
-        run_id=exact_run.run_id,
-        freeze_version=1,
-        requirement_id=exact_requirement.id,
-        priority_period_from=reserved_blank.priority_period_from,
-        priority_period_to=reserved_blank.priority_period_to,
-        realization_mode="make",
-        reserved_qty=Decimal("5"),
-        realized_qty=Decimal("0"),
-        lifecycle_status="active",
-    )
-    db_session.add(exact_reservation)
-    db_session.flush()
     fact = db_session.query(StockLedgerEntry).filter_by(
         ingest_batch_id=generation.physical_import_batch_id
     ).one()
-    fact.organization_ref = "ORG-1"
+    fact.organization_ref = DEFAULT_ORGANIZATION_REF1C
     db_session.flush()
 
     result = run_historical_replay(db_session, generation.id)
-    events = db_session.query(ReservationEvent).filter_by(
+    event = db_session.query(ReservationEvent).filter_by(
         ledger_generation_id=generation.id
-    ).all()
+    ).one()
 
+    assert result["facts"] == 1
     assert Decimal(result["allocated_qty"]) == Decimal("5")
+    assert result["ambiguous_pool_facts"] == 0
     assert result["legacy_identity_collapsed_pool_facts"] == 0
-    assert len(events) == 1
-    assert events[0].reservation_id == exact_reservation.id
-    assert events[0].planning_stock_pool == "legacy"
+    assert event.reservation_id == reserved.id
 
 
 def test_replay_fifo_remains_oldest_pool_for_later_output(db_session):
@@ -954,7 +957,7 @@ def test_replay_fifo_remains_oldest_pool_for_later_output(db_session):
     )
     generation.cutoff = datetime(2027, 7, 21)
     generation.physical_import_batch.cutoff = datetime(2027, 7, 21)
-    reservation_a.organization_ref = ""
+    reservation_a.organization_ref = DEFAULT_ORGANIZATION_REF1C
     reservation_a.reserved_qty = Decimal("2")
     req = db_session.query(MrpRequirement).filter_by(
         item_id=reservation_a.item_id
@@ -1000,12 +1003,12 @@ def test_replay_fifo_remains_oldest_pool_for_later_output(db_session):
             gross_qty=3,
             net_qty=3,
         ),
-        ReservationEntry(
-            ledger_generation_id=generation.id,
-            item_id=reservation_a.item_id,
-            characteristic_ref="",
-            organization_ref="",
-            planning_stock_pool="selected",
+            ReservationEntry(
+                ledger_generation_id=generation.id,
+                item_id=reservation_a.item_id,
+                characteristic_ref="",
+                organization_ref=DEFAULT_ORGANIZATION_REF1C,
+                planning_stock_pool="selected",
             run_id=later_run.run_id,
             freeze_version=1,
             requirement_id=req2.id,
@@ -1022,7 +1025,7 @@ def test_replay_fifo_remains_oldest_pool_for_later_output(db_session):
         source_content_hash="org-fifo",
         item_id=reservation_a.item_id,
         characteristic_ref="",
-        organization_ref="ORG-LATE",
+        organization_ref=DEFAULT_ORGANIZATION_REF1C,
         warehouse_ref1c="WH",
         qty=Decimal("5"),
         qty_after=Decimal("5"),
@@ -1265,7 +1268,7 @@ def test_replay_preserves_mode_isolated_bucket_capacity(db_session):
         source_content_hash="consume-fact",
         item_id=make_reservation.item_id,
         characteristic_ref="",
-        organization_ref="",
+        organization_ref=DEFAULT_ORGANIZATION_REF1C,
         warehouse_ref1c="WH",
         qty=Decimal("26"),
         qty_after=Decimal("26"),
@@ -1283,7 +1286,7 @@ def test_replay_preserves_mode_isolated_bucket_capacity(db_session):
         ledger_generation_id=generation.id,
         item_id=make_reservation.item_id,
         characteristic_ref="",
-        organization_ref="",
+        organization_ref=DEFAULT_ORGANIZATION_REF1C,
         planning_stock_pool="selected",
         run_id=make_reservation.run_id,
         freeze_version=1,

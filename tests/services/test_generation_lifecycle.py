@@ -24,6 +24,7 @@ from app.services.item_ledger.supplier_receipt_allocation import (
     RECEIPT_OPERATION,
     SupplierDocumentEvidence,
 )
+from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 
 
 def _generation(
@@ -176,7 +177,7 @@ def _synthetic(db, key: str = "ok", replenishment_method: str = "Произво�
         source_content_hash=f"hash-{key}",
         item_id=item.item_id,
         characteristic_ref="",
-        organization_ref="",
+        organization_ref=DEFAULT_ORGANIZATION_REF1C,
         warehouse_ref1c="WH",
         qty=Decimal("5"),
         qty_after=Decimal("999999"),
@@ -1062,7 +1063,7 @@ def test_structural_supplier_evidence_diagnostic_blocks_before_fifo_and_acceptan
         source_content_hash="supplier-diagnostic",
         item_id=requirement.item_id,
         characteristic_ref="",
-        organization_ref="",
+        organization_ref=DEFAULT_ORGANIZATION_REF1C,
         warehouse_ref1c="WH",
         qty=Decimal("1"),
         posting_at=datetime(2026, 7, 21),
@@ -1127,7 +1128,7 @@ def test_supplier_candidates_require_explicit_odata_client(db_session):
         source_content_hash="supplier-client",
         item_id=requirement.item_id,
         characteristic_ref="",
-        organization_ref="",
+        organization_ref=DEFAULT_ORGANIZATION_REF1C,
         warehouse_ref1c="WH",
         qty=Decimal("1"),
         posting_at=datetime(2026, 7, 21),
@@ -1165,7 +1166,7 @@ def test_internal_transfer_does_not_enter_supplier_evidence_gate(
             source_content_hash=f"internal-transfer-{line_no}",
             item_id=requirement.item_id,
             characteristic_ref="",
-            organization_ref="",
+            organization_ref=DEFAULT_ORGANIZATION_REF1C,
             warehouse_ref1c=warehouse,
             qty=qty,
             posting_at=datetime(2026, 7, 21),
@@ -1209,7 +1210,7 @@ def test_direct_supplier_receipt_is_explicitly_unplanned_but_does_not_block(
         source_content_hash="direct-receipt",
         item_id=requirement.item_id,
         characteristic_ref="",
-        organization_ref="",
+        organization_ref=DEFAULT_ORGANIZATION_REF1C,
         warehouse_ref1c="WH",
         qty=Decimal("3"),
         posting_at=datetime(2026, 7, 21),
@@ -1271,7 +1272,7 @@ def test_accepted_generation_can_ignore_customer_sale_expense_rows(db_session, m
         source_content_hash="ignored-customer-sale",
         item_id=requirement.item_id,
         characteristic_ref="",
-        organization_ref="",
+        organization_ref=DEFAULT_ORGANIZATION_REF1C,
         warehouse_ref1c="WH",
         qty=Decimal("-2"),
         posting_at=datetime(2026, 7, 21),
@@ -1342,7 +1343,7 @@ def test_validation_rejects_supplier_receipt_candidate_rows_without_provenance(d
         source_content_hash="missing-provenance",
         item_id=requirement.item_id,
         characteristic_ref="",
-        organization_ref="",
+        organization_ref=DEFAULT_ORGANIZATION_REF1C,
         warehouse_ref1c="WH",
         qty=Decimal("-2"),
         posting_at=datetime(2026, 7, 21),
@@ -1370,7 +1371,7 @@ def test_accept_rejects_ignored_supplier_entries_if_not_candidate_rows(db_sessio
         source_content_hash="ignored-failure",
         item_id=requirement.item_id,
         characteristic_ref="",
-        organization_ref="",
+        organization_ref=DEFAULT_ORGANIZATION_REF1C,
         warehouse_ref1c="WH",
         qty=Decimal("2"),
         posting_at=datetime(2026, 7, 21),
@@ -1411,3 +1412,103 @@ def test_accept_rejects_ignored_supplier_entries_if_not_candidate_rows(db_sessio
             replay_from=datetime(2026, 7, 1),
             odata_client=object(),
         )
+
+
+def test_supplier_candidates_only_include_default_organization_rows(
+    db_session, monkeypatch
+):
+    generation, requirement = _synthetic(db_session, "supplier-org-filter")
+    db_session.add(models.StockLedgerEntry(
+        ingest_batch_id=generation.physical_import_batch_id,
+        source_content_hash="supplier-default-org",
+        item_id=requirement.item_id,
+        characteristic_ref="",
+        organization_ref=DEFAULT_ORGANIZATION_REF1C,
+        warehouse_ref1c="WH",
+        qty=Decimal("1"),
+        posting_at=datetime(2026, 7, 21),
+        record_type="Receipt",
+        movement_kind="supplier_receipt",
+        recorder_type="Document_ПриходнаяНакладная",
+        recorder_ref="supplier-default-org",
+        line_no="1",
+        ingest_source="test",
+    ))
+    foreign = models.StockLedgerEntry(
+        ingest_batch_id=generation.physical_import_batch_id,
+        source_content_hash="supplier-foreign-org",
+        item_id=requirement.item_id,
+        characteristic_ref="",
+        organization_ref="00000000-0000-0000-0000-000000000001",
+        warehouse_ref1c="WH",
+        qty=Decimal("1"),
+        posting_at=datetime(2026, 7, 21),
+        record_type="Receipt",
+        movement_kind="supplier_receipt",
+        recorder_type="Document_ПриходнаяНакладная",
+        recorder_ref="supplier-foreign-org",
+        line_no="1",
+        ingest_source="test",
+    )
+    db_session.add(foreign)
+    db_session.commit()
+
+    default_candidate = db_session.query(models.StockLedgerEntry).filter_by(
+        recorder_ref="supplier-default-org",
+        ingest_batch_id=generation.physical_import_batch_id,
+    ).one()
+    evidence = SupplierDocumentEvidence(
+        receipt_doc_type="Document_ПриходнаяНакладная",
+        receipt_doc_ref=default_candidate.recorder_ref,
+        receipt_doc_line_no=default_candidate.line_no,
+        operation_key=RECEIPT_OPERATION,
+        operation_name="Приобретение у поставщика",
+        supplier_order_type="",
+        supplier_order_ref="",
+        supplier_order_line_no="0",
+        item_id=default_candidate.item_id,
+        characteristic_ref=default_candidate.characteristic_ref or "",
+        warehouse_ref1c=default_candidate.warehouse_ref1c or "",
+        signed_qty=Decimal(str(default_candidate.qty)),
+    )
+    observed: list[int] = []
+
+    def extract(_db, _client, rows):
+        observed[:] = [int(row.id) for row in rows if row.id is not None]
+        assert len(observed) == 1
+        assert int(observed[0]) == int(default_candidate.id)
+        return SupplierEvidenceExtractionResult(
+            evidence=(evidence,),
+            diagnostics=(),
+            ignored_stock_ledger_entries=(),
+            fetched_document_count=1,
+        )
+
+    monkeypatch.setattr(
+        "app.services.item_ledger.generation_lifecycle."
+        "extract_supplier_document_evidence",
+        extract,
+    )
+
+    result = accept_generation_build(
+        db_session,
+        generation.id,
+        replay_from=datetime(2026, 7, 1),
+        odata_client=object(),
+    )
+
+    assert result["status"] == "accepted"
+    assert result["supplier_receipt_evidence"] == 1
+    assert observed == [int(default_candidate.id)]
+    assert db_session.query(
+        models.StockLedgerSupplierReceiptProvenance
+    ).filter_by(
+        ledger_generation_id=generation.id,
+        stock_ledger_entry_id=default_candidate.id,
+    ).one()
+    assert db_session.query(
+        models.StockLedgerSupplierReceiptProvenance
+    ).filter_by(
+        ledger_generation_id=generation.id,
+        stock_ledger_entry_id=foreign.id,
+    ).count() == 0

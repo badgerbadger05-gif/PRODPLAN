@@ -21,6 +21,9 @@ def reserve(
     run_id: int = 1,
     plan_period_from: date | None = None,
     plan_period_to: date | None = None,
+    characteristic_ref: str = "",
+    organization_ref: str = "",
+    planning_stock_pool: str = "selected",
     bucket_id: int = 1,
     order_refs: tuple[str, ...] = (),
 ) -> Reserve:
@@ -40,6 +43,9 @@ def reserve(
         requirement_id=requirement_id,
         bucket_date=due,
         bucket_id=bucket_id,
+        characteristic_ref=characteristic_ref,
+        organization_ref=organization_ref,
+        planning_stock_pool=planning_stock_pool,
         order_refs=order_refs,
     )
 
@@ -51,6 +57,8 @@ def fact(
     mode: str = "make",
     requirement_id: int | None = None,
     order_ref: str | None = None,
+    characteristic_ref: str = "",
+    organization_ref: str = "",
     posting_at: datetime = datetime(2026, 7, 1, tzinfo=timezone.utc),
 ) -> Fact:
     return Fact(
@@ -61,6 +69,8 @@ def fact(
         posting_at=posting_at,
         requirement_id=requirement_id,
         order_ref=order_ref,
+        characteristic_ref=characteristic_ref,
+        organization_ref=organization_ref,
     )
 
 
@@ -114,6 +124,57 @@ def test_order_link_wins_then_consume_surplus_remains_unplanned():
     ]
     assert result.unplanned[0].reason == "no_eligible_reserve_capacity"
     assert result.unplanned_qty == Decimal("3")
+
+
+def test_make_fifo_ignores_characteristic_across_reserves_and_facts():
+    rows = [
+        reserve(
+            "char-a",
+            1,
+            qty="2",
+            mode="make",
+            characteristic_ref="CHAR-A",
+            organization_ref="ORG-1",
+            planning_stock_pool="selected",
+        ),
+        reserve(
+            "char-b",
+            1,
+            qty="3",
+            mode="make",
+            characteristic_ref="CHAR-B",
+            organization_ref="ORG-1",
+            planning_stock_pool="selected",
+        ),
+    ]
+
+    result = allocate_historical_facts(
+        [
+            fact(
+                "fact-a",
+                "2",
+                mode="make",
+                characteristic_ref="CHAR-FA",
+                organization_ref="ORG-1",
+                posting_at=datetime(2026, 6, 30, 12, 0, tzinfo=timezone.utc),
+            ),
+            fact(
+                "fact-b",
+                "3",
+                mode="make",
+                characteristic_ref="CHAR-FB",
+                organization_ref="ORG-1",
+                posting_at=datetime(2026, 7, 1, 10, 0, tzinfo=timezone.utc),
+            ),
+        ],
+        rows,
+    )
+
+    assert [(a.fact_id, a.reserve_id, a.qty) for a in result.allocations] == [
+        ("fact-a", "char-a", Decimal("2")),
+        ("fact-b", "char-b", Decimal("3")),
+    ]
+    assert result.unplanned_qty == Decimal("0")
 
 
 def test_unaddressed_make_fifo_uses_due_plan_run_requirement_bucket_order():

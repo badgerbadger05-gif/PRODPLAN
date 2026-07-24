@@ -83,10 +83,9 @@ class ReplayResult:
     unplanned_qty: Decimal
 
 
-def _pool_key(value: Fact | Reserve) -> tuple[int, str, str, str, Mode]:
+def _pool_key(value: Fact | Reserve) -> tuple[int, str, str, Mode]:
     return (
         int(value.item_id),
-        str(value.characteristic_ref),
         str(value.organization_ref),
         str(value.planning_stock_pool),
         value.mode,

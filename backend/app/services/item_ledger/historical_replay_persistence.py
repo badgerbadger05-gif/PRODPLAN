@@ -21,6 +21,7 @@ from app.models import (
     StockLedgerEntry,
 )
 from app import models
+from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 
 from .historical_replay_core import Fact, Reserve, allocate_historical_facts
 from .physical_visibility import visible_sles_for_generation
@@ -262,7 +263,7 @@ def run_historical_replay(
 
     reserves: list[Reserve] = []
     entry_by_core_id: dict[str, ReservationEntry] = {}
-    pools_by_key: dict[tuple[int, str, str, str], set[str]] = {}
+    pools_by_key: dict[tuple[int, str, str], set[str]] = {}
     contour_refs = contour_warehouse_refs(db)
     has_warehouse_policy = db.query(models.StockWarehouse).count() > 0
     visible_candidates = [
@@ -283,22 +284,6 @@ def run_historical_replay(
         row for row in candidate_rows
         if str(row.movement_kind or "") in _IGNORED_FACT_KINDS
     ]
-    factual_identities_by_key: dict[
-        tuple[int, str],
-        set[tuple[str, str]],
-    ] = {}
-    for row in physical_rows:
-        factual_identities_by_key.setdefault(
-            (
-                int(row.item_id),
-                _fact_mode(row),
-            ),
-            set(),
-        ).add((
-            str(row.characteristic_ref or ""),
-            str(row.organization_ref or ""),
-        ))
-
     for row in entries:
         if row.run_id is None:
             raise ValueError(f"reservation {row.id} has no run lineage")
@@ -318,7 +303,7 @@ def run_historical_replay(
             bucket_date=bucket.bucket_date if bucket else None,
             bucket_id=int(bucket.id) if bucket else None,
             characteristic_ref=str(row.characteristic_ref or ""),
-            organization_ref=str(row.organization_ref or ""),
+            organization_ref="",
             planning_stock_pool=str(row.planning_stock_pool or ""),
             order_refs=order_refs_by_requirement.get(int(row.requirement_id), ()),
         )
@@ -327,7 +312,6 @@ def run_historical_replay(
         pools_by_key.setdefault(
             (
                 reserve.item_id,
-                reserve.characteristic_ref,
                 reserve.organization_ref,
                 reserve.mode,
             ),
@@ -340,12 +324,15 @@ def run_historical_replay(
     sle_by_core_id: dict[str, StockLedgerEntry] = {}
     identity_by_core_id: dict[str, tuple[int | None, str | None]] = {}
     mode_has_pools = set(
-        (item_id, mode) for item_id, _char, _org, mode in pools_by_key.keys()
+        (item_id, mode) for item_id, _org, mode in pools_by_key.keys()
     )
     ambiguous_pool_facts = 0
     ambiguous_identity_facts = 0
     legacy_identity_collapsed_pool_facts = 0
     for row in physical_rows:
+        if str(row.organization_ref or "").strip() != DEFAULT_ORGANIZATION_REF1C:
+            ignored_rows.append(row)
+            continue
         mode = _fact_mode(row)
         if (
             mode == "make"
@@ -371,29 +358,13 @@ def run_historical_replay(
             continue
         exact_key = (
             int(row.item_id),
-            str(row.characteristic_ref or ""),
-            str(row.organization_ref or ""),
+            "",
             mode,
         )
         pools = pools_by_key.get(exact_key, set())
-        fallback_key = (int(row.item_id), mode)
-        fact_characteristic = str(row.characteristic_ref or "")
-        fact_org = str(row.organization_ref or "")
-        fallback_pools = pools_by_key.get(
-            (int(row.item_id), "", "", mode),
-            set(),
-        )
+        fact_characteristic = ""
         if len(pools) == 1:
             pool = next(iter(pools))
-        elif (
-            not pools
-            and len(fallback_pools) == 1
-            and len(factual_identities_by_key.get(fallback_key, set())) == 1
-        ):
-            pool = next(iter(fallback_pools))
-            fact_characteristic = ""
-            fact_org = ""
-            legacy_identity_collapsed_pool_facts += 1
         elif (
             not pools
             and (int(row.item_id), mode) not in mode_has_pools
@@ -413,7 +384,7 @@ def run_historical_replay(
             qty=abs(_decimal(row.qty)),
             posting_at=row.posting_at,
             characteristic_ref=fact_characteristic,
-            organization_ref=fact_org,
+            organization_ref="",
             planning_stock_pool=pool,
             requirement_id=requirement_id,
             order_ref=order_ref,

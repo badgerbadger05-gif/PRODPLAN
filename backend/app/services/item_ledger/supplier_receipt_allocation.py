@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import Iterable
-from sqlalchemy import func, or_
 
 from sqlalchemy.orm import Session
 
@@ -25,7 +24,6 @@ CORRECTION_OPERATION = "8d96f940"
 SUPPLIER_RETURN_OPERATION = "8d96f436"
 TRANSFER_OPERATION = "8d970232"
 SUPPLIER_ORDER_TYPE = "Document_ЗаказПоставщику"
-ZERO_GUID = "00000000-0000-0000-0000-000000000000"
 
 _OPERATION_NAMES = {
     RECEIPT_OPERATION: frozenset({
@@ -117,11 +115,6 @@ class SupplierReceiptBuildResult:
 
 def _text(value: object) -> str:
     return str(value or "").strip()
-
-
-def _canonical_characteristic_ref(value: object) -> str:
-    result = _text(value)
-    return "" if not result or result.lower() == ZERO_GUID else result
 
 
 def _decimal(value: object) -> Decimal:
@@ -266,22 +259,9 @@ def _candidate_order_lines(
     ).one_or_none()
     if order is None:
         return []
-    characteristic = _canonical_characteristic_ref(evidence.characteristic_ref)
-    characteristic_filter = (
-        models.SupplierOrderItem.characteristic_ref1c == characteristic
-        if characteristic
-        else or_(
-            models.SupplierOrderItem.characteristic_ref1c.is_(None),
-            models.SupplierOrderItem.characteristic_ref1c == "",
-            func.lower(
-                models.SupplierOrderItem.characteristic_ref1c
-            ) == ZERO_GUID,
-        )
-    )
     return db.query(models.SupplierOrderItem).filter(
         models.SupplierOrderItem.order_id == order.order_id,
         models.SupplierOrderItem.item_id_ref == evidence.item_id,
-        characteristic_filter,
     ).all()
 
 
@@ -532,8 +512,6 @@ def _rebuild_supplier_receipt_coverage_unsafe(
             )
         if any(
             sle.item_id != row.item_id
-            or _canonical_characteristic_ref(sle.characteristic_ref)
-            != _canonical_characteristic_ref(row.characteristic_ref)
             or _text(sle.warehouse_ref1c) != _text(row.warehouse_ref1c)
             for sle in matched_sles
         ) or sum((_decimal(sle.qty) for sle in matched_sles), Decimal("0")) != _decimal(row.signed_qty):

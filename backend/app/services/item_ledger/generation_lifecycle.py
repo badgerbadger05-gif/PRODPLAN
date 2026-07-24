@@ -31,6 +31,7 @@ from .physical import canonical_content_hash
 from .physical_visibility import visible_sles_for_generation
 from .supplier_receipt_allocation import rebuild_supplier_receipt_coverage
 from .supplier_receipt_odata import extract_supplier_document_evidence
+from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 
 
 CAPABILITIES = {
@@ -238,6 +239,7 @@ def _supplier_candidates(
     return tuple(
         row for row in visible_sles_for_generation(db, generation_id)
         if str(row.recorder_type or "") in _SUPPLIER_DOCUMENT_TYPES
+        and str(row.organization_ref or "") == DEFAULT_ORGANIZATION_REF1C
     )
 
 

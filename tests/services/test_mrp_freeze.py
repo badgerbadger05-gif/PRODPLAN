@@ -14,6 +14,7 @@ import json
 import pytest
 
 from app import models
+from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from app.services.mrp_freeze import (
     LedgerPoolUnavailable,
     build_shared_pools,
@@ -157,7 +158,7 @@ def _world(db, demands, *, root=None, stock=None, future=None):
                 ledger_generation_id=target.id,
                 item_id=item.item_id,
                 characteristic_ref="",
-                organization_ref="",
+                organization_ref=DEFAULT_ORGANIZATION_REF1C,
                 warehouse_ref1c="",
                 on_hand=qty,
             )
@@ -179,7 +180,7 @@ def _world(db, demands, *, root=None, stock=None, future=None):
                 supply_kind="supplier_order",
                 item_id=item.item_id,
                 characteristic_ref="",
-                organization_ref="",
+                organization_ref=DEFAULT_ORGANIZATION_REF1C,
                 planning_stock_pool="default",
                 destination_warehouse_ref1c="WH",
                 source_ref=f"supply-{index}",
@@ -419,7 +420,7 @@ def test_build_shared_pools_ignores_ignored_and_unselected_warehouses(db_session
             ledger_generation_id=target.id,
             item_id=item.item_id,
             characteristic_ref="",
-            organization_ref="",
+            organization_ref=DEFAULT_ORGANIZATION_REF1C,
             warehouse_ref1c="WH-SELECTED",
             on_hand=10,
         ),
@@ -452,8 +453,8 @@ def test_build_shared_pools_ignores_ignored_and_unselected_warehouses(db_session
     assert pools.stock[item.item_id] == pytest.approx(10)
 
 
-def test_build_shared_pools_allows_single_foreign_org_in_selected_warehouse(db_session):
-    item = _item(db_session, "SCOPE-BLOCK")
+def test_build_shared_pools_counts_only_zsm_org_with_foreign_stock_present(db_session):
+    item = _item(db_session, "SCOPE-ZSM-ONLY")
     target = _freeze_candidate_generation(db_session, suffix="block")
     db_session.add(
         models.StockWarehouse(
@@ -465,9 +466,19 @@ def test_build_shared_pools_allows_single_foreign_org_in_selected_warehouse(db_s
             ledger_generation_id=target.id,
             item_id=item.item_id,
             characteristic_ref="",
+            organization_ref=DEFAULT_ORGANIZATION_REF1C,
+            warehouse_ref1c="WH-SELECTED",
+            on_hand=3,
+        )
+    )
+    db_session.add(
+        models.StockBin(
+            ledger_generation_id=target.id,
+            item_id=item.item_id,
+            characteristic_ref="",
             organization_ref="ORG-FOREIGN",
             warehouse_ref1c="WH-SELECTED",
-            on_hand=10,
+            on_hand=7,
         )
     )
     db_session.flush()
@@ -479,10 +490,10 @@ def test_build_shared_pools_allows_single_foreign_org_in_selected_warehouse(db_s
         relevant_item_ids=[item.item_id],
     )
 
-    assert pools.stock[item.item_id] == pytest.approx(10)
+    assert pools.stock[item.item_id] == pytest.approx(3)
 
 
-def test_build_shared_pools_rejects_two_foreign_orgs_in_selected_warehouse(db_session):
+def test_build_shared_pools_selected_only_foreign_orgs_gives_zero_stock(db_session):
     item = _item(db_session, "SCOPE-BLOCK-MULTI")
     target = _freeze_candidate_generation(db_session, suffix="block-multi")
     db_session.add(
@@ -510,39 +521,63 @@ def test_build_shared_pools_rejects_two_foreign_orgs_in_selected_warehouse(db_se
     ])
     db_session.flush()
 
-    with pytest.raises(LedgerPoolUnavailable, match="characteristic/organization physical pools"):
-        build_shared_pools(
-            db_session,
-            [],
-            ledger_generation_id=target.id,
-            relevant_item_ids=[item.item_id],
-        )
+    pools = build_shared_pools(
+        db_session,
+        [],
+        ledger_generation_id=target.id,
+        relevant_item_ids=[item.item_id],
+    )
+    assert pools.stock.get(item.item_id, 0.0) == pytest.approx(0.0)
 
 
-def test_build_shared_pools_rejects_characteristic_in_selected_warehouse(db_session):
-    item = _item(db_session, "SCOPE-CHAR")
-    target = _freeze_candidate_generation(db_session, suffix="char")
+def test_build_shared_pools_collapses_all_characteristics_in_zsm_warehouse(db_session):
+    item = _item(db_session, "SCOPE-CHAR-COLLAPSE")
+    target = _freeze_candidate_generation(db_session, suffix="char-collapse")
     db_session.add(
         models.StockWarehouse(
             warehouse_ref1c="WH-SELECTED", warehouse_name="Selected", is_selected=True
         )
     )
-    db_session.add(
+    db_session.add_all([
         models.StockBin(
             ledger_generation_id=target.id,
             item_id=item.item_id,
-            characteristic_ref="CHARACTERISTIC",
-            organization_ref="",
+            characteristic_ref="",
+            organization_ref=DEFAULT_ORGANIZATION_REF1C,
             warehouse_ref1c="WH-SELECTED",
-            on_hand=10,
-        )
-    )
+            on_hand=2,
+        ),
+        models.StockBin(
+            ledger_generation_id=target.id,
+            item_id=item.item_id,
+            characteristic_ref="00000000-0000-0000-0000-000000000000",
+            organization_ref=DEFAULT_ORGANIZATION_REF1C,
+            warehouse_ref1c="WH-SELECTED",
+            on_hand=3,
+        ),
+        models.StockBin(
+            ledger_generation_id=target.id,
+            item_id=item.item_id,
+            characteristic_ref="CHARACTERISTIC-A",
+            organization_ref=DEFAULT_ORGANIZATION_REF1C,
+            warehouse_ref1c="WH-SELECTED",
+            on_hand=5,
+        ),
+        models.StockBin(
+            ledger_generation_id=target.id,
+            item_id=item.item_id,
+            characteristic_ref="CHARACTERISTIC-B",
+            organization_ref=DEFAULT_ORGANIZATION_REF1C,
+            warehouse_ref1c="WH-SELECTED",
+            on_hand=7,
+        ),
+    ])
     db_session.flush()
 
-    with pytest.raises(LedgerPoolUnavailable, match="characteristic/organization physical pools"):
-        build_shared_pools(
-            db_session,
-            [],
-            ledger_generation_id=target.id,
-            relevant_item_ids=[item.item_id],
-        )
+    pools = build_shared_pools(
+        db_session,
+        [],
+        ledger_generation_id=target.id,
+        relevant_item_ids=[item.item_id],
+    )
+    assert pools.stock[item.item_id] == pytest.approx(17)

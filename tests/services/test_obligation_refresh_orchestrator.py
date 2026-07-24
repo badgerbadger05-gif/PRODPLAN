@@ -8,6 +8,7 @@ import pytest
 from app import models
 from app.services import obligation_refresh_orchestrator as workflow
 from app.services.mrp_result_snapshot import read_mrp_result_manifest
+from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from app.services.obligation_refresh_publish import ObligationRefreshPublishError
 
 
@@ -211,7 +212,7 @@ def test_candidate_replay_applies_fifo_fact_to_candidate_reservation(db_session)
     physical = accepted.physical_import_batch
     db_session.add(models.StockLedgerEntry(
         ingest_batch_id=physical.id, source_content_hash="f" * 64, item_id=item.item_id,
-        characteristic_ref="", organization_ref="", warehouse_ref1c="WH-OUT", qty=Decimal("5"),
+        characteristic_ref="", organization_ref=DEFAULT_ORGANIZATION_REF1C, warehouse_ref1c="WH-OUT", qty=Decimal("5"),
         posting_at=datetime(2026, 7, 2, tzinfo=timezone.utc), record_type="receipt",
         movement_kind="assembly_in", recorder_type="Production", recorder_ref="FIFO", line_no="1",
     ))

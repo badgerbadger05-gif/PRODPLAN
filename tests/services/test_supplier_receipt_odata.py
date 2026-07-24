@@ -50,6 +50,7 @@ def _sle(
     line="1",
     qty="2",
     warehouse="wh-in",
+    characteristic="00000000-0000-0000-0000-000000000000",
 ):
     row = models.StockLedgerEntry(
         item_id=item.item_id,
@@ -57,7 +58,7 @@ def _sle(
         recorder_ref=ref,
         line_no=line,
         qty=Decimal(qty),
-        characteristic_ref="",
+        characteristic_ref=characteristic,
         warehouse_ref1c=warehouse,
     )
     row.id = row_id
@@ -72,6 +73,7 @@ def _doc(
     qty="2",
     warehouse="wh-in",
     line="1",
+    characteristic="00000000-0000-0000-0000-000000000000",
 ):
     return {
         "Ref_Key": ref,
@@ -83,10 +85,38 @@ def _doc(
         "Запасы": [{
             "LineNumber": line,
             "Номенклатура_Key": "item-ref",
-            "Характеристика_Key": "00000000-0000-0000-0000-000000000000",
+            "Характеристика_Key": characteristic,
             "Количество": qty,
         }],
     }
+
+
+def test_characteristic_mismatch_between_ledger_and_document_is_accepted_as_evidence(
+    db_session,
+):
+    item = _item(db_session)
+    entry = _sle(
+        item,
+        characteristic="phys-char-1",
+        doc_type="Document_ПриходнаяНакладная",
+        ref="mismatch-ref",
+    )
+    doc = _doc(
+        "mismatch-ref",
+        RECEIPT_OPERATION,
+        "Приобретение у поставщика",
+        characteristic="doc-char-1",
+    )
+
+    result = extract_supplier_document_evidence(
+        db_session,
+        _Client({"Document_ПриходнаяНакладная(guid'mismatch-ref')": doc}),
+        [entry],
+    )
+
+    assert result.evidence[0].characteristic_ref == "doc-char-1"
+    assert result.evidence[0].receipt_doc_ref == "mismatch-ref"
+    assert result.diagnostics == ()
 
 
 def test_exact_receipt_fetch_is_deduplicated_and_preserves_basis_line_zero(db_session):

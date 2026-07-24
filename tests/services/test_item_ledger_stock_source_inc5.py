@@ -34,6 +34,7 @@ from app.services.item_ledger import (
     stock_source,
     use_bin_stock,
 )
+from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from app.services.item_ledger.config import STOCK_SOURCE_BIN, STOCK_SOURCE_LEGACY
 from app.services.mrp_stock_helpers import effective_stock_by_item_all
 from app.services.mrp_freeze import build_shared_pools
@@ -81,7 +82,7 @@ def _seed_bin(db, item_id, wh, qty, period=datetime.date(2026, 7, 1)):
     generation = db.get(models.PlanningTruthState, 1).current_generation
     seed_from_balance(
         db,
-        {LedgerKey(item_id, "", "", wh): qty},
+        {LedgerKey(item_id, "", DEFAULT_ORGANIZATION_REF1C, wh): qty},
         anchor_period=period,
         import_batch=generation.physical_import_batch,
         ledger_generation_id=generation.id,

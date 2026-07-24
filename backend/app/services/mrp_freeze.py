@@ -71,6 +71,7 @@ from .planning_truth import (
     CAPABILITY_RESERVATION_REPLAY,
     require_accepted_truth,
 )
+from .one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from .supplier_order_status import state_counts_in_mrp
 from .replenishment import (
     REPLENISHMENT_FLOW_PURCHASE,
@@ -278,6 +279,7 @@ class _MrpWarehouseScope:
     selected_refs: Set[str]
     ignored_refs: Set[str]
     finished_refs: Set[str]
+    organization_ref: str = DEFAULT_ORGANIZATION_REF1C
 
 
 def _mrp_warehouse_scope(db: Session) -> _MrpWarehouseScope:
@@ -304,6 +306,7 @@ def _mrp_warehouse_scope(db: Session) -> _MrpWarehouseScope:
         selected_refs=selected_refs,
         ignored_refs=ignored_refs,
         finished_refs=finished_refs,
+        organization_ref=DEFAULT_ORGANIZATION_REF1C,
     )
 
 
@@ -321,6 +324,7 @@ def _apply_mrp_warehouse_scope(
         query = query.filter(~StockBin.warehouse_ref1c.in_(scope.ignored_refs))
     if scope.finished_refs:
         query = query.filter(~StockBin.warehouse_ref1c.in_(scope.finished_refs))
+    query = query.filter(StockBin.organization_ref == scope.organization_ref)
     return query
 
 
@@ -348,7 +352,6 @@ def build_shared_pools(
     relevant_ids = {int(i) for i in (relevant_item_ids or ())}
     stock = _ledger_stock_by_item_all(db, int(ledger_generation_id))
     stock_initial = dict(stock)
-    _reject_incompatible_physical_pools(db, int(ledger_generation_id), relevant_ids)
     future_rows = (
         db.query(LedgerFutureSupply)
         .filter(LedgerFutureSupply.ledger_generation_id == int(ledger_generation_id))
@@ -429,46 +432,6 @@ def _ledger_stock_by_item_all(db: Session, ledger_generation_id: int) -> Dict[in
         int(item_id): _to_float(qty)
         for item_id, qty in query.group_by(StockBin.item_id).all()
     }
-
-
-def _reject_incompatible_physical_pools(
-    db: Session,
-    ledger_generation_id: int,
-    relevant_item_ids: Set[int],
-) -> None:
-    if not relevant_item_ids:
-        return
-    rows = (
-        db.query(
-            StockBin.item_id,
-            StockBin.characteristic_ref,
-            StockBin.organization_ref,
-        )
-        .filter(
-            StockBin.ledger_generation_id == int(ledger_generation_id),
-            StockBin.item_id.in_(relevant_item_ids),
-            func.abs(StockBin.on_hand) > EPS,
-        )
-        .distinct()
-    )
-    rows = _apply_mrp_warehouse_scope(rows, _mrp_warehouse_scope(db)).all()
-    pools: Dict[int, Set[Tuple[str, str]]] = defaultdict(set)
-    for item_id, characteristic_ref, organization_ref in rows:
-        pools[int(item_id)].add(
-            (str(characteristic_ref or ""), str(organization_ref or ""))
-        )
-    incompatible = sorted(
-        item_id
-        for item_id, keys in pools.items()
-        if len(keys) > 1
-        or any(characteristic for characteristic, _ in keys)
-    )
-    if incompatible:
-        raise LedgerPoolUnavailable(
-            "ledger_pool_unavailable: MRP requirements cannot identify "
-            "characteristic/organization physical pools for items "
-            f"{incompatible}; rebuild with pool-aware obligation schema"
-        )
 
 
 def _reject_legacy_future_supply(

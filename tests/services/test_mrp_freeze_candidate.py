@@ -7,6 +7,7 @@ import json
 import pytest
 
 from app import models
+from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from app.services.mrp_freeze import (
     LedgerPoolUnavailable,
     build_shared_pools,
@@ -59,7 +60,7 @@ def _candidate_world(db, quantities=(10, 20)):
     db.add(item); db.flush()
     db.add(models.StockBin(
         ledger_generation_id=target.id, item_id=item.item_id,
-        characteristic_ref="", organization_ref="", warehouse_ref1c="", on_hand=15,
+        characteristic_ref="", organization_ref=DEFAULT_ORGANIZATION_REF1C, warehouse_ref1c="", on_hand=15,
     ))
     # The future-supply capture precedes the executor and belongs to the exact
     # candidate generation.

@@ -501,20 +501,16 @@ def extract_supplier_document_evidence(
                         entry, "item_mismatch", "document item differs from Ledger row"
                     ))
                     continue
-                characteristic = _guid(_first(
-                    row, "Характеристика_Key", "Characteristic_Key"
-                ))
                 if (
                     any(
                         int(physical.item_id) != int(entry.item_id)
-                        or _guid(physical.characteristic_ref) != characteristic
                         for physical in physical_rows
                     )
                 ):
                     diagnostics.append(_diagnostic(
                         entry,
-                        "characteristic_mismatch",
-                        "document characteristic differs from Ledger row",
+                        "item_mismatch",
+                        "document item differs from Ledger row",
                     ))
                     continue
                 code, signed_qty = _signed_document_qty(recorder_type, sle_qty, row)
@@ -546,7 +542,9 @@ def extract_supplier_document_evidence(
                     supplier_order_ref="",
                     supplier_order_line_no="0",
                     item_id=int(entry.item_id),
-                    characteristic_ref=characteristic,
+                    characteristic_ref=_guid(_first(
+                        row, "Характеристика_Key", "Characteristic_Key"
+                    )),
                     warehouse_ref1c=warehouse,
                     signed_qty=signed_qty,
                     correction_receipt_ref=correction_ref,
@@ -569,17 +567,6 @@ def extract_supplier_document_evidence(
                     entry, "item_mismatch", "document item differs from Ledger row"
                 ))
                 continue
-            characteristic = _guid(_text(physical_rows[0].characteristic_ref))
-            if any(
-                _guid(physical.characteristic_ref) != characteristic
-                for physical in physical_rows
-            ):
-                diagnostics.append(_diagnostic(
-                    entry,
-                    "characteristic_mismatch",
-                    "document characteristic differs from Ledger row",
-                ))
-                continue
             expected_warehouse = _guid(physical_rows[0].warehouse_ref1c)
             if any(_guid(physical.warehouse_ref1c) != expected_warehouse for physical in physical_rows):
                 diagnostics.append(_diagnostic(
@@ -591,11 +578,6 @@ def extract_supplier_document_evidence(
             mismatch_code = ""
             for row_no, doc_row in list(enumerate(unused_rows)):
                 if _guid(doc_row.get("Номенклатура_Key")) != expected_item_ref:
-                    continue
-                row_characteristic = _guid(_first(
-                    doc_row, "Характеристика_Key", "Characteristic_Key"
-                ))
-                if row_characteristic != characteristic:
                     continue
                 code, row_signed_qty = _signed_document_qty(
                     recorder_type, sle_qty, doc_row
@@ -645,6 +627,9 @@ def extract_supplier_document_evidence(
                 if index not in selected_indices_set
             ]
             row = selected_rows[0]
+            evidence_characteristic = _guid(_first(
+                row, "Характеристика_Key", "Characteristic_Key"
+            ))
             order_refs = {_row_order_tuple(row_, doc) for row_ in selected_rows}
             supplier_order_ref = ""
             supplier_order_type = ""
@@ -700,7 +685,7 @@ def extract_supplier_document_evidence(
                 supplier_order_ref=supplier_order_ref,
                 supplier_order_line_no=supplier_order_line,
                 item_id=int(entry.item_id),
-                characteristic_ref=characteristic,
+                characteristic_ref=evidence_characteristic,
                 warehouse_ref1c=warehouse,
                 signed_qty=signed_qty,
                 correction_receipt_ref=correction_ref,
