@@ -65,48 +65,55 @@ def fact(
 
 
 def test_exact_requirement_wins_before_fifo():
-    old = reserve("old", 10, due=date(2026, 5, 31))
-    linked = reserve("linked", 20)
+    old = reserve("old", 10, due=date(2026, 5, 31), mode="consume")
+    linked = reserve("linked", 20, mode="consume")
 
-    result = allocate_historical_facts([fact("f", "6", requirement_id=20)], [old, linked])
+    result = allocate_historical_facts(
+        [fact("f", "6", requirement_id=20, mode="consume")],
+        [old, linked],
+    )
 
     assert [(a.reserve_id, a.qty, a.match_rule) for a in result.allocations] == [
         ("linked", Decimal("6"), "requirement")
     ]
 
 
-def test_later_exact_fact_wins_globally_before_earlier_unaddressed_fifo():
+def test_later_consumption_exact_wins_before_earlier_unaddressed_consume_is_unplanned():
     rows = [
-        reserve("owned", 20, qty="5"),
-        reserve("pool", 10, due=date(2026, 5, 31), qty="5"),
+        reserve("owned", 20, qty="5", mode="consume"),
+        reserve("pool", 10, due=date(2026, 5, 31), qty="5", mode="consume"),
     ]
     early = Fact(
         **{
-            **fact("early", "7").__dict__,
+            **fact("early", "7", mode="consume").__dict__,
             "posting_at": datetime(2026, 6, 1, tzinfo=timezone.utc),
         }
     )
-    late = fact("late", "5", requirement_id=20)
+    late = fact("late", "5", requirement_id=20, mode="consume")
 
     result = allocate_historical_facts([early, late], rows)
 
     assert [(a.fact_id, a.reserve_id, a.match_rule) for a in result.allocations] == [
-        ("late", "owned", "requirement"),
-        ("early", "pool", "fifo"),
+        ("late", "owned", "requirement")
     ]
-    assert result.unplanned_qty == Decimal("2")
+    assert result.unplanned[0].reason == "consume_fact_requires_address"
+    assert result.unplanned_qty == Decimal("7")
 
 
-def test_order_link_wins_then_make_surplus_uses_canonical_fifo():
-    old = reserve("old", 10, due=date(2026, 5, 31), qty="4")
-    linked = reserve("linked", 20, qty="3", order_refs=("PO-1",))
+def test_order_link_wins_then_consume_surplus_remains_unplanned():
+    old = reserve("old", 10, due=date(2026, 5, 31), qty="4", mode="consume")
+    linked = reserve("linked", 20, qty="3", order_refs=("PO-1",), mode="consume")
 
-    result = allocate_historical_facts([fact("f", "6", order_ref="PO-1")], [linked, old])
+    result = allocate_historical_facts(
+        [fact("f", "6", order_ref="PO-1", mode="consume")],
+        [linked, old],
+    )
 
     assert [(a.reserve_id, a.qty, a.match_rule) for a in result.allocations] == [
         ("linked", Decimal("3"), "order"),
-        ("old", Decimal("3"), "fifo"),
     ]
+    assert result.unplanned[0].reason == "no_eligible_reserve_capacity"
+    assert result.unplanned_qty == Decimal("3")
 
 
 def test_unaddressed_make_fifo_uses_due_plan_run_requirement_bucket_order():
@@ -139,27 +146,58 @@ def test_unaddressed_output_next_year_closes_oldest_reserve():
     ]
 
 
-def test_exact_august_identity_may_deliberately_match_early_output():
+def test_exact_august_identity_may_apply_only_to_consume():
     august = reserve(
         "august",
         8,
         qty="4",
         due=date(2026, 8, 31),
         order_refs=("PO-AUG",),
+        mode="consume",
     )
 
     by_requirement = allocate_historical_facts(
-        [fact("july-owned", "4", requirement_id=8)],
+        [fact("july-owned", "4", requirement_id=8, mode="consume")],
         [august],
     )
     by_order = allocate_historical_facts(
-        [fact("july-order", "4", order_ref="PO-AUG")],
+        [fact("july-order", "4", order_ref="PO-AUG", mode="consume")],
         [august],
     )
 
     assert by_requirement.allocations[0].match_rule == "requirement"
     assert by_order.allocations[0].match_rule == "order"
     assert by_requirement.unplanned_qty == by_order.unplanned_qty == Decimal("0")
+
+
+def test_make_with_identity_never_pegs_fifo_before_older_underproduction():
+    result = allocate_historical_facts(
+        [
+            fact(
+                "june-output",
+                "3",
+                posting_at=datetime(2026, 6, 15, tzinfo=timezone.utc),
+                mode="make",
+            ),
+            fact(
+                "july-output",
+                "2",
+                posting_at=datetime(2027, 7, 9, tzinfo=timezone.utc),
+                requirement_id=13,
+                mode="make",
+            ),
+        ],
+        [
+            reserve("run14", 14, qty="5", due=date(2026, 7, 31), run_id=14),
+            reserve("run13", 13, qty="3", due=date(2026, 6, 30), run_id=13),
+        ],
+    )
+
+    assert [(a.fact_id, a.reserve_id, a.match_rule) for a in result.allocations] == [
+        ("june-output", "run13", "fifo"),
+        ("july-output", "run14", "fifo"),
+    ]
+    assert result.unplanned_qty == Decimal("0")
 
 
 def test_unaddressed_output_still_uses_oldest_prior_period_reserve():

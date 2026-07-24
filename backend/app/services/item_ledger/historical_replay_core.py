@@ -137,10 +137,11 @@ def allocate_historical_facts(
 ) -> ReplayResult:
     """Allocate accepted historical facts without mutating either input.
 
-    Matching order is exact requirement, exact exported/source order, then
-    canonical FIFO for unaddressed ``make`` facts only.  Canonical FIFO priority
-    follows reserve plan periods and run identity before any posting date
-    consideration.
+    For ``consume`` facts, matching order is exact requirement, exact
+    exported/source order, then fail-closed if still unaddressed.
+    ``make`` facts bypass exact matching and use canonical FIFO only.  Canonical
+    FIFO priority follows reserve plan periods and run identity before any
+    posting date consideration.
 
     Unaddressed ``consume`` facts remain explicitly unplanned.
     """
@@ -173,10 +174,12 @@ def allocate_historical_facts(
     sorted_facts = tuple(sorted(fact_rows, key=_fact_key))
     leftovers = {fact.fact_id: fact.qty for fact in sorted_facts}
 
-    # Phase 1: every exact claim is honored before any pool FIFO.  This is
-    # intentionally global: an earlier unaddressed fact must not occupy capacity
-    # owned by a later fact carrying an exact requirement/order identity.
+    # Phase 1: consume claims are addressed by explicit links before FIFO.
+    # Make facts intentionally skip exact match to preserve FIFO-first
+    # reserve exhaustion regardless of document execution timing.
     for fact in sorted_facts:
+        if fact.mode != "consume":
+            continue
         compatible = [
             reserve
             for reserve in ordered_reserves
