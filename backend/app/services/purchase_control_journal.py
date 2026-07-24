@@ -855,6 +855,13 @@ def list_journal(db: Session, **kwargs: Any) -> Dict[str, Any]:
     if kwargs.get("phase"):
         rows = [r for r in rows if r.get("supply_phase") == str(kwargs["phase"])]
 
+    if not kwargs.get("include_to_order", True):
+        rows = [
+            r
+            for r in rows
+            if not (r.get("row_generator") == _BUY_ROW_GENERATOR and r.get("line_status") == "to_order")
+        ]
+
     horizon_iso = kwargs.get("horizon_period_to").isoformat() if kwargs.get("horizon_period_to") else None
     rows = [
         projected

@@ -11,6 +11,7 @@ import pytest
 
 from app import models
 from app.services import planning_truth
+from app.services import purchase_control_materialization as pcm
 from app.services.purchase_control_materialization import (
     PurchaseControlMaterializationError,
     materialize_rows,
@@ -275,6 +276,41 @@ def _recording_materializer(records: list[str], _db, _groups, _request_payload, 
     return _materializer_with_records(_db, _groups, _request_payload, _batch_id, _dry_run)
 
 
+class _FakePurchaseControlODataClient:
+    def __init__(self, *, existing_docs: list[dict] | None = None, fail: bool = False):
+        self.existing_docs = list(existing_docs or [])
+        self.fail = fail
+        self.posts: list[tuple[str, dict]] = []
+        self.gets: list[str] = []
+
+    def get_all(self, entity: str, *, filter_query: str | None = None, **_kwargs):
+        self.gets.append(filter_query or "")
+        if self.fail:
+            raise RuntimeError("simulated get_all failure")
+        return list(self.existing_docs)
+
+    def post(self, entity: str, payload: dict) -> dict:
+        self.posts.append((entity, payload))
+        if self.fail:
+            raise RuntimeError("simulated post failure")
+        return {
+            "Ref_Key": f"po-ref-{len(self.posts)}",
+            "Контрагент_Key": payload.get("Контрагент_Key"),
+            "Запасы": payload.get("Запасы") or [],
+        }
+
+
+def _as_expected_alloc_map(row: dict) -> dict[int, float]:
+    allocations: dict[int, float] = {}
+    for slice_row in row.get("slices", []) or []:
+        rid = slice_row.get("reservation_id")
+        qty = round(float(slice_row.get("to_order_qty") or 0.0), 6)
+        if rid is None or qty <= 0:
+            continue
+        allocations[int(rid)] = round(allocations.get(int(rid), 0.0) + qty, 6)
+    return allocations
+
+
 def test_materialize_rows_rejects_stale_snapshot_id(db_session):
     generation, snapshot = _build_multi_run_snapshot(db_session)
     row = _snapshot_first_row(snapshot)
@@ -322,6 +358,57 @@ def test_materialize_rows_rejects_stale_reservation_generation(db_session):
         )
 
 
+def test_materialize_rows_aggregates_duplicate_reservation_ids_in_expected(db_session):
+    _generation, snapshot = _build_multi_run_snapshot(db_session)
+    rows = snapshot.payload.get("rows")
+    if not isinstance(rows, list) or not rows:
+        raise AssertionError("snapshot row set is malformed")
+    row = rows[0]
+    slices = row.get("slices")
+    if not isinstance(slices, list) or not slices:
+        raise AssertionError("snapshot row has no allocation slices")
+
+    reservation_id = slices[0].get("reservation_id")
+    if reservation_id is None:
+        raise AssertionError("snapshot slice is missing reservation_id")
+
+    original_qty = round(float(slices[0].get("to_order_qty") or 0.0), 6)
+    first_qty = round(original_qty / 2, 6)
+    second_qty = round(original_qty - first_qty, 6)
+    slices[0]["to_order_qty"] = first_qty
+    duplicated = dict(slices[0])
+    duplicated["to_order_qty"] = second_qty
+    duplicated["reservation_id"] = reservation_id
+    slices.append(duplicated)
+    row["slices"] = slices
+    expected_line_count = sum(
+        1
+        for slice_row in slices
+        if float(slice_row.get("to_order_qty") or 0.0) > 0 and slice_row.get("reservation_id") is not None
+    )
+    db_session.flush()
+
+    row_key = row["row_key"]
+    expected_allocs = _as_expected_alloc_map(row)
+
+    result = materialize_rows(
+        db_session,
+        snapshot_id=snapshot.id,
+        row_keys=[row_key],
+        dry_run=False,
+        materializer=lambda *_args, **_kwargs: _materializer_with_records(*_args, **_kwargs),
+    )
+
+    assert result["status"] == "completed"
+    allocations = db_session.query(models.PurchaseExportObligationAllocation).all()
+    assert len(allocations) == expected_line_count
+    by_reservation: dict[int, float] = {}
+    for alloc in allocations:
+        rid = int(alloc.reservation_id)
+        by_reservation[rid] = round(by_reservation.get(rid, 0.0) + float(alloc.allocated_qty), 6)
+    assert by_reservation == expected_allocs
+
+
 def test_materialize_rows_idempotent_retry_and_durable_lineage(db_session, monkeypatch):
     generation, snapshot = _build_multi_run_snapshot(db_session)
     row = _snapshot_first_row(snapshot)
@@ -363,3 +450,151 @@ def test_materialize_rows_idempotent_retry_and_durable_lineage(db_session, monke
     assert second["idempotency_key"] == first["idempotency_key"]
     assert second["status"] == "completed"
     assert len(calls) == 1
+
+
+def test_materialize_rows_default_writer_posts_and_verifies_payload(db_session, monkeypatch):
+    _, snapshot = _build_multi_run_snapshot(db_session)
+    row = _snapshot_first_row(snapshot)
+    expected_allocs = _as_expected_alloc_map(row)
+
+    client = _FakePurchaseControlODataClient()
+
+    monkeypatch.setattr(pcm, "_load_odata_config", lambda: {"base_url": "http://mtzdock/unf_demo/odata/standard.odata"})
+    monkeypatch.setattr(pcm, "OData1CClient", lambda **_: client)
+
+    result = materialize_rows(
+        db_session,
+        snapshot_id=snapshot.id,
+        row_keys=[row["row_key"]],
+        dry_run=False,
+    )
+
+    assert result["status"] == "completed"
+    assert len(client.posts) == 1
+    assert client.gets, "default writer should query marker recovery"
+
+    allocations = db_session.query(models.PurchaseExportObligationAllocation).all()
+    assert len(allocations) == len(expected_allocs)
+    assert {alloc.reservation_id: round(float(alloc.allocated_qty), 6) for alloc in allocations} == expected_allocs
+    assert all(alloc.line_hash is not None for alloc in allocations)
+    assert all(alloc.line_token is not None for alloc in allocations)
+
+
+def test_materialize_rows_default_writer_recovers_existing_order_without_post(db_session, monkeypatch):
+    generation, snapshot = _build_multi_run_snapshot(db_session)
+    row = _snapshot_first_row(snapshot)
+    accepted_snapshot = pcm.purchase_control_snapshot.read_snapshot(db_session)
+    groups, selected_rows, ledger_generation_id = pcm._load_groups_and_lineages(
+        db_session, accepted_snapshot, [row["row_key"]]
+    )
+    request = pcm._build_request_payload(
+        snapshot=accepted_snapshot,
+        requested_keys=[row["row_key"]],
+        selected_rows=selected_rows,
+        groups=groups,
+        ledger_generation_id=ledger_generation_id,
+    )
+    assert ledger_generation_id == generation.id
+
+    request_hash = request["request_hash"]
+    for group in groups:
+        pcm._stamp_group_lines(group, request_hash)
+    existing_doc = {
+        "Ref_Key": "po-ref-existing",
+        "Контрагент_Key": groups[0].supplier_ref1c,
+        "Запасы": pcm._order_lines_payload("po-ref-existing", groups[0]),
+    }
+
+    client = _FakePurchaseControlODataClient(existing_docs=[existing_doc])
+    monkeypatch.setattr(pcm, "_load_odata_config", lambda: {"base_url": "http://mtzdock/unf_demo/odata/standard.odata"})
+    monkeypatch.setattr(pcm, "OData1CClient", lambda **_: client)
+
+    created, allocations, _writer = pcm._materialize_purchase_control_orders_to_1c(
+        db_session,
+        groups,
+        request,
+        1,
+        False,
+    )
+
+    assert created == 0
+    assert allocations, "existing marker should be reused"
+    assert not client.posts
+    assert client.gets
+
+
+def test_materialize_rows_default_writer_rejects_line_payload_mismatch(db_session, monkeypatch):
+    _, snapshot = _build_multi_run_snapshot(db_session)
+    row = _snapshot_first_row(snapshot)
+    accepted_snapshot = pcm.purchase_control_snapshot.read_snapshot(db_session)
+    groups, selected_rows, ledger_generation_id = pcm._load_groups_and_lineages(
+        db_session, accepted_snapshot, [row["row_key"]]
+    )
+    request = pcm._build_request_payload(
+        snapshot=accepted_snapshot,
+        requested_keys=[row["row_key"]],
+        selected_rows=selected_rows,
+        groups=groups,
+        ledger_generation_id=ledger_generation_id,
+    )
+    request_hash = request["request_hash"]
+    for group in groups:
+        pcm._stamp_group_lines(group, request_hash)
+
+    lines = pcm._order_lines_payload("po-ref-existing", groups[0])
+    lines[0]["Количество"] += 1.0
+    existing_doc = {
+        "Ref_Key": "po-ref-existing",
+        "Контрагент_Key": groups[0].supplier_ref1c,
+        "Запасы": lines,
+    }
+
+    client = _FakePurchaseControlODataClient(existing_docs=[existing_doc])
+    monkeypatch.setattr(pcm, "_load_odata_config", lambda: {"base_url": "http://mtzdock/unf_demo/odata/standard.odata"})
+    monkeypatch.setattr(pcm, "OData1CClient", lambda **_: client)
+
+    with pytest.raises(RuntimeError, match="line payload mismatch"):
+        pcm._materialize_purchase_control_orders_to_1c(
+            db_session,
+            groups,
+            request,
+            1,
+            False,
+        )
+
+
+def test_materialize_rows_default_writer_rejects_duplicate_marker_search_result(db_session, monkeypatch):
+    _, snapshot = _build_multi_run_snapshot(db_session)
+    row = _snapshot_first_row(snapshot)
+    accepted_snapshot = pcm.purchase_control_snapshot.read_snapshot(db_session)
+    groups, selected_rows, ledger_generation_id = pcm._load_groups_and_lineages(
+        db_session, accepted_snapshot, [row["row_key"]]
+    )
+    request = pcm._build_request_payload(
+        snapshot=accepted_snapshot,
+        requested_keys=[row["row_key"]],
+        selected_rows=selected_rows,
+        groups=groups,
+        ledger_generation_id=ledger_generation_id,
+    )
+    request_hash = request["request_hash"]
+    for group in groups:
+        pcm._stamp_group_lines(group, request_hash)
+
+    duplicate = {
+        "Ref_Key": "po-ref-dup-1",
+        "Контрагент_Key": groups[0].supplier_ref1c,
+        "Запасы": pcm._order_lines_payload("po-ref-dup-1", groups[0]),
+    }
+    client = _FakePurchaseControlODataClient(existing_docs=[duplicate, duplicate])
+    monkeypatch.setattr(pcm, "_load_odata_config", lambda: {"base_url": "http://mtzdock/unf_demo/odata/standard.odata"})
+    monkeypatch.setattr(pcm, "OData1CClient", lambda **_: client)
+
+    with pytest.raises(RuntimeError, match="несколько документов"):
+        pcm._materialize_purchase_control_orders_to_1c(
+            db_session,
+            groups,
+            request,
+            1,
+            False,
+        )

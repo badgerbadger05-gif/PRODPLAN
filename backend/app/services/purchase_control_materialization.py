@@ -13,14 +13,28 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
+from datetime import date as _date_type
 from typing import Any, Callable, Optional, Sequence, Tuple
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app import models
-from app.services.one_c_export_common import payload_hash as _payload_hash
+from app.services.one_c_export_common import (
+    EMPTY_REF1C,
+    add_origin_marker,
+    clean_ref1c,
+    create_odata_client,
+    fmt_1c_datetime,
+    find_document_by_origin,
+    origin_token,
+    payload_hash as _payload_hash,
+)
+from app.services.odata_config import load_odata_config as _load_odata_config
+from app.services.one_c_purchase_order_export import PURCHASE_ORDER_ENTITY
+from app.services.odata_client import OData1CClient
 from app.services.planning_truth import PlanningTruthUnavailable
 from . import purchase_control_snapshot
 from .purchase_control_snapshot import validate_purchase_control_journal_buy_row
@@ -44,7 +58,7 @@ class ReservationAllocationLine:
     line_hash: Optional[str] = None
 
 
-@dataclass(frozen=True)
+@dataclass
 class MaterializeOrderLine:
     row_key: str
     reservation_id: int
@@ -54,6 +68,8 @@ class MaterializeOrderLine:
     need_date: Optional[str]
     order_date: Optional[str]
     qty: float
+    request_line_token: Optional[int] = None
+    request_line_hash: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -72,6 +88,258 @@ MaterializerCallable = Callable[
 
 _EPS = 1e-9
 _EPS_ALLOC = 1e-6
+
+
+def _canonical_value(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return format(value.normalize(), "f") if value else "0"
+    if isinstance(value, (int, float)):
+        return format(Decimal(str(value)).normalize(), "f") if value else "0"
+    if isinstance(value, _date_type):
+        return value.isoformat()
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(k): _canonical_value(v) for k, v in sorted(value.items())}
+    if isinstance(value, (list, tuple)):
+        return [_canonical_value(v) for v in value]
+    return value
+
+
+def _canonical_hash(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(
+        _canonical_value(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _positive_63bit_token(payload: dict[str, Any]) -> int:
+    value = int.from_bytes(
+        hashlib.sha256(
+            json.dumps(
+                _canonical_value(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).digest()[:8],
+        "big",
+    ) & ((1 << 63) - 1)
+    return value or 1
+
+
+def _acquire_materialization_lock(db: Session, idempotency_key: str) -> None:
+    """Serialize the local claim and the external 1C call for one request."""
+    if db.get_bind().dialect.name != "postgresql":
+        return
+    raw = hashlib.sha256(idempotency_key.encode("utf-8")).digest()[:8]
+    lock_key = int.from_bytes(raw, "big", signed=True)
+    db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": lock_key})
+
+
+def _fmt_need_date(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    try:
+        return fmt_1c_datetime(date.fromisoformat(value))
+    except ValueError:
+        return None
+
+
+def _one_c_line_payload_token_group_hash(group: MaterializeOrderGroup) -> str:
+    """Stable hash payload for a supplier group across instances."""
+    reservation_ids = sorted(int(line.reservation_id) for line in group.lines)
+    payload = {
+        "v": 4,
+        "kind": "purchase_control_materialize_group",
+        "supplier": clean_ref1c(group.supplier_ref1c),
+        "reservation_ids": reservation_ids,
+    }
+    return _canonical_hash(payload)
+
+
+def _group_marker_token(request_hash: str, group: MaterializeOrderGroup) -> str:
+    return origin_token(
+        "purchase_control_materialization",
+        {
+            "request_hash": request_hash,
+            "supplier": clean_ref1c(group.supplier_ref1c),
+            "group_hash": _one_c_line_payload_token_group_hash(group),
+        },
+    )
+
+
+def _line_token_payload(
+    *,
+    line: MaterializeOrderLine,
+    request_hash: str,
+    supplier_ref1c: str,
+) -> dict[str, Any]:
+    return {
+        "v": 4,
+        "kind": "purchase_control_materialize_line",
+        "request_hash": request_hash,
+        "row_key": line.row_key,
+        "supplier": clean_ref1c(supplier_ref1c),
+        "reservation_id": int(line.reservation_id),
+        "item": line.item_ref1c,
+        "unit": line.unit_ref1c,
+        "qty": float(round(line.qty, 6)),
+        "need_date": _normalize_text(line.need_date),
+        "order_date": _normalize_text(line.order_date),
+    }
+
+
+def _stamp_group_lines(group: MaterializeOrderGroup, request_hash: str) -> None:
+    lines = sorted(group.lines, key=lambda line: (line.row_key, line.reservation_id))
+    seen: set[int] = set()
+    for line in lines:
+        payload = _line_token_payload(
+            line=line,
+            request_hash=request_hash,
+            supplier_ref1c=group.supplier_ref1c,
+        )
+        token = _positive_63bit_token(payload)
+        if token in seen:
+            raise RuntimeError("purchase materialization line token collision")
+        seen.add(token)
+        line.request_line_token = token
+        line.request_line_hash = _canonical_hash(payload)
+
+
+def _supplier_order_comment(request_hash: str, group: MaterializeOrderGroup) -> str:
+    marker = _group_marker_token(request_hash=request_hash, group=group)
+    return add_origin_marker(f"PRODPLAN source=purchase_control; {request_hash}", marker)
+
+
+def _order_lines_payload(ref_key: str, group: MaterializeOrderGroup) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line_no, line in enumerate(group.lines, start=1):
+        token = line.request_line_token
+        if token is None:
+            raise RuntimeError("1C purchase materialization requires stamped request line tokens")
+        row = {
+            "LineNumber": line_no,
+            "Номенклатура_Key": line.item_ref1c,
+            "Характеристика_Key": EMPTY_REF1C,
+            "Количество": float(line.qty),
+            "КлючСвязи": int(token),
+            "ДатаПоступления": _fmt_need_date(line.need_date),
+            "Содержание": "",
+        }
+        if clean_ref1c(line.unit_ref1c):
+            row["ЕдиницаИзмерения"] = clean_ref1c(line.unit_ref1c)
+            row["ЕдиницаИзмерения_Type"] = "StandardODATA.Catalog_КлассификаторЕдиницИзмерения"
+        if ref_key:
+            row["Ref_Key"] = ref_key
+        rows.append({k: v for k, v in row.items() if v is not None})
+    return rows
+
+
+def _parse_1c_need_date(value: Any) -> str:
+    if not value:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).date().isoformat()
+    except ValueError:
+        return ""
+
+
+def _verify_order_lines(
+    *,
+    doc: dict[str, Any],
+    group: MaterializeOrderGroup,
+    request_hash: str,
+) -> list[dict[str, Any]]:
+    if not isinstance(doc, dict):
+        raise RuntimeError("1C purchase materialization returned malformed document")
+
+    supplier_ref = clean_ref1c(group.supplier_ref1c)
+    doc_supplier_ref = clean_ref1c(doc.get("Контрагент_Key"))
+    if doc_supplier_ref != supplier_ref:
+        raise RuntimeError("1C purchase materialization returned supplier mismatch")
+
+    lines = doc.get("Запасы")
+    if not isinstance(lines, list) or len(lines) != len(group.lines):
+        raise RuntimeError(
+            "1C purchase materialization did not return exact order lines; "
+            "cannot validate supplier order allocation"
+        )
+
+    supplier_order_ref = clean_ref1c(doc.get("Ref_Key"))
+    if not supplier_order_ref:
+        raise RuntimeError("1C purchase materialization returned no order ref")
+
+    expected_by_token: dict[int, tuple[MaterializeOrderLine, str]] = {}
+    for line in group.lines:
+        if line.request_line_token is None:
+            raise RuntimeError("1C purchase materialization received unstamped order lines")
+        token = int(line.request_line_token)
+        expected_by_token[token] = (
+            line,
+            _canonical_hash(
+                _line_token_payload(
+                    line=line,
+                    request_hash=request_hash,
+                    supplier_ref1c=group.supplier_ref1c,
+                )
+            ),
+        )
+
+    exact_rows: list[tuple[str, int, int, str, MaterializeOrderLine]] = []
+    for actual in lines:
+        try:
+            token = int(actual.get("КлючСвязи"))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("1C purchase materialization returned malformed line token") from exc
+        expected = expected_by_token.pop(token, None)
+        if expected is None:
+            raise RuntimeError("1C purchase materialization returned unknown or duplicate КлючСвязи")
+
+        expected_line, expected_hash = expected
+        line_no = actual.get("LineNumber")
+        if line_no is None:
+            raise RuntimeError("1C purchase materialization line has no exact LineNumber")
+        actual_unit = clean_ref1c(actual.get("ЕдиницаИзмерения"))
+        expected_unit = clean_ref1c(expected_line.unit_ref1c)
+        raw_need = _parse_1c_need_date(actual.get("ДатаПоступления"))
+        expected_need = _parse_1c_need_date(expected_line.need_date)
+        if (
+            _normalize_text(actual.get("Номенклатура_Key")) != expected_line.item_ref1c
+            or _normalize_text(actual.get("Характеристика_Key")) != EMPTY_REF1C
+            or abs(float(actual.get("Количество") or 0.0) - float(expected_line.qty)) > 1e-6
+            or actual_unit != expected_unit
+            or raw_need != (expected_need or "")
+        ):
+            raise RuntimeError("1C purchase materialization line payload mismatch")
+
+        exact_rows.append(
+            (
+                supplier_order_ref,
+                int(line_no),
+                int(token),
+                expected_hash,
+                expected_line,
+            )
+        )
+
+    if expected_by_token:
+        raise RuntimeError("1C purchase materialization did not return every order line token")
+
+    out: list[dict[str, Any]] = []
+    for supplier_order_ref, line_no, token, line_hash, expected_line in exact_rows:
+        out.append(
+            {
+                "reservation_id": int(expected_line.reservation_id),
+                "supplier_order_ref": supplier_order_ref,
+                "supplier_order_line_no": str(line_no),
+                "allocated_qty": float(round(expected_line.qty, 6)),
+                "line_token": token,
+                "line_hash": line_hash,
+                "line_payload_hash": line_hash,
+            }
+        )
+    return out
 
 
 def _to_float(value: Any, *, field: str | None = None) -> float:
@@ -377,6 +645,12 @@ def _build_request_payload(
         "source": "purchase_control_snapshot",
         "snapshot_id": int(snapshot.get("meta", {}).get("snapshot_id") or 0),
         "snapshot_ledger_generation": int(ledger_generation_id),
+        "request_hash": _payload_hash(
+            {
+                "snapshot_id": int(snapshot.get("meta", {}).get("snapshot_id") or 0),
+                "rows": _line_signature(selected_rows),
+            }
+        ),
         "row_count": len(selected_rows),
         "row_keys": sorted(set(_normalize_text(k) for k in requested_keys)),
         "groups": [
@@ -576,6 +850,99 @@ def _flatten_row(row: Any) -> dict[str, Any]:
     return dict(row)
 
 
+def _materialize_purchase_control_orders_to_1c(
+    db: Session,
+    groups: list[MaterializeOrderGroup],
+    request_payload: dict[str, Any],
+    _batch_id: int,
+    _dry_run: bool,
+) -> tuple[int, list[dict[str, Any]], dict[str, Any]]:
+    if _dry_run:
+        return 0, [], {"status": "ok", "orders": 0, "dry_run": True}
+
+    if not groups:
+        return 0, [], {"status": "ok", "orders": 0}
+
+    _ = db  # reader-only
+    request_hash = _normalize_text(request_payload.get("request_hash"))
+    if not request_hash:
+        request_hash = _payload_hash(request_payload)
+
+    for group in groups:
+        _stamp_group_lines(group, request_hash)
+
+    client = create_odata_client(
+        _load_odata_config(), OData1CClient, allow_production=False, require_demo_base=True
+    )
+
+    created = 0
+    all_allocations: list[dict[str, Any]] = []
+    for group in sorted(groups, key=lambda g: g.supplier_id):
+        order_comment = _supplier_order_comment(request_hash, group)
+        header_payload = {
+            "Number": f"PC-{group.supplier_id}-{request_hash[:8]}",
+            "Date": fmt_1c_datetime(date.today()),
+            "Posted": False,
+            "Контрагент_Key": clean_ref1c(group.supplier_ref1c),
+            "ДатаПоступления": _fmt_need_date(_normalize_text(group.lines[0].need_date)),
+            "Комментарий": order_comment,
+            "Запасы": _order_lines_payload("", group),
+        }
+
+        token = _group_marker_token(request_hash=request_hash, group=group)
+        existing = find_document_by_origin(
+            client,
+            entity=PURCHASE_ORDER_ENTITY,
+            token=token,
+            select_fields=["Ref_Key", "Контрагент_Key", "Комментарий", "Запасы"],
+        )
+
+        if existing:
+            doc = existing
+            doc_token = _verify_order_lines(doc=doc, group=group, request_hash=request_hash)
+            for allocation in doc_token:
+                all_allocations.append(allocation)
+            continue
+
+        created_doc = client.post(PURCHASE_ORDER_ENTITY, header_payload)
+        ref_key = clean_ref1c(created_doc.get("Ref_Key") if isinstance(created_doc, dict) else None)
+        if not ref_key:
+            raise RuntimeError("1C purchase materialization did not return order Ref_Key")
+
+        recovered = client.get_all(
+            PURCHASE_ORDER_ENTITY,
+            filter_query=f"substringof('{token}', Комментарий)",
+            select_fields=["Ref_Key", "Контрагент_Key", "Запасы"],
+            top=1,
+            max_records=2,
+            max_pages=1,
+            order_by=None,
+        )
+        if len(recovered) > 1:
+            raise RuntimeError("1C purchase materialization origin marker is ambiguous")
+        if recovered:
+            doc = recovered[0]
+        else:
+            doc = {"Ref_Key": ref_key, **created_doc}
+
+        if not isinstance(doc, dict):
+            raise RuntimeError("1C purchase materialization returned malformed order document")
+
+        doc_token = _verify_order_lines(doc=doc, group=group, request_hash=request_hash)
+        for allocation in doc_token:
+            all_allocations.append(allocation)
+        created += 1
+
+    return created, all_allocations, {"status": "ok", "orders": created}
+
+
+def _resolve_default_materializer() -> MaterializerCallable:
+    config = _load_odata_config()
+    if not isinstance(config, dict) or not str(config.get("base_url") or "").strip():
+        return _materializer_not_configured
+    return _materialize_purchase_control_orders_to_1c
+
+
 def materialize_rows(
     db: Session,
     *,
@@ -641,6 +1008,7 @@ def materialize_rows(
     if dry_run:
         return preview
 
+    _acquire_materialization_lock(db, key)
     existing = db.query(models.PurchaseExportBatch).filter_by(idempotency_key=key).one_or_none()
     if existing is not None:
         if existing.status == "completed":
@@ -671,7 +1039,7 @@ def materialize_rows(
     db.add(batch)
     db.flush()
 
-    writer = materializer or _materializer_not_configured
+    writer = materializer if materializer is not None else _resolve_default_materializer()
 
     try:
         created_qty, allocations_raw, writer_result = writer(
@@ -679,7 +1047,7 @@ def materialize_rows(
             groups,
             request_payload,
             int(batch.id),
-            False,
+            dry_run,
         )
         if not isinstance(created_qty, int) or created_qty < 0:
             raise PurchaseControlMaterializationError("materializer returned malformed created_qty")
@@ -687,11 +1055,14 @@ def materialize_rows(
         if not isinstance(allocations_raw, list):
             raise PurchaseControlMaterializationError("materializer returned malformed allocations")
 
-        expected: dict[int, float] = {
-            int(line.reservation_id): float(round(line.qty, 6))
-            for group in groups
-            for line in group.lines
-        }
+        expected: dict[int, float] = {}
+        for group in groups:
+            for line in group.lines:
+                reservation_id = int(line.reservation_id)
+                expected[reservation_id] = round(
+                    float(expected.get(reservation_id, 0.0)) + float(round(line.qty, 6)),
+                    6,
+                )
 
         allocation_payload = _build_allocation_records(
             [dict(a) for a in allocations_raw],

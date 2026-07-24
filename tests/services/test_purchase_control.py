@@ -27,13 +27,53 @@ from app.models import (
     PlanningReadSnapshot,
 )
 from app.services.one_c_purchase_order_export import PURCHASE_ORDER_ENTITY
+from app.routers.purchase_control import get_orders
 from app.services.purchase_control_journal import (
     _legacy_get_order_card,
     _legacy_list_journal,
+    list_journal,
     list_filters,
 )
 
 TODAY = date(2026, 6, 11)
+SNAPSHOT_CAPABILITIES = {
+    "physical_ledger": True,
+    "reservation_replay": True,
+    "planning_snapshots": True,
+    "purchase_control_journal": True,
+}
+
+
+def _write_snapshot_with_rows(db, *, rows: list[dict], to_order_by_period=None, run_ids=None):
+    generation = db.get(LedgerGeneration, db.info["accepted_journal_generation_id"])
+    generation.capabilities = dict(SNAPSHOT_CAPABILITIES)
+    db.flush()
+    snapshot = PlanningReadSnapshot(
+        consumer="purchase_control_journal",
+        snapshot_key="journal:v1",
+        ledger_generation_id=generation.id,
+        cutoff=generation.cutoff,
+        truth_status="accepted",
+        reason=None,
+        payload={
+            "meta": {
+                "ledger_generation": generation.id,
+                "ledger_generation_id": generation.id,
+                "cutoff": generation.cutoff.isoformat(),
+                "truth_status": "accepted",
+                "read_only": True,
+                "fact_source": "ledger",
+                "run_ids": run_ids or [],
+                "to_order_by_period": to_order_by_period or [],
+            },
+            "rows": list(rows),
+            "cards": {},
+        },
+        published_at=datetime(2026, 6, 1),
+    )
+    db.add(snapshot)
+    db.flush()
+    return snapshot
 
 
 @pytest.fixture(autouse=True)
@@ -265,6 +305,112 @@ def test_list_journal_includes_unordered_mrp_purchases(db_session):
 
     without = _legacy_list_journal(db_session, include_to_order=False, today=TODAY)
     assert all(r["line_status"] != "to_order" for r in without["rows"])
+
+
+def test_list_journal_include_to_order_toggle_for_snapshot_layer(db_session):
+    supplier = _make_supplier(db_session, "snap-supplier", "ООО Тест снапшот")
+    item = _make_item(db_session, "SNAP-1", "Поставка из снапшота", supplier_ref="snap-supplier")
+    _write_snapshot_with_rows(
+        db_session,
+        rows=[
+            {
+                "row_key": "snap-to-order-1",
+                "line_id": None,
+                "purchase_id": None,
+                "source_purchase_ids": [],
+                "order_id": None,
+                "order_number": "",
+                "order_date": None,
+                "order_ref1c": None,
+                "order_state_name": None,
+                "supply_phase": "in_stock",
+                "counts_in_mrp": None,
+                "source": "ledger",
+                "supplier_id": int(supplier.supplier_id),
+                "supplier_name": "ООО Тест снапшот",
+                "item_id": int(item.item_id),
+                "item_code": item.item_code,
+                "item_article": item.item_article,
+                "item_name": item.item_name,
+                "unit": item.unit,
+                "quantity": 10.0,
+                "received_qty": 0.0,
+                "remaining_qty": 10.0,
+                "delivery_date": "2026-06-15",
+                "need_date": "2026-06-15",
+                "overdue_days": 0,
+                "line_status": "to_order",
+                "price": 0.0,
+                "amount": 0.0,
+                "run_id": 1,
+                "run_ids": [1],
+                "reservation_ids": [1],
+                "requirement_ids": [2],
+                "plan_period_from": "2026-06-01",
+                "plan_period_to": "2026-06-30",
+                "period_label": "Июнь 2026",
+                "row_generator": "mrp_reservation",
+                "slices": [],
+            },
+            {
+                "row_key": "snap-expected-1",
+                "line_id": None,
+                "purchase_id": None,
+                "source_purchase_ids": [],
+                "order_id": None,
+                "order_number": "Ожидаемый",
+                "order_date": "2026-06-01",
+                "order_ref1c": "REF-1",
+                "order_state_name": "В закупку",
+                "supply_phase": "in_stock",
+                "counts_in_mrp": None,
+                "source": "ledger",
+                "supplier_id": int(supplier.supplier_id),
+                "supplier_name": "ООО Тест снапшот",
+                "item_id": int(item.item_id),
+                "item_code": item.item_code,
+                "item_article": item.item_article,
+                "item_name": item.item_name,
+                "unit": item.unit,
+                "quantity": 5.0,
+                "received_qty": 1.0,
+                "remaining_qty": 4.0,
+                "delivery_date": "2026-06-20",
+                "need_date": "2026-06-20",
+                "overdue_days": 0,
+                "line_status": "expected",
+                "price": 0.0,
+                "amount": 0.0,
+                "run_id": None,
+                "run_ids": [],
+                "reservation_ids": [],
+                "requirement_ids": [],
+                "plan_period_from": None,
+                "plan_period_to": None,
+                "period_label": None,
+                "row_generator": "ledger_future_supply",
+                "slices": [],
+            },
+        ],
+        to_order_by_period=[{"plan_period_to": "2026-06-30", "total_qty": 10.0, "item_count": 1}],
+        run_ids=[1],
+    )
+    db_session.commit()
+
+    full = get_orders(db=db_session, limit=100, offset=0, include_to_order=True)
+    assert full["summary"]["to_order"] == 1
+    assert any(
+        row.get("row_generator") == "mrp_reservation" and row.get("line_status") == "to_order"
+        for row in full["rows"]
+    )
+
+    limited = get_orders(db=db_session, limit=100, offset=0, include_to_order=False)
+    assert limited["summary"]["to_order"] == 0
+    assert not any(
+        row.get("row_generator") == "mrp_reservation" and row.get("line_status") == "to_order"
+        for row in limited["rows"]
+    )
+    assert all(r["line_status"] == "expected" for r in limited["rows"])
 
 
 def test_journal_aggregates_active_runs(db_session):
