@@ -13,6 +13,25 @@ export type PurchaseFactStatus = 'available' | 'unavailable' | string
 // Фаза движения товара по модели снабжения (группировка состояний 1С).
 export type SupplyPhase = 'no_goods' | 'in_transit' | 'in_stock' | 'terminal' | 'unknown'
 
+export type PurchaseCoverageSlice = {
+  plan_period_from: string | null
+  plan_period_to: string | null
+  period_label: string | null
+  required_qty: number
+  realized_qty: number
+  open_order_covered_qty: number
+  to_order_qty: number
+  to_order_pct: number
+  coverage_slices: unknown[]
+}
+
+export type PurchaseHorizonBucket = {
+  plan_period_to: string | null
+  period_label: string
+  item_count: number
+  total_qty: number
+}
+
 export type PurchaseRow = {
   row_key: string
   line_id: number | null
@@ -43,6 +62,23 @@ export type PurchaseRow = {
   price: number | null
   amount: number | null
   run_id: number | null
+  run_ids?: number[]
+  requirement_ids?: number[]
+  reservation_ids?: number[]
+  planning_stock_pool?: string | null
+  required_qty?: number
+  realized_qty?: number
+  open_order_covered_qty?: number
+  to_order_qty?: number
+  to_order_pct?: number
+  open_order_covered_pct?: number
+  plan_period_from?: string | null
+  plan_period_to?: string | null
+  period_label?: string | null
+  horizon_bucket_count?: number
+  horizon_buckets?: PurchaseHorizonBucket[]
+  slices?: PurchaseCoverageSlice[]
+  row_generator?: string | null
   fact_status: PurchaseFactStatus
   fact_source: string
 }
@@ -129,6 +165,8 @@ export type PurchaseFilters = {
   state: string
   phase: string
   active_only: boolean
+  include_to_order: boolean
+  horizon_period_to: string
   sort_by: 'delivery_date' | 'order_date'
   sort_dir: 'asc' | 'desc'
 }

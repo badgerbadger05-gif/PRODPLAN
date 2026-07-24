@@ -15,10 +15,18 @@ export function getPurchaseFilters() {
   return api<PurchaseFiltersResponse>('/v1/purchase-control/filters')
 }
 
-export function exportPurchasesTo1C(runId: number, purchaseIds: number[]) {
-  return api<Record<string, unknown>>(`/v1/plan/results/${runId}/purchases/export-to-1c`, {
+export function materializePurchaseControlRows(payload: {
+  snapshot_id: number
+  row_keys: string[]
+  dry_run?: boolean
+}) {
+  return api<Record<string, unknown>>('/v1/purchase-control/materialize', {
     method: 'POST',
-    body: JSON.stringify({ purchase_ids: purchaseIds, dry_run: false, allow_production: true }),
+    body: JSON.stringify({
+      snapshot_id: payload.snapshot_id,
+      row_keys: payload.row_keys,
+      dry_run: payload.dry_run ?? false,
+    }),
   })
 }
 

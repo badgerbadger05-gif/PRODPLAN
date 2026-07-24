@@ -67,8 +67,14 @@ export function PurchaseControlPage() {
       access={access}
       breadcrumbs="Закупки / Журнал закупок"
       renderTopBadge={(state) => {
-        const meta = state.listMeta.meta as { ledger_generation?: number } | undefined
-        return <>Ledger: {Number(meta?.ledger_generation ?? state.listMeta.ledger_generation_id) || '—'}</>
+        const meta = state.listMeta.meta as { ledger_generation?: number; snapshot_id?: number } | undefined
+        const snapshot = Number(meta?.snapshot_id ?? 0)
+        const ledger = Number(meta?.ledger_generation ?? state.listMeta.ledger_generation_id)
+        return (
+          <>
+            Снимок: {snapshot || '—'} · Ledger: {ledger || '—'}
+          </>
+        )
       }}
       renderFilters={() => null}
       renderTable={(state) => (

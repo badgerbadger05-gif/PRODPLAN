@@ -14,6 +14,11 @@ const row: PurchaseRow = {
   order_ref1c: null,
   order_state_name: null,
   source: 'mrp',
+  row_generator: 'mrp_reservation',
+  required_qty: 100,
+  realized_qty: 0,
+  open_order_covered_qty: 0,
+  to_order_qty: 100,
   supplier_id: 7,
   supplier_name: 'ООО Металл',
   item_id: 42,
@@ -50,7 +55,7 @@ describe('purchase journal CSV schema', () => {
 
     expect(csv).toBe(
       '"Заказ";"Дата заказа";"Поставщик";"Артикул";"Номенклатура";"Заказано";"Поступило";"Осталось";"Дата поставки";"Просрочка, дн";"Статус 1С";"Фаза";"Статус";"Сумма"\n'
-      + '"MRP #11, MRP #12";"2026-07-20";"ООО Металл";"ART-42";"Лист стальной";"100";"0";"100";"2026-07-25";"";"";"Нет товара";"К заказу";""\n',
+      + '"Под заказ (MRP)";"2026-07-20";"ООО Металл";"ART-42";"Лист стальной";"100";"0";"100";"2026-07-25";"";"";"Нет товара";"К заказу";""\n',
     )
   })
 

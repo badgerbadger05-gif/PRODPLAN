@@ -9953,6 +9953,95 @@
         }
       }
     },
+    "/api/v1/purchase-control/materialize": {
+      "post": {
+        "tags": [
+          "purchase-control"
+        ],
+        "summary": "Materialize",
+        "description": "Materialize selected neutral MRP rows against the accepted snapshot.",
+        "operationId": "materialize_purchase_control_rows_api_v1_purchase_control_materialize_post",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                  "snapshot_id"
+                ],
+                "properties": {
+                  "snapshot_id": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "title": "Snapshot Id"
+                  },
+                  "row_keys": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    },
+                    "title": "Row Keys"
+                  },
+                  "dry_run": {
+                    "type": "boolean",
+                    "default": true,
+                    "title": "Dry Run"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Materialize Api V1 Purchase Control Materialize Post"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service Not Ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Materialize Api V1 Purchase Control Materialize Post 503"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/workshop-binding-review/items": {
       "get": {
         "tags": [

@@ -3058,6 +3058,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/purchase-control/materialize": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Materialize
+         * @description Materialize selected neutral MRP rows against the accepted snapshot.
+         */
+        post: operations["materialize_purchase_control_rows_api_v1_purchase_control_materialize_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/workshop-binding-review/items": {
         parameters: {
             query?: never;
@@ -12161,6 +12181,71 @@ export interface operations {
         responses: {
             /** @description Successful Response */
             200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
+    materialize_purchase_control_rows_api_v1_purchase_control_materialize_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    /** Snapshot Id */
+                    snapshot_id: number;
+                    /** Row Keys */
+                    row_keys?: string[];
+                    /**
+                     * Dry Run
+                     * @default true
+                     */
+                    dry_run?: boolean;
+                };
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Service Not Ready */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

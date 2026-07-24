@@ -3,7 +3,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { PurchaseRow } from '../../domain/purchaseControl'
 import {
-  exportPurchasesTo1C,
+  materializePurchaseControlRows,
   getPurchaseFilters,
   getPurchaseOrderCard,
   listPurchaseJournal,
@@ -12,7 +12,7 @@ import {
 import { PurchaseControlPage } from './PurchaseControlPage'
 
 vi.mock('../../services/purchaseControl', () => ({
-  exportPurchasesTo1C: vi.fn(),
+  materializePurchaseControlRows: vi.fn(),
   getPurchaseFilters: vi.fn(),
   getPurchaseOrderCard: vi.fn(),
   listPurchaseJournal: vi.fn(),
@@ -20,10 +20,10 @@ vi.mock('../../services/purchaseControl', () => ({
 }))
 
 const purchaseRow: PurchaseRow = {
-  row_key: 'purchase:41',
+  row_key: 'buy:9:default',
   line_id: null,
-  purchase_id: 41,
-  source_purchase_ids: [41, 42],
+  purchase_id: null,
+  source_purchase_ids: [],
   order_id: null,
   order_number: '',
   order_date: '2026-07-20',
@@ -40,6 +40,11 @@ const purchaseRow: PurchaseRow = {
   quantity: 12,
   received_qty: 0,
   remaining_qty: 12,
+  row_generator: 'mrp_reservation',
+  to_order_qty: 12,
+  required_qty: 12,
+  realized_qty: 0,
+  open_order_covered_qty: 0,
   delivery_date: null,
   need_date: '2026-07-25',
   overdue_days: 0,
@@ -49,6 +54,12 @@ const purchaseRow: PurchaseRow = {
   price: 100,
   amount: 1200,
   run_id: 17,
+  run_ids: [17, 18],
+  requirement_ids: [101, 102],
+  reservation_ids: [201, 202],
+  planning_stock_pool: 'default',
+  open_order_covered_pct: 0,
+  to_order_pct: 100,
   fact_status: 'available',
   fact_source: 'mrp',
 }
@@ -63,6 +74,7 @@ const orderedRow: PurchaseRow = {
   order_number: 'ЗП-000008',
   order_ref1c: 'order-ref',
   order_state_name: 'К поступлению',
+  row_generator: 'ledger_future_supply',
   received_qty: null,
   line_status: 'unavailable',
   supply_phase: 'in_transit',
@@ -82,8 +94,8 @@ describe('PurchaseControlPage Doctype migration', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     vi.mocked(listPurchaseJournal).mockResolvedValue({
-      rows: [purchaseRow, orderedRow],
-      total: 2,
+      rows: [purchaseRow],
+      total: 1,
       limit: 100,
       offset: 0,
       run_id: 17,
@@ -98,18 +110,18 @@ describe('PurchaseControlPage Doctype migration', () => {
         truth_status: 'accepted',
         truth_reason: null,
         fact_source: 'ledger',
-        received_qty_status: 'unavailable',
+        received_qty_status: 'available',
         read_only: true,
       },
       summary: {
-        total_rows: 2,
-        by_status: { to_order: 1, unavailable: 1 },
-        by_phase: { no_goods: 1, in_transit: 1 },
+        total_rows: 1,
+        by_status: { to_order: 1 },
+        by_phase: { no_goods: 1 },
         to_order: 1,
         overdue: 0,
         expected_7d: 2,
         in_transit_amount: 1200,
-        fact_status: 'unavailable',
+        fact_status: 'available',
       },
     })
     vi.mocked(getPurchaseFilters).mockResolvedValue({
@@ -144,20 +156,23 @@ describe('PurchaseControlPage Doctype migration', () => {
         read_only: true,
       },
     })
-    vi.mocked(exportPurchasesTo1C).mockResolvedValue({ orders_created: 1, orders_existing: 0 })
     vi.mocked(syncSupplierOrdersFrom1C).mockResolvedValue({ orders_created: 0, orders_updated: 1 })
+    vi.mocked(materializePurchaseControlRows).mockResolvedValue({
+      snapshot_id: 51,
+      rows_total: 1,
+      dry_run: false,
+      status: 'completed',
+    })
   })
 
   it('preserves dense journal rows, summary controls and explicit search', async () => {
     renderPage('/purchase-control?order_id=8&search=вал')
 
     expect((await screen.findAllByText('Подшипник ведущего вала')).length).toBeGreaterThan(0)
-    expect(screen.getByText('MRP #41 +1')).toBeInTheDocument()
-    expect(screen.getByText('ЗП-000008')).toBeInTheDocument()
+    expect(screen.getAllByText('Под заказ (MRP)').length).toBeGreaterThan(0)
     expect(screen.getByRole('button', { name: 'Нет товара: 1' })).toBeInTheDocument()
     expect(screen.getByRole('option', { name: 'Промснаб' })).toBeInTheDocument()
-    expect(screen.getAllByText('н/д').length).toBeGreaterThan(0)
-    expect(screen.getByText('Факт поступления: н/д')).toBeInTheDocument()
+    expect(screen.getByText(/оформлено 0% · к заказу 100%/)).toBeInTheDocument()
 
     expect(vi.mocked(listPurchaseJournal).mock.calls[0]?.[0].get('order_id')).toBe('8')
     expect(vi.mocked(listPurchaseJournal).mock.calls[0]?.[0].get('search')).toBe('вал')
@@ -169,23 +184,21 @@ describe('PurchaseControlPage Doctype migration', () => {
     expect(vi.mocked(listPurchaseJournal).mock.calls[1]?.[0].get('search')).toBe('подшипник')
   })
 
-  it('keeps guarded MRP selection and export to 1C flow', async () => {
+  it('keeps guarded MRP selection and materialization flow', async () => {
     renderPage()
-    await screen.findByText('MRP #41 +1')
+    await screen.findAllByText('Под заказ (MRP)')
 
-    const checkboxes = screen.getAllByRole('checkbox')
-    expect(checkboxes).toHaveLength(1)
-    fireEvent.click(checkboxes[0])
-    fireEvent.click(screen.getByRole('button', { name: 'Заказать в 1С (1)' }))
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Выбрать строку buy:9:default' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Сформировать заказы (1)' }))
 
-    await waitFor(() => expect(exportPurchasesTo1C).toHaveBeenCalledWith(17, [41, 42]))
-    expect(await screen.findByText('Заказы поставщику: создано 1, уже было 0')).toBeInTheDocument()
+    await waitFor(() => expect(materializePurchaseControlRows).toHaveBeenCalledWith({ snapshot_id: 51, row_keys: ['buy:9:default'], dry_run: false }))
+    expect(await screen.findByText('Сформировано заказов по 1 строкам снапшота')).toBeInTheDocument()
     await waitFor(() => expect(syncSupplierOrdersFrom1C).toHaveBeenCalled())
   })
 
   it('delegates sorting and instant filters to the runtime data source', async () => {
     renderPage()
-    await screen.findByText('MRP #41 +1')
+    await screen.findAllByText('Под заказ (MRP)')
 
     fireEvent.click(screen.getByRole('button', { name: /^Поставка/ }))
     await waitFor(() => expect(listPurchaseJournal).toHaveBeenCalledTimes(2))

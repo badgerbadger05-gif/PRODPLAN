@@ -1,5 +1,4 @@
 import {
-  purchaseIdsForRow,
   purchaseLineStatusLabel,
   purchaseLineStatusPillClass,
   supplyPhaseLabel,
@@ -43,14 +42,15 @@ export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseRowKeys, 
       </thead>
       <tbody>
         {rows.map((row) => {
-          const purchaseIds = purchaseIdsForRow(row)
-          const purchaseTitle = purchaseIds.map((id) => `MRP #${id}`).join(', ')
+          const runCount = row.run_ids?.length ?? (row.run_id ? 1 : 0)
+          const generatorLabel = row.row_generator === 'mrp_reservation' ? 'Под заказ (MRP)' : row.row_generator
           return (
           <tr key={row.row_key} className={row.row_key === activeRow?.row_key ? 'activeRow' : ''} onClick={() => onActivate(row.row_key)}>
             <td className="checkCol">
-              {row.line_status === 'to_order' && purchaseIds.length > 0 && (
+              {row.line_status === 'to_order' && row.row_generator === 'mrp_reservation' && (row.to_order_qty ?? row.remaining_qty) > 0 && (
                 <input
                   type="checkbox"
+                  aria-label={`Выбрать строку ${row.row_key}`}
                   checked={selectedPurchaseRowKeys.has(row.row_key)}
                   onChange={(e) => {
                     const next = new Set(selectedPurchaseRowKeys)
@@ -65,10 +65,8 @@ export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseRowKeys, 
             <td className={`orderCell ${row.order_ref1c ? 'oneCOrderCell' : ''}`}>
               {row.line_status === 'to_order' ? (
                 <>
-                  <strong title={purchaseTitle}>
-                    MRP #{row.purchase_id ?? purchaseIds[0]}{purchaseIds.length > 1 ? ` +${purchaseIds.length - 1}` : ''}
-                  </strong>
-                  <span title={`заказ ${dateRu(row.order_date) || '—'}`}>заказ {dateRu(row.order_date) || '—'}</span>
+                  <strong title={generatorLabel || ''}>{generatorLabel || 'К заказу'}</strong>
+                  <span>{runCount ? `планов: ${runCount}` : 'общая потребность'} · {row.period_label || dateRu(row.need_date) || 'весь горизонт'}</span>
                 </>
               ) : (
                 <>
@@ -85,8 +83,17 @@ export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseRowKeys, 
               <strong title={row.supplier_name || 'Не указан'}>{row.supplier_name || 'Не указан'}</strong>
             </td>
             <td className="numCell">
-              <strong>{qty(row.remaining_qty)}</strong>
-              <span>/ {qty(row.quantity)} {row.unit || ''}</span>
+              <strong>
+                {qty(row.required_qty ?? row.quantity)}
+                {row.row_generator === 'mrp_reservation' ? ' (нужно)' : ''}
+              </strong>
+              <span>
+                / {qty(row.remaining_qty)}
+                {row.unit ? ` ${row.unit}` : ''}
+                {row.row_generator === 'mrp_reservation'
+                  ? ` · оформлено ${qty(row.open_order_covered_pct ?? 0)}% · к заказу ${qty(row.to_order_pct ?? 0)}%`
+                  : ''}
+              </span>
             </td>
             <td className="numCell">
               {row.received_qty === null

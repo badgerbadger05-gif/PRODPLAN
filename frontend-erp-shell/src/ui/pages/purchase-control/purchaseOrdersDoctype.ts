@@ -1,13 +1,12 @@
 import {
-  purchaseIdsForRow,
   purchaseLineStatusLabel,
   supplyPhaseLabel,
   type PurchaseFilters,
   type PurchaseRow,
 } from '../../../domain/purchaseControl'
 import {
-  exportPurchasesTo1C,
   listPurchaseJournal,
+  materializePurchaseControlRows,
   syncSupplierOrdersFrom1C,
 } from '../../../services/purchaseControl'
 import type { Doctype } from '../../doctype'
@@ -36,7 +35,7 @@ export function createPurchaseOrdersDoctype(
     meta: {
       name: 'purchase_order',
       title: 'Журнал закупок',
-      subtitle: 'Заказы поставщику из 1С и незаказанные MRP-потребности: сроки, поступления, просрочка',
+      subtitle: 'Общие BUY-потребности по планам: поступило, покрыто заказами и точный остаток к заказу',
       hotkeys: 'F5 Обновить · Enter Детали',
       idField: 'row_key',
       selectionMode: 'multiple',
@@ -52,7 +51,7 @@ export function createPurchaseOrdersDoctype(
             key: 'order',
             title: 'Заказ',
             value: (row) => row.line_status === 'to_order'
-              ? purchaseIdsForRow(row).map((id) => `MRP #${id}`).join(', ')
+              ? 'Под заказ (MRP)'
               : row.order_number,
           },
           {
@@ -103,6 +102,8 @@ export function createPurchaseOrdersDoctype(
       state: '',
       phase: '',
       active_only: true,
+      include_to_order: true,
+      horizon_period_to: '',
       sort_by: 'delivery_date',
       sort_dir: 'asc',
     },
@@ -112,6 +113,7 @@ export function createPurchaseOrdersDoctype(
           limit: String(limit),
           offset: String(offset),
           active_only: filters.active_only ? 'true' : 'false',
+          include_to_order: filters.include_to_order ? 'true' : 'false',
           sort_by: sortBy === 'order' ? 'order_date' : sortBy === 'delivery_date' ? 'delivery_date' : filters.sort_by,
           sort_dir: sortDir ?? filters.sort_dir,
         })
@@ -121,11 +123,10 @@ export function createPurchaseOrdersDoctype(
         if (filters.line_status) params.set('line_status', filters.line_status)
         if (filters.state) params.set('state', filters.state)
         if (filters.phase) params.set('phase', filters.phase)
+        if (filters.horizon_period_to) params.set('horizon_period_to', filters.horizon_period_to)
         return listPurchaseJournal(params)
       },
     },
-    // The journal keeps its proven dense table renderer. These declarations remain
-    // the shared sizing/sorting contract and make the resource discoverable by the ERP registry.
     columns: purchaseOrderColumns.map((column) => ({
       ...column,
       type: column.key === 'select' ? 'select-checkbox' as const : undefined,
@@ -137,27 +138,34 @@ export function createPurchaseOrdersDoctype(
       { kind: 'toggle', field: 'active_only', label: 'Активные' },
       { kind: 'select', field: 'state', label: 'Статус 1С', options: [], allowEmpty: true },
       { kind: 'select', field: 'line_status', label: 'Статус', options: [], allowEmpty: true },
+      { kind: 'toggle', field: 'include_to_order', label: 'К заказу' },
+      { kind: 'search', field: 'horizon_period_to', mode: 'submit' },
     ],
     actions: [
       {
-        key: 'export_1c',
-        label: ({ selection }) => `Заказать в 1С${selection.length ? ` (${selection.length})` : ''}`,
+        key: 'materialize',
+        label: ({ selection }) => `Сформировать заказы${selection.length ? ` (${selection.length})` : ''}`,
         scope: 'selection',
         tone: 'primary',
         disabledReason: ({ selection }) => selection.length
           ? ''
-          : 'Выберите строки «К заказу»',
+          : 'Выберите MRP-строки к заказу',
         async run({ selection, listMeta }) {
-          const runId = Number(listMeta.run_id ?? 0)
-          if (!runId) return { error: 'Нет зафиксированного MRP-прогона: нечего заказывать' }
-          const purchaseIds = [...new Set(selection.flatMap(purchaseIdsForRow))]
-          if (!purchaseIds.length) return { error: 'В выбранных строках нет MRP-потребностей' }
-          const result = await exportPurchasesTo1C(runId, purchaseIds)
-          const created = Number(result.orders_created ?? 0)
-          const existing = Number(result.orders_existing ?? 0)
+          const snapshotId = Number((listMeta.meta as { snapshot_id?: number } | undefined)?.snapshot_id ?? 0)
+          if (!snapshotId) return { error: 'Снимок закупок ещё не зафиксирован' }
+          const selectedRowKeys = [
+            ...new Set(selection.map((row) => row.row_key)),
+          ]
+          if (!selectedRowKeys.length) return { error: 'В выбранных строках нет строк к заказу' }
+          const result = await materializePurchaseControlRows({
+            snapshot_id: snapshotId,
+            row_keys: selectedRowKeys,
+            dry_run: false,
+          })
+          const rowsTotal = Number((result as { rows_total?: number }).rows_total ?? selectedRowKeys.length)
           await syncSupplierOrdersFrom1C().catch(() => undefined)
           return {
-            message: `Заказы поставщику: создано ${created}, уже было ${existing}`,
+            message: `Сформировано заказов по ${rowsTotal} строкам снапшота`,
             clearSelection: true,
             reload: true,
           }
@@ -179,11 +187,13 @@ export function createPurchaseOrdersDoctype(
     permissions: {
       view: ['viewer', 'buyer', 'planner', 'admin'],
       actions: {
-        export_1c: 'purchase.export_1c',
+        materialize: 'purchase.export_1c',
         sync_1c: 'purchase.sync_1c',
       },
     },
-    selectable: (row) => row.line_status === 'to_order' && purchaseIdsForRow(row).length > 0,
-    selectionDisabledReason: () => 'Заказывать можно только строки «К заказу» с MRP-потребностью',
+    selectable: (row) => row.line_status === 'to_order'
+      && row.row_generator === 'mrp_reservation'
+      && Number(row.to_order_qty ?? row.remaining_qty) > 0,
+    selectionDisabledReason: () => 'К заказу можно выбирать только строки MRP-снабжения (row_generator = mrp_reservation)',
   }
 }

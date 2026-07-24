@@ -1,6 +1,5 @@
 import { useEffect, useState } from 'react'
 import {
-  purchaseIdsForRow,
   purchaseLineStatusLabel,
   purchaseLineStatusPillClass,
   supplyPhaseLabel,
@@ -46,11 +45,6 @@ export function PurchaseDetailPane({ activeRow, embedded = false }: Props) {
     return embedded ? empty : <aside className="detailPane">{empty}</aside>
   }
 
-  const mrpHref = activeRow.run_id && activeRow.purchase_id
-    ? `#/mrp-runs/${activeRow.run_id}?tab=purchases&purchase_id=${activeRow.purchase_id}`
-    : null
-  const purchaseIds = purchaseIdsForRow(activeRow)
-
   const content = (
     <>
       <h2>{activeRow.line_status === 'to_order' ? 'MRP-потребность' : 'Карточка строки'}</h2>
@@ -59,15 +53,27 @@ export function PurchaseDetailPane({ activeRow, embedded = false }: Props) {
       <div className="detailGrid">
         {activeRow.line_status === 'to_order' ? (
           <>
-            <span>Закупка MRP</span><strong>{purchaseIds.map((id) => `#${id}`).join(', ') || '—'}</strong>
+            <span>Генератор</span><strong>{activeRow.row_generator === 'mrp_reservation' ? 'Под заказ (MRP)' : activeRow.row_generator || '—'}</strong>
+            <span>Планы</span><strong>{activeRow.run_ids?.length ?? (activeRow.run_id ? 1 : 0)}</strong>
             <span>Дата заказа</span><strong>{dateRu(activeRow.order_date) || '—'}</strong>
             <span>Дата потребности</span><strong>{dateRu(activeRow.need_date) || '—'}</strong>
+            <span>Общая потребность / к заказу</span>
+            <strong>
+              {activeRow.required_qty == null ? '—' : qty(activeRow.required_qty)} / {activeRow.to_order_qty == null ? '—' : qty(activeRow.to_order_qty)}
+            </strong>
+            <span>Поступило сейчас</span>
+            <strong>{activeRow.realized_qty == null ? '—' : qty(activeRow.realized_qty)}</strong>
+            <span>Покрыто заказами</span>
+            <strong>{activeRow.open_order_covered_qty == null ? '—' : `${qty(activeRow.open_order_covered_qty)} (${qty(activeRow.open_order_covered_pct ?? 0)}%)`}</strong>
+            <span>К заказу</span>
+            <strong>{activeRow.to_order_qty == null ? '—' : `${qty(activeRow.to_order_qty)} (${qty(activeRow.to_order_pct ?? 0)}%)`}</strong>
           </>
         ) : (
           <>
             <span>Заказ</span><strong>{activeRow.order_number}</strong>
             <span>Дата заказа</span><strong>{dateRu(activeRow.order_date) || '—'}</strong>
             <span>Дата поставки</span><strong>{dateRu(activeRow.delivery_date) || '—'}</strong>
+            <span>Источник</span><strong>{activeRow.row_generator || '—'}</strong>
             <span>Статус 1С</span>
             <strong>
               {activeRow.order_state_name ? (
@@ -83,14 +89,18 @@ export function PurchaseDetailPane({ activeRow, embedded = false }: Props) {
           </>
         )}
         <span>Поставщик</span><strong>{activeRow.supplier_name || 'Не указан'}</strong>
-        <span>Заказано</span><strong>{qty(activeRow.quantity)} {activeRow.unit || ''}</strong>
-        <span>Поступило</span>
-        <strong>
-          {activeRow.received_qty === null
-            ? <span className="muted" title="Факт поступления отсутствует в снимке">н/д</span>
-            : `${qty(activeRow.received_qty)} ${activeRow.unit || ''}`}
-        </strong>
-        <span>Осталось</span><strong>{qty(activeRow.remaining_qty)} {activeRow.unit || ''}</strong>
+        {activeRow.line_status !== 'to_order' && (
+          <>
+            <span>Заказано</span><strong>{qty(activeRow.quantity)} {activeRow.unit || ''}</strong>
+            <span>Поступило</span>
+            <strong>
+              {activeRow.received_qty === null
+                ? <span className="muted" title="Факт поступления отсутствует в снимке">н/д</span>
+                : `${qty(activeRow.received_qty)} ${activeRow.unit || ''}`}
+            </strong>
+            <span>Осталось</span><strong>{qty(activeRow.remaining_qty)} {activeRow.unit || ''}</strong>
+          </>
+        )}
         {activeRow.price !== null && activeRow.price > 0 && (<><span>Цена</span><strong>{qty(activeRow.price)}</strong></>)}
         {activeRow.amount !== null && activeRow.amount > 0 && (<><span>Сумма</span><strong>{qty(activeRow.amount)}</strong></>)}
         <span>Статус</span>
@@ -103,12 +113,6 @@ export function PurchaseDetailPane({ activeRow, embedded = false }: Props) {
               </span>
             )}
         </strong>
-        {mrpHref && (
-          <>
-            <span>Источник</span>
-            <strong><a href={mrpHref}>MRP прогон #{activeRow.run_id}</a></strong>
-          </>
-        )}
       </div>
 
       {orderId && (
