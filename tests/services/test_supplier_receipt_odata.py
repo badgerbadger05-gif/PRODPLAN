@@ -122,6 +122,81 @@ def test_exact_receipt_fetch_is_deduplicated_and_preserves_basis_line_zero(db_se
     assert result.diagnostics == ()
 
 
+def test_reversed_receipt_rows_match_by_semantic_signature_not_line_number(db_session):
+    item = _item(db_session)
+    entries = [
+        _sle(item, row_id=1, line="1", qty="1", warehouse="wh-receipt"),
+        _sle(item, row_id=2, line="2", qty="4", warehouse="wh-receipt"),
+    ]
+    doc = _doc(
+        "receipt-ref",
+        RECEIPT_OPERATION,
+        "Приобретение у поставщика",
+        warehouse="wh-receipt",
+    )
+    doc["Запасы"] = [
+        {
+            "LineNumber": "1",
+            "Номенклатура_Key": "item-ref",
+            "Характеристика_Key": "00000000-0000-0000-0000-000000000000",
+            "Количество": "4",
+        },
+        {
+            "LineNumber": "2",
+            "Номенклатура_Key": "item-ref",
+            "Характеристика_Key": "00000000-0000-0000-0000-000000000000",
+            "Количество": "1",
+        },
+    ]
+
+    result = extract_supplier_document_evidence(
+        db_session,
+        _Client({
+            "Document_ПриходнаяНакладная(guid'receipt-ref')": doc
+        }),
+        entries,
+    )
+
+    assert len(result.evidence) == 2
+    assert [row.receipt_doc_line_no for row in result.evidence] == ["1", "2"]
+    assert {row.signed_qty for row in result.evidence} == {Decimal("1"), Decimal("4")}
+    assert result.diagnostics == ()
+
+
+def test_ambiguous_identical_document_rows_fail_with_duplicate_error(db_session):
+    item = _item(db_session)
+    doc = _doc(
+        "receipt-ref",
+        RECEIPT_OPERATION,
+        "Приобретение у поставщика",
+    )
+    doc["Запасы"] = [
+        {
+            "LineNumber": "1",
+            "Номенклатура_Key": "item-ref",
+            "Характеристика_Key": "00000000-0000-0000-0000-000000000000",
+            "Количество": "2",
+        },
+        {
+            "LineNumber": "2",
+            "Номенклатура_Key": "item-ref",
+            "Характеристика_Key": "00000000-0000-0000-0000-000000000000",
+            "Количество": "2",
+        },
+    ]
+
+    result = extract_supplier_document_evidence(
+        db_session,
+        _Client({
+            "Document_ПриходнаяНакладная(guid'receipt-ref')": doc
+        }),
+        [_sle(item, qty="2")],
+    )
+
+    assert result.evidence == ()
+    assert result.diagnostics[0].code == "duplicate_document_line"
+
+
 def test_correction_receipt_minus_one_requires_typed_original_receipt(db_session):
     item = _item(db_session)
     entry = _sle(

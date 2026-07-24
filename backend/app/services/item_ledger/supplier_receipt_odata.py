@@ -171,6 +171,26 @@ def _correction_delta(row: dict) -> Decimal | None:
     return None
 
 
+def _signed_document_qty(
+    recorder_type: str,
+    sle_qty: Decimal,
+    row: dict,
+) -> tuple[str, Decimal | None]:
+    if recorder_type == "Document_КорректировкаПоступления":
+        delta = _correction_delta(row)
+        if delta is None:
+            return "correction_delta_unverified", None
+        return "", delta
+    raw_qty = _decimal(row.get("Количество"))
+    if raw_qty is None:
+        return "missing_quantity", None
+    if recorder_type == "Document_ПриходнаяНакладная":
+        return "", abs(raw_qty)
+    if recorder_type == "Document_РасходнаяНакладная":
+        return "", -abs(raw_qty)
+    return "", abs(raw_qty) if sle_qty > 0 else -abs(raw_qty)
+
+
 def _strict_operation_matches(expected: str, key: str, name: str) -> bool:
     probe = SupplierDocumentEvidence(
         receipt_doc_type="",
@@ -323,10 +343,18 @@ def extract_supplier_document_evidence(
                 for row in document_entries
             )
             continue
+        unused_rows = [raw_row for raw_row in rows if isinstance(raw_row, dict)]
+        if not unused_rows:
+            diagnostics.extend(
+                _diagnostic(
+                    row, "missing_document_line", "document has no usable table rows"
+                )
+                for row in document_entries
+            )
+            continue
         by_line: dict[str, list[dict]] = {}
-        for raw_row in rows:
-            if isinstance(raw_row, dict):
-                by_line.setdefault(_text(raw_row.get("LineNumber")), []).append(raw_row)
+        for raw_row in unused_rows:
+            by_line.setdefault(_text(raw_row.get("LineNumber")), []).append(raw_row)
 
         entry_units: list[
             tuple[models.StockLedgerEntry, list[models.StockLedgerEntry], Decimal]
@@ -352,35 +380,99 @@ def extract_supplier_document_evidence(
                 ))
 
         for entry, physical_rows, sle_qty in entry_units:
-            line_rows = by_line.get(_text(entry.line_no), [])
-            if len(line_rows) != 1:
-                code = "missing_document_line" if not line_rows else "duplicate_document_line"
-                diagnostics.append(_diagnostic(
-                    entry, code, "exactly one table-part row is required"
+            if recorder_type == "Document_ПеремещениеЗапасов":
+                line_rows = by_line.get(_text(entry.line_no), [])
+                if len(line_rows) != 1:
+                    code = "missing_document_line" if not line_rows else "duplicate_document_line"
+                    diagnostics.append(_diagnostic(
+                        entry, code, "exactly one table-part row is required"
+                    ))
+                    continue
+                row = line_rows[0]
+                document_item_ref = _guid(row.get("Номенклатура_Key"))
+                expected_item_ref = item_refs.get(int(entry.item_id), "")
+                if not expected_item_ref:
+                    diagnostics.append(_diagnostic(
+                        entry, "missing_item_identity", "Ledger item has no 1C identity"
+                    ))
+                    continue
+                if document_item_ref != expected_item_ref:
+                    diagnostics.append(_diagnostic(
+                        entry, "item_mismatch", "document item differs from Ledger row"
+                    ))
+                    continue
+                characteristic = _guid(_first(
+                    row, "Характеристика_Key", "Characteristic_Key"
+                ))
+                if (
+                    any(
+                        int(physical.item_id) != int(entry.item_id)
+                        or _guid(physical.characteristic_ref) != characteristic
+                        for physical in physical_rows
+                    )
+                ):
+                    diagnostics.append(_diagnostic(
+                        entry,
+                        "characteristic_mismatch",
+                        "document characteristic differs from Ledger row",
+                    ))
+                    continue
+                code, signed_qty = _signed_document_qty(recorder_type, sle_qty, row)
+                if code:
+                    diagnostics.append(_diagnostic(
+                        entry, code, "document row cannot be normalized"
+                    ))
+                    continue
+                warehouse = _warehouse(recorder_type, signed_qty, row, doc)
+                if (
+                    not warehouse
+                    or any(
+                        warehouse != _guid(physical.warehouse_ref1c)
+                        for physical in physical_rows
+                    )
+                ):
+                    diagnostics.append(_diagnostic(
+                        entry, "warehouse_mismatch",
+                        "document warehouse differs from Ledger row",
+                    ))
+                    continue
+                evidence.append(SupplierDocumentEvidence(
+                    receipt_doc_type=recorder_type,
+                    receipt_doc_ref=recorder_ref,
+                    receipt_doc_line_no=_text(entry.line_no),
+                    operation_key=operation_key,
+                    operation_name=operation_name,
+                    supplier_order_type="",
+                    supplier_order_ref="",
+                    supplier_order_line_no="0",
+                    item_id=int(entry.item_id),
+                    characteristic_ref=characteristic,
+                    warehouse_ref1c=warehouse,
+                    signed_qty=signed_qty,
+                    correction_receipt_ref=correction_ref,
                 ))
                 continue
-            row = line_rows[0]
-            document_item_ref = _guid(row.get("Номенклатура_Key"))
+
             expected_item_ref = item_refs.get(int(entry.item_id), "")
             if not expected_item_ref:
                 diagnostics.append(_diagnostic(
                     entry, "missing_item_identity", "Ledger item has no 1C identity"
                 ))
                 continue
-            if document_item_ref != expected_item_ref:
+            if not physical_rows:
+                diagnostics.append(_diagnostic(
+                    entry, "item_mismatch", "document row has no physical Ledger rows"
+                ))
+                continue
+            if any(int(physical.item_id) != int(entry.item_id) for physical in physical_rows):
                 diagnostics.append(_diagnostic(
                     entry, "item_mismatch", "document item differs from Ledger row"
                 ))
                 continue
-            characteristic = _guid(_first(
-                row, "Характеристика_Key", "Characteristic_Key"
-            ))
-            if (
-                any(int(physical.item_id) != int(entry.item_id) for physical in physical_rows)
-                or any(
-                    _guid(physical.characteristic_ref) != characteristic
-                    for physical in physical_rows
-                )
+            characteristic = _guid(_text(physical_rows[0].characteristic_ref))
+            if any(
+                _guid(physical.characteristic_ref) != characteristic
+                for physical in physical_rows
             ):
                 diagnostics.append(_diagnostic(
                     entry,
@@ -388,38 +480,55 @@ def extract_supplier_document_evidence(
                     "document characteristic differs from Ledger row",
                 ))
                 continue
-            raw_qty = _decimal(row.get("Количество"))
-            if recorder_type == "Document_КорректировкаПоступления":
-                signed_qty = sle_qty
-                delta = _correction_delta(row)
-                if delta is None:
-                    diagnostics.append(_diagnostic(
-                        entry,
-                        "correction_delta_unverified",
-                        "correction row has no supported before/after quantity fields",
-                    ))
-                    continue
-                if delta != sle_qty:
-                    diagnostics.append(_diagnostic(
-                        entry, "quantity_mismatch",
-                        "correction new-minus-old differs from Ledger row",
-                    ))
-                    continue
-            elif raw_qty is None:
+            expected_warehouse = _guid(physical_rows[0].warehouse_ref1c)
+            if any(_guid(physical.warehouse_ref1c) != expected_warehouse for physical in physical_rows):
                 diagnostics.append(_diagnostic(
-                    entry, "missing_quantity", "document quantity is not decimal"
+                    entry, "warehouse_mismatch",
+                    "document warehouse differs across physical rows",
                 ))
                 continue
-            elif recorder_type == "Document_ПриходнаяНакладная":
-                signed_qty = abs(raw_qty)
-            elif recorder_type == "Document_РасходнаяНакладная":
-                signed_qty = -abs(raw_qty)
-            else:
-                signed_qty = abs(raw_qty) if sle_qty > 0 else -abs(raw_qty)
-            if signed_qty != sle_qty:
+            candidates: list[dict] = []
+            mismatch_code = ""
+            for doc_row in unused_rows:
+                if _guid(doc_row.get("Номенклатура_Key")) != expected_item_ref:
+                    continue
+                row_characteristic = _guid(_first(
+                    doc_row, "Характеристика_Key", "Characteristic_Key"
+                ))
+                if row_characteristic != characteristic:
+                    continue
+                code, row_signed_qty = _signed_document_qty(
+                    recorder_type, sle_qty, doc_row
+                )
+                if code:
+                    mismatch_code = mismatch_code or code
+                    continue
+                row_warehouse = _warehouse(recorder_type, row_signed_qty, doc_row, doc)
+                if row_warehouse != expected_warehouse:
+                    continue
+                if row_signed_qty != sle_qty:
+                    mismatch_code = "quantity_mismatch"
+                    continue
+                candidates.append(doc_row)
+
+            if len(candidates) != 1:
+                code = "missing_document_line"
+                if len(candidates) > 1:
+                    code = "duplicate_document_line"
+                elif mismatch_code:
+                    code = mismatch_code
                 diagnostics.append(_diagnostic(
-                    entry, "quantity_mismatch",
-                    "signed document quantity differs from Ledger row",
+                    entry, code,
+                    "exactly one matching document row is required",
+                ))
+                continue
+
+            row = candidates[0]
+            unused_rows = [row_ for row_ in unused_rows if row_ is not row]
+            sign_code, signed_qty = _signed_document_qty(recorder_type, sle_qty, row)
+            if sign_code:
+                diagnostics.append(_diagnostic(
+                    entry, sign_code, "line matching cannot be normalized"
                 ))
                 continue
             warehouse = _warehouse(recorder_type, signed_qty, row, doc)
