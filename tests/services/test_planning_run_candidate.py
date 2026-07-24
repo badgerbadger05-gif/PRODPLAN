@@ -110,7 +110,7 @@ def test_create_candidate_accepts_historical_parent_with_reservation_lineage(db_
     assert candidate.ledger_generation_id == target.id
 
 
-def test_create_candidate_rejects_ambiguous_reservation_lineage(db_session):
+def test_create_candidate_accepts_historical_parent_with_current_and_stale_lineage(db_session):
     parent, accepted, target = _parent_and_target(db_session)
     parent.ledger_generation_id = None
     alt_generation = models.LedgerGeneration(
@@ -160,7 +160,41 @@ def test_create_candidate_rejects_ambiguous_reservation_lineage(db_session):
     ])
     db_session.flush()
 
-    with pytest.raises(PlanningRunCandidateError, match="ambiguous Ledger lineage"):
+    create_candidate_run(db_session, parent.run_id, target.id, "refresh-worker")
+
+
+def test_create_candidate_rejects_legacy_parent_without_current_evidence(db_session):
+    parent, accepted, target = _parent_and_target(db_session)
+    parent.ledger_generation_id = None
+    stale = models.LedgerGeneration(
+        generation_key="historical-only", status="stale", cutoff=accepted.cutoff,
+        source_watermarks={}, physical_import_batch=accepted.physical_import_batch,
+        capabilities={},
+        algorithm_version="tests/1",
+    )
+    db_session.add(stale)
+    db_session.flush()
+    item = models.Item(
+        item_code="RES-HIST-NONE", item_name="No current", unit="шт", replenishment_method="Покупка",
+        replenishment_time=3, stock_qty=0, status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+    req = models.MrpRequirement(
+        run_id=parent.run_id, item_id=item.item_id, total_required_qty=0,
+        net_required_qty=0, period_from=parent.period_from, period_to=parent.period_to,
+        bom_level=0,
+    )
+    db_session.add(req)
+    db_session.flush()
+    db_session.add(models.ReservationEntry(
+        ledger_generation_id=stale.id, item_id=item.item_id, run_id=parent.run_id,
+        freeze_version=0, requirement_id=req.id, priority_period_from=parent.period_from,
+        priority_period_to=parent.period_to,
+    ))
+    db_session.flush()
+
+    with pytest.raises(PlanningRunCandidateError, match="no Ledger generation"):
         create_candidate_run(db_session, parent.run_id, target.id, "refresh-worker")
 
 

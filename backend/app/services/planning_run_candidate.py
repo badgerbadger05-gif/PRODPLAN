@@ -42,62 +42,66 @@ def _resolve_parent_generation_id(
         return int(parent.ledger_generation_id)
 
     run_id = int(parent.run_id)
-    def _coerce_lineage(gen_id):
-        return int(gen_id[0] if hasattr(gen_id, "__getitem__") else gen_id)
+    pointer = db.get(models.PlanningTruthState, 1)
+    if (
+        pointer is None
+        or pointer.current_generation_id is None
+    ):
+        return None
 
-    pending_lineages = {
-        int(entry.ledger_generation_id)
-        for entry in list(db.new)
-        if isinstance(entry, models.ReservationEntry)
-        and entry.ledger_generation_id is not None
-        and (
-            entry.run_id == run_id
-            or (
-                entry.run_id is None
-                and entry.requirement is not None
-                and int(entry.requirement.run_id) == run_id
-            )
-            or (
-                entry.run_id is None
-                and entry.requirement_id is not None
-                and db.query(models.MrpRequirement.run_id)
-                .filter(models.MrpRequirement.id == int(entry.requirement_id))
-                .scalar() == run_id
-            )
-        )
-    }
+    current_generation_id = int(pointer.current_generation_id)
+    current = db.get(models.LedgerGeneration, current_generation_id)
+    if current is None or str(current.status) != "accepted":
+        return None
 
-    raw_lineages = db.query(models.ReservationEntry.ledger_generation_id).filter(
+    def _is_matching_run(entry: models.ReservationEntry) -> bool:
+        if entry.ledger_generation_id is None:
+            return False
+        if int(entry.ledger_generation_id) != current_generation_id:
+            return False
+        if entry.run_id == run_id:
+            return True
+        if entry.run_id is not None:
+            return False
+        if entry.requirement is not None and int(entry.requirement.run_id) == run_id:
+            return True
+        if entry.requirement_id is None:
+            return False
+        return db.query(models.MrpRequirement.run_id).filter(
+            models.MrpRequirement.id == int(entry.requirement_id)
+        ).scalar() == run_id
+
+    if any(_is_matching_run(entry) for entry in list(db.new) if isinstance(entry, models.ReservationEntry)):
+        return current_generation_id
+
+    pending = db.query(models.ReservationEntry.run_id).filter(
         and_(
-            models.ReservationEntry.ledger_generation_id.isnot(None),
+            models.ReservationEntry.ledger_generation_id == current_generation_id,
             models.ReservationEntry.run_id == run_id,
         )
-    ).all()
+    ).limit(1).scalar()
+    if pending is not None:
+        return current_generation_id
 
-    if not raw_lineages:
-        raw_lineages = (
-            db.query(models.ReservationEntry.ledger_generation_id)
-            .join(
-                models.MrpRequirement,
-                models.ReservationEntry.requirement_id == models.MrpRequirement.id,
-            )
-            .filter(
-                and_(
-                    models.ReservationEntry.ledger_generation_id.isnot(None),
-                    models.MrpRequirement.run_id == run_id,
-                    models.ReservationEntry.run_id.is_(None),
-                )
-            )
-            .all()
+    persisted = (
+        db.query(models.ReservationEntry.run_id)
+        .join(
+            models.MrpRequirement,
+            models.ReservationEntry.requirement_id == models.MrpRequirement.id,
         )
-
-    lineages = {_coerce_lineage(gen_id) for gen_id in raw_lineages}
-    lineages.update(pending_lineages)
-    if not lineages:
-        return None
-    if len(lineages) > 1:
-        raise PlanningRunCandidateError("parent run has ambiguous Ledger lineage")
-    return next(iter(lineages))
+        .filter(
+            and_(
+                models.ReservationEntry.ledger_generation_id == current_generation_id,
+                models.MrpRequirement.run_id == run_id,
+                models.ReservationEntry.run_id.is_(None),
+            )
+        )
+        .limit(1)
+        .scalar()
+    )
+    if persisted is not None:
+        return current_generation_id
+    return None
 
 
 def _require_parent_and_target(
