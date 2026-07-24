@@ -17,7 +17,7 @@ from .. import models
 
 _MAKE_FACT_TYPES = frozenset({"linked_production", "unlinked_production"})
 _CONSUME_FACT_TYPES = frozenset({"component_consumption"})
-_SAFE_FACT_TYPES = _MAKE_FACT_TYPES | _CONSUME_FACT_TYPES
+_SAFE_FACT_TYPES = _MAKE_FACT_TYPES | _CONSUME_FACT_TYPES | frozenset({"supplier_receipt"})
 
 
 class GenerationReconciliationMismatch(RuntimeError):
@@ -124,7 +124,15 @@ def build_generation_targets(
                 raise GenerationReconciliationMismatch(
                     f"unsafe execution fact_type={fact_type!r} for allocation {allocation.id}"
                 )
-            mode = "make" if fact_type in _MAKE_FACT_TYPES else "consume"
+            if fact_type == "supplier_receipt":
+                if str(allocation.allocation_kind or "") != "execution":
+                    raise GenerationReconciliationMismatch(
+                        "unsafe supplier_receipt execution mode for non-execution allocation "
+                        f"{allocation.id}"
+                    )
+                mode = "buy"
+            else:
+                mode = "make" if fact_type in _MAKE_FACT_TYPES else "consume"
             key = (int(allocation.requirement_id), mode)
             allocation_totals[key] = allocation_totals.get(key, Decimal("0")) + _d(
                 allocation.allocated_qty
@@ -133,7 +141,7 @@ def build_generation_targets(
     grouped: dict[tuple[int, str], dict[str, Decimal]] = {}
     for entry in entries:
         mode = str(entry.realization_mode or "")
-        if mode not in {"make", "consume"}:
+        if mode not in {"make", "consume", "buy"}:
             raise GenerationReconciliationMismatch(
                 f"reservation {entry.id} has unsupported realization_mode={mode!r}"
             )

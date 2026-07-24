@@ -1494,6 +1494,117 @@ class PurchaseExportLineAllocation(Base):
     planned_purchase = relationship("PlannedPurchase")
 
 
+class PurchaseExportBatch(Base):
+    """Immutable boundary for planning-control export materialization."""
+
+    __tablename__ = "purchase_export_batch"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('building', 'completed', 'failed', 'aborted')",
+            name="ck_purchase_export_batch_status",
+        ),
+        UniqueConstraint("idempotency_key", name="uq_purchase_export_batch_idempotency_key"),
+        Index(
+            "ix_purchase_export_batch_ledger_generation_id",
+            "ledger_generation_id",
+        ),
+        Index(
+            "ix_purchase_export_batch_planning_read_snapshot_id",
+            "planning_read_snapshot_id",
+        ),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    planning_read_snapshot_id = Column(
+        BigInteger,
+        ForeignKey("planning_read_snapshot.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    idempotency_key = Column(String(128), nullable=False)
+    status = Column(String(24), nullable=False, server_default="building")
+    payload_hash = Column(String(64), nullable=True)
+    request_payload = Column(CrossPlatformJSON, nullable=True)
+    result_payload = Column(CrossPlatformJSON, nullable=True)
+    reason = Column(TEXT, nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+        onupdate=func.now(),
+    )
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+    ledger_generation = relationship("LedgerGeneration")
+    planning_read_snapshot = relationship("PlanningReadSnapshot")
+
+
+class PurchaseExportObligationAllocation(Base):
+    """Materialization allocation from one planning reservation to one 1C line."""
+
+    __tablename__ = "purchase_export_obligation_allocation"
+    __table_args__ = (
+        CheckConstraint(
+            "allocated_qty > 0",
+            name="ck_purchase_export_obligation_allocation_qty_positive",
+        ),
+        UniqueConstraint(
+            "batch_id",
+            "supplier_order_ref",
+            "supplier_order_line_no",
+            "reservation_id",
+            name="uq_purchase_export_obligation_allocation",
+        ),
+        Index(
+            "ix_purchase_export_obligation_allocation_batch_reservation",
+            "batch_id",
+            "reservation_id",
+        ),
+        Index(
+            "ix_purchase_export_obligation_allocation_batch_supplier_line",
+            "batch_id",
+            "supplier_order_ref",
+            "supplier_order_line_no",
+        ),
+        Index(
+            "ix_purchase_export_obligation_allocation_planned_purchase",
+            "planned_purchase_id",
+            "batch_id",
+        ),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    batch_id = Column(
+        BigInteger,
+        ForeignKey("purchase_export_batch.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    reservation_id = Column(
+        BigInteger,
+        ForeignKey("reservation_entry.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    supplier_order_ref = Column(String(64), nullable=False)
+    supplier_order_line_no = Column(String(32), nullable=False)
+    line_token = Column(BigInteger, nullable=True)
+    line_hash = Column(String(64), nullable=True)
+    allocated_qty = Column(DECIMAL(15, 3), nullable=False)
+    planned_purchase_id = Column(
+        Integer,
+        ForeignKey("planned_purchase.purchase_id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    batch = relationship("PurchaseExportBatch")
+    reservation = relationship("ReservationEntry")
+    planned_purchase = relationship("PlannedPurchase")
+
+
 class PlannedRework(Base):
     __tablename__ = "planned_rework"
 
@@ -3031,8 +3142,8 @@ class ReservationEntry(Base):
     requirement_id = Column(Integer, ForeignKey("mrp_requirement.id", ondelete="CASCADE"), nullable=False)
     priority_period_from = Column(Date, nullable=False)
     priority_period_to = Column(Date, nullable=False)
-    # realization_mode ∈ {consume, make} — the axis of realization (§3, §6).
-    # consume outstanding drives reserved_soft; make contributes exactly 0.
+    # realization_mode ∈ {consume, buy, make} — the axis of realization (§3, §6).
+    # make-like modes (make/buy) do not drive reserved_soft; consume does.
     realization_mode = Column(String(10), nullable=False, server_default="consume")
     reserved_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
     realized_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")

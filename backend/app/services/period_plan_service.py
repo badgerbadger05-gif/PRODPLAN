@@ -41,7 +41,6 @@ from ..models import (
     ReservationEntry,
     ReservationEvent,
     StockLedgerEntry,
-    StockLedgerSupplierReceiptProvenance,
 )
 from .planning_service import (
     DEFAULT_PLANNING_CONFIG,
@@ -2509,34 +2508,6 @@ def _build_execution_snapshot_rows(
                 continue
             allocation["stock_ledger_entry"] = stock_entries.get(int(stock_id))
 
-    supplier_provenance_rows = (
-        db.query(
-            StockLedgerEntry.item_id,
-            StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id,
-            StockLedgerSupplierReceiptProvenance.match_status,
-        )
-        .join(
-            StockLedgerSupplierReceiptProvenance,
-            StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id
-            == StockLedgerEntry.id,
-        )
-        .filter(
-            StockLedgerSupplierReceiptProvenance.ledger_generation_id
-            == int(generation_id)
-        )
-        .all()
-    )
-    exact_supplier_sle_ids = {
-        int(sle_id)
-        for _item_id, sle_id, match_status in supplier_provenance_rows
-        if str(match_status or "") == "exact"
-    }
-    unresolved_supplier_items = {
-        int(item_id)
-        for item_id, _sle_id, match_status in supplier_provenance_rows
-        if str(match_status or "") in {"unmatched", "ambiguous"}
-    }
-
     for req_id in req_ids:
         req = items_by_requirement.get(int(req_id))
         if not req:
@@ -2571,25 +2542,38 @@ def _build_execution_snapshot_rows(
             ),
             10,
         )
+        execution_supplier_keys = {
+            (
+                str(payload.get("fact_type") or ""),
+                str(payload.get("fact_ref") or ""),
+                str(payload.get("fact_line_ref") or ""),
+            )
+            for payload in allocations
+            if str(payload.get("allocation_kind") or "") == "execution"
+            and str(payload.get("fact_type") or "") == "supplier_receipt"
+        }
         supplier_receipt_qty = round(
             sum(
                 _to_float(payload.get("allocated_qty"))
                 for payload in allocations
                 if (
-                    str(payload.get("allocation_kind") or "")
-                    == "coverage_realization"
+                    str(payload.get("allocation_kind") or "") == "execution"
                     and str(payload.get("fact_type") or "") == "supplier_receipt"
-                    and int(payload.get("stock_ledger_entry_id") or 0)
-                    in exact_supplier_sle_ids
+                )
+                or (
+                    str(payload.get("allocation_kind") or "") == "coverage_realization"
+                    and str(payload.get("fact_type") or "") == "supplier_receipt"
+                    and (
+                        str(payload.get("fact_type") or ""),
+                        str(payload.get("fact_ref") or ""),
+                        str(payload.get("fact_line_ref") or ""),
+                    ) not in execution_supplier_keys
                 )
             ),
             10,
         )
         flow = item_flow_by_id.get(item_id)
-        execution_available = not (
-            flow == REPLENISHMENT_FLOW_PURCHASE
-            and item_id in unresolved_supplier_items
-        )
+        execution_available = True
         completed_qty = (
             supplier_receipt_qty
             if flow == REPLENISHMENT_FLOW_PURCHASE
@@ -2626,20 +2610,16 @@ def _build_execution_snapshot_rows(
             "gross_qty": _to_float(req.get("gross_required_qty")),
             "net_qty": _to_float(req.get("net_required_qty")),
             "progress_base_qty": progress_base_qty,
-            "completed_qty": completed_qty if execution_available else None,
+            "completed_qty": completed_qty,
             "execution_available": execution_available,
-            "execution_unavailable_reason": (
-                "Supplier receipt evidence is unmatched or ambiguous"
-                if not execution_available
-                else None
-            ),
+            "execution_unavailable_reason": None,
             "execution_source": (
                 "supplier_receipt_coverage"
                 if flow == REPLENISHMENT_FLOW_PURCHASE
                 else "reservation_realization"
             ),
             "remaining_qty": remaining_qty,
-            "coverage_pct": coverage_pct if execution_available else None,
+            "coverage_pct": coverage_pct,
             "ordered_qty": ordered_qty,
             "unassigned_qty": max(
                 0.0, _to_float(req.get("net_required_qty")) - ordered_qty

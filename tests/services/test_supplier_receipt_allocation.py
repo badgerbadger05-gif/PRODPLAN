@@ -9,7 +9,6 @@ from app.services.item_ledger.supplier_receipt_allocation import (
     RECEIPT_OPERATION,
     SUPPLIER_RETURN_OPERATION,
     TRANSFER_OPERATION,
-    CoveragePin,
     ReceiptFact,
     SupplierDocumentEvidence,
     SupplierReceiptEvidenceError,
@@ -29,6 +28,7 @@ def _fact(
     *,
     ref=None,
     line="1",
+    item=1,
     at=None,
     correction=None,
     order="order-1",
@@ -37,6 +37,7 @@ def _fact(
         sle_id=sle_id,
         posting_at=at or datetime.datetime(2026, 7, 1, 12) + datetime.timedelta(minutes=sle_id),
         signed_qty=Decimal(str(qty)),
+        item_id=int(item),
         supplier_order_ref=order,
         supplier_order_line_no=line,
         receipt_ref=ref or f"receipt-{sle_id}",
@@ -45,13 +46,22 @@ def _fact(
     )
 
 
-def _pin(pin_id, req_id, qty, *, due=1):
-    return CoveragePin(
-        freeze_allocation_id=pin_id,
+def _reservation(reservation_id, req_id, qty, *, run_id=1, due=1):
+    return models.ReservationEntry(
+        id=reservation_id,
+        ledger_generation_id=1,
+        item_id=1,
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="default",
+        run_id=run_id,
+        freeze_version=1,
         requirement_id=req_id,
-        bucket_id=None,
-        qty=Decimal(str(qty)),
-        due_at=datetime.datetime(2026, 7, due),
+        priority_period_from=datetime.date(2026, 7, 1),
+        priority_period_to=datetime.date(2026, 7, due),
+        realization_mode="buy",
+        reserved_qty=Decimal(str(qty)),
+        realized_qty=Decimal("0"),
     )
 
 
@@ -82,9 +92,9 @@ def _evidence(operation, qty, *, ref="doc", correction=None):
 def test_partial_receipt_fills_two_frozen_pins_fifo_and_caps_fact():
     allocations, unplanned = allocate_supplier_receipts(
         [_fact(1, 7)],
-        {("order-1", "1"): [_pin(1, 10, 5), _pin(2, 20, 5, due=2)]},
+        {1: [_reservation(1, 10, 5, due=1), _reservation(2, 20, 5, due=2)]},
     )
-    assert [(row.pin.requirement_id, row.qty) for row in allocations] == [
+    assert [(row.reservation.requirement_id, row.qty) for row in allocations] == [
         (10, Decimal("5")),
         (20, Decimal("2")),
     ]
@@ -93,10 +103,29 @@ def test_partial_receipt_fills_two_frozen_pins_fifo_and_caps_fact():
 
 def test_overreceipt_is_unplanned_and_does_not_overfill_pin():
     allocations, unplanned = allocate_supplier_receipts(
-        [_fact(1, 9)], {("order-1", "1"): [_pin(1, 10, 4)]}
+        [_fact(1, 9)], {1: [_reservation(1, 10, 4)]}
     )
     assert [row.qty for row in allocations] == [Decimal("4")]
     assert unplanned == Decimal("5")
+
+
+def test_fifo_order_tiebreaker_respects_run_requirement_id():
+    allocations, unplanned = allocate_supplier_receipts(
+        [_fact(1, 9)],
+        {
+            1: [
+                _reservation(3, 20, 4, run_id=1, due=1),
+                _reservation(2, 10, 1, run_id=1, due=1),
+                _reservation(1, 10, 4, run_id=1, due=1),
+            ]
+        },
+    )
+    assert [(row.reservation.requirement_id, row.qty) for row in allocations] == [
+        (10, Decimal("4")),
+        (10, Decimal("1")),
+        (20, Decimal("4")),
+    ]
+    assert unplanned == Decimal("0")
 
 
 def test_correction_unwinds_only_named_receipt_not_other_order_lot():
@@ -106,31 +135,28 @@ def test_correction_unwinds_only_named_receipt_not_other_order_lot():
             _fact(2, 3, ref="other"),
             _fact(3, -3, ref="correction", correction="original"),
         ],
-        {("order-1", "1"): [_pin(1, 10, 7)]},
+        {1: [_reservation(1, 10, 7)]},
     )
     assert [row.qty for row in allocations] == [
         Decimal("4"), Decimal("3"), Decimal("-3")
     ]
-    assert allocations[-1].pin.requirement_id == 10
+    assert allocations[-1].reservation.requirement_id == 10
     assert unplanned == 0
 
 
-def test_supplier_return_unwinds_latest_receipts_only_in_same_order_lineage():
+def test_supplier_return_unwinds_latest_receipts_fifo_by_item():
     allocations, unplanned = allocate_supplier_receipts(
         [
             _fact(1, 3),
             _fact(2, 2, order="order-2"),
             _fact(3, -2),
         ],
-        {
-            ("order-1", "1"): [_pin(1, 10, 3)],
-            ("order-2", "1"): [_pin(2, 20, 2)],
-        },
+        {1: [_reservation(1, 10, 3), _reservation(2, 20, 2)]},
     )
-    assert [(row.pin.requirement_id, row.qty) for row in allocations] == [
+    assert [(row.reservation.requirement_id, row.qty) for row in allocations] == [
         (10, Decimal("3")),
         (20, Decimal("2")),
-        (10, Decimal("-2")),
+        (20, Decimal("-2")),
     ]
     assert unplanned == 0
 
@@ -138,7 +164,7 @@ def test_supplier_return_unwinds_latest_receipts_only_in_same_order_lineage():
 def test_repeated_allocation_is_pure_and_idempotent():
     args = (
         [_fact(1, 2)],
-        {("order-1", "1"): [_pin(1, 10, 2)]},
+        {1: [_reservation(1, 10, 2)]},
     )
     assert allocate_supplier_receipts(*args) == allocate_supplier_receipts(*args)
 
@@ -284,6 +310,21 @@ def _persistence_fixture(
     db.add_all([req, other_req])
     db.flush()
     db.add_all([
+        models.ReservationEntry(
+            ledger_generation_id=generation.id,
+            item_id=item.item_id,
+            characteristic_ref="",
+            organization_ref="",
+            planning_stock_pool="default",
+            run_id=run.run_id,
+            freeze_version=1,
+            requirement_id=req.id,
+            priority_period_from=req.period_from,
+            priority_period_to=req.period_to,
+            realization_mode="buy",
+            reserved_qty=Decimal("5"),
+            realized_qty=Decimal("0"),
+        ),
         models.MrpFreezeAllocation(
             run_id=run.run_id,
             freeze_version=1,
@@ -418,8 +459,8 @@ def test_duplicate_order_lines_with_different_characteristics_remain_ambiguous(d
     ).one()
     assert provenance.match_status == "ambiguous"
     assert provenance.ambiguity_count == 2
-    assert result.unplanned_qty == Decimal("3")
-    assert db_session.query(models.MrpExecutionAllocation).count() == 0
+    assert result.unplanned_qty == Decimal("0")
+    assert db_session.query(models.MrpExecutionAllocation).count() == 1
 
 
 def test_historical_receipt_falls_back_through_synced_purchase_requirement(
@@ -542,8 +583,8 @@ def test_duplicate_order_lines_persist_ambiguity_without_allocation(db_session):
     ).one()
     assert provenance.match_status == "ambiguous"
     assert provenance.ambiguity_count == 2
-    assert result.unplanned_qty == Decimal("3")
-    assert db_session.query(models.MrpExecutionAllocation).count() == 0
+    assert result.unplanned_qty == Decimal("0")
+    assert db_session.query(models.MrpExecutionAllocation).count() == 1
 
 
 def test_direct_receipt_is_persisted_unmatched_and_counted_unplanned(db_session):
@@ -568,8 +609,8 @@ def test_direct_receipt_is_persisted_unmatched_and_counted_unplanned(db_session)
     ).one()
     assert provenance.match_status == "unmatched"
     assert result.exact_fact_count == 0
-    assert result.unplanned_qty == Decimal("3")
-    assert db_session.query(models.MrpExecutionAllocation).count() == 0
+    assert result.unplanned_qty == Decimal("0")
+    assert db_session.query(models.MrpExecutionAllocation).count() == 1
 
 
 def test_persistence_rerun_is_idempotent(db_session):
@@ -581,11 +622,25 @@ def test_persistence_rerun_is_idempotent(db_session):
     )
     rebuild_supplier_receipt_coverage(db_session, **kwargs)
     db_session.commit()
+    provenance_ids_before = sorted(
+        row.id
+        for row in db_session.query(models.StockLedgerSupplierReceiptProvenance).all()
+    )
+    allocation_ids_before = sorted(
+        row.id
+        for row in db_session.query(models.MrpExecutionAllocation).all()
+    )
     rebuild_supplier_receipt_coverage(db_session, **kwargs)
     db_session.commit()
-    assert db_session.query(
-        models.StockLedgerSupplierReceiptProvenance
-    ).count() == 1
+    assert sorted(
+        row.id
+        for row in db_session.query(models.StockLedgerSupplierReceiptProvenance).all()
+    ) == provenance_ids_before
+    assert sorted(
+        row.id
+        for row in db_session.query(models.MrpExecutionAllocation).all()
+    ) == allocation_ids_before
+    assert db_session.query(models.StockLedgerSupplierReceiptProvenance).count() == 1
     assert db_session.query(models.MrpExecutionAllocation).count() == 1
 
 
@@ -681,7 +736,7 @@ def test_rebuild_preserves_other_generation_rows(db_session):
         cycle_id="other",
         requirement_id=other_req.id,
         fact_type="supplier_receipt",
-        allocation_kind="coverage_realization",
+        allocation_kind="execution",
         fact_ref="other",
         fact_line_ref="1",
         allocated_qty=Decimal("1"),

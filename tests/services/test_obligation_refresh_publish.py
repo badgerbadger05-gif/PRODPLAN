@@ -111,6 +111,17 @@ def _candidate_read_snapshots(db, target, candidates, cutoff):
     target._test_purchase_journal_snapshot_id = purchase_journal.id
 
 
+def _set_purchase_journal_rows(db_session, target, *, rows):
+    snapshot = db_session.query(models.PlanningReadSnapshot).filter_by(
+        ledger_generation_id=target.id, consumer="purchase_control_journal", snapshot_key="journal:v1"
+    ).one_or_none()
+    assert snapshot is not None
+    payload = dict(snapshot.payload)
+    payload["rows"] = rows
+    snapshot.payload = payload
+    db_session.flush()
+
+
 def _batch(db, count=2, add_count=0):
     cutoff = datetime(2026, 7, 23, 12, tzinfo=timezone.utc)
     parent_generation = _generation(db, key="accepted", status="accepted", cutoff=cutoff)
@@ -427,6 +438,58 @@ def test_publish_rejects_prelocked_add_plan(db_session):
 
     with pytest.raises(ObligationRefreshPublishError, match="already locked"):
         _publish(db_session, parent, target, cutoff)
+
+
+def test_publish_rejects_misplaced_purchase_journal_row_contract(db_session):
+    cutoff, parent, target, _parents, _candidates = _batch(db_session)
+    _set_purchase_journal_rows(
+        db_session,
+        target,
+        rows=[{
+            "row_key": "ledger-supply:1",
+            "row_generator": "ledger_future_supply",
+            "required_qty": 10.0,
+            "realized_qty": 0.0,
+            "open_order_covered_qty": 0.0,
+            "to_order_qty": 10.0,
+            "quantity": 10.0,
+            "remaining_qty": 10.0,
+            "run_id": 1,
+            "run_ids": [1],
+            "received_qty": 0.0,
+        }],
+    )
+
+    with pytest.raises(ObligationRefreshPublishError, match="purchase control journal row violates Ledger fact contract"):
+        _publish(db_session, parent, target, cutoff)
+
+
+def test_publish_allows_buy_journal_row_contract(db_session):
+    cutoff, parent, target, _parents, candidates = _batch(db_session)
+    run_id = int(candidates[0].run_id)
+    _set_purchase_journal_rows(
+        db_session,
+        target,
+        rows=[{
+            "row_key": "buy:1:main",
+            "row_generator": "mrp_reservation",
+            "required_qty": 10.0,
+            "realized_qty": 2.0,
+            "open_order_covered_qty": 1.0,
+            "to_order_qty": 7.0,
+            "quantity": 10.0,
+            "remaining_qty": 7.0,
+            "run_id": run_id,
+            "run_ids": [run_id],
+            "requirement_ids": [101],
+            "reservation_ids": [201],
+            "received_qty": 2.0,
+            "planning_stock_pool": "main",
+        }],
+    )
+    # If row contract drifts here, publish must fail immediately on the contract
+    # gate before touching production-run locking.
+    assert _publish(db_session, parent, target, cutoff).published is True
 
 
 @pytest.mark.parametrize("mutation, error", [

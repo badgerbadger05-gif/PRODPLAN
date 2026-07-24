@@ -19,6 +19,7 @@ from sqlalchemy import or_, text
 from sqlalchemy.orm import Session
 
 from app import models
+from app.services.purchase_control_snapshot import validate_purchase_control_journal_buy_row
 from app.services.mrp_freeze import MRP_LEDGER_LOCK_KEY
 from app.services.obligation_refresh_manifest import MANIFEST_HASH_KEY, MANIFEST_KEY
 
@@ -667,14 +668,11 @@ def _exact_retry(
     seen_journal_rows: set[str] = set()
     for row in journal_rows:
         try:
+            validate_purchase_control_journal_buy_row(row)
             key = str(row["row_key"])
-            ordered = Decimal(str(row["quantity"]))
-            open_qty = Decimal(str(row["remaining_qty"]))
         except (KeyError, TypeError, ValueError, InvalidOperation):
             return None
-        if (not key.startswith("ledger-supply:") or key in seen_journal_rows
-                or ordered < 0 or open_qty < 0 or open_qty > ordered
-                or row.get("received_qty") is not None):
+        if key in seen_journal_rows:
             return None
         seen_journal_rows.add(key)
     by_parent = {int(old.run_id): candidate for old, candidate in refreshes}
@@ -850,10 +848,15 @@ def publish_obligation_refresh_batch(
     seen_supply_rows: set[str] = set()
     for row in journal_rows:
         try:
-            key, ordered, open_qty = str(row["row_key"]), Decimal(str(row["quantity"])), Decimal(str(row["remaining_qty"]))
-        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+            validate_purchase_control_journal_buy_row(row)
+            key = str(row["row_key"])
+        except (KeyError, TypeError, InvalidOperation) as exc:
             raise ObligationRefreshPublishError("purchase control journal row is malformed") from exc
-        if not key.startswith("ledger-supply:") or key in seen_supply_rows or ordered < 0 or open_qty < 0 or open_qty > ordered or row.get("received_qty") is not None:
+        except ValueError as exc:
+            if "malformed" in str(exc):
+                raise ObligationRefreshPublishError("purchase control journal row is malformed") from exc
+            raise ObligationRefreshPublishError("purchase control journal row violates Ledger fact contract") from exc
+        if key in seen_supply_rows:
             raise ObligationRefreshPublishError("purchase control journal row violates Ledger fact contract")
         seen_supply_rows.add(key)
     if _source_export_links_exist(db, candidate_ids):

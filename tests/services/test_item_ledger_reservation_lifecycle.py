@@ -31,7 +31,7 @@ from app.models import (
     ReservationEvent,
 )
 from app.services.item_ledger.ingest import EMPTY_GUID, pull_recorder_movements
-from app.services.item_ledger.reservation import CONSUME, MAKE
+from app.services.item_ledger.reservation import BUY, CONSUME, MAKE
 from app.services.item_ledger.reservation_ledger import (
     item_ledger_position,
     materialize_reservations,
@@ -268,7 +268,7 @@ def test_release_run_reservations_drops_reserved_soft(db_session):
     assert pos_before["reserved_soft"] == pytest.approx(6.0)
     assert pos_before["available"] == pytest.approx(-6.0)
 
-    assert release_run_reservations(db, [run.run_id], "cyc") == 1
+    assert release_run_reservations(db, [run.run_id], "cyc") == 2
     entry = _entry(db, req, CONSUME)
     db.refresh(entry)
     assert entry.lifecycle_status == "released"
@@ -308,6 +308,36 @@ def test_apply_run_closure_releases_reservations(db_session):
     ] == pytest.approx(0.0)
 
 
+def test_release_and_reopen_purchase_has_buy_and_consume_modes(db_session):
+    db = db_session
+    run = _run(db, date(2026, 7, 1), date(2026, 7, 15))
+    comp = _item(db, "BUY", produced=False)
+    req = _req(db, run, comp, gross=6, net=4, bom_level=1)
+    materialize_reservations(db, [req], {run.run_id: run}, "cyc")
+
+    consume = _entry(db, req, CONSUME)
+    buy = _entry(db, req, BUY)
+    assert consume is not None and buy is not None
+    assert Decimal(str(consume.reserved_qty)) == Decimal("6")
+    assert Decimal(str(buy.reserved_qty)) == Decimal("4")
+
+    assert release_run_reservations(db, [run.run_id], "cyc") == 2
+    for entry in (consume, buy):
+        db.refresh(entry)
+        assert entry.lifecycle_status == "released"
+        assert Decimal(str(entry.reserved_qty)) == Decimal("0")
+        assert Decimal(str(entry.reserved_qty)) == Decimal(str(entry.realized_qty))
+
+    assert reopen_run_reservations(db, [run.run_id], "cyc") == 2
+    for entry in (consume, buy):
+        db.refresh(entry)
+        assert entry.lifecycle_status == "active"
+        if str(entry.realization_mode) == CONSUME:
+            assert Decimal(str(entry.reserved_qty)) == Decimal("6")
+        else:
+            assert Decimal(str(entry.reserved_qty)) == Decimal("4")
+
+
 def test_force_close_releases_and_is_idempotent(db_session):
     db = db_session
     run = _run(db, date(2026, 7, 1), date(2026, 7, 15))
@@ -319,7 +349,7 @@ def test_force_close_releases_and_is_idempotent(db_session):
 
     res = force_close_run(db, run.run_id)
     assert res["status"] == "closed"
-    assert res["reservations_released"] == 2  # make + consume
+    assert res["reservations_released"] == 3  # make + purchase consume + buy
 
     for r, mode in ((make_req, MAKE), (req, CONSUME)):
         entry = _entry(db, r, mode)
@@ -333,7 +363,7 @@ def test_force_close_releases_and_is_idempotent(db_session):
     assert res2["reservations_released"] == 0
     assert db.query(ReservationEvent).filter(
         ReservationEvent.event_kind == "release"
-    ).count() == 2
+    ).count() == 3
 
 
 def test_reopen_run_restores_released_reservations(db_session):
@@ -345,7 +375,7 @@ def test_reopen_run_restores_released_reservations(db_session):
 
     force_close_run(db, run.run_id)
     res = reopen_run(db, run.run_id)
-    assert res["reservations_reopened"] == 1
+    assert res["reservations_reopened"] == 2
 
     entry = _entry(db, req, CONSUME)
     db.refresh(entry)
@@ -371,7 +401,7 @@ def test_reopen_run_reservations_direct_idempotent(db_session):
     req = _req(db, run, comp, gross=2, net=2, bom_level=1)
     materialize_reservations(db, [req], {run.run_id: run}, "cyc")
     release_run_reservations(db, [run.run_id], "cyc")
-    assert reopen_run_reservations(db, [run.run_id], "cyc") == 1
+    assert reopen_run_reservations(db, [run.run_id], "cyc") == 2
     assert reopen_run_reservations(db, [run.run_id], "cyc") == 0
     entry = _entry(db, req, CONSUME)
     assert _kinds(db, entry).count("reopen") == 1
@@ -390,7 +420,7 @@ def test_shadow_sweep_releases_ghosts_of_closed_run(db_session):
 
     scope = diagnostic_ledger_scope(db)  # CLOSED run with an open req stays in scope
     summary = run_reservation_shadow(db, scope, "cyc")
-    assert summary["reservations_released_swept"] == 1
+    assert summary["reservations_released_swept"] == 2
 
     entry = _entry(db, req, CONSUME)
     db.refresh(entry)

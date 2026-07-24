@@ -7,13 +7,13 @@ does not read OData or legacy ``received_qty`` projections.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 from decimal import Decimal
 from typing import Iterable
 
 from sqlalchemy.orm import Session
 
 from app import models
+from .reservation import fold_reservation_entry
 
 from .physical import canonical_content_hash, canonical_decimal
 from .physical_visibility import visible_sles_for_generation
@@ -82,6 +82,7 @@ class ReceiptFact:
     sle_id: int
     posting_at: datetime
     signed_qty: Decimal
+    item_id: int
     supplier_order_ref: str
     supplier_order_line_no: str
     receipt_ref: str
@@ -90,18 +91,9 @@ class ReceiptFact:
 
 
 @dataclass(frozen=True)
-class CoveragePin:
-    freeze_allocation_id: int
-    requirement_id: int
-    bucket_id: int | None
-    qty: Decimal
-    due_at: datetime
-
-
-@dataclass(frozen=True)
 class CoverageAllocation:
     fact: ReceiptFact
-    pin: CoveragePin
+    reservation: models.ReservationEntry
     qty: Decimal
 
 
@@ -145,6 +137,126 @@ def _operation_prefix(row: SupplierDocumentEvidence) -> str:
     return matches[0]
 
 
+def _entry_key(entry: models.ReservationEntry) -> int:
+    entry_id = getattr(entry, "id", None)
+    return int(entry_id) if entry_id is not None else id(entry)
+
+
+def _entry_outstanding(entry: models.ReservationEntry) -> Decimal:
+    return max(_decimal(entry.reserved_qty) - _decimal(entry.realized_qty), Decimal("0"))
+
+
+def _buy_reservation_order(entry: models.ReservationEntry) -> tuple:
+    return (
+        entry.priority_period_from,
+        entry.priority_period_to,
+        int(entry.run_id) if entry.run_id is not None else 0,
+        int(entry.requirement_id),
+        _entry_key(entry),
+    )
+
+
+def _event_exists(db: Session, ledger_generation_id: int, idempotency_key: str) -> bool:
+    return (
+        db.query(models.ReservationEvent.id)
+        .filter(
+            models.ReservationEvent.ledger_generation_id == int(ledger_generation_id),
+            models.ReservationEvent.idempotency_key == idempotency_key,
+        )
+        .first()
+        is not None
+    )
+
+
+def _append_reservation_event(
+    db: Session,
+    allocation: CoverageAllocation,
+    *,
+    cycle_id: str,
+) -> bool:
+    reservation = allocation.reservation
+    if reservation.id is None:
+        return False
+    qty = _decimal(allocation.qty)
+    if qty == 0:
+        return False
+    reservation_id = int(reservation.id)
+    reservation_seeded = (
+        db.query(models.ReservationEvent.id)
+        .filter(
+            models.ReservationEvent.ledger_generation_id == int(reservation.ledger_generation_id),
+            models.ReservationEvent.reservation_id == reservation_id,
+        )
+        .first()
+        is not None
+    )
+    event_kind = "realize" if qty > 0 else "unrealize"
+    key = f"{event_kind}:{int(reservation.id)}:{int(allocation.fact.sle_id)}"
+    if _event_exists(db, int(reservation.ledger_generation_id), key):
+        return False
+    reserved_delta = (
+        _decimal(reservation.reserved_qty)
+        if (qty > 0 and not reservation_seeded)
+        else Decimal("0")
+    )
+    db.add(models.ReservationEvent(
+        ledger_generation_id=int(reservation.ledger_generation_id),
+        reservation_id=int(reservation.id),
+        item_id=int(allocation.fact.item_id),
+        characteristic_ref=str(reservation.characteristic_ref or ""),
+        organization_ref=str(reservation.organization_ref or ""),
+        planning_stock_pool=str(reservation.planning_stock_pool or "default"),
+        event_kind=event_kind,
+        reserved_delta=reserved_delta,
+        realized_delta=qty,
+        sle_id=int(allocation.fact.sle_id),
+        fact_ref=str(allocation.fact.receipt_ref),
+        fact_line_ref=f"{allocation.fact.receipt_line_no}#sle:{allocation.fact.sle_id}",
+        match_rule="fifo",
+        cycle_id=cycle_id,
+        idempotency_key=key,
+        event_at=allocation.fact.posting_at,
+    ))
+    return True
+
+
+def _reservation_bucket_id(
+    db: Session,
+    cache: dict[int, int | None],
+    requirement_id: int,
+) -> int | None:
+    requirement_key = int(requirement_id)
+    if requirement_key in cache:
+        return cache[requirement_key]
+    bucket = (
+        db.query(models.MrpRequirementBucket)
+        .filter_by(requirement_id=requirement_key)
+        .order_by(
+            models.MrpRequirementBucket.bucket_date,
+            models.MrpRequirementBucket.id,
+        )
+        .first()
+    )
+    value = int(bucket.id) if bucket is not None else None
+    cache[requirement_key] = value
+    return value
+
+
+def _buy_reservations_for_item(
+    db: Session,
+    ledger_generation_id: int,
+    item_id: int,
+) -> tuple[models.ReservationEntry, ...]:
+    rows = db.query(models.ReservationEntry).filter(
+        models.ReservationEntry.ledger_generation_id == int(ledger_generation_id),
+        models.ReservationEntry.item_id == int(item_id),
+        models.ReservationEntry.planning_stock_pool == "default",
+        models.ReservationEntry.realization_mode == "buy",
+        models.ReservationEntry.lifecycle_status.in_(("active", "closed")),
+    ).all()
+    return tuple(sorted(rows, key=_buy_reservation_order))
+
+
 def _validate_operations(rows: tuple[SupplierDocumentEvidence, ...]) -> None:
     transfers: dict[tuple[str, str, int, str], list[SupplierDocumentEvidence]] = {}
     for row in rows:
@@ -179,48 +291,57 @@ def _validate_operations(rows: tuple[SupplierDocumentEvidence, ...]) -> None:
 
 def allocate_supplier_receipts(
     facts: Iterable[ReceiptFact],
-    pins_by_order: dict[tuple[str, str], Iterable[CoveragePin]],
+    reservations_by_item: dict[int, Iterable[models.ReservationEntry]],
 ) -> tuple[tuple[CoverageAllocation, ...], Decimal]:
     """Pure deterministic allocator.
 
-    Positive receipt facts fill frozen pins FIFO.  Corrections unwind only the
-    named original receipt; supplier returns unwind the same order lineage.
-    Negative allocations are audit rows and never mutate reservation
-    realization.
+    Positive supplier receipts fill BUY reservations FIFO by item. Corrections and
+    returns unwind the latest prior realization for the same order lineage (or
+    the named original document for explicit corrections), never allowing
+    realized_qty to go negative.
     """
     ordered = sorted(facts, key=lambda row: (row.posting_at, row.sle_id))
-    pins = {
-        key: tuple(sorted(value, key=lambda pin: (
-            pin.due_at, pin.requirement_id, pin.bucket_id or -1,
-            pin.freeze_allocation_id,
-        )))
-        for key, value in pins_by_order.items()
+    reservations = {
+        item_id: tuple(
+            sorted(
+                (entry for entry in values if _entry_outstanding(entry) > 0),
+                key=_buy_reservation_order,
+            )
+        )
+        for item_id, values in reservations_by_item.items()
     }
-    remaining = {
-        pin.freeze_allocation_id: pin.qty
-        for values in pins.values() for pin in values
+    remaining: dict[int, Decimal] = {
+        _entry_key(entry): _entry_outstanding(entry)
+        for values in reservations.values()
+        for entry in values
     }
     positive_by_receipt: dict[str, list[CoverageAllocation]] = {}
-    active_by_order: dict[tuple[str, str], list[CoverageAllocation]] = {}
+    active_by_order: dict[tuple[int, str, str], list[CoverageAllocation]] = {}
+    active_by_item: dict[int, list[CoverageAllocation]] = {}
     active_qty: dict[int, Decimal] = {}
     result: list[CoverageAllocation] = []
     unplanned = Decimal("0")
-
     for fact in ordered:
-        key = (fact.supplier_order_ref, fact.supplier_order_line_no)
-        qty = fact.signed_qty
+        qty = _decimal(fact.signed_qty)
         if qty > 0:
+            item_id = int(fact.item_id)
             left = qty
-            for pin in pins.get(key, ()):
-                take = min(left, remaining[pin.freeze_allocation_id])
+            for reservation in reservations.get(item_id, ()):
+                key = _entry_key(reservation)
+                outstanding = remaining.get(key, Decimal("0"))
+                take = min(left, outstanding)
                 if take <= 0:
                     continue
-                allocation = CoverageAllocation(fact=fact, pin=pin, qty=take)
+                allocation = CoverageAllocation(fact=fact, reservation=reservation, qty=take)
                 result.append(allocation)
                 positive_by_receipt.setdefault(fact.receipt_ref, []).append(allocation)
-                active_by_order.setdefault(key, []).append(allocation)
+                active_by_order.setdefault(
+                    (item_id, fact.supplier_order_ref, fact.supplier_order_line_no),
+                    [],
+                ).append(allocation)
+                active_by_item.setdefault(item_id, []).append(allocation)
                 active_qty[id(allocation)] = take
-                remaining[pin.freeze_allocation_id] -= take
+                remaining[key] = outstanding - take
                 left -= take
                 if left == 0:
                     break
@@ -228,23 +349,38 @@ def allocate_supplier_receipts(
             continue
 
         left = -qty
+        if left <= 0:
+            continue
         source = (
             positive_by_receipt.get(_text(fact.correction_receipt_ref), [])
             if fact.correction_receipt_ref
-            else active_by_order.get(key, [])
+            else active_by_item.get(int(fact.item_id), [])
         )
+        unwind_by_reservation: dict[int, Decimal] = {}
+        unwind_samples: dict[int, models.ReservationEntry] = {}
         for original in reversed(source):
-            available = active_qty[id(original)]
+            available = active_qty.get(id(original), Decimal("0"))
             take = min(left, available)
             if take <= 0:
                 continue
-            result.append(CoverageAllocation(fact=fact, pin=original.pin, qty=-take))
-            active_qty[id(original)] -= take
-            remaining[original.pin.freeze_allocation_id] += take
+            reservation_key = _entry_key(original.reservation)
+            unwind_by_reservation[reservation_key] = (
+                unwind_by_reservation.get(reservation_key, Decimal("0")) + take
+            )
+            unwind_samples[reservation_key] = original.reservation
+            active_qty[id(original)] = available - take
             left -= take
             if left == 0:
                 break
-        unplanned -= left
+        for reservation_key, take in unwind_by_reservation.items():
+            if take <= 0:
+                continue
+            result.append(CoverageAllocation(
+                fact=fact,
+                reservation=unwind_samples[reservation_key],
+                qty=-take,
+            ))
+
     return tuple(result), unplanned
 
 
@@ -263,190 +399,6 @@ def _candidate_order_lines(
         models.SupplierOrderItem.order_id == order.order_id,
         models.SupplierOrderItem.item_id_ref == evidence.item_id,
     ).all()
-
-
-def _pins_for_order(
-    db: Session,
-    generation_id: int,
-    order_ref: str,
-    line_no: str,
-) -> tuple[CoveragePin, ...]:
-    exports = db.query(models.PurchaseExportLineAllocation).filter_by(
-        ledger_generation_id=generation_id,
-        supplier_order_ref=order_ref,
-        supplier_order_line_no=line_no,
-    ).all()
-    allowed_requirements = {
-        int(row.planned_purchase.source_mrp_requirement_id)
-        for row in exports
-        if row.planned_purchase is not None
-        and row.planned_purchase.source_mrp_requirement_id is not None
-    }
-    export_caps: dict[int, Decimal] = {}
-    for export in exports:
-        purchase = export.planned_purchase
-        if purchase is None or purchase.source_mrp_requirement_id is None:
-            continue
-        requirement_id = int(purchase.source_mrp_requirement_id)
-        export_caps[requirement_id] = (
-            export_caps.get(requirement_id, Decimal("0"))
-            + _decimal(export.allocated_qty)
-        )
-    query = db.query(models.MrpFreezeAllocation).filter_by(
-        source_type="supplier_order",
-        source_ref=order_ref,
-        source_line_ref=line_no,
-    )
-    if exports:
-        if not allowed_requirements:
-            return ()
-        query = query.filter(
-            models.MrpFreezeAllocation.requirement_id.in_(allowed_requirements)
-        )
-    rows = sorted(
-        query.all(),
-        key=lambda row: (
-            row.requirement.period_to if row.requirement is not None else datetime.max.date(),
-            row.run_id,
-            row.requirement_id,
-            row.id,
-        ),
-    )
-    result: list[CoveragePin] = []
-    for row in rows:
-        requirement = row.requirement
-        if requirement is None:
-            continue
-        run = db.get(models.PlanningRun, row.run_id)
-        if (
-            run is None
-            or run.ledger_generation_id is None
-            or int(run.ledger_generation_id) != int(generation_id)
-            or run.active_freeze_version is None
-            or int(row.freeze_version) != int(run.active_freeze_version)
-        ):
-            continue
-        bucket = db.query(models.MrpRequirementBucket).filter_by(
-            requirement_id=row.requirement_id
-        ).order_by(models.MrpRequirementBucket.bucket_date, models.MrpRequirementBucket.id).first()
-        due = datetime.combine(requirement.period_to, datetime.min.time())
-        pin_qty = _decimal(row.alloc_qty)
-        if exports:
-            available_export = export_caps.get(row.requirement_id, Decimal("0"))
-            pin_qty = min(pin_qty, available_export)
-            export_caps[row.requirement_id] = available_export - pin_qty
-        if pin_qty <= 0:
-            continue
-        result.append(CoveragePin(
-            freeze_allocation_id=row.id,
-            requirement_id=row.requirement_id,
-            bucket_id=bucket.id if bucket else None,
-            qty=pin_qty,
-            due_at=due,
-        ))
-    if result:
-        return tuple(result)
-
-    # Historical generations predate immutable export-line allocations and
-    # supplier-order freeze pins. Recover the explicit chain which still
-    # exists in the mirror:
-    # receipt line -> supplier order -> successful planned_purchase SyncLink
-    # -> source MRP requirement. If even that address is absent, §2.5 assigns
-    # the receipt FIFO to the oldest uncovered purchase obligation of the same
-    # item/pool. Empty characteristic is the only supported pool dimension.
-    order = db.query(models.SupplierOrder).filter(
-        models.SupplierOrder.order_ref1c == order_ref
-    ).one_or_none()
-    if order is None:
-        return ()
-    try:
-        canonical_line_no = int(line_no)
-    except (TypeError, ValueError):
-        return ()
-    order_line = db.query(models.SupplierOrderItem).filter(
-        models.SupplierOrderItem.order_id == order.order_id,
-        models.SupplierOrderItem.line_number == canonical_line_no,
-    ).one_or_none()
-    if order_line is None or order_line.item_id_ref is None:
-        return ()
-    item_id = int(order_line.item_id_ref)
-    eligible_requirement_ids = {
-        int(requirement_id)
-        for (requirement_id,) in (
-            db.query(models.ReservationEntry.requirement_id)
-            .filter(
-                models.ReservationEntry.ledger_generation_id
-                == int(generation_id),
-                models.ReservationEntry.requirement_id.isnot(None),
-            )
-            .distinct()
-            .all()
-        )
-    }
-    linked_purchase_ids = {
-        int(source_id)
-        for (source_id,) in (
-            db.query(models.SyncLink.source_id)
-            .filter(
-                models.SyncLink.source_system == "PRODPLAN",
-                models.SyncLink.source_doctype == "planned_purchase",
-                models.SyncLink.target_entity == "Document_ЗаказПоставщику",
-                models.SyncLink.target_ref_key == order_ref,
-                models.SyncLink.status == "success",
-            )
-            .all()
-        )
-    }
-    purchase_query = db.query(models.PlannedPurchase).filter(
-        models.PlannedPurchase.item_id == item_id,
-        models.PlannedPurchase.source_mrp_requirement_id.isnot(None),
-    )
-    if linked_purchase_ids:
-        purchase_query = purchase_query.filter(
-            models.PlannedPurchase.purchase_id.in_(linked_purchase_ids)
-        )
-    purchases = sorted(
-        (
-            purchase
-            for purchase in purchase_query.all()
-            if int(purchase.source_mrp_requirement_id)
-            in eligible_requirement_ids
-        ),
-        key=lambda purchase: (
-            purchase.need_date or datetime.max.date(),
-            int(purchase.source_mrp_requirement_id),
-            int(purchase.purchase_id),
-        ),
-    )
-    for purchase in purchases:
-        requirement_id = int(purchase.source_mrp_requirement_id)
-        requirement = db.get(models.MrpRequirement, requirement_id)
-        if requirement is None:
-            continue
-        bucket = (
-            db.query(models.MrpRequirementBucket)
-            .filter_by(requirement_id=requirement_id)
-            .order_by(
-                models.MrpRequirementBucket.bucket_date,
-                models.MrpRequirementBucket.id,
-            )
-            .first()
-        )
-        qty = _decimal(purchase.qty)
-        if qty <= 0:
-            continue
-        result.append(CoveragePin(
-            # Negative identity is an in-memory stable key. Historical rows
-            # have no MrpFreezeAllocation FK to persist.
-            freeze_allocation_id=-int(purchase.purchase_id),
-            requirement_id=requirement_id,
-            bucket_id=bucket.id if bucket else None,
-            qty=qty,
-            due_at=datetime.combine(
-                requirement.period_to, datetime.min.time()
-            ),
-        ))
-    return tuple(result)
 
 
 def _rebuild_supplier_receipt_coverage_unsafe(
@@ -484,17 +436,42 @@ def _rebuild_supplier_receipt_coverage_unsafe(
             [],
         ).append(sle)
 
-    db.query(models.MrpExecutionAllocation).filter_by(
-        ledger_generation_id=ledger_generation_id,
-        fact_type="supplier_receipt",
-        allocation_kind="coverage_realization",
-    ).delete(synchronize_session=False)
-    db.query(models.StockLedgerSupplierReceiptProvenance).filter_by(
-        ledger_generation_id=ledger_generation_id
-    ).delete(synchronize_session=False)
+    provenance_by_entry = {
+        int(row.stock_ledger_entry_id): row
+        for row in db.query(models.StockLedgerSupplierReceiptProvenance).filter_by(
+            ledger_generation_id=ledger_generation_id
+        ).all()
+    }
+    touched_provenance_entry_ids: set[int] = set()
 
+    existing_execution_allocations = {
+        (
+            int(row.requirement_id),
+            row.bucket_id,
+            str(row.fact_ref),
+            str(row.fact_line_ref),
+            str(row.fact_type),
+            str(row.allocation_kind),
+        ): row
+        for row in db.query(models.MrpExecutionAllocation).filter_by(
+            ledger_generation_id=ledger_generation_id,
+            fact_type="supplier_receipt",
+            allocation_kind="execution",
+        ).all()
+    }
+    touched_execution_allocation_keys: set[tuple[int, int | None, str, str, str, str]] = set()
+
+    def _execution_allocation_key(allocation: CoverageAllocation, bucket_id: int | None) -> tuple[int, int | None, str, str, str, str]:
+        return (
+            int(allocation.reservation.requirement_id),
+            bucket_id,
+            str(allocation.fact.receipt_ref),
+            f"{allocation.fact.receipt_line_no}#sle:{allocation.fact.sle_id}",
+            "supplier_receipt",
+            "execution",
+        )
     facts: list[ReceiptFact] = []
-    explicitly_unplanned = Decimal("0")
+    exact_fact_count = 0
     provenance_count = 0
     for row in rows:
         operation = _operation_prefix(row)
@@ -530,6 +507,8 @@ def _rebuild_supplier_receipt_coverage_unsafe(
         status = "exact" if exact_candidate is not None else (
             "ambiguous" if len(candidates) > 1 else "unmatched"
         )
+        if status == "exact":
+            exact_fact_count += 1
         reason = None if status == "exact" else (
             "multiple exact supplier order lines" if status == "ambiguous"
             else "no exact typed supplier order line"
@@ -562,101 +541,171 @@ def _rebuild_supplier_receipt_coverage_unsafe(
             if exact_candidate is not None else None
         )
         for sle in matched_sles:
-            db.add(models.StockLedgerSupplierReceiptProvenance(
-                ledger_generation_id=ledger_generation_id,
-                stock_ledger_entry_id=sle.id,
-                receipt_doc_type=_text(row.receipt_doc_type),
-                receipt_doc_ref=_text(row.receipt_doc_ref),
-                receipt_doc_line_no=_text(row.receipt_doc_line_no),
-                supplier_order_ref=(
-                    _text(row.supplier_order_ref) if status == "exact" else None
-                ),
-                supplier_order_line_no=(
-                    canonical_line_no if status == "exact" else None
-                ),
-                operation_kind=_OPERATION_KINDS[operation],
-                operation_key=evidence_payload["operation_key"],
-                operation_name=evidence_payload["operation_name"],
-                correction_receipt_ref=evidence_payload["correction_receipt_ref"],
-                evidence_hash=evidence_hash,
-                evidence_payload=evidence_payload,
-                match_rule=operation_rule,
-                match_status=status,
-                ambiguity_count=len(candidates) if status == "ambiguous" else 0,
-                reason=reason,
-            ))
-            provenance_count += 1
-            if status == "exact":
-                facts.append(ReceiptFact(
-                    sle_id=sle.id,
-                    posting_at=sle.posting_at,
-                    signed_qty=_decimal(sle.qty),
+            matched_sle_id = int(sle.id)
+            touched_provenance_entry_ids.add(matched_sle_id)
+            provenance = provenance_by_entry.get(matched_sle_id)
+            supplier_order_line_no = (
+                canonical_line_no if status == "exact" else _text(row.supplier_order_line_no)
+            )
+            if provenance is None:
+                provenance = models.StockLedgerSupplierReceiptProvenance(
+                    ledger_generation_id=ledger_generation_id,
+                    stock_ledger_entry_id=matched_sle_id,
+                    receipt_doc_type=_text(row.receipt_doc_type),
+                    receipt_doc_ref=_text(row.receipt_doc_ref),
+                    receipt_doc_line_no=_text(row.receipt_doc_line_no),
                     supplier_order_ref=_text(row.supplier_order_ref),
-                    supplier_order_line_no=str(canonical_line_no),
-                    receipt_ref=_text(row.receipt_doc_ref),
-                    receipt_line_no=_text(row.receipt_doc_line_no),
-                    correction_receipt_ref=_text(row.correction_receipt_ref) or None,
-                ))
+                    supplier_order_line_no=supplier_order_line_no,
+                    operation_kind=_OPERATION_KINDS[operation],
+                    operation_key=evidence_payload["operation_key"],
+                    operation_name=evidence_payload["operation_name"],
+                    correction_receipt_ref=evidence_payload["correction_receipt_ref"],
+                    evidence_hash=evidence_hash,
+                    evidence_payload=evidence_payload,
+                    match_rule=operation_rule,
+                    match_status=status,
+                    ambiguity_count=len(candidates) if status == "ambiguous" else 0,
+                    reason=reason,
+                )
+                db.add(provenance)
+                provenance_by_entry[matched_sle_id] = provenance
             else:
-                explicitly_unplanned += _decimal(sle.qty)
+                provenance.ledger_generation_id = ledger_generation_id
+                provenance.stock_ledger_entry_id = matched_sle_id
+                provenance.receipt_doc_type = _text(row.receipt_doc_type)
+                provenance.receipt_doc_ref = _text(row.receipt_doc_ref)
+                provenance.receipt_doc_line_no = _text(row.receipt_doc_line_no)
+                provenance.supplier_order_ref = _text(row.supplier_order_ref)
+                provenance.supplier_order_line_no = supplier_order_line_no
+                provenance.operation_kind = _OPERATION_KINDS[operation]
+                provenance.operation_key = evidence_payload["operation_key"]
+                provenance.operation_name = evidence_payload["operation_name"]
+                provenance.correction_receipt_ref = evidence_payload["correction_receipt_ref"]
+                provenance.evidence_hash = evidence_hash
+                provenance.evidence_payload = evidence_payload
+                provenance.match_rule = operation_rule
+                provenance.match_status = status
+                provenance.ambiguity_count = len(candidates) if status == "ambiguous" else 0
+                provenance.reason = reason
+            provenance_count += 1
+            facts.append(ReceiptFact(
+                sle_id=sle.id,
+                posting_at=sle.posting_at,
+                signed_qty=_decimal(sle.qty),
+                item_id=int(row.item_id),
+                supplier_order_ref=_text(row.supplier_order_ref),
+                supplier_order_line_no=(
+                    str(canonical_line_no) if status == "exact" else _text(row.supplier_order_line_no)
+                ),
+                receipt_ref=_text(row.receipt_doc_ref),
+                receipt_line_no=_text(row.receipt_doc_line_no),
+                correction_receipt_ref=_text(row.correction_receipt_ref) or None,
+            ))
+
+    for stale_entry_id, stale_provenance in provenance_by_entry.items():
+        if stale_entry_id not in touched_provenance_entry_ids:
+            db.delete(stale_provenance)
 
     # Make the normalized, generation-scoped evidence durable inside the
     # current savepoint before FIFO is evaluated.  A later allocation failure
     # still rolls the savepoint back atomically, while the allocator can never
     # run ahead of its auditable provenance.
     db.flush()
-    keys = {(fact.supplier_order_ref, fact.supplier_order_line_no) for fact in facts}
-    pins_by_order = {
-        key: _pins_for_order(db, ledger_generation_id, key[0], key[1])
-        for key in keys
+    reservations_by_item = {
+        item_id: _buy_reservations_for_item(
+            db,
+            ledger_generation_id=ledger_generation_id,
+            item_id=item_id,
+        )
+        for item_id in {int(fact.item_id) for fact in facts}
     }
-    allocations, unplanned = allocate_supplier_receipts(facts, pins_by_order)
+    allocations, unplanned = allocate_supplier_receipts(facts, reservations_by_item)
     aggregated: dict[
-        tuple[int, int, int | None], CoverageAllocation
+        tuple[int, int | None, int | None], CoverageAllocation
     ] = {}
-    aggregate_qty: dict[tuple[int, int, int | None], Decimal] = {}
+    aggregate_qty: dict[tuple[int, int | None, int | None], Decimal] = {}
+    bucket_cache: dict[int, int | None] = {}
+    folded_reservations: set[int] = set()
     for allocation in allocations:
+        if allocation.reservation.requirement_id is None:
+            continue
         key = (
             allocation.fact.sle_id,
-            allocation.pin.requirement_id,
-            allocation.pin.bucket_id,
+            allocation.reservation.requirement_id,
+            _reservation_bucket_id(
+                db,
+                bucket_cache,
+                int(allocation.reservation.requirement_id),
+            ) if allocation.reservation.requirement_id is not None else None,
         )
         aggregated[key] = allocation
         aggregate_qty[key] = aggregate_qty.get(key, Decimal("0")) + allocation.qty
+        reservation = allocation.reservation
+        if reservation.id is not None:
+            if _append_reservation_event(
+                db,
+                allocation=allocation,
+                cycle_id=cycle_id,
+            ):
+                folded_reservations.add(int(reservation.id))
+            else:
+                event_key = (
+                    f"{'realize' if allocation.qty > 0 else 'unrealize'}:"
+                    f"{int(reservation.id)}:{int(allocation.fact.sle_id)}"
+                )
+                if _event_exists(db, int(reservation.ledger_generation_id), event_key):
+                    folded_reservations.add(int(reservation.id))
+    db.flush()
     for key, allocation in aggregated.items():
         qty = aggregate_qty[key]
         if qty == 0:
             continue
-        db.add(models.MrpExecutionAllocation(
-            ledger_generation_id=ledger_generation_id,
-            cycle_id=cycle_id,
-            requirement_id=allocation.pin.requirement_id,
-            bucket_id=allocation.pin.bucket_id,
-            fact_type="supplier_receipt",
-            allocation_kind="coverage_realization",
-            fact_ref=allocation.fact.receipt_ref,
-            # One 1C document line may legitimately emit several physical
-            # SLEs.  The read-ledger UNIQUE key predates stock_ledger_entry_id,
-            # therefore keep both identities in its bounded line token.
-            fact_line_ref=(
-                f"{allocation.fact.receipt_line_no}#sle:{allocation.fact.sle_id}"
-            ),
-            fact_date=allocation.fact.posting_at,
-            allocated_qty=qty,
-            stock_ledger_entry_id=allocation.fact.sle_id,
-            freeze_allocation_id=(
-                allocation.pin.freeze_allocation_id
-                if allocation.pin.freeze_allocation_id > 0
-                else None
-            ),
-            origin_requirement_id=allocation.pin.requirement_id,
-        ))
+        reservation = allocation.reservation
+        allocation_key = _execution_allocation_key(allocation, key[2])
+        touched_execution_allocation_keys.add(allocation_key)
+        existing_allocation = existing_execution_allocations.get(allocation_key)
+        if existing_allocation is None:
+            existing_allocation = models.MrpExecutionAllocation(
+                ledger_generation_id=ledger_generation_id,
+                cycle_id=cycle_id,
+                requirement_id=allocation.reservation.requirement_id,
+                bucket_id=key[2],
+                fact_type="supplier_receipt",
+                allocation_kind="execution",
+                fact_ref=allocation.fact.receipt_ref,
+                # One 1C document line may legitimately emit several physical
+                # SLEs.  The read-ledger UNIQUE key predates stock_ledger_entry_id,
+                # therefore keep both identities in its bounded line token.
+                fact_line_ref=(
+                    f"{allocation.fact.receipt_line_no}#sle:{allocation.fact.sle_id}"
+                ),
+                fact_date=allocation.fact.posting_at,
+                allocated_qty=qty,
+                stock_ledger_entry_id=allocation.fact.sle_id,
+                origin_requirement_id=allocation.reservation.requirement_id,
+            )
+            db.add(existing_allocation)
+            existing_execution_allocations[allocation_key] = existing_allocation
+        else:
+            existing_allocation.cycle_id = cycle_id
+            existing_allocation.bucket_id = key[2]
+            existing_allocation.fact_ref = allocation.fact.receipt_ref
+            existing_allocation.fact_date = allocation.fact.posting_at
+            existing_allocation.allocated_qty = qty
+            existing_allocation.stock_ledger_entry_id = allocation.fact.sle_id
+            existing_allocation.origin_requirement_id = allocation.reservation.requirement_id
+
+    for key, allocation in existing_execution_allocations.items():
+        if key not in touched_execution_allocation_keys:
+            db.delete(allocation)
+    for reservation_id in sorted(folded_reservations):
+        fold_reservation_entry(db, reservation_id)
     db.flush()
     return SupplierReceiptBuildResult(
         provenance_count=provenance_count,
-        exact_fact_count=len(facts),
+        exact_fact_count=exact_fact_count,
         allocation_count=sum(1 for qty in aggregate_qty.values() if qty != 0),
-        unplanned_qty=unplanned + explicitly_unplanned,
+        unplanned_qty=unplanned,
     )
 
 

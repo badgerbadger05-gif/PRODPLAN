@@ -166,6 +166,16 @@ def test_make_and_consume_targets_ignore_poisoned_requirement_caches(db_session)
     assert targets[(requirement.id, "consume")].target_qty == Decimal("3")
 
 
+def test_buy_target_uses_uncovered_when_no_execution_allocation(db_session):
+    generation, run, requirement, _reservation = _scope(
+        db_session, "buy", mode="buy", reserved="10", realized="0", uncovered="4"
+    )
+    targets = build_generation_targets(
+        db_session, ledger_generation_id=generation.id, run_id=run.run_id
+    )
+    assert targets[(requirement.id, "buy")].target_qty == Decimal("4")
+
+
 def test_two_generations_are_isolated_and_accepted_rows_remain_unchanged(db_session):
     first = _scope(
         db_session, "g1", mode="make", reserved="10", realized="4", uncovered="0"
@@ -265,6 +275,106 @@ def test_purchase_commitment_is_generation_scoped_and_not_receipt_netting(db_ses
     assert exported == {current_pp.purchase_id}
     assert unexported == {}
     assert commitments == {requirement.item_id: 4.0}
+
+
+def test_supplier_receipt_execution_allocation_is_reconciled_as_buy(db_session):
+    batch = models.PhysicalImportBatch(
+        batch_key="supplier-reconcile",
+        status="completed",
+        cutoff=datetime(2026, 7, 23),
+    )
+    generation = models.LedgerGeneration(
+        generation_key="supplier-reconcile-generation",
+        status="accepted",
+        cutoff=datetime(2026, 7, 23),
+        accepted_at=datetime(2026, 7, 23),
+        physical_import_batch=batch,
+        algorithm_version="test",
+        replay_version="test",
+        source_watermarks={},
+        capabilities={},
+    )
+    item = models.Item(item_code="SUP-REC", item_name="Supplier receipt item")
+    run = models.PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={})
+    db_session.add_all([batch, generation, item, run])
+    db_session.flush()
+    requirement = models.MrpRequirement(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        total_required_qty=10,
+        net_required_qty=10,
+        period_from=date(2026, 7, 1),
+        period_to=date(2026, 7, 31),
+        bom_level=1,
+    )
+    db_session.add(requirement)
+    db_session.flush()
+    reservation = models.ReservationEntry(
+        ledger_generation_id=generation.id,
+        item_id=item.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="default",
+        run_id=run.run_id,
+        freeze_version=1,
+        requirement_id=requirement.id,
+        priority_period_from=date(2026, 7, 1),
+        priority_period_to=date(2026, 7, 31),
+        realization_mode="buy",
+        reserved_qty=Decimal("10"),
+        realized_qty=Decimal("4"),
+        uncovered_qty=Decimal("6"),
+    )
+    db_session.add(reservation)
+    db_session.flush()
+    db_session.add_all([
+        models.ReservationEvent(
+            ledger_generation_id=generation.id,
+            reservation_id=reservation.id,
+            item_id=item.item_id,
+            characteristic_ref="",
+            organization_ref="",
+            planning_stock_pool="default",
+            event_kind="open",
+            reserved_delta=Decimal("10"),
+            realized_delta=Decimal("0"),
+            idempotency_key="buy:open",
+        ),
+        models.ReservationEvent(
+            ledger_generation_id=generation.id,
+            reservation_id=reservation.id,
+            item_id=item.item_id,
+            characteristic_ref="",
+            organization_ref="",
+            planning_stock_pool="default",
+            event_kind="realize",
+            reserved_delta=Decimal("0"),
+            realized_delta=Decimal("4"),
+            idempotency_key="buy:realize",
+        ),
+    ])
+    req = requirement
+    db_session.add(models.MrpExecutionAllocation(
+        ledger_generation_id=generation.id,
+        cycle_id="test-supplier",
+        requirement_id=req.id,
+        fact_type="supplier_receipt",
+        allocation_kind="execution",
+        fact_ref="receipt-supplier",
+        fact_line_ref="1",
+        allocated_qty=Decimal("4"),
+    ))
+    db_session.add(
+        models.PlanningTruthState(
+            id=1,
+            current_generation_id=generation.id,
+        )
+    ) if db_session.get(models.PlanningTruthState, 1) is None else None
+    db_session.flush()
+
+    targets = build_generation_targets(db_session, ledger_generation_id=generation.id, run_id=run.run_id)
+    assert targets[(req.id, "buy")].realized_qty == Decimal("4")
+    assert targets[(req.id, "buy")].target_qty == Decimal("6")
 
 
 def test_strict_reconcile_skips_all_legacy_repairs(db_session, monkeypatch):

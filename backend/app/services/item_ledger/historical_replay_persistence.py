@@ -48,6 +48,8 @@ def bucket_capacity_for_mode(
         return max(_decimal(bucket.net_qty), Decimal("0"))
     if mode_key == "consume":
         return max(_decimal(bucket.gross_qty), Decimal("0"))
+    if mode_key == "buy":
+        return max(_decimal(bucket.net_qty), Decimal("0"))
     raise ValueError(f"unsupported realization mode for bucket capacity: {mode}")
 
 

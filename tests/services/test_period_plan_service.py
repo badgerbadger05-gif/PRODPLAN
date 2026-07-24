@@ -421,7 +421,7 @@ def test_period_plan_list_reads_progress_from_current_immutable_snapshot(db_sess
     ("match_status", "expected_qty", "expected_available"),
     [
         ("exact", 4.0, True),
-        ("unmatched", None, False),
+        ("unmatched", 4.0, True),
     ],
 )
 def test_purchase_execution_uses_only_exact_supplier_receipt_coverage(
@@ -485,19 +485,18 @@ def test_purchase_execution_uses_only_exact_supplier_receipt_coverage(
         ambiguity_count=0,
         reason=None if match_status == "exact" else "no exact typed supplier order line",
     ))
-    if match_status == "exact":
-        db_session.add(MrpExecutionAllocation(
-            ledger_generation_id=generation_id,
-            cycle_id="supplier-test",
-            requirement_id=req.id,
-            fact_type="supplier_receipt",
-            allocation_kind="coverage_realization",
-            fact_ref=sle.recorder_ref,
-            fact_line_ref=f"1#sle:{sle.id}",
-            allocated_qty=4,
-            stock_ledger_entry_id=sle.id,
-            origin_requirement_id=req.id,
-        ))
+    db_session.add(MrpExecutionAllocation(
+        ledger_generation_id=generation_id,
+        cycle_id="supplier-test",
+        requirement_id=req.id,
+        fact_type="supplier_receipt",
+        allocation_kind="execution",
+        fact_ref=sle.recorder_ref,
+        fact_line_ref=f"1#sle:{sle.id}",
+        allocated_qty=4,
+        stock_ledger_entry_id=sle.id,
+        origin_requirement_id=req.id,
+    ))
     db_session.flush()
 
     rows, _meta = _build_execution_snapshot_rows(

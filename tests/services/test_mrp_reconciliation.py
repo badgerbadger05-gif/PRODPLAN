@@ -1010,7 +1010,7 @@ def test_legacy_stock_drift_requires_explicit_diagnostic_mode(
     production = _public_reconcile_snapshot(db_session, run_id, dry_run=True)
     db_session.refresh(comp_req)
     assert production["purchase_added"] == []
-    assert production["purchase_pruned"]
+    assert production["purchase_pruned"] == []
     assert float(comp_req.drift_adjustment_qty) == 0.0
     assert db_session.get(PlannedPurchase, pp.purchase_id) is not None
 

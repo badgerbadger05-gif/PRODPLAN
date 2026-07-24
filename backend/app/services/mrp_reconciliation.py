@@ -1116,7 +1116,7 @@ def reconcile_snapshot(
             expected_mode = (
                 "make"
                 if flow == REPLENISHMENT_FLOW_PRODUCTION
-                else "consume"
+                else "buy"
                 if flow == REPLENISHMENT_FLOW_PURCHASE
                 else None
             )

@@ -21,6 +21,7 @@ from app import models
 from app.services.item_ledger.candidate_future_supply import capture_candidate_future_supply
 from app.services.item_ledger.candidate_realization_replay import replay_candidate_realizations
 from app.services.item_ledger.obligation_generation import fork_obligation_generation
+from app.services.item_ledger.reservation_ledger import redistribute_generation_pools
 from app.services.dbr.cockpit_candidate import (
     DbrCockpitCandidateError,
     build_cockpit_candidate_snapshot,
@@ -292,6 +293,11 @@ def run_obligation_refresh(
     }
     _complete(reservation_batch, reservation_metrics)
     replay = replay_candidate_realizations(db, target_id)
+    redistribute_generation_pools(
+        db,
+        target_id,
+        f"obligation-refresh:{key}",
+    )
     snapshots = {str(run_id): int(build_mrp_result_candidate_snapshot(db, run_id).id) for run_id in candidate_ids}
     purchase_journal_snapshot = build_purchase_journal_candidate(db, target_id)
     target = db.get(models.LedgerGeneration, target_id)

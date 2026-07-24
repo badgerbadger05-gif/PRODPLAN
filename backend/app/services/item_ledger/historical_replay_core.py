@@ -13,7 +13,7 @@ from decimal import Decimal
 from typing import Iterable, Literal, Optional, Tuple
 
 
-Mode = Literal["make", "consume"]
+Mode = Literal["make", "consume", "buy"]
 MatchRule = Literal["requirement", "order", "fifo"]
 
 
@@ -116,7 +116,7 @@ def _validate(facts: tuple[Fact, ...], reserves: tuple[Reserve, ...]) -> None:
     if len(reserve_ids) != len(set(reserve_ids)):
         raise ValueError("reserve_id must be unique")
     for fact in facts:
-        if fact.mode not in ("make", "consume"):
+        if fact.mode not in ("make", "consume", "buy"):
             raise ValueError(f"fact {fact.fact_id}: unsupported mode")
         if fact.is_reversal or fact.qty <= 0:
             raise ValueError(
@@ -124,7 +124,7 @@ def _validate(facts: tuple[Fact, ...], reserves: tuple[Reserve, ...]) -> None:
                 "must be normalized explicitly before replay"
             )
     for reserve in reserves:
-        if reserve.mode not in ("make", "consume"):
+        if reserve.mode not in ("make", "consume", "buy"):
             raise ValueError(f"reserve {reserve.reserve_id}: unsupported mode")
         if reserve.reserved_qty < 0:
             raise ValueError(f"reserve {reserve.reserve_id}: reserved_qty must be non-negative")

@@ -37,6 +37,7 @@ from ..replenishment import REPLENISHMENT_FLOW_PURCHASE, classify_replenishment_
 from .reconcile import contour_warehouse_refs
 from .reservation import (
     CONSUME,
+    BUY,
     MAKE,
     Coverage,
     IncomingLine,
@@ -84,6 +85,9 @@ _ALWAYS_CONSUME_KINDS = {"assembly_out", "expense", "writeoff"}
 _TRANSFER_OUT = "transfer_out"
 # SLE movement kinds that REALIZE a make reservation (production receipt, qty>0).
 _MAKE_RECEIPT_KINDS = {"assembly_in"}
+# SLE movement kinds that REALIZE/UNREALIZE a BUY reservation (supplier
+# purchase movement family; corrections/returns are explicit inverse lines).
+_BUY_RECEIPT_KINDS = {"supplier_receipt", "correction", "supplier_return"}
 # A transfer receipt REALIZES a make reservation only when it lands on a
 # finished-goods (ГП) warehouse — приход ГП на склад ГП по перемещению с
 # основанием-заказом. Ordinary transfer_in (materials moved to a workshop)
@@ -219,26 +223,35 @@ def mode_targets(req: models.MrpRequirement, item: Optional[models.Item]) -> Lis
     * PRODUCED requirement → a ``make`` record, reserved = net_required_qty.
     * CONSUMED item (bom_level ≥ 1) → a ``consume`` record, reserved =
       total_required_qty (gross).
+    * PURCHASED item (bom_level ≥ 1) → ``consume`` (gross) + ``buy`` (net).
 
     Combined this yields exactly the §2.2 split:
       bom_level 0 produced (finished good)  → make only
       produced intermediate (level ≥ 1)     → BOTH (consume gross + make net)
-      purchased (level ≥ 1)                 → consume only
+      purchased (level ≥ 1)                 → consume + buy
     """
     bom_level = int(req.bom_level or 0)
     targets: List[Tuple[str, Decimal]] = []
-    if _is_produced(item):
+    is_produced = _is_produced(item)
+    if is_produced:
         targets.append((MAKE, _dec(req.net_required_qty)))
     if bom_level >= 1:
         targets.append((CONSUME, _dec(req.total_required_qty)))
+        if not is_produced:
+            targets.append((BUY, _dec(req.net_required_qty)))
     return targets
 
 
-def _pin_mode_for_alloc(source_type: str, has_consume: bool, has_make: bool) -> Optional[str]:
+def _pin_mode_for_alloc(
+    source_type: str,
+    has_consume: bool,
+    has_make: bool,
+) -> Optional[str]:
     """Which reservation mode a frozen allocation attaches to (design §2.2/§3.1).
 
     supplier pins reduce make_uncovered (§3.1) → make (when a make record
-    exists); stock/wip pins net the consume gross → consume (when it exists);
+    exists), otherwise consume (when it exists);
+    stock/wip pins net the consume gross → consume (when it exists);
     a finished good (make only) takes everything on make.
     """
     if source_type == _SUPPLIER and has_make:
@@ -995,6 +1008,7 @@ class _MatchIndex:
     ):
         self.res_by_req_mode: Dict[Tuple[int, str], models.ReservationEntry] = {}
         self.res_by_run_item_mode: Dict[Tuple[int, int, str], List[models.ReservationEntry]] = {}
+        self.buy_by_item: Dict[int, List[models.ReservationEntry]] = {}
         entries = (
             db.query(models.ReservationEntry)
             .filter(models.ReservationEntry.requirement_id.in_(list(open_req_ids)))
@@ -1012,6 +1026,8 @@ class _MatchIndex:
             self.res_by_run_item_mode.setdefault(
                 (int(e.run_id), int(e.item_id), str(e.realization_mode)), []
             ).append(e)
+            if str(e.realization_mode) == BUY:
+                self.buy_by_item.setdefault(int(e.item_id), []).append(e)
 
         # order_ref1c → ProductionOrder (peg anchor); (order_id,item_id)→source_req
         self.order_by_ref: Dict[str, models.ProductionOrder] = {}
@@ -1181,6 +1197,13 @@ class _MatchIndex:
             return None
         return sorted(active, key=self._key_of)[0]
 
+    def _sorted(self, entries: List[models.ReservationEntry], statuses: Sequence[str]) -> List[models.ReservationEntry]:
+        status_set = {str(s) for s in statuses}
+        return sorted(
+            [e for e in entries if str(e.lifecycle_status) in status_set],
+            key=self._key_of,
+        )
+
     def match_issue(self, sle: models.StockLedgerEntry) -> Tuple[Optional[models.ReservationEntry], str]:
         """Match a physical issue (qty<0) to a CONSUME reservation (design §6.3).
 
@@ -1236,6 +1259,22 @@ class _MatchIndex:
         if not active:
             return None
         return sorted(active, key=self._key_of)[0]
+
+    def buy_fifo(self, item_id: int) -> List[models.ReservationEntry]:
+        """Active BUY reservations for ``item_id`` in FIFO order."""
+        return self._sorted(
+            self.buy_by_item.get(int(item_id), []),
+            ("active",),
+        )
+
+    def buy_for_unrealize(self, item_id: int) -> List[models.ReservationEntry]:
+        """BUY reservations with positive realized that can be unrealized, FIFO."""
+        candidates = [
+            entry
+            for entry in self.buy_by_item.get(int(item_id), [])
+            if _dec(entry.realized_qty) > EPS
+        ]
+        return self._sorted(candidates, ("active", "closed"))
 
     def match_receipt(self, sle: models.StockLedgerEntry) -> Tuple[Optional[models.ReservationEntry], str]:
         """Match a make receipt (qty>0: assembly_in, or transfer_in onto a
@@ -1334,7 +1373,9 @@ def realize_from_sle(
     B: residual → unplanned_consumption, no realize). Make receipt (qty>0
     assembly_in, or transfer_in landing on a finished-goods (ГП) warehouse —
     приход ГП по перемещению с основанием-заказом) pegged → make-reservation
-    realize. An unmatched issue is ``unplanned_consumption`` (decision #11):
+    realize. Supplier movements (supplier_receipt / correction / supplier_return)
+    apply to BUY reservations in global FIFO. An unmatched issue is
+    ``unplanned_consumption`` (decision #11):
     NEVER a silent global FIFO. idempotency_key
     ``realize:{reservation_id}:{sle_id}``.
 
@@ -1352,6 +1393,7 @@ def realize_from_sle(
     summary = {
         "realized_consume": 0,
         "realized_make": 0,
+        "realized_buy": 0,
         "unplanned_consumption": 0,
         "unplanned_qty": 0.0,
         "internal_transfer": 0,
@@ -1486,6 +1528,77 @@ def realize_from_sle(
                 if wrote:
                     summary["realized_make"] += 1
                 _fold_entry(db, entry)
+        elif mk in _BUY_RECEIPT_KINDS:
+            if qty > 0:
+                remaining = qty
+                for entry in index.buy_fifo(int(sle.item_id)):
+                    _fold_entry(db, entry)  # refresh outstanding before cap
+                    outstanding = max(
+                        _dec(entry.reserved_qty) - _dec(entry.realized_qty),
+                        Decimal("0"),
+                    )
+                    if outstanding <= EPS:
+                        continue
+                    realize_q = min(remaining, outstanding)
+                    if realize_q > EPS:
+                        wrote = _append_event(
+                            db, entry,
+                            event_kind="realize",
+                            idempotency_key=f"realize:{int(entry.id)}:{int(sle.id)}",
+                            realized_delta=realize_q,
+                            sle_id=int(sle.id),
+                            fact_ref=str(sle.recorder_ref or ""),
+                            fact_line_ref=str(sle.line_no or ""),
+                            match_rule="fifo",
+                            cycle_id=cycle_id,
+                        )
+                        if wrote:
+                            summary["realized_buy"] += 1
+                        _fold_entry(db, entry)
+                    remaining -= realize_q
+                    if remaining <= EPS:
+                        break
+                continue
+            if qty < 0:
+                remaining = -qty
+                for entry in index.buy_for_unrealize(int(sle.item_id)):
+                    _fold_entry(db, entry)  # refresh realized before cap
+                    realized = _dec(entry.realized_qty)
+                    if realized <= EPS:
+                        continue
+                    unrealize_q = min(remaining, realized)
+                    if unrealize_q > EPS:
+                        wrote = _append_event(
+                            db, entry,
+                            event_kind="unrealize",
+                            idempotency_key=f"unrealize:{int(entry.id)}:{int(sle.id)}",
+                            realized_delta=-unrealize_q,
+                            sle_id=int(sle.id),
+                            fact_ref=str(sle.recorder_ref or ""),
+                            fact_line_ref=str(sle.line_no or ""),
+                            match_rule="fifo",
+                            cycle_id=cycle_id,
+                        )
+                        if wrote:
+                            summary["realized_buy"] += 1
+                        _fold_entry(db, entry)
+                        if (
+                            str(entry.lifecycle_status) == "closed"
+                            and _dec(entry.realized_qty) + EPS < _dec(entry.reserved_qty)
+                        ):
+                            _append_event(
+                                db, entry,
+                                event_kind="reopen",
+                                idempotency_key=f"reopen:{int(entry.id)}:{int(sle.id)}",
+                                cycle_id=cycle_id,
+                            )
+                            entry.lifecycle_status = "active"
+                            entry.closed_at = None
+                            _fold_entry(db, entry)
+                    remaining -= unrealize_q
+                    if remaining <= EPS:
+                        break
+                continue
     return summary
 
 
@@ -1510,7 +1623,150 @@ def redistribute_pool(
     """
     generation_id = _resolve_generation_id(db, ledger_generation_id)
     pk = pool_key_for(int(item_id))
-    entries = (
+
+    def _line_sort_key(line: IncomingLine):
+        return (
+            0 if line.due_date is not None else 1,
+            line.due_date if line.due_date is not None else 0,
+            line.order_ref,
+            line.line_ref,
+            line.line_id,
+        )
+
+    def redistribute_buy_pool(
+        buy_entries: List[models.ReservationEntry],
+        cycle_id: str,
+    ) -> None:
+        """Redistribute global BUY coverage from supplier open supply in FIFO order."""
+        if not buy_entries:
+            return
+
+        buy_lines = (
+            db.query(models.LedgerFutureSupply)
+            .filter(
+                models.LedgerFutureSupply.ledger_generation_id == generation_id,
+                models.LedgerFutureSupply.item_id == int(item_id),
+                models.LedgerFutureSupply.planning_stock_pool == pk.planning_stock_pool,
+                models.LedgerFutureSupply.supply_kind == _SUPPLIER,
+                models.LedgerFutureSupply.evidence_status != "rejected",
+                models.LedgerFutureSupply.open_qty_at_cutoff > EPS,
+            )
+            .order_by(
+                models.LedgerFutureSupply.eta_date.asc(),
+                models.LedgerFutureSupply.source_ref.asc(),
+                models.LedgerFutureSupply.source_line_ref.asc(),
+                models.LedgerFutureSupply.id.asc(),
+            )
+            .all()
+        )
+
+        incoming_lines: List[IncomingLine] = []
+        line_meta_by_id: Dict[str, Tuple[str, str]] = {}
+        for row in buy_lines:
+            line_id = f"future-supply:{int(row.id)}"
+            source_ref = str(row.source_ref or "").strip() or line_id
+            source_line_ref = str(row.source_line_ref or "").strip() or ""
+            incoming_lines.append(
+                IncomingLine(
+                    line_id=line_id,
+                    source_kind=_SUPPLIER,
+                    remaining=_dec(row.open_qty_at_cutoff),
+                    due_date=row.eta_date,
+                    order_ref=source_ref,
+                    line_ref=source_line_ref,
+                )
+            )
+            line_meta_by_id[line_id] = (source_ref, source_line_ref)
+
+        ordered_buy_lines = sorted(incoming_lines, key=_line_sort_key)
+        remaining = {line.line_id: _dec(line.remaining) for line in ordered_buy_lines}
+        buy_entry_by_key: Dict[Tuple, models.ReservationEntry] = {}
+        buy_reserves: List[Reserve] = []
+        for e in buy_entries:
+            key = (
+                e.priority_period_from,
+                e.priority_period_to,
+                int(e.run_id) if e.run_id is not None else 0,
+                int(e.requirement_id),
+            )
+            buy_entry_by_key[key] = e
+            buy_reserves.append(
+                Reserve(
+                    key=key,
+                    reserved_qty=_dec(e.reserved_qty),
+                    realized_qty=_dec(e.realized_qty),
+                    realization_mode=BUY,
+                    requirement_id=int(e.requirement_id),
+                )
+            )
+
+        coverage_by_reserve: Dict[Tuple, Dict[str, Decimal]] = {}
+        for r in sorted(buy_reserves, key=lambda rr: rr.key):
+            need = max(r.outstanding - r.covered, Decimal("0"))
+            r.uncovered = need
+            r.coverage_state = coverage_state_for(r.outstanding, Decimal("0"))
+            if need <= EPS:
+                coverage_by_reserve[r.key] = {}
+                continue
+            per_line: Dict[str, Decimal] = {}
+            for line in ordered_buy_lines:
+                rem = remaining.get(line.line_id, Decimal("0"))
+                if rem <= EPS or need <= EPS:
+                    continue
+                take = min(need, rem)
+                if take > 0:
+                    r.covered_incoming_supplier += take
+                    remaining[line.line_id] = rem - take
+                    per_line[line.line_id] = per_line.get(line.line_id, Decimal("0")) + take
+                    need -= take
+            r.uncovered = max(r.outstanding - r.covered, Decimal("0"))
+            r.coverage_state = coverage_state_for(r.outstanding, r.covered)
+            coverage_by_reserve[r.key] = per_line
+
+        buy_entry_ids = [int(e.id) for e in buy_entries]
+        db.query(models.ReservationCoverage).filter(
+            models.ReservationCoverage.reservation_id.in_(buy_entry_ids),
+            models.ReservationCoverage.pin_kind == "floating",
+        ).delete(synchronize_session="fetch")
+        db.flush()
+
+        now = _now()
+        for r in buy_reserves:
+            entry = buy_entry_by_key.get(r.key)
+            if entry is None:
+                continue
+            entry.covered_on_hand_qty = Decimal("0")
+            entry.covered_incoming_wip_qty = Decimal("0")
+            entry.covered_incoming_supplier_qty = r.covered_incoming_supplier
+            entry.uncovered_qty = r.uncovered
+            entry.coverage_state = r.coverage_state
+            for line_id, covered_qty in coverage_by_reserve.get(r.key, {}).items():
+                source_ref, source_line_ref = line_meta_by_id.get(
+                    line_id, (line_id, "")
+                )
+                if covered_qty <= EPS:
+                    continue
+                db.add(
+                    models.ReservationCoverage(
+                        reservation_id=int(entry.id),
+                        source_kind=_SUPPLIER,
+                        source_ref=source_ref,
+                        source_line_ref=source_line_ref,
+                        pin_kind="floating",
+                        alloc_qty=Decimal("0"),
+                        fact_at_freeze=Decimal("0"),
+                        covered_qty=covered_qty,
+                        realized_qty=Decimal("0"),
+                        evaporated_qty=Decimal("0"),
+                        cycle_id=cycle_id,
+                        computed_at=now,
+                    )
+                )
+        db.flush()
+
+    # Consume-axis: inventory coverage remains unchanged for BUY and ignores buy
+    # open orders by design. This path preserves all existing behavior.
+    consume_entries = (
         db.query(models.ReservationEntry)
         .filter(
             models.ReservationEntry.item_id == int(item_id),
@@ -1523,106 +1779,125 @@ def redistribute_pool(
         )
         .all()
     )
-    if not entries:
-        return None
-
-    entry_by_key: Dict[Tuple, models.ReservationEntry] = {}
-    reserves: List[Reserve] = []
-    lines: List[IncomingLine] = []
-    for e in entries:
-        key = (
-            e.priority_period_from,
-            e.priority_period_to,
-            int(e.run_id) if e.run_id is not None else 0,
-            int(e.requirement_id),
-        )
-        entry_by_key[key] = e
-        r = Reserve(
-            key=key,
-            reserved_qty=_dec(e.reserved_qty),
-            realized_qty=_dec(e.realized_qty),
-            realization_mode=CONSUME,
-            requirement_id=int(e.requirement_id),
-        )
-        # frozen supplier/wip pins → Pin + a private IncomingLine (remaining=pin_live)
-        pins = (
-            db.query(models.ReservationCoverage)
-            .filter(
-                models.ReservationCoverage.reservation_id == int(e.id),
-                models.ReservationCoverage.pin_kind == "frozen",
+    pool: Optional[Pool] = None
+    if consume_entries:
+        entry_by_key: Dict[Tuple, models.ReservationEntry] = {}
+        reserves: List[Reserve] = []
+        lines: List[IncomingLine] = []
+        for e in consume_entries:
+            key = (
+                e.priority_period_from,
+                e.priority_period_to,
+                int(e.run_id) if e.run_id is not None else 0,
+                int(e.requirement_id),
             )
-            .all()
-        )
-        for p in pins:
-            sk = str(p.source_kind)
-            if sk not in (_SUPPLIER, _WIP):
-                continue
-            line_id = f"{sk}:{p.source_ref}:{p.source_line_ref}:{int(p.reservation_id)}"
-            pin = Pin(
-                line_id=line_id,
-                source_kind=sk,
-                alloc_qty=_dec(p.alloc_qty),
-                evaporated_qty=_dec(p.evaporated_qty),
-                realized_qty=_dec(p.realized_qty),
+            entry_by_key[key] = e
+            r = Reserve(
+                key=key,
+                reserved_qty=_dec(e.reserved_qty),
+                realized_qty=_dec(e.realized_qty),
+                realization_mode=CONSUME,
+                requirement_id=int(e.requirement_id),
             )
-            r.pins.append(pin)
-            if pin.pin_live > 0:
-                lines.append(
-                    IncomingLine(
-                        line_id=line_id,
-                        source_kind=sk,
-                        remaining=pin.pin_live,
-                        order_ref=str(p.source_ref),
-                        line_ref=str(p.source_line_ref),
-                    )
+            # frozen supplier/wip pins → Pin + a private IncomingLine (remaining=pin_live)
+            pins = (
+                db.query(models.ReservationCoverage)
+                .filter(
+                    models.ReservationCoverage.reservation_id == int(e.id),
+                    models.ReservationCoverage.pin_kind == "frozen",
                 )
-        reserves.append(r)
-
-    on_hand = _dec(on_hand_by_item.get(int(item_id), 0.0))
-    pool = Pool(on_hand=on_hand, reserves=reserves, lines=lines)
-    result = redistribute(pool)
-
-    # persist: clear existing floating rows for these entries, rewrite from result
-    entry_ids = [int(e.id) for e in entries]
-    db.query(models.ReservationCoverage).filter(
-        models.ReservationCoverage.reservation_id.in_(entry_ids),
-        models.ReservationCoverage.pin_kind == "floating",
-    ).delete(synchronize_session="fetch")
-    db.flush()
-
-    now = _now()
-    for r in result.reserves:
-        entry = entry_by_key.get(r.key)
-        if entry is None:
-            continue
-        entry.covered_on_hand_qty = r.covered_on_hand
-        entry.covered_incoming_supplier_qty = r.covered_incoming_supplier
-        entry.covered_incoming_wip_qty = r.covered_incoming_wip
-        entry.uncovered_qty = r.uncovered
-        entry.coverage_state = r.coverage_state
-    # aggregate floating coverage per (reservation, source_kind)
-    for cov in result.coverages:
-        entry = entry_by_key.get(cov.reserve_key)
-        if entry is None:
-            continue
-        source_ref = "pool" if cov.source_kind == _ON_HAND else ""
-        db.add(
-            models.ReservationCoverage(
-                reservation_id=int(entry.id),
-                source_kind=cov.source_kind,
-                source_ref=source_ref,
-                source_line_ref="",
-                pin_kind="floating",
-                alloc_qty=Decimal("0"),
-                fact_at_freeze=Decimal("0"),
-                covered_qty=cov.covered_qty,
-                realized_qty=Decimal("0"),
-                evaporated_qty=Decimal("0"),
-                cycle_id=cycle_id,
-                computed_at=now,
+                .all()
             )
+            for p in pins:
+                sk = str(p.source_kind)
+                if sk not in (_SUPPLIER, _WIP):
+                    continue
+                line_id = f"{sk}:{p.source_ref}:{p.source_line_ref}:{int(p.reservation_id)}"
+                pin = Pin(
+                    line_id=line_id,
+                    source_kind=sk,
+                    alloc_qty=_dec(p.alloc_qty),
+                    evaporated_qty=_dec(p.evaporated_qty),
+                    realized_qty=_dec(p.realized_qty),
+                )
+                r.pins.append(pin)
+                if pin.pin_live > 0:
+                    lines.append(
+                        IncomingLine(
+                            line_id=line_id,
+                            source_kind=sk,
+                            remaining=pin.pin_live,
+                            order_ref=str(p.source_ref),
+                            line_ref=str(p.source_line_ref),
+                        )
+                    )
+            reserves.append(r)
+
+        on_hand = _dec(on_hand_by_item.get(int(item_id), 0.0))
+        pool = Pool(on_hand=on_hand, reserves=reserves, lines=lines)
+        result = redistribute(pool)
+
+        # persist: clear existing floating rows for these entries, rewrite from result
+        entry_ids = [int(e.id) for e in consume_entries]
+        db.query(models.ReservationCoverage).filter(
+            models.ReservationCoverage.reservation_id.in_(entry_ids),
+            models.ReservationCoverage.pin_kind == "floating",
+        ).delete(synchronize_session="fetch")
+        db.flush()
+
+        now = _now()
+        for r in result.reserves:
+            entry = entry_by_key.get(r.key)
+            if entry is None:
+                continue
+            entry.covered_on_hand_qty = r.covered_on_hand
+            entry.covered_incoming_supplier_qty = r.covered_incoming_supplier
+            entry.covered_incoming_wip_qty = r.covered_incoming_wip
+            entry.uncovered_qty = r.uncovered
+            entry.coverage_state = r.coverage_state
+        # aggregate floating coverage per (reservation, source_kind)
+        for cov in result.coverages:
+            entry = entry_by_key.get(cov.reserve_key)
+            if entry is None:
+                continue
+            source_ref = "pool" if cov.source_kind == _ON_HAND else ""
+            db.add(
+                models.ReservationCoverage(
+                    reservation_id=int(entry.id),
+                    source_kind=cov.source_kind,
+                    source_ref=source_ref,
+                    source_line_ref="",
+                    pin_kind="floating",
+                    alloc_qty=Decimal("0"),
+                    fact_at_freeze=Decimal("0"),
+                    covered_qty=cov.covered_qty,
+                    realized_qty=Decimal("0"),
+                    evaporated_qty=Decimal("0"),
+                    cycle_id=cycle_id,
+                    computed_at=now,
+                )
+            )
+        db.flush()
+
+    # BUY-axis: global open-order FIFO in the current pool by default pool only.
+    # BUY never participates in reserved_soft; it uses only supplier open_qty coverage.
+    buy_entries = (
+        db.query(models.ReservationEntry)
+        .filter(
+            models.ReservationEntry.item_id == int(item_id),
+            models.ReservationEntry.characteristic_ref == pk.characteristic_ref,
+            models.ReservationEntry.organization_ref == pk.organization_ref,
+            models.ReservationEntry.planning_stock_pool == pk.planning_stock_pool,
+            models.ReservationEntry.realization_mode == BUY,
+            models.ReservationEntry.lifecycle_status == "active",
+            models.ReservationEntry.ledger_generation_id == generation_id,
         )
-    db.flush()
+        .all()
+    )
+    redistribute_buy_pool(buy_entries, cycle_id)
+
+    if pool is None:
+        pool = Pool(on_hand=_dec(on_hand_by_item.get(int(item_id), 0.0)))
     return pool
 
 
@@ -1789,6 +2064,43 @@ def run_reservation_shadow(
         "pools_redistributed": pools_redistributed,
         **realize_summary,
     }
+
+
+def redistribute_generation_pools(
+    db: Session,
+    ledger_generation_id: int,
+    cycle_id: str,
+) -> int:
+    """Rebuild every active reservation coverage cache in one generation.
+
+    Candidate obligation refreshes materialize reservations outside the normal
+    Ledger cycle. They must still run the same consume/BUY projection before
+    immutable read snapshots are built.
+    """
+    generation_id = _resolve_generation_id(db, int(ledger_generation_id))
+    item_ids = [
+        int(item_id)
+        for (item_id,) in (
+            db.query(models.ReservationEntry.item_id)
+            .filter(
+                models.ReservationEntry.ledger_generation_id == generation_id,
+                models.ReservationEntry.lifecycle_status == "active",
+            )
+            .distinct()
+            .all()
+        )
+    ]
+    on_hand = _ledger_on_hand_by_generation(db, generation_id)
+    for item_id in sorted(item_ids):
+        redistribute_pool(
+            db,
+            item_id,
+            on_hand,
+            cycle_id,
+            ledger_generation_id=generation_id,
+        )
+    db.flush()
+    return len(item_ids)
 
 
 def effective_net_bin(

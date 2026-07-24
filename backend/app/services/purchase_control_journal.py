@@ -39,6 +39,129 @@ from .supplier_order_status import (
 )
 
 _EPS = 1e-9
+_BUY_ROW_GENERATOR = "mrp_reservation"
+
+
+def _coverage_percent(part: float, total: float) -> float:
+    if total <= 0:
+        return 0.0
+    return round(max(part, 0.0) / total * 100.0, 6)
+
+
+def _horizon_filter_inclusive(value: Any, horizon_iso: Optional[str]) -> bool:
+    if horizon_iso is None:
+        return True
+    if value is None:
+        return False
+    return str(value) <= horizon_iso
+
+
+def _reconcile_buy_row_for_horizon(row: Dict[str, Any], horizon_iso: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Return BUY-row copy projected to selected horizon slices.
+
+    For grouped BUY rows we recompute all quantities and percentages only from
+    slices that lie in the selected horizon. Legacy run-pinning is intentionally
+    avoided: all included slices participate, even when an item/pool row spans
+    multiple plans.
+    """
+    if row.get("row_generator") != _BUY_ROW_GENERATOR:
+        return dict(row)
+    if horizon_iso is None:
+        return dict(row)
+
+    slices = [dict(s) for s in row.get("slices") or [] if _horizon_filter_inclusive(s.get("plan_period_to"), horizon_iso)]
+    if not slices:
+        return None
+
+    required = round(sum(_to_float(s.get("required_qty")) for s in slices), 3)
+    realized = round(sum(_to_float(s.get("realized_qty")) for s in slices), 3)
+    open_order_covered = round(sum(_to_float(s.get("open_order_covered_qty")) for s in slices), 3)
+    to_order = round(sum(_to_float(s.get("to_order_qty")) for s in slices), 3)
+
+    if required <= _EPS and to_order <= _EPS:
+        return None
+
+    run_ids = sorted({int(s["run_id"]) for s in slices if s.get("run_id") is not None})
+    requirement_ids = sorted({int(s["requirement_id"]) for s in slices if s.get("requirement_id") is not None})
+    reservation_ids = sorted({int(s["reservation_id"]) for s in slices if s.get("reservation_id") is not None})
+
+    bucket_slices = [dict(s) for s in slices]
+    ordered_period_tos = [str(s.get("plan_period_to") or "") for s in bucket_slices]
+    ordered_period_froms = [str(s.get("plan_period_from") or "") for s in bucket_slices]
+    ordered_labels = [s.get("period_label") for s in bucket_slices if s.get("period_label") is not None]
+    bucket_period_to = min(ordered_period_tos)
+    last_period_to = max(ordered_period_tos)
+    first_period_from = min(ordered_period_froms)
+    period_label = ordered_labels[0] if ordered_labels else _period_label(_parse_date(last_period_to))
+
+    projected = dict(row)
+    projected.update(
+        {
+            "run_id": run_ids[0] if len(run_ids) == 1 else None,
+            "run_ids": run_ids,
+            "requirement_ids": requirement_ids,
+            "reservation_ids": reservation_ids,
+            "slices": bucket_slices,
+            "horizon_buckets": bucket_slices,
+            "horizon_bucket_count": len(bucket_slices),
+            "required_qty": required,
+            "realized_qty": realized,
+            "open_order_covered_qty": open_order_covered,
+            "to_order_qty": to_order,
+            "to_order_pct": _coverage_percent(to_order, required),
+            "open_order_covered_pct": _coverage_percent(open_order_covered, required),
+            "plan_period_from": first_period_from,
+            "plan_period_to": last_period_to,
+            "period_label": period_label,
+            "delivery_date": last_period_to,
+            "quantity": required,
+            "remaining_qty": to_order,
+            "received_qty": realized,
+            "line_status": "to_order" if to_order > _EPS else "received",
+        }
+    )
+    return projected
+
+
+def _sum_to_order_by_period(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    buckets: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        if row.get("line_status") != "to_order":
+            continue
+        if row.get("row_generator") == _BUY_ROW_GENERATOR and row.get("horizon_buckets"):
+            slices = row.get("horizon_buckets")
+        else:
+            slices = [
+                {
+                    "plan_period_to": row.get("plan_period_to"),
+                    "period_label": row.get("period_label"),
+                    "to_order_qty": row.get("to_order_qty"),
+                }
+            ]
+
+        for slice_row in slices:
+            period_to = str(slice_row.get("plan_period_to") or "")
+            label = slice_row.get("period_label")
+            bucket = buckets.setdefault(
+                period_to,
+                {
+                    "plan_period_to": period_to,
+                    "period_label": label,
+                    "item_count": 0,
+                    "total_qty": 0.0,
+                },
+            )
+            bucket["item_count"] += 1
+            bucket["total_qty"] += _to_float(slice_row.get("to_order_qty"))
+
+    ordered = sorted(
+        buckets.values(),
+        key=lambda bucket: (bucket["plan_period_to"] is None, bucket["plan_period_to"] or ""),
+    )
+    for bucket in ordered:
+        bucket["item_count"] = int(bucket["item_count"])
+        bucket["total_qty"] = round(float(bucket["total_qty"]), 6)
+    return ordered
 
 # line_status values, in display priority order
 LINE_STATUSES = ("to_order", "overdue", "no_date", "expected", "partial", "received", "closed")
@@ -675,7 +798,9 @@ def _legacy_get_order_card(db: Session, order_id: int, *, today: Optional[date] 
 
 
 def list_filters(db: Session) -> Dict[str, Any]:
-    rows = read_snapshot(db)["rows"]
+    snapshot = read_snapshot(db)
+    rows = snapshot["rows"]
+    cards = snapshot.get("cards") or {}
     suppliers = sorted(
         {
             (int(row["supplier_id"]), str(row.get("supplier_name") or ""))
@@ -683,23 +808,90 @@ def list_filters(db: Session) -> Dict[str, Any]:
         },
         key=lambda row: (row[1].casefold(), row[0]),
     )
+    supplier_ids_from_cards = {
+        (int(line["supplier_id"]), str(line.get("supplier_name") or ""))
+        for card in cards.values()
+        for line in card.get("lines") or []
+        if line.get("supplier_id") is not None
+    }
+    suppliers = sorted(
+        set(suppliers) | set(supplier_ids_from_cards),
+        key=lambda row: (row[1].casefold(), row[0]),
+    )
     suppliers = [{"supplier_id": supplier_id, "supplier_name": name} for supplier_id, name in suppliers]
-    states = sorted({str(row["order_state_name"]) for row in rows if row.get("order_state_name")})
+    states = {
+        str(row["order_state_name"])
+        for row in rows
+        if row.get("order_state_name")
+    }
+    for card in cards.values():
+        for line in card.get("lines") or []:
+            if line.get("order_state_name"):
+                states.add(str(line["order_state_name"]))
+    states = sorted(states)
     return {"suppliers": suppliers, "states": states}
 
 
 def list_journal(db: Session, **kwargs: Any) -> Dict[str, Any]:
     """Filter only the current immutable purchase-journal snapshot."""
-    snapshot = read_snapshot(db); rows = [dict(row) for row in snapshot["rows"]]
+    snapshot = read_snapshot(db)
+    rows = [dict(row) for row in snapshot["rows"]]
+    meta = dict(snapshot.get("meta") or {})
+    run_ids = [int(v) for v in meta.get("run_ids", []) if v is not None]
+    to_order_by_period = [dict(row) for row in meta.get("to_order_by_period", [])]
+    if to_order_by_period:
+        # Keep legacy key shape (`period_to`) for API consumers while preserving
+        # snapshot-native `plan_period_to` in metadata.
+        for bucket in to_order_by_period:
+            if "period_to" not in bucket and "plan_period_to" in bucket:
+                bucket["period_to"] = bucket["plan_period_to"]
     order_id, supplier_id, search, line_status = (kwargs.get(k) for k in ("order_id", "supplier_id", "search", "line_status"))
-    if order_id is not None: rows = [r for r in rows if r.get("order_id") == int(order_id)]
-    if supplier_id is not None: rows = [r for r in rows if r.get("supplier_id") == int(supplier_id)]
-    if line_status: rows = [r for r in rows if r.get("line_status") == str(line_status)]
-    if kwargs.get("state"): rows = [r for r in rows if r.get("order_state_name") == str(kwargs["state"])]
-    if kwargs.get("phase"): rows = [r for r in rows if r.get("supply_phase") == str(kwargs["phase"])]
-    if kwargs.get("active_only", True): rows = [r for r in rows if float(r.get("remaining_qty") or 0) > 0]
-    if kwargs.get("date_from"): rows = [r for r in rows if r.get("delivery_date") is not None and str(r["delivery_date"]) >= str(kwargs["date_from"])]
-    if kwargs.get("date_to"): rows = [r for r in rows if r.get("delivery_date") is not None and str(r["delivery_date"]) <= str(kwargs["date_to"])]
+    if order_id is not None:
+        rows = [r for r in rows if r.get("order_id") == int(order_id)]
+    if supplier_id is not None:
+        rows = [r for r in rows if r.get("supplier_id") == int(supplier_id)]
+    if kwargs.get("state"):
+        rows = [r for r in rows if r.get("order_state_name") == str(kwargs["state"])]
+    if kwargs.get("phase"):
+        rows = [r for r in rows if r.get("supply_phase") == str(kwargs["phase"])]
+
+    horizon_iso = kwargs.get("horizon_period_to").isoformat() if kwargs.get("horizon_period_to") else None
+    rows = [
+        projected
+        for row in rows
+        for projected in (
+            [
+                _reconcile_buy_row_for_horizon(row, horizon_iso)
+            ]
+            if row.get("row_generator") == _BUY_ROW_GENERATOR
+            else [dict(row)]
+        )
+        if projected is not None
+    ]
+
+    if line_status:
+        rows = [r for r in rows if r.get("line_status") == str(line_status)]
+
+    if kwargs.get("active_only", True):
+        rows = [r for r in rows if float(r.get("remaining_qty") or 0) > 0]
+
+    if kwargs.get("date_from"):
+        rows = [r for r in rows if r.get("delivery_date") is not None and str(r["delivery_date"]) >= str(kwargs["date_from"])]
+    if kwargs.get("date_to"):
+        rows = [r for r in rows if r.get("delivery_date") is not None and str(r["delivery_date"]) <= str(kwargs["date_to"])]
+
+    if horizon_period_to := kwargs.get("horizon_period_to"):
+        to_order_by_period = _sum_to_order_by_period(rows)
+        for bucket in to_order_by_period:
+            if "period_to" not in bucket:
+                bucket["period_to"] = bucket["plan_period_to"]
+    elif to_order_by_period:
+        for bucket in to_order_by_period:
+            if "period_to" not in bucket and "plan_period_to" in bucket:
+                bucket["period_to"] = bucket["plan_period_to"]
+    else:
+        to_order_by_period = []
+
     if search:
         needle = str(search).casefold(); rows = [r for r in rows if needle in " ".join(str(r.get(k) or "") for k in ("order_number","item_name","item_code","supplier_name")).casefold()]
     sort_by = str(kwargs.get("sort_by") or "delivery_date")
@@ -717,10 +909,16 @@ def list_journal(db: Session, **kwargs: Any) -> Dict[str, Any]:
     summary = {"total_rows": len(rows), "by_status": by_status, "by_phase": by_phase,
                "to_order": by_status.get("to_order", 0), "overdue": by_status.get("overdue", 0),
                "expected_7d": 0, "in_transit_amount": 0.0,
-               "fact_status": "unavailable"}
+               "fact_status": "available"}
     limit, offset = max(1, min(int(kwargs.get("limit") or 100), 500)), max(0, int(kwargs.get("offset") or 0))
     return {"rows": rows[offset:offset + limit], "total": len(rows), "limit": limit, "offset": offset,
-            "run_id": None, "run_ids": [], "truth_status": snapshot["meta"]["truth_status"], "ledger_generation_id": snapshot["meta"]["ledger_generation"], "summary": summary, "to_order_by_period": [], "meta": snapshot["meta"]}
+            "run_id": run_ids[0] if len(run_ids) == 1 else None,
+            "run_ids": run_ids,
+            "truth_status": meta.get("truth_status", snapshot["meta"]["truth_status"]),
+            "ledger_generation_id": snapshot["meta"]["ledger_generation"],
+            "summary": summary,
+            "to_order_by_period": to_order_by_period,
+            "meta": snapshot["meta"]}
 
 
 def get_order_card(db: Session, order_id: int, *, today: Optional[date] = None) -> Dict[str, Any]:

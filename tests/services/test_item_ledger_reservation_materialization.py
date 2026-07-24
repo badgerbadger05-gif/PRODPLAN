@@ -17,6 +17,8 @@ pytestmark = pytest.mark.usefixtures("building_ledger_generation")
 from app import models
 from app.models import (
     Item,
+    LedgerBuildBatch,
+    LedgerFutureSupply,
     MrpFreezeAllocation,
     MrpRequirement,
     PlanningRun,
@@ -25,22 +27,23 @@ from app.models import (
     ProductionOrder,
     ProductionPlanHeader,
     ProductionProduct,
-    ReservationCoverage,
     ReservationEntry,
     ReservationEvent,
+    ReservationCoverage,
     StockBin,
     StockLedgerEntry,
     StockRecorderPull,
     StockWarehouse,
     SyncLink,
 )
-from app.services.item_ledger.reservation import CONSUME, MAKE
+from app.services.item_ledger.reservation import CONSUME, MAKE, BUY
 from app.services.item_ledger.reservation_ledger import (
     materialize_reservations,
     materialize_reservations_for_freeze,
     mirror_frozen_pins,
     mode_targets,
     realize_from_sle,
+    item_ledger_position,
     redistribute_pool,
     reservation_shadow_report,
     run_reservation_shadow,
@@ -142,6 +145,63 @@ def _run(db, pf, pt, *, version=1):
     db.add(r)
     db.flush()
     return r
+
+
+def _future_supply_batch(db, generation):
+    capture_cutoff = datetime(2026, 7, 23, 12)
+    batch = LedgerBuildBatch(
+        ledger_generation_id=generation.id,
+        stage="snapshot_build",
+        batch_key=f"snapshot-{generation.id}",
+        status="completed",
+        algorithm_version="tests-buy-axis",
+        metrics={},
+        completed_at=capture_cutoff,
+    )
+    db.add(batch)
+    db.flush()
+    return batch, capture_cutoff
+
+
+def _future_supply(
+    db,
+    generation,
+    batch,
+    item,
+    *,
+    source_ref,
+    source_line_ref,
+    qty,
+    pool="default",
+    due=date(2026, 8, 1),
+    capture_cutoff=None,
+    evidence_status="exact",
+):
+    capture_cutoff = capture_cutoff or datetime(2026, 7, 23, 12)
+    row = LedgerFutureSupply(
+        ledger_generation_id=generation.id,
+        supply_kind="supplier_order",
+        item_id=item.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool=pool,
+        destination_warehouse_ref1c="WH-1",
+        source_ref=source_ref,
+        source_line_ref=source_line_ref,
+        source_local_id=source_line_ref,
+        ordered_qty_at_cutoff=Decimal(str(qty)),
+        realized_qty_at_cutoff=Decimal("0"),
+        open_qty_at_cutoff=Decimal(str(qty)),
+        eta_date=due,
+        source_state_key="open",
+        capture_cutoff=capture_cutoff,
+        source_content_hash=f"hash-{source_ref}-{source_line_ref}",
+        capture_batch_id=batch.id,
+        evidence_status=evidence_status,
+    )
+    db.add(row)
+    db.flush()
+    return row
 
 
 def _req(db, run, item, *, gross, net, bom_level, version=1):
@@ -322,14 +382,15 @@ def test_mode_assignment_produced_intermediate_both(db_session):
     assert Decimal(str(_entry(db, req, MAKE).reserved_qty)) == Decimal("7")
 
 
-def test_mode_assignment_purchased_consume_only(db_session):
+def test_mode_assignment_purchased_buy_and_consume(db_session):
     db = db_session
     run = _run(db, date(2026, 7, 1), date(2026, 7, 15))
     it = _item(db, "BUY", produced=False)
     req = _req(db, run, it, gross=8, net=6, bom_level=1)
-    assert mode_targets(req, it) == [(CONSUME, Decimal("8"))]  # gross
+    assert mode_targets(req, it) == [(CONSUME, Decimal("8")), (BUY, Decimal("6"))]
 
     materialize_reservations(db, [req], {run.run_id: run}, "cyc")
+    assert Decimal(str(_entry(db, req, BUY).reserved_qty)) == Decimal("6")
     assert _entry(db, req, MAKE) is None
     assert Decimal(str(_entry(db, req, CONSUME).reserved_qty)) == Decimal("8")
 
@@ -363,7 +424,7 @@ def test_frozen_pin_dual_write_mirrors_allocation(db_session):
 
     entry = _entry(db, req, CONSUME)
     pins = db.query(ReservationCoverage).filter(
-        ReservationCoverage.reservation_id == entry.id,
+        ReservationCoverage.reservation_id == int(entry.id),
         ReservationCoverage.pin_kind == "frozen",
     ).all()
     by_kind = {p.source_kind: p for p in pins}
@@ -534,6 +595,39 @@ def test_make_receipt_via_pull_order_ref(db_session):
     assert Decimal(str(entry.realized_qty)) == Decimal("5")
 
 
+def test_supplier_receipt_realize_buy_fifo(db_session):
+    db = db_session
+    run_old = _run(db, date(2026, 7, 1), date(2026, 7, 15))
+    run_new = _run(db, date(2026, 7, 16), date(2026, 7, 31))
+    it = _item(db, "COMP", produced=False)
+    req_old = _req(db, run_old, it, gross=10, net=4, bom_level=1)
+    req_new = _req(db, run_new, it, gross=10, net=4, bom_level=1)
+    materialize_reservations(
+        db, [req_old, req_new], {run_old.run_id: run_old, run_new.run_id: run_new}, "cyc",
+    )
+
+    _sle(db, it, qty=6, kind="supplier_receipt", recorder="SUP-REC-1")
+    summary = realize_from_sle(db, diagnostic_ledger_scope(db), "cyc")
+
+    old_buy = _entry(db, req_old, BUY)
+    new_buy = _entry(db, req_new, BUY)
+    db.refresh(old_buy)
+    db.refresh(new_buy)
+    assert Decimal(str(old_buy.realized_qty)) == Decimal("4")
+    assert Decimal(str(new_buy.realized_qty)) == Decimal("2")
+    assert summary["realized_buy"] == 2
+    events = (
+        db.query(ReservationEvent)
+        .filter(
+            ReservationEvent.reservation_id.in_([int(old_buy.id), int(new_buy.id)]),
+            ReservationEvent.event_kind == "realize",
+        )
+        .order_by(ReservationEvent.id.asc())
+        .all()
+    )
+    assert [Decimal(str(ev.realized_delta)) for ev in events] == [Decimal("4"), Decimal("2")]
+
+
 def test_transfer_to_finished_goods_warehouse_closes_make(db_session):
     """Перемещение ГП на склад ГП (basis = ЗаказНаПроизводство): transfer_in
     landing on an is_finished_goods warehouse realizes the make reservation via
@@ -660,6 +754,222 @@ def test_redistribute_persists_floating_coverage_golden(db_session):
     assert covered.get(e1.id) == Decimal("6")
     assert covered.get(e2.id) == Decimal("4")
     assert e3.id not in covered  # zero coverage → no floating row
+
+
+def test_redistribute_buy_pool_global_fifo_and_no_reserved_soft_impact(db_session):
+    db = db_session
+    run_early = _run(db, date(2026, 7, 1), date(2026, 7, 15))
+    run_late = _run(db, date(2026, 7, 16), date(2026, 7, 31))
+    it = _item(db, "BUY-POOL", produced=False)
+
+    req_old = _req(db, run_early, it, gross=8, net=6, bom_level=1)
+    req_new = _req(db, run_late, it, gross=5, net=4, bom_level=1)
+    runs = {run_early.run_id: run_early, run_late.run_id: run_late}
+    materialize_reservations(db, [req_old, req_new], runs, "cyc")
+
+    generation = db.get(models.PlanningTruthState, 1).current_generation
+    batch, cutoff = _future_supply_batch(db, generation)
+    _future_supply(
+        db, generation, batch, it,
+        source_ref="SO-1", source_line_ref="1", qty=3,
+        due=date(2026, 8, 10), capture_cutoff=cutoff
+    )
+    _future_supply(
+        db, generation, batch, it,
+        source_ref="SO-2", source_line_ref="2", qty=7,
+        due=date(2026, 8, 11), capture_cutoff=cutoff
+    )
+    _future_supply(
+        db, generation, batch, it,
+        source_ref="SO-3", source_line_ref="3", qty=9,
+        due=date(2026, 8, 12), capture_cutoff=cutoff
+    )
+
+    pool = redistribute_pool(db, it.item_id, {it.item_id: 0.0}, "cyc")
+    assert pool is not None
+
+    buy_old = _entry(db, req_old, BUY)
+    buy_new = _entry(db, req_new, BUY)
+    consume_old = _entry(db, req_old, CONSUME)
+    consume_new = _entry(db, req_new, CONSUME)
+    db.refresh(buy_old)
+    db.refresh(buy_new)
+    assert Decimal(str(buy_old.covered_incoming_supplier_qty)) == Decimal("6")
+    assert Decimal(str(buy_new.covered_incoming_supplier_qty)) == Decimal("4")
+    assert Decimal(str(buy_old.uncovered_qty)) == Decimal("0")
+    assert Decimal(str(buy_new.uncovered_qty)) == Decimal("0")
+    assert buy_old.coverage_state == "covered"
+    assert buy_new.coverage_state == "covered"
+
+    buy_old_float = db.query(ReservationCoverage).filter(
+        ReservationCoverage.reservation_id == int(buy_old.id),
+        ReservationCoverage.pin_kind == "floating",
+        ReservationCoverage.source_kind == "supplier_order",
+    ).all()
+    assert sum(Decimal(str(c.covered_qty)) for c in buy_old_float) == Decimal("6")
+    assert len(buy_old_float) == 2
+    buy_new_float = db.query(ReservationCoverage).filter(
+        ReservationCoverage.reservation_id == int(buy_new.id),
+        ReservationCoverage.pin_kind == "floating",
+        ReservationCoverage.source_kind == "supplier_order",
+    ).all()
+    assert sum(Decimal(str(c.covered_qty)) for c in buy_new_float) == Decimal("4")
+    assert len(buy_new_float) == 1
+
+    reserved_soft = item_ledger_position(db, [it.item_id])[it.item_id]["reserved_soft"]
+    expected_reserved_soft = float(
+        Decimal(str(consume_old.reserved_qty)) + Decimal(str(consume_new.reserved_qty))
+    )
+    assert reserved_soft == pytest.approx(expected_reserved_soft)
+
+
+def test_redistribute_buy_pool_shortage_and_ambiguous_supply_included(db_session):
+    db = db_session
+    run_early = _run(db, date(2026, 7, 1), date(2026, 7, 15))
+    run_late = _run(db, date(2026, 7, 16), date(2026, 7, 31))
+    it = _item(db, "BUY-SHORT", produced=False)
+
+    req_old = _req(db, run_early, it, gross=8, net=6, bom_level=1)
+    req_new = _req(db, run_late, it, gross=2, net=2, bom_level=1)
+    runs = {run_early.run_id: run_early, run_late.run_id: run_late}
+    materialize_reservations(db, [req_old, req_new], runs, "cyc")
+
+    generation = db.get(models.PlanningTruthState, 1).current_generation
+    batch, cutoff = _future_supply_batch(db, generation)
+    _future_supply(
+        db, generation, batch, it,
+        source_ref="SO-A", source_line_ref="2", qty=4,
+        due=date(2026, 8, 12), capture_cutoff=cutoff,
+        evidence_status="ambiguous",
+    )
+    _future_supply(
+        db, generation, batch, it,
+        source_ref="SO-B", source_line_ref="1", qty=3,
+        due=date(2026, 8, 10), capture_cutoff=cutoff,
+    )
+    _future_supply(
+        db, generation, batch, it,
+        source_ref="SO-REJ", source_line_ref="1", qty=100,
+        due=date(2026, 8, 9), capture_cutoff=cutoff,
+        evidence_status="rejected",
+    )
+
+    redistribute_pool(db, it.item_id, {it.item_id: 0.0}, "cyc")
+
+    buy_old = _entry(db, req_old, BUY)
+    buy_new = _entry(db, req_new, BUY)
+    db.refresh(buy_old)
+    db.refresh(buy_new)
+
+    assert Decimal(str(buy_old.covered_incoming_supplier_qty)) == Decimal("6")
+    assert Decimal(str(buy_old.uncovered_qty)) == Decimal("0")
+    assert buy_old.coverage_state == "covered"
+
+    assert Decimal(str(buy_new.covered_incoming_supplier_qty)) == Decimal("1")
+    assert Decimal(str(buy_new.uncovered_qty)) == Decimal("1")
+    assert buy_new.coverage_state == "partial"
+
+    floats = db.query(ReservationCoverage).filter(
+        ReservationCoverage.pin_kind == "floating",
+        ReservationCoverage.source_kind == "supplier_order",
+    ).order_by(ReservationCoverage.reservation_id.asc(), ReservationCoverage.id.asc()).all()
+    covered_old = [c for c in floats if int(c.reservation_id) == int(buy_old.id)]
+    covered_new = [c for c in floats if int(c.reservation_id) == int(buy_new.id)]
+    assert len(covered_old) == 2
+    assert Decimal(str(covered_old[0].covered_qty)) == Decimal("3")
+    assert Decimal(str(covered_old[1].covered_qty)) == Decimal("3")
+    assert covered_old[0].source_ref == "SO-B"
+    assert covered_old[0].source_line_ref == "1"
+    assert covered_old[1].source_ref == "SO-A"
+    assert covered_old[1].source_line_ref == "2"
+    assert len(covered_new) == 1
+    assert Decimal(str(covered_new[0].covered_qty)) == Decimal("1")
+    assert covered_new[0].source_ref == "SO-A"
+    assert covered_new[0].source_line_ref == "2"
+
+
+def test_redistribute_buy_pool_zero_supply_initializes_uncovered(db_session):
+    db = db_session
+    run = _run(db, date(2026, 7, 1), date(2026, 7, 15))
+    it = _item(db, "BUY-ZERO", produced=False)
+
+    req = _req(db, run, it, gross=10, net=10, bom_level=1)
+    materialize_reservations(db, [req], {run.run_id: run}, "cyc")
+    redistribute_pool(db, it.item_id, {it.item_id: 0.0}, "cyc")
+
+    buy_entry = _entry(db, req, BUY)
+    db.refresh(buy_entry)
+    assert Decimal(str(buy_entry.covered_incoming_supplier_qty)) == Decimal("0")
+    assert Decimal(str(buy_entry.uncovered_qty)) == Decimal("10")
+    assert buy_entry.coverage_state == "uncovered"
+
+    floats = db.query(ReservationCoverage).filter(
+        ReservationCoverage.reservation_id == int(buy_entry.id),
+        ReservationCoverage.pin_kind == "floating",
+        ReservationCoverage.source_kind == "supplier_order",
+    ).all()
+    assert floats == []
+
+
+def test_redistribute_buy_pool_stale_lines_removed_after_supply_reduction(db_session):
+    db = db_session
+    run_early = _run(db, date(2026, 7, 1), date(2026, 7, 15))
+    run_late = _run(db, date(2026, 7, 16), date(2026, 7, 31))
+    it = _item(db, "BUY-STALE", produced=False)
+
+    req_old = _req(db, run_early, it, gross=7, net=7, bom_level=1)
+    req_new = _req(db, run_late, it, gross=7, net=7, bom_level=1)
+    runs = {run_early.run_id: run_early, run_late.run_id: run_late}
+    materialize_reservations(db, [req_old, req_new], runs, "cyc")
+
+    generation = db.get(models.PlanningTruthState, 1).current_generation
+    batch, cutoff = _future_supply_batch(db, generation)
+    first = _future_supply(
+        db, generation, batch, it,
+        source_ref="SO-1", source_line_ref="1", qty=10,
+        due=date(2026, 8, 10), capture_cutoff=cutoff,
+    )
+    _future_supply(
+        db, generation, batch, it,
+        source_ref="SO-2", source_line_ref="1", qty=4,
+        due=date(2026, 8, 11), capture_cutoff=cutoff,
+    )
+
+    redis1 = redistribute_pool(db, it.item_id, {it.item_id: 0.0}, "cyc")
+    assert redis1 is not None
+    buy_old = _entry(db, req_old, BUY)
+    buy_new = _entry(db, req_new, BUY)
+    db.refresh(buy_old)
+    db.refresh(buy_new)
+    assert Decimal(str(buy_old.covered_incoming_supplier_qty)) == Decimal("7")
+    assert Decimal(str(buy_old.uncovered_qty)) == Decimal("0")
+    assert Decimal(str(buy_new.covered_incoming_supplier_qty)) == Decimal("7")
+    assert Decimal(str(buy_new.uncovered_qty)) == Decimal("0")
+
+    first.open_qty_at_cutoff = Decimal("0")
+    db.flush()
+
+    redis2 = redistribute_pool(db, it.item_id, {it.item_id: 0.0}, "cyc-2")
+    assert redis2 is not None
+    db.refresh(buy_old)
+    db.refresh(buy_new)
+    assert Decimal(str(buy_old.covered_incoming_supplier_qty)) == Decimal("4")
+    assert Decimal(str(buy_old.uncovered_qty)) == Decimal("3")
+    assert Decimal(str(buy_new.covered_incoming_supplier_qty)) == Decimal("0")
+    assert Decimal(str(buy_new.uncovered_qty)) == Decimal("7")
+    remaining = db.query(ReservationCoverage).filter(
+        ReservationCoverage.pin_kind == "floating",
+        ReservationCoverage.source_kind == "supplier_order",
+    ).count()
+    assert remaining == 1
+    old_float = db.query(ReservationCoverage).filter(
+        ReservationCoverage.reservation_id == int(buy_old.id),
+        ReservationCoverage.pin_kind == "floating",
+        ReservationCoverage.source_kind == "supplier_order",
+    ).all()
+    assert len(old_float) == 1
+    assert Decimal(str(old_float[0].covered_qty)) == Decimal("4")
+    assert old_float[0].source_ref == "SO-2"
 
 
 # ---------------------------------------------------------------------------

@@ -273,6 +273,16 @@ def test_inv_res_onemode_and_make_zero():
     assert _f(reserved_soft(pool)) == 6  # make adds exactly 0
 
 
+def test_inv_res_buy_does_not_block_stock_pool_positioning():
+    # BUY reserves are a separate supply-axis obligation, not part of pool
+    # soft-demand the way consume reservations are.
+    buy = _reserve(K_R1, 6, mode="buy")
+    pool = Pool(on_hand=4, reserves=[buy])
+    assert _f(reserved_soft(pool)) == 0
+    assert _f(available(pool)) == 4
+    assert _f(uncovered_pool(pool)) == 0
+
+
 def test_inv_idem_dist_double_run_identical():
     def _mk():
         return Pool(

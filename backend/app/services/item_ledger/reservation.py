@@ -29,6 +29,7 @@ Number = Union[int, float, Decimal, str]
 
 CONSUME = "consume"
 MAKE = "make"
+BUY = "buy"
 
 _SUPPLIER = "supplier_order"
 _WIP = "wip_order"
@@ -216,7 +217,7 @@ class RedistributeResult:
 
 
 def _consume_active(pool: Pool) -> List[Reserve]:
-    return [r for r in pool.reserves if r.realization_mode == CONSUME]
+    return [r for r in pool.reserves if str(r.realization_mode) == CONSUME]
 
 
 def on_hand_pos(pool: Pool) -> Decimal:
@@ -225,7 +226,7 @@ def on_hand_pos(pool: Pool) -> Decimal:
 
 
 def reserved_soft(pool: Pool) -> Decimal:
-    """Σ outstanding over active consume reserves (design §3). make → exactly 0."""
+    """Σ outstanding over active consume-mode reserves (design §3). make/buy → exactly 0."""
     return sum((r.outstanding for r in _consume_active(pool)), Decimal("0"))
 
 

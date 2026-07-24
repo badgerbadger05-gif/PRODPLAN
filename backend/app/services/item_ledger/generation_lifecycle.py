@@ -412,23 +412,30 @@ def validate_generation_build(
     allocations = db.query(models.MrpExecutionAllocation).filter(
         models.MrpExecutionAllocation.ledger_generation_id == int(generation.id)
     ).all()
+    supplier_allocation_by_key: dict[
+        tuple[int | None, int | None, str, str], models.MrpExecutionAllocation
+    ] = {}
+    replay_allocations: list[models.MrpExecutionAllocation] = []
     for allocation in allocations:
-        if (
-            str(allocation.fact_type or "") == "supplier_receipt"
-            and str(allocation.allocation_kind or "") == "coverage_realization"
-        ):
-            if not str(allocation.cycle_id or "").startswith(
-                f"historical-supplier:g{generation.id}:"
+        if str(allocation.fact_type or "") == "supplier_receipt":
+            supplier_key = (
+                allocation.requirement_id if allocation.requirement_id is not None else None,
+                allocation.bucket_id,
+                str(allocation.fact_ref or ""),
+                str(allocation.fact_line_ref or ""),
+            )
+            if (
+                supplier_key not in supplier_allocation_by_key
+                or (
+                    str(allocation.allocation_kind or "") == "execution"
+                    and str(supplier_allocation_by_key[supplier_key].allocation_kind or "") != "execution"
+                )
             ):
-                raise GenerationValidationError(
-                    "supplier allocation lacks generation build lineage"
-                )
-            if int(allocation.requirement_id) not in selected_requirement_ids:
-                raise GenerationValidationError(
-                    "supplier allocation escapes selected obligations"
-                )
-            supplier_allocated_qty += _d(allocation.allocated_qty)
+                supplier_allocation_by_key[supplier_key] = allocation
             continue
+        replay_allocations.append(allocation)
+
+    for allocation in replay_allocations:
         if not str(allocation.cycle_id or "").startswith("historical-replay:g"):
             raise GenerationValidationError("legacy execution allocation entered generation build")
         mode = _SAFE_FACT_MODE.get(str(allocation.fact_type or ""))
@@ -452,6 +459,23 @@ def validate_generation_build(
                 raise GenerationValidationError(
                     "unphased execution allocation requires legacy net-phasing flag"
                 )
+    for allocation in supplier_allocation_by_key.values():
+        if str(allocation.allocation_kind or "") not in {"coverage_realization", "execution"}:
+            raise GenerationValidationError("unsafe supplier allocation kind")
+        if not str(allocation.cycle_id or "").startswith(
+            f"historical-supplier:g{generation.id}:"
+        ):
+            raise GenerationValidationError(
+                "supplier allocation lacks generation build lineage"
+            )
+        if (
+            allocation.requirement_id is None
+            or int(allocation.requirement_id) not in selected_requirement_ids
+        ):
+            raise GenerationValidationError(
+                "supplier allocation escapes selected obligations"
+            )
+        supplier_allocated_qty += _d(allocation.allocated_qty)
     if dict(allocation_by_req_mode) != {
         key: qty for key, qty in realized_by_req_mode.items() if qty != 0
     }:

@@ -1,9 +1,8 @@
 """Project exported supplier orders into auditable future-supply evidence.
 
 This boundary deliberately reads neither ``SupplierOrderItem.received_qty`` nor
-any legacy proposal status/remaining projection.  Realisation is reconstructed
-only from the immutable, visible Stock Ledger rows whose supplier receipt
-provenance is an exact match to the exported 1C order line.
+any legacy proposal status/remaining projection. Realisation is reconstructed
+from immutable, visible Stock Ledger rows for supplier-receipt operations.
 
 Current export allocations do not yet retain a destination/pool.  They are
 therefore preserved as rejected evidence (open quantity zero), rather than
@@ -103,7 +102,6 @@ def supplier_future_supply_evidence(
         == models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id,
     ).filter(
         models.StockLedgerSupplierReceiptProvenance.ledger_generation_id == int(generation.id),
-        models.StockLedgerSupplierReceiptProvenance.match_status == "exact",
         models.StockLedgerSupplierReceiptProvenance.operation_kind.in_(
             ("supplier_receipt", "correction", "supplier_return")
         ),
