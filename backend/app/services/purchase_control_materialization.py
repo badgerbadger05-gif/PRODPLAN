@@ -62,9 +62,12 @@ class ReservationAllocationLine:
 class MaterializeOrderLine:
     row_key: str
     reservation_id: int
+    requirement_id: int
     item_id: int
     item_ref1c: str
     unit_ref1c: str
+    planning_stock_pool: str
+    destination_warehouse_ref1c: str
     need_date: Optional[str]
     order_date: Optional[str]
     qty: float
@@ -125,13 +128,25 @@ def _positive_63bit_token(payload: dict[str, Any]) -> int:
     return value or 1
 
 
-def _acquire_materialization_lock(db: Session, idempotency_key: str) -> None:
-    """Serialize the local claim and the external 1C call for one request."""
+def _acquire_reservation_claim_locks(
+    db: Session,
+    reservation_ids: Sequence[int],
+) -> None:
+    """Serialize durable claims in stable reservation order on PostgreSQL."""
     if db.get_bind().dialect.name != "postgresql":
         return
-    raw = hashlib.sha256(idempotency_key.encode("utf-8")).digest()[:8]
-    lock_key = int.from_bytes(raw, "big", signed=True)
-    db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": lock_key})
+    for reservation_id in sorted({int(value) for value in reservation_ids}):
+        lock_key = _positive_63bit_token(
+            {
+                "v": 1,
+                "kind": "purchase_control_reservation_claim",
+                "reservation_id": reservation_id,
+            }
+        )
+        db.execute(
+            text("SELECT pg_advisory_xact_lock(:k)"),
+            {"k": lock_key},
+        )
 
 
 def _fmt_need_date(value: Optional[str]) -> Optional[str]:
@@ -143,23 +158,45 @@ def _fmt_need_date(value: Optional[str]) -> Optional[str]:
         return None
 
 
+def _stable_line_identity(
+    line: MaterializeOrderLine,
+    supplier_ref1c: str,
+) -> dict[str, Any]:
+    """Generation-independent identity of one fixed planning obligation."""
+    return {
+        "v": 5,
+        "kind": "purchase_control_materialize_line",
+        "row_key": line.row_key,
+        "requirement_id": int(line.requirement_id),
+        "supplier": clean_ref1c(supplier_ref1c),
+        "item": line.item_ref1c,
+        "unit": line.unit_ref1c,
+        "planning_stock_pool": line.planning_stock_pool,
+        "destination_warehouse_ref1c": line.destination_warehouse_ref1c,
+        "qty": float(round(line.qty, 6)),
+        "need_date": _normalize_text(line.need_date),
+        "order_date": _normalize_text(line.order_date),
+    }
+
+
 def _one_c_line_payload_token_group_hash(group: MaterializeOrderGroup) -> str:
-    """Stable hash payload for a supplier group across instances."""
-    reservation_ids = sorted(int(line.reservation_id) for line in group.lines)
+    """Stable supplier-group identity across snapshots and Ledger republishes."""
     payload = {
-        "v": 4,
+        "v": 5,
         "kind": "purchase_control_materialize_group",
         "supplier": clean_ref1c(group.supplier_ref1c),
-        "reservation_ids": reservation_ids,
+        "lines": sorted(
+            _canonical_hash(_stable_line_identity(line, group.supplier_ref1c))
+            for line in group.lines
+        ),
     }
     return _canonical_hash(payload)
 
 
-def _group_marker_token(request_hash: str, group: MaterializeOrderGroup) -> str:
+def _group_marker_token(group: MaterializeOrderGroup) -> str:
     return origin_token(
         "purchase_control_materialization",
         {
-            "request_hash": request_hash,
             "supplier": clean_ref1c(group.supplier_ref1c),
             "group_hash": _one_c_line_payload_token_group_hash(group),
         },
@@ -169,31 +206,17 @@ def _group_marker_token(request_hash: str, group: MaterializeOrderGroup) -> str:
 def _line_token_payload(
     *,
     line: MaterializeOrderLine,
-    request_hash: str,
     supplier_ref1c: str,
 ) -> dict[str, Any]:
-    return {
-        "v": 4,
-        "kind": "purchase_control_materialize_line",
-        "request_hash": request_hash,
-        "row_key": line.row_key,
-        "supplier": clean_ref1c(supplier_ref1c),
-        "reservation_id": int(line.reservation_id),
-        "item": line.item_ref1c,
-        "unit": line.unit_ref1c,
-        "qty": float(round(line.qty, 6)),
-        "need_date": _normalize_text(line.need_date),
-        "order_date": _normalize_text(line.order_date),
-    }
+    return _stable_line_identity(line, supplier_ref1c)
 
 
-def _stamp_group_lines(group: MaterializeOrderGroup, request_hash: str) -> None:
+def _stamp_group_lines(group: MaterializeOrderGroup) -> None:
     lines = sorted(group.lines, key=lambda line: (line.row_key, line.reservation_id))
     seen: set[int] = set()
     for line in lines:
         payload = _line_token_payload(
             line=line,
-            request_hash=request_hash,
             supplier_ref1c=group.supplier_ref1c,
         )
         token = _positive_63bit_token(payload)
@@ -204,9 +227,13 @@ def _stamp_group_lines(group: MaterializeOrderGroup, request_hash: str) -> None:
         line.request_line_hash = _canonical_hash(payload)
 
 
-def _supplier_order_comment(request_hash: str, group: MaterializeOrderGroup) -> str:
-    marker = _group_marker_token(request_hash=request_hash, group=group)
-    return add_origin_marker(f"PRODPLAN source=purchase_control; {request_hash}", marker)
+def _supplier_order_comment(group: MaterializeOrderGroup) -> str:
+    group_hash = _one_c_line_payload_token_group_hash(group)
+    marker = _group_marker_token(group=group)
+    return add_origin_marker(
+        f"PRODPLAN source=purchase_control; group={group_hash}",
+        marker,
+    )
 
 
 def _order_lines_payload(ref_key: str, group: MaterializeOrderGroup) -> list[dict[str, Any]]:
@@ -249,7 +276,6 @@ def _verify_order_lines(
     *,
     doc: dict[str, Any],
     group: MaterializeOrderGroup,
-    request_hash: str,
 ) -> list[dict[str, Any]]:
     if not isinstance(doc, dict):
         raise RuntimeError("1C purchase materialization returned malformed document")
@@ -269,6 +295,7 @@ def _verify_order_lines(
     supplier_order_ref = clean_ref1c(doc.get("Ref_Key"))
     if not supplier_order_ref:
         raise RuntimeError("1C purchase materialization returned no order ref")
+    supplier_order_number = _normalize_text(doc.get("Number"))
 
     expected_by_token: dict[int, tuple[MaterializeOrderLine, str]] = {}
     for line in group.lines:
@@ -280,13 +307,12 @@ def _verify_order_lines(
             _canonical_hash(
                 _line_token_payload(
                     line=line,
-                    request_hash=request_hash,
                     supplier_ref1c=group.supplier_ref1c,
                 )
             ),
         )
 
-    exact_rows: list[tuple[str, int, int, str, MaterializeOrderLine]] = []
+    exact_rows: list[tuple[str, int, str, int, str, MaterializeOrderLine]] = []
     for actual in lines:
         try:
             token = int(actual.get("КлючСвязи"))
@@ -317,6 +343,7 @@ def _verify_order_lines(
             (
                 supplier_order_ref,
                 int(line_no),
+                supplier_order_number,
                 int(token),
                 expected_hash,
                 expected_line,
@@ -327,11 +354,12 @@ def _verify_order_lines(
         raise RuntimeError("1C purchase materialization did not return every order line token")
 
     out: list[dict[str, Any]] = []
-    for supplier_order_ref, line_no, token, line_hash, expected_line in exact_rows:
+    for supplier_order_ref, line_no, order_number, token, line_hash, expected_line in exact_rows:
         out.append(
             {
                 "reservation_id": int(expected_line.reservation_id),
                 "supplier_order_ref": supplier_order_ref,
+                "supplier_order_number": order_number,
                 "supplier_order_line_no": str(line_no),
                 "allocated_qty": float(round(expected_line.qty, 6)),
                 "line_token": token,
@@ -496,6 +524,9 @@ def _load_groups_and_lineages(
     requested_keys: Sequence[str],
 ) -> tuple[list[MaterializeOrderGroup], list[dict[str, Any]], int]:
     selected_rows, ledger_generation_id = _validate_requested_rows(snapshot, requested_keys)
+    configured_destination = clean_ref1c(
+        _load_odata_config().get("purchase_destination_warehouse_ref1c")
+    )
 
     line_rows: list[tuple[str, MaterializeOrderLine]] = []
     by_key = {_row_key(row): row for row in snapshot.get("rows", []) if isinstance(row, dict)}
@@ -529,6 +560,14 @@ def _load_groups_and_lineages(
             raise PurchaseControlMaterializationError(
                 f"row {row_key}: item {item_id} missing unit"
             )
+        planning_stock_pool = _normalize_text(row.get("planning_stock_pool"))
+        if not planning_stock_pool:
+            raise PurchaseControlMaterializationError(
+                f"row {row_key}: planning_stock_pool is missing"
+            )
+        destination_warehouse_ref1c = clean_ref1c(
+            row.get("destination_warehouse_ref1c")
+        ) or configured_destination
 
         slices = row.get("slices")
         if not isinstance(slices, list) or not slices:
@@ -584,9 +623,12 @@ def _load_groups_and_lineages(
                     MaterializeOrderLine(
                         row_key=row_key,
                         reservation_id=reservation_id,
+                        requirement_id=int(reservation.requirement_id),
                         item_id=item_id,
                         item_ref1c=item_ref1c,
                         unit_ref1c=unit_ref1c,
+                        planning_stock_pool=planning_stock_pool,
+                        destination_warehouse_ref1c=destination_warehouse_ref1c,
                         need_date=row_need_date,
                         order_date=order_date,
                         qty=alloc_qty,
@@ -678,14 +720,23 @@ def _build_request_payload(
 
 
 def _make_idempotency_key(
-    snapshot: dict[str, Any],
-    requested_keys: Sequence[str],
-    selected_rows: list[dict[str, Any]],
+    groups: Sequence[MaterializeOrderGroup],
 ) -> str:
     canonical = {
-        "snapshot_id": int(snapshot.get("meta", {}).get("snapshot_id") or 0),
-        "rows": _line_signature(selected_rows),
-        "request_keys": sorted({_normalize_text(key) for key in requested_keys}),
+        "v": 2,
+        "kind": "purchase_control_materialize",
+        "groups": [
+            {
+                "supplier": clean_ref1c(group.supplier_ref1c),
+                "lines": sorted(
+                    _canonical_hash(
+                        _stable_line_identity(line, group.supplier_ref1c)
+                    )
+                    for line in group.lines
+                ),
+            }
+            for group in sorted(groups, key=lambda value: value.supplier_ref1c)
+        ],
     }
     digest = hashlib.sha256(
         json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
@@ -699,7 +750,7 @@ def _parse_allocation_record(
     allocation: dict[str, Any],
     expected: dict[int, float],
     seen: dict[int, float],
-) -> tuple[int, float, str, str, Optional[int], Optional[str]]:
+) -> tuple[int, float, str, str, Optional[str], Optional[int], Optional[str]]:
     if not isinstance(allocation, dict):
         raise PurchaseControlMaterializationError("allocation item must be an object")
 
@@ -720,6 +771,8 @@ def _parse_allocation_record(
             f"allocation for reservation_id={rid} misses supplier order identity"
         )
 
+    order_number = _normalize_text(allocation.get("supplier_order_number")) or None
+
     token = _optional_int(allocation.get("line_token"), field="allocation.line_token")
     line_hash = _normalize_text(allocation.get("line_hash")) or None
 
@@ -728,7 +781,27 @@ def _parse_allocation_record(
     if seen[rid] - expected_qty > _EPS_ALLOC:
         raise PurchaseControlMaterializationError(f"allocation overflow for reservation_id={rid}")
 
-    return rid, allocated_qty, supplier_order_ref, supplier_order_line_no, token, line_hash
+    return (
+        rid,
+        allocated_qty,
+        supplier_order_ref,
+        supplier_order_line_no,
+        order_number,
+        token,
+        line_hash,
+    )
+
+
+def _parse_iso_date(value: Any) -> date | None:
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
 
 
 def _build_writer_result(
@@ -771,7 +844,9 @@ def _build_writer_result(
 def _build_allocation_records(
     allocations: list[dict[str, Any]],
     expected: dict[int, float],
+    line_by_reservation: dict[int, MaterializeOrderLine],
     batch_id: int,
+    ledger_generation_id: int,
 ) -> tuple[dict[str, Any], dict[str, list[dict[str, Any]]]]:
     seen: dict[int, float] = {}
     by_order_ref: dict[str, list[dict[str, Any]]] = {}
@@ -784,9 +859,16 @@ def _build_allocation_records(
             allocated_qty,
             supplier_order_ref,
             supplier_order_line_no,
+            supplier_order_number,
             line_token,
             line_hash,
         ) = _parse_allocation_record(allocation, expected, seen)
+
+        line = line_by_reservation.get(reservation_id)
+        if line is None:
+            raise PurchaseControlMaterializationError(
+                f"allocation includes unsupported reservation_id={reservation_id}"
+            )
 
         db_records.append(
             models.PurchaseExportObligationAllocation(
@@ -797,6 +879,11 @@ def _build_allocation_records(
                 line_token=line_token,
                 line_hash=line_hash,
                 allocated_qty=Decimal(str(allocated_qty)),
+                ledger_generation_id=int(ledger_generation_id),
+                item_id=int(line.item_id),
+                planning_stock_pool=_normalize_text(line.planning_stock_pool),
+                destination_warehouse_ref1c=clean_ref1c(line.destination_warehouse_ref1c),
+                eta_date=_parse_iso_date(line.need_date),
                 planned_purchase_id=_optional_int(
                     allocation.get("planned_purchase_id"),
                     field="allocation.planned_purchase_id",
@@ -812,6 +899,7 @@ def _build_allocation_records(
                 "allocated_qty": allocated_qty,
                 "line_token": line_token,
                 "line_hash": line_hash,
+                "supplier_order_number": supplier_order_number,
             }
         )
         allocation_lines.append(
@@ -864,12 +952,26 @@ def _materialize_purchase_control_orders_to_1c(
         return 0, [], {"status": "ok", "orders": 0}
 
     _ = db  # reader-only
-    request_hash = _normalize_text(request_payload.get("request_hash"))
-    if not request_hash:
-        request_hash = _payload_hash(request_payload)
-
+    configured_destination = clean_ref1c(
+        _load_odata_config().get("purchase_destination_warehouse_ref1c")
+    )
     for group in groups:
-        _stamp_group_lines(group, request_hash)
+        for line in group.lines:
+            if not clean_ref1c(line.destination_warehouse_ref1c):
+                line.destination_warehouse_ref1c = configured_destination
+    missing_destination = [
+        int(line.reservation_id)
+        for group in groups
+        for line in group.lines
+        if not clean_ref1c(line.destination_warehouse_ref1c)
+    ]
+    if missing_destination:
+        raise PurchaseControlMaterializationError(
+            "purchase_destination_warehouse_ref1c is required for BUY materialization; "
+            f"reservations={sorted(missing_destination)}"
+        )
+    for group in groups:
+        _stamp_group_lines(group)
 
     client = create_odata_client(
         _load_odata_config(), OData1CClient, allow_production=False, require_demo_base=True
@@ -878,9 +980,10 @@ def _materialize_purchase_control_orders_to_1c(
     created = 0
     all_allocations: list[dict[str, Any]] = []
     for group in sorted(groups, key=lambda g: g.supplier_id):
-        order_comment = _supplier_order_comment(request_hash, group)
+        order_comment = _supplier_order_comment(group)
+        group_hash = _one_c_line_payload_token_group_hash(group)
         header_payload = {
-            "Number": f"PC-{group.supplier_id}-{request_hash[:8]}",
+            "Number": f"PC-{group.supplier_id}-{group_hash[:8]}",
             "Date": fmt_1c_datetime(date.today()),
             "Posted": False,
             "Контрагент_Key": clean_ref1c(group.supplier_ref1c),
@@ -889,17 +992,17 @@ def _materialize_purchase_control_orders_to_1c(
             "Запасы": _order_lines_payload("", group),
         }
 
-        token = _group_marker_token(request_hash=request_hash, group=group)
+        token = _group_marker_token(group=group)
         existing = find_document_by_origin(
             client,
             entity=PURCHASE_ORDER_ENTITY,
             token=token,
-            select_fields=["Ref_Key", "Контрагент_Key", "Комментарий", "Запасы"],
+            select_fields=["Ref_Key", "Number", "Контрагент_Key", "Комментарий", "Запасы"],
         )
 
         if existing:
             doc = existing
-            doc_token = _verify_order_lines(doc=doc, group=group, request_hash=request_hash)
+            doc_token = _verify_order_lines(doc=doc, group=group)
             for allocation in doc_token:
                 all_allocations.append(allocation)
             continue
@@ -928,7 +1031,7 @@ def _materialize_purchase_control_orders_to_1c(
         if not isinstance(doc, dict):
             raise RuntimeError("1C purchase materialization returned malformed order document")
 
-        doc_token = _verify_order_lines(doc=doc, group=group, request_hash=request_hash)
+        doc_token = _verify_order_lines(doc=doc, group=group)
         for allocation in doc_token:
             all_allocations.append(allocation)
         created += 1
@@ -941,6 +1044,167 @@ def _resolve_default_materializer() -> MaterializerCallable:
     if not isinstance(config, dict) or not str(config.get("base_url") or "").strip():
         return _materializer_not_configured
     return _materialize_purchase_control_orders_to_1c
+
+
+_BUY_RESERVATION_SOURCE_DOCTYPE = "buy_reservation"
+
+
+def _reservation_claim_hash(
+    group: MaterializeOrderGroup,
+    reservation_id: int,
+    batch_id: int,
+) -> str:
+    return _canonical_hash(
+        {
+            "v": 1,
+            "kind": "buy_reservation_claim",
+            "reservation_id": int(reservation_id),
+            "batch_id": int(batch_id),
+            "lines": sorted(
+                _canonical_hash(
+                    _stable_line_identity(line, group.supplier_ref1c)
+                )
+                for line in group.lines
+                if int(line.reservation_id) == int(reservation_id)
+            ),
+        }
+    )
+
+
+def _group_reservation_ids(group: MaterializeOrderGroup) -> set[int]:
+    return {int(line.reservation_id) for line in group.lines}
+
+
+def _preflight_existing_claims(
+    db: Session,
+    groups: Sequence[MaterializeOrderGroup],
+    *,
+    allowed_success_ids: set[int] | None = None,
+) -> None:
+    """Reject a stale/overlapping selection before any new external write."""
+    reservation_ids = sorted(
+        {
+            int(line.reservation_id)
+            for group in groups
+            for line in group.lines
+        }
+    )
+    if not reservation_ids:
+        return
+    links = (
+        db.query(models.SyncLink)
+        .filter(
+            models.SyncLink.source_system == "PRODPLAN",
+            models.SyncLink.source_doctype == _BUY_RESERVATION_SOURCE_DOCTYPE,
+            models.SyncLink.source_id.in_(reservation_ids),
+            models.SyncLink.target_entity == PURCHASE_ORDER_ENTITY,
+            models.SyncLink.status == "success",
+        )
+        .all()
+    )
+    allowed = allowed_success_ids or set()
+    conflicts = [link for link in links if int(link.source_id) not in allowed]
+    if conflicts:
+        raise PurchaseControlMaterializationError(
+            "selection contains already materialized BUY reservations: "
+            f"{sorted(int(link.source_id) for link in conflicts)}"
+        )
+
+
+def _claim_group(
+    db: Session,
+    group: MaterializeOrderGroup,
+    ledger_generation_id: int,
+    batch_id: int,
+) -> list[models.SyncLink]:
+    """Create durable reservation-level claims before recover/POST."""
+    claimed: list[models.SyncLink] = []
+    _acquire_reservation_claim_locks(db, sorted(_group_reservation_ids(group)))
+    for reservation_id in sorted(_group_reservation_ids(group)):
+        claim_hash = _reservation_claim_hash(group, reservation_id, batch_id)
+        link = (
+            db.query(models.SyncLink)
+            .filter_by(
+                source_system="PRODPLAN",
+                source_doctype=_BUY_RESERVATION_SOURCE_DOCTYPE,
+                source_id=int(reservation_id),
+                target_entity=PURCHASE_ORDER_ENTITY,
+            )
+            .one_or_none()
+        )
+        if link is None:
+            link = models.SyncLink(
+                source_system="PRODPLAN",
+                source_doctype=_BUY_RESERVATION_SOURCE_DOCTYPE,
+                source_id=int(reservation_id),
+                target_system="1C",
+                target_entity=PURCHASE_ORDER_ENTITY,
+                payload_hash=claim_hash,
+                target_ref_key=None,
+                target_number="",
+                ledger_generation_id=int(ledger_generation_id),
+                status="planned",
+            )
+            db.add(link)
+        else:
+            if str(link.payload_hash or "") != claim_hash:
+                raise PurchaseControlMaterializationError(
+                    f"BUY reservation {reservation_id} claim payload changed"
+                )
+            if str(link.status) == "success":
+                raise PurchaseControlMaterializationError(
+                    f"BUY reservation {reservation_id} is already materialized"
+                )
+            link.status = "planned"
+            link.last_error = None
+            link.ledger_generation_id = int(ledger_generation_id)
+            link.payload_hash = claim_hash
+        claimed.append(link)
+    db.flush()
+    return claimed
+
+
+def _complete_group_claims(
+    claims: Sequence[models.SyncLink],
+    allocations: Sequence[dict[str, Any]],
+) -> None:
+    refs_by_reservation: dict[int, set[str]] = {}
+    numbers_by_reservation: dict[int, set[str]] = {}
+    for allocation in allocations:
+        reservation_id = _to_int(
+            allocation.get("reservation_id"),
+            field="allocation.reservation_id",
+        )
+        order_ref = clean_ref1c(allocation.get("supplier_order_ref"))
+        if order_ref:
+            refs_by_reservation.setdefault(reservation_id, set()).add(order_ref)
+        order_number = _normalize_text(allocation.get("supplier_order_number"))
+        if order_number:
+            numbers_by_reservation.setdefault(reservation_id, set()).add(order_number)
+    now = datetime.now(timezone.utc)
+    for link in claims:
+        refs = refs_by_reservation.get(int(link.source_id), set())
+        if len(refs) != 1:
+            raise PurchaseControlMaterializationError(
+                f"BUY reservation {link.source_id} does not map to one supplier order"
+            )
+        link.target_ref_key = next(iter(refs))
+        numbers = numbers_by_reservation.get(int(link.source_id), set())
+        if numbers:
+            link.target_number = next(iter(numbers))
+        link.status = "success"
+        link.last_error = None
+        link.last_synced_at = now
+
+
+def _fail_group_claims(
+    claims: Sequence[models.SyncLink],
+    reason: str,
+) -> None:
+    for link in claims:
+        if str(link.status) != "success":
+            link.status = "error"
+            link.last_error = reason
 
 
 def materialize_rows(
@@ -968,7 +1232,7 @@ def materialize_rows(
     groups, selected_rows, ledger_generation_id = _load_groups_and_lineages(
         db, snapshot, row_keys
     )
-    key = _make_idempotency_key(snapshot, row_keys, selected_rows)
+    key = _make_idempotency_key(groups)
     request_payload = _build_request_payload(
         snapshot=snapshot,
         requested_keys=row_keys,
@@ -1008,100 +1272,202 @@ def materialize_rows(
     if dry_run:
         return preview
 
-    _acquire_materialization_lock(db, key)
-    existing = db.query(models.PurchaseExportBatch).filter_by(idempotency_key=key).one_or_none()
-    if existing is not None:
-        if existing.status == "completed":
+    writer = materializer if materializer is not None else _resolve_default_materializer()
+    if writer is _materializer_not_configured:
+        writer(db, groups, request_payload, 0, dry_run)
+
+    batch_id: int | None = None
+    active_claims: list[models.SyncLink] = []
+    try:
+        batch = (
+            db.query(models.PurchaseExportBatch)
+            .filter_by(idempotency_key=key)
+            .one_or_none()
+        )
+        if batch is not None and batch.status == "completed":
             return {
                 **preview,
-                "batch_id": int(existing.id),
-                "status": existing.status,
-                "result": existing.result_payload,
-                "created_at": existing.created_at.isoformat() if existing.created_at else None,
-                "completed_at": existing.completed_at.isoformat()
-                if existing.completed_at
+                "batch_id": int(batch.id),
+                "status": batch.status,
+                "result": batch.result_payload,
+                "created_at": batch.created_at.isoformat() if batch.created_at else None,
+                "completed_at": batch.completed_at.isoformat()
+                if batch.completed_at
                 else None,
             }
-        if existing.status in {"building", "failed", "aborted"}:
+        if batch is not None and batch.status == "aborted":
             raise PurchaseControlMaterializationError(
-                "another materialization batch with same lineage is not in terminal state"
+                "aborted materialization batch requires manual resolution"
             )
+        if batch is None:
+            batch = models.PurchaseExportBatch(
+                ledger_generation_id=int(ledger_generation_id),
+                planning_read_snapshot_id=int(meta.get("snapshot_id") or current_snapshot_id),
+                idempotency_key=key,
+                status="building",
+                payload_hash=request_hash,
+                request_payload=request_payload,
+                result_payload=None,
+            )
+            db.add(batch)
+            db.flush()
+        else:
+            batch.status = "building"
+            batch.reason = None
+            batch.completed_at = None
+            batch.result_payload = None
+        batch_id = int(batch.id)
 
-    batch = models.PurchaseExportBatch(
-        ledger_generation_id=int(ledger_generation_id),
-        planning_read_snapshot_id=int(meta.get("snapshot_id") or current_snapshot_id),
-        idempotency_key=key,
-        status="building",
-        payload_hash=request_hash,
-        request_payload=request_payload,
-        result_payload=None,
-    )
-    db.add(batch)
-    db.flush()
-
-    writer = materializer if materializer is not None else _resolve_default_materializer()
-
-    try:
-        created_qty, allocations_raw, writer_result = writer(
+        completed_ids = {
+            int(value)
+            for (value,) in (
+                db.query(models.PurchaseExportObligationAllocation.reservation_id)
+                .filter_by(batch_id=batch_id)
+                .distinct()
+                .all()
+            )
+        }
+        _preflight_existing_claims(
             db,
             groups,
-            request_payload,
-            int(batch.id),
-            dry_run,
+            allowed_success_ids=completed_ids,
         )
-        if not isinstance(created_qty, int) or created_qty < 0:
-            raise PurchaseControlMaterializationError("materializer returned malformed created_qty")
+        pending_groups = [
+            group
+            for group in sorted(groups, key=lambda value: value.supplier_id)
+            if not _group_reservation_ids(group).issubset(completed_ids)
+        ]
+        db.commit()
 
-        if not isinstance(allocations_raw, list):
-            raise PurchaseControlMaterializationError("materializer returned malformed allocations")
+        total_created = 0
+        writer_results: list[dict[str, Any]] = []
 
-        expected: dict[int, float] = {}
-        for group in groups:
+        for group in pending_groups:
+            active_claims = _claim_group(
+                db,
+                group,
+                ledger_generation_id,
+                batch_id,
+            )
+            db.commit()
+
+            created_qty, allocations_raw, writer_result = writer(
+                db,
+                [group],
+                request_payload,
+                batch_id,
+                dry_run,
+            )
+            if not isinstance(created_qty, int) or created_qty < 0:
+                raise PurchaseControlMaterializationError(
+                    "materializer returned malformed created_qty"
+                )
+            if not isinstance(allocations_raw, list):
+                raise PurchaseControlMaterializationError(
+                    "materializer returned malformed allocations"
+                )
+
+            expected: dict[int, float] = {}
             for line in group.lines:
                 reservation_id = int(line.reservation_id)
                 expected[reservation_id] = round(
-                    float(expected.get(reservation_id, 0.0)) + float(round(line.qty, 6)),
+                    float(expected.get(reservation_id, 0.0))
+                    + float(round(line.qty, 6)),
                     6,
                 )
+            allocation_payload = _build_allocation_records(
+                [dict(value) for value in allocations_raw],
+                expected,
+                {int(line.reservation_id): line for line in group.lines},
+                batch_id,
+                ledger_generation_id,
+            )
+            for record in allocation_payload["records"]:
+                db.add(record)
+            _complete_group_claims(
+                active_claims,
+                allocations_raw,
+            )
+            db.commit()
+            active_claims = []
 
-        allocation_payload = _build_allocation_records(
-            [dict(a) for a in allocations_raw],
-            expected,
-            int(batch.id),
+            total_created += created_qty
+            writer_results.append(dict(writer_result or {}))
+
+        all_allocations = (
+            db.query(models.PurchaseExportObligationAllocation)
+            .filter_by(batch_id=batch_id)
+            .all()
         )
-        for record in allocation_payload["records"]:
-            db.add(record)
+        expected_all: dict[int, float] = {}
+        seen_all: dict[int, float] = {}
+        by_order_all: dict[str, list[dict[str, Any]]] = {}
+        for group in groups:
+            for line in group.lines:
+                reservation_id = int(line.reservation_id)
+                expected_all[reservation_id] = round(
+                    expected_all.get(reservation_id, 0.0) + float(line.qty),
+                    6,
+                )
+        for allocation in all_allocations:
+            reservation_id = int(allocation.reservation_id)
+            seen_all[reservation_id] = round(
+                seen_all.get(reservation_id, 0.0) + float(allocation.allocated_qty),
+                6,
+            )
+            by_order_all.setdefault(str(allocation.supplier_order_ref), []).append(
+                {
+                    "supplier_order_line_no": str(allocation.supplier_order_line_no),
+                    "reservation_id": reservation_id,
+                    "allocated_qty": float(allocation.allocated_qty),
+                    "line_token": allocation.line_token,
+                    "line_hash": allocation.line_hash,
+                }
+            )
+        if expected_all != seen_all:
+            raise PurchaseControlMaterializationError(
+                "durable materialization allocations mismatch"
+            )
 
-        allocation_result = _build_writer_result(
-            expected=expected,
-            seen=allocation_payload["seen"],
-            allocations_by_order=allocation_payload["by_order_ref"],
-            result_payload=writer_result,
-            created_qty=created_qty,
+        batch = db.get(models.PurchaseExportBatch, batch_id)
+        if batch is None:
+            raise PurchaseControlMaterializationError("materialization batch disappeared")
+        result = _build_writer_result(
+            expected=expected_all,
+            seen=seen_all,
+            allocations_by_order=by_order_all,
+            result_payload={"groups": writer_results},
+            created_qty=total_created,
         )
-
         batch.status = "completed"
         batch.completed_at = datetime.now(timezone.utc)
-        batch.result_payload = allocation_result
+        batch.result_payload = result
         db.commit()
-
         return {
             **preview,
-            "batch_id": int(batch.id),
+            "batch_id": batch_id,
             "status": batch.status,
             "result": batch.result_payload,
         }
-
     except Exception as exc:  # noqa: BLE001
-        batch.status = "failed"
-        batch.reason = str(exc)
-        batch.completed_at = datetime.now(timezone.utc)
-        batch.result_payload = {
-            "status": "failed",
-            "reason": str(exc),
-        }
-        db.add(batch)
-        db.commit()
+        if not db.is_active:
+            db.rollback()
+        if batch_id is not None:
+            batch = db.get(models.PurchaseExportBatch, batch_id)
+            if batch is not None:
+                batch.status = "failed"
+                batch.reason = str(exc)
+                batch.completed_at = datetime.now(timezone.utc)
+                batch.result_payload = {"status": "failed", "reason": str(exc)}
+            if active_claims:
+                claim_ids = [int(link.link_id) for link in active_claims if link.link_id]
+                durable_claims = (
+                    db.query(models.SyncLink)
+                    .filter(models.SyncLink.link_id.in_(claim_ids))
+                    .all()
+                )
+                _fail_group_claims(durable_claims, str(exc))
+            db.commit()
         raise
 
 

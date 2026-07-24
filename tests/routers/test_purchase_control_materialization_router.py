@@ -248,7 +248,7 @@ def test_materialize_endpoint_returns_not_configured_when_materializer_missing(c
         },
     )
 
-    assert response.status_code == 503
+    assert response.status_code == 503, response.json()
     detail = response.json()["detail"]
     assert detail["code"] == "purchase_control_materializer_not_configured"
 

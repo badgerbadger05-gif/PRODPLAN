@@ -1576,6 +1576,22 @@ class PurchaseExportObligationAllocation(Base):
             "planned_purchase_id",
             "batch_id",
         ),
+        Index(
+            "ix_purchase_export_obligation_allocation_ledger_generation_id",
+            "ledger_generation_id",
+        ),
+        Index(
+            "ix_purchase_export_obligation_allocation_item_id",
+            "item_id",
+        ),
+        Index(
+            "ix_purchase_export_obligation_allocation_planning_stock_pool",
+            "planning_stock_pool",
+        ),
+        Index(
+            "ix_purchase_export_obligation_alloc_destination_wh",
+            "destination_warehouse_ref1c",
+        ),
     )
 
     id = Column(BigIntPK, primary_key=True, autoincrement=True)
@@ -1599,10 +1615,25 @@ class PurchaseExportObligationAllocation(Base):
         ForeignKey("planned_purchase.purchase_id", ondelete="SET NULL"),
         nullable=True,
     )
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    item_id = Column(
+        Integer,
+        ForeignKey("items.item_id", ondelete="RESTRICT"),
+        nullable=True,
+    )
+    planning_stock_pool = Column(String(64), nullable=True)
+    destination_warehouse_ref1c = Column(String(36), nullable=True)
+    eta_date = Column(Date, nullable=True)
 
     batch = relationship("PurchaseExportBatch")
     reservation = relationship("ReservationEntry")
     planned_purchase = relationship("PlannedPurchase")
+    ledger_generation = relationship("LedgerGeneration")
+    item = relationship("Item")
 
 
 class PlannedRework(Base):

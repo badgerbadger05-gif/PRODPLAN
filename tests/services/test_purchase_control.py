@@ -397,14 +397,26 @@ def test_list_journal_include_to_order_toggle_for_snapshot_layer(db_session):
     )
     db_session.commit()
 
-    full = get_orders(db=db_session, limit=100, offset=0, include_to_order=True)
+    full = get_orders(
+        db=db_session,
+        limit=100,
+        offset=0,
+        include_to_order=True,
+        horizon_period_to=None,
+    )
     assert full["summary"]["to_order"] == 1
     assert any(
         row.get("row_generator") == "mrp_reservation" and row.get("line_status") == "to_order"
         for row in full["rows"]
     )
 
-    limited = get_orders(db=db_session, limit=100, offset=0, include_to_order=False)
+    limited = get_orders(
+        db=db_session,
+        limit=100,
+        offset=0,
+        include_to_order=False,
+        horizon_period_to=None,
+    )
     assert limited["summary"]["to_order"] == 0
     assert not any(
         row.get("row_generator") == "mrp_reservation" and row.get("line_status") == "to_order"

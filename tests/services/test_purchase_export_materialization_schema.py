@@ -120,6 +120,10 @@ def test_purchase_export_obligation_allocation_metadata_contract():
     assert set(("batch_id", "reservation_id", "supplier_order_ref", "supplier_order_line_no", "allocated_qty")) <= set(
         col.name for col in table.columns if not col.nullable
     )
+    assert {
+        "planning_stock_pool",
+        "destination_warehouse_ref1c",
+    } <= {col.name for col in table.columns}
 
     foreign_keys = {
         (fk.parent.name, fk.target_fullname, fk.ondelete)
@@ -128,6 +132,8 @@ def test_purchase_export_obligation_allocation_metadata_contract():
     assert ("batch_id", "purchase_export_batch.id", "RESTRICT") in foreign_keys
     assert ("reservation_id", "reservation_entry.id", "RESTRICT") in foreign_keys
     assert ("planned_purchase_id", "planned_purchase.purchase_id", "SET NULL") in foreign_keys
+    assert ("ledger_generation_id", "ledger_generation.id", "RESTRICT") in foreign_keys
+    assert ("item_id", "items.item_id", "RESTRICT") in foreign_keys
 
     unique = {
         tuple(constraint.columns.keys())
@@ -153,6 +159,10 @@ def test_purchase_export_obligation_allocation_metadata_contract():
         "ix_purchase_export_obligation_allocation_batch_reservation",
         "ix_purchase_export_obligation_allocation_batch_supplier_line",
         "ix_purchase_export_obligation_allocation_planned_purchase",
+        "ix_purchase_export_obligation_allocation_ledger_generation_id",
+        "ix_purchase_export_obligation_allocation_item_id",
+        "ix_purchase_export_obligation_allocation_planning_stock_pool",
+        "ix_purchase_export_obligation_alloc_destination_wh",
     } <= indexes
 
 
@@ -209,11 +219,11 @@ def test_purchase_export_obligation_allocation_can_insert(db_session):
 def test_purchase_export_batch_migration_follows_current_head():
     path = (
         Path(__file__).resolve().parents[2]
-        / "backend/alembic/versions/20260723_19_add_purchase_export_materialization.py"
+        / "backend/alembic/versions/20260724_01_add_obligation_allocation_buy_projection.py"
     )
     spec = spec_from_file_location("purchase_export_batch_migration", path)
     module = module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
-    assert module.revision == "20260723_19"
-    assert module.down_revision == "20260723_18"
+    assert module.revision == "20260724_01"
+    assert module.down_revision == "20260723_19"
