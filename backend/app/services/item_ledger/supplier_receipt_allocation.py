@@ -634,15 +634,14 @@ def _rebuild_supplier_receipt_coverage_unsafe(
     }
     allocations, unplanned = allocate_supplier_receipts(facts, pins_by_order)
     aggregated: dict[
-        tuple[int, int, int | None, int], CoverageAllocation
+        tuple[int, int, int | None], CoverageAllocation
     ] = {}
-    aggregate_qty: dict[tuple[int, int, int | None, int], Decimal] = {}
+    aggregate_qty: dict[tuple[int, int, int | None], Decimal] = {}
     for allocation in allocations:
         key = (
             allocation.fact.sle_id,
             allocation.pin.requirement_id,
             allocation.pin.bucket_id,
-            allocation.pin.freeze_allocation_id,
         )
         aggregated[key] = allocation
         aggregate_qty[key] = aggregate_qty.get(key, Decimal("0")) + allocation.qty

@@ -381,9 +381,9 @@ def test_historical_receipt_falls_back_through_synced_purchase_requirement(
     purchase = models.PlannedPurchase(
         run_id=req.run_id,
         item_id=req.item_id,
-        requested_qty=5,
-        planned_qty=5,
-        qty=5,
+        requested_qty=1,
+        planned_qty=1,
+        qty=1,
         need_date=req.period_to,
         order_date=req.period_from,
         lead_time_days=0,
@@ -393,11 +393,34 @@ def test_historical_receipt_falls_back_through_synced_purchase_requirement(
     )
     db_session.add(purchase)
     db_session.flush()
+    second_purchase = models.PlannedPurchase(
+        run_id=req.run_id,
+        item_id=req.item_id,
+        requested_qty=4,
+        planned_qty=4,
+        qty=4,
+        need_date=req.period_to,
+        order_date=req.period_from,
+        lead_time_days=0,
+        priority_index=1,
+        bucket_date=req.period_to,
+        source_mrp_requirement_id=req.id,
+    )
+    db_session.add(second_purchase)
+    db_session.flush()
     db_session.add_all([
         models.SyncLink(
             source_system="PRODPLAN",
             source_doctype="planned_purchase",
             source_id=purchase.purchase_id,
+            target_entity="Document_ЗаказПоставщику",
+            target_ref_key="order-1",
+            status="success",
+        ),
+        models.SyncLink(
+            source_system="PRODPLAN",
+            source_doctype="planned_purchase",
+            source_id=second_purchase.purchase_id,
             target_entity="Document_ЗаказПоставщику",
             target_ref_key="order-1",
             status="success",
