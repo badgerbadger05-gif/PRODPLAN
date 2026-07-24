@@ -611,7 +611,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   }, [journal])
 
   const journalExecutionByFlow = useMemo(() => {
-    if (!journal || !isPlanningTruthAccepted(journal)) return [] as Array<{ flow: string; label: string; pct: number | null; base: number; available: boolean }>
+    if (!journal || !isPlanningTruthAccepted(journal)) return [] as Array<{ flow: string; label: string; pct: number | null; confirmedPct: number | null; base: number; available: boolean }>
     const source = journal.summary.execution_by_flow
     if (source) {
       return ['purchase', 'production', 'rework']
@@ -619,6 +619,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
           flow,
           label: flowLabel(flow),
           pct: source[flow]?.execution_pct ?? null,
+          confirmedPct: source[flow]?.confirmed_pct ?? null,
           base: source[flow]?.base_qty ?? 0,
           available: source[flow]?.available !== false,
         }))
@@ -637,7 +638,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
         const entry = grouped.get(flow)
         const base = entry?.base ?? 0
         const pct = base > 1e-9 ? Math.round(((entry?.completed ?? 0) / base) * 1000) / 10 : 100
-        return { flow, label: flowLabel(flow), pct, base, available: true }
+        return { flow, label: flowLabel(flow), pct, confirmedPct: pct, base, available: true }
       })
       .filter((row) => row.base > 1e-9)
   }, [journal])
@@ -1155,7 +1156,11 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                   )}
                   {journalExecutionByFlow.map((row) => (
                     <span key={row.flow} className="toolbarText">
-                      {row.label}: {row.available && row.pct !== null ? `${row.pct}%` : 'недоступно'}
+                      {row.label}: {row.available && row.pct !== null
+                        ? `${row.pct}%`
+                        : row.confirmedPct !== null
+                          ? `≥${row.confirmedPct}% · часть н/д`
+                          : 'недоступно'}
                     </span>
                   ))}
                   <button

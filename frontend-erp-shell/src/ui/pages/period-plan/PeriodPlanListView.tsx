@@ -69,7 +69,14 @@ export function PeriodPlanListView({ onOpenPlan }: ListViewProps) {
     }
     const value = Math.max(0, plan.execution_pct)
     const pct = Math.min(100, value).toLocaleString('ru-RU', { maximumFractionDigits: 1 })
-    return <span className={`miniPill ${executionPillClass(value)}`}>{pct}%</span>
+    return (
+      <span
+        className={`miniPill ${executionPillClass(value)}`}
+        title={plan.execution_partial ? 'Подтверждённый минимум; часть фактов недоступна' : undefined}
+      >
+        {plan.execution_partial ? '≥' : ''}{pct}%
+      </span>
+    )
   }
 
   const loadList = useCallback(async (nextOffset: number) => {

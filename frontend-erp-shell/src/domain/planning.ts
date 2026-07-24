@@ -171,6 +171,7 @@ export type PeriodPlan = {
   execution_completed_qty?: number | null
   execution_base_qty?: number | null
   execution_pct?: number | null
+  execution_partial?: boolean
   execution_status?: string | null
   execution_reason?: string | null
 }
@@ -323,10 +324,14 @@ export type ExecutionJournalSummary = {
   execution_completed_qty?: number | null
   execution_base_qty?: number | null
   execution_pct?: number | null
+  execution_confirmed_pct?: number | null
+  execution_partial?: boolean
   execution_by_flow?: Record<string, {
     completed_qty: number
     base_qty: number
     execution_pct: number | null
+    confirmed_pct?: number | null
+    total_base_qty?: number
     available?: boolean
   }> | null
 }
