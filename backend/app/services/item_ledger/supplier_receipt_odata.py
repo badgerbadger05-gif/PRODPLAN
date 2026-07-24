@@ -38,7 +38,10 @@ _SUPPORTED_DOCUMENTS = {
 _TABLE_PART = "Запасы"
 _ZERO_GUID = "00000000-0000-0000-0000-000000000000"
 _KNOWN_CUSTOMER_SALE_OPERATION = "8d970836"
-_KNOWN_CUSTOMER_SALE_OPERATION_NAME = "продажа покупателю"
+_KNOWN_CUSTOMER_SALE_OPERATION_NAMES = frozenset({
+    "продажапокупателю",
+    "продажа покупателю",
+})
 
 
 @dataclass(frozen=True)
@@ -81,7 +84,8 @@ def _is_ignored_customer_sale(
     return (
         recorder_type == "Document_РасходнаяНакладная"
         and _guid(operation_key).startswith(_KNOWN_CUSTOMER_SALE_OPERATION)
-        and _normalized_operation_name(operation_name) == _KNOWN_CUSTOMER_SALE_OPERATION_NAME
+        and _normalized_operation_name(operation_name)
+        in _KNOWN_CUSTOMER_SALE_OPERATION_NAMES
     )
 
 

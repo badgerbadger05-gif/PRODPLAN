@@ -414,6 +414,32 @@ def test_customer_sale_expense_is_ignored_without_evidence_or_diagnostics(db_ses
     assert result.diagnostics == ()
 
 
+def test_live_compact_customer_sale_name_is_ignored(db_session):
+    item = _item(db_session)
+    entry = _sle(
+        item,
+        doc_type="Document_РасходнаяНакладная",
+        ref="live-customer-sale-ref",
+        qty="-1",
+    )
+    doc = _doc(
+        "live-customer-sale-ref",
+        "8d970836",
+        "ПродажаПокупателю",
+    )
+
+    result = extract_supplier_document_evidence(
+        db_session,
+        _Client({
+            "Document_РасходнаяНакладная(guid'live-customer-sale-ref')": doc
+        }),
+        [entry],
+    )
+
+    assert result.evidence == ()
+    assert result.diagnostics == ()
+
+
 def test_supplier_return_operation_still_honors_receipt_matching(db_session):
     item = _item(db_session)
     entry = _sle(
