@@ -37,11 +37,41 @@ _SUPPORTED_DOCUMENTS = {
 }
 _TABLE_PART = "Запасы"
 _ZERO_GUID = "00000000-0000-0000-0000-000000000000"
-_KNOWN_CUSTOMER_SALE_OPERATION = "8d970836"
-_KNOWN_CUSTOMER_SALE_OPERATION_NAMES = frozenset({
-    "продажапокупателю",
-    "продажа покупателю",
-})
+_NON_SUPPLIER_EXPENSE_OPERATION_PREFIXES: dict[str, frozenset[str]] = {
+    "8d970836": frozenset({"продажа покупателю", "продажапокупателю"}),
+    "8d9701b0": frozenset({"передача на комиссию", "передачанакомиссию"}),
+    "8d970138": frozenset({"передача в переработку", "передачавпереработку"}),
+}
+
+
+def _operation_name_normalized(value: object) -> str:
+    return " ".join(_text(value).lower().split())
+
+
+def _operation_name_compact(value: object) -> str:
+    return _operation_name_normalized(value).replace(" ", "")
+
+
+def _is_non_supplier_expense_operation(
+    recorder_type: str,
+    operation_key: str,
+    operation_name: str,
+) -> bool:
+    if recorder_type != "Document_РасходнаяНакладная":
+        return False
+
+    operation_key = _guid(operation_key)
+    normalized = _operation_name_normalized(operation_name)
+    compact = _operation_name_compact(operation_name)
+
+    for (
+        allowed_prefix,
+        allowed_names,
+    ) in _NON_SUPPLIER_EXPENSE_OPERATION_PREFIXES.items():
+        if not operation_key.startswith(allowed_prefix):
+            continue
+        return normalized in allowed_names or compact in allowed_names
+    return False
 
 
 @dataclass(frozen=True)
@@ -70,23 +100,6 @@ def _normalized_type(value: object) -> str:
         if result.startswith(prefix):
             return result[len(prefix):]
     return result
-
-
-def _normalized_operation_name(value: object) -> str:
-    return " ".join(_text(value).lower().split())
-
-
-def _is_ignored_customer_sale(
-    recorder_type: str,
-    operation_key: str,
-    operation_name: str,
-) -> bool:
-    return (
-        recorder_type == "Document_РасходнаяНакладная"
-        and _guid(operation_key).startswith(_KNOWN_CUSTOMER_SALE_OPERATION)
-        and _normalized_operation_name(operation_name)
-        in _KNOWN_CUSTOMER_SALE_OPERATION_NAMES
-    )
 
 
 def _guid(value: object) -> str:
@@ -369,7 +382,7 @@ def extract_supplier_document_evidence(
             continue
 
         operation_key, operation_name = _operation(doc)
-        if _is_ignored_customer_sale(
+        if _is_non_supplier_expense_operation(
             recorder_type,
             operation_key,
             operation_name,

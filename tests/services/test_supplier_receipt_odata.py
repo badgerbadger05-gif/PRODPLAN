@@ -1,4 +1,5 @@
 from decimal import Decimal
+import pytest
 
 from app import models
 from app.services.item_ledger.supplier_receipt_allocation import (
@@ -390,48 +391,39 @@ def test_supplier_return_expense_normalizes_positive_document_qty_negative(db_se
     assert result.evidence[0].signed_qty == Decimal("-2")
 
 
-def test_customer_sale_expense_is_ignored_without_evidence_or_diagnostics(db_session):
+@pytest.mark.parametrize(
+    ("operation_key", "operation_name"),
+    (
+        ("8d970836", "  Продажа   Покупателю  "),
+        ("8d970836", "ПродажаПокупателю"),
+        ("8d9701b0", "  Передача   на  комиссию  "),
+        ("8d9701b0", "ПередачаНаКомиссию"),
+        ("8d970138", "  Передача  в  переработку "),
+        ("8d970138", "ПередачаВПереработку"),
+    ),
+)
+def test_known_non_supplier_expense_operations_are_ignored_without_evidence_or_diagnostics(
+    db_session,
+    operation_key,
+    operation_name,
+):
     item = _item(db_session)
     entry = _sle(
         item,
         doc_type="Document_РасходнаяНакладная",
-        ref="customer-sale-ref",
+        ref=f"ignored-expense-ref-{operation_key}",
         qty="-2",
     )
     doc = _doc(
-        "customer-sale-ref",
-        "8d970836",
-        "  Продажа   Покупателю  ",
-    )
-
-    result = extract_supplier_document_evidence(
-        db_session,
-        _Client({"Document_РасходнаяНакладная(guid'customer-sale-ref')": doc}),
-        [entry],
-    )
-
-    assert result.evidence == ()
-    assert result.diagnostics == ()
-
-
-def test_live_compact_customer_sale_name_is_ignored(db_session):
-    item = _item(db_session)
-    entry = _sle(
-        item,
-        doc_type="Document_РасходнаяНакладная",
-        ref="live-customer-sale-ref",
-        qty="-1",
-    )
-    doc = _doc(
-        "live-customer-sale-ref",
-        "8d970836",
-        "ПродажаПокупателю",
+        f"ignored-expense-ref-{operation_key}",
+        operation_key,
+        operation_name,
     )
 
     result = extract_supplier_document_evidence(
         db_session,
         _Client({
-            "Document_РасходнаяНакладная(guid'live-customer-sale-ref')": doc
+            f"Document_РасходнаяНакладная(guid'ignored-expense-ref-{operation_key}')": doc
         }),
         [entry],
     )
@@ -482,6 +474,32 @@ def test_wrong_customer_sale_expense_name_stays_wrong_operation(db_session):
     result = extract_supplier_document_evidence(
         db_session,
         _Client({"Document_РасходнаяНакладная(guid'wrong-customer-sale-ref')": doc}),
+        [entry],
+    )
+
+    assert result.evidence == ()
+    assert result.diagnostics[0].code == "wrong_operation"
+
+
+def test_unknown_expense_operation_stays_wrong_operation(db_session):
+    item = _item(db_session)
+    entry = _sle(
+        item,
+        doc_type="Document_РасходнаяНакладная",
+        ref="unknown-expense-ref",
+        qty="-2",
+    )
+    doc = _doc(
+        "unknown-expense-ref",
+        "8d970900",
+        "Передача на комиссию",
+    )
+
+    result = extract_supplier_document_evidence(
+        db_session,
+        _Client({
+            "Document_РасходнаяНакладная(guid'unknown-expense-ref')": doc
+        }),
         [entry],
     )
 
