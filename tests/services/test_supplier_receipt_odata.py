@@ -390,6 +390,79 @@ def test_supplier_return_expense_normalizes_positive_document_qty_negative(db_se
     assert result.evidence[0].signed_qty == Decimal("-2")
 
 
+def test_customer_sale_expense_is_ignored_without_evidence_or_diagnostics(db_session):
+    item = _item(db_session)
+    entry = _sle(
+        item,
+        doc_type="Document_РасходнаяНакладная",
+        ref="customer-sale-ref",
+        qty="-2",
+    )
+    doc = _doc(
+        "customer-sale-ref",
+        "8d970836",
+        "  Продажа   Покупателю  ",
+    )
+
+    result = extract_supplier_document_evidence(
+        db_session,
+        _Client({"Document_РасходнаяНакладная(guid'customer-sale-ref')": doc}),
+        [entry],
+    )
+
+    assert result.evidence == ()
+    assert result.diagnostics == ()
+
+
+def test_supplier_return_operation_still_honors_receipt_matching(db_session):
+    item = _item(db_session)
+    entry = _sle(
+        item,
+        doc_type="Document_РасходнаяНакладная",
+        ref="return-ref-2",
+        qty="-2",
+    )
+    doc = _doc(
+        "return-ref-2",
+        SUPPLIER_RETURN_OPERATION,
+        " Возврат  поставщику ",
+    )
+
+    result = extract_supplier_document_evidence(
+        db_session,
+        _Client({"Document_РасходнаяНакладная(guid'return-ref-2')": doc}),
+        [entry],
+    )
+
+    assert len(result.evidence) == 1
+    assert result.evidence[0].operation_key.startswith(SUPPLIER_RETURN_OPERATION)
+    assert result.evidence[0].operation_name == "Возврат  поставщику"
+
+
+def test_wrong_customer_sale_expense_name_stays_wrong_operation(db_session):
+    item = _item(db_session)
+    entry = _sle(
+        item,
+        doc_type="Document_РасходнаяНакладная",
+        ref="wrong-customer-sale-ref",
+        qty="-2",
+    )
+    doc = _doc(
+        "wrong-customer-sale-ref",
+        "8d970836",
+        "Возврат покупателю",
+    )
+
+    result = extract_supplier_document_evidence(
+        db_session,
+        _Client({"Document_РасходнаяНакладная(guid'wrong-customer-sale-ref')": doc}),
+        [entry],
+    )
+
+    assert result.evidence == ()
+    assert result.diagnostics[0].code == "wrong_operation"
+
+
 def test_transfer_builds_balanced_pair_from_one_document_line(db_session):
     item = _item(db_session)
     entries = [

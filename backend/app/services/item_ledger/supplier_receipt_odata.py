@@ -37,6 +37,8 @@ _SUPPORTED_DOCUMENTS = {
 }
 _TABLE_PART = "Запасы"
 _ZERO_GUID = "00000000-0000-0000-0000-000000000000"
+_KNOWN_CUSTOMER_SALE_OPERATION = "8d970836"
+_KNOWN_CUSTOMER_SALE_OPERATION_NAME = "продажа покупателю"
 
 
 @dataclass(frozen=True)
@@ -65,6 +67,22 @@ def _normalized_type(value: object) -> str:
         if result.startswith(prefix):
             return result[len(prefix):]
     return result
+
+
+def _normalized_operation_name(value: object) -> str:
+    return " ".join(_text(value).lower().split())
+
+
+def _is_ignored_customer_sale(
+    recorder_type: str,
+    operation_key: str,
+    operation_name: str,
+) -> bool:
+    return (
+        recorder_type == "Document_РасходнаяНакладная"
+        and _guid(operation_key).startswith(_KNOWN_CUSTOMER_SALE_OPERATION)
+        and _normalized_operation_name(operation_name) == _KNOWN_CUSTOMER_SALE_OPERATION_NAME
+    )
 
 
 def _guid(value: object) -> str:
@@ -347,6 +365,12 @@ def extract_supplier_document_evidence(
             continue
 
         operation_key, operation_name = _operation(doc)
+        if _is_ignored_customer_sale(
+            recorder_type,
+            operation_key,
+            operation_name,
+        ):
+            continue
         if not _strict_operation_matches(
             expected_operation, operation_key, operation_name
         ):
