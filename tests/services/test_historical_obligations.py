@@ -1,4 +1,4 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -100,6 +100,12 @@ def _requirement(db, run, *, status="open", gross=10, net=8):
     )
     db.flush()
     return req
+
+
+def _set_bucket_date(req: models.MrpRequirement, bucket_date: date) -> models.MrpRequirementBucket:
+    bucket = req.buckets[0]
+    bucket.bucket_date = bucket_date
+    return bucket
 
 
 def test_archived_fixed_plan_and_closed_requirement_are_materialized(db_session):
@@ -234,3 +240,54 @@ def test_plan_fixed_after_cutoff_is_excluded(db_session):
     db_session.flush()
 
     assert select_historical_obligation_runs(db_session, CUTOFF) == []
+
+
+def test_legacy_bucket_outside_requirement_period_is_materialized(db_session):
+    generation = _generation(db_session)
+    plan = _plan(db_session)
+    run = _run(db_session, plan)
+    req = _requirement(db_session, run, gross=12, net=12)
+    legacy_date = run.period_from - timedelta(days=1)
+    _set_bucket_date(req, legacy_date)
+
+    result = materialize_historical_obligations(db_session, generation.id)
+    batch = db_session.query(models.LedgerBuildBatch).filter(
+        models.LedgerBuildBatch.id == result["batch_id"]
+    ).one()
+
+    assert legacy_date.isoformat() in batch.metrics["selected_bucket_dates"]
+    assert batch.metrics["legacy_out_of_period_bucket_ids"] == [
+        int(req.buckets[0].id)
+    ]
+    assert batch.metrics["legacy_out_of_period_bucket_dates"] == [
+        legacy_date.isoformat()
+    ]
+    assert result["selected_bucket_ids"] == [int(req.buckets[0].id)]
+    assert db_session.query(models.ReservationEntry).filter_by(
+        requirement_id=req.id
+    ).count() == 1
+
+
+def test_historical_obligation_manifest_preserves_bucket_dates(db_session):
+    generation = _generation(db_session)
+    plan = _plan(db_session, start=date(2026, 6, 1), end=date(2026, 6, 30))
+    run = _run(db_session, plan)
+    req_in = _requirement(db_session, run, gross=5, net=5)
+    req_out = _requirement(db_session, run, status="closed", gross=3, net=3)
+    _set_bucket_date(req_out, date(2026, 5, 15))
+
+    result = materialize_historical_obligations(db_session, generation.id)
+    batch = db_session.query(models.LedgerBuildBatch).filter(
+        models.LedgerBuildBatch.id == result["batch_id"]
+    ).one()
+
+    assert batch.metrics["selected_bucket_dates"] == [
+        req_in.buckets[0].bucket_date.isoformat(),
+        req_out.buckets[0].bucket_date.isoformat(),
+    ]
+    assert batch.metrics["legacy_out_of_period_bucket_ids"] == [
+        int(req_out.buckets[0].id)
+    ]
+    assert batch.metrics["legacy_out_of_period_bucket_dates"] == [
+        req_out.buckets[0].bucket_date.isoformat()
+    ]

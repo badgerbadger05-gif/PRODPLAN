@@ -197,6 +197,7 @@ def materialize_historical_obligations(
                 f"requirement {req.id} has ambiguous run period lineage"
             )
     buckets_by_requirement: dict[int, list[models.MrpRequirementBucket]] = {}
+    legacy_bucket_ids: list[int] = []
     for bucket in buckets:
         req = req_by_id.get(int(bucket.requirement_id))
         if (
@@ -208,9 +209,7 @@ def materialize_historical_obligations(
                 f"bucket {bucket.id} has ambiguous requirement lineage"
             )
         if not (req.period_from <= bucket.bucket_date <= req.period_to):
-            raise HistoricalObligationAmbiguity(
-                f"bucket {bucket.id} is outside its frozen requirement period"
-            )
+            legacy_bucket_ids.append(int(bucket.id))
         buckets_by_requirement.setdefault(int(req.id), []).append(bucket)
     for req in requirements:
         req_buckets = buckets_by_requirement.get(int(req.id), [])
@@ -294,6 +293,7 @@ def materialize_historical_obligations(
             events += int(inserted)
             _fold_entry(db, entry)
 
+    legacy_bucket_id_set = set(legacy_bucket_ids)
     metrics = {
         "selected_runs": len(runs),
         "requirements": len(requirements),
@@ -304,6 +304,16 @@ def materialize_historical_obligations(
         "selected_run_ids": run_ids,
         "selected_requirement_ids": requirement_ids,
         "selected_bucket_ids": [int(row.id) for row in buckets],
+        "selected_bucket_dates": [
+            row.bucket_date.isoformat() if row.bucket_date is not None else None
+            for row in buckets
+        ],
+        "legacy_out_of_period_bucket_ids": legacy_bucket_ids,
+        "legacy_out_of_period_bucket_dates": [
+            row.bucket_date.isoformat()
+            for row in buckets
+            if int(row.id) in legacy_bucket_id_set
+        ],
     }
     batch = models.LedgerBuildBatch(
         ledger_generation_id=int(generation.id),
