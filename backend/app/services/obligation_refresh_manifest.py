@@ -22,6 +22,7 @@ from app.services.planning_run_candidate import (
     PlanningRunCandidateError,
     create_added_candidate_run,
     create_candidate_run,
+    _resolve_parent_generation_id,
 )
 
 
@@ -100,13 +101,15 @@ def _require_target(
 
 def _current_parents(db: Session, parent_generation_id: int) -> list[models.PlanningRun]:
     rows = db.query(models.PlanningRun).filter(
-        models.PlanningRun.ledger_generation_id == int(parent_generation_id),
         models.PlanningRun.status == "FIXED_SNAPSHOT",
         models.PlanningRun.source_plan_id.isnot(None),
     ).order_by(models.PlanningRun.source_plan_id, models.PlanningRun.run_id).all()
     seen: set[int] = set()
     for row in rows:
         plan_id = int(row.source_plan_id)
+        resolved_generation = _resolve_parent_generation_id(db, row)
+        if resolved_generation != int(parent_generation_id):
+            continue
         if plan_id in seen:
             raise ObligationRefreshManifestError(
                 f"current generation has multiple FIXED_SNAPSHOT runs for plan {plan_id}"

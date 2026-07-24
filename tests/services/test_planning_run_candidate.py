@@ -83,6 +83,87 @@ def test_create_candidate_copies_header_without_mutating_parent_or_pointer(db_se
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == accepted.id
 
 
+def test_create_candidate_accepts_historical_parent_with_reservation_lineage(db_session):
+    parent, accepted, target = _parent_and_target(db_session)
+    parent.ledger_generation_id = None
+    item = models.Item(
+        item_code="RES-HIST", item_name="Hist item", unit="шт", replenishment_method="Покупка",
+        replenishment_time=3, stock_qty=0, status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+    req = models.MrpRequirement(
+        run_id=parent.run_id, item_id=item.item_id, total_required_qty=0,
+        net_required_qty=0, period_from=parent.period_from, period_to=parent.period_to,
+        bom_level=0,
+    )
+    db_session.add(req)
+    db_session.flush()
+    db_session.add(models.ReservationEntry(
+        ledger_generation_id=accepted.id, item_id=item.item_id, run_id=parent.run_id,
+        freeze_version=0, requirement_id=req.id, priority_period_from=parent.period_from,
+        priority_period_to=parent.period_to,
+    ))
+    candidate = create_candidate_run(db_session, parent.run_id, target.id, "refresh-worker")
+    assert candidate.prior_run_id == parent.run_id
+    assert candidate.source_plan_id == parent.source_plan_id
+    assert candidate.ledger_generation_id == target.id
+
+
+def test_create_candidate_rejects_ambiguous_reservation_lineage(db_session):
+    parent, accepted, target = _parent_and_target(db_session)
+    parent.ledger_generation_id = None
+    alt_generation = models.LedgerGeneration(
+        generation_key="historical-legacy", status="stale", cutoff=accepted.cutoff,
+        source_watermarks={}, physical_import_batch=accepted.physical_import_batch,
+        capabilities={},
+        algorithm_version="tests/1",
+    )
+    # Keep pointer unchanged; lineage for this parent must remain unambiguous.
+    db_session.add(alt_generation)
+    db_session.flush()
+    item = models.Item(
+        item_code="RES-HIST-AMB", item_name="Ambiguous", unit="шт", replenishment_method="Покупка",
+        replenishment_time=3, stock_qty=0, status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+    item_b = models.Item(
+        item_code="RES-HIST-AMB-2", item_name="Ambiguous item b", unit="шт", replenishment_method="Покупка",
+        replenishment_time=3, stock_qty=0, status="active",
+    )
+    db_session.add(item_b)
+    db_session.flush()
+    req_a = models.MrpRequirement(
+        run_id=parent.run_id, item_id=item.item_id, total_required_qty=0,
+        net_required_qty=0, period_from=parent.period_from, period_to=parent.period_to,
+        bom_level=0,
+    )
+    req_b = models.MrpRequirement(
+        run_id=parent.run_id, item_id=item_b.item_id, total_required_qty=0,
+        net_required_qty=0, period_from=parent.period_from, period_to=parent.period_to,
+        bom_level=0,
+    )
+    db_session.add_all([req_a, req_b])
+    db_session.flush()
+    db_session.add_all([
+        models.ReservationEntry(
+            ledger_generation_id=accepted.id, item_id=item.item_id, run_id=parent.run_id,
+            freeze_version=0, requirement_id=req_a.id, priority_period_from=parent.period_from,
+            priority_period_to=parent.period_to,
+        ),
+        models.ReservationEntry(
+            ledger_generation_id=alt_generation.id, item_id=item_b.item_id, run_id=parent.run_id,
+            freeze_version=0, requirement_id=req_b.id, priority_period_from=parent.period_from,
+            priority_period_to=parent.period_to,
+        ),
+    ])
+    db_session.flush()
+
+    with pytest.raises(PlanningRunCandidateError, match="ambiguous Ledger lineage"):
+        create_candidate_run(db_session, parent.run_id, target.id, "refresh-worker")
+
+
 def test_create_candidate_is_idempotent_only_for_exact_lineage(db_session):
     parent, _accepted, target = _parent_and_target(db_session)
     first = create_candidate_run(db_session, parent.run_id, target.id, "worker-a")

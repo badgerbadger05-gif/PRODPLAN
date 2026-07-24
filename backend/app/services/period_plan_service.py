@@ -41,6 +41,7 @@ from ..models import (
     ReservationEntry,
     ReservationEvent,
     StockLedgerEntry,
+    StockLedgerSupplierReceiptProvenance,
 )
 from .planning_service import (
     DEFAULT_PLANNING_CONFIG,
@@ -57,6 +58,7 @@ from .mrp_stock_helpers import (
     consume_wip_detailed as _consume_wip_detailed,
     effective_stock_by_item_all as _effective_stock_by_item_all,
 )
+from .planning_run_candidate import _resolve_parent_generation_id
 from .replenishment import (
     REPLENISHMENT_FLOW_PRODUCTION,
     REPLENISHMENT_FLOW_PURCHASE,
@@ -219,6 +221,7 @@ def list_period_plans(
     )
     plan_ids = [int(plan.id) for plan in plans]
     line_stats: Dict[int, Dict[str, float]] = {}
+    execution_by_plan: Dict[int, Dict[str, Any]] = {}
     if plan_ids:
         stats_rows = (
             db.query(
@@ -234,13 +237,73 @@ def list_period_plans(
             int(row.plan_id): {"line_count": int(row.line_count or 0), "total_qty": _to_float(row.total_qty)}
             for row in stats_rows
         }
+        truth_generation_id = (
+            db.query(PlanningTruthState.current_generation_id)
+            .filter(PlanningTruthState.id == 1)
+            .scalar()
+        )
+        if truth_generation_id is not None:
+            snapshots = (
+                db.query(PlanningReadSnapshot)
+                .filter(
+                    PlanningReadSnapshot.consumer == "period_plan_execution",
+                    PlanningReadSnapshot.ledger_generation_id
+                    == int(truth_generation_id),
+                    PlanningReadSnapshot.truth_status == "accepted",
+                )
+                .order_by(
+                    PlanningReadSnapshot.published_at.desc(),
+                    PlanningReadSnapshot.id.desc(),
+                )
+                .all()
+            )
+            wanted = set(plan_ids)
+            for snapshot in snapshots:
+                payload = dict(snapshot.payload or {})
+                payload_plan = dict(payload.get("plan") or {})
+                try:
+                    payload_plan_id = int(payload_plan.get("id"))
+                except (TypeError, ValueError):
+                    continue
+                if payload_plan_id not in wanted or payload_plan_id in execution_by_plan:
+                    continue
+                summary = dict(payload.get("summary") or {})
+                execution_by_plan[payload_plan_id] = {
+                    "execution_pct": summary.get("execution_pct"),
+                    "execution_completed_qty": summary.get("execution_completed_qty"),
+                    "execution_base_qty": summary.get("execution_base_qty"),
+                    "execution_status": str(payload.get("truth_status") or ""),
+                    "execution_reason": payload.get("truth_reason"),
+                    "execution_generation_id": int(truth_generation_id),
+                }
     return {
         "rows": [
-            _serialize_plan(
-                plan,
-                line_count=int(line_stats.get(int(plan.id), {}).get("line_count", 0)),
-                total_qty=float(line_stats.get(int(plan.id), {}).get("total_qty", 0.0)),
-            )
+            {
+                **_serialize_plan(
+                    plan,
+                    line_count=int(line_stats.get(int(plan.id), {}).get("line_count", 0)),
+                    total_qty=float(line_stats.get(int(plan.id), {}).get("total_qty", 0.0)),
+                ),
+                **execution_by_plan.get(
+                    int(plan.id),
+                    {
+                        "execution_pct": None,
+                        "execution_completed_qty": None,
+                        "execution_base_qty": None,
+                        "execution_status": "unavailable",
+                        "execution_reason": (
+                            "Execution snapshot is missing for the accepted Ledger generation"
+                            if truth_generation_id is not None
+                            else "Accepted Ledger generation is unavailable"
+                        ),
+                        "execution_generation_id": (
+                            int(truth_generation_id)
+                            if truth_generation_id is not None
+                            else None
+                        ),
+                    },
+                ),
+            }
             for plan in plans
         ],
         "total": int(total),
@@ -911,13 +974,28 @@ def create_mrp_snapshot_from_period_plan(
         cfg_id, cfg = get_active_planning_config(db)
     except Exception:
         cfg_id, cfg = None, dict(DEFAULT_PLANNING_CONFIG)
+    add_plan_ids = (int(plan.id),)
+    for current in (
+        db.query(PlanningRun)
+        .filter(
+            PlanningRun.source_plan_id == int(plan.id),
+            PlanningRun.status == "FIXED_SNAPSHOT",
+        )
+        .all()
+    ):
+        if current.ledger_generation_id is not None:
+            continue
+        resolved_parent_generation_id = _resolve_parent_generation_id(db, current)
+        if resolved_parent_generation_id == int(parent.id):
+            add_plan_ids = ()
+            break
 
     from .obligation_refresh_orchestrator import run_obligation_refresh
     report = run_obligation_refresh(
         db,
         parent_generation_id=int(parent.id),
         generation_key=key,
-        add_plan_ids=(int(plan.id),),
+        add_plan_ids=add_plan_ids,
         started_by=started_by or "api",
         horizon_days=max(1, (plan.period_to - plan.period_from).days + 1),
         config_version_id=cfg_id,
@@ -1927,20 +2005,34 @@ def _execution_row_summary(
     execution_completed_qty = 0.0
     execution_base_qty = 0.0
     execution_by_flow: Dict[str, Dict[str, float]] = {}
+    execution_available_items = 0
     fully_covered = 0
     partially_covered = 0
     not_covered = 0
     net_zero = 0
     for row in rows:
         total_items += 1
+        execution_available = bool(row.get("execution_available", True))
         completed_qty = _to_float(row.get("completed_qty"))
         base_qty = _to_float(row.get("progress_base_qty", row.get("net_qty")))
         item_flow = str(row.get("flow") or "")
-        execution_completed_qty += completed_qty
-        execution_base_qty += base_qty
-        flow_summary = execution_by_flow.setdefault(item_flow, {"completed_qty": 0.0, "base_qty": 0.0})
-        flow_summary["completed_qty"] += completed_qty
-        flow_summary["base_qty"] += base_qty
+        if execution_available:
+            execution_available_items += 1
+            execution_completed_qty += completed_qty
+            execution_base_qty += base_qty
+        flow_summary = execution_by_flow.setdefault(
+            item_flow,
+            {
+                "completed_qty": 0.0,
+                "base_qty": 0.0,
+                "available": True,
+            },
+        )
+        if execution_available:
+            flow_summary["completed_qty"] += completed_qty
+            flow_summary["base_qty"] += base_qty
+        else:
+            flow_summary["available"] = False
         status = str(row.get("status") or "")
         if status == "net_zero":
             net_zero += 1
@@ -1951,11 +2043,18 @@ def _execution_row_summary(
         else:
             not_covered += 1
     execution_pct = (
-        round(execution_completed_qty / execution_base_qty * 100.0, 1)
-        if execution_base_qty > 1e-9
-        else 100.0
+        None
+        if execution_available_items == 0 and total_items > 0
+        else (
+            round(execution_completed_qty / execution_base_qty * 100.0, 1)
+            if execution_base_qty > 1e-9
+            else 100.0
+        )
     )
     for details in execution_by_flow.values():
+        if not bool(details.get("available", True)):
+            details["execution_pct"] = None
+            continue
         base_qty = _to_float(details.get("base_qty"))
         details["execution_pct"] = (
             round(_to_float(details.get("completed_qty")) / base_qty * 100.0, 1)
@@ -2377,6 +2476,34 @@ def _build_execution_snapshot_rows(
                 continue
             allocation["stock_ledger_entry"] = stock_entries.get(int(stock_id))
 
+    supplier_provenance_rows = (
+        db.query(
+            StockLedgerEntry.item_id,
+            StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id,
+            StockLedgerSupplierReceiptProvenance.match_status,
+        )
+        .join(
+            StockLedgerSupplierReceiptProvenance,
+            StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id
+            == StockLedgerEntry.id,
+        )
+        .filter(
+            StockLedgerSupplierReceiptProvenance.ledger_generation_id
+            == int(generation_id)
+        )
+        .all()
+    )
+    exact_supplier_sle_ids = {
+        int(sle_id)
+        for _item_id, sle_id, match_status in supplier_provenance_rows
+        if str(match_status or "") == "exact"
+    }
+    unresolved_supplier_items = {
+        int(item_id)
+        for item_id, _sle_id, match_status in supplier_provenance_rows
+        if str(match_status or "") in {"unmatched", "ambiguous"}
+    }
+
     for req_id in req_ids:
         req = items_by_requirement.get(int(req_id))
         if not req:
@@ -2403,13 +2530,37 @@ def _build_execution_snapshot_rows(
             ),
         )
         progress_base_qty = _to_float(req["net_required_qty"])
-        completed_qty = round(
+        execution_completed_qty = round(
             sum(
                 _to_float(payload.get("allocated_qty"))
                 for payload in allocations
                 if str(payload.get("allocation_kind") or "") == "execution"
             ),
             10,
+        )
+        supplier_receipt_qty = round(
+            sum(
+                _to_float(payload.get("allocated_qty"))
+                for payload in allocations
+                if (
+                    str(payload.get("allocation_kind") or "")
+                    == "coverage_realization"
+                    and str(payload.get("fact_type") or "") == "supplier_receipt"
+                    and int(payload.get("stock_ledger_entry_id") or 0)
+                    in exact_supplier_sle_ids
+                )
+            ),
+            10,
+        )
+        flow = item_flow_by_id.get(item_id)
+        execution_available = not (
+            flow == REPLENISHMENT_FLOW_PURCHASE
+            and item_id in unresolved_supplier_items
+        )
+        completed_qty = (
+            supplier_receipt_qty
+            if flow == REPLENISHMENT_FLOW_PURCHASE
+            else execution_completed_qty
         )
         if progress_base_qty > 1e-9:
             completed_qty = min(max(0.0, completed_qty), progress_base_qty)
@@ -2442,9 +2593,20 @@ def _build_execution_snapshot_rows(
             "gross_qty": _to_float(req.get("gross_required_qty")),
             "net_qty": _to_float(req.get("net_required_qty")),
             "progress_base_qty": progress_base_qty,
-            "completed_qty": completed_qty,
+            "completed_qty": completed_qty if execution_available else None,
+            "execution_available": execution_available,
+            "execution_unavailable_reason": (
+                "Supplier receipt evidence is unmatched or ambiguous"
+                if not execution_available
+                else None
+            ),
+            "execution_source": (
+                "supplier_receipt_coverage"
+                if flow == REPLENISHMENT_FLOW_PURCHASE
+                else "reservation_realization"
+            ),
             "remaining_qty": remaining_qty,
-            "coverage_pct": coverage_pct,
+            "coverage_pct": coverage_pct if execution_available else None,
             "ordered_qty": ordered_qty,
             "unassigned_qty": max(
                 0.0, _to_float(req.get("net_required_qty")) - ordered_qty

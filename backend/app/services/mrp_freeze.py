@@ -64,6 +64,7 @@ from ..models import (
     SyncLink,
 )
 from .mrp_stock_helpers import WipSupplyLine
+from .planning_run_candidate import PlanningRunCandidateError, _resolve_parent_generation_id
 from .planning_truth import (
     CAPABILITY_EXECUTION_ALLOCATIONS,
     CAPABILITY_PHYSICAL_LEDGER,
@@ -884,7 +885,13 @@ def freeze_candidate_snapshots(
             if run.prior_run_id is None or int(run.prior_run_id) != parent_run_id:
                 raise LedgerPoolUnavailable("candidate freeze refresh candidate parent conflicts with manifest")
             old = db.get(PlanningRun, parent_run_id)
-            if old is None or str(old.status) != FIXED_SNAPSHOT_STATUS or int(old.ledger_generation_id or 0) != parent_id:
+            if old is None or str(old.status) != FIXED_SNAPSHOT_STATUS:
+                raise LedgerPoolUnavailable("candidate freeze parent run is not a fixed current-generation snapshot")
+            try:
+                old_parent_generation_id = _resolve_parent_generation_id(db, old)
+            except PlanningRunCandidateError as exc:
+                raise LedgerPoolUnavailable("candidate freeze parent run is not a fixed current-generation snapshot") from exc
+            if old_parent_generation_id != parent_id:
                 raise LedgerPoolUnavailable("candidate freeze parent run is not a fixed current-generation snapshot")
             if old.source_plan_id != run.source_plan_id:
                 raise LedgerPoolUnavailable("candidate freeze source plan differs from parent")

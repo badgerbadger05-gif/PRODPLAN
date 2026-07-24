@@ -8,11 +8,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from app import models
 from app.models import (
     DefaultSpecification,
     Item,
     LedgerGeneration,
     MrpRequirement,
+    MrpExecutionAllocation,
     PlannedOrder,
     PlannedPurchase,
     PlanningRun,
@@ -25,17 +27,23 @@ from app.models import (
     PlanningTruthState,
     PlanningReadSnapshot,
     StockBin,
+    StockLedgerEntry,
+    StockLedgerSupplierReceiptProvenance,
     SpecComponent,
     Specification,
     SyncLink,
     SupplierOrder,
     SupplierOrderItem,
 )
+from app.services import period_plan_service
+from app.services import obligation_refresh_orchestrator
 from app.services.period_plan_service import (
     _compute_legacy_period_plan_execution_journal,
+    _build_execution_snapshot_rows,
     build_period_plan_execution_snapshot,
     create_mrp_snapshot_from_period_plan,
     get_period_plan_execution_journal,
+    list_period_plans,
 )
 @pytest.fixture(autouse=True)
 def _accepted_planning_truth(db_session):
@@ -111,6 +119,72 @@ def _publish_plan(db, plan: ProductionPlanHeader):
 
 def _planned_purchase(db, result):
     return db.query(PlannedPurchase).filter_by(run_id=result["run_id"]).one()
+
+
+def test_publish_plan_prefers_reservation_lineage_refresh_over_add(db_session, monkeypatch):
+    item = _make_purchased_item(db_session, "HIST-SLICE")
+    plan = _make_fixed_plan(db_session, item, date(2026, 10, 1), qty=10.0)
+    accepted = db_session.get(PlanningTruthState, 1).current_generation_id
+    accepted_generation = db_session.get(LedgerGeneration, int(accepted))
+
+    parent = models.PlanningRun(
+        status="FIXED_SNAPSHOT", ledger_generation_id=None, source_plan_id=plan.id,
+        period_from=plan.period_from, period_to=plan.period_to,
+        started_at=accepted_generation.cutoff, fixed_at=accepted_generation.cutoff, finished_at=accepted_generation.cutoff,
+    )
+    db_session.add(parent)
+    db_session.flush()
+    req = models.MrpRequirement(
+        run_id=parent.run_id, item_id=item.item_id, total_required_qty=0,
+        net_required_qty=0, period_from=plan.period_from, period_to=plan.period_to,
+        bom_level=0,
+    )
+    db_session.add(req)
+    db_session.flush()
+    db_session.add(models.ReservationEntry(
+        ledger_generation_id=int(accepted), item_id=item.item_id, run_id=parent.run_id,
+        freeze_version=0, requirement_id=req.id, priority_period_from=plan.period_from,
+        priority_period_to=plan.period_to,
+    ))
+    db_session.flush()
+
+    target = models.LedgerGeneration(
+        generation_key="period-plan-refresh-target", status="building",
+        cutoff=accepted_generation.cutoff, source_watermarks={
+            "generation_kind": "obligation_refresh", "parent_generation_id": int(accepted)
+        }, capabilities={}, physical_import_batch=accepted_generation.physical_import_batch,
+        algorithm_version="tests/1",
+    )
+    db_session.add(target)
+    db_session.flush()
+    db_session.add(
+        models.PlanningRun(
+            status="FIXED_SNAPSHOT", source_plan_id=plan.id, ledger_generation_id=target.id,
+            prior_run_id=parent.run_id, period_from=plan.period_from, period_to=plan.period_to,
+            started_at=accepted_generation.cutoff, fixed_at=accepted_generation.cutoff,
+            finished_at=accepted_generation.cutoff,
+        )
+    )
+    db_session.flush()
+    candidate_run_id = db_session.query(models.PlanningRun.run_id).filter(
+        models.PlanningRun.source_plan_id == int(plan.id),
+        models.PlanningRun.ledger_generation_id == target.id,
+    ).scalar()
+
+    observed = {}
+
+    def fake_run_obligation_refresh(db, **kwargs):
+        observed["add_plan_ids"] = tuple(kwargs["add_plan_ids"])
+        return SimpleNamespace(
+            candidate_run_ids=[int(candidate_run_id)], target_generation_id=int(target.id), published=False,
+        )
+
+    monkeypatch.setattr(obligation_refresh_orchestrator, "run_obligation_refresh", fake_run_obligation_refresh)
+    result = _publish_plan(db_session, plan)
+
+    assert observed["add_plan_ids"] == ()
+    assert result["run_id"] == int(candidate_run_id)
+    assert db_session.get(models.PlanningRun, result["run_id"]).prior_run_id == parent.run_id
 
 
 def test_execution_journal_is_explicitly_unavailable_without_accepted_truth(
@@ -304,6 +378,150 @@ def test_execution_snapshot_persists_canonical_accepted_lineage(db_session):
     assert snapshot.cutoff == generation.cutoff
     assert snapshot.truth_status == "accepted"
     assert snapshot.payload == payload
+
+
+def test_period_plan_list_reads_progress_from_current_immutable_snapshot(db_session):
+    item = _make_purchased_item(db_session, "LIST-PROGRESS")
+    plan = _make_fixed_plan(db_session, item, date(2026, 7, 1), qty=5.0)
+    generation_id = int(
+        db_session.query(PlanningTruthState.current_generation_id).scalar()
+    )
+    generation = db_session.get(LedgerGeneration, generation_id)
+    db_session.add(PlanningReadSnapshot(
+        consumer="period_plan_execution",
+        snapshot_key=f"plan={plan.id};run=77",
+        ledger_generation_id=generation_id,
+        cutoff=generation.cutoff,
+        truth_status="accepted",
+        payload={
+            "plan": {"id": plan.id},
+            "truth_status": "accepted",
+            "summary": {
+                "execution_pct": 62.5,
+                "execution_completed_qty": 5,
+                "execution_base_qty": 8,
+            },
+        },
+        published_at=datetime.datetime(2026, 7, 24),
+    ))
+    db_session.commit()
+
+    result = list_period_plans(db_session)
+
+    row = next(row for row in result["rows"] if row["id"] == plan.id)
+    assert row["execution_pct"] == 62.5
+    assert row["execution_completed_qty"] == 5
+    assert row["execution_base_qty"] == 8
+    assert row["execution_status"] == "accepted"
+    assert row["execution_reason"] is None
+    assert row["execution_generation_id"] == generation_id
+
+
+@pytest.mark.parametrize(
+    ("match_status", "expected_qty", "expected_available"),
+    [
+        ("exact", 4.0, True),
+        ("unmatched", None, False),
+    ],
+)
+def test_purchase_execution_uses_only_exact_supplier_receipt_coverage(
+    db_session, match_status, expected_qty, expected_available
+):
+    item = _make_purchased_item(db_session, f"BUY-RECEIPT-{match_status}")
+    generation_id = int(
+        db_session.query(PlanningTruthState.current_generation_id).scalar()
+    )
+    batch = db_session.query(PhysicalImportBatch).one()
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        period_from=date(2026, 7, 1),
+        period_to=date(2026, 7, 31),
+    )
+    db_session.add(run)
+    db_session.flush()
+    req = MrpRequirement(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        total_required_qty=10,
+        net_required_qty=10,
+        period_from=run.period_from,
+        period_to=run.period_to,
+        bom_level=0,
+    )
+    db_session.add(req)
+    db_session.flush()
+    sle = StockLedgerEntry(
+        ingest_batch_id=batch.id,
+        source_content_hash=f"receipt-{match_status}",
+        item_id=item.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        warehouse_ref1c="main",
+        qty=4,
+        qty_after=4,
+        posting_at=datetime.datetime(2026, 7, 10),
+        record_type="Receipt",
+        movement_kind="receipt",
+        recorder_type="Document_ПриобретениеТоваровУслуг",
+        recorder_ref=f"receipt-{match_status}",
+        line_no="1",
+        ingest_source="pull",
+    )
+    db_session.add(sle)
+    db_session.flush()
+    db_session.add(StockLedgerSupplierReceiptProvenance(
+        ledger_generation_id=generation_id,
+        stock_ledger_entry_id=sle.id,
+        receipt_doc_type=sle.recorder_type,
+        receipt_doc_ref=sle.recorder_ref,
+        receipt_doc_line_no=sle.line_no,
+        supplier_order_ref="order-1" if match_status == "exact" else None,
+        supplier_order_line_no="1" if match_status == "exact" else None,
+        operation_kind="supplier_receipt",
+        evidence_hash="evidence",
+        evidence_payload={},
+        match_rule="typed_order_line",
+        match_status=match_status,
+        ambiguity_count=0,
+        reason=None if match_status == "exact" else "no exact typed supplier order line",
+    ))
+    if match_status == "exact":
+        db_session.add(MrpExecutionAllocation(
+            ledger_generation_id=generation_id,
+            cycle_id="supplier-test",
+            requirement_id=req.id,
+            fact_type="supplier_receipt",
+            allocation_kind="coverage_realization",
+            fact_ref=sle.recorder_ref,
+            fact_line_ref=f"1#sle:{sle.id}",
+            allocated_qty=4,
+            stock_ledger_entry_id=sle.id,
+            origin_requirement_id=req.id,
+        ))
+    db_session.flush()
+
+    rows, _meta = _build_execution_snapshot_rows(
+        db_session,
+        run,
+        requirement_ids=[req.id],
+        items_by_requirement={
+            req.id: {
+                "item_id": item.item_id,
+                "item_code": item.item_code,
+                "item_article": item.item_article,
+                "item_name": item.item_name,
+                "gross_required_qty": 10,
+                "net_required_qty": 10,
+                "bom_level": 0,
+            }
+        },
+        generation_id=generation_id,
+        root_item_ids_by_item={item.item_id: []},
+    )
+
+    assert rows[0]["completed_qty"] == expected_qty
+    assert rows[0]["execution_available"] is expected_available
+    assert rows[0]["execution_source"] == "supplier_receipt_coverage"
 
 
 def _make_fixed_plan(

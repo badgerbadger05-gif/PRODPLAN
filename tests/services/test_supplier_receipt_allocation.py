@@ -199,7 +199,13 @@ def test_live_and_predefined_compact_operation_names(
     _validate_operations((row,))
 
 
-def _persistence_fixture(db, *, duplicate=False, legacy_received=999):
+def _persistence_fixture(
+    db,
+    *,
+    duplicate=False,
+    legacy_received=999,
+    supplier_line_characteristic: str | None = None,
+):
     item = models.Item(item_code="SUP-CORE", item_name="Supplier core")
     batch = models.PhysicalImportBatch(
         batch_key="supplier-core-batch", status="completed", source_watermarks={}
@@ -233,7 +239,7 @@ def _persistence_fixture(db, *, duplicate=False, legacy_received=999):
         order_id=order.order_id,
         item_id_ref=item.item_id,
         line_number=1,
-        characteristic_ref1c=None,
+        characteristic_ref1c=supplier_line_characteristic,
         quantity=Decimal("5"),
         received_qty=Decimal(str(legacy_received)),
         remaining_qty=Decimal("-994"),
@@ -243,7 +249,7 @@ def _persistence_fixture(db, *, duplicate=False, legacy_received=999):
             order_id=order.order_id,
             item_id_ref=item.item_id,
             line_number=1,
-            characteristic_ref1c=None,
+            characteristic_ref1c=supplier_line_characteristic,
             quantity=Decimal("5"),
             received_qty=0,
             remaining_qty=5,
@@ -338,6 +344,33 @@ def test_persistence_ignores_legacy_received_qty_and_cross_generation_pin(db_ses
     assert provenance.correction_receipt_ref is None
     assert len(provenance.evidence_hash) == 64
     assert provenance.evidence_payload["signed_qty"] == "3"
+
+
+def test_zero_guid_matches_canonical_empty_characteristic_in_order_item(db_session):
+    generation, req = _persistence_fixture(
+        db_session,
+        supplier_line_characteristic="00000000-0000-0000-0000-000000000000",
+    )
+    evidence = _evidence(RECEIPT_OPERATION, 3)
+    evidence = SupplierDocumentEvidence(
+        **{
+            **evidence.__dict__,
+            "characteristic_ref": "00000000-0000-0000-0000-000000000000",
+        }
+    )
+    result = rebuild_supplier_receipt_coverage(
+        db_session,
+        ledger_generation_id=generation.id,
+        evidence=[evidence],
+        cycle_id="test",
+    )
+    db_session.commit()
+    provenance = db_session.query(
+        models.StockLedgerSupplierReceiptProvenance
+    ).one()
+    assert result.exact_fact_count == 1
+    assert provenance.match_status == "exact"
+    assert db_session.query(models.MrpExecutionAllocation).one().requirement_id == req.id
 
 
 def test_live_basis_line_zero_resolves_unique_canonical_order_line(db_session):

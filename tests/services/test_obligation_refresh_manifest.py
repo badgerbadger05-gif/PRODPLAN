@@ -109,6 +109,45 @@ def test_manifest_allows_first_add_only_and_exact_retry(db_session):
     assert again.entries == first.entries
 
 
+def test_manifest_refreshes_parent_with_null_ledger_generation_via_reservation_lineage(db_session):
+    accepted, target, _parents = _fixture(db_session, plans=0)
+    plan = models.ProductionPlanHeader(
+        name="legacy parent", period_from=date(2026, 7, 1), period_to=date(2026, 7, 31),
+        status="fixed",
+    )
+    db_session.add(plan)
+    item = models.Item(
+        item_code="RESH-PLAN", item_name="Item", unit="шт", replenishment_method="Покупка",
+        replenishment_time=3, stock_qty=0, status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+    parent = models.PlanningRun(
+        status="FIXED_SNAPSHOT", ledger_generation_id=None, source_plan_id=plan.id,
+        period_from=plan.period_from, period_to=plan.period_to, started_at=accepted.cutoff,
+        fixed_at=accepted.cutoff, finished_at=accepted.cutoff,
+    )
+    db_session.add(parent)
+    db_session.flush()
+    req = models.MrpRequirement(
+        run_id=parent.run_id, item_id=item.item_id, total_required_qty=0,
+        net_required_qty=0, period_from=plan.period_from, period_to=plan.period_to, bom_level=0,
+    )
+    db_session.add(req)
+    db_session.flush()
+    db_session.add(models.ReservationEntry(
+        ledger_generation_id=accepted.id, item_id=item.item_id, run_id=parent.run_id,
+        freeze_version=0, requirement_id=req.id, priority_period_from=plan.period_from,
+        priority_period_to=plan.period_to,
+    ))
+    db_session.flush()
+
+    result = _create(db_session, accepted, target)
+    assert [(row["action"], row["plan_id"], row["parent_run_id"]) for row in result.entries] == [
+        ("refresh", plan.id, parent.run_id),
+    ]
+
+
 def test_manifest_never_omits_current_plan_and_conflicting_retry_is_rejected(db_session):
     accepted, target, parents = _fixture(db_session)
     result = _create(db_session, accepted, target)

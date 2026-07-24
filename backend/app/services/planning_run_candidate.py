@@ -10,6 +10,7 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timezone
 
+from sqlalchemy import and_
 from sqlalchemy.orm import Session
 
 from app import models
@@ -27,6 +28,78 @@ def _as_utc(value: datetime | None, field: str) -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _resolve_parent_generation_id(
+    db: Session,
+    parent: models.PlanningRun,
+) -> int | None:
+    """Resolve a parent generation from direct lineage or reservation replay.
+
+    Legacy historical FIXED_SNAPSHOT rows occasionally arrive with
+    ``ledger_generation_id`` cleared; in that case their lineage is inferred
+    from reservation replay rows for the same run.
+    """
+    if parent.ledger_generation_id is not None:
+        return int(parent.ledger_generation_id)
+
+    run_id = int(parent.run_id)
+    def _coerce_lineage(gen_id):
+        return int(gen_id[0] if hasattr(gen_id, "__getitem__") else gen_id)
+
+    pending_lineages = {
+        int(entry.ledger_generation_id)
+        for entry in list(db.new)
+        if isinstance(entry, models.ReservationEntry)
+        and entry.ledger_generation_id is not None
+        and (
+            entry.run_id == run_id
+            or (
+                entry.run_id is None
+                and entry.requirement is not None
+                and int(entry.requirement.run_id) == run_id
+            )
+            or (
+                entry.run_id is None
+                and entry.requirement_id is not None
+                and db.query(models.MrpRequirement.run_id)
+                .filter(models.MrpRequirement.id == int(entry.requirement_id))
+                .scalar() == run_id
+            )
+        )
+    }
+
+    raw_lineages = db.query(models.ReservationEntry.ledger_generation_id).filter(
+        and_(
+            models.ReservationEntry.ledger_generation_id.isnot(None),
+            models.ReservationEntry.run_id == run_id,
+        )
+    ).all()
+
+    if not raw_lineages:
+        raw_lineages = (
+            db.query(models.ReservationEntry.ledger_generation_id)
+            .join(
+                models.MrpRequirement,
+                models.ReservationEntry.requirement_id == models.MrpRequirement.id,
+            )
+            .filter(
+                and_(
+                    models.ReservationEntry.ledger_generation_id.isnot(None),
+                    models.MrpRequirement.run_id == run_id,
+                    models.ReservationEntry.run_id.is_(None),
+                )
+            )
+            .all()
+        )
+
+    lineages = {_coerce_lineage(gen_id) for gen_id in raw_lineages}
+    lineages.update(pending_lineages)
+    if not lineages:
+        return None
+    if len(lineages) > 1:
+        raise PlanningRunCandidateError("parent run has ambiguous Ledger lineage")
+    return next(iter(lineages))
+
+
 def _require_parent_and_target(
     db: Session,
     *,
@@ -40,17 +113,18 @@ def _require_parent_and_target(
         raise PlanningRunCandidateError("parent run must be FIXED_SNAPSHOT")
     if parent.source_plan_id is None:
         raise PlanningRunCandidateError("parent run must have source_plan_id")
-    if parent.ledger_generation_id is None:
+    parent_generation_id = _resolve_parent_generation_id(db, parent)
+    if parent_generation_id is None:
         raise PlanningRunCandidateError("parent run has no Ledger generation")
 
     pointer = db.get(models.PlanningTruthState, 1)
     if pointer is None or pointer.current_generation_id is None:
         raise PlanningRunCandidateError("accepted Ledger pointer is not set")
-    if int(pointer.current_generation_id) != int(parent.ledger_generation_id):
+    if int(pointer.current_generation_id) != parent_generation_id:
         raise PlanningRunCandidateError(
             "parent run is not bound to the current accepted Ledger generation"
         )
-    accepted = db.get(models.LedgerGeneration, int(parent.ledger_generation_id))
+    accepted = db.get(models.LedgerGeneration, parent_generation_id)
     if accepted is None or str(accepted.status) != "accepted":
         raise PlanningRunCandidateError("parent Ledger generation is not accepted")
 
