@@ -373,6 +373,67 @@ def test_zero_guid_matches_canonical_empty_characteristic_in_order_item(db_sessi
     assert db_session.query(models.MrpExecutionAllocation).one().requirement_id == req.id
 
 
+def test_historical_receipt_falls_back_through_synced_purchase_requirement(
+    db_session,
+):
+    generation, req = _persistence_fixture(db_session)
+    db_session.query(models.MrpFreezeAllocation).delete()
+    purchase = models.PlannedPurchase(
+        run_id=req.run_id,
+        item_id=req.item_id,
+        requested_qty=5,
+        planned_qty=5,
+        qty=5,
+        need_date=req.period_to,
+        order_date=req.period_from,
+        lead_time_days=0,
+        priority_index=0,
+        bucket_date=req.period_to,
+        source_mrp_requirement_id=req.id,
+    )
+    db_session.add(purchase)
+    db_session.flush()
+    db_session.add_all([
+        models.SyncLink(
+            source_system="PRODPLAN",
+            source_doctype="planned_purchase",
+            source_id=purchase.purchase_id,
+            target_entity="Document_ЗаказПоставщику",
+            target_ref_key="order-1",
+            status="success",
+        ),
+        models.ReservationEntry(
+            ledger_generation_id=generation.id,
+            item_id=req.item_id,
+            characteristic_ref="",
+            organization_ref="",
+            planning_stock_pool="default",
+            run_id=req.run_id,
+            freeze_version=1,
+            requirement_id=req.id,
+            priority_period_from=req.period_from,
+            priority_period_to=req.period_to,
+            realization_mode="consume",
+            reserved_qty=5,
+        ),
+    ])
+    db_session.commit()
+
+    result = rebuild_supplier_receipt_coverage(
+        db_session,
+        ledger_generation_id=generation.id,
+        evidence=[_evidence(RECEIPT_OPERATION, 3)],
+        cycle_id="historical-fallback",
+    )
+    db_session.commit()
+
+    allocation = db_session.query(models.MrpExecutionAllocation).one()
+    assert result.allocation_count == 1
+    assert allocation.requirement_id == req.id
+    assert allocation.allocated_qty == Decimal("3.000")
+    assert allocation.freeze_allocation_id is None
+
+
 def test_live_basis_line_zero_resolves_unique_canonical_order_line(db_session):
     generation, req = _persistence_fixture(db_session)
     evidence = _evidence(RECEIPT_OPERATION, 3)

@@ -364,6 +364,108 @@ def _pins_for_order(
             qty=pin_qty,
             due_at=due,
         ))
+    if result:
+        return tuple(result)
+
+    # Historical generations predate immutable export-line allocations and
+    # supplier-order freeze pins. Recover the explicit chain which still
+    # exists in the mirror:
+    # receipt line -> supplier order -> successful planned_purchase SyncLink
+    # -> source MRP requirement. If even that address is absent, §2.5 assigns
+    # the receipt FIFO to the oldest uncovered purchase obligation of the same
+    # item/pool. Empty characteristic is the only supported pool dimension.
+    order = db.query(models.SupplierOrder).filter(
+        models.SupplierOrder.order_ref1c == order_ref
+    ).one_or_none()
+    if order is None:
+        return ()
+    try:
+        canonical_line_no = int(line_no)
+    except (TypeError, ValueError):
+        return ()
+    order_line = db.query(models.SupplierOrderItem).filter(
+        models.SupplierOrderItem.order_id == order.order_id,
+        models.SupplierOrderItem.line_number == canonical_line_no,
+    ).one_or_none()
+    if order_line is None or order_line.item_id_ref is None:
+        return ()
+    item_id = int(order_line.item_id_ref)
+    eligible_requirement_ids = {
+        int(requirement_id)
+        for (requirement_id,) in (
+            db.query(models.ReservationEntry.requirement_id)
+            .filter(
+                models.ReservationEntry.ledger_generation_id
+                == int(generation_id),
+                models.ReservationEntry.requirement_id.isnot(None),
+            )
+            .distinct()
+            .all()
+        )
+    }
+    linked_purchase_ids = {
+        int(source_id)
+        for (source_id,) in (
+            db.query(models.SyncLink.source_id)
+            .filter(
+                models.SyncLink.source_system == "PRODPLAN",
+                models.SyncLink.source_doctype == "planned_purchase",
+                models.SyncLink.target_entity == "Document_ЗаказПоставщику",
+                models.SyncLink.target_ref_key == order_ref,
+                models.SyncLink.status == "success",
+            )
+            .all()
+        )
+    }
+    purchase_query = db.query(models.PlannedPurchase).filter(
+        models.PlannedPurchase.item_id == item_id,
+        models.PlannedPurchase.source_mrp_requirement_id.isnot(None),
+    )
+    if linked_purchase_ids:
+        purchase_query = purchase_query.filter(
+            models.PlannedPurchase.purchase_id.in_(linked_purchase_ids)
+        )
+    purchases = sorted(
+        (
+            purchase
+            for purchase in purchase_query.all()
+            if int(purchase.source_mrp_requirement_id)
+            in eligible_requirement_ids
+        ),
+        key=lambda purchase: (
+            purchase.need_date or datetime.max.date(),
+            int(purchase.source_mrp_requirement_id),
+            int(purchase.purchase_id),
+        ),
+    )
+    for purchase in purchases:
+        requirement_id = int(purchase.source_mrp_requirement_id)
+        requirement = db.get(models.MrpRequirement, requirement_id)
+        if requirement is None:
+            continue
+        bucket = (
+            db.query(models.MrpRequirementBucket)
+            .filter_by(requirement_id=requirement_id)
+            .order_by(
+                models.MrpRequirementBucket.bucket_date,
+                models.MrpRequirementBucket.id,
+            )
+            .first()
+        )
+        qty = _decimal(purchase.qty)
+        if qty <= 0:
+            continue
+        result.append(CoveragePin(
+            # Negative identity is an in-memory stable key. Historical rows
+            # have no MrpFreezeAllocation FK to persist.
+            freeze_allocation_id=-int(purchase.purchase_id),
+            requirement_id=requirement_id,
+            bucket_id=bucket.id if bucket else None,
+            qty=qty,
+            due_at=datetime.combine(
+                requirement.period_to, datetime.min.time()
+            ),
+        ))
     return tuple(result)
 
 
@@ -565,7 +667,11 @@ def _rebuild_supplier_receipt_coverage_unsafe(
             fact_date=allocation.fact.posting_at,
             allocated_qty=qty,
             stock_ledger_entry_id=allocation.fact.sle_id,
-            freeze_allocation_id=allocation.pin.freeze_allocation_id,
+            freeze_allocation_id=(
+                allocation.pin.freeze_allocation_id
+                if allocation.pin.freeze_allocation_id > 0
+                else None
+            ),
             origin_requirement_id=allocation.pin.requirement_id,
         ))
     db.flush()
