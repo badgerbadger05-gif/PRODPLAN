@@ -18,6 +18,7 @@ from app.services.item_ledger.generation_lifecycle import (
 from app.services.item_ledger.supplier_receipt_odata import (
     SupplierEvidenceDiagnostic,
     SupplierEvidenceExtractionResult,
+    SupplierReceiptExclusion,
 )
 from app.services.item_ledger.supplier_receipt_allocation import (
     RECEIPT_OPERATION,
@@ -244,6 +245,40 @@ def _configure_obligation_checkpoint(
             realized_qty=Decimal(replay_allocated),
             lifecycle_status="active",
         ))
+    db_session.flush()
+
+
+def _add_matching_reservation_event(
+    db_session,
+    generation: models.LedgerGeneration,
+    requirement: models.MrpRequirement,
+) -> None:
+    reservation = db_session.query(models.ReservationEntry).filter_by(
+        ledger_generation_id=generation.id,
+        requirement_id=requirement.id,
+    ).one()
+    fact = db_session.query(models.StockLedgerEntry).filter_by(
+        ingest_batch_id=generation.physical_import_batch_id,
+    ).order_by(models.StockLedgerEntry.id.asc()).first()
+    assert fact is not None
+    db_session.add(models.ReservationEvent(
+        ledger_generation_id=generation.id,
+        reservation_id=reservation.id,
+        item_id=reservation.item_id,
+        characteristic_ref=reservation.characteristic_ref,
+        organization_ref=reservation.organization_ref,
+        planning_stock_pool=reservation.planning_stock_pool,
+        event_kind="realize",
+        reserved_delta=reservation.reserved_qty,
+        realized_delta=reservation.realized_qty,
+        sle_id=fact.id,
+        fact_ref=fact.recorder_ref,
+        fact_line_ref=fact.line_no,
+        match_rule="fifo",
+        cycle_id=f"historical-replay:g{generation.id}",
+        idempotency_key=f"test:g{generation.id}:r{reservation.id}:sle{fact.id}",
+        event_at=fact.posting_at,
+    ))
     db_session.flush()
 
 
@@ -927,6 +962,7 @@ def test_direct_supplier_receipt_is_explicitly_unplanned_but_does_not_block(
         lambda *_args, **_kwargs: SupplierEvidenceExtractionResult(
             evidence=(evidence,),
             diagnostics=(),
+            ignored_stock_ledger_entries=(),
             fetched_document_count=1,
         ),
     )
@@ -947,3 +983,152 @@ def test_direct_supplier_receipt_is_explicitly_unplanned_but_does_not_block(
         models.StockLedgerSupplierReceiptProvenance
     ).filter_by(ledger_generation_id=generation.id).one()
     assert provenance.match_status == "unmatched"
+
+
+def test_accepted_generation_can_ignore_customer_sale_expense_rows(db_session, monkeypatch):
+    generation, requirement = _synthetic(db_session, "ignored-customer-sale")
+    ignored = models.StockLedgerEntry(
+        ingest_batch_id=generation.physical_import_batch_id,
+        source_content_hash="ignored-customer-sale",
+        item_id=requirement.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        warehouse_ref1c="WH",
+        qty=Decimal("-2"),
+        posting_at=datetime(2026, 7, 21),
+        record_type="Expense",
+        movement_kind="supplier_return",
+        recorder_type="Document_РасходнаяНакладная",
+        recorder_ref="ignored-sale",
+        line_no="1",
+        ingest_source="test",
+    )
+    db_session.add(ignored)
+    db_session.commit()
+
+    ignored_id = int(ignored.id)
+    monkeypatch.setattr(
+        "app.services.item_ledger.generation_lifecycle."
+        "extract_supplier_document_evidence",
+        lambda *_args, **_kwargs: SupplierEvidenceExtractionResult(
+            evidence=(),
+            diagnostics=(),
+            ignored_stock_ledger_entries=(
+                SupplierReceiptExclusion(
+                    stock_ledger_entry_id=ignored_id,
+                    operation_key="8d970836-9934-11eb-e39a-fa163e61326a",
+                    operation_name="Продажа Покупателю",
+                ),
+            ),
+            fetched_document_count=1,
+        ),
+    )
+
+    result = accept_generation_build(
+        db_session,
+        generation.id,
+        replay_from=datetime(2026, 7, 1),
+        odata_client=object(),
+    )
+
+    assert result["status"] == "accepted"
+    assert result["supplier_receipt_evidence"] == 1
+    assert result["supplier_receipt_ignored_count"] == 1
+    assert Decimal(result["supplier_receipt_ignored_qty"]) == Decimal("-2")
+    assert Decimal(result["supplier_receipts"]["unplanned_qty"]) == Decimal("0")
+    assert Decimal(result["supplier_receipt_unplanned_qty"]) == Decimal("0")
+    provenance = db_session.query(
+        models.StockLedgerSupplierReceiptProvenance
+    ).filter_by(ledger_generation_id=generation.id).one()
+    assert provenance.match_status == "excluded_non_supplier"
+    assert provenance.operation_kind == "non_supplier_expense"
+    assert provenance.operation_key == "8d970836-9934-11eb-e39a-fa163e61326a"
+    assert provenance.match_rule == "supplier-receipt-non-supplier-exclusion"
+    assert provenance.reason == "non-supplier expense operation"
+    assert result["supplier_receipts"]["status_counts"]["excluded_non_supplier"] == 1
+
+
+def test_validation_rejects_supplier_receipt_candidate_rows_without_provenance(db_session):
+    generation, requirement = _synthetic(db_session, "missing-provenance")
+    _configure_obligation_checkpoint(
+        db_session,
+        generation,
+        requirement,
+        allow_unphased=False,
+        replay_allocated="0",
+    )
+    _add_matching_reservation_event(db_session, generation, requirement)
+    ignored = models.StockLedgerEntry(
+        ingest_batch_id=generation.physical_import_batch_id,
+        source_content_hash="missing-provenance",
+        item_id=requirement.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        warehouse_ref1c="WH",
+        qty=Decimal("-2"),
+        posting_at=datetime(2026, 7, 21),
+        record_type="Expense",
+        movement_kind="supplier_return",
+        recorder_type="Document_РасходнаяНакладная",
+        recorder_ref="missing-provenance",
+        line_no="1",
+        ingest_source="test",
+    )
+    db_session.add(ignored)
+    db_session.commit()
+
+    with pytest.raises(
+        GenerationValidationError,
+        match="supplier receipt evidence must cover all supplier candidate rows",
+    ):
+        validate_generation_build(db_session, generation.id)
+
+
+def test_accept_rejects_ignored_supplier_entries_if_not_candidate_rows(db_session, monkeypatch):
+    generation, requirement = _synthetic(db_session, "supplier-foreign-ignored")
+    db_session.add(models.StockLedgerEntry(
+        ingest_batch_id=generation.physical_import_batch_id,
+        source_content_hash="ignored-failure",
+        item_id=requirement.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        warehouse_ref1c="WH",
+        qty=Decimal("2"),
+        posting_at=datetime(2026, 7, 21),
+        record_type="Receipt",
+        movement_kind="supplier_receipt",
+        recorder_type="Document_ПриходнаяНакладная",
+        recorder_ref="missing-candidate",
+        line_no="1",
+        ingest_source="test",
+    ))
+    db_session.flush()
+
+    invalid_ignored_id = -1
+    monkeypatch.setattr(
+        "app.services.item_ledger.generation_lifecycle."
+        "extract_supplier_document_evidence",
+        lambda *_args, **_kwargs: SupplierEvidenceExtractionResult(
+            evidence=(),
+            diagnostics=(),
+            ignored_stock_ledger_entries=(
+                SupplierReceiptExclusion(
+                    stock_ledger_entry_id=invalid_ignored_id,
+                    operation_key="8d970836-9934-11eb-e39a-fa163e61326a",
+                    operation_name="Продажа Покупателю",
+                ),
+            ),
+            fetched_document_count=1,
+        ),
+    )
+
+    with pytest.raises(
+        GenerationValidationError,
+        match="ignored supplier stock entry ids must reference supplier candidates",
+    ):
+        accept_generation_build(
+            db_session,
+            generation.id,
+            replay_from=datetime(2026, 7, 1),
+            odata_client=object(),
+        )

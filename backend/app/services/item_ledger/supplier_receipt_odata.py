@@ -84,10 +84,18 @@ class SupplierEvidenceDiagnostic:
 
 
 @dataclass(frozen=True)
+class SupplierReceiptExclusion:
+    stock_ledger_entry_id: int
+    operation_key: str
+    operation_name: str
+
+
+@dataclass(frozen=True)
 class SupplierEvidenceExtractionResult:
     evidence: tuple[SupplierDocumentEvidence, ...]
     diagnostics: tuple[SupplierEvidenceDiagnostic, ...]
     fetched_document_count: int
+    ignored_stock_ledger_entries: tuple[SupplierReceiptExclusion, ...] = ()
 
 
 def _text(value: object) -> str:
@@ -329,6 +337,7 @@ def extract_supplier_document_evidence(
     } if item_ids else {}
 
     grouped: dict[tuple[str, str], list[models.StockLedgerEntry]] = {}
+    ignored_stock_ledger_entries: set[SupplierReceiptExclusion] = set()
     for entry in entries:
         grouped.setdefault(
             (_text(entry.recorder_type), _text(entry.recorder_ref)), []
@@ -387,6 +396,15 @@ def extract_supplier_document_evidence(
             operation_key,
             operation_name,
         ):
+            ignored_stock_ledger_entries.update(
+                SupplierReceiptExclusion(
+                    stock_ledger_entry_id=int(row.id),
+                    operation_key=operation_key,
+                    operation_name=operation_name,
+                )
+                for row in document_entries
+                if row.id is not None
+            )
             continue
         if not _strict_operation_matches(
             expected_operation, operation_key, operation_name
@@ -691,5 +709,15 @@ def extract_supplier_document_evidence(
     return SupplierEvidenceExtractionResult(
         evidence=tuple(evidence),
         diagnostics=tuple(diagnostics),
+        ignored_stock_ledger_entries=tuple(
+            sorted(
+                ignored_stock_ledger_entries,
+                key=lambda item: (
+                    item.stock_ledger_entry_id,
+                    item.operation_key,
+                    item.operation_name,
+                ),
+            ),
+        ),
         fetched_document_count=fetched,
     )

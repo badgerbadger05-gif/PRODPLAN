@@ -11,6 +11,7 @@ from app.services.item_ledger.supplier_receipt_allocation import (
 )
 from app.services.item_ledger.supplier_receipt_odata import (
     extract_supplier_document_evidence,
+    SupplierReceiptExclusion,
 )
 
 
@@ -429,6 +430,13 @@ def test_known_non_supplier_expense_operations_are_ignored_without_evidence_or_d
     )
 
     assert result.evidence == ()
+    assert result.ignored_stock_ledger_entries == (
+        SupplierReceiptExclusion(
+            stock_ledger_entry_id=entry.id,
+            operation_key=f"{operation_key}-9934-11eb-e39a-fa163e61326a",
+            operation_name=operation_name.strip(),
+        ),
+    )
     assert result.diagnostics == ()
 
 

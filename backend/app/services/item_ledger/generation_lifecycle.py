@@ -26,6 +26,7 @@ from .historical_replay_persistence import (
     _ALGORITHM_VERSION as REPLAY_ALGORITHM_VERSION,
     run_historical_replay,
 )
+from .physical import canonical_content_hash
 from .physical_visibility import visible_sles_for_generation
 from .supplier_receipt_allocation import rebuild_supplier_receipt_coverage
 from .supplier_receipt_odata import extract_supplier_document_evidence
@@ -239,6 +240,64 @@ def _supplier_candidates(
     )
 
 
+def _persist_non_supplier_receipt_rows(
+    db: Session,
+    *,
+    generation_id: int,
+    supplier_candidates: tuple[models.StockLedgerEntry, ...],
+    ignored_stock_ledger_entries: tuple[tuple[int, str, str], ...] = (),
+) -> None:
+    if not ignored_stock_ledger_entries:
+        return
+
+    candidate_by_id = {
+        int(row.id): row
+        for row in supplier_candidates
+        if row.id is not None
+    }
+
+    seen_ids: set[int] = set()
+    for ignored_id, operation_key, operation_name in ignored_stock_ledger_entries:
+        entry_id = int(ignored_id)
+        if entry_id not in candidate_by_id:
+            raise GenerationValidationError(
+                "ignored supplier stock entry ids must reference supplier candidates"
+            )
+        if entry_id in seen_ids:
+            continue
+        row = candidate_by_id[entry_id]
+        evidence_payload = {
+            "stock_ledger_entry_id": int(row.id),
+            "receipt_doc_type": str(row.recorder_type or ""),
+            "receipt_doc_ref": str(row.recorder_ref or ""),
+            "receipt_doc_line_no": str(row.line_no or ""),
+            "operation_key": operation_key,
+            "operation_name": operation_name,
+        }
+        db.add(models.StockLedgerSupplierReceiptProvenance(
+            ledger_generation_id=generation_id,
+            stock_ledger_entry_id=int(row.id),
+            receipt_doc_type=str(row.recorder_type or ""),
+            receipt_doc_ref=str(row.recorder_ref or ""),
+            receipt_doc_line_no=str(row.line_no or ""),
+            supplier_order_ref=None,
+            supplier_order_line_no=None,
+            operation_kind="non_supplier_expense",
+            operation_key=operation_key,
+            operation_name=operation_name,
+            correction_receipt_ref=None,
+            evidence_hash=canonical_content_hash(evidence_payload),
+            evidence_payload=evidence_payload,
+            match_rule="supplier-receipt-non-supplier-exclusion",
+            match_status="excluded_non_supplier",
+            ambiguity_count=0,
+            reason="non-supplier expense operation",
+        ))
+        seen_ids.add(entry_id)
+
+    db.flush()
+
+
 def validate_generation_build(
     db: Session,
     generation_id: int,
@@ -407,7 +466,16 @@ def validate_generation_build(
         raise GenerationValidationError("replay metrics disagree with persisted allocations")
 
     supplier_candidates = _supplier_candidates(db, int(generation.id))
-    supplier_physical_ids = {int(row.id) for row in supplier_candidates}
+    supplier_physical_ids = {
+        int(row.id)
+        for row in supplier_candidates
+        if row.id is not None
+    }
+    supplier_candidate_by_id = {
+        int(row.id): row
+        for row in supplier_candidates
+        if row.id is not None
+    }
     provenance = db.query(
         models.StockLedgerSupplierReceiptProvenance
     ).filter(
@@ -415,11 +483,20 @@ def validate_generation_build(
         == int(generation.id)
     ).all()
     provenance_ids = {int(row.stock_ledger_entry_id) for row in provenance}
+    if provenance_ids - supplier_physical_ids:
+        raise GenerationValidationError(
+            "supplier receipt provenance must reference supplier candidates"
+        )
     if provenance_ids != supplier_physical_ids:
         raise GenerationValidationError(
-            "supplier receipt evidence does not cover every physical row"
+            "supplier receipt evidence must cover all supplier candidate rows"
         )
-    allowed_supplier_statuses = {"exact", "unmatched", "ambiguous"}
+    allowed_supplier_statuses = {
+        "exact",
+        "unmatched",
+        "ambiguous",
+        "excluded_non_supplier",
+    }
     if any(
         str(row.match_status or "") not in allowed_supplier_statuses
         for row in provenance
@@ -427,14 +504,41 @@ def validate_generation_build(
         raise GenerationValidationError(
             "supplier receipt evidence has an invalid classification"
         )
+    if any(
+        str(row.operation_kind or "") != "non_supplier_expense"
+        or not str(row.operation_key or "").strip()
+        or not str(row.operation_name or "").strip()
+        or str(row.match_rule or "") != "supplier-receipt-non-supplier-exclusion"
+        or row.supplier_order_ref is not None
+        or row.supplier_order_line_no is not None
+        for row in provenance
+        if str(row.match_status or "") == "excluded_non_supplier"
+    ):
+        raise GenerationValidationError(
+            "non-supplier exclusion lacks explicit operation evidence"
+        )
+    excluded_ids = {
+        int(row.stock_ledger_entry_id)
+        for row in provenance
+        if str(row.match_status or "") == "excluded_non_supplier"
+    }
     supplier_status_counts = {
         status: sum(
             1 for row in provenance if str(row.match_status or "") == status
         )
         for status in sorted(allowed_supplier_statuses)
     }
+    supplier_relevant_ids = {
+        int(row.stock_ledger_entry_id)
+        for row in provenance
+        if str(row.match_status or "") != "excluded_non_supplier"
+    }
     supplier_physical_qty = sum(
-        (_d(row.qty) for row in supplier_candidates),
+        (_d(supplier_candidate_by_id[row_id].qty) for row_id in supplier_relevant_ids),
+        Decimal("0"),
+    )
+    supplier_ignored_qty = sum(
+        (_d(supplier_candidate_by_id[row_id].qty) for row_id in excluded_ids),
         Decimal("0"),
     )
     supplier_unplanned_qty = supplier_physical_qty - supplier_allocated_qty
@@ -473,6 +577,8 @@ def validate_generation_build(
         "reservation_events": len(events),
         "execution_allocations": len(allocations),
         "supplier_receipt_evidence": len(provenance),
+        "supplier_receipt_ignored_count": len(excluded_ids),
+        "supplier_receipt_ignored_qty": str(supplier_ignored_qty),
         "supplier_receipt_status_counts": supplier_status_counts,
         "supplier_receipt_unplanned_qty": str(supplier_unplanned_qty),
         "fact_qty": str(fact_qty),
@@ -521,6 +627,24 @@ def accept_generation_build(
             ledger_generation_id=int(generation.id),
             evidence=extraction.evidence if extraction is not None else (),
             cycle_id=f"historical-supplier:g{generation.id}:accept",
+        )
+        _persist_non_supplier_receipt_rows(
+            db,
+            generation_id=int(generation.id),
+            supplier_candidates=supplier_candidates,
+            ignored_stock_ledger_entries=(
+                tuple(
+                    (
+                        entry.stock_ledger_entry_id,
+                        entry.operation_key,
+                        entry.operation_name,
+                    )
+                    for entry in (
+                        extraction.ignored_stock_ledger_entries
+                        if extraction is not None else ()
+                    )
+                )
+            ),
         )
         validation = validate_generation_build(
             db,

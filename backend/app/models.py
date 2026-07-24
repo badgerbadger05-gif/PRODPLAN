@@ -2731,12 +2731,13 @@ class StockLedgerSupplierReceiptProvenance(Base):
             name="uq_supplier_receipt_provenance_generation_sle",
         ),
         CheckConstraint(
-            "match_status IN ('exact', 'ambiguous', 'unmatched')",
+            "match_status IN ('exact', 'ambiguous', 'unmatched', "
+            "'excluded_non_supplier')",
             name="ck_supplier_receipt_provenance_match_status",
         ),
         CheckConstraint(
             "operation_kind IN ('supplier_receipt', 'correction', "
-            "'supplier_return', 'transfer', 'unknown')",
+            "'supplier_return', 'transfer', 'non_supplier_expense', 'unknown')",
             name="ck_supplier_receipt_provenance_operation_kind",
         ),
         CheckConstraint(
@@ -2749,6 +2750,11 @@ class StockLedgerSupplierReceiptProvenance(Base):
             "OR (match_status = 'ambiguous' AND ambiguity_count > 1 "
             "AND reason IS NOT NULL) "
             "OR (match_status = 'unmatched' AND ambiguity_count = 0 "
+            "AND reason IS NOT NULL) "
+            "OR (match_status = 'excluded_non_supplier' AND supplier_order_ref IS NULL "
+            "AND supplier_order_line_no IS NULL AND ambiguity_count = 0 "
+            "AND operation_kind = 'non_supplier_expense' "
+            "AND operation_key IS NOT NULL AND operation_name IS NOT NULL "
             "AND reason IS NOT NULL)",
             name="ck_supplier_receipt_provenance_match_evidence",
         ),
@@ -2808,7 +2814,7 @@ class StockLedgerSupplierReceiptProvenance(Base):
         server_default=text("'{}'"),
     )
     match_rule = Column(String(64), nullable=False)
-    match_status = Column(String(16), nullable=False)
+    match_status = Column(String(32), nullable=False)
     ambiguity_count = Column(Integer, nullable=False, server_default="0")
     reason = Column(TEXT, nullable=True)
     created_at = Column(
