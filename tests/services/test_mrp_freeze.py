@@ -57,6 +57,28 @@ def _seal(target, parents, candidates):
     }
 
 
+def _freeze_candidate_generation(db, *, suffix: str = "scope"):
+    physical = models.PhysicalImportBatch(
+        batch_key=f"freeze-physical-{suffix}",
+        status="completed",
+        cutoff=CUTOFF,
+        source_watermarks={},
+        completed_at=CUTOFF,
+    )
+    generation = models.LedgerGeneration(
+        generation_key=f"freeze-target-{suffix}",
+        status="building",
+        cutoff=CUTOFF,
+        source_watermarks={},
+        capabilities={"physical_ledger": True},
+        physical_import_batch=physical,
+        algorithm_version="tests",
+    )
+    db.add_all([physical, generation])
+    db.flush()
+    return generation
+
+
 def _item(db, code, *, method="Покупка"):
     row = models.Item(
         item_code=code,
@@ -380,3 +402,80 @@ def test_pool_key_normalises_to_default():
 def test_build_shared_pools_requires_explicit_ledger_generation(db_session):
     with pytest.raises(TypeError):
         build_shared_pools(db_session, [])
+
+
+def test_build_shared_pools_ignores_ignored_and_unselected_warehouses(db_session):
+    item = _item(db_session, "SCOPE-OK")
+    target = _freeze_candidate_generation(db_session, suffix="non-block")
+
+    db_session.add_all([
+        models.StockWarehouse(warehouse_ref1c="WH-SELECTED", warehouse_name="Selected", is_selected=True),
+        models.StockWarehouse(warehouse_ref1c="WH-UNSELECTED", warehouse_name="Unselected", is_selected=False),
+        models.StockWarehouse(warehouse_ref1c="WH-IGNORED", warehouse_name="Ignored", is_selected=True),
+    ])
+    db_session.add(models.IgnoredWarehouse(warehouse_ref1c="WH-IGNORED", warehouse_name="Ignored"))
+    db_session.add_all([
+        models.StockBin(
+            ledger_generation_id=target.id,
+            item_id=item.item_id,
+            characteristic_ref="",
+            organization_ref="",
+            warehouse_ref1c="WH-SELECTED",
+            on_hand=10,
+        ),
+        models.StockBin(
+            ledger_generation_id=target.id,
+            item_id=item.item_id,
+            characteristic_ref="",
+            organization_ref="ORG-UNSELECTED",
+            warehouse_ref1c="WH-UNSELECTED",
+            on_hand=7,
+        ),
+        models.StockBin(
+            ledger_generation_id=target.id,
+            item_id=item.item_id,
+            characteristic_ref="",
+            organization_ref="ORG-IGNORED",
+            warehouse_ref1c="WH-IGNORED",
+            on_hand=5,
+        ),
+    ])
+    db_session.flush()
+
+    pools = build_shared_pools(
+        db_session,
+        [],
+        ledger_generation_id=target.id,
+        relevant_item_ids=[item.item_id],
+    )
+
+    assert pools.stock[item.item_id] == pytest.approx(10)
+
+
+def test_build_shared_pools_rejects_foreign_org_in_selected_warehouse(db_session):
+    item = _item(db_session, "SCOPE-BLOCK")
+    target = _freeze_candidate_generation(db_session, suffix="block")
+    db_session.add(
+        models.StockWarehouse(
+            warehouse_ref1c="WH-SELECTED", warehouse_name="Selected", is_selected=True
+        )
+    )
+    db_session.add(
+        models.StockBin(
+            ledger_generation_id=target.id,
+            item_id=item.item_id,
+            characteristic_ref="",
+            organization_ref="ORG-FOREIGN",
+            warehouse_ref1c="WH-SELECTED",
+            on_hand=10,
+        )
+    )
+    db_session.flush()
+
+    with pytest.raises(LedgerPoolUnavailable, match="characteristic/organization physical pools"):
+        build_shared_pools(
+            db_session,
+            [],
+            ledger_generation_id=target.id,
+            relevant_item_ids=[item.item_id],
+        )

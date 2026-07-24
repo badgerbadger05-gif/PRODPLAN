@@ -272,6 +272,58 @@ def _own_supplier_order_ids(db: Session, active_run_ids: Iterable[int]) -> Set[i
     }
 
 
+@dataclass(frozen=True)
+class _MrpWarehouseScope:
+    has_warehouse_rows: bool
+    selected_refs: Set[str]
+    ignored_refs: Set[str]
+    finished_refs: Set[str]
+
+
+def _mrp_warehouse_scope(db: Session) -> _MrpWarehouseScope:
+    ignored_refs = {
+        str(ref)
+        for (ref,) in db.query(IgnoredWarehouse.warehouse_ref1c).all()
+        if ref
+    }
+    warehouse_rows = db.query(
+        StockWarehouse.warehouse_ref1c,
+        StockWarehouse.is_selected,
+        StockWarehouse.is_finished_goods,
+    ).all()
+    selected_refs = {
+        str(ref)
+        for ref, selected, finished in warehouse_rows
+        if ref and bool(selected) and not bool(finished)
+    }
+    finished_refs = {
+        str(ref) for ref, _selected, finished in warehouse_rows if ref and bool(finished)
+    }
+    return _MrpWarehouseScope(
+        has_warehouse_rows=bool(warehouse_rows),
+        selected_refs=selected_refs,
+        ignored_refs=ignored_refs,
+        finished_refs=finished_refs,
+    )
+
+
+def _apply_mrp_warehouse_scope(
+    query: Any,
+    scope: _MrpWarehouseScope,
+):
+    if scope.has_warehouse_rows:
+        query = (
+            query.filter(StockBin.warehouse_ref1c.in_(scope.selected_refs))
+            if scope.selected_refs
+            else query.filter(False)
+        )
+    if scope.ignored_refs:
+        query = query.filter(~StockBin.warehouse_ref1c.in_(scope.ignored_refs))
+    if scope.finished_refs:
+        query = query.filter(~StockBin.warehouse_ref1c.in_(scope.finished_refs))
+    return query
+
+
 # ---------------------------------------------------------------------------
 # §3 — pool construction (ONCE for the whole queue)
 # ---------------------------------------------------------------------------
@@ -368,37 +420,11 @@ def build_shared_pools(
 
 def _ledger_stock_by_item_all(db: Session, ledger_generation_id: int) -> Dict[int, float]:
     """Read planning stock from one exact accepted generation, with no fallback."""
-    ignored_refs = {
-        str(ref)
-        for (ref,) in db.query(IgnoredWarehouse.warehouse_ref1c).all()
-        if ref
-    }
-    warehouse_rows = db.query(
-        StockWarehouse.warehouse_ref1c,
-        StockWarehouse.is_selected,
-        StockWarehouse.is_finished_goods,
-    ).all()
-    selected_refs = {
-        str(ref)
-        for ref, selected, finished in warehouse_rows
-        if ref and bool(selected) and not bool(finished)
-    }
-    finished_refs = {
-        str(ref) for ref, _selected, finished in warehouse_rows if ref and bool(finished)
-    }
+    scope = _mrp_warehouse_scope(db)
     query = db.query(StockBin.item_id, func.sum(StockBin.on_hand)).filter(
         StockBin.ledger_generation_id == int(ledger_generation_id)
     )
-    if warehouse_rows:
-        query = (
-            query.filter(StockBin.warehouse_ref1c.in_(selected_refs))
-            if selected_refs
-            else query.filter(False)
-        )
-    if ignored_refs:
-        query = query.filter(~StockBin.warehouse_ref1c.in_(ignored_refs))
-    if finished_refs:
-        query = query.filter(~StockBin.warehouse_ref1c.in_(finished_refs))
+    query = _apply_mrp_warehouse_scope(query, scope)
     return {
         int(item_id): _to_float(qty)
         for item_id, qty in query.group_by(StockBin.item_id).all()
@@ -424,8 +450,8 @@ def _reject_incompatible_physical_pools(
             func.abs(StockBin.on_hand) > EPS,
         )
         .distinct()
-        .all()
     )
+    rows = _apply_mrp_warehouse_scope(rows, _mrp_warehouse_scope(db)).all()
     pools: Dict[int, Set[Tuple[str, str]]] = defaultdict(set)
     for item_id, characteristic_ref, organization_ref in rows:
         pools[int(item_id)].add(
