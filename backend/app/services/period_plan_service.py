@@ -269,7 +269,14 @@ def list_period_plans(
                     continue
                 summary = dict(payload.get("summary") or {})
                 execution_by_plan[payload_plan_id] = {
-                    "execution_pct": summary.get("execution_pct"),
+                    "execution_pct": (
+                        summary.get("execution_pct")
+                        if summary.get("execution_pct") is not None
+                        else summary.get("execution_confirmed_pct")
+                    ),
+                    "execution_partial": bool(
+                        summary.get("execution_partial", False)
+                    ),
                     "execution_completed_qty": summary.get("execution_completed_qty"),
                     "execution_base_qty": summary.get("execution_base_qty"),
                     "execution_status": str(payload.get("truth_status") or ""),
@@ -288,6 +295,7 @@ def list_period_plans(
                     int(plan.id),
                     {
                         "execution_pct": None,
+                        "execution_partial": False,
                         "execution_completed_qty": None,
                         "execution_base_qty": None,
                         "execution_status": "unavailable",
@@ -2004,8 +2012,10 @@ def _execution_row_summary(
     total_items = 0
     execution_completed_qty = 0.0
     execution_base_qty = 0.0
+    execution_total_base_qty = 0.0
     execution_by_flow: Dict[str, Dict[str, float]] = {}
     execution_available_items = 0
+    execution_has_unavailable = False
     fully_covered = 0
     partially_covered = 0
     not_covered = 0
@@ -2016,6 +2026,7 @@ def _execution_row_summary(
         completed_qty = _to_float(row.get("completed_qty"))
         base_qty = _to_float(row.get("progress_base_qty", row.get("net_qty")))
         item_flow = str(row.get("flow") or "")
+        execution_total_base_qty += base_qty
         if execution_available:
             execution_available_items += 1
             execution_completed_qty += completed_qty
@@ -2025,13 +2036,16 @@ def _execution_row_summary(
             {
                 "completed_qty": 0.0,
                 "base_qty": 0.0,
+                "total_base_qty": 0.0,
                 "available": True,
             },
         )
+        flow_summary["total_base_qty"] += base_qty
         if execution_available:
             flow_summary["completed_qty"] += completed_qty
             flow_summary["base_qty"] += base_qty
         else:
+            execution_has_unavailable = True
             flow_summary["available"] = False
         status = str(row.get("status") or "")
         if status == "net_zero":
@@ -2042,9 +2056,14 @@ def _execution_row_summary(
             partially_covered += 1
         else:
             not_covered += 1
+    execution_confirmed_pct = (
+        round(execution_completed_qty / execution_total_base_qty * 100.0, 1)
+        if execution_total_base_qty > 1e-9
+        else (100.0 if execution_available_items > 0 else None)
+    )
     execution_pct = (
         None
-        if execution_available_items == 0 and total_items > 0
+        if execution_has_unavailable
         else (
             round(execution_completed_qty / execution_base_qty * 100.0, 1)
             if execution_base_qty > 1e-9
@@ -2053,6 +2072,17 @@ def _execution_row_summary(
     )
     for details in execution_by_flow.values():
         if not bool(details.get("available", True)):
+            total_base_qty = _to_float(details.get("total_base_qty"))
+            details["confirmed_pct"] = (
+                round(
+                    _to_float(details.get("completed_qty"))
+                    / total_base_qty
+                    * 100.0,
+                    1,
+                )
+                if total_base_qty > 1e-9
+                else None
+            )
             details["execution_pct"] = None
             continue
         base_qty = _to_float(details.get("base_qty"))
@@ -2065,8 +2095,11 @@ def _execution_row_summary(
         "truth_status": "accepted",
         "total_items": total_items,
         "execution_completed_qty": execution_completed_qty,
-        "execution_base_qty": execution_base_qty,
+        "execution_base_qty": execution_total_base_qty,
+        "execution_available_base_qty": execution_base_qty,
         "execution_pct": execution_pct,
+        "execution_confirmed_pct": execution_confirmed_pct,
+        "execution_partial": execution_has_unavailable,
         "execution_by_flow": execution_by_flow,
         "fully_covered": fully_covered,
         "partially_covered": partially_covered,
