@@ -960,6 +960,12 @@ def test_replay_uses_gross_capacity_for_consume_when_bucket_net_is_zero(db_sessi
         ingest_batch_id=generation.physical_import_batch_id
     ).one()
     _address_fact_to_requirement(db_session, fact, reservation)
+    _append_obligation_batch(
+        db_session,
+        generation,
+        requirement_id=int(reservation.requirement_id),
+        allow_unphased=True,
+    )
 
     result = run_historical_replay(db_session, generation.id)
 

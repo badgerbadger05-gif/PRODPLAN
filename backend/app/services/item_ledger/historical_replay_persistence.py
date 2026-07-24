@@ -462,7 +462,10 @@ def run_historical_replay(
             slices: list[tuple[int | None, Decimal]] = []
             left = _decimal(allocation.qty)
             if buckets:
-                if int(entry.requirement_id) in legacy_unphased_requirement_ids:
+                if (
+                    mode == "make"
+                    and int(entry.requirement_id) in legacy_unphased_requirement_ids
+                ):
                     slices = [(None, left)]
                 else:
                     for bucket in buckets:
