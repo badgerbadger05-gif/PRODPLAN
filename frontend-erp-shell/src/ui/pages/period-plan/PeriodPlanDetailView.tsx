@@ -48,6 +48,8 @@ import { ForecastShift } from './ForecastShift'
 
 type Tab = 'matrix' | 'journal'
 
+type JournalCoverageFilter = '' | 'covered' | 'partial' | 'ordered' | 'none' | 'net_zero' | 'incomplete'
+
 interface DetailViewProps {
   planId: number
   onBack: () => void
@@ -97,7 +99,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   const [journalError, setJournalError] = useState('')
   const [journalFlow, setJournalFlow] = useState('')
   const [journalBomLevel, setJournalBomLevel] = useState<string>('')
-  const [journalCoverage, setJournalCoverage] = useState<string>('')
+  const [journalCoverage, setJournalCoverage] = useState<JournalCoverageFilter>('')
   const [journalShowNetZero, setJournalShowNetZero] = useState(false)
   const [journalRootItemId, setJournalRootItemId] = useState<number | null>(null)
   const [journalRootDialogOpen, setJournalRootDialogOpen] = useState(false)
@@ -571,7 +573,14 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
       rows = rows.filter((r) => journalRowStatus(r) !== 'net_zero')
     }
     if (journalCoverage) {
-      rows = rows.filter((r) => journalRowStatus(r) === journalCoverage)
+      if (journalCoverage === 'incomplete') {
+        rows = rows.filter((r) => {
+          const status = journalRowStatus(r)
+          return status === 'partial' || status === 'ordered' || status === 'none'
+        })
+      } else {
+        rows = rows.filter((r) => journalRowStatus(r) === journalCoverage)
+      }
     }
     const dir = journalSortDir === 'asc' ? 1 : -1
     rows.sort((a, b) => {
@@ -594,6 +603,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   const journalExecutionPct = useMemo(() => {
     if (!journal || !isPlanningTruthAccepted(journal)) return null
     if (typeof journal.summary.execution_pct === 'number') return journal.summary.execution_pct
+    if (journal.summary.execution_pct === null) return null
     const base = journal.rows.reduce((sum, row) => sum + (row.progress_base_qty ?? row.net_qty ?? 0), 0)
     if (base <= 1e-9) return 100
     const completed = journal.rows.reduce((sum, row) => sum + (row.completed_qty ?? 0), 0)
@@ -601,17 +611,18 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   }, [journal])
 
   const journalExecutionByFlow = useMemo(() => {
-    if (!journal || !isPlanningTruthAccepted(journal)) return [] as Array<{ flow: string; label: string; pct: number; base: number }>
+    if (!journal || !isPlanningTruthAccepted(journal)) return [] as Array<{ flow: string; label: string; pct: number | null; base: number; available: boolean }>
     const source = journal.summary.execution_by_flow
     if (source) {
       return ['purchase', 'production', 'rework']
         .map((flow) => ({
           flow,
           label: flowLabel(flow),
-          pct: source[flow]?.execution_pct ?? 100,
+          pct: source[flow]?.execution_pct ?? null,
           base: source[flow]?.base_qty ?? 0,
+          available: source[flow]?.available !== false,
         }))
-        .filter((row) => row.base > 1e-9)
+        .filter((row) => row.base > 1e-9 || !row.available)
     }
     const grouped = new Map<string, { completed: number; base: number }>()
     journal.rows.forEach((row) => {
@@ -626,7 +637,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
         const entry = grouped.get(flow)
         const base = entry?.base ?? 0
         const pct = base > 1e-9 ? Math.round(((entry?.completed ?? 0) / base) * 1000) / 10 : 100
-        return { flow, label: flowLabel(flow), pct, base }
+        return { flow, label: flowLabel(flow), pct, base, available: true }
       })
       .filter((row) => row.base > 1e-9)
   }, [journal])
@@ -1143,7 +1154,9 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                     <span className="toolbarText" title="Выполнено / чистая потребность по всем строкам">Общее выполнение: {journalExecutionPct}%</span>
                   )}
                   {journalExecutionByFlow.map((row) => (
-                    <span key={row.flow} className="toolbarText">{row.label}: {row.pct}%</span>
+                    <span key={row.flow} className="toolbarText">
+                      {row.label}: {row.available && row.pct !== null ? `${row.pct}%` : 'недоступно'}
+                    </span>
                   ))}
                   <button
                     className="filterBtn"
@@ -1170,6 +1183,16 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                       title="Показать только частично выполненные строки"
                     >
                       Частично: {journal.summary.partially_covered}
+                    </button>
+                  )}
+                  {journal.summary.not_covered + journal.summary.partially_covered > 0 && (
+                    <button
+                      className="filterBtn"
+                      style={{ color: 'var(--red)' }}
+                      onClick={() => setJournalCoverage((v) => (v === 'incomplete' ? '' : 'incomplete'))}
+                      title="Показать строки с неполным выполнением"
+                    >
+                      Невыполнено: {journal.summary.not_covered + journal.summary.partially_covered}
                     </button>
                   )}
                   {journal.summary.net_zero > 0 && (
@@ -1253,12 +1276,13 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                       <td>
                         <label className="columnFilterControl">
                           <span>Статус</span>
-                          <select value={journalCoverage} onChange={(e) => setJournalCoverage(e.target.value)}>
+                          <select value={journalCoverage} onChange={(e) => setJournalCoverage(e.target.value as JournalCoverageFilter)}>
                             <option value="">Все</option>
                             <option value="covered">Закрыто</option>
                             <option value="partial">Частично</option>
                             <option value="ordered">Оформлено</option>
                             <option value="none">Не оформлено</option>
+                            <option value="incomplete">Невыполнено</option>
                             <option value="net_zero">Покрыто складом</option>
                           </select>
                         </label>
@@ -1331,7 +1355,13 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                           >
                             {row.ordered_qty > 0 || (row.unassigned_qty ?? 0) > 0 ? qty(row.ordered_qty) : <span className="muted">—</span>}
                           </td>
-                          <td className="numCell">{journalTruthAccepted && row.completed_qty > 0 ? qty(row.completed_qty) : <span className="muted">—</span>}</td>
+                          <td className="numCell">
+                            {journalTruthAccepted && row.execution_available === false
+                              ? <span className="muted" title={row.execution_unavailable_reason ?? undefined}>н/д</span>
+                              : journalTruthAccepted && (row.completed_qty ?? 0) > 0
+                                ? qty(row.completed_qty ?? 0)
+                                : <span className="muted">—</span>}
+                          </td>
                           <td className="numCell" style={{ color: row.remaining_qty > 0 ? 'var(--red)' : undefined }}>
                             {journalTruthAccepted && row.remaining_qty > 0 ? qty(row.remaining_qty) : '—'}
                           </td>
@@ -1347,7 +1377,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                               : <span className="muted">Недоступно</span>}
                           </td>
                           <td style={{ textAlign: 'center' }}>
-                            {journalTruthAccepted
+                            {journalTruthAccepted && row.coverage_pct !== null
                               ? <span className={`miniPill ${coverageClass(row.coverage_pct)}`}>{row.coverage_pct}%</span>
                               : <span className="muted">—</span>}
                           </td>

@@ -168,6 +168,11 @@ export type PeriodPlan = {
   updated_at?: string | null
   line_count?: number
   total_qty?: number
+  execution_completed_qty?: number | null
+  execution_base_qty?: number | null
+  execution_pct?: number | null
+  execution_status?: string | null
+  execution_reason?: string | null
 }
 
 export type PeriodPlanListResponse = {
@@ -264,12 +269,15 @@ export type ExecutionJournalRow = {
   stock_qty?: number
   net_qty: number
   ordered_qty: number
-  completed_qty: number
+  completed_qty: number | null
   covered_qty: number
   remaining_qty: number
   unassigned_qty?: number
   progress_base_qty?: number
-  coverage_pct: number
+  coverage_pct: number | null
+  execution_available?: boolean
+  execution_unavailable_reason?: string | null
+  execution_source?: 'reservation_realization' | 'supplier_receipt_coverage' | string
   need_date?: string | null
   status?: JournalRowStatus
   forecast_date?: string | null
@@ -285,7 +293,7 @@ export function journalRowStatus(row: Pick<ExecutionJournalRow, 'status' | 'net_
   if (row.status) return row.status
   if (row.net_qty <= 0) return 'net_zero'
   if (row.remaining_qty <= 0) return 'covered'
-  if (row.completed_qty > 0) return 'partial'
+  if ((row.completed_qty ?? 0) > 0) return 'partial'
   if (row.ordered_qty > 0) return 'ordered'
   return 'none'
 }
@@ -315,7 +323,12 @@ export type ExecutionJournalSummary = {
   execution_completed_qty?: number | null
   execution_base_qty?: number | null
   execution_pct?: number | null
-  execution_by_flow?: Record<string, { completed_qty: number; base_qty: number; execution_pct: number }> | null
+  execution_by_flow?: Record<string, {
+    completed_qty: number
+    base_qty: number
+    execution_pct: number | null
+    available?: boolean
+  }> | null
 }
 
 export type PlanningTruthStatus = 'accepted' | 'unavailable' | 'stale' | 'uninitialized' | 'rejected'

@@ -149,6 +149,79 @@ const journalResponseWithLedgerLinks: ExecutionJournalResponse = {
   ],
 }
 
+const journalResponseMixed: ExecutionJournalResponse = {
+  ...journalResponse,
+  rows: [
+    {
+      req_id: 1,
+      item_id: 501,
+      item_code: 'C-501',
+      item_name: 'Насос ГА-1',
+      item_article: 'ART-501',
+      flow: 'production',
+      bom_level: 0,
+      gross_qty: 10,
+      stock_qty: 0,
+      net_qty: 10,
+      ordered_qty: 4,
+      completed_qty: 10,
+      covered_qty: 10,
+      remaining_qty: 0,
+      unassigned_qty: 0,
+      coverage_pct: 100,
+      need_date: '2026-05-15',
+      work_items: [],
+    },
+    {
+      req_id: 2,
+      item_id: 502,
+      item_code: 'C-502',
+      item_name: 'Фильтр ГА-2',
+      item_article: 'ART-502',
+      flow: 'production',
+      bom_level: 0,
+      gross_qty: 12,
+      stock_qty: 0,
+      net_qty: 12,
+      ordered_qty: 0,
+      completed_qty: 0,
+      covered_qty: 0,
+      remaining_qty: 12,
+      unassigned_qty: 12,
+      coverage_pct: 0,
+      need_date: '2026-05-16',
+      work_items: [],
+    },
+    {
+      req_id: 3,
+      item_id: 503,
+      item_code: 'C-503',
+      item_name: 'Клапан ГА-3',
+      item_article: 'ART-503',
+      flow: 'purchase',
+      bom_level: 0,
+      gross_qty: 8,
+      stock_qty: 0,
+      net_qty: 8,
+      ordered_qty: 3,
+      completed_qty: 0,
+      covered_qty: 0,
+      remaining_qty: 5,
+      unassigned_qty: 5,
+      coverage_pct: 0,
+      need_date: '2026-05-17',
+      work_items: [],
+    },
+  ],
+  summary: {
+    total_items: 3,
+    fully_covered: 1,
+    partially_covered: 0,
+    not_covered: 2,
+    net_zero: 0,
+  },
+}
+
 const listPlanA: PeriodPlan = {
   id: 101,
   name: 'АПРЕЛЬ 2026',
@@ -161,12 +234,15 @@ const listPlanA: PeriodPlan = {
   fixed_at: null,
   fixed_by: null,
   line_count: 3,
+  execution_pct: 62.9,
 }
 const listPlanB: PeriodPlan = {
   ...listPlanA,
   id: 102,
   name: 'МАРТ 2026',
   status: 'archived',
+  execution_pct: null,
+  execution_reason: 'Нет данных',
 }
 
 const searchItem: NomenclatureSearchItem = {
@@ -232,6 +308,9 @@ describe('PeriodPlanPage — list view', () => {
     expect(screen.getByRole('button', { name: 'Новый план' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /Название/ })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: /^Статус/ })).toBeInTheDocument()
+    expect(screen.getByText('Выполнение')).toBeInTheDocument()
+    expect(screen.getByText('62,9%')).toBeInTheDocument()
+    expect(screen.getByText('Недоступно: Нет данных')).toBeInTheDocument()
   })
 
   it('shows the empty state when no plans are returned', async () => {
@@ -397,6 +476,36 @@ describe('PeriodPlanPage — detail view', () => {
       'href',
       '#/mrp-runs/900?tab=production&planned_order_id=77',
     )
+  })
+
+  it('filters journal rows by incomplete status via button and dropdown', async () => {
+    const user = userEvent.setup()
+    vi.mocked(periodPlanSvc.getExecutionJournal).mockResolvedValue(journalResponseMixed)
+    renderAt('/period-plan/123')
+
+    await user.click(screen.getByRole('button', { name: 'Журнал исполнения' }))
+    expect(await screen.findByText('Фильтр ГА-2')).toBeInTheDocument()
+    expect(screen.getByText('Клапан ГА-3')).toBeInTheDocument()
+
+    const incompleteButton = screen.getByRole('button', { name: /Невыполнено: 2/ })
+    await user.click(incompleteButton)
+
+    expect(screen.queryByText('Насос ГА-1')).not.toBeInTheDocument()
+    expect(screen.getByText('Фильтр ГА-2')).toBeInTheDocument()
+    expect(screen.getByText('Клапан ГА-3')).toBeInTheDocument()
+
+    await user.click(incompleteButton)
+
+    const statusSelect = screen.getAllByRole('combobox').find((node) => (
+      Array.from((node as HTMLSelectElement).options).some((option) => option.value === 'incomplete')
+    )) as HTMLSelectElement | undefined
+    expect(statusSelect).toBeDefined()
+    if (statusSelect) {
+      await user.selectOptions(statusSelect, 'incomplete')
+    }
+    expect(screen.queryByText('Насос ГА-1')).not.toBeInTheDocument()
+    expect(screen.getByText('Фильтр ГА-2')).toBeInTheDocument()
+    expect(screen.getByText('Клапан ГА-3')).toBeInTheDocument()
   })
 
   it('fails closed when execution truth is unavailable', async () => {

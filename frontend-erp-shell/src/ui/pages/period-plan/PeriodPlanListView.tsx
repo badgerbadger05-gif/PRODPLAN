@@ -25,7 +25,7 @@ const periodPlanListColumns = [
   { key: 'fixed_by', title: 'Кем', width: 110, minWidth: 110, grow: false, sortable: false },
   { key: 'created_at', title: 'Создан', width: 140, minWidth: 140, grow: false, sortable: true },
   { key: 'line_count', title: 'Строк', width: 64, minWidth: 64, grow: false, align: 'right', sortable: false },
-  { key: 'comment', title: 'Комментарий', minWidth: 240, grow: true, sortable: false },
+  { key: 'execution', title: 'Выполнение', minWidth: 140, grow: true, sortable: false },
 ] as const satisfies TableColumnDoctype[]
 
 export function PeriodPlanListView({ onOpenPlan }: ListViewProps) {
@@ -56,6 +56,21 @@ export function PeriodPlanListView({ onOpenPlan }: ListViewProps) {
   const selected = plans.find((p) => p.id === selectedId) ?? null
   const canDelete = selected?.status !== 'archived' // backend will reject if there are SUCCESS MRP runs
   const dateOrderInvalid = !!(newFrom && newTo && newFrom > newTo)
+
+  function executionPillClass(pct: number) {
+    if (pct >= 100) return 'ready'
+    if (pct > 0) return 'partial'
+    return 'shortage'
+  }
+
+  function executionText(plan: PeriodPlan) {
+    if (typeof plan.execution_pct !== 'number' || !Number.isFinite(plan.execution_pct)) {
+      return <span className="muted">{plan.execution_reason ? `Недоступно: ${plan.execution_reason}` : 'Недоступно'}</span>
+    }
+    const value = Math.max(0, plan.execution_pct)
+    const pct = Math.min(100, value).toLocaleString('ru-RU', { maximumFractionDigits: 1 })
+    return <span className={`miniPill ${executionPillClass(value)}`}>{pct}%</span>
+  }
 
   const loadList = useCallback(async (nextOffset: number) => {
     setLoading(true)
@@ -328,7 +343,7 @@ export function PeriodPlanListView({ onOpenPlan }: ListViewProps) {
                   <td><span className="muted">{plan.fixed_by ?? plan.created_by ?? '—'}</span></td>
                   <td><span className="muted">{plan.created_at ? dateTimeRu(plan.created_at) : '—'}</span></td>
                   <td style={{ textAlign: 'right' }}><strong>{plan.line_count ?? 0}</strong></td>
-                  <td><span className="muted">{plan.comment ?? '—'}</span></td>
+                  <td>{executionText(plan)}</td>
                 </tr>
               ))}
               {!loading && !plans.length && (
