@@ -606,6 +606,204 @@ def test_validation_rejects_non_make_legacy_bucketless_flag(
         validate_generation_build(db_session, generation.id)
 
 
+def test_validation_uses_gross_capacity_for_consume_allocation(
+    db_session,
+):
+    generation, requirement = _synthetic(
+        db_session,
+        "validate-consume-gross",
+        replenishment_method="Производство",
+    )
+    _configure_obligation_checkpoint(
+        db_session,
+        generation,
+        requirement,
+        allow_unphased=False,
+        replay_allocated="26",
+    )
+    make_reservation = db_session.query(models.ReservationEntry).filter_by(
+        ledger_generation_id=generation.id,
+    ).one()
+    make_reservation.reserved_qty = Decimal("0")
+    make_reservation.realized_qty = Decimal("0")
+    consume_reservation = models.ReservationEntry(
+        ledger_generation_id=generation.id,
+        item_id=make_reservation.item_id,
+        characteristic_ref=make_reservation.characteristic_ref,
+        organization_ref=make_reservation.organization_ref,
+        planning_stock_pool=make_reservation.planning_stock_pool,
+        run_id=make_reservation.run_id,
+        freeze_version=1,
+        requirement_id=make_reservation.requirement_id,
+        priority_period_from=make_reservation.priority_period_from,
+        priority_period_to=make_reservation.priority_period_to,
+        realization_mode="consume",
+        reserved_qty=Decimal("26"),
+        realized_qty=Decimal("26"),
+        lifecycle_status="active",
+    )
+    db_session.add(consume_reservation)
+    db_session.flush()
+    bucket = db_session.query(models.MrpRequirementBucket).filter_by(
+        requirement_id=requirement.id,
+    ).one()
+    bucket.gross_qty = Decimal("26")
+    bucket.net_qty = Decimal("0")
+    fact = db_session.query(models.StockLedgerEntry).filter_by(
+        ingest_batch_id=generation.physical_import_batch_id,
+    ).one()
+    db_session.add_all([
+        models.ReservationEvent(
+            ledger_generation_id=generation.id,
+            reservation_id=consume_reservation.id,
+            item_id=consume_reservation.item_id,
+            characteristic_ref=consume_reservation.characteristic_ref,
+            organization_ref=consume_reservation.organization_ref,
+            planning_stock_pool=consume_reservation.planning_stock_pool,
+            event_kind="realize",
+            reserved_delta=Decimal("26"),
+            realized_delta=Decimal("26"),
+            sle_id=fact.id,
+            fact_ref=fact.recorder_ref,
+            fact_line_ref=fact.line_no,
+            match_rule="fifo",
+            cycle_id=f"historical-replay:g{generation.id}",
+            idempotency_key=f"consume-alloc:g{generation.id}:sle{fact.id}:r{consume_reservation.id}",
+            event_at=fact.posting_at,
+        ),
+        models.MrpExecutionAllocation(
+            ledger_generation_id=generation.id,
+            cycle_id=f"historical-replay:g{generation.id}",
+            requirement_id=requirement.id,
+            bucket_id=bucket.id,
+            fact_type="component_consumption",
+            allocation_kind="execution",
+            fact_ref=fact.recorder_ref,
+            fact_line_ref=fact.line_no,
+            fact_date=fact.posting_at,
+            allocated_qty=Decimal("26"),
+        ),
+    ])
+    db_session.flush()
+
+    result = validate_generation_build(db_session, generation.id)
+    assert result["valid"] is True
+    assert result["execution_allocations"] == 1
+
+
+def test_validation_isolates_bucket_capacity_by_mode_in_single_bucket(db_session):
+    generation, requirement = _synthetic(
+        db_session,
+        "validate-mode-isolated",
+        replenishment_method="Производство",
+    )
+    _configure_obligation_checkpoint(
+        db_session,
+        generation,
+        requirement,
+        allow_unphased=False,
+        replay_allocated="52",
+    )
+    make_reservation = db_session.query(models.ReservationEntry).filter_by(
+        ledger_generation_id=generation.id,
+    ).one()
+    make_reservation.reserved_qty = Decimal("26")
+    make_reservation.realized_qty = Decimal("26")
+    consume_reservation = models.ReservationEntry(
+        ledger_generation_id=generation.id,
+        item_id=make_reservation.item_id,
+        characteristic_ref=make_reservation.characteristic_ref,
+        organization_ref=make_reservation.organization_ref,
+        planning_stock_pool=make_reservation.planning_stock_pool,
+        run_id=make_reservation.run_id,
+        freeze_version=1,
+        requirement_id=make_reservation.requirement_id,
+        priority_period_from=make_reservation.priority_period_from,
+        priority_period_to=make_reservation.priority_period_to,
+        realization_mode="consume",
+        reserved_qty=Decimal("26"),
+        realized_qty=Decimal("26"),
+        lifecycle_status="active",
+    )
+    db_session.add(consume_reservation)
+    db_session.flush()
+    bucket = db_session.query(models.MrpRequirementBucket).filter_by(
+        requirement_id=requirement.id,
+    ).one()
+    bucket.gross_qty = Decimal("26")
+    bucket.net_qty = Decimal("26")
+    fact = db_session.query(models.StockLedgerEntry).filter_by(
+        ingest_batch_id=generation.physical_import_batch_id,
+    ).one()
+    db_session.add_all([
+        models.ReservationEvent(
+            ledger_generation_id=generation.id,
+            reservation_id=make_reservation.id,
+            item_id=make_reservation.item_id,
+            characteristic_ref=make_reservation.characteristic_ref,
+            organization_ref=make_reservation.organization_ref,
+            planning_stock_pool=make_reservation.planning_stock_pool,
+            event_kind="realize",
+            reserved_delta=Decimal("26"),
+            realized_delta=Decimal("26"),
+            sle_id=fact.id,
+            fact_ref=fact.recorder_ref,
+            fact_line_ref=fact.line_no,
+            match_rule="fifo",
+            cycle_id=f"historical-replay:g{generation.id}",
+            idempotency_key=f"mode-make:g{generation.id}:sle{fact.id}:r{make_reservation.id}",
+            event_at=fact.posting_at,
+        ),
+        models.MrpExecutionAllocation(
+            ledger_generation_id=generation.id,
+            cycle_id=f"historical-replay:g{generation.id}",
+            requirement_id=requirement.id,
+            bucket_id=bucket.id,
+            fact_type="linked_production",
+            allocation_kind="execution",
+            fact_ref=fact.recorder_ref,
+            fact_line_ref=fact.line_no,
+            fact_date=fact.posting_at,
+            allocated_qty=Decimal("26"),
+        ),
+        models.ReservationEvent(
+            ledger_generation_id=generation.id,
+            reservation_id=consume_reservation.id,
+            item_id=consume_reservation.item_id,
+            characteristic_ref=consume_reservation.characteristic_ref,
+            organization_ref=consume_reservation.organization_ref,
+            planning_stock_pool=consume_reservation.planning_stock_pool,
+            event_kind="realize",
+            reserved_delta=Decimal("26"),
+            realized_delta=Decimal("26"),
+            sle_id=fact.id,
+            fact_ref=fact.recorder_ref,
+            fact_line_ref=fact.line_no,
+            match_rule="fifo",
+            cycle_id=f"historical-replay:g{generation.id}",
+            idempotency_key=f"mode-consume:g{generation.id}:sle{fact.id}:r{consume_reservation.id}",
+            event_at=fact.posting_at,
+        ),
+        models.MrpExecutionAllocation(
+            ledger_generation_id=generation.id,
+            cycle_id=f"historical-replay:g{generation.id}",
+            requirement_id=requirement.id,
+            bucket_id=bucket.id,
+            fact_type="component_consumption",
+            allocation_kind="execution",
+            fact_ref=fact.recorder_ref,
+            fact_line_ref=fact.line_no,
+            fact_date=fact.posting_at,
+            allocated_qty=Decimal("26"),
+        ),
+    ])
+    db_session.flush()
+
+    result = validate_generation_build(db_session, generation.id)
+    assert result["valid"] is True
+    assert result["execution_allocations"] == 2
+
+
 def test_validation_rejects_malformed_legacy_metric_ids(db_session):
     generation, requirement = _synthetic(
         db_session,

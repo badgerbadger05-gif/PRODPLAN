@@ -35,6 +35,18 @@ def _decimal(value: Any) -> Decimal:
     return Decimal(str(value or 0))
 
 
+def bucket_capacity_for_mode(
+    bucket: MrpRequirementBucket,
+    mode: str,
+) -> Decimal:
+    mode_key = str(mode or "").lower()
+    if mode_key == "make":
+        return max(_decimal(bucket.net_qty), Decimal("0"))
+    if mode_key == "consume":
+        return max(_decimal(bucket.gross_qty), Decimal("0"))
+    raise ValueError(f"unsupported realization mode for bucket capacity: {mode}")
+
+
 def _checksum(rows: list[dict[str, Any]]) -> str:
     raw = json.dumps(rows, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -374,6 +386,7 @@ def run_historical_replay(
         entry = entry_by_core_id[allocation.reserve_id]
         sle = sle_by_core_id[allocation.fact_id]
         idempotency_key = f"hist:g{generation.id}:sle{sle.id}:r{entry.id}"
+        mode = _fact_mode(sle)
         event = (
             db.query(ReservationEvent)
             .filter(
@@ -439,7 +452,7 @@ def run_historical_replay(
                 )
             for existing in existing_slices:
                 if existing.bucket_id is not None:
-                    used_key = (int(existing.bucket_id), _fact_mode(sle))
+                    used_key = (int(existing.bucket_id), mode)
                     bucket_used[used_key] = (
                         bucket_used.get(used_key, Decimal("0"))
                         + _decimal(existing.allocated_qty)
@@ -453,8 +466,8 @@ def run_historical_replay(
                     slices = [(None, left)]
                 else:
                     for bucket in buckets:
-                        capacity = max(_decimal(bucket.net_qty), Decimal("0"))
-                        used_key = (int(bucket.id), _fact_mode(sle))
+                        capacity = bucket_capacity_for_mode(bucket, mode)
+                        used_key = (int(bucket.id), mode)
                         take = min(
                             left,
                             max(

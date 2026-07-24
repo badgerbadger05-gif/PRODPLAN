@@ -24,6 +24,7 @@ from .historical_obligations import (
 )
 from .historical_replay_persistence import (
     _ALGORITHM_VERSION as REPLAY_ALGORITHM_VERSION,
+    bucket_capacity_for_mode,
     run_historical_replay,
 )
 from .physical import canonical_content_hash
@@ -454,7 +455,9 @@ def validate_generation_build(
     }:
         raise GenerationValidationError("bucket allocation sums differ from realized events")
     for (bucket_id, _mode), qty in bucket_mode_qty.items():
-        if qty > max(_d(bucket_by_id[bucket_id].net_qty), Decimal("0")):
+        bucket = bucket_by_id[bucket_id]
+        capacity = bucket_capacity_for_mode(bucket, _mode)
+        if qty > capacity:
             raise GenerationValidationError("bucket allocation exceeds frozen capacity")
 
     fact_qty = _d(replay_metrics.get("fact_qty"))

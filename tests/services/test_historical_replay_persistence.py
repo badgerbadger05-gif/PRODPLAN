@@ -141,6 +141,40 @@ def _append_obligation_batch(
     db.flush()
 
 
+def _address_fact_to_requirement(
+    db,
+    fact: StockLedgerEntry,
+    reservation: ReservationEntry,
+) -> None:
+    order = ProductionOrder(
+        order_number=f"ORDER-{fact.recorder_ref}",
+        order_date=fact.posting_at,
+        order_ref1c=f"ORDER-REF-{fact.recorder_ref}",
+        deletion_mark=False,
+        source="1c",
+    )
+    db.add(order)
+    db.flush()
+    db.add_all([
+        ProductionProduct(
+            order_id=order.order_id,
+            item_id=reservation.item_id,
+            line_number=1,
+            quantity=abs(Decimal(str(fact.qty))),
+            produced_qty=0,
+            remaining_qty=abs(Decimal(str(fact.qty))),
+            source_mrp_requirement_id=reservation.requirement_id,
+        ),
+        StockRecorderPull(
+            recorder_type=fact.recorder_type,
+            recorder_ref=fact.recorder_ref,
+            status="done",
+            order_ref=order.order_ref1c,
+        ),
+    ])
+    db.flush()
+
+
 def test_replay_is_idempotent_and_folds_realized_cache(db_session):
     generation, reservation = _generation_scope(db_session, "IDEMP")
 
@@ -900,3 +934,145 @@ def test_replay_fifo_remains_oldest_pool_for_later_output(db_session):
     assert allocations[0].allocated_qty == Decimal("2")
     assert allocations[1].requirement_id == req2.id
     assert allocations[1].allocated_qty == Decimal("3")
+
+
+def test_replay_uses_gross_capacity_for_consume_when_bucket_net_is_zero(db_session):
+    generation, reservation = _generation_scope(
+        db_session,
+        "CONSUME-GROSS",
+        fact_qty="26",
+        reserve_qty="26",
+        realization_mode="consume",
+        movement_kind="assembly_out",
+        add_default_bucket=False,
+    )
+    db_session.add(MrpRequirementBucket(
+        requirement_id=reservation.requirement_id,
+        run_id=reservation.run_id,
+        item_id=reservation.item_id,
+        bucket_date=date(2026, 7, 20),
+        gross_qty=Decimal("26"),
+        net_qty=Decimal("0"),
+    ))
+    reservation.reserved_qty = Decimal("26")
+    db_session.flush()
+    fact = db_session.query(StockLedgerEntry).filter_by(
+        ingest_batch_id=generation.physical_import_batch_id
+    ).one()
+    _address_fact_to_requirement(db_session, fact, reservation)
+
+    result = run_historical_replay(db_session, generation.id)
+
+    assert Decimal(result["allocated_qty"]) == Decimal("26")
+    rows = (
+        db_session.query(MrpExecutionAllocation)
+        .filter_by(ledger_generation_id=generation.id)
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].allocated_qty == Decimal("26")
+    assert rows[0].bucket_id is not None
+
+
+def test_replay_rejects_make_allocation_when_bucket_net_is_zero(db_session):
+    generation, reservation = _generation_scope(
+        db_session,
+        "MAKE-NET-ZERO",
+        fact_qty="26",
+        reserve_qty="26",
+        realization_mode="make",
+        add_default_bucket=False,
+    )
+    db_session.add(MrpRequirementBucket(
+        requirement_id=reservation.requirement_id,
+        run_id=reservation.run_id,
+        item_id=reservation.item_id,
+        bucket_date=date(2026, 7, 20),
+        gross_qty=Decimal("26"),
+        net_qty=Decimal("0"),
+    ))
+    reservation.reserved_qty = Decimal("26")
+    db_session.flush()
+
+    with pytest.raises(
+        ValueError, match="bucket capacity is below realization",
+    ):
+        run_historical_replay(db_session, generation.id)
+
+
+def test_replay_preserves_mode_isolated_bucket_capacity(db_session):
+    generation, make_reservation = _generation_scope(
+        db_session,
+        "MODE-ISOLATED",
+        fact_qty="26",
+        reserve_qty="26",
+        realization_mode="make",
+        add_default_bucket=False,
+    )
+    db_session.add(MrpRequirementBucket(
+        requirement_id=make_reservation.requirement_id,
+        run_id=make_reservation.run_id,
+        item_id=make_reservation.item_id,
+        bucket_date=date(2026, 7, 20),
+        gross_qty=Decimal("26"),
+        net_qty=Decimal("26"),
+    ))
+    consume_fact = StockLedgerEntry(
+        ingest_batch_id=generation.physical_import_batch_id,
+        source_content_hash="consume-fact",
+        item_id=make_reservation.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        warehouse_ref1c="WH",
+        qty=Decimal("26"),
+        qty_after=Decimal("26"),
+        posting_at=datetime(2026, 7, 20, 12, 0),
+        record_type="Receipt",
+        movement_kind="assembly_out",
+        recorder_type="Consumption",
+        recorder_ref="REC-MODE-ISOLATED-CONSUME",
+        line_no="2",
+        ingest_source="test",
+        active=True,
+    )
+    db_session.add(consume_fact)
+    consume_reservation = ReservationEntry(
+        ledger_generation_id=generation.id,
+        item_id=make_reservation.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="selected",
+        run_id=make_reservation.run_id,
+        freeze_version=1,
+        requirement_id=make_reservation.requirement_id,
+        priority_period_from=make_reservation.priority_period_from,
+        priority_period_to=make_reservation.priority_period_to,
+        realization_mode="consume",
+        reserved_qty=Decimal("26"),
+        realized_qty=Decimal("0"),
+        lifecycle_status="active",
+    )
+    db_session.add(consume_reservation)
+    db_session.flush()
+    make_fact = db_session.query(StockLedgerEntry).filter_by(
+        ingest_batch_id=generation.physical_import_batch_id,
+        source_content_hash="hash-MODE-ISOLATED",
+    ).one()
+    _address_fact_to_requirement(db_session, make_fact, make_reservation)
+    _address_fact_to_requirement(db_session, consume_fact, consume_reservation)
+
+    result = run_historical_replay(db_session, generation.id)
+
+    assert Decimal(result["allocated_qty"]) == Decimal("52")
+    rows = (
+        db_session.query(MrpExecutionAllocation)
+        .filter_by(ledger_generation_id=generation.id)
+        .order_by(MrpExecutionAllocation.id.asc())
+        .all()
+    )
+    assert len(rows) == 2
+    assert {row.fact_type for row in rows} == {"linked_production", "component_consumption"}
+    by_type = {row.fact_type: row.allocated_qty for row in rows}
+    assert by_type["linked_production"] == Decimal("26")
+    assert by_type["component_consumption"] == Decimal("26")
+    assert len({row.bucket_id for row in rows}) == 1
