@@ -702,6 +702,104 @@ def test_replay_collapses_singleton_fact_identity_to_legacy_blank_pool(db_sessio
     assert reservation.realized_qty == Decimal("5")
 
 
+def test_replay_treats_no_pool_facts_as_unplanned_without_ambiguity(db_session):
+    cutoff = datetime(2026, 7, 23, 12, 0)
+    item = Item(item_code="ITEM-NO-POOL", item_name="Item No Pool")
+    batch = PhysicalImportBatch(batch_key="physical-no-pool", status="completed", cutoff=cutoff)
+    db_session.add_all([item, batch])
+    db_session.flush()
+    generation = LedgerGeneration(
+        generation_key="generation-no-pool",
+        status="building",
+        cutoff=cutoff,
+        physical_import_batch_id=batch.id,
+        algorithm_version="test/1",
+        replay_version="test-replay/1",
+        source_watermarks={"replay_from": "2026-07-01T00:00:00"},
+        capabilities={},
+    )
+    db_session.add(generation)
+    db_session.flush()
+    db_session.add(StockLedgerEntry(
+        ingest_batch_id=batch.id,
+        source_content_hash="no-pool-fact",
+        item_id=item.item_id,
+        characteristic_ref="CHAR-NP",
+        organization_ref="ORG-NP",
+        warehouse_ref1c="WH",
+        qty=Decimal("4"),
+        qty_after=Decimal("4"),
+        posting_at=datetime(2026, 7, 20, 10, 0),
+        record_type="Receipt",
+        movement_kind="assembly_in",
+        recorder_type="Production",
+        recorder_ref="REC-NO-POOL",
+        line_no="1",
+        ingest_source="test",
+        active=True,
+    ))
+    db_session.commit()
+
+    result = run_historical_replay(db_session, generation.id)
+
+    assert Decimal(result["facts"]) == Decimal("1")
+    assert result["allocations"] == 0
+    assert result["unplanned_facts"] == 1
+    assert Decimal(result["unplanned_qty"]) == Decimal("4")
+    assert result["ambiguous_pool_facts"] == 0
+    assert db_session.query(ReservationEvent).filter_by(
+        ledger_generation_id=generation.id
+    ).count() == 0
+
+
+def test_replay_rejects_ambiguous_pools_even_with_no_pool_candidate_fact_identity(db_session):
+    generation, reservation = _generation_scope(
+        db_session, "AMBIGUOUS-POOL", fact_qty="4", reserve_qty="4"
+    )
+    run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={})
+    db_session.add(run)
+    db_session.flush()
+    ambiguous_requirement = MrpRequirement(
+        run_id=run.run_id,
+        item_id=reservation.item_id,
+        total_required_qty=4,
+        net_required_qty=4,
+        covered_qty=0,
+        remaining_qty=4,
+        period_from=date(2026, 7, 1),
+        period_to=date(2026, 7, 31),
+        bom_level=0,
+    )
+    db_session.add(ambiguous_requirement)
+    db_session.flush()
+    db_session.add(ReservationEntry(
+        ledger_generation_id=generation.id,
+        item_id=reservation.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="legacy",
+        run_id=run.run_id,
+        freeze_version=1,
+        requirement_id=ambiguous_requirement.id,
+        priority_period_from=reservation.priority_period_from,
+        priority_period_to=reservation.priority_period_to,
+        realization_mode="make",
+        reserved_qty=Decimal("4"),
+        realized_qty=Decimal("0"),
+        lifecycle_status="active",
+    ))
+    db_session.flush()
+
+    result = run_historical_replay(db_session, generation.id)
+
+    assert result["allocations"] == 0
+    assert Decimal(result["unplanned_qty"]) == Decimal("4")
+    assert result["ambiguous_pool_facts"] == 1
+    assert db_session.query(ReservationEvent).filter_by(
+        ledger_generation_id=generation.id
+    ).count() == 0
+
+
 def test_replay_multi_org_facts_do_not_fallback_to_blank_org(db_session):
     generation, reservation = _generation_scope(
         db_session, "ORG-MULTI", fact_qty="0", reserve_qty="8"

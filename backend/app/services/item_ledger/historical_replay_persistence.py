@@ -29,6 +29,8 @@ from .physical_visibility import visible_sles_for_generation
 _ALGORITHM_VERSION = "historical-replay-persistence/1"
 _SAFE_REALIZATION_KINDS = frozenset({"assembly_in", "assembly_out", "writeoff"})
 _IGNORED_FACT_KINDS = frozenset({"receipt", "expense"})
+_UNRESOLVED_POOL_PREFIX = "__unresolved_pool__"
+_NO_POOL_SENTINEL_PREFIX = "__no_pool__"
 
 
 def _decimal(value: Any) -> Decimal:
@@ -331,6 +333,9 @@ def run_historical_replay(
     facts: list[Fact] = []
     sle_by_core_id: dict[str, StockLedgerEntry] = {}
     identity_by_core_id: dict[str, tuple[int | None, str | None]] = {}
+    mode_has_pools = set(
+        (item_id, mode) for item_id, _char, _org, mode in pools_by_key.keys()
+    )
     ambiguous_pool_facts = 0
     ambiguous_identity_facts = 0
     legacy_identity_collapsed_pool_facts = 0
@@ -361,8 +366,13 @@ def run_historical_replay(
             fact_characteristic = ""
             fact_org = ""
             legacy_identity_collapsed_pool_facts += 1
+        elif (
+            not pools
+            and (int(row.item_id), mode) not in mode_has_pools
+        ):
+            pool = f"{_NO_POOL_SENTINEL_PREFIX}:{int(row.item_id)}:{mode}"
         else:
-            pool = f"__unresolved_pool__:{row.id}"
+            pool = f"{_UNRESOLVED_POOL_PREFIX}:{row.id}"
             ambiguous_pool_facts += 1
         core_id = str(int(row.id))
         requirement_id, order_ref, ambiguous_identity = _identity_for_sle(db, row)
