@@ -197,6 +197,141 @@ def test_ambiguous_identical_document_rows_fail_with_duplicate_error(db_session)
     assert result.diagnostics[0].code == "duplicate_document_line"
 
 
+def test_aggregated_supplier_rows_match_with_shared_order_lineage(db_session):
+    item = _item(db_session)
+    doc = _doc(
+        "receipt-ref",
+        RECEIPT_OPERATION,
+        "Приобретение у поставщика",
+    )
+    doc["Запасы"] = [
+        {
+            "LineNumber": "1",
+            "Номенклатура_Key": "item-ref",
+            "Характеристика_Key": "00000000-0000-0000-0000-000000000000",
+            "Количество": "140.5",
+            "Заказ": "order-960",
+            "Заказ_Type": ORDER_TYPE,
+            "НомерСтрокиДокументаОснования": "7",
+        },
+        {
+            "LineNumber": "2",
+            "Номенклатура_Key": "item-ref",
+            "Характеристика_Key": "00000000-0000-0000-0000-000000000000",
+            "Количество": "5",
+            "Заказ": "order-960",
+            "Заказ_Type": ORDER_TYPE,
+            "НомерСтрокиДокументаОснования": "7",
+        },
+    ]
+    result = extract_supplier_document_evidence(
+        db_session,
+        _Client({
+            "Document_ПриходнаяНакладная(guid'receipt-ref')": doc
+        }),
+        [_sle(item, qty="145.5")],
+    )
+
+    assert len(result.evidence) == 1
+    assert result.evidence[0].supplier_order_ref == "order-960"
+    assert result.evidence[0].supplier_order_type == "Document_ЗаказПоставщику"
+    assert result.evidence[0].supplier_order_line_no == "7"
+    assert result.evidence[0].signed_qty == Decimal("145.5")
+    assert result.diagnostics == ()
+
+
+def test_aggregated_supplier_rows_from_different_orders_are_unplanned(db_session):
+    item = _item(db_session)
+    doc = _doc(
+        "receipt-ref",
+        RECEIPT_OPERATION,
+        "Приобретение у поставщика",
+    )
+    doc["Запасы"] = [
+        {
+            "LineNumber": "1",
+            "Номенклатура_Key": "item-ref",
+            "Характеристика_Key": "00000000-0000-0000-0000-000000000000",
+            "Количество": "140.5",
+            "Заказ": "order-960",
+            "Заказ_Type": ORDER_TYPE,
+            "НомерСтрокиДокументаОснования": "9",
+        },
+        {
+            "LineNumber": "2",
+            "Номенклатура_Key": "item-ref",
+            "Характеристика_Key": "00000000-0000-0000-0000-000000000000",
+            "Количество": "5",
+            "Заказ": "order-dee",
+            "Заказ_Type": ORDER_TYPE,
+            "НомерСтрокиДокументаОснования": "7",
+        },
+    ]
+    result = extract_supplier_document_evidence(
+        db_session,
+        _Client({
+            "Document_ПриходнаяНакладная(guid'receipt-ref')": doc
+        }),
+        [_sle(item, qty="145.5")],
+    )
+
+    assert len(result.evidence) == 1
+    assert result.evidence[0].supplier_order_ref == ""
+    assert result.evidence[0].supplier_order_type == ""
+    assert result.evidence[0].supplier_order_line_no == "0"
+    assert result.evidence[0].signed_qty == Decimal("145.5")
+    assert result.diagnostics == ()
+
+
+def test_ambiguous_supplier_row_subsets_fail_with_duplicate_line_code(db_session):
+    item = _item(db_session)
+    doc = _doc(
+        "receipt-ref",
+        RECEIPT_OPERATION,
+        "Приобретение у поставщика",
+    )
+    doc["Запасы"] = [
+        {
+            "LineNumber": "1",
+            "Номенклатура_Key": "item-ref",
+            "Характеристика_Key": "00000000-0000-0000-0000-000000000000",
+            "Количество": "2",
+            "Заказ": "order-660",
+            "Заказ_Type": ORDER_TYPE,
+            "НомерСтрокиДокументаОснования": "7",
+        },
+        {
+            "LineNumber": "2",
+            "Номенклатура_Key": "item-ref",
+            "Характеристика_Key": "00000000-0000-0000-0000-000000000000",
+            "Количество": "1",
+            "Заказ": "order-670",
+            "Заказ_Type": ORDER_TYPE,
+            "НомерСтрокиДокументаОснования": "8",
+        },
+        {
+            "LineNumber": "3",
+            "Номенклатура_Key": "item-ref",
+            "Характеристика_Key": "00000000-0000-0000-0000-000000000000",
+            "Количество": "1",
+            "Заказ": "order-680",
+            "Заказ_Type": ORDER_TYPE,
+            "НомерСтрокиДокументаОснования": "9",
+        },
+    ]
+    # Target 3 can be formed by 2+1 (with two distinct 1s) -> ambiguous.
+    result = extract_supplier_document_evidence(
+        db_session,
+        _Client({
+            "Document_ПриходнаяНакладная(guid'receipt-ref')": doc
+        }),
+        [_sle(item, qty="3")],
+    )
+
+    assert result.evidence == ()
+    assert result.diagnostics[0].code == "duplicate_document_line"
+
+
 def test_correction_receipt_minus_one_requires_typed_original_receipt(db_session):
     item = _item(db_session)
     entry = _sle(

@@ -213,6 +213,47 @@ def _strict_operation_matches(expected: str, key: str, name: str) -> bool:
         return False
 
 
+def _unique_signed_subset_indices(
+    rows: list[tuple[int, dict]],
+    target: Decimal,
+    recorder_type: str,
+    sle_qty: Decimal,
+) -> tuple[list[int], bool, bool]:
+    """Find a unique subset of rows whose signed qty equals ``target``.
+
+    Returns ``(indices, has_subset, is_unique)``.
+    """
+    states: dict[Decimal, tuple[tuple[int, ...], int]] = {
+        Decimal("0"): ((), 1),
+    }
+    for row_no, row in rows:
+        row_qty = _signed_document_qty(recorder_type, sle_qty, row)[1]
+        if row_qty is None:
+            continue
+        snapshot = list(states.items())
+        for current_sum, (path, ways) in snapshot:
+            next_sum = current_sum + row_qty
+            next_path = path + (row_no,)
+            if next_sum not in states:
+                states[next_sum] = (next_path, ways)
+                continue
+            existing_path, existing_ways = states[next_sum]
+            if existing_ways == 1 and next_path != existing_path:
+                states[next_sum] = (existing_path, 2)
+    state = states.get(target)
+    if state is None:
+        return [], False, False
+    (path, ways) = state
+    if ways > 1:
+        return [], True, False
+    return list(path), True, True
+
+
+def _row_order_tuple(row: dict, doc: dict) -> tuple[str, str, str]:
+    ref, order_type, line_no = _order(row, doc)
+    return _guid(ref), _normalized_type(order_type), _text(line_no) or "0"
+
+
 def _diagnostic(
     entry: models.StockLedgerEntry,
     code: str,
@@ -487,9 +528,9 @@ def extract_supplier_document_evidence(
                     "document warehouse differs across physical rows",
                 ))
                 continue
-            candidates: list[dict] = []
+            candidates: list[tuple[int, dict]] = []
             mismatch_code = ""
-            for doc_row in unused_rows:
+            for row_no, doc_row in list(enumerate(unused_rows)):
                 if _guid(doc_row.get("Номенклатура_Key")) != expected_item_ref:
                     continue
                 row_characteristic = _guid(_first(
@@ -506,16 +547,11 @@ def extract_supplier_document_evidence(
                 row_warehouse = _warehouse(recorder_type, row_signed_qty, doc_row, doc)
                 if row_warehouse != expected_warehouse:
                     continue
-                if row_signed_qty != sle_qty:
-                    mismatch_code = "quantity_mismatch"
-                    continue
-                candidates.append(doc_row)
+                candidates.append((row_no, doc_row))
 
-            if len(candidates) != 1:
+            if len(candidates) == 0:
                 code = "missing_document_line"
-                if len(candidates) > 1:
-                    code = "duplicate_document_line"
-                elif mismatch_code:
+                if mismatch_code:
                     code = mismatch_code
                 diagnostics.append(_diagnostic(
                     entry, code,
@@ -523,13 +559,54 @@ def extract_supplier_document_evidence(
                 ))
                 continue
 
-            row = candidates[0]
-            unused_rows = [row_ for row_ in unused_rows if row_ is not row]
-            sign_code, signed_qty = _signed_document_qty(recorder_type, sle_qty, row)
-            if sign_code:
+            candidate_indices, has_subset, unique = _unique_signed_subset_indices(
+                candidates,
+                sle_qty,
+                recorder_type,
+                sle_qty,
+            )
+            selected_indices_set = set(candidate_indices)
+            if not has_subset:
+                code = mismatch_code or "quantity_mismatch"
                 diagnostics.append(_diagnostic(
-                    entry, sign_code, "line matching cannot be normalized"
+                    entry, code,
+                    "unique document row subset for Ledger quantity was not found",
                 ))
+                continue
+            if not unique:
+                diagnostics.append(_diagnostic(
+                    entry,
+                    "duplicate_document_line",
+                    "multiple unique document row subsets for the same Ledger row",
+                ))
+                continue
+            selected_rows = [unused_rows[index] for index in sorted(candidate_indices)]
+            unused_rows = [
+                row_ for index, row_ in enumerate(unused_rows)
+                if index not in selected_indices_set
+            ]
+            row = selected_rows[0]
+            order_refs = {_row_order_tuple(row_, doc) for row_ in selected_rows}
+            supplier_order_ref = ""
+            supplier_order_type = ""
+            supplier_order_line = "0"
+            if len(order_refs) == 1:
+                supplier_order_ref, supplier_order_type, supplier_order_line = next(iter(order_refs))
+            signed_qty = Decimal("0")
+            invalid_qty = False
+            for selected_row in selected_rows:
+                sign_code, row_signed_qty = _signed_document_qty(
+                    recorder_type, sle_qty, selected_row
+                )
+                if sign_code or row_signed_qty is None:
+                    diagnostics.append(_diagnostic(
+                        entry, sign_code or "missing_quantity",
+                        "line matching cannot be normalized"
+                    ))
+                    invalid_qty = True
+                    break
+                signed_qty += row_signed_qty
+            if invalid_qty:
                 continue
             warehouse = _warehouse(recorder_type, signed_qty, row, doc)
             if (
@@ -544,30 +621,25 @@ def extract_supplier_document_evidence(
                     "document warehouse differs from Ledger row",
                 ))
                 continue
-            order_ref, order_type, order_line = _order(row, doc)
             if (
-                recorder_type != "Document_ПеремещениеЗапасов"
-                and (
-                    _normalized_type(order_type) != SUPPLIER_ORDER_TYPE
-                    or not order_ref
-                )
+                supplier_order_type != SUPPLIER_ORDER_TYPE
+                or not supplier_order_ref
             ):
-                # This is a valid physical supplier fact with no addressable
-                # frozen-order lineage (direct receipt/surplus).  Preserve it
-                # as normalized evidence; the generation-scoped provenance
-                # layer classifies it as explicitly unplanned.
-                order_ref = ""
-                order_type = ""
-                order_line = "0"
+                # This is a valid physical supplier fact without a single
+                # addressable order lineage (direct receipt/surplus or mixed
+                # document rows).  Preserve it as unplanned evidence.
+                supplier_order_ref = ""
+                supplier_order_type = ""
+                supplier_order_line = "0"
             evidence.append(SupplierDocumentEvidence(
                 receipt_doc_type=recorder_type,
                 receipt_doc_ref=recorder_ref,
                 receipt_doc_line_no=_text(entry.line_no),
                 operation_key=operation_key,
                 operation_name=operation_name,
-                supplier_order_type=order_type,
-                supplier_order_ref=order_ref,
-                supplier_order_line_no=order_line,
+                supplier_order_type=supplier_order_type,
+                supplier_order_ref=supplier_order_ref,
+                supplier_order_line_no=supplier_order_line,
                 item_id=int(entry.item_id),
                 characteristic_ref=characteristic,
                 warehouse_ref1c=warehouse,
