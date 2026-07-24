@@ -673,6 +673,49 @@ def test_validation_rejects_malformed_legacy_metric_ids(db_session):
         validate_generation_build(db_session, generation.id)
 
 
+@pytest.mark.parametrize(
+    "ambiguous_pool,ambiguous_identity,pattern",
+    [
+        ("1", "0", "unresolved planning-stock pools"),
+        ("0", "1", "unresolved provenance identities"),
+    ],
+)
+def test_validation_rejects_replay_ambiguity_metrics(
+    db_session, ambiguous_pool, ambiguous_identity, pattern
+):
+    generation, requirement = _synthetic(
+        db_session,
+        "ambiguous-replay-metrics",
+        replenishment_method="Покупка",
+    )
+    _configure_obligation_checkpoint(
+        db_session,
+        generation,
+        requirement,
+        allow_unphased=False,
+        replay_allocated="0",
+    )
+    replay_batch = (
+        db_session.query(models.LedgerBuildBatch)
+        .filter(
+            models.LedgerBuildBatch.ledger_generation_id == generation.id,
+            models.LedgerBuildBatch.stage == "reservation_replay",
+        )
+        .one()
+    )
+    replay_batch.metrics = {
+        "fact_qty": "0",
+        "allocated_qty": "0",
+        "unplanned_qty": "0",
+        "ambiguous_pool_facts": ambiguous_pool,
+        "ambiguous_identity_facts": ambiguous_identity,
+    }
+    db_session.flush()
+
+    with pytest.raises(GenerationValidationError, match=pattern):
+        validate_generation_build(db_session, generation.id)
+
+
 def test_empty_prefix_requires_explicit_declaration(db_session):
     implicit = _generation(db_session, "implicit-empty")
     db_session.commit()

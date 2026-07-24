@@ -248,6 +248,35 @@ def run_historical_replay(
     reserves: list[Reserve] = []
     entry_by_core_id: dict[str, ReservationEntry] = {}
     pools_by_key: dict[tuple[int, str, str, str], set[str]] = {}
+    visible_candidates = [
+        row
+        for row in visible_sles_for_generation(db, int(generation.id))
+        if str(row.movement_kind or "") in (
+            _SAFE_REALIZATION_KINDS | _IGNORED_FACT_KINDS
+        )
+        and _decimal(row.qty) != 0
+    ]
+    candidate_rows = [row for row in visible_candidates if row.posting_at > lower_bound]
+    excluded_pre_replay = len(visible_candidates) - len(candidate_rows)
+    physical_rows = [
+        row for row in candidate_rows
+        if str(row.movement_kind or "") in _SAFE_REALIZATION_KINDS
+    ]
+    ignored_rows = [
+        row for row in candidate_rows
+        if str(row.movement_kind or "") in _IGNORED_FACT_KINDS
+    ]
+    factual_orgs_by_key: dict[tuple[int, str, str], set[str]] = {}
+    for row in physical_rows:
+        factual_orgs_by_key.setdefault(
+            (
+                int(row.item_id),
+                str(row.characteristic_ref or ""),
+                _fact_mode(row),
+            ),
+            set(),
+        ).add(str(row.organization_ref or ""))
+
     for row in entries:
         if row.run_id is None:
             raise ValueError(f"reservation {row.id} has no run lineage")
@@ -282,41 +311,37 @@ def run_historical_replay(
             ),
             set(),
         ).add(reserve.planning_stock_pool)
-
-    visible_candidates = [
-        row
-        for row in visible_sles_for_generation(db, int(generation.id))
-        if str(row.movement_kind or "") in (
-            _SAFE_REALIZATION_KINDS | _IGNORED_FACT_KINDS
-        )
-        and _decimal(row.qty) != 0
-    ]
-    candidate_rows = [row for row in visible_candidates if row.posting_at > lower_bound]
-    excluded_pre_replay = len(visible_candidates) - len(candidate_rows)
-    physical_rows = [
-        row for row in candidate_rows
-        if str(row.movement_kind or "") in _SAFE_REALIZATION_KINDS
-    ]
-    ignored_rows = [
-        row for row in candidate_rows
-        if str(row.movement_kind or "") in _IGNORED_FACT_KINDS
-    ]
     facts: list[Fact] = []
     sle_by_core_id: dict[str, StockLedgerEntry] = {}
     identity_by_core_id: dict[str, tuple[int | None, str | None]] = {}
     ambiguous_pool_facts = 0
     ambiguous_identity_facts = 0
+    organization_collapsed_pool_facts = 0
     for row in physical_rows:
         mode = _fact_mode(row)
-        key = (
+        exact_key = (
             int(row.item_id),
             str(row.characteristic_ref or ""),
             str(row.organization_ref or ""),
             mode,
         )
-        pools = pools_by_key.get(key, set())
+        pools = pools_by_key.get(exact_key, set())
+        fallback_key = (int(row.item_id), str(row.characteristic_ref or ""), mode)
+        fact_org = str(row.organization_ref or "")
+        fallback_pools = pools_by_key.get(
+            (int(row.item_id), str(row.characteristic_ref or ""), "", mode),
+            set(),
+        )
         if len(pools) == 1:
             pool = next(iter(pools))
+        elif (
+            not pools
+            and len(fallback_pools) == 1
+            and len(factual_orgs_by_key.get(fallback_key, set())) == 1
+        ):
+            pool = next(iter(fallback_pools))
+            fact_org = ""
+            organization_collapsed_pool_facts += 1
         else:
             pool = f"__unresolved_pool__:{row.id}"
             ambiguous_pool_facts += 1
@@ -331,7 +356,7 @@ def run_historical_replay(
             qty=abs(_decimal(row.qty)),
             posting_at=row.posting_at,
             characteristic_ref=str(row.characteristic_ref or ""),
-            organization_ref=str(row.organization_ref or ""),
+            organization_ref=fact_org,
             planning_stock_pool=pool,
             requirement_id=requirement_id,
             order_ref=order_ref,
@@ -522,6 +547,7 @@ def run_historical_replay(
         "unplanned_facts": len(result.unplanned),
         "ambiguous_pool_facts": ambiguous_pool_facts,
         "ambiguous_identity_facts": ambiguous_identity_facts,
+        "organization_collapsed_pool_facts": organization_collapsed_pool_facts,
         "excluded_pre_replay_facts": excluded_pre_replay,
         "replay_from": lower_bound.isoformat(),
         "input_checksum": _checksum(input_rows),

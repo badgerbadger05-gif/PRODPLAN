@@ -645,3 +645,258 @@ def test_ambiguous_order_identity_leaves_consume_unplanned(db_session):
     assert Decimal(result["allocated_qty"]) == Decimal("0")
     assert Decimal(result["unplanned_qty"]) == Decimal("4")
     assert result["ambiguous_identity_facts"] == 1
+
+
+def test_replay_collapses_singleton_fact_org_to_blank_org_pool(db_session):
+    generation, reservation = _generation_scope(
+        db_session, "ORG-COLLAPSE", fact_qty="5", reserve_qty="5"
+    )
+    fact = db_session.query(StockLedgerEntry).filter_by(
+        ingest_batch_id=generation.physical_import_batch_id
+    ).one()
+    fact.organization_ref = "ORG-1"
+    db_session.flush()
+
+    result = run_historical_replay(db_session, generation.id)
+
+    assert Decimal(result["allocated_qty"]) == Decimal("5")
+    assert result["organization_collapsed_pool_facts"] == 1
+    assert result["ambiguous_pool_facts"] == 0
+    assert Decimal(result["unplanned_qty"]) == Decimal("0")
+    db_session.refresh(reservation)
+    assert reservation.realized_qty == Decimal("5")
+
+
+def test_replay_multi_org_facts_do_not_fallback_to_blank_org(db_session):
+    generation, reservation = _generation_scope(
+        db_session, "ORG-MULTI", fact_qty="0", reserve_qty="8"
+    )
+    reservation.reserved_qty = Decimal("8")
+    db_session.add_all([
+        StockLedgerEntry(
+            ingest_batch_id=generation.physical_import_batch_id,
+            source_content_hash="org-multi-a",
+            item_id=reservation.item_id,
+            characteristic_ref="",
+            organization_ref="ORG-A",
+            warehouse_ref1c="WH",
+            qty=Decimal("4"),
+            qty_after=Decimal("4"),
+            posting_at=datetime(2026, 7, 20, 11, 0),
+            record_type="Receipt",
+            movement_kind="assembly_in",
+            recorder_type="Production",
+            recorder_ref="REC-ORG-MULTI-A",
+            line_no="1",
+            ingest_source="test",
+            active=True,
+        ),
+        StockLedgerEntry(
+            ingest_batch_id=generation.physical_import_batch_id,
+            source_content_hash="org-multi-b",
+            item_id=reservation.item_id,
+            characteristic_ref="",
+            organization_ref="ORG-B",
+            warehouse_ref1c="WH",
+            qty=Decimal("4"),
+            qty_after=Decimal("8"),
+            posting_at=datetime(2026, 7, 20, 11, 0),
+            record_type="Receipt",
+            movement_kind="assembly_in",
+            recorder_type="Production",
+            recorder_ref="REC-ORG-MULTI-B",
+            line_no="1",
+            ingest_source="test",
+            active=True,
+        ),
+    ])
+    db_session.query(StockLedgerEntry).filter(
+        StockLedgerEntry.ingest_batch_id == generation.physical_import_batch_id,
+        StockLedgerEntry.source_content_hash == f"hash-ORG-MULTI",
+    ).delete(synchronize_session=False)
+    db_session.flush()
+
+    result = run_historical_replay(db_session, generation.id)
+
+    assert result["ambiguous_pool_facts"] == 2
+    assert result["organization_collapsed_pool_facts"] == 0
+    assert Decimal(result["allocated_qty"]) == Decimal("0")
+    assert Decimal(result["unplanned_qty"]) == Decimal("8")
+    assert db_session.query(ReservationEvent).filter_by(
+        ledger_generation_id=generation.id
+    ).count() == 0
+    db_session.refresh(reservation)
+    assert reservation.realized_qty == Decimal("0")
+
+
+def test_replay_exact_org_match_takes_precedence_over_blank_org_fallback(db_session):
+    generation, reserved_blank = _generation_scope(
+        db_session, "ORG-EXACT", fact_qty="5", reserve_qty="5"
+    )
+    exact_run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={})
+    db_session.add(exact_run)
+    db_session.flush()
+    exact_requirement = MrpRequirement(
+        run_id=exact_run.run_id,
+        item_id=reserved_blank.item_id,
+        total_required_qty=Decimal("5"),
+        net_required_qty=Decimal("5"),
+        covered_qty=0,
+        remaining_qty=Decimal("5"),
+        period_from=date(2026, 7, 1),
+        period_to=date(2026, 7, 31),
+        bom_level=0,
+    )
+    db_session.add(exact_requirement)
+    db_session.flush()
+    db_session.add(MrpRequirementBucket(
+        requirement_id=exact_requirement.id,
+        run_id=exact_run.run_id,
+        item_id=reserved_blank.item_id,
+        bucket_date=date(2026, 7, 20),
+        gross_qty=Decimal("5"),
+        net_qty=Decimal("5"),
+    ))
+    exact_reservation = ReservationEntry(
+        ledger_generation_id=generation.id,
+        item_id=reserved_blank.item_id,
+        characteristic_ref="",
+        organization_ref="ORG-1",
+        planning_stock_pool="legacy",
+        run_id=exact_run.run_id,
+        freeze_version=1,
+        requirement_id=exact_requirement.id,
+        priority_period_from=reserved_blank.priority_period_from,
+        priority_period_to=reserved_blank.priority_period_to,
+        realization_mode="make",
+        reserved_qty=Decimal("5"),
+        realized_qty=Decimal("0"),
+        lifecycle_status="active",
+    )
+    db_session.add(exact_reservation)
+    db_session.flush()
+    fact = db_session.query(StockLedgerEntry).filter_by(
+        ingest_batch_id=generation.physical_import_batch_id
+    ).one()
+    fact.organization_ref = "ORG-1"
+    db_session.flush()
+
+    result = run_historical_replay(db_session, generation.id)
+    events = db_session.query(ReservationEvent).filter_by(
+        ledger_generation_id=generation.id
+    ).all()
+
+    assert Decimal(result["allocated_qty"]) == Decimal("5")
+    assert result["organization_collapsed_pool_facts"] == 0
+    assert len(events) == 1
+    assert events[0].reservation_id == exact_reservation.id
+    assert events[0].planning_stock_pool == "legacy"
+
+
+def test_replay_fifo_remains_oldest_pool_for_later_output(db_session):
+    generation, reservation_a = _generation_scope(
+        db_session, "ORG-FIFO", fact_qty="0", reserve_qty="2"
+    )
+    generation.cutoff = datetime(2027, 7, 21)
+    generation.physical_import_batch.cutoff = datetime(2027, 7, 21)
+    reservation_a.organization_ref = ""
+    reservation_a.reserved_qty = Decimal("2")
+    req = db_session.query(MrpRequirement).filter_by(
+        item_id=reservation_a.item_id
+    ).first()
+    assert req is not None
+    reservation_a.reserved_qty = Decimal("2")
+    later_run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={})
+    db_session.add(later_run)
+    db_session.flush()
+    db_session.add(
+        MrpRequirement(
+            run_id=later_run.run_id,
+            item_id=reservation_a.item_id,
+            total_required_qty=3,
+            net_required_qty=3,
+            covered_qty=0,
+            remaining_qty=3,
+            period_from=date(2027, 1, 1),
+            period_to=date(2027, 1, 31),
+            bom_level=0,
+        )
+    )
+    db_session.flush()
+    req2 = db_session.query(MrpRequirement).filter(
+        MrpRequirement.run_id == later_run.run_id,
+        MrpRequirement.item_id == reservation_a.item_id,
+    ).order_by(MrpRequirement.id.desc()).first()
+    assert req2 is not None
+    db_session.add_all([
+        MrpRequirementBucket(
+            requirement_id=reservation_a.requirement_id,
+            run_id=reservation_a.run_id,
+            item_id=reservation_a.item_id,
+            bucket_date=date(2026, 6, 30),
+            gross_qty=2,
+            net_qty=2,
+        ),
+        MrpRequirementBucket(
+            requirement_id=req2.id,
+            run_id=req2.run_id,
+            item_id=req2.item_id,
+            bucket_date=date(2027, 1, 31),
+            gross_qty=3,
+            net_qty=3,
+        ),
+        ReservationEntry(
+            ledger_generation_id=generation.id,
+            item_id=reservation_a.item_id,
+            characteristic_ref="",
+            organization_ref="",
+            planning_stock_pool="selected",
+            run_id=later_run.run_id,
+            freeze_version=1,
+            requirement_id=req2.id,
+            priority_period_from=req2.period_from,
+            priority_period_to=req2.period_to,
+            realization_mode="make",
+            reserved_qty=Decimal("3"),
+            realized_qty=Decimal("0"),
+            lifecycle_status="active",
+        ),
+    ])
+    db_session.add(StockLedgerEntry(
+        ingest_batch_id=generation.physical_import_batch_id,
+        source_content_hash="org-fifo",
+        item_id=reservation_a.item_id,
+        characteristic_ref="",
+        organization_ref="ORG-LATE",
+        warehouse_ref1c="WH",
+        qty=Decimal("5"),
+        qty_after=Decimal("5"),
+        posting_at=datetime(2027, 7, 20, 10, 0),
+        record_type="Receipt",
+        movement_kind="assembly_in",
+        recorder_type="Production",
+        recorder_ref="REC-ORG-FIFO",
+        line_no="1",
+        ingest_source="test",
+        active=True,
+    ))
+    db_session.query(StockLedgerEntry).filter(
+        StockLedgerEntry.ingest_batch_id == generation.physical_import_batch_id,
+        StockLedgerEntry.source_content_hash == "hash-ORG-FIFO",
+    ).delete(synchronize_session=False)
+    db_session.flush()
+
+    result = run_historical_replay(db_session, generation.id)
+    allocations = (
+        db_session.query(MrpExecutionAllocation)
+        .filter_by(ledger_generation_id=generation.id)
+        .order_by(MrpExecutionAllocation.bucket_id.asc(), MrpExecutionAllocation.id.asc())
+        .all()
+    )
+
+    assert result["allocated_qty"] == "5.000"
+    assert len(allocations) == 2
+    assert allocations[0].requirement_id == reservation_a.requirement_id
+    assert allocations[0].allocated_qty == Decimal("2")
+    assert allocations[1].requirement_id == req2.id
+    assert allocations[1].allocated_qty == Decimal("3")

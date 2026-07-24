@@ -464,6 +464,10 @@ def validate_generation_build(
         raise GenerationValidationError("historical replay violates fact conservation")
     if allocated_qty != sum(allocation_by_req_mode.values(), Decimal("0")):
         raise GenerationValidationError("replay metrics disagree with persisted allocations")
+    if _d(replay_metrics.get("ambiguous_pool_facts")) != Decimal("0"):
+        raise GenerationValidationError("historical replay has unresolved planning-stock pools")
+    if _d(replay_metrics.get("ambiguous_identity_facts")) != Decimal("0"):
+        raise GenerationValidationError("historical replay has unresolved provenance identities")
 
     supplier_candidates = _supplier_candidates(db, int(generation.id))
     supplier_physical_ids = {
