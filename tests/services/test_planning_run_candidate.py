@@ -338,6 +338,50 @@ def test_create_added_candidate_retries_exact_add_and_rejects_conflicts(db_sessi
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == accepted.id
 
 
+def test_create_added_candidate_rejects_legacy_current_duplicate(db_session):
+    _parent, accepted, target = _parent_and_target(db_session)
+    plan = models.ProductionPlanHeader(
+        name="legacy duplicate", period_from=date(2026, 8, 1), period_to=date(2026, 8, 31), status="fixed",
+    )
+    db_session.add(plan)
+    db_session.flush()
+    duplicate_current = models.PlanningRun(
+        status="FIXED_SNAPSHOT", ledger_generation_id=None, source_plan_id=plan.id,
+        period_from=plan.period_from, period_to=plan.period_to, config_snapshot={},
+    )
+    db_session.add(duplicate_current)
+    db_session.flush()
+    item = models.Item(
+        item_code="legacy-dup-item", item_name="Legacy duplicate item",
+        unit="шт", replenishment_method="Покупка", replenishment_time=7, stock_qty=0,
+        status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+    req = models.MrpRequirement(
+        run_id=duplicate_current.run_id, item_id=item.item_id, total_required_qty=0,
+        net_required_qty=0, period_from=plan.period_from, period_to=plan.period_to, bom_level=0,
+    )
+    db_session.add(req)
+    db_session.flush()
+    db_session.add(models.ReservationEntry(
+        ledger_generation_id=accepted.id,
+        item_id=item.item_id,
+        run_id=duplicate_current.run_id,
+        freeze_version=0,
+        requirement_id=req.id,
+        priority_period_from=plan.period_from,
+        priority_period_to=plan.period_to,
+    ))
+    db_session.flush()
+
+    with pytest.raises(PlanningRunCandidateError, match="already has a FIXED_SNAPSHOT"):
+        create_added_candidate_run(
+            db_session, plan.id, target.id, "worker",
+            horizon_days=30, config_version_id=None, config_snapshot={},
+        )
+
+
 def test_create_added_candidate_rejects_duplicate_current_plan_and_outer_rollback(db_session):
     _parent, accepted, target = _parent_and_target(db_session)
     plan = models.ProductionPlanHeader(

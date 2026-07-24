@@ -21,7 +21,12 @@ from sqlalchemy.orm import Session
 from app import models
 from app.services.purchase_control_snapshot import validate_purchase_control_journal_buy_row
 from app.services.mrp_freeze import MRP_LEDGER_LOCK_KEY
-from app.services.obligation_refresh_manifest import MANIFEST_HASH_KEY, MANIFEST_KEY
+from app.services.obligation_refresh_manifest import (
+    MANIFEST_HASH_KEY,
+    MANIFEST_KEY,
+    _current_parents,
+)
+from app.services.planning_run_candidate import _resolve_parent_generation_id
 
 
 class ObligationRefreshPublishError(RuntimeError):
@@ -627,11 +632,20 @@ def _exact_retry(
     if not candidates:
         return None
     parent_ids = [int(row.prior_run_id) for row in candidates if row.prior_run_id is not None]
-    parents = _lock(db.query(models.PlanningRun)).filter(
-        models.PlanningRun.run_id.in_(parent_ids),
-        models.PlanningRun.status == "SUPERSEDED",
-        models.PlanningRun.ledger_generation_id == int(parent.id),
-    ).all() if parent_ids else []
+    if parent_ids:
+        superseded = _lock(db.query(models.PlanningRun)).filter(
+            models.PlanningRun.run_id.in_(parent_ids),
+            models.PlanningRun.status == "SUPERSEDED",
+            models.PlanningRun.source_plan_id.isnot(None),
+        ).all()
+        parents = [
+            row for row in superseded
+            if _resolve_parent_generation_id(
+                db, row, current_generation_id=int(parent.id)
+            ) == int(parent.id)
+        ]
+    else:
+        parents = []
     try:
         refreshes, additions = _require_manifest(
             db, target=target, parents=parents, candidates=candidates,
@@ -691,10 +705,15 @@ def _exact_retry(
             or candidate.finished_at is None
         ):
             return None
-    if db.query(models.PlanningRun.run_id).filter(
-        models.PlanningRun.ledger_generation_id == int(parent.id),
+    fixed_parents = _lock(db.query(models.PlanningRun)).filter(
         models.PlanningRun.status == "FIXED_SNAPSHOT",
-    ).first() is not None:
+        models.PlanningRun.source_plan_id.isnot(None),
+    ).all()
+    if any(
+        _resolve_parent_generation_id(
+            db, row, current_generation_id=int(parent.id)
+        ) == int(parent.id) for row in fixed_parents
+    ):
         return None
     candidate_ids = [int(row.run_id) for row in candidates]
     try:
@@ -778,10 +797,10 @@ def publish_obligation_refresh_batch(
     pointer, parent, target = _require_refresh_lineage(
         db, int(parent_generation_id), int(target_generation_id)
     )
-    parents = _lock(db.query(models.PlanningRun)).filter(
-        models.PlanningRun.ledger_generation_id == int(parent.id),
-        models.PlanningRun.status == "FIXED_SNAPSHOT",
-    ).order_by(models.PlanningRun.run_id).all()
+    parents = [
+        _lock(db.query(models.PlanningRun)).filter_by(run_id=int(row.run_id)).one()
+        for row in _current_parents(db, int(parent.id))
+    ]
     if any(row.source_plan_id is None for row in parents):
         raise ObligationRefreshPublishError("active parent snapshot lacks source plan lineage")
 

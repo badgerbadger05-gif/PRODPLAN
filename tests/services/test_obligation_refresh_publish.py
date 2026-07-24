@@ -249,6 +249,47 @@ def test_publish_exact_retry_is_noop_but_mixed_state_is_rejected(db_session):
         _publish(db_session, parent, target, cutoff)
 
 
+def test_publish_legacy_parent_without_direct_generation_id_is_supported_and_exact_retry_is_noop(db_session):
+    cutoff, parent, target, parents, candidates = _batch(db_session, count=1)
+    legacy_parent = parents[0]
+    legacy_parent.ledger_generation_id = None
+    item = models.Item(
+        item_code="legacy-lineage-item", item_name="legacy lineage item",
+        unit="шт", replenishment_method="Покупка", replenishment_time=7, stock_qty=0,
+        status="active",
+    )
+    db_session.add(item)
+    db_session.flush()
+    req = models.MrpRequirement(
+        run_id=legacy_parent.run_id, item_id=item.item_id, total_required_qty=0,
+        net_required_qty=0, period_from=legacy_parent.period_from,
+        period_to=legacy_parent.period_to, bom_level=0,
+    )
+    db_session.add(req)
+    db_session.flush()
+    db_session.add(models.ReservationEntry(
+        ledger_generation_id=parent.id,
+        item_id=item.item_id,
+        run_id=legacy_parent.run_id,
+        freeze_version=0,
+        requirement_id=req.id,
+        priority_period_from=legacy_parent.period_from,
+        priority_period_to=legacy_parent.period_to,
+    ))
+    db_session.flush()
+
+    first = _publish(db_session, parent, target, cutoff)
+    assert first.published is True
+    assert first.parent_run_ids == (legacy_parent.run_id,)
+    assert first.candidate_run_ids == (candidates[0].run_id,)
+    db_session.commit()
+
+    retry = _publish(db_session, parent, target, cutoff)
+    assert retry.published is False
+    assert retry.parent_run_ids == first.parent_run_ids
+    assert retry.candidate_run_ids == first.candidate_run_ids
+
+
 def test_publish_rejects_candidate_with_external_export_link(db_session):
     cutoff, parent, target, _parents, candidates = _batch(db_session)
     order = models.ProductionOrder(

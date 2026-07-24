@@ -31,6 +31,8 @@ def _as_utc(value: datetime | None, field: str) -> datetime:
 def _resolve_parent_generation_id(
     db: Session,
     parent: models.PlanningRun,
+    *,
+    current_generation_id: int | None = None,
 ) -> int | None:
     """Resolve a parent generation from direct lineage or reservation replay.
 
@@ -42,14 +44,17 @@ def _resolve_parent_generation_id(
         return int(parent.ledger_generation_id)
 
     run_id = int(parent.run_id)
-    pointer = db.get(models.PlanningTruthState, 1)
-    if (
-        pointer is None
-        or pointer.current_generation_id is None
-    ):
-        return None
+    if current_generation_id is None:
+        pointer = db.get(models.PlanningTruthState, 1)
+        if (
+            pointer is None
+            or pointer.current_generation_id is None
+        ):
+            return None
+        current_generation_id = int(pointer.current_generation_id)
+    else:
+        current_generation_id = int(current_generation_id)
 
-    current_generation_id = int(pointer.current_generation_id)
     current = db.get(models.LedgerGeneration, current_generation_id)
     if current is None or str(current.status) != "accepted":
         return None
@@ -253,13 +258,22 @@ def _require_added_plan_and_target(
 
     # A plan that already has a published snapshot on the current truth
     # generation is a refresh, never another add.  Historical/superseded runs
-    # deliberately do not participate in this decision.
-    current_fixed = db.query(models.PlanningRun.run_id).filter(
+    # deliberately do not participate in this decision unless lineage proves
+    # they belong to the same accepted generation.
+    current_fixed = db.query(models.PlanningRun).filter(
         models.PlanningRun.ledger_generation_id == int(accepted.id),
         models.PlanningRun.source_plan_id == int(plan.id),
         models.PlanningRun.status == "FIXED_SNAPSHOT",
-    ).first()
-    if current_fixed is not None:
+    ).all()
+    legacy_fixed = db.query(models.PlanningRun).filter(
+        models.PlanningRun.source_plan_id == int(plan.id),
+        models.PlanningRun.status == "FIXED_SNAPSHOT",
+        models.PlanningRun.ledger_generation_id.is_(None),
+    ).all()
+    if (
+        current_fixed
+        or any(_resolve_parent_generation_id(db, row) == int(accepted.id) for row in legacy_fixed)
+    ):
         raise PlanningRunCandidateError(
             "source production plan already has a FIXED_SNAPSHOT on current Ledger generation"
         )
