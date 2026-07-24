@@ -2817,7 +2817,7 @@
           "plan"
         ],
         "summary": "Start Planning Run",
-        "description": "Полный расчёт планирования и сохранение результатов прогона.\nСоздаёт RUN с конфигурацией (RUNNING) → выполняет расчёт предпросмотра (gross+net),\nклассифицирует потоки (production/purchase), сохраняет planned_order/planned_purchase,\nзавершает статусом SUCCESS/FAILED и возвращает run_id.",
+        "description": "Retired: live runs bypass immutable Ledger candidates and snapshots.",
         "operationId": "start_planning_run_api_v1_plan_calc_post",
         "requestBody": {
           "content": {
@@ -2857,7 +2857,7 @@
           "plan"
         ],
         "summary": "Calc Preview",
-        "description": "Предпросчёт валовой и чистой потребности (без записи результатов в БД).\nПолитики и горизонты берутся из активной конфигурации с учётом overrides.",
+        "description": "Retired: previews must be persisted by the background refresh flow.",
         "operationId": "calc_preview_api_v1_plan_calc_preview_post",
         "requestBody": {
           "content": {
@@ -2897,7 +2897,7 @@
           "plan"
         ],
         "summary": "Calc Gross",
-        "description": "Валовая потребность (BOM-развёртка) без неттинга и без записи в БД.",
+        "description": "Retired: gross demand is part of a sealed Ledger-bound snapshot.",
         "operationId": "calc_gross_api_v1_plan_calc_gross_post",
         "requestBody": {
           "content": {
@@ -3140,7 +3140,7 @@
           "plan"
         ],
         "summary": "Get Planning Result Summary",
-        "description": "Сводка результатов прогона планирования (KPI, предупреждения, базовые счётчики)",
+        "description": "Сводка из сохранённого Ledger-bound снимка; расчёт не запускается.",
         "operationId": "get_planning_result_summary_api_v1_plan_results__run_id__get",
         "parameters": [
           {
@@ -3150,6 +3150,22 @@
             "schema": {
               "type": "integer",
               "title": "Run Id"
+            }
+          },
+          {
+            "name": "snapshot_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Snapshot Id"
             }
           }
         ],
@@ -3181,7 +3197,7 @@
           "plan"
         ],
         "summary": "Get Planning Result Production",
-        "description": "Производственные заказы и этапы по прогону (с фильтрами и пагинацией)",
+        "description": "Производственные обязательства из сохранённого снимка.",
         "operationId": "get_planning_result_production_api_v1_plan_results__run_id__production_get",
         "parameters": [
           {
@@ -3324,6 +3340,22 @@
               ],
               "title": "Sort Dir"
             }
+          },
+          {
+            "name": "snapshot_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Snapshot Id"
+            }
           }
         ],
         "responses": {
@@ -3354,7 +3386,7 @@
           "plan"
         ],
         "summary": "Get Planning Result Production Grouped",
-        "description": "Группированная по участкам выдача производственных заказов",
+        "description": "Группировка сохранённых производственных обязательств по участкам.",
         "operationId": "get_planning_result_production_grouped_api_v1_plan_results__run_id__production_grouped_get",
         "parameters": [
           {
@@ -3513,7 +3545,7 @@
           "plan"
         ],
         "summary": "Get Planning Result Purchases",
-        "description": "Заявки на закупку по прогону (с фильтрами и пагинацией)",
+        "description": "Закупочные обязательства из сохранённого снимка.",
         "operationId": "get_planning_result_purchases_api_v1_plan_results__run_id__purchases_get",
         "parameters": [
           {
@@ -3656,6 +3688,22 @@
               ],
               "title": "Sort Dir"
             }
+          },
+          {
+            "name": "snapshot_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Snapshot Id"
+            }
           }
         ],
         "responses": {
@@ -3686,7 +3734,7 @@
           "plan"
         ],
         "summary": "Get Planning Result Purchases Grouped",
-        "description": "Агрегированная выдача закупок по item_id+unit (для верхней таблицы UI).",
+        "description": "Агрегированная выдача закупок из принятого снимка.",
         "operationId": "get_planning_result_purchases_grouped_api_v1_plan_results__run_id__purchases_grouped_get",
         "parameters": [
           {
@@ -3779,7 +3827,7 @@
           "plan"
         ],
         "summary": "Get Planning Result Rework",
-        "description": "Заказы на переработку по прогону (с фильтрами и пагинацией).",
+        "description": "Обязательства переработки из сохранённого снимка.",
         "operationId": "get_planning_result_rework_api_v1_plan_results__run_id__rework_get",
         "parameters": [
           {
@@ -3922,6 +3970,22 @@
               ],
               "title": "Sort Dir"
             }
+          },
+          {
+            "name": "snapshot_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Snapshot Id"
+            }
           }
         ],
         "responses": {
@@ -3952,7 +4016,7 @@
           "plan"
         ],
         "summary": "Get Planning Result Rework Grouped",
-        "description": "Группированная выдача заказов на переработку.",
+        "description": "Группированная выдача переработки из принятого снимка.",
         "operationId": "get_planning_result_rework_grouped_api_v1_plan_results__run_id__rework_grouped_get",
         "parameters": [
           {
@@ -4095,7 +4159,7 @@
           "plan"
         ],
         "summary": "Get Planning Result Purchases Grouped By Category",
-        "description": "Группированная выдача закупок по товарным группам.",
+        "description": "Закупки по сохранённой в снимке товарной группе.",
         "operationId": "get_planning_result_purchases_grouped_by_category_api_v1_plan_results__run_id__purchases_grouped_by_category_get",
         "parameters": [
           {
@@ -4238,7 +4302,7 @@
           "plan"
         ],
         "summary": "Get Planning Result Rework Grouped By Category",
-        "description": "Группированная выдача заказов на переработку по товарным группам.",
+        "description": "Переработка по сохранённой в снимке товарной группе.",
         "operationId": "get_planning_result_rework_grouped_by_category_api_v1_plan_results__run_id__rework_grouped_by_category_get",
         "parameters": [
           {
@@ -4381,7 +4445,7 @@
           "plan"
         ],
         "summary": "Get Planning Result Capacity",
-        "description": "Загрузка мощностей по участкам (фильтры и пагинация)",
+        "description": "Загрузка мощностей из сохранённого MRP-снимка.",
         "operationId": "get_planning_result_capacity_api_v1_plan_results__run_id__capacity_get",
         "parameters": [
           {
@@ -4475,6 +4539,22 @@
               "type": "integer",
               "default": 0,
               "title": "Offset"
+            }
+          },
+          {
+            "name": "snapshot_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Snapshot Id"
             }
           }
         ],
@@ -4981,6 +5061,22 @@
               ],
               "title": "Sort Dir"
             }
+          },
+          {
+            "name": "snapshot_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Snapshot Id"
+            }
           }
         ],
         "responses": {
@@ -5128,6 +5224,22 @@
               ],
               "title": "Sort Dir"
             }
+          },
+          {
+            "name": "snapshot_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Snapshot Id"
+            }
           }
         ],
         "responses": {
@@ -5209,7 +5321,7 @@
           "plan"
         ],
         "summary": "Refreeze Mrp Snapshots",
-        "description": "Заморозка v2: пере-заморозить остаточный нетто-расчёт всей активной\nобласти MRP (все открытые FIXED_SNAPSHOT-планы) против ОДНОГО общего пула\nзапасов/поставок/WIP — физическая единица кредитуется не более чем одному\nплану. ``plan_id`` включает конкретный план в область (создаёт/обновляет его\nпрогон). ``dry_run=true`` считает и откатывает, ничего не записывая.",
+        "description": "Retired destructive endpoint; use the period-plan snapshot contract.",
         "operationId": "refreeze_mrp_snapshots_api_v1_plan_mrp_snapshot_refreeze_post",
         "requestBody": {
           "content": {
@@ -5251,7 +5363,7 @@
           "plan"
         ],
         "summary": "Reconcile Active Snapshots",
-        "description": "Регламентная сверка остаточной потребности: пересчитать текущий нетто-расчёт\nдля каждого активного MRP-снимка и добрать недопокрытие (заказы на\nпроизводство в журнал, строки закупок в MRP). В 1С ничего не уходит —\nтолько по кнопке пользователя.\n\n`dry_run=true` считает и возвращает дельту, ничего не записывая.",
+        "description": "Retired: proposal mutations belong to obligation-refresh publish.",
         "operationId": "reconcile_active_snapshots_api_v1_plan_reconcile_post",
         "requestBody": {
           "content": {
@@ -5293,7 +5405,7 @@
           "plan"
         ],
         "summary": "Reconcile Single Snapshot",
-        "description": "Сверка одного FIXED_SNAPSHOT-прогона. См. POST /reconcile.",
+        "description": "Retired: a published run is immutable and cannot be reconciled live.",
         "operationId": "reconcile_single_snapshot_api_v1_plan_results__run_id__reconcile_post",
         "parameters": [
           {
@@ -5568,6 +5680,22 @@
                 }
               ],
               "title": "Sort Dir"
+            }
+          },
+          {
+            "name": "snapshot_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Snapshot Id"
             }
           }
         ],
@@ -8206,6 +8334,50 @@
         }
       }
     },
+    "/api/v1/production-control/orders/{product_id}/materials/refresh": {
+      "post": {
+        "tags": [
+          "production-control"
+        ],
+        "summary": "Post Order Line Materials Refresh",
+        "operationId": "post_order_line_materials_refresh_api_v1_production_control_orders__product_id__materials_refresh_post",
+        "parameters": [
+          {
+            "name": "product_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Product Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Post Order Line Materials Refresh Api V1 Production Control Orders  Product Id  Materials Refresh Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/production-control/orders/{product_id}/produce": {
       "post": {
         "tags": [
@@ -10232,6 +10404,26 @@
         }
       }
     },
+    "/api/v1/dbr/feeder/cockpit": {
+      "get": {
+        "tags": [
+          "dbr"
+        ],
+        "summary": "Get Feeder Cockpit",
+        "description": "Return one coherent, saved DBR read model for the accepted Ledger.",
+        "operationId": "get_feeder_cockpit_api_v1_dbr_feeder_cockpit_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/dbr/feeder/positions": {
       "get": {
         "tags": [
@@ -10417,16 +10609,6 @@
             "schema": {
               "type": "integer",
               "title": "Position Id"
-            }
-          },
-          {
-            "name": "include_live_nfp",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "boolean",
-              "default": true,
-              "title": "Include Live Nfp"
             }
           }
         ],
@@ -11537,6 +11719,26 @@
         }
       }
     },
+    "/api/v1/dbr/purchase/cockpit": {
+      "get": {
+        "tags": [
+          "dbr"
+        ],
+        "summary": "Get Purchase Cockpit",
+        "description": "Read the immutable purchase obligations of the accepted Ledger only.",
+        "operationId": "get_purchase_cockpit_api_v1_dbr_purchase_cockpit_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/dbr/feeder/purchase/launch": {
       "post": {
         "tags": [
@@ -11583,7 +11785,7 @@
           "dbr"
         ],
         "summary": "Purchase Plan Preview",
-        "description": "Pure net-requirement preview (no writes) for a program or active schedule.",
+        "description": "Retired: use the saved Ledger purchase cockpit instead.",
         "operationId": "purchase_plan_preview_api_v1_dbr_purchase_plan_preview_get",
         "parameters": [
           {
@@ -11652,7 +11854,7 @@
           "dbr"
         ],
         "summary": "Purchase Plan Materialize",
-        "description": "Materialize the net purchase plan into supplier orders (same export path).\n\ndry_run=true (default) previews only; unresolved rows (no supplier) are\nreported and never block the batch.",
+        "description": "Retired until a Ledger-native purchase materializer is implemented.",
         "operationId": "purchase_plan_materialize_api_v1_dbr_purchase_plan_materialize_post",
         "requestBody": {
           "content": {
@@ -12384,6 +12586,455 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ItemLedgerDriftResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/item-ledger/admin/historical-generations/bootstrap": {
+      "post": {
+        "tags": [
+          "item-ledger-admin"
+        ],
+        "summary": "Bootstrap Historical Generation",
+        "description": "Create/resume historical lineage and seed its immutable opening Balance.",
+        "operationId": "bootstrap_historical_generation_api_v1_item_ledger_admin_historical_generations_bootstrap_post",
+        "parameters": [
+          {
+            "name": "X-PRODPLAN-ADMIN-TOKEN",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Prodplan-Admin-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HistoricalBootstrapRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Bootstrap Historical Generation Api V1 Item Ledger Admin Historical Generations Bootstrap Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/item-ledger/admin/historical-generations/{generation_id}/import": {
+      "post": {
+        "tags": [
+          "item-ledger-admin"
+        ],
+        "summary": "Import Historical Generation",
+        "description": "Process a bounded number of durable windows, pausing between 1C reads.",
+        "operationId": "import_historical_generation_api_v1_item_ledger_admin_historical_generations__generation_id__import_post",
+        "parameters": [
+          {
+            "name": "generation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Generation Id"
+            }
+          },
+          {
+            "name": "X-PRODPLAN-ADMIN-TOKEN",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Prodplan-Admin-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HistoricalImportRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Import Historical Generation Api V1 Item Ledger Admin Historical Generations  Generation Id  Import Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/item-ledger/admin/historical-generations/{generation_id}": {
+      "get": {
+        "tags": [
+          "item-ledger-admin"
+        ],
+        "summary": "Get Historical Generation",
+        "operationId": "get_historical_generation_api_v1_item_ledger_admin_historical_generations__generation_id__get",
+        "parameters": [
+          {
+            "name": "generation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Generation Id"
+            }
+          },
+          {
+            "name": "X-PRODPLAN-ADMIN-TOKEN",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Prodplan-Admin-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Get Historical Generation Api V1 Item Ledger Admin Historical Generations  Generation Id  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/item-ledger/admin/historical-generations/{generation_id}/verify-balance": {
+      "post": {
+        "tags": [
+          "item-ledger-admin"
+        ],
+        "summary": "Verify Historical Generation Balance",
+        "operationId": "verify_historical_generation_balance_api_v1_item_ledger_admin_historical_generations__generation_id__verify_balance_post",
+        "parameters": [
+          {
+            "name": "generation_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "title": "Generation Id"
+            }
+          },
+          {
+            "name": "X-PRODPLAN-ADMIN-TOKEN",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Prodplan-Admin-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Verify Historical Generation Balance Api V1 Item Ledger Admin Historical Generations  Generation Id  Verify Balance Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/item-ledger/admin/generations/accept": {
+      "post": {
+        "tags": [
+          "item-ledger-admin"
+        ],
+        "summary": "Accept Generation",
+        "description": "Build and atomically publish one explicitly selected generation.",
+        "operationId": "accept_generation_api_v1_item_ledger_admin_generations_accept_post",
+        "parameters": [
+          {
+            "name": "X-PRODPLAN-ADMIN-TOKEN",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Prodplan-Admin-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GenerationAcceptRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Accept Generation Api V1 Item Ledger Admin Generations Accept Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/item-ledger/admin/generations/invalidate": {
+      "post": {
+        "tags": [
+          "item-ledger-admin"
+        ],
+        "summary": "Invalidate Generation",
+        "description": "Fail-close the current generation without falling back to older truth.",
+        "operationId": "invalidate_generation_api_v1_item_ledger_admin_generations_invalidate_post",
+        "parameters": [
+          {
+            "name": "X-PRODPLAN-ADMIN-TOKEN",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Prodplan-Admin-Token"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GenerationInvalidateRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TruthLifecycleResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/item-ledger/admin/seed": {
+      "post": {
+        "tags": [
+          "item-ledger-admin"
+        ],
+        "summary": "Seed Ledger",
+        "description": "Сид якоря T0 леджера-1 из свежего 1С /Balance (design Прил. A §4).",
+        "operationId": "seed_ledger_api_v1_item_ledger_admin_seed_post",
+        "parameters": [
+          {
+            "name": "dry_run",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Только сводка, БД не трогается",
+              "default": true,
+              "title": "Dry Run"
+            },
+            "description": "Только сводка, БД не трогается"
+          },
+          {
+            "name": "force",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Совместимый параметр; разрушительный пере-сид отключён и при существующей истории возвращает 409",
+              "default": false,
+              "title": "Force"
+            },
+            "description": "Совместимый параметр; разрушительный пере-сид отключён и при существующей истории возвращает 409"
+          },
+          {
+            "name": "X-PRODPLAN-ADMIN-TOKEN",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Prodplan-Admin-Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SeedResponse"
                 }
               }
             }
@@ -13592,6 +14243,55 @@
         "type": "object",
         "title": "GenerateEmbeddingsRequest"
       },
+      "GenerationAcceptRequest": {
+        "properties": {
+          "generation_id": {
+            "type": "integer",
+            "title": "Generation Id"
+          },
+          "replay_from": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Replay From"
+          },
+          "explicit_empty_physical": {
+            "type": "boolean",
+            "title": "Explicit Empty Physical",
+            "default": false
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "generation_id",
+          "replay_from"
+        ],
+        "title": "GenerationAcceptRequest"
+      },
+      "GenerationInvalidateRequest": {
+        "properties": {
+          "expected_generation_id": {
+            "type": "integer",
+            "title": "Expected Generation Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "reason": {
+            "type": "string",
+            "title": "Reason"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "expected_generation_id",
+          "status",
+          "reason"
+        ],
+        "title": "GenerationInvalidateRequest"
+      },
       "GroupsSelection": {
         "properties": {
           "ids": {
@@ -13620,6 +14320,80 @@
         },
         "type": "object",
         "title": "HTTPValidationError"
+      },
+      "HistoricalBootstrapRequest": {
+        "properties": {
+          "generation_key": {
+            "type": "string",
+            "title": "Generation Key"
+          },
+          "opening_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Opening At"
+          },
+          "replay_from": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Replay From"
+          },
+          "cutoff": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Cutoff"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "generation_key",
+          "opening_at",
+          "replay_from",
+          "cutoff"
+        ],
+        "title": "HistoricalBootstrapRequest"
+      },
+      "HistoricalImportRequest": {
+        "properties": {
+          "max_windows": {
+            "type": "integer",
+            "maximum": 24.0,
+            "minimum": 1.0,
+            "title": "Max Windows",
+            "default": 1
+          },
+          "window_hours": {
+            "type": "integer",
+            "maximum": 168.0,
+            "minimum": 1.0,
+            "title": "Window Hours",
+            "default": 24
+          },
+          "page_size": {
+            "type": "integer",
+            "maximum": 5000.0,
+            "minimum": 1.0,
+            "title": "Page Size",
+            "default": 1000
+          },
+          "max_pages_per_window": {
+            "type": "integer",
+            "maximum": 100000.0,
+            "minimum": 1.0,
+            "title": "Max Pages Per Window",
+            "default": 10000
+          },
+          "pause_seconds": {
+            "type": "number",
+            "maximum": 300.0,
+            "minimum": 0.0,
+            "title": "Pause Seconds",
+            "default": 0
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "HistoricalImportRequest"
       },
       "IgnoredWarehousePayload": {
         "properties": {
@@ -13946,6 +14720,9 @@
             },
             "type": "array",
             "title": "Rows"
+          },
+          "truth_meta": {
+            "$ref": "#/components/schemas/TruthMeta"
           }
         },
         "additionalProperties": false,
@@ -13954,7 +14731,8 @@
           "total",
           "limit",
           "offset",
-          "rows"
+          "rows",
+          "truth_meta"
         ],
         "title": "ItemLedgerDriftResponse"
       },
@@ -14190,6 +14968,9 @@
             },
             "type": "array",
             "title": "Rows"
+          },
+          "truth_meta": {
+            "$ref": "#/components/schemas/TruthMeta"
           }
         },
         "additionalProperties": false,
@@ -14198,7 +14979,8 @@
           "total",
           "limit",
           "offset",
-          "rows"
+          "rows",
+          "truth_meta"
         ],
         "title": "ItemLedgerMovementsResponse"
       },
@@ -14284,6 +15066,9 @@
           },
           "flags": {
             "$ref": "#/components/schemas/ItemLedgerPositionFlags"
+          },
+          "truth_meta": {
+            "$ref": "#/components/schemas/TruthMeta"
           }
         },
         "additionalProperties": false,
@@ -14302,7 +15087,8 @@
           "available",
           "projected",
           "uncovered",
-          "flags"
+          "flags",
+          "truth_meta"
         ],
         "title": "ItemLedgerPositionResponse"
       },
@@ -14441,13 +15227,17 @@
             },
             "type": "array",
             "title": "Rows"
+          },
+          "truth_meta": {
+            "$ref": "#/components/schemas/TruthMeta"
           }
         },
         "additionalProperties": false,
         "type": "object",
         "required": [
           "reservation_id",
-          "rows"
+          "rows",
+          "truth_meta"
         ],
         "title": "ItemLedgerReservationEventsResponse"
       },
@@ -14588,12 +15378,16 @@
             },
             "type": "array",
             "title": "Rows"
+          },
+          "truth_meta": {
+            "$ref": "#/components/schemas/TruthMeta"
           }
         },
         "additionalProperties": false,
         "type": "object",
         "required": [
-          "rows"
+          "rows",
+          "truth_meta"
         ],
         "title": "ItemLedgerReservationsResponse"
       },
@@ -15349,6 +16143,10 @@
       },
       "PeriodPlanMrpSnapshotRequest": {
         "properties": {
+          "generation_key": {
+            "type": "string",
+            "title": "Generation Key"
+          },
           "started_by": {
             "anyOf": [
               {
@@ -15362,6 +16160,9 @@
           }
         },
         "type": "object",
+        "required": [
+          "generation_key"
+        ],
         "title": "PeriodPlanMrpSnapshotRequest"
       },
       "PeriodPlanUpdateRequest": {
@@ -15812,6 +16613,33 @@
       },
       "ProductionGroupedResponse": {
         "properties": {
+          "snapshot_id": {
+            "type": "integer",
+            "title": "Snapshot Id"
+          },
+          "ledger_generation": {
+            "type": "integer",
+            "title": "Ledger Generation"
+          },
+          "cutoff": {
+            "type": "string",
+            "title": "Cutoff"
+          },
+          "truth_status": {
+            "type": "string",
+            "title": "Truth Status"
+          },
+          "truth_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Truth Reason"
+          },
           "groups": {
             "items": {
               "$ref": "#/components/schemas/ProductionGroup"
@@ -15838,6 +16666,10 @@
         },
         "type": "object",
         "required": [
+          "snapshot_id",
+          "ledger_generation",
+          "cutoff",
+          "truth_status",
           "groups",
           "total_groups",
           "total_orders",
@@ -15923,6 +16755,9 @@
               }
             ],
             "title": "Latest Source Plan Id"
+          },
+          "truth_meta": {
+            "$ref": "#/components/schemas/TruthMeta"
           }
         },
         "additionalProperties": false,
@@ -15931,7 +16766,8 @@
           "rows",
           "total",
           "limit",
-          "offset"
+          "offset",
+          "truth_meta"
         ],
         "title": "ProductionOrderJournalResponse"
       },
@@ -16886,6 +17722,10 @@
       },
       "ProgramCreate": {
         "properties": {
+          "source_run_id": {
+            "type": "integer",
+            "title": "Source Run Id"
+          },
           "from_date": {
             "type": "string",
             "format": "date",
@@ -16940,6 +17780,7 @@
         },
         "type": "object",
         "required": [
+          "source_run_id",
           "from_date",
           "to_date"
         ],
@@ -17352,6 +18193,33 @@
       },
       "PurchaseCategoryGroupedResponse": {
         "properties": {
+          "snapshot_id": {
+            "type": "integer",
+            "title": "Snapshot Id"
+          },
+          "ledger_generation": {
+            "type": "integer",
+            "title": "Ledger Generation"
+          },
+          "cutoff": {
+            "type": "string",
+            "title": "Cutoff"
+          },
+          "truth_status": {
+            "type": "string",
+            "title": "Truth Status"
+          },
+          "truth_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Truth Reason"
+          },
           "groups": {
             "items": {
               "$ref": "#/components/schemas/PurchaseCategoryGroup"
@@ -17378,6 +18246,10 @@
         },
         "type": "object",
         "required": [
+          "snapshot_id",
+          "ledger_generation",
+          "cutoff",
+          "truth_status",
           "groups",
           "total_groups",
           "total_orders",
@@ -17389,17 +18261,11 @@
       "PurchaseLaunchRequest": {
         "properties": {
           "signal_ids": {
-            "anyOf": [
-              {
-                "items": {
-                  "type": "integer"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
+            "items": {
+              "type": "integer"
+            },
+            "type": "array",
+            "minItems": 1,
             "title": "Signal Ids"
           },
           "dry_run": {
@@ -17409,6 +18275,9 @@
           }
         },
         "type": "object",
+        "required": [
+          "signal_ids"
+        ],
         "title": "PurchaseLaunchRequest"
       },
       "PurchaseOrder1CExportRequest": {
@@ -18041,6 +18910,33 @@
       },
       "ReworkGroupedResponse": {
         "properties": {
+          "snapshot_id": {
+            "type": "integer",
+            "title": "Snapshot Id"
+          },
+          "ledger_generation": {
+            "type": "integer",
+            "title": "Ledger Generation"
+          },
+          "cutoff": {
+            "type": "string",
+            "title": "Cutoff"
+          },
+          "truth_status": {
+            "type": "string",
+            "title": "Truth Status"
+          },
+          "truth_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Truth Reason"
+          },
           "groups": {
             "items": {
               "$ref": "#/components/schemas/ReworkGroup"
@@ -18067,6 +18963,10 @@
         },
         "type": "object",
         "required": [
+          "snapshot_id",
+          "ledger_generation",
+          "cutoff",
+          "truth_status",
           "groups",
           "total_groups",
           "total_orders",
@@ -18074,6 +18974,156 @@
           "offset"
         ],
         "title": "ReworkGroupedResponse"
+      },
+      "SeedReseedStats": {
+        "properties": {
+          "entries_deleted": {
+            "type": "integer",
+            "title": "Entries Deleted"
+          },
+          "anchors_deleted": {
+            "type": "integer",
+            "title": "Anchors Deleted"
+          },
+          "bins_deleted": {
+            "type": "integer",
+            "title": "Bins Deleted"
+          },
+          "pull_rows_deleted": {
+            "type": "integer",
+            "title": "Pull Rows Deleted"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "entries_deleted",
+          "anchors_deleted",
+          "bins_deleted",
+          "pull_rows_deleted"
+        ],
+        "title": "SeedReseedStats"
+      },
+      "SeedResponse": {
+        "properties": {
+          "dry_run": {
+            "type": "boolean",
+            "title": "Dry Run"
+          },
+          "force": {
+            "type": "boolean",
+            "title": "Force"
+          },
+          "anchor_period": {
+            "type": "string",
+            "title": "Anchor Period"
+          },
+          "posting_at": {
+            "type": "string",
+            "title": "Posting At"
+          },
+          "balance_rows": {
+            "type": "integer",
+            "title": "Balance Rows"
+          },
+          "keys_total": {
+            "type": "integer",
+            "title": "Keys Total"
+          },
+          "keys_nonzero": {
+            "type": "integer",
+            "title": "Keys Nonzero"
+          },
+          "keys_skipped_zero": {
+            "type": "integer",
+            "title": "Keys Skipped Zero"
+          },
+          "total_qty": {
+            "type": "number",
+            "title": "Total Qty"
+          },
+          "anchors_existing": {
+            "type": "integer",
+            "title": "Anchors Existing"
+          },
+          "anchors_created": {
+            "type": "integer",
+            "title": "Anchors Created"
+          },
+          "entries_created": {
+            "type": "integer",
+            "title": "Entries Created"
+          },
+          "inflight_pulls": {
+            "type": "integer",
+            "title": "Inflight Pulls"
+          },
+          "reseed": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SeedReseedStats"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "physical_import_batch_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Physical Import Batch Id"
+          },
+          "ledger_generation_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ledger Generation Id"
+          },
+          "ledger_generation_status": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ledger Generation Status"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "dry_run",
+          "force",
+          "anchor_period",
+          "posting_at",
+          "balance_rows",
+          "keys_total",
+          "keys_nonzero",
+          "keys_skipped_zero",
+          "total_qty",
+          "anchors_existing",
+          "anchors_created",
+          "entries_created",
+          "inflight_pulls",
+          "reseed",
+          "physical_import_batch_id",
+          "ledger_generation_id",
+          "ledger_generation_status"
+        ],
+        "title": "SeedResponse"
       },
       "SetQuantityRequest": {
         "properties": {
@@ -18589,6 +19639,82 @@
         },
         "type": "object",
         "title": "SyncJobConfigPatch"
+      },
+      "TruthLifecycleResponse": {
+        "properties": {
+          "ledger_generation": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ledger Generation"
+          },
+          "truth_status": {
+            "type": "string",
+            "title": "Truth Status"
+          },
+          "ready": {
+            "type": "boolean",
+            "title": "Ready"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "truth_status",
+          "ready"
+        ],
+        "title": "TruthLifecycleResponse"
+      },
+      "TruthMeta": {
+        "properties": {
+          "ledger_generation": {
+            "type": "integer",
+            "title": "Ledger Generation"
+          },
+          "cutoff": {
+            "type": "string",
+            "title": "Cutoff"
+          },
+          "truth_status": {
+            "type": "string",
+            "title": "Truth Status"
+          },
+          "truth_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Truth Reason"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "ledger_generation",
+          "cutoff",
+          "truth_status"
+        ],
+        "title": "TruthMeta"
       },
       "UpdateQuantityPayload": {
         "properties": {

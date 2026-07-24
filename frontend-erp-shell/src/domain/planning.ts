@@ -237,6 +237,21 @@ export type ExecutionWorkItem = {
   forecast_reason?: string | null
 }
 
+export type ExecutionJournalLedgerLinkEvent = {
+  event_id: number
+  sle_id?: number | null
+  fact_ref?: string | null
+  fact_line_ref?: string | null
+  match_rule?: string | null
+  reservation_id?: number | null
+}
+
+export type ExecutionJournalLedgerLinks = {
+  item_id: number
+  reservation_ids: number[]
+  events: ExecutionJournalLedgerLinkEvent[]
+}
+
 export type ExecutionJournalRow = {
   req_id: number
   item_id: number
@@ -261,6 +276,7 @@ export type ExecutionJournalRow = {
   forecast_shift_days?: number | null
   forecast_reason?: string | null
   work_items: ExecutionWorkItem[]
+  ledger_links?: ExecutionJournalLedgerLinks | null
 }
 
 export type JournalRowStatus = 'net_zero' | 'covered' | 'partial' | 'ordered' | 'none'
@@ -304,6 +320,15 @@ export type ExecutionJournalSummary = {
 
 export type PlanningTruthStatus = 'accepted' | 'unavailable' | 'stale' | 'uninitialized' | 'rejected'
 
+export type ExecutionJournalTruthMeta = {
+  accepted_at?: string | null
+  accepted_by?: string | null
+  truth_source?: string | null
+  unavailable_sections?: string[] | null
+  unavailable_reason?: string | null
+  [key: string]: unknown
+}
+
 export type ExecutionJournalResponse = {
   plan: PeriodPlan
   run_id: number
@@ -312,6 +337,7 @@ export type ExecutionJournalResponse = {
   truth_status?: PlanningTruthStatus | string
   ledger_generation?: string | number | null
   cutoff?: string | null
+  truth_meta?: ExecutionJournalTruthMeta | null
   truth_reason?: string | null
   reason?: string | null
 }

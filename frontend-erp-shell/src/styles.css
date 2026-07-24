@@ -2851,6 +2851,11 @@ button.dbrLaunchBtn {
   background: var(--panel2);
 }
 
+.ledgerTimelineStep.selected {
+  border-left-color: var(--green);
+  background: linear-gradient(90deg, #e6f8ef, var(--panel2));
+}
+
 .ledgerTimelineStep.posting {
   border-left-color: var(--blue);
 }

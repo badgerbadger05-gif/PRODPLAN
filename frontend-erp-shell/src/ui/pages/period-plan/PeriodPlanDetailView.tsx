@@ -1,5 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
+  ExecutionJournalLedgerLinkEvent,
+  ExecutionJournalRow,
   ExecutionJournalResponse,
   ExecutionWorkItem,
   PeriodPlan,
@@ -699,6 +701,67 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
       : null
   }
 
+  function ledgerItemLink(row: Pick<ExecutionJournalRow, 'item_id' | 'item_code'>) {
+    const itemId = Number(row.item_id) || null
+    if (!itemId || !Number.isFinite(itemId)) return '#/ledger'
+    return `#/ledger/items/${encodeURIComponent(String(itemId))}`
+  }
+
+  function ledgerReservationLink(row: Pick<ExecutionJournalRow, 'item_id' | 'ledger_links'>, reservationId: number) {
+    const itemId = Number(row.ledger_links?.item_id ?? '')
+    if (!Number.isFinite(itemId) || !itemId) return `#/ledger/items/${row.item_id}`
+    return `#/ledger/items/${itemId}?tab=reservations&reservation_id=${encodeURIComponent(String(reservationId))}`
+  }
+
+  function ledgerEventLink(row: Pick<ExecutionJournalRow, 'item_id' | 'ledger_links'>, event: ExecutionJournalLedgerLinkEvent) {
+    const reservationId = event.reservation_id
+    const itemId = Number(row.ledger_links?.item_id ?? '')
+    const base = Number.isFinite(itemId) && itemId ? `#/ledger/items/${itemId}` : '#/ledger'
+    if (!Number.isFinite(reservationId) || !reservationId) return `${base}?tab=reservations`
+    const search = new URLSearchParams({
+      tab: 'reservations',
+      reservation_id: String(reservationId),
+      event_id: String(event.event_id),
+    })
+    return `${base}?${search.toString()}`
+  }
+
+  function ledgerLinksControls(row: ExecutionJournalRow) {
+    const links: { href: string; label: string; title: string; kind: 'reservation' | 'event' }[] = []
+    const ledgerLinks = row.ledger_links
+    if (!ledgerLinks) return links
+    const itemId = Number(ledgerLinks.item_id ?? '')
+    const resolvedItemId = Number.isFinite(itemId) && itemId > 0 ? itemId : row.item_id
+    const reservations = (ledgerLinks.reservation_ids ?? []).filter((reservationId): reservationId is number => Number.isFinite(reservationId) && reservationId > 0)
+    if (reservations.length) {
+      links.push({
+        href: `#/ledger/items/${encodeURIComponent(String(resolvedItemId))}`,
+        label: `Номенклатура #${resolvedItemId}`,
+        title: 'Ledger номенклатуры',
+        kind: 'reservation',
+      })
+      reservations.slice(0, 5).forEach((reservationId) => {
+        links.push({
+          href: ledgerReservationLink(row, reservationId),
+          label: `Резерв #${reservationId}`,
+          title: `Ledger: резерв #${reservationId}`,
+          kind: 'reservation',
+        })
+      })
+    }
+    const events = (ledgerLinks.events ?? []).filter((event) => Number.isFinite(event.event_id) && event.event_id > 0)
+    events.forEach((event) => {
+      if (!event.reservation_id) return
+      links.push({
+        href: ledgerEventLink(row, event),
+        label: `Событие #${event.event_id}`,
+        title: `Ledger событие #${event.event_id}`,
+        kind: 'event',
+      })
+    })
+    return links
+  }
+
   // Column sums for matrix footer
   const matrixColSums = useMemo(() => {
     if (!matrix) return {} as Record<string, number>
@@ -1230,7 +1293,9 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                     </tr>
                   </thead>
                   <tbody>
-                    {filteredJournalRows.map((row) => (
+                    {filteredJournalRows.map((row) => {
+                      const rowLedgerLinks = ledgerLinksControls(row)
+                      return (
                       <React.Fragment key={row.req_id}>
                         <tr
                           className={expandedReq === row.req_id ? 'activeRow' : ''}
@@ -1238,7 +1303,19 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                           onClick={() => setExpandedReq(expandedReq === row.req_id ? null : row.req_id)}
                         >
                           <td><span className="muted">{row.item_article || row.item_code}</span></td>
-                          <td><strong>{row.item_name}</strong></td>
+                          <td>
+                            <strong>
+                              <a
+                                href={ledgerItemLink(row)}
+                                title={`Ledger номенклатуры: ${row.item_code}`}
+                                onClick={(event) => event.stopPropagation()}
+                                style={{ textDecoration: 'none' }}
+                              >
+                                {row.item_name}
+                              </a>
+                            </strong>
+                            {row.item_article && <div className="muted">{row.item_article}</div>}
+                          </td>
                           <td><span className={`miniPill ${flowClass(row.flow)}`}>{flowLabel(row.flow)}</span></td>
                           <td style={{ textAlign: 'center' }}>{row.bom_level}</td>
                           <td
@@ -1339,8 +1416,33 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                             </tr>
                           )
                         })}
+                        {expandedReq === row.req_id && (
+                          <tr>
+                            <td />
+                            <td colSpan={11} style={{ paddingLeft: 24, marginBottom: 6 }}>
+                              {rowLedgerLinks.length > 0 ? (
+                                <div style={{ display: 'inline-flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                                  <span className="muted" style={{ fontSize: 12 }}>Ledger:</span>
+                                  {rowLedgerLinks.map((link) => (
+                                    <a
+                                      key={link.label + link.href}
+                                      href={link.href}
+                                      onClick={(event) => event.stopPropagation()}
+                                      className={`miniPill ${link.kind === 'event' ? 'partial' : 'to_move'}`}
+                                      style={{ textDecoration: 'none' }}
+                                      title={link.title}
+                                    >
+                                      {link.label}
+                                    </a>
+                                  ))}
+                                </div>
+                              ) : null}
+                            </td>
+                          </tr>
+                        )}
                       </React.Fragment>
-                    ))}
+                      )
+                    })}
                     {!filteredJournalRows.length && (
                       <tr><td colSpan={12}><div className="emptyDetail">Нет данных по выбранному фильтру</div></td></tr>
                     )}

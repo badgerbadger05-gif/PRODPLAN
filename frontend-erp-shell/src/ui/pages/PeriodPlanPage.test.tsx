@@ -114,6 +114,41 @@ const journalResponse: ExecutionJournalResponse = {
   },
 }
 
+const journalResponseWithLedgerLinks: ExecutionJournalResponse = {
+  ...journalResponse,
+  rows: [
+    {
+      ...journalResponse.rows[0],
+      ledger_links: {
+        item_id: 501,
+        reservation_ids: [101],
+        events: [
+          {
+            event_id: 11,
+            reservation_id: 101,
+            sle_id: 88231,
+            fact_ref: 'doc-1',
+            fact_line_ref: 'line-2',
+            match_rule: 'fifo',
+          },
+        ],
+      },
+      work_items: [
+        {
+          type: 'planned_order',
+          order_id: 77,
+          qty: 1,
+          remaining_qty: 1,
+          need_date: '2026-05-20',
+          forecast_date: null,
+          forecast_shift_days: null,
+          forecast_reason: null,
+        },
+      ],
+    },
+  ],
+}
+
 const listPlanA: PeriodPlan = {
   id: 101,
   name: 'АПРЕЛЬ 2026',
@@ -335,6 +370,33 @@ describe('PeriodPlanPage — detail view', () => {
     expect(vi.mocked(periodPlanSvc.getExecutionJournal).mock.calls[0][0]).toBe(123)
     // Journal-specific column header appears.
     expect(await screen.findByText('Тип')).toBeInTheDocument()
+  })
+
+  it('shows ledger links in expanded journal rows while preserving work-item links', async () => {
+    const user = userEvent.setup()
+    vi.mocked(periodPlanSvc.getExecutionJournal).mockResolvedValue(journalResponseWithLedgerLinks)
+    renderAt('/period-plan/123')
+    await screen.findByText('Насос ГА-1')
+
+    await user.click(screen.getByRole('button', { name: 'Журнал исполнения' }))
+    expect(await screen.findByText('Тип')).toBeInTheDocument()
+
+    const journalRow = await screen.findByText('Насос ГА-1')
+    await user.click(journalRow.closest('tr') as HTMLTableRowElement)
+
+    expect(await screen.findByRole('link', { name: 'Номенклатура #501' })).toHaveAttribute('href', '#/ledger/items/501')
+    expect(screen.getByRole('link', { name: 'Резерв #101' })).toHaveAttribute(
+      'href',
+      '#/ledger/items/501?tab=reservations&reservation_id=101',
+    )
+    expect(screen.getByRole('link', { name: 'Событие #11' })).toHaveAttribute(
+      'href',
+      '#/ledger/items/501?tab=reservations&reservation_id=101&event_id=11',
+    )
+    expect(screen.getByRole('link', { name: 'Задание #77' })).toHaveAttribute(
+      'href',
+      '#/mrp-runs/900?tab=production&planned_order_id=77',
+    )
   })
 
   it('fails closed when execution truth is unavailable', async () => {

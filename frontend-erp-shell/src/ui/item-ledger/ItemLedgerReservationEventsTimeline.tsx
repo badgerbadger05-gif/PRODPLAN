@@ -5,6 +5,7 @@ type EventRow = ItemLedgerReservationEventsResponse['rows'][number]
 
 type Props = {
   rows: EventRow[]
+  highlightedEventId?: number | null
 }
 
 const eventLabel: Record<string, string> = {
@@ -19,11 +20,15 @@ const eventLabel: Record<string, string> = {
   reopen: 'Возобновлён',
 }
 
-export function ItemLedgerReservationEventsTimeline({ rows }: Props) {
+export function ItemLedgerReservationEventsTimeline({ rows, highlightedEventId = null }: Props) {
   return (
     <ol className="ledgerTimeline" aria-label="Журнал событий резерва">
       {rows.map((event) => (
-        <li key={event.id} className={`ledgerTimelineStep ${event.event_kind}`}>
+        <li
+          key={event.id}
+          className={`ledgerTimelineStep ${event.event_kind}${highlightedEventId === event.id ? ' selected' : ''}`}
+          aria-current={highlightedEventId === event.id ? 'step' : undefined}
+        >
           <div>
             <strong>{eventLabel[event.event_kind] || event.event_kind}</strong>
             <span>{dateTimeRu(event.event_at) || '—'}</span>

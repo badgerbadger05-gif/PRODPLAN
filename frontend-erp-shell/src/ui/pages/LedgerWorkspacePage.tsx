@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import {
   getItemLedgerDrift,
   getItemLedgerMovements,
@@ -76,6 +76,9 @@ type Props = {
   provider?: ItemLedgerDataProvider
   itemId?: string | null
   onOpenItem?: (itemId: number) => void
+  initialTab?: Tab
+  initialReservationId?: number | null
+  initialEventId?: number | null
 }
 
 type LoadingState = {
@@ -105,8 +108,13 @@ const defaultReservationFilters: ReservationFilterState = {
 
 const reservationStatusOptions = ['active', 'closed', 'released', 'carried', 'cancelled']
 
-function toNumber(value: string) {
-  if (!value.trim()) return null
+function normalizeLedgerTab(raw: string | null) {
+  if (raw === 'movements' || raw === 'reservations' || raw === 'drift') return raw
+  return 'movements'
+}
+
+function toNumber(value: string | null) {
+  if (!value || !value.trim()) return null
   const parsed = Number.parseInt(value, 10)
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null
 }
@@ -144,11 +152,14 @@ export function LedgerWorkspacePage({
   provider = defaultItemLedgerProvider,
   itemId = null,
   onOpenItem,
+  initialTab,
+  initialReservationId = null,
+  initialEventId = null,
 }: Props) {
   const resolvedItemId = toItemId(itemId)
   const hasRouteItemId = resolvedItemId !== null
 
-  const [tab, setTab] = useState<Tab>('movements')
+  const [tab, setTab] = useState<Tab>(normalizeLedgerTab(initialTab ?? null))
   const [position, setPosition] = useState<ItemLedgerPosition | null>(null)
   const [movements, setMovements] = useState<ItemLedgerMovementsResponse['rows']>([])
   const [reservations, setReservations] = useState<ItemLedgerReservationsResponse['rows']>([])
@@ -162,7 +173,8 @@ export function LedgerWorkspacePage({
   const [reservationDraftFilters, setReservationDraftFilters] = useState<ReservationFilterState>(defaultReservationFilters)
   const [reservationFilters, setReservationFilters] = useState<ReservationFilterState>(defaultReservationFilters)
 
-  const [selectedReservationId, setSelectedReservationId] = useState<number | null>(null)
+  const [selectedReservationId, setSelectedReservationId] = useState<number | null>(initialReservationId)
+  const [highlightedEventId, setHighlightedEventId] = useState<number | null>(initialEventId)
   const [reservationEvents, setReservationEvents] = useState<ItemLedgerReservationEventsResponse['rows']>([])
   const [reservationEventsLoading, setReservationEventsLoading] = useState(false)
 
@@ -201,7 +213,6 @@ export function LedgerWorkspacePage({
     setLoadingState({ movements: true, reservations: true, drift: true })
     setErrors({ position: '', movements: '', reservations: '', drift: '', reservationEvents: '' })
     setReservationEvents([])
-    setSelectedReservationId(null)
 
     void Promise.allSettled([
       provider.loadPosition(resolvedItemId, controller.signal),
@@ -230,6 +241,8 @@ export function LedgerWorkspacePage({
       } else {
         setReservations([])
         setErrors((state) => ({ ...state, reservations: readableError(reservationsResult.reason) }))
+        setSelectedReservationId(null)
+        setHighlightedEventId(null)
       }
 
       if (driftResult.status === 'fulfilled') {
@@ -246,10 +259,18 @@ export function LedgerWorkspacePage({
   }, [itemId, hasRouteItemId, provider, movementFilters, reservationFilters, resolvedItemId])
 
   useEffect(() => {
+    if (!hasRouteItemId || selectedReservationId === null || loadingState.reservations) return
+    if (reservations.some((row) => row.reservation_id === selectedReservationId)) return
+    setSelectedReservationId(null)
+    setHighlightedEventId(null)
+  }, [hasRouteItemId, loadingState.reservations, reservations, selectedReservationId])
+
+  useEffect(() => {
     if (!hasRouteItemId || selectedReservationId === null) {
       setReservationEvents([])
       setReservationEventsLoading(false)
       setErrors((state) => ({ ...state, reservationEvents: '' }))
+      setHighlightedEventId(null)
       return
     }
 
@@ -465,13 +486,14 @@ export function LedgerWorkspacePage({
                 <div>Загрузка резервов...</div>
               )
               : (
-                <div className="ledgerSplit">
+                    <div className="ledgerSplit">
                   <div className="tablePane">
                     <ItemLedgerReservationsTable
                       rows={reservations}
                       selectedReservationId={selectedReservationId}
                       onSelect={(row) => {
                         setSelectedReservationId(row.reservation_id)
+                        setHighlightedEventId(null)
                       }}
                     />
                   </div>
@@ -483,7 +505,7 @@ export function LedgerWorkspacePage({
                         {errors.reservationEvents && <div role="alert" className="errorLine">{errors.reservationEvents}</div>}
                         {reservationEventsLoading
                           ? <div>Загрузка событий резерва...</div>
-                          : <ItemLedgerReservationEventsTimeline rows={reservationEvents} />}
+                          : <ItemLedgerReservationEventsTimeline rows={reservationEvents} highlightedEventId={highlightedEventId} />}
                       </>
                     )}
                   </aside>
@@ -506,10 +528,17 @@ export function LedgerWorkspacePage({
 export function LedgerWorkspaceRoute({ provider }: { provider?: ItemLedgerDataProvider }) {
   const { itemId } = useParams()
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  const initialTab = normalizeLedgerTab(searchParams.get('tab'))
+  const initialReservationId = toNumber(searchParams.get('reservation_id'))
+  const initialEventId = toNumber(searchParams.get('event_id'))
   return (
     <LedgerWorkspacePage
       provider={provider}
       itemId={itemId}
+      initialTab={initialTab}
+      initialReservationId={initialReservationId}
+      initialEventId={initialEventId}
       onOpenItem={(nextItemId) => navigate(`/ledger/items/${encodeURIComponent(String(nextItemId))}`)}
     />
   )

@@ -35,6 +35,19 @@ import type {
   DbrSettings,
   DbrSettingsUpdate,
 } from '../domain/dbr'
+
+type TruthMeta = {
+  ledger_generation: number
+  cutoff: string
+  truth_status: string
+  truth_reason?: string | null
+}
+
+type DbrSectionEnvelope<T> = {
+  section: string
+  rows: T
+  truth_meta: TruthMeta
+}
 import { api, apiText, ApiError } from '../lib/api'
 
 export function isDbrConflict(error: unknown): error is ApiError {
@@ -208,11 +221,15 @@ export function listDbrFeederPositions(filters: DbrFeederFilters = {}) {
   if (filters.search?.trim()) search.set('search', filters.search.trim())
   if (filters.limit !== undefined) search.set('limit', String(filters.limit))
   if (filters.offset !== undefined) search.set('offset', String(filters.offset))
-  return api<DbrFeederPosition[]>(`/v1/dbr/feeder/positions?${search.toString()}`)
+  return api<DbrSectionEnvelope<DbrFeederPosition[]>>(
+    `/v1/dbr/feeder/positions?${search.toString()}`,
+  ).then((response) => response.rows)
 }
 
 export function getDbrProcessingBoard() {
-  return api<DbrProcessingBoard>('/v1/dbr/feeder/processing/board')
+  return api<DbrSectionEnvelope<DbrProcessingBoard>>(
+    '/v1/dbr/feeder/processing/board',
+  ).then((response) => response.rows)
 }
 
 export function previewDbrProcessingChain() {
@@ -269,7 +286,9 @@ export function listDbrFeederSignals(filters: DbrFeederSignalFilters = {}) {
   if (filters.limit !== undefined) search.set('limit', String(filters.limit))
   if (filters.offset !== undefined) search.set('offset', String(filters.offset))
   const query = search.toString()
-  return api<DbrFeederSignal[]>(`/v1/dbr/feeder/signals${query ? `?${query}` : ''}`)
+  return api<DbrSectionEnvelope<DbrFeederSignal[]>>(
+    `/v1/dbr/feeder/signals${query ? `?${query}` : ''}`,
+  ).then((response) => response.rows)
 }
 
 export function getDbrFeederSignal(signalId: number) {
@@ -279,7 +298,9 @@ export function getDbrFeederSignal(signalId: number) {
 // ── Feeder material readiness + chain explosion (advisory, no 1С writes) ──────
 
 export function getDbrFeederDeficits() {
-  return api<DbrFeederDeficitsResult>('/v1/dbr/feeder/deficits')
+  return api<DbrSectionEnvelope<DbrFeederDeficitsResult>>(
+    '/v1/dbr/feeder/deficits',
+  ).then((response) => response.rows)
 }
 
 export function previewDbrFeederChain() {

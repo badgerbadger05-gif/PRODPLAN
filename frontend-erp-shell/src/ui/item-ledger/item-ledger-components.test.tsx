@@ -10,7 +10,15 @@ import {
 import { qty } from '../../lib/format'
 import type { ItemLedgerDriftResponse, ItemLedgerMovementRow, ItemLedgerPosition, ItemLedgerReservationsResponse, ItemLedgerReservationEventsResponse } from '../../domain/itemLedger'
 
+const truthMeta = {
+  ledger_generation: 4,
+  cutoff: '2026-07-23T12:00:00',
+  truth_status: 'accepted',
+  truth_reason: null,
+}
+
 const position: ItemLedgerPosition = {
+  truth_meta: truthMeta,
   item_id: 9401,
   item_code: '00000063',
   item_name: 'Труба',

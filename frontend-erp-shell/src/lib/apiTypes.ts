@@ -1102,10 +1102,7 @@ export interface paths {
         put?: never;
         /**
          * Start Planning Run
-         * @description Полный расчёт планирования и сохранение результатов прогона.
-         *     Создаёт RUN с конфигурацией (RUNNING) → выполняет расчёт предпросмотра (gross+net),
-         *     классифицирует потоки (production/purchase), сохраняет planned_order/planned_purchase,
-         *     завершает статусом SUCCESS/FAILED и возвращает run_id.
+         * @description Retired: live runs bypass immutable Ledger candidates and snapshots.
          */
         post: operations["start_planning_run_api_v1_plan_calc_post"];
         delete?: never;
@@ -1125,8 +1122,7 @@ export interface paths {
         put?: never;
         /**
          * Calc Preview
-         * @description Предпросчёт валовой и чистой потребности (без записи результатов в БД).
-         *     Политики и горизонты берутся из активной конфигурации с учётом overrides.
+         * @description Retired: previews must be persisted by the background refresh flow.
          */
         post: operations["calc_preview_api_v1_plan_calc_preview_post"];
         delete?: never;
@@ -1146,7 +1142,7 @@ export interface paths {
         put?: never;
         /**
          * Calc Gross
-         * @description Валовая потребность (BOM-развёртка) без неттинга и без записи в БД.
+         * @description Retired: gross demand is part of a sealed Ledger-bound snapshot.
          */
         post: operations["calc_gross_api_v1_plan_calc_gross_post"];
         delete?: never;
@@ -1248,7 +1244,7 @@ export interface paths {
         };
         /**
          * Get Planning Result Summary
-         * @description Сводка результатов прогона планирования (KPI, предупреждения, базовые счётчики)
+         * @description Сводка из сохранённого Ledger-bound снимка; расчёт не запускается.
          */
         get: operations["get_planning_result_summary_api_v1_plan_results__run_id__get"];
         put?: never;
@@ -1268,7 +1264,7 @@ export interface paths {
         };
         /**
          * Get Planning Result Production
-         * @description Производственные заказы и этапы по прогону (с фильтрами и пагинацией)
+         * @description Производственные обязательства из сохранённого снимка.
          */
         get: operations["get_planning_result_production_api_v1_plan_results__run_id__production_get"];
         put?: never;
@@ -1288,7 +1284,7 @@ export interface paths {
         };
         /**
          * Get Planning Result Production Grouped
-         * @description Группированная по участкам выдача производственных заказов
+         * @description Группировка сохранённых производственных обязательств по участкам.
          */
         get: operations["get_planning_result_production_grouped_api_v1_plan_results__run_id__production_grouped_get"];
         put?: never;
@@ -1308,7 +1304,7 @@ export interface paths {
         };
         /**
          * Get Planning Result Purchases
-         * @description Заявки на закупку по прогону (с фильтрами и пагинацией)
+         * @description Закупочные обязательства из сохранённого снимка.
          */
         get: operations["get_planning_result_purchases_api_v1_plan_results__run_id__purchases_get"];
         put?: never;
@@ -1328,7 +1324,7 @@ export interface paths {
         };
         /**
          * Get Planning Result Purchases Grouped
-         * @description Агрегированная выдача закупок по item_id+unit (для верхней таблицы UI).
+         * @description Агрегированная выдача закупок из принятого снимка.
          */
         get: operations["get_planning_result_purchases_grouped_api_v1_plan_results__run_id__purchases_grouped_get"];
         put?: never;
@@ -1348,7 +1344,7 @@ export interface paths {
         };
         /**
          * Get Planning Result Rework
-         * @description Заказы на переработку по прогону (с фильтрами и пагинацией).
+         * @description Обязательства переработки из сохранённого снимка.
          */
         get: operations["get_planning_result_rework_api_v1_plan_results__run_id__rework_get"];
         put?: never;
@@ -1368,7 +1364,7 @@ export interface paths {
         };
         /**
          * Get Planning Result Rework Grouped
-         * @description Группированная выдача заказов на переработку.
+         * @description Группированная выдача переработки из принятого снимка.
          */
         get: operations["get_planning_result_rework_grouped_api_v1_plan_results__run_id__rework_grouped_get"];
         put?: never;
@@ -1388,7 +1384,7 @@ export interface paths {
         };
         /**
          * Get Planning Result Purchases Grouped By Category
-         * @description Группированная выдача закупок по товарным группам.
+         * @description Закупки по сохранённой в снимке товарной группе.
          */
         get: operations["get_planning_result_purchases_grouped_by_category_api_v1_plan_results__run_id__purchases_grouped_by_category_get"];
         put?: never;
@@ -1408,7 +1404,7 @@ export interface paths {
         };
         /**
          * Get Planning Result Rework Grouped By Category
-         * @description Группированная выдача заказов на переработку по товарным группам.
+         * @description Переработка по сохранённой в снимке товарной группе.
          */
         get: operations["get_planning_result_rework_grouped_by_category_api_v1_plan_results__run_id__rework_grouped_by_category_get"];
         put?: never;
@@ -1428,7 +1424,7 @@ export interface paths {
         };
         /**
          * Get Planning Result Capacity
-         * @description Загрузка мощностей по участкам (фильтры и пагинация)
+         * @description Загрузка мощностей из сохранённого MRP-снимка.
          */
         get: operations["get_planning_result_capacity_api_v1_plan_results__run_id__capacity_get"];
         put?: never;
@@ -1637,11 +1633,7 @@ export interface paths {
         put?: never;
         /**
          * Refreeze Mrp Snapshots
-         * @description Заморозка v2: пере-заморозить остаточный нетто-расчёт всей активной
-         *     области MRP (все открытые FIXED_SNAPSHOT-планы) против ОДНОГО общего пула
-         *     запасов/поставок/WIP — физическая единица кредитуется не более чем одному
-         *     плану. ``plan_id`` включает конкретный план в область (создаёт/обновляет его
-         *     прогон). ``dry_run=true`` считает и откатывает, ничего не записывая.
+         * @description Retired destructive endpoint; use the period-plan snapshot contract.
          */
         post: operations["refreeze_mrp_snapshots_api_v1_plan_mrp_snapshot_refreeze_post"];
         delete?: never;
@@ -1661,12 +1653,7 @@ export interface paths {
         put?: never;
         /**
          * Reconcile Active Snapshots
-         * @description Регламентная сверка остаточной потребности: пересчитать текущий нетто-расчёт
-         *     для каждого активного MRP-снимка и добрать недопокрытие (заказы на
-         *     производство в журнал, строки закупок в MRP). В 1С ничего не уходит —
-         *     только по кнопке пользователя.
-         *
-         *     `dry_run=true` считает и возвращает дельту, ничего не записывая.
+         * @description Retired: proposal mutations belong to obligation-refresh publish.
          */
         post: operations["reconcile_active_snapshots_api_v1_plan_reconcile_post"];
         delete?: never;
@@ -1686,7 +1673,7 @@ export interface paths {
         put?: never;
         /**
          * Reconcile Single Snapshot
-         * @description Сверка одного FIXED_SNAPSHOT-прогона. См. POST /reconcile.
+         * @description Retired: a published run is immutable and cannot be reconciled live.
          */
         post: operations["reconcile_single_snapshot_api_v1_plan_results__run_id__reconcile_post"];
         delete?: never;
@@ -2549,6 +2536,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/production-control/orders/{product_id}/materials/refresh": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Post Order Line Materials Refresh */
+        post: operations["post_order_line_materials_refresh_api_v1_production_control_orders__product_id__materials_refresh_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/production-control/orders/{product_id}/produce": {
         parameters: {
             query?: never;
@@ -3193,6 +3197,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/dbr/feeder/cockpit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Feeder Cockpit
+         * @description Return one coherent, saved DBR read model for the accepted Ledger.
+         */
+        get: operations["get_feeder_cockpit_api_v1_dbr_feeder_cockpit_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/dbr/feeder/positions": {
         parameters: {
             query?: never;
@@ -3686,6 +3710,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/dbr/purchase/cockpit": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Purchase Cockpit
+         * @description Read the immutable purchase obligations of the accepted Ledger only.
+         */
+        get: operations["get_purchase_cockpit_api_v1_dbr_purchase_cockpit_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/dbr/feeder/purchase/launch": {
         parameters: {
             query?: never;
@@ -3719,7 +3763,7 @@ export interface paths {
         };
         /**
          * Purchase Plan Preview
-         * @description Pure net-requirement preview (no writes) for a program or active schedule.
+         * @description Retired: use the saved Ledger purchase cockpit instead.
          */
         get: operations["purchase_plan_preview_api_v1_dbr_purchase_plan_preview_get"];
         put?: never;
@@ -3741,10 +3785,7 @@ export interface paths {
         put?: never;
         /**
          * Purchase Plan Materialize
-         * @description Materialize the net purchase plan into supplier orders (same export path).
-         *
-         *     dry_run=true (default) previews only; unresolved rows (no supplier) are
-         *     reported and never block the batch.
+         * @description Retired until a Ledger-native purchase materializer is implemented.
          */
         post: operations["purchase_plan_materialize_api_v1_dbr_purchase_plan_materialize_post"];
         delete?: never;
@@ -4008,6 +4049,140 @@ export interface paths {
         get: operations["get_drift_api_v1_item_ledger__item_id__drift_get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/item-ledger/admin/historical-generations/bootstrap": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Bootstrap Historical Generation
+         * @description Create/resume historical lineage and seed its immutable opening Balance.
+         */
+        post: operations["bootstrap_historical_generation_api_v1_item_ledger_admin_historical_generations_bootstrap_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/item-ledger/admin/historical-generations/{generation_id}/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Import Historical Generation
+         * @description Process a bounded number of durable windows, pausing between 1C reads.
+         */
+        post: operations["import_historical_generation_api_v1_item_ledger_admin_historical_generations__generation_id__import_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/item-ledger/admin/historical-generations/{generation_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Historical Generation */
+        get: operations["get_historical_generation_api_v1_item_ledger_admin_historical_generations__generation_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/item-ledger/admin/historical-generations/{generation_id}/verify-balance": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Verify Historical Generation Balance */
+        post: operations["verify_historical_generation_balance_api_v1_item_ledger_admin_historical_generations__generation_id__verify_balance_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/item-ledger/admin/generations/accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Accept Generation
+         * @description Build and atomically publish one explicitly selected generation.
+         */
+        post: operations["accept_generation_api_v1_item_ledger_admin_generations_accept_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/item-ledger/admin/generations/invalidate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Invalidate Generation
+         * @description Fail-close the current generation without falling back to older truth.
+         */
+        post: operations["invalidate_generation_api_v1_item_ledger_admin_generations_invalidate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/item-ledger/admin/seed": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Seed Ledger
+         * @description Сид якоря T0 леджера-1 из свежего 1С /Balance (design Прил. A §4).
+         */
+        post: operations["seed_ledger_api_v1_item_ledger_admin_seed_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4471,6 +4646,30 @@ export interface components {
         };
         /** GenerateEmbeddingsRequest */
         GenerateEmbeddingsRequest: Record<string, never>;
+        /** GenerationAcceptRequest */
+        GenerationAcceptRequest: {
+            /** Generation Id */
+            generation_id: number;
+            /**
+             * Replay From
+             * Format: date-time
+             */
+            replay_from: string;
+            /**
+             * Explicit Empty Physical
+             * @default false
+             */
+            explicit_empty_physical: boolean;
+        };
+        /** GenerationInvalidateRequest */
+        GenerationInvalidateRequest: {
+            /** Expected Generation Id */
+            expected_generation_id: number;
+            /** Status */
+            status: string;
+            /** Reason */
+            reason: string;
+        };
         /** GroupsSelection */
         GroupsSelection: {
             /** Ids */
@@ -4480,6 +4679,54 @@ export interface components {
         HTTPValidationError: {
             /** Detail */
             detail?: components["schemas"]["ValidationError"][];
+        };
+        /** HistoricalBootstrapRequest */
+        HistoricalBootstrapRequest: {
+            /** Generation Key */
+            generation_key: string;
+            /**
+             * Opening At
+             * Format: date-time
+             */
+            opening_at: string;
+            /**
+             * Replay From
+             * Format: date-time
+             */
+            replay_from: string;
+            /**
+             * Cutoff
+             * Format: date-time
+             */
+            cutoff: string;
+        };
+        /** HistoricalImportRequest */
+        HistoricalImportRequest: {
+            /**
+             * Max Windows
+             * @default 1
+             */
+            max_windows: number;
+            /**
+             * Window Hours
+             * @default 24
+             */
+            window_hours: number;
+            /**
+             * Page Size
+             * @default 1000
+             */
+            page_size: number;
+            /**
+             * Max Pages Per Window
+             * @default 10000
+             */
+            max_pages_per_window: number;
+            /**
+             * Pause Seconds
+             * @default 0
+             */
+            pause_seconds: number;
         };
         /** IgnoredWarehousePayload */
         IgnoredWarehousePayload: {
@@ -4588,6 +4835,7 @@ export interface components {
             offset: number;
             /** Rows */
             rows: components["schemas"]["ItemLedgerDriftRow"][];
+            truth_meta: components["schemas"]["TruthMeta"];
         };
         /** ItemLedgerDriftRow */
         ItemLedgerDriftRow: {
@@ -4659,6 +4907,7 @@ export interface components {
             offset: number;
             /** Rows */
             rows: components["schemas"]["ItemLedgerMovement"][];
+            truth_meta: components["schemas"]["TruthMeta"];
         };
         /** ItemLedgerPositionFlags */
         ItemLedgerPositionFlags: {
@@ -4698,6 +4947,7 @@ export interface components {
             /** Uncovered */
             uncovered: number;
             flags: components["schemas"]["ItemLedgerPositionFlags"];
+            truth_meta: components["schemas"]["TruthMeta"];
         };
         /** ItemLedgerPositionWarehouse */
         ItemLedgerPositionWarehouse: {
@@ -4748,6 +4998,7 @@ export interface components {
             reservation_id: number;
             /** Rows */
             rows: components["schemas"]["ItemLedgerReservationEventRow"][];
+            truth_meta: components["schemas"]["TruthMeta"];
         };
         /** ItemLedgerReservationPriority */
         ItemLedgerReservationPriority: {
@@ -4789,6 +5040,7 @@ export interface components {
         ItemLedgerReservationsResponse: {
             /** Rows */
             rows: components["schemas"]["ItemLedgerReservationRow"][];
+            truth_meta: components["schemas"]["TruthMeta"];
         };
         /** ItemUpdate */
         ItemUpdate: {
@@ -5043,6 +5295,8 @@ export interface components {
         };
         /** PeriodPlanMrpSnapshotRequest */
         PeriodPlanMrpSnapshotRequest: {
+            /** Generation Key */
+            generation_key: string;
             /** Started By */
             started_by?: string | null;
         };
@@ -5203,6 +5457,16 @@ export interface components {
         };
         /** ProductionGroupedResponse */
         ProductionGroupedResponse: {
+            /** Snapshot Id */
+            snapshot_id: number;
+            /** Ledger Generation */
+            ledger_generation: number;
+            /** Cutoff */
+            cutoff: string;
+            /** Truth Status */
+            truth_status: string;
+            /** Truth Reason */
+            truth_reason?: string | null;
             /** Groups */
             groups: components["schemas"]["ProductionGroup"][];
             /** Total Groups */
@@ -5247,6 +5511,7 @@ export interface components {
             latest_run_id?: number | null;
             /** Latest Source Plan Id */
             latest_source_plan_id?: number | null;
+            truth_meta: components["schemas"]["TruthMeta"];
         };
         /**
          * ProductionOrderJournalRowResponse
@@ -5551,6 +5816,8 @@ export interface components {
         };
         /** ProgramCreate */
         ProgramCreate: {
+            /** Source Run Id */
+            source_run_id: number;
             /**
              * From Date
              * Format: date
@@ -5687,6 +5954,16 @@ export interface components {
         };
         /** PurchaseCategoryGroupedResponse */
         PurchaseCategoryGroupedResponse: {
+            /** Snapshot Id */
+            snapshot_id: number;
+            /** Ledger Generation */
+            ledger_generation: number;
+            /** Cutoff */
+            cutoff: string;
+            /** Truth Status */
+            truth_status: string;
+            /** Truth Reason */
+            truth_reason?: string | null;
             /** Groups */
             groups: components["schemas"]["PurchaseCategoryGroup"][];
             /** Total Groups */
@@ -5701,7 +5978,7 @@ export interface components {
         /** PurchaseLaunchRequest */
         PurchaseLaunchRequest: {
             /** Signal Ids */
-            signal_ids?: number[] | null;
+            signal_ids: number[];
             /**
              * Dry Run
              * @default true
@@ -5964,6 +6241,16 @@ export interface components {
         };
         /** ReworkGroupedResponse */
         ReworkGroupedResponse: {
+            /** Snapshot Id */
+            snapshot_id: number;
+            /** Ledger Generation */
+            ledger_generation: number;
+            /** Cutoff */
+            cutoff: string;
+            /** Truth Status */
+            truth_status: string;
+            /** Truth Reason */
+            truth_reason?: string | null;
             /** Groups */
             groups: components["schemas"]["ReworkGroup"][];
             /** Total Groups */
@@ -5974,6 +6261,53 @@ export interface components {
             limit: number;
             /** Offset */
             offset: number;
+        };
+        /** SeedReseedStats */
+        SeedReseedStats: {
+            /** Entries Deleted */
+            entries_deleted: number;
+            /** Anchors Deleted */
+            anchors_deleted: number;
+            /** Bins Deleted */
+            bins_deleted: number;
+            /** Pull Rows Deleted */
+            pull_rows_deleted: number;
+        };
+        /** SeedResponse */
+        SeedResponse: {
+            /** Dry Run */
+            dry_run: boolean;
+            /** Force */
+            force: boolean;
+            /** Anchor Period */
+            anchor_period: string;
+            /** Posting At */
+            posting_at: string;
+            /** Balance Rows */
+            balance_rows: number;
+            /** Keys Total */
+            keys_total: number;
+            /** Keys Nonzero */
+            keys_nonzero: number;
+            /** Keys Skipped Zero */
+            keys_skipped_zero: number;
+            /** Total Qty */
+            total_qty: number;
+            /** Anchors Existing */
+            anchors_existing: number;
+            /** Anchors Created */
+            anchors_created: number;
+            /** Entries Created */
+            entries_created: number;
+            /** Inflight Pulls */
+            inflight_pulls: number;
+            reseed: components["schemas"]["SeedReseedStats"] | null;
+            /** Physical Import Batch Id */
+            physical_import_batch_id: number | null;
+            /** Ledger Generation Id */
+            ledger_generation_id: number | null;
+            /** Ledger Generation Status */
+            ledger_generation_status: string | null;
         };
         /** SetQuantityRequest */
         SetQuantityRequest: {
@@ -6139,6 +6473,30 @@ export interface components {
             interval_seconds?: number | null;
             /** Enabled */
             enabled?: boolean | null;
+        };
+        /** TruthLifecycleResponse */
+        TruthLifecycleResponse: {
+            /** Ledger Generation */
+            ledger_generation?: number | null;
+            /** Truth Status */
+            truth_status: string;
+            /** Ready */
+            ready: boolean;
+            /** Reason */
+            reason?: string | null;
+        } & {
+            [key: string]: unknown;
+        };
+        /** TruthMeta */
+        TruthMeta: {
+            /** Ledger Generation */
+            ledger_generation: number;
+            /** Cutoff */
+            cutoff: string;
+            /** Truth Status */
+            truth_status: string;
+            /** Truth Reason */
+            truth_reason?: string | null;
         };
         /** UpdateQuantityPayload */
         UpdateQuantityPayload: {
@@ -8465,7 +8823,9 @@ export interface operations {
     };
     get_planning_result_summary_api_v1_plan_results__run_id__get: {
         parameters: {
-            query?: never;
+            query?: {
+                snapshot_id?: number | null;
+            };
             header?: never;
             path: {
                 run_id: number;
@@ -8506,6 +8866,7 @@ export interface operations {
                 offset?: number;
                 sort_by?: string | null;
                 sort_dir?: string | null;
+                snapshot_id?: number | null;
             };
             header?: never;
             path: {
@@ -8587,6 +8948,7 @@ export interface operations {
                 offset?: number;
                 sort_by?: string | null;
                 sort_dir?: string | null;
+                snapshot_id?: number | null;
             };
             header?: never;
             path: {
@@ -8664,6 +9026,7 @@ export interface operations {
                 offset?: number;
                 sort_by?: string | null;
                 sort_dir?: string | null;
+                snapshot_id?: number | null;
             };
             header?: never;
             path: {
@@ -8819,6 +9182,7 @@ export interface operations {
                 date_to?: string | null;
                 limit?: number;
                 offset?: number;
+                snapshot_id?: number | null;
             };
             header?: never;
             path: {
@@ -9074,6 +9438,7 @@ export interface operations {
                 date_to?: string | null;
                 sort_by?: string | null;
                 sort_dir?: string | null;
+                snapshot_id?: number | null;
             };
             header?: never;
             path: {
@@ -9113,6 +9478,7 @@ export interface operations {
                 date_to?: string | null;
                 sort_by?: string | null;
                 sort_dir?: string | null;
+                snapshot_id?: number | null;
             };
             header?: never;
             path: {
@@ -9358,6 +9724,7 @@ export interface operations {
                 date_to?: string | null;
                 sort_by?: string | null;
                 sort_dir?: string | null;
+                snapshot_id?: number | null;
             };
             header?: never;
             path: {
@@ -10777,6 +11144,39 @@ export interface operations {
             };
         };
     };
+    post_order_line_materials_refresh_api_v1_production_control_orders__product_id__materials_refresh_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                product_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     post_produce_line_api_v1_production_control_orders__product_id__produce_post: {
         parameters: {
             query?: never;
@@ -12098,6 +12498,26 @@ export interface operations {
             };
         };
     };
+    get_feeder_cockpit_api_v1_dbr_feeder_cockpit_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
     get_feeder_positions_api_v1_dbr_feeder_positions_get: {
         parameters: {
             query?: {
@@ -12140,9 +12560,7 @@ export interface operations {
     };
     get_feeder_position_api_v1_dbr_feeder_positions__position_id__get: {
         parameters: {
-            query?: {
-                include_live_nfp?: boolean;
-            };
+            query?: never;
             header?: never;
             path: {
                 position_id: number;
@@ -12954,6 +13372,26 @@ export interface operations {
             };
         };
     };
+    get_purchase_cockpit_api_v1_dbr_purchase_cockpit_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+        };
+    };
     feeder_launch_purchase_api_v1_dbr_feeder_purchase_launch_post: {
         parameters: {
             query?: never;
@@ -13493,6 +13931,260 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ItemLedgerDriftResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    bootstrap_historical_generation_api_v1_item_ledger_admin_historical_generations_bootstrap_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-PRODPLAN-ADMIN-TOKEN"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["HistoricalBootstrapRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    import_historical_generation_api_v1_item_ledger_admin_historical_generations__generation_id__import_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-PRODPLAN-ADMIN-TOKEN"?: string | null;
+            };
+            path: {
+                generation_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["HistoricalImportRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_historical_generation_api_v1_item_ledger_admin_historical_generations__generation_id__get: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-PRODPLAN-ADMIN-TOKEN"?: string | null;
+            };
+            path: {
+                generation_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    verify_historical_generation_balance_api_v1_item_ledger_admin_historical_generations__generation_id__verify_balance_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-PRODPLAN-ADMIN-TOKEN"?: string | null;
+            };
+            path: {
+                generation_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    accept_generation_api_v1_item_ledger_admin_generations_accept_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-PRODPLAN-ADMIN-TOKEN"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GenerationAcceptRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    invalidate_generation_api_v1_item_ledger_admin_generations_invalidate_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-PRODPLAN-ADMIN-TOKEN"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GenerationInvalidateRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TruthLifecycleResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    seed_ledger_api_v1_item_ledger_admin_seed_post: {
+        parameters: {
+            query?: {
+                /** @description Только сводка, БД не трогается */
+                dry_run?: boolean;
+                /** @description Совместимый параметр; разрушительный пере-сид отключён и при существующей истории возвращает 409 */
+                force?: boolean;
+            };
+            header?: {
+                "X-PRODPLAN-ADMIN-TOKEN"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SeedResponse"];
                 };
             };
             /** @description Validation Error */

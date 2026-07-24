@@ -29,7 +29,15 @@ function defer<T>(): Defer<T> {
   return { resolve, promise }
 }
 
+const truthMeta = {
+  ledger_generation: 4,
+  cutoff: '2026-07-23T12:00:00',
+  truth_status: 'accepted',
+  truth_reason: null,
+}
+
 const position: ItemLedgerPosition = {
+  truth_meta: truthMeta,
   item_id: 9401,
   item_code: '00000063',
   item_name: 'Труба',
@@ -60,6 +68,7 @@ const position: ItemLedgerPosition = {
 }
 
 const movements: ItemLedgerMovementsResponse = {
+  truth_meta: truthMeta,
   total: 1,
   limit: 100,
   offset: 0,
@@ -100,6 +109,7 @@ const movements: ItemLedgerMovementsResponse = {
 }
 
 const reservations: ItemLedgerReservationsResponse = {
+  truth_meta: truthMeta,
   rows: [
     {
       reservation_id: 101,
@@ -137,6 +147,7 @@ const reservations: ItemLedgerReservationsResponse = {
 }
 
 const drift: ItemLedgerDriftResponse = {
+  truth_meta: truthMeta,
   total: 1,
   limit: 100,
   offset: 0,
@@ -160,6 +171,7 @@ const drift: ItemLedgerDriftResponse = {
 }
 
 const reservationEvents: ItemLedgerReservationEventsResponse = {
+  truth_meta: truthMeta,
   reservation_id: 101,
   rows: [
     {
@@ -188,9 +200,9 @@ function createProvider(overrides: Partial<ItemLedgerDataProvider> = {}): ItemLe
   }
 }
 
-function renderLedgerRoute(provider: ItemLedgerDataProvider) {
+function renderLedgerRoute(provider: ItemLedgerDataProvider, initialEntries = ['/ledger']) {
   return render(
-    <MemoryRouter initialEntries={['/ledger']}>
+    <MemoryRouter initialEntries={initialEntries}>
       <Routes>
         <Route path="/ledger" element={<LedgerWorkspaceRoute provider={provider} />} />
         <Route path="/ledger/items/:itemId" element={<LedgerWorkspaceRoute provider={provider} />} />
@@ -270,6 +282,7 @@ describe('LedgerWorkspacePage', () => {
     fireEvent.click(screen.getByRole('row', { name: /Резерв 102/ }))
 
     secondEvents.resolve({
+      truth_meta: truthMeta,
       reservation_id: 102,
       rows: [
         {
@@ -288,6 +301,7 @@ describe('LedgerWorkspacePage', () => {
     })
 
     firstEvents.resolve({
+      truth_meta: truthMeta,
       reservation_id: 101,
       rows: [
         {
@@ -309,5 +323,19 @@ describe('LedgerWorkspacePage', () => {
       expect(screen.getByText(/doc-2/)).toBeInTheDocument()
       expect(screen.queryByText(/doc-1/)).not.toBeInTheDocument()
     })
+  })
+
+  it('opens ledger with reservations tab and preselected reservation/event from query params', async () => {
+    const provider = createProvider()
+    const { container } = renderLedgerRoute(provider, ['/ledger/items/9401?tab=reservations&reservation_id=101&event_id=7'])
+
+    expect(await screen.findByText('Труба')).toBeInTheDocument()
+    expect(await screen.findByText('События резерва #101')).toBeInTheDocument()
+    await waitFor(() => expect(provider.loadReservationEvents).toHaveBeenCalledWith(9401, 101, expect.any(AbortSignal)))
+
+    const selectedEvent = container.querySelector('.ledgerTimelineStep.selected')
+    expect(selectedEvent).toBeTruthy()
+    expect(selectedEvent).toHaveAttribute('aria-current', 'step')
+    expect(selectedEvent).toHaveTextContent('SLE #88231')
   })
 })
