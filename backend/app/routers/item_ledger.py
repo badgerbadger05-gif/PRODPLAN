@@ -33,6 +33,7 @@ from pydantic import BaseModel, ConfigDict
 
 from .. import models
 from ..database import get_db
+from ..routers.truth_meta import TruthMeta, build_truth_meta
 from ..services.item_ledger.physical_visibility import visible_sle_query
 from ..services.item_ledger.reservation_ledger import item_ledger_position
 from ..services.mrp_freeze import pool_key_for
@@ -40,6 +41,7 @@ from ..services.planning_truth import (
     CAPABILITY_EXECUTION_ALLOCATIONS,
     CAPABILITY_PHYSICAL_LEDGER,
     CAPABILITY_RESERVATION_REPLAY,
+    PlanningTruthReadiness,
     PlanningTruthUnavailable,
     require_accepted_truth,
 )
@@ -54,7 +56,7 @@ def _accepted_generation(
     *,
     consumer: str,
     capabilities: tuple[str, ...],
-) -> int:
+) -> PlanningTruthReadiness:
     try:
         truth = require_accepted_truth(
             db,
@@ -66,7 +68,11 @@ def _accepted_generation(
             status_code=409,
             detail=jsonable_encoder(exc.as_dict()),
         ) from exc
-    return int(truth.generation_id)
+    return truth
+
+
+def _truth_meta(readiness: PlanningTruthReadiness) -> dict:
+    return build_truth_meta(readiness).model_dump()
 
 
 class ItemLedgerPositionWarehouse(BaseModel):
@@ -99,6 +105,7 @@ class ItemLedgerPositionResponse(BaseModel):
     projected: float
     uncovered: float
     flags: ItemLedgerPositionFlags
+    truth_meta: TruthMeta
 
 
 class ItemLedgerMovement(BaseModel):
@@ -125,6 +132,7 @@ class ItemLedgerMovementsResponse(BaseModel):
     limit: int
     offset: int
     rows: List[ItemLedgerMovement]
+    truth_meta: TruthMeta
 
 
 class ItemLedgerReservationPriority(BaseModel):
@@ -159,6 +167,7 @@ class ItemLedgerReservationsResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     rows: List[ItemLedgerReservationRow]
+    truth_meta: TruthMeta
 
 
 class ItemLedgerReservationEventRow(BaseModel):
@@ -179,6 +188,7 @@ class ItemLedgerReservationEventsResponse(BaseModel):
 
     reservation_id: int
     rows: List[ItemLedgerReservationEventRow]
+    truth_meta: TruthMeta
 
 
 class ItemLedgerDriftRow(BaseModel):
@@ -204,6 +214,7 @@ class ItemLedgerDriftResponse(BaseModel):
     limit: int
     offset: int
     rows: List[ItemLedgerDriftRow]
+    truth_meta: TruthMeta
 
 
 # ---------------------------------------------------------------------------
@@ -274,11 +285,12 @@ def get_position(item_id: int, db: Session = Depends(get_db)) -> ItemLedgerPosit
     ``uncovered`` are surfaced as-is (a negative available is a deficit signal,
     not clamped)."""
     item = _get_item_or_404(db, item_id)
-    generation_id = _accepted_generation(
+    truth = _accepted_generation(
         db,
         consumer="item_ledger.position",
         capabilities=(CAPABILITY_PHYSICAL_LEDGER, CAPABILITY_RESERVATION_REPLAY),
     )
+    generation_id = int(truth.generation_id)
     pos = item_ledger_position(
         db,
         [int(item_id)],
@@ -327,6 +339,7 @@ def get_position(item_id: int, db: Session = Depends(get_db)) -> ItemLedgerPosit
 
     pk = pool_key_for(int(item_id))
     return {
+        "truth_meta": _truth_meta(truth),
         "item_id": int(item_id),
         "item_code": item.item_code,
         "item_name": item.item_name,
@@ -365,11 +378,12 @@ def get_movements(
     sorted ``(posting_at, id)``, paginated (total + rows). ``qty_after`` is the
     running balance the ledger carried — "how it computed"."""
     _get_item_or_404(db, item_id)
-    generation_id = _accepted_generation(
+    truth = _accepted_generation(
         db,
         consumer="item_ledger.movements",
         capabilities=(CAPABILITY_PHYSICAL_LEDGER,),
     )
+    generation_id = int(truth.generation_id)
 
     name_by_ref, *_ = _contour(db)
 
@@ -419,7 +433,13 @@ def get_movements(
         }
         for r in rows
     ]
-    return {"total": total, "limit": limit, "offset": offset, "rows": out}
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "rows": out,
+        "truth_meta": _truth_meta(truth),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -436,11 +456,12 @@ def get_reservations(
     in reservations, what covers each and how much is uncovered. ``make`` rows
     contribute 0 to reserved_soft (surfaced separately as production)."""
     _get_item_or_404(db, item_id)
-    generation_id = _accepted_generation(
+    truth = _accepted_generation(
         db,
         consumer="item_ledger.reservations",
         capabilities=(CAPABILITY_RESERVATION_REPLAY,),
     )
+    generation_id = int(truth.generation_id)
 
     q = db.query(models.ReservationEntry).filter(
         models.ReservationEntry.item_id == int(item_id),
@@ -495,7 +516,7 @@ def get_reservations(
             "lifecycle_status": e.lifecycle_status,
             "coverage_state": e.coverage_state,
         })
-    return {"rows": rows}
+    return {"rows": rows, "truth_meta": _truth_meta(truth)}
 
 
 # ---------------------------------------------------------------------------
@@ -514,11 +535,12 @@ def get_reservation_events(
     ``sle_id`` links an event to the physical movement that closed it — the debug
     thread. 404 unless the reservation belongs to the item."""
     _get_item_or_404(db, item_id)
-    generation_id = _accepted_generation(
+    truth = _accepted_generation(
         db,
         consumer="item_ledger.reservation_events",
         capabilities=(CAPABILITY_RESERVATION_REPLAY,),
     )
+    generation_id = int(truth.generation_id)
     entry = (
         db.query(models.ReservationEntry)
         .filter(
@@ -559,7 +581,11 @@ def get_reservation_events(
         }
         for ev in events
     ]
-    return {"reservation_id": int(reservation_id), "rows": rows}
+    return {
+        "reservation_id": int(reservation_id),
+        "rows": rows,
+        "truth_meta": _truth_meta(truth),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -585,11 +611,12 @@ def get_drift(
     ``cause`` is derived from ``kind`` and ``adjustment_sle_id`` is not tracked on
     the drift row (returned null); ``details`` carries the raw provenance."""
     _get_item_or_404(db, item_id)
-    generation_id = _accepted_generation(
+    truth = _accepted_generation(
         db,
         consumer="item_ledger.drift",
         capabilities=(CAPABILITY_EXECUTION_ALLOCATIONS,),
     )
+    generation_id = int(truth.generation_id)
     q = db.query(models.MrpDriftEvent).filter(
         models.MrpDriftEvent.item_id == int(item_id),
         models.MrpDriftEvent.ledger_generation_id == generation_id,
@@ -622,4 +649,10 @@ def get_drift(
         }
         for r in rows
     ]
-    return {"total": total, "limit": limit, "offset": offset, "rows": out}
+    return {
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "rows": out,
+        "truth_meta": _truth_meta(truth),
+    }

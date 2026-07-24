@@ -26,6 +26,11 @@ from sqlalchemy.orm import Session
 from .. import models
 from ..database import get_db
 from ..services import planning_truth
+from ..routers.truth_meta import (
+    DbrSectionEnvelope,
+    build_truth_meta,
+    build_truth_meta_from_snapshot,
+)
 from ..services.dbr import (
     cockpit_snapshot_service,
     drum_board_snapshot,
@@ -342,8 +347,10 @@ def get_feeder_positions(
     db: Session = Depends(get_db),
 ):
     try:
-        return cockpit_snapshot_service.query_positions(
+        cockpit = cockpit_snapshot_service.read_cockpit_snapshot(db)
+        rows = cockpit_snapshot_service.query_positions(
             db,
+            cockpit=cockpit,
             include_live_nfp=include_live_nfp,
             active=active,
             active_only=active_only,
@@ -357,6 +364,11 @@ def get_feeder_positions(
         )
     except cockpit_snapshot_service.DbrCockpitSnapshotUnavailable as exc:
         raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+    return DbrSectionEnvelope(
+        section="positions",
+        rows=rows,
+        truth_meta=build_truth_meta_from_snapshot(cockpit["meta"]),
+    ).model_dump()
 
 
 @router.get("/feeder/positions/{position_id}")
@@ -439,12 +451,18 @@ def get_feeder_signals(
     db: Session = Depends(get_db),
 ):
     try:
-        return cockpit_snapshot_service.query_signals(
-            db, status=status, zone=zone, signal_type=signal_type,
+        cockpit = cockpit_snapshot_service.read_cockpit_snapshot(db)
+        rows = cockpit_snapshot_service.query_signals(
+            db, cockpit=cockpit, status=status, zone=zone, signal_type=signal_type,
             search=search, limit=limit, offset=offset,
         )
     except cockpit_snapshot_service.DbrCockpitSnapshotUnavailable as exc:
         raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+    return DbrSectionEnvelope(
+        section="signals",
+        rows=rows,
+        truth_meta=build_truth_meta_from_snapshot(cockpit["meta"]),
+    ).model_dump()
 
 
 @router.get("/feeder/signals/{signal_id}")
@@ -466,9 +484,15 @@ def get_feeder_signal(signal_id: int, db: Session = Depends(get_db)):
 @router.get("/feeder/deficits")
 def get_feeder_deficits(db: Session = Depends(get_db)):
     try:
-        return cockpit_snapshot_service.get_deficits(db)
+        cockpit = cockpit_snapshot_service.read_cockpit_snapshot(db)
+        rows = cockpit_snapshot_service.get_deficits(db, cockpit=cockpit)
     except cockpit_snapshot_service.DbrCockpitSnapshotUnavailable as exc:
         raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+    return DbrSectionEnvelope(
+        section="deficits",
+        rows=rows,
+        truth_meta=build_truth_meta_from_snapshot(cockpit["meta"]),
+    ).model_dump()
 
 
 @router.get("/feeder/processing/board")
@@ -476,9 +500,15 @@ def get_processing_board(db: Session = Depends(get_db)):
     """Борд давальческого контура (питатель №3): NFP-разложение processing-
     позиций, открытые заказы переработчику и алерты просроченного кругорейса."""
     try:
-        return cockpit_snapshot_service.get_processing_board(db)
+        cockpit = cockpit_snapshot_service.read_cockpit_snapshot(db)
+        rows = cockpit_snapshot_service.get_processing_board(db, cockpit=cockpit)
     except cockpit_snapshot_service.DbrCockpitSnapshotUnavailable as exc:
         raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+    return DbrSectionEnvelope(
+        section="processing_board",
+        rows=rows,
+        truth_meta=build_truth_meta_from_snapshot(cockpit["meta"]),
+    ).model_dump()
 
 
 @router.get("/feeder/processing/trip-manifest")

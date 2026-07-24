@@ -658,6 +658,20 @@ def accept_generation_build(
             int(generation.id),
             explicit_empty_physical=explicit_empty_physical,
         )
+        try:
+            from ..period_plan_service import (
+                build_period_plan_execution_snapshots_for_generation,
+            )
+
+            planning_snapshots = (
+                build_period_plan_execution_snapshots_for_generation(
+                    db, int(generation.id)
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            raise GenerationValidationError(
+                f"period-plan execution snapshot build failed: {exc}"
+            ) from exc
         generation.capabilities = dict(CAPABILITIES)
         generation.status = "accepted"
         generation.accepted_at = datetime.now(timezone.utc)
@@ -670,6 +684,7 @@ def accept_generation_build(
         "physical": physical,
         "obligations": obligations,
         "replay": replay,
+        "planning_snapshots": planning_snapshots,
         "supplier_receipts": {
             "documents_fetched": (
                 extraction.fetched_document_count if extraction is not None else 0

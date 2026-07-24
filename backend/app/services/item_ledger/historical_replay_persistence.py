@@ -24,6 +24,7 @@ from app import models
 
 from .historical_replay_core import Fact, Reserve, allocate_historical_facts
 from .physical_visibility import visible_sles_for_generation
+from .reconcile import contour_warehouse_refs
 
 
 _ALGORITHM_VERSION = "historical-replay-persistence/1"
@@ -262,6 +263,8 @@ def run_historical_replay(
     reserves: list[Reserve] = []
     entry_by_core_id: dict[str, ReservationEntry] = {}
     pools_by_key: dict[tuple[int, str, str, str], set[str]] = {}
+    contour_refs = contour_warehouse_refs(db)
+    has_warehouse_policy = db.query(models.StockWarehouse).count() > 0
     visible_candidates = [
         row
         for row in visible_sles_for_generation(db, int(generation.id))
@@ -331,6 +334,9 @@ def run_historical_replay(
             set(),
         ).add(reserve.planning_stock_pool)
     facts: list[Fact] = []
+    excluded_make_facts = 0
+    excluded_make_qty = Decimal("0")
+    excluded_make_samples: list[dict[str, str | int]] = []
     sle_by_core_id: dict[str, StockLedgerEntry] = {}
     identity_by_core_id: dict[str, tuple[int | None, str | None]] = {}
     mode_has_pools = set(
@@ -341,6 +347,28 @@ def run_historical_replay(
     legacy_identity_collapsed_pool_facts = 0
     for row in physical_rows:
         mode = _fact_mode(row)
+        if (
+            mode == "make"
+            and (
+                not has_warehouse_policy
+                or not str(row.warehouse_ref1c or "").strip()
+                or str(row.warehouse_ref1c).strip() in contour_refs
+            )
+        ):
+            excluded_make_facts += 1
+            excluded_make_qty += abs(_decimal(row.qty))
+            excluded_make_samples.append({
+                "sle_id": int(row.id),
+                "warehouse_ref1c": str(row.warehouse_ref1c or ""),
+                "reason": (
+                    "warehouse_policy_missing"
+                    if not has_warehouse_policy
+                    else "ambiguous"
+                    if not str(row.warehouse_ref1c or "").strip()
+                    else "contour"
+                ),
+            })
+            continue
         exact_key = (
             int(row.item_id),
             str(row.characteristic_ref or ""),
@@ -583,6 +611,9 @@ def run_historical_replay(
         "legacy_identity_collapsed_pool_facts": (
             legacy_identity_collapsed_pool_facts
         ),
+        "excluded_make_facts": excluded_make_facts,
+        "excluded_make_qty": str(excluded_make_qty),
+        "excluded_make_samples": excluded_make_samples,
         "excluded_pre_replay_facts": excluded_pre_replay,
         "replay_from": lower_bound.isoformat(),
         "input_checksum": _checksum(input_rows),

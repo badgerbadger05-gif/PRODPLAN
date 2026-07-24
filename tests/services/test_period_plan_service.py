@@ -23,6 +23,7 @@ from app.models import (
     ProductionProduct,
     PhysicalImportBatch,
     PlanningTruthState,
+    PlanningReadSnapshot,
     StockBin,
     SpecComponent,
     Specification,
@@ -52,11 +53,12 @@ def _accepted_planning_truth(db_session):
         status="accepted",
         cutoff=cutoff,
         accepted_at=cutoff,
-        source_watermarks={},
+        source_watermarks={"replay_from": "2026-06-01T00:00:00"},
         capabilities={
             "physical_ledger": True,
             "reservation_replay": True,
             "execution_allocations": True,
+            "planning_snapshots": True,
         },
         physical_import_batch=batch,
         algorithm_version="test",
@@ -233,8 +235,6 @@ def test_execution_journal_missing_current_snapshot_is_unavailable(
 
 
 def test_legacy_nonzero_aggregates_cannot_publish_execution_snapshot(db_session):
-    from app import models
-
     item = _make_purchased_item(db_session, "LEGACY-NOT-TRUTH")
     plan = _make_fixed_plan(db_session, item, date(2026, 7, 1), qty=5.0)
     run = PlanningRun(
@@ -263,10 +263,47 @@ def test_legacy_nonzero_aggregates_cannot_publish_execution_snapshot(db_session)
     ))
     db_session.commit()
 
-    with pytest.raises(NotImplementedError, match="Item Ledger allocation builder"):
-        build_period_plan_execution_snapshot(db_session, plan.id, run_id=run.run_id)
+    result = build_period_plan_execution_snapshot(db_session, plan.id, run_id=run.run_id)
 
-    assert db_session.query(models.PlanningReadSnapshot).count() == 0
+    current = db_session.query(PlanningTruthState.current_generation_id).scalar()
+    assert result["run_id"] == int(run.run_id)
+    assert result["ledger_generation"] == int(current)
+    assert result["summary"]["total_items"] == 0
+    assert result["summary"]["execution_by_flow"] == {}
+    assert result["rows"] == []
+    assert db_session.query(PlanningReadSnapshot).count() == 0
+
+
+def test_execution_snapshot_persists_canonical_accepted_lineage(db_session):
+    item = _make_purchased_item(db_session, "SNAPSHOT-LINEAGE")
+    plan = _make_fixed_plan(db_session, item, date(2026, 7, 1), qty=5.0)
+    generation_id = int(db_session.query(PlanningTruthState.current_generation_id).scalar())
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        source_plan_id=plan.id,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        ledger_generation_id=generation_id,
+    )
+    db_session.add(run)
+    db_session.flush()
+
+    payload = build_period_plan_execution_snapshot(
+        db_session,
+        plan.id,
+        run_id=run.run_id,
+        generation_id=generation_id,
+        persist=True,
+    )
+
+    snapshot = db_session.query(PlanningReadSnapshot).one()
+    generation = db_session.get(LedgerGeneration, generation_id)
+    assert snapshot.consumer == "period_plan_execution"
+    assert snapshot.snapshot_key == f"plan={plan.id};run={run.run_id}"
+    assert snapshot.ledger_generation_id == generation_id
+    assert snapshot.cutoff == generation.cutoff
+    assert snapshot.truth_status == "accepted"
+    assert snapshot.payload == payload
 
 
 def _make_fixed_plan(

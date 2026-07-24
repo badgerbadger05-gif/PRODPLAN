@@ -20,6 +20,7 @@ def test_orders_journal_exposes_strict_typed_envelope_and_dbr_filter():
     assert response == {"$ref": "#/components/schemas/ProductionOrderJournalResponse"}
     assert schema["components"]["schemas"]["ProductionOrderJournalResponse"]["additionalProperties"] is False
     assert schema["components"]["schemas"]["ProductionOrderPlanningResponse"]["additionalProperties"] is False
+    assert "truth_meta" in schema["components"]["schemas"]["ProductionOrderJournalResponse"]["properties"]
     assert "planning" in schema["components"]["schemas"]["ProductionOrderJournalRowResponse"]["properties"]
     contour = next(param for param in operation["parameters"] if param["name"] == "planning_contour")
     assert "dbr_feeder" in contour["description"]

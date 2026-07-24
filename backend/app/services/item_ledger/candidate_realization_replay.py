@@ -7,7 +7,7 @@ window; it never copies or touches the accepted generation's reservations.
 
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime
 from hashlib import sha256
 import json
 from typing import Any
@@ -105,15 +105,22 @@ def _manifest_candidate_runs(
     return sorted(by_id.values(), key=lambda row: (row.period_from, row.period_to, row.run_id))
 
 
+def _replay_from(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    raise CandidateRealizationReplayError("target generation lacks accepted replay_from")
+
+
 def replay_candidate_realizations(
     db: Session,
     target_generation_id: int,
 ) -> dict[str, Any]:
     """Run FIFO realization for the exact candidates in a sealed refresh.
 
-    The earliest candidate period is the lower exclusive boundary, so a fact
-    before this refresh belongs to prior history and is retained as unplanned
-    rather than silently closing a newly created obligation.  Transaction
+    Use the immutable obligation replay_from from the accepted parent lineage to
+    preserve replay cut boundaries across refresh generations. Transaction
     ownership remains with the refresh workflow.
     """
     target = db.get(models.LedgerGeneration, int(target_generation_id))
@@ -130,6 +137,12 @@ def replay_candidate_realizations(
         raise CandidateRealizationReplayError(
             "target generation lacks accepted parent lineage"
         ) from exc
+    try:
+        replay_from = _replay_from(marks["replay_from"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CandidateRealizationReplayError(
+            "target generation lacks replay_from"
+        ) from exc
     parent = db.get(models.LedgerGeneration, parent_id)
     pointer = db.get(models.PlanningTruthState, 1)
     if (
@@ -145,8 +158,7 @@ def replay_candidate_realizations(
             "target does not reuse the current accepted physical prefix"
         )
     runs = _manifest_candidate_runs(db, target)
-    earliest = min(row.period_from for row in runs)
-    lower_bound = datetime.combine(earliest, time.min, tzinfo=timezone.utc) - timedelta(microseconds=1)
+    lower_bound = replay_from
     result = run_historical_replay(
         db, int(target.id), replay_from=lower_bound,
     )

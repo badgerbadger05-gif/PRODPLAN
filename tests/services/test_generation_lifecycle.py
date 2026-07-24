@@ -117,6 +117,12 @@ def _bootstrap_gate_watermarks(
 
 def _synthetic(db, key: str = "ok", replenishment_method: str = "Производство"):
     generation = _generation(db, key)
+    db.add(models.StockWarehouse(
+        warehouse_ref1c="WH",
+        warehouse_name="Outside planning contour",
+        is_selected=False,
+        is_finished_goods=False,
+    ))
     item = models.Item(
         item_code=f"ITEM-{key}",
         item_name=key,
@@ -333,6 +339,38 @@ def test_failure_rolls_back_every_build_write_and_pointer(db_session, monkeypatc
         ledger_generation_id=generation.id
     ).count() == 0
     assert db_session.get(models.PlanningTruthState, 1) is None
+
+
+def test_snapshot_build_failure_rolls_back_acceptance_atomically(db_session, monkeypatch):
+    generation, _requirement = _synthetic(db_session, "snapshot-rollback")
+
+    def fail_snapshot_build(*_args, **_kwargs):
+        raise ValueError("snapshot provenance is incomplete")
+
+    monkeypatch.setattr(
+        "app.services.period_plan_service.build_period_plan_execution_snapshots_for_generation",
+        fail_snapshot_build,
+    )
+
+    with pytest.raises(
+        GenerationValidationError,
+        match="period-plan execution snapshot build failed",
+    ):
+        accept_generation_build(
+            db_session,
+            generation.id,
+            replay_from=datetime(2026, 7, 1),
+        )
+
+    db_session.expire_all()
+    assert db_session.get(models.LedgerGeneration, generation.id).status == "building"
+    assert db_session.get(models.PlanningTruthState, 1) is None
+    assert db_session.query(models.StockBin).filter_by(
+        ledger_generation_id=generation.id
+    ).count() == 0
+    assert db_session.query(models.PlanningReadSnapshot).filter_by(
+        ledger_generation_id=generation.id
+    ).count() == 0
 
 
 def test_accepted_generation_is_immutable(db_session):

@@ -220,6 +220,7 @@ def get_signal_snapshot(db: Session, signal_id: int) -> Optional[dict[str, Any]]
 def query_positions(
     db: Session,
     *,
+    cockpit: Optional[dict[str, Any]] = None,
     include_live_nfp: bool = False,
     active: Optional[bool] = None,
     active_only: bool = False,
@@ -231,7 +232,7 @@ def query_positions(
     limit: int = 1000,
     offset: int = 0,
 ) -> list[dict[str, Any]]:
-    rows = _snapshot_positions(db, read_cockpit_snapshot(db))
+    rows = _snapshot_positions(db, cockpit or read_cockpit_snapshot(db))
     effective_active = True if active_only and active is None else active
     needle = (search or "").strip().casefold()
     filtered = [
@@ -260,6 +261,7 @@ def query_positions(
 def query_signals(
     db: Session,
     *,
+    cockpit: Optional[dict[str, Any]] = None,
     status: Optional[str] = None,
     zone: Optional[str] = None,
     signal_type: Optional[str] = None,
@@ -267,7 +269,7 @@ def query_signals(
     limit: int = 1000,
     offset: int = 0,
 ) -> list[dict[str, Any]]:
-    cockpit = read_cockpit_snapshot(db)
+    cockpit = cockpit or read_cockpit_snapshot(db)
     rows = _snapshot_signals(db, cockpit)
     needle = (search or "").strip().casefold()
     filtered = [
@@ -285,12 +287,12 @@ def query_signals(
     return filtered[offset : offset + limit]
 
 
-def get_deficits(db: Session) -> dict[str, Any]:
-    return dict(read_cockpit_snapshot(db)["deficits"])
+def get_deficits(db: Session, *, cockpit: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    return dict((cockpit or read_cockpit_snapshot(db))["deficits"])
 
 
-def get_processing_board(db: Session) -> dict[str, Any]:
-    return dict(read_cockpit_snapshot(db)["processing_board"])
+def get_processing_board(db: Session, *, cockpit: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    return dict((cockpit or read_cockpit_snapshot(db))["processing_board"])
 
 
 def build_cockpit_snapshot(db: Session) -> models.PlanningReadSnapshot:

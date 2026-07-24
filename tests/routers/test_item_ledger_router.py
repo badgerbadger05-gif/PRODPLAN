@@ -234,6 +234,8 @@ def test_position_math_and_shape(client, seeded):
     assert r.status_code == 200
     d = r.json()
     ItemLedgerPositionResponse.model_validate(d)
+    assert d["truth_meta"]["truth_status"] == "accepted"
+    assert d["truth_meta"]["ledger_generation"] == 1
     assert d["item_id"] == seeded["a"]
     assert d["item_code"] == "00000063"
     assert d["pool_key"] == f"{seeded['a']}::default"
@@ -264,6 +266,8 @@ def test_position_unknown_item_404(client, seeded):
 def test_movements_sorted_and_scoped(client, seeded):
     d = client.get(f"/api/v1/item-ledger/{seeded['a']}/movements").json()
     ItemLedgerMovementsResponse.model_validate(d)
+    assert d["truth_meta"]["truth_status"] == "accepted"
+    assert d["truth_meta"]["ledger_generation"] == 1
     assert d["total"] == 3  # item B's row excluded
     ats = [row["posting_at"] for row in d["rows"]]
     assert ats == sorted(ats)  # (posting_at, id) ascending
@@ -311,6 +315,8 @@ def test_movements_unknown_item_404(client, seeded):
 def test_reservations_shape_and_coverage(client, seeded):
     d = client.get(f"/api/v1/item-ledger/{seeded['a']}/reservations").json()
     ItemLedgerReservationsResponse.model_validate(d)
+    assert d["truth_meta"]["truth_status"] == "accepted"
+    assert d["truth_meta"]["ledger_generation"] == 1
     assert len(d["rows"]) == 3  # 2 consume + 1 make
     by_req = {row["requirement_id"]: row for row in d["rows"]}
     r1 = by_req[55831]
@@ -351,6 +357,8 @@ def test_events_thread(client, seeded):
         f"/api/v1/item-ledger/{seeded['a']}/reservations/{seeded['r1']}/events"
     ).json()
     ItemLedgerReservationEventsResponse.model_validate(d)
+    assert d["truth_meta"]["truth_status"] == "accepted"
+    assert d["truth_meta"]["ledger_generation"] == 1
     kinds = [e["event_kind"] for e in d["rows"]]
     assert kinds == ["open", "realize"]
     realize = d["rows"][1]
@@ -379,6 +387,8 @@ def test_events_unknown_reservation_404(client, seeded):
 def test_drift_rows(client, seeded):
     d = client.get(f"/api/v1/item-ledger/{seeded['a']}/drift").json()
     ItemLedgerDriftResponse.model_validate(d)
+    assert d["truth_meta"]["truth_status"] == "accepted"
+    assert d["truth_meta"]["ledger_generation"] == 1
     assert d["total"] == 1
     row = d["rows"][0]
     assert row["kind"] == "evaporation"

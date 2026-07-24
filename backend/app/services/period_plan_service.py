@@ -22,6 +22,7 @@ from ..models import (
     PlannedPurchase,
     PlannedRework,
     PlanningRun,
+    PlanningReadSnapshot,
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
@@ -36,6 +37,10 @@ from ..models import (
     SyncLink,
     SupplierOrder,
     SupplierOrderItem,
+    MrpExecutionAllocation,
+    ReservationEntry,
+    ReservationEvent,
+    StockLedgerEntry,
 )
 from .planning_service import (
     DEFAULT_PLANNING_CONFIG,
@@ -1774,12 +1779,9 @@ def _execution_snapshot_key(
     bom_level: Optional[int],
     flow: Optional[str],
 ) -> str:
-    return (
-        f"plan={int(plan_id)};run={int(run_id)};"
-        f"root={int(root_item_id) if root_item_id is not None else '*'};"
-        f"level={int(bom_level) if bom_level is not None else '*'};"
-        f"flow={flow or '*'}"
-    )
+    # Canonical snapshot is keyed by plan+run only; request-level filters are
+    # applied by the read path so one immutable snapshot serves all variants.
+    return f"plan={int(plan_id)};run={int(run_id)}"
 
 
 def _resolve_execution_run(db: Session, plan: ProductionPlanHeader, run_id: Optional[int]) -> PlanningRun:
@@ -1878,6 +1880,601 @@ def _execution_unavailable_payload(
     }
 
 
+def _iso_datetime(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value) if value else None
+
+
+def _filter_execution_rows(
+    _db: Session,
+    rows: List[Dict[str, Any]],
+    *,
+    root_item_id: Optional[int],
+    bom_level: Optional[int],
+    flow: Optional[str],
+) -> List[Dict[str, Any]]:
+    if root_item_id is None and bom_level is None and flow is None:
+        return rows
+    filtered: List[Dict[str, Any]] = []
+    for row in rows:
+        root_members = {
+            int(value)
+            for value in (row.get("root_item_ids") or [])
+        }
+        if (
+            root_item_id is not None
+            and int(root_item_id) not in root_members
+            and int(row.get("item_id", 0)) != int(root_item_id)
+        ):
+            continue
+        if bom_level is not None and int(row.get("bom_level", 0)) != int(bom_level):
+            continue
+        if flow is not None and row.get("flow") != flow:
+            continue
+        filtered.append(dict(row))
+    return filtered
+
+
+def _execution_row_summary(
+    rows: Iterable[Dict[str, Any]],
+) -> Dict[str, Any]:
+    total_items = 0
+    execution_completed_qty = 0.0
+    execution_base_qty = 0.0
+    execution_by_flow: Dict[str, Dict[str, float]] = {}
+    fully_covered = 0
+    partially_covered = 0
+    not_covered = 0
+    net_zero = 0
+    for row in rows:
+        total_items += 1
+        completed_qty = _to_float(row.get("completed_qty"))
+        base_qty = _to_float(row.get("progress_base_qty", row.get("net_qty")))
+        item_flow = str(row.get("flow") or "")
+        execution_completed_qty += completed_qty
+        execution_base_qty += base_qty
+        flow_summary = execution_by_flow.setdefault(item_flow, {"completed_qty": 0.0, "base_qty": 0.0})
+        flow_summary["completed_qty"] += completed_qty
+        flow_summary["base_qty"] += base_qty
+        status = str(row.get("status") or "")
+        if status == "net_zero":
+            net_zero += 1
+        elif status == "covered":
+            fully_covered += 1
+        elif status == "partial":
+            partially_covered += 1
+        else:
+            not_covered += 1
+    execution_pct = (
+        round(execution_completed_qty / execution_base_qty * 100.0, 1)
+        if execution_base_qty > 1e-9
+        else 100.0
+    )
+    for details in execution_by_flow.values():
+        base_qty = _to_float(details.get("base_qty"))
+        details["execution_pct"] = (
+            round(_to_float(details.get("completed_qty")) / base_qty * 100.0, 1)
+            if base_qty > 1e-9
+            else 100.0
+        )
+    return {
+        "truth_status": "accepted",
+        "total_items": total_items,
+        "execution_completed_qty": execution_completed_qty,
+        "execution_base_qty": execution_base_qty,
+        "execution_pct": execution_pct,
+        "execution_by_flow": execution_by_flow,
+        "fully_covered": fully_covered,
+        "partially_covered": partially_covered,
+        "not_covered": not_covered,
+        "net_zero": net_zero,
+    }
+
+
+def _attach_execution_information_links(
+    rows: Iterable[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    enriched: List[Dict[str, Any]] = []
+    for row in rows:
+        row = dict(row)
+        if not isinstance(row.get("information_links"), dict):
+            row_item_id = int(row.get("item_id") or 0)
+            row["information_links"] = {
+                "reservation_events": [
+                    {
+                        "reservation_id": int(reservation_id),
+                        "url": f"/api/v1/item-ledger/{row_item_id}/reservations/{int(reservation_id)}/events",
+                    }
+                    for reservation_id in sorted(set(int(rid) for rid in row.get("reservation_ids", []) if rid is not None))
+                ],
+            }
+        execution_events = row.get("execution_events") or []
+        if isinstance(execution_events, list):
+            resolved_events = []
+            row_item_id = int(row.get("item_id") or 0)
+            for event in execution_events:
+                event = dict(event)
+                if (
+                    isinstance(event, dict)
+                    and int(event.get("reservation_id") or 0)
+                    and "reservation_events_url" not in event
+                ):
+                    event["reservation_events_url"] = (
+                        f"/api/v1/item-ledger/{row_item_id}/reservations/{int(event.get('reservation_id'))}/events"
+                    )
+                resolved_events.append(event)
+            row["execution_events"] = resolved_events
+        row["ledger_links"] = {
+            "item_id": int(row.get("item_id") or 0),
+            "reservation_ids": sorted({
+                int(reservation_id)
+                for reservation_id in row.get("reservation_ids", [])
+                if reservation_id is not None
+            }),
+            "events": [
+                {
+                    "event_id": int(event.get("event_id")),
+                    "reservation_id": int(event.get("reservation_id")),
+                    "sle_id": event.get("stock_ledger_entry_id"),
+                    "fact_ref": event.get("fact_ref"),
+                    "fact_line_ref": event.get("fact_line_ref"),
+                    "match_rule": event.get("match_rule"),
+                }
+                for event in row.get("execution_events", [])
+                if event.get("event_id") is not None
+                and event.get("reservation_id") is not None
+                and str(event.get("event_kind") or "") == "realize"
+            ],
+        }
+        enriched.append(row)
+    return enriched
+
+
+def _execution_obligation_links(
+    db: Session,
+    run: PlanningRun,
+    *,
+    requirement_ids: List[int],
+    requirement_id_by_item: Dict[int, int],
+) -> tuple[Dict[int, List[Dict[str, Any]]], Dict[int, float]]:
+    """Capture navigational obligation links without consulting legacy facts."""
+    links_by_requirement: Dict[int, List[Dict[str, Any]]] = {}
+    ordered_by_requirement: Dict[int, float] = {}
+    if not requirement_ids:
+        return links_by_requirement, ordered_by_requirement
+
+    actual_production_requirements: Set[int] = set()
+    for product, order, state in (
+        db.query(ProductionProduct, ProductionOrder, ProductionOrderLineState)
+        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
+        .outerjoin(
+            ProductionOrderLineState,
+            ProductionOrderLineState.product_id == ProductionProduct.product_id,
+        )
+        .filter(ProductionProduct.source_mrp_requirement_id.in_(requirement_ids))
+        .all()
+    ):
+        requirement_id = int(product.source_mrp_requirement_id)
+        if state is not None and str(state.status or "").casefold() == "cancelled":
+            continue
+        qty = _to_float(product.quantity)
+        opened = bool(order.order_ref1c)
+        actual_production_requirements.add(requirement_id)
+        if opened:
+            ordered_by_requirement[requirement_id] = (
+                ordered_by_requirement.get(requirement_id, 0.0) + qty
+            )
+        links_by_requirement.setdefault(requirement_id, []).append({
+            "type": "production_order",
+            "product_id": int(product.product_id),
+            "order_id": int(order.order_id),
+            "order_number": str(order.order_number or ""),
+            "one_c_opened": opened,
+            "qty": qty,
+            "completed_qty": None,
+            "remaining_qty": None,
+            "opened_at": _iso_datetime(state.opened_at) if state is not None else None,
+            "order_state": str(order.order_state_name or order.order_state_key or ""),
+        })
+
+    demand_refs = [f"req:{requirement_id}" for requirement_id in requirement_ids]
+    for planned in (
+        db.query(PlannedOrder)
+        .filter(
+            PlannedOrder.run_id == int(run.run_id),
+            PlannedOrder.demand_ref.in_(demand_refs),
+        )
+        .all()
+    ):
+        try:
+            requirement_id = int(str(planned.demand_ref).split(":", 1)[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if requirement_id in actual_production_requirements:
+            continue
+        qty = _to_float(planned.qty)
+        links_by_requirement.setdefault(requirement_id, []).append({
+            "type": "planned_order",
+            "order_id": int(planned.order_id),
+            "qty": qty,
+            "completed_qty": None,
+            "remaining_qty": None,
+            "need_date": _iso_datetime(planned.need_date),
+            **_forecast_payload(
+                planned.finish_date or planned.start_date or planned.need_date,
+                planned.need_date,
+            ),
+        })
+
+    purchases = (
+        db.query(PlannedPurchase)
+        .filter(
+            PlannedPurchase.run_id == int(run.run_id),
+            PlannedPurchase.item_id.in_(list(requirement_id_by_item)),
+        )
+        .all()
+    )
+    purchase_ids = [int(row.purchase_id) for row in purchases]
+    sync_by_purchase: Dict[int, SyncLink] = {}
+    if purchase_ids:
+        for link in (
+            db.query(SyncLink)
+            .filter(
+                SyncLink.source_system == "PRODPLAN",
+                SyncLink.source_doctype == "planned_purchase",
+                SyncLink.source_id.in_(purchase_ids),
+                SyncLink.target_entity == "Document_ЗаказПоставщику",
+                SyncLink.status == "success",
+                SyncLink.target_ref_key.isnot(None),
+            )
+            .all()
+        ):
+            sync_by_purchase[int(link.source_id)] = link
+    supplier_refs = {
+        str(link.target_ref_key or "").strip()
+        for link in sync_by_purchase.values()
+        if str(link.target_ref_key or "").strip()
+    }
+    supplier_by_ref = {
+        str(order.order_ref1c or "").strip(): order
+        for order in (
+            db.query(SupplierOrder)
+            .filter(SupplierOrder.order_ref1c.in_(supplier_refs))
+            .all()
+            if supplier_refs
+            else []
+        )
+    }
+    for purchase in purchases:
+        requirement_id = (
+            int(purchase.source_mrp_requirement_id)
+            if purchase.source_mrp_requirement_id is not None
+            else requirement_id_by_item.get(int(purchase.item_id))
+        )
+        if requirement_id is None:
+            continue
+        link = sync_by_purchase.get(int(purchase.purchase_id))
+        supplier_ref = str(getattr(link, "target_ref_key", "") or "").strip()
+        supplier_order = supplier_by_ref.get(supplier_ref)
+        opened = bool(supplier_ref)
+        qty = _to_float(purchase.qty)
+        if opened:
+            ordered_by_requirement[requirement_id] = (
+                ordered_by_requirement.get(requirement_id, 0.0) + qty
+            )
+        links_by_requirement.setdefault(requirement_id, []).append({
+            "type": "planned_purchase",
+            "purchase_id": int(purchase.purchase_id),
+            "qty": qty,
+            "completed_qty": None,
+            "remaining_qty": None,
+            "need_date": _iso_datetime(purchase.need_date),
+            "order_date": _iso_datetime(purchase.order_date),
+            "lead_time_days": int(purchase.lead_time_days or 0),
+            "order_ref1c": supplier_ref or None,
+            "order_number": (
+                str(supplier_order.order_number or "") if supplier_order else None
+            ),
+            "order_state": (
+                str(
+                    supplier_order.order_state_name
+                    or supplier_order.order_state_key
+                    or ""
+                )
+                if supplier_order
+                else None
+            ),
+            "one_c_opened": opened,
+            **_forecast_payload(purchase.need_date, purchase.need_date, reason="purchase"),
+        })
+
+    for rework in (
+        db.query(PlannedRework)
+        .filter(
+            PlannedRework.run_id == int(run.run_id),
+            PlannedRework.item_id.in_(list(requirement_id_by_item)),
+        )
+        .all()
+    ):
+        requirement_id = requirement_id_by_item.get(int(rework.item_id))
+        if requirement_id is None:
+            continue
+        links_by_requirement.setdefault(requirement_id, []).append({
+            "type": "planned_rework",
+            "rework_id": int(rework.rework_id),
+            "qty": _to_float(rework.qty),
+            "completed_qty": None,
+            "remaining_qty": None,
+            "need_date": _iso_datetime(rework.need_date),
+            "order_date": _iso_datetime(rework.order_date),
+            "lead_time_days": int(rework.lead_time_days or 0),
+            **_forecast_payload(rework.need_date, rework.need_date, reason="rework"),
+        })
+
+    return links_by_requirement, ordered_by_requirement
+
+
+def _build_execution_snapshot_rows(
+    db: Session,
+    run: PlanningRun,
+    *,
+    requirement_ids: Iterable[int],
+    items_by_requirement: Dict[int, Dict[str, Any]],
+    generation_id: int,
+    root_item_ids_by_item: Dict[int, List[int]],
+) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    req_ids = sorted({int(value) for value in requirement_ids})
+    req_rows: List[Dict[str, Any]] = []
+    if not req_ids:
+        return req_rows, {"total_items": 0, "truth_status": "accepted"}
+
+    item_ids = [int(req.get("item_id")) for req in items_by_requirement.values() if req.get("item_id") is not None]
+    if item_ids:
+        item_flow_by_id = {
+            int(item.item_id): classify_replenishment_flow(getattr(item, "replenishment_method", None))
+            for item in db.query(Item.item_id, Item.replenishment_method).filter(Item.item_id.in_(item_ids)).all()
+        }
+    else:
+        item_flow_by_id = {}
+    requirement_id_by_item = {
+        int(payload["item_id"]): int(requirement_id)
+        for requirement_id, payload in items_by_requirement.items()
+    }
+    work_items_by_requirement, ordered_by_requirement = _execution_obligation_links(
+        db,
+        run,
+        requirement_ids=req_ids,
+        requirement_id_by_item=requirement_id_by_item,
+    )
+
+    reservation_rows = (
+        db.query(ReservationEntry.id, ReservationEntry.requirement_id)
+        .filter(
+            ReservationEntry.ledger_generation_id == int(generation_id),
+            ReservationEntry.requirement_id.in_(req_ids),
+        )
+        .all()
+    )
+    reservation_ids_by_req: Dict[int, List[int]] = {}
+    reservation_ids: List[int] = []
+    for row_id, req_id in reservation_rows:
+        rid = int(req_id)
+        reservation_ids_by_req.setdefault(rid, []).append(int(row_id))
+        reservation_ids.append(int(row_id))
+
+    events_by_requirement: Dict[int, List[Dict[str, Any]]] = {}
+    event_ids_by_fact: Dict[tuple[str, str], List[int]] = {}
+    if reservation_ids:
+        for event, req_id in (
+            db.query(ReservationEvent, ReservationEntry.requirement_id.label("requirement_id"))
+            .join(ReservationEntry, ReservationEvent.reservation_id == ReservationEntry.id)
+            .filter(ReservationEvent.ledger_generation_id == int(generation_id))
+            .filter(ReservationEvent.reservation_id.in_(reservation_ids))
+            .all()
+        ):
+            event_payload = {
+                "event_id": int(event.id),
+                "reservation_id": int(event.reservation_id),
+                "reservation_event_kind": str(event.event_kind or ""),
+                "realized_delta": _to_float(event.realized_delta),
+                "reserved_delta": _to_float(event.reserved_delta),
+                "fact_ref": str(event.fact_ref or ""),
+                "fact_line_ref": str(event.fact_line_ref or ""),
+                "match_rule": str(event.match_rule or ""),
+                "event_at": _iso_datetime(event.event_at),
+                "event_kind": str(event.event_kind or ""),
+                "stock_ledger_entry_id": int(event.sle_id) if event.sle_id is not None else None,
+            }
+            events_by_requirement.setdefault(int(req_id), []).append(event_payload)
+            event_ids_by_fact.setdefault(
+                (str(event.fact_ref or ""), str(event.fact_line_ref or "")),
+                [],
+            ).append(int(event.id))
+
+    allocation_rows = (
+        db.query(MrpExecutionAllocation)
+        .filter(
+            MrpExecutionAllocation.ledger_generation_id == int(generation_id),
+            MrpExecutionAllocation.requirement_id.in_(req_ids),
+        )
+        .order_by(
+            MrpExecutionAllocation.requirement_id.asc(),
+            MrpExecutionAllocation.allocation_kind.asc(),
+            MrpExecutionAllocation.fact_type.asc(),
+            MrpExecutionAllocation.fact_ref.asc(),
+            MrpExecutionAllocation.fact_line_ref.asc(),
+        )
+        .all()
+    )
+    allocation_by_requirement: Dict[int, List[Dict[str, Any]]] = {}
+    stock_ledger_entry_ids: Set[int] = set()
+    for allocation in allocation_rows:
+        req_id = int(allocation.requirement_id)
+        stock_id = allocation.stock_ledger_entry_id
+        if stock_id is not None:
+            stock_ledger_entry_ids.add(int(stock_id))
+        allocation_payload = {
+            "allocation_id": int(allocation.id),
+            "allocation_kind": str(allocation.allocation_kind or ""),
+            "fact_type": str(allocation.fact_type or ""),
+            "fact_ref": str(allocation.fact_ref or ""),
+            "fact_line_ref": str(allocation.fact_line_ref or ""),
+            "allocated_qty": _to_float(allocation.allocated_qty),
+            "bucket_id": int(allocation.bucket_id) if allocation.bucket_id is not None else None,
+            "fact_date": _iso_datetime(allocation.fact_date),
+            "stock_ledger_entry_id": int(stock_id) if stock_id is not None else None,
+            "origin_requirement_id": int(allocation.origin_requirement_id)
+            if allocation.origin_requirement_id is not None
+            else None,
+            "calculated_at": _iso_datetime(allocation.calculated_at),
+            "reservation_event_ids": sorted(
+                set(
+                    event_ids_by_fact.get(
+                        (str(allocation.fact_ref or ""), str(allocation.fact_line_ref or "")),
+                        [],
+                    )
+                )
+            ),
+        }
+        allocation_by_requirement.setdefault(req_id, []).append(allocation_payload)
+
+    stock_entries: Dict[int, Dict[str, Any]] = {}
+    if stock_ledger_entry_ids:
+        for entry in (
+            db.query(
+                StockLedgerEntry.id,
+                StockLedgerEntry.record_type,
+                StockLedgerEntry.movement_kind,
+                StockLedgerEntry.recorder_type,
+                StockLedgerEntry.recorder_ref,
+                StockLedgerEntry.line_no,
+                StockLedgerEntry.posting_at,
+                StockLedgerEntry.item_id,
+            )
+            .filter(StockLedgerEntry.id.in_(stock_ledger_entry_ids))
+            .all()
+        ):
+            stock_entries[int(entry.id)] = {
+                "id": int(entry.id),
+                "record_type": str(entry.record_type or ""),
+                "movement_kind": str(entry.movement_kind or ""),
+                "recorder_type": str(entry.recorder_type or ""),
+                "recorder_ref": str(entry.recorder_ref or ""),
+                "line_no": str(entry.line_no or ""),
+                "posting_at": _iso_datetime(entry.posting_at),
+                "item_id": int(entry.item_id),
+            }
+
+    for req_id, allocations in allocation_by_requirement.items():
+        for allocation in allocations:
+            stock_id = allocation.get("stock_ledger_entry_id")
+            if stock_id is None:
+                continue
+            allocation["stock_ledger_entry"] = stock_entries.get(int(stock_id))
+
+    for req_id in req_ids:
+        req = items_by_requirement.get(int(req_id))
+        if not req:
+            continue
+        item_id = int(req.get("item_id"))
+        reservations = sorted(set(reservation_ids_by_req.get(req_id, [])))
+        events = sorted(
+            events_by_requirement.get(req_id, []),
+            key=lambda payload: (
+                str(payload.get("event_at") or ""),
+                int(payload.get("event_id") or 0),
+            ),
+        )
+        for event in events:
+            event["reservation_events_url"] = f"/api/v1/item-ledger/{item_id}/reservations/{int(event.get('reservation_id') or 0)}/events"
+        allocations = sorted(
+            allocation_by_requirement.get(req_id, []),
+            key=lambda payload: (
+                str(payload.get("allocation_kind") or ""),
+                str(payload.get("fact_type") or ""),
+                str(payload.get("fact_ref") or ""),
+                str(payload.get("fact_line_ref") or ""),
+                int(payload.get("allocation_id") or 0),
+            ),
+        )
+        progress_base_qty = _to_float(req["net_required_qty"])
+        completed_qty = round(
+            sum(
+                _to_float(payload.get("allocated_qty"))
+                for payload in allocations
+                if str(payload.get("allocation_kind") or "") == "execution"
+            ),
+            10,
+        )
+        if progress_base_qty > 1e-9:
+            completed_qty = min(max(0.0, completed_qty), progress_base_qty)
+            if completed_qty < 1e-9 and reservations:
+                status = "ordered"
+            elif completed_qty < 1e-9:
+                status = "none"
+            elif completed_qty + 1e-9 >= progress_base_qty:
+                status = "covered"
+            else:
+                status = "partial"
+        else:
+            status = "net_zero"
+            completed_qty = 0.0
+        remaining_qty = max(0.0, progress_base_qty - completed_qty)
+        coverage_pct = (
+            round(completed_qty / progress_base_qty * 100.0, 1)
+            if progress_base_qty > 1e-9
+            else 100.0
+        )
+        ordered_qty = ordered_by_requirement.get(req_id, 0.0)
+        req_rows.append({
+            "req_id": int(req_id),
+            "item_id": item_id,
+            "item_code": str(req.get("item_code") or ""),
+            "item_article": str(req.get("item_article") or "") if req.get("item_article") else None,
+            "item_name": str(req.get("item_name") or ""),
+            "flow": item_flow_by_id.get(item_id),
+            "bom_level": int(req.get("bom_level") or 0),
+            "gross_qty": _to_float(req.get("gross_required_qty")),
+            "net_qty": _to_float(req.get("net_required_qty")),
+            "progress_base_qty": progress_base_qty,
+            "completed_qty": completed_qty,
+            "remaining_qty": remaining_qty,
+            "coverage_pct": coverage_pct,
+            "ordered_qty": ordered_qty,
+            "unassigned_qty": max(
+                0.0, _to_float(req.get("net_required_qty")) - ordered_qty
+            ),
+            "root_item_ids": root_item_ids_by_item.get(item_id, []),
+            "information_links": {
+                "reservation_events": [
+                    {
+                        "reservation_id": reservation_id,
+                        "url": f"/api/v1/item-ledger/{item_id}/reservations/{reservation_id}/events",
+                    }
+                    for reservation_id in reservations
+                ],
+            },
+            "status": status,
+            "reservation_ids": reservations,
+            "execution_events": events,
+            "execution_allocations": allocations,
+            "work_items": work_items_by_requirement.get(req_id, []),
+        })
+
+    req_rows.sort(key=lambda row: (int(row.get("bom_level") or 0), int(row.get("item_id") or 0), str(row.get("item_code") or "")))
+    return req_rows, {
+        "truth_status": "accepted",
+        "reservation_rows": len(reservation_rows),
+        "allocation_rows": len(allocation_rows),
+        "execution_by_requirement": _execution_row_summary(req_rows),
+    }
+
+
 def get_period_plan_execution_journal(
     db: Session,
     plan_id: int,
@@ -1901,8 +2498,11 @@ def get_period_plan_execution_journal(
     plan = _get_plan(db, plan_id)
     run = _resolve_execution_run(db, plan, run_id)
     snapshot_key = _execution_snapshot_key(
-        plan_id=plan.id, run_id=run.run_id, root_item_id=root_item_id,
-        bom_level=bom_level, flow=flow,
+        plan_id=plan.id,
+        run_id=run.run_id,
+        root_item_id=root_item_id,
+        bom_level=bom_level,
+        flow=flow,
     )
     capabilities = (
         CAPABILITY_PHYSICAL_LEDGER,
@@ -1928,7 +2528,23 @@ def get_period_plan_execution_journal(
             bom_level=bom_level, flow=flow, truth_state=get_truth_state(db),
             reason="Execution snapshot is missing for the accepted Ledger generation",
         )
-    return dict(snapshot.payload)
+    payload = dict(snapshot.payload)
+    if root_item_id is None and bom_level is None and flow is None:
+        return payload
+    rows = _filter_execution_rows(
+        db,
+        list(payload.get("rows") or []),
+        root_item_id=root_item_id,
+        bom_level=bom_level,
+        flow=flow,
+    )
+    rows = _attach_execution_information_links(rows)
+    summary = _execution_row_summary(rows)
+    payload["rows"] = rows
+    summary_payload = dict(payload.get("summary") or {})
+    summary_payload.update(summary)
+    payload["summary"] = summary_payload
+    return payload
 
 
 def _compute_legacy_period_plan_execution_journal(
@@ -2536,14 +3152,198 @@ def build_period_plan_execution_snapshot(
     root_item_id: Optional[int] = None,
     bom_level: Optional[int] = None,
     flow: Optional[str] = None,
+    generation_id: Optional[int] = None,
+    persist: bool = False,
 ) -> Dict[str, Any]:
-    """Reserved entry point for the future Ledger-allocation builder.
+    """Build one immutable Ledger-native plan/run execution snapshot."""
+    from .planning_truth import get_truth_state
 
-    The retained legacy diagnostic reads produced/received order aggregates.
-    Those values are not accepted Item Ledger facts and must never be published
-    under an accepted Ledger generation, regardless of declared capabilities.
-    """
-    raise NotImplementedError(
-        "period-plan execution snapshot publication is blocked until a "
-        "generation-scoped Item Ledger allocation builder is implemented"
+    plan = _get_plan(db, plan_id)
+    run = _resolve_execution_run(db, plan, run_id)
+    reqs_with_items = (
+        db.query(MrpRequirement, Item)
+        .join(Item, Item.item_id == MrpRequirement.item_id)
+        .filter(MrpRequirement.run_id == int(run.run_id))
+        .order_by(MrpRequirement.bom_level.asc(), Item.item_name.asc())
+        .all()
     )
+    run_requirements = [int(req.id) for req, _item in reqs_with_items]
+    items_by_req: Dict[int, Dict[str, Any]] = {}
+    for req, item in reqs_with_items:
+        items_by_req[int(req.id)] = {
+            "item_id": int(req.item_id),
+            "item_code": str(item.item_code or ""),
+            "item_name": str(item.item_name or ""),
+            "item_article": str(item.item_article or "") if item.item_article else None,
+            "gross_required_qty": _to_float(req.total_required_qty),
+            "net_required_qty": _to_float(req.net_required_qty),
+            "bom_level": int(req.bom_level or 0),
+        }
+
+    if generation_id is None:
+        if run.ledger_generation_id is not None:
+            generation_id = int(run.ledger_generation_id)
+        else:
+            truth = get_truth_state(db)
+            if truth.generation_id is None:
+                raise ValueError("execution snapshot requires a Ledger generation")
+            generation_id = int(truth.generation_id)
+    if not isinstance(generation_id, int) or generation_id <= 0:
+        raise ValueError("execution snapshot requires generation_id")
+
+    generation = db.get(LedgerGeneration, generation_id)
+    if generation is None:
+        raise ValueError("execution snapshot references missing LedgerGeneration")
+    if generation.cutoff is None:
+        raise ValueError("execution snapshot requires generation cutoff")
+    if str(generation.status or "") not in {"building", "accepted"}:
+        raise ValueError("execution snapshot requires building or accepted generation")
+
+    root_item_ids = sorted({
+        int(item_id)
+        for (item_id,) in (
+            db.query(ProductionPlanLine.item_id)
+            .filter(ProductionPlanLine.plan_id == int(plan.id))
+            .distinct()
+            .all()
+        )
+    })
+    descendants_by_root = _bom_descendants_by_item(db, root_item_ids)
+    roots_by_item: Dict[int, List[int]] = {}
+    for root_id, descendant_ids in descendants_by_root.items():
+        for item_id in descendant_ids:
+            roots_by_item.setdefault(int(item_id), []).append(int(root_id))
+    for item_id in list(roots_by_item):
+        roots_by_item[item_id] = sorted(set(roots_by_item[item_id]))
+
+    rows, _meta = _build_execution_snapshot_rows(
+        db,
+        run,
+        requirement_ids=run_requirements,
+        items_by_requirement=items_by_req,
+        generation_id=generation_id,
+        root_item_ids_by_item=roots_by_item,
+    )
+    rows = _filter_execution_rows(
+        db,
+        rows,
+        root_item_id=root_item_id,
+        bom_level=bom_level,
+        flow=flow,
+    )
+    rows = _attach_execution_information_links(rows)
+    summary = _execution_row_summary(rows)
+    payload = {
+        "plan": _serialize_plan(plan),
+        "run_id": int(run.run_id),
+        # Candidate snapshots are unreachable until the surrounding transaction
+        # atomically accepts and publishes their generation.
+        "truth_status": "accepted",
+        "ledger_generation": int(generation_id),
+        "cutoff": generation.cutoff.isoformat(),
+        "truth_generation_id": generation_id,
+        "truth_cutoff": generation.cutoff.isoformat(),
+        "truth_reason": None,
+        "rows": rows,
+        "summary": summary,
+    }
+    snapshot_key = _execution_snapshot_key(
+        plan_id=plan.id,
+        run_id=run.run_id,
+        root_item_id=None,
+        bom_level=None,
+        flow=None,
+    )
+    if not persist:
+        return payload
+
+    existing = (
+        db.query(PlanningReadSnapshot)
+        .filter(
+            PlanningReadSnapshot.consumer == "period_plan_execution",
+            PlanningReadSnapshot.snapshot_key == snapshot_key,
+            PlanningReadSnapshot.ledger_generation_id == int(generation_id),
+        )
+        .one_or_none()
+    )
+    if existing is not None:
+        if (
+            existing.cutoff != generation.cutoff
+            or str(existing.truth_status) != "accepted"
+            or dict(existing.payload or {}) != payload
+            or existing.reason is not None
+        ):
+            raise ValueError(
+                f"execution snapshot {snapshot_key} conflicts with sealed candidate"
+            )
+        return dict(existing.payload)
+    db.add(PlanningReadSnapshot(
+        consumer="period_plan_execution",
+        snapshot_key=snapshot_key,
+        ledger_generation_id=int(generation_id),
+        cutoff=generation.cutoff,
+        truth_status="accepted",
+        payload=payload,
+        reason=None,
+        published_at=datetime.now(timezone.utc),
+    ))
+    db.flush()
+    return payload
+
+
+def build_period_plan_execution_snapshots_for_generation(
+    db: Session,
+    generation_id: int,
+) -> Dict[str, Any]:
+    """Build every fixed plan/run snapshot belonging to one candidate."""
+    generation = db.get(LedgerGeneration, int(generation_id))
+    if generation is None:
+        raise ValueError("execution snapshot generation does not exist")
+    run_ids = [
+        int(run_id)
+        for (run_id,) in (
+            db.query(ReservationEntry.run_id)
+            .filter(
+                ReservationEntry.ledger_generation_id == int(generation_id),
+                ReservationEntry.run_id.isnot(None),
+            )
+            .distinct()
+            .order_by(ReservationEntry.run_id.asc())
+            .all()
+        )
+    ]
+    runs = (
+        db.query(PlanningRun)
+        .filter(PlanningRun.run_id.in_(run_ids))
+        .order_by(PlanningRun.run_id.asc())
+        .all()
+        if run_ids
+        else []
+    )
+    if len(runs) != len(run_ids):
+        raise ValueError("execution snapshot run lineage is incomplete")
+    snapshots: List[Dict[str, int]] = []
+    for run in runs:
+        if (
+            str(run.status or "") != "FIXED_SNAPSHOT"
+            or run.source_plan_id is None
+        ):
+            raise ValueError(
+                f"execution snapshot run {run.run_id} lacks fixed period-plan lineage"
+            )
+        build_period_plan_execution_snapshot(
+            db,
+            int(run.source_plan_id),
+            run_id=int(run.run_id),
+            generation_id=int(generation_id),
+            persist=True,
+        )
+        snapshots.append({
+            "plan_id": int(run.source_plan_id),
+            "run_id": int(run.run_id),
+        })
+    return {
+        "ledger_generation_id": int(generation_id),
+        "snapshots": len(snapshots),
+        "plan_runs": snapshots,
+    }

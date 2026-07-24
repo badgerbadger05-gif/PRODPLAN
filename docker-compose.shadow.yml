@@ -43,6 +43,7 @@ services:
       PRODPLAN_DEPLOYMENT_CONTOUR: parallel
       PRODPLAN_STABLE_URL: ${PRODPLAN_STABLE_URL:-http://mtzdock.lan:9010}
       STABLE_PRODPLAN_API_URL: ${PRODPLAN_STABLE_API_URL:-http://mtzdock.lan:8010}
+      ITEM_LEDGER_ADMIN_TOKEN: ${ITEM_LEDGER_ADMIN_TOKEN:?Set ITEM_LEDGER_ADMIN_TOKEN in .env.shadow}
     depends_on:
       db:
         condition: service_healthy

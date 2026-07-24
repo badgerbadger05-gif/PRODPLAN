@@ -19,12 +19,19 @@ def _world(db, *, with_parent=True, qty=5, replenishment_method="Покупка"
     )
     accepted = models.LedgerGeneration(
         generation_key="orchestrator-accepted", status="accepted", cutoff=cutoff,
-        source_watermarks={}, capabilities={"physical_ledger": True},
+        source_watermarks={"replay_from": "2026-07-01T00:00:00+00:00"},
+        capabilities={"physical_ledger": True},
         physical_import_batch=physical, algorithm_version="test", accepted_at=cutoff,
     )
     item = models.Item(item_code="ORCH-PURCHASE", item_name="orchestrator purchase",
                        replenishment_method=replenishment_method)
-    db.add_all([physical, accepted, item]); db.flush()
+    warehouse = models.StockWarehouse(
+        warehouse_ref1c="WH-OUT",
+        warehouse_name="Outside planning contour",
+        is_selected=False,
+        is_finished_goods=False,
+    )
+    db.add_all([physical, accepted, item, warehouse]); db.flush()
     db.add(models.PlanningTruthState(id=1, current_generation_id=accepted.id))
     plan = models.ProductionPlanHeader(name="orchestrator plan", status="fixed",
         period_from=period_from, period_to=date(2026, 8, 31))
@@ -204,7 +211,7 @@ def test_candidate_replay_applies_fifo_fact_to_candidate_reservation(db_session)
     physical = accepted.physical_import_batch
     db_session.add(models.StockLedgerEntry(
         ingest_batch_id=physical.id, source_content_hash="f" * 64, item_id=item.item_id,
-        characteristic_ref="", organization_ref="", warehouse_ref1c="", qty=Decimal("5"),
+        characteristic_ref="", organization_ref="", warehouse_ref1c="WH-OUT", qty=Decimal("5"),
         posting_at=datetime(2026, 7, 2, tzinfo=timezone.utc), record_type="receipt",
         movement_kind="assembly_in", recorder_type="Production", recorder_ref="FIFO", line_no="1",
     ))

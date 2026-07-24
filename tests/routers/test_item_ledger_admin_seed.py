@@ -25,6 +25,11 @@ import app.routers.item_ledger_admin as admin_mod
 from app.services.item_ledger.historical_import_orchestration import HistoricalImportError
 
 
+@pytest.fixture(autouse=True)
+def _admin_perimeter(monkeypatch):
+    monkeypatch.setenv("ITEM_LEDGER_ADMIN_TOKEN", "test-admin-token")
+
+
 @pytest.fixture()
 def db_session():
     # StaticPool: one shared in-memory connection, so the TestClient worker
@@ -51,7 +56,7 @@ def _client(db):
         yield db
 
     app.dependency_overrides[get_db] = _override
-    return TestClient(app)
+    return TestClient(app, headers={"X-PRODPLAN-ADMIN-TOKEN": "test-admin-token"})
 
 
 def _setup_items(db):
@@ -86,6 +91,21 @@ def _counts(db):
         db.query(models.StockBin).count(),
         db.query(models.StockLedgerAnchor).count(),
     )
+
+
+def test_admin_perimeter_rejects_missing_token(db_session):
+    app = FastAPI()
+    app.include_router(admin_mod.router, prefix="/api")
+    response = TestClient(app).post("/api/v1/item-ledger/admin/seed")
+    assert response.status_code == 401
+
+
+def test_admin_perimeter_fails_closed_when_not_configured(db_session, monkeypatch):
+    monkeypatch.delenv("ITEM_LEDGER_ADMIN_TOKEN")
+    app = FastAPI()
+    app.include_router(admin_mod.router, prefix="/api")
+    response = TestClient(app).post("/api/v1/item-ledger/admin/seed")
+    assert response.status_code == 503
 
 
 def test_seed_dry_run_default_writes_nothing(db_session, seeded_odata):

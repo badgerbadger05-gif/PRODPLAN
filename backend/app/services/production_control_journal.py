@@ -35,7 +35,7 @@ from .production_control_common import (
     to_float as _to_float,
 )
 from .production_control_domain import ensure_state as _ensure_state
-from .planning_truth import require_accepted_truth
+from .planning_truth import PlanningTruthReadiness, require_accepted_truth
 from .production_control_material_issues import refresh_existing_material_issues_for_product
 from .replenishment import REPLENISHMENT_FLOW_PRODUCTION, classify_replenishment_flow
 from .paint_weld_pairs import is_welded_blocked
@@ -971,6 +971,7 @@ def _planned_dates_by_item(
 def list_journal(
     db: Session,
     *,
+    truth: PlanningTruthReadiness | None = None,
     product_id: Optional[int] = None,
     order_id: Optional[int] = None,
     root_item_id: Optional[int] = None,
@@ -986,7 +987,7 @@ def list_journal(
     limit: int = 100,
     offset: int = 0,
 ) -> Dict[str, Any]:
-    truth = require_accepted_truth(db, "production_control_journal")
+    truth = truth or require_accepted_truth(db, "production_control_journal")
     accepted_run_ids = _accepted_fixed_run_ids(
         db,
         ledger_generation_id=int(truth.generation_id),

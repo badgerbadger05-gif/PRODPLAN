@@ -173,10 +173,16 @@ def test_mount_gets_read_snapshot_without_invoking_live_calculators(
 
     assert positions.status_code == signals.status_code == 200
     assert deficits.status_code == board.status_code == 200
-    assert positions.json()[0]["live_nfp"]["nfp"] == 2
-    assert signals.json()[0]["id"] == 21
-    assert deficits.json()["deficits"][0]["short_qty"] == 4
-    assert board.json()["positions"][0]["position_id"] == 31
+    positions_payload = positions.json()
+    signals_payload = signals.json()
+    deficits_payload = deficits.json()
+    board_payload = board.json()
+    assert positions_payload["rows"][0]["live_nfp"]["nfp"] == 2
+    assert signals_payload["rows"][0]["id"] == 21
+    assert deficits_payload["rows"]["deficits"][0]["short_qty"] == 4
+    assert board_payload["rows"]["positions"][0]["position_id"] == 31
+    assert positions_payload["truth_meta"]["truth_status"] == "accepted"
+    assert positions_payload["truth_meta"]["ledger_generation"] is not None
     assert cockpit.status_code == 200
     assert cockpit.json()["meta"]["truth_status"] == "accepted"
     assert cockpit.json()["meta"]["ledger_generation"] is not None
@@ -197,7 +203,7 @@ def test_position_detail_reads_immutable_current_snapshot_and_ignores_live_query
 
     listed = client.get("/api/v1/dbr/feeder/positions", params={"include_live_nfp": "true"})
     assert listed.status_code == 200, listed.text
-    stable_id = listed.json()[0]["id"]
+    stable_id = listed.json()["rows"][0]["id"]
     assert isinstance(stable_id, int) and stable_id > 0
     assert stable_id <= (2**53 - 1)
 

@@ -94,7 +94,7 @@ def _accepted_planning_truth(db_session):
         generation_key="mrp-reconciliation-diagnostic",
         status="accepted",
         cutoff=datetime(2026, 7, 23),
-        source_watermarks={},
+        source_watermarks={"replay_from": "2026-06-01T00:00:00+00:00"},
         capabilities={
             "physical_ledger": True,
             "reservation_replay": True,

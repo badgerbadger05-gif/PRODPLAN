@@ -42,6 +42,13 @@ require_env() {
   [[ "${password}" =~ ^[A-Za-z0-9_-]+$ ]] || die \
     "для DATABASE_URL используйте URL-безопасный пароль: A-Z, a-z, 0-9, _ и -"
 
+  local admin_token
+  admin_token="$(sed -n 's/^ITEM_LEDGER_ADMIN_TOKEN=//p' "${ENV_FILE}" | tail -n 1)"
+  [[ "${#admin_token}" -ge 32 ]] || die \
+    "ITEM_LEDGER_ADMIN_TOKEN должен быть не короче 32 символов"
+  [[ "${admin_token}" != *REPLACE* && "${admin_token}" != *change_me* ]] || die \
+    "замените шаблонный ITEM_LEDGER_ADMIN_TOKEN"
+
   local frontend_context
   frontend_context="$(sed -n 's/^PRODPLAN_FRONTEND_BUILD_CONTEXT=//p' "${ENV_FILE}" | tail -n 1)"
   frontend_context="${frontend_context:-./frontend-erp-shell}"

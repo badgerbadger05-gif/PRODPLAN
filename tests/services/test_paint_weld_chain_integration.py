@@ -56,7 +56,10 @@ def _accepted_planning_truth(db_session):
         status="accepted",
         cutoff=cutoff,
         accepted_at=cutoff,
-        source_watermarks={"explicit_empty_prefix": True},
+        source_watermarks={
+            "explicit_empty_prefix": True,
+            "replay_from": "2026-05-01T00:00:00+00:00",
+        },
         capabilities={
             "physical_ledger": True,
             "reservation_replay": True,

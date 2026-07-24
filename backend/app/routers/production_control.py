@@ -7,6 +7,8 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
+from ..services import planning_truth
+from ..routers.truth_meta import TruthMeta, build_truth_meta
 from ..database import get_db
 from ..models import DefaultSpecification, Employee, Operation, ProductionProduct, ProductionStage, Specification, SpecOperation
 from ..schemas import ODataSyncRequest
@@ -332,6 +334,7 @@ class ProductionOrderJournalResponse(BaseModel):
     offset: int
     latest_run_id: Optional[int] = None
     latest_source_plan_id: Optional[int] = None
+    truth_meta: TruthMeta
 
 
 @router.get("/orders", response_model=ProductionOrderJournalResponse)
@@ -356,8 +359,10 @@ def get_orders_journal(
     db: Session = Depends(get_db),
 ):
     try:
-        return list_journal(
+        truth = planning_truth.require_accepted_truth(db, "production_control.orders")
+        journal = list_journal(
             db,
+            truth=truth,
             product_id=product_id,
             order_id=order_id,
             root_item_id=root_item_id,
@@ -373,6 +378,8 @@ def get_orders_journal(
             limit=limit,
             offset=offset,
         )
+        journal["truth_meta"] = build_truth_meta(truth).model_dump()
+        return journal
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

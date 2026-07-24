@@ -15,12 +15,14 @@ from app.services.item_ledger.obligation_generation import (
 
 def _accepted_parent(db, *, key="accepted", pointer=True, status="accepted"):
     cutoff = datetime(2026, 7, 23, 12, tzinfo=timezone.utc)
+    replay_from = datetime(2026, 7, 1, tzinfo=timezone.utc)
     physical = models.PhysicalImportBatch(
         batch_key=f"physical:{key}", status="completed", cutoff=cutoff,
         source_watermarks={"rows_read": 1}, completed_at=cutoff,
     )
     parent = models.LedgerGeneration(
-        generation_key=key, status=status, cutoff=cutoff, source_watermarks={},
+        generation_key=key, status=status, cutoff=cutoff,
+        source_watermarks={"replay_from": replay_from.isoformat()},
         capabilities={"physical_ledger": True}, physical_import_batch=physical,
         algorithm_version="accepted/1", accepted_at=cutoff,
     )
@@ -102,7 +104,9 @@ def test_fork_reuses_exact_prefix_and_materializes_bins_without_publishing(db_se
     assert candidate.physical_import_batch_id == physical.id
     assert candidate.cutoff == parent.cutoff.replace(tzinfo=None)
     assert candidate.source_watermarks == {
-        "parent_generation_id": parent.id, "generation_kind": GENERATION_KIND,
+        "parent_generation_id": parent.id,
+        "generation_kind": GENERATION_KIND,
+        "replay_from": parent.source_watermarks["replay_from"],
     }
     assert candidate.capabilities == {}
     assert candidate.algorithm_version == ALGORITHM_VERSION

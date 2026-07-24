@@ -25,12 +25,14 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from decimal import Decimal
+import hmac
+import os
 from zoneinfo import ZoneInfo
 import time
 from typing import Any, Dict, List, Mapping, Optional
 from urllib.error import URLError
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
@@ -72,7 +74,24 @@ from ..services.planning_truth import (
     invalidate_current_generation,
 )
 
-router = APIRouter(prefix="/v1/item-ledger/admin", tags=["item-ledger-admin"])
+def require_item_ledger_admin(
+    token: str | None = Header(default=None, alias="X-PRODPLAN-ADMIN-TOKEN"),
+) -> None:
+    expected = os.getenv("ITEM_LEDGER_ADMIN_TOKEN", "").strip()
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="item-ledger admin perimeter is not configured",
+        )
+    if token is None or not hmac.compare_digest(token, expected):
+        raise HTTPException(status_code=401, detail="invalid item-ledger admin token")
+
+
+router = APIRouter(
+    prefix="/v1/item-ledger/admin",
+    tags=["item-ledger-admin"],
+    dependencies=[Depends(require_item_ledger_admin)],
+)
 
 
 class SeedReseedStats(BaseModel):

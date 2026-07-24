@@ -200,6 +200,30 @@ def test_make_with_identity_never_pegs_fifo_before_older_underproduction():
     assert result.unplanned_qty == Decimal("0")
 
 
+def test_july_make_with_identity_hint_closes_future_reserve_after_older():
+    result = allocate_historical_facts(
+        [
+            fact(
+                "july-preproduction",
+                "6",
+                posting_at=datetime(2026, 7, 9, tzinfo=timezone.utc),
+                requirement_id=99,
+                mode="make",
+            ),
+        ],
+        [
+            reserve("old-aug", 10, qty="3", due=date(2026, 8, 31), run_id=10),
+            reserve("future-sep", 11, qty="10", due=date(2026, 9, 30), run_id=11),
+        ],
+    )
+
+    assert [(a.fact_id, a.reserve_id, a.match_rule, a.qty) for a in result.allocations] == [
+        ("july-preproduction", "old-aug", "fifo", Decimal("3")),
+        ("july-preproduction", "future-sep", "fifo", Decimal("3")),
+    ]
+    assert result.unplanned_qty == Decimal("0")
+
+
 def test_unaddressed_output_still_uses_oldest_prior_period_reserve():
     may = reserve("may", 5, qty="2", due=date(2026, 5, 31))
     june = reserve("june", 6, qty="2", due=date(2026, 6, 30))

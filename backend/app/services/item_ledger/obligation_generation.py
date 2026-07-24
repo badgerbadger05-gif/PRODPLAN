@@ -47,10 +47,14 @@ def _utc(value: datetime | None, field: str) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-def _expected_watermarks(parent_id: int) -> dict[str, Any]:
+def _expected_watermarks_with_replay_from(
+    parent_id: int,
+    replay_from: datetime,
+) -> dict[str, Any]:
     return {
         "parent_generation_id": int(parent_id),
         "generation_kind": GENERATION_KIND,
+        "replay_from": _utc(replay_from, "replay_from").isoformat(),
     }
 
 
@@ -154,7 +158,7 @@ def _clone_supplier_receipt_provenance(
 
 def _require_current_accepted_parent(
     db: Session, parent_generation_id: int
-) -> tuple[models.LedgerGeneration, models.PhysicalImportBatch]:
+) -> tuple[models.LedgerGeneration, models.PhysicalImportBatch, datetime]:
     parent = db.get(models.LedgerGeneration, int(parent_generation_id))
     if parent is None or str(parent.status) != "accepted":
         raise ObligationGenerationError("parent generation must be ACCEPTED")
@@ -172,7 +176,16 @@ def _require_current_accepted_parent(
     )
     if physical is None or str(physical.status) != "completed":
         raise ObligationGenerationError("parent physical import batch is not completed")
-    return parent, physical
+    parent_marks = dict(parent.source_watermarks or {})
+    try:
+        parent_replay_from = datetime.fromisoformat(
+            str(parent_marks["replay_from"])
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ObligationGenerationError(
+            "parent generation lacks replay_from lineage"
+        ) from exc
+    return parent, physical, _utc(parent_replay_from, "replay_from")
 
 
 def _exact_existing(
@@ -182,12 +195,16 @@ def _exact_existing(
     parent: models.LedgerGeneration,
     physical: models.PhysicalImportBatch,
     key: str,
+    replay_from: datetime,
 ) -> None:
     if (
         str(existing.status) != "building"
         or existing.physical_import_batch_id != physical.id
         or _utc(existing.cutoff, "existing cutoff") != _utc(parent.cutoff, "parent cutoff")
-        or dict(existing.source_watermarks or {}) != _expected_watermarks(parent.id)
+        or dict(existing.source_watermarks or {}) != _expected_watermarks_with_replay_from(
+            parent.id,
+            replay_from,
+        )
         or dict(existing.capabilities or {}) != {}
         or str(existing.algorithm_version) != ALGORITHM_VERSION
         or str(existing.replay_version) != REPLAY_VERSION
@@ -234,12 +251,21 @@ def fork_obligation_generation(
     if len(_checkpoint_key(key)) > 128:
         raise ValueError("generation_key is too long")
 
-    parent, physical = _require_current_accepted_parent(db, parent_generation_id)
+    parent, physical, replay_from = _require_current_accepted_parent(
+        db, parent_generation_id
+    )
     existing = db.query(models.LedgerGeneration).filter(
         models.LedgerGeneration.generation_key == key
     ).one_or_none()
     if existing is not None:
-        _exact_existing(db, existing, parent=parent, physical=physical, key=key)
+        _exact_existing(
+            db,
+            existing,
+            parent=parent,
+            physical=physical,
+            key=key,
+            replay_from=replay_from,
+        )
         return ObligationGenerationResult(
             ledger_generation_id=int(existing.id),
             generation_key=key,
@@ -252,7 +278,9 @@ def fork_obligation_generation(
         generation_key=key,
         status="building",
         cutoff=parent.cutoff,
-        source_watermarks=_expected_watermarks(parent.id),
+        source_watermarks=_expected_watermarks_with_replay_from(
+            parent.id, replay_from,
+        ),
         capabilities={},
         physical_import_batch_id=int(physical.id),
         algorithm_version=ALGORITHM_VERSION,

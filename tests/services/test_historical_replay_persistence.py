@@ -7,6 +7,8 @@ from app.models import (
     Item,
     LedgerBuildBatch,
     LedgerGeneration,
+    StockBin,
+    StockWarehouse,
     MrpExecutionAllocation,
     MrpRequirement,
     MrpRequirementBucket,
@@ -36,11 +38,22 @@ def _generation_scope(
     item: Item | None = None,
     realization_mode: str = "make",
     movement_kind: str = "assembly_in",
+    add_default_warehouse_policy: bool = True,
 ):
     cutoff = datetime(2026, 7, 23, 12, 0)
     item = item or Item(item_code=f"ITEM-{key}", item_name=f"Item {key}")
     batch = PhysicalImportBatch(batch_key=f"physical-{key}", status="completed", cutoff=cutoff)
     db.add_all([item, batch])
+    if (
+        add_default_warehouse_policy
+        and db.query(StockWarehouse).filter_by(warehouse_ref1c="WH").count() == 0
+    ):
+        db.add(StockWarehouse(
+            warehouse_ref1c="WH",
+            warehouse_name="Outside default",
+            is_selected=False,
+            is_finished_goods=False,
+        ))
     db.flush()
     generation = LedgerGeneration(
         generation_key=f"generation-{key}",
@@ -706,7 +719,16 @@ def test_replay_treats_no_pool_facts_as_unplanned_without_ambiguity(db_session):
     cutoff = datetime(2026, 7, 23, 12, 0)
     item = Item(item_code="ITEM-NO-POOL", item_name="Item No Pool")
     batch = PhysicalImportBatch(batch_key="physical-no-pool", status="completed", cutoff=cutoff)
-    db_session.add_all([item, batch])
+    db_session.add_all([
+        item,
+        batch,
+        StockWarehouse(
+            warehouse_ref1c="WH",
+            warehouse_name="Outside planning contour",
+            is_selected=False,
+            is_finished_goods=False,
+        ),
+    ])
     db_session.flush()
     generation = LedgerGeneration(
         generation_key="generation-no-pool",
@@ -1103,6 +1125,122 @@ def test_replay_rejects_make_allocation_when_bucket_net_is_zero(db_session):
         ValueError, match="bucket capacity is below realization",
     ):
         run_historical_replay(db_session, generation.id)
+
+
+def test_replay_excludes_make_facts_for_selected_non_fg_contour_warehouse(db_session):
+    generation, reservation = _generation_scope(
+        db_session,
+        "MAKE-IN-CONTOUR",
+        fact_qty="5",
+        reserve_qty="5",
+        realization_mode="make",
+    )
+    warehouse = db_session.query(StockWarehouse).filter_by(
+        warehouse_ref1c="WH"
+    ).one()
+    warehouse.warehouse_name = "Contour A"
+    warehouse.is_selected = True
+    db_session.flush()
+    fact = db_session.query(StockLedgerEntry).filter_by(
+        ingest_batch_id=generation.physical_import_batch_id
+    ).one()
+    db_session.add(StockBin(
+        ledger_generation_id=generation.id,
+        item_id=reservation.item_id,
+        characteristic_ref=fact.characteristic_ref or "",
+        organization_ref=fact.organization_ref or "",
+        warehouse_ref1c=fact.warehouse_ref1c,
+        on_hand=fact.qty,
+    ))
+    db_session.commit()
+
+    result = run_historical_replay(db_session, generation.id)
+
+    assert result["facts"] == 0
+    assert result["allocations"] == 0
+    assert result["unplanned_facts"] == 0
+    assert Decimal(result["excluded_make_facts"]) == Decimal("1")
+    assert Decimal(result["excluded_make_qty"]) == Decimal("5")
+    assert Decimal(result["allocated_qty"]) == Decimal("0")
+    assert Decimal(result["unplanned_qty"]) == Decimal("0")
+    assert db_session.query(ReservationEvent).filter_by(
+        ledger_generation_id=generation.id
+    ).count() == 0
+    db_session.refresh(reservation)
+    assert reservation.realized_qty == Decimal("0")
+
+
+def test_replay_excludes_make_when_warehouse_policy_is_missing(db_session):
+    generation, reservation = _generation_scope(
+        db_session,
+        "MAKE-NO-WAREHOUSE-POLICY",
+        fact_qty="5",
+        reserve_qty="5",
+        realization_mode="make",
+        add_default_warehouse_policy=False,
+    )
+
+    result = run_historical_replay(db_session, generation.id)
+
+    assert result["facts"] == 0
+    assert result["excluded_make_facts"] == 1
+    assert result["excluded_make_samples"][0]["reason"] == "warehouse_policy_missing"
+    assert result["allocated_qty"] == "0"
+    assert db_session.query(ReservationEvent).filter_by(
+        ledger_generation_id=generation.id
+    ).count() == 0
+    db_session.refresh(reservation)
+    assert reservation.realized_qty == Decimal("0")
+
+
+def test_replay_allows_make_facts_for_outside_contour_warehouse(db_session):
+    generation, reservation = _generation_scope(
+        db_session,
+        "MAKE-OUT-OF-CONTOUR",
+        fact_qty="5",
+        reserve_qty="5",
+        realization_mode="make",
+    )
+    db_session.add_all([
+        StockWarehouse(
+            warehouse_ref1c="WH-IN",
+            warehouse_name="Contour A",
+            is_selected=True,
+            is_finished_goods=False,
+        ),
+        StockWarehouse(
+            warehouse_ref1c="WH-OUT",
+            warehouse_name="Outside A",
+            is_selected=False,
+            is_finished_goods=False,
+        ),
+    ])
+    fact = db_session.query(StockLedgerEntry).filter_by(
+        ingest_batch_id=generation.physical_import_batch_id
+    ).one()
+    fact.warehouse_ref1c = "WH-OUT"
+    db_session.add(StockBin(
+        ledger_generation_id=generation.id,
+        item_id=reservation.item_id,
+        characteristic_ref=fact.characteristic_ref or "",
+        organization_ref=fact.organization_ref or "",
+        warehouse_ref1c=fact.warehouse_ref1c,
+        on_hand=fact.qty,
+    ))
+    db_session.flush()
+
+    result = run_historical_replay(db_session, generation.id)
+
+    assert result["facts"] == 1
+    assert result["excluded_make_facts"] == 0
+    assert Decimal(result["allocated_qty"]) == Decimal("5")
+    assert result["allocations"] == 1
+    assert result["unplanned_facts"] == 0
+    assert db_session.query(ReservationEvent).filter_by(
+        ledger_generation_id=generation.id
+    ).count() == 1
+    db_session.refresh(reservation)
+    assert reservation.realized_qty == Decimal("5")
 
 
 def test_replay_preserves_mode_isolated_bucket_capacity(db_session):
