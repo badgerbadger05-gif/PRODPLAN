@@ -278,16 +278,21 @@ def run_historical_replay(
         row for row in candidate_rows
         if str(row.movement_kind or "") in _IGNORED_FACT_KINDS
     ]
-    factual_orgs_by_key: dict[tuple[int, str, str], set[str]] = {}
+    factual_identities_by_key: dict[
+        tuple[int, str],
+        set[tuple[str, str]],
+    ] = {}
     for row in physical_rows:
-        factual_orgs_by_key.setdefault(
+        factual_identities_by_key.setdefault(
             (
                 int(row.item_id),
-                str(row.characteristic_ref or ""),
                 _fact_mode(row),
             ),
             set(),
-        ).add(str(row.organization_ref or ""))
+        ).add((
+            str(row.characteristic_ref or ""),
+            str(row.organization_ref or ""),
+        ))
 
     for row in entries:
         if row.run_id is None:
@@ -328,7 +333,7 @@ def run_historical_replay(
     identity_by_core_id: dict[str, tuple[int | None, str | None]] = {}
     ambiguous_pool_facts = 0
     ambiguous_identity_facts = 0
-    organization_collapsed_pool_facts = 0
+    legacy_identity_collapsed_pool_facts = 0
     for row in physical_rows:
         mode = _fact_mode(row)
         exact_key = (
@@ -338,10 +343,11 @@ def run_historical_replay(
             mode,
         )
         pools = pools_by_key.get(exact_key, set())
-        fallback_key = (int(row.item_id), str(row.characteristic_ref or ""), mode)
+        fallback_key = (int(row.item_id), mode)
+        fact_characteristic = str(row.characteristic_ref or "")
         fact_org = str(row.organization_ref or "")
         fallback_pools = pools_by_key.get(
-            (int(row.item_id), str(row.characteristic_ref or ""), "", mode),
+            (int(row.item_id), "", "", mode),
             set(),
         )
         if len(pools) == 1:
@@ -349,11 +355,12 @@ def run_historical_replay(
         elif (
             not pools
             and len(fallback_pools) == 1
-            and len(factual_orgs_by_key.get(fallback_key, set())) == 1
+            and len(factual_identities_by_key.get(fallback_key, set())) == 1
         ):
             pool = next(iter(fallback_pools))
+            fact_characteristic = ""
             fact_org = ""
-            organization_collapsed_pool_facts += 1
+            legacy_identity_collapsed_pool_facts += 1
         else:
             pool = f"__unresolved_pool__:{row.id}"
             ambiguous_pool_facts += 1
@@ -367,7 +374,7 @@ def run_historical_replay(
             mode=mode,  # type: ignore[arg-type]
             qty=abs(_decimal(row.qty)),
             posting_at=row.posting_at,
-            characteristic_ref=str(row.characteristic_ref or ""),
+            characteristic_ref=fact_characteristic,
             organization_ref=fact_org,
             planning_stock_pool=pool,
             requirement_id=requirement_id,
@@ -563,7 +570,9 @@ def run_historical_replay(
         "unplanned_facts": len(result.unplanned),
         "ambiguous_pool_facts": ambiguous_pool_facts,
         "ambiguous_identity_facts": ambiguous_identity_facts,
-        "organization_collapsed_pool_facts": organization_collapsed_pool_facts,
+        "legacy_identity_collapsed_pool_facts": (
+            legacy_identity_collapsed_pool_facts
+        ),
         "excluded_pre_replay_facts": excluded_pre_replay,
         "replay_from": lower_bound.isoformat(),
         "input_checksum": _checksum(input_rows),

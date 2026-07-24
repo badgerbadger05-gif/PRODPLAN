@@ -681,20 +681,21 @@ def test_ambiguous_order_identity_leaves_consume_unplanned(db_session):
     assert result["ambiguous_identity_facts"] == 1
 
 
-def test_replay_collapses_singleton_fact_org_to_blank_org_pool(db_session):
+def test_replay_collapses_singleton_fact_identity_to_legacy_blank_pool(db_session):
     generation, reservation = _generation_scope(
         db_session, "ORG-COLLAPSE", fact_qty="5", reserve_qty="5"
     )
     fact = db_session.query(StockLedgerEntry).filter_by(
         ingest_batch_id=generation.physical_import_batch_id
     ).one()
+    fact.characteristic_ref = "CHAR-1"
     fact.organization_ref = "ORG-1"
     db_session.flush()
 
     result = run_historical_replay(db_session, generation.id)
 
     assert Decimal(result["allocated_qty"]) == Decimal("5")
-    assert result["organization_collapsed_pool_facts"] == 1
+    assert result["legacy_identity_collapsed_pool_facts"] == 1
     assert result["ambiguous_pool_facts"] == 0
     assert Decimal(result["unplanned_qty"]) == Decimal("0")
     db_session.refresh(reservation)
@@ -753,7 +754,7 @@ def test_replay_multi_org_facts_do_not_fallback_to_blank_org(db_session):
     result = run_historical_replay(db_session, generation.id)
 
     assert result["ambiguous_pool_facts"] == 2
-    assert result["organization_collapsed_pool_facts"] == 0
+    assert result["legacy_identity_collapsed_pool_facts"] == 0
     assert Decimal(result["allocated_qty"]) == Decimal("0")
     assert Decimal(result["unplanned_qty"]) == Decimal("8")
     assert db_session.query(ReservationEvent).filter_by(
@@ -821,7 +822,7 @@ def test_replay_exact_org_match_takes_precedence_over_blank_org_fallback(db_sess
     ).all()
 
     assert Decimal(result["allocated_qty"]) == Decimal("5")
-    assert result["organization_collapsed_pool_facts"] == 0
+    assert result["legacy_identity_collapsed_pool_facts"] == 0
     assert len(events) == 1
     assert events[0].reservation_id == exact_reservation.id
     assert events[0].planning_stock_pool == "legacy"
