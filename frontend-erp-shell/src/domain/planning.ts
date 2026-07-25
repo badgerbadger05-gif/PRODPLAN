@@ -174,6 +174,14 @@ export type PeriodPlan = {
   execution_partial?: boolean
   execution_status?: string | null
   execution_reason?: string | null
+  execution_by_flow?: Record<string, {
+    completed_qty: number
+    base_qty: number
+    execution_pct: number | null
+    confirmed_pct?: number | null
+    total_base_qty?: number
+    available?: boolean
+  }> | null
 }
 
 export type PeriodPlanListResponse = {

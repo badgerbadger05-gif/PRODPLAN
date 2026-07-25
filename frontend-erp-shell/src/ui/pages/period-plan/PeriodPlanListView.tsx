@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { PeriodPlan } from '../../../domain/planning'
-import { periodPlanStatusClass, periodPlanStatusLabel } from '../../../domain/planning'
+import { flowLabel, periodPlanStatusClass, periodPlanStatusLabel } from '../../../domain/planning'
 import { dateRu, dateTimeRu } from '../../../lib/format'
 import { createPeriodPlan, deletePeriodPlan, listPeriodPlans } from '../../../services/periodPlan'
 import { DocumentWindow } from '../../layout/DocumentWindow'
@@ -63,18 +63,67 @@ export function PeriodPlanListView({ onOpenPlan }: ListViewProps) {
     return 'shortage'
   }
 
+  const flowPctFmt = (pct: number) =>
+    Math.min(100, Math.max(0, pct)).toLocaleString('ru-RU', { maximumFractionDigits: 1 })
+
+  // Compact per-flow abbreviations for the list cell; full label lives in the tooltip.
+  function flowAbbr(flow: string) {
+    if (flow === 'purchase') return 'Зак'
+    if (flow === 'production') return 'Пр'
+    if (flow === 'rework') return 'Пер'
+    return flowLabel(flow)
+  }
+
+  const FLOW_ORDER = ['purchase', 'production', 'rework']
+
+  function executionFlowRows(source: PeriodPlan['execution_by_flow']) {
+    if (!source) return [] as Array<{ flow: string; pct: number | null; available: boolean }>
+    const orderOf = (flow: string) => {
+      const idx = FLOW_ORDER.indexOf(flow)
+      return idx === -1 ? FLOW_ORDER.length : idx
+    }
+    return Object.keys(source)
+      .sort((a, b) => orderOf(a) - orderOf(b))
+      .map((flow) => {
+        const entry = source[flow]
+        const base = entry?.base_qty ?? 0
+        const pct = entry?.execution_pct ?? null
+        const available = entry?.available !== false && pct !== null
+        return { flow, base, available, pct }
+      })
+      // Skip available flows with no demand (net-zero); always surface an
+      // unavailable flow so its "н/д" state stays visible.
+      .filter((row) => (row.available ? row.base > 1e-9 : true))
+  }
+
   function executionText(plan: PeriodPlan) {
     if (typeof plan.execution_pct !== 'number' || !Number.isFinite(plan.execution_pct)) {
+      // Draft plans have no MRP run yet — show a neutral dash, not the raw
+      // snapshot-missing reason (keep the reason in the tooltip).
+      if (plan.status === 'draft') {
+        return <span className="muted" title={plan.execution_reason ?? undefined}>—</span>
+      }
       return <span className="muted">{plan.execution_reason ? `Недоступно: ${plan.execution_reason}` : 'Недоступно'}</span>
     }
     const value = Math.max(0, plan.execution_pct)
     const pct = Math.min(100, value).toLocaleString('ru-RU', { maximumFractionDigits: 1 })
+    const flows = executionFlowRows(plan.execution_by_flow)
     return (
-      <span
-        className={`miniPill ${executionPillClass(value)}`}
-        title={plan.execution_partial ? 'Подтверждённый минимум; часть фактов недоступна' : undefined}
-      >
-        {plan.execution_partial ? '≥' : ''}{pct}%
+      <span style={{ display: 'inline-flex', flexWrap: 'wrap', alignItems: 'center', gap: 4 }}>
+        <span
+          className={`miniPill ${executionPillClass(value)}`}
+          title={plan.execution_partial ? 'Подтверждённый минимум; часть фактов недоступна' : undefined}
+        >
+          {plan.execution_partial ? '≥' : ''}{pct}%
+        </span>
+        {flows.map((row) => (
+          <span key={row.flow} className="muted" title={flowLabel(row.flow)}>
+            ·{' '}
+            {row.available && row.pct !== null
+              ? `${flowAbbr(row.flow)} ${flowPctFmt(row.pct)}%`
+              : `${flowAbbr(row.flow)}: н/д`}
+          </span>
+        ))}
       </span>
     )
   }

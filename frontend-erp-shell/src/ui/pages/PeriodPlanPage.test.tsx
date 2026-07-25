@@ -447,6 +447,49 @@ describe('PeriodPlanPage — list view', () => {
     expect(screen.getByText('Недоступно: Нет данных')).toBeInTheDocument()
   })
 
+  it('breaks execution down by flow with labels and shows a dash for draft plans', async () => {
+    vi.mocked(periodPlanSvc.listPeriodPlans).mockResolvedValue({
+      rows: [
+        {
+          ...listPlanA,
+          id: 201,
+          name: 'МАЙ 2026',
+          status: 'fixed',
+          fixed_at: '2026-05-01T09:00:00',
+          fixed_by: 'ivan',
+          execution_pct: 67.3,
+          execution_by_flow: {
+            purchase: { completed_qty: 0, base_qty: 5, execution_pct: 0, available: true },
+            production: { completed_qty: 9, base_qty: 10, execution_pct: 93.7, available: true },
+            rework: { completed_qty: 3, base_qty: 5, execution_pct: 60, available: true },
+            packaging: { completed_qty: 0, base_qty: 0, execution_pct: 100, available: true },
+          },
+        },
+        {
+          ...listPlanA,
+          id: 202,
+          name: 'ИЮНЬ 2026 ЧЕРНОВИК',
+          status: 'draft',
+          execution_pct: null,
+          execution_reason: 'Execution snapshot is missing for the accepted Ledger generation',
+        },
+      ],
+      total: 2,
+    })
+    renderAt('/period-plan')
+
+    // Overall percent plus each flow with its abbreviation (full label in title).
+    expect(await screen.findByText('67,3%')).toBeInTheDocument()
+    expect(screen.getByText(/Зак 0%/)).toBeInTheDocument()
+    expect(screen.getByText(/Пр 93,7%/)).toBeInTheDocument()
+    expect(screen.getByText(/Пер 60%/)).toBeInTheDocument()
+    // Net-zero flow (base 0) is skipped.
+    expect(screen.queryByText(/packaging|Упаков/)).not.toBeInTheDocument()
+    // Draft plan without an MRP run shows a neutral dash, not the raw reason.
+    expect(screen.getAllByText('—').length).toBeGreaterThan(0)
+    expect(screen.queryByText(/snapshot is missing/)).not.toBeInTheDocument()
+  })
+
   it('shows the empty state when no plans are returned', async () => {
     vi.mocked(periodPlanSvc.listPeriodPlans).mockResolvedValue({ rows: [], total: 0 })
     renderAt('/period-plan')
@@ -630,6 +673,9 @@ describe('PeriodPlanPage — detail view', () => {
     await user.click(screen.getByRole('button', { name: 'Журнал исполнения' }))
 
     expect(await screen.findByText(/покрыто 0% · к заказу 100%/)).toBeInTheDocument()
+    // Each flow in the header keeps its label prefix (regression: bare numbers).
+    expect(screen.getByText('Закупка: покрыто 0% · к заказу 100%')).toBeInTheDocument()
+    expect(screen.getByText('Производство: 20%')).toBeInTheDocument()
     expect(screen.queryByText(/≥/)).not.toBeInTheDocument()
     expect(screen.queryByText(/часть н\/д/)).not.toBeInTheDocument()
   })
@@ -750,7 +796,7 @@ describe('PeriodPlanPage — detail view', () => {
 
     expect(await screen.findByText('Насос ГА-1')).toBeInTheDocument()
     expect(screen.queryByText(/покрыто/)).not.toBeInTheDocument()
-    expect(screen.getByText('недоступно')).toBeInTheDocument()
+    expect(screen.getByText('Закупка: недоступно')).toBeInTheDocument()
     expect(screen.queryByText('Загрузка журнала…')).not.toBeInTheDocument()
 
     await waitFor(() => expect(purchaseControlSvc.listPurchaseJournal).toHaveBeenCalledTimes(1))

@@ -767,7 +767,19 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
         ...purchaseRowBase,
         base: source.purchase?.base_qty ?? 0,
       }
-      return [...productionAndRework, purchase].filter((row) => row.base > 1e-9 || row.flow === 'purchase' || !row.available)
+      const knownFlows = new Set(['production', 'rework', 'purchase'])
+      const extras = Object.keys(source)
+        .filter((flow) => !knownFlows.has(flow))
+        .map((flow) => ({
+          flow,
+          label: flowLabel(flow),
+          pct: source[flow]?.execution_pct ?? null,
+          confirmedPct: source[flow]?.confirmed_pct ?? null,
+          toOrderPct: null,
+          base: source[flow]?.base_qty ?? 0,
+          available: source[flow]?.available !== false,
+        }))
+      return [...productionAndRework, purchase, ...extras].filter((row) => row.base > 1e-9 || row.flow === 'purchase' || !row.available)
     }
     const grouped = new Map<string, { completed: number; base: number }>()
     journal.rows.forEach((row) => {
@@ -1305,6 +1317,7 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                   )}
                   {journalExecutionByFlow.map((row) => (
                     <span key={row.flow} className="toolbarText">
+                      {row.label}:{' '}
                       {row.flow === 'purchase'
                         ? row.available && row.pct !== null && row.toOrderPct !== null
                           ? `покрыто ${row.pct}% · к заказу ${row.toOrderPct}%`
