@@ -509,6 +509,44 @@ def test_validation_rejects_foreign_generation_supplier_reservation_cycle(db_ses
         validate_generation_build(db_session, generation.id)
 
 
+def test_validation_matches_supplier_allocations_to_supplier_realization_events(db_session):
+    generation, requirement = _synthetic(db_session, "supplier-realization")
+    _configure_obligation_checkpoint(
+        db_session,
+        generation,
+        requirement,
+        allow_unphased=False,
+        replay_allocated="0",
+    )
+    reservation = db_session.query(models.ReservationEntry).filter_by(
+        ledger_generation_id=generation.id
+    ).one()
+    reservation.realization_mode = "buy"
+    reservation.reserved_qty = Decimal("5")
+    reservation.realized_qty = Decimal("5")
+    _add_matching_reservation_event(db_session, generation, requirement)
+    event = db_session.query(models.ReservationEvent).filter_by(
+        ledger_generation_id=generation.id
+    ).one()
+    event.cycle_id = f"historical-supplier:g{generation.id}:accept"
+    db_session.add(models.MrpExecutionAllocation(
+        ledger_generation_id=generation.id,
+        cycle_id=f"historical-supplier:g{generation.id}:accept",
+        requirement_id=requirement.id,
+        fact_type="supplier_receipt",
+        allocation_kind="execution",
+        fact_ref=event.fact_ref,
+        fact_line_ref=event.fact_line_ref,
+        allocated_qty=Decimal("5"),
+    ))
+    db_session.flush()
+
+    result = validate_generation_build(db_session, generation.id)
+
+    assert result["valid"] is True
+    assert result["allocated_qty"] == "0"
+
+
 def test_validation_rejects_unphased_allocation_for_nonlegacy_make_requirement(db_session):
     generation, requirement = _synthetic(db_session, "no-legacy-unphased")
     _configure_obligation_checkpoint(

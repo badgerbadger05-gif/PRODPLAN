@@ -476,6 +476,7 @@ def validate_generation_build(
     supplier_allocation_by_key: dict[
         tuple[int | None, int | None, str, str], models.MrpExecutionAllocation
     ] = {}
+    supplier_realized_by_req_mode: dict[tuple[int, str], Decimal] = defaultdict(Decimal)
     replay_allocations: list[models.MrpExecutionAllocation] = []
     for allocation in allocations:
         if str(allocation.fact_type or "") == "supplier_receipt":
@@ -536,8 +537,15 @@ def validate_generation_build(
             raise GenerationValidationError(
                 "supplier allocation escapes selected obligations"
             )
-        supplier_allocated_qty += _d(allocation.allocated_qty)
-    if dict(allocation_by_req_mode) != {
+        supplier_qty = _d(allocation.allocated_qty)
+        supplier_allocated_qty += supplier_qty
+        supplier_realized_by_req_mode[
+            (int(allocation.requirement_id), "buy")
+        ] += supplier_qty
+    realized_allocations_by_req_mode = defaultdict(Decimal, allocation_by_req_mode)
+    for key, qty in supplier_realized_by_req_mode.items():
+        realized_allocations_by_req_mode[key] += qty
+    if dict(realized_allocations_by_req_mode) != {
         key: qty for key, qty in realized_by_req_mode.items() if qty != 0
     }:
         raise GenerationValidationError("bucket allocation sums differ from realized events")
