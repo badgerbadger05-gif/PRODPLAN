@@ -291,8 +291,14 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
       setLastRunId(data.run_id)
       if (!selectedRunId) setSelectedRunId(data.run_id)
       setPlan(data.plan)
-      const metric = data.plan?.period_to ? await loadLedgerPurchaseCoverage(data.plan.period_to) : null
-      if (journalPurchaseMetricRequest.current === metricRequestId) setJournalPurchaseMetric(metric)
+      if (data.plan?.period_to) {
+        try {
+          const metric = await loadLedgerPurchaseCoverage(data.plan.period_to)
+          if (journalPurchaseMetricRequest.current === metricRequestId) setJournalPurchaseMetric(metric)
+        } catch {
+          if (journalPurchaseMetricRequest.current === metricRequestId) setJournalPurchaseMetric(null)
+        }
+      }
     } catch (e) {
       setJournalError(e instanceof Error ? e.message : String(e))
       setJournal(null)

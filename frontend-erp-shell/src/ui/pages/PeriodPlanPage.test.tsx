@@ -738,6 +738,28 @@ describe('PeriodPlanPage — detail view', () => {
     expect(screen.getByText(/Исполнение не рассчитано/)).toBeInTheDocument()
   })
 
+  it('keeps execution journal loaded when purchase metric request fails and marks purchase unavailable', async () => {
+    vi.mocked(periodPlanSvc.getExecutionJournal).mockResolvedValue(journalResponse)
+    vi.mocked(purchaseControlSvc.listPurchaseJournal).mockRejectedValueOnce(new Error('503 Stale Purchase Snapshot'))
+
+    const user = userEvent.setup()
+    renderAt('/period-plan/123')
+    await screen.findByText('Насос ГА-1')
+
+    await user.click(screen.getByRole('button', { name: 'Журнал исполнения' }))
+
+    expect(await screen.findByText('Насос ГА-1')).toBeInTheDocument()
+    expect(screen.queryByText(/покрыто/)).not.toBeInTheDocument()
+    expect(screen.getByText('недоступно')).toBeInTheDocument()
+    expect(screen.queryByText('Загрузка журнала…')).not.toBeInTheDocument()
+
+    await waitFor(() => expect(purchaseControlSvc.listPurchaseJournal).toHaveBeenCalledTimes(1))
+    await new Promise((resolve) => {
+      setTimeout(resolve, 150)
+    })
+    expect(purchaseControlSvc.listPurchaseJournal).toHaveBeenCalledTimes(1)
+  })
+
   it('deletes a matrix row (draft) via deleteItemFromPeriodPlan after confirm', async () => {
     const user = userEvent.setup()
     renderAt('/period-plan/123')
