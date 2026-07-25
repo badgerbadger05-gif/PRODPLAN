@@ -1,5 +1,9 @@
 # Repository Guidelines
 
+> **ОБЯЗАТЕЛЬНО ПЕРВЫМ: прочитай `.docs/CANON.md`** — конституция структуры
+> (канонические ядра, запрет дублей, один источник истины на величину).
+> Волна, нарушающая канон, отклоняется на приёмке целиком.
+
 ## Project Structure & Module Organization
 
 PRODPLAN is split into a FastAPI backend and a Vite/React frontend. Backend code lives in `backend/app`, with Alembic migrations in `backend/alembic` and worker entrypoints in `backend/sync_worker.py` and `backend/reconcile_worker.py`. Frontend source is in `frontend-erp-shell/src`; static assets are in `frontend-erp-shell/public`. Shared or operational material is kept in `docs`, `scripts`, `tools`, `config`, and `config-test`. Main pytest coverage lives in the root `tests` directory, with additional frontend smoke tests in `frontend-erp-shell/tests`.
