@@ -2,7 +2,7 @@
 
 The manifest is deliberately created before requirements, reservations or MRP
 snapshots.  It makes a refresh a closed transaction: every currently published
-plan is refreshed, requested fixed plans without a current run are added, and
+plan is retained, requested fixed plans without a current run are added, and
 later retries cannot quietly change that set.
 """
 
@@ -21,7 +21,6 @@ from app import models
 from app.services.planning_run_candidate import (
     PlanningRunCandidateError,
     create_added_candidate_run,
-    create_candidate_run,
     _resolve_parent_generation_id,
 )
 
@@ -185,14 +184,38 @@ def _existing_result(
         if not isinstance(entry, dict):
             raise ObligationRefreshManifestError("target refresh manifest entry is malformed")
         try:
-            candidate_id = int(entry["candidate_run_id"])
             plan_id = int(entry["plan_id"])
         except (KeyError, TypeError, ValueError) as exc:
             raise ObligationRefreshManifestError(
                 "target refresh manifest entry identity is malformed"
             ) from exc
-        candidate = db.get(models.PlanningRun, candidate_id)
+        action = entry.get("action")
         expected_parent = entry.get("parent_run_id")
+        if action == "retain":
+            try:
+                parent_id = int(expected_parent)
+            except (TypeError, ValueError) as exc:
+                raise ObligationRefreshManifestError(
+                    "target retain manifest parent identity is malformed"
+                ) from exc
+            parent = db.get(models.PlanningRun, parent_id)
+            if (
+                entry.get("candidate_run_id") is not None
+                or parent is None
+                or str(parent.status) != "FIXED_SNAPSHOT"
+                or int(parent.source_plan_id or -1) != plan_id
+            ):
+                raise ObligationRefreshManifestError(
+                    "target retain manifest lineage conflicts"
+                )
+            continue
+        try:
+            candidate_id = int(entry["candidate_run_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ObligationRefreshManifestError(
+                "target refresh manifest candidate identity is malformed"
+            ) from exc
+        candidate = db.get(models.PlanningRun, candidate_id)
         if (
             candidate is None
             or str(candidate.status) != "BUILDING_SNAPSHOT"
@@ -206,7 +229,7 @@ def _existing_result(
                 entry.get("action") == "add"
                 and candidate.prior_run_id is not None
             )
-            or entry.get("action") not in {"refresh", "add"}
+            or action not in {"refresh", "add"}
         ):
             raise ObligationRefreshManifestError(
                 "target refresh manifest candidate lineage conflicts"
@@ -283,13 +306,10 @@ def create_obligation_refresh_manifest(
     entries: list[dict[str, int | str | None]] = []
     try:
         for parent_run in parents:
-            candidate = create_candidate_run(
-                db, int(parent_run.run_id), int(target.id), started_by
-            )
             entries.append({
-                "action": "refresh", "plan_id": int(parent_run.source_plan_id),
+                "action": "retain", "plan_id": int(parent_run.source_plan_id),
                 "parent_run_id": int(parent_run.run_id),
-                "candidate_run_id": int(candidate.run_id),
+                "candidate_run_id": None,
             })
         for plan_id in add_ids:
             candidate = create_added_candidate_run(

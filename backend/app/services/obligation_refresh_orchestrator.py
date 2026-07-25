@@ -20,8 +20,14 @@ from sqlalchemy.orm import Session
 from app import models
 from app.services.item_ledger.candidate_future_supply import capture_candidate_future_supply
 from app.services.item_ledger.candidate_realization_replay import replay_candidate_realizations
-from app.services.item_ledger.obligation_generation import fork_obligation_generation
+from app.services.item_ledger.obligation_generation import (
+    carry_forward_retained_reservations,
+    fork_obligation_generation,
+)
 from app.services.item_ledger.reservation_ledger import redistribute_generation_pools
+from app.services.item_ledger.supplier_receipt_allocation import (
+    rebuild_supplier_receipt_coverage_from_persisted_provenance,
+)
 from app.services.dbr.cockpit_candidate import (
     DbrCockpitCandidateError,
     build_cockpit_candidate_snapshot,
@@ -36,7 +42,10 @@ from app.services.dbr.purchase_candidate import (
 )
 from app.services.purchase_control_snapshot import build_candidate_snapshot as build_purchase_journal_candidate
 from app.services.mrp_freeze import MRP_LEDGER_LOCK_KEY, freeze_candidate_snapshots
-from app.services.mrp_result_snapshot import build_mrp_result_candidate_snapshot
+from app.services.mrp_result_snapshot import (
+    build_mrp_result_candidate_snapshot,
+    build_mrp_result_snapshot,
+)
 from app.services.obligation_refresh_manifest import (
     MANIFEST_HASH_KEY,
     MANIFEST_KEY,
@@ -50,6 +59,7 @@ _CORE_CAPABILITIES = {
     "physical_ledger": True,
     "reservation_replay": True,
     "execution_allocations": True,
+    "supplier_receipt_coverage": True,
     "planning_snapshots": True,
     "purchase_control_journal": True,
 }
@@ -179,6 +189,15 @@ def _publish_execution_snapshots(db: Session, generation_id: int) -> None:
         ) from exc
 
 
+def _publish_retained_mrp_snapshots(
+    db: Session,
+    generation_id: int,
+    retained_run_ids: Iterable[int],
+) -> None:
+    for run_id in sorted({int(value) for value in retained_run_ids}):
+        build_mrp_result_snapshot(db, run_id)
+
+
 def _retry_published(
     db: Session, target: models.LedgerGeneration, *, parent_generation_id: int,
     add_plan_ids: Iterable[int], horizon_days: int | None,
@@ -198,6 +217,17 @@ def _retry_published(
         accepted_at=target.accepted_at, capabilities=dict(target.capabilities or {}),
     )
     _publish_execution_snapshots(db, int(target.id))
+    manifest = marks.get(MANIFEST_KEY)
+    retained_ids = (
+        [
+            int(entry["parent_run_id"])
+            for entry in manifest.get("entries", [])
+            if isinstance(entry, dict) and entry.get("action") == "retain"
+        ]
+        if isinstance(manifest, dict)
+        else []
+    )
+    _publish_retained_mrp_snapshots(db, int(target.id), retained_ids)
     return ObligationRefreshOrchestrationResult(
         parent_generation_id=int(parent_generation_id), target_generation_id=int(target.id),
         candidate_run_ids=tuple(result.candidate_run_ids), published=result.published,
@@ -230,6 +260,20 @@ def run_obligation_refresh(
     add_ids = tuple(sorted(int(v) for v in add_plan_ids))
     if len(add_ids) != len(set(add_ids)) or any(v <= 0 for v in add_ids):
         raise ValueError("add_plan_ids must be unique positive ids")
+    if len(add_ids) > 1:
+        # The freeze anchors the shared stock baseline at the earliest
+        # period_from of the batch: mixing periods would net a later plan
+        # against an earlier boundary (inflated demand). Fail closed.
+        period_froms = {
+            row.period_from
+            for row in db.query(models.ProductionPlanHeader)
+            .filter(models.ProductionPlanHeader.id.in_(add_ids))
+            .all()
+        }
+        if len(period_froms) > 1:
+            raise ObligationRefreshOrchestratorError(
+                "add plans with different period_from must be refreshed separately"
+            )
     if db.get_bind().dialect.name == "postgresql":
         db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": MRP_LEDGER_LOCK_KEY})
 
@@ -285,9 +329,22 @@ def run_obligation_refresh(
         horizon_days=horizon_days, config_version_id=config_version_id, config_snapshot=config,
         planning_pool_by_warehouse=dict(planning_pool_by_warehouse or {}),
     )
-    candidate_ids = tuple(sorted(int(entry["candidate_run_id"]) for entry in manifest.entries))
-    if not candidate_ids:
-        raise ObligationRefreshOrchestratorError("refresh manifest has no candidate runs")
+    candidate_ids = tuple(sorted(
+        int(entry["candidate_run_id"])
+        for entry in manifest.entries
+        if entry.get("candidate_run_id") is not None
+    ))
+    retained_run_ids = tuple(sorted(
+        int(entry["parent_run_id"])
+        for entry in manifest.entries
+        if entry.get("action") == "retain"
+    ))
+    retained_reservation_count = carry_forward_retained_reservations(
+        db,
+        parent_generation_id=int(parent_generation_id),
+        target_generation_id=target_id,
+        retained_run_ids=retained_run_ids,
+    )
 
     reservation_batch = _single_stage(db, target_id, "reservation_materialize", key)
     snapshot_batch = _single_stage(db, target_id, "snapshot_build", key)
@@ -296,21 +353,37 @@ def run_obligation_refresh(
         planning_pool_by_warehouse=dict(planning_pool_by_warehouse or {}),
         explicit_make_transfer_recorders=explicit_make_transfer_recorders,
     )
-    freeze = freeze_candidate_snapshots(
-        db, parent_generation_id=int(parent_generation_id), target_generation_id=target_id,
-        candidate_run_ids=candidate_ids,
+    freeze = (
+        freeze_candidate_snapshots(
+            db, parent_generation_id=int(parent_generation_id), target_generation_id=target_id,
+            candidate_run_ids=candidate_ids,
+        )
+        if candidate_ids
+        else {
+            "candidate_run_ids": [],
+            "retained_run_ids": list(retained_run_ids),
+            "frozen": 0,
+        }
     )
     reservation_count = db.query(models.ReservationEntry.id).filter(
         models.ReservationEntry.ledger_generation_id == target_id,
         models.ReservationEntry.run_id.in_(candidate_ids),
     ).count()
     reservation_metrics = {
-        "candidate_run_ids": list(candidate_ids), "reservation_entries": int(reservation_count),
+        "candidate_run_ids": list(candidate_ids),
+        "retained_run_ids": list(retained_run_ids),
+        "retained_reservation_entries": int(retained_reservation_count),
+        "reservation_entries": int(reservation_count),
         "freeze_summary": _json_value(freeze),
         "input_checksum": sha256(_canonical({"candidate_run_ids": candidate_ids, "freeze": freeze}).encode()).hexdigest(),
     }
     _complete(reservation_batch, reservation_metrics)
     replay = replay_candidate_realizations(db, target_id)
+    supplier = rebuild_supplier_receipt_coverage_from_persisted_provenance(
+        db,
+        ledger_generation_id=target_id,
+        cycle_id=f"historical-supplier:g{target_id}:obligation-refresh",
+    )
     redistribute_generation_pools(
         db,
         target_id,
@@ -376,6 +449,12 @@ def run_obligation_refresh(
         "future_supply_capture": _json_value(capture),
         "freeze_summary": _json_value(freeze),
         "replay_summary": _json_value(replay),
+        "supplier_receipt_summary": _json_value({
+            "provenance_count": supplier.provenance_count,
+            "exact_fact_count": supplier.exact_fact_count,
+            "allocation_count": supplier.allocation_count,
+            "unplanned_qty": supplier.unplanned_qty,
+        }),
         "purchase_control_journal_snapshot_id": int(purchase_journal_snapshot.id),
         **dbr_metrics,
     }
@@ -387,6 +466,7 @@ def run_obligation_refresh(
         accepted_at=_utc(accepted_at), capabilities=dict(capabilities),
     )
     _publish_execution_snapshots(db, target_id)
+    _publish_retained_mrp_snapshots(db, target_id, retained_run_ids)
     return ObligationRefreshOrchestrationResult(
         parent_generation_id=int(parent_generation_id), target_generation_id=target_id,
         candidate_run_ids=tuple(published.candidate_run_ids), published=published.published,

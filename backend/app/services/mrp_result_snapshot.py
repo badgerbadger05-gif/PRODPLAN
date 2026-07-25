@@ -143,6 +143,18 @@ def _validate_obligation_lineage(
     generation_id: int,
 ) -> None:
     """Reject every obligation row whose accepted-generation origin is unknown."""
+    allowed_generation_ids = {int(generation_id)}
+    cursor = db.get(models.LedgerGeneration, int(generation_id))
+    while cursor is not None:
+        marks = dict(cursor.source_watermarks or {})
+        try:
+            parent_id = int(marks["parent_generation_id"])
+        except (KeyError, TypeError, ValueError):
+            break
+        if parent_id in allowed_generation_ids:
+            break
+        allowed_generation_ids.add(parent_id)
+        cursor = db.get(models.LedgerGeneration, parent_id)
     for model in (models.PlannedOrder, models.PlannedPurchase, models.PlannedRework):
         lineage_column = getattr(model, "ledger_generation_id", None)
         base = db.query(func.count()).select_from(model).filter(
@@ -155,7 +167,8 @@ def _validate_obligation_lineage(
                 )
             continue
         invalid = base.filter(
-            (lineage_column.is_(None)) | (lineage_column != int(generation_id))
+            (lineage_column.is_(None))
+            | (~lineage_column.in_(sorted(allowed_generation_ids)))
         ).scalar()
         if int(invalid or 0):
             raise ValueError(
@@ -302,11 +315,28 @@ def _require_sealed_candidate_manifest(
             raise ValueError("candidate snapshot obligation_refresh_manifest entry is malformed")
         try:
             action = str(entry["action"])
-            candidate_id = int(entry["candidate_run_id"])
             plan_id = int(entry["plan_id"])
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(
                 "candidate snapshot obligation_refresh_manifest entry identity is malformed"
+            ) from exc
+        if action == "retain":
+            if (
+                plan_id <= 0
+                or plan_id in declared_plan_ids
+                or entry.get("candidate_run_id") is not None
+                or entry.get("parent_run_id") is None
+            ):
+                raise ValueError(
+                    "candidate snapshot obligation_refresh_manifest has invalid retain entry"
+                )
+            declared_plan_ids.add(plan_id)
+            continue
+        try:
+            candidate_id = int(entry["candidate_run_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                "candidate snapshot obligation_refresh_manifest candidate identity is malformed"
             ) from exc
         if (
             action not in {"refresh", "add"}

@@ -2518,6 +2518,13 @@ class MrpFreezeBaseline(Base):
     organization_ref = Column(String(36), nullable=True)
     planning_stock_pool = Column(String(64), nullable=True)
     frozen_at = Column(TIMESTAMP, nullable=False, default=func.now(), server_default=func.now())
+    baseline_at = Column(TIMESTAMP, nullable=True)
+    physical_import_batch_id = Column(
+        BigInteger,
+        ForeignKey("physical_import_batch.id", ondelete="RESTRICT"),
+        nullable=True,
+        index=True,
+    )
     stock_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
     produced_total = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
     received_total = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")

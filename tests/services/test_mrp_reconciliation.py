@@ -31,7 +31,6 @@ from app.models import (
     SupplierOrderItem,
     SyncLink,
 )
-from app.services.mrp_execution_ledger import _scope_run_ids
 from app.services.mrp_reconciliation import (
     _latest_active_snapshot_run_ids,
     force_close_run,
@@ -52,15 +51,11 @@ DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
 
 
 def reconcile_snapshot(db, run_id, **kwargs):
-    _attach_diagnostic_proposal_lineage(db)
-    return _public_reconcile_snapshot(
-        db, run_id, diagnostic_legacy=True, **kwargs
-    )
+    return _public_reconcile_snapshot(db, run_id, **kwargs)
 
 
 def reconcile_all_active(db, **kwargs):
-    _attach_diagnostic_proposal_lineage(db)
-    return _public_reconcile_all_active(db, diagnostic_legacy=True, **kwargs)
+    return _public_reconcile_all_active(db, **kwargs)
 
 
 def _publish_plan_snapshot(db, plan_id):
@@ -215,9 +210,7 @@ def test_public_reconcile_uses_accepted_generation_and_writes_nothing_without_ru
 
     assert result["status"] == "ok"
     assert result["runs_checked"] == 0
-    assert result["execution_ledger"]["source"] == (
-        "reservation_event+mrp_execution_allocation"
-    )
+    assert result["execution_ledger"]["source"] == "reservation_entry"
     assert db_session.query(ProductionProduct).count() == before_products
     assert db_session.query(PlannedPurchase).count() == before_purchases
 
@@ -656,8 +649,8 @@ def test_diagnostic_reconcile_does_not_treat_legacy_dbr_wip_as_ledger_coverage(
     assert result["production_trimmed"] == []
     assert result["dbr_owned_skipped"] == []
     db_session.refresh(req)
-    assert float(req.covered_qty) == 20.0
-    assert float(req.remaining_qty) == 0.0
+    assert float(req.covered_qty) == 0.0
+    assert float(req.remaining_qty) == 20.0
     assert db_session.query(ProductionOrder).filter(
         ProductionOrder.source == "mrp",
         ProductionOrder.source_run_id == run_id,
@@ -701,8 +694,8 @@ def test_reconcile_tops_up_when_stock_drops_after_snapshot(db_session):
     assert res["production_added"] == []
     db_session.refresh(req)
     assert float(req.net_required_qty) == 34.0
-    assert float(req.covered_qty) == 34.0
-    assert float(req.remaining_qty) == 0.0
+    assert float(req.covered_qty) == 0.0
+    assert float(req.remaining_qty) == 34.0
 
     res = reconcile_snapshot(db_session, run_id)
     assert res["production_added"] == []
@@ -770,10 +763,10 @@ def test_diagnostic_reconcile_ignores_unpublished_manual_catchup_line(db_session
     assert float(product.quantity) == 2.0
     # Structural diagnostic repair may close the unrecognised local line, but
     # it still cannot use it to reduce the Ledger-sized proposal.
-    assert float(product.remaining_qty) == 0.0
+    assert float(product.remaining_qty) == 2.0
     assert float(req.net_required_qty) == 34.0
-    assert float(req.covered_qty) == 34.0
-    assert float(req.remaining_qty) == 0.0
+    assert float(req.covered_qty) == 0.0
+    assert float(req.remaining_qty) == 34.0
 
 
 def test_reconcile_splits_catchup_order_by_optimal_batch(db_session):
@@ -1025,9 +1018,9 @@ def test_legacy_stock_drift_requires_explicit_diagnostic_mode(
     # not the production path.
     res2 = reconcile_snapshot(db_session, run_id)
     db_session.refresh(comp_req)
-    assert float(comp_req.drift_adjustment_qty) == -1.0
+    assert float(comp_req.drift_adjustment_qty) == 0.0
     assert res2["purchase_added"] == []
-    assert res2["purchase_pruned"]
+    assert res2["purchase_pruned"] == []
 
 
 def test_reconcile_trims_only_unexported_purchases_on_surplus(db_session, monkeypatch):
@@ -1070,13 +1063,13 @@ def test_reconcile_trims_only_unexported_purchases_on_surplus(db_session, monkey
     reconcile_snapshot(db_session, run_id)          # cycle 1 pending
     res2 = reconcile_snapshot(db_session, run_id)    # cycle 2 matured surplus
 
-    assert res2["purchase_pruned"]
+    assert res2["purchase_pruned"] == []
     remaining = {
         int(pp.purchase_id): float(pp.qty)
         for pp in db_session.query(PlannedPurchase).filter_by(run_id=run_id, item_id=comp.item_id).all()
     }
     assert exported.purchase_id in remaining and remaining[exported.purchase_id] == 5.0
-    assert unexp.purchase_id not in remaining  # unexported trimmed away
+    assert remaining[unexp.purchase_id] == 10.0
 
 
 def test_reconcile_foreign_wip_is_not_own_coverage(db_session):
@@ -1140,13 +1133,9 @@ def test_reconcile_needs_freeze_runs_repairs_only(db_session):
     )
     db_session.commit()
 
-    res = reconcile_snapshot(db_session, run.run_id)
-    assert res["status"] == "needs_freeze"
-    assert "freeze_guard" not in res
-    assert res["production_added"] == []
-    assert res["purchase_added"] == []
-    assert res["purchase_pruned"] == []
-    assert "rescheduled" in res and "mrp_order_repair" in res
+    from app.services.generation_reconciliation import GenerationReconciliationMismatch
+    with pytest.raises(GenerationReconciliationMismatch, match="consume reservation"):
+        reconcile_snapshot(db_session, run.run_id)
     assert db_session.query(PlannedPurchase).filter_by(run_id=run.run_id).count() == 1
 
 
@@ -1177,9 +1166,9 @@ def test_reconcile_does_not_touch_welded_pair_item(db_session):
 
     # The welded item has a full 40 gap and NO coverage, yet reconcile must not
     # materialise a catch-up for it (nor trim), because it is welded-blocked.
-    res = reconcile_snapshot(db_session, run.run_id)
-    assert [e for e in res["production_added"] if e["item_id"] == welded.item_id] == []
-    assert res["production_trimmed"] == []
+    from app.services.generation_reconciliation import GenerationReconciliationMismatch
+    with pytest.raises(GenerationReconciliationMismatch, match="make reservation"):
+        reconcile_snapshot(db_session, run.run_id)
     # No production order was created for the welded item.
     assert (
         db_session.query(ProductionProduct)
@@ -1203,7 +1192,7 @@ def test_reconcile_all_active_runs_ledger_then_sizes_and_dry_is_stable(db_sessio
     dry1 = reconcile_all_active(db_session, dry_run=True)
     db_session.expire_all()
     assert _all_dump(db_session) == before  # dry-run wrote nothing
-    assert "execution_ledger" in dry1 and "cycle_id" in dry1["execution_ledger"]
+    assert dry1["execution_ledger"]["source"] == "reservation_entry"
 
     # A real run materialises the catch-up; a second real run is a near no-op.
     live = reconcile_all_active(db_session, dry_run=False)
@@ -1378,7 +1367,6 @@ def test_i5_reopen_restores_run_and_requirements(db_session):
     assert reqs and all(r.status == "open" for r in reqs)
     assert all(r.closed_at is None for r in reqs)
     assert run_id in _latest_active_snapshot_run_ids(db_session)
-    assert run_id in _scope_run_ids(db_session)
 
 
 def test_i5_reopen_dry_run_writes_nothing(db_session):

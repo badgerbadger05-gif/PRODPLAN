@@ -207,7 +207,7 @@ def test_replay_is_idempotent_and_folds_realized_cache(db_session):
     ).count() == 1
     assert db_session.query(MrpExecutionAllocation).filter_by(
         ledger_generation_id=generation.id
-    ).count() == 1
+    ).count() == 0
     db_session.refresh(reservation)
     assert reservation.realized_qty == Decimal("5")
     assert db_session.query(LedgerBuildBatch).filter_by(
@@ -449,16 +449,13 @@ def test_realization_is_split_across_all_requirement_buckets(db_session):
     first = run_historical_replay(db_session, generation.id)
     db_session.commit()
     second = run_historical_replay(db_session, generation.id)
-    rows = (
-        db_session.query(MrpExecutionAllocation)
-        .filter_by(ledger_generation_id=generation.id)
-        .order_by(MrpExecutionAllocation.bucket_id.asc())
-        .all()
-    )
+    rows = db_session.query(ReservationEvent).filter_by(
+        ledger_generation_id=generation.id,
+        reservation_id=reservation.id,
+    ).all()
 
-    assert [row.allocated_qty for row in rows] == [Decimal("2"), Decimal("3")]
-    assert sum((row.allocated_qty for row in rows), Decimal("0")) == Decimal("5")
-    assert first["execution_allocations_inserted"] == 2
+    assert [row.realized_delta for row in rows] == [Decimal("5")]
+    assert first["execution_allocations_inserted"] == 0
     assert second["execution_allocations_inserted"] == 0
 
 
@@ -499,17 +496,13 @@ def test_legacy_net_mismatch_uses_only_unphased_slice(db_session):
     result = run_historical_replay(db_session, generation.id)
     db_session.commit()
 
-    rows = (
-        db_session.query(MrpExecutionAllocation)
-        .filter_by(ledger_generation_id=generation.id)
-        .order_by(MrpExecutionAllocation.id.asc())
-        .all()
-    )
-    by_bucket = {row.bucket_id: row.allocated_qty for row in rows}
+    rows = db_session.query(ReservationEvent).filter_by(
+        ledger_generation_id=generation.id,
+        reservation_id=reservation.id,
+    ).all()
 
     assert Decimal(result["allocated_qty"]) == Decimal("6")
-    assert len(by_bucket) == 1
-    assert by_bucket[None] == Decimal("6")
+    assert [row.realized_delta for row in rows] == [Decimal("6")]
 
 
 def test_legacy_net_mismatch_ignores_stale_excess_bucket_capacity(db_session):
@@ -541,19 +534,17 @@ def test_legacy_net_mismatch_ignores_stale_excess_bucket_capacity(db_session):
     result = run_historical_replay(db_session, generation.id)
     db_session.commit()
 
-    rows = (
-        db_session.query(MrpExecutionAllocation)
-        .filter_by(ledger_generation_id=generation.id)
-        .order_by(MrpExecutionAllocation.id.asc())
-        .all()
-    )
+    rows = db_session.query(ReservationEvent).filter_by(
+        ledger_generation_id=generation.id,
+        reservation_id=reservation.id,
+    ).all()
 
     assert Decimal(result["allocated_qty"]) == Decimal("3")
     assert len(rows) == 1
-    assert rows[0].bucket_id is None
+    assert rows[0].realized_delta == Decimal("3")
 
 
-def test_replay_refuses_malformed_legacy_metric_ids(db_session):
+def test_replay_ignores_retired_legacy_phasing_metrics(db_session):
     generation, _reservation = _generation_scope(
         db_session, "LEGACY-MALFORMED", fact_qty="4", reserve_qty="4"
     )
@@ -571,11 +562,8 @@ def test_replay_refuses_malformed_legacy_metric_ids(db_session):
     ))
     db_session.commit()
 
-    with pytest.raises(
-        ValueError,
-        match="legacy_net_phasing_requirement_ids must contain integer ids",
-    ):
-        run_historical_replay(db_session, generation.id)
+    result = run_historical_replay(db_session, generation.id)
+    assert Decimal(result["allocated_qty"]) == Decimal("4")
 
 
 def test_recorder_order_identity_addresses_consume_exactly(db_session):
@@ -1046,18 +1034,19 @@ def test_replay_fifo_remains_oldest_pool_for_later_output(db_session):
 
     result = run_historical_replay(db_session, generation.id)
     allocations = (
-        db_session.query(MrpExecutionAllocation)
-        .filter_by(ledger_generation_id=generation.id)
-        .order_by(MrpExecutionAllocation.bucket_id.asc(), MrpExecutionAllocation.id.asc())
+        db_session.query(ReservationEvent, ReservationEntry)
+        .join(ReservationEntry, ReservationEntry.id == ReservationEvent.reservation_id)
+        .filter(ReservationEvent.ledger_generation_id == generation.id)
+        .order_by(ReservationEvent.id.asc())
         .all()
     )
 
     assert result["allocated_qty"] == "5.000"
     assert len(allocations) == 2
-    assert allocations[0].requirement_id == reservation_a.requirement_id
-    assert allocations[0].allocated_qty == Decimal("2")
-    assert allocations[1].requirement_id == req2.id
-    assert allocations[1].allocated_qty == Decimal("3")
+    assert allocations[0][1].requirement_id == reservation_a.requirement_id
+    assert allocations[0][0].realized_delta == Decimal("2")
+    assert allocations[1][1].requirement_id == req2.id
+    assert allocations[1][0].realized_delta == Decimal("3")
 
 
 def test_replay_uses_gross_capacity_for_consume_when_bucket_net_is_zero(db_session):
@@ -1094,17 +1083,15 @@ def test_replay_uses_gross_capacity_for_consume_when_bucket_net_is_zero(db_sessi
     result = run_historical_replay(db_session, generation.id)
 
     assert Decimal(result["allocated_qty"]) == Decimal("26")
-    rows = (
-        db_session.query(MrpExecutionAllocation)
-        .filter_by(ledger_generation_id=generation.id)
-        .all()
-    )
+    rows = db_session.query(ReservationEvent).filter_by(
+        ledger_generation_id=generation.id,
+        reservation_id=reservation.id,
+    ).all()
     assert len(rows) == 1
-    assert rows[0].allocated_qty == Decimal("26")
-    assert rows[0].bucket_id is not None
+    assert rows[0].realized_delta == Decimal("26")
 
 
-def test_replay_rejects_make_allocation_when_bucket_net_is_zero(db_session):
+def test_replay_uses_frozen_make_reservation_when_bucket_net_is_zero(db_session):
     generation, reservation = _generation_scope(
         db_session,
         "MAKE-NET-ZERO",
@@ -1124,10 +1111,12 @@ def test_replay_rejects_make_allocation_when_bucket_net_is_zero(db_session):
     reservation.reserved_qty = Decimal("26")
     db_session.flush()
 
-    with pytest.raises(
-        ValueError, match="bucket capacity is below realization",
-    ):
-        run_historical_replay(db_session, generation.id)
+    result = run_historical_replay(db_session, generation.id)
+    assert Decimal(result["allocated_qty"]) == Decimal("26")
+    assert db_session.query(ReservationEvent).filter_by(
+        ledger_generation_id=generation.id,
+        reservation_id=reservation.id,
+    ).one().realized_delta == Decimal("26")
 
 
 def test_replay_excludes_make_facts_for_selected_non_fg_contour_warehouse(db_session):
@@ -1311,14 +1300,13 @@ def test_replay_preserves_mode_isolated_bucket_capacity(db_session):
 
     assert Decimal(result["allocated_qty"]) == Decimal("52")
     rows = (
-        db_session.query(MrpExecutionAllocation)
-        .filter_by(ledger_generation_id=generation.id)
-        .order_by(MrpExecutionAllocation.id.asc())
+        db_session.query(ReservationEvent, ReservationEntry)
+        .join(ReservationEntry, ReservationEntry.id == ReservationEvent.reservation_id)
+        .filter(ReservationEvent.ledger_generation_id == generation.id)
+        .order_by(ReservationEvent.id.asc())
         .all()
     )
     assert len(rows) == 2
-    assert {row.fact_type for row in rows} == {"linked_production", "component_consumption"}
-    by_type = {row.fact_type: row.allocated_qty for row in rows}
-    assert by_type["linked_production"] == Decimal("26")
-    assert by_type["component_consumption"] == Decimal("26")
-    assert len({row.bucket_id for row in rows}) == 1
+    by_mode = {entry.realization_mode: event.realized_delta for event, entry in rows}
+    assert by_mode["make"] == Decimal("26")
+    assert by_mode["consume"] == Decimal("26")

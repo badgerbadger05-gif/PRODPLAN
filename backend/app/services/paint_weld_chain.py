@@ -35,12 +35,10 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Dict, Optional, Tuple
 
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..models import (
     Item,
-    MrpExecutionAllocation,
     MrpRequirement,
     PaintWeldChainLink,
     PaintWeldPair,
@@ -226,35 +224,17 @@ def _resolve_weld_obligation(
         .with_for_update()
         .all()
     )
-    line_refs = [str(int(product.product_id)) for product, _order in rows]
-    realized_by_line: dict[str, float] = {}
-    if line_refs:
-        for line_ref, realized in (
-            db.query(
-                MrpExecutionAllocation.fact_line_ref,
-                func.sum(MrpExecutionAllocation.allocated_qty),
-            )
-            .filter(
-                MrpExecutionAllocation.ledger_generation_id
-                == int(ctx.generation_id),
-                MrpExecutionAllocation.requirement_id
-                == int(requirement.id),
-                MrpExecutionAllocation.fact_type == "linked_production",
-                MrpExecutionAllocation.allocation_kind == "execution",
-                MrpExecutionAllocation.fact_line_ref.in_(line_refs),
-            )
-            .group_by(MrpExecutionAllocation.fact_line_ref)
-            .all()
-        ):
-            realized_by_line[str(line_ref)] = _to_float(realized)
-    allocated = sum(
-        max(
-            _to_float(product.quantity)
-            - realized_by_line.get(str(int(product.product_id)), 0.0),
-            0.0,
-        )
-        for product, _order in rows
-    )
+    # ReservationEntry is the only numeric execution source.  Distribute its
+    # realized fold deterministically over linked order rows solely for
+    # drill-down; no execution-allocation read model participates in the guard.
+    realized_left = _to_float(reservation.realized_qty)
+    open_by_product: dict[int, float] = {}
+    for product, _order in sorted(rows, key=lambda pair: int(pair[0].product_id)):
+        quantity = _to_float(product.quantity)
+        realized = min(max(realized_left, 0.0), max(quantity, 0.0))
+        realized_left -= realized
+        open_by_product[int(product.product_id)] = max(quantity - realized, 0.0)
+    allocated = sum(open_by_product.values())
     raw_outstanding = max(
         _to_float(reservation.reserved_qty) - _to_float(reservation.realized_qty),
         0.0,
@@ -263,11 +243,7 @@ def _resolve_weld_obligation(
     open_orders = tuple(
         {
             "number": str(order.order_number or ""),
-            "qty": max(
-                _to_float(product.quantity)
-                - realized_by_line.get(str(int(product.product_id)), 0.0),
-                0.0,
-            ),
+            "qty": open_by_product[int(product.product_id)],
             "product_id": int(product.product_id),
         }
         for product, order in rows

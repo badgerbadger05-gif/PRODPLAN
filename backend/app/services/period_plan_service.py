@@ -37,10 +37,8 @@ from ..models import (
     SyncLink,
     SupplierOrder,
     SupplierOrderItem,
-    MrpExecutionAllocation,
     ReservationEntry,
     ReservationEvent,
-    StockLedgerEntry,
 )
 from .planning_service import (
     DEFAULT_PLANNING_CONFIG,
@@ -983,7 +981,7 @@ def create_mrp_snapshot_from_period_plan(
         cfg_id, cfg = get_active_planning_config(db)
     except Exception:
         cfg_id, cfg = None, dict(DEFAULT_PLANNING_CONFIG)
-    add_plan_ids = (int(plan.id),)
+    current_run: PlanningRun | None = None
     for current in (
         db.query(PlanningRun)
         .filter(
@@ -992,19 +990,33 @@ def create_mrp_snapshot_from_period_plan(
         )
         .all()
     ):
-        if current.ledger_generation_id is not None:
-            continue
         resolved_parent_generation_id = _resolve_parent_generation_id(db, current)
         if resolved_parent_generation_id == int(parent.id):
-            add_plan_ids = ()
-            break
+            if current_run is not None:
+                raise ValueError(
+                    "План имеет несколько текущих зафиксированных MRP-снимков"
+                )
+            current_run = current
+    if current_run is not None:
+        # A fixed plan is an immutable obligation.  Re-opening its snapshot must
+        # never fork a generation, re-explode the BOM or net against today's
+        # stock.  Fact refreshes rebuild generation-scoped reservations and
+        # execution snapshots around this same run.
+        return {
+            "status": "ok",
+            "generation_key": key,
+            "ledger_generation_id": int(parent.id),
+            "run_id": int(current_run.run_id),
+            "published": False,
+            "immutable": True,
+        }
 
     from .obligation_refresh_orchestrator import run_obligation_refresh
     report = run_obligation_refresh(
         db,
         parent_generation_id=int(parent.id),
         generation_key=key,
-        add_plan_ids=add_plan_ids,
+        add_plan_ids=(int(plan.id),),
         started_by=started_by or "api",
         horizon_days=max(1, (plan.period_to - plan.period_from).days + 1),
         config_version_id=cfg_id,
@@ -1592,7 +1604,14 @@ def _freeze_one_run(
         if sum(float(q) for q in gross_buckets.values()) > 1e-9
     )
     baseline_rows = _write_freeze_baseline(
-        db, run, new_version, frozen_item_ids, shared_pools.stock_initial, now
+        db,
+        run,
+        new_version,
+        frozen_item_ids,
+        shared_pools.stock_initial,
+        now,
+        baseline_at=shared_pools.baseline_at,
+        physical_import_batch_id=shared_pools.physical_import_batch_id,
     )
     allocation_rows = _write_freeze_allocation(
         db, run, new_version, trace, req_by_item, shared_pools.stock_initial, now
@@ -2038,10 +2057,18 @@ def _execution_row_summary(
                 "completed_qty": 0.0,
                 "base_qty": 0.0,
                 "total_base_qty": 0.0,
+                "purchase_covered_qty": 0.0,
+                "purchase_to_order_qty": 0.0,
                 "available": True,
             },
         )
         flow_summary["total_base_qty"] += base_qty
+        flow_summary["purchase_covered_qty"] += _to_float(
+            row.get("purchase_covered_qty")
+        )
+        flow_summary["purchase_to_order_qty"] += _to_float(
+            row.get("purchase_to_order_qty")
+        )
         if execution_available:
             flow_summary["completed_qty"] += completed_qty
             flow_summary["base_qty"] += base_qty
@@ -2091,6 +2118,27 @@ def _execution_row_summary(
             round(_to_float(details.get("completed_qty")) / base_qty * 100.0, 1)
             if base_qty > 1e-9
             else 100.0
+        )
+        total_base_qty = _to_float(details.get("total_base_qty"))
+        details["covered_pct"] = (
+            round(
+                _to_float(details.get("purchase_covered_qty"))
+                / total_base_qty
+                * 100.0,
+                1,
+            )
+            if total_base_qty > 1e-9
+            else 100.0
+        )
+        details["to_order_pct"] = (
+            round(
+                _to_float(details.get("purchase_to_order_qty"))
+                / total_base_qty
+                * 100.0,
+                1,
+            )
+            if total_base_qty > 1e-9
+            else 0.0
         )
     return {
         "truth_status": "accepted",
@@ -2386,7 +2434,15 @@ def _build_execution_snapshot_rows(
     )
 
     reservation_rows = (
-        db.query(ReservationEntry.id, ReservationEntry.requirement_id)
+        db.query(
+            ReservationEntry.id,
+                ReservationEntry.requirement_id,
+                ReservationEntry.realization_mode,
+                ReservationEntry.reserved_qty,
+                ReservationEntry.realized_qty,
+                ReservationEntry.covered_incoming_supplier_qty,
+                ReservationEntry.uncovered_qty,
+        )
         .filter(
             ReservationEntry.ledger_generation_id == int(generation_id),
             ReservationEntry.requirement_id.in_(req_ids),
@@ -2394,14 +2450,35 @@ def _build_execution_snapshot_rows(
         .all()
     )
     reservation_ids_by_req: Dict[int, List[int]] = {}
+    realized_by_req_mode: Dict[tuple[int, str], float] = {}
+    purchase_coverage_by_req: Dict[int, tuple[float, float]] = {}
     reservation_ids: List[int] = []
-    for row_id, req_id in reservation_rows:
+    for (
+        row_id,
+        req_id,
+        realization_mode,
+        _reserved_qty,
+        realized_qty,
+        covered_supplier_qty,
+        uncovered_qty,
+    ) in reservation_rows:
         rid = int(req_id)
         reservation_ids_by_req.setdefault(rid, []).append(int(row_id))
         reservation_ids.append(int(row_id))
+        mode_key = (rid, str(realization_mode or ""))
+        realized_by_req_mode[mode_key] = (
+            realized_by_req_mode.get(mode_key, 0.0) + _to_float(realized_qty)
+        )
+        if str(realization_mode or "") == "buy":
+            covered, to_order = purchase_coverage_by_req.get(rid, (0.0, 0.0))
+            purchase_coverage_by_req[rid] = (
+                covered
+                + _to_float(realized_qty)
+                + _to_float(covered_supplier_qty),
+                to_order + _to_float(uncovered_qty),
+            )
 
     events_by_requirement: Dict[int, List[Dict[str, Any]]] = {}
-    event_ids_by_fact: Dict[tuple[str, str], List[int]] = {}
     if reservation_ids:
         for event, req_id in (
             db.query(ReservationEvent, ReservationEntry.requirement_id.label("requirement_id"))
@@ -2424,91 +2501,6 @@ def _build_execution_snapshot_rows(
                 "stock_ledger_entry_id": int(event.sle_id) if event.sle_id is not None else None,
             }
             events_by_requirement.setdefault(int(req_id), []).append(event_payload)
-            event_ids_by_fact.setdefault(
-                (str(event.fact_ref or ""), str(event.fact_line_ref or "")),
-                [],
-            ).append(int(event.id))
-
-    allocation_rows = (
-        db.query(MrpExecutionAllocation)
-        .filter(
-            MrpExecutionAllocation.ledger_generation_id == int(generation_id),
-            MrpExecutionAllocation.requirement_id.in_(req_ids),
-        )
-        .order_by(
-            MrpExecutionAllocation.requirement_id.asc(),
-            MrpExecutionAllocation.allocation_kind.asc(),
-            MrpExecutionAllocation.fact_type.asc(),
-            MrpExecutionAllocation.fact_ref.asc(),
-            MrpExecutionAllocation.fact_line_ref.asc(),
-        )
-        .all()
-    )
-    allocation_by_requirement: Dict[int, List[Dict[str, Any]]] = {}
-    stock_ledger_entry_ids: Set[int] = set()
-    for allocation in allocation_rows:
-        req_id = int(allocation.requirement_id)
-        stock_id = allocation.stock_ledger_entry_id
-        if stock_id is not None:
-            stock_ledger_entry_ids.add(int(stock_id))
-        allocation_payload = {
-            "allocation_id": int(allocation.id),
-            "allocation_kind": str(allocation.allocation_kind or ""),
-            "fact_type": str(allocation.fact_type or ""),
-            "fact_ref": str(allocation.fact_ref or ""),
-            "fact_line_ref": str(allocation.fact_line_ref or ""),
-            "allocated_qty": _to_float(allocation.allocated_qty),
-            "bucket_id": int(allocation.bucket_id) if allocation.bucket_id is not None else None,
-            "fact_date": _iso_datetime(allocation.fact_date),
-            "stock_ledger_entry_id": int(stock_id) if stock_id is not None else None,
-            "origin_requirement_id": int(allocation.origin_requirement_id)
-            if allocation.origin_requirement_id is not None
-            else None,
-            "calculated_at": _iso_datetime(allocation.calculated_at),
-            "reservation_event_ids": sorted(
-                set(
-                    event_ids_by_fact.get(
-                        (str(allocation.fact_ref or ""), str(allocation.fact_line_ref or "")),
-                        [],
-                    )
-                )
-            ),
-        }
-        allocation_by_requirement.setdefault(req_id, []).append(allocation_payload)
-
-    stock_entries: Dict[int, Dict[str, Any]] = {}
-    if stock_ledger_entry_ids:
-        for entry in (
-            db.query(
-                StockLedgerEntry.id,
-                StockLedgerEntry.record_type,
-                StockLedgerEntry.movement_kind,
-                StockLedgerEntry.recorder_type,
-                StockLedgerEntry.recorder_ref,
-                StockLedgerEntry.line_no,
-                StockLedgerEntry.posting_at,
-                StockLedgerEntry.item_id,
-            )
-            .filter(StockLedgerEntry.id.in_(stock_ledger_entry_ids))
-            .all()
-        ):
-            stock_entries[int(entry.id)] = {
-                "id": int(entry.id),
-                "record_type": str(entry.record_type or ""),
-                "movement_kind": str(entry.movement_kind or ""),
-                "recorder_type": str(entry.recorder_type or ""),
-                "recorder_ref": str(entry.recorder_ref or ""),
-                "line_no": str(entry.line_no or ""),
-                "posting_at": _iso_datetime(entry.posting_at),
-                "item_id": int(entry.item_id),
-            }
-
-    for req_id, allocations in allocation_by_requirement.items():
-        for allocation in allocations:
-            stock_id = allocation.get("stock_ledger_entry_id")
-            if stock_id is None:
-                continue
-            allocation["stock_ledger_entry"] = stock_entries.get(int(stock_id))
 
     for req_id in req_ids:
         req = items_by_requirement.get(int(req_id))
@@ -2525,64 +2517,24 @@ def _build_execution_snapshot_rows(
         )
         for event in events:
             event["reservation_events_url"] = f"/api/v1/item-ledger/{item_id}/reservations/{int(event.get('reservation_id') or 0)}/events"
-        allocations = sorted(
-            allocation_by_requirement.get(req_id, []),
-            key=lambda payload: (
-                str(payload.get("allocation_kind") or ""),
-                str(payload.get("fact_type") or ""),
-                str(payload.get("fact_ref") or ""),
-                str(payload.get("fact_line_ref") or ""),
-                int(payload.get("allocation_id") or 0),
-            ),
-        )
         progress_base_qty = _to_float(req["net_required_qty"])
-        execution_completed_qty = round(
-            sum(
-                _to_float(payload.get("allocated_qty"))
-                for payload in allocations
-                if str(payload.get("allocation_kind") or "") == "execution"
-            ),
-            10,
-        )
-        execution_supplier_keys = {
-            (
-                str(payload.get("fact_type") or ""),
-                str(payload.get("fact_ref") or ""),
-                str(payload.get("fact_line_ref") or ""),
-            )
-            for payload in allocations
-            if str(payload.get("allocation_kind") or "") == "execution"
-            and str(payload.get("fact_type") or "") == "supplier_receipt"
-        }
-        supplier_receipt_qty = round(
-            sum(
-                _to_float(payload.get("allocated_qty"))
-                for payload in allocations
-                if (
-                    str(payload.get("allocation_kind") or "") == "execution"
-                    and str(payload.get("fact_type") or "") == "supplier_receipt"
-                )
-                or (
-                    str(payload.get("allocation_kind") or "") == "coverage_realization"
-                    and str(payload.get("fact_type") or "") == "supplier_receipt"
-                    and (
-                        str(payload.get("fact_type") or ""),
-                        str(payload.get("fact_ref") or ""),
-                        str(payload.get("fact_line_ref") or ""),
-                    ) not in execution_supplier_keys
-                )
-            ),
-            10,
-        )
         flow = item_flow_by_id.get(item_id)
         execution_available = True
-        completed_qty = (
-            supplier_receipt_qty
+        realization_mode = (
+            "buy"
             if flow == REPLENISHMENT_FLOW_PURCHASE
-            else execution_completed_qty
+            else "make"
+        )
+        completed_qty = round(
+            realized_by_req_mode.get((int(req_id), realization_mode), 0.0),
+            10,
         )
         if progress_base_qty > 1e-9:
-            completed_qty = min(max(0.0, completed_qty), progress_base_qty)
+            if completed_qty < -1e-9 or completed_qty > progress_base_qty + 1e-9:
+                raise ValueError(
+                    f"reservation fold exceeds frozen requirement {req_id}: "
+                    f"realized={completed_qty}, frozen={progress_base_qty}"
+                )
             if completed_qty < 1e-9 and reservations:
                 status = "ordered"
             elif completed_qty < 1e-9:
@@ -2592,6 +2544,11 @@ def _build_execution_snapshot_rows(
             else:
                 status = "partial"
         else:
+            if abs(completed_qty) > 1e-9:
+                raise ValueError(
+                    f"net-zero requirement {req_id} has realized quantity "
+                    f"{completed_qty}"
+                )
             status = "net_zero"
             completed_qty = 0.0
         remaining_qty = max(0.0, progress_base_qty - completed_qty)
@@ -2601,6 +2558,11 @@ def _build_execution_snapshot_rows(
             else 100.0
         )
         ordered_qty = ordered_by_requirement.get(req_id, 0.0)
+        purchase_covered_qty, purchase_to_order_qty = (
+            purchase_coverage_by_req.get(req_id, (0.0, 0.0))
+            if flow == REPLENISHMENT_FLOW_PURCHASE
+            else (0.0, 0.0)
+        )
         req_rows.append({
             "req_id": int(req_id),
             "item_id": item_id,
@@ -2623,6 +2585,8 @@ def _build_execution_snapshot_rows(
             "remaining_qty": remaining_qty,
             "coverage_pct": coverage_pct,
             "ordered_qty": ordered_qty,
+            "purchase_covered_qty": purchase_covered_qty,
+            "purchase_to_order_qty": purchase_to_order_qty,
             "unassigned_qty": max(
                 0.0, _to_float(req.get("net_required_qty")) - ordered_qty
             ),
@@ -2639,7 +2603,7 @@ def _build_execution_snapshot_rows(
             "status": status,
             "reservation_ids": reservations,
             "execution_events": events,
-            "execution_allocations": allocations,
+            "execution_allocations": [],
             "work_items": work_items_by_requirement.get(req_id, []),
         })
 
@@ -2647,7 +2611,7 @@ def _build_execution_snapshot_rows(
     return req_rows, {
         "truth_status": "accepted",
         "reservation_rows": len(reservation_rows),
-        "allocation_rows": len(allocation_rows),
+        "allocation_rows": 0,
         "execution_by_requirement": _execution_row_summary(req_rows),
     }
 
@@ -2685,6 +2649,7 @@ def get_period_plan_execution_journal(
         CAPABILITY_PHYSICAL_LEDGER,
         CAPABILITY_RESERVATION_REPLAY,
         CAPABILITY_EXECUTION_ALLOCATIONS,
+        "supplier_receipt_coverage",
         CAPABILITY_PLANNING_SNAPSHOTS,
     )
     try:
@@ -2722,603 +2687,6 @@ def get_period_plan_execution_journal(
     summary_payload.update(summary)
     payload["summary"] = summary_payload
     return payload
-
-
-def _compute_legacy_period_plan_execution_journal(
-    db: Session,
-    plan_id: int,
-    *,
-    run_id: Optional[int] = None,
-    root_item_id: Optional[int] = None,
-    bom_level: Optional[int] = None,
-    flow: Optional[str] = None,
-) -> Dict[str, Any]:
-    plan = _get_plan(db, plan_id)
-
-    if run_id is not None:
-        run = db.query(PlanningRun).filter(PlanningRun.run_id == int(run_id)).first()
-        if not run or int(run.source_plan_id or -1) != int(plan.id):
-            raise ValueError("Run not found for this plan")
-    else:
-        run = (
-            db.query(PlanningRun)
-            .filter(
-                PlanningRun.source_plan_id == int(plan.id),
-                PlanningRun.status == "FIXED_SNAPSHOT",
-            )
-            .order_by(PlanningRun.run_id.desc())
-            .first()
-        )
-        if not run:
-            raise ValueError("No FIXED_SNAPSHOT run found for this plan")
-
-    reqs_with_items = (
-        db.query(MrpRequirement, Item)
-        .join(Item, Item.item_id == MrpRequirement.item_id)
-        .filter(MrpRequirement.run_id == int(run.run_id))
-        .order_by(MrpRequirement.bom_level.asc(), Item.item_name.asc())
-        .all()
-    )
-    if root_item_id is not None:
-        related_ids = _bom_descendants_by_item(db, [int(root_item_id)]).get(int(root_item_id), {int(root_item_id)})
-        reqs_with_items = [(req, item) for req, item in reqs_with_items if int(req.item_id) in related_ids]
-
-    if not reqs_with_items:
-        from .planning_truth import get_truth_state
-
-        empty_truth = get_truth_state(db)
-        execution_available = bool(empty_truth.ready)
-        return {
-            "plan": _serialize_plan(plan),
-            "run_id": int(run.run_id),
-            "truth_status": empty_truth.status,
-            "truth_generation_id": empty_truth.generation_id,
-            "ledger_generation": empty_truth.generation_id,
-            "truth_cutoff": empty_truth.cutoff.isoformat() if empty_truth.cutoff else None,
-            "cutoff": empty_truth.cutoff.isoformat() if empty_truth.cutoff else None,
-            "truth_reason": empty_truth.reason,
-            "rows": [],
-            "summary": {
-                "truth_status": empty_truth.status,
-                "total_items": 0,
-                "fully_covered": 0,
-                "partially_covered": 0,
-                "not_covered": 0,
-                "net_zero": 0,
-                "execution_completed_qty": 0.0 if execution_available else None,
-                "execution_base_qty": 0.0 if execution_available else None,
-                "execution_pct": 100.0 if execution_available else None,
-                "execution_by_flow": {} if execution_available else None,
-            },
-        }
-
-    req_ids = [int(req.id) for req, _ in reqs_with_items]
-    item_ids = [int(req.item_id) for req, _ in reqs_with_items]
-    req_by_id = {int(req.id): req for req, _ in reqs_with_items}
-
-    # Execution is a fact, and accepted Item Ledger truth is its only source.
-    # Do this before touching any legacy order aggregates: an empty/unaccepted
-    # ledger must never be presented as apparently precise execution.
-    from .planning_truth import (
-        CAPABILITY_EXECUTION_ALLOCATIONS,
-        CAPABILITY_PHYSICAL_LEDGER,
-        CAPABILITY_RESERVATION_REPLAY,
-        PlanningTruthUnavailable,
-        require_accepted_truth,
-    )
-
-    try:
-        truth_state = require_accepted_truth(
-            db,
-            consumer="period_plan_execution",
-            required_capabilities=(
-                CAPABILITY_PHYSICAL_LEDGER,
-                CAPABILITY_RESERVATION_REPLAY,
-                CAPABILITY_EXECUTION_ALLOCATIONS,
-            ),
-        )
-    except PlanningTruthUnavailable as exc:
-        truth_state = exc.state
-
-        def _truth_value(name: str) -> Any:
-            if isinstance(truth_state, dict):
-                return truth_state.get(name)
-            return getattr(truth_state, name, None)
-
-        unavailable_rows: List[Dict[str, Any]] = []
-        for req, item in reqs_with_items:
-            item_flow = classify_replenishment_flow(getattr(item, "replenishment_method", None))
-            if bom_level is not None and int(req.bom_level or 0) != bom_level:
-                continue
-            if flow is not None and item_flow != flow:
-                continue
-            unavailable_rows.append({
-                "req_id": int(req.id),
-                "item_id": int(req.item_id),
-                "item_code": str(item.item_code or ""),
-                "item_article": str(item.item_article or "") if item.item_article else None,
-                "item_name": str(item.item_name or ""),
-                "flow": item_flow,
-                "bom_level": int(req.bom_level or 0),
-                "gross_qty": _to_float(req.total_required_qty),
-                "net_qty": _to_float(req.net_required_qty),
-                "completed_qty": None,
-                "covered_qty": None,
-                "remaining_qty": None,
-                "progress_base_qty": None,
-                "coverage_pct": None,
-                "status": "execution_unavailable",
-                "work_items": [],
-            })
-        return {
-            "plan": _serialize_plan(plan),
-            "run_id": int(run.run_id),
-            "truth_status": _truth_value("status") or "unavailable",
-            "truth_generation_id": _truth_value("generation_id"),
-            "ledger_generation": _truth_value("generation_id"),
-            "truth_cutoff": (
-                _truth_value("cutoff").isoformat()
-                if hasattr(_truth_value("cutoff"), "isoformat")
-                else _truth_value("cutoff")
-            ),
-            "cutoff": (
-                _truth_value("cutoff").isoformat()
-                if hasattr(_truth_value("cutoff"), "isoformat")
-                else _truth_value("cutoff")
-            ),
-            "truth_reason": _truth_value("reason"),
-            "rows": unavailable_rows,
-            "summary": {
-                "truth_status": _truth_value("status") or "unavailable",
-                "total_items": len(unavailable_rows),
-                "execution_completed_qty": None,
-                "execution_base_qty": None,
-                "execution_pct": None,
-                "execution_by_flow": None,
-            },
-        }
-
-    # Production: actual production orders linked via source_mrp_requirement_id.
-    prod_rows = (
-        db.query(ProductionProduct, ProductionOrder, ProductionOrderLineState)
-        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
-        .outerjoin(ProductionOrderLineState, ProductionOrderLineState.product_id == ProductionProduct.product_id)
-        .filter(ProductionProduct.source_mrp_requirement_id.in_(req_ids))
-        .all()
-    )
-    prods_by_req_id: Dict[int, List[Dict[str, Any]]] = {}
-    prod_ordered_by_req_id: Dict[int, float] = {}
-    prod_done_by_req_id: Dict[int, float] = {}
-    for pp, po, state in prod_rows:
-        if state and str(state.status or "").lower() in {"cancelled"}:
-            continue
-        req_id = int(pp.source_mrp_requirement_id)
-        qty_value = _to_float(pp.quantity)
-        remaining_value = _to_float(pp.remaining_qty)
-        done_value = min(qty_value, max(0.0, _to_float(getattr(pp, "produced_qty", 0.0))))
-        is_one_c_opened = bool(po.order_ref1c)
-        if is_one_c_opened:
-            prod_ordered_by_req_id[req_id] = prod_ordered_by_req_id.get(req_id, 0.0) + qty_value
-            prod_done_by_req_id[req_id] = prod_done_by_req_id.get(req_id, 0.0) + done_value
-        req_due = req_by_id.get(req_id).period_to if req_by_id.get(req_id) else None
-        planned_finish = state.planned_finish_date if state and state.planned_finish_date else None
-        forecast = _forecast_payload(planned_finish, req_due or planned_finish)
-        prods_by_req_id.setdefault(req_id, []).append({
-            "type": "production_order",
-            "product_id": int(pp.product_id),
-            "order_id": int(po.order_id),
-            "order_number": str(po.order_number or ""),
-            "order_ref1c": str(po.order_ref1c or "") if po.order_ref1c else None,
-            "order_source": str(po.source or "1c"),
-            "one_c_opened": is_one_c_opened,
-            "opened_at": state.opened_at.isoformat() if state and state.opened_at else None,
-            "order_state": str(po.order_state_name or po.order_state_key or ""),
-            "qty": qty_value,
-            "completed_qty": done_value,
-            "remaining_qty": remaining_value,
-            **forecast,
-        })
-
-    # Production: direct 1C orders are not linked to a specific MRP
-    # requirement.  Allocate them FIFO between period plans, otherwise the
-    # same output is counted in every plan that contains the item and newer
-    # plans can look completed while older ones remain open.
-    direct_prods_by_req_id: Dict[int, List[Dict[str, Any]]] = {}
-    direct_prod_ordered_by_req_id: Dict[int, float] = {}
-    direct_prod_done_by_req_id: Dict[int, float] = {}
-    direct_items_by_item: Dict[int, List[Dict[str, Any]]] = {}
-    direct_query = (
-        db.query(ProductionProduct, ProductionOrder, ProductionOrderLineState)
-        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
-        .outerjoin(ProductionOrderLineState, ProductionOrderLineState.product_id == ProductionProduct.product_id)
-        .filter(ProductionProduct.item_id.in_(item_ids))
-        .filter(ProductionProduct.source_mrp_requirement_id.is_(None))
-        .filter(ProductionOrder.source == "1c")
-        .filter(ProductionOrder.order_ref1c.isnot(None))
-        .filter(ProductionOrder.deletion_mark.is_(False))
-    )
-    # A direct 1C order belongs only to the period in which it was opened.
-    # It must never close the execution of a future release programme.
-    direct_from = plan.period_from or _DIRECT_1C_PRODUCTION_HORIZON
-    direct_query = direct_query.filter(
-        ProductionOrder.order_date >= datetime.combine(direct_from, datetime.min.time())
-    )
-    if plan.period_to:
-        direct_query = direct_query.filter(
-            ProductionOrder.order_date < datetime.combine(plan.period_to + timedelta(days=1), datetime.min.time())
-        )
-    direct_prod_rows = direct_query.all()
-    for pp, po, state in direct_prod_rows:
-        if state and str(state.status or "").lower() in {"cancelled"}:
-            continue
-        item_id = int(pp.item_id)
-        qty_value = _to_float(pp.quantity)
-        remaining_value = _to_float(pp.remaining_qty)
-        produced_value = max(0.0, _to_float(getattr(pp, "produced_qty", 0.0)))
-        is_done_state = str(po.order_state_key or "").lower() == _DONE_STATE_KEY
-        done_value = min(qty_value, produced_value)
-        if is_done_state and done_value <= 1e-9:
-            done_value = qty_value
-        planned_finish = state.planned_finish_date if state and state.planned_finish_date else None
-        direct_items_by_item.setdefault(item_id, []).append({
-            "type": "production_order",
-            "product_id": int(pp.product_id),
-            "order_id": int(po.order_id),
-            "order_number": str(po.order_number or ""),
-            "order_ref1c": str(po.order_ref1c or "") if po.order_ref1c else None,
-            "order_source": str(po.source or "1c"),
-            "one_c_opened": True,
-            "opened_at": state.opened_at.isoformat() if state and state.opened_at else None,
-            "order_state": str(po.order_state_name or po.order_state_key or ""),
-            "qty": qty_value,
-            "completed_qty": done_value,
-            "remaining_qty": remaining_value,
-            **_forecast_payload(planned_finish, plan.period_to or planned_finish),
-        })
-
-    # Each journal is self-contained.  Period filtering above already makes a
-    # direct order unique to its period, so allocating it to older plans would
-    # incorrectly let a past programme consume current execution.
-    fifo_requirements: Dict[int, List[Tuple[MrpRequirement, ProductionPlanHeader]]] = {}
-    for candidate_req, _item in reqs_with_items:
-        fifo_requirements.setdefault(int(candidate_req.item_id), []).append((candidate_req, plan))
-
-    for item_id, direct_items in direct_items_by_item.items():
-        demands = sorted(
-            fifo_requirements.get(item_id, []),
-            key=lambda entry: (
-                entry[1].period_from,
-                entry[1].period_to,
-                int(entry[1].id),
-                int(entry[0].bom_level or 0),
-                int(entry[0].id),
-            ),
-        )
-        for metric, linked_by_req, destination in (
-            ("qty", prod_ordered_by_req_id, direct_prod_ordered_by_req_id),
-            ("completed_qty", prod_done_by_req_id, direct_prod_done_by_req_id),
-        ):
-            available = sum(_to_float(direct_item[metric]) for direct_item in direct_items)
-            for demand, _ in demands:
-                req_id = int(demand.id)
-                capacity = max(0.0, _to_float(demand.net_required_qty) - linked_by_req.get(req_id, 0.0))
-                allocated = min(available, capacity)
-                if allocated > 1e-9:
-                    destination[req_id] = destination.get(req_id, 0.0) + allocated
-                    available -= allocated
-                if available <= 1e-9:
-                    break
-
-        # Keep the order details visible on the plan that received the FIFO
-        # allocation. Quantities in the displayed work item are clipped to the
-        # amount allocated to that requirement.
-        for demand, _ in demands:
-            req_id = int(demand.id)
-            ordered_left = direct_prod_ordered_by_req_id.get(req_id, 0.0)
-            completed_left = direct_prod_done_by_req_id.get(req_id, 0.0)
-            if ordered_left <= 1e-9 and completed_left <= 1e-9:
-                continue
-            for direct_item in direct_items:
-                item_qty = _to_float(direct_item["qty"])
-                item_done = _to_float(direct_item["completed_qty"])
-                allocated_qty = min(ordered_left, item_qty)
-                allocated_done = min(completed_left, item_done, allocated_qty)
-                if allocated_qty <= 1e-9 and allocated_done <= 1e-9:
-                    continue
-                allocated_item = dict(direct_item)
-                allocated_item["qty"] = allocated_qty
-                allocated_item["completed_qty"] = allocated_done
-                allocated_item["remaining_qty"] = max(0.0, allocated_qty - allocated_done)
-                direct_prods_by_req_id.setdefault(req_id, []).append(allocated_item)
-                ordered_left -= allocated_qty
-                completed_left -= allocated_done
-
-    # Production: planned MRP tasks. They are the live work queue before real
-    # 1C production orders are created, so the execution journal must show them.
-    demand_refs = [f"mrp_requirement:{req_id}" for req_id in req_ids]
-    planned_orders_by_req_id: Dict[int, List[Dict[str, Any]]] = {}
-    planned_ordered_by_req_id: Dict[int, float] = {}
-    if demand_refs:
-        for po in (
-            db.query(PlannedOrder)
-            .filter(PlannedOrder.run_id == int(run.run_id), PlannedOrder.demand_ref.in_(demand_refs))
-            .all()
-        ):
-            raw_ref = str(po.demand_ref or "")
-            try:
-                req_id = int(raw_ref.split(":", 1)[1])
-            except Exception:
-                continue
-            qty_value = _to_float(po.qty)
-            planned_ordered_by_req_id[req_id] = planned_ordered_by_req_id.get(req_id, 0.0) + qty_value
-            forecast_date = po.finish_date or po.start_date or po.need_date
-            planned_orders_by_req_id.setdefault(req_id, []).append({
-                "type": "planned_order",
-                "order_id": int(po.order_id),
-                "qty": qty_value,
-                "completed_qty": 0.0,
-                "remaining_qty": qty_value,
-                "need_date": po.need_date.isoformat() if po.need_date else None,
-                **_forecast_payload(forecast_date, po.need_date),
-            })
-
-    # Purchase: PlannedPurchase linked via source_mrp_requirement_id (precise),
-    # with a fallback to run_id + item_id for rows created before migration 08.
-    purchases_by_req_id: Dict[int, List[Dict[str, Any]]] = {}
-    purchases_by_item_fallback: Dict[int, List[Dict[str, Any]]] = {}
-    purchase_ordered_by_req_id: Dict[int, float] = {}
-    purchase_ordered_by_item_fallback: Dict[int, float] = {}
-    purchase_done_by_req_id: Dict[int, float] = {}
-    purchase_done_by_item_fallback: Dict[int, float] = {}
-    planned_purchase_rows = (
-        db.query(PlannedPurchase)
-        .filter(PlannedPurchase.run_id == int(run.run_id), PlannedPurchase.item_id.in_(item_ids))
-        .all()
-    )
-    purchase_ids = [int(pp.purchase_id) for pp in planned_purchase_rows]
-    purchase_links_by_id: Dict[int, SyncLink] = {}
-    if purchase_ids:
-        for link in (
-            db.query(SyncLink)
-            .filter(
-                SyncLink.source_system == "PRODPLAN",
-                SyncLink.source_doctype == "planned_purchase",
-                SyncLink.source_id.in_(purchase_ids),
-                SyncLink.target_entity == "Document_ЗаказПоставщику",
-                SyncLink.status == "success",
-                SyncLink.target_ref_key.isnot(None),
-            )
-            .all()
-        ):
-            purchase_links_by_id[int(link.source_id)] = link
-    supplier_refs = sorted({
-        str(link.target_ref_key).strip()
-        for link in purchase_links_by_id.values()
-        if str(link.target_ref_key or "").strip()
-    })
-    supplier_orders_by_ref: Dict[str, SupplierOrder] = {}
-    if supplier_refs:
-        for order in (
-            db.query(SupplierOrder)
-            .filter(SupplierOrder.order_ref1c.in_(supplier_refs))
-            .all()
-        ):
-            supplier_orders_by_ref[str(order.order_ref1c or "").strip()] = order
-
-    for pp in planned_purchase_rows:
-        qty_value = _to_float(pp.qty)
-        purchase_id = int(pp.purchase_id)
-        link = purchase_links_by_id.get(purchase_id)
-        supplier_ref = str(getattr(link, "target_ref_key", "") or "").strip() if link else ""
-        supplier_order = supplier_orders_by_ref.get(supplier_ref) if supplier_ref else None
-        is_ordered = bool(supplier_ref)
-        is_done = _is_supplier_order_done(supplier_order)
-        ordered_value = qty_value if is_ordered else 0.0
-        done_value = qty_value if is_done else 0.0
-        entry = {
-            "type": "planned_purchase",
-            "purchase_id": purchase_id,
-            "qty": qty_value,
-            "completed_qty": done_value,
-            "remaining_qty": max(0.0, qty_value - done_value),
-            "need_date": pp.need_date.isoformat() if pp.need_date else None,
-            "order_date": pp.order_date.isoformat() if pp.order_date else None,
-            "lead_time_days": int(pp.lead_time_days or 0),
-            "order_ref1c": supplier_ref or None,
-            "order_number": str(getattr(supplier_order, "order_number", "") or "") if supplier_order else None,
-            "order_state": str(getattr(supplier_order, "order_state_name", "") or getattr(supplier_order, "order_state_key", "") or "") if supplier_order else None,
-            "one_c_opened": is_ordered,
-            **_forecast_payload(pp.need_date, pp.need_date, reason="purchase"),
-        }
-        if pp.source_mrp_requirement_id is not None:
-            req_id = int(pp.source_mrp_requirement_id)
-            purchases_by_req_id.setdefault(req_id, []).append(entry)
-            purchase_ordered_by_req_id[req_id] = purchase_ordered_by_req_id.get(req_id, 0.0) + ordered_value
-            purchase_done_by_req_id[req_id] = purchase_done_by_req_id.get(req_id, 0.0) + done_value
-        else:
-            item_id = int(pp.item_id)
-            purchases_by_item_fallback.setdefault(item_id, []).append(entry)
-            purchase_ordered_by_item_fallback[item_id] = purchase_ordered_by_item_fallback.get(item_id, 0.0) + ordered_value
-            purchase_done_by_item_fallback[item_id] = purchase_done_by_item_fallback.get(item_id, 0.0) + done_value
-
-    # Rework: PlannedRework by run_id + item_id
-    reworks_by_item: Dict[int, List[Dict[str, Any]]] = {}
-    rework_ordered_by_item: Dict[int, float] = {}
-    for rw in (
-        db.query(PlannedRework)
-        .filter(PlannedRework.run_id == int(run.run_id), PlannedRework.item_id.in_(item_ids))
-        .all()
-    ):
-        item_id = int(rw.item_id)
-        qty_value = _to_float(rw.qty)
-        rework_ordered_by_item[item_id] = rework_ordered_by_item.get(item_id, 0.0) + qty_value
-        reworks_by_item.setdefault(int(rw.item_id), []).append({
-            "type": "planned_rework",
-            "rework_id": int(rw.rework_id),
-            "qty": qty_value,
-            "completed_qty": 0.0,
-            "remaining_qty": qty_value,
-            "need_date": rw.need_date.isoformat() if rw.need_date else None,
-            "order_date": rw.order_date.isoformat() if rw.order_date else None,
-            "lead_time_days": int(rw.lead_time_days or 0),
-            **_forecast_payload(rw.need_date, rw.need_date, reason="rework"),
-        })
-
-    rows: List[Dict[str, Any]] = []
-    summary = {
-        "total_items": 0,
-        "fully_covered": 0,
-        "partially_covered": 0,
-        "not_covered": 0,
-        "net_zero": 0,
-        "execution_completed_qty": 0.0,
-        "execution_base_qty": 0.0,
-        "execution_pct": 100.0,
-        "execution_by_flow": {},
-    }
-    execution_by_flow: Dict[str, Dict[str, float]] = {}
-
-    for req, item in reqs_with_items:
-        item_flow = classify_replenishment_flow(getattr(item, "replenishment_method", None))
-
-        if bom_level is not None and int(req.bom_level or 0) != bom_level:
-            continue
-        if flow is not None and item_flow != flow:
-            continue
-
-        req_id = int(req.id)
-        item_id = int(req.item_id)
-        gross_qty = _to_float(req.total_required_qty)
-        net_qty = _to_float(req.net_required_qty)
-        stock_qty = max(0.0, gross_qty - net_qty)
-
-        if item_flow == REPLENISHMENT_FLOW_PRODUCTION:
-            actual_items = prods_by_req_id.get(req_id, [])
-            direct_items = direct_prods_by_req_id.get(req_id, [])
-            planned_items = planned_orders_by_req_id.get(req_id, [])
-            work_items = actual_items + direct_items or planned_items
-            # "В заказах" is the quantity placed into real production orders.
-            # Planned MRP tasks remain visible in work_items and in "К запуску",
-            # but they are not actual orders yet.
-            ordered_qty = prod_ordered_by_req_id.get(req_id, 0.0) + direct_prod_ordered_by_req_id.get(req_id, 0.0)
-            completed_qty = prod_done_by_req_id.get(req_id, 0.0) + direct_prod_done_by_req_id.get(req_id, 0.0)
-        elif item_flow == REPLENISHMENT_FLOW_PURCHASE:
-            work_items = purchases_by_req_id.get(req_id, []) or purchases_by_item_fallback.get(item_id, [])
-            ordered_qty = purchase_ordered_by_req_id.get(req_id, purchase_ordered_by_item_fallback.get(item_id, 0.0))
-            completed_qty = purchase_done_by_req_id.get(req_id, purchase_done_by_item_fallback.get(item_id, 0.0))
-        else:
-            work_items = reworks_by_item.get(item_id, [])
-            ordered_qty = rework_ordered_by_item.get(item_id, 0.0)
-            completed_qty = 0.0
-
-        progress_base_qty = net_qty if net_qty > 1e-9 else ordered_qty
-        completed_qty = min(max(0.0, completed_qty), progress_base_qty) if progress_base_qty > 1e-9 else 0.0
-        remaining_qty = max(0.0, progress_base_qty - completed_qty)
-        unassigned_qty = max(0.0, net_qty - ordered_qty)
-        progress_pct = round(completed_qty / progress_base_qty * 100.0, 1) if progress_base_qty > 1e-9 else 100.0
-        forecast_dates: List[date] = []
-        for wi in work_items:
-            raw_forecast = wi.get("forecast_date") or wi.get("need_date")
-            if raw_forecast:
-                try:
-                    forecast_dates.append(_parse_date(raw_forecast, "forecast_date"))
-                except Exception:
-                    pass
-        row_forecast = max(forecast_dates) if forecast_dates else None
-        row_due = req.period_to if req.period_to else None
-        row_forecast_payload = _forecast_payload(row_forecast, row_due)
-
-        need_dates: List[date] = []
-        for wi in work_items:
-            raw_need = wi.get("need_date")
-            if raw_need:
-                try:
-                    need_dates.append(_parse_date(raw_need, "need_date"))
-                except Exception:
-                    pass
-        row_need_date = min(need_dates) if need_dates else row_due
-
-        if net_qty < 1e-9:
-            row_status = "net_zero"
-        elif remaining_qty < 1e-9:
-            row_status = "covered"
-        elif completed_qty > 1e-9:
-            row_status = "partial"
-        elif ordered_qty > 1e-9:
-            row_status = "ordered"
-        else:
-            row_status = "none"
-
-        rows.append({
-            "req_id": req_id,
-            "item_id": item_id,
-            "item_code": str(item.item_code or ""),
-            "item_article": str(item.item_article or "") if item.item_article else None,
-            "item_name": str(item.item_name or ""),
-            "flow": item_flow,
-            "bom_level": int(req.bom_level or 0),
-            "gross_qty": gross_qty,
-            "stock_qty": stock_qty,
-            "net_qty": net_qty,
-            "ordered_qty": ordered_qty,
-            "completed_qty": completed_qty,
-            "covered_qty": completed_qty,
-            "remaining_qty": remaining_qty,
-            "unassigned_qty": unassigned_qty,
-            "progress_base_qty": progress_base_qty,
-            "coverage_pct": progress_pct,
-            "need_date": row_need_date.isoformat() if row_need_date else None,
-            "status": row_status,
-            **row_forecast_payload,
-            "work_items": work_items,
-        })
-
-        summary["total_items"] += 1
-        summary["execution_completed_qty"] += completed_qty
-        summary["execution_base_qty"] += progress_base_qty
-        flow_summary = execution_by_flow.setdefault(
-            item_flow,
-            {"completed_qty": 0.0, "base_qty": 0.0, "execution_pct": 100.0},
-        )
-        flow_summary["completed_qty"] += completed_qty
-        flow_summary["base_qty"] += progress_base_qty
-        if net_qty < 1e-9:
-            summary["net_zero"] += 1
-        elif remaining_qty < 1e-9:
-            summary["fully_covered"] += 1
-        elif completed_qty > 1e-9:
-            summary["partially_covered"] += 1
-        else:
-            summary["not_covered"] += 1
-
-    execution_base_qty = _to_float(summary["execution_base_qty"])
-    summary["execution_pct"] = (
-        round(_to_float(summary["execution_completed_qty"]) / execution_base_qty * 100.0, 1)
-        if execution_base_qty > 1e-9
-        else 100.0
-    )
-    for flow_summary in execution_by_flow.values():
-        base_qty = _to_float(flow_summary["base_qty"])
-        flow_summary["execution_pct"] = (
-            round(_to_float(flow_summary["completed_qty"]) / base_qty * 100.0, 1)
-            if base_qty > 1e-9
-            else 100.0
-        )
-    summary["execution_by_flow"] = execution_by_flow
-    summary["truth_status"] = truth_state.status
-
-    return {
-        "plan": _serialize_plan(plan),
-        "run_id": int(run.run_id),
-        "truth_status": truth_state.status,
-        "truth_generation_id": truth_state.generation_id,
-        "ledger_generation": truth_state.generation_id,
-        "truth_cutoff": truth_state.cutoff.isoformat() if truth_state.cutoff else None,
-        "cutoff": truth_state.cutoff.isoformat() if truth_state.cutoff else None,
-        "truth_reason": truth_state.reason,
-        "rows": rows,
-        "summary": summary,
-    }
 
 
 def build_period_plan_execution_snapshot(

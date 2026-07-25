@@ -654,6 +654,11 @@ def pull_recorder_movements(
             touched_item_ids,
             f"pull:{recorder_ref}"[:64],
             ledger_generation_id=ledger_generation_id,
+            sle_ids=[
+                int(row.id)
+                for row in new_by_line.values()
+                if row.id is not None
+            ],
         )
 
     # --- pull-status transition (§2.3) ---

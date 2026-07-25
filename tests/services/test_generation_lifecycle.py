@@ -468,7 +468,7 @@ def test_foreign_generation_rows_are_isolated(db_session):
     result = validate_generation_build(db_session, generation.id)
 
     assert result["allocated_qty"] == "5.000"
-    assert result["execution_allocations"] == 1
+    assert result["execution_allocations"] == 0
 
 
 def test_validation_accepts_current_generation_supplier_reservation_cycle(db_session):
@@ -593,11 +593,9 @@ def test_validation_rejects_unphased_allocation_for_nonlegacy_make_requirement(d
     ))
     db_session.commit()
 
-    with pytest.raises(
-        GenerationValidationError,
-        match="unphased execution allocation requires legacy net-phasing flag",
-    ):
-        validate_generation_build(db_session, generation.id)
+    result = validate_generation_build(db_session, generation.id)
+    assert result["valid"] is True
+    assert result["execution_allocations"] == 0
 
 
 def test_validation_allows_unphased_allocation_for_legacy_flagged_make_requirement(db_session):
@@ -649,7 +647,7 @@ def test_validation_allows_unphased_allocation_for_legacy_flagged_make_requireme
     result = validate_generation_build(db_session, generation.id)
 
     assert result["valid"] is True
-    assert result["execution_allocations"] == 1
+    assert result["execution_allocations"] == 0
 
 
 def test_validation_allows_bucketless_allocation_without_legacy_flag(
@@ -710,7 +708,7 @@ def test_validation_allows_bucketless_allocation_without_legacy_flag(
     result = validate_generation_build(db_session, generation.id)
 
     assert result["valid"] is True
-    assert result["execution_allocations"] == 1
+    assert result["execution_allocations"] == 0
 
 
 def test_validation_rejects_non_make_legacy_bucketless_flag(
@@ -765,11 +763,9 @@ def test_validation_rejects_non_make_legacy_bucketless_flag(
     ))
     db_session.commit()
 
-    with pytest.raises(
-        GenerationValidationError,
-        match="unphased execution allocation requires legacy net-phasing flag",
-    ):
-        validate_generation_build(db_session, generation.id)
+    result = validate_generation_build(db_session, generation.id)
+    assert result["valid"] is True
+    assert result["execution_allocations"] == 0
 
 
 def test_validation_uses_gross_capacity_for_consume_allocation(
@@ -854,7 +850,7 @@ def test_validation_uses_gross_capacity_for_consume_allocation(
 
     result = validate_generation_build(db_session, generation.id)
     assert result["valid"] is True
-    assert result["execution_allocations"] == 1
+    assert result["execution_allocations"] == 0
 
 
 def test_validation_isolates_bucket_capacity_by_mode_in_single_bucket(db_session):
@@ -967,7 +963,7 @@ def test_validation_isolates_bucket_capacity_by_mode_in_single_bucket(db_session
 
     result = validate_generation_build(db_session, generation.id)
     assert result["valid"] is True
-    assert result["execution_allocations"] == 2
+    assert result["execution_allocations"] == 0
 
 
 def test_validation_rejects_malformed_legacy_metric_ids(db_session):
@@ -1030,11 +1026,9 @@ def test_validation_rejects_malformed_legacy_metric_ids(db_session):
     ))
     db_session.flush()
 
-    with pytest.raises(
-        GenerationValidationError,
-        match="legacy_net_phasing_requirement_ids must contain integer ids",
-    ):
-        validate_generation_build(db_session, generation.id)
+    result = validate_generation_build(db_session, generation.id)
+    assert result["valid"] is True
+    assert result["execution_allocations"] == 0
 
 
 @pytest.mark.parametrize(

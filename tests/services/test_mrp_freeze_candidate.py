@@ -62,6 +62,21 @@ def _candidate_world(db, quantities=(10, 20)):
         ledger_generation_id=target.id, item_id=item.item_id,
         characteristic_ref="", organization_ref=DEFAULT_ORGANIZATION_REF1C, warehouse_ref1c="", on_hand=15,
     ))
+    db.add(models.StockLedgerEntry(
+        ingest_batch_id=physical.id,
+        source_content_hash="stock-baseline-" + ("0" * 49),
+        item_id=item.item_id,
+        characteristic_ref="",
+        organization_ref=DEFAULT_ORGANIZATION_REF1C,
+        warehouse_ref1c="WH-PLAN",
+        qty=15,
+        posting_at=cutoff,
+        record_type="receipt",
+        movement_kind="receipt",
+        recorder_type="StockBaseline",
+        recorder_ref="candidate-freeze",
+        line_no="1",
+    ))
     # The future-supply capture precedes the executor and belongs to the exact
     # candidate generation.
     capture = models.LedgerBuildBatch(
@@ -189,6 +204,131 @@ def test_candidate_freeze_supports_sealed_add_only(db_session):
     assert db_session.query(models.MrpRequirement).filter_by(run_id=candidate.run_id).count() == 1
 
 
+def test_add_candidate_cannot_reuse_supplier_supply_claimed_by_retained_run(db_session):
+    accepted, target, item, parents, old_candidates, _lines = _candidate_world(
+        db_session, (1,)
+    )
+    db_session.delete(old_candidates[0])
+    db_session.flush()
+    retained = parents[0]
+    retained_requirement = models.MrpRequirement(
+        run_id=retained.run_id,
+        item_id=item.item_id,
+        total_required_qty=1,
+        net_required_qty=1,
+        covered_qty=0,
+        remaining_qty=1,
+        period_from=retained.period_from,
+        period_to=retained.period_to,
+        bom_level=0,
+        freeze_version=retained.active_freeze_version,
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="default",
+    )
+    db_session.add(retained_requirement)
+    db_session.flush()
+    db_session.add(models.MrpFreezeAllocation(
+        run_id=retained.run_id,
+        freeze_version=retained.active_freeze_version,
+        requirement_id=retained_requirement.id,
+        item_id=item.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="default",
+        source_type="supplier_order",
+        source_ref="t",
+        source_line_ref="1",
+        alloc_qty=1,
+        fact_at_freeze=2,
+        realized_qty=0,
+        evaporated_qty=0,
+    ))
+    capture = db_session.query(models.LedgerBuildBatch).filter_by(
+        ledger_generation_id=target.id,
+        stage="snapshot_build",
+    ).one()
+    db_session.add(models.LedgerFutureSupply(
+        ledger_generation_id=target.id,
+        supply_kind="wip_order",
+        item_id=item.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="default",
+        destination_warehouse_ref1c="WH-PLAN",
+        source_ref="w",
+        source_line_ref="1",
+        ordered_qty_at_cutoff=2,
+        realized_qty_at_cutoff=0,
+        open_qty_at_cutoff=2,
+        eta_date=date(2026, 8, 1),
+        source_state_key="open",
+        capture_cutoff=target.cutoff,
+        source_content_hash="w" * 64,
+        capture_batch_id=capture.id,
+        evidence_status="exact",
+    ))
+    db_session.add(models.MrpFreezeAllocation(
+        run_id=retained.run_id,
+        freeze_version=retained.active_freeze_version,
+        requirement_id=retained_requirement.id,
+        item_id=item.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="default",
+        source_type="wip_order",
+        source_ref="w",
+        source_line_ref="1",
+        alloc_qty=1,
+        fact_at_freeze=2,
+        realized_qty=0,
+        evaporated_qty=0,
+    ))
+    plan, line, candidate = _add_candidate(db_session, target, item)
+    line.qty = 30
+    _seal_manifest(
+        target,
+        [
+            {
+                "action": "retain",
+                "plan_id": retained.source_plan_id,
+                "parent_run_id": retained.run_id,
+                "candidate_run_id": None,
+            },
+            {
+                "action": "add",
+                "plan_id": plan.id,
+                "parent_run_id": None,
+                "candidate_run_id": candidate.run_id,
+            },
+        ],
+        add_plan_ids=[plan.id],
+        add_config={"first": True},
+        horizon_days=45,
+    )
+
+    freeze_candidate_snapshots(
+        db_session,
+        parent_generation_id=accepted.id,
+        target_generation_id=target.id,
+        candidate_run_ids=[candidate.run_id],
+    )
+
+    requirement = db_session.query(models.MrpRequirement).filter_by(
+        run_id=candidate.run_id,
+        item_id=item.item_id,
+    ).one()
+    purchase_qty = sum(
+        float(row.qty)
+        for row in db_session.query(models.PlannedPurchase).filter_by(
+            run_id=candidate.run_id
+        )
+    )
+    # Historical stock 15 + one unclaimed supplier + one unclaimed WIP unit.
+    assert float(requirement.net_required_qty) == pytest.approx(14)
+    assert purchase_qty == pytest.approx(13)
+
+
 def test_candidate_freeze_supports_sealed_refresh_and_add(db_session):
     accepted, target, item, parents, candidates, _lines = _candidate_world(db_session)
     plan, line, added = _add_candidate(db_session, target, item)
@@ -241,3 +381,88 @@ def test_exact_future_supply_without_pool_or_destination_is_rejected(db_session)
         build_shared_pools(
             db_session, [], ledger_generation_id=target.id, relevant_item_ids=[item.item_id]
         )
+
+
+def _retained_claim_world(db, *, wip_open_qty):
+    """World with one retained run claiming 1 unit of a WIP line whose ledger
+    remainder is `wip_open_qty` (None = line fully received, absent from pool)."""
+    accepted, target, item, parents, old_candidates, _lines = _candidate_world(db, (1,))
+    db.delete(old_candidates[0])
+    db.flush()
+    retained = parents[0]
+    retained_requirement = models.MrpRequirement(
+        run_id=retained.run_id, item_id=item.item_id,
+        total_required_qty=1, net_required_qty=1, covered_qty=0, remaining_qty=1,
+        period_from=retained.period_from, period_to=retained.period_to,
+        bom_level=0, freeze_version=retained.active_freeze_version,
+        characteristic_ref="", organization_ref="", planning_stock_pool="default",
+    )
+    db.add(retained_requirement)
+    db.flush()
+    capture = db.query(models.LedgerBuildBatch).filter_by(
+        ledger_generation_id=target.id, stage="snapshot_build",
+    ).one()
+    if wip_open_qty is not None:
+        db.add(models.LedgerFutureSupply(
+            ledger_generation_id=target.id, supply_kind="wip_order",
+            item_id=item.item_id, characteristic_ref="", organization_ref="",
+            planning_stock_pool="default", destination_warehouse_ref1c="WH-PLAN",
+            source_ref="w", source_line_ref="1",
+            ordered_qty_at_cutoff=2,
+            realized_qty_at_cutoff=2 - wip_open_qty,
+            open_qty_at_cutoff=wip_open_qty,
+            eta_date=date(2026, 8, 1), source_state_key="open",
+            capture_cutoff=target.cutoff, source_content_hash="w" * 64,
+            capture_batch_id=capture.id, evidence_status="exact",
+        ))
+    db.add(models.MrpFreezeAllocation(
+        run_id=retained.run_id, freeze_version=retained.active_freeze_version,
+        requirement_id=retained_requirement.id, item_id=item.item_id,
+        characteristic_ref="", organization_ref="", planning_stock_pool="default",
+        source_type="wip_order", source_ref="w", source_line_ref="1",
+        alloc_qty=1, fact_at_freeze=2, realized_qty=0, evaporated_qty=0,
+    ))
+    plan, line, candidate = _add_candidate(db, target, item)
+    line.qty = 30
+    _seal_manifest(
+        target,
+        [
+            {"action": "retain", "plan_id": retained.source_plan_id,
+             "parent_run_id": retained.run_id, "candidate_run_id": None},
+            {"action": "add", "plan_id": plan.id,
+             "parent_run_id": None, "candidate_run_id": candidate.run_id},
+        ],
+        add_plan_ids=[plan.id], add_config={"first": True}, horizon_days=45,
+    )
+    return accepted, target, item, candidate
+
+
+def test_partially_received_retained_claim_clips_to_line_remainder(db_session):
+    # Retained claim is 1, but 1.6 of the line already arrived (remainder 0.4).
+    # The dead realized/evaporated columns are ignored: the claim clips to the
+    # ledger remainder instead of raising, and the candidate gets nothing.
+    accepted, target, item, candidate = _retained_claim_world(db_session, wip_open_qty=0.4)
+    freeze_candidate_snapshots(
+        db_session, parent_generation_id=accepted.id,
+        target_generation_id=target.id, candidate_run_ids=[candidate.run_id],
+    )
+    requirement = db_session.query(models.MrpRequirement).filter_by(
+        run_id=candidate.run_id, item_id=item.item_id,
+    ).one()
+    # Historical stock 15 only: the whole WIP remainder belongs to the senior
+    # retained claim, none of it reaches the new candidate.
+    assert float(requirement.net_required_qty) == pytest.approx(15)
+
+
+def test_fully_received_retained_claim_skips_missing_line(db_session):
+    # The claimed line is fully received (absent from the candidate pool):
+    # the retained claim is realized, freeze must proceed without raising.
+    accepted, target, item, candidate = _retained_claim_world(db_session, wip_open_qty=None)
+    freeze_candidate_snapshots(
+        db_session, parent_generation_id=accepted.id,
+        target_generation_id=target.id, candidate_run_ids=[candidate.run_id],
+    )
+    requirement = db_session.query(models.MrpRequirement).filter_by(
+        run_id=candidate.run_id, item_id=item.item_id,
+    ).one()
+    assert float(requirement.net_required_qty) == pytest.approx(15)

@@ -7,7 +7,8 @@ important arithmetic, FIFO/shared-pool, isolation and retry guards against the
 current BUILDING Ledger candidate contract.
 """
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from hashlib import sha256
 import json
 
@@ -153,7 +154,7 @@ def _world(db, demands, *, root=None, stock=None, future=None):
     if root is None:
         root = _item(db, "ROOT")
     for item, qty in (stock or {}).items():
-        db.add(
+        db.add_all([
             models.StockBin(
                 ledger_generation_id=target.id,
                 item_id=item.item_id,
@@ -161,8 +162,23 @@ def _world(db, demands, *, root=None, stock=None, future=None):
                 organization_ref=DEFAULT_ORGANIZATION_REF1C,
                 warehouse_ref1c="",
                 on_hand=qty,
-            )
-        )
+            ),
+            models.StockLedgerEntry(
+                ingest_batch_id=physical.id,
+                source_content_hash=f"freeze-stock-{item.item_id}-{qty}",
+                item_id=item.item_id,
+                characteristic_ref="",
+                organization_ref=DEFAULT_ORGANIZATION_REF1C,
+                warehouse_ref1c="",
+                qty=qty,
+                qty_after=qty,
+                posting_at=datetime(2026, 7, 20, 12, 0),
+                record_type="Receipt",
+                movement_kind="receipt",
+                ingest_source="test",
+                active=True,
+            ),
+        ])
     capture = models.LedgerBuildBatch(
         ledger_generation_id=target.id,
         stage="snapshot_build",
@@ -403,6 +419,79 @@ def test_pool_key_normalises_to_default():
 def test_build_shared_pools_requires_explicit_ledger_generation(db_session):
     with pytest.raises(TypeError):
         build_shared_pools(db_session, [])
+
+
+def test_build_shared_pools_uses_signed_sle_balance_at_historical_baseline(
+    db_session,
+):
+    item = _item(db_session, "SCOPE-HISTORICAL")
+    target = _freeze_candidate_generation(db_session, suffix="historical")
+    db_session.add(models.StockWarehouse(
+        warehouse_ref1c="WH",
+        warehouse_name="Selected",
+        is_selected=True,
+    ))
+    db_session.add_all([
+        models.StockLedgerEntry(
+            ingest_batch_id=target.physical_import_batch_id,
+            source_content_hash="hist-before-in",
+            item_id=item.item_id,
+            characteristic_ref="",
+            organization_ref=DEFAULT_ORGANIZATION_REF1C,
+            warehouse_ref1c="WH",
+            qty=Decimal("10"),
+            qty_after=Decimal("999"),
+            posting_at=datetime(2026, 5, 31, 12, 0),
+            record_type="Receipt",
+            movement_kind="receipt",
+            ingest_source="test",
+            active=True,
+        ),
+        models.StockLedgerEntry(
+            ingest_batch_id=target.physical_import_batch_id,
+            source_content_hash="hist-before-out",
+            item_id=item.item_id,
+            characteristic_ref="",
+            organization_ref=DEFAULT_ORGANIZATION_REF1C,
+            warehouse_ref1c="WH",
+            qty=Decimal("-12"),
+            qty_after=Decimal("777"),
+            posting_at=datetime(2026, 5, 31, 18, 0),
+            record_type="Expense",
+            movement_kind="expense",
+            ingest_source="test",
+            active=True,
+        ),
+        models.StockLedgerEntry(
+            ingest_batch_id=target.physical_import_batch_id,
+            source_content_hash="hist-after",
+            item_id=item.item_id,
+            characteristic_ref="",
+            organization_ref=DEFAULT_ORGANIZATION_REF1C,
+            warehouse_ref1c="WH",
+            qty=Decimal("50"),
+            qty_after=Decimal("50"),
+            posting_at=datetime(2026, 6, 1, 0, 0),
+            record_type="Receipt",
+            movement_kind="receipt",
+            ingest_source="test",
+            active=True,
+        ),
+    ])
+    db_session.flush()
+
+    baseline_at = datetime(2026, 6, 1, 0, 0) - timedelta(microseconds=1)
+    pools = build_shared_pools(
+        db_session,
+        [],
+        ledger_generation_id=target.id,
+        relevant_item_ids=[item.item_id],
+        stock_baseline_at=baseline_at,
+    )
+
+    assert pools.stock[item.item_id] == pytest.approx(-2)
+    assert pools.baseline_at == baseline_at
+    assert pools.physical_import_batch_id == target.physical_import_batch_id
 
 
 def test_build_shared_pools_ignores_ignored_and_unselected_warehouses(db_session):

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from hashlib import sha256
 from threading import Lock
 from typing import Any, Mapping
 
@@ -12,7 +11,6 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app import models
-from app.services.obligation_refresh_orchestrator import run_obligation_refresh
 
 from .generation_lifecycle import accept_generation_build
 from .historical_bootstrap_phase0 import (
@@ -56,11 +54,6 @@ def _utc(value: datetime, field: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         return value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc)
-
-
-def _obligation_key(key: str) -> str:
-    digest = sha256(key.encode("utf-8")).hexdigest()[:32]
-    return f"physical-publish:{digest}"
 
 
 def _acquire_lifecycle_lock(db: Session):
@@ -219,35 +212,35 @@ def run_physical_refresh(
                 "physical refresh lacks replay_from"
             ) from exc
 
-        # This pointer transition and the following obligation refresh share
-        # one outer transaction.  Other sessions therefore see either the old
-        # complete truth or the final complete truth, never the intermediate.
+        # Physical refresh changes facts, not frozen plan obligations.
+        # accept_generation_build rebuilds the generation-scoped reservation
+        # fold and immutable read snapshots for the existing fixed runs.  A
+        # second obligation refresh here used to re-explode every BOM and
+        # overwrite frozen net quantities with today's stock basis.
         accept_generation_build(
             db,
             int(physical_generation.id),
             replay_from=replay_from,
             odata_client=client,
         )
-        published = run_obligation_refresh(
-            db,
-            parent_generation_id=int(physical_generation.id),
-            generation_key=_obligation_key(key),
-            started_by=started_by,
-            config_version_id=config_version_id,
-            config_snapshot=dict(config_snapshot or {}),
-            planning_pool_by_warehouse=dict(planning_pool_by_warehouse or {}),
+        fixed_run_ids = tuple(
+            int(run_id)
+            for (run_id,) in db.query(models.PlanningRun.run_id)
+            .filter(models.PlanningRun.status == "FIXED_SNAPSHOT")
+            .order_by(models.PlanningRun.run_id.asc())
+            .all()
         )
         db.commit()
         return PhysicalRefreshOrchestrationResult(
             parent_generation_id=int(parent.id),
             physical_generation_id=int(physical_generation.id),
-            published_generation_id=int(published.target_generation_id),
+            published_generation_id=int(physical_generation.id),
             cutoff=cutoff,
             physical_import=physical_import,
             recorder_audit=recorder_audit,
             balance_convergence=convergence,
-            candidate_run_ids=tuple(published.candidate_run_ids),
-            published=bool(published.published),
+            candidate_run_ids=fixed_run_ids,
+            published=True,
         )
     except Exception:
         db.rollback()

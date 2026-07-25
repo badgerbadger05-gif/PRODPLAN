@@ -235,8 +235,8 @@ def test_candidate_replay_rejects_empty_manifest_and_cross_generation_reservatio
     rogue = db_session.query(models.ReservationEntry).filter_by(
         ledger_generation_id=target.id
     ).first()
-    rogue.ledger_generation_id = parent.id
-    with pytest.raises(CandidateRealizationReplayError, match="another generation"):
+    rogue.run_id = candidates[0][2].run_id
+    with pytest.raises(CandidateRealizationReplayError, match="unsealed run"):
         replay_candidate_realizations(db_session, target.id)
 
 

@@ -24,7 +24,6 @@ from .historical_obligations import (
 )
 from .historical_replay_persistence import (
     _ALGORITHM_VERSION as REPLAY_ALGORITHM_VERSION,
-    bucket_capacity_for_mode,
     run_historical_replay,
 )
 from .physical import canonical_content_hash
@@ -47,13 +46,6 @@ _SUPPLIER_DOCUMENT_TYPES = frozenset({
     "Document_КорректировкаПоступления",
     "Document_РасходнаяНакладная",
 })
-_SAFE_FACT_MODE = {
-    "linked_production": "make",
-    "unlinked_production": "make",
-    "component_consumption": "consume",
-}
-
-
 class GenerationValidationError(ValueError):
     pass
 
@@ -448,120 +440,30 @@ def validate_generation_build(
             (int(entry.requirement_id), str(entry.realization_mode))
         ] += realized
 
-    bucket_by_id = {
-        int(row.id): row
-        for row in db.query(models.MrpRequirementBucket).filter(
-            models.MrpRequirementBucket.requirement_id.in_(
-                sorted(selected_requirement_ids)
-            )
-        ).all()
-    } if selected_requirement_ids else {}
-    bucketed_requirement_ids = {int(row.requirement_id) for row in bucket_by_id.values()}
-    make_requirement_ids = {
-        int(entry.requirement_id)
-        for entry in entries
-        if str(entry.realization_mode).lower() == "make"
-    }
-    legacy_unphased_requirement_ids = _parse_int_id_list(
-        obligation_metrics.get("legacy_net_phasing_requirement_ids"),
-        "legacy_net_phasing_requirement_ids",
+    replay_realized_qty = sum(
+        (
+            _d(event.realized_delta)
+            for event in events
+            if str(event.cycle_id or "") == f"historical-replay:g{generation.id}"
+        ),
+        Decimal("0"),
     )
-    legacy_unphased_requirement_ids &= make_requirement_ids
-    allocation_by_req_mode: dict[tuple[int, str], Decimal] = defaultdict(Decimal)
-    bucket_mode_qty: dict[tuple[int, str], Decimal] = defaultdict(Decimal)
-    supplier_allocated_qty = Decimal("0")
-    allocations = db.query(models.MrpExecutionAllocation).filter(
-        models.MrpExecutionAllocation.ledger_generation_id == int(generation.id)
-    ).all()
-    supplier_allocation_by_key: dict[
-        tuple[int | None, int | None, str, str], models.MrpExecutionAllocation
-    ] = {}
-    supplier_realized_by_req_mode: dict[tuple[int, str], Decimal] = defaultdict(Decimal)
-    replay_allocations: list[models.MrpExecutionAllocation] = []
-    for allocation in allocations:
-        if str(allocation.fact_type or "") == "supplier_receipt":
-            supplier_key = (
-                allocation.requirement_id if allocation.requirement_id is not None else None,
-                allocation.bucket_id,
-                str(allocation.fact_ref or ""),
-                str(allocation.fact_line_ref or ""),
-            )
-            if (
-                supplier_key not in supplier_allocation_by_key
-                or (
-                    str(allocation.allocation_kind or "") == "execution"
-                    and str(supplier_allocation_by_key[supplier_key].allocation_kind or "") != "execution"
-                )
-            ):
-                supplier_allocation_by_key[supplier_key] = allocation
-            continue
-        replay_allocations.append(allocation)
-
-    for allocation in replay_allocations:
-        if not str(allocation.cycle_id or "").startswith("historical-replay:g"):
-            raise GenerationValidationError("legacy execution allocation entered generation build")
-        mode = _SAFE_FACT_MODE.get(str(allocation.fact_type or ""))
-        if mode is None or str(allocation.allocation_kind or "") != "execution":
-            raise GenerationValidationError("unsafe or legacy execution allocation")
-        requirement_id = int(allocation.requirement_id)
-        if requirement_id not in selected_requirement_ids:
-            raise GenerationValidationError("execution allocation escapes selected obligations")
-        qty = _d(allocation.allocated_qty)
-        allocation_by_req_mode[(requirement_id, mode)] += qty
-        if allocation.bucket_id is not None:
-            bucket = bucket_by_id.get(int(allocation.bucket_id))
-            if bucket is None or int(bucket.requirement_id) != requirement_id:
-                raise GenerationValidationError("allocation bucket escapes requirement")
-            bucket_mode_qty[(int(bucket.id), mode)] += qty
-        else:
-            if requirement_id in bucketed_requirement_ids and (
-                mode != "make"
-                or requirement_id not in legacy_unphased_requirement_ids
-            ):
-                raise GenerationValidationError(
-                    "unphased execution allocation requires legacy net-phasing flag"
-                )
-    for allocation in supplier_allocation_by_key.values():
-        if str(allocation.allocation_kind or "") not in {"coverage_realization", "execution"}:
-            raise GenerationValidationError("unsafe supplier allocation kind")
-        if not str(allocation.cycle_id or "").startswith(
-            f"historical-supplier:g{generation.id}:"
-        ):
-            raise GenerationValidationError(
-                "supplier allocation lacks generation build lineage"
-            )
-        if (
-            allocation.requirement_id is None
-            or int(allocation.requirement_id) not in selected_requirement_ids
-        ):
-            raise GenerationValidationError(
-                "supplier allocation escapes selected obligations"
-            )
-        supplier_qty = _d(allocation.allocated_qty)
-        supplier_allocated_qty += supplier_qty
-        supplier_realized_by_req_mode[
-            (int(allocation.requirement_id), "buy")
-        ] += supplier_qty
-    realized_allocations_by_req_mode = defaultdict(Decimal, allocation_by_req_mode)
-    for key, qty in supplier_realized_by_req_mode.items():
-        realized_allocations_by_req_mode[key] += qty
-    if dict(realized_allocations_by_req_mode) != {
-        key: qty for key, qty in realized_by_req_mode.items() if qty != 0
-    }:
-        raise GenerationValidationError("bucket allocation sums differ from realized events")
-    for (bucket_id, _mode), qty in bucket_mode_qty.items():
-        bucket = bucket_by_id[bucket_id]
-        capacity = bucket_capacity_for_mode(bucket, _mode)
-        if qty > capacity:
-            raise GenerationValidationError("bucket allocation exceeds frozen capacity")
+    supplier_allocated_qty = sum(
+        (
+            _d(event.realized_delta)
+            for event in events
+            if str(event.cycle_id or "").startswith(supplier_cycle_prefix)
+        ),
+        Decimal("0"),
+    )
 
     fact_qty = _d(replay_metrics.get("fact_qty"))
     allocated_qty = _d(replay_metrics.get("allocated_qty"))
     unplanned_qty = _d(replay_metrics.get("unplanned_qty"))
     if fact_qty != allocated_qty + unplanned_qty:
         raise GenerationValidationError("historical replay violates fact conservation")
-    if allocated_qty != sum(allocation_by_req_mode.values(), Decimal("0")):
-        raise GenerationValidationError("replay metrics disagree with persisted allocations")
+    if allocated_qty != replay_realized_qty:
+        raise GenerationValidationError("replay metrics disagree with reservation events")
     if _d(replay_metrics.get("ambiguous_pool_facts")) != Decimal("0"):
         raise GenerationValidationError("historical replay has unresolved planning-stock pools")
     if _d(replay_metrics.get("ambiguous_identity_facts")) != Decimal("0"):
@@ -677,7 +579,7 @@ def validate_generation_build(
         "selected_requirements": len(selected_requirement_ids),
         "reservation_entries": len(entries),
         "reservation_events": len(events),
-        "execution_allocations": len(allocations),
+        "execution_allocations": 0,
         "supplier_receipt_evidence": len(provenance),
         "supplier_receipt_ignored_count": len(excluded_ids),
         "supplier_receipt_ignored_qty": str(supplier_ignored_qty),

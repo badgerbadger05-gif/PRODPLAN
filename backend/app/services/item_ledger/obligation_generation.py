@@ -312,3 +312,112 @@ def fork_obligation_generation(
         cutoff=_utc(parent.cutoff, "parent cutoff"),
         created=True,
     )
+
+
+def carry_forward_retained_reservations(
+    db: Session,
+    *,
+    parent_generation_id: int,
+    target_generation_id: int,
+    retained_run_ids: tuple[int, ...],
+) -> int:
+    """Copy only generation-scoped projections for immutable retained runs."""
+    run_ids = tuple(sorted({int(value) for value in retained_run_ids}))
+    if not run_ids:
+        return 0
+    existing_count = db.query(models.ReservationEntry.id).filter(
+        models.ReservationEntry.ledger_generation_id == int(target_generation_id),
+        models.ReservationEntry.run_id.in_(run_ids),
+    ).count()
+    source_entries = db.query(models.ReservationEntry).filter(
+        models.ReservationEntry.ledger_generation_id == int(parent_generation_id),
+        models.ReservationEntry.run_id.in_(run_ids),
+    ).order_by(models.ReservationEntry.id.asc()).all()
+    source_ids = [int(row.id) for row in source_entries]
+    if existing_count:
+        if existing_count != len(source_entries):
+            raise ObligationGenerationError(
+                "retained reservation projection is partial on target generation"
+            )
+        return int(existing_count)
+    event_rows = (
+        db.query(models.ReservationEvent)
+        .filter(
+            models.ReservationEvent.ledger_generation_id == int(parent_generation_id),
+            models.ReservationEvent.reservation_id.in_(source_ids),
+        )
+        .order_by(models.ReservationEvent.id.asc())
+        .all()
+        if source_ids else []
+    )
+    coverage_rows = (
+        db.query(models.ReservationCoverage)
+        .filter(models.ReservationCoverage.reservation_id.in_(source_ids))
+        .order_by(models.ReservationCoverage.id.asc())
+        .all()
+        if source_ids else []
+    )
+    new_ids: dict[int, int] = {}
+    for source in source_entries:
+        target = models.ReservationEntry(
+            ledger_generation_id=int(target_generation_id),
+            item_id=source.item_id,
+            characteristic_ref=source.characteristic_ref,
+            organization_ref=source.organization_ref,
+            planning_stock_pool=source.planning_stock_pool,
+            run_id=source.run_id,
+            freeze_version=source.freeze_version,
+            requirement_id=source.requirement_id,
+            priority_period_from=source.priority_period_from,
+            priority_period_to=source.priority_period_to,
+            realization_mode=source.realization_mode,
+            reserved_qty=source.reserved_qty,
+            realized_qty=source.realized_qty,
+            covered_on_hand_qty=source.covered_on_hand_qty,
+            covered_incoming_supplier_qty=source.covered_incoming_supplier_qty,
+            covered_incoming_wip_qty=source.covered_incoming_wip_qty,
+            uncovered_qty=source.uncovered_qty,
+            lifecycle_status=source.lifecycle_status,
+            coverage_state=source.coverage_state,
+            opened_at=source.opened_at,
+            closed_at=source.closed_at,
+        )
+        db.add(target)
+        db.flush()
+        new_ids[int(source.id)] = int(target.id)
+    for source in event_rows:
+        db.add(models.ReservationEvent(
+            ledger_generation_id=int(target_generation_id),
+            reservation_id=new_ids[int(source.reservation_id)],
+            item_id=source.item_id,
+            characteristic_ref=source.characteristic_ref,
+            organization_ref=source.organization_ref,
+            planning_stock_pool=source.planning_stock_pool,
+            event_kind=source.event_kind,
+            reserved_delta=source.reserved_delta,
+            realized_delta=source.realized_delta,
+            sle_id=source.sle_id,
+            fact_ref=source.fact_ref,
+            fact_line_ref=source.fact_line_ref,
+            match_rule=source.match_rule,
+            cycle_id=source.cycle_id,
+            idempotency_key=source.idempotency_key,
+            event_at=source.event_at,
+        ))
+    for source in coverage_rows:
+        db.add(models.ReservationCoverage(
+            reservation_id=new_ids[int(source.reservation_id)],
+            source_kind=source.source_kind,
+            source_ref=source.source_ref,
+            source_line_ref=source.source_line_ref,
+            pin_kind=source.pin_kind,
+            alloc_qty=source.alloc_qty,
+            fact_at_freeze=source.fact_at_freeze,
+            covered_qty=source.covered_qty,
+            realized_qty=source.realized_qty,
+            evaporated_qty=source.evaporated_qty,
+            cycle_id=source.cycle_id,
+            computed_at=source.computed_at,
+        ))
+    db.flush()
+    return len(source_entries)

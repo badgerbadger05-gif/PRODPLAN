@@ -13,7 +13,7 @@ from typing import Iterable
 from sqlalchemy.orm import Session
 
 from app import models
-from .reservation import fold_reservation_entry
+from .reservation import append_realization_event, fold_reservation_entry
 
 from .physical import canonical_content_hash, canonical_decimal
 from .physical_visibility import visible_sles_for_generation
@@ -190,8 +190,10 @@ def _append_reservation_event(
         .first()
         is not None
     )
-    event_kind = "realize" if qty > 0 else "unrealize"
-    key = f"{event_kind}:{int(reservation.id)}:{int(allocation.fact.sle_id)}"
+    key = (
+        f"{'realize' if qty > 0 else 'unrealize'}:"
+        f"{int(reservation.id)}:{int(allocation.fact.sle_id)}"
+    )
     if _event_exists(db, int(reservation.ledger_generation_id), key):
         return False
     reserved_delta = (
@@ -199,15 +201,9 @@ def _append_reservation_event(
         if (qty > 0 and not reservation_seeded)
         else Decimal("0")
     )
-    db.add(models.ReservationEvent(
-        ledger_generation_id=int(reservation.ledger_generation_id),
-        reservation_id=int(reservation.id),
-        item_id=int(allocation.fact.item_id),
-        characteristic_ref=str(reservation.characteristic_ref or ""),
-        organization_ref=str(reservation.organization_ref or ""),
-        planning_stock_pool=str(reservation.planning_stock_pool or "default"),
-        event_kind=event_kind,
-        reserved_delta=reserved_delta,
+    return append_realization_event(
+        db,
+        reservation,
         realized_delta=qty,
         sle_id=int(allocation.fact.sle_id),
         fact_ref=str(allocation.fact.receipt_ref),
@@ -216,30 +212,8 @@ def _append_reservation_event(
         cycle_id=cycle_id,
         idempotency_key=key,
         event_at=allocation.fact.posting_at,
-    ))
-    return True
-
-
-def _reservation_bucket_id(
-    db: Session,
-    cache: dict[int, int | None],
-    requirement_id: int,
-) -> int | None:
-    requirement_key = int(requirement_id)
-    if requirement_key in cache:
-        return cache[requirement_key]
-    bucket = (
-        db.query(models.MrpRequirementBucket)
-        .filter_by(requirement_id=requirement_key)
-        .order_by(
-            models.MrpRequirementBucket.bucket_date,
-            models.MrpRequirementBucket.id,
-        )
-        .first()
+        reserved_delta=reserved_delta,
     )
-    value = int(bucket.id) if bucket is not None else None
-    cache[requirement_key] = value
-    return value
 
 
 def _buy_reservations_for_item(
@@ -444,32 +418,6 @@ def _rebuild_supplier_receipt_coverage_unsafe(
     }
     touched_provenance_entry_ids: set[int] = set()
 
-    existing_execution_allocations = {
-        (
-            int(row.requirement_id),
-            row.bucket_id,
-            str(row.fact_ref),
-            str(row.fact_line_ref),
-            str(row.fact_type),
-            str(row.allocation_kind),
-        ): row
-        for row in db.query(models.MrpExecutionAllocation).filter_by(
-            ledger_generation_id=ledger_generation_id,
-            fact_type="supplier_receipt",
-            allocation_kind="execution",
-        ).all()
-    }
-    touched_execution_allocation_keys: set[tuple[int, int | None, str, str, str, str]] = set()
-
-    def _execution_allocation_key(allocation: CoverageAllocation, bucket_id: int | None) -> tuple[int, int | None, str, str, str, str]:
-        return (
-            int(allocation.reservation.requirement_id),
-            bucket_id,
-            str(allocation.fact.receipt_ref),
-            f"{allocation.fact.receipt_line_no}#sle:{allocation.fact.sle_id}",
-            "supplier_receipt",
-            "execution",
-        )
     facts: list[ReceiptFact] = []
     exact_fact_count = 0
     provenance_count = 0
@@ -620,26 +568,16 @@ def _rebuild_supplier_receipt_coverage_unsafe(
         for item_id in {int(fact.item_id) for fact in facts}
     }
     allocations, unplanned = allocate_supplier_receipts(facts, reservations_by_item)
-    aggregated: dict[
-        tuple[int, int | None, int | None], CoverageAllocation
-    ] = {}
-    aggregate_qty: dict[tuple[int, int | None, int | None], Decimal] = {}
-    bucket_cache: dict[int, int | None] = {}
+    realized_keys: set[tuple[int, int]] = set()
     folded_reservations: set[int] = set()
     for allocation in allocations:
         if allocation.reservation.requirement_id is None:
             continue
-        key = (
-            allocation.fact.sle_id,
-            allocation.reservation.requirement_id,
-            _reservation_bucket_id(
-                db,
-                bucket_cache,
+        if allocation.qty != 0:
+            realized_keys.add((
+                int(allocation.fact.sle_id),
                 int(allocation.reservation.requirement_id),
-            ) if allocation.reservation.requirement_id is not None else None,
-        )
-        aggregated[key] = allocation
-        aggregate_qty[key] = aggregate_qty.get(key, Decimal("0")) + allocation.qty
+            ))
         reservation = allocation.reservation
         if reservation.id is not None:
             if _append_reservation_event(
@@ -655,56 +593,13 @@ def _rebuild_supplier_receipt_coverage_unsafe(
                 )
                 if _event_exists(db, int(reservation.ledger_generation_id), event_key):
                     folded_reservations.add(int(reservation.id))
-    db.flush()
-    for key, allocation in aggregated.items():
-        qty = aggregate_qty[key]
-        if qty == 0:
-            continue
-        reservation = allocation.reservation
-        allocation_key = _execution_allocation_key(allocation, key[2])
-        touched_execution_allocation_keys.add(allocation_key)
-        existing_allocation = existing_execution_allocations.get(allocation_key)
-        if existing_allocation is None:
-            existing_allocation = models.MrpExecutionAllocation(
-                ledger_generation_id=ledger_generation_id,
-                cycle_id=cycle_id,
-                requirement_id=allocation.reservation.requirement_id,
-                bucket_id=key[2],
-                fact_type="supplier_receipt",
-                allocation_kind="execution",
-                fact_ref=allocation.fact.receipt_ref,
-                # One 1C document line may legitimately emit several physical
-                # SLEs.  The read-ledger UNIQUE key predates stock_ledger_entry_id,
-                # therefore keep both identities in its bounded line token.
-                fact_line_ref=(
-                    f"{allocation.fact.receipt_line_no}#sle:{allocation.fact.sle_id}"
-                ),
-                fact_date=allocation.fact.posting_at,
-                allocated_qty=qty,
-                stock_ledger_entry_id=allocation.fact.sle_id,
-                origin_requirement_id=allocation.reservation.requirement_id,
-            )
-            db.add(existing_allocation)
-            existing_execution_allocations[allocation_key] = existing_allocation
-        else:
-            existing_allocation.cycle_id = cycle_id
-            existing_allocation.bucket_id = key[2]
-            existing_allocation.fact_ref = allocation.fact.receipt_ref
-            existing_allocation.fact_date = allocation.fact.posting_at
-            existing_allocation.allocated_qty = qty
-            existing_allocation.stock_ledger_entry_id = allocation.fact.sle_id
-            existing_allocation.origin_requirement_id = allocation.reservation.requirement_id
-
-    for key, allocation in existing_execution_allocations.items():
-        if key not in touched_execution_allocation_keys:
-            db.delete(allocation)
     for reservation_id in sorted(folded_reservations):
         fold_reservation_entry(db, reservation_id)
     db.flush()
     return SupplierReceiptBuildResult(
         provenance_count=provenance_count,
         exact_fact_count=exact_fact_count,
-        allocation_count=sum(1 for qty in aggregate_qty.values() if qty != 0),
+        allocation_count=len(realized_keys),
         unplanned_qty=unplanned,
     )
 
@@ -730,3 +625,67 @@ def rebuild_supplier_receipt_coverage(
             evidence=rows,
             cycle_id=cycle_id,
         )
+
+
+def rebuild_supplier_receipt_coverage_from_persisted_provenance(
+    db: Session,
+    *,
+    ledger_generation_id: int,
+    cycle_id: str,
+) -> SupplierReceiptBuildResult:
+    """Replay BUY realization from the generation's immutable receipt evidence.
+
+    Obligation refresh reuses the accepted physical prefix and clones its
+    generation-scoped provenance.  Re-reading mutable 1C documents would break
+    that boundary; reconstruct the normalized evidence from the persisted
+    payload instead.
+    """
+    rows = (
+        db.query(models.StockLedgerSupplierReceiptProvenance)
+        .filter(
+            models.StockLedgerSupplierReceiptProvenance.ledger_generation_id
+            == int(ledger_generation_id),
+            models.StockLedgerSupplierReceiptProvenance.match_status
+            != "excluded_non_supplier",
+        )
+        .order_by(
+            models.StockLedgerSupplierReceiptProvenance.receipt_doc_ref.asc(),
+            models.StockLedgerSupplierReceiptProvenance.receipt_doc_line_no.asc(),
+            models.StockLedgerSupplierReceiptProvenance.stock_ledger_entry_id.asc(),
+        )
+        .all()
+    )
+    evidence: list[SupplierDocumentEvidence] = []
+    for row in rows:
+        payload = dict(row.evidence_payload or {})
+        try:
+            evidence.append(SupplierDocumentEvidence(
+                receipt_doc_type=str(payload["receipt_doc_type"]),
+                receipt_doc_ref=str(payload["receipt_doc_ref"]),
+                receipt_doc_line_no=str(payload["receipt_doc_line_no"]),
+                operation_key=str(payload["operation_key"]),
+                operation_name=str(payload["operation_name"]),
+                supplier_order_type=str(payload.get("supplier_order_type") or ""),
+                supplier_order_ref=str(payload.get("supplier_order_ref") or ""),
+                supplier_order_line_no=str(payload.get("supplier_order_line_no") or ""),
+                item_id=int(payload["item_id"]),
+                characteristic_ref=str(payload.get("characteristic_ref") or ""),
+                warehouse_ref1c=str(payload.get("warehouse_ref1c") or ""),
+                signed_qty=_decimal(payload["signed_qty"]),
+                correction_receipt_ref=(
+                    str(payload["correction_receipt_ref"])
+                    if payload.get("correction_receipt_ref")
+                    else None
+                ),
+            ))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SupplierReceiptEvidenceError(
+                "persisted supplier receipt provenance is incomplete for "
+                f"SLE {int(row.stock_ledger_entry_id)}"
+            ) from exc
+    return rebuild_supplier_receipt_coverage(
+        db,
+        ledger_generation_id=int(ledger_generation_id),
+        evidence=evidence,
+        cycle_id=cycle_id,
+    )

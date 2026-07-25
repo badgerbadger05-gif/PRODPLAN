@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from hashlib import sha256
 import json
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
@@ -58,6 +58,7 @@ from ..models import (
     SpecComponent,
     Specification,
     StockBin,
+    StockLedgerEntry,
     StockWarehouse,
     SupplierOrder,
     SupplierOrderItem,
@@ -97,7 +98,7 @@ PURCHASE_ORDER_ENTITY = "Document_ЗаказПоставщику"
 DEFAULT_STOCK_POOL = "default"
 EMPTY_REF = ""
 
-# Shared with the future run_ledger_cycle so the two never interleave. SQLite is
+# Shared by freeze and generation publication so they never interleave. SQLite is
 # a no-op (single-writer); PG serialises the maintenance operation.
 MRP_LEDGER_LOCK_KEY = 0x4D52504C444752  # "MRPLDGR"
 MRP_REQUIRED_CAPABILITIES = (
@@ -159,6 +160,8 @@ class FreezeSharedPools:
     stock_initial: Dict[int, float]
     wip: Dict[int, List[WipSupplyLine]]
     supplier: Dict[int, List[Dict[str, Any]]]
+    baseline_at: datetime | None = None
+    physical_import_batch_id: int | None = None
 
 
 @dataclass
@@ -340,6 +343,7 @@ def build_shared_pools(
     wip_relevant_item_ids: Optional[Iterable[int]] = None,
     exclude_wip_product_ids: Optional[Iterable[int]] = None,
     exclude_supplier_order_ids: Optional[Iterable[int]] = None,
+    stock_baseline_at: datetime | None = None,
 ) -> FreezeSharedPools:
     """Build consume-once pools from one exact *candidate* generation only.
 
@@ -350,7 +354,20 @@ def build_shared_pools(
     those are source-system projections, never planning facts.
     """
     relevant_ids = {int(i) for i in (relevant_item_ids or ())}
-    stock = _ledger_stock_by_item_all(db, int(ledger_generation_id))
+    generation = db.get(LedgerGeneration, int(ledger_generation_id))
+    if generation is None:
+        raise LedgerPoolUnavailable(
+            f"ledger_pool_unavailable: generation {ledger_generation_id} is missing"
+        )
+    stock = (
+        _ledger_stock_by_item_at(
+            db,
+            physical_import_batch_id=int(generation.physical_import_batch_id),
+            cutoff=stock_baseline_at,
+        )
+        if stock_baseline_at is not None
+        else _ledger_stock_by_item_all(db, int(ledger_generation_id))
+    )
     stock_initial = dict(stock)
     future_rows = (
         db.query(LedgerFutureSupply)
@@ -398,10 +415,13 @@ def build_shared_pools(
                 order_id=local_id,
                 order_ref1c=str(row.source_ref),
                 product_id=int(row.id),
+                source_line_ref=str(row.source_line_ref),
             ))
         elif row.supply_kind == "supplier_order":
             supplier[item_id].append({
                 "order_ref1c": str(row.source_ref),
+                "source_ref": str(row.source_ref),
+                "source_line_ref": str(row.source_line_ref),
                 "order_id": None,
                 "line_id": int(row.id),
                 "delivery_date": eta or date.min,
@@ -417,7 +437,12 @@ def build_shared_pools(
     for lines in supplier.values():
         lines.sort(key=lambda line: (line["delivery_date"], line["order_ref1c"], line["line_id"]))
     return FreezeSharedPools(
-        stock=stock, stock_initial=stock_initial, wip=dict(wip), supplier=dict(supplier)
+        stock=stock,
+        stock_initial=stock_initial,
+        wip=dict(wip),
+        supplier=dict(supplier),
+        baseline_at=stock_baseline_at,
+        physical_import_batch_id=int(generation.physical_import_batch_id),
     )
 
 
@@ -431,6 +456,40 @@ def _ledger_stock_by_item_all(db: Session, ledger_generation_id: int) -> Dict[in
     return {
         int(item_id): _to_float(qty)
         for item_id, qty in query.group_by(StockBin.item_id).all()
+    }
+
+
+def _ledger_stock_by_item_at(
+    db: Session,
+    *,
+    physical_import_batch_id: int,
+    cutoff: datetime,
+) -> Dict[int, float]:
+    """Signed physical stock at one immutable business-time boundary."""
+    from .item_ledger.physical_visibility import visible_sle_query
+
+    scope = _mrp_warehouse_scope(db)
+    query = visible_sle_query(
+        db,
+        physical_import_batch_id=int(physical_import_batch_id),
+        cutoff=cutoff,
+    ).with_entities(StockLedgerEntry.item_id, func.sum(StockLedgerEntry.qty))
+    if scope.has_warehouse_rows:
+        query = (
+            query.filter(StockLedgerEntry.warehouse_ref1c.in_(scope.selected_refs))
+            if scope.selected_refs
+            else query.filter(False)
+        )
+    if scope.ignored_refs:
+        query = query.filter(~StockLedgerEntry.warehouse_ref1c.in_(scope.ignored_refs))
+    if scope.finished_refs:
+        query = query.filter(~StockLedgerEntry.warehouse_ref1c.in_(scope.finished_refs))
+    query = query.filter(
+        StockLedgerEntry.organization_ref == scope.organization_ref
+    )
+    return {
+        int(item_id): _to_float(qty)
+        for item_id, qty in query.group_by(StockLedgerEntry.item_id).all()
     }
 
 
@@ -509,6 +568,9 @@ def _write_freeze_baseline(
     item_ids: List[int],
     stock_initial: Dict[int, float],
     now: datetime,
+    *,
+    baseline_at: datetime | None,
+    physical_import_batch_id: int | None,
 ) -> int:
     """Frozen supply position per pool for every item with gross > 0.
 
@@ -530,6 +592,8 @@ def _write_freeze_baseline(
                 organization_ref=pk.organization_ref,
                 planning_stock_pool=pk.planning_stock_pool,
                 frozen_at=now,
+                baseline_at=baseline_at,
+                physical_import_batch_id=physical_import_batch_id,
                 stock_qty=_to_float(stock_initial.get(int(iid), 0.0)),
                 # Deprecated diagnostic columns. They must never be populated
                 # from ProductionProduct/SupplierOrderItem legacy counters.
@@ -587,22 +651,27 @@ def _write_freeze_allocation(
             )
             count += 1
 
-        wip_agg: Dict[int, Dict[str, Any]] = {}
+        wip_agg: Dict[Tuple[str, str], Dict[str, Any]] = {}
         for line, used in itrace.wip_allocs:
             if used <= EPS:
                 continue
+            source_ref = str(line.order_ref1c or "").strip()
+            source_line_ref = str(line.source_line_ref or "").strip()
+            if not source_ref or not source_line_ref:
+                raise LedgerPoolUnavailable(
+                    "ledger_pool_unavailable: WIP allocation lacks stable source identity"
+                )
             entry = wip_agg.setdefault(
-                int(line.product_id),
+                (source_ref, source_line_ref),
                 {
-                    "order_ref1c": line.order_ref1c,
-                    "order_id": int(line.order_id),
+                    "source_ref": source_ref,
+                    "source_line_ref": source_line_ref,
                     "used": 0.0,
                     "fact": float(line.fact_at_freeze),
                 },
             )
             entry["used"] += float(used)
-        for product_id, entry in sorted(wip_agg.items()):
-            ref = entry["order_ref1c"] or f"local:{entry['order_id']}"
+        for _identity, entry in sorted(wip_agg.items()):
             db.add(
                 MrpFreezeAllocation(
                     run_id=int(run.run_id),
@@ -613,8 +682,8 @@ def _write_freeze_allocation(
                     organization_ref=pk.organization_ref,
                     planning_stock_pool=pk.planning_stock_pool,
                     source_type="wip_order",
-                    source_ref=str(ref),
-                    source_line_ref=str(product_id),
+                    source_ref=entry["source_ref"],
+                    source_line_ref=entry["source_line_ref"],
                     alloc_qty=float(entry["used"]),
                     fact_at_freeze=float(entry["fact"]),
                     realized_qty=0.0,
@@ -628,25 +697,24 @@ def _write_freeze_allocation(
         for row, used in itrace.supplier_allocs:
             if used <= EPS:
                 continue
-            line_id = row.get("line_id")
-            key = int(line_id) if line_id is not None else id(row)
+            source_ref = str(row.get("source_ref") or row.get("order_ref1c") or "").strip()
+            source_line_ref = str(row.get("source_line_ref") or "").strip()
+            if not source_ref or not source_line_ref:
+                raise LedgerPoolUnavailable(
+                    "ledger_pool_unavailable: supplier allocation lacks stable source identity"
+                )
+            key = (source_ref, source_line_ref)
             entry = sup_agg.setdefault(
                 key,
                 {
-                    "order_ref1c": row.get("order_ref1c"),
-                    "order_id": row.get("order_id"),
+                    "source_ref": source_ref,
+                    "source_line_ref": source_line_ref,
                     "used": 0.0,
                     "fact": _to_float(row.get("fact_at_freeze", 0.0)),
-                    "line_id": line_id,
                 },
             )
             entry["used"] += float(used)
         for _key, entry in sorted(sup_agg.items(), key=lambda kv: str(kv[0])):
-            order_id = entry["order_id"]
-            ref = entry["order_ref1c"] or (
-                f"local:{order_id}" if order_id is not None else "local"
-            )
-            line_ref = entry["line_id"]
             db.add(
                 MrpFreezeAllocation(
                     run_id=int(run.run_id),
@@ -657,8 +725,8 @@ def _write_freeze_allocation(
                     organization_ref=pk.organization_ref,
                     planning_stock_pool=pk.planning_stock_pool,
                     source_type="supplier_order",
-                    source_ref=str(ref),
-                    source_line_ref=str(line_ref if line_ref is not None else _key),
+                    source_ref=entry["source_ref"],
+                    source_line_ref=entry["source_line_ref"],
                     alloc_qty=float(entry["used"]),
                     fact_at_freeze=float(entry["fact"]),
                     realized_qty=0.0,
@@ -825,6 +893,7 @@ def freeze_candidate_snapshots(
         raise LedgerPoolUnavailable("candidate freeze add config is malformed")
 
     manifest_entries: Dict[int, Mapping[str, Any]] = {}
+    retained_entries: List[Mapping[str, Any]] = []
     manifest_plan_ids: Set[int] = set()
     for entry in entries:
         if not isinstance(entry, Mapping):
@@ -832,9 +901,23 @@ def freeze_candidate_snapshots(
         try:
             action = str(entry["action"])
             plan_id = int(entry["plan_id"])
-            candidate_id = int(entry["candidate_run_id"])
         except (KeyError, TypeError, ValueError) as exc:
             raise LedgerPoolUnavailable("candidate freeze obligation_refresh_manifest entry identity is malformed") from exc
+        if action == "retain":
+            if (
+                plan_id <= 0
+                or plan_id in manifest_plan_ids
+                or entry.get("candidate_run_id") is not None
+                or entry.get("parent_run_id") is None
+            ):
+                raise LedgerPoolUnavailable("candidate freeze retain entry is malformed")
+            retained_entries.append(entry)
+            manifest_plan_ids.add(plan_id)
+            continue
+        try:
+            candidate_id = int(entry["candidate_run_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise LedgerPoolUnavailable("candidate freeze candidate identity is malformed") from exc
         if action not in {"refresh", "add"} or plan_id <= 0 or candidate_id <= 0:
             raise LedgerPoolUnavailable("candidate freeze obligation_refresh_manifest contains unsupported action")
         if candidate_id in manifest_entries or plan_id in manifest_plan_ids:
@@ -920,10 +1003,145 @@ def freeze_candidate_snapshots(
         raise LedgerPoolUnavailable("candidate freeze source plan is missing")
 
     relevant_item_ids = _relevant_item_ids_for_plans(db, set(plans))
+    # Frozen obligation stock is the signed physical Ledger balance immediately
+    # before the earliest plan business period starts.  Receipts on/after that
+    # boundary are execution facts, never retroactive netting.
+    baseline_day = min(plan.period_from for plan in plans.values())
+    stock_baseline_at = (
+        datetime.combine(baseline_day, time.min) - timedelta(microseconds=1)
+    )
     pools = build_shared_pools(
         db, requested_ids, ledger_generation_id=target_id,
         relevant_item_ids=relevant_item_ids,
+        stock_baseline_at=stock_baseline_at,
     )
+    retained_run_ids = [
+        int(entry["parent_run_id"])
+        for entry in retained_entries
+    ]
+    if retained_run_ids:
+        # Seniority order for FIFO attribution below: oldest plan first,
+        # the same queue key the execution ledger uses everywhere.
+        retained_run_ids = [
+            int(row.run_id)
+            for row in db.query(PlanningRun)
+            .filter(PlanningRun.run_id.in_(retained_run_ids))
+            .order_by(
+                PlanningRun.period_from.asc(),
+                PlanningRun.period_to.asc(),
+                PlanningRun.run_id.asc(),
+            )
+            .all()
+        ]
+        retained_runs = {
+            int(row.run_id): int(row.active_freeze_version or 0)
+            for row in db.query(PlanningRun).filter(
+                PlanningRun.run_id.in_(retained_run_ids)
+            ).all()
+        }
+        retained_stock = db.query(
+            MrpFreezeAllocation.run_id,
+            MrpFreezeAllocation.item_id,
+            func.sum(MrpFreezeAllocation.alloc_qty),
+        ).filter(
+            MrpFreezeAllocation.run_id.in_(retained_run_ids),
+            MrpFreezeAllocation.source_type == "stock",
+        ).group_by(
+            MrpFreezeAllocation.run_id,
+            MrpFreezeAllocation.item_id,
+        ).all()
+        for run_id, item_id, qty in retained_stock:
+            # Only the immutable active freeze version may reserve the pool.
+            version = retained_runs.get(int(run_id), 0)
+            active_qty = db.query(func.coalesce(func.sum(MrpFreezeAllocation.alloc_qty), 0)).filter(
+                MrpFreezeAllocation.run_id == int(run_id),
+                MrpFreezeAllocation.freeze_version == version,
+                MrpFreezeAllocation.item_id == int(item_id),
+                MrpFreezeAllocation.source_type == "stock",
+            ).scalar()
+            pools.stock[int(item_id)] = (
+                pools.stock.get(int(item_id), 0.0) - _to_float(active_qty)
+            )
+        retained_future = db.query(MrpFreezeAllocation).filter(
+            MrpFreezeAllocation.run_id.in_(retained_run_ids),
+            MrpFreezeAllocation.source_type.in_(("wip_order", "supplier_order")),
+            MrpFreezeAllocation.item_id.in_(relevant_item_ids),
+        ).all()
+        # Oldest plan first: receipts against a shared supply line are
+        # attributed to the senior retained claim before anything is left for
+        # the new candidate (decisions-log §2.5/§2.6 FIFO discipline).
+        retained_order = {
+            int(run_id): index for index, run_id in enumerate(retained_run_ids)
+        }
+        retained_future.sort(key=lambda row: (
+            retained_order.get(int(row.run_id), len(retained_order)), int(row.id)
+        ))
+        for allocation in retained_future:
+            if int(allocation.freeze_version) != retained_runs.get(int(allocation.run_id), 0):
+                continue
+            # MrpFreezeAllocation.realized_qty/evaporated_qty are dead columns
+            # (their writer retired with the legacy execution engine): the live
+            # measure of "how much of this frozen claim is still outstanding"
+            # is the supply line's own ledger remainder (ordered − received).
+            # A claim can therefore never exceed the line remainder — whatever
+            # was received has already realized the senior claim first.
+            retained_qty = _to_float(allocation.alloc_qty)
+            if retained_qty <= EPS:
+                continue
+            item_id = int(allocation.item_id)
+            if str(allocation.planning_stock_pool or DEFAULT_STOCK_POOL) != DEFAULT_STOCK_POOL:
+                raise LedgerPoolUnavailable(
+                    "ledger_pool_unavailable: retained allocation uses unsupported stock pool"
+                )
+            source_ref = str(allocation.source_ref or "").strip()
+            source_line_ref = str(allocation.source_line_ref or "").strip()
+            if not source_ref or not source_line_ref:
+                raise LedgerPoolUnavailable(
+                    "ledger_pool_unavailable: retained future allocation lacks stable source identity"
+                )
+            if allocation.source_type == "wip_order":
+                matches = [
+                    line for line in pools.wip.get(item_id, [])
+                    if str(line.order_ref1c or "") == source_ref
+                    and str(line.source_line_ref or "") == source_line_ref
+                ]
+                remaining_key = "remaining"
+            else:
+                matches = [
+                    line for line in pools.supplier.get(item_id, [])
+                    if str(line.get("source_ref") or line.get("order_ref1c") or "") == source_ref
+                    and str(line.get("source_line_ref") or "") == source_line_ref
+                ]
+                remaining_key = "remaining_qty"
+            if len(matches) > 1:
+                raise LedgerPoolUnavailable(
+                    "ledger_pool_unavailable: retained future allocation source "
+                    f"{allocation.source_type}:{source_ref}:{source_line_ref} "
+                    f"matched {len(matches)} target rows"
+                )
+            if not matches:
+                # The supply line is fully received/closed: the retained claim
+                # is fully realized and there is nothing left to grant the new
+                # candidate from it — no exclusion needed, no double count
+                # possible (an absent line grants nothing to anyone).
+                continue
+            line = matches[0]
+            available = (
+                _to_float(getattr(line, remaining_key))
+                if allocation.source_type == "wip_order"
+                else _to_float(line[remaining_key])
+            )
+            # Clip instead of raise: alloc − received > remainder simply means
+            # part of the claim already arrived (FIFO-attributed to the senior
+            # retained plan); the outstanding claim is capped by the remainder.
+            retained_qty = min(retained_qty, available)
+            if retained_qty <= EPS:
+                continue
+            new_remaining = max(available - retained_qty, 0.0)
+            if allocation.source_type == "wip_order":
+                line.remaining = new_remaining
+            else:
+                line[remaining_key] = new_remaining
     from .period_plan_service import _freeze_one_run
     now = datetime.now(timezone.utc)
     results: List[Dict[str, Any]] = []

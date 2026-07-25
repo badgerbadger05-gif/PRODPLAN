@@ -37,7 +37,6 @@ from app.services.item_ledger.reservation_ledger import (
     redistribute_after_ledger_apply,
     redistribute_pool,
 )
-from app.services.mrp_execution_ledger import _ledger_scope
 from tests.services.test_item_ledger_reservation_lifecycle import (
     FakeODataClient,
     _register_line,
@@ -53,6 +52,15 @@ from tests.services.test_item_ledger_reservation_materialization import (
     _run,
     _sle,
 )
+
+
+def _sle_ids(db):
+    return [
+        int(row_id)
+        for (row_id,) in db.query(models.StockLedgerEntry.id)
+        .filter(models.StockLedgerEntry.active.is_(True))
+        .all()
+    ]
 
 TRANSFER = "Document_ПеремещениеЗапасов"
 RECEIPT = "Document_ПоступлениеТоваровУслуг"
@@ -175,7 +183,9 @@ def test_t1_realize_precedes_redistribute(db_session):
     assert Decimal(str(entry.uncovered_qty)) == Decimal("6")
 
     # т1: realize (6) THEN redistribute → outstanding 4, on_hand 4 → fully covered
-    summary = redistribute_after_ledger_apply(db, [comp.item_id], "t1")
+    summary = redistribute_after_ledger_apply(
+        db, [comp.item_id], "t1", sle_ids=_sle_ids(db)
+    )
     db.refresh(entry)
     assert summary["realized_consume"] == 1
     assert Decimal(str(entry.realized_qty)) == Decimal("6")
@@ -187,7 +197,9 @@ def test_t1_idempotent(db_session):
     """A repeat trigger call adds no events and leaves the caches byte-identical."""
     db = db_session
     comp, req = _pegged_issue_pool(db, reserved=10, on_hand=10, issue_qty=6)
-    redistribute_after_ledger_apply(db, [comp.item_id], "t1")
+    redistribute_after_ledger_apply(
+        db, [comp.item_id], "t1", sle_ids=_sle_ids(db)
+    )
     entry = _entry(db, req, CONSUME)
     db.refresh(entry)
     events_1 = db.query(ReservationEvent).count()
@@ -197,7 +209,9 @@ def test_t1_idempotent(db_session):
         models.ReservationCoverage.pin_kind == "floating"
     ).count()
 
-    redistribute_after_ledger_apply(db, [comp.item_id], "t1-again")
+    redistribute_after_ledger_apply(
+        db, [comp.item_id], "t1-again", sle_ids=_sle_ids(db)
+    )
     db.refresh(entry)
     assert db.query(ReservationEvent).count() == events_1  # no doubled realize
     assert Decimal(str(entry.realized_qty)) == realized_1
@@ -266,7 +280,9 @@ def test_internal_contour_transfer_does_not_realize(db_session):
     _sle(db, comp, qty=5, kind="transfer_in", recorder="MOVE-1",
          recorder_type=TRANSFER, warehouse="wh-B", line_no="2")
 
-    summary = realize_from_sle(db, diagnostic_ledger_scope(db), "cyc")
+    summary = realize_from_sle(
+        db, diagnostic_ledger_scope(db), "cyc", sle_ids=_sle_ids(db)
+    )
     entry = _entry(db, req, CONSUME)
     db.refresh(entry)
     assert summary["internal_transfer"] == 1
@@ -293,7 +309,9 @@ def test_transfer_out_of_contour_realizes(db_session):
     _sle(db, comp, qty=5, kind="transfer_in", recorder="MOVE-2",
          recorder_type=TRANSFER, warehouse="wh-W", line_no="2")
 
-    summary = realize_from_sle(db, diagnostic_ledger_scope(db), "cyc")
+    summary = realize_from_sle(
+        db, diagnostic_ledger_scope(db), "cyc", sle_ids=_sle_ids(db)
+    )
     entry = _entry(db, req, CONSUME)
     db.refresh(entry)
     assert summary["internal_transfer"] == 0
@@ -326,7 +344,9 @@ def _return_setup(db, *, reserved, outbound_qty):
     _pull(db, "DOC-O", order_ref="ORD-1")
     _sle(db, comp, qty=-outbound_qty, kind="assembly_out", recorder="DOC-O",
          warehouse="wh-A", line_no="1")
-    realize_from_sle(db, diagnostic_ledger_scope(db), "outbound")
+    realize_from_sle(
+        db, diagnostic_ledger_scope(db), "outbound", sle_ids=_sle_ids(db)
+    )
 
     # return document: material_issue direction='return', workshop → contour
     ret = _material_issue(db, order, line, direction="return")
@@ -347,7 +367,9 @@ def test_return_decreases_realized_reserve_active(db_session):
     # return 2 of the leftovers back into the contour
     _sle(db, comp, qty=-2, kind="transfer_out", recorder="RET-1",
          recorder_type=TRANSFER, warehouse="wh-W", line_no="1")
-    summary = realize_from_sle(db, diagnostic_ledger_scope(db), "return")
+    summary = realize_from_sle(
+        db, diagnostic_ledger_scope(db), "return", sle_ids=_sle_ids(db)
+    )
 
     db.refresh(entry)
     assert summary["returned_unrealize"] == 1
@@ -371,7 +393,9 @@ def test_return_reopens_closed_reserve(db_session):
 
     _sle(db, comp, qty=-2, kind="transfer_out", recorder="RET-1",
          recorder_type=TRANSFER, warehouse="wh-W", line_no="1")
-    summary = realize_from_sle(db, diagnostic_ledger_scope(db), "return")
+    summary = realize_from_sle(
+        db, diagnostic_ledger_scope(db), "return", sle_ids=_sle_ids(db)
+    )
 
     db.refresh(entry)
     assert summary["returned_unrealize"] == 1
@@ -390,13 +414,17 @@ def test_return_unrealize_capped_and_idempotent(db_session):
     # return MORE than was realized → capped at 6
     _sle(db, comp, qty=-9, kind="transfer_out", recorder="RET-1",
          recorder_type=TRANSFER, warehouse="wh-W", line_no="1")
-    realize_from_sle(db, diagnostic_ledger_scope(db), "return")
+    realize_from_sle(
+        db, diagnostic_ledger_scope(db), "return", sle_ids=_sle_ids(db)
+    )
     entry = _entry(db, req, CONSUME)
     db.refresh(entry)
     assert Decimal(str(entry.realized_qty)) == Decimal("0")  # 6 − min(9, 6)
 
     events_1 = db.query(ReservationEvent).count()
-    realize_from_sle(db, diagnostic_ledger_scope(db), "return-again")
+    realize_from_sle(
+        db, diagnostic_ledger_scope(db), "return-again", sle_ids=_sle_ids(db)
+    )
     db.refresh(entry)
     assert db.query(ReservationEvent).count() == events_1  # no double unrealize
     assert Decimal(str(entry.realized_qty)) == Decimal("0")

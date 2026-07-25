@@ -13,7 +13,6 @@ from app.services.item_ledger.physical import (
     guard_physical_batch_writer,
     physical_sequence_lock_context,
 )
-from app.services.obligation_refresh_orchestrator import ObligationRefreshOrchestrationResult
 
 
 def test_physical_lifecycle_lock_uses_dedicated_connection_across_commits():
@@ -147,7 +146,9 @@ def test_run_physical_refresh_no_work_on_lock_contention(db_session, monkeypatch
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == parent.id
 
 
-def test_run_physical_refresh_processes_fork_import_balance_accept_obligation_in_order(db_session, monkeypatch):
+def test_run_physical_refresh_publishes_accepted_physical_generation_without_refreeze(
+    db_session, monkeypatch
+):
     parent, parent_batch = _accepted_parent(db_session)
     forked_batch = models.PhysicalImportBatch(
         batch_key="forked-physical",
@@ -165,17 +166,7 @@ def test_run_physical_refresh_processes_fork_import_balance_accept_obligation_in
         algorithm_version="ledger-physical-refresh-generation/1",
         replay_version="ledger-physical-refresh-replay/1",
     )
-    published = models.LedgerGeneration(
-        generation_key="published-physical",
-        status="accepted",
-        cutoff=parent.cutoff + timedelta(days=1),
-        source_watermarks={"reason": "test"},
-        physical_import_batch=parent_batch,
-        algorithm_version="ledger-physical-refresh-generation/1",
-        accepted_at=parent.cutoff + timedelta(days=1),
-        capabilities={"physical_ledger": True},
-    )
-    db_session.add_all([forked_batch, physical, published])
+    db_session.add_all([forked_batch, physical])
     db_session.flush()
 
     target_cutoff = parent.cutoff + timedelta(days=1)
@@ -241,17 +232,14 @@ def test_run_physical_refresh_processes_fork_import_balance_accept_obligation_in
         "evaluate_physical_refresh_balance_convergence",
         lambda *args, **kwargs: calls.append("balance") or balance_result,
     )
-    monkeypatch.setattr(
-        workflow,
-        "accept_generation_build",
-        lambda *args, **kwargs: calls.append("accept") or {},
-    )
-    monkeypatch.setattr(
-        workflow,
-        "run_obligation_refresh",
-        lambda *args, **kwargs: calls.append("obligation")
-        or _publish_obligation_refresh(db_session, parent.id, published.id),
-    )
+    def _accept(*_args, **_kwargs):
+        calls.append("accept")
+        physical.status = "accepted"
+        physical.accepted_at = target_cutoff
+        db_session.get(models.PlanningTruthState, 1).current_generation_id = physical.id
+        db_session.flush()
+
+    monkeypatch.setattr(workflow, "accept_generation_build", _accept)
     monkeypatch.setattr(db_session, "commit", _commit)
 
     result = workflow.run_physical_refresh(
@@ -263,30 +251,15 @@ def test_run_physical_refresh_processes_fork_import_balance_accept_obligation_in
         started_by="pytest",
     )
 
-    assert calls == ["fork", "audit", "import", "balance", "accept", "obligation"]
+    assert calls == ["fork", "audit", "import", "balance", "accept"]
     assert commit_calls == ["commit", "commit"]
     assert result.parent_generation_id == parent.id
     assert result.physical_generation_id == physical.id
-    assert result.published_generation_id == published.id
+    assert result.published_generation_id == physical.id
     assert result.cutoff == target_cutoff.replace(tzinfo=timezone.utc)
     assert result.published is True
-    assert result.candidate_run_ids == (11, 12, 13)
-    assert db_session.get(models.PlanningTruthState, 1).current_generation_id == published.id
-
-
-def _publish_obligation_refresh(db_session, parent_id, published_id):
-    state = db_session.get(models.PlanningTruthState, 1)
-    if state is None:
-        state = models.PlanningTruthState(id=1)
-        db_session.add(state)
-    state.current_generation_id = published_id
-    db_session.flush()
-    return ObligationRefreshOrchestrationResult(
-        parent_generation_id=parent_id,
-        target_generation_id=published_id,
-        candidate_run_ids=(11, 12, 13),
-        published=True,
-    )
+    assert result.candidate_run_ids == ()
+    assert db_session.get(models.PlanningTruthState, 1).current_generation_id == physical.id
 
 
 def test_balance_mismatch_stops_before_accept_or_obligation(db_session, monkeypatch):
@@ -355,11 +328,6 @@ def test_balance_mismatch_stops_before_accept_or_obligation(db_session, monkeypa
         "accept_generation_build",
         lambda *args, **kwargs: calls.append("accept") or pytest.fail("accept must not run on mismatch"),
     )
-    monkeypatch.setattr(
-        workflow,
-        "run_obligation_refresh",
-        lambda *args, **kwargs: calls.append("obligation") or pytest.fail("obligation must not run on mismatch"),
-    )
 
     with pytest.raises(
         workflow.PhysicalRefreshOrchestratorError,
@@ -377,7 +345,7 @@ def test_balance_mismatch_stops_before_accept_or_obligation(db_session, monkeypa
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == parent.id
 
 
-def test_final_obligation_exception_rolls_back_intermediate_pointer(db_session, monkeypatch):
+def test_accept_exception_rolls_back_intermediate_pointer(db_session, monkeypatch):
     parent, _ = _accepted_parent(db_session)
     target_cutoff = parent.cutoff + timedelta(days=1)
     calls = []
@@ -445,20 +413,16 @@ def test_final_obligation_exception_rolls_back_intermediate_pointer(db_session, 
         state = db_session.get(models.PlanningTruthState, 1)
         state.current_generation_id = physical.id
         db_session.flush()
-
-    def _obligation(*_args, **_kwargs):
-        calls.append("obligation")
-        raise RuntimeError("obligation publish failed")
+        raise RuntimeError("accept publish failed")
 
     monkeypatch.setattr(workflow, "fork_physical_refresh_generation", lambda *args, **kwargs: calls.append("fork") or fork_result)
     monkeypatch.setattr(workflow, "run_physical_recorder_audit", lambda *args, **kwargs: calls.append("audit") or object())
     monkeypatch.setattr(workflow, "run_historical_physical_import", lambda *args, **kwargs: calls.append("import") or import_result)
     monkeypatch.setattr(workflow, "evaluate_physical_refresh_balance_convergence", lambda *args, **kwargs: calls.append("balance") or balance_result)
     monkeypatch.setattr(workflow, "accept_generation_build", _accept)
-    monkeypatch.setattr(workflow, "run_obligation_refresh", _obligation)
     monkeypatch.setattr(db_session, "commit", _commit)
 
-    with pytest.raises(RuntimeError, match="obligation publish failed"):
+    with pytest.raises(RuntimeError, match="accept publish failed"):
         workflow.run_physical_refresh(
             db_session,
             generation_key="rollback-obligation",
@@ -467,6 +431,6 @@ def test_final_obligation_exception_rolls_back_intermediate_pointer(db_session, 
             balance_snapshot={},
         )
 
-    assert calls == ["fork", "audit", "import", "balance", "accept", "obligation"]
+    assert calls == ["fork", "audit", "import", "balance", "accept"]
     assert commit_calls == ["commit"]
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == parent.id

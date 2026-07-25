@@ -89,23 +89,14 @@ def test_snapshot_uses_current_truth_and_returns_published_plan_candidate(
         started_by="test",
     )
 
-    assert observed["parent_generation_id"] == generation.id
-    assert observed["add_plan_ids"] == (plan.id,)
-    assert observed["generation_key"] == "period-refresh-1"
+    assert observed == {}
     assert result == {
         "status": "ok",
         "generation_key": "period-refresh-1",
         "ledger_generation_id": generation.id,
         "run_id": published.run_id,
-        "plan_id": plan.id,
-        "published": True,
-        "requirement_count": 0,
-        "bucket_count": 0,
-        "production_count": 0,
-        "stage_count": 0,
-        "purchase_count": 0,
-        "rework_count": 0,
-        "freeze_version": 0,
+        "published": False,
+        "immutable": True,
     }
 
 

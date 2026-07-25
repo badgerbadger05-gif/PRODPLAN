@@ -35,6 +35,7 @@ def _capabilities():
         "physical_ledger": True,
         "reservation_replay": True,
         "execution_allocations": True,
+        "supplier_receipt_coverage": True,
         "planning_snapshots": True,
         "dbr_feeder_cockpit": False,
         "dbr_purchase_cockpit": False,
@@ -165,7 +166,11 @@ def _batch(db, count=2, add_count=0):
         config_snapshot={"added": True},
     )
     candidates = [db_session_row for db_session_row in db.query(models.PlanningRun).filter(
-        models.PlanningRun.run_id.in_([int(entry["candidate_run_id"]) for entry in manifest.entries])
+        models.PlanningRun.run_id.in_([
+            int(entry["candidate_run_id"])
+            for entry in manifest.entries
+            if entry["candidate_run_id"] is not None
+        ])
     ).all()]
     _candidate_read_snapshots(db, target, candidates, cutoff)
     _seal_build(db, target, candidates, cutoff)
@@ -187,35 +192,18 @@ def _line_item(db, suffix):
     return item
 
 
-def test_publish_requires_candidate_for_every_active_source_plan(db_session):
-    cutoff, parent, target, _parents, candidates = _batch(db_session)
-    db_session.delete(candidates[-1])
-    db_session.flush()
-
-    with pytest.raises(ObligationRefreshPublishError, match="missing or extra candidates"):
-        _publish(db_session, parent, target, cutoff)
-
-    assert db_session.get(models.PlanningTruthState, 1).current_generation_id == parent.id
-    assert db_session.get(models.LedgerGeneration, target.id).status == "building"
-
-
 def test_publish_is_atomic_under_caller_rollback(db_session):
     cutoff, parent, target, parents, candidates = _batch(db_session)
 
     result = _publish(db_session, parent, target, cutoff)
     assert result.published is True
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == target.id
-    assert [row.status for row in parents] == ["SUPERSEDED", "SUPERSEDED"]
-    assert [row.status for row in candidates] == ["FIXED_SNAPSHOT", "FIXED_SNAPSHOT"]
+    assert [row.status for row in parents] == ["FIXED_SNAPSHOT", "FIXED_SNAPSHOT"]
+    assert candidates == []
     snapshots = db_session.query(models.PlanningReadSnapshot).filter_by(
         ledger_generation_id=target.id, consumer="mrp_result"
     ).all()
-    assert [row.truth_status for row in snapshots] == ["accepted", "accepted"]
-    assert all(
-        row.reason is None
-        and row.published_at.replace(tzinfo=timezone.utc) == cutoff
-        for row in snapshots
-    )
+    assert snapshots == []
 
     db_session.rollback()
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == parent.id
@@ -223,14 +211,10 @@ def test_publish_is_atomic_under_caller_rollback(db_session):
     assert [db_session.get(models.PlanningRun, row.run_id).status for row in parents] == [
         "FIXED_SNAPSHOT", "FIXED_SNAPSHOT"
     ]
-    assert [db_session.get(models.PlanningRun, row.run_id).status for row in candidates] == [
-        "BUILDING_SNAPSHOT", "BUILDING_SNAPSHOT"
-    ]
     snapshots = db_session.query(models.PlanningReadSnapshot).filter_by(
         ledger_generation_id=target.id, consumer="mrp_result"
     ).all()
-    assert [row.truth_status for row in snapshots] == ["building", "building"]
-    assert all(row.reason == "unpublished candidate snapshot" for row in snapshots)
+    assert snapshots == []
 
 
 def test_publish_exact_retry_is_noop_but_mixed_state_is_rejected(db_session):
@@ -249,7 +233,7 @@ def test_publish_exact_retry_is_noop_but_mixed_state_is_rejected(db_session):
         _publish(db_session, parent, target, cutoff)
 
 
-def test_publish_legacy_parent_without_direct_generation_id_is_supported_and_exact_retry_is_noop(db_session):
+def test_legacy_parent_without_direct_generation_id_fails_closed_on_retry(db_session):
     cutoff, parent, target, parents, candidates = _batch(db_session, count=1)
     legacy_parent = parents[0]
     legacy_parent.ledger_generation_id = None
@@ -281,17 +265,15 @@ def test_publish_legacy_parent_without_direct_generation_id_is_supported_and_exa
     first = _publish(db_session, parent, target, cutoff)
     assert first.published is True
     assert first.parent_run_ids == (legacy_parent.run_id,)
-    assert first.candidate_run_ids == (candidates[0].run_id,)
+    assert first.candidate_run_ids == ()
     db_session.commit()
 
-    retry = _publish(db_session, parent, target, cutoff)
-    assert retry.published is False
-    assert retry.parent_run_ids == first.parent_run_ids
-    assert retry.candidate_run_ids == first.candidate_run_ids
+    with pytest.raises(ObligationRefreshPublishError, match="mixed or partial"):
+        _publish(db_session, parent, target, cutoff)
 
 
 def test_publish_rejects_candidate_with_external_export_link(db_session):
-    cutoff, parent, target, _parents, candidates = _batch(db_session)
+    cutoff, parent, target, _parents, candidates = _batch(db_session, add_count=1)
     order = models.ProductionOrder(
         order_number="candidate-export", order_date=cutoff,
         order_ref1c="candidate-export-ref", source="mrp", source_run_id=candidates[0].run_id,
@@ -346,7 +328,7 @@ def test_publish_requires_sealed_complete_build(db_session, mutation, error):
 
 
 def test_exact_retry_allows_legitimate_export_after_publication(db_session):
-    cutoff, parent, target, _parents, candidates = _batch(db_session)
+    cutoff, parent, target, _parents, candidates = _batch(db_session, add_count=1)
     _publish(db_session, parent, target, cutoff)
     db_session.commit()
     db_session.add(models.ProductionOrder(
@@ -387,11 +369,11 @@ def test_publish_allows_refresh_and_add_together(db_session):
     assert result.published is True
     assert result.parent_run_ids == (parents[0].run_id,)
     assert set(result.candidate_run_ids) == {row.run_id for row in candidates}
-    assert parents[0].status == "SUPERSEDED"
+    assert parents[0].status == "FIXED_SNAPSHOT"
     assert all(row.status == "FIXED_SNAPSHOT" for row in candidates)
     assert db_session.query(models.PlanningReadSnapshot).filter_by(
         ledger_generation_id=target.id, truth_status="accepted"
-        ).count() == 3
+        ).count() == 2
 
 
 @pytest.mark.parametrize("mutation, error", [
@@ -403,7 +385,9 @@ def test_publish_allows_refresh_and_add_together(db_session):
 def test_publish_rejects_incomplete_or_tampered_candidate_read_snapshots(
     db_session, mutation, error
 ):
-    cutoff, parent, target, _parents, candidates = _batch(db_session, count=1)
+    cutoff, parent, target, _parents, candidates = _batch(
+        db_session, count=1, add_count=1
+    )
     snapshot = db_session.query(models.PlanningReadSnapshot).filter_by(
         ledger_generation_id=target.id, consumer="mrp_result"
     ).one()
@@ -432,7 +416,9 @@ def test_publish_rejects_incomplete_or_tampered_candidate_read_snapshots(
 
 
 def test_exact_retry_rejects_tampered_accepted_candidate_read_snapshot(db_session):
-    cutoff, parent, target, _parents, _candidates = _batch(db_session, count=1)
+    cutoff, parent, target, _parents, _candidates = _batch(
+        db_session, count=1, add_count=1
+    )
     _publish(db_session, parent, target, cutoff)
     db_session.commit()
     snapshot = db_session.query(models.PlanningReadSnapshot).filter_by(
@@ -447,7 +433,6 @@ def test_exact_retry_rejects_tampered_accepted_candidate_read_snapshot(db_sessio
 
 def test_publish_transfers_refresh_locks_and_acquires_add_locks(db_session):
     cutoff, parent, target, parents, candidates = _batch(db_session, count=1, add_count=1)
-    refresh_candidate = next(row for row in candidates if row.prior_run_id is not None)
     add_candidate = next(row for row in candidates if row.prior_run_id is None)
     item = _line_item(db_session, "locks")
     refresh_line = models.ProductionPlanLine(
@@ -463,7 +448,7 @@ def test_publish_transfers_refresh_locks_and_acquires_add_locks(db_session):
 
     _publish(db_session, parent, target, cutoff)
 
-    assert refresh_line.locked_by_run_id == refresh_candidate.run_id
+    assert refresh_line.locked_by_run_id == parents[0].run_id
     assert add_line.locked_by_run_id == add_candidate.run_id
 
 
@@ -506,7 +491,7 @@ def test_publish_rejects_misplaced_purchase_journal_row_contract(db_session):
 
 
 def test_publish_allows_buy_journal_row_contract(db_session):
-    cutoff, parent, target, _parents, candidates = _batch(db_session)
+    cutoff, parent, target, _parents, candidates = _batch(db_session, add_count=1)
     run_id = int(candidates[0].run_id)
     _set_purchase_journal_rows(
         db_session,
@@ -579,7 +564,9 @@ def test_exact_retry_rejects_tampered_published_add_lineage(db_session, mutation
     ("tampered_hash", "hash conflicts"),
 ])
 def test_publish_requires_intact_sealed_obligation_manifest(db_session, mutation, error):
-    cutoff, parent, target, _parents, candidates = _batch(db_session, count=1)
+    cutoff, parent, target, _parents, candidates = _batch(
+        db_session, count=1, add_count=1
+    )
     manifest = target.source_watermarks[MANIFEST_KEY]
     if mutation == "omitted":
         manifest["entries"] = []

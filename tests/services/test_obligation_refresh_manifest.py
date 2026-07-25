@@ -69,7 +69,7 @@ def _create(db, accepted, target, add_ids=(), **overrides):
     )
 
 
-def test_manifest_refreshes_every_current_plan_and_adds_fixed_plan(db_session):
+def test_manifest_retains_every_current_plan_and_adds_fixed_plan(db_session):
     accepted, target, parents = _fixture(db_session)
     added = models.ProductionPlanHeader(
         name="new fixed", period_from=date(2026, 8, 1), period_to=date(2026, 8, 31), status="fixed",
@@ -82,8 +82,8 @@ def test_manifest_refreshes_every_current_plan_and_adds_fixed_plan(db_session):
     assert result.created is True
     assert [(row["action"], row["plan_id"], row["parent_run_id"])
             for row in result.entries] == [
-        ("refresh", parents[0][0].id, parents[0][1].run_id),
-        ("refresh", parents[1][0].id, parents[1][1].run_id),
+        ("retain", parents[0][0].id, parents[0][1].run_id),
+        ("retain", parents[1][0].id, parents[1][1].run_id),
         ("add", added.id, None),
     ]
     manifest = target.source_watermarks[MANIFEST_KEY]
@@ -91,7 +91,7 @@ def test_manifest_refreshes_every_current_plan_and_adds_fixed_plan(db_session):
     assert manifest["add_request"]["plan_ids"] == [added.id]
     assert {row.source_plan_id for row in db_session.query(models.PlanningRun).filter_by(
         ledger_generation_id=target.id, status="BUILDING_SNAPSHOT"
-    )} == {parents[0][0].id, parents[1][0].id, added.id}
+    )} == {added.id}
 
 
 def test_manifest_allows_first_add_only_and_exact_retry(db_session):
@@ -110,7 +110,7 @@ def test_manifest_allows_first_add_only_and_exact_retry(db_session):
     assert again.entries == first.entries
 
 
-def test_manifest_refreshes_parent_with_null_ledger_generation_via_reservation_lineage(db_session):
+def test_manifest_retains_parent_with_null_ledger_generation_via_reservation_lineage(db_session):
     accepted, target, _parents = _fixture(db_session, plans=0)
     plan = models.ProductionPlanHeader(
         name="legacy parent", period_from=date(2026, 7, 1), period_to=date(2026, 7, 31),
@@ -145,15 +145,15 @@ def test_manifest_refreshes_parent_with_null_ledger_generation_via_reservation_l
 
     result = _create(db_session, accepted, target)
     assert [(row["action"], row["plan_id"], row["parent_run_id"]) for row in result.entries] == [
-        ("refresh", plan.id, parent.run_id),
+        ("retain", plan.id, parent.run_id),
     ]
 
 
 def test_manifest_never_omits_current_plan_and_conflicting_retry_is_rejected(db_session):
     accepted, target, parents = _fixture(db_session)
     result = _create(db_session, accepted, target)
-    refreshed = {row["plan_id"] for row in result.entries if row["action"] == "refresh"}
-    assert refreshed == {plan.id for plan, _run in parents}
+    retained = {row["plan_id"] for row in result.entries if row["action"] == "retain"}
+    assert retained == {plan.id for plan, _run in parents}
     db_session.commit()
 
     with pytest.raises(ObligationRefreshManifestError, match="conflicting retry"):
@@ -171,7 +171,11 @@ def test_manifest_conflicting_add_and_outer_rollback(db_session):
     db_session.add(plan)
     db_session.flush()
     result = _create(db_session, accepted, target, [plan.id])
-    run_ids = [row["candidate_run_id"] for row in result.entries]
+    run_ids = [
+        row["candidate_run_id"]
+        for row in result.entries
+        if row["candidate_run_id"] is not None
+    ]
     db_session.rollback()
 
     assert all(db_session.get(models.PlanningRun, run_id) is None for run_id in run_ids)
@@ -179,18 +183,18 @@ def test_manifest_conflicting_add_and_outer_rollback(db_session):
     assert MANIFEST_KEY not in restored.source_watermarks
 
 
-def test_manifest_retry_rejects_tampered_candidate_set(db_session):
+def test_manifest_retry_rejects_tampered_retained_parent(db_session):
     accepted, target, _parents = _fixture(db_session, plans=1)
     result = _create(db_session, accepted, target)
     db_session.commit()
-    candidate = db_session.get(
-        models.PlanningRun, int(result.entries[0]["candidate_run_id"])
+    parent = db_session.get(
+        models.PlanningRun, int(result.entries[0]["parent_run_id"])
     )
-    candidate.prior_run_id = None
+    parent.status = "SUPERSEDED"
     db_session.flush()
 
     with pytest.raises(
-        ObligationRefreshManifestError, match="candidate lineage conflicts"
+        ObligationRefreshManifestError, match="retain manifest lineage conflicts"
     ):
         _create(db_session, accepted, target)
 
@@ -219,8 +223,8 @@ def test_manifest_ignores_fixed_snapshot_runs_from_other_generation(db_session):
 
     result = _create(db_session, accepted, target)
     assert [(row["action"], row["plan_id"], row["parent_run_id"]) for row in result.entries] == [
-        ("refresh", parents[0][0].id, parents[0][1].run_id),
-        ("refresh", parents[1][0].id, parents[1][1].run_id),
+        ("retain", parents[0][0].id, parents[0][1].run_id),
+        ("retain", parents[1][0].id, parents[1][1].run_id),
     ]
 
 

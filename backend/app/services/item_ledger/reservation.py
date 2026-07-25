@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal
+from datetime import datetime, timezone
 from typing import Iterable, List, Optional, Sequence, Tuple, Union
 
 from sqlalchemy.orm import Session
@@ -97,6 +98,72 @@ def fold_reservation_entry(session: Session, reservation_id: int) -> Reservation
         entry.realized_qty = fold.realized_qty
         session.flush()
     return fold
+
+
+def append_realization_event(
+    session: Session,
+    entry: models.ReservationEntry,
+    *,
+    realized_delta: Number,
+    sle_id: int | None,
+    fact_ref: str,
+    fact_line_ref: str,
+    match_rule: str,
+    cycle_id: str,
+    idempotency_key: str,
+    event_at: datetime | None = None,
+    reserved_delta: Number | None = None,
+    event_kind: str | None = None,
+) -> bool:
+    """Append one idempotent realization fact to the canonical event stream.
+
+    Matching belongs to the caller.  This function is the single persistence
+    boundary shared by MAKE, CONSUME and BUY allocators; the materialized
+    ``ReservationEntry`` cache is rebuilt only by ``fold_reservation_entry``.
+    """
+    generation_id = int(entry.ledger_generation_id)
+    existing = (
+        session.query(models.ReservationEvent.id)
+        .filter(
+            models.ReservationEvent.ledger_generation_id == generation_id,
+            models.ReservationEvent.idempotency_key == str(idempotency_key),
+        )
+        .first()
+    )
+    if existing is not None:
+        return False
+    if reserved_delta is None:
+        reservation_seeded = (
+            session.query(models.ReservationEvent.id)
+            .filter(
+                models.ReservationEvent.ledger_generation_id == generation_id,
+                models.ReservationEvent.reservation_id == int(entry.id),
+            )
+            .first()
+            is not None
+        )
+        reserved_delta = 0 if reservation_seeded else entry.reserved_qty
+    delta = _dec(realized_delta)
+    session.add(models.ReservationEvent(
+        ledger_generation_id=generation_id,
+        reservation_id=int(entry.id),
+        item_id=int(entry.item_id),
+        characteristic_ref=str(entry.characteristic_ref or ""),
+        organization_ref=str(entry.organization_ref or ""),
+        planning_stock_pool=str(entry.planning_stock_pool or "default"),
+        event_kind=event_kind or ("realize" if delta >= 0 else "unrealize"),
+        reserved_delta=_dec(reserved_delta),
+        realized_delta=delta,
+        sle_id=int(sle_id) if sle_id is not None else None,
+        fact_ref=str(fact_ref or ""),
+        fact_line_ref=str(fact_line_ref or ""),
+        match_rule=str(match_rule or ""),
+        cycle_id=str(cycle_id or ""),
+        idempotency_key=str(idempotency_key),
+        event_at=event_at or datetime.now(timezone.utc),
+    ))
+    session.flush()
+    return True
 
 
 # ---------------------------------------------------------------------------

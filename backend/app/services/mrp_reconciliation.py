@@ -73,7 +73,6 @@ from .production_control_journal import (
     dedupe_mrp_production_orders,
 )
 from .production_binding_repair import repair_clean_mrp_bindings
-from .mrp_execution_ledger import run_ledger_cycle
 from .generation_reconciliation import (
     GenerationReconciliationMismatch,
     build_generation_targets,
@@ -951,6 +950,12 @@ def reconcile_snapshot(
     supply to ``desired_outstanding``. Never re-explodes demand, never writes
     ``net_required_qty``. Returns a per-item summary of what was added / trimmed.
     """
+    if diagnostic_legacy:
+        raise ValueError(
+            "diagnostic_legacy reconciliation is retired; "
+            "accepted ReservationEntry truth is the only execution source"
+        )
+
     run = db.query(PlanningRun).filter(PlanningRun.run_id == int(run_id)).one_or_none()
     if run is None:
         raise ValueError(f"run_id={run_id}: прогон не найден")
@@ -1053,17 +1058,6 @@ def reconcile_snapshot(
             "drift_adjust_total": 0.0,
             **repairs,
         }
-
-    # The ledger cycle populates executed_qty + drift_adjustment_qty; run it now
-    # unless the caller (reconcile_all_active) already ran it for the whole scope.
-    if diagnostic_legacy and not ledger_cycle_ran:
-        # Let a ledger-cycle failure propagate. Continuing with the previous
-        # executed_qty cache could create or trim real supply from stale facts.
-        try:
-            run_ledger_cycle(db, diagnostic_legacy=True)
-        except Exception:
-            db.rollback()
-            raise
 
     period_to = run.period_to or max((r.period_to for r in open_reqs), default=date.today())
     own_open_production = _own_open_production_by_item(
@@ -1486,19 +1480,13 @@ def reconcile_all_active(
     dry_run: bool = False,
     diagnostic_legacy: bool = False,
 ) -> Dict[str, Any]:
-    """Reconcile the latest snapshot of every plan whose period is still open.
+    """Reconcile active snapshots from accepted ReservationEntry truth."""
+    if diagnostic_legacy:
+        raise ValueError(
+            "diagnostic_legacy reconciliation is retired; "
+            "accepted ReservationEntry truth is the only execution source"
+        )
 
-    Composite cycle (v2 §6): the execution ledger (verify → executed → drift →
-    drift_adjustment) is rebuilt ONCE for the whole canonical scope BEFORE the
-    per-run sizing loop, so every run sizes against a freshly persisted
-    executed/drift ledger. The scope is re-derived inside run_ledger_cycle (last
-    FIXED_SNAPSHOT per plan, NO period filter, plus CLOSED-with-open-req), so it
-    is not parameterised by ``run_ids`` here.
-    """
-    # 1) Ledger cycle first — persist executed_qty + drift_adjustment_qty for the
-    # scope. On a non-dry run commit it so the per-run sizers read committed
-    # facts; a dry run keeps it in the session and rolls the whole thing back at
-    # the end.
     from .planning_truth import (
         CAPABILITY_EXECUTION_ALLOCATIONS,
         CAPABILITY_PHYSICAL_LEDGER,
@@ -1546,34 +1534,11 @@ def reconcile_all_active(
             "results": [],
         }
 
-    execution_ledger: Dict[str, Any]
-    if diagnostic_legacy:
-        try:
-            execution_ledger = run_ledger_cycle(db, diagnostic_legacy=True)
-            if not dry_run:
-                db.commit()
-        except Exception as exc:  # noqa: BLE001 — diagnostic path remains fail closed
-            db.rollback()
-            return {
-                "status": "blocked",
-                "truth_status": "unavailable",
-                "ledger_generation": truth_state.generation_id,
-                "truth_reason": f"ledger_cycle_failed: {exc}",
-                "dry_run": bool(dry_run),
-                "runs_checked": 0,
-                "production_lines_added": 0,
-                "purchase_lines_added": 0,
-                "purchase_lines_pruned": 0,
-                "production_lines_trimmed": 0,
-                "execution_ledger": {"status": "error", "error": str(exc)},
-                "results": [],
-            }
-    else:
-        execution_ledger = {
-            "status": "accepted",
-            "ledger_generation_id": int(truth_state.generation_id),
-            "source": "reservation_event+mrp_execution_allocation",
-        }
+    execution_ledger: Dict[str, Any] = {
+        "status": "accepted",
+        "ledger_generation_id": int(truth_state.generation_id),
+        "source": "reservation_entry",
+    }
 
     # 2) Per-run drift-correction sizing. The ledger already ran, so pass
     # ledger_cycle_ran=True; on a non-dry run each snapshot owns its own commit,

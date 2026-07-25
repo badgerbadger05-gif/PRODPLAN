@@ -365,6 +365,24 @@ def _persistence_fixture(
     return generation, req
 
 
+def _supplier_event_rows(db, generation_id):
+    rows = (
+        db.query(models.ReservationEvent, models.ReservationEntry)
+        .join(
+            models.ReservationEntry,
+            models.ReservationEntry.id == models.ReservationEvent.reservation_id,
+        )
+        .filter(models.ReservationEvent.ledger_generation_id == generation_id)
+        .order_by(models.ReservationEvent.id)
+        .all()
+    )
+    return [
+        (event, entry)
+        for event, entry in rows
+        if Decimal(event.realized_delta or 0) != 0
+    ]
+
+
 def test_persistence_ignores_legacy_received_qty_and_cross_generation_pin(db_session):
     generation, req = _persistence_fixture(db_session, legacy_received=999)
     result = rebuild_supplier_receipt_coverage(
@@ -375,8 +393,8 @@ def test_persistence_ignores_legacy_received_qty_and_cross_generation_pin(db_ses
     )
     db_session.commit()
     assert result.exact_fact_count == 1
-    rows = db_session.query(models.MrpExecutionAllocation).all()
-    assert [(row.requirement_id, row.allocated_qty) for row in rows] == [
+    rows = _supplier_event_rows(db_session, generation.id)
+    assert [(entry.requirement_id, event.realized_delta) for event, entry in rows] == [
         (req.id, Decimal("3.000"))
     ]
     provenance = db_session.query(
@@ -427,7 +445,7 @@ def test_supplier_line_characteristic_variants_are_ignored_for_exact_matching(
     assert provenance.evidence_payload["characteristic_ref"] == (
         "" if evidence_characteristic is None else evidence_characteristic
     )
-    assert db_session.query(models.MrpExecutionAllocation).one().requirement_id == req.id
+    assert _supplier_event_rows(db_session, generation.id)[0][1].requirement_id == req.id
 
 
 def test_duplicate_order_lines_with_different_characteristics_remain_ambiguous(db_session):
@@ -460,7 +478,6 @@ def test_duplicate_order_lines_with_different_characteristics_remain_ambiguous(d
     assert provenance.match_status == "ambiguous"
     assert provenance.ambiguity_count == 2
     assert result.unplanned_qty == Decimal("0")
-    assert db_session.query(models.MrpExecutionAllocation).count() == 1
 
 
 def test_historical_receipt_falls_back_through_synced_purchase_requirement(
@@ -540,11 +557,10 @@ def test_historical_receipt_falls_back_through_synced_purchase_requirement(
     )
     db_session.commit()
 
-    allocation = db_session.query(models.MrpExecutionAllocation).one()
+    event, entry = _supplier_event_rows(db_session, generation.id)[0]
     assert result.allocation_count == 1
-    assert allocation.requirement_id == req.id
-    assert allocation.allocated_qty == Decimal("3.000")
-    assert allocation.freeze_allocation_id is None
+    assert entry.requirement_id == req.id
+    assert event.realized_delta == Decimal("3.000")
 
 
 def test_live_basis_line_zero_resolves_unique_canonical_order_line(db_session):
@@ -565,7 +581,7 @@ def test_live_basis_line_zero_resolves_unique_canonical_order_line(db_session):
     ).one()
     assert provenance.match_status == "exact"
     assert provenance.supplier_order_line_no == "1"
-    assert db_session.query(models.MrpExecutionAllocation).one().requirement_id == req.id
+    assert _supplier_event_rows(db_session, generation.id)[0][1].requirement_id == req.id
 
 
 def test_duplicate_order_lines_persist_ambiguity_without_allocation(db_session):
@@ -584,7 +600,6 @@ def test_duplicate_order_lines_persist_ambiguity_without_allocation(db_session):
     assert provenance.match_status == "ambiguous"
     assert provenance.ambiguity_count == 2
     assert result.unplanned_qty == Decimal("0")
-    assert db_session.query(models.MrpExecutionAllocation).count() == 1
 
 
 def test_direct_receipt_is_persisted_unmatched_and_counted_unplanned(db_session):
@@ -610,7 +625,6 @@ def test_direct_receipt_is_persisted_unmatched_and_counted_unplanned(db_session)
     assert provenance.match_status == "unmatched"
     assert result.exact_fact_count == 0
     assert result.unplanned_qty == Decimal("0")
-    assert db_session.query(models.MrpExecutionAllocation).count() == 1
 
 
 def test_persistence_rerun_is_idempotent(db_session):
@@ -626,22 +640,20 @@ def test_persistence_rerun_is_idempotent(db_session):
         row.id
         for row in db_session.query(models.StockLedgerSupplierReceiptProvenance).all()
     )
-    allocation_ids_before = sorted(
-        row.id
-        for row in db_session.query(models.MrpExecutionAllocation).all()
-    )
+    event_ids_before = [
+        event.id for event, _entry in _supplier_event_rows(db_session, generation.id)
+    ]
     rebuild_supplier_receipt_coverage(db_session, **kwargs)
     db_session.commit()
     assert sorted(
         row.id
         for row in db_session.query(models.StockLedgerSupplierReceiptProvenance).all()
     ) == provenance_ids_before
-    assert sorted(
-        row.id
-        for row in db_session.query(models.MrpExecutionAllocation).all()
-    ) == allocation_ids_before
+    assert [
+        event.id for event, _entry in _supplier_event_rows(db_session, generation.id)
+    ] == event_ids_before
     assert db_session.query(models.StockLedgerSupplierReceiptProvenance).count() == 1
-    assert db_session.query(models.MrpExecutionAllocation).count() == 1
+    assert len(_supplier_event_rows(db_session, generation.id)) == 1
 
 
 def test_accepted_generation_rejects_mutation(db_session):
@@ -704,11 +716,12 @@ def test_correction_of_multi_sle_receipt_aggregates_negative_pin_row(db_session)
         cycle_id="test",
     )
     db_session.commit()
-    rows = db_session.query(models.MrpExecutionAllocation).order_by(
-        models.MrpExecutionAllocation.allocated_qty
-    ).all()
+    rows = sorted(
+        (event for event, _entry in _supplier_event_rows(db_session, generation.id)),
+        key=lambda event: event.realized_delta,
+    )
     assert result.allocation_count == 3
-    assert [row.allocated_qty for row in rows] == [
+    assert [row.realized_delta for row in rows] == [
         Decimal("-4.000"), Decimal("2.000"), Decimal("3.000")
     ]
     correction_rows = db_session.query(

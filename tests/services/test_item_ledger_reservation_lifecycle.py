@@ -42,12 +42,9 @@ from app.services.item_ledger.reservation_ledger import (
     run_reservation_shadow,
     unrealize_replaced_sle,
 )
-from app.services.mrp_execution_ledger import (
-    _ledger_scope,
-    apply_run_closure,
-)
 from app.services.mrp_reconciliation import force_close_run, reopen_run
 from tests.services.test_item_ledger_reservation_materialization import (
+    _all_sle_ids,
     diagnostic_ledger_scope,
     _entry,
     _item,
@@ -149,7 +146,7 @@ def test_repull_same_recorder_does_not_double_realized(db_session):
         db, ASSEMBLY, "DOC-G", client=client,
         ledger_generation_id=generation_id,
     )
-    realize_from_sle(db, diagnostic_ledger_scope(db), "cyc")
+    realize_from_sle(db, diagnostic_ledger_scope(db), "cyc", sle_ids=_all_sle_ids(db))
 
     entry = _entry(db, req, CONSUME)
     db.refresh(entry)
@@ -182,7 +179,7 @@ def test_repull_same_recorder_does_not_double_realized(db_session):
 
     # the explicit re-match is now a no-op (т1 already applied it in the pull) —
     # still realized 4, never 8.
-    realize_from_sle(db, diagnostic_ledger_scope(db), "cyc2")
+    realize_from_sle(db, diagnostic_ledger_scope(db), "cyc2", sle_ids=_all_sle_ids(db))
     db.refresh(entry)
     assert Decimal(str(entry.realized_qty)) == Decimal("4")
     assert entry.lifecycle_status == "closed"
@@ -201,7 +198,7 @@ def test_repull_changed_qty_lands_on_new_document_qty(db_session):
         db, ASSEMBLY, "DOC-G", client=client4,
         ledger_generation_id=generation_id,
     )
-    realize_from_sle(db, diagnostic_ledger_scope(db), "cyc")
+    realize_from_sle(db, diagnostic_ledger_scope(db), "cyc", sle_ids=_all_sle_ids(db))
 
     client3 = FakeODataClient(
         {"DOC-G": [_register_line("1", "Expense", "ref-comp", "wh-1", 3)]}
@@ -211,7 +208,7 @@ def test_repull_changed_qty_lands_on_new_document_qty(db_session):
         db, ASSEMBLY, "DOC-G", client=client3,
         ledger_generation_id=generation_id,
     )
-    realize_from_sle(db, diagnostic_ledger_scope(db), "cyc2")
+    realize_from_sle(db, diagnostic_ledger_scope(db), "cyc2", sle_ids=_all_sle_ids(db))
 
     entry = _entry(db, req, CONSUME)
     db.refresh(entry)
@@ -231,7 +228,7 @@ def test_unrealize_replaced_sle_idempotent(db_session):
     _order(db, "ORD-U", run=run)
     _pull(db, "DOC-U", order_ref="ORD-U")
     sle = _sle(db, comp, qty=-4, kind="assembly_out", recorder="DOC-U")
-    realize_from_sle(db, diagnostic_ledger_scope(db), "cyc")
+    realize_from_sle(db, diagnostic_ledger_scope(db), "cyc", sle_ids=_all_sle_ids(db))
 
     assert unrealize_replaced_sle(db, [sle.id], "DOC-U") == 1
     assert unrealize_replaced_sle(db, [sle.id], "DOC-U") == 0
@@ -285,27 +282,6 @@ def test_release_run_reservations_drops_reserved_soft(db_session):
     # idempotent: repeat call finds no active entries
     assert release_run_reservations(db, [run.run_id], "cyc") == 0
     assert _kinds(db, entry).count("release") == 1
-
-
-def test_apply_run_closure_releases_reservations(db_session):
-    """Auto-closure by execution releases the run's reservations."""
-    db = db_session
-    run = _run(db, date(2026, 7, 1), date(2026, 7, 15))
-    comp = _item(db, "COMP", produced=False)
-    req = _req(db, run, comp, gross=5, net=5, bom_level=1)
-    req.executed_qty = 5.0  # deficit executed in full
-    materialize_reservations(db, [req], {run.run_id: run}, "cyc")
-
-    scope = diagnostic_ledger_scope(db)
-    closed = apply_run_closure(db, scope, cycle_id="cyc")
-    assert closed == [run.run_id]
-
-    entry = _entry(db, req, CONSUME)
-    db.refresh(entry)
-    assert entry.lifecycle_status == "released"
-    assert item_ledger_position(db, [comp.item_id])[comp.item_id][
-        "reserved_soft"
-    ] == pytest.approx(0.0)
 
 
 def test_release_and_reopen_purchase_has_buy_and_consume_modes(db_session):
@@ -461,7 +437,9 @@ def test_late_realization_of_released_reserve_is_unplanned(db_session):
     release_run_reservations(db, [run.run_id], "cyc")
 
     _sle(db, comp, qty=-4, kind="assembly_out", recorder="DOC-L")
-    summary = realize_from_sle(db, diagnostic_ledger_scope(db), "cyc2")
+    summary = realize_from_sle(
+        db, diagnostic_ledger_scope(db), "cyc2", sle_ids=_all_sle_ids(db)
+    )
     assert summary["realized_consume"] == 0
     assert summary["unplanned_consumption"] == 1
     entry = _entry(db, req, CONSUME)
@@ -515,7 +493,7 @@ def test_refreeze_cancel_keeps_realized_history(db_session):
     _order(db, "ORD-C", run=run)
     _pull(db, "DOC-C", order_ref="ORD-C")
     _sle(db, comp, qty=-2, kind="assembly_out", recorder="DOC-C")
-    realize_from_sle(db, diagnostic_ledger_scope(db), "cyc")
+    realize_from_sle(db, diagnostic_ledger_scope(db), "cyc", sle_ids=_all_sle_ids(db))
 
     req.total_required_qty = 0.0
     req.net_required_qty = 0.0

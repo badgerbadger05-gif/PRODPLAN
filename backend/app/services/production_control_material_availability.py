@@ -432,8 +432,7 @@ def preview_materials(db: Session, product_id: int, *, refresh_state: bool = Fal
 
     Per-component fields:
       required_qty   вЂ” needed for this order line
-      available_qty  вЂ” items.stock_qty minus open material-issue reservations,
-                       clamped to >=0
+      available_qty  вЂ” signed stock minus open material-issue reservations
       missing_qty    вЂ” max(0, required - available)
       coverage       вЂ” 'ok' | 'partial' | 'shortage'
       eta_dates      вЂ” chronological list of {source, date, qty, ref} from
@@ -508,7 +507,7 @@ def preview_materials(db: Session, product_id: int, *, refresh_state: bool = Fal
         raw_stock = stock_by_item.get(iid, 0.0)
         reserved = reservations.get(iid, 0.0)
         own_reserved = own_reservation.total(iid)
-        available = max(0.0, raw_stock - reserved - own_reserved)
+        available = raw_stock - reserved - own_reserved
         own_at_workshop = own_reservation.at_workshop.get(iid, 0.0)
         own_in_transit = own_reservation.in_transit.get(iid, 0.0)
         covering = own_at_workshop if require_reserved_at_workshop else available + own_reserved

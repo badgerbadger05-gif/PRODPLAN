@@ -75,7 +75,8 @@ def test_add_only_builds_real_checkpoints_and_promotes_persisted_read_snapshot(d
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == target.id
     assert target.capabilities == {
         "physical_ledger": True, "reservation_replay": True,
-        "execution_allocations": True, "planning_snapshots": True,
+        "execution_allocations": True, "supplier_receipt_coverage": True,
+        "planning_snapshots": True,
         "dbr_feeder_cockpit": False,
         "dbr_purchase_cockpit": False,
         "purchase_control_journal": True,
@@ -95,6 +96,21 @@ def test_add_only_builds_real_checkpoints_and_promotes_persisted_read_snapshot(d
         ledger_generation_id=target.id, consumer="period_plan_execution").all()
     assert len(execution_snapshots) == 1
     assert all(row.truth_status == "accepted" for row in execution_snapshots)
+
+
+def test_add_plans_with_mixed_periods_fail_closed(db_session):
+    accepted, plan, _line, _item, _old, _cutoff = _world(db_session, with_parent=False)
+    other = models.ProductionPlanHeader(
+        name="orchestrator plan sep", status="fixed",
+        period_from=date(2026, 9, 1), period_to=date(2026, 9, 30),
+    )
+    db_session.add(other)
+    db_session.commit()
+    with pytest.raises(
+        workflow.ObligationRefreshOrchestratorError,
+        match="different period_from",
+    ):
+        _run(db_session, accepted, "orch-mixed", add=[plan.id, other.id])
 
 
 def test_configured_dbr_policy_and_cockpit_publish_atomically(db_session):
@@ -193,8 +209,16 @@ def test_configured_dbr_policy_and_cockpit_publish_atomically(db_session):
         )
 
 
-def test_refresh_plus_add_publishes_both_and_supersedes_only_parent(db_session):
+def test_add_retains_existing_fixed_obligation_without_refreeze(db_session):
     accepted, plan, _line, _item, old, _cutoff = _world(db_session)
+    old_run_id = int(old.run_id)
+    old_freeze_version = old.active_freeze_version
+    old_requirements = [
+        (int(row.id), Decimal(row.net_required_qty))
+        for row in db_session.query(models.MrpRequirement)
+        .filter_by(run_id=old_run_id)
+        .order_by(models.MrpRequirement.id)
+    ]
     extra = models.ProductionPlanHeader(name="new", status="fixed",
         period_from=date(2026, 9, 1), period_to=date(2026, 9, 30))
     db_session.add(extra); db_session.flush()
@@ -206,29 +230,17 @@ def test_refresh_plus_add_publishes_both_and_supersedes_only_parent(db_session):
     result = _run(db_session, accepted, "orch-refresh-add", add=[extra.id], config={"add": 1})
     rows = db_session.query(models.PlanningRun).filter(
         models.PlanningRun.run_id.in_(result.candidate_run_ids)).all()
-    assert old.status == "SUPERSEDED"
-    assert {row.source_plan_id for row in rows} == {plan.id, extra.id}
+    assert old.status == "FIXED_SNAPSHOT"
+    assert old.run_id == old_run_id
+    assert old.active_freeze_version == old_freeze_version
+    assert [
+        (int(row.id), Decimal(row.net_required_qty))
+        for row in db_session.query(models.MrpRequirement)
+        .filter_by(run_id=old_run_id)
+        .order_by(models.MrpRequirement.id)
+    ] == old_requirements
+    assert {row.source_plan_id for row in rows} == {extra.id}
     assert all(row.status == "FIXED_SNAPSHOT" and row.pinned for row in rows)
-
-
-def test_candidate_replay_applies_fifo_fact_to_candidate_reservation(db_session):
-    accepted, _plan, _line, item, _old, cutoff = _world(
-        db_session, qty=5, replenishment_method="Производство", period_from=date(2026, 7, 1)
-    )
-    physical = accepted.physical_import_batch
-    db_session.add(models.StockLedgerEntry(
-        ingest_batch_id=physical.id, source_content_hash="f" * 64, item_id=item.item_id,
-        characteristic_ref="", organization_ref=DEFAULT_ORGANIZATION_REF1C, warehouse_ref1c="WH-OUT", qty=Decimal("5"),
-        posting_at=datetime(2026, 7, 2, tzinfo=timezone.utc), record_type="receipt",
-        movement_kind="assembly_in", recorder_type="Production", recorder_ref="FIFO", line_no="1",
-    ))
-    db_session.commit()
-    result = _run(db_session, accepted, "orch-fifo")
-    entry = db_session.query(models.ReservationEntry).filter_by(
-        ledger_generation_id=result.target_generation_id).one()
-    assert Decimal(str(entry.realized_qty)) == Decimal("5")
-    assert db_session.query(models.MrpExecutionAllocation).filter_by(
-        ledger_generation_id=result.target_generation_id).count() == 1
 
 
 def test_failure_after_freeze_is_reversible_by_outer_transaction(db_session, monkeypatch):

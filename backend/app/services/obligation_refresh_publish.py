@@ -63,6 +63,7 @@ _REQUIRED_PUBLISHED_CAPABILITIES = frozenset({
     "physical_ledger",
     "reservation_replay",
     "execution_allocations",
+    "supplier_receipt_coverage",
     "planning_snapshots",
 })
 
@@ -110,7 +111,11 @@ def _require_manifest(
     parents: list[models.PlanningRun],
     candidates: list[models.PlanningRun],
     candidate_status: str,
-) -> tuple[list[tuple[models.PlanningRun, models.PlanningRun]], list[models.PlanningRun]]:
+) -> tuple[
+    list[tuple[models.PlanningRun, models.PlanningRun]],
+    list[models.PlanningRun],
+    list[models.PlanningRun],
+]:
     """Validate the sealed refresh/add set against the actual run rows.
 
     The source-watermark manifest is the batch boundary.  In particular, a
@@ -140,18 +145,46 @@ def _require_manifest(
     declared_plans: set[int] = set()
     refreshes: list[tuple[models.PlanningRun, models.PlanningRun]] = []
     additions: list[models.PlanningRun] = []
+    retained: list[models.PlanningRun] = []
     for entry in entries:
         if not isinstance(entry, dict):
             raise ObligationRefreshPublishError("obligation_refresh_manifest entry is malformed")
         try:
             action = str(entry["action"])
             plan_id = int(entry["plan_id"])
-            candidate_id = int(entry["candidate_run_id"])
         except (KeyError, TypeError, ValueError) as exc:
             raise ObligationRefreshPublishError("obligation_refresh_manifest entry identity is malformed") from exc
-        if action not in {"refresh", "add"} or plan_id <= 0:
+        if action not in {"refresh", "add", "retain"} or plan_id <= 0:
             raise ObligationRefreshPublishError("obligation_refresh_manifest contains unsupported action")
-        if candidate_id in declared_candidate_ids or plan_id in declared_plans:
+        if plan_id in declared_plans:
+            raise ObligationRefreshPublishError("obligation_refresh_manifest has duplicate candidate or plan")
+        declared_plans.add(plan_id)
+        if action == "retain":
+            try:
+                parent_id = int(entry["parent_run_id"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ObligationRefreshPublishError(
+                    "retain manifest entry lacks parent run"
+                ) from exc
+            parent = parent_by_id.get(parent_id)
+            if (
+                entry.get("candidate_run_id") is not None
+                or parent is None
+                or parent_by_plan.get(plan_id) is not parent
+                or str(parent.status) != "FIXED_SNAPSHOT"
+            ):
+                raise ObligationRefreshPublishError(
+                    "retain manifest omits or changes current parent"
+                )
+            retained.append(parent)
+            continue
+        try:
+            candidate_id = int(entry["candidate_run_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ObligationRefreshPublishError(
+                "obligation_refresh_manifest candidate identity is malformed"
+            ) from exc
+        if candidate_id in declared_candidate_ids:
             raise ObligationRefreshPublishError("obligation_refresh_manifest has duplicate candidate or plan")
         candidate = candidate_by_id.get(candidate_id)
         if (
@@ -162,7 +195,6 @@ def _require_manifest(
         ):
             raise ObligationRefreshPublishError("obligation_refresh_manifest has missing or extra candidates")
         declared_candidate_ids.add(candidate_id)
-        declared_plans.add(plan_id)
 
         if action == "refresh":
             try:
@@ -205,7 +237,10 @@ def _require_manifest(
 
     if declared_candidate_ids != set(candidate_by_id):
         raise ObligationRefreshPublishError("obligation_refresh_manifest has missing or extra candidates")
-    if {int(parent.run_id) for parent, _candidate in refreshes} != set(parent_by_id):
+    covered_parent_ids = {
+        int(parent.run_id) for parent, _candidate in refreshes
+    } | {int(parent.run_id) for parent in retained}
+    if covered_parent_ids != set(parent_by_id):
         raise ObligationRefreshPublishError("obligation_refresh_manifest omits or adds refresh parents")
 
     try:
@@ -240,7 +275,7 @@ def _require_manifest(
             or candidate.config_snapshot != add_request["config_snapshot"]
         ):
             raise ObligationRefreshPublishError("add candidate config conflicts with manifest")
-    return refreshes, additions
+    return refreshes, additions, retained
 
 
 def _source_export_links_exist(db: Session, candidate_ids: list[int]) -> bool:
@@ -625,29 +660,50 @@ def _exact_retry(
         or dict(target.source_watermarks or {}).get("parent_generation_id") != int(parent.id)
     ):
         return None
-    candidates = _lock(db.query(models.PlanningRun)).filter(
-        models.PlanningRun.ledger_generation_id == int(target.id),
-        models.PlanningRun.status == "FIXED_SNAPSHOT",
-    ).all()
-    if not candidates:
+    manifest = dict(target.source_watermarks or {}).get(MANIFEST_KEY)
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("entries"), list):
         return None
-    parent_ids = [int(row.prior_run_id) for row in candidates if row.prior_run_id is not None]
+    candidate_manifest_ids: list[int] = []
+    parent_ids: list[int] = []
+    for entry in manifest["entries"]:
+        if not isinstance(entry, dict):
+            return None
+        try:
+            if entry.get("action") == "retain":
+                parent_ids.append(int(entry["parent_run_id"]))
+            else:
+                candidate_manifest_ids.append(int(entry["candidate_run_id"]))
+        except (KeyError, TypeError, ValueError):
+            return None
+    candidates = (
+        _lock(db.query(models.PlanningRun))
+        .filter(
+            models.PlanningRun.run_id.in_(candidate_manifest_ids),
+            models.PlanningRun.ledger_generation_id == int(target.id),
+            models.PlanningRun.status == "FIXED_SNAPSHOT",
+        )
+        .all()
+        if candidate_manifest_ids
+        else []
+    )
+    if {int(row.run_id) for row in candidates} != set(candidate_manifest_ids):
+        return None
+    parent_ids.extend(
+        int(row.prior_run_id)
+        for row in candidates
+        if row.prior_run_id is not None
+    )
+    parent_ids = sorted(set(parent_ids))
     if parent_ids:
         superseded = _lock(db.query(models.PlanningRun)).filter(
             models.PlanningRun.run_id.in_(parent_ids),
-            models.PlanningRun.status == "SUPERSEDED",
             models.PlanningRun.source_plan_id.isnot(None),
         ).all()
-        parents = [
-            row for row in superseded
-            if _resolve_parent_generation_id(
-                db, row, current_generation_id=int(parent.id)
-            ) == int(parent.id)
-        ]
+        parents = superseded
     else:
         parents = []
     try:
-        refreshes, additions = _require_manifest(
+        refreshes, additions, retained = _require_manifest(
             db, target=target, parents=parents, candidates=candidates,
             candidate_status="FIXED_SNAPSHOT",
         )
@@ -752,7 +808,10 @@ def _exact_retry(
             return None
     return ObligationRefreshPublishResult(
         parent_generation_id=int(parent.id), target_generation_id=int(target.id),
-        parent_run_ids=tuple(sorted(int(row.run_id) for row, _candidate in refreshes)),
+        parent_run_ids=tuple(sorted(
+            [int(row.run_id) for row, _candidate in refreshes]
+            + [int(row.run_id) for row in retained]
+        )),
         candidate_run_ids=tuple(sorted(candidate_ids)), published=False,
     )
 
@@ -808,7 +867,7 @@ def publish_obligation_refresh_batch(
         models.PlanningRun.ledger_generation_id == int(target.id),
         models.PlanningRun.status == "BUILDING_SNAPSHOT",
     ).all()
-    refreshes, additions = _require_manifest(
+    refreshes, additions, retained = _require_manifest(
         db, target=target, parents=parents, candidates=candidates,
         candidate_status="BUILDING_SNAPSHOT",
     )
@@ -910,6 +969,11 @@ def publish_obligation_refresh_batch(
     target.accepted_at = accepted_at
     target.capabilities = capability_snapshot
     pointer.current_generation_id = int(target.id)
+    for retained_run in retained:
+        # The frozen obligation rows stay untouched; only the run's accepted
+        # truth projection advances to the new generation.
+        retained_run.ledger_generation_id = int(target.id)
+        retained_run.ledger_cutoff = target.cutoff
     for parent_run, candidate in refreshes:
         parent_run.status = "SUPERSEDED"
         candidate.status = "FIXED_SNAPSHOT"
@@ -928,6 +992,9 @@ def publish_obligation_refresh_batch(
     db.flush()
     return ObligationRefreshPublishResult(
         parent_generation_id=int(parent.id), target_generation_id=int(target.id),
-        parent_run_ids=tuple(int(row.run_id) for row, _candidate in refreshes),
+        parent_run_ids=tuple(sorted(
+            [int(row.run_id) for row, _candidate in refreshes]
+            + [int(row.run_id) for row in retained]
+        )),
         candidate_run_ids=tuple(candidate_ids), published=True,
     )

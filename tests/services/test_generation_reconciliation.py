@@ -198,20 +198,16 @@ def test_two_generations_are_isolated_and_accepted_rows_remain_unchanged(db_sess
     assert first[2].id not in {key[0] for key in target}
 
 
-def test_allocation_mismatch_fails_closed(db_session):
-    generation, run, requirement, _reservation = _scope(
+def test_reservation_cache_mismatch_fails_closed(db_session):
+    generation, run, _requirement, reservation = _scope(
         db_session, "bad", mode="consume", reserved="9", realized="4", uncovered="2"
     )
-    allocation = db_session.query(models.MrpExecutionAllocation).filter_by(
-        ledger_generation_id=generation.id,
-        requirement_id=requirement.id,
-    ).one()
-    allocation.allocated_qty = Decimal("3")
+    reservation.realized_qty = Decimal("3")
     db_session.flush()
     before_products = db_session.query(models.ProductionProduct).count()
     before_purchases = db_session.query(models.PlannedPurchase).count()
 
-    with pytest.raises(GenerationReconciliationMismatch, match="allocation=3"):
+    with pytest.raises(GenerationReconciliationMismatch, match="cache does not equal"):
         build_generation_targets(
             db_session, ledger_generation_id=generation.id, run_id=run.run_id
         )

@@ -8,16 +8,13 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models import (
     LedgerBuildBatch,
     LedgerGeneration,
-    MrpExecutionAllocation,
     MrpRequirementBucket,
     ReservationEntry,
-    ReservationEvent,
     StockLedgerEntry,
 )
 from app import models
@@ -26,6 +23,7 @@ from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 from .historical_replay_core import Fact, Reserve, allocate_historical_facts
 from .physical_visibility import visible_sles_for_generation
 from .reconcile import contour_warehouse_refs
+from .reservation import append_realization_event, fold_reservation_entry
 
 
 _ALGORITHM_VERSION = "historical-replay-persistence/1"
@@ -86,38 +84,6 @@ def _replay_lower_bound(
         if value is not None:
             return value
     raise ValueError("historical replay requires explicit replay_from lower bound")
-
-
-def _legacy_unphased_requirement_ids(
-    db: Session, generation_id: int
-) -> set[int]:
-    batch = (
-        db.query(LedgerBuildBatch)
-        .filter(
-            LedgerBuildBatch.ledger_generation_id == generation_id,
-            LedgerBuildBatch.stage == "reservation_materialize",
-            LedgerBuildBatch.status == "completed",
-        )
-        .one_or_none()
-    )
-    if batch is None or not isinstance(batch.metrics, dict):
-        return set()
-    legacy_net_phasing_requirement_ids = batch.metrics.get(
-        "legacy_net_phasing_requirement_ids"
-    )
-    if legacy_net_phasing_requirement_ids is None:
-        return set()
-    if not isinstance(legacy_net_phasing_requirement_ids, (list, tuple)):
-        raise ValueError("legacy reservation batch has malformed legacy_net_phasing_requirement_ids")
-    ids: set[int] = set()
-    for value in legacy_net_phasing_requirement_ids:
-        try:
-            ids.add(int(value))
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "legacy reservation batch legacy_net_phasing_requirement_ids must contain integer ids"
-            ) from exc
-    return ids
 
 
 def _identity_for_sle(
@@ -188,6 +154,7 @@ def run_historical_replay(
     ledger_generation_id: int,
     *,
     replay_from: datetime | None = None,
+    run_ids: tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
     """Replay one explicit BUILDING generation and persist only scoped output."""
     generation = db.get(LedgerGeneration, int(ledger_generation_id))
@@ -201,29 +168,19 @@ def run_historical_replay(
         raise ValueError("historical replay requires physical_import_batch_id")
     lower_bound = _replay_lower_bound(generation, replay_from)
 
-    entries = (
-        db.query(ReservationEntry)
-        .filter(
-            ReservationEntry.ledger_generation_id == generation.id,
-            ReservationEntry.lifecycle_status == "active",
+    entries_query = db.query(ReservationEntry).filter(
+        ReservationEntry.ledger_generation_id == generation.id,
+        ReservationEntry.lifecycle_status == "active",
+    )
+    if run_ids is not None:
+        scoped_ids = tuple(sorted({int(value) for value in run_ids}))
+        entries_query = (
+            entries_query.filter(ReservationEntry.run_id.in_(scoped_ids))
+            if scoped_ids
+            else entries_query.filter(False)
         )
-        .order_by(ReservationEntry.id.asc())
-        .all()
-    )
+    entries = entries_query.order_by(ReservationEntry.id.asc()).all()
     requirement_ids = [int(row.requirement_id) for row in entries]
-    legacy_unphased_requirement_ids = _legacy_unphased_requirement_ids(
-        db, int(generation.id)
-    )
-    legacy_unphased_requirement_ids = {
-        requirement_id
-        for requirement_id in legacy_unphased_requirement_ids
-        if requirement_id
-        in {
-            int(entry.requirement_id)
-            for entry in entries
-            if str(entry.realization_mode).lower() == "make"
-        }
-    }
     buckets_by_requirement: dict[int, list[MrpRequirementBucket]] = {}
     if requirement_ids:
         for bucket in (
@@ -324,7 +281,6 @@ def run_historical_replay(
     excluded_make_qty = Decimal("0")
     excluded_make_samples: list[dict[str, str | int]] = []
     sle_by_core_id: dict[str, StockLedgerEntry] = {}
-    identity_by_core_id: dict[str, tuple[int | None, str | None]] = {}
     mode_has_pools = set(
         (item_id, mode) for item_id, _org, mode in pools_by_key.keys()
     )
@@ -392,152 +348,30 @@ def run_historical_replay(
             order_ref=order_ref,
         ))
         sle_by_core_id[core_id] = row
-        identity_by_core_id[core_id] = (requirement_id, order_ref)
 
     result = allocate_historical_facts(facts, reserves)
     cycle_id = f"historical-replay:g{generation.id}"
     inserted_events = 0
-    inserted_allocations = 0
-    bucket_used: dict[tuple[int, str], Decimal] = {}
     allocation_rows_for_checksum: list[dict[str, Any]] = []
     for allocation in result.allocations:
         entry = entry_by_core_id[allocation.reserve_id]
         sle = sle_by_core_id[allocation.fact_id]
         idempotency_key = f"hist:g{generation.id}:sle{sle.id}:r{entry.id}"
         mode = _fact_mode(sle)
-        event = (
-            db.query(ReservationEvent)
-            .filter(
-                ReservationEvent.ledger_generation_id == generation.id,
-                ReservationEvent.idempotency_key == idempotency_key,
-            )
-            .one_or_none()
-        )
-        if event is None:
-            event = ReservationEvent(
-                ledger_generation_id=generation.id,
-                reservation_id=entry.id,
-                item_id=entry.item_id,
-                characteristic_ref=entry.characteristic_ref,
-                organization_ref=entry.organization_ref,
-                planning_stock_pool=entry.planning_stock_pool,
-                event_kind="realize",
-                reserved_delta=Decimal("0"),
-                realized_delta=allocation.qty,
-                sle_id=sle.id,
-                fact_ref=str(sle.recorder_ref or f"sle:{sle.id}"),
-                fact_line_ref=str(sle.line_no or ""),
-                match_rule="fifo" if allocation.match_rule == "fifo" else "pegged",
-                cycle_id=cycle_id,
-                idempotency_key=idempotency_key,
-                event_at=sle.posting_at,
-            )
-            db.add(event)
+        if append_realization_event(
+            db,
+            entry,
+            realized_delta=allocation.qty,
+            sle_id=int(sle.id),
+            fact_ref=str(sle.recorder_ref or f"sle:{sle.id}"),
+            fact_line_ref=str(sle.line_no or ""),
+            match_rule="fifo" if allocation.match_rule == "fifo" else "pegged",
+            cycle_id=cycle_id,
+            idempotency_key=idempotency_key,
+            event_at=sle.posting_at,
+        ):
             inserted_events += 1
 
-        fact_ref = str(sle.recorder_ref or f"sle:{sle.id}")
-        fact_line_ref = str(sle.line_no or "")
-        resolved_requirement_id, _resolved_order_ref = identity_by_core_id[allocation.fact_id]
-        fact_type = (
-            (
-                "linked_production"
-                if resolved_requirement_id is not None
-                else "unlinked_production"
-            )
-            if _fact_mode(sle) == "make"
-            else "component_consumption"
-        )
-        buckets = buckets_by_requirement.get(int(entry.requirement_id), [])
-        existing_slices = (
-            db.query(MrpExecutionAllocation)
-            .filter(
-                MrpExecutionAllocation.ledger_generation_id == generation.id,
-                MrpExecutionAllocation.requirement_id == entry.requirement_id,
-                MrpExecutionAllocation.fact_type == fact_type,
-                MrpExecutionAllocation.fact_ref == fact_ref,
-                MrpExecutionAllocation.fact_line_ref == fact_line_ref,
-                MrpExecutionAllocation.allocation_kind == "execution",
-            )
-            .all()
-        )
-        if existing_slices:
-            if sum(
-                (_decimal(row.allocated_qty) for row in existing_slices),
-                Decimal("0"),
-            ) != _decimal(allocation.qty):
-                raise ValueError(
-                    f"existing allocation slices disagree for fact {fact_ref}/{fact_line_ref}"
-                )
-            for existing in existing_slices:
-                if existing.bucket_id is not None:
-                    used_key = (int(existing.bucket_id), mode)
-                    bucket_used[used_key] = (
-                        bucket_used.get(used_key, Decimal("0"))
-                        + _decimal(existing.allocated_qty)
-                    )
-            slices = []
-        else:
-            slices: list[tuple[int | None, Decimal]] = []
-            left = _decimal(allocation.qty)
-            if buckets:
-                if (
-                    mode == "make"
-                    and int(entry.requirement_id) in legacy_unphased_requirement_ids
-                ):
-                    slices = [(None, left)]
-                else:
-                    for bucket in buckets:
-                        capacity = bucket_capacity_for_mode(bucket, mode)
-                        used_key = (int(bucket.id), mode)
-                        take = min(
-                            left,
-                            max(
-                                capacity - bucket_used.get(used_key, Decimal("0")),
-                                Decimal("0"),
-                            ),
-                        )
-                        if take > 0:
-                            slices.append((int(bucket.id), take))
-                            bucket_used[used_key] = (
-                                bucket_used.get(used_key, Decimal("0")) + take
-                            )
-                            left -= take
-                        if left <= 0:
-                            break
-                    if left > 0:
-                        raise ValueError(
-                            f"requirement {entry.requirement_id} bucket capacity is below realization"
-                        )
-            else:
-                slices.append((None, left))
-        for bucket_id, slice_qty in slices:
-            execution = (
-                db.query(MrpExecutionAllocation)
-                .filter(
-                    MrpExecutionAllocation.ledger_generation_id == generation.id,
-                    MrpExecutionAllocation.requirement_id == entry.requirement_id,
-                    MrpExecutionAllocation.bucket_id == bucket_id,
-                    MrpExecutionAllocation.fact_type == fact_type,
-                    MrpExecutionAllocation.fact_ref == fact_ref,
-                    MrpExecutionAllocation.fact_line_ref == fact_line_ref,
-                    MrpExecutionAllocation.allocation_kind == "execution",
-                )
-                .one_or_none()
-            )
-            if execution is None:
-                db.add(MrpExecutionAllocation(
-                    ledger_generation_id=generation.id,
-                    cycle_id=cycle_id,
-                    requirement_id=entry.requirement_id,
-                    bucket_id=bucket_id,
-                    fact_type=fact_type,
-                    allocation_kind="execution",
-                    fact_ref=fact_ref,
-                    fact_line_ref=fact_line_ref,
-                    fact_date=sle.posting_at,
-                    allocated_qty=slice_qty,
-                ))
-                inserted_allocations += 1
         allocation_rows_for_checksum.append({
             "sle_id": int(sle.id),
             "reservation_id": int(entry.id),
@@ -546,17 +380,8 @@ def run_historical_replay(
             "rule": allocation.match_rule,
         })
 
-    db.flush()
     for entry in entries:
-        realized = (
-            db.query(func.coalesce(func.sum(ReservationEvent.realized_delta), 0))
-            .filter(
-                ReservationEvent.ledger_generation_id == generation.id,
-                ReservationEvent.reservation_id == entry.id,
-            )
-            .scalar()
-        )
-        entry.realized_qty = _decimal(realized)
+        fold_reservation_entry(db, int(entry.id))
 
     input_rows = [
         {
@@ -574,7 +399,7 @@ def run_historical_replay(
         "reservations": len(reserves),
         "allocations": len(result.allocations),
         "events_inserted": inserted_events,
-        "execution_allocations_inserted": inserted_allocations,
+        "execution_allocations_inserted": 0,
         "fact_qty": str(result.fact_qty),
         "allocated_qty": str(result.allocated_qty),
         "unplanned_qty": str(result.unplanned_qty),

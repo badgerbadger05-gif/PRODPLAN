@@ -44,16 +44,37 @@ def _manifest_candidate_runs(
         raise CandidateRealizationReplayError("obligation_refresh_manifest must have entries")
 
     candidate_ids: set[int] = set()
+    retained_ids: set[int] = set()
     plan_ids: set[int] = set()
     for entry in entries:
         if not isinstance(entry, dict):
             raise CandidateRealizationReplayError("obligation_refresh_manifest entry is malformed")
         try:
-            candidate_id = int(entry["candidate_run_id"])
             plan_id = int(entry["plan_id"])
         except (KeyError, TypeError, ValueError) as exc:
             raise CandidateRealizationReplayError(
                 "obligation_refresh_manifest entry identity is malformed"
+            ) from exc
+        action = str(entry.get("action") or "")
+        if action == "retain":
+            try:
+                retained_id = int(entry["parent_run_id"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise CandidateRealizationReplayError(
+                    "obligation_refresh_manifest retain identity is malformed"
+                ) from exc
+            if entry.get("candidate_run_id") is not None:
+                raise CandidateRealizationReplayError(
+                    "retained run must not have a candidate"
+                )
+            retained_ids.add(retained_id)
+            plan_ids.add(plan_id)
+            continue
+        try:
+            candidate_id = int(entry["candidate_run_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CandidateRealizationReplayError(
+                "obligation_refresh_manifest candidate identity is malformed"
             ) from exc
         if candidate_id <= 0 or plan_id <= 0 or candidate_id in candidate_ids or plan_id in plan_ids:
             raise CandidateRealizationReplayError("obligation_refresh_manifest has duplicate candidates")
@@ -67,6 +88,8 @@ def _manifest_candidate_runs(
     if set(by_id) != candidate_ids:
         raise CandidateRealizationReplayError("manifest names missing candidate run")
     for entry in entries:
+        if entry.get("action") == "retain":
+            continue
         run = by_id[int(entry["candidate_run_id"])]
         if (
             str(run.status) != "BUILDING_SNAPSHOT"
@@ -88,16 +111,19 @@ def _manifest_candidate_runs(
     }
     if target_candidates != candidate_ids:
         raise CandidateRealizationReplayError("target has missing or extra manifest candidates")
+    sealed_run_ids = candidate_ids | retained_ids
     reservation_rows = db.query(models.ReservationEntry).filter(
-        models.ReservationEntry.run_id.in_(sorted(candidate_ids))
+        models.ReservationEntry.ledger_generation_id == int(target.id)
     ).all()
-    if any(int(row.ledger_generation_id) != int(target.id) for row in reservation_rows):
-        raise CandidateRealizationReplayError("candidate reservation belongs to another generation")
+    if any(int(row.run_id) not in sealed_run_ids for row in reservation_rows):
+        raise CandidateRealizationReplayError(
+            "target contains reservation for an unsealed run"
+        )
     outside = db.query(models.ReservationEntry.id).filter(
         models.ReservationEntry.ledger_generation_id == int(target.id),
         or_(
             models.ReservationEntry.run_id.is_(None),
-            ~models.ReservationEntry.run_id.in_(sorted(candidate_ids)),
+            ~models.ReservationEntry.run_id.in_(sorted(sealed_run_ids)),
         ),
     ).first()
     if outside is not None:
@@ -160,7 +186,10 @@ def replay_candidate_realizations(
     runs = _manifest_candidate_runs(db, target)
     lower_bound = replay_from
     result = run_historical_replay(
-        db, int(target.id), replay_from=lower_bound,
+        db,
+        int(target.id),
+        replay_from=lower_bound,
+        run_ids=tuple(int(row.run_id) for row in runs),
     )
     return {
         **result,

@@ -11,7 +11,7 @@ CRITICAL — Inc4 is PURE SHADOW and ADDITIVE:
     affected (that is Inc6).
   * Every entry point is designed to be wrapped by the caller in try/except so a
     failure logs and never breaks freeze or the ledger cycle. The callers
-    (mrp_freeze.refreeze_active_snapshots, mrp_execution_ledger.run_ledger_cycle)
+    (candidate freeze, generation-scoped replay)
     keep their existing behavior byte-identical whether this block runs or not.
   * No OData write, no INSERT into stock_ledger_entry (INV-1way): this module
     only reads ledger-1 and writes the reservation_* tables.
@@ -44,6 +44,7 @@ from .reservation import (
     Pin,
     Pool,
     Reserve,
+    append_realization_event,
     coverage_state_for,
     fold_reservation_events,
     redistribute,
@@ -53,7 +54,7 @@ logger = logging.getLogger(__name__)
 
 EPS = Decimal("1e-9")
 
-# PlanningRun.status of a closed run (mrp_execution_ledger.CLOSED_STATUS;
+# PlanningRun.status of a closed run;
 # duplicated as a literal to avoid a module cycle).
 _RUN_CLOSED_STATUS = "CLOSED"
 
@@ -223,12 +224,14 @@ def mode_targets(req: models.MrpRequirement, item: Optional[models.Item]) -> Lis
     * PRODUCED requirement → a ``make`` record, reserved = net_required_qty.
     * CONSUMED item (bom_level ≥ 1) → a ``consume`` record, reserved =
       total_required_qty (gross).
-    * PURCHASED item (bom_level ≥ 1) → ``consume`` (gross) + ``buy`` (net).
+    * PURCHASED requirement → ``buy`` (net); when it is also a component
+      (bom_level ≥ 1), it additionally carries ``consume`` (gross).
 
     Combined this yields exactly the §2.2 split:
       bom_level 0 produced (finished good)  → make only
       produced intermediate (level ≥ 1)     → BOTH (consume gross + make net)
-      purchased (level ≥ 1)                 → consume + buy
+      purchased root (level 0)              → buy only
+      purchased component (level ≥ 1)       → consume + buy
     """
     bom_level = int(req.bom_level or 0)
     targets: List[Tuple[str, Decimal]] = []
@@ -237,8 +240,8 @@ def mode_targets(req: models.MrpRequirement, item: Optional[models.Item]) -> Lis
         targets.append((MAKE, _dec(req.net_required_qty)))
     if bom_level >= 1:
         targets.append((CONSUME, _dec(req.total_required_qty)))
-        if not is_produced:
-            targets.append((BUY, _dec(req.net_required_qty)))
+    if not is_produced:
+        targets.append((BUY, _dec(req.net_required_qty)))
     return targets
 
 
@@ -348,30 +351,20 @@ def _append_event(
 ) -> bool:
     """Append one reservation_event, idempotent by idempotency_key. Returns True
     if a new row was written (design §2.3, append-only, never UPDATE/DELETE)."""
-    if _event_exists(db, int(entry.ledger_generation_id), idempotency_key):
-        return False
-    db.add(
-        models.ReservationEvent(
-            ledger_generation_id=int(entry.ledger_generation_id),
-            reservation_id=int(entry.id),
-            item_id=int(entry.item_id),
-            characteristic_ref=entry.characteristic_ref,
-            organization_ref=entry.organization_ref,
-            planning_stock_pool=entry.planning_stock_pool,
-            event_kind=event_kind,
-            reserved_delta=reserved_delta,
-            realized_delta=realized_delta,
-            sle_id=sle_id,
-            fact_ref=fact_ref,
-            fact_line_ref=fact_line_ref,
-            match_rule=match_rule,
-            cycle_id=cycle_id,
-            idempotency_key=idempotency_key,
-            event_at=_now(),
-        )
+    return append_realization_event(
+        db,
+        entry,
+        realized_delta=realized_delta,
+        sle_id=sle_id,
+        fact_ref=fact_ref,
+        fact_line_ref=fact_line_ref,
+        match_rule=match_rule,
+        cycle_id=cycle_id,
+        idempotency_key=idempotency_key,
+        event_at=_now(),
+        reserved_delta=reserved_delta,
+        event_kind=event_kind,
     )
-    db.flush()
-    return True
 
 
 def _fold_entry(db: Session, entry: models.ReservationEntry) -> Tuple[Decimal, Decimal, Decimal]:
@@ -1366,6 +1359,7 @@ def realize_from_sle(
     cycle_id: str,
     *,
     ledger_generation_id: Optional[int] = None,
+    sle_ids: Iterable[int],
 ) -> Dict[str, Any]:
     """Append realize events from physical SLE not yet applied (design §6.1/§6.3).
 
@@ -1430,8 +1424,12 @@ def realize_from_sle(
         .all()
     }
 
+    changed_sle_ids = sorted({int(value) for value in sle_ids})
+    if not changed_sle_ids:
+        return summary
     sles = (
         db.query(models.StockLedgerEntry)
+        .filter(models.StockLedgerEntry.id.in_(changed_sle_ids))
         .filter(models.StockLedgerEntry.item_id.in_(list(scope.pool_items)))
         .filter(models.StockLedgerEntry.active.is_(True))
         .order_by(models.StockLedgerEntry.posting_at.asc(), models.StockLedgerEntry.id.asc())
@@ -1922,6 +1920,7 @@ def redistribute_after_ledger_apply(
     *,
     match: bool = True,
     ledger_generation_id: Optional[int] = None,
+    sle_ids: Iterable[int] = (),
 ) -> Dict[str, Any]:
     """Trigger т1 (design §5): after ledger-1 is applied to some keys (a pull or
     a reconcile adjustment) refresh JUST the touched pools, so position /
@@ -1985,6 +1984,7 @@ def redistribute_after_ledger_apply(
             realize_summary = realize_from_sle(
                 db, scope, cycle_id,
                 ledger_generation_id=generation_id,
+                sle_ids=sle_ids,
             )
             for k in ("realized_consume", "realized_make", "returned_unrealize",
                       "internal_transfer", "unplanned_consumption"):
@@ -2016,10 +2016,7 @@ def run_reservation_shadow(
     *,
     ledger_generation_id: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """The Inc4 reservation block, called from run_ledger_cycle AFTER verify /
-    executed / drift / closure. PURE SHADOW: writes only reservation_* tables,
-    returns a diagnostic summary that the caller does NOT fold into its own
-    (byte-identical) return dict.
+    """Materialize and fold one generation-scoped reservation shadow.
     """
     generation_id = _resolve_generation_id(db, ledger_generation_id)
     reqs = list(scope.open_reqs)
@@ -2044,7 +2041,11 @@ def run_reservation_shadow(
         db, scope.freeze_allocs, ledger_generation_id=generation_id,
     )
     realize_summary = realize_from_sle(
-        db, scope, cycle_id, ledger_generation_id=generation_id,
+        db,
+        scope,
+        cycle_id,
+        ledger_generation_id=generation_id,
+        sle_ids=(),
     )
 
     on_hand = _ledger_on_hand_by_generation(db, generation_id)

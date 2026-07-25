@@ -282,6 +282,7 @@ class WipSupplyLine:
     order_id: int
     order_ref1c: Optional[str]
     product_id: int
+    source_line_ref: str = ""
 
 
 def active_wip_supply_by_item(
