@@ -1,4 +1,4 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -114,6 +114,57 @@ def _bootstrap_gate_watermarks(
             ),
         },
     }
+
+
+def _physical_refresh_gate_watermarks(
+    generation: models.LedgerGeneration,
+    *,
+    historical_import_completed_through=None,
+    convergence_valid=True,
+    convergence_cutoff=None,
+    convergence_batch_id=None,
+) -> dict[str, object]:
+    return {
+        **dict(generation.source_watermarks or {}),
+        "generation_kind": "physical_refresh",
+        "historical_import_completed_through": (
+            historical_import_completed_through.isoformat()
+            if historical_import_completed_through is not None
+            else generation.cutoff.isoformat()
+        ),
+        "balance_convergence": {
+            "valid": convergence_valid,
+            "cutoff": (
+                convergence_cutoff.isoformat()
+                if convergence_cutoff is not None
+                else generation.cutoff.isoformat()
+            ),
+            "physical_import_batch_id": (
+                generation.physical_import_batch_id
+                if convergence_batch_id is None
+                else convergence_batch_id
+            ),
+        },
+    }
+
+
+def _physical_refresh_gate_ready(
+    db_session, key: str = "physical-refresh-gate"
+) -> tuple[models.LedgerGeneration, models.MrpRequirement]:
+    generation, requirement = _synthetic(
+        db_session,
+        key,
+        replenishment_method="Производство",
+    )
+    _configure_obligation_checkpoint(
+        db_session,
+        generation,
+        requirement,
+        allow_unphased=False,
+    )
+    generation.source_watermarks = _physical_refresh_gate_watermarks(generation)
+    db_session.commit()
+    return generation, requirement
 
 
 def _synthetic(db, key: str = "ok", replenishment_method: str = "Производство"):
@@ -1040,6 +1091,54 @@ def test_bootstrap_validation_gate_rejects_misaligned_convergence_batch(
         match="balance_convergence.physical_import_batch_id",
     ):
         validate_generation_build(db_session, generation.id, explicit_empty_physical=True)
+
+
+def test_physical_refresh_validation_gate_rejects_wrong_cutoff(
+    db_session,
+):
+    generation, _requirement = _physical_refresh_gate_ready(
+        db_session,
+        "physical-refresh-cutoff",
+    )
+    generation.source_watermarks = _physical_refresh_gate_watermarks(
+        generation,
+        historical_import_completed_through=generation.cutoff - timedelta(hours=1),
+    )
+    db_session.commit()
+
+    with pytest.raises(
+        GenerationValidationError,
+        match="historical_import_completed_through must equal generation cutoff",
+    ):
+        validate_generation_build(
+            db_session,
+            generation.id,
+            explicit_empty_physical=True,
+        )
+
+
+def test_physical_refresh_validation_rejects_mismatched_convergence_batch(
+    db_session,
+):
+    generation, _requirement = _physical_refresh_gate_ready(
+        db_session,
+        "physical-refresh-batch",
+    )
+    generation.source_watermarks = _physical_refresh_gate_watermarks(
+        generation,
+        convergence_batch_id=generation.physical_import_batch_id + 1,
+    )
+    db_session.commit()
+
+    with pytest.raises(
+        GenerationValidationError,
+        match="balance_convergence.physical_import_batch_id",
+    ):
+        validate_generation_build(
+            db_session,
+            generation.id,
+            explicit_empty_physical=True,
+        )
 
 
 def test_non_bootstrap_generation_is_not_subject_to_bootstrap_gate(

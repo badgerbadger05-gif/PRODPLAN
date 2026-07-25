@@ -63,6 +63,7 @@ from ..services.item_ledger.physical import (
     EPS,
     LedgerKey,
     canonical_content_hash,
+    guard_physical_batch_writer,
     seed_from_balance,
 )
 from ..services.item_ledger.reconcile import build_balance_snapshot
@@ -587,6 +588,7 @@ def seed_ledger(
         "anchor_period": anchor_period.isoformat(),
         "keys_nonzero": len(nonzero),
     }
+    guard_physical_batch_writer(db)
     import_batch = models.PhysicalImportBatch(
         batch_key=(
             f"admin-seed:{posting_at.strftime('%Y%m%dT%H%M%S%f')}:"

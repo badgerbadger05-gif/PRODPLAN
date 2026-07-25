@@ -40,9 +40,6 @@ def _resolve_parent_generation_id(
     ``ledger_generation_id`` cleared; in that case their lineage is inferred
     from reservation replay rows for the same run.
     """
-    if parent.ledger_generation_id is not None:
-        return int(parent.ledger_generation_id)
-
     run_id = int(parent.run_id)
     if current_generation_id is None:
         pointer = db.get(models.PlanningTruthState, 1)
@@ -54,6 +51,12 @@ def _resolve_parent_generation_id(
         current_generation_id = int(pointer.current_generation_id)
     else:
         current_generation_id = int(current_generation_id)
+
+    if (
+        parent.ledger_generation_id is not None
+        and int(parent.ledger_generation_id) == current_generation_id
+    ):
+        return current_generation_id
 
     current = db.get(models.LedgerGeneration, current_generation_id)
     if current is None or str(current.status) != "accepted":
@@ -106,6 +109,11 @@ def _resolve_parent_generation_id(
     )
     if persisted is not None:
         return current_generation_id
+    # A direct lineage remains authoritative only when the current generation
+    # has not replayed this run. Physical-refresh generations deliberately
+    # reuse frozen run headers while rebuilding their reservations.
+    if parent.ledger_generation_id is not None:
+        return int(parent.ledger_generation_id)
     return None
 
 

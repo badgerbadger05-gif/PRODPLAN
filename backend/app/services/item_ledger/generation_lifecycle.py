@@ -41,6 +41,7 @@ CAPABILITIES = {
     "supplier_receipt_coverage": True,
     "planning_snapshots": True,
 }
+PHYSICAL_REFRESH_KIND = "physical_refresh"
 _SUPPLIER_DOCUMENT_TYPES = frozenset({
     "Document_ПриходнаяНакладная",
     "Document_КорректировкаПоступления",
@@ -127,6 +128,58 @@ def _validate_historical_bootstrap_watermarks(
             "source_watermarks.balance_convergence.valid must be true"
         )
 
+    convergence_cutoff = _parse_iso_datetime(
+        convergence.get("cutoff"),
+        "source_watermarks.balance_convergence.cutoff",
+    )
+    if convergence_cutoff != cutoff:
+        raise GenerationValidationError(
+            "balance_convergence.cutoff must equal generation cutoff"
+        )
+    try:
+        convergence_batch_id = int(convergence.get("physical_import_batch_id"))
+    except (TypeError, ValueError) as exc:
+        raise GenerationValidationError(
+            "balance_convergence.physical_import_batch_id must match generation physical boundary"
+        ) from exc
+    if convergence_batch_id != int(generation.physical_import_batch_id):
+        raise GenerationValidationError(
+            "balance_convergence.physical_import_batch_id must match generation physical boundary"
+        )
+
+
+def _validate_physical_refresh_watermarks(
+    generation: models.LedgerGeneration,
+) -> None:
+    source_watermarks = generation.source_watermarks
+    if not isinstance(source_watermarks, dict):
+        if source_watermarks is None:
+            return
+        raise GenerationValidationError(
+            "physical refresh requires source_watermarks mapping"
+        )
+    if str(source_watermarks.get("generation_kind") or "") != PHYSICAL_REFRESH_KIND:
+        return
+
+    cutoff = _utc(generation.cutoff, "generation cutoff")
+    historical_import_completed_through = _parse_iso_datetime(
+        source_watermarks.get("historical_import_completed_through"),
+        "source_watermarks.historical_import_completed_through",
+    )
+    if historical_import_completed_through != cutoff:
+        raise GenerationValidationError(
+            "historical_import_completed_through must equal generation cutoff"
+        )
+
+    convergence = source_watermarks.get("balance_convergence")
+    if not isinstance(convergence, dict):
+        raise GenerationValidationError(
+            "source_watermarks.balance_convergence must be present"
+        )
+    if convergence.get("valid") is not True:
+        raise GenerationValidationError(
+            "source_watermarks.balance_convergence.valid must be true"
+        )
     convergence_cutoff = _parse_iso_datetime(
         convergence.get("cutoff"),
         "source_watermarks.balance_convergence.cutoff",
@@ -317,6 +370,7 @@ def validate_generation_build(
     if physical_batch.cutoff and physical_batch.cutoff > generation.cutoff:
         raise GenerationValidationError("physical import boundary exceeds generation cutoff")
     _validate_historical_bootstrap_watermarks(generation)
+    _validate_physical_refresh_watermarks(generation)
     partial_physical = db.query(models.LedgerBuildBatch.id).filter(
         models.LedgerBuildBatch.ledger_generation_id == int(generation.id),
         models.LedgerBuildBatch.stage == "physical_import",

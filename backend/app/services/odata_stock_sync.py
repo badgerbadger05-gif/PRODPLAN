@@ -306,7 +306,12 @@ def _upsert_item_warehouse_stock(
     return (rows_upserted, len(touched_item_ids))
 
 
-def sync_stock_from_odata(db: Session, req: ODataSyncRequest) -> dict:
+def sync_stock_from_odata(
+    db: Session,
+    req: ODataSyncRequest,
+    *,
+    reconcile_ledger: bool = False,
+) -> dict:
     """
     Синхронизация остатков из 1С через OData.
     Алгоритм аналогичен PRODPLANOLD/src/odata_stock_sync.py:
@@ -538,21 +543,27 @@ def sync_stock_from_odata(db: Session, req: ODataSyncRequest) -> dict:
         # the full snapshot + shadow diagnostics. SHADOW — feeds only the unread
         # stock_bin/SLE; the ItemWarehouseStock refresh above is untouched (dual
         # write). Guarded: a reconcile failure must never break the legacy sweep.
-        try:
-            from .item_ledger.reconcile import run_balance_reconcile_after_sweep
+        if reconcile_ledger:
+            # Ledger writes are owned by the BUILDING physical_refresh
+            # lifecycle. Keep this opt-in only for its internal caller; the
+            # ordinary scheduled stock sweep remains a legacy/read staging
+            # update and can never create a foreign PhysicalImportBatch or
+            # reconcile adjustment.
+            try:
+                from .item_ledger.reconcile import run_balance_reconcile_after_sweep
 
-            rec = run_balance_reconcile_after_sweep(db, full_balance_rows)
-            print(
-                f"[OData][stock] balance-reconcile: compared={rec.compared} "
-                f"matched={rec.matched} pending={rec.pending} held={rec.held} "
-                f"adjusted={rec.adjusted} "
-                f"discovered_recorders={rec.discovered_recorders} "
-                f"discovery_skipped={rec.discovery_skipped} "
-                f"anomalies={rec.anomalies}",
-                flush=True,
-            )
-        except Exception as e:
-            print(f"[OData][stock] balance-reconcile skipped: {e}", flush=True)
+                rec = run_balance_reconcile_after_sweep(db, full_balance_rows)
+                print(
+                    f"[OData][stock] balance-reconcile: compared={rec.compared} "
+                    f"matched={rec.matched} pending={rec.pending} held={rec.held} "
+                    f"adjusted={rec.adjusted} "
+                    f"discovered_recorders={rec.discovered_recorders} "
+                    f"discovery_skipped={rec.discovery_skipped} "
+                    f"anomalies={rec.anomalies}",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"[OData][stock] balance-reconcile skipped: {e}", flush=True)
 
         if req.dry_run:
             db.rollback()

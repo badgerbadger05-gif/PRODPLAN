@@ -16,6 +16,7 @@ from app.services.item_ledger.historical_bootstrap_phase0 import (
     BalanceConvergenceResult,
     seed_historical_opening_balance,
     evaluate_historical_balance_convergence,
+    evaluate_physical_refresh_balance_convergence,
 )
 from app.services.item_ledger.physical import LedgerKey
 
@@ -237,3 +238,129 @@ def test_balance_convergence_detects_mismatch_and_marks_invalid(db_session):
     assert checked.deltas[0].delta_qty == "-3"
     generation = db_session.get(models.LedgerGeneration, created.ledger_generation_id)
     assert generation.source_watermarks[CONVERGENCE_KEY]["valid"] is False
+
+
+def test_physical_refresh_balance_convergence_passes_and_persists_metadata(db_session):
+    created = _generation(db_session, "phase0-phys-refresh-pass")
+    generation = db_session.get(models.LedgerGeneration, created.ledger_generation_id)
+    generation.source_watermarks = {
+        "generation_kind": "physical_refresh",
+        "historical_import_completed_through": created.cutoff.replace(
+            tzinfo=timezone.utc
+        ).isoformat(),
+    }
+    item = _item(db_session, "PH0-PH-OK")
+    db_session.add(
+        models.StockLedgerEntry(
+            ingest_batch_id=created.physical_import_batch_id,
+            source_content_hash="phase0-phys-refresh-pass",
+            item_id=item.item_id,
+            characteristic_ref="",
+            organization_ref="",
+            warehouse_ref1c="WH-1",
+            qty=Decimal("2"),
+            qty_after=Decimal("0"),
+            posting_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            record_type="Receipt",
+            movement_kind="test",
+            recorder_type="phase0",
+            recorder_ref="move-2",
+            line_no="1",
+        )
+    )
+    db_session.commit()
+
+    checked = evaluate_physical_refresh_balance_convergence(
+        db_session,
+        ledger_generation_id=created.ledger_generation_id,
+        balance_snapshot={LedgerKey(item.item_id, "", "", "WH-1"): Decimal("2")},
+    )
+    assert isinstance(checked, BalanceConvergenceResult)
+    assert checked.valid is True
+    assert checked.compared == 1
+    assert checked.mismatched == 0
+    assert checked.matched == 1
+    generation = db_session.get(models.LedgerGeneration, created.ledger_generation_id)
+    convergence = generation.source_watermarks["balance_convergence"]
+    assert convergence["valid"] is True
+    assert convergence["content_hash"] == checked.content_hash
+    assert convergence["physical_import_batch_id"] == created.physical_import_batch_id
+
+
+def test_physical_refresh_balance_convergence_detects_mismatch_and_marks_invalid(
+    db_session,
+):
+    created = _generation(db_session, "phase0-phys-refresh-miss")
+    generation = db_session.get(models.LedgerGeneration, created.ledger_generation_id)
+    generation.source_watermarks = {
+        "generation_kind": "physical_refresh",
+        "historical_import_completed_through": created.cutoff.replace(
+            tzinfo=timezone.utc
+        ).isoformat(),
+    }
+    item = _item(db_session, "PH0-PH-MISS")
+    db_session.add(
+        models.StockLedgerEntry(
+            ingest_batch_id=created.physical_import_batch_id,
+            source_content_hash="phase0-phys-refresh-miss",
+            item_id=item.item_id,
+            characteristic_ref="",
+            organization_ref="",
+            warehouse_ref1c="WH-1",
+            qty=Decimal("2"),
+            qty_after=Decimal("0"),
+            posting_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            record_type="Receipt",
+            movement_kind="test",
+            recorder_type="phase0",
+            recorder_ref="move-3",
+            line_no="1",
+        )
+    )
+    db_session.commit()
+
+    checked = evaluate_physical_refresh_balance_convergence(
+        db_session,
+        ledger_generation_id=created.ledger_generation_id,
+        balance_snapshot={LedgerKey(item.item_id, "", "", "WH-1"): Decimal("5")},
+    )
+
+    assert checked.valid is False
+    assert checked.mismatched == 1
+    assert checked.deltas[0].delta_qty == "3"
+    generation = db_session.get(models.LedgerGeneration, created.ledger_generation_id)
+    assert generation.source_watermarks["balance_convergence"]["valid"] is False
+
+
+def test_physical_refresh_balance_convergence_rejects_wrong_kind(db_session):
+    created = _generation(db_session, "phase0-phys-refresh-kind")
+    item = _item(db_session, "PH0-PH-KIND")
+    db_session.add(
+        models.StockLedgerEntry(
+            ingest_batch_id=created.physical_import_batch_id,
+            source_content_hash="phase0-phys-refresh-kind",
+            item_id=item.item_id,
+            characteristic_ref="",
+            organization_ref="",
+            warehouse_ref1c="WH-1",
+            qty=Decimal("1"),
+            qty_after=Decimal("0"),
+            posting_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            record_type="Receipt",
+            movement_kind="test",
+            recorder_type="phase0",
+            recorder_ref="move-4",
+            line_no="1",
+        )
+    )
+    db_session.commit()
+
+    with pytest.raises(
+        Phase0BootstrapError,
+        match="generation requires generation_kind=physical_refresh",
+    ):
+        evaluate_physical_refresh_balance_convergence(
+            db_session,
+            ledger_generation_id=created.ledger_generation_id,
+            balance_snapshot={LedgerKey(item.item_id, "", "", "WH-1"): Decimal("1")},
+        )

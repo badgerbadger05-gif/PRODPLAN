@@ -1683,6 +1683,9 @@ def _ensure_legacy_diagnostic_generation(db: Session) -> int:
         .one_or_none()
     )
     if batch is None:
+        from .item_ledger.physical import guard_physical_batch_writer
+
+        guard_physical_batch_writer(db)
         batch = PhysicalImportBatch(
             batch_key="legacy-ledger-diagnostic",
             status="completed",

@@ -1,4 +1,4 @@
-from app.models import Item, ItemWarehouseStock, StockWarehouse
+from app.models import Item, ItemWarehouseStock, PhysicalImportBatch, StockWarehouse
 from app.schemas import ODataSyncRequest
 from app.services import odata_stock_sync as stock_sync
 
@@ -61,6 +61,55 @@ def test_sync_stock_uses_only_selected_warehouses(db_session, monkeypatch):
     db.refresh(item)
     assert float(item.stock_qty) == 5.0
     assert int(stats.get("warehouses_selected", 0)) == 1
+
+
+def test_ordinary_stock_sync_mismatch_does_not_create_foreign_physical_batch(
+    db_session, monkeypatch
+):
+    """A legacy stock sweep must not materialize Ledger truth on its own.
+
+    The 1C Balance deliberately disagrees with the legacy quantity (10 -> 7),
+    which used to enter reconcile and create an adjustment/import batch.  The
+    BUILDING physical-refresh lifecycle is the sole owner of those writes.
+    """
+    item = Item(
+        item_code="ITEM-MISMATCH",
+        item_name="Mismatch",
+        item_article="ITEM-MISMATCH",
+        stock_qty=10.0,
+        status="active",
+    )
+    db_session.add(item)
+    db_session.add(
+        StockWarehouse(
+            warehouse_ref1c="W-MISMATCH",
+            warehouse_code="M",
+            warehouse_name="Main",
+            is_selected=True,
+        )
+    )
+    db_session.commit()
+
+    monkeypatch.setattr(
+        stock_sync,
+        "get_stock_from_1c_odata",
+        lambda **kwargs: [
+            {
+                "code": "ITEM-MISMATCH",
+                "qty": 7.0,
+                "ref": "",
+                "warehouse_ref": "W-MISMATCH",
+                "warehouse_code": "M",
+                "warehouse_name": "Main",
+            }
+        ],
+    )
+
+    stock_sync.sync_stock_from_odata(db_session, _mk_req())
+
+    db_session.refresh(item)
+    assert float(item.stock_qty) == 7.0
+    assert db_session.query(PhysicalImportBatch).count() == 0
 
 
 def test_sync_stock_warehouses_upserts_and_selects_by_default(db_session, monkeypatch):

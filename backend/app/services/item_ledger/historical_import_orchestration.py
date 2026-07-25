@@ -18,7 +18,7 @@ from app import models
 
 from .historical_register_scan import scan_historical_register_range
 from .ingest import pull_recorder_movements
-from .physical import canonical_content_hash
+from .physical import canonical_content_hash, guard_physical_batch_writer
 
 
 ALGORITHM_VERSION = "historical-physical-import/1"
@@ -75,6 +75,10 @@ def _completed_checkpoint(
 
 def _lock_physical_batch_sequence(db: Session) -> None:
     """Prevent a concurrent batch insert from crossing this window on Postgres."""
+    # Stable lock order: advisory sequence guard first, then table lock.  The
+    # refresh lifecycle owns the advisory session lock and its ContextVar makes
+    # this call a no-op while retaining the table lock.
+    guard_physical_batch_writer(db)
     if db.get_bind().dialect.name == "postgresql":
         db.execute(
             text(
@@ -258,6 +262,7 @@ def run_historical_physical_import(
             )
             checkpoint = scan.windows[0]
             previous_batch_id = int(generation.physical_import_batch_id)
+            guard_physical_batch_writer(db)
             physical_batch = models.PhysicalImportBatch(
                 batch_key=f"historical:{generation.id}:{build_key.rsplit(':', 1)[-1]}",
                 status="building",
@@ -276,10 +281,7 @@ def run_historical_physical_import(
             pull_metrics: list[dict[str, Any]] = []
             for discovered in scan.recorders:
                 identity = discovered.identity
-                result = pull_recorder_movements(
-                    db,
-                    identity.recorder_type,
-                    identity.recorder_ref,
+                pull_kwargs = dict(
                     client=client,
                     source="historical_register_scan",
                     import_batch=physical_batch,
@@ -288,6 +290,10 @@ def run_historical_physical_import(
                     ledger_generation_id=None,
                     max_posting_at=to_inclusive,
                     strict_historical=True,
+                )
+                result = pull_recorder_movements(
+                    db, identity.recorder_type, identity.recorder_ref,
+                    **pull_kwargs,
                 )
                 quarantined = (
                     result.status not in {"done", "empty"}

@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Iterable, List, Mapping, NamedTuple, Optional, Tuple, Union
@@ -19,6 +21,43 @@ from sqlalchemy.orm import Session
 from app import models
 
 EPS = Decimal("1e-9")
+# One global lock space for every writer of the id-prefix physical history.
+# A refresh holds the session-level form across its checkpoint commits; an
+# individual recorder pull takes the transaction-level form.
+PHYSICAL_SEQUENCE_LOCK_KEY = 0x706879732D726566  # signed bigint: "phys-ref"
+_physical_sequence_lock_owned: ContextVar[bool] = ContextVar(
+    "physical_sequence_lock_owned", default=False
+)
+
+
+@contextmanager
+def physical_sequence_lock_context():
+    """Mark the current physical-refresh call stack as lock-owner only."""
+    token = _physical_sequence_lock_owned.set(True)
+    try:
+        yield
+    finally:
+        _physical_sequence_lock_owned.reset(token)
+
+
+def guard_physical_batch_writer(session: Session) -> None:
+    """Serialize every PhysicalImportBatch writer on PostgreSQL.
+
+    The lifecycle sets a ContextVar while holding the session-level lock on its
+    dedicated connection; internal writers then safely skip this transaction
+    lock. All standalone writers retain the default advisory guard.
+    """
+    if _physical_sequence_lock_owned.get():
+        return
+    try:
+        dialect = session.get_bind().dialect.name
+    except Exception:
+        dialect = ""
+    if dialect == "postgresql":
+        session.execute(
+            text("SELECT pg_advisory_xact_lock(:k)"),
+            {"k": PHYSICAL_SEQUENCE_LOCK_KEY},
+        )
 
 Number = Union[int, float, Decimal, str]
 
@@ -67,6 +106,7 @@ def ensure_physical_import_batch(
     batch: Optional[models.PhysicalImportBatch] = None,
 ) -> models.PhysicalImportBatch:
     """Return an explicit physical import boundary, creating it idempotently."""
+    guard_physical_batch_writer(session)
     if batch is not None:
         retained = dict(batch.source_watermarks or {})
         retained.update(dict(source_watermarks))

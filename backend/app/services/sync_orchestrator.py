@@ -16,13 +16,17 @@ reversible. Everything is read-only against 1C.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ..schemas import ODataSyncRequest
@@ -47,7 +51,10 @@ from .processing_stock_sync import (
     sync_processing_stock_from_odata,
 )
 from .nomenclature_groups_sync import refresh_nomenclature_groups
-from .item_ledger.ingest import is_retryable_error, process_pending_pulls
+from .item_ledger.ingest import is_retryable_error, _build_client
+from .item_ledger.reconcile import build_balance_snapshot
+from .item_ledger.physical_refresh_orchestrator import run_physical_refresh
+from .odata_client import get_stock_from_1c_odata
 from .. import models
 
 
@@ -65,6 +72,18 @@ _CATEGORY_SELECT = [
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _to_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _odata_datetime(value: datetime) -> str:
+    if value.tzinfo is not None and value.utcoffset() is not None:
+        value = value.astimezone(ZoneInfo("Europe/Moscow"))
+    return value.replace(tzinfo=None, microsecond=0).isoformat()
 
 
 def _build_payload(config: Dict[str, Any], entity_name: str, **overrides: Any) -> ODataSyncRequest:
@@ -156,27 +175,64 @@ _DBR_SOURCE_JOBS = {"stock", "productionOrders", "supplierOrders", "processingSt
 _DBR_RETRY_BASE_SECONDS = 300
 _DBR_RETRY_MAX_SECONDS = 3600
 _DBR_FULL_INTERVAL_SECONDS = 3600
-_LEDGER_PULL_LIMIT = 10
+_PHYSICAL_REFRESH_RETRY_BASE_SECONDS = 300
+_PHYSICAL_REFRESH_RETRY_MAX_SECONDS = 3600
+_PHYSICAL_REFRESH_INTERVAL_SECONDS = 3600
+_PHYSICAL_REFRESH_ENTITY = "AccumulationRegister_ЗапасыНаСкладах/Balance"
+# Signed bigint, stable across processes and deployments.
+_SYNC_ORCHESTRATOR_LOCK_KEY = 0x73796E632D6F7263  # 'sync-orc'
 
 
 # --- State persistence -------------------------------------------------------
 
 def _load_state() -> Dict[str, Any]:
-    try:
-        if STATE_PATH.exists():
-            return json.loads(STATE_PATH.read_text("utf-8") or "{}")
-    except Exception:
-        pass
+    if STATE_PATH.exists():
+        try:
+            value = json.loads(STATE_PATH.read_text("utf-8") or "{}")
+        except Exception as exc:
+            raise RuntimeError(
+                f"sync schedule state is unreadable: {STATE_PATH}"
+            ) from exc
+        if not isinstance(value, dict):
+            raise RuntimeError(
+                f"sync schedule state must be a JSON object: {STATE_PATH}"
+            )
+        return value
     return {}
 
 
-def _save_state(state: Dict[str, Any]) -> None:
+def _save_state(state: Dict[str, Any], *, required: bool = False) -> None:
+    temp_path: Path | None = None
     try:
         STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        payload = json.dumps(
+            state, ensure_ascii=False, indent=2
+        ).encode("utf-8")
+        fd, raw_path = tempfile.mkstemp(
+            prefix=f".{STATE_PATH.name}.",
+            suffix=".tmp",
+            dir=str(STATE_PATH.parent),
+        )
+        temp_path = Path(raw_path)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, STATE_PATH)
+        temp_path = None
+        dir_fd = os.open(STATE_PATH.parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     except Exception:
-        # Operational state only — never fail a sync because state couldn't be saved.
-        pass
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        if required:
+            raise
 
 
 def _job_state(state: Dict[str, Any], job_id: str) -> Dict[str, Any]:
@@ -206,6 +262,14 @@ def _parse_iso(value: Any) -> Optional[datetime]:
         return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
     except Exception:
         return None
+
+
+def _rollback_if_possible(db: Optional[Session]) -> None:
+    if db is not None and hasattr(db, "rollback"):
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
 
 def _due_jobs(state: Dict[str, Any], now: datetime) -> List[SyncJob]:
@@ -241,6 +305,174 @@ def _dbr_state(state: Dict[str, Any]) -> Dict[str, Any]:
     return state.setdefault("dbr_maintenance", {})
 
 
+def _physical_refresh_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    return state.setdefault("physical_refresh_maintenance", {})
+
+
+def _current_accepted_parent(db: Session) -> models.LedgerGeneration:
+    truth = db.get(models.PlanningTruthState, 1)
+    if truth is None or truth.current_generation_id is None:
+        raise RuntimeError("planning truth is not initialized")
+    generation = db.get(models.LedgerGeneration, int(truth.current_generation_id))
+    if generation is None or str(generation.status) != "accepted" or generation.cutoff is None:
+        raise RuntimeError("current planning truth is not an accepted generation")
+    return generation
+
+
+def _has_current_accepted_parent(db: Optional[Session]) -> bool:
+    if db is None:
+        return False
+    try:
+        return _current_accepted_parent(db) is not None
+    except Exception:
+        return False
+
+
+def _building_physical_refreshes(
+    db: Session,
+    parent_generation_id: int,
+) -> list[models.LedgerGeneration]:
+    result: list[models.LedgerGeneration] = []
+    for generation in (
+        db.query(models.LedgerGeneration)
+        .filter(models.LedgerGeneration.status == "building")
+        .order_by(models.LedgerGeneration.id.asc())
+        .all()
+    ):
+        marks = dict(generation.source_watermarks or {})
+        if (
+            marks.get("generation_kind") == "physical_refresh"
+            and int(marks.get("parent_generation_id") or -1)
+            == int(parent_generation_id)
+        ):
+            result.append(generation)
+    return result
+
+
+def _physical_refresh_inventory(
+    db: Optional[Session], parent_generation_id: Optional[int]
+) -> Dict[str, Any]:
+    """Inventory every BUILDING generation that looks like a physical refresh."""
+    inventory: Dict[str, Any] = {
+        "total": 0,
+        "recoverable": [],
+        "unexpected": [],
+    }
+    if db is None or not hasattr(db, "query"):
+        return inventory
+    rows = (
+        db.query(models.LedgerGeneration)
+        .filter(models.LedgerGeneration.status == "building")
+        .order_by(models.LedgerGeneration.id.asc())
+        .all()
+    )
+    for generation in rows:
+        marks = dict(generation.source_watermarks or {})
+        key = str(generation.generation_key or "")
+        algorithm = str(generation.algorithm_version or "")
+        looks_like = (
+            marks.get("generation_kind") == "physical_refresh"
+            or key.startswith("physical-refresh:")
+            or "physical-refresh" in algorithm
+        )
+        if not looks_like:
+            continue
+        inventory["total"] += 1
+        parent_id = marks.get("parent_generation_id")
+        valid_parent = False
+        try:
+            valid_parent = parent_generation_id is not None and int(parent_id) == int(parent_generation_id)
+        except (TypeError, ValueError):
+            valid_parent = False
+        well_formed = (
+            marks.get("generation_kind") == "physical_refresh"
+            and valid_parent
+            and generation.cutoff is not None
+            and bool(key)
+        )
+        if well_formed:
+            inventory["recoverable"].append(generation)
+            continue
+        inventory["unexpected"].append({
+            "generation_id": int(generation.id),
+            "generation_key": key,
+            "parent_generation_id": parent_id,
+            "generation_kind": marks.get("generation_kind"),
+            "algorithm_version": algorithm,
+            "reason": "malformed_or_non_current_parent",
+        })
+    return inventory
+
+
+def _physical_refresh_due(state: Dict[str, Any], now: datetime) -> bool:
+    maintenance = _physical_refresh_state(state)
+    if int(maintenance.get("failure_count") or 0) > 0:
+        retry_at = _parse_iso(maintenance.get("next_retry_at"))
+        return retry_at is None or now >= retry_at
+    last_success = _parse_iso(maintenance.get("last_success_at"))
+    if last_success is None:
+        return True
+    return (now - last_success).total_seconds() >= _PHYSICAL_REFRESH_INTERVAL_SECONDS
+
+
+def _run_physical_refresh_job(
+    db: Session,
+    target_cutoff: datetime,
+    generation_key: str,
+) -> Dict[str, Any]:
+    parent = _current_accepted_parent(db)
+    target_cutoff = _to_utc(target_cutoff).replace(microsecond=0)
+    existing = db.query(models.LedgerGeneration).filter(
+        models.LedgerGeneration.generation_key == generation_key
+    ).one_or_none()
+    if (
+        existing is not None
+        and str(existing.status) == "accepted"
+        and _to_utc(parent.cutoff) >= target_cutoff
+    ):
+        return {
+            "parent_generation_id": int(
+                dict(existing.source_watermarks or {}).get(
+                    "parent_generation_id", existing.id
+                )
+            ),
+            "physical_generation_id": int(existing.id),
+            "published_generation_id": int(parent.id),
+            "target_cutoff": target_cutoff.isoformat(),
+            "published": True,
+            "result": {"accepted": True, "candidate_runs": 0, "recovered": True},
+        }
+    client = _build_client()
+    filter_query = f"Period le datetime'{_odata_datetime(target_cutoff)}'"
+    balance_rows = get_stock_from_1c_odata(
+        base_url=client.base_url,
+        entity_name=_PHYSICAL_REFRESH_ENTITY,
+        username=client.username,
+        password=client.password,
+        token=client.token,
+        filter_query=filter_query,
+    )
+    balance_snapshot = build_balance_snapshot(db, balance_rows, strict=True)
+    result = run_physical_refresh(
+        db,
+        generation_key=generation_key,
+        target_cutoff=target_cutoff,
+        client=client,
+        balance_snapshot=balance_snapshot,
+    )
+    return {
+        "parent_generation_id": result.parent_generation_id,
+        "physical_generation_id": result.physical_generation_id,
+        "published_generation_id": result.published_generation_id,
+        "target_cutoff": result.cutoff.isoformat(),
+        "published": bool(result.published),
+        "result": {
+            "accepted": bool(result.published),
+            "candidate_runs": len(result.candidate_run_ids),
+        },
+    }
+
+
 def _mark_dbr_dirty(state: Dict[str, Any], now: datetime, source_job: str) -> None:
     maintenance = _dbr_state(state)
     maintenance["dirty"] = True
@@ -263,6 +495,63 @@ def _dbr_full_due(state: Dict[str, Any], now: datetime) -> bool:
     # make an unconfigured/new installation run a costly DBR job before its
     # first ordinary sync has completed.
     return last is not None and (now - last).total_seconds() >= _DBR_FULL_INTERVAL_SECONDS
+
+
+def _acquire_cluster_lock(db: Optional[Session]):
+    if db is None:
+        return True
+    if not hasattr(db, "get_bind"):
+        return True
+    try:
+        bind = db.get_bind()
+        dialect = getattr(bind, "dialect", None)
+        if getattr(dialect, "name", "") != "postgresql":
+            return True
+    except Exception:
+        return False
+
+    connection = None
+    try:
+        # Session commits/rollbacks may return their connection to the pool.
+        # Keep the advisory lock on a dedicated connection for the whole tick.
+        connection = bind.connect()
+        (acquired,) = connection.execute(
+            text("SELECT pg_try_advisory_lock(:k)"),
+            {"k": _SYNC_ORCHESTRATOR_LOCK_KEY},
+        ).fetchone()
+        connection.commit()
+        if not acquired:
+            connection.close()
+            return False
+        return connection
+    except Exception:
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+        return False
+
+
+def _release_cluster_lock(lock) -> None:
+    if lock is True or lock is False or lock is None:
+        return
+    try:
+        lock.execute(
+            text("SELECT pg_advisory_unlock(:k)"),
+            {"k": _SYNC_ORCHESTRATOR_LOCK_KEY},
+        )
+        lock.commit()
+    except Exception:
+        try:
+            lock.rollback()
+        except Exception:
+            pass
+    finally:
+        try:
+            lock.close()
+        except Exception:
+            pass
 
 
 def _run_dbr_maintenance(db: Session, *, full: bool) -> Dict[str, Any]:
@@ -298,17 +587,6 @@ def pull_queue_health(db: Optional[Session]) -> Dict[str, int]:
     return {"pending": pending, "error_retryable": retryable, "error_exhausted": exhausted, "ready": pending + retryable}
 
 
-def _run_ledger_pulls(db: Session, config: Dict[str, Any]) -> Dict[str, Any]:
-    results = process_pending_pulls(db, config=config, limit=_LEDGER_PULL_LIMIT)
-    return {
-        "processed": len(results),
-        "done": sum(1 for result in results if result.status == "done"),
-        "empty": sum(1 for result in results if result.status == "empty"),
-        "error": sum(1 for result in results if result.status == "error"),
-        "queue": pull_queue_health(db),
-    }
-
-
 # --- Public API --------------------------------------------------------------
 
 def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
@@ -323,32 +601,25 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
 
     if not _run_lock.acquire(blocking=False):
         return {"status": "busy", "reason": "another sync is running"}
+    cluster_locked = False
     try:
+        cluster_locked = _acquire_cluster_lock(db)
+        if not cluster_locked:
+            return {"status": "busy", "reason": "another sync is running (cluster lock)"}
+
         now = now or _now()
         state = _load_state()
 
-        # Maintenance has precedence over a new OData pull but is still exactly
-        # one unit per tick. A source job only marks DBR dirty; it never starts
-        # recalculation in the same tick.
+        # Recorder pulls are part of the physical-refresh BUILDING generation.
+        # They must never create shared physical batches outside that lifecycle.
         ledger_health = pull_queue_health(db)
-        if ledger_health["ready"]:
-            started = time.time()
-            try:
-                summary = _run_ledger_pulls(db, config)
-                result = {"status": "ok", "job": "ledgerPulls", "summary": summary}
-            except Exception as exc:  # defensive: process_pending_pulls isolates rows itself
-                db.rollback()
-                result = {"status": "error", "job": "ledgerPulls", "error": str(exc)}
-            result["duration_ms"] = int((time.time() - started) * 1000)
-            _save_state(state)
-            return result
 
         maintenance = _dbr_state(state)
         dbr_mode = (
             "full" if maintenance.get("full_pending") and _dbr_dirty_due(state, now)
             else ("incremental" if _dbr_dirty_due(state, now) else ("full" if _dbr_full_due(state, now) else None))
         )
-        if dbr_mode is not None:
+        if dbr_mode is not None and not ledger_health["ready"]:
             started = time.time()
             try:
                 summary = _run_dbr_maintenance(db, full=dbr_mode == "full")
@@ -382,8 +653,90 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
                 if dbr_mode == "full":
                     maintenance["full_pending"] = True
                 result = {"status": "error", "job": "dbrMaintenance", "mode": dbr_mode, "error": str(exc)}
-            _save_state(state)
+            _save_state(state, required=True)
             result["duration_ms"] = maintenance["last_duration_ms"]
+            return result
+
+        physical_state = _physical_refresh_state(state)
+        active_parent_for_inventory = _current_accepted_parent(db) if _has_current_accepted_parent(db) else None
+        physical_inventory = _physical_refresh_inventory(
+            db,
+            int(active_parent_for_inventory.id) if active_parent_for_inventory is not None else None,
+        )
+        if physical_inventory["unexpected"]:
+            raise RuntimeError(
+                "unexpected BUILDING physical refresh generations require review: "
+                + json.dumps(physical_inventory["unexpected"], ensure_ascii=False)
+            )
+        if _has_current_accepted_parent(db) and (
+            ledger_health["ready"] or _physical_refresh_due(state, now)
+        ):
+            started = time.time()
+            active_cutoff = _parse_iso(physical_state.get("active_cutoff"))
+            active_key = str(physical_state.get("active_generation_key") or "").strip()
+            if active_cutoff is None or not active_key:
+                active_parent = _current_accepted_parent(db)
+                inventory = _physical_refresh_inventory(db, int(active_parent.id))
+                if inventory["unexpected"]:
+                    raise RuntimeError(
+                        "unexpected BUILDING physical refresh generations require review: "
+                        + json.dumps(inventory["unexpected"], ensure_ascii=False)
+                    )
+                recoverable = inventory["recoverable"]
+                if len(recoverable) > 1:
+                    raise RuntimeError(
+                        "multiple BUILDING physical refresh generations require review"
+                    )
+                if recoverable:
+                    candidate = recoverable[0]
+                    active_cutoff = _to_utc(candidate.cutoff).replace(
+                        microsecond=0
+                    )
+                    active_key = str(candidate.generation_key)
+                else:
+                    active_cutoff = _to_utc(now).replace(microsecond=0)
+                    active_key = (
+                        f"physical-refresh:{active_parent.id}:"
+                        f"{active_cutoff.isoformat()}"
+                    )
+                physical_state["active_cutoff"] = active_cutoff.isoformat()
+                physical_state["active_generation_key"] = active_key
+                # The retry identity must survive a worker/process crash before
+                # any remote read or durable import checkpoint.
+                _save_state(state, required=True)
+            try:
+                summary = _run_physical_refresh_job(
+                    db, active_cutoff, active_key
+                )
+                physical_state["last_status"] = "ok"
+                physical_state["last_error"] = None
+                physical_state["failure_count"] = 0
+                physical_state["next_retry_at"] = None
+                physical_state["last_attempt_at"] = now.isoformat()
+                physical_state["last_success_at"] = now.isoformat()
+                physical_state["last_cutoff"] = summary["target_cutoff"]
+                physical_state["last_result"] = summary
+                physical_state["active_cutoff"] = None
+                physical_state["active_generation_key"] = None
+                physical_state["last_duration_ms"] = int((time.time() - started) * 1000)
+                result = {"status": "ok", "job": "physicalRefresh", "summary": summary}
+            except Exception as exc:  # noqa: BLE001
+                _rollback_if_possible(db)
+                failures = int(physical_state.get("failure_count") or 0) + 1
+                backoff = min(
+                    _PHYSICAL_REFRESH_RETRY_BASE_SECONDS * (2 ** (failures - 1)),
+                    _PHYSICAL_REFRESH_RETRY_MAX_SECONDS,
+                )
+                physical_state["last_status"] = "error"
+                physical_state["last_error"] = str(exc)[:1000]
+                physical_state["failure_count"] = failures
+                physical_state["next_retry_at"] = (now + timedelta(seconds=backoff)).isoformat()
+                physical_state["last_attempt_at"] = now.isoformat()
+                physical_state["last_duration_ms"] = int((time.time() - started) * 1000)
+                physical_state["last_cutoff"] = _to_utc(now).isoformat()
+                result = {"status": "error", "job": "physicalRefresh", "error": str(exc)}
+            _save_state(state, required=True)
+            result["duration_ms"] = physical_state["last_duration_ms"]
             return result
 
         due = _due_jobs(state, now)
@@ -407,7 +760,7 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
             if job.id in _DBR_SOURCE_JOBS:
                 _mark_dbr_dirty(state, now, job.id)
         except Exception as exc:  # noqa: BLE001 — one job's failure must not kill the loop
-            db.rollback()
+            _rollback_if_possible(db)
             job_state["last_status"] = "error"
             job_state["last_error"] = str(exc)[:1000]
             result["status"] = "error"
@@ -418,11 +771,13 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
             job_state["last_run_at"] = now.isoformat()
             job_state["last_duration_ms"] = int((time.time() - started) * 1000)
             state.setdefault("jobs", {})[job.id] = job_state
-            _save_state(state)
+            _save_state(state, required=True)
 
         result["duration_ms"] = job_state["last_duration_ms"]
         return result
     finally:
+        if cluster_locked:
+            _release_cluster_lock(cluster_locked)
         _run_lock.release()
 
 
@@ -453,6 +808,18 @@ def status(db: Optional[Session] = None, *, now: Optional[datetime] = None) -> D
             "next_due_at": next_due,
             "due_now": last is None or (now - last).total_seconds() >= interval,
         })
+    current_parent_id: int | None = None
+    physical_inventory: Dict[str, Any] = {
+        "total": 0,
+        "recoverable": [],
+        "unexpected": [],
+    }
+    if db is not None:
+        try:
+            current_parent_id = int(_current_accepted_parent(db).id)
+        except Exception:
+            pass
+        physical_inventory = _physical_refresh_inventory(db, current_parent_id)
     return {
         "status": "ok",
         "configured": bool(str(config.get("base_url") or "").strip()),
@@ -470,6 +837,23 @@ def status(db: Optional[Session] = None, *, now: Optional[datetime] = None) -> D
             "last_duration_ms": _dbr_state(state).get("last_duration_ms"),
         },
         "ledger_pull_queue": pull_queue_health(db),
+        "physical_refresh": {
+            "last_status": _physical_refresh_state(state).get("last_status"),
+            "last_error": _physical_refresh_state(state).get("last_error"),
+            "failure_count": int(_physical_refresh_state(state).get("failure_count") or 0),
+            "next_retry_at": _physical_refresh_state(state).get("next_retry_at"),
+            "last_attempt_at": _physical_refresh_state(state).get("last_attempt_at"),
+            "last_success_at": _physical_refresh_state(state).get("last_success_at"),
+            "last_cutoff": _physical_refresh_state(state).get("last_cutoff"),
+            "active_cutoff": _physical_refresh_state(state).get("active_cutoff"),
+            "active_generation_key": _physical_refresh_state(state).get("active_generation_key"),
+            "last_duration_ms": _physical_refresh_state(state).get("last_duration_ms"),
+            "last_result": _physical_refresh_state(state).get("last_result"),
+            "building_inventory_total": int(physical_inventory["total"]),
+            "recoverable_building_count": len(physical_inventory["recoverable"]),
+            "unexpected_building_count": len(physical_inventory["unexpected"]),
+            "unexpected_buildings": physical_inventory["unexpected"],
+        },
         "processing_stock": processing_stock_status(db) if db is not None else None,
     }
 
@@ -489,5 +873,5 @@ def update_config(updates: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
             js["interval_seconds"] = max(60, int(patch["interval_seconds"]))
         if "enabled" in patch and patch["enabled"] is not None:
             js["enabled"] = bool(patch["enabled"])
-    _save_state(state)
+    _save_state(state, required=True)
     return status()

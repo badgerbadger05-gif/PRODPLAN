@@ -97,6 +97,7 @@ class PullResult:
     skipped_unknown_record_type: int = 0
     touched_keys: List[LedgerKey] = field(default_factory=list)
     diagnostics: List[str] = field(default_factory=list)
+    physical_import_batch_id: Optional[int] = None
     error: Optional[str] = None
 
 
@@ -351,6 +352,9 @@ def pull_recorder_movements(
     # The lock must cover the remote read as well as the local apply. Otherwise
     # two transactions may fetch different 1C revisions and apply them in the
     # reverse order after waiting only at the write boundary.
+    from .physical import guard_physical_batch_writer
+
+    guard_physical_batch_writer(session)
     _advisory_xact_lock(session, recorder_type, recorder_ref)
 
     filter_query = f"Recorder eq cast(guid'{recorder_ref}', '{recorder_type}')"
@@ -527,6 +531,7 @@ def pull_recorder_movements(
         and active_state_matches
     ):
         result.status = "done" if expected_line_count else "empty"
+        result.physical_import_batch_id = int(latest_batch.id) if latest_batch is not None else None
         pull_row = _upsert_pull_row(
             session,
             recorder_type,
@@ -549,7 +554,10 @@ def pull_recorder_movements(
             f"after:{int(latest_batch.id) if latest_batch is not None else 0}:"
             f"{content_hash[:32]}"
         ),
-        cutoff=max((row[4] for row in normalized), default=datetime.now()),
+        cutoff=max(
+            (row[4] for row in normalized),
+            default=max_posting_at or datetime.now(),
+        ),
         source_watermarks={
             "source": REGISTER_ENTITY,
             "recorder_type": recorder_type,
@@ -562,6 +570,7 @@ def pull_recorder_movements(
         },
         batch=import_batch,
     )
+    result.physical_import_batch_id = int(import_batch.id)
 
     replaced_sle_ids = [int(row.id) for row in active_rows]
     if replaced_sle_ids and ledger_generation_id is not None:

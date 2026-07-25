@@ -31,6 +31,7 @@ from .physical import (
     LedgerKey,
     canonical_content_hash,
     canonical_decimal,
+    guard_physical_batch_writer,
     seed_from_balance,
 )
 from .physical import EPS
@@ -47,6 +48,7 @@ OPENING_SOURCE = "historical-bootstrap-opening-seed"
 OPENING_CONTENT_HASH_KEY = "content_hash"
 OPENING_AT_KEY = "opening_at"
 OPENING_BATCH_ID_KEY = "physical_import_batch_id"
+PHYSICAL_REFRESH_KIND = "physical_refresh"
 
 
 @dataclass(frozen=True)
@@ -132,6 +134,24 @@ def _assert_historical_building_generation(db: Session, generation_id: int) -> m
         )
     if generation.cutoff is None:
         raise Phase0BootstrapError("generation requires cutoff")
+    return generation
+
+
+def _assert_physical_refresh_building_generation(
+    db: Session, generation_id: int
+) -> models.LedgerGeneration:
+    generation = db.get(models.LedgerGeneration, int(generation_id))
+    if generation is None:
+        raise Phase0BootstrapError(f"LedgerGeneration {generation_id} not found")
+    if str(generation.status or "") != "building":
+        raise Phase0BootstrapError("requires BUILDING physical refresh generation")
+    if generation.cutoff is None:
+        raise Phase0BootstrapError("generation requires cutoff")
+    if generation.physical_import_batch_id is None:
+        raise Phase0BootstrapError("generation has no physical import terminal")
+    watermarks = _generation_source_watermarks(generation)
+    if watermarks.get("generation_kind") != PHYSICAL_REFRESH_KIND:
+        raise Phase0BootstrapError("generation requires generation_kind=physical_refresh")
     return generation
 
 
@@ -237,6 +257,7 @@ def seed_historical_opening_balance(
         _assert_no_interleaving_import_batches(db, generation)
 
         opening_batch_key = _batch_key(generation, content_hash)
+        guard_physical_batch_writer(db)
         opening_batch = models.PhysicalImportBatch(
             batch_key=opening_batch_key,
             status="completed",
@@ -402,6 +423,86 @@ def evaluate_historical_balance_convergence(
     except Exception as exc:
         db.rollback()
         raise Phase0BootstrapError(str(exc)) from exc
+
+    return BalanceConvergenceResult(
+        ledger_generation_id=int(generation.id),
+        cutoff=cutoff.isoformat(),
+        checked_at=checked.isoformat(),
+        valid=valid,
+        content_hash=content_hash,
+        compared=compared,
+        matched=matched,
+        mismatched=mismatched,
+        terminal_batch_id=int(generation.physical_import_batch_id),
+        deltas=tuple(deltas),
+    )
+
+
+def evaluate_physical_refresh_balance_convergence(
+    db: Session,
+    *,
+    ledger_generation_id: int,
+    balance_snapshot: Mapping[LedgerKey | tuple[int, str, str, str], Any],
+    checked_at: datetime | None = None,
+    eps: Decimal = EPS,
+    commit: bool = False,
+) -> BalanceConvergenceResult:
+    """Compare Balance without adjustments and persist a deterministic diagnostic."""
+    generation = _assert_physical_refresh_building_generation(db, ledger_generation_id)
+    normalized_snapshot = _aggregate_snapshot(balance_snapshot)
+    content_hash = _snapshot_convergence_content_hash(normalized_snapshot)
+    visible = _aggregate_sles_for_convergence(db, generation)
+
+    deltas: list[BalanceConvergenceDelta] = []
+    compared = 0
+    matched = 0
+    mismatched = 0
+    keys = set(visible.keys()) | set(normalized_snapshot.keys())
+
+    for item_id, organization_ref, warehouse_ref1c in sorted(keys):
+        agg_key = (item_id, organization_ref, warehouse_ref1c)
+        balance_qty = normalized_snapshot.get(agg_key, Decimal("0"))
+        ledger_qty = visible.get(agg_key, Decimal("0"))
+        delta = balance_qty - ledger_qty
+        close = abs(delta) <= eps
+        if close:
+            matched += 1
+        else:
+            mismatched += 1
+        compared += 1
+        deltas.append(
+            BalanceConvergenceDelta(
+                item_id=item_id,
+                organization_ref=organization_ref,
+                warehouse_ref1c=warehouse_ref1c,
+                balance_qty=str(balance_qty.normalize()),
+                ledger_qty=str(ledger_qty.normalize()),
+                delta_qty=str(delta.normalize()),
+                matched=close,
+            )
+        )
+
+    valid = mismatched == 0
+    checked = _utc(checked_at or datetime.now(timezone.utc), "checked_at")
+    cutoff = _utc(generation.cutoff, "generation cutoff")
+    convergence = {
+        "checked_at": checked.isoformat(),
+        "valid": valid,
+        "cutoff": cutoff.isoformat(),
+        "physical_import_batch_id": int(generation.physical_import_batch_id),
+        "content_hash": content_hash,
+        "compared": compared,
+        "matched": matched,
+        "mismatched": mismatched,
+    }
+
+    watermarks = _generation_source_watermarks(generation)
+    generation.source_watermarks = {
+        **watermarks,
+        CONVERGENCE_KEY: convergence,
+    }
+    if commit:
+        db.commit()
 
     return BalanceConvergenceResult(
         ledger_generation_id=int(generation.id),

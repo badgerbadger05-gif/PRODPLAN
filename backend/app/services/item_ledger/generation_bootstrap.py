@@ -20,6 +20,7 @@ from .historical_import_orchestration import (
     HistoricalImportResult,
     run_historical_physical_import,
 )
+from .physical import guard_physical_batch_writer
 
 
 ALGORITHM_VERSION = "ledger-generation-bootstrap/1"
@@ -202,6 +203,7 @@ def create_historical_generation(
                 f"Ledger build checkpoint {int(incomplete_stage[0])} is incomplete"
             )
 
+        guard_physical_batch_writer(db)
         boundary = models.PhysicalImportBatch(
             batch_key=f"bootstrap:{key}",
             status="completed",
