@@ -471,6 +471,44 @@ def test_foreign_generation_rows_are_isolated(db_session):
     assert result["execution_allocations"] == 1
 
 
+def test_validation_accepts_current_generation_supplier_reservation_cycle(db_session):
+    generation, _requirement = _synthetic(db_session, "supplier-cycle")
+    accept_generation_build(
+        db_session, generation.id, replay_from=datetime(2026, 7, 1)
+    )
+    generation.status = "building"
+    generation.accepted_at = None
+    event = db_session.query(models.ReservationEvent).filter_by(
+        ledger_generation_id=generation.id
+    ).first()
+    event.cycle_id = f"historical-supplier:g{generation.id}:accept"
+    db_session.flush()
+
+    result = validate_generation_build(db_session, generation.id)
+
+    assert result["valid"] is True
+
+
+def test_validation_rejects_foreign_generation_supplier_reservation_cycle(db_session):
+    generation, _requirement = _synthetic(db_session, "foreign-supplier-cycle")
+    accept_generation_build(
+        db_session, generation.id, replay_from=datetime(2026, 7, 1)
+    )
+    generation.status = "building"
+    generation.accepted_at = None
+    event = db_session.query(models.ReservationEvent).filter_by(
+        ledger_generation_id=generation.id
+    ).first()
+    event.cycle_id = f"historical-supplier:g{generation.id + 1}:accept"
+    db_session.flush()
+
+    with pytest.raises(
+        GenerationValidationError,
+        match="legacy reservation event entered generation build",
+    ):
+        validate_generation_build(db_session, generation.id)
+
+
 def test_validation_rejects_unphased_allocation_for_nonlegacy_make_requirement(db_session):
     generation, requirement = _synthetic(db_session, "no-legacy-unphased")
     _configure_obligation_checkpoint(

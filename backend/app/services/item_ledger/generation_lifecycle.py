@@ -418,11 +418,18 @@ def validate_generation_build(
     events = db.query(models.ReservationEvent).filter(
         models.ReservationEvent.ledger_generation_id == int(generation.id)
     ).all()
+    allowed_reservation_cycles = {
+        f"historical-obligations:g{generation.id}",
+        f"historical-replay:g{generation.id}",
+    }
+    supplier_cycle_prefix = f"historical-supplier:g{generation.id}:"
     for event in events:
         if int(event.reservation_id) not in entry_by_id:
             raise GenerationValidationError("reservation event escapes generation")
-        if not str(event.cycle_id or "").startswith(
-            ("historical-obligations:g", "historical-replay:g")
+        event_cycle = str(event.cycle_id or "")
+        if (
+            event_cycle not in allowed_reservation_cycles
+            and not event_cycle.startswith(supplier_cycle_prefix)
         ):
             raise GenerationValidationError("legacy reservation event entered generation build")
         reserved, realized = event_sums[int(event.reservation_id)]
