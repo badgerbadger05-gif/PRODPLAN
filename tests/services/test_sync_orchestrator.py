@@ -458,3 +458,31 @@ def test_tick_fails_closed_on_unexpected_building_physical_refresh(
     inventory = orch.status(db_session)["physical_refresh"]
     assert inventory["building_inventory_total"] == 1
     assert inventory["unexpected_building_count"] == 1
+
+
+def test_orphan_non_physical_terminal_is_visible_and_blocks_remote_refresh(
+    tmp_state, db_session, monkeypatch
+):
+    parent = _accepted_parent_fixture(db_session)
+    db_session.add(
+        models.PhysicalImportBatch(
+            batch_key="bootstrap-orphan-terminal",
+            status="completed",
+            cutoff=parent.cutoff + timedelta(hours=1),
+            source_watermarks={"source": "historical-bootstrap-boundary"},
+        )
+    )
+    db_session.commit()
+    monkeypatch.setattr(orch, "load_odata_config", lambda: {"base_url": "http://configured"})
+    monkeypatch.setattr(
+        orch,
+        "_run_physical_refresh_job",
+        lambda *args, **kwargs: pytest.fail("remote refresh must be blocked by terminal conflict"),
+    )
+    snapshot = orch.status(db_session)
+    physical = snapshot["physical_refresh"]
+    assert physical["accepted_physical_terminal_id"] == int(parent.physical_import_batch_id)
+    assert physical["global_physical_terminal_id"] != physical["accepted_physical_terminal_id"]
+    assert physical["terminal_conflict"] is True
+    with pytest.raises(RuntimeError, match="terminal conflicts"):
+        orch.tick(db_session, now=datetime(2026, 7, 24, 12, tzinfo=timezone.utc))

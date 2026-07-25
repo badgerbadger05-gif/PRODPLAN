@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import text
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 from ..schemas import ODataSyncRequest
@@ -404,6 +404,58 @@ def _physical_refresh_inventory(
     return inventory
 
 
+def _physical_terminal_preflight(
+    db: Optional[Session], parent_generation: Optional[models.LedgerGeneration]
+) -> Dict[str, Any]:
+    accepted_id = (
+        int(parent_generation.physical_import_batch_id)
+        if parent_generation is not None and parent_generation.physical_import_batch_id is not None
+        else None
+    )
+    result: Dict[str, Any] = {
+        "accepted_physical_terminal_id": accepted_id,
+        "global_physical_terminal_id": None,
+        "terminal_conflict": False,
+        "terminal_conflict_batch": None,
+        "explained_by_generation_id": None,
+    }
+    if db is None or not hasattr(db, "query"):
+        return result
+    global_id = db.query(func.max(models.PhysicalImportBatch.id)).scalar()
+    result["global_physical_terminal_id"] = int(global_id) if global_id is not None else None
+    if accepted_id is None or global_id is None or int(global_id) == accepted_id:
+        return result
+    current_parent_id = int(parent_generation.id) if parent_generation is not None else None
+    explained = (
+        db.query(models.LedgerGeneration)
+        .filter(
+            models.LedgerGeneration.status == "building",
+            models.LedgerGeneration.physical_import_batch_id == int(global_id),
+        )
+        .all()
+    )
+    for generation in explained:
+        marks = dict(generation.source_watermarks or {})
+        try:
+            same_parent = int(marks.get("parent_generation_id")) == current_parent_id
+        except (TypeError, ValueError):
+            same_parent = False
+        if marks.get("generation_kind") == "physical_refresh" and same_parent:
+            result["explained_by_generation_id"] = int(generation.id)
+            return result
+    batch = db.get(models.PhysicalImportBatch, int(global_id))
+    result["terminal_conflict"] = True
+    if batch is not None:
+        result["terminal_conflict_batch"] = {
+            "id": int(batch.id),
+            "batch_key": str(batch.batch_key),
+            "status": str(batch.status),
+            "cutoff": batch.cutoff.isoformat() if batch.cutoff is not None else None,
+            "source": dict(batch.source_watermarks or {}).get("source"),
+        }
+    return result
+
+
 def _physical_refresh_due(state: Dict[str, Any], now: datetime) -> bool:
     maintenance = _physical_refresh_state(state)
     if int(maintenance.get("failure_count") or 0) > 0:
@@ -659,6 +711,12 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
 
         physical_state = _physical_refresh_state(state)
         active_parent_for_inventory = _current_accepted_parent(db) if _has_current_accepted_parent(db) else None
+        terminal_preflight = _physical_terminal_preflight(db, active_parent_for_inventory)
+        if terminal_preflight["terminal_conflict"]:
+            raise RuntimeError(
+                "physical import terminal conflicts with accepted planning truth: "
+                + json.dumps(terminal_preflight["terminal_conflict_batch"], ensure_ascii=False)
+            )
         physical_inventory = _physical_refresh_inventory(
             db,
             int(active_parent_for_inventory.id) if active_parent_for_inventory is not None else None,
@@ -814,6 +872,10 @@ def status(db: Optional[Session] = None, *, now: Optional[datetime] = None) -> D
         "recoverable": [],
         "unexpected": [],
     }
+    terminal_preflight: Dict[str, Any] = _physical_terminal_preflight(
+        db,
+        _current_accepted_parent(db) if db is not None and _has_current_accepted_parent(db) else None,
+    )
     if db is not None:
         try:
             current_parent_id = int(_current_accepted_parent(db).id)
@@ -853,6 +915,11 @@ def status(db: Optional[Session] = None, *, now: Optional[datetime] = None) -> D
             "recoverable_building_count": len(physical_inventory["recoverable"]),
             "unexpected_building_count": len(physical_inventory["unexpected"]),
             "unexpected_buildings": physical_inventory["unexpected"],
+            "accepted_physical_terminal_id": terminal_preflight["accepted_physical_terminal_id"],
+            "global_physical_terminal_id": terminal_preflight["global_physical_terminal_id"],
+            "terminal_conflict": terminal_preflight["terminal_conflict"],
+            "terminal_conflict_batch": terminal_preflight["terminal_conflict_batch"],
+            "terminal_explained_by_generation_id": terminal_preflight["explained_by_generation_id"],
         },
         "processing_stock": processing_stock_status(db) if db is not None else None,
     }
