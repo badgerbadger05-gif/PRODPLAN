@@ -278,6 +278,7 @@ def list_period_plans(
                     ),
                     "execution_completed_qty": summary.get("execution_completed_qty"),
                     "execution_base_qty": summary.get("execution_base_qty"),
+                    "execution_by_flow": summary.get("execution_by_flow") or {},
                     "execution_status": str(payload.get("truth_status") or ""),
                     "execution_reason": payload.get("truth_reason"),
                     "execution_generation_id": int(truth_generation_id),
@@ -297,6 +298,7 @@ def list_period_plans(
                         "execution_partial": False,
                         "execution_completed_qty": None,
                         "execution_base_qty": None,
+                        "execution_by_flow": {},
                         "execution_status": "unavailable",
                         "execution_reason": (
                             "Execution snapshot is missing for the accepted Ledger generation"
