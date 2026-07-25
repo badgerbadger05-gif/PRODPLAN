@@ -288,8 +288,18 @@ export type ExecutionJournalSummary = {
   net_zero: number
   execution_completed_qty?: number
   execution_base_qty?: number
-  execution_pct?: number
-  execution_by_flow?: Record<string, { completed_qty: number; base_qty: number; execution_pct: number }>
+  execution_pct?: number | null
+  execution_by_flow?: Record<
+    string,
+    {
+      completed_qty: number
+      base_qty: number
+      execution_pct: number | null
+      available?: boolean
+      confirmed_pct?: number | null
+      total_base_qty?: number
+    }
+  > | null
 }
 
 export type ExecutionJournalResponse = {
@@ -317,6 +327,45 @@ export function flowLabel(flow: string) {
   if (flow === 'purchase') return 'Закупка'
   if (flow === 'rework') return 'Переработка'
   return flow
+}
+
+// Preferred display order for the well-known replenishment flows; unknown
+// flow keys are appended after these in their original order.
+const FLOW_DISPLAY_ORDER = ['purchase', 'production', 'rework']
+
+export type ExecutionFlowSummaryRow = {
+  flow: string
+  label: string
+  text: string
+}
+
+// Builds the per-flow entries shown in the execution journal header, e.g.
+// "Закупка: 0%", "Производство: 98.5%", "Переработка: недоступно".
+// Every entry keeps its label; a flow with no execution data (unavailable, or
+// a null percentage) is rendered as "недоступно" instead of a fake number, and
+// an unknown flow key falls back to showing the key itself (via flowLabel).
+export function executionFlowSummary(
+  source: ExecutionJournalSummary['execution_by_flow'],
+): ExecutionFlowSummaryRow[] {
+  if (!source) return []
+  const orderOf = (flow: string) => {
+    const idx = FLOW_DISPLAY_ORDER.indexOf(flow)
+    return idx === -1 ? FLOW_DISPLAY_ORDER.length : idx
+  }
+  const keys = Object.keys(source).sort((a, b) => orderOf(a) - orderOf(b))
+  const rows: ExecutionFlowSummaryRow[] = []
+  for (const flow of keys) {
+    const entry = source[flow]
+    const base = entry?.base_qty ?? 0
+    const available = entry?.available ?? true
+    const pct = entry?.execution_pct
+    // Skip available flows with no demand (net-zero); always surface a flow
+    // that is unavailable so the operator sees the "недоступно" state.
+    if (available && base <= 1e-9) continue
+    const text = !available || typeof pct !== 'number' ? 'недоступно' : `${pct}%`
+    rows.push({ flow, label: flowLabel(flow), text })
+  }
+  return rows
 }
 
 export function flowClass(flow: string) {

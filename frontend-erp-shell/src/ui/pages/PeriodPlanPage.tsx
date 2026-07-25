@@ -9,6 +9,7 @@ import type {
 } from '../../domain/planning'
 import {
   coverageClass,
+  executionFlowSummary,
   flowClass,
   flowLabel,
   journalRowStatus,
@@ -979,36 +980,10 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     return Math.round((completed / base) * 1000) / 10
   }, [journal])
 
-  const journalExecutionByFlow = useMemo(() => {
-    if (!journal) return [] as Array<{ flow: string; label: string; pct: number; base: number }>
-    const source = journal.summary.execution_by_flow
-    if (source) {
-      return ['purchase', 'production', 'rework']
-        .map((flow) => ({
-          flow,
-          label: flowLabel(flow),
-          pct: source[flow]?.execution_pct ?? 100,
-          base: source[flow]?.base_qty ?? 0,
-        }))
-        .filter((row) => row.base > 1e-9)
-    }
-    const grouped = new Map<string, { completed: number; base: number }>()
-    journal.rows.forEach((row) => {
-      const base = row.progress_base_qty ?? row.net_qty ?? 0
-      const entry = grouped.get(row.flow) ?? { completed: 0, base: 0 }
-      entry.completed += row.completed_qty ?? 0
-      entry.base += base
-      grouped.set(row.flow, entry)
-    })
-    return ['purchase', 'production', 'rework']
-      .map((flow) => {
-        const entry = grouped.get(flow)
-        const base = entry?.base ?? 0
-        const pct = base > 1e-9 ? Math.round(((entry?.completed ?? 0) / base) * 1000) / 10 : 100
-        return { flow, label: flowLabel(flow), pct, base }
-      })
-      .filter((row) => row.base > 1e-9)
-  }, [journal])
+  const journalExecutionByFlow = useMemo(
+    () => (journal ? executionFlowSummary(journal.summary.execution_by_flow) : []),
+    [journal],
+  )
 
   const rootOptions = useMemo<RootProductOption[]>(() => (
     (matrix?.rows ?? []).map((row) => ({
@@ -1454,7 +1429,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
                     <span className="toolbarText" title="Выполнено / чистая потребность по всем строкам">Общее выполнение: {journalExecutionPct}%</span>
                   )}
                   {journalExecutionByFlow.map((row) => (
-                    <span key={row.flow} className="toolbarText">{row.label}: {row.pct}%</span>
+                    <span key={row.flow} className="toolbarText">{row.label}: {row.text}</span>
                   ))}
                   <button
                     className="filterBtn"
