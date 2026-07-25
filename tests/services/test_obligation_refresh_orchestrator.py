@@ -89,6 +89,12 @@ def test_add_only_builds_real_checkpoints_and_promotes_persisted_read_snapshot(d
     assert db_session.get(models.PlanningReadSnapshot, snapshot_id).truth_status == "accepted"
     # This public read function consumes the stored snapshot; it does not run MRP.
     assert read_mrp_result_manifest(db_session, candidate.run_id)["run_id"] == candidate.run_id
+    # Journals must not go dark after a refresh: every published generation
+    # carries its own period-plan execution snapshots (decisions-log §2.6/§7.7).
+    execution_snapshots = db_session.query(models.PlanningReadSnapshot).filter_by(
+        ledger_generation_id=target.id, consumer="period_plan_execution").all()
+    assert len(execution_snapshots) == 1
+    assert all(row.truth_status == "accepted" for row in execution_snapshots)
 
 
 def test_configured_dbr_policy_and_cockpit_publish_atomically(db_session):

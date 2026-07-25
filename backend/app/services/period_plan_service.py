@@ -3474,7 +3474,7 @@ def build_period_plan_execution_snapshots_for_generation(
     generation = db.get(LedgerGeneration, int(generation_id))
     if generation is None:
         raise ValueError("execution snapshot generation does not exist")
-    run_ids = [
+    reservation_run_ids = {
         int(run_id)
         for (run_id,) in (
             db.query(ReservationEntry.run_id)
@@ -3483,10 +3483,25 @@ def build_period_plan_execution_snapshots_for_generation(
                 ReservationEntry.run_id.isnot(None),
             )
             .distinct()
-            .order_by(ReservationEntry.run_id.asc())
             .all()
         )
-    ]
+    }
+    # A candidate run with zero reservations (e.g. a plan whose demand is fully
+    # stock-covered) still owns a journal: derive runs from the generation's own
+    # FIXED_SNAPSHOT lineage too, not only from reservation back-references.
+    generation_run_ids = {
+        int(run_id)
+        for (run_id,) in (
+            db.query(PlanningRun.run_id)
+            .filter(
+                PlanningRun.ledger_generation_id == int(generation_id),
+                PlanningRun.status == "FIXED_SNAPSHOT",
+                PlanningRun.source_plan_id.isnot(None),
+            )
+            .all()
+        )
+    }
+    run_ids = sorted(reservation_run_ids | generation_run_ids)
     runs = (
         db.query(PlanningRun)
         .filter(PlanningRun.run_id.in_(run_ids))

@@ -162,6 +162,23 @@ def _manifest_request_matches(
         raise ObligationRefreshOrchestratorError("conflicting retry of published refresh request")
 
 
+def _publish_execution_snapshots(db: Session, generation_id: int) -> None:
+    """Journals must never go dark after a refresh: every published generation
+    carries its own period-plan execution snapshots, same as genesis accept.
+    The builder is idempotent (existing identical snapshot is returned as-is),
+    so the exact-retry path is safe to route through here too."""
+    from app.services.period_plan_service import (
+        build_period_plan_execution_snapshots_for_generation,
+    )
+
+    try:
+        build_period_plan_execution_snapshots_for_generation(db, int(generation_id))
+    except (TypeError, ValueError) as exc:
+        raise ObligationRefreshOrchestratorError(
+            f"period-plan execution snapshot build failed: {exc}"
+        ) from exc
+
+
 def _retry_published(
     db: Session, target: models.LedgerGeneration, *, parent_generation_id: int,
     add_plan_ids: Iterable[int], horizon_days: int | None,
@@ -180,6 +197,7 @@ def _retry_published(
         db, parent_generation_id=int(parent_generation_id), target_generation_id=int(target.id),
         accepted_at=target.accepted_at, capabilities=dict(target.capabilities or {}),
     )
+    _publish_execution_snapshots(db, int(target.id))
     return ObligationRefreshOrchestrationResult(
         parent_generation_id=int(parent_generation_id), target_generation_id=int(target.id),
         candidate_run_ids=tuple(result.candidate_run_ids), published=result.published,
@@ -368,6 +386,7 @@ def run_obligation_refresh(
         db, parent_generation_id=int(parent_generation_id), target_generation_id=target_id,
         accepted_at=_utc(accepted_at), capabilities=dict(capabilities),
     )
+    _publish_execution_snapshots(db, target_id)
     return ObligationRefreshOrchestrationResult(
         parent_generation_id=int(parent_generation_id), target_generation_id=target_id,
         candidate_run_ids=tuple(published.candidate_run_ids), published=published.published,
