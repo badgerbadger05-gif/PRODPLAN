@@ -473,7 +473,10 @@ def _ledger_stock_by_item_at(
         db,
         physical_import_batch_id=int(physical_import_batch_id),
         cutoff=cutoff,
-    ).with_entities(StockLedgerEntry.item_id, func.sum(StockLedgerEntry.qty))
+    ).order_by(None).with_entities(
+        StockLedgerEntry.item_id,
+        func.sum(StockLedgerEntry.qty),
+    )
     if scope.has_warehouse_rows:
         query = (
             query.filter(StockLedgerEntry.warehouse_ref1c.in_(scope.selected_refs))
