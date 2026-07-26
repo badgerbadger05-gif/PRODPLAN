@@ -123,6 +123,11 @@ def _require_target_generation(
     return generation, parent
 
 
+# Recorder types that are synthetic (not backed by a 1C document) and therefore
+# must never be re-pulled from 1C during the recorder audit.
+_SYNTHETIC_RECORDER_TYPES = frozenset({"seed"})
+
+
 def _collect_recorder_identities(
     db: Session,
     parent_generation_id: int,
@@ -133,6 +138,11 @@ def _collect_recorder_identities(
     for row in parent_rows:
         recorder_type = str(row.recorder_type or "")
         recorder_ref = str(row.recorder_ref or "")
+        # Synthetic opening-balance anchors (movement_kind/recorder_type "seed")
+        # are not 1C documents; re-pulling them by Recorder filter makes 1C reject
+        # the request. They carry no real recorder to re-audit, so skip them.
+        if recorder_type in _SYNTHETIC_RECORDER_TYPES:
+            continue
         if recorder_ref:
             identities.add((recorder_type, recorder_ref))
 
@@ -145,6 +155,8 @@ def _collect_recorder_identities(
     for row in queued_rows:
         recorder_type = str(row.recorder_type or "")
         recorder_ref = str(row.recorder_ref or "")
+        if recorder_type in _SYNTHETIC_RECORDER_TYPES:
+            continue
         if recorder_ref:
             identities.add((recorder_type, recorder_ref))
 
