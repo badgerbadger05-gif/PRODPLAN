@@ -3,7 +3,7 @@ from datetime import date, datetime, timedelta, timezone
 import pytest
 
 from app import models
-from app.services.item_ledger.reservation import BUY, CONSUME
+from app.services.item_ledger.reservation import BUY
 from app.services.item_ledger.historical_obligations import (
     HistoricalObligationAmbiguity,
     materialize_historical_obligations,
@@ -43,7 +43,7 @@ def _plan(db, *, status="fixed", start=date(2026, 6, 1), end=date(2026, 6, 30)):
         period_from=start,
         period_to=end,
         status=status,
-        fixed_at=CUTOFF if status in {"fixed", "archived"} else None,
+        fixed_at=CUTOFF if status == "fixed" else None,
     )
     db.add(plan)
     db.flush()
@@ -79,8 +79,6 @@ def _requirement(db, run, *, status="open", gross=10, net=8):
         item_id=item.item_id,
         total_required_qty=gross,
         net_required_qty=net,
-        covered_qty=0,
-        remaining_qty=net,
         period_from=run.period_from,
         period_to=run.period_to,
         bom_level=1,
@@ -124,8 +122,6 @@ def _requirement_with_method(
         item_id=item.item_id,
         total_required_qty=gross,
         net_required_qty=net,
-        covered_qty=0,
-        remaining_qty=net,
         period_from=run.period_from,
         period_to=run.period_to,
         bom_level=1,
@@ -165,35 +161,22 @@ def _entry_by_mode(
 def _assert_purchased_contract_entry_sizes(
     db, req: models.MrpRequirement, *, gross: float, net: float
 ) -> None:
-    consume_entry = _entry_by_mode(db, req, CONSUME)
     buy_entry = _entry_by_mode(db, req, BUY)
-    assert consume_entry is not None
     assert buy_entry is not None
-    assert float(consume_entry.reserved_qty) == float(gross)
-    assert float(buy_entry.reserved_qty) == float(net)
-    assert consume_entry.lifecycle_status == "active"
+    assert float(buy_entry.reserved_qty) == float(gross)
+    assert float(buy_entry.replenishment_required_qty) == float(net)
     assert buy_entry.lifecycle_status == "active"
 
 
-def test_archived_fixed_plan_and_closed_requirement_are_materialized(db_session):
+def test_closed_plan_is_not_materialized_as_active_obligation(db_session):
     generation = _generation(db_session)
-    plan = _plan(db_session, status="archived")
-    run = _run(db_session, plan, status="CLOSED")
-    req = _requirement(db_session, run, status="closed")
+    plan = _plan(db_session, status="closed")
+    run = _run(db_session, plan, status="FIXED_SNAPSHOT")
+    _requirement(db_session, run, status="closed")
 
     result = materialize_historical_obligations(db_session, generation.id)
 
-    assert result["selected_run_ids"] == [run.run_id]
-    consume_entry = _entry_by_mode(db_session, req, CONSUME)
-    buy_entry = _entry_by_mode(db_session, req, BUY)
-    assert consume_entry is not None
-    assert buy_entry is not None
-    assert consume_entry.requirement_id == req.id
-    assert buy_entry.requirement_id == req.id
-    assert float(consume_entry.reserved_qty) == 10
-    assert float(buy_entry.reserved_qty) == 8
-    assert float(consume_entry.realized_qty) == 0
-    assert float(buy_entry.realized_qty) == 0
+    assert result["selected_run_ids"] == []
 
 
 def test_draft_source_less_and_nonterminal_runs_are_excluded(db_session):
@@ -217,10 +200,30 @@ def test_draft_source_less_and_nonterminal_runs_are_excluded(db_session):
     assert select_historical_obligation_runs(db_session, CUTOFF) == []
 
 
+def test_closed_run_is_not_materialized_from_historical_obligations(db_session):
+    plan = _plan(db_session)
+    run = _run(db_session, plan, status="CLOSED")
+    _requirement(db_session, run)
+
+    assert run.status == "CLOSED"
+    assert select_historical_obligation_runs(db_session, CUTOFF) == []
+
+
 def test_latest_fixed_snapshot_is_canonical_duplicate(db_session):
     plan = _plan(db_session)
-    old = _run(db_session, plan)
-    latest = _run(db_session, plan, prior=old)
+    db_session.add(
+        models.PlanningRun(
+            status="CLOSED",
+            config_snapshot={},
+            source_plan_id=plan.id,
+            fixed_at=CUTOFF,
+            period_from=date(2026, 6, 1),
+            period_to=date(2026, 6, 30),
+            prior_run_id=None,
+        )
+    )
+    db_session.flush()
+    latest = _run(db_session, plan)
 
     selected = select_historical_obligation_runs(db_session, CUTOFF)
 
@@ -259,8 +262,8 @@ def test_rerun_is_idempotent_with_completed_manifest(db_session):
     assert first["idempotent"] is False
     assert second["idempotent"] is True
     assert first["batch_id"] == second["batch_id"]
-    assert db_session.query(models.ReservationEntry).count() == 2
-    assert db_session.query(models.ReservationEvent).count() == 2
+    assert db_session.query(models.ReservationEntry).count() == 1
+    assert db_session.query(models.ReservationEvent).count() == 1
     assert db_session.query(models.LedgerBuildBatch).count() == 1
     assert db_session.query(models.LedgerBuildBatch).one().stage == (
         "reservation_materialize"
@@ -332,7 +335,7 @@ def test_legacy_bucket_outside_requirement_period_is_materialized(db_session):
     assert result["selected_bucket_ids"] == [int(req.buckets[0].id)]
     assert db_session.query(models.ReservationEntry).filter_by(
         requirement_id=req.id
-    ).count() == 2
+    ).count() == 1
 
 
 def test_legacy_net_mismatch_is_audited_for_all_requirements(db_session):

@@ -1,9 +1,9 @@
-"""Ledger-1 physical ingest — pull-by-document (design §2.1, §2.3, §3а, §6).
+"""Physical Item Ledger ingest by source document.
 
 Mirrors 1С ``AccumulationRegister_ЗапасыНаСкладах`` movement lines into the
 append-only ``stock_ledger_entry`` (ledger-1) READ-ONLY: this module contains no
 OData write and never touches a pre-existing planning table (INV-1way /
-INV-no-write). The confirmed 1С shape (Inc0 probe) is built to exactly:
+INV-no-write). The confirmed 1С shape is:
 
 * Query the register filtered ``Recorder eq cast(guid'REF', '<recorder_type>')``
   (the cast form works; ``Recorder_Key eq guid`` → HTTP 400). The response is one
@@ -15,9 +15,9 @@ INV-no-write). The confirmed 1С shape (Inc0 probe) is built to exactly:
   characteristic ``Характеристика_Key`` (zero GUID → ''), org ``Организация_Key``,
   ``LineNumber`` → line_no, ``Period`` → posting_at, and ``Active`` must be true.
 
-Dirt filter (§6): non-warehouse СтруктурнаяЕдиница (polymorphic, e.g. Контрагенты)
+Dirt filter: non-warehouse СтруктурнаяЕдиница (polymorphic, e.g. Контрагенты)
 → ``skipped_non_warehouse``; qty == 0 → dropped (no zero rows); unknown item →
-``skipped_unknown_item`` + diagnostic (no crash). Replace-by-recorder (§3а step 4)
+``skipped_unknown_item`` + diagnostic (no crash). Replace-by-recorder
 under a per-recorder advisory lock: delete this recorder's document_pull rows,
 insert the normalized lines, then rebuild running balance + stock_bin for every
 touched ledger key. Anchor guard skips lines at/under the active anchor T0.
@@ -111,7 +111,7 @@ class HistoricalPullValidationError(ValueError):
 
 
 def _norm_ref(value: Any) -> str:
-    """Normalize a 1С GUID ref: strip; zero GUID → '' (design §2.1)."""
+    """Normalize a 1С GUID ref: strip; zero GUID → '' ()."""
     s = str(value or "").strip()
     if not s or s == EMPTY_GUID:
         return ""
@@ -260,7 +260,7 @@ def _latest_recorder_import_batch(
 def _document_order_ref(client: Any, recorder_type: str, recorder_ref: str) -> str:
     """Fetch the recorder DOCUMENT HEADER and extract its production-order GUID.
 
-    Variant-B substrate for the SLE→reservation matching chain (design §6.3):
+    Variant-B substrate for the SLE→reservation matching chain ():
     * ``Document_СборкаЗапасов`` carries ``ЗаказНаПроизводство_Key`` (the field
       our manufacture export fills and the 1C UI fills for hand-made docs);
     * ``Document_ПеремещениеЗапасов`` carries the composite ``ДокументОснование``
@@ -295,7 +295,7 @@ def _document_order_ref(client: Any, recorder_type: str, recorder_ref: str) -> s
                     ref = _norm_ref(row.get("ДокументОснование"))
                     if ref:
                         return ref
-    except Exception:  # noqa: BLE001 — header capture is best-effort by design
+    except Exception:  # noqa: BLE001 — header capture is best-effort
         return ""
     return ""
 
@@ -330,7 +330,7 @@ def pull_recorder_movements(
     max_posting_at: Optional[datetime] = None,
     strict_historical: bool = False,
 ) -> PullResult:
-    """Pull one 1С recorder's RecordSet → ledger-1 (design §3а steps 1–5).
+    """Pull one 1С recorder's RecordSet → ledger-1 ( steps 1–5).
 
     Replace-by-recorder is atomic under a per-recorder advisory lock: the
     recorder's prior ``document_pull`` rows are deleted and the freshly
@@ -361,7 +361,7 @@ def pull_recorder_movements(
     rows = client.get_all(REGISTER_ENTITY, filter_query=filter_query, order_by=None)
     lines = _extract_record_set(rows if isinstance(rows, list) else [rows])
 
-    # Variant-B header capture (design §6.3): remember the producing order's
+    # Variant-B header capture (): remember the producing order's
     # GUID alongside the recorder so matching pegs 1C-native documents too.
     header_order_ref = _document_order_ref(client, recorder_type, recorder_ref)
 
@@ -572,29 +572,6 @@ def pull_recorder_movements(
     )
     result.physical_import_batch_id = int(import_batch.id)
 
-    replaced_sle_ids = [int(row.id) for row in active_rows]
-    if replaced_sle_ids and ledger_generation_id is not None:
-        from .reservation_ledger import unrealize_replaced_sle
-
-        provenance = {
-            int(event.id): int(event.sle_id)
-            for event in session.query(models.ReservationEvent)
-            .filter(models.ReservationEvent.sle_id.in_(replaced_sle_ids))
-            .all()
-            if event.sle_id is not None
-        }
-        unrealize_replaced_sle(
-            session,
-            replaced_sle_ids,
-            recorder_ref,
-            ledger_generation_id=ledger_generation_id,
-        )
-        if provenance:
-            for event in session.query(models.ReservationEvent).filter(
-                models.ReservationEvent.id.in_(list(provenance))
-            ):
-                event.sle_id = provenance[int(event.id)]
-
     for old in active_rows:
         old.active = False
 
@@ -639,29 +616,7 @@ def pull_recorder_movements(
         )
     result.touched_keys = list(touched.keys())
 
-    # Trigger т1 (design §5): event-driven incremental redistribute of the pools
-    # touched by this pull — realize/unrealize the fresh facts, THEN refresh the
-    # coverage caches, so uncovered / position стая current between full ledger
-    # cycles. Guarded internally: a failure logs and never breaks the pull (the
-    # cycle re-materializes the caches). The replace-by-recorder unrealize above
-    # already compensated the deleted rows; this re-matches the fresh ones.
-    touched_item_ids = {k.item_id for k in touched}
-    if touched_item_ids and ledger_generation_id is not None:
-        from .reservation_ledger import redistribute_after_ledger_apply
-
-        redistribute_after_ledger_apply(
-            session,
-            touched_item_ids,
-            f"pull:{recorder_ref}"[:64],
-            ledger_generation_id=ledger_generation_id,
-            sle_ids=[
-                int(row.id)
-                for row in new_by_line.values()
-                if row.id is not None
-            ],
-        )
-
-    # --- pull-status transition (§2.3) ---
+    # --- pull-status transition () ---
     # Success paths (done/empty) do NOT bump attempts: attempts counts failed
     # pull attempts only (the error path in process_pending_pulls bumps it).
     result.status = "done" if result.inserted > 0 else "empty"
@@ -683,7 +638,7 @@ def pull_recorder_movements(
 
 
 # ---------------------------------------------------------------------------
-# queue + retry (design §2.3 / §3а step 4)
+# queue + retry ( /  step 4)
 # ---------------------------------------------------------------------------
 
 
@@ -733,7 +688,7 @@ def enqueue_recorder_pull(
     recorder_ref: str,
     source: str = "",
 ) -> models.StockRecorderPull:
-    """Put a recorder on the pull queue (design §3а step 1) — fast, no OData.
+    """Put a recorder on the pull queue ( step 1) — fast, no OData.
 
     Get-or-create equivalent of ``INSERT ... ON CONFLICT(recorder) DO UPDATE
     status='pending'``: a new recorder is inserted 'pending'; an existing row is

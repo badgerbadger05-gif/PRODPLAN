@@ -27,7 +27,6 @@ from ..services.planning_service import (
     get_run_summary,
     get_run_purchases,  # retained as a test guard; snapshot routes never call it
     get_run_capacity,
-    get_run_pegging,
     # retention & pin control
     # Config management
     list_planning_configs,
@@ -43,7 +42,6 @@ from ..services.forced_orders import (
     create_forced_order_request,
     process_forced_order_request,
     export_forced_order_xlsx,
-    export_shortage_report_for_run,
 )
 from ..services.mrp_result_snapshot import (
     read_mrp_result_manifest,
@@ -56,7 +54,6 @@ from ..services.mrp_result_export import (
 from ..services.one_c_purchase_order_export import export_planned_purchases_to_1c
 from ..services.period_plan_service import (
     add_item_to_period_plan,
-    archive_period_plan,
     bulk_upsert_period_plan_lines,
     create_period_plan,
     create_mrp_snapshot_from_period_plan,
@@ -68,44 +65,10 @@ from ..services.period_plan_service import (
     get_period_plan_matrix,
     list_mrp_runs_for_plan,
     list_period_plans,
-    unarchive_period_plan,
     update_period_plan_header,
 )
 
 router = APIRouter(prefix="/v1/plan", tags=["plan"])
-
-
-def _retire_legacy_live_mrp(operation: str) -> None:
-    """Fail closed for calculators outside the Ledger candidate/publish flow."""
-    raise HTTPException(
-        status_code=410,
-        detail={
-            "code": "legacy_live_mrp_retired",
-            "operation": operation,
-            "truth_status": "unavailable",
-            "truth_reason": (
-                "Live MRP calculation and mutation are retired. Build an "
-                "immutable Item Ledger candidate and publish its saved snapshots."
-            ),
-        },
-    )
-
-
-def _reject_legacy_mrp_result_read(run_id: int) -> None:
-    """Do not expose non-snapshot result projections as planning truth."""
-    raise HTTPException(
-        status_code=503,
-        detail={
-            "code": "mrp_result_snapshot_required",
-            "run_id": int(run_id),
-            "truth_status": "unavailable",
-            "truth_reason": (
-                "This result view has not been migrated to the accepted "
-                "Item Ledger snapshot"
-            ),
-            "rows": [],
-        },
-    )
 
 
 def _read_all_mrp_snapshot_rows(
@@ -605,22 +568,6 @@ async def period_plans_fix(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.post("/period-plans/{plan_id}/archive")
-async def period_plans_archive(plan_id: int, db: Session = Depends(get_db)):
-    try:
-        return archive_period_plan(db, plan_id)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.post("/period-plans/{plan_id}/unarchive")
-async def period_plans_unarchive(plan_id: int, db: Session = Depends(get_db)):
-    try:
-        return unarchive_period_plan(db, plan_id)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
 @router.patch("/period-plans/{plan_id}")
 async def period_plans_patch(
     plan_id: int,
@@ -869,12 +816,6 @@ async def ensure_plan_item(
 
 # ===== MRP Planning API (runs and results) =====
 
-class CalcRequest(BaseModel):
-    horizon_days: Optional[int] = None
-    config_overrides: Optional[Dict[str, Any]] = None
-    started_by: Optional[str] = None
-
-
 # Retention & pinning DTOs
 class RetentionCleanupRequest(BaseModel):
     older_than_days: Optional[int] = 30
@@ -883,33 +824,6 @@ class RetentionCleanupRequest(BaseModel):
 
 class PinRequest(BaseModel):
     pinned: bool
-
-
-@router.post("/calc")
-async def start_planning_run(
-    req: CalcRequest,
-    db: Session = Depends(get_db)
-):
-    """Retired: live runs bypass immutable Ledger candidates and snapshots."""
-    _retire_legacy_live_mrp("calc")
-
-
-@router.post("/calc_preview")
-async def calc_preview(
-    req: CalcRequest,
-    db: Session = Depends(get_db)
-):
-    """Retired: previews must be persisted by the background refresh flow."""
-    _retire_legacy_live_mrp("calc_preview")
-
-
-@router.post("/calc_gross")
-async def calc_gross(
-    req: CalcRequest,
-    db: Session = Depends(get_db)
-):
-    """Retired: gross demand is part of a sealed Ledger-bound snapshot."""
-    _retire_legacy_live_mrp("calc_gross")
 
 
 # ===== Planning configuration management API =====
@@ -1340,47 +1254,6 @@ async def get_planning_result_capacity(
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.get("/results/{run_id}/pegging")
-async def get_planning_result_pegging(
-    run_id: int,
-    child_item_id: Optional[int] = None,
-    parent_item_id: Optional[int] = None,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    limit: int = 200,
-    offset: int = 0,
-    db: Session = Depends(get_db)
-):
-    """Трассируемость компонент → спрос (pegging) по прогону (с фильтрами и пагинацией)"""
-    _reject_legacy_mrp_result_read(run_id)
-    try:
-        return get_run_pegging(
-            db=db,
-            run_id=int(run_id),
-            child_item_id=child_item_id,
-            parent_item_id=parent_item_id,
-            date_from=date_from,
-            date_to=date_to,
-            limit=limit,
-            offset=offset,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.get("/results/{run_id}/shortage-report")
-async def get_shortage_report(
-    run_id: int,
-    db: Session = Depends(get_db),
-):
-    """XLSX отчёт по дефицитам комплектующих (blocked/partial) для прогона"""
-    _reject_legacy_mrp_result_read(run_id)
-    try:
-        return export_shortage_report_for_run(db=db, run_id=int(run_id))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
 @router.post("/forced_orders")
 async def create_forced_order(
     req: ForcedOrderCreateRequest,
@@ -1769,76 +1642,22 @@ class ReconcileRequest(BaseModel):
     dry_run: bool = False
 
 
-class RefreezeRequest(BaseModel):
-    dry_run: bool = False
-    plan_id: Optional[int] = None
-
-
-@router.post("/mrp-snapshot/refreeze")
-async def refreeze_mrp_snapshots(
-    req: RefreezeRequest = RefreezeRequest(),
-    db: Session = Depends(get_db),
-):
-    """Retired destructive endpoint; use the period-plan snapshot contract."""
-    _retire_legacy_live_mrp("mrp_snapshot_refreeze")
-
-
-@router.post("/reconcile")
-async def reconcile_active_snapshots(
-    req: ReconcileRequest = ReconcileRequest(),
-    db: Session = Depends(get_db),
-):
-    """Retired: proposal mutations belong to obligation-refresh publish."""
-    _retire_legacy_live_mrp("reconcile")
-
-
-@router.post("/results/{run_id}/reconcile")
-async def reconcile_single_snapshot(
+@router.post("/mrp/run/{run_id}/close")
+async def close_mrp_run(
     run_id: int,
     req: ReconcileRequest = ReconcileRequest(),
     db: Session = Depends(get_db),
 ):
-    """Retired: a published run is immutable and cannot be reconciled live."""
-    _retire_legacy_live_mrp("run_reconcile")
+    """Явно закрыть плановый прогон (FIXED_SNAPSHOT→CLOSED).
 
-
-@router.post("/mrp/run/{run_id}/force-close")
-async def force_close_mrp_run(
-    run_id: int,
-    req: ReconcileRequest = ReconcileRequest(),
-    db: Session = Depends(get_db),
-):
-    """Принудительно закрыть недовыполненный FIXED_SNAPSHOT-прогон (бизнес-решение).
-
-    Остаток НЕ переносится: открытые требования закрываются, их неэкспортированные
-    закупочные предложения усыхают до нуля (экспортированные в 1С не трогаем —
-    отмена вручную). Идемпотентно на уже закрытом прогоне. `dry_run=true` считает
-    и откатывает.
+    Закрытие убирает активные резервы из рабочих очередей (release),
+    требования и закупочные строки не перезаписывает. Доступно только для
+    зафиксированных прогонах. Повторный вызов идемпотентен.
     """
-    from ..services.mrp_reconciliation import force_close_run
+    from ..services.period_plan_service import close_fixed_plan
 
     try:
-        return force_close_run(db, int(run_id), dry_run=bool(req.dry_run))
-    except ValueError as e:
-        detail = str(e)
-        raise HTTPException(status_code=404 if "не найден" in detail else 400, detail=detail)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.post("/mrp/run/{run_id}/reopen")
-async def reopen_mrp_run(
-    run_id: int,
-    req: ReconcileRequest = ReconcileRequest(),
-    db: Session = Depends(get_db),
-):
-    """Отменить закрытие прогона: CLOSED → FIXED_SNAPSHOT, закрытые требования
-    снова открываются и возвращаются в область расчёта. `dry_run=true` откатывает.
-    """
-    from ..services.mrp_reconciliation import reopen_run
-
-    try:
-        return reopen_run(db, int(run_id), dry_run=bool(req.dry_run))
+        return close_fixed_plan(db, int(run_id), dry_run=bool(req.dry_run))
     except ValueError as e:
         detail = str(e)
         raise HTTPException(status_code=404 if "не найден" in detail else 400, detail=detail)

@@ -24,21 +24,8 @@ from app.services.item_ledger.obligation_generation import (
     carry_forward_retained_reservations,
     fork_obligation_generation,
 )
-from app.services.item_ledger.reservation_ledger import redistribute_generation_pools
 from app.services.item_ledger.supplier_receipt_allocation import (
     rebuild_supplier_receipt_coverage_from_persisted_provenance,
-)
-from app.services.dbr.cockpit_candidate import (
-    DbrCockpitCandidateError,
-    build_cockpit_candidate_snapshot,
-)
-from app.services.dbr.policy_snapshot import (
-    DbrPolicySnapshotError,
-    build_policy_candidate_snapshot,
-)
-from app.services.dbr.purchase_candidate import (
-    DbrPurchaseCandidateError,
-    build_purchase_candidate_snapshot,
 )
 from app.services.purchase_control_snapshot import build_candidate_snapshot as build_purchase_journal_candidate
 from app.services.mrp_freeze import MRP_LEDGER_LOCK_KEY, freeze_candidate_snapshots
@@ -52,19 +39,37 @@ from app.services.obligation_refresh_manifest import (
     create_obligation_refresh_manifest,
 )
 from app.services.obligation_refresh_publish import publish_obligation_refresh_batch
+from app.services.item_ledger.assembly_queue_snapshot import (
+    build_assembly_queue_snapshot,
+)
+from app.services.item_ledger.assembly_output_persistence import (
+    materialize_assembly_output_allocations,
+)
+from app.services.item_ledger.drum_schedule_persistence import (
+    materialize_drum_schedule,
+)
+from app.services.item_ledger.replenishment_work_item_builder import (
+    materialize_replenishment_work_items,
+)
+from app.services.item_ledger.shelf_projection_persistence import (
+    materialize_shelf_projections,
+)
 
 
 _VERSION = "obligation-refresh-orchestrator/1"
 _CORE_CAPABILITIES = {
     "physical_ledger": True,
     "reservation_replay": True,
+    "replenishment_work_item": True,
     "execution_allocations": True,
     "supplier_receipt_coverage": True,
     "planning_snapshots": True,
+    "assembly_output_allocation": True,
+    "assembly_queue": True,
+    "drum_schedule": True,
+    "shelf_projection": True,
     "purchase_control_journal": True,
 }
-_DBR_CAPABILITY = "dbr_feeder_cockpit"
-_DBR_PURCHASE_CAPABILITY = "dbr_purchase_cockpit"
 
 
 class ObligationRefreshOrchestratorError(RuntimeError):
@@ -143,7 +148,8 @@ def _complete(batch: models.LedgerBuildBatch, metrics: Mapping[str, Any]) -> Non
 
 def _manifest_request_matches(
     target: models.LedgerGeneration,
-    *, add_plan_ids: Iterable[int], horizon_days: int | None,
+    *, add_plan_ids: Iterable[int], retire_plan_ids: Iterable[int],
+    horizon_days: int | None,
     config_version_id: int | None, config_snapshot: Mapping[str, Any],
     planning_pool_by_warehouse: Mapping[str, str],
 ) -> None:
@@ -158,6 +164,7 @@ def _manifest_request_matches(
         request = manifest["add_request"]
         expected = {
             "plan_ids": sorted(int(v) for v in add_plan_ids),
+            "retire_plan_ids": sorted(int(v) for v in retire_plan_ids),
             "horizon_days": horizon_days,
             "config_version_id": config_version_id,
             "config_snapshot": dict(config_snapshot),
@@ -200,11 +207,14 @@ def _publish_retained_mrp_snapshots(
 
 def _retry_published(
     db: Session, target: models.LedgerGeneration, *, parent_generation_id: int,
-    add_plan_ids: Iterable[int], horizon_days: int | None,
+    add_plan_ids: Iterable[int], retire_plan_ids: Iterable[int],
+    horizon_days: int | None,
     config_version_id: int | None, config_snapshot: Mapping[str, Any],
     planning_pool_by_warehouse: Mapping[str, str],
 ) -> ObligationRefreshOrchestrationResult:
-    _manifest_request_matches(target, add_plan_ids=add_plan_ids, horizon_days=horizon_days,
+    _manifest_request_matches(
+        target, add_plan_ids=add_plan_ids, retire_plan_ids=retire_plan_ids,
+        horizon_days=horizon_days,
                               config_version_id=config_version_id, config_snapshot=config_snapshot,
                               planning_pool_by_warehouse=planning_pool_by_warehouse)
     marks = dict(target.source_watermarks or {})
@@ -240,6 +250,7 @@ def run_obligation_refresh(
     parent_generation_id: int,
     generation_key: str,
     add_plan_ids: Iterable[int] = (),
+    retire_plan_ids: Iterable[int] = (),
     started_by: str | None = None,
     horizon_days: int | None = None,
     config_version_id: int | None = None,
@@ -258,8 +269,13 @@ def run_obligation_refresh(
         raise ValueError("generation_key is required")
     config = dict(config_snapshot or {})
     add_ids = tuple(sorted(int(v) for v in add_plan_ids))
+    retire_ids = tuple(sorted(int(v) for v in retire_plan_ids))
     if len(add_ids) != len(set(add_ids)) or any(v <= 0 for v in add_ids):
         raise ValueError("add_plan_ids must be unique positive ids")
+    if len(retire_ids) != len(set(retire_ids)) or any(v <= 0 for v in retire_ids):
+        raise ValueError("retire_plan_ids must be unique positive ids")
+    if set(add_ids).intersection(retire_ids):
+        raise ValueError("a plan cannot be added and retired together")
     if len(add_ids) > 1:
         # The freeze anchors the shared stock baseline at the earliest
         # period_from of the batch: mixing periods would net a later plan
@@ -304,7 +320,8 @@ def run_obligation_refresh(
                 "published retry requires target to be current accepted planning truth"
             )
         return _retry_published(
-            db, existing, parent_generation_id=original_parent_id, add_plan_ids=add_ids,
+            db, existing, parent_generation_id=original_parent_id,
+            add_plan_ids=add_ids, retire_plan_ids=retire_ids,
             horizon_days=horizon_days, config_version_id=config_version_id, config_snapshot=config,
             planning_pool_by_warehouse=dict(planning_pool_by_warehouse or {}),
         )
@@ -325,7 +342,8 @@ def run_obligation_refresh(
     fork = fork_obligation_generation(db, int(parent_generation_id), key)
     target_id = int(fork.ledger_generation_id)
     manifest = create_obligation_refresh_manifest(
-        db, int(parent_generation_id), target_id, add_ids, started_by=started_by,
+        db, int(parent_generation_id), target_id, add_ids,
+        retire_plan_ids=retire_ids, started_by=started_by,
         horizon_days=horizon_days, config_version_id=config_version_id, config_snapshot=config,
         planning_pool_by_warehouse=dict(planning_pool_by_warehouse or {}),
     )
@@ -347,6 +365,7 @@ def run_obligation_refresh(
     )
 
     reservation_batch = _single_stage(db, target_id, "reservation_materialize", key)
+    replenishment_batch = _single_stage(db, target_id, "replenishment_work_item", key)
     snapshot_batch = _single_stage(db, target_id, "snapshot_build", key)
     capture = capture_candidate_future_supply(
         db, int(parent_generation_id), target_id, int(snapshot_batch.id),
@@ -378,19 +397,24 @@ def run_obligation_refresh(
         "input_checksum": sha256(_canonical({"candidate_run_ids": candidate_ids, "freeze": freeze}).encode()).hexdigest(),
     }
     _complete(reservation_batch, reservation_metrics)
+    replenishment_summary = materialize_replenishment_work_items(
+        db,
+        target_id,
+        int(replenishment_batch.id),
+    )
+    _complete(replenishment_batch, replenishment_summary)
     replay = replay_candidate_realizations(db, target_id)
+    assembly_outputs = materialize_assembly_output_allocations(db, target_id)
+    drum_schedule = materialize_drum_schedule(db, target_id)
+    shelf_projection = materialize_shelf_projections(db, target_id)
     supplier = rebuild_supplier_receipt_coverage_from_persisted_provenance(
         db,
         ledger_generation_id=target_id,
         cycle_id=f"historical-supplier:g{target_id}:obligation-refresh",
     )
-    redistribute_generation_pools(
-        db,
-        target_id,
-        f"obligation-refresh:{key}",
-    )
     snapshots = {str(run_id): int(build_mrp_result_candidate_snapshot(db, run_id).id) for run_id in candidate_ids}
     purchase_journal_snapshot = build_purchase_journal_candidate(db, target_id)
+    assembly_queue_snapshot = build_assembly_queue_snapshot(db, target_id)
     target = db.get(models.LedgerGeneration, target_id)
     if target is None or str(target.status) != "building":
         raise ObligationRefreshOrchestratorError(
@@ -401,47 +425,7 @@ def run_obligation_refresh(
     target.capabilities = dict(_CORE_CAPABILITIES)
     db.flush()
 
-    dbr_metrics: dict[str, Any]
-    capabilities = {
-        **_CORE_CAPABILITIES,
-        _DBR_CAPABILITY: False,
-        _DBR_PURCHASE_CAPABILITY: False,
-    }
-    dbr_configured = (
-        db.get(models.DbrSettings, 1) is not None
-        and bool(planning_pool_by_warehouse)
-    )
-    if dbr_configured:
-        try:
-            policy_snapshot = build_policy_candidate_snapshot(db, target_id)
-            cockpit_snapshot = build_cockpit_candidate_snapshot(db, target_id)
-            purchase_snapshot = build_purchase_candidate_snapshot(db, target_id)
-        except (DbrPolicySnapshotError, DbrCockpitCandidateError, DbrPurchaseCandidateError) as exc:
-            raise ObligationRefreshOrchestratorError(
-                f"configured DBR candidate build failed: {exc}"
-            ) from exc
-        policy_hash = sha256(
-            _canonical(policy_snapshot.payload).encode("utf-8")
-        ).hexdigest()
-        dbr_metrics = {
-            "dbr_cockpit_ready": True,
-            "dbr_purchase_ready": True,
-            "dbr_policy_snapshot_id": int(policy_snapshot.id),
-            "dbr_cockpit_snapshot_id": int(cockpit_snapshot.id),
-            "dbr_purchase_snapshot_id": int(purchase_snapshot.id),
-            "dbr_policy_hash": policy_hash,
-        }
-        capabilities[_DBR_CAPABILITY] = True
-        capabilities[_DBR_PURCHASE_CAPABILITY] = True
-    else:
-        dbr_metrics = {
-            "dbr_cockpit_ready": False,
-            "dbr_purchase_ready": False,
-            "dbr_unavailable_reason": (
-                "DBR settings and an exact planning_pool_by_warehouse mapping "
-                "are required"
-            ),
-        }
+    capabilities = dict(_CORE_CAPABILITIES)
     snapshot_metrics = {
         "candidate_run_ids": list(candidate_ids),
         "candidate_read_snapshot_ids": snapshots,
@@ -449,14 +433,17 @@ def run_obligation_refresh(
         "future_supply_capture": _json_value(capture),
         "freeze_summary": _json_value(freeze),
         "replay_summary": _json_value(replay),
+        "assembly_output_summary": _json_value(assembly_outputs),
+        "drum_schedule_summary": _json_value(drum_schedule),
+        "shelf_projection_summary": _json_value(shelf_projection),
         "supplier_receipt_summary": _json_value({
             "provenance_count": supplier.provenance_count,
             "exact_fact_count": supplier.exact_fact_count,
             "allocation_count": supplier.allocation_count,
-            "unplanned_qty": supplier.unplanned_qty,
+            "surplus_qty": supplier.surplus_qty,
         }),
         "purchase_control_journal_snapshot_id": int(purchase_journal_snapshot.id),
-        **dbr_metrics,
+        "assembly_queue_snapshot_id": int(assembly_queue_snapshot.id),
     }
     _complete(snapshot_batch, snapshot_metrics)
     target.capabilities = dict(capabilities)

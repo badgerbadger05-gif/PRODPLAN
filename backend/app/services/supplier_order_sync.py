@@ -889,23 +889,6 @@ def sync_supplier_orders_from_odata(db: Session, req: ODataSyncRequest) -> dict:
             db.rollback()
         else:
             db.commit()
-            # DBR feedback (Фаза 3): двигаем статусы закупных сигналов по факту
-            # поступления материализованных заказов поставщику. Best-effort —
-            # сбой обратной связи НЕ должен ронять синк (общий несущий сервис).
-            try:
-                from .dbr.feedback_service import apply_purchase_order_feedback
-
-                fb_stats = apply_purchase_order_feedback(db)
-                print(
-                    f"[DBR PURCHASE FEEDBACK] signals_updated={fb_stats.get('signals_updated', 0)}"
-                )
-            except Exception as fb_exc:
-                print(f"[DBR PURCHASE FEEDBACK WARNING] {fb_exc}")
-                try:
-                    db.rollback()
-                except Exception:
-                    pass
-
     except Exception as e:
         db.rollback()
         raise Exception(f"Ошибка синхронизации заказов поставщикам: {e}")

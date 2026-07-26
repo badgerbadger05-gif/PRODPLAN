@@ -168,13 +168,6 @@ SYNC_JOBS: List[SyncJob] = [
 _JOB_BY_ID: Dict[str, SyncJob] = {j.id: j for j in SYNC_JOBS}
 _ORDER_INDEX: Dict[str, int] = {j.id: i for i, j in enumerate(SYNC_JOBS)}
 
-# DBR is deliberately maintained on a *following* tick after a source sync.
-# Keeping this state beside the sync schedule makes it durable without adding a
-# DB migration and preserves the one-unit-of-work-per-tick rate limit.
-_DBR_SOURCE_JOBS = {"stock", "productionOrders", "supplierOrders", "processingStock"}
-_DBR_RETRY_BASE_SECONDS = 300
-_DBR_RETRY_MAX_SECONDS = 3600
-_DBR_FULL_INTERVAL_SECONDS = 3600
 _PHYSICAL_REFRESH_RETRY_BASE_SECONDS = 300
 _PHYSICAL_REFRESH_RETRY_MAX_SECONDS = 3600
 _PHYSICAL_REFRESH_INTERVAL_SECONDS = 3600
@@ -299,10 +292,6 @@ def _pick_next(due: List[SyncJob], state: Dict[str, Any], now: datetime) -> Opti
         return (now - last).total_seconds() - _interval_for(state, job)
 
     return sorted(due, key=lambda j: (_ORDER_INDEX[j.id], -overdue_seconds(j)))[0]
-
-
-def _dbr_state(state: Dict[str, Any]) -> Dict[str, Any]:
-    return state.setdefault("dbr_maintenance", {})
 
 
 def _physical_refresh_state(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -525,30 +514,6 @@ def _run_physical_refresh_job(
     }
 
 
-def _mark_dbr_dirty(state: Dict[str, Any], now: datetime, source_job: str) -> None:
-    maintenance = _dbr_state(state)
-    maintenance["dirty"] = True
-    maintenance.setdefault("dirty_since", now.isoformat())
-    maintenance["dirty_source"] = source_job
-    maintenance["next_retry_at"] = None
-
-
-def _dbr_dirty_due(state: Dict[str, Any], now: datetime) -> bool:
-    maintenance = _dbr_state(state)
-    if not maintenance.get("dirty"):
-        return False
-    retry_at = _parse_iso(maintenance.get("next_retry_at"))
-    return retry_at is None or now >= retry_at
-
-
-def _dbr_full_due(state: Dict[str, Any], now: datetime) -> bool:
-    last = _parse_iso(_dbr_state(state).get("last_full_at"))
-    # The first full rebuild follows a source-driven incremental run. Do not
-    # make an unconfigured/new installation run a costly DBR job before its
-    # first ordinary sync has completed.
-    return last is not None and (now - last).total_seconds() >= _DBR_FULL_INTERVAL_SECONDS
-
-
 def _acquire_cluster_lock(db: Optional[Session]):
     if db is None:
         return True
@@ -606,18 +571,6 @@ def _release_cluster_lock(lock) -> None:
             pass
 
 
-def _run_dbr_maintenance(db: Session, *, full: bool) -> Dict[str, Any]:
-    """Run one atomic DBR maintenance unit; commit only after every stage."""
-    # Fail closed: these existing calculators read mutable legacy stock/WIP.
-    # Running them under an accepted generation would launder that data into
-    # Ledger lineage. Resume only after a Ledger-native builder exists.
-    return {
-        "status": "skipped",
-        "reason": "dbr_ledger_projection_unavailable",
-        "full": bool(full),
-    }
-
-
 def pull_queue_health(db: Optional[Session]) -> Dict[str, int]:
     """Small operational snapshot; no mutation and safe for status diagnostics."""
     if db is None:
@@ -665,49 +618,6 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
         # Recorder pulls are part of the physical-refresh BUILDING generation.
         # They must never create shared physical batches outside that lifecycle.
         ledger_health = pull_queue_health(db)
-
-        maintenance = _dbr_state(state)
-        dbr_mode = (
-            "full" if maintenance.get("full_pending") and _dbr_dirty_due(state, now)
-            else ("incremental" if _dbr_dirty_due(state, now) else ("full" if _dbr_full_due(state, now) else None))
-        )
-        if dbr_mode is not None and not ledger_health["ready"]:
-            started = time.time()
-            try:
-                summary = _run_dbr_maintenance(db, full=dbr_mode == "full")
-                maintenance["last_status"] = "ok"
-                maintenance["last_error"] = None
-                maintenance["failure_count"] = 0
-                maintenance["last_duration_ms"] = int((time.time() - started) * 1000)
-                if dbr_mode == "incremental":
-                    maintenance["dirty"] = False
-                    maintenance["dirty_since"] = None
-                    maintenance["next_retry_at"] = None
-                    maintenance["last_incremental_at"] = now.isoformat()
-                    # Establish the hourly full-rebuild cadence after the
-                    # first source-driven maintenance succeeds.
-                    maintenance.setdefault("last_full_at", now.isoformat())
-                else:
-                    maintenance["last_full_at"] = now.isoformat()
-                    maintenance["full_pending"] = False
-                result = {"status": "ok", "job": "dbrMaintenance", "mode": dbr_mode, "summary": summary}
-            except Exception as exc:  # noqa: BLE001 - keep the marker for retry
-                db.rollback()
-                failures = int(maintenance.get("failure_count") or 0) + 1
-                backoff = min(_DBR_RETRY_BASE_SECONDS * (2 ** (failures - 1)), _DBR_RETRY_MAX_SECONDS)
-                maintenance["dirty"] = True
-                maintenance.setdefault("dirty_since", now.isoformat())
-                maintenance["failure_count"] = failures
-                maintenance["next_retry_at"] = (now + timedelta(seconds=backoff)).isoformat()
-                maintenance["last_status"] = "error"
-                maintenance["last_error"] = str(exc)[:1000]
-                maintenance["last_duration_ms"] = int((time.time() - started) * 1000)
-                if dbr_mode == "full":
-                    maintenance["full_pending"] = True
-                result = {"status": "error", "job": "dbrMaintenance", "mode": dbr_mode, "error": str(exc)}
-            _save_state(state, required=True)
-            result["duration_ms"] = maintenance["last_duration_ms"]
-            return result
 
         physical_state = _physical_refresh_state(state)
         active_parent_for_inventory = _current_accepted_parent(db) if _has_current_accepted_parent(db) else None
@@ -815,8 +725,6 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
             job_state["last_status"] = "ok"
             job_state["last_error"] = None
             result["summary"] = summary if isinstance(summary, dict) else {"result": str(summary)}
-            if job.id in _DBR_SOURCE_JOBS:
-                _mark_dbr_dirty(state, now, job.id)
         except Exception as exc:  # noqa: BLE001 — one job's failure must not kill the loop
             _rollback_if_possible(db)
             job_state["last_status"] = "error"
@@ -886,18 +794,6 @@ def status(db: Optional[Session] = None, *, now: Optional[datetime] = None) -> D
         "status": "ok",
         "configured": bool(str(config.get("base_url") or "").strip()),
         "jobs": jobs_out,
-        "dbr_maintenance": {
-            "dirty": bool(_dbr_state(state).get("dirty")),
-            "dirty_since": _dbr_state(state).get("dirty_since"),
-            "dirty_source": _dbr_state(state).get("dirty_source"),
-            "next_retry_at": _dbr_state(state).get("next_retry_at"),
-            "last_incremental_at": _dbr_state(state).get("last_incremental_at"),
-            "last_full_at": _dbr_state(state).get("last_full_at"),
-            "full_pending": bool(_dbr_state(state).get("full_pending")),
-            "last_status": _dbr_state(state).get("last_status"),
-            "last_error": _dbr_state(state).get("last_error"),
-            "last_duration_ms": _dbr_state(state).get("last_duration_ms"),
-        },
         "ledger_pull_queue": pull_queue_health(db),
         "physical_refresh": {
             "last_status": _physical_refresh_state(state).get("last_status"),

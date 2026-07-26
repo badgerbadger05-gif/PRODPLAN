@@ -14,7 +14,6 @@ from app.models import (
     Item,
     LedgerGeneration,
     MrpRequirement,
-    MrpExecutionAllocation,
     PlannedOrder,
     PlannedPurchase,
     PlanningRun,
@@ -24,6 +23,7 @@ from app.models import (
     ProductionPlanLine,
     ProductionProduct,
     PhysicalImportBatch,
+    ClosedPlanSnapshot,
     PlanningTruthState,
     PlanningReadSnapshot,
     StockBin,
@@ -118,73 +118,6 @@ def _publish_plan(db, plan: ProductionPlanHeader):
 
 def _planned_purchase(db, result):
     return db.query(PlannedPurchase).filter_by(run_id=result["run_id"]).one()
-
-
-def test_publish_fixed_plan_reuses_immutable_run_without_obligation_refresh(
-    db_session, monkeypatch
-):
-    item = _make_purchased_item(db_session, "HIST-SLICE")
-    plan = _make_fixed_plan(db_session, item, date(2026, 10, 1), qty=10.0)
-    accepted = db_session.get(PlanningTruthState, 1).current_generation_id
-    accepted_generation = db_session.get(LedgerGeneration, int(accepted))
-
-    parent = models.PlanningRun(
-        status="FIXED_SNAPSHOT", ledger_generation_id=None, source_plan_id=plan.id,
-        period_from=plan.period_from, period_to=plan.period_to,
-        started_at=accepted_generation.cutoff, fixed_at=accepted_generation.cutoff, finished_at=accepted_generation.cutoff,
-    )
-    db_session.add(parent)
-    db_session.flush()
-    req = models.MrpRequirement(
-        run_id=parent.run_id, item_id=item.item_id, total_required_qty=0,
-        net_required_qty=0, period_from=plan.period_from, period_to=plan.period_to,
-        bom_level=0,
-    )
-    db_session.add(req)
-    db_session.flush()
-    db_session.add(models.ReservationEntry(
-        ledger_generation_id=int(accepted), item_id=item.item_id, run_id=parent.run_id,
-        freeze_version=0, requirement_id=req.id, priority_period_from=plan.period_from,
-        priority_period_to=plan.period_to,
-    ))
-    db_session.flush()
-
-    target = models.LedgerGeneration(
-        generation_key="period-plan-refresh-target", status="building",
-        cutoff=accepted_generation.cutoff, source_watermarks={
-            "generation_kind": "obligation_refresh", "parent_generation_id": int(accepted)
-        }, capabilities={}, physical_import_batch=accepted_generation.physical_import_batch,
-        algorithm_version="tests/1",
-    )
-    db_session.add(target)
-    db_session.flush()
-    db_session.add(
-        models.PlanningRun(
-            status="FIXED_SNAPSHOT", source_plan_id=plan.id, ledger_generation_id=target.id,
-            prior_run_id=parent.run_id, period_from=plan.period_from, period_to=plan.period_to,
-            started_at=accepted_generation.cutoff, fixed_at=accepted_generation.cutoff,
-            finished_at=accepted_generation.cutoff,
-        )
-    )
-    db_session.flush()
-    candidate_run_id = db_session.query(models.PlanningRun.run_id).filter(
-        models.PlanningRun.source_plan_id == int(plan.id),
-        models.PlanningRun.ledger_generation_id == target.id,
-    ).scalar()
-
-    monkeypatch.setattr(
-        obligation_refresh_orchestrator,
-        "run_obligation_refresh",
-        lambda *_args, **_kwargs: pytest.fail(
-            "immutable fixed plan must not enter obligation refresh"
-        ),
-    )
-    result = _publish_plan(db_session, plan)
-
-    assert result["run_id"] == int(parent.run_id)
-    assert result["ledger_generation_id"] == int(accepted)
-    assert result["published"] is False
-    assert result["immutable"] is True
 
 
 def test_execution_journal_is_explicitly_unavailable_without_accepted_truth(
@@ -300,6 +233,66 @@ def test_execution_journal_missing_current_snapshot_is_unavailable(
     assert result["ledger_generation"] == 9
     assert result["summary"]["execution_pct"] is None
     assert "snapshot is missing" in result["truth_reason"]
+
+
+def test_execution_journal_reads_closed_plan_snapshot_without_current_truth(db_session):
+    item = _make_purchased_item(db_session, "CLOSED-HISTORY")
+    generation_id = int(db_session.info["period_plan_ledger_generation_id"])
+    plan = _make_fixed_plan(db_session, item, date(2026, 7, 1), qty=1.0)
+    run = PlanningRun(
+        status="FIXED_SNAPSHOT",
+        source_plan_id=plan.id,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        ledger_generation_id=generation_id,
+    )
+    db_session.add(run)
+    db_session.flush()
+    db_session.add(MrpRequirement(
+        run_id=run.run_id,
+        item_id=item.item_id,
+        total_required_qty=1,
+        net_required_qty=1,
+        period_from=plan.period_from,
+        period_to=plan.period_to,
+        bom_level=0,
+    ))
+    db_session.flush()
+
+    payload = build_period_plan_execution_snapshot(
+        db_session,
+        plan.id,
+        run_id=run.run_id,
+        persist=True,
+    )
+    generation = db_session.get(LedgerGeneration, generation_id)
+    assert generation is not None
+
+    db_session.add(ClosedPlanSnapshot(
+        plan_id=plan.id,
+        run_id=run.run_id,
+        ledger_generation_id=generation_id,
+        cutoff=generation.cutoff,
+        payload=payload,
+        closed_at=datetime.datetime(2026, 7, 24, 12, 0),
+    ))
+    run.status = "CLOSED"
+    db_session.commit()
+
+    # Verify reads are served from closed history even when truth is unavailable.
+    db_session.query(PlanningTruthState).delete()
+    db_session.commit()
+
+    explicit = get_period_plan_execution_journal(
+        db_session, plan.id, run_id=run.run_id,
+    )
+    neutral = get_period_plan_execution_journal(db_session, plan.id)
+
+    assert explicit["run_id"] == int(run.run_id)
+    assert explicit["summary"]["execution_pct"] == payload["summary"]["execution_pct"]
+    assert explicit["summary"]["execution_completed_qty"] == payload["summary"]["execution_completed_qty"]
+    assert explicit["ledger_generation"] == payload["ledger_generation"]
+    assert neutral["run_id"] == int(run.run_id)
 
 
 def test_legacy_nonzero_aggregates_cannot_publish_execution_snapshot(db_session):
@@ -481,9 +474,11 @@ def test_purchase_execution_reads_buy_reservation_fold_not_allocation_projection
         requirement_id=req.id,
         priority_period_from=run.period_from,
         priority_period_to=run.period_to,
-        realization_mode="buy",
-        reserved_qty=10,
-        realized_qty=4,
+            realization_mode="buy",
+            reserved_qty=10,
+            replenishment_required_qty=10,
+            replenishment_received_qty=4,
+            realized_qty=4,
     )
     db_session.add(reservation)
     db_session.flush()
@@ -500,19 +495,6 @@ def test_purchase_execution_reads_buy_reservation_fold_not_allocation_projection
         cycle_id="supplier-test",
         idempotency_key=f"realize:{reservation.id}:{sle.id}",
     ))
-    # A conflicting provenance projection must not change the execution number.
-    db_session.add(MrpExecutionAllocation(
-        ledger_generation_id=generation_id,
-        cycle_id="obsolete-read-model",
-        requirement_id=req.id,
-        fact_type="supplier_receipt",
-        allocation_kind="execution",
-        fact_ref="conflicting-allocation",
-        fact_line_ref="1",
-        allocated_qty=9,
-    ))
-    db_session.flush()
-
     rows, _meta = _build_execution_snapshot_rows(
         db_session,
         run,

@@ -33,7 +33,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
@@ -45,6 +45,7 @@ from ..models import (
     PlanningRun,
     ProductionOrder,
     ProductionOrderLineState,
+    ProductionManufacture,
     ProductionProduct,
     ProductionResource,
     ReservationEntry,
@@ -656,7 +657,7 @@ def _active_pair(db: Session, painted_item_id: int) -> PaintWeldPair:
 
 # ---------------------------------------------------------------------------
 # Этап 4: одновременное закрытие обоих заказов цепочки из одного окна журнала.
-# Выпуски обоих строк → СборкаЗапасов обоих заказов → ОДИН комбинированный
+# Выпуски обеих строк → СборкаЗапасов обоих заказов → ОДИН комбинированный
 # СдельныйНаряд (см. one_c_piecework_export.export_chain_piecework_to_1c),
 # который закрывает оба заказа.
 # ---------------------------------------------------------------------------
@@ -704,7 +705,7 @@ def _chain_link_for_product(
     )
 
 
-def _latest_manufacture(db: Session, product_id: int) -> Optional["ProductionManufacture"]:
+def _latest_manufacture(db: Session, product_id: int):
     from ..models import ProductionManufacture
 
     return (
@@ -746,6 +747,7 @@ def close_paint_chain(
     """
     from .one_c_manufacture_export import export_manufactures_to_1c
     from .one_c_piecework_export import export_chain_piecework_to_1c
+    from .production_control_production_flow import produce_line, rollback_local_manufacture
 
     link, paint_product, weld_product = _chain_link_for_product(db, product_id)
 
@@ -759,6 +761,10 @@ def close_paint_chain(
             raise ValueError(
                 f"product_id={product.product_id}: нечего закрывать — "
                 "ничего не произведено и количество к выпуску 0"
+            )
+        if planned < 0:
+            raise ValueError(
+                f"product_id={product.product_id}: количество к выпуску должно быть неотрицательным"
             )
         return {
             "product_id": int(product.product_id),
@@ -781,7 +787,6 @@ def close_paint_chain(
     }
 
     if dry_run:
-        # Предпросмотр сдельного возможен, только если оба выпуска уже есть.
         if weld_plan["existing_manufacture_id"] and paint_plan["existing_manufacture_id"]:
             result["piecework_preview"] = export_chain_piecework_to_1c(
                 db,
@@ -794,7 +799,7 @@ def close_paint_chain(
             result["piecework_preview"] = None
         return result
 
-    from .production_control_production_flow import produce_line
+    created_manufacture_ids: List[int] = []
 
     def _ensure_manufacture(plan: Dict[str, Any], operation_executors: Any) -> int:
         if plan["qty_to_produce"] > 0:
@@ -807,8 +812,14 @@ def close_paint_chain(
                 comment=comment,
             )
             plan["produce"] = produced
-            return int(produced["manufacture_id"])
+            manufacture_id = int(produced["manufacture_id"])
+            created_manufacture_ids.append(manufacture_id)
+            return manufacture_id
         plan["produce"] = None
+        if plan["existing_manufacture_id"] is None:
+            raise ValueError(
+                f"product_id={plan['product_id']}: не найден выпуск для повторного закрытия"
+            )
         return int(plan["existing_manufacture_id"])
 
     # Сварка первой: её выпуск — вход окраски.
@@ -822,6 +833,32 @@ def close_paint_chain(
         allow_production=allow_production,
     )
     result["manufactures_export"] = manufactures_export
+    export_entries = {
+        int(entry.get("manufacture_id")): entry
+        for entry in (manufactures_export.get("entries") or [])
+        if entry.get("manufacture_id") is not None
+    }
+    failed_manufactures = []
+    for manufacture_id in (weld_manufacture_id, paint_manufacture_id):
+        entry = export_entries.get(int(manufacture_id), {})
+        persisted = db.get(ProductionManufacture, int(manufacture_id))
+        exported_ref = str(
+            entry.get("target_ref_key")
+            or (persisted.exported_ref1c if persisted is not None else "")
+            or ""
+        )
+        if not exported_ref:
+            failed_manufactures.append(
+                str(
+                    entry.get("error")
+                    or entry.get("reason")
+                    or f"manufacture_id={manufacture_id}: 1С не создала и не провела СборкаЗапасов"
+                )
+            )
+            if manufacture_id in created_manufacture_ids:
+                rollback_local_manufacture(db, manufacture_id)
+    if failed_manufactures or int(manufactures_export.get("manufactures_error") or 0) > 0:
+        raise ValueError("; ".join(failed_manufactures) or "Ошибка экспорта СборкаЗапасов цепочки")
 
     piecework_export = export_chain_piecework_to_1c(
         db,
@@ -832,6 +869,12 @@ def close_paint_chain(
     )
     result["piecework_export"] = piecework_export
     if piecework_export.get("status") not in ("ok", "existing"):
-        result["status"] = "partial_error"
+        raise ValueError(
+            str(
+                piecework_export.get("error")
+                or "1С не создала и не провела комбинированный СдельныйНаряд"
+            )
+        )
+    result["ledger_readback"] = "queued"
     db.commit()
     return result

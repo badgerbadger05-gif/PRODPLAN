@@ -15,7 +15,6 @@ from datetime import datetime
 from app.models import (
     DefaultSpecification,
     Item,
-    ItemWarehouseStock,
     ProductionMaterialIssue,
     ProductionOrder,
     ProductionOrderLineState,

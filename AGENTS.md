@@ -46,6 +46,20 @@ not facts. Empty, stale or unaccepted Ledger means unavailable: fail closed,
 block dependent calculations/mutations, and never fall back to legacy
 aggregates. Pages read saved snapshots; heavy recalculation belongs in workers.
 
+## Frontend Framework Invariant
+
+Follow [`.docs/frontend-framework.md`](.docs/frontend-framework.md). Extend the
+shared ERP shell instead of creating parallel DBR/MRP pages for the same
+entity. Reuse existing primitives, keep HTTP in `src/services`, derive
+transport types from OpenAPI, and do not move backend business formulas into
+React. Migrate incrementally when touching a screen; do not start a broad
+rewrite without an explicit task.
+
+Frontend is read-only with respect to business math: totals, remaining values,
+percentages, statuses, priorities, KPIs, grouping, and allowed actions must
+come precomputed from a persisted backend read model. Client code may format
+values and manage UI state, but must not reconstruct domain results from rows.
+
 ## Testing Guidelines
 
 Pytest is configured by `pytest.ini` to discover `test_*.py` under `tests`, with `backend` on `pythonpath`. Add or update focused service tests for backend behavior changes, especially sync, planning, reservations, and 1C export flows. For UI changes, run `npm run build`; add Playwright coverage when behavior spans navigation or critical user workflows.

@@ -1,11 +1,11 @@
-"""Ledger-1 physical ingest — pull-by-document (design §2.1, §2.3, §3а, §6).
+"""Ledger-1 physical ingest — pull-by-document (, , , ).
 
 Exercises pull_recorder_movements against a mocked OData client returning the
-Inc0-confirmed recorder-row shape ({Recorder, Recorder_Type, RecordSet}):
+-confirmed recorder-row shape ({Recorder, Recorder_Type, RecordSet}):
 
 * signed SLE rows (Receipt → +, Expense → −), across warehouses, with
   qty_after / stock_bin folded (INV-fold);
-* the §6 dirt filter with counters (non-warehouse СтруктурнаяЕдиница, qty == 0,
+* the  dirt filter with counters (non-warehouse СтруктурнаяЕдиница, qty == 0,
   unknown item) and a diagnostic instead of a crash;
 * replace-by-recorder idempotency — a re-pull yields an identical row set
   (INV-idem) and a changed re-pull replaces in place;
@@ -45,7 +45,7 @@ def _f(x):
 
 
 class FakeODataClient:
-    """Returns the Inc0-confirmed recorder-row shape for a cast-Recorder filter."""
+    """Returns the -confirmed recorder-row shape for a cast-Recorder filter."""
 
     def __init__(self, records_by_recorder):
         self.records_by_recorder = records_by_recorder
@@ -144,7 +144,7 @@ def _snapshot(db, recorder_ref):
 
 
 # ---------------------------------------------------------------------------
-# pull — signed rows + bin fold (§2.1, §3а)
+# pull — signed rows + bin fold (, )
 # ---------------------------------------------------------------------------
 
 
@@ -201,7 +201,7 @@ def test_pull_transfer_expense_receipt(db_session):
 
 
 # ---------------------------------------------------------------------------
-# dirt filter (§6)
+# dirt filter ()
 # ---------------------------------------------------------------------------
 
 
@@ -240,7 +240,7 @@ def test_pull_skips_inactive_lines(db_session):
 
 
 # ---------------------------------------------------------------------------
-# replace-by-recorder (§3а step 4) — idempotency
+# replace-by-recorder ( step 4) — idempotency
 # ---------------------------------------------------------------------------
 
 
@@ -284,7 +284,7 @@ def test_pull_replace_by_recorder_updates_qty(db_session):
 
 
 # ---------------------------------------------------------------------------
-# anchor guard (§3а step 4)
+# anchor guard ( step 4)
 # ---------------------------------------------------------------------------
 
 
@@ -344,7 +344,7 @@ def test_pull_recorder_respects_naive_period_for_aware_cutoff(db_session):
 
 
 # ---------------------------------------------------------------------------
-# pull-status transitions (§2.3)
+# pull-status transitions ()
 # ---------------------------------------------------------------------------
 
 
@@ -360,7 +360,7 @@ def test_pull_empty_status(db_session):
 
 
 # ---------------------------------------------------------------------------
-# queue + retry (§2.3 / §3а)
+# queue + retry ( / )
 # ---------------------------------------------------------------------------
 
 
@@ -476,7 +476,7 @@ def test_exhausted_error_not_drained_until_reenqueued(db_session):
 
 
 # ---------------------------------------------------------------------------
-# export hooks (§3а step 1, §6.1) — via the transfer on-success writer
+# export hooks ( step 1, ) — via the transfer on-success writer
 # ---------------------------------------------------------------------------
 
 
@@ -519,7 +519,7 @@ def test_transfer_hook_never_raises_when_enqueue_errors(db_session, monkeypatch)
 
     monkeypatch.setattr(ingest_mod, "enqueue_recorder_pull", _boom)
 
-    # Must NOT raise into the export flow (safety net is inc3 Balance-reconcile).
+    # Must NOT raise into the export flow (safety net is  Balance-reconcile).
     ste._mark_issue_exported(db_session, issue.issue_id, "REF-XYZ")
     db_session.flush()  # export path flushes/commits after on_success
     assert issue.status == "exported" and issue.exported_ref1c == "REF-XYZ"

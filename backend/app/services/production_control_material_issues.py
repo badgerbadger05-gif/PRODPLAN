@@ -22,7 +22,6 @@ from ..models import (
     SyncLink,
     WorkshopWarehouseBinding,
 )
-from ..schemas import ODataSyncRequest
 from .production_control_common import date_to_iso as _date_to_iso, to_float as _to_float
 from .production_control_domain import ensure_state as _ensure_state, unit_display as _unit_display
 from .production_control_material_availability import _components_for_product
@@ -35,11 +34,11 @@ from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
 from .one_c_stock_transfer_export import STOCK_TRANSFER_ENTITY
 from .one_c_document_numbers import material_issue_number
-from .production_control_reservations import (
-    ReservationState,
+from .production_material_custody import (
+    MaterialCustodyState,
     TRANSIT_STATUSES,
-    is_product_reservation_active,
-    load_reservation_state,
+    is_product_custody_active,
+    load_material_custody,
 )
 from .planning_truth import require_accepted_truth
 from .workshop_resolution import (
@@ -560,7 +559,7 @@ def _free_destination_stock(
     db: Session,
     component_item_ids: List[int],
     destination_warehouse_ref1c: Optional[str],
-    reservation_state: ReservationState,
+    reservation_state: MaterialCustodyState,
     ledger_generation_id: Optional[int] = None,
 ) -> Dict[int, float]:
     """
@@ -602,7 +601,7 @@ def _free_destination_stock(
     return result
 
 
-def _claim_components_in_place(
+def _claim_components_from_workshop(
     db: Session,
     product: ProductionProduct,
     components: List[Dict[str, Any]],
@@ -613,11 +612,10 @@ def _claim_components_in_place(
     ledger_generation_id: int,
 ) -> Optional[ProductionMaterialIssue]:
     """
-    Record that components already lying on the workshop warehouse are taken
-    by this order. Creates/extends a direction='in_place' issue: a local-only
-    reservation document, posted immediately, never exported to 1C (1C has no
-    reservation concept — the components physically stay where they are and
-    get written off the workshop by the closing СборкаЗапасов).
+    Record that components already lying on the destination workshop warehouse are
+    taken by this order as a zero-distance posted issue (source == destination).
+    This keeps on-workshop reservations in the canonical ProductionMaterialIssue
+    trail while avoiding source-warehouse movement and 1C export.
     """
     dest = _clean_ref1c(destination_warehouse_ref1c)
     issue = (
@@ -625,7 +623,9 @@ def _claim_components_in_place(
         .options(joinedload(ProductionMaterialIssue.lines))
         .filter(
             ProductionMaterialIssue.product_id == int(product.product_id),
-            ProductionMaterialIssue.direction == "in_place",
+            ProductionMaterialIssue.direction == "issue",
+            ProductionMaterialIssue.source_warehouse_ref1c == dest,
+            ProductionMaterialIssue.warehouse_ref1c == dest,
             ProductionMaterialIssue.status == "posted",
         )
         .order_by(ProductionMaterialIssue.issue_id.desc())
@@ -637,7 +637,7 @@ def _claim_components_in_place(
             product_id=int(product.product_id),
             order_id=int(product.order_id),
             status="posted",
-            direction="in_place",
+            direction="issue",
             warehouse_ref1c=dest,
             source_warehouse_ref1c=dest,
             initiated_by=initiated_by,
@@ -713,17 +713,17 @@ def _shrink_transit_reservations(
 ) -> None:
     """
     Release over-reservation after the order quantity went down. Non-posted
-    transfer lines shrink (newest documents first); in_place claims release
-    by decreasing both required and issued. Posted transfers stay — physical
-    leftovers go back via the return flow.
+    transfer lines shrink (newest documents first). Posted zero-distance claims
+    also shrink both required and issued: they reflect workshop stock that was
+    locally reserved and must be released back when the order shrinks.
     """
-    def _release_from(issue: ProductionMaterialIssue, *, in_place: bool) -> None:
+    def _release_from(issue: ProductionMaterialIssue, *, local: bool) -> None:
         for line in sorted(issue.lines or [], key=lambda l: l.line_id, reverse=True):
             cid = int(line.component_item_id)
             excess = excess_by_component.get(cid, 0.0)
             if excess <= 1e-9:
                 continue
-            if in_place:
+            if local:
                 current = _to_float(line.issued_qty)
                 take = min(current, excess)
                 line.issued_qty = current - take
@@ -742,10 +742,17 @@ def _shrink_transit_reservations(
             "issued",
             "exported",
         ):
-            _release_from(issue, in_place=False)
+            _release_from(issue, local=False)
     for issue in ordered:
-        if str(issue.direction or "") == "in_place" and str(issue.status or "") == "posted":
-            _release_from(issue, in_place=True)
+        source = _clean_ref1c(issue.source_warehouse_ref1c)
+        destination = _clean_ref1c(issue.warehouse_ref1c)
+        if (
+            str(issue.direction or "") == "issue"
+            and str(issue.status or "") == "posted"
+            and source
+            and source == destination
+        ):
+            _release_from(issue, local=True)
 
 
 # Arbitrary stable key for the transaction-scoped advisory lock that serializes
@@ -783,9 +790,9 @@ def create_material_issues(
     ``required - already reserved for this line`` (kits in transit + kits on
     the workshop). The outstanding part is covered in two steps:
 
-    1. Free stock already lying on the destination workshop warehouse is
-       claimed in place (direction='in_place', no 1C document) — the rule
-       "компоненты на участке списываются с участка".
+    1. Free stock already lying on the destination workshop warehouse is claimed
+       as a zero-distance posted issue (source=destination), never exported to
+       1C.
     2. Only the remainder becomes physical transfer requests, so storekeepers
        are never asked to move a full kit that partially exists at the
        destination already.
@@ -816,7 +823,7 @@ def create_material_issues(
         if not product:
             errors.append(f"product_id={pid}: строка заказа не найдена")
             continue
-        if not is_product_reservation_active(product):
+        if not is_product_custody_active(product):
             errors.append(
                 f"product_id={pid}: строка заказа уже закрыта или завершена в 1С; "
                 "новые перемещения не создаются"
@@ -829,7 +836,7 @@ def create_material_issues(
             .filter(
                 ProductionMaterialIssue.product_id == int(product.product_id),
                 ProductionMaterialIssue.status.in_(("draft", "requested", "issued", "exported", "posted", "error")),
-                ProductionMaterialIssue.direction.in_(("issue", "in_place")),
+                ProductionMaterialIssue.direction == "issue",
             )
             .order_by(ProductionMaterialIssue.issue_id.desc())
             .all()
@@ -870,7 +877,7 @@ def create_material_issues(
             continue
 
         comp_ids = [int(c["component_item_id"]) for c in components]
-        reservation_state = load_reservation_state(db, item_ids=comp_ids)
+        reservation_state = load_material_custody(db, item_ids=comp_ids)
         own = reservation_state.for_product(int(product.product_id))
 
         outstanding: Dict[int, float] = {}
@@ -899,8 +906,8 @@ def create_material_issues(
             if int(comp["component_item_id"]) in outstanding
         ]
 
-        # Step 1 (planned, applied after source selection succeeds): claim
-        # free stock already on the destination workshop.
+        # Step 1 (planned, applied after source selection succeeds): reserve
+        # free stock already on the destination workshop as zero-distance posts.
         free_dest = _free_destination_stock(
             db,
             [int(c["component_item_id"]) for c in outstanding_components],
@@ -977,7 +984,7 @@ def create_material_issues(
                     ],
                 }
             )
-            claim_issue = _claim_components_in_place(
+            claim_issue = _claim_components_from_workshop(
                 db,
                 product,
                 claims,
@@ -996,7 +1003,7 @@ def create_material_issues(
                         "item_name": str(product.item.item_name or ""),
                         "lines_count": len(claims),
                         "source_warehouse_ref1c": _clean_ref1c(resolved_warehouse),
-                        "direction": "in_place",
+                        "direction": "issue",
                     }
                 )
 
@@ -1473,73 +1480,3 @@ def build_issue_1c_payload(db: Session, issue_id: int) -> Dict[str, Any]:
             "product_id": issue_data["product_id"],
         },
     }
-
-
-def export_issue_to_1c(db: Session, issue_id: int, req: ODataSyncRequest) -> Dict[str, Any]:
-    from .one_c_export_common import clean_ref1c
-
-    truth = require_accepted_truth(db, "production_material_issue_export")
-    issue = db.query(ProductionMaterialIssue).filter(ProductionMaterialIssue.issue_id == int(issue_id)).first()
-    if not issue:
-        raise ValueError("Документ выдачи не найден")
-    if issue.ledger_generation_id is None or int(issue.ledger_generation_id) != int(truth.generation_id):
-        raise ValueError("material issue is not bound to current accepted Ledger generation")
-
-    # Idempotency: a document already created in 1C must not be POSTed again —
-    # a repeat would create a duplicate Document_ПеремещениеЗапасов (a real
-    # second stock transfer). Return the existing ref instead of re-posting.
-    existing_ref = clean_ref1c(getattr(issue, "exported_ref1c", None))
-    if existing_ref and not req.dry_run:
-        return {
-            "status": "already_exported",
-            "issue_id": int(issue.issue_id),
-            "document_number": str(issue.document_number),
-            "exported_ref1c": existing_ref,
-        }
-
-    payload = build_issue_1c_payload(db, issue_id)
-
-    if req.dry_run:
-        return {
-            "status": "dry_run",
-            "entity_name": req.entity_name,
-            "payload": payload,
-        }
-
-    from ..services.odata_client import OData1CClient
-
-    client = OData1CClient(req.base_url, req.username, req.password, req.token)
-    try:
-        response = client.post(req.entity_name, payload, timeout=120)
-        ref = str(response.get("Ref_Key") or response.get("ref") or response.get("Ref") or "")
-        issue.status = "exported"
-        issue.exported_ref1c = ref or None
-        issue.exported_at = datetime.now(timezone.utc)
-        issue.export_error = None
-        state = (
-            db.query(ProductionOrderLineState)
-            .filter(ProductionOrderLineState.product_id == issue.product_id)
-            .first()
-        )
-        if state:
-            state.issue_status = "exported"
-        db.commit()
-        return {
-            "status": "ok",
-            "issue_id": int(issue.issue_id),
-            "document_number": str(issue.document_number),
-            "exported_ref1c": ref,
-            "response": response,
-        }
-    except Exception as e:
-        issue.status = "error"
-        issue.export_error = str(e)
-        state = (
-            db.query(ProductionOrderLineState)
-            .filter(ProductionOrderLineState.product_id == issue.product_id)
-            .first()
-        )
-        if state:
-            state.issue_status = "error"
-        db.commit()
-        raise

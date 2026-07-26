@@ -151,15 +151,15 @@ def test_delete_unknown_pair_returns_404(client):
     assert r.status_code == 404
 
 
-def test_guard_endpoint(client, db_session):
+def test_guard_endpoint_fails_closed_without_accepted_ledger(client, db_session):
     painted, welded = _seed_pair(db_session)
     welded.stock_qty = 20
     db_session.commit()
     client.post("/api/v1/paint-weld/pairs/rebuild")
 
     r = client.get(f"/api/v1/paint-weld/guard?painted_item_id={painted.item_id}&qty=5")
-    assert r.status_code == 200
-    assert r.json()["verdict"] == "stock_covers"
+    assert r.status_code == 503
+    assert r.json()["detail"]["truth_status"] == "uninitialized"
 
 
 def test_chain_preview_rejects_unpublished_item_demand(

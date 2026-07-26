@@ -5,15 +5,16 @@ from datetime import date, datetime
 
 import pytest
 
+from app import models
 from app.models import (
     IgnoredWarehouse,
     Item,
-    ItemWarehouseStock,
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
     StockWarehouse,
 )
+from app.services.planning_truth import PlanningTruthUnavailable
 from app.services.mrp_stock_helpers import (
     active_wip_eta_by_item,
     consume_wip_at_or_before,
@@ -71,48 +72,44 @@ def test_empty_wip_returns_full_qty_unchanged():
 # ---------------------------------------------------------------------------
 
 
-def test_effective_stock_returns_aggregated_when_no_ignored_warehouses(db_session):
+def test_effective_stock_reads_only_accepted_generation_and_contour(
+    db_session,
+    building_ledger_generation,
+):
     db = db_session
-    a = _mk_item(db, code="STK-A", stock=100.0)
-    b = _mk_item(db, code="STK-B", stock=50.0)
-    db.commit()
-
-    result = effective_stock_by_item_all(db)
-    assert result[a.item_id] == 100.0
-    assert result[b.item_id] == 50.0
-
-
-def test_effective_stock_subtracts_ignored_warehouses(db_session):
-    db = db_session
-    # Item with 100 total: 30 in a "normal" warehouse, 70 in brak isolator.
     item = _mk_item(db, code="STK-IGN", stock=100.0)
-
     db.add(StockWarehouse(warehouse_ref1c="wh-normal", warehouse_name="Normal", is_selected=True))
     db.add(StockWarehouse(warehouse_ref1c="wh-isolator", warehouse_name="Brak", is_selected=True))
     db.add(IgnoredWarehouse(warehouse_ref1c="wh-isolator", warehouse_name="Brak", reason="defective"))
-    db.add(ItemWarehouseStock(item_id=item.item_id, warehouse_ref1c="wh-normal", qty=30.0))
-    db.add(ItemWarehouseStock(item_id=item.item_id, warehouse_ref1c="wh-isolator", qty=70.0))
-    db.commit()
+    db.add_all([
+        models.StockBin(
+            ledger_generation_id=building_ledger_generation.id,
+            item_id=item.item_id,
+            warehouse_ref1c="wh-normal",
+            on_hand=30,
+        ),
+        models.StockBin(
+            ledger_generation_id=building_ledger_generation.id,
+            item_id=item.item_id,
+            warehouse_ref1c="wh-isolator",
+            on_hand=70,
+        ),
+    ])
+    building_ledger_generation.status = "accepted"
+    building_ledger_generation.accepted_at = datetime(2026, 7, 26)
+    building_ledger_generation.cutoff = datetime(2026, 7, 26)
+    pointer = db.get(models.PlanningTruthState, 1)
+    pointer.current_generation_id = building_ledger_generation.id
+    db.flush()
 
     result = effective_stock_by_item_all(db)
-    # Only the non-ignored warehouse counts.
     assert result[item.item_id] == 30.0
 
 
-def test_effective_stock_falls_back_to_item_stock_qty_for_unbroken_items(db_session):
-    """Items without any item_warehouse_stock rows fall back to Item.stock_qty
-    so a partially-synced DB doesn't blank coverage."""
-    db = db_session
-    has_breakdown = _mk_item(db, code="STK-WB", stock=100.0)
-    no_breakdown = _mk_item(db, code="STK-NB", stock=42.0)
-
-    db.add(IgnoredWarehouse(warehouse_ref1c="wh-x", warehouse_name="X", reason="brak"))
-    db.add(ItemWarehouseStock(item_id=has_breakdown.item_id, warehouse_ref1c="wh-y", qty=10.0))
-    db.commit()
-
-    result = effective_stock_by_item_all(db)
-    assert result[has_breakdown.item_id] == 10.0  # via breakdown
-    assert result[no_breakdown.item_id] == 42.0   # via fallback
+def test_effective_stock_fails_closed_without_published_ledger(db_session):
+    _mk_item(db_session, code="STK-NO-TRUTH", stock=42.0)
+    with pytest.raises(PlanningTruthUnavailable):
+        effective_stock_by_item_all(db_session)
 
 
 # ---------------------------------------------------------------------------

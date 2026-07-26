@@ -1,4 +1,4 @@
-"""Schema/defaults test for the item-ledger tables (Increment 1, additive).
+"""Schema/defaults test for the additive Item Ledger tables.
 
 Creates one minimal row per new table and asserts server-side defaults apply.
 No business logic — only create_all + insert defaults (mirrors the existing
@@ -119,14 +119,16 @@ def _mk_reservation_row(db_session):
 def test_reservation_entry_defaults(db_session):
     _item, entry = _mk_reservation_row(db_session)
     assert entry.planning_stock_pool == "default"
-    assert entry.realization_mode == "consume"
+    assert entry.realization_mode == "make"
     assert float(entry.reserved_qty) == 0 and float(entry.realized_qty) == 0
-    assert float(entry.uncovered_qty) == 0
-    assert entry.lifecycle_status == "active" and entry.coverage_state == "uncovered"
+    assert float(entry.covered_from_stock_at_freeze_qty) == 0
+    assert float(entry.replenishment_required_qty) == 0
+    assert float(entry.replenishment_received_qty) == 0
+    assert entry.lifecycle_status == "active"
     assert int(entry.freeze_version) == 0
 
 
-def test_reservation_event_and_coverage_defaults(db_session):
+def test_reservation_event_defaults(db_session):
     item, entry = _mk_reservation_row(db_session)
     ev = models.ReservationEvent(
         ledger_generation_id=entry.ledger_generation_id,
@@ -134,10 +136,6 @@ def test_reservation_event_and_coverage_defaults(db_session):
         reserved_delta=6, idempotency_key="open:1",
     )
     db_session.add(ev)
-    cov = models.ReservationCoverage(reservation_id=entry.id, source_kind="on_hand")
-    db_session.add(cov)
     db_session.commit()
     db_session.refresh(ev)
-    db_session.refresh(cov)
     assert ev.planning_stock_pool == "default" and ev.match_rule == "" and ev.sle_id is None
-    assert cov.pin_kind == "floating" and float(cov.covered_qty) == 0 and float(cov.alloc_qty) == 0

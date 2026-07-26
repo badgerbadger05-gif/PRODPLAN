@@ -1,4 +1,4 @@
-"""Ledger-1 (physical movements) math + seeding — design §2.1, §3, §6.
+"""Ledger-1 (physical movements) math + seeding — , , .
 
 Pure helper (`fold_running_balance`) plus two Session-taking writers that only
 touch the new ledger tables (`rebuild_running_balance`, `seed_from_balance`).
@@ -69,7 +69,7 @@ def _dec(value: Number) -> Decimal:
 
 
 class LedgerKey(NamedTuple):
-    """Physical key of ledger-1 (design §2): the axis Balance-сверка can see."""
+    """Physical key of ledger-1 (): the axis Balance-сверка can see."""
 
     item_id: int
     characteristic_ref: str = ""
@@ -158,8 +158,8 @@ def fold_running_balance(
 ) -> Tuple[List[Decimal], Decimal]:
     """PURE fold: signed movement quantities → (running qty_after list, final).
 
-    on_hand = Σ qty = final = last qty_after (design §2.1 R-A / §6). No clamping
-    of negatives — a negative running balance is a real reconcile signal (§4a).
+    on_hand = Σ qty = final = last qty_after ( R-A / ). No clamping
+    of negatives — a negative running balance is a real reconcile signal (a).
     """
     running = _dec(start)
     qty_after: List[Decimal] = []
@@ -189,7 +189,7 @@ def rebuild_running_balance(
 
     Rows are ordered by (posting_at, id) — insertion order within a timestamp.
     ``from_posting_at`` limits the rewrite window: the opening balance is the
-    qty_after of the last row strictly before it (design §6 narrow rebuild).
+    qty_after of the last row strictly before it ( narrow rebuild).
     Returns the final on_hand. Writes only stock_ledger_entry.qty_after and
     stock_bin (both ledger-1 tables).
     """
@@ -267,11 +267,11 @@ def seed_from_balance(
     import_batch: Optional[models.PhysicalImportBatch] = None,
     ledger_generation_id: Optional[int] = None,
 ) -> List[models.StockLedgerEntry]:
-    """Seed ledger-1 from a Balance dict {ledger_key: qty} (design §2.1 seed / §6).
+    """Seed ledger-1 from a Balance dict {ledger_key: qty} ( seed / ).
 
     Writes one seed SLE per key (movement_kind='seed', qty_after == qty), builds
     the stock_bin, and records a stock_ledger_anchor for the period. The ACTUAL
-    OData Balance pull is inc2 — here only the seeding logic given a dict is
+    OData Balance pull is  — here only the seeding logic given a dict is
     exercised (no OData). Idempotent per (period, key) via the recorder unique
     key and the anchor unique key; re-seeding a present key is skipped.
     """

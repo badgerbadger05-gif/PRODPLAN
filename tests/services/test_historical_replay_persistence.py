@@ -9,7 +9,6 @@ from app.models import (
     LedgerGeneration,
     StockBin,
     StockWarehouse,
-    MrpExecutionAllocation,
     MrpRequirement,
     MrpRequirementBucket,
     PhysicalImportBatch,
@@ -75,8 +74,7 @@ def _generation_scope(
         item_id=item.item_id,
         total_required_qty=Decimal(reserve_qty),
         net_required_qty=Decimal(reserve_qty),
-        covered_qty=0,
-        remaining_qty=Decimal(reserve_qty),
+
         period_from=date(2026, 7, 1),
         period_to=date(2026, 7, 31),
         bom_level=0,
@@ -205,9 +203,6 @@ def test_replay_is_idempotent_and_folds_realized_cache(db_session):
     assert db_session.query(ReservationEvent).filter_by(
         ledger_generation_id=generation.id
     ).count() == 1
-    assert db_session.query(MrpExecutionAllocation).filter_by(
-        ledger_generation_id=generation.id
-    ).count() == 0
     db_session.refresh(reservation)
     assert reservation.realized_qty == Decimal("5")
     assert db_session.query(LedgerBuildBatch).filter_by(
@@ -248,12 +243,12 @@ def test_replay_reports_conservation_and_unplanned_surplus(db_session):
     result = run_historical_replay(db_session, generation.id)
 
     assert Decimal(result["fact_qty"]) == Decimal(result["allocated_qty"]) + Decimal(
-        result["unplanned_qty"]
+        result["surplus_qty"]
     )
     assert Decimal(result["fact_qty"]) == Decimal("7")
     assert Decimal(result["allocated_qty"]) == Decimal("5")
-    assert Decimal(result["unplanned_qty"]) == Decimal("2")
-    assert result["unplanned_facts"] == 1
+    assert Decimal(result["surplus_qty"]) == Decimal("2")
+    assert result["surplus_facts"] == 1
     assert len(result["input_checksum"]) == 64
     assert len(result["allocation_checksum"]) == 64
 
@@ -296,13 +291,13 @@ def test_physical_import_watermark_includes_all_earlier_batches(db_session):
     assert Decimal(result["allocated_qty"]) == Decimal("5")
 
 
-def test_generic_receipt_cannot_realize_consume_reservation(db_session):
+def test_generic_receipt_is_not_a_production_replenishment(db_session):
     generation, reservation = _generation_scope(
         db_session,
         "RECEIPT",
         fact_qty="5",
         reserve_qty="5",
-        realization_mode="consume",
+        realization_mode="make",
         movement_kind="receipt",
     )
 
@@ -325,7 +320,7 @@ def test_generic_expense_is_ignored_not_execution(db_session):
         "EXPENSE",
         fact_qty="-4",
         reserve_qty="4",
-        realization_mode="consume",
+        realization_mode="make",
         movement_kind="expense",
     )
 
@@ -334,9 +329,6 @@ def test_generic_expense_is_ignored_not_execution(db_session):
     assert result["facts"] == 0
     assert result["ignored_facts"] == 1
     assert Decimal(result["ignored_fact_qty"]) == Decimal("4")
-    assert db_session.query(MrpExecutionAllocation).filter_by(
-        ledger_generation_id=generation.id
-    ).count() == 0
     db_session.refresh(reservation)
     assert reservation.realized_qty == Decimal("0")
 
@@ -394,7 +386,7 @@ def test_later_supersession_does_not_change_generation_replay(db_session):
     assert second["facts"] == first["facts"] == 1
     assert second["fact_qty"] == first["fact_qty"]
     assert second["allocated_qty"] == first["allocated_qty"]
-    assert second["unplanned_qty"] == first["unplanned_qty"]
+    assert second["surplus_qty"] == first["surplus_qty"]
     assert second["input_checksum"] == first["input_checksum"]
     assert second["allocation_checksum"] == first["allocation_checksum"]
 
@@ -566,183 +558,6 @@ def test_replay_ignores_retired_legacy_phasing_metrics(db_session):
     assert Decimal(result["allocated_qty"]) == Decimal("4")
 
 
-def test_recorder_order_identity_addresses_consume_exactly(db_session):
-    generation, reservation = _generation_scope(
-        db_session,
-        "EXACT-CONSUME",
-        fact_qty="4",
-        reserve_qty="4",
-        realization_mode="consume",
-        movement_kind="assembly_out",
-    )
-    sle = db_session.query(StockLedgerEntry).filter_by(
-        ingest_batch_id=generation.physical_import_batch_id
-    ).one()
-    order = ProductionOrder(
-        order_number="EXACT",
-        order_date=datetime(2026, 7, 1),
-        order_ref1c="ORDER-EXACT",
-        deletion_mark=False,
-        source="1c",
-    )
-    db_session.add(order)
-    db_session.flush()
-    db_session.add(ProductionProduct(
-        order_id=order.order_id,
-        item_id=reservation.item_id,
-        line_number=1,
-        quantity=4,
-        produced_qty=0,
-        remaining_qty=4,
-        source_mrp_requirement_id=reservation.requirement_id,
-    ))
-    db_session.add(StockRecorderPull(
-        recorder_type=sle.recorder_type,
-        recorder_ref=sle.recorder_ref,
-        status="done",
-        order_ref=order.order_ref1c,
-    ))
-    db_session.commit()
-
-    result = run_historical_replay(db_session, generation.id)
-
-    assert Decimal(result["allocated_qty"]) == Decimal("4")
-    assert Decimal(result["unplanned_qty"]) == Decimal("0")
-    event = db_session.query(ReservationEvent).filter_by(
-        ledger_generation_id=generation.id
-    ).one()
-    assert event.match_rule == "pegged"
-
-
-def test_ambiguous_order_identity_leaves_consume_unplanned(db_session):
-    generation, reservation = _generation_scope(
-        db_session,
-        "AMBIGUOUS-CONSUME",
-        fact_qty="4",
-        reserve_qty="4",
-        realization_mode="consume",
-        movement_kind="assembly_out",
-    )
-    sle = db_session.query(StockLedgerEntry).filter_by(
-        ingest_batch_id=generation.physical_import_batch_id
-    ).one()
-    order = ProductionOrder(
-        order_number="AMBIGUOUS",
-        order_date=datetime(2026, 7, 1),
-        order_ref1c="ORDER-AMBIGUOUS",
-        deletion_mark=False,
-        source="1c",
-    )
-    other_run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={})
-    db_session.add_all([order, other_run])
-    db_session.flush()
-    other_requirement = MrpRequirement(
-        run_id=other_run.run_id,
-        item_id=reservation.item_id,
-        total_required_qty=4,
-        net_required_qty=4,
-        covered_qty=0,
-        remaining_qty=4,
-        period_from=date(2026, 7, 1),
-        period_to=date(2026, 7, 31),
-        bom_level=0,
-    )
-    db_session.add(other_requirement)
-    db_session.flush()
-    db_session.add_all([
-        ProductionProduct(
-            order_id=order.order_id,
-            item_id=reservation.item_id,
-            line_number=1,
-            quantity=2,
-            produced_qty=0,
-            remaining_qty=2,
-            source_mrp_requirement_id=reservation.requirement_id,
-        ),
-        ProductionProduct(
-            order_id=order.order_id,
-            item_id=reservation.item_id,
-            line_number=2,
-            quantity=2,
-            produced_qty=0,
-            remaining_qty=2,
-            source_mrp_requirement_id=other_requirement.id,
-        ),
-        StockRecorderPull(
-            recorder_type=sle.recorder_type,
-            recorder_ref=sle.recorder_ref,
-            status="done",
-            order_ref=order.order_ref1c,
-        ),
-    ])
-    db_session.commit()
-
-    result = run_historical_replay(db_session, generation.id)
-
-    assert Decimal(result["allocated_qty"]) == Decimal("0")
-    assert Decimal(result["unplanned_qty"]) == Decimal("4")
-    assert result["ambiguous_identity_facts"] == 1
-
-
-def test_replay_allocates_multiple_characteristics_in_one_fifo_pool(db_session):
-    generation, reservation = _generation_scope(
-        db_session, "MULTI-CHAR", fact_qty="0", reserve_qty="7"
-    )
-    batch_id = generation.physical_import_batch_id
-    db_session.add_all([
-        StockLedgerEntry(
-            ingest_batch_id=batch_id,
-            source_content_hash="multi-char-a",
-            item_id=reservation.item_id,
-            characteristic_ref="CHAR-A",
-            organization_ref=DEFAULT_ORGANIZATION_REF1C,
-            warehouse_ref1c="WH",
-            qty=Decimal("3"),
-            qty_after=Decimal("3"),
-            posting_at=datetime(2026, 7, 20, 10, 0),
-            record_type="Receipt",
-            movement_kind="assembly_in",
-            recorder_type="Production",
-            recorder_ref="REC-MULTI-CHAR-A",
-            line_no="1",
-            ingest_source="test",
-            active=True,
-        ),
-        StockLedgerEntry(
-            ingest_batch_id=batch_id,
-            source_content_hash="multi-char-b",
-            item_id=reservation.item_id,
-            characteristic_ref="CHAR-B",
-            organization_ref=DEFAULT_ORGANIZATION_REF1C,
-            warehouse_ref1c="WH",
-            qty=Decimal("4"),
-            qty_after=Decimal("7"),
-            posting_at=datetime(2026, 7, 20, 11, 0),
-            record_type="Receipt",
-            movement_kind="assembly_in",
-            recorder_type="Production",
-            recorder_ref="REC-MULTI-CHAR-B",
-            line_no="1",
-            ingest_source="test",
-            active=True,
-        ),
-    ])
-    db_session.flush()
-    db_session.refresh(reservation)
-
-    result = run_historical_replay(db_session, generation.id)
-
-    assert Decimal(result["facts"]) == Decimal("2")
-    assert result["allocations"] == 2
-    assert Decimal(result["allocated_qty"]) == Decimal("7")
-    assert Decimal(result["unplanned_qty"]) == Decimal("0")
-    assert result["ambiguous_pool_facts"] == 0
-    assert result["legacy_identity_collapsed_pool_facts"] == 0
-    assert db_session.query(ReservationEvent).filter_by(
-        ledger_generation_id=generation.id
-    ).count() == 2
-    db_session.refresh(reservation)
-    assert reservation.realized_qty == Decimal("7")
 
 
 def test_replay_ignores_non_zsm_facts_without_ambiguity(db_session):
@@ -796,8 +611,8 @@ def test_replay_ignores_non_zsm_facts_without_ambiguity(db_session):
 
     assert result["facts"] == 0
     assert result["allocations"] == 0
-    assert result["unplanned_facts"] == 0
-    assert Decimal(result["unplanned_qty"]) == Decimal("0")
+    assert result["surplus_facts"] == 0
+    assert Decimal(result["surplus_qty"]) == Decimal("0")
     assert result["ambiguous_pool_facts"] == 0
     assert result["ignored_facts"] == 1
     assert db_session.query(ReservationEvent).filter_by(
@@ -817,8 +632,6 @@ def test_replay_rejects_ambiguous_pools_even_with_no_pool_candidate_fact_identit
         item_id=reservation.item_id,
         total_required_qty=4,
         net_required_qty=4,
-        covered_qty=0,
-        remaining_qty=4,
         period_from=date(2026, 7, 1),
         period_to=date(2026, 7, 31),
         bom_level=0,
@@ -846,7 +659,7 @@ def test_replay_rejects_ambiguous_pools_even_with_no_pool_candidate_fact_identit
     result = run_historical_replay(db_session, generation.id)
 
     assert result["allocations"] == 0
-    assert Decimal(result["unplanned_qty"]) == Decimal("4")
+    assert Decimal(result["surplus_qty"]) == Decimal("4")
     assert result["ambiguous_pool_facts"] == 1
     assert db_session.query(ReservationEvent).filter_by(
         ledger_generation_id=generation.id
@@ -908,7 +721,7 @@ def test_replay_multi_org_facts_do_not_fallback_to_blank_org(db_session):
     assert result["ambiguous_pool_facts"] == 0
     assert result["legacy_identity_collapsed_pool_facts"] == 0
     assert Decimal(result["allocated_qty"]) == Decimal("0")
-    assert Decimal(result["unplanned_qty"]) == Decimal("0")
+    assert Decimal(result["surplus_qty"]) == Decimal("0")
     assert result["ignored_facts"] == 2
     assert db_session.query(ReservationEvent).filter_by(
         ledger_generation_id=generation.id
@@ -961,8 +774,6 @@ def test_replay_fifo_remains_oldest_pool_for_later_output(db_session):
             item_id=reservation_a.item_id,
             total_required_qty=3,
             net_required_qty=3,
-            covered_qty=0,
-            remaining_qty=3,
             period_from=date(2027, 1, 1),
             period_to=date(2027, 1, 31),
             bom_level=0,
@@ -1049,48 +860,6 @@ def test_replay_fifo_remains_oldest_pool_for_later_output(db_session):
     assert allocations[1][0].realized_delta == Decimal("3")
 
 
-def test_replay_uses_gross_capacity_for_consume_when_bucket_net_is_zero(db_session):
-    generation, reservation = _generation_scope(
-        db_session,
-        "CONSUME-GROSS",
-        fact_qty="26",
-        reserve_qty="26",
-        realization_mode="consume",
-        movement_kind="assembly_out",
-        add_default_bucket=False,
-    )
-    db_session.add(MrpRequirementBucket(
-        requirement_id=reservation.requirement_id,
-        run_id=reservation.run_id,
-        item_id=reservation.item_id,
-        bucket_date=date(2026, 7, 20),
-        gross_qty=Decimal("26"),
-        net_qty=Decimal("0"),
-    ))
-    reservation.reserved_qty = Decimal("26")
-    db_session.flush()
-    fact = db_session.query(StockLedgerEntry).filter_by(
-        ingest_batch_id=generation.physical_import_batch_id
-    ).one()
-    _address_fact_to_requirement(db_session, fact, reservation)
-    _append_obligation_batch(
-        db_session,
-        generation,
-        requirement_id=int(reservation.requirement_id),
-        allow_unphased=True,
-    )
-
-    result = run_historical_replay(db_session, generation.id)
-
-    assert Decimal(result["allocated_qty"]) == Decimal("26")
-    rows = db_session.query(ReservationEvent).filter_by(
-        ledger_generation_id=generation.id,
-        reservation_id=reservation.id,
-    ).all()
-    assert len(rows) == 1
-    assert rows[0].realized_delta == Decimal("26")
-
-
 def test_replay_uses_frozen_make_reservation_when_bucket_net_is_zero(db_session):
     generation, reservation = _generation_scope(
         db_session,
@@ -1150,11 +919,11 @@ def test_replay_excludes_make_facts_for_selected_non_fg_contour_warehouse(db_ses
 
     assert result["facts"] == 0
     assert result["allocations"] == 0
-    assert result["unplanned_facts"] == 0
+    assert result["surplus_facts"] == 0
     assert Decimal(result["excluded_make_facts"]) == Decimal("1")
     assert Decimal(result["excluded_make_qty"]) == Decimal("5")
     assert Decimal(result["allocated_qty"]) == Decimal("0")
-    assert Decimal(result["unplanned_qty"]) == Decimal("0")
+    assert Decimal(result["surplus_qty"]) == Decimal("0")
     assert db_session.query(ReservationEvent).filter_by(
         ledger_generation_id=generation.id
     ).count() == 0
@@ -1227,86 +996,9 @@ def test_replay_allows_make_facts_for_outside_contour_warehouse(db_session):
     assert result["excluded_make_facts"] == 0
     assert Decimal(result["allocated_qty"]) == Decimal("5")
     assert result["allocations"] == 1
-    assert result["unplanned_facts"] == 0
+    assert result["surplus_facts"] == 0
     assert db_session.query(ReservationEvent).filter_by(
         ledger_generation_id=generation.id
     ).count() == 1
     db_session.refresh(reservation)
     assert reservation.realized_qty == Decimal("5")
-
-
-def test_replay_preserves_mode_isolated_bucket_capacity(db_session):
-    generation, make_reservation = _generation_scope(
-        db_session,
-        "MODE-ISOLATED",
-        fact_qty="26",
-        reserve_qty="26",
-        realization_mode="make",
-        add_default_bucket=False,
-    )
-    db_session.add(MrpRequirementBucket(
-        requirement_id=make_reservation.requirement_id,
-        run_id=make_reservation.run_id,
-        item_id=make_reservation.item_id,
-        bucket_date=date(2026, 7, 20),
-        gross_qty=Decimal("26"),
-        net_qty=Decimal("26"),
-    ))
-    consume_fact = StockLedgerEntry(
-        ingest_batch_id=generation.physical_import_batch_id,
-        source_content_hash="consume-fact",
-        item_id=make_reservation.item_id,
-        characteristic_ref="",
-        organization_ref=DEFAULT_ORGANIZATION_REF1C,
-        warehouse_ref1c="WH",
-        qty=Decimal("26"),
-        qty_after=Decimal("26"),
-        posting_at=datetime(2026, 7, 20, 12, 0),
-        record_type="Receipt",
-        movement_kind="assembly_out",
-        recorder_type="Consumption",
-        recorder_ref="REC-MODE-ISOLATED-CONSUME",
-        line_no="2",
-        ingest_source="test",
-        active=True,
-    )
-    db_session.add(consume_fact)
-    consume_reservation = ReservationEntry(
-        ledger_generation_id=generation.id,
-        item_id=make_reservation.item_id,
-        characteristic_ref="",
-        organization_ref=DEFAULT_ORGANIZATION_REF1C,
-        planning_stock_pool="selected",
-        run_id=make_reservation.run_id,
-        freeze_version=1,
-        requirement_id=make_reservation.requirement_id,
-        priority_period_from=make_reservation.priority_period_from,
-        priority_period_to=make_reservation.priority_period_to,
-        realization_mode="consume",
-        reserved_qty=Decimal("26"),
-        realized_qty=Decimal("0"),
-        lifecycle_status="active",
-    )
-    db_session.add(consume_reservation)
-    db_session.flush()
-    make_fact = db_session.query(StockLedgerEntry).filter_by(
-        ingest_batch_id=generation.physical_import_batch_id,
-        source_content_hash="hash-MODE-ISOLATED",
-    ).one()
-    _address_fact_to_requirement(db_session, make_fact, make_reservation)
-    _address_fact_to_requirement(db_session, consume_fact, consume_reservation)
-
-    result = run_historical_replay(db_session, generation.id)
-
-    assert Decimal(result["allocated_qty"]) == Decimal("52")
-    rows = (
-        db_session.query(ReservationEvent, ReservationEntry)
-        .join(ReservationEntry, ReservationEntry.id == ReservationEvent.reservation_id)
-        .filter(ReservationEvent.ledger_generation_id == generation.id)
-        .order_by(ReservationEvent.id.asc())
-        .all()
-    )
-    assert len(rows) == 2
-    by_mode = {entry.realization_mode: event.realized_delta for event, entry in rows}
-    assert by_mode["make"] == Decimal("26")
-    assert by_mode["consume"] == Decimal("26")

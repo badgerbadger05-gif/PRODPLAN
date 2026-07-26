@@ -119,7 +119,7 @@ def test_run_list_and_delete_guard_use_only_exact_current_published_truth(db_ses
         ledger_generation_id=current.id, config_snapshot={}, pinned=True,
     )
     stale_run = models.PlanningRun(
-        status="FIXED_SNAPSHOT", source_plan_id=plan.id,
+        status="SUPERSEDED", source_plan_id=plan.id,
         ledger_generation_id=old.id, config_snapshot={}, pinned=True,
     )
     legacy_success = models.PlanningRun(

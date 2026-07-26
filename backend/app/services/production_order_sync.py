@@ -549,24 +549,6 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
                 print(f"[FACT SYNC WARNING] {e}")
                 # Не прерываем основную синхронизацию из-за ошибки факта
 
-            # DBR feedback (Фаза 3): двигаем статусы слотов/сигналов по факту
-            # выпуска материализованных заказов. Best-effort — сбой обратной
-            # связи НЕ должен ронять синк заказов (общий несущий сервис).
-            try:
-                from .dbr.feedback_service import apply_order_feedback
-
-                fb_stats = apply_order_feedback(db)
-                print(
-                    f"[DBR FEEDBACK] slots_updated={fb_stats.get('slots_updated', 0)}, "
-                    f"signals_updated={fb_stats.get('signals_updated', 0)}"
-                )
-            except Exception as e:
-                print(f"[DBR FEEDBACK WARNING] {e}")
-                try:
-                    db.rollback()
-                except Exception:
-                    pass
-
     except Exception as e:
         db.rollback()
         raise Exception(f"Ошибка синхронизации заказов на производство: {e}")

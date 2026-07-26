@@ -14,7 +14,6 @@ import pytest
 from app.models import (
     DefaultSpecification,
     Item,
-    ItemWarehouseStock,
     ProductionMaterialIssue,
     ProductionMaterialIssueLine,
     ProductionOrder,
@@ -29,15 +28,10 @@ from app.models import (
 )
 from app.services.production_control_material_availability import preview_materials
 from app.services.production_control_material_issues import create_material_issues
-from app.services.production_control_production_flow import (
-    produce_line,
-    return_leftover_components,
+from app.services.production_material_custody import (
+    load_material_custody,
+    committed_material_by_item,
 )
-from app.services.production_control_reservations import (
-    load_reservation_state,
-    open_reservations_by_item,
-)
-from app.services.production_reservation_repair import repair_in_place_reservations
 from app.services.planning_truth import publish_generation
 
 WORKSHOP_WH = "wh-weld"
@@ -175,24 +169,6 @@ def _post_full_transfer(db, product, comp, *, qty, source_wh=SOURCE_WH, dest_wh=
 # ---------------------------------------------------------------------------
 
 
-def test_posted_kit_stays_reserved_until_produced(db_session):
-    db = db_session
-    _add_warehouses(db)
-    parent, comp, product = _setup(db, qty_per_unit=2.0, order_qty=5.0)
-    _post_full_transfer(db, product, comp, qty=10.0)
-
-    reserved = open_reservations_by_item(db, [comp.item_id])
-    assert reserved[comp.item_id] == pytest.approx(10.0)
-
-    produce_line(db, product.product_id, qty=3.0)
-    reserved = open_reservations_by_item(db, [comp.item_id])
-    assert reserved[comp.item_id] == pytest.approx(4.0)  # 10 - 3*2
-
-    produce_line(db, product.product_id, qty=2.0)
-    reserved = open_reservations_by_item(db, [comp.item_id])
-    assert reserved.get(comp.item_id, 0.0) == pytest.approx(0.0)
-
-
 def test_transit_reserves_at_source_posted_reserves_at_workshop(db_session):
     db = db_session
     _add_warehouses(db)
@@ -220,7 +196,7 @@ def test_transit_reserves_at_source_posted_reserves_at_workshop(db_session):
     )
     db.commit()
 
-    state = load_reservation_state(db, item_ids=[comp.item_id])
+    state = load_material_custody(db, item_ids=[comp.item_id])
     assert state.reserved_at_warehouse(SOURCE_WH, comp.item_id) == pytest.approx(8.0)
     assert state.reserved_at_warehouse(WORKSHOP_WH, comp.item_id) == pytest.approx(0.0)
 
@@ -260,7 +236,7 @@ def test_finished_production_line_releases_exported_transfer_reservations(db_ses
         )
     db.commit()
 
-    state = load_reservation_state(db, item_ids=[comp.item_id])
+    state = load_material_custody(db, item_ids=[comp.item_id])
     assert state.for_product(product.product_id).total(comp.item_id) == pytest.approx(0.0)
     assert state.reserved_at_warehouse(SOURCE_WH, comp.item_id) == pytest.approx(0.0)
 
@@ -270,34 +246,6 @@ def test_finished_production_line_releases_exported_transfer_reservations(db_ses
         f"product_id={product.product_id}: строка заказа уже закрыта или завершена в 1С; "
         "новые перемещения не создаются"
     ]
-
-
-def test_repair_in_place_reservation_covers_legacy_shortfall(db_session):
-    db = db_session
-    _add_warehouses(db)
-    parent, comp, product = _setup(db, qty_per_unit=1.0, order_qty=8.0)
-    _post_full_transfer(db, product, comp, qty=4.0)
-
-    with pytest.raises(ValueError, match="Недостаточно компонентов"):
-        produce_line(db, product.product_id, qty=8.0)
-
-    result = repair_in_place_reservations(
-        db,
-        [product.product_id],
-        warehouse_ref1c=WORKSHOP_WH,
-        initiated_by="test repair",
-        dry_run=False,
-    )
-
-    assert result["errors"] == []
-    assert result["repaired"][0]["direction"] == "in_place"
-    assert result["repaired"][0]["lines"][0]["claim_qty"] == pytest.approx(4.0)
-
-    state = load_reservation_state(db, item_ids=[comp.item_id])
-    assert state.for_product(product.product_id).at_workshop[comp.item_id] == pytest.approx(8.0)
-
-    produced = produce_line(db, product.product_id, qty=8.0)
-    assert produced["status"] == "ok"
 
 
 def test_posted_without_issued_qty_still_reserves(db_session):
@@ -310,7 +258,7 @@ def test_posted_without_issued_qty_still_reserves(db_session):
         line.issued_qty = 0.0
     db.commit()
 
-    reserved = open_reservations_by_item(db, [comp.item_id])
+    reserved = committed_material_by_item(db, [comp.item_id])
     assert reserved[comp.item_id] == pytest.approx(8.0)
 
 
@@ -359,7 +307,7 @@ def test_second_order_cannot_be_covered_by_first_orders_kit(db_session):
 
 
 # ---------------------------------------------------------------------------
-# create_material_issues: in-place claims + delta transfers
+# create_material_issues: zero-distance claims + delta transfers
 # ---------------------------------------------------------------------------
 
 
@@ -375,14 +323,19 @@ def test_create_issues_claims_destination_stock_and_moves_only_delta(db_session)
     )
     assert result["errors"] == []
     created = result["created"]
-    in_place = [row for row in created if row.get("direction") == "in_place"]
-    transfers = [row for row in created if row.get("direction") != "in_place"]
-    assert len(in_place) == 1
+    workshop_rows = [
+        row for row in created if str(row.get("source_warehouse_ref1c") or "") == WORKSHOP_WH
+    ]
+    transfers = [
+        row for row in created if str(row.get("source_warehouse_ref1c") or "") != WORKSHOP_WH
+    ]
+    assert len(workshop_rows) == 1
     assert len(transfers) == 1
 
-    claim_issue = db.get(ProductionMaterialIssue, in_place[0]["issue_id"])
+    claim_issue = db.get(ProductionMaterialIssue, workshop_rows[0]["issue_id"])
     assert claim_issue.status == "posted"
-    assert claim_issue.document_number.startswith("RS")
+    assert claim_issue.direction == "issue"
+    assert claim_issue.document_number.startswith("MT")
     assert claim_issue.lines[0].required_qty == pytest.approx(4.0)
     assert claim_issue.lines[0].issued_qty == pytest.approx(4.0)
 
@@ -400,7 +353,7 @@ def test_create_issues_claims_destination_stock_and_moves_only_delta(db_session)
     assert state.status == "to_move"
 
 
-def test_create_issues_fully_in_place_marks_line_assembled(db_session):
+def test_create_material_issues_fully_from_workshop_marks_line_assembled(db_session):
     db = db_session
     _add_warehouses(db)
     parent, comp, product = _setup(db, order_qty=8.0)
@@ -411,7 +364,7 @@ def test_create_issues_fully_in_place_marks_line_assembled(db_session):
     )
     assert result["errors"] == []
     assert len(result["created"]) == 1
-    assert result["created"][0]["direction"] == "in_place"
+    assert result["created"][0]["direction"] == "issue"
 
     state = (
         db.query(ProductionOrderLineState)
@@ -427,10 +380,12 @@ def test_create_issues_fully_in_place_marks_line_assembled(db_session):
         db, [product_b.product_id], warehouse_ref1c=WORKSHOP_WH
     )
     created_b = result_b["created"]
-    in_place_b = [row for row in created_b if row.get("direction") == "in_place"]
+    workshop_b = [
+        row for row in created_b if str(row.get("source_warehouse_ref1c") or "") == WORKSHOP_WH
+    ]
     # only 2 left free on the workshop (10 - 8 claimed)
-    assert len(in_place_b) == 1
-    issue_b = db.get(ProductionMaterialIssue, in_place_b[0]["issue_id"])
+    assert len(workshop_b) == 1
+    issue_b = db.get(ProductionMaterialIssue, workshop_b[0]["issue_id"])
     assert issue_b.lines[0].required_qty == pytest.approx(2.0)
 
 
@@ -496,71 +451,11 @@ def test_quantity_decrease_releases_open_reservation(db_session):
 
 
 # ---------------------------------------------------------------------------
-# Produce guard
-# ---------------------------------------------------------------------------
-
-
-def test_produce_blocked_until_kit_is_at_workshop(db_session):
-    db = db_session
-    _add_warehouses(db)
-    parent, comp, product = _setup(db, qty_per_unit=2.0, order_qty=5.0)
-
-    issue = ProductionMaterialIssue(
-        document_number="MT-G",
-        product_id=product.product_id,
-        order_id=product.order_id,
-        status="issued",
-        direction="issue",
-        warehouse_ref1c=WORKSHOP_WH,
-        source_warehouse_ref1c=SOURCE_WH,
-    )
-    db.add(issue)
-    db.flush()
-    db.add(
-        ProductionMaterialIssueLine(
-            issue_id=issue.issue_id,
-            component_item_id=comp.item_id,
-            required_qty=10.0,
-            issued_qty=0.0,
-            line_status="planned",
-        )
-    )
-    db.commit()
-
-    with pytest.raises(ValueError, match="зарезервированных на участке"):
-        produce_line(db, product.product_id, qty=5.0)
-
-    issue.status = "posted"
-    for line in issue.lines:
-        line.issued_qty = line.required_qty
-    db.commit()
-
-    result = produce_line(db, product.product_id, qty=5.0)
-    assert result["status"] == "ok"
-
-
-def test_produce_blocked_when_kit_partially_consumed_by_overproduction(db_session):
-    db = db_session
-    _add_warehouses(db)
-    parent, comp, product = _setup(db, qty_per_unit=2.0, order_qty=5.0)
-    _post_full_transfer(db, product, comp, qty=10.0)
-
-    produce_line(db, product.product_id, qty=5.0)
-    # remaining_qty is now 0; bump the plan as the overproduce UI flow does.
-    product.quantity = 7.0
-    product.remaining_qty = 2.0
-    db.commit()
-
-    with pytest.raises(ValueError, match="зарезервированных на участке"):
-        produce_line(db, product.product_id, qty=2.0)
-
-
-# ---------------------------------------------------------------------------
 # 1C export isolation
 # ---------------------------------------------------------------------------
 
 
-def test_in_place_issue_is_never_exported_to_1c(db_session):
+def test_zero_distance_issue_is_never_exported_to_1c(db_session):
     db = db_session
     _add_warehouses(db)
     parent, comp, product = _setup(db, order_qty=8.0)
@@ -574,54 +469,4 @@ def test_in_place_issue_is_never_exported_to_1c(db_session):
     entries, skipped = _collect_export_entries(db, [issue_id])
     assert entries == []
     assert len(skipped) == 1
-    assert "in_place" in str(skipped[0]["reason"])
-
-
-# ---------------------------------------------------------------------------
-# Returns
-# ---------------------------------------------------------------------------
-
-
-def test_return_releases_in_place_claim_without_1c_document(db_session):
-    db = db_session
-    _add_warehouses(db)
-    parent, comp, product = _setup(db, qty_per_unit=2.0, order_qty=5.0)
-    _set_stock(db, comp, {WORKSHOP_WH: 10.0})
-
-    create_material_issues(db, [product.product_id], warehouse_ref1c=WORKSHOP_WH)
-    produce_line(db, product.product_id, qty=3.0)
-
-    result = return_leftover_components(db, product.product_id)
-    # All leftover (10 - 6 = 4) is an in-place claim: release locally, no doc.
-    assert result.get("return_issue_id") is None
-    assert sum(row["released_qty"] for row in result["released_in_place"]) == pytest.approx(4.0)
-
-    reserved = open_reservations_by_item(db, [comp.item_id])
-    assert reserved.get(comp.item_id, 0.0) == pytest.approx(0.0)
-
-
-def test_return_mixes_in_place_release_and_physical_return(db_session):
-    db = db_session
-    _add_warehouses(db)
-    parent, comp, product = _setup(db, qty_per_unit=2.0, order_qty=5.0)
-    # 4 already on the workshop, the rest comes from the source warehouse.
-    _set_stock(db, comp, {WORKSHOP_WH: 4.0, SOURCE_WH: 100.0})
-
-    result = create_material_issues(db, [product.product_id], warehouse_ref1c=WORKSHOP_WH)
-    transfer_ids = [
-        row["issue_id"] for row in result["created"] if row.get("direction") != "in_place"
-    ]
-    transfer = db.get(ProductionMaterialIssue, transfer_ids[0])
-    transfer.status = "posted"
-    for line in transfer.lines:
-        line.issued_qty = line.required_qty
-        line.line_status = "issued"
-    db.commit()
-
-    produce_line(db, product.product_id, qty=3.0)
-
-    result = return_leftover_components(db, product.product_id)
-    # leftover = 10 - 6 = 4: first the 4-pc in-place claim is released...
-    assert sum(row["released_qty"] for row in result["released_in_place"]) == pytest.approx(4.0)
-    # ...which fully covers the leftover, so no physical return document.
-    assert result.get("return_issue_id") is None
+    assert "source=destination" in str(skipped[0]["reason"])

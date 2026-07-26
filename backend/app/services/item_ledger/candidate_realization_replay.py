@@ -45,6 +45,7 @@ def _manifest_candidate_runs(
 
     candidate_ids: set[int] = set()
     retained_ids: set[int] = set()
+    retired_ids: set[int] = set()
     plan_ids: set[int] = set()
     for entry in entries:
         if not isinstance(entry, dict):
@@ -70,6 +71,20 @@ def _manifest_candidate_runs(
             retained_ids.add(retained_id)
             plan_ids.add(plan_id)
             continue
+        if action == "retire":
+            try:
+                retired_id = int(entry["parent_run_id"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise CandidateRealizationReplayError(
+                    "obligation_refresh_manifest retire identity is malformed"
+                ) from exc
+            if entry.get("candidate_run_id") is not None:
+                raise CandidateRealizationReplayError(
+                    "retired run must not have a candidate"
+                )
+            retired_ids.add(retired_id)
+            plan_ids.add(plan_id)
+            continue
         try:
             candidate_id = int(entry["candidate_run_id"])
         except (KeyError, TypeError, ValueError) as exc:
@@ -88,7 +103,7 @@ def _manifest_candidate_runs(
     if set(by_id) != candidate_ids:
         raise CandidateRealizationReplayError("manifest names missing candidate run")
     for entry in entries:
-        if entry.get("action") == "retain":
+        if entry.get("action") in {"retain", "retire"}:
             continue
         run = by_id[int(entry["candidate_run_id"])]
         if (

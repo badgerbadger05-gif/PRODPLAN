@@ -140,20 +140,15 @@ def produce_line(
     comment: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Record one production event on a ProductionProduct line.
+    Record an operator command to create production documents in 1C.
 
     Effects:
-    - Creates a ProductionManufacture row (qty + executor + comment).
-    - Bumps production_products.produced_qty by qty.
-    - Decreases production_products.remaining_qty by qty (clamped >=0).
-    - Updates ProductionOrderLineState.status:
-        remaining > 0 -> 'produced_partial'
-        remaining <= 0 -> 'produced'
-      The state is sticky past those values: never regresses.
+    - Creates a ProductionManufacture command row with executors.
+    - Does not record physical execution or mutate produced/remaining caches.
 
-    The 1C-side Document_СборкаЗапасов is created separately via
-    one_c_manufacture_export.export_manufactures_to_1c (typically right after
-    via the journal "Выгрузить выпуск в 1С" action).
+    The command is exported as Document_СборкаЗапасов and
+    Document_СдельныйНаряд. Only the read-back posting register imported into
+    Item Ledger may change factual execution through canonical FIFO.
     """
     qty_f = float(qty or 0)
     if qty_f <= 0:
@@ -167,18 +162,23 @@ def produce_line(
     if product is None:
         raise ValueError(f"product_id={product_id}: строка заказа не найдена")
 
-    remaining = _to_float(product.remaining_qty)
-    produced_before = _to_float(product.produced_qty)
-    overproduced_qty = 0.0
-    order_quantity_before = _to_float(product.quantity)
-    if remaining <= 1e-9:
+    order_quantity = _to_float(product.quantity)
+    commanded_before = sum(
+        _to_float(row[0])
+        for row in db.query(ProductionManufacture.qty)
+        .filter(ProductionManufacture.product_id == int(product.product_id))
+        .filter(ProductionManufacture.status.in_(("draft", "exported")))
+        .all()
+    )
+    command_remaining = max(0.0, order_quantity - commanded_before)
+    if command_remaining <= 1e-9:
         raise ValueError(
-            "remaining_qty=0: эта строка уже произведена полностью"
+            "По этой строке уже создана исполнительная команда на весь объём"
         )
-    if qty_f - remaining > 1e-6:
-        overproduced_qty = qty_f - remaining
-        product.quantity = produced_before + qty_f
-        remaining = qty_f
+    if qty_f - command_remaining > 1e-6:
+        raise ValueError(
+            "qty превышает остаток, ещё не переданный в исполнительные документы"
+        )
 
     material_issue = (
         db.query(ProductionMaterialIssue)
@@ -248,36 +248,20 @@ def produce_line(
             employee_type=str(getattr(employee, "employee_type", None) or "employee"),
         ))
 
-    product.produced_qty = produced_before + qty_f
-    new_remaining = max(0.0, remaining - qty_f)
-    product.remaining_qty = new_remaining
-
     state = _ensure_state(db, product)
-    if new_remaining <= 1e-9:
-        new_state = "produced"
-    else:
-        new_state = "produced_partial"
-    # Stickiness: don't drop from 'produced' back to 'produced_partial'
-    # if the user somehow recorded a negative-equivalent.
-    if state.status not in {"produced", "cancelled"}:
-        state.status = new_state
-    elif state.status == "produced_partial" and new_state == "produced":
-        # Partial -> full produced (final batch).
-        state.status = "produced"
-
     db.commit()
 
     return {
-        "status": "ok",
+        "status": "pending_1c_fact",
         "manufacture_id": int(manufacture.manufacture_id),
         "product_id": int(product.product_id),
         "order_id": int(product.order_id),
         "qty": float(qty_f),
-        "produced_qty_total": float(product.produced_qty),
-        "remaining_qty": float(product.remaining_qty),
-        "overproduced_qty": float(overproduced_qty),
-        "order_quantity_before": float(order_quantity_before),
-        "order_quantity_after": float(product.quantity),
+        "produced_qty_total": float(product.produced_qty or 0),
+        "remaining_qty": float(product.remaining_qty or 0),
+        "commanded_qty_total": float(commanded_before + qty_f),
+        "command_remaining_qty": float(max(command_remaining - qty_f, 0.0)),
+        "fact_pending": True,
         "line_status": state.status,
     }
 
@@ -307,13 +291,7 @@ def rollback_local_manufacture(db: Session, manufacture_id: int) -> Dict[str, An
     if product is None:
         raise ValueError(f"product_id={manufacture.product_id}: строка заказа не найдена")
 
-    qty_f = _to_float(manufacture.qty)
-    product.produced_qty = max(0.0, _to_float(product.produced_qty) - qty_f)
-    product.remaining_qty = _to_float(product.remaining_qty) + qty_f
-
     state = _ensure_state(db, product)
-    if state.status in {"produced", "produced_partial"}:
-        state.status = "assembled"
 
     db.delete(manufacture)
     db.commit()

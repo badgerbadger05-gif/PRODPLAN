@@ -64,41 +64,6 @@ def _sle(db, generation, item, *, recorder, qty="3", kind="assembly_in", char=""
     return row
 
 
-def test_wip_capture_uses_visible_line_exact_manufacture_fact_not_legacy_counters(db_session):
-    generation, _physical, build, item, warehouse = _scope(db_session)
-    order, product = _product(db_session, item, warehouse)
-    manufacture = models.ProductionManufacture(product_id=product.product_id, order_id=order.order_id, qty=3)
-    db_session.add(manufacture)
-    db_session.flush()
-    _sle(db_session, generation, item, recorder="ASSEMBLY-1", warehouse=warehouse.warehouse_ref1c)
-    db_session.add(models.SyncLink(
-        source_system="PRODPLAN",
-        source_doctype="manufacture", source_id=manufacture.manufacture_id,
-        target_entity="Document_СборкаЗапасов", target_ref_key="ASSEMBLY-1", status="success",
-        ledger_generation_id=generation.id,
-    ))
-    db_session.flush()
-
-    target = models.LedgerGeneration(
-        generation_key="wip-building-target", status="building", cutoff=generation.cutoff,
-        source_watermarks={}, capabilities={}, physical_import_batch_id=generation.physical_import_batch_id,
-        algorithm_version="test",
-    )
-    db_session.add(target)
-    db_session.flush()
-    build.ledger_generation_id = target.id
-    db_session.flush()
-    metrics = capture_wip_future_supply(
-        db_session, generation.id, target.id, build.id,
-        planning_pool_by_warehouse={warehouse.warehouse_ref1c: "assembly-pool"},
-    )
-    stored = db_session.query(models.LedgerFutureSupply).one()
-    assert Decimal(str(stored.ordered_qty_at_cutoff)) == Decimal("10")
-    assert Decimal(str(stored.realized_qty_at_cutoff)) == Decimal("3")
-    assert Decimal(str(stored.open_qty_at_cutoff)) == Decimal("7")
-    assert stored.evidence_status == "exact"
-    assert metrics["open_qty"] == Decimal("7")
-
 
 def test_order_ref_route_requires_one_item_characteristic_candidate(db_session):
     generation, _physical, _build, item, warehouse = _scope(db_session, "amb")
@@ -145,32 +110,3 @@ def test_no_explicit_pool_mapping_is_rejected_even_for_selected_warehouse(db_ses
     row = collect_wip_future_supply_evidence(db_session, generation.id)[0]
     assert row.evidence_status == "rejected"
     assert row.reason == "planning_pool_not_mapped"
-
-
-def test_assembly_and_explicit_transfer_for_one_line_are_ambiguous_not_summed(db_session):
-    generation, _physical, _build, item, warehouse = _scope(db_session, "double")
-    order, product = _product(db_session, item, warehouse)
-    manufacture = models.ProductionManufacture(product_id=product.product_id, order_id=order.order_id, qty=3)
-    db_session.add(manufacture)
-    db_session.flush()
-    _sle(db_session, generation, item, recorder="ASSEMBLY-DOUBLE", qty="3", warehouse=warehouse.warehouse_ref1c)
-    _sle(db_session, generation, item, recorder="TRANSFER-DOUBLE", qty="2", kind="transfer_in", line="2", warehouse=warehouse.warehouse_ref1c)
-    db_session.add_all([
-        models.SyncLink(source_system="PRODPLAN", source_doctype="manufacture",
-                        source_id=manufacture.manufacture_id,
-                        target_entity="Document_СборкаЗапасов",
-                        target_ref_key="ASSEMBLY-DOUBLE", status="success",
-                        ledger_generation_id=generation.id),
-        models.StockRecorderPull(recorder_type="Document", recorder_ref="TRANSFER-DOUBLE",
-                                 order_ref=order.order_ref1c, status="done"),
-    ])
-    db_session.flush()
-
-    row = collect_wip_future_supply_evidence(
-        db_session, generation.id,
-        planning_pool_by_warehouse={warehouse.warehouse_ref1c: "assembly-pool"},
-        explicit_make_transfer_recorders={"TRANSFER-DOUBLE"},
-    )[0]
-    assert row.evidence_status == "rejected"
-    assert row.realized_qty_at_cutoff == Decimal("5")
-    assert "ambiguous assembly and transfer" in (row.reason or "")

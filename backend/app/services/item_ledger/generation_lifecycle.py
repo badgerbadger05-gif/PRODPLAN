@@ -30,6 +30,13 @@ from .physical import canonical_content_hash
 from .physical_visibility import visible_sles_for_generation
 from .supplier_receipt_allocation import rebuild_supplier_receipt_coverage
 from .supplier_receipt_odata import extract_supplier_document_evidence
+from .assembly_queue_snapshot import build_assembly_queue_snapshot
+from .assembly_output_persistence import (
+    _ALGORITHM_VERSION as ASSEMBLY_OUTPUT_ALGORITHM_VERSION,
+    materialize_assembly_output_allocations,
+)
+from .drum_schedule_persistence import materialize_drum_schedule
+from .shelf_projection_persistence import materialize_shelf_projections
 from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
 
 
@@ -39,6 +46,10 @@ CAPABILITIES = {
     "execution_allocations": True,
     "supplier_receipt_coverage": True,
     "planning_snapshots": True,
+    "assembly_output_allocation": True,
+    "assembly_queue": True,
+    "drum_schedule": True,
+    "shelf_projection": True,
 }
 PHYSICAL_REFRESH_KIND = "physical_refresh"
 _SUPPLIER_DOCUMENT_TYPES = frozenset({
@@ -384,12 +395,25 @@ def validate_generation_build(
         db, int(generation.id), "reservation_materialize"
     )
     replay_batch = _completed_stage(db, int(generation.id), "reservation_replay")
+    assembly_output_batch = _completed_stage(
+        db, int(generation.id), "assembly_output_allocation"
+    )
     obligation_metrics = dict(obligation_batch.metrics or {})
     replay_metrics = dict(replay_batch.metrics or {})
     if obligation_batch.algorithm_version != OBLIGATION_ALGORITHM_VERSION:
         raise GenerationValidationError("unexpected historical obligation algorithm")
     if replay_batch.algorithm_version != REPLAY_ALGORITHM_VERSION:
         raise GenerationValidationError("unexpected historical replay algorithm")
+    if assembly_output_batch.algorithm_version != ASSEMBLY_OUTPUT_ALGORITHM_VERSION:
+        raise GenerationValidationError("unexpected assembly output allocation algorithm")
+    assembly_metrics = dict(assembly_output_batch.metrics or {})
+    assembly_fact_qty = _d(assembly_metrics.get("fact_qty"))
+    assembly_allocated_qty = _d(assembly_metrics.get("allocated_qty"))
+    assembly_surplus_qty = _d(assembly_metrics.get("surplus_total"))
+    if assembly_fact_qty != assembly_allocated_qty + assembly_surplus_qty:
+        raise GenerationValidationError(
+            "assembly output allocation conservation failed"
+        )
     selected_requirement_ids = _parse_int_id_list(
         obligation_metrics.get("selected_requirement_ids"), "selected_requirement_ids"
     )
@@ -429,16 +453,20 @@ def validate_generation_build(
             reserved + _d(event.reserved_delta),
             realized + _d(event.realized_delta),
         )
-    realized_by_req_mode: dict[tuple[int, str], Decimal] = defaultdict(Decimal)
     for entry in entries:
         reserved, realized = event_sums[int(entry.id)]
-        if reserved != _d(entry.reserved_qty) or realized != _d(entry.realized_qty):
+        if (
+            reserved != _d(entry.reserved_qty)
+            or realized != _d(entry.realized_qty)
+            or realized != _d(entry.replenishment_received_qty)
+        ):
             raise GenerationValidationError(
                 f"reservation {entry.id} cache differs from event fold"
             )
-        realized_by_req_mode[
-            (int(entry.requirement_id), str(entry.realization_mode))
-        ] += realized
+        if realized > _d(entry.replenishment_required_qty):
+            raise GenerationValidationError(
+                f"reservation {entry.id} replenishment exceeds frozen demand"
+            )
 
     replay_realized_qty = sum(
         (
@@ -459,8 +487,8 @@ def validate_generation_build(
 
     fact_qty = _d(replay_metrics.get("fact_qty"))
     allocated_qty = _d(replay_metrics.get("allocated_qty"))
-    unplanned_qty = _d(replay_metrics.get("unplanned_qty"))
-    if fact_qty != allocated_qty + unplanned_qty:
+    surplus_qty = _d(replay_metrics.get("surplus_qty"))
+    if fact_qty != allocated_qty + surplus_qty:
         raise GenerationValidationError("historical replay violates fact conservation")
     if allocated_qty != replay_realized_qty:
         raise GenerationValidationError("replay metrics disagree with reservation events")
@@ -545,7 +573,7 @@ def validate_generation_build(
         (_d(supplier_candidate_by_id[row_id].qty) for row_id in excluded_ids),
         Decimal("0"),
     )
-    supplier_unplanned_qty = supplier_physical_qty - supplier_allocated_qty
+    supplier_surplus_qty = supplier_physical_qty - supplier_allocated_qty
 
     expected_bins: dict[tuple[int, str, str, str], tuple[Decimal, int]] = {}
     for row in visible:
@@ -584,10 +612,10 @@ def validate_generation_build(
         "supplier_receipt_ignored_count": len(excluded_ids),
         "supplier_receipt_ignored_qty": str(supplier_ignored_qty),
         "supplier_receipt_status_counts": supplier_status_counts,
-        "supplier_receipt_unplanned_qty": str(supplier_unplanned_qty),
+        "supplier_receipt_surplus_qty": str(supplier_surplus_qty),
         "fact_qty": str(fact_qty),
         "allocated_qty": str(allocated_qty),
-        "unplanned_qty": str(unplanned_qty),
+        "surplus_qty": str(surplus_qty),
         "valid": True,
     }
 
@@ -650,6 +678,18 @@ def accept_generation_build(
                 )
             ),
         )
+        assembly_outputs = materialize_assembly_output_allocations(
+            db, int(generation.id)
+        )
+        try:
+            drum_schedule = materialize_drum_schedule(db, int(generation.id))
+            shelf_projection = materialize_shelf_projections(
+                db, int(generation.id)
+            )
+        except ValueError as exc:
+            raise GenerationValidationError(
+                f"canonical drum build failed: {exc}"
+            ) from exc
         validation = validate_generation_build(
             db,
             int(generation.id),
@@ -665,9 +705,12 @@ def accept_generation_build(
                     db, int(generation.id)
                 )
             )
+            assembly_queue_snapshot = build_assembly_queue_snapshot(
+                db, int(generation.id)
+            )
         except (TypeError, ValueError) as exc:
             raise GenerationValidationError(
-                f"period-plan execution snapshot build failed: {exc}"
+                f"planning read snapshot build failed: {exc}"
             ) from exc
         generation.capabilities = dict(CAPABILITIES)
         generation.status = "accepted"
@@ -681,7 +724,11 @@ def accept_generation_build(
         "physical": physical,
         "obligations": obligations,
         "replay": replay,
+        "assembly_outputs": assembly_outputs,
+        "drum_schedule": drum_schedule,
+        "shelf_projection": shelf_projection,
         "planning_snapshots": planning_snapshots,
+        "assembly_queue_snapshot_id": int(assembly_queue_snapshot.id),
         "supplier_receipts": {
             "documents_fetched": (
                 extraction.fetched_document_count if extraction is not None else 0
@@ -691,7 +738,7 @@ def accept_generation_build(
             ),
             "provenance": supplier.provenance_count,
             "allocations": supplier.allocation_count,
-            "unplanned_qty": str(supplier.unplanned_qty),
+            "surplus_qty": str(supplier.surplus_qty),
             "status_counts": validation["supplier_receipt_status_counts"],
         },
     }

@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+from decimal import Decimal
 
 import pytest
 
+from app import models
 from app.models import (
     DefaultSpecification,
     Employee,
@@ -31,6 +33,11 @@ from app.models import (
 )
 from app.routers.production_control import ExportPieceworkPayload
 from app.services import one_c_manufacture_export as exporter
+from app.services import one_c_piecework_export as piecework_exporter
+from app.services.item_ledger.assembly_output_persistence import (
+    materialize_assembly_output_allocations,
+)
+from app.services.item_ledger.ingest import pull_recorder_movements
 from app.services import production_control_production_flow as flow
 from app.services.production_control_production_flow import produce_line, rollback_local_manufacture
 
@@ -237,28 +244,31 @@ def _stub_config(monkeypatch, *, base_url: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_produce_full_marks_line_produced(db_session):
+def test_produce_full_creates_command_without_recording_fact(db_session):
     db = db_session
     item = _mk_item(db, code="PRD-FULL", ref1c="ref-prd-full")
     product = _mk_product(db, item, qty=5.0)
 
     result = produce_line(db, product.product_id, qty=5, executor="иван")
-    assert result["status"] == "ok"
+    assert result["status"] == "pending_1c_fact"
     assert result["qty"] == 5.0
-    assert result["produced_qty_total"] == 5.0
-    assert result["remaining_qty"] == 0.0
-    assert result["line_status"] == "produced"
+    assert result["produced_qty_total"] == 0.0
+    assert result["remaining_qty"] == 5.0
+    assert result["commanded_qty_total"] == 5.0
+    assert result["command_remaining_qty"] == 0.0
+    assert result["fact_pending"] is True
+    assert result["line_status"] == "ready"
 
     db.refresh(product)
-    assert float(product.produced_qty) == 5.0
-    assert float(product.remaining_qty) == 0.0
+    assert float(product.produced_qty) == 0.0
+    assert float(product.remaining_qty) == 5.0
 
     state = (
         db.query(ProductionOrderLineState)
         .filter_by(product_id=product.product_id)
         .one()
     )
-    assert state.status == "produced"
+    assert state.status == "ready"
 
     manufacture = (
         db.query(ProductionManufacture)
@@ -313,19 +323,21 @@ def test_produce_line_saves_operation_executors(db_session):
     assert row.employee_name == "Оператор операции"
 
 
-def test_partial_then_remaining_finishes_line(db_session):
-    """Two produce_line calls combine into a final 'produced' state."""
+def test_partial_commands_fill_executable_quantity_without_recording_fact(db_session):
     db = db_session
     item = _mk_item(db, code="PRD-PART", ref1c="ref-prd-part")
     product = _mk_product(db, item, qty=7.0)
 
     r1 = produce_line(db, product.product_id, qty=3, executor="op1")
-    assert r1["line_status"] == "produced_partial"
-    assert r1["remaining_qty"] == 4.0
+    assert r1["line_status"] == "ready"
+    assert r1["command_remaining_qty"] == 4.0
 
     r2 = produce_line(db, product.product_id, qty=4, executor="op2")
-    assert r2["line_status"] == "produced"
-    assert r2["remaining_qty"] == 0.0
+    assert r2["line_status"] == "ready"
+    assert r2["command_remaining_qty"] == 0.0
+    db.refresh(product)
+    assert float(product.produced_qty) == 0.0
+    assert float(product.remaining_qty) == 7.0
 
     # Two manufactures, total 7.
     mans = (
@@ -337,28 +349,21 @@ def test_partial_then_remaining_finishes_line(db_session):
     assert [float(m.qty) for m in mans] == [3.0, 4.0]
 
 
-def test_produce_more_than_remaining_expands_order_quantity(db_session):
+def test_produce_more_than_uncommanded_quantity_is_rejected(db_session):
     db = db_session
     item = _mk_item(db, code="PRD-OVER", ref1c="ref-prd-over")
     product = _mk_product(db, item, qty=2.0)
 
-    result = produce_line(db, product.product_id, qty=3)
-
-    assert result["status"] == "ok"
-    assert result["qty"] == 3.0
-    assert result["overproduced_qty"] == 1.0
-    assert result["order_quantity_before"] == 2.0
-    assert result["order_quantity_after"] == 3.0
-    assert result["produced_qty_total"] == 3.0
-    assert result["remaining_qty"] == 0.0
+    with pytest.raises(ValueError, match="исполнительные документы"):
+        produce_line(db, product.product_id, qty=3)
 
     db.refresh(product)
-    assert float(product.quantity) == 3.0
-    assert float(product.produced_qty) == 3.0
-    assert float(product.remaining_qty) == 0.0
+    assert float(product.quantity) == 2.0
+    assert float(product.produced_qty) == 0.0
+    assert float(product.remaining_qty) == 2.0
     assert (
         db.query(ProductionManufacture).filter_by(product_id=product.product_id).count()
-        == 1
+        == 0
     )
 
 
@@ -433,11 +438,11 @@ def test_produce_refreshes_1c_spec_before_reservation_guard(db_session, monkeypa
 
     result = produce_line(db, product.product_id, qty=16.0)
 
-    assert result["status"] == "ok"
-    assert result["line_status"] == "produced"
+    assert result["status"] == "pending_1c_fact"
+    assert result["line_status"] == "ready"
     db.refresh(product)
-    assert float(product.produced_qty) == 16.0
-    assert float(product.remaining_qty) == 0.0
+    assert float(product.produced_qty) == 0.0
+    assert float(product.remaining_qty) == 16.0
 
 
 # ---------------------------------------------------------------------------
@@ -1071,3 +1076,164 @@ def test_guard_checks_bulk_batch_against_shared_balance(db_session, monkeypatch)
     assert "нужно 6" in m2.export_error and "в 1С 4" in m2.export_error
     # One shared balance read per unit for the whole batch, not per entry.
     assert len(fake.balance_queries) == 1
+
+
+def test_produce_exports_both_documents_then_readback_closes_plans_fifo(
+    db_session, monkeypatch
+):
+    """Document creation is a command; only its Ledger read-back is FIFO fact."""
+    db = db_session
+    item = _mk_item(db, code="E2E-PRODUCE", ref1c="e2e-item-ref")
+    product = _mk_product(db, item, qty=7)
+    _attach_current_mrp_lineage(db, product)
+
+    command = produce_line(db, product.product_id, qty=7, executor="operator")
+    manufacture_id = int(command["manufacture_id"])
+    db.refresh(product)
+    assert float(product.produced_qty) == 0
+    assert float(product.remaining_qty) == 7
+
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    manufacture_client = _FakeClient(ref_key="assembly-e2e-ref")
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: manufacture_client)
+    manufacture = exporter.export_manufactures_to_1c(
+        db, [manufacture_id], dry_run=False, allow_production=True
+    )
+    assert manufacture["manufactures_created"] == 1
+    assert len(manufacture_client.posts) == 1
+
+    monkeypatch.setattr(
+        piecework_exporter,
+        "_load_odata_config",
+        lambda: {
+            "base_url": "http://demo/odata/unf_demo",
+            "username": "u",
+            "password": "p",
+        },
+    )
+    piecework_client = _FakeClient(ref_key="piecework-e2e-ref")
+    monkeypatch.setattr(
+        piecework_exporter, "OData1CClient", lambda **_: piecework_client
+    )
+    piecework = piecework_exporter.export_piecework_to_1c(
+        db,
+        [manufacture_id],
+        operation_ref="operation-e2e-ref",
+        dry_run=False,
+        allow_production=True,
+    )
+    assert piecework["manufactures_created"] == 1
+    assert len(piecework_client.posts) == 1
+
+    cutoff = datetime(2026, 7, 31, tzinfo=timezone.utc)
+    physical_batch = models.PhysicalImportBatch(
+        batch_key="produce-e2e-physical",
+        status="completed",
+        cutoff=cutoff,
+        source_watermarks={},
+        completed_at=cutoff,
+    )
+    generation = models.LedgerGeneration(
+        generation_key="produce-e2e-generation",
+        status="building",
+        cutoff=cutoff,
+        source_watermarks={},
+        capabilities={},
+        physical_import_batch=physical_batch,
+        algorithm_version="tests/produce-e2e",
+    )
+    db.add_all([
+        generation,
+        models.StockWarehouse(
+            warehouse_ref1c="e2e-warehouse",
+            warehouse_name="E2E warehouse",
+        ),
+    ])
+    db.flush()
+
+    lines = []
+    for idx, (start, qty) in enumerate(
+        ((date(2026, 7, 1), Decimal("2")), (date(2026, 8, 1), Decimal("8"))),
+        start=1,
+    ):
+        plan = models.ProductionPlanHeader(
+            name=f"produce-e2e-plan-{idx}",
+            period_from=start,
+            period_to=date(2026, 12, 31),
+            status="fixed",
+        )
+        db.add(plan)
+        db.flush()
+        db.add(models.PlanningRun(
+            status="FIXED_SNAPSHOT",
+            config_snapshot={},
+            ledger_generation_id=int(generation.id),
+            ledger_cutoff=cutoff,
+            active_freeze_version=1,
+            source_plan_id=int(plan.id),
+            period_from=start,
+            period_to=date(2026, 12, 31),
+        ))
+        line = models.ProductionPlanLine(
+            plan_id=int(plan.id),
+            item_id=int(item.item_id),
+            bucket_date=start,
+            qty=qty,
+        )
+        db.add(line)
+        db.flush()
+        lines.append(line)
+
+    class ReadBackClient:
+        def get_all(self, entity_name, **_kwargs):
+            if entity_name == "Document_СборкаЗапасов":
+                return [{
+                    "Ref_Key": "assembly-e2e-ref",
+                    "ЗаказНаПроизводство_Key": product.order.order_ref1c,
+                }]
+            return [{
+                "Recorder": "assembly-e2e-ref",
+                "Recorder_Type": "AccumulationRecordType",
+                "RecordSet": [{
+                    "Period": "2026-07-10T10:00:00",
+                    "LineNumber": "1",
+                    "Active": True,
+                    "RecordType": "Receipt",
+                    "Организация_Key": "00000000-0000-0000-0000-000000000000",
+                    "Номенклатура_Key": "e2e-item-ref",
+                    "Характеристика_Key": "00000000-0000-0000-0000-000000000000",
+                    "Партия_Key": "00000000-0000-0000-0000-000000000000",
+                    "СтруктурнаяЕдиница_Key": "e2e-warehouse",
+                    "Ячейка_Key": "00000000-0000-0000-0000-000000000000",
+                    "Количество": 7,
+                    "КоличествоИнт": 0,
+                    "ХозяйственнаяОперация_Key": "00000000-0000-0000-0000-000000000000",
+                }],
+            }]
+
+    pulled = pull_recorder_movements(
+        db,
+        "Document_СборкаЗапасов",
+        "assembly-e2e-ref",
+        client=ReadBackClient(),
+        ledger_generation_id=int(generation.id),
+    )
+    assert pulled.status == "done"
+    generation.physical_import_batch_id = int(pulled.physical_import_batch_id)
+    db.flush()
+    result = materialize_assembly_output_allocations(db, int(generation.id))
+    allocations = (
+        db.query(models.AssemblyOutputAllocation)
+        .filter_by(ledger_generation_id=int(generation.id))
+        .order_by(models.AssemblyOutputAllocation.allocation_ordinal.asc())
+        .all()
+    )
+    assert result["allocations"] == 2
+    assert [int(row.plan_line_id) for row in allocations] == [
+        int(lines[0].id),
+        int(lines[1].id),
+    ]
+    assert [Decimal(row.allocated_qty) for row in allocations] == [
+        Decimal("2"),
+        Decimal("5"),
+    ]

@@ -383,12 +383,20 @@ def deactivate_pair(db: Session, pair_id: int) -> Dict[str, Any]:
 
 
 def _effective_welded_stock(db: Session, welded_item_id: int) -> float:
-    """Эффективный остаток сварной: выбранные − игнорируемые склады − резервы."""
-    from .production_control_material_availability import _stock_by_item
-    from .production_control_reservations import open_reservations_by_item
+    """Accepted Ledger stock minus operational reservations."""
+    from .item_ledger import item_ledger_position
+    from .planning_truth import require_accepted
+    from .production_material_custody import committed_material_by_item
 
-    stock = _to_float(_stock_by_item(db, [welded_item_id]).get(welded_item_id, 0.0))
-    reserved = _to_float(open_reservations_by_item(db, [welded_item_id]).get(welded_item_id, 0.0))
+    truth = require_accepted(db)
+    stock = _to_float(
+        item_ledger_position(
+            db,
+            [welded_item_id],
+            ledger_generation_id=truth.generation_id,
+        )[welded_item_id]["on_hand"]
+    )
+    reserved = _to_float(committed_material_by_item(db, [welded_item_id]).get(welded_item_id, 0.0))
     return max(stock - reserved, 0.0)
 
 

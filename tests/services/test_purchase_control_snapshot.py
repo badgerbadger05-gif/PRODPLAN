@@ -160,8 +160,6 @@ def _add_buy_plan_run(
         item_id=item.item_id,
         total_required_qty=required_qty,
         net_required_qty=required_qty,
-        covered_qty=Decimal("0"),
-        remaining_qty=required_qty,
         period_from=period_from,
         period_to=period_to,
         bom_level=1,
@@ -183,28 +181,28 @@ def _add_buy_plan_run(
         realization_mode="buy",
         reserved_qty=required_qty,
         realized_qty=realized_qty,
-        covered_incoming_supplier_qty=covered_incoming,
-        covered_incoming_wip_qty=Decimal("0"),
-        uncovered_qty=uncovered,
+        covered_from_stock_at_freeze_qty=Decimal("0"),
+        replenishment_required_qty=required_qty,
+        replenishment_received_qty=realized_qty,
         lifecycle_status="active",
     )
     db.add(reservation)
     db.flush()
+    work_item = models.ReplenishmentWorkItem(
+        ledger_generation_id=generation.id,
+        reservation=reservation,
+        plan_id=run.id,
+        run_id=planning_run.run_id,
+        requirement_id=requirement.id,
+        item_id=item.item_id,
+        replenishment_method="buy",
+        replenishment_required_qty=required_qty,
+        replenishment_fulfilled_qty=realized_qty,
+        replenishment_remaining_qty=required_qty - realized_qty,
+    )
+    db.add(work_item)
+    db.flush()
 
-    if covered_incoming > Decimal("0"):
-        db.add(
-            models.ReservationCoverage(
-                reservation_id=reservation.id,
-                source_kind="supplier_order",
-                source_ref="supplier-1",
-                source_line_ref="10",
-                pin_kind="incoming",
-                alloc_qty=covered_incoming,
-                covered_qty=covered_incoming,
-                realized_qty=covered_incoming,
-                evaporated_qty=Decimal("0"),
-            )
-        )
     db.flush()
 
     return planning_run
@@ -415,8 +413,6 @@ def test_candidate_includes_active_buy_reservations_as_to_order(db_session):
         item_id=item.item_id,
         total_required_qty=Decimal("10"),
         net_required_qty=Decimal("10"),
-        covered_qty=Decimal("0"),
-        remaining_qty=Decimal("10"),
         period_from=date(2026, 8, 1),
         period_to=date(2026, 8, 31),
         bom_level=1,
@@ -438,27 +434,28 @@ def test_candidate_includes_active_buy_reservations_as_to_order(db_session):
         realization_mode="buy",
         reserved_qty=Decimal("10"),
         realized_qty=Decimal("3"),
-        covered_incoming_supplier_qty=Decimal("2"),
-        covered_incoming_wip_qty=Decimal("0"),
-        uncovered_qty=Decimal("5"),
+        covered_from_stock_at_freeze_qty=Decimal("0"),
+        replenishment_required_qty=Decimal("10"),
+        replenishment_received_qty=Decimal("3"),
         lifecycle_status="active",
     )
     db_session.add(reservation)
     db_session.flush()
-
-    db_session.add(
-        models.ReservationCoverage(
-            reservation_id=reservation.id,
-            source_kind="supplier_order",
-            source_ref="supplier-1",
-            source_line_ref="10",
-            pin_kind="incoming",
-            alloc_qty=Decimal("2"),
-            covered_qty=Decimal("2"),
-            realized_qty=Decimal("1"),
-            evaporated_qty=Decimal("0"),
-        )
+    work_item = models.ReplenishmentWorkItem(
+        ledger_generation_id=generation.id,
+        reservation_id=reservation.id,
+        plan_id=plan.id,
+        run_id=run.run_id,
+        requirement_id=requirement.id,
+        item_id=int(item.item_id),
+        replenishment_method="buy",
+        replenishment_required_qty=Decimal("10"),
+        replenishment_fulfilled_qty=Decimal("3"),
+        replenishment_remaining_qty=Decimal("7"),
     )
+    db_session.add(work_item)
+    db_session.flush()
+
     db_session.flush()
 
     snapshot = build_candidate_snapshot(db_session, generation.id)
@@ -468,9 +465,15 @@ def test_candidate_includes_active_buy_reservations_as_to_order(db_session):
     row = rows[0]
     assert row["item_code"] == "RAW-MAT"
     assert row["line_status"] == "to_order"
-    assert row["to_order_qty"] == 5.0
+    # An order is an execution document, not physical fulfillment. Only the
+    # accepted receipt reduces the replenishment remainder.
+    assert row["to_order_qty"] == 7.0
     assert row["required_qty"] == 10.0
     assert row["received_qty"] == 3.0
+    slices = row.get("slices")
+    assert isinstance(slices, list) and slices
+    for bucket in slices:
+        assert bucket["work_item_id"] is not None
 
 
 def test_list_journal_returns_snapshot_meta_run_ids_and_to_order_buckets(db_session):
@@ -505,8 +508,6 @@ def test_list_journal_returns_snapshot_meta_run_ids_and_to_order_buckets(db_sess
         item_id=int(item.item_id),
         total_required_qty=Decimal("10"),
         net_required_qty=Decimal("10"),
-        covered_qty=Decimal("0"),
-        remaining_qty=Decimal("10"),
         period_from=date(2026, 8, 1),
         period_to=date(2026, 8, 31),
         bom_level=1,
@@ -528,27 +529,28 @@ def test_list_journal_returns_snapshot_meta_run_ids_and_to_order_buckets(db_sess
         realization_mode="buy",
         reserved_qty=Decimal("10"),
         realized_qty=Decimal("3"),
-        covered_incoming_supplier_qty=Decimal("2"),
-        covered_incoming_wip_qty=Decimal("0"),
-        uncovered_qty=Decimal("5"),
+        covered_from_stock_at_freeze_qty=Decimal("0"),
+        replenishment_required_qty=Decimal("10"),
+        replenishment_received_qty=Decimal("3"),
         lifecycle_status="active",
     )
     db_session.add(reservation)
     db_session.flush()
-
-    db_session.add(
-        models.ReservationCoverage(
-            reservation_id=reservation.id,
-            source_kind="supplier_order",
-            source_ref="supplier-1",
-            source_line_ref="10",
-            pin_kind="incoming",
-            alloc_qty=Decimal("2"),
-            covered_qty=Decimal("2"),
-            realized_qty=Decimal("1"),
-            evaporated_qty=Decimal("0"),
-        )
+    work_item = models.ReplenishmentWorkItem(
+        ledger_generation_id=generation.id,
+        reservation_id=reservation.id,
+        plan_id=int(run.id),
+        run_id=planning_run.run_id,
+        requirement_id=requirement.id,
+        item_id=int(item.item_id),
+        replenishment_method="buy",
+        replenishment_required_qty=Decimal("10"),
+        replenishment_fulfilled_qty=Decimal("3"),
+        replenishment_remaining_qty=Decimal("7"),
     )
+    db_session.add(work_item)
+    db_session.flush()
+
     db_session.flush()
 
     build_candidate_snapshot(db_session, generation.id)
@@ -560,7 +562,7 @@ def test_list_journal_returns_snapshot_meta_run_ids_and_to_order_buckets(db_sess
     bucket = result["to_order_by_period"][0]
     assert bucket["plan_period_to"] == "2026-08-31"
     assert bucket["period_to"] == "2026-08-31"
-    assert bucket["total_qty"] == 5.0
+    assert bucket["total_qty"] == 7.0
     assert bucket["item_count"] == 1
 
 
@@ -577,14 +579,14 @@ def test_list_journal_horizon_selector_aggregates_all_buy_slices(db_session):
     assert row["run_ids"] == [int(aug_run.run_id), int(sep_run.run_id)]
     assert row["required_qty"] == 20.0
     assert row["realized_qty"] == 5.0
-    assert row["open_order_covered_qty"] == 3.0
-    assert row["to_order_qty"] == 12.0
-    assert row["to_order_pct"] == round(12.0 / 20.0 * 100.0, 6)
-    assert row["open_order_covered_pct"] == round(3.0 / 20.0 * 100.0, 6)
+    assert row["open_order_covered_qty"] == 0.0
+    assert row["to_order_qty"] == 15.0
+    assert row["to_order_pct"] == 75.0
+    assert row["open_order_covered_pct"] == 0.0
     assert abs(row["required_qty"] - (row["realized_qty"] + row["open_order_covered_qty"] + row["to_order_qty"]) ) < 1e-9
     assert row["horizon_bucket_count"] == 2
     assert [bucket["plan_period_to"] for bucket in row["horizon_buckets"]] == ["2026-08-31", "2026-09-30"]
-    assert [bucket["total_qty"] for bucket in result["to_order_by_period"]] == [5.0, 7.0]
+    assert [bucket["total_qty"] for bucket in result["to_order_by_period"]] == [7.0, 8.0]
 
 
 def test_router_horizon_selector_filters_buy_rows_by_plan_slice(db_session):
@@ -606,8 +608,8 @@ def test_router_horizon_selector_filters_buy_rows_by_plan_slice(db_session):
     assert row["run_ids"] == [int(aug_run.run_id)]
     assert row["required_qty"] == 10.0
     assert row["realized_qty"] == 3.0
-    assert row["open_order_covered_qty"] == 2.0
-    assert row["to_order_qty"] == 5.0
+    assert row["open_order_covered_qty"] == 0.0
+    assert row["to_order_qty"] == 7.0
     assert row["horizon_bucket_count"] == 1
     assert result["to_order_by_period"] == [
         {
@@ -615,8 +617,8 @@ def test_router_horizon_selector_filters_buy_rows_by_plan_slice(db_session):
             "period_to": "2026-08-31",
             "period_label": "Август 2026",
             "item_count": 1,
-            "total_qty": 5.0,
+            "total_qty": 7.0,
         }
     ]
-    assert row["to_order_pct"] == 50.0
-    assert row["open_order_covered_pct"] == 20.0
+    assert row["to_order_pct"] == 70.0
+    assert row["open_order_covered_pct"] == 0.0

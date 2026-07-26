@@ -37,15 +37,27 @@ def _capabilities():
         "execution_allocations": True,
         "supplier_receipt_coverage": True,
         "planning_snapshots": True,
-        "dbr_feeder_cockpit": False,
-        "dbr_purchase_cockpit": False,
+        "replenishment_work_item": True,
+        "assembly_output_allocation": True,
+        "assembly_queue": True,
+        "drum_schedule": True,
+        "shelf_projection": True,
         "purchase_control_journal": True,
     }
 
 
 def _seal_build(db, target, candidates, cutoff):
     target.capabilities = _capabilities()
-    for stage in ("physical_import", "reservation_materialize", "reservation_replay", "snapshot_build"):
+    for stage in (
+        "physical_import",
+        "reservation_materialize",
+        "replenishment_work_item",
+        "reservation_replay",
+        "assembly_output_allocation",
+        "drum_schedule",
+        "shelf_projection",
+        "snapshot_build",
+    ):
         metrics = {}
         if stage == "snapshot_build":
             metrics = {
@@ -54,8 +66,6 @@ def _seal_build(db, target, candidates, cutoff):
                     str(row.run_id): row._test_read_snapshot_id for row in candidates
                 },
                 "future_supply_captured": True,
-                "dbr_cockpit_ready": False,
-                "dbr_purchase_ready": False,
                 "purchase_control_journal_snapshot_id": target._test_purchase_journal_snapshot_id,
             }
         db.add(models.LedgerBuildBatch(

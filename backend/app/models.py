@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from sqlalchemy import Column, Integer, BigInteger, String, DECIMAL, TIMESTAMP, ForeignKey, TEXT, Boolean, DateTime, Date, CheckConstraint, JSON, UniqueConstraint, Index
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func, text
@@ -96,7 +98,9 @@ class LedgerBuildBatch(Base):
         CheckConstraint(
             "stage IN ('physical_import', 'reservation_replay', "
             "'reservation_materialize', "
-            "'execution_allocation', 'snapshot_build')",
+            "'execution_allocation', 'assembly_output_allocation', "
+            "'replenishment_work_item', "
+            "'snapshot_build', 'drum_schedule', 'shelf_projection')",
             name="ck_ledger_build_batch_stage",
         ),
         CheckConstraint(
@@ -126,7 +130,6 @@ class LedgerBuildBatch(Base):
     completed_at = Column(DateTime(timezone=True), nullable=True)
 
     ledger_generation = relationship("LedgerGeneration")
-
 
 class LedgerFutureSupply(Base):
     """Immutable, generation-scoped snapshot of supply available after cutoff.
@@ -282,6 +285,48 @@ class PlanningReadSnapshot(Base):
     )
 
 
+class ClosedPlanSnapshot(Base):
+    """Immutable execution payload captured at explicit plan closure."""
+
+    __tablename__ = "closed_plan_snapshot"
+    __table_args__ = (
+        UniqueConstraint("plan_id", "run_id", name="uq_closed_plan_snapshot_plan_run"),
+        Index("ix_closed_plan_snapshot_plan", "plan_id"),
+        Index("ix_closed_plan_snapshot_run", "run_id"),
+        Index("ix_closed_plan_snapshot_generation", "ledger_generation_id"),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    plan_id = Column(
+        Integer,
+        ForeignKey("production_plan_header.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    run_id = Column(
+        BigInteger,
+        ForeignKey("planning_run.run_id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    cutoff = Column(DateTime(timezone=True), nullable=False)
+    payload = Column(CrossPlatformJSON, nullable=False, default=dict)
+    closed_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+    plan = relationship("ProductionPlanHeader")
+    run = relationship("PlanningRun")
+    ledger_generation = relationship("LedgerGeneration")
+
+
 class PlanningReadRow(Base):
     """Generic immutable row belonging to one planning read snapshot."""
 
@@ -374,87 +419,6 @@ class PlanningReadRootMember(Base):
     root_item = relationship("Item")
 
 
-class PlanningComparisonBatch(Base):
-    """One immutable comparison attempt between stable and shadow contours."""
-    __tablename__ = "planning_comparison_batch"
-    __table_args__ = (
-        UniqueConstraint("capture_key", name="uq_planning_comparison_batch_capture_key"),
-    )
-
-    id = Column(BigIntPK, primary_key=True, autoincrement=True)
-    capture_key = Column(String(128), nullable=False)
-    stable_base_url = Column(String(512), nullable=False)
-    cutoff_grade = Column(String(16), nullable=False)
-    cutoff_reason = Column(TEXT, nullable=True)
-    stable_run_key = Column(String(128), nullable=True)
-    shadow_run_key = Column(String(128), nullable=True)
-    metrics = Column(CrossPlatformJSON, nullable=False, default=dict)
-    created_at = Column(TIMESTAMP, nullable=False, server_default=func.now())
-
-
-class PlanningComparisonEvent(Base):
-    """Append-only audit trail for capture lifecycle."""
-    __tablename__ = "planning_comparison_event"
-
-    id = Column(BigIntPK, primary_key=True, autoincrement=True)
-    batch_id = Column(BigInteger, ForeignKey("planning_comparison_batch.id", ondelete="RESTRICT"), nullable=False, index=True)
-    event_type = Column(String(64), nullable=False)
-    payload = Column(CrossPlatformJSON, nullable=False, default=dict)
-    created_at = Column(TIMESTAMP, nullable=False, server_default=func.now())
-
-
-class PlanningComparisonSnapshot(Base):
-    """Raw, hashed source payload retained for reproducibility."""
-    __tablename__ = "planning_comparison_snapshot"
-    __table_args__ = (
-        UniqueConstraint("batch_id", "contour", "snapshot_kind", name="uq_planning_comparison_snapshot_axis"),
-    )
-
-    id = Column(BigIntPK, primary_key=True, autoincrement=True)
-    batch_id = Column(BigInteger, ForeignKey("planning_comparison_batch.id", ondelete="RESTRICT"), nullable=False, index=True)
-    contour = Column(String(16), nullable=False)
-    snapshot_kind = Column(String(32), nullable=False)
-    raw_payload_hash = Column(String(64), nullable=False)
-    payload = Column(CrossPlatformJSON, nullable=False)
-    captured_at = Column(TIMESTAMP, nullable=False, server_default=func.now())
-
-
-class PlanningComparisonRow(Base):
-    """Canonical result row; never uses a contour-local numeric identifier."""
-    __tablename__ = "planning_comparison_row"
-    __table_args__ = (
-        UniqueConstraint("batch_id", "contour", "result_kind", "canonical_key", name="uq_planning_comparison_row_axis"),
-    )
-
-    id = Column(BigIntPK, primary_key=True, autoincrement=True)
-    batch_id = Column(BigInteger, ForeignKey("planning_comparison_batch.id", ondelete="RESTRICT"), nullable=False, index=True)
-    contour = Column(String(16), nullable=False)
-    result_kind = Column(String(16), nullable=False)
-    canonical_key = Column(String(768), nullable=False)
-    item_key = Column(String(128), nullable=False, index=True)
-    bucket_date = Column(Date, nullable=True)
-    quantity = Column(DECIMAL(24, 6), nullable=False)
-    raw_payload_hash = Column(String(64), nullable=False)
-    payload = Column(CrossPlatformJSON, nullable=False)
-
-
-class PlanningComparisonDiff(Base):
-    __tablename__ = "planning_comparison_diff"
-    __table_args__ = (
-        UniqueConstraint("batch_id", "result_kind", "canonical_key", name="uq_planning_comparison_diff_axis"),
-    )
-
-    id = Column(BigIntPK, primary_key=True, autoincrement=True)
-    batch_id = Column(BigInteger, ForeignKey("planning_comparison_batch.id", ondelete="RESTRICT"), nullable=False, index=True)
-    result_kind = Column(String(16), nullable=False)
-    canonical_key = Column(String(768), nullable=False)
-    item_key = Column(String(128), nullable=False, index=True)
-    stable_quantity = Column(DECIMAL(24, 6), nullable=False)
-    shadow_quantity = Column(DECIMAL(24, 6), nullable=False)
-    delta_quantity = Column(DECIMAL(24, 6), nullable=False)
-    classification = Column(String(24), nullable=False)
-
-
 class ProductionStage(Base):
     __tablename__ = "production_stages"
 
@@ -521,39 +485,14 @@ class StockWarehouse(Base):
     warehouse_code = Column(String(50), nullable=True, index=True)
     warehouse_name = Column(String(255), nullable=False)
     is_selected = Column(Boolean, nullable=False, default=True)
-    # Item-ledger §2.5: third warehouse-policy label. A finished-goods warehouse
+    # Item-ledger : third warehouse-policy label. A finished-goods warehouse
     # is a legitimate 1С warehouse whose SLE are mirrored and whose bin is kept,
     # but the planning pool never sums it (on_hand(P) excludes it) — finished
     # goods are produced straight onto it, outside the planning contour. Additive
-    # in Inc1: no reader consults it yet (pool exclusion lands with ingest, inc2+).
+    # in : no reader consults it yet (pool exclusion lands with ingest, ).
     is_finished_goods = Column(Boolean, nullable=False, default=False, server_default="false")
     created_at = Column(TIMESTAMP, default=func.now())
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now())
-
-
-class ItemWarehouseStock(Base):
-    """
-    Per-(item, warehouse) stock breakdown synchronized from 1C OData. Lets
-    coverage analysis exclude warehouses listed in `ignored_warehouses` and
-    is a foundation for automatic source-warehouse selection during material
-    issue creation. Primary key (item_id, warehouse_ref1c).
-    """
-    __tablename__ = "item_warehouse_stock"
-
-    item_id = Column(
-        Integer,
-        ForeignKey("items.item_id", ondelete="CASCADE"),
-        primary_key=True,
-    )
-    warehouse_ref1c = Column(String(36), primary_key=True, index=True)
-    qty = Column(DECIMAL(15, 3), nullable=False, default=0, server_default="0")
-    updated_at = Column(
-        TIMESTAMP,
-        default=func.now(),
-        server_default=func.now(),
-        onupdate=func.now(),
-        nullable=False,
-    )
 
 
 class ProcessingContractorStock(Base):
@@ -728,13 +667,6 @@ class ProductionProduct(Base):
             postgresql_where=text("source_planned_order_id IS NOT NULL"),
             sqlite_where=text("source_planned_order_id IS NOT NULL"),
         ),
-        Index(
-            "ux_production_products_source_dbr_signal",
-            "source_dbr_signal_id",
-            unique=True,
-            postgresql_where=text("source_dbr_signal_id IS NOT NULL"),
-            sqlite_where=text("source_dbr_signal_id IS NOT NULL"),
-        ),
     )
 
     product_id = Column(Integer, primary_key=True, index=True)
@@ -757,14 +689,6 @@ class ProductionProduct(Base):
         Integer,
         ForeignKey('planned_order.order_id', ondelete="SET NULL"),
         nullable=True,
-    )
-    # DBR feeder signals materialize into the same local production journal.
-    # The partial unique index makes that projection idempotent.
-    source_dbr_signal_id = Column(
-        Integer,
-        ForeignKey('dbr_feeder_signal.id', ondelete="SET NULL"),
-        nullable=True,
-        index=True,
     )
     # When this line was generated from a period-plan MRP snapshot, points to
     # the mrp_requirement row it satisfies. NULL for 1C-synced and legacy-MRP
@@ -1256,7 +1180,10 @@ class ProductionPlanHeader(Base):
     __tablename__ = "production_plan_header"
     __table_args__ = (
         CheckConstraint("period_to >= period_from", name="ck_production_plan_header_period"),
-        CheckConstraint("status in ('draft', 'fixed', 'archived')", name="ck_production_plan_header_status"),
+        CheckConstraint(
+            "status in ('draft', 'fixed', 'closed')",
+            name="ck_production_plan_header_status",
+        ),
     )
 
     id = Column(Integer, primary_key=True, index=True)
@@ -1301,6 +1228,19 @@ class PlanningRun(Base):
     # same lineage, so they must not participate in this identity. Both
     # columns also stay nullable for legacy rows.
     __table_args__ = (
+        # A non-null plan must never have more than one published fixed snapshot
+        # across all ledger generations.
+        Index(
+            "uq_planning_run_fixed_snapshot_source_plan",
+            "source_plan_id",
+            unique=True,
+            postgresql_where=text(
+                "status = 'FIXED_SNAPSHOT' AND source_plan_id IS NOT NULL"
+            ),
+            sqlite_where=text(
+                "status = 'FIXED_SNAPSHOT' AND source_plan_id IS NOT NULL"
+            ),
+        ),
         Index(
             "uq_planning_run_generation_source_plan",
             "ledger_generation_id",
@@ -1335,7 +1275,7 @@ class PlanningRun(Base):
     period_to = Column(Date, nullable=True, index=True)
     fixed_at = Column(TIMESTAMP, nullable=True)
     prior_run_id = Column(Integer, ForeignKey("planning_run.run_id", ondelete="SET NULL"), nullable=True, index=True)
-    # Ledger v2 (Increment 1, additive) — currently active baseline version for
+    # Ledger v2 (, additive) — currently active baseline version for
     # this run. Default-1 semantics arrive with the freeze writer (later
     # increment); nullable now so existing rows are untouched.
     active_freeze_version = Column(Integer, nullable=True)
@@ -1678,24 +1618,12 @@ class MrpRequirement(Base):
     item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
     total_required_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0)
     net_required_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0)
-    covered_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0)
-    remaining_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0)
     period_from = Column(Date, nullable=False, index=True)
     period_to = Column(Date, nullable=False, index=True)
     bom_level = Column(Integer, nullable=False, default=0)
-    # Phase-1 execution-ledger columns. NB (ledger v2): executed_qty and
-    # initial_snapshot_stock become *derived caches* in later increments
-    # (executed_qty = Σ mrp_execution_allocation rows with kind='execution');
-    # no behavior change here, kept as-is for backward compatibility.
-    executed_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
-    carried_remaining = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
-    initial_snapshot_stock = Column(DECIMAL(15, 3), nullable=True)
     status = Column(String(20), nullable=False, default="open", server_default="open", index=True)
     closed_at = Column(TIMESTAMP, nullable=True)
-    # Ledger v2 (Increment 1, additive) — freeze/pool qualification. Unread by
-    # logic yet; defaults keep existing rows/behavior unchanged.
     freeze_version = Column(Integer, nullable=True)
-    drift_adjustment_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
     characteristic_ref = Column(String(36), nullable=True)
     organization_ref = Column(String(36), nullable=True)
     planning_stock_pool = Column(String(64), nullable=True)
@@ -1863,62 +1791,12 @@ class SyncLink(Base):
 
 
 # ---------------------------------------------------------------------------
-# DBR (Drum-Buffer-Rope) parallel planning module — settings/config tables.
-# Ported from ERPNext prodflow (ProdFlow Planning Settings / Assembly Rate /
-# child supply-risk settings). See .docs/dbr_parallel_module_roadmap.md §3.
-# Read-only against shared tables; only these dbr_* tables are module-owned.
+# Assembly takt master retained for the canonical drum scheduler.
+# The historical table name stays unchanged until its data is migrated.
 # ---------------------------------------------------------------------------
 
 
-class DbrSettings(Base):
-    """
-    Singleton row (id=1) of DBR planning settings. Mirrors ERPNext prodflow
-    `ProdFlow Planning Settings`. Warehouse roles reference
-    stock_warehouses.warehouse_ref1c by value (no hard FK — warehouses are
-    synced from 1C and may be (re)created independently).
-    """
-    __tablename__ = "dbr_settings"
-
-    id = Column(Integer, primary_key=True, index=True)
-    # Barabar / gate horizon
-    frozen_days = Column(Integer, nullable=False, default=3, server_default="3")
-    gate_horizon_workdays = Column(Integer, nullable=False, default=10, server_default="10")
-    shelf_threshold_qty = Column(DECIMAL(12, 3), nullable=False, default=5, server_default="5")
-    # Replenishment-time classes (days)
-    rt_machining_days = Column(Integer, nullable=False, default=7, server_default="7")
-    rt_welding_days = Column(Integer, nullable=False, default=15, server_default="15")
-    rt_painting_days = Column(Integer, nullable=False, default=21, server_default="21")
-    # Batch (green-zone) days per operation kind
-    batch_days_turning = Column(Integer, nullable=False, default=10, server_default="10")
-    batch_days_bending = Column(Integer, nullable=False, default=7, server_default="7")
-    batch_days_welding = Column(Integer, nullable=False, default=5, server_default="5")
-    batch_days_paint_black = Column(Integer, nullable=False, default=2, server_default="2")
-    batch_days_paint_color = Column(Integer, nullable=False, default=3, server_default="3")
-    # Feeder chain
-    feeder_chain_enabled = Column(Boolean, nullable=False, default=False, server_default=text("false"))
-    feeder_load_horizon_weeks = Column(Integer, nullable=False, default=4, server_default="4")
-    # Давальческая переработка (питатель №3, фаза 4): RT всей цепочки
-    # (мехцех → ожидание рейса → кругорейс → приёмка) и рейс-интервал (квант
-    # партии = ADU × интервал). См. питатель-3-гальваника-round-trip.md.
-    rt_processing_days = Column(Integer, nullable=False, default=25, server_default="25")
-    processing_trip_interval_days = Column(Integer, nullable=False, default=7, server_default="7")
-    # Порог алерта просроченного кругорейса: открытый заказ переработчику
-    # старше N дней = партия у подрядчика дольше нормы (дока §5).
-    processing_roundtrip_days = Column(Integer, nullable=False, default=14, server_default="14")
-    # Shelf warehouses (roles): №2 (mechshop WIP), №3 (painted), №4 (hull #2).
-    # FK-semantics on stock_warehouses.warehouse_ref1c, but no hard FK.
-    w2_warehouse_ref1c = Column(String(36), nullable=True)
-    w3_warehouse_ref1c = Column(String(36), nullable=True)
-    w4_warehouse_ref1c = Column(String(36), nullable=True)
-    # Fastener (метизы) item-category names excluded from the kit as free-issue.
-    # JSON list of ItemCategory.category_name values; empty list = nobody is a
-    # fastener. Mirrors ERPNext prodflow FASTENER_ITEM_GROUPS.
-    fastener_categories = Column(CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'"))
-    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
-    updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
-
-
-class DbrAssemblyRate(Base):
+class AssemblyRate(Base):
     """
     Assembly takt: how many units of an SKU one unit of resource capacity
     yields per day. Mirrors ERPNext prodflow `ProdFlow Assembly Rate`.
@@ -1949,455 +1827,358 @@ class DbrAssemblyRate(Base):
     item = relationship("Item")
 
 
-class DbrCategorySupplyRisk(Base):
-    """
-    Per-category (1С item group) supply-risk safety percentage and the
-    warehouse where the category is received. Mirrors ERPNext prodflow child
-    "category supply risk" settings.
-    """
-    __tablename__ = "dbr_category_supply_risk"
-    __table_args__ = (
-        UniqueConstraint("item_group", name="ux_dbr_category_supply_risk_group"),
-    )
+class AssemblyQueueLine(Base):
+    """Canonical normalized queue line for FIXED Snapshot live plans."""
 
-    id = Column(Integer, primary_key=True, index=True)
-    item_group = Column(String(255), nullable=False, index=True)
-    receipt_warehouse_ref1c = Column(String(36), nullable=True)
-    supply_risk_pct = Column(DECIMAL(6, 2), nullable=True)
-    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
-    updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
-
-
-class DbrSupermarketPosition(Base):
-    """Static Phase-2 buffer sizing for one item at one destination shelf."""
-
-    __tablename__ = "dbr_supermarket_position"
+    __tablename__ = "assembly_queue_line"
     __table_args__ = (
         UniqueConstraint(
             "ledger_generation_id",
-            "item_id",
-            "warehouse_ref1c",
-            name="ux_dbr_supermarket_position_generation_item_warehouse",
+            "plan_line_id",
+            name="uq_assembly_queue_line_generation_plan_line",
         ),
-        CheckConstraint("adu >= 0", name="ck_dbr_supermarket_position_adu_nonnegative"),
-        CheckConstraint("commonality >= 0", name="ck_dbr_supermarket_position_commonality_nonnegative"),
-        CheckConstraint("rt_days >= 0", name="ck_dbr_supermarket_position_rt_nonnegative"),
-        CheckConstraint("batch_days >= 0", name="ck_dbr_supermarket_position_batch_nonnegative"),
-        CheckConstraint("q_batch >= 0", name="ck_dbr_supermarket_position_q_batch_nonnegative"),
-        CheckConstraint("k_var >= 0", name="ck_dbr_supermarket_position_k_var_nonnegative"),
-        CheckConstraint("k_var <= 1", name="ck_dbr_supermarket_position_k_var_bounded"),
-        CheckConstraint("supply_risk_pct >= 0", name="ck_dbr_supermarket_position_supply_risk_nonnegative"),
-        CheckConstraint("supply_type IN ('manufacture', 'purchase', 'processing')", name="ck_dbr_supermarket_position_supply_type_allowed"),
-        CheckConstraint("mode IN ('shelf', 'under_schedule')", name="ck_dbr_supermarket_position_mode_allowed"),
-        CheckConstraint("rt_source IN ('class', 'lead_time', 'chain')", name="ck_dbr_supermarket_position_rt_source_allowed"),
-        CheckConstraint("red_qty >= 0 AND yellow_qty >= 0 AND green_qty >= 0 AND target_qty >= 0", name="ck_dbr_supermarket_position_zones_nonnegative"),
-    )
-
-    id = Column(Integer, primary_key=True, index=True)
-    ledger_generation_id = Column(
-        BigInteger,
-        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
-        nullable=True,
-        index=True,
-    )
-    item_id = Column(Integer, ForeignKey("items.item_id", ondelete="CASCADE"), nullable=False, index=True)
-    warehouse_ref1c = Column(String(36), nullable=False, index=True)
-    supply_type = Column(String(20), nullable=False)
-    mode = Column(String(20), nullable=False)
-    is_active = Column(Boolean, nullable=False, default=True, server_default="true", index=True)
-    is_stale = Column(Boolean, nullable=False, default=False, server_default="false", index=True)
-    adu = Column(DECIMAL(16, 4), nullable=False)
-    commonality = Column(Integer, nullable=False)
-    route_class = Column(String(40), nullable=True)
-    rt_days = Column(DECIMAL(10, 3), nullable=False)
-    rt_source = Column(String(20), nullable=False, default="class", server_default="class")
-    batch_days = Column(DECIMAL(10, 3), nullable=False)
-    q_batch = Column(DECIMAL(16, 3), nullable=False)
-    k_var = Column(DECIMAL(6, 3), nullable=False)
-    supply_risk_pct = Column(DECIMAL(8, 3), nullable=False, default=0, server_default="0")
-    red_qty = Column(DECIMAL(16, 3), nullable=False)
-    yellow_qty = Column(DECIMAL(16, 3), nullable=False)
-    green_qty = Column(DECIMAL(16, 3), nullable=False)
-    target_qty = Column(DECIMAL(16, 3), nullable=False)
-    source_schedule_id = Column(Integer, ForeignKey("dbr_drum_schedule.id", ondelete="SET NULL"), nullable=True, index=True)
-    data_quality = Column(CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'"))
-    calculation_snapshot = Column(CrossPlatformJSON, nullable=False, default=dict, server_default=text("'{}'"))
-    calculated_at = Column(TIMESTAMP, nullable=False, default=func.now(), server_default=func.now())
-    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
-    updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
-
-    item = relationship("Item")
-    ledger_generation = relationship("LedgerGeneration")
-    source_schedule = relationship("DbrDrumSchedule")
-
-
-class DbrFeederSignal(Base):
-    """Advisory replenishment signal; never an order or a launch command."""
-
-    __tablename__ = "dbr_feeder_signal"
-    __table_args__ = (
-        UniqueConstraint(
-            "ledger_generation_id",
-            "dedup_key",
-            name="ux_dbr_feeder_signal_generation_dedup_key",
-        ),
-        CheckConstraint("signal_type IN ('Пополнение', 'Под график', 'Цепочка')", name="ck_dbr_feeder_signal_type"),
+        CheckConstraint("planned_output_qty >= 0", name="ck_assembly_queue_line_planned_qty_nonnegative"),
         CheckConstraint(
-            "status IN ('Open', 'Diagnostic', 'Order Created', 'In Work', 'Done', 'Cancelled')",
-            name="ck_dbr_feeder_signal_status",
+            "accepted_plan_output_qty >= 0",
+            name="ck_assembly_queue_line_accepted_qty_nonnegative",
         ),
-        CheckConstraint("suggested_qty >= 0", name="ck_dbr_feeder_signal_qty_nonnegative"),
         CheckConstraint(
-            "(source_run_id IS NULL AND freeze_version IS NULL) OR "
-            "(source_run_id IS NOT NULL AND freeze_version IS NOT NULL)",
-            name="ck_dbr_feeder_signal_run_freeze_pair",
+            "assembly_remaining_qty >= 0",
+            name="ck_assembly_queue_line_remaining_qty_nonnegative",
         ),
-    )
-
-    id = Column(Integer, primary_key=True, index=True)
-    ledger_generation_id = Column(
-        BigInteger,
-        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
-        nullable=True,
-        index=True,
-    )
-    source_run_id = Column(
-        Integer,
-        ForeignKey("planning_run.run_id", ondelete="RESTRICT"),
-        nullable=True,
-        index=True,
-    )
-    freeze_version = Column(Integer, nullable=True)
-    dedup_key = Column(String(66), nullable=False, index=True)
-    signal_type = Column(String(30), nullable=False, default="Пополнение", server_default="Пополнение")
-    # Chain signals ("Цепочка") are pegged to a parent signal, not to a shelf
-    # position — hence the position is nullable for that family.
-    supermarket_position_id = Column(
-        Integer,
-        ForeignKey("dbr_supermarket_position.id", ondelete="CASCADE"),
-        nullable=True,
-        index=True,
-    )
-    item_id = Column(Integer, ForeignKey("items.item_id", ondelete="CASCADE"), nullable=False, index=True)
-    warehouse_ref1c = Column(String(36), nullable=False, index=True)
-    status = Column(String(20), nullable=False, default="Open", server_default="Open", index=True)
-    suggested_qty = Column(DECIMAL(16, 3), nullable=False, default=0, server_default="0")
-    priority = Column(DECIMAL(16, 6), nullable=False, default=0, server_default="0", index=True)
-    zone = Column(String(20), nullable=True, index=True)
-    nfp_snapshot = Column(DECIMAL(16, 3), nullable=True)
-    target_qty_snapshot = Column(DECIMAL(16, 3), nullable=True)
-    kit_force = Column(Boolean, nullable=False, default=False, server_default="false")
-    kit_shortage_qty = Column(DECIMAL(16, 3), nullable=False, default=0, server_default="0")
-    # Chain pegging (Фаза 3.2): child "Цепочка" signal points at the signal whose
-    # kit deficit spawned it; chain_depth guards against pathological BOM trees.
-    parent_signal_id = Column(
-        Integer, ForeignKey("dbr_feeder_signal.id", ondelete="CASCADE"), nullable=True, index=True
-    )
-    chain_depth = Column(Integer, nullable=False, default=0, server_default="0")
-    source_schedule_id = Column(Integer, ForeignKey("dbr_drum_schedule.id", ondelete="SET NULL"), nullable=True, index=True)
-    drum_slot_id = Column(Integer, ForeignKey("dbr_drum_slot.id", ondelete="CASCADE"), nullable=True, index=True)
-    need_date = Column(Date, nullable=True, index=True)
-    required_date = Column(Date, nullable=True, index=True)
-    raw_demand_qty = Column(DECIMAL(16, 3), nullable=True)
-    raw_shortage_qty = Column(DECIMAL(16, 3), nullable=True)
-    calculated_batch_qty = Column(DECIMAL(16, 3), nullable=True)
-    data_quality = Column(CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'"))
-    is_incomplete = Column(Boolean, nullable=False, default=False, server_default="false", index=True)
-    reason_json = Column(CrossPlatformJSON, nullable=False, default=dict, server_default=text("'{}'"))
-    # Materialization (Фаза 3): the 1С Document_ЗаказНаПроизводство created when
-    # this signal was launched. Stamped by services/dbr/materialize_service.
-    one_c_order_ref = Column(String(36), nullable=True, index=True)
-    one_c_order_number = Column(String(50), nullable=True)
-    refreshed_at = Column(TIMESTAMP, nullable=False, default=func.now(), server_default=func.now())
-    cancelled_at = Column(TIMESTAMP, nullable=True)
-    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
-    updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
-
-    position = relationship("DbrSupermarketPosition")
-    ledger_generation = relationship("LedgerGeneration")
-    source_run = relationship("PlanningRun")
-    item = relationship("Item")
-    source_schedule = relationship("DbrDrumSchedule")
-    drum_slot = relationship("DbrDrumSlot")
-    parent_signal = relationship("DbrFeederSignal", remote_side=[id])
-
-
-# --------------------------------------------------------------------------
-# DBR Phase 1 — production program, drum schedule, slots, capacity gaps
-# --------------------------------------------------------------------------
-
-
-class DbrProductionProgram(Base):
-    """Производственная программа выпуска (аналог ERPNext prodflow
-    `ProdFlow Production Program`). Строки в dbr_production_program_item."""
-
-    __tablename__ = "dbr_production_program"
-    __table_args__ = (
         CheckConstraint(
-            "(source_run_id IS NULL AND ledger_generation_id IS NULL AND freeze_version IS NULL) OR "
-            "(source_run_id IS NOT NULL AND ledger_generation_id IS NOT NULL AND freeze_version IS NOT NULL)",
-            name="ck_dbr_program_lineage_tuple",
+            "period_to >= period_from",
+            name="ck_assembly_queue_line_period",
         ),
-    )
-
-    id = Column(Integer, primary_key=True, index=True)
-    source_run_id = Column(
-        Integer,
-        ForeignKey("planning_run.run_id", ondelete="RESTRICT"),
-        nullable=True,
-        index=True,
-    )
-    ledger_generation_id = Column(
-        BigInteger,
-        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
-        nullable=True,
-        index=True,
-    )
-    freeze_version = Column(Integer, nullable=True)
-    company = Column(String(255), nullable=True)
-    title = Column(String(255), nullable=True)
-    from_date = Column(Date, nullable=False)
-    to_date = Column(Date, nullable=False)
-    # draft / approved / closed / cancelled
-    status = Column(String(20), nullable=False, default="draft", server_default="draft", index=True)
-    created_by = Column(String(100), nullable=True)
-    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
-    updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
-
-    items = relationship(
-        "DbrProductionProgramItem",
-        back_populates="program",
-        cascade="all, delete-orphan",
-    )
-    source_run = relationship("PlanningRun")
-    ledger_generation = relationship("LedgerGeneration")
-
-
-class DbrProductionProgramItem(Base):
-    __tablename__ = "dbr_production_program_item"
-
-    id = Column(Integer, primary_key=True, index=True)
-    program_id = Column(
-        Integer,
-        ForeignKey("dbr_production_program.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
-    program_date = Column(Date, nullable=False, index=True)
-    qty = Column(DECIMAL(14, 3), nullable=False)
-    comment = Column(TEXT, nullable=True)
-    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
-    updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
-
-    program = relationship("DbrProductionProgram", back_populates="items")
-    item = relationship("Item")
-
-
-class DbrDrumSchedule(Base):
-    """Катящийся график барабана (аналог `ProdFlow Drum Schedule`).
-
-    config_snapshot фиксирует настройки DBR на момент расчёта, чтобы результат
-    был воспроизводим независимо от последующих правок dbr_settings.
-    """
-
-    __tablename__ = "dbr_drum_schedule"
-    __table_args__ = (
         Index(
-            "ux_dbr_drum_schedule_one_active",
+            "ix_assembly_queue_line_generation_status",
             "ledger_generation_id",
-            "status",
-            unique=True,
-            postgresql_where=text("status = 'active'"),
-            sqlite_where=text("status = 'active'"),
+            "line_status",
+        ),
+        Index(
+            "ix_assembly_queue_line_generation_sort",
+            "ledger_generation_id",
+            "sort_key",
+        ),
+        Index(
+            "ix_assembly_queue_line_plan_line",
+            "plan_id",
+            "plan_line_id",
         ),
     )
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(BigIntPK, primary_key=True, autoincrement=True, index=True)
     ledger_generation_id = Column(
         BigInteger,
         ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
-        nullable=True,
+        nullable=False,
         index=True,
     )
-    period_from = Column(Date, nullable=False)
-    period_to = Column(Date, nullable=False)
-    source_program_id = Column(
+    planning_run_id = Column(
         Integer,
-        ForeignKey("dbr_production_program.id", ondelete="SET NULL"),
-        nullable=True,
+        ForeignKey("planning_run.run_id", ondelete="RESTRICT"),
+        nullable=False,
         index=True,
     )
-    # draft / active / superseded / cancelled
-    status = Column(String(20), nullable=False, default="draft", server_default="draft", index=True)
-    config_snapshot = Column(CrossPlatformJSON, nullable=True)
+    plan_id = Column(
+        Integer,
+        ForeignKey("production_plan_header.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    plan_line_id = Column(
+        Integer,
+        ForeignKey("production_plan_line.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    item_id = Column(
+        Integer,
+        ForeignKey("items.item_id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    bucket_date = Column(Date, nullable=False)
+    period_from = Column(Date, nullable=False, index=True)
+    period_to = Column(Date, nullable=False, index=True)
+    planned_output_qty = Column(DECIMAL(15, 3), nullable=False)
+    accepted_plan_output_qty = Column(DECIMAL(15, 3), nullable=False)
+    assembly_remaining_qty = Column(DECIMAL(15, 3), nullable=False)
+    original_priority = Column(CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'"))
+    sort_key = Column(String(128), nullable=False)
+    line_status = Column(String(20), nullable=False, default="open", server_default="open")
     created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
-    updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
+    updated_at = Column(
+        TIMESTAMP,
+        default=func.now(),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
 
-    slots = relationship(
-        "DbrDrumSlot",
-        back_populates="schedule",
-        cascade="all, delete-orphan",
-    )
-    capacity_gaps = relationship(
-        "DbrDrumCapacityGap",
-        back_populates="schedule",
-        cascade="all, delete-orphan",
-    )
-    source_program = relationship("DbrProductionProgram")
+    planning_run = relationship("PlanningRun")
+    plan = relationship("ProductionPlanHeader")
+    plan_line = relationship("ProductionPlanLine")
+    item = relationship("Item")
     ledger_generation = relationship("LedgerGeneration")
-    covered_programs = relationship(
-        "DbrDrumScheduleProgram",
-        back_populates="schedule",
-        cascade="all, delete-orphan",
-    )
 
 
-class DbrDrumScheduleProgram(Base):
-    """Idempotency marker for programs materialized into one drum schedule."""
-
-    __tablename__ = "dbr_drum_schedule_program"
+class DrumSchedule(Base):
+    __tablename__ = "drum_schedule"
     __table_args__ = (
         UniqueConstraint(
-            "schedule_id",
-            "program_id",
-            name="ux_dbr_drum_schedule_program",
+            "ledger_generation_id",
+            name="uq_drum_schedule_generation",
         ),
-        CheckConstraint(
-            "(source_run_id IS NULL AND ledger_generation_id IS NULL AND freeze_version IS NULL) OR "
-            "(source_run_id IS NOT NULL AND ledger_generation_id IS NOT NULL AND freeze_version IS NOT NULL)",
-            name="ck_dbr_schedule_program_lineage_tuple",
-        ),
+        CheckConstraint("slot_row_count >= 0", name="ck_drum_schedule_slot_row_count_nonnegative"),
+        CheckConstraint("gap_row_count >= 0", name="ck_drum_schedule_gap_row_count_nonnegative"),
+        CheckConstraint("total_open_qty >= 0", name="ck_drum_schedule_total_open_qty_nonnegative"),
+        CheckConstraint("total_slot_qty >= 0", name="ck_drum_schedule_total_slot_qty_nonnegative"),
+        CheckConstraint("total_gap_qty >= 0", name="ck_drum_schedule_total_gap_qty_nonnegative"),
+        Index("ix_drum_schedule_generation", "ledger_generation_id"),
+        Index("ix_drum_schedule_algorithm", "algorithm_version"),
     )
 
-    id = Column(Integer, primary_key=True, index=True)
-    schedule_id = Column(
-        Integer,
-        ForeignKey("dbr_drum_schedule.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    program_id = Column(
-        Integer,
-        ForeignKey("dbr_production_program.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    source_run_id = Column(
-        Integer,
-        ForeignKey("planning_run.run_id", ondelete="RESTRICT"),
-        nullable=True,
-        index=True,
-    )
+    id = Column(BigIntPK, primary_key=True, autoincrement=True, index=True)
     ledger_generation_id = Column(
         BigInteger,
         ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
-        nullable=True,
+        nullable=False,
         index=True,
     )
-    freeze_version = Column(Integer, nullable=True)
-    created_at = Column(
-        TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False
-    )
+    status = Column(String(20), nullable=False, default="completed", server_default="completed")
+    algorithm_version = Column(String(64), nullable=False)
+    schedule_from = Column(Date, nullable=False)
+    schedule_to = Column(Date, nullable=False)
+    queue_signature = Column(String(64), nullable=False)
+    slot_signature = Column(String(64), nullable=False)
+    gap_signature = Column(String(64), nullable=False)
+    slot_row_count = Column(Integer, nullable=False, default=0, server_default="0")
+    gap_row_count = Column(Integer, nullable=False, default=0, server_default="0")
+    total_open_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default=text("0"))
+    total_slot_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default=text("0"))
+    total_gap_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default=text("0"))
+    metrics = Column(CrossPlatformJSON, nullable=False, default=dict, server_default=text("'{}'"))
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
 
-    schedule = relationship("DbrDrumSchedule", back_populates="covered_programs")
-    program = relationship("DbrProductionProgram")
-    source_run = relationship("PlanningRun")
     ledger_generation = relationship("LedgerGeneration")
 
 
-class DbrDrumSlot(Base):
-    """Плитка барабана: одно изделие × участок × день.
-
-    planned_date фиксируется при рождении плитки и не меняется; slot_date
-    подвижна (перенос/roll-forward). Границы жизненного цикла — release_status.
-    """
-
-    __tablename__ = "dbr_drum_slot"
+class DrumSlot(Base):
+    __tablename__ = "drum_slot"
     __table_args__ = (
-        CheckConstraint(
-            "(source_run_id IS NULL AND ledger_generation_id IS NULL AND freeze_version IS NULL) OR "
-            "(source_run_id IS NOT NULL AND ledger_generation_id IS NOT NULL AND freeze_version IS NOT NULL)",
-            name="ck_dbr_drum_slot_lineage_tuple",
+        UniqueConstraint(
+            "drum_schedule_id",
+            "assembly_queue_line_id",
+            "slot_ordinal",
+            name="uq_drum_slot_schedule_line_ordinal",
         ),
+        CheckConstraint("slot_qty > 0", name="ck_drum_slot_qty_positive"),
+        CheckConstraint("slot_ordinal >= 0", name="ck_drum_slot_ordinal_nonnegative"),
+        Index("ix_drum_slot_schedule_date", "drum_schedule_id", "slot_date"),
+        Index("ix_drum_slot_resource_date", "resource_id", "slot_date"),
+        Index("ix_drum_slot_item", "item_id"),
+        Index("ix_drum_slot_plan", "plan_id", "plan_line_id"),
     )
 
-    id = Column(Integer, primary_key=True, index=True)
-    schedule_id = Column(
-        Integer,
-        ForeignKey("dbr_drum_schedule.id", ondelete="CASCADE"),
+    id = Column(BigIntPK, primary_key=True, autoincrement=True, index=True)
+    drum_schedule_id = Column(
+        BigIntPK,
+        ForeignKey("drum_schedule.id", ondelete="RESTRICT"),
         nullable=False,
         index=True,
     )
-    slot_date = Column(Date, nullable=False, index=True)
-    planned_date = Column(Date, nullable=False)
-    resource_id = Column(Integer, ForeignKey("production_resources.resource_id"), nullable=False, index=True)
-    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
-    qty = Column(DECIMAL(14, 3), nullable=False)
-    produced_qty = Column(DECIMAL(14, 3), nullable=False, default=0, server_default="0")
-    # green / yellow / red / unknown
-    kit_status = Column(String(10), nullable=False, default="unknown", server_default="unknown", index=True)
-    shortage_json = Column(CrossPlatformJSON, nullable=True)
-    # pending / released / completed
-    release_status = Column(String(12), nullable=False, default="pending", server_default="pending", index=True)
-    # Materialization (Фаза 3): the 1С Document_ЗаказНаПроизводство created when
-    # this slot was released. Stamped by services/dbr/materialize_service.
-    one_c_order_ref = Column(String(36), nullable=True, index=True)
-    one_c_order_number = Column(String(50), nullable=True)
-    source_program_id = Column(
-        Integer,
-        ForeignKey("dbr_production_program.id", ondelete="SET NULL"),
-        nullable=True,
+    assembly_queue_line_id = Column(
+        BigInteger,
+        ForeignKey("assembly_queue_line.id", ondelete="RESTRICT"),
+        nullable=False,
         index=True,
     )
-    source_run_id = Column(
+    plan_id = Column(
         Integer,
-        ForeignKey("planning_run.run_id", ondelete="RESTRICT"),
-        nullable=True,
+        ForeignKey("production_plan_header.id", ondelete="RESTRICT"),
+        nullable=False,
         index=True,
     )
+    plan_line_id = Column(
+        Integer,
+        ForeignKey("production_plan_line.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    item_id = Column(
+        Integer,
+        ForeignKey("items.item_id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    resource_id = Column(
+        Integer,
+        ForeignKey("production_resources.resource_id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    slot_date = Column(Date, nullable=False)
+    slot_qty = Column(DECIMAL(15, 3), nullable=False)
+    planned_output_qty = Column(DECIMAL(15, 3), nullable=False)
+    slot_ordinal = Column(Integer, nullable=False, default=0, server_default="0")
+    original_priority = Column(CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'"))
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+
+    drum_schedule = relationship("DrumSchedule")
+    queue_line = relationship("AssemblyQueueLine")
+
+
+class DrumCapacityGap(Base):
+    __tablename__ = "drum_capacity_gap"
+    __table_args__ = (
+        UniqueConstraint(
+            "drum_schedule_id",
+            "assembly_queue_line_id",
+            "resource_id",
+            "gap_date",
+            name="uq_drum_gap_schedule_line_resource_date",
+        ),
+        CheckConstraint("required_qty >= 0", name="ck_drum_gap_required_qty_nonnegative"),
+        CheckConstraint("available_capacity >= 0", name="ck_drum_gap_available_capacity_nonnegative"),
+        CheckConstraint("gap_qty >= 0", name="ck_drum_gap_qty_nonnegative"),
+        Index("ix_drum_gap_schedule_resource_date", "drum_schedule_id", "resource_id", "gap_date"),
+        Index("ix_drum_gap_schedule_item", "drum_schedule_id", "item_id"),
+        Index("ix_drum_gap_item_resource", "item_id", "resource_id"),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True, index=True)
+    drum_schedule_id = Column(
+        BigIntPK,
+        ForeignKey("drum_schedule.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    assembly_queue_line_id = Column(
+        BigInteger,
+        ForeignKey("assembly_queue_line.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    plan_id = Column(
+        Integer,
+        ForeignKey("production_plan_header.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    plan_line_id = Column(
+        Integer,
+        ForeignKey("production_plan_line.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    resource_id = Column(
+        Integer,
+        ForeignKey("production_resources.resource_id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    item_id = Column(
+        Integer,
+        ForeignKey("items.item_id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    gap_date = Column(Date, nullable=False)
+    required_qty = Column(DECIMAL(15, 3), nullable=False)
+    available_capacity = Column(DECIMAL(15, 3), nullable=False)
+    gap_qty = Column(DECIMAL(15, 3), nullable=False)
+    original_priority = Column(CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'"))
+    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+
+    drum_schedule = relationship("DrumSchedule")
+    queue_line = relationship("AssemblyQueueLine")
+
+
+class ShelfPolicy(Base):
+    """Stable physical shelf configuration; never plan-generated."""
+
+    __tablename__ = "shelf_policy"
+    __table_args__ = (
+        UniqueConstraint("item_id", "warehouse_ref1c", name="uq_shelf_policy_item_warehouse"),
+        CheckConstraint("replenishment_time_days >= 0", name="ck_shelf_policy_replenishment_nonnegative"),
+        CheckConstraint("review_cycle_days >= 0", name="ck_shelf_policy_review_nonnegative"),
+        CheckConstraint("safety_days >= 0", name="ck_shelf_policy_safety_nonnegative"),
+        CheckConstraint("batch_multiple > 0", name="ck_shelf_policy_batch_positive"),
+        Index("ix_shelf_policy_active_item", "active", "item_id"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    item_id = Column(Integer, ForeignKey("items.item_id", ondelete="RESTRICT"), nullable=False, index=True)
+    warehouse_ref1c = Column(String(36), nullable=False, index=True)
+    replenishment_time_days = Column(Integer, nullable=False, default=0, server_default="0")
+    review_cycle_days = Column(Integer, nullable=False, default=0, server_default="0")
+    safety_days = Column(Integer, nullable=False, default=0, server_default="0")
+    batch_multiple = Column(DECIMAL(15, 3), nullable=False, default=1, server_default="1")
+    active = Column(Boolean, nullable=False, default=True, server_default=text("true"))
+    created_at = Column(TIMESTAMP, nullable=False, server_default=func.now())
+    updated_at = Column(TIMESTAMP, nullable=False, server_default=func.now(), onupdate=func.now())
+
+    item = relationship("Item")
+
+
+class ShelfProjection(Base):
+    """Immutable generation-bound timing projection of existing MRP demand."""
+
+    __tablename__ = "shelf_projection"
+    __table_args__ = (
+        UniqueConstraint(
+            "ledger_generation_id",
+            "shelf_policy_id",
+            name="uq_shelf_projection_generation_policy",
+        ),
+        CheckConstraint("target_qty >= 0", name="ck_shelf_projection_target_nonnegative"),
+        CheckConstraint("gap_qty >= 0", name="ck_shelf_projection_gap_nonnegative"),
+        CheckConstraint("transfer_qty >= 0", name="ck_shelf_projection_transfer_nonnegative"),
+        CheckConstraint("pull_qty >= 0", name="ck_shelf_projection_pull_nonnegative"),
+        CheckConstraint("materialized_qty >= 0", name="ck_shelf_projection_materialized_nonnegative"),
+        CheckConstraint(
+            "materialized_qty <= unlaunched_mrp_qty",
+            name="ck_shelf_projection_materialized_within_mrp",
+        ),
+        Index("ix_shelf_projection_generation_priority", "ledger_generation_id", "latest_start_date"),
+        Index("ix_shelf_projection_item", "item_id"),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True, index=True)
     ledger_generation_id = Column(
         BigInteger,
         ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
-        nullable=True,
-        index=True,
-    )
-    freeze_version = Column(Integer, nullable=True)
-    position = Column(Integer, nullable=False, default=0, server_default="0")
-    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
-    updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
-
-    schedule = relationship("DbrDrumSchedule", back_populates="slots")
-    resource = relationship("ProductionResource")
-    item = relationship("Item")
-    source_run = relationship("PlanningRun")
-    ledger_generation = relationship("LedgerGeneration")
-
-
-class DbrDrumCapacityGap(Base):
-    """Разрыв мощности: сколько штук изделия не влезло в такт участка в день."""
-
-    __tablename__ = "dbr_drum_capacity_gap"
-
-    id = Column(Integer, primary_key=True, index=True)
-    schedule_id = Column(
-        Integer,
-        ForeignKey("dbr_drum_schedule.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
-    gap_date = Column(Date, nullable=True, index=True)
-    resource_id = Column(Integer, ForeignKey("production_resources.resource_id"), nullable=True, index=True)
-    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=True, index=True)
-    required_qty = Column(DECIMAL(14, 3), nullable=False)
-    takt_qty = Column(DECIMAL(14, 3), nullable=False)
-    gap_qty = Column(DECIMAL(14, 3), nullable=False)
-    resolution = Column(String(64), nullable=True)
-    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
-    updated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), onupdate=func.now(), nullable=False)
+    shelf_policy_id = Column(
+        Integer,
+        ForeignKey("shelf_policy.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    item_id = Column(Integer, ForeignKey("items.item_id", ondelete="RESTRICT"), nullable=False, index=True)
+    warehouse_ref1c = Column(String(36), nullable=False)
+    as_of_date = Column(Date, nullable=False)
+    protection_until = Column(Date, nullable=False)
+    target_qty = Column(DECIMAL(15, 3), nullable=False)
+    shelf_physical_qty = Column(DECIMAL(15, 3), nullable=False)
+    other_stock_qty = Column(DECIMAL(15, 3), nullable=False)
+    confirmed_open_production_qty = Column(DECIMAL(15, 3), nullable=False)
+    projected_qty = Column(DECIMAL(15, 3), nullable=False)
+    gap_qty = Column(DECIMAL(15, 3), nullable=False)
+    transfer_qty = Column(DECIMAL(15, 3), nullable=False)
+    unlaunched_mrp_qty = Column(DECIMAL(15, 3), nullable=False)
+    pull_qty = Column(DECIMAL(15, 3), nullable=False)
+    materialized_qty = Column(DECIMAL(15, 3), nullable=False)
+    first_shortage_date = Column(Date, nullable=True)
+    latest_start_date = Column(Date, nullable=True)
+    demand_manifest = Column(CrossPlatformJSON, nullable=False, default=list, server_default=text("'[]'"))
+    created_at = Column(TIMESTAMP, nullable=False, server_default=func.now())
 
-    schedule = relationship("DbrDrumSchedule", back_populates="capacity_gaps")
-    resource = relationship("ProductionResource")
+    generation = relationship("LedgerGeneration")
+    policy = relationship("ShelfPolicy")
     item = relationship("Item")
 
 
@@ -2465,20 +2246,15 @@ class PaintWeldChainLink(Base):
 
 
 # ---------------------------------------------------------------------------
-# MRP Execution Ledger v2 — Increment 1 (ADDITIVE SCHEMA ONLY).
+# MRP Execution Ledger v2 —  (ADDITIVE SCHEMA ONLY).
 #
-# See mrp-ledger-blueprint-v2.md §3. These tables model the frozen-plan
-# baseline, its allocations/BOM snapshot, the rebuilt-each-cycle execution
-# ledger, the carry trace and the drift-event log. NO logic reads them yet;
-# creating them changes zero behavior. Persisted-immutable tables (baseline /
-# freeze_allocation / freeze_component / carry) capture the moment-of-freeze
-# snapshot; the rebuildable ones (execution_allocation / drift_event) are
-# derived caches restored each cycle.
+# See .docs/reservation-replenishment-core.md. The remaining tables model the
+# immutable frozen-plan baseline and its allocation/BOM snapshot.
 #
-# Pool qualification (v2 §2): pool_key = (item_id, characteristic_ref,
+# Pool qualification (v2 ): pool_key = (item_id, characteristic_ref,
 # organization_ref, planning_stock_pool). Pool columns are nullable here for
 # additive consistency with MrpRequirement's new pool columns; an empty
-# characteristic is a distinct key value, not a wildcard (v2 §2). See the
+# characteristic is a distinct key value, not a wildcard (v2 ). See the
 # INCREMENT-1 report note on normalizing empty pool keys before these tables
 # carry data (owner decision).
 # ---------------------------------------------------------------------------
@@ -2486,7 +2262,7 @@ class PaintWeldChainLink(Base):
 
 class MrpFreezeBaseline(Base):
     """Run-scoped, versioned frozen snapshot of a pool's supply position at
-    freeze time (v2 §3). Immutable versions: refreeze = INSERT version+1;
+    freeze time (v2 ). Immutable versions: refreeze = INSERT version+1;
     refreezing run A never touches run B."""
 
     __tablename__ = "mrp_freeze_baseline"
@@ -2536,7 +2312,7 @@ class MrpFreezeBaseline(Base):
 
 
 class MrpFreezeAllocation(Base):
-    """Coverage-carrying frozen allocation (v2 §3): binds a requirement to a
+    """Coverage-carrying frozen allocation (v2 ): binds a requirement to a
     supply source (stock / supplier_order / wip_order). alloc_qty and source
     are immutable; realized_qty / evaporated_qty are rewritten each cycle by
     verify_frozen_supply. Prevents double net deduction."""
@@ -2588,7 +2364,7 @@ class MrpFreezeAllocation(Base):
 
 
 class MrpFreezeComponent(Base):
-    """Frozen BOM / consumption norms (v2 §3). Writer = freeze; reader = drift
+    """Frozen BOM / consumption norms (v2 ). Writer = freeze; reader = drift
     only (a spec/norm change after freeze does NOT create drift)."""
 
     __tablename__ = "mrp_freeze_component"
@@ -2628,180 +2404,23 @@ class MrpFreezeComponent(Base):
     component_item = relationship("Item", foreign_keys=[component_item_id])
 
 
-class MrpExecutionAllocation(Base):
-    """Explainable read-ledger: fact → requirement (v2 §3). Fully rebuilt each
-    cycle. kind='execution' consumes net (Σ over buckets = executed_qty);
-    kind='coverage_realization' (a fact reshaping already-counted coverage,
-    e.g. supplier→stock) does NOT count toward executed."""
-
-    __tablename__ = "mrp_execution_allocation"
-    __table_args__ = (
-        UniqueConstraint(
-            "ledger_generation_id",
-            "requirement_id",
-            "bucket_id",
-            "fact_type",
-            "fact_ref",
-            "fact_line_ref",
-            "allocation_kind",
-            name="ux_mrp_execution_allocation_fact",
-        ),
-        Index("ix_mrp_execution_allocation_cycle", "cycle_id"),
-        Index("ix_mrp_execution_allocation_requirement", "requirement_id"),
-        Index("ix_mrp_execution_allocation_bucket", "bucket_id"),
-        Index(
-            "ix_mrp_execution_allocation_generation_sle",
-            "ledger_generation_id",
-            "stock_ledger_entry_id",
-        ),
-    )
-
-    id = Column(Integer, primary_key=True, index=True)
-    ledger_generation_id = Column(
-        BigInteger,
-        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
-        nullable=False,
-        index=True,
-    )
-    cycle_id = Column(String(64), nullable=False, server_default="")
-    requirement_id = Column(Integer, ForeignKey("mrp_requirement.id", ondelete="CASCADE"), nullable=False, index=True)
-    bucket_id = Column(Integer, ForeignKey("mrp_requirement_bucket.id", ondelete="CASCADE"), nullable=True, index=True)
-    # fact_type ∈ {linked_production, unlinked_production, supplier_receipt,
-    # carry, manual_surplus, drift_surplus}; allocation_kind ∈ {execution,
-    # coverage_realization}. Empty string = distinct key value (not wildcard).
-    fact_type = Column(String(32), nullable=False, server_default="")
-    allocation_kind = Column(String(32), nullable=False, server_default="")
-    fact_ref = Column(String(64), nullable=False, server_default="")
-    fact_line_ref = Column(String(64), nullable=False, server_default="")
-    fact_date = Column(TIMESTAMP, nullable=True)
-    allocated_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
-    # Exact physical fact identity. Nullable only for migration compatibility
-    # and non-physical allocation kinds (carry/manual/drift).
-    stock_ledger_entry_id = Column(
-        BigInteger,
-        ForeignKey("stock_ledger_entry.id", ondelete="RESTRICT"),
-        nullable=True,
-        index=True,
-    )
-    freeze_allocation_id = Column(
-        Integer, ForeignKey("mrp_freeze_allocation.id", ondelete="SET NULL"), nullable=True, index=True
-    )
-    origin_requirement_id = Column(
-        Integer, ForeignKey("mrp_requirement.id", ondelete="SET NULL"), nullable=True, index=True
-    )
-    calculated_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
-
-    requirement = relationship("MrpRequirement", foreign_keys=[requirement_id])
-    bucket = relationship("MrpRequirementBucket")
-    freeze_allocation = relationship("MrpFreezeAllocation")
-    origin_requirement = relationship("MrpRequirement", foreign_keys=[origin_requirement_id])
-    ledger_generation = relationship("LedgerGeneration")
-    stock_ledger_entry = relationship("StockLedgerEntry")
-
-
-class MrpRequirementCarry(Base):
-    """Carry trace (v2 §3): source_requirement → target_requirement. UNIQUE on
-    source_requirement_id enforces once-only + idempotent carry."""
-
-    __tablename__ = "mrp_requirement_carry"
-    __table_args__ = (
-        UniqueConstraint("source_requirement_id", name="ux_mrp_requirement_carry_source"),
-        Index("ix_mrp_requirement_carry_target", "target_requirement_id"),
-        Index(
-            "ix_mrp_requirement_carry_pool",
-            "item_id",
-            "characteristic_ref",
-            "organization_ref",
-            "planning_stock_pool",
-        ),
-    )
-
-    id = Column(Integer, primary_key=True, index=True)
-    source_requirement_id = Column(Integer, ForeignKey("mrp_requirement.id", ondelete="CASCADE"), nullable=False)
-    target_requirement_id = Column(Integer, ForeignKey("mrp_requirement.id", ondelete="CASCADE"), nullable=False, index=True)
-    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
-    characteristic_ref = Column(String(36), nullable=True)
-    organization_ref = Column(String(36), nullable=True)
-    planning_stock_pool = Column(String(64), nullable=True)
-    carried_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
-    carried_at = Column(TIMESTAMP, nullable=True)
-    operator = Column(String(100), nullable=True)
-    source_run_id = Column(Integer, ForeignKey("planning_run.run_id", ondelete="SET NULL"), nullable=True, index=True)
-    target_run_id = Column(Integer, ForeignKey("planning_run.run_id", ondelete="SET NULL"), nullable=True, index=True)
-    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
-
-    source_requirement = relationship("MrpRequirement", foreign_keys=[source_requirement_id])
-    target_requirement = relationship("MrpRequirement", foreign_keys=[target_requirement_id])
-    item = relationship("Item")
-
-
-class MrpDriftEvent(Base):
-    """Explainability of drift (v2 §3), rewritten each cycle. matured=false =
-    pending_drift (visible, not materialized)."""
-
-    __tablename__ = "mrp_drift_event"
-    __table_args__ = (
-        Index("ix_mrp_drift_event_cycle", "cycle_id"),
-        Index(
-            "ix_mrp_drift_event_pool",
-            "item_id",
-            "characteristic_ref",
-            "organization_ref",
-            "planning_stock_pool",
-        ),
-        Index("ix_mrp_drift_event_requirement", "requirement_id"),
-    )
-
-    id = Column(Integer, primary_key=True, index=True)
-    ledger_generation_id = Column(
-        BigInteger,
-        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
-        nullable=True,
-        index=True,
-    )
-    cycle_id = Column(String(64), nullable=False, server_default="", index=True)
-    item_id = Column(Integer, ForeignKey("items.item_id"), nullable=False, index=True)
-    characteristic_ref = Column(String(36), nullable=True)
-    organization_ref = Column(String(36), nullable=True)
-    planning_stock_pool = Column(String(64), nullable=True)
-    # kind ∈ {shortfall, surplus, evaporation}.
-    kind = Column(String(32), nullable=False, server_default="")
-    drift_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
-    expected_stock = Column(DECIMAL(15, 3), nullable=True)
-    actual_stock = Column(DECIMAL(15, 3), nullable=True)
-    matured = Column(Boolean, nullable=False, default=False, server_default="false")
-    first_seen_cycle_id = Column(String(64), nullable=True)
-    requirement_id = Column(Integer, ForeignKey("mrp_requirement.id", ondelete="SET NULL"), nullable=True, index=True)
-    details = Column(CrossPlatformJSON, nullable=True)
-    created_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
-
-    item = relationship("Item")
-    requirement = relationship("MrpRequirement")
-    ledger_generation = relationship("LedgerGeneration")
-
-
 # ---------------------------------------------------------------------------
-# ITEM-LEDGER (item-центричный двойной леджер) — Increment 1, additive schema.
+# ITEM LEDGER: physical quantity tape plus immutable planning reservations.
 #
-# Two append-only ledgers whose fold gives an item's state (design §1–§2):
+# Two append-only ledgers whose fold gives an item's state (–):
 #   Ledger-1 (physical movements, mirror of 1С AccumulationRegister): keyed
 #     physically (item, characteristic, organization, warehouse) — stock_ledger_
 #     entry (signed qty + running qty_after), stock_bin (on_hand fold),
 #     stock_recorder_pull (pull idempotency), stock_ledger_anchor (seed/S0).
-#   Ledger-2 (soft reservations, PRODPLAN-owned): keyed by planning pool —
-#     reservation_entry (materialized fold, per requirement×mode),
-#     reservation_event (append-only journal, idempotency_key), reservation_
-#     coverage (frozen pins + floating distribution projection).
-#
-# Inc1 is schema + pure fold/redistribute functions only: NO writer is wired
-# into freeze/cycle/reconcile, and no reader consults these tables — zero
-# behavior change. Pool/key columns are NOT NULL default '' (design §2.2): an
+#   Reservation tape (PRODPLAN-owned): reservation_entry stores one frozen
+#     obligation per requirement; reservation_event is its append-only physical
+#     replenishment journal. Pool/key columns are NOT NULL default '': an
 # empty characteristic/organization is a distinct key value, never a wildcard.
 # ---------------------------------------------------------------------------
 
 
 class StockLedgerEntry(Base):
-    """Ledger-1 append-only physical movement (design §2.1 / stock-doc §2.1).
+    """Ledger-1 append-only physical movement ( / stock-doc ).
     Signed ``qty`` (receipt > 0, expense < 0, base UoM); ``qty_after`` is the
     running balance projection (R-A). One row per (recorder, line); replacement
     is by-recorder (delete+reinsert), never UPDATE of an applied row (И5)."""
@@ -2850,7 +2469,7 @@ class StockLedgerEntry(Base):
     # movement_kind ∈ {receipt, expense, assembly_in, assembly_out, transfer_in,
     # transfer_out, writeoff, adjustment, seed}. Empty = distinct key value.
     movement_kind = Column(String(32), nullable=False, server_default="")
-    # recorder identity: 1С document type / GUID / LineNumber (string, inc0).
+    # recorder identity: 1С document type / GUID / LineNumber (string, ).
     recorder_type = Column(String(64), nullable=False, server_default="")
     recorder_ref = Column(String(64), nullable=False, server_default="")
     line_no = Column(String(32), nullable=False, server_default="")
@@ -2974,6 +2593,173 @@ class StockLedgerSupplierReceiptProvenance(Base):
     stock_ledger_entry = relationship("StockLedgerEntry")
 
 
+class AssemblyOutputFactDecision(Base):
+    """Decision table for mapping one physical assembly output to plan provenance.
+
+    The canonical path is exact match to a production plan line; only when exact
+    provenance is absent the fallback is FIFO by the caller-provided queue order.
+    One decision can be ambiguous or invalid to preserve provenance integrity.
+    """
+
+    __tablename__ = "assembly_output_fact_decision"
+    __table_args__ = (
+        UniqueConstraint(
+            "ledger_generation_id",
+            "stock_ledger_entry_id",
+            name="uq_assembly_output_fact_decision_generation_sle",
+        ),
+        CheckConstraint(
+            "decision_status IN ('allocatable', 'ambiguous', 'invalid')",
+            name="ck_assembly_output_fact_decision_status",
+        ),
+        CheckConstraint(
+            "link_kind IN ('exact_plan_line', 'planned_order', 'order_ref', 'none')",
+            name="ck_assembly_output_fact_decision_link_kind",
+        ),
+        CheckConstraint(
+            "surplus_qty >= 0",
+            name="ck_assembly_output_fact_decision_surplus_nonnegative",
+        ),
+        CheckConstraint(
+            "length(source_content_hash) = 64",
+            name="ck_assembly_output_fact_decision_source_content_hash_len",
+        ),
+        Index(
+            "ix_assembly_output_fact_decision_generation",
+            "ledger_generation_id",
+        ),
+        Index(
+            "ix_assembly_output_fact_decision_stock_ledger_entry",
+            "stock_ledger_entry_id",
+        ),
+        Index(
+            "ix_assembly_output_fact_decision_generation_status",
+            "ledger_generation_id",
+            "decision_status",
+        ),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    stock_ledger_entry_id = Column(
+        BigInteger,
+        ForeignKey("stock_ledger_entry.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    decision_status = Column(String(16), nullable=False)
+    link_kind = Column(String(24), nullable=False)
+    reason = Column(TEXT, nullable=True)
+    evidence_payload = Column(
+        CrossPlatformJSON,
+        nullable=False,
+        default=dict,
+        server_default=text("'{}'"),
+    )
+    source_content_hash = Column(String(64), nullable=False)
+    surplus_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+
+    ledger_generation = relationship("LedgerGeneration")
+    stock_ledger_entry = relationship("StockLedgerEntry")
+
+
+class AssemblyOutputAllocation(Base):
+    """Concrete per-plan-line allocations emitted by canonical physical output logic."""
+
+    __tablename__ = "assembly_output_allocation"
+    __table_args__ = (
+        UniqueConstraint(
+            "ledger_generation_id",
+            "stock_ledger_entry_id",
+            "allocation_ordinal",
+            name="uq_assembly_output_allocation_generation_sle_ordinal",
+        ),
+        UniqueConstraint(
+            "ledger_generation_id",
+            "stock_ledger_entry_id",
+            "plan_line_id",
+            name="uq_assembly_output_allocation_generation_sle_plan_line",
+        ),
+        CheckConstraint(
+            "allocated_qty > 0",
+            name="ck_assembly_output_allocation_qty_positive",
+        ),
+        CheckConstraint(
+            "match_rule IN ('exact', 'fifo')",
+            name="ck_assembly_output_allocation_match_rule",
+        ),
+        CheckConstraint(
+            "allocation_ordinal >= 0",
+            name="ck_assembly_output_allocation_ordinal_nonnegative",
+        ),
+        Index(
+            "ix_assembly_output_allocation_generation",
+            "ledger_generation_id",
+        ),
+        Index(
+            "ix_assembly_output_allocation_stock_ledger_entry",
+            "stock_ledger_entry_id",
+        ),
+        Index(
+            "ix_assembly_output_allocation_plan",
+            "plan_id",
+        ),
+        Index(
+            "ix_assembly_output_allocation_plan_line",
+            "plan_line_id",
+        ),
+        Index(
+            "ix_assembly_output_allocation_generation_match_rule",
+            "ledger_generation_id",
+            "match_rule",
+        ),
+    )
+
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    stock_ledger_entry_id = Column(
+        BigInteger,
+        ForeignKey("stock_ledger_entry.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    plan_id = Column(
+        Integer,
+        ForeignKey("production_plan_header.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    plan_line_id = Column(
+        Integer,
+        ForeignKey("production_plan_line.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    allocated_qty = Column(DECIMAL(15, 3), nullable=False)
+    match_rule = Column(String(8), nullable=False)
+    allocation_ordinal = Column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+
+    ledger_generation = relationship("LedgerGeneration")
+    stock_ledger_entry = relationship("StockLedgerEntry")
+    plan = relationship("ProductionPlanHeader")
+    plan_line = relationship("ProductionPlanLine")
+
+
 class StockLedgerFactSupersession(Base):
     """Append-only replacement edge preserving earlier accepted fact prefixes."""
     __tablename__ = "stock_ledger_fact_supersession"
@@ -3011,9 +2797,9 @@ class StockLedgerFactSupersession(Base):
 
 
 class StockBin(Base):
-    """Ledger-1 fold cache: on_hand per physical key (design §2.1). on_hand =
+    """Ledger-1 fold cache: on_hand per physical key (). on_hand =
     Σ qty over the key's SLE (= last qty_after). reconcile_pending_qty holds a
-    debounced Balance-vs-ledger delta (written by the reconcile step, inc3)."""
+    debounced Balance-vs-ledger delta (written by the reconcile step, )."""
 
     __tablename__ = "stock_bin"
     __table_args__ = (
@@ -3046,11 +2832,11 @@ class StockBin(Base):
     organization_ref = Column(String(36), nullable=False, server_default="")
     warehouse_ref1c = Column(String(36), nullable=False, server_default="")
     on_hand = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
-    # Debounced Balance-vs-ledger delta (inc3 §3б step 3): a non-zero value means
+    # Debounced Balance-vs-ledger delta (  step 3): a non-zero value means
     # a drift was seen last sweep and is awaiting a confirming second sweep.
     reconcile_pending_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
     # When this key was last confirmed reconciled against 1С /Balance (|delta|≤EPS
-    # matched, or an adjustment-SLE applied). NULL = never reconciled (inc3).
+    # matched, or an adjustment-SLE applied). NULL = never reconciled ().
     last_reconciled_at = Column(TIMESTAMP, nullable=True)
     last_entry_id = Column(BigInteger, nullable=True)
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now(), server_default=func.now(), nullable=False)
@@ -3060,8 +2846,8 @@ class StockBin(Base):
 
 
 class StockRecorderPull(Base):
-    """Ledger-1 pull idempotency ledger (design §2.1). One row per 1С recorder
-    already mirrored, so a re-pull of the same document is a no-op (inc2)."""
+    """Ledger-1 pull idempotency ledger (). One row per 1С recorder
+    already mirrored, so a re-pull of the same document is a no-op ()."""
 
     __tablename__ = "stock_recorder_pull"
     __table_args__ = (
@@ -3073,8 +2859,8 @@ class StockRecorderPull(Base):
     recorder_type = Column(String(64), nullable=False, server_default="")
     recorder_ref = Column(String(64), nullable=False, server_default="")
     line_count = Column(Integer, nullable=False, default=0, server_default="0")
-    # status ∈ {pending, done, empty, error} (inc2). A hook enqueues 'pending';
-    # the puller sets done/empty/error. 'pulled' remains the inc1 legacy default.
+    # status ∈ {pending, done, empty, error} (). A hook enqueues 'pending';
+    # the puller sets done/empty/error. 'pulled' remains the  legacy default.
     status = Column(String(20), nullable=False, server_default="pulled")
     # What put the recorder on the queue (e.g. 'manufacture_export',
     # 'stock_transfer_export', 'reconcile'); diagnostic only.
@@ -3093,7 +2879,7 @@ class StockRecorderPull(Base):
 
 
 class StockLedgerAnchor(Base):
-    """Ledger-1 anchor (design §2.1 / stock-doc §5): a per-key seed/S0 point.
+    """Ledger-1 anchor ( / stock-doc ): a per-key seed/S0 point.
     After the anchor the running balance is authoritative; the anchor records
     the Balance-derived opening quantity and the period it belongs to."""
 
@@ -3140,17 +2926,17 @@ class StockLedgerAnchor(Base):
 
 
 class ReservationEntry(Base):
-    """Ledger-2 materialized reservation (design §2.2): one row per requirement
-    × realization_mode. Caches (reserved_qty/realized_qty) are the fold of
-    reservation_event; covered_*/uncovered_qty/coverage_state are the
-    redistribute() projection. reserved_qty is the plan's draw on the pool, NOT
-    the shortfall — shortfall is the derived uncovered_qty."""
+    """One immutable plan reservation plus its FIFO replenishment progress."""
 
     __tablename__ = "reservation_entry"
     __table_args__ = (
         UniqueConstraint(
-            "ledger_generation_id", "requirement_id", "realization_mode",
-            name="ux_reservation_entry_req_mode",
+            "ledger_generation_id", "requirement_id",
+            name="ux_reservation_entry_requirement",
+        ),
+        CheckConstraint(
+            "realization_mode IN ('make', 'buy')",
+            name="ck_reservation_entry_replenishment_flow",
         ),
         Index(
             "ix_reservation_entry_pool",
@@ -3163,6 +2949,26 @@ class ReservationEntry(Base):
         Index("ix_reservation_entry_run_version", "run_id", "freeze_version"),
         Index("ix_reservation_entry_requirement", "requirement_id"),
     )
+
+    def __init__(self, **kwargs):
+        # Direct builders must state the immutable replenishment denominator.
+        # For the common all-missing case it equals the full reserve.
+        reserved = Decimal(str(kwargs.get("reserved_qty", 0) or 0))
+        required = kwargs.get("replenishment_required_qty")
+        if required is None:
+            required = reserved
+            kwargs["replenishment_required_qty"] = required
+        if "covered_from_stock_at_freeze_qty" not in kwargs:
+            kwargs["covered_from_stock_at_freeze_qty"] = max(
+                reserved - Decimal(str(required or 0)),
+                Decimal("0"),
+            )
+        if "replenishment_received_qty" not in kwargs:
+            kwargs["replenishment_received_qty"] = min(
+                max(Decimal(str(kwargs.get("realized_qty", 0) or 0)), Decimal("0")),
+                max(Decimal(str(required or 0)), Decimal("0")),
+            )
+        super().__init__(**kwargs)
 
     id = Column(BigIntPK, primary_key=True, index=True)
     ledger_generation_id = Column(
@@ -3180,19 +2986,24 @@ class ReservationEntry(Base):
     requirement_id = Column(Integer, ForeignKey("mrp_requirement.id", ondelete="CASCADE"), nullable=False)
     priority_period_from = Column(Date, nullable=False)
     priority_period_to = Column(Date, nullable=False)
-    # realization_mode ∈ {consume, buy, make} — the axis of realization (§3, §6).
-    # make-like modes (make/buy) do not drive reserved_soft; consume does.
-    realization_mode = Column(String(10), nullable=False, server_default="consume")
+    # Compatibility storage name; semantically this is replenishment_flow and
+    # accepts only make|buy. It routes one calculation to a working journal.
+    realization_mode = Column(String(10), nullable=False, server_default="make")
     reserved_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
+    covered_from_stock_at_freeze_qty = Column(
+        DECIMAL(15, 3), nullable=False, default=0.0, server_default="0"
+    )
+    replenishment_required_qty = Column(
+        DECIMAL(15, 3), nullable=False, default=0.0, server_default="0"
+    )
+    replenishment_received_qty = Column(
+        DECIMAL(15, 3), nullable=False, default=0.0, server_default="0"
+    )
+    # Compatibility cache during the code migration. It mirrors
+    # replenishment_received_qty and is not an independent source.
     realized_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
-    covered_on_hand_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
-    covered_incoming_supplier_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
-    covered_incoming_wip_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
-    uncovered_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
-    # lifecycle_status ∈ {active, closed, released, carried, cancelled} (§6.2).
+    # Active rows participate in FIFO; released rows are historical only.
     lifecycle_status = Column(String(20), nullable=False, server_default="active")
-    # coverage_state ∈ {covered, partial, uncovered} — derived from uncovered_qty.
-    coverage_state = Column(String(20), nullable=False, server_default="uncovered")
     opened_at = Column(TIMESTAMP, nullable=True)
     closed_at = Column(TIMESTAMP, nullable=True)
     updated_at = Column(TIMESTAMP, default=func.now(), onupdate=func.now(), server_default=func.now(), nullable=False)
@@ -3204,7 +3015,7 @@ class ReservationEntry(Base):
 
 
 class ReservationEvent(Base):
-    """Ledger-2 append-only reservation journal (design §2.3). Fold by
+    """Ledger-2 append-only reservation journal (). Fold by
     reservation gives reserved_qty/realized_qty; fold by item-key gives the
     pool's reserved_soft. Never UPDATE/DELETE (analogue of И5). idempotency_key
     makes a re-run non-duplicating."""
@@ -3239,14 +3050,14 @@ class ReservationEvent(Base):
     organization_ref = Column(String(36), nullable=False, server_default="")
     planning_stock_pool = Column(String(64), nullable=False, server_default="default")
     # event_kind ∈ {open, amend, realize, unrealize, cancel, release,
-    # carry_out, carry_in, close, reopen} (§6.2).
+    # carry_out, carry_in, close, reopen} ().
     event_kind = Column(String(20), nullable=False, server_default="")
     reserved_delta = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
     realized_delta = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
     sle_id = Column(BigInteger, ForeignKey("stock_ledger_entry.id", ondelete="SET NULL"), nullable=True)
     fact_ref = Column(String(64), nullable=False, server_default="")
     fact_line_ref = Column(String(64), nullable=False, server_default="")
-    # match_rule ∈ {pegged, fifo, manual} (§6.3).
+    # match_rule ∈ {pegged, fifo, manual} ().
     match_rule = Column(String(20), nullable=False, server_default="")
     cycle_id = Column(String(64), nullable=False, server_default="")
     idempotency_key = Column(String(120), nullable=False)
@@ -3258,39 +3069,127 @@ class ReservationEvent(Base):
     ledger_generation = relationship("LedgerGeneration")
 
 
-class ReservationCoverage(Base):
-    """Ledger-2 coverage projection (design §2.4): who covers a reservation.
-    frozen pins (pin_kind='frozen') carry the immutable freeze allocation (=
-    MrpFreezeAllocation), realized/evaporated rewritten by verify_frozen_supply;
-    floating rows (pin_kind='floating') are (re)written ONLY by redistribute()."""
+class ReplenishmentWorkItem(Base):
+    """One immutable unified replenishment journal line (make/buy).
 
-    __tablename__ = "reservation_coverage"
+    Each active reservation with positive replenishment requirement maps to
+    exactly one work item in one generation. Idempotency is guaranteed by
+    generation + reservation uniqueness and deterministic rebuild.
+    """
+
+    __tablename__ = "replenishment_work_item"
     __table_args__ = (
         UniqueConstraint(
-            "reservation_id",
-            "source_kind",
-            "source_ref",
-            "source_line_ref",
-            "pin_kind",
-            name="ux_reservation_coverage_source",
+            "ledger_generation_id", "reservation_id",
+            name="uq_replenishment_work_item_generation_reservation",
         ),
-        Index("ix_reservation_coverage_reservation", "reservation_id"),
+        CheckConstraint(
+            "replenishment_method IN ('make', 'buy')",
+            name="ck_replenishment_work_item_method",
+        ),
+        CheckConstraint(
+            "replenishment_required_qty >= 0",
+            name="ck_replenishment_work_item_required_nonnegative",
+        ),
+        CheckConstraint(
+            "replenishment_fulfilled_qty >= 0",
+            name="ck_replenishment_work_item_fulfilled_nonnegative",
+        ),
+        CheckConstraint(
+            "replenishment_remaining_qty >= 0",
+            name="ck_replenishment_work_item_remaining_nonnegative",
+        ),
+        CheckConstraint(
+            "replenishment_required_qty >= replenishment_fulfilled_qty",
+            name="ck_replenishment_work_item_fulfilled_le_required",
+        ),
+        CheckConstraint(
+            "replenishment_required_qty >= replenishment_remaining_qty",
+            name="ck_replenishment_work_item_remaining_le_required",
+        ),
+        CheckConstraint(
+            "replenishment_remaining_qty = "
+            "replenishment_required_qty - replenishment_fulfilled_qty",
+            name="ck_replenishment_work_item_remaining_exact",
+        ),
+        Index("ix_replenishment_work_item_generation", "ledger_generation_id"),
+        Index("ix_replenishment_work_item_plan", "plan_id"),
+        Index("ix_replenishment_work_item_run", "run_id"),
     )
 
-    id = Column(BigIntPK, primary_key=True, index=True)
-    reservation_id = Column(BigInteger, ForeignKey("reservation_entry.id", ondelete="CASCADE"), nullable=False)
-    # source_kind ∈ {on_hand, supplier_order, wip_order}.
-    source_kind = Column(String(20), nullable=False, server_default="")
-    source_ref = Column(String(64), nullable=False, server_default="")
-    source_line_ref = Column(String(64), nullable=False, server_default="")
-    # pin_kind ∈ {frozen, floating}.
-    pin_kind = Column(String(10), nullable=False, server_default="floating")
-    alloc_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
-    fact_at_freeze = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
-    covered_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
-    realized_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
-    evaporated_qty = Column(DECIMAL(15, 3), nullable=False, default=0.0, server_default="0")
-    cycle_id = Column(String(64), nullable=False, server_default="")
-    computed_at = Column(TIMESTAMP, default=func.now(), server_default=func.now(), nullable=False)
+    id = Column(BigIntPK, primary_key=True, autoincrement=True)
+    ledger_generation_id = Column(
+        BigInteger,
+        ForeignKey("ledger_generation.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    reservation_id = Column(
+        BigInteger,
+        ForeignKey("reservation_entry.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    plan_id = Column(
+        Integer,
+        ForeignKey("production_plan_header.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    run_id = Column(
+        Integer,
+        ForeignKey("planning_run.run_id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    requirement_id = Column(
+        Integer,
+        ForeignKey("mrp_requirement.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    item_id = Column(
+        Integer,
+        ForeignKey("items.item_id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    replenishment_method = Column(String(10), nullable=False)
+    replenishment_required_qty = Column(
+        DECIMAL(15, 3),
+        nullable=False,
+        default=0.0,
+        server_default="0",
+    )
+    replenishment_fulfilled_qty = Column(
+        DECIMAL(15, 3),
+        nullable=False,
+        default=0.0,
+        server_default="0",
+    )
+    replenishment_remaining_qty = Column(
+        DECIMAL(15, 3),
+        nullable=False,
+        default=0.0,
+        server_default="0",
+    )
+    # Optional execution lineage is preserved for downstream consumers.
+    execution_document_kind = Column(String(24), nullable=False, server_default="")
+    execution_document_id = Column(BigInteger, nullable=True)
+    execution_document_state = Column(String(24), nullable=False, server_default="")
+    execution_document_payload = Column(
+        CrossPlatformJSON,
+        nullable=False,
+        default=dict,
+        server_default=text("'{}'"),
+    )
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
 
+    ledger_generation = relationship("LedgerGeneration")
     reservation = relationship("ReservationEntry")
+    plan = relationship("ProductionPlanHeader")
+    run = relationship("PlanningRun")
+    requirement = relationship("MrpRequirement")
+    item = relationship("Item")

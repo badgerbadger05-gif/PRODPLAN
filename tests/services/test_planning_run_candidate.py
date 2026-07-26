@@ -214,7 +214,7 @@ def test_create_candidate_is_idempotent_only_for_exact_lineage(db_session):
 def test_candidate_identity_ignores_historical_run_but_rejects_second_building(db_session):
     parent, _accepted, target = _parent_and_target(db_session)
     historical = models.PlanningRun(
-        status="FIXED_SNAPSHOT",
+        status="SUPERSEDED",
         ledger_generation_id=target.id,
         source_plan_id=parent.source_plan_id,
         config_snapshot={},

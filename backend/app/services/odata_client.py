@@ -695,7 +695,7 @@ def convert_1c_stock_to_records(
 
         # Organization dimension (Balance is taken with Dimensions including
         # Организация). Surfaced additively so the item-ledger Balance-reconcile
-        # (inc3) can align on the full physical key (item, org, warehouse); a
+        # () can align on the full physical key (item, org, warehouse); a
         # zero GUID collapses to '' to match the ledger key convention.
         org_ref = _extract_ref_key(
             record.get("Организация_Key")

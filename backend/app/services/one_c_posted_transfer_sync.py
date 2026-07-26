@@ -248,7 +248,7 @@ def _apply_posted(
             or_(
                 ProductionMaterialIssue.direction.is_(None),
                 ProductionMaterialIssue.direction == "",
-                ProductionMaterialIssue.direction.in_(("issue", "in_place")),
+                ProductionMaterialIssue.direction == "issue",
             ),
             ProductionMaterialIssue.status.in_(("draft", "requested", "issued", "exported")),
         )

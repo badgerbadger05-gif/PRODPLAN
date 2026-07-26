@@ -124,6 +124,7 @@ def _payload(
     entries: list[dict[str, int | str | None]],
     *,
     add_plan_ids: list[int],
+    retire_plan_ids: list[int],
     horizon_days: int | None,
     config_version_id: int | None,
     config_snapshot: dict[str, Any],
@@ -134,6 +135,7 @@ def _payload(
         "entries": entries,
         "add_request": {
             "plan_ids": add_plan_ids,
+            "retire_plan_ids": retire_plan_ids,
             "horizon_days": horizon_days,
             "config_version_id": config_version_id,
             "config_snapshot": config_snapshot,
@@ -257,6 +259,7 @@ def create_obligation_refresh_manifest(
     parent_generation_id: int,
     target_generation_id: int,
     add_plan_ids: Iterable[int],
+    retire_plan_ids: Iterable[int] = (),
     *,
     started_by: str | None,
     horizon_days: int | None,
@@ -273,6 +276,9 @@ def create_obligation_refresh_manifest(
     if not isinstance(config_snapshot, dict):
         raise ObligationRefreshManifestError("config_snapshot must be a mapping")
     add_ids = _normalise_add_ids(add_plan_ids)
+    retire_ids = _normalise_add_ids(retire_plan_ids)
+    if set(add_ids).intersection(retire_ids):
+        raise ObligationRefreshManifestError("a plan cannot be added and retired together")
     pool_mapping = _normalise_pool_mapping(planning_pool_by_warehouse)
     parent, target = _require_target(db, parent_generation_id, target_generation_id)
     existing = _existing_result(db, target)
@@ -282,6 +288,7 @@ def create_obligation_refresh_manifest(
         # plan or alter sealed first-plan settings on a retry.
         expected = _payload(
             list(existing.entries), add_plan_ids=add_ids,
+            retire_plan_ids=retire_ids,
             horizon_days=horizon_days, config_version_id=config_version_id,
             config_snapshot=deepcopy(config_snapshot),
             planning_pool_by_warehouse=pool_mapping,
@@ -297,6 +304,11 @@ def create_obligation_refresh_manifest(
 
     parents = _current_parents(db, int(parent.id))
     current_plan_ids = {int(row.source_plan_id) for row in parents}
+    missing_retire = set(retire_ids) - current_plan_ids
+    if missing_retire:
+        raise ObligationRefreshManifestError(
+            f"retire plan has no current FIXED_SNAPSHOT: {min(missing_retire)}"
+        )
     overlap = current_plan_ids.intersection(add_ids)
     if overlap:
         raise ObligationRefreshManifestError(
@@ -307,7 +319,12 @@ def create_obligation_refresh_manifest(
     try:
         for parent_run in parents:
             entries.append({
-                "action": "retain", "plan_id": int(parent_run.source_plan_id),
+                "action": (
+                    "retire"
+                    if int(parent_run.source_plan_id) in set(retire_ids)
+                    else "retain"
+                ),
+                "plan_id": int(parent_run.source_plan_id),
                 "parent_run_id": int(parent_run.run_id),
                 "candidate_run_id": None,
             })
@@ -326,7 +343,8 @@ def create_obligation_refresh_manifest(
 
     entries.sort(key=lambda row: (int(row["plan_id"]), str(row["action"])))
     payload = _payload(
-        entries, add_plan_ids=add_ids, horizon_days=horizon_days,
+        entries, add_plan_ids=add_ids, retire_plan_ids=retire_ids,
+        horizon_days=horizon_days,
         config_version_id=config_version_id, config_snapshot=deepcopy(config_snapshot),
         planning_pool_by_warehouse=pool_mapping,
     )

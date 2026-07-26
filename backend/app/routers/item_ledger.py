@@ -1,24 +1,20 @@
-"""Item-ledger per-item read API — the "nomenclature card" (Increment 7).
+"""Item-ledger per-item read API — the nomenclature card.
 
 Read-only, purely additive inspection endpoints over the item-ledger substrate
-(inc1–6). They render an item's ledger state for the diagnostic/explainability
-screen: the pool projection (§1), the physical movement tape (§2), the soft
-reservations (§3), a reservation's provenance journal (§4) and the drift/
-reconcile events (§5).
+and render its state for diagnostics: the pool projection, physical movement
+tape, and soft reservations with their provenance journal.
 
-These endpoints ALWAYS read the ledger tables directly — they are NOT gated by
-STOCK_SOURCE: the card is a ledger inspection tool that shows ledger state
-regardless of which stock source the compute core currently consults. Nothing
-here touches the compute core (freeze / cycle / reconcile / netting), writes to
-1С, or mutates any row — every handler is a pure SELECT.
+These endpoints always read the accepted Item Ledger generation. Nothing here
+touches freeze, cycle, reconcile or netting, writes to 1С, or mutates a row:
+every handler is a pure SELECT.
 
 Data-access is reused from the item-ledger services:
-  * reservation_ledger.item_ledger_position — the §1 pool projection.
+  * reservation_ledger.item_ledger_position — the pool projection.
   * reconcile.ledger_on_hand_by_item — the per-item on_hand fold + the planning
     contour (selected − finished-goods − ignored) used for the warehouse split.
   * mrp_freeze.pool_key_for — the canonical pool key.
-Direct ORM reads: StockLedgerEntry (§2), ReservationEntry / ReservationEvent /
-ReservationCoverage (§3/§4), MrpDriftEvent (§5).
+Direct ORM reads cover physical entries, immutable make/buy reservations and
+their append-only event tape.
 """
 from __future__ import annotations
 
@@ -35,10 +31,10 @@ from .. import models
 from ..database import get_db
 from ..routers.truth_meta import TruthMeta, build_truth_meta
 from ..services.item_ledger.physical_visibility import visible_sle_query
+from ..services.item_ledger.reservation import replenishment_remaining
 from ..services.item_ledger.reservation_ledger import item_ledger_position
 from ..services.mrp_freeze import pool_key_for
 from ..services.planning_truth import (
-    CAPABILITY_EXECUTION_ALLOCATIONS,
     CAPABILITY_PHYSICAL_LEDGER,
     CAPABILITY_RESERVATION_REPLAY,
     PlanningTruthReadiness,
@@ -140,12 +136,6 @@ class ItemLedgerReservationPriority(BaseModel):
     period_to: Optional[str]
 
 
-class ItemLedgerReservationCovered(BaseModel):
-    on_hand: float
-    incoming_supplier: float
-    incoming_wip: float
-
-
 class ItemLedgerReservationRow(BaseModel):
     reservation_id: int
     run_id: Optional[int]
@@ -155,12 +145,11 @@ class ItemLedgerReservationRow(BaseModel):
     realization_mode: str
     priority: ItemLedgerReservationPriority
     reserved_qty: float
-    realized_qty: float
-    outstanding: float
-    covered: ItemLedgerReservationCovered
-    uncovered_qty: float
+    covered_from_stock_at_freeze_qty: float
+    replenishment_required_qty: float
+    replenishment_received_qty: float
+    replenishment_remaining_qty: float
     lifecycle_status: str
-    coverage_state: str
 
 
 class ItemLedgerReservationsResponse(BaseModel):
@@ -188,32 +177,6 @@ class ItemLedgerReservationEventsResponse(BaseModel):
 
     reservation_id: int
     rows: List[ItemLedgerReservationEventRow]
-    truth_meta: TruthMeta
-
-
-class ItemLedgerDriftRow(BaseModel):
-    id: int
-    cycle_id: str
-    kind: str
-    drift_qty: float
-    expected_stock: Optional[float]
-    actual_stock: Optional[float]
-    at: Optional[str]
-    cause: Optional[str]
-    adjustment_sle_id: Optional[int]
-    matured: bool
-    first_seen_cycle_id: Optional[str]
-    requirement_id: Optional[int]
-    details: Optional[Any]
-
-
-class ItemLedgerDriftResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    total: int
-    limit: int
-    offset: int
-    rows: List[ItemLedgerDriftRow]
     truth_meta: TruthMeta
 
 
@@ -275,13 +238,13 @@ def _in_contour(ref: str, selected, finished_goods, ignored, has_settings) -> bo
 
 
 # ---------------------------------------------------------------------------
-# §1 — position (card header / summary)
+#  — position (card header / summary)
 # ---------------------------------------------------------------------------
 @router.get("/{item_id}/position", response_model=ItemLedgerPositionResponse)
 def get_position(item_id: int, db: Session = Depends(get_db)) -> ItemLedgerPositionResponse:
-    """The §1 pool projection for one item — the ledger's own view (read the
-    ledger tables directly, never gated by STOCK_SOURCE). on_hand / available /
-    projected / uncovered follow the §2.5 formulas; ``available`` and
+    """The  pool projection for one item — the ledger's own view (read the
+    ledger tables directly. on_hand / available /
+    projected / uncovered follow the  formulas; ``available`` and
     ``uncovered`` are surfaced as-is (a negative available is a deficit signal,
     not clamped)."""
     item = _get_item_or_404(db, item_id)
@@ -362,7 +325,7 @@ def get_position(item_id: int, db: Session = Depends(get_db)) -> ItemLedgerPosit
 
 
 # ---------------------------------------------------------------------------
-# §2 — movements (physical ledger tape)
+#  — movements (physical ledger tape)
 # ---------------------------------------------------------------------------
 @router.get("/{item_id}/movements", response_model=ItemLedgerMovementsResponse)
 def get_movements(
@@ -374,7 +337,7 @@ def get_movements(
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
 ) -> ItemLedgerMovementsResponse:
-    """§2 — the signed physical movement tape (active StockLedgerEntry rows),
+    """ — the signed physical movement tape (active StockLedgerEntry rows),
     sorted ``(posting_at, id)``, paginated (total + rows). ``qty_after`` is the
     running balance the ledger carried — "how it computed"."""
     _get_item_or_404(db, item_id)
@@ -443,7 +406,7 @@ def get_movements(
 
 
 # ---------------------------------------------------------------------------
-# §3 — reservations (soft reservation tape)
+#  — reservations (soft reservation tape)
 # ---------------------------------------------------------------------------
 @router.get("/{item_id}/reservations", response_model=ItemLedgerReservationsResponse)
 def get_reservations(
@@ -452,9 +415,9 @@ def get_reservations(
     run_id: Optional[int] = Query(None),
     db: Session = Depends(get_db),
 ) -> ItemLedgerReservationsResponse:
-    """§3 — the per-item soft reservation tape: on which runs/plans the item hangs
-    in reservations, what covers each and how much is uncovered. ``make`` rows
-    contribute 0 to reserved_soft (surfaced separately as production)."""
+    """ — the per-item soft reservation tape: on which runs/plans the item hangs
+    in reservations, what covers each and how much is uncovered. The make/buy
+    value routes replenishment; it does not create or suppress demand."""
     _get_item_or_404(db, item_id)
     truth = _accepted_generation(
         db,
@@ -492,7 +455,8 @@ def get_reservations(
         run = runs.get(int(e.run_id)) if e.run_id is not None else None
         plan_id = int(run.source_plan_id) if run is not None and run.source_plan_id is not None else None
         reserved = _f(e.reserved_qty)
-        realized = _f(e.realized_qty)
+        replenishment_required = _f(e.replenishment_required_qty)
+        replenishment_received = _f(e.replenishment_received_qty)
         rows.append({
             "reservation_id": int(e.id),
             "run_id": int(e.run_id) if e.run_id is not None else None,
@@ -505,22 +469,24 @@ def get_reservations(
                 "period_to": _iso(e.priority_period_to),
             },
             "reserved_qty": reserved,
-            "realized_qty": realized,
-            "outstanding": max(reserved - realized, 0.0),
-            "covered": {
-                "on_hand": _f(e.covered_on_hand_qty),
-                "incoming_supplier": _f(e.covered_incoming_supplier_qty),
-                "incoming_wip": _f(e.covered_incoming_wip_qty),
-            },
-            "uncovered_qty": _f(e.uncovered_qty),
+            "covered_from_stock_at_freeze_qty": _f(
+                e.covered_from_stock_at_freeze_qty
+            ),
+            "replenishment_required_qty": replenishment_required,
+            "replenishment_received_qty": replenishment_received,
+            "replenishment_remaining_qty": float(
+                replenishment_remaining(
+                    replenishment_required,
+                    replenishment_received,
+                )
+            ),
             "lifecycle_status": e.lifecycle_status,
-            "coverage_state": e.coverage_state,
         })
     return {"rows": rows, "truth_meta": _truth_meta(truth)}
 
 
 # ---------------------------------------------------------------------------
-# §4 — reservation events (provenance journal)
+#  — reservation events (provenance journal)
 # ---------------------------------------------------------------------------
 @router.get(
     "/{item_id}/reservations/{reservation_id}/events",
@@ -531,7 +497,7 @@ def get_reservation_events(
     reservation_id: int,
     db: Session = Depends(get_db),
 ) -> ItemLedgerReservationEventsResponse:
-    """§4 — the append-only journal of one reservation (open/amend/realize/…).
+    """ — the append-only journal of one reservation (open/amend/realize/…).
     ``sle_id`` links an event to the physical movement that closed it — the debug
     thread. 404 unless the reservation belongs to the item."""
     _get_item_or_404(db, item_id)
@@ -584,75 +550,5 @@ def get_reservation_events(
     return {
         "reservation_id": int(reservation_id),
         "rows": rows,
-        "truth_meta": _truth_meta(truth),
-    }
-
-
-# ---------------------------------------------------------------------------
-# §5 — drift (reconciliation issues)
-# ---------------------------------------------------------------------------
-# kind → coarse cause label (MrpDriftEvent stores no explicit cause/adjustment
-# link; the label is derived so the card can group issues). See handler note.
-_CAUSE_BY_KIND = {
-    "evaporation": "supply_evaporation",
-    "shortfall": "unplanned_consumption",
-    "surplus": "balance_reconcile",
-}
-
-
-@router.get("/{item_id}/drift", response_model=ItemLedgerDriftResponse)
-def get_drift(
-    item_id: int,
-    limit: int = Query(100, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
-    db: Session = Depends(get_db),
-) -> ItemLedgerDriftResponse:
-    """§5 — MrpDriftEvent rows for the item (where reality diverged from plan).
-    ``cause`` is derived from ``kind`` and ``adjustment_sle_id`` is not tracked on
-    the drift row (returned null); ``details`` carries the raw provenance."""
-    _get_item_or_404(db, item_id)
-    truth = _accepted_generation(
-        db,
-        consumer="item_ledger.drift",
-        capabilities=(CAPABILITY_EXECUTION_ALLOCATIONS,),
-    )
-    generation_id = int(truth.generation_id)
-    q = db.query(models.MrpDriftEvent).filter(
-        models.MrpDriftEvent.item_id == int(item_id),
-        models.MrpDriftEvent.ledger_generation_id == generation_id,
-    )
-    total = q.count()
-    rows = (
-        q.order_by(
-            models.MrpDriftEvent.created_at.asc(),
-            models.MrpDriftEvent.id.asc(),
-        )
-        .offset(offset)
-        .limit(limit)
-        .all()
-    )
-    out = [
-        {
-            "id": int(r.id),
-            "cycle_id": r.cycle_id or "",
-            "kind": r.kind or "",
-            "drift_qty": _f(r.drift_qty),
-            "expected_stock": None if r.expected_stock is None else _f(r.expected_stock),
-            "actual_stock": None if r.actual_stock is None else _f(r.actual_stock),
-            "at": _iso(r.created_at),
-            "cause": _CAUSE_BY_KIND.get(str(r.kind or "")),
-            "adjustment_sle_id": None,
-            "matured": bool(r.matured),
-            "first_seen_cycle_id": r.first_seen_cycle_id,
-            "requirement_id": int(r.requirement_id) if r.requirement_id is not None else None,
-            "details": r.details,
-        }
-        for r in rows
-    ]
-    return {
-        "total": total,
-        "limit": limit,
-        "offset": offset,
-        "rows": out,
         "truth_meta": _truth_meta(truth),
     }

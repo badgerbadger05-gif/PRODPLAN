@@ -30,6 +30,15 @@ from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
 
 PURCHASE_ORDER_ENTITY = "Document_ЗаказПоставщику"
+
+
+def create_purchase_order_document(
+    client: OData1CClient,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    """The single transport-level create point for 1C purchase orders."""
+    result = client.post(PURCHASE_ORDER_ENTITY, payload)
+    return result if isinstance(result, dict) else {}
 EMPTY_REF1C = "00000000-0000-0000-0000-000000000000"
 UNIT_TYPE_1C = "StandardODATA.Catalog_КлассификаторЕдиницИзмерения"
 
@@ -835,7 +844,7 @@ def export_planned_purchases_to_1c(
                 "Запасы": [],
             }
             header_payload["Запасы"] = _order_lines_payload("", group)
-            created_header = client.post(PURCHASE_ORDER_ENTITY, header_payload)
+            created_header = create_purchase_order_document(client, header_payload)
             ref_key = str(created_header.get("Ref_Key") or "").strip()
             if not ref_key:
                 raise RuntimeError(f"1C did not return Ref_Key for {group.number}")

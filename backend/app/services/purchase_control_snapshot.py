@@ -1,14 +1,15 @@
 """Immutable Ledger-native read boundary for the purchase control journal."""
 from __future__ import annotations
 
-from collections import defaultdict
 from datetime import datetime, timezone
+import math
 from typing import Any
 
 from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session
 
 from app import models
+from app.services.item_ledger.reservation import replenishment_remaining
 from app.services.planning_truth import (
     CAPABILITY_PHYSICAL_LEDGER,
     CAPABILITY_PLANNING_SNAPSHOTS,
@@ -107,15 +108,17 @@ def validate_purchase_control_journal_buy_row(row: Any) -> None:
         raise ValueError("purchase control buy row has invalid quantities")
     if received_qty < 0 or received_qty > required_qty + _EPS_FLOAT:
         raise ValueError("purchase control buy row has invalid quantities")
-    if abs(quantity - required_qty) > _EPS_FLOAT:
+    if not math.isclose(quantity, required_qty, abs_tol=_EPS_FLOAT):
         raise ValueError("purchase control buy row quantity is inconsistent")
-    if abs(received_qty - realized_qty) > _EPS_FLOAT:
+    if not math.isclose(received_qty, realized_qty, abs_tol=_EPS_FLOAT):
         raise ValueError("purchase control buy row quantity is inconsistent")
-    if abs(remaining_qty - to_order_qty) > _EPS_FLOAT:
+    if not math.isclose(remaining_qty, to_order_qty, abs_tol=_EPS_FLOAT):
         raise ValueError("purchase control buy row quantity is inconsistent")
-    if abs(
-        realized_qty + open_order_covered_qty + to_order_qty - required_qty
-    ) > _EPS_FLOAT:
+    if not math.isclose(
+        realized_qty + open_order_covered_qty + to_order_qty,
+        required_qty,
+        abs_tol=_EPS_FLOAT,
+    ):
         raise ValueError("purchase control buy row quantity is inconsistent")
     reservation_ids = row.get("reservation_ids")
     requirement_ids = row.get("requirement_ids")
@@ -292,34 +295,35 @@ def _build_buyer_rows(
     to_order_by_period: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     entries = (
-        db.query(models.ReservationEntry, models.Item)
-        .join(models.Item, models.Item.item_id == models.ReservationEntry.item_id)
+        db.query(
+            models.ReplenishmentWorkItem,
+            models.ReservationEntry,
+            models.Item,
+        )
+        .join(
+            models.ReservationEntry,
+            models.ReservationEntry.id
+            == models.ReplenishmentWorkItem.reservation_id,
+        )
+        .join(
+            models.Item,
+            models.Item.item_id == models.ReplenishmentWorkItem.item_id,
+        )
         .filter(
-            models.ReservationEntry.ledger_generation_id == generation_id,
-            models.ReservationEntry.realization_mode == _BUY_MODE,
+            models.ReplenishmentWorkItem.ledger_generation_id == generation_id,
+            models.ReplenishmentWorkItem.replenishment_method == _BUY_MODE,
             models.ReservationEntry.lifecycle_status == "active",
         )
         .order_by(
             models.Item.item_code.asc(),
             models.ReservationEntry.planning_stock_pool.asc(),
-            models.ReservationEntry.run_id.asc(),
-            models.ReservationEntry.id.asc(),
+            models.ReplenishmentWorkItem.run_id.asc(),
+            models.ReplenishmentWorkItem.id.asc(),
         )
         .all()
     )
     if not entries:
         return []
-
-    reservation_ids = [int(entry.id) for entry, _item in entries]
-    coverage_rows = (
-        db.query(models.ReservationCoverage)
-        .filter(models.ReservationCoverage.reservation_id.in_(reservation_ids))
-        .order_by(models.ReservationCoverage.id.asc())
-        .all()
-    )
-    coverage_by_reservation: dict[int, list[models.ReservationCoverage]] = defaultdict(list)
-    for cov in coverage_rows:
-        coverage_by_reservation[int(cov.reservation_id)].append(cov)
 
     supplier_refs = {
         _clean_ref(s.supplier_ref1c).lower(): int(s.supplier_id)
@@ -339,13 +343,14 @@ def _build_buyer_rows(
 
     grouped_rows: dict[tuple[int, str], dict[str, Any]] = {}
 
-    run_ids: set[int] = set(int(e.run_id) for e, _item in entries if e.run_id is not None)
+    run_ids: set[int] = {
+        int(work_item.run_id)
+        for work_item, _reservation, _item in entries
+    }
     horizons = _run_horizons(db, run_ids)
 
-    for reservation, item in entries:
-        if reservation.run_id is None:
-            raise ValueError("active buy reservation has no planning-run lineage")
-        run_id = int(reservation.run_id)
+    for work_item, reservation, item in entries:
+        run_id = int(work_item.run_id)
         horizon = horizons.get(run_id)
         if horizon is None:
             raise ValueError("buy reservation references planning run without period horizon")
@@ -354,33 +359,23 @@ def _build_buyer_rows(
         if period_from is None or period_to is None:
             raise ValueError("buy reservation run has incomplete plan horizon")
 
-        required = _to_float(reservation.reserved_qty)
-        realized = _to_float(reservation.realized_qty)
-        open_order_covered = max(_to_float(reservation.covered_incoming_supplier_qty), 0.0)
-        to_order = _to_float(reservation.uncovered_qty)
+        required = _to_float(work_item.replenishment_required_qty)
+        realized = _to_float(work_item.replenishment_fulfilled_qty)
+        # Open orders are not physical receipts and cannot mutate the frozen
+        # obligation. They are represented by their own saved supply facts.
+        open_order_covered = 0.0
+        to_order = _to_float(work_item.replenishment_remaining_qty)
 
         if required < 0 or realized < 0 or to_order < 0:
             raise ValueError("buy reservation has invalid quantities")
-        if realized - required > _EPS_FLOAT:
+        if realized > required + _EPS_FLOAT:
             raise ValueError("buy reservation realized exceeds reserved")
-        if to_order - (required - realized) > _EPS_FLOAT:
+        if not math.isclose(
+            to_order,
+            float(replenishment_remaining(required, realized)),
+            abs_tol=_EPS_FLOAT,
+        ):
             raise ValueError("buy reservation has inconsistent uncovered quantity")
-
-        coverage_lines = [
-            {
-                "source_kind": c.source_kind,
-                "source_ref": _clean_ref(c.source_ref),
-                "source_line_ref": _clean_ref(c.source_line_ref),
-                "pin_kind": c.pin_kind,
-                "alloc_qty": _to_float(c.alloc_qty),
-                "covered_qty": _to_float(c.covered_qty),
-                "realized_qty": _to_float(c.realized_qty),
-                "evaporated_qty": _to_float(c.evaporated_qty),
-                "source_id": int(c.id),
-            }
-            for c in coverage_by_reservation[int(reservation.id)]
-            if _clean_ref(c.source_ref) and _clean_ref(c.source_line_ref)
-        ]
 
         pool = _clean_ref(reservation.planning_stock_pool) or "main"
         item_code = str(item.item_code or "")
@@ -407,11 +402,9 @@ def _build_buyer_rows(
             },
         )
 
-        requirement_id = reservation.requirement_id
-        if requirement_id is None:
-            raise ValueError("active buy reservation has no requirement lineage")
+        requirement_id = int(work_item.requirement_id)
 
-        target["requirement_ids"].add(int(requirement_id))
+        target["requirement_ids"].add(requirement_id)
         target["reservation_ids"].add(int(reservation.id))
         target["run_ids"].add(run_id)
         target["required_qty"] += required
@@ -422,7 +415,8 @@ def _build_buyer_rows(
         target["slices"].append(
             {
                 "reservation_id": int(reservation.id),
-                "requirement_id": int(requirement_id),
+                "work_item_id": int(work_item.id),
+                "requirement_id": requirement_id,
                 "run_id": run_id,
                 "plan_period_from": period_from.isoformat() if period_from else None,
                 "plan_period_to": period_to.isoformat() if period_to else None,
@@ -433,7 +427,7 @@ def _build_buyer_rows(
                 "to_order_qty": to_order,
                 "to_order_pct": _coverage_percent(to_order, required),
                 "open_order_covered_pct": _coverage_percent(open_order_covered, required),
-                "coverage_slices": coverage_lines,
+                "coverage_slices": [],
             }
         )
         target["horizon_buckets"].append(target["slices"][-1])

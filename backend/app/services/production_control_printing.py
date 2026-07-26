@@ -11,11 +11,11 @@ from ..models import (
     DefaultSpecification,
     IgnoredWarehouse,
     Item,
-    ItemWarehouseStock,
     MrpRequirement,
     Operation,
     PaintWeldChainLink,
     PlanningRun,
+    StockBin,
     ProductionPlanHeader,
     ProductionPlanLine,
     ProductionMaterialIssue,
@@ -29,6 +29,7 @@ from ..models import (
     Unit,
 )
 from .production_control_common import looks_like_guid as _looks_like_guid, to_float as _to_float
+from . import planning_truth
 from .one_c_production_order_export import PRODUCTION_ORDER_ENTITY
 
 
@@ -217,6 +218,14 @@ def _multi_stock_warehouse_item_ids(db: Session, item_ids: Sequence[int]) -> set
     if not ids:
         return set()
 
+    try:
+        truth = planning_truth.get_truth_state(db)
+    except Exception:
+        return set()
+    if not truth.generation_id:
+        return set()
+    accepted_generation_id = int(truth.generation_id)
+
     ignored_refs = {
         str(row.warehouse_ref1c or "").strip()
         for row in db.query(IgnoredWarehouse.warehouse_ref1c).all()
@@ -230,10 +239,11 @@ def _multi_stock_warehouse_item_ids(db: Session, item_ids: Sequence[int]) -> set
     selected_refs = {ref for ref, is_selected in warehouse_settings.items() if is_selected}
 
     rows = (
-        db.query(ItemWarehouseStock.item_id, ItemWarehouseStock.warehouse_ref1c)
+        db.query(StockBin.item_id, StockBin.warehouse_ref1c)
         .filter(
-            ItemWarehouseStock.item_id.in_(ids),
-            ItemWarehouseStock.qty > 0,
+            StockBin.ledger_generation_id == accepted_generation_id,
+            StockBin.item_id.in_(ids),
+            StockBin.on_hand > 0,
         )
         .all()
     )

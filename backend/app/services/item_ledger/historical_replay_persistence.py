@@ -27,8 +27,8 @@ from .reservation import append_realization_event, fold_reservation_entry
 
 
 _ALGORITHM_VERSION = "historical-replay-persistence/1"
-_SAFE_REALIZATION_KINDS = frozenset({"assembly_in", "assembly_out", "writeoff"})
-_IGNORED_FACT_KINDS = frozenset({"receipt", "expense"})
+_SAFE_REALIZATION_KINDS = frozenset({"assembly_in"})
+_IGNORED_FACT_KINDS = frozenset({"assembly_out", "writeoff", "receipt", "expense"})
 _UNRESOLVED_POOL_PREFIX = "__unresolved_pool__"
 _NO_POOL_SENTINEL_PREFIX = "__no_pool__"
 
@@ -44,8 +44,6 @@ def bucket_capacity_for_mode(
     mode_key = str(mode or "").lower()
     if mode_key == "make":
         return max(_decimal(bucket.net_qty), Decimal("0"))
-    if mode_key == "consume":
-        return max(_decimal(bucket.gross_qty), Decimal("0"))
     if mode_key == "buy":
         return max(_decimal(bucket.net_qty), Decimal("0"))
     raise ValueError(f"unsupported realization mode for bucket capacity: {mode}")
@@ -57,7 +55,9 @@ def _checksum(rows: list[dict[str, Any]]) -> str:
 
 
 def _fact_mode(row: StockLedgerEntry) -> str:
-    return "make" if str(row.movement_kind or "") == "assembly_in" else "consume"
+    if str(row.movement_kind or "") != "assembly_in":
+        raise ValueError("only positive production replenishment enters replay")
+    return "make"
 
 
 def _as_datetime(value: Any) -> datetime | None:
@@ -111,14 +111,11 @@ def _identity_for_sle(
     links = db.query(models.SyncLink).filter(
         models.SyncLink.target_ref_key == recorder,
         models.SyncLink.status == "success",
-        models.SyncLink.source_doctype.in_(("manufacture", "material_issue")),
+        models.SyncLink.source_doctype == "material_issue",
     ).all()
     order_ids: set[int] = set()
     for link in links:
-        if link.source_doctype == "manufacture":
-            source = db.get(models.ProductionManufacture, int(link.source_id))
-        else:
-            source = db.get(models.ProductionMaterialIssue, int(link.source_id))
+        source = db.get(models.ProductionMaterialIssue, int(link.source_id))
         if source is not None:
             order_ids.add(int(source.order_id))
     if order_refs:
@@ -253,7 +250,7 @@ def run_historical_replay(
             reserve_id=core_id,
             item_id=int(row.item_id),
             mode=str(row.realization_mode),  # validated by pure core
-            reserved_qty=_decimal(row.reserved_qty),
+            reserved_qty=_decimal(row.replenishment_required_qty),
             due_date=row.priority_period_to,
             plan_period_from=row.priority_period_from,
             plan_period_to=row.priority_period_to,
@@ -402,8 +399,8 @@ def run_historical_replay(
         "execution_allocations_inserted": 0,
         "fact_qty": str(result.fact_qty),
         "allocated_qty": str(result.allocated_qty),
-        "unplanned_qty": str(result.unplanned_qty),
-        "unplanned_facts": len(result.unplanned),
+        "surplus_qty": str(result.surplus_qty),
+        "surplus_facts": len(result.surplus),
         "ambiguous_pool_facts": ambiguous_pool_facts,
         "ambiguous_identity_facts": ambiguous_identity_facts,
         "legacy_identity_collapsed_pool_facts": (

@@ -46,8 +46,6 @@ export type OrderRow = {
   mrp_req_net_qty?: number | null
   mrp_req_covered_qty?: number | null
   mrp_req_remaining_qty?: number | null
-  failed_manufacture_id?: number | null
-  failed_manufacture_error?: string | null
   paint_weld_chain?: PaintWeldChainInfo | null
 }
 
@@ -227,6 +225,13 @@ export type MaterialIssueCreateResponse = {
   errors: string[]
 }
 
+export type MaterialIssueCreatePayload = {
+  product_ids: number[]
+  initiated_by?: string | null
+  warehouse_ref1c?: string | null
+  source_warehouse_ref1c?: string | null
+}
+
 export type TransferIssueRow = {
   issue_id: number
   document_number: string
@@ -288,6 +293,113 @@ export type MaterialIssueDetail = TransferIssueRow & {
   }>
 }
 
+export type ProductionOrderFilters = {
+  search: string
+  status: string
+  workshop_id: string
+  coverage_status: string
+  root_item_id: string
+  sort_by: 'planned_start_date'
+  sort_dir: 'asc' | 'desc'
+}
+
+export type ProduceLinePayload = {
+  qty: number
+  executor?: string | null
+  operation_executors?: Array<{
+    line_number?: number
+    spec_operation_id?: number
+    operation_id?: number
+    employee_ref1c?: string
+    employee_name?: string
+  }>
+  comment?: string | null
+}
+
+export type ProduceLineResult = {
+  status: string
+  manufacture_id: number
+  product_id: number
+  order_id: number
+  qty: number
+  produced_qty_total: number
+  remaining_qty: number
+  commanded_qty_total: number
+  command_remaining_qty: number
+  fact_pending: boolean
+  line_status: string
+  ledger_readback: 'queued'
+  manufacture_export: ExportManufacturesResult
+  piecework_export: ExportPieceworkResult
+}
+
+export type ReturnLeftoversResult = {
+  status: string
+  issued_issues: number
+  created_issues: number
+  skipped_rows: Array<{ issue_id?: number; reason?: string }>
+  entries: Array<{
+    product_id: number
+    issue_id: number
+    direction: string
+    issued_qty: number
+    returned_qty: number
+    warehouse_ref1c?: string | null
+    source_warehouse_ref1c?: string | null
+    detail?: string
+  }>
+}
+
+export type ExportManufacturesResult = {
+  status: string
+  manufactures_eligible: number
+  manufactures_created: number
+  manufactures_existing: number
+  manufactures_already_linked: number
+  manufactures_error: number
+  payloads: Array<Record<string, unknown>>
+  skipped_rows: Array<Record<string, unknown>>
+  entries: Array<Record<string, unknown>>
+}
+
+export type ExportPieceworkResult = {
+  status: string
+  manufactures_eligible: number
+  manufactures_created: number
+  manufactures_already_linked: number
+  manufactures_error: number
+  payloads: Array<Record<string, unknown>>
+  skipped_rows: Array<Record<string, unknown>>
+  entries: Array<Record<string, unknown>>
+}
+
+export type OrderQuantityPatchResponse = {
+  status: string
+  quantity: number
+  remaining_qty: number
+  mrp_req_net_qty?: number | null
+  mrp_req_covered_qty?: number | null
+  mrp_req_remaining_qty?: number | null
+}
+
+export type OrderStatePatchPayload = {
+  status?: string
+  issue_status?: string
+  workshop_id?: number
+  planned_start_date?: string
+  planned_finish_date?: string
+  comment?: string
+}
+
+export type SyncPostedTransfersResponse = {
+  status: string
+  candidates: number
+  advanced: number
+  errors: string[]
+}
+
+export type ProductionFilters = ProductionOrderFilters
+
 export const productionStatusOptions = [
   ['shortage', 'Дефицит'],
   ['to_move', 'К перемещению'],
@@ -310,16 +422,6 @@ export const coverageLabels: Record<string, string> = {
   produced: 'Готов',
   production_error: 'Ошибка выпуска',
   completed: 'Завершён',
-}
-
-export type ProductionFilters = {
-  search: string
-  status: string
-  workshop_id: string
-  coverage_status: string
-  root_item_id: string
-  sort_by: 'planned_start_date'
-  sort_dir: 'asc' | 'desc'
 }
 
 export function productionStatusLabel(value: string) {

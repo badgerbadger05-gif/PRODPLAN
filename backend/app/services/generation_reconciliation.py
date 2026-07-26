@@ -13,6 +13,7 @@ from typing import Iterable
 from sqlalchemy.orm import Session
 
 from .. import models
+from .item_ledger.reservation import replenishment_remaining
 
 
 class GenerationReconciliationMismatch(RuntimeError):
@@ -59,9 +60,8 @@ def build_generation_targets(
 ) -> dict[tuple[int, str], ReconciliationTarget]:
     """Validate one accepted generation and return proposal sizing targets.
 
-    ``make`` is sized from reservation outstanding (reserved minus realized).
-    ``consume`` is sized from the generation-scoped uncovered projection.  The
-    realization side is the independently folded append-only event stream.
+    ``make`` and ``buy`` are sized from the frozen replenishment obligation.
+    The realization side is the independently folded append-only event stream.
     """
     generation = db.get(models.LedgerGeneration, int(ledger_generation_id))
     if generation is None or str(generation.status or "") != "accepted":
@@ -102,7 +102,7 @@ def build_generation_targets(
     grouped: dict[tuple[int, str], dict[str, Decimal]] = {}
     for entry in entries:
         mode = str(entry.realization_mode or "")
-        if mode not in {"make", "consume", "buy"}:
+        if mode not in {"make", "buy"}:
             raise GenerationReconciliationMismatch(
                 f"reservation {entry.id} has unsupported realization_mode={mode!r}"
             )
@@ -115,19 +115,28 @@ def build_generation_targets(
         key = (int(entry.requirement_id), mode)
         row = grouped.setdefault(
             key,
-            {"reserved": Decimal("0"), "realized": Decimal("0"), "uncovered": Decimal("0")},
+            {
+                "reserved": Decimal("0"),
+                "realized": Decimal("0"),
+                "replenishment_required": Decimal("0"),
+                "replenishment_received": Decimal("0"),
+            },
         )
         row["reserved"] += folded_reserved
         row["realized"] += folded_realized
         if str(entry.lifecycle_status or "") in {"active", "carried"}:
-            row["uncovered"] += max(_d(entry.uncovered_qty), Decimal("0"))
+            row["replenishment_required"] += max(
+                _d(entry.replenishment_required_qty), Decimal("0")
+            )
+            row["replenishment_received"] += max(
+                _d(entry.replenishment_received_qty), Decimal("0")
+            )
 
     targets: dict[tuple[int, str], ReconciliationTarget] = {}
     for key, values in grouped.items():
-        target = (
-            max(values["reserved"] - values["realized"], Decimal("0"))
-            if key[1] == "make"
-            else values["uncovered"]
+        target = replenishment_remaining(
+            values["replenishment_required"],
+            values["replenishment_received"],
         )
         targets[key] = ReconciliationTarget(
             requirement_id=key[0],

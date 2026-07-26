@@ -105,8 +105,6 @@ def _add_buy_run(
         item_id=item.item_id,
         total_required_qty=required_qty,
         net_required_qty=required_qty,
-        covered_qty=Decimal("0"),
-        remaining_qty=required_qty,
         period_from=period_from,
         period_to=period_to,
         bom_level=1,
@@ -128,31 +126,31 @@ def _add_buy_run(
         realization_mode="buy",
         reserved_qty=required_qty,
         realized_qty=realized_qty,
-        covered_incoming_supplier_qty=covered_incoming,
-        covered_incoming_wip_qty=Decimal("0"),
-        uncovered_qty=uncovered,
+        covered_from_stock_at_freeze_qty=Decimal("0"),
+        replenishment_required_qty=required_qty,
+        replenishment_received_qty=realized_qty,
         lifecycle_status="active",
     )
     db.add(reservation)
     db.flush()
-
-    if covered_incoming > Decimal("0"):
-        db.add(
-            models.ReservationCoverage(
-                reservation_id=reservation.id,
-                source_kind="supplier_order",
-                source_ref="supplier-1",
-                source_line_ref="10",
-                pin_kind="incoming",
-                alloc_qty=covered_incoming,
-                covered_qty=covered_incoming,
-                realized_qty=covered_incoming,
-                evaporated_qty=Decimal("0"),
-            )
-        )
+    work_item = models.ReplenishmentWorkItem(
+        ledger_generation_id=generation.id,
+        reservation_id=reservation.id,
+        plan_id=plan.id,
+        run_id=planning_run.run_id,
+        requirement_id=requirement.id,
+        item_id=item.item_id,
+        replenishment_method="buy",
+        replenishment_required_qty=required_qty,
+        replenishment_fulfilled_qty=realized_qty,
+        replenishment_remaining_qty=required_qty - realized_qty,
+    )
+    db.add(work_item)
     db.flush()
 
-    return reservation, planning_run
+    db.flush()
+
+    return reservation, planning_run, work_item
 
 
 def _accept_generation_snapshot(db, generation: models.LedgerGeneration, snapshot: models.PlanningReadSnapshot):
@@ -170,7 +168,7 @@ def _accept_generation_snapshot(db, generation: models.LedgerGeneration, snapsho
 
 def _stale_generation_fixture(db):
     old_generation, item, _supplier = _accepted_generation(db)
-    old_reservation, _old_run = _add_buy_run(
+    old_reservation, _old_run, _old_work_item = _add_buy_run(
         db,
         generation=old_generation,
         item=item,

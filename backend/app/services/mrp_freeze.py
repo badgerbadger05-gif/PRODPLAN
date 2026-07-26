@@ -50,7 +50,6 @@ from ..models import (
     MrpRequirement,
     PlannedPurchase,
     PlanningRun,
-    PlanningTruthState,
     ProductionOrder,
     ProductionPlanHeader,
     ProductionPlanLine,
@@ -70,6 +69,7 @@ from .planning_truth import (
     CAPABILITY_EXECUTION_ALLOCATIONS,
     CAPABILITY_PHYSICAL_LEDGER,
     CAPABILITY_RESERVATION_REPLAY,
+    PlanningTruthUnavailable,
     require_accepted_truth,
 )
 from .one_c_export_common import DEFAULT_ORGANIZATION_REF1C
@@ -115,7 +115,7 @@ class LedgerPoolUnavailable(RuntimeError):
 
 
 # ---------------------------------------------------------------------------
-# §1 — pool key (pragmatic single-pool today; the ONLY place to widen later)
+#  — pool key (pragmatic single-pool today; the ONLY place to widen later)
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class PoolKey:
@@ -141,7 +141,7 @@ def pool_key_for(
 
 
 # ---------------------------------------------------------------------------
-# §2 — shared structures
+#  — shared structures
 # ---------------------------------------------------------------------------
 @dataclass
 class FreezeSharedPools:
@@ -185,7 +185,7 @@ class FreezeTrace:
 
 
 # ---------------------------------------------------------------------------
-# §3 — self-exclusion sets (built BEFORE the pools)
+#  — self-exclusion sets (built BEFORE the pools)
 # ---------------------------------------------------------------------------
 def _own_wip_product_ids(db: Session, active_run_ids: Iterable[int]) -> Set[int]:
     """Product ids of a run's OWN materialised production — orders that EXECUTE
@@ -232,7 +232,7 @@ def _own_supplier_order_ids(db: Session, active_run_ids: Iterable[int]) -> Set[i
 
     A successful ``planned_purchase → Document_ЗаказПоставщику`` sync-link is own
     when its source PlannedPurchase's run is active. If the source PlannedPurchase
-    row is gone (deleted), the order is excluded by default (§15.1: prefer a small
+    row is gone (deleted), the order is excluded by default (: prefer a small
     over-order to a phantom double-credit; the run_id debt is tracked upstream).
     """
     active_set = {int(r) for r in active_run_ids}
@@ -332,7 +332,7 @@ def _apply_mrp_warehouse_scope(
 
 
 # ---------------------------------------------------------------------------
-# §3 — pool construction (ONCE for the whole queue)
+#  — pool construction (ONCE for the whole queue)
 # ---------------------------------------------------------------------------
 def build_shared_pools(
     db: Session,
@@ -562,7 +562,7 @@ def _reject_legacy_future_supply(
 
 
 # ---------------------------------------------------------------------------
-# §7 — freeze-table writers (per-run, per-version, frozen_at=now)
+#  — freeze-table writers (per-run, per-version, frozen_at=now)
 # ---------------------------------------------------------------------------
 def _write_freeze_baseline(
     db: Session,
@@ -577,9 +577,9 @@ def _write_freeze_baseline(
 ) -> int:
     """Frozen supply position per pool for every item with gross > 0.
 
-    ``stock_qty`` = S0 (equal across every run of the pool = pool anchor v2 §6).
+    ``stock_qty`` = S0 (equal across every run of the pool = pool anchor v2 ).
     ``produced_total`` / ``received_total`` = cumulative facts (kept for later
-    Δ), stamped identically for every run. ``unit_coef`` = 1.0 (§15.2 risk).
+    Δ), stamped identically for every run. ``unit_coef`` = 1.0 ( risk).
     """
     if not item_ids:
         return 0
@@ -799,7 +799,7 @@ def _write_freeze_component(
 
 
 # ---------------------------------------------------------------------------
-# §6 — orchestrator
+#  — orchestrator
 # ---------------------------------------------------------------------------
 def _to_float(value: Any) -> float:
     try:
@@ -859,11 +859,22 @@ def freeze_candidate_snapshots(
     requested_ids = sorted({int(value) for value in candidate_run_ids})
     if not requested_ids:
         raise LedgerPoolUnavailable("candidate freeze requires candidate run ids")
+    try:
+        readiness = require_accepted_truth(
+            db, consumer="mrp_freeze.candidate", required_capabilities=MRP_REQUIRED_CAPABILITIES
+        )
+    except PlanningTruthUnavailable as exc:
+        reason = getattr(exc.readiness, "reason", None) or str(exc)
+        raise LedgerPoolUnavailable(
+            "candidate freeze parent is not the current accepted Ledger generation: "
+            f"{reason}"
+        ) from exc
+    if int(readiness.ledger_generation or 0) != parent_id:
+        raise LedgerPoolUnavailable("candidate freeze parent is not the current accepted Ledger generation")
 
     parent = db.get(LedgerGeneration, parent_id)
     target = db.get(LedgerGeneration, target_id)
-    truth = db.get(PlanningTruthState, 1)
-    if parent is None or str(parent.status) != "accepted" or truth is None or int(truth.current_generation_id or 0) != parent_id:
+    if parent is None or str(parent.status) != "accepted":
         raise LedgerPoolUnavailable("candidate freeze parent is not the current accepted Ledger generation")
     if target is None or str(target.status) != "building":
         raise LedgerPoolUnavailable("candidate freeze target must be a BUILDING Ledger generation")
@@ -1072,7 +1083,7 @@ def freeze_candidate_snapshots(
         ).all()
         # Oldest plan first: receipts against a shared supply line are
         # attributed to the senior retained claim before anything is left for
-        # the new candidate (decisions-log §2.5/§2.6 FIFO discipline).
+        # the new candidate (decisions-log / FIFO discipline).
         retained_order = {
             int(run_id): index for index, run_id in enumerate(retained_run_ids)
         }
@@ -1163,7 +1174,11 @@ def freeze_candidate_snapshots(
     materialize_reservations_for_freeze(
         db, requested_ids, ledger_generation_id=target_id,
     )
-    if int(db.get(PlanningTruthState, 1).current_generation_id or 0) != parent_id:
+    try:
+        readiness = require_accepted_truth(db, "candidate freeze")
+    except PlanningTruthUnavailable as exc:
+        raise LedgerPoolUnavailable("accepted Ledger pointer changed during candidate freeze") from exc
+    if int(readiness.generation_id or 0) != parent_id:
         raise LedgerPoolUnavailable("accepted Ledger pointer changed during candidate freeze")
     # The refresh coordinator owns the outer atomic transaction: this executor
     # deliberately exposes its writes with flush but never commits or rolls
@@ -1227,8 +1242,18 @@ def _root_item_ids_for_plans(db: Session, plan_ids: Set[int]) -> Set[int]:
 
 
 def _latest_active_snapshot_run_ids(db: Session) -> List[int]:
-    """Latest FIXED_SNAPSHOT run per open plan. Delegates to the reconciliation
-    helper (single source of truth); imported locally to avoid a module cycle."""
-    from .mrp_reconciliation import _latest_active_snapshot_run_ids as _impl
+    """All fixed plan runs bound to the exact accepted Ledger generation."""
+    from .planning_truth import require_accepted_truth
 
-    return list(_impl(db))
+    truth = require_accepted_truth(db, consumer="mrp_freeze")
+    rows = (
+        db.query(PlanningRun.run_id)
+        .filter(
+            PlanningRun.status == "FIXED_SNAPSHOT",
+            PlanningRun.ledger_generation_id == int(truth.generation_id),
+            PlanningRun.source_plan_id.isnot(None),
+        )
+        .order_by(PlanningRun.run_id.asc())
+        .all()
+    )
+    return [int(run_id) for (run_id,) in rows if run_id is not None]

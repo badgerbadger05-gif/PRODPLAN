@@ -22,7 +22,10 @@ from app.models import (
     ProductionResource,
     ProductionStage,
     ResourceProductionKind,
+    PhysicalImportBatch,
+    LedgerGeneration,
 )
+from app.services.planning_truth import publish_generation
 
 from app.services.order_quantity_calculator import OrderQuantityCalculator
 from app.services.planning_service import (
@@ -51,6 +54,30 @@ def _mk_run(db, snapshot=None) -> PlanningRun:
     db.add(run)
     db.flush()
     return run
+
+
+def _publish_empty_ledger(db, key: str) -> None:
+    cutoff = datetime.datetime(
+        2026, 7, 26, tzinfo=datetime.timezone.utc
+    )
+    batch = PhysicalImportBatch(
+        batch_key=f"{key}-batch",
+        status="completed",
+        cutoff=cutoff,
+        source_watermarks={"explicit_empty_prefix": True},
+    )
+    generation = LedgerGeneration(
+        generation_key=f"{key}-generation",
+        status="accepted",
+        cutoff=cutoff,
+        accepted_at=cutoff,
+        physical_import_batch=batch,
+        algorithm_version="tests/empty-ledger",
+        source_watermarks={"explicit_empty_prefix": True},
+        capabilities={"physical_ledger": True},
+    )
+    publish_generation(db, generation)
+    db.flush()
 
 
 def test_parent_can_be_falsely_blocked_when_component_stock_missing_in_cache(db_session):
@@ -623,6 +650,7 @@ def test_turning_item_net_requirement_collapses_to_first_need_date_and_moves_bla
     )
     db.commit()
 
+    _publish_empty_ledger(db, "turning-collapse")
     result = compute_planning_preview(
         db,
         horizon_days=20,
@@ -714,6 +742,7 @@ def test_bom_explosion_shifts_child_need_date_by_parent_lead_time(db_session):
     db.add(ProductionPlanEntry(item_id=top.item_id, date=top_need, planned_qty=1))
     db.commit()
 
+    _publish_empty_ledger(db, "buffer-shift")
     result = compute_planning_preview(
         db,
         horizon_days=60,
@@ -771,6 +800,7 @@ def test_non_turning_item_keeps_requirement_buckets(db_session):
     )
     db.commit()
 
+    _publish_empty_ledger(db, "regular-phasing")
     result = compute_planning_preview(
         db,
         horizon_days=20,
@@ -1440,4 +1470,3 @@ def test_control_run_keeps_production_orders_identical_with_purchase_and_rework_
     ]
     assert db.query(PlannedPurchase).filter(PlannedPurchase.run_id == mixed_run.run_id).count() == 1
     assert db.query(PlannedRework).filter(PlannedRework.run_id == mixed_run.run_id).count() == 1
-

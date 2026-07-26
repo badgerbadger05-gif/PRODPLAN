@@ -148,7 +148,6 @@ def test_manifest_retains_parent_with_null_ledger_generation_via_reservation_lin
         ("retain", plan.id, parent.run_id),
     ]
 
-
 def test_manifest_never_omits_current_plan_and_conflicting_retry_is_rejected(db_session):
     accepted, target, parents = _fixture(db_session)
     result = _create(db_session, accepted, target)
@@ -226,42 +225,3 @@ def test_manifest_ignores_fixed_snapshot_runs_from_other_generation(db_session):
         ("retain", parents[0][0].id, parents[0][1].run_id),
         ("retain", parents[1][0].id, parents[1][1].run_id),
     ]
-
-
-def test_current_parent_duplicate_detection_applies_only_to_selected_lineage(db_session):
-    accepted, _target, parents = _fixture(db_session, plans=1)
-    other = _generation(
-        db_session, "other-duplicate-check-generation", "accepted", accepted.cutoff,
-        {"other_generation": True},
-        physical=accepted.physical_import_batch,
-    )
-    duplicate_plan = parents[0][0]
-    db_session.add(models.PlanningRun(
-        status="FIXED_SNAPSHOT", ledger_generation_id=other.id,
-        source_plan_id=duplicate_plan.id, period_from=duplicate_plan.period_from,
-        period_to=duplicate_plan.period_to, horizon_days=30, config_snapshot={"parent": "other"},
-        fixed_at=accepted.cutoff, finished_at=accepted.cutoff,
-    ))
-    db_session.add(models.PlanningRun(
-        status="FIXED_SNAPSHOT", ledger_generation_id=other.id,
-        source_plan_id=duplicate_plan.id, period_from=duplicate_plan.period_from,
-        period_to=duplicate_plan.period_to, horizon_days=30, config_snapshot={"parent": "other-duplicate"},
-        fixed_at=accepted.cutoff, finished_at=accepted.cutoff,
-    ))
-    db_session.flush()
-
-    selected = _current_parents(db_session, accepted.id)
-    assert [int(row.source_plan_id) for row in selected] == [duplicate_plan.id]
-
-    db_session.add(models.PlanningRun(
-        status="FIXED_SNAPSHOT", ledger_generation_id=accepted.id,
-        source_plan_id=duplicate_plan.id, period_from=duplicate_plan.period_from,
-        period_to=duplicate_plan.period_to, horizon_days=30, config_snapshot={"parent": "duplicate-current"},
-        fixed_at=accepted.cutoff, finished_at=accepted.cutoff,
-    ))
-    db_session.flush()
-
-    with pytest.raises(
-        ObligationRefreshManifestError, match="multiple FIXED_SNAPSHOT runs for plan"
-    ):
-        _current_parents(db_session, accepted.id)

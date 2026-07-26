@@ -53,12 +53,11 @@ export function updatePeriodPlanHeader(
   })
 }
 
-export function archivePeriodPlan(planId: number) {
-  return api<PeriodPlan>(`/v1/plan/period-plans/${planId}/archive`, { method: 'POST' })
-}
-
-export function unarchivePeriodPlan(planId: number) {
-  return api<PeriodPlan>(`/v1/plan/period-plans/${planId}/unarchive`, { method: 'POST' })
+export function closePeriodPlanRun(runId: number) {
+  return api<{ status: string; run_id: number }>(
+    `/v1/plan/mrp/run/${runId}/close`,
+    { method: 'POST', body: JSON.stringify({ dry_run: false }) },
+  )
 }
 
 export function listPeriodPlanRuns(planId: number, limit = 50) {
@@ -128,24 +127,4 @@ export type ReconcileResult = {
   production_added: { item_id: number; item_code?: string; qty: number }[]
   purchase_added: { item_id: number; item_code?: string; qty: number }[]
   rescheduled?: { floating: number; fixed: number; warnings: unknown[] }
-}
-
-// Пересчёт остаточной потребности по снимку: добор недопокрытия (заказы в
-// журнал, строки закупок) + перепланировка ещё не открытых в 1С заказов от
-// сегодня. В 1С ничего не пишется — только по кнопке пользователя.
-export function reconcileRun(runId: number) {
-  return api<ReconcileResult>(`/v1/plan/results/${runId}/reconcile`, {
-    method: 'POST',
-    body: JSON.stringify({ dry_run: false }),
-  })
-}
-
-export function createProductionOrdersFromRequirements(requirementIds: number[], initiatedBy = 'erp-shell') {
-  return api<{ status: string; created: unknown[]; reused: unknown[]; skipped: unknown[]; errors: string[] }>(
-    '/v1/production-control/orders/from-mrp-requirements',
-    {
-      method: 'POST',
-      body: JSON.stringify({ requirement_ids: requirementIds, initiated_by: initiatedBy }),
-    },
-  )
 }

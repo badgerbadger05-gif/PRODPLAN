@@ -91,40 +91,6 @@ def _order_refs_by_recorder(db: Session) -> dict[str, set[str]]:
     return result
 
 
-def _linked_product_ids_by_recorder(
-    db: Session,
-    ledger_generation_id: int,
-) -> dict[str, set[int]]:
-    """Return only line-exact manufacture document links.
-
-    ``material_issue`` links are component transfers, not finished-product
-    evidence.  Treating them as make would conflate assembly with transfer.
-    ``transfer_in`` can still use the guarded order-ref route below.
-    """
-    links = db.query(models.SyncLink).filter(
-        models.SyncLink.source_system == "PRODPLAN",
-        models.SyncLink.status == _SUCCESS,
-        models.SyncLink.source_doctype == "manufacture",
-        models.SyncLink.target_entity == "Document_СборкаЗапасов",
-        models.SyncLink.target_ref_key.isnot(None),
-        models.SyncLink.ledger_generation_id == int(ledger_generation_id),
-    ).all()
-    ids = {int(link.source_id) for link in links if _text(link.target_ref_key)}
-    product_by_manufacture = {
-        int(manufacture_id): int(product_id)
-        for manufacture_id, product_id in db.query(
-            models.ProductionManufacture.manufacture_id,
-            models.ProductionManufacture.product_id,
-        ).filter(models.ProductionManufacture.manufacture_id.in_(ids)).all()
-    } if ids else {}
-    result: dict[str, set[int]] = defaultdict(set)
-    for link in links:
-        product_id = product_by_manufacture.get(int(link.source_id))
-        if product_id is not None:
-            result[_text(link.target_ref_key)].add(product_id)
-    return result
-
-
 def collect_wip_future_supply_evidence(
     db: Session,
     ledger_generation_id: int,
@@ -155,7 +121,7 @@ def collect_wip_future_supply_evidence(
                 int(product.product_id)
             )
 
-    direct_links = _linked_product_ids_by_recorder(db, generation.id)
+    direct_links: dict[str, set[int]] = {}
     order_refs = _order_refs_by_recorder(db)
     realized: dict[int, Decimal] = defaultdict(Decimal)
     invalid_reasons: dict[int, set[str]] = defaultdict(set)

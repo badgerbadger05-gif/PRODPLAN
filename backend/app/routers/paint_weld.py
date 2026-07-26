@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from ..database import get_db
 from ..services import paint_weld_pairs as service
+from ..services import planning_truth
 from ..services.paint_weld_chain import close_paint_chain, open_paint_chain
 
 router = APIRouter(prefix="/v1/paint-weld", tags=["paint-weld"])
@@ -94,7 +95,10 @@ async def guard(
     qty: float,
     db: Session = Depends(get_db),
 ):
-    return service.guard_paint_order(db, int(painted_item_id), float(qty))
+    try:
+        return service.guard_paint_order(db, int(painted_item_id), float(qty))
+    except planning_truth.PlanningTruthUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.as_dict())
 
 
 @router.post("/chain/preview", response_model=dict)
@@ -139,8 +143,8 @@ async def chain_open(payload: ChainOpenPayload, db: Session = Depends(get_db)):
 @router.post("/chain/close", response_model=dict)
 async def chain_close(payload: ChainClosePayload, db: Session = Depends(get_db)):
     """Закрыть цепочку «окраска↔сварка» одним действием: выпуски обеих строк,
-    СборкаЗапасов обоих заказов и один комбинированный сдельный наряд,
-    закрывающий оба заказа. dry_run=true — предпросмотр."""
+    СборкаЗапасов обоих заказов и один комбинированный СдельныйНаряд, закрывающий
+    оба заказа. dry_run=true — предпросмотр."""
     try:
         return close_paint_chain(
             db,

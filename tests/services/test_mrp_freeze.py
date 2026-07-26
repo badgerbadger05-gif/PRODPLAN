@@ -128,7 +128,11 @@ def _world(db, demands, *, root=None, stock=None, future=None):
         status="accepted",
         cutoff=CUTOFF,
         source_watermarks={},
-        capabilities={"physical_ledger": True},
+        capabilities={
+            "physical_ledger": True,
+            "reservation_replay": True,
+            "execution_allocations": True,
+        },
         physical_import_batch=physical,
         algorithm_version="tests",
         accepted_at=CUTOFF,
@@ -330,7 +334,15 @@ def test_freeze_uses_target_stockbin_not_legacy_item_stock_qty(db_session):
 
     _freeze(db_session, accepted, target, candidates)
 
-    assert float(_req(db_session, candidates[0], item).initial_snapshot_stock) == pytest.approx(4)
+    reservation = (
+        db_session.query(models.ReservationEntry)
+        .filter_by(
+            ledger_generation_id=target.id,
+            requirement_id=_req(db_session, candidates[0], item).id,
+        )
+        .one()
+    )
+    assert float(reservation.covered_from_stock_at_freeze_qty) == pytest.approx(4)
     assert _purchase(db_session, candidates[0], item) == pytest.approx(6)
 
 
@@ -396,7 +408,7 @@ def test_candidate_freeze_rejects_stale_parent_pointer(db_session):
         db_session, [2], root=item
     )
     db_session.get(models.PlanningTruthState, 1).current_generation_id = target.id
-    with pytest.raises(LedgerPoolUnavailable, match="current accepted"):
+    with pytest.raises(LedgerPoolUnavailable, match="accepted Ledger required"):
         _freeze(db_session, accepted, target, candidates)
     assert db_session.query(models.MrpRequirement).count() == 0
 

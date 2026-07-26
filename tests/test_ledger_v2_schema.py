@@ -1,7 +1,7 @@
-"""Schema test for MRP execution ledger v2 (Increment 1, additive only).
+"""Schema test for the additive MRP execution-ledger schema.
 
 Creates one minimal row in each new ledger table and asserts server-side
-defaults apply (drift_adjustment_qty==0, realized/evaporated==0, matured==False,
+defaults apply ( realized/evaporated==0, matured==False,
 etc.). No business logic is exercised — only defaults from create_all + insert.
 """
 
@@ -61,7 +61,7 @@ def test_mrp_requirement_v2_column_defaults(db_session):
 
     # New MrpRequirement pool/freeze columns default correctly.
     assert req.freeze_version is None
-    assert float(req.drift_adjustment_qty) == 0
+    assert not hasattr(req, "drift_adjustment_qty")
     assert req.characteristic_ref is None
     assert req.organization_ref is None
     assert req.planning_stock_pool is None
@@ -115,77 +115,6 @@ def test_freeze_component_defaults(db_session):
     assert row.spec_version is None
     assert float(row.norm_qty_per_unit) == 0
     assert float(row.unit_coef) == 1
-
-
-def test_execution_allocation_defaults(db_session):
-    _item, _run, req = _mk_item_run_req(db_session)
-    generation = _generation(db_session)
-    row = models.MrpExecutionAllocation(
-        ledger_generation_id=generation.id,
-        requirement_id=req.id,
-    )
-    db_session.add(row)
-    db_session.commit()
-    db_session.refresh(row)
-
-    assert row.cycle_id == ""
-    assert row.fact_type == ""
-    assert row.allocation_kind == ""
-    assert row.fact_ref == ""
-    assert row.fact_line_ref == ""
-    assert float(row.allocated_qty) == 0
-    assert row.bucket_id is None
-    assert row.freeze_allocation_id is None
-    assert row.origin_requirement_id is None
-    assert row.calculated_at is not None
-
-
-def test_requirement_carry_defaults(db_session):
-    item, _run, req = _mk_item_run_req(db_session)
-    row = models.MrpRequirementCarry(
-        source_requirement_id=req.id, target_requirement_id=req.id, item_id=item.item_id,
-    )
-    db_session.add(row)
-    db_session.commit()
-    db_session.refresh(row)
-
-    assert float(row.carried_qty) == 0
-    assert row.carried_at is None
-    assert row.operator is None
-    assert row.source_run_id is None
-    assert row.target_run_id is None
-
-
-def test_drift_event_defaults(db_session):
-    item, _run, _req = _mk_item_run_req(db_session)
-    row = models.MrpDriftEvent(item_id=item.item_id)
-    db_session.add(row)
-    db_session.commit()
-    db_session.refresh(row)
-
-    assert row.cycle_id == ""
-    assert row.kind == ""
-    assert float(row.drift_qty) == 0
-    assert row.expected_stock is None
-    assert row.actual_stock is None
-    assert row.matured is False
-    assert row.first_seen_cycle_id is None
-    assert row.requirement_id is None
-    assert row.details is None
-    assert row.ledger_generation_id is None
-
-
-def test_drift_event_accepts_generation_lineage(db_session):
-    generation = _generation(db_session)
-    item, _run, _req = _mk_item_run_req(db_session)
-    row = models.MrpDriftEvent(
-        ledger_generation_id=generation.id,
-        item_id=item.item_id,
-    )
-    db_session.add(row)
-    db_session.commit()
-    db_session.refresh(row)
-    assert row.ledger_generation_id == generation.id
 
 
 def test_ledger_build_batch_accepts_reservation_materialize_stage(db_session):

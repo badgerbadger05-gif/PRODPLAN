@@ -9,10 +9,11 @@ Painting specs with 0 or >1 'Сборка' are reported as unpaired (not blocked
 """
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 
 import pytest
 
+from app import models
 from app.models import (
     DefaultSpecification,
     Item,
@@ -318,10 +319,26 @@ def _open_weld_order(db, predecessor: Item, remaining: float):
     return order
 
 
-def test_guard_stock_covers(db_session):
+def _publish_stock(db, generation, item_id: int, quantity: float) -> None:
+    db.add(
+        models.StockBin(
+            ledger_generation_id=generation.id,
+            item_id=item_id,
+            warehouse_ref1c="guard-main",
+            on_hand=quantity,
+        )
+    )
+    generation.status = "accepted"
+    generation.cutoff = datetime(2026, 7, 26)
+    generation.accepted_at = datetime(2026, 7, 26)
+    pointer = db.get(models.PlanningTruthState, 1)
+    pointer.current_generation_id = generation.id
+    db.flush()
+
+
+def test_guard_stock_covers(db_session, building_ledger_generation):
     painted, predecessor, _s = _painted_with_predecessor(db_session, "G1")
-    predecessor.stock_qty = 10
-    db_session.flush()
+    _publish_stock(db_session, building_ledger_generation, predecessor.item_id, 10)
     rebuild_auto_pairs(db_session)
 
     result = guard_paint_order(db_session, painted.item_id, qty=5)
@@ -330,19 +347,21 @@ def test_guard_stock_covers(db_session):
     assert result["stock_qty"] == pytest.approx(10.0)
 
 
-def test_guard_order_open(db_session):
+def test_guard_order_open(db_session, building_ledger_generation):
     painted, predecessor, _s = _painted_with_predecessor(db_session, "G2")
     rebuild_auto_pairs(db_session)
     _open_weld_order(db_session, predecessor, remaining=8)
+    _publish_stock(db_session, building_ledger_generation, predecessor.item_id, 0)
 
     result = guard_paint_order(db_session, painted.item_id, qty=5)
     assert result["verdict"] == "order_open"
     assert result["open_orders"][0]["remaining"] == pytest.approx(8.0)
 
 
-def test_guard_need_weld(db_session):
+def test_guard_need_weld(db_session, building_ledger_generation):
     painted, predecessor, _s = _painted_with_predecessor(db_session, "G3")
     rebuild_auto_pairs(db_session)
+    _publish_stock(db_session, building_ledger_generation, predecessor.item_id, 0)
 
     result = guard_paint_order(db_session, painted.item_id, qty=5)
     assert result["verdict"] == "need_weld"

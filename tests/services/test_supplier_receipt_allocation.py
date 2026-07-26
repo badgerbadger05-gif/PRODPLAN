@@ -61,6 +61,8 @@ def _reservation(reservation_id, req_id, qty, *, run_id=1, due=1):
         priority_period_to=datetime.date(2026, 7, due),
         realization_mode="buy",
         reserved_qty=Decimal(str(qty)),
+        replenishment_required_qty=Decimal(str(qty)),
+        replenishment_received_qty=Decimal("0"),
         realized_qty=Decimal("0"),
     )
 
@@ -323,6 +325,8 @@ def _persistence_fixture(
             priority_period_to=req.period_to,
             realization_mode="buy",
             reserved_qty=Decimal("5"),
+            replenishment_required_qty=Decimal("5"),
+            replenishment_received_qty=Decimal("0"),
             realized_qty=Decimal("0"),
         ),
         models.MrpFreezeAllocation(
@@ -477,7 +481,7 @@ def test_duplicate_order_lines_with_different_characteristics_remain_ambiguous(d
     ).one()
     assert provenance.match_status == "ambiguous"
     assert provenance.ambiguity_count == 2
-    assert result.unplanned_qty == Decimal("0")
+    assert result.surplus_qty == Decimal("0")
 
 
 def test_historical_receipt_falls_back_through_synced_purchase_requirement(
@@ -532,21 +536,15 @@ def test_historical_receipt_falls_back_through_synced_purchase_requirement(
             target_ref_key="order-1",
             status="success",
         ),
-        models.ReservationEntry(
-            ledger_generation_id=generation.id,
-            item_id=req.item_id,
-            characteristic_ref="",
-            organization_ref="",
-            planning_stock_pool="default",
-            run_id=req.run_id,
-            freeze_version=1,
-            requirement_id=req.id,
-            priority_period_from=req.period_from,
-            priority_period_to=req.period_to,
-            realization_mode="consume",
-            reserved_qty=5,
-        ),
     ])
+    reservation = db_session.query(models.ReservationEntry).filter_by(
+        ledger_generation_id=generation.id,
+        requirement_id=req.id,
+    ).one()
+    reservation.realization_mode = "buy"
+    reservation.reserved_qty = 5
+    reservation.replenishment_required_qty = 5
+    reservation.replenishment_received_qty = 0
     db_session.commit()
 
     result = rebuild_supplier_receipt_coverage(
@@ -599,7 +597,7 @@ def test_duplicate_order_lines_persist_ambiguity_without_allocation(db_session):
     ).one()
     assert provenance.match_status == "ambiguous"
     assert provenance.ambiguity_count == 2
-    assert result.unplanned_qty == Decimal("0")
+    assert result.surplus_qty == Decimal("0")
 
 
 def test_direct_receipt_is_persisted_unmatched_and_counted_unplanned(db_session):
@@ -624,7 +622,7 @@ def test_direct_receipt_is_persisted_unmatched_and_counted_unplanned(db_session)
     ).one()
     assert provenance.match_status == "unmatched"
     assert result.exact_fact_count == 0
-    assert result.unplanned_qty == Decimal("0")
+    assert result.surplus_qty == Decimal("0")
 
 
 def test_persistence_rerun_is_idempotent(db_session):
@@ -744,16 +742,38 @@ def test_rebuild_preserves_other_generation_rows(db_session):
         run_id=other_run.run_id
     ).one()
     other_generation_id = int(other_run.ledger_generation_id)
-    db_session.add(models.MrpExecutionAllocation(
-        ledger_generation_id=other_generation_id,
-        cycle_id="other",
-        requirement_id=other_req.id,
-        fact_type="supplier_receipt",
-        allocation_kind="execution",
-        fact_ref="other",
-        fact_line_ref="1",
-        allocated_qty=Decimal("1"),
-    ))
+    other_sle = models.StockLedgerEntry(
+        ingest_batch_id=generation.physical_import_batch_id,
+        source_content_hash="z" * 64,
+        item_id=other_req.item_id,
+        qty=Decimal("10"),
+        posting_at=datetime.datetime(2026, 7, 4),
+        record_type="Receipt",
+        movement_kind="receipt",
+        recorder_type="Document_Receipt",
+        recorder_ref="other-doc",
+        line_no="1",
+    )
+    db_session.add(other_sle)
+    db_session.add(
+        models.StockLedgerSupplierReceiptProvenance(
+            ledger_generation_id=other_generation_id,
+            stock_ledger_entry=other_sle,
+            receipt_doc_type="Document_Receipt",
+            receipt_doc_ref="other-doc",
+            receipt_doc_line_no="1",
+            supplier_order_ref="other-order",
+            supplier_order_line_no="1",
+            operation_kind="supplier_receipt",
+            operation_key=RECEIPT_OPERATION,
+            operation_name="Приобретение у поставщика",
+            match_rule="1c-base-document-line",
+            match_status="exact",
+            ambiguity_count=0,
+            evidence_hash="0" * 64,
+            evidence_payload={"signed_qty": "1"},
+        )
+    )
     db_session.commit()
     rebuild_supplier_receipt_coverage(
         db_session,
@@ -762,8 +782,8 @@ def test_rebuild_preserves_other_generation_rows(db_session):
         cycle_id="test",
     )
     db_session.commit()
-    assert db_session.query(models.MrpExecutionAllocation).filter_by(
-        ledger_generation_id=other_generation_id
+    assert db_session.query(models.StockLedgerSupplierReceiptProvenance).filter_by(
+        ledger_generation_id=other_generation_id,
     ).count() == 1
 
 
@@ -781,7 +801,7 @@ def test_failure_after_delete_rolls_back_savepoint_and_preserves_projection(
     before_provenance = db_session.query(
         models.StockLedgerSupplierReceiptProvenance
     ).count()
-    before_allocations = db_session.query(models.MrpExecutionAllocation).count()
+    before_events = len(_supplier_event_rows(db_session, generation.id))
 
     def injected_failure(*_args, **_kwargs):
         raise RuntimeError("injected after destructive deletes")
@@ -797,9 +817,7 @@ def test_failure_after_delete_rolls_back_savepoint_and_preserves_projection(
     assert db_session.query(
         models.StockLedgerSupplierReceiptProvenance
     ).count() == before_provenance
-    assert db_session.query(
-        models.MrpExecutionAllocation
-    ).count() == before_allocations
+    assert len(_supplier_event_rows(db_session, generation.id)) == before_events
 
 
 def test_normalized_evidence_is_flushed_before_supplier_fifo(

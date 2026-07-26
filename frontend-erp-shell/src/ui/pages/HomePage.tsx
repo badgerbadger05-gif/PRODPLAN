@@ -80,6 +80,9 @@ export function HomePage() {
             <h2>Рабочие разделы</h2>
             <div className="homeActions">
               <button className="primary" onClick={() => navigate('/period-plan')}>Планирование выпуска</button>
+              <button onClick={() => navigate('/assembly-queue')}>Очередь сборки</button>
+              <button onClick={() => navigate('/drum')}>Барабан</button>
+              <button onClick={() => navigate('/shelves')}>Полки</button>
               <button onClick={() => navigate('/production-control')}>Журнал заказов</button>
               <button onClick={() => navigate('/production-report-week')}>Выпуск недельный</button>
               <button onClick={() => navigate('/mrp-runs')}>MRP прогоны</button>

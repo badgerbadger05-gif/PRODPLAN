@@ -5,7 +5,6 @@ import { planningStatusLabel } from '../../domain/planning'
 import { downloadBase64File } from '../../lib/download'
 import { dateRu, dateTimeRu, qty } from '../../lib/format'
 import {
-  createProductionControlOrdersFromMrp,
   exportPlanningResultProduction,
   exportPlanningResultPurchases,
   exportPlanningResultRework,
@@ -89,7 +88,6 @@ export function MrpResultPage() {
   const [draftDateTo, setDraftDateTo] = useState('')
   const [loading, setLoading] = useState(false)
   const [exporting, setExporting] = useState(false)
-  const [selectedProductionIds, setSelectedProductionIds] = useState<Set<number>>(new Set())
   const [selectedPurchaseIds, setSelectedPurchaseIds] = useState<Set<number>>(new Set())
   const [purchaseSupplierFilter, setPurchaseSupplierFilter] = useState('')
   const [purchaseCategoryFilter, setPurchaseCategoryFilter] = useState('')
@@ -136,7 +134,7 @@ export function MrpResultPage() {
   const activeRowsLength = tab === 'production' ? productionRows.length : tab === 'purchases' ? purchaseRows.length : tab === 'rework' ? reworkRows.length : capacityRows.length
   const activeVisibleFrom = activeTotal && activeRowsLength ? activeOffset + 1 : 0
   const activeVisibleTo = activeTotal && activeRowsLength ? Math.min(activeOffset + activeRowsLength, activeTotal) : 0
-  const selectedCount = tab === 'production' ? selectedProductionIds.size : tab === 'purchases' ? selectedPurchaseIds.size : 0
+  const selectedCount = tab === 'purchases' ? selectedPurchaseIds.size : 0
 
   const totals = useMemo(() => ({
     productionQty: productionRows.reduce((sum, row) => sum + Number(row.qty || 0), 0),
@@ -206,7 +204,6 @@ export function MrpResultPage() {
     setPurchaseTotal(0)
     setReworkTotal(0)
     setCapacityTotal(0)
-    setSelectedProductionIds(new Set())
     setSelectedPurchaseIds(new Set())
     setPurchaseSupplierFilter('')
     setPurchaseCategoryFilter('')
@@ -257,29 +254,6 @@ export function MrpResultPage() {
           ? await exportPlanningResultPurchases(runId, params)
           : await exportPlanningResultRework(runId, params)
       downloadBase64File(response, `mrp_${tab}_${runId}.${format}`)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setExporting(false)
-    }
-  }
-
-  async function createSelectedProductionOrders() {
-    if (!selectedProductionIds.size) return
-    setExporting(true)
-    setError('')
-    setMessage('')
-    try {
-      const result = await createProductionControlOrdersFromMrp({
-        run_id: runId,
-        date_from: dateFrom || undefined,
-        date_to: dateTo || undefined,
-        planned_order_ids: Array.from(selectedProductionIds),
-      })
-      setSelectedProductionIds(new Set())
-      await loadSummary()
-      await loadTab('production', offsets.production)
-      setMessage(formatActionResult('Создание заказов', result))
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -362,7 +336,6 @@ export function MrpResultPage() {
           <button onClick={() => navigate('/mrp-runs')}>К списку прогонов</button>
           <button onClick={() => { void loadSummary(); refreshActiveTab() }} disabled={loading}>Обновить</button>
           {tab !== 'capacity' && <button onClick={() => void exportActive('xlsx')} disabled={loading || exporting}>XLSX</button>}
-          {tab === 'production' && <button className="primary" onClick={() => void createSelectedProductionOrders()} disabled={!selectedProductionIds.size || loading || exporting}>Создать заказы ({selectedProductionIds.size})</button>}
           {tab === 'purchases' && <button className="primary" onClick={() => void exportSelectedPurchasesTo1C()} disabled={!selectedPurchaseIds.size || loading || exporting}>Выгрузить в 1С ({selectedPurchaseIds.size})</button>}
           <div className="barSeparator" />
           <button onClick={() => setRootDialogOpen(true)}>Корневое изделие</button>
@@ -399,7 +372,7 @@ export function MrpResultPage() {
         </div>
 
         <div className="tablePane resultTablePane">
-          {tab === 'production' && <ProductionResultTable rows={productionRows} selectedIds={selectedProductionIds} highlightedId={highlightedProductionId} onSelectedIdsChange={setSelectedProductionIds} />}
+          {tab === 'production' && <ProductionResultTable rows={productionRows} highlightedId={highlightedProductionId} />}
           {tab === 'purchases' && (
             <PurchaseResultTable
               rows={filteredPurchaseRows}
@@ -476,36 +449,18 @@ function rowOrderIds(row: MrpProductionRow) {
   return row.source_order_ids?.length ? row.source_order_ids : [row.order_id]
 }
 
-function isProductionRowSelectable(row: MrpProductionRow) {
-  return Number(row.qty || 0) > 0
-}
-
 function rowPurchaseIds(row: MrpPurchaseRow) {
   return row.source_purchase_ids?.length ? row.source_purchase_ids : [row.purchase_id]
 }
 
-function ProductionResultTable({ rows, selectedIds, highlightedId, onSelectedIdsChange }: {
+function ProductionResultTable({ rows, highlightedId }: {
   rows: MrpProductionRow[]
-  selectedIds: Set<number>
   highlightedId: number | null
-  onSelectedIdsChange: (ids: Set<number>) => void
 }) {
-  const visibleIds = rows.filter(isProductionRowSelectable).flatMap(rowOrderIds)
-  const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id))
-
   return (
     <table className="journalTable resultTable">
       <thead>
         <tr>
-          <th className="checkCol">
-            <input
-              type="checkbox"
-              checked={allVisibleSelected}
-              disabled={!visibleIds.length}
-              onChange={(e) => onSelectedIdsChange(toggleMany(selectedIds, visibleIds, e.target.checked))}
-              aria-label="Выбрать все видимые производственные заказы"
-            />
-          </th>
           <th>Изделие</th>
           <th>Кол-во</th>
           <th>Потребность</th>
@@ -518,15 +473,6 @@ function ProductionResultTable({ rows, selectedIds, highlightedId, onSelectedIds
       <tbody>
         {rows.map((row) => (
           <tr key={row.order_id} className={highlightedId && rowOrderIds(row).includes(highlightedId) ? 'activeRow' : undefined}>
-            <td className="checkCol">
-              <input
-                type="checkbox"
-                checked={rowOrderIds(row).every((id) => selectedIds.has(id))}
-                disabled={!isProductionRowSelectable(row)}
-                onChange={(e) => onSelectedIdsChange(toggleMany(selectedIds, rowOrderIds(row), e.target.checked))}
-                aria-label={`Выбрать ${row.item_name || row.item_article || row.order_id}`}
-              />
-            </td>
             <td className="itemCell">
               <strong>{row.item_name || `Номенклатура #${row.item_id}`}</strong>
               <span>{row.item_article || ''} {row.badge || ''}</span>

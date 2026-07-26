@@ -1,6 +1,6 @@
-"""Ledger-1 Balance-reconcile (the shrunk drift) + shadow diagnostics — §3б.
+"""Ledger-1 Balance-reconcile (the shrunk drift) + shadow diagnostics — .
 
-Exercises the inc3 after-step against a mocked Balance snapshot vs bin state:
+Exercises the  after-step against a mocked Balance snapshot vs bin state:
 
 * match (|delta|≤EPS) → last_reconciled_at set, pending cleared, no SLE;
 * first delta → reconcile_pending_qty stored, no SLE;
@@ -27,7 +27,6 @@ from app.services.item_ledger import (
     process_pending_pulls as _process_pending_pulls,
     reconcile_balance_snapshot as _reconcile_balance_snapshot,
     seed_from_balance as _seed_from_balance,
-    stock_shadow_report,
 )
 from app.services.item_ledger.reconcile import (
     RECONCILE_DISCOVERY_SOURCE,
@@ -99,7 +98,7 @@ def _bin(db, item_id, wh, org=""):
 
 
 # ---------------------------------------------------------------------------
-# match / pending / apply (§3б steps 2–3)
+# match / pending / apply ( steps 2–3)
 # ---------------------------------------------------------------------------
 
 
@@ -204,7 +203,7 @@ def test_reconcile_second_same_delta_applies_adjustment_and_folds_bin(db_session
 
 
 def test_reconcile_out_of_band_writeoff_scenario(db_session):
-    """Bin 10, balance 7 for two sweeps → −3 adjustment-SLE, bin → 7 (§3б)."""
+    """Bin 10, balance 7 for two sweeps → −3 adjustment-SLE, bin → 7 ()."""
     it = _item(db_session, "C1", "ref-c1")
     _seed_bin(db_session, it.item_id, "wh-2", 10)
     key = LedgerKey(it.item_id, "", "", "wh-2")
@@ -443,7 +442,7 @@ def test_reconcile_aggregate_discrepancy_adjusts_only_empty_char_bin(db_session)
 
 
 # ---------------------------------------------------------------------------
-# §7.4(д) — сверка v2: discovery of the missed source document
+#  — сверка v2: discovery of the missed source document
 # ---------------------------------------------------------------------------
 
 ASSEMBLY = "Document_СборкаЗапасов"
@@ -543,7 +542,7 @@ def test_discovery_unknown_recorder_enqueued_and_held(db_session):
 
 
 def test_discovery_then_drained_pull_converges_without_adjustment(db_session):
-    """The §7.4д happy path: discrepancy → recorder discovered + enqueued →
+    """The  happy path: discrepancy → recorder discovered + enqueued →
     orchestrator drains the pull (emulated) → the ledger replays the movement
     with a real Recorder and the next sweep matches. No anonymous SLE at all."""
     db_session.add(models.StockWarehouse(warehouse_ref1c="wh-1", warehouse_name="WH1"))
@@ -661,7 +660,7 @@ def test_discovery_odata_error_holds_key_without_crash(db_session):
 
 
 # ---------------------------------------------------------------------------
-# snapshot builder — org alignment (§2.1 / §3б key)
+# snapshot builder — org alignment ( /  key)
 # ---------------------------------------------------------------------------
 
 
@@ -681,7 +680,7 @@ def test_build_balance_snapshot_aligns_on_full_key_with_org(db_session):
 
 
 # ---------------------------------------------------------------------------
-# ledger_on_hand_by_item — selected/ignored contour (§2.5)
+# ledger_on_hand_by_item — selected/ignored contour ()
 # ---------------------------------------------------------------------------
 
 
@@ -700,29 +699,3 @@ def test_ledger_on_hand_by_item_respects_contour(db_session):
 
     by_item = ledger_on_hand_by_item(db_session)
     assert by_item.get(it.item_id) == 6  # only the selected, non-ignored warehouse
-
-
-# ---------------------------------------------------------------------------
-# shadow report shape (point 4)
-# ---------------------------------------------------------------------------
-
-
-def test_stock_shadow_report_shape(db_session):
-    it = _item(db_session, "P1", "ref-1", stock_qty=10.0)
-    db_session.add(models.StockWarehouse(warehouse_ref1c="wh-1", warehouse_name="WH1", is_selected=True))
-    db_session.flush()
-    _seed_bin(db_session, it.item_id, "wh-1", 7)  # ledger 7 vs legacy stock_qty 10
-
-    rep = stock_shadow_report(db_session, include_all=True)
-
-    assert set(rep.keys()) == {"generated_at", "counts", "totals", "items"}
-    assert set(rep["counts"].keys()) == {
-        "bins", "matched", "pending", "adjusted_keys", "adjustment_sles", "divergent_items",
-    }
-    assert set(rep["totals"].keys()) == {"ledger_on_hand", "legacy_stock", "divergence"}
-    row = next(r for r in rep["items"] if r["item_id"] == it.item_id)
-    assert row["ledger_on_hand"] == 7.0
-    assert row["legacy_stock"] == 10.0
-    assert row["divergence"] == -3.0
-    assert rep["counts"]["divergent_items"] == 1
-    assert rep["counts"]["bins"] == 1

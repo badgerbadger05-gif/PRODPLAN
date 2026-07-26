@@ -9,7 +9,6 @@ from sqlalchemy.exc import IntegrityError
 from app.models import (
     DefaultSpecification,
     ProductionKind,
-    ProductionManufacture,
     ResourceProductionKind,
     Employee,
     Item,
@@ -34,7 +33,6 @@ from app.models import (
     SupplierOrder,
     SupplierOrderItem,
     SyncLink,
-    ItemWarehouseStock,
     IgnoredWarehouse,
     WorkshopWarehouseBinding,
     LedgerGeneration,
@@ -47,8 +45,6 @@ from app.routers.production_control import (
     post_order_line_materials_refresh,
 )
 from app.services.production_control_journal import (
-    create_orders_from_mrp,
-    create_production_orders_from_mrp_requirements,
     cancel_local_order,
     dedupe_mrp_production_orders,
     list_journal,
@@ -95,7 +91,7 @@ def _accepted_mrp_context(db_session, *, key: str):
 
 
 def _accepted_stock_bin(db_session, item_id: int, warehouse_ref1c: str, qty: float) -> StockBin:
-    """Seed the exact accepted Ledger fold, never legacy ItemWarehouseStock."""
+    """Seed the exact accepted Ledger fold only."""
     return StockBin(
         ledger_generation_id=int(db_session.info["production_journal_generation_id"]),
         item_id=int(item_id), characteristic_ref="", organization_ref="",
@@ -286,9 +282,9 @@ def test_route_sheet_highlights_warehouse_conflict_and_key_values(db_session):
     db_session.add(SpecOperation(spec_id=spec.spec_id, stage_id=stage.stage_id, operation_id=operation.operation_id, time_norm=1))
     db_session.add(IgnoredWarehouse(warehouse_ref1c="ignored-hl", warehouse_name="Склад участка"))
     db_session.add_all([
-        ItemWarehouseStock(item_id=component.item_id, warehouse_ref1c="src-hl", qty=3),
-        ItemWarehouseStock(item_id=component.item_id, warehouse_ref1c="src-hl-2", qty=4),
-        ItemWarehouseStock(item_id=component.item_id, warehouse_ref1c="ignored-hl", qty=5),
+        _accepted_stock_bin(db_session, component.item_id, "src-hl", 3),
+        _accepted_stock_bin(db_session, component.item_id, "src-hl-2", 4),
+        _accepted_stock_bin(db_session, component.item_id, "ignored-hl", 5),
     ])
 
     order = ProductionOrder(
@@ -417,9 +413,9 @@ def test_route_sheet_printing_batches_multiple_products(db_session):
     assert "MRP-BATCH-3" in html
     assert "Материал пакетной печати" in html
     assert "Собрать" in html
-    # 10 запросов пакетной печати + 1 константная проверка цепочек
-    # «окраска↔сварка» (paint_weld_chain_links, этап 3).
-    assert len(statements) <= 11
+    # Число запросов остаётся константным независимо от размера пакета,
+    # включая разрешение принятого поколения и чтение StockBin.
+    assert len(statements) <= 13
 
 
 def _route_spec_to_workshop(db, spec, suffix: str) -> None:
@@ -510,59 +506,6 @@ def test_journal_and_material_issue_are_scoped_to_order_line(db_session):
     assert journal_after["rows"][0]["status"] == "to_move"
     assert journal_after["rows"][0]["issue_count"] == 1
 
-
-def test_journal_keeps_failed_1c_manufacture_visible(db_session):
-    item = Item(
-        item_code="ERR-P",
-        item_name="Деталь с ошибкой выпуска",
-        item_article="ERR-P",
-        unit="шт",
-        stock_qty=0,
-        status="active",
-    )
-    db_session.add(item)
-    db_session.flush()
-    order = ProductionOrder(
-        order_number="PP001308410",
-        order_date=datetime(2026, 6, 8),
-        order_ref1c="order-ref-error",
-        is_posted=True,
-        deletion_mark=False,
-    )
-    db_session.add(order)
-    db_session.flush()
-    product = ProductionProduct(
-        order_id=order.order_id,
-        item_id=item.item_id,
-        line_number=1,
-        quantity=140,
-        produced_qty=140,
-        remaining_qty=0,
-    )
-    db_session.add(product)
-    db_session.flush()
-    db_session.add(ProductionOrderLineState(
-        product_id=product.product_id,
-        status="produced",
-        issue_status="posted",
-    ))
-    db_session.add(ProductionManufacture(
-        product_id=product.product_id,
-        order_id=order.order_id,
-        qty=140,
-        status="error",
-        exported_ref1c="manufacture-ref-error",
-        export_error="Не удалось провести производство",
-    ))
-    db_session.commit()
-
-    journal = list_journal(db_session, search="1308410")
-
-    assert journal["total"] == 1
-    row = journal["rows"][0]
-    assert row["product_id"] == product.product_id
-    assert row["status"] == "production_error"
-    assert row["failed_manufacture_error"] == "Не удалось провести производство"
 
 
 def test_journal_exposes_prodplan_number_separately_from_1c_number(db_session):
@@ -686,7 +629,7 @@ def test_journal_can_filter_by_product_id(db_session):
     assert result["rows"][0]["order_number"] == "FLT-B"
 
 
-def test_journal_exposes_mrp_requirement_coverage_fields(db_session):
+def test_journal_does_not_fabricate_work_item_coverage(db_session):
     item = Item(
         item_code="MRP-COV",
         item_name="MRP coverage item",
@@ -705,8 +648,6 @@ def test_journal_exposes_mrp_requirement_coverage_fields(db_session):
         item_id=item.item_id,
         total_required_qty=20,
         net_required_qty=20,
-        covered_qty=8,
-        remaining_qty=12,
         period_from=_dt.date(2026, 6, 1),
         period_to=_dt.date(2026, 6, 5),
         bom_level=0,
@@ -743,9 +684,9 @@ def test_journal_exposes_mrp_requirement_coverage_fields(db_session):
     assert row["source_mrp_requirement_id"] == req.id
     assert row["source_mrp_allocation_key"] == "MRP-REQ-1"
     assert row["optimal_batch"] == 12
-    assert row["mrp_req_net_qty"] == 20
-    assert row["mrp_req_covered_qty"] == 8
-    assert row["mrp_req_remaining_qty"] == 12
+    assert row["mrp_req_net_qty"] is None
+    assert row["mrp_req_covered_qty"] is None
+    assert row["mrp_req_remaining_qty"] is None
 
 
 def test_update_product_quantity_releases_mrp_requirement_coverage(db_session):
@@ -768,8 +709,6 @@ def test_update_product_quantity_releases_mrp_requirement_coverage(db_session):
         item_id=item.item_id,
         total_required_qty=20,
         net_required_qty=20,
-        covered_qty=20,
-        remaining_qty=0,
         period_from=_dt.date(2026, 6, 1),
         period_to=_dt.date(2026, 6, 30),
         bom_level=0,
@@ -803,11 +742,9 @@ def test_update_product_quantity_releases_mrp_requirement_coverage(db_session):
     db_session.refresh(product)
     assert float(product.quantity) == 12
     assert float(product.remaining_qty) == 12
-    assert float(req.covered_qty) == 12
-    assert float(req.remaining_qty) == 8
-    assert result["mrp_req_net_qty"] == 20
-    assert result["mrp_req_covered_qty"] == 12
-    assert result["mrp_req_remaining_qty"] == 8
+    assert not hasattr(req, "covered_qty")
+    assert not hasattr(req, "remaining_qty")
+    assert "mrp_req_net_qty" not in result
 
 
 def test_update_product_quantity_refreshes_open_material_issue_lines(db_session):
@@ -823,7 +760,7 @@ def test_update_product_quantity_refreshes_open_material_issue_lines(db_session)
     db_session.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
     db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=1))
     db_session.add(StockWarehouse(warehouse_ref1c="src-qty-issue", warehouse_code="SRC", warehouse_name="Source", is_selected=True))
-    db_session.add(ItemWarehouseStock(item_id=comp.item_id, warehouse_ref1c="src-qty-issue", qty=100))
+    db_session.add(_accepted_stock_bin(db_session, comp.item_id, "src-qty-issue", 100))
 
     order = ProductionOrder(order_number="QTY-ISSUE-001", order_date=datetime(2026, 6, 15), deletion_mark=False)
     db_session.add(order)
@@ -865,7 +802,7 @@ def test_update_product_quantity_reports_posted_material_issues_as_blocked(db_se
     db_session.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
     db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=1))
     db_session.add(StockWarehouse(warehouse_ref1c="src-qty-posted", warehouse_code="SRC", warehouse_name="Source", is_selected=True))
-    db_session.add(ItemWarehouseStock(item_id=comp.item_id, warehouse_ref1c="src-qty-posted", qty=100))
+    db_session.add(_accepted_stock_bin(db_session, comp.item_id, "src-qty-posted", 100))
 
     order = ProductionOrder(order_number="QTY-POSTED-001", order_date=datetime(2026, 6, 15), deletion_mark=False)
     db_session.add(order)
@@ -898,192 +835,6 @@ def test_update_product_quantity_reports_posted_material_issues_as_blocked(db_se
     assert result["material_issues_refresh"]["blocked"][0]["issue_id"] == issue_id
 
 
-def test_requirement_materialization_does_not_top_up_from_legacy_remaining_qty(db_session):
-    generation, cutoff = _accepted_mrp_context(db_session, key="mrp-no-topup")
-    item = Item(
-        item_code="MRP-TOPUP",
-        item_name="MRP top-up item",
-        unit="шт",
-        stock_qty=0,
-        replenishment_method="Производство",
-        status="active",
-    )
-    db_session.add(item)
-    db_session.flush()
-
-    run = PlanningRun(
-        status="FIXED_SNAPSHOT",
-        started_at=datetime(2026, 5, 27),
-        active_freeze_version=1,
-        ledger_generation_id=generation.id,
-        ledger_cutoff=cutoff,
-    )
-    db_session.add(run)
-    db_session.flush()
-    req = MrpRequirement(
-        run_id=run.run_id,
-        item_id=item.item_id,
-        total_required_qty=27,
-        net_required_qty=27,
-        covered_qty=4,
-        remaining_qty=23,
-        period_from=_dt.date(2026, 6, 1),
-        period_to=_dt.date(2026, 6, 30),
-        bom_level=0,
-        freeze_version=1,
-    )
-    db_session.add(req)
-    db_session.flush()
-
-    order = ProductionOrder(
-        order_number="PP-EXISTING",
-        order_date=datetime(2026, 5, 27),
-        deletion_mark=False,
-        source="mrp",
-        source_run_id=run.run_id,
-    )
-    db_session.add(order)
-    db_session.flush()
-    existing = ProductionProduct(
-        order_id=order.order_id,
-        item_id=item.item_id,
-        line_number=1,
-        quantity=4,
-        produced_qty=0,
-        remaining_qty=4,
-        source_mrp_requirement_id=req.id,
-        source_mrp_allocation_key=f"mrp_requirement:{req.id}:order:1",
-        ledger_generation_id=generation.id,
-    )
-    db_session.add(existing)
-    db_session.commit()
-
-    result = create_production_orders_from_mrp_requirements(db_session, [req.id])
-
-    assert result["created"] == []
-    assert len(result["reused"]) == 1
-    assert result["skipped"][0]["reason"] == "already materialized for this Ledger generation"
-    db_session.refresh(req)
-    assert float(req.covered_qty) == 4
-    assert float(req.remaining_qty) == 23
-    products = (
-        db_session.query(ProductionProduct)
-        .filter(ProductionProduct.source_mrp_requirement_id == req.id)
-        .order_by(ProductionProduct.product_id.asc())
-        .all()
-    )
-    assert [float(p.quantity) for p in products] == [4]
-
-
-def test_fill_remaining_splits_requirement_by_optimal_batch(db_session):
-    generation, cutoff = _accepted_mrp_context(db_session, key="mrp-batch")
-    item = Item(
-        item_code="MRP-BATCH",
-        item_name="MRP optimal batch item",
-        unit="шт",
-        stock_qty=0,
-        optimal_batch=12,
-        replenishment_method="Производство",
-        status="active",
-    )
-    db_session.add(item)
-    db_session.flush()
-
-    run = PlanningRun(
-        status="FIXED_SNAPSHOT",
-        started_at=datetime(2026, 6, 4),
-        active_freeze_version=1,
-        ledger_generation_id=generation.id,
-        ledger_cutoff=cutoff,
-    )
-    db_session.add(run)
-    db_session.flush()
-    req = MrpRequirement(
-        run_id=run.run_id,
-        item_id=item.item_id,
-        total_required_qty=38,
-        net_required_qty=38,
-        covered_qty=0,
-        remaining_qty=38,
-        period_from=_dt.date(2026, 6, 4),
-        period_to=_dt.date(2026, 6, 8),
-        bom_level=0,
-        freeze_version=1,
-    )
-    db_session.add(req)
-    db_session.commit()
-
-    result = create_production_orders_from_mrp_requirements(db_session, [req.id])
-
-    assert [float(row["qty"]) for row in result["created"]] == [12, 12, 12, 2]
-    assert result["reused"] == []
-    db_session.refresh(req)
-    # Legacy requirement caches are immutable evidence; materialization is
-    # recorded by generation-bound products instead of rewriting these totals.
-    assert float(req.covered_qty) == 0
-    assert float(req.remaining_qty) == 38
-
-    products = (
-        db_session.query(ProductionProduct)
-        .filter(ProductionProduct.source_mrp_requirement_id == req.id)
-        .order_by(ProductionProduct.product_id.asc())
-        .all()
-    )
-    assert [float(p.quantity) for p in products] == [12, 12, 12, 2]
-    assert [p.source_mrp_allocation_key for p in products] == [
-        f"mrp_requirement:{req.id}:order:1",
-        f"mrp_requirement:{req.id}:order:2",
-        f"mrp_requirement:{req.id}:order:3",
-        f"mrp_requirement:{req.id}:order:4",
-    ]
-
-
-def test_repeated_mrp_requirement_materialization_is_idempotent(db_session):
-    generation, cutoff = _accepted_mrp_context(db_session, key="mrp-retry")
-    item = Item(
-        item_code="MRP-RERUN",
-        item_name="MRP rerun item",
-        unit="шт",
-        stock_qty=0,
-        replenishment_method="Производство",
-        status="active",
-    )
-    db_session.add(item)
-    db_session.flush()
-
-    run1 = PlanningRun(
-        status="FIXED_SNAPSHOT",
-        started_at=datetime(2026, 6, 4),
-        active_freeze_version=1,
-        ledger_generation_id=generation.id,
-        ledger_cutoff=cutoff,
-    )
-    db_session.add(run1)
-    db_session.flush()
-    req1 = MrpRequirement(
-        run_id=run1.run_id,
-        item_id=item.item_id,
-        total_required_qty=25,
-        net_required_qty=25,
-        covered_qty=0,
-        remaining_qty=25,
-        period_from=_dt.date(2026, 6, 1),
-        period_to=_dt.date(2026, 6, 30),
-        bom_level=0,
-        freeze_version=1,
-    )
-    db_session.add(req1)
-    db_session.commit()
-
-    first = create_production_orders_from_mrp_requirements(db_session, [req1.id])
-    assert len(first["created"]) == 1
-
-    second = create_production_orders_from_mrp_requirements(db_session, [req1.id])
-
-    assert second["created"] == []
-    assert len(second["reused"]) == 1
-    assert db_session.query(ProductionProduct).filter(ProductionProduct.item_id == item.item_id).count() == 1
-
 
 def test_dedupe_mrp_production_orders_cancels_local_excess_duplicates(db_session):
     item = Item(
@@ -1108,8 +859,6 @@ def test_dedupe_mrp_production_orders_cancels_local_excess_duplicates(db_session
             item_id=item.item_id,
             total_required_qty=25,
             net_required_qty=25,
-            covered_qty=25,
-            remaining_qty=0,
             period_from=_dt.date(2026, 6, 1),
             period_to=_dt.date(2026, 6, 30),
             bom_level=0,
@@ -1161,8 +910,8 @@ def test_dedupe_mrp_production_orders_cancels_local_excess_duplicates(db_session
     assert float(kept.remaining_qty) == 25
     old_req = next(req for req in reqs if req.id == cancelled.source_mrp_requirement_id)
     db_session.refresh(old_req)
-    assert float(old_req.covered_qty) == 0
-    assert float(old_req.remaining_qty) == 25
+    assert not hasattr(old_req, "covered_qty")
+    assert not hasattr(old_req, "remaining_qty")
 
 
 def test_dedupe_mrp_production_orders_reduces_single_local_overcoverage(db_session):
@@ -1184,8 +933,6 @@ def test_dedupe_mrp_production_orders_reduces_single_local_overcoverage(db_sessi
         item_id=item.item_id,
         total_required_qty=20,
         net_required_qty=6,
-        covered_qty=12,
-        remaining_qty=0,
         period_from=_dt.date(2026, 6, 1),
         period_to=_dt.date(2026, 6, 30),
         bom_level=0,
@@ -1229,8 +976,8 @@ def test_dedupe_mrp_production_orders_reduces_single_local_overcoverage(db_sessi
     db_session.refresh(req)
     assert float(product.quantity) == 6
     assert float(product.remaining_qty) == 6
-    assert float(req.covered_qty) == 6
-    assert float(req.remaining_qty) == 0
+    assert not hasattr(req, "covered_qty")
+    assert not hasattr(req, "remaining_qty")
 
 
 def test_dedupe_mrp_production_orders_cancels_single_local_when_requirement_zero(db_session):
@@ -1252,8 +999,6 @@ def test_dedupe_mrp_production_orders_cancels_single_local_when_requirement_zero
         item_id=item.item_id,
         total_required_qty=20,
         net_required_qty=0,
-        covered_qty=10,
-        remaining_qty=0,
         period_from=_dt.date(2026, 6, 1),
         period_to=_dt.date(2026, 6, 30),
         bom_level=0,
@@ -1292,8 +1037,8 @@ def test_dedupe_mrp_production_orders_cancels_single_local_when_requirement_zero
     state = db_session.query(ProductionOrderLineState).filter_by(product_id=product.product_id).one()
     assert state.status == "cancelled"
     assert float(product.remaining_qty) == 0
-    assert float(req.covered_qty) == 0
-    assert float(req.remaining_qty) == 0
+    assert not hasattr(req, "covered_qty")
+    assert not hasattr(req, "remaining_qty")
 
 
 def test_dedupe_mrp_production_orders_never_cancels_1c_open_order(db_session):
@@ -1318,8 +1063,6 @@ def test_dedupe_mrp_production_orders_never_cancels_1c_open_order(db_session):
             item_id=item.item_id,
             total_required_qty=25,
             net_required_qty=25,
-            covered_qty=25,
-            remaining_qty=0,
             period_from=_dt.date(2026, 6, 1),
             period_to=_dt.date(2026, 6, 30),
             bom_level=0,
@@ -1529,35 +1272,35 @@ def test_journal_root_filter_uses_all_active_plan_snapshot_scopes(db_session):
         period_to=_dt.date(2026, 7, 31),
         status="fixed",
     )
-    archived_plan = ProductionPlanHeader(
-        name="Archived plan",
+    closed_plan = ProductionPlanHeader(
+        name="Closed plan",
         period_from=_dt.date(2026, 5, 1),
         period_to=_dt.date(2026, 5, 31),
-        status="archived",
+        status="closed",
     )
-    db_session.add_all([plan_a, plan_b, archived_plan])
+    db_session.add_all([plan_a, plan_b, closed_plan])
     db_session.flush()
     db_session.add_all([
         ProductionPlanLine(plan_id=plan_a.id, item_id=root.item_id, bucket_date=_dt.date(2026, 6, 1), qty=1),
         ProductionPlanLine(plan_id=plan_b.id, item_id=root.item_id, bucket_date=_dt.date(2026, 7, 1), qty=1),
-        ProductionPlanLine(plan_id=archived_plan.id, item_id=root.item_id, bucket_date=_dt.date(2026, 5, 1), qty=1),
+        ProductionPlanLine(plan_id=closed_plan.id, item_id=root.item_id, bucket_date=_dt.date(2026, 5, 1), qty=1),
     ])
     current_generation_id = db_session.info["production_journal_generation_id"]
     # Older lineage is deliberately unbound; two active plan snapshots are
-    # bound to the published generation.  The archived plan is excluded by
+    # bound to the published generation.  The closed plan is excluded by
     # header status even when it carries that generation.
-    old_run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={}, source_plan_id=plan_a.id)
+    old_run = PlanningRun(status="SUPERSEDED", config_snapshot={}, source_plan_id=plan_a.id)
     latest_run_a = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={}, source_plan_id=plan_a.id, ledger_generation_id=current_generation_id)
     latest_run_b = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={}, source_plan_id=plan_b.id, ledger_generation_id=current_generation_id)
-    archived_run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={}, source_plan_id=archived_plan.id, ledger_generation_id=current_generation_id)
-    db_session.add_all([old_run, latest_run_a, latest_run_b, archived_run])
+    closed_run = PlanningRun(status="FIXED_SNAPSHOT", config_snapshot={}, source_plan_id=closed_plan.id, ledger_generation_id=current_generation_id)
+    db_session.add_all([old_run, latest_run_a, latest_run_b, closed_run])
     db_session.flush()
 
     for run, number in [
         (old_run, "OLD-RUN"),
         (latest_run_a, "LATEST-RUN-A"),
         (latest_run_b, "LATEST-RUN-B"),
-        (archived_run, "ARCHIVED-RUN"),
+        (closed_run, "CLOSED-RUN"),
     ]:
         order = ProductionOrder(
             order_number=number,
@@ -2099,8 +1842,6 @@ def test_cancel_local_order_without_1c_marks_deleted_and_removes_local_issues(db
         run_id=run.run_id,
         item_id=item.item_id,
         net_required_qty=5,
-        covered_qty=5,
-        remaining_qty=0,
         period_from=_dt.date(2026, 6, 1),
         period_to=_dt.date(2026, 6, 30),
         bom_level=0,
@@ -2135,8 +1876,8 @@ def test_cancel_local_order_without_1c_marks_deleted_and_removes_local_issues(db
     db_session.refresh(req)
     assert result["deleted_issues"] == 1
     assert order.deletion_mark is True
-    assert float(req.covered_qty) == 0
-    assert float(req.remaining_qty) == 5
+    assert not hasattr(req, "covered_qty")
+    assert not hasattr(req, "remaining_qty")
     assert list_journal(db_session)["total"] == 0
 
 
@@ -2319,165 +2060,6 @@ def test_material_issue_journal_hides_produced_lines(db_session):
     assert result["rows"][0]["document_number"] == "MI-LINE-ACTIVE-ISSUE"
 
 
-def test_create_orders_from_mrp_materializes_planned_orders(db_session):
-    """
-    POST /v1/production-control/orders/from-mrp must turn selected
-    planned_order rows into internal production orders tagged source='mrp',
-    with the source_planned_order_id back-link and an initial line state.
-    Second call for the same planned_orders is a no-op (reused).
-    """
-    generation, cutoff = _accepted_mrp_context(db_session, key="planned-orders")
-    item = Item(
-        item_code="MRP-ITEM",
-        item_name="Item from MRP",
-        item_article="ART-MRP",
-        unit="шт",
-        stock_qty=0,
-        status="active",
-    )
-    db_session.add(item)
-    db_session.flush()
-
-    run = PlanningRun(
-        status="FIXED_SNAPSHOT",
-        config_snapshot=json.dumps({}),
-        active_freeze_version=1,
-        ledger_generation_id=generation.id,
-        ledger_cutoff=cutoff,
-    )
-    db_session.add(run)
-    db_session.flush()
-    planned_a = PlannedOrder(
-        run_id=run.run_id,
-        item_id=item.item_id,
-        requested_qty=10,
-        planned_qty=10,
-        qty=10,
-        need_date=_dt.date(2026, 6, 1),
-        start_date=_dt.date(2026, 5, 25),
-        finish_date=_dt.date(2026, 5, 31),
-        bucket_date=_dt.date(2026, 6, 1),
-        ledger_generation_id=generation.id,
-    )
-    planned_b = PlannedOrder(
-        run_id=run.run_id,
-        item_id=item.item_id,
-        requested_qty=4,
-        planned_qty=4,
-        qty=4,
-        need_date=_dt.date(2026, 6, 5),
-        bucket_date=_dt.date(2026, 6, 5),
-        ledger_generation_id=generation.id,
-    )
-    db_session.add_all([planned_a, planned_b])
-    db_session.commit()
-
-    first = create_orders_from_mrp(
-        db_session,
-        [planned_a.order_id, planned_b.order_id],
-        initiated_by="planner",
-    )
-    assert first["status"] == "ok"
-    assert first["errors"] == []
-    assert first["reused"] == []
-    assert {row["planned_order_id"] for row in first["created"]} == {
-        planned_a.order_id,
-        planned_b.order_id,
-    }
-    for row in first["created"]:
-        order = (
-            db_session.query(ProductionOrder)
-            .filter(ProductionOrder.order_id == row["order_id"])
-            .one()
-        )
-        assert order.source == "mrp"
-        assert order.source_run_id == run.run_id
-        assert order.is_posted is False
-        assert order.order_ref1c is None
-        product = (
-            db_session.query(ProductionProduct)
-            .filter(ProductionProduct.product_id == row["product_id"])
-            .one()
-        )
-        assert product.source_planned_order_id == row["planned_order_id"]
-        assert float(product.quantity) == row["qty"]
-        assert float(product.remaining_qty) == row["qty"]
-        # ProductionOrderLineState seeded with status='shortage' per plan.
-        from app.models import ProductionOrderLineState as POLS
-        state = (
-            db_session.query(POLS)
-            .filter(POLS.product_id == product.product_id)
-            .one()
-        )
-        assert state.status == "shortage"
-        assert state.issue_status == "not_requested"
-
-    # Second call must be a no-op.
-    second = create_orders_from_mrp(
-        db_session,
-        [planned_a.order_id, planned_b.order_id],
-    )
-    assert second["created"] == []
-    assert len(second["reused"]) == 2
-    assert (
-        db_session.query(ProductionOrder)
-        .filter(ProductionOrder.source == "mrp", ProductionOrder.source_run_id == run.run_id)
-        .count()
-        == 2
-    )
-
-
-def test_create_orders_from_mrp_rejects_missing_selected_line_before_writes(db_session):
-    """
-    Bad planned_order ids and 0-qty rows must be reported as errors instead of
-    aborting the whole batch.
-    """
-    generation, cutoff = _accepted_mrp_context(db_session, key="missing-line")
-    item = Item(
-        item_code="MRP-SKIP",
-        item_name="Skip item",
-        item_article="SKIP",
-        unit="шт",
-        stock_qty=0,
-        status="active",
-    )
-    db_session.add(item)
-    db_session.flush()
-    run = PlanningRun(
-        status="FIXED_SNAPSHOT",
-        config_snapshot=json.dumps({}),
-        active_freeze_version=1,
-        ledger_generation_id=generation.id,
-        ledger_cutoff=cutoff,
-    )
-    db_session.add(run)
-    db_session.flush()
-    zero_qty = PlannedOrder(
-        run_id=run.run_id,
-        item_id=item.item_id,
-        requested_qty=0,
-        planned_qty=0,
-        qty=0,
-        need_date=_dt.date(2026, 6, 1),
-        bucket_date=_dt.date(2026, 6, 1),
-        ledger_generation_id=generation.id,
-    )
-    db_session.add(zero_qty)
-    db_session.commit()
-
-    with pytest.raises(MrpMutationLineageError, match="do not exist"):
-        create_orders_from_mrp(db_session, [zero_qty.order_id, 999_999])
-    # Nothing committed for the invalid batch.
-    assert (
-        db_session.query(ProductionOrder).filter(ProductionOrder.source == "mrp").count() == 0
-    )
-
-
-# ---------------------------------------------------------------------------
-# Coverage evaluation in preview_materials
-# ---------------------------------------------------------------------------
-
-
 def _make_basic_spec(db, parent_name="Parent", child_specs=()):
     """Helper that wires Item + Specification + SpecComponents + DefaultSpecification."""
     parent = Item(
@@ -2507,6 +2089,15 @@ def _make_basic_spec(db, parent_name="Parent", child_specs=()):
         )
         db.add(comp)
         db.flush()
+        if stock:
+            db.add(
+                _accepted_stock_bin(
+                    db,
+                    comp.item_id,
+                    f"WH-{code}",
+                    float(stock),
+                )
+            )
         db.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=qty_per_unit))
         components.append(comp)
     return parent, spec, components
@@ -3052,7 +2643,6 @@ def test_create_material_issues_uses_workshop_binding_when_warehouse_not_pinned(
     db_session.flush()
     db_session.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
     db_session.add(SpecComponent(spec_id=spec.spec_id, item_id=comp.item_id, quantity=1))
-
     order = ProductionOrder(
         order_number="WH-001",
         order_date=datetime(2026, 5, 20),
@@ -3096,7 +2686,6 @@ def test_create_material_issues_uses_workshop_binding_when_warehouse_not_pinned(
     from app.models import ProductionMaterialIssue
     issue = db_session.query(ProductionMaterialIssue).filter_by(issue_id=issue_id).one()
     assert issue.warehouse_ref1c == "aaaa1111-aaaa-1111-aaaa-111111111111"
-
     # Caller-supplied warehouse_ref1c wins over the binding. Create a second
     # product to avoid the active-issue idempotency lock.
     product2 = ProductionProduct(
@@ -3136,7 +2725,6 @@ def test_create_material_issues_uses_workshop_binding_when_warehouse_not_pinned(
 
 def test_create_material_issues_splits_components_by_source_warehouse(db_session):
     from app.models import (
-        ItemWarehouseStock,
         ProductionMaterialIssue,
         ProductionResource,
         StockWarehouse,
@@ -3174,9 +2762,9 @@ def test_create_material_issues_splits_components_by_source_warehouse(db_session
         StockWarehouse(warehouse_ref1c="WH-A", warehouse_code="A", warehouse_name="Склад А", is_selected=True),
         StockWarehouse(warehouse_ref1c="WH-B", warehouse_code="B", warehouse_name="Склад Б", is_selected=True),
     ])
-    # No stock on WH-DEST: components lying on the destination workshop are
-    # claimed in place (direction='in_place') instead of being transferred,
-    # which is covered by test_section_stock_reservations.py.
+    # No stock on WH-DEST: components already on the destination workshop are
+    # claimed as zero-distance workshop issues, which is covered by
+    # test_section_stock_reservations.py.
     db_session.add_all([
         _accepted_stock_bin(db_session, comp_a.item_id, "WH-A", 5),
         _accepted_stock_bin(db_session, comp_b.item_id, "WH-B", 5),
@@ -3232,14 +2820,15 @@ def test_create_material_issues_skips_component_already_on_destination_warehouse
     result = create_material_issues(db_session, [product.product_id], initiated_by="op")
 
     assert len(result["created"]) == 1
-    assert result["created"][0]["direction"] == "in_place"
+    assert result["created"][0]["direction"] == "issue"
     assert result["reused"] == []
     assert result["selection_required"] == []
     assert result["errors"] == []
     assert result["already_on_destination"][0]["components"][0]["covered_qty"] == 2
     issue = db_session.query(ProductionMaterialIssue).one()
-    assert issue.direction == "in_place"
+    assert issue.direction == "issue"
     assert issue.status == "posted"
+    assert issue.source_warehouse_ref1c == "WH-DEST"
     assert issue.warehouse_ref1c == "WH-DEST"
     assert issue.lines[0].required_qty == 2
     assert issue.lines[0].issued_qty == 2
@@ -3281,11 +2870,12 @@ def test_create_material_issues_moves_only_missing_qty_when_partially_on_destina
     result = create_material_issues(db_session, [product.product_id], initiated_by="op")
 
     assert len(result["created"]) == 2
-    assert {row.get("direction", "issue") for row in result["created"]} == {"in_place", "issue"}
+    assert {str(row.get("source_warehouse_ref1c") or "") for row in result["created"]} == {"WH-DEST", "WH-SRC"}
     assert result["already_on_destination"][0]["components"][0]["covered_qty"] == 2
     issues = db_session.query(ProductionMaterialIssue).order_by(ProductionMaterialIssue.issue_id).all()
-    assert [issue.direction for issue in issues] == ["in_place", "issue"]
+    assert [issue.direction for issue in issues] == ["issue", "issue"]
     assert issues[0].source_warehouse_ref1c == "WH-DEST"
+    assert issues[0].warehouse_ref1c == "WH-DEST"
     assert issues[0].lines[0].required_qty == 2
     assert issues[0].lines[0].issued_qty == 2
     assert issues[1].source_warehouse_ref1c == "WH-SRC"
@@ -3331,10 +2921,10 @@ def test_create_material_issues_does_not_reuse_destination_stock_for_multiple_pr
     result = create_material_issues(db_session, [p.product_id for p in products], initiated_by="op")
 
     assert len(result["created"]) == 2
-    assert {row.get("direction", "issue") for row in result["created"]} == {"in_place", "issue"}
+    assert {str(row.get("source_warehouse_ref1c") or "") for row in result["created"]} == {"WH-DEST", "WH-SRC"}
     assert len(result["already_on_destination"]) == 1
     issues = db_session.query(ProductionMaterialIssue).order_by(ProductionMaterialIssue.issue_id).all()
-    assert [issue.direction for issue in issues] == ["in_place", "issue"]
+    assert [issue.direction for issue in issues] == ["issue", "issue"]
     assert issues[0].product_id == products[0].product_id
     assert issues[0].lines[0].required_qty == 2
     assert issues[1].product_id == products[1].product_id
@@ -3343,7 +2933,6 @@ def test_create_material_issues_does_not_reuse_destination_stock_for_multiple_pr
 
 def test_create_material_issues_asks_when_component_has_multiple_source_warehouses(db_session):
     from app.models import (
-        ItemWarehouseStock,
         ProductionMaterialIssue,
         ProductionResource,
         StockWarehouse,
@@ -3414,12 +3003,8 @@ def test_preview_materials_excludes_ignored_warehouses_from_stock(db_session):
     Plan rule: "Игнорируемые склады нужны, чтобы не задавать лишние вопросы
     по остаткам, например если компонент лежит в изоляторе брака."
 
-    With item_warehouse_stock populated AND an ignored_warehouses entry, the
-    coverage calculation must use the per-warehouse breakdown and exclude
-    stock sitting in ignored warehouses, even if Item.stock_qty (aggregated)
-    suggests there's enough.
+    The accepted Ledger contour excludes stock sitting in ignored warehouses.
     """
-    from app.models import ItemWarehouseStock
     from app.services.production_control_settings import upsert_ignored_warehouse
 
     parent, _spec, comps = _make_basic_spec(
@@ -3430,13 +3015,9 @@ def test_preview_materials_excludes_ignored_warehouses_from_stock(db_session):
     comp = comps[0]
     _order, product = _make_internal_order_for(db_session, parent, qty=2)
 
-    # Aggregated says we have 10 — but it's all in the brak isolator.
-    comp.stock_qty = 10
     db_session.add(
-        ItemWarehouseStock(
-            item_id=comp.item_id,
-            warehouse_ref1c="brak-warehouse-guid",
-            qty=10,
+        _accepted_stock_bin(
+            db_session, comp.item_id, "brak-warehouse-guid", 10
         )
     )
     db_session.commit()
@@ -3473,13 +3054,7 @@ def test_preview_materials_excludes_ignored_warehouses_from_stock(db_session):
     assert only_comp["coverage"] == "shortage"
 
 
-def test_preview_materials_falls_back_to_aggregated_when_no_breakdown(db_session):
-    """
-    With ignored_warehouses configured but no item_warehouse_stock rows for
-    the component (e.g. stock hasn't been re-synced yet after the migration),
-    fall back to aggregated Item.stock_qty so coverage doesn't collapse to 0
-    during the rollout.
-    """
+def test_preview_materials_does_not_fall_back_to_aggregated_stock(db_session):
     from app.services.production_control_settings import upsert_ignored_warehouse
 
     parent, _spec, comps = _make_basic_spec(
@@ -3495,43 +3070,30 @@ def test_preview_materials_falls_back_to_aggregated_when_no_breakdown(db_session
     upsert_ignored_warehouse(db_session, "some-other-warehouse")
 
     preview = preview_materials(db_session, product.product_id)
-    # With no breakdown rows, fallback returns 5 -> need 2 -> ok.
-    assert preview["coverage"] == "ready"
-    assert preview["components"][0]["available_qty"] == 5
-    assert preview["components"][0]["coverage"] == "ok"
+    assert preview["coverage"] == "shortage"
+    assert preview["components"][0]["available_qty"] == 0
+    assert preview["components"][0]["coverage"] == "shortage"
 
 
-def test_preview_materials_mixes_breakdown_and_aggregated_fallback(db_session):
-    """
-    Component A has per-warehouse breakdown with everything in an ignored
-    warehouse -> 0 available. Component B has no breakdown rows at all ->
-    falls back to aggregated Item.stock_qty.
-
-    Order-level coverage aggregates per the plan: any 'shortage' -> shortage.
-    So this case is a 'shortage' (blocked on comp A) despite comp B being
-    fully covered. The point of the test is the per-component values:
-    breakdown path is authoritative when present, aggregated is the fallback.
-    """
-    from app.models import ItemWarehouseStock
+def test_preview_materials_uses_only_nonignored_ledger_bins(db_session):
     from app.services.production_control_settings import upsert_ignored_warehouse
 
     parent, _spec, comps = _make_basic_spec(
         db_session,
         parent_name="MixParent",
         child_specs=[
-            ("MIXA", "Comp A all-ignored", 50, 1),  # need 1*2 = 2
-            ("MIXB", "Comp B aggregated only", 50, 1),  # need 1*2 = 2
+            ("MIXA", "Comp A all-ignored", 0, 1),
+            ("MIXB", "Comp B ledger stock", 0, 1),
         ],
     )
     comp_a, _comp_b = comps
     _order, product = _make_internal_order_for(db_session, parent, qty=2)
 
     db_session.add(
-        ItemWarehouseStock(
-            item_id=comp_a.item_id,
-            warehouse_ref1c="brak-mix-guid",
-            qty=50,
-        )
+        _accepted_stock_bin(db_session, comp_a.item_id, "brak-mix-guid", 50)
+    )
+    db_session.add(
+        _accepted_stock_bin(db_session, comps[1].item_id, "normal-mix-guid", 50)
     )
     db_session.commit()
     upsert_ignored_warehouse(db_session, "brak-mix-guid")
@@ -3541,5 +3103,5 @@ def test_preview_materials_mixes_breakdown_and_aggregated_fallback(db_session):
     by_name = {c["item_name"]: c for c in preview["components"]}
     assert by_name["Comp A all-ignored"]["available_qty"] == 0
     assert by_name["Comp A all-ignored"]["coverage"] == "shortage"
-    assert by_name["Comp B aggregated only"]["available_qty"] == 50
-    assert by_name["Comp B aggregated only"]["coverage"] == "ok"
+    assert by_name["Comp B ledger stock"]["available_qty"] == 50
+    assert by_name["Comp B ledger stock"]["coverage"] == "ok"

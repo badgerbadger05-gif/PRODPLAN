@@ -5,7 +5,6 @@ from hashlib import sha256
 import json
 
 import pytest
-from fastapi import HTTPException
 
 from app import models
 from app.routers import plan as plan_router
@@ -585,32 +584,6 @@ def test_builder_failure_rolls_back_manifest_rows_and_memberships(
     assert db_session.query(models.PlanningReadSnapshot).count() == 0
     assert db_session.query(models.PlanningReadRow).count() == 0
     assert db_session.query(models.PlanningReadRootMember).count() == 0
-
-
-def test_unmigrated_legacy_get_is_rejected_before_service_call(monkeypatch):
-    def legacy_service_must_not_run(*args, **kwargs):
-        raise AssertionError("legacy capacity service was called")
-
-    monkeypatch.setattr(
-        plan_router, "get_run_pegging", legacy_service_must_not_run
-    )
-    with pytest.raises(HTTPException) as exc:
-        asyncio.run(
-            plan_router.get_planning_result_pegging(
-                run_id=123,
-                child_item_id=None,
-                parent_item_id=None,
-                date_from=None,
-                date_to=None,
-                limit=200,
-                offset=0,
-                db=None,
-            )
-        )
-
-    assert exc.value.status_code == 503
-    assert exc.value.detail["code"] == "mrp_result_snapshot_required"
-    assert exc.value.detail["rows"] == []
 
 
 def test_purchase_export_reads_shared_snapshot_not_legacy_getter(

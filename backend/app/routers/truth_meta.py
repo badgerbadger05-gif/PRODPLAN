@@ -23,14 +23,6 @@ class TruthMeta(BaseModel):
     truth_reason: str | None = None
 
 
-class DbrSectionEnvelope(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    section: str
-    rows: Any
-    truth_meta: TruthMeta
-
-
 def build_truth_meta(readiness: PlanningTruthReadiness) -> TruthMeta:
     cutoff: datetime | None = readiness.cutoff
     return TruthMeta(

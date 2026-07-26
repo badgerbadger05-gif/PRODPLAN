@@ -147,7 +147,7 @@ export function planningStatusLabel(status: string) {
 export type PeriodPlan = {
   id: number
   name: string
-  status: 'draft' | 'fixed' | 'archived'
+  status: 'draft' | 'fixed' | 'closed'
   period_from: string
   period_to: string
   comment?: string | null
@@ -312,7 +312,7 @@ export type ExecutionJournalResponse = {
 export function periodPlanStatusLabel(status: string) {
   if (status === 'draft') return 'Черновик'
   if (status === 'fixed') return 'Зафиксирован'
-  if (status === 'archived') return 'Архив'
+  if (status === 'closed') return 'Закрыт'
   return status
 }
 

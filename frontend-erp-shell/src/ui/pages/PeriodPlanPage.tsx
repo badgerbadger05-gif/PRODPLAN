@@ -23,12 +23,9 @@ import { dateRu, dateTimeRu, qty } from '../../lib/format'
 import { ensurePlanItem, searchNomenclature } from '../../services/productionPlan'
 import {
   addItemToPeriodPlan,
-  reconcileRun,
-  archivePeriodPlan,
   bulkUpsertPeriodPlanLines,
   createMrpSnapshot,
   createPeriodPlan,
-  createProductionOrdersFromRequirements,
   deleteItemFromPeriodPlan,
   deletePeriodPlan,
   fixPeriodPlan,
@@ -36,7 +33,7 @@ import {
   getPeriodPlanMatrix,
   listPeriodPlanRuns,
   listPeriodPlans,
-  unarchivePeriodPlan,
+  closePeriodPlanRun,
   updatePeriodPlanHeader,
 } from '../../services/periodPlan'
 import { DocumentWindow } from '../layout/DocumentWindow'
@@ -145,7 +142,7 @@ function PeriodPlanListView({ onOpenPlan }: ListViewProps) {
   const [deleting, setDeleting] = useState(false)
 
   const selected = plans.find((p) => p.id === selectedId) ?? null
-  const canDelete = selected?.status !== 'archived' // backend will reject if there are SUCCESS MRP runs
+  const canDelete = selected?.status === 'draft'
   const dateOrderInvalid = !!(newFrom && newTo && newFrom > newTo)
 
   const loadList = useCallback(async (nextOffset: number) => {
@@ -348,7 +345,7 @@ function PeriodPlanListView({ onOpenPlan }: ListViewProps) {
                       <option value="">Все</option>
                       <option value="draft">Черновик</option>
                       <option value="fixed">Зафиксирован</option>
-                      <option value="archived">Архив</option>
+                      <option value="closed">Закрытые</option>
                     </select>
                   </label>
                 </td>
@@ -406,7 +403,7 @@ function PeriodPlanListView({ onOpenPlan }: ListViewProps) {
                 <tr
                   key={plan.id}
                   className={plan.id === selectedId ? 'activeRow' : ''}
-                  style={{ cursor: 'pointer', opacity: plan.status === 'archived' ? 0.62 : undefined }}
+                  style={{ cursor: 'pointer', opacity: plan.status === 'closed' ? 0.62 : undefined }}
                   onClick={() => setSelectedId(plan.id === selectedId ? null : plan.id)}
                   onDoubleClick={() => onOpenPlan(plan.id)}
                 >
@@ -517,9 +514,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
 
   const isDraft = plan?.status === 'draft'
   const isFixed = plan?.status === 'fixed'
-  const isArchived = plan?.status === 'archived'
   const hasDirty = Object.keys(dirty).length > 0
-  const hasRuns = runs.length > 0 || lastRunId !== null
   const activeRunId = selectedRunId ?? lastRunId ?? runs[0]?.run_id ?? null
 
   const loadMatrix = useCallback(async () => {
@@ -636,29 +631,14 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     }
   }
 
-  async function handleArchive() {
-    if (!confirm('Отправить план в архив? Архивные планы скрываются из активной работы.')) return
+  async function handleClose() {
+    if (!activeRunId || !confirm('Закрыть план? Остаток не переносится автоматически.')) return
     setActing(true)
     setError('')
     setMessage('')
     try {
-      await archivePeriodPlan(planId)
-      setMessage('План отправлен в архив')
-      await loadMatrix()
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setActing(false)
-    }
-  }
-
-  async function handleUnarchive() {
-    setActing(true)
-    setError('')
-    setMessage('')
-    try {
-      await unarchivePeriodPlan(planId)
-      setMessage('План возвращён из архива')
+      await closePeriodPlanRun(activeRunId)
+      setMessage('План закрыт, история выполнения сохранена')
       await loadMatrix()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -720,53 +700,6 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     }
   }
 
-  async function handleAllocate() {
-    const runId = activeRunId
-    if (!runId) return
-    setActing(true)
-    setError('')
-    setMessage('')
-    try {
-      const res = await reconcileRun(runId)
-      const prod = res.production_added?.length ?? 0
-      const purch = res.purchase_added?.length ?? 0
-      const moved = res.rescheduled?.floating ?? 0
-      setMessage(`Пересчёт: производство +${prod}, закупки +${purch}, перепланировано ${moved} строк`)
-      await loadJournal(journalFlow, runId, journalRootItemId)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setActing(false)
-    }
-  }
-
-  async function handleCreateProductionOrders() {
-    if (!journal) return
-    const reqIds = journal.rows
-      .filter((r) => r.flow === 'production' && r.remaining_qty > 1e-9)
-      .map((r) => r.req_id)
-    if (!reqIds.length) return
-    setActing(true)
-    setError('')
-    setMessage('')
-    try {
-      const result = await createProductionOrdersFromRequirements(reqIds)
-      const created = (result.created as unknown[]).length
-      const reused = (result.reused as unknown[]).length
-      const skipped = (result.skipped as unknown[]).length
-      const parts: string[] = []
-      if (created) parts.push(`создано ${created}`)
-      if (reused) parts.push(`уже было ${reused}`)
-      if (skipped) parts.push(`пропущено ${skipped}`)
-      setMessage(`Заказы производства: ${parts.join(', ') || 'нет изменений'}`)
-      if (result.errors?.length) setError(result.errors.join('; '))
-      await loadJournal(journalFlow, activeRunId ?? undefined, journalRootItemId)
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setActing(false)
-    }
-  }
 
   async function handleSaveMatrix() {
     if (!matrix) return
@@ -1107,14 +1040,8 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
           {isFixed && (
             <button className="primary" onClick={() => void handleSnapshot()} disabled={acting}>MRP снимок</button>
           )}
-          {hasRuns && (
-            <button onClick={() => void handleAllocate()} disabled={acting || !activeRunId} title="Пересчитать остаточную потребность: добор недопокрытия и перепланировка ещё не открытых в 1С заказов от сегодня">Пересчёт</button>
-          )}
-          {isFixed && (
-            <button onClick={() => void handleArchive()} disabled={acting}>В архив</button>
-          )}
-          {isArchived && (
-            <button onClick={() => void handleUnarchive()} disabled={acting}>Из архива</button>
+          {isFixed && activeRunId && (
+            <button onClick={() => void handleClose()} disabled={acting}>Закрыть план</button>
           )}
           {hasDirty && tab === 'matrix' && (
             <>
@@ -1415,13 +1342,6 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
               <button onClick={() => void loadJournal(journalFlow, activeRunId ?? undefined, journalRootItemId)} disabled={journalLoading}>Обновить</button>
               <button onClick={downloadJournalCsv} disabled={!journal || journalLoading}>CSV</button>
               <div className="barSeparator" />
-              <button
-                onClick={() => void handleCreateProductionOrders()}
-                disabled={acting || !journal || !journal.rows.some((r) => r.flow === 'production' && r.remaining_qty > 1e-9)}
-                title="Создать заказы производства для незакрытых строк производственного потока"
-              >
-                Создать заказы производства
-              </button>
               {journal && (
                 <>
                   <div className="barSeparator" />

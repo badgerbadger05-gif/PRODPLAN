@@ -1,14 +1,15 @@
-"""Increment 7 — per-item item-ledger read API (the "nomenclature card").
+""" — per-item item-ledger read API (the "nomenclature card").
 
-Read-only endpoints over the ledger substrate (inc1–6). These assert the §1–§5
-response shapes + key numbers on a small seeded fixture: the §1 position math,
-§2 movement sorting/pagination/filtering, §3 reservation coverage, §4 the event
-provenance thread (+ cross-item 404), §5 drift rows, and 404 on unknown item.
+Read-only endpoints over the accepted Item Ledger. These assert the
+response shapes + key numbers on a small seeded fixture: the  position math,
+ movement sorting/pagination/filtering,  reservation coverage,  the event
+provenance thread (+ cross-item 404), and 404 on unknown item.
 Nothing here exercises the compute core — pure SELECT endpoints.
 """
 from __future__ import annotations
 
 import datetime as dt
+from decimal import Decimal
 
 import pytest
 from fastapi import FastAPI
@@ -20,7 +21,6 @@ from sqlalchemy.pool import StaticPool
 from app import models
 from app.database import Base, get_db
 from app.routers.item_ledger import (
-    ItemLedgerDriftResponse,
     ItemLedgerMovementsResponse,
     ItemLedgerPositionResponse,
     ItemLedgerReservationEventsResponse,
@@ -106,7 +106,6 @@ def test_openapi_exposes_strict_response_models(client):
         "/api/v1/item-ledger/{item_id}/movements": "ItemLedgerMovementsResponse",
         "/api/v1/item-ledger/{item_id}/reservations": "ItemLedgerReservationsResponse",
         "/api/v1/item-ledger/{item_id}/reservations/{reservation_id}/events": "ItemLedgerReservationEventsResponse",
-        "/api/v1/item-ledger/{item_id}/drift": "ItemLedgerDriftResponse",
     }
     for path, model in expected.items():
         response_schema = schema["paths"][path]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
@@ -144,7 +143,7 @@ def _sle(db, item_id, wh, qty, qty_after, posting_at, kind, rref, line, src="doc
     return e
 
 
-def _res(db, item_id, req_id, reserved, *, mode="consume", realized=0.0, status="active",
+def _res(db, item_id, req_id, reserved, *, mode="buy", realized=0.0, status="active",
          run_id=None, cov_oh=0.0, cov_sup=0.0, cov_wip=0.0, uncovered=0.0, cov_state="uncovered"):
     generation_id = db.get(models.PlanningTruthState, 1).current_generation_id
     e = models.ReservationEntry(
@@ -152,9 +151,10 @@ def _res(db, item_id, req_id, reserved, *, mode="consume", realized=0.0, status=
         item_id=item_id, requirement_id=req_id, run_id=run_id, freeze_version=0,
         priority_period_from=dt.date(2026, 8, 1), priority_period_to=dt.date(2026, 8, 31),
         realization_mode=mode, reserved_qty=reserved, realized_qty=realized,
-        covered_on_hand_qty=cov_oh, covered_incoming_supplier_qty=cov_sup,
-        covered_incoming_wip_qty=cov_wip, uncovered_qty=uncovered,
-        lifecycle_status=status, coverage_state=cov_state,
+        covered_from_stock_at_freeze_qty=cov_oh,
+        replenishment_required_qty=max(Decimal(str(reserved)) - Decimal(str(cov_oh)), Decimal("0")),
+        replenishment_received_qty=realized,
+        lifecycle_status=status,
     )
     db.add(e)
     db.flush()
@@ -170,15 +170,6 @@ def _event(db, res, kind, *, reserved_delta=0.0, realized_delta=0.0, sle_id=None
         fact_ref=fact_ref, match_rule=match_rule, cycle_id=cycle_id,
         idempotency_key=key or f"{kind}:{res.id}:{sle_id}",
     ))
-    db.flush()
-
-
-def _drift(db, item_id, kind, drift_qty, *, expected=None, actual=None, cycle_id="cyc-1"):
-    generation_id = db.get(models.PlanningTruthState, 1).current_generation_id
-    db.add(models.MrpDriftEvent(ledger_generation_id=generation_id,
-                                cycle_id=cycle_id, item_id=item_id, kind=kind,
-                                drift_qty=drift_qty, expected_stock=expected,
-                                actual_stock=actual, matured=True))
     db.flush()
 
 
@@ -205,7 +196,7 @@ def seeded(db_session):
     # a movement for item B (must never leak into A's tape)
     _sle(db, b.item_id, "W1", 5.0, 5.0, dt.datetime(2026, 7, 20, 0, 0, 0), "receipt", "recB", 1)
 
-    # reservations on A: two consume (outstanding 191.07 + 335.13 = 526.2) + one make (0).
+    # reservations on A: two buy replenishments plus one make replenishment.
     r1 = _res(db, a.item_id, 55831, 270.64, realized=79.57, run_id=17,
               cov_oh=120.0, cov_sup=71.07, uncovered=0.0, cov_state="covered")
     _res(db, a.item_id, 55832, 335.13, realized=0.0, run_id=17,
@@ -219,15 +210,12 @@ def seeded(db_session):
     _event(db, r1, "realize", realized_delta=79.57, sle_id=1, fact_ref="rec-1",
            match_rule="pegged", key="realize:55831:1")
 
-    # drift on A.
-    _drift(db, a.item_id, "evaporation", 3.0, expected=10.0, actual=7.0)
-
     db.commit()
     return {"a": a.item_id, "b": b.item_id, "r1": r1.id, "rb": rb.id}
 
 
 # ---------------------------------------------------------------------------
-# §1 position
+#  position
 # ---------------------------------------------------------------------------
 def test_position_math_and_shape(client, seeded):
     r = client.get(f"/api/v1/item-ledger/{seeded['a']}/position")
@@ -243,14 +231,13 @@ def test_position_math_and_shape(client, seeded):
     # ГП warehouse excluded; two contour warehouses summing to on_hand.
     whs = {w["warehouse_ref1c"]: w["qty"] for w in d["on_hand_by_warehouse"]}
     assert whs == pytest.approx({"W1": 300.0, "W2": 35.144})
-    assert d["reserved_soft"] == pytest.approx(526.2)
-    assert d["available"] == pytest.approx(335.144 - 526.2)
-    # Incoming is persisted coverage from this accepted Ledger generation,
-    # never a live supplier/WIP mirror.
-    assert d["incoming_supplier"] == pytest.approx(71.07)
+    assert d["reserved_soft"] == pytest.approx(705.77)
+    assert d["available"] == pytest.approx(335.144 - 705.77)
+    # Orders and historical coverage caches are not physical incoming facts.
+    assert d["incoming_supplier"] == pytest.approx(0.0)
     assert d["incoming_wip"] == pytest.approx(0.0)
-    assert d["projected"] == pytest.approx(335.144 + 71.07 - 526.2)
-    assert d["uncovered"] == pytest.approx(526.2 - 335.144 - 71.07)
+    assert d["projected"] == pytest.approx(335.144 - 705.77)
+    assert d["uncovered"] == pytest.approx(705.77 - 335.144)
     assert d["flags"]["on_hand_negative"] is False
     assert d["flags"]["has_uncovered"] is True
     assert d["flags"]["reconcile_pending"] is False
@@ -261,7 +248,7 @@ def test_position_unknown_item_404(client, seeded):
 
 
 # ---------------------------------------------------------------------------
-# §2 movements
+#  movements
 # ---------------------------------------------------------------------------
 def test_movements_sorted_and_scoped(client, seeded):
     d = client.get(f"/api/v1/item-ledger/{seeded['a']}/movements").json()
@@ -310,24 +297,23 @@ def test_movements_unknown_item_404(client, seeded):
 
 
 # ---------------------------------------------------------------------------
-# §3 reservations
+#  reservations
 # ---------------------------------------------------------------------------
 def test_reservations_shape_and_coverage(client, seeded):
     d = client.get(f"/api/v1/item-ledger/{seeded['a']}/reservations").json()
     ItemLedgerReservationsResponse.model_validate(d)
     assert d["truth_meta"]["truth_status"] == "accepted"
     assert d["truth_meta"]["ledger_generation"] == 1
-    assert len(d["rows"]) == 3  # 2 consume + 1 make
+    assert len(d["rows"]) == 3  # 2 buy + 1 make
     by_req = {row["requirement_id"]: row for row in d["rows"]}
     r1 = by_req[55831]
     assert r1["reservation_id"] == seeded["r1"]
     assert r1["run_id"] == 17
-    assert r1["realization_mode"] == "consume"
-    assert r1["outstanding"] == pytest.approx(270.64 - 79.57)
-    assert r1["covered"] == {"on_hand": pytest.approx(120.0),
-                             "incoming_supplier": pytest.approx(71.07),
-                             "incoming_wip": pytest.approx(0.0)}
-    assert r1["coverage_state"] == "covered"
+    assert r1["realization_mode"] == "buy"
+    assert r1["covered_from_stock_at_freeze_qty"] == pytest.approx(120.0)
+    assert r1["replenishment_required_qty"] == pytest.approx(150.64)
+    assert r1["replenishment_received_qty"] == pytest.approx(79.57)
+    assert r1["replenishment_remaining_qty"] == pytest.approx(71.07)
     assert r1["priority"] == {"period_from": "2026-08-01", "period_to": "2026-08-31"}
     # the make row is present and flagged as make.
     assert by_req[55833]["realization_mode"] == "make"
@@ -350,7 +336,7 @@ def test_reservations_unknown_item_404(client, seeded):
 
 
 # ---------------------------------------------------------------------------
-# §4 events
+#  events
 # ---------------------------------------------------------------------------
 def test_events_thread(client, seeded):
     d = client.get(
@@ -379,94 +365,3 @@ def test_events_cross_item_404(client, seeded):
 def test_events_unknown_reservation_404(client, seeded):
     r = client.get(f"/api/v1/item-ledger/{seeded['a']}/reservations/999999/events")
     assert r.status_code == 404
-
-
-# ---------------------------------------------------------------------------
-# §5 drift
-# ---------------------------------------------------------------------------
-def test_drift_rows(client, seeded):
-    d = client.get(f"/api/v1/item-ledger/{seeded['a']}/drift").json()
-    ItemLedgerDriftResponse.model_validate(d)
-    assert d["truth_meta"]["truth_status"] == "accepted"
-    assert d["truth_meta"]["ledger_generation"] == 1
-    assert d["total"] == 1
-    row = d["rows"][0]
-    assert row["kind"] == "evaporation"
-    assert row["drift_qty"] == pytest.approx(3.0)
-    assert row["expected_stock"] == pytest.approx(10.0)
-    assert row["actual_stock"] == pytest.approx(7.0)
-    assert row["cause"] == "supply_evaporation"   # derived from kind
-    assert row["adjustment_sle_id"] is None        # not tracked on the drift row
-    assert row["at"] is not None
-
-
-def test_drift_empty_for_other_item(client, seeded):
-    d = client.get(f"/api/v1/item-ledger/{seeded['b']}/drift").json()
-    ItemLedgerDriftResponse.model_validate(d)
-    assert d["total"] == 0 and d["rows"] == []
-
-
-def test_drift_excludes_legacy_and_other_generation_rows(client, db_session, seeded):
-    item_id = seeded["a"]
-    imported = models.PhysicalImportBatch(
-        batch_key="router-other-physical",
-        status="completed",
-        source_watermarks={},
-        completed_at=dt.datetime(2026, 7, 22),
-    )
-    other = models.LedgerGeneration(
-        generation_key="router-other-generation",
-        status="rejected",
-        cutoff=dt.datetime(2026, 7, 22, 23, 59),
-        source_watermarks={},
-        capabilities={"execution_allocations": True},
-        physical_import_batch=imported,
-        algorithm_version="tests/other",
-    )
-    db_session.add_all([
-        imported,
-        other,
-        models.MrpDriftEvent(
-            item_id=item_id,
-            cycle_id="legacy-null",
-            kind="shortfall",
-            drift_qty=99,
-            matured=True,
-        ),
-    ])
-    db_session.flush()
-    db_session.add(models.MrpDriftEvent(
-        ledger_generation_id=other.id,
-        item_id=item_id,
-        cycle_id="other-generation",
-        kind="surplus",
-        drift_qty=88,
-        matured=True,
-    ))
-    db_session.commit()
-
-    d = client.get(f"/api/v1/item-ledger/{item_id}/drift").json()
-    assert d["total"] == 1
-    assert [row["cycle_id"] for row in d["rows"]] == ["cyc-1"]
-
-
-def test_drift_fails_closed_without_execution_capability(client, db_session, seeded):
-    generation = db_session.get(
-        models.LedgerGeneration,
-        db_session.get(models.PlanningTruthState, 1).current_generation_id,
-    )
-    generation.capabilities = {
-        "physical_ledger": True,
-        "reservation_replay": True,
-        "execution_allocations": False,
-    }
-    db_session.commit()
-
-    response = client.get(f"/api/v1/item-ledger/{seeded['a']}/drift")
-    assert response.status_code == 409
-    assert response.json()["detail"]["code"] == "planning_truth_unavailable"
-    assert response.json()["detail"]["consumer"] == "item_ledger.drift"
-
-
-def test_drift_unknown_item_404(client, seeded):
-    assert client.get("/api/v1/item-ledger/999999/drift").status_code == 404

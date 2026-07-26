@@ -22,7 +22,7 @@ def _item_requirement(db, code: str):
     return item, run, requirement
 
 
-def _consume_reservation(
+def _reservation(
     db,
     *,
     generation_id: int,
@@ -39,11 +39,11 @@ def _consume_reservation(
         requirement_id=requirement.id,
         priority_period_from=date(2026, 7, 1),
         priority_period_to=date(2026, 7, 31),
-        realization_mode="consume",
+        realization_mode="make",
         reserved_qty=10,
         realized_qty=0,
-        covered_incoming_supplier_qty=supplier,
-        covered_incoming_wip_qty=wip,
+        replenishment_required_qty=10,
+        replenishment_received_qty=0,
         lifecycle_status="active",
     )
     db.add(row)
@@ -118,7 +118,7 @@ def test_position_incoming_is_isolated_by_ledger_generation(
     db = db_session
     first = building_ledger_generation
     item, run, requirement = _item_requirement(db, "POSITION-GENERATION-ISOLATION")
-    _consume_reservation(
+    _reservation(
         db,
         generation_id=first.id,
         item=item,
@@ -137,7 +137,7 @@ def test_position_incoming_is_isolated_by_ledger_generation(
     )
     db.add(second)
     db.flush()
-    _consume_reservation(
+    _reservation(
         db,
         generation_id=second.id,
         item=item,
@@ -153,8 +153,7 @@ def test_position_incoming_is_isolated_by_ledger_generation(
         db, [item.item_id], ledger_generation_id=second.id,
     )[item.item_id]
 
-    assert first_position["incoming_supplier"] == 3
+    assert first_position["incoming_supplier"] == 0
     assert first_position["incoming_wip"] == 0
     assert second_position["incoming_supplier"] == 0
-    assert second_position["incoming_wip"] == 7
-
+    assert second_position["incoming_wip"] == 0

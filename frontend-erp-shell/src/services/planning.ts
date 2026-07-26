@@ -79,19 +79,6 @@ export function getShortageReport(runId: number) {
   )
 }
 
-export function createProductionControlOrdersFromMrp(body: {
-  run_id: number
-  date_from?: string
-  date_to?: string
-  planned_order_ids?: number[]
-  dry_run?: boolean
-}) {
-  return api<Record<string, unknown>>('/v1/production-control/orders/from-mrp', {
-    method: 'POST',
-    body: JSON.stringify(body),
-  })
-}
-
 export function exportPurchasesTo1C(runId: number, body: {
   date_from?: string
   date_to?: string

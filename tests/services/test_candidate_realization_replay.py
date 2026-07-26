@@ -109,12 +109,12 @@ def _world(
         db.add_all([old, run]); db.flush()
         requirement = models.MrpRequirement(
             run_id=run.run_id, item_id=item.item_id, total_required_qty=Decimal("5"),
-            net_required_qty=Decimal("5"), covered_qty=0, remaining_qty=Decimal("5"),
+            net_required_qty=Decimal("5"),
             period_from=period, period_to=period_to, bom_level=0,
         )
         parent_requirement = models.MrpRequirement(
             run_id=old.run_id, item_id=item.item_id, total_required_qty=Decimal("5"),
-            net_required_qty=Decimal("5"), covered_qty=0, remaining_qty=Decimal("5"),
+            net_required_qty=Decimal("5"),
             period_from=period, period_to=period_to, bom_level=0,
         )
         db.add_all([requirement, parent_requirement]); db.flush()

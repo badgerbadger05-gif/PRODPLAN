@@ -106,18 +106,6 @@ def test_supplier_lineage_models_preserve_exact_many_to_one_export(db_session):
                 match_status="exact",
                 ambiguity_count=0,
             ),
-            models.MrpExecutionAllocation(
-                ledger_generation_id=generation.id,
-                cycle_id="supplier-test",
-                requirement_id=requirement.id,
-                fact_type="supplier_receipt",
-                allocation_kind="coverage_realization",
-                fact_ref=sle.recorder_ref,
-                fact_line_ref=sle.line_no,
-                fact_date=sle.posting_at,
-                allocated_qty=Decimal("7"),
-                stock_ledger_entry_id=sle.id,
-            ),
         ]
     )
     db_session.commit()
@@ -134,8 +122,6 @@ def test_supplier_lineage_models_preserve_exact_many_to_one_export(db_session):
     ).one()
     assert provenance.stock_ledger_entry_id == sle.id
     assert provenance.match_status == "exact"
-    allocation = db_session.query(models.MrpExecutionAllocation).one()
-    assert allocation.stock_ledger_entry_id == sle.id
 
 
 def test_one_receipt_document_line_may_emit_multiple_physical_sles(db_session):

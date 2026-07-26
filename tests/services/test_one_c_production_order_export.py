@@ -282,7 +282,6 @@ def test_dry_run_payload_includes_materials_operations_and_reserve_warehouse(db_
         lambda **_: pytest.fail("Network client must not be instantiated in dry-run"),
     )
     monkeypatch.setattr(exporter, "_current_1c_datetime", lambda: "2026-05-27T09:58:40")
-    monkeypatch.setattr(exporter, "_current_moscow_datetime", lambda: "2026-05-27T10:58:40")
 
     result = exporter.export_production_orders_to_1c(db, [order.order_id], dry_run=True)
     payload = result["payloads"][0]["payload"]
@@ -290,8 +289,8 @@ def test_dry_run_payload_includes_materials_operations_and_reserve_warehouse(db_
     # The document date is durable order data, so a retry produces the same
     # canonical full payload rather than a new hash every second.
     assert payload["Date"] == "2026-05-20T00:00:00"
-    assert payload["Старт"] == "2026-06-12T10:58:40"
-    assert payload["Финиш"] == "2026-06-13T10:58:40"
+    assert payload["Старт"] == "2026-06-12T00:00:00"
+    assert payload["Финиш"] == "2026-06-13T00:00:00"
     assert payload["СтруктурнаяЕдиницаРезерв_Key"] == "workshop-warehouse-ref"
     assert payload["СтруктурнаяЕдиницаПродукции_Key"] == "production-warehouse-ref"
     [prod_row] = payload["Продукция"]

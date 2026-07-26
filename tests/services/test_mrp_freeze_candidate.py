@@ -44,7 +44,13 @@ def _candidate_world(db, quantities=(10, 20)):
     )
     accepted = models.LedgerGeneration(
         generation_key="candidate-freeze-accepted", status="accepted", cutoff=cutoff,
-        source_watermarks={}, capabilities={}, physical_import_batch=physical,
+        source_watermarks={},
+        capabilities={
+            "physical_ledger": True,
+            "reservation_replay": True,
+            "execution_allocations": True,
+        },
+        physical_import_batch=physical,
         algorithm_version="tests", accepted_at=cutoff,
     )
     target = models.LedgerGeneration(
@@ -216,8 +222,6 @@ def test_add_candidate_cannot_reuse_supplier_supply_claimed_by_retained_run(db_s
         item_id=item.item_id,
         total_required_qty=1,
         net_required_qty=1,
-        covered_qty=0,
-        remaining_qty=1,
         period_from=retained.period_from,
         period_to=retained.period_to,
         bom_level=0,
@@ -363,6 +367,29 @@ def test_candidate_freeze_rejects_non_building_target(db_session):
         )
 
 
+def test_candidate_freeze_rejects_stale_truth(db_session, monkeypatch):
+    accepted, target, item, _parents, candidates, _lines = _candidate_world(db_session)
+    # The accepted parent is intentionally stale by max-age contract.
+    monkeypatch.setenv("PLANNING_TRUTH_MAX_AGE_SECONDS", "1")
+
+    with pytest.raises(LedgerPoolUnavailable, match="Accepted generation|stale"):
+        freeze_candidate_snapshots(
+            db_session, parent_generation_id=accepted.id,
+            target_generation_id=target.id, candidate_run_ids=[row.run_id for row in candidates],
+        )
+
+
+def test_candidate_freeze_rejects_missing_required_capabilities(db_session):
+    accepted, target, item, _parents, candidates, _lines = _candidate_world(db_session)
+    accepted.capabilities = {"physical_ledger": True}
+
+    with pytest.raises(LedgerPoolUnavailable, match="lacks capabilities"):
+        freeze_candidate_snapshots(
+            db_session, parent_generation_id=accepted.id,
+            target_generation_id=target.id, candidate_run_ids=[row.run_id for row in candidates],
+        )
+
+
 def test_exact_future_supply_without_pool_or_destination_is_rejected(db_session):
     _accepted, target, item, _parents, _candidates, _lines = _candidate_world(db_session)
     capture = db_session.query(models.LedgerBuildBatch).filter_by(
@@ -392,7 +419,7 @@ def _retained_claim_world(db, *, wip_open_qty):
     retained = parents[0]
     retained_requirement = models.MrpRequirement(
         run_id=retained.run_id, item_id=item.item_id,
-        total_required_qty=1, net_required_qty=1, covered_qty=0, remaining_qty=1,
+        total_required_qty=1, net_required_qty=1,
         period_from=retained.period_from, period_to=retained.period_to,
         bom_level=0, freeze_version=retained.active_freeze_version,
         characteristic_ref="", organization_ref="", planning_stock_pool="default",

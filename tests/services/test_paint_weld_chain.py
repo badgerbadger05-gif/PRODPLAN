@@ -186,8 +186,6 @@ def _setup_pair(
         item_id=welded.item_id,
         total_required_qty=10,
         net_required_qty=weld_outstanding,
-        covered_qty=10 - weld_outstanding,
-        remaining_qty=weld_outstanding,
         period_from=date(2026, 8, 1),
         period_to=date(2026, 8, 31),
         bom_level=1,
@@ -210,8 +208,9 @@ def _setup_pair(
             realization_mode="make",
             reserved_qty=weld_outstanding,
             realized_qty=0,
+            replenishment_required_qty=weld_outstanding,
+            replenishment_received_qty=0,
             lifecycle_status="active",
-            coverage_state="uncovered" if weld_outstanding else "covered",
         )
     )
     db.commit()
@@ -510,19 +509,7 @@ def test_existing_weld_allocations_reduce_shared_obligation(
         requirement_id=req.id, realization_mode="make"
     ).one()
     reservation.realized_qty = 2
-    db_session.add(
-        models.MrpExecutionAllocation(
-            ledger_generation_id=generation.id,
-            cycle_id="paint-weld-allocation",
-            requirement_id=req.id,
-            bucket_id=None,
-            fact_type="linked_production",
-            allocation_kind="execution",
-            fact_ref="local-existing",
-            fact_line_ref=str(already_product.product_id),
-            allocated_qty=2,
-        )
-    )
+    reservation.replenishment_received_qty = 2
     db_session.commit()
     _stub_demo(monkeypatch)
     _no_network(monkeypatch)

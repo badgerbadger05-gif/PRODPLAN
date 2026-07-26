@@ -329,13 +329,13 @@ def _collect_export_entries(
             )
             continue
 
-        # Local-only reservation of components already lying on the workshop
-        # warehouse: nothing physically moves, 1C has no such document.
-        if str(issue.direction or "") == "in_place":
+        source_ref = _clean_ref1c(issue.source_warehouse_ref1c)
+        destination_ref = _clean_ref1c(issue.warehouse_ref1c)
+        if source_ref and destination_ref and source_ref == destination_ref:
             skipped.append(
                 {
                     "issue_id": int(issue.issue_id),
-                    "reason": "direction='in_place': локальный резерв, в 1С не выгружается",
+                    "reason": "source=destination: внутренний резерв, в 1С не выгружается",
                 }
             )
             continue
@@ -512,9 +512,9 @@ def _mark_issue_exported(
     )
     if state:
         state.issue_status = "exported"
-    # Item-ledger inc2 (§3а step 1, §6.1): fire-and-forget enqueue of a
+    # Item-ledger  ( step 1, ): fire-and-forget enqueue of a
     # pull-by-document for the just-posted Document_ПеремещениеЗапасов. NEVER let
-    # this raise into the export flow — the reconcile Balance-sweep (inc3) is the
+    # this raise into the export flow — the reconcile Balance-sweep () is the
     # safety net. No OData here: enqueue only writes a 'pending' row.
     try:
         from .item_ledger.ingest import enqueue_recorder_pull
@@ -557,7 +557,7 @@ def _chain_export_parent_orders(
     Returns the parent-export summary (or None when no parents needed export).
     """
     parent_rows = (
-        db.query(ProductionOrder.order_id, ProductionOrder.source, ProductionProduct.source_dbr_signal_id)
+        db.query(ProductionOrder.order_id)
         .join(ProductionMaterialIssue, ProductionMaterialIssue.order_id == ProductionOrder.order_id)
         .join(ProductionProduct, ProductionProduct.product_id == ProductionMaterialIssue.product_id)
         .filter(ProductionMaterialIssue.issue_id.in_(list(issue_ids)))
@@ -569,16 +569,7 @@ def _chain_export_parent_orders(
         .distinct()
         .all()
     )
-    mrp_order_ids = [int(row.order_id) for row in parent_rows if str(row.source or "").lower() != "dbr"]
-    dbr_order_ids = [int(row.order_id) for row in parent_rows if str(row.source or "").lower() == "dbr"]
-    if dbr_order_ids:
-        # A material-issue export must never resurrect DBR's retired live
-        # materializer as an implicit side effect.  The DBR order needs an
-        # immutable-Ledger-authorized 1C reference before this chain may run.
-        raise ValueError(
-            "dbr_parent_order_materialization_retired: DBR parent production order has no 1C reference "
-            "(" + ", ".join(str(value) for value in sorted(dbr_order_ids)) + ")"
-        )
+    mrp_order_ids = [int(row.order_id) for row in parent_rows]
     if not mrp_order_ids:
         return None
     mrp_summary = (
@@ -599,7 +590,6 @@ def _chain_export_parent_orders(
         "orders_created": int(mrp_summary.get("orders_created") or 0),
         "orders_already_linked": int(mrp_summary.get("orders_already_linked") or 0),
         "orders_error": int(mrp_summary.get("orders_error") or 0),
-        "dbr_entries": [],
     }
 
 

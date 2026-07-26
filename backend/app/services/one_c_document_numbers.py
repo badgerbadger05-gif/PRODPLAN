@@ -4,7 +4,7 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from ..models import ProductionManufacture, ProductionMaterialIssue, ProductionOrder
+from ..models import ProductionMaterialIssue, ProductionManufacture, ProductionOrder
 
 
 def chain_key_for_order(order: ProductionOrder) -> str:
@@ -53,9 +53,9 @@ def material_issue_suffix(db: Session, issue: ProductionMaterialIssue) -> str:
 
 def material_issue_number(db: Session, issue: ProductionMaterialIssue) -> str:
     direction = str(issue.direction or "issue")
-    # 'in_place' is a local-only reservation document (components claimed
-    # where they already lie); it never reaches 1C but needs its own series.
-    prefix = {"return": "RT", "in_place": "RS"}.get(direction, "MT")
+    # Local workshop-stock reservation keeps the same movement series; only true
+    # returns are exported with RT.
+    prefix = {"return": "RT"}.get(direction, "MT")
     # 1C's Document_ПеремещениеЗапасов.Number is limited to 11 characters in
     # the target base. Order-chain suffixes like MT001204813A get truncated by
     # 1C to MT001204813, making A/B documents collide. Keep the whole number
@@ -63,35 +63,11 @@ def material_issue_number(db: Session, issue: ProductionMaterialIssue) -> str:
     return f"{prefix}{int(issue.issue_id) % 1_000_000_000:09d}"
 
 
-def manufacture_suffix(db: Session, manufacture: ProductionManufacture) -> str:
-    rows = (
-        db.query(ProductionManufacture.manufacture_id)
-        .filter(
-            ProductionManufacture.order_id == int(manufacture.order_id),
-            ProductionManufacture.status != "cancelled",
-        )
-        .order_by(ProductionManufacture.manufacture_id.asc())
-        .all()
-    )
-    ids = [int(row[0]) for row in rows]
-    if len(ids) <= 1:
-        return ""
-    try:
-        idx = ids.index(int(manufacture.manufacture_id)) + 1
-    except ValueError:
-        idx = len(ids) + 1
-    return suffix_for_index(idx)
-
-
 def manufacture_number(db: Session, manufacture: ProductionManufacture) -> str:
-    order = manufacture.order
-    if order is None:
-        order = db.query(ProductionOrder).filter(ProductionOrder.order_id == int(manufacture.order_id)).one()
-    return f"MF{chain_key_for_order(order)}{manufacture_suffix(db, manufacture)}"
+    """Return stable, bounded number for Document_СборкаЗапасов."""
+    return f"MF{int(manufacture.manufacture_id) % 1_000_000_000:09d}"
 
 
 def piecework_number(db: Session, manufacture: ProductionManufacture) -> str:
-    order = manufacture.order
-    if order is None:
-        order = db.query(ProductionOrder).filter(ProductionOrder.order_id == int(manufacture.order_id)).one()
-    return f"PW{chain_key_for_order(order)}{manufacture_suffix(db, manufacture)}"
+    """Return stable, bounded number for Document_СдельныйНаряд."""
+    return f"PW{int(manufacture.manufacture_id) % 1_000_000_000:09d}"

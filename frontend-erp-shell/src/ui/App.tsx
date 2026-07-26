@@ -1,11 +1,9 @@
 import { Link, NavLink, Route, Routes } from 'react-router-dom'
 import { ErrorBoundary } from './ErrorBoundary'
-import { DbrDrumBoardPage } from './pages/DbrDrumBoardPage'
-import { DbrFeederPage } from './pages/DbrFeederPage'
-import { DbrProgramsPage } from './pages/DbrProgramsPage'
-import { DbrPurchasePage } from './pages/DbrPurchasePage'
-import { DbrSettingsPage } from './pages/DbrSettingsPage'
 import { HomePage } from './pages/HomePage'
+import { AssemblyQueuePage } from './pages/AssemblyQueuePage'
+import { DrumPage } from './pages/DrumPage'
+import { ShelvesPage } from './pages/ShelvesPage'
 import { MrpResultPage } from './pages/MrpResultPage'
 import { MrpRunsPage } from './pages/MrpRunsPage'
 import { PeriodPlanPage } from './pages/PeriodPlanPage'
@@ -22,7 +20,9 @@ import { WorkshopBindingReviewPage } from './pages/WorkshopBindingReviewPage'
 const navItems = [
   { to: '/', title: 'Главная', end: true },
   { to: '/period-plan', title: 'Планирование выпуска' },
-  { to: '/dbr', title: 'Планирование DBR' },
+  { to: '/assembly-queue', title: 'Очередь сборки' },
+  { to: '/drum', title: 'Барабан' },
+  { to: '/shelves', title: 'Полки' },
   { to: '/mrp-runs', title: 'MRP прогоны' },
   { to: '/production-control', title: 'Журнал заказов' },
   { to: '/purchase-control', title: 'Журнал закупок' },
@@ -66,11 +66,9 @@ export function App() {
         <Route path="/" element={<HomePage />} />
         <Route path="/period-plan" element={<PeriodPlanPage />} />
         <Route path="/period-plan/:planId" element={<PeriodPlanPage />} />
-        <Route path="/dbr" element={<DbrDrumBoardPage />} />
-        <Route path="/dbr/programs" element={<DbrProgramsPage />} />
-        <Route path="/dbr/feeder" element={<DbrFeederPage />} />
-        <Route path="/dbr/purchase" element={<DbrPurchasePage />} />
-        <Route path="/dbr/settings" element={<DbrSettingsPage />} />
+        <Route path="/assembly-queue" element={<AssemblyQueuePage />} />
+        <Route path="/drum" element={<DrumPage />} />
+        <Route path="/shelves" element={<ShelvesPage />} />
         <Route path="/production-control" element={<ProductionControlPage />} />
         <Route path="/purchase-control" element={<PurchaseControlPage />} />
         <Route path="/transfer-requests" element={<TransferRequestsPage />} />

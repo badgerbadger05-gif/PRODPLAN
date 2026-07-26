@@ -8,7 +8,6 @@ from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
     DefaultSpecification,
-    DbrFeederSignal,
     Item,
     MrpRequirement,
     PaintWeldChainLink,
@@ -16,12 +15,13 @@ from ..models import (
     PlanningRun,
     ProductionPlanHeader,
     ProductionPlanLine,
-    ProductionManufacture,
     ProductionMaterialIssue,
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
     ProductionResource,
+    ReservationEntry,
+    ReplenishmentWorkItem,
     ResourceProductionKind,
     SpecComponent,
     Specification,
@@ -37,13 +37,10 @@ from .production_control_common import (
 from .production_control_domain import ensure_state as _ensure_state
 from .planning_truth import PlanningTruthReadiness, require_accepted_truth
 from .production_control_material_issues import refresh_existing_material_issues_for_product
-from .replenishment import REPLENISHMENT_FLOW_PRODUCTION, classify_replenishment_flow
 from .paint_weld_pairs import is_welded_blocked
 from .mrp_mutation_guard import (
     MrpMutationLineageError,
     require_current_run,
-    require_selected_proposals,
-    require_selected_requirements,
 )
 
 
@@ -92,40 +89,6 @@ STATUS_FILTER_GROUPS = {
 }
 
 ACTIVE_COVERAGE_STATUSES = {"shortage", "partial", "ready"}
-
-
-def _dbr_queue_state(signal: DbrFeederSignal) -> str:
-    if signal.status == "Diagnostic":
-        return "diagnostic"
-    if bool(signal.is_incomplete) or float(signal.kit_shortage_qty or 0) > 0:
-        return "blocked"
-    if signal.status == "Open":
-        return "ready"
-    return str(signal.status or "").strip().lower().replace(" ", "_") or "unknown"
-
-
-def _dbr_planning_payload(signal: DbrFeederSignal) -> Dict[str, Any]:
-    reason_json = signal.reason_json if isinstance(signal.reason_json, dict) else {}
-    missing_reasons = reason_json.get("missing_reasons")
-    if isinstance(missing_reasons, list) and missing_reasons:
-        reason = "; ".join(str(value) for value in missing_reasons)
-    else:
-        reason = str(reason_json.get("generator") or "")
-    return {
-        "contour": "dbr_feeder",
-        "source_id": int(signal.id),
-        "schedule_id": int(signal.source_schedule_id) if signal.source_schedule_id is not None else None,
-        "slot_id": int(signal.drum_slot_id) if signal.drum_slot_id is not None else None,
-        "signal_type": str(signal.signal_type or ""),
-        "priority": _to_float(signal.priority),
-        "zone": str(signal.zone or "") or None,
-        "need_date": _date_to_iso(signal.need_date),
-        "required_date": _date_to_iso(signal.required_date),
-        "queue_state": _dbr_queue_state(signal),
-        "chain_depth": int(signal.chain_depth or 0),
-        "parent_signal_id": int(signal.parent_signal_id) if signal.parent_signal_id is not None else None,
-        "reason": reason or None,
-    }
 
 
 def _journal_work_status(line_status: str) -> str:
@@ -365,7 +328,6 @@ def dedupe_mrp_production_orders(db: Session, *, dry_run: bool = True) -> Dict[s
             if not dry_run:
                 actual_state = state or _ensure_state(db, product)
                 if actual_state.status not in _TERMINAL_LINE_STATUSES:
-                    _adjust_requirement_coverage(db, product, -qty)
                     actual_state.status = "cancelled"
                     product.remaining_qty = 0.0
             cancelled_count += 1
@@ -384,17 +346,12 @@ def dedupe_mrp_production_orders(db: Session, *, dry_run: bool = True) -> Dict[s
                 "delta_qty": delta,
             })
             if not dry_run and delta > 1e-9:
-                _adjust_requirement_coverage(db, product, -delta)
                 product.remaining_qty = new_qty
                 produced_qty = _to_float(product.produced_qty)
                 product.quantity = max(produced_qty + new_qty, produced_qty)
             if delta > 1e-9:
                 reduced_count += 1
                 reduced_qty_total += delta
-
-        if not dry_run:
-            latest_req.covered_qty = min(kept_qty, required_qty)
-            latest_req.remaining_qty = max(required_qty - _to_float(latest_req.covered_qty), 0.0)
 
         repaired.append({
             "scope": list(key),
@@ -567,210 +524,74 @@ def _unit_display_by_raw(db: Session, raw_units: Sequence[Any]) -> Dict[str, str
     return result
 
 
-def create_orders_from_mrp(
+def materialize_make_work_items(
     db: Session,
-    planned_order_ids: Sequence[int],
+    work_item_ids: Sequence[int],
     *,
     initiated_by: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Materialize selected MRP planned_order rows into internal production
-    orders (ProductionOrder.source='mrp', ProductionProduct.source_planned_
-    order_id=...).
-
-    Idempotent per the plan: if a planned_order is already backed by a
-    ProductionProduct, it is returned in `reused` and no duplicate is made.
-    The partial UNIQUE INDEX ux_production_products_source_planned_order
-    enforces this at the DB layer as a safety net.
-
-    Each internal order gets a single line with quantity / remaining_qty
-    equal to the planned_order's planned_qty, and a ProductionOrderLineState
-    row in status='new' / issue_status='not_requested'.
-    """
-    selected_ids = [int(value) for value in planned_order_ids]
-    selected = (
-        db.query(PlannedOrder)
-        .filter(PlannedOrder.order_id.in_(selected_ids))
-        .all()
-    )
-    if len({int(row.order_id) for row in selected}) != len(set(selected_ids)):
-        raise MrpMutationLineageError("one or more selected planned orders do not exist")
-    run_ids = {int(row.run_id) for row in selected}
-    if len(run_ids) != 1:
-        raise MrpMutationLineageError("selected planned orders have mixed or empty runs")
-    run, generation_id = require_current_run(
-        db, run_ids.pop(), consumer="production_control.create_orders_from_mrp"
-    )
-    require_selected_proposals(
-        db,
-        selected,
-        run=run,
-        generation_id=generation_id,
-        consumer="production_control.create_orders_from_mrp",
-    )
-
-    created: List[Dict[str, Any]] = []
-    reused: List[Dict[str, Any]] = []
-    skipped: List[Dict[str, Any]] = []
-    errors: List[str] = []
-
-    today = datetime.now(timezone.utc)
-    for pid_raw in planned_order_ids:
-        try:
-            pid = int(pid_raw)
-        except Exception:
-            errors.append(f"planned_order_id={pid_raw!r}: невалидный идентификатор")
-            continue
-
-        planned = db.query(PlannedOrder).filter(PlannedOrder.order_id == pid).first()
-        if not planned:
-            errors.append(f"planned_order_id={pid}: запись MRP не найдена")
-            continue
-
-        item = db.query(Item).filter(Item.item_id == int(planned.item_id)).first()
-        if not item:
-            errors.append(f"planned_order_id={pid}: номенклатура {planned.item_id} не найдена")
-            continue
-
-        # Сварная деталь активной пары «окраска↔сварка» заказывается по цепочке
-        # от окраски, не самостоятельно. Сироты (без активной пары) не блокируются.
-        if is_welded_blocked(db, [int(planned.item_id)]):
-            skipped.append({
-                "planned_order_id": pid,
-                "item_id": int(planned.item_id),
-                "reason": "заказывается по цепочке от окраски",
-            })
-            continue
-
-        # Idempotency check at the application layer (cheap, friendly error)
-        existing_product = (
-            db.query(ProductionProduct)
-            .filter(ProductionProduct.source_planned_order_id == pid)
-            .order_by(ProductionProduct.product_id.desc())
-            .first()
-        )
-        if existing_product is not None:
-            if (
-                existing_product.ledger_generation_id is None
-                or int(existing_product.ledger_generation_id) != generation_id
-            ):
-                raise MrpMutationLineageError(
-                    f"planned_order_id={pid}: existing materialization has stale Ledger lineage"
-                )
-            existing_order = (
-                db.query(ProductionOrder)
-                .filter(ProductionOrder.order_id == existing_product.order_id)
-                .first()
-            )
-            reused.append(
-                {
-                    "planned_order_id": pid,
-                    "product_id": int(existing_product.product_id),
-                    "order_id": int(existing_product.order_id),
-                    "order_number": str(existing_order.order_number) if existing_order else None,
-                    "item_id": int(planned.item_id),
-                    "item_name": str(item.item_name or ""),
-                }
-            )
-            continue
-
-        qty = _to_float(planned.planned_qty) or _to_float(planned.qty)
-        if qty <= 0:
-            errors.append(f"planned_order_id={pid}: planned_qty={planned.planned_qty!r} вЂ” нечего материализовать")
-            continue
-
-        # Deterministic, traceable internal number вЂ” also unique because
-        # production_orders.order_number is indexed (not unique-constrained,
-        # but planned_order.order_id never repeats within a planning_run).
-        order_number = f"MRP-{int(planned.run_id)}-{pid}"
-        order = ProductionOrder(
-            order_number=order_number,
-            order_date=today,
-            order_ref1c=None,
-            is_posted=False,
-            deletion_mark=False,
-            source="mrp",
-            source_run_id=int(planned.run_id),
-        )
-        db.add(order)
-        db.flush()
-
-        product = ProductionProduct(
-            order_id=int(order.order_id),
-            item_id=int(planned.item_id),
-            line_number=1,
-            quantity=qty,
-            produced_qty=0,
-            remaining_qty=qty,
-            spec_id=_default_spec_id_for_item(db, int(planned.item_id)),
-            source_planned_order_id=pid,
-            ledger_generation_id=generation_id,
-        )
-        db.add(product)
-        db.flush()
-
-        state = ProductionOrderLineState(
-            product_id=int(product.product_id),
-            status="shortage",
-            issue_status="not_requested",
-            planned_start_date=planned.start_date,
-            planned_finish_date=planned.finish_date or planned.need_date,
-        )
-        db.add(state)
-
-        created.append(
-            {
-                "planned_order_id": pid,
-                "product_id": int(product.product_id),
-                "order_id": int(order.order_id),
-                "order_number": order_number,
-                "item_id": int(planned.item_id),
-                "item_name": str(item.item_name or ""),
-                "qty": qty,
-            }
-        )
-
-    db.commit()
-    return {"status": "ok", "created": created, "reused": reused, "skipped": skipped, "errors": errors, "initiated_by": initiated_by}
-
-
-def create_production_orders_from_mrp_requirements(
-    db: Session,
-    requirement_ids: Sequence[int],
-    *,
-    initiated_by: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Materialize selected MrpRequirement rows (production-flow items) into
-    internal production orders (ProductionOrder.source='mrp').
-
-    Only production-flow items are processed; purchase/rework requirements are
-    skipped (they are covered by PlannedPurchase / PlannedRework instead).
+    Materialize canonical make work items into internal production orders.
 
     Idempotent: if a ProductionProduct already links to this requirement via
     source_mrp_requirement_id, the existing order is returned in `reused` and
     no duplicate is created.
 
-    MrpRequirement.covered_qty / remaining_qty are updated to reflect newly
-    created orders.
+    The frozen requirement and its Ledger reservation are never mutated.
     """
-    selected_ids = [int(value) for value in requirement_ids]
+    selected_ids = [int(value) for value in work_item_ids]
     selected = (
-        db.query(MrpRequirement)
-        .filter(MrpRequirement.id.in_(selected_ids))
+        db.query(ReplenishmentWorkItem)
+        .filter(ReplenishmentWorkItem.id.in_(selected_ids))
         .all()
     )
     if len({int(row.id) for row in selected}) != len(set(selected_ids)):
-        raise MrpMutationLineageError("one or more selected MRP requirements do not exist")
+        raise MrpMutationLineageError("one or more selected work items do not exist")
     run_ids = {int(row.run_id) for row in selected}
     if len(run_ids) != 1:
-        raise MrpMutationLineageError("selected MRP requirements have mixed or empty runs")
+        raise MrpMutationLineageError("selected work items have mixed or empty runs")
     run, generation_id = require_current_run(
         db,
         run_ids.pop(),
-        consumer="production_control.create_production_orders_from_mrp_requirements",
+        consumer="production_control.materialize_make_work_items",
     )
-    require_selected_requirements(selected, run=run)
+    if any(
+        int(row.ledger_generation_id) != generation_id
+        or row.replenishment_method != "make"
+        for row in selected
+    ):
+        raise MrpMutationLineageError(
+            "selected work items are not current-generation make obligations"
+        )
+    selected_reservations = [
+        db.get(ReservationEntry, int(row.reservation_id)) for row in selected
+    ]
+    if any(
+        reservation is None
+        or int(reservation.ledger_generation_id) != generation_id
+        or str(reservation.lifecycle_status) != "active"
+        or str(reservation.realization_mode) != "make"
+        or int(reservation.requirement_id) != int(work.requirement_id)
+        or int(reservation.item_id) != int(work.item_id)
+        or int(reservation.run_id) != int(work.run_id)
+        for work, reservation in zip(selected, selected_reservations)
+    ):
+        raise MrpMutationLineageError(
+            "selected work items have invalid reservation lineage"
+        )
+    selected_requirements = [
+        db.get(MrpRequirement, int(row.requirement_id)) for row in selected
+    ]
+    if any(
+        requirement is None
+        or int(requirement.run_id) != int(run.run_id)
+        or requirement.freeze_version is None
+        or int(requirement.freeze_version) != int(run.active_freeze_version)
+        for requirement in selected_requirements
+    ):
+        raise MrpMutationLineageError(
+            "selected work items are outside the current active freeze"
+        )
 
     created: List[Dict[str, Any]] = []
     reused: List[Dict[str, Any]] = []
@@ -779,31 +600,27 @@ def create_production_orders_from_mrp_requirements(
 
     today = datetime.now(timezone.utc)
 
-    for rid_raw in requirement_ids:
+    work_by_id = {int(row.id): row for row in selected}
+    for work_id_raw in work_item_ids:
         try:
-            rid = int(rid_raw)
+            work_id = int(work_id_raw)
         except Exception:
-            errors.append(f"requirement_id={rid_raw!r}: невалидный идентификатор")
+            errors.append(f"work_item_id={work_id_raw!r}: невалидный идентификатор")
             continue
 
-        req = db.query(MrpRequirement).filter(MrpRequirement.id == rid).first()
+        work = work_by_id.get(work_id)
+        if work is None:
+            errors.append(f"work_item_id={work_id}: рабочая строка не найдена")
+            continue
+        rid = int(work.requirement_id)
+        req = db.get(MrpRequirement, rid)
         if not req:
-            errors.append(f"requirement_id={rid}: требование не найдено")
+            errors.append(f"work_item_id={work_id}: требование не найдено")
             continue
 
         item = db.query(Item).filter(Item.item_id == int(req.item_id)).first()
         if not item:
             errors.append(f"requirement_id={rid}: номенклатура {req.item_id} не найдена")
-            continue
-
-        # Only production-flow items get production orders
-        flow = classify_replenishment_flow(getattr(item, "replenishment_method", None))
-        if flow != REPLENISHMENT_FLOW_PRODUCTION:
-            skipped.append({
-                "requirement_id": rid,
-                "item_id": int(req.item_id),
-                "reason": f"flow={flow}",
-            })
             continue
 
         # Сварная деталь активной пары «окраска↔сварка» не заказывается
@@ -817,7 +634,17 @@ def create_production_orders_from_mrp_requirements(
             })
             continue
 
-        net_qty = _to_float(req.net_required_qty)
+        net_qty = _to_float(work.replenishment_remaining_qty)
+        if net_qty <= 1e-9:
+            skipped.append(
+                {
+                    "work_item_id": work_id,
+                    "requirement_id": rid,
+                    "item_id": int(req.item_id),
+                    "reason": "replenishment already fulfilled",
+                }
+            )
+            continue
         active_products = _active_mrp_products_for_requirement(db, req)
         if active_products:
             for product, order in active_products:
@@ -828,7 +655,9 @@ def create_production_orders_from_mrp_requirements(
                     raise MrpMutationLineageError(
                         f"requirement_id={rid}: existing materialization has stale Ledger lineage"
                     )
-                reused.append(_reused_product_payload(product, order, requirement_id=rid))
+                payload = _reused_product_payload(product, order, requirement_id=rid)
+                payload["work_item_id"] = work_id
+                reused.append(payload)
             skipped.append({
                 "requirement_id": rid,
                 "item_id": int(req.item_id),
@@ -894,6 +723,7 @@ def create_production_orders_from_mrp_requirements(
             db.add(state)
 
             created.append({
+                "work_item_id": work_id,
                 "requirement_id": rid,
                 "product_id": int(product.product_id),
                 "order_id": int(order.order_id),
@@ -997,11 +827,6 @@ def list_journal(
     run_id = accepted_run_ids[0] if len(accepted_run_ids) == 1 else None
     latest_run = db.query(PlanningRun).filter(PlanningRun.run_id == run_id).first() if run_id is not None else None
     requested_coverage_status = str(coverage_status) if coverage_status else None
-    failed_manufacture_products = (
-        select(ProductionManufacture.product_id)
-        .filter(ProductionManufacture.status == "error")
-    )
-
     query = (
         db.query(ProductionProduct)
         .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
@@ -1009,14 +834,12 @@ def list_journal(
         .outerjoin(ProductionOrderLineState, ProductionOrderLineState.product_id == ProductionProduct.product_id)
         .filter(ProductionOrder.deletion_mark == False)
         .filter(or_(ProductionOrder.order_state_key.is_(None), func.lower(ProductionOrder.order_state_key) != DONE_STATE_KEY))
-        .filter(or_(
-            func.coalesce(ProductionProduct.remaining_qty, ProductionProduct.quantity) > 0,
-            ProductionProduct.product_id.in_(failed_manufacture_products),
-        ))
-        .filter(or_(
-            func.coalesce(ProductionOrderLineState.status, "shortage").notin_(tuple(_TERMINAL_LINE_STATUSES)),
-            ProductionProduct.product_id.in_(failed_manufacture_products),
-        ))
+        .filter(func.coalesce(ProductionProduct.remaining_qty, ProductionProduct.quantity) > 0)
+        .filter(
+            func.coalesce(ProductionOrderLineState.status, "shortage").notin_(
+                tuple(_TERMINAL_LINE_STATUSES)
+            )
+        )
         .options(
             joinedload(ProductionProduct.order),
             joinedload(ProductionProduct.item),
@@ -1024,7 +847,7 @@ def list_journal(
         )
     )
 
-    # 1C/DBR work stays visible on its own factual lineage.  MRP-originated
+    # 1C work stays visible on its own factual lineage. MRP-originated
     # work, however, is an obligation projection and is valid only when its
     # source snapshot belongs to the exact published generation and a fixed
     # production plan.  A missing source_run_id is legacy/ambiguous, not a
@@ -1054,12 +877,7 @@ def list_journal(
         query = query.filter(func.coalesce(ProductionOrderLineState.status, "shortage").in_(status_values))
     if planning_contour:
         contour = str(planning_contour).strip().lower()
-        if contour == "dbr_feeder":
-            query = query.join(
-                DbrFeederSignal,
-                DbrFeederSignal.id == ProductionProduct.source_dbr_signal_id,
-            )
-        elif contour in {"mrp", "1c", "dbr"}:
+        if contour in {"mrp", "1c"}:
             query = query.filter(ProductionOrder.source == contour)
         else:
             raise ValueError("unknown planning_contour")
@@ -1088,13 +906,7 @@ def list_journal(
         requested_offset = max(0, int(offset or 0))
         max_offset = max(0, ((total - 1) // effective_limit) * effective_limit) if total else 0
         effective_offset = min(requested_offset, max_offset)
-        if sort_field == "dbr_priority" and str(planning_contour or "").strip().lower() == "dbr_feeder":
-            query = query.order_by(
-                DbrFeederSignal.kit_force.desc(),
-                DbrFeederSignal.priority.desc(),
-                DbrFeederSignal.id.asc(),
-            )
-        elif sort_field in {"planned_start_date", "planned_finish_date"}:
+        if sort_field in {"planned_start_date", "planned_finish_date"}:
             planned_dates_sq = (
                 db.query(
                     PlannedOrder.item_id.label("item_id"),
@@ -1172,17 +984,6 @@ def list_journal(
         for product in rows
         if getattr(product, "source_mrp_requirement_id", None) is not None
     })
-    dbr_signal_ids = sorted({
-        int(product.source_dbr_signal_id)
-        for product in rows
-        if getattr(product, "source_dbr_signal_id", None) is not None
-    })
-    dbr_by_id: Dict[int, DbrFeederSignal] = {}
-    if dbr_signal_ids:
-        dbr_by_id = {
-            int(signal.id): signal
-            for signal in db.query(DbrFeederSignal).filter(DbrFeederSignal.id.in_(dbr_signal_ids)).all()
-        }
     planned_due_by_id: Dict[int, date] = {}
     if planned_order_ids:
         for row in (
@@ -1194,22 +995,38 @@ def list_journal(
                 planned_due_by_id[int(row.order_id)] = row.need_date
     req_meta_by_id: Dict[int, Dict[str, Any]] = {}
     if req_ids:
+        work_by_requirement = {
+            int(row.requirement_id): row
+            for row in (
+                db.query(ReplenishmentWorkItem)
+                .filter(
+                    ReplenishmentWorkItem.requirement_id.in_(req_ids),
+                    ReplenishmentWorkItem.replenishment_method == "make",
+                    ReplenishmentWorkItem.ledger_generation_id == int(truth.generation_id),
+                )
+                .all()
+            )
+        }
         for row in (
             db.query(
                 MrpRequirement.id,
                 MrpRequirement.period_to,
-                MrpRequirement.net_required_qty,
-                MrpRequirement.covered_qty,
-                MrpRequirement.remaining_qty,
             )
             .filter(MrpRequirement.id.in_(req_ids))
             .all()
         ):
+            work = work_by_requirement.get(int(row.id))
             req_meta_by_id[int(row.id)] = {
                 "period_to": row.period_to,
-                "net_required_qty": _to_float(row.net_required_qty),
-                "covered_qty": _to_float(row.covered_qty),
-                "remaining_qty": _to_float(row.remaining_qty),
+                "net_required_qty": (
+                    _to_float(work.replenishment_required_qty) if work else None
+                ),
+                "covered_qty": (
+                    _to_float(work.replenishment_fulfilled_qty) if work else None
+                ),
+                "remaining_qty": (
+                    _to_float(work.replenishment_remaining_qty) if work else None
+                ),
             }
     item_ids = sorted({int(product.item_id) for product in rows if product.item_id is not None})
     product_ids = sorted({int(product.product_id) for product in rows if product.product_id is not None})
@@ -1229,17 +1046,6 @@ def list_journal(
             .all()
         ):
             issue_count_by_product[int(row.product_id)] = int(row.issue_count or 0)
-    failed_manufacture_by_product: Dict[int, ProductionManufacture] = {}
-    if product_ids:
-        failed_rows = (
-            db.query(ProductionManufacture)
-            .filter(ProductionManufacture.product_id.in_(product_ids))
-            .filter(ProductionManufacture.status == "error")
-            .order_by(ProductionManufacture.product_id.asc(), ProductionManufacture.manufacture_id.desc())
-            .all()
-        )
-        for manufacture in failed_rows:
-            failed_manufacture_by_product.setdefault(int(manufacture.product_id), manufacture)
     unit_by_raw = _unit_display_by_raw(db, [getattr(product.item, "unit", None) for product in rows if product.item])
 
     # Цепочки «окраска↔сварка» (этап 4): признак роли строки и вторая сторона —
@@ -1315,8 +1121,6 @@ def list_journal(
         due_date = None
         source_planned_order_id = int(product.source_planned_order_id) if product.source_planned_order_id is not None else None
         source_mrp_requirement_id = int(product.source_mrp_requirement_id) if product.source_mrp_requirement_id is not None else None
-        source_dbr_signal_id = int(product.source_dbr_signal_id) if product.source_dbr_signal_id is not None else None
-        dbr_signal = dbr_by_id.get(source_dbr_signal_id or 0)
         if source_planned_order_id is not None:
             due_date = planned_due_by_id.get(source_planned_order_id)
         req_meta = req_meta_by_id.get(source_mrp_requirement_id or 0, {})
@@ -1331,7 +1135,6 @@ def list_journal(
             order_one_c_number = str(product.order.order_number or "")
 
         issue_count = issue_count_by_product.get(int(product.product_id), 0)
-        failed_manufacture = failed_manufacture_by_product.get(int(product.product_id))
         line_status = str(state.status if state else "shortage")
         issue_status = str(state.issue_status if state else "not_requested")
         material_coverage_status = str(getattr(state, "material_coverage_status", "") or "")
@@ -1341,8 +1144,6 @@ def list_journal(
             work_status = _journal_work_status(row_coverage_status)
         else:
             work_status = _journal_work_status(line_status)
-        if failed_manufacture is not None:
-            work_status = "production_error"
         coverage_label = (
             material_coverage_label
             if row_coverage_status == material_coverage_status and material_coverage_label
@@ -1390,13 +1191,9 @@ def list_journal(
                 "issue_count": int(issue_count),
                 "route_sheet_printed_at": _date_to_iso(state.route_sheet_printed_at) if state else None,
                 "comment": str(state.comment or "") if state else "",
-                "failed_manufacture_id": int(failed_manufacture.manufacture_id) if failed_manufacture else None,
-                "failed_manufacture_error": str(failed_manufacture.export_error or "") if failed_manufacture else None,
                 "source_run_id": int(product.order.source_run_id) if product.order.source_run_id is not None else None,
                 **source_plan,
                 "source_planned_order_id": source_planned_order_id,
-                "source_dbr_signal_id": source_dbr_signal_id,
-                "planning": _dbr_planning_payload(dbr_signal) if dbr_signal else None,
                 "source_mrp_requirement_id": source_mrp_requirement_id,
                 "source_mrp_allocation_key": str(product.source_mrp_allocation_key or "") if product.source_mrp_allocation_key else None,
                 "mrp_req_net_qty": req_meta.get("net_required_qty"),
@@ -1429,31 +1226,6 @@ def list_journal(
         "latest_run_id": run_id,
         "latest_source_plan_id": int(latest_run.source_plan_id) if latest_run and latest_run.source_plan_id is not None else None,
     }
-
-
-def _adjust_requirement_coverage(db: Session, product: ProductionProduct, delta_covered: float) -> None:
-    """
-    Shift the backing MrpRequirement.covered_qty by `delta_covered` (signed) and
-    recompute remaining_qty, clamped to [0, net_required_qty].
-
-    Mirrors the coverage bump done at materialization
-    (create_production_orders_from_mrp_requirements). A negative delta releases
-    coverage so the residual demand becomes visible again — used when a line is
-    closed/cancelled with an un-produced remainder, or its planned quantity is
-    reduced. No-op for lines that are not backed by an MrpRequirement
-    (1C-source lines, planned-order-source lines).
-    """
-    rid = getattr(product, "source_mrp_requirement_id", None)
-    if rid is None:
-        return
-    req = db.query(MrpRequirement).filter(MrpRequirement.id == int(rid)).first()
-    if req is None:
-        return
-    net_qty = _to_float(req.net_required_qty)
-    new_covered = _to_float(req.covered_qty) + float(delta_covered)
-    new_covered = max(0.0, min(new_covered, net_qty))
-    req.covered_qty = new_covered
-    req.remaining_qty = max(net_qty - new_covered, 0.0)
 
 
 # Terminal states that close a line: a remainder left un-produced here is never
@@ -1489,7 +1261,6 @@ def update_line_state(db: Session, product_id: int, payload: Dict[str, Any]) -> 
         if status in _TERMINAL_LINE_STATUSES and prev_status not in _TERMINAL_LINE_STATUSES:
             released = _to_float(product.remaining_qty)
             if released > 1e-9:
-                _adjust_requirement_coverage(db, product, -released)
                 product.remaining_qty = 0.0
     if "issue_status" in payload and payload.get("issue_status"):
         issue_status = str(payload.get("issue_status")).strip()
@@ -1566,7 +1337,7 @@ def cancel_local_order(db: Session, product_id: int) -> Dict[str, Any]:
     issues = (
         db.query(ProductionMaterialIssue)
         .filter(ProductionMaterialIssue.product_id.in_(product_ids))
-        .filter(ProductionMaterialIssue.direction.in_(("issue", "in_place")))
+        .filter(ProductionMaterialIssue.direction == "issue")
         .all()
     )
     linked_issues = [issue for issue in issues if _material_issue_has_1c_link(db, issue)]
@@ -1585,7 +1356,6 @@ def cancel_local_order(db: Session, product_id: int) -> Dict[str, Any]:
         if state.status != "cancelled":
             qty_to_release = _to_float(row.remaining_qty)
             if qty_to_release > 1e-9:
-                _adjust_requirement_coverage(db, row, -qty_to_release)
                 released_qty += qty_to_release
                 row.remaining_qty = 0.0
             state.status = "cancelled"
@@ -1626,14 +1396,8 @@ def update_product_quantity(db: Session, product_id: int, quantity: float) -> Di
             "Нельзя уменьшить заказ ниже факта."
         )
 
-    old_qty = _to_float(product.quantity)
     product.quantity = qty
     product.remaining_qty = max(0.0, qty - produced)
-    # Keep the backing requirement's coverage in sync: shrinking the line frees
-    # coverage (exposes residual demand), growing it consumes more.
-    delta = qty - old_qty
-    if abs(delta) > 1e-9:
-        _adjust_requirement_coverage(db, product, delta)
     material_issues_refresh = refresh_existing_material_issues_for_product(db, product)
     db.commit()
     payload: Dict[str, Any] = {
@@ -1643,15 +1407,4 @@ def update_product_quantity(db: Session, product_id: int, quantity: float) -> Di
         "remaining_qty": float(product.remaining_qty),
         "material_issues_refresh": material_issues_refresh,
     }
-    rid = getattr(product, "source_mrp_requirement_id", None)
-    if rid is not None:
-        req = db.query(MrpRequirement).filter(MrpRequirement.id == int(rid)).first()
-        if req is not None:
-            payload.update(
-                {
-                    "mrp_req_net_qty": _to_float(req.net_required_qty),
-                    "mrp_req_covered_qty": _to_float(req.covered_qty),
-                    "mrp_req_remaining_qty": _to_float(req.remaining_qty),
-                }
-            )
     return payload

@@ -7,28 +7,25 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
+from .. import models
 from ..services import planning_truth
 from ..routers.truth_meta import TruthMeta, build_truth_meta
 from ..database import get_db
 from ..models import DefaultSpecification, Employee, Operation, ProductionProduct, ProductionStage, Specification, SpecOperation
-from ..schemas import ODataSyncRequest
 from ..services.one_c_manufacture_export import export_manufactures_to_1c
-from ..services.one_c_order_completion_repair import repair_prodplan_order_completion_success
-from ..services.one_c_piecework_export import export_piecework_to_1c
 from ..services.one_c_posted_transfer_sync import sync_posted_transfers
+from ..services.one_c_piecework_export import export_piecework_to_1c
 from ..services.one_c_production_order_export import export_production_orders_to_1c
 from ..services.one_c_stock_transfer_export import export_material_issues_to_1c
 from ..services.production_control_material_issues import (
     assemble_material_issue,
     create_material_issues,
     delete_local_material_issue,
-    export_issue_to_1c,  # retained only so tests prove the retired route never calls it
     get_issue,
     list_material_issues,
 )
 from ..services.production_control_journal import (
-    create_orders_from_mrp,
-    create_production_orders_from_mrp_requirements,
+    materialize_make_work_items,
     cancel_local_order,
     dedupe_mrp_production_orders,
     list_journal,
@@ -46,11 +43,295 @@ from ..services.production_control_production_flow import (
     return_leftover_components,
     rollback_local_manufacture,
 )
-from ..services.production_reservation_repair import repair_in_place_reservations
 from .production_control_settings import router as settings_router
 
 
 router = APIRouter(prefix="/v1/production-control", tags=["production-control"])
+
+
+class AssemblyQueueRow(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    plan_id: int
+    plan_line_id: int
+    run_id: int
+    item_id: int
+    item_code: str
+    item_name: str
+    bucket_date: str
+    period_from: str
+    period_to: str
+    planned_output_qty: float
+    accepted_plan_output_qty: float
+    assembly_remaining_qty: float
+    priority_key: list[Union[str, int]]
+
+
+class AssemblyQueueResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rows: list[AssemblyQueueRow]
+    total_rows: int
+    total_queue_qty: float
+    truth_meta: TruthMeta
+
+
+class DrumSlotRow(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    plan_id: int
+    plan_line_id: int
+    item_id: int
+    resource_id: int
+    slot_date: str
+    slot_qty: float
+    slot_ordinal: int
+    original_priority: list[Union[str, int]]
+
+
+class DrumGapRow(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    plan_id: int
+    plan_line_id: int
+    item_id: int
+    resource_id: int
+    gap_date: str
+    gap_qty: float
+    original_priority: list[Union[str, int]]
+
+
+class DrumScheduleResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schedule_from: str
+    schedule_to: str
+    slots: list[DrumSlotRow]
+    gaps: list[DrumGapRow]
+    total_open_qty: float
+    total_slot_qty: float
+    total_gap_qty: float
+    truth_meta: TruthMeta
+
+
+class ShelfProjectionRow(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    policy_id: int
+    item_id: int
+    warehouse_ref1c: str
+    protection_until: str
+    target_qty: float
+    shelf_physical_qty: float
+    other_stock_qty: float
+    projected_qty: float
+    gap_qty: float
+    transfer_qty: float
+    unlaunched_mrp_qty: float
+    pull_qty: float
+    materialized_qty: float
+    first_shortage_date: str | None
+    latest_start_date: str | None
+
+
+class ShelfProjectionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rows: list[ShelfProjectionRow]
+    total_rows: int
+    truth_meta: TruthMeta
+
+
+@router.get("/assembly-queue", response_model=AssemblyQueueResponse)
+def get_assembly_queue(
+    db: Session = Depends(get_db),
+) -> AssemblyQueueResponse:
+    """Read the immutable queue belonging to the exact accepted generation."""
+    try:
+        snapshot = planning_truth.get_latest_read_snapshot(
+            db,
+            consumer="assembly_queue",
+            snapshot_key="current:v1",
+            required_capabilities=(
+                planning_truth.CAPABILITY_PHYSICAL_LEDGER,
+                planning_truth.CAPABILITY_RESERVATION_REPLAY,
+                planning_truth.CAPABILITY_PLANNING_SNAPSHOTS,
+                planning_truth.CAPABILITY_ASSEMBLY_QUEUE,
+            ),
+        )
+    except planning_truth.PlanningTruthUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+    if snapshot is None:
+        readiness = planning_truth.get_truth_state(db)
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "assembly_queue_unavailable",
+                "reason": "assembly queue snapshot is missing for accepted generation",
+                **readiness.as_dict(),
+            },
+        )
+    payload = dict(snapshot.payload or {})
+    response = {
+        "rows": list(payload.get("rows") or []),
+        "total_rows": int(payload.get("total_rows") or 0),
+        "total_queue_qty": float(payload.get("total_queue_qty") or 0),
+        "truth_meta": build_truth_meta(planning_truth.get_truth_state(db)),
+    }
+    return AssemblyQueueResponse.model_validate(response)
+
+
+@router.get("/drum", response_model=DrumScheduleResponse)
+def get_drum_schedule(db: Session = Depends(get_db)) -> DrumScheduleResponse:
+    """Read the persisted drum of the exact accepted generation."""
+    try:
+        truth = planning_truth.require_accepted_truth(
+            db,
+            "drum_schedule",
+            required_capabilities=(
+                planning_truth.CAPABILITY_PHYSICAL_LEDGER,
+                planning_truth.CAPABILITY_ASSEMBLY_QUEUE,
+                planning_truth.CAPABILITY_DRUM_SCHEDULE,
+            ),
+        )
+    except planning_truth.PlanningTruthUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+    schedule = (
+        db.query(models.DrumSchedule)
+        .filter(models.DrumSchedule.ledger_generation_id == truth.generation_id)
+        .one_or_none()
+    )
+    if schedule is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "drum_schedule_unavailable",
+                "reason": "drum schedule is missing for accepted generation",
+                **truth.as_dict(),
+            },
+        )
+    slots = (
+        db.query(models.DrumSlot)
+        .filter(models.DrumSlot.drum_schedule_id == schedule.id)
+        .order_by(
+            models.DrumSlot.slot_date,
+            models.DrumSlot.resource_id,
+            models.DrumSlot.slot_ordinal,
+            models.DrumSlot.id,
+        )
+        .all()
+    )
+    gaps = (
+        db.query(models.DrumCapacityGap)
+        .filter(models.DrumCapacityGap.drum_schedule_id == schedule.id)
+        .order_by(
+            models.DrumCapacityGap.gap_date,
+            models.DrumCapacityGap.resource_id,
+            models.DrumCapacityGap.id,
+        )
+        .all()
+    )
+    return DrumScheduleResponse.model_validate(
+        {
+            "schedule_from": schedule.schedule_from.isoformat(),
+            "schedule_to": schedule.schedule_to.isoformat(),
+            "slots": [
+                {
+                    "plan_id": row.plan_id,
+                    "plan_line_id": row.plan_line_id,
+                    "item_id": row.item_id,
+                    "resource_id": row.resource_id,
+                    "slot_date": row.slot_date.isoformat(),
+                    "slot_qty": float(row.slot_qty),
+                    "slot_ordinal": row.slot_ordinal,
+                    "original_priority": list(row.original_priority or []),
+                }
+                for row in slots
+            ],
+            "gaps": [
+                {
+                    "plan_id": row.plan_id,
+                    "plan_line_id": row.plan_line_id,
+                    "item_id": row.item_id,
+                    "resource_id": row.resource_id,
+                    "gap_date": row.gap_date.isoformat(),
+                    "gap_qty": float(row.gap_qty),
+                    "original_priority": list(row.original_priority or []),
+                }
+                for row in gaps
+            ],
+            "total_open_qty": float(schedule.total_open_qty),
+            "total_slot_qty": float(schedule.total_slot_qty),
+            "total_gap_qty": float(schedule.total_gap_qty),
+            "truth_meta": build_truth_meta(truth),
+        }
+    )
+
+
+@router.get("/shelves", response_model=ShelfProjectionResponse)
+def get_shelf_projections(
+    db: Session = Depends(get_db),
+) -> ShelfProjectionResponse:
+    """Read persisted shelf pull priorities of the accepted generation."""
+    try:
+        truth = planning_truth.require_accepted_truth(
+            db,
+            "shelf_projection",
+            required_capabilities=(
+                planning_truth.CAPABILITY_PHYSICAL_LEDGER,
+                planning_truth.CAPABILITY_DRUM_SCHEDULE,
+                planning_truth.CAPABILITY_SHELF_PROJECTION,
+            ),
+        )
+    except planning_truth.PlanningTruthUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+    rows = (
+        db.query(models.ShelfProjection)
+        .filter(
+            models.ShelfProjection.ledger_generation_id == truth.generation_id
+        )
+        .order_by(
+            models.ShelfProjection.latest_start_date.asc().nullslast(),
+            models.ShelfProjection.item_id,
+            models.ShelfProjection.id,
+        )
+        .all()
+    )
+    payload = [
+        {
+            "policy_id": row.shelf_policy_id,
+            "item_id": row.item_id,
+            "warehouse_ref1c": row.warehouse_ref1c,
+            "protection_until": row.protection_until.isoformat(),
+            "target_qty": float(row.target_qty),
+            "shelf_physical_qty": float(row.shelf_physical_qty),
+            "other_stock_qty": float(row.other_stock_qty),
+            "projected_qty": float(row.projected_qty),
+            "gap_qty": float(row.gap_qty),
+            "transfer_qty": float(row.transfer_qty),
+            "unlaunched_mrp_qty": float(row.unlaunched_mrp_qty),
+            "pull_qty": float(row.pull_qty),
+            "materialized_qty": float(row.materialized_qty),
+            "first_shortage_date": (
+                row.first_shortage_date.isoformat()
+                if row.first_shortage_date
+                else None
+            ),
+            "latest_start_date": (
+                row.latest_start_date.isoformat()
+                if row.latest_start_date
+                else None
+            ),
+        }
+        for row in rows
+    ]
+    return ShelfProjectionResponse.model_validate(
+        {
+            "rows": payload,
+            "total_rows": len(payload),
+            "truth_meta": build_truth_meta(truth),
+        }
+    )
 
 
 @router.get("/employees", response_model=dict)
@@ -153,13 +434,8 @@ class MaterialIssueCreatePayload(BaseModel):
     source_warehouse_ref1c: Optional[str] = None
 
 
-class OrdersFromMrpPayload(BaseModel):
-    planned_order_ids: List[int]
-    initiated_by: Optional[str] = None
-
-
-class OrdersFromMrpRequirementsPayload(BaseModel):
-    requirement_ids: List[int]
+class OrdersFromWorkItemsPayload(BaseModel):
+    work_item_ids: List[int]
     initiated_by: Optional[str] = None
 
 
@@ -181,23 +457,6 @@ class ExportMaterialIssuesPayload(BaseModel):
     issue_ids: List[int]
     dry_run: bool = True
     allow_production: bool = False
-
-
-class AssembleMaterialIssuePayload(BaseModel):
-    allow_production: bool = False
-
-
-class InPlaceReservationRepairPayload(BaseModel):
-    product_ids: List[int]
-    initiated_by: Optional[str] = None
-    warehouse_ref1c: Optional[str] = None
-    dry_run: bool = True
-
-
-class PrintRouteSheetsPayload(BaseModel):
-    product_ids: List[int]
-    mark_printed: bool = True
-    auto_print: bool = True
 
 
 class ProduceLinePayload(BaseModel):
@@ -225,32 +484,15 @@ class ExportPieceworkPayload(BaseModel):
     allow_production: bool = False
 
 
-class OrderCompletionRepairPayload(BaseModel):
-    dry_run: bool = True
+class AssembleMaterialIssuePayload(BaseModel):
     allow_production: bool = False
-    number_prefix: str = "PP"
-    date_from: str = "2026-05-01T00:00:00"
-    max_records: int = 5000
 
 
-class ProductionOrderPlanningResponse(BaseModel):
-    """DBR provenance for a journal line; absent for non-DBR contours."""
+class PrintRouteSheetsPayload(BaseModel):
+    product_ids: List[int]
+    mark_printed: bool = True
+    auto_print: bool = True
 
-    model_config = ConfigDict(extra="forbid")
-
-    contour: str
-    source_id: int
-    schedule_id: Optional[int] = None
-    slot_id: Optional[int] = None
-    signal_type: str
-    priority: Optional[float] = None
-    zone: Optional[str] = None
-    need_date: Optional[str] = None
-    required_date: Optional[str] = None
-    queue_state: str
-    chain_depth: int = 0
-    parent_signal_id: Optional[int] = None
-    reason: Optional[str] = None
 
 
 class PaintWeldChainResponse(BaseModel):
@@ -307,8 +549,6 @@ class ProductionOrderJournalRowResponse(BaseModel):
     issue_count: int
     route_sheet_printed_at: Optional[str] = None
     comment: str
-    failed_manufacture_id: Optional[int] = None
-    failed_manufacture_error: Optional[str] = None
     source_run_id: Optional[int] = None
     source_plan_id: Optional[int] = None
     source_plan_name: Optional[str] = None
@@ -320,8 +560,6 @@ class ProductionOrderJournalRowResponse(BaseModel):
     mrp_req_net_qty: Optional[float] = None
     mrp_req_covered_qty: Optional[float] = None
     mrp_req_remaining_qty: Optional[float] = None
-    source_dbr_signal_id: Optional[int] = None
-    planning: Optional[ProductionOrderPlanningResponse] = None
     paint_weld_chain: Optional[PaintWeldChainResponse] = None
 
 
@@ -347,7 +585,7 @@ def get_orders_journal(
     coverage_status: Optional[str] = None,
     planning_contour: Optional[str] = Query(
         None,
-        description="Контур планирования: dbr_feeder для очереди мехцеха; mrp, dbr или 1c для источника заказа.",
+        description="Контур планирования: mrp или 1c для источника заказа.",
     ),
     search: Optional[str] = None,
     date_from: Optional[str] = None,
@@ -380,6 +618,8 @@ def get_orders_journal(
         )
         journal["truth_meta"] = build_truth_meta(truth).model_dump()
         return journal
+    except planning_truth.PlanningTruthUnavailable as exc:
+        raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -470,13 +710,13 @@ def post_produce_line(
     db: Session = Depends(get_db),
 ):
     """
-    Record one production event on the line. Bumps produced_qty / decreases
-    remaining_qty / promotes line status to produced_partial or produced.
-    Creates a ProductionManufacture row. Local only вЂ” does NOT send to 1C;
-    use POST /manufactures/export-to-1c for that.
+    One operator action: create the durable command, export and post
+    СборкаЗапасов, then export and post СдельныйНаряд. The assembly exporter
+    enqueues the posted recorder for immediate Item Ledger read-back. None of
+    these document writes is itself a production fact.
     """
     try:
-        return produce_line(
+        command = produce_line(
             db,
             int(product_id),
             qty=float(payload.qty),
@@ -484,6 +724,52 @@ def post_produce_line(
             operation_executors=payload.operation_executors,
             comment=payload.comment,
         )
+        manufacture_id = int(command["manufacture_id"])
+        manufacture_export = export_manufactures_to_1c(
+            db,
+            [manufacture_id],
+            dry_run=False,
+            allow_production=True,
+        )
+        manufacture_entry = (manufacture_export.get("entries") or [{}])[0]
+        manufacture_ref = str(manufacture_entry.get("target_ref_key") or "")
+        if (
+            int(manufacture_export.get("manufactures_error") or 0) > 0
+            or not manufacture_ref
+        ):
+            if not manufacture_ref:
+                rollback_local_manufacture(db, manufacture_id)
+            raise ValueError(
+                str(
+                    manufacture_entry.get("error")
+                    or manufacture_entry.get("reason")
+                    or "1С не создала и не провела СборкаЗапасов"
+                )
+            )
+        piecework_export = export_piecework_to_1c(
+            db,
+            [manufacture_id],
+            dry_run=False,
+            allow_production=True,
+        )
+        piecework_entry = (piecework_export.get("entries") or [{}])[0]
+        if (
+            int(piecework_export.get("manufactures_error") or 0) > 0
+            or not str(piecework_entry.get("target_ref_key") or "")
+        ):
+            raise ValueError(
+                str(
+                    piecework_entry.get("error")
+                    or piecework_entry.get("reason")
+                    or "1С не создала и не провела СдельныйНаряд"
+                )
+            )
+        return {
+            **command,
+            "manufacture_export": manufacture_export,
+            "piecework_export": piecework_export,
+            "ledger_readback": "queued",
+        }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -497,13 +783,8 @@ def post_return_leftovers(
     db: Session = Depends(get_db),
 ):
     """
-    Создать обратное перемещение лишних компонентов на исходные склады для
-    частично произведённой строки. Локально только вЂ” в 1С документ
-    отправится отдельно через /material-issues/export-to-1c.
-
-    Возвращает либо status='ok' с return_issue_id и list of lines, либо
-    status='skipped' с человекочитаемой причиной (produced_qty=0, нет
-    выгруженных исходящих перемещений, или нет компонентов с остатком).
+    Create inbound transfer for leftover components from partial production.
+    Export remains in /material-issues/export-to-1c.
     """
     try:
         return return_leftover_components(db, int(product_id), initiated_by=initiated_by)
@@ -519,8 +800,7 @@ def post_export_manufactures_to_1c(
     db: Session = Depends(get_db),
 ):
     """
-    Bulk-экспорт выпусков (производств) в 1С как Document_СборкаЗапасов
-    (Posted=false). РРґРµРјРїРѕС‚РµРЅС‚РЅРѕ через sync_link.
+    Bulk-экспорт выпусков в 1С как Document_СборкаЗапасов.
     """
     if not payload.manufacture_ids:
         raise HTTPException(status_code=400, detail="Не выбраны выпуски")
@@ -559,12 +839,6 @@ def post_export_piecework_to_1c(
 ):
     """
     Bulk-экспорт выпусков в 1С как Document_СдельныйНаряд.
-    Идемпотентно через sync_link (source_doctype='piecework').
-
-    Требование: каждый manufacture должен быть уже выгружен как
-    Document_СборкаЗапасов (поле exported_ref1c заполнено) — он используется
-    как ДокументОснование сдельного наряда. Операция по умолчанию берется
-    из спецификации выпуска; operation_ref нужен только для ручного override.
     """
     if not payload.manufacture_ids:
         raise HTTPException(status_code=400, detail="Не выбраны выпуски")
@@ -589,67 +863,22 @@ def post_export_piecework_to_1c(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/repair/order-completion-success", response_model=dict)
-def post_repair_order_completion_success(payload: OrderCompletionRepairPayload):
-    """
-    Backfill 1C Document_ЗаказНаПроизводство.ВариантЗавершения='Успешно'
-    for completed PRODPLAN-created orders (by Number prefix, default PP).
-    """
-    try:
-        return repair_prodplan_order_completion_success(
-            dry_run=bool(payload.dry_run),
-            allow_production=bool(payload.allow_production),
-            number_prefix=payload.number_prefix,
-            date_from=payload.date_from,
-            max_records=int(payload.max_records),
-        )
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/orders/from-mrp", response_model=dict)
-def post_orders_from_mrp(payload: OrdersFromMrpPayload, db: Session = Depends(get_db)):
-    """
-    Materialize selected MRP planned_order rows as internal production orders
-    (production_orders.source='mrp'). Idempotent: planned_orders that already
-    back a production_products line are returned under `reused`.
-    """
-    if not payload.planned_order_ids:
-        raise HTTPException(status_code=400, detail="Не выбраны строки MRP")
-    try:
-        return create_orders_from_mrp(
-            db,
-            [int(x) for x in payload.planned_order_ids],
-            initiated_by=payload.initiated_by,
-        )
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-@router.post("/orders/from-mrp-requirements", response_model=dict)
-def post_orders_from_mrp_requirements(
-    payload: OrdersFromMrpRequirementsPayload,
+@router.post("/orders/from-work-items", response_model=dict)
+def post_orders_from_work_items(
+    payload: OrdersFromWorkItemsPayload,
     db: Session = Depends(get_db),
 ):
     """
-    Materialize selected MrpRequirement rows (production-flow items from a
-    period-plan MRP snapshot) into internal production orders.
+    Materialize selected current-generation make work items into orders.
 
-    Idempotent: requirements that already have a ProductionProduct linked via
-    source_mrp_requirement_id are returned under `reused`.
-    Purchase/rework requirements are returned under `skipped`.
-    MrpRequirement.covered_qty / remaining_qty are updated.
+    Frozen requirement, reservation and work-item quantities are not changed.
     """
-    if not payload.requirement_ids:
-        raise HTTPException(status_code=400, detail="Не выбраны требования MRP")
+    if not payload.work_item_ids:
+        raise HTTPException(status_code=400, detail="Не выбраны рабочие строки")
     try:
-        return create_production_orders_from_mrp_requirements(
+        return materialize_make_work_items(
             db,
-            [int(x) for x in payload.requirement_ids],
+            [int(x) for x in payload.work_item_ids],
             initiated_by=payload.initiated_by,
         )
     except Exception as e:
@@ -798,45 +1027,6 @@ def post_material_issue_assembled(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/reservation-repair/in-place", response_model=dict)
-def post_repair_in_place_reservations(
-    payload: InPlaceReservationRepairPayload,
-    db: Session = Depends(get_db),
-):
-    if not payload.product_ids:
-        raise HTTPException(status_code=400, detail="Не выбраны строки заказа")
-    try:
-        return repair_in_place_reservations(
-            db,
-            [int(x) for x in payload.product_ids],
-            initiated_by=payload.initiated_by,
-            warehouse_ref1c=payload.warehouse_ref1c,
-            dry_run=bool(payload.dry_run),
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/material-issues/{issue_id}/export-to-1c", response_model=dict, deprecated=True)
-def post_material_issue_to_1c_legacy(
-    issue_id: int,
-    payload: ODataSyncRequest,
-    db: Session = Depends(get_db),
-):
-    """
-    Legacy: single-issue export. Kept for backwards-compatibility with
-    existing clients. Prefer POST /material-issues/export-to-1c.
-    """
-    raise HTTPException(status_code=503, detail={
-        "code": "material_issue_legacy_single_export_retired",
-        "consumer": "production_material_issue_export",
-        "status": "unavailable", "read_only": True,
-        "reason": "Deprecated single-document export is retired; immutable Ledger authorization is unavailable",
-    })
 
 
 @router.post("/sync-posted-transfers", response_model=dict)

@@ -1,4 +1,4 @@
-"""Ledger-1 running-balance / seed tests + ledger-2 DB fold (design §2, §6, §9).
+"""Ledger-1 running-balance / seed tests + ledger-2 DB fold (, , ).
 
 Covers INV-fold (bin.on_hand == Σ qty == last qty_after), INV-anchor (seed
 writes an anchor, idempotent), narrow rebuild_running_balance, and the DB
@@ -54,7 +54,7 @@ def _generation(db_session, suffix):
 
 
 # ---------------------------------------------------------------------------
-# fold_running_balance — pure (§2.1 R-A)
+# fold_running_balance — pure ( R-A)
 # ---------------------------------------------------------------------------
 
 
@@ -66,12 +66,12 @@ def test_fold_running_balance_pure():
 
 def test_fold_running_balance_allows_negative():
     qty_after, final = fold_running_balance([2, -5])
-    assert [_f(x) for x in qty_after] == [2, -3]  # not clamped (§4a)
+    assert [_f(x) for x in qty_after] == [2, -3]  # not clamped (a)
     assert _f(final) == -3
 
 
 # ---------------------------------------------------------------------------
-# seed_from_balance + INV-anchor (§2.1 seed)
+# seed_from_balance + INV-anchor ( seed)
 # ---------------------------------------------------------------------------
 
 
@@ -133,7 +133,7 @@ def test_seed_recorder_ref_fits_postgresql_limit_for_guid_dimensions(db_session)
 
 
 # ---------------------------------------------------------------------------
-# rebuild_running_balance (§6 narrow rebuild + on_hand fold)
+# rebuild_running_balance ( narrow rebuild + on_hand fold)
 # ---------------------------------------------------------------------------
 
 
@@ -212,7 +212,7 @@ def test_rebuild_running_balance_narrow_from_point(db_session):
 
 
 # ---------------------------------------------------------------------------
-# ledger-2 DB fold materialization (INV-RES-fold, §9)
+# ledger-2 DB fold materialization (INV-RES-fold, )
 # ---------------------------------------------------------------------------
 
 
@@ -232,7 +232,7 @@ def _mk_reservation(db_session):
         ledger_generation_id=generation.id,
         item_id=item.item_id, requirement_id=req.id, run_id=run.run_id, freeze_version=1,
         priority_period_from=datetime.date(2026, 7, 1), priority_period_to=datetime.date(2026, 7, 15),
-        realization_mode="consume",
+        realization_mode="make",
     )
     db_session.add(entry)
     db_session.flush()

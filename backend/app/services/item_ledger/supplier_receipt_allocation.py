@@ -13,7 +13,11 @@ from typing import Iterable
 from sqlalchemy.orm import Session
 
 from app import models
-from .reservation import append_realization_event, fold_reservation_entry
+from .reservation import (
+    append_realization_event,
+    fold_reservation_entry,
+    replenishment_remaining,
+)
 
 from .physical import canonical_content_hash, canonical_decimal
 from .physical_visibility import visible_sles_for_generation
@@ -102,7 +106,7 @@ class SupplierReceiptBuildResult:
     provenance_count: int
     exact_fact_count: int
     allocation_count: int
-    unplanned_qty: Decimal
+    surplus_qty: Decimal
 
 
 def _text(value: object) -> str:
@@ -143,7 +147,10 @@ def _entry_key(entry: models.ReservationEntry) -> int:
 
 
 def _entry_outstanding(entry: models.ReservationEntry) -> Decimal:
-    return max(_decimal(entry.reserved_qty) - _decimal(entry.realized_qty), Decimal("0"))
+    return replenishment_remaining(
+        entry.replenishment_required_qty,
+        entry.replenishment_received_qty,
+    )
 
 
 def _buy_reservation_order(entry: models.ReservationEntry) -> tuple:
@@ -226,7 +233,7 @@ def _buy_reservations_for_item(
         models.ReservationEntry.item_id == int(item_id),
         models.ReservationEntry.planning_stock_pool == "default",
         models.ReservationEntry.realization_mode == "buy",
-        models.ReservationEntry.lifecycle_status.in_(("active", "closed")),
+        models.ReservationEntry.lifecycle_status == "active",
     ).all()
     return tuple(sorted(rows, key=_buy_reservation_order))
 
@@ -294,7 +301,7 @@ def allocate_supplier_receipts(
     active_by_item: dict[int, list[CoverageAllocation]] = {}
     active_qty: dict[int, Decimal] = {}
     result: list[CoverageAllocation] = []
-    unplanned = Decimal("0")
+    surplus = Decimal("0")
     for fact in ordered:
         qty = _decimal(fact.signed_qty)
         if qty > 0:
@@ -319,7 +326,7 @@ def allocate_supplier_receipts(
                 left -= take
                 if left == 0:
                     break
-            unplanned += left
+            surplus += left
             continue
 
         left = -qty
@@ -355,7 +362,7 @@ def allocate_supplier_receipts(
                 qty=-take,
             ))
 
-    return tuple(result), unplanned
+    return tuple(result), surplus
 
 
 def _candidate_order_lines(
@@ -567,7 +574,7 @@ def _rebuild_supplier_receipt_coverage_unsafe(
         )
         for item_id in {int(fact.item_id) for fact in facts}
     }
-    allocations, unplanned = allocate_supplier_receipts(facts, reservations_by_item)
+    allocations, surplus = allocate_supplier_receipts(facts, reservations_by_item)
     realized_keys: set[tuple[int, int]] = set()
     folded_reservations: set[int] = set()
     for allocation in allocations:
@@ -600,7 +607,7 @@ def _rebuild_supplier_receipt_coverage_unsafe(
         provenance_count=provenance_count,
         exact_fact_count=exact_fact_count,
         allocation_count=len(realized_keys),
-        unplanned_qty=unplanned,
+        surplus_qty=surplus,
     )
 
 

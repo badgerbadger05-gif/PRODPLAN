@@ -22,15 +22,48 @@ def _accepted(db, key="one"):
     return generation
 
 
-def test_source_selection_ignores_foreign_item_warehouse_stock(db_session):
+def test_source_selection_uses_current_accepted_stockbin_generation_only(db_session):
     generation = _accepted(db_session)
     item = models.Item(item_code="MI-LEDGER", item_name="Ledger item")
     db_session.add_all((item, models.StockWarehouse(warehouse_ref1c="BIN", warehouse_name="BIN", is_selected=True),
                         models.StockWarehouse(warehouse_ref1c="LEGACY", warehouse_name="LEGACY", is_selected=True)))
     db_session.flush()
-    db_session.add(models.ItemWarehouseStock(item_id=item.item_id, warehouse_ref1c="LEGACY", qty=99))
-    db_session.add(models.StockBin(ledger_generation_id=generation.id, item_id=item.item_id,
-                                   characteristic_ref="", organization_ref="", warehouse_ref1c="BIN", on_hand=4))
+    foreign_batch = models.PhysicalImportBatch(
+        batch_key="mi-foreign",
+        status="completed",
+        cutoff=datetime(2026, 7, 23, tzinfo=timezone.utc),
+        source_watermarks={},
+    )
+    foreign_generation = models.LedgerGeneration(
+        generation_key="mi-foreign",
+        status="accepted",
+        cutoff=datetime(2026, 7, 22, tzinfo=timezone.utc),
+        accepted_at=datetime(2026, 7, 22, tzinfo=timezone.utc),
+        physical_import_batch=foreign_batch,
+        source_watermarks={},
+        capabilities={},
+        algorithm_version="test",
+    )
+    db_session.add_all((foreign_batch, foreign_generation))
+    db_session.flush()
+    db_session.add_all([
+        models.StockBin(
+            ledger_generation_id=generation.id,
+            item_id=item.item_id,
+            characteristic_ref="",
+            organization_ref="",
+            warehouse_ref1c="BIN",
+            on_hand=4,
+        ),
+        models.StockBin(
+            ledger_generation_id=foreign_generation.id,
+            item_id=item.item_id,
+            characteristic_ref="",
+            organization_ref="",
+            warehouse_ref1c="LEGACY",
+            on_hand=99,
+        ),
+    ])
     db_session.flush()
     options = issues._source_warehouse_options(db_session, [item.item_id], ledger_generation_id=generation.id)
     assert options[item.item_id] == [{"ref1c": "BIN", "name": "BIN", "qty": 4.0}]

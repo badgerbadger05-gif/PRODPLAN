@@ -1,86 +1,121 @@
-# База данных
+# База данных: фактическая и целевая схема
 
-Источник правды: `backend/app/models.py` (77 таблиц), миграции — `backend/alembic/versions/`.
-Любое изменение моделей → миграция Alembic + правка этого файла.
+Источник фактических имён — `backend/app/models.py` и миграции Alembic.
+Документ явно разделяет существующие таблицы и целевые замены.
 
-Внимание: на чистой БД схему строит `create_all`, а не миграции (несущий `create_all` — см. `tech-debt.md` B1).
+Обозначения:
 
-## Справочники и календарь
+- **есть** — таблица существует;
+- **переходная** — существует, но не является целевым владельцем;
+- **цель** — таблицы пока нет, требуется реализация.
 
-- `items` — номенклатура (+ `optimal_batch`, `buffer_days` через ресурс)
-- `item_categories` — категории номенклатуры 1С
-- `units` — единицы измерения
-- `employees` — сотрудники 1С (для сдельного наряда)
-- `operations` — операции (нормы/расценки)
-- `suppliers` — поставщики
-- `production_stages` — этапы производства
-- `production_resources` — участки/ресурсы
-- `resource_stages` — связь «ресурс → этап»
-- `production_kinds` / `resource_production_kinds` — виды производства 1С и их привязка к участкам
-- `stock_warehouses` — склады 1С
-- `item_warehouse_stock` — legacy-остатки по складам (снимок из 1С)
-- `ignored_warehouses` — исключённые из подбора склады
-- `workshop_warehouse_bindings` — привязка цех ↔ склад
-- `root_products` — корневые изделия
-- `item_embeddings` — эмбеддинги для поиска номенклатуры
-- `work_calendar_day` — производственный календарь
+## Справочники
 
-## Спецификации (BOM)
+| Статус | Таблица | Назначение |
+|---|---|---|
+| есть | `items` | номенклатура и способ пополнения |
+| есть | `specifications`, `spec_components`, `spec_operations` | BOM и операции |
+| есть | `production_resources` | участки и мощность |
+| есть | `dbr_assembly_rate` | текущие такты сборки |
+| есть | `stock_warehouses`, `ignored_warehouses` | политика складов |
+| есть | `work_calendar_day` | производственный календарь |
 
-- `specifications` / `spec_components` / `spec_operations` — спецификации, состав, операции
-- `default_specifications` — спецификация по умолчанию для изделия
+## План и MRP
 
-## Ядро планирования (MRP)
+| Статус | Таблица | Назначение |
+|---|---|---|
+| есть | `production_plan_header`, `production_plan_line` | периодный план |
+| есть | `planning_run` | расчёт MRP |
+| есть | `mrp_requirement`, `mrp_requirement_bucket` | BOM-потребности |
+| есть | `planned_order`, `planned_order_stage` | предложения производства |
+| есть | `planned_purchase` | предложения закупки |
+| есть | `planned_rework` | предложения переработки |
+| есть | `capacity_load` | расчёт мощности |
 
-- `planning_config_versions` — версии конфигурации планирования
-- `production_plan_header` / `production_plan_line` — период-план (шапка/строки)
-- `production_plan_entries` — записи плана производства
-- `planning_run` — прогон MRP
-- `planned_order` / `planned_order_stage` — плановые производственные заказы и их этапы
-- `planned_purchase` — плановые закупки
-- `planned_rework` — заказы на переработку
-- `mrp_requirement` / `mrp_requirement_bucket` — потребности MRP и их разрезы
-- `capacity_load` — загрузка мощностей
-- `pegging_link` — трассировка потребностей
-- `forced_order_request` / `forced_order_result` — принудительные заказы
-- `production_day_close` / `production_day_close_item` — закрытие дня и перенос остатков
+Частичный уникальный индекс гарантирует один `FIXED_SNAPSHOT`
+`planning_run` на фиксированный план.
 
-## MRP freeze / execution / drift
+## Физический Item Ledger
 
-- `mrp_freeze_baseline` / `mrp_freeze_allocation` / `mrp_freeze_component` — заморозка нетто-расчёта (stock-once между планами)
-- `mrp_execution_allocation` — привязка факта исполнения к потребностям
-- `mrp_drift_event` — события дрейфа (reconcile)
-- `mrp_requirement_carry` — МЁРТВАЯ (carry-дизайн отброшен, снести — см. `tech-debt.md`)
+| Статус | Таблица | Назначение |
+|---|---|---|
+| есть | `stock_ledger_entry` | append-only движения |
+| есть | `stock_bin` | fold физического остатка |
+| есть | `stock_recorder_pull` | очередь pull регистраторов |
+| есть | `stock_ledger_anchor` | начальный Balance-якорь |
+| есть | `ledger_generation` | поколение построения |
 
-## DBR (11 таблиц)
+## Резервы
 
-- `dbr_settings` — настройки модуля
-- `dbr_assembly_rate` — темпы сборки
-- `dbr_category_supply_risk` — риск снабжения по категориям
-- `dbr_supermarket_position` — позиции супермаркета (буферы питателей)
-- `dbr_feeder_signal` — сигналы питателей
-- `dbr_production_program` / `dbr_production_program_item` — производственная программа
-- `dbr_drum_schedule` / `dbr_drum_schedule_program` / `dbr_drum_slot` — расписание барабана и слоты
-- `dbr_drum_capacity_gap` — дефициты мощности барабана
+| Статус | Таблица | Назначение |
+|---|---|---|
+| есть | `reservation_entry` | резерв и материализованный fold |
+| есть | `reservation_event` | события назначения физического факта |
 
-## Item-ledger (7 таблиц)
+Целевая одна `reservation_entry` хранит полный резерв, покрытие наличием,
+исходную потребность пополнения и её физически выполненную часть.
+Плавающая таблица `reservation_coverage` и её cache-поля удалены миграцией
+`20260726_09`.
 
-- `stock_ledger_entry` — append-only движения (леджер-1)
-- `stock_bin` — агрегат остатка по ключу item/склад/характеристика/организация
-- `stock_recorder_pull` — очередь pull-by-document (retry/attempts)
-- `stock_ledger_anchor` — T0-якорь первичной загрузки
-- `reservation_entry` / `reservation_event` / `reservation_coverage` — леджер-2 резервов (резерв, журнал событий, покрытие)
+## Барабан
 
-## Paint/weld
+Ручная программа, график с `program_id` и переходные таблицы
+`dbr_production_program*`, `dbr_drum_schedule*`, `dbr_drum_slot`,
+`dbr_drum_capacity_gap` удалены миграцией `20260726_06`.
 
-- `paint_weld_pairs` / `paint_weld_chain_links` — связка «окраска ↔ сварка» (пары и звенья цепочки)
+### Целевая схема
 
-## 1С-зеркала (документы)
+| Статус | Таблица | Назначение |
+|---|---|---|
+| есть | `assembly_queue_line` | остаток верхнеуровневой строки живого плана |
+| есть | `drum_schedule` | опубликованная версия раскладки поколения |
+| есть | `drum_slot` | часть строки очереди на дате и участке |
+| есть | `drum_capacity_gap` | явный дефицит мощности |
 
-- `production_orders` / `production_products` — заказы на производство 1С и их строки
-- `production_order_line_states` — состояния строк (перемещение/выпуск, ref-ы документов)
-- `production_material_issues` / `production_material_issue_lines` — заявки на перемещение материалов
-- `production_manufactures` / `production_manufacture_operations` — выпуски (СборкаЗапасов) и операции
-- `production_components` / `production_operations` — состав/операции заказов 1С
-- `supplier_orders` / `supplier_order_items` — заказы поставщику 1С
-- `sync_link` — связь локальных сущностей с документами 1С (Ref_Key)
+Таблицы создаёт миграция `20260726_07`; барабан входит в атомарную публикацию
+Ledger generation и не рассчитывается на GET.
+
+## Полки
+
+Переходные NFP/zone-таблицы `dbr_supermarket_position` и
+`dbr_feeder_signal` удалены миграцией `20260726_06`.
+
+### Целевая схема
+
+| Статус | Таблица | Назначение |
+|---|---|---|
+| есть | `shelf_policy` | физическая полка и параметры защитного окна |
+| есть | `shelf_projection` | target, projected, transfer, gap, pull и первая нехватка поколения |
+
+Таблицы создаёт миграция `20260726_08`. Проекция строится только из
+зафиксированных MRP-резервов, норм `mrp_freeze_component`, физических
+`stock_bin` и сохранённых `drum_slot`; самостоятельного спроса не имеет.
+
+## Исполнительные журналы и 1С
+
+| Статус | Таблица | Назначение |
+|---|---|---|
+| есть | `production_orders`, `production_products` | зеркало заказов производства 1С |
+| есть | `production_order_line_states` | оперативное состояние строки |
+| есть | `supplier_orders`, `supplier_order_items` | зеркало заказов поставщикам |
+| есть | `production_material_issues`, `production_material_issue_lines` | перемещения материалов |
+| есть | `sync_link` | связь локальной сущности с документом 1С |
+| есть | `replenishment_work_item` | единая рабочая проекция резерва `make/buy` |
+
+Заказ не является источником физического выполнения.
+Таблица создаётся миграцией `20260726_10`, строится внутри поколения из
+активных резервов и механически хранит точный остаток
+`required - fulfilled`.
+
+## Read-model
+
+| Статус | Таблица | Назначение |
+|---|---|---|
+| есть | `planning_truth_state` | указатель принятой истины |
+| есть | `planning_read_snapshot` | сохранённые backend read-model |
+| есть | `closed_plan_snapshot` | неизменяемая история закрытого плана |
+
+Все расчётные read-model должны принадлежать одному `ledger_generation` и
+`cutoff`.
+`closed_plan_snapshot` создаётся миграцией `20260726_11` и фиксирует
+execution payload до исключения плана из живого поколения.

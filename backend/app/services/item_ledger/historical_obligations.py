@@ -17,7 +17,6 @@ from sqlalchemy.orm import Session
 from app import models
 
 from .reservation_ledger import (
-    CONSUME,
     _append_event,
     _fold_entry,
     _get_or_create_entry,
@@ -62,7 +61,7 @@ def select_historical_obligation_runs(
     plans = (
         db.query(models.ProductionPlanHeader)
         .filter(
-            models.ProductionPlanHeader.status.in_(("fixed", "archived")),
+            models.ProductionPlanHeader.status == "fixed",
             models.ProductionPlanHeader.fixed_at.isnot(None),
             models.ProductionPlanHeader.fixed_at <= cutoff,
         )
@@ -75,30 +74,16 @@ def select_historical_obligation_runs(
             db.query(models.PlanningRun)
             .filter(
                 models.PlanningRun.source_plan_id == int(plan.id),
-                models.PlanningRun.status.in_(("FIXED_SNAPSHOT", "CLOSED")),
+                models.PlanningRun.status == "FIXED_SNAPSHOT",
                 models.PlanningRun.fixed_at.isnot(None),
                 models.PlanningRun.fixed_at <= cutoff,
             )
             .order_by(models.PlanningRun.run_id.desc())
             .all()
         )
-        fixed = [
-            run for run in candidates
-            if str(run.status) == "FIXED_SNAPSHOT"
-        ]
-        if fixed:
-            chosen = fixed[0]
-        else:
-            closed = [
-                run
-                for run in candidates
-                if str(run.status) == "CLOSED"
-                and plan.fixed_at is not None
-                and run.fixed_at is not None
-            ]
-            if not closed:
-                continue
-            chosen = closed[0]
+        if not candidates:
+            continue
+        chosen = candidates[0]
         _validate_run_period(chosen, plan)
         selected.append(chosen)
     return selected
@@ -284,8 +269,6 @@ def materialize_historical_obligations(
     cycle_id = f"historical-obligations:g{generation.id}"
     for req in requirements:
         targets = mode_targets(req, items.get(int(req.item_id)))
-        if not targets:
-            targets = [(CONSUME, Decimal(str(req.total_required_qty or 0)))]
         for mode, target in targets:
             entry = _get_or_create_entry(
                 db,

@@ -21,7 +21,11 @@ def _world(db, *, with_parent=True, qty=5, replenishment_method="Покупка"
     accepted = models.LedgerGeneration(
         generation_key="orchestrator-accepted", status="accepted", cutoff=cutoff,
         source_watermarks={"replay_from": "2026-07-01T00:00:00+00:00"},
-        capabilities={"physical_ledger": True},
+        capabilities={
+            "physical_ledger": True,
+            "reservation_replay": True,
+            "execution_allocations": True,
+        },
         physical_import_batch=physical, algorithm_version="test", accepted_at=cutoff,
     )
     item = models.Item(item_code="ORCH-PURCHASE", item_name="orchestrator purchase",
@@ -77,21 +81,31 @@ def test_add_only_builds_real_checkpoints_and_promotes_persisted_read_snapshot(d
         "physical_ledger": True, "reservation_replay": True,
         "execution_allocations": True, "supplier_receipt_coverage": True,
         "planning_snapshots": True,
-        "dbr_feeder_cockpit": False,
-        "dbr_purchase_cockpit": False,
+        "replenishment_work_item": True,
+        "assembly_output_allocation": True,
+        "assembly_queue": True,
+        "drum_schedule": True,
+        "shelf_projection": True,
         "purchase_control_journal": True,
     }
-    assert {"physical_import", "reservation_materialize", "reservation_replay", "snapshot_build"} == set(by_stage)
+    assert {
+        "physical_import",
+        "reservation_materialize",
+        "replenishment_work_item",
+        "reservation_replay",
+        "assembly_output_allocation",
+        "drum_schedule",
+        "shelf_projection",
+        "snapshot_build",
+    } == set(by_stage)
     assert all(row.status == "completed" for row in by_stage.values())
     assert by_stage["snapshot_build"].metrics["future_supply_captured"] is True
-    assert by_stage["snapshot_build"].metrics["dbr_cockpit_ready"] is False
-    assert by_stage["snapshot_build"].metrics["dbr_purchase_ready"] is False
     snapshot_id = by_stage["snapshot_build"].metrics["candidate_read_snapshot_ids"][str(candidate.run_id)]
     assert db_session.get(models.PlanningReadSnapshot, snapshot_id).truth_status == "accepted"
     # This public read function consumes the stored snapshot; it does not run MRP.
     assert read_mrp_result_manifest(db_session, candidate.run_id)["run_id"] == candidate.run_id
     # Journals must not go dark after a refresh: every published generation
-    # carries its own period-plan execution snapshots (decisions-log §2.6/§7.7).
+    # carries its own period-plan execution snapshots (decisions-log /).
     execution_snapshots = db_session.query(models.PlanningReadSnapshot).filter_by(
         ledger_generation_id=target.id, consumer="period_plan_execution").all()
     assert len(execution_snapshots) == 1
@@ -111,102 +125,6 @@ def test_add_plans_with_mixed_periods_fail_closed(db_session):
         match="different period_from",
     ):
         _run(db_session, accepted, "orch-mixed", add=[plan.id, other.id])
-
-
-def test_configured_dbr_policy_and_cockpit_publish_atomically(db_session):
-    accepted, plan, _line, _item, _old, _cutoff = _world(
-        db_session, with_parent=False
-    )
-    db_session.add(models.DbrSettings(
-        id=1,
-        w2_warehouse_ref1c="W2",
-        w3_warehouse_ref1c="W3",
-        w4_warehouse_ref1c="W4",
-    ))
-    day = plan.period_from
-    while day <= plan.period_to:
-        db_session.add(models.WorkCalendarDay(date=day, is_workday=True))
-        day += timedelta(days=1)
-    db_session.commit()
-
-    result = _run(
-        db_session,
-        accepted,
-        "orch-add-dbr",
-        add=[plan.id],
-        pool_mapping={"W2": "w2", "W3": "w3", "W4": "default"},
-    )
-    target = db_session.get(models.LedgerGeneration, result.target_generation_id)
-    checkpoint = db_session.query(models.LedgerBuildBatch).filter_by(
-        ledger_generation_id=target.id,
-        stage="snapshot_build",
-    ).one()
-    policy = db_session.get(
-        models.PlanningReadSnapshot,
-        checkpoint.metrics["dbr_policy_snapshot_id"],
-    )
-    cockpit = db_session.get(
-        models.PlanningReadSnapshot,
-        checkpoint.metrics["dbr_cockpit_snapshot_id"],
-    )
-    purchase = db_session.get(
-        models.PlanningReadSnapshot,
-        checkpoint.metrics["dbr_purchase_snapshot_id"],
-    )
-
-    assert target.capabilities["dbr_feeder_cockpit"] is True
-    assert target.capabilities["dbr_purchase_cockpit"] is True
-    assert checkpoint.metrics["dbr_cockpit_ready"] is True
-    assert checkpoint.metrics["dbr_purchase_ready"] is True
-    assert policy.truth_status == cockpit.truth_status == purchase.truth_status == "accepted"
-    assert policy.reason is None and cockpit.reason is None and purchase.reason is None
-    assert cockpit.payload["meta"]["policy_snapshot_id"] == policy.id
-    assert purchase.payload["meta"]["policy_snapshot_id"] == policy.id
-    assert cockpit.payload["meta"]["ledger_generation"] == target.id
-    db_session.commit()
-
-    retry = _run(
-        db_session,
-        accepted,
-        "orch-add-dbr",
-        add=[plan.id],
-        pool_mapping={"W2": "w2", "W3": "w3", "W4": "default"},
-    )
-    assert retry.published is False
-    # The exact retry must reject a saved purchase snapshot that no longer
-    # proves Ledger identity/read-only semantics; it may not silently reuse
-    # the other two DBR snapshots.
-    purchase.payload = {
-        **purchase.payload,
-        "meta": {**purchase.payload["meta"], "read_only": False},
-    }
-    db_session.flush()
-    with pytest.raises(
-        ObligationRefreshPublishError,
-        match="mixed or partial",
-    ):
-        _run(
-            db_session,
-            accepted,
-            "orch-add-dbr",
-            add=[plan.id],
-            pool_mapping={"W2": "w2", "W3": "w3", "W4": "default"},
-        )
-    db_session.rollback()
-    missing_purchase = db_session.get(
-        models.PlanningReadSnapshot,
-        checkpoint.metrics["dbr_purchase_snapshot_id"],
-    )
-    db_session.delete(missing_purchase)
-    db_session.flush()
-    with pytest.raises(ObligationRefreshPublishError, match="mixed or partial"):
-        _run(
-            db_session,
-            accepted,
-            "orch-add-dbr",
-            add=[plan.id],
-            pool_mapping={"W2": "w2", "W3": "w3", "W4": "default"},
-        )
 
 
 def test_add_retains_existing_fixed_obligation_without_refreeze(db_session):

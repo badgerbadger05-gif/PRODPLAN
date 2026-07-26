@@ -33,7 +33,10 @@ from app.services.one_c_export_common import (
     payload_hash as _payload_hash,
 )
 from app.services.odata_config import load_odata_config as _load_odata_config
-from app.services.one_c_purchase_order_export import PURCHASE_ORDER_ENTITY
+from app.services.one_c_purchase_order_export import (
+    PURCHASE_ORDER_ENTITY,
+    create_purchase_order_document,
+)
 from app.services.odata_client import OData1CClient
 from app.services.planning_truth import PlanningTruthUnavailable
 from . import purchase_control_snapshot
@@ -579,6 +582,10 @@ def _load_groups_and_lineages(
         for slice_row in slices:
             if not isinstance(slice_row, dict):
                 continue
+            work_item_id = _to_int(
+                slice_row.get("work_item_id"),
+                field="work_item_id",
+            )
             reservation_id = _to_int(
                 slice_row.get("reservation_id"),
                 field="reservation_id",
@@ -590,6 +597,23 @@ def _load_groups_and_lineages(
             if alloc_qty <= 0:
                 continue
 
+            work_item = db.get(models.ReplenishmentWorkItem, work_item_id)
+            if work_item is None:
+                raise PurchaseControlMaterializationError(
+                    f"row {row_key}: work item {work_item_id} not found"
+                )
+            if int(work_item.ledger_generation_id) != ledger_generation_id:
+                raise PurchaseControlMaterializationError(
+                    f"row {row_key}: work item {work_item_id} has stale generation"
+                )
+            if (
+                int(work_item.reservation_id) != reservation_id
+                or int(work_item.item_id) != item_id
+                or str(work_item.replenishment_method) != "buy"
+            ):
+                raise PurchaseControlMaterializationError(
+                    f"row {row_key}: work item {work_item_id} lineage mismatch"
+                )
             reservation = db.get(models.ReservationEntry, reservation_id)
             if reservation is None:
                 raise PurchaseControlMaterializationError(
@@ -611,9 +635,13 @@ def _load_groups_and_lineages(
                 raise PurchaseControlMaterializationError(
                     f"row {row_key}: reservation {reservation_id} has no planning run lineage"
                 )
-            if float(reservation.uncovered_qty or 0) + _EPS < alloc_qty:
+            replenishment_open = float(
+                work_item.replenishment_remaining_qty or 0
+            )
+            if replenishment_open + _EPS < alloc_qty:
                 raise PurchaseControlMaterializationError(
-                    f"row {row_key}: reservation {reservation_id} uncovered qty is too small"
+                    f"row {row_key}: reservation {reservation_id} "
+                    "replenishment remainder is too small"
                 )
 
             row_need_date = _normalize_text(slice_row.get("plan_period_to")) or need_date
@@ -1007,7 +1035,7 @@ def _materialize_purchase_control_orders_to_1c(
                 all_allocations.append(allocation)
             continue
 
-        created_doc = client.post(PURCHASE_ORDER_ENTITY, header_payload)
+        created_doc = create_purchase_order_document(client, header_payload)
         ref_key = clean_ref1c(created_doc.get("Ref_Key") if isinstance(created_doc, dict) else None)
         if not ref_key:
             raise RuntimeError("1C purchase materialization did not return order Ref_Key")

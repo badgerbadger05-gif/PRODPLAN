@@ -13,8 +13,8 @@ from decimal import Decimal
 from typing import Iterable, Literal, Optional, Tuple
 
 
-Mode = Literal["make", "consume", "buy"]
-MatchRule = Literal["requirement", "order", "fifo"]
+Mode = Literal["make", "buy"]
+MatchRule = Literal["fifo"]
 
 
 @dataclass(frozen=True)
@@ -60,7 +60,7 @@ class Allocation:
 
 
 @dataclass(frozen=True)
-class UnplannedFact:
+class SurplusFact:
     fact_id: str
     qty: Decimal
     reason: str
@@ -76,11 +76,11 @@ class ReserveRealization:
 @dataclass(frozen=True)
 class ReplayResult:
     allocations: Tuple[Allocation, ...]
-    unplanned: Tuple[UnplannedFact, ...]
+    surplus: Tuple[SurplusFact, ...]
     realizations: Tuple[ReserveRealization, ...]
     fact_qty: Decimal
     allocated_qty: Decimal
-    unplanned_qty: Decimal
+    surplus_qty: Decimal
 
 
 def _pool_key(value: Fact | Reserve) -> tuple[int, str, str, Mode]:
@@ -116,7 +116,7 @@ def _validate(facts: tuple[Fact, ...], reserves: tuple[Reserve, ...]) -> None:
     if len(reserve_ids) != len(set(reserve_ids)):
         raise ValueError("reserve_id must be unique")
     for fact in facts:
-        if fact.mode not in ("make", "consume", "buy"):
+        if fact.mode not in ("make", "buy"):
             raise ValueError(f"fact {fact.fact_id}: unsupported mode")
         if fact.is_reversal or fact.qty <= 0:
             raise ValueError(
@@ -124,7 +124,7 @@ def _validate(facts: tuple[Fact, ...], reserves: tuple[Reserve, ...]) -> None:
                 "must be normalized explicitly before replay"
             )
     for reserve in reserves:
-        if reserve.mode not in ("make", "consume", "buy"):
+        if reserve.mode not in ("make", "buy"):
             raise ValueError(f"reserve {reserve.reserve_id}: unsupported mode")
         if reserve.reserved_qty < 0:
             raise ValueError(f"reserve {reserve.reserve_id}: reserved_qty must be non-negative")
@@ -136,13 +136,8 @@ def allocate_historical_facts(
 ) -> ReplayResult:
     """Allocate accepted historical facts without mutating either input.
 
-    For ``consume`` facts, matching order is exact requirement, exact
-    exported/source order, then fail-closed if still unaddressed.
-    ``make`` facts bypass exact matching and use canonical FIFO only.  Canonical
-    FIFO priority follows reserve plan periods and run identity before any
-    posting date consideration.
-
-    Unaddressed ``consume`` facts remain explicitly unplanned.
+    Every accepted positive replenishment uses the same oldest-first FIFO.
+    Requirement/order identity is provenance only and never gates quantity.
     """
 
     fact_rows = tuple(facts)
@@ -153,7 +148,7 @@ def allocate_historical_facts(
     remaining = {row.reserve_id: row.reserved_qty for row in ordered_reserves}
     realized = {row.reserve_id: Decimal("0") for row in ordered_reserves}
     allocations: list[Allocation] = []
-    unplanned: list[UnplannedFact] = []
+    surplus: list[SurplusFact] = []
 
     def place(fact: Fact, qty: Decimal, candidates: Iterable[Reserve], rule: MatchRule) -> Decimal:
         left = qty
@@ -173,42 +168,6 @@ def allocate_historical_facts(
     sorted_facts = tuple(sorted(fact_rows, key=_fact_key))
     leftovers = {fact.fact_id: fact.qty for fact in sorted_facts}
 
-    # Phase 1: consume claims are addressed by explicit links before FIFO.
-    # Make facts intentionally skip exact match to preserve FIFO-first
-    # reserve exhaustion regardless of document execution timing.
-    for fact in sorted_facts:
-        if fact.mode != "consume":
-            continue
-        compatible = [
-            reserve
-            for reserve in ordered_reserves
-            if _pool_key(reserve) == _pool_key(fact)
-        ]
-        left = leftovers[fact.fact_id]
-
-        if fact.requirement_id is not None:
-            exact = [
-                reserve
-                for reserve in compatible
-                if reserve.requirement_id == fact.requirement_id
-            ]
-            left = place(fact, left, exact, "requirement")
-
-        if left > 0 and fact.order_ref:
-            by_order = [
-                reserve
-                for reserve in compatible
-                if fact.order_ref in reserve.order_refs
-                and (
-                    fact.requirement_id is None
-                    or reserve.requirement_id != fact.requirement_id
-                )
-            ]
-            left = place(fact, left, by_order, "order")
-        leftovers[fact.fact_id] = left
-
-    # Phase 2: only make/output may use pool FIFO.  Consume without remaining
-    # exact address is deliberately left unplanned.
     for fact in sorted_facts:
         left = leftovers[fact.fact_id]
         compatible = [
@@ -216,18 +175,13 @@ def allocate_historical_facts(
             for reserve in ordered_reserves
             if _pool_key(reserve) == _pool_key(fact)
         ]
-        if left > 0 and fact.mode == "make":
-            # Exact surplus and genuinely unaddressed output may satisfy the
-            # next oldest make obligation in the same planning pool.
+        if left > 0:
             left = place(fact, left, compatible, "fifo")
 
         if left > 0:
-            reason = (
-                "consume_fact_requires_address"
-                if fact.mode == "consume" and not (fact.requirement_id or fact.order_ref)
-                else "no_eligible_reserve_capacity"
+            surplus.append(
+                SurplusFact(fact.fact_id, left, "no_live_replenishment_demand")
             )
-            unplanned.append(UnplannedFact(fact.fact_id, left, reason))
 
     realization_rows = tuple(
         ReserveRealization(row.reserve_id, row.reserved_qty, realized[row.reserve_id])
@@ -235,18 +189,18 @@ def allocate_historical_facts(
     )
     fact_qty = sum((row.qty for row in fact_rows), Decimal("0"))
     allocated_qty = sum((row.qty for row in allocations), Decimal("0"))
-    unplanned_qty = sum((row.qty for row in unplanned), Decimal("0"))
+    surplus_qty = sum((row.qty for row in surplus), Decimal("0"))
 
-    if allocated_qty + unplanned_qty != fact_qty:
+    if allocated_qty + surplus_qty != fact_qty:
         raise AssertionError("fact conservation violated")
     if any(row.realized_qty > row.reserved_qty for row in realization_rows):
         raise AssertionError("realized_qty exceeds reserved_qty")
 
     return ReplayResult(
         allocations=tuple(allocations),
-        unplanned=tuple(unplanned),
+        surplus=tuple(surplus),
         realizations=realization_rows,
         fact_qty=fact_qty,
         allocated_qty=allocated_qty,
-        unplanned_qty=unplanned_qty,
+        surplus_qty=surplus_qty,
     )

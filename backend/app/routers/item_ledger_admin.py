@@ -1,4 +1,4 @@
-"""Item-ledger admin — операционный запуск леджера-1 (design Прил. A §4).
+"""Item-ledger admin — операционный запуск физического Ledger.
 
 Единственная дыра конвейера, которую закрывает этот роутер: у
 ``seed_from_balance`` не было прод-вызова — якорь T0 никто не создавал, и
@@ -10,8 +10,8 @@ POST /api/v1/item-ledger/admin/seed?dry_run=true&force=false
 * Снимает свежий 1С ``/Balance`` (тот же ``get_stock_from_1c_odata``, что и
   штатный свип), нормализует в ключи леджера (``build_balance_snapshot``) и
   сеет ledger-1: seed-SLE + stock_bin + stock_ledger_anchor(T0) на каждый
-  ненулевой ключ (A §4.1–4.2). T0 = момент снимка: пуллы применяют только
-  строки с posting_at > T0 (anchor guard, A §4.3) — двойного учёта нет.
+  ненулевой ключ (A –4.2). T0 = момент снимка: пуллы применяют только
+  строки с posting_at > T0 (anchor guard, A ) — двойного учёта нет.
 * ``dry_run`` (default true) — только посчитать и показать сводку, БД не
   трогается.
 * Идемпотентность: повторный сид при уже существующих якорях, включая
@@ -114,7 +114,7 @@ class SeedResponse(BaseModel):
     balance_rows: int          # сырых строк Balance от 1С
     keys_total: int            # разрешённых ключей леджера в снимке
     keys_nonzero: int          # ключей к посеву (|qty| > EPS)
-    keys_skipped_zero: int     # нулевые ключи — не сеются (A §4.2)
+    keys_skipped_zero: int     # нулевые ключи — не сеются (A )
     total_qty: float           # Σ qty по сеемым ключам
     anchors_existing: int      # якорей в БД до вызова
     anchors_created: int       # фактически создано (0 при dry_run)
@@ -515,7 +515,7 @@ def seed_ledger(
     ),
     db: Session = Depends(get_db),
 ) -> SeedResponse:
-    """Сид якоря T0 леджера-1 из свежего 1С /Balance (design Прил. A §4)."""
+    """Сид якоря T0 физического Ledger из свежего 1С /Balance."""
     config = load_odata_config()
     if not str(config.get("base_url") or "").strip():
         raise HTTPException(status_code=400, detail="OData connection is not configured (base_url missing)")

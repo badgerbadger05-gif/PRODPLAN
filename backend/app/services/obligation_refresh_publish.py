@@ -16,6 +16,7 @@ import json
 from typing import Any, Mapping
 
 from sqlalchemy import or_, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app import models
@@ -45,26 +46,27 @@ class ObligationRefreshPublishResult:
 _REQUIRED_BUILD_STAGES = (
     "physical_import",
     "reservation_materialize",
+    "replenishment_work_item",
     "reservation_replay",
+    "assembly_output_allocation",
+    "drum_schedule",
+    "shelf_projection",
     "snapshot_build",
 )
 
 _MRP_RESULT_CONSUMER = "mrp_result"
-_DBR_POLICY_CONSUMER = "dbr_policy_input"
-_DBR_POLICY_KEY = "policy:v1"
-_DBR_COCKPIT_CONSUMER = "dbr_feeder_cockpit"
-_DBR_COCKPIT_KEY = "cockpit:v1"
-_DBR_PURCHASE_CONSUMER = "dbr_purchase_cockpit"
-_DBR_PURCHASE_KEY = "purchase:v1"
-_DBR_CAPABILITY = "dbr_feeder_cockpit"
-_DBR_PURCHASE_CAPABILITY = "dbr_purchase_cockpit"
 _MRP_ROW_KINDS = frozenset({"production", "purchase", "rework", "capacity"})
 _REQUIRED_PUBLISHED_CAPABILITIES = frozenset({
     "physical_ledger",
     "reservation_replay",
     "execution_allocations",
+    "replenishment_work_item",
     "supplier_receipt_coverage",
     "planning_snapshots",
+    "assembly_output_allocation",
+    "assembly_queue",
+    "drum_schedule",
+    "shelf_projection",
 })
 
 
@@ -115,6 +117,7 @@ def _require_manifest(
     list[tuple[models.PlanningRun, models.PlanningRun]],
     list[models.PlanningRun],
     list[models.PlanningRun],
+    list[models.PlanningRun],
 ]:
     """Validate the sealed refresh/add set against the actual run rows.
 
@@ -146,6 +149,7 @@ def _require_manifest(
     refreshes: list[tuple[models.PlanningRun, models.PlanningRun]] = []
     additions: list[models.PlanningRun] = []
     retained: list[models.PlanningRun] = []
+    retired: list[models.PlanningRun] = []
     for entry in entries:
         if not isinstance(entry, dict):
             raise ObligationRefreshPublishError("obligation_refresh_manifest entry is malformed")
@@ -154,7 +158,7 @@ def _require_manifest(
             plan_id = int(entry["plan_id"])
         except (KeyError, TypeError, ValueError) as exc:
             raise ObligationRefreshPublishError("obligation_refresh_manifest entry identity is malformed") from exc
-        if action not in {"refresh", "add", "retain"} or plan_id <= 0:
+        if action not in {"refresh", "add", "retain", "retire"} or plan_id <= 0:
             raise ObligationRefreshPublishError("obligation_refresh_manifest contains unsupported action")
         if plan_id in declared_plans:
             raise ObligationRefreshPublishError("obligation_refresh_manifest has duplicate candidate or plan")
@@ -177,6 +181,30 @@ def _require_manifest(
                     "retain manifest omits or changes current parent"
                 )
             retained.append(parent)
+            continue
+        if action == "retire":
+            try:
+                parent_id = int(entry["parent_run_id"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ObligationRefreshPublishError(
+                    "retire manifest entry lacks parent run"
+                ) from exc
+            parent = parent_by_id.get(parent_id)
+            expected_parent_status = (
+                "CLOSED"
+                if candidate_status == "FIXED_SNAPSHOT"
+                else "FIXED_SNAPSHOT"
+            )
+            if (
+                entry.get("candidate_run_id") is not None
+                or parent is None
+                or parent_by_plan.get(plan_id) is not parent
+                or str(parent.status) != expected_parent_status
+            ):
+                raise ObligationRefreshPublishError(
+                    "retire manifest omits or changes current parent"
+                )
+            retired.append(parent)
             continue
         try:
             candidate_id = int(entry["candidate_run_id"])
@@ -239,7 +267,9 @@ def _require_manifest(
         raise ObligationRefreshPublishError("obligation_refresh_manifest has missing or extra candidates")
     covered_parent_ids = {
         int(parent.run_id) for parent, _candidate in refreshes
-    } | {int(parent.run_id) for parent in retained}
+    } | {
+        int(parent.run_id) for parent in [*retained, *retired]
+    }
     if covered_parent_ids != set(parent_by_id):
         raise ObligationRefreshPublishError("obligation_refresh_manifest omits or adds refresh parents")
 
@@ -251,6 +281,16 @@ def _require_manifest(
         raise ObligationRefreshPublishError("obligation_refresh_manifest add_request plan_ids are malformed")
     if set(request_plan_ids) != {int(row.source_plan_id) for row in additions}:
         raise ObligationRefreshPublishError("obligation_refresh_manifest add_request conflicts with candidates")
+    try:
+        request_retire_ids = [int(value) for value in add_request["retire_plan_ids"]]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ObligationRefreshPublishError("obligation_refresh_manifest retire request is malformed") from exc
+    if (
+        request_retire_ids != sorted(request_retire_ids)
+        or len(request_retire_ids) != len(set(request_retire_ids))
+        or set(request_retire_ids) != {int(row.source_plan_id) for row in retired}
+    ):
+        raise ObligationRefreshPublishError("obligation_refresh_manifest retire request conflicts")
     if not isinstance(add_request.get("config_snapshot"), dict):
         raise ObligationRefreshPublishError("obligation_refresh_manifest add config is malformed")
     pool_mapping = add_request.get("planning_pool_by_warehouse")
@@ -275,7 +315,7 @@ def _require_manifest(
             or candidate.config_snapshot != add_request["config_snapshot"]
         ):
             raise ObligationRefreshPublishError("add candidate config conflicts with manifest")
-    return refreshes, additions, retained
+    return refreshes, additions, retained, retired
 
 
 def _source_export_links_exist(db: Session, candidate_ids: list[int]) -> bool:
@@ -395,15 +435,6 @@ def _require_sealed_build(
         truth_status="building",
         accepted_at=None,
     )
-    _require_candidate_dbr_snapshots(
-        db,
-        target=target,
-        candidate_ids=candidate_ids,
-        snapshot_metrics=snapshot_metrics,
-        capabilities=capabilities,
-        truth_status="building",
-        accepted_at=None,
-    )
 
 
 def _require_candidate_read_snapshots(
@@ -489,160 +520,6 @@ def _require_candidate_read_snapshots(
     return [by_id[declared[run_id]] for run_id in sorted(declared)]
 
 
-def _require_candidate_dbr_snapshots(
-    db: Session,
-    *,
-    target: models.LedgerGeneration,
-    candidate_ids: list[int],
-    snapshot_metrics: Mapping[str, Any],
-    capabilities: Mapping[str, Any],
-    truth_status: str,
-    accepted_at: datetime | None,
-) -> list[models.PlanningReadSnapshot]:
-    """Validate the DBR policy/feeder/purchase trio all-or-nothing."""
-    rows = _lock(db.query(models.PlanningReadSnapshot)).filter(
-        models.PlanningReadSnapshot.ledger_generation_id == int(target.id),
-        models.PlanningReadSnapshot.consumer.in_(
-            (_DBR_POLICY_CONSUMER, _DBR_COCKPIT_CONSUMER, _DBR_PURCHASE_CONSUMER)
-        ),
-    ).all()
-    feeder_enabled = capabilities.get(_DBR_CAPABILITY) is True
-    purchase_enabled = capabilities.get(_DBR_PURCHASE_CAPABILITY) is True
-    if not feeder_enabled and not purchase_enabled:
-        if (snapshot_metrics.get("dbr_cockpit_ready") is not False
-                or snapshot_metrics.get("dbr_purchase_ready") is not False):
-            raise ObligationRefreshPublishError(
-                "snapshot_build lacks explicit DBR readiness"
-            )
-        if rows:
-            raise ObligationRefreshPublishError(
-                "DBR-unavailable generation contains candidate DBR snapshots"
-            )
-        return []
-
-    if not feeder_enabled or not purchase_enabled:
-        raise ObligationRefreshPublishError("DBR feeder and purchase capabilities must publish together")
-
-    if (snapshot_metrics.get("dbr_cockpit_ready") is not True
-            or snapshot_metrics.get("dbr_purchase_ready") is not True):
-        raise ObligationRefreshPublishError(
-            "DBR capability conflicts with snapshot readiness"
-        )
-    try:
-        policy_id = int(snapshot_metrics["dbr_policy_snapshot_id"])
-        cockpit_id = int(snapshot_metrics["dbr_cockpit_snapshot_id"])
-        purchase_id = int(snapshot_metrics["dbr_purchase_snapshot_id"])
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ObligationRefreshPublishError(
-            "snapshot_build DBR snapshot identities are malformed"
-        ) from exc
-    expected_ids = {policy_id, cockpit_id, purchase_id}
-    by_id = {int(row.id): row for row in rows}
-    if set(by_id) != expected_ids or len(expected_ids) != len(by_id):
-        raise ObligationRefreshPublishError(
-            "target has missing or extra DBR candidate snapshots"
-        )
-    policy = by_id[policy_id]
-    cockpit = by_id[cockpit_id]
-    purchase = by_id[purchase_id]
-    expected_cutoff = _utc(target.cutoff, "target cutoff")
-    if (
-        policy.consumer != _DBR_POLICY_CONSUMER
-        or policy.snapshot_key != _DBR_POLICY_KEY
-        or cockpit.consumer != _DBR_COCKPIT_CONSUMER
-        or cockpit.snapshot_key != _DBR_COCKPIT_KEY
-        or purchase.consumer != _DBR_PURCHASE_CONSUMER
-        or purchase.snapshot_key != _DBR_PURCHASE_KEY
-        or str(policy.truth_status) != truth_status
-        or str(cockpit.truth_status) != truth_status
-        or str(purchase.truth_status) != truth_status
-        or _utc(policy.cutoff, "DBR policy cutoff") != expected_cutoff
-        or _utc(cockpit.cutoff, "DBR cockpit cutoff") != expected_cutoff
-        or _utc(purchase.cutoff, "DBR purchase cutoff") != expected_cutoff
-    ):
-        raise ObligationRefreshPublishError(
-            "DBR candidate snapshot lineage conflicts"
-        )
-    if accepted_at is None:
-        if policy.reason is None or cockpit.reason is None or purchase.reason is None:
-            raise ObligationRefreshPublishError(
-                "unpublished DBR candidate snapshot lacks reason"
-            )
-    elif (
-        policy.reason is not None
-        or cockpit.reason is not None
-        or purchase.reason is not None
-        or _utc(policy.published_at, "DBR policy published_at") != accepted_at
-        or _utc(cockpit.published_at, "DBR cockpit published_at") != accepted_at
-        or _utc(purchase.published_at, "DBR purchase published_at") != accepted_at
-    ):
-        raise ObligationRefreshPublishError(
-            "accepted DBR snapshot publication state conflicts"
-        )
-    meta = cockpit.payload.get("meta") if isinstance(cockpit.payload, dict) else None
-    purchase_meta = purchase.payload.get("meta") if isinstance(purchase.payload, dict) else None
-    policy_runs = policy.payload.get("runs") if isinstance(policy.payload, dict) else None
-    if not isinstance(policy_runs, list):
-        raise ObligationRefreshPublishError("DBR policy run manifest is malformed")
-    try:
-        declared_runs = sorted(int(row["run_id"]) for row in policy_runs)
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ObligationRefreshPublishError(
-            "DBR policy run manifest is malformed"
-        ) from exc
-    cockpit_runs = [
-        {
-            "run_id": int(row["run_id"]),
-            "freeze_version": int(row["freeze_version"]),
-        }
-        for row in policy_runs
-    ]
-    if (
-        not isinstance(meta, dict)
-        or int(meta.get("policy_snapshot_id") or -1) != policy_id
-        or meta.get("runs") != cockpit_runs
-        or declared_runs != sorted(candidate_ids)
-        or not isinstance(purchase_meta, dict)
-        or int(purchase_meta.get("policy_snapshot_id") or -1) != policy_id
-        or purchase_meta.get("runs") != cockpit_runs
-    ):
-        raise ObligationRefreshPublishError(
-            "DBR cockpit policy/run manifest conflicts"
-        )
-    if (
-        int(purchase_meta.get("ledger_generation") or -1) != int(target.id)
-        or int(purchase_meta.get("ledger_generation_id") or -1) != int(target.id)
-        or purchase_meta.get("read_only") is not True
-        or not isinstance(purchase.payload.get("rows"), list)
-    ):
-        raise ObligationRefreshPublishError("DBR purchase snapshot meta conflicts")
-    seen_reservations: set[int] = set()
-    seen_axes: set[tuple[str, str]] = set()
-    for row in purchase.payload["rows"]:
-        if not isinstance(row, dict):
-            raise ObligationRefreshPublishError("DBR purchase snapshot row is malformed")
-        reservation_ids = row.get("reservation_ids")
-        if not isinstance(reservation_ids, list) or not reservation_ids:
-            raise ObligationRefreshPublishError("DBR purchase row lacks reservation identities")
-        try:
-            ids = [int(value) for value in reservation_ids]
-            to_order = Decimal(str(row["to_order_qty"]))
-            uncovered = Decimal(str(row["uncovered_qty"]))
-        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
-            raise ObligationRefreshPublishError("DBR purchase row has invalid quantities") from exc
-        if (len(ids) != len(set(ids)) or any(value <= 0 for value in ids)
-                or seen_reservations.intersection(ids)):
-            raise ObligationRefreshPublishError("DBR purchase reservation identity is duplicated")
-        if to_order < 0 or uncovered < 0 or to_order != uncovered:
-            raise ObligationRefreshPublishError("DBR purchase to_order must equal nonnegative uncovered")
-        axis = (str(row.get("item_code") or "").strip(), str(row.get("planning_stock_pool") or "").strip())
-        if not axis[0] or not axis[1] or axis in seen_axes:
-            raise ObligationRefreshPublishError("DBR purchase row axis is malformed or duplicated")
-        seen_reservations.update(ids)
-        seen_axes.add(axis)
-    return [policy, cockpit, purchase]
-
-
 def _exact_retry(
     db: Session, *, parent: models.LedgerGeneration, target: models.LedgerGeneration,
     pointer: models.PlanningTruthState, accepted_at: datetime, capabilities: dict[str, Any],
@@ -669,7 +546,7 @@ def _exact_retry(
         if not isinstance(entry, dict):
             return None
         try:
-            if entry.get("action") == "retain":
+            if entry.get("action") in {"retain", "retire"}:
                 parent_ids.append(int(entry["parent_run_id"]))
             else:
                 candidate_manifest_ids.append(int(entry["candidate_run_id"]))
@@ -703,7 +580,7 @@ def _exact_retry(
     else:
         parents = []
     try:
-        refreshes, additions, retained = _require_manifest(
+        refreshes, additions, retained, retired = _require_manifest(
             db, target=target, parents=parents, candidates=candidates,
             candidate_status="FIXED_SNAPSHOT",
         )
@@ -781,15 +658,6 @@ def _exact_retry(
             truth_status="accepted",
             accepted_at=accepted_at,
         )
-        _require_candidate_dbr_snapshots(
-            db,
-            target=target,
-            candidate_ids=candidate_ids,
-            snapshot_metrics=dict(snapshot_batch.metrics or {}),
-            capabilities=capabilities,
-            truth_status="accepted",
-            accepted_at=accepted_at,
-        )
     except ObligationRefreshPublishError:
         return None
     for parent_run, candidate in refreshes:
@@ -811,6 +679,7 @@ def _exact_retry(
         parent_run_ids=tuple(sorted(
             [int(row.run_id) for row, _candidate in refreshes]
             + [int(row.run_id) for row in retained]
+            + [int(row.run_id) for row in retired]
         )),
         candidate_run_ids=tuple(sorted(candidate_ids)), published=False,
     )
@@ -867,7 +736,7 @@ def publish_obligation_refresh_batch(
         models.PlanningRun.ledger_generation_id == int(target.id),
         models.PlanningRun.status == "BUILDING_SNAPSHOT",
     ).all()
-    refreshes, additions, retained = _require_manifest(
+    refreshes, additions, retained, retired = _require_manifest(
         db, target=target, parents=parents, candidates=candidates,
         candidate_status="BUILDING_SNAPSHOT",
     )
@@ -890,15 +759,6 @@ def publish_obligation_refresh_batch(
         target=target,
         candidate_ids=candidate_ids,
         snapshot_metrics=dict(snapshot_batch.metrics or {}),
-        truth_status="building",
-        accepted_at=None,
-    )
-    candidate_dbr_snapshots = _require_candidate_dbr_snapshots(
-        db,
-        target=target,
-        candidate_ids=candidate_ids,
-        snapshot_metrics=dict(snapshot_batch.metrics or {}),
-        capabilities=capability_snapshot,
         truth_status="building",
         accepted_at=None,
     )
@@ -964,6 +824,17 @@ def publish_obligation_refresh_batch(
         ).all()
         for row in all_rows:
             row.locked_by_run_id = int(candidate.run_id)
+    for retired_run in retired:
+        plan = _lock(db.query(models.ProductionPlanHeader)).filter(
+            models.ProductionPlanHeader.id == int(retired_run.source_plan_id),
+        ).one_or_none()
+        if plan is None or str(plan.status) != "fixed":
+            raise ObligationRefreshPublishError(
+                "retire manifest plan must be fixed"
+            )
+        retired_run.status = "CLOSED"
+        retired_run.finished_at = accepted_at
+        plan.status = "closed"
 
     target.status = "accepted"
     target.accepted_at = accepted_at
@@ -985,11 +856,23 @@ def publish_obligation_refresh_batch(
         candidate.pinned = True
         candidate.fixed_at = accepted_at
         candidate.finished_at = accepted_at
-    for snapshot in [*candidate_read_snapshots, *candidate_dbr_snapshots, candidate_purchase_journal]:
+    for snapshot in [*candidate_read_snapshots, candidate_purchase_journal]:
         snapshot.truth_status = "accepted"
         snapshot.reason = None
         snapshot.published_at = accepted_at
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        message = str(exc.orig).lower() if getattr(exc, "orig", None) else str(exc).lower()
+        if (
+            "uq_planning_run_fixed_snapshot_source_plan" in message
+            or "unique constraint failed: planning_run.source_plan_id" in message
+        ):
+            raise ObligationRefreshPublishError(
+                "publish failed: plan already has a FIXED_SNAPSHOT planning run"
+            ) from exc
+        raise
+    db.expire(pointer, ["current_generation"])
     return ObligationRefreshPublishResult(
         parent_generation_id=int(parent.id), target_generation_id=int(target.id),
         parent_run_ids=tuple(sorted(

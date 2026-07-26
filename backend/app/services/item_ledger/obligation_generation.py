@@ -350,13 +350,6 @@ def carry_forward_retained_reservations(
         .all()
         if source_ids else []
     )
-    coverage_rows = (
-        db.query(models.ReservationCoverage)
-        .filter(models.ReservationCoverage.reservation_id.in_(source_ids))
-        .order_by(models.ReservationCoverage.id.asc())
-        .all()
-        if source_ids else []
-    )
     new_ids: dict[int, int] = {}
     for source in source_entries:
         target = models.ReservationEntry(
@@ -373,12 +366,10 @@ def carry_forward_retained_reservations(
             realization_mode=source.realization_mode,
             reserved_qty=source.reserved_qty,
             realized_qty=source.realized_qty,
-            covered_on_hand_qty=source.covered_on_hand_qty,
-            covered_incoming_supplier_qty=source.covered_incoming_supplier_qty,
-            covered_incoming_wip_qty=source.covered_incoming_wip_qty,
-            uncovered_qty=source.uncovered_qty,
+            covered_from_stock_at_freeze_qty=source.covered_from_stock_at_freeze_qty,
+            replenishment_required_qty=source.replenishment_required_qty,
+            replenishment_received_qty=source.replenishment_received_qty,
             lifecycle_status=source.lifecycle_status,
-            coverage_state=source.coverage_state,
             opened_at=source.opened_at,
             closed_at=source.closed_at,
         )
@@ -403,21 +394,6 @@ def carry_forward_retained_reservations(
             cycle_id=source.cycle_id,
             idempotency_key=source.idempotency_key,
             event_at=source.event_at,
-        ))
-    for source in coverage_rows:
-        db.add(models.ReservationCoverage(
-            reservation_id=new_ids[int(source.reservation_id)],
-            source_kind=source.source_kind,
-            source_ref=source.source_ref,
-            source_line_ref=source.source_line_ref,
-            pin_kind=source.pin_kind,
-            alloc_qty=source.alloc_qty,
-            fact_at_freeze=source.fact_at_freeze,
-            covered_qty=source.covered_qty,
-            realized_qty=source.realized_qty,
-            evaporated_qty=source.evaporated_qty,
-            cycle_id=source.cycle_id,
-            computed_at=source.computed_at,
         ))
     db.flush()
     return len(source_entries)

@@ -7,16 +7,13 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
 
 from ..models import (
-    IgnoredWarehouse,
     Item,
-    ItemWarehouseStock,
     PlannedOrder,
     PlannedPurchase,
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
     SpecComponent,
-    StockWarehouse,
     SupplierOrder,
     SupplierOrderItem,
 )
@@ -62,92 +59,15 @@ def _components_for_product(db: Session, product: ProductionProduct) -> Tuple[Op
     return spec_id, components
 
 
-def _stock_by_item(db: Session, item_ids: Sequence[int]) -> Dict[int, float]:
-    """
-    Return per-item available stock with warehouse settings applied.
-
-    Resolution order:
-    1. If there are no warehouse rows at all -> aggregated Item.stock_qty
-       (legacy behavior, fast).
-    2. Else use item_warehouse_stock filtered to selected warehouses and with
-       ignored warehouses excluded. Items that have ANY rows in
-       item_warehouse_stock are considered "covered by the breakdown" — if all
-       of their stock is in unselected/ignored warehouses they end up with 0,
-       which is the desired effect.
-    3. Items without any breakdown rows fallback to Item.stock_qty so a
-       partially-synced DB doesn't blank coverage. After a full re-sync the
-       breakdown path becomes authoritative for everything.
-    """
-    ids = [int(x) for x in item_ids if x is not None]
-    if not ids:
-        return {}
-
-    ignored_refs_rows = db.query(IgnoredWarehouse.warehouse_ref1c).all()
-    ignored_refs = {str(r[0]) for r in ignored_refs_rows if r and r[0]}
-    warehouse_rows = db.query(StockWarehouse.warehouse_ref1c, StockWarehouse.is_selected).all()
-    selected_refs = {
-        str(ref)
-        for ref, is_selected in warehouse_rows
-        if ref and bool(is_selected)
-    }
-    has_warehouse_settings = bool(warehouse_rows)
-
-    if not has_warehouse_settings and not ignored_refs:
-        result: Dict[int, float] = {}
-        for iid, stock in (
-            db.query(Item.item_id, Item.stock_qty).filter(Item.item_id.in_(ids)).all()
-        ):
-            result[int(iid)] = _to_float(stock)
-        return result
-
-    # Per-warehouse path: sum selected, non-ignored buckets per item.
-    sum_query = (
-        db.query(ItemWarehouseStock.item_id, func.sum(ItemWarehouseStock.qty))
-        .filter(ItemWarehouseStock.item_id.in_(ids))
-    )
-    if has_warehouse_settings:
-        if selected_refs:
-            sum_query = sum_query.filter(ItemWarehouseStock.warehouse_ref1c.in_(selected_refs))
-        else:
-            sum_query = sum_query.filter(False)
-    if ignored_refs:
-        sum_query = sum_query.filter(~ItemWarehouseStock.warehouse_ref1c.in_(ignored_refs))
-    sum_rows = sum_query.group_by(ItemWarehouseStock.item_id).all()
-    breakdown_stocks: Dict[int, float] = {int(iid): _to_float(qty) for iid, qty in sum_rows}
-
-    # Items that have ANY breakdown rows at all (even if 0 after ignored
-    # filter). These items are "authoritative" via the breakdown table.
-    has_any_rows = {
-        int(iid)
-        for (iid,) in db.query(ItemWarehouseStock.item_id)
-        .filter(ItemWarehouseStock.item_id.in_(ids))
-        .distinct()
-        .all()
-    }
-
-    result: Dict[int, float] = {}
-    missing_ids = [iid for iid in ids if iid not in has_any_rows]
-    if missing_ids:
-        # No breakdown yet for these items -> fallback to aggregated.
-        for iid, stock in (
-            db.query(Item.item_id, Item.stock_qty).filter(Item.item_id.in_(missing_ids)).all()
-        ):
-            result[int(iid)] = _to_float(stock)
-    for iid in ids:
-        if iid in has_any_rows:
-            result[iid] = breakdown_stocks.get(iid, 0.0)
-    return result
-
-
 def _open_issue_reservations_by_item(db: Session, item_ids: Sequence[int]) -> Dict[int, float]:
     """
     Components held for production lines: kits in transit (draft..exported
     transfers) plus kits already delivered to workshop warehouses (posted
-    transfers and in-place claims) that production has not consumed yet.
+    transfers and local zero-distance claims) that production has not consumed yet.
     """
-    from .production_control_reservations import open_reservations_by_item
+    from .production_material_custody import committed_material_by_item
 
-    return open_reservations_by_item(db, item_ids)
+    return committed_material_by_item(db, item_ids)
 
 
 def _supplier_eta_by_item(db: Session, item_ids: Sequence[int]) -> Dict[int, List[Dict[str, Any]]]:
@@ -457,13 +377,17 @@ def preview_materials(db: Session, product_id: int, *, refresh_state: bool = Fal
     spec_id, components = _components_for_product(db, product)
 
     comp_ids = [int(c["component_item_id"]) for c in components]
-    # Stock honours `ignored_warehouses`: items lying in е.g. изоляторе брака
-    # are not counted as available (plan rule).
-    stock_by_item = _stock_by_item(db, comp_ids)
+    from .item_ledger import item_ledger_position
 
-    from .production_control_reservations import load_reservation_state
+    ledger_positions = item_ledger_position(db, comp_ids)
+    stock_by_item = {
+        item_id: float(position["on_hand"])
+        for item_id, position in ledger_positions.items()
+    }
 
-    reservation_state = load_reservation_state(db, item_ids=comp_ids)
+    from .production_material_custody import load_material_custody
+
+    reservation_state = load_material_custody(db, item_ids=comp_ids)
     # Components held by OTHER lines are unavailable; components this line
     # already holds (in transit or delivered to its workshop) count as its own
     # coverage instead of re-entering the pool.
@@ -476,18 +400,6 @@ def preview_materials(db: Session, product_id: int, *, refresh_state: bool = Fal
         reservation_state,
         exclude_product_id=int(product.product_id),
     )
-    # Inc5 (design §2.5 / §11): behind STOCK_SOURCE=bin, additively expose the
-    # ledger pool projection (available / projected / uncovered) per component.
-    # Purely additive — the legacy availability path above is untouched, and the
-    # block is inert under the default legacy flag.
-    from .item_ledger.config import use_bin_stock
-
-    ledger_positions: Dict[int, Dict[str, float]] = {}
-    if use_bin_stock():
-        from .item_ledger import item_ledger_position
-
-        ledger_positions = item_ledger_position(db, comp_ids)
-
     run_id = _latest_run_id(db)
     supplier_eta = _supplier_eta_by_item(db, comp_ids)
     production_eta = _production_eta_by_item(db, comp_ids)

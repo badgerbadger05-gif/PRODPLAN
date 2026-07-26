@@ -21,6 +21,7 @@ from ..models import (
     PlannedOrderStage,
     PlannedPurchase,
     PlannedRework,
+    ClosedPlanSnapshot,
     PlanningRun,
     PlanningReadSnapshot,
     ProductionOrder,
@@ -56,6 +57,7 @@ from .mrp_stock_helpers import (
     effective_stock_by_item_all as _effective_stock_by_item_all,
 )
 from .planning_run_candidate import _resolve_parent_generation_id
+from .item_ledger.reservation import replenishment_remaining
 from .replenishment import (
     REPLENISHMENT_FLOW_PRODUCTION,
     REPLENISHMENT_FLOW_PURCHASE,
@@ -64,12 +66,17 @@ from .replenishment import (
 )
 
 
-PLAN_STATUSES = {"draft", "fixed", "archived"}
+PLAN_STATUSES = {"draft", "fixed", "closed"}
 
 # Matches planning_service.DONE_STATE_KEY — 1C state for completed production orders.
 _DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
 _DIRECT_1C_PRODUCTION_HORIZON = date(2026, 5, 1)
 _SUPPLIER_ORDER_DONE_STATES = {"принят на склад"}
+_CLOSE_REFRESH_KEY_PREFIX = "close-fixed-run"
+
+
+def _close_refresh_generation_key(*, run_id: int, parent_generation_id: int) -> str:
+    return f"{_CLOSE_REFRESH_KEY_PREFIX}:{int(run_id)}:{int(parent_generation_id)}"
 
 
 def _parse_date(value: Any, field: str = "date") -> date:
@@ -369,31 +376,12 @@ def get_period_plan(db: Session, plan_id: int) -> Dict[str, Any]:
 
 def fix_period_plan(db: Session, plan_id: int, *, fixed_by: Optional[str] = None) -> Dict[str, Any]:
     plan = _get_plan(db, plan_id)
-    if plan.status == "archived":
-        raise ValueError("Архивный план нельзя фиксировать")
+    if plan.status == "closed":
+        raise ValueError("Закрытый план нельзя фиксировать")
     if plan.status != "fixed":
         plan.status = "fixed"
         plan.fixed_by = fixed_by
         plan.fixed_at = datetime.now(timezone.utc)
-    db.commit()
-    db.refresh(plan)
-    return _serialize_plan(plan)
-
-
-def archive_period_plan(db: Session, plan_id: int) -> Dict[str, Any]:
-    plan = _get_plan(db, plan_id)
-    plan.status = "archived"
-    db.commit()
-    db.refresh(plan)
-    return _serialize_plan(plan)
-
-
-def unarchive_period_plan(db: Session, plan_id: int) -> Dict[str, Any]:
-    """Restore plan from archive. Returns to 'fixed' if previously fixed (has fixed_at), else 'draft'."""
-    plan = _get_plan(db, plan_id)
-    if plan.status != "archived":
-        raise ValueError("Только архивный план можно вернуть из архива")
-    plan.status = "fixed" if plan.fixed_at else "draft"
     db.commit()
     db.refresh(plan)
     return _serialize_plan(plan)
@@ -490,21 +478,11 @@ def material_availability_positions(
     db: Session,
     item_ids: Optional[Iterable[int]] = None,
 ) -> Dict[int, Dict[str, float]]:
-    """Inc5 (design §2.5 / §11): expose the ledger pool projection
+    """Expose the canonical ledger pool projection
     (``on_hand`` / ``incoming`` / ``reserved_soft`` / ``available`` /
     ``projected`` / ``uncovered``) per item for the period-plan
-    material-availability readers, behind the ``STOCK_SOURCE=bin`` flag.
-
-    Additive and read-only: under the default legacy flag this returns ``{}`` and
-    nothing in the planning pipeline consults it — the netting path
-    (``_explode_bom_net_first``) is NOT rewired onto the reservation ledger here
-    (that is Inc6). Only the stock ON-HAND source of the netting is flipped, via
-    ``effective_stock_by_item_all``.
+    material-availability readers. Item Ledger is the sole stock owner.
     """
-    from .item_ledger.config import use_bin_stock
-
-    if not use_bin_stock():
-        return {}
     from .item_ledger import item_ledger_position
 
     ids = list(item_ids) if item_ids is not None else None
@@ -1057,7 +1035,7 @@ def _prepare_include_run(
     now: datetime,
 ) -> PlanningRun:
     """Validate the include plan and get-or-create/refresh ONLY its run header
-    (v2 §6.2). Every other run's header is left untouched by a refreeze.
+    (v2 ). Every other run's header is left untouched by a refreeze.
     Validation errors carry the same texts as the legacy snapshot entry point
     and fire before any pool is built or row written.
     """
@@ -1135,7 +1113,7 @@ def _freeze_one_run(
     is_include: bool = True,
     manage_plan_locks: bool = True,
 ) -> Dict[str, Any]:
-    """Freeze ONE active run against the shared queue-wide pool (v2 §5/§6.5).
+    """Freeze ONE active run against the shared queue-wide pool (v2 /).
 
     The legacy single-snapshot body, extended so the BOM explosion consumes the
     shared pools once (``shared_pools``/``trace``); requirements are stamped with
@@ -1167,7 +1145,7 @@ def _freeze_one_run(
         int(req.item_id): req
         for req in db.query(MrpRequirement).filter(MrpRequirement.run_id == int(run.run_id)).all()
     }
-    # Own already-exported PlannedPurchase survive the rebuild (v2 §5): their 1C
+    # Own already-exported PlannedPurchase survive the rebuild (v2 ): their 1C
     # supplier order is self-excluded from the pool, so the exported qty is this
     # run's own coverage — consume it before booking any fresh purchase, and do
     # not delete it. Unexported local recommendations are rebuilt as before.
@@ -1235,8 +1213,6 @@ def _freeze_one_run(
         bom_lvl = bom_level_map.get(item_id, 0)
 
         pk = pool_key_for(int(item_id))
-        item_trace = trace.by_item.get(int(item_id))
-        initial_stock = float(item_trace.stock_alloc) if item_trace else 0.0
         req = existing_req_by_item.get(int(item_id))
         if req is None:
             req = MrpRequirement(
@@ -1244,8 +1220,6 @@ def _freeze_one_run(
                 item_id=int(item_id),
                 total_required_qty=total_gross,
                 net_required_qty=total_net,
-                covered_qty=0.0,
-                remaining_qty=total_net,
                 period_from=plan.period_from,
                 period_to=plan.period_to,
                 bom_level=bom_lvl,
@@ -1254,18 +1228,14 @@ def _freeze_one_run(
         else:
             req.total_required_qty = total_gross
             req.net_required_qty = total_net
-            req.covered_qty = 0.0
-            req.remaining_qty = total_net
             req.period_from = plan.period_from
             req.period_to = plan.period_to
             req.bom_level = bom_lvl
         # Freeze v2 stamps: version, zeroed drift, pool key, frozen stock alloc.
         req.freeze_version = int(new_version)
-        req.drift_adjustment_qty = 0.0
         req.characteristic_ref = pk.characteristic_ref
         req.organization_ref = pk.organization_ref
         req.planning_stock_pool = pk.planning_stock_pool
-        req.initial_snapshot_stock = initial_stock
         db.flush()
         req_by_item[item_id] = req
         seen_requirement_item_ids.add(int(item_id))
@@ -1296,17 +1266,13 @@ def _freeze_one_run(
         pk = pool_key_for(int(item_id))
         req.total_required_qty = 0.0
         req.net_required_qty = 0.0
-        req.covered_qty = 0.0
-        req.remaining_qty = 0.0
         req.period_from = plan.period_from
         req.period_to = plan.period_to
         # Dropped item: still re-stamp the freeze version (initial stock = 0).
         req.freeze_version = int(new_version)
-        req.drift_adjustment_qty = 0.0
         req.characteristic_ref = pk.characteristic_ref
         req.organization_ref = pk.organization_ref
         req.planning_stock_pool = pk.planning_stock_pool
-        req.initial_snapshot_stock = 0.0
 
     # --- Allocate PlannedOrder / PlannedPurchase / PlannedRework by replenishment flow ---
     allocatable_item_ids = [
@@ -1445,23 +1411,6 @@ def _freeze_one_run(
                     production_count += 1
                     alloc_total_qty += net_qty
 
-            # Mark the requirement covered by the allocation created above.
-            #
-            # Only purchase and rework flows close the requirement at snapshot
-            # time, because their PlannedPurchase / PlannedRework rows ARE the
-            # downstream orders that will be issued to 1C. PlannedOrder for a
-            # production-flow item is just an MRP proposal — covered_qty is
-            # incremented when a ProductionProduct is materialized via
-            # create_production_orders_from_mrp_requirements. Otherwise the
-            # very first materialization always skips with
-            # "remaining_qty=0 (уже покрыто)".
-            if flow in (REPLENISHMENT_FLOW_PURCHASE, REPLENISHMENT_FLOW_REWORK):
-                req = req_by_item.get(iid)
-                if req and alloc_total_qty > 0:
-                    total_net = _to_float(req.net_required_qty)
-                    req.covered_qty = min(alloc_total_qty, total_net)
-                    req.remaining_qty = max(0.0, total_net - alloc_total_qty)
-
         if created_production_orders:
             db.flush()
             produced_item_ids = sorted({int(order.item_id) for order in created_production_orders})
@@ -1593,7 +1542,7 @@ def _freeze_one_run(
             frozen_schedule_warnings = schedule_warnings
             # Only the include run records scheduler warnings on run.warnings
             # (legacy single-snapshot behaviour). Other runs report them in the
-            # refreeze result only, never mutating their own header (v2 §6.5d).
+            # refreeze result only, never mutating their own header (v2 d).
             if schedule_warnings and is_include:
                 run.warnings = list(run.warnings or []) + schedule_warnings
 
@@ -1726,6 +1675,228 @@ def lock_period_plan_lines(db: Session, plan_id: int, run_id: int, line_ids: Opt
     count = q.update({"locked_by_run_id": int(run_id)}, synchronize_session=False)
     db.commit()
     return int(count or 0)
+
+
+def _read_period_plan_execution_payload_for_run(
+    db: Session,
+    *,
+    plan: ProductionPlanHeader,
+    run: PlanningRun,
+    generation_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    payload_generation_id = (
+        int(generation_id) if generation_id is not None else int(run.ledger_generation_id)
+        if run.ledger_generation_id is not None else None
+    )
+    if payload_generation_id is None:
+        raise ValueError(f"run_id={int(run.run_id)}: execution snapshot generation is unknown")
+    snapshot_key = _execution_snapshot_key(
+        plan_id=plan.id,
+        run_id=run.run_id,
+        root_item_id=None,
+        bom_level=None,
+        flow=None,
+    )
+    snapshot = (
+        db.query(PlanningReadSnapshot)
+        .filter(
+            PlanningReadSnapshot.consumer == "period_plan_execution",
+            PlanningReadSnapshot.snapshot_key == snapshot_key,
+            PlanningReadSnapshot.ledger_generation_id == payload_generation_id,
+        )
+        .one_or_none()
+    )
+    if snapshot is None:
+        raise ValueError(
+            f"run_id={int(run.run_id)}: execution snapshot is missing for the run"
+        )
+    return dict(snapshot.payload)
+
+
+def _latest_closed_plan_snapshot(
+    db: Session,
+    *,
+    plan_id: int,
+    run_id: int,
+) -> ClosedPlanSnapshot | None:
+    return (
+        db.query(ClosedPlanSnapshot)
+        .filter(
+            ClosedPlanSnapshot.plan_id == int(plan_id),
+            ClosedPlanSnapshot.run_id == int(run_id),
+        )
+        .one_or_none()
+    )
+
+
+def close_fixed_plan(db: Session, run_id: int, *, dry_run: bool = False) -> Dict[str, Any]:
+    """Canonical explicit close for a fixed planning run.
+
+    Accepts only ``FIXED_SNAPSHOT`` → ``CLOSED`` and releases active run
+    reservations so they are removed from active queue usage.
+    This operation is close-only: no requirement status changes, no pruning and
+    no recalculation. No reopen path exists by design.
+    """
+    run = (
+        db.query(PlanningRun)
+        .filter(PlanningRun.run_id == int(run_id))
+        .with_for_update()
+        .one_or_none()
+    )
+    if run is None:
+        raise ValueError(f"run_id={run_id}: прогон не найден")
+    if run.source_plan_id is None:
+        raise ValueError(f"run_id={run_id}: run is not bound to a production plan")
+    if str(run.status or "") not in {"FIXED_SNAPSHOT", "CLOSED"}:
+        raise ValueError(
+            f"run_id={run_id}: нельзя close "
+            f"(status={run.status}, ожидался FIXED_SNAPSHOT)"
+        )
+    truth = db.get(PlanningTruthState, 1)
+    if truth is None or truth.current_generation_id is None:
+        raise ValueError("Current accepted planning truth is unavailable")
+    parent_generation_id = int(truth.current_generation_id)
+    parent_generation = db.get(LedgerGeneration, parent_generation_id)
+    if parent_generation is None or str(parent_generation.status) != "accepted":
+        raise ValueError("Current accepted planning truth is unavailable")
+    plan = db.get(ProductionPlanHeader, int(run.source_plan_id))
+    if plan is None:
+        raise ValueError(f"run_id={run_id}: bound plan not found")
+
+    existing_closed_snapshot = _latest_closed_plan_snapshot(
+        db, plan_id=plan.id, run_id=run.run_id
+    )
+
+    if str(run.status or "") == "CLOSED":
+        if existing_closed_snapshot is None:
+            raise ValueError("closed plan snapshot is missing for this run")
+        active_reservations = db.query(ReservationEntry.id).filter(
+            ReservationEntry.run_id == int(run.run_id),
+            ReservationEntry.ledger_generation_id == parent_generation_id,
+            ReservationEntry.lifecycle_status == "active",
+        ).count()
+        if active_reservations:
+            raise ValueError(
+                "закрытый прогон всё ещё присутствует в текущем planning truth"
+            )
+        current_payload = _read_period_plan_execution_payload_for_run(
+            db,
+            plan=plan,
+            run=run,
+            generation_id=int(existing_closed_snapshot.ledger_generation_id),
+        )
+        if dict(existing_closed_snapshot.payload or {}) != current_payload:
+            raise ValueError("closed plan snapshot payload mismatch for this run")
+        if dry_run:
+            db.rollback()
+            return {
+                "status": "already_closed",
+                "run_id": int(run.run_id),
+                "dry_run": bool(dry_run),
+                "requirements_closed": 0,
+                "reservations_released": 0,
+                "purchases_pruned": [],
+                "published_generation_id": int(existing_closed_snapshot.ledger_generation_id),
+            }
+        return {
+            "status": "already_closed",
+            "run_id": int(run.run_id),
+            "dry_run": bool(dry_run),
+            "requirements_closed": 0,
+            "reservations_released": 0,
+            "purchases_pruned": [],
+            "published_generation_id": int(existing_closed_snapshot.ledger_generation_id),
+        }
+
+    resolved_parent_generation_id = _resolve_parent_generation_id(
+        db, run, current_generation_id=parent_generation_id,
+    )
+    if resolved_parent_generation_id != parent_generation_id:
+        raise ValueError(f"run_id={run_id}: not bound to the current accepted planning truth")
+
+    payload_generation_id = (
+        int(run.ledger_generation_id) if run.ledger_generation_id is not None else parent_generation_id
+    )
+    execution_payload = _read_period_plan_execution_payload_for_run(
+        db,
+        plan=plan,
+        run=run,
+        generation_id=payload_generation_id,
+    )
+    if existing_closed_snapshot is not None:
+        if dict(existing_closed_snapshot.payload or {}) != execution_payload:
+            raise ValueError("closed plan snapshot payload mismatch for this run")
+        return {
+            "status": "already_closed",
+            "run_id": int(run.run_id),
+            "dry_run": bool(dry_run),
+            "requirements_closed": 0,
+            "reservations_released": 0,
+            "purchases_pruned": [],
+            "published_generation_id": int(payload_generation_id),
+        }
+
+    execution_generation = db.get(LedgerGeneration, payload_generation_id)
+    if execution_generation is None:
+        raise ValueError("run has no execution generation lineage")
+    if execution_generation.cutoff is None:
+        raise ValueError("run execution cutoff is unavailable")
+
+    if not dry_run:
+        db.add(ClosedPlanSnapshot(
+            plan_id=plan.id,
+            run_id=run.run_id,
+            ledger_generation_id=payload_generation_id,
+            cutoff=execution_generation.cutoff,
+            payload=execution_payload,
+            closed_at=datetime.now(timezone.utc),
+        ))
+
+    from .obligation_refresh_orchestrator import run_obligation_refresh
+
+    generation_key = _close_refresh_generation_key(
+        run_id=int(run.run_id),
+        parent_generation_id=parent_generation_id,
+    )
+    try:
+        report = run_obligation_refresh(
+            db,
+            parent_generation_id=parent_generation_id,
+            generation_key=generation_key,
+            add_plan_ids=(),
+            retire_plan_ids=(int(plan.id),),
+            started_by=f"close_fixed_plan:{int(run.run_id)}",
+        )
+        if dry_run:
+            db.rollback()
+            return {
+                "status": "closed",
+                "run_id": int(run_id),
+                "dry_run": bool(dry_run),
+                "requirements_closed": 0,
+                "reservations_released": 0,
+                "purchases_pruned": [],
+                "published_generation_id": int(report.target_generation_id),
+                "published": bool(report.published),
+            }
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    db.refresh(run)
+    db.refresh(plan)
+    if str(run.status) != "CLOSED" or str(plan.status) != "closed":
+        raise ValueError("публикация закрытия не завершила lifecycle плана")
+    return {
+        "status": "closed",
+        "run_id": int(run_id),
+        "dry_run": bool(dry_run),
+        "requirements_closed": 0,
+        "reservations_released": 0,
+        "purchases_pruned": [],
+        "published_generation_id": int(report.target_generation_id),
+        "published": bool(report.published),
+    }
 
 
 def _latest_fixed_run_for_plan(db: Session, plan_id: int) -> Optional[PlanningRun]:
@@ -1893,14 +2064,18 @@ def _execution_snapshot_key(
 def _resolve_execution_run(db: Session, plan: ProductionPlanHeader, run_id: Optional[int]) -> PlanningRun:
     if run_id is not None:
         run = db.query(PlanningRun).filter(PlanningRun.run_id == int(run_id)).first()
-        if not run or int(run.source_plan_id or -1) != int(plan.id):
+        if (
+            not run
+            or int(run.source_plan_id or -1) != int(plan.id)
+            or str(run.status or "") not in {"FIXED_SNAPSHOT", "CLOSED"}
+        ):
             raise ValueError("Run not found for this plan")
         return run
     run = (
         db.query(PlanningRun)
         .filter(
             PlanningRun.source_plan_id == int(plan.id),
-            PlanningRun.status == "FIXED_SNAPSHOT",
+            PlanningRun.status.in_(("FIXED_SNAPSHOT", "CLOSED")),
         )
         .order_by(PlanningRun.run_id.desc())
         .first()
@@ -2439,9 +2614,8 @@ def _build_execution_snapshot_rows(
                 ReservationEntry.requirement_id,
                 ReservationEntry.realization_mode,
                 ReservationEntry.reserved_qty,
-                ReservationEntry.realized_qty,
-                ReservationEntry.covered_incoming_supplier_qty,
-                ReservationEntry.uncovered_qty,
+                ReservationEntry.replenishment_required_qty,
+                ReservationEntry.replenishment_received_qty,
         )
         .filter(
             ReservationEntry.ledger_generation_id == int(generation_id),
@@ -2458,24 +2632,28 @@ def _build_execution_snapshot_rows(
         req_id,
         realization_mode,
         _reserved_qty,
-        realized_qty,
-        covered_supplier_qty,
-        uncovered_qty,
+        replenishment_required_qty,
+        replenishment_received_qty,
     ) in reservation_rows:
         rid = int(req_id)
         reservation_ids_by_req.setdefault(rid, []).append(int(row_id))
         reservation_ids.append(int(row_id))
         mode_key = (rid, str(realization_mode or ""))
         realized_by_req_mode[mode_key] = (
-            realized_by_req_mode.get(mode_key, 0.0) + _to_float(realized_qty)
+            realized_by_req_mode.get(mode_key, 0.0)
+            + _to_float(replenishment_received_qty)
         )
         if str(realization_mode or "") == "buy":
             covered, to_order = purchase_coverage_by_req.get(rid, (0.0, 0.0))
             purchase_coverage_by_req[rid] = (
-                covered
-                + _to_float(realized_qty)
-                + _to_float(covered_supplier_qty),
-                to_order + _to_float(uncovered_qty),
+                covered + _to_float(replenishment_received_qty),
+                to_order
+                + float(
+                    replenishment_remaining(
+                        replenishment_required_qty,
+                        replenishment_received_qty,
+                    )
+                ),
             )
 
     events_by_requirement: Dict[int, List[Dict[str, Any]]] = {}
@@ -2517,7 +2695,18 @@ def _build_execution_snapshot_rows(
         )
         for event in events:
             event["reservation_events_url"] = f"/api/v1/item-ledger/{item_id}/reservations/{int(event.get('reservation_id') or 0)}/events"
-        progress_base_qty = _to_float(req["net_required_qty"])
+        reservation_row = next(
+            (
+                row for row in reservation_rows
+                if int(row[1]) == int(req_id)
+            ),
+            None,
+        )
+        progress_base_qty = (
+            _to_float(reservation_row[4])
+            if reservation_row is not None
+            else _to_float(req["net_required_qty"])
+        )
         flow = item_flow_by_id.get(item_id)
         execution_available = True
         realization_mode = (
@@ -2626,6 +2815,7 @@ def get_period_plan_execution_journal(
     flow: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Read the immutable execution snapshot. Never computes or publishes."""
+    from .planning_truth import get_truth_state
     from .planning_truth import (
         CAPABILITY_EXECUTION_ALLOCATIONS,
         CAPABILITY_PHYSICAL_LEDGER,
@@ -2633,44 +2823,72 @@ def get_period_plan_execution_journal(
         CAPABILITY_RESERVATION_REPLAY,
         PlanningTruthUnavailable,
         get_latest_read_snapshot,
-        get_truth_state,
     )
 
     plan = _get_plan(db, plan_id)
     run = _resolve_execution_run(db, plan, run_id)
-    snapshot_key = _execution_snapshot_key(
-        plan_id=plan.id,
-        run_id=run.run_id,
-        root_item_id=root_item_id,
-        bom_level=bom_level,
-        flow=flow,
-    )
-    capabilities = (
-        CAPABILITY_PHYSICAL_LEDGER,
-        CAPABILITY_RESERVATION_REPLAY,
-        CAPABILITY_EXECUTION_ALLOCATIONS,
-        "supplier_receipt_coverage",
-        CAPABILITY_PLANNING_SNAPSHOTS,
-    )
-    try:
-        snapshot = get_latest_read_snapshot(
-            db,
-            consumer="period_plan_execution",
-            snapshot_key=snapshot_key,
-            required_capabilities=capabilities,
+
+    if str(run.status or "") == "CLOSED":
+        closed_snapshot = (
+            db.query(ClosedPlanSnapshot)
+            .filter(
+                ClosedPlanSnapshot.plan_id == int(plan.id),
+                ClosedPlanSnapshot.run_id == int(run.run_id),
+            )
+            .one_or_none()
         )
-    except PlanningTruthUnavailable as exc:
-        return _execution_unavailable_payload(
-            db, plan=plan, run=run, root_item_id=root_item_id,
-            bom_level=bom_level, flow=flow, truth_state=exc.state,
+        if closed_snapshot is None:
+            return _execution_unavailable_payload(
+                db,
+                plan=plan,
+                run=run,
+                root_item_id=root_item_id,
+                bom_level=bom_level,
+                flow=flow,
+                truth_state=get_truth_state(db),
+                reason="Execution snapshot is missing for the closed plan",
+            )
+        payload = dict(closed_snapshot.payload or {})
+    else:
+        snapshot_key = _execution_snapshot_key(
+            plan_id=plan.id,
+            run_id=run.run_id,
+            root_item_id=root_item_id,
+            bom_level=bom_level,
+            flow=flow,
         )
-    if snapshot is None:
-        return _execution_unavailable_payload(
-            db, plan=plan, run=run, root_item_id=root_item_id,
-            bom_level=bom_level, flow=flow, truth_state=get_truth_state(db),
-            reason="Execution snapshot is missing for the accepted Ledger generation",
+        capabilities = (
+            CAPABILITY_PHYSICAL_LEDGER,
+            CAPABILITY_RESERVATION_REPLAY,
+            CAPABILITY_EXECUTION_ALLOCATIONS,
+            "supplier_receipt_coverage",
+            CAPABILITY_PLANNING_SNAPSHOTS,
         )
-    payload = dict(snapshot.payload)
+        try:
+            snapshot = get_latest_read_snapshot(
+                db,
+                consumer="period_plan_execution",
+                snapshot_key=snapshot_key,
+                required_capabilities=capabilities,
+            )
+        except PlanningTruthUnavailable as exc:
+            return _execution_unavailable_payload(
+                db,
+                plan=plan,
+                run=run,
+                root_item_id=root_item_id,
+                bom_level=bom_level,
+                flow=flow,
+                truth_state=exc.state,
+            )
+        if snapshot is None:
+            return _execution_unavailable_payload(
+                db, plan=plan, run=run, root_item_id=root_item_id,
+                bom_level=bom_level, flow=flow, truth_state=get_truth_state(db),
+                reason="Execution snapshot is missing for the accepted Ledger generation",
+            )
+        payload = dict(snapshot.payload)
+
     if root_item_id is None and bom_level is None and flow is None:
         return payload
     rows = _filter_execution_rows(

@@ -291,7 +291,6 @@ def _load_production_area_map(db: Session, item_ids: List[int]) -> Dict[int, Dic
 DEFAULT_PLANNING_CONFIG: Dict[str, Any] = {
     "planning_horizon_days": 90,
     "mps_daily_horizon_days": 90,
-    "weekly": {"enabled": True, "anchor_day": "Monday", "need_date_day": "Friday"},
     "procurement": {
         "default_lead_time_days": 30,
         "lead_time_min_policy": "max(default_lead_time_days, lead_time_from_item)",
@@ -307,7 +306,7 @@ DEFAULT_PLANNING_CONFIG: Dict[str, Any] = {
         "weight_cycle_time": 0.3,
         "default_importance": 1,
     },
-    "toggles": {"include_wip": False, "enable_weekly_route_detail": False},
+    "toggles": {"include_wip": False},
 }
 
 # Pagination constants
@@ -2429,7 +2428,8 @@ def _get_active_production_remaining_by_item(db: Session) -> Dict[int, float]:
     """
     Aggregate remaining qty from ALL active production orders by produced item,
     regardless of source. Internal MRP-originated orders (source='mrp', created
-    via /v1/production-control/orders/from-mrp) and 1C-synced ones (source='1c')
+    from the canonical replenishment work-item contour and 1C-synced ones
+    (source='1c')
     are both counted here, because both represent already-committed production
     that should reduce the net requirement of subsequent MRP runs (plan rule:
     "эти заказы учитываются в следующих MRP-расчетах как активное ожидаемое
@@ -3939,7 +3939,7 @@ def run_planning_run(
 
         # A) Active production orders as already planned finished output.
         # Covers both 1C-synced orders and internal MRP-originated ones
-        # (source='mrp' from /v1/production-control/orders/from-mrp), per plan
+        # (source='mrp' from canonical replenishment work items), per plan
         # rule "эти заказы учитываются в следующих MRP-расчетах".
         active_remaining_by_item = _get_active_production_remaining_by_item(db)
         supplier_remaining_by_item_date = _get_active_supplier_remaining_by_item_date(db)

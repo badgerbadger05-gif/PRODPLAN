@@ -613,7 +613,10 @@ def _build_header_payload(
         "Комментарий": comment,
         "Продукция": products,
     }
-    planned_time_source = _current_moscow_datetime()
+    # Planned dates are date-only in the canonical model.  Derive their time
+    # component from the durable document timestamp so an identical retry
+    # produces the identical payload hash.
+    planned_time_source = document_dt
     start_dt = _combine_planned_date_with_time(entry.planned_start_date, planned_time_source)
     finish_dt = _combine_planned_date_with_time(entry.planned_finish_date or entry.planned_start_date, planned_time_source)
     if start_dt:

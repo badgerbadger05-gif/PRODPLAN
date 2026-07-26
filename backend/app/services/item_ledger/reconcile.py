@@ -1,10 +1,10 @@
-"""Ledger-1 Balance-reconcile v2 (сверка через документ-источник) — §3б + §7.4(д).
+"""Balance reconciliation through the source document.
 
 The local materialized ``stock_bin.on_hand`` may drift from 1С for postings made
 OUTSIDE our documents (manual Списание, inventory counts, foreign transfers).
 The existing ~30-min stock sweep already pulls the 1С ``/Balance`` snapshot and
-full-refreshes ``ItemWarehouseStock``/``Item.stock_qty``; inc3 adds an
-after-step that compares that snapshot against the ledger bins and, for
+refreshes ``Item.stock_qty``; this service then compares that
+snapshot against the ledger bins and, for
 confirmed out-of-band deltas, recovers — v2: by *finding the missed document*
 first, and only then (register clean) by a compensating adjustment-SLE.
 
@@ -13,10 +13,9 @@ Comparison axis — Д7, characteristics (choice documented per the audit):
     ``Dimensions='Номенклатура,СтруктурнаяЕдиница,Организация'`` — WITHOUT
     Характеристика — and ``convert_1c_stock_to_records`` does not surface a
     characteristic either. Widening those Dimensions was rejected: the same
-    query feeds the legacy sweep consumers (``ItemWarehouseStock`` /
-    ``Item.stock_qty``), so per-characteristic rows would change the granularity
-    of a shared prod contract on unverified live-1С behavior (design Прил. A
-    §3б step 1 pins the current dims). Therefore the reconcile compares
+    query feeds the stock-sum compatibility projection (``Item.stock_qty``),
+    so per-characteristic rows would change its granularity without verified
+    live-1С evidence. Therefore the reconcile compares
     **aggregates per (item, organization, warehouse)**: Σ ``stock_bin.on_hand``
     over ALL characteristics of the key vs the Balance row(s) for that key
     (variant «б»). Bins keyed by a real ``characteristic_ref`` (ingest keys bins
@@ -27,7 +26,7 @@ Comparison axis — Д7, characteristics (choice documented per the audit):
     ONLY into the char='' bin and ONLY for a matured *aggregate* discrepancy;
     per-char bins are never touched by the reconcile.
 
-Debounce (§3б step 3) is unchanged: the maturity window W=48h is not needed
+The maturity window W=48h is not needed
 (one registrar); only a one-sweep debounce against snapshot races:
 
 * ``|delta| ≤ EPS``            → matched: ``last_reconciled_at``, clear pending.
@@ -35,7 +34,7 @@ Debounce (§3б step 3) is unchanged: the maturity window W=48h is not needed
 * ``|delta| > EPS`` 2nd sweep, same (±EPS) delta AND no in-flight pull →
   the v2 discovery→adjustment order below.
 
-Discovery→adjustment order (owner decision §7.4(д): «расхождение = мы
+Discovery→adjustment order («расхождение = мы
 пропустили документ, а не повод для анонимной поправки»):
 
 1. For a matured key, point-query the movements register
@@ -60,9 +59,7 @@ anomaly-adjustment (accepted, same as the design's backdating compromise); an
 item without ``item_ref1c`` cannot be queried by name — the adjustment is its
 only recovery path.
 
-Everything here stays SHADOW: the adjustment-SLE feeds only the (still-unread)
-stock_bin — no reader is switched (inc5), no reservation side is wired (inc4),
-and there is no OData write (INV-1way / INV-no-write). The diagnostic report is
+There is no OData write (INV-1way / INV-no-write). The diagnostic report is
 read-only.
 """
 
@@ -94,7 +91,7 @@ RECONCILE_SOURCE = "balance_reconcile"
 RECONCILE_RECORDER_TYPE = "reconcile"
 RECONCILE_MOVEMENT_KIND = "reconcile_adjustment"
 
-# §7.4(д) discovery: the pull-queue source tag and the per-sweep cap on point
+#  discovery: the pull-queue source tag and the per-sweep cap on point
 # register queries (each matured key costs one OData round-trip; the rest are
 # held to the next sweep — bounded 1С load by construction).
 RECONCILE_DISCOVERY_SOURCE = "reconcile-discovery"
@@ -129,7 +126,7 @@ class ReconcileEvent:
 
 @dataclass
 class ReconcileResult:
-    """Counters + event trace of one reconcile_balance_snapshot call (§3б)."""
+    """Counters + event trace of one reconcile_balance_snapshot call ()."""
 
     batch_ref: str = ""
     snapshot_period: Optional[datetime] = None
@@ -138,7 +135,7 @@ class ReconcileResult:
     pending: int = 0  # first-seen deltas stored, not applied
     held: int = 0     # confirmed deltas held back (in-flight pull / discovery)
     adjusted: int = 0  # adjustment-SLEs written
-    # §7.4(д) discovery counters (sweep report):
+    #  discovery counters (sweep report):
     discovered_recorders: int = 0  # missed recorders found + enqueued this sweep
     discovery_skipped: int = 0     # matured keys not checked (limit / OData error)
     anomalies: int = 0             # register clean, delta stayed → anonymous adjustment
@@ -146,7 +143,7 @@ class ReconcileResult:
 
 
 # ---------------------------------------------------------------------------
-# pending-pull race guard (§3б step 3)
+# pending-pull race guard ( step 3)
 # ---------------------------------------------------------------------------
 
 
@@ -191,14 +188,14 @@ def _has_inflight_pull(session: Session) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# §7.4(д) discovery helpers
+#  discovery helpers
 # ---------------------------------------------------------------------------
 
 
 class _FailingDiscoveryClient:
     """Stand-in when the real OData client could not be built.
 
-    Every discovery attempt raises, so matured deltas are HELD (§7.4д forbids
+    Every discovery attempt raises, so matured deltas are HELD ( forbids
     an anonymous adjustment that skipped the document search) and the sweep
     itself never crashes.
     """
@@ -374,8 +371,8 @@ def reconcile_balance_snapshot(
     (item, org, warehouse) — Д7 variant «б»); bins are summed over all
     characteristics of the same aggregate key. Missing bin ⇒ on_hand 0; missing
     balance row ⇒ balance 0; keys that are zero on both sides are not
-    persisted. Debounce + apply per §3б step 3; a matured delta goes through
-    the §7.4(д) discovery order when ``discovery_client`` is set (the prod
+    persisted. Debounce + apply per  step 3; a matured delta goes through
+    the  discovery order when ``discovery_client`` is set (the prod
     sweep always sets it; ``None`` = legacy direct-adjustment mode for
     unit-level callers). Writes only ledger-1 tables
     (stock_ledger_entry.qty_after via rebuild + stock_bin) plus
@@ -426,14 +423,14 @@ def reconcile_balance_snapshot(
         on_hand = sum((_dec(b.on_hand) for b in group), Decimal("0"))
         delta = balance_qty - on_hand
 
-        # Both sides zero and no bin rows → nothing to persist (§3б step 2).
+        # Both sides zero and no bin rows → nothing to persist ( step 2).
         if not group and abs(balance_qty) <= eps:
             continue
 
         result.compared += 1
 
         if abs(delta) <= eps:
-            # Matched: clear the debounce, stamp the reconcile time (§3б step 2)
+            # Matched: clear the debounce, stamp the reconcile time ( step 2)
             # on every bin of the aggregate — they are jointly reconciled.
             for b in group:
                 b.reconcile_pending_qty = Decimal("0")
@@ -460,7 +457,7 @@ def reconcile_balance_snapshot(
             continue
 
         if same_as_prior:
-            # Second consecutive sweep, same delta, no in-flight pull. §7.4(д):
+            # Second consecutive sweep, same delta, no in-flight pull. :
             # a discrepancy means «we missed a document» — search the register
             # for its recorder BEFORE resorting to an anonymous adjustment.
             if discovery_client is not None:
@@ -581,20 +578,10 @@ def reconcile_balance_snapshot(
                 "(on_hand %s -> %s) batch=%s",
                 sle.id, key, delta, on_hand, balance_qty, batch_ref,
             )
-            # Trigger т1 (design §5 / §6.1 «adjustment сверки → redistribute»):
-            # the adjustment moved on_hand, so refresh the touched item's coverage
-            # caches (a negative delta may surface uncovered — пример 3). match=False
-            # — an anonymous adjustment has no reservation to realize; matching stays
-            # the cycle's job. Guarded internally: never breaks the sweep.
-            from .reservation_ledger import redistribute_after_ledger_apply
-
-            redistribute_after_ledger_apply(
-                session, [key.item_id], batch_ref[:64], match=False
-            )
             continue
 
         # First sighting (or the delta changed / flipped sign → debounce reset):
-        # store the pending delta, do NOT apply this sweep (§3б step 3).
+        # store the pending delta, do NOT apply this sweep ( step 3).
         _store_pending(session, key, group, delta, int(ledger_generation_id))
         result.pending += 1
         result.events.append(
@@ -615,7 +602,7 @@ def _insert_adjustment_sle(
     *,
     import_batch: Optional[models.PhysicalImportBatch] = None,
 ) -> models.StockLedgerEntry:
-    """INSERT the compensating adjustment-SLE (§3б step 3). Signed qty=delta."""
+    """INSERT the compensating adjustment-SLE ( step 3). Signed qty=delta."""
     row_hash = canonical_content_hash(
         {
             "recorder_type": RECONCILE_RECORDER_TYPE,
@@ -735,14 +722,14 @@ def run_balance_reconcile_after_sweep(
     import_batch: Optional[models.PhysicalImportBatch] = None,
     ledger_generation_id: Optional[int] = None,
 ) -> ReconcileResult:
-    """The stock-sweep after-step (§3б): reconcile bins vs the Balance snapshot.
+    """The stock-sweep after-step (): reconcile bins vs the Balance snapshot.
 
     Called at the tail of ``sync_stock_from_odata`` with the FULL (pre-warehouse-
     filter) converted Balance rows, so bins in any known warehouse reconcile
     against 1С regardless of the planning selection contour. Guarded by its
     caller — a failure here never breaks the legacy sweep.
 
-    Discovery (§7.4д) is ALWAYS on for this prod path: by default a read-only
+    Discovery () is ALWAYS on for this prod path: by default a read-only
     OData client is built lazily (same config as ingest); if it cannot be built,
     matured deltas are held rather than anonymously adjusted (never crash).
     Tests inject ``discovery_client`` explicitly; passing ``None`` disables
@@ -753,7 +740,7 @@ def run_balance_reconcile_after_sweep(
             from .ingest import _build_client
 
             discovery_client = _build_client()
-        except Exception as exc:  # noqa: BLE001 — held, not crashed (§7.4д)
+        except Exception as exc:  # noqa: BLE001 — held, not crashed ()
             discovery_client = _FailingDiscoveryClient(str(exc))
     snapshot = build_balance_snapshot(session, balance_rows)
     return reconcile_balance_snapshot(
@@ -774,14 +761,14 @@ def run_balance_reconcile_after_sweep(
 
 
 def ledger_on_hand_by_item(session: Session) -> Dict[int, float]:
-    """``{item_id: Σ stock_bin.on_hand}`` over the planning contour (design §2.5
+    """``{item_id: Σ stock_bin.on_hand}`` over the planning contour (
     pool on_hand): selected warehouses, ignored excluded, **finished_goods
     (ГП) warehouses excluded** — the pool never sums stock parked on a
-    finished-goods warehouse (§2.5: ГП выпускается напрямую на ГП-склад вне
+    finished-goods warehouse (: ГП выпускается напрямую на ГП-склад вне
     контура).
 
     This is the ledger-world stock source rendered per item so it can be laid
-    beside the legacy world (shadow report) and, from Inc5, feed the flipped
+    beside the legacy world (shadow report) and, from , feed the flipped
     ``effective_stock_by_item_all`` bin path. Read-only. If no warehouse
     settings exist, sums every bin (legacy fallback).
     """
@@ -795,7 +782,7 @@ def ledger_on_hand_by_item(session: Session) -> Dict[int, float]:
         models.StockWarehouse.is_finished_goods,
     ).all()
     # selected minus finished_goods — a ГП склад is out of the planning contour
-    # even if it is (also) flagged selected (§2.5).
+    # even if it is (also) flagged selected ().
     selected_refs = {
         str(ref) for ref, sel, fg in warehouse_rows if ref and bool(sel) and not bool(fg)
     }
@@ -819,7 +806,7 @@ def ledger_on_hand_by_item(session: Session) -> Dict[int, float]:
 
 
 def contour_warehouse_refs(session: Session) -> Set[str]:
-    """Refs of warehouses INSIDE the planning contour (design §2.5): selected,
+    """Refs of warehouses INSIDE the planning contour (): selected,
     NOT ignored, NOT finished_goods — the same axis :func:`ledger_on_hand_by_item`
     sums on_hand over.
 
@@ -832,7 +819,7 @@ def contour_warehouse_refs(session: Session) -> Set[str]:
     no warehouse settings exist at all the set is empty — the internal-move
     suppression then never fires and ``transfer_out`` keeps its legacy
     realize-always behavior (conservative: суppress only on a proven contour
-    destination). ГП-склады are excluded even when also flagged selected (§2.5).
+    destination). ГП-склады are excluded even when also flagged selected ().
     """
     ignored_refs = {
         str(r[0]) for r in session.query(models.IgnoredWarehouse.warehouse_ref1c).all()
@@ -847,98 +834,4 @@ def contour_warehouse_refs(session: Session) -> Set[str]:
         str(ref)
         for ref, sel, fg in rows
         if ref and bool(sel) and not bool(fg) and str(ref) not in ignored_refs
-    }
-
-
-def stock_shadow_report(
-    session: Session,
-    *,
-    eps: float = float(EPS),
-    include_all: bool = False,
-) -> Dict[str, Any]:
-    """Shadow-mode observation surface (point 4): ledger world vs legacy world.
-
-    Per item: ``ledger_on_hand`` (Σ bin over the contour) vs ``legacy_stock``
-    (``effective_stock_by_item_all``) and their divergence; plus reconcile
-    counts (matched / pending / adjusted) over the bins. Read-only, no behavior
-    change — this is what we watch ≥1 week before inc5 flips the readers.
-    """
-    from ..mrp_stock_helpers import effective_stock_by_item_all
-
-    legacy = effective_stock_by_item_all(session)
-    ledger = ledger_on_hand_by_item(session)
-
-    item_codes = {
-        int(iid): (code, name)
-        for iid, code, name in session.query(
-            models.Item.item_id, models.Item.item_code, models.Item.item_name
-        ).all()
-    }
-
-    all_item_ids = set(legacy.keys()) | set(ledger.keys())
-    items: List[Dict[str, Any]] = []
-    divergent = 0
-    tot_ledger = 0.0
-    tot_legacy = 0.0
-    for iid in all_item_ids:
-        lv = float(ledger.get(iid, 0.0))
-        gv = float(legacy.get(iid, 0.0))
-        div = lv - gv
-        tot_ledger += lv
-        tot_legacy += gv
-        is_div = abs(div) > eps
-        if is_div:
-            divergent += 1
-        if include_all or is_div or abs(lv) > eps or abs(gv) > eps:
-            code, name = item_codes.get(iid, ("", ""))
-            items.append({
-                "item_id": iid,
-                "item_code": code,
-                "item_name": name,
-                "ledger_on_hand": lv,
-                "legacy_stock": gv,
-                "divergence": div,
-            })
-    items.sort(key=lambda r: abs(r["divergence"]), reverse=True)
-
-    bins = session.query(models.StockBin).all()
-    matched = sum(
-        1 for b in bins
-        if b.last_reconciled_at is not None and abs(float(b.reconcile_pending_qty or 0)) <= eps
-    )
-    pending = sum(1 for b in bins if abs(float(b.reconcile_pending_qty or 0)) > eps)
-
-    adjustment_rows = (
-        session.query(models.StockLedgerEntry)
-        .filter(models.StockLedgerEntry.ingest_source == RECONCILE_SOURCE)
-        .count()
-    )
-    adjusted_keys = (
-        session.query(
-            models.StockLedgerEntry.item_id,
-            models.StockLedgerEntry.characteristic_ref,
-            models.StockLedgerEntry.organization_ref,
-            models.StockLedgerEntry.warehouse_ref1c,
-        )
-        .filter(models.StockLedgerEntry.ingest_source == RECONCILE_SOURCE)
-        .distinct()
-        .count()
-    )
-
-    return {
-        "generated_at": datetime.now().isoformat(),
-        "counts": {
-            "bins": len(bins),
-            "matched": matched,
-            "pending": pending,
-            "adjusted_keys": adjusted_keys,
-            "adjustment_sles": adjustment_rows,
-            "divergent_items": divergent,
-        },
-        "totals": {
-            "ledger_on_hand": tot_ledger,
-            "legacy_stock": tot_legacy,
-            "divergence": tot_ledger - tot_legacy,
-        },
-        "items": items,
     }

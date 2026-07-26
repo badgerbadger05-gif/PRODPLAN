@@ -1,4 +1,4 @@
-"""POST /api/v1/item-ledger/admin/seed — сид якоря T0 леджера-1 (Прил. A §4).
+"""POST /api/v1/item-ledger/admin/seed — сид якоря T0 физического Ledger.
 
 * dry-run (default) считает сводку и НЕ пишет в БД;
 * боевой сид создаёт seed-SLE + stock_bin + stock_ledger_anchor на каждый
@@ -74,7 +74,7 @@ def _rows(qty1=10, qty2=4):
     return [
         {"code": "P1", "ref": "ref-item-1", "organization_ref": "ORG1", "warehouse_ref": "wh-1", "qty": qty1},
         {"code": "C1", "ref": "ref-item-2", "organization_ref": "ORG1", "warehouse_ref": "wh-1", "qty": qty2},
-        # zero-qty key must be skipped (A §4.2: нулевые ключи не сеются)
+        # zero-qty key must be skipped (A : нулевые ключи не сеются)
         {"code": "C1", "ref": "ref-item-2", "organization_ref": "ORG2", "warehouse_ref": "wh-1", "qty": 0},
     ]
 

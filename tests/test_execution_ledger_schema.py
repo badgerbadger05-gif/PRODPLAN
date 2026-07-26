@@ -28,11 +28,11 @@ def test_mrp_requirement_ledger_defaults(db_session):
     db_session.commit()
     db_session.refresh(req)
 
-    assert float(req.executed_qty) == 0
-    assert float(req.carried_remaining) == 0
     assert req.status == "open"
     assert req.closed_at is None
-    assert req.initial_snapshot_stock is None
+    assert not hasattr(req, "executed_qty")
+    assert not hasattr(req, "carried_remaining")
+    assert not hasattr(req, "initial_snapshot_stock")
 
 
 def test_planning_run_prior_run_defaults(db_session):
