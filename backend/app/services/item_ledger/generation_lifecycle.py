@@ -37,7 +37,11 @@ from .assembly_output_persistence import (
 )
 from .drum_schedule_persistence import materialize_drum_schedule
 from .shelf_projection_persistence import materialize_shelf_projections
+from .replenishment_work_item_builder import materialize_replenishment_work_items
 from app.services.one_c_export_common import DEFAULT_ORGANIZATION_REF1C
+from app.services.purchase_control_snapshot import (
+    build_candidate_snapshot as build_purchase_journal_candidate,
+)
 
 
 CAPABILITIES = {
@@ -50,8 +54,11 @@ CAPABILITIES = {
     "assembly_queue": True,
     "drum_schedule": True,
     "shelf_projection": True,
+    "replenishment_work_item": True,
+    "purchase_control_journal": True,
 }
 PHYSICAL_REFRESH_KIND = "physical_refresh"
+_REPLENISHMENT_WORK_ITEM_ALGORITHM_VERSION = "physical-refresh-replenishment-work-item/1"
 _SUPPLIER_DOCUMENT_TYPES = frozenset({
     "Document_ПриходнаяНакладная",
     "Document_КорректировкаПоступления",
@@ -712,6 +719,30 @@ def accept_generation_build(
             raise GenerationValidationError(
                 f"planning read snapshot build failed: {exc}"
             ) from exc
+        try:
+            replenishment_batch = models.LedgerBuildBatch(
+                ledger_generation_id=int(generation.id),
+                stage="replenishment_work_item",
+                batch_key=f"g{generation.id}:replenishment_work_item",
+                status="building",
+                algorithm_version=_REPLENISHMENT_WORK_ITEM_ALGORITHM_VERSION,
+                metrics={},
+            )
+            db.add(replenishment_batch)
+            db.flush()
+            replenishment_work_items = materialize_replenishment_work_items(
+                db, int(generation.id), int(replenishment_batch.id)
+            )
+            replenishment_batch.status = "completed"
+            replenishment_batch.metrics = replenishment_work_items
+            replenishment_batch.completed_at = datetime.now(timezone.utc)
+            purchase_journal_snapshot = build_purchase_journal_candidate(
+                db, int(generation.id)
+            )
+        except ValueError as exc:
+            raise GenerationValidationError(
+                f"replenishment work item / purchase journal build failed: {exc}"
+            ) from exc
         generation.capabilities = dict(CAPABILITIES)
         generation.status = "accepted"
         generation.accepted_at = datetime.now(timezone.utc)
@@ -729,6 +760,8 @@ def accept_generation_build(
         "shelf_projection": shelf_projection,
         "planning_snapshots": planning_snapshots,
         "assembly_queue_snapshot_id": int(assembly_queue_snapshot.id),
+        "replenishment_work_items": replenishment_work_items,
+        "purchase_journal_snapshot_id": int(purchase_journal_snapshot.id),
         "supplier_receipts": {
             "documents_fetched": (
                 extraction.fetched_document_count if extraction is not None else 0
