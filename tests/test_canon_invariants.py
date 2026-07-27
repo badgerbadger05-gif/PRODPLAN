@@ -17,6 +17,18 @@ def _read(path: Path) -> str:
     return path.read_text(encoding="utf-8").lstrip("\ufeff")
 
 
+def _read_owner_document(name: str) -> str | None:
+    """Read an owner-decision document kept outside the repository.
+
+    Per .docs/CANON.md these live next to the checkout (the owner's machine)
+    and are deliberately not vendored in, so copying them here would create a
+    second source of truth. They are simply absent on CI and on any other
+    machine; the caller then checks only the in-repo half of the invariant.
+    """
+    path = PRODPLAN / name
+    return _read(path) if path.is_file() else None
+
+
 def _python_sources(root: Path):
     return sorted(path for path in root.rglob("*.py") if path.is_file())
 
@@ -83,25 +95,28 @@ def test_canonical_module_registry_points_to_existing_code() -> None:
 
 
 def test_execution_contract_uses_percent_and_caps_execution() -> None:
-    decisions = _read(PRODPLAN / "mrp-decisions-log.md")
+    decisions = _read_owner_document("mrp-decisions-log.md")
     reservation = _read(REPO / ".docs/reservation-replenishment-core.md")
 
-    for document in (decisions, reservation):
+    documents = [reservation] if decisions is None else [decisions, reservation]
+    for document in documents:
         assert "replenishment_required_qty * 100" in document
         assert "min(" in document
         assert "replenishment_received_qty" in document
-    assert "от 0 до 100" in decisions
     assert "0 <= execution_pct <= 100" in reservation
+    if decisions is not None:
+        assert "от 0 до 100" in decisions
 
 
 def test_plan_output_field_name_is_canonical() -> None:
-    design = _read(PRODPLAN / "mrp-item-ledger-design.md")
+    design = _read_owner_document("mrp-item-ledger-design.md")
     assembly = _read(REPO / ".docs/assembly-queue-and-drum.md")
 
-    assert "accepted_plan_output_qty" in design
     assert "accepted_plan_output_qty" in assembly
-    assert "accepted_output_qty" not in design
     assert "accepted_output_qty" not in assembly
+    if design is not None:
+        assert "accepted_plan_output_qty" in design
+        assert "accepted_output_qty" not in design
 
 
 def test_user_guide_does_not_restore_retired_workflows() -> None:
