@@ -4,12 +4,22 @@ The service is intentionally narrow: it gathers the union of known recorder
 identities, re-pulls each recorder idempotently under strict historical rules,
 and publishes a completed ``physical_import`` checkpoint only when all pulls for
 that generation are terminal.
+
+The known set is not sufficient on its own.  1C register rows carry the
+*document* date in ``Period``, not the moment the record set was written, so a
+document posted (or re-posted) after the parent cutoff but dated before it lands
+inside an already-closed forward window: the forward scan never revisits it and
+the audit, which only re-pulls recorders the ledger already knows, never learns
+it exists.  Such a recorder is invisible forever and the gap accumulates with
+every refresh.  The audit therefore re-discovers the retained horizon
+``(opening_at, parent_cutoff]`` on every run and folds anything new into the set
+it verifies.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import func
@@ -17,15 +27,28 @@ from sqlalchemy.orm import Session
 
 from app import models
 
+from .historical_register_scan import scan_historical_register_range
 from .ingest import DEFAULT_MAX_ATTEMPTS, pull_recorder_movements
 from .physical import canonical_content_hash
 from .physical_visibility import visible_sles_for_generation
 
 
-ALGORITHM_VERSION = "ledger-physical-refresh-import/1"
+ALGORITHM_VERSION = "ledger-physical-refresh-import/2"
 GENERATION_KIND = "physical_refresh"
 CHECKPOINT_KEY_PREFIX = "physical-refresh-recorder-audit"
-CHECKPOINT_VERSION = "1"
+CHECKPOINT_VERSION = "2"
+
+# Discovery re-reads the register only for recorder identities ($select is four
+# columns), so a wide window is cheap next to the per-recorder pulls that follow.
+DISCOVERY_WINDOW_SIZE = timedelta(days=7)
+DISCOVERY_PAGE_SIZE = 1000
+# Floor used only when the opening-balance boundary cannot be located; below the
+# anchor every movement is dropped as pre-anchor anyway.
+DISCOVERY_FALLBACK_LOOKBACK = timedelta(days=365)
+# The opening boundary is recognised by this watermark rather than by its
+# ``source`` tag: ensure_physical_import_batch rewrites ``source`` to the seed
+# ingest source, but ``opening_at`` is written only by the opening seed.
+OPENING_AT_KEY = "opening_at"
 
 
 class PhysicalRefreshImportError(RuntimeError):
@@ -43,6 +66,8 @@ class PhysicalRefreshImportResult:
     checkpoint_id: int
     terminal_physical_import_batch_id: int
     from_checkpoint: bool
+    discovered_recorders: int = 0
+    backdated_recorders: int = 0
 
 
 def _utc(value: datetime | str | None, field: str) -> datetime:
@@ -126,6 +151,94 @@ def _require_target_generation(
 # Recorder types that are synthetic (not backed by a 1C document) and therefore
 # must never be re-pulled from 1C during the recorder audit.
 _SYNTHETIC_RECORDER_TYPES = frozenset({"seed"})
+
+
+def _opening_boundary_at(db: Session) -> datetime | None:
+    """Timestamp of the opening-balance seed, the floor of retained history."""
+    batch = (
+        db.query(models.PhysicalImportBatch)
+        .filter(
+            models.PhysicalImportBatch.source_watermarks[OPENING_AT_KEY]
+            .as_string()
+            .isnot(None)
+        )
+        .order_by(models.PhysicalImportBatch.id.asc())
+        .first()
+    )
+    if batch is None:
+        return None
+    raw = dict(batch.source_watermarks or {}).get(OPENING_AT_KEY)
+    if raw is None:
+        return None
+    try:
+        return _utc(raw, "opening_at")
+    except PhysicalRefreshImportError:
+        return None
+
+
+def _discovery_range(
+    db: Session,
+    *,
+    parent_cutoff: datetime,
+    lookback: timedelta | None,
+) -> tuple[datetime, datetime] | None:
+    """Resolve ``(from_exclusive, to_inclusive]`` for backdated-recorder discovery.
+
+    ``lookback`` bounds the scan for operators who cannot afford the full
+    horizon; ``None`` (the default) discovers everything the ledger retains.
+    Both ends are floored at the opening boundary because movements at or below
+    the anchor are dropped as pre-anchor and cannot enter the ledger anyway.
+    """
+    opening_at = _opening_boundary_at(db)
+    floor = opening_at
+    if lookback is not None:
+        bounded = parent_cutoff - lookback
+        floor = bounded if floor is None else max(floor, bounded)
+    elif floor is None:
+        floor = parent_cutoff - DISCOVERY_FALLBACK_LOOKBACK
+    if floor >= parent_cutoff:
+        return None
+    return floor, parent_cutoff
+
+
+def _discover_recorder_identities(
+    client: Any,
+    *,
+    from_exclusive: datetime,
+    to_inclusive: datetime,
+    window_size: timedelta,
+    page_size: int,
+) -> tuple[tuple[str, str], ...]:
+    """Recorder identities present in the register over a closed historical range.
+
+    Discovery reads identities only: no recorder contents, no ledger write and
+    no watermark advance.  The caller decides which of them still need a pull.
+    """
+    scan = scan_historical_register_range(
+        client,
+        from_exclusive=from_exclusive,
+        to_inclusive=to_inclusive,
+        window_size=window_size,
+        page_size=page_size,
+    )
+    return tuple(
+        (discovered.identity.recorder_type, discovered.identity.recorder_ref)
+        for discovered in scan.recorders
+    )
+
+
+def _merge_recorder_identities(
+    *sources: tuple[tuple[str, str], ...],
+) -> tuple[tuple[str, str], ...]:
+    """Union recorder identities under the audit's ordering and dirt filter."""
+    identities: set[tuple[str, str]] = set()
+    for source in sources:
+        for recorder_type, recorder_ref in source:
+            if recorder_type in _SYNTHETIC_RECORDER_TYPES:
+                continue
+            if recorder_ref:
+                identities.add((recorder_type, recorder_ref))
+    return tuple(sorted(identities, key=lambda item: (item[0], item[1])))
 
 
 def _collect_recorder_identities(
@@ -276,8 +389,17 @@ def run_physical_recorder_audit(
     ledger_generation_id: int,
     parent_generation_id: int,
     client: Any,
+    discovery_lookback: timedelta | None = None,
+    discovery_window_size: timedelta = DISCOVERY_WINDOW_SIZE,
+    discovery_page_size: int = DISCOVERY_PAGE_SIZE,
 ) -> PhysicalRefreshImportResult:
-    """Run recorder-audit refresh for one physical-refresh BUILDING generation."""
+    """Run recorder-audit refresh for one physical-refresh BUILDING generation.
+
+    ``discovery_lookback`` bounds how far back the register is re-read for
+    recorders the ledger has never seen; ``None`` covers the whole retained
+    horizon, which is what makes a document backdated behind the parent cutoff
+    recoverable.
+    """
     generation, parent = _require_target_generation(
         db,
         ledger_generation_id=ledger_generation_id,
@@ -298,6 +420,7 @@ def run_physical_recorder_audit(
     )
     if existing is not None:
         metrics = dict(existing.metrics or {})
+        discovery = dict(metrics.get("discovery") or {})
         return PhysicalRefreshImportResult(
             ledger_generation_id=int(generation.id),
             parent_generation_id=int(parent.id),
@@ -308,6 +431,8 @@ def run_physical_recorder_audit(
             checkpoint_id=int(existing.id),
             terminal_physical_import_batch_id=int(metrics.get("physical_import_batch_id") or 0),
             from_checkpoint=True,
+            discovered_recorders=int(discovery.get("discovered_recorders") or 0),
+            backdated_recorders=int(discovery.get("backdated_recorders") or 0),
         )
 
     if int(generation.physical_import_batch_id) != start_boundary_id:
@@ -315,7 +440,41 @@ def run_physical_recorder_audit(
             "target generation physical import seed changed before recorder audit"
         )
     _assert_global_terminal(db, start_boundary_id)
-    target_recorders = _collect_recorder_identities(db, int(parent_generation_id))
+
+    # Discovery precedes the known set: a recorder that only 1C knows about must
+    # join this audit, otherwise it can never enter the ledger at all.
+    known_recorders = _collect_recorder_identities(db, int(parent_generation_id))
+    discovery_range = _discovery_range(
+        db,
+        parent_cutoff=parent_cutoff,
+        lookback=discovery_lookback,
+    )
+    discovered: tuple[tuple[str, str], ...] = ()
+    if discovery_range is not None:
+        discovery_from, discovery_to = discovery_range
+        try:
+            discovered = _discover_recorder_identities(
+                client,
+                from_exclusive=discovery_from,
+                to_inclusive=discovery_to,
+                window_size=discovery_window_size,
+                page_size=discovery_page_size,
+            )
+        except Exception as exc:
+            raise PhysicalRefreshImportError(
+                f"backdated recorder discovery failed: {exc}"
+            ) from exc
+    backdated = tuple(sorted(set(discovered) - set(known_recorders)))
+    discovery_metrics = {
+        "from_exclusive": discovery_range[0].isoformat() if discovery_range else None,
+        "to_inclusive": discovery_range[1].isoformat() if discovery_range else None,
+        "window_size_seconds": int(discovery_window_size.total_seconds()),
+        "discovered_recorders": len(discovered),
+        "backdated_recorders": len(backdated),
+        "backdated": list(_result_summary(backdated)),
+    }
+
+    target_recorders = _merge_recorder_identities(known_recorders, discovered)
     recorder_manifest = list(_result_summary(target_recorders))
     input_checksum = canonical_content_hash(recorder_manifest)
 
@@ -430,6 +589,7 @@ def run_physical_recorder_audit(
                 "checksum": canonical_content_hash(run_rows),
                 "input_checksum": input_checksum,
                 "recorder_count": len(target_recorders),
+                "discovery": discovery_metrics,
             },
         }
 
@@ -452,6 +612,7 @@ def run_physical_recorder_audit(
                 "physical_import_batch_id": int(current_terminal),
                 "recorders": recorder_manifest,
                 "audit_rows": run_rows,
+                "discovery": discovery_metrics,
             },
             completed_at=datetime.now(timezone.utc),
         )
@@ -469,6 +630,8 @@ def run_physical_recorder_audit(
             checkpoint_id=int(checkpoint.id),
             terminal_physical_import_batch_id=int(current_terminal),
             from_checkpoint=False,
+            discovered_recorders=len(discovered),
+            backdated_recorders=len(backdated),
         )
     except PhysicalRefreshImportError:
         db.rollback()

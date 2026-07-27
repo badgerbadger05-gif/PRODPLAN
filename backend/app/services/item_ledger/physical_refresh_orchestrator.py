@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from threading import Lock
 from typing import Any, Mapping
 
@@ -109,6 +110,28 @@ def _release_lifecycle_lock(lock) -> None:
             pass
 
 
+_MISMATCH_SAMPLE = 5
+
+
+def _mismatch_digest(convergence: BalanceConvergenceResult) -> str:
+    """Name the worst offenders so a failed refresh is actionable on sight.
+
+    Without this the operator learns only a count and has to reconstruct the
+    register diff by hand against a three-hour run.
+    """
+    mismatched = [delta for delta in convergence.deltas if not delta.matched]
+    mismatched.sort(key=lambda delta: abs(Decimal(delta.delta_qty)), reverse=True)
+    sample = ", ".join(
+        f"item={delta.item_id} wh={delta.warehouse_ref1c} "
+        f"ledger={delta.ledger_qty} 1c={delta.balance_qty} delta={delta.delta_qty}"
+        for delta in mismatched[:_MISMATCH_SAMPLE]
+    )
+    surplus = len(mismatched) - _MISMATCH_SAMPLE
+    if surplus > 0:
+        sample = f"{sample}, +{surplus} more"
+    return f"worst: {sample}" if sample else "no deltas retained"
+
+
 def _current_parent(db: Session) -> models.LedgerGeneration:
     pointer = db.get(models.PlanningTruthState, 1)
     if pointer is None or pointer.current_generation_id is None:
@@ -133,6 +156,7 @@ def run_physical_refresh(
     started_by: str = "auto-sync",
     window_size: timedelta = timedelta(days=1),
     max_windows: int | None = None,
+    discovery_lookback: timedelta | None = None,
     config_version_id: int | None = None,
     config_snapshot: Mapping[str, Any] | None = None,
     planning_pool_by_warehouse: Mapping[str, str] | None = None,
@@ -169,6 +193,7 @@ def run_physical_refresh(
             ledger_generation_id=int(fork.ledger_generation_id),
             parent_generation_id=int(parent.id),
             client=client,
+            discovery_lookback=discovery_lookback,
         )
         physical_import = run_historical_physical_import(
             db,
@@ -195,6 +220,7 @@ def run_physical_refresh(
         if not convergence.valid:
             raise PhysicalRefreshOrchestratorError(
                 f"Balance convergence failed: {convergence.mismatched} mismatches"
+                f" ({_mismatch_digest(convergence)})"
             )
 
         physical_generation = db.get(

@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 import re
 
 import pytest
@@ -86,8 +87,57 @@ def _seed_visible_entry(
     db_session.flush()
 
 
-class _RecorderClient:
-    def __init__(self, lines_by_ref):
+class _RegisterClient:
+    """Client stub for the discovery scan the audit now performs.
+
+    ``register_rows`` are the flat ``_RecordType`` rows 1C would return for the
+    discovery range; each carries Period + Recorder identity only, which is all
+    discovery selects.
+    """
+
+    def __init__(self, register_rows=()):
+        self.register_rows = list(register_rows)
+        self.discovery_filters: list[str] = []
+
+    def _make_request(self, entity_name, params):
+        assert entity_name == "AccumulationRegister_ЗапасыНаСкладах_RecordType"
+        filter_query = str(params.get("$filter") or "")
+        self.discovery_filters.append(filter_query)
+        if int(params.get("$skip") or 0):
+            return {"value": []}
+        bounds = re.findall(r"datetime'([^']+)'", filter_query)
+        low, high = (datetime.fromisoformat(bound) for bound in bounds)
+        return {
+            "value": [
+                row for row in self.register_rows
+                if low < datetime.fromisoformat(row["Period"]) <= high
+            ]
+        }
+
+    def discovery_window_starts(self):
+        return [
+            datetime.fromisoformat(re.findall(r"datetime'([^']+)'", flt)[0])
+            for flt in self.discovery_filters
+        ]
+
+
+def _as_register_time(value: datetime) -> datetime:
+    """1C receives OData filter bounds as naive Europe/Moscow local time."""
+    return value.astimezone(ZoneInfo("Europe/Moscow")).replace(tzinfo=None)
+
+
+def _register_row(recorder_type, recorder_ref, period="2026-07-10T10:00:00"):
+    return {
+        "Period": period,
+        "Recorder": recorder_ref,
+        "Recorder_Type": f"StandardODATA.{recorder_type}",
+        "LineNumber": "1",
+    }
+
+
+class _RecorderClient(_RegisterClient):
+    def __init__(self, lines_by_ref, register_rows=()):
+        super().__init__(register_rows)
         self.lines_by_ref = lines_by_ref
 
     def get_all(self, entity_name, filter_query=None, **kwargs):
@@ -243,7 +293,7 @@ def test_physical_refresh_recorder_audit_runs_union_and_tracks_changed_recorders
         db_session,
         ledger_generation_id=target.id,
         parent_generation_id=parent.id,
-        client=object(),
+        client=_RegisterClient(),
     )
 
     assert isinstance(result, PhysicalRefreshImportResult)
@@ -315,7 +365,7 @@ def test_physical_refresh_recorder_audit_reuses_completed_checkpoint_without_cli
         db_session,
         ledger_generation_id=target.id,
         parent_generation_id=parent.id,
-        client=object(),
+        client=_RegisterClient(),
     )
     assert created_calls == [("called", "")]
 
@@ -341,7 +391,7 @@ def test_physical_refresh_recorder_audit_reuses_completed_checkpoint_without_cli
         db_session,
         ledger_generation_id=target.id,
         parent_generation_id=parent.id,
-        client=object(),
+        client=_RegisterClient(),
     )
 
     assert first.from_checkpoint is False
@@ -376,7 +426,7 @@ def test_physical_refresh_recorder_audit_rejects_pull_error_status(db_session, m
             db_session,
             ledger_generation_id=target.id,
             parent_generation_id=parent.id,
-            client=object(),
+            client=_RegisterClient(),
         )
     assert (
         db_session.query(models.LedgerBuildBatch)
@@ -411,7 +461,7 @@ def test_physical_refresh_recorder_audit_rejects_nonzero_skips(db_session, monke
             db_session,
             ledger_generation_id=target.id,
             parent_generation_id=parent.id,
-            client=object(),
+            client=_RegisterClient(),
         )
     assert (
         db_session.query(models.LedgerBuildBatch)
@@ -441,7 +491,7 @@ def test_physical_refresh_recorder_audit_rejects_global_terminal_interleaving(db
             db_session,
             ledger_generation_id=target.id,
             parent_generation_id=parent.id,
-            client=object(),
+            client=_RegisterClient(),
         )
 
 
@@ -486,7 +536,7 @@ def test_physical_refresh_recorder_audit_collects_pending_and_retryable_error_on
         db_session,
         ledger_generation_id=target.id,
         parent_generation_id=parent.id,
-        client=object(),
+        client=_RegisterClient(),
     )
     assert calls == [
         ("Document_ErrorRetry", "a"),
@@ -530,9 +580,195 @@ def test_recorder_audit_allows_noop_with_older_recorder_watermark(db_session, mo
         db_session,
         ledger_generation_id=target.id,
         parent_generation_id=parent.id,
-        client=object(),
+        client=_RegisterClient(),
     )
     assert result.terminal_physical_import_batch_id > int(parent_batch.id)
+
+
+def test_backdated_recorder_absent_from_ledger_joins_the_audit(db_session, monkeypatch):
+    """A document dated behind the parent cutoff but posted after it.
+
+    Its register Period sits in a forward window that already closed, so the
+    forward scan will never revisit it and the ledger has never heard of it.
+    Discovery is the only thing that can bring it in.
+    """
+    parent, parent_batch = _accepted_parent(db_session, "backdated")
+    _seed_visible_entry(
+        db_session,
+        int(parent_batch.id),
+        recorder_type="Document_СборкаЗапасов",
+        recorder_ref="known-doc",
+        posting_at=parent.cutoff - timedelta(days=3),
+    )
+    target = _building_target(db_session, parent, "backdated")
+    db_session.commit()
+
+    calls: list[tuple[str, str]] = []
+
+    def _pull(db, recorder_type, recorder_ref, **kwargs):
+        calls.append((recorder_type, recorder_ref))
+        return PullResult(
+            status="done",
+            inserted=0,
+            physical_import_batch_id=int(parent_batch.id),
+        )
+
+    monkeypatch.setattr(
+        "app.services.item_ledger.physical_refresh_import.pull_recorder_movements",
+        _pull,
+    )
+    client = _RegisterClient([
+        _register_row("Document_СборкаЗапасов", "known-doc", "2026-07-20T09:00:00"),
+        _register_row("Document_СборкаЗапасов", "backdated-doc", "2026-07-22T09:29:01"),
+    ])
+    result = run_physical_recorder_audit(
+        db_session,
+        ledger_generation_id=target.id,
+        parent_generation_id=parent.id,
+        client=client,
+    )
+
+    assert ("Document_СборкаЗапасов", "backdated-doc") in calls
+    assert result.recorder_count == 2
+    assert result.discovered_recorders == 2
+    assert result.backdated_recorders == 1
+    checkpoint = db_session.query(models.LedgerBuildBatch).filter_by(
+        ledger_generation_id=int(target.id),
+        batch_key=f"{CHECKPOINT_KEY_PREFIX}:{int(target.id)}:{CHECKPOINT_VERSION}",
+    ).one()
+    assert checkpoint.metrics["discovery"]["backdated"] == [
+        {
+            "recorder_type": "Document_СборкаЗапасов",
+            "recorder_ref": "backdated-doc",
+        }
+    ]
+
+
+def test_backdated_recorder_movements_reach_the_refreshed_generation(db_session):
+    """End-to-end: the missing expense lands in the child, not the parent."""
+    parent, target = _real_audit_world(db_session, "BACKDATED")
+    client = _RecorderClient(
+        {
+            "DOC-BACKDATED": [_movement_line(5)],
+            "LATE-DOC": [dict(_movement_line(7), RecordType="Expense")],
+        },
+        register_rows=[
+            _register_row("Document_Receipt", "DOC-BACKDATED"),
+            _register_row("Document_СборкаЗапасов", "LATE-DOC", "2026-07-22T09:29:01"),
+        ],
+    )
+
+    result = run_physical_recorder_audit(
+        db_session,
+        ledger_generation_id=target.id,
+        parent_generation_id=parent.id,
+        client=client,
+    )
+
+    assert result.backdated_recorders == 1
+    assert [row.qty for row in visible_sles_for_generation(db_session, parent.id)] == [
+        Decimal("5")
+    ]
+    assert sorted(
+        (row.recorder_ref, row.qty)
+        for row in visible_sles_for_generation(db_session, target.id)
+    ) == [("DOC-BACKDATED", Decimal("5")), ("LATE-DOC", Decimal("-7"))]
+
+
+def test_recorder_audit_discovery_is_floored_at_the_opening_boundary(db_session, monkeypatch):
+    opening_at = datetime(2026, 7, 13, 12, tzinfo=timezone.utc)
+    db_session.add(models.PhysicalImportBatch(
+        batch_key="historical-bootstrap-opening:g1:hash",
+        status="completed",
+        cutoff=opening_at,
+        source_watermarks={
+            # ensure_physical_import_batch rewrites `source` to the seed ingest
+            # source; only `opening_at` reliably marks the opening boundary.
+            "source": "seed",
+            "anchor_period": opening_at.date().isoformat(),
+            "opening_at": opening_at.isoformat(),
+        },
+        completed_at=opening_at,
+    ))
+    db_session.flush()
+    parent, _parent_batch = _accepted_parent(db_session, "opening-floor")
+    assert parent.cutoff - opening_at == timedelta(days=10)
+    target = _building_target(db_session, parent, "opening-floor")
+    db_session.commit()
+
+    monkeypatch.setattr(
+        "app.services.item_ledger.physical_refresh_import.pull_recorder_movements",
+        lambda *args, **kwargs: pytest.fail("no recorder to pull"),
+    )
+    client = _RegisterClient()
+    run_physical_recorder_audit(
+        db_session,
+        ledger_generation_id=target.id,
+        parent_generation_id=parent.id,
+        client=client,
+    )
+
+    starts = client.discovery_window_starts()
+    assert min(starts) == _as_register_time(opening_at)
+    # 10 days at the 7-day discovery window: one full window plus the remainder.
+    assert len(starts) == 2
+
+
+def test_recorder_audit_discovery_respects_explicit_lookback(db_session, monkeypatch):
+    parent, _ = _accepted_parent(db_session, "lookback")
+    target = _building_target(db_session, parent, "lookback")
+    db_session.commit()
+
+    monkeypatch.setattr(
+        "app.services.item_ledger.physical_refresh_import.pull_recorder_movements",
+        lambda *args, **kwargs: pytest.fail("no recorder to pull"),
+    )
+    client = _RegisterClient()
+    run_physical_recorder_audit(
+        db_session,
+        ledger_generation_id=target.id,
+        parent_generation_id=parent.id,
+        client=client,
+        discovery_lookback=timedelta(days=7),
+        discovery_window_size=timedelta(days=7),
+    )
+
+    starts = client.discovery_window_starts()
+    assert len(starts) == 1
+    parent_cutoff = parent.cutoff.replace(tzinfo=timezone.utc)
+    assert starts[0] == _as_register_time(parent_cutoff - timedelta(days=7))
+
+
+def test_recorder_audit_fails_closed_when_discovery_cannot_read_the_register(
+    db_session, monkeypatch
+):
+    parent, _ = _accepted_parent(db_session, "discovery-down")
+    target = _building_target(db_session, parent, "discovery-down")
+    db_session.commit()
+
+    class _BrokenClient:
+        def _make_request(self, *args, **kwargs):
+            raise RuntimeError("1C unavailable")
+
+    monkeypatch.setattr(
+        "app.services.item_ledger.physical_refresh_import.pull_recorder_movements",
+        lambda *args, **kwargs: pytest.fail("audit must not pull after discovery failed"),
+    )
+    with pytest.raises(
+        PhysicalRefreshImportError,
+        match="backdated recorder discovery failed",
+    ):
+        run_physical_recorder_audit(
+            db_session,
+            ledger_generation_id=target.id,
+            parent_generation_id=parent.id,
+            client=_BrokenClient(),
+        )
+    assert (
+        db_session.query(models.LedgerBuildBatch)
+        .filter_by(ledger_generation_id=target.id, stage="physical_import")
+        .count()
+    ) == 0
 
 
 def test_old_recorder_correction_is_revisioned_inside_refresh(db_session):
