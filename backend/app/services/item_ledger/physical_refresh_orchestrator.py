@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from threading import Lock
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -21,6 +21,11 @@ from .historical_bootstrap_phase0 import (
 from .historical_import_orchestration import (
     HistoricalImportResult,
     run_historical_physical_import,
+)
+from .opening_balance_reconcile import (
+    OpeningBalanceReconcileResult,
+    opening_boundary,
+    reconcile_opening_balance,
 )
 from .physical import PHYSICAL_SEQUENCE_LOCK_KEY, physical_sequence_lock_context
 from .physical_refresh_import import (
@@ -49,6 +54,7 @@ class PhysicalRefreshOrchestrationResult:
     balance_convergence: BalanceConvergenceResult
     candidate_run_ids: tuple[int, ...]
     published: bool
+    opening_reconcile: OpeningBalanceReconcileResult | None = None
 
 
 def _utc(value: datetime, field: str) -> datetime:
@@ -110,6 +116,28 @@ def _release_lifecycle_lock(lock) -> None:
             pass
 
 
+def _reconcile_opening_balance(
+    db: Session,
+    *,
+    ledger_generation_id: int,
+    loader: Callable[[datetime], Mapping[Any, Any]] | None,
+) -> OpeningBalanceReconcileResult | None:
+    """Re-align the T0 prefix with 1C before the forward window import."""
+    if loader is None:
+        return None
+    boundary = opening_boundary(db)
+    if boundary is None:
+        return None
+    _batch, opening_at = boundary
+    result = reconcile_opening_balance(
+        db,
+        ledger_generation_id=int(ledger_generation_id),
+        opening_snapshot=loader(opening_at),
+    )
+    db.commit()
+    return result
+
+
 _MISMATCH_SAMPLE = 5
 
 
@@ -157,6 +185,7 @@ def run_physical_refresh(
     window_size: timedelta = timedelta(days=1),
     max_windows: int | None = None,
     discovery_lookback: timedelta | None = None,
+    opening_balance_loader: Callable[[datetime], Mapping[Any, Any]] | None = None,
     config_version_id: int | None = None,
     config_snapshot: Mapping[str, Any] | None = None,
     planning_pool_by_warehouse: Mapping[str, str] | None = None,
@@ -166,6 +195,10 @@ def run_physical_refresh(
     Window imports are durable checkpoints.  The accepted pointer remains on
     the parent until physical validation, full replay, and the existing
     obligation-refresh publisher all succeed.
+
+    ``opening_balance_loader`` is called with the anchor instant and must return
+    1C's Balance as of it.  Without it the opening balance is left as seeded,
+    which leaves documents backdated behind the anchor permanently unaccounted.
     """
     key = str(generation_key or "").strip()
     if not key:
@@ -194,6 +227,14 @@ def run_physical_refresh(
             parent_generation_id=int(parent.id),
             client=client,
             discovery_lookback=discovery_lookback,
+        )
+        # Between the audit and the forward import: the audit requires the
+        # generation to still sit on the parent boundary, and the forward import
+        # starts from whatever boundary this leaves behind.
+        opening_reconcile = _reconcile_opening_balance(
+            db,
+            ledger_generation_id=int(fork.ledger_generation_id),
+            loader=opening_balance_loader,
         )
         physical_import = run_historical_physical_import(
             db,
@@ -267,6 +308,7 @@ def run_physical_refresh(
             balance_convergence=convergence,
             candidate_run_ids=fixed_run_ids,
             published=True,
+            opening_reconcile=opening_reconcile,
         )
     except Exception:
         db.rollback()

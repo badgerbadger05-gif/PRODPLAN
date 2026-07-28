@@ -494,12 +494,30 @@ def _run_physical_refresh_job(
         filter_query=filter_query,
     )
     balance_snapshot = build_balance_snapshot(db, balance_rows, strict=True)
+
+    def _load_opening_balance(opening_at: datetime) -> Dict[Any, Any]:
+        """1C's Balance as of the anchor, re-asked on every refresh.
+
+        Documents backdated behind the anchor change this answer after the seed
+        was taken; the refresh materializes the difference as an adjustment.
+        """
+        rows = get_stock_from_1c_odata(
+            base_url=client.base_url,
+            entity_name=_PHYSICAL_REFRESH_ENTITY,
+            username=client.username,
+            password=client.password,
+            token=client.token,
+            filter_query=f"Period le datetime'{_odata_datetime(opening_at)}'",
+        )
+        return build_balance_snapshot(db, rows, strict=True)
+
     result = run_physical_refresh(
         db,
         generation_key=generation_key,
         target_cutoff=target_cutoff,
         client=client,
         balance_snapshot=balance_snapshot,
+        opening_balance_loader=_load_opening_balance,
     )
     return {
         "parent_generation_id": result.parent_generation_id,
@@ -510,6 +528,11 @@ def _run_physical_refresh_job(
         "result": {
             "accepted": bool(result.published),
             "candidate_runs": len(result.candidate_run_ids),
+            "opening_adjusted_keys": (
+                result.opening_reconcile.adjusted_keys
+                if result.opening_reconcile is not None
+                else 0
+            ),
         },
     }
 

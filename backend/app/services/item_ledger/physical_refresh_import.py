@@ -29,6 +29,7 @@ from app import models
 
 from .historical_register_scan import scan_historical_register_range
 from .ingest import DEFAULT_MAX_ATTEMPTS, pull_recorder_movements
+from .opening_balance_reconcile import opening_boundary
 from .physical import canonical_content_hash
 from .physical_visibility import visible_sles_for_generation
 
@@ -45,10 +46,6 @@ DISCOVERY_PAGE_SIZE = 1000
 # Floor used only when the opening-balance boundary cannot be located; below the
 # anchor every movement is dropped as pre-anchor anyway.
 DISCOVERY_FALLBACK_LOOKBACK = timedelta(days=365)
-# The opening boundary is recognised by this watermark rather than by its
-# ``source`` tag: ensure_physical_import_batch rewrites ``source`` to the seed
-# ingest source, but ``opening_at`` is written only by the opening seed.
-OPENING_AT_KEY = "opening_at"
 
 
 class PhysicalRefreshImportError(RuntimeError):
@@ -155,25 +152,8 @@ _SYNTHETIC_RECORDER_TYPES = frozenset({"seed"})
 
 def _opening_boundary_at(db: Session) -> datetime | None:
     """Timestamp of the opening-balance seed, the floor of retained history."""
-    batch = (
-        db.query(models.PhysicalImportBatch)
-        .filter(
-            models.PhysicalImportBatch.source_watermarks[OPENING_AT_KEY]
-            .as_string()
-            .isnot(None)
-        )
-        .order_by(models.PhysicalImportBatch.id.asc())
-        .first()
-    )
-    if batch is None:
-        return None
-    raw = dict(batch.source_watermarks or {}).get(OPENING_AT_KEY)
-    if raw is None:
-        return None
-    try:
-        return _utc(raw, "opening_at")
-    except PhysicalRefreshImportError:
-        return None
+    boundary = opening_boundary(db)
+    return None if boundary is None else boundary[1]
 
 
 def _discovery_range(
