@@ -21,6 +21,7 @@ import {
 import type { NomenclatureSearchItem } from '../../domain/productionPlan'
 import { dateRu, dateTimeRu, qty } from '../../lib/format'
 import { ensurePlanItem, searchNomenclature } from '../../services/productionPlan'
+import type { MrpSnapshotResult } from '../../services/periodPlan'
 import {
   addItemToPeriodPlan,
   bulkUpsertPeriodPlanLines,
@@ -54,6 +55,20 @@ function nextFriday(offset = 0) {
 
 function bucketLabel(iso: string) {
   return dateRu(iso).slice(0, 5)
+}
+
+/** Describe the snapshot the backend published, using only its own counters.
+ *
+ * On the idempotent branch (`immutable`) the backend returns the already
+ * published snapshot and omits the counters; nothing is invented for them. */
+function mrpSnapshotSummary(mrp: MrpSnapshotResult) {
+  const parts = [`run #${mrp.run_id}`, `поколение #${mrp.ledger_generation_id}`]
+  if (typeof mrp.requirement_count === 'number') parts.push(`требований: ${mrp.requirement_count}`)
+  if (typeof mrp.production_count === 'number') parts.push(`производство: ${mrp.production_count}`)
+  if (typeof mrp.purchase_count === 'number') parts.push(`закупок: ${mrp.purchase_count}`)
+  if (typeof mrp.rework_count === 'number') parts.push(`переработок: ${mrp.rework_count}`)
+  if (mrp.immutable) parts.push('снимок уже был опубликован')
+  return parts.join(', ')
 }
 
 type ForecastInfo = {
@@ -489,6 +504,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
   const [lastRunId, setLastRunId] = useState<number | null>(null)
 
   const [runs, setRuns] = useState<PeriodPlanRun[]>([])
+  const [runsLoaded, setRunsLoaded] = useState(false)
   const [selectedRunId, setSelectedRunId] = useState<number | null>(null)
 
   const [acting, setActing] = useState(false)
@@ -536,6 +552,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     try {
       const data = await listPeriodPlanRuns(planId)
       setRuns(data.rows ?? [])
+      setRunsLoaded(true)
       if (!selectedRunId && data.rows?.length) {
         setSelectedRunId(data.rows[0].run_id)
         setLastRunId((prev) => prev ?? data.rows[0].run_id)
@@ -616,14 +633,27 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
       setError('Нельзя зафиксировать пустой план. Введите хотя бы одно ненулевое количество.')
       return
     }
-    if (!confirm('Зафиксировать план? После фиксации редактирование уже введённых значений недоступно (можно только дозаполнять новые ячейки), и план можно прогнать через MRP-снимок.')) return
+    if (!confirm('Зафиксировать план? Фиксация атомарна: план становится неизменяемым и в той же транзакции публикуется MRP-снимок одного поколения Ledger. Отдельного шага «MRP» нет.')) return
     setActing(true)
     setError('')
     setMessage('')
     try {
-      await fixPeriodPlan(planId)
-      setMessage('План зафиксирован. Теперь доступна кнопка «MRP снимок».')
-      await loadMatrix()
+      const fixed = await fixPeriodPlan(planId)
+      const mrp = fixed.mrp
+      if (mrp) {
+        setLastRunId(mrp.run_id)
+        setSelectedRunId(mrp.run_id)
+        setMessage(`План зафиксирован, MRP-снимок опубликован: ${mrpSnapshotSummary(mrp)}`)
+        setTab('journal')
+        await Promise.all([
+          loadMatrix(),
+          loadJournal(journalFlow, mrp.run_id, journalRootItemId),
+          loadRuns(),
+        ])
+      } else {
+        setMessage('План зафиксирован')
+        await Promise.all([loadMatrix(), loadRuns()])
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -682,7 +712,11 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     }
   }
 
-  async function handleSnapshot() {
+  /** Emergency path only: a plan that is already `fixed` but has no run at all,
+   * i.e. its snapshot was lost or never published (older fixations, restored
+   * database). The canonical flow publishes the snapshot inside «Зафиксировать»,
+   * so this button is hidden as soon as the plan has a run. */
+  async function handleSnapshotRecovery() {
     setActing(true)
     setError('')
     setMessage('')
@@ -690,7 +724,7 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
       const result = await createMrpSnapshot(planId)
       setLastRunId(result.run_id)
       setSelectedRunId(result.run_id)
-      setMessage(`MRP-снимок создан: run #${result.run_id}, требований: ${result.requirement_count}, закупок: ${result.purchase_count}, переработок: ${result.rework_count}`)
+      setMessage(`MRP-снимок восстановлен: ${mrpSnapshotSummary(result)}`)
       setTab('journal')
       await Promise.all([loadJournal(journalFlow, result.run_id, journalRootItemId), loadRuns()])
     } catch (e) {
@@ -1037,8 +1071,14 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
               {!editingHeader && <button onClick={startEditHeader} disabled={acting}>Изменить шапку</button>}
             </>
           )}
-          {isFixed && (
-            <button className="primary" onClick={() => void handleSnapshot()} disabled={acting}>MRP снимок</button>
+          {isFixed && runsLoaded && !runs.length && (
+            <button
+              onClick={() => void handleSnapshotRecovery()}
+              disabled={acting}
+              title="Аварийное восстановление: план зафиксирован, но ни одного прогона/снимка у него нет"
+            >
+              Восстановить MRP-снимок
+            </button>
           )}
           {isFixed && activeRunId && (
             <button onClick={() => void handleClose()} disabled={acting}>Закрыть план</button>
@@ -1396,7 +1436,11 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
             {journalError && <div className="errorLine">{journalError}</div>}
             {!journal && !journalLoading && !journalError && (
               <div className="emptyDetail" style={{ margin: 16 }}>
-                MRP-снимок не создан. Зафиксируйте план и нажмите «MRP снимок».
+                {isDraft
+                  ? 'Журнал появится после фиксации: она атомарно публикует MRP-снимок плана.'
+                  : runsLoaded && !runs.length
+                    ? 'У плана нет опубликованного MRP-снимка. Восстановите его кнопкой «Восстановить MRP-снимок».'
+                    : 'Журнал выбранного прогона не загружен.'}
               </div>
             )}
 

@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useState } from 'react'
 import { dateRu, qty } from '../../lib/format'
+import { unavailableTruth } from '../../lib/api'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
+import { TruthUnavailableNotice } from '../TruthUnavailableNotice'
 import { listAssemblyQueue } from '../../services/assemblyQueue'
 import type { AssemblyQueueRow } from '../../domain/assemblyQueue'
+
+const PAGE_LIMIT = 100
 
 function formatPriority(key: Array<string | number>) {
   return key.join(' · ')
@@ -21,27 +25,39 @@ export function AssemblyQueuePage() {
   const [rows, setRows] = useState<AssemblyQueueRow[]>([])
   const [totalRows, setTotalRows] = useState(0)
   const [totalQueueQty, setTotalQueueQty] = useState(0)
+  const [offset, setOffset] = useState(0)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [unavailable, setUnavailable] = useState('')
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (nextOffset: number) => {
     setLoading(true)
     setError('')
+    setUnavailable('')
     try {
-      const data = await listAssemblyQueue()
+      const data = await listAssemblyQueue({ limit: PAGE_LIMIT, offset: nextOffset })
       setRows(data.rows ?? [])
       setTotalRows(Number(data.total_rows || 0))
       setTotalQueueQty(Number(data.total_queue_qty || 0))
+      setOffset(Number(data.offset ?? nextOffset))
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      const blocked = unavailableTruth(e)
+      if (blocked) setUnavailable(blocked.reason)
+      else setError(e instanceof Error ? e.message : String(e))
+      setRows([])
+      setTotalRows(0)
+      setTotalQueueQty(0)
     } finally {
       setLoading(false)
     }
   }, [])
 
   useEffect(() => {
-    void load()
+    void load(0)
   }, [load])
+
+  const visibleFrom = rows.length ? offset + 1 : 0
+  const visibleTo = offset + rows.length
 
   return (
     <main className="workArea">
@@ -52,22 +68,27 @@ export function AssemblyQueuePage() {
         footer={
           <StatusBar
             loading={loading}
-            visibleFrom={rows.length ? 1 : 0}
-            visibleTo={rows.length}
+            visibleFrom={visibleFrom}
+            visibleTo={visibleTo}
             total={totalRows}
             selectedCount={0}
-            canPrev={false}
-            canNext={false}
-            onPrev={() => undefined}
-            onNext={() => undefined}
+            canPrev={offset > 0}
+            canNext={visibleTo < totalRows}
+            onPrev={() => void load(Math.max(0, offset - PAGE_LIMIT))}
+            onNext={() => void load(offset + PAGE_LIMIT)}
           />
         }
       >
         <div className="commandBar">
-          <button onClick={() => void load()} disabled={loading}>Обновить</button>
+          <button onClick={() => void load(offset)} disabled={loading}>Обновить</button>
           <div className="toolbarText">Ожидаемая доступность: {totalRows ? `${formatNumber(totalQueueQty)} ед.` : 'нет строк'}</div>
+          <div className="toolbarText">Строк: {totalRows}</div>
+          {totalRows > PAGE_LIMIT && (
+            <div className="toolbarText">Показаны {visibleFrom}–{visibleTo}</div>
+          )}
         </div>
 
+        {unavailable && <TruthUnavailableNotice reason={unavailable} />}
         {error && <div className="errorLine">{error}</div>}
 
         <div style={{ overflow: 'auto' }}>
@@ -94,7 +115,7 @@ export function AssemblyQueuePage() {
                   <td colSpan={12}>Загрузка...</td>
                 </tr>
               ) : null}
-              {!loading && !rows.length ? (
+              {!loading && !rows.length && !unavailable && !error ? (
                 <tr>
                   <td colSpan={12}>Нет строк очереди на текущей правде</td>
                 </tr>

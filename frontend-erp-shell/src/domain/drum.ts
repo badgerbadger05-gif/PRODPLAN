@@ -1,5 +1,10 @@
+import type { TruthMeta } from './truth'
+
 export type DrumPriorityPart = string | number
 
+// The persisted drum carries no item names (see
+// `app.routers.production_control.DrumSlotRow`): slots reference `item_id` and
+// `resource_id` only.
 export type DrumSlotRow = {
   plan_id: number
   plan_line_id: number
@@ -21,13 +26,6 @@ export type DrumCapacityGapRow = {
   original_priority: DrumPriorityPart[]
 }
 
-export type DrumTruthMeta = {
-  ledger_generation: number
-  cutoff: string
-  truth_status: string
-  truth_reason: string | null
-}
-
 export type DrumResponse = {
   schedule_from: string
   schedule_to: string
@@ -36,5 +34,10 @@ export type DrumResponse = {
   total_open_qty: number
   total_slot_qty: number
   total_gap_qty: number
-  truth_meta: DrumTruthMeta
+  // Whole-schedule counts; `slots`/`gaps` are the requested window of each.
+  total_slots: number
+  total_gaps: number
+  limit: number
+  offset: number
+  truth_meta: TruthMeta
 }

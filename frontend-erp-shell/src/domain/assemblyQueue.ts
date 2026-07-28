@@ -1,3 +1,5 @@
+import type { TruthMeta } from './truth'
+
 export type AssemblyQueuePriorityPart = string | number
 
 export type AssemblyQueueRow = {
@@ -16,16 +18,12 @@ export type AssemblyQueueRow = {
   priority_key: AssemblyQueuePriorityPart[]
 }
 
-export type AssemblyQueueTruthMeta = {
-  ledger_generation: number
-  cutoff: string
-  truth_status: string
-  truth_reason: string | null
-}
-
 export type AssemblyQueueResponse = {
   rows: AssemblyQueueRow[]
+  // Whole-queue totals; `rows` is the requested window of the same queue.
   total_rows: number
   total_queue_qty: number
-  truth_meta: AssemblyQueueTruthMeta
+  limit: number
+  offset: number
+  truth_meta: TruthMeta
 }

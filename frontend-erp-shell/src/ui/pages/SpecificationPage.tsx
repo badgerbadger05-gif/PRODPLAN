@@ -233,7 +233,7 @@ export function SpecificationPage() {
       </div>
 
       <DocumentWindow
-        title="BOM cockpit"
+        title="Спецификации"
         subtitle="Поиск, дерево состава, плоская развертка, где используется и контроль качества"
         hotkeys="Enter — поиск / двойной переход через Открыть как корень"
         footer={(

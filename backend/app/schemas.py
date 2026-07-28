@@ -1,5 +1,5 @@
-from pydantic import BaseModel, ConfigDict
-from typing import Optional, List
+from pydantic import BaseModel, ConfigDict, model_validator
+from typing import Any, Optional, List
 from datetime import date, datetime
 
 
@@ -24,6 +24,41 @@ class ItemCreate(ItemBase):
 
 class ItemUpdate(ItemBase):
     pass
+
+
+class ItemPatch(BaseModel):
+    """Partial item update: only the fields actually sent are written.
+
+    `stock_qty` is deliberately absent. Physical stock belongs to the 1C sync and
+    the Item Ledger, so a browser form must never be able to carry it — with a
+    full-record PUT an editor of one planning attribute had to resend the stock
+    it had read a moment earlier and could silently overwrite a fresher sync
+    value. `extra="forbid"` plus the explicit check below turn such an attempt
+    into 422 instead of a silent write.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    item_code: Optional[str] = None
+    item_name: Optional[str] = None
+    item_article: Optional[str] = None
+    item_ref1c: Optional[str] = None
+    supplier_ref1c: Optional[str] = None
+    replenishment_time: Optional[int] = None
+    unit: Optional[str] = None
+    category_id: Optional[int] = None
+    optimal_batch: Optional[float] = None
+    status: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_physical_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "stock_qty" in data:
+            raise ValueError(
+                "stock_qty is owned by the 1C sync and the Item Ledger and "
+                "cannot be changed through a partial item update"
+            )
+        return data
 
 
 class Item(ItemBase):

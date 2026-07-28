@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useState } from 'react'
 import { dateRu, qty } from '../../lib/format'
+import { unavailableTruth } from '../../lib/api'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
+import { TruthUnavailableNotice } from '../TruthUnavailableNotice'
 import { listDrum } from '../../services/drum'
 import type { DrumCapacityGapRow, DrumSlotRow } from '../../domain/drum'
+
+const PAGE_LIMIT = 200
 
 function formatPriority(key: Array<string | number>) {
   return key.join(' · ')
@@ -20,6 +24,9 @@ function formatNumber(value: number) {
 export function DrumPage() {
   const [slots, setSlots] = useState<DrumSlotRow[]>([])
   const [gaps, setGaps] = useState<DrumCapacityGapRow[]>([])
+  const [totalSlots, setTotalSlots] = useState(0)
+  const [totalGaps, setTotalGaps] = useState(0)
+  const [offset, setOffset] = useState(0)
   const [totalOpenQty, setTotalOpenQty] = useState(0)
   const [totalSlotQty, setTotalSlotQty] = useState(0)
   const [totalGapQty, setTotalGapQty] = useState(0)
@@ -27,31 +34,47 @@ export function DrumPage() {
   const [scheduleTo, setScheduleTo] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const [unavailable, setUnavailable] = useState('')
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (nextOffset: number) => {
     setLoading(true)
     setError('')
+    setUnavailable('')
     try {
-      const data = await listDrum()
+      const data = await listDrum({ limit: PAGE_LIMIT, offset: nextOffset })
       setSlots(data.slots ?? [])
       setGaps(data.gaps ?? [])
+      setTotalSlots(Number(data.total_slots || 0))
+      setTotalGaps(Number(data.total_gaps || 0))
+      setOffset(Number(data.offset ?? nextOffset))
       setTotalOpenQty(Number(data.total_open_qty || 0))
       setTotalSlotQty(Number(data.total_slot_qty || 0))
       setTotalGapQty(Number(data.total_gap_qty || 0))
       setScheduleFrom(data.schedule_from || '')
       setScheduleTo(data.schedule_to || '')
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      const blocked = unavailableTruth(e)
+      if (blocked) setUnavailable(blocked.reason)
+      else setError(e instanceof Error ? e.message : String(e))
+      setSlots([])
+      setGaps([])
+      setTotalSlots(0)
+      setTotalGaps(0)
     } finally {
       setLoading(false)
     }
   }, [])
 
   useEffect(() => {
-    void load()
+    void load(0)
   }, [load])
 
-  const totalRows = slots.length + gaps.length
+  // The endpoint windows slots and gaps independently with the same
+  // limit/offset, so the pager walks whichever collection is longer.
+  const pagedTotal = Math.max(totalSlots, totalGaps)
+  const visibleRows = Math.max(slots.length, gaps.length)
+  const visibleFrom = visibleRows ? offset + 1 : 0
+  const visibleTo = offset + visibleRows
 
   return (
     <main className="workArea">
@@ -62,19 +85,19 @@ export function DrumPage() {
         footer={(
           <StatusBar
             loading={loading}
-            visibleFrom={totalRows ? 1 : 0}
-            visibleTo={totalRows}
-            total={totalRows}
+            visibleFrom={visibleFrom}
+            visibleTo={visibleTo}
+            total={pagedTotal}
             selectedCount={0}
-            canPrev={false}
-            canNext={false}
-            onPrev={() => undefined}
-            onNext={() => undefined}
+            canPrev={offset > 0}
+            canNext={visibleTo < pagedTotal}
+            onPrev={() => void load(Math.max(0, offset - PAGE_LIMIT))}
+            onNext={() => void load(offset + PAGE_LIMIT)}
           />
         )}
       >
         <div className="commandBar">
-          <button onClick={() => void load()} disabled={loading}>Обновить</button>
+          <button onClick={() => void load(offset)} disabled={loading}>Обновить</button>
           <div className="toolbarText">
             {scheduleFrom && scheduleTo ? `Окно барабана: ${formatDate(scheduleFrom)}–${formatDate(scheduleTo)}` : 'Окно барабана: не рассчитано'}
           </div>
@@ -83,9 +106,10 @@ export function DrumPage() {
           </div>
         </div>
 
+        {unavailable && <TruthUnavailableNotice reason={unavailable} />}
         {error && <div className="errorLine">{error}</div>}
 
-        <h3>Слоты барабана</h3>
+        <h3>Слоты барабана — {totalSlots}</h3>
         <div style={{ overflow: 'auto', marginBottom: 20 }}>
           <table className="journalTable">
             <thead>
@@ -127,7 +151,7 @@ export function DrumPage() {
           </table>
         </div>
 
-        <h3>Дефицит мощности (gaps)</h3>
+        <h3>Дефицит мощности (gaps) — {totalGaps}</h3>
         <div style={{ overflow: 'auto' }}>
           <table className="journalTable">
             <thead>

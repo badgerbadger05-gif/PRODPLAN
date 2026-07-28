@@ -12,6 +12,8 @@ describe('listShelves', () => {
         {
           policy_id: 17,
           item_id: 420,
+          item_code: '000420',
+          item_name: 'Втулка',
           warehouse_ref1c: 'A01',
           protection_until: '2026-07-26',
           target_qty: 120,
@@ -25,9 +27,23 @@ describe('listShelves', () => {
           materialized_qty: 10,
           first_shortage_date: '2026-07-27',
           latest_start_date: '2026-07-25',
+          demand_manifest: [
+            {
+              need_date: '2026-07-27',
+              qty: '30.000',
+              priority: ['2026-07-27', 11],
+              planning_run_id: 5,
+              plan_id: 3,
+              plan_line_id: 9,
+              drum_slot_id: 77,
+              freeze_component_id: 88,
+            },
+          ],
         },
       ],
       total_rows: 1,
+      limit: 1000,
+      offset: 0,
       truth_meta: {
         ledger_generation: 42,
         cutoff: '2026-07-26T00:00:00+00:00',
@@ -47,6 +63,20 @@ describe('listShelves', () => {
       expect.objectContaining({
         headers: { 'Content-Type': 'application/json' },
       }),
+    )
+  })
+
+  it('passes the requested page window to the backend', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ rows: [], total_rows: 0, limit: 50, offset: 100 }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await listShelves({ limit: 50, offset: 100 })
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      '/api/v1/production-control/shelves?limit=50&offset=100',
     )
   })
 })

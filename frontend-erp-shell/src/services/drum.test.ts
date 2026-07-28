@@ -15,6 +15,10 @@ describe('listDrum', () => {
       total_open_qty: 0,
       total_slot_qty: 0,
       total_gap_qty: 0,
+      total_slots: 0,
+      total_gaps: 0,
+      limit: 1000,
+      offset: 0,
       truth_meta: {
         ledger_generation: 42,
         cutoff: '2026-07-26T00:00:00+00:00',
@@ -34,6 +38,20 @@ describe('listDrum', () => {
       expect.objectContaining({
         headers: { 'Content-Type': 'application/json' },
       }),
+    )
+  })
+
+  it('passes the requested page window to the backend', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ slots: [], gaps: [], total_slots: 0, total_gaps: 0, limit: 50, offset: 50 }),
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await listDrum({ limit: 50, offset: 50 })
+
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      '/api/v1/production-control/drum?limit=50&offset=50',
     )
   })
 })
