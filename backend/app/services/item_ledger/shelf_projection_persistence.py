@@ -55,10 +55,19 @@ def _demands_by_policy(
             models.AssemblyQueueLine.id == models.DrumSlot.assembly_queue_line_id,
         )
         .join(
+            models.PlanningRun,
+            models.PlanningRun.run_id == models.AssemblyQueueLine.planning_run_id,
+        )
+        .join(
             models.MrpFreezeComponent,
             and_(
                 models.MrpFreezeComponent.run_id
                 == models.AssemblyQueueLine.planning_run_id,
+                # Refreezing one run keeps every older frozen norm row alive.
+                # Without the active version the same component demand would be
+                # summed once per freeze version and inflate the shelf target.
+                models.MrpFreezeComponent.freeze_version
+                == models.PlanningRun.active_freeze_version,
                 models.MrpFreezeComponent.parent_item_id == models.DrumSlot.item_id,
                 models.MrpFreezeComponent.component_item_id.in_(sorted(by_item)),
             ),
@@ -120,8 +129,21 @@ def _open_mrp(
     )
 
 
+def _ignored_warehouses(db: Session) -> set[str]:
+    """Warehouses whose stock must never propose a transfer to the shelf."""
+    return {
+        str(ref)
+        for (ref,) in db.query(models.IgnoredWarehouse.warehouse_ref1c).all()
+        if ref
+    }
+
+
 def _stock(
-    db: Session, generation_id: int, item_id: int, shelf_warehouse: str
+    db: Session,
+    generation_id: int,
+    item_id: int,
+    shelf_warehouse: str,
+    ignored_warehouses: set[str],
 ) -> tuple[Decimal, Decimal]:
     rows = (
         db.query(models.StockBin.warehouse_ref1c, func.sum(models.StockBin.on_hand))
@@ -136,11 +158,14 @@ def _stock(
         (_d(qty) for warehouse, qty in rows if str(warehouse) == shelf_warehouse),
         Decimal("0"),
     )
+    # Ignored warehouses (tolling stock, scrap isolator, WIP) hold quantity that
+    # is not ours to move, so it must not turn into a transfer proposal.
     other = sum(
         (
             max(_d(qty), Decimal("0"))
             for warehouse, qty in rows
             if str(warehouse) != shelf_warehouse
+            and str(warehouse) not in ignored_warehouses
         ),
         Decimal("0"),
     )
@@ -259,6 +284,7 @@ def materialize_shelf_projections(
 
     created: list[models.ShelfProjection] = []
     as_of = generation.cutoff.date()
+    ignored_warehouses = _ignored_warehouses(db)
     for policy in policies:
         manifest = demands[int(policy.id)]
         open_qty, requirement_ids = _open_mrp(
@@ -269,6 +295,7 @@ def materialize_shelf_projections(
             int(generation.id),
             int(policy.item_id),
             str(policy.warehouse_ref1c),
+            ignored_warehouses,
         )
         preliminary = project_shelf(
             tuple(

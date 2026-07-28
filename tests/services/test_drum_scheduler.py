@@ -66,6 +66,105 @@ def test_drum_is_deterministic_and_respects_non_workday() -> None:
     assert {row.slot_date for row in first.slots} == {date(2026, 7, 28)}
 
 
+def test_shared_resource_books_capacity_units_not_sku_units() -> None:
+    """A fast SKU must not eat the slow SKU's capacity by unit count."""
+    day = date(2026, 7, 27)
+    result = build_drum_plan(
+        (
+            _line(1, "4", sort_key="a", item_id=1),
+            _line(2, "100", sort_key="b", item_id=2),
+        ),
+        {
+            1: (AssemblyRateProfile(10, Decimal("1")),),
+            2: (AssemblyRateProfile(10, Decimal("5")),),
+        },
+        {day: True},
+        schedule_from=day,
+        schedule_to=day,
+        resource_capacity_by_id={10: Decimal("10")},
+    )
+
+    by_line = {row.queue_line_id: row.slot_qty for row in result.slots}
+    # 4 units of the takt-1 SKU consume 4 capacity units, so 6 capacity units
+    # remain and yield 6 * 5 = 30 units of the takt-5 SKU — not 50 - 4 = 46.
+    assert by_line == {1: Decimal("4"), 2: Decimal("30")}
+    assert [(row.queue_line_id, row.gap_qty) for row in result.gaps] == [
+        (2, Decimal("70"))
+    ]
+
+    rates = {1: Decimal("1"), 2: Decimal("5")}
+    consumed = sum(
+        (slot.slot_qty / rates[slot.item_id] for slot in result.slots),
+        Decimal("0"),
+    )
+    assert consumed == Decimal("10")
+
+
+def test_shared_resource_is_not_starved_by_foreign_sku_units() -> None:
+    """A high-takt SKU must not block the rest of the day for a slow SKU."""
+    day = date(2026, 7, 27)
+    result = build_drum_plan(
+        (
+            _line(1, "30", sort_key="a", item_id=1),
+            _line(2, "20", sort_key="b", item_id=2),
+        ),
+        {
+            1: (AssemblyRateProfile(10, Decimal("10")),),
+            2: (AssemblyRateProfile(10, Decimal("1")),),
+        },
+        {day: True},
+        schedule_from=day,
+        schedule_to=day,
+        resource_capacity_by_id={10: Decimal("10")},
+    )
+
+    by_line = {row.queue_line_id: row.slot_qty for row in result.slots}
+    # 30 units at takt 10 cost 3 capacity units; 7 capacity units are left, so
+    # the takt-1 SKU still gets 7 units instead of being locked out by "30".
+    assert by_line == {1: Decimal("30"), 2: Decimal("7")}
+    assert [(row.queue_line_id, row.gap_qty) for row in result.gaps] == [
+        (2, Decimal("13"))
+    ]
+
+    rates = {1: Decimal("10"), 2: Decimal("1")}
+    consumed = sum(
+        (slot.slot_qty / rates[slot.item_id] for slot in result.slots),
+        Decimal("0"),
+    )
+    assert consumed == Decimal("10")
+
+
+def test_per_resource_horizon_stops_short_of_the_global_window() -> None:
+    first = date(2026, 7, 27)
+    second = date(2026, 7, 28)
+    result = build_drum_plan(
+        (
+            _line(1, "8", sort_key="a", item_id=1),
+            _line(2, "8", sort_key="b", item_id=2),
+        ),
+        {
+            1: (AssemblyRateProfile(10, Decimal("1")),),
+            2: (AssemblyRateProfile(11, Decimal("1")),),
+        },
+        {first: True, second: True},
+        schedule_from=first,
+        schedule_to=second,
+        resource_capacity_by_id={10: Decimal("5"), 11: Decimal("5")},
+        resource_horizon_end_by_id={10: first},
+    )
+
+    slots = {(row.queue_line_id, row.slot_date): row.slot_qty for row in result.slots}
+    # Resource 10 closes after day one; resource 11 keeps the full window.
+    assert slots == {
+        (1, first): Decimal("5"),
+        (2, first): Decimal("5"),
+        (2, second): Decimal("3"),
+    }
+    assert [(row.queue_line_id, row.gap_date, row.gap_qty) for row in result.gaps] == [
+        (1, first, Decimal("3"))
+    ]
+
+
 @pytest.mark.parametrize(
     ("rates", "message"),
     [

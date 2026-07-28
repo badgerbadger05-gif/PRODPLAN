@@ -168,7 +168,12 @@ def _persist_queue(
 
 def _rates_and_capacity(
     db: Session, queue_rows: list[models.AssemblyQueueLine]
-) -> tuple[dict[int, tuple[AssemblyRateProfile, ...]], dict[int, Decimal], int]:
+) -> tuple[
+    dict[int, tuple[AssemblyRateProfile, ...]],
+    dict[int, Decimal],
+    int,
+    dict[int, int],
+]:
     item_ids = sorted({int(row.item_id) for row in queue_rows})
     rate_rows = (
         db.query(models.AssemblyRate)
@@ -205,10 +210,13 @@ def _rates_and_capacity(
     capacity = {int(row.resource_id): _d(row.capacity) for row in resources}
     if set(resource_ids) != set(capacity):
         raise ValueError("assembly rate references missing production resource")
-    horizon = max(
-        [max(int(row.planning_range or 0), 1) for row in resources] or [1]
-    )
-    return normalized, capacity, horizon
+    # Every resource keeps its own planning range; the schedule window is the
+    # widest of them, but a resource never spills demand past its own horizon.
+    horizon_by_resource = {
+        int(row.resource_id): max(int(row.planning_range or 0), 1) for row in resources
+    }
+    horizon = max(list(horizon_by_resource.values()) or [1])
+    return normalized, capacity, horizon, horizon_by_resource
 
 
 def _plan(
@@ -216,9 +224,13 @@ def _plan(
     generation: models.LedgerGeneration,
     queue_rows: list[models.AssemblyQueueLine],
 ):
-    rates, capacity, horizon = _rates_and_capacity(db, queue_rows)
+    rates, capacity, horizon, horizon_by_resource = _rates_and_capacity(db, queue_rows)
     schedule_from = generation.cutoff.date()
     schedule_to = schedule_from + timedelta(days=horizon - 1)
+    resource_horizon_end = {
+        resource_id: schedule_from + timedelta(days=days - 1)
+        for resource_id, days in horizon_by_resource.items()
+    }
     calendar: dict[date, bool] = {}
     cursor = schedule_from
     while cursor <= schedule_to:
@@ -243,6 +255,7 @@ def _plan(
         schedule_from=schedule_from,
         schedule_to=schedule_to,
         resource_capacity_by_id=capacity,
+        resource_horizon_end_by_id=resource_horizon_end,
     )
 
 

@@ -145,6 +145,8 @@ def test_assembly_queue_returns_strict_payload_for_accepted_snapshot(client, db_
     assert response.status_code == 200
     assert response.json() == {
         **payload,
+        "limit": 1000,
+        "offset": 0,
         "truth_meta": {
             "ledger_generation": int(generation.id),
             "cutoff": generation.cutoff.isoformat(),
@@ -152,6 +154,50 @@ def test_assembly_queue_returns_strict_payload_for_accepted_snapshot(client, db_
             "truth_reason": None,
         },
     }
+
+
+def test_assembly_queue_pages_rows_but_keeps_whole_queue_totals(client, db_session):
+    _accepted_generation(db_session)
+    rows = [
+        {
+            "run_id": 3000 + index,
+            "plan_id": 4000 + index,
+            "plan_line_id": 4100 + index,
+            "item_id": 5000 + index,
+            "item_code": f"FG-{index}",
+            "item_name": f"Finished good {index}",
+            "bucket_date": "2026-08-03",
+            "period_from": "2026-08-01",
+            "period_to": "2026-08-31",
+            "planned_output_qty": 10.0,
+            "accepted_plan_output_qty": 0.0,
+            "assembly_remaining_qty": 10.0,
+            "priority_key": ["2026-08-01", "2026-08-31", 4000 + index, 4100 + index],
+        }
+        for index in range(5)
+    ]
+    _publish_snapshot(
+        db_session,
+        {"rows": rows, "total_rows": len(rows), "total_queue_qty": 50.0},
+    )
+    db_session.commit()
+
+    page = client.get(
+        "/api/v1/production-control/assembly-queue", params={"limit": 2, "offset": 3}
+    ).json()
+
+    assert [row["plan_line_id"] for row in page["rows"]] == [4103, 4104]
+    assert page["total_rows"] == 5
+    assert page["total_queue_qty"] == 50.0
+    assert page["limit"] == 2
+    assert page["offset"] == 3
+
+    assert (
+        client.get(
+            "/api/v1/production-control/assembly-queue", params={"limit": 0}
+        ).status_code
+        == 422
+    )
 
 
 def test_assembly_queue_router_rejects_missing_assembly_queue_capability(
@@ -210,6 +256,10 @@ def test_drum_router_reads_only_persisted_accepted_schedule(client, db_session):
         "total_open_qty": 0.0,
         "total_slot_qty": 0.0,
         "total_gap_qty": 0.0,
+        "total_slots": 0,
+        "total_gaps": 0,
+        "limit": 1000,
+        "offset": 0,
         "truth_meta": {
             "ledger_generation": generation.id,
             "cutoff": generation.cutoff.isoformat(),
@@ -230,6 +280,66 @@ def test_drum_router_fails_closed_without_persisted_schedule(db_session):
     assert exc.value.detail["code"] == "drum_schedule_unavailable"
 
 
+def _drum_schedule_with_slots(db, generation, cutoff, *, slot_count: int):
+    schedule = models.DrumSchedule(
+        ledger_generation_id=generation.id,
+        status="completed",
+        algorithm_version="tests/1",
+        schedule_from=cutoff.date(),
+        schedule_to=cutoff.date(),
+        queue_signature="q" * 64,
+        slot_signature="s" * 64,
+        gap_signature="g" * 64,
+        slot_row_count=slot_count,
+        gap_row_count=0,
+        total_open_qty=slot_count,
+        total_slot_qty=slot_count,
+        total_gap_qty=0,
+        metrics={},
+    )
+    db.add(schedule)
+    db.flush()
+    for ordinal in range(slot_count):
+        db.add(
+            models.DrumSlot(
+                drum_schedule_id=schedule.id,
+                assembly_queue_line_id=900 + ordinal,
+                plan_id=1,
+                plan_line_id=1,
+                item_id=7,
+                resource_id=3,
+                slot_date=cutoff.date(),
+                slot_qty=1,
+                planned_output_qty=1,
+                slot_ordinal=ordinal,
+                original_priority=[],
+            )
+        )
+    db.flush()
+    return schedule
+
+
+def test_drum_router_pages_slots_and_reports_totals(client, db_session):
+    generation, cutoff = _accepted_generation(db_session)
+    _drum_schedule_with_slots(db_session, generation, cutoff, slot_count=5)
+    db_session.commit()
+
+    page = client.get(
+        "/api/v1/production-control/drum", params={"limit": 2, "offset": 2}
+    ).json()
+
+    assert len(page["slots"]) == 2
+    assert page["total_slots"] == 5
+    assert page["total_gaps"] == 0
+    assert page["limit"] == 2
+    assert page["offset"] == 2
+    # Schedule-wide totals never shrink with the page.
+    assert page["total_slot_qty"] == 5.0
+
+    full = client.get("/api/v1/production-control/drum").json()
+    assert len(full["slots"]) == 5
+
+
 def test_shelves_router_reads_empty_persisted_projection(client, db_session):
     generation, _ = _accepted_generation(db_session)
     db_session.commit()
@@ -240,6 +350,71 @@ def test_shelves_router_reads_empty_persisted_projection(client, db_session):
     assert response.json()["rows"] == []
     assert response.json()["total_rows"] == 0
     assert response.json()["truth_meta"]["ledger_generation"] == generation.id
+
+
+def test_shelves_router_exposes_item_labels_manifest_and_paging(client, db_session):
+    generation, cutoff = _accepted_generation(db_session)
+    item = models.Item(item_code="COMP-9", item_name="Shelf component 9")
+    db_session.add(item)
+    db_session.flush()
+    policy = models.ShelfPolicy(
+        item_id=item.item_id,
+        warehouse_ref1c="SHELF",
+        replenishment_time_days=3,
+        review_cycle_days=1,
+        safety_days=0,
+        batch_multiple=1,
+    )
+    db_session.add(policy)
+    db_session.flush()
+    manifest = [
+        {
+            "need_date": "2026-08-05",
+            "qty": "4",
+            "priority": ["2026-08-01", "2026-08-31", 1, 1],
+            "drum_slot_id": 11,
+        }
+    ]
+    db_session.add(
+        models.ShelfProjection(
+            ledger_generation_id=generation.id,
+            shelf_policy_id=policy.id,
+            item_id=item.item_id,
+            warehouse_ref1c="SHELF",
+            as_of_date=cutoff.date(),
+            protection_until=cutoff.date(),
+            target_qty=4,
+            shelf_physical_qty=0,
+            other_stock_qty=0,
+            confirmed_open_production_qty=0,
+            projected_qty=0,
+            gap_qty=4,
+            transfer_qty=0,
+            unlaunched_mrp_qty=4,
+            pull_qty=4,
+            materialized_qty=4,
+            first_shortage_date=None,
+            latest_start_date=None,
+            demand_manifest=manifest,
+        )
+    )
+    db_session.commit()
+
+    body = client.get("/api/v1/production-control/shelves").json()
+
+    assert body["total_rows"] == 1
+    assert body["limit"] == 1000
+    assert body["offset"] == 0
+    row = body["rows"][0]
+    assert row["item_code"] == "COMP-9"
+    assert row["item_name"] == "Shelf component 9"
+    assert row["demand_manifest"] == manifest
+
+    empty_page = client.get(
+        "/api/v1/production-control/shelves", params={"limit": 1, "offset": 1}
+    ).json()
+    assert empty_page["rows"] == []
+    assert empty_page["total_rows"] == 1
 
 
 def test_shelves_router_fails_closed_without_capability(db_session):

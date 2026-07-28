@@ -73,6 +73,8 @@ class AssemblyQueueResponse(BaseModel):
     rows: list[AssemblyQueueRow]
     total_rows: int
     total_queue_qty: float
+    limit: int
+    offset: int
     truth_meta: TruthMeta
 
 
@@ -111,6 +113,10 @@ class DrumScheduleResponse(BaseModel):
     total_open_qty: float
     total_slot_qty: float
     total_gap_qty: float
+    total_slots: int
+    total_gaps: int
+    limit: int
+    offset: int
     truth_meta: TruthMeta
 
 
@@ -119,6 +125,8 @@ class ShelfProjectionRow(BaseModel):
 
     policy_id: int
     item_id: int
+    item_code: str | None
+    item_name: str | None
     warehouse_ref1c: str
     protection_until: str
     target_qty: float
@@ -132,6 +140,7 @@ class ShelfProjectionRow(BaseModel):
     materialized_qty: float
     first_shortage_date: str | None
     latest_start_date: str | None
+    demand_manifest: list[dict]
 
 
 class ShelfProjectionResponse(BaseModel):
@@ -139,11 +148,22 @@ class ShelfProjectionResponse(BaseModel):
 
     rows: list[ShelfProjectionRow]
     total_rows: int
+    limit: int
+    offset: int
     truth_meta: TruthMeta
+
+
+# Read pages default wide enough that today's whole generation still arrives in
+# one call, but never unbounded: one accepted generation can hold tens of
+# thousands of slots.
+DBR_PAGE_DEFAULT = 1000
+DBR_PAGE_MAX = 10000
 
 
 @router.get("/assembly-queue", response_model=AssemblyQueueResponse)
 def get_assembly_queue(
+    limit: Annotated[int, Query(ge=1, le=DBR_PAGE_MAX)] = DBR_PAGE_DEFAULT,
+    offset: Annotated[int, Query(ge=0)] = 0,
     db: Session = Depends(get_db),
 ) -> AssemblyQueueResponse:
     """Read the immutable queue belonging to the exact accepted generation."""
@@ -172,17 +192,26 @@ def get_assembly_queue(
             },
         )
     payload = dict(snapshot.payload or {})
+    all_rows = list(payload.get("rows") or [])
+    # total_rows / total_queue_qty stay whole-queue totals: the page is a window
+    # into the snapshot, not a different queue.
     response = {
-        "rows": list(payload.get("rows") or []),
+        "rows": all_rows[offset : offset + limit],
         "total_rows": int(payload.get("total_rows") or 0),
         "total_queue_qty": float(payload.get("total_queue_qty") or 0),
+        "limit": limit,
+        "offset": offset,
         "truth_meta": build_truth_meta(planning_truth.get_truth_state(db)),
     }
     return AssemblyQueueResponse.model_validate(response)
 
 
 @router.get("/drum", response_model=DrumScheduleResponse)
-def get_drum_schedule(db: Session = Depends(get_db)) -> DrumScheduleResponse:
+def get_drum_schedule(
+    limit: Annotated[int, Query(ge=1, le=DBR_PAGE_MAX)] = DBR_PAGE_DEFAULT,
+    offset: Annotated[int, Query(ge=0)] = 0,
+    db: Session = Depends(get_db),
+) -> DrumScheduleResponse:
     """Read the persisted drum of the exact accepted generation."""
     try:
         truth = planning_truth.require_accepted_truth(
@@ -210,25 +239,35 @@ def get_drum_schedule(db: Session = Depends(get_db)) -> DrumScheduleResponse:
                 **truth.as_dict(),
             },
         )
+    slot_query = db.query(models.DrumSlot).filter(
+        models.DrumSlot.drum_schedule_id == schedule.id
+    )
+    gap_query = db.query(models.DrumCapacityGap).filter(
+        models.DrumCapacityGap.drum_schedule_id == schedule.id
+    )
+    total_slots = int(slot_query.count() or 0)
+    total_gaps = int(gap_query.count() or 0)
+    # limit/offset window both collections independently; the schedule totals
+    # below always describe the whole persisted schedule.
     slots = (
-        db.query(models.DrumSlot)
-        .filter(models.DrumSlot.drum_schedule_id == schedule.id)
-        .order_by(
+        slot_query.order_by(
             models.DrumSlot.slot_date,
             models.DrumSlot.resource_id,
             models.DrumSlot.slot_ordinal,
             models.DrumSlot.id,
         )
+        .offset(offset)
+        .limit(limit)
         .all()
     )
     gaps = (
-        db.query(models.DrumCapacityGap)
-        .filter(models.DrumCapacityGap.drum_schedule_id == schedule.id)
-        .order_by(
+        gap_query.order_by(
             models.DrumCapacityGap.gap_date,
             models.DrumCapacityGap.resource_id,
             models.DrumCapacityGap.id,
         )
+        .offset(offset)
+        .limit(limit)
         .all()
     )
     return DrumScheduleResponse.model_validate(
@@ -263,6 +302,10 @@ def get_drum_schedule(db: Session = Depends(get_db)) -> DrumScheduleResponse:
             "total_open_qty": float(schedule.total_open_qty),
             "total_slot_qty": float(schedule.total_slot_qty),
             "total_gap_qty": float(schedule.total_gap_qty),
+            "total_slots": total_slots,
+            "total_gaps": total_gaps,
+            "limit": limit,
+            "offset": offset,
             "truth_meta": build_truth_meta(truth),
         }
     )
@@ -270,6 +313,8 @@ def get_drum_schedule(db: Session = Depends(get_db)) -> DrumScheduleResponse:
 
 @router.get("/shelves", response_model=ShelfProjectionResponse)
 def get_shelf_projections(
+    limit: Annotated[int, Query(ge=1, le=DBR_PAGE_MAX)] = DBR_PAGE_DEFAULT,
+    offset: Annotated[int, Query(ge=0)] = 0,
     db: Session = Depends(get_db),
 ) -> ShelfProjectionResponse:
     """Read persisted shelf pull priorities of the accepted generation."""
@@ -285,22 +330,45 @@ def get_shelf_projections(
         )
     except planning_truth.PlanningTruthUnavailable as exc:
         raise HTTPException(status_code=503, detail=exc.as_dict()) from exc
+    query = db.query(models.ShelfProjection).filter(
+        models.ShelfProjection.ledger_generation_id == truth.generation_id
+    )
+    total_rows = int(query.count() or 0)
     rows = (
-        db.query(models.ShelfProjection)
-        .filter(
-            models.ShelfProjection.ledger_generation_id == truth.generation_id
-        )
-        .order_by(
+        query.order_by(
             models.ShelfProjection.latest_start_date.asc().nullslast(),
             models.ShelfProjection.item_id,
             models.ShelfProjection.id,
         )
+        .offset(offset)
+        .limit(limit)
         .all()
+    )
+    item_ids = sorted({int(row.item_id) for row in rows})
+    items = (
+        {
+            int(item.item_id): item
+            for item in db.query(models.Item)
+            .filter(models.Item.item_id.in_(item_ids))
+            .all()
+        }
+        if item_ids
+        else {}
     )
     payload = [
         {
             "policy_id": row.shelf_policy_id,
             "item_id": row.item_id,
+            "item_code": (
+                items[int(row.item_id)].item_code
+                if int(row.item_id) in items
+                else None
+            ),
+            "item_name": (
+                items[int(row.item_id)].item_name
+                if int(row.item_id) in items
+                else None
+            ),
             "warehouse_ref1c": row.warehouse_ref1c,
             "protection_until": row.protection_until.isoformat(),
             "target_qty": float(row.target_qty),
@@ -322,13 +390,18 @@ def get_shelf_projections(
                 if row.latest_start_date
                 else None
             ),
+            # Which drum slots this shelf line defends — the master needs it to
+            # see what stops when the pull is late.
+            "demand_manifest": list(row.demand_manifest or []),
         }
         for row in rows
     ]
     return ShelfProjectionResponse.model_validate(
         {
             "rows": payload,
-            "total_rows": len(payload),
+            "total_rows": total_rows,
+            "limit": limit,
+            "offset": offset,
             "truth_meta": build_truth_meta(truth),
         }
     )

@@ -127,11 +127,13 @@ def build_drum_plan(
     schedule_from: date,
     schedule_to: date,
     resource_capacity_by_id: dict[int, Decimal],
+    resource_horizon_end_by_id: dict[int, date] | None = None,
 ) -> DrumSchedulePlan:
     if schedule_to < schedule_from:
         raise ValueError("schedule_to must be >= schedule_from")
 
     calendar = calendar_by_date or {}
+    horizon_end = dict(resource_horizon_end_by_id or {})
     ordered = sorted(
         tuple(queue_lines),
         key=lambda row: (str(row.sort_key), int(row.queue_line_id)),
@@ -156,6 +158,9 @@ def build_drum_plan(
             },
         )
 
+    # Consumption is booked in *capacity units*, never in SKU units. Two SKUs
+    # sharing one resource have different takts, so a slot of 30 units of a
+    # 10-per-capacity SKU must charge the resource 3 capacity units, not 30.
     used_capacity: dict[tuple[int, date], Decimal] = {}
     output_slots: list[PlannedSlot] = []
     output_gaps: list[CapacityGap] = []
@@ -172,22 +177,27 @@ def build_drum_plan(
             raise ValueError(f"ambiguous assembly rates for item {int(queue_line.item_id)}")
 
         profile = profiles[0]
-        resource_capacity = _dec(resource_capacity_by_id.get(int(profile.resource_id), Decimal("0")))
+        resource_id = int(profile.resource_id)
+        resource_capacity = _dec(resource_capacity_by_id.get(resource_id, Decimal("0")))
         rate = _dec(profile.qty_per_capacity)
         if rate <= 0:
             raise ValueError(f"invalid takt for item {int(queue_line.item_id)}")
-        daily_output = resource_capacity * rate
-        if daily_output <= 0:
-            raise ValueError(f"non-positive capacity for resource {int(profile.resource_id)}")
+        if resource_capacity * rate <= 0:
+            raise ValueError(f"non-positive capacity for resource {resource_id}")
+
+        resource_last_day = min(horizon_end.get(resource_id, schedule_to), schedule_to)
+        if resource_last_day < schedule_from:
+            resource_last_day = schedule_from
 
         remaining = open_qty
         current = schedule_from
         slot_ordinal = 0
 
-        while remaining > 0 and current <= schedule_to:
+        while remaining > 0 and current <= resource_last_day:
             if _workday_flag(calendar, current):
-                used = _dec(used_capacity.get((int(profile.resource_id), current), Decimal("0")))
-                available = max(daily_output - used, Decimal("0"))
+                used = _dec(used_capacity.get((resource_id, current), Decimal("0")))
+                free_capacity = max(resource_capacity - used, Decimal("0"))
+                available = free_capacity * rate
                 if available > 0:
                     take = min(remaining, available)
                     if take > 0:
@@ -197,7 +207,7 @@ def build_drum_plan(
                                 plan_id=int(queue_line.plan_id),
                                 plan_line_id=int(queue_line.plan_line_id),
                                 item_id=int(queue_line.item_id),
-                                resource_id=int(profile.resource_id),
+                                resource_id=resource_id,
                                 slot_date=current,
                                 slot_qty=take,
                                 planned_output_qty=_dec(queue_line.planned_output_qty),
@@ -205,17 +215,24 @@ def build_drum_plan(
                                 original_priority=tuple(queue_line.original_priority),
                             )
                         )
-                        used_capacity[(int(profile.resource_id), current)] = used + take
+                        # Exhausting the day is booked exactly, so repeated
+                        # non-terminating divisions can never drift the day
+                        # above or below its configured capacity.
+                        if take >= available:
+                            used_capacity[(resource_id, current)] = resource_capacity
+                        else:
+                            used_capacity[(resource_id, current)] = used + (take / rate)
                         remaining -= take
                         slot_ordinal += 1
             current += timedelta(days=1)
 
         if remaining > 0:
             available_last = Decimal("0")
-            if _workday_flag(calendar, schedule_to):
-                daily_output = resource_capacity * rate
-                used = _dec(used_capacity.get((int(profile.resource_id), schedule_to), Decimal("0")))
-                available_last = max(daily_output - used, Decimal("0"))
+            if _workday_flag(calendar, resource_last_day):
+                used = _dec(
+                    used_capacity.get((resource_id, resource_last_day), Decimal("0"))
+                )
+                available_last = max(resource_capacity - used, Decimal("0")) * rate
 
             output_gaps.append(
                 CapacityGap(
@@ -223,8 +240,8 @@ def build_drum_plan(
                     plan_id=int(queue_line.plan_id),
                     plan_line_id=int(queue_line.plan_line_id),
                     item_id=int(queue_line.item_id),
-                    resource_id=int(profile.resource_id),
-                    gap_date=schedule_to,
+                    resource_id=resource_id,
+                    gap_date=resource_last_day,
                     required_qty=remaining,
                     available_capacity=available_last,
                     gap_qty=remaining,
