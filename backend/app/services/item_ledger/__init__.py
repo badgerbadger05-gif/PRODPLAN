@@ -67,6 +67,13 @@ from .opening_balance_reconcile import (  # noqa: F401
     opening_boundary,
     reconcile_opening_balance,
 )
+from .physical_refresh_discard import (  # noqa: F401
+    ALGORITHM_VERSION as PHYSICAL_REFRESH_DISCARD_ALGORITHM_VERSION,
+    PhysicalRefreshDiscardError,
+    PhysicalRefreshDiscardResult,
+    discard_physical_refresh_candidate,
+    restore_active_invariant,
+)
 from .physical_refresh_import import (  # noqa: F401
     ALGORITHM_VERSION as PHYSICAL_REFRESH_IMPORT_ALGORITHM_VERSION,
     CHECKPOINT_KEY_PREFIX,
