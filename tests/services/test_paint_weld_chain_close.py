@@ -83,6 +83,49 @@ def _stub_live(monkeypatch, fake) -> None:
     monkeypatch.setattr(exporter, "_create_odata_client", lambda *a, **kw: fake)
 
 
+def _stub_manufactures_export(monkeypatch, *, failing_ids: set):
+    """Подменить экспорт СборокЗапасов: часть строк проваливается, часть — нет.
+
+    Возвращает штатную форму сводки (``entries`` + ``manufactures_error``),
+    чтобы close_paint_chain разбирал результат построчно.
+    """
+    from app.services import one_c_manufacture_export
+
+    def _fake(db, ids, **_kwargs):
+        entries = []
+        errors = 0
+        for manufacture_id in ids:
+            row = db.get(ProductionManufacture, int(manufacture_id))
+            if int(manufacture_id) in failing_ids:
+                errors += 1
+                entries.append(
+                    {
+                        "manufacture_id": int(manufacture_id),
+                        "status": "error",
+                        "error": "1С отказала в проведении СборкаЗапасов",
+                    }
+                )
+                continue
+            if not str(row.exported_ref1c or ""):
+                row.exported_ref1c = f"sborka-live-{manufacture_id}"
+                row.status = "exported"
+                db.flush()
+            entries.append(
+                {
+                    "manufacture_id": int(manufacture_id),
+                    "status": "created",
+                    "target_ref_key": row.exported_ref1c,
+                }
+            )
+        return {
+            "status": "ok" if not errors else "partial_error",
+            "entries": entries,
+            "manufactures_error": errors,
+        }
+
+    monkeypatch.setattr(one_c_manufacture_export, "export_manufactures_to_1c", _fake)
+
+
 def _mk_side(db, *, code: str, op_ref: str, op_name: str, qty: float, sborka_ref: str):
     """Одна сторона цепочки: item + спека с операцией + заказ/строка/выпуск."""
     item = Item(
@@ -373,6 +416,130 @@ def test_close_chain_live_exports_combined_and_closes_orders(db_session, monkeyp
     db_session.refresh(ctx["paint"]["order"])
     assert ctx["weld"]["order"].order_state_name == "Завершен"
     assert ctx["paint"]["order"].order_state_name == "Завершен"
+
+
+def test_close_chain_partial_export_keeps_posted_side_and_resumes(db_session, monkeypatch):
+    """Частичный успех: проведённая сборка остаётся, повтор докатывает цепочку.
+
+    Раньше окрасочная сторона падала, а результат уходил исключением — при этом
+    сварочная СборкаЗапасов оставалась в 1С без комбинированного наряда и без
+    внятного состояния для оператора.
+    """
+    ctx = _setup_chain(db_session)
+    paint_manufacture = ctx["paint"]["m"]
+    paint_manufacture.exported_ref1c = None
+    paint_manufacture.status = "draft"
+    db_session.commit()
+
+    fake = _FakeClient(ref_key="pw-resume-ref")
+    _stub_live(monkeypatch, fake)
+    failing = {int(paint_manufacture.manufacture_id)}
+    _stub_manufactures_export(monkeypatch, failing_ids=failing)
+
+    first = close_paint_chain(
+        db_session,
+        product_id=ctx["paint"]["product"].product_id,
+        dry_run=False,
+        allow_production=True,
+    )
+
+    assert first["status"] == "partial"
+    assert first["chain_state"] == "partially_posted"
+    assert first["resume_required"] is True
+    assert first["posted_sides"] == ["weld"]
+    assert first["pending_sides"] == ["paint"]
+    assert "докат" in first["message"]
+    assert "1С отказала" in first["error"]
+    # комбинированный наряд не создавался
+    assert fake.posts == []
+    # проведённая сварочная сборка НЕ откачена
+    db_session.refresh(ctx["weld"]["m"])
+    assert ctx["weld"]["m"].exported_ref1c == "sborka-weld-ref"
+    assert db_session.query(ProductionManufacture).count() == 2
+    # заказы остаются открытыми
+    db_session.refresh(ctx["weld"]["order"])
+    db_session.refresh(ctx["paint"]["order"])
+    assert ctx["weld"]["order"].order_state_name is None
+    assert ctx["paint"]["order"].order_state_name is None
+
+    # ----- докат повторным вызовом -----
+    failing.clear()
+    second = close_paint_chain(
+        db_session,
+        product_id=ctx["paint"]["product"].product_id,
+        dry_run=False,
+        allow_production=True,
+    )
+
+    assert second["status"] == "ok"
+    assert second["chain_state"] == "closed"
+    assert second["resume_required"] is False
+    assert second["pending_sides"] == []
+    # ровно один комбинированный сдельный и ни одного дубля выпуска
+    assert len(fake.posts) == 1
+    assert db_session.query(ProductionManufacture).count() == 2
+
+    db_session.refresh(ctx["weld"]["order"])
+    db_session.refresh(ctx["paint"]["order"])
+    assert ctx["weld"]["order"].order_state_name == "Завершен"
+    assert ctx["paint"]["order"].order_state_name == "Завершен"
+
+    links = (
+        db_session.query(SyncLink)
+        .filter(SyncLink.source_doctype == "piecework", SyncLink.status == "success")
+        .all()
+    )
+    assert {int(link.source_id) for link in links} == {
+        int(ctx["weld"]["m"].manufacture_id),
+        int(ctx["paint"]["m"].manufacture_id),
+    }
+    assert {link.target_ref_key for link in links} == {"pw-resume-ref"}
+
+
+def test_close_chain_dry_run_reports_partially_posted_state(db_session):
+    ctx = _setup_chain(db_session)
+    ctx["paint"]["m"].exported_ref1c = None
+    ctx["paint"]["m"].status = "draft"
+    db_session.commit()
+
+    result = close_paint_chain(
+        db_session, product_id=ctx["weld"]["product"].product_id, dry_run=True
+    )
+
+    assert result["chain_state"] == "partially_posted"
+    assert result["resume_required"] is True
+    assert result["posted_sides"] == ["weld"]
+    assert result["pending_sides"] == ["paint"]
+
+
+def test_close_chain_does_not_force_order_completion_on_partial_output(
+    db_session, monkeypatch
+):
+    """Цепочечный путь не форсит закрытие заказа: работает общая семантика —
+    заказ закрывается только при полном покрытии скомандованным объёмом."""
+    ctx = _setup_chain(db_session)
+    # сварка скомандована частично: 4 из 6
+    ctx["weld"]["m"].qty = 4
+    ctx["weld"]["product"].produced_qty = 0
+    db_session.commit()
+
+    fake = _FakeClient(ref_key="pw-partial-output-ref")
+    _stub_live(monkeypatch, fake)
+    _stub_manufactures_export(monkeypatch, failing_ids=set())
+
+    result = close_paint_chain(
+        db_session,
+        product_id=ctx["paint"]["product"].product_id,
+        dry_run=False,
+        allow_production=True,
+    )
+
+    assert result["status"] == "ok"
+    patched_paths = [path for path, _ in fake.patches]
+    assert "Document_ЗаказНаПроизводство(guid'order-ref-PAINT')" in patched_paths
+    assert "Document_ЗаказНаПроизводство(guid'order-ref-WELD')" not in patched_paths
+    db_session.refresh(ctx["weld"]["order"])
+    assert ctx["weld"]["order"].order_state_name is None
 
 
 def test_journal_rows_carry_chain_info(db_session):

@@ -1432,51 +1432,27 @@ def assemble_material_issue(
         if state.status in {"shortage", "partial", "ready", "to_move"}:
             state.status = "assembled"
         state.issue_status = "posted"
+    # Item-ledger: fire-and-forget enqueue of a pull-by-document. The export
+    # step enqueues the *unposted* document; this button is the one that runs
+    # Unpost+Post, i.e. the moment the movement actually appears in the 1C
+    # register. Without this the movement only reached the Ledger through the
+    # reconcile Balance-sweep. NEVER let it raise into the posting flow — the
+    # sweep stays the safety net. No OData here: enqueue writes a 'pending' row.
+    try:
+        from .item_ledger.ingest import enqueue_recorder_pull
+
+        enqueue_recorder_pull(
+            db, STOCK_TRANSFER_ENTITY, ref_key, source="material_issue_assemble"
+        )
+    except Exception as _exc:  # noqa: BLE001
+        print(
+            f"[item-ledger] enqueue pull failed for {STOCK_TRANSFER_ENTITY} "
+            f"{ref_key}: {_exc}"
+        )
     db.commit()
     return {
         "status": "ok",
         "issue_id": int(issue.issue_id),
         "product_id": int(issue.product_id),
         "target_ref_key": ref_key,
-    }
-
-
-def build_issue_1c_payload(db: Session, issue_id: int) -> Dict[str, Any]:
-    issue_data = get_issue(db, issue_id)
-    issue = (
-        db.query(ProductionMaterialIssue)
-        .options(
-            joinedload(ProductionMaterialIssue.order),
-            joinedload(ProductionMaterialIssue.product).joinedload(ProductionProduct.item),
-            joinedload(ProductionMaterialIssue.lines).joinedload(ProductionMaterialIssueLine.component_item),
-        )
-        .filter(ProductionMaterialIssue.issue_id == int(issue_id))
-        .first()
-    )
-    if not issue:
-        raise ValueError("Документ выдачи не найден")
-
-    return {
-        "Number": str(issue.document_number),
-        "Date": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
-        "Posted": False,
-        "Комментарий": f"PRODPLAN: выдача под заказ {issue.order.order_number}, строка {issue.product.line_number or issue.product_id}",
-        "ЗаказНаПроизводство_Key": str(issue.order.order_ref1c or ""),
-        "Склад_Key": str(issue.warehouse_ref1c or ""),
-        "Продукция_Key": str(issue.product.item.item_ref1c or "") if issue.product and issue.product.item else "",
-        "ПродукцияКоличество": _to_float(issue.product.remaining_qty) or _to_float(issue.product.quantity),
-        "Материалы": [
-            {
-                "LineNumber": idx + 1,
-                "Номенклатура_Key": str(line.component_item.item_ref1c or ""),
-                "Количество": _to_float(line.required_qty),
-                "Единица": _unit_display(db, line.unit or line.component_item.unit),
-            }
-            for idx, line in enumerate(sorted(issue.lines, key=lambda x: x.line_id))
-        ],
-        "_prodplan": {
-            "issue_id": issue_data["issue_id"],
-            "document_number": issue_data["document_number"],
-            "product_id": issue_data["product_id"],
-        },
     }

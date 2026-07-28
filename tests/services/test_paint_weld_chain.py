@@ -237,6 +237,22 @@ class _FakeClient:
         self.operations.append(operation_path)
 
 
+class _RefusingClient(_FakeClient):
+    """1С приняла запрос, но не вернула Ref_Key — заказ не создан."""
+
+    def post(self, entity, payload, **_kwargs):
+        self.posts.append((entity, payload))
+        return {}
+
+
+class _FailingClient(_FakeClient):
+    """1С отклонила создание окрасочного заказа."""
+
+    def post(self, entity, payload, **_kwargs):
+        self.posts.append((entity, payload))
+        raise RuntimeError("1С: не заполнена организация")
+
+
 def _stub_demo(monkeypatch):
     monkeypatch.setattr(
         exporter,
@@ -395,6 +411,58 @@ def test_open_need_weld_creates_orders_in_order_with_basis(db_session, monkeypat
         .count()
         == 2
     )
+
+
+def test_weld_order_is_not_exported_when_paint_order_has_no_ref(db_session, monkeypatch):
+    """Контракт: «если основание неизвестно — дочерний документ выгружать нельзя».
+
+    1С не вернула Ref_Key окрасочного заказа → order_ref1c пуст → сварочный
+    заказ НЕ уходит в 1С (иначе он создался бы без ЗаказНаПроизводствоОснование).
+    """
+    db = db_session
+    _painted, _welded, painted_product = _setup_pair(db, weld_outstanding=10)
+    _stub_demo(monkeypatch)
+    fake = _RefusingClient()
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    with pytest.raises(ValueError, match="без подтверждённого основания"):
+        open_paint_chain(
+            db,
+            painted_product_id=painted_product.product_id,
+            planned_start="2026-08-10",
+            dry_run=False,
+        )
+
+    # ровно одна попытка POST — окрасочная; дочернего документа в 1С нет
+    assert len(fake.posts) == 1
+    assert db.query(ProductionOrder).count() == 1
+    assert db.query(PaintWeldChainLink).count() == 0
+    paint_order = db.query(ProductionOrder).one()
+    assert not (paint_order.order_ref1c or "")
+
+
+def test_weld_order_is_not_exported_when_paint_export_errors(db_session, monkeypatch):
+    """Ошибка 1С по родителю попадает в текст ошибки цепочки как причина."""
+    db = db_session
+    _painted, _welded, painted_product = _setup_pair(db, weld_outstanding=10)
+    _stub_demo(monkeypatch)
+    fake = _FailingClient()
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
+
+    with pytest.raises(ValueError) as excinfo:
+        open_paint_chain(
+            db,
+            painted_product_id=painted_product.product_id,
+            planned_start="2026-08-10",
+            dry_run=False,
+        )
+
+    message = str(excinfo.value)
+    assert "не заполнена организация" in message
+    assert "не выгружен" in message
+    assert len(fake.posts) == 1
+    assert db.query(ProductionOrder).count() == 1
+    assert db.query(PaintWeldChainLink).count() == 0
 
 
 def test_open_is_idempotent_on_repeat(db_session, monkeypatch):

@@ -144,7 +144,14 @@ async def chain_open(payload: ChainOpenPayload, db: Session = Depends(get_db)):
 async def chain_close(payload: ChainClosePayload, db: Session = Depends(get_db)):
     """Закрыть цепочку «окраска↔сварка» одним действием: выпуски обеих строк,
     СборкаЗапасов обоих заказов и один комбинированный СдельныйНаряд, закрывающий
-    оба заказа. dry_run=true — предпросмотр."""
+    оба заказа. dry_run=true — предпросмотр.
+
+    Закрытие возобновляемо. Если часть шага прошла (одна СборкаЗапасов в 1С, или
+    обе сборки есть, а наряда нет), ответ приходит с HTTP 200 и
+    ``status='partial'``, ``resume_required=true``, ``chain_state``,
+    ``posted_sides``/``pending_sides`` и человекочитаемым ``message``: проведённые
+    документы не откатываются, повторный вызов докатывает недостающие без дублей.
+    400 остаётся только для случая, когда в 1С не ушло ничего."""
     try:
         return close_paint_chain(
             db,

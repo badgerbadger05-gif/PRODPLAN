@@ -399,6 +399,51 @@ def _order_payload(export_summary: Dict[str, Any], order_id: int) -> Optional[Di
     return None
 
 
+def _order_export_entry(
+    export_summary: Dict[str, Any], order_id: int
+) -> Optional[Dict[str, Any]]:
+    for row in export_summary.get("entries", []) or []:
+        try:
+            row_order_id = int(row.get("order_id", -1))
+        except (TypeError, ValueError):
+            continue
+        if row_order_id == int(order_id):
+            return row
+    return None
+
+
+def _parent_export_failure(
+    export_summary: Dict[str, Any], *, order_id: int
+) -> Optional[str]:
+    """Причина, по которой окрасочный заказ нельзя считать выгруженным в 1С.
+
+    Контракт .docs/one_c_export_from_prodplan.md: «Если основание неизвестно или
+    родительский документ ещё не создан в 1С, дочерний документ выгружать
+    нельзя». Значит результат экспорта родителя обязан анализироваться, а не
+    приниматься на веру по общему ``status`` сводки: батч-статус ``ok`` ничего
+    не говорит о конкретной строке, а строка без ``target_ref_key`` — это
+    ненайденное основание. Возвращает None, когда основание подтверждено.
+    """
+    entry = _order_export_entry(export_summary, int(order_id))
+    if entry is None:
+        skipped = [
+            str(row.get("reason") or row)
+            for row in (export_summary.get("skipped_rows") or [])
+            if str(row.get("order_id", "")) == str(order_id)
+        ]
+        return "; ".join(skipped) or "1С не вернула результат по окрасочному заказу"
+    status = str(entry.get("status") or "")
+    if status not in ("created", "existing"):
+        return str(
+            entry.get("error")
+            or entry.get("reason")
+            or f"статус выгрузки заказа — '{status or 'unknown'}'"
+        )
+    if not str(entry.get("target_ref_key") or "").strip():
+        return "1С не вернула Ref_Key окрасочного заказа"
+    return None
+
+
 def open_paint_chain(
     db: Session,
     *,
@@ -585,6 +630,21 @@ def open_paint_chain(
         )
         db.flush()
         db.refresh(paint_order)
+        # Основание дочернего документа обязано быть подтверждённым, а не
+        # предполагаемым: без этой проверки сварочный заказ уходил в 1С без
+        # ЗаказНаПроизводствоОснование_Key, как только окрасочный не создался.
+        paint_failure = _parent_export_failure(
+            paint_export, order_id=int(paint_order.order_id)
+        )
+        paint_ref = str(paint_order.order_ref1c or "").strip()
+        if paint_failure is None and not paint_ref:
+            paint_failure = "order_ref1c окрасочного заказа остался пустым"
+        if paint_failure is not None:
+            raise ValueError(
+                f"Окрасочный заказ {production_order_number(paint_order)} не выгружен "
+                f"в 1С: {paint_failure}. Сварочный заказ не выгружается без "
+                "подтверждённого основания."
+            )
         result["painted"] = {
             "order_id": int(paint_order.order_id),
             "order_number": str(paint_order.order_number or ""),
@@ -618,11 +678,14 @@ def open_paint_chain(
                 dry_run=False,
                 allow_production=allow_production,
                 comment_suffixes={int(weld_order.order_id): basis},
-                basis_order_refs={
-                    int(weld_order.order_id): str(paint_order.order_ref1c or "")
-                },
+                basis_order_refs={int(weld_order.order_id): paint_ref},
             )
             db.refresh(weld_order)
+            weld_failure = _parent_export_failure(
+                weld_export, order_id=int(weld_order.order_id)
+            )
+            if weld_failure is None and not str(weld_order.order_ref1c or "").strip():
+                weld_failure = "order_ref1c сварочного заказа остался пустым"
             result["welded"] = {
                 "order_id": int(weld_order.order_id),
                 "order_number": str(weld_order.order_number or ""),
@@ -634,7 +697,17 @@ def open_paint_chain(
                 "basis": basis,
                 "reused": weld_reused,
                 "export": weld_export,
+                "error": weld_failure,
             }
+            if weld_failure is not None:
+                # Окрасочный заказ уже живёт в 1С (экспортёр коммитит построчно),
+                # поэтому откатывать нечего — но и «ok» это не есть.
+                result["status"] = "partial_error"
+                result["error"] = (
+                    f"Окрасочный заказ выгружен, сварочный "
+                    f"{production_order_number(weld_order)} — нет: {weld_failure}. "
+                    "Повторите открытие цепочки."
+                )
 
         db.commit()
         return result
@@ -744,6 +817,17 @@ def close_paint_chain(
 
     dry_run=True — предпросмотр: что будет произведено и, если оба выпуска уже
     существуют, payload комбинированного сдельного.
+
+    Закрытие возобновляемо (см. produce_line после доработки «докат цепочки»).
+    Обе СборкиЗапасов уходят одним вызовом экспортёра, но их результаты
+    разбираются построчно: проведённая в 1С сборка НИКОГДА не откатывается
+    из-за того, что вторая не прошла. При частичном успехе ответ несёт
+    ``status='partial'`` / ``chain_state='partially_posted'`` /
+    ``resume_required=True``, а повторный вызов докатывает недостающую сборку
+    и комбинированный наряд, не создавая дублей: успешная сторона узнаётся по
+    ``exported_ref1c`` (produce_line возвращает её как ``resumed``), а
+    неудачная — локальный выпуск без 1С-документа — откатывается, чтобы гард
+    «всё уже скомандовано» не заблокировал докат.
     """
     from .one_c_manufacture_export import export_manufactures_to_1c
     from .one_c_piecework_export import export_chain_piecework_to_1c
@@ -772,6 +856,9 @@ def close_paint_chain(
             "remaining_qty": remaining,
             "qty_to_produce": planned if remaining > 0 and planned > 0 else 0.0,
             "existing_manufacture_id": int(existing.manufacture_id) if existing else None,
+            "manufacture_ref1c": (
+                str(existing.exported_ref1c or "").strip() or None if existing else None
+            ),
         }
 
     weld_plan = _plan_side(weld_product, weld_qty)
@@ -787,6 +874,21 @@ def close_paint_chain(
     }
 
     if dry_run:
+        posted = [
+            side
+            for side, plan in (("weld", weld_plan), ("paint", paint_plan))
+            if plan["manufacture_ref1c"]
+        ]
+        result["posted_sides"] = posted
+        result["pending_sides"] = [
+            side for side in ("weld", "paint") if side not in posted
+        ]
+        result["chain_state"] = (
+            "manufactures_posted"
+            if len(posted) == 2
+            else ("partially_posted" if posted else "not_started")
+        )
+        result["resume_required"] = len(posted) == 1
         if weld_plan["existing_manufacture_id"] and paint_plan["existing_manufacture_id"]:
             result["piecework_preview"] = export_chain_piecework_to_1c(
                 db,
@@ -813,7 +915,10 @@ def close_paint_chain(
             )
             plan["produce"] = produced
             manufacture_id = int(produced["manufacture_id"])
-            created_manufacture_ids.append(manufacture_id)
+            # Возобновлённый выпуск уже владеет документом 1С — он не «создан
+            # этим вызовом» и не подлежит локальному откату.
+            if not bool(produced.get("resumed")):
+                created_manufacture_ids.append(manufacture_id)
             return manufacture_id
         plan["produce"] = None
         if plan["existing_manufacture_id"] is None:
@@ -825,6 +930,8 @@ def close_paint_chain(
     # Сварка первой: её выпуск — вход окраски.
     weld_manufacture_id = _ensure_manufacture(weld_plan, weld_operation_executors)
     paint_manufacture_id = _ensure_manufacture(paint_plan, paint_operation_executors)
+    weld_plan["manufacture_id"] = weld_manufacture_id
+    paint_plan["manufacture_id"] = paint_manufacture_id
 
     manufactures_export = export_manufactures_to_1c(
         db,
@@ -838,27 +945,61 @@ def close_paint_chain(
         for entry in (manufactures_export.get("entries") or [])
         if entry.get("manufacture_id") is not None
     }
-    failed_manufactures = []
-    for manufacture_id in (weld_manufacture_id, paint_manufacture_id):
+    posted_sides: List[str] = []
+    pending_sides: List[str] = []
+    failures: List[str] = []
+    for side, plan, manufacture_id in (
+        ("weld", weld_plan, weld_manufacture_id),
+        ("paint", paint_plan, paint_manufacture_id),
+    ):
         entry = export_entries.get(int(manufacture_id), {})
         persisted = db.get(ProductionManufacture, int(manufacture_id))
         exported_ref = str(
             entry.get("target_ref_key")
             or (persisted.exported_ref1c if persisted is not None else "")
             or ""
+        ).strip()
+        # Документ, созданный но не проведённый, экспортёр помечает status=error
+        # и всё равно штампует exported_ref1c — такой стороне нельзя выдавать
+        # «проведено».
+        if exported_ref and str(entry.get("status") or "") != "error":
+            plan["manufacture_ref1c"] = exported_ref
+            posted_sides.append(side)
+            continue
+        reason = str(
+            entry.get("error")
+            or entry.get("reason")
+            or f"manufacture_id={manufacture_id}: 1С не создала и не провела СборкаЗапасов"
         )
-        if not exported_ref:
-            failed_manufactures.append(
-                str(
-                    entry.get("error")
-                    or entry.get("reason")
-                    or f"manufacture_id={manufacture_id}: 1С не создала и не провела СборкаЗапасов"
-                )
-            )
-            if manufacture_id in created_manufacture_ids:
-                rollback_local_manufacture(db, manufacture_id)
-    if failed_manufactures or int(manufactures_export.get("manufactures_error") or 0) > 0:
-        raise ValueError("; ".join(failed_manufactures) or "Ошибка экспорта СборкаЗапасов цепочки")
+        plan["manufacture_ref1c"] = exported_ref or None
+        plan["error"] = reason
+        pending_sides.append(side)
+        failures.append(f"{side}: {reason}")
+        # Локальный выпуск без 1С-документа откатывается, иначе гард
+        # «по этой строке уже создана команда на весь объём» заблокирует докат.
+        if manufacture_id in created_manufacture_ids and not exported_ref:
+            rollback_local_manufacture(db, manufacture_id)
+
+    result["posted_sides"] = posted_sides
+    result["pending_sides"] = pending_sides
+
+    if pending_sides and not posted_sides:
+        # Ни одна СборкаЗапасов не попала в 1С — докатывать нечего.
+        raise ValueError("; ".join(failures) or "Ошибка экспорта СборкаЗапасов цепочки")
+    if pending_sides:
+        db.commit()
+        result["status"] = "partial"
+        result["chain_state"] = "partially_posted"
+        result["resume_required"] = True
+        result["error"] = "; ".join(failures)
+        result["message"] = (
+            "Цепочка частично проведена: СборкаЗапасов стороны "
+            f"{', '.join(posted_sides)} в 1С, сторона "
+            f"{', '.join(pending_sides)} — нет, комбинированный СдельныйНаряд не "
+            "создавался. Требуется докат: повторите закрытие цепочки, проведённая "
+            "сборка переиспользуется без дубля."
+        )
+        return result
 
     piecework_export = export_chain_piecework_to_1c(
         db,
@@ -869,12 +1010,23 @@ def close_paint_chain(
     )
     result["piecework_export"] = piecework_export
     if piecework_export.get("status") not in ("ok", "existing"):
-        raise ValueError(
-            str(
-                piecework_export.get("error")
-                or "1С не создала и не провела комбинированный СдельныйНаряд"
-            )
+        # Обе сборки живут в 1С — откатывать их нельзя, наряд докатывается
+        # повторным закрытием (sync_link 'piecework' держит идемпотентность).
+        db.commit()
+        result["status"] = "partial"
+        result["chain_state"] = "manufactures_posted_piecework_pending"
+        result["resume_required"] = True
+        result["error"] = str(
+            piecework_export.get("error")
+            or "1С не создала и не провела комбинированный СдельныйНаряд"
         )
+        result["message"] = (
+            "Обе СборкиЗапасов проведены в 1С, комбинированный СдельныйНаряд — нет. "
+            "Требуется докат: повторите закрытие цепочки."
+        )
+        return result
+    result["chain_state"] = "closed"
+    result["resume_required"] = False
     result["ledger_readback"] = "queued"
     db.commit()
     return result
