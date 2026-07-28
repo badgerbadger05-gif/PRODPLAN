@@ -56,7 +56,7 @@ from ..services.period_plan_service import (
     add_item_to_period_plan,
     bulk_upsert_period_plan_lines,
     create_period_plan,
-    create_mrp_snapshot_from_period_plan,
+    create_mrp_snapshot_for_plan,
     delete_period_plan,
     delete_period_plan_item,
     fix_period_plan,
@@ -419,7 +419,10 @@ class PeriodPlanFixRequest(BaseModel):
 
 
 class PeriodPlanMrpSnapshotRequest(BaseModel):
-    generation_key: str
+    # Optional by contract: the refresh key is infrastructure, resolved by the
+    # server from the current accepted Ledger generation.  It stays accepted for
+    # operator/worker callers that must pin an exact retry key.
+    generation_key: Optional[str] = None
     started_by: Optional[str] = None
 
 
@@ -559,12 +562,19 @@ async def period_plans_bulk_upsert(
 @router.post("/period-plans/{plan_id}/fix")
 async def period_plans_fix(
     plan_id: int,
-    req: PeriodPlanFixRequest,
+    req: PeriodPlanFixRequest = PeriodPlanFixRequest(),
     db: Session = Depends(get_db),
 ):
+    """Единственное действие «Зафиксировать»: атомарно фиксирует план и
+    публикует его MRP-снимок одним поколением Ledger.
+
+    Отдельной кнопки «MRP-снимок» в каноническом сценарии нет. Если снимок не
+    опубликован, план остаётся `draft` (fail closed).
+    """
     try:
         return fix_period_plan(db, plan_id, fixed_by=req.fixed_by)
     except Exception as e:
+        db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -602,11 +612,19 @@ async def period_plans_runs(
 @router.post("/period-plans/{plan_id}/mrp-snapshot")
 async def period_plans_mrp_snapshot(
     plan_id: int,
-    req: PeriodPlanMrpSnapshotRequest,
+    req: PeriodPlanMrpSnapshotRequest = PeriodPlanMrpSnapshotRequest(),
     db: Session = Depends(get_db),
 ):
+    """Совместимый путь восстановления снимка уже зафиксированного плана.
+
+    Основной сценарий — атомарный `POST /period-plans/{id}/fix`. Этот маршрут
+    остаётся идемпотентным повтором: если у плана уже есть снимок в текущем
+    принятом поколении, он возвращается как есть и ничего не форкается.
+    `generation_key` необязателен — сервер выводит его из текущего принятого
+    поколения.
+    """
     try:
-        result = create_mrp_snapshot_from_period_plan(
+        result = create_mrp_snapshot_for_plan(
             db,
             plan_id,
             generation_key=req.generation_key,

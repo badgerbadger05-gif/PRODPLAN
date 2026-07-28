@@ -4,7 +4,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.orm import Session
 
 if TYPE_CHECKING:  # pragma: no cover - typing only; runtime import is mrp_freeze→here
@@ -73,10 +73,59 @@ _DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
 _DIRECT_1C_PRODUCTION_HORIZON = date(2026, 5, 1)
 _SUPPLIER_ORDER_DONE_STATES = {"принят на склад"}
 _CLOSE_REFRESH_KEY_PREFIX = "close-fixed-run"
+_FIX_REFRESH_KEY_PREFIX = "fix-period-plan"
 
 
 def _close_refresh_generation_key(*, run_id: int, parent_generation_id: int) -> str:
     return f"{_CLOSE_REFRESH_KEY_PREFIX}:{int(run_id)}:{int(parent_generation_id)}"
+
+
+def _fix_refresh_generation_key(*, plan_id: int, parent_generation_id: int) -> str:
+    """Server-owned refresh key for «Зафиксировать».
+
+    Deterministic in ``(plan, parent generation)`` exactly like the close key, so
+    a retry of the same fixation against the same accepted truth reuses one
+    generation instead of forking a second one.  Callers never have to invent a
+    key; the UI must not be able to pin one.
+    """
+    return f"{_FIX_REFRESH_KEY_PREFIX}:{int(plan_id)}:{int(parent_generation_id)}"
+
+
+def _lock_mrp_ledger(db: Session) -> None:
+    """Take the Ledger publication lock that ``run_obligation_refresh`` uses.
+
+    The orchestrator acquires ``MRP_LEDGER_LOCK_KEY`` only once it is already
+    committed to forking a generation.  Everything this module checks *before*
+    that call — «does this plan already own a snapshot in the current accepted
+    truth?» — used to run unserialised, so two concurrent fixations could both
+    see "no snapshot", both fork, and leave the plan permanently poisoned with
+    two current FIXED_SNAPSHOT runs.  Taking the *same* key here closes that
+    TOCTOU window; PostgreSQL advisory locks are re-entrant inside one
+    transaction, so the orchestrator's later acquisition is a no-op.
+
+    SQLite (tests) has no advisory locks and a single writer, so this is a
+    documented no-op — the same platform guard the orchestrator uses.
+    """
+    try:
+        dialect = db.get_bind().dialect.name
+    except Exception:  # pragma: no cover - unbound session in unit tests
+        return
+    if dialect != "postgresql":
+        return
+    from .mrp_freeze import MRP_LEDGER_LOCK_KEY
+
+    db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": MRP_LEDGER_LOCK_KEY})
+
+
+def _current_accepted_generation(db: Session) -> LedgerGeneration:
+    """Resolve the one accepted Ledger generation every plan write descends from."""
+    truth = db.get(PlanningTruthState, 1)
+    if truth is None or truth.current_generation_id is None:
+        raise ValueError("Current accepted Ledger truth is unavailable")
+    parent = db.get(LedgerGeneration, int(truth.current_generation_id))
+    if parent is None or str(parent.status) != "accepted":
+        raise ValueError("Current accepted Ledger truth is unavailable")
+    return parent
 
 
 def _parse_date(value: Any, field: str = "date") -> date:
@@ -375,16 +424,61 @@ def get_period_plan(db: Session, plan_id: int) -> Dict[str, Any]:
 
 
 def fix_period_plan(db: Session, plan_id: int, *, fixed_by: Optional[str] = None) -> Dict[str, Any]:
+    """The single atomic «Зафиксировать» action (``period_plan_target.md`` §Фиксация).
+
+    Fixation is one operation, not two buttons: it validates a non-empty plan,
+    freezes the release rows, explodes the BOM once and publishes the consistent
+    single-generation Ledger snapshot (full reservations, availability coverage,
+    replenishment need, make/buy routing, assembly queue) through
+    ``run_obligation_refresh``, and only then marks the plan ``fixed``.
+
+    Fail closed.  The status flip and the snapshot share one transaction: if the
+    snapshot cannot be published the whole thing is rolled back and the plan
+    stays ``draft`` and editable.  A plan can never end up ``fixed`` — immutable,
+    with no way back to draft — while carrying no MRP snapshot.
+
+    Idempotent for the recovery case: a plan that is already ``fixed`` and
+    already owns a snapshot in the current accepted truth is returned unchanged
+    (``mrp.immutable = True``); a plan left ``fixed`` without a snapshot by the
+    old two-step flow gets its missing snapshot published here.
+    """
     plan = _get_plan(db, plan_id)
     if plan.status == "closed":
         raise ValueError("Закрытый план нельзя фиксировать")
-    if plan.status != "fixed":
-        plan.status = "fixed"
-        plan.fixed_by = fixed_by
-        plan.fixed_at = datetime.now(timezone.utc)
-    db.commit()
-    db.refresh(plan)
-    return _serialize_plan(plan)
+    # Serialise with the Ledger publication lock BEFORE any check that decides
+    # whether a snapshot has to be created (see ``_lock_mrp_ledger``).
+    _lock_mrp_ledger(db)
+    has_release = (
+        db.query(ProductionPlanLine.id)
+        .filter(
+            ProductionPlanLine.plan_id == int(plan.id),
+            ProductionPlanLine.qty > 0,
+        )
+        .first()
+    )
+    if not has_release:
+        raise ValueError("Нельзя зафиксировать пустой план: нет положительного выпуска")
+
+    try:
+        if plan.status != "fixed":
+            plan.status = "fixed"
+            plan.fixed_by = fixed_by
+            plan.fixed_at = datetime.now(timezone.utc)
+            # Flush, do not commit: the snapshot publisher requires a fixed plan
+            # inside this same transaction, and a failure must undo the flip.
+            db.flush()
+        snapshot = create_mrp_snapshot_for_plan(
+            db, int(plan.id), started_by=fixed_by or "api",
+        )
+        # Serialise while the transaction is still open: after the commit every
+        # attribute is expired, and the published state is exactly what we are
+        # about to commit.
+        payload = _serialize_plan(plan)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return {**payload, "mrp": snapshot}
 
 
 def update_period_plan_header(
@@ -934,6 +1028,10 @@ def create_mrp_snapshot_from_period_plan(
 ) -> Dict[str, Any]:
     """Publish this fixed plan through the atomic Ledger obligation refresh.
 
+    Strict entry point: ``generation_key`` must be pinned by the caller.  The
+    canonical UI path is :func:`fix_period_plan`; use
+    :func:`create_mrp_snapshot_for_plan` when the key should be server-owned.
+
     Transaction ownership deliberately remains with the caller.  This service
     neither commits nor rolls back, so a failed refresh cannot expose a partial
     candidate generation.
@@ -941,6 +1039,10 @@ def create_mrp_snapshot_from_period_plan(
     key = str(generation_key or "").strip()
     if not key:
         raise ValueError("generation_key is required")
+    # The existing-snapshot probe below and the fork it guards must be one
+    # atomic decision, so the publication lock is taken here rather than deep
+    # inside ``run_obligation_refresh``.
+    _lock_mrp_ledger(db)
     plan = _get_plan(db, int(plan_id))
     if plan.status != "fixed":
         raise ValueError("MRP-снимок можно создать только из зафиксированного плана")
@@ -949,12 +1051,7 @@ def create_mrp_snapshot_from_period_plan(
         ProductionPlanLine.qty > 0,
     ).first():
         raise ValueError("В плане нет положительной потребности для MRP")
-    truth = db.get(PlanningTruthState, 1)
-    if truth is None or truth.current_generation_id is None:
-        raise ValueError("Current accepted Ledger truth is unavailable")
-    parent = db.get(LedgerGeneration, int(truth.current_generation_id))
-    if parent is None or str(parent.status) != "accepted":
-        raise ValueError("Current accepted Ledger truth is unavailable")
+    parent = _current_accepted_generation(db)
     try:
         cfg_id, cfg = get_active_planning_config(db)
     except Exception:
@@ -1026,6 +1123,42 @@ def create_mrp_snapshot_from_period_plan(
         "rework_count": db.query(PlannedRework).filter_by(run_id=run_id).count(),
         "freeze_version": int(run.active_freeze_version or 0),
     }
+
+
+def create_mrp_snapshot_for_plan(
+    db: Session,
+    plan_id: int,
+    *,
+    generation_key: Optional[str] = None,
+    started_by: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Publish the plan's MRP snapshot with a server-owned refresh key.
+
+    The refresh key is infrastructure, not user input: when the caller does not
+    pin one it is derived deterministically from ``(plan, current accepted
+    generation)``, exactly like the close path.  This is what makes the HTTP
+    contract keyless — the client cannot invent, collide with or replay a
+    generation key.
+
+    Used by the atomic :func:`fix_period_plan` and by the compatibility
+    ``POST /period-plans/{id}/mrp-snapshot`` recovery route.  Repeating it for a
+    plan that already owns a snapshot in the current truth is idempotent: the
+    existing run is returned and nothing is forked.
+
+    Transaction ownership stays with the caller (no commit / no rollback here).
+    """
+    # Resolve the key under the publication lock: the parent generation it is
+    # derived from must be the same one the refresh will fork.
+    _lock_mrp_ledger(db)
+    key = str(generation_key or "").strip()
+    if not key:
+        parent = _current_accepted_generation(db)
+        key = _fix_refresh_generation_key(
+            plan_id=int(plan_id), parent_generation_id=int(parent.id),
+        )
+    return create_mrp_snapshot_from_period_plan(
+        db, int(plan_id), generation_key=key, started_by=started_by,
+    )
 
 
 def _prepare_include_run(
@@ -1736,6 +1869,17 @@ def close_fixed_plan(db: Session, run_id: int, *, dry_run: bool = False) -> Dict
     reservations so they are removed from active queue usage.
     This operation is close-only: no requirement status changes, no pruning and
     no recalculation. No reopen path exists by design.
+
+    ``dry_run`` is a *full-fidelity* preview, not a cheap one: it executes the
+    real ``run_obligation_refresh`` (generation fork + freeze + publish) and only
+    then rolls the transaction back.  That is what makes it trustworthy — a
+    dry run that succeeds proves the real close will succeed — but it costs a
+    complete refresh and holds the global Ledger publication advisory lock for
+    its whole duration.  A cheap preview would need the orchestrator to expose a
+    validate-only mode; short of that, do NOT call ``dry_run`` on a hot path or
+    from polling UI.  ``published_generation_id`` in a dry-run result names the
+    forked generation that was rolled back, so it must not be persisted or shown
+    as a real generation id.
     """
     run = (
         db.query(PlanningRun)

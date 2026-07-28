@@ -67,15 +67,43 @@ export function listPeriodPlanRuns(planId: number, limit = 50) {
 // Re-export for callers that want the row type
 export type { PeriodPlanRun }
 
+/** MRP snapshot published by fixation (or by the compatibility recovery route).
+ *
+ * The counters are absent on the idempotent branch (`immutable: true`), where an
+ * already published snapshot is returned instead of a freshly built one. */
+export type MrpSnapshotResult = {
+  status: string
+  generation_key: string
+  ledger_generation_id: number
+  run_id: number
+  plan_id?: number
+  published: boolean
+  immutable?: boolean
+  requirement_count?: number
+  bucket_count?: number
+  production_count?: number
+  stage_count?: number
+  purchase_count?: number
+  rework_count?: number
+  freeze_version?: number
+}
+
+/** «Зафиксировать» — one atomic action.
+ *
+ * The backend validates the non-empty plan, publishes the single-generation MRP
+ * snapshot and marks the plan fixed in one transaction; on failure the plan stays
+ * `draft`. There is no separate "run MRP" step in the canonical flow. */
 export function fixPeriodPlan(planId: number, fixedBy = 'erp-shell') {
-  return api<PeriodPlan>(`/v1/plan/period-plans/${planId}/fix`, {
+  return api<PeriodPlan & { mrp: MrpSnapshotResult }>(`/v1/plan/period-plans/${planId}/fix`, {
     method: 'POST',
     body: JSON.stringify({ fixed_by: fixedBy }),
   })
 }
 
+/** Compatibility recovery path for a plan that is already fixed but lost/never
+ * got its snapshot. Idempotent. `generation_key` is server-owned — never sent. */
 export function createMrpSnapshot(planId: number) {
-  return api<{ status: string; run_id: number; plan_id: number; requirement_count: number; purchase_count: number; rework_count: number }>(
+  return api<MrpSnapshotResult>(
     `/v1/plan/period-plans/${planId}/mrp-snapshot`,
     { method: 'POST', body: JSON.stringify({ started_by: 'erp-shell' }) },
   )
