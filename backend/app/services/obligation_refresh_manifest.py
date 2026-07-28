@@ -193,12 +193,17 @@ def _existing_result(
             ) from exc
         action = entry.get("action")
         expected_parent = entry.get("parent_run_id")
-        if action == "retain":
+        if action in {"retain", "retire"}:
+            # Both actions name a *current* parent run and never a candidate:
+            # a retire only changes what the publisher does with that parent
+            # (CLOSED instead of carried forward), so the resume-time lineage
+            # proof is identical.  Omitting the retire branch here used to make
+            # every resume of an interrupted plan closure fail on ``int(None)``.
             try:
                 parent_id = int(expected_parent)
             except (TypeError, ValueError) as exc:
                 raise ObligationRefreshManifestError(
-                    "target retain manifest parent identity is malformed"
+                    f"target {action} manifest parent identity is malformed"
                 ) from exc
             parent = db.get(models.PlanningRun, parent_id)
             if (
@@ -208,7 +213,7 @@ def _existing_result(
                 or int(parent.source_plan_id or -1) != plan_id
             ):
                 raise ObligationRefreshManifestError(
-                    "target retain manifest lineage conflicts"
+                    f"target {action} manifest lineage conflicts"
                 )
             continue
         try:
@@ -267,11 +272,11 @@ def create_obligation_refresh_manifest(
     config_snapshot: dict[str, Any],
     planning_pool_by_warehouse: Mapping[str, str] | None = None,
 ) -> ObligationRefreshManifestResult:
-    """Create or exactly retry the sealed refresh/add run set.
+    """Create or exactly retry the sealed refresh/add/retain/retire run set.
 
-    ``retire`` is intentionally absent: retiring a plan changes operational
-    obligations and needs its own reviewed workflow.  This helper owns neither
-    transaction commit nor rollback.
+    ``retire`` names a current parent whose plan is being closed by this build:
+    the entry carries ``parent_run_id`` and never a candidate, exactly like
+    ``retain``.  This helper owns neither transaction commit nor rollback.
     """
     if not isinstance(config_snapshot, dict):
         raise ObligationRefreshManifestError("config_snapshot must be a mapping")

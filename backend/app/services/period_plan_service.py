@@ -64,6 +64,7 @@ from .replenishment import (
     REPLENISHMENT_FLOW_REWORK,
     classify_replenishment_flow,
 )
+from .warnings import make_warning
 
 
 PLAN_STATUSES = {"draft", "fixed", "closed"}
@@ -74,6 +75,27 @@ _DIRECT_1C_PRODUCTION_HORIZON = date(2026, 5, 1)
 _SUPPLIER_ORDER_DONE_STATES = {"принят на склад"}
 _CLOSE_REFRESH_KEY_PREFIX = "close-fixed-run"
 _FIX_REFRESH_KEY_PREFIX = "fix-period-plan"
+
+# Canonical `PlannedOrder.demand_ref` spelling for a frozen MRP requirement.
+# The writer below and `production_control_journal` (the other consumer of this
+# link) both use it; `_LEGACY_DEMAND_REF_PREFIX` is accepted on read only, so
+# rows written by older builds keep resolving to their requirement.
+_DEMAND_REF_PREFIX = "mrp_requirement:"
+_LEGACY_DEMAND_REF_PREFIX = "req:"
+
+
+def _demand_ref(requirement_id: int) -> str:
+    return f"{_DEMAND_REF_PREFIX}{int(requirement_id)}"
+
+
+def _demand_ref_lookup(requirement_ids: Iterable[int]) -> Dict[str, int]:
+    """Every accepted spelling of a requirement's demand_ref → requirement id."""
+    lookup: Dict[str, int] = {}
+    for requirement_id in requirement_ids:
+        rid = int(requirement_id)
+        lookup[f"{_DEMAND_REF_PREFIX}{rid}"] = rid
+        lookup[f"{_LEGACY_DEMAND_REF_PREFIX}{rid}"] = rid
+    return lookup
 
 
 def _close_refresh_generation_key(*, run_id: int, parent_generation_id: int) -> str:
@@ -588,7 +610,14 @@ def _explode_bom_net_first(
     plan_demands: Dict[int, Dict[date, float]],
     shared_pools: Optional["FreezeSharedPools"] = None,
     trace: Optional["FreezeTrace"] = None,
-) -> Tuple[Dict[int, Dict[date, float]], Dict[int, Dict[date, float]], Dict[int, int]]:
+    *,
+    need_date_floor: date,
+) -> Tuple[
+    Dict[int, Dict[date, float]],
+    Dict[int, Dict[date, float]],
+    Dict[int, int],
+    List[Dict[str, Any]],
+]:
     """Net-first multi-level BOM explosion with WIP netting and lead-time shifting.
 
     ``shared_pools`` — when provided (freeze v2), the effective-stock and WIP
@@ -612,15 +641,24 @@ def _explode_bom_net_first(
          not suppress this explosion: an open parent order still consumes its
          components, so their demand has to keep propagating down the tree.
 
+    ``need_date_floor`` is the earliest date a need may be dated to. It is the
+    *generation cutoff*, never ``date.today()``: a rebuild of the same Ledger
+    generation on another day must produce the same numbers (planning-truth
+    invariants 4-5).
+
     Returns:
         gross_map  — {item_id: {bucket_date: gross_qty}}
         net_map    — {item_id: {bucket_date: net_qty}}  (after stock + WIP)
         bom_level_map — {item_id: minimum_bom_level}  (0 = plan item, 1 = component, …)
+        warnings   — structured records of BOM edges that could not be exploded
 
-    Cycle safety: each item is exploded as a parent at most once (``exploded_parents``
-    set). Convergent BOMs (same sub-assembly under multiple parents) are handled
-    correctly because all parents at the same depth contribute to ``next_demand``
-    before the next iteration starts.
+    Cycle safety is PER PATH, not global: an item is re-exploded whenever new
+    demand reaches it at a deeper level, and only an edge back into the item's
+    own ancestors is refused. A single global "already exploded" set silently
+    truncated convergent BOMs — with ``A→B→C`` and ``A→D→B→C`` the second arrival
+    of ``B`` (at depth 2) got its gross/net but its children were never
+    re-exploded, so ``C`` permanently lost the ``D`` branch's demand. Ancestors
+    only ever grow, so the walk still terminates on a genuinely cyclic BOM.
     """
     # --- Pre-load BOM data in bulk (avoid N+1 per item) ---
     # Effective stock with ignored warehouses (e.g., brak isolator) excluded;
@@ -667,10 +705,10 @@ def _explode_bom_net_first(
     if shared_pools is not None:
         wip_eta_by_item: Dict[int, list] = shared_pools.wip
     else:
-        try:
-            wip_eta_by_item = _active_wip_eta_by_item(db)
-        except Exception:
-            wip_eta_by_item = {}
+        # Fail closed: a WIP read that blows up used to be swallowed into an
+        # empty pool, and an empty WIP pool inflates net demand for the whole
+        # frozen — permanently, because the freeze is never recomputed.
+        wip_eta_by_item = _active_wip_eta_by_item(db)
 
     # --- Buffer-days lookup: item → default spec → production_kind → resource.buffer_days ---
     all_spec_ids: set = set(default_spec_map.values())
@@ -697,10 +735,9 @@ def _explode_bom_net_first(
         res_by_id = {int(r.resource_id): r for r in resources}
 
     buffer_days_cache: Dict[int, int] = {}
-    today = date.today()
 
-    def clamp_to_today(value: date) -> date:
-        return today if value < today else value
+    def clamp_to_floor(value: date) -> date:
+        return need_date_floor if value < need_date_floor else value
 
     def resolve_buffer_days(item_id: int) -> int:
         if item_id in buffer_days_cache:
@@ -740,8 +777,12 @@ def _explode_bom_net_first(
         avail_wip = {
             int(iid): list(entries) for iid, entries in wip_eta_by_item.items()
         }
-    # Prevent cycles: track items already exploded as parents
-    exploded_parents: set = set()
+    # Per-path cycle guard: every item that led to this one, unioned over the
+    # paths that carried demand into it. An edge is refused only when the child
+    # is already its own ancestor, so a convergent sub-assembly keeps exploding.
+    ancestors_by_item: Dict[int, Set[int]] = {}
+    explosion_warnings: List[Dict[str, Any]] = []
+    reported_cycle_edges: Set[Tuple[int, int]] = set()
 
     # Level 0: demand from plan lines
     demand_map: Dict[int, Dict[date, float]] = {
@@ -853,9 +894,8 @@ def _explode_bom_net_first(
             # NOT after-stock-and-WIP): an open parent order still needs its
             # components produced, so WIP must not suppress the explosion or
             # lower BOM levels silently stay in deficit with no orders.
-            if not explode_buckets or iid in exploded_parents:
-                continue  # Nothing to propagate, or cycle guard
-            exploded_parents.add(iid)
+            if not explode_buckets:
+                continue  # Nothing to propagate
 
             spec_id = default_spec_map.get(iid)
             if not spec_id:
@@ -865,6 +905,8 @@ def _explode_bom_net_first(
             if not comps:
                 continue
 
+            own_ancestors = ancestors_by_item.get(iid, set())
+            child_ancestors = own_ancestors | {iid}
             for bucket_date, exp_q in explode_buckets:
                 for comp in comps:
                     try:
@@ -873,6 +915,22 @@ def _explode_bom_net_first(
                     except Exception:
                         continue
                     if per_unit <= 1e-12 or exp_q <= 1e-9:
+                        continue
+                    if child_id in child_ancestors:
+                        # A genuinely cyclic BOM. The demand on this edge cannot
+                        # be planned, so say so instead of absorbing it.
+                        if (iid, child_id) not in reported_cycle_edges:
+                            reported_cycle_edges.add((iid, child_id))
+                            explosion_warnings.append(make_warning(
+                                "BOM_CYCLE_EDGE_SKIPPED",
+                                msg=(
+                                    "BOM-цикл: компонент уже является предком "
+                                    "своего узла, ветка не разворачивается"
+                                ),
+                                parent_item_id=int(iid),
+                                child_item_id=int(child_id),
+                                bom_level=int(depth),
+                            ))
                         continue
                     child_qty = exp_q * per_unit
                     # Classical MRP lead-time offset: shift the child's
@@ -888,14 +946,29 @@ def _explode_bom_net_first(
                     # with buffers 7/5/3 it produced a 12-day error).
                     buf = resolve_buffer_days(iid)
                     child_date = (bucket_date - timedelta(days=buf)) if buf > 0 else bucket_date
-                    child_date = clamp_to_today(child_date)
+                    child_date = clamp_to_floor(child_date)
                     if child_id not in next_demand:
                         next_demand[child_id] = {}
                     next_demand[child_id][child_date] = (
                         next_demand[child_id].get(child_date, 0.0) + child_qty
                     )
+                    ancestors_by_item.setdefault(child_id, set()).update(child_ancestors)
 
         demand_map = next_demand
+
+    if any(
+        float(qty or 0.0) > 1e-9
+        for buckets in demand_map.values()
+        for qty in buckets.values()
+    ):
+        # Fail closed: the residual demand belongs to real BOM levels that would
+        # never be planned. Silently dropping it is exactly the "лишиться
+        # невыполненной потребности" the canon forbids.
+        raise ValueError(
+            "Развёртка BOM превысила предел вложенности "
+            f"({MAX_BOM_DEPTH}): потребность нижних уровней осталась "
+            f"неразвёрнутой для номенклатур {sorted(demand_map)[:10]}"
+        )
 
     # Freeze v2: record the frozen BOM norms for EVERY parent that carries gross
     # demand and has a default spec — including stock-covered parents whose
@@ -915,7 +988,7 @@ def _explode_bom_net_first(
                     continue
                 trace.component_norms.append((int(iid), child_id, int(spec_id), per_unit))
 
-    return gross_map, net_map, bom_level_map
+    return gross_map, net_map, bom_level_map, explosion_warnings
 
 
 def _load_purchase_supplier_remaining(
@@ -1243,6 +1316,7 @@ def _freeze_one_run(
     trace: "FreezeTrace",
     now: datetime,
     new_version: int,
+    cutoff_date: date,
     is_include: bool = True,
     manage_plan_locks: bool = True,
 ) -> Dict[str, Any]:
@@ -1255,6 +1329,11 @@ def _freeze_one_run(
     and the freeze baseline/allocation/component tables are written. Requirement
     ids are preserved through the ``(run_id,item_id)`` upsert. No commit here —
     the orchestrator owns the transaction.
+
+    ``cutoff_date`` is the generation cutoff and the ONLY "now" this freeze may
+    use. Wall-clock ``date.today()`` made a rebuild of the same generation on a
+    later day produce different need/order dates, breaking planning-truth
+    invariants 4-5 (one cutoff for all projections, idempotent reprocessing).
     """
     from .mrp_freeze import (
         pool_key_for,
@@ -1327,9 +1406,16 @@ def _freeze_one_run(
     # gross_map[item_id][bucket_date] = gross qty (before stock)
     # net_map[item_id][bucket_date]   = net qty  (after stock)
     # bom_level_map[item_id]          = 0 for plan items, 1+ for components
-    gross_map, net_map, bom_level_map = _explode_bom_net_first(
-        db, buckets_by_item, shared_pools, trace
+    gross_map, net_map, bom_level_map, explosion_warnings = _explode_bom_net_first(
+        db, buckets_by_item, shared_pools, trace, need_date_floor=cutoff_date
     )
+    if explosion_warnings:
+        # `planning_run_candidate` seeds `warnings` as an empty dict; every
+        # reader treats the column as a list. Normalise before appending.
+        existing_warnings = run.warnings
+        run.warnings = (
+            list(existing_warnings) if isinstance(existing_warnings, list) else []
+        ) + explosion_warnings
 
     # --- Persist MrpRequirement + MrpRequirementBucket for every item with demand ---
     req_count = 0
@@ -1476,7 +1562,7 @@ def _freeze_one_run(
                     if remaining_need > 1e-9:
                         # Only create a PlannedPurchase for the portion not covered by supplier.
                         need_date = bucket_date
-                        order_date = max(date.today(), need_date - timedelta(days=lead_time))
+                        order_date = max(cutoff_date, need_date - timedelta(days=lead_time))
                         db.add(PlannedPurchase(
                             run_id=int(run.run_id),
                             item_id=int(iid),
@@ -1500,7 +1586,7 @@ def _freeze_one_run(
                     if net_qty <= 1e-9:
                         continue
                     need_date = bucket_date
-                    order_date = max(date.today(), need_date - timedelta(days=lead_time))
+                    order_date = max(cutoff_date, need_date - timedelta(days=lead_time))
                     db.add(PlannedRework(
                         run_id=int(run.run_id),
                         item_id=int(iid),
@@ -1535,7 +1621,7 @@ def _freeze_one_run(
                         start_date=bucket_date,
                         finish_date=bucket_date,
                         bucket_date=bucket_date,
-                        demand_ref=f"mrp_requirement:{req_id}" if req_id else None,
+                        demand_ref=_demand_ref(req_id) if req_id else None,
                         demand_date=bucket_date,
                         ledger_generation_id=int(run.ledger_generation_id),
                     )
@@ -2277,6 +2363,10 @@ def _execution_unavailable_payload(
             "progress_base_qty": None,
             "coverage_pct": None,
             "status": "execution_unavailable",
+            "execution_available": False,
+            "execution_unavailable_reason": (
+                reason or "Execution snapshot is not published"
+            ),
             "work_items": [],
         })
     state_value = lambda name: (
@@ -2303,6 +2393,25 @@ def _execution_unavailable_payload(
             "execution_by_flow": None,
         },
     }
+
+
+def _generation_truth_status(generation: Optional[LedgerGeneration]) -> str:
+    """Truth status of a generation, read from the generation itself.
+
+    A candidate is ``building`` until its own publish transaction flips it, and
+    the persisted read-snapshot payload is sealed byte-for-byte at build time —
+    so the payload keeps the published spelling. This helper exists for the
+    build metadata, which must never claim ``accepted`` for a generation that
+    was never accepted.
+    """
+    if generation is None:
+        return "unavailable"
+    status = str(getattr(generation, "status", "") or "")
+    if status == "accepted":
+        return "accepted"
+    if status == "building":
+        return "building"
+    return "unavailable"
 
 
 def _iso_datetime(value: Any) -> Optional[str]:
@@ -2353,7 +2462,6 @@ def _execution_row_summary(
     execution_base_qty = 0.0
     execution_total_base_qty = 0.0
     execution_by_flow: Dict[str, Dict[str, float]] = {}
-    execution_available_items = 0
     execution_has_unavailable = False
     fully_covered = 0
     partially_covered = 0
@@ -2367,7 +2475,6 @@ def _execution_row_summary(
         item_flow = str(row.get("flow") or "")
         execution_total_base_qty += base_qty
         if execution_available:
-            execution_available_items += 1
             execution_completed_qty += completed_qty
             execution_base_qty += base_qty
         flow_summary = execution_by_flow.setdefault(
@@ -2403,10 +2510,14 @@ def _execution_row_summary(
             partially_covered += 1
         else:
             not_covered += 1
+    # A percentage of nothing is not 100% — it is undefined. The canonical
+    # `replenishment_execution_pct` returns None for a zero base; the plan-level
+    # aggregates must not invent a full bar for an empty or fully stock-covered
+    # selection (the UI renders null as «недоступно»).
     execution_confirmed_pct = (
         round(execution_completed_qty / execution_total_base_qty * 100.0, 1)
         if execution_total_base_qty > 1e-9
-        else (100.0 if execution_available_items > 0 else None)
+        else None
     )
     execution_pct = (
         None
@@ -2414,7 +2525,7 @@ def _execution_row_summary(
         else (
             round(execution_completed_qty / execution_base_qty * 100.0, 1)
             if execution_base_qty > 1e-9
-            else 100.0
+            else None
         )
     )
     for details in execution_by_flow.values():
@@ -2436,7 +2547,7 @@ def _execution_row_summary(
         details["execution_pct"] = (
             round(_to_float(details.get("completed_qty")) / base_qty * 100.0, 1)
             if base_qty > 1e-9
-            else 100.0
+            else None
         )
         total_base_qty = _to_float(details.get("total_base_qty"))
         details["covered_pct"] = (
@@ -2447,7 +2558,7 @@ def _execution_row_summary(
                 1,
             )
             if total_base_qty > 1e-9
-            else 100.0
+            else None
         )
         details["to_order_pct"] = (
             round(
@@ -2457,7 +2568,7 @@ def _execution_row_summary(
                 1,
             )
             if total_base_qty > 1e-9
-            else 0.0
+            else None
         )
     return {
         "truth_status": "accepted",
@@ -2582,18 +2693,20 @@ def _execution_obligation_links(
             "order_state": str(order.order_state_name or order.order_state_key or ""),
         })
 
-    demand_refs = [f"req:{requirement_id}" for requirement_id in requirement_ids]
+    # The writer stamps `mrp_requirement:<id>`; reading `req:<id>` matched
+    # nothing, so every make requirement silently reported ordered_qty=0 and a
+    # full unassigned_qty.  Read both spellings, write only the canonical one.
+    requirement_id_by_demand_ref = _demand_ref_lookup(requirement_ids)
     for planned in (
         db.query(PlannedOrder)
         .filter(
             PlannedOrder.run_id == int(run.run_id),
-            PlannedOrder.demand_ref.in_(demand_refs),
+            PlannedOrder.demand_ref.in_(sorted(requirement_id_by_demand_ref)),
         )
         .all()
     ):
-        try:
-            requirement_id = int(str(planned.demand_ref).split(":", 1)[1])
-        except (TypeError, ValueError, IndexError):
+        requirement_id = requirement_id_by_demand_ref.get(str(planned.demand_ref or ""))
+        if requirement_id is None:
             continue
         if requirement_id in actual_production_requirements:
             continue
@@ -2731,7 +2844,12 @@ def _build_execution_snapshot_rows(
     req_ids = sorted({int(value) for value in requirement_ids})
     req_rows: List[Dict[str, Any]] = []
     if not req_ids:
-        return req_rows, {"total_items": 0, "truth_status": "accepted"}
+        return req_rows, {
+            "total_items": 0,
+            "truth_status": _generation_truth_status(
+                db.get(LedgerGeneration, int(generation_id))
+            ),
+        }
 
     item_ids = [int(req.get("item_id")) for req in items_by_requirement.values() if req.get("item_id") is not None]
     if item_ids:
@@ -2846,13 +2964,26 @@ def _build_execution_snapshot_rows(
             ),
             None,
         )
+        flow = item_flow_by_id.get(item_id)
+        # The reservation ledger of THIS generation is the only source of
+        # execution for a requirement. When it holds no row, the fact is
+        # unknown — reporting a zero (and netting it against the frozen
+        # requirement as a legacy fallback) fabricates progress. Fail closed to
+        # `unavailable`, exactly like the truth-level payload does.
+        execution_available = reservation_row is not None
+        execution_unavailable_reason = (
+            None
+            if execution_available
+            else (
+                "Резерв этой потребности отсутствует в поколении "
+                f"{int(generation_id)}: факт выполнения неизвестен"
+            )
+        )
         progress_base_qty = (
             _to_float(reservation_row[4])
             if reservation_row is not None
             else _to_float(req["net_required_qty"])
         )
-        flow = item_flow_by_id.get(item_id)
-        execution_available = True
         realization_mode = (
             "buy"
             if flow == REPLENISHMENT_FLOW_PURCHASE
@@ -2862,6 +2993,56 @@ def _build_execution_snapshot_rows(
             realized_by_req_mode.get((int(req_id), realization_mode), 0.0),
             10,
         )
+        execution_allocations = [
+            {
+                "event_id": int(event.get("event_id")),
+                "reservation_id": int(event.get("reservation_id")),
+                "stock_ledger_entry_id": event.get("stock_ledger_entry_id"),
+                "qty": _to_float(event.get("realized_delta")),
+                "fact_ref": event.get("fact_ref"),
+                "fact_line_ref": event.get("fact_line_ref"),
+                "match_rule": event.get("match_rule"),
+                "event_at": event.get("event_at"),
+            }
+            for event in events
+            if event.get("stock_ledger_entry_id") is not None
+            and abs(_to_float(event.get("realized_delta"))) > 1e-9
+        ]
+        if not execution_available:
+            req_rows.append({
+                "req_id": int(req_id),
+                "item_id": item_id,
+                "item_code": str(req.get("item_code") or ""),
+                "item_article": str(req.get("item_article") or "") if req.get("item_article") else None,
+                "item_name": str(req.get("item_name") or ""),
+                "flow": flow,
+                "bom_level": int(req.get("bom_level") or 0),
+                "gross_qty": _to_float(req.get("gross_required_qty")),
+                "net_qty": _to_float(req.get("net_required_qty")),
+                "progress_base_qty": progress_base_qty,
+                "completed_qty": None,
+                "execution_available": False,
+                "execution_unavailable_reason": execution_unavailable_reason,
+                "execution_source": None,
+                "remaining_qty": None,
+                "coverage_pct": None,
+                "ordered_qty": ordered_by_requirement.get(req_id, 0.0),
+                "purchase_covered_qty": 0.0,
+                "purchase_to_order_qty": 0.0,
+                "unassigned_qty": max(
+                    0.0,
+                    _to_float(req.get("net_required_qty"))
+                    - ordered_by_requirement.get(req_id, 0.0),
+                ),
+                "root_item_ids": root_item_ids_by_item.get(item_id, []),
+                "information_links": {"reservation_events": []},
+                "status": "execution_unavailable",
+                "reservation_ids": [],
+                "execution_events": events,
+                "execution_allocations": execution_allocations,
+                "work_items": work_items_by_requirement.get(req_id, []),
+            })
+            continue
         if progress_base_qty > 1e-9:
             if completed_qty < -1e-9 or completed_qty > progress_base_qty + 1e-9:
                 raise ValueError(
@@ -2888,7 +3069,9 @@ def _build_execution_snapshot_rows(
         coverage_pct = (
             round(completed_qty / progress_base_qty * 100.0, 1)
             if progress_base_qty > 1e-9
-            else 100.0
+            # Nothing to replenish — the canonical `replenishment_execution_pct`
+            # returns None for a zero base rather than inventing 100%.
+            else None
         )
         ordered_qty = ordered_by_requirement.get(req_id, 0.0)
         purchase_covered_qty, purchase_to_order_qty = (
@@ -2909,7 +3092,7 @@ def _build_execution_snapshot_rows(
             "progress_base_qty": progress_base_qty,
             "completed_qty": completed_qty,
             "execution_available": execution_available,
-            "execution_unavailable_reason": None,
+            "execution_unavailable_reason": execution_unavailable_reason,
             "execution_source": (
                 "supplier_receipt_coverage"
                 if flow == REPLENISHMENT_FLOW_PURCHASE
@@ -2936,15 +3119,21 @@ def _build_execution_snapshot_rows(
             "status": status,
             "reservation_ids": reservations,
             "execution_events": events,
-            "execution_allocations": [],
+            # Real FIFO assignments of physical facts onto this requirement's
+            # reservations, not a placeholder: every reservation event that
+            # names a stock ledger entry is one allocation.
+            "execution_allocations": execution_allocations,
             "work_items": work_items_by_requirement.get(req_id, []),
         })
 
     req_rows.sort(key=lambda row: (int(row.get("bom_level") or 0), int(row.get("item_id") or 0), str(row.get("item_code") or "")))
+    generation = db.get(LedgerGeneration, int(generation_id))
     return req_rows, {
-        "truth_status": "accepted",
+        "truth_status": _generation_truth_status(generation),
         "reservation_rows": len(reservation_rows),
-        "allocation_rows": 0,
+        "allocation_rows": sum(
+            len(row.get("execution_allocations") or []) for row in req_rows
+        ),
         "execution_by_requirement": _execution_row_summary(req_rows),
     }
 

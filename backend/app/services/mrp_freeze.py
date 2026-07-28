@@ -802,10 +802,20 @@ def _write_freeze_component(
 #  — orchestrator
 # ---------------------------------------------------------------------------
 def _to_float(value: Any) -> float:
-    try:
-        return float(value or 0.0)
-    except Exception:
+    """Frozen-quantity coercion — fail closed, never a silent zero.
+
+    This runs on the WRITE path of the frozen obligation (baselines, allocations,
+    retained claims). Swallowing a malformed quantity into ``0.0`` produced an
+    immutable, permanently wrong freeze with no trace of the failure.
+    """
+    if value is None:
         return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise LedgerPoolUnavailable(
+            f"frozen quantity is not numeric: {value!r}"
+        ) from exc
 
 
 def _next_freeze_version(db: Session, run: PlanningRun) -> int:
@@ -917,15 +927,19 @@ def freeze_candidate_snapshots(
             plan_id = int(entry["plan_id"])
         except (KeyError, TypeError, ValueError) as exc:
             raise LedgerPoolUnavailable("candidate freeze obligation_refresh_manifest entry identity is malformed") from exc
-        if action == "retain":
+        if action in {"retain", "retire"}:
             if (
                 plan_id <= 0
                 or plan_id in manifest_plan_ids
                 or entry.get("candidate_run_id") is not None
                 or entry.get("parent_run_id") is None
             ):
-                raise LedgerPoolUnavailable("candidate freeze retain entry is malformed")
-            retained_entries.append(entry)
+                raise LedgerPoolUnavailable(f"candidate freeze {action} entry is malformed")
+            # A retired parent is being closed by this very build: its frozen
+            # claims are released, so it must NOT hold stock or future supply
+            # away from the candidates.  Only ``retain`` keeps seniority below.
+            if action == "retain":
+                retained_entries.append(entry)
             manifest_plan_ids.add(plan_id)
             continue
         try:
@@ -1158,6 +1172,11 @@ def freeze_candidate_snapshots(
                 line[remaining_key] = new_remaining
     from .period_plan_service import _freeze_one_run
     now = datetime.now(timezone.utc)
+    # Every date this freeze clamps to is the generation cutoff, never the wall
+    # clock: rebuilding the same generation tomorrow must yield the same rows.
+    cutoff_date = target.cutoff.date() if isinstance(target.cutoff, datetime) else target.cutoff
+    if not isinstance(cutoff_date, date):
+        raise LedgerPoolUnavailable("candidate freeze target has no usable cutoff")
     results: List[Dict[str, Any]] = []
     for run_id in sorted(requested_ids, key=lambda rid: (runs[rid].period_from or date.min, runs[rid].period_to or date.max, rid)):
         run = runs[run_id]
@@ -1165,8 +1184,8 @@ def freeze_candidate_snapshots(
         trace = FreezeTrace()
         result = _freeze_one_run(
             db, run, plans[int(run.source_plan_id)], shared_pools=pools,
-            trace=trace, now=now, new_version=1, is_include=True,
-            manage_plan_locks=False,
+            trace=trace, now=now, new_version=1, cutoff_date=cutoff_date,
+            is_include=True, manage_plan_locks=False,
         )
         results.append(result)
 

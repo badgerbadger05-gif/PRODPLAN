@@ -320,7 +320,11 @@ def _require_sealed_candidate_manifest(
             raise ValueError(
                 "candidate snapshot obligation_refresh_manifest entry identity is malformed"
             ) from exc
-        if action == "retain":
+        if action in {"retain", "retire"}:
+            # ``retire`` differs from ``retain`` only in what the publisher does
+            # with the named parent run; neither owns a candidate, so the sealed
+            # -set proof is the same.  Without this branch a refresh that both
+            # adds and closes a plan died on ``int(None)`` here.
             if (
                 plan_id <= 0
                 or plan_id in declared_plan_ids
@@ -328,7 +332,8 @@ def _require_sealed_candidate_manifest(
                 or entry.get("parent_run_id") is None
             ):
                 raise ValueError(
-                    "candidate snapshot obligation_refresh_manifest has invalid retain entry"
+                    "candidate snapshot obligation_refresh_manifest has invalid "
+                    f"{action} entry"
                 )
             declared_plan_ids.add(plan_id)
             continue
