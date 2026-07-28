@@ -22,13 +22,42 @@ export type PlanningRunsResponse = {
   offset: number
 }
 
-export type StartPlanningRunResponse = {
-  status: string
-  run_id: number
+// Ledger truth states published by backend/app/services/planning_truth.py.
+export type PlanningTruthStatus = 'uninitialized' | 'building' | 'accepted' | 'stale' | 'rejected'
+
+// Every Ledger-bound MRP read model carries this envelope. When
+// `truth_status` is not `accepted` the payload is the `_unavailable()` stub
+// (mrp_result_snapshot.py) — empty rows and zero totals that must never be
+// rendered as real numbers.
+export type PlanningTruthEnvelope = {
+  snapshot_id?: number | null
+  ledger_generation?: number | null
+  cutoff?: string | null
+  truth_status?: PlanningTruthStatus
+  truth_reason?: string | null
 }
 
-export type MrpSummary = {
-  run: PlanningRunRow
+export type MrpRowKind = 'production' | 'purchase' | 'rework' | 'capacity'
+
+export function planningTruthStatusLabel(status: PlanningTruthStatus | undefined) {
+  if (status === 'accepted') return 'Принят'
+  if (status === 'building') return 'Строится'
+  if (status === 'stale') return 'Устарел'
+  if (status === 'rejected') return 'Отклонён'
+  if (status === 'uninitialized') return 'Не инициализирован'
+  return 'Неизвестно'
+}
+
+// A missing `truth_status` means the endpoint predates the envelope; only an
+// explicit non-accepted status blocks rendering.
+export function isPlanningTruthUsable(envelope: PlanningTruthEnvelope | null | undefined) {
+  const status = envelope?.truth_status
+  return status === undefined || status === 'accepted'
+}
+
+export type MrpSummary = PlanningTruthEnvelope & {
+  // Absent in the `_unavailable()` manifest, which carries no run summary.
+  run?: PlanningRunRow
   counts?: {
     production_orders?: number
     purchase_requests?: number
@@ -40,6 +69,8 @@ export type MrpSummary = {
     hours_planned_total?: number
     hours_available_total?: number
   }
+  snapshot_counts?: Partial<Record<MrpRowKind, number>>
+  snapshot_total_qty?: Partial<Record<MrpRowKind, number>>
   warnings?: Array<Record<string, unknown>>
 }
 
@@ -126,9 +157,11 @@ export type MrpCapacityRow = {
   overload_hours: number
 }
 
-export type MrpPagedResponse<T> = {
+export type MrpPagedResponse<T> = PlanningTruthEnvelope & {
   rows: T[]
   total: number
+  // Backend-computed sum of `qty` over the whole filtered selection, not just
+  // the returned page (mrp_result_snapshot.read_mrp_result_rows).
   total_qty?: number
   limit: number
   offset: number

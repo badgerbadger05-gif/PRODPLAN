@@ -13,7 +13,7 @@ export class ApiError extends Error {
   }
 }
 
-export async function api<T>(path: string, init?: RequestInit, signal?: AbortSignal): Promise<T> {
+async function request(path: string, init?: RequestInit, signal?: AbortSignal): Promise<Response> {
   const res = await fetch(`/api${path}`, {
     headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
     ...init,
@@ -41,5 +41,18 @@ export async function api<T>(path: string, init?: RequestInit, signal?: AbortSig
     throw new ApiError(message, res.status, detail)
   }
 
-  return res.json()
+  return res
+}
+
+export async function api<T>(path: string, init?: RequestInit, signal?: AbortSignal): Promise<T> {
+  const res = await request(path, init, signal)
+  return res.json() as Promise<T>
+}
+
+// Transport for endpoints that answer with a document body instead of JSON
+// (e.g. the route-sheet printer returns `text/html`). `api()` would call
+// `res.json()` on those and always throw, so such endpoints must use this.
+export async function apiText(path: string, init?: RequestInit, signal?: AbortSignal): Promise<string> {
+  const res = await request(path, init, signal)
+  return res.text()
 }

@@ -6,7 +6,6 @@ import type {
   MrpReworkRow,
   MrpSummary,
   PlanningRunsResponse,
-  StartPlanningRunResponse,
 } from '../domain/planning'
 import { api } from '../lib/api'
 
@@ -15,13 +14,6 @@ export function listPlanningRuns(params: { limit?: number; offset?: number } = {
   if (params.limit) search.set('limit', String(params.limit))
   if (typeof params.offset === 'number') search.set('offset', String(params.offset))
   return api<PlanningRunsResponse>(`/v1/plan/runs?${search.toString()}`)
-}
-
-export function startPlanningRun(body: { horizon_days?: number; started_by?: string } = {}) {
-  return api<StartPlanningRunResponse>('/v1/plan/calc', {
-    method: 'POST',
-    body: JSON.stringify(body),
-  })
 }
 
 export function getPlanningRunSummary(runId: number) {
@@ -70,12 +62,6 @@ export function exportPlanningResultPurchases(runId: number, params: { format: '
 export function exportPlanningResultRework(runId: number, params: { format: 'csv' | 'xlsx'; date_from?: string; date_to?: string; root_item_id?: number | null }) {
   return api<{ data_base64?: string; filename?: string; content_type?: string }>(
     `/v1/plan/results/${runId}/rework/export?${buildResultQuery(params)}`,
-  )
-}
-
-export function getShortageReport(runId: number) {
-  return api<{ data_base64?: string; filename?: string; content_type?: string; message?: string }>(
-    `/v1/plan/results/${runId}/shortage-report`,
   )
 }
 

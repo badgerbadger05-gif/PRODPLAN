@@ -904,13 +904,13 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     return Array.from(new Set(journal.rows.map((r) => r.bom_level))).sort((a, b) => a - b)
   }, [journal])
 
+  // `execution_pct === null` is the backend's explicit "недоступно"
+  // (period_plan_service._unavailable_execution_journal). The frontend never
+  // recomputes it from the rows — a fabricated percentage would look like a
+  // real figure.
   const journalExecutionPct = useMemo(() => {
     if (!journal) return null
-    if (typeof journal.summary.execution_pct === 'number') return journal.summary.execution_pct
-    const base = journal.rows.reduce((sum, row) => sum + (row.progress_base_qty ?? row.net_qty ?? 0), 0)
-    if (base <= 1e-9) return 100
-    const completed = journal.rows.reduce((sum, row) => sum + (row.completed_qty ?? 0), 0)
-    return Math.round((completed / base) * 1000) / 10
+    return typeof journal.summary.execution_pct === 'number' ? journal.summary.execution_pct : null
   }, [journal])
 
   const journalExecutionByFlow = useMemo(
@@ -1345,9 +1345,9 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
               {journal && (
                 <>
                   <div className="barSeparator" />
-                  {journalExecutionPct !== null && (
-                    <span className="toolbarText" title="Выполнено / чистая потребность по всем строкам">Общее выполнение: {journalExecutionPct}%</span>
-                  )}
+                  <span className="toolbarText" title="Выполнено / чистая потребность по всем строкам">
+                    Общее выполнение: {journalExecutionPct === null ? 'недоступно' : `${journalExecutionPct}%`}
+                  </span>
                   {journalExecutionByFlow.map((row) => (
                     <span key={row.flow} className="toolbarText">{row.label}: {row.text}</span>
                   ))}

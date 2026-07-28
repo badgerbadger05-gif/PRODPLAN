@@ -6,9 +6,11 @@ import {
   exportProductionOrdersReport,
   exportSupplierOrdersReport,
   fetchODataMetadata,
+  getNomenclatureGroupSelection,
   getODataConfig,
   listNomenclatureGroups,
   listWarehouses,
+  refreshNomenclatureGroups,
   runSyncAction,
   saveNomenclatureGroupSelection,
   saveODataConfig,
@@ -38,6 +40,10 @@ export function SyncPage() {
   const [selectedWarehouses, setSelectedWarehouses] = useState<Set<string>>(new Set())
   const [groups, setGroups] = useState<NomenclatureGroupItem[]>([])
   const [selectedGroups, setSelectedGroups] = useState<Set<string>>(new Set())
+  // Saving the selection overwrites config/odata_groups_selected.json wholesale,
+  // so the button stays locked until both the list and the stored selection
+  // have actually been read back from the backend.
+  const [groupsLoaded, setGroupsLoaded] = useState(false)
   const [running, setRunning] = useState<string>('')
   const [log, setLog] = useState<SyncLogEntry[]>([])
   const [progress, setProgress] = useState({ done: 0, total: 0, title: '' })
@@ -81,13 +87,28 @@ export function SyncPage() {
 
   async function loadGroups() {
     try {
-      const data = await listNomenclatureGroups()
-      const rows = data.items ?? data.rows ?? []
+      // The list and the persisted selection live on two different endpoints.
+      const [rows, selectedIds] = await Promise.all([
+        listNomenclatureGroups(),
+        getNomenclatureGroupSelection(),
+      ])
       setGroups(rows)
-      setSelectedGroups(new Set(data.selected_ids ?? []))
+      setSelectedGroups(new Set(selectedIds))
+      setGroupsLoaded(true)
     } catch (e) {
+      setGroupsLoaded(false)
       setError(e instanceof Error ? e.message : String(e))
     }
+  }
+
+  async function refreshGroups() {
+    try {
+      await runNamed('Обновить список групп из 1С', () => refreshNomenclatureGroups(config))
+    } catch {
+      // runNamed already logged the failure and filled the error line.
+      return
+    }
+    await loadGroups()
   }
 
   async function runNamed(title: string, runner: () => Promise<unknown>) {
@@ -269,15 +290,22 @@ export function SyncPage() {
               title="Группы номенклатуры"
               count={groups.length}
               selected={selectedGroups.size}
+              saveDisabled={!groupsLoaded || busy}
+              saveTitle={groupsLoaded ? undefined : 'Список групп и сохранённый выбор ещё не загружены'}
               onSelectAll={() => setSelectedGroups(new Set(groups.map((row) => row.id)))}
               onClear={() => setSelectedGroups(new Set())}
               onSave={() => void runNamed('Сохранить выбор групп', () => saveNomenclatureGroupSelection(Array.from(selectedGroups)))}
+              extraActions={(
+                <button onClick={() => void refreshGroups()} disabled={busy}>Обновить из 1С</button>
+              )}
             >
               {groups.length === 0 ? (
                 <div className="emptyDetail" style={{ padding: '8px 0' }}>
-                  {selectedGroups.size > 0
-                    ? `Список групп не загружен. Сохранено ${selectedGroups.size} позиций — запустите синхронизацию «Группы номенклатуры», чтобы обновить список.`
-                    : 'Список групп пуст — запустите синхронизацию «Группы номенклатуры».'}
+                  {!groupsLoaded
+                    ? 'Список групп не загружен — проверьте подключение к backend.'
+                    : selectedGroups.size > 0
+                      ? `Кэш групп пуст, но сохранено ${selectedGroups.size} позиций. Нажмите «Обновить из 1С», чтобы получить список.`
+                      : 'Кэш групп пуст — нажмите «Обновить из 1С».'}
                 </div>
               ) : groups.map((g) => (
                 <label className="selectionRow" key={g.id}>
@@ -315,13 +343,16 @@ export function SyncPage() {
   )
 }
 
-function SelectionPanel({ title, count, selected, onSelectAll, onClear, onSave, children }: {
+function SelectionPanel({ title, count, selected, onSelectAll, onClear, onSave, saveDisabled, saveTitle, extraActions, children }: {
   title: string
   count: number
   selected: number
   onSelectAll: () => void
   onClear: () => void
   onSave: () => void
+  saveDisabled?: boolean
+  saveTitle?: string
+  extraActions?: ReactNode
   children: ReactNode
 }) {
   return (
@@ -331,7 +362,8 @@ function SelectionPanel({ title, count, selected, onSelectAll, onClear, onSave, 
       <div className="syncActionsRow">
         <button onClick={onSelectAll}>Все</button>
         <button onClick={onClear}>Снять</button>
-        <button className="primary" onClick={onSave}>Сохранить</button>
+        <button className="primary" onClick={onSave} disabled={saveDisabled} title={saveTitle}>Сохранить</button>
+        {extraActions}
       </div>
       <div className="selectionList">{children || <div className="emptyDetail">Список пуст</div>}</div>
     </div>

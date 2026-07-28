@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import type { MrpCapacityRow, MrpProductionRow, MrpPurchaseRow, MrpReworkRow, MrpSummary } from '../../domain/planning'
-import { planningStatusLabel } from '../../domain/planning'
+import { isPlanningTruthUsable, planningStatusLabel, planningTruthStatusLabel } from '../../domain/planning'
 import { downloadBase64File } from '../../lib/download'
 import { dateRu, dateTimeRu, qty } from '../../lib/format'
 import {
@@ -82,6 +82,11 @@ export function MrpResultPage() {
   const [purchaseTotal, setPurchaseTotal] = useState(0)
   const [reworkTotal, setReworkTotal] = useState(0)
   const [capacityTotal, setCapacityTotal] = useState(0)
+  // Backend-computed sums over the whole filtered selection; `null` while the
+  // tab has not been read yet. Never recomputed from the visible page.
+  const [productionTotalQty, setProductionTotalQty] = useState<number | null>(null)
+  const [purchaseTotalQty, setPurchaseTotalQty] = useState<number | null>(null)
+  const [reworkTotalQty, setReworkTotalQty] = useState<number | null>(null)
   const [dateFrom, setDateFrom] = useState('')
   const [dateTo, setDateTo] = useState('')
   const [draftDateFrom, setDraftDateFrom] = useState('')
@@ -129,19 +134,30 @@ export function MrpResultPage() {
       return true
     })
   ), [purchaseCategoryFilter, purchaseRows, purchaseSupplierFilter])
+  // The supplier/category selects filter the already loaded page in the
+  // browser, so the "shown" counters must follow the filtered list while
+  // pagination keeps following the raw server page.
+  const purchaseFilterActive = tab === 'purchases' && Boolean(purchaseSupplierFilter || purchaseCategoryFilter)
   const activeOffset = offsets[tab]
   const activeTotal = tab === 'production' ? productionTotal : tab === 'purchases' ? purchaseTotal : tab === 'rework' ? reworkTotal : capacityTotal
-  const activeRowsLength = tab === 'production' ? productionRows.length : tab === 'purchases' ? purchaseRows.length : tab === 'rework' ? reworkRows.length : capacityRows.length
-  const activeVisibleFrom = activeTotal && activeRowsLength ? activeOffset + 1 : 0
-  const activeVisibleTo = activeTotal && activeRowsLength ? Math.min(activeOffset + activeRowsLength, activeTotal) : 0
+  const pageRowsLength = tab === 'production' ? productionRows.length : tab === 'purchases' ? purchaseRows.length : tab === 'rework' ? reworkRows.length : capacityRows.length
+  const visibleRowsLength = tab === 'purchases' ? filteredPurchaseRows.length : pageRowsLength
+  const statusTotal = purchaseFilterActive ? pageRowsLength : activeTotal
+  const activeVisibleFrom = visibleRowsLength ? (purchaseFilterActive ? 1 : activeOffset + 1) : 0
+  const activeVisibleTo = visibleRowsLength
+    ? (purchaseFilterActive ? visibleRowsLength : Math.min(activeOffset + visibleRowsLength, activeTotal))
+    : 0
   const selectedCount = tab === 'purchases' ? selectedPurchaseIds.size : 0
 
-  const totals = useMemo(() => ({
-    productionQty: productionRows.reduce((sum, row) => sum + Number(row.qty || 0), 0),
-    purchaseQty: purchaseRows.reduce((sum, row) => sum + Number(row.qty || 0), 0),
-    reworkQty: reworkRows.reduce((sum, row) => sum + Number(row.qty || 0), 0),
-    overloadHours: capacityRows.reduce((sum, row) => sum + Number(row.overload_hours || 0), 0),
-  }), [productionRows, purchaseRows, reworkRows, capacityRows])
+  // Ready totals from the persisted read model: the paged endpoints answer with
+  // `total_qty` over the whole filtered selection, and the manifest carries the
+  // unfiltered per-kind sums plus the capacity overload total.
+  const totals = {
+    productionQty: productionTotalQty ?? summary?.snapshot_total_qty?.production ?? null,
+    purchaseQty: purchaseTotalQty ?? summary?.snapshot_total_qty?.purchase ?? null,
+    reworkQty: reworkTotalQty ?? summary?.snapshot_total_qty?.rework ?? null,
+    overloadHours: summary?.capacity?.overload_total ?? null,
+  }
 
   useEffect(() => {
     if (queryTab) setTab(queryTab)
@@ -167,16 +183,19 @@ export function MrpResultPage() {
         if (seq !== loadSeq.current) return
         setProductionRows(data.rows ?? [])
         setProductionTotal(data.total ?? 0)
+        setProductionTotalQty(data.total_qty ?? null)
       } else if (targetTab === 'purchases') {
         const data = await getPlanningResultPurchases(runId, params)
         if (seq !== loadSeq.current) return
         setPurchaseRows(data.rows ?? [])
         setPurchaseTotal(data.total ?? 0)
+        setPurchaseTotalQty(data.total_qty ?? null)
       } else if (targetTab === 'rework') {
         const data = await getPlanningResultRework(runId, params)
         if (seq !== loadSeq.current) return
         setReworkRows(data.rows ?? [])
         setReworkTotal(data.total ?? 0)
+        setReworkTotalQty(data.total_qty ?? null)
       } else {
         const data = await getPlanningResultCapacity(runId, params)
         if (seq !== loadSeq.current) return
@@ -204,6 +223,9 @@ export function MrpResultPage() {
     setPurchaseTotal(0)
     setReworkTotal(0)
     setCapacityTotal(0)
+    setProductionTotalQty(null)
+    setPurchaseTotalQty(null)
+    setReworkTotalQty(null)
     setSelectedPurchaseIds(new Set())
     setPurchaseSupplierFilter('')
     setPurchaseCategoryFilter('')
@@ -307,11 +329,20 @@ export function MrpResultPage() {
     setOffsets((prev) => ({ ...prev, [tab]: nextOffset }))
   }
 
+  // When the Ledger snapshot is not accepted the backend answers with empty
+  // rows and zero totals; rendering them as a normal table would show fake
+  // zeros instead of "no data".
+  const truthUsable = isPlanningTruthUsable(summary)
+
   return (
     <main className="workArea">
       <div className="topLine">
         <div className="breadcrumbs">MRP / Результат прогона #{runId}</div>
-        <div className="runBadge">{summary?.run?.status ? planningStatusLabel(summary.run.status) : 'Загрузка'}</div>
+        <div className="runBadge">
+          {!truthUsable
+            ? 'Данные недоступны'
+            : summary?.run?.status ? planningStatusLabel(summary.run.status) : 'Загрузка'}
+        </div>
       </div>
 
       <DocumentWindow
@@ -321,12 +352,12 @@ export function MrpResultPage() {
         footer={(
           <StatusBar
             loading={loading}
-            visibleFrom={activeVisibleFrom}
-            visibleTo={activeVisibleTo}
-            total={activeTotal}
+            visibleFrom={truthUsable ? activeVisibleFrom : 0}
+            visibleTo={truthUsable ? activeVisibleTo : 0}
+            total={truthUsable ? statusTotal : 0}
             selectedCount={selectedCount}
-            canPrev={activeOffset > 0}
-            canNext={activeOffset + activeRowsLength < activeTotal}
+            canPrev={truthUsable && activeOffset > 0}
+            canNext={truthUsable && activeOffset + pageRowsLength < activeTotal}
             onPrev={goPrev}
             onNext={goNext}
           />
@@ -335,8 +366,8 @@ export function MrpResultPage() {
         <div className="commandBar">
           <button onClick={() => navigate('/mrp-runs')}>К списку прогонов</button>
           <button onClick={() => { void loadSummary(); refreshActiveTab() }} disabled={loading}>Обновить</button>
-          {tab !== 'capacity' && <button onClick={() => void exportActive('xlsx')} disabled={loading || exporting}>XLSX</button>}
-          {tab === 'purchases' && <button className="primary" onClick={() => void exportSelectedPurchasesTo1C()} disabled={!selectedPurchaseIds.size || loading || exporting}>Выгрузить в 1С ({selectedPurchaseIds.size})</button>}
+          {tab !== 'capacity' && <button onClick={() => void exportActive('xlsx')} disabled={!truthUsable || loading || exporting}>XLSX</button>}
+          {tab === 'purchases' && <button className="primary" onClick={() => void exportSelectedPurchasesTo1C()} disabled={!truthUsable || !selectedPurchaseIds.size || loading || exporting}>Выгрузить в 1С ({selectedPurchaseIds.size})</button>}
           <div className="barSeparator" />
           <button onClick={() => setRootDialogOpen(true)}>Корневое изделие</button>
           <span className="toolbarText">{rootProductLabel(rootOptions, rootItemId)}</span>
@@ -355,41 +386,47 @@ export function MrpResultPage() {
         {error && <div className="errorLine">{error}</div>}
         {message && <div className="successLine">{message}</div>}
 
-        <div className="mrpSummaryStrip">
-          <Metric title="Старт" value={dateTimeRu(summary?.run?.started_at) || '—'} />
-          <Metric title="Горизонт" value={`${qty(summary?.run?.horizon_days)} дн.`} />
-          <Metric title="Производство" value={qty(summary?.counts?.production_orders ?? productionTotal)} hint={`${qty(totals.productionQty)} шт.`} />
-          <Metric title="Закупки" value={qty(summary?.counts?.purchase_requests ?? purchaseTotal)} hint={`${qty(totals.purchaseQty)} шт.`} />
-          <Metric title="Переработка" value={qty(summary?.counts?.rework_requests ?? reworkTotal)} hint={`${qty(totals.reworkQty)} шт.`} />
-          <Metric title="Перегрузы" value={qty(summary?.capacity?.overloaded_buckets)} hint={`${qty(totals.overloadHours)} н/ч`} />
-        </div>
+        {!truthUsable ? (
+          <TruthUnavailablePane summary={summary} />
+        ) : (
+          <>
+            <div className="mrpSummaryStrip">
+              <Metric title="Старт" value={dateTimeRu(summary?.run?.started_at) || '—'} />
+              <Metric title="Горизонт" value={`${qty(summary?.run?.horizon_days)} дн.`} />
+              <Metric title="Производство" value={qty(summary?.counts?.production_orders ?? productionTotal)} hint={hintQty(totals.productionQty, 'шт.')} />
+              <Metric title="Закупки" value={qty(summary?.counts?.purchase_requests ?? purchaseTotal)} hint={hintQty(totals.purchaseQty, 'шт.')} />
+              <Metric title="Переработка" value={qty(summary?.counts?.rework_requests ?? reworkTotal)} hint={hintQty(totals.reworkQty, 'шт.')} />
+              <Metric title="Перегрузы" value={qty(summary?.capacity?.overloaded_buckets)} hint={hintQty(totals.overloadHours, 'н/ч')} />
+            </div>
 
-        <div className="tabsBar">
-          <button className={tab === 'production' ? 'activeTab' : ''} onClick={() => setTab('production')}>Производство</button>
-          <button className={tab === 'purchases' ? 'activeTab' : ''} onClick={() => setTab('purchases')}>Закупки</button>
-          <button className={tab === 'rework' ? 'activeTab' : ''} onClick={() => setTab('rework')}>Переработка</button>
-          <button className={tab === 'capacity' ? 'activeTab' : ''} onClick={() => setTab('capacity')}>Мощности</button>
-        </div>
+            <div className="tabsBar">
+              <button className={tab === 'production' ? 'activeTab' : ''} onClick={() => setTab('production')}>Производство</button>
+              <button className={tab === 'purchases' ? 'activeTab' : ''} onClick={() => setTab('purchases')}>Закупки</button>
+              <button className={tab === 'rework' ? 'activeTab' : ''} onClick={() => setTab('rework')}>Переработка</button>
+              <button className={tab === 'capacity' ? 'activeTab' : ''} onClick={() => setTab('capacity')}>Мощности</button>
+            </div>
 
-        <div className="tablePane resultTablePane">
-          {tab === 'production' && <ProductionResultTable rows={productionRows} highlightedId={highlightedProductionId} />}
-          {tab === 'purchases' && (
-            <PurchaseResultTable
-              rows={filteredPurchaseRows}
-              selectedIds={selectedPurchaseIds}
-              highlightedId={highlightedPurchaseId}
-              supplierFilter={purchaseSupplierFilter}
-              categoryFilter={purchaseCategoryFilter}
-              supplierOptions={purchaseSupplierOptions}
-              categoryOptions={purchaseCategoryOptions}
-              onSupplierFilterChange={setPurchaseSupplierFilter}
-              onCategoryFilterChange={setPurchaseCategoryFilter}
-              onSelectedIdsChange={setSelectedPurchaseIds}
-            />
-          )}
-          {tab === 'rework' && <ReworkResultTable rows={reworkRows} highlightedId={highlightedReworkId} />}
-          {tab === 'capacity' && <CapacityResultTable rows={capacityRows} />}
-        </div>
+            <div className="tablePane resultTablePane">
+              {tab === 'production' && <ProductionResultTable rows={productionRows} highlightedId={highlightedProductionId} />}
+              {tab === 'purchases' && (
+                <PurchaseResultTable
+                  rows={filteredPurchaseRows}
+                  selectedIds={selectedPurchaseIds}
+                  highlightedId={highlightedPurchaseId}
+                  supplierFilter={purchaseSupplierFilter}
+                  categoryFilter={purchaseCategoryFilter}
+                  supplierOptions={purchaseSupplierOptions}
+                  categoryOptions={purchaseCategoryOptions}
+                  onSupplierFilterChange={setPurchaseSupplierFilter}
+                  onCategoryFilterChange={setPurchaseCategoryFilter}
+                  onSelectedIdsChange={setSelectedPurchaseIds}
+                />
+              )}
+              {tab === 'rework' && <ReworkResultTable rows={reworkRows} highlightedId={highlightedReworkId} />}
+              {tab === 'capacity' && <CapacityResultTable rows={capacityRows} />}
+            </div>
+          </>
+        )}
       </DocumentWindow>
       <RootProductFilterDialog
         open={rootDialogOpen}
@@ -399,6 +436,29 @@ export function MrpResultPage() {
         onClose={() => setRootDialogOpen(false)}
       />
     </main>
+  )
+}
+
+// A backend total that has not been read yet stays "—"; zero is never used in
+// place of an unknown value.
+function hintQty(value: number | null, unit: string) {
+  return value === null ? '—' : `${qty(value)} ${unit}`
+}
+
+function TruthUnavailablePane({ summary }: { summary: MrpSummary | null }) {
+  const reason = summary?.truth_reason || 'снимок результата MRP не опубликован'
+  return (
+    <div className="tablePane resultTablePane">
+      <div className="emptyDetail" style={{ padding: 24, display: 'grid', gap: 8, justifyItems: 'start' }}>
+        <strong>Данные недоступны: {reason}</strong>
+        <span>
+          {`Состояние Ledger: ${planningTruthStatusLabel(summary?.truth_status)}`}
+          {` · поколение: ${summary?.ledger_generation ?? '—'}`}
+          {` · срез: ${dateTimeRu(summary?.cutoff) || '—'}`}
+        </span>
+        <span>Итоги и строки не показываются, пока снимок не принят.</span>
+      </div>
+    </div>
   )
 }
 

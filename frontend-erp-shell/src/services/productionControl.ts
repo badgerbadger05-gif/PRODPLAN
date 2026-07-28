@@ -13,7 +13,7 @@ import type {
   TransferIssueRow,
   ProductionFilters,
 } from '../domain/productionControl'
-import { api } from '../lib/api'
+import { api, apiText } from '../lib/api'
 import { listResources } from './resources'
 
 export function listProductionOrders(params: {
@@ -152,8 +152,10 @@ export function saveProductionSettings(payload: {
   })
 }
 
+// The backend answers with `HTMLResponse`, so the raw document text is read
+// through `apiText` — `api()` would try to parse it as JSON and always fail.
 export function printRouteSheets(productIds: number[], options: { markPrinted?: boolean; autoPrint?: boolean } = {}) {
-  return api<string>('/v1/production-control/route-sheets/print', {
+  return apiText('/v1/production-control/route-sheets/print', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({

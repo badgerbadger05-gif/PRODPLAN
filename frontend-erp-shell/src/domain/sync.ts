@@ -37,10 +37,43 @@ export type WarehouseItem = {
   is_selected: boolean
 }
 
+// GET /v1/odata/groups replays the cached 1C payload verbatim:
+// `{"value": [{Ref_Key, Code, Description, IsFolder}]}` (backend
+// routers/odata.py::get_saved_groups). The selection lives on a separate
+// endpoint, GET /v1/odata/groups/selection → `{"ids": [...]}`.
+export type NomenclatureGroupODataRow = {
+  Ref_Key: string
+  Code?: string | null
+  Description?: string | null
+  IsFolder?: boolean | null
+}
+
+export type NomenclatureGroupsResponse = {
+  value?: NomenclatureGroupODataRow[] | null
+}
+
+export type NomenclatureGroupsSelectionResponse = {
+  ids?: string[] | null
+}
+
 export type NomenclatureGroupItem = {
   id: string
   code: string
   name: string
+}
+
+// Single typed adapter for the raw 1C rows. Only folders are selectable; the
+// cache is written with `IsFolder eq true`, so a missing flag is tolerated and
+// only an explicit `false` is dropped.
+export function toNomenclatureGroupItems(response: NomenclatureGroupsResponse): NomenclatureGroupItem[] {
+  return (response.value ?? [])
+    .filter((row) => row.IsFolder !== false)
+    .map((row) => ({
+      id: String(row.Ref_Key ?? '').trim(),
+      code: String(row.Code ?? '').trim(),
+      name: String(row.Description ?? '').trim(),
+    }))
+    .filter((row) => row.id !== '')
 }
 
 export type SyncLogEntry = {

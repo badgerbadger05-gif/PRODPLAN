@@ -12,7 +12,7 @@ import {
   type WorkshopWarehouse,
 } from '../../domain/productionControl'
 import type { ProductionResource } from '../../domain/resources'
-import { api } from '../../lib/api'
+import { updateItemOptimalBatch } from '../../services/items'
 import { getPeriodPlanMatrix, listPeriodPlans } from '../../services/periodPlan'
 import {
   cancelLocalProductionOrder,
@@ -477,24 +477,8 @@ export function ProductionControlPage() {
   }
 
   async function saveOptimalBatch(itemId: number, value: number | null) {
-    const item = await api<Record<string, unknown>>(`/v1/items/${itemId}`)
-    await api(`/v1/items/${itemId}`, {
-      method: 'PUT',
-      body: JSON.stringify({
-        item_code: String(item.item_code ?? ''),
-        item_name: String(item.item_name ?? ''),
-        item_article: item.item_article ?? null,
-        item_ref1c: item.item_ref1c ?? null,
-        supplier_ref1c: item.supplier_ref1c ?? null,
-        replenishment_time: item.replenishment_time ?? null,
-        unit: item.unit ?? null,
-        category_id: item.category_id ?? null,
-        stock_qty: Number(item.stock_qty ?? 0),
-        optimal_batch: value,
-        status: String(item.status ?? 'active'),
-      }),
-    })
-    setRows((list) => list.map((row) => row.item_id === itemId ? { ...row, optimal_batch: value } : row))
+    const saved = await updateItemOptimalBatch(itemId, value)
+    setRows((list) => list.map((row) => row.item_id === itemId ? { ...row, optimal_batch: saved.optimal_batch ?? null } : row))
   }
 
   async function saveOrderQuantity(productId: number, value: number) {
