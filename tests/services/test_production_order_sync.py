@@ -6,6 +6,8 @@ from app.models import (
     ProductionOrderLineState,
     ProductionProduct,
     ProductionResource,
+    ProductionStage,
+    Specification,
     WorkshopWarehouseBinding,
 )
 from app.schemas import ODataSyncRequest
@@ -288,6 +290,208 @@ def test_production_destination_falls_back_to_existing_workshop_binding(db_sessi
     )
 
     assert (destination, source) == ("production-ref", "binding")
+
+
+def _spec_stage_fixture(db):
+    """Item + Specification + ProductionStage all carrying 1C refs."""
+    item = Item(
+        item_code="SPEC-SYNC-ITEM",
+        item_name="Spec Sync Item",
+        item_article="SPEC-SYNC-ITEM",
+        item_ref1c="item-ref-spec",
+        stock_qty=0,
+        status="active",
+    )
+    spec = Specification(
+        spec_code="SP-1",
+        spec_name="Spec 1",
+        spec_ref1c="spec-ref-1",
+    )
+    stage = ProductionStage(stage_name="Сварка", stage_ref1c="stage-ref-1")
+    db.add_all([item, spec, stage])
+    db.flush()
+    return item, spec, stage
+
+
+def _spec_stage_client(product_row, *, reject_extended=False, calls=None):
+    class FakeODataClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def get_all(self, entity_name, filter_query=None, select_fields=None, **_kwargs):
+            if entity_name == "Document_ЗаказНаПроизводство":
+                return [
+                    {
+                        "Ref_Key": "order-ref-spec",
+                        "Number": "3001",
+                        "Date": "2026-06-15T00:00:00",
+                        "Posted": True,
+                        "DeletionMark": False,
+                        "СостояниеЗаказа_Key": DONE_STATE_KEY,
+                    }
+                ]
+            if entity_name == "Document_ЗаказНаПроизводство_Продукция":
+                if calls is not None:
+                    calls.append(list(select_fields or []))
+                if reject_extended and "Спецификация_Key" in (select_fields or []):
+                    raise RuntimeError("Bad request: path segment is not found")
+                return [dict(product_row)]
+            if entity_name == "Document_СборкаЗапасов":
+                return []
+            raise AssertionError(f"Unexpected OData entity: {entity_name}")
+
+    return FakeODataClient
+
+
+def test_production_order_sync_resolves_spec_and_stage_refs(db_session, monkeypatch):
+    db = db_session
+    _item, spec, stage = _spec_stage_fixture(db)
+    db.commit()
+
+    calls = []
+    monkeypatch.setattr(
+        "app.services.odata_client.OData1CClient",
+        _spec_stage_client(
+            {
+                "Ref_Key": "order-ref-spec",
+                "LineNumber": 1,
+                "Номенклатура_Key": "item-ref-spec",
+                "Количество": 3.0,
+                "Спецификация_Key": "spec-ref-1",
+                "Этап_Key": "stage-ref-1",
+            },
+            calls=calls,
+        ),
+    )
+
+    sync_production_orders_from_odata(
+        db,
+        ODataSyncRequest(
+            base_url="http://1c.example/odata",
+            entity_name="Document_ЗаказНаПроизводство",
+        ),
+    )
+
+    assert "Спецификация_Key" in calls[0]
+    assert "Этап_Key" in calls[0]
+    product = db.query(ProductionProduct).one()
+    assert product.spec_id == spec.spec_id
+    assert product.stage_id == stage.stage_id
+
+
+def test_production_order_sync_keeps_spec_and_stage_when_1c_omits_them(
+    db_session, monkeypatch
+):
+    """Regression: a sync without Спецификация_Key/Этап_Key used to NULL them."""
+    db = db_session
+    item, spec, stage = _spec_stage_fixture(db)
+    order = ProductionOrder(
+        order_number="3001",
+        order_date=datetime.datetime(2026, 6, 15),
+        order_ref1c="order-ref-spec",
+        is_posted=True,
+        deletion_mark=False,
+    )
+    db.add(order)
+    db.flush()
+    db.add(
+        ProductionProduct(
+            order_id=order.order_id,
+            item_id=item.item_id,
+            line_number=1,
+            quantity=3,
+            produced_qty=0,
+            remaining_qty=3,
+            spec_id=spec.spec_id,
+            stage_id=stage.stage_id,
+        )
+    )
+    db.commit()
+
+    monkeypatch.setattr(
+        "app.services.odata_client.OData1CClient",
+        _spec_stage_client(
+            {
+                "Ref_Key": "order-ref-spec",
+                "LineNumber": 1,
+                "Номенклатура_Key": "item-ref-spec",
+                "Количество": 4.0,
+            }
+        ),
+    )
+
+    sync_production_orders_from_odata(
+        db,
+        ODataSyncRequest(
+            base_url="http://1c.example/odata",
+            entity_name="Document_ЗаказНаПроизводство",
+        ),
+    )
+
+    product = db.query(ProductionProduct).one()
+    assert float(product.quantity) == 4.0
+    assert product.spec_id == spec.spec_id
+    assert product.stage_id == stage.stage_id
+
+
+def test_production_order_sync_falls_back_when_1c_rejects_spec_select(
+    db_session, monkeypatch
+):
+    db = db_session
+    item, spec, stage = _spec_stage_fixture(db)
+    order = ProductionOrder(
+        order_number="3001",
+        order_date=datetime.datetime(2026, 6, 15),
+        order_ref1c="order-ref-spec",
+        is_posted=True,
+        deletion_mark=False,
+    )
+    db.add(order)
+    db.flush()
+    db.add(
+        ProductionProduct(
+            order_id=order.order_id,
+            item_id=item.item_id,
+            line_number=1,
+            quantity=3,
+            produced_qty=0,
+            remaining_qty=3,
+            spec_id=spec.spec_id,
+            stage_id=stage.stage_id,
+        )
+    )
+    db.commit()
+
+    calls = []
+    monkeypatch.setattr(
+        "app.services.odata_client.OData1CClient",
+        _spec_stage_client(
+            {
+                "Ref_Key": "order-ref-spec",
+                "LineNumber": 1,
+                "Номенклатура_Key": "item-ref-spec",
+                "Количество": 3.0,
+            },
+            reject_extended=True,
+            calls=calls,
+        ),
+    )
+
+    stats = sync_production_orders_from_odata(
+        db,
+        ODataSyncRequest(
+            base_url="http://1c.example/odata",
+            entity_name="Document_ЗаказНаПроизводство",
+        ),
+    )
+
+    # Первая попытка с расширенным $select, вторая — на минимальном наборе.
+    assert "Спецификация_Key" in calls[0]
+    assert "Спецификация_Key" not in calls[1]
+    assert stats["products_failed"] == 0
+    product = db.query(ProductionProduct).one()
+    assert product.spec_id == spec.spec_id
+    assert product.stage_id == stage.stage_id
 
 
 def test_production_destination_line_precedes_header(db_session):

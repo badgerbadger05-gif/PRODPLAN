@@ -98,6 +98,15 @@ def _query_transfer_docs(client: OData1CClient, ref_keys: Iterable[str]) -> Dict
     return found
 
 
+def _has_posted_composition(doc: Optional[Dict[str, Any]]) -> bool:
+    """Вернул ли 1С табличную часть проведённого документа.
+
+    Без неё подтвердить, какие именно строки выданы, нечем: тогда состав
+    считается неизвестным, а не пустым.
+    """
+    return doc is not None and doc.get("Запасы") is not None
+
+
 def _posted_quantities_by_item_ref(doc: Optional[Dict[str, Any]]) -> Dict[str, float]:
     result: Dict[str, float] = {}
     for row in (doc or {}).get("Запасы") or []:
@@ -112,10 +121,18 @@ def _sync_issue_lines_from_posted_doc(
     db: Session,
     issue: ProductionMaterialIssue,
     doc: Optional[Dict[str, Any]],
-) -> bool:
+) -> Tuple[bool, Optional[set[int]]]:
+    """
+    Приводит строки выдачи к составу проведённого документа 1С.
+
+    Возвращает (что-то изменилось, id подтверждённых компонентов). Второй
+    элемент равен None, если 1С не отдал табличную часть — тогда состав
+    документа неизвестен, и вызывающий код не вправе считать строки выданными
+    по подтверждённому списку.
+    """
+    if not _has_posted_composition(doc):
+        return (False, None)
     posted_by_ref = _posted_quantities_by_item_ref(doc)
-    if not posted_by_ref:
-        return False
 
     item_ids = [int(line.component_item_id) for line in issue.lines or [] if line.component_item_id]
     item_ref_by_id = {
@@ -130,11 +147,13 @@ def _sync_issue_lines_from_posted_doc(
 
     changed = False
     seen_refs: set[str] = set()
+    confirmed_item_ids: set[int] = set()
     for line in issue.lines or []:
         item_ref = item_ref_by_id.get(int(line.component_item_id))
         if not item_ref or item_ref not in posted_by_ref:
             continue
         seen_refs.add(item_ref)
+        confirmed_item_ids.add(int(line.component_item_id))
         posted_qty = posted_by_ref[item_ref]
         if abs(float(line.required_qty or 0.0) - posted_qty) > 1e-6:
             line.required_qty = posted_qty
@@ -162,8 +181,9 @@ def _sync_issue_lines_from_posted_doc(
                 line_status="issued",
             )
         )
+        confirmed_item_ids.add(int(item.item_id))
         changed = True
-    return changed
+    return (changed, confirmed_item_ids)
 
 
 def _apply_deleted(db: Session, link: SyncLink) -> Tuple[bool, Optional[str]]:
@@ -228,10 +248,18 @@ def _apply_posted(
         issue.export_error = None
         changed = True
 
-    if _sync_issue_lines_from_posted_doc(db, issue, doc):
+    lines_changed, confirmed_item_ids = _sync_issue_lines_from_posted_doc(db, issue, doc)
+    if lines_changed:
         changed = True
 
     for line in issue.lines or []:
+        if (
+            confirmed_item_ids is not None
+            and int(line.component_item_id) not in confirmed_item_ids
+        ):
+            # Строки, которых нет в проведённом документе 1С, выданными не
+            # считаются: раньше их молча закрывали как issued.
+            continue
         required = float(line.required_qty or 0.0)
         if float(line.issued_qty or 0.0) != required:
             line.issued_qty = required

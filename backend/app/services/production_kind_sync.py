@@ -107,7 +107,11 @@ def sync_production_kinds_from_odata(db: Session, req: ODataSyncRequest) -> dict
                 name = (row.get("Description") or row.get("Наименование") or row.get("Представление") or "").strip()
                 if not name:
                     # как крайний случай — пробуем более распространённые варианты
-                    name = (row.get("Name") or row.get("Наим") or row.get("Desc") or "").strip() or ref
+                    name = (row.get("Name") or row.get("Наим") or row.get("Desc") or "").strip()
+                # На фолбэк-пути ($select=Ref_Key / без $select) 1С не отдаёт
+                # наименование. GUID годится как имя только для НОВОЙ записи и
+                # никогда — как замена уже известному локальному имени.
+                fallback_name = name or ref
 
                 ex = existing_by_ref.get(ref)
                 if not ex and name:
@@ -117,8 +121,9 @@ def sync_production_kinds_from_odata(db: Session, req: ODataSyncRequest) -> dict
                 if ex:
                     need_update = False
                     # Обновим имя (на всякий случай) и зафиксируем ref_1c
-                    if name and (ex.name or "") != name:
-                        ex.name = name
+                    new_name = name or (ex.name or "").strip() or fallback_name
+                    if (ex.name or "") != new_name:
+                        ex.name = new_name
                         need_update = True
                     if (not ex.ref_1c) or (ex.ref_1c != ref):
                         ex.ref_1c = ref
@@ -136,14 +141,13 @@ def sync_production_kinds_from_odata(db: Session, req: ODataSyncRequest) -> dict
                 else:
                     # Вставка новой записи
                     new_kind = ProductionKind(
-                        name=name,
+                        name=fallback_name,
                         ref_1c=ref,
                     )
                     db.add(new_kind)
                     created += 1
                     existing_by_ref[ref] = new_kind
-                    if name:
-                        existing_by_name[name] = new_kind
+                    existing_by_name[fallback_name] = new_kind
             except Exception:
                 # Не валим всю синхронизацию из‑за единичной записи
                 continue

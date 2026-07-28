@@ -213,11 +213,22 @@ def _save_state(state: Dict[str, Any], *, required: bool = False) -> None:
             os.fsync(stream.fileno())
         os.replace(temp_path, STATE_PATH)
         temp_path = None
-        dir_fd = os.open(STATE_PATH.parent, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+        # os.replace() already swapped the file atomically; the directory fsync
+        # below is only a durability barrier. Windows cannot open a directory
+        # handle (PermissionError), so the barrier is skipped there instead of
+        # failing an otherwise successful state write.
+        if os.name != "nt":
+            try:
+                dir_fd = os.open(STATE_PATH.parent, os.O_RDONLY)
+            except OSError:
+                dir_fd = None
+            if dir_fd is not None:
+                try:
+                    os.fsync(dir_fd)
+                except OSError:
+                    pass
+                finally:
+                    os.close(dir_fd)
     except Exception:
         if temp_path is not None:
             try:

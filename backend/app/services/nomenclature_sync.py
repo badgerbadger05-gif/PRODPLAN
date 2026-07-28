@@ -10,6 +10,16 @@ from ..models import Item, ItemCategory, Supplier
 from ..schemas import ODataSyncRequest
 
 
+def _is_folder(record: Dict) -> bool:
+    """Признак группы каталога 1С (IsFolder). Группы не являются номенклатурой."""
+    value = record.get('IsFolder')
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value == 1
+    return str(value or '').strip().lower() in {'true', '1', 'yes', 'да', 'истина'}
+
+
 @dataclass
 class NomenclatureSyncStats:
     """Статистика синхронизации номенклатуры"""
@@ -108,6 +118,12 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                 try:
                     ref_key = (record.get('Ref_Key') or '').strip()
                     if not ref_key:
+                        continue
+
+                    # Группы каталога (IsFolder == true) не являются позициями
+                    # номенклатуры — фильтруем их на клиенте, т.к. $filter по
+                    # этому полю 1С принимает не всегда.
+                    if _is_folder(record):
                         continue
 
                     # Прогресс
@@ -290,6 +306,8 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                     order_by="Ref_Key",
                 ):
                     for record in page:
+                        if _is_folder(record):
+                            continue
                         code = (record.get('Code') or '').strip()
                         if not code or code in seen_codes:
                             continue
@@ -357,18 +375,11 @@ def sync_nomenclature_from_odata(db: Session, req: ODataSyncRequest) -> dict:
         if req.dry_run:
             db.rollback()
         else:
-            try:
-                db.commit()
-            except Exception as e:
-                db.rollback()
-                # Если это ошибка дубликата ключа, попробуем обработать её
-                if "duplicate key value violates unique constraint" in str(e):
-                    print(f"Обнаружен конфликт уникальности при сохранении. Повторная попытка...")
-                    # В случае ошибки дубликата, откатываемся и не бросаем исключение дальше
-                    # Данные уже обработаны в памяти, просто не сохранились из-за конфликта
-                    pass
-                else:
-                    raise e
+            # Никакого «мягкого» глотания ошибок коммита: rollback уже отменил
+            # все накопленные изменения, и вернуть stats с ненулевыми счётчиками
+            # значило бы соврать вызывающему (оркестратор пишет last_status="ok").
+            # Ошибку пробрасываем — её обработает внешний except ниже.
+            db.commit()
 
     except Exception as e:
         db.rollback()

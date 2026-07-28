@@ -239,6 +239,7 @@ def test_physical_refresh_runs_with_strict_snapshot_and_stores_state(tmp_state, 
             self.cutoff = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
             self.candidate_run_ids = (100, 101)
             self.published = True
+            self.opening_reconcile = None
 
     def _mock_balance(*args, **kwargs):
         got_filter.append(str(kwargs["filter_query"]))

@@ -382,6 +382,81 @@ def test_repeat_run_adds_component_line_added_in_1c(db_session, monkeypatch):
     assert added[0].line_status == "issued"
 
 
+def test_only_lines_present_in_posted_doc_are_marked_issued(db_session, monkeypatch):
+    """Regression: lines missing from the posted 1C document stayed unissued."""
+    db = db_session
+    issue, _link = _mk_issue_with_link(db, target_ref_key="ref-partial")
+    confirmed_item_id = int(issue.lines[0].component_item_id)
+
+    extra_item = Item(
+        item_code="IT-not-in-1c",
+        item_name="Not in the posted document",
+        item_article="ART-not-in-1c",
+        item_ref1c="item-ref-not-in-1c",
+        unit="шт",
+        stock_qty=0,
+        status="active",
+    )
+    db.add(extra_item)
+    db.flush()
+    db.add(
+        ProductionMaterialIssueLine(
+            issue_id=int(issue.issue_id),
+            component_item_id=int(extra_item.item_id),
+            required_qty=5.0,
+            issued_qty=0.0,
+            line_status="planned",
+        )
+    )
+    db.commit()
+
+    _stub_config(monkeypatch)
+    monkeypatch.setattr(
+        posted_sync, "OData1CClient", lambda **_: _FakeOData({"ref-partial"})
+    )
+
+    result = posted_sync.sync_posted_transfers(db)
+    assert result["advanced"] == 1
+
+    lines = {
+        int(line.component_item_id): line
+        for line in db.query(ProductionMaterialIssueLine)
+        .filter_by(issue_id=issue.issue_id)
+        .all()
+    }
+    assert lines[confirmed_item_id].line_status == "issued"
+    assert float(lines[confirmed_item_id].issued_qty) == pytest.approx(1.0)
+
+    untouched = lines[int(extra_item.item_id)]
+    assert untouched.line_status == "planned"
+    assert float(untouched.issued_qty) == pytest.approx(0.0)
+
+
+def test_falls_back_to_required_qty_when_1c_omits_document_rows(db_session, monkeypatch):
+    """No table part in the 1C answer = composition unknown, legacy behaviour."""
+    db = db_session
+    issue, _link = _mk_issue_with_link(db, target_ref_key="ref-no-rows")
+
+    class _NoRowsOData(_FakeOData):
+        def get_all(self, entity, filter_query=None, select_fields=None, **kwargs):
+            rows = super().get_all(entity, filter_query, select_fields, **kwargs)
+            for row in rows:
+                row.pop("Запасы", None)
+            return rows
+
+    _stub_config(monkeypatch)
+    monkeypatch.setattr(
+        posted_sync, "OData1CClient", lambda **_: _NoRowsOData({"ref-no-rows"})
+    )
+
+    result = posted_sync.sync_posted_transfers(db)
+    assert result["advanced"] == 1
+
+    line = db.query(ProductionMaterialIssueLine).filter_by(issue_id=issue.issue_id).one()
+    assert line.line_status == "issued"
+    assert float(line.issued_qty) == pytest.approx(float(line.required_qty))
+
+
 def test_does_not_regress_state_past_assembled(db_session, monkeypatch):
     """If the line is already 'produced' / 'produced_partial', the posted
     transfer must not roll it back to 'assembled'."""

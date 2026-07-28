@@ -13,6 +13,8 @@ from ..models import (
     ProductionOrder,
     ProductionOrderLineState,
     ProductionProduct,
+    ProductionStage,
+    Specification,
     WorkshopWarehouseBinding,
 )
 from ..schemas import ODataSyncRequest
@@ -115,6 +117,36 @@ def _nonzero_guid(val) -> Optional[str]:
     if not normalized or normalized == "00000000-0000-0000-0000-000000000000":
         return None
     return normalized
+
+
+def _resolve_local_ref_id(
+    db: Session,
+    id_column,
+    ref_column,
+    raw_key,
+    cache: Dict[str, Optional[int]],
+) -> Optional[int]:
+    """
+    Ref_Key из 1С -> локальный id справочника.
+
+    Возвращает None, если ссылка пустая/нулевая или соответствующей записи в
+    локальной базе нет. Вызывающий код обязан трактовать None как «неизвестно»,
+    а не как «очистить значение».
+    """
+    normalized = _nonzero_guid(raw_key)
+    if not normalized:
+        return None
+    if normalized in cache:
+        return cache[normalized]
+    row = (
+        db.query(id_column)
+        .filter(ref_column.isnot(None))
+        .filter(ref_column.in_([normalized, str(raw_key or "").strip()]))
+        .first()
+    )
+    resolved = int(row[0]) if row else None
+    cache[normalized] = resolved
+    return resolved
 
 
 def _resolve_product_destination(
@@ -306,6 +338,8 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
         unchanged_count = 0
         products_created = 0
         products_updated = 0
+        spec_id_cache: Dict[str, Optional[int]] = {}
+        stage_id_cache: Dict[str, Optional[int]] = {}
         # --- 2) Строки продукции (отдельный EntitySet) ---
         # ВАЖНО: строки нужны нормализованные по LineNumber, т.к. item_id может повторяться в разных строках.
         products_entity = "Document_ЗаказНаПроизводство_Продукция"
@@ -319,6 +353,14 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
             "Количество",
             "СтруктурнаяЕдиница_Key",
         ]
+        # Спецификация/этап есть не в каждой конфигурации: пробуем расширенный
+        # $select один раз и, если 1С его не принимает, навсегда откатываемся
+        # на минимальный набор полей (см. фолбэк в цикле ниже).
+        products_select_extended = products_select + [
+            "Спецификация_Key",
+            "Этап_Key",
+        ]
+        use_extended_products_select = True
         order_keys: List[str] = []
         for r in order_data:
             rk = str((r.get("Ref_Key") or "")).strip()
@@ -338,14 +380,33 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
                 batch_keys = order_keys[i:i + BATCH_SIZE]
                 or_filter = " or ".join([f"Ref_Key eq guid'{k}'" for k in batch_keys])
                 try:
-                    rows = client.get_all(
-                        products_entity,
-                        filter_query=f"({or_filter})",
-                        select_fields=products_select,
-                        top=1000,
-                        max_pages=1000,
-                        order_by="LineNumber",
-                    )
+                    try:
+                        rows = client.get_all(
+                            products_entity,
+                            filter_query=f"({or_filter})",
+                            select_fields=(
+                                products_select_extended
+                                if use_extended_products_select
+                                else products_select
+                            ),
+                            top=1000,
+                            max_pages=1000,
+                            order_by="LineNumber",
+                        )
+                    except Exception:
+                        if not use_extended_products_select:
+                            raise
+                        # Конфигурация без Спецификация_Key/Этап_Key: 1С отвечает
+                        # 400 на такой $select. Дальше идём без этих полей.
+                        use_extended_products_select = False
+                        rows = client.get_all(
+                            products_entity,
+                            filter_query=f"({or_filter})",
+                            select_fields=products_select,
+                            top=1000,
+                            max_pages=1000,
+                            order_by="LineNumber",
+                        )
                     for pr in rows:
                         rk = str((pr.get("Ref_Key") or "")).strip()
                         if rk:
@@ -441,10 +502,25 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
                         if not item_key:
                             continue
 
-                        # Находим связанные объекты
+                        # Находим связанные объекты.
+                        # spec_id/stage_id разрешаем по Ref_Key из 1С; None здесь
+                        # означает «1С не дал ссылку либо она неизвестна локально»,
+                        # и в этом случае существующая привязка сохраняется.
                         item = existing_items.get(item_key)
-                        spec = None
-                        stage = None
+                        spec_id = _resolve_local_ref_id(
+                            db,
+                            Specification.spec_id,
+                            Specification.spec_ref1c,
+                            spec_key,
+                            spec_id_cache,
+                        )
+                        stage_id = _resolve_local_ref_id(
+                            db,
+                            ProductionStage.stage_id,
+                            ProductionStage.stage_ref1c,
+                            stage_key,
+                            stage_id_cache,
+                        )
 
                         if not item:
                             continue
@@ -468,15 +544,23 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
                         )
 
                         if existing_product:
+                            # Нечего подставить — оставляем как есть, иначе каждая
+                            # синхронизация обнуляла бы привязку спецификации/этапа.
+                            target_spec_id = (
+                                spec_id if spec_id is not None else existing_product.spec_id
+                            )
+                            target_stage_id = (
+                                stage_id if stage_id is not None else existing_product.stage_id
+                            )
                             if (existing_product.quantity != quantity or
-                                existing_product.spec_id != (spec.spec_id if spec else None) or
-                                existing_product.stage_id != (stage.stage_id if stage else None) or
+                                existing_product.spec_id != target_spec_id or
+                                existing_product.stage_id != target_stage_id or
                                 getattr(existing_product, "line_number", None) != line_number or
                                 getattr(existing_product, "characteristic_ref1c", None) != characteristic_key or
                                 existing_product.destination_warehouse_ref1c != destination_ref):
                                 existing_product.quantity = quantity
-                                existing_product.spec_id = spec.spec_id if spec else None
-                                existing_product.stage_id = stage.stage_id if stage else None
+                                existing_product.spec_id = target_spec_id
+                                existing_product.stage_id = target_stage_id
                                 existing_product.line_number = line_number
                                 existing_product.characteristic_ref1c = characteristic_key
                                 existing_product.destination_warehouse_ref1c = destination_ref
@@ -493,8 +577,8 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
                                 quantity=quantity,
                                 produced_qty=0.0,
                                 remaining_qty=quantity,
-                                spec_id=spec.spec_id if spec else None,
-                                stage_id=stage.stage_id if stage else None
+                                spec_id=spec_id,
+                                stage_id=stage_id,
                             )
                             db.add(new_product)
                             products_created += 1

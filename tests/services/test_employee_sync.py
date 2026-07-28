@@ -142,6 +142,51 @@ def test_sync_employees_updates_existing_row(db_session, monkeypatch):
     assert employee.data_version == "new"
 
 
+def test_sync_employees_keeps_local_name_when_1c_omits_description(
+    db_session, monkeypatch
+):
+    """Regression: a Description-less answer used to rename the row to its GUID."""
+    db_session.add(
+        Employee(
+            employee_ref1c="11111111-1111-1111-1111-111111111111",
+            employee_code="0001",
+            employee_name="Иванов Иван",
+            deletion_mark=False,
+            data_version="old",
+        )
+    )
+    db_session.commit()
+
+    _FakeODataClient.count = 1
+    _FakeODataClient.pages = [
+        [
+            {
+                "Ref_Key": "11111111-1111-1111-1111-111111111111",
+                "DataVersion": "new",
+            }
+        ]
+    ]
+    monkeypatch.setattr(employee_sync, "OData1CClient", _FakeODataClient)
+
+    sync_employees_from_odata(db_session, _request())
+
+    employee = db_session.query(Employee).one()
+    assert employee.employee_name == "Иванов Иван"
+
+
+def test_sync_employees_uses_ref_as_name_only_for_new_rows(db_session, monkeypatch):
+    _FakeODataClient.count = 1
+    _FakeODataClient.pages = [
+        [{"Ref_Key": "22222222-2222-2222-2222-222222222222"}]
+    ]
+    monkeypatch.setattr(employee_sync, "OData1CClient", _FakeODataClient)
+
+    sync_employees_from_odata(db_session, _request())
+
+    employee = db_session.query(Employee).one()
+    assert employee.employee_name == "22222222-2222-2222-2222-222222222222"
+
+
 def test_sync_employees_dry_run_rolls_back(db_session, monkeypatch):
     _FakeODataClient.count = 1
     _FakeODataClient.pages = [

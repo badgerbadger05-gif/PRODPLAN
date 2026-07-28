@@ -98,13 +98,15 @@ def sync_employees_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                     progress.update("employees", processed=processed, message=msg)
 
                 code = _s(row.get("Code")) or None
-                name = (
+                source_name = (
                     _s(row.get("Description"))
                     or _s(row.get("Наименование"))
                     or _s(row.get("Name"))
-                    or code
-                    or ref_key
                 )
+                # code/ref_key — заглушка на случай, когда 1С не отдал имя
+                # (например, урезанный $select). Ими допустимо назвать только
+                # новую запись, но не затирать уже известное локальное имя.
+                fallback_name = source_name or code or ref_key
                 deletion_mark = _bool(row.get("DeletionMark"))
                 data_version = _s(row.get("DataVersion")) or None
 
@@ -117,8 +119,13 @@ def sync_employees_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                     if getattr(existing, "employee_type", None) != employee_type:
                         existing.employee_type = employee_type
                         need_update = True
-                    if existing.employee_name != name:
-                        existing.employee_name = name
+                    new_name = (
+                        source_name
+                        or _s(existing.employee_name)
+                        or fallback_name
+                    )
+                    if existing.employee_name != new_name:
+                        existing.employee_name = new_name
                         need_update = True
                     if bool(existing.deletion_mark) != deletion_mark:
                         existing.deletion_mark = deletion_mark
@@ -136,7 +143,7 @@ def sync_employees_from_odata(db: Session, req: ODataSyncRequest) -> dict:
                         employee_ref1c=ref_key,
                         employee_type=employee_type,
                         employee_code=code,
-                        employee_name=name,
+                        employee_name=fallback_name,
                         deletion_mark=deletion_mark,
                         data_version=data_version,
                     )
