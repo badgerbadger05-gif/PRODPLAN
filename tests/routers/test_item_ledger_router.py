@@ -56,6 +56,7 @@ def db_session():
             "physical_ledger": True,
             "reservation_replay": True,
             "execution_allocations": True,
+            "future_supply": True,
         },
         physical_import_batch=imported,
         algorithm_version="tests/1",
@@ -365,3 +366,21 @@ def test_events_cross_item_404(client, seeded):
 def test_events_unknown_reservation_404(client, seeded):
     r = client.get(f"/api/v1/item-ledger/{seeded['a']}/reservations/999999/events")
     assert r.status_code == 404
+
+
+def test_position_is_unavailable_when_the_generation_has_no_future_supply(
+    client, db_session, seeded
+):
+    """CANON rule 7: an unanswerable "incoming" is unavailable, never zero."""
+    generation = db_session.query(models.LedgerGeneration).one()
+    generation.capabilities = {
+        name: enabled
+        for name, enabled in dict(generation.capabilities or {}).items()
+        if name != "future_supply"
+    }
+    db_session.commit()
+
+    r = client.get(f"/api/v1/item-ledger/{seeded['a']}/position")
+
+    assert r.status_code == 409
+    assert "future_supply" in r.json()["detail"]["reason"]

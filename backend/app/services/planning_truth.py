@@ -12,7 +12,7 @@ import os
 from typing import Any, Mapping
 
 from sqlalchemy.orm import Session
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from app import models
 
@@ -28,6 +28,7 @@ CAPABILITY_ASSEMBLY_QUEUE = "assembly_queue"
 CAPABILITY_DRUM_SCHEDULE = "drum_schedule"
 CAPABILITY_SHELF_PROJECTION = "shelf_projection"
 CAPABILITY_PURCHASE_CONTROL_JOURNAL = "purchase_control_journal"
+CAPABILITY_FUTURE_SUPPLY = "future_supply"
 TRUTH_MAX_AGE_SECONDS_ENV = "PLANNING_TRUTH_MAX_AGE_SECONDS"
 
 
@@ -94,6 +95,31 @@ class PlanningTruthInvalidationConflict(RuntimeError):
     """The requested invalidation does not match the current truth pointer."""
 
     code = "planning_truth_invalidation_conflict"
+
+
+class PlanningTruthPublishConflict(RuntimeError):
+    """The pointer moved away from the parent this publication descends from."""
+
+    code = "planning_truth_publish_conflict"
+
+
+def _serialize_publication(db: Session) -> None:
+    """Make every publisher contend for one lock, not two disjoint ones.
+
+    ``physical_refresh_orchestrator`` holds a session-level physical-sequence
+    lock while ``obligation_refresh_*`` holds ``MRP_LEDGER_LOCK_KEY``; on their
+    own the two never exclude each other, so two pipelines could reach the
+    pointer at once.  Both publication paths converge here, so taking the MRP
+    lock for the pointer switch serialises them without a second lock order:
+    the obligation path already holds it (a transaction-scoped advisory lock is
+    re-entrant for the session which owns it) and the physical path takes it
+    only after its own lock, never the reverse.
+    """
+    if db.get_bind().dialect.name != "postgresql":
+        return
+    from .mrp_freeze import MRP_LEDGER_LOCK_KEY
+
+    db.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": MRP_LEDGER_LOCK_KEY})
 
 
 def _configured_max_age() -> timedelta | None:
@@ -226,8 +252,16 @@ def require_accepted_truth(
 def publish_generation(
     db: Session,
     generation: models.LedgerGeneration,
+    *,
+    expected_parent_id: int | None = None,
 ) -> PlanningTruthReadiness:
-    """Atomically point planning reads at a structurally valid accepted build."""
+    """Atomically point planning reads at a structurally valid accepted build.
+
+    ``expected_parent_id`` is a compare-and-set on the truth pointer: a build
+    forked from one accepted generation must not overwrite a pointer that has
+    since moved to another.  The pointer row is locked for the check, so a
+    concurrent publisher either loses the race with a conflict or waits.
+    """
     if generation.status not in TRUTH_STATUSES:
         raise ValueError(f"unsupported truth status: {generation.status}")
     if generation.status != "accepted":
@@ -239,10 +273,28 @@ def publish_generation(
 
     db.add(generation)
     db.flush()
-    pointer = db.get(models.PlanningTruthState, 1)
+    _serialize_publication(db)
+    pointer = db.execute(
+        select(models.PlanningTruthState)
+        .where(models.PlanningTruthState.id == 1)
+        .with_for_update(),
+    ).scalar_one_or_none()
     if pointer is None:
         pointer = models.PlanningTruthState(id=1)
         db.add(pointer)
+        db.flush()
+    current_id = (
+        int(pointer.current_generation_id)
+        if pointer.current_generation_id is not None
+        else None
+    )
+    if expected_parent_id is not None:
+        expected = int(expected_parent_id)
+        # Republishing the same generation is idempotent, not a conflict.
+        if current_id not in {expected, int(generation.id)}:
+            raise PlanningTruthPublishConflict(
+                f"planning truth pointer is {current_id}, expected parent {expected}"
+            )
     pointer.current_generation_id = generation.id
     db.flush()
     # A long-lived worker session may already have resolved the relationship to

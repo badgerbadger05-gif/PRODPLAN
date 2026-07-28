@@ -157,3 +157,129 @@ def test_position_incoming_is_isolated_by_ledger_generation(
     assert first_position["incoming_wip"] == 0
     assert second_position["incoming_supplier"] == 0
     assert second_position["incoming_wip"] == 0
+
+
+def _future_supply(
+    db,
+    *,
+    generation,
+    item,
+    supply_kind: str,
+    open_qty,
+    source_ref: str,
+    evidence_status: str = "exact",
+):
+    """One captured future-supply row scoped to a generation."""
+    batch = models.LedgerBuildBatch(
+        ledger_generation_id=int(generation.id),
+        stage="snapshot_build",
+        batch_key=f"capture-{generation.id}-{source_ref}",
+        status="completed",
+        algorithm_version="tests/1",
+        metrics={},
+    )
+    db.add(batch)
+    db.flush()
+    row = models.LedgerFutureSupply(
+        ledger_generation_id=int(generation.id),
+        capture_batch_id=int(batch.id),
+        supply_kind=supply_kind,
+        item_id=item.item_id,
+        planning_stock_pool="default",
+        destination_warehouse_ref1c="WH",
+        source_ref=source_ref,
+        source_line_ref="1",
+        ordered_qty_at_cutoff=open_qty,
+        realized_qty_at_cutoff=0,
+        open_qty_at_cutoff=open_qty,
+        source_state_key="ready",
+        capture_cutoff=datetime(2026, 7, 20, 12),
+        source_content_hash=f"hash-{source_ref}",
+        evidence_status=evidence_status,
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def test_position_incoming_reads_the_generation_future_supply_capture(
+    db_session,
+    building_ledger_generation,
+):
+    """``incoming`` is the generation's own capture, not a hardcoded zero."""
+    db = db_session
+    generation = building_ledger_generation
+    item, _run, _requirement = _item_requirement(db, "POSITION-FUTURE-SUPPLY")
+    _future_supply(
+        db,
+        generation=generation,
+        item=item,
+        supply_kind="supplier_order",
+        open_qty=6,
+        source_ref="supplier-1",
+    )
+    _future_supply(
+        db,
+        generation=generation,
+        item=item,
+        supply_kind="wip_order",
+        open_qty=4,
+        source_ref="wip-1",
+    )
+    # Non-exact evidence is retained for audit but is not open supply.
+    _future_supply(
+        db,
+        generation=generation,
+        item=item,
+        supply_kind="supplier_order",
+        open_qty=0,
+        source_ref="supplier-ambiguous",
+        evidence_status="ambiguous",
+    )
+
+    position = item_ledger_position(
+        db, [item.item_id], ledger_generation_id=generation.id,
+    )[item.item_id]
+
+    assert position["incoming_supplier"] == 6
+    assert position["incoming_wip"] == 4
+    assert position["incoming"] == 10
+    assert position["projected"] == 10
+
+
+def test_position_incoming_stays_scoped_to_its_own_generation(
+    db_session,
+    building_ledger_generation,
+):
+    db = db_session
+    first = building_ledger_generation
+    item, _run, _requirement = _item_requirement(db, "POSITION-FS-ISOLATION")
+    second = models.LedgerGeneration(
+        generation_key="position-future-supply-two",
+        status="building",
+        physical_import_batch_id=first.physical_import_batch_id,
+        algorithm_version="tests/position-fs-2",
+        source_watermarks={},
+        capabilities={},
+    )
+    db.add(second)
+    db.flush()
+    _future_supply(
+        db,
+        generation=first,
+        item=item,
+        supply_kind="supplier_order",
+        open_qty=5,
+        source_ref="fs-isolation",
+    )
+
+    first_position = item_ledger_position(
+        db, [item.item_id], ledger_generation_id=first.id,
+    )[item.item_id]
+    second_position = item_ledger_position(
+        db, [item.item_id], ledger_generation_id=second.id,
+    )[item.item_id]
+
+    assert first_position["incoming_supplier"] == 5
+    assert second_position["incoming_supplier"] == 0
+    assert second_position["incoming"] == 0

@@ -67,6 +67,9 @@ _REQUIRED_PUBLISHED_CAPABILITIES = frozenset({
     "assembly_queue",
     "drum_schedule",
     "shelf_projection",
+    # An obligation refresh always captures future supply; a target which does
+    # not carry it would publish a purchase journal with zero ordered/in-transit.
+    "future_supply",
 })
 
 

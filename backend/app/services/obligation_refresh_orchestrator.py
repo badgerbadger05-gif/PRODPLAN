@@ -20,6 +20,10 @@ from sqlalchemy.orm import Session
 from app import models
 from app.services.item_ledger.candidate_future_supply import capture_candidate_future_supply
 from app.services.item_ledger.candidate_realization_replay import replay_candidate_realizations
+from app.services.item_ledger.generation_lifecycle import (
+    GenerationValidationError,
+    validate_obligation_refresh_build,
+)
 from app.services.item_ledger.obligation_generation import (
     carry_forward_retained_reservations,
     fork_obligation_generation,
@@ -69,6 +73,7 @@ _CORE_CAPABILITIES = {
     "drum_schedule": True,
     "shelf_projection": True,
     "purchase_control_journal": True,
+    "future_supply": True,
 }
 
 
@@ -448,6 +453,18 @@ def run_obligation_refresh(
     _complete(snapshot_batch, snapshot_metrics)
     target.capabilities = dict(capabilities)
     db.flush()
+    # The publisher audits lineage, manifests and read snapshots, but nothing
+    # ever proved the *structure* of the candidate itself: that is what the
+    # genesis path gets from validate_generation_build.  Run its applicable
+    # subset here so an obligation refresh cannot become truth with a broken
+    # StockBin fold, a reservation cache that disagrees with its own events, or
+    # an event belonging to a foreign generation.
+    try:
+        validate_obligation_refresh_build(db, target_id)
+    except GenerationValidationError as exc:
+        raise ObligationRefreshOrchestratorError(
+            f"obligation refresh candidate is structurally invalid: {exc}"
+        ) from exc
     published = publish_obligation_refresh_batch(
         db, parent_generation_id=int(parent_generation_id), target_generation_id=target_id,
         accepted_at=_utc(accepted_at), capabilities=dict(capabilities),

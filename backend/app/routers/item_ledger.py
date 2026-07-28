@@ -35,6 +35,7 @@ from ..services.item_ledger.reservation import replenishment_remaining
 from ..services.item_ledger.reservation_ledger import item_ledger_position
 from ..services.mrp_freeze import pool_key_for
 from ..services.planning_truth import (
+    CAPABILITY_FUTURE_SUPPLY,
     CAPABILITY_PHYSICAL_LEDGER,
     CAPABILITY_RESERVATION_REPLAY,
     PlanningTruthReadiness,
@@ -246,12 +247,20 @@ def get_position(item_id: int, db: Session = Depends(get_db)) -> ItemLedgerPosit
     ledger tables directly. on_hand / available /
     projected / uncovered follow the  formulas; ``available`` and
     ``uncovered`` are surfaced as-is (a negative available is a deficit signal,
-    not clamped)."""
+    not clamped).
+
+    ``incoming`` comes from the generation's own future-supply capture, so the
+    card requires that capability: a generation which never captured future
+    supply must read as unavailable, never as zero ordered / zero in transit."""
     item = _get_item_or_404(db, item_id)
     truth = _accepted_generation(
         db,
         consumer="item_ledger.position",
-        capabilities=(CAPABILITY_PHYSICAL_LEDGER, CAPABILITY_RESERVATION_REPLAY),
+        capabilities=(
+            CAPABILITY_PHYSICAL_LEDGER,
+            CAPABILITY_RESERVATION_REPLAY,
+            CAPABILITY_FUTURE_SUPPLY,
+        ),
     )
     generation_id = int(truth.generation_id)
     pos = item_ledger_position(

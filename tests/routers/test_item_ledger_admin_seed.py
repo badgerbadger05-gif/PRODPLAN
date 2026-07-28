@@ -330,6 +330,9 @@ def test_operator_accept_endpoint_wires_explicit_generation_and_commits(
         "replay_from": datetime(2026, 7, 1, tzinfo=timezone.utc),
         "odata_client": fake_client,
         "explicit_empty_physical": False,
+        # Omitted by the caller: the pointer compare-and-set then falls back to
+        # the generation's own sealed parent lineage.
+        "expected_parent_id": None,
     }
 
 

@@ -340,11 +340,16 @@ def run_physical_refresh(
         # fold and immutable read snapshots for the existing fixed runs.  A
         # second obligation refresh here used to re-explode every BOM and
         # overwrite frozen net quantities with today's stock basis.
+        # The pointer is re-checked here, not only at the fork: the import
+        # window runs for minutes and commits repeatedly, so another publisher
+        # may have advanced truth in the meantime.  accept_generation_build
+        # compares-and-sets under the pointer row lock.
         accept_generation_build(
             db,
             int(physical_generation.id),
             replay_from=replay_from,
             odata_client=client,
+            expected_parent_id=int(parent.id),
         )
         fixed_run_ids = tuple(
             int(run_id)

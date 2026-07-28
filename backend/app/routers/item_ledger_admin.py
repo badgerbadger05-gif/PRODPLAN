@@ -59,6 +59,10 @@ from ..services.item_ledger.historical_bootstrap_phase0 import (
     evaluate_historical_balance_convergence,
     seed_historical_opening_balance,
 )
+from ..services.item_ledger.physical_refresh_discard import (
+    PhysicalRefreshDiscardError,
+    discard_physical_refresh_candidate,
+)
 from ..services.item_ledger.physical import (
     EPS,
     LedgerKey,
@@ -72,6 +76,7 @@ from ..services.odata_client import OData1CClient
 from ..services.odata_config import load_odata_config, sanitize_base_url
 from ..services.planning_truth import (
     PlanningTruthInvalidationConflict,
+    PlanningTruthPublishConflict,
     invalidate_current_generation,
 )
 
@@ -132,6 +137,17 @@ class GenerationAcceptRequest(BaseModel):
     generation_id: int
     replay_from: datetime
     explicit_empty_physical: bool = False
+    # Optional compare-and-set on the truth pointer.  When omitted the
+    # generation's own sealed parent lineage is used, so a refresh candidate
+    # can never overwrite a pointer that moved on after its fork.
+    expected_parent_generation_id: Optional[int] = None
+
+
+class PhysicalRefreshDiscardRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ledger_generation_id: int
+    reason: str
 
 
 class GenerationInvalidateRequest(BaseModel):
@@ -461,6 +477,7 @@ def accept_generation(
             replay_from=payload.replay_from,
             odata_client=_odata_client_if_configured(),
             explicit_empty_physical=payload.explicit_empty_physical,
+            expected_parent_id=payload.expected_parent_generation_id,
         )
         db.commit()
         return {
@@ -470,12 +487,58 @@ def accept_generation(
             "ready": True,
             "reason": None,
         }
-    except GenerationValidationError as exc:
+    except (GenerationValidationError, PlanningTruthPublishConflict) as exc:
         db.rollback()
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except Exception:
         db.rollback()
         raise
+
+
+@router.post("/physical-refresh/discard", response_model=dict)
+def discard_physical_refresh(
+    payload: PhysicalRefreshDiscardRequest,
+    db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Roll one unpublishable refresh candidate back to its accepted parent.
+
+    Until this endpoint existed the rollback had no production caller at all: a
+    candidate that failed convergence kept its physical import batches above the
+    accepted parent's boundary, and because visibility is an id-prefix the next
+    three-hour fork could never pass its own audit.  One failed refresh
+    therefore blocked the pipeline permanently and was undone by hand.
+    """
+    try:
+        result = discard_physical_refresh_candidate(
+            db,
+            ledger_generation_id=payload.ledger_generation_id,
+            reason=payload.reason,
+        )
+        db.commit()
+    except (ValueError, PhysicalRefreshDiscardError) as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except Exception:
+        db.rollback()
+        raise
+    return {
+        "ledger_generation_id": result.ledger_generation_id,
+        "parent_generation_id": result.parent_generation_id,
+        "status": "rejected",
+        "reason": payload.reason,
+        "boundary_before": result.boundary_before,
+        "boundary_after": result.boundary_after,
+        "deleted_physical_batches": result.deleted_physical_batches,
+        "deleted_ledger_entries": result.deleted_ledger_entries,
+        "deleted_supersessions": result.deleted_supersessions,
+        "deleted_anchors": result.deleted_anchors,
+        "deleted_generation_rows": result.deleted_generation_rows,
+        "reactivated_entries": result.reactivated_entries,
+        "parent_fingerprint": {
+            "rows": result.parent_fingerprint[0],
+            "total_qty": result.parent_fingerprint[1],
+        },
+    }
 
 
 @router.post("/generations/invalidate", response_model=TruthLifecycleResponse)

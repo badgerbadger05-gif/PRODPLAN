@@ -87,6 +87,7 @@ def test_add_only_builds_real_checkpoints_and_promotes_persisted_read_snapshot(d
         "drum_schedule": True,
         "shelf_projection": True,
         "purchase_control_journal": True,
+        "future_supply": True,
     }
     assert {
         "physical_import",

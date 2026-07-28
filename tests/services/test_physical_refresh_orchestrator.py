@@ -232,8 +232,11 @@ def test_run_physical_refresh_publishes_accepted_physical_generation_without_ref
         "evaluate_physical_refresh_balance_convergence",
         lambda *args, **kwargs: calls.append("balance") or balance_result,
     )
-    def _accept(*_args, **_kwargs):
+    accept_kwargs = {}
+
+    def _accept(*_args, **kwargs):
         calls.append("accept")
+        accept_kwargs.update(kwargs)
         physical.status = "accepted"
         physical.accepted_at = target_cutoff
         db_session.get(models.PlanningTruthState, 1).current_generation_id = physical.id
@@ -260,6 +263,9 @@ def test_run_physical_refresh_publishes_accepted_physical_generation_without_ref
     assert result.published is True
     assert result.candidate_run_ids == ()
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == physical.id
+    # The import window commits repeatedly and takes minutes, so the pointer is
+    # compared-and-set again at publication, not only checked at the fork.
+    assert accept_kwargs["expected_parent_id"] == parent.id
 
 
 def test_balance_mismatch_stops_before_accept_or_obligation(db_session, monkeypatch):

@@ -43,6 +43,7 @@ def _capabilities():
         "drum_schedule": True,
         "shelf_projection": True,
         "purchase_control_journal": True,
+        "future_supply": True,
     }
 
 

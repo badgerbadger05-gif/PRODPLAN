@@ -10,7 +10,7 @@ outer transaction.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
@@ -22,6 +22,7 @@ from .physical import canonical_content_hash, canonical_decimal
 
 _KINDS = frozenset({"wip_order", "supplier_order"})
 _STATUSES = frozenset({"exact", "ambiguous", "unmatched", "rejected"})
+CARRY_FORWARD_ALGORITHM_VERSION = "ledger-future-supply-carry-forward/1"
 
 
 class FutureSupplyCaptureError(ValueError):
@@ -244,6 +245,126 @@ def _validated_rows(
         "surplus_qty": total_surplus,
         "content_hash": canonical_content_hash([_row_hash_payload(row) for row in rows]),
     }
+
+
+_CARRY_FORWARD_FIELDS = (
+    "supply_kind",
+    "item_id",
+    "characteristic_ref",
+    "organization_ref",
+    "planning_stock_pool",
+    "destination_warehouse_ref1c",
+    "source_ref",
+    "source_line_ref",
+    "source_local_id",
+    "ordered_qty_at_cutoff",
+    "realized_qty_at_cutoff",
+    "open_qty_at_cutoff",
+    "eta_date",
+    "source_state_key",
+    "source_updated_at",
+    "capture_cutoff",
+    "source_content_hash",
+    "evidence_status",
+    "reason",
+)
+
+
+def _generation_rows(db: Session, generation_id: int) -> list[models.LedgerFutureSupply]:
+    return db.query(models.LedgerFutureSupply).filter(
+        models.LedgerFutureSupply.ledger_generation_id == int(generation_id)
+    ).all()
+
+
+def _capture_summary(rows: list[models.LedgerFutureSupply]) -> dict[str, Any]:
+    payloads = sorted(
+        (_stored_row_payload(row) for row in rows), key=_row_sort_key
+    )
+    open_qty = sum(
+        (Decimal(str(row.open_qty_at_cutoff or 0)) for row in rows), Decimal("0")
+    )
+    return {
+        "rows": len(rows),
+        "exact_rows": sum(1 for row in rows if str(row.evidence_status) == "exact"),
+        "open_qty": canonical_decimal(open_qty),
+        "content_hash": canonical_content_hash(payloads),
+    }
+
+
+def carry_forward_future_supply(
+    db: Session,
+    *,
+    parent_generation_id: int,
+    target_generation_id: int,
+) -> Mapping[str, Any]:
+    """Copy the accepted parent's future-supply capture into a refresh target.
+
+    A physical refresh advances *facts*, not obligations: it re-reads no
+    supplier or WIP order, so recapturing here would fabricate evidence, while
+    capturing nothing leaves the purchase journal reporting zero ordered and
+    zero in transit after every three-hour cycle.  The rows are therefore
+    carried verbatim, keeping the ``capture_cutoff`` at which the evidence was
+    really observed, under one dedicated carry-forward batch so their origin
+    stays auditable.  Idempotent: an exact repeat returns the existing summary.
+    """
+    target = db.get(models.LedgerGeneration, int(target_generation_id))
+    if target is None or str(target.status) != "building":
+        raise FutureSupplyCaptureError(
+            "future supply carry-forward requires a BUILDING target generation"
+        )
+    parent = db.get(models.LedgerGeneration, int(parent_generation_id))
+    if parent is None or str(parent.status) != "accepted":
+        raise FutureSupplyCaptureError(
+            "future supply carry-forward requires an accepted source generation"
+        )
+    if int(parent.id) == int(target.id):
+        raise FutureSupplyCaptureError("future supply carry-forward requires two generations")
+
+    parent_rows = _generation_rows(db, int(parent.id))
+    expected = _capture_summary(parent_rows)
+    existing_rows = _generation_rows(db, int(target.id))
+    if existing_rows:
+        if _capture_summary(existing_rows) != expected:
+            raise FutureSupplyCaptureError(
+                "target already carries a conflicting future-supply capture"
+            )
+        return {**expected, "created": False, "source_generation_id": int(parent.id)}
+
+    batch_key = f"future-supply-carry-forward:g{int(target.id)}"
+    batch = db.query(models.LedgerBuildBatch).filter(
+        models.LedgerBuildBatch.ledger_generation_id == int(target.id),
+        models.LedgerBuildBatch.stage == "snapshot_build",
+        models.LedgerBuildBatch.batch_key == batch_key,
+    ).one_or_none()
+    if batch is None:
+        batch = models.LedgerBuildBatch(
+            ledger_generation_id=int(target.id),
+            stage="snapshot_build",
+            batch_key=batch_key,
+            status="building",
+            algorithm_version=CARRY_FORWARD_ALGORITHM_VERSION,
+            metrics={},
+        )
+        db.add(batch)
+        db.flush()
+    for source in parent_rows:
+        db.add(models.LedgerFutureSupply(
+            ledger_generation_id=int(target.id),
+            capture_batch_id=int(batch.id),
+            **{field: getattr(source, field) for field in _CARRY_FORWARD_FIELDS},
+        ))
+    db.flush()
+    if _capture_summary(_generation_rows(db, int(target.id))) != expected:
+        raise FutureSupplyCaptureError("carried-forward future supply conflicts")
+    batch.status = "completed"
+    batch.metrics = {
+        **expected,
+        "source_generation_id": int(parent.id),
+        "carried_forward": True,
+    }
+    batch.completed_at = datetime.now(timezone.utc)
+    db.flush()
+    return {**expected, "created": True, "source_generation_id": int(parent.id)}
 
 
 def replace_future_supply_capture(

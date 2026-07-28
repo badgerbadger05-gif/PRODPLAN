@@ -355,6 +355,50 @@ def materialize_reservations_for_freeze(
     return {"reservations": len(touched), "frozen_pins": 0}
 
 
+_FUTURE_SUPPLY_KIND_FIELD = {
+    "supplier_order": "incoming_supplier",
+    "wip_order": "incoming_wip",
+}
+
+
+def _ledger_incoming_by_generation(
+    db: Session, generation_id: int
+) -> Dict[int, Dict[str, float]]:
+    """Open future supply of one generation, split by kind.
+
+    The only source is the generation's own ``ledger_future_supply`` capture.
+    Live order mirrors are provenance, not fact, so they are never consulted;
+    a generation without a capture reports nothing rather than a fabricated
+    zero, and its consumers fail closed on the ``future_supply`` capability.
+    """
+    rows = (
+        db.query(
+            models.LedgerFutureSupply.item_id,
+            models.LedgerFutureSupply.supply_kind,
+            func.sum(models.LedgerFutureSupply.open_qty_at_cutoff),
+        )
+        .filter(
+            models.LedgerFutureSupply.ledger_generation_id == int(generation_id),
+            models.LedgerFutureSupply.evidence_status == "exact",
+        )
+        .group_by(
+            models.LedgerFutureSupply.item_id,
+            models.LedgerFutureSupply.supply_kind,
+        )
+        .all()
+    )
+    incoming: Dict[int, Dict[str, float]] = {}
+    for item_id, supply_kind, open_qty in rows:
+        field = _FUTURE_SUPPLY_KIND_FIELD.get(str(supply_kind or ""))
+        if field is None:
+            continue
+        bucket = incoming.setdefault(
+            int(item_id), {"incoming_supplier": 0.0, "incoming_wip": 0.0}
+        )
+        bucket[field] += max(float(open_qty or 0.0), 0.0)
+    return incoming
+
+
 def item_ledger_position(
     db: Session,
     item_ids: Optional[Sequence[int]] = None,
@@ -367,6 +411,7 @@ def item_ledger_position(
         {int(i) for i in item_ids if i is not None} if item_ids is not None else None
     )
     on_hand_all = _ledger_on_hand_by_generation(db, generation_id)
+    incoming_all = _ledger_incoming_by_generation(db, generation_id)
     reserved_soft: Dict[int, float] = {}
     res_rows = (
         db.query(
@@ -384,7 +429,7 @@ def item_ledger_position(
         if frozen > 0.0:
             reserved_soft[int(item_id)] = reserved_soft.get(int(item_id), 0.0) + frozen
 
-    keys = set(on_hand_all) | set(reserved_soft)
+    keys = set(on_hand_all) | set(reserved_soft) | set(incoming_all)
     if want is not None:
         keys = set(want)
 
@@ -393,8 +438,9 @@ def item_ledger_position(
         oh = float(on_hand_all.get(item_id, 0.0))
         oh_pos = oh if oh > 0.0 else 0.0
         soft = float(reserved_soft.get(item_id, 0.0))
-        incoming_supplier = 0.0
-        incoming_wip = 0.0
+        item_incoming = incoming_all.get(int(item_id), {})
+        incoming_supplier = float(item_incoming.get("incoming_supplier", 0.0))
+        incoming_wip = float(item_incoming.get("incoming_wip", 0.0))
         incoming = incoming_supplier + incoming_wip
         result[int(item_id)] = {
             "on_hand": oh,
