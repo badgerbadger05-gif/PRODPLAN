@@ -13,6 +13,10 @@ from sqlalchemy.orm import Session
 
 from app import models
 
+from ..mrp_result_snapshot import build_mrp_result_snapshot
+from ..purchase_control_snapshot import (
+    promote_candidate_snapshot as promote_purchase_journal_candidate,
+)
 from .generation_lifecycle import accept_generation_build
 from .historical_bootstrap_phase0 import (
     BalanceConvergenceResult,
@@ -136,6 +140,40 @@ def _reconcile_opening_balance(
     )
     db.commit()
     return result
+
+
+def _publish_refresh_read_snapshots(
+    db: Session,
+    *,
+    generation: models.LedgerGeneration,
+    fixed_run_ids: tuple[int, ...],
+) -> None:
+    """Finish the read surface of a just-accepted physical refresh.
+
+    Fails closed when the generation advertises a capability whose snapshot did
+    not materialize: a silently missing snapshot reads to the operator as an
+    outage of the whole screen, which is exactly how this gap survived.
+    """
+    capabilities = dict(generation.capabilities or {})
+    accepted_at = generation.accepted_at or datetime.now(timezone.utc)
+
+    promoted = promote_purchase_journal_candidate(
+        db, generation=generation, accepted_at=accepted_at
+    )
+    if promoted is None and capabilities.get("purchase_control_journal"):
+        raise PhysicalRefreshOrchestratorError(
+            f"generation {generation.id} claims the purchase_control_journal "
+            "capability but has no journal candidate to publish"
+        )
+
+    for run_id in fixed_run_ids:
+        try:
+            build_mrp_result_snapshot(db, int(run_id))
+        except ValueError as exc:
+            raise PhysicalRefreshOrchestratorError(
+                f"MRP result snapshot for run {run_id} could not be published: {exc}"
+            ) from exc
+    db.flush()
 
 
 _MISMATCH_SAMPLE = 5
@@ -296,6 +334,17 @@ def run_physical_refresh(
             .filter(models.PlanningRun.status == "FIXED_SNAPSHOT")
             .order_by(models.PlanningRun.run_id.asc())
             .all()
+        )
+        # Accepting a generation rebuilds the read snapshots that carry their own
+        # accepted status, but not these two: the purchase journal is only ever
+        # written as a candidate, and MRP result snapshots are per fixed run.
+        # Both promotions live in the obligation refresh publisher, which this
+        # path deliberately does not run, so without this every physical refresh
+        # leaves the purchase and MRP screens unavailable.
+        _publish_refresh_read_snapshots(
+            db,
+            generation=physical_generation,
+            fixed_run_ids=fixed_run_ids,
         )
         db.commit()
         return PhysicalRefreshOrchestrationResult(

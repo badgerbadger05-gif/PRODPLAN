@@ -662,6 +662,77 @@ def build_candidate_snapshot(db: Session, generation_id: int) -> models.Planning
     return snapshot
 
 
+class PurchaseJournalPromotionError(RuntimeError):
+    """The journal candidate is not fit to become readable truth."""
+
+
+def promote_candidate_snapshot(
+    db: Session,
+    *,
+    generation: models.LedgerGeneration,
+    accepted_at: datetime,
+) -> models.PlanningReadSnapshot | None:
+    """Turn this generation's BUILDING journal candidate into accepted truth.
+
+    ``build_candidate_snapshot`` always writes a candidate, and readers only
+    accept ``truth_status='accepted'``, so a path that accepts a generation
+    without promoting leaves the purchase journal permanently unavailable.  The
+    obligation refresh publisher does this inline; the physical refresh path
+    needs the same step, so the guards live here rather than being written twice
+    from memory.  Returns ``None`` when the generation has no candidate.
+    """
+    candidate = db.query(models.PlanningReadSnapshot).filter(
+        models.PlanningReadSnapshot.consumer == CONSUMER,
+        models.PlanningReadSnapshot.snapshot_key == SNAPSHOT_KEY,
+        models.PlanningReadSnapshot.ledger_generation_id == int(generation.id),
+        models.PlanningReadSnapshot.truth_status == "building",
+        models.PlanningReadSnapshot.cutoff == generation.cutoff,
+    ).one_or_none()
+    if candidate is None:
+        return None
+
+    payload = candidate.payload if isinstance(candidate.payload, dict) else None
+    meta = payload.get("meta") if isinstance(payload, dict) else None
+    rows = payload.get("rows") if isinstance(payload, dict) else None
+    cards = payload.get("cards") if isinstance(payload, dict) else None
+    if (
+        not isinstance(meta, dict)
+        or meta.get("read_only") is not True
+        or meta.get("fact_source") != "ledger"
+        or int(meta.get("ledger_generation_id") or -1) != int(generation.id)
+        or not isinstance(rows, list)
+        or not isinstance(cards, dict)
+    ):
+        raise PurchaseJournalPromotionError(
+            "purchase control journal candidate is missing or stale"
+        )
+
+    seen: set[str] = set()
+    for row in rows:
+        try:
+            validate_purchase_control_journal_buy_row(row)
+            key = str(row["row_key"])
+        except (KeyError, TypeError) as exc:
+            raise PurchaseJournalPromotionError(
+                "purchase control journal row is malformed"
+            ) from exc
+        except ValueError as exc:
+            raise PurchaseJournalPromotionError(
+                "purchase control journal row violates the Ledger fact contract"
+            ) from exc
+        if key in seen:
+            raise PurchaseJournalPromotionError(
+                "purchase control journal row violates the Ledger fact contract"
+            )
+        seen.add(key)
+
+    candidate.truth_status = "accepted"
+    candidate.reason = None
+    candidate.published_at = accepted_at
+    db.flush()
+    return candidate
+
+
 def read_snapshot(db: Session) -> dict[str, Any]:
     try:
         snapshot = get_latest_read_snapshot(
