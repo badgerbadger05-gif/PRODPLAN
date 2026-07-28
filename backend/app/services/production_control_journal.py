@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -23,6 +24,8 @@ from ..models import (
     ReservationEntry,
     ReplenishmentWorkItem,
     ResourceProductionKind,
+    ShelfPolicy,
+    ShelfProjection,
     SpecComponent,
     Specification,
     SyncLink,
@@ -89,6 +92,70 @@ STATUS_FILTER_GROUPS = {
 }
 
 ACTIVE_COVERAGE_STATUSES = {"shortage", "partial", "ready"}
+
+# Where a journal line takes its launch quantity and launch date from.
+# 'shelf_pull'    — DBR shelf projection of the accepted generation drives it;
+# 'mrp_remaining' — no shelf for this item, legacy MRP remainder drives it.
+LAUNCH_SOURCE_SHELF = "shelf_pull"
+LAUNCH_SOURCE_MRP = "mrp_remaining"
+
+
+@dataclass(frozen=True)
+class _ShelfPull:
+    """One saved shelf projection row, read never recomputed (CANON §Правила 1)."""
+
+    item_id: int
+    warehouse_ref1c: str
+    pull_qty: float
+    materialized_qty: float
+    first_shortage_date: Optional[date]
+    latest_start_date: Optional[date]
+
+
+def _shelf_pull_by_item(
+    db: Session,
+    *,
+    ledger_generation_id: Optional[int],
+    item_ids: Optional[Sequence[int]] = None,
+) -> Dict[int, _ShelfPull]:
+    """Saved shelf pull of the accepted generation, keyed by produced item.
+
+    The journal reads ``pull_qty`` / ``materialized_qty`` / ``latest_start_date``
+    from the persisted projection.  Recomputing the shelf formulas here would
+    create a second owner of the величина, which the canon forbids.
+    """
+    if ledger_generation_id is None:
+        return {}
+    query = (
+        db.query(ShelfProjection, ShelfPolicy)
+        .join(ShelfPolicy, ShelfPolicy.id == ShelfProjection.shelf_policy_id)
+        .filter(ShelfProjection.ledger_generation_id == int(ledger_generation_id))
+        .filter(ShelfPolicy.active.is_(True))
+    )
+    ids = sorted({int(value) for value in (item_ids or []) if value is not None})
+    if item_ids is not None:
+        if not ids:
+            return {}
+        query = query.filter(ShelfProjection.item_id.in_(ids))
+    result: Dict[int, _ShelfPull] = {}
+    for projection, _policy in query.order_by(
+        ShelfProjection.item_id.asc(),
+        ShelfProjection.shelf_policy_id.asc(),
+    ).all():
+        # An item with several shelves is resolved by the lowest policy id so
+        # the journal stays deterministic across pages and reruns.
+        result.setdefault(
+            int(projection.item_id),
+            _ShelfPull(
+                item_id=int(projection.item_id),
+                warehouse_ref1c=str(projection.warehouse_ref1c or ""),
+                pull_qty=_to_float(projection.pull_qty),
+                materialized_qty=_to_float(projection.materialized_qty),
+                first_shortage_date=projection.first_shortage_date,
+                latest_start_date=projection.latest_start_date,
+            ),
+        )
+    return result
 
 
 def _journal_work_status(line_status: str) -> str:
@@ -600,6 +667,19 @@ def materialize_make_work_items(
 
     today = datetime.now(timezone.utc)
 
+    # DBR owns how much of the frozen MRP remainder is pulled right now.  For a
+    # shelf-managed item the launch quantity is the saved ``materialized_qty``
+    # (= pull_qty rounded up to the shelf's batch_multiple, already capped by
+    # the unlaunched MRP), spread across the selected requirements of that item.
+    shelf_by_item = _shelf_pull_by_item(
+        db,
+        ledger_generation_id=generation_id,
+        item_ids=[int(row.item_id) for row in selected],
+    )
+    shelf_allowance: Dict[int, float] = {
+        item_id: float(pull.materialized_qty) for item_id, pull in shelf_by_item.items()
+    }
+
     work_by_id = {int(row.id): row for row in selected}
     for work_id_raw in work_item_ids:
         try:
@@ -682,7 +762,35 @@ def materialize_make_work_items(
         planned_start = min((task.start_date for task in planned_tasks if task.start_date), default=req.period_from)
         planned_finish = max((task.finish_date or task.need_date for task in planned_tasks if task.finish_date or task.need_date), default=req.period_to)
         spec_id = _default_spec_id_for_item(db, int(req.item_id))
-        batches = _split_qty_by_optimal_batch(remaining, getattr(item, "optimal_batch", None))
+
+        shelf = shelf_by_item.get(int(req.item_id))
+        launch_source = LAUNCH_SOURCE_MRP
+        if shelf is None:
+            # No shelf for this item: legacy MRP remainder split by optimal_batch.
+            batches = _split_qty_by_optimal_batch(remaining, getattr(item, "optimal_batch", None))
+        else:
+            launch_source = LAUNCH_SOURCE_SHELF
+            allowance = shelf_allowance.get(int(req.item_id), 0.0)
+            pull_qty = min(remaining, allowance)
+            if pull_qty <= 1e-9:
+                skipped.append({
+                    "work_item_id": work_id,
+                    "requirement_id": rid,
+                    "item_id": int(req.item_id),
+                    "reason": "буфер полки закрыт: вытягивание не требуется",
+                })
+                continue
+            shelf_allowance[int(req.item_id)] = allowance - pull_qty
+            # materialized_qty is already a multiple of policy.batch_multiple and
+            # already fits inside the unlaunched MRP, so it is launched as one
+            # line; item.optimal_batch is the legacy fallback and must not
+            # re-split a shelf pull.
+            batches = [pull_qty]
+            # Стартовать позже latest_start_date значит опоздать со сборкой.
+            if shelf.latest_start_date is not None:
+                planned_start = shelf.latest_start_date
+            if shelf.first_shortage_date is not None:
+                planned_finish = shelf.first_shortage_date
         for index, qty in enumerate(batches, start=1):
             seq = existing_count + index
             order_number = f"MRP-R-{rid}" if seq == 1 and len(batches) == 1 else f"MRP-R-{rid}-{seq}"
@@ -731,6 +839,10 @@ def materialize_make_work_items(
                 "item_id": int(req.item_id),
                 "item_name": str(item.item_name or ""),
                 "qty": qty,
+                "launch_source": launch_source,
+                "shelf_warehouse_ref1c": shelf.warehouse_ref1c if shelf else None,
+                "shelf_pull_qty": shelf.pull_qty if shelf else None,
+                "shelf_latest_start_date": _date_to_iso(shelf.latest_start_date) if shelf else None,
             })
 
         # Requirement coverage/execution is derived from the Ledger.  Do not
@@ -938,6 +1050,14 @@ def list_journal(
 
     page_item_ids = sorted({int(product.item_id) for product in rows if product.item_id is not None})
     plan_dates = _planned_dates_by_item(db, accepted_run_ids, page_item_ids)
+    # The shelf projection of the accepted generation owns the launch date of a
+    # shelf-managed item; the legacy CapacityScheduler dates stay as fallback
+    # only for items without a shelf.
+    shelf_by_item = _shelf_pull_by_item(
+        db,
+        ledger_generation_id=int(truth.generation_id) if truth.generation_id is not None else None,
+        item_ids=page_item_ids,
+    )
     order_ids = sorted({int(product.order_id) for product in rows})
     run_ids = sorted({
         int(product.order.source_run_id)
@@ -1114,6 +1234,11 @@ def list_journal(
             continue
 
         planned_start, planned_finish = plan_dates.get(int(product.item_id), (None, None))
+        shelf = shelf_by_item.get(int(product.item_id))
+        if shelf is not None and shelf.latest_start_date is not None:
+            planned_start = shelf.latest_start_date
+        if shelf is not None and shelf.first_shortage_date is not None:
+            planned_finish = shelf.first_shortage_date
         if state and state.planned_start_date:
             planned_start = state.planned_start_date
         if state and state.planned_finish_date:
@@ -1199,6 +1324,13 @@ def list_journal(
                 "mrp_req_net_qty": req_meta.get("net_required_qty"),
                 "mrp_req_covered_qty": req_meta.get("covered_qty"),
                 "mrp_req_remaining_qty": req_meta.get("remaining_qty"),
+                # Чем управляется запуск строки: вытягиванием полки или
+                # остатком MRP. Оператор видит источник количества и даты.
+                "launch_source": LAUNCH_SOURCE_SHELF if shelf else LAUNCH_SOURCE_MRP,
+                "shelf_warehouse_ref1c": shelf.warehouse_ref1c if shelf else None,
+                "shelf_pull_qty": shelf.pull_qty if shelf else None,
+                "shelf_materialized_qty": shelf.materialized_qty if shelf else None,
+                "shelf_latest_start_date": _date_to_iso(shelf.latest_start_date) if shelf else None,
                 "paint_weld_chain": chain_by_order_id.get(int(product.order_id)),
             }
         )

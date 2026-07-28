@@ -633,6 +633,12 @@ class ProductionOrderJournalRowResponse(BaseModel):
     mrp_req_net_qty: Optional[float] = None
     mrp_req_covered_qty: Optional[float] = None
     mrp_req_remaining_qty: Optional[float] = None
+    # DBR shelf pull: what drives this launch, how much and onto which shelf.
+    launch_source: str = "mrp_remaining"
+    shelf_warehouse_ref1c: Optional[str] = None
+    shelf_pull_qty: Optional[float] = None
+    shelf_materialized_qty: Optional[float] = None
+    shelf_latest_start_date: Optional[str] = None
     paint_weld_chain: Optional[PaintWeldChainResponse] = None
 
 

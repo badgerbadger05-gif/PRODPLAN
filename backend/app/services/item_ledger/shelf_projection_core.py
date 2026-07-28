@@ -15,6 +15,19 @@ class ShelfDemand:
 
 
 @dataclass(frozen=True)
+class ShelfReceipt:
+    """Confirmed replenishment that lands on the shelf on a known date.
+
+    The canon counts a confirmed order as shelf coverage only when it arrives
+    ``до нужной даты``.  An undated confirmed quantity therefore cannot be
+    time-phased and is treated as an opening balance instead.
+    """
+
+    available_from: date
+    qty: Decimal
+
+
+@dataclass(frozen=True)
 class ShelfProjectionResult:
     protection_until: date
     target_qty: Decimal
@@ -43,6 +56,42 @@ def _round_up(value: Decimal, multiple: Decimal) -> Decimal:
     return (value / multiple).to_integral_value(rounding=ROUND_CEILING) * multiple
 
 
+def _project_timely_coverage(
+    ordered: list[ShelfDemand],
+    *,
+    protection_until: date,
+    opening_balance: Decimal,
+    receipts: list[ShelfReceipt],
+) -> tuple[Decimal, date | None]:
+    """Coverage that reaches the shelf in time, and the first shortage date.
+
+    ``shelf_projected_qty`` is the protected drum demand that the shelf balance
+    plus timely confirmed receipts actually serve.  Quantity that only shows up
+    after a need date stays out of the projection: it cannot repair a shortage
+    that already happened, so it must not shrink ``shelf_gap_qty``.
+    """
+    balance = opening_balance
+    covered = Decimal("0")
+    first_shortage: date | None = None
+    next_receipt = 0
+    for row in ordered:
+        if row.need_date > protection_until:
+            break
+        while (
+            next_receipt < len(receipts)
+            and receipts[next_receipt].available_from <= row.need_date
+        ):
+            balance += _d(receipts[next_receipt].qty)
+            next_receipt += 1
+        required = _d(row.qty)
+        served = min(max(balance, Decimal("0")), required)
+        covered += served
+        balance -= served
+        if served < required and first_shortage is None:
+            first_shortage = row.need_date
+    return covered, first_shortage
+
+
 def project_shelf(
     demands: tuple[ShelfDemand, ...],
     *,
@@ -55,6 +104,7 @@ def project_shelf(
     shelf_physical_qty: Decimal,
     other_stock_qty: Decimal,
     confirmed_open_production_qty: Decimal,
+    confirmed_receipts: tuple[ShelfReceipt, ...] = (),
 ) -> ShelfProjectionResult:
     """Calculate timing only; never create demand beyond frozen MRP."""
     if min(replenishment_time_days, review_cycle_days, safety_days) < 0:
@@ -62,7 +112,14 @@ def project_shelf(
     open_qty = max(_d(open_mrp_qty), Decimal("0"))
     physical = _d(shelf_physical_qty)
     other = max(_d(other_stock_qty), Decimal("0"))
-    confirmed = max(_d(confirmed_open_production_qty), Decimal("0"))
+    opening_confirmed = max(_d(confirmed_open_production_qty), Decimal("0"))
+    dated_receipts = sorted(
+        (row for row in confirmed_receipts if _d(row.qty) > 0),
+        key=lambda row: row.available_from,
+    )
+    confirmed = opening_confirmed + sum(
+        (_d(row.qty) for row in dated_receipts), Decimal("0")
+    )
     protection_until = as_of + timedelta(
         days=replenishment_time_days + review_cycle_days + safety_days
     )
@@ -75,22 +132,24 @@ def project_shelf(
         Decimal("0"),
     )
     target = min(protected_demand, open_qty)
-    projected = physical + confirmed
+    # Canon "что считается покрытием полки": for every need date only what is
+    # already on the shelf, or confirmed to land there before that date, counts
+    # — net of the earlier drum consumption that ate the same balance first.
+    # Walking the drum dates is therefore the projection; a flat
+    # ``physical + confirmed`` would let a late receipt cover an earlier
+    # shortage and silently suppress the mech-shop pull.
+    projected, first_shortage = _project_timely_coverage(
+        ordered,
+        protection_until=protection_until,
+        opening_balance=physical + opening_confirmed,
+        receipts=dated_receipts,
+    )
     gap = max(target - projected, Decimal("0"))
     transfer = min(gap, other)
     unlaunched = max(open_qty - confirmed, Decimal("0"))
     pull = min(max(gap - transfer, Decimal("0")), unlaunched)
     materialized = min(_round_up(pull, _d(batch_multiple)), unlaunched)
 
-    cumulative = Decimal("0")
-    first_shortage: date | None = None
-    for row in ordered:
-        if row.need_date > protection_until:
-            break
-        cumulative += _d(row.qty)
-        if cumulative > projected:
-            first_shortage = row.need_date
-            break
     latest_start = (
         first_shortage - timedelta(days=replenishment_time_days)
         if first_shortage is not None
