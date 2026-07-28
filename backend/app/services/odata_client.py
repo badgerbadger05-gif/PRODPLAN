@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import socket
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -8,6 +10,23 @@ import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any
 from zoneinfo import ZoneInfo
+
+
+logger = logging.getLogger(__name__)
+
+# Overload / gateway statuses worth retrying on an idempotent write. 500 is
+# deliberately excluded: on 1C it usually means the operation itself failed
+# (business logic), and repeating it just multiplies the same error.
+WRITE_RETRY_STATUS_CODES = frozenset({429, 502, 503, 504})
+
+# Connection failures that provably happened *before* the request body could
+# reach 1C. Only these are safe to retry for a non-idempotent create.
+_PRE_SEND_CONNECTION_ERRORS = (ConnectionRefusedError, socket.gaierror)
+
+
+def _is_pre_send_connection_error(exc: urllib.error.URLError) -> bool:
+    reason = getattr(exc, "reason", None)
+    return isinstance(reason, _PRE_SEND_CONNECTION_ERRORS)
 
 
 class OData1CClient:
@@ -23,6 +42,10 @@ class OData1CClient:
             "Accept": "application/json;odata.metadata=minimal",
             "Content-Type": "application/json",
         }
+        # Set by get_all/iter_pages/iter_by_guid: True when the max_pages guard
+        # cut the fetch short, so callers can tell a complete selection from a
+        # truncated one instead of silently treating a partial answer as whole.
+        self.last_result_truncated = False
 
     def _make_request(
         self,
@@ -128,117 +151,164 @@ class OData1CClient:
             headers["Authorization"] = f"Basic {encoded}"
         return headers
 
+    @staticmethod
+    def _decode_write_response(response, url: str) -> Dict[str, Any]:
+        data = response.read()
+        text = data.decode("utf-8", errors="replace").strip()
+        if not text:
+            return {}
+        content_type = response.headers.get("Content-Type", "") or ""
+        if "application/json" in content_type.lower() or text.startswith("{") or text.startswith("["):
+            return json.loads(text)
+        return {"_raw": text, "_content_type": content_type, "_url": url}
+
+    @staticmethod
+    def _retry_wait_seconds(exc: Exception, attempt: int, backoff: float) -> float:
+        wait_s: Optional[float] = None
+        try:
+            headers = getattr(exc, "headers", None)
+            ra = headers.get("Retry-After") if headers else None
+            if ra:
+                wait_s = float(ra)
+        except Exception:
+            wait_s = None
+        if wait_s is None:
+            wait_s = float(backoff) * (2 ** attempt)
+        return max(0.1, min(wait_s, 30.0))
+
+    def _send_write(
+        self,
+        method: str,
+        url: str,
+        body: bytes,
+        timeout: int,
+        *,
+        idempotent: bool,
+        retries: int,
+        retry_backoff_sec: float,
+    ) -> Dict[str, Any]:
+        """Perform a write with retry policy driven by idempotency.
+
+        ``idempotent=True`` (Post/Unpost/PATCH — repeating them converges to the
+        same 1C state) retries gateway/overload statuses and network errors.
+        ``idempotent=False`` (document creation) never retries once the request
+        may have reached 1C: a retry there would create a duplicate document.
+        """
+        attempt = 0
+        retries = max(0, int(retries))
+        while True:
+            request = urllib.request.Request(url, data=body, method=method)
+            for k, v in self._build_headers().items():
+                request.add_header(k, v)
+            try:
+                from datetime import datetime as _dt
+                print(f"[OData] {_dt.now(timezone.utc).isoformat()} {method} {url}")
+            except Exception:
+                pass
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    return self._decode_write_response(response, url)
+            except urllib.error.HTTPError as e:
+                err_data = ""
+                try:
+                    err_data = e.read().decode("utf-8", errors="replace")
+                except Exception:
+                    pass
+                code = int(getattr(e, "code", 0) or 0)
+                if idempotent and code in WRITE_RETRY_STATUS_CODES and attempt < retries:
+                    wait_s = self._retry_wait_seconds(e, attempt, retry_backoff_sec)
+                    logger.warning(
+                        "%s %s failed with HTTP %s, retry %s/%s in %.1fs",
+                        method, url, code, attempt + 1, retries, wait_s,
+                    )
+                    time.sleep(wait_s)
+                    attempt += 1
+                    continue
+                raise urllib.error.URLError(
+                    f"HTTP Error {e.code}: {e.reason}. URL: {url}. Details: {err_data}"
+                )
+            except urllib.error.URLError as e:
+                # For a non-idempotent create only failures that happened before
+                # the body left this process may be retried; a reset or timeout
+                # after sending could mean 1C already recorded the document.
+                may_retry = idempotent or _is_pre_send_connection_error(e)
+                if may_retry and attempt < retries:
+                    wait_s = self._retry_wait_seconds(e, attempt, retry_backoff_sec)
+                    logger.warning(
+                        "%s %s network error (%s), retry %s/%s in %.1fs",
+                        method, url, e, attempt + 1, retries, wait_s,
+                    )
+                    time.sleep(wait_s)
+                    attempt += 1
+                    continue
+                raise
+
     def post(
         self,
         endpoint: str,
         payload: Dict[str, Any],
         timeout: int = 60,
+        retries: int = 2,
+        retry_backoff_sec: float = 1.0,
     ) -> Dict[str, Any]:
+        """Create a document. NOT retried after the request may have arrived."""
         endpoint_clean = (endpoint or "").lstrip("/")
         endpoint_quoted = urllib.parse.quote(endpoint_clean, safe="$()_-,.=/'")
         url = f"{self.base_url}/{endpoint_quoted}"
         body = json.dumps(payload or {}, ensure_ascii=False).encode("utf-8")
-        request = urllib.request.Request(url, data=body, method="POST")
-        for k, v in self._build_headers().items():
-            request.add_header(k, v)
-        try:
-            from datetime import datetime as _dt
-            print(f"[OData] {_dt.now(timezone.utc).isoformat()} POST {url}")
-        except Exception:
-            pass
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                data = response.read()
-                text = data.decode("utf-8", errors="replace").strip()
-                if not text:
-                    return {}
-                content_type = response.headers.get("Content-Type", "") or ""
-                if "application/json" in content_type.lower() or text.startswith("{") or text.startswith("["):
-                    return json.loads(text)
-                return {"_raw": text, "_content_type": content_type, "_url": url}
-        except urllib.error.HTTPError as e:
-            err_data = ""
-            try:
-                err_data = e.read().decode("utf-8", errors="replace")
-            except Exception:
-                pass
-            raise urllib.error.URLError(
-                f"HTTP Error {e.code}: {e.reason}. URL: {url}. Details: {err_data}"
-            )
+        return self._send_write(
+            "POST",
+            url,
+            body,
+            timeout,
+            idempotent=False,
+            retries=retries,
+            retry_backoff_sec=retry_backoff_sec,
+        )
 
     def post_operation(
         self,
         endpoint: str,
         timeout: int = 60,
+        retries: int = 3,
+        retry_backoff_sec: float = 1.0,
     ) -> Dict[str, Any]:
+        """Post/Unpost — idempotent in 1C, so transient failures are retried."""
         endpoint_clean = (endpoint or "").lstrip("/")
         endpoint_quoted = urllib.parse.quote(endpoint_clean, safe="$()_-,.=/'?&")
         url = f"{self.base_url}/{endpoint_quoted}"
-        request = urllib.request.Request(url, data=b"", method="POST")
-        for k, v in self._build_headers().items():
-            request.add_header(k, v)
-        try:
-            from datetime import datetime as _dt
-            print(f"[OData] {_dt.now(timezone.utc).isoformat()} POST {url}")
-        except Exception:
-            pass
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                data = response.read()
-                text = data.decode("utf-8", errors="replace").strip()
-                if not text:
-                    return {}
-                content_type = response.headers.get("Content-Type", "") or ""
-                if "application/json" in content_type.lower() or text.startswith("{") or text.startswith("["):
-                    return json.loads(text)
-                return {"_raw": text, "_content_type": content_type, "_url": url}
-        except urllib.error.HTTPError as e:
-            err_data = ""
-            try:
-                err_data = e.read().decode("utf-8", errors="replace")
-            except Exception:
-                pass
-            raise urllib.error.URLError(
-                f"HTTP Error {e.code}: {e.reason}. URL: {url}. Details: {err_data}"
-            )
+        return self._send_write(
+            "POST",
+            url,
+            b"",
+            timeout,
+            idempotent=True,
+            retries=retries,
+            retry_backoff_sec=retry_backoff_sec,
+        )
 
     def patch(
         self,
         endpoint: str,
         payload: Dict[str, Any],
         timeout: int = 60,
+        retries: int = 3,
+        retry_backoff_sec: float = 1.0,
     ) -> Dict[str, Any]:
+        """Field update on an existing object — idempotent, so retried."""
         endpoint_clean = (endpoint or "").lstrip("/")
         endpoint_quoted = urllib.parse.quote(endpoint_clean, safe="$()_-,.=/'")
         url = f"{self.base_url}/{endpoint_quoted}"
         body = json.dumps(payload or {}, ensure_ascii=False).encode("utf-8")
-        request = urllib.request.Request(url, data=body, method="PATCH")
-        for k, v in self._build_headers().items():
-            request.add_header(k, v)
-        try:
-            from datetime import datetime as _dt
-            print(f"[OData] {_dt.now(timezone.utc).isoformat()} PATCH {url}")
-        except Exception:
-            pass
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                data = response.read()
-                text = data.decode("utf-8", errors="replace").strip()
-                if not text:
-                    return {}
-                content_type = response.headers.get("Content-Type", "") or ""
-                if "application/json" in content_type.lower() or text.startswith("{") or text.startswith("["):
-                    return json.loads(text)
-                return {"_raw": text, "_content_type": content_type, "_url": url}
-        except urllib.error.HTTPError as e:
-            err_data = ""
-            try:
-                err_data = e.read().decode("utf-8", errors="replace")
-            except Exception:
-                pass
-            raise urllib.error.URLError(
-                f"HTTP Error {e.code}: {e.reason}. URL: {url}. Details: {err_data}"
-            )
+        return self._send_write(
+            "PATCH",
+            url,
+            body,
+            timeout,
+            idempotent=True,
+            retries=retries,
+            retry_backoff_sec=retry_backoff_sec,
+        )
 
     @staticmethod
     def _sanitize_select_fields(select_fields: Optional[List[str]]) -> Optional[List[str]]:
@@ -274,11 +344,18 @@ class OData1CClient:
         skip = 0
         last_sig: Optional[str] = None
         page_count = 0
+        self.last_result_truncated = False
 
         while True:
             # Ограничение на количество страниц (страховка от бесконечного цикла)
             page_count += 1
             if max_pages and page_count > max_pages:
+                self.last_result_truncated = True
+                logger.warning(
+                    "OData get_all(%s) hit the max_pages=%s guard after %s records "
+                    "— the result is TRUNCATED",
+                    entity_name, max_pages, len(all_data),
+                )
                 break
 
             params: Dict[str, Any] = {"$top": top, "$skip": skip}
@@ -369,10 +446,16 @@ class OData1CClient:
         skip = 0
         page_count = 0
         last_sig: Optional[str] = None
+        self.last_result_truncated = False
 
         while True:
             page_count += 1
             if max_pages and page_count > max_pages:
+                self.last_result_truncated = True
+                logger.warning(
+                    "OData iter_pages(%s) hit the max_pages=%s guard — iteration is TRUNCATED",
+                    entity_name, max_pages,
+                )
                 break
 
             params: Dict[str, Any] = {"$top": top, "$skip": skip}
@@ -431,10 +514,16 @@ class OData1CClient:
         """
         last_key: Optional[str] = None
         page_count = 0
+        self.last_result_truncated = False
 
         while True:
             page_count += 1
             if max_pages and page_count > max_pages:
+                self.last_result_truncated = True
+                logger.warning(
+                    "OData iter_by_guid(%s) hit the max_pages=%s guard — iteration is TRUNCATED",
+                    entity_name, max_pages,
+                )
                 break
 
             filters: List[str] = []
@@ -502,10 +591,18 @@ def _extract_ref_key(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _resolve_warehouse_mapping(client: OData1CClient, warehouse_refs: List[str]) -> Dict[str, Dict[str, str]]:
+def _resolve_warehouse_mapping(
+    client: OData1CClient,
+    warehouse_refs: List[str],
+    errors: Optional[List[str]] = None,
+) -> Dict[str, Dict[str, str]]:
     """
     Пытается резолвить склады по GUID через наиболее типовые каталоги 1С.
     Возвращает map: Ref_Key -> {"Code": "...", "Name": "..."}.
+
+    Отсутствие каталога в конфигурации — норма (пробуем следующий), но сбой
+    самого запроса раньше был неотличим: `except: continue` прятал и
+    недоступность 1С. Теперь ошибки логируются и накапливаются в ``errors``.
     """
     refs = sorted({str(x).strip() for x in (warehouse_refs or []) if str(x).strip()})
     if not refs:
@@ -566,8 +663,21 @@ def _resolve_warehouse_mapping(client: OData1CClient, warehouse_refs: List[str])
                             mapping[rk]["Code"] = code
                         if not mapping[rk].get("Name") and name:
                             mapping[rk]["Name"] = name
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            message = f"{entity}: {exc}"
+            logger.warning("warehouse catalog lookup failed (%s)", message)
+            if errors is not None:
+                errors.append(message)
             continue
+
+    unresolved_after = [r for r in guid_refs if r not in mapping]
+    if unresolved_after and errors:
+        # Every candidate catalog errored → the warehouse names are missing
+        # because 1C was unreachable, not because the refs are unknown.
+        logger.warning(
+            "%s of %s warehouse refs stayed unresolved after errors: %s",
+            len(unresolved_after), len(guid_refs), "; ".join(errors),
+        )
 
     return mapping
 
@@ -726,13 +836,24 @@ def get_stock_from_1c_odata(
     token: Optional[str] = None,
     filter_query: Optional[str] = None,
     select_fields: Optional[List[str]] = None,
+    diagnostics: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Универсальная загрузка остатков.
     Особенность: для AccumulationRegister .../Balance у 1С может не быть поля Ref_Key,
     поэтому $orderby по умолчанию отключаем.
+
+    ``diagnostics`` (опционально) заполняется признаками неполноты выборки:
+    усечение по max_pages, ошибка резолва кодов номенклатуры, ошибки резолва
+    складов. Раньше всё это молча терялось.
     """
     client = OData1CClient(base_url, username, password, token)
+    diag: Dict[str, Any] = diagnostics if diagnostics is not None else {}
+    diag.setdefault("truncated", False)
+    diag.setdefault("nomenclature_resolve_error", None)
+    diag.setdefault("nomenclature_keys", 0)
+    diag.setdefault("nomenclature_resolved", 0)
+    diag.setdefault("warehouse_resolve_errors", [])
 
     # The plain AccumulationRegister_ЗапасыНаСкладах entity returns movement
     # recorders with nested RecordSet lines in UNF demo. For stock sync we need
@@ -783,6 +904,13 @@ def get_stock_from_1c_odata(
         max_pages=1000,
         order_by=use_order_by,
     )
+    diag["truncated"] = bool(getattr(client, "last_result_truncated", False))
+    if diag["truncated"]:
+        logger.error(
+            "stock balance fetch for %s was TRUNCATED by the page guard — "
+            "the returned balance is incomplete",
+            effective_entity,
+        )
 
     # Сбор ключей номенклатуры из ответа Balance (вариативные поля)
     keys: List[str] = []
@@ -814,11 +942,14 @@ def get_stock_from_1c_odata(
                 print("[OData] Balance sample fields:", list(sample.keys())[:20])
         except Exception:
             pass
+    diag["nomenclature_keys"] = len(keys)
     if keys:
+        # Получаем соответствия Ref_Key -> (Code, Description) батчами.
+        # Раньше ошибка на любом батче обнуляла весь результат (`key_to_code =
+        # None`) без единого следа: остатки молча приезжали без кодов.
+        mapping: Dict[str, Dict[str, str]] = {}
+        CHUNK = 20
         try:
-            # Получаем соответствия Ref_Key -> (Code, Description) батчами
-            mapping: Dict[str, Dict[str, str]] = {}
-            CHUNK = 20
             for i in range(0, len(keys), CHUNK):
                 chunk = keys[i:i + CHUNK]
                 ors = " or ".join([f"Ref_Key eq guid'{k}'" for k in chunk])
@@ -839,9 +970,21 @@ def get_stock_from_1c_odata(
                             "Description": str(r.get("Description") or "").strip(),
                             "Артикул": str(r.get("Артикул") or "").strip(),
                         }
-            key_to_code = mapping
-        except Exception:
-            key_to_code = None
+        except Exception as exc:  # noqa: BLE001
+            diag["nomenclature_resolve_error"] = str(exc)
+            logger.error(
+                "nomenclature code resolution failed after %s/%s keys: %s",
+                len(mapping), len(keys), exc,
+            )
+        # Keep whatever was resolved: a partial mapping is strictly better than
+        # discarding every code that already came back.
+        key_to_code = mapping or None
+        diag["nomenclature_resolved"] = len(mapping)
+        if len(mapping) < len(keys) and diag["nomenclature_resolve_error"] is None:
+            logger.warning(
+                "nomenclature code resolution returned %s of %s keys",
+                len(mapping), len(keys),
+            )
 
     warehouse_keys: List[str] = []
     for r in stock_data:
@@ -856,7 +999,9 @@ def get_stock_from_1c_odata(
         wk = _extract_ref_key(w)
         if wk:
             warehouse_keys.append(wk)
-    warehouse_map = _resolve_warehouse_mapping(client, warehouse_keys)
+    warehouse_errors: List[str] = []
+    warehouse_map = _resolve_warehouse_mapping(client, warehouse_keys, warehouse_errors)
+    diag["warehouse_resolve_errors"] = warehouse_errors
 
     return convert_1c_stock_to_records(
         stock_data,

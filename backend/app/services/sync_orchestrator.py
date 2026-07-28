@@ -16,6 +16,7 @@ reversible. Everything is read-only against 1C.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -57,6 +58,8 @@ from .item_ledger.physical_refresh_orchestrator import run_physical_refresh
 from .odata_client import get_stock_from_1c_odata
 from .. import models
 
+
+logger = logging.getLogger(__name__)
 
 STATE_PATH = Path("config") / "sync_schedule.json"
 
@@ -456,6 +459,93 @@ def _physical_terminal_preflight(
     return result
 
 
+def _has_active_physical_identity(physical_state: Dict[str, Any]) -> bool:
+    return bool(
+        str(physical_state.get("active_generation_key") or "").strip()
+        and _parse_iso(physical_state.get("active_cutoff")) is not None
+    )
+
+
+def _physical_refresh_block(
+    terminal_preflight: Dict[str, Any],
+    inventory: Dict[str, Any],
+    physical_state: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Why the physical-refresh slot must not run, or None when it may.
+
+    These conditions used to abort the whole tick. They are local to the
+    physical contour, so they now fence that one slot: the 15 reference syncs
+    keep their schedule while an operator reviews the conflict.
+    """
+    if terminal_preflight.get("terminal_conflict"):
+        return {
+            "code": "terminal_conflict",
+            "message": (
+                "physical import terminal conflicts with accepted planning truth: "
+                + json.dumps(
+                    terminal_preflight.get("terminal_conflict_batch"),
+                    ensure_ascii=False,
+                )
+            ),
+            "details": terminal_preflight.get("terminal_conflict_batch"),
+        }
+    if inventory.get("unexpected"):
+        return {
+            "code": "unexpected_building_generations",
+            "message": (
+                "unexpected BUILDING physical refresh generations require review: "
+                + json.dumps(inventory["unexpected"], ensure_ascii=False)
+            ),
+            "details": inventory["unexpected"],
+        }
+    if not _has_active_physical_identity(physical_state) and len(
+        inventory.get("recoverable") or []
+    ) > 1:
+        return {
+            "code": "multiple_building_refreshes",
+            "message": "multiple BUILDING physical refresh generations require review",
+            "details": [int(g.id) for g in inventory["recoverable"]],
+        }
+    return None
+
+
+def _record_physical_block(
+    physical_state: Dict[str, Any],
+    block: Optional[Dict[str, Any]],
+    now: datetime,
+) -> bool:
+    """Persist the block marker; returns True when the stored value changed."""
+    previous_code = physical_state.get("blocked_code")
+    previous_reason = physical_state.get("blocked_reason")
+    if block is None:
+        if previous_code is None and previous_reason is None:
+            return False
+        physical_state["blocked_code"] = None
+        physical_state["blocked_reason"] = None
+        physical_state["blocked_details"] = None
+        physical_state["blocked_since"] = None
+        return True
+    changed = previous_code != block["code"] or previous_reason != block["message"]
+    if changed:
+        logger.warning(
+            "physical refresh slot blocked (%s): %s", block["code"], block["message"]
+        )
+        physical_state["blocked_since"] = now.isoformat()
+    physical_state["blocked_code"] = block["code"]
+    physical_state["blocked_reason"] = block["message"]
+    physical_state["blocked_details"] = block["details"]
+    return changed
+
+
+def _physical_refresh_retry_pending(state: Dict[str, Any], now: datetime) -> bool:
+    """True while an earlier failure's backoff window has not elapsed."""
+    maintenance = _physical_refresh_state(state)
+    if int(maintenance.get("failure_count") or 0) <= 0:
+        return False
+    retry_at = _parse_iso(maintenance.get("next_retry_at"))
+    return retry_at is not None and now < retry_at
+
+
 def _physical_refresh_due(state: Dict[str, Any], now: datetime) -> bool:
     maintenance = _physical_refresh_state(state)
     if int(maintenance.get("failure_count") or 0) > 0:
@@ -548,6 +638,25 @@ def _run_physical_refresh_job(
     }
 
 
+class ClusterLockError:
+    """A lock attempt that failed for an infrastructure reason, not contention.
+
+    Falsy on purpose so any legacy ``if not lock`` check keeps failing closed,
+    while callers that care can tell a broken DB from a busy peer.
+    """
+
+    __slots__ = ("error",)
+
+    def __init__(self, error: str) -> None:
+        self.error = error
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return f"ClusterLockError({self.error!r})"
+
+
 def _acquire_cluster_lock(db: Optional[Session]):
     if db is None:
         return True
@@ -558,8 +667,9 @@ def _acquire_cluster_lock(db: Optional[Session]):
         dialect = getattr(bind, "dialect", None)
         if getattr(dialect, "name", "") != "postgresql":
             return True
-    except Exception:
-        return False
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("sync scheduler could not inspect the DB bind")
+        return ClusterLockError(str(exc))
 
     connection = None
     try:
@@ -575,17 +685,20 @@ def _acquire_cluster_lock(db: Optional[Session]):
             connection.close()
             return False
         return connection
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
         if connection is not None:
             try:
                 connection.close()
             except Exception:
                 pass
-        return False
+        # Previously any DB failure here was reported as "busy", so an
+        # unreachable database looked exactly like a peer holding the lock.
+        logger.exception("sync scheduler advisory lock failed")
+        return ClusterLockError(str(exc))
 
 
 def _release_cluster_lock(lock) -> None:
-    if lock is True or lock is False or lock is None:
+    if lock is True or lock is False or lock is None or isinstance(lock, ClusterLockError):
         return
     try:
         lock.execute(
@@ -640,11 +753,18 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
 
     if not _run_lock.acquire(blocking=False):
         return {"status": "busy", "reason": "another sync is running"}
-    cluster_locked = False
+    cluster_locked: Any = False
     try:
         cluster_locked = _acquire_cluster_lock(db)
+        if isinstance(cluster_locked, ClusterLockError):
+            return {
+                "status": "error",
+                "reason": "cluster lock could not be evaluated",
+                "lock": "error",
+                "error": cluster_locked.error,
+            }
         if not cluster_locked:
-            return {"status": "busy", "reason": "another sync is running (cluster lock)"}
+            return {"status": "busy", "reason": "another sync is running (cluster lock)", "lock": "busy"}
 
         now = now or _now()
         state = _load_state()
@@ -656,39 +776,44 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
         physical_state = _physical_refresh_state(state)
         active_parent_for_inventory = _current_accepted_parent(db) if _has_current_accepted_parent(db) else None
         terminal_preflight = _physical_terminal_preflight(db, active_parent_for_inventory)
-        if terminal_preflight["terminal_conflict"]:
-            raise RuntimeError(
-                "physical import terminal conflicts with accepted planning truth: "
-                + json.dumps(terminal_preflight["terminal_conflict_batch"], ensure_ascii=False)
-            )
         physical_inventory = _physical_refresh_inventory(
             db,
             int(active_parent_for_inventory.id) if active_parent_for_inventory is not None else None,
         )
-        if physical_inventory["unexpected"]:
-            raise RuntimeError(
-                "unexpected BUILDING physical refresh generations require review: "
-                + json.dumps(physical_inventory["unexpected"], ensure_ascii=False)
-            )
-        if _has_current_accepted_parent(db) and (
-            ledger_health["ready"] or _physical_refresh_due(state, now)
-        ):
+        physical_block = _physical_refresh_block(
+            terminal_preflight, physical_inventory, physical_state
+        )
+        block_changed = _record_physical_block(physical_state, physical_block, now)
+
+        # The physical slot competes with the reference schedule; both the
+        # "queue has work" and the "interval elapsed" reasons must respect the
+        # failure backoff, otherwise a permanently failing refresh retries every
+        # tick instead of 300s → 3600s.
+        physical_ready = (
+            physical_block is None
+            and active_parent_for_inventory is not None
+            and not _physical_refresh_retry_pending(state, now)
+            and bool(ledger_health["ready"] or _physical_refresh_due(state, now))
+        )
+
+        due = _due_jobs(state, now)
+        job = _pick_next(due, state, now)
+
+        # Fairness: while the recorder queue drains, the refresh is ready on
+        # every single tick and strict priority starves the reference syncs
+        # indefinitely. Alternate slots whenever both want the same tick — the
+        # refresh still owns every tick nobody else needs.
+        if physical_ready and job is not None and state.get("last_tick_slot") == "physical":
+            physical_ready = False
+
+        if physical_ready:
+            state["last_tick_slot"] = "physical"
             started = time.time()
             active_cutoff = _parse_iso(physical_state.get("active_cutoff"))
             active_key = str(physical_state.get("active_generation_key") or "").strip()
             if active_cutoff is None or not active_key:
-                active_parent = _current_accepted_parent(db)
-                inventory = _physical_refresh_inventory(db, int(active_parent.id))
-                if inventory["unexpected"]:
-                    raise RuntimeError(
-                        "unexpected BUILDING physical refresh generations require review: "
-                        + json.dumps(inventory["unexpected"], ensure_ascii=False)
-                    )
-                recoverable = inventory["recoverable"]
-                if len(recoverable) > 1:
-                    raise RuntimeError(
-                        "multiple BUILDING physical refresh generations require review"
-                    )
+                active_parent = active_parent_for_inventory
+                recoverable = physical_inventory["recoverable"]
                 if recoverable:
                     candidate = recoverable[0]
                     active_cutoff = _to_utc(candidate.cutoff).replace(
@@ -741,11 +866,15 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
             result["duration_ms"] = physical_state["last_duration_ms"]
             return result
 
-        due = _due_jobs(state, now)
-        job = _pick_next(due, state, now)
         if job is None:
-            return {"status": "idle", "due": 0}
+            if block_changed:
+                _save_state(state, required=True)
+            idle: Dict[str, Any] = {"status": "idle", "due": 0}
+            if physical_block is not None:
+                idle["physical_refresh_blocked_reason"] = physical_block["message"]
+            return idle
 
+        state["last_tick_slot"] = "jobs"
         started = time.time()
         result: Dict[str, Any] = {
             "status": "ok",
@@ -753,6 +882,8 @@ def tick(db: Session, *, now: Optional[datetime] = None) -> Dict[str, Any]:
             "title": job.title,
             "due_count": len(due),
         }
+        if physical_block is not None:
+            result["physical_refresh_blocked_reason"] = physical_block["message"]
         job_state: Dict[str, Any] = dict(_job_state(state, job.id))
         try:
             summary = job.runner(db, config)
@@ -824,12 +955,31 @@ def status(db: Optional[Session] = None, *, now: Optional[datetime] = None) -> D
         except Exception:
             pass
         physical_inventory = _physical_refresh_inventory(db, current_parent_id)
+    physical_state = _physical_refresh_state(state)
+    if db is not None:
+        block = _physical_refresh_block(
+            terminal_preflight, physical_inventory, physical_state
+        )
+        blocked_reason = block["message"] if block else None
+        blocked_code = block["code"] if block else None
+        blocked_details = block["details"] if block else None
+    else:
+        blocked_reason = physical_state.get("blocked_reason")
+        blocked_code = physical_state.get("blocked_code")
+        blocked_details = physical_state.get("blocked_details")
     return {
         "status": "ok",
         "configured": bool(str(config.get("base_url") or "").strip()),
         "jobs": jobs_out,
         "ledger_pull_queue": pull_queue_health(db),
+        # Surfaced at the top level too: an operator looking at "overdue" needs
+        # the reason the physical contour stopped without reading nested state.
+        "physical_refresh_blocked_reason": blocked_reason,
         "physical_refresh": {
+            "blocked_reason": blocked_reason,
+            "blocked_code": blocked_code,
+            "blocked_details": blocked_details,
+            "blocked_since": physical_state.get("blocked_since"),
             "last_status": _physical_refresh_state(state).get("last_status"),
             "last_error": _physical_refresh_state(state).get("last_error"),
             "failure_count": int(_physical_refresh_state(state).get("failure_count") or 0),

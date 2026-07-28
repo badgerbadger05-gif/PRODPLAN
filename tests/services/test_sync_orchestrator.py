@@ -398,6 +398,7 @@ def test_physical_refresh_recovers_building_generation_when_state_is_lost(
 def test_tick_fails_closed_on_unexpected_building_physical_refresh(
     tmp_state, db_session, monkeypatch, marks, key, algorithm
 ):
+    """The physical slot is fenced, but the reference schedule keeps running."""
     parent = _accepted_parent_fixture(db_session)
     db_session.add(
         models.LedgerGeneration(
@@ -412,11 +413,29 @@ def test_tick_fails_closed_on_unexpected_building_physical_refresh(
     )
     db_session.commit()
     monkeypatch.setattr(orch, "load_odata_config", lambda: {"base_url": "http://configured"})
-    with pytest.raises(RuntimeError, match="unexpected BUILDING physical refresh"):
-        orch.tick(db_session, now=datetime(2026, 7, 24, 12, tzinfo=timezone.utc))
-    inventory = orch.status(db_session)["physical_refresh"]
+    monkeypatch.setattr(
+        orch,
+        "_run_physical_refresh_job",
+        lambda *a, **k: pytest.fail("physical refresh must stay blocked"),
+    )
+    ran = []
+    jobs = [SyncJob("alpha", "Alpha", 1000, lambda db, cfg: ran.append("alpha") or {"ok": True})]
+    monkeypatch.setattr(orch, "SYNC_JOBS", jobs)
+    monkeypatch.setattr(orch, "_JOB_BY_ID", {j.id: j for j in jobs})
+    monkeypatch.setattr(orch, "_ORDER_INDEX", {"alpha": 0})
+
+    res = orch.tick(db_session, now=datetime(2026, 7, 24, 12, tzinfo=timezone.utc))
+    assert res["status"] == "ok"
+    assert res["job"] == "alpha"
+    assert ran == ["alpha"]
+    assert "unexpected BUILDING physical refresh" in res["physical_refresh_blocked_reason"]
+
+    snapshot = orch.status(db_session)
+    inventory = snapshot["physical_refresh"]
     assert inventory["building_inventory_total"] == 1
     assert inventory["unexpected_building_count"] == 1
+    assert inventory["blocked_code"] == "unexpected_building_generations"
+    assert "unexpected BUILDING physical refresh" in snapshot["physical_refresh_blocked_reason"]
 
 
 def test_orphan_non_physical_terminal_is_visible_and_blocks_remote_refresh(
@@ -443,5 +462,195 @@ def test_orphan_non_physical_terminal_is_visible_and_blocks_remote_refresh(
     assert physical["accepted_physical_terminal_id"] == int(parent.physical_import_batch_id)
     assert physical["global_physical_terminal_id"] != physical["accepted_physical_terminal_id"]
     assert physical["terminal_conflict"] is True
-    with pytest.raises(RuntimeError, match="terminal conflicts"):
-        orch.tick(db_session, now=datetime(2026, 7, 24, 12, tzinfo=timezone.utc))
+    assert physical["blocked_code"] == "terminal_conflict"
+    assert "terminal conflicts" in snapshot["physical_refresh_blocked_reason"]
+
+    ran = []
+    jobs = [SyncJob("alpha", "Alpha", 1000, lambda db, cfg: ran.append("alpha") or {"ok": True})]
+    monkeypatch.setattr(orch, "SYNC_JOBS", jobs)
+    monkeypatch.setattr(orch, "_JOB_BY_ID", {j.id: j for j in jobs})
+    monkeypatch.setattr(orch, "_ORDER_INDEX", {"alpha": 0})
+    # The conflict fences the physical slot only: reference syncs keep running.
+    res = orch.tick(db_session, now=datetime(2026, 7, 24, 12, tzinfo=timezone.utc))
+    assert res["status"] == "ok"
+    assert ran == ["alpha"]
+    assert "terminal conflicts" in res["physical_refresh_blocked_reason"]
+
+
+def _stub_reference_jobs(monkeypatch, ran: list, *, interval: int = 100):
+    jobs = [
+        SyncJob("alpha", "Alpha", interval, lambda db, cfg: ran.append("alpha") or {"ok": True})
+    ]
+    monkeypatch.setattr(orch, "SYNC_JOBS", jobs)
+    monkeypatch.setattr(orch, "_JOB_BY_ID", {j.id: j for j in jobs})
+    monkeypatch.setattr(orch, "_ORDER_INDEX", {"alpha": 0})
+    return jobs
+
+
+def test_always_ready_physical_refresh_does_not_starve_due_reference_jobs(
+    tmp_state, db_session, monkeypatch
+):
+    """A never-empty recorder queue must not monopolise every tick."""
+    parent = _accepted_parent_fixture(db_session)
+    ran: list[str] = []
+    _stub_reference_jobs(monkeypatch, ran)
+    monkeypatch.setattr(orch, "load_odata_config", lambda: {"base_url": "http://configured"})
+    # Queue never drains → physical refresh is "ready" on every single tick.
+    monkeypatch.setattr(
+        orch,
+        "pull_queue_health",
+        lambda db: {"pending": 5, "error_retryable": 0, "error_exhausted": 0, "ready": 5},
+    )
+    physical_runs: list[str] = []
+
+    def _refresh(db, cutoff, key):
+        physical_runs.append(key)
+        return {
+            "parent_generation_id": parent.id,
+            "physical_generation_id": parent.id + 1,
+            "published_generation_id": parent.id + 2,
+            "target_cutoff": cutoff.isoformat(),
+            "published": True,
+            "result": {"ok": True},
+        }
+
+    monkeypatch.setattr(orch, "_run_physical_refresh_job", _refresh)
+
+    base = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
+    slots = [
+        orch.tick(db=db_session, now=base + timedelta(seconds=200 * i)).get("job")
+        for i in range(4)
+    ]
+    assert slots == ["physicalRefresh", "alpha", "physicalRefresh", "alpha"]
+    assert ran == ["alpha", "alpha"]
+    assert len(physical_runs) == 2
+
+
+def test_physical_refresh_keeps_every_tick_when_no_reference_job_is_due(
+    tmp_state, db_session, monkeypatch
+):
+    """Alternation only kicks in against a competitor; otherwise refresh owns the tick."""
+    parent = _accepted_parent_fixture(db_session)
+    ran: list[str] = []
+    _stub_reference_jobs(monkeypatch, ran, interval=100_000)
+    monkeypatch.setattr(orch, "load_odata_config", lambda: {"base_url": "http://configured"})
+    monkeypatch.setattr(
+        orch,
+        "pull_queue_health",
+        lambda db: {"pending": 5, "error_retryable": 0, "error_exhausted": 0, "ready": 5},
+    )
+    monkeypatch.setattr(
+        orch,
+        "_run_physical_refresh_job",
+        lambda db, cutoff, key: {
+            "parent_generation_id": parent.id,
+            "physical_generation_id": parent.id + 1,
+            "published_generation_id": parent.id + 2,
+            "target_cutoff": cutoff.isoformat(),
+            "published": True,
+            "result": {"ok": True},
+        },
+    )
+    base = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
+    first = orch.tick(db=db_session, now=base)          # alpha is due too → refresh
+    second = orch.tick(db=db_session, now=base + timedelta(seconds=60))   # alpha ran? no
+    third = orch.tick(db=db_session, now=base + timedelta(seconds=120))
+    assert first["job"] == "physicalRefresh"
+    assert second["job"] == "alpha"       # alpha was still due on the alternate slot
+    assert third["job"] == "physicalRefresh"
+    # alpha's long interval means it is no longer due: refresh keeps every tick.
+    assert [
+        orch.tick(db=db_session, now=base + timedelta(seconds=180 + 60 * i)).get("job")
+        for i in range(3)
+    ] == ["physicalRefresh"] * 3
+
+
+def test_ready_queue_respects_physical_refresh_backoff(
+    tmp_state, db_session, monkeypatch
+):
+    """A failing refresh must back off even while the pull queue stays hot."""
+    _accepted_parent_fixture(db_session)
+    ran: list[str] = []
+    _stub_reference_jobs(monkeypatch, ran, interval=100_000)
+    monkeypatch.setattr(orch, "load_odata_config", lambda: {"base_url": "http://configured"})
+    monkeypatch.setattr(
+        orch,
+        "pull_queue_health",
+        lambda db: {"pending": 3, "error_retryable": 0, "error_exhausted": 0, "ready": 3},
+    )
+    attempts: list[datetime] = []
+
+    def _boom(db, cutoff, key):
+        attempts.append(cutoff)
+        raise RuntimeError("1c down")
+
+    monkeypatch.setattr(orch, "_run_physical_refresh_job", _boom)
+
+    now = datetime(2026, 7, 24, 12, 0, tzinfo=timezone.utc)
+    first = orch.tick(db=db_session, now=now)
+    assert first["status"] == "error"
+    state = orch.status(db_session)["physical_refresh"]
+    assert state["failure_count"] == 1
+    next_retry = datetime.fromisoformat(state["next_retry_at"])
+    assert (next_retry - now).total_seconds() == orch._PHYSICAL_REFRESH_RETRY_BASE_SECONDS
+
+    # 120s later the queue is still "ready" — the old code retried the refresh
+    # here; now the tick goes to the reference schedule, then falls idle.
+    assert orch.tick(db=db_session, now=now + timedelta(seconds=120))["job"] == "alpha"
+    assert orch.tick(db=db_session, now=now + timedelta(seconds=130))["status"] == "idle"
+    assert len(attempts) == 1
+    # After the backoff window the retry is allowed again.
+    assert orch.tick(db=db_session, now=next_retry + timedelta(seconds=1))["status"] == "error"
+    assert len(attempts) == 2
+
+
+def test_cluster_lock_db_failure_is_reported_as_error_not_busy(monkeypatch, tmp_state):
+    class Bind:
+        dialect = type("Dialect", (), {"name": "postgresql"})()
+
+        def connect(self):
+            raise RuntimeError("connection pool exhausted")
+
+    class DB:
+        def get_bind(self):
+            return Bind()
+
+    lock = orch._acquire_cluster_lock(DB())
+    assert isinstance(lock, orch.ClusterLockError)
+    assert not lock                      # still falsy → legacy checks fail closed
+    assert "pool exhausted" in lock.error
+    # Releasing a failed acquisition is a no-op, not a crash.
+    orch._release_cluster_lock(lock)
+
+    monkeypatch.setattr(orch, "load_odata_config", lambda: {"base_url": "http://configured"})
+    res = orch.tick(db=DB())
+    assert res["status"] == "error"
+    assert res["lock"] == "error"
+    assert "pool exhausted" in res["error"]
+
+
+def test_cluster_lock_contention_is_still_busy(monkeypatch, tmp_state):
+    class Connection:
+        def execute(self, *_a, **_k):
+            return type("R", (), {"fetchone": lambda self: (False,)})()
+
+        def commit(self):
+            pass
+
+        def close(self):
+            pass
+
+    class Bind:
+        dialect = type("Dialect", (), {"name": "postgresql"})()
+
+        def connect(self):
+            return Connection()
+
+    class DB:
+        def get_bind(self):
+            return Bind()
+
+    monkeypatch.setattr(orch, "load_odata_config", lambda: {"base_url": "http://configured"})
+    res = orch.tick(db=DB())
+    assert res["status"] == "busy"
+    assert res["lock"] == "busy"
