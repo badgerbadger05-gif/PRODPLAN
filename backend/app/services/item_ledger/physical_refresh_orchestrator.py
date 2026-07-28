@@ -150,6 +150,12 @@ def _publish_refresh_read_snapshots(
 ) -> None:
     """Finish the read surface of a just-accepted physical refresh.
 
+    Publishes only what this generation owns: its own purchase-journal
+    candidate, and MRP result snapshots for runs already bound to it.  Runs
+    frozen against older truth stay unpublished here on purpose — rebinding
+    them belongs to the obligation refresh, and quietly rebuilding them against
+    fresh facts would contradict the frozen obligations they encode.
+
     Fails closed when the generation advertises a capability whose snapshot did
     not materialize: a silently missing snapshot reads to the operator as an
     outage of the whole screen, which is exactly how this gap survived.
@@ -167,6 +173,18 @@ def _publish_refresh_read_snapshots(
         )
 
     for run_id in fixed_run_ids:
+        run = db.get(models.PlanningRun, int(run_id))
+        if run is None:
+            continue
+        # A physical refresh does not rebind frozen runs — that is the
+        # obligation refresh's job — so most fixed runs still belong to older
+        # truth and have no snapshot to publish here. Only the ones this
+        # generation actually owns are ours to rebuild.
+        if (
+            int(run.ledger_generation_id or 0) != int(generation.id)
+            or run.ledger_cutoff != generation.cutoff
+        ):
+            continue
         try:
             build_mrp_result_snapshot(db, int(run_id))
         except ValueError as exc:

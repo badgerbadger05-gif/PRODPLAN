@@ -210,6 +210,38 @@ def test_refresh_fails_closed_when_a_claimed_journal_is_absent(db_session):
         )
 
 
+def test_runs_frozen_against_older_truth_are_left_alone(db_session):
+    """The leftover fixed runs on this contour belong to generations long gone.
+
+    Publishing them here would fail on the binding check and take the whole
+    refresh down with it, which is what happened on shadow.
+    """
+    generation = _generation(db_session)
+    stale_run = models.PlanningRun(
+        run_id=2,
+        status="FIXED_SNAPSHOT",
+        pinned=True,
+        ledger_generation_id=int(generation.id) - 1,
+        ledger_cutoff=CUTOFF - timedelta(days=40),
+    )
+    db_session.add(stale_run)
+    db_session.flush()
+
+    def _explode(*_args, **_kwargs):
+        raise AssertionError("a run bound to older truth must not be republished")
+
+    import app.services.item_ledger.physical_refresh_orchestrator as workflow
+
+    original = workflow.build_mrp_result_snapshot
+    workflow.build_mrp_result_snapshot = _explode
+    try:
+        _publish_refresh_read_snapshots(
+            db_session, generation=generation, fixed_run_ids=(2,)
+        )
+    finally:
+        workflow.build_mrp_result_snapshot = original
+
+
 def test_refresh_tolerates_a_generation_that_claims_no_journal(db_session):
     generation = _generation(db_session, capabilities={})
     _publish_refresh_read_snapshots(
