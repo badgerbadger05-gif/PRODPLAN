@@ -55,6 +55,11 @@ EPS = Decimal("0.001")
 # different event — a re-posted period, a changed organization, a bad snapshot —
 # and must not rewrite the opening balance unattended.
 MAX_ADJUSTED_KEYS = 500
+# Adjustment rows are ordinary ledger facts, so their recorder identity has to
+# fit the same column every pulled recorder uses.
+RECORDER_REF_LIMIT = int(
+    models.StockLedgerEntry.__table__.c.recorder_ref.type.length or 64
+)
 
 AggregateKey = tuple[int, str, str]
 
@@ -179,13 +184,26 @@ def _require_building_generation(db: Session, generation_id: int) -> models.Ledg
 
 
 def _adjustment_recorder_ref(opening_at: datetime, key: AggregateKey) -> str:
+    """Deterministic recorder identity for one adjusted key.
+
+    The identity hash is truncated to whatever ``recorder_ref`` can still hold
+    after the readable prefix, so the column width stays the single source of
+    truth rather than a hand-counted literal.
+    """
     identity = canonical_content_hash({
         "opening_at": opening_at.isoformat(),
         "item_id": key[0],
         "organization_ref": key[1],
         "warehouse_ref1c": key[2],
     })
-    return f"{ADJUSTMENT_SOURCE}:{opening_at.date().isoformat()}:{identity[:40]}"
+    prefix = f"{ADJUSTMENT_SOURCE}:{opening_at.date().isoformat()}:"
+    room = RECORDER_REF_LIMIT - len(prefix)
+    if room < 16:
+        raise OpeningBalanceReconcileError(
+            f"recorder_ref prefix {prefix!r} leaves only {room} characters for the "
+            "identity hash; the adjustment identity would not be collision-safe"
+        )
+    return f"{prefix}{identity[:room]}"
 
 
 def reconcile_opening_balance(

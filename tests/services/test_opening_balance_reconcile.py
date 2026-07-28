@@ -213,6 +213,32 @@ def test_key_unknown_to_the_seed_also_gets_an_anchor(db_session):
     assert anchor.balance_qty == Decimal("2")
 
 
+def test_written_adjustment_fits_every_ledger_column(db_session):
+    """The first shadow run died here: recorder_ref overflowed varchar(64)."""
+    generation, item = _world(db_session)
+
+    result = reconcile_opening_balance(
+        db_session,
+        ledger_generation_id=int(generation.id),
+        opening_snapshot={LedgerKey(item.item_id, "", ORG, WH): Decimal("2180")},
+    )
+    assert result.created is True
+
+    row = db_session.query(models.StockLedgerEntry).filter(
+        models.StockLedgerEntry.recorder_type == ADJUSTMENT_RECORDER_TYPE
+    ).one()
+    columns = models.StockLedgerEntry.__table__.c
+    for name in (
+        "recorder_ref", "recorder_type", "movement_kind",
+        "ingest_source", "record_type", "line_no", "source_content_hash",
+    ):
+        limit = columns[name].type.length
+        value = getattr(row, name)
+        assert len(value) <= limit, (
+            f"{name}={value!r} is {len(value)} chars, column holds {limit}"
+        )
+
+
 def test_mass_shift_is_refused_rather_than_applied(db_session):
     generation, item = _world(db_session)
     extra = []
