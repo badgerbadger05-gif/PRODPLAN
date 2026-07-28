@@ -257,6 +257,11 @@ def rebuild_running_balance(
     return on_hand
 
 
+# Recorder identity of the opening seed. Named so consumers that must never
+# re-pull synthetic rows from 1C can reference it instead of the literal.
+SEED_RECORDER_TYPE = "seed"
+
+
 def seed_from_balance(
     session: Session,
     balance_snapshot: Mapping[LedgerKey, Number],
@@ -342,8 +347,8 @@ def seed_from_balance(
             qty_after=qty,
             posting_at=posting_at,
             record_type="Receipt" if qty >= 0 else "Expense",
-            movement_kind="seed",
-            recorder_type="seed",
+            movement_kind=SEED_RECORDER_TYPE,
+            recorder_type=SEED_RECORDER_TYPE,
             recorder_ref=recorder_ref,
             line_no="0",
             ingest_source=ingest_source,

@@ -29,7 +29,11 @@ from app import models
 
 from .historical_register_scan import scan_historical_register_range
 from .ingest import DEFAULT_MAX_ATTEMPTS, pull_recorder_movements
-from .opening_balance_reconcile import opening_boundary
+from .opening_balance_reconcile import (
+    ADJUSTMENT_RECORDER_TYPE,
+    opening_boundary,
+)
+from .physical import SEED_RECORDER_TYPE
 from .physical import canonical_content_hash
 from .physical_visibility import visible_sles_for_generation
 
@@ -145,9 +149,12 @@ def _require_target_generation(
     return generation, parent
 
 
-# Recorder types that are synthetic (not backed by a 1C document) and therefore
-# must never be re-pulled from 1C during the recorder audit.
-_SYNTHETIC_RECORDER_TYPES = frozenset({"seed"})
+# Recorder types PRODPLAN writes itself. They are not backed by a 1C document,
+# so filtering the register by them makes 1C reject the whole request, and the
+# audit must never try. Derived from the constants that produce them rather than
+# spelled out again, because a synthetic type added later would otherwise fail
+# only on the next refresh, long after the code that introduced it.
+_SYNTHETIC_RECORDER_TYPES = frozenset({SEED_RECORDER_TYPE, ADJUSTMENT_RECORDER_TYPE})
 
 
 def _opening_boundary_at(db: Session) -> datetime | None:

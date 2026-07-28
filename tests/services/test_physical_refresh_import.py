@@ -585,6 +585,78 @@ def test_recorder_audit_allows_noop_with_older_recorder_watermark(db_session, mo
     assert result.terminal_physical_import_batch_id > int(parent_batch.id)
 
 
+def test_every_recorder_type_prodplan_writes_itself_is_treated_as_synthetic():
+    """Filtering the 1C register by a synthetic recorder makes 1C reject the request.
+
+    The audit collects recorder identities from the ledger, so any row PRODPLAN
+    writes under its own recorder type would otherwise be re-pulled as if it
+    were a document. That is a whole refresh lost, discovered only on the next
+    run — which is exactly what the opening adjustment caused.
+    """
+    from app.services.item_ledger.opening_balance_reconcile import (
+        ADJUSTMENT_RECORDER_TYPE,
+    )
+    from app.services.item_ledger.physical import SEED_RECORDER_TYPE
+    from app.services.item_ledger.physical_refresh_import import (
+        _SYNTHETIC_RECORDER_TYPES,
+    )
+
+    for recorder_type in (SEED_RECORDER_TYPE, ADJUSTMENT_RECORDER_TYPE):
+        assert recorder_type in _SYNTHETIC_RECORDER_TYPES, (
+            f"{recorder_type!r} is written by PRODPLAN but the audit would "
+            "try to re-pull it from 1C"
+        )
+
+
+def test_opening_adjustment_rows_never_enter_the_audit(db_session, monkeypatch):
+    """End-to-end: a generation carrying opening adjustments audits cleanly."""
+    parent, parent_batch = _accepted_parent(db_session, "synthetic")
+    _seed_visible_entry(
+        db_session,
+        int(parent_batch.id),
+        recorder_type="opening_adjustment",
+        recorder_ref="opening_adjustment:2026-06-02:deadbeef",
+        posting_at=parent.cutoff - timedelta(days=20),
+    )
+    _seed_visible_entry(
+        db_session,
+        int(parent_batch.id),
+        recorder_type="seed",
+        recorder_ref="seed:2026-06-02:cafe",
+        posting_at=parent.cutoff - timedelta(days=20),
+    )
+    _seed_visible_entry(
+        db_session,
+        int(parent_batch.id),
+        recorder_type="Document_ПеремещениеЗапасов",
+        recorder_ref="real-doc",
+        posting_at=parent.cutoff - timedelta(days=1),
+    )
+    target = _building_target(db_session, parent, "synthetic")
+    db_session.commit()
+
+    pulled: list[str] = []
+
+    def _pull(db, recorder_type, recorder_ref, **kwargs):
+        pulled.append(recorder_ref)
+        return PullResult(
+            status="done", inserted=0, physical_import_batch_id=int(parent_batch.id)
+        )
+
+    monkeypatch.setattr(
+        "app.services.item_ledger.physical_refresh_import.pull_recorder_movements",
+        _pull,
+    )
+    run_physical_recorder_audit(
+        db_session,
+        ledger_generation_id=target.id,
+        parent_generation_id=parent.id,
+        client=_RegisterClient(),
+    )
+
+    assert pulled == ["real-doc"]
+
+
 def test_backdated_recorder_absent_from_ledger_joins_the_audit(db_session, monkeypatch):
     """A document dated behind the parent cutoff but posted after it.
 
