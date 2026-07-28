@@ -62,6 +62,73 @@ def _checkpoint_key(generation_key: str) -> str:
     return f"obligation-refresh:{generation_key}"
 
 
+def _sealed_manifest_keys() -> tuple[str, str]:
+    """The two watermark keys a *later* step of this same build may add.
+
+    Imported lazily: the manifest module consumes this one, so an import-time
+    dependency in the other direction would close the cycle.
+    """
+    from app.services.obligation_refresh_manifest import (
+        MANIFEST_HASH_KEY,
+        MANIFEST_KEY,
+    )
+
+    return str(MANIFEST_KEY), str(MANIFEST_HASH_KEY)
+
+
+def _manifest_hash(payload: Any) -> str:
+    """Byte-identical to ``obligation_refresh_manifest._hash``."""
+    return sha256(
+        json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _watermarks_are_own_progress(
+    existing: dict[str, Any], expected: dict[str, Any]
+) -> bool:
+    """Is ``existing`` the fork's own lineage, possibly advanced by its build?
+
+    A resume re-enters :func:`fork_obligation_generation` with the same
+    ``generation_key`` *after* later steps have already run.  The only step
+    which is allowed to grow an obligation target's watermarks is the manifest
+    seal, so:
+
+    * every key the fork itself wrote must still be byte-identical — that is
+      what proves this generation belongs to the same parent, the same
+      ``replay_from`` and the same generation kind, and it is what rejects a
+      foreign request squatting on the key;
+    * the only tolerated additions are the sealed manifest pair, and the seal
+      must still hash to its own recorded content hash.
+
+    Anything else (a missing base key, a mutated base key, an unknown extra key,
+    a manifest whose hash does not match) is a conflict, not progress.  The
+    *request* sealed inside that manifest is re-verified by
+    :func:`create_obligation_refresh_manifest` immediately afterwards, so a
+    same-lineage build with different plan ids is still refused — one layer up,
+    where the request actually lives.
+    """
+    manifest_key, hash_key = _sealed_manifest_keys()
+    base = {
+        key: value
+        for key, value in existing.items()
+        if key not in (manifest_key, hash_key)
+    }
+    if base != expected:
+        return False
+    extra = set(existing) - set(base)
+    if not extra:
+        return True
+    if extra != {manifest_key, hash_key}:
+        return False
+    manifest = existing.get(manifest_key)
+    content_hash = existing.get(hash_key)
+    if not isinstance(manifest, dict) or not isinstance(content_hash, str):
+        return False
+    return _manifest_hash(manifest) == content_hash
+
+
 def _reused_metrics(
     parent: models.LedgerGeneration,
     physical: models.PhysicalImportBatch,
@@ -201,11 +268,18 @@ def _exact_existing(
         str(existing.status) != "building"
         or existing.physical_import_batch_id != physical.id
         or _utc(existing.cutoff, "existing cutoff") != _utc(parent.cutoff, "parent cutoff")
-        or dict(existing.source_watermarks or {}) != _expected_watermarks_with_replay_from(
-            parent.id,
-            replay_from,
+        or not _watermarks_are_own_progress(
+            dict(existing.source_watermarks or {}),
+            _expected_watermarks_with_replay_from(parent.id, replay_from),
         )
-        or dict(existing.capabilities or {}) != {}
+        # ``capabilities`` are deliberately NOT compared: the fork creates them
+        # empty, but the later build steps of this very generation declare the
+        # capability snapshot they produced, and a resume must not read that as
+        # a foreign lineage.  What the candidate actually claims is audited
+        # where it matters — ``publish_obligation_refresh_batch`` refuses to
+        # accept a target whose capabilities are empty, incomplete, or differ
+        # from the snapshot the publisher was handed.
+        or not isinstance(existing.capabilities or {}, dict)
         or str(existing.algorithm_version) != ALGORITHM_VERSION
         or str(existing.replay_version) != REPLAY_VERSION
     ):

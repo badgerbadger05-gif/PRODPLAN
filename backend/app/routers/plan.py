@@ -65,6 +65,7 @@ from ..services.period_plan_service import (
     get_period_plan_matrix,
     list_mrp_runs_for_plan,
     list_period_plans,
+    repair_duplicate_plan_snapshots,
     update_period_plan_header,
 )
 
@@ -426,6 +427,10 @@ class PeriodPlanMrpSnapshotRequest(BaseModel):
     started_by: Optional[str] = None
 
 
+class PeriodPlanRepairSnapshotsRequest(BaseModel):
+    repaired_by: Optional[str] = None
+
+
 class PeriodPlanUpdateRequest(BaseModel):
     name: Optional[str] = None
     period_from: Optional[str] = None
@@ -629,6 +634,32 @@ async def period_plans_mrp_snapshot(
             plan_id,
             generation_key=req.generation_key,
             started_by=req.started_by or "api",
+        )
+        db.commit()
+        return result
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/period-plans/{plan_id}/repair-duplicate-snapshots")
+async def period_plans_repair_duplicate_snapshots(
+    plan_id: int,
+    req: PeriodPlanRepairSnapshotsRequest = PeriodPlanRepairSnapshotsRequest(),
+    db: Session = Depends(get_db),
+):
+    """Административный ремонт плана с несколькими текущими FIXED_SNAPSHOT.
+
+    Старая гонка TOCTOU могла опубликовать два снимка одного плана. Такой план
+    навсегда отвергается обычным путём («План имеет несколько текущих
+    зафиксированных MRP-снимков»). Ремонт под тем же локом публикации
+    детерминированно оставляет один прогон, остальные переводит в `SUPERSEDED`,
+    после чего обычный путь снимка снова работает. Идемпотентен: для здорового
+    плана возвращает `repaired=false` и ничего не меняет.
+    """
+    try:
+        result = repair_duplicate_plan_snapshots(
+            db, plan_id, repaired_by=req.repaired_by,
         )
         db.commit()
         return result
@@ -1784,7 +1815,19 @@ async def export_plan(
     req: ExportRequest,
     db: Session = Depends(get_db)
 ):
-    """Экспортировать план производства в CSV или Excel"""
+    """Экспортировать план производства в CSV или Excel.
+
+    Формат берётся из тела запроса и генерируется честно. Раньше маршрут всегда
+    отдавал CSV, но проставлял в ответе запрошенный формат, поэтому клиент,
+    попросивший `xlsx`, сохранял CSV под именем книги Excel. Неподдерживаемый
+    формат теперь отвергается 422, а не подменяется молча.
+    """
+    export_format = str(req.format or "csv").strip().lower()
+    if export_format not in {"csv", "xlsx"}:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Неподдерживаемый формат экспорта: {req.format!r} (csv|xlsx)",
+        )
     try:
         # Получаем все данные без пагинации
         data = query_plan_matrix_paginated(
@@ -1818,22 +1861,67 @@ async def export_plan(
 
             export_rows.append(export_row)
 
-        # Возвращаем CSV
+        headers = list(export_rows[0].keys()) if export_rows else [
+            'Изделие', 'Артикул', 'Код', 'План на месяц', *dates,
+        ]
+
+        if export_format == "xlsx":
+            import base64
+            import io
+
+            try:
+                from openpyxl import Workbook
+                from openpyxl.styles import Font
+                from openpyxl.utils import get_column_letter
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"openpyxl not available: {e}")
+
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "Plan"
+            ws.append(headers)
+            for col_idx in range(1, len(headers) + 1):
+                ws.cell(row=1, column=col_idx).font = Font(bold=True)
+            widths = {idx: len(str(name)) for idx, name in enumerate(headers, start=1)}
+            for row in export_rows:
+                values = [row.get(name, "") for name in headers]
+                ws.append(values)
+                for idx, value in enumerate(values, start=1):
+                    widths[idx] = max(widths.get(idx, 0), len(str(value if value is not None else "")))
+            for col_idx in range(1, len(headers) + 1):
+                ws.column_dimensions[get_column_letter(col_idx)].width = min(
+                    max(widths.get(col_idx, 10) * 1.2 + 2, 12), 60
+                )
+
+            bio = io.BytesIO()
+            wb.save(bio)
+            bio.seek(0)
+            return {
+                "status": "ok",
+                "data_base64": base64.b64encode(bio.read()).decode("utf-8"),
+                "format": "xlsx",
+                "filename": "production_plan.xlsx",
+                "total_rows": len(export_rows),
+            }
+
         import io
         import csv
 
         output = io.StringIO()
         if export_rows:
-            writer = csv.DictWriter(output, fieldnames=export_rows[0].keys())
+            writer = csv.DictWriter(output, fieldnames=headers)
             writer.writeheader()
             writer.writerows(export_rows)
 
         return {
             "status": "ok",
             "data": output.getvalue(),
-            "format": req.format,
+            "format": "csv",
+            "filename": "production_plan.csv",
             "total_rows": len(export_rows)
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

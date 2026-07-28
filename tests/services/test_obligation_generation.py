@@ -1,9 +1,15 @@
 from datetime import datetime, timezone
 from decimal import Decimal
+from hashlib import sha256
+import json
 
 import pytest
 
 from app import models
+from app.services.obligation_refresh_manifest import (
+    MANIFEST_HASH_KEY,
+    MANIFEST_KEY,
+)
 from app.services.item_ledger.obligation_generation import (
     ALGORITHM_VERSION,
     GENERATION_KIND,
@@ -127,8 +133,11 @@ def test_fork_is_idempotent_only_for_exact_building_candidate(db_session):
     assert second.created is False
     assert second.ledger_generation_id == first.ledger_generation_id
 
+    # ``capabilities`` are no longer part of this identity — the build declares
+    # them on its own target and a resume must not read that as a foreign
+    # lineage (the publisher audits them instead).  Lineage itself still is.
     candidate = db_session.get(models.LedgerGeneration, first.ledger_generation_id)
-    candidate.capabilities = {"bad": True}
+    candidate.replay_version = "someone-elses-replay/9"
     db_session.commit()
     with pytest.raises(ObligationGenerationError, match="different"):
         fork_obligation_generation(db_session, parent.id, "obligation-idempotent")
@@ -209,3 +218,64 @@ def test_fork_rejects_foreign_parent_even_when_current_pointer_is_valid(db_sessi
     assert db_session.get(models.PlanningTruthState, 1).current_generation_id == current.id
     with pytest.raises(ObligationGenerationError, match="not the current"):
         fork_obligation_generation(db_session, foreign.id, "foreign-child")
+
+
+# ---------------------------------------------------------------------------
+# Resume: the fork is re-entered after later steps advanced its own watermarks
+# ---------------------------------------------------------------------------
+
+def _seal_manifest(db, generation, payload):
+    """Write the manifest pair exactly the way the manifest module does."""
+    generation.source_watermarks = {
+        **dict(generation.source_watermarks or {}),
+        MANIFEST_KEY: payload,
+        MANIFEST_HASH_KEY: sha256(
+            json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest(),
+    }
+    db.commit()
+
+
+def test_fork_accepts_its_own_candidate_after_the_manifest_sealed_watermarks(db_session):
+    """A resume re-enters the fork once the manifest grew the watermarks.
+
+    Before this, the fork compared watermarks for byte equality with the three
+    keys it had written itself, so every resume of an interrupted refresh was
+    refused before the manifest could even be re-read.
+    """
+    parent, _physical = _accepted_parent(db_session)
+    first = fork_obligation_generation(db_session, parent.id, "sealed-resume")
+    db_session.commit()
+    candidate = db_session.get(models.LedgerGeneration, first.ledger_generation_id)
+    _seal_manifest(db_session, candidate, {"version": 1, "entries": [], "add_request": {}})
+
+    resumed = fork_obligation_generation(db_session, parent.id, "sealed-resume")
+
+    assert resumed.created is False
+    assert resumed.ledger_generation_id == first.ledger_generation_id
+
+
+@pytest.mark.parametrize("mutate", ["hash", "unknown_key", "parent", "replay_from"])
+def test_fork_still_rejects_a_watermark_that_is_not_its_own_progress(db_session, mutate):
+    parent, _physical = _accepted_parent(db_session)
+    first = fork_obligation_generation(db_session, parent.id, f"tampered-{mutate}")
+    db_session.commit()
+    candidate = db_session.get(models.LedgerGeneration, first.ledger_generation_id)
+    _seal_manifest(db_session, candidate, {"version": 1, "entries": [], "add_request": {}})
+
+    marks = dict(candidate.source_watermarks)
+    if mutate == "hash":
+        marks[MANIFEST_HASH_KEY] = "0" * 64
+    elif mutate == "unknown_key":
+        marks["someone_elses_watermark"] = 1
+    elif mutate == "parent":
+        marks["parent_generation_id"] = int(parent.id) + 1000
+    else:
+        marks["replay_from"] = "2020-01-01T00:00:00+00:00"
+    candidate.source_watermarks = marks
+    db_session.commit()
+
+    with pytest.raises(ObligationGenerationError, match="different"):
+        fork_obligation_generation(db_session, parent.id, f"tampered-{mutate}")

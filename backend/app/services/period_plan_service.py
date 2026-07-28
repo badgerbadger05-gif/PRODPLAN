@@ -1234,6 +1234,114 @@ def create_mrp_snapshot_for_plan(
     )
 
 
+def _has_mrp_result_snapshot(db: Session, run_id: int, generation_id: Optional[int]) -> bool:
+    # Lazy: ``mrp_result_snapshot`` owns both the consumer name and the key
+    # spelling, and importing it at module scope would close an import cycle.
+    from .mrp_result_snapshot import CONSUMER as MRP_RESULT_CONSUMER, _snapshot_key
+
+    query = db.query(PlanningReadSnapshot.id).filter(
+        PlanningReadSnapshot.consumer == MRP_RESULT_CONSUMER,
+        PlanningReadSnapshot.snapshot_key == _snapshot_key(int(run_id)),
+    )
+    if generation_id is not None:
+        query = query.filter(
+            PlanningReadSnapshot.ledger_generation_id == int(generation_id)
+        )
+    return query.first() is not None
+
+
+def repair_duplicate_plan_snapshots(
+    db: Session,
+    plan_id: int,
+    *,
+    repaired_by: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Admin repair for a plan poisoned with more than one FIXED_SNAPSHOT run.
+
+    Before the publication lock was taken in :func:`_lock_mrp_ledger`, two
+    concurrent fixations of the same plan could both observe «no snapshot yet»,
+    both fork a generation and both publish.  The plan is then permanently
+    unusable: :func:`create_mrp_snapshot_from_period_plan` refuses it with «План
+    имеет несколько текущих зафиксированных MRP-снимков», and the
+    ``uq_planning_run_fixed_snapshot_source_plan`` migration cannot even be
+    applied to such a database.  The race itself is closed; this is the cleanup
+    for rows it already produced.
+
+    The surviving run is chosen deterministically, never by wall-clock luck:
+    a published MRP result snapshot in the current accepted generation wins over
+    one in any generation, which wins over one with no snapshot at all, and the
+    highest ``run_id`` breaks every remaining tie.  Losers become
+    ``SUPERSEDED`` — the same status the obligation-refresh publisher gives a
+    parent run it replaced; no new lifecycle state is invented.  Plan lines
+    still locked by a loser are re-pointed at the survivor so the plan keeps one
+    coherent lock owner.
+
+    Transaction ownership stays with the caller (no commit / no rollback here).
+    """
+    _lock_mrp_ledger(db)
+    plan = _get_plan(db, int(plan_id))
+    parent = _current_accepted_generation(db)
+    runs = (
+        db.query(PlanningRun)
+        .filter(
+            PlanningRun.source_plan_id == int(plan.id),
+            PlanningRun.status == "FIXED_SNAPSHOT",
+        )
+        .order_by(PlanningRun.run_id.asc())
+        .all()
+    )
+    current_run_ids = {
+        int(run.run_id)
+        for run in runs
+        if _resolve_parent_generation_id(
+            db, run, current_generation_id=int(parent.id)
+        ) == int(parent.id)
+    }
+    if len(runs) <= 1:
+        return {
+            "status": "ok",
+            "plan_id": int(plan.id),
+            "repaired": False,
+            "survivor_run_id": int(runs[0].run_id) if runs else None,
+            "superseded_run_ids": [],
+            "current_generation_id": int(parent.id),
+        }
+
+    # Prefer a run that is bound to the current truth at all: a FIXED_SNAPSHOT
+    # left behind by an older generation must never outrank a live one.
+    candidates = [run for run in runs if int(run.run_id) in current_run_ids] or runs
+
+    def _rank(run: PlanningRun) -> tuple[int, int, int]:
+        return (
+            int(_has_mrp_result_snapshot(db, int(run.run_id), int(parent.id))),
+            int(_has_mrp_result_snapshot(db, int(run.run_id), None)),
+            int(run.run_id),
+        )
+
+    survivor = max(candidates, key=_rank)
+    superseded: List[int] = []
+    for run in runs:
+        if int(run.run_id) == int(survivor.run_id):
+            continue
+        run.status = "SUPERSEDED"
+        run.pinned = False
+        superseded.append(int(run.run_id))
+    db.query(ProductionPlanLine).filter(
+        ProductionPlanLine.plan_id == int(plan.id),
+        ProductionPlanLine.locked_by_run_id.in_(superseded),
+    ).update({"locked_by_run_id": int(survivor.run_id)}, synchronize_session=False)
+    db.flush()
+    return {
+        "status": "ok",
+        "plan_id": int(plan.id),
+        "repaired": True,
+        "survivor_run_id": int(survivor.run_id),
+        "superseded_run_ids": superseded,
+        "current_generation_id": int(parent.id),
+        "repaired_by": str(repaired_by) if repaired_by else None,
+    }
+
+
 def _prepare_include_run(
     db: Session,
     plan_id: int,
@@ -2054,17 +2162,15 @@ def close_fixed_plan(db: Session, run_id: int, *, dry_run: bool = False) -> Dict
         generation_id=payload_generation_id,
     )
     if existing_closed_snapshot is not None:
+        # The run is still FIXED_SNAPSHOT here (the CLOSED branch returned
+        # above), so this row is the residue of a closure whose worker died
+        # *after* recording the snapshot and before the publication became
+        # truth.  Answering «already_closed» would be a silent lie: the plan is
+        # still open in the current planning truth.  Verify the recorded payload
+        # is still the one this run produces and then resume the refresh; the
+        # existing row is reused rather than duplicated.
         if dict(existing_closed_snapshot.payload or {}) != execution_payload:
             raise ValueError("closed plan snapshot payload mismatch for this run")
-        return {
-            "status": "already_closed",
-            "run_id": int(run.run_id),
-            "dry_run": bool(dry_run),
-            "requirements_closed": 0,
-            "reservations_released": 0,
-            "purchases_pruned": [],
-            "published_generation_id": int(payload_generation_id),
-        }
 
     execution_generation = db.get(LedgerGeneration, payload_generation_id)
     if execution_generation is None:
@@ -2072,7 +2178,7 @@ def close_fixed_plan(db: Session, run_id: int, *, dry_run: bool = False) -> Dict
     if execution_generation.cutoff is None:
         raise ValueError("run execution cutoff is unavailable")
 
-    if not dry_run:
+    if not dry_run and existing_closed_snapshot is None:
         db.add(ClosedPlanSnapshot(
             plan_id=plan.id,
             run_id=run.run_id,
