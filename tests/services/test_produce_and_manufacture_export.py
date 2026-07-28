@@ -797,7 +797,9 @@ def test_failed_posting_keeps_created_ref_on_manufacture(db_session, monkeypatch
     assert m.export_error is None
 
 
-def test_second_export_repairs_existing_document(db_session, monkeypatch):
+def test_second_export_does_not_touch_successfully_exported_document(db_session, monkeypatch):
+    """Contract «Что не делать» п.5: a successful sync_link means the document
+    exists and is posted — a repeat must not Unpost/PATCH/Post it again."""
     db = db_session
     item = _mk_item(db, code="EXP-DUP", ref1c="item-ref-dup")
     product = _mk_product(db, item, qty=2)
@@ -809,15 +811,156 @@ def test_second_export_repairs_existing_document(db_session, monkeypatch):
 
     exporter.export_manufactures_to_1c(db, [mid], dry_run=False)
     assert len(fake.posts) == 1
+    operations_after_first = list(fake.operations)
 
     result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False)
-    assert result["manufactures_created"] == 1
-    assert result["manufactures_already_linked"] == 0
+    assert result["manufactures_created"] == 0
+    assert result["manufactures_error"] == 0
+    assert result["manufactures_eligible"] == 0
+    assert result["manufactures_already_linked"] == 1
     assert len(fake.posts) == 1
-    assert len(fake.patches) == 1
-    assert fake.patches[0][0] == "Document_СборкаЗапасов(guid'reuse-ref')"
-    assert "Document_СборкаЗапасов(guid'reuse-ref')/Unpost" in fake.operations
-    assert "Document_СборкаЗапасов(guid'reuse-ref')/Post?PostingModeOperational=true" in fake.operations
+    assert fake.patches == []
+    assert fake.operations == operations_after_first
+
+    entry = result["entries"][0]
+    assert entry["status"] == "existing"
+    assert entry["target_ref_key"] == "reuse-ref"
+
+    m = db.query(ProductionManufacture).filter_by(manufacture_id=mid).one()
+    assert m.status == "exported"
+    assert m.exported_ref1c == "reuse-ref"
+
+
+def test_manufacture_payload_without_order_ref_raises_value_error():
+    """Business invariant, not an assert: СборкаЗапасов needs its order basis."""
+    entry = exporter.ManufactureExportEntry(
+        manufacture_id=1,
+        product_id=2,
+        order_id=3,
+        order_ref1c=None,
+        item_ref1c="item-ref",
+        item_name="Item",
+        item_article="ART",
+        unit_ref1c="unit-ref",
+        qty=1,
+        number="MF000000001",
+    )
+
+    with pytest.raises(ValueError, match="order_ref1c"):
+        exporter._build_header_payload(entry, {})
+
+
+# ---------------------------------------------------------------------------
+# Resumable «Произвести»
+# ---------------------------------------------------------------------------
+
+
+def test_commanded_qty_counts_errored_manufacture_with_1c_document(db_session):
+    db = db_session
+    item = _mk_item(db, code="CMD-ERR", ref1c="item-ref-cmd-err")
+    product = _mk_product(db, item, qty=5)
+    mid = produce_line(db, product.product_id, qty=5)["manufacture_id"]
+    m = db.query(ProductionManufacture).filter_by(manufacture_id=mid).one()
+    m.status = "error"
+    m.exported_ref1c = "assembly-created-ref"
+    db.commit()
+
+    totals = exporter.commanded_qty_by_product(db, [product.product_id])
+
+    assert totals[product.product_id] == 5.0
+
+    # ... while a local-only failure (no 1C document) frees the quantity again.
+    m.exported_ref1c = None
+    db.commit()
+    assert exporter.commanded_qty_by_product(db, [product.product_id])[product.product_id] == 0.0
+
+
+def test_repeat_produce_resumes_failed_assembly_instead_of_duplicating(db_session, monkeypatch):
+    """A СборкаЗапасов created but not posted must be retried, never doubled."""
+    db = db_session
+    item = _mk_item(db, code="RESUME-ERR", ref1c="item-ref-resume-err")
+    product = _mk_product(db, item, qty=5)
+    mid = produce_line(db, product.product_id, qty=5)["manufacture_id"]
+
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    monkeypatch.setattr(
+        exporter,
+        "OData1CClient",
+        lambda **_: _PostFailsAfterCreateClient(ref_key="assembly-created-not-posted"),
+    )
+    failed = exporter.export_manufactures_to_1c(db, [mid], dry_run=False)
+    assert failed["manufactures_error"] == 1
+
+    again = produce_line(db, product.product_id, qty=5)
+
+    assert again["status"] == "resumed_pending_1c_fact"
+    assert again["resumed"] is True
+    assert again["manufacture_id"] == mid
+    assert "СборкаЗапасов уже создана" in again["resume_reason"]
+    assert (
+        db.query(ProductionManufacture).filter_by(product_id=product.product_id).count() == 1
+    )
+
+    # And the resumed export repairs the existing document instead of creating one.
+    retry_client = _FakeClient(ref_key="should-not-create")
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: retry_client)
+    retry = exporter.export_manufactures_to_1c(db, [again["manufacture_id"]], dry_run=False)
+    assert retry["manufactures_created"] == 1
+    assert retry_client.posts == []
+
+
+def test_repeat_produce_resumes_when_piecework_order_is_missing(db_session, monkeypatch):
+    """Assembly posted, наряд failed: the next press rolls the chain forward."""
+    db = db_session
+    item = _mk_item(db, code="RESUME-PW", ref1c="item-ref-resume-pw")
+    product = _mk_product(db, item, qty=6)
+    mid = produce_line(db, product.product_id, qty=6)["manufacture_id"]
+
+    _stub_config(monkeypatch, base_url="http://demo/odata/unf_demo")
+    monkeypatch.setattr(exporter, "OData1CClient", lambda **_: _FakeClient(ref_key="assembly-posted-ref"))
+    assert exporter.export_manufactures_to_1c(db, [mid], dry_run=False)["manufactures_created"] == 1
+
+    again = produce_line(db, product.product_id, qty=6)
+
+    assert again["resumed"] is True
+    assert again["manufacture_id"] == mid
+    assert "СдельныйНаряд не создан" in again["resume_reason"]
+    assert (
+        db.query(ProductionManufacture).filter_by(product_id=product.product_id).count() == 1
+    )
+
+    # Once the наряд exists, the line is fully commanded again — no more resume.
+    db.add(SyncLink(
+        source_doctype="piecework",
+        source_id=mid,
+        target_entity=piecework_exporter.PIECEWORK_ENTITY,
+        target_number="PW000000001",
+        payload_hash="hash",
+        target_ref_key="piecework-ref",
+        status="success",
+    ))
+    db.commit()
+
+    with pytest.raises(ValueError, match="весь объём"):
+        produce_line(db, product.product_id, qty=6)
+
+
+def test_export_failure_detail_surfaces_skipped_rows():
+    from app.routers.production_control import _export_failure_detail
+
+    export = {
+        "entries": [],
+        "skipped_rows": [
+            {"manufacture_id": 7, "reason": "item_ref1c пустой, нельзя сопоставить"},
+        ],
+    }
+
+    detail = _export_failure_detail(export, {}, "1С не создала и не провела СборкаЗапасов")
+
+    assert "item_ref1c пустой" in detail
+    assert detail.startswith("1С не создала")
+    # An entry-level error still wins over the skip list.
+    assert _export_failure_detail(export, {"error": "boom"}, "default") == "boom"
 
 
 def test_chain_auto_exports_parent_order_in_dry_run(db_session):

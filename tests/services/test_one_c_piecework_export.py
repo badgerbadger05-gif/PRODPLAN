@@ -575,8 +575,10 @@ def test_existing_error_link_with_ref_patches_not_posts_duplicate(db_session, mo
     assert fake.posts == []
     assert len(fake.patches) == 3
     assert fake.patches[0][0] == "Document_СдельныйНаряд(guid'existing-ref')"
+    # 1C refuses to PATCH a posted document: the retry unposts it first.
     assert fake.operations == [
-        "Document_СдельныйНаряд(guid'existing-ref')/Post?PostingModeOperational=true"
+        "Document_СдельныйНаряд(guid'existing-ref')/Unpost",
+        "Document_СдельныйНаряд(guid'existing-ref')/Post?PostingModeOperational=true",
     ]
     assert fake.patches[1][0] == "Document_СдельныйНаряд(guid'existing-ref')"
     assert fake.patches[2][0] == f"Document_ЗаказНаПроизводство(guid'order-ref-{item.item_id}')"
@@ -591,6 +593,127 @@ def test_existing_error_link_with_ref_patches_not_posts_duplicate(db_session, mo
     assert link.target_ref_key == "existing-ref"
     db.refresh(m.order)
     assert m.order.order_state_key == exporter.DONE_STATE_KEY
+
+
+def test_partial_release_does_not_close_the_production_order(db_session, monkeypatch):
+    """Частичный выпуск не закрывает Document_ЗаказНаПроизводство целиком."""
+    db = db_session
+    item = _mk_item(db, code="PW-PARTIAL", ref1c="item-ref-partial")
+    m = _mk_manufacture(db, item, qty=4.0, exported_ref1c="basis-ref-partial")
+    m.product.quantity = 10
+    m.product.produced_qty = 0
+    m.product.remaining_qty = 10
+    db.commit()
+
+    fake = _FakeClient(ref_key="pw-partial-ref")
+    _stub_config(monkeypatch, base_url="http://mtzw7/unf_demo/odata/standard.odata")
+    monkeypatch.setattr(exporter, "_create_odata_client", lambda *a, **kw: fake)
+
+    result = exporter.export_piecework_to_1c(
+        db, [m.manufacture_id],
+        operation_ref="op-ref-partial",
+        dry_run=False,
+    )
+
+    assert result["manufactures_created"] == 1
+    # Only the piecework document itself is patched, the order is untouched.
+    assert [ref for ref, _payload in fake.patches] == [
+        "Document_СдельныйНаряд(guid'pw-partial-ref')"
+    ]
+    assert result["entries"][0]["order_closed"] is False
+    db.refresh(m.order)
+    assert m.order.order_state_key is None
+    assert m.order.order_state_name is None
+
+
+def test_full_release_closes_the_production_order(db_session, monkeypatch):
+    db = db_session
+    item = _mk_item(db, code="PW-FULL", ref1c="item-ref-full")
+    m = _mk_manufacture(db, item, qty=4.0, exported_ref1c="basis-ref-full")
+    m.product.quantity = 4
+    m.product.produced_qty = 0
+    m.product.remaining_qty = 4
+    db.commit()
+
+    fake = _FakeClient(ref_key="pw-full-ref")
+    _stub_config(monkeypatch, base_url="http://mtzw7/unf_demo/odata/standard.odata")
+    monkeypatch.setattr(exporter, "_create_odata_client", lambda *a, **kw: fake)
+
+    result = exporter.export_piecework_to_1c(
+        db, [m.manufacture_id],
+        operation_ref="op-ref-full",
+        dry_run=False,
+    )
+
+    assert result["entries"][0]["order_closed"] is True
+    assert fake.patches[-1][0] == f"Document_ЗаказНаПроизводство(guid'order-ref-{item.item_id}')"
+    db.refresh(m.order)
+    assert m.order.order_state_key == exporter.DONE_STATE_KEY
+
+
+def test_missing_spec_operation_fails_only_its_own_entry(db_session, monkeypatch):
+    """Один плохой выпуск не должен рвать весь батч без записи ошибок."""
+    db = db_session
+    good_item = _mk_item(db, code="PW-BATCH-OK", ref1c="item-ref-batch-ok")
+    spec = Specification(spec_name="Batch spec", spec_ref1c="spec-ref-batch")
+    operation = Operation(operation_ref1c="op-ref-batch", operation_name="Сборка", time_norm=0.25)
+    db.add_all([spec, operation])
+    db.flush()
+    db.add(DefaultSpecification(item_id=good_item.item_id, spec_id=spec.spec_id))
+    db.add(SpecOperation(spec_id=spec.spec_id, operation_id=operation.operation_id, time_norm=0.5))
+    db.commit()
+    good = _mk_manufacture(db, good_item, qty=2.0, exported_ref1c="basis-ref-batch-ok")
+
+    bad_item = _mk_item(db, code="PW-BATCH-BAD", ref1c="item-ref-batch-bad")
+    bad = _mk_manufacture(db, bad_item, qty=2.0, exported_ref1c="basis-ref-batch-bad")
+
+    fake = _FakeClient(ref_key="pw-batch-ref")
+    _stub_config(monkeypatch, base_url="http://mtzw7/unf_demo/odata/standard.odata")
+    monkeypatch.setattr(exporter, "_create_odata_client", lambda *a, **kw: fake)
+
+    result = exporter.export_piecework_to_1c(
+        db, [good.manufacture_id, bad.manufacture_id], dry_run=False
+    )
+
+    assert result["manufactures_created"] == 1
+    assert result["manufactures_error"] == 1
+    assert result["status"] == "partial_error"
+    assert len(fake.posts) == 1
+
+    db.refresh(bad)
+    assert "не найдена операция спецификации" in (bad.export_error or "")
+    bad_link = db.query(SyncLink).filter_by(
+        source_doctype="piecework",
+        source_id=bad.manufacture_id,
+    ).one()
+    assert bad_link.status == "error"
+    db.refresh(good)
+    assert good.export_error is None
+
+
+def test_piecework_failure_is_recorded_on_the_manufacture(db_session, monkeypatch):
+    """Проведённая сборка без наряда должна быть видна в журнале."""
+    db = db_session
+    item = _mk_item(db, code="PW-TRACE", ref1c="item-ref-trace")
+    m = _mk_manufacture(db, item, exported_ref1c="ref-trace")
+
+    fake = _FakeClient(fail=True)
+    _stub_config(monkeypatch, base_url="http://mtzw7/unf_demo/odata/standard.odata")
+    monkeypatch.setattr(exporter, "_create_odata_client", lambda *a, **kw: fake)
+
+    result = exporter.export_piecework_to_1c(
+        db, [m.manufacture_id],
+        operation_ref="op-ref-trace",
+        dry_run=False,
+    )
+
+    assert result["manufactures_error"] == 1
+    db.refresh(m)
+    assert m.export_error and m.export_error.startswith("СдельныйНаряд:")
+    assert "simulated 1C failure" in m.export_error
+    # The assembly itself stays exported — only the наряд step failed.
+    assert m.status == "exported"
+    assert m.exported_ref1c == "ref-trace"
 
 
 def test_live_post_error_recorded_in_sync_link(db_session, monkeypatch):

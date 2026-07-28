@@ -17,6 +17,7 @@ from ..models import (
     SpecComponent,
     SpecOperation,
     Specification,
+    SyncLink,
 )
 from ..schemas import ODataSyncRequest
 from .odata_config import load_odata_config
@@ -24,6 +25,8 @@ from .production_control_common import to_float as _to_float
 from .production_control_domain import default_spec_id as _default_spec_id, ensure_state as _ensure_state
 from .specification_sync import sync_specifications_from_odata
 from .one_c_document_numbers import material_issue_number
+from .one_c_manufacture_export import commanded_qty_by_product
+from .one_c_piecework_export import PIECEWORK_ENTITY
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +133,58 @@ def _ensure_workshop_reservation_covers(
         )
 
 
+def _piecework_order_is_in_1c(db: Session, manufacture_id: int) -> bool:
+    """True when this выпуск already has its Document_СдельныйНаряд in 1C."""
+    link = (
+        db.query(SyncLink)
+        .filter(
+            SyncLink.source_system == "PRODPLAN",
+            SyncLink.source_doctype == "piecework",
+            SyncLink.source_id == int(manufacture_id),
+            SyncLink.target_entity == PIECEWORK_ENTITY,
+        )
+        .one_or_none()
+    )
+    return bool(
+        link is not None
+        and str(link.status or "") == "success"
+        and str(link.target_ref_key or "").strip()
+    )
+
+
+def _resumable_manufacture(db: Session, product_id: int):
+    """
+    An unfinished «Произвести» of this line that must be continued, not repeated.
+
+    Per .docs/one_c_export_from_prodplan.md п.8 ("если шаг цепочки упал, уже
+    созданные документы не дублируются при повторном нажатии"), a выпуск whose
+    Document_СборкаЗапасов already lives in 1C but which never got its
+    Document_СдельныйНаряд is a half-finished chain: the next press must roll it
+    forward. Returns (manufacture, reason) or None.
+    """
+    rows = (
+        db.query(ProductionManufacture)
+        .filter(ProductionManufacture.product_id == int(product_id))
+        .filter(ProductionManufacture.status.in_(("draft", "exported", "error")))
+        .order_by(ProductionManufacture.manufacture_id.asc())
+        .all()
+    )
+    for manufacture in rows:
+        if not str(manufacture.exported_ref1c or "").strip():
+            continue
+        if _piecework_order_is_in_1c(db, int(manufacture.manufacture_id)):
+            continue
+        if str(manufacture.status or "").lower() == "error":
+            reason = (
+                "СборкаЗапасов уже создана в 1С, но не завершена "
+                f"({manufacture.export_error or 'ошибка выгрузки'}) — повторяем выгрузку"
+            )
+        else:
+            reason = "СборкаЗапасов уже проведена в 1С, но СдельныйНаряд не создан — докатываем цепочку"
+        return manufacture, reason
+    return None
+
+
 def produce_line(
     db: Session,
     product_id: int,
@@ -163,13 +218,36 @@ def produce_line(
         raise ValueError(f"product_id={product_id}: строка заказа не найдена")
 
     order_quantity = _to_float(product.quantity)
-    commanded_before = sum(
-        _to_float(row[0])
-        for row in db.query(ProductionManufacture.qty)
-        .filter(ProductionManufacture.product_id == int(product.product_id))
-        .filter(ProductionManufacture.status.in_(("draft", "exported")))
-        .all()
+    commanded_before = commanded_qty_by_product(db, [int(product.product_id)]).get(
+        int(product.product_id), 0.0
     )
+
+    # Resume before anything else: an unfinished выпуск already owns a 1C
+    # Document_СборкаЗапасов, so a second press must finish that chain instead
+    # of creating a duplicate assembly (or dying on the "всё уже скомандовано"
+    # guard when the наряд step failed).
+    resumable = _resumable_manufacture(db, int(product.product_id))
+    if resumable is not None:
+        manufacture, resume_reason = resumable
+        state = _ensure_state(db, product)
+        db.commit()
+        return {
+            "status": "resumed_pending_1c_fact",
+            "resumed": True,
+            "resume_reason": resume_reason,
+            "manufacture_id": int(manufacture.manufacture_id),
+            "product_id": int(product.product_id),
+            "order_id": int(product.order_id),
+            "qty": float(_to_float(manufacture.qty)),
+            "requested_qty": float(qty_f),
+            "produced_qty_total": float(product.produced_qty or 0),
+            "remaining_qty": float(product.remaining_qty or 0),
+            "commanded_qty_total": float(commanded_before),
+            "command_remaining_qty": float(max(order_quantity - commanded_before, 0.0)),
+            "fact_pending": True,
+            "line_status": state.status,
+        }
+
     command_remaining = max(0.0, order_quantity - commanded_before)
     if command_remaining <= 1e-9:
         raise ValueError(
@@ -253,6 +331,7 @@ def produce_line(
 
     return {
         "status": "pending_1c_fact",
+        "resumed": False,
         "manufacture_id": int(manufacture.manufacture_id),
         "product_id": int(product.product_id),
         "order_id": int(product.order_id),

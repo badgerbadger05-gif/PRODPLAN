@@ -112,6 +112,42 @@ def _existing_link(db: Session, manufacture_id: int) -> Optional[SyncLink]:
     )
 
 
+#: Manufacture statuses that always count as "already handed to 1C documents".
+COMMANDED_STATUSES = ("draft", "exported")
+
+
+def commanded_qty_by_product(db: Session, product_ids: List[int]) -> Dict[int, float]:
+    """
+    Quantity already handed to executive 1C documents, per production line.
+
+    A manufacture left in ``status='error'`` still counts whenever its 1C
+    document exists (``exported_ref1c`` is set): Document_СборкаЗапасов is live
+    in 1C and must be resumed, not duplicated by a fresh «Произвести».
+    """
+    ids = [int(x) for x in product_ids if x is not None]
+    totals: Dict[int, float] = {pid: 0.0 for pid in ids}
+    if not ids:
+        return totals
+    rows = (
+        db.query(
+            ProductionManufacture.product_id,
+            ProductionManufacture.qty,
+            ProductionManufacture.status,
+            ProductionManufacture.exported_ref1c,
+        )
+        .filter(ProductionManufacture.product_id.in_(ids))
+        .all()
+    )
+    for product_id, qty, status, exported_ref1c in rows:
+        state = str(status or "").lower()
+        counts = state in COMMANDED_STATUSES or (
+            state == "error" and bool(_clean_ref1c(exported_ref1c))
+        )
+        if counts:
+            totals[int(product_id)] = totals.get(int(product_id), 0.0) + float(qty or 0)
+    return totals
+
+
 def _binding_for_product(db: Session, product: ProductionProduct) -> Optional[WorkshopWarehouseBinding]:
     workshop_id = resolve_workshop_for_product(db, product)
     return warehouse_binding_for_workshop(db, workshop_id)
@@ -611,7 +647,11 @@ def _build_header_payload(entry: ManufactureExportEntry, config: Optional[Dict[s
     # 1C UNF links assembly to production order through this dedicated field.
     # The generic composite ДокументОснование on Document_СборкаЗапасов does
     # not accept Document_ЗаказНаПроизводство in the current OData metadata.
-    assert entry.order_ref1c, "manufacture export requires order_ref1c basis"
+    if not entry.order_ref1c:
+        raise ValueError(
+            f"manufacture_id={entry.manufacture_id}: нет order_ref1c — "
+            "СборкаЗапасов не может быть создана без основания-заказа"
+        )
     payload["ЗаказНаПроизводство_Key"] = entry.order_ref1c
     return payload
 
@@ -698,18 +738,26 @@ def export_manufactures_to_1c(
     already_linked: List[ManufactureExportEntry] = []
     for entry in entries:
         link = _existing_link(db, entry.manufacture_id)
-        if link and _clean_ref1c(link.target_ref_key):
-            entry.target_ref_key = _clean_ref1c(link.target_ref_key)
-            entry.unpost_before_patch = True
-            entry.reason = "повторная отправка: 1С-документ уже был создан, обновляем реквизиты и проводим"
+        link_ref = _clean_ref1c(link.target_ref_key) if link else ""
         m_row = (
             db.query(ProductionManufacture)
             .filter(ProductionManufacture.manufacture_id == entry.manufacture_id)
             .one()
         )
         manufacture_ref = _clean_ref1c(m_row.exported_ref1c)
-        if manufacture_ref:
-            entry.target_ref_key = entry.target_ref_key or manufacture_ref
+        if link is not None and link.status == "success" and link_ref:
+            # Contract .docs/one_c_export_from_prodplan.md, «Что не делать» п.5:
+            # a successful sync_link means the 1C document already exists and is
+            # posted. Re-sending it would Unpost + PATCH + Post a live document
+            # and re-run its component write-off for nothing.
+            entry.status = "existing"
+            entry.target_ref_key = link_ref
+            entry.reason = "уже выгружен в 1С (sync_link)"
+            already_linked.append(entry)
+            continue
+        existing_ref = link_ref or manufacture_ref
+        if existing_ref:
+            entry.target_ref_key = existing_ref
             entry.unpost_before_patch = True
             entry.reason = "повторная отправка: 1С-документ уже был создан, обновляем реквизиты и проводим"
         eligible.append(entry)

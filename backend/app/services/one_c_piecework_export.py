@@ -61,7 +61,10 @@ from .one_c_export_common import (
 from .odata_config import load_odata_config as _load_odata_config
 from .odata_client import OData1CClient
 from .one_c_document_numbers import piecework_number
-from .one_c_manufacture_export import export_manufactures_to_1c
+from .one_c_manufacture_export import (
+    commanded_qty_by_product as _commanded_qty_by_product,
+    export_manufactures_to_1c,
+)
 
 
 PIECEWORK_ENTITY = "Document_СдельныйНаряд"
@@ -109,9 +112,11 @@ class PieceworkExportEntry:
     employee_type: str = "employee"
     document_datetime: Optional[str] = None
     target_ref_key: Optional[str] = None
+    unpost_before_patch: bool = False
     status: str = "planned"
     error: Optional[str] = None
     reason: Optional[str] = None
+    order_closed: Optional[bool] = None
 
 
 @dataclass(frozen=True)
@@ -715,6 +720,90 @@ def _upsert_link(
     )
 
 
+def _record_manufacture_export_error(db: Session, manufacture_id: int, error: str) -> None:
+    """
+    Surface a piecework failure on the выпуск row.
+
+    Without it a posted Document_СборкаЗапасов whose Document_СдельныйНаряд
+    never made it into 1C looks perfectly healthy in the journal.
+    """
+    m_row = (
+        db.query(ProductionManufacture)
+        .filter(ProductionManufacture.manufacture_id == int(manufacture_id))
+        .one_or_none()
+    )
+    if m_row is None:
+        return
+    m_row.export_error = f"СдельныйНаряд: {error}"
+
+
+def _order_is_fully_commanded(db: Session, order_id: int) -> bool:
+    """
+    True when every line of the production order is fully handed to executive
+    1C documents (or already reported as produced).
+
+    Closing Document_ЗаказНаПроизводство tells 1C the order is finished, so a
+    partial выпуск must not trigger it — the uncommanded remainder would be
+    silently written off together with the order.
+    """
+    rows = (
+        db.query(
+            ProductionProduct.product_id,
+            ProductionProduct.quantity,
+            ProductionProduct.produced_qty,
+        )
+        .filter(ProductionProduct.order_id == int(order_id))
+        .all()
+    )
+    if not rows:
+        # Unknown scope — never close the 1C order on a guess.
+        return False
+    commanded = _commanded_qty_by_product(db, [int(row[0]) for row in rows])
+    for product_id, quantity, produced_qty in rows:
+        covered = max(
+            commanded.get(int(product_id), 0.0),
+            float(produced_qty or 0),
+        )
+        if covered + 1e-6 < float(quantity or 0):
+            return False
+    return True
+
+
+def _close_production_order(
+    db: Session,
+    client: OData1CClient,
+    entry: PieceworkExportEntry,
+) -> bool:
+    """
+    Mark the parent Document_ЗаказНаПроизводство as finished in 1C and locally.
+    No-op (returns False) while the order still has an uncommanded remainder.
+    """
+    order_ref = _clean_ref1c(entry.order_ref1c)
+    if not order_ref:
+        return False
+    if not _order_is_fully_commanded(db, int(entry.order_id)):
+        return False
+    patch = getattr(client, "patch", None)
+    if patch is None:
+        raise RuntimeError("OData client cannot patch production order completion state")
+    patch(
+        f"{PRODUCTION_ORDER_ENTITY}(guid'{order_ref}')",
+        {
+            "СостояниеЗаказа_Key": DONE_STATE_KEY,
+            "ВариантЗавершения": ORDER_COMPLETION_SUCCESS,
+        },
+    )
+    order = (
+        db.query(ProductionOrder)
+        .filter(ProductionOrder.order_id == int(entry.order_id))
+        .one_or_none()
+    )
+    if order is not None:
+        order.order_state_key = DONE_STATE_KEY
+        order.order_state_name = "Завершен"
+    return True
+
+
 def _chain_export_parent_manufactures(
     db: Session,
     manufacture_ids: List[int],
@@ -789,6 +878,11 @@ def export_piecework_to_1c(
             continue
         if link and _clean_ref1c(link.target_ref_key):
             entry.target_ref_key = _clean_ref1c(link.target_ref_key)
+            # The previous attempt may have died after the document was created
+            # AND posted (e.g. the closing PATCH failed). 1C refuses to PATCH a
+            # posted document, so the retry must unpost it first — exactly as
+            # the manufacture exporter does.
+            entry.unpost_before_patch = True
             entry.reason = "повторная отправка: 1С-документ уже был создан, обновляем реквизиты и проводим"
         eligible.append(entry)
 
@@ -817,17 +911,44 @@ def export_piecework_to_1c(
     price_type_ref = _piecework_price_type_ref(config)
 
     payloads: List[Dict[str, Any]] = []
+    exportable: List[PieceworkExportEntry] = []
+    build_errors = 0
     for entry in eligible:
-        payload = _build_header_payload(
-            entry,
-            operation_ref=operation_ref,
-            time_norm=time_norm,
-            price=price,
-            organization_ref=organization_ref,
-            structural_unit_ref=structural_unit_ref,
-            business_operation_ref=business_operation_ref,
-        )
+        # A single unusable выпуск (no spec operation) must not blow up the
+        # whole batch: mark that entry and keep exporting the rest.
+        try:
+            payload = _build_header_payload(
+                entry,
+                operation_ref=operation_ref,
+                time_norm=time_norm,
+                price=price,
+                organization_ref=organization_ref,
+                structural_unit_ref=structural_unit_ref,
+                business_operation_ref=business_operation_ref,
+            )
+        except Exception as exc:  # noqa: BLE001 — per-entry isolation
+            entry.status = "error"
+            entry.error = str(exc)
+            build_errors += 1
+            if not dry_run:
+                _record_manufacture_export_error(db, entry.manufacture_id, str(exc))
+                _upsert_link(
+                    db,
+                    entry=entry,
+                    payload_hash="",
+                    target_ref_key=_clean_ref1c(entry.target_ref_key) or None,
+                    status="error",
+                    last_error=str(exc),
+                )
+            continue
+        exportable.append(entry)
         payloads.append({"manufacture_id": entry.manufacture_id, "number": entry.number, "payload": payload})
+
+    if build_errors and not dry_run:
+        db.commit()
+    eligible = exportable
+    summary["manufactures_error"] = build_errors
+    summary["status"] = "ok" if build_errors == 0 else "partial_error"
 
     if dry_run:
         summary["entries"] = [asdict(e) for e in entries]
@@ -869,25 +990,12 @@ def export_piecework_to_1c(
                     "ДатаЗакрытия": entry.document_datetime,
                 },
             )
-        order_ref = _clean_ref1c(entry.order_ref1c)
-        if order_ref:
-            if patch is None:
-                raise RuntimeError("OData client cannot patch production order completion state")
-            patch(
-                f"{PRODUCTION_ORDER_ENTITY}(guid'{order_ref}')",
-                {
-                    "СостояниеЗаказа_Key": DONE_STATE_KEY,
-                    "ВариантЗавершения": ORDER_COMPLETION_SUCCESS,
-                },
-            )
-            order = (
-                db.query(ProductionOrder)
-                .filter(ProductionOrder.order_id == int(entry.order_id))
-                .one_or_none()
-            )
-            if order is not None:
-                order.order_state_key = DONE_STATE_KEY
-                order.order_state_name = "Завершен"
+        # A выпуск closes the 1C order only when nothing is left uncommanded on
+        # it: partial production must keep Document_ЗаказНаПроизводство open.
+        entry.order_closed = _close_production_order(db, client, entry)
+
+    def _mark_error(entry: PieceworkExportEntry, error: str) -> None:
+        _record_manufacture_export_error(db, entry.manufacture_id, error)
 
     created, errored = _post_export_entries(
         db,
@@ -897,16 +1005,16 @@ def export_piecework_to_1c(
         missing_ref_error=f"1C did not return Ref_Key for new {PIECEWORK_ENTITY}",
         upsert_link=lambda **kwargs: _upsert_link(db, **kwargs),
         on_success=_mark_success,
-        on_error=lambda entry, error: None,
+        on_error=_mark_error,
         log_error=lambda entry: (
             f"[1C piecework export] manufacture_id={entry.manufacture_id} failed: {entry.error}"
         ),
     )
 
     summary["manufactures_created"] = created
-    summary["manufactures_error"] = errored
+    summary["manufactures_error"] = errored + build_errors
     summary["entries"] = [asdict(e) for e in entries]
-    summary["status"] = "ok" if errored == 0 else "partial_error"
+    summary["status"] = "ok" if errored + build_errors == 0 else "partial_error"
     return summary
 
 
@@ -1043,6 +1151,7 @@ def export_chain_piecework_to_1c(
         return summary
     if paint_link and _clean_ref1c(paint_link.target_ref_key):
         paint_entry.target_ref_key = _clean_ref1c(paint_link.target_ref_key)
+        paint_entry.unpost_before_patch = True
         paint_entry.reason = (
             "повторная отправка: 1С-документ уже был создан, обновляем реквизиты и проводим"
         )
@@ -1061,21 +1170,26 @@ def export_chain_piecework_to_1c(
     weld_entry.document_datetime = when
     paint_entry.document_datetime = when
 
-    weld_payload = _build_header_payload(
-        weld_entry,
-        operation_ref="",
-        organization_ref=organization_ref,
-        # участок построчно: сварочный блок — участок сварки
-        structural_unit_ref=weld_entry.structural_unit_ref1c or default_structural_unit,
-        business_operation_ref=business_operation_ref,
-    )
-    paint_payload = _build_header_payload(
-        paint_entry,
-        operation_ref="",
-        organization_ref=organization_ref,
-        structural_unit_ref=paint_entry.structural_unit_ref1c or default_structural_unit,
-        business_operation_ref=business_operation_ref,
-    )
+    try:
+        weld_payload = _build_header_payload(
+            weld_entry,
+            operation_ref="",
+            organization_ref=organization_ref,
+            # участок построчно: сварочный блок — участок сварки
+            structural_unit_ref=weld_entry.structural_unit_ref1c or default_structural_unit,
+            business_operation_ref=business_operation_ref,
+        )
+        paint_payload = _build_header_payload(
+            paint_entry,
+            operation_ref="",
+            organization_ref=organization_ref,
+            structural_unit_ref=paint_entry.structural_unit_ref1c or default_structural_unit,
+            business_operation_ref=business_operation_ref,
+        )
+    except Exception as exc:  # noqa: BLE001 — вернуть диагностику, а не 500
+        summary["status"] = "error"
+        summary["error"] = str(exc)
+        return summary
     combined = _merge_chain_payloads(weld_payload=weld_payload, paint_payload=paint_payload)
     payload_envelope = {
         "manufacture_id": paint_entry.manufacture_id,
@@ -1129,28 +1243,15 @@ def export_chain_piecework_to_1c(
                 f"{PIECEWORK_ENTITY}(guid'{ref_key}')",
                 {"Date": when, "Закрыт": True, "ДатаЗакрытия": when},
             )
-        # Закрытие обоих заказов цепочки — одним действием.
+        # Закрытие обоих заказов цепочки — одним действием, но только тех, по
+        # которым не осталось нескомандованного остатка (частичный выпуск не
+        # закрывает заказ).
         for chain_entry in (weld_entry, paint_entry):
-            order_ref = _clean_ref1c(chain_entry.order_ref1c)
-            if not order_ref:
-                continue
-            if patch is None:
-                raise RuntimeError("OData client cannot patch production order completion state")
-            patch(
-                f"{PRODUCTION_ORDER_ENTITY}(guid'{order_ref}')",
-                {
-                    "СостояниеЗаказа_Key": DONE_STATE_KEY,
-                    "ВариантЗавершения": ORDER_COMPLETION_SUCCESS,
-                },
-            )
-            order = (
-                db.query(ProductionOrder)
-                .filter(ProductionOrder.order_id == int(chain_entry.order_id))
-                .one_or_none()
-            )
-            if order is not None:
-                order.order_state_key = DONE_STATE_KEY
-                order.order_state_name = "Завершен"
+            chain_entry.order_closed = _close_production_order(db, client, chain_entry)
+
+    def _mark_error(entry: PieceworkExportEntry, error: str) -> None:
+        for chain_entry in (weld_entry, paint_entry):
+            _record_manufacture_export_error(db, chain_entry.manufacture_id, error)
 
     created, errored = _post_export_entries(
         db,
@@ -1160,7 +1261,7 @@ def export_chain_piecework_to_1c(
         missing_ref_error=f"1C did not return Ref_Key for new {PIECEWORK_ENTITY}",
         upsert_link=_upsert_links,
         on_success=_mark_success,
-        on_error=lambda entry, error: None,
+        on_error=_mark_error,
         log_error=lambda entry: (
             f"[1C chain piecework export] manufactures=({weld_manufacture_id},{paint_manufacture_id}) "
             f"failed: {entry.error}"

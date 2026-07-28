@@ -703,6 +703,32 @@ def post_order_line_materials_refresh(
         raise HTTPException(status_code=400, detail=str(e))
 
 
+def _export_failure_detail(
+    export: dict,
+    entry: dict,
+    default: str,
+) -> str:
+    """
+    Human-readable reason a 1C export step failed.
+
+    A row that never became an export entry (missing item_ref1c, missing parent
+    order, cancelled …) leaves `entries` empty and carries its real diagnosis in
+    `skipped_rows` — without this those reasons were lost behind the generic
+    "1С не создала и не провела ..." message.
+    """
+    detail = str(entry.get("error") or entry.get("reason") or "").strip()
+    if detail:
+        return detail
+    reasons = [
+        str(row.get("reason") or "").strip()
+        for row in (export.get("skipped_rows") or [])
+        if str(row.get("reason") or "").strip()
+    ]
+    if reasons:
+        return f"{default}: " + "; ".join(reasons)
+    return default
+
+
 @router.post("/orders/{product_id}/produce", response_model=dict)
 def post_produce_line(
     product_id: int,
@@ -725,6 +751,7 @@ def post_produce_line(
             comment=payload.comment,
         )
         manufacture_id = int(command["manufacture_id"])
+        resumed = bool(command.get("resumed"))
         manufacture_export = export_manufactures_to_1c(
             db,
             [manufacture_id],
@@ -737,13 +764,13 @@ def post_produce_line(
             int(manufacture_export.get("manufactures_error") or 0) > 0
             or not manufacture_ref
         ):
-            if not manufacture_ref:
+            if not manufacture_ref and not resumed:
                 rollback_local_manufacture(db, manufacture_id)
             raise ValueError(
-                str(
-                    manufacture_entry.get("error")
-                    or manufacture_entry.get("reason")
-                    or "1С не создала и не провела СборкаЗапасов"
+                _export_failure_detail(
+                    manufacture_export,
+                    manufacture_entry,
+                    "1С не создала и не провела СборкаЗапасов",
                 )
             )
         piecework_export = export_piecework_to_1c(
@@ -758,10 +785,10 @@ def post_produce_line(
             or not str(piecework_entry.get("target_ref_key") or "")
         ):
             raise ValueError(
-                str(
-                    piecework_entry.get("error")
-                    or piecework_entry.get("reason")
-                    or "1С не создала и не провела СдельныйНаряд"
+                _export_failure_detail(
+                    piecework_export,
+                    piecework_entry,
+                    "1С не создала и не провела СдельныйНаряд",
                 )
             )
         return {
