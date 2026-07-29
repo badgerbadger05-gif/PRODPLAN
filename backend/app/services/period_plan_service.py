@@ -753,6 +753,7 @@ def _explode_bom_net_first(
     ancestors_by_item: Dict[int, Set[int]] = {}
     explosion_warnings: List[Dict[str, Any]] = []
     reported_cycle_edges: Set[Tuple[int, int]] = set()
+    reported_negative_stock_items: Set[int] = set()
 
     # Level 0: demand from plan lines
     demand_map: Dict[int, Dict[date, float]] = {
@@ -810,7 +811,26 @@ def _explode_bom_net_first(
             #     for THIS item (net_map / net_required_qty / reconciliation
             #     top-ups). An open order already covers this, so no duplicate
             #     parent order is created.
-            stock_left = avail_stock.get(iid, 0.0)
+            stock_left = float(avail_stock.get(iid, 0.0) or 0.0)
+            if stock_left < 0.0:
+                # A negative physical balance is evidence of an inventory
+                # discrepancy, not anti-stock that may be added to a new
+                # obligation.  Preserve the physical S0 in the freeze baseline
+                # (shared_pools.stock_initial), but expose zero units to the
+                # consume-once allocation pool and make the discrepancy
+                # independently visible on the frozen run.
+                if iid not in reported_negative_stock_items:
+                    explosion_warnings.append(
+                        {
+                            "code": "NEGATIVE_PHYSICAL_STOCK_UNAVAILABLE",
+                            "item_id": iid,
+                            "physical_stock_qty": stock_left,
+                            "allocatable_stock_qty": 0.0,
+                        }
+                    )
+                    reported_negative_stock_items.add(iid)
+                stock_left = 0.0
+                avail_stock[iid] = 0.0
             stock_before = stock_left  # freeze v2: how much stock this item ate
             wip_list = avail_wip.setdefault(iid, [])
             net_buckets: List[Tuple[date, float]] = []      # after stock + WIP → orders

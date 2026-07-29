@@ -250,7 +250,9 @@ def test_candidate_freeze_rejects_baseline_before_physical_opening(db_session):
     ).count() == 0
 
 
-def test_candidate_freeze_rejects_negative_physical_pool_without_clamping(db_session):
+def test_first_candidate_freeze_clamps_negative_physical_pool_without_inflating_demand(
+    db_session,
+):
     accepted, target, item, _parents, _candidates, _lines = _candidate_world(
         db_session, ()
     )
@@ -272,20 +274,39 @@ def test_candidate_freeze_rejects_negative_physical_pool_without_clamping(db_ses
         horizon_days=45,
     )
 
-    with pytest.raises(
-        LedgerPoolUnavailable, match="net requirement exceeds gross"
-    ):
-        freeze_candidate_snapshots(
-            db_session,
-            parent_generation_id=accepted.id,
-            target_generation_id=target.id,
-            candidate_run_ids=[candidate.run_id],
-        )
+    report = freeze_candidate_snapshots(
+        db_session,
+        parent_generation_id=accepted.id,
+        target_generation_id=target.id,
+        candidate_run_ids=[candidate.run_id],
+    )
 
+    assert report["order"] == [candidate.run_id]
     assert float(physical_row.qty) == pytest.approx(-5)
-    assert db_session.query(models.MrpRequirement).filter_by(
-        run_id=candidate.run_id
+    requirement = db_session.query(models.MrpRequirement).filter_by(
+        run_id=candidate.run_id, item_id=item.item_id
+    ).one()
+    assert float(requirement.total_required_qty) == pytest.approx(3)
+    assert float(requirement.net_required_qty) == pytest.approx(3)
+    baseline = db_session.query(models.MrpFreezeBaseline).filter_by(
+        run_id=candidate.run_id,
+        item_id=item.item_id,
+        freeze_version=candidate.active_freeze_version,
+    ).one()
+    assert float(baseline.stock_qty) == pytest.approx(-5)
+    assert db_session.query(models.MrpFreezeAllocation).filter_by(
+        run_id=candidate.run_id,
+        item_id=item.item_id,
+        source_type="stock",
     ).count() == 0
+    assert candidate.warnings == [
+        {
+            "code": "NEGATIVE_PHYSICAL_STOCK_UNAVAILABLE",
+            "item_id": item.item_id,
+            "physical_stock_qty": -5.0,
+            "allocatable_stock_qty": 0.0,
+        }
+    ]
 
 
 def test_retained_stock_shortage_fails_instead_of_inflating_new_plan(db_session):
