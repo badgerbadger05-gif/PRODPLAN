@@ -1,5 +1,5 @@
 from typing import List, Any, Dict
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from ..database import get_db
@@ -32,9 +32,30 @@ def get_resource_distribution(db: Session = Depends(get_db)):
 
 
 @router.get("/", response_model=List[ProductionResourceSchema])
-def get_resources(db: Session = Depends(get_db)):
-    """Получить список всех производственных участков"""
-    resources = db.query(ProductionResource).offset(0).limit(100).all()
+def get_resources(
+    skip: int = Query(0, ge=0, description="Сколько участков пропустить"),
+    limit: int = Query(
+        1000,
+        ge=1,
+        le=5000,
+        description="Максимум участков в ответе",
+    ),
+    db: Session = Depends(get_db),
+):
+    """Получить список производственных участков.
+
+    Раньше здесь стоял захардкоженный ``.offset(0).limit(100)``, который молча
+    обрезал список. Форма ответа не изменилась (плоский массив участков —
+    frontend-erp-shell/src/services/resources.ts ждёт именно его), но лимит
+    поднят и вынесен в параметры запроса.
+    """
+    resources = (
+        db.query(ProductionResource)
+        .order_by(ProductionResource.resource_id)
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
     return resources
 
 

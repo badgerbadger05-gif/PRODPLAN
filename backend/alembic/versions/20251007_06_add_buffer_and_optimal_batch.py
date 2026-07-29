@@ -27,9 +27,12 @@ def upgrade() -> None:
         'production_resources',
         sa.Column('buffer_days', sa.Integer(), nullable=False, server_default='0')
     )
-    # Optionally drop server_default to keep explicit values only
-    with op.get_context().autocommit_block():
-        op.execute("ALTER TABLE production_resources ALTER COLUMN buffer_days DROP DEFAULT")
+    # Optionally drop server_default to keep explicit values only.
+    # SQLite не умеет ALTER COLUMN ... DROP DEFAULT (и не нуждается в нём:
+    # сервер-дефолт там безвреден), поэтому шаг только для PostgreSQL.
+    if op.get_bind().dialect.name == "postgresql":
+        with op.get_context().autocommit_block():
+            op.execute("ALTER TABLE production_resources ALTER COLUMN buffer_days DROP DEFAULT")
 
 
 def downgrade() -> None:

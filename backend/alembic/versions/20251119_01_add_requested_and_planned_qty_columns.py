@@ -16,75 +16,50 @@ branch_labels = None
 depends_on = None
 
 
+_TABLES = ("planned_order", "planned_purchase")
+_COLUMNS = ("requested_qty", "planned_qty")
+_QTY_TYPE = sa.Numeric(15, 3)
+
+
+def _columns(table: str) -> set:
+    return {col["name"] for col in sa.inspect(op.get_bind()).get_columns(table)}
+
+
 def upgrade() -> None:
-    # planned_order
-    op.execute(
-        sa.text(
-            """
-            ALTER TABLE planned_order
-                ADD COLUMN IF NOT EXISTS requested_qty NUMERIC(15, 3);
-            ALTER TABLE planned_order
-                ADD COLUMN IF NOT EXISTS planned_qty NUMERIC(15, 3);
-            """
-        )
-    )
-    # planned_purchase
-    op.execute(
-        sa.text(
-            """
-            ALTER TABLE planned_purchase
-                ADD COLUMN IF NOT EXISTS requested_qty NUMERIC(15, 3);
-            ALTER TABLE planned_purchase
-                ADD COLUMN IF NOT EXISTS planned_qty NUMERIC(15, 3);
-            """
-        )
-    )
+    # Раньше здесь был сырой PostgreSQL-DDL (ADD COLUMN IF NOT EXISTS /
+    # ALTER COLUMN SET NOT NULL). Заменено на портируемые операции Alembic:
+    # семантика на PostgreSQL прежняя, но цепочку теперь можно прогнать и на
+    # SQLite (тест воспроизводимости схемы).
+    for table in _TABLES:
+        existing = _columns(table)
+        for column in _COLUMNS:
+            if column not in existing:
+                op.add_column(table, sa.Column(column, _QTY_TYPE, nullable=True))
 
-    op.execute(
-        sa.text(
-            """
-            UPDATE planned_order
-               SET requested_qty = qty,
-                   planned_qty = qty
-             WHERE requested_qty IS NULL
-                OR planned_qty IS NULL;
-            UPDATE planned_purchase
-               SET requested_qty = qty,
-                   planned_qty = qty
-             WHERE requested_qty IS NULL
-                OR planned_qty IS NULL;
-            """
+    for table in _TABLES:
+        op.execute(
+            sa.text(
+                f"""
+                UPDATE {table}
+                   SET requested_qty = qty,
+                       planned_qty = qty
+                 WHERE requested_qty IS NULL
+                    OR planned_qty IS NULL
+                """
+            )
         )
-    )
 
-    op.execute(
-        sa.text(
-            """
-            ALTER TABLE planned_order
-                ALTER COLUMN requested_qty SET NOT NULL;
-            ALTER TABLE planned_order
-                ALTER COLUMN planned_qty SET NOT NULL;
-            ALTER TABLE planned_purchase
-                ALTER COLUMN requested_qty SET NOT NULL;
-            ALTER TABLE planned_purchase
-                ALTER COLUMN planned_qty SET NOT NULL;
-            """
-        )
-    )
+    # SQLite не поддерживает ALTER COLUMN ... SET NOT NULL вне batch-режима;
+    # для проверки состава схемы это несущественно.
+    if op.get_bind().dialect.name == "postgresql":
+        for table in _TABLES:
+            for column in _COLUMNS:
+                op.alter_column(table, column, existing_type=_QTY_TYPE, nullable=False)
 
 
 def downgrade() -> None:
-    op.execute(
-        sa.text(
-            """
-            ALTER TABLE planned_purchase
-                DROP COLUMN IF EXISTS planned_qty;
-            ALTER TABLE planned_purchase
-                DROP COLUMN IF EXISTS requested_qty;
-            ALTER TABLE planned_order
-                DROP COLUMN IF EXISTS planned_qty;
-            ALTER TABLE planned_order
-                DROP COLUMN IF EXISTS requested_qty;
-            """
-        )
-    )
+    for table in reversed(_TABLES):
+        existing = _columns(table)
+        for column in reversed(_COLUMNS):
+            if column in existing:
+                op.drop_column(table, column)

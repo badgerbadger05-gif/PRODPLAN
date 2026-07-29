@@ -59,6 +59,31 @@ def upgrade() -> None:
           )
         """
     )
+    # Перенос данных ниже написан на диалекте PostgreSQL (UPDATE ... FROM).
+    # На чистой БД переносить нечего, поэтому на других диалектах (SQLite в
+    # тесте воспроизводимости схемы) блок пропускается; схема от него не зависит.
+    if op.get_bind().dialect.name == "postgresql":
+        _backfill_replenishment_rows()
+
+    op.drop_constraint(
+        "ux_reservation_entry_req_mode",
+        "reservation_entry",
+        type_="unique",
+    )
+    op.create_unique_constraint(
+        "ux_reservation_entry_requirement",
+        "reservation_entry",
+        ["ledger_generation_id", "requirement_id"],
+    )
+    op.create_check_constraint(
+        "ck_reservation_entry_replenishment_flow",
+        "reservation_entry",
+        "realization_mode IN ('make', 'buy')",
+    )
+
+
+def _backfill_replenishment_rows() -> None:
+    """PostgreSQL-only data migration (UPDATE ... FROM)."""
     op.execute(
         """
         UPDATE reservation_entry r
@@ -124,21 +149,6 @@ def upgrade() -> None:
         FROM mrp_requirement req
         WHERE req.id = r.requirement_id
         """
-    )
-    op.drop_constraint(
-        "ux_reservation_entry_req_mode",
-        "reservation_entry",
-        type_="unique",
-    )
-    op.create_unique_constraint(
-        "ux_reservation_entry_requirement",
-        "reservation_entry",
-        ["ledger_generation_id", "requirement_id"],
-    )
-    op.create_check_constraint(
-        "ck_reservation_entry_replenishment_flow",
-        "reservation_entry",
-        "realization_mode IN ('make', 'buy')",
     )
 
 

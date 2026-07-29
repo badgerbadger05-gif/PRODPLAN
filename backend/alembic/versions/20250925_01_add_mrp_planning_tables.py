@@ -1,7 +1,7 @@
 """add mrp planning tables
 
 Revision ID: 20250925_01
-Revises: 
+Revises: 20250924_00
 Create Date: 2025-09-25 09:36:30
 
 """
@@ -12,7 +12,7 @@ from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
 revision = '20250925_01'
-down_revision = None
+down_revision = '20250924_00'
 branch_labels = None
 depends_on = None
 

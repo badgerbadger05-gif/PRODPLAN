@@ -24,18 +24,41 @@ import logging
 
 app = FastAPI(title="PRODPLAN API", version="1.0.0")
 
-# Create tables
+# Страховка для тестов и локальных прогонов на пустой SQLite.
+# Схема воспроизводима из миграций: `alembic upgrade head` на чистой БД даёт
+# ровно Base.metadata (см. tests/test_alembic_schema_reproducibility.py).
+# Новые таблицы добавляем миграцией, а не полагаясь на этот вызов.
 Base.metadata.create_all(bind=engine)
 
 # Logging configuration for spec tree debug
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("specification").setLevel(logging.INFO)
 
-# CORS: разрешаем фронтенд (nginx на 9000)
-frontend_origin = os.getenv("FRONTEND_ORIGIN", "http://localhost:9000")
+# CORS: фронтенд поднимается на разных портах в зависимости от контура —
+# 9000 (легаси/локальный), 9010 (prod), 9020 (shadow), 9300 (dev).
+# FRONTEND_ORIGIN переопределяет список целиком; допускается перечисление
+# через запятую.
+_DEFAULT_FRONTEND_PORTS = (9000, 9010, 9020, 9300)
+_DEFAULT_FRONTEND_ORIGINS = [
+    f"http://{host}:{port}"
+    for port in _DEFAULT_FRONTEND_PORTS
+    for host in ("localhost", "127.0.0.1")
+]
+
+
+def _resolve_frontend_origins() -> list[str]:
+    raw = os.getenv("FRONTEND_ORIGIN")
+    if not raw or not raw.strip():
+        return list(_DEFAULT_FRONTEND_ORIGINS)
+    configured = [origin.strip() for origin in raw.split(",") if origin.strip()]
+    # Дедупликация с сохранением порядка.
+    return list(dict.fromkeys(configured))
+
+
+frontend_origins = _resolve_frontend_origins()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[frontend_origin, "http://127.0.0.1:9000"],
+    allow_origins=frontend_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization"],

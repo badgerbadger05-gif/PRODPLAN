@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from typing import Dict, Optional, List, Iterable, DefaultDict, Tuple
+from typing import Any, Dict, Optional, List, Iterable, DefaultDict, Tuple
 from datetime import datetime
 
 from collections import defaultdict
@@ -265,19 +265,6 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
             order_by="Ref_Key",
         )
 
-        # Диагностика: посмотреть "сырые" значения полей, которые участвуют в фильтрации.
-        # Это нужно, чтобы выявить расхождение между серверным OData-фильтром и пост-фильтром приложения.
-        for i, rec in enumerate(order_data[:5]):
-            raw_dm = rec.get("DeletionMark")
-            raw_posted = rec.get("Posted")
-            raw_state = rec.get("СостояниеЗаказа_Key")
-            print(
-                f"[DEBUG RAW {i}] Ref_Key={rec.get('Ref_Key')}, Number={rec.get('Number')}, "
-                f"DeletionMark={raw_dm!r} (type={type(raw_dm).__name__}, parsed={_parse_1c_bool(raw_dm, False)}), "
-                f"Posted={raw_posted!r} (type={type(raw_posted).__name__}, parsed={_parse_1c_bool(raw_posted, False)}), "
-                f"СостояниеЗаказа_Key={raw_state!r}"
-            )
-
         # Дублируем фильтр на уровне приложения: 1С / прокси иногда игнорируют часть условий.
         removed_by_dm = 0
         removed_by_posted = 0
@@ -318,12 +305,6 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
             return asdict(stats)
 
         stats.orders_total = len(order_data)
-        
-        # Логирование для отладки: первые 5 заказов
-        for i, rec in enumerate(order_data[:5]):
-            dm = rec.get('DeletionMark')
-            print(f"[DEBUG Order {i}] Ref_Key={rec.get('Ref_Key')}, Number={rec.get('Number')}, "
-                  f"DeletionMark={dm} (type={type(dm).__name__}), СостояниеЗаказа_Key={rec.get('СостояниеЗаказа_Key')}")
 
         # Получаем существующие записи для сопоставления
         existing_orders = {
@@ -640,7 +621,7 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
     return asdict(stats)
 
 
-def sync_production_fact_from_odata(db: Session, req: ODataSyncRequest) -> Dict[str, any]:
+def sync_production_fact_from_odata(db: Session, req: ODataSyncRequest) -> Dict[str, Any]:
     """
     Синхронизация факта выпуска из 1С через OData.
     

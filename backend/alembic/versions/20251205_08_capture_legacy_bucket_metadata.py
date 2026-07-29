@@ -64,6 +64,14 @@ def upgrade() -> None:
 
     conn = op.get_bind()
 
+    # Шаги 2-4 — перенос исторических данных сырым PostgreSQL-SQL
+    # (BOOL_OR / TO_JSONB / ON CONFLICT / несколько операторов в одном execute).
+    # На чистой БД переносить нечего, поэтому на других диалектах (SQLite в
+    # тесте воспроизводимости схемы) шаги пропускаются: состав схемы от них
+    # не зависит.
+    if conn.dialect.name != "postgresql":
+        return
+
     # 2) Populate planning_run_bucket_modes
     # Derive legacy bucket usage per run:
     # - use_weekly = TRUE if any of the detail tables has bucket_type <> 'daily' for that run

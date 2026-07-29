@@ -23,9 +23,19 @@ def _has_index(inspector, table_name: str, index_name: str) -> bool:
     return index_name in {idx["name"] for idx in inspector.get_indexes(table_name)}
 
 
+def _has_table(inspector, table_name: str) -> bool:
+    return table_name in set(inspector.get_table_names())
+
+
 def upgrade() -> None:
     bind = op.get_bind()
     inspector = sa.inspect(bind)
+
+    # Таблицы production_control_workshop_warehouses нет ни в models.py, ни в
+    # одной create_table-миграции: имя осталось от раннего контура (актуальное —
+    # workshop_warehouse_bindings). На чистой БД ревизия должна быть no-op.
+    if not _has_table(inspector, "production_control_workshop_warehouses"):
+        return
 
     if not _has_column(inspector, "production_control_workshop_warehouses", "source_warehouse_ref1c"):
         op.add_column(
@@ -49,6 +59,9 @@ def upgrade() -> None:
 def downgrade() -> None:
     bind = op.get_bind()
     inspector = sa.inspect(bind)
+
+    if not _has_table(inspector, "production_control_workshop_warehouses"):
+        return
 
     if _has_index(inspector, "production_control_workshop_warehouses", "ix_pcww_source_warehouse_ref1c"):
         op.drop_index(
