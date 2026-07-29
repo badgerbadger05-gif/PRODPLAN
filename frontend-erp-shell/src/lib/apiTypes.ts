@@ -38,7 +38,16 @@ export interface paths {
         delete: operations["delete_item_endpoint_api_v1_items__item_id__delete"];
         options?: never;
         head?: never;
-        patch?: never;
+        /**
+         * Patch Item Endpoint
+         * @description Update only the sent planning attributes of an item.
+         *
+         *     Editing one attribute must not require the client to resend the whole
+         *     record: `stock_qty` is a physical value owned by the 1C sync / Item Ledger,
+         *     and echoing a just-read copy of it back races the sync. PATCH refuses it
+         *     (422) instead.
+         */
+        patch: operations["patch_item_endpoint_api_v1_items__item_id__patch"];
         trace?: never;
     };
     "/api/v1/sync/stock-odata": {
@@ -765,7 +774,14 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Period Plans Fix */
+        /**
+         * Period Plans Fix
+         * @description Единственное действие «Зафиксировать»: атомарно фиксирует план и
+         *     публикует его MRP-снимок одним поколением Ledger.
+         *
+         *     Отдельной кнопки «MRP-снимок» в каноническом сценарии нет. Если снимок не
+         *     опубликован, план остаётся `draft` (fail closed).
+         */
         post: operations["period_plans_fix_api_v1_plan_period_plans__plan_id__fix_post"];
         delete?: never;
         options?: never;
@@ -799,8 +815,44 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Period Plans Mrp Snapshot */
+        /**
+         * Period Plans Mrp Snapshot
+         * @description Совместимый путь восстановления снимка уже зафиксированного плана.
+         *
+         *     Основной сценарий — атомарный `POST /period-plans/{id}/fix`. Этот маршрут
+         *     остаётся идемпотентным повтором: если у плана уже есть снимок в текущем
+         *     принятом поколении, он возвращается как есть и ничего не форкается.
+         *     `generation_key` необязателен — сервер выводит его из текущего принятого
+         *     поколения.
+         */
         post: operations["period_plans_mrp_snapshot_api_v1_plan_period_plans__plan_id__mrp_snapshot_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/plan/period-plans/{plan_id}/repair-duplicate-snapshots": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Period Plans Repair Duplicate Snapshots
+         * @description Административный ремонт плана с несколькими текущими FIXED_SNAPSHOT.
+         *
+         *     Старая гонка TOCTOU могла опубликовать два снимка одного плана. Такой план
+         *     навсегда отвергается обычным путём («План имеет несколько текущих
+         *     зафиксированных MRP-снимков»). Ремонт под тем же локом публикации
+         *     детерминированно оставляет один прогон, остальные переводит в `SUPERSEDED`,
+         *     после чего обычный путь снимка снова работает. Идемпотентен: для здорового
+         *     плана возвращает `repaired=false` и ничего не меняет.
+         */
+        post: operations["period_plans_repair_duplicate_snapshots_api_v1_plan_period_plans__plan_id__repair_duplicate_snapshots_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -824,130 +876,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/plan/matrix": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Get Plan Matrix
-         * @description Получить матрицу плана производства по дням
-         */
-        post: operations["get_plan_matrix_api_v1_plan_matrix_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/plan/upsert": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Upsert Plan
-         * @description Добавить/обновить запись плана производства
-         */
-        post: operations["upsert_plan_api_v1_plan_upsert_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/plan/bulk_upsert": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Bulk Upsert Plan
-         * @description Пакетное сохранение записей плана производства
-         */
-        post: operations["bulk_upsert_plan_api_v1_plan_bulk_upsert_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/plan/production_report/week": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Get Production Report Week
-         * @description Недельный отчёт о выпуске техники (Пн–Вс), включая статусы закрытия дней.
-         */
-        post: operations["get_production_report_week_api_v1_plan_production_report_week_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/plan/production_report/fact/bulk_upsert": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Bulk Upsert Production Report Fact
-         * @description Пакетное сохранение факта выпуска (completed_qty).
-         *
-         *     Важно: закрытые дни read-only.
-         */
-        post: operations["bulk_upsert_production_report_fact_api_v1_plan_production_report_fact_bulk_upsert_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/plan/production_report/day/close": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Close Production Report Day
-         * @description Закрыть предыдущий рабочий день: перенос остатка (carry) на D_target.
-         *
-         *     Поддерживает re-run (повторное закрытие) с откатом предыдущего переноса.
-         */
-        post: operations["close_production_report_day_api_v1_plan_production_report_day_close_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/plan/anchor": {
         parameters: {
             query?: never;
@@ -964,46 +892,6 @@ export interface paths {
         get: operations["get_planning_anchor_api_v1_plan_anchor_get"];
         put?: never;
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/plan/delete_row": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Delete Plan Row
-         * @description Удалить записи плана для изделия в заданном периоде
-         */
-        post: operations["delete_plan_row_api_v1_plan_delete_row_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/plan/ensure_item": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Ensure Plan Item
-         * @description Гарантировать наличие изделия в плане производства
-         */
-        post: operations["ensure_plan_item_api_v1_plan_ensure_item_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1486,26 +1374,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/plan/export": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Export Plan
-         * @description Экспортировать план производства в CSV или Excel
-         */
-        post: operations["export_plan_api_v1_plan_export_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/nomenclature/search": {
         parameters: {
             query?: never;
@@ -1515,38 +1383,17 @@ export interface paths {
         };
         /**
          * Search Nomenclature
-         * @description Поиск номенклатуры с поддержкой семантического поиска
+         * @description Текстовый поиск номенклатуры по наименованию, коду и артикулу.
          *
          *     - **q**: Поисковый запрос (минимум 2 символа)
          *     - **limit**: Максимальное количество результатов (1-100)
-         *     - **use_semantic**: Использовать семантический поиск (если доступны эмбеддинги)
-         *     - **threshold**: Минимальная схожесть для семантического поиска (0.0-1.0)
+         *
+         *     «Семантический» режим убран: он строился на md5-псевдовекторах и при
+         *     непустой таблице item_embeddings подменял собой рабочий текстовый поиск.
          */
         get: operations["search_nomenclature_api_v1_nomenclature_search_get"];
         put?: never;
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/nomenclature/generate-embeddings": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Generate Embeddings
-         * @description Генерация эмбеддингов для всех элементов номенклатуры
-         *
-         *     Создает или обновляет векторные представления для всех активных элементов номенклатуры.
-         */
-        post: operations["generate_embeddings_api_v1_nomenclature_generate_embeddings_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1562,7 +1409,10 @@ export interface paths {
         };
         /**
          * Get Nomenclature Stats
-         * @description Получить статистику по номенклатуре и эмбеддингам
+         * @description Получить статистику по номенклатуре и эмбеддингам.
+         *
+         *     Заполнение item_embeddings убрано вместе с псевдосемантическим поиском:
+         *     сейчас items_with_embeddings отражает только исторические строки.
          */
         get: operations["get_nomenclature_stats_api_v1_nomenclature_stats_get"];
         put?: never;
@@ -1974,7 +1824,12 @@ export interface paths {
         };
         /**
          * Get Resources
-         * @description Получить список всех производственных участков
+         * @description Получить список производственных участков.
+         *
+         *     Раньше здесь стоял захардкоженный ``.offset(0).limit(100)``, который молча
+         *     обрезал список. Форма ответа не изменилась (плоский массив участков —
+         *     frontend-erp-shell/src/services/resources.ts ждёт именно его), но лимит
+         *     поднят и вынесен в параметры запроса.
          */
         get: operations["get_resources_api_v1_resources__get"];
         put?: never;
@@ -2493,8 +2348,8 @@ export interface paths {
          *     Safety:
          *     - Default `dry_run=true` returns the payload that would be sent without
          *       contacting 1C.
-         *     - To actually write, pass `dry_run=false`. Refuses non-demo base_url
-         *       unless `allow_production=true` is also set.
+         *     - To actually write, pass `dry_run=false`; запись идёт в базу 1С из
+         *       настроек подключения.
          */
         post: operations["post_export_production_orders_to_1c_api_v1_production_control_orders_export_to_1c_post"];
         delete?: never;
@@ -2554,8 +2409,7 @@ export interface paths {
          *     (Posted=false). РРґРµРјРїРѕС‚РµРЅС‚РЅРѕ через sync_link.
          *
          *     - `dry_run=true` (default) вЂ” возвращает payload, не пишет в 1С.
-         *     - `dry_run=false` вЂ” реально пишет; refuse при non-demo base_url без
-         *       `allow_production=true`.
+         *     - `dry_run=false` вЂ” реально пишет в базу 1С из настроек подключения.
          */
         post: operations["post_export_material_issues_to_1c_api_v1_production_control_material_issues_export_to_1c_post"];
         delete?: never;
@@ -2938,6 +2792,35 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/paint-weld/chain/close": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Chain Close
+         * @description Закрыть цепочку «окраска↔сварка» одним действием: выпуски обеих строк,
+         *     СборкаЗапасов обоих заказов и один комбинированный СдельныйНаряд, закрывающий
+         *     оба заказа. dry_run=true — предпросмотр.
+         *
+         *     Закрытие возобновляемо. Если часть шага прошла (одна СборкаЗапасов в 1С, или
+         *     обе сборки есть, а наряда нет), ответ приходит с HTTP 200 и
+         *     ``status='partial'``, ``resume_required=true``, ``chain_state``,
+         *     ``posted_sides``/``pending_sides`` и человекочитаемым ``message``: проведённые
+         *     документы не откатываются, повторный вызов докатывает недостающие без дублей.
+         *     400 остаётся только для случая, когда в 1С не ушло ничего.
+         */
+        post: operations["chain_close_api_v1_paint_weld_chain_close_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/item-ledger/{item_id}/position": {
         parameters: {
             query?: never;
@@ -2952,6 +2835,10 @@ export interface paths {
          *     projected / uncovered follow the  formulas; ``available`` and
          *     ``uncovered`` are surfaced as-is (a negative available is a deficit signal,
          *     not clamped).
+         *
+         *     ``incoming`` comes from the generation's own future-supply capture, so the
+         *     card requires that capability: a generation which never captured future
+         *     supply must read as unavailable, never as zero ordered / zero in transit.
          */
         get: operations["get_position_api_v1_item_ledger__item_id__position_get"];
         put?: never;
@@ -3122,6 +3009,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/item-ledger/admin/physical-refresh/discard": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Discard Physical Refresh
+         * @description Roll one unpublishable refresh candidate back to its accepted parent.
+         *
+         *     Until this endpoint existed the rollback had no production caller at all: a
+         *     candidate that failed convergence kept its physical import batches above the
+         *     accepted parent's boundary, and because visibility is an id-prefix the next
+         *     three-hour fork could never pass its own audit.  One failed refresh
+         *     therefore blocked the pipeline permanently and was undone by hand.
+         */
+        post: operations["discard_physical_refresh_api_v1_item_ledger_admin_physical_refresh_discard_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/item-ledger/admin/generations/invalidate": {
         parameters: {
             query?: never;
@@ -3160,6 +3073,120 @@ export interface paths {
         options?: never;
         head?: never;
         patch?: never;
+        trace?: never;
+    };
+    "/api/v1/planning-rates/assembly-rates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Assembly Rates
+         * @description List configured assembly takts, newest filter-first, paginated.
+         */
+        get: operations["list_assembly_rates_api_v1_planning_rates_assembly_rates_get"];
+        /**
+         * Upsert Assembly Rates
+         * @description Upsert takts by (resource_id, item_id); the pair is unique by model.
+         */
+        put: operations["upsert_assembly_rates_api_v1_planning_rates_assembly_rates_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/planning-rates/assembly-rates/{rate_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Delete Assembly Rate */
+        delete: operations["delete_assembly_rate_api_v1_planning_rates_assembly_rates__rate_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/planning-rates/shelf-policies": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List Shelf Policies */
+        get: operations["list_shelf_policies_api_v1_planning_rates_shelf_policies_get"];
+        put?: never;
+        /** Create Shelf Policy */
+        post: operations["create_shelf_policy_api_v1_planning_rates_shelf_policies_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/planning-rates/shelf-policies/{policy_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Update Shelf Policy */
+        put: operations["update_shelf_policy_api_v1_planning_rates_shelf_policies__policy_id__put"];
+        post?: never;
+        /** Delete Shelf Policy */
+        delete: operations["delete_shelf_policy_api_v1_planning_rates_shelf_policies__policy_id__delete"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/planning-rates/resources": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List Planning Resources
+         * @description Resources with the takt count that already points at them.
+         */
+        get: operations["list_planning_resources_api_v1_planning_rates_resources_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/planning-rates/resources/{resource_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Patch Planning Resource */
+        patch: operations["patch_planning_resource_api_v1_planning_rates_resources__resource_id__patch"];
         trace?: never;
     };
     "/": {
@@ -3239,6 +3266,10 @@ export interface components {
             total_rows: number;
             /** Total Queue Qty */
             total_queue_qty: number;
+            /** Limit */
+            limit: number;
+            /** Offset */
+            offset: number;
             truth_meta: components["schemas"]["TruthMeta"];
         };
         /** AssemblyQueueRow */
@@ -3270,24 +3301,88 @@ export interface components {
             /** Priority Key */
             priority_key: (string | number)[];
         };
-        /** BulkUpsertEntry */
-        BulkUpsertEntry: {
+        /** AssemblyRateListResponse */
+        AssemblyRateListResponse: {
+            /** Rows */
+            rows: components["schemas"]["AssemblyRateRow"][];
+            /** Total */
+            total: number;
+            /** Limit */
+            limit: number;
+            /** Offset */
+            offset: number;
+        };
+        /** AssemblyRateRow */
+        AssemblyRateRow: {
+            /** Id */
+            id: number;
             /** Item Id */
             item_id: number;
-            /** Date */
-            date: string;
-            /** Qty */
-            qty: number;
-            /** Stage Id */
-            stage_id?: number | null;
+            /** Item Code */
+            item_code?: string | null;
+            /** Item Name */
+            item_name?: string | null;
+            /** Resource Id */
+            resource_id: number;
+            /** Resource Name */
+            resource_name?: string | null;
+            /** Qty Per Capacity */
+            qty_per_capacity: number;
         };
-        /** BulkUpsertRequest */
-        BulkUpsertRequest: {
+        /** AssemblyRateUpsert */
+        AssemblyRateUpsert: {
+            /** Item Id */
+            item_id: number;
+            /** Resource Id */
+            resource_id: number;
+            /** Qty Per Capacity */
+            qty_per_capacity: number | string;
+        };
+        /** AssemblyRateUpsertRequest */
+        AssemblyRateUpsertRequest: {
+            /** Rows */
+            rows: components["schemas"]["AssemblyRateUpsert"][];
+        };
+        /** AssemblyRateUpsertResponse */
+        AssemblyRateUpsertResponse: {
+            /** Rows */
+            rows: components["schemas"]["AssemblyRateRow"][];
+            /** Created */
+            created: number;
+            /** Updated */
+            updated: number;
+        };
+        /**
+         * ChainClosePayload
+         * @description Закрытие цепочки из окна журнала (этап 4): любая сторона цепочки.
+         */
+        ChainClosePayload: {
+            /** Product Id */
+            product_id: number;
+            /** Weld Qty */
+            weld_qty?: number | null;
+            /** Paint Qty */
+            paint_qty?: number | null;
+            /** Executor */
+            executor?: string | null;
+            /** Weld Operation Executors */
+            weld_operation_executors?: unknown[] | null;
+            /** Paint Operation Executors */
+            paint_operation_executors?: unknown[] | null;
+            /** Comment */
+            comment?: string | null;
             /**
-             * Entries
-             * @default []
+             * Dry Run
+             * @default true
              */
-            entries: components["schemas"]["BulkUpsertEntry"][];
+            dry_run: boolean;
+            /**
+             * Allow Production
+             * @default false
+             */
+            allow_production: boolean;
+            /** Initiated By */
+            initiated_by?: string | null;
         };
         /** ChainOpenPayload */
         ChainOpenPayload: {
@@ -3335,19 +3430,12 @@ export interface components {
              */
             dry_run: boolean;
         };
-        /** DeleteRowRequest */
-        DeleteRowRequest: {
-            /** Item Id */
-            item_id: number;
-            /** Start Date */
-            start_date?: string | null;
-            /**
-             * Days
-             * @default 30
-             */
-            days: number;
-            /** Stage Id */
-            stage_id?: number | null;
+        /** DeleteResponse */
+        DeleteResponse: {
+            /** Deleted */
+            deleted: boolean;
+            /** Id */
+            id: number;
         };
         /** DrumGapRow */
         DrumGapRow: {
@@ -3382,6 +3470,14 @@ export interface components {
             total_slot_qty: number;
             /** Total Gap Qty */
             total_gap_qty: number;
+            /** Total Slots */
+            total_slots: number;
+            /** Total Gaps */
+            total_gaps: number;
+            /** Limit */
+            limit: number;
+            /** Offset */
+            offset: number;
             truth_meta: components["schemas"]["TruthMeta"];
         };
         /** DrumSlotRow */
@@ -3392,6 +3488,10 @@ export interface components {
             plan_line_id: number;
             /** Item Id */
             item_id: number;
+            /** Item Code */
+            item_code?: string | null;
+            /** Item Name */
+            item_name?: string | null;
             /** Resource Id */
             resource_id: number;
             /** Slot Date */
@@ -3402,15 +3502,6 @@ export interface components {
             slot_ordinal: number;
             /** Original Priority */
             original_priority: (string | number)[];
-        };
-        /** EnsureItemRequest */
-        EnsureItemRequest: {
-            /** Item Code */
-            item_code: string;
-            /** Item Name */
-            item_name?: string | null;
-            /** Item Article */
-            item_article?: string | null;
         };
         /** ExportManufacturesPayload */
         ExportManufacturesPayload: {
@@ -3490,23 +3581,6 @@ export interface components {
              */
             allow_production: boolean;
         };
-        /** ExportRequest */
-        ExportRequest: {
-            /**
-             * Format
-             * @default csv
-             */
-            format: string;
-            /** Start Date */
-            start_date?: string | null;
-            /**
-             * Days
-             * @default 30
-             */
-            days: number;
-            /** Stage Id */
-            stage_id?: number | null;
-        };
         /** ForcedOrderCreateRequest */
         ForcedOrderCreateRequest: {
             /** Run Id */
@@ -3522,8 +3596,6 @@ export interface components {
             /** Reason */
             reason?: string | null;
         };
-        /** GenerateEmbeddingsRequest */
-        GenerateEmbeddingsRequest: Record<string, never>;
         /** GenerationAcceptRequest */
         GenerationAcceptRequest: {
             /** Generation Id */
@@ -3538,6 +3610,8 @@ export interface components {
              * @default false
              */
             explicit_empty_physical: boolean;
+            /** Expected Parent Generation Id */
+            expected_parent_generation_id?: number | null;
         };
         /** GenerationInvalidateRequest */
         GenerationInvalidateRequest: {
@@ -3855,6 +3929,39 @@ export interface components {
             rows: components["schemas"]["ItemLedgerReservationRow"][];
             truth_meta: components["schemas"]["TruthMeta"];
         };
+        /**
+         * ItemPatch
+         * @description Partial item update: only the fields actually sent are written.
+         *
+         *     `stock_qty` is deliberately absent. Physical stock belongs to the 1C sync and
+         *     the Item Ledger, so a browser form must never be able to carry it — with a
+         *     full-record PUT an editor of one planning attribute had to resend the stock
+         *     it had read a moment earlier and could silently overwrite a fresher sync
+         *     value. `extra="forbid"` plus the explicit check below turn such an attempt
+         *     into 422 instead of a silent write.
+         */
+        ItemPatch: {
+            /** Item Code */
+            item_code?: string | null;
+            /** Item Name */
+            item_name?: string | null;
+            /** Item Article */
+            item_article?: string | null;
+            /** Item Ref1C */
+            item_ref1c?: string | null;
+            /** Supplier Ref1C */
+            supplier_ref1c?: string | null;
+            /** Replenishment Time */
+            replenishment_time?: number | null;
+            /** Unit */
+            unit?: string | null;
+            /** Category Id */
+            category_id?: number | null;
+            /** Optimal Batch */
+            optimal_batch?: number | null;
+            /** Status */
+            status?: string | null;
+        };
         /** ItemUpdate */
         ItemUpdate: {
             /** Item Code */
@@ -4074,9 +4181,14 @@ export interface components {
         /** PeriodPlanMrpSnapshotRequest */
         PeriodPlanMrpSnapshotRequest: {
             /** Generation Key */
-            generation_key: string;
+            generation_key?: string | null;
             /** Started By */
             started_by?: string | null;
+        };
+        /** PeriodPlanRepairSnapshotsRequest */
+        PeriodPlanRepairSnapshotsRequest: {
+            /** Repaired By */
+            repaired_by?: string | null;
         };
         /** PeriodPlanUpdateRequest */
         PeriodPlanUpdateRequest: {
@@ -4089,37 +4201,12 @@ export interface components {
             /** Comment */
             comment?: string | null;
         };
-        /** PlanMatrixRequest */
-        PlanMatrixRequest: {
-            /** Start Date */
-            start_date?: string | null;
-            /**
-             * Days
-             * @default 30
-             */
-            days: number;
-            /** Stage Id */
-            stage_id?: number | null;
-            /**
-             * Page
-             * @default 1
-             */
-            page: number;
-            /**
-             * Page Size
-             * @default 30
-             */
-            page_size: number;
-            /**
-             * Sort By
-             * @default item_name
-             */
-            sort_by: string;
-            /**
-             * Sort Dir
-             * @default asc
-             */
-            sort_dir: string;
+        /** PhysicalRefreshDiscardRequest */
+        PhysicalRefreshDiscardRequest: {
+            /** Ledger Generation Id */
+            ledger_generation_id: number;
+            /** Reason */
+            reason: string;
         };
         /** PlanningConfigCreate */
         PlanningConfigCreate: {
@@ -4386,40 +4473,20 @@ export interface components {
             mrp_req_covered_qty?: number | null;
             /** Mrp Req Remaining Qty */
             mrp_req_remaining_qty?: number | null;
-            paint_weld_chain?: components["schemas"]["PaintWeldChainResponse"] | null;
-        };
-        /** ProductionReportDayCloseRequest */
-        ProductionReportDayCloseRequest: {
-            /** Close Date */
-            close_date?: string | null;
-            /** Closed By */
-            closed_by?: string | null;
-        };
-        /** ProductionReportFactBulkUpsertRequest */
-        ProductionReportFactBulkUpsertRequest: {
             /**
-             * Entries
-             * @default []
+             * Launch Source
+             * @default mrp_remaining
              */
-            entries: components["schemas"]["ProductionReportFactEntry"][];
-            /** Rerun Editable Date */
-            rerun_editable_date?: string | null;
-        };
-        /** ProductionReportFactEntry */
-        ProductionReportFactEntry: {
-            /** Item Id */
-            item_id: number;
-            /** Date */
-            date: string;
-            /** Fact Qty */
-            fact_qty: number;
-        };
-        /** ProductionReportWeekRequest */
-        ProductionReportWeekRequest: {
-            /** Week Start */
-            week_start?: string | null;
-            /** Any Date In Week */
-            any_date_in_week?: string | null;
+            launch_source: string;
+            /** Shelf Warehouse Ref1C */
+            shelf_warehouse_ref1c?: string | null;
+            /** Shelf Pull Qty */
+            shelf_pull_qty?: number | null;
+            /** Shelf Materialized Qty */
+            shelf_materialized_qty?: number | null;
+            /** Shelf Latest Start Date */
+            shelf_latest_start_date?: string | null;
+            paint_weld_chain?: components["schemas"]["PaintWeldChainResponse"] | null;
         };
         /** ProductionResource */
         ProductionResource: {
@@ -4502,6 +4569,39 @@ export interface components {
              * @default 0
              */
             buffer_days: number;
+        };
+        /** ProductionResourceListResponse */
+        ProductionResourceListResponse: {
+            /** Rows */
+            rows: components["schemas"]["ProductionResourceRow"][];
+            /** Total */
+            total: number;
+            /** Limit */
+            limit: number;
+            /** Offset */
+            offset: number;
+        };
+        /** ProductionResourcePatch */
+        ProductionResourcePatch: {
+            /** Capacity */
+            capacity?: number | string | null;
+            /** Planning Range */
+            planning_range?: number | null;
+        };
+        /** ProductionResourceRow */
+        ProductionResourceRow: {
+            /** Resource Id */
+            resource_id: number;
+            /** Resource Name */
+            resource_name: string;
+            /** Capacity */
+            capacity: number;
+            /** Planning Range */
+            planning_range: number;
+            /** Shift Offset */
+            shift_offset: number;
+            /** Assembly Rate Count */
+            assembly_rate_count: number;
         };
         /** ProductionResourceUpdate */
         ProductionResourceUpdate: {
@@ -4968,12 +5068,99 @@ export interface components {
                 [key: string]: unknown;
             }[];
         };
+        /** ShelfPolicyCreate */
+        ShelfPolicyCreate: {
+            /** Item Id */
+            item_id: number;
+            /** Warehouse Ref1C */
+            warehouse_ref1c: string;
+            /**
+             * Replenishment Time Days
+             * @default 0
+             */
+            replenishment_time_days: number;
+            /**
+             * Review Cycle Days
+             * @default 0
+             */
+            review_cycle_days: number;
+            /**
+             * Safety Days
+             * @default 0
+             */
+            safety_days: number;
+            /**
+             * Batch Multiple
+             * @default 1
+             */
+            batch_multiple: number | string;
+            /**
+             * Active
+             * @default true
+             */
+            active: boolean;
+        };
+        /** ShelfPolicyListResponse */
+        ShelfPolicyListResponse: {
+            /** Rows */
+            rows: components["schemas"]["ShelfPolicyRow"][];
+            /** Total */
+            total: number;
+            /** Limit */
+            limit: number;
+            /** Offset */
+            offset: number;
+        };
+        /** ShelfPolicyRow */
+        ShelfPolicyRow: {
+            /** Id */
+            id: number;
+            /** Item Id */
+            item_id: number;
+            /** Item Code */
+            item_code?: string | null;
+            /** Item Name */
+            item_name?: string | null;
+            /** Warehouse Ref1C */
+            warehouse_ref1c: string;
+            /** Warehouse Name */
+            warehouse_name?: string | null;
+            /** Replenishment Time Days */
+            replenishment_time_days: number;
+            /** Review Cycle Days */
+            review_cycle_days: number;
+            /** Safety Days */
+            safety_days: number;
+            /** Batch Multiple */
+            batch_multiple: number;
+            /** Active */
+            active: boolean;
+        };
+        /** ShelfPolicyUpdate */
+        ShelfPolicyUpdate: {
+            /** Warehouse Ref1C */
+            warehouse_ref1c?: string | null;
+            /** Replenishment Time Days */
+            replenishment_time_days?: number | null;
+            /** Review Cycle Days */
+            review_cycle_days?: number | null;
+            /** Safety Days */
+            safety_days?: number | null;
+            /** Batch Multiple */
+            batch_multiple?: number | string | null;
+            /** Active */
+            active?: boolean | null;
+        };
         /** ShelfProjectionResponse */
         ShelfProjectionResponse: {
             /** Rows */
             rows: components["schemas"]["ShelfProjectionRow"][];
             /** Total Rows */
             total_rows: number;
+            /** Limit */
+            limit: number;
+            /** Offset */
+            offset: number;
             truth_meta: components["schemas"]["TruthMeta"];
         };
         /** ShelfProjectionRow */
@@ -4982,6 +5169,10 @@ export interface components {
             policy_id: number;
             /** Item Id */
             item_id: number;
+            /** Item Code */
+            item_code: string | null;
+            /** Item Name */
+            item_name: string | null;
             /** Warehouse Ref1C */
             warehouse_ref1c: string;
             /** Protection Until */
@@ -5008,6 +5199,10 @@ export interface components {
             first_shortage_date: string | null;
             /** Latest Start Date */
             latest_start_date: string | null;
+            /** Demand Manifest */
+            demand_manifest: {
+                [key: string]: unknown;
+            }[];
         };
         /** SyncAutoConfigPayload */
         SyncAutoConfigPayload: {
@@ -5054,17 +5249,6 @@ export interface components {
         UpdateQuantityPayload: {
             /** Quantity */
             quantity: number;
-        };
-        /** UpsertPlanRequest */
-        UpsertPlanRequest: {
-            /** Item Id */
-            item_id: number;
-            /** Date */
-            date: string;
-            /** Qty */
-            qty: number;
-            /** Stage Id */
-            stage_id?: number | null;
         };
         /** ValidationError */
         ValidationError: {
@@ -5244,6 +5428,41 @@ export interface operations {
             cookie?: never;
         };
         requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Item"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    patch_item_endpoint_api_v1_items__item_id__patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                item_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ItemPatch"];
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {
@@ -6595,7 +6814,7 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody: {
+        requestBody?: {
             content: {
                 "application/json": components["schemas"]["PeriodPlanFixRequest"];
             };
@@ -6663,9 +6882,44 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody: {
+        requestBody?: {
             content: {
                 "application/json": components["schemas"]["PeriodPlanMrpSnapshotRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    period_plans_repair_duplicate_snapshots_api_v1_plan_period_plans__plan_id__repair_duplicate_snapshots_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                plan_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["PeriodPlanRepairSnapshotsRequest"];
             };
         };
         responses: {
@@ -6725,204 +6979,6 @@ export interface operations {
             };
         };
     };
-    get_plan_matrix_api_v1_plan_matrix_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["PlanMatrixRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    upsert_plan_api_v1_plan_upsert_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["UpsertPlanRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    bulk_upsert_plan_api_v1_plan_bulk_upsert_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["BulkUpsertRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    get_production_report_week_api_v1_plan_production_report_week_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ProductionReportWeekRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    bulk_upsert_production_report_fact_api_v1_plan_production_report_fact_bulk_upsert_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ProductionReportFactBulkUpsertRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    close_production_report_day_api_v1_plan_production_report_day_close_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ProductionReportDayCloseRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     get_planning_anchor_api_v1_plan_anchor_get: {
         parameters: {
             query?: never;
@@ -6939,72 +6995,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": unknown;
-                };
-            };
-        };
-    };
-    delete_plan_row_api_v1_plan_delete_row_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["DeleteRowRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    ensure_plan_item_api_v1_plan_ensure_item_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["EnsureItemRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -7885,39 +7875,6 @@ export interface operations {
             };
         };
     };
-    export_plan_api_v1_plan_export_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ExportRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     search_nomenclature_api_v1_nomenclature_search_get: {
         parameters: {
             query: {
@@ -7925,49 +7882,12 @@ export interface operations {
                 q: string;
                 /** @description Максимальное количество результатов */
                 limit?: number;
-                /** @description Использовать семантический поиск */
-                use_semantic?: boolean;
-                /** @description Порог схожести для семантического поиска */
-                threshold?: number;
             };
             header?: never;
             path?: never;
             cookie?: never;
         };
         requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    generate_embeddings_api_v1_nomenclature_generate_embeddings_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["GenerateEmbeddingsRequest"];
-            };
-        };
         responses: {
             /** @description Successful Response */
             200: {
@@ -8622,7 +8542,12 @@ export interface operations {
     };
     get_resources_api_v1_resources__get: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description Сколько участков пропустить */
+                skip?: number;
+                /** @description Максимум участков в ответе */
+                limit?: number;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -8636,6 +8561,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ProductionResource"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -8988,7 +8922,10 @@ export interface operations {
     };
     get_assembly_queue_api_v1_production_control_assembly_queue_get: {
         parameters: {
-            query?: never;
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -9004,11 +8941,23 @@ export interface operations {
                     "application/json": components["schemas"]["AssemblyQueueResponse"];
                 };
             };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
         };
     };
     get_drum_schedule_api_v1_production_control_drum_get: {
         parameters: {
-            query?: never;
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -9024,11 +8973,23 @@ export interface operations {
                     "application/json": components["schemas"]["DrumScheduleResponse"];
                 };
             };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
         };
     };
     get_shelf_projections_api_v1_production_control_shelves_get: {
         parameters: {
-            query?: never;
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -9042,6 +9003,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ShelfProjectionResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -10575,6 +10545,41 @@ export interface operations {
             };
         };
     };
+    chain_close_api_v1_paint_weld_chain_close_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChainClosePayload"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_position_api_v1_item_ledger__item_id__position_get: {
         parameters: {
             query?: never;
@@ -10893,6 +10898,43 @@ export interface operations {
             };
         };
     };
+    discard_physical_refresh_api_v1_item_ledger_admin_physical_refresh_discard_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                "X-PRODPLAN-ADMIN-TOKEN"?: string | null;
+            };
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PhysicalRefreshDiscardRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     invalidate_generation_api_v1_item_ledger_admin_generations_invalidate_post: {
         parameters: {
             query?: never;
@@ -10951,6 +10993,304 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SeedResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_assembly_rates_api_v1_planning_rates_assembly_rates_get: {
+        parameters: {
+            query?: {
+                item_id?: number | null;
+                resource_id?: number | null;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AssemblyRateListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    upsert_assembly_rates_api_v1_planning_rates_assembly_rates_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AssemblyRateUpsertRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AssemblyRateUpsertResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_assembly_rate_api_v1_planning_rates_assembly_rates__rate_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                rate_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeleteResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_shelf_policies_api_v1_planning_rates_shelf_policies_get: {
+        parameters: {
+            query?: {
+                item_id?: number | null;
+                active?: boolean | null;
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ShelfPolicyListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_shelf_policy_api_v1_planning_rates_shelf_policies_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ShelfPolicyCreate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ShelfPolicyRow"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_shelf_policy_api_v1_planning_rates_shelf_policies__policy_id__put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                policy_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ShelfPolicyUpdate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ShelfPolicyRow"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_shelf_policy_api_v1_planning_rates_shelf_policies__policy_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                policy_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeleteResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    list_planning_resources_api_v1_planning_rates_resources_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProductionResourceListResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    patch_planning_resource_api_v1_planning_rates_resources__resource_id__patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                resource_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProductionResourcePatch"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProductionResourceRow"];
                 };
             };
             /** @description Validation Error */
