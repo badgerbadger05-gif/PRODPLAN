@@ -21,7 +21,7 @@ import {
 } from '../../../domain/planning'
 import type { NomenclatureSearchItem } from '../../../domain/productionPlan'
 import { dateRu, dateTimeRu, qty } from '../../../lib/format'
-import { ensurePlanItem, searchNomenclature } from '../../../services/productionPlan'
+import { searchNomenclature } from '../../../services/productionPlan'
 import {
   addItemToPeriodPlan,
   reconcileRun,
@@ -518,8 +518,10 @@ export function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     setError('')
     setMessage('')
     try {
-      const ensured = await ensurePlanItem(item)
-      await addItemToPeriodPlan(planId, ensured.item_id)
+      if (item.item_id == null) {
+        throw new Error(`У позиции «${item.item_name}» нет item_id — она не найдена в справочнике`)
+      }
+      await addItemToPeriodPlan(planId, item.item_id)
       setMessage(`Добавлено: ${item.item_name}`)
       setSearchQuery('')
       setSearchRows([])

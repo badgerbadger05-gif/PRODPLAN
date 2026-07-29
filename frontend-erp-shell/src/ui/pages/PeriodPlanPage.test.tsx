@@ -33,7 +33,6 @@ vi.mock('../../services/periodPlan', () => ({
 }))
 vi.mock('../../services/productionPlan', () => ({
   searchNomenclature: vi.fn(),
-  ensurePlanItem: vi.fn(),
 }))
 // ── Fake data shaped to the domain types ──────────────────────────────────────
 const draftPlan: PeriodPlan = {
@@ -303,7 +302,6 @@ beforeEach(() => {
   vi.mocked(productionPlanSvc.searchNomenclature).mockResolvedValue({
     items: [searchItem], total: 1, query: '', search_type: 'trgm',
   })
-  vi.mocked(productionPlanSvc.ensurePlanItem).mockResolvedValue({ status: 'ok', item_id: 777 })
 })
 
 afterEach(() => {
@@ -485,7 +483,7 @@ describe('PeriodPlanPage — detail view', () => {
     expect(await screen.findByText('Клапан КР-9')).toBeInTheDocument()
   })
 
-  it('adds a search result via ensurePlanItem then addItemToPeriodPlan', async () => {
+  it('adds a search result directly via addItemToPeriodPlan using its item_id', async () => {
     const user = userEvent.setup()
     renderAt('/period-plan/123')
     const input = await screen.findByPlaceholderText(/поиск по мере ввода/)
@@ -494,8 +492,7 @@ describe('PeriodPlanPage — detail view', () => {
     const option = await screen.findByRole('button', { name: /Клапан КР-9/ })
     await user.click(option)
 
-    await waitFor(() => expect(productionPlanSvc.ensurePlanItem).toHaveBeenCalledWith(searchItem))
-    expect(periodPlanSvc.addItemToPeriodPlan).toHaveBeenCalledWith(123, 777)
+    await waitFor(() => expect(periodPlanSvc.addItemToPeriodPlan).toHaveBeenCalledWith(123, 777))
   })
 
   it('switches to the journal tab and loads the execution journal', async () => {
