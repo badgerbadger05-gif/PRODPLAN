@@ -1,0 +1,67 @@
+# Карточка номенклатуры — контракт чтения
+
+Карточка показывает принятое поколение Item Ledger и никогда не запускает
+пересчёт.
+
+Каждый ответ содержит `ledger_generation`, `cutoff`, `truth_status` и
+`unavailable_reason`. Если `truth_status != accepted`, количественные
+показатели и выполнение недоступны. Нули как fallback запрещены.
+
+## 1. Лента количества
+
+Показываются `posting_at`, `qty`, `qty_after`, склад, вид движения,
+регистратор и строка документа. Сортировка — `(posting_at, id)`.
+
+## 2. Лента резервов
+
+Одна строка на требование плана:
+
+```jsonc
+{
+  "reservation_id": 5123,
+  "plan_id": 5,
+  "requirement_id": 55831,
+  "reserved_qty": 270.64,
+  "covered_from_stock_at_freeze_qty": 120.0,
+  "replenishment": {
+    "flow": "buy",
+    "required_qty": 150.64,
+    "received_qty": 79.57,
+    "remaining_qty": 71.07,
+    "execution_pct": 52.82,
+    "state": "partial"
+  },
+  "lifecycle_status": "active"
+}
+```
+
+`flow` принимает `make` или `buy` и определяет только рабочий журнал.
+При `required_qty = 0` процент равен `null`, состояние —
+`replenishment_not_required`.
+
+## 3. Назначения пополнений
+
+Для резерва показываются `physical_sle_id`, `assigned_qty`, `posting_at`,
+регистратор и необязательная ссылка на заказ. Правило назначения всегда FIFO.
+Ссылка на заказ является provenance и не меняет количество.
+
+## 4. Сводка позиции
+
+```text
+on_hand
+active_reserved_qty
+free_qty = on_hand - active_reserved_qty
+replenishment_required_qty
+replenishment_received_qty
+replenishment_remaining_qty
+```
+
+Отрицательный `free_qty` показывается без клампа.
+
+## 5. Граница
+
+Карточка read-only. Она читает физическую ленту, одну ленту резервов и события
+назначения одного принятого поколения. Других расчётных источников нет.
+
+Очередь сборки не является третьей лентой номенклатуры. Это проекция
+верхнеуровневых строк планов, закрываемая теми же физическими выпусками.
