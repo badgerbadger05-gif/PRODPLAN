@@ -37,7 +37,8 @@ def _accepted_world(db):
     """One accepted generation + one purchased item, the shared starting truth."""
     physical = models.PhysicalImportBatch(
         batch_key="retire-physical", status="completed", cutoff=CUTOFF,
-        source_watermarks={}, completed_at=CUTOFF,
+        source_watermarks={"opening_at": "2025-01-01T00:00:00+00:00"},
+        completed_at=CUTOFF,
     )
     accepted = models.LedgerGeneration(
         generation_key="retire-accepted", status="accepted", cutoff=CUTOFF,
@@ -56,6 +57,18 @@ def _accepted_world(db):
     db.add_all([physical, accepted, item])
     db.flush()
     db.add(models.PlanningTruthState(id=1, current_generation_id=accepted.id))
+    resource = models.ProductionResource(
+        resource_name="Retire assembly",
+        planning_range=30,
+        capacity=Decimal("100"),
+    )
+    db.add(resource)
+    db.flush()
+    db.add(models.AssemblyRate(
+        resource_id=int(resource.resource_id),
+        item_id=int(item.item_id),
+        qty_per_capacity=Decimal("1"),
+    ))
     db.commit()
     return accepted, item
 

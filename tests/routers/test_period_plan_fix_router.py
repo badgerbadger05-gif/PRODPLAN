@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from app.database import get_db
 from app.models import (
+    AssemblyRate,
     Item,
     LedgerGeneration,
     PhysicalImportBatch,
@@ -21,6 +22,7 @@ from app.models import (
     PlanningTruthState,
     ProductionPlanHeader,
     ProductionPlanLine,
+    ProductionResource,
 )
 from app.routers.plan import router as plan_router
 
@@ -46,7 +48,7 @@ def accepted_generation(db_session):
         batch_key="fix-router-ledger",
         status="completed",
         cutoff=cutoff,
-        source_watermarks={},
+        source_watermarks={"opening_at": "2025-01-01T00:00:00+00:00"},
         completed_at=cutoff,
     )
     generation = LedgerGeneration(
@@ -67,6 +69,14 @@ def accepted_generation(db_session):
     db_session.add(generation)
     db_session.flush()
     db_session.add(PlanningTruthState(id=1, current_generation_id=generation.id))
+    resource = ProductionResource(
+        resource_name="Fix router assembly",
+        planning_range=30,
+        capacity=100,
+    )
+    db_session.add(resource)
+    db_session.flush()
+    db_session.info["fix_router_assembly_resource_id"] = int(resource.resource_id)
     db_session.commit()
     return generation
 
@@ -82,6 +92,12 @@ def _plan_with_line(db, *, status: str = "draft", qty: float = 7.0) -> Productio
         status="active",
     )
     db.add(item)
+    db.flush()
+    db.add(AssemblyRate(
+        resource_id=int(db.info["fix_router_assembly_resource_id"]),
+        item_id=int(item.item_id),
+        qty_per_capacity=1,
+    ))
     db.flush()
     plan = ProductionPlanHeader(
         name="Август", period_from=date(2026, 8, 1), period_to=date(2026, 8, 31),

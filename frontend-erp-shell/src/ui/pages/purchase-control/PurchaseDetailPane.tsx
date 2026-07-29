@@ -47,11 +47,11 @@ export function PurchaseDetailPane({ activeRow, embedded = false }: Props) {
 
   const content = (
     <>
-      <h2>{activeRow.line_status === 'to_order' ? 'MRP-потребность' : 'Карточка строки'}</h2>
+      <h2>{activeRow.row_generator === 'mrp_reservation' ? 'MRP-потребность' : 'Карточка строки'}</h2>
       <div className="detailTitle">{activeRow.item_name}</div>
       <div className="detailMeta">{activeRow.item_article || activeRow.item_code}</div>
       <div className="detailGrid">
-        {activeRow.line_status === 'to_order' ? (
+        {activeRow.row_generator === 'mrp_reservation' ? (
           <>
             <span>Генератор</span><strong>{activeRow.row_generator === 'mrp_reservation' ? 'Под заказ (MRP)' : activeRow.row_generator || '—'}</strong>
             <span>Планы</span><strong>{activeRow.run_ids?.length ?? (activeRow.run_id ? 1 : 0)}</strong>
@@ -89,7 +89,7 @@ export function PurchaseDetailPane({ activeRow, embedded = false }: Props) {
           </>
         )}
         <span>Поставщик</span><strong>{activeRow.supplier_name || 'Не указан'}</strong>
-        {activeRow.line_status !== 'to_order' && (
+        {activeRow.row_generator !== 'mrp_reservation' && (
           <>
             <span>Заказано</span><strong>{qty(activeRow.quantity)} {activeRow.unit || ''}</strong>
             <span>Поступило</span>

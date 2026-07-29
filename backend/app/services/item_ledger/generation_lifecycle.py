@@ -472,6 +472,36 @@ def _reservation_fold_checkpoint(
     return entries, events, entry_by_id
 
 
+def _reservation_fact_conservation_checkpoint(
+    events: list[models.ReservationEvent],
+    visible: list[models.StockLedgerEntry],
+) -> int:
+    """Prove that realization projections partition, rather than clone, facts."""
+    visible_by_id = {int(row.id): row for row in visible}
+    realized_by_sle: dict[int, Decimal] = {}
+    for event in events:
+        delta = _d(event.realized_delta)
+        if delta == 0:
+            continue
+        if event.sle_id is None or int(event.sle_id) not in visible_by_id:
+            raise GenerationValidationError(
+                "reservation realization references a non-visible physical fact"
+            )
+        sle_id = int(event.sle_id)
+        physical_qty = _d(visible_by_id[sle_id].qty)
+        if physical_qty == 0 or (physical_qty > 0) != (delta > 0):
+            raise GenerationValidationError(
+                f"reservation realization sign conflicts with physical SLE {sle_id}"
+            )
+        realized_by_sle[sle_id] = realized_by_sle.get(sle_id, Decimal("0")) + delta
+    for sle_id, realized_qty in realized_by_sle.items():
+        if abs(realized_qty) > abs(_d(visible_by_id[sle_id].qty)):
+            raise GenerationValidationError(
+                f"reservation realizations exceed physical SLE {sle_id}"
+            )
+    return len(realized_by_sle)
+
+
 def _stock_bin_fold_checkpoint(
     db: Session,
     generation: models.LedgerGeneration,
@@ -625,6 +655,7 @@ def validate_obligation_refresh_build(
     entries, events, _by_id = _reservation_fold_checkpoint(
         db, generation, is_allowed_cycle=_is_allowed_cycle
     )
+    realized_fact_count = _reservation_fact_conservation_checkpoint(events, visible)
     bin_count = _stock_bin_fold_checkpoint(db, generation, visible)
     provenance, _candidates, excluded_ids, status_counts = (
         _supplier_provenance_checkpoint(db, generation, require_full_coverage=False)
@@ -635,6 +666,7 @@ def validate_obligation_refresh_build(
         "stock_bins": bin_count,
         "reservation_entries": len(entries),
         "reservation_events": len(events),
+        "realized_physical_facts": realized_fact_count,
         "carried_forward_generations": sorted(
             allowed_generation_ids - {int(generation.id)}
         ),
@@ -707,6 +739,7 @@ def validate_generation_build(
     entries, events, _entry_by_id = _reservation_fold_checkpoint(
         db, generation, is_allowed_cycle=_is_allowed_cycle
     )
+    _reservation_fact_conservation_checkpoint(events, visible)
     represented = {int(row.requirement_id) for row in entries}
     missing = sorted(selected_requirement_ids - represented)
     if missing:

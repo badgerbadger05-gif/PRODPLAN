@@ -1,4 +1,5 @@
 import { DocumentWindow } from '../layout/DocumentWindow'
+import { AsyncState } from '../layout/AsyncState'
 import { StatusBar } from '../layout/StatusBar'
 import { CommandBar } from './CommandBar'
 import { DoctypeTable } from './DoctypeTable'
@@ -35,6 +36,9 @@ type Props<Row, Filters extends object, Detail> = {
   renderCommandBar?: (state: DoctypeListState<Row, Filters, Detail>) => ReactNode
   renderToolbarAfter?: (state: DoctypeListState<Row, Filters, Detail>) => ReactNode
   renderTable?: (state: DoctypeListState<Row, Filters, Detail>) => ReactNode
+  splitClassName?: string
+  loadingLabel?: string
+  emptyLabel?: string
 }
 
 export function DoctypePage<Row, Filters extends object, Detail>({
@@ -52,6 +56,9 @@ export function DoctypePage<Row, Filters extends object, Detail>({
   renderCommandBar,
   renderToolbarAfter,
   renderTable,
+  splitClassName,
+  loadingLabel = 'Загрузка данных…',
+  emptyLabel = 'Нет данных',
 }: Props<Row, Filters, Detail>) {
   const [searchParams, setSearchParams] = useSearchParams()
   const columnOptions = useMemo(
@@ -220,22 +227,43 @@ export function DoctypePage<Row, Filters extends object, Detail>({
           onCopyLink={() => void navigator.clipboard?.writeText(window.location.href)}
         />
         {renderFilters ? renderFilters(state) : <FilterBar doctype={doctype} state={state} />}
-        {state.listLoading && <div className="srOnly" role="status">Загрузка...</div>}
-        {state.error && <div className="errorLine" role="alert">{state.error}</div>}
-        {state.message && <div className="successLine" role="status">{state.message}</div>}
-        <div className={doctype.detail || renderDetail ? 'split' : undefined}>
-          {renderTable
-            ? renderTable(state)
-            : (
-                <DoctypeTable
-                  doctype={doctype}
-                  state={state}
-                  onRowDoubleClick={onRowDoubleClick}
-                  visibleColumns={visibleColumns}
-                  density={density}
-                  access={access}
-                />
-              )}
+        {state.listLoading && <div className="srOnly" role="status" aria-live="polite">Загрузка...</div>}
+        {state.error && state.rows.length > 0 && <div className="errorLine" role="alert">{state.error}</div>}
+        {state.message && (
+          <div className="successLine" role={state.listLoading ? undefined : 'status'}>
+            {state.message}
+          </div>
+        )}
+        <div className={[
+          doctype.detail || renderDetail ? 'split' : '',
+          splitClassName ?? '',
+        ].filter(Boolean).join(' ') || undefined}>
+          <AsyncState
+            loading={state.listLoading}
+            error={state.error}
+            empty={state.rows.length === 0 && (
+              state.listLoading
+              || Boolean(state.error)
+              || Boolean(renderTable)
+            )}
+            loadingLabel={loadingLabel}
+            emptyLabel={emptyLabel}
+            onRetry={state.reload}
+            announce={false}
+          >
+            {renderTable
+              ? renderTable(state)
+              : (
+                  <DoctypeTable
+                    doctype={doctype}
+                    state={state}
+                    onRowDoubleClick={onRowDoubleClick}
+                    visibleColumns={visibleColumns}
+                    density={density}
+                    access={access}
+                  />
+                )}
+          </AsyncState>
           {(doctype.detail || renderDetail) && (
             <aside className="detailPane">
               {state.detailLoading && <div>Загрузка...</div>}

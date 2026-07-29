@@ -10,6 +10,7 @@ from sqlalchemy import and_, asc, func
 from sqlalchemy.orm import Session
 
 from app import models
+from .live_plan_scope import live_plan_run_ids
 
 
 CONSUMER = "assembly_queue"
@@ -50,6 +51,10 @@ def _sort_key(period_from: Any, period_to: Any, plan_id: int, plan_line_id: int)
 
 
 def _build_rows(db: Session, generation_id: int) -> list[dict[str, Any]]:
+    generation = db.get(models.LedgerGeneration, int(generation_id))
+    if generation is None:
+        raise ValueError("assembly queue snapshot generation not found")
+    run_ids = live_plan_run_ids(db, generation)
     accepted_allocations = (
         db.query(
             models.AssemblyOutputAllocation.plan_line_id.label("plan_line_id"),
@@ -84,8 +89,7 @@ def _build_rows(db: Session, generation_id: int) -> list[dict[str, Any]]:
             models.PlanningRun,
             and_(
                 models.PlanningRun.source_plan_id == models.ProductionPlanHeader.id,
-                models.PlanningRun.status == "FIXED_SNAPSHOT",
-                models.PlanningRun.ledger_generation_id == int(generation_id),
+                models.PlanningRun.run_id.in_(run_ids),
             ),
         )
         .join(models.Item, models.Item.item_id == models.ProductionPlanLine.item_id)

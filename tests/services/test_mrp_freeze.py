@@ -26,6 +26,7 @@ from app.services.mrp_freeze import (
 
 
 CUTOFF = datetime(2026, 7, 23, 12, tzinfo=timezone.utc)
+OPENING_AT = datetime(2026, 5, 1, tzinfo=timezone.utc)
 
 
 def _seal(target, parents, candidates):
@@ -64,7 +65,7 @@ def _freeze_candidate_generation(db, *, suffix: str = "scope"):
         batch_key=f"freeze-physical-{suffix}",
         status="completed",
         cutoff=CUTOFF,
-        source_watermarks={},
+        source_watermarks={"opening_at": OPENING_AT.isoformat()},
         completed_at=CUTOFF,
     )
     generation = models.LedgerGeneration(
@@ -120,7 +121,7 @@ def _world(db, demands, *, root=None, stock=None, future=None):
         batch_key=f"freeze-physical-{id(demands)}",
         status="completed",
         cutoff=CUTOFF,
-        source_watermarks={},
+        source_watermarks={"opening_at": OPENING_AT.isoformat()},
         completed_at=CUTOFF,
     )
     accepted = models.LedgerGeneration(

@@ -251,6 +251,12 @@ def build_shared_pools(
         raise LedgerPoolUnavailable(
             f"ledger_pool_unavailable: generation {ledger_generation_id} is missing"
         )
+    if stock_baseline_at is not None:
+        _assert_baseline_within_physical_history(
+            db,
+            physical_import_batch_id=int(generation.physical_import_batch_id),
+            baseline_at=stock_baseline_at,
+        )
     stock = (
         _ledger_stock_by_item_at(
             db,
@@ -336,6 +342,47 @@ def build_shared_pools(
         baseline_at=stock_baseline_at,
         physical_import_batch_id=int(generation.physical_import_batch_id),
     )
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Normalise DB/test datetimes for physical-history boundary comparisons."""
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _assert_baseline_within_physical_history(
+    db: Session,
+    *,
+    physical_import_batch_id: int,
+    baseline_at: datetime,
+) -> None:
+    """Reject a stock baseline outside the imported physical-history prefix.
+
+    An empty aggregate before the opening boundary is not a factual zero.  It is
+    unavailable history and must stop MRP before immutable requirements are
+    written.
+    """
+    from .item_ledger.opening_balance_reconcile import opening_boundary
+
+    boundary = opening_boundary(db)
+    if boundary is None:
+        raise LedgerPoolUnavailable(
+            "ledger_pool_unavailable: physical history has no opening boundary "
+            "for the requested stock baseline"
+        )
+    opening_batch, opening_at = boundary
+    if int(opening_batch.id) > int(physical_import_batch_id):
+        raise LedgerPoolUnavailable(
+            "ledger_pool_unavailable: physical opening boundary is outside "
+            f"import prefix {physical_import_batch_id}"
+        )
+    if _as_utc(baseline_at) < _as_utc(opening_at):
+        raise LedgerPoolUnavailable(
+            "ledger_pool_unavailable: stock baseline "
+            f"{_as_utc(baseline_at).isoformat()} precedes physical opening "
+            f"{_as_utc(opening_at).isoformat()}"
+        )
 
 
 def _ledger_stock_by_item_all(db: Session, ledger_generation_id: int) -> Dict[int, float]:
@@ -914,9 +961,16 @@ def freeze_candidate_snapshots(
                 MrpFreezeAllocation.item_id == int(item_id),
                 MrpFreezeAllocation.source_type == "stock",
             ).scalar()
-            pools.stock[int(item_id)] = (
-                pools.stock.get(int(item_id), 0.0) - _to_float(active_qty)
-            )
+            item_id = int(item_id)
+            retained_qty = _to_float(active_qty)
+            available_qty = pools.stock.get(item_id, 0.0)
+            if retained_qty > available_qty + EPS:
+                raise LedgerPoolUnavailable(
+                    "ledger_pool_unavailable: retained stock allocation exceeds "
+                    f"physical baseline for run={int(run_id)}, item={item_id}: "
+                    f"retained={retained_qty}, available={available_qty}"
+                )
+            pools.stock[item_id] = available_qty - retained_qty
         retained_future = db.query(MrpFreezeAllocation).filter(
             MrpFreezeAllocation.run_id.in_(retained_run_ids),
             MrpFreezeAllocation.source_type.in_(("wip_order", "supplier_order")),

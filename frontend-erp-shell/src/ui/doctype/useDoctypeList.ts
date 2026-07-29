@@ -87,7 +87,6 @@ export function useDoctypeList<Row, Filters extends object, Detail>(
     const access = JSON.parse(accessKey) as AccessSubject
     setListLoading(true)
     setError('')
-    setListMeta({})
 
     void doctype.dataSource
       .list(

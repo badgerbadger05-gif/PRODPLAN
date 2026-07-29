@@ -90,6 +90,27 @@ function renderPage(url = '/purchase-control') {
   )
 }
 
+const expectedMrpRow: PurchaseRow = {
+  ...purchaseRow,
+  row_key: 'buy:9:covered',
+  line_status: 'expected',
+  to_order_qty: 0,
+  remaining_qty: 12,
+  open_order_covered_qty: 12,
+  open_order_covered_pct: 100,
+  to_order_pct: 0,
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, resolve, reject }
+}
+
 describe('PurchaseControlPage Doctype migration', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -208,5 +229,112 @@ describe('PurchaseControlPage Doctype migration', () => {
     fireEvent.change(screen.getByLabelText('Поставщик'), { target: { value: '7' } })
     await waitFor(() => expect(listPurchaseJournal).toHaveBeenCalledTimes(3))
     expect(vi.mocked(listPurchaseJournal).mock.calls[2]?.[0].get('supplier_id')).toBe('7')
+  })
+
+  it('distinguishes a slow initial request from a completed empty journal', async () => {
+    const request = deferred<Awaited<ReturnType<typeof listPurchaseJournal>>>()
+    vi.mocked(listPurchaseJournal).mockReturnValueOnce(request.promise)
+    renderPage()
+
+    expect(screen.getByText('Загрузка журнала закупок…')).toBeVisible()
+    expect(screen.getByText('Ответ может занять несколько секунд. Данные ещё не получены.')).toBeVisible()
+    expect(screen.getByText('Снимок: загрузка… · Ledger: загрузка…')).toBeVisible()
+    expect(screen.queryByRole('table')).not.toBeInTheDocument()
+
+    request.resolve({
+      rows: [],
+      total: 0,
+      limit: 100,
+      offset: 0,
+      run_id: null,
+      run_ids: [],
+      truth_status: 'accepted',
+      ledger_generation_id: 23,
+      summary: {
+        total_rows: 0,
+        by_status: {},
+        by_phase: {},
+        to_order: 0,
+        overdue: 0,
+        expected_7d: 0,
+        in_transit_amount: 0,
+        fact_status: 'available',
+      },
+      meta: {
+        snapshot_id: 52,
+        ledger_generation: 23,
+        cutoff: '2026-07-23T12:00:00+00:00',
+        truth_status: 'accepted',
+        fact_source: 'ledger',
+        received_qty_status: 'available',
+        read_only: true,
+      },
+    })
+    expect(await screen.findByText('В журнале закупок нет строк')).toBeVisible()
+    expect(screen.getByText('Запрос завершён: подходящих строк нет.')).toBeVisible()
+  })
+
+  it('shows a retryable error state instead of an empty purchase table', async () => {
+    vi.mocked(listPurchaseJournal).mockRejectedValueOnce(new Error('VPN timeout'))
+    renderPage()
+
+    expect(await screen.findByText('Не удалось загрузить данные')).toBeVisible()
+    expect(screen.getByRole('alert')).toHaveTextContent('VPN timeout')
+    expect(screen.getByText('Снимок: недоступен · Ledger: недоступен')).toBeVisible()
+    expect(screen.getByRole('button', { name: 'Повторить' })).toBeEnabled()
+  })
+
+  it('keeps snapshot identity and scroll-safe geometry during a refresh', async () => {
+    renderPage()
+    await screen.findAllByText('Под заказ (MRP)')
+    expect(screen.getByText('Снимок: 51 · Ledger: 23')).toBeVisible()
+    expect(document.querySelector('.split')).toHaveClass('purchaseJournalSplit')
+
+    const refresh = deferred<Awaited<ReturnType<typeof listPurchaseJournal>>>()
+    vi.mocked(listPurchaseJournal).mockReturnValueOnce(refresh.promise)
+    fireEvent.click(screen.getByRole('button', { name: 'Обновить' }))
+
+    await waitFor(() => expect(listPurchaseJournal).toHaveBeenCalledTimes(2))
+    expect(screen.getByText('Снимок: 51 · Ledger: 23')).toBeVisible()
+    expect(document.querySelector('.asyncStateContent')).toHaveAttribute('aria-busy', 'true')
+  })
+
+  it('renders an order-covered MRP aggregate without exposing it to materialization', async () => {
+    vi.mocked(listPurchaseJournal).mockResolvedValueOnce({
+      rows: [expectedMrpRow],
+      total: 1,
+      limit: 100,
+      offset: 0,
+      run_id: 17,
+      run_ids: [17],
+      truth_status: 'accepted',
+      ledger_generation_id: 23,
+      meta: {
+        snapshot_id: 51,
+        ledger_generation: 23,
+        cutoff: '2026-07-23T12:00:00+00:00',
+        truth_status: 'accepted',
+        fact_source: 'ledger',
+        received_qty_status: 'available',
+        read_only: true,
+      },
+      summary: {
+        total_rows: 1,
+        by_status: { expected: 1 },
+        by_phase: { no_goods: 1 },
+        to_order: 0,
+        overdue: 0,
+        expected_7d: 1,
+        in_transit_amount: 1200,
+        fact_status: 'available',
+      },
+    })
+    renderPage()
+
+    expect(await screen.findAllByText('Под заказ (MRP)')).not.toHaveLength(0)
+    expect(screen.getByText('Покрыто открытыми заказами')).toBeVisible()
+    expect(screen.getAllByText('Ожидается').some((element) => element.matches('.pill'))).toBe(true)
+    expect(screen.queryByRole('checkbox', { name: /Выбрать строку buy:9:covered/ })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Сформировать заказы' })).toBeDisabled()
   })
 })

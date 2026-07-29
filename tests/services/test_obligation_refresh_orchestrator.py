@@ -16,7 +16,8 @@ def _world(db, *, with_parent=True, qty=5, replenishment_method="Покупка"
     cutoff = datetime(2026, 7, 23, 12, tzinfo=timezone.utc)
     physical = models.PhysicalImportBatch(
         batch_key="orchestrator-physical", status="completed", cutoff=cutoff,
-        source_watermarks={}, completed_at=cutoff,
+        source_watermarks={"opening_at": "2025-01-01T00:00:00+00:00"},
+        completed_at=cutoff,
     )
     accepted = models.LedgerGeneration(
         generation_key="orchestrator-accepted", status="accepted", cutoff=cutoff,
@@ -30,13 +31,23 @@ def _world(db, *, with_parent=True, qty=5, replenishment_method="Покупка"
     )
     item = models.Item(item_code="ORCH-PURCHASE", item_name="orchestrator purchase",
                        replenishment_method=replenishment_method)
+    resource = models.ProductionResource(
+        resource_name="Orchestrator assembly",
+        planning_range=30,
+        capacity=Decimal("100"),
+    )
     warehouse = models.StockWarehouse(
         warehouse_ref1c="WH-OUT",
         warehouse_name="Outside planning contour",
         is_selected=False,
         is_finished_goods=False,
     )
-    db.add_all([physical, accepted, item, warehouse]); db.flush()
+    db.add_all([physical, accepted, item, warehouse, resource]); db.flush()
+    db.add(models.AssemblyRate(
+        resource_id=resource.resource_id,
+        item_id=item.item_id,
+        qty_per_capacity=Decimal("1"),
+    ))
     db.add(models.PlanningTruthState(id=1, current_generation_id=accepted.id))
     plan = models.ProductionPlanHeader(name="orchestrator plan", status="fixed",
         period_from=period_from, period_to=date(2026, 8, 31))
@@ -111,6 +122,12 @@ def test_add_only_builds_real_checkpoints_and_promotes_persisted_read_snapshot(d
         ledger_generation_id=target.id, consumer="period_plan_execution").all()
     assert len(execution_snapshots) == 1
     assert all(row.truth_status == "accepted" for row in execution_snapshots)
+    queue = db_session.query(models.PlanningReadSnapshot).filter_by(
+        ledger_generation_id=target.id,
+        consumer="assembly_queue",
+    ).one()
+    assert queue.payload["total_rows"] == 1
+    assert queue.payload["total_queue_qty"] == 5.0
 
 
 def test_add_plans_with_mixed_periods_fail_closed(db_session):

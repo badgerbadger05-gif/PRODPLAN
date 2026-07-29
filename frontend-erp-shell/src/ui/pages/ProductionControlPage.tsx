@@ -35,6 +35,7 @@ import { DocumentWindow } from '../layout/DocumentWindow'
 import { RootProductFilterDialog } from '../RootProductFilterDialog'
 import { rootProductLabel, type RootProductOption } from '../rootProductOptions'
 import { StatusBar } from '../layout/StatusBar'
+import { AsyncState } from '../layout/AsyncState'
 import { ProductionCommandBar } from './production-control/ProductionCommandBar'
 import { ProductionDetailPane } from './production-control/ProductionDetailPane'
 import { ProductionFilterBar } from './production-control/ProductionFilterBar'
@@ -607,7 +608,9 @@ export function ProductionControlPage() {
     <main className="workArea">
       <div className="topLine">
         <div className="breadcrumbs">Производство / Журнал заказов на производство</div>
-        <div className="runBadge">MRP run: {runId ?? '—'}</div>
+        <div className="runBadge">
+          MRP run: {runId ?? (loading ? 'загрузка…' : error ? 'недоступен' : '—')}
+        </div>
       </div>
 
       <DocumentWindow
@@ -645,7 +648,7 @@ export function ProductionControlPage() {
           onOpenRootProductFilter={() => setRootDialogOpen(true)}
         />
 
-        {error && <div className="errorLine" role="alert">{error}</div>}
+        {error && rows.length > 0 && <div className="errorLine" role="alert">{error}</div>}
         {message && <div className="successLine" role="status">{message}</div>}
 
         <ProductionViewBar filters={filters} onChange={changeFilters} />
@@ -659,20 +662,29 @@ export function ProductionControlPage() {
               onSubmit={() => void load(0)}
               onToggleSort={toggleSort}
             />
-            <ProductionOrdersTable
-              rows={rows}
-              activeRow={activeRow}
-              selectedIds={selectedIds}
-              sort={{
-                sortBy: filters.sort_by === 'planned_start_date' ? filters.sort_by : null,
-                sortDir: filters.sort_dir,
-              }}
-              onSelectIds={setSelectedIds}
-              onActivate={setActiveId}
-              onOpenMaterials={(row) => void loadMaterials(row.product_id)}
-              onChangeStatus={(row, status) => void changeStatus(row, status)}
-              onToggleSort={toggleSort}
-            />
+            <AsyncState
+              loading={loading}
+              error={error}
+              empty={rows.length === 0}
+              loadingLabel="Загрузка журнала производства…"
+              emptyLabel="В журнале производства нет заказов"
+              onRetry={() => void load(offsetRef.current)}
+            >
+              <ProductionOrdersTable
+                rows={rows}
+                activeRow={activeRow}
+                selectedIds={selectedIds}
+                sort={{
+                  sortBy: filters.sort_by === 'planned_start_date' ? filters.sort_by : null,
+                  sortDir: filters.sort_dir,
+                }}
+                onSelectIds={setSelectedIds}
+                onActivate={setActiveId}
+                onOpenMaterials={(row) => void loadMaterials(row.product_id)}
+                onChangeStatus={(row, status) => void changeStatus(row, status)}
+                onToggleSort={toggleSort}
+              />
+            </AsyncState>
           </div>
 
           {settingsOpen ? (

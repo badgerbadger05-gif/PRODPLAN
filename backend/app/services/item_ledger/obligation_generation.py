@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from hashlib import sha256
 import json
 from typing import Any
@@ -395,7 +396,14 @@ def carry_forward_retained_reservations(
     target_generation_id: int,
     retained_run_ids: tuple[int, ...],
 ) -> int:
-    """Copy only generation-scoped projections for immutable retained runs."""
+    """Copy immutable retained obligations, but never carry physical realization.
+
+    A realization belongs to the candidate generation's physical replay.  Copying
+    it from the parent and then replaying the shared physical prefix lets one SLE
+    cover both a retained reservation and a new candidate reservation.  The
+    retained obligation is immutable, so seed one fresh ``open`` event and let
+    the generation-wide replay rebuild all physical coverage.
+    """
     run_ids = tuple(sorted({int(value) for value in retained_run_ids}))
     if not run_ids:
         return 0
@@ -407,23 +415,12 @@ def carry_forward_retained_reservations(
         models.ReservationEntry.ledger_generation_id == int(parent_generation_id),
         models.ReservationEntry.run_id.in_(run_ids),
     ).order_by(models.ReservationEntry.id.asc()).all()
-    source_ids = [int(row.id) for row in source_entries]
     if existing_count:
         if existing_count != len(source_entries):
             raise ObligationGenerationError(
                 "retained reservation projection is partial on target generation"
             )
         return int(existing_count)
-    event_rows = (
-        db.query(models.ReservationEvent)
-        .filter(
-            models.ReservationEvent.ledger_generation_id == int(parent_generation_id),
-            models.ReservationEvent.reservation_id.in_(source_ids),
-        )
-        .order_by(models.ReservationEvent.id.asc())
-        .all()
-        if source_ids else []
-    )
     new_ids: dict[int, int] = {}
     for source in source_entries:
         target = models.ReservationEntry(
@@ -439,10 +436,10 @@ def carry_forward_retained_reservations(
             priority_period_to=source.priority_period_to,
             realization_mode=source.realization_mode,
             reserved_qty=source.reserved_qty,
-            realized_qty=source.realized_qty,
+            realized_qty=Decimal("0"),
             covered_from_stock_at_freeze_qty=source.covered_from_stock_at_freeze_qty,
             replenishment_required_qty=source.replenishment_required_qty,
-            replenishment_received_qty=source.replenishment_received_qty,
+            replenishment_received_qty=Decimal("0"),
             lifecycle_status=source.lifecycle_status,
             opened_at=source.opened_at,
             closed_at=source.closed_at,
@@ -450,24 +447,27 @@ def carry_forward_retained_reservations(
         db.add(target)
         db.flush()
         new_ids[int(source.id)] = int(target.id)
-    for source in event_rows:
+    for source in source_entries:
+        target_id = new_ids[int(source.id)]
         db.add(models.ReservationEvent(
             ledger_generation_id=int(target_generation_id),
-            reservation_id=new_ids[int(source.reservation_id)],
+            reservation_id=target_id,
             item_id=source.item_id,
             characteristic_ref=source.characteristic_ref,
             organization_ref=source.organization_ref,
             planning_stock_pool=source.planning_stock_pool,
-            event_kind=source.event_kind,
-            reserved_delta=source.reserved_delta,
-            realized_delta=source.realized_delta,
-            sle_id=source.sle_id,
-            fact_ref=source.fact_ref,
-            fact_line_ref=source.fact_line_ref,
-            match_rule=source.match_rule,
-            cycle_id=source.cycle_id,
-            idempotency_key=source.idempotency_key,
-            event_at=source.event_at,
+            event_kind="open",
+            reserved_delta=source.reserved_qty,
+            realized_delta=Decimal("0"),
+            sle_id=None,
+            fact_ref="",
+            fact_line_ref="",
+            match_rule="",
+            cycle_id=f"obligation-carry:g{int(target_generation_id)}",
+            idempotency_key=(
+                f"carry-open:g{int(target_generation_id)}:source-r{int(source.id)}"
+            ),
+            event_at=source.opened_at or datetime.now(timezone.utc),
         ))
     db.flush()
     return len(source_entries)

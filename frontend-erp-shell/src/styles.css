@@ -421,6 +421,73 @@ input:focus, select:focus {
   background: #fff;
 }
 
+.purchaseJournalSplit {
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 370px);
+  overflow: hidden;
+}
+
+.purchaseJournalSplit > .asyncStateContent,
+.purchaseJournalSplit > .tablePane {
+  min-width: 0;
+  max-width: 100%;
+  overflow: auto;
+}
+
+.asyncStateContent {
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  display: flex;
+  overflow: hidden;
+}
+
+.asyncStateContent > .tablePane {
+  min-width: 0;
+  flex: 1;
+}
+
+.asyncState {
+  min-width: 0;
+  min-height: 180px;
+  flex: 1;
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  gap: 8px;
+  padding: 24px;
+  border-right: 1px solid var(--line);
+  background: #fff;
+  color: var(--muted);
+  text-align: center;
+}
+
+.asyncState strong {
+  color: var(--text);
+  font-size: 14px;
+}
+
+.asyncStateError strong,
+.asyncStateError span {
+  color: var(--red);
+}
+
+.asyncStateSpinner {
+  width: 24px;
+  height: 24px;
+  border: 3px solid #d6dce4;
+  border-top-color: var(--blue);
+  border-radius: 50%;
+  animation: asyncStateSpin .8s linear infinite;
+}
+
+@keyframes asyncStateSpin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .asyncStateSpinner { animation: none; }
+}
+
 .savedViewsBar {
   position: relative;
   display: flex;

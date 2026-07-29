@@ -1,6 +1,7 @@
 """The freeze executor may materialize only unpublished candidate snapshots."""
 
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from hashlib import sha256
 import json
 
@@ -14,6 +15,9 @@ from app.services.mrp_freeze import (
     freeze_candidate_snapshots,
     refreeze_active_snapshots,
 )
+
+
+OPENING_AT = datetime(2026, 7, 1, tzinfo=timezone.utc)
 
 
 def _seal_manifest(target, entries, *, add_plan_ids=(), add_config=None, horizon_days=None, config_version_id=None):
@@ -40,7 +44,7 @@ def _candidate_world(db, quantities=(10, 20)):
     cutoff = datetime(2026, 7, 23, 12, tzinfo=timezone.utc)
     physical = models.PhysicalImportBatch(
         batch_key="candidate-freeze-physical", status="completed", cutoff=cutoff,
-        source_watermarks={}, completed_at=cutoff,
+        source_watermarks={"opening_at": OPENING_AT.isoformat()}, completed_at=cutoff,
     )
     accepted = models.LedgerGeneration(
         generation_key="candidate-freeze-accepted", status="accepted", cutoff=cutoff,
@@ -208,6 +212,156 @@ def test_candidate_freeze_supports_sealed_add_only(db_session):
     assert report["order"] == [candidate.run_id]
     assert db_session.get(models.ProductionPlanLine, line.id).locked_by_run_id is None
     assert db_session.query(models.MrpRequirement).filter_by(run_id=candidate.run_id).count() == 1
+
+
+def test_candidate_freeze_rejects_baseline_before_physical_opening(db_session):
+    accepted, target, item, _parents, _candidates, _lines = _candidate_world(
+        db_session, ()
+    )
+    plan, _line, candidate = _add_candidate(db_session, target, item)
+    plan.period_from = date(2026, 6, 1)
+    plan.period_to = date(2026, 6, 30)
+    candidate.period_from = plan.period_from
+    candidate.period_to = plan.period_to
+    candidate.horizon_days = 30
+    _seal_manifest(
+        target,
+        [{
+            "action": "add",
+            "plan_id": plan.id,
+            "parent_run_id": None,
+            "candidate_run_id": candidate.run_id,
+        }],
+        add_plan_ids=[plan.id],
+        add_config={"first": True},
+        horizon_days=30,
+    )
+
+    with pytest.raises(LedgerPoolUnavailable, match="precedes physical opening"):
+        freeze_candidate_snapshots(
+            db_session,
+            parent_generation_id=accepted.id,
+            target_generation_id=target.id,
+            candidate_run_ids=[candidate.run_id],
+        )
+
+    assert db_session.query(models.MrpRequirement).filter_by(
+        run_id=candidate.run_id
+    ).count() == 0
+
+
+def test_candidate_freeze_rejects_negative_physical_pool_without_clamping(db_session):
+    accepted, target, item, _parents, _candidates, _lines = _candidate_world(
+        db_session, ()
+    )
+    physical_row = db_session.query(models.StockLedgerEntry).filter_by(
+        item_id=item.item_id
+    ).one()
+    physical_row.qty = Decimal("-5")
+    plan, _line, candidate = _add_candidate(db_session, target, item)
+    _seal_manifest(
+        target,
+        [{
+            "action": "add",
+            "plan_id": plan.id,
+            "parent_run_id": None,
+            "candidate_run_id": candidate.run_id,
+        }],
+        add_plan_ids=[plan.id],
+        add_config={"first": True},
+        horizon_days=45,
+    )
+
+    with pytest.raises(
+        LedgerPoolUnavailable, match="net requirement exceeds gross"
+    ):
+        freeze_candidate_snapshots(
+            db_session,
+            parent_generation_id=accepted.id,
+            target_generation_id=target.id,
+            candidate_run_ids=[candidate.run_id],
+        )
+
+    assert float(physical_row.qty) == pytest.approx(-5)
+    assert db_session.query(models.MrpRequirement).filter_by(
+        run_id=candidate.run_id
+    ).count() == 0
+
+
+def test_retained_stock_shortage_fails_instead_of_inflating_new_plan(db_session):
+    accepted, target, item, parents, old_candidates, _lines = _candidate_world(
+        db_session, (20,)
+    )
+    db_session.delete(old_candidates[0])
+    db_session.flush()
+    retained = parents[0]
+    retained_requirement = models.MrpRequirement(
+        run_id=retained.run_id,
+        item_id=item.item_id,
+        total_required_qty=Decimal("20"),
+        net_required_qty=Decimal("5"),
+        period_from=retained.period_from,
+        period_to=retained.period_to,
+        bom_level=0,
+        freeze_version=retained.active_freeze_version,
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="default",
+    )
+    db_session.add(retained_requirement)
+    db_session.flush()
+    db_session.add(models.MrpFreezeAllocation(
+        run_id=retained.run_id,
+        freeze_version=retained.active_freeze_version,
+        requirement_id=retained_requirement.id,
+        item_id=item.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="default",
+        source_type="stock",
+        source_ref="",
+        source_line_ref="",
+        alloc_qty=Decimal("20"),
+        fact_at_freeze=Decimal("20"),
+        realized_qty=0,
+        evaporated_qty=0,
+    ))
+    plan, _line, candidate = _add_candidate(db_session, target, item)
+    _seal_manifest(
+        target,
+        [
+            {
+                "action": "retain",
+                "plan_id": retained.source_plan_id,
+                "parent_run_id": retained.run_id,
+                "candidate_run_id": None,
+            },
+            {
+                "action": "add",
+                "plan_id": plan.id,
+                "parent_run_id": None,
+                "candidate_run_id": candidate.run_id,
+            },
+        ],
+        add_plan_ids=[plan.id],
+        add_config={"first": True},
+        horizon_days=45,
+    )
+
+    with pytest.raises(
+        LedgerPoolUnavailable,
+        match=r"retained stock allocation exceeds physical baseline.*retained=20.0, available=15.0",
+    ):
+        freeze_candidate_snapshots(
+            db_session,
+            parent_generation_id=accepted.id,
+            target_generation_id=target.id,
+            candidate_run_ids=[candidate.run_id],
+        )
+
+    assert db_session.query(models.MrpRequirement).filter_by(
+        run_id=candidate.run_id
+    ).count() == 0
 
 
 def test_add_candidate_cannot_reuse_supplier_supply_claimed_by_retained_run(db_session):

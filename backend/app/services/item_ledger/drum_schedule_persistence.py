@@ -13,6 +13,7 @@ from app import models
 from app.services.work_calendar_service import is_workday
 
 from .drum_scheduler import AssemblyRateProfile, QueueLine, build_drum_plan
+from .live_plan_scope import live_plan_run_ids
 
 
 STAGE = "drum_schedule"
@@ -35,6 +36,10 @@ def _sort_key(period_from: date, period_to: date, plan_id: int, line_id: int) ->
 
 
 def _source_rows(db: Session, generation_id: int) -> list[dict[str, Any]]:
+    generation = db.get(models.LedgerGeneration, int(generation_id))
+    if generation is None:
+        raise ValueError(f"LedgerGeneration {generation_id} not found")
+    run_ids = live_plan_run_ids(db, generation)
     allocations = (
         db.query(
             models.AssemblyOutputAllocation.plan_line_id.label("plan_line_id"),
@@ -61,8 +66,7 @@ def _source_rows(db: Session, generation_id: int) -> list[dict[str, Any]]:
             models.PlanningRun,
             and_(
                 models.PlanningRun.source_plan_id == models.ProductionPlanHeader.id,
-                models.PlanningRun.status == "FIXED_SNAPSHOT",
-                models.PlanningRun.ledger_generation_id == int(generation_id),
+                models.PlanningRun.run_id.in_(run_ids),
             ),
         )
         .outerjoin(

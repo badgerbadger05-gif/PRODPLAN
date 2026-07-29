@@ -2,7 +2,7 @@
 
 The stage is deterministic:
 - read only visible positive ``assembly_in`` facts
-- allocate only against FIXED-SNAPSHOT runs and fixed headers
+- allocate only against the generation's sealed live-plan scope and fixed headers
 - sort candidates by fixed planning FIFO order
 - share remaining candidate capacities across facts
 - persist exact checksums and return them for repeated-run drift control
@@ -26,6 +26,7 @@ from app.services.item_ledger.assembly_output_core import (
     allocate_output_fact,
 )
 from app.services.item_ledger.physical_visibility import visible_sle_query
+from app.services.item_ledger.live_plan_scope import live_plan_run_ids
 
 _STAGE = "assembly_output_allocation"
 _ALGORITHM_VERSION = "assembly-output-allocation/1"
@@ -120,6 +121,10 @@ def _load_visible_facts(
 
 
 def _load_live_candidates(db: Session, generation_id: int) -> tuple[QueueCandidate, ...]:
+    generation = db.get(models.LedgerGeneration, int(generation_id))
+    if generation is None:
+        raise ValueError(f"ledger generation {generation_id} does not exist")
+    run_ids = live_plan_run_ids(db, generation)
     rows = (
         db.query(models.PlanningRun, models.ProductionPlanHeader, models.ProductionPlanLine)
         .join(
@@ -131,8 +136,7 @@ def _load_live_candidates(db: Session, generation_id: int) -> tuple[QueueCandida
             models.ProductionPlanLine.plan_id == models.ProductionPlanHeader.id,
         )
         .filter(
-            models.PlanningRun.status == "FIXED_SNAPSHOT",
-            models.PlanningRun.ledger_generation_id == int(generation_id),
+            models.PlanningRun.run_id.in_(run_ids),
             models.ProductionPlanHeader.status == "fixed",
             models.ProductionPlanLine.qty > 0,
             models.ProductionPlanLine.bucket_date >= models.ProductionPlanHeader.period_from,

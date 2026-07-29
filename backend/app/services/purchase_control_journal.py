@@ -94,7 +94,13 @@ def _reconcile_buy_row_for_horizon(row: Dict[str, Any], horizon_iso: Optional[st
             "quantity": required,
             "remaining_qty": to_order,
             "received_qty": realized,
-            "line_status": "to_order" if to_order > _EPS else "received",
+            "line_status": (
+                "to_order"
+                if to_order > _EPS
+                else "expected"
+                if open_order_covered > _EPS
+                else "received"
+            ),
         }
     )
     return projected

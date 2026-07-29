@@ -13,6 +13,15 @@ from app.services.item_ledger.candidate_realization_replay import (
     CandidateRealizationReplayError,
     replay_candidate_realizations,
 )
+from app.services.item_ledger.assembly_output_persistence import (
+    materialize_assembly_output_allocations,
+)
+from app.services.item_ledger.assembly_queue_snapshot import (
+    build_assembly_queue_snapshot,
+)
+from app.services.item_ledger.obligation_generation import (
+    carry_forward_retained_reservations,
+)
 
 
 def _seal(
@@ -220,6 +229,147 @@ def test_candidate_replay_retry_is_idempotent(db_session):
     assert second["events_inserted"] == 0
     assert first["allocation_checksum"] == second["allocation_checksum"]
     assert after == before
+
+
+def test_retained_and_candidate_replay_partition_one_sle_and_keep_open_output(
+    db_session,
+):
+    parent, target, candidates, _parent_reservations = _world(
+        db_session,
+        candidate_periods=(date(2026, 9, 10),),
+        fact_rows=((datetime(2026, 7, 5, 10, 0), "5"),),
+    )
+    candidate, candidate_plan, old_candidate = candidates[0]
+    item = db_session.query(models.Item).filter_by(item_code="CAND-REPLAY").one()
+    sle = db_session.query(models.StockLedgerEntry).one()
+    sle.source_content_hash = sha256(b"candidate-replay-assembly-output").hexdigest()
+
+    retained_plan = models.ProductionPlanHeader(
+        name="retained august",
+        period_from=date(2026, 8, 1),
+        period_to=date(2026, 8, 31),
+        status="fixed",
+    )
+    db_session.add(retained_plan)
+    db_session.flush()
+    retained_line = models.ProductionPlanLine(
+        plan_id=retained_plan.id,
+        item_id=item.item_id,
+        bucket_date=date(2026, 8, 1),
+        qty=Decimal("10"),
+    )
+    candidate_line = models.ProductionPlanLine(
+        plan_id=candidate_plan.id,
+        item_id=item.item_id,
+        bucket_date=candidate_plan.period_from,
+        qty=Decimal("10"),
+    )
+    retained_run = models.PlanningRun(
+        status="FIXED_SNAPSHOT",
+        ledger_generation_id=parent.id,
+        source_plan_id=retained_plan.id,
+        period_from=retained_plan.period_from,
+        period_to=retained_plan.period_to,
+        config_snapshot={},
+    )
+    db_session.add_all([retained_line, candidate_line, retained_run])
+    db_session.flush()
+    retained_requirement = models.MrpRequirement(
+        run_id=retained_run.run_id,
+        item_id=item.item_id,
+        total_required_qty=Decimal("5"),
+        net_required_qty=Decimal("5"),
+        period_from=retained_plan.period_from,
+        period_to=retained_plan.period_to,
+        bom_level=0,
+    )
+    db_session.add(retained_requirement)
+    db_session.flush()
+    retained_reservation = models.ReservationEntry(
+        ledger_generation_id=parent.id,
+        item_id=item.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="selected",
+        run_id=retained_run.run_id,
+        freeze_version=1,
+        requirement_id=retained_requirement.id,
+        priority_period_from=retained_plan.period_from,
+        priority_period_to=retained_plan.period_to,
+        realization_mode="make",
+        reserved_qty=Decimal("5"),
+        realized_qty=Decimal("5"),
+        replenishment_required_qty=Decimal("5"),
+        replenishment_received_qty=Decimal("5"),
+        lifecycle_status="active",
+    )
+    db_session.add(retained_reservation)
+    db_session.flush()
+    db_session.add(models.ReservationEvent(
+        ledger_generation_id=parent.id,
+        reservation_id=retained_reservation.id,
+        item_id=item.item_id,
+        characteristic_ref="",
+        organization_ref="",
+        planning_stock_pool="selected",
+        event_kind="realize",
+        reserved_delta=Decimal("5"),
+        realized_delta=Decimal("5"),
+        sle_id=sle.id,
+        fact_ref=sle.recorder_ref,
+        fact_line_ref=sle.line_no,
+        match_rule="fifo",
+        cycle_id=f"historical-replay:g{parent.id}",
+        idempotency_key=f"parent:sle{sle.id}:r{retained_reservation.id}",
+        event_at=sle.posting_at,
+    ))
+    db_session.flush()
+    _seal(
+        target,
+        [
+            {
+                "action": "retain",
+                "plan_id": retained_plan.id,
+                "parent_run_id": retained_run.run_id,
+                "candidate_run_id": None,
+            },
+            {
+                "action": "refresh",
+                "plan_id": candidate_plan.id,
+                "parent_run_id": old_candidate.run_id,
+                "candidate_run_id": candidate.run_id,
+            },
+        ],
+        parent_id=parent.id,
+    )
+    carry_forward_retained_reservations(
+        db_session,
+        parent_generation_id=parent.id,
+        target_generation_id=target.id,
+        retained_run_ids=(retained_run.run_id,),
+    )
+
+    first = replay_candidate_realizations(db_session, target.id)
+    second = replay_candidate_realizations(db_session, target.id)
+
+    target_events = db_session.query(models.ReservationEvent).filter(
+        models.ReservationEvent.ledger_generation_id == target.id,
+        models.ReservationEvent.sle_id == sle.id,
+    ).all()
+    assert Decimal(first["allocated_qty"]) == Decimal("5")
+    assert second["events_inserted"] == 0
+    assert len(target_events) == 1
+    assert sum((row.realized_delta for row in target_events), Decimal("0")) == Decimal("5")
+
+    materialize_assembly_output_allocations(db_session, target.id)
+    output_allocations = db_session.query(models.AssemblyOutputAllocation).filter_by(
+        ledger_generation_id=target.id,
+        stock_ledger_entry_id=sle.id,
+    ).all()
+    assert sum((row.allocated_qty for row in output_allocations), Decimal("0")) == Decimal("5")
+    queue = build_assembly_queue_snapshot(db_session, target.id)
+    assert queue.payload["total_rows"] == 2
+    assert queue.payload["total_queue_qty"] == 15.0
 
 
 def test_candidate_replay_rejects_empty_manifest_and_cross_generation_reservation(db_session):

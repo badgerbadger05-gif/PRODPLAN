@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Iterable, Union
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app import models
@@ -133,6 +134,50 @@ def append_realization_event(
     )
     if exists is not None:
         return False
+    delta = _dec(realized_delta)
+    if sle_id is not None and delta != 0:
+        sle = session.get(models.StockLedgerEntry, int(sle_id))
+        if sle is None:
+            raise ValueError(f"realization references missing SLE {sle_id}")
+        physical_qty = _dec(sle.qty)
+        if physical_qty == 0 or (physical_qty > 0) != (delta > 0):
+            raise ValueError(
+                f"realization sign conflicts with physical SLE {sle_id}"
+            )
+        same_allocation = (
+            session.query(models.ReservationEvent)
+            .filter(
+                models.ReservationEvent.ledger_generation_id == generation_id,
+                models.ReservationEvent.reservation_id == int(entry.id),
+                models.ReservationEvent.sle_id == int(sle_id),
+                models.ReservationEvent.realized_delta != 0,
+            )
+            .one_or_none()
+        )
+        if same_allocation is not None:
+            if (
+                _dec(same_allocation.realized_delta) == delta
+                and str(same_allocation.fact_ref or "") == str(fact_ref or "")
+                and str(same_allocation.fact_line_ref or "")
+                == str(fact_line_ref or "")
+            ):
+                return False
+            raise ValueError(
+                "one physical SLE cannot be allocated to the same reservation twice"
+            )
+        allocated = _dec(
+            session.query(func.coalesce(func.sum(models.ReservationEvent.realized_delta), 0))
+            .filter(
+                models.ReservationEvent.ledger_generation_id == generation_id,
+                models.ReservationEvent.sle_id == int(sle_id),
+                models.ReservationEvent.realized_delta != 0,
+            )
+            .scalar()
+        )
+        if abs(allocated + delta) > abs(physical_qty):
+            raise ValueError(
+                f"realization allocations exceed physical SLE {sle_id}"
+            )
     if reserved_delta is None:
         seeded = (
             session.query(models.ReservationEvent.id)
@@ -144,7 +189,6 @@ def append_realization_event(
             is not None
         )
         reserved_delta = 0 if seeded else entry.reserved_qty
-    delta = _dec(realized_delta)
     session.add(
         models.ReservationEvent(
             ledger_generation_id=generation_id,

@@ -70,6 +70,12 @@ export function PurchaseControlPage() {
         const meta = state.listMeta.meta as { ledger_generation?: number; snapshot_id?: number } | undefined
         const snapshot = Number(meta?.snapshot_id ?? 0)
         const ledger = Number(meta?.ledger_generation ?? state.listMeta.ledger_generation_id)
+        if (state.listLoading && !snapshot && !ledger) {
+          return <>Снимок: загрузка… · Ledger: загрузка…</>
+        }
+        if (state.error && !snapshot && !ledger) {
+          return <>Снимок: недоступен · Ledger: недоступен</>
+        }
         return (
           <>
             Снимок: {snapshot || '—'} · Ledger: {ledger || '—'}
@@ -77,6 +83,9 @@ export function PurchaseControlPage() {
         )
       }}
       renderFilters={() => null}
+      splitClassName="purchaseJournalSplit"
+      loadingLabel="Загрузка журнала закупок…"
+      emptyLabel="В журнале закупок нет строк"
       renderTable={(state) => (
         <div className="tablePane">
           <PurchaseFilterBar

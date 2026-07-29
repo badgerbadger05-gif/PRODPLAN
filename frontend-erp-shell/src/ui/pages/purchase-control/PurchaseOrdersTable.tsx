@@ -43,7 +43,8 @@ export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseRowKeys, 
       <tbody>
         {rows.map((row) => {
           const runCount = row.run_ids?.length ?? (row.run_id ? 1 : 0)
-          const generatorLabel = row.row_generator === 'mrp_reservation' ? 'Под заказ (MRP)' : row.row_generator
+          const isMrpReservation = row.row_generator === 'mrp_reservation'
+          const generatorLabel = isMrpReservation ? 'Под заказ (MRP)' : row.row_generator
           return (
           <tr key={row.row_key} className={row.row_key === activeRow?.row_key ? 'activeRow' : ''} onClick={() => onActivate(row.row_key)}>
             <td className="checkCol">
@@ -63,9 +64,9 @@ export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseRowKeys, 
               )}
             </td>
             <td className={`orderCell ${row.order_ref1c ? 'oneCOrderCell' : ''}`}>
-              {row.line_status === 'to_order' ? (
+              {isMrpReservation ? (
                 <>
-                  <strong title={generatorLabel || ''}>{generatorLabel || 'К заказу'}</strong>
+                  <strong title={generatorLabel || ''}>{generatorLabel}</strong>
                   <span>{runCount ? `планов: ${runCount}` : 'общая потребность'} · {row.period_label || dateRu(row.need_date) || 'весь горизонт'}</span>
                 </>
               ) : (
@@ -101,7 +102,7 @@ export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseRowKeys, 
                 : row.received_qty > 0 ? qty(row.received_qty) : <span className="muted">—</span>}
             </td>
             <td className="dateCell">
-              {row.line_status === 'to_order' ? (
+              {isMrpReservation ? (
                 <span title="Дата потребности по MRP">потр. {dateRu(row.need_date) || '—'}</span>
               ) : (
                 <span>{dateRu(row.delivery_date) || '—'}</span>
@@ -119,7 +120,11 @@ export function PurchaseOrdersTable({ rows, activeRow, selectedPurchaseRowKeys, 
                   {row.order_state_name}
                 </span>
               ) : (
-                <span className="muted">{row.line_status === 'to_order' ? 'Не заказан' : '—'}</span>
+                <span className="muted">
+                  {isMrpReservation
+                    ? row.line_status === 'expected' ? 'Покрыто открытыми заказами' : 'Не заказан'
+                    : '—'}
+                </span>
               )}
             </td>
             <td>

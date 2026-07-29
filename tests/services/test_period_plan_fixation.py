@@ -11,6 +11,7 @@ from datetime import date
 import pytest
 
 from app.models import (
+    AssemblyRate,
     Item,
     LedgerGeneration,
     MrpRequirement,
@@ -19,6 +20,7 @@ from app.models import (
     PlanningTruthState,
     ProductionPlanHeader,
     ProductionPlanLine,
+    ProductionResource,
 )
 from app.services import period_plan_service
 from app.services.period_plan_service import (
@@ -36,7 +38,7 @@ def _accepted_planning_truth(db_session):
         batch_key="fixation-ledger",
         status="completed",
         cutoff=cutoff,
-        source_watermarks={},
+        source_watermarks={"opening_at": "2025-01-01T00:00:00+00:00"},
         completed_at=cutoff,
     )
     generation = LedgerGeneration(
@@ -57,6 +59,14 @@ def _accepted_planning_truth(db_session):
     db_session.add(generation)
     db_session.flush()
     db_session.add(PlanningTruthState(id=1, current_generation_id=generation.id))
+    resource = ProductionResource(
+        resource_name="Fixation assembly",
+        planning_range=30,
+        capacity=100,
+    )
+    db_session.add(resource)
+    db_session.flush()
+    db_session.info["fixation_assembly_resource_id"] = int(resource.resource_id)
     db_session.commit()
     db_session.info["fixation_generation_id"] = int(generation.id)
     return generation
@@ -74,6 +84,12 @@ def _purchased_item(db, code: str) -> Item:
         status="active",
     )
     db.add(item)
+    db.flush()
+    db.add(AssemblyRate(
+        resource_id=int(db.info["fixation_assembly_resource_id"]),
+        item_id=int(item.item_id),
+        qty_per_capacity=1,
+    ))
     db.flush()
     return item
 

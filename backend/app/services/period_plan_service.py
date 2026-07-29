@@ -39,6 +39,7 @@ from ..models import (
     SupplierOrder,
     ReservationEntry,
     ReservationEvent,
+    ReplenishmentWorkItem,
 )
 from .planning_service import (
     DEFAULT_PLANNING_CONFIG,
@@ -1239,6 +1240,7 @@ def _freeze_one_run(
     invariants 4-5 (one cutoff for all projections, idempotent reprocessing).
     """
     from .mrp_freeze import (
+        LedgerPoolUnavailable,
         pool_key_for,
         _write_freeze_baseline,
         _write_freeze_allocation,
@@ -1332,6 +1334,12 @@ def _freeze_one_run(
 
         net_buckets = net_map.get(item_id, {})
         total_net = sum(float(q) for q in net_buckets.values()) if net_buckets else 0.0
+        if total_net > total_gross + 1e-9:
+            raise LedgerPoolUnavailable(
+                "ledger_pool_unavailable: net requirement exceeds gross "
+                f"for run={int(run.run_id)}, item={int(item_id)}: "
+                f"net={total_net}, gross={total_gross}"
+            )
         bom_lvl = bom_level_map.get(item_id, 0)
 
         pk = pool_key_for(int(item_id))
@@ -2775,6 +2783,29 @@ def _build_execution_snapshot_rows(
         )
         .all()
     )
+    buy_entries = (
+        db.query(ReplenishmentWorkItem, ReservationEntry, Item)
+        .join(
+            ReservationEntry,
+            ReservationEntry.id == ReplenishmentWorkItem.reservation_id,
+        )
+        .join(Item, Item.item_id == ReplenishmentWorkItem.item_id)
+        .filter(
+            ReplenishmentWorkItem.ledger_generation_id == int(generation_id),
+            ReplenishmentWorkItem.replenishment_method == "buy",
+            ReservationEntry.lifecycle_status == "active",
+        )
+        .all()
+    )
+    from .purchase_control_snapshot import open_supplier_coverage_by_reservation
+
+    open_purchase_by_reservation, _open_purchase_slices = (
+        open_supplier_coverage_by_reservation(
+            db,
+            int(generation_id),
+            buy_entries,
+        )
+    )
     reservation_ids_by_req: Dict[int, List[int]] = {}
     realized_by_req_mode: Dict[tuple[int, str], float] = {}
     purchase_coverage_by_req: Dict[int, tuple[float, float]] = {}
@@ -2797,15 +2828,20 @@ def _build_execution_snapshot_rows(
         )
         if str(realization_mode or "") == "buy":
             covered, to_order = purchase_coverage_by_req.get(rid, (0.0, 0.0))
+            received = _to_float(replenishment_received_qty)
+            remaining_after_receipts = float(
+                replenishment_remaining(
+                    replenishment_required_qty,
+                    replenishment_received_qty,
+                )
+            )
+            open_order_covered = min(
+                open_purchase_by_reservation.get(int(row_id), 0.0),
+                remaining_after_receipts,
+            )
             purchase_coverage_by_req[rid] = (
-                covered + _to_float(replenishment_received_qty),
-                to_order
-                + float(
-                    replenishment_remaining(
-                        replenishment_required_qty,
-                        replenishment_received_qty,
-                    )
-                ),
+                covered + received + open_order_covered,
+                to_order + max(remaining_after_receipts - open_order_covered, 0.0),
             )
 
     events_by_requirement: Dict[int, List[Dict[str, Any]]] = {}

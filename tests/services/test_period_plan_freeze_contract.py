@@ -17,6 +17,7 @@ from decimal import Decimal
 import pytest
 
 from app.models import (
+    AssemblyRate,
     DefaultSpecification,
     Item,
     LedgerGeneration,
@@ -27,6 +28,7 @@ from app.models import (
     PlanningTruthState,
     ProductionPlanHeader,
     ProductionPlanLine,
+    ProductionResource,
     SpecComponent,
     Specification,
 )
@@ -48,7 +50,8 @@ FLOOR = date(2026, 7, 23)
 def _accepted_planning_truth(db_session):
     batch = PhysicalImportBatch(
         batch_key="freeze-contract", status="completed", cutoff=CUTOFF,
-        source_watermarks={}, completed_at=CUTOFF,
+        source_watermarks={"opening_at": "2026-06-01T00:00:00+00:00"},
+        completed_at=CUTOFF,
     )
     generation = LedgerGeneration(
         generation_key="freeze-contract", status="accepted", cutoff=CUTOFF,
@@ -64,8 +67,16 @@ def _accepted_planning_truth(db_session):
     db_session.add(generation)
     db_session.flush()
     db_session.add(PlanningTruthState(id=1, current_generation_id=generation.id))
+    resource = ProductionResource(
+        resource_name="Freeze contract assembly",
+        planning_range=30,
+        capacity=Decimal("100"),
+    )
+    db_session.add(resource)
+    db_session.flush()
     db_session.commit()
     db_session.info["generation_id"] = int(generation.id)
+    db_session.info["assembly_resource_id"] = int(resource.resource_id)
     return generation
 
 
@@ -76,6 +87,12 @@ def _item(db, code, *, method="Производство") -> Item:
         status="active",
     )
     db.add(item)
+    db.flush()
+    db.add(AssemblyRate(
+        resource_id=int(db.info["assembly_resource_id"]),
+        item_id=int(item.item_id),
+        qty_per_capacity=Decimal("1"),
+    ))
     db.flush()
     return item
 

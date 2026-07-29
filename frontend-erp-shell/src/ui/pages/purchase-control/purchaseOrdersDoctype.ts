@@ -50,7 +50,7 @@ export function createPurchaseOrdersDoctype(
           {
             key: 'order',
             title: 'Заказ',
-            value: (row) => row.line_status === 'to_order'
+            value: (row) => row.row_generator === 'mrp_reservation'
               ? 'Под заказ (MRP)'
               : row.order_number,
           },

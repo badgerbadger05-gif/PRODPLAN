@@ -2,7 +2,7 @@
 import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 import { mockSessionProvider } from './mockSessionProvider'
 import type { SessionProvider, SessionUser } from './types'
-import { onApiUnauthorized } from '../../lib/api'
+import { subscribeToSessionExpiry } from '../../services/session'
 
 type SessionState = {
   user: SessionUser | null
@@ -38,7 +38,7 @@ export function SessionRoot({
     return () => controller.abort()
   }, [provider])
 
-  useEffect(() => onApiUnauthorized(() => {
+  useEffect(() => subscribeToSessionExpiry(() => {
     setReason('Сессия истекла. Войдите снова.')
     setUser(null)
   }), [])

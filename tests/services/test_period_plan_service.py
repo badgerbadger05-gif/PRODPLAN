@@ -11,6 +11,7 @@ import pytest
 from app import models
 from app.models import (
     DefaultSpecification,
+    AssemblyRate,
     Item,
     LedgerGeneration,
     MrpRequirement,
@@ -22,6 +23,7 @@ from app.models import (
     ProductionPlanHeader,
     ProductionPlanLine,
     ProductionProduct,
+    ProductionResource,
     PhysicalImportBatch,
     ClosedPlanSnapshot,
     PlanningTruthState,
@@ -52,7 +54,7 @@ def _accepted_planning_truth(db_session):
         batch_key="period-plan-ledger",
         status="completed",
         cutoff=cutoff,
-        source_watermarks={},
+        source_watermarks={"opening_at": "2025-01-01T00:00:00+00:00"},
         completed_at=cutoff,
     )
     generation = LedgerGeneration(
@@ -73,8 +75,15 @@ def _accepted_planning_truth(db_session):
     db_session.add(generation)
     db_session.flush()
     db_session.add(PlanningTruthState(id=1, current_generation_id=generation.id))
+    resource = ProductionResource(
+        resource_name="Period plan assembly",
+        planning_range=30,
+        capacity=100,
+    )
+    db_session.add(resource)
     db_session.flush()
     db_session.info["period_plan_ledger_generation_id"] = int(generation.id)
+    db_session.info["assembly_resource_id"] = int(resource.resource_id)
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +536,19 @@ def _make_fixed_plan(
     period_from: date | None = None,
     period_to: date | None = None,
 ) -> ProductionPlanHeader:
+    if (
+        db.query(AssemblyRate)
+        .filter(AssemblyRate.item_id == int(item.item_id))
+        .count()
+        == 0
+    ):
+        db.add(
+            AssemblyRate(
+                resource_id=int(db.info["assembly_resource_id"]),
+                item_id=int(item.item_id),
+                qty_per_capacity=1,
+            )
+        )
     if period_from is None:
         period_from = bucket_date
     if period_to is None:

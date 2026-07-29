@@ -516,6 +516,8 @@ describe('ProductionControlPage — characterization', () => {
     vi.mocked(listProductionOrders).mockResolvedValue({ rows: [], total: 0, limit: 100, offset: 0, latest_run_id: null })
     renderPage()
 
+    expect(await screen.findByText('В журнале производства нет заказов')).toBeVisible()
+    expect(screen.getByText('Запрос завершён: подходящих строк нет.')).toBeVisible()
     // Detail pane placeholder appears when there is no active row.
     expect(await screen.findByText('Выберите строку')).toBeInTheDocument()
     expect(screen.queryByText('Кронштейн')).not.toBeInTheDocument()
@@ -528,5 +530,23 @@ describe('ProductionControlPage — characterization', () => {
     renderPage()
 
     expect(await screen.findByRole('alert')).toHaveTextContent('boom-load-failed')
+    expect(screen.getByText('Не удалось загрузить данные')).toBeVisible()
+    expect(screen.getByText('MRP run: недоступен')).toBeVisible()
+  })
+
+  it('shows an explicit initial loading state before the production response arrives', async () => {
+    const request = deferred<Awaited<ReturnType<typeof listProductionOrders>>>()
+    vi.mocked(listProductionOrders).mockReturnValueOnce(request.promise)
+    renderPage()
+
+    expect(screen.getByText('Загрузка журнала производства…')).toBeVisible()
+    expect(screen.getByText('Ответ может занять несколько секунд. Данные ещё не получены.')).toBeVisible()
+    expect(screen.getByText('MRP run: загрузка…')).toBeVisible()
+    expect(screen.queryByRole('table', { name: 'Заказы на производство' })).not.toBeInTheDocument()
+
+    await act(async () => {
+      request.resolve({ rows: [], total: 0, limit: 100, offset: 0, latest_run_id: null })
+    })
+    expect(await screen.findByText('В журнале производства нет заказов')).toBeVisible()
   })
 })
