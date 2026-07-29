@@ -5,7 +5,7 @@ import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
 import { TruthUnavailableNotice } from '../TruthUnavailableNotice'
 import { listDrum } from '../../services/drum'
-import type { DrumCapacityGapRow, DrumSlotRow } from '../../domain/drum'
+import { drumItemLabel, type DrumCapacityGapRow, type DrumSlotRow } from '../../domain/drum'
 
 const PAGE_LIMIT = 200
 
@@ -116,7 +116,7 @@ export function DrumPage() {
               <tr>
                 <th className="numCell">plan</th>
                 <th className="numCell">plan_line</th>
-                <th className="numCell">item_id</th>
+                <th>Номенклатура</th>
                 <th className="numCell">resource_id</th>
                 <th>Дата слота</th>
                 <th className="numCell">Порядок</th>
@@ -139,7 +139,7 @@ export function DrumPage() {
                 <tr key={`${slot.plan_id}-${slot.plan_line_id}-${slot.resource_id}-${slot.slot_ordinal}`}>
                   <td className="numCell">{slot.plan_id}</td>
                   <td className="numCell">{slot.plan_line_id}</td>
-                  <td className="numCell">{slot.item_id}</td>
+                  <td title={`item_id ${slot.item_id}`}>{drumItemLabel(slot)}</td>
                   <td className="numCell">{slot.resource_id}</td>
                   <td>{formatDate(slot.slot_date)}</td>
                   <td className="numCell">{slot.slot_ordinal}</td>
@@ -158,7 +158,7 @@ export function DrumPage() {
               <tr>
                 <th className="numCell">plan</th>
                 <th className="numCell">plan_line</th>
-                <th className="numCell">item_id</th>
+                <th>Номенклатура</th>
                 <th className="numCell">resource_id</th>
                 <th>Дата дефицита</th>
                 <th className="numCell">Дефицит</th>
@@ -180,7 +180,7 @@ export function DrumPage() {
                 <tr key={`${gap.plan_id}-${gap.plan_line_id}-${gap.resource_id}-${gap.gap_date}`}>
                   <td className="numCell">{gap.plan_id}</td>
                   <td className="numCell">{gap.plan_line_id}</td>
-                  <td className="numCell">{gap.item_id}</td>
+                  <td title={`item_id ${gap.item_id}`}>{drumItemLabel(gap)}</td>
                   <td className="numCell">{gap.resource_id}</td>
                   <td>{formatDate(gap.gap_date)}</td>
                   <td className="numCell">{formatNumber(gap.gap_qty)}</td>

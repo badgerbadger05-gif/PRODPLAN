@@ -46,7 +46,23 @@ export type OrderRow = {
   mrp_req_net_qty?: number | null
   mrp_req_covered_qty?: number | null
   mrp_req_remaining_qty?: number | null
+  // DBR: чем вызван запуск строки и какой полкой он ограничен.
+  // См. ProductionOrderJournalRowResponse в backend/app/routers/production_control.py.
+  launch_source?: LaunchSource
+  shelf_warehouse_ref1c?: string | null
+  shelf_pull_qty?: number | null
+  shelf_materialized_qty?: number | null
+  shelf_latest_start_date?: string | null
   paint_weld_chain?: PaintWeldChainInfo | null
+}
+
+// Источник запуска строки журнала: вытягивание с полки DBR либо остаток MRP.
+// Значения приходят готовыми (LAUNCH_SOURCE_SHELF / LAUNCH_SOURCE_MRP в
+// backend/app/services/production_control_journal.py), frontend их не выводит.
+export type LaunchSource = 'shelf_pull' | 'mrp_remaining'
+
+export function isShelfPullRow(row: Pick<OrderRow, 'launch_source'>) {
+  return row.launch_source === 'shelf_pull'
 }
 
 // Цепочка «окраска↔сварка»: строка входит в связанную пару заказов.
@@ -55,6 +71,92 @@ export type PaintWeldChainInfo = {
   link_id: number
   counterpart_order_id?: number | null
   counterpart_product_id?: number | null
+}
+
+// Фактический контракт закрытия цепочки:
+// backend/app/services/paint_weld_chain.py::close_paint_chain,
+// backend/app/routers/paint_weld.py::chain_close.
+export type PaintWeldChainSide = 'weld' | 'paint'
+
+export type PaintWeldChainCloseStatus = 'ok' | 'partial'
+
+export type PaintWeldChainState =
+  | 'not_started'
+  | 'partially_posted'
+  | 'manufactures_posted'
+  | 'manufactures_posted_piecework_pending'
+  | 'closed'
+
+export type PaintWeldChainSidePlan = {
+  product_id: number
+  order_id: number
+  remaining_qty: number
+  qty_to_produce: number
+  existing_manufacture_id?: number | null
+  manufacture_id?: number
+  manufacture_ref1c?: string | null
+  produce?: ProduceLineResult | null
+  error?: string
+}
+
+// Комбинированный СдельныйНаряд цепочки: export_chain_piecework_to_1c.
+export type ChainPieceworkExportResult = {
+  status: 'ok' | 'existing' | 'error' | 'partial_error'
+  dry_run: boolean
+  entity: string
+  combined: boolean
+  weld_manufacture_id: number
+  paint_manufacture_id: number
+  target_ref_key?: string | null
+  reason?: string
+  error?: string
+  created?: number
+  errored?: number
+  skipped_rows: Array<Record<string, unknown>>
+  entries?: Array<Record<string, unknown>>
+  payloads?: Array<Record<string, unknown>>
+}
+
+export type PaintWeldChainCloseResult = {
+  status: PaintWeldChainCloseStatus
+  dry_run: boolean
+  initiated_by?: string | null
+  chain_link_id: number
+  weld: PaintWeldChainSidePlan
+  paint: PaintWeldChainSidePlan
+  chain_state: PaintWeldChainState
+  resume_required: boolean
+  posted_sides: PaintWeldChainSide[]
+  pending_sides: PaintWeldChainSide[]
+  // Готовое человекочитаемое объяснение частичного закрытия — backend владеет
+  // формулировкой, frontend её не собирает.
+  message?: string
+  error?: string
+  ledger_readback?: 'queued'
+  manufactures_export?: ExportManufacturesResult
+  piecework_export?: ChainPieceworkExportResult
+  piecework_preview?: ChainPieceworkExportResult | null
+}
+
+export const paintWeldChainSideLabels: Record<PaintWeldChainSide, string> = {
+  weld: 'сварка',
+  paint: 'окраска',
+}
+
+export const paintWeldChainStateLabels: Record<PaintWeldChainState, string> = {
+  not_started: 'Не начата',
+  partially_posted: 'Проведена частично',
+  manufactures_posted: 'Сборки запасов проведены',
+  manufactures_posted_piecework_pending: 'Сборки проведены, наряда нет',
+  closed: 'Закрыта',
+}
+
+export function paintWeldChainStateLabel(state: PaintWeldChainState) {
+  return paintWeldChainStateLabels[state] ?? state
+}
+
+export function paintWeldChainSidesLabel(sides: PaintWeldChainSide[]) {
+  return sides.map((side) => paintWeldChainSideLabels[side] ?? side).join(', ')
 }
 
 export type MaterialRow = {

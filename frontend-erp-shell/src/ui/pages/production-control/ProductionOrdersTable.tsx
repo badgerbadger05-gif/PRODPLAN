@@ -1,4 +1,4 @@
-import { coverageLabels, productionStatusOptions, productionStatusSelectValue, type OrderRow } from '../../../domain/productionControl'
+import { coverageLabels, isShelfPullRow, productionStatusOptions, productionStatusSelectValue, type OrderRow } from '../../../domain/productionControl'
 import { dateRu, qty } from '../../../lib/format'
 import { sortGlyph, tableColumnStyle, tableMinWidth, type TableSortState } from '../../tableDoctype'
 import { productionOrderColumns, type ProductionOrderSortKey } from './productionOrdersDoctype'
@@ -26,6 +26,23 @@ function ForecastShift({ row }: { row: OrderRow }) {
   const dateText = row.forecast_date ? dateRu(row.forecast_date).slice(0, 5) : ''
   const title = [row.forecast_reason, row.forecast_date ? `прогноз ${dateRu(row.forecast_date)}` : null].filter(Boolean).join(' · ')
   return <span className={`forecastShift ${cls}`} title={title}>{label}{dateText ? ` · ${dateText}` : ''}</span>
+}
+
+// Признак источника запуска приходит готовым (`launch_source`): полка DBR
+// вытянула строку или это остаток MRP. Ничего не пересчитывается — тултип
+// только перечисляет уже посчитанные backend-ом величины полки.
+function ShelfPullBadge({ row }: { row: OrderRow }) {
+  if (!isShelfPullRow(row)) return null
+  const title = [
+    'Запуск вытянут полкой DBR',
+    row.shelf_pull_qty === null || row.shelf_pull_qty === undefined ? null : `вытягивание ${qty(row.shelf_pull_qty)}`,
+    row.shelf_materialized_qty === null || row.shelf_materialized_qty === undefined
+      ? null
+      : `материализовано ${qty(row.shelf_materialized_qty)}`,
+    row.shelf_latest_start_date ? `запуск не позже ${dateRu(row.shelf_latest_start_date)}` : null,
+    row.shelf_warehouse_ref1c ? `склад полки ${row.shelf_warehouse_ref1c}` : null,
+  ].filter(Boolean).join(' · ')
+  return <span className="miniPill shelfPull" title={title}>Полка</span>
 }
 
 function orderSubline(row: OrderRow) {
@@ -95,7 +112,10 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
                   </span>
                 )}
               </strong>
-              <span title={row.item_article || row.item_code || ''}>{row.item_article || row.item_code || ''}</span>
+              <span title={row.item_article || row.item_code || ''}>
+                {row.item_article || row.item_code || ''}
+                <ShelfPullBadge row={row} />
+              </span>
             </td>
             <td className="numCell">
               <strong>{qty(row.remaining_qty)}</strong>
@@ -104,6 +124,11 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
             <td className="dateCell">
               <span>С: {dateRu(row.planned_start_date) || '—'}</span>
               <span>По: {dateRu(row.planned_finish_date) || '—'}</span>
+              {row.shelf_latest_start_date && (
+                <span className="shelfStartDate" title="Крайний срок запуска строки по полке DBR">
+                  Запуск до: {dateRu(row.shelf_latest_start_date)}
+                </span>
+              )}
               <ForecastShift row={row} />
             </td>
             <td>

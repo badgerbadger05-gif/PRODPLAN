@@ -2,11 +2,15 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import {
   coverageLabels,
+  paintWeldChainSidesLabel,
+  paintWeldChainStateLabel,
   type MaterialIssueCreatePayload,
   type ControlWarehouse,
   type MaterialIssueCreateResponse,
   type MaterialsResponse,
   type OrderRow,
+  type PaintWeldChainSide,
+  type PaintWeldChainState,
   type ProductionFilters,
   type WarehouseCandidate,
   type WorkshopWarehouse,
@@ -47,6 +51,16 @@ const coverageDrivenStatuses = new Set(['shortage', 'partial', 'ready'])
 
 function recordArray(value: unknown): Array<Record<string, unknown>> {
   return Array.isArray(value) ? value.filter((row): row is Record<string, unknown> => Boolean(row) && typeof row === 'object') : []
+}
+
+// Незакрытая до конца цепочка «окраска↔сварка»: что уже в 1С, что осталось и
+// какую строку нужно докатить повторным вызовом того же закрытия.
+type ChainResumeNotice = {
+  productId: number
+  message: string
+  chainState: PaintWeldChainState
+  postedSides: PaintWeldChainSide[]
+  pendingSides: PaintWeldChainSide[]
 }
 
 function firstExportProblem(...summaries: Array<Record<string, unknown> | null | undefined>) {
@@ -91,6 +105,7 @@ export function ProductionControlPage() {
   const filtersRef = useRef(filters)
   const offsetRef = useRef(offset)
   const [message, setMessage] = useState('')
+  const [chainResume, setChainResume] = useState<ChainResumeNotice | null>(null)
   const [resources, setResources] = useState<ProductionResource[]>([])
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsSaving, setSettingsSaving] = useState(false)
@@ -538,26 +553,47 @@ export function ProductionControlPage() {
     }
   }
 
-  async function closeSelectedChain() {
-    const row = selectedRows.length === 1 ? selectedRows[0] : null
-    if (!row?.paint_weld_chain) return
-    if (!window.confirm('Закрыть оба заказа цепочки окраска↔сварка одним действием?')) return
+  // Закрытие возобновляемо: тот же вызов и докатывает недостающие документы,
+  // поэтому «Докатить» — это повтор closePaintWeldChain по той же строке.
+  async function runChainClose(productId: number) {
     setLoading(true)
     setError('')
     setMessage('')
     try {
-      await closePaintWeldChain(row.product_id)
-      setMessage(
-        'Сборки запасов обоих звеньев и комбинированный сдельный наряд созданы в 1С. ' +
-        'Факт ожидает считывания проведения в Item Ledger.',
-      )
+      const result = await closePaintWeldChain(productId)
+      if (result.status === 'partial') {
+        setChainResume({
+          productId,
+          message:
+            result.message
+            || result.error
+            || 'Цепочка проведена в 1С частично. Требуется докат: повторите закрытие цепочки.',
+          chainState: result.chain_state,
+          postedSides: result.posted_sides ?? [],
+          pendingSides: result.pending_sides ?? [],
+        })
+        await load(offsetRef.current)
+        return
+      }
+      setChainResume(null)
       setSelectedIds(new Set())
       await load(offsetRef.current)
+      setMessage(
+        'Цепочка закрыта: сборки запасов обоих звеньев и комбинированный сдельный наряд проведены в 1С. ' +
+        'Факт ожидает считывания проведения в Item Ledger.',
+      )
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
       setLoading(false)
     }
+  }
+
+  async function closeSelectedChain() {
+    const row = selectedRows.length === 1 ? selectedRows[0] : null
+    if (!row?.paint_weld_chain) return
+    if (!window.confirm('Закрыть оба заказа цепочки окраска↔сварка одним действием?')) return
+    await runChainClose(row.product_id)
   }
 
   function printRows(ids: number[]) {
@@ -666,6 +702,30 @@ export function ProductionControlPage() {
 
         {error && <div className="errorLine">{error}</div>}
         {message && <div className="successLine">{message}</div>}
+        {chainResume && (
+          <div className="warningLine chainResumeNotice">
+            <div className="chainResumeText">
+              <strong>Цепочка окраска↔сварка закрыта не полностью.</strong>
+              <span>{chainResume.message}</span>
+              <span className="muted">
+                Состояние: {paintWeldChainStateLabel(chainResume.chainState)}
+                {chainResume.postedSides.length ? ` · в 1С: ${paintWeldChainSidesLabel(chainResume.postedSides)}` : ''}
+                {chainResume.pendingSides.length ? ` · осталось: ${paintWeldChainSidesLabel(chainResume.pendingSides)}` : ''}
+              </span>
+            </div>
+            <div className="chainResumeActions">
+              <button
+                className="primary"
+                onClick={() => void runChainClose(chainResume.productId)}
+                disabled={loading}
+                title="Повторить закрытие цепочки: проведённые документы переиспользуются без дублей"
+              >
+                Докатить
+              </button>
+              <button onClick={() => setChainResume(null)} disabled={loading}>Скрыть</button>
+            </div>
+          </div>
+        )}
 
         <div className="split">
           <div className="tablePane">

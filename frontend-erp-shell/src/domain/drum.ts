@@ -2,13 +2,18 @@ import type { TruthMeta } from './truth'
 
 export type DrumPriorityPart = string | number
 
-// The persisted drum carries no item names (see
-// `app.routers.production_control.DrumSlotRow`): slots reference `item_id` and
-// `resource_id` only.
-export type DrumSlotRow = {
+// `item_code`/`item_name` — необязательные: старая persisted-версия барабана
+// (`app.routers.production_control.DrumSlotRow`) их не несёт, строка тогда
+// опознаётся только по `item_id`.
+export type DrumItemIdentity = {
+  item_id: number
+  item_code?: string | null
+  item_name?: string | null
+}
+
+export type DrumSlotRow = DrumItemIdentity & {
   plan_id: number
   plan_line_id: number
-  item_id: number
   resource_id: number
   slot_date: string
   slot_qty: number
@@ -16,14 +21,21 @@ export type DrumSlotRow = {
   original_priority: DrumPriorityPart[]
 }
 
-export type DrumCapacityGapRow = {
+export type DrumCapacityGapRow = DrumItemIdentity & {
   plan_id: number
   plan_line_id: number
-  item_id: number
   resource_id: number
   gap_date: string
   gap_qty: number
   original_priority: DrumPriorityPart[]
+}
+
+// «код — имя», пока backend их отдаёт; иначе остаётся сырой item_id.
+export function drumItemLabel(row: DrumItemIdentity) {
+  const code = (row.item_code ?? '').trim()
+  const name = (row.item_name ?? '').trim()
+  if (code && name) return `${code} — ${name}`
+  return code || name || String(row.item_id)
 }
 
 export type DrumResponse = {

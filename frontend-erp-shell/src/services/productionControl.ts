@@ -6,6 +6,7 @@ import type {
   OrderQuantityPatchResponse,
   OrderStatePatchPayload,
   OrdersResponse,
+  PaintWeldChainCloseResult,
   ProduceLinePayload,
   ProduceLineResult,
   ReturnLeftoversResult,
@@ -107,14 +108,18 @@ export function produceOrderLine(productId: number, payload: ProduceLinePayload)
   })
 }
 
-export function closePaintWeldChain(productId: number) {
-  return api<Record<string, unknown>>('/v1/paint-weld/chain/close', {
+// POST /v1/paint-weld/chain/close (backend/app/routers/paint_weld.py::chain_close,
+// payload ChainClosePayload). Закрытие возобновляемо: частичное проведение
+// приходит с HTTP 200 и status='partial', повтор того же вызова докатывает
+// недостающие документы без дублей.
+export function closePaintWeldChain(productId: number, initiatedBy = 'erp-shell-chain-close') {
+  return api<PaintWeldChainCloseResult>('/v1/paint-weld/chain/close', {
     method: 'POST',
     body: JSON.stringify({
       product_id: productId,
       dry_run: false,
       allow_production: true,
-      initiated_by: 'erp-shell-chain-close',
+      initiated_by: initiatedBy,
     }),
   })
 }
