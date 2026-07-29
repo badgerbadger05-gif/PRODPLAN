@@ -702,7 +702,6 @@ def export_planned_purchases_to_1c(
     date_to: Optional[str] = None,
     purchase_ids: Optional[List[int]] = None,
     dry_run: bool = False,
-    allow_production: bool = False,
 ) -> Dict[str, Any]:
     run, generation_id = require_current_run(
         db, int(run_id), consumer="one_c_purchase_order_export"
@@ -780,12 +779,7 @@ def export_planned_purchases_to_1c(
             "orders": [],
         }
 
-    client = _create_odata_client(
-        _load_odata_config(),
-        OData1CClient,
-        allow_production=allow_production,
-        require_demo_base=True,
-    )
+    client = _create_odata_client(_load_odata_config(), OData1CClient)
 
     created = 0
     existing = 0

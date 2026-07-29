@@ -115,25 +115,17 @@ def find_document_by_origin(
     return rows[0] if rows else None
 
 
-def is_demo_base_url(base_url: str) -> bool:
-    return "unf_demo" in (base_url or "").lower()
+def create_odata_client(config: Dict[str, Any], client_factory: Any) -> Any:
+    """Build the OData client for the base configured in PRODPLAN.
 
-
-def create_odata_client(
-    config: Dict[str, Any],
-    client_factory: Any,
-    *,
-    allow_production: bool = False,
-    require_demo_base: bool = False,
-) -> Any:
+    Go-live: PRODPLAN writes into the base from the saved 1C connection
+    settings, whatever that base is. The write-side protections are dry_run
+    (full preview without a write), sync_link idempotency and the
+    origin-marker lookup — not a base_url pattern check.
+    """
     base_url = str(config.get("base_url") or "").strip()
     if not base_url:
         raise ValueError("OData config is not set. Save 1C connection settings first.")
-    if require_demo_base and not is_demo_base_url(base_url) and not allow_production:
-        raise PermissionError(
-            f"Refusing to write to non-demo base_url '{base_url}'. "
-            "Pass allow_production=true to override (use with caution)."
-        )
     return client_factory(
         base_url=base_url,
         username=config.get("username") or None,

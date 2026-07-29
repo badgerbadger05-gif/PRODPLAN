@@ -1341,12 +1341,7 @@ def list_material_issues(
     }
 
 
-def assemble_material_issue(
-    db: Session,
-    issue_id: int,
-    *,
-    allow_production: bool = False,
-) -> Dict[str, Any]:
+def assemble_material_issue(db: Session, issue_id: int) -> Dict[str, Any]:
     truth = require_accepted_truth(db, "production_material_issue_assemble")
     issue = (
         db.query(ProductionMaterialIssue)
@@ -1378,12 +1373,7 @@ def assemble_material_issue(
         )
         .one_or_none()
     )
-    client = _create_odata_client(
-        _load_odata_config(),
-        OData1CClient,
-        allow_production=allow_production,
-        require_demo_base=True,
-    )
+    client = _create_odata_client(_load_odata_config(), OData1CClient)
     try:
         from .one_c_stock_transfer_export import (
             add_source_cells_to_payload,

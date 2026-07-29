@@ -235,12 +235,13 @@ def test_purchase_order_export_limits_to_selected_purchase_ids(db_session):
     assert result["orders"][0]["lines"][0]["qty"] == 2.0
 
 
-def test_purchase_order_export_refuses_non_demo_base_without_override(db_session, monkeypatch):
+def test_purchase_order_export_writes_into_configured_production_base(db_session, monkeypatch):
+    """Go-live: демо-гард удалён — экспорт пишет в базу из настроек подключения."""
     db = db_session
 
     item = Item(
         item_code="PO-1C-GUARD",
-        item_name="Защищённая закупка",
+        item_name="Боевая закупка",
         item_article="GUARD",
         item_ref1c="item-ref-guard",
         supplier_ref1c="supplier-guard",
@@ -266,14 +267,32 @@ def test_purchase_order_export_refuses_non_demo_base_without_override(db_session
     )
     db.commit()
 
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def get_all(self, *args, **kwargs):
+            return []
+
+        def post(self, *args, **kwargs):
+            payload = args[1] if len(args) > 1 else kwargs["payload"]
+            return {
+                "Ref_Key": "purchase-order-prod-ref",
+                "Контрагент_Key": payload["Контрагент_Key"],
+                "Запасы": payload["Запасы"],
+            }
+
     monkeypatch.setattr(
         exporter,
         "_load_odata_config",
-        lambda: {"base_url": "http://mtzw7/unf/odata/standard.odata"},
+        lambda: {"base_url": "http://mtzw7/unf/odata/standard.odata"},  # NOT unf_demo
     )
+    monkeypatch.setattr(exporter, "OData1CClient", FakeClient)
 
-    with pytest.raises(PermissionError):
-        export_planned_purchases_to_1c(db, run.run_id, dry_run=False)
+    result = export_planned_purchases_to_1c(db, run.run_id, dry_run=False)
+
+    assert result["status"] == "ok"
+    assert result["orders_created"] == 1
 
 
 def test_purchase_order_export_stamps_sync_links_for_source_purchases(db_session, monkeypatch):

@@ -453,7 +453,6 @@ def open_paint_chain(
     planned_start: Any = None,
     planned_finish: Any = None,
     dry_run: bool = True,
-    allow_production: bool = False,
     initiated_by: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Открыть окрасочный заказ + (при need_weld) сварочный на основании.
@@ -568,7 +567,7 @@ def open_paint_chain(
 
         if dry_run:
             paint_export = export_production_orders_to_1c(
-                db, [int(paint_order.order_id)], dry_run=True, allow_production=allow_production
+                db, [int(paint_order.order_id)], dry_run=True
             )
             result["painted"] = {
                 "order_id": int(paint_order.order_id),
@@ -598,7 +597,6 @@ def open_paint_chain(
                     db,
                     [int(weld_order.order_id)],
                     dry_run=True,
-                    allow_production=allow_production,
                     comment_suffixes={int(weld_order.order_id): _basis_comment(paint_order)},
                     # В предпросмотре ref окрасочного есть только если он уже
                     # выгружен в 1С; при реальном открытии поле появится всегда.
@@ -626,7 +624,6 @@ def open_paint_chain(
             db,
             [int(paint_order.order_id)],
             dry_run=False,
-            allow_production=allow_production,
         )
         db.flush()
         db.refresh(paint_order)
@@ -676,7 +673,6 @@ def open_paint_chain(
                 db,
                 [int(weld_order.order_id)],
                 dry_run=False,
-                allow_production=allow_production,
                 comment_suffixes={int(weld_order.order_id): basis},
                 basis_order_refs={int(weld_order.order_id): paint_ref},
             )
@@ -801,7 +797,6 @@ def close_paint_chain(
     paint_operation_executors: Optional[Any] = None,
     comment: Optional[str] = None,
     dry_run: bool = True,
-    allow_production: bool = False,
     initiated_by: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
@@ -895,7 +890,6 @@ def close_paint_chain(
                 weld_manufacture_id=weld_plan["existing_manufacture_id"],
                 paint_manufacture_id=paint_plan["existing_manufacture_id"],
                 dry_run=True,
-                allow_production=allow_production,
             )
         else:
             result["piecework_preview"] = None
@@ -937,7 +931,6 @@ def close_paint_chain(
         db,
         [weld_manufacture_id, paint_manufacture_id],
         dry_run=False,
-        allow_production=allow_production,
     )
     result["manufactures_export"] = manufactures_export
     export_entries = {
@@ -1006,7 +999,6 @@ def close_paint_chain(
         weld_manufacture_id=weld_manufacture_id,
         paint_manufacture_id=paint_manufacture_id,
         dry_run=False,
-        allow_production=allow_production,
     )
     result["piecework_export"] = piecework_export
     if piecework_export.get("status") not in ("ok", "existing"):

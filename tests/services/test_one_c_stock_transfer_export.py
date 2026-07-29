@@ -324,7 +324,7 @@ def test_apply_payload_fills_source_storage_cell_from_live_1c_balance(db_session
     monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
 
     result = exporter.export_material_issues_to_1c(
-        db, [issue.issue_id], dry_run=False, allow_production=False
+        db, [issue.issue_id], dry_run=False
     )
 
     assert result["issues_created"] == 1
@@ -431,7 +431,7 @@ def test_chain_full_apply_exports_order_then_transfer(db_session, monkeypatch):
     monkeypatch.setattr(fake, "post", staged_post)
 
     result = exporter.export_material_issues_to_1c(
-        db, [issue.issue_id], dry_run=False, allow_production=False
+        db, [issue.issue_id], dry_run=False
     )
 
     # Parent chain happened first.
@@ -459,7 +459,11 @@ def test_export_skips_issue_when_source_warehouse_unset(db_session, monkeypatch)
     assert result["skipped_rows"][0]["reason"] == "склад отправитель пуст — перемещение в 1С не сформировано"
 
 
-def test_demo_guard_refuses_non_demo_without_override(db_session, monkeypatch):
+def test_export_writes_into_configured_production_base(db_session, monkeypatch):
+    """Go-live: демо-гард удалён — пишем в базу из настроек, какой бы она ни была.
+
+    dry_run остаётся единственным предпросмотром: он не создаёт клиента 1С.
+    """
     db = db_session
     parent = _mk_item(db, code="TRP3", ref1c="parent-ref-3")
     comp = _mk_item(db, code="TRC3", ref1c="comp-ref-3")
@@ -469,14 +473,11 @@ def test_demo_guard_refuses_non_demo_without_override(db_session, monkeypatch):
     fake = _FakeClient()
     monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
 
-    with pytest.raises(PermissionError):
-        exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=False)
+    preview = exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=True)
+    assert preview["payloads"]
     assert fake.posts == []
 
-    # allow_production overrides.
-    result = exporter.export_material_issues_to_1c(
-        db, [issue.issue_id], dry_run=False, allow_production=True
-    )
+    result = exporter.export_material_issues_to_1c(db, [issue.issue_id], dry_run=False)
     assert result["issues_created"] == 1
 
 

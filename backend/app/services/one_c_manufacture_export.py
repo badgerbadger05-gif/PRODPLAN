@@ -4,10 +4,9 @@ Pattern: mirrors one_c_production_order_export.py / one_c_stock_transfer_export.
 Documentation: .docs/one_c_export_from_prodplan.md.
 
 Safety per the doc:
-1. Default dry_run=True.
-2. Refuse non-demo base_url unless allow_production=True.
-3. Posted=false on create, then conduct through standard 1C Post operation.
-4. Idempotency via sync_link (source_doctype='manufacture').
+1. Default dry_run=True (full preview, nothing is written).
+2. Posted=false on create, then conduct through standard 1C Post operation.
+3. Idempotency via sync_link (source_doctype='manufacture').
 
 A ProductionManufacture represents one "Произвести" event on a
 production_products line. In 1C this maps to Document_СборкаЗапасов
@@ -678,7 +677,6 @@ def _chain_export_parent_orders(
     manufacture_ids: List[int],
     *,
     dry_run: bool,
-    allow_production: bool,
 ) -> Optional[Dict[str, Any]]:
     """
     Per .docs/one_c_export_from_prodplan.md: a Document_СборкаЗапасов MUST be
@@ -705,7 +703,6 @@ def _chain_export_parent_orders(
         db,
         parent_ids,
         dry_run=dry_run,
-        allow_production=allow_production,
     )
 
 
@@ -714,7 +711,6 @@ def export_manufactures_to_1c(
     manufacture_ids: List[int],
     *,
     dry_run: bool = True,
-    allow_production: bool = False,
 ) -> Dict[str, Any]:
     """
     Export selected ProductionManufactures to 1C as Document_СборкаЗапасов
@@ -724,7 +720,7 @@ def export_manufactures_to_1c(
     is exported first (so the manufacture can carry a valid ДокументОснование).
     """
     parent_export = _chain_export_parent_orders(
-        db, list(manufacture_ids), dry_run=dry_run, allow_production=allow_production
+        db, list(manufacture_ids), dry_run=dry_run
     )
     entries, skipped, warnings = _collect_export_entries(db, list(manufacture_ids))
 
@@ -783,12 +779,7 @@ def export_manufactures_to_1c(
         summary["payloads"] = payloads
         return summary
 
-    client = _create_odata_client(
-        config,
-        OData1CClient,
-        allow_production=allow_production,
-        require_demo_base=True,
-    )
+    client = _create_odata_client(config, OData1CClient)
     _inherit_structural_units_from_parent_order(client, eligible)
 
     # Pre-flight: refuse exports whose component write-off cannot be covered

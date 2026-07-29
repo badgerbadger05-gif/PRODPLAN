@@ -87,7 +87,7 @@ def test_assemble_posts_operationally_and_enqueues_recorder_pull(db_session, mon
     _stub_1c(monkeypatch, fake)
 
     result = issues.assemble_material_issue(
-        db_session, issue.issue_id, allow_production=True
+        db_session, issue.issue_id
     )
 
     assert result["status"] == "ok"
@@ -124,7 +124,7 @@ def test_assemble_repull_resets_an_exhausted_pull_row(db_session, monkeypatch):
     fake = _FakeClient()
     _stub_1c(monkeypatch, fake)
 
-    issues.assemble_material_issue(db_session, issue.issue_id, allow_production=True)
+    issues.assemble_material_issue(db_session, issue.issue_id)
 
     rows = (
         db_session.query(models.StockRecorderPull)
@@ -148,7 +148,7 @@ def test_assemble_failure_does_not_enqueue_pull(db_session, monkeypatch):
     _stub_1c(monkeypatch, fake)
 
     try:
-        issues.assemble_material_issue(db_session, issue.issue_id, allow_production=True)
+        issues.assemble_material_issue(db_session, issue.issue_id)
         assert False, "ожидали ValueError"
     except ValueError as exc:
         assert "отказала" in str(exc)

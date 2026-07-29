@@ -5,11 +5,9 @@ Documentation: .docs/one_c_export_from_prodplan.md.
 
 Safety rules from the doc are enforced on top of the call site:
 1. Default `dry_run=True`; explicit dry_run=False is required to write.
-2. Refuse to write if the configured base_url doesn't look like a demo DB
-   (substring 'unf_demo'), unless `allow_production=True` is also set.
-3. Always send `Posted=false`, then immediately conduct the created order
+2. Always send `Posted=false`, then immediately conduct the created order
    through the standard 1C `Post?PostingModeOperational=true` command.
-4. Idempotency: skip orders that already have a successful sync_link OR a
+3. Idempotency: skip orders that already have a successful sync_link OR a
    non-empty `production_orders.order_ref1c` (it gets stamped from the
    1C response on first successful export).
 
@@ -754,7 +752,6 @@ def export_production_orders_to_1c(
     order_ids: List[int],
     *,
     dry_run: bool = True,
-    allow_production: bool = False,
     comment_suffixes: Optional[Dict[int, str]] = None,
     basis_order_refs: Optional[Dict[int, str]] = None,
 ) -> Dict[str, Any]:
@@ -763,10 +760,8 @@ def export_production_orders_to_1c(
     Document_ЗаказНаПроизводство with Posted=false, then operationally posts
     each created 1C document.
 
-    Default is `dry_run=True` per plan safety rule. Caller must pass
-    `dry_run=False` to actually write. A second guard refuses to write to a
-    base_url that doesn't look like a demo DB unless `allow_production=True`
-    is also passed.
+    Default is `dry_run=True` per plan safety rule: the caller must pass
+    `dry_run=False` to actually write into the configured 1C base.
     """
     selected_ids = sorted({int(order_id) for order_id in order_ids})
     selected_orders = (
@@ -872,12 +867,7 @@ def export_production_orders_to_1c(
         return summary
 
     # ----- real write below -----
-    client = _create_odata_client(
-        config,
-        OData1CClient,
-        allow_production=allow_production,
-        require_demo_base=True,
-    )
+    client = _create_odata_client(config, OData1CClient)
 
     # Recover a POST performed by another PRODPLAN instance before creating
     # anything new.  This intentionally happens after payload construction so

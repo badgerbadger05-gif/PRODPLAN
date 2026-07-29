@@ -559,7 +559,7 @@ def test_export_inherits_warehouses_from_parent_1c_order_when_local_binding_miss
     )
     monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
 
-    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False, allow_production=True)
+    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False)
 
     assert result["manufactures_created"] == 1
     assert fake.gets
@@ -619,7 +619,7 @@ def test_export_uses_parent_order_product_warehouse_over_local_binding(db_sessio
     )
     monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
 
-    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False, allow_production=True)
+    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False)
 
     assert result["manufactures_created"] == 1
     payload = fake.posts[0][1]
@@ -667,7 +667,7 @@ def test_export_uses_completion_stage_even_without_local_spec_stages(db_session,
     )
     monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
 
-    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False, allow_production=True)
+    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False)
 
     assert result["manufactures_created"] == 1
     payload = fake.posts[0][1]
@@ -692,7 +692,11 @@ def test_rollback_local_manufacture_restores_line(db_session):
     assert db.query(ProductionManufacture).filter_by(manufacture_id=result["manufacture_id"]).one_or_none() is None
 
 
-def test_demo_guard_refuses_non_demo_without_override(db_session, monkeypatch):
+def test_export_writes_into_configured_production_base(db_session, monkeypatch):
+    """Go-live: демо-гард удалён — пишем в базу из настроек подключения.
+
+    Предпросмотр остаётся только за dry_run: он не постит в 1С.
+    """
     db = db_session
     item = _mk_item(db, code="EXP-GUARD", ref1c="item-ref-guard")
     product = _mk_product(db, item, qty=2)
@@ -702,13 +706,11 @@ def test_demo_guard_refuses_non_demo_without_override(db_session, monkeypatch):
     fake = _FakeClient()
     monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
 
-    with pytest.raises(PermissionError):
-        exporter.export_manufactures_to_1c(db, [mid], dry_run=False)
+    preview = exporter.export_manufactures_to_1c(db, [mid], dry_run=True)
+    assert preview["payloads"]
     assert fake.posts == []
 
-    result = exporter.export_manufactures_to_1c(
-        db, [mid], dry_run=False, allow_production=True
-    )
+    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False)
     assert result["manufactures_created"] == 1
 
 
@@ -1069,7 +1071,7 @@ def test_export_blocked_when_1c_unit_balance_insufficient(db_session, monkeypatc
     )
     monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
 
-    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False, allow_production=True)
+    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False)
 
     assert result["manufactures_blocked"] == 1
     assert result["manufactures_error"] == 1
@@ -1098,7 +1100,7 @@ def test_export_blocked_when_component_absent_on_unit(db_session, monkeypatch):
     fake = _BalanceClient(balance_rows=[])
     monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
 
-    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False, allow_production=True)
+    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False)
 
     assert result["manufactures_blocked"] == 1
     assert fake.posts == []
@@ -1117,7 +1119,7 @@ def test_export_proceeds_when_1c_unit_balance_sufficient(db_session, monkeypatch
     )
     monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
 
-    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False, allow_production=True)
+    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False)
 
     assert result["manufactures_blocked"] == 0
     assert result["manufactures_created"] == 1
@@ -1137,7 +1139,7 @@ def test_export_fails_open_when_balance_query_errors(db_session, monkeypatch):
     fake = _BalanceClient(ref_key="guard-fopen-ref", balance_fail=True)
     monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
 
-    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False, allow_production=True)
+    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False)
 
     assert result["manufactures_blocked"] == 0
     assert result["manufactures_created"] == 1
@@ -1159,7 +1161,7 @@ def test_guard_skips_repair_of_existing_1c_document(db_session, monkeypatch):
     fake = _BalanceClient(balance_rows=[])
     monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
 
-    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False, allow_production=True)
+    result = exporter.export_manufactures_to_1c(db, [mid], dry_run=False)
 
     assert result["manufactures_blocked"] == 0
     assert result["manufactures_created"] == 1
@@ -1206,7 +1208,7 @@ def test_guard_checks_bulk_batch_against_shared_balance(db_session, monkeypatch)
     monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
 
     result = exporter.export_manufactures_to_1c(
-        db, [mid1, mid2], dry_run=False, allow_production=True
+        db, [mid1, mid2], dry_run=False
     )
 
     assert result["manufactures_created"] == 1
@@ -1240,7 +1242,7 @@ def test_produce_exports_both_documents_then_readback_closes_plans_fifo(
     manufacture_client = _FakeClient(ref_key="assembly-e2e-ref")
     monkeypatch.setattr(exporter, "OData1CClient", lambda **_: manufacture_client)
     manufacture = exporter.export_manufactures_to_1c(
-        db, [manufacture_id], dry_run=False, allow_production=True
+        db, [manufacture_id], dry_run=False
     )
     assert manufacture["manufactures_created"] == 1
     assert len(manufacture_client.posts) == 1
@@ -1263,7 +1265,6 @@ def test_produce_exports_both_documents_then_readback_closes_plans_fifo(
         [manufacture_id],
         operation_ref="operation-e2e-ref",
         dry_run=False,
-        allow_production=True,
     )
     assert piecework["manufactures_created"] == 1
     assert len(piecework_client.posts) == 1

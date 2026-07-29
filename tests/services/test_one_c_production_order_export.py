@@ -2,7 +2,7 @@
 
 Covers:
 - dry-run preview returns payloads without touching the network
-- demo-DB guard refuses non-demo base_url unless allow_production
+- go-live: запись идёт в базу из настроек, демо-гарда больше нет
 - successful write stamps sync_link + production_orders.order_ref1c
 - second call is a no-op (sync_link idempotency)
 - ineligible orders (1C-synced, deletion_mark, missing item ref1c, missing
@@ -315,27 +315,27 @@ def test_dry_run_payload_includes_materials_operations_and_reserve_warehouse(db_
     assert payload["ЗапланированыОперации"] is True
 
 
-def test_demo_base_url_guard_blocks_non_demo_without_override(db_session, monkeypatch):
+def test_export_writes_into_configured_production_base(db_session, monkeypatch):
+    """Go-live: демо-гард удалён — пишем в базу из настроек подключения.
+
+    Единственный предпросмотр — dry_run: он не создаёт клиента и не постит.
+    """
     db = db_session
     item = _mk_item(db, code="P2", ref1c="22222222-2222-2222-2222-222222222222")
     run = _mk_run(db)
     order = _mk_mrp_order(db, item, run_id=run.run_id)
 
     _stub_odata_config(monkeypatch, base_url="http://erp-prod.example/odata/unf")  # NOT unf_demo
-    # Stub the client to detect accidental writes.
     fake = _FakeClient()
     monkeypatch.setattr(exporter, "OData1CClient", lambda **_: fake)
 
-    with pytest.raises(PermissionError):
-        exporter.export_production_orders_to_1c(
-            db, [order.order_id], dry_run=False, allow_production=False
-        )
+    preview = exporter.export_production_orders_to_1c(
+        db, [order.order_id], dry_run=True
+    )
+    assert preview["payloads"]
     assert fake.posts == []
 
-    # With explicit override the same call goes through.
-    result = exporter.export_production_orders_to_1c(
-        db, [order.order_id], dry_run=False, allow_production=True
-    )
+    result = exporter.export_production_orders_to_1c(db, [order.order_id], dry_run=False)
     assert result["orders_created"] == 1
     assert len(fake.posts) == 1
 

@@ -259,7 +259,6 @@ def test_combined_live_closes_both_orders_and_links_both_manufactures(db_session
         weld_manufacture_id=ctx["weld"]["m"].manufacture_id,
         paint_manufacture_id=ctx["paint"]["m"].manufacture_id,
         dry_run=False,
-        allow_production=True,
     )
 
     assert result["status"] == "ok"
@@ -304,7 +303,6 @@ def test_combined_repeat_is_noop(db_session, monkeypatch):
         weld_manufacture_id=ctx["weld"]["m"].manufacture_id,
         paint_manufacture_id=ctx["paint"]["m"].manufacture_id,
         dry_run=False,
-        allow_production=True,
     )
     assert first["status"] == "ok"
     posts_after_first = len(fake.posts)
@@ -314,7 +312,6 @@ def test_combined_repeat_is_noop(db_session, monkeypatch):
         weld_manufacture_id=ctx["weld"]["m"].manufacture_id,
         paint_manufacture_id=ctx["paint"]["m"].manufacture_id,
         dry_run=False,
-        allow_production=True,
     )
     assert second["status"] == "existing"
     assert len(fake.posts) == posts_after_first
@@ -404,7 +401,6 @@ def test_close_chain_live_exports_combined_and_closes_orders(db_session, monkeyp
         db_session,
         product_id=ctx["paint"]["product"].product_id,
         dry_run=False,
-        allow_production=True,
     )
 
     assert result["status"] == "ok"
@@ -440,7 +436,6 @@ def test_close_chain_partial_export_keeps_posted_side_and_resumes(db_session, mo
         db_session,
         product_id=ctx["paint"]["product"].product_id,
         dry_run=False,
-        allow_production=True,
     )
 
     assert first["status"] == "partial"
@@ -468,7 +463,6 @@ def test_close_chain_partial_export_keeps_posted_side_and_resumes(db_session, mo
         db_session,
         product_id=ctx["paint"]["product"].product_id,
         dry_run=False,
-        allow_production=True,
     )
 
     assert second["status"] == "ok"
@@ -531,7 +525,6 @@ def test_close_chain_does_not_force_order_completion_on_partial_output(
         db_session,
         product_id=ctx["paint"]["product"].product_id,
         dry_run=False,
-        allow_production=True,
     )
 
     assert result["status"] == "ok"

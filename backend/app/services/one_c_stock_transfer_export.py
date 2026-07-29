@@ -4,10 +4,9 @@ Pattern: mirrors one_c_production_order_export.py.
 Documentation: .docs/one_c_export_from_prodplan.md.
 
 Safety per the doc:
-1. Default dry_run=True.
-2. Refuse non-demo base_url unless allow_production=True.
-3. Posted=false (proceedng stays on 1C admin side).
-4. Idempotency via sync_link (source_doctype='material_issue').
+1. Default dry_run=True (full preview, nothing is written).
+2. Posted=false (proceedng stays on 1C admin side).
+3. Idempotency via sync_link (source_doctype='material_issue').
 
 A material issue in PRODPLAN models the warehouse-to-workshop transfer of
 the components needed for one production_products line. In 1C this is a
@@ -542,7 +541,6 @@ def _chain_export_parent_orders(
     issue_ids: List[int],
     *,
     dry_run: bool,
-    allow_production: bool,
 ) -> Optional[Dict[str, Any]]:
     """
     Per .docs/one_c_export_from_prodplan.md: a transfer document MUST be
@@ -573,7 +571,6 @@ def _chain_export_parent_orders(
             db,
             mrp_order_ids,
             dry_run=dry_run,
-            allow_production=allow_production,
         )
         if mrp_order_ids
         else {}
@@ -594,7 +591,6 @@ def export_material_issues_to_1c(
     issue_ids: List[int],
     *,
     dry_run: bool = True,
-    allow_production: bool = False,
 ) -> Dict[str, Any]:
     """
     Export selected ProductionMaterialIssues to 1C as Document_ПеремещениеЗапасов
@@ -620,7 +616,7 @@ def export_material_issues_to_1c(
             + ", ".join(str(value) for value in sorted(invalid))
         )
     parent_export = _chain_export_parent_orders(
-        db, list(issue_ids), dry_run=dry_run, allow_production=allow_production
+        db, list(issue_ids), dry_run=dry_run
     )
     entries, skipped = _collect_export_entries(db, list(issue_ids))
 
@@ -678,12 +674,7 @@ def export_material_issues_to_1c(
         summary["payloads"] = payloads
         return summary
 
-    client = _create_odata_client(
-        config,
-        OData1CClient,
-        allow_production=allow_production,
-        require_demo_base=True,
-    )
+    client = _create_odata_client(config, OData1CClient)
     for entry, payload in zip(eligible, payloads):
         add_source_cells_to_payload(client, entry, payload["payload"])
 

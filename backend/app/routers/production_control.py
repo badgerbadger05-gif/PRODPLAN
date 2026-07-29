@@ -547,12 +547,15 @@ class UpdateQuantityPayload(BaseModel):
 class ExportProductionOrdersPayload(BaseModel):
     order_ids: List[int]
     dry_run: bool = True
+    # DEPRECATED: демо-гард записи удалён после go-live. Поле принимается и
+    # игнорируется, чтобы существующие клиенты не получали 422.
     allow_production: bool = False
 
 
 class ExportMaterialIssuesPayload(BaseModel):
     issue_ids: List[int]
     dry_run: bool = True
+    # DEPRECATED, см. ExportProductionOrdersPayload: принимается, не влияет.
     allow_production: bool = False
 
 
@@ -566,6 +569,7 @@ class ProduceLinePayload(BaseModel):
 class ExportManufacturesPayload(BaseModel):
     manufacture_ids: List[int]
     dry_run: bool = True
+    # DEPRECATED, см. ExportProductionOrdersPayload: принимается, не влияет.
     allow_production: bool = False
 
 
@@ -578,10 +582,12 @@ class ExportPieceworkPayload(BaseModel):
     structural_unit_ref: Optional[str] = None
     business_operation_ref: Optional[str] = None
     dry_run: bool = True
+    # DEPRECATED, см. ExportProductionOrdersPayload: принимается, не влияет.
     allow_production: bool = False
 
 
 class AssembleMaterialIssuePayload(BaseModel):
+    # DEPRECATED, см. ExportProductionOrdersPayload: принимается, не влияет.
     allow_production: bool = False
 
 
@@ -859,7 +865,6 @@ def post_produce_line(
             db,
             [manufacture_id],
             dry_run=False,
-            allow_production=True,
         )
         manufacture_entry = (manufacture_export.get("entries") or [{}])[0]
         manufacture_ref = str(manufacture_entry.get("target_ref_key") or "")
@@ -880,7 +885,6 @@ def post_produce_line(
             db,
             [manufacture_id],
             dry_run=False,
-            allow_production=True,
         )
         piecework_entry = (piecework_export.get("entries") or [{}])[0]
         if (
@@ -939,10 +943,7 @@ def post_export_manufactures_to_1c(
             db,
             [int(x) for x in payload.manufacture_ids],
             dry_run=bool(payload.dry_run),
-            allow_production=bool(payload.allow_production) or not bool(payload.dry_run),
         )
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -983,10 +984,7 @@ def post_export_piecework_to_1c(
             structural_unit_ref=payload.structural_unit_ref,
             business_operation_ref=payload.business_operation_ref,
             dry_run=bool(payload.dry_run),
-            allow_production=bool(payload.allow_production) or not bool(payload.dry_run),
         )
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -1030,8 +1028,8 @@ def post_export_production_orders_to_1c(
     Safety:
     - Default `dry_run=true` returns the payload that would be sent without
       contacting 1C.
-    - To actually write, pass `dry_run=false`. Refuses non-demo base_url
-      unless `allow_production=true` is also set.
+    - To actually write, pass `dry_run=false`; запись идёт в базу 1С из
+      настроек подключения.
     """
     if not payload.order_ids:
         raise HTTPException(status_code=400, detail="Не выбраны заказы для экспорта")
@@ -1040,11 +1038,7 @@ def post_export_production_orders_to_1c(
             db,
             [int(x) for x in payload.order_ids],
             dry_run=bool(payload.dry_run),
-            allow_production=bool(payload.allow_production) or not bool(payload.dry_run),
         )
-    except PermissionError as e:
-        # Demo-DB safety guard tripped.
-        raise HTTPException(status_code=403, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -1119,8 +1113,7 @@ def post_export_material_issues_to_1c(
     (Posted=false). РРґРµРјРїРѕС‚РµРЅС‚РЅРѕ через sync_link.
 
     - `dry_run=true` (default) вЂ” возвращает payload, не пишет в 1С.
-    - `dry_run=false` вЂ” реально пишет; refuse при non-demo base_url без
-      `allow_production=true`.
+    - `dry_run=false` вЂ” реально пишет в базу 1С из настроек подключения.
     """
     if not payload.issue_ids:
         raise HTTPException(status_code=400, detail="Не выбраны документы выдачи")
@@ -1129,10 +1122,7 @@ def post_export_material_issues_to_1c(
             db,
             [int(x) for x in payload.issue_ids],
             dry_run=bool(payload.dry_run),
-            allow_production=bool(payload.allow_production) or not bool(payload.dry_run),
         )
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -1146,13 +1136,7 @@ def post_material_issue_assembled(
     db: Session = Depends(get_db),
 ):
     try:
-        return assemble_material_issue(
-            db,
-            int(issue_id),
-            allow_production=True,
-        )
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
+        return assemble_material_issue(db, int(issue_id))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

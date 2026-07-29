@@ -1001,9 +1001,7 @@ def _materialize_purchase_control_orders_to_1c(
     for group in groups:
         _stamp_group_lines(group)
 
-    client = create_odata_client(
-        _load_odata_config(), OData1CClient, allow_production=False, require_demo_base=True
-    )
+    client = create_odata_client(_load_odata_config(), OData1CClient)
 
     created = 0
     all_allocations: list[dict[str, Any]] = []

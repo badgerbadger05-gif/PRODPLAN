@@ -349,7 +349,6 @@ def test_brigade_executor_uses_brigade_type_and_composition(db_session, monkeypa
         [m.manufacture_id],
         operation_ref="op-ref",
         dry_run=False,
-        allow_production=True,
     )
 
     assert result["manufactures_created"] == 1
@@ -403,7 +402,6 @@ def test_single_executor_is_written_to_operation_rows(db_session, monkeypatch):
         [m.manufacture_id],
         operation_ref="op-ref",
         dry_run=False,
-        allow_production=True,
     )
 
     assert result["manufactures_created"] == 1

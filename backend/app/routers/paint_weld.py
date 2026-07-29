@@ -35,6 +35,8 @@ class ChainPreviewPayload(BaseModel):
 class ChainOpenPayload(ChainPreviewPayload):
     # Preview/confirm pattern as in DBR materialization: dry_run defaults to True.
     dry_run: bool = True
+    # DEPRECATED: демо-гард записи в 1С удалён после go-live. Поле принимается
+    # и игнорируется, чтобы существующие клиенты не получали 422.
     allow_production: bool = False
     initiated_by: Optional[str] = None
 
@@ -50,6 +52,7 @@ class ChainClosePayload(BaseModel):
     paint_operation_executors: Optional[list] = None
     comment: Optional[str] = None
     dry_run: bool = True
+    # DEPRECATED, см. ChainOpenPayload: принимается, не влияет.
     allow_production: bool = False
     initiated_by: Optional[str] = None
 
@@ -131,11 +134,8 @@ async def chain_open(payload: ChainOpenPayload, db: Session = Depends(get_db)):
             planned_start=payload.planned_start,
             planned_finish=payload.planned_finish,
             dry_run=bool(payload.dry_run),
-            allow_production=bool(payload.allow_production) or not bool(payload.dry_run),
             initiated_by=payload.initiated_by,
         )
-    except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -163,10 +163,7 @@ async def chain_close(payload: ChainClosePayload, db: Session = Depends(get_db))
             paint_operation_executors=payload.paint_operation_executors,
             comment=payload.comment,
             dry_run=bool(payload.dry_run),
-            allow_production=bool(payload.allow_production) or not bool(payload.dry_run),
             initiated_by=payload.initiated_by,
         )
-    except PermissionError as exc:
-        raise HTTPException(status_code=403, detail=str(exc))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
