@@ -22,41 +22,17 @@ export type PlanningRunsResponse = {
   offset: number
 }
 
-// Ledger truth states published by backend/app/services/planning_truth.py.
-export type PlanningTruthStatus = 'uninitialized' | 'building' | 'accepted' | 'stale' | 'rejected'
+export type StartPlanningRunResponse = {
+  status: string
+  run_id: number
+}
 
-// Every Ledger-bound MRP read model carries this envelope. When
-// `truth_status` is not `accepted` the payload is the `_unavailable()` stub
-// (mrp_result_snapshot.py) — empty rows and zero totals that must never be
-// rendered as real numbers.
-export type PlanningTruthEnvelope = {
-  snapshot_id?: number | null
-  ledger_generation?: number | null
-  cutoff?: string | null
-  truth_status?: PlanningTruthStatus
+export type MrpSummary = {
+  snapshot_id: number | null
+  ledger_generation: number | null
+  cutoff: string | null
+  truth_status: string
   truth_reason?: string | null
-}
-
-export type MrpRowKind = 'production' | 'purchase' | 'rework' | 'capacity'
-
-export function planningTruthStatusLabel(status: PlanningTruthStatus | undefined) {
-  if (status === 'accepted') return 'Принят'
-  if (status === 'building') return 'Строится'
-  if (status === 'stale') return 'Устарел'
-  if (status === 'rejected') return 'Отклонён'
-  if (status === 'uninitialized') return 'Не инициализирован'
-  return 'Неизвестно'
-}
-
-// A missing `truth_status` means the endpoint predates the envelope; only an
-// explicit non-accepted status blocks rendering.
-export function isPlanningTruthUsable(envelope: PlanningTruthEnvelope | null | undefined) {
-  const status = envelope?.truth_status
-  return status === undefined || status === 'accepted'
-}
-
-export type MrpSummary = PlanningTruthEnvelope & {
-  // Absent in the `_unavailable()` manifest, which carries no run summary.
   run?: PlanningRunRow
   counts?: {
     production_orders?: number
@@ -69,8 +45,6 @@ export type MrpSummary = PlanningTruthEnvelope & {
     hours_planned_total?: number
     hours_available_total?: number
   }
-  snapshot_counts?: Partial<Record<MrpRowKind, number>>
-  snapshot_total_qty?: Partial<Record<MrpRowKind, number>>
   warnings?: Array<Record<string, unknown>>
 }
 
@@ -157,11 +131,14 @@ export type MrpCapacityRow = {
   overload_hours: number
 }
 
-export type MrpPagedResponse<T> = PlanningTruthEnvelope & {
+export type MrpPagedResponse<T> = {
+  snapshot_id: number | null
+  ledger_generation: number | null
+  cutoff: string | null
+  truth_status: string
+  truth_reason?: string | null
   rows: T[]
   total: number
-  // Backend-computed sum of `qty` over the whole filtered selection, not just
-  // the returned page (mrp_result_snapshot.read_mrp_result_rows).
   total_qty?: number
   limit: number
   offset: number
@@ -180,7 +157,7 @@ export function planningStatusLabel(status: string) {
 export type PeriodPlan = {
   id: number
   name: string
-  status: 'draft' | 'fixed' | 'closed'
+  status: 'draft' | 'fixed' | 'archived'
   period_from: string
   period_to: string
   comment?: string | null
@@ -191,6 +168,20 @@ export type PeriodPlan = {
   updated_at?: string | null
   line_count?: number
   total_qty?: number
+  execution_completed_qty?: number | null
+  execution_base_qty?: number | null
+  execution_pct?: number | null
+  execution_partial?: boolean
+  execution_status?: string | null
+  execution_reason?: string | null
+  execution_by_flow?: Record<string, {
+    completed_qty: number
+    base_qty: number
+    execution_pct: number | null
+    confirmed_pct?: number | null
+    total_base_qty?: number
+    available?: boolean
+  }> | null
 }
 
 export type PeriodPlanListResponse = {
@@ -260,6 +251,21 @@ export type ExecutionWorkItem = {
   forecast_reason?: string | null
 }
 
+export type ExecutionJournalLedgerLinkEvent = {
+  event_id: number
+  sle_id?: number | null
+  fact_ref?: string | null
+  fact_line_ref?: string | null
+  match_rule?: string | null
+  reservation_id?: number | null
+}
+
+export type ExecutionJournalLedgerLinks = {
+  item_id: number
+  reservation_ids: number[]
+  events: ExecutionJournalLedgerLinkEvent[]
+}
+
 export type ExecutionJournalRow = {
   req_id: number
   item_id: number
@@ -272,18 +278,22 @@ export type ExecutionJournalRow = {
   stock_qty?: number
   net_qty: number
   ordered_qty: number
-  completed_qty: number
+  completed_qty: number | null
   covered_qty: number
   remaining_qty: number
   unassigned_qty?: number
   progress_base_qty?: number
-  coverage_pct: number
+  coverage_pct: number | null
+  execution_available?: boolean
+  execution_unavailable_reason?: string | null
+  execution_source?: 'reservation_realization' | 'supplier_receipt_coverage' | string
   need_date?: string | null
   status?: JournalRowStatus
   forecast_date?: string | null
   forecast_shift_days?: number | null
   forecast_reason?: string | null
   work_items: ExecutionWorkItem[]
+  ledger_links?: ExecutionJournalLedgerLinks | null
 }
 
 export type JournalRowStatus = 'net_zero' | 'covered' | 'partial' | 'ordered' | 'none'
@@ -292,7 +302,7 @@ export function journalRowStatus(row: Pick<ExecutionJournalRow, 'status' | 'net_
   if (row.status) return row.status
   if (row.net_qty <= 0) return 'net_zero'
   if (row.remaining_qty <= 0) return 'covered'
-  if (row.completed_qty > 0) return 'partial'
+  if ((row.completed_qty ?? 0) > 0) return 'partial'
   if (row.ordered_qty > 0) return 'ordered'
   return 'none'
 }
@@ -319,20 +329,34 @@ export type ExecutionJournalSummary = {
   partially_covered: number
   not_covered: number
   net_zero: number
-  execution_completed_qty?: number
-  execution_base_qty?: number
+  execution_completed_qty?: number | null
+  execution_base_qty?: number | null
   execution_pct?: number | null
-  execution_by_flow?: Record<
-    string,
-    {
-      completed_qty: number
-      base_qty: number
-      execution_pct: number | null
-      available?: boolean
-      confirmed_pct?: number | null
-      total_base_qty?: number
-    }
-  > | null
+  execution_confirmed_pct?: number | null
+  execution_partial?: boolean
+  execution_by_flow?: Record<string, {
+    completed_qty: number
+    base_qty: number
+    execution_pct: number | null
+    confirmed_pct?: number | null
+    covered_pct?: number | null
+    to_order_pct?: number | null
+    purchase_covered_qty?: number
+    purchase_to_order_qty?: number
+    total_base_qty?: number
+    available?: boolean
+  }> | null
+}
+
+export type PlanningTruthStatus = 'accepted' | 'unavailable' | 'stale' | 'uninitialized' | 'rejected'
+
+export type ExecutionJournalTruthMeta = {
+  accepted_at?: string | null
+  accepted_by?: string | null
+  truth_source?: string | null
+  unavailable_sections?: string[] | null
+  unavailable_reason?: string | null
+  [key: string]: unknown
 }
 
 export type ExecutionJournalResponse = {
@@ -340,12 +364,22 @@ export type ExecutionJournalResponse = {
   run_id: number
   rows: ExecutionJournalRow[]
   summary: ExecutionJournalSummary
+  truth_status?: PlanningTruthStatus | string
+  ledger_generation?: string | number | null
+  cutoff?: string | null
+  truth_meta?: ExecutionJournalTruthMeta | null
+  truth_reason?: string | null
+  reason?: string | null
+}
+
+export function isPlanningTruthAccepted(value: Pick<ExecutionJournalResponse, 'truth_status'> | null | undefined) {
+  return value?.truth_status === 'accepted'
 }
 
 export function periodPlanStatusLabel(status: string) {
   if (status === 'draft') return 'Черновик'
   if (status === 'fixed') return 'Зафиксирован'
-  if (status === 'closed') return 'Закрыт'
+  if (status === 'archived') return 'Архив'
   return status
 }
 
@@ -360,45 +394,6 @@ export function flowLabel(flow: string) {
   if (flow === 'purchase') return 'Закупка'
   if (flow === 'rework') return 'Переработка'
   return flow
-}
-
-// Preferred display order for the well-known replenishment flows; unknown
-// flow keys are appended after these in their original order.
-const FLOW_DISPLAY_ORDER = ['purchase', 'production', 'rework']
-
-export type ExecutionFlowSummaryRow = {
-  flow: string
-  label: string
-  text: string
-}
-
-// Builds the per-flow entries shown in the execution journal header, e.g.
-// "Закупка: 0%", "Производство: 98.5%", "Переработка: недоступно".
-// Every entry keeps its label; a flow with no execution data (unavailable, or
-// a null percentage) is rendered as "недоступно" instead of a fake number, and
-// an unknown flow key falls back to showing the key itself (via flowLabel).
-export function executionFlowSummary(
-  source: ExecutionJournalSummary['execution_by_flow'],
-): ExecutionFlowSummaryRow[] {
-  if (!source) return []
-  const orderOf = (flow: string) => {
-    const idx = FLOW_DISPLAY_ORDER.indexOf(flow)
-    return idx === -1 ? FLOW_DISPLAY_ORDER.length : idx
-  }
-  const keys = Object.keys(source).sort((a, b) => orderOf(a) - orderOf(b))
-  const rows: ExecutionFlowSummaryRow[] = []
-  for (const flow of keys) {
-    const entry = source[flow]
-    const base = entry?.base_qty ?? 0
-    const available = entry?.available ?? true
-    const pct = entry?.execution_pct
-    // Skip available flows with no demand (net-zero); always surface a flow
-    // that is unavailable so the operator sees the "недоступно" state.
-    if (available && base <= 1e-9) continue
-    const text = !available || typeof pct !== 'number' ? 'недоступно' : `${pct}%`
-    rows.push({ flow, label: flowLabel(flow), text })
-  }
-  return rows
 }
 
 export function flowClass(flow: string) {

@@ -80,7 +80,7 @@ export function ProductionDetailPane({
   const canEditQuantity = rowSource === 'mrp' && !activeRow?.source_mrp_allocation_key?.startsWith('1C')
   const hasMrpCoverage = activeRow?.source_mrp_requirement_id != null && activeRow?.mrp_req_net_qty != null
   const mrpRemaining = activeRow?.mrp_req_remaining_qty ?? 0
-  const canUseMaterialCoverage = !activeRow?.issue_status || activeRow.issue_status === 'not_requested'
+  const canUseMaterialCoverage = !activeRow?.issue_status || activeRow?.issue_status === 'not_requested'
   const activeCoverageStatus = (canUseMaterialCoverage ? materials?.coverage_status : '')
     || activeRow?.coverage_status
     || activeRow?.status
@@ -91,6 +91,16 @@ export function ProductionDetailPane({
     || activeCoverageStatus
   const planSourceLabel = activeRow?.source_plan_name
     || (activeRow?.source_plan_id ? `План #${activeRow.source_plan_id}` : '')
+  const dbrPlanning = activeRow?.planning?.contour === 'dbr_feeder' ? activeRow.planning : null
+  const sourceDisplayLabel = dbrPlanning ? 'DBR · очередь мехцеха' : (planSourceLabel || rowSource || '1C')
+
+  function queueStateLabel(state?: string | null) {
+    if (state === 'ready') return 'Готов к запуску'
+    if (state === 'blocked') return 'Заблокирован материалами'
+    if (state === 'not_due') return 'Срок запуска не наступил'
+    if (state === 'diagnostic') return 'Требует разбора'
+    return state || '—'
+  }
 
   function sourceLabel(source?: string | null) {
     if (source === 'supplier_order') return 'Заказ поставщику'
@@ -164,7 +174,7 @@ export function ProductionDetailPane({
                 <span>Заказ 1С</span><strong>{activeRow.order_one_c_number || activeRow.order_number}</strong>
               </>
             )}
-            <span>Источник</span><strong>{planSourceLabel || rowSource || '1C'}</strong>
+            <span>Источник</span><strong>{sourceDisplayLabel}</strong>
             <span>Остаток</span><strong>{qty(activeRow.remaining_qty)} {activeRow.unit}</strong>
             <span>Кол-во запуска</span>
             <span className="batchEditCell">
@@ -210,6 +220,29 @@ export function ProductionDetailPane({
               {batchError && <span className="batchHint error">{batchError}</span>}
             </span>
           </div>
+          {dbrPlanning && (
+            <div className="dbrPlanningBlock">
+              <div className="dbrPlanningTitle">
+                <span>Планирование DBR</span>
+                <span className={`planningBadge ${dbrPlanning.zone || 'dbr'}`}>
+                  {dbrPlanning.zone === 'red' ? 'Красная зона' : dbrPlanning.zone === 'yellow' ? 'Жёлтая зона' : dbrPlanning.zone === 'green' ? 'Зелёная зона' : 'DBR'}
+                </span>
+              </div>
+              <div className="detailGrid">
+                <span>Сигнал</span><strong>#{activeRow.source_dbr_signal_id || dbrPlanning.source_id || '—'}</strong>
+                <span>Тип</span><strong>{dbrPlanning.signal_type || '—'}</strong>
+                <span>Приоритет</span><strong>{dbrPlanning.priority ?? '—'}</strong>
+                <span>Требуется</span><strong>{dateRu(dbrPlanning.required_date) || '—'}</strong>
+                <span>Слот барабана</span><strong>{dbrPlanning.slot_id ? `#${dbrPlanning.slot_id}` : '—'}</strong>
+                <span>Состояние очереди</span><strong>{queueStateLabel(dbrPlanning.queue_state)}</strong>
+                {dbrPlanning.reason && (
+                  <>
+                    <span>Причина</span><strong>{dbrPlanning.reason}</strong>
+                  </>
+                )}
+              </div>
+            </div>
+          )}
           {hasMrpCoverage && (
             <div className="mrpCoverageBlock">
               <div className="mrpCoverageTitle">MRP потребность #{activeRow.source_mrp_requirement_id}</div>
@@ -235,7 +268,7 @@ export function ProductionDetailPane({
                 disabled={Number(activeRow.remaining_qty) <= 0}
                 title="Создать и провести СборкаЗапасов и СдельныйНаряд в 1С; факт принять после read-back"
               >
-                Произвести
+                Произвести строку
               </button>
             )}
             {activeRow && (

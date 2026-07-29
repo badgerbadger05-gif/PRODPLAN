@@ -1,24 +1,15 @@
 import { useMemo, useState } from 'react'
-import type { DistributedComponent, ResourceDistributionResult } from '../../domain/stageDistribution'
-import { dateTimeRu, qty } from '../../lib/format'
+import type { ResourceDistributionResult } from '../../domain/stageDistribution'
+import { dateTimeRu } from '../../lib/format'
 import { calculateResourceDistribution } from '../../services/stageDistribution'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
-
-function aggregateComponents(rows: DistributedComponent[]) {
-  const map = new Map<string, DistributedComponent>()
-  rows.forEach((row) => {
-    const key = `${row.item_id}:${row.stage_id ?? 'null'}`
-    const existing = map.get(key)
-    if (!existing) {
-      map.set(key, { ...row })
-      return
-    }
-    existing.qty_per_unit = Number(existing.qty_per_unit || 0) + Number(row.qty_per_unit || 0)
-    existing.norm_hours_total = Number(existing.norm_hours_total || 0) + Number(row.norm_hours_total || 0)
-  })
-  return Array.from(map.values())
-}
+import {
+  ResourceTabs,
+  StageDistributionControls,
+  StageDistributionTable,
+} from './stage-distribution/components'
+import { aggregateComponents, flattenResourceComponents } from './stage-distribution/model'
 
 export function StageDistributionPage() {
   const [resources, setResources] = useState<ResourceDistributionResult[]>([])
@@ -31,7 +22,7 @@ export function StageDistributionPage() {
 
   const active = useMemo(() => resources.find((row) => row.resource_id === activeId) ?? resources[0] ?? null, [resources, activeId])
   const components = useMemo(() => {
-    const rows = (active?.products ?? []).flatMap((product) => product.components.map((component) => ({ ...component, root: product.root_item_name })))
+    const rows = flattenResourceComponents(active)
     return aggregate ? aggregateComponents(rows) : rows
   }, [active, aggregate])
 
@@ -77,57 +68,27 @@ export function StageDistributionPage() {
           />
         )}
       >
-        <div className="commandBar">
-          <button className="primary" onClick={() => void calculate()} disabled={loading}>Рассчитать</button>
-          <label className="inlineControl">
-            <input type="checkbox" checked={aggregate} onChange={(e) => setAggregate(e.target.checked)} />
-            <span>Суммировать одинаковые детали</span>
-          </label>
-        </div>
+        <StageDistributionControls
+          aggregate={aggregate}
+          loading={loading}
+          onCalculate={() => void calculate()}
+          onAggregateChange={setAggregate}
+        />
 
         {error && <div className="errorLine">{error}</div>}
         {message && <div className="successLine">{message}</div>}
 
-        <div className="tabsBar">
-          {resources.map((resource) => (
-            <button key={resource.resource_id} className={resource.resource_id === active?.resource_id ? 'activeTab' : ''} onClick={() => setActiveId(resource.resource_id)}>
-              {resource.resource_name} · {qty(resource.norm_hours)} н/ч
-            </button>
-          ))}
-        </div>
+        <ResourceTabs
+          resources={resources}
+          activeResourceId={active?.resource_id ?? null}
+          onActivate={setActiveId}
+        />
 
-        <div className="tablePane resultTablePane">
-          <table className="journalTable stageDistributionTable">
-            <thead>
-              <tr>
-                <th>Деталь</th>
-                <th>Артикул</th>
-                <th>Этап</th>
-                <th>Кол-во</th>
-                <th>Остаток</th>
-                <th>Норма</th>
-                <th>Сумма н/ч</th>
-              </tr>
-            </thead>
-            <tbody>
-              {components.map((row, index) => (
-                <tr key={`${row.item_id}-${row.stage_id ?? 'x'}-${index}`}>
-                  <td className="itemCell">
-                    <strong>{row.item_name}</strong>
-                    <span>{row.item_code}</span>
-                  </td>
-                  <td>{row.item_article || ''}</td>
-                  <td>{row.stage_name || '—'}</td>
-                  <td className="numCell"><strong>{qty(row.qty_per_unit)}</strong></td>
-                  <td className="numCell"><strong>{qty(row.stock_qty)}</strong></td>
-                  <td className="numCell"><strong>{qty(row.norm_hours)}</strong></td>
-                  <td className="numCell"><strong>{qty(row.norm_hours_total)}</strong></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          {!resources.length && !loading && <div className="emptyDetail">Нажмите «Рассчитать», чтобы получить распределение</div>}
-        </div>
+        <StageDistributionTable
+          components={components}
+          hasResources={resources.length > 0}
+          loading={loading}
+        />
       </DocumentWindow>
     </main>
   )

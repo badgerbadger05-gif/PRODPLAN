@@ -1,4 +1,4 @@
-import { coverageLabels, isShelfPullRow, productionStatusOptions, productionStatusSelectValue, type OrderRow } from '../../../domain/productionControl'
+import { coverageLabels, productionStatusOptions, productionStatusSelectValue, type OrderRow } from '../../../domain/productionControl'
 import { dateRu, qty } from '../../../lib/format'
 import { sortGlyph, tableColumnStyle, tableMinWidth, type TableSortState } from '../../tableDoctype'
 import { productionOrderColumns, type ProductionOrderSortKey } from './productionOrdersDoctype'
@@ -7,7 +7,7 @@ type Props = {
   rows: OrderRow[]
   activeRow: OrderRow | null
   selectedIds: Set<number>
-  sort: TableSortState<ProductionOrderSortKey>
+  sort: { sortBy: ProductionOrderSortKey | null; sortDir: 'asc' | 'desc' }
   onSelectIds: (ids: Set<number>) => void
   onActivate: (id: number) => void
   onOpenMaterials: (row: OrderRow) => void
@@ -28,23 +28,6 @@ function ForecastShift({ row }: { row: OrderRow }) {
   return <span className={`forecastShift ${cls}`} title={title}>{label}{dateText ? ` · ${dateText}` : ''}</span>
 }
 
-// Признак источника запуска приходит готовым (`launch_source`): полка DBR
-// вытянула строку или это остаток MRP. Ничего не пересчитывается — тултип
-// только перечисляет уже посчитанные backend-ом величины полки.
-function ShelfPullBadge({ row }: { row: OrderRow }) {
-  if (!isShelfPullRow(row)) return null
-  const title = [
-    'Запуск вытянут полкой DBR',
-    row.shelf_pull_qty === null || row.shelf_pull_qty === undefined ? null : `вытягивание ${qty(row.shelf_pull_qty)}`,
-    row.shelf_materialized_qty === null || row.shelf_materialized_qty === undefined
-      ? null
-      : `материализовано ${qty(row.shelf_materialized_qty)}`,
-    row.shelf_latest_start_date ? `запуск не позже ${dateRu(row.shelf_latest_start_date)}` : null,
-    row.shelf_warehouse_ref1c ? `склад полки ${row.shelf_warehouse_ref1c}` : null,
-  ].filter(Boolean).join(' · ')
-  return <span className="miniPill shelfPull" title={title}>Полка</span>
-}
-
 function orderSubline(row: OrderRow) {
   if (row.order_ref1c) return row.order_one_c_number || (row.order_source === '1c' ? row.order_number : 'Открыт в 1С')
   return `${dateRu(row.order_date)} · стр. ${row.line_number || '—'}`
@@ -54,9 +37,16 @@ function orderMainLine(row: OrderRow) {
   return row.order_prodplan_number || row.order_number
 }
 
+function planningZoneLabel(zone?: string | null) {
+  if (zone === 'red') return 'Красная зона'
+  if (zone === 'yellow') return 'Жёлтая зона'
+  if (zone === 'green') return 'Зелёная зона'
+  return zone || 'DBR'
+}
+
 export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSelectIds, onActivate, onOpenMaterials, onChangeStatus, onToggleSort }: Props) {
   return (
-    <table className="journalTable productionOrdersTable" style={{ minWidth: tableMinWidth(productionOrderColumns) }}>
+    <table aria-label="Заказы на производство" className="journalTable productionOrdersTable" style={{ minWidth: tableMinWidth(productionOrderColumns) }}>
       <colgroup>
         {productionOrderColumns.map((column) => (
           <col key={column.key} className={column.grow ? 'growCol' : undefined} style={tableColumnStyle(column)} />
@@ -65,10 +55,17 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
       <thead>
         <tr>
           {productionOrderColumns.map((column) => (
-            <th key={column.key} className={column.className} style={tableColumnStyle(column)}>
+            <th
+              key={column.key}
+              className={column.className}
+              style={tableColumnStyle(column)}
+              aria-sort={column.sortable && sort.sortBy === column.key ? (sort.sortDir === 'asc' ? 'ascending' : 'descending') : undefined}
+            >
               {column.sortable ? (
                 <button type="button" className="tableSortButton" onClick={() => onToggleSort(column.key as ProductionOrderSortKey)}>
-                  {column.title}{sortGlyph(sort, column.key as ProductionOrderSortKey)}
+                  {column.title}{sort.sortBy === column.key
+                    ? sortGlyph(sort as TableSortState<ProductionOrderSortKey>, column.key as ProductionOrderSortKey)
+                    : ''}
                 </button>
               ) : column.title}
             </th>
@@ -77,10 +74,32 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
       </thead>
       <tbody>
         {rows.map((row) => (
-          <tr key={row.product_id} className={row.product_id === activeRow?.product_id ? 'activeRow' : ''} onClick={() => onActivate(row.product_id)} onDoubleClick={() => onOpenMaterials(row)}>
+          <tr
+            key={row.product_id}
+            className={row.product_id === activeRow?.product_id ? 'activeRow' : ''}
+            tabIndex={0}
+            aria-selected={row.product_id === activeRow?.product_id}
+            onClick={() => onActivate(row.product_id)}
+            onDoubleClick={() => onOpenMaterials(row)}
+            onKeyDown={(event) => {
+              if (event.target !== event.currentTarget) return
+              if (event.key === 'Enter') {
+                event.preventDefault()
+                onActivate(row.product_id)
+                onOpenMaterials(row)
+              } else if (event.key === ' ') {
+                event.preventDefault()
+                const next = new Set(selectedIds)
+                if (next.has(row.product_id)) next.delete(row.product_id)
+                else next.add(row.product_id)
+                onSelectIds(next)
+              }
+            }}
+          >
             <td className="checkCol">
               <input
                 type="checkbox"
+                aria-label={`Выбрать заказ ${orderMainLine(row)}`}
                 checked={selectedIds.has(row.product_id)}
                 onChange={(e) => {
                   const next = new Set(selectedIds)
@@ -114,7 +133,18 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
               </strong>
               <span title={row.item_article || row.item_code || ''}>
                 {row.item_article || row.item_code || ''}
-                <ShelfPullBadge row={row} />
+                {row.planning?.contour === 'dbr_feeder' && (
+                  <span
+                    className={`planningBadge ${row.planning.zone || 'dbr'}`}
+                    title={[
+                      planningZoneLabel(row.planning.zone),
+                      row.planning.priority != null ? `приоритет ${row.planning.priority}` : null,
+                      row.planning.signal_type,
+                    ].filter(Boolean).join(' · ')}
+                  >
+                    DBR{row.planning.priority != null ? ` ${row.planning.priority}` : ''}
+                  </span>
+                )}
               </span>
             </td>
             <td className="numCell">
@@ -122,13 +152,10 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
               <span>/ {qty(row.quantity)} {row.unit || ''}</span>
             </td>
             <td className="dateCell">
-              <span>С: {dateRu(row.planned_start_date) || '—'}</span>
+              <span>
+                {row.planning?.contour === 'dbr_feeder' ? 'Нужно' : 'С'}: {dateRu(row.planning?.required_date || row.planned_start_date) || '—'}
+              </span>
               <span>По: {dateRu(row.planned_finish_date) || '—'}</span>
-              {row.shelf_latest_start_date && (
-                <span className="shelfStartDate" title="Крайний срок запуска строки по полке DBR">
-                  Запуск до: {dateRu(row.shelf_latest_start_date)}
-                </span>
-              )}
               <ForecastShift row={row} />
             </td>
             <td>
@@ -136,7 +163,7 @@ export function ProductionOrdersTable({ rows, activeRow, selectedIds, sort, onSe
               <span className="muted">{row.stage_name || ''}</span>
             </td>
             <td>
-              <select value={productionStatusSelectValue(row.status)} onChange={(e) => onChangeStatus(row, e.target.value)} onClick={(e) => e.stopPropagation()}>
+              <select aria-label={`Статус заказа ${orderMainLine(row)}`} value={productionStatusSelectValue(row.status)} onChange={(e) => onChangeStatus(row, e.target.value)} onClick={(e) => e.stopPropagation()}>
                 {manualProductionStatusOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
               </select>
             </td>

@@ -1,93 +1,124 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { ApiError, api, problemMessage, unavailableTruth } from './api'
 
-afterEach(() => {
-  vi.unstubAllGlobals()
-})
+import { ApiError, api, apiText, onApiUnauthorized, setApiAccessTokenProvider } from './api'
 
-function respond(status: number, body: unknown) {
-  vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
-    ok: false,
-    status,
-    text: async () => JSON.stringify(body),
-  }))
-}
-
-describe('problemMessage', () => {
-  it('reads the structured truth detail instead of dumping JSON', () => {
-    expect(problemMessage({
-      code: 'planning_truth_unavailable',
-      consumer: 'drum_schedule',
-      truth_status: 'stale',
-      ledger_generation: 42,
-      reason: 'Accepted generation exceeded freshness threshold',
-    })).toBe('Accepted generation exceeded freshness threshold (поколение устарело, поколение #42)')
+describe('api transport', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+    setApiAccessTokenProvider(null)
   })
 
-  it('falls back to the code when the reason was overwritten with null', () => {
-    expect(problemMessage({
-      code: 'drum_schedule_unavailable',
-      reason: null,
-      truth_status: 'accepted',
-      ledger_generation: 7,
-    })).toBe('расписание барабана отсутствует для принятого поколения (accepted, поколение #7)')
+  it('returns a successful JSON response', async () => {
+    const payload = { id: 42, status: 'posted' }
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(api<typeof payload>('/ledger/postings/42')).resolves.toEqual(payload)
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/ledger/postings/42',
+      expect.objectContaining({
+        headers: expect.objectContaining({ 'Content-Type': 'application/json' }),
+      }),
+    )
   })
 
-  it('still prefers the human message of a structured conflict body', () => {
-    expect(problemMessage({ message: 'Дефицит компонентов', deficit_lines: [] }))
-      .toBe('Дефицит компонентов')
+  it('returns undefined for a successful 204 response', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status: 204 })))
+
+    await expect(api<void>('/session', { method: 'DELETE' })).resolves.toBeUndefined()
   })
 
-  it('returns null when nothing known is present', () => {
-    expect(problemMessage({ deficit_lines: [] })).toBeNull()
-    expect(problemMessage([{ loc: ['body'] }])).toBeNull()
-  })
-})
+  it('returns text through the shared transport', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+      new Response('<html>Маршрутный лист</html>', {
+        status: 200,
+        headers: { 'Content-Type': 'text/html' },
+      }),
+    ))
 
-describe('api error mapping', () => {
-  it('throws a readable message for a structured 503', async () => {
-    respond(503, {
-      detail: {
-        code: 'assembly_queue_unavailable',
-        reason: 'assembly queue snapshot is missing',
-        truth_status: 'uninitialized',
-        ledger_generation: null,
-      },
-    })
-
-    await expect(api('/v1/production-control/assembly-queue')).rejects.toMatchObject({
-      status: 503,
-      message: 'assembly queue snapshot is missing (поколение Ledger не опубликовано)',
-    })
+    await expect(apiText('/print')).resolves.toContain('Маршрутный лист')
   })
 
-  it('keeps stringifying a detail with no known field', async () => {
-    respond(400, { detail: { rows: [1, 2] } })
+  it('preserves structured error detail in ApiError', async () => {
+    const detail = {
+      message: 'Проводка не сбалансирована',
+      deficit_lines: [{ account: 'materials', amount: 125 }],
+    }
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ detail }), {
+          status: 409,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      ),
+    )
 
-    await expect(api('/v1/anything')).rejects.toMatchObject({
-      message: '{"rows":[1,2]}',
-    })
+    const request = api('/ledger/postings')
+
+    await expect(request).rejects.toMatchObject({
+      name: 'ApiError',
+      message: detail.message,
+      status: 409,
+      detail,
+    } satisfies Partial<ApiError>)
   })
-})
 
-describe('unavailableTruth', () => {
-  it('recognises a structured 503 as an unavailable truth, not a transport error', () => {
-    const error = new ApiError('x', 503, {
-      code: 'shelf_projection_unavailable',
-      reason: 'shelf projection is missing for accepted generation',
-      truth_status: 'accepted',
-      ledger_generation: 5,
-    })
+  it('notifies unauthorized listeners for a 401 response', async () => {
+    const unauthorized = vi.fn()
+    const unsubscribe = onApiUnauthorized(unauthorized)
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ detail: 'Сессия истекла' }), {
+          status: 401,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      ),
+    )
 
-    expect(unavailableTruth(error)).toEqual({
-      reason: 'shelf projection is missing for accepted generation (accepted, поколение #5)',
-      code: 'shelf_projection_unavailable',
-    })
+    try {
+      await expect(api('/protected')).rejects.toMatchObject({ status: 401 })
+      expect(unauthorized).toHaveBeenCalledOnce()
+    } finally {
+      unsubscribe()
+    }
   })
 
-  it('ignores other statuses and plain errors', () => {
-    expect(unavailableTruth(new ApiError('boom', 500, { code: 'x' }))).toBeNull()
-    expect(unavailableTruth(new ApiError('boom', 503, 'plain text'))).toBeNull()
-    expect(unavailableTruth(new Error('offline'))).toBeNull()
+  it('does not notify unauthorized listeners for a 403 response', async () => {
+    const unauthorized = vi.fn()
+    const unsubscribe = onApiUnauthorized(unauthorized)
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ detail: 'Недостаточно прав' }), {
+          status: 403,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      ),
+    )
+
+    try {
+      await expect(api('/admin-only')).rejects.toMatchObject({ status: 403 })
+      expect(unauthorized).not.toHaveBeenCalled()
+    } finally {
+      unsubscribe()
+    }
+  })
+
+  it('still throws the ApiError when an unauthorized listener fails', async () => {
+    const unsubscribe = onApiUnauthorized(() => { throw new Error('listener failure') })
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('unauthorized', { status: 401 })))
+    try {
+      await expect(api('/protected')).rejects.toMatchObject({ status: 401 })
+    } finally {
+      unsubscribe()
+    }
   })
 })

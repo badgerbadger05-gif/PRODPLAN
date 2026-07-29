@@ -36,7 +36,7 @@ export function ProductionFilterBar({ filters, resources, onChange, onSubmit, on
           <td></td>
           <td>
             <button className="filterBtn columnFilterButton" onClick={() => onToggleSort('planned_start_date')}>
-              План {filters.sort_dir === 'asc' ? '▲' : '▼'}
+              План {filters.sort_by === 'planned_start_date' ? (filters.sort_dir === 'asc' ? '▲' : '▼') : ''}
             </button>
           </td>
           <td>

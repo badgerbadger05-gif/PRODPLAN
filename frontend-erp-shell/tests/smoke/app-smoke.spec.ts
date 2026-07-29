@@ -1,43 +1,158 @@
-import { expect, test } from '@playwright/test'
+import { expect, test, type Page } from '@playwright/test'
 
-const sections = [
-  { nav: 'Планирование выпуска', title: 'Планирование выпуска' },
-  { nav: 'Очередь сборки', title: 'Очередь сборки' },
-  { nav: 'Барабан', title: 'Барабан' },
-  { nav: 'Полки', title: 'Полки' },
-  { nav: 'Журнал заказов', title: 'Журнал заказов на производство' },
-  { nav: 'MRP прогоны', title: 'MRP планирование' },
-  { nav: 'Ресурсы', title: 'Производственные ресурсы' },
-  { nav: 'Распределение этапов', title: 'Распределение этапов' },
-  { nav: 'Спецификации', title: 'Спецификации' },
-  { nav: 'Синхронизация', title: 'Синхронизация 1С OData' },
-]
+const planningRun = {
+  run_id: 42,
+  status: 'completed',
+  started_at: '2026-07-20T10:00:00',
+  finished_at: '2026-07-20T10:05:00',
+  period_from: '2026-07-21',
+  period_to: '2026-07-31',
+  source_plan_id: 7,
+  source_plan_name: 'Июль',
+  requirement_count: 120,
+  requirement_remaining_qty: 15,
+  order_count: 18,
+  purchase_count: 6,
+  overload_buckets: 2,
+}
 
-test('opens the ERP shell and critical sections', async ({ page, request }) => {
+const transfer = {
+  issue_id: 5,
+  document_number: 'ПМ-000005',
+  status: 'exported',
+  product_id: 11,
+  order_id: 12,
+  order_number: 'ЗСНФ-001',
+  order_prodplan_number: 'ПП-001',
+  order_one_c_number: 'ЗСНФ-001',
+  order_ref1c: 'order-ref',
+  item_name: 'Корпус редуктора',
+  item_article: 'КР-01',
+  quantity: 10,
+  remaining_qty: 4,
+  unit: 'шт',
+  source_warehouse_ref1c: 'wh-source',
+  source_warehouse_name: 'Заготовительный участок',
+  warehouse_ref1c: 'wh-destination',
+  destination_warehouse_name: 'Сборочный участок',
+  exported_ref1c: 'transfer-ref',
+  one_c_number: 'ПТ-000005',
+  can_assemble: true,
+  line_status: 'to_move',
+  lines_count: 1,
+}
+
+async function mockApi(page: Page) {
+  await page.route('**/api/**', async (route) => {
+    const url = new URL(route.request().url())
+    if (url.pathname === '/api/v1/plan/runs') {
+      await route.fulfill({ json: { rows: [planningRun], total: 1, limit: 30, offset: 0 } })
+      return
+    }
+    if (url.pathname === '/api/v1/resources/') {
+      await route.fulfill({ json: [] })
+      return
+    }
+    if (url.pathname.includes('/warehouses')) {
+      await route.fulfill({ json: { rows: [], total: 0, selected_total: 0 } })
+      return
+    }
+    if (url.pathname === '/api/v1/production-control/material-issues') {
+      await route.fulfill({
+        json: {
+          rows: [transfer],
+          total: 1,
+          limit: 100,
+          offset: 0,
+          source_warehouses: [{
+            warehouse_ref1c: 'wh-source',
+            warehouse_name: 'Заготовительный участок',
+          }],
+        },
+      })
+      return
+    }
+    if (url.pathname === '/api/v1/production-control/material-issues/5') {
+      await route.fulfill({
+        json: {
+          ...transfer,
+          lines: [{
+            line_id: 9,
+            component_item_id: 15,
+            item_name: 'Втулка',
+            item_article: 'ВТ-15',
+            required_qty: 4,
+            issued_qty: 3,
+            line_status: 'planned',
+          }],
+        },
+      })
+      return
+    }
+    await route.fulfill({ status: 200, json: { rows: [], total: 0 } })
+  })
+}
+
+test.beforeEach(async ({ page }) => {
+  await mockApi(page)
+})
+
+async function loginAs(page: Page, role: 'admin' | 'viewer') {
+  await page.getByRole('button', { name: 'Выйти' }).click()
+  await expect(page.getByRole('heading', { name: 'PRODPLAN' })).toBeVisible()
+  await page.getByLabel('Логин').fill(role)
+  await page.getByRole('button', { name: 'Войти' }).click()
+  await expect(page.getByText(`Демо · ${role}`)).toBeVisible()
+}
+
+test('opens the lazy ERP shell without a backend', async ({ page }) => {
   const consoleErrors: string[] = []
   page.on('console', (message) => {
-    if (
-      message.type() === 'error'
-      && !message.text().startsWith('Failed to load resource:')
-    ) {
-      consoleErrors.push(message.text())
-    }
+    if (message.type() === 'error') consoleErrors.push(message.text())
   })
-  page.on('pageerror', (error) => {
-    consoleErrors.push(error.message)
-  })
-
-  const health = await request.get('http://127.0.0.1:8000/health')
-  expect(health.ok(), 'Backend must be running on http://127.0.0.1:8000').toBeTruthy()
+  page.on('pageerror', (error) => consoleErrors.push(error.message))
 
   await page.goto('/')
   await expect(page.locator('.brand').getByText('PRODPLAN', { exact: true })).toBeVisible()
   await expect(page.getByRole('heading', { name: 'Главная' })).toBeVisible()
+  await expect(page.getByText('#42')).toBeVisible()
 
-  for (const section of sections) {
-    await page.getByRole('link', { name: section.nav, exact: true }).click()
-    await expect(page.getByRole('heading', { name: section.title, exact: true })).toBeVisible()
-  }
+  const sessionBox = await page.locator('.sessionBadgeTop').boundingBox()
+  const logoBox = await page.locator('.navLogoSlot img').boundingBox()
+  expect(sessionBox).not.toBeNull()
+  expect(logoBox).not.toBeNull()
+  expect(sessionBox!.y).toBeLessThan(34)
+  expect(sessionBox!.x).toBeGreaterThan(logoBox!.x + logoBox!.width)
+
+  await page.getByRole('link', { name: 'MRP прогоны' }).click()
+  await expect(page.getByRole('heading', { name: 'MRP планирование' })).toBeVisible()
+  await expect(page.getByText('Прогон #42')).toBeVisible()
+
+  await page.getByRole('link', { name: 'Заявки перемещений' }).click()
+  await expect(page.getByRole('heading', { name: 'Заявки на перемещение' })).toBeVisible()
+  await expect(page.getByText('ПМ-000005')).toBeVisible()
+  await expect(page.getByText('Втулка')).toBeVisible()
 
   expect(consoleErrors).toEqual([])
+})
+
+test('keeps admin navigation complete and filters viewer navigation', async ({ page }) => {
+  await page.goto('/')
+
+  await expect(page.getByText('Демо · admin')).toBeVisible()
+  await expect(page.getByRole('link', { name: /Планирование выпуска/ })).toBeVisible()
+  await expect(page.getByRole('link', { name: /Журнал закупок/ })).toBeVisible()
+  await expect(page.getByRole('link', { name: 'Синхронизация' })).toBeVisible()
+
+  await loginAs(page, 'viewer')
+
+  await expect(page.getByRole('link', { name: /MRP прогоны/ })).toBeVisible()
+  await expect(page.getByRole('link', { name: /Заявки перемещений/ })).toBeVisible()
+  await expect(page.getByRole('link', { name: /Ledger/ })).toBeVisible()
+  await expect(page.getByRole('link', { name: /Планирование выпуска/ })).toHaveCount(0)
+  await expect(page.getByRole('link', { name: /Журнал закупок/ })).toHaveCount(0)
+  await expect(page.getByRole('link', { name: 'Синхронизация' })).toHaveCount(0)
+
+  await page.evaluate(() => { window.location.hash = '/sync' })
+  await expect(page.getByRole('alert')).toHaveText('Нет доступа к разделу')
 })

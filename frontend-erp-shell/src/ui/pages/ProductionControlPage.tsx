@@ -2,83 +2,62 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useSearchParams } from 'react-router-dom'
 import {
   coverageLabels,
-  paintWeldChainSidesLabel,
-  paintWeldChainStateLabel,
-  type MaterialIssueCreatePayload,
   type ControlWarehouse,
   type MaterialIssueCreateResponse,
   type MaterialsResponse,
   type OrderRow,
-  type PaintWeldChainSide,
-  type PaintWeldChainState,
   type ProductionFilters,
   type WarehouseCandidate,
   type WorkshopWarehouse,
 } from '../../domain/productionControl'
 import type { ProductionResource } from '../../domain/resources'
-import { updateItemOptimalBatch } from '../../services/items'
 import { getPeriodPlanMatrix, listPeriodPlans } from '../../services/periodPlan'
 import {
-  cancelLocalProductionOrder,
-  closePaintWeldChain,
-  createMaterialIssues as createMaterialIssuesAction,
+  deleteProductionOrder,
   exportMaterialIssuesTo1C,
+  fetchRouteSheetsPrintHtml,
+  getItem,
   getOrderMaterials,
-  getProductionSettings,
+  getProductionControlSettings,
   listProductionOrders,
-  listProductionResources,
-  printRouteSheets,
+  postMaterialIssues,
   produceOrderLine,
   refreshOrderMaterials,
   returnLeftoverComponents,
-  saveProductionSettings,
+  saveProductionControlSettings,
   syncPostedTransfers,
+  updateItem,
   updateOrderQuantity,
-  updateOrderState,
+  updateOrderStatus,
 } from '../../services/productionControl'
+import { listResources } from '../../services/resources'
 import { DocumentWindow } from '../layout/DocumentWindow'
-import { RootProductFilterDialog, rootProductLabel, type RootProductOption } from '../RootProductFilterDialog'
+import { RootProductFilterDialog } from '../RootProductFilterDialog'
+import { rootProductLabel, type RootProductOption } from '../rootProductOptions'
 import { StatusBar } from '../layout/StatusBar'
 import { ProductionCommandBar } from './production-control/ProductionCommandBar'
 import { ProductionDetailPane } from './production-control/ProductionDetailPane'
 import { ProductionFilterBar } from './production-control/ProductionFilterBar'
 import { ProductionOrdersTable } from './production-control/ProductionOrdersTable'
 import { ProductionSettingsPane } from './production-control/ProductionSettingsPane'
+import { ProductionViewBar } from './production-control/ProductionViewBar'
 import type { ProductionOrderSortKey } from './production-control/productionOrdersDoctype'
-
-const limit = 100
-const coverageDrivenStatuses = new Set(['shortage', 'partial', 'ready'])
-
-function recordArray(value: unknown): Array<Record<string, unknown>> {
-  return Array.isArray(value) ? value.filter((row): row is Record<string, unknown> => Boolean(row) && typeof row === 'object') : []
-}
-
-// Незакрытая до конца цепочка «окраска↔сварка»: что уже в 1С, что осталось и
-// какую строку нужно докатить повторным вызовом того же закрытия.
-type ChainResumeNotice = {
-  productId: number
-  message: string
-  chainState: PaintWeldChainState
-  postedSides: PaintWeldChainSide[]
-  pendingSides: PaintWeldChainSide[]
-}
-
-function firstExportProblem(...summaries: Array<Record<string, unknown> | null | undefined>) {
-  for (const summary of summaries) {
-    if (!summary) continue
-    for (const entry of recordArray(summary.entries)) {
-      const problem = entry.error || entry.reason
-      if (problem) return String(problem)
-    }
-    for (const row of recordArray(summary.skipped_rows)) {
-      const problem = row.error || row.reason
-      if (problem) return String(problem)
-    }
-  }
-  return ''
-}
+import { WarehousePickerDialog } from './production-control/WarehousePickerDialog'
+import { firstExportProblem, issueIdsFromCreateResult, limit } from './production-control/helpers'
+import {
+  activeProductionRow,
+  applyMaterialCoverage,
+  buildProductionOrderParams,
+  buildProductionSettingsPayload,
+  nextProductionSort,
+  productionPagination,
+  selectedProductionRows,
+} from './production-control/model'
 
 export function ProductionControlPage() {
+  const listRequestSeq = useRef(0)
+  const materialsRequestSeq = useRef(0)
+  const dangerousMutationLocked = useRef(false)
   const [searchParams] = useSearchParams()
   const focusProductId = searchParams.get('product_id')
   const focusOrderId = searchParams.get('order_id')
@@ -99,13 +78,13 @@ export function ProductionControlPage() {
     workshop_id: '',
     coverage_status: '',
     root_item_id: '',
+    planning_contour: '',
     sort_by: 'planned_start_date',
     sort_dir: 'asc',
   })
   const filtersRef = useRef(filters)
   const offsetRef = useRef(offset)
   const [message, setMessage] = useState('')
-  const [chainResume, setChainResume] = useState<ChainResumeNotice | null>(null)
   const [resources, setResources] = useState<ProductionResource[]>([])
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsSaving, setSettingsSaving] = useState(false)
@@ -127,26 +106,24 @@ export function ProductionControlPage() {
     offsetRef.current = offset
   }, [offset])
 
-  const activeRow = useMemo(() => rows.find((row) => row.product_id === activeId) ?? rows[0] ?? null, [rows, activeId])
-  const selectedRows = useMemo(() => rows.filter((row) => selectedIds.has(row.product_id)), [rows, selectedIds])
+  const activeRow = useMemo(() => activeProductionRow(rows, activeId), [rows, activeId])
+  const selectedRows = useMemo(() => selectedProductionRows(rows, selectedIds), [rows, selectedIds])
+
   const load = useCallback(async (nextOffset: number) => {
+    const requestSeq = ++listRequestSeq.current
     setLoading(true)
     setError('')
     setMessage('')
     try {
-      const data = await listProductionOrders({
-        limit,
+      const params = buildProductionOrderParams({
+        filters: filtersRef.current,
         offset: nextOffset,
+        limit,
         focusProductId,
         focusOrderId,
-        search: filtersRef.current.search,
-        status: filtersRef.current.status,
-        workshop_id: filtersRef.current.workshop_id,
-        coverage_status: filtersRef.current.coverage_status,
-        root_item_id: filtersRef.current.root_item_id,
-        sort_by: filtersRef.current.sort_by,
-        sort_dir: filtersRef.current.sort_dir,
       })
+      const data = await listProductionOrders(params)
+      if (requestSeq !== listRequestSeq.current) return
       setRows(data.rows ?? [])
       setTotal(data.total ?? 0)
       setRunId(data.latest_run_id ?? null)
@@ -158,15 +135,16 @@ export function ProductionControlPage() {
         return data.rows?.[0]?.product_id ?? null
       })
     } catch (e) {
+      if (requestSeq !== listRequestSeq.current) return
       setError(e instanceof Error ? e.message : String(e))
     } finally {
-      setLoading(false)
+      if (requestSeq === listRequestSeq.current) setLoading(false)
     }
   }, [focusOrderId, focusProductId])
 
   const loadResources = useCallback(async () => {
     try {
-      setResources(await listProductionResources())
+      setResources(await listResources())
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     }
@@ -219,8 +197,8 @@ export function ProductionControlPage() {
     setError('')
     try {
       const [settingsData, resourcesData] = await Promise.all([
-        getProductionSettings(),
-        resources.length ? Promise.resolve(resources) : listProductionResources(),
+        getProductionControlSettings(),
+        resources.length ? Promise.resolve(resources) : listResources(),
       ])
       setResources(resourcesData)
       setWarehouses(settingsData.warehouses ?? [])
@@ -237,18 +215,7 @@ export function ProductionControlPage() {
     setSettingsSaving(true)
     setError('')
     try {
-      const saved = await saveProductionSettings({
-        workshop_warehouses: workshopRows
-          .map((row) => ({
-            resource_id: row.resource_id ?? row.workshop_id,
-            workshop_id: row.workshop_id ?? row.resource_id,
-            warehouse_ref1c: row.warehouse_ref1c,
-            production_warehouse_ref1c: row.production_warehouse_ref1c ?? '',
-          }))
-          .filter((row) => row.resource_id && row.warehouse_ref1c),
-        ignored_warehouses: Array.from(ignoredRefs).map((warehouse_ref1c) => ({ warehouse_ref1c })),
-        warehouses,
-      })
+      const saved = await saveProductionControlSettings(buildProductionSettingsPayload(workshopRows, ignoredRefs))
       setWarehouses(saved.warehouses ?? [])
       setWorkshopRows(saved.workshop_warehouses ?? [])
       setIgnoredRefs(new Set((saved.ignored_warehouses ?? []).map((row) => row.warehouse_ref1c).filter(Boolean)))
@@ -261,49 +228,61 @@ export function ProductionControlPage() {
     }
   }
 
-  const loadMaterials = useCallback(async (productId: number, refresh = true) => {
+  const requestMaterials = useCallback(async (
+    productId: number,
+    request: (id: number) => Promise<MaterialsResponse>,
+    updateCoverage: boolean,
+  ) => {
+    const requestSeq = ++materialsRequestSeq.current
     setActiveId(productId)
     setMaterials(null)
     try {
-      const data = refresh
-        ? await refreshOrderMaterials(productId)
-        : await getOrderMaterials(productId)
+      const data = await request(productId)
+      if (requestSeq !== materialsRequestSeq.current) return
       setMaterials(data)
       const coverageStatus = String(data.coverage_status || '')
-      if (refresh && coverageStatus) {
-        setRows((list) => list.map((item) => {
-          if (item.product_id !== productId) return item
-          const canApplyMaterialCoverage = (!item.issue_status || item.issue_status === 'not_requested')
-            && coverageDrivenStatuses.has(String(item.coverage_status || item.status || ''))
-          if (!canApplyMaterialCoverage) return item
-          return {
-            ...item,
-            status: coverageDrivenStatuses.has(String(item.status || '')) ? coverageStatus : item.status,
-            coverage_status: coverageStatus,
-            coverage_label: data.coverage_label || coverageLabels[coverageStatus] || coverageStatus,
-          }
-        }))
+      if (updateCoverage && coverageStatus) {
+        setRows((list) => applyMaterialCoverage(list, productId, coverageStatus, data.coverage_label))
       }
     } catch (e) {
+      if (requestSeq !== materialsRequestSeq.current) return
       setError(e instanceof Error ? e.message : String(e))
     }
   }, [])
+
+  const loadMaterials = useCallback(
+    (productId: number) => requestMaterials(productId, getOrderMaterials, false),
+    [requestMaterials],
+  )
+
+  const refreshMaterials = useCallback(
+    (productId: number) => requestMaterials(productId, refreshOrderMaterials, true),
+    [requestMaterials],
+  )
+
+  function beginDangerousMutation() {
+    if (dangerousMutationLocked.current) return false
+    dangerousMutationLocked.current = true
+    return true
+  }
+
+  function endDangerousMutation() {
+    dangerousMutationLocked.current = false
+  }
 
   async function changeStatus(row: OrderRow, status: string) {
     const previous = row.status
     setRows((list) => list.map((item) => item.product_id === row.product_id ? { ...item, status } : item))
     try {
-      await updateOrderState(row.product_id, { status })
+      await updateOrderStatus(row.product_id, status)
     } catch (e) {
       setRows((list) => list.map((item) => item.product_id === row.product_id ? { ...item, status: previous } : item))
       setError(e instanceof Error ? e.message : String(e))
     }
   }
 
-  async function requestMaterialIssues(sourceWarehouseRef: string | undefined, productIds: number[]) {
-    const body: MaterialIssueCreatePayload = { product_ids: productIds, initiated_by: 'erp-shell' }
-    if (sourceWarehouseRef) body.source_warehouse_ref1c = sourceWarehouseRef
-    return createMaterialIssuesAction(body)
+  function requestMaterialIssues(sourceWarehouseRef: string | undefined, productIds: number[]) {
+    return postMaterialIssues(productIds, 'erp-shell', sourceWarehouseRef)
   }
 
   function showWarehousePicker(result: MaterialIssueCreateResponse, mode: 'issues' | 'export', productIds?: number[]) {
@@ -324,13 +303,6 @@ export function ProductionControlPage() {
     return true
   }
 
-  function issueIdsFromCreateResult(result: MaterialIssueCreateResponse) {
-    return [
-      ...(result.created ?? []).map((row) => row.issue_id),
-      ...(result.reused ?? []).map((row) => row.issue_id),
-    ].filter(Boolean)
-  }
-
   function prepareRouteSheetWindow() {
     const printWindow = window.open('', '_blank')
     if (!printWindow) {
@@ -347,7 +319,7 @@ export function ProductionControlPage() {
 
   function renderRouteSheets(ids: number[], printWindow: Window | null) {
     if (!ids.length || !printWindow || printWindow.closed) return
-    void printRouteSheets(ids, { markPrinted: true, autoPrint: true })
+    void fetchRouteSheetsPrintHtml(ids)
       .then((html) => {
         printWindow.document.open()
         printWindow.document.write(html)
@@ -368,6 +340,7 @@ export function ProductionControlPage() {
   async function createMaterialIssues(sourceWarehouseRef?: string, productIds?: number[]) {
     const ids = productIds ?? Array.from(selectedIds)
     if (!ids.length) return
+    if (!beginDangerousMutation()) return
     setLoading(true)
     setError('')
     setMessage('')
@@ -388,6 +361,7 @@ export function ProductionControlPage() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
+      endDangerousMutation()
       setLoading(false)
     }
   }
@@ -412,6 +386,7 @@ export function ProductionControlPage() {
   async function exportTo1C(sourceWarehouseRef?: string, productIds?: number[]) {
     const ids = productIds ?? Array.from(selectedIds)
     if (!ids.length) return
+    if (!beginDangerousMutation()) return
     setLoading(true)
     setError('')
     setMessage('')
@@ -435,7 +410,7 @@ export function ProductionControlPage() {
         await load(offsetRef.current)
         return
       }
-      const result = await exportMaterialIssuesTo1C(issueIds, { dry_run: false, allow_production: true })
+      const result = await exportMaterialIssuesTo1C(issueIds)
       const parent = (result.parent_orders_export ?? {}) as Record<string, unknown>
       const ordersCreated = Number(parent.orders_created ?? 0)
       const ordersExisting = Number(parent.orders_already_linked ?? 0)
@@ -465,6 +440,7 @@ export function ProductionControlPage() {
       closeRouteSheetWindow(printWindow)
       setError(e instanceof Error ? e.message : String(e))
     } finally {
+      endDangerousMutation()
       setLoading(false)
     }
   }
@@ -492,8 +468,21 @@ export function ProductionControlPage() {
   }
 
   async function saveOptimalBatch(itemId: number, value: number | null) {
-    const saved = await updateItemOptimalBatch(itemId, value)
-    setRows((list) => list.map((row) => row.item_id === itemId ? { ...row, optimal_batch: saved.optimal_batch ?? null } : row))
+    const item = await getItem(itemId)
+    await updateItem(itemId, {
+      item_code: String(item.item_code ?? ''),
+      item_name: String(item.item_name ?? ''),
+      item_article: item.item_article ?? null,
+      item_ref1c: item.item_ref1c ?? null,
+      supplier_ref1c: item.supplier_ref1c ?? null,
+      replenishment_time: item.replenishment_time ?? null,
+      unit: item.unit ?? null,
+      category_id: item.category_id ?? null,
+      stock_qty: Number(item.stock_qty ?? 0),
+      optimal_batch: value,
+      status: String(item.status ?? 'active'),
+    })
+    setRows((list) => list.map((row) => row.item_id === itemId ? { ...row, optimal_batch: value } : row))
   }
 
   async function saveOrderQuantity(productId: number, value: number) {
@@ -508,11 +497,12 @@ export function ProductionControlPage() {
     } : row))
   }
 
-  async function produceActiveLine(productId?: number | null) {
+  async function produceActiveLine(productId: number | null | undefined) {
     if (!productId) return
     const activeOrder = rows.find((row) => row.product_id === productId)
     const qty = Number(activeOrder?.remaining_qty ?? 0)
     if (!Number.isFinite(qty) || qty <= 0) return
+    if (!beginDangerousMutation()) return
     setLoading(true)
     setError('')
     setMessage('')
@@ -525,17 +515,19 @@ export function ProductionControlPage() {
         `Сборка запасов и сдельный наряд созданы в 1С на ${result.qty} ед. ` +
         'Факт ожидает считывания проведения в Item Ledger.',
       )
-      await loadMaterials(productId, false)
+      await loadMaterials(productId)
       await load(offsetRef.current)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
+      endDangerousMutation()
       setLoading(false)
     }
   }
 
-  async function returnActiveLeftovers(productId?: number | null) {
+  async function returnActiveLeftovers(productId: number | null | undefined) {
     if (!productId) return
+    if (!beginDangerousMutation()) return
     setLoading(true)
     setError('')
     setMessage('')
@@ -544,60 +536,14 @@ export function ProductionControlPage() {
       const created = Number(result.created_issues ?? 0)
       const skipped = (result.skipped_rows ?? []).length
       setMessage(`Возврат остатков: создано заявок ${created}${skipped ? `, пропущено ${skipped}` : ''}`)
-      await loadMaterials(productId, false)
+      await loadMaterials(productId)
       await load(offsetRef.current)
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
+      endDangerousMutation()
       setLoading(false)
     }
-  }
-
-  // Закрытие возобновляемо: тот же вызов и докатывает недостающие документы,
-  // поэтому «Докатить» — это повтор closePaintWeldChain по той же строке.
-  async function runChainClose(productId: number) {
-    setLoading(true)
-    setError('')
-    setMessage('')
-    try {
-      const result = await closePaintWeldChain(productId)
-      if (result.status === 'partial') {
-        setChainResume({
-          productId,
-          message:
-            result.message
-            || result.error
-            || 'Цепочка проведена в 1С частично. Требуется докат: повторите закрытие цепочки.',
-          chainState: result.chain_state,
-          postedSides: result.posted_sides ?? [],
-          pendingSides: result.pending_sides ?? [],
-        })
-        await load(offsetRef.current)
-        return
-      }
-      setChainResume(null)
-      setSelectedIds(new Set())
-      await load(offsetRef.current)
-      setMessage(
-        'Цепочка закрыта: сборки запасов обоих звеньев и комбинированный сдельный наряд проведены в 1С. ' +
-        'Факт ожидает считывания проведения в Item Ledger.',
-      )
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  async function closeSelectedChain() {
-    const row = selectedRows.length === 1 ? selectedRows[0] : null
-    if (!row?.paint_weld_chain) return
-    if (!window.confirm('Закрыть оба заказа цепочки окраска↔сварка одним действием?')) return
-    await runChainClose(row.product_id)
-  }
-
-  function printRows(ids: number[]) {
-    openRouteSheets(ids)
   }
 
   async function deleteSelectedLocalOrders() {
@@ -605,13 +551,17 @@ export function ProductionControlPage() {
     const deletable = selected.filter((row) => !row.order_ref1c)
     if (!deletable.length) return
     const names = deletable.map((row) => row.order_prodplan_number || row.order_number).join(', ')
-    if (!window.confirm(`Удалить локальные заказы без 1С: ${names}?`)) return
+    if (!beginDangerousMutation()) return
+    if (!window.confirm(`Удалить локальные заказы без 1С: ${names}?`)) {
+      endDangerousMutation()
+      return
+    }
     setLoading(true)
     setError('')
     setMessage('')
     try {
       for (const row of deletable) {
-        await cancelLocalProductionOrder(row.product_id)
+        await deleteProductionOrder(row.product_id)
       }
       setSelectedIds(new Set())
       setMessage(`Удалено локальных заказов: ${deletable.length}`)
@@ -619,17 +569,13 @@ export function ProductionControlPage() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
+      endDangerousMutation()
       setLoading(false)
     }
   }
 
   function toggleSort(key: ProductionOrderSortKey) {
-    const current = filtersRef.current
-    const next = {
-      ...current,
-      sort_by: key,
-      sort_dir: current.sort_by === key && current.sort_dir === 'asc' ? 'desc' : 'asc',
-    } satisfies ProductionFilters
+    const next = nextProductionSort(filtersRef.current, key)
     filtersRef.current = next
     setFilters(next)
     void load(0)
@@ -652,11 +598,10 @@ export function ProductionControlPage() {
 
   useEffect(() => {
     const productId = activeRow?.product_id
-    if (productId) void loadMaterials(productId, false)
+    if (productId) void loadMaterials(productId)
   }, [activeRow?.product_id, loadMaterials])
 
-  const visibleFrom = total ? offset + 1 : 0
-  const visibleTo = Math.min(offset + rows.length, total)
+  const { visibleFrom, visibleTo } = productionPagination(offset, rows.length, total)
 
   return (
     <main className="workArea">
@@ -689,8 +634,8 @@ export function ProductionControlPage() {
           loading={loading}
           onExportTo1C={() => void exportTo1C()}
           onSyncFrom1C={() => void syncFrom1C()}
-          onCloseChain={() => void closeSelectedChain()}
-          onPrintSelected={() => printRows(Array.from(selectedIds))}
+          onProduce={() => void produceActiveLine(selectedRows[0]?.product_id)}
+          onPrintSelected={() => openRouteSheets(Array.from(selectedIds))}
           onDeleteSelected={() => void deleteSelectedLocalOrders()}
           onOpenSettings={() => void openSettings()}
           onRefresh={() => void load(offset)}
@@ -700,32 +645,10 @@ export function ProductionControlPage() {
           onOpenRootProductFilter={() => setRootDialogOpen(true)}
         />
 
-        {error && <div className="errorLine">{error}</div>}
-        {message && <div className="successLine">{message}</div>}
-        {chainResume && (
-          <div className="warningLine chainResumeNotice">
-            <div className="chainResumeText">
-              <strong>Цепочка окраска↔сварка закрыта не полностью.</strong>
-              <span>{chainResume.message}</span>
-              <span className="muted">
-                Состояние: {paintWeldChainStateLabel(chainResume.chainState)}
-                {chainResume.postedSides.length ? ` · в 1С: ${paintWeldChainSidesLabel(chainResume.postedSides)}` : ''}
-                {chainResume.pendingSides.length ? ` · осталось: ${paintWeldChainSidesLabel(chainResume.pendingSides)}` : ''}
-              </span>
-            </div>
-            <div className="chainResumeActions">
-              <button
-                className="primary"
-                onClick={() => void runChainClose(chainResume.productId)}
-                disabled={loading}
-                title="Повторить закрытие цепочки: проведённые документы переиспользуются без дублей"
-              >
-                Докатить
-              </button>
-              <button onClick={() => setChainResume(null)} disabled={loading}>Скрыть</button>
-            </div>
-          </div>
-        )}
+        {error && <div className="errorLine" role="alert">{error}</div>}
+        {message && <div className="successLine" role="status">{message}</div>}
+
+        <ProductionViewBar filters={filters} onChange={changeFilters} />
 
         <div className="split">
           <div className="tablePane">
@@ -740,7 +663,10 @@ export function ProductionControlPage() {
               rows={rows}
               activeRow={activeRow}
               selectedIds={selectedIds}
-              sort={{ sortBy: filters.sort_by, sortDir: filters.sort_dir }}
+              sort={{
+                sortBy: filters.sort_by === 'planned_start_date' ? filters.sort_by : null,
+                sortDir: filters.sort_dir,
+              }}
               onSelectIds={setSelectedIds}
               onActivate={setActiveId}
               onOpenMaterials={(row) => void loadMaterials(row.product_id)}
@@ -766,10 +692,10 @@ export function ProductionControlPage() {
               activeRow={activeRow}
               materials={materials}
               coverageLabels={coverageLabels}
-              onLoadMaterials={() => activeRow && void loadMaterials(activeRow.product_id)}
+              onLoadMaterials={() => activeRow && void refreshMaterials(activeRow.product_id)}
               onProduce={() => void produceActiveLine(activeRow?.product_id)}
               onReturnLeftovers={() => void returnActiveLeftovers(activeRow?.product_id)}
-              onPrint={() => activeRow && printRows([activeRow.product_id])}
+              onPrint={() => activeRow && openRouteSheets([activeRow.product_id])}
               onOptimalBatchSave={(itemId, value) => saveOptimalBatch(itemId, value)}
               onQuantitySave={(productId, value) => saveOrderQuantity(productId, value)}
             />
@@ -791,52 +717,15 @@ export function ProductionControlPage() {
         onClose={() => setRootDialogOpen(false)}
       />
       {warehousePickerOpen && warehousePickerCandidates.length > 0 && (
-        <div className="dialogOverlay" onClick={(e) => { if (e.target === e.currentTarget) setWarehousePickerOpen(false) }}>
-          <div className="dialogBox">
-            <div className="dialogHeader">Выберите склад-источник материалов</div>
-            <div className="dialogBody">
-              <p>Найдено несколько складов с остатком ({warehousePickerProductIds.length} поз.). Выберите склад отправитель:</p>
-              {warehousePickerComponents.length > 0 && (
-                <div className="dialogField">
-                  <label>Детали</label>
-                  <div className="fieldHint">
-                    {warehousePickerComponents.map((component, index) => (
-                      <div key={`${component.item_name}-${component.item_article ?? ''}-${index}`}>
-                        {component.item_name}{component.item_article ? ` (${component.item_article})` : ''} · нужно {component.required_qty.toLocaleString('ru-RU')}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-              {warehousePickerCandidates.map((c) => (
-                <div key={c.ref1c} className="dialogField" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                  <input
-                    type="radio"
-                    id={`wh-${c.ref1c}`}
-                    name="warehousePicker"
-                    value={c.ref1c}
-                    checked={warehousePickerSelected === c.ref1c}
-                    onChange={() => setWarehousePickerSelected(c.ref1c)}
-                  />
-                  <label htmlFor={`wh-${c.ref1c}`}>
-                    {c.name}
-                    {typeof c.qty === 'number'
-                      ? ` (${c.qty.toLocaleString('ru-RU')})`
-                      : typeof c.components_covered === 'number' && typeof c.total_components === 'number'
-                        ? ` (${c.components_covered}/${c.total_components} компонентов)`
-                        : ''}
-                  </label>
-                </div>
-              ))}
-            </div>
-            <div className="dialogFooter">
-              <button onClick={() => setWarehousePickerOpen(false)}>Отмена</button>
-              <button className="primary" onClick={() => void confirmWarehousePicker()} disabled={!warehousePickerSelected}>
-                Подтвердить
-              </button>
-            </div>
-          </div>
-        </div>
+        <WarehousePickerDialog
+          warehousePickerCandidates={warehousePickerCandidates}
+          warehousePickerComponents={warehousePickerComponents}
+          warehousePickerProductIds={warehousePickerProductIds}
+          warehousePickerSelected={warehousePickerSelected}
+          setWarehousePickerOpen={setWarehousePickerOpen}
+          setWarehousePickerSelected={setWarehousePickerSelected}
+          confirmWarehousePicker={confirmWarehousePicker}
+        />
       )}
     </main>
   )

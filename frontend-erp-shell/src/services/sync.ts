@@ -1,12 +1,4 @@
-import type {
-  NomenclatureGroupItem,
-  NomenclatureGroupsResponse,
-  NomenclatureGroupsSelectionResponse,
-  ODataConfig,
-  SyncAction,
-  WarehouseItem,
-} from '../domain/sync'
-import { toNomenclatureGroupItems } from '../domain/sync'
+import type { NomenclatureGroupItem, ODataConfig, SyncAction, WarehouseItem } from '../domain/sync'
 import { api } from '../lib/api'
 
 function syncPayload(config: ODataConfig, action: SyncAction) {
@@ -61,28 +53,12 @@ export function saveWarehouseSelection(selected_refs: string[]) {
   })
 }
 
-export async function listNomenclatureGroups(): Promise<NomenclatureGroupItem[]> {
-  const data = await api<NomenclatureGroupsResponse>('/v1/odata/groups')
-  return toNomenclatureGroupItems(data)
-}
-
-export async function getNomenclatureGroupSelection(): Promise<string[]> {
-  const data = await api<NomenclatureGroupsSelectionResponse>('/v1/odata/groups/selection')
-  return (data.ids ?? []).map((id) => String(id))
-}
-
-// Re-pulls the folder list from 1C into output/odata_groups_nomenclature.json.
-// This is the only action that refreshes the available groups; it never touches
-// the saved selection.
-export function refreshNomenclatureGroups(config: ODataConfig) {
-  return api<{ status: string; total: number; file: string }>('/v1/odata/categories/export_groups', {
-    method: 'POST',
-    body: JSON.stringify(config),
-  })
+export function listNomenclatureGroups() {
+  return api<{ items?: NomenclatureGroupItem[]; rows?: NomenclatureGroupItem[]; selected_ids?: string[] }>('/v1/odata/groups')
 }
 
 export function saveNomenclatureGroupSelection(ids: string[]) {
-  return api<{ status: string; saved: number }>('/v1/odata/groups/selection', {
+  return api<Record<string, unknown>>('/v1/odata/groups/selection', {
     method: 'POST',
     body: JSON.stringify({ ids }),
   })
