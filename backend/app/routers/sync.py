@@ -9,7 +9,7 @@ from ..services.odata_stock_sync import sync_stock_from_odata, sync_stock_wareho
 from ..services.nomenclature_sync import sync_nomenclature_from_odata, NomenclatureSyncStats
 from ..services.category_sync import sync_categories_from_odata, CategorySyncStats
 from ..services.specification_sync import sync_specifications_from_odata, SpecificationSyncStats
-from ..services.production_order_sync import sync_production_orders_from_odata, ProductionOrderSyncStats, sync_production_fact_from_odata
+from ..services.production_order_sync import sync_production_orders_from_odata, ProductionOrderSyncStats, sync_production_facts
 from ..services.production_order_export import export_production_orders_xlsx
 from ..services.supplier_order_sync import sync_supplier_orders_from_odata, SupplierOrderSyncStats
 from ..services.supplier_order_export import export_supplier_orders_xlsx
@@ -286,24 +286,16 @@ def export_production_orders(db: Session = Depends(get_db)):
 def sync_production_orders_fact_odata(payload: ODataSyncRequest, db: Session = Depends(get_db)):
     payload = _resolve_sync_payload(payload)
     """
-    Синхронизация факта выпуска из 1С через OData.
-    Загружает данные из Document_СборкаЗапасов и обновляет produced_qty/remaining_qty.
-    
-    Тело запроса (как для ODataSyncRequest):
-    {
-      "base_url": "http://srv-1c:8080/base/odata/standard.odata",
-      "entity_name": "Document_СборкаЗапасов",
-      "username": "user",
-      "password": "pass",
-      "token": null,
-      "filter_query": null,
-      "select_fields": null,
-      "dry_run": false,
-      "zero_missing": false
-    }
+    Пересчёт кэша факта выпуска из принятого поколения Item Ledger.
+
+    1С здесь не читается: `produced_qty`/`remaining_qty` — кэш проведённых
+    `СборкаЗапасов`, считанных назад из Ledger. Без принятого поколения кэш
+    не переписывается, ответ несёт `status="unavailable"`.
+
+    Тело запроса (как для ODataSyncRequest); используется только `dry_run`.
     """
     try:
-        stats = sync_production_fact_from_odata(db, payload)
+        stats = sync_production_facts(db, payload)
         return stats
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Sync error: {e}")

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, Optional, List, Iterable, DefaultDict, Tuple
+from decimal import Decimal
+from typing import Any, Dict, Optional, List, Iterable, DefaultDict
 from datetime import datetime
 
 from collections import defaultdict
@@ -602,16 +603,16 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
             
             db.commit()
 
-            # После успешной синхронизации заказов и продукции,
-            # загружаем факт выпуска из сборок (Сборка запасов)
-            # и обновляем produced_qty / remaining_qty
+            # Новые/изменённые строки заказа сдвигают плановое количество, а
+            # значит и кэш остатка выпуска. Пересчитываем его из принятого
+            # Item Ledger — второго канала факта нет.
             try:
-                fact_stats = sync_production_fact_from_odata(db, req)
-                print(f"[FACT SYNC] Assemblies: {fact_stats.get('assemblies_loaded', 0)}, "
-                      f"Products: {fact_stats.get('assembly_products_loaded', 0)}, "
+                fact_stats = sync_production_facts(db, req)
+                print(f"[FACT CACHE] Status: {fact_stats.get('status')}, "
+                      f"Facts: {fact_stats.get('facts', 0)}, "
                       f"Updated: {fact_stats.get('products_updated', 0)}")
             except Exception as e:
-                print(f"[FACT SYNC WARNING] {e}")
+                print(f"[FACT CACHE WARNING] {e}")
                 # Не прерываем основную синхронизацию из-за ошибки факта
 
     except Exception as e:
@@ -621,191 +622,151 @@ def sync_production_orders_from_odata(db: Session, req: ODataSyncRequest) -> dic
     return asdict(stats)
 
 
-def sync_production_fact_from_odata(db: Session, req: ODataSyncRequest) -> Dict[str, Any]:
-    """
-    Синхронизация факта выпуска из 1С через OData.
-    
-    Источник: Document_СборкаЗапасов и Document_СборкаЗапасов_Продукция.
-    
-    Алгоритм:
-    1. Загружаем все активные заказы из БД для маппинга
-    2. Для каждого заказа загружаем СборкаЗапасов с фильтром по ЗаказНаПроизводство_Key
-    3. Загружаем продукцию сборок
-    4. Агрегируем produced_qty по (order_ref1c, item_ref1c, characteristic_ref1c)
-    5. Обновляем ProductionProduct.produced_qty и remaining_qty
-    """
-    from ..services.odata_client import OData1CClient
-    from ..models import Item
-    
-    stats = {
-        "assemblies_loaded": 0,
-        "assembly_products_loaded": 0,
-        "products_updated": 0,
-        "orders_skipped_missing_ref": 0,
-        "errors": [],
-        "dry_run": bool(req.dry_run),
-    }
-    
-    try:
-        client = OData1CClient(req.base_url, req.username, req.password, req.token)
+FACT_CACHE_CONSUMER = "production_fact_cache"
 
-        # --- 1) Загружаем все активные заказы из БД для маппинга ---
-        active_orders = db.query(ProductionOrder).filter(
-            ProductionOrder.deletion_mark == False
-        ).all()
-        orders_by_ref1c = {}
-        for order in active_orders:
-            order_ref1c = str(order.order_ref1c or "").strip()
-            if not order_ref1c:
-                stats["orders_skipped_missing_ref"] += 1
-                continue
-            orders_by_ref1c[order_ref1c] = order
 
-        if stats["orders_skipped_missing_ref"]:
-            print(
-                "[FACT SYNC] Skipping "
-                f"{stats['orders_skipped_missing_ref']} active orders without order_ref1c"
+def _cache_line_states(db: Session, product_ids: List[int]) -> Dict[int, str]:
+    """Статусы строк пакетно; отсутствие строки статуса = пустой статус."""
+    statuses: Dict[int, str] = {}
+    for chunk in _chunked(product_ids, 500):
+        rows = (
+            db.query(
+                ProductionOrderLineState.product_id,
+                ProductionOrderLineState.status,
             )
+            .filter(ProductionOrderLineState.product_id.in_(chunk))
+            .all()
+        )
+        statuses.update(
+            {int(product_id): str(status or "") for product_id, status in rows}
+        )
+    return statuses
 
-        if not orders_by_ref1c:
-            stats["dry_run"] = True
-            return stats
 
-        # --- 2) Загружаем СборкаЗапасов для каждого заказа ---
-        # Агрегация produced_qty по (order_ref1c, item_ref1c, characteristic_ref1c)
-        produced_agg: DefaultDict[Tuple[str, str, str], float] = defaultdict(float)
-        
-        order_keys = list(orders_by_ref1c.keys())
-        print(f"[FACT SYNC] Processing {len(order_keys)} orders")
+def sync_production_facts(db: Session, req: Optional[ODataSyncRequest] = None) -> Dict[str, Any]:
+    """
+    Пересчитать кэш факта выпуска из ПРИНЯТОГО поколения Item Ledger.
 
-        # Загружаем сборки для каждого заказа отдельно (чтобы избежать проблем с длинными URL)
-        for i, order_ref1c in enumerate(order_keys):
-            if i % 20 == 0:
-                print(f"[FACT SYNC] Progress: {i}/{len(order_keys)}")
-            
-            try:
-                # Загружаем сборки для заказа
-                assemblies = client.get_all(
-                    "Document_СборкаЗапасов",
-                    filter_query=f"ЗаказНаПроизводство_Key eq guid'{order_ref1c}' and Posted eq true",
-                    select_fields=["Ref_Key", "ЗаказНаПроизводство_Key", "DeletionMark"],
-                    top=1000,
-                    max_pages=10,
-                )
-                
-                # Фильтруем DeletionMark в коде
-                assembly_keys = []
-                for asm in assemblies:
-                    dm = _parse_1c_bool(asm.get("DeletionMark"), False)
-                    if not dm:
-                        ak = str(asm.get("Ref_Key") or "").strip()
-                        if ak:
-                            assembly_keys.append(ak)
-                            stats["assemblies_loaded"] += 1
-                
-                if not assembly_keys:
-                    continue
-                
-                # Загружаем продукцию сборок
-                # Используем expand чтобы получить продукцию одним запросом
-                for j, assembly_key in enumerate(assembly_keys):
-                    if j % 50 == 0:
-                        print(f"[FACT SYNC] Order {order_ref1c}: assembly products progress {j}/{len(assembly_keys)}")
-                    try:
-                        assembly_products = client.get_all(
-                            "Document_СборкаЗапасов_Продукция",
-                            filter_query=f"Ref_Key eq guid'{assembly_key}'",
-                            select_fields=["Номенклатура_Key", "Характеристика_Key", "Количество"],
-                            top=1000,
-                            max_pages=5,
-                        )
-                        
-                        for prod in assembly_products:
-                            item_key = str(prod.get("Номенклатура_Key", "") or "").strip()
-                            char_key = str(prod.get("Характеристика_Key", "") or "").strip() or ""
-                            try:
-                                qty = float(prod.get("Количество", 0.0) or 0.0)
-                            except Exception:
-                                qty = 0.0
-                            
-                            if not item_key:
-                                continue
-                            
-                            # Агрегируем по (order, item, characteristic)
-                            agg_key = (order_ref1c, item_key, char_key)
-                            produced_agg[agg_key] += qty
-                            stats["assembly_products_loaded"] += 1
-                            
-                    except Exception as e:
-                        print(f"[FACT SYNC] Error loading assembly products: {e}")
-                        continue
-                        
-            except Exception as e:
-                print(f"[FACT SYNC] Error for order {order_ref1c}: {e}")
-                stats["errors"].append(f"Order {order_ref1c}: {e}")
-                continue
+    CANON: «Факт выпуска — считанный назад результат проведения
+    `СборкаЗапасов` в принятом Item Ledger». Документы 1С здесь не читаются:
+    параллельного движка факта нет. Функция — единственный писатель
+    `ProductionProduct.produced_qty`; сами поля остаются кэшем чтения для
+    журнала, гарда команды и возврата остатков компонентов.
 
-        if not produced_agg:
-            print("[FACT SYNC] No production facts found")
-            stats["dry_run"] = True
-            return stats
+    Fail-closed (`planning-truth-contract` §Fail closed): без принятого
+    поколения кэш НЕ переписывается и НЕ обнуляется, а сводка возвращает
+    `status="unavailable"` с причиной.
 
-        # --- 3) Обновляем ProductionProduct ---
-        products_updated = 0
-        products_not_found = 0
+    `remaining_qty` пересчитывается по той же формуле, что и ручная
+    корректировка `production_control_journal.update_product_quantity`
+    (`max(0, quantity - produced_qty)`), но терминальные строки
+    (`completed` / `cancelled`) не воскрешаются: их обнулённый остаток —
+    решение оператора, а не производная факта.
+    """
+    from .planning_truth import (
+        CAPABILITY_PHYSICAL_LEDGER,
+        PlanningTruthUnavailable,
+        require_accepted_truth,
+    )
+    from .item_ledger.physical_visibility import PhysicalVisibilityError
+    from .item_ledger.production_fact_projection import derive_production_output
+    # Владелец терминальных статусов строки — производственный журнал.
+    from .production_control_journal import _TERMINAL_LINE_STATUSES
 
-        for (order_ref1c, item_ref1c, char_ref1c), produced_qty in produced_agg.items():
-            if order_ref1c not in orders_by_ref1c:
-                continue
+    dry_run = bool(getattr(req, "dry_run", False))
 
-            order = orders_by_ref1c[order_ref1c]
+    try:
+        truth = require_accepted_truth(
+            db,
+            FACT_CACHE_CONSUMER,
+            (CAPABILITY_PHYSICAL_LEDGER,),
+        )
+    except PlanningTruthUnavailable as exc:
+        readiness = exc.readiness
+        return {
+            "status": "unavailable",
+            "source": "item_ledger",
+            "truth_status": str(readiness.truth_status),
+            "ledger_generation": readiness.ledger_generation,
+            "cutoff": readiness.cutoff.isoformat() if readiness.cutoff else None,
+            "reason": readiness.reason or str(exc),
+            # CANON: неизвестный факт не показывается нулём.
+            "facts": None,
+            "products_updated": 0,
+            "products_unchanged": None,
+            "dry_run": dry_run,
+        }
 
-            # Находим ProductionProduct по (order_id, item_id, characteristic_ref1c)
-            product = None
+    try:
+        projection = derive_production_output(
+            db,
+            ledger_generation_id=int(truth.generation_id),
+        )
+    except PhysicalVisibilityError as exc:
+        return {
+            "status": "unavailable",
+            "source": "item_ledger",
+            "truth_status": str(truth.truth_status),
+            "ledger_generation": truth.generation_id,
+            "cutoff": truth.cutoff.isoformat() if truth.cutoff else None,
+            "reason": str(exc),
+            # CANON: неизвестный факт не показывается нулём.
+            "facts": None,
+            "products_updated": 0,
+            "products_unchanged": None,
+            "dry_run": dry_run,
+        }
 
-            # Находим item по item_ref1c
-            item = db.query(Item).filter_by(item_ref1c=item_ref1c).first()
-            if not item:
-                products_not_found += 1
-                continue
+    products = db.query(ProductionProduct).all()
+    line_status_by_product = _cache_line_states(
+        db, [int(product.product_id) for product in products]
+    )
 
-            # Поиск с characteristic (если есть)
-            if char_ref1c:
-                product = db.query(ProductionProduct).filter_by(
-                    order_id=order.order_id,
-                    item_id=item.item_id,
-                    characteristic_ref1c=char_ref1c,
-                ).first()
+    products_updated = 0
+    products_unchanged = 0
+    zero = Decimal("0")
+    for product in products:
+        product_id = int(product.product_id)
+        derived = projection.produced_by_product.get(product_id, zero)
+        cached = Decimal(str(product.produced_qty or 0))
+        if cached == derived:
+            products_unchanged += 1
+            continue
+        product.produced_qty = derived
+        if line_status_by_product.get(product_id, "") not in _TERMINAL_LINE_STATUSES:
+            planned = Decimal(str(product.quantity or 0))
+            product.remaining_qty = max(planned - derived, zero)
+        products_updated += 1
 
-            # Поиск без characteristic
-            if not product:
-                product = db.query(ProductionProduct).filter_by(
-                    order_id=order.order_id,
-                    item_id=item.item_id,
-                ).first()
-
-            if product:
-                from decimal import Decimal
-                produced_qty_dec = Decimal(str(produced_qty))
-                product.produced_qty = float(produced_qty_dec)
-                product.remaining_qty = float(max(product.quantity - produced_qty_dec, Decimal('0')))
-                products_updated += 1
-            else:
-                products_not_found += 1
-
-        print(f"[FACT SYNC] Assemblies: {stats['assemblies_loaded']}, "
-              f"Products: {stats['assembly_products_loaded']}, "
-              f"Updated: {products_updated}, Not found: {products_not_found}")
-
-        stats["products_updated"] = products_updated
-
-        if req.dry_run:
-            db.rollback()
-        else:
-            db.commit()
-
-    except Exception as e:
+    if dry_run:
         db.rollback()
-        raise Exception(f"Ошибка синхронизации факта выпуска: {e}")
+    else:
+        db.commit()
 
-    return stats
+    print(
+        f"[FACT CACHE] generation={projection.ledger_generation_id} "
+        f"facts={projection.facts} matched={projection.matched_facts} "
+        f"ambiguous={projection.ambiguous_facts} "
+        f"unmatched={projection.unmatched_facts} updated={products_updated}"
+    )
+
+    return {
+        "status": "ok",
+        "source": "item_ledger",
+        "truth_status": str(truth.truth_status),
+        "ledger_generation": projection.ledger_generation_id,
+        "cutoff": projection.cutoff.isoformat() if projection.cutoff else None,
+        "reason": None,
+        "facts": projection.facts,
+        "fact_qty": float(projection.fact_qty),
+        "matched_facts": projection.matched_facts,
+        "matched_qty": float(projection.matched_qty),
+        "exact_link_facts": projection.exact_link_facts,
+        "order_scope_facts": projection.order_scope_facts,
+        "ambiguous_facts": projection.ambiguous_facts,
+        "unmatched_facts": projection.unmatched_facts,
+        "surplus_qty": float(projection.surplus_qty),
+        "products_updated": products_updated,
+        "products_unchanged": products_unchanged,
+        "dry_run": dry_run,
+    }

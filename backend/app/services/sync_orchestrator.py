@@ -44,7 +44,7 @@ from .production_kind_sync import sync_production_kinds_from_odata
 from .operations_sync import sync_operations_from_odata
 from .employee_sync import sync_employees_from_odata
 from .odata_stock_sync import sync_stock_from_odata, sync_stock_warehouses_from_odata
-from .production_order_sync import sync_production_orders_from_odata, sync_production_fact_from_odata
+from .production_order_sync import sync_production_orders_from_odata, sync_production_facts
 from .production_control_material_availability import recalculate_production_coverage
 from .supplier_order_sync import sync_supplier_orders_from_odata
 from .processing_stock_sync import (
@@ -158,7 +158,9 @@ SYNC_JOBS: List[SyncJob] = [
     SyncJob("warehouses", "Склады", 86_400, _single("AccumulationRegister_ЗапасыНаСкладах", sync_stock_warehouses_from_odata)),
     SyncJob("stock", "Остатки + обеспечение журнала", 1_800, _run_stock),
     SyncJob("productionOrders", "Заказы на производство", 3_600, _single("Document_ЗаказНаПроизводство", sync_production_orders_from_odata)),
-    SyncJob("productionFacts", "Факт выпуска", 3_600, _single("Document_СборкаЗапасов", sync_production_fact_from_odata)),
+    # Факт выпуска не тянется из 1С: тик пересчитывает кэш produced_qty из
+    # принятого поколения Item Ledger. Каденс = задержка кэша за поколением.
+    SyncJob("productionFacts", "Факт выпуска", 3_600, _single("Document_СборкаЗапасов", sync_production_facts)),
     SyncJob("supplierOrders", "Заказы поставщику", 3_600, _single("Document_ЗаказПоставщику", sync_supplier_orders_from_odata)),
     SyncJob(
         "processingStock",
