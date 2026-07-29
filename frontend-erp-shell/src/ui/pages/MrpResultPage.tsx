@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import type { MrpCapacityRow, MrpProductionRow, MrpPurchaseRow, MrpReworkRow, MrpSummary } from '../../domain/planning'
-import { isPlanningTruthUsable, planningStatusLabel, planningTruthStatusLabel } from '../../domain/planning'
+import { planningStatusLabel } from '../../domain/planning'
 import { downloadBase64File } from '../../lib/download'
 import { dateRu, dateTimeRu, qty } from '../../lib/format'
 import {
+  createProductionControlOrdersFromMrp,
   exportPlanningResultProduction,
   exportPlanningResultPurchases,
   exportPlanningResultRework,
@@ -17,10 +18,25 @@ import {
 } from '../../services/planning'
 import { getPeriodPlanMatrix } from '../../services/periodPlan'
 import { DocumentWindow } from '../layout/DocumentWindow'
-import { RootProductFilterDialog, rootProductLabel, type RootProductOption } from '../RootProductFilterDialog'
+import { RootProductFilterDialog } from '../RootProductFilterDialog'
+import { rootProductLabel, type RootProductOption } from '../rootProductOptions'
 import { StatusBar } from '../layout/StatusBar'
+import {
+  filterPurchaseRows,
+  formatActionResult,
+  isProductionRowSelectable,
+  mrpResultTotals,
+  parseMrpResultTab,
+  parsePositiveId,
+  productionSourceIds,
+  purchaseFilterOptions,
+  purchaseSourceIds,
+  supplierDisplayName,
+  toggleMany,
+  type MrpResultTab,
+} from './mrp-result/model'
 
-type Tab = 'production' | 'purchases' | 'rework' | 'capacity'
+type Tab = MrpResultTab
 
 const limit = 200
 
@@ -30,24 +46,6 @@ function emptyTabFlags(): Record<Tab, boolean> {
 
 function emptyTabOffsets(): Record<Tab, number> {
   return { production: 0, purchases: 0, rework: 0, capacity: 0 }
-}
-
-function parseTab(value: string | null): Tab | null {
-  if (value === 'production' || value === 'purchases' || value === 'rework' || value === 'capacity') return value
-  return null
-}
-
-function parseId(value: string | null) {
-  const id = Number(value)
-  return Number.isFinite(id) && id > 0 ? id : null
-}
-
-function supplierDisplayName(row: MrpPurchaseRow) {
-  return (row.supplier_name || '').trim() || 'Без наименования'
-}
-
-function supplierFilterKey(row: MrpPurchaseRow) {
-  return (row.supplier_name || '').trim() ? (row.supplier_ref1c || row.supplier_name || '') : '__missing_supplier_name'
 }
 
 function ForecastShift({ forecast }: { forecast?: { forecast_date?: string | null; forecast_shift_days?: number | null; forecast_reason?: string | null } | null }) {
@@ -66,11 +64,12 @@ export function MrpResultPage() {
   const runId = Number(runIdParam)
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
-  const queryTab = parseTab(searchParams.get('tab'))
-  const highlightedProductionId = parseId(searchParams.get('planned_order_id'))
-  const highlightedPurchaseId = parseId(searchParams.get('purchase_id'))
-  const highlightedReworkId = parseId(searchParams.get('rework_id'))
+  const queryTab = parseMrpResultTab(searchParams.get('tab'))
+  const highlightedProductionId = parsePositiveId(searchParams.get('planned_order_id'))
+  const highlightedPurchaseId = parsePositiveId(searchParams.get('purchase_id'))
+  const highlightedReworkId = parsePositiveId(searchParams.get('rework_id'))
   const [summary, setSummary] = useState<MrpSummary | null>(null)
+  const [dataRunId, setDataRunId] = useState(runId)
   const [tab, setTab] = useState<Tab>(() => queryTab ?? 'production')
   const [loadedTabs, setLoadedTabs] = useState<Record<Tab, boolean>>(() => emptyTabFlags())
   const [offsets, setOffsets] = useState<Record<Tab, number>>(() => emptyTabOffsets())
@@ -82,17 +81,13 @@ export function MrpResultPage() {
   const [purchaseTotal, setPurchaseTotal] = useState(0)
   const [reworkTotal, setReworkTotal] = useState(0)
   const [capacityTotal, setCapacityTotal] = useState(0)
-  // Backend-computed sums over the whole filtered selection; `null` while the
-  // tab has not been read yet. Never recomputed from the visible page.
-  const [productionTotalQty, setProductionTotalQty] = useState<number | null>(null)
-  const [purchaseTotalQty, setPurchaseTotalQty] = useState<number | null>(null)
-  const [reworkTotalQty, setReworkTotalQty] = useState<number | null>(null)
   const [dateFrom, setDateFrom] = useState('')
   const [dateTo, setDateTo] = useState('')
   const [draftDateFrom, setDraftDateFrom] = useState('')
   const [draftDateTo, setDraftDateTo] = useState('')
   const [loading, setLoading] = useState(false)
   const [exporting, setExporting] = useState(false)
+  const [selectedProductionIds, setSelectedProductionIds] = useState<Set<number>>(new Set())
   const [selectedPurchaseIds, setSelectedPurchaseIds] = useState<Set<number>>(new Set())
   const [purchaseSupplierFilter, setPurchaseSupplierFilter] = useState('')
   const [purchaseCategoryFilter, setPurchaseCategoryFilter] = useState('')
@@ -102,117 +97,41 @@ export function MrpResultPage() {
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
   const loadSeq = useRef(0)
+  const summarySeq = useRef(0)
+  const mutationInFlight = useRef(false)
+  const previousRunId = useRef(runId)
+  const snapshotId = summary?.snapshot_id ?? null
+  const truthAccepted = summary?.truth_status === 'accepted' && snapshotId !== null
+  const truthUnavailableReason = summary && !truthAccepted
+    ? summary.truth_reason || `Снимок MRP недоступен: ${summary.truth_status || 'unavailable'}`
+    : ''
 
-  const purchaseSupplierOptions = useMemo(() => {
-    const map = new Map<string, string>()
-    purchaseRows.forEach((row) => {
-      const key = supplierFilterKey(row)
-      if (!key) return
-      map.set(key, supplierDisplayName(row))
-    })
-    return Array.from(map.entries()).map(([value, label]) => ({ value, label })).sort((a, b) => a.label.localeCompare(b.label, 'ru'))
-  }, [purchaseRows])
-  const purchaseCategoryOptions = useMemo(() => {
-    const map = new Map<string, string>()
-    purchaseRows.forEach((row) => {
-      const key = row.category_id !== null && row.category_id !== undefined
-        ? String(row.category_id)
-        : (row.category_ref1c || row.category_name || '')
-      if (!key) return
-      map.set(key, row.category_name || 'Без товарной группы')
-    })
-    return Array.from(map.entries()).map(([value, label]) => ({ value, label })).sort((a, b) => a.label.localeCompare(b.label, 'ru'))
-  }, [purchaseRows])
-  const filteredPurchaseRows = useMemo(() => (
-    purchaseRows.filter((row) => {
-      const supplierKey = supplierFilterKey(row)
-      const categoryKey = row.category_id !== null && row.category_id !== undefined
-        ? String(row.category_id)
-        : (row.category_ref1c || row.category_name || '')
-      if (purchaseSupplierFilter && supplierKey !== purchaseSupplierFilter) return false
-      if (purchaseCategoryFilter && categoryKey !== purchaseCategoryFilter) return false
-      return true
-    })
-  ), [purchaseCategoryFilter, purchaseRows, purchaseSupplierFilter])
-  // The supplier/category selects filter the already loaded page in the
-  // browser, so the "shown" counters must follow the filtered list while
-  // pagination keeps following the raw server page.
-  const purchaseFilterActive = tab === 'purchases' && Boolean(purchaseSupplierFilter || purchaseCategoryFilter)
+  const purchaseOptions = useMemo(() => purchaseFilterOptions(purchaseRows), [purchaseRows])
+  const purchaseSupplierOptions = purchaseOptions.suppliers
+  const purchaseCategoryOptions = purchaseOptions.categories
+  const filteredPurchaseRows = useMemo(
+    () => filterPurchaseRows(purchaseRows, purchaseSupplierFilter, purchaseCategoryFilter),
+    [purchaseCategoryFilter, purchaseRows, purchaseSupplierFilter],
+  )
   const activeOffset = offsets[tab]
   const activeTotal = tab === 'production' ? productionTotal : tab === 'purchases' ? purchaseTotal : tab === 'rework' ? reworkTotal : capacityTotal
-  const pageRowsLength = tab === 'production' ? productionRows.length : tab === 'purchases' ? purchaseRows.length : tab === 'rework' ? reworkRows.length : capacityRows.length
-  const visibleRowsLength = tab === 'purchases' ? filteredPurchaseRows.length : pageRowsLength
-  const statusTotal = purchaseFilterActive ? pageRowsLength : activeTotal
-  const activeVisibleFrom = visibleRowsLength ? (purchaseFilterActive ? 1 : activeOffset + 1) : 0
-  const activeVisibleTo = visibleRowsLength
-    ? (purchaseFilterActive ? visibleRowsLength : Math.min(activeOffset + visibleRowsLength, activeTotal))
-    : 0
-  const selectedCount = tab === 'purchases' ? selectedPurchaseIds.size : 0
+  const activeRowsLength = tab === 'production' ? productionRows.length : tab === 'purchases' ? purchaseRows.length : tab === 'rework' ? reworkRows.length : capacityRows.length
+  const activeVisibleFrom = activeTotal && activeRowsLength ? activeOffset + 1 : 0
+  const activeVisibleTo = activeTotal && activeRowsLength ? Math.min(activeOffset + activeRowsLength, activeTotal) : 0
+  const selectedCount = tab === 'production' ? selectedProductionIds.size : tab === 'purchases' ? selectedPurchaseIds.size : 0
 
-  // Ready totals from the persisted read model: the paged endpoints answer with
-  // `total_qty` over the whole filtered selection, and the manifest carries the
-  // unfiltered per-kind sums plus the capacity overload total.
-  const totals = {
-    productionQty: productionTotalQty ?? summary?.snapshot_total_qty?.production ?? null,
-    purchaseQty: purchaseTotalQty ?? summary?.snapshot_total_qty?.purchase ?? null,
-    reworkQty: reworkTotalQty ?? summary?.snapshot_total_qty?.rework ?? null,
-    overloadHours: summary?.capacity?.overload_total ?? null,
-  }
+  const totals = useMemo(
+    () => mrpResultTotals(productionRows, purchaseRows, reworkRows, capacityRows),
+    [productionRows, purchaseRows, reworkRows, capacityRows],
+  )
 
   useEffect(() => {
     if (queryTab) setTab(queryTab)
   }, [queryTab])
 
-  const loadSummary = useCallback(async () => {
-    try {
-      setSummary(await getPlanningRunSummary(runId))
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
-    }
-  }, [runId])
-
-  const loadTab = useCallback(async (targetTab: Tab, nextOffset: number) => {
-    const seq = ++loadSeq.current
-    setLoading(true)
-    setError('')
-    setMessage('')
-    try {
-      const params = { date_from: dateFrom || undefined, date_to: dateTo || undefined, root_item_id: rootItemId, limit, offset: nextOffset }
-      if (targetTab === 'production') {
-        const data = await getPlanningResultProduction(runId, params)
-        if (seq !== loadSeq.current) return
-        setProductionRows(data.rows ?? [])
-        setProductionTotal(data.total ?? 0)
-        setProductionTotalQty(data.total_qty ?? null)
-      } else if (targetTab === 'purchases') {
-        const data = await getPlanningResultPurchases(runId, params)
-        if (seq !== loadSeq.current) return
-        setPurchaseRows(data.rows ?? [])
-        setPurchaseTotal(data.total ?? 0)
-        setPurchaseTotalQty(data.total_qty ?? null)
-      } else if (targetTab === 'rework') {
-        const data = await getPlanningResultRework(runId, params)
-        if (seq !== loadSeq.current) return
-        setReworkRows(data.rows ?? [])
-        setReworkTotal(data.total ?? 0)
-        setReworkTotalQty(data.total_qty ?? null)
-      } else {
-        const data = await getPlanningResultCapacity(runId, params)
-        if (seq !== loadSeq.current) return
-        setCapacityRows(data.rows ?? [])
-        setCapacityTotal(data.total ?? 0)
-      }
-      setOffsets((prev) => ({ ...prev, [targetTab]: nextOffset }))
-      setLoadedTabs((prev) => ({ ...prev, [targetTab]: true }))
-    } catch (e) {
-      if (seq === loadSeq.current) setError(e instanceof Error ? e.message : String(e))
-    } finally {
-      if (seq === loadSeq.current) setLoading(false)
-    }
-  }, [dateFrom, dateTo, rootItemId, runId])
-
   const invalidateTabs = useCallback(() => {
     loadSeq.current += 1
+    setLoading(false)
     setLoadedTabs(emptyTabFlags())
     setOffsets(emptyTabOffsets())
     setProductionRows([])
@@ -223,25 +142,106 @@ export function MrpResultPage() {
     setPurchaseTotal(0)
     setReworkTotal(0)
     setCapacityTotal(0)
-    setProductionTotalQty(null)
-    setPurchaseTotalQty(null)
-    setReworkTotalQty(null)
+    setSelectedProductionIds(new Set())
     setSelectedPurchaseIds(new Set())
     setPurchaseSupplierFilter('')
     setPurchaseCategoryFilter('')
   }, [])
 
-  const refreshActiveTab = useCallback(() => {
-    void loadTab(tab, offsets[tab])
-  }, [loadTab, offsets, tab])
+  const loadSummary = useCallback(async () => {
+    const seq = ++summarySeq.current
+    invalidateTabs()
+    try {
+      const nextSummary = await getPlanningRunSummary(runId)
+      if (seq === summarySeq.current) {
+        setSummary(nextSummary)
+        if (nextSummary.truth_status !== 'accepted' || nextSummary.snapshot_id === null) {
+          setError(nextSummary.truth_reason || `Снимок MRP недоступен: ${nextSummary.truth_status || 'unavailable'}`)
+        } else {
+          setError('')
+        }
+      }
+    } catch (e) {
+      if (seq === summarySeq.current) {
+        setSummary(null)
+        setError(e instanceof Error ? e.message : String(e))
+      }
+    }
+  }, [invalidateTabs, runId])
+
+  const loadTab = useCallback(async (targetTab: Tab, nextOffset: number) => {
+    const seq = ++loadSeq.current
+    setLoading(true)
+    setError('')
+    if (!truthAccepted || snapshotId === null) {
+      invalidateTabs()
+      return
+    }
+    try {
+      const params = { snapshot_id: snapshotId, date_from: dateFrom || undefined, date_to: dateTo || undefined, root_item_id: rootItemId, limit, offset: nextOffset }
+      let data
+      if (targetTab === 'production') {
+        data = await getPlanningResultProduction(runId, params)
+        if (seq !== loadSeq.current) return
+        setProductionRows(data.rows ?? [])
+        setProductionTotal(data.total ?? 0)
+      } else if (targetTab === 'purchases') {
+        data = await getPlanningResultPurchases(runId, params)
+        if (seq !== loadSeq.current) return
+        setPurchaseRows(data.rows ?? [])
+        setPurchaseTotal(data.total ?? 0)
+      } else if (targetTab === 'rework') {
+        data = await getPlanningResultRework(runId, params)
+        if (seq !== loadSeq.current) return
+        setReworkRows(data.rows ?? [])
+        setReworkTotal(data.total ?? 0)
+      } else {
+        data = await getPlanningResultCapacity(runId, params)
+        if (seq !== loadSeq.current) return
+        setCapacityRows(data.rows ?? [])
+        setCapacityTotal(data.total ?? 0)
+      }
+      const identityMatches = data.truth_status === 'accepted'
+        && data.snapshot_id === snapshotId
+        && data.ledger_generation === summary?.ledger_generation
+        && data.cutoff === summary?.cutoff
+      if (!identityMatches) {
+        const mismatchReason = data.truth_reason || 'Ответ вкладки не соответствует зафиксированному снимку MRP'
+        setSummary((current) => current ? {
+          ...current,
+          snapshot_id: null,
+          truth_status: 'unavailable',
+          truth_reason: mismatchReason,
+        } : current)
+        invalidateTabs()
+        setError(mismatchReason)
+        return
+      }
+      setOffsets((prev) => ({ ...prev, [targetTab]: nextOffset }))
+      setLoadedTabs((prev) => ({ ...prev, [targetTab]: true }))
+    } catch (e) {
+      if (seq === loadSeq.current) setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      if (seq === loadSeq.current) setLoading(false)
+    }
+  }, [dateFrom, dateTo, invalidateTabs, rootItemId, runId, snapshotId, summary, truthAccepted])
+
+  useEffect(() => {
+    if (previousRunId.current === runId) return
+    previousRunId.current = runId
+    summarySeq.current += 1
+    setSummary(null)
+    invalidateTabs()
+    setDataRunId(runId)
+  }, [invalidateTabs, runId])
 
   useEffect(() => {
     void loadSummary()
   }, [loadSummary])
 
   useEffect(() => {
-    if (!loadedTabs[tab]) void loadTab(tab, offsets[tab])
-  }, [loadedTabs, loadTab, offsets, tab])
+    if (dataRunId === runId && truthAccepted && !loadedTabs[tab]) void loadTab(tab, offsets[tab])
+  }, [dataRunId, loadedTabs, loadTab, offsets, runId, tab, truthAccepted])
 
   useEffect(() => {
     let cancelled = false
@@ -266,10 +266,11 @@ export function MrpResultPage() {
   }, [summary?.run?.source_plan_id])
 
   async function exportActive(format: 'csv' | 'xlsx') {
+    if (!truthAccepted || snapshotId === null) return
     setExporting(true)
     setError('')
     try {
-      const params = { format, date_from: dateFrom || undefined, date_to: dateTo || undefined, root_item_id: rootItemId }
+      const params = { snapshot_id: snapshotId, format, date_from: dateFrom || undefined, date_to: dateTo || undefined, root_item_id: rootItemId }
       const response = tab === 'production'
         ? await exportPlanningResultProduction(runId, params)
         : tab === 'purchases'
@@ -283,8 +284,33 @@ export function MrpResultPage() {
     }
   }
 
+  async function createSelectedProductionOrders() {
+    if (!truthAccepted || !selectedProductionIds.size || mutationInFlight.current) return
+    mutationInFlight.current = true
+    setExporting(true)
+    setError('')
+    setMessage('')
+    try {
+      const result = await createProductionControlOrdersFromMrp({
+        run_id: runId,
+        date_from: dateFrom || undefined,
+        date_to: dateTo || undefined,
+        planned_order_ids: Array.from(selectedProductionIds),
+      })
+      setSelectedProductionIds(new Set())
+      await loadSummary()
+      setMessage(formatActionResult('Создание заказов', result))
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    } finally {
+      mutationInFlight.current = false
+      setExporting(false)
+    }
+  }
+
   async function exportSelectedPurchasesTo1C() {
-    if (!selectedPurchaseIds.size) return
+    if (!truthAccepted || !selectedPurchaseIds.size || mutationInFlight.current) return
+    mutationInFlight.current = true
     setExporting(true)
     setError('')
     setMessage('')
@@ -301,6 +327,7 @@ export function MrpResultPage() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
+      mutationInFlight.current = false
       setExporting(false)
     }
   }
@@ -329,20 +356,11 @@ export function MrpResultPage() {
     setOffsets((prev) => ({ ...prev, [tab]: nextOffset }))
   }
 
-  // When the Ledger snapshot is not accepted the backend answers with empty
-  // rows and zero totals; rendering them as a normal table would show fake
-  // zeros instead of "no data".
-  const truthUsable = isPlanningTruthUsable(summary)
-
   return (
     <main className="workArea">
       <div className="topLine">
         <div className="breadcrumbs">MRP / Результат прогона #{runId}</div>
-        <div className="runBadge">
-          {!truthUsable
-            ? 'Данные недоступны'
-            : summary?.run?.status ? planningStatusLabel(summary.run.status) : 'Загрузка'}
-        </div>
+        <div className="runBadge">{truthUnavailableReason ? 'Данные недоступны' : summary?.run?.status ? planningStatusLabel(summary.run.status) : 'Загрузка'}</div>
       </div>
 
       <DocumentWindow
@@ -352,12 +370,12 @@ export function MrpResultPage() {
         footer={(
           <StatusBar
             loading={loading}
-            visibleFrom={truthUsable ? activeVisibleFrom : 0}
-            visibleTo={truthUsable ? activeVisibleTo : 0}
-            total={truthUsable ? statusTotal : 0}
+            visibleFrom={activeVisibleFrom}
+            visibleTo={activeVisibleTo}
+            total={activeTotal}
             selectedCount={selectedCount}
-            canPrev={truthUsable && activeOffset > 0}
-            canNext={truthUsable && activeOffset + pageRowsLength < activeTotal}
+            canPrev={activeOffset > 0}
+            canNext={activeOffset + activeRowsLength < activeTotal}
             onPrev={goPrev}
             onNext={goNext}
           />
@@ -365,9 +383,10 @@ export function MrpResultPage() {
       >
         <div className="commandBar">
           <button onClick={() => navigate('/mrp-runs')}>К списку прогонов</button>
-          <button onClick={() => { void loadSummary(); refreshActiveTab() }} disabled={loading}>Обновить</button>
-          {tab !== 'capacity' && <button onClick={() => void exportActive('xlsx')} disabled={!truthUsable || loading || exporting}>XLSX</button>}
-          {tab === 'purchases' && <button className="primary" onClick={() => void exportSelectedPurchasesTo1C()} disabled={!truthUsable || !selectedPurchaseIds.size || loading || exporting}>Выгрузить в 1С ({selectedPurchaseIds.size})</button>}
+          <button onClick={() => { void loadSummary() }} disabled={loading}>Обновить</button>
+          {tab !== 'capacity' && <button onClick={() => void exportActive('xlsx')} disabled={!truthAccepted || loading || exporting}>XLSX</button>}
+          {tab === 'production' && <button className="primary" onClick={() => void createSelectedProductionOrders()} disabled={!truthAccepted || !selectedProductionIds.size || loading || exporting}>Создать заказы ({selectedProductionIds.size})</button>}
+          {tab === 'purchases' && <button className="primary" onClick={() => void exportSelectedPurchasesTo1C()} disabled={!truthAccepted || !selectedPurchaseIds.size || loading || exporting}>Выгрузить в 1С ({selectedPurchaseIds.size})</button>}
           <div className="barSeparator" />
           <button onClick={() => setRootDialogOpen(true)}>Корневое изделие</button>
           <span className="toolbarText">{rootProductLabel(rootOptions, rootItemId)}</span>
@@ -384,49 +403,45 @@ export function MrpResultPage() {
         </div>
 
         {error && <div className="errorLine">{error}</div>}
+        {truthUnavailableReason && !error && <div className="errorLine">{truthUnavailableReason}</div>}
         {message && <div className="successLine">{message}</div>}
 
-        {!truthUsable ? (
-          <TruthUnavailablePane summary={summary} />
-        ) : (
-          <>
-            <div className="mrpSummaryStrip">
-              <Metric title="Старт" value={dateTimeRu(summary?.run?.started_at) || '—'} />
-              <Metric title="Горизонт" value={`${qty(summary?.run?.horizon_days)} дн.`} />
-              <Metric title="Производство" value={qty(summary?.counts?.production_orders ?? productionTotal)} hint={hintQty(totals.productionQty, 'шт.')} />
-              <Metric title="Закупки" value={qty(summary?.counts?.purchase_requests ?? purchaseTotal)} hint={hintQty(totals.purchaseQty, 'шт.')} />
-              <Metric title="Переработка" value={qty(summary?.counts?.rework_requests ?? reworkTotal)} hint={hintQty(totals.reworkQty, 'шт.')} />
-              <Metric title="Перегрузы" value={qty(summary?.capacity?.overloaded_buckets)} hint={hintQty(totals.overloadHours, 'н/ч')} />
-            </div>
+        <div className="mrpSummaryStrip">
+          <Metric title="Старт" value={truthAccepted ? dateTimeRu(summary?.run?.started_at) || '—' : 'Недоступно'} />
+          <Metric title="Горизонт" value={truthAccepted ? `${qty(summary?.run?.horizon_days)} дн.` : 'Недоступно'} />
+          <Metric title="Производство" value={truthAccepted ? qty(summary?.counts?.production_orders ?? productionTotal) : 'Недоступно'} hint={truthAccepted ? `${qty(totals.productionQty)} шт.` : undefined} />
+          <Metric title="Закупки" value={truthAccepted ? qty(summary?.counts?.purchase_requests ?? purchaseTotal) : 'Недоступно'} hint={truthAccepted ? `${qty(totals.purchaseQty)} шт.` : undefined} />
+          <Metric title="Переработка" value={truthAccepted ? qty(summary?.counts?.rework_requests ?? reworkTotal) : 'Недоступно'} hint={truthAccepted ? `${qty(totals.reworkQty)} шт.` : undefined} />
+          <Metric title="Перегрузы" value={truthAccepted ? qty(summary?.capacity?.overloaded_buckets) : 'Недоступно'} hint={truthAccepted ? `${qty(totals.overloadHours)} н/ч` : undefined} />
+        </div>
 
-            <div className="tabsBar">
-              <button className={tab === 'production' ? 'activeTab' : ''} onClick={() => setTab('production')}>Производство</button>
-              <button className={tab === 'purchases' ? 'activeTab' : ''} onClick={() => setTab('purchases')}>Закупки</button>
-              <button className={tab === 'rework' ? 'activeTab' : ''} onClick={() => setTab('rework')}>Переработка</button>
-              <button className={tab === 'capacity' ? 'activeTab' : ''} onClick={() => setTab('capacity')}>Мощности</button>
-            </div>
+        <div className="tabsBar">
+          <button className={tab === 'production' ? 'activeTab' : ''} onClick={() => setTab('production')}>Производство</button>
+          <button className={tab === 'purchases' ? 'activeTab' : ''} onClick={() => setTab('purchases')}>Закупки</button>
+          <button className={tab === 'rework' ? 'activeTab' : ''} onClick={() => setTab('rework')}>Переработка</button>
+          <button className={tab === 'capacity' ? 'activeTab' : ''} onClick={() => setTab('capacity')}>Мощности</button>
+        </div>
 
-            <div className="tablePane resultTablePane">
-              {tab === 'production' && <ProductionResultTable rows={productionRows} highlightedId={highlightedProductionId} />}
-              {tab === 'purchases' && (
-                <PurchaseResultTable
-                  rows={filteredPurchaseRows}
-                  selectedIds={selectedPurchaseIds}
-                  highlightedId={highlightedPurchaseId}
-                  supplierFilter={purchaseSupplierFilter}
-                  categoryFilter={purchaseCategoryFilter}
-                  supplierOptions={purchaseSupplierOptions}
-                  categoryOptions={purchaseCategoryOptions}
-                  onSupplierFilterChange={setPurchaseSupplierFilter}
-                  onCategoryFilterChange={setPurchaseCategoryFilter}
-                  onSelectedIdsChange={setSelectedPurchaseIds}
-                />
-              )}
-              {tab === 'rework' && <ReworkResultTable rows={reworkRows} highlightedId={highlightedReworkId} />}
-              {tab === 'capacity' && <CapacityResultTable rows={capacityRows} />}
-            </div>
-          </>
-        )}
+        <div className="tablePane resultTablePane">
+          {!truthAccepted && <div className="emptyState">Фактические данные MRP недоступны. Дождитесь принятого Ledger-снимка.</div>}
+          {tab === 'production' && <ProductionResultTable rows={productionRows} selectedIds={selectedProductionIds} highlightedId={highlightedProductionId} onSelectedIdsChange={setSelectedProductionIds} />}
+          {tab === 'purchases' && (
+            <PurchaseResultTable
+              rows={filteredPurchaseRows}
+              selectedIds={selectedPurchaseIds}
+              highlightedId={highlightedPurchaseId}
+              supplierFilter={purchaseSupplierFilter}
+              categoryFilter={purchaseCategoryFilter}
+              supplierOptions={purchaseSupplierOptions}
+              categoryOptions={purchaseCategoryOptions}
+              onSupplierFilterChange={setPurchaseSupplierFilter}
+              onCategoryFilterChange={setPurchaseCategoryFilter}
+              onSelectedIdsChange={setSelectedPurchaseIds}
+            />
+          )}
+          {tab === 'rework' && <ReworkResultTable rows={reworkRows} highlightedId={highlightedReworkId} />}
+          {tab === 'capacity' && <CapacityResultTable rows={capacityRows} />}
+        </div>
       </DocumentWindow>
       <RootProductFilterDialog
         open={rootDialogOpen}
@@ -436,29 +451,6 @@ export function MrpResultPage() {
         onClose={() => setRootDialogOpen(false)}
       />
     </main>
-  )
-}
-
-// A backend total that has not been read yet stays "—"; zero is never used in
-// place of an unknown value.
-function hintQty(value: number | null, unit: string) {
-  return value === null ? '—' : `${qty(value)} ${unit}`
-}
-
-function TruthUnavailablePane({ summary }: { summary: MrpSummary | null }) {
-  const reason = summary?.truth_reason || 'снимок результата MRP не опубликован'
-  return (
-    <div className="tablePane resultTablePane">
-      <div className="emptyDetail" style={{ padding: 24, display: 'grid', gap: 8, justifyItems: 'start' }}>
-        <strong>Данные недоступны: {reason}</strong>
-        <span>
-          {`Состояние Ledger: ${planningTruthStatusLabel(summary?.truth_status)}`}
-          {` · поколение: ${summary?.ledger_generation ?? '—'}`}
-          {` · срез: ${dateTimeRu(summary?.cutoff) || '—'}`}
-        </span>
-        <span>Итоги и строки не показываются, пока снимок не принят.</span>
-      </div>
-    </div>
   )
 }
 
@@ -472,55 +464,28 @@ function Metric({ title, value, hint }: { title: string; value: string; hint?: s
   )
 }
 
-function formatActionResult(title: string, result: Record<string, unknown>) {
-  const created = numberValue(result.created ?? result.created_count ?? result.orders_created ?? result.exported ?? result.exported_count)
-  const existing = numberValue(result.existing ?? result.existing_count ?? result.orders_existing)
-  const skipped = countValue(result.skipped ?? result.skipped_count ?? result.skipped_rows)
-  const errors = countValue(result.errors ?? result.error_count)
-  const parts = [`${title}: выполнено`]
-  if (created) parts.push(`новых ${created}`)
-  if (existing) parts.push(`уже было ${existing}`)
-  if (skipped) parts.push(`пропущено ${skipped}`)
-  if (errors) parts.push(`ошибок ${errors}`)
-  if (parts.length > 1) return parts.join(', ')
-  return `${title}: ${JSON.stringify(result).slice(0, 220)}`
-}
-
-function numberValue(value: unknown) {
-  const number = Number(value ?? 0)
-  return Number.isFinite(number) ? number : 0
-}
-
-function countValue(value: unknown) {
-  if (Array.isArray(value)) return value.length
-  return numberValue(value)
-}
-
-function toggleMany(set: Set<number>, ids: number[], checked: boolean) {
-  const next = new Set(set)
-  ids.forEach((id) => {
-    if (checked) next.add(id)
-    else next.delete(id)
-  })
-  return next
-}
-
-function rowOrderIds(row: MrpProductionRow) {
-  return row.source_order_ids?.length ? row.source_order_ids : [row.order_id]
-}
-
-function rowPurchaseIds(row: MrpPurchaseRow) {
-  return row.source_purchase_ids?.length ? row.source_purchase_ids : [row.purchase_id]
-}
-
-function ProductionResultTable({ rows, highlightedId }: {
+function ProductionResultTable({ rows, selectedIds, highlightedId, onSelectedIdsChange }: {
   rows: MrpProductionRow[]
+  selectedIds: Set<number>
   highlightedId: number | null
+  onSelectedIdsChange: (ids: Set<number>) => void
 }) {
+  const visibleIds = rows.filter(isProductionRowSelectable).flatMap(productionSourceIds)
+  const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id))
+
   return (
     <table className="journalTable resultTable">
       <thead>
         <tr>
+          <th className="checkCol">
+            <input
+              type="checkbox"
+              checked={allVisibleSelected}
+              disabled={!visibleIds.length}
+              onChange={(e) => onSelectedIdsChange(toggleMany(selectedIds, visibleIds, e.target.checked))}
+              aria-label="Выбрать все видимые производственные заказы"
+            />
+          </th>
           <th>Изделие</th>
           <th>Кол-во</th>
           <th>Потребность</th>
@@ -532,7 +497,16 @@ function ProductionResultTable({ rows, highlightedId }: {
       </thead>
       <tbody>
         {rows.map((row) => (
-          <tr key={row.order_id} className={highlightedId && rowOrderIds(row).includes(highlightedId) ? 'activeRow' : undefined}>
+          <tr key={row.order_id} className={highlightedId && productionSourceIds(row).includes(highlightedId) ? 'activeRow' : undefined}>
+            <td className="checkCol">
+              <input
+                type="checkbox"
+                checked={productionSourceIds(row).every((id) => selectedIds.has(id))}
+                disabled={!isProductionRowSelectable(row)}
+                onChange={(e) => onSelectedIdsChange(toggleMany(selectedIds, productionSourceIds(row), e.target.checked))}
+                aria-label={`Выбрать ${row.item_name || row.item_article || row.order_id}`}
+              />
+            </td>
             <td className="itemCell">
               <strong>{row.item_name || `Номенклатура #${row.item_id}`}</strong>
               <span>{row.item_article || ''} {row.badge || ''}</span>
@@ -573,7 +547,7 @@ function PurchaseResultTable({
   onCategoryFilterChange: (value: string) => void
   onSelectedIdsChange: (ids: Set<number>) => void
 }) {
-  const visibleIds = rows.flatMap(rowPurchaseIds)
+  const visibleIds = rows.flatMap(purchaseSourceIds)
   const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id))
 
   return (
@@ -645,12 +619,12 @@ function PurchaseResultTable({
             ? `${qty(covered)} / ${qty(requested)} ${row.unit || ''} (${coveragePct}%)`
             : '—'
           return (
-          <tr key={row.purchase_id} className={highlightedId && rowPurchaseIds(row).includes(highlightedId) ? 'activeRow' : undefined}>
+          <tr key={row.purchase_id} className={highlightedId && purchaseSourceIds(row).includes(highlightedId) ? 'activeRow' : undefined}>
             <td className="checkCol">
               <input
                 type="checkbox"
-                checked={rowPurchaseIds(row).every((id) => selectedIds.has(id))}
-                onChange={(e) => onSelectedIdsChange(toggleMany(selectedIds, rowPurchaseIds(row), e.target.checked))}
+                checked={purchaseSourceIds(row).every((id) => selectedIds.has(id))}
+                onChange={(e) => onSelectedIdsChange(toggleMany(selectedIds, purchaseSourceIds(row), e.target.checked))}
                 aria-label={`Выбрать ${row.item_name || row.item_article || row.purchase_id}`}
               />
             </td>

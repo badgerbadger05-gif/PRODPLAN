@@ -1,4 +1,4 @@
-import { useMemo, useState, type CSSProperties } from 'react'
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import type {
   BomFlattenedItem,
   BomItem,
@@ -20,8 +20,19 @@ import {
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
 import { SpecRepairDialog, type RepairAction } from './specification/SpecRepairDialog'
-
-type BomTab = 'tree' | 'flat' | 'where-used' | 'quality'
+import {
+  SpecificationResults,
+  type SpecificationTab,
+} from './specification/SpecificationResults'
+import {
+  filterFlattenedRows,
+  filterSpecRows,
+  flattenSpecNodes,
+  getMethodOptions,
+  itemTitle,
+  nodeItemId,
+  nodeTitle,
+} from './specification/model'
 
 type LoadedBom = {
   item: BomItem
@@ -31,77 +42,12 @@ type LoadedBom = {
   quality: BomQualityIssue[]
 }
 
-function flatten(nodes: SpecNode[], level = 0, path: string[] = []): SpecFlatRow[] {
-  return nodes.flatMap((node) => {
-    const title = nodeTitle(node)
-    const nextPath = node.type === 'item' ? [...path, title] : path
-    return [
-      { ...node, level, path: nextPath },
-      ...flatten(node.children ?? [], level + 1, nextPath),
-    ]
-  })
-}
-
-function nodeTitle(node: SpecNode) {
-  return node.type === 'operation'
-    ? node.operation?.name || 'Операция'
-    : node.name || 'Номенклатура'
-}
-
-function nodeItemId(node: SpecNode) {
-  const payload = (node as SpecNode & { item?: { id?: number | string } }).item
-  if (payload?.id == null) return null
-  const parsed = Number(payload.id)
-  return Number.isFinite(parsed) ? parsed : null
-}
-
-function itemTitle(item?: BomItem | null) {
-  if (!item) return ''
-  return [item.item_article, item.item_name].filter(Boolean).join(' · ') || item.item_code
-}
-
-function warningSeverity(warnings?: string[]) {
-  if ((warnings ?? []).includes('CYCLE_DETECTED')) return 'failed'
-  if ((warnings ?? []).length) return 'partial'
-  return 'ready'
-}
-
-function qualitySeverityClass(severity: string) {
-  if (severity === 'error') return 'failed'
-  if (severity === 'warning') return 'partial'
-  return 'ready'
-}
-
-function normalizeFilterValue(value?: string | null) {
-  return String(value || '').trim().toLowerCase()
-}
-
-function useFilteredRows(rows: SpecFlatRow[], query: string, replenishmentMethod: string) {
-  return useMemo(() => {
-    const text = query.trim().toLowerCase()
-    const method = normalizeFilterValue(replenishmentMethod)
-    if (!text && !method) return rows
-    return rows.filter((row) => {
-      if (method && normalizeFilterValue(row.replenishmentMethod) !== method) return false
-      const haystack = [
-        nodeTitle(row),
-        row.article,
-        row.stage?.name,
-        row.operation?.name,
-        row.replenishmentMethod,
-        ...(row.warnings ?? []),
-      ].filter(Boolean).join(' ').toLowerCase()
-      return !text || haystack.includes(text)
-    })
-  }, [rows, query, replenishmentMethod])
-}
-
 export function SpecificationPage() {
   const [query, setQuery] = useState('')
   const [treeFilter, setTreeFilter] = useState('')
   const [methodFilter, setMethodFilter] = useState('')
   const [rootQty, setRootQty] = useState(1)
-  const [tab, setTab] = useState<BomTab>('tree')
+  const [tab, setTab] = useState<SpecificationTab>('tree')
   const [searchItems, setSearchItems] = useState<BomItem[]>([])
   const [loaded, setLoaded] = useState<LoadedBom | null>(null)
   const [selectedNode, setSelectedNode] = useState<SpecFlatRow | null>(null)
@@ -112,24 +58,62 @@ export function SpecificationPage() {
   const [message, setMessage] = useState('')
   const [repairAction, setRepairAction] = useState<RepairAction | null>(null)
   const [picking, setPicking] = useState(false)
+  const loadSequence = useRef(0)
+  const pickerRef = useRef<HTMLDivElement>(null)
+  const pickerReturnFocus = useRef<HTMLElement | null>(null)
 
-  const rows = useMemo(() => flatten(loaded?.nodes ?? []), [loaded])
-  const filteredRows = useFilteredRows(rows, treeFilter, methodFilter)
-  const methodOptions = useMemo(() => {
-    const methods = new Set<string>()
-    rows.forEach((row) => {
-      if (row.type === 'item' && row.replenishmentMethod) methods.add(row.replenishmentMethod)
-    })
-    ;(loaded?.flattened ?? []).forEach((row) => {
-      if (row.replenishment_method) methods.add(row.replenishment_method)
-    })
-    return Array.from(methods).sort((a, b) => a.localeCompare(b, 'ru'))
-  }, [rows, loaded?.flattened])
-  const filteredFlattened = useMemo(() => {
-    const method = normalizeFilterValue(methodFilter)
-    if (!method) return loaded?.flattened ?? []
-    return (loaded?.flattened ?? []).filter((row) => normalizeFilterValue(row.replenishment_method) === method)
-  }, [loaded?.flattened, methodFilter])
+  useEffect(() => {
+    if (!picking) return
+    pickerReturnFocus.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null
+    const selector = 'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    pickerRef.current?.querySelector<HTMLElement>(selector)?.focus()
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        setPicking(false)
+        return
+      }
+      if (event.key !== 'Tab' || !pickerRef.current) return
+      const focusable = [...pickerRef.current.querySelectorAll<HTMLElement>(selector)]
+      if (!focusable.length) {
+        event.preventDefault()
+        pickerRef.current.focus()
+        return
+      }
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (event.shiftKey && (document.activeElement === first || !pickerRef.current.contains(document.activeElement))) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && (document.activeElement === last || !pickerRef.current.contains(document.activeElement))) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+    document.addEventListener('keydown', onKeyDown)
+    return () => {
+      document.removeEventListener('keydown', onKeyDown)
+      pickerReturnFocus.current?.focus()
+      pickerReturnFocus.current = null
+    }
+  }, [picking])
+
+  const rows = useMemo(() => flattenSpecNodes(loaded?.nodes ?? []), [loaded])
+  const filteredRows = useMemo(
+    () => filterSpecRows(rows, treeFilter, methodFilter),
+    [rows, treeFilter, methodFilter],
+  )
+  const methodOptions = useMemo(
+    () => getMethodOptions(rows, loaded?.flattened ?? []),
+    [rows, loaded?.flattened],
+  )
+  const filteredFlattened = useMemo(
+    () => filterFlattenedRows(loaded?.flattened ?? [], methodFilter),
+    [loaded?.flattened, methodFilter],
+  )
   const itemRows = rows.filter((row) => row.type === 'item')
   const operationRows = rows.filter((row) => row.type === 'operation')
   const warningsCount = rows.reduce((sum, row) => sum + (row.warnings?.length ?? 0), 0)
@@ -162,6 +146,7 @@ export function SpecificationPage() {
   }
 
   async function loadItem(item: BomItem) {
+    const sequence = ++loadSequence.current
     setLoading(true)
     setError('')
     setMessage('')
@@ -173,6 +158,7 @@ export function SpecificationPage() {
         getSpecificationWhereUsed({ item_id: item.item_id, max_depth: 10 }),
         getSpecificationQuality({ item_id: item.item_id, max_depth: 20 }),
       ])
+      if (sequence !== loadSequence.current) return
       setLoaded({
         item,
         nodes: tree.nodes ?? [],
@@ -184,9 +170,10 @@ export function SpecificationPage() {
       setSelectedFlat(null)
       setMessage(`Загружено: ${itemTitle(item)}`)
     } catch (e) {
+      if (sequence !== loadSequence.current) return
       setError(e instanceof Error ? e.message : String(e))
     } finally {
-      setLoading(false)
+      if (sequence === loadSequence.current) setLoading(false)
     }
   }
 
@@ -223,7 +210,30 @@ export function SpecificationPage() {
     }
   }
 
+  function handleTabKeyDown(
+    event: ReactKeyboardEvent<HTMLSpanElement>,
+    index: number,
+  ) {
+    const tabs: SpecificationTab[] = ['tree', 'flat', 'where-used', 'quality']
+    let nextIndex = index
+    if (event.key === 'ArrowRight') nextIndex = (index + 1) % tabs.length
+    else if (event.key === 'ArrowLeft') nextIndex = (index - 1 + tabs.length) % tabs.length
+    else if (event.key === 'Home') nextIndex = 0
+    else if (event.key === 'End') nextIndex = tabs.length - 1
+    else return
+
+    event.preventDefault()
+    setTab(tabs[nextIndex])
+    const tabList = event.currentTarget.parentElement
+    ;(tabList?.children[nextIndex] as HTMLElement | undefined)?.focus()
+  }
+
   const selectedTitle = selectedNode ? nodeTitle(selectedNode) : selectedFlat?.name ?? itemTitle(loaded?.item)
+  const selectedAccessibleTitle = selectedNode
+    ? selectedNode.type === 'item'
+      ? [selectedNode.article, nodeTitle(selectedNode)].filter(Boolean).join(' · ')
+      : nodeTitle(selectedNode)
+    : selectedTitle
 
   return (
     <main className="workArea">
@@ -233,7 +243,7 @@ export function SpecificationPage() {
       </div>
 
       <DocumentWindow
-        title="Спецификации"
+        title="BOM cockpit"
         subtitle="Поиск, дерево состава, плоская развертка, где используется и контроль качества"
         hotkeys="Enter — поиск / двойной переход через Открыть как корень"
         footer={(
@@ -336,152 +346,47 @@ export function SpecificationPage() {
               <div className="metricCell"><span>Проблемы</span><strong>{loaded.quality.length || warningsCount}</strong><em>quality</em></div>
             </div>
 
-            <div className="tabsBar bomTabs">
-              <button className={tab === 'tree' ? 'activeTab' : ''} onClick={() => setTab('tree')}>Дерево</button>
-              <button className={tab === 'flat' ? 'activeTab' : ''} onClick={() => setTab('flat')}>Плоская развертка</button>
-              <button className={tab === 'where-used' ? 'activeTab' : ''} onClick={() => setTab('where-used')}>Где используется</button>
-              <button className={tab === 'quality' ? 'activeTab' : ''} onClick={() => setTab('quality')}>Качество</button>
+            <div className="tabsBar bomTabs" role="tablist">
+              {([
+                ['tree', 'Дерево'],
+                ['flat', 'Плоская развертка'],
+                ['where-used', 'Где используется'],
+                ['quality', 'Качество'],
+              ] as const).map(([value, label], index) => (
+                <span
+                  key={value}
+                  id={`specification-tab-${value}`}
+                  role="tab"
+                  aria-controls={`specification-panel-${value}`}
+                  aria-selected={tab === value}
+                  tabIndex={tab === value ? 0 : -1}
+                  onKeyDown={(event) => handleTabKeyDown(event, index)}
+                  style={{ display: 'contents' }}
+                >
+                  <button
+                    className={tab === value ? 'activeTab' : ''}
+                    onClick={() => setTab(value)}
+                    tabIndex={-1}
+                  >{label}</button>
+                </span>
+              ))}
             </div>
 
             <div className="split bomCockpitSplit">
-              <div className="tablePane resultTablePane">
-                {tab === 'tree' && (
-                  <table className="journalTable bomTreeTable">
-                    <thead>
-                      <tr>
-                        <th>Узел</th>
-                        <th>Артикул</th>
-                        <th>Этап</th>
-                        <th>Метод</th>
-                        <th>Кол-во</th>
-                        <th>Ед./Норма</th>
-                        <th>Итого</th>
-                        <th>Проблемы</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {filteredRows.map((row, index) => (
-                        <tr
-                          key={`${row.id}-${index}`}
-                          className={`${row.type === 'operation' ? 'operationRow' : ''}${selectedNode?.id === row.id ? ' activeRow' : ''}`}
-                          onClick={() => setSelectedNode(row)}
-                        >
-                          <td className="itemCell bomNameCell" style={{ '--level': row.level } as CSSProperties}>
-                            <strong>{nodeTitle(row)}</strong>
-                            <span>{row.type === 'operation' ? 'операция' : `уровень ${row.level}`}</span>
-                          </td>
-                          <td>{row.article || ''}</td>
-                          <td>{row.stage?.name || ''}</td>
-                          <td>{row.type === 'operation' ? '' : row.replenishmentMethod || ''}</td>
-                          <td className="numCell"><strong>{row.qtyPerParent == null ? '' : qty(row.qtyPerParent)}</strong></td>
-                          <td>{row.type === 'operation' ? `${qty(row.timeNormNh)} н/ч` : row.unit || ''}</td>
-                          <td className="numCell"><strong>{row.computed?.treeQty == null ? '' : qty(row.computed.treeQty)}</strong></td>
-                          <td><span className={`miniPill ${warningSeverity(row.warnings)}`}>{(row.warnings ?? []).length || 'ok'}</span></td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                )}
-
-                {tab === 'flat' && (
-                  <table className="journalTable bomFlatTable">
-                    <thead>
-                      <tr>
-                        <th>Компонент</th>
-                        <th>Артикул</th>
-                        <th>Метод</th>
-                        <th>Итого</th>
-                        <th>Ед.</th>
-                        <th>Вхождений</th>
-                        <th>Уровни</th>
-                        <th>Этапы</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {filteredFlattened.map((row) => (
-                        <tr key={row.item_id} className={selectedFlat?.item_id === row.item_id ? 'activeRow' : ''} onClick={() => setSelectedFlat(row)}>
-                          <td className="itemCell"><strong>{row.name}</strong><span>{row.item_code}</span></td>
-                          <td>{row.article || ''}</td>
-                          <td>{row.replenishment_method || ''}</td>
-                          <td className="numCell"><strong>{qty(row.total_qty)}</strong></td>
-                          <td>{row.unit || ''}</td>
-                          <td className="numCell"><strong>{row.occurrences}</strong></td>
-                          <td>{row.levels.join(', ')}</td>
-                          <td>{row.stages.join(', ')}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                )}
-
-                {tab === 'where-used' && (
-                  <table className="journalTable bomWhereTable">
-                    <colgroup>
-                      <col className="bomWhereParentCol" />
-                      <col className="bomWhereSpecCol" />
-                      <col className="bomWhereSmallCol" />
-                      <col className="bomWhereSmallCol" />
-                      <col className="bomWhereQtyCol" />
-                      <col className="bomWhereStageCol" />
-                    </colgroup>
-                    <thead>
-                      <tr>
-                        <th>Родитель</th>
-                        <th>Спецификация</th>
-                        <th>Уровень вверх</th>
-                        <th>Кол-во</th>
-                        <th>Итого к цели</th>
-                        <th>Этап</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {loaded.whereUsed.map((row, index) => (
-                        <tr key={`${row.parent.item_id}-${index}`}>
-                          <td className="itemCell bomWhereParentCell">
-                            <strong title={row.parent.item_name}>{row.parent.item_name}</strong>
-                            <span title={row.parent.item_article || row.parent.item_code}>{row.parent.item_article || row.parent.item_code}</span>
-                          </td>
-                          <td className="bomWhereSpecCell" title={row.spec.spec_name || row.spec.spec_code || `#${row.spec.spec_id}`}>
-                            {row.spec.spec_name || row.spec.spec_code || `#${row.spec.spec_id}`}
-                          </td>
-                          <td className="numCell"><strong>{row.level_up}</strong></td>
-                          <td className="numCell"><strong>{qty(row.qty_per_parent)}</strong></td>
-                          <td className="numCell"><strong>{qty(row.total_qty_to_target)}</strong></td>
-                          <td className="bomWhereStageCell" title={row.stage?.name || ''}>{row.stage?.name || ''}</td>
-                        </tr>
-                      ))}
-                      {!loaded.whereUsed.length && <tr><td colSpan={6} className="emptyDetail">В родительских спецификациях не найдено</td></tr>}
-                    </tbody>
-                  </table>
-                )}
-
-                {tab === 'quality' && (
-                  <table className="journalTable bomQualityTable">
-                    <thead>
-                      <tr>
-                        <th>Проблема</th>
-                        <th>Серьезность</th>
-                        <th>Номенклатура</th>
-                        <th>Спецификация</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {loaded.quality.map((issue, index) => (
-                        <tr key={`${issue.code}-${issue.spec_id ?? ''}-${issue.item?.item_id ?? ''}-${index}`}>
-                          <td className="itemCell"><strong>{issue.message}</strong><span>{issue.code}</span></td>
-                          <td><span className={`miniPill ${qualitySeverityClass(issue.severity)}`}>{issue.severity}</span></td>
-                          <td>{issue.item ? [issue.item.item_article, issue.item.item_name].filter(Boolean).join(' · ') : ''}</td>
-                          <td>{issue.spec_id ? `#${issue.spec_id}` : ''}</td>
-                        </tr>
-                      ))}
-                      {!loaded.quality.length && <tr><td colSpan={4} className="emptyDetail">Критичных проблем не найдено</td></tr>}
-                    </tbody>
-                  </table>
-                )}
-              </div>
+              <SpecificationResults
+                tab={tab}
+                treeRows={filteredRows}
+                selectedNode={selectedNode}
+                onSelectNode={setSelectedNode}
+                flattenedRows={filteredFlattened}
+                selectedFlat={selectedFlat}
+                onSelectFlat={setSelectedFlat}
+                whereUsed={loaded.whereUsed}
+                quality={loaded.quality}
+              />
 
               <aside className="detailPane bomDetailPane">
-                <h2>{selectedTitle || 'BOM'}</h2>
+                <h2 aria-label={selectedAccessibleTitle || 'BOM'}>{selectedTitle || 'BOM'}</h2>
                 <div className="detailMeta">
                   <span>{loaded.item.item_code}</span>
                   <span>{loaded.item.spec_id ? `Спецификация #${loaded.item.spec_id}` : 'Спецификация не найдена'}</span>
@@ -549,8 +454,15 @@ export function SpecificationPage() {
         )}
 
         {loaded && picking && searchItems.length > 0 && (
-          <div className="dialogOverlay" onClick={(e) => e.target === e.currentTarget && setPicking(false)}>
-            <div className="dialogBox bomPickerBox">
+          <div className="dialogOverlay" onMouseDown={(e) => e.target === e.currentTarget && setPicking(false)}>
+            <div
+              ref={pickerRef}
+              className="dialogBox bomPickerBox"
+              role="dialog"
+              aria-modal="true"
+              aria-label={`Найдено позиций: ${searchItems.length} — выберите`}
+              tabIndex={-1}
+            >
               <div className="dialogHeader">Найдено позиций: {searchItems.length} — выберите</div>
               <div className="dialogBody">
                 <table className="journalTable bomSearchTable">

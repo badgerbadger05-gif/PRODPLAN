@@ -53,11 +53,12 @@ export function updatePeriodPlanHeader(
   })
 }
 
-export function closePeriodPlanRun(runId: number) {
-  return api<{ status: string; run_id: number }>(
-    `/v1/plan/mrp/run/${runId}/close`,
-    { method: 'POST', body: JSON.stringify({ dry_run: false }) },
-  )
+export function archivePeriodPlan(planId: number) {
+  return api<PeriodPlan>(`/v1/plan/period-plans/${planId}/archive`, { method: 'POST' })
+}
+
+export function unarchivePeriodPlan(planId: number) {
+  return api<PeriodPlan>(`/v1/plan/period-plans/${planId}/unarchive`, { method: 'POST' })
 }
 
 export function listPeriodPlanRuns(planId: number, limit = 50) {
@@ -67,45 +68,27 @@ export function listPeriodPlanRuns(planId: number, limit = 50) {
 // Re-export for callers that want the row type
 export type { PeriodPlanRun }
 
-/** MRP snapshot published by fixation (or by the compatibility recovery route).
- *
- * The counters are absent on the idempotent branch (`immutable: true`), where an
- * already published snapshot is returned instead of a freshly built one. */
-export type MrpSnapshotResult = {
-  status: string
-  generation_key: string
-  ledger_generation_id: number
-  run_id: number
-  plan_id?: number
-  published: boolean
-  immutable?: boolean
-  requirement_count?: number
-  bucket_count?: number
-  production_count?: number
-  stage_count?: number
-  purchase_count?: number
-  rework_count?: number
-  freeze_version?: number
-}
-
-/** «Зафиксировать» — one atomic action.
- *
- * The backend validates the non-empty plan, publishes the single-generation MRP
- * snapshot and marks the plan fixed in one transaction; on failure the plan stays
- * `draft`. There is no separate "run MRP" step in the canonical flow. */
 export function fixPeriodPlan(planId: number, fixedBy = 'erp-shell') {
-  return api<PeriodPlan & { mrp: MrpSnapshotResult }>(`/v1/plan/period-plans/${planId}/fix`, {
+  return api<PeriodPlan>(`/v1/plan/period-plans/${planId}/fix`, {
     method: 'POST',
     body: JSON.stringify({ fixed_by: fixedBy }),
   })
 }
 
-/** Compatibility recovery path for a plan that is already fixed but lost/never
- * got its snapshot. Idempotent. `generation_key` is server-owned — never sent. */
 export function createMrpSnapshot(planId: number) {
-  return api<MrpSnapshotResult>(
+  // The backend publishes an entire Ledger generation atomically.  Keep one
+  // idempotency key in this request body so transport-level retries cannot
+  // create a second generation for the same click.
+  const generationKey = `period-plan-${planId}-${crypto.randomUUID()}`
+  return api<{ status: string; run_id: number; plan_id: number; requirement_count: number; purchase_count: number; rework_count: number }>(
     `/v1/plan/period-plans/${planId}/mrp-snapshot`,
-    { method: 'POST', body: JSON.stringify({ started_by: 'erp-shell' }) },
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        started_by: 'erp-shell',
+        generation_key: generationKey,
+      }),
+    },
   )
 }
 
@@ -155,4 +138,24 @@ export type ReconcileResult = {
   production_added: { item_id: number; item_code?: string; qty: number }[]
   purchase_added: { item_id: number; item_code?: string; qty: number }[]
   rescheduled?: { floating: number; fixed: number; warnings: unknown[] }
+}
+
+// Пересчёт остаточной потребности по снимку: добор недопокрытия (заказы в
+// журнал, строки закупок) + перепланировка ещё не открытых в 1С заказов от
+// сегодня. В 1С ничего не пишется — только по кнопке пользователя.
+export function reconcileRun(runId: number) {
+  return api<ReconcileResult>(`/v1/plan/results/${runId}/reconcile`, {
+    method: 'POST',
+    body: JSON.stringify({ dry_run: false }),
+  })
+}
+
+export function createProductionOrdersFromRequirements(requirementIds: number[], initiatedBy = 'erp-shell') {
+  return api<{ status: string; created: unknown[]; reused: unknown[]; skipped: unknown[]; errors: string[] }>(
+    '/v1/production-control/orders/from-mrp-requirements',
+    {
+      method: 'POST',
+      body: JSON.stringify({ requirement_ids: requirementIds, initiated_by: initiatedBy }),
+    },
+  )
 }

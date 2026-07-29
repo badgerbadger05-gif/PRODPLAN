@@ -44,6 +44,27 @@ export function PurchaseFilterBar({ filters, suppliers, states, onChange, onSubm
               </select>
             </label>
           </td>
+        <td>
+          <label className="columnFilterControl">
+            <span>К заказу</span>
+            <input
+              type="checkbox"
+              checked={filters.include_to_order}
+              onChange={(e) => onChange({ ...filters, include_to_order: e.target.checked }, true)}
+            />
+          </label>
+        </td>
+        <td>
+          <label className="columnFilterControl">
+            <span>Горизонт до</span>
+            <input
+              type="date"
+              value={filters.horizon_period_to}
+              onChange={(e) => onChange({ ...filters, horizon_period_to: e.target.value }, true)}
+            />
+          </label>
+        </td>
+          <td></td>
           <td>
             <label className="columnFilterControl" title="Фаза движения товара: Нет товара / Товар в пути / На складе">
               <span>Фаза</span>

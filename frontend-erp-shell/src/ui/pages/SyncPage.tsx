@@ -1,17 +1,10 @@
 import { useEffect, useMemo, useState } from 'react'
-import type { ReactNode } from 'react'
-import { fullSyncOrder, syncActions, type NomenclatureGroupItem, type ODataConfig, type SyncAction, type SyncLogEntry, type WarehouseItem } from '../../domain/sync'
-import { downloadBase64File } from '../../lib/download'
+import { syncActions, type NomenclatureGroupItem, type ODataConfig, type SyncAction, type WarehouseItem } from '../../domain/sync'
 import {
-  exportProductionOrdersReport,
-  exportSupplierOrdersReport,
   fetchODataMetadata,
-  getNomenclatureGroupSelection,
   getODataConfig,
   listNomenclatureGroups,
   listWarehouses,
-  refreshNomenclatureGroups,
-  runSyncAction,
   saveNomenclatureGroupSelection,
   saveODataConfig,
   saveWarehouseSelection,
@@ -19,20 +12,17 @@ import {
 } from '../../services/sync'
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { StatusBar } from '../layout/StatusBar'
+import {
+  ConnectionPanel,
+  FullSyncPanel,
+  SelectionPanel,
+  SyncActionGroups,
+  SyncOperationLog,
+  SyncProgress,
+} from './sync/components'
+import { useSyncRunner } from './sync/useSyncRunner'
 
 const emptyConfig: ODataConfig = { base_url: '', username: '', password: '', token: '' }
-
-function shortResult(value: unknown) {
-  try {
-    return JSON.stringify(value).slice(0, 260)
-  } catch {
-    return String(value).slice(0, 260)
-  }
-}
-
-function nowTime() {
-  return new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-}
 
 export function SyncPage() {
   const [config, setConfig] = useState<ODataConfig>(emptyConfig)
@@ -40,15 +30,6 @@ export function SyncPage() {
   const [selectedWarehouses, setSelectedWarehouses] = useState<Set<string>>(new Set())
   const [groups, setGroups] = useState<NomenclatureGroupItem[]>([])
   const [selectedGroups, setSelectedGroups] = useState<Set<string>>(new Set())
-  // Saving the selection overwrites config/odata_groups_selected.json wholesale,
-  // so the button stays locked until both the list and the stored selection
-  // have actually been read back from the backend.
-  const [groupsLoaded, setGroupsLoaded] = useState(false)
-  const [running, setRunning] = useState<string>('')
-  const [log, setLog] = useState<SyncLogEntry[]>([])
-  const [progress, setProgress] = useState({ done: 0, total: 0, title: '' })
-  const [error, setError] = useState('')
-  const [message, setMessage] = useState('')
 
   const groupedActions = useMemo(() => {
     const map = new Map<string, SyncAction[]>()
@@ -59,19 +40,12 @@ export function SyncPage() {
     return Array.from(map.entries())
   }, [])
 
-  const busy = Boolean(running)
-  const progressPercent = progress.total ? Math.round((progress.done / progress.total) * 100) : 0
-
-  function addLog(entry: Omit<SyncLogEntry, 'at'>) {
-    setLog((current) => [{ ...entry, at: nowTime() }, ...current].slice(0, 40))
-  }
-
   async function loadConfig() {
     try {
       const data = await getODataConfig()
       setConfig({ ...emptyConfig, ...data })
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      reportError(e instanceof Error ? e.message : String(e))
     }
   }
 
@@ -81,102 +55,53 @@ export function SyncPage() {
       setWarehouses(data.rows ?? [])
       setSelectedWarehouses(new Set((data.rows ?? []).filter((row) => row.is_selected).map((row) => row.warehouse_ref1c)))
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e))
+      reportError(e instanceof Error ? e.message : String(e))
     }
   }
 
   async function loadGroups() {
     try {
-      // The list and the persisted selection live on two different endpoints.
-      const [rows, selectedIds] = await Promise.all([
-        listNomenclatureGroups(),
-        getNomenclatureGroupSelection(),
-      ])
+      const data = await listNomenclatureGroups()
+      const rows = data.items ?? data.rows ?? []
       setGroups(rows)
-      setSelectedGroups(new Set(selectedIds))
-      setGroupsLoaded(true)
+      setSelectedGroups(new Set(data.selected_ids ?? []))
     } catch (e) {
-      setGroupsLoaded(false)
-      setError(e instanceof Error ? e.message : String(e))
+      reportError(e instanceof Error ? e.message : String(e))
     }
   }
 
-  async function refreshGroups() {
-    try {
-      await runNamed('Обновить список групп из 1С', () => refreshNomenclatureGroups(config))
-    } catch {
-      // runNamed already logged the failure and filled the error line.
-      return
-    }
-    await loadGroups()
-  }
-
-  async function runNamed(title: string, runner: () => Promise<unknown>) {
-    setRunning(title)
-    setError('')
-    setMessage('')
-    addLog({ title, status: 'running' })
-    try {
-      const result = await runner()
-      addLog({ title, status: 'ok', details: shortResult(result) })
-      setMessage(`${title}: выполнено`)
-      return result
-    } catch (e) {
-      const text = e instanceof Error ? e.message : String(e)
-      addLog({ title, status: 'error', details: text })
-      setError(text)
-      throw e
-    } finally {
-      setRunning('')
-    }
-  }
-
-  async function runAction(action: SyncAction) {
-    await runNamed(action.title, () => runSyncAction(config, action))
-    if (action.id === 'warehouses') await loadWarehouses()
-  }
-
-  async function runFullSync() {
-    setRunning('Полная синхронизация')
-    setError('')
-    setMessage('')
-    setProgress({ done: 0, total: fullSyncOrder.length, title: 'Полная синхронизация' })
-    try {
-      for (const id of fullSyncOrder) {
-        const action = syncActions.find((item) => item.id === id)
-        if (!action) continue
-        addLog({ title: action.title, status: 'running' })
-        const result = await runSyncAction(config, action)
-        addLog({ title: action.title, status: 'ok', details: shortResult(result) })
-        setProgress((current) => ({ ...current, done: current.done + 1 }))
-      }
-      setMessage('Полная синхронизация завершена')
+  const {
+    error,
+    exportReport,
+    log,
+    message,
+    progress,
+    reportError,
+    runAction,
+    runFullSync,
+    runNamed,
+    running,
+  } = useSyncRunner({
+    config,
+    refreshWarehouses: loadWarehouses,
+    refreshSelections: async () => {
       await Promise.all([loadWarehouses(), loadGroups()])
-    } catch (e) {
-      const text = e instanceof Error ? e.message : String(e)
-      setError(text)
-      addLog({ title: 'Полная синхронизация', status: 'error', details: text })
-    } finally {
-      setRunning('')
-    }
-  }
+    },
+  })
+
+  const busy = Boolean(running)
+  const progressPercent = progress.total ? Math.round((progress.done / progress.total) * 100) : 0
 
   async function saveConfig() {
     await runNamed('Сохранить настройки', () => saveODataConfig(config))
-  }
-
-  async function exportReport(kind: 'production' | 'supplier') {
-    await runNamed(kind === 'production' ? 'Excel: заказы на производство' : 'Excel: заказы поставщику', async () => {
-      const result = kind === 'production' ? await exportProductionOrdersReport() : await exportSupplierOrdersReport()
-      downloadBase64File(result, kind === 'production' ? 'production_orders.xlsx' : 'supplier_orders.xlsx')
-      return result
-    })
   }
 
   useEffect(() => {
     void loadConfig()
     void loadWarehouses()
     void loadGroups()
+    // Bootstrap is intentionally one-shot; later refreshes are explicit runner callbacks.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   return (
@@ -206,58 +131,28 @@ export function SyncPage() {
       >
         <div className="syncLayout">
           <section className="syncMain">
-            <div className="syncPanel">
-              <h2>Подключение</h2>
-              <label><span>Базовый URL</span><input value={config.base_url} onChange={(e) => setConfig({ ...config, base_url: e.target.value })} /></label>
-              <div className="syncFormGrid">
-                <label><span>Пользователь</span><input value={config.username || ''} onChange={(e) => setConfig({ ...config, username: e.target.value })} /></label>
-                <label><span>Пароль</span><input type="password" value={config.password || ''} onChange={(e) => setConfig({ ...config, password: e.target.value })} /></label>
-                <label><span>Bearer token</span><input value={config.token || ''} onChange={(e) => setConfig({ ...config, token: e.target.value })} /></label>
-              </div>
-              <div className="syncActionsRow">
-                <button className="primary" onClick={() => void saveConfig()} disabled={busy}>Сохранить настройки</button>
-                <button onClick={() => void runNamed('Тест подключения', () => testODataConnection(config))} disabled={busy}>Тест подключения</button>
-                <button onClick={() => void runNamed('Выгрузить метаданные', () => fetchODataMetadata(config))} disabled={busy}>Выгрузить метаданные</button>
-              </div>
-            </div>
+            <ConnectionPanel
+              config={config}
+              busy={busy}
+              onConfigChange={setConfig}
+              onSave={() => void saveConfig()}
+              onTest={() => void runNamed('Тест подключения', () => testODataConnection(config))}
+              onFetchMetadata={() => void runNamed('Выгрузить метаданные', () => fetchODataMetadata(config))}
+            />
 
-            <div className="syncPanel syncFull">
-              <div>
-                <h2>Полная синхронизация</h2>
-                <p>Очередность: справочники, структура производства, склады, остатки, производственные и поставщицкие заказы.</p>
-              </div>
-              <button className="primary" onClick={() => void runFullSync()} disabled={busy}>Запустить полную синхронизацию</button>
-            </div>
+            <FullSyncPanel busy={busy} onRun={() => void runFullSync()} />
 
-            {progress.total > 0 && (
-              <div className="syncProgress">
-                <div><strong>{progress.title}</strong><span>{progress.done} из {progress.total} · {progressPercent}%</span></div>
-                <div className="progressTrack"><div style={{ width: `${progressPercent}%` }} /></div>
-              </div>
-            )}
+            <SyncProgress {...progress} percent={progressPercent} />
 
-            {error && <div className="errorLine">{error}</div>}
-            {message && <div className="successLine">{message}</div>}
+            {error && <div className="errorLine" role="alert">{error}</div>}
+            {message && <div className="successLine" role="status">{message}</div>}
 
-            <div className="syncGroups">
-              {groupedActions.map(([group, actions]) => (
-                <div className="syncPanel" key={group}>
-                  <h2>{group}</h2>
-                  <div className="syncButtonGrid">
-                    {actions.map((action) => (
-                      <button key={action.id} onClick={() => void runAction(action)} disabled={busy}>{action.title}</button>
-                    ))}
-                  </div>
-                </div>
-              ))}
-              <div className="syncPanel">
-                <h2>Excel-отчёты</h2>
-                <div className="syncButtonGrid">
-                  <button onClick={() => void exportReport('production')} disabled={busy}>Заказы на производство</button>
-                  <button onClick={() => void exportReport('supplier')} disabled={busy}>Учитываемые заказы поставщику</button>
-                </div>
-              </div>
-            </div>
+            <SyncActionGroups
+              groups={groupedActions}
+              busy={busy}
+              onRunAction={(action) => void runAction(action)}
+              onExport={(kind) => void exportReport(kind)}
+            />
           </section>
 
           <aside className="syncSide">
@@ -265,6 +160,7 @@ export function SyncPage() {
               title="Склады для остатков"
               count={warehouses.length}
               selected={selectedWarehouses.size}
+              busy={busy}
               onSelectAll={() => setSelectedWarehouses(new Set(warehouses.map((row) => row.warehouse_ref1c)))}
               onClear={() => setSelectedWarehouses(new Set())}
               onSave={() => void runNamed('Сохранить выбор складов', () => saveWarehouseSelection(Array.from(selectedWarehouses)))}
@@ -273,6 +169,7 @@ export function SyncPage() {
                 <label className="selectionRow" key={w.warehouse_ref1c}>
                   <input
                     type="checkbox"
+                    disabled={busy}
                     checked={selectedWarehouses.has(w.warehouse_ref1c)}
                     onChange={(e) => {
                       const next = new Set(selectedWarehouses)
@@ -290,27 +187,22 @@ export function SyncPage() {
               title="Группы номенклатуры"
               count={groups.length}
               selected={selectedGroups.size}
-              saveDisabled={!groupsLoaded || busy}
-              saveTitle={groupsLoaded ? undefined : 'Список групп и сохранённый выбор ещё не загружены'}
+              busy={busy}
               onSelectAll={() => setSelectedGroups(new Set(groups.map((row) => row.id)))}
               onClear={() => setSelectedGroups(new Set())}
               onSave={() => void runNamed('Сохранить выбор групп', () => saveNomenclatureGroupSelection(Array.from(selectedGroups)))}
-              extraActions={(
-                <button onClick={() => void refreshGroups()} disabled={busy}>Обновить из 1С</button>
-              )}
             >
               {groups.length === 0 ? (
                 <div className="emptyDetail" style={{ padding: '8px 0' }}>
-                  {!groupsLoaded
-                    ? 'Список групп не загружен — проверьте подключение к backend.'
-                    : selectedGroups.size > 0
-                      ? `Кэш групп пуст, но сохранено ${selectedGroups.size} позиций. Нажмите «Обновить из 1С», чтобы получить список.`
-                      : 'Кэш групп пуст — нажмите «Обновить из 1С».'}
+                  {selectedGroups.size > 0
+                    ? `Список групп не загружен. Сохранено ${selectedGroups.size} позиций — запустите синхронизацию «Группы номенклатуры», чтобы обновить список.`
+                    : 'Список групп пуст — запустите синхронизацию «Группы номенклатуры».'}
                 </div>
               ) : groups.map((g) => (
                 <label className="selectionRow" key={g.id}>
                   <input
                     type="checkbox"
+                    disabled={busy}
                     checked={selectedGroups.has(g.id)}
                     onChange={(e) => {
                       const next = new Set(selectedGroups)
@@ -325,47 +217,9 @@ export function SyncPage() {
             </SelectionPanel>
           </aside>
 
-          <section className="syncLog">
-            <h2>Журнал операций</h2>
-            {log.map((entry, index) => (
-              <div className={`logRow ${entry.status}`} key={`${entry.at}-${index}`}>
-                <strong>{entry.at}</strong>
-                <span>{entry.title}</span>
-                <em>{entry.status}</em>
-                {entry.details && <small>{entry.details}</small>}
-              </div>
-            ))}
-            {!log.length && <div className="emptyDetail">Операций пока не было</div>}
-          </section>
+          <SyncOperationLog entries={log} />
         </div>
       </DocumentWindow>
     </main>
-  )
-}
-
-function SelectionPanel({ title, count, selected, onSelectAll, onClear, onSave, saveDisabled, saveTitle, extraActions, children }: {
-  title: string
-  count: number
-  selected: number
-  onSelectAll: () => void
-  onClear: () => void
-  onSave: () => void
-  saveDisabled?: boolean
-  saveTitle?: string
-  extraActions?: ReactNode
-  children: ReactNode
-}) {
-  return (
-    <div className="syncPanel selectionPanel">
-      <h2>{title}</h2>
-      <div className="selectionMeta">Всего: {count} · Выбрано: {selected}</div>
-      <div className="syncActionsRow">
-        <button onClick={onSelectAll}>Все</button>
-        <button onClick={onClear}>Снять</button>
-        <button className="primary" onClick={onSave} disabled={saveDisabled} title={saveTitle}>Сохранить</button>
-        {extraActions}
-      </div>
-      <div className="selectionList">{children || <div className="emptyDetail">Список пуст</div>}</div>
-    </div>
   )
 }

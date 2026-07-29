@@ -46,23 +46,28 @@ export type OrderRow = {
   mrp_req_net_qty?: number | null
   mrp_req_covered_qty?: number | null
   mrp_req_remaining_qty?: number | null
-  // DBR: чем вызван запуск строки и какой полкой он ограничен.
-  // См. ProductionOrderJournalRowResponse в backend/app/routers/production_control.py.
-  launch_source?: LaunchSource
-  shelf_warehouse_ref1c?: string | null
-  shelf_pull_qty?: number | null
-  shelf_materialized_qty?: number | null
-  shelf_latest_start_date?: string | null
+  failed_manufacture_id?: number | null
+  failed_manufacture_error?: string | null
   paint_weld_chain?: PaintWeldChainInfo | null
+  source_dbr_signal_id?: number | null
+  planning?: ProductionPlanningInfo | null
 }
 
-// Источник запуска строки журнала: вытягивание с полки DBR либо остаток MRP.
-// Значения приходят готовыми (LAUNCH_SOURCE_SHELF / LAUNCH_SOURCE_MRP в
-// backend/app/services/production_control_journal.py), frontend их не выводит.
-export type LaunchSource = 'shelf_pull' | 'mrp_remaining'
-
-export function isShelfPullRow(row: Pick<OrderRow, 'launch_source'>) {
-  return row.launch_source === 'shelf_pull'
+export type ProductionPlanningInfo = {
+  contour?: 'mrp' | 'dbr_drum' | 'dbr_feeder' | 'manual' | '1c' | string | null
+  source_id?: number | null
+  program_id?: number | null
+  schedule_id?: number | null
+  slot_id?: number | null
+  signal_type?: string | null
+  priority?: number | null
+  zone?: 'red' | 'yellow' | 'green' | string | null
+  need_date?: string | null
+  required_date?: string | null
+  queue_state?: 'ready' | 'blocked' | 'not_due' | 'diagnostic' | string | null
+  chain_depth?: number | null
+  parent_signal_id?: number | null
+  reason?: string | null
 }
 
 // Цепочка «окраска↔сварка»: строка входит в связанную пару заказов.
@@ -71,92 +76,6 @@ export type PaintWeldChainInfo = {
   link_id: number
   counterpart_order_id?: number | null
   counterpart_product_id?: number | null
-}
-
-// Фактический контракт закрытия цепочки:
-// backend/app/services/paint_weld_chain.py::close_paint_chain,
-// backend/app/routers/paint_weld.py::chain_close.
-export type PaintWeldChainSide = 'weld' | 'paint'
-
-export type PaintWeldChainCloseStatus = 'ok' | 'partial'
-
-export type PaintWeldChainState =
-  | 'not_started'
-  | 'partially_posted'
-  | 'manufactures_posted'
-  | 'manufactures_posted_piecework_pending'
-  | 'closed'
-
-export type PaintWeldChainSidePlan = {
-  product_id: number
-  order_id: number
-  remaining_qty: number
-  qty_to_produce: number
-  existing_manufacture_id?: number | null
-  manufacture_id?: number
-  manufacture_ref1c?: string | null
-  produce?: ProduceLineResult | null
-  error?: string
-}
-
-// Комбинированный СдельныйНаряд цепочки: export_chain_piecework_to_1c.
-export type ChainPieceworkExportResult = {
-  status: 'ok' | 'existing' | 'error' | 'partial_error'
-  dry_run: boolean
-  entity: string
-  combined: boolean
-  weld_manufacture_id: number
-  paint_manufacture_id: number
-  target_ref_key?: string | null
-  reason?: string
-  error?: string
-  created?: number
-  errored?: number
-  skipped_rows: Array<Record<string, unknown>>
-  entries?: Array<Record<string, unknown>>
-  payloads?: Array<Record<string, unknown>>
-}
-
-export type PaintWeldChainCloseResult = {
-  status: PaintWeldChainCloseStatus
-  dry_run: boolean
-  initiated_by?: string | null
-  chain_link_id: number
-  weld: PaintWeldChainSidePlan
-  paint: PaintWeldChainSidePlan
-  chain_state: PaintWeldChainState
-  resume_required: boolean
-  posted_sides: PaintWeldChainSide[]
-  pending_sides: PaintWeldChainSide[]
-  // Готовое человекочитаемое объяснение частичного закрытия — backend владеет
-  // формулировкой, frontend её не собирает.
-  message?: string
-  error?: string
-  ledger_readback?: 'queued'
-  manufactures_export?: ExportManufacturesResult
-  piecework_export?: ChainPieceworkExportResult
-  piecework_preview?: ChainPieceworkExportResult | null
-}
-
-export const paintWeldChainSideLabels: Record<PaintWeldChainSide, string> = {
-  weld: 'сварка',
-  paint: 'окраска',
-}
-
-export const paintWeldChainStateLabels: Record<PaintWeldChainState, string> = {
-  not_started: 'Не начата',
-  partially_posted: 'Проведена частично',
-  manufactures_posted: 'Сборки запасов проведены',
-  manufactures_posted_piecework_pending: 'Сборки проведены, наряда нет',
-  closed: 'Закрыта',
-}
-
-export function paintWeldChainStateLabel(state: PaintWeldChainState) {
-  return paintWeldChainStateLabels[state] ?? state
-}
-
-export function paintWeldChainSidesLabel(sides: PaintWeldChainSide[]) {
-  return sides.map((side) => paintWeldChainSideLabels[side] ?? side).join(', ')
 }
 
 export type MaterialRow = {
@@ -334,6 +253,50 @@ export type MaterialIssueCreatePayload = {
   source_warehouse_ref1c?: string | null
 }
 
+export type ProduceLinePayload = {
+  qty: number
+  executor?: string | null
+  operation_executors?: Array<{
+    line_number?: number
+    spec_operation_id?: number
+    operation_id?: number
+    employee_ref1c?: string
+    employee_name?: string
+  }>
+  comment?: string | null
+}
+
+export type ProduceLineResult = {
+  status: string
+  manufacture_id: number
+  product_id: number
+  order_id: number
+  qty: number
+  produced_qty_total: number
+  remaining_qty: number
+  overproduced_qty: number
+  order_quantity_before: number
+  order_quantity_after: number
+  line_status: string
+}
+
+export type ReturnLeftoversResult = {
+  status: string
+  issued_issues: number
+  created_issues: number
+  skipped_rows: Array<{ issue_id?: number; reason?: string }>
+  entries: Array<{
+    product_id: number
+    issue_id: number
+    direction: string
+    issued_qty: number
+    returned_qty: number
+    warehouse_ref1c?: string | null
+    source_warehouse_ref1c?: string | null
+    detail?: string
+  }>
+}
+
 export type TransferIssueRow = {
   issue_id: number
   document_number: string
@@ -395,113 +358,6 @@ export type MaterialIssueDetail = TransferIssueRow & {
   }>
 }
 
-export type ProductionOrderFilters = {
-  search: string
-  status: string
-  workshop_id: string
-  coverage_status: string
-  root_item_id: string
-  sort_by: 'planned_start_date'
-  sort_dir: 'asc' | 'desc'
-}
-
-export type ProduceLinePayload = {
-  qty: number
-  executor?: string | null
-  operation_executors?: Array<{
-    line_number?: number
-    spec_operation_id?: number
-    operation_id?: number
-    employee_ref1c?: string
-    employee_name?: string
-  }>
-  comment?: string | null
-}
-
-export type ProduceLineResult = {
-  status: string
-  manufacture_id: number
-  product_id: number
-  order_id: number
-  qty: number
-  produced_qty_total: number
-  remaining_qty: number
-  commanded_qty_total: number
-  command_remaining_qty: number
-  fact_pending: boolean
-  line_status: string
-  ledger_readback: 'queued'
-  manufacture_export: ExportManufacturesResult
-  piecework_export: ExportPieceworkResult
-}
-
-export type ReturnLeftoversResult = {
-  status: string
-  issued_issues: number
-  created_issues: number
-  skipped_rows: Array<{ issue_id?: number; reason?: string }>
-  entries: Array<{
-    product_id: number
-    issue_id: number
-    direction: string
-    issued_qty: number
-    returned_qty: number
-    warehouse_ref1c?: string | null
-    source_warehouse_ref1c?: string | null
-    detail?: string
-  }>
-}
-
-export type ExportManufacturesResult = {
-  status: string
-  manufactures_eligible: number
-  manufactures_created: number
-  manufactures_existing: number
-  manufactures_already_linked: number
-  manufactures_error: number
-  payloads: Array<Record<string, unknown>>
-  skipped_rows: Array<Record<string, unknown>>
-  entries: Array<Record<string, unknown>>
-}
-
-export type ExportPieceworkResult = {
-  status: string
-  manufactures_eligible: number
-  manufactures_created: number
-  manufactures_already_linked: number
-  manufactures_error: number
-  payloads: Array<Record<string, unknown>>
-  skipped_rows: Array<Record<string, unknown>>
-  entries: Array<Record<string, unknown>>
-}
-
-export type OrderQuantityPatchResponse = {
-  status: string
-  quantity: number
-  remaining_qty: number
-  mrp_req_net_qty?: number | null
-  mrp_req_covered_qty?: number | null
-  mrp_req_remaining_qty?: number | null
-}
-
-export type OrderStatePatchPayload = {
-  status?: string
-  issue_status?: string
-  workshop_id?: number
-  planned_start_date?: string
-  planned_finish_date?: string
-  comment?: string
-}
-
-export type SyncPostedTransfersResponse = {
-  status: string
-  candidates: number
-  advanced: number
-  errors: string[]
-}
-
-export type ProductionFilters = ProductionOrderFilters
-
 export const productionStatusOptions = [
   ['shortage', 'Дефицит'],
   ['to_move', 'К перемещению'],
@@ -524,6 +380,17 @@ export const coverageLabels: Record<string, string> = {
   produced: 'Готов',
   production_error: 'Ошибка выпуска',
   completed: 'Завершён',
+}
+
+export type ProductionFilters = {
+  search: string
+  status: string
+  workshop_id: string
+  coverage_status: string
+  root_item_id: string
+  planning_contour: string
+  sort_by: 'planned_start_date' | 'dbr_priority'
+  sort_dir: 'asc' | 'desc'
 }
 
 export function productionStatusLabel(value: string) {

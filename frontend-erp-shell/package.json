@@ -7,8 +7,12 @@
     "dev": "vite --host 0.0.0.0 --port 9300",
     "lint": "eslint .",
     "smoke": "playwright test",
-    "test": "vitest run",
+    "test": "vitest run && npm run test:bundle-budget",
+    "test:bundle-budget": "node --test scripts/check-bundle-budget.test.mjs",
+    "test:watch": "vitest",
+    "api:types": "openapi-typescript ../docs/api/openapi.json -o src/lib/apiTypes.ts",
     "build": "tsc -b && vite build",
+    "bundle:check": "node scripts/check-bundle-budget.mjs",
     "preview": "vite preview --host 0.0.0.0 --port 9301"
   },
   "dependencies": {
@@ -22,6 +26,9 @@
   "devDependencies": {
     "@eslint/js": "^9.39.4",
     "@playwright/test": "^1.60.0",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@testing-library/user-event": "^14.6.1",
     "@types/node": "^22.15.21",
     "@types/react": "^19.1.5",
     "@types/react-dom": "^19.1.5",
@@ -29,6 +36,8 @@
     "eslint-plugin-react-hooks": "^7.1.1",
     "eslint-plugin-react-refresh": "^0.5.2",
     "globals": "^17.6.0",
+    "jsdom": "^25.0.1",
+    "openapi-typescript": "^7.13.0",
     "typescript-eslint": "^8.46.0",
     "vitest": "^3.2.7"
   },
