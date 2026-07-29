@@ -9,10 +9,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from hashlib import sha256
 import json
 from typing import Any
+
+
+_QTY_QUANTUM = Decimal("0.001")
 
 
 def _dec(value: Any) -> Decimal:
@@ -199,7 +202,17 @@ def build_drum_plan(
                 free_capacity = max(resource_capacity - used, Decimal("0"))
                 available = free_capacity * rate
                 if available > 0:
-                    take = min(remaining, available)
+                    # Persisted drum quantities have scale 3.  Repeated
+                    # ``take / rate`` operations can leave a positive Decimal
+                    # residue such as 2.25E-27 after the day is physically
+                    # exhausted.  It must not become a slot that the database
+                    # rounds to 0.000; floor the candidate to the canonical
+                    # quantity quantum and leave any unusable residue for a
+                    # later day or an explicit capacity gap.
+                    take = min(remaining, available).quantize(
+                        _QTY_QUANTUM,
+                        rounding=ROUND_DOWN,
+                    )
                     if take > 0:
                         output_slots.append(
                             PlannedSlot(
