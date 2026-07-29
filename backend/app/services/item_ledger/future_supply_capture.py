@@ -376,8 +376,13 @@ def replace_future_supply_capture(
     """Atomically replace one BUILDING snapshot batch's future-supply projection.
 
     A savepoint gives the caller all-or-nothing behavior without committing or
-    rolling back its transaction.  The batch remains ``building``: lifecycle
-    ownership stays with the generation orchestrator.
+    rolling back its transaction.  The batch keeps whatever status it had:
+    lifecycle ownership stays with the generation orchestrator.
+
+    A generation that is still BUILDING may be resumed after its snapshot batch
+    was already sealed COMPLETED, so that batch is accepted too — but only as a
+    re-read: a completed batch's rows must come out byte-identical, and any
+    difference is a conflict rather than an overwrite of sealed evidence.
     """
     generation = db.get(models.LedgerGeneration, int(generation_id))
     if generation is None or str(generation.status) != "building":
@@ -387,9 +392,12 @@ def replace_future_supply_capture(
         batch is None
         or int(batch.ledger_generation_id) != int(generation.id)
         or str(batch.stage) != "snapshot_build"
-        or str(batch.status) != "building"
+        or str(batch.status) not in {"building", "completed"}
     ):
-        raise FutureSupplyCaptureError("capture batch must be this generation's BUILDING snapshot_build batch")
+        raise FutureSupplyCaptureError(
+            "capture batch must be this generation's BUILDING or own COMPLETED "
+            "snapshot_build batch"
+        )
 
     rows, metrics = _validated_rows(generation, evidence)
     with db.begin_nested():
@@ -422,6 +430,10 @@ def replace_future_supply_capture(
             _row_hash_payload(row) for row in rows
         ]:
             return metrics
+        if str(batch.status) == "completed":
+            raise FutureSupplyCaptureError(
+                "completed capture batch conflicts with the recaptured future supply"
+            )
         for existing_row in replaced_rows:
             db.delete(existing_row)
         # Flush the delete before re-inserting: this keeps the SQLAlchemy

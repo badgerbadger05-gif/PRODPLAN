@@ -1,12 +1,15 @@
 """Persistence-level guards for the shelf projection inputs.
 
-Covers two ways the projection used to read more demand or more usable stock
+Covers three ways the projection used to read more demand or more usable stock
 than the canon allows:
 
 * frozen norms were joined by ``run_id`` only, so every historical freeze
   version of the same run inflated ``shelf_target_qty``;
 * every non-shelf warehouse counted as transferable, including the ignored
-  ones (tolling stock, scrap isolator).
+  ones (tolling stock, scrap isolator);
+* confirmed production was collapsed into one undated scalar under a
+  "finishes before the end of the protection window" filter, so an order that
+  lands *after* an earlier drum slot still counted as its coverage.
 """
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -140,6 +143,146 @@ def _freeze_component(db, *, run, parent, component, version: int, norm: str):
         )
     )
     db.flush()
+
+
+def _confirmed_order(db, *, component, requirement_id, qty: str, finish: date | None):
+    """One confirmed production order onto the shelf, finishing on ``finish``."""
+    order = models.ProductionOrder(
+        order_number=f"CONF-{requirement_id}-{finish}",
+        order_date=datetime(2026, 7, 20, tzinfo=timezone.utc),
+        deletion_mark=False,
+        is_posted=False,
+        source="mrp",
+    )
+    db.add(order)
+    db.flush()
+    product = models.ProductionProduct(
+        order_id=order.order_id,
+        item_id=component.item_id,
+        line_number=1,
+        destination_warehouse_ref1c="SHELF",
+        quantity=Decimal(qty),
+        produced_qty=Decimal("0"),
+        remaining_qty=Decimal(qty),
+        source_mrp_requirement_id=int(requirement_id),
+    )
+    db.add(product)
+    db.flush()
+    db.add(
+        models.ProductionOrderLineState(
+            product_id=product.product_id,
+            status="in_progress",
+            planned_finish_date=finish,
+        )
+    )
+    db.flush()
+    return product
+
+
+def test_confirmed_production_covers_only_the_slots_it_lands_before(db_session):
+    """A late order must not close an earlier shortage.
+
+    The drum needs 10 units on 2026-07-27 and 10 more on 2026-07-28.  A
+    confirmed order finishing on 2026-08-01 is inside the protection window
+    (which runs to 2026-08-06) — the old scalar therefore counted its whole 20
+    as coverage and reported no gap at all.  Dated receipts make the core see
+    that nothing has landed by either need date.
+    """
+    generation, item, component, run = _contour(
+        db_session, key="late-receipt", active_freeze_version=1
+    )
+    _freeze_component(
+        db_session, run=run, parent=item, component=component, version=1, norm="2"
+    )
+    requirement_id = int(
+        db_session.query(models.MrpRequirement.id)
+        .filter(models.MrpRequirement.run_id == run.run_id)
+        .scalar()
+    )
+    _confirmed_order(
+        db_session,
+        component=component,
+        requirement_id=requirement_id,
+        qty="20",
+        finish=date(2026, 8, 1),
+    )
+
+    materialize_drum_schedule(db_session, generation.id)
+    materialize_shelf_projections(db_session, generation.id)
+
+    row = db_session.query(models.ShelfProjection).one()
+    assert row.target_qty == Decimal("20")
+    # The order is still confirmed — it just is not coverage for these dates.
+    assert row.confirmed_open_production_qty == Decimal("20")
+    assert row.projected_qty == Decimal("0")
+    assert row.gap_qty == Decimal("20")
+    assert row.first_shortage_date == date(2026, 7, 27)
+    # replenishment_time_days=5 back from the first shortage.
+    assert row.latest_start_date == date(2026, 7, 22)
+    # 100 open MRP minus the 20 already launched stays pullable.
+    assert row.unlaunched_mrp_qty == Decimal("80")
+    assert row.pull_qty == Decimal("20")
+
+
+def test_confirmed_production_landing_before_the_slot_still_covers_it(db_session):
+    """The same order one week earlier is coverage, and the gap closes."""
+    generation, item, component, run = _contour(
+        db_session, key="early-receipt", active_freeze_version=1
+    )
+    _freeze_component(
+        db_session, run=run, parent=item, component=component, version=1, norm="2"
+    )
+    requirement_id = int(
+        db_session.query(models.MrpRequirement.id)
+        .filter(models.MrpRequirement.run_id == run.run_id)
+        .scalar()
+    )
+    _confirmed_order(
+        db_session,
+        component=component,
+        requirement_id=requirement_id,
+        qty="20",
+        finish=date(2026, 7, 26),
+    )
+
+    materialize_drum_schedule(db_session, generation.id)
+    materialize_shelf_projections(db_session, generation.id)
+
+    row = db_session.query(models.ShelfProjection).one()
+    assert row.projected_qty == Decimal("20")
+    assert row.gap_qty == Decimal("0")
+    assert row.first_shortage_date is None
+    assert row.pull_qty == Decimal("0")
+
+
+def test_undated_confirmed_production_is_never_shelf_coverage(db_session):
+    """An order with no planned finish date cannot be time-phased at all."""
+    generation, item, component, run = _contour(
+        db_session, key="undated-receipt", active_freeze_version=1
+    )
+    _freeze_component(
+        db_session, run=run, parent=item, component=component, version=1, norm="2"
+    )
+    requirement_id = int(
+        db_session.query(models.MrpRequirement.id)
+        .filter(models.MrpRequirement.run_id == run.run_id)
+        .scalar()
+    )
+    _confirmed_order(
+        db_session,
+        component=component,
+        requirement_id=requirement_id,
+        qty="20",
+        finish=None,
+    )
+
+    materialize_drum_schedule(db_session, generation.id)
+    materialize_shelf_projections(db_session, generation.id)
+
+    row = db_session.query(models.ShelfProjection).one()
+    assert row.confirmed_open_production_qty == Decimal("0")
+    assert row.gap_qty == Decimal("20")
+    assert row.pull_qty == Decimal("20")
 
 
 def test_shelf_demand_reads_only_the_active_freeze_version(db_session):

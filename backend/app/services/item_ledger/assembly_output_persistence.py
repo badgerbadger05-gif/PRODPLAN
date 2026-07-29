@@ -368,6 +368,44 @@ def _decision_payload_by_fact(current_fact: _OutputFact) -> dict[str, Any]:
     )
 
 
+def _persist_rows(
+    db: Session,
+    generation: models.LedgerGeneration,
+    fact_signature: list[dict[str, Any]],
+    allocation_signature: list[dict[str, Any]],
+    fact_by_sle: dict[int, _OutputFact],
+) -> None:
+    for fact_row in fact_signature:
+        fact = fact_by_sle[int(fact_row["stock_ledger_entry_id"])]
+        db.add(
+            models.AssemblyOutputFactDecision(
+                ledger_generation_id=int(generation.id),
+                stock_ledger_entry_id=int(fact_row["stock_ledger_entry_id"]),
+                decision_status=_text(fact_row["decision_status"]),
+                link_kind=_text(fact_row["link_kind"]),
+                reason=_text(fact_row["reason"]) or None,
+                evidence_payload=_decision_payload_by_fact(fact),
+                source_content_hash=_text(fact_row["source_content_hash"]),
+                surplus_qty=_dec(fact_row["surplus_qty"]),
+            )
+        )
+
+    for alloc in allocation_signature:
+        db.add(
+            models.AssemblyOutputAllocation(
+                ledger_generation_id=int(generation.id),
+                stock_ledger_entry_id=int(alloc["stock_ledger_entry_id"]),
+                plan_id=int(alloc["plan_id"]),
+                plan_line_id=int(alloc["plan_line_id"]),
+                allocated_qty=_dec(alloc["allocated_qty"]),
+                match_rule=_text(alloc["match_rule"]),
+                allocation_ordinal=int(alloc["allocation_ordinal"]),
+            )
+        )
+
+    db.flush()
+
+
 def materialize_assembly_output_allocations(
     db: Session,
     generation_id: int,
@@ -453,37 +491,26 @@ def materialize_assembly_output_allocations(
         }
 
     if existing_batch is not None:
-        raise ValueError("assembly output allocation batch drift")
+        # A resumed refresh replays this stage from the top, so the batch this
+        # very generation already completed is a success — not drift — provided
+        # the rebuilt set still matches the metrics it recorded.  The frequent
+        # case is a close with no assembly facts at all: the pass writes neither
+        # a decision nor an allocation, and the old unconditional raise made it
+        # reject the empty batch it had written itself, killing every resume
+        # past this stage.  Anything the interrupted worker never got to write
+        # is written now; a real content change still fails on the metrics.
+        if _canonical(dict(existing_batch.metrics or {})) != _canonical(
+            expected_batch_metrics
+        ):
+            raise ValueError("assembly output allocation batch drift")
+        _persist_rows(db, generation, fact_signature, allocation_signature, fact_by_sle)
+        return {
+            "ledger_generation_id": int(generation.id),
+            "batch_id": int(existing_batch.id),
+            **metrics,
+        }
 
-    for fact_row in fact_signature:
-        fact = fact_by_sle[int(fact_row["stock_ledger_entry_id"])]
-        db.add(
-            models.AssemblyOutputFactDecision(
-                ledger_generation_id=int(generation.id),
-                stock_ledger_entry_id=int(fact_row["stock_ledger_entry_id"]),
-                decision_status=_text(fact_row["decision_status"]),
-                link_kind=_text(fact_row["link_kind"]),
-                reason=_text(fact_row["reason"]) or None,
-                evidence_payload=_decision_payload_by_fact(fact),
-                source_content_hash=_text(fact_row["source_content_hash"]),
-                surplus_qty=_dec(fact_row["surplus_qty"]),
-            )
-        )
-
-    for alloc in allocation_signature:
-        db.add(
-            models.AssemblyOutputAllocation(
-                ledger_generation_id=int(generation.id),
-                stock_ledger_entry_id=int(alloc["stock_ledger_entry_id"]),
-                plan_id=int(alloc["plan_id"]),
-                plan_line_id=int(alloc["plan_line_id"]),
-                allocated_qty=_dec(alloc["allocated_qty"]),
-                match_rule=_text(alloc["match_rule"]),
-                allocation_ordinal=int(alloc["allocation_ordinal"]),
-            )
-        )
-
-    db.flush()
+    _persist_rows(db, generation, fact_signature, allocation_signature, fact_by_sle)
 
     batch = models.LedgerBuildBatch(
         ledger_generation_id=int(generation.id),

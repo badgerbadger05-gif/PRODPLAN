@@ -84,6 +84,10 @@ class DrumSlotRow(BaseModel):
     plan_id: int
     plan_line_id: int
     item_id: int
+    # Additive: the drum board used to render bare item ids. Nullable because a
+    # slot is keyed by the persisted generation, not by the live item table.
+    item_code: str | None = None
+    item_name: str | None = None
     resource_id: int
     slot_date: str
     slot_qty: float
@@ -160,6 +164,18 @@ DBR_PAGE_DEFAULT = 1000
 DBR_PAGE_MAX = 10000
 
 
+def _items_by_id(db: Session, item_ids: set[int]) -> dict[int, models.Item]:
+    """Label lookup for one already-paged read; never widens the page itself."""
+    if not item_ids:
+        return {}
+    return {
+        int(item.item_id): item
+        for item in db.query(models.Item)
+        .filter(models.Item.item_id.in_(sorted(item_ids)))
+        .all()
+    }
+
+
 @router.get("/assembly-queue", response_model=AssemblyQueueResponse)
 def get_assembly_queue(
     limit: Annotated[int, Query(ge=1, le=DBR_PAGE_MAX)] = DBR_PAGE_DEFAULT,
@@ -186,9 +202,12 @@ def get_assembly_queue(
         raise HTTPException(
             status_code=503,
             detail={
+                # Readiness first: its own ``reason`` is None whenever the truth
+                # pointer is healthy, so unpacking it last used to erase the only
+                # sentence that explains what is actually missing.
+                **readiness.as_dict(),
                 "code": "assembly_queue_unavailable",
                 "reason": "assembly queue snapshot is missing for accepted generation",
-                **readiness.as_dict(),
             },
         )
     payload = dict(snapshot.payload or {})
@@ -234,9 +253,11 @@ def get_drum_schedule(
         raise HTTPException(
             status_code=503,
             detail={
+                # Same ordering rule as the assembly queue above: the explicit
+                # reason must survive the readiness projection.
+                **truth.as_dict(),
                 "code": "drum_schedule_unavailable",
                 "reason": "drum schedule is missing for accepted generation",
-                **truth.as_dict(),
             },
         )
     slot_query = db.query(models.DrumSlot).filter(
@@ -270,6 +291,9 @@ def get_drum_schedule(
         .limit(limit)
         .all()
     )
+    # Item labels for this page only, in one query — the drum board needs a name
+    # next to every slot, not the raw item id.
+    slot_items = _items_by_id(db, {int(row.item_id) for row in slots})
     return DrumScheduleResponse.model_validate(
         {
             "schedule_from": schedule.schedule_from.isoformat(),
@@ -279,6 +303,16 @@ def get_drum_schedule(
                     "plan_id": row.plan_id,
                     "plan_line_id": row.plan_line_id,
                     "item_id": row.item_id,
+                    "item_code": (
+                        slot_items[int(row.item_id)].item_code
+                        if int(row.item_id) in slot_items
+                        else None
+                    ),
+                    "item_name": (
+                        slot_items[int(row.item_id)].item_name
+                        if int(row.item_id) in slot_items
+                        else None
+                    ),
                     "resource_id": row.resource_id,
                     "slot_date": row.slot_date.isoformat(),
                     "slot_qty": float(row.slot_qty),
@@ -344,17 +378,7 @@ def get_shelf_projections(
         .limit(limit)
         .all()
     )
-    item_ids = sorted({int(row.item_id) for row in rows})
-    items = (
-        {
-            int(item.item_id): item
-            for item in db.query(models.Item)
-            .filter(models.Item.item_id.in_(item_ids))
-            .all()
-        }
-        if item_ids
-        else {}
-    )
+    items = _items_by_id(db, {int(row.item_id) for row in rows})
     payload = [
         {
             "policy_id": row.shelf_policy_id,

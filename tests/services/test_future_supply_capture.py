@@ -143,6 +143,64 @@ def test_reversed_input_has_same_metrics_and_does_not_rewrite(db_session):
     assert after == before
 
 
+def test_sealed_snapshot_batch_is_re_read_but_never_overwritten(db_session):
+    """A BUILDING generation may be resumed after its snapshot batch was sealed.
+
+    ``close_fixed_plan`` replays every stage from the top, so the capture is
+    re-entered once ``snapshot_build`` is already COMPLETED.  Insisting on a
+    BUILDING batch killed that resume outright.  A completed batch is now
+    accepted as a re-read only: identical evidence returns the same metrics and
+    touches nothing, while a changed capture is a conflict, not an overwrite.
+    """
+    generation, batch, item = _context(db_session, "sealed")
+    evidence = [_evidence(generation, item)]
+    first = replace_future_supply_capture(db_session, generation.id, batch.id, evidence)
+    db_session.flush()
+    before = [
+        (row.id, row.created_at)
+        for row in db_session.query(models.LedgerFutureSupply).order_by(
+            models.LedgerFutureSupply.id
+        )
+    ]
+    batch.status = "completed"
+    db_session.flush()
+
+    assert replace_future_supply_capture(
+        db_session, generation.id, batch.id, evidence
+    ) == first
+    assert [
+        (row.id, row.created_at)
+        for row in db_session.query(models.LedgerFutureSupply).order_by(
+            models.LedgerFutureSupply.id
+        )
+    ] == before
+
+    with pytest.raises(FutureSupplyCaptureError, match="completed capture batch"):
+        replace_future_supply_capture(
+            db_session,
+            generation.id,
+            batch.id,
+            [_evidence(generation, item, ordered="99")],
+        )
+    assert db_session.query(models.LedgerFutureSupply).count() == 1
+
+
+def test_capture_batch_of_another_stage_or_generation_is_still_refused(db_session):
+    generation, batch, item = _context(db_session, "foreign")
+    other = models.LedgerBuildBatch(
+        ledger_generation_id=generation.id, stage="shelf_projection",
+        status="completed", batch_key="foreign-stage", algorithm_version="test",
+        metrics={},
+    )
+    db_session.add(other)
+    db_session.flush()
+
+    with pytest.raises(FutureSupplyCaptureError, match="snapshot_build batch"):
+        replace_future_supply_capture(
+            db_session, generation.id, other.id, [_evidence(generation, item)]
+        )
+
+
 def test_outer_rollback_removes_capture(db_session):
     generation, batch, item = _context(db_session)
     db_session.commit()

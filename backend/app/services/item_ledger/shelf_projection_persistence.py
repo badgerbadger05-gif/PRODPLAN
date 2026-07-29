@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from app import models
 
 from .reservation import replenishment_remaining
-from .shelf_projection_core import ShelfDemand, project_shelf
+from .shelf_projection_core import ShelfDemand, ShelfReceipt, project_shelf
 
 
 STAGE = "shelf_projection"
@@ -172,14 +172,25 @@ def _stock(
     return shelf, other
 
 
-def _confirmed_production(
+def _confirmed_receipts(
     db: Session,
     requirement_ids: list[int],
     warehouse_ref1c: str,
-    protection_until,
-) -> Decimal:
+) -> tuple[ShelfReceipt, ...]:
+    """Confirmed production for this shelf, kept as dated receipts.
+
+    This used to collapse into one scalar under a ``planned_finish_date <=
+    protection_until`` filter, which made every in-window order cover every
+    in-window need date — including the ones it lands after.  The canon counts
+    a confirmed order as coverage only when it arrives *before the need date*,
+    so every date is handed to the core untouched and the core decides: a late
+    receipt no longer silently closes an early shortage and suppresses the pull.
+    An order with no planned finish date stays out entirely — it cannot be
+    time-phased, and treating it as already on the shelf would be the same
+    over-coverage in a different disguise.
+    """
     if not requirement_ids:
-        return Decimal("0")
+        return ()
     rows = (
         db.query(models.ProductionProduct, models.ProductionOrderLineState)
         .outerjoin(
@@ -194,15 +205,15 @@ def _confirmed_production(
         )
         .all()
     )
-    return sum(
-        (
-            _d(product.remaining_qty)
-            for product, state in rows
-            if state is not None
-            and state.planned_finish_date is not None
-            and state.planned_finish_date <= protection_until
-        ),
-        Decimal("0"),
+    return tuple(
+        ShelfReceipt(
+            available_from=state.planned_finish_date,
+            qty=_d(product.remaining_qty),
+        )
+        for product, state in rows
+        if state is not None
+        and state.planned_finish_date is not None
+        and _d(product.remaining_qty) > 0
     )
 
 
@@ -297,27 +308,8 @@ def materialize_shelf_projections(
             str(policy.warehouse_ref1c),
             ignored_warehouses,
         )
-        preliminary = project_shelf(
-            tuple(
-                ShelfDemand(row["need_date"], row["qty"], row["priority"])
-                for row in manifest
-            ),
-            as_of=as_of,
-            replenishment_time_days=int(policy.replenishment_time_days),
-            review_cycle_days=int(policy.review_cycle_days),
-            safety_days=int(policy.safety_days),
-            batch_multiple=_d(policy.batch_multiple),
-            open_mrp_qty=open_qty,
-            shelf_physical_qty=shelf_qty,
-            other_stock_qty=other_qty,
-            confirmed_open_production_qty=Decimal("0"),
-        )
-        confirmed = _confirmed_production(
-            db,
-            requirement_ids,
-            str(policy.warehouse_ref1c),
-            preliminary.protection_until,
-        )
+        # One pass now: the second projection only ever existed to learn
+        # ``protection_until`` for the receipt filter this no longer applies.
         result = project_shelf(
             tuple(
                 ShelfDemand(row["need_date"], row["qty"], row["priority"])
@@ -331,7 +323,12 @@ def materialize_shelf_projections(
             open_mrp_qty=open_qty,
             shelf_physical_qty=shelf_qty,
             other_stock_qty=other_qty,
-            confirmed_open_production_qty=confirmed,
+            confirmed_open_production_qty=Decimal("0"),
+            confirmed_receipts=_confirmed_receipts(
+                db,
+                requirement_ids,
+                str(policy.warehouse_ref1c),
+            ),
         )
         row = models.ShelfProjection(
             ledger_generation_id=int(generation.id),

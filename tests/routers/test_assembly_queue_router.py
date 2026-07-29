@@ -223,6 +223,38 @@ def test_assembly_queue_router_rejects_missing_snapshot_even_with_capability(
     assert detail["code"] == "assembly_queue_unavailable"
 
 
+def test_missing_snapshot_detail_keeps_its_own_reason(db_session):
+    """The readiness projection must not erase the explicit diagnosis.
+
+    The truth pointer is perfectly healthy here, so ``readiness.reason`` is
+    ``None``; unpacking it last used to overwrite the one sentence that says
+    what is actually missing, and the caller received ``reason: null``.
+    """
+    generation, _ = _accepted_generation(db_session)
+    db_session.commit()
+    assert planning_truth.get_truth_state(db_session).reason is None
+
+    with pytest.raises(HTTPException) as queue_exc:
+        get_assembly_queue(db=db_session)
+    queue_detail = queue_exc.value.detail
+    assert queue_detail["code"] == "assembly_queue_unavailable"
+    assert queue_detail["reason"] == (
+        "assembly queue snapshot is missing for accepted generation"
+    )
+    # The readiness projection still travels alongside it.
+    assert queue_detail["truth_status"] == "accepted"
+    assert queue_detail["ledger_generation"] == int(generation.id)
+
+    with pytest.raises(HTTPException) as drum_exc:
+        get_drum_schedule(db=db_session)
+    drum_detail = drum_exc.value.detail
+    assert drum_detail["code"] == "drum_schedule_unavailable"
+    assert drum_detail["reason"] == (
+        "drum schedule is missing for accepted generation"
+    )
+    assert drum_detail["ledger_generation"] == int(generation.id)
+
+
 def test_drum_router_reads_only_persisted_accepted_schedule(client, db_session):
     generation, cutoff = _accepted_generation(db_session)
     db_session.add(
@@ -280,7 +312,9 @@ def test_drum_router_fails_closed_without_persisted_schedule(db_session):
     assert exc.value.detail["code"] == "drum_schedule_unavailable"
 
 
-def _drum_schedule_with_slots(db, generation, cutoff, *, slot_count: int):
+def _drum_schedule_with_slots(
+    db, generation, cutoff, *, slot_count: int, item_id: int = 7
+):
     schedule = models.DrumSchedule(
         ledger_generation_id=generation.id,
         status="completed",
@@ -306,7 +340,7 @@ def _drum_schedule_with_slots(db, generation, cutoff, *, slot_count: int):
                 assembly_queue_line_id=900 + ordinal,
                 plan_id=1,
                 plan_line_id=1,
-                item_id=7,
+                item_id=item_id,
                 resource_id=3,
                 slot_date=cutoff.date(),
                 slot_qty=1,
@@ -335,9 +369,36 @@ def test_drum_router_pages_slots_and_reports_totals(client, db_session):
     assert page["offset"] == 2
     # Schedule-wide totals never shrink with the page.
     assert page["total_slot_qty"] == 5.0
+    # No Item row behind this id: the labels are additive and stay nullable.
+    assert page["slots"][0]["item_code"] is None
+    assert page["slots"][0]["item_name"] is None
 
     full = client.get("/api/v1/production-control/drum").json()
     assert len(full["slots"]) == 5
+
+
+def test_drum_router_exposes_item_labels_on_slots(client, db_session):
+    """The drum board must not be left rendering bare item ids."""
+    generation, cutoff = _accepted_generation(db_session)
+    item = models.Item(item_code="DRUM-7", item_name="Drum item 7")
+    db_session.add(item)
+    db_session.flush()
+    _drum_schedule_with_slots(
+        db_session, generation, cutoff, slot_count=2, item_id=item.item_id
+    )
+    db_session.commit()
+
+    body = client.get("/api/v1/production-control/drum").json()
+
+    assert [row["item_code"] for row in body["slots"]] == ["DRUM-7", "DRUM-7"]
+    assert [row["item_name"] for row in body["slots"]] == [
+        "Drum item 7",
+        "Drum item 7",
+    ]
+    # Backwards compatible: every pre-existing slot field is untouched.
+    assert body["slots"][0]["item_id"] == int(item.item_id)
+    assert body["slots"][0]["slot_ordinal"] == 0
+    assert body["slots"][0]["slot_qty"] == 1.0
 
 
 def test_shelves_router_reads_empty_persisted_projection(client, db_session):

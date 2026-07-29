@@ -102,38 +102,7 @@ FAULTS = {
     "before_publish": ("publish_obligation_refresh_batch", False),
 }
 
-# Faults later than the replay stage are still not resumable, and the remaining
-# blockers all live in modules this change is not allowed to touch:
-#
-# * ``item_ledger/assembly_output_persistence.py`` (the last «assembly output
-#   allocation batch drift» raise) — a rerun that produces no decisions and no
-#   allocations refuses the batch it wrote itself, so any resume past
-#   ``replay_candidate_realizations`` dies there;
-# * ``item_ledger/future_supply_capture.py`` («capture batch must be this
-#   generation's BUILDING snapshot_build batch») — a resume re-enters the
-#   capture once that batch has been sealed COMPLETED.
-#
-# Both are one-condition fixes in the same shape as the two this change makes
-# (accept the completed artefact of this very generation, rebuild only what is
-# missing).  ``strict=True`` makes these two turn into failures the moment that
-# happens, which is the signal to delete this block.
-NOT_YET_RESUMABLE = {
-    "after_snapshots": "assembly_output_persistence rerun rejects its own batch",
-    "after_snapshot_seal": "future_supply_capture rejects a sealed snapshot_build batch",
-    "before_publish": "future_supply_capture rejects a sealed snapshot_build batch",
-}
-
-
-@pytest.mark.parametrize("stage", [
-    pytest.param(
-        name,
-        marks=(
-            [pytest.mark.xfail(reason=NOT_YET_RESUMABLE[name], strict=True)]
-            if name in NOT_YET_RESUMABLE else []
-        ),
-    )
-    for name in sorted(FAULTS)
-])
+@pytest.mark.parametrize("stage", sorted(FAULTS))
 def test_close_fixed_plan_resumes_after_a_fault_at_every_stage(
     db_session, monkeypatch, stage
 ):

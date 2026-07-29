@@ -352,6 +352,86 @@ def test_rerun_is_idempotent_and_drift_conflict_raises(db_session):
         materialize_assembly_output_allocations(db_session, generation.id)
 
 
+def test_rerun_accepts_the_empty_batch_it_wrote_itself(db_session):
+    """A close with no assembly facts must stay resumable.
+
+    The pass then writes neither a decision nor an allocation, so its own
+    COMPLETED batch is the only evidence it ever ran.  Refusing that batch as
+    drift used to kill every resume of «Закрыть план» past this stage.
+    """
+    cutoff = datetime(2026, 7, 31, tzinfo=timezone.utc)
+    generation = _building_generation(db_session, key="empty-rerun", cutoff=cutoff)
+    item = _item(db_session, "ASM-EMPTY")
+    _plan_with_run(
+        db_session,
+        generation=generation,
+        plan_status="fixed",
+        item=item,
+        qty=Decimal("5"),
+        period_from=date(2026, 7, 1),
+    )
+
+    first = materialize_assembly_output_allocations(db_session, generation.id)
+    assert first["facts"] == 0
+    assert first["allocations"] == 0
+
+    second = materialize_assembly_output_allocations(db_session, generation.id)
+
+    assert second == first
+    assert db_session.query(models.LedgerBuildBatch).filter_by(
+        ledger_generation_id=generation.id,
+        stage="assembly_output_allocation",
+    ).count() == 1
+
+    # A fact that appears after the seal changes the rebuilt set, and that is
+    # still drift — resuming never means silently re-allocating.
+    _sline(
+        db_session,
+        batch=generation.physical_import_batch,
+        item=item,
+        qty="3",
+        at=datetime(2026, 7, 15, tzinfo=timezone.utc),
+        recorder="late",
+    )
+    with pytest.raises(ValueError, match="drift"):
+        materialize_assembly_output_allocations(db_session, generation.id)
+
+
+def test_rerun_rewrites_rows_its_interrupted_worker_never_persisted(db_session):
+    """Resume rebuilds only what is missing under the batch it already wrote."""
+    cutoff = datetime(2026, 7, 31, tzinfo=timezone.utc)
+    generation = _building_generation(db_session, key="partial-rerun", cutoff=cutoff)
+    item = _item(db_session, "ASM-PARTIAL")
+    _plan_with_run(
+        db_session,
+        generation=generation,
+        plan_status="fixed",
+        item=item,
+        qty=Decimal("5"),
+        period_from=date(2026, 7, 1),
+    )
+    _sline(
+        db_session,
+        batch=generation.physical_import_batch,
+        item=item,
+        qty="4",
+        at=datetime(2026, 7, 10, tzinfo=timezone.utc),
+        recorder="partial",
+    )
+
+    first = materialize_assembly_output_allocations(db_session, generation.id)
+    db_session.query(models.AssemblyOutputAllocation).delete()
+    db_session.query(models.AssemblyOutputFactDecision).delete()
+    db_session.flush()
+
+    second = materialize_assembly_output_allocations(db_session, generation.id)
+
+    assert second == first
+    assert db_session.query(models.AssemblyOutputFactDecision).count() == 1
+    allocation = db_session.query(models.AssemblyOutputAllocation).one()
+    assert Decimal(allocation.allocated_qty) == Decimal("4")
+
+
 def test_isolated_by_generation_physical_prefix(db_session):
     cutoff = datetime(2026, 7, 31, tzinfo=timezone.utc)
     generation_a = _building_generation(db_session, key="iso-a", cutoff=cutoff)
