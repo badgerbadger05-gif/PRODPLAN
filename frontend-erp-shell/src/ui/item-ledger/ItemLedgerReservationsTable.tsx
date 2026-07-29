@@ -23,12 +23,6 @@ const statusTone: Record<string, string> = {
   cancelled: 'running',
 }
 
-const coverageTone: Record<string, string> = {
-  covered: 'success',
-  partial: 'warning',
-  uncovered: 'shortage',
-}
-
 export function ItemLedgerReservationsTable({ rows, selectedReservationId, onSelect }: Props) {
   const activateAt = (index: number, current: HTMLTableRowElement) => {
     const nextIndex = Math.max(0, Math.min(index, rows.length - 1))
@@ -48,14 +42,11 @@ export function ItemLedgerReservationsTable({ rows, selectedReservationId, onSel
           <th>Период</th>
           <th>Тип</th>
           <th className="numCell">Резерв</th>
-          <th className="numCell">Погашено</th>
+          <th className="numCell">Покрыто при фиксации</th>
+          <th className="numCell">Пополнение</th>
+          <th className="numCell">Получено</th>
           <th className="numCell">Осталось</th>
-          <th className="numCell">On hand</th>
-          <th className="numCell">Входящий поставщик</th>
-          <th className="numCell">Входящий WIP</th>
-          <th>Непокрыто</th>
           <th>Статус</th>
-          <th>Покрытие</th>
         </tr>
       </thead>
       <tbody>
@@ -103,22 +94,17 @@ export function ItemLedgerReservationsTable({ rows, selectedReservationId, onSel
                 <StatusBadge tone={tone}>{modeLabel}</StatusBadge>
               </td>
               <td className="numCell">{qty(row.reserved_qty)}</td>
-              <td className="numCell">{qty(row.realized_qty)}</td>
-              <td className="numCell">
-                <strong>{row.outstanding > 0 ? '+' : ''}{qty(row.outstanding)}</strong>
-              </td>
-              <td className="numCell">{qty(row.covered.on_hand)}</td>
-              <td className="numCell">{qty(row.covered.incoming_supplier)}</td>
-              <td className="numCell">{qty(row.covered.incoming_wip)}</td>
-              <td>{row.uncovered_qty > 0 ? `+${qty(row.uncovered_qty)}` : qty(row.uncovered_qty)}</td>
+              <td className="numCell">{qty(row.covered_from_stock_at_freeze_qty)}</td>
+              <td className="numCell">{qty(row.replenishment_required_qty)}</td>
+              <td className="numCell">{qty(row.replenishment_received_qty)}</td>
+              <td className="numCell"><strong>{qty(row.replenishment_remaining_qty)}</strong></td>
               <td><StatusBadge tone={statusTone[row.lifecycle_status] || ''}>{row.lifecycle_status}</StatusBadge></td>
-              <td><StatusBadge tone={coverageTone[row.coverage_state] || ''}>{row.coverage_state}</StatusBadge></td>
             </tr>
           )
         })}
         {!rows.length && (
           <tr>
-            <td colSpan={14}>
+            <td colSpan={11}>
               <div className="emptyDetail">Резервов нет</div>
             </td>
           </tr>

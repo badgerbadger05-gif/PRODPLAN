@@ -8,9 +8,10 @@ type Props = {
   coverageLabels: Record<string, string>
   onLoadMaterials: () => void
   onPrint: () => void
+  onProduce: () => void
+  onReturnLeftovers: () => void
   onOptimalBatchSave: (itemId: number, value: number | null) => Promise<void>
   onQuantitySave: (productId: number, value: number) => Promise<void>
-  onFillRemaining: (sourceRunId: number, requirementId: number) => Promise<void>
 }
 
 export function ProductionDetailPane({
@@ -19,25 +20,23 @@ export function ProductionDetailPane({
   coverageLabels,
   onLoadMaterials,
   onPrint,
+  onProduce,
+  onReturnLeftovers,
   onOptimalBatchSave,
   onQuantitySave,
-  onFillRemaining,
 }: Props) {
   const [batchValue, setBatchValue] = useState('')
   const [quantityValue, setQuantityValue] = useState('')
   const [batchSaving, setBatchSaving] = useState(false)
   const [quantitySaving, setQuantitySaving] = useState(false)
-  const [fillSaving, setFillSaving] = useState(false)
   const [batchError, setBatchError] = useState('')
   const [quantityError, setQuantityError] = useState('')
-  const [fillError, setFillError] = useState('')
 
   useEffect(() => {
     setBatchValue(activeRow?.optimal_batch != null ? String(activeRow.optimal_batch) : '')
     setQuantityValue(activeRow?.quantity != null ? String(activeRow.quantity) : '')
     setBatchError('')
     setQuantityError('')
-    setFillError('')
   }, [activeRow?.product_id, activeRow?.optimal_batch, activeRow?.quantity])
 
   async function handleBatchSave() {
@@ -77,25 +76,11 @@ export function ProductionDetailPane({
     }
   }
 
-  async function handleFillRemaining() {
-    if (!activeRow?.source_run_id || !activeRow?.source_mrp_requirement_id) return
-    setFillError('')
-    setFillSaving(true)
-    try {
-      await onFillRemaining(activeRow.source_run_id, activeRow.source_mrp_requirement_id)
-    } catch {
-      setFillError('Ошибка создания заказов')
-    } finally {
-      setFillSaving(false)
-    }
-  }
-
   const rowSource = activeRow?.order_source || activeRow?.source
   const canEditQuantity = rowSource === 'mrp' && !activeRow?.source_mrp_allocation_key?.startsWith('1C')
   const hasMrpCoverage = activeRow?.source_mrp_requirement_id != null && activeRow?.mrp_req_net_qty != null
   const mrpRemaining = activeRow?.mrp_req_remaining_qty ?? 0
-  const canFillRemaining = hasMrpCoverage && mrpRemaining > 0.001 && !!activeRow?.source_run_id
-  const canUseMaterialCoverage = !activeRow?.issue_status || activeRow.issue_status === 'not_requested'
+  const canUseMaterialCoverage = !activeRow?.issue_status || activeRow?.issue_status === 'not_requested'
   const activeCoverageStatus = (canUseMaterialCoverage ? materials?.coverage_status : '')
     || activeRow?.coverage_status
     || activeRow?.status
@@ -269,22 +254,32 @@ export function ProductionDetailPane({
                   {qty(mrpRemaining)} {activeRow.unit}
                 </strong>
               </div>
-              {canFillRemaining && (
-                <div className="mrpCoverageActions">
-                  <button className="primary" disabled={fillSaving} onClick={() => void handleFillRemaining()}>
-                    {fillSaving ? 'Создаём...' : `Досоздать ${qty(mrpRemaining)} ${activeRow.unit}`}
-                  </button>
-                  {fillError && <span className="batchHint error">{fillError}</span>}
-                </div>
-              )}
-              {!canFillRemaining && mrpRemaining <= 0.001 && (
+              {mrpRemaining <= 0.001 && (
                 <div className="mrpCoveredBadge">Потребность закрыта полностью</div>
               )}
             </div>
           )}
           <div className="detailActions">
-            <button onClick={onLoadMaterials}>Обновить обеспечение</button>
+            <button onClick={onLoadMaterials}>Обновить материалы</button>
             <button onClick={onPrint}>Печать листа</button>
+            {activeRow && (
+              <button
+                onClick={onProduce}
+                disabled={Number(activeRow.remaining_qty) <= 0}
+                title="Создать и провести СборкаЗапасов и СдельныйНаряд в 1С; факт принять после read-back"
+              >
+                Произвести строку
+              </button>
+            )}
+            {activeRow && (
+              <button
+                onClick={onReturnLeftovers}
+                disabled={activeRow.status !== 'produced_partial'}
+                title="Вернуть остатки компонентов с участка обратно на исходный склад"
+              >
+                Вернуть остатки
+              </button>
+            )}
           </div>
           <h3>Комплектующие</h3>
           <div className="materialsList">

@@ -27,7 +27,7 @@ vi.mock('../../services/productionControl', () => ({
   syncPostedTransfers: vi.fn(),
   closePaintWeldChain: vi.fn(),
   updateOrderQuantity: vi.fn(),
-  produceOrder: vi.fn(),
+  produceOrderLine: vi.fn(),
   exportManufacturesTo1C: vi.fn(),
   exportManufacturesPieceworkTo1C: vi.fn(),
   rollbackManufactureLocal: vi.fn(),
@@ -58,6 +58,7 @@ import {
   syncPostedTransfers,
   deleteProductionOrder,
   fetchRouteSheetsPrintHtml,
+  produceOrderLine,
 } from '../../services/productionControl'
 import { listPeriodPlans, getPeriodPlanMatrix } from '../../services/periodPlan'
 import { listResources } from '../../services/resources'
@@ -195,6 +196,7 @@ beforeEach(() => {
   vi.mocked(listProductionOperations).mockResolvedValue({ rows: [], total: 0 })
   vi.mocked(updateOrderStatus).mockResolvedValue({} as never)
   vi.mocked(deleteProductionOrder).mockResolvedValue({} as never)
+  vi.mocked(produceOrderLine).mockResolvedValue({ qty: 10 } as never)
   vi.mocked(fetchRouteSheetsPrintHtml).mockResolvedValue('<html></html>')
   vi.mocked(postMaterialIssues).mockResolvedValue({
     status: 'ok',
@@ -229,7 +231,6 @@ describe('ProductionControlPage — characterization', () => {
     for (const label of [
       'Запустить в 1С',
       'Произвести',
-      'Закрыть цепочку',
       'Синхронизировать',
       'Печать маршрутных',
       'Удалить',
@@ -348,7 +349,7 @@ describe('ProductionControlPage — characterization', () => {
     await waitFor(() => expect(getOrderMaterials).toHaveBeenCalledWith(101))
 
     vi.mocked(getOrderMaterials).mockClear()
-    await user.click(screen.getByRole('button', { name: 'Обновить обеспечение' }))
+    await user.click(screen.getByRole('button', { name: 'Обновить материалы' }))
 
     await waitFor(() => expect(refreshOrderMaterials).toHaveBeenCalledTimes(1))
     expect(refreshOrderMaterials).toHaveBeenCalledWith(101)
@@ -415,7 +416,7 @@ describe('ProductionControlPage — characterization', () => {
     await waitFor(() => expect(exportMaterialIssuesTo1C).toHaveBeenCalledWith([1]))
   })
 
-  it('opens the produce dialog for a single assembled/posted row', async () => {
+  it('runs the canonical produce action for one assembled row', async () => {
     const user = userEvent.setup()
     renderPage()
     await screen.findByText('Вал')
@@ -427,12 +428,10 @@ describe('ProductionControlPage — characterization', () => {
     expect(produceBtn).toBeEnabled()
 
     await user.click(produceBtn)
-
-    expect(await screen.findByRole('dialog', { name: 'Произвести - Кронштейн' })).toBeInTheDocument()
-    expect(screen.getByLabelText('Количество (шт)')).toBeInTheDocument()
-    // Dialog bootstraps operations + employees for the selected product.
-    await waitFor(() => expect(listProductionOperations).toHaveBeenCalledWith(101))
-    expect(listProductionEmployees).toHaveBeenCalled()
+    await waitFor(() => expect(produceOrderLine).toHaveBeenCalledWith(
+      101,
+      { qty: 10, executor: 'erp-shell' },
+    ))
   })
 
   it('"Синхронизировать" calls syncPostedTransfers and shows a summary message', async () => {

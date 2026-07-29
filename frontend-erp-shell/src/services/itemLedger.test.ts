@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
-  getItemLedgerDrift,
   getItemLedgerMovements,
   getItemLedgerPosition,
   getItemLedgerReservations,
@@ -121,18 +120,4 @@ describe('item-ledger boundary service', () => {
     expect(init?.body).toBeUndefined()
   })
 
-  it('loads drift with pagination and exact query', async () => {
-    const payload = { total: 1, limit: 3, offset: 2, rows: [] }
-    const fetchMock = mockFetchJson(payload)
-
-    await expect(getItemLedgerDrift(15, { limit: 3, offset: 2 })).resolves.toEqual(payload)
-
-    expect(fetchMock).toHaveBeenCalledWith(
-      '/api/v1/item-ledger/15/drift?limit=3&offset=2',
-      expect.objectContaining({
-        headers: expect.objectContaining({ 'Content-Type': 'application/json' }),
-      }),
-    )
-    expectGetOnlyFetchCall(fetchMock)
-  })
 })

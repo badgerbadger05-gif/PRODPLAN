@@ -1,7 +1,6 @@
 import { api } from '../lib/api'
 import type { paths } from '../lib/apiTypes'
 import type {
-  ItemLedgerDriftResponse,
   ItemLedgerMovementsResponse,
   ItemLedgerPosition,
   ItemLedgerReservationsResponse,
@@ -15,9 +14,6 @@ export type ItemLedgerMovementsFilters = NonNullable<
 >
 export type ItemLedgerReservationsFilters = NonNullable<
   paths['/api/v1/item-ledger/{item_id}/reservations']['get']['parameters']['query']
->
-export type ItemLedgerDriftPagination = NonNullable<
-  paths['/api/v1/item-ledger/{item_id}/drift']['get']['parameters']['query']
 >
 
 function toQuery(params: Record<string, string | number | undefined | null>) {
@@ -65,18 +61,6 @@ export function getItemLedgerReservationEvents(itemId: number, reservationId: nu
     `${ITEM_LEDGER_BASE}/${encodeURIComponent(itemId)}/reservations/${encodeURIComponent(
       reservationId,
     )}/events`,
-    undefined,
-    signal,
-  )
-}
-
-export function getItemLedgerDrift(itemId: number, pagination: ItemLedgerDriftPagination = {}, signal?: AbortSignal) {
-  const query = toQuery({
-    limit: pagination.limit,
-    offset: pagination.offset,
-  })
-  return api<ItemLedgerDriftResponse>(
-    `${ITEM_LEDGER_BASE}/${encodeURIComponent(itemId)}/drift${query ? `?${query}` : ''}`,
     undefined,
     signal,
   )

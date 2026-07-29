@@ -8,11 +8,9 @@ import type {
   PeriodPlan,
   PeriodPlanMatrix,
 } from '../../domain/planning'
-import type { PurchaseOrdersResponse, PurchaseRow } from '../../domain/purchaseControl'
 import type { NomenclatureSearchItem } from '../../domain/productionPlan'
 import * as periodPlanSvc from '../../services/periodPlan'
 import * as productionPlanSvc from '../../services/productionPlan'
-import * as purchaseControlSvc from '../../services/purchaseControl'
 
 // ── Mock the entire service layer so no real network happens ──────────────────
 vi.mock('../../services/periodPlan', () => ({
@@ -37,10 +35,6 @@ vi.mock('../../services/productionPlan', () => ({
   searchNomenclature: vi.fn(),
   ensurePlanItem: vi.fn(),
 }))
-vi.mock('../../services/purchaseControl', () => ({
-  listPurchaseJournal: vi.fn(),
-}))
-
 // ── Fake data shaped to the domain types ──────────────────────────────────────
 const draftPlan: PeriodPlan = {
   id: 123,
@@ -116,6 +110,24 @@ const journalResponse: ExecutionJournalResponse = {
     partially_covered: 1,
     not_covered: 0,
     net_zero: 0,
+    execution_by_flow: {
+      production: {
+        completed_qty: 2,
+        base_qty: 10,
+        execution_pct: 20,
+        available: true,
+      },
+      purchase: {
+        completed_qty: 0,
+        base_qty: 10,
+        execution_pct: 0,
+        covered_pct: 0,
+        to_order_pct: 100,
+        purchase_covered_qty: 0,
+        purchase_to_order_qty: 10,
+        available: true,
+      },
+    },
   },
 }
 
@@ -250,134 +262,6 @@ const listPlanB: PeriodPlan = {
   execution_reason: 'Нет данных',
 }
 
-const zeroPurchaseJournalMetricResponse: PurchaseOrdersResponse = {
-  rows: [],
-  total: 0,
-  limit: 500,
-  offset: 0,
-  run_id: 17,
-  run_ids: [17],
-  truth_status: 'accepted',
-  ledger_generation_id: 7,
-  summary: {
-    total_rows: 0,
-    by_status: {},
-    by_phase: {},
-    to_order: 0,
-    overdue: 0,
-    expected_7d: 0,
-    in_transit_amount: 0,
-    fact_status: 'available',
-  },
-  meta: {
-    snapshot_id: 51,
-    ledger_generation: 7,
-    ledger_generation_id: 7,
-    cutoff: '2026-05-31T23:59:59Z',
-    truth_status: 'accepted',
-    fact_source: 'ledger',
-    received_qty_status: 'available',
-    read_only: true,
-  },
-}
-
-const basePurchaseLedgerRow: PurchaseRow = {
-  row_key: 'ledger:buy:default',
-  line_id: null,
-  purchase_id: null,
-  source_purchase_ids: [],
-  order_id: null,
-  order_number: '',
-  order_date: null,
-  order_ref1c: null,
-  order_state_name: null,
-  source: 'mrp',
-  supplier_id: 99,
-  supplier_name: 'Промснаб',
-  item_id: 901,
-  item_code: 'PART-901',
-  item_article: 'ART-901',
-  item_name: 'Запасной элемент',
-  unit: 'шт',
-  quantity: 10,
-  received_qty: 0,
-  remaining_qty: 10,
-  delivery_date: null,
-  need_date: '2026-05-20',
-  overdue_days: null,
-  line_status: 'to_order',
-  supply_phase: 'no_goods',
-  counts_in_mrp: false,
-  price: 100,
-  amount: 1000,
-  run_id: 17,
-  run_ids: [17],
-  requirement_ids: [1001],
-  reservation_ids: [2001],
-  planning_stock_pool: 'default',
-  fact_status: 'available',
-  fact_source: 'ledger',
-}
-
-function buildLedgerPurchaseResponse(rows: PurchaseRow[], total = rows.length): PurchaseOrdersResponse {
-  return {
-    rows,
-    total,
-    limit: 500,
-    offset: 0,
-    run_id: 17,
-    run_ids: [17],
-    truth_status: 'accepted',
-    ledger_generation_id: 7,
-    summary: {
-      total_rows: rows.length,
-      by_status: {},
-      by_phase: {},
-      to_order: 0,
-      overdue: 0,
-      expected_7d: 0,
-      in_transit_amount: 0,
-      fact_status: 'available',
-    },
-    meta: {
-      snapshot_id: 51,
-      ledger_generation: 7,
-      ledger_generation_id: 7,
-      cutoff: '2026-05-31T23:59:59Z',
-      truth_status: 'accepted',
-      fact_source: 'ledger',
-      received_qty_status: 'available',
-      read_only: true,
-    },
-  }
-}
-
-function makeLedgerPurchaseRow({
-  rowKey,
-  requiredQty,
-  realizedQty,
-  openOrderCoveredQty,
-  toOrderQty,
-}: {
-  rowKey: string
-  requiredQty: number
-  realizedQty: number
-  openOrderCoveredQty: number
-  toOrderQty: number
-}) {
-  return {
-    ...basePurchaseLedgerRow,
-    row_key: rowKey,
-    required_qty: requiredQty,
-    realized_qty: realizedQty,
-    open_order_covered_qty: openOrderCoveredQty,
-    to_order_qty: toOrderQty,
-    remaining_qty: Math.max(0, requiredQty - realizedQty - openOrderCoveredQty - toOrderQty),
-    to_order_pct: requiredQty === 0 ? 0 : (toOrderQty / requiredQty) * 100,
-    quantity: requiredQty,
-  }
-}
-
 const searchItem: NomenclatureSearchItem = {
   item_id: 777,
   item_code: 'C-909',
@@ -420,7 +304,6 @@ beforeEach(() => {
     items: [searchItem], total: 1, query: '', search_type: 'trgm',
   })
   vi.mocked(productionPlanSvc.ensurePlanItem).mockResolvedValue({ status: 'ok', item_id: 777 })
-  vi.mocked(purchaseControlSvc.listPurchaseJournal).mockResolvedValue(zeroPurchaseJournalMetricResponse)
 })
 
 afterEach(() => {
@@ -612,19 +495,8 @@ describe('PeriodPlanPage — detail view', () => {
     )
   })
 
-  it('shows exact 0% purchase coverage and 100% to-order from ledger coverage rows', async () => {
+  it('shows exact 0% purchase coverage and 100% to-order from the execution snapshot', async () => {
     const user = userEvent.setup()
-    vi.mocked(purchaseControlSvc.listPurchaseJournal).mockResolvedValue(
-      buildLedgerPurchaseResponse([
-        makeLedgerPurchaseRow({
-          rowKey: 'ledger:buy:zero',
-          requiredQty: 10,
-          realizedQty: 0,
-          openOrderCoveredQty: 0,
-          toOrderQty: 10,
-        }),
-      ]),
-    )
 
     renderAt('/period-plan/123')
     await user.click(screen.getByRole('button', { name: 'Журнал исполнения' }))
@@ -634,19 +506,27 @@ describe('PeriodPlanPage — detail view', () => {
     expect(screen.queryByText(/часть н\/д/)).not.toBeInTheDocument()
   })
 
-  it('shows exact 100% purchase coverage and 0% to-order from ledger coverage rows', async () => {
+  it('shows exact 100% purchase coverage and 0% to-order from the execution snapshot', async () => {
     const user = userEvent.setup()
-    vi.mocked(purchaseControlSvc.listPurchaseJournal).mockResolvedValue(
-      buildLedgerPurchaseResponse([
-        makeLedgerPurchaseRow({
-          rowKey: 'ledger:buy:full',
-          requiredQty: 10,
-          realizedQty: 9,
-          openOrderCoveredQty: 1,
-          toOrderQty: 0,
-        }),
-      ]),
-    )
+    vi.mocked(periodPlanSvc.getExecutionJournal).mockResolvedValue({
+      ...journalResponse,
+      summary: {
+        ...journalResponse.summary,
+        execution_by_flow: {
+          ...journalResponse.summary.execution_by_flow,
+          purchase: {
+            completed_qty: 9,
+            base_qty: 10,
+            execution_pct: 90,
+            covered_pct: 100,
+            to_order_pct: 0,
+            purchase_covered_qty: 10,
+            purchase_to_order_qty: 0,
+            available: true,
+          },
+        },
+      },
+    })
 
     renderAt('/period-plan/123')
     await user.click(screen.getByRole('button', { name: 'Журнал исполнения' }))
@@ -708,7 +588,7 @@ describe('PeriodPlanPage — detail view', () => {
     expect(screen.getByRole('button', { name: 'CSV' })).toBeDisabled()
   })
 
-  it('shows purchase metric from purchase-control even when execution truth is unavailable', async () => {
+  it('fails purchase coverage closed when execution truth is unavailable', async () => {
     vi.mocked(periodPlanSvc.getExecutionJournal).mockResolvedValue({
       ...journalResponse,
       truth_status: 'uninitialized',
@@ -716,31 +596,31 @@ describe('PeriodPlanPage — detail view', () => {
       ledger_generation: null,
       cutoff: null,
     })
-    vi.mocked(purchaseControlSvc.listPurchaseJournal).mockResolvedValue(
-      buildLedgerPurchaseResponse([
-        makeLedgerPurchaseRow({
-          rowKey: 'ledger:buy:metric',
-          requiredQty: 10,
-          realizedQty: 0,
-          openOrderCoveredQty: 0,
-          toOrderQty: 10,
-        }),
-      ]),
-    )
-
     const user = userEvent.setup()
     renderAt('/period-plan/123')
     await screen.findByText('Насос ГА-1')
 
     await user.click(screen.getByRole('button', { name: 'Журнал исполнения' }))
 
-    expect(await screen.findByText(/покрыто 0% · к заказу 100%/)).toBeInTheDocument()
+    expect(screen.queryByText(/покрыто/)).not.toBeInTheDocument()
     expect(screen.getByText(/Исполнение не рассчитано/)).toBeInTheDocument()
   })
 
-  it('keeps execution journal loaded when purchase metric request fails and marks purchase unavailable', async () => {
-    vi.mocked(periodPlanSvc.getExecutionJournal).mockResolvedValue(journalResponse)
-    vi.mocked(purchaseControlSvc.listPurchaseJournal).mockRejectedValueOnce(new Error('503 Stale Purchase Snapshot'))
+  it('marks purchase unavailable when the execution snapshot omits its metric', async () => {
+    vi.mocked(periodPlanSvc.getExecutionJournal).mockResolvedValue({
+      ...journalResponse,
+      summary: {
+        ...journalResponse.summary,
+        execution_by_flow: {
+          production: {
+            completed_qty: 2,
+            base_qty: 10,
+            execution_pct: 20,
+            available: true,
+          },
+        },
+      },
+    })
 
     const user = userEvent.setup()
     renderAt('/period-plan/123')
@@ -753,11 +633,6 @@ describe('PeriodPlanPage — detail view', () => {
     expect(screen.getByText('недоступно')).toBeInTheDocument()
     expect(screen.queryByText('Загрузка журнала…')).not.toBeInTheDocument()
 
-    await waitFor(() => expect(purchaseControlSvc.listPurchaseJournal).toHaveBeenCalledTimes(1))
-    await new Promise((resolve) => {
-      setTimeout(resolve, 150)
-    })
-    expect(purchaseControlSvc.listPurchaseJournal).toHaveBeenCalledTimes(1)
   })
 
   it('deletes a matrix row (draft) via deleteItemFromPeriodPlan after confirm', async () => {

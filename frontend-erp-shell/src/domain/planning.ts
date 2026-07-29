@@ -331,6 +331,10 @@ export type ExecutionJournalSummary = {
     base_qty: number
     execution_pct: number | null
     confirmed_pct?: number | null
+    covered_pct?: number | null
+    to_order_pct?: number | null
+    purchase_covered_qty?: number
+    purchase_to_order_qty?: number
     total_base_qty?: number
     available?: boolean
   }> | null

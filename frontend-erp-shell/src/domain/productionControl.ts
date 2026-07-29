@@ -246,6 +246,57 @@ export type MaterialIssueCreateResponse = {
   errors: string[]
 }
 
+export type MaterialIssueCreatePayload = {
+  product_ids: number[]
+  initiated_by?: string | null
+  warehouse_ref1c?: string | null
+  source_warehouse_ref1c?: string | null
+}
+
+export type ProduceLinePayload = {
+  qty: number
+  executor?: string | null
+  operation_executors?: Array<{
+    line_number?: number
+    spec_operation_id?: number
+    operation_id?: number
+    employee_ref1c?: string
+    employee_name?: string
+  }>
+  comment?: string | null
+}
+
+export type ProduceLineResult = {
+  status: string
+  manufacture_id: number
+  product_id: number
+  order_id: number
+  qty: number
+  produced_qty_total: number
+  remaining_qty: number
+  overproduced_qty: number
+  order_quantity_before: number
+  order_quantity_after: number
+  line_status: string
+}
+
+export type ReturnLeftoversResult = {
+  status: string
+  issued_issues: number
+  created_issues: number
+  skipped_rows: Array<{ issue_id?: number; reason?: string }>
+  entries: Array<{
+    product_id: number
+    issue_id: number
+    direction: string
+    issued_qty: number
+    returned_qty: number
+    warehouse_ref1c?: string | null
+    source_warehouse_ref1c?: string | null
+    detail?: string
+  }>
+}
+
 export type TransferIssueRow = {
   issue_id: number
   document_number: string

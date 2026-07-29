@@ -1,24 +1,20 @@
 import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import {
-  getItemLedgerDrift,
   getItemLedgerMovements,
   getItemLedgerPosition,
   getItemLedgerReservationEvents,
   getItemLedgerReservations,
-  type ItemLedgerDriftPagination,
   type ItemLedgerMovementsFilters,
   type ItemLedgerReservationsFilters,
 } from '../../services/itemLedger'
 import type {
-  ItemLedgerDriftResponse,
   ItemLedgerMovementsResponse,
   ItemLedgerPosition,
   ItemLedgerReservationsResponse,
   ItemLedgerReservationEventsResponse,
 } from '../../domain/itemLedger'
 import {
-  ItemLedgerDriftTable,
   ItemLedgerMovementsTable,
   ItemLedgerPositionSummary,
   ItemLedgerReservationEventsTimeline,
@@ -27,7 +23,7 @@ import {
 import { DocumentWindow } from '../layout/DocumentWindow'
 import { Button } from '../kit'
 
-type Tab = 'movements' | 'reservations' | 'drift'
+type Tab = 'movements' | 'reservations'
 
 type MovementFilterState = {
   date_from: string
@@ -57,11 +53,6 @@ export interface ItemLedgerDataProvider {
     reservationId: number,
     signal?: AbortSignal,
   ): Promise<ItemLedgerReservationEventsResponse>
-  loadDrift(
-    itemId: number,
-    pagination?: ItemLedgerDriftPagination,
-    signal?: AbortSignal,
-  ): Promise<ItemLedgerDriftResponse>
 }
 
 const defaultItemLedgerProvider: ItemLedgerDataProvider = {
@@ -69,7 +60,6 @@ const defaultItemLedgerProvider: ItemLedgerDataProvider = {
   loadMovements: (itemId, filters, signal) => getItemLedgerMovements(itemId, filters, signal),
   loadReservations: (itemId, filters, signal) => getItemLedgerReservations(itemId, filters, signal),
   loadReservationEvents: (itemId, reservationId, signal) => getItemLedgerReservationEvents(itemId, reservationId, signal),
-  loadDrift: (itemId, pagination, signal) => getItemLedgerDrift(itemId, pagination, signal),
 }
 
 type Props = {
@@ -84,14 +74,12 @@ type Props = {
 type LoadingState = {
   movements: boolean
   reservations: boolean
-  drift: boolean
 }
 
 type ErrorState = {
   position: string
   movements: string
   reservations: string
-  drift: string
   reservationEvents: string
 }
 
@@ -109,7 +97,7 @@ const defaultReservationFilters: ReservationFilterState = {
 const reservationStatusOptions = ['active', 'closed', 'released', 'carried', 'cancelled']
 
 function normalizeLedgerTab(raw: string | null) {
-  if (raw === 'movements' || raw === 'reservations' || raw === 'drift') return raw
+  if (raw === 'movements' || raw === 'reservations') return raw
   return 'movements'
 }
 
@@ -163,7 +151,6 @@ export function LedgerWorkspacePage({
   const [position, setPosition] = useState<ItemLedgerPosition | null>(null)
   const [movements, setMovements] = useState<ItemLedgerMovementsResponse['rows']>([])
   const [reservations, setReservations] = useState<ItemLedgerReservationsResponse['rows']>([])
-  const [drift, setDrift] = useState<ItemLedgerDriftResponse['rows']>([])
 
   const [entryItemId, setEntryItemId] = useState('')
   const [entryError, setEntryError] = useState('')
@@ -181,13 +168,11 @@ export function LedgerWorkspacePage({
   const [loadingState, setLoadingState] = useState<LoadingState>({
     movements: true,
     reservations: true,
-    drift: true,
   })
   const [errors, setErrors] = useState<ErrorState>({
     position: '',
     movements: '',
     reservations: '',
-    drift: '',
     reservationEvents: '',
   })
 
@@ -199,27 +184,25 @@ export function LedgerWorkspacePage({
       setPosition(null)
       setMovements([])
       setReservations([])
-      setDrift([])
       setSelectedReservationId(null)
       setReservationEvents([])
-      setErrors({ position: '', movements: '', reservations: '', drift: '', reservationEvents: '' })
-      setLoadingState({ movements: false, reservations: false, drift: false })
+      setErrors({ position: '', movements: '', reservations: '', reservationEvents: '' })
+      setLoadingState({ movements: false, reservations: false })
       return
     }
 
     const controller = new AbortController()
     const sequence = ++loadSequence.current
 
-    setLoadingState({ movements: true, reservations: true, drift: true })
-    setErrors({ position: '', movements: '', reservations: '', drift: '', reservationEvents: '' })
+    setLoadingState({ movements: true, reservations: true })
+    setErrors({ position: '', movements: '', reservations: '', reservationEvents: '' })
     setReservationEvents([])
 
     void Promise.allSettled([
       provider.loadPosition(resolvedItemId, controller.signal),
       provider.loadMovements(resolvedItemId, normalizeMovementFilters(movementFilters), controller.signal),
       provider.loadReservations(resolvedItemId, normalizeReservationFilters(reservationFilters), controller.signal),
-      provider.loadDrift(resolvedItemId, {}, controller.signal),
-    ]).then(([positionResult, movementsResult, reservationsResult, driftResult]) => {
+    ]).then(([positionResult, movementsResult, reservationsResult]) => {
       if (sequence !== loadSequence.current || controller.signal.aborted) return
 
       if (positionResult.status === 'fulfilled') {
@@ -245,14 +228,7 @@ export function LedgerWorkspacePage({
         setHighlightedEventId(null)
       }
 
-      if (driftResult.status === 'fulfilled') {
-        setDrift(driftResult.value.rows)
-      } else {
-        setDrift([])
-        setErrors((state) => ({ ...state, drift: readableError(driftResult.reason) }))
-      }
-
-      setLoadingState({ movements: false, reservations: false, drift: false })
+      setLoadingState({ movements: false, reservations: false })
     })
 
     return () => controller.abort()
@@ -377,7 +353,6 @@ export function LedgerWorkspacePage({
         <div className="toolbar ledgerToolbar">
           <Button variant={tab === 'movements' ? 'primary' : 'default'} onClick={() => setTab('movements')}>Движения</Button>
           <Button variant={tab === 'reservations' ? 'primary' : 'default'} onClick={() => setTab('reservations')}>Резервы</Button>
-          <Button variant={tab === 'drift' ? 'primary' : 'default'} onClick={() => setTab('drift')}>Дрейф</Button>
           <span className="toolbarSpacer" />
           <Button
             onClick={() => {
@@ -514,12 +489,6 @@ export function LedgerWorkspacePage({
           </>
         )}
 
-        {tab === 'drift' && (
-          <>
-            {errors.drift && <div role="alert" className="errorLine">{errors.drift}</div>}
-            {loadingState.drift ? <div>Загрузка дрейфа...</div> : <ItemLedgerDriftTable rows={drift} />}
-          </>
-        )}
       </DocumentWindow>
     </main>
   )

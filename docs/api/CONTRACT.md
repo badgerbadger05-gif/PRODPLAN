@@ -4,7 +4,7 @@
 
 ## 0. Источник истины по эндпоинтам
 
-`docs/api/openapi.json` — **авто-сгенерирован** из FastAPI (`app.openapi()`), OpenAPI 3.1, 183 пути / 99 схем. Это машинная истина по request/response каждого эндпоинта; регенерируется backend'ом при изменениях. Фронт **генерирует TS-типы из него** (`npx openapi-typescript docs/api/openapi.json -o src/lib/apiTypes.ts`) и строит на моках, пока backend дописывается. Ручные типы, дублирующие openapi, запрещены.
+`docs/api/openapi.json` — **авто-сгенерирован** из FastAPI (`app.openapi()`), OpenAPI 3.1, 158 путей / 107 схем. Это машинная истина по request/response каждого эндпоинта; регенерируется backend'ом при изменениях. Фронт **генерирует TS-типы из него** (`npx openapi-typescript docs/api/openapi.json -o src/lib/apiTypes.ts`) и строит на моках, пока backend дописывается. Ручные типы, дублирующие openapi, запрещены.
 
 Этот документ фиксирует то, чего в openapi нет: сквозные конвенции, модель авторизации/прав, правила владения, потребление.
 
@@ -19,9 +19,9 @@
 - **Идемпотентность мутаций:**
   - существующие экспорты в 1С идемпотентны через `sync_link` (повторный экспорт не создаёт дубль документа 1С);
   - для НОВЫХ мутаций-предложений вводится заголовок `Idempotency-Key: <uuid>` — backend хранит результат по ключу; повтор с тем же ключом возвращает тот же результат, не создаёт второе покрытие. Фронт генерит ключ на действие и повторяет его при ретрае.
-- **Reconcile/ledger — семантика (важно для фронта):** пересчёт леджера — это **цикл на всю каноническую область**, а не пер-план вызов. Публичный триггер — `POST /api/v1/plan/reconcile` (без run_ids). Фронт НЕ запускает частичный пересчёт одного плана. `executed_qty`/проекции — производные (только для чтения), их нельзя редактировать с фронта. Подробности модели — `mrp-ledger-blueprint-v2.md`.
+- **Ledger — семантика (важно для фронта):** построение и публикация Ledger выполняются backend-ом для всей канонической области. Фронт не запускает частичный пересчёт одного плана. Все проекции только читаются. Нормативная модель — `/home/ivan/PRODPLAN/repo/.docs/planning-truth-contract.md`.
 
-## 2. Авторизация и права (backend задаёт, фронт гейтит, сервер проверяет)
+## 2. Авторизация и права (backend задаёт, фронт отображает, сервер проверяет)
 
 Сейчас авторизации НЕТ (см. FRONTEND-TECHDEBT P0/P1). Целевой контракт, который реализует backend и на который строит фронт:
 
@@ -38,14 +38,18 @@
 Строковые коды, приходят в `/me.permissions`. Особо выделены **записи в 1С** (запись в источник правды):
 - `plan.run`, `plan.reconcile`, `plan.snapshot.refreeze`
 - `purchase.propose`, `purchase.export_1c`   ← экспорт заказа поставщику в 1С
-- `production.propose`, `production.produce`, `production.post_1c` ← проведение СборкаЗапасов
+- `production.propose`, `production.produce`, `production.post_1c` ← санкционированный выпуск через СборкаЗапасов и СдельныйНаряд
 - `material_issue.assemble_post_1c`           ← проведение ПеремещениеЗапасов
 - `piecework.export_post_1c`                  ← проведение СдельныйНаряд
 - `spec.writeback_1c`
 - `*.view` на разделы.
 
 ### 2.4. Правило гейтинга
-- Фронт гейтит **экраны** (навигация/роутинг) и **действия** через `Doctype.permissions` (`view: Role[]|perm`, `actions: {key: perm}`). Кнопка без права — скрыта/заблокирована.
+- Фронт гейтит **экраны** по полученным правам. Доступность доменных действий
+  не вычисляется по строкам на клиенте: backend возвращает готовые
+  `available_actions`/флаги, а frontend только скрывает или блокирует кнопку.
+- `Doctype.permissions` связывает кнопку с permission-кодом, но не заменяет
+  серверное решение о доступности действия.
 - **Сервер ОБЯЗАН проверять права независимо от UI.** Фронт-гейт — это UX, не безопасность. Каждый мутирующий эндпоинт проверяет соответствующий permission и возвращает `403` при отказе.
 - `403` в контракте: `{ detail: "forbidden", required: "<permission>" }`.
 
@@ -70,12 +74,11 @@
 | `/api/v1/purchase-control/*` | журнал закупок | purchase_order |
 | `/api/v1/plan/*` (56 эндпоинтов) | планы, прогоны, результаты MRP, reconcile, **будущие ledger-экраны** | plan_run / mrp_result / (проводки, происхождение, сверки — по мере backend) |
 | `/api/v1/specification/*` | спецификации/BOM, дерево, качество | specification |
-| `/api/v1/dbr/*` | DBR (барабан/питатель/сигналы) | dbr_* |
 | `/api/v1/resources/*`, `/stages` | участки/этапы/виды производства | resources |
 | `/api/v1/nomenclature|items|units|employees/*` | справочники (карточки элементов) | item_card (витрина по pool_key — ledger) |
 | `/api/v1/sync/*`, `/odata/*` | синхронизация с 1С (read-only) | sync |
 
-Полный список — `openapi.json`. Ledger-специфичные экраны (проводки/происхождение расчёта/сверки) добавятся в контракт по мере реализации backend-леджера (Фазы 3–6, blueprint-v2) — они НЕ блокируют старт фронта: Doctype-рантайм и миграция существующих экранов от них не зависят.
+Полный список — `openapi.json`. Ledger-специфичные экраны читают сохранённые backend read-model согласно `/home/ivan/PRODPLAN/repo/.docs/frontend-framework.md`.
 
 ## 6. Пример: Doctype ↔ endpoint (production_order)
 
@@ -107,11 +110,11 @@ export const productionOrderDoctype: Doctype<OrderRow, ProductionFilters, OrderD
   ],
   actions: [
     { key:'export_1c', label:'Запустить в 1С', scope:'selection', tone:'primary',
-      enabled: c => c.selection.length>0 && c.selection.every(r=>r.coverage_status==='assembled'),
+      enabled: c => c.selection.length>0 && c.selection.every(r=>r.available_actions.export_1c),
       run: exportMaterialIssuesTo1C /* POST …/material-issues/export-to-1c */ },
     { key:'produce', label:'Произвести', scope:'selection', open:{ dialog:'produce' } },
     { key:'delete', label:'Удалить', scope:'selection', tone:'danger', confirm:'Удалить локальный заказ?',
-      enabled: c => c.selection.length===1 && !c.selection[0].order_ref1c, run: deleteProductionOrder },
+      enabled: c => c.selection.length===1 && c.selection[0].available_actions.delete, run: deleteProductionOrder },
   ],
   detail: { sections: [{ title:'Материалы', table: { rows: d=>d.components, columns: materialColumns } }] },
   permissions: { view:['planner','shopfloor','admin'],
@@ -120,6 +123,9 @@ export const productionOrderDoctype: Doctype<OrderRow, ProductionFilters, OrderD
 ```
 
 ## CHANGELOG
+- 2026-07-26 v5: OpenAPI регенерирован из канонического backend; переходный
+  DBR-контур удалён, санкционированное действие «Произвести» сохранено по
+  решению владельца §1.6.
 - 2026-07-23 v4: `GET /api/v1/production-control/orders` получил строгий envelope
   `ProductionOrderJournalResponse`. Для представления «Очередь мехцеха» используется
   query `planning_contour=dbr_feeder`; это те же реальные строки журнала, а DBR-происхождение

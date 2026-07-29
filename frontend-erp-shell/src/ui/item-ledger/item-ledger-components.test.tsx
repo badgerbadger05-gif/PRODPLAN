@@ -1,14 +1,13 @@
 import { fireEvent, render, screen } from '@testing-library/react'
 import { describe, expect, it, vi } from 'vitest'
 import {
-  ItemLedgerDriftTable,
   ItemLedgerMovementsTable,
   ItemLedgerPositionSummary,
   ItemLedgerReservationEventsTimeline,
   ItemLedgerReservationsTable,
 } from './index'
 import { qty } from '../../lib/format'
-import type { ItemLedgerDriftResponse, ItemLedgerMovementRow, ItemLedgerPosition, ItemLedgerReservationsResponse, ItemLedgerReservationEventsResponse } from '../../domain/itemLedger'
+import type { ItemLedgerMovementRow, ItemLedgerPosition, ItemLedgerReservationsResponse, ItemLedgerReservationEventsResponse } from '../../domain/itemLedger'
 
 const truthMeta = {
   ledger_generation: 4,
@@ -81,12 +80,11 @@ const reservations: ItemLedgerReservationsResponse['rows'] = [
     realization_mode: 'consume',
     priority: { period_from: '2026-08-01', period_to: '2026-08-31' },
     reserved_qty: 270.64,
-    realized_qty: 79.57,
-    outstanding: 191.07,
-    covered: { on_hand: 120, incoming_supplier: 71.07, incoming_wip: 0 },
-    uncovered_qty: 0,
+    covered_from_stock_at_freeze_qty: 120,
+    replenishment_required_qty: 150.64,
+    replenishment_received_qty: 79.57,
+    replenishment_remaining_qty: 71.07,
     lifecycle_status: 'active',
-    coverage_state: 'covered',
   },
   {
     reservation_id: 102,
@@ -97,12 +95,11 @@ const reservations: ItemLedgerReservationsResponse['rows'] = [
     realization_mode: 'make',
     priority: { period_from: '2026-09-01', period_to: '2026-09-30' },
     reserved_qty: 80,
-    realized_qty: 20,
-    outstanding: 60,
-    covered: { on_hand: 10, incoming_supplier: 20, incoming_wip: 5 },
-    uncovered_qty: 30,
+    covered_from_stock_at_freeze_qty: 10,
+    replenishment_required_qty: 70,
+    replenishment_received_qty: 20,
+    replenishment_remaining_qty: 50,
     lifecycle_status: 'released',
-    coverage_state: 'partial',
   },
 ]
 
@@ -118,24 +115,6 @@ const events: ItemLedgerReservationEventsResponse['rows'] = [
     fact_line_ref: 'line-2',
     match_rule: 'pegged',
     cycle_id: 'cycle-1',
-  },
-]
-
-const driftRows: ItemLedgerDriftResponse['rows'] = [
-  {
-    id: 1,
-    cycle_id: '',
-    kind: 'shortfall',
-    drift_qty: 3,
-    expected_stock: 10,
-    actual_stock: 7,
-    at: '2026-07-21T11:00:00',
-    cause: null,
-    adjustment_sle_id: null,
-    matured: false,
-    first_seen_cycle_id: null,
-    requirement_id: null,
-    details: { note: 'supply gap', source: 'openapi' },
   },
 ]
 
@@ -174,11 +153,4 @@ describe('item-ledger presentation primitives', () => {
     expect(screen.getByText(/doc-1/)).toBeInTheDocument()
   })
 
-  it('renders drift rows with nullable fields and extra debug details', () => {
-    render(<ItemLedgerDriftTable rows={driftRows} />)
-    expect(screen.getByRole('table', { name: 'Таблица дрейфа номенклатуры' })).toBeInTheDocument()
-    expect(screen.getByText(/\+3/)).toBeInTheDocument()
-    expect(screen.getAllByText('—').length).toBeGreaterThanOrEqual(2)
-    expect(screen.getByText(/"note"/)).toBeInTheDocument()
-  })
 })

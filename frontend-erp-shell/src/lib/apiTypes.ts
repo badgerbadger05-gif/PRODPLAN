@@ -75,53 +75,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/sync/stock-ledger/shadow-report": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Stock Ledger Shadow Report
-         * @description Item-ledger shadow diagnostic (design §3б / inc3): per item the ledger
-         *     world (Σ stock_bin.on_hand over the contour) vs the legacy world
-         *     (effective_stock_by_item_all) and their divergence, plus reconcile counts
-         *     (matched / pending / adjusted). Read-only; no behavior change.
-         */
-        get: operations["stock_ledger_shadow_report_api_v1_sync_stock_ledger_shadow_report_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/sync/reservation-ledger/shadow-report": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Reservation Ledger Shadow Report
-         * @description Item-ledger reservation shadow diagnostic (design §11 Инк4): per
-         *     requirement the reservation world (uncovered / outstanding / produced) laid
-         *     beside the inc1–5 world (remaining_qty / covered_qty / executed_qty), and per
-         *     pool reserved_soft vs Σ remaining. Read-only; no behavior change (Inc4 is
-         *     pure shadow — no reader consults the reservation ledger yet).
-         */
-        get: operations["reservation_ledger_shadow_report_api_v1_sync_reservation_ledger_shadow_report_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/sync/warehouses": {
         parameters: {
             query?: never;
@@ -820,40 +773,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/plan/period-plans/{plan_id}/archive": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Period Plans Archive */
-        post: operations["period_plans_archive_api_v1_plan_period_plans__plan_id__archive_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/plan/period-plans/{plan_id}/unarchive": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Period Plans Unarchive */
-        post: operations["period_plans_unarchive_api_v1_plan_period_plans__plan_id__unarchive_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/plan/period-plans/{plan_id}/runs": {
         parameters: {
             query?: never;
@@ -1085,66 +1004,6 @@ export interface paths {
          * @description Гарантировать наличие изделия в плане производства
          */
         post: operations["ensure_plan_item_api_v1_plan_ensure_item_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/plan/calc": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Start Planning Run
-         * @description Retired: live runs bypass immutable Ledger candidates and snapshots.
-         */
-        post: operations["start_planning_run_api_v1_plan_calc_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/plan/calc_preview": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Calc Preview
-         * @description Retired: previews must be persisted by the background refresh flow.
-         */
-        post: operations["calc_preview_api_v1_plan_calc_preview_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/plan/calc_gross": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Calc Gross
-         * @description Retired: gross demand is part of a sealed Ledger-bound snapshot.
-         */
-        post: operations["calc_gross_api_v1_plan_calc_gross_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1435,46 +1294,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/plan/results/{run_id}/pegging": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get Planning Result Pegging
-         * @description Трассируемость компонент → спрос (pegging) по прогону (с фильтрами и пагинацией)
-         */
-        get: operations["get_planning_result_pegging_api_v1_plan_results__run_id__pegging_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/plan/results/{run_id}/shortage-report": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get Shortage Report
-         * @description XLSX отчёт по дефицитам комплектующих (blocked/partial) для прогона
-         */
-        get: operations["get_shortage_report_api_v1_plan_results__run_id__shortage_report_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/plan/forced_orders": {
         parameters: {
             query?: never;
@@ -1622,7 +1441,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/plan/mrp-snapshot/refreeze": {
+    "/api/v1/plan/mrp/run/{run_id}/close": {
         parameters: {
             query?: never;
             header?: never;
@@ -1632,96 +1451,14 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Refreeze Mrp Snapshots
-         * @description Retired destructive endpoint; use the period-plan snapshot contract.
-         */
-        post: operations["refreeze_mrp_snapshots_api_v1_plan_mrp_snapshot_refreeze_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/plan/reconcile": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Reconcile Active Snapshots
-         * @description Retired: proposal mutations belong to obligation-refresh publish.
-         */
-        post: operations["reconcile_active_snapshots_api_v1_plan_reconcile_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/plan/results/{run_id}/reconcile": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Reconcile Single Snapshot
-         * @description Retired: a published run is immutable and cannot be reconciled live.
-         */
-        post: operations["reconcile_single_snapshot_api_v1_plan_results__run_id__reconcile_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/plan/mrp/run/{run_id}/force-close": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Force Close Mrp Run
-         * @description Принудительно закрыть недовыполненный FIXED_SNAPSHOT-прогон (бизнес-решение).
+         * Close Mrp Run
+         * @description Явно закрыть плановый прогон (FIXED_SNAPSHOT→CLOSED).
          *
-         *     Остаток НЕ переносится: открытые требования закрываются, их неэкспортированные
-         *     закупочные предложения усыхают до нуля (экспортированные в 1С не трогаем —
-         *     отмена вручную). Идемпотентно на уже закрытом прогоне. `dry_run=true` считает
-         *     и откатывает.
+         *     Закрытие убирает активные резервы из рабочих очередей (release),
+         *     требования и закупочные строки не перезаписывает. Доступно только для
+         *     зафиксированных прогонах. Повторный вызов идемпотентен.
          */
-        post: operations["force_close_mrp_run_api_v1_plan_mrp_run__run_id__force_close_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/plan/mrp/run/{run_id}/reopen": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Reopen Mrp Run
-         * @description Отменить закрытие прогона: CLOSED → FIXED_SNAPSHOT, закрытые требования
-         *     снова открываются и возвращаются в область расчёта. `dry_run=true` откатывает.
-         */
-        post: operations["reopen_mrp_run_api_v1_plan_mrp_run__run_id__reopen_post"];
+        post: operations["close_mrp_run_api_v1_plan_mrp_run__run_id__close_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2388,6 +2125,66 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/production-control/assembly-queue": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Assembly Queue
+         * @description Read the immutable queue belonging to the exact accepted generation.
+         */
+        get: operations["get_assembly_queue_api_v1_production_control_assembly_queue_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/production-control/drum": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Drum Schedule
+         * @description Read the persisted drum of the exact accepted generation.
+         */
+        get: operations["get_drum_schedule_api_v1_production_control_drum_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/production-control/shelves": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get Shelf Projections
+         * @description Read persisted shelf pull priorities of the accepted generation.
+         */
+        get: operations["get_shelf_projections_api_v1_production_control_shelves_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/production-control/employees": {
         parameters: {
             query?: never;
@@ -2564,10 +2361,10 @@ export interface paths {
         put?: never;
         /**
          * Post Produce Line
-         * @description Record one production event on the line. Bumps produced_qty / decreases
-         *     remaining_qty / promotes line status to produced_partial or produced.
-         *     Creates a ProductionManufacture row. Local only вЂ” does NOT send to 1C;
-         *     use POST /manufactures/export-to-1c for that.
+         * @description One operator action: create the durable command, export and post
+         *     СборкаЗапасов, then export and post СдельныйНаряд. The assembly exporter
+         *     enqueues the posted recorder for immediate Item Ledger read-back. None of
+         *     these document writes is itself a production fact.
          */
         post: operations["post_produce_line_api_v1_production_control_orders__product_id__produce_post"];
         delete?: never;
@@ -2587,13 +2384,8 @@ export interface paths {
         put?: never;
         /**
          * Post Return Leftovers
-         * @description Создать обратное перемещение лишних компонентов на исходные склады для
-         *     частично произведённой строки. Локально только вЂ” в 1С документ
-         *     отправится отдельно через /material-issues/export-to-1c.
-         *
-         *     Возвращает либо status='ok' с return_issue_id и list of lines, либо
-         *     status='skipped' с человекочитаемой причиной (produced_qty=0, нет
-         *     выгруженных исходящих перемещений, или нет компонентов с остатком).
+         * @description Create inbound transfer for leftover components from partial production.
+         *     Export remains in /material-issues/export-to-1c.
          */
         post: operations["post_return_leftovers_api_v1_production_control_orders__product_id__return_leftovers_post"];
         delete?: never;
@@ -2613,8 +2405,7 @@ export interface paths {
         put?: never;
         /**
          * Post Export Manufactures To 1C
-         * @description Bulk-экспорт выпусков (производств) в 1С как Document_СборкаЗапасов
-         *     (Posted=false). РРґРµРјРїРѕС‚РµРЅС‚РЅРѕ через sync_link.
+         * @description Bulk-экспорт выпусков в 1С как Document_СборкаЗапасов.
          */
         post: operations["post_export_manufactures_to_1c_api_v1_production_control_manufactures_export_to_1c_post"];
         delete?: never;
@@ -2652,12 +2443,6 @@ export interface paths {
         /**
          * Post Export Piecework To 1C
          * @description Bulk-экспорт выпусков в 1С как Document_СдельныйНаряд.
-         *     Идемпотентно через sync_link (source_doctype='piecework').
-         *
-         *     Требование: каждый manufacture должен быть уже выгружен как
-         *     Document_СборкаЗапасов (поле exported_ref1c заполнено) — он используется
-         *     как ДокументОснование сдельного наряда. Операция по умолчанию берется
-         *     из спецификации выпуска; operation_ref нужен только для ручного override.
          */
         post: operations["post_export_piecework_to_1c_api_v1_production_control_manufactures_export_piecework_to_1c_post"];
         delete?: never;
@@ -2666,7 +2451,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/production-control/repair/order-completion-success": {
+    "/api/v1/production-control/orders/from-work-items": {
         parameters: {
             query?: never;
             header?: never;
@@ -2676,59 +2461,12 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Post Repair Order Completion Success
-         * @description Backfill 1C Document_ЗаказНаПроизводство.ВариантЗавершения='Успешно'
-         *     for completed PRODPLAN-created orders (by Number prefix, default PP).
-         */
-        post: operations["post_repair_order_completion_success_api_v1_production_control_repair_order_completion_success_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/production-control/orders/from-mrp": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Post Orders From Mrp
-         * @description Materialize selected MRP planned_order rows as internal production orders
-         *     (production_orders.source='mrp'). Idempotent: planned_orders that already
-         *     back a production_products line are returned under `reused`.
-         */
-        post: operations["post_orders_from_mrp_api_v1_production_control_orders_from_mrp_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/production-control/orders/from-mrp-requirements": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Post Orders From Mrp Requirements
-         * @description Materialize selected MrpRequirement rows (production-flow items from a
-         *     period-plan MRP snapshot) into internal production orders.
+         * Post Orders From Work Items
+         * @description Materialize selected current-generation make work items into orders.
          *
-         *     Idempotent: requirements that already have a ProductionProduct linked via
-         *     source_mrp_requirement_id are returned under `reused`.
-         *     Purchase/rework requirements are returned under `skipped`.
-         *     MrpRequirement.covered_qty / remaining_qty are updated.
+         *     Frozen requirement, reservation and work-item quantities are not changed.
          */
-        post: operations["post_orders_from_mrp_requirements_api_v1_production_control_orders_from_mrp_requirements_post"];
+        post: operations["post_orders_from_work_items_api_v1_production_control_orders_from_work_items_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2837,45 +2575,6 @@ export interface paths {
         put?: never;
         /** Post Material Issue Assembled */
         post: operations["post_material_issue_assembled_api_v1_production_control_material_issues__issue_id__assembled_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/production-control/reservation-repair/in-place": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Post Repair In Place Reservations */
-        post: operations["post_repair_in_place_reservations_api_v1_production_control_reservation_repair_in_place_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/production-control/material-issues/{issue_id}/export-to-1c": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Post Material Issue To 1C Legacy
-         * @deprecated
-         * @description Legacy: single-issue export. Kept for backwards-compatibility with
-         *     existing clients. Prefer POST /material-issues/export-to-1c.
-         */
-        post: operations["post_material_issue_to_1c_legacy_api_v1_production_control_material_issues__issue_id__export_to_1c_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3068,8 +2767,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Materialize
-         * @description Materialize selected neutral MRP rows against the accepted snapshot.
+         * Materialize Purchase Control Rows
+         * @description Materialize selected neutral MRP purchase rows from the accepted snapshot.
          */
         post: operations["materialize_purchase_control_rows_api_v1_purchase_control_materialize_post"];
         delete?: never;
@@ -3106,708 +2805,6 @@ export interface paths {
         get: operations["get_review_item_lines_api_v1_workshop_binding_review_items__item_id__lines_get"];
         put?: never;
         post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/settings": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Get Settings */
-        get: operations["get_settings_api_v1_dbr_settings_get"];
-        /** Put Settings */
-        put: operations["put_settings_api_v1_dbr_settings_put"];
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/assembly-rates": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Get Assembly Rates */
-        get: operations["get_assembly_rates_api_v1_dbr_assembly_rates_get"];
-        /** Put Assembly Rate */
-        put: operations["put_assembly_rate_api_v1_dbr_assembly_rates_put"];
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/assembly-rates/{rate_id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post?: never;
-        /** Delete Assembly Rate */
-        delete: operations["delete_assembly_rate_api_v1_dbr_assembly_rates__rate_id__delete"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/category-risks": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Get Category Risks */
-        get: operations["get_category_risks_api_v1_dbr_category_risks_get"];
-        /** Put Category Risks */
-        put: operations["put_category_risks_api_v1_dbr_category_risks_put"];
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/feeder/positions/preview": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Preview Feeder Positions */
-        post: operations["preview_feeder_positions_api_v1_dbr_feeder_positions_preview_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/feeder/positions/rebuild": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Rebuild Feeder Positions */
-        post: operations["rebuild_feeder_positions_api_v1_dbr_feeder_positions_rebuild_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/feeder/cockpit": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get Feeder Cockpit
-         * @description Return one coherent, saved DBR read model for the accepted Ledger.
-         */
-        get: operations["get_feeder_cockpit_api_v1_dbr_feeder_cockpit_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/feeder/positions": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Get Feeder Positions */
-        get: operations["get_feeder_positions_api_v1_dbr_feeder_positions_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/feeder/positions/{position_id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Get Feeder Position */
-        get: operations["get_feeder_position_api_v1_dbr_feeder_positions__position_id__get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/feeder/signals/preview": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Preview Feeder Signals */
-        post: operations["preview_feeder_signals_api_v1_dbr_feeder_signals_preview_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/feeder/signals/refresh": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Refresh Feeder Signals */
-        post: operations["refresh_feeder_signals_api_v1_dbr_feeder_signals_refresh_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/feeder/signals": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Get Feeder Signals */
-        get: operations["get_feeder_signals_api_v1_dbr_feeder_signals_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/feeder/signals/{signal_id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Get Feeder Signal */
-        get: operations["get_feeder_signal_api_v1_dbr_feeder_signals__signal_id__get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/feeder/deficits": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Get Feeder Deficits */
-        get: operations["get_feeder_deficits_api_v1_dbr_feeder_deficits_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/feeder/processing/board": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get Processing Board
-         * @description Борд давальческого контура (питатель №3): NFP-разложение processing-
-         *     позиций, открытые заказы переработчику и алерты просроченного кругорейса.
-         */
-        get: operations["get_processing_board_api_v1_dbr_feeder_processing_board_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/feeder/processing/trip-manifest": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get Processing Trip Manifest
-         * @description Read-only manifest preview grouped by toll-processing contractor.
-         */
-        get: operations["get_processing_trip_manifest_api_v1_dbr_feeder_processing_trip_manifest_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/feeder/processing/trip-manifest/print": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Print Processing Trip Manifest
-         * @description Simple printable HTML view of the same manifest preview.
-         */
-        get: operations["print_processing_trip_manifest_api_v1_dbr_feeder_processing_trip_manifest_print_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/feeder/chain/preview": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Preview Feeder Chain */
-        post: operations["preview_feeder_chain_api_v1_dbr_feeder_chain_preview_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/feeder/processing/chain/preview": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Preview Processing Feeder Chain
-         * @description Read-only chain preview limited to processing supermarket signals.
-         */
-        post: operations["preview_processing_feeder_chain_api_v1_dbr_feeder_processing_chain_preview_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/feeder/chain/refresh": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Refresh Feeder Chain */
-        post: operations["refresh_feeder_chain_api_v1_dbr_feeder_chain_refresh_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/programs": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** List Programs */
-        get: operations["list_programs_api_v1_dbr_programs_get"];
-        put?: never;
-        /** Create Program */
-        post: operations["create_program_api_v1_dbr_programs_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/programs/{program_id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Get Program */
-        get: operations["get_program_api_v1_dbr_programs__program_id__get"];
-        /** Update Program */
-        put: operations["update_program_api_v1_dbr_programs__program_id__put"];
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/programs/{program_id}/approve": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Approve Program */
-        post: operations["approve_program_api_v1_dbr_programs__program_id__approve_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/drum/build": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Drum Build */
-        post: operations["drum_build_api_v1_dbr_drum_build_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/drum/{schedule_id}/activate": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Drum Activate */
-        post: operations["drum_activate_api_v1_dbr_drum__schedule_id__activate_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/drum/{schedule_id}/extend": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Drum Extend */
-        post: operations["drum_extend_api_v1_dbr_drum__schedule_id__extend_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/drum/active/board": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Drum Board */
-        get: operations["drum_board_api_v1_dbr_drum_active_board_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/drum/{schedule_id}/refresh-gate": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Drum Refresh Gate */
-        post: operations["drum_refresh_gate_api_v1_dbr_drum__schedule_id__refresh_gate_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/drum/{schedule_id}/roll-forward": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Drum Roll Forward */
-        post: operations["drum_roll_forward_api_v1_dbr_drum__schedule_id__roll_forward_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/drum/slots/{slot_id}/move": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Drum Move Slot */
-        post: operations["drum_move_slot_api_v1_dbr_drum_slots__slot_id__move_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/drum/slots/{slot_id}/release": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Drum Release Slot
-         * @description Materialize a green+pending slot into a 1С production order (Фаза 3).
-         *
-         *     dry_run=true (default) returns the payload preview and writes nothing;
-         *     dry_run=false writes to 1С and marks the slot released.
-         */
-        post: operations["drum_release_slot_api_v1_dbr_drum_slots__slot_id__release_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/drum/{schedule_id}/release-day": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Drum Release Day
-         * @description Batch-release every green+pending slot of one day. Partial failures do
-         *     not roll back the slots that already succeeded (per-slot isolation).
-         */
-        post: operations["drum_release_day_api_v1_dbr_drum__schedule_id__release_day_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/feeder/signals/{signal_id}/launch": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Feeder Launch Signal
-         * @description Launch an Open+complete feeder signal into a 1С production order (Фаза 3).
-         *
-         *     Gated by material readiness: a deficit returns 409 with deficit_lines.
-         *     dry_run=true (default) returns the payload preview and writes nothing.
-         */
-        post: operations["feeder_launch_signal_api_v1_dbr_feeder_signals__signal_id__launch_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/feeder/signals/{signal_id}/processing-order-preview": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Feeder Processing Order Preview
-         * @description Preview a toll-processing supplier order; this endpoint can never write to 1C.
-         */
-        get: operations["feeder_processing_order_preview_api_v1_dbr_feeder_signals__signal_id__processing_order_preview_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/purchase/cockpit": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get Purchase Cockpit
-         * @description Read the immutable purchase obligations of the accepted Ledger only.
-         */
-        get: operations["get_purchase_cockpit_api_v1_dbr_purchase_cockpit_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/feeder/purchase/launch": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Feeder Launch Purchase
-         * @description Launch open «Пополнение» signals of purchased items into supplier orders.
-         *
-         *     Lines are grouped by supplier (items.supplier_ref1c); signals with no
-         *     supplier are returned under `unresolved`, never blocking the batch.
-         *     dry_run=true (default) returns the grouped payload preview and writes nothing.
-         */
-        post: operations["feeder_launch_purchase_api_v1_dbr_feeder_purchase_launch_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/purchase-plan/preview": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Purchase Plan Preview
-         * @description Retired: use the saved Ledger purchase cockpit instead.
-         */
-        get: operations["purchase_plan_preview_api_v1_dbr_purchase_plan_preview_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/dbr/purchase-plan/materialize": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Purchase Plan Materialize
-         * @description Retired until a Ledger-native purchase materializer is implemented.
-         */
-        post: operations["purchase_plan_materialize_api_v1_dbr_purchase_plan_materialize_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3941,28 +2938,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/paint-weld/chain/close": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Chain Close
-         * @description Закрыть цепочку «окраска↔сварка» одним действием: выпуски обеих строк,
-         *     СборкаЗапасов обоих заказов и один комбинированный сдельный наряд,
-         *     закрывающий оба заказа. dry_run=true — предпросмотр.
-         */
-        post: operations["chain_close_api_v1_paint_weld_chain_close_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/api/v1/item-ledger/{item_id}/position": {
         parameters: {
             query?: never;
@@ -3972,9 +2947,9 @@ export interface paths {
         };
         /**
          * Get Position
-         * @description The §1 pool projection for one item — the ledger's own view (read the
-         *     ledger tables directly, never gated by STOCK_SOURCE). on_hand / available /
-         *     projected / uncovered follow the §2.5 formulas; ``available`` and
+         * @description The  pool projection for one item — the ledger's own view (read the
+         *     ledger tables directly. on_hand / available /
+         *     projected / uncovered follow the  formulas; ``available`` and
          *     ``uncovered`` are surfaced as-is (a negative available is a deficit signal,
          *     not clamped).
          */
@@ -3996,7 +2971,7 @@ export interface paths {
         };
         /**
          * Get Movements
-         * @description §2 — the signed physical movement tape (active StockLedgerEntry rows),
+         * @description — the signed physical movement tape (active StockLedgerEntry rows),
          *     sorted ``(posting_at, id)``, paginated (total + rows). ``qty_after`` is the
          *     running balance the ledger carried — "how it computed".
          */
@@ -4018,9 +2993,9 @@ export interface paths {
         };
         /**
          * Get Reservations
-         * @description §3 — the per-item soft reservation tape: on which runs/plans the item hangs
-         *     in reservations, what covers each and how much is uncovered. ``make`` rows
-         *     contribute 0 to reserved_soft (surfaced separately as production).
+         * @description — the per-item soft reservation tape: on which runs/plans the item hangs
+         *     in reservations, what covers each and how much is uncovered. The make/buy
+         *     value routes replenishment; it does not create or suppress demand.
          */
         get: operations["get_reservations_api_v1_item_ledger__item_id__reservations_get"];
         put?: never;
@@ -4040,33 +3015,11 @@ export interface paths {
         };
         /**
          * Get Reservation Events
-         * @description §4 — the append-only journal of one reservation (open/amend/realize/…).
+         * @description — the append-only journal of one reservation (open/amend/realize/…).
          *     ``sle_id`` links an event to the physical movement that closed it — the debug
          *     thread. 404 unless the reservation belongs to the item.
          */
         get: operations["get_reservation_events_api_v1_item_ledger__item_id__reservations__reservation_id__events_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/item-ledger/{item_id}/drift": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get Drift
-         * @description §5 — MrpDriftEvent rows for the item (where reality diverged from plan).
-         *     ``cause`` is derived from ``kind`` and ``adjustment_sle_id`` is not tracked on
-         *     the drift row (returned null); ``details`` carries the raw provenance.
-         */
-        get: operations["get_drift_api_v1_item_ledger__item_id__drift_get"];
         put?: never;
         post?: never;
         delete?: never;
@@ -4200,83 +3153,9 @@ export interface paths {
         put?: never;
         /**
          * Seed Ledger
-         * @description Сид якоря T0 леджера-1 из свежего 1С /Balance (design Прил. A §4).
+         * @description Сид якоря T0 физического Ledger из свежего 1С /Balance.
          */
         post: operations["seed_ledger_api_v1_item_ledger_admin_seed_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/planning-comparison/input-fingerprint": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get Input Fingerprint
-         * @description Read-only comparable input watermarks and optional canonical latest results.
-         */
-        get: operations["get_input_fingerprint_api_v1_planning_comparison_input_fingerprint_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/planning-comparison/captures": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Create Capture
-         * @description Capture stable through HTTP and shadow locally; never starts/materializes planning.
-         */
-        post: operations["create_capture_api_v1_planning_comparison_captures_post"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/planning-comparison/batches": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Get Batches */
-        get: operations["get_batches_api_v1_planning_comparison_batches_get"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/api/v1/planning-comparison/batches/{batch_id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Get Batch */
-        get: operations["get_batch_api_v1_planning_comparison_batches__batch_id__get"];
-        put?: never;
-        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -4352,31 +3231,44 @@ export interface components {
              */
             allow_production: boolean;
         };
-        /** AssemblyRateOut */
-        AssemblyRateOut: {
-            /** Id */
-            id: number;
-            /** Resource Id */
-            resource_id: number;
-            /** Resource Name */
-            resource_name: string;
+        /** AssemblyQueueResponse */
+        AssemblyQueueResponse: {
+            /** Rows */
+            rows: components["schemas"]["AssemblyQueueRow"][];
+            /** Total Rows */
+            total_rows: number;
+            /** Total Queue Qty */
+            total_queue_qty: number;
+            truth_meta: components["schemas"]["TruthMeta"];
+        };
+        /** AssemblyQueueRow */
+        AssemblyQueueRow: {
+            /** Plan Id */
+            plan_id: number;
+            /** Plan Line Id */
+            plan_line_id: number;
+            /** Run Id */
+            run_id: number;
             /** Item Id */
             item_id: number;
             /** Item Code */
             item_code: string;
             /** Item Name */
             item_name: string;
-            /** Qty Per Capacity */
-            qty_per_capacity: string;
-        };
-        /** AssemblyRateUpsert */
-        AssemblyRateUpsert: {
-            /** Resource Id */
-            resource_id: number;
-            /** Item Id */
-            item_id: number;
-            /** Qty Per Capacity */
-            qty_per_capacity: number | string;
+            /** Bucket Date */
+            bucket_date: string;
+            /** Period From */
+            period_from: string;
+            /** Period To */
+            period_to: string;
+            /** Planned Output Qty */
+            planned_output_qty: number;
+            /** Accepted Plan Output Qty */
+            accepted_plan_output_qty: number;
+            /** Assembly Remaining Qty */
+            assembly_remaining_qty: number;
+            /** Priority Key */
+            priority_key: (string | number)[];
         };
         /** BulkUpsertEntry */
         BulkUpsertEntry: {
@@ -4396,84 +3288,6 @@ export interface components {
              * @default []
              */
             entries: components["schemas"]["BulkUpsertEntry"][];
-        };
-        /** CalcRequest */
-        CalcRequest: {
-            /** Horizon Days */
-            horizon_days?: number | null;
-            /** Config Overrides */
-            config_overrides?: {
-                [key: string]: unknown;
-            } | null;
-            /** Started By */
-            started_by?: string | null;
-        };
-        /** CaptureRequest */
-        CaptureRequest: {
-            /** Capture Key */
-            capture_key?: string | null;
-            /**
-             * Max Skew Seconds
-             * @default 300
-             */
-            max_skew_seconds: number;
-        };
-        /** CategoryRiskIn */
-        CategoryRiskIn: {
-            /** Item Group */
-            item_group: string;
-            /** Receipt Warehouse Ref1C */
-            receipt_warehouse_ref1c?: string | null;
-            /** Supply Risk Pct */
-            supply_risk_pct?: number | string | null;
-        };
-        /** CategoryRiskOut */
-        CategoryRiskOut: {
-            /** Id */
-            id: number;
-            /** Item Group */
-            item_group: string;
-            /** Receipt Warehouse Ref1C */
-            receipt_warehouse_ref1c?: string | null;
-            /** Supply Risk Pct */
-            supply_risk_pct?: string | null;
-        };
-        /** CategoryRisksReplace */
-        CategoryRisksReplace: {
-            /** Rows */
-            rows: components["schemas"]["CategoryRiskIn"][];
-        };
-        /**
-         * ChainClosePayload
-         * @description Закрытие цепочки из окна журнала (этап 4): любая сторона цепочки.
-         */
-        ChainClosePayload: {
-            /** Product Id */
-            product_id: number;
-            /** Weld Qty */
-            weld_qty?: number | null;
-            /** Paint Qty */
-            paint_qty?: number | null;
-            /** Executor */
-            executor?: string | null;
-            /** Weld Operation Executors */
-            weld_operation_executors?: unknown[] | null;
-            /** Paint Operation Executors */
-            paint_operation_executors?: unknown[] | null;
-            /** Comment */
-            comment?: string | null;
-            /**
-             * Dry Run
-             * @default true
-             */
-            dry_run: boolean;
-            /**
-             * Allow Production
-             * @default false
-             */
-            allow_production: boolean;
-            /** Initiated By */
-            initiated_by?: string | null;
         };
         /** ChainOpenPayload */
         ChainOpenPayload: {
@@ -4535,15 +3349,59 @@ export interface components {
             /** Stage Id */
             stage_id?: number | null;
         };
-        /** DrumBuild */
-        DrumBuild: {
-            /** Program Id */
-            program_id: number;
+        /** DrumGapRow */
+        DrumGapRow: {
+            /** Plan Id */
+            plan_id: number;
+            /** Plan Line Id */
+            plan_line_id: number;
+            /** Item Id */
+            item_id: number;
+            /** Resource Id */
+            resource_id: number;
+            /** Gap Date */
+            gap_date: string;
+            /** Gap Qty */
+            gap_qty: number;
+            /** Original Priority */
+            original_priority: (string | number)[];
         };
-        /** DrumExtend */
-        DrumExtend: {
-            /** Program Id */
-            program_id: number;
+        /** DrumScheduleResponse */
+        DrumScheduleResponse: {
+            /** Schedule From */
+            schedule_from: string;
+            /** Schedule To */
+            schedule_to: string;
+            /** Slots */
+            slots: components["schemas"]["DrumSlotRow"][];
+            /** Gaps */
+            gaps: components["schemas"]["DrumGapRow"][];
+            /** Total Open Qty */
+            total_open_qty: number;
+            /** Total Slot Qty */
+            total_slot_qty: number;
+            /** Total Gap Qty */
+            total_gap_qty: number;
+            truth_meta: components["schemas"]["TruthMeta"];
+        };
+        /** DrumSlotRow */
+        DrumSlotRow: {
+            /** Plan Id */
+            plan_id: number;
+            /** Plan Line Id */
+            plan_line_id: number;
+            /** Item Id */
+            item_id: number;
+            /** Resource Id */
+            resource_id: number;
+            /** Slot Date */
+            slot_date: string;
+            /** Slot Qty */
+            slot_qty: number;
+            /** Slot Ordinal */
+            slot_ordinal: number;
+            /** Original Priority */
+            original_priority: (string | number)[];
         };
         /** EnsureItemRequest */
         EnsureItemRequest: {
@@ -4757,20 +3615,6 @@ export interface components {
             /** Reason */
             reason?: string | null;
         };
-        /** InPlaceReservationRepairPayload */
-        InPlaceReservationRepairPayload: {
-            /** Product Ids */
-            product_ids: number[];
-            /** Initiated By */
-            initiated_by?: string | null;
-            /** Warehouse Ref1C */
-            warehouse_ref1c?: string | null;
-            /**
-             * Dry Run
-             * @default true
-             */
-            dry_run: boolean;
-        };
         /** Item */
         Item: {
             /** Item Code */
@@ -4844,47 +3688,6 @@ export interface components {
              * @default active
              */
             status: string;
-        };
-        /** ItemLedgerDriftResponse */
-        ItemLedgerDriftResponse: {
-            /** Total */
-            total: number;
-            /** Limit */
-            limit: number;
-            /** Offset */
-            offset: number;
-            /** Rows */
-            rows: components["schemas"]["ItemLedgerDriftRow"][];
-            truth_meta: components["schemas"]["TruthMeta"];
-        };
-        /** ItemLedgerDriftRow */
-        ItemLedgerDriftRow: {
-            /** Id */
-            id: number;
-            /** Cycle Id */
-            cycle_id: string;
-            /** Kind */
-            kind: string;
-            /** Drift Qty */
-            drift_qty: number;
-            /** Expected Stock */
-            expected_stock: number | null;
-            /** Actual Stock */
-            actual_stock: number | null;
-            /** At */
-            at: string | null;
-            /** Cause */
-            cause: string | null;
-            /** Adjustment Sle Id */
-            adjustment_sle_id: number | null;
-            /** Matured */
-            matured: boolean;
-            /** First Seen Cycle Id */
-            first_seen_cycle_id: string | null;
-            /** Requirement Id */
-            requirement_id: number | null;
-            /** Details */
-            details: unknown | null;
         };
         /** ItemLedgerMovement */
         ItemLedgerMovement: {
@@ -4980,15 +3783,6 @@ export interface components {
             /** Qty Negative */
             qty_negative: boolean;
         };
-        /** ItemLedgerReservationCovered */
-        ItemLedgerReservationCovered: {
-            /** On Hand */
-            on_hand: number;
-            /** Incoming Supplier */
-            incoming_supplier: number;
-            /** Incoming Wip */
-            incoming_wip: number;
-        };
         /** ItemLedgerReservationEventRow */
         ItemLedgerReservationEventRow: {
             /** Id */
@@ -5044,17 +3838,16 @@ export interface components {
             priority: components["schemas"]["ItemLedgerReservationPriority"];
             /** Reserved Qty */
             reserved_qty: number;
-            /** Realized Qty */
-            realized_qty: number;
-            /** Outstanding */
-            outstanding: number;
-            covered: components["schemas"]["ItemLedgerReservationCovered"];
-            /** Uncovered Qty */
-            uncovered_qty: number;
+            /** Covered From Stock At Freeze Qty */
+            covered_from_stock_at_freeze_qty: number;
+            /** Replenishment Required Qty */
+            replenishment_required_qty: number;
+            /** Replenishment Received Qty */
+            replenishment_received_qty: number;
+            /** Replenishment Remaining Qty */
+            replenishment_remaining_qty: number;
             /** Lifecycle Status */
             lifecycle_status: string;
-            /** Coverage State */
-            coverage_state: string;
         };
         /** ItemLedgerReservationsResponse */
         ItemLedgerReservationsResponse: {
@@ -5220,45 +4013,10 @@ export interface components {
             /** Odata Entity */
             odata_entity: string;
         };
-        /** OrderCompletionRepairPayload */
-        OrderCompletionRepairPayload: {
-            /**
-             * Dry Run
-             * @default true
-             */
-            dry_run: boolean;
-            /**
-             * Allow Production
-             * @default false
-             */
-            allow_production: boolean;
-            /**
-             * Number Prefix
-             * @default PP
-             */
-            number_prefix: string;
-            /**
-             * Date From
-             * @default 2026-05-01T00:00:00
-             */
-            date_from: string;
-            /**
-             * Max Records
-             * @default 5000
-             */
-            max_records: number;
-        };
-        /** OrdersFromMrpPayload */
-        OrdersFromMrpPayload: {
-            /** Planned Order Ids */
-            planned_order_ids: number[];
-            /** Initiated By */
-            initiated_by?: string | null;
-        };
-        /** OrdersFromMrpRequirementsPayload */
-        OrdersFromMrpRequirementsPayload: {
-            /** Requirement Ids */
-            requirement_ids: number[];
+        /** OrdersFromWorkItemsPayload */
+        OrdersFromWorkItemsPayload: {
+            /** Work Item Ids */
+            work_item_ids: number[];
             /** Initiated By */
             initiated_by?: string | null;
         };
@@ -5378,18 +4136,6 @@ export interface components {
              * @default false
              */
             activate: boolean | null;
-        };
-        /** PositionPreviewRequest */
-        PositionPreviewRequest: {
-            /** Schedule Id */
-            schedule_id?: number | null;
-        };
-        /** PositionRebuildRequest */
-        PositionRebuildRequest: {
-            /** Schedule Id */
-            schedule_id?: number | null;
-            /** Expected Schedule Id */
-            expected_schedule_id?: number | null;
         };
         /** PrintRouteSheetsPayload */
         PrintRouteSheetsPayload: {
@@ -5618,10 +4364,6 @@ export interface components {
             route_sheet_printed_at?: string | null;
             /** Comment */
             comment: string;
-            /** Failed Manufacture Id */
-            failed_manufacture_id?: number | null;
-            /** Failed Manufacture Error */
-            failed_manufacture_error?: string | null;
             /** Source Run Id */
             source_run_id?: number | null;
             /** Source Plan Id */
@@ -5644,45 +4386,7 @@ export interface components {
             mrp_req_covered_qty?: number | null;
             /** Mrp Req Remaining Qty */
             mrp_req_remaining_qty?: number | null;
-            /** Source Dbr Signal Id */
-            source_dbr_signal_id?: number | null;
-            planning?: components["schemas"]["ProductionOrderPlanningResponse"] | null;
             paint_weld_chain?: components["schemas"]["PaintWeldChainResponse"] | null;
-        };
-        /**
-         * ProductionOrderPlanningResponse
-         * @description DBR provenance for a journal line; absent for non-DBR contours.
-         */
-        ProductionOrderPlanningResponse: {
-            /** Contour */
-            contour: string;
-            /** Source Id */
-            source_id: number;
-            /** Schedule Id */
-            schedule_id?: number | null;
-            /** Slot Id */
-            slot_id?: number | null;
-            /** Signal Type */
-            signal_type: string;
-            /** Priority */
-            priority?: number | null;
-            /** Zone */
-            zone?: string | null;
-            /** Need Date */
-            need_date?: string | null;
-            /** Required Date */
-            required_date?: string | null;
-            /** Queue State */
-            queue_state: string;
-            /**
-             * Chain Depth
-             * @default 0
-             */
-            chain_depth: number;
-            /** Parent Signal Id */
-            parent_signal_id?: number | null;
-            /** Reason */
-            reason?: string | null;
         };
         /** ProductionReportDayCloseRequest */
         ProductionReportDayCloseRequest: {
@@ -5834,59 +4538,6 @@ export interface components {
              */
             buffer_days: number;
         };
-        /** ProgramCreate */
-        ProgramCreate: {
-            /** Source Run Id */
-            source_run_id: number;
-            /**
-             * From Date
-             * Format: date
-             */
-            from_date: string;
-            /**
-             * To Date
-             * Format: date
-             */
-            to_date: string;
-            /** Company */
-            company?: string | null;
-            /** Title */
-            title?: string | null;
-            /** Created By */
-            created_by?: string | null;
-            /**
-             * Items
-             * @default []
-             */
-            items: components["schemas"]["ProgramItemIn"][];
-        };
-        /** ProgramItemIn */
-        ProgramItemIn: {
-            /** Item Id */
-            item_id: number;
-            /**
-             * Program Date
-             * Format: date
-             */
-            program_date: string;
-            /** Qty */
-            qty: number | string;
-            /** Comment */
-            comment?: string | null;
-        };
-        /** ProgramUpdate */
-        ProgramUpdate: {
-            /** From Date */
-            from_date?: string | null;
-            /** To Date */
-            to_date?: string | null;
-            /** Company */
-            company?: string | null;
-            /** Title */
-            title?: string | null;
-            /** Items */
-            items?: components["schemas"]["ProgramItemIn"][] | null;
-        };
         /** PurchaseCategoryGroup */
         PurchaseCategoryGroup: {
             /** Group Id */
@@ -5995,10 +4646,12 @@ export interface components {
             /** Offset */
             offset: number;
         };
-        /** PurchaseLaunchRequest */
-        PurchaseLaunchRequest: {
-            /** Signal Ids */
-            signal_ids: number[];
+        /** PurchaseControlMaterializeRequest */
+        PurchaseControlMaterializeRequest: {
+            /** Snapshot Id */
+            snapshot_id: number;
+            /** Row Keys */
+            row_keys?: string[];
             /**
              * Dry Run
              * @default true
@@ -6024,54 +4677,11 @@ export interface components {
              */
             allow_production: boolean | null;
         };
-        /** PurchasePlanMaterializeRequest */
-        PurchasePlanMaterializeRequest: {
-            /** Program Id */
-            program_id?: number | null;
-            /**
-             * Active
-             * @default false
-             */
-            active: boolean;
-            /**
-             * Threshold Days
-             * @default 60
-             */
-            threshold_days: number;
-            /**
-             * Dry Run
-             * @default true
-             */
-            dry_run: boolean;
-        };
         /** ReconcileRequest */
         ReconcileRequest: {
             /**
              * Dry Run
              * @default false
-             */
-            dry_run: boolean;
-        };
-        /** RefreezeRequest */
-        RefreezeRequest: {
-            /**
-             * Dry Run
-             * @default false
-             */
-            dry_run: boolean;
-            /** Plan Id */
-            plan_id?: number | null;
-        };
-        /** ReleaseDayRequest */
-        ReleaseDayRequest: {
-            /**
-             * Day
-             * Format: date
-             */
-            day: string;
-            /**
-             * Dry Run
-             * @default true
              */
             dry_run: boolean;
         };
@@ -6341,54 +4951,6 @@ export interface components {
              */
             dry_run: boolean;
         };
-        /** SettingsOut */
-        SettingsOut: {
-            /** Id */
-            id: number;
-            /** Frozen Days */
-            frozen_days: number;
-            /** Gate Horizon Workdays */
-            gate_horizon_workdays: number;
-            /** Shelf Threshold Qty */
-            shelf_threshold_qty: string;
-            /** Rt Machining Days */
-            rt_machining_days: number;
-            /** Rt Welding Days */
-            rt_welding_days: number;
-            /** Rt Painting Days */
-            rt_painting_days: number;
-            /** Batch Days Turning */
-            batch_days_turning: number;
-            /** Batch Days Bending */
-            batch_days_bending: number;
-            /** Batch Days Welding */
-            batch_days_welding: number;
-            /** Batch Days Paint Black */
-            batch_days_paint_black: number;
-            /** Batch Days Paint Color */
-            batch_days_paint_color: number;
-            /** Rt Processing Days */
-            rt_processing_days: number;
-            /** Processing Trip Interval Days */
-            processing_trip_interval_days: number;
-            /** Processing Roundtrip Days */
-            processing_roundtrip_days: number;
-            /** Feeder Chain Enabled */
-            feeder_chain_enabled: boolean;
-            /** Feeder Load Horizon Weeks */
-            feeder_load_horizon_weeks: number;
-            /** W2 Warehouse Ref1C */
-            w2_warehouse_ref1c?: string | null;
-            /** W3 Warehouse Ref1C */
-            w3_warehouse_ref1c?: string | null;
-            /** W4 Warehouse Ref1C */
-            w4_warehouse_ref1c?: string | null;
-            /**
-             * Fastener Categories
-             * @default []
-             */
-            fastener_categories: string[];
-        };
         /** SettingsPayload */
         SettingsPayload: {
             /**
@@ -6406,76 +4968,46 @@ export interface components {
                 [key: string]: unknown;
             }[];
         };
-        /** SettingsUpdate */
-        SettingsUpdate: {
-            /** Frozen Days */
-            frozen_days?: number | null;
-            /** Gate Horizon Workdays */
-            gate_horizon_workdays?: number | null;
-            /** Shelf Threshold Qty */
-            shelf_threshold_qty?: number | string | null;
-            /** Rt Machining Days */
-            rt_machining_days?: number | null;
-            /** Rt Welding Days */
-            rt_welding_days?: number | null;
-            /** Rt Painting Days */
-            rt_painting_days?: number | null;
-            /** Batch Days Turning */
-            batch_days_turning?: number | null;
-            /** Batch Days Bending */
-            batch_days_bending?: number | null;
-            /** Batch Days Welding */
-            batch_days_welding?: number | null;
-            /** Batch Days Paint Black */
-            batch_days_paint_black?: number | null;
-            /** Batch Days Paint Color */
-            batch_days_paint_color?: number | null;
-            /** Rt Processing Days */
-            rt_processing_days?: number | null;
-            /** Processing Trip Interval Days */
-            processing_trip_interval_days?: number | null;
-            /** Processing Roundtrip Days */
-            processing_roundtrip_days?: number | null;
-            /** Feeder Chain Enabled */
-            feeder_chain_enabled?: boolean | null;
-            /** Feeder Load Horizon Weeks */
-            feeder_load_horizon_weeks?: number | null;
-            /** W2 Warehouse Ref1C */
-            w2_warehouse_ref1c?: string | null;
-            /** W3 Warehouse Ref1C */
-            w3_warehouse_ref1c?: string | null;
-            /** W4 Warehouse Ref1C */
-            w4_warehouse_ref1c?: string | null;
-            /** Fastener Categories */
-            fastener_categories?: string[] | null;
+        /** ShelfProjectionResponse */
+        ShelfProjectionResponse: {
+            /** Rows */
+            rows: components["schemas"]["ShelfProjectionRow"][];
+            /** Total Rows */
+            total_rows: number;
+            truth_meta: components["schemas"]["TruthMeta"];
         };
-        /** SignalLaunchRequest */
-        SignalLaunchRequest: {
-            /**
-             * Dry Run
-             * @default true
-             */
-            dry_run: boolean;
-            /**
-             * Allow Production
-             * @default false
-             */
-            allow_production: boolean;
-        };
-        /** SignalRefreshRequest */
-        SignalRefreshRequest: {
-            /** Expected Schedule Id */
-            expected_schedule_id?: number | null;
-        };
-        /** SlotMove */
-        SlotMove: {
-            /**
-             * New Date
-             * Format: date
-             */
-            new_date: string;
-            /** New Resource Id */
-            new_resource_id?: number | null;
+        /** ShelfProjectionRow */
+        ShelfProjectionRow: {
+            /** Policy Id */
+            policy_id: number;
+            /** Item Id */
+            item_id: number;
+            /** Warehouse Ref1C */
+            warehouse_ref1c: string;
+            /** Protection Until */
+            protection_until: string;
+            /** Target Qty */
+            target_qty: number;
+            /** Shelf Physical Qty */
+            shelf_physical_qty: number;
+            /** Other Stock Qty */
+            other_stock_qty: number;
+            /** Projected Qty */
+            projected_qty: number;
+            /** Gap Qty */
+            gap_qty: number;
+            /** Transfer Qty */
+            transfer_qty: number;
+            /** Unlaunched Mrp Qty */
+            unlaunched_mrp_qty: number;
+            /** Pull Qty */
+            pull_qty: number;
+            /** Materialized Qty */
+            materialized_qty: number;
+            /** First Shortage Date */
+            first_shortage_date: string | null;
+            /** Latest Start Date */
+            latest_start_date: string | null;
         };
         /** SyncAutoConfigPayload */
         SyncAutoConfigPayload: {
@@ -6797,61 +5329,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    stock_ledger_shadow_report_api_v1_sync_stock_ledger_shadow_report_get: {
-        parameters: {
-            query?: {
-                include_all?: boolean;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    reservation_ledger_shadow_report_api_v1_sync_reservation_ledger_shadow_report_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
                 };
             };
         };
@@ -8144,68 +6621,6 @@ export interface operations {
             };
         };
     };
-    period_plans_archive_api_v1_plan_period_plans__plan_id__archive_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                plan_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    period_plans_unarchive_api_v1_plan_period_plans__plan_id__unarchive_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                plan_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     period_plans_runs_api_v1_plan_period_plans__plan_id__runs_get: {
         parameters: {
             query?: {
@@ -8571,105 +6986,6 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["EnsureItemRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    start_planning_run_api_v1_plan_calc_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["CalcRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    calc_preview_api_v1_plan_calc_preview_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["CalcRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    calc_gross_api_v1_plan_calc_gross_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["CalcRequest"];
             };
         };
         responses: {
@@ -9232,75 +7548,6 @@ export interface operations {
             };
         };
     };
-    get_planning_result_pegging_api_v1_plan_results__run_id__pegging_get: {
-        parameters: {
-            query?: {
-                child_item_id?: number | null;
-                parent_item_id?: number | null;
-                date_from?: string | null;
-                date_to?: string | null;
-                limit?: number;
-                offset?: number;
-            };
-            header?: never;
-            path: {
-                run_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    get_shortage_report_api_v1_plan_results__run_id__shortage_report_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                run_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     list_forced_orders_api_v1_plan_forced_orders_get: {
         parameters: {
             query?: {
@@ -9563,143 +7810,7 @@ export interface operations {
             };
         };
     };
-    refreeze_mrp_snapshots_api_v1_plan_mrp_snapshot_refreeze_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: {
-            content: {
-                "application/json": components["schemas"]["RefreezeRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    reconcile_active_snapshots_api_v1_plan_reconcile_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: {
-            content: {
-                "application/json": components["schemas"]["ReconcileRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    reconcile_single_snapshot_api_v1_plan_results__run_id__reconcile_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                run_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: {
-            content: {
-                "application/json": components["schemas"]["ReconcileRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    force_close_mrp_run_api_v1_plan_mrp_run__run_id__force_close_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                run_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: {
-            content: {
-                "application/json": components["schemas"]["ReconcileRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    reopen_mrp_run_api_v1_plan_mrp_run__run_id__reopen_post: {
+    close_mrp_run_api_v1_plan_mrp_run__run_id__close_post: {
         parameters: {
             query?: never;
             header?: never;
@@ -10875,6 +8986,66 @@ export interface operations {
             };
         };
     };
+    get_assembly_queue_api_v1_production_control_assembly_queue_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AssemblyQueueResponse"];
+                };
+            };
+        };
+    };
+    get_drum_schedule_api_v1_production_control_drum_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DrumScheduleResponse"];
+                };
+            };
+        };
+    };
+    get_shelf_projections_api_v1_production_control_shelves_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ShelfProjectionResponse"];
+                };
+            };
+        };
+    };
     list_employees_api_v1_production_control_employees_get: {
         parameters: {
             query?: {
@@ -10951,7 +9122,7 @@ export interface operations {
                 workshop_id?: number | null;
                 status?: string | null;
                 coverage_status?: string | null;
-                /** @description Контур планирования: dbr_feeder для очереди мехцеха; mrp, dbr или 1c для источника заказа. */
+                /** @description Контур планирования: mrp или 1c для источника заказа. */
                 planning_contour?: string | null;
                 search?: string | null;
                 date_from?: string | null;
@@ -11372,7 +9543,7 @@ export interface operations {
             };
         };
     };
-    post_repair_order_completion_success_api_v1_production_control_repair_order_completion_success_post: {
+    post_orders_from_work_items_api_v1_production_control_orders_from_work_items_post: {
         parameters: {
             query?: never;
             header?: never;
@@ -11381,77 +9552,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["OrderCompletionRepairPayload"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    post_orders_from_mrp_api_v1_production_control_orders_from_mrp_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["OrdersFromMrpPayload"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    post_orders_from_mrp_requirements_api_v1_production_control_orders_from_mrp_requirements_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["OrdersFromMrpRequirementsPayload"];
+                "application/json": components["schemas"]["OrdersFromWorkItemsPayload"];
             };
         };
         responses: {
@@ -11697,78 +9798,6 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["AssembleMaterialIssuePayload"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    post_repair_in_place_reservations_api_v1_production_control_reservation_repair_in_place_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["InPlaceReservationRepairPayload"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    post_material_issue_to_1c_legacy_api_v1_production_control_material_issues__issue_id__export_to_1c_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                issue_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ODataSyncRequest"];
             };
         };
         responses: {
@@ -12201,17 +10230,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": {
-                    /** Snapshot Id */
-                    snapshot_id: number;
-                    /** Row Keys */
-                    row_keys?: string[];
-                    /**
-                     * Dry Run
-                     * @default true
-                     */
-                    dry_run?: boolean;
-                };
+                "application/json": components["schemas"]["PurchaseControlMaterializeRequest"];
             };
         };
         responses: {
@@ -12227,32 +10246,12 @@ export interface operations {
                 };
             };
             /** @description Validation Error */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-            /** @description Validation Error */
             422: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-            /** @description Service Not Ready */
-            503: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
                 };
             };
         };
@@ -12314,1255 +10313,6 @@ export interface operations {
                     "application/json": {
                         [key: string]: unknown;
                     };
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    get_settings_api_v1_dbr_settings_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["SettingsOut"];
-                };
-            };
-        };
-    };
-    put_settings_api_v1_dbr_settings_put: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["SettingsUpdate"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["SettingsOut"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    get_assembly_rates_api_v1_dbr_assembly_rates_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AssemblyRateOut"][];
-                };
-            };
-        };
-    };
-    put_assembly_rate_api_v1_dbr_assembly_rates_put: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["AssemblyRateUpsert"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AssemblyRateOut"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    delete_assembly_rate_api_v1_dbr_assembly_rates__rate_id__delete: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                rate_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    get_category_risks_api_v1_dbr_category_risks_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["CategoryRiskOut"][];
-                };
-            };
-        };
-    };
-    put_category_risks_api_v1_dbr_category_risks_put: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["CategoryRisksReplace"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["CategoryRiskOut"][];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    preview_feeder_positions_api_v1_dbr_feeder_positions_preview_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["PositionPreviewRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    rebuild_feeder_positions_api_v1_dbr_feeder_positions_rebuild_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["PositionRebuildRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    get_feeder_cockpit_api_v1_dbr_feeder_cockpit_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-        };
-    };
-    get_feeder_positions_api_v1_dbr_feeder_positions_get: {
-        parameters: {
-            query?: {
-                include_live_nfp?: boolean;
-                active?: boolean | null;
-                active_only?: boolean;
-                mode?: string | null;
-                supply?: string | null;
-                warehouse?: string | null;
-                zone?: string | null;
-                search?: string | null;
-                limit?: number;
-                offset?: number;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    get_feeder_position_api_v1_dbr_feeder_positions__position_id__get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                position_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    preview_feeder_signals_api_v1_dbr_feeder_signals_preview_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-        };
-    };
-    refresh_feeder_signals_api_v1_dbr_feeder_signals_refresh_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["SignalRefreshRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    get_feeder_signals_api_v1_dbr_feeder_signals_get: {
-        parameters: {
-            query?: {
-                status?: string | null;
-                zone?: string | null;
-                signal_type?: string | null;
-                search?: string | null;
-                limit?: number;
-                offset?: number;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    get_feeder_signal_api_v1_dbr_feeder_signals__signal_id__get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                signal_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    get_feeder_deficits_api_v1_dbr_feeder_deficits_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-        };
-    };
-    get_processing_board_api_v1_dbr_feeder_processing_board_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-        };
-    };
-    get_processing_trip_manifest_api_v1_dbr_feeder_processing_trip_manifest_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-        };
-    };
-    print_processing_trip_manifest_api_v1_dbr_feeder_processing_trip_manifest_print_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "text/html": string;
-                };
-            };
-        };
-    };
-    preview_feeder_chain_api_v1_dbr_feeder_chain_preview_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-        };
-    };
-    preview_processing_feeder_chain_api_v1_dbr_feeder_processing_chain_preview_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-        };
-    };
-    refresh_feeder_chain_api_v1_dbr_feeder_chain_refresh_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-        };
-    };
-    list_programs_api_v1_dbr_programs_get: {
-        parameters: {
-            query?: {
-                status?: string | null;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    create_program_api_v1_dbr_programs_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ProgramCreate"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    get_program_api_v1_dbr_programs__program_id__get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                program_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    update_program_api_v1_dbr_programs__program_id__put: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                program_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ProgramUpdate"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    approve_program_api_v1_dbr_programs__program_id__approve_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                program_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    drum_build_api_v1_dbr_drum_build_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["DrumBuild"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    drum_activate_api_v1_dbr_drum__schedule_id__activate_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                schedule_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    drum_extend_api_v1_dbr_drum__schedule_id__extend_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                schedule_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["DrumExtend"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    drum_board_api_v1_dbr_drum_active_board_get: {
-        parameters: {
-            query?: {
-                date_from?: string | null;
-                date_to?: string | null;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    drum_refresh_gate_api_v1_dbr_drum__schedule_id__refresh_gate_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                schedule_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    drum_roll_forward_api_v1_dbr_drum__schedule_id__roll_forward_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                schedule_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    drum_move_slot_api_v1_dbr_drum_slots__slot_id__move_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                slot_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["SlotMove"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    drum_release_slot_api_v1_dbr_drum_slots__slot_id__release_post: {
-        parameters: {
-            query?: {
-                dry_run?: boolean;
-            };
-            header?: never;
-            path: {
-                slot_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    drum_release_day_api_v1_dbr_drum__schedule_id__release_day_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                schedule_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ReleaseDayRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    feeder_launch_signal_api_v1_dbr_feeder_signals__signal_id__launch_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                signal_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["SignalLaunchRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    feeder_processing_order_preview_api_v1_dbr_feeder_signals__signal_id__processing_order_preview_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                signal_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    get_purchase_cockpit_api_v1_dbr_purchase_cockpit_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-        };
-    };
-    feeder_launch_purchase_api_v1_dbr_feeder_purchase_launch_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["PurchaseLaunchRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    purchase_plan_preview_api_v1_dbr_purchase_plan_preview_get: {
-        parameters: {
-            query?: {
-                program_id?: number | null;
-                active?: boolean;
-                threshold_days?: number;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    purchase_plan_materialize_api_v1_dbr_purchase_plan_materialize_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["PurchasePlanMaterializeRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": unknown;
                 };
             };
             /** @description Validation Error */
@@ -13825,41 +10575,6 @@ export interface operations {
             };
         };
     };
-    chain_close_api_v1_paint_weld_chain_close_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ChainClosePayload"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
     get_position_api_v1_item_ledger__item_id__position_get: {
         parameters: {
             query?: never;
@@ -13982,40 +10697,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ItemLedgerReservationEventsResponse"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    get_drift_api_v1_item_ledger__item_id__drift_get: {
-        parameters: {
-            query?: {
-                limit?: number;
-                offset?: number;
-            };
-            header?: never;
-            path: {
-                item_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ItemLedgerDriftResponse"];
                 };
             };
             /** @description Validation Error */
@@ -14270,141 +10951,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SeedResponse"];
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    get_input_fingerprint_api_v1_planning_comparison_input_fingerprint_get: {
-        parameters: {
-            query?: {
-                include_results?: boolean;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    create_capture_api_v1_planning_comparison_captures_post: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["CaptureRequest"];
-            };
-        };
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    get_batches_api_v1_planning_comparison_batches_get: {
-        parameters: {
-            query?: {
-                limit?: number;
-                offset?: number;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
-                };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    get_batch_api_v1_planning_comparison_batches__batch_id__get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                batch_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": {
-                        [key: string]: unknown;
-                    };
                 };
             };
             /** @description Validation Error */

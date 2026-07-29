@@ -4,7 +4,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ApiError } from '../../lib/api'
 import { qty } from '../../lib/format'
 import type {
-  ItemLedgerDriftResponse,
   ItemLedgerMovementsResponse,
   ItemLedgerPosition,
   ItemLedgerReservationsResponse,
@@ -120,12 +119,11 @@ const reservations: ItemLedgerReservationsResponse = {
       realization_mode: 'consume',
       priority: { period_from: '2026-07-01', period_to: '2026-07-31' },
       reserved_qty: 270.64,
-      realized_qty: 79.57,
-      outstanding: 191.07,
-      covered: { on_hand: 120, incoming_supplier: 71.07, incoming_wip: 0 },
-      uncovered_qty: 0,
+      covered_from_stock_at_freeze_qty: 120,
+      replenishment_required_qty: 150.64,
+      replenishment_received_qty: 79.57,
+      replenishment_remaining_qty: 71.07,
       lifecycle_status: 'active',
-      coverage_state: 'covered',
     },
     {
       reservation_id: 102,
@@ -136,36 +134,11 @@ const reservations: ItemLedgerReservationsResponse = {
       realization_mode: 'make',
       priority: { period_from: '2026-08-01', period_to: '2026-08-31' },
       reserved_qty: 80,
-      realized_qty: 20,
-      outstanding: 60,
-      covered: { on_hand: 10, incoming_supplier: 20, incoming_wip: 5 },
-      uncovered_qty: 30,
+      covered_from_stock_at_freeze_qty: 10,
+      replenishment_required_qty: 70,
+      replenishment_received_qty: 20,
+      replenishment_remaining_qty: 50,
       lifecycle_status: 'released',
-      coverage_state: 'partial',
-    },
-  ],
-}
-
-const drift: ItemLedgerDriftResponse = {
-  truth_meta: truthMeta,
-  total: 1,
-  limit: 100,
-  offset: 0,
-  rows: [
-    {
-      id: 1,
-      cycle_id: '',
-      kind: 'shortfall',
-      drift_qty: 3,
-      expected_stock: 10,
-      actual_stock: 7,
-      at: '2026-07-21T11:00:00',
-      cause: null,
-      adjustment_sle_id: null,
-      matured: false,
-      first_seen_cycle_id: null,
-      requirement_id: null,
-      details: { note: 'supply gap', source: 'openapi' },
     },
   ],
 }
@@ -195,7 +168,6 @@ function createProvider(overrides: Partial<ItemLedgerDataProvider> = {}): ItemLe
     loadMovements: vi.fn().mockResolvedValue(movements),
     loadReservations: vi.fn().mockResolvedValue(reservations),
     loadReservationEvents: vi.fn().mockResolvedValue(reservationEvents),
-    loadDrift: vi.fn().mockResolvedValue(drift),
     ...overrides,
   }
 }
@@ -268,7 +240,6 @@ describe('LedgerWorkspacePage', () => {
       loadPosition: vi.fn().mockResolvedValue(position),
       loadMovements: vi.fn().mockResolvedValue(movements),
       loadReservations: vi.fn().mockResolvedValue(reservations),
-      loadDrift: vi.fn().mockResolvedValue(drift),
       loadReservationEvents: vi.fn((_, reservationId) => {
         if (reservationId === 101) return firstEvents.promise
         return secondEvents.promise

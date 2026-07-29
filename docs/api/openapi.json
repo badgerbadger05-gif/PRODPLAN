@@ -313,76 +313,6 @@
         }
       }
     },
-    "/api/v1/sync/stock-ledger/shadow-report": {
-      "get": {
-        "tags": [
-          "sync"
-        ],
-        "summary": "Stock Ledger Shadow Report",
-        "description": "Item-ledger shadow diagnostic (design §3б / inc3): per item the ledger\nworld (Σ stock_bin.on_hand over the contour) vs the legacy world\n(effective_stock_by_item_all) and their divergence, plus reconcile counts\n(matched / pending / adjusted). Read-only; no behavior change.",
-        "operationId": "stock_ledger_shadow_report_api_v1_sync_stock_ledger_shadow_report_get",
-        "parameters": [
-          {
-            "name": "include_all",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "boolean",
-              "default": false,
-              "title": "Include All"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response Stock Ledger Shadow Report Api V1 Sync Stock Ledger Shadow Report Get"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/sync/reservation-ledger/shadow-report": {
-      "get": {
-        "tags": [
-          "sync"
-        ],
-        "summary": "Reservation Ledger Shadow Report",
-        "description": "Item-ledger reservation shadow diagnostic (design §11 Инк4): per\nrequirement the reservation world (uncovered / outstanding / produced) laid\nbeside the inc1–5 world (remaining_qty / covered_qty / executed_qty), and per\npool reserved_soft vs Σ remaining. Read-only; no behavior change (Inc4 is\npure shadow — no reader consults the reservation ledger yet).",
-        "operationId": "reservation_ledger_shadow_report_api_v1_sync_reservation_ledger_shadow_report_get",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object",
-                  "title": "Response Reservation Ledger Shadow Report Api V1 Sync Reservation Ledger Shadow Report Get"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/api/v1/sync/warehouses": {
       "get": {
         "tags": [
@@ -2187,86 +2117,6 @@
         }
       }
     },
-    "/api/v1/plan/period-plans/{plan_id}/archive": {
-      "post": {
-        "tags": [
-          "plan"
-        ],
-        "summary": "Period Plans Archive",
-        "operationId": "period_plans_archive_api_v1_plan_period_plans__plan_id__archive_post",
-        "parameters": [
-          {
-            "name": "plan_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Plan Id"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/plan/period-plans/{plan_id}/unarchive": {
-      "post": {
-        "tags": [
-          "plan"
-        ],
-        "summary": "Period Plans Unarchive",
-        "operationId": "period_plans_unarchive_api_v1_plan_period_plans__plan_id__unarchive_post",
-        "parameters": [
-          {
-            "name": "plan_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Plan Id"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/api/v1/plan/period-plans/{plan_id}/runs": {
       "get": {
         "tags": [
@@ -2784,126 +2634,6 @@
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/EnsureItemRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/plan/calc": {
-      "post": {
-        "tags": [
-          "plan"
-        ],
-        "summary": "Start Planning Run",
-        "description": "Retired: live runs bypass immutable Ledger candidates and snapshots.",
-        "operationId": "start_planning_run_api_v1_plan_calc_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CalcRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/plan/calc_preview": {
-      "post": {
-        "tags": [
-          "plan"
-        ],
-        "summary": "Calc Preview",
-        "description": "Retired: previews must be persisted by the background refresh flow.",
-        "operationId": "calc_preview_api_v1_plan_calc_preview_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CalcRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/plan/calc_gross": {
-      "post": {
-        "tags": [
-          "plan"
-        ],
-        "summary": "Calc Gross",
-        "description": "Retired: gross demand is part of a sealed Ledger-bound snapshot.",
-        "operationId": "calc_gross_api_v1_plan_calc_gross_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CalcRequest"
               }
             }
           },
@@ -4580,172 +4310,6 @@
         }
       }
     },
-    "/api/v1/plan/results/{run_id}/pegging": {
-      "get": {
-        "tags": [
-          "plan"
-        ],
-        "summary": "Get Planning Result Pegging",
-        "description": "Трассируемость компонент → спрос (pegging) по прогону (с фильтрами и пагинацией)",
-        "operationId": "get_planning_result_pegging_api_v1_plan_results__run_id__pegging_get",
-        "parameters": [
-          {
-            "name": "run_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Run Id"
-            }
-          },
-          {
-            "name": "child_item_id",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Child Item Id"
-            }
-          },
-          {
-            "name": "parent_item_id",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Parent Item Id"
-            }
-          },
-          {
-            "name": "date_from",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Date From"
-            }
-          },
-          {
-            "name": "date_to",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Date To"
-            }
-          },
-          {
-            "name": "limit",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "default": 200,
-              "title": "Limit"
-            }
-          },
-          {
-            "name": "offset",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "default": 0,
-              "title": "Offset"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/plan/results/{run_id}/shortage-report": {
-      "get": {
-        "tags": [
-          "plan"
-        ],
-        "summary": "Get Shortage Report",
-        "description": "XLSX отчёт по дефицитам комплектующих (blocked/partial) для прогона",
-        "operationId": "get_shortage_report_api_v1_plan_results__run_id__shortage_report_get",
-        "parameters": [
-          {
-            "name": "run_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Run Id"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/api/v1/plan/forced_orders": {
       "post": {
         "tags": [
@@ -5315,204 +4879,14 @@
         }
       }
     },
-    "/api/v1/plan/mrp-snapshot/refreeze": {
+    "/api/v1/plan/mrp/run/{run_id}/close": {
       "post": {
         "tags": [
           "plan"
         ],
-        "summary": "Refreeze Mrp Snapshots",
-        "description": "Retired destructive endpoint; use the period-plan snapshot contract.",
-        "operationId": "refreeze_mrp_snapshots_api_v1_plan_mrp_snapshot_refreeze_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/RefreezeRequest",
-                "default": {
-                  "dry_run": false
-                }
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/plan/reconcile": {
-      "post": {
-        "tags": [
-          "plan"
-        ],
-        "summary": "Reconcile Active Snapshots",
-        "description": "Retired: proposal mutations belong to obligation-refresh publish.",
-        "operationId": "reconcile_active_snapshots_api_v1_plan_reconcile_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ReconcileRequest",
-                "default": {
-                  "dry_run": false
-                }
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/plan/results/{run_id}/reconcile": {
-      "post": {
-        "tags": [
-          "plan"
-        ],
-        "summary": "Reconcile Single Snapshot",
-        "description": "Retired: a published run is immutable and cannot be reconciled live.",
-        "operationId": "reconcile_single_snapshot_api_v1_plan_results__run_id__reconcile_post",
-        "parameters": [
-          {
-            "name": "run_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Run Id"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ReconcileRequest",
-                "default": {
-                  "dry_run": false
-                }
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/plan/mrp/run/{run_id}/force-close": {
-      "post": {
-        "tags": [
-          "plan"
-        ],
-        "summary": "Force Close Mrp Run",
-        "description": "Принудительно закрыть недовыполненный FIXED_SNAPSHOT-прогон (бизнес-решение).\n\nОстаток НЕ переносится: открытые требования закрываются, их неэкспортированные\nзакупочные предложения усыхают до нуля (экспортированные в 1С не трогаем —\nотмена вручную). Идемпотентно на уже закрытом прогоне. `dry_run=true` считает\nи откатывает.",
-        "operationId": "force_close_mrp_run_api_v1_plan_mrp_run__run_id__force_close_post",
-        "parameters": [
-          {
-            "name": "run_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Run Id"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ReconcileRequest",
-                "default": {
-                  "dry_run": false
-                }
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/plan/mrp/run/{run_id}/reopen": {
-      "post": {
-        "tags": [
-          "plan"
-        ],
-        "summary": "Reopen Mrp Run",
-        "description": "Отменить закрытие прогона: CLOSED → FIXED_SNAPSHOT, закрытые требования\nснова открываются и возвращаются в область расчёта. `dry_run=true` откатывает.",
-        "operationId": "reopen_mrp_run_api_v1_plan_mrp_run__run_id__reopen_post",
+        "summary": "Close Mrp Run",
+        "description": "Явно закрыть плановый прогон (FIXED_SNAPSHOT→CLOSED).\n\nЗакрытие убирает активные резервы из рабочих очередей (release),\nтребования и закупочные строки не перезаписывает. Доступно только для\nзафиксированных прогонах. Повторный вызов идемпотентен.",
+        "operationId": "close_mrp_run_api_v1_plan_mrp_run__run_id__close_post",
         "parameters": [
           {
             "name": "run_id",
@@ -7729,6 +7103,72 @@
         }
       }
     },
+    "/api/v1/production-control/assembly-queue": {
+      "get": {
+        "tags": [
+          "production-control"
+        ],
+        "summary": "Get Assembly Queue",
+        "description": "Read the immutable queue belonging to the exact accepted generation.",
+        "operationId": "get_assembly_queue_api_v1_production_control_assembly_queue_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AssemblyQueueResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/production-control/drum": {
+      "get": {
+        "tags": [
+          "production-control"
+        ],
+        "summary": "Get Drum Schedule",
+        "description": "Read the persisted drum of the exact accepted generation.",
+        "operationId": "get_drum_schedule_api_v1_production_control_drum_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DrumScheduleResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/production-control/shelves": {
+      "get": {
+        "tags": [
+          "production-control"
+        ],
+        "summary": "Get Shelf Projections",
+        "description": "Read persisted shelf pull priorities of the accepted generation.",
+        "operationId": "get_shelf_projections_api_v1_production_control_shelves_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShelfProjectionResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/production-control/employees": {
       "get": {
         "tags": [
@@ -7953,10 +7393,10 @@
                   "type": "null"
                 }
               ],
-              "description": "Контур планирования: dbr_feeder для очереди мехцеха; mrp, dbr или 1c для источника заказа.",
+              "description": "Контур планирования: mrp или 1c для источника заказа.",
               "title": "Planning Contour"
             },
-            "description": "Контур планирования: dbr_feeder для очереди мехцеха; mrp, dbr или 1c для источника заказа."
+            "description": "Контур планирования: mrp или 1c для источника заказа."
           },
           {
             "name": "search",
@@ -8384,7 +7824,7 @@
           "production-control"
         ],
         "summary": "Post Produce Line",
-        "description": "Record one production event on the line. Bumps produced_qty / decreases\nremaining_qty / promotes line status to produced_partial or produced.\nCreates a ProductionManufacture row. Local only вЂ” does NOT send to 1C;\nuse POST /manufactures/export-to-1c for that.",
+        "description": "One operator action: create the durable command, export and post\nСборкаЗапасов, then export and post СдельныйНаряд. The assembly exporter\nenqueues the posted recorder for immediate Item Ledger read-back. None of\nthese document writes is itself a production fact.",
         "operationId": "post_produce_line_api_v1_production_control_orders__product_id__produce_post",
         "parameters": [
           {
@@ -8439,7 +7879,7 @@
           "production-control"
         ],
         "summary": "Post Return Leftovers",
-        "description": "Создать обратное перемещение лишних компонентов на исходные склады для\nчастично произведённой строки. Локально только вЂ” в 1С документ\nотправится отдельно через /material-issues/export-to-1c.\n\nВозвращает либо status='ok' с return_issue_id и list of lines, либо\nstatus='skipped' с человекочитаемой причиной (produced_qty=0, нет\nвыгруженных исходящих перемещений, или нет компонентов с остатком).",
+        "description": "Create inbound transfer for leftover components from partial production.\nExport remains in /material-issues/export-to-1c.",
         "operationId": "post_return_leftovers_api_v1_production_control_orders__product_id__return_leftovers_post",
         "parameters": [
           {
@@ -8500,7 +7940,7 @@
           "production-control"
         ],
         "summary": "Post Export Manufactures To 1C",
-        "description": "Bulk-экспорт выпусков (производств) в 1С как Document_СборкаЗапасов\n(Posted=false). РРґРµРјРїРѕС‚РµРЅС‚РЅРѕ через sync_link.",
+        "description": "Bulk-экспорт выпусков в 1С как Document_СборкаЗапасов.",
         "operationId": "post_export_manufactures_to_1c_api_v1_production_control_manufactures_export_to_1c_post",
         "requestBody": {
           "content": {
@@ -8588,7 +8028,7 @@
           "production-control"
         ],
         "summary": "Post Export Piecework To 1C",
-        "description": "Bulk-экспорт выпусков в 1С как Document_СдельныйНаряд.\nИдемпотентно через sync_link (source_doctype='piecework').\n\nТребование: каждый manufacture должен быть уже выгружен как\nDocument_СборкаЗапасов (поле exported_ref1c заполнено) — он используется\nкак ДокументОснование сдельного наряда. Операция по умолчанию берется\nиз спецификации выпуска; operation_ref нужен только для ручного override.",
+        "description": "Bulk-экспорт выпусков в 1С как Document_СдельныйНаряд.",
         "operationId": "post_export_piecework_to_1c_api_v1_production_control_manufactures_export_piecework_to_1c_post",
         "requestBody": {
           "content": {
@@ -8626,19 +8066,19 @@
         }
       }
     },
-    "/api/v1/production-control/repair/order-completion-success": {
+    "/api/v1/production-control/orders/from-work-items": {
       "post": {
         "tags": [
           "production-control"
         ],
-        "summary": "Post Repair Order Completion Success",
-        "description": "Backfill 1C Document_ЗаказНаПроизводство.ВариантЗавершения='Успешно'\nfor completed PRODPLAN-created orders (by Number prefix, default PP).",
-        "operationId": "post_repair_order_completion_success_api_v1_production_control_repair_order_completion_success_post",
+        "summary": "Post Orders From Work Items",
+        "description": "Materialize selected current-generation make work items into orders.\n\nFrozen requirement, reservation and work-item quantities are not changed.",
+        "operationId": "post_orders_from_work_items_api_v1_production_control_orders_from_work_items_post",
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/OrderCompletionRepairPayload"
+                "$ref": "#/components/schemas/OrdersFromWorkItemsPayload"
               }
             }
           },
@@ -8652,95 +8092,7 @@
                 "schema": {
                   "additionalProperties": true,
                   "type": "object",
-                  "title": "Response Post Repair Order Completion Success Api V1 Production Control Repair Order Completion Success Post"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/production-control/orders/from-mrp": {
-      "post": {
-        "tags": [
-          "production-control"
-        ],
-        "summary": "Post Orders From Mrp",
-        "description": "Materialize selected MRP planned_order rows as internal production orders\n(production_orders.source='mrp'). Idempotent: planned_orders that already\nback a production_products line are returned under `reused`.",
-        "operationId": "post_orders_from_mrp_api_v1_production_control_orders_from_mrp_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/OrdersFromMrpPayload"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object",
-                  "title": "Response Post Orders From Mrp Api V1 Production Control Orders From Mrp Post"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/production-control/orders/from-mrp-requirements": {
-      "post": {
-        "tags": [
-          "production-control"
-        ],
-        "summary": "Post Orders From Mrp Requirements",
-        "description": "Materialize selected MrpRequirement rows (production-flow items from a\nperiod-plan MRP snapshot) into internal production orders.\n\nIdempotent: requirements that already have a ProductionProduct linked via\nsource_mrp_requirement_id are returned under `reused`.\nPurchase/rework requirements are returned under `skipped`.\nMrpRequirement.covered_qty / remaining_qty are updated.",
-        "operationId": "post_orders_from_mrp_requirements_api_v1_production_control_orders_from_mrp_requirements_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/OrdersFromMrpRequirementsPayload"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object",
-                  "title": "Response Post Orders From Mrp Requirements Api V1 Production Control Orders From Mrp Requirements Post"
+                  "title": "Response Post Orders From Work Items Api V1 Production Control Orders From Work Items Post"
                 }
               }
             }
@@ -9113,105 +8465,6 @@
                   "type": "object",
                   "additionalProperties": true,
                   "title": "Response Post Material Issue Assembled Api V1 Production Control Material Issues  Issue Id  Assembled Post"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/production-control/reservation-repair/in-place": {
-      "post": {
-        "tags": [
-          "production-control"
-        ],
-        "summary": "Post Repair In Place Reservations",
-        "operationId": "post_repair_in_place_reservations_api_v1_production_control_reservation_repair_in_place_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/InPlaceReservationRepairPayload"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object",
-                  "title": "Response Post Repair In Place Reservations Api V1 Production Control Reservation Repair In Place Post"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/production-control/material-issues/{issue_id}/export-to-1c": {
-      "post": {
-        "tags": [
-          "production-control"
-        ],
-        "summary": "Post Material Issue To 1C Legacy",
-        "description": "Legacy: single-issue export. Kept for backwards-compatibility with\nexisting clients. Prefer POST /material-issues/export-to-1c.",
-        "operationId": "post_material_issue_to_1c_legacy_api_v1_production_control_material_issues__issue_id__export_to_1c_post",
-        "deprecated": true,
-        "parameters": [
-          {
-            "name": "issue_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Issue Id"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ODataSyncRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response Post Material Issue To 1C Legacy Api V1 Production Control Material Issues  Issue Id  Export To 1C Post"
                 }
               }
             }
@@ -9958,41 +9211,18 @@
         "tags": [
           "purchase-control"
         ],
-        "summary": "Materialize",
-        "description": "Materialize selected neutral MRP rows against the accepted snapshot.",
+        "summary": "Materialize Purchase Control Rows",
+        "description": "Materialize selected neutral MRP purchase rows from the accepted snapshot.",
         "operationId": "materialize_purchase_control_rows_api_v1_purchase_control_materialize_post",
         "requestBody": {
-          "required": true,
           "content": {
             "application/json": {
               "schema": {
-                "additionalProperties": false,
-                "type": "object",
-                "required": [
-                  "snapshot_id"
-                ],
-                "properties": {
-                  "snapshot_id": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "title": "Snapshot Id"
-                  },
-                  "row_keys": {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    },
-                    "title": "Row Keys"
-                  },
-                  "dry_run": {
-                    "type": "boolean",
-                    "default": true,
-                    "title": "Dry Run"
-                  }
-                }
+                "$ref": "#/components/schemas/PurchaseControlMaterializeRequest"
               }
             }
-          }
+          },
+          "required": true
         },
         "responses": {
           "200": {
@@ -10000,19 +9230,9 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
                   "additionalProperties": true,
-                  "title": "Response Materialize Api V1 Purchase Control Materialize Post"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "type": "object",
+                  "title": "Response Materialize Purchase Control Rows Api V1 Purchase Control Materialize Post"
                 }
               }
             }
@@ -10023,18 +9243,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "Service Not Ready",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object",
-                  "title": "Response Materialize Api V1 Purchase Control Materialize Post 503"
                 }
               }
             }
@@ -10167,1800 +9375,6 @@
                   "additionalProperties": true,
                   "title": "Response Get Review Item Lines Api V1 Workshop Binding Review Items  Item Id  Lines Get"
                 }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/settings": {
-      "get": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Get Settings",
-        "operationId": "get_settings_api_v1_dbr_settings_get",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SettingsOut"
-                }
-              }
-            }
-          }
-        }
-      },
-      "put": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Put Settings",
-        "operationId": "put_settings_api_v1_dbr_settings_put",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/SettingsUpdate"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SettingsOut"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/assembly-rates": {
-      "get": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Get Assembly Rates",
-        "operationId": "get_assembly_rates_api_v1_dbr_assembly_rates_get",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/AssemblyRateOut"
-                  },
-                  "type": "array",
-                  "title": "Response Get Assembly Rates Api V1 Dbr Assembly Rates Get"
-                }
-              }
-            }
-          }
-        }
-      },
-      "put": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Put Assembly Rate",
-        "operationId": "put_assembly_rate_api_v1_dbr_assembly_rates_put",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/AssemblyRateUpsert"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AssemblyRateOut"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/assembly-rates/{rate_id}": {
-      "delete": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Delete Assembly Rate",
-        "operationId": "delete_assembly_rate_api_v1_dbr_assembly_rates__rate_id__delete",
-        "parameters": [
-          {
-            "name": "rate_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Rate Id"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/category-risks": {
-      "get": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Get Category Risks",
-        "operationId": "get_category_risks_api_v1_dbr_category_risks_get",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/CategoryRiskOut"
-                  },
-                  "type": "array",
-                  "title": "Response Get Category Risks Api V1 Dbr Category Risks Get"
-                }
-              }
-            }
-          }
-        }
-      },
-      "put": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Put Category Risks",
-        "operationId": "put_category_risks_api_v1_dbr_category_risks_put",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CategoryRisksReplace"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "items": {
-                    "$ref": "#/components/schemas/CategoryRiskOut"
-                  },
-                  "type": "array",
-                  "title": "Response Put Category Risks Api V1 Dbr Category Risks Put"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/feeder/positions/preview": {
-      "post": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Preview Feeder Positions",
-        "operationId": "preview_feeder_positions_api_v1_dbr_feeder_positions_preview_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/PositionPreviewRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/feeder/positions/rebuild": {
-      "post": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Rebuild Feeder Positions",
-        "operationId": "rebuild_feeder_positions_api_v1_dbr_feeder_positions_rebuild_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/PositionRebuildRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/feeder/cockpit": {
-      "get": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Get Feeder Cockpit",
-        "description": "Return one coherent, saved DBR read model for the accepted Ledger.",
-        "operationId": "get_feeder_cockpit_api_v1_dbr_feeder_cockpit_get",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/feeder/positions": {
-      "get": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Get Feeder Positions",
-        "operationId": "get_feeder_positions_api_v1_dbr_feeder_positions_get",
-        "parameters": [
-          {
-            "name": "include_live_nfp",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "boolean",
-              "default": false,
-              "title": "Include Live Nfp"
-            }
-          },
-          {
-            "name": "active",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "boolean"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Active"
-            }
-          },
-          {
-            "name": "active_only",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "boolean",
-              "default": false,
-              "title": "Active Only"
-            }
-          },
-          {
-            "name": "mode",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Mode"
-            }
-          },
-          {
-            "name": "supply",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Supply"
-            }
-          },
-          {
-            "name": "warehouse",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Warehouse"
-            }
-          },
-          {
-            "name": "zone",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Zone"
-            }
-          },
-          {
-            "name": "search",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Search"
-            }
-          },
-          {
-            "name": "limit",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "maximum": 5000,
-              "minimum": 1,
-              "default": 1000,
-              "title": "Limit"
-            }
-          },
-          {
-            "name": "offset",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 0,
-              "default": 0,
-              "title": "Offset"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/feeder/positions/{position_id}": {
-      "get": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Get Feeder Position",
-        "operationId": "get_feeder_position_api_v1_dbr_feeder_positions__position_id__get",
-        "parameters": [
-          {
-            "name": "position_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Position Id"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/feeder/signals/preview": {
-      "post": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Preview Feeder Signals",
-        "operationId": "preview_feeder_signals_api_v1_dbr_feeder_signals_preview_post",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/feeder/signals/refresh": {
-      "post": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Refresh Feeder Signals",
-        "operationId": "refresh_feeder_signals_api_v1_dbr_feeder_signals_refresh_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/SignalRefreshRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/feeder/signals": {
-      "get": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Get Feeder Signals",
-        "operationId": "get_feeder_signals_api_v1_dbr_feeder_signals_get",
-        "parameters": [
-          {
-            "name": "status",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Status"
-            }
-          },
-          {
-            "name": "zone",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Zone"
-            }
-          },
-          {
-            "name": "signal_type",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Signal Type"
-            }
-          },
-          {
-            "name": "search",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Search"
-            }
-          },
-          {
-            "name": "limit",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "maximum": 5000,
-              "minimum": 1,
-              "default": 1000,
-              "title": "Limit"
-            }
-          },
-          {
-            "name": "offset",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 0,
-              "default": 0,
-              "title": "Offset"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/feeder/signals/{signal_id}": {
-      "get": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Get Feeder Signal",
-        "operationId": "get_feeder_signal_api_v1_dbr_feeder_signals__signal_id__get",
-        "parameters": [
-          {
-            "name": "signal_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Signal Id"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/feeder/deficits": {
-      "get": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Get Feeder Deficits",
-        "operationId": "get_feeder_deficits_api_v1_dbr_feeder_deficits_get",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/feeder/processing/board": {
-      "get": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Get Processing Board",
-        "description": "Борд давальческого контура (питатель №3): NFP-разложение processing-\nпозиций, открытые заказы переработчику и алерты просроченного кругорейса.",
-        "operationId": "get_processing_board_api_v1_dbr_feeder_processing_board_get",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/feeder/processing/trip-manifest": {
-      "get": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Get Processing Trip Manifest",
-        "description": "Read-only manifest preview grouped by toll-processing contractor.",
-        "operationId": "get_processing_trip_manifest_api_v1_dbr_feeder_processing_trip_manifest_get",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/feeder/processing/trip-manifest/print": {
-      "get": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Print Processing Trip Manifest",
-        "description": "Simple printable HTML view of the same manifest preview.",
-        "operationId": "print_processing_trip_manifest_api_v1_dbr_feeder_processing_trip_manifest_print_get",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "text/html": {
-                "schema": {
-                  "type": "string"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/feeder/chain/preview": {
-      "post": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Preview Feeder Chain",
-        "operationId": "preview_feeder_chain_api_v1_dbr_feeder_chain_preview_post",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/feeder/processing/chain/preview": {
-      "post": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Preview Processing Feeder Chain",
-        "description": "Read-only chain preview limited to processing supermarket signals.",
-        "operationId": "preview_processing_feeder_chain_api_v1_dbr_feeder_processing_chain_preview_post",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/feeder/chain/refresh": {
-      "post": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Refresh Feeder Chain",
-        "operationId": "refresh_feeder_chain_api_v1_dbr_feeder_chain_refresh_post",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/programs": {
-      "post": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Create Program",
-        "operationId": "create_program_api_v1_dbr_programs_post",
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ProgramCreate"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      },
-      "get": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "List Programs",
-        "operationId": "list_programs_api_v1_dbr_programs_get",
-        "parameters": [
-          {
-            "name": "status",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Status"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/programs/{program_id}": {
-      "get": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Get Program",
-        "operationId": "get_program_api_v1_dbr_programs__program_id__get",
-        "parameters": [
-          {
-            "name": "program_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Program Id"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      },
-      "put": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Update Program",
-        "operationId": "update_program_api_v1_dbr_programs__program_id__put",
-        "parameters": [
-          {
-            "name": "program_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Program Id"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ProgramUpdate"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/programs/{program_id}/approve": {
-      "post": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Approve Program",
-        "operationId": "approve_program_api_v1_dbr_programs__program_id__approve_post",
-        "parameters": [
-          {
-            "name": "program_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Program Id"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/drum/build": {
-      "post": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Drum Build",
-        "operationId": "drum_build_api_v1_dbr_drum_build_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/DrumBuild"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/drum/{schedule_id}/activate": {
-      "post": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Drum Activate",
-        "operationId": "drum_activate_api_v1_dbr_drum__schedule_id__activate_post",
-        "parameters": [
-          {
-            "name": "schedule_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Schedule Id"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/drum/{schedule_id}/extend": {
-      "post": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Drum Extend",
-        "operationId": "drum_extend_api_v1_dbr_drum__schedule_id__extend_post",
-        "parameters": [
-          {
-            "name": "schedule_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Schedule Id"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/DrumExtend"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/drum/active/board": {
-      "get": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Drum Board",
-        "operationId": "drum_board_api_v1_dbr_drum_active_board_get",
-        "parameters": [
-          {
-            "name": "date_from",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "format": "date"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Date From"
-            }
-          },
-          {
-            "name": "date_to",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string",
-                  "format": "date"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Date To"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/drum/{schedule_id}/refresh-gate": {
-      "post": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Drum Refresh Gate",
-        "operationId": "drum_refresh_gate_api_v1_dbr_drum__schedule_id__refresh_gate_post",
-        "parameters": [
-          {
-            "name": "schedule_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Schedule Id"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/drum/{schedule_id}/roll-forward": {
-      "post": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Drum Roll Forward",
-        "operationId": "drum_roll_forward_api_v1_dbr_drum__schedule_id__roll_forward_post",
-        "parameters": [
-          {
-            "name": "schedule_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Schedule Id"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/drum/slots/{slot_id}/move": {
-      "post": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Drum Move Slot",
-        "operationId": "drum_move_slot_api_v1_dbr_drum_slots__slot_id__move_post",
-        "parameters": [
-          {
-            "name": "slot_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Slot Id"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/SlotMove"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/drum/slots/{slot_id}/release": {
-      "post": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Drum Release Slot",
-        "description": "Materialize a green+pending slot into a 1С production order (Фаза 3).\n\ndry_run=true (default) returns the payload preview and writes nothing;\ndry_run=false writes to 1С and marks the slot released.",
-        "operationId": "drum_release_slot_api_v1_dbr_drum_slots__slot_id__release_post",
-        "parameters": [
-          {
-            "name": "slot_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Slot Id"
-            }
-          },
-          {
-            "name": "dry_run",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "boolean",
-              "default": true,
-              "title": "Dry Run"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/drum/{schedule_id}/release-day": {
-      "post": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Drum Release Day",
-        "description": "Batch-release every green+pending slot of one day. Partial failures do\nnot roll back the slots that already succeeded (per-slot isolation).",
-        "operationId": "drum_release_day_api_v1_dbr_drum__schedule_id__release_day_post",
-        "parameters": [
-          {
-            "name": "schedule_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Schedule Id"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ReleaseDayRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/feeder/signals/{signal_id}/launch": {
-      "post": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Feeder Launch Signal",
-        "description": "Launch an Open+complete feeder signal into a 1С production order (Фаза 3).\n\nGated by material readiness: a deficit returns 409 with deficit_lines.\ndry_run=true (default) returns the payload preview and writes nothing.",
-        "operationId": "feeder_launch_signal_api_v1_dbr_feeder_signals__signal_id__launch_post",
-        "parameters": [
-          {
-            "name": "signal_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Signal Id"
-            }
-          }
-        ],
-        "requestBody": {
-          "required": true,
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/SignalLaunchRequest"
-              }
-            }
-          }
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/feeder/signals/{signal_id}/processing-order-preview": {
-      "get": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Feeder Processing Order Preview",
-        "description": "Preview a toll-processing supplier order; this endpoint can never write to 1C.",
-        "operationId": "feeder_processing_order_preview_api_v1_dbr_feeder_signals__signal_id__processing_order_preview_get",
-        "parameters": [
-          {
-            "name": "signal_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Signal Id"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/purchase/cockpit": {
-      "get": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Get Purchase Cockpit",
-        "description": "Read the immutable purchase obligations of the accepted Ledger only.",
-        "operationId": "get_purchase_cockpit_api_v1_dbr_purchase_cockpit_get",
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/feeder/purchase/launch": {
-      "post": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Feeder Launch Purchase",
-        "description": "Launch open «Пополнение» signals of purchased items into supplier orders.\n\nLines are grouped by supplier (items.supplier_ref1c); signals with no\nsupplier are returned under `unresolved`, never blocking the batch.\ndry_run=true (default) returns the grouped payload preview and writes nothing.",
-        "operationId": "feeder_launch_purchase_api_v1_dbr_feeder_purchase_launch_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/PurchaseLaunchRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/purchase-plan/preview": {
-      "get": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Purchase Plan Preview",
-        "description": "Retired: use the saved Ledger purchase cockpit instead.",
-        "operationId": "purchase_plan_preview_api_v1_dbr_purchase_plan_preview_get",
-        "parameters": [
-          {
-            "name": "program_id",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "integer"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Program Id"
-            }
-          },
-          {
-            "name": "active",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "boolean",
-              "default": false,
-              "title": "Active"
-            }
-          },
-          {
-            "name": "threshold_days",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 0,
-              "default": 60,
-              "title": "Threshold Days"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/dbr/purchase-plan/materialize": {
-      "post": {
-        "tags": [
-          "dbr"
-        ],
-        "summary": "Purchase Plan Materialize",
-        "description": "Retired until a Ledger-native purchase materializer is implemented.",
-        "operationId": "purchase_plan_materialize_api_v1_dbr_purchase_plan_materialize_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/PurchasePlanMaterializeRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {}
               }
             }
           },
@@ -12294,57 +9708,13 @@
         }
       }
     },
-    "/api/v1/paint-weld/chain/close": {
-      "post": {
-        "tags": [
-          "paint-weld"
-        ],
-        "summary": "Chain Close",
-        "description": "Закрыть цепочку «окраска↔сварка» одним действием: выпуски обеих строк,\nСборкаЗапасов обоих заказов и один комбинированный сдельный наряд,\nзакрывающий оба заказа. dry_run=true — предпросмотр.",
-        "operationId": "chain_close_api_v1_paint_weld_chain_close_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ChainClosePayload"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object",
-                  "title": "Response Chain Close Api V1 Paint Weld Chain Close Post"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/api/v1/item-ledger/{item_id}/position": {
       "get": {
         "tags": [
           "item-ledger"
         ],
         "summary": "Get Position",
-        "description": "The §1 pool projection for one item — the ledger's own view (read the\nledger tables directly, never gated by STOCK_SOURCE). on_hand / available /\nprojected / uncovered follow the §2.5 formulas; ``available`` and\n``uncovered`` are surfaced as-is (a negative available is a deficit signal,\nnot clamped).",
+        "description": "The  pool projection for one item — the ledger's own view (read the\nledger tables directly. on_hand / available /\nprojected / uncovered follow the  formulas; ``available`` and\n``uncovered`` are surfaced as-is (a negative available is a deficit signal,\nnot clamped).",
         "operationId": "get_position_api_v1_item_ledger__item_id__position_get",
         "parameters": [
           {
@@ -12387,7 +9757,7 @@
           "item-ledger"
         ],
         "summary": "Get Movements",
-        "description": "§2 — the signed physical movement tape (active StockLedgerEntry rows),\nsorted ``(posting_at, id)``, paginated (total + rows). ``qty_after`` is the\nrunning balance the ledger carried — \"how it computed\".",
+        "description": "— the signed physical movement tape (active StockLedgerEntry rows),\nsorted ``(posting_at, id)``, paginated (total + rows). ``qty_after`` is the\nrunning balance the ledger carried — \"how it computed\".",
         "operationId": "get_movements_api_v1_item_ledger__item_id__movements_get",
         "parameters": [
           {
@@ -12503,7 +9873,7 @@
           "item-ledger"
         ],
         "summary": "Get Reservations",
-        "description": "§3 — the per-item soft reservation tape: on which runs/plans the item hangs\nin reservations, what covers each and how much is uncovered. ``make`` rows\ncontribute 0 to reserved_soft (surfaced separately as production).",
+        "description": "— the per-item soft reservation tape: on which runs/plans the item hangs\nin reservations, what covers each and how much is uncovered. The make/buy\nvalue routes replenishment; it does not create or suppress demand.",
         "operationId": "get_reservations_api_v1_item_ledger__item_id__reservations_get",
         "parameters": [
           {
@@ -12580,7 +9950,7 @@
           "item-ledger"
         ],
         "summary": "Get Reservation Events",
-        "description": "§4 — the append-only journal of one reservation (open/amend/realize/…).\n``sle_id`` links an event to the physical movement that closed it — the debug\nthread. 404 unless the reservation belongs to the item.",
+        "description": "— the append-only journal of one reservation (open/amend/realize/…).\n``sle_id`` links an event to the physical movement that closed it — the debug\nthread. 404 unless the reservation belongs to the item.",
         "operationId": "get_reservation_events_api_v1_item_ledger__item_id__reservations__reservation_id__events_get",
         "parameters": [
           {
@@ -12609,72 +9979,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ItemLedgerReservationEventsResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/item-ledger/{item_id}/drift": {
-      "get": {
-        "tags": [
-          "item-ledger"
-        ],
-        "summary": "Get Drift",
-        "description": "§5 — MrpDriftEvent rows for the item (where reality diverged from plan).\n``cause`` is derived from ``kind`` and ``adjustment_sle_id`` is not tracked on\nthe drift row (returned null); ``details`` carries the raw provenance.",
-        "operationId": "get_drift_api_v1_item_ledger__item_id__drift_get",
-        "parameters": [
-          {
-            "name": "item_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Item Id"
-            }
-          },
-          {
-            "name": "limit",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "maximum": 1000,
-              "minimum": 1,
-              "default": 100,
-              "title": "Limit"
-            }
-          },
-          {
-            "name": "offset",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "minimum": 0,
-              "default": 0,
-              "title": "Offset"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ItemLedgerDriftResponse"
                 }
               }
             }
@@ -13073,7 +10377,7 @@
           "item-ledger-admin"
         ],
         "summary": "Seed Ledger",
-        "description": "Сид якоря T0 леджера-1 из свежего 1С /Balance (design Прил. A §4).",
+        "description": "Сид якоря T0 физического Ledger из свежего 1С /Balance.",
         "operationId": "seed_ledger_api_v1_item_ledger_admin_seed_post",
         "parameters": [
           {
@@ -13124,195 +10428,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/SeedResponse"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/planning-comparison/input-fingerprint": {
-      "get": {
-        "tags": [
-          "planning-comparison"
-        ],
-        "summary": "Get Input Fingerprint",
-        "description": "Read-only comparable input watermarks and optional canonical latest results.",
-        "operationId": "get_input_fingerprint_api_v1_planning_comparison_input_fingerprint_get",
-        "parameters": [
-          {
-            "name": "include_results",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "boolean",
-              "default": false,
-              "title": "Include Results"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response Get Input Fingerprint Api V1 Planning Comparison Input Fingerprint Get"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/planning-comparison/captures": {
-      "post": {
-        "tags": [
-          "planning-comparison"
-        ],
-        "summary": "Create Capture",
-        "description": "Capture stable through HTTP and shadow locally; never starts/materializes planning.",
-        "operationId": "create_capture_api_v1_planning_comparison_captures_post",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/CaptureRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": true,
-                  "type": "object",
-                  "title": "Response Create Capture Api V1 Planning Comparison Captures Post"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/planning-comparison/batches": {
-      "get": {
-        "tags": [
-          "planning-comparison"
-        ],
-        "summary": "Get Batches",
-        "operationId": "get_batches_api_v1_planning_comparison_batches_get",
-        "parameters": [
-          {
-            "name": "limit",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "default": 50,
-              "title": "Limit"
-            }
-          },
-          {
-            "name": "offset",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "default": 0,
-              "title": "Offset"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response Get Batches Api V1 Planning Comparison Batches Get"
-                }
-              }
-            }
-          },
-          "422": {
-            "description": "Validation Error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/api/v1/planning-comparison/batches/{batch_id}": {
-      "get": {
-        "tags": [
-          "planning-comparison"
-        ],
-        "summary": "Get Batch",
-        "operationId": "get_batch_api_v1_planning_comparison_batches__batch_id__get",
-        "parameters": [
-          {
-            "name": "batch_id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "integer",
-              "title": "Batch Id"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Successful Response",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "additionalProperties": true,
-                  "title": "Response Get Batch Api V1 Planning Comparison Batches  Batch Id  Get"
                 }
               }
             }
@@ -13431,19 +10546,50 @@
         "type": "object",
         "title": "AssembleMaterialIssuePayload"
       },
-      "AssemblyRateOut": {
+      "AssemblyQueueResponse": {
         "properties": {
-          "id": {
-            "type": "integer",
-            "title": "Id"
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/AssemblyQueueRow"
+            },
+            "type": "array",
+            "title": "Rows"
           },
-          "resource_id": {
+          "total_rows": {
             "type": "integer",
-            "title": "Resource Id"
+            "title": "Total Rows"
           },
-          "resource_name": {
-            "type": "string",
-            "title": "Resource Name"
+          "total_queue_qty": {
+            "type": "number",
+            "title": "Total Queue Qty"
+          },
+          "truth_meta": {
+            "$ref": "#/components/schemas/TruthMeta"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "rows",
+          "total_rows",
+          "total_queue_qty",
+          "truth_meta"
+        ],
+        "title": "AssemblyQueueResponse"
+      },
+      "AssemblyQueueRow": {
+        "properties": {
+          "plan_id": {
+            "type": "integer",
+            "title": "Plan Id"
+          },
+          "plan_line_id": {
+            "type": "integer",
+            "title": "Plan Line Id"
+          },
+          "run_id": {
+            "type": "integer",
+            "title": "Run Id"
           },
           "item_id": {
             "type": "integer",
@@ -13457,55 +10603,63 @@
             "type": "string",
             "title": "Item Name"
           },
-          "qty_per_capacity": {
+          "bucket_date": {
             "type": "string",
-            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
-            "title": "Qty Per Capacity"
+            "title": "Bucket Date"
+          },
+          "period_from": {
+            "type": "string",
+            "title": "Period From"
+          },
+          "period_to": {
+            "type": "string",
+            "title": "Period To"
+          },
+          "planned_output_qty": {
+            "type": "number",
+            "title": "Planned Output Qty"
+          },
+          "accepted_plan_output_qty": {
+            "type": "number",
+            "title": "Accepted Plan Output Qty"
+          },
+          "assembly_remaining_qty": {
+            "type": "number",
+            "title": "Assembly Remaining Qty"
+          },
+          "priority_key": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Priority Key"
           }
         },
+        "additionalProperties": false,
         "type": "object",
         "required": [
-          "id",
-          "resource_id",
-          "resource_name",
+          "plan_id",
+          "plan_line_id",
+          "run_id",
           "item_id",
           "item_code",
           "item_name",
-          "qty_per_capacity"
+          "bucket_date",
+          "period_from",
+          "period_to",
+          "planned_output_qty",
+          "accepted_plan_output_qty",
+          "assembly_remaining_qty",
+          "priority_key"
         ],
-        "title": "AssemblyRateOut"
-      },
-      "AssemblyRateUpsert": {
-        "properties": {
-          "resource_id": {
-            "type": "integer",
-            "title": "Resource Id"
-          },
-          "item_id": {
-            "type": "integer",
-            "title": "Item Id"
-          },
-          "qty_per_capacity": {
-            "anyOf": [
-              {
-                "type": "number",
-                "exclusiveMinimum": 0.0
-              },
-              {
-                "type": "string",
-                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"
-              }
-            ],
-            "title": "Qty Per Capacity"
-          }
-        },
-        "type": "object",
-        "required": [
-          "resource_id",
-          "item_id",
-          "qty_per_capacity"
-        ],
-        "title": "AssemblyRateUpsert"
+        "title": "AssemblyQueueRow"
       },
       "BulkUpsertEntry": {
         "properties": {
@@ -13554,271 +10708,6 @@
         },
         "type": "object",
         "title": "BulkUpsertRequest"
-      },
-      "CalcRequest": {
-        "properties": {
-          "horizon_days": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Horizon Days"
-          },
-          "config_overrides": {
-            "anyOf": [
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Config Overrides"
-          },
-          "started_by": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Started By"
-          }
-        },
-        "type": "object",
-        "title": "CalcRequest"
-      },
-      "CaptureRequest": {
-        "properties": {
-          "capture_key": {
-            "anyOf": [
-              {
-                "type": "string",
-                "maxLength": 128,
-                "minLength": 1
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Capture Key"
-          },
-          "max_skew_seconds": {
-            "type": "integer",
-            "maximum": 86400.0,
-            "minimum": 0.0,
-            "title": "Max Skew Seconds",
-            "default": 300
-          }
-        },
-        "type": "object",
-        "title": "CaptureRequest"
-      },
-      "CategoryRiskIn": {
-        "properties": {
-          "item_group": {
-            "type": "string",
-            "title": "Item Group"
-          },
-          "receipt_warehouse_ref1c": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Receipt Warehouse Ref1C"
-          },
-          "supply_risk_pct": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "string",
-                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Supply Risk Pct"
-          }
-        },
-        "type": "object",
-        "required": [
-          "item_group"
-        ],
-        "title": "CategoryRiskIn"
-      },
-      "CategoryRiskOut": {
-        "properties": {
-          "id": {
-            "type": "integer",
-            "title": "Id"
-          },
-          "item_group": {
-            "type": "string",
-            "title": "Item Group"
-          },
-          "receipt_warehouse_ref1c": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Receipt Warehouse Ref1C"
-          },
-          "supply_risk_pct": {
-            "anyOf": [
-              {
-                "type": "string",
-                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Supply Risk Pct"
-          }
-        },
-        "type": "object",
-        "required": [
-          "id",
-          "item_group"
-        ],
-        "title": "CategoryRiskOut"
-      },
-      "CategoryRisksReplace": {
-        "properties": {
-          "rows": {
-            "items": {
-              "$ref": "#/components/schemas/CategoryRiskIn"
-            },
-            "type": "array",
-            "title": "Rows"
-          }
-        },
-        "type": "object",
-        "required": [
-          "rows"
-        ],
-        "title": "CategoryRisksReplace"
-      },
-      "ChainClosePayload": {
-        "properties": {
-          "product_id": {
-            "type": "integer",
-            "title": "Product Id"
-          },
-          "weld_qty": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Weld Qty"
-          },
-          "paint_qty": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Paint Qty"
-          },
-          "executor": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Executor"
-          },
-          "weld_operation_executors": {
-            "anyOf": [
-              {
-                "items": {},
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Weld Operation Executors"
-          },
-          "paint_operation_executors": {
-            "anyOf": [
-              {
-                "items": {},
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Paint Operation Executors"
-          },
-          "comment": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Comment"
-          },
-          "dry_run": {
-            "type": "boolean",
-            "title": "Dry Run",
-            "default": true
-          },
-          "allow_production": {
-            "type": "boolean",
-            "title": "Allow Production",
-            "default": false
-          },
-          "initiated_by": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Initiated By"
-          }
-        },
-        "type": "object",
-        "required": [
-          "product_id"
-        ],
-        "title": "ChainClosePayload",
-        "description": "Закрытие цепочки из окна журнала (этап 4): любая сторона цепочки."
       },
       "ChainOpenPayload": {
         "properties": {
@@ -14014,31 +10903,172 @@
         ],
         "title": "DeleteRowRequest"
       },
-      "DrumBuild": {
+      "DrumGapRow": {
         "properties": {
-          "program_id": {
+          "plan_id": {
             "type": "integer",
-            "title": "Program Id"
+            "title": "Plan Id"
+          },
+          "plan_line_id": {
+            "type": "integer",
+            "title": "Plan Line Id"
+          },
+          "item_id": {
+            "type": "integer",
+            "title": "Item Id"
+          },
+          "resource_id": {
+            "type": "integer",
+            "title": "Resource Id"
+          },
+          "gap_date": {
+            "type": "string",
+            "title": "Gap Date"
+          },
+          "gap_qty": {
+            "type": "number",
+            "title": "Gap Qty"
+          },
+          "original_priority": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Original Priority"
           }
         },
+        "additionalProperties": false,
         "type": "object",
         "required": [
-          "program_id"
+          "plan_id",
+          "plan_line_id",
+          "item_id",
+          "resource_id",
+          "gap_date",
+          "gap_qty",
+          "original_priority"
         ],
-        "title": "DrumBuild"
+        "title": "DrumGapRow"
       },
-      "DrumExtend": {
+      "DrumScheduleResponse": {
         "properties": {
-          "program_id": {
-            "type": "integer",
-            "title": "Program Id"
+          "schedule_from": {
+            "type": "string",
+            "title": "Schedule From"
+          },
+          "schedule_to": {
+            "type": "string",
+            "title": "Schedule To"
+          },
+          "slots": {
+            "items": {
+              "$ref": "#/components/schemas/DrumSlotRow"
+            },
+            "type": "array",
+            "title": "Slots"
+          },
+          "gaps": {
+            "items": {
+              "$ref": "#/components/schemas/DrumGapRow"
+            },
+            "type": "array",
+            "title": "Gaps"
+          },
+          "total_open_qty": {
+            "type": "number",
+            "title": "Total Open Qty"
+          },
+          "total_slot_qty": {
+            "type": "number",
+            "title": "Total Slot Qty"
+          },
+          "total_gap_qty": {
+            "type": "number",
+            "title": "Total Gap Qty"
+          },
+          "truth_meta": {
+            "$ref": "#/components/schemas/TruthMeta"
           }
         },
+        "additionalProperties": false,
         "type": "object",
         "required": [
-          "program_id"
+          "schedule_from",
+          "schedule_to",
+          "slots",
+          "gaps",
+          "total_open_qty",
+          "total_slot_qty",
+          "total_gap_qty",
+          "truth_meta"
         ],
-        "title": "DrumExtend"
+        "title": "DrumScheduleResponse"
+      },
+      "DrumSlotRow": {
+        "properties": {
+          "plan_id": {
+            "type": "integer",
+            "title": "Plan Id"
+          },
+          "plan_line_id": {
+            "type": "integer",
+            "title": "Plan Line Id"
+          },
+          "item_id": {
+            "type": "integer",
+            "title": "Item Id"
+          },
+          "resource_id": {
+            "type": "integer",
+            "title": "Resource Id"
+          },
+          "slot_date": {
+            "type": "string",
+            "title": "Slot Date"
+          },
+          "slot_qty": {
+            "type": "number",
+            "title": "Slot Qty"
+          },
+          "slot_ordinal": {
+            "type": "integer",
+            "title": "Slot Ordinal"
+          },
+          "original_priority": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "type": "array",
+            "title": "Original Priority"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "plan_id",
+          "plan_line_id",
+          "item_id",
+          "resource_id",
+          "slot_date",
+          "slot_qty",
+          "slot_ordinal",
+          "original_priority"
+        ],
+        "title": "DrumSlotRow"
       },
       "EnsureItemRequest": {
         "properties": {
@@ -14519,49 +11549,6 @@
         ],
         "title": "IgnoredWarehousePayload"
       },
-      "InPlaceReservationRepairPayload": {
-        "properties": {
-          "product_ids": {
-            "items": {
-              "type": "integer"
-            },
-            "type": "array",
-            "title": "Product Ids"
-          },
-          "initiated_by": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Initiated By"
-          },
-          "warehouse_ref1c": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Warehouse Ref1C"
-          },
-          "dry_run": {
-            "type": "boolean",
-            "title": "Dry Run",
-            "default": true
-          }
-        },
-        "type": "object",
-        "required": [
-          "product_ids"
-        ],
-        "title": "InPlaceReservationRepairPayload"
-      },
       "Item": {
         "properties": {
           "item_code": {
@@ -14788,169 +11775,6 @@
           "item_name"
         ],
         "title": "ItemCreate"
-      },
-      "ItemLedgerDriftResponse": {
-        "properties": {
-          "total": {
-            "type": "integer",
-            "title": "Total"
-          },
-          "limit": {
-            "type": "integer",
-            "title": "Limit"
-          },
-          "offset": {
-            "type": "integer",
-            "title": "Offset"
-          },
-          "rows": {
-            "items": {
-              "$ref": "#/components/schemas/ItemLedgerDriftRow"
-            },
-            "type": "array",
-            "title": "Rows"
-          },
-          "truth_meta": {
-            "$ref": "#/components/schemas/TruthMeta"
-          }
-        },
-        "additionalProperties": false,
-        "type": "object",
-        "required": [
-          "total",
-          "limit",
-          "offset",
-          "rows",
-          "truth_meta"
-        ],
-        "title": "ItemLedgerDriftResponse"
-      },
-      "ItemLedgerDriftRow": {
-        "properties": {
-          "id": {
-            "type": "integer",
-            "title": "Id"
-          },
-          "cycle_id": {
-            "type": "string",
-            "title": "Cycle Id"
-          },
-          "kind": {
-            "type": "string",
-            "title": "Kind"
-          },
-          "drift_qty": {
-            "type": "number",
-            "title": "Drift Qty"
-          },
-          "expected_stock": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Expected Stock"
-          },
-          "actual_stock": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Actual Stock"
-          },
-          "at": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "At"
-          },
-          "cause": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Cause"
-          },
-          "adjustment_sle_id": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Adjustment Sle Id"
-          },
-          "matured": {
-            "type": "boolean",
-            "title": "Matured"
-          },
-          "first_seen_cycle_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "First Seen Cycle Id"
-          },
-          "requirement_id": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Requirement Id"
-          },
-          "details": {
-            "anyOf": [
-              {},
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Details"
-          }
-        },
-        "type": "object",
-        "required": [
-          "id",
-          "cycle_id",
-          "kind",
-          "drift_qty",
-          "expected_stock",
-          "actual_stock",
-          "at",
-          "cause",
-          "adjustment_sle_id",
-          "matured",
-          "first_seen_cycle_id",
-          "requirement_id",
-          "details"
-        ],
-        "title": "ItemLedgerDriftRow"
       },
       "ItemLedgerMovement": {
         "properties": {
@@ -15209,29 +12033,6 @@
         ],
         "title": "ItemLedgerPositionWarehouse"
       },
-      "ItemLedgerReservationCovered": {
-        "properties": {
-          "on_hand": {
-            "type": "number",
-            "title": "On Hand"
-          },
-          "incoming_supplier": {
-            "type": "number",
-            "title": "Incoming Supplier"
-          },
-          "incoming_wip": {
-            "type": "number",
-            "title": "Incoming Wip"
-          }
-        },
-        "type": "object",
-        "required": [
-          "on_hand",
-          "incoming_supplier",
-          "incoming_wip"
-        ],
-        "title": "ItemLedgerReservationCovered"
-      },
       "ItemLedgerReservationEventRow": {
         "properties": {
           "id": {
@@ -15416,28 +12217,25 @@
             "type": "number",
             "title": "Reserved Qty"
           },
-          "realized_qty": {
+          "covered_from_stock_at_freeze_qty": {
             "type": "number",
-            "title": "Realized Qty"
+            "title": "Covered From Stock At Freeze Qty"
           },
-          "outstanding": {
+          "replenishment_required_qty": {
             "type": "number",
-            "title": "Outstanding"
+            "title": "Replenishment Required Qty"
           },
-          "covered": {
-            "$ref": "#/components/schemas/ItemLedgerReservationCovered"
-          },
-          "uncovered_qty": {
+          "replenishment_received_qty": {
             "type": "number",
-            "title": "Uncovered Qty"
+            "title": "Replenishment Received Qty"
+          },
+          "replenishment_remaining_qty": {
+            "type": "number",
+            "title": "Replenishment Remaining Qty"
           },
           "lifecycle_status": {
             "type": "string",
             "title": "Lifecycle Status"
-          },
-          "coverage_state": {
-            "type": "string",
-            "title": "Coverage State"
           }
         },
         "type": "object",
@@ -15450,12 +12248,11 @@
           "realization_mode",
           "priority",
           "reserved_qty",
-          "realized_qty",
-          "outstanding",
-          "covered",
-          "uncovered_qty",
-          "lifecycle_status",
-          "coverage_state"
+          "covered_from_stock_at_freeze_qty",
+          "replenishment_required_qty",
+          "replenishment_received_qty",
+          "replenishment_remaining_qty",
+          "lifecycle_status"
         ],
         "title": "ItemLedgerReservationRow"
       },
@@ -15992,45 +12789,14 @@
         ],
         "title": "ODataSyncStats"
       },
-      "OrderCompletionRepairPayload": {
+      "OrdersFromWorkItemsPayload": {
         "properties": {
-          "dry_run": {
-            "type": "boolean",
-            "title": "Dry Run",
-            "default": true
-          },
-          "allow_production": {
-            "type": "boolean",
-            "title": "Allow Production",
-            "default": false
-          },
-          "number_prefix": {
-            "type": "string",
-            "title": "Number Prefix",
-            "default": "PP"
-          },
-          "date_from": {
-            "type": "string",
-            "title": "Date From",
-            "default": "2026-05-01T00:00:00"
-          },
-          "max_records": {
-            "type": "integer",
-            "title": "Max Records",
-            "default": 5000
-          }
-        },
-        "type": "object",
-        "title": "OrderCompletionRepairPayload"
-      },
-      "OrdersFromMrpPayload": {
-        "properties": {
-          "planned_order_ids": {
+          "work_item_ids": {
             "items": {
               "type": "integer"
             },
             "type": "array",
-            "title": "Planned Order Ids"
+            "title": "Work Item Ids"
           },
           "initiated_by": {
             "anyOf": [
@@ -16046,36 +12812,9 @@
         },
         "type": "object",
         "required": [
-          "planned_order_ids"
+          "work_item_ids"
         ],
-        "title": "OrdersFromMrpPayload"
-      },
-      "OrdersFromMrpRequirementsPayload": {
-        "properties": {
-          "requirement_ids": {
-            "items": {
-              "type": "integer"
-            },
-            "type": "array",
-            "title": "Requirement Ids"
-          },
-          "initiated_by": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Initiated By"
-          }
-        },
-        "type": "object",
-        "required": [
-          "requirement_ids"
-        ],
-        "title": "OrdersFromMrpRequirementsPayload"
+        "title": "OrdersFromWorkItemsPayload"
       },
       "PaintWeldChainResponse": {
         "properties": {
@@ -16404,51 +13143,6 @@
           "config"
         ],
         "title": "PlanningConfigCreate"
-      },
-      "PositionPreviewRequest": {
-        "properties": {
-          "schedule_id": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Schedule Id"
-          }
-        },
-        "type": "object",
-        "title": "PositionPreviewRequest"
-      },
-      "PositionRebuildRequest": {
-        "properties": {
-          "schedule_id": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Schedule Id"
-          },
-          "expected_schedule_id": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Expected Schedule Id"
-          }
-        },
-        "type": "object",
-        "title": "PositionRebuildRequest"
       },
       "PrintRouteSheetsPayload": {
         "properties": {
@@ -17172,28 +13866,6 @@
             "type": "string",
             "title": "Comment"
           },
-          "failed_manufacture_id": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Failed Manufacture Id"
-          },
-          "failed_manufacture_error": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Failed Manufacture Error"
-          },
           "source_run_id": {
             "anyOf": [
               {
@@ -17315,27 +13987,6 @@
             ],
             "title": "Mrp Req Remaining Qty"
           },
-          "source_dbr_signal_id": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Source Dbr Signal Id"
-          },
-          "planning": {
-            "anyOf": [
-              {
-                "$ref": "#/components/schemas/ProductionOrderPlanningResponse"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
           "paint_weld_chain": {
             "anyOf": [
               {
@@ -17372,129 +14023,6 @@
         ],
         "title": "ProductionOrderJournalRowResponse",
         "description": "One real production line in the unified production-control journal."
-      },
-      "ProductionOrderPlanningResponse": {
-        "properties": {
-          "contour": {
-            "type": "string",
-            "title": "Contour"
-          },
-          "source_id": {
-            "type": "integer",
-            "title": "Source Id"
-          },
-          "schedule_id": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Schedule Id"
-          },
-          "slot_id": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Slot Id"
-          },
-          "signal_type": {
-            "type": "string",
-            "title": "Signal Type"
-          },
-          "priority": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Priority"
-          },
-          "zone": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Zone"
-          },
-          "need_date": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Need Date"
-          },
-          "required_date": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Required Date"
-          },
-          "queue_state": {
-            "type": "string",
-            "title": "Queue State"
-          },
-          "chain_depth": {
-            "type": "integer",
-            "title": "Chain Depth",
-            "default": 0
-          },
-          "parent_signal_id": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Parent Signal Id"
-          },
-          "reason": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Reason"
-          }
-        },
-        "additionalProperties": false,
-        "type": "object",
-        "required": [
-          "contour",
-          "source_id",
-          "signal_type",
-          "queue_state"
-        ],
-        "title": "ProductionOrderPlanningResponse",
-        "description": "DBR provenance for a journal line; absent for non-DBR contours."
       },
       "ProductionReportDayCloseRequest": {
         "properties": {
@@ -17808,181 +14336,6 @@
           "resource_name"
         ],
         "title": "ProductionResourceUpdate"
-      },
-      "ProgramCreate": {
-        "properties": {
-          "source_run_id": {
-            "type": "integer",
-            "title": "Source Run Id"
-          },
-          "from_date": {
-            "type": "string",
-            "format": "date",
-            "title": "From Date"
-          },
-          "to_date": {
-            "type": "string",
-            "format": "date",
-            "title": "To Date"
-          },
-          "company": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Company"
-          },
-          "title": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Title"
-          },
-          "created_by": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Created By"
-          },
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/ProgramItemIn"
-            },
-            "type": "array",
-            "title": "Items",
-            "default": []
-          }
-        },
-        "type": "object",
-        "required": [
-          "source_run_id",
-          "from_date",
-          "to_date"
-        ],
-        "title": "ProgramCreate"
-      },
-      "ProgramItemIn": {
-        "properties": {
-          "item_id": {
-            "type": "integer",
-            "title": "Item Id"
-          },
-          "program_date": {
-            "type": "string",
-            "format": "date",
-            "title": "Program Date"
-          },
-          "qty": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "string",
-                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"
-              }
-            ],
-            "title": "Qty"
-          },
-          "comment": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Comment"
-          }
-        },
-        "type": "object",
-        "required": [
-          "item_id",
-          "program_date",
-          "qty"
-        ],
-        "title": "ProgramItemIn"
-      },
-      "ProgramUpdate": {
-        "properties": {
-          "from_date": {
-            "anyOf": [
-              {
-                "type": "string",
-                "format": "date"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "From Date"
-          },
-          "to_date": {
-            "anyOf": [
-              {
-                "type": "string",
-                "format": "date"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "To Date"
-          },
-          "company": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Company"
-          },
-          "title": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Title"
-          },
-          "items": {
-            "anyOf": [
-              {
-                "items": {
-                  "$ref": "#/components/schemas/ProgramItemIn"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Items"
-          }
-        },
-        "type": "object",
-        "title": "ProgramUpdate"
       },
       "PurchaseCategoryGroup": {
         "properties": {
@@ -18347,15 +14700,19 @@
         ],
         "title": "PurchaseCategoryGroupedResponse"
       },
-      "PurchaseLaunchRequest": {
+      "PurchaseControlMaterializeRequest": {
         "properties": {
-          "signal_ids": {
+          "snapshot_id": {
+            "type": "integer",
+            "minimum": 1.0,
+            "title": "Snapshot Id"
+          },
+          "row_keys": {
             "items": {
-              "type": "integer"
+              "type": "string"
             },
             "type": "array",
-            "minItems": 1,
-            "title": "Signal Ids"
+            "title": "Row Keys"
           },
           "dry_run": {
             "type": "boolean",
@@ -18365,9 +14722,9 @@
         },
         "type": "object",
         "required": [
-          "signal_ids"
+          "snapshot_id"
         ],
-        "title": "PurchaseLaunchRequest"
+        "title": "PurchaseControlMaterializeRequest"
       },
       "PurchaseOrder1CExportRequest": {
         "properties": {
@@ -18435,38 +14792,6 @@
         "type": "object",
         "title": "PurchaseOrder1CExportRequest"
       },
-      "PurchasePlanMaterializeRequest": {
-        "properties": {
-          "program_id": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Program Id"
-          },
-          "active": {
-            "type": "boolean",
-            "title": "Active",
-            "default": false
-          },
-          "threshold_days": {
-            "type": "integer",
-            "title": "Threshold Days",
-            "default": 60
-          },
-          "dry_run": {
-            "type": "boolean",
-            "title": "Dry Run",
-            "default": true
-          }
-        },
-        "type": "object",
-        "title": "PurchasePlanMaterializeRequest"
-      },
       "ReconcileRequest": {
         "properties": {
           "dry_run": {
@@ -18477,47 +14802,6 @@
         },
         "type": "object",
         "title": "ReconcileRequest"
-      },
-      "RefreezeRequest": {
-        "properties": {
-          "dry_run": {
-            "type": "boolean",
-            "title": "Dry Run",
-            "default": false
-          },
-          "plan_id": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Plan Id"
-          }
-        },
-        "type": "object",
-        "title": "RefreezeRequest"
-      },
-      "ReleaseDayRequest": {
-        "properties": {
-          "day": {
-            "type": "string",
-            "format": "date",
-            "title": "Day"
-          },
-          "dry_run": {
-            "type": "boolean",
-            "title": "Dry Run",
-            "default": true
-          }
-        },
-        "type": "object",
-        "required": [
-          "day"
-        ],
-        "title": "ReleaseDayRequest"
       },
       "RemoveRequest": {
         "properties": {
@@ -19237,141 +15521,6 @@
         ],
         "title": "SetQuantityRequest"
       },
-      "SettingsOut": {
-        "properties": {
-          "id": {
-            "type": "integer",
-            "title": "Id"
-          },
-          "frozen_days": {
-            "type": "integer",
-            "title": "Frozen Days"
-          },
-          "gate_horizon_workdays": {
-            "type": "integer",
-            "title": "Gate Horizon Workdays"
-          },
-          "shelf_threshold_qty": {
-            "type": "string",
-            "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
-            "title": "Shelf Threshold Qty"
-          },
-          "rt_machining_days": {
-            "type": "integer",
-            "title": "Rt Machining Days"
-          },
-          "rt_welding_days": {
-            "type": "integer",
-            "title": "Rt Welding Days"
-          },
-          "rt_painting_days": {
-            "type": "integer",
-            "title": "Rt Painting Days"
-          },
-          "batch_days_turning": {
-            "type": "integer",
-            "title": "Batch Days Turning"
-          },
-          "batch_days_bending": {
-            "type": "integer",
-            "title": "Batch Days Bending"
-          },
-          "batch_days_welding": {
-            "type": "integer",
-            "title": "Batch Days Welding"
-          },
-          "batch_days_paint_black": {
-            "type": "integer",
-            "title": "Batch Days Paint Black"
-          },
-          "batch_days_paint_color": {
-            "type": "integer",
-            "title": "Batch Days Paint Color"
-          },
-          "rt_processing_days": {
-            "type": "integer",
-            "title": "Rt Processing Days"
-          },
-          "processing_trip_interval_days": {
-            "type": "integer",
-            "title": "Processing Trip Interval Days"
-          },
-          "processing_roundtrip_days": {
-            "type": "integer",
-            "title": "Processing Roundtrip Days"
-          },
-          "feeder_chain_enabled": {
-            "type": "boolean",
-            "title": "Feeder Chain Enabled"
-          },
-          "feeder_load_horizon_weeks": {
-            "type": "integer",
-            "title": "Feeder Load Horizon Weeks"
-          },
-          "w2_warehouse_ref1c": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "W2 Warehouse Ref1C"
-          },
-          "w3_warehouse_ref1c": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "W3 Warehouse Ref1C"
-          },
-          "w4_warehouse_ref1c": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "W4 Warehouse Ref1C"
-          },
-          "fastener_categories": {
-            "items": {
-              "type": "string"
-            },
-            "type": "array",
-            "title": "Fastener Categories",
-            "default": []
-          }
-        },
-        "type": "object",
-        "required": [
-          "id",
-          "frozen_days",
-          "gate_horizon_workdays",
-          "shelf_threshold_qty",
-          "rt_machining_days",
-          "rt_welding_days",
-          "rt_painting_days",
-          "batch_days_turning",
-          "batch_days_bending",
-          "batch_days_welding",
-          "batch_days_paint_black",
-          "batch_days_paint_color",
-          "rt_processing_days",
-          "processing_trip_interval_days",
-          "processing_roundtrip_days",
-          "feeder_chain_enabled",
-          "feeder_load_horizon_weeks"
-        ],
-        "title": "SettingsOut"
-      },
       "SettingsPayload": {
         "properties": {
           "workshop_warehouses": {
@@ -19396,296 +15545,129 @@
         "type": "object",
         "title": "SettingsPayload"
       },
-      "SettingsUpdate": {
+      "ShelfProjectionResponse": {
         "properties": {
-          "frozen_days": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Frozen Days"
+          "rows": {
+            "items": {
+              "$ref": "#/components/schemas/ShelfProjectionRow"
+            },
+            "type": "array",
+            "title": "Rows"
           },
-          "gate_horizon_workdays": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Gate Horizon Workdays"
+          "total_rows": {
+            "type": "integer",
+            "title": "Total Rows"
           },
-          "shelf_threshold_qty": {
-            "anyOf": [
-              {
-                "type": "number"
-              },
-              {
-                "type": "string",
-                "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Shelf Threshold Qty"
-          },
-          "rt_machining_days": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Rt Machining Days"
-          },
-          "rt_welding_days": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Rt Welding Days"
-          },
-          "rt_painting_days": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Rt Painting Days"
-          },
-          "batch_days_turning": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Batch Days Turning"
-          },
-          "batch_days_bending": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Batch Days Bending"
-          },
-          "batch_days_welding": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Batch Days Welding"
-          },
-          "batch_days_paint_black": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Batch Days Paint Black"
-          },
-          "batch_days_paint_color": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Batch Days Paint Color"
-          },
-          "rt_processing_days": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Rt Processing Days"
-          },
-          "processing_trip_interval_days": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Processing Trip Interval Days"
-          },
-          "processing_roundtrip_days": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Processing Roundtrip Days"
-          },
-          "feeder_chain_enabled": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Feeder Chain Enabled"
-          },
-          "feeder_load_horizon_weeks": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Feeder Load Horizon Weeks"
-          },
-          "w2_warehouse_ref1c": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "W2 Warehouse Ref1C"
-          },
-          "w3_warehouse_ref1c": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "W3 Warehouse Ref1C"
-          },
-          "w4_warehouse_ref1c": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "W4 Warehouse Ref1C"
-          },
-          "fastener_categories": {
-            "anyOf": [
-              {
-                "items": {
-                  "type": "string"
-                },
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Fastener Categories"
+          "truth_meta": {
+            "$ref": "#/components/schemas/TruthMeta"
           }
         },
-        "type": "object",
-        "title": "SettingsUpdate"
-      },
-      "SignalLaunchRequest": {
-        "properties": {
-          "dry_run": {
-            "type": "boolean",
-            "title": "Dry Run",
-            "default": true
-          },
-          "allow_production": {
-            "type": "boolean",
-            "title": "Allow Production",
-            "default": false
-          }
-        },
-        "type": "object",
-        "title": "SignalLaunchRequest"
-      },
-      "SignalRefreshRequest": {
-        "properties": {
-          "expected_schedule_id": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Expected Schedule Id"
-          }
-        },
-        "type": "object",
-        "title": "SignalRefreshRequest"
-      },
-      "SlotMove": {
-        "properties": {
-          "new_date": {
-            "type": "string",
-            "format": "date",
-            "title": "New Date"
-          },
-          "new_resource_id": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "New Resource Id"
-          }
-        },
+        "additionalProperties": false,
         "type": "object",
         "required": [
-          "new_date"
+          "rows",
+          "total_rows",
+          "truth_meta"
         ],
-        "title": "SlotMove"
+        "title": "ShelfProjectionResponse"
+      },
+      "ShelfProjectionRow": {
+        "properties": {
+          "policy_id": {
+            "type": "integer",
+            "title": "Policy Id"
+          },
+          "item_id": {
+            "type": "integer",
+            "title": "Item Id"
+          },
+          "warehouse_ref1c": {
+            "type": "string",
+            "title": "Warehouse Ref1C"
+          },
+          "protection_until": {
+            "type": "string",
+            "title": "Protection Until"
+          },
+          "target_qty": {
+            "type": "number",
+            "title": "Target Qty"
+          },
+          "shelf_physical_qty": {
+            "type": "number",
+            "title": "Shelf Physical Qty"
+          },
+          "other_stock_qty": {
+            "type": "number",
+            "title": "Other Stock Qty"
+          },
+          "projected_qty": {
+            "type": "number",
+            "title": "Projected Qty"
+          },
+          "gap_qty": {
+            "type": "number",
+            "title": "Gap Qty"
+          },
+          "transfer_qty": {
+            "type": "number",
+            "title": "Transfer Qty"
+          },
+          "unlaunched_mrp_qty": {
+            "type": "number",
+            "title": "Unlaunched Mrp Qty"
+          },
+          "pull_qty": {
+            "type": "number",
+            "title": "Pull Qty"
+          },
+          "materialized_qty": {
+            "type": "number",
+            "title": "Materialized Qty"
+          },
+          "first_shortage_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Shortage Date"
+          },
+          "latest_start_date": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Start Date"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "policy_id",
+          "item_id",
+          "warehouse_ref1c",
+          "protection_until",
+          "target_qty",
+          "shelf_physical_qty",
+          "other_stock_qty",
+          "projected_qty",
+          "gap_qty",
+          "transfer_qty",
+          "unlaunched_mrp_qty",
+          "pull_qty",
+          "materialized_qty",
+          "first_shortage_date",
+          "latest_start_date"
+        ],
+        "title": "ShelfProjectionRow"
       },
       "SyncAutoConfigPayload": {
         "properties": {
