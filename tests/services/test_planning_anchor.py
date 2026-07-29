@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date
 
 from backend.app.models import ProductionDayClose
-from backend.app.services.production_report_service import get_planning_anchor_date
+from backend.app.services.work_calendar_service import get_planning_anchor_date
 
 
 def test_anchor_without_any_closed_days_falls_back_to_previous_workday(db_session):

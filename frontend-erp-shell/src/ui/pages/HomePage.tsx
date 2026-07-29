@@ -84,7 +84,6 @@ export function HomePage() {
               <button onClick={() => navigate('/drum')}>Барабан</button>
               <button onClick={() => navigate('/shelves')}>Полки</button>
               <button onClick={() => navigate('/production-control')}>Журнал заказов</button>
-              <button onClick={() => navigate('/production-report-week')}>Выпуск недельный</button>
               <button onClick={() => navigate('/mrp-runs')}>MRP прогоны</button>
               <button onClick={() => navigate('/sync')}>Синхронизация</button>
               <button onClick={() => navigate('/resources')}>Ресурсы</button>

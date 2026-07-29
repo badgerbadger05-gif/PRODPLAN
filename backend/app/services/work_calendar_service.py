@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 from datetime import date, timedelta
-from typing import Optional
+from typing import Any, Dict, Optional
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from ..models import WorkCalendarDay
+from ..models import ProductionDayClose, WorkCalendarDay
 
 
 def is_workday(db: Session, d: date) -> bool:
@@ -52,4 +53,39 @@ def next_workday(db: Session, d: date) -> date:
             return cur
         cur += timedelta(days=1)
     raise RuntimeError("next_workday: calendar loop guard exceeded")
+
+
+def get_planning_anchor_date(
+    db: Session,
+    today_override: Optional[date] = None,
+) -> Dict[str, Any]:
+    """Определить якорную дату для отображения планового окна.
+
+    Требование (UI): показывать план начиная с *первого не закрытого* рабочего дня.
+
+    Формула:
+    - last_closed = max(production_day_close.close_date where status='CLOSED')
+    - anchor_date = next_workday(last_closed)
+    - если last_closed отсутствует: anchor_date = previous_workday(today)
+    """
+
+    today = today_override or date.today()
+    last_closed: Optional[date] = (
+        db.query(func.max(ProductionDayClose.close_date))
+        .filter(ProductionDayClose.status == "CLOSED")
+        .scalar()
+    )
+
+    if last_closed is not None:
+        anchor = next_workday(db, last_closed)
+    else:
+        # Если процесс закрытий ещё не начинали, якорим на дне, который должен закрываться сейчас
+        # (предыдущий рабочий день относительно today).
+        anchor = previous_workday(db, today)
+
+    return {
+        "today": today.isoformat(),
+        "last_closed_date": last_closed.isoformat() if last_closed is not None else None,
+        "anchor_date": anchor.isoformat(),
+    }
 

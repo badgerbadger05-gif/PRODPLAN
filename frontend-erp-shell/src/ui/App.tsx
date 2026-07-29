@@ -8,7 +8,6 @@ import { MrpResultPage } from './pages/MrpResultPage'
 import { MrpRunsPage } from './pages/MrpRunsPage'
 import { PeriodPlanPage } from './pages/PeriodPlanPage'
 import { ProductionControlPage } from './pages/ProductionControlPage'
-import { ProductionReportWeekPage } from './pages/ProductionReportWeekPage'
 import { PurchaseControlPage } from './pages/PurchaseControlPage'
 import { ResourcesPage } from './pages/ResourcesPage'
 import { SpecificationPage } from './pages/SpecificationPage'
@@ -27,7 +26,6 @@ const navItems = [
   { to: '/production-control', title: 'Журнал заказов' },
   { to: '/purchase-control', title: 'Журнал закупок' },
   { to: '/transfer-requests', title: 'Заявки перемещений' },
-  { to: '/production-report-week', title: 'Выпуск недельный' },
   { to: '/resources', title: 'Ресурсы' },
   { to: '/workshop-binding-review', title: 'Разбор привязок' },
   { to: '/stage-distribution', title: 'Распределение этапов' },
@@ -72,7 +70,6 @@ export function App() {
         <Route path="/production-control" element={<ProductionControlPage />} />
         <Route path="/purchase-control" element={<PurchaseControlPage />} />
         <Route path="/transfer-requests" element={<TransferRequestsPage />} />
-        <Route path="/production-report-week" element={<ProductionReportWeekPage />} />
         <Route path="/mrp-runs" element={<MrpRunsPage />} />
         <Route path="/mrp-runs/:runId" element={<MrpResultPage />} />
         <Route path="/resources" element={<ResourcesPage />} />
