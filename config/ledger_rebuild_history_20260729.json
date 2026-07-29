@@ -1,0 +1,80 @@
+{
+  "opening_at": "2026-05-31T23:59:59.999999+03:00",
+  "replay_from": "2026-05-31T23:59:59.999999+03:00",
+  "bootstrap_cutoff": "2026-06-02T14:12:50+00:00",
+  "bootstrap_key": "prod-rebuild-20260729-opening",
+  "required_assembly_item_codes": [
+    "00-00000331",
+    "00-00001323",
+    "НФ-00005432",
+    "НФ-00005804",
+    "НФ-00006916",
+    "НФ-00008685",
+    "НФ-00009196",
+    "НФ-00010800",
+    "НФ-00011025",
+    "НФ-00011376"
+  ],
+  "plans": [
+    {
+      "plan_id": 1,
+      "cutoff": "2026-06-02T14:12:50+00:00",
+      "physical_key": null,
+      "obligation_key": "prod-rebuild-20260729-obligation-plan1"
+    },
+    {
+      "plan_id": 2,
+      "cutoff": "2026-06-11T16:08:24+00:00",
+      "physical_key": "prod-rebuild-20260729-physical-plan2",
+      "obligation_key": "prod-rebuild-20260729-obligation-plan2"
+    },
+    {
+      "plan_id": 3,
+      "cutoff": "2026-06-15T13:39:47+00:00",
+      "physical_key": "prod-rebuild-20260729-physical-plan3",
+      "obligation_key": "prod-rebuild-20260729-obligation-plan3"
+    },
+    {
+      "plan_id": 4,
+      "cutoff": "2026-06-26T17:35:42+00:00",
+      "physical_key": "prod-rebuild-20260729-physical-plan4",
+      "obligation_key": "prod-rebuild-20260729-obligation-plan4"
+    },
+    {
+      "plan_id": 5,
+      "cutoff": "2026-07-02T15:23:36+00:00",
+      "physical_key": "prod-rebuild-20260729-physical-plan5",
+      "obligation_key": "prod-rebuild-20260729-obligation-plan5"
+    },
+    {
+      "plan_id": 6,
+      "cutoff": "2026-07-14T13:33:31+00:00",
+      "physical_key": "prod-rebuild-20260729-physical-plan6",
+      "obligation_key": "prod-rebuild-20260729-obligation-plan6"
+    },
+    {
+      "plan_id": 7,
+      "cutoff": "2026-07-14T13:39:34+00:00",
+      "physical_key": "prod-rebuild-20260729-physical-plan7",
+      "obligation_key": "prod-rebuild-20260729-obligation-plan7"
+    },
+    {
+      "plan_id": 8,
+      "cutoff": "2026-07-14T13:40:49+00:00",
+      "physical_key": "prod-rebuild-20260729-physical-plan8",
+      "obligation_key": "prod-rebuild-20260729-obligation-plan8"
+    },
+    {
+      "plan_id": 9,
+      "cutoff": "2026-07-15T16:42:15+00:00",
+      "physical_key": "prod-rebuild-20260729-physical-plan9",
+      "obligation_key": "prod-rebuild-20260729-obligation-plan9"
+    },
+    {
+      "plan_id": 11,
+      "cutoff": "2026-07-28T11:30:24+00:00",
+      "physical_key": "prod-rebuild-20260729-physical-plan11",
+      "obligation_key": "prod-rebuild-20260729-obligation-plan11"
+    }
+  ]
+}
