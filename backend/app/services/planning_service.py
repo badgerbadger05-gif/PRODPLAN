@@ -25,7 +25,6 @@ from ..models import (
     ProductionPlanHeader,
     DefaultSpecification,
     SpecComponent,
-    ProductionPlanEntry,
     ProductionResource,
     ResourceStage,
     ProductionStage,
@@ -2455,11 +2454,21 @@ def compute_planning_preview(
       (classic multi-level netting issue).
 
     New approach:
-      1) Read root demand from production_plan_entries (MPS) for the horizon.
+      1) Read root demand for the horizon.
       2) For each BOM level:
          - net current level demand against stock/WIP
          - explode ONLY the residual (net) to components (with buffer_days shift)
       3) Accumulate gross/net maps across all levels.
+
+    ВАЖНО (снятие легаси-матрицы плана):
+      Единственным входом спроса здесь была легаси-матрица
+      ``production_plan_entries``. Владелец решил, что плановый выпуск ведёт
+      только канонический периодный план (``production_plan_header`` /
+      ``production_plan_line``), а его развёртку владеет ``mrp_freeze`` →
+      ``period_plan_service``. Легаси-вход удалён и НЕ заменён вторым чтением
+      канонического плана: параллельный движок спроса запрещён каноном.
+      Функция сохранена только как ещё живой в тестах каркас нетирования и
+      подлежит удалению вместе с ``run_planning_run`` отдельной волной.
     """
 
     # --- Resolve planning snapshot ---
@@ -2486,18 +2495,11 @@ def compute_planning_preview(
 
     include_wip = bool(snapshot.get("toggles", {}).get("include_wip", True))
 
-    # --- Root demand (MPS) ---
-    # Note: we aggregate per (item_id, date) to avoid double-counting.
-    mps_rows = (
-        db.query(
-            ProductionPlanEntry.item_id,
-            func.date(ProductionPlanEntry.date).label("d"),
-            func.sum(func.coalesce(ProductionPlanEntry.planned_qty, 0.0)).label("qty"),
-        )
-        .filter(ProductionPlanEntry.date >= d0, ProductionPlanEntry.date <= dmax)
-        .group_by(ProductionPlanEntry.item_id, func.date(ProductionPlanEntry.date))
-        .all()
-    )
+    # --- Root demand ---
+    # Легаси-матрица плана удалена, канонический периодный план сюда намеренно
+    # не подключается (см. docstring). Спрос отсутствует — движок возвращает
+    # пустой результат, а не подставляет второй источник.
+    mps_rows: List[Tuple[int, Any, float]] = []
 
     factor = 1.0 + (ss_percent / 100.0)
 

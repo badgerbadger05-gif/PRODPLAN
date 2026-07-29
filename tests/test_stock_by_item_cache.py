@@ -602,192 +602,38 @@ def test_purchase_results_marks_late_supplier_order_coverage(db_session):
     assert "ЗСНФ-LATE" in (serialized["badge"] or "")
 
 
-def test_turning_item_net_requirement_collapses_to_first_need_date_and_moves_blank(db_session):
-    db = db_session
-    today = datetime.date.today()
+def test_legacy_plan_matrix_rows_are_not_demand_any_more(db_session):
+    """Легаси-матрица плана (`production_plan_entries`) больше не является
+    источником спроса.
 
-    turning_kind = ProductionKind(ref_1c="turn-kind", name="Токарные работы")
-    blank_kind = ProductionKind(ref_1c="blank-kind", name="Заготовительные работы")
-    turning_area = ProductionResource(resource_name="Токарный участок", capacity=8, daily_work_hours=8, buffer_days=0)
-    blank_area = ProductionResource(resource_name="Заготовительный участок", capacity=8, daily_work_hours=8, buffer_days=5)
-    blank_stage = ProductionStage(stage_name="Заготовка", stage_order=1, stage_ref1c="blank-stage")
-    db.add_all([turning_kind, blank_kind, turning_area, blank_area, blank_stage])
-    db.flush()
-    db.add(ResourceProductionKind(resource_id=turning_area.resource_id, production_kind_id=turning_kind.id))
-    db.add(ResourceProductionKind(resource_id=blank_area.resource_id, production_kind_id=blank_kind.id))
-
-    parent = Item(
-        item_code="TURN-PARENT",
-        item_name="Turning Parent",
-        item_article="TURN-PARENT",
-        replenishment_method="Производство",
-        stock_qty=0,
-        status="active",
-    )
-    blank = Item(
-        item_code="TURN-BLANK",
-        item_name="Turning Blank",
-        item_article="TURN-BLANK",
-        replenishment_method="Производство",
-        stock_qty=0,
-        status="active",
-    )
-    db.add_all([parent, blank])
-    db.flush()
-
-    spec = Specification(spec_code="TURN-SPEC", spec_name="Turning Spec", production_kind_id=turning_kind.id)
-    blank_spec = Specification(spec_code="BLANK-SPEC", spec_name="Blank Spec", production_kind_id=blank_kind.id)
-    db.add_all([spec, blank_spec])
-    db.flush()
-    db.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
-    db.add(DefaultSpecification(item_id=blank.item_id, spec_id=blank_spec.spec_id))
-    db.add(SpecComponent(spec_id=spec.spec_id, item_id=blank.item_id, quantity=2.0, stage_id=blank_stage.stage_id))
-    db.add_all(
-        [
-            ProductionPlanEntry(item_id=parent.item_id, date=today + datetime.timedelta(days=2), planned_qty=3),
-            ProductionPlanEntry(item_id=parent.item_id, date=today + datetime.timedelta(days=7), planned_qty=4),
-        ]
-    )
-    db.commit()
-
-    _publish_empty_ledger(db, "turning-collapse")
-    result = compute_planning_preview(
-        db,
-        horizon_days=20,
-        config_overrides={"safety_stock_percent": 0, "toggles": {"include_wip": False}},
-    )
-
-    first_need = (today + datetime.timedelta(days=2)).isoformat()
-    later_need = (today + datetime.timedelta(days=7)).isoformat()
-    parent_net = result["net"][str(parent.item_id)]
-    blank_net = result["net"][str(blank.item_id)]
-
-    assert parent_net == {first_need: 7.0}
-    assert blank_net == {first_need: 14.0}
-    assert later_need not in parent_net
-    assert later_need not in blank_net
-    assert any(
-        w.get("code") == "TURNING_BLANK_PRIORITY"
-        and w.get("item_id") == blank.item_id
-        and w.get("parent_item_id") == parent.item_id
-        and w.get("need_date") == first_need
-        for w in result.get("warnings", [])
-    )
-
-
-def test_bom_explosion_shifts_child_need_date_by_parent_lead_time(db_session):
-    """Classical MRP lead-time offsetting: the child component's need_date
-    is shifted back by the PARENT's production buffer_days. Across multiple
-    BOM levels the buffers accumulate (grandparent + parent + ... ), so the
-    leaf material gets a need_date far enough back to cover the full chain.
-
-    Earlier code used `resolve_buffer_days(child_id)` at every level, which
-    shifted by the wrong link and effectively lost one level of lead time
-    per BOM hop (a 3-level chain with buffers 7/5/3 mis-shifted by 12
-    days).
+    Раньше `compute_planning_preview` читала эту таблицу как MPS: любая строка,
+    записанная мёртвыми ручками `/v1/plan/*`, порождала полноценную
+    BOM-развёртку параллельно каноническому периодному плану. Матрица удалена,
+    и оставшиеся в БД строки должны молча игнорироваться — движок отдаёт пустой
+    спрос, а не второй источник.
     """
     db = db_session
     today = datetime.date.today()
 
-    # Two production stages with different lead times.
-    top_kind = ProductionKind(ref_1c="top-kind", name="Сборка")
-    sub_kind = ProductionKind(ref_1c="sub-kind", name="Узлы")
-    # buffer_days here represents the workshop's production lead time.
-    top_area = ProductionResource(resource_name="Сборка", capacity=8, daily_work_hours=8, buffer_days=7)
-    sub_area = ProductionResource(resource_name="Узлы", capacity=8, daily_work_hours=8, buffer_days=5)
-    db.add_all([top_kind, sub_kind, top_area, sub_area])
-    db.flush()
-    db.add(ResourceProductionKind(resource_id=top_area.resource_id, production_kind_id=top_kind.id))
-    db.add(ResourceProductionKind(resource_id=sub_area.resource_id, production_kind_id=sub_kind.id))
-
-    top = Item(
-        item_code="LT-TOP",
-        item_name="Top Product",
-        item_article="LT-TOP",
-        replenishment_method="Производство",
-        stock_qty=0,
-        status="active",
-    )
-    sub = Item(
-        item_code="LT-SUB",
-        item_name="Sub Assembly",
-        item_article="LT-SUB",
-        replenishment_method="Производство",
-        stock_qty=0,
-        status="active",
-    )
-    leaf = Item(
-        item_code="LT-LEAF",
-        item_name="Leaf Material",
-        item_article="LT-LEAF",
-        replenishment_method="Покупка",   # purchased leaf, no production buffer
-        stock_qty=0,
-        status="active",
-    )
-    db.add_all([top, sub, leaf])
-    db.flush()
-
-    top_spec = Specification(spec_code="TOP", spec_name="Top Spec", production_kind_id=top_kind.id)
-    sub_spec = Specification(spec_code="SUB", spec_name="Sub Spec", production_kind_id=sub_kind.id)
-    db.add_all([top_spec, sub_spec])
-    db.flush()
-    db.add(DefaultSpecification(item_id=top.item_id, spec_id=top_spec.spec_id))
-    db.add(DefaultSpecification(item_id=sub.item_id, spec_id=sub_spec.spec_id))
-    db.add(SpecComponent(spec_id=top_spec.spec_id, item_id=sub.item_id, quantity=1.0))
-    db.add(SpecComponent(spec_id=sub_spec.spec_id, item_id=leaf.item_id, quantity=1.0))
-
-    # Top is needed in 30 days — well past any buffer, so the shift is not
-    # clamped by `today` for any level.
-    top_need = today + datetime.timedelta(days=30)
-    db.add(ProductionPlanEntry(item_id=top.item_id, date=top_need, planned_qty=1))
-    db.commit()
-
-    _publish_empty_ledger(db, "buffer-shift")
-    result = compute_planning_preview(
-        db,
-        horizon_days=60,
-        config_overrides={"safety_stock_percent": 0, "toggles": {"include_wip": False}},
-    )
-
-    # Top stays at its plan date — it's the root of the explosion.
-    assert result["net"][str(top.item_id)] == {top_need.isoformat(): 1.0}
-
-    # Sub is shifted back by TOP's buffer (7 days) — the time it takes to
-    # assemble the top product. Sub must be ready 7 days before top ships.
-    sub_need = top_need - datetime.timedelta(days=7)
-    assert result["net"][str(sub.item_id)] == {sub_need.isoformat(): 1.0}
-
-    # Leaf is shifted back by SUB's buffer (5 days). Total accumulated
-    # offset from top: 7 + 5 = 12 days. The pre-fix code would have shifted
-    # leaf by leaf's own (purchase-flow) buffer of 0 — dropping 12 days of
-    # lead time.
-    leaf_need = sub_need - datetime.timedelta(days=5)
-    assert result["net"][str(leaf.item_id)] == {leaf_need.isoformat(): 1.0}
-
-
-def test_non_turning_item_keeps_requirement_buckets(db_session):
-    db = db_session
-    today = datetime.date.today()
-
     parent = Item(
-        item_code="REG-PARENT",
-        item_name="Regular Parent",
-        item_article="REG-PARENT",
+        item_code="LEGACY-PARENT",
+        item_name="Legacy Parent",
+        item_article="LEGACY-PARENT",
         replenishment_method="Производство",
         stock_qty=0,
         status="active",
     )
     component = Item(
-        item_code="REG-COMP",
-        item_name="Regular Component",
-        item_article="REG-COMP",
+        item_code="LEGACY-COMP",
+        item_name="Legacy Component",
+        item_article="LEGACY-COMP",
         replenishment_method="Производство",
         stock_qty=0,
         status="active",
     )
     db.add_all([parent, component])
     db.flush()
-    spec = Specification(spec_code="REG-SPEC", spec_name="Regular Spec")
+    spec = Specification(spec_code="LEGACY-SPEC", spec_name="Legacy Spec")
     db.add(spec)
     db.flush()
     db.add(DefaultSpecification(item_id=parent.item_id, spec_id=spec.spec_id))
@@ -800,19 +646,16 @@ def test_non_turning_item_keeps_requirement_buckets(db_session):
     )
     db.commit()
 
-    _publish_empty_ledger(db, "regular-phasing")
+    _publish_empty_ledger(db, "legacy-matrix-ignored")
     result = compute_planning_preview(
         db,
         horizon_days=20,
         config_overrides={"safety_stock_percent": 0, "toggles": {"include_wip": False}},
     )
 
-    first_need = (today + datetime.timedelta(days=2)).isoformat()
-    later_need = (today + datetime.timedelta(days=7)).isoformat()
-
-    assert result["net"][str(parent.item_id)] == {first_need: 3.0, later_need: 4.0}
-    assert result["net"][str(component.item_id)] == {first_need: 6.0, later_need: 8.0}
-    assert not any(w.get("code") == "TURNING_BLANK_PRIORITY" for w in result.get("warnings", []))
+    assert result["net"] == {}
+    assert result["gross"] == {}
+    assert result["stats"] == {"items": 0, "buckets": 0}
 
 
 def test_active_supplier_remaining_filters_new_cancelled_deleted_and_missing_date(db_session):

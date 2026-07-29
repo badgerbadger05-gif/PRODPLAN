@@ -18,9 +18,9 @@ import {
   periodPlanStatusClass,
   periodPlanStatusLabel,
 } from '../../domain/planning'
-import type { NomenclatureSearchItem } from '../../domain/productionPlan'
+import type { NomenclatureSearchItem } from '../../domain/nomenclature'
 import { dateRu, dateTimeRu, qty } from '../../lib/format'
-import { ensurePlanItem, searchNomenclature } from '../../services/productionPlan'
+import { searchNomenclature } from '../../services/nomenclature'
 import type { MrpSnapshotResult } from '../../services/periodPlan'
 import {
   addItemToPeriodPlan,
@@ -858,13 +858,15 @@ function PeriodPlanDetailView({ planId, onBack }: DetailViewProps) {
     return () => { cancelled = true; clearTimeout(handle) }
   }, [searchQuery])
 
+  // Строка плана добавляется только по существующей номенклатуре: её ведёт
+  // синхронизация из 1С. Локального создания и переименования позиций из UI
+  // больше нет — поиск обязателен, `item_id` берётся прямо из его результата.
   async function handleAddItem(item: NomenclatureSearchItem) {
     setActing(true)
     setError('')
     setMessage('')
     try {
-      const ensured = await ensurePlanItem(item)
-      await addItemToPeriodPlan(planId, ensured.item_id)
+      await addItemToPeriodPlan(planId, item.item_id)
       setMessage(`Добавлено: ${item.item_name}`)
       setSearchQuery('')
       setSearchRows([])
