@@ -38,8 +38,11 @@ cd /home/barsukov/prodplan
 docker compose -f docker-compose.test.yml logs --tail=200 backend
 docker compose -f docker-compose.test.yml logs --tail=200 frontend
 docker compose -f docker-compose.test.yml logs --tail=200 sync-worker
-docker compose -f docker-compose.test.yml logs --tail=200 reconcile-worker
 ```
+
+Сервиса `reconcile-worker` в compose нет: legacy-воркер живой MRP-сверки
+отключён (`backend/reconcile_worker.py` — заглушка), обновление физической
+истины идёт через `physical_refresh`-оркестратор внутри backend.
 
 ## Миграции production
 

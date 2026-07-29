@@ -22,7 +22,7 @@ operation_ref is still accepted as a manual single-operation override.
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict, field
-from datetime import date, datetime
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy.orm import Session, joinedload
@@ -253,10 +253,6 @@ def _enrich_payload_prices_from_1c(
         "number": entry.number,
         "lookups": lookups,
     }
-
-
-def _short_piecework_number(manufacture_id: int) -> str:
-    return f"PW{int(manufacture_id) % 1_000_000_000:09d}"
 
 
 def _existing_link(db: Session, manufacture_id: int) -> Optional[SyncLink]:

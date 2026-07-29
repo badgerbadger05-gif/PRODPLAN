@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Optional
-
 from sqlalchemy.orm import Session
 
 from ..models import ProductionMaterialIssue, ProductionManufacture, ProductionOrder
@@ -19,36 +17,6 @@ def production_order_number(order: ProductionOrder) -> str:
 
 def purchase_order_number(run_id: int, index: int) -> str:
     return f"PO{int(run_id) % 100000:05d}{int(index) % 1000:03d}"
-
-
-def suffix_for_index(index: int) -> str:
-    if index <= 0:
-        index = 1
-    letters = []
-    value = int(index)
-    while value:
-        value, rem = divmod(value - 1, 26)
-        letters.append(chr(ord("A") + rem))
-    return "".join(reversed(letters))
-
-
-def material_issue_suffix(db: Session, issue: ProductionMaterialIssue) -> str:
-    rows = (
-        db.query(ProductionMaterialIssue.issue_id)
-        .filter(
-            ProductionMaterialIssue.order_id == int(issue.order_id),
-            ProductionMaterialIssue.direction == str(issue.direction or "issue"),
-            ProductionMaterialIssue.status != "cancelled",
-        )
-        .order_by(ProductionMaterialIssue.issue_id.asc())
-        .all()
-    )
-    ids = [int(row[0]) for row in rows]
-    try:
-        idx = ids.index(int(issue.issue_id)) + 1
-    except ValueError:
-        idx = len(ids) + 1
-    return suffix_for_index(idx)
 
 
 def material_issue_number(db: Session, issue: ProductionMaterialIssue) -> str:

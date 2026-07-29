@@ -24,19 +24,19 @@ from ..services.production_report_service import (
 
 from ..services.planning_service import (
     list_planning_runs,
-    get_run_summary,
-    get_run_purchases,  # retained as a test guard; snapshot routes never call it
+    # Retained as test guards: tests/services/test_mrp_result_snapshot.py
+    # monkeypatches these names on this module to prove the snapshot routes
+    # never fall back to the legacy live getters.
+    get_run_purchases,
     get_run_capacity,
-    # retention & pin control
     # Config management
     list_planning_configs,
     create_planning_config_version,
     activate_planning_config_version,
     get_active_planning_config_full
 )
-from ..models import ProductionResource
 from ..schemas import ProductionGroupedResponse, PurchaseCategoryGroupedResponse, ReworkGroupedResponse
-from ..models import ForcedOrderRequest, ForcedOrderResult
+from ..models import ForcedOrderRequest
 
 from ..services.forced_orders import (
     create_forced_order_request,
@@ -275,39 +275,6 @@ def _production_groups_from_snapshot(
     return sorted(
         groups.values(), key=lambda group: (group.get("area_name") or "").lower()
     )
-
-
-def _xlsx_from_rows(
-    *,
-    headers: list[str],
-    data_rows: list[list[Any]],
-    filename: str,
-) -> dict[str, Any]:
-    import base64
-    import io
-
-    try:
-        from openpyxl import Workbook
-        from openpyxl.styles import Font
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"openpyxl not available: {exc}")
-    workbook = Workbook()
-    sheet = workbook.active
-    sheet.title = "MRP"
-    sheet.append(headers)
-    for cell in sheet[1]:
-        cell.font = Font(bold=True)
-    for row in data_rows:
-        sheet.append(row)
-    stream = io.BytesIO()
-    workbook.save(stream)
-    return {
-        "status": "ok",
-        "format": "xlsx",
-        "data_base64": base64.b64encode(stream.getvalue()).decode("ascii"),
-        "filename": filename,
-        "total_rows": len(data_rows),
-    }
 
 
 # Pydantic модели

@@ -237,42 +237,6 @@ class OrderQuantityCalculator:
 
         return self._normalize_lot_qty(base_qty, min_batch, multiple, rounding)
 
-    def _calculate_buffer_qty(self, item_id: int) -> float:
-        """
-        Buffer qty = avg_daily_demand * buffer_days(area)
-        - buffer_days is taken from the first mapped resource for the item's production kind
-        - avg_daily_demand computed as total demand in horizon divided by horizon_days (not count of buckets)
-        """
-        buffer_days = 0
-        # 1) get production_kind from default spec
-        spec_id = self.default_spec_map.get(int(item_id))
-        production_kind_id = None
-        if spec_id:
-            spec = self.spec_by_id.get(int(spec_id))
-            if spec:
-                production_kind_id = getattr(spec, "production_kind_id", None)
-
-        # 2) find first resource candidate for this production kind to read buffer_days
-        if production_kind_id is not None:
-            candidates = [rid for rid, pkset in self.production_kinds_by_resource.items() if production_kind_id in pkset]
-            if candidates:
-                res = self.res_by_id.get(int(candidates[0]))
-                if res is not None:
-                    try:
-                        buffer_days = int(getattr(res, "buffer_days", 0) or 0)
-                    except Exception:
-                        buffer_days = 0
-
-        if buffer_days <= 0 or self.horizon_days <= 0:
-            return 0.0
-
-        total_demand = float(self.total_demand_by_item.get(int(item_id), 0.0) or 0.0)
-        if total_demand <= 0.0:
-            return 0.0
-
-        avg_daily_demand = total_demand / float(max(1, self.horizon_days))
-        return float(avg_daily_demand * buffer_days)
-
     def _is_discrete_unit_by_item(self, item_id: int) -> bool:
         """
         Heuristic to determine if an item must be planned in whole units (шт).

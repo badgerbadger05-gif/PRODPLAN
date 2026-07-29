@@ -253,10 +253,6 @@ def _existing_link(db: Session, issue_id: int) -> Optional[SyncLink]:
     )
 
 
-def _short_transfer_number(issue_id: int) -> str:
-    return f"MT{int(issue_id) % 1_000_000_000:09d}"
-
-
 def _guid_or_empty(value: Optional[str]) -> str:
     ref = _clean_ref1c(value)
     if not ref:

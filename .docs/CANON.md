@@ -49,8 +49,8 @@ PRODPLAN состоит из четырёх последовательно св�
 | События и fold резервов | `backend/app/services/item_ledger/reservation_ledger.py` |
 | Фиксация плана и BOM | `backend/app/services/mrp_freeze.py`, `planning_service.py` |
 | Публикация поколения | `backend/app/services/item_ledger/generation_lifecycle.py`, `obligation_refresh_orchestrator.py`, `planning_truth.py` |
-| Очередь сборки и барабан | контракт `assembly-queue-and-drum.md`; существующий `services/dbr` подлежит замене этим владельцем |
-| Полки и вытягивание | контракт `shelves-buffers-and-mechshop-pull.md`; отдельный NFP не является владельцем спроса |
+| Очередь сборки и барабан | контракт `assembly-queue-and-drum.md`; код — `backend/app/services/item_ledger/drum_scheduler.py`, `drum_schedule_persistence.py`, `assembly_queue_snapshot.py`, `assembly_output_core.py`, `assembly_output_persistence.py` (каталог `services/dbr` удалён) |
+| Полки и вытягивание | контракт `shelves-buffers-and-mechshop-pull.md`; код — `backend/app/services/item_ledger/shelf_projection_core.py`, `shelf_projection_persistence.py`; отдельный NFP не является владельцем спроса |
 | Read-model | `PlanningReadSnapshot` и специализированные `*_snapshot.py` |
 | Frontend | OpenAPI + `src/services`; UI только отображает read-model |
 | Запись в 1С | санкционированные `one_c_*_export.py` |
@@ -136,8 +136,12 @@ read-model. Frontend выполняет только форматировани�
 канонические формулы и имена полей, отсутствие ссылок на удалённые контракты и
 возврата отменённых пользовательских сценариев.
 
-До включения файла в обязательный CI и покрытия перечисленных ниже
-архитектурных инвариантов сведение кода ядра не считается завершённым:
+Файл включён в обязательный CI: workflow `.github/workflows/canon.yml` гоняет
+`pytest -q tests/test_canon_invariants.py` в job `canon-invariants`, от которого
+зависят job'ы `backend` и `frontend` — красный канон блокирует весь прогон.
+
+До покрытия перечисленных ниже архитектурных инвариантов сведение кода ядра
+не считается завершённым:
 
 - фиксированный список писателей `ReservationEvent`;
 - единственные точки записи документов в 1С;

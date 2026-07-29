@@ -37,17 +37,12 @@ from ..models import (
     Specification,
     SyncLink,
     SupplierOrder,
-    SupplierOrderItem,
     ReservationEntry,
     ReservationEvent,
 )
 from .planning_service import (
     DEFAULT_PLANNING_CONFIG,
     get_active_planning_config,
-)
-from .supplier_order_status import (
-    normalize_state as _normalize_supplier_order_state_name,
-    state_counts_in_mrp as _supplier_order_counts_in_mrp,
 )
 from .capacity_scheduler import CapacityScheduler
 from .mrp_stock_helpers import (
@@ -67,12 +62,8 @@ from .replenishment import (
 from .warnings import make_warning
 
 
-PLAN_STATUSES = {"draft", "fixed", "closed"}
-
 # Matches planning_service.DONE_STATE_KEY — 1C state for completed production orders.
 _DONE_STATE_KEY = "ad28565a-991b-11eb-e39a-fa163e61326a"
-_DIRECT_1C_PRODUCTION_HORIZON = date(2026, 5, 1)
-_SUPPLIER_ORDER_DONE_STATES = {"принят на склад"}
 _CLOSE_REFRESH_KEY_PREFIX = "close-fixed-run"
 _FIX_REFRESH_KEY_PREFIX = "fix-period-plan"
 
@@ -235,13 +226,6 @@ def _serialize_plan(
         "line_count": int(line_count or 0) if line_count is not None else None,
         "total_qty": float(total_qty or 0.0) if total_qty is not None else None,
     }
-
-
-def _is_supplier_order_done(order: Optional[SupplierOrder]) -> bool:
-    if order is None or bool(getattr(order, "deletion_mark", False)):
-        return False
-    state_name = _normalize_supplier_order_state_name(getattr(order, "order_state_name", None))
-    return state_name in _SUPPLIER_ORDER_DONE_STATES
 
 
 def _get_plan(db: Session, plan_id: int) -> ProductionPlanHeader:
@@ -588,21 +572,6 @@ def delete_period_plan(db: Session, plan_id: int) -> Dict[str, Any]:
     db.delete(plan)
     db.commit()
     return {"status": "deleted", "id": plan_id, "name": name}
-
-
-def material_availability_positions(
-    db: Session,
-    item_ids: Optional[Iterable[int]] = None,
-) -> Dict[int, Dict[str, float]]:
-    """Expose the canonical ledger pool projection
-    (``on_hand`` / ``incoming`` / ``reserved_soft`` / ``available`` /
-    ``projected`` / ``uncovered``) per item for the period-plan
-    material-availability readers. Item Ledger is the sole stock owner.
-    """
-    from .item_ledger import item_ledger_position
-
-    ids = list(item_ids) if item_ids is not None else None
-    return item_ledger_position(db, ids)
 
 
 def _explode_bom_net_first(
@@ -991,107 +960,6 @@ def _explode_bom_net_first(
     return gross_map, net_map, bom_level_map, explosion_warnings
 
 
-def _load_purchase_supplier_remaining(
-    db: Session,
-    item_ids: List[int],
-    period_to: date,
-    *,
-    exclude_order_ids: Optional[Iterable[int]] = None,
-) -> Dict[int, List[Dict[str, Any]]]:
-    """
-    Batch-load open supplier-order lines for the given purchased item IDs where
-    delivery_date <= period_to.  Results are sorted by delivery_date ascending so
-    they can be consumed greedily (earliest supply covers earliest demand).
-
-    Filtering rules mirror planning_service._get_active_supplier_remaining_by_item_date:
-    - Deleted supplier orders are skipped (deletion_mark=True).
-    - Учитываются только фазы «в пути» / «на складе» (state_counts_in_mrp);
-      «Нет товара» (Новый заказ / В закупку / Бухгалтерия) и терминальные — пропускаются.
-    - Lines without a delivery_date are skipped.
-    - Lines with remaining_qty <= 0 are skipped.
-
-    Each row additionally carries identity — ``order_id`` / ``order_ref1c`` /
-    ``line_id`` (SupplierOrderItem PK) / ``line_number`` / ``fact_at_freeze`` —
-    for the freeze allocation writer. Existing callers read only ``delivery_date``
-    / ``remaining_qty``; the extra keys are inert. ``exclude_order_ids`` drops a
-    run's OWN already-exported supplier orders (self-exclusion). Both the extra
-    keys and the deterministic ``(delivery_date, order_id, line_id)`` tie-break
-    are additive — with ``exclude_order_ids=None`` and no same-date ties the
-    result is the prior behaviour.
-    """
-    if not item_ids:
-        return {}
-    exclude = {int(o) for o in (exclude_order_ids or [])}
-
-    try:
-        rows = (
-            db.query(
-                SupplierOrderItem.item_id_ref,
-                SupplierOrderItem.delivery_date,
-                SupplierOrder.order_state_key,
-                SupplierOrder.order_state_name,
-                SupplierOrderItem.remaining_qty,
-                SupplierOrder.order_id,
-                SupplierOrder.order_ref1c,
-                SupplierOrderItem.item_id,
-                SupplierOrderItem.line_number,
-            )
-            .join(SupplierOrder, SupplierOrder.order_id == SupplierOrderItem.order_id)
-            .filter(SupplierOrderItem.item_id_ref.in_(item_ids))
-            .filter(SupplierOrder.deletion_mark.is_(False))
-            .filter(SupplierOrderItem.delivery_date.isnot(None))
-            .filter(SupplierOrderItem.delivery_date < period_to + timedelta(days=1))
-            .filter(func.coalesce(SupplierOrderItem.remaining_qty, 0.0) > 0)
-            .order_by(
-                SupplierOrderItem.delivery_date.asc(),
-                SupplierOrder.order_id.asc(),
-                SupplierOrderItem.item_id.asc(),
-            )
-            .all()
-        )
-    except Exception:
-        rows = []
-
-    result: Dict[int, List[Dict[str, Any]]] = {}
-    for (
-        iid,
-        delivery_dt,
-        state_key,
-        state_name,
-        qty,
-        order_id,
-        order_ref1c,
-        line_id,
-        line_number,
-    ) in rows:
-        try:
-            if not _supplier_order_counts_in_mrp(state_name):
-                continue
-            if order_id is not None and int(order_id) in exclude:
-                continue
-            item_id = int(iid)
-            delivery_date = (
-                delivery_dt.date() if isinstance(delivery_dt, datetime) else delivery_dt
-            )
-            remaining = float(qty or 0.0)
-        except Exception:
-            continue
-        if remaining <= 1e-12:
-            continue
-        result.setdefault(item_id, []).append(
-            {
-                "delivery_date": delivery_date,
-                "remaining_qty": remaining,
-                "order_id": int(order_id) if order_id is not None else None,
-                "order_ref1c": (str(order_ref1c) if order_ref1c else None),
-                "line_id": int(line_id) if line_id is not None else None,
-                "line_number": int(line_number) if line_number is not None else None,
-                "fact_at_freeze": remaining,
-            }
-        )
-    return result
-
-
 def create_mrp_snapshot_from_period_plan(
     db: Session,
     plan_id: int,
@@ -1340,79 +1208,6 @@ def repair_duplicate_plan_snapshots(
         "current_generation_id": int(parent.id),
         "repaired_by": str(repaired_by) if repaired_by else None,
     }
-
-
-def _prepare_include_run(
-    db: Session,
-    plan_id: int,
-    started_by: Optional[str],
-    now: datetime,
-) -> PlanningRun:
-    """Validate the include plan and get-or-create/refresh ONLY its run header
-    (v2 ). Every other run's header is left untouched by a refreeze.
-    Validation errors carry the same texts as the legacy snapshot entry point
-    and fire before any pool is built or row written.
-    """
-    plan = _get_plan(db, plan_id)
-    if plan.status != "fixed":
-        raise ValueError("MRP-снимок можно создать только из зафиксированного плана")
-    has_line = (
-        db.query(ProductionPlanLine.id)
-        .filter(ProductionPlanLine.plan_id == int(plan.id))
-        .filter(ProductionPlanLine.qty > 0)
-        .first()
-    )
-    if not has_line:
-        raise ValueError("В плане нет положительной потребности для MRP")
-
-    try:
-        cfg_id, cfg = get_active_planning_config(db)
-    except Exception:
-        cfg_id, cfg = 0, dict(DEFAULT_PLANNING_CONFIG)
-
-    snapshot = dict(cfg or {})
-    snapshot["planning_horizon_days"] = max(1, (plan.period_to - plan.period_from).days + 1)
-    snapshot["source_plan"] = {
-        "id": int(plan.id),
-        "name": str(plan.name or ""),
-        "period_from": plan.period_from.isoformat(),
-        "period_to": plan.period_to.isoformat(),
-    }
-
-    run = _latest_fixed_run_for_plan(db, int(plan.id))
-    if run is None:
-        run = PlanningRun(
-            status="FIXED_SNAPSHOT",
-            started_by=started_by or "api",
-            horizon_days=int(snapshot["planning_horizon_days"]),
-            pinned=True,
-            source_plan_id=int(plan.id),
-            period_from=plan.period_from,
-            period_to=plan.period_to,
-            fixed_at=now,
-            config_version_id=cfg_id,
-            config_snapshot=snapshot,
-            warnings=[],
-            kpi={},
-            started_at=now,
-            finished_at=now,
-        )
-        db.add(run)
-    else:
-        run.started_by = started_by or run.started_by or "api"
-        run.horizon_days = int(snapshot["planning_horizon_days"])
-        run.pinned = True
-        run.period_from = plan.period_from
-        run.period_to = plan.period_to
-        run.fixed_at = now
-        run.config_version_id = cfg_id
-        run.config_snapshot = snapshot
-        run.warnings = []
-        run.kpi = {}
-        run.started_at = now
-        run.finished_at = now
-    db.flush()
-    return run
 
 
 def _freeze_one_run(
@@ -1991,17 +1786,6 @@ def bulk_upsert_period_plan_lines(db: Session, plan_id: int, entries: Iterable[D
         saved += 1
     db.commit()
     return {"status": "ok", "saved": int(saved)}
-
-
-def lock_period_plan_lines(db: Session, plan_id: int, run_id: int, line_ids: Optional[Iterable[int]] = None) -> int:
-    plan = _get_plan(db, plan_id)
-    q = db.query(ProductionPlanLine).filter(ProductionPlanLine.plan_id == int(plan.id))
-    if line_ids is not None:
-        ids = [int(x) for x in line_ids]
-        q = q.filter(ProductionPlanLine.id.in_(ids))
-    count = q.update({"locked_by_run_id": int(run_id)}, synchronize_session=False)
-    db.commit()
-    return int(count or 0)
 
 
 def _read_period_plan_execution_payload_for_run(

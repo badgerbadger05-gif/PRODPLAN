@@ -21,7 +21,7 @@ for posting and does not rely on UI-side autofill.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import or_
@@ -31,7 +31,6 @@ from ..models import (
     Item,
     ProductionManufacture,
     ProductionOrder,
-    ProductionOrderLineState,
     ProductionProduct,
     ProductionStage,
     SpecComponent,
@@ -95,11 +94,6 @@ class ManufactureExportEntry:
     status: str = "planned"
     error: Optional[str] = None
     reason: Optional[str] = None
-
-
-def _short_manufacture_number(manufacture_id: int) -> str:
-    """Short, recognizable, unique number that fits 1C's Number column."""
-    return f"PM{int(manufacture_id) % 1_000_000_000:09d}"
 
 
 def _existing_link(db: Session, manufacture_id: int) -> Optional[SyncLink]:

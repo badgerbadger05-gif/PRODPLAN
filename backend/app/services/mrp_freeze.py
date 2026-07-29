@@ -1,4 +1,4 @@
-"""Freeze v2 orchestrator — ``refreeze_active_snapshots`` and its machinery.
+"""Freeze v2 orchestrator — ``freeze_candidate_snapshots`` and its machinery.
 
 Root fix for the fixed-MRP execution-ledger rebuild (increment 2). A single
 "freeze" re-derives every open FIXED_SNAPSHOT plan's net demand against ONE
@@ -20,11 +20,11 @@ Key invariants (see the increment-2 spec):
 * Pool columns are always written as ``''`` / ``'default'`` — never NULL.
 * One commit per operation; ``dry_run`` rolls the whole queue back.
 
-The heavy per-run body (``_freeze_one_run``) and the run-header preparation
-(``_prepare_include_run``) live in :mod:`period_plan_service`; this module owns
-the pool construction, the pool key, the freeze-table writers and the queue
-orchestration. The module cycle (mrp_freeze → period_plan_service) is one-way:
-period_plan_service imports back only locally, inside function bodies.
+The heavy per-run body (``_freeze_one_run``) lives in
+:mod:`period_plan_service`; this module owns the pool construction, the pool
+key, the freeze-table writers and the queue orchestration. The module cycle
+(mrp_freeze → period_plan_service) is one-way: period_plan_service imports back
+only locally, inside function bodies.
 """
 from __future__ import annotations
 
@@ -35,22 +35,19 @@ from hashlib import sha256
 import json
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
-from sqlalchemy import func, text
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..models import (
     DefaultSpecification,
     IgnoredWarehouse,
-    Item,
     LedgerGeneration,
     LedgerFutureSupply,
     MrpFreezeAllocation,
     MrpFreezeBaseline,
     MrpFreezeComponent,
     MrpRequirement,
-    PlannedPurchase,
     PlanningRun,
-    ProductionOrder,
     ProductionPlanHeader,
     ProductionPlanLine,
     ProductionProduct,
@@ -59,9 +56,6 @@ from ..models import (
     StockBin,
     StockLedgerEntry,
     StockWarehouse,
-    SupplierOrder,
-    SupplierOrderItem,
-    SyncLink,
 )
 from .mrp_stock_helpers import WipSupplyLine
 from .planning_run_candidate import PlanningRunCandidateError, _resolve_parent_generation_id
@@ -73,11 +67,6 @@ from .planning_truth import (
     require_accepted_truth,
 )
 from .one_c_export_common import DEFAULT_ORGANIZATION_REF1C
-from .supplier_order_status import state_counts_in_mrp
-from .replenishment import (
-    REPLENISHMENT_FLOW_PURCHASE,
-    classify_replenishment_flow,
-)
 
 __all__ = [
     "PoolKey",
@@ -88,12 +77,10 @@ __all__ = [
     "FreezeTrace",
     "build_shared_pools",
     "freeze_candidate_snapshots",
-    "refreeze_active_snapshots",
 ]
 
 EPS = 1e-9
 FIXED_SNAPSHOT_STATUS = "FIXED_SNAPSHOT"
-PURCHASE_ORDER_ENTITY = "Document_ЗаказПоставщику"
 
 DEFAULT_STOCK_POOL = "default"
 EMPTY_REF = ""
@@ -184,98 +171,6 @@ class FreezeTrace:
     component_norms: List[Tuple[int, int, int, float]] = field(default_factory=list)
 
 
-# ---------------------------------------------------------------------------
-#  — self-exclusion sets (built BEFORE the pools)
-# ---------------------------------------------------------------------------
-def _own_wip_product_ids(db: Session, active_run_ids: Iterable[int]) -> Set[int]:
-    """Product ids of a run's OWN materialised production — orders that EXECUTE
-    the active snapshots' net, so they must not double as coverage of it.
-
-    Own = ``ProductionProduct.source_mrp_requirement_id`` in an active run's
-    requirements, OR ``ProductionOrder.source == 'mrp'`` with ``source_run_id``
-    in the active set.
-    """
-    run_ids = [int(r) for r in active_run_ids]
-    if not run_ids:
-        return set()
-    result: Set[int] = set()
-
-    req_ids = [
-        int(rid)
-        for (rid,) in db.query(MrpRequirement.id)
-        .filter(MrpRequirement.run_id.in_(run_ids))
-        .all()
-    ]
-    if req_ids:
-        for (pid,) in (
-            db.query(ProductionProduct.product_id)
-            .filter(ProductionProduct.source_mrp_requirement_id.in_(req_ids))
-            .all()
-        ):
-            result.add(int(pid))
-
-    for (pid,) in (
-        db.query(ProductionProduct.product_id)
-        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
-        .filter(ProductionOrder.source == "mrp")
-        .filter(ProductionOrder.source_run_id.in_(run_ids))
-        .all()
-    ):
-        result.add(int(pid))
-    return result
-
-
-def _own_supplier_order_ids(db: Session, active_run_ids: Iterable[int]) -> Set[int]:
-    """SupplierOrder ids exported from a run's OWN PlannedPurchase — their supply
-    is the run's own coverage (kept as ``own_exported_left`` in _freeze_one_run),
-    so they must not ALSO be credited via the shared supplier pool.
-
-    A successful ``planned_purchase → Document_ЗаказПоставщику`` sync-link is own
-    when its source PlannedPurchase's run is active. If the source PlannedPurchase
-    row is gone (deleted), the order is excluded by default (: prefer a small
-    over-order to a phantom double-credit; the run_id debt is tracked upstream).
-    """
-    active_set = {int(r) for r in active_run_ids}
-    links = (
-        db.query(SyncLink.source_id, SyncLink.target_ref_key)
-        .filter(SyncLink.source_system == "PRODPLAN")
-        .filter(SyncLink.source_doctype == "planned_purchase")
-        .filter(SyncLink.target_entity == PURCHASE_ORDER_ENTITY)
-        .filter(SyncLink.status == "success")
-        .filter(SyncLink.target_ref_key.isnot(None))
-        .all()
-    )
-    if not links:
-        return set()
-
-    source_ids = [int(sid) for sid, _ref in links]
-    pp_run_by_id = {
-        int(pid): int(rid)
-        for pid, rid in (
-            db.query(PlannedPurchase.purchase_id, PlannedPurchase.run_id)
-            .filter(PlannedPurchase.purchase_id.in_(source_ids))
-            .all()
-        )
-    }
-    own_refs: Set[str] = set()
-    for source_id, ref_key in links:
-        ref = str(ref_key or "").strip()
-        if not ref:
-            continue
-        run_id = pp_run_by_id.get(int(source_id))
-        if run_id is None or run_id in active_set:
-            own_refs.add(ref)
-    if not own_refs:
-        return set()
-
-    return {
-        int(oid)
-        for (oid,) in db.query(SupplierOrder.order_id)
-        .filter(SupplierOrder.order_ref1c.in_(own_refs))
-        .all()
-    }
-
-
 @dataclass(frozen=True)
 class _MrpWarehouseScope:
     has_warehouse_rows: bool
@@ -340,9 +235,6 @@ def build_shared_pools(
     *,
     ledger_generation_id: int,
     relevant_item_ids: Optional[Iterable[int]] = None,
-    wip_relevant_item_ids: Optional[Iterable[int]] = None,
-    exclude_wip_product_ids: Optional[Iterable[int]] = None,
-    exclude_supplier_order_ids: Optional[Iterable[int]] = None,
     stock_baseline_at: datetime | None = None,
 ) -> FreezeSharedPools:
     """Build consume-once pools from one exact *candidate* generation only.
@@ -494,71 +386,6 @@ def _ledger_stock_by_item_at(
         int(item_id): _to_float(qty)
         for item_id, qty in query.group_by(StockLedgerEntry.item_id).all()
     }
-
-
-def _reject_legacy_future_supply(
-    db: Session,
-    relevant_item_ids: Set[int],
-    *,
-    wip_item_ids: Optional[Set[int]] = None,
-) -> None:
-    """Until native pool loaders exist, legacy WIP/supplier candidates are unknown."""
-    if not relevant_item_ids:
-        return
-    wip_scope = wip_item_ids if wip_item_ids is not None else relevant_item_ids
-    wip = (
-        db.query(ProductionProduct.product_id)
-        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
-        .filter(
-            ProductionProduct.item_id.in_(wip_scope),
-            ProductionOrder.deletion_mark.is_(False),
-            func.coalesce(ProductionProduct.remaining_qty, 0) > EPS,
-        )
-        .first()
-    )
-    supplier_rows = (
-        db.query(SupplierOrderItem.item_id, SupplierOrder.order_state_name)
-        .join(SupplierOrder, SupplierOrder.order_id == SupplierOrderItem.order_id)
-        .filter(
-            SupplierOrderItem.item_id_ref.in_(relevant_item_ids),
-            SupplierOrder.deletion_mark.is_(False),
-            func.coalesce(SupplierOrderItem.remaining_qty, 0) > EPS,
-        )
-        .all()
-    )
-    supplier = next(
-        (row for row in supplier_rows if state_counts_in_mrp(row.order_state_name)),
-        None,
-    )
-    exported = (
-        db.query(SyncLink.source_id)
-        .join(
-            PlannedPurchase,
-            PlannedPurchase.purchase_id == SyncLink.source_id,
-        )
-        .filter(
-            PlannedPurchase.item_id.in_(relevant_item_ids),
-            SyncLink.source_system == "PRODPLAN",
-            SyncLink.source_doctype == "planned_purchase",
-            SyncLink.target_entity == PURCHASE_ORDER_ENTITY,
-            SyncLink.status == "success",
-        )
-        .first()
-    )
-    if wip or supplier or exported:
-        kinds = ", ".join(
-            name
-            for name, candidate in (
-                ("wip", wip),
-                ("supplier", supplier),
-                ("exported_purchase", exported),
-            )
-            if candidate
-        )
-        raise LedgerPoolUnavailable(
-            "ledger_pool_unavailable: Ledger-native future supply loader is "
-            f"not implemented for candidate pools: {kinds}"
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -1244,35 +1071,3 @@ def _relevant_item_ids_for_plans(db: Session, plan_ids: Set[int]) -> Set[int]:
         relevant.update(children)
     return relevant
 
-
-def _root_item_ids_for_plans(db: Session, plan_ids: Set[int]) -> Set[int]:
-    if not plan_ids:
-        return set()
-    return {
-        int(item_id)
-        for (item_id,) in db.query(ProductionPlanLine.item_id)
-        .filter(
-            ProductionPlanLine.plan_id.in_(plan_ids),
-            ProductionPlanLine.qty > 0,
-        )
-        .distinct()
-        .all()
-    }
-
-
-def _latest_active_snapshot_run_ids(db: Session) -> List[int]:
-    """All fixed plan runs bound to the exact accepted Ledger generation."""
-    from .planning_truth import require_accepted_truth
-
-    truth = require_accepted_truth(db, consumer="mrp_freeze")
-    rows = (
-        db.query(PlanningRun.run_id)
-        .filter(
-            PlanningRun.status == "FIXED_SNAPSHOT",
-            PlanningRun.ledger_generation_id == int(truth.generation_id),
-            PlanningRun.source_plan_id.isnot(None),
-        )
-        .order_by(PlanningRun.run_id.asc())
-        .all()
-    )
-    return [int(run_id) for (run_id,) in rows if run_id is not None]

@@ -10,9 +10,9 @@ every handler is a pure SELECT.
 
 Data-access is reused from the item-ledger services:
   * reservation_ledger.item_ledger_position — the pool projection.
-  * reconcile.ledger_on_hand_by_item — the per-item on_hand fold + the planning
-    contour (selected − finished-goods − ignored) used for the warehouse split.
   * mrp_freeze.pool_key_for — the canonical pool key.
+The per-warehouse split folds stock_bin.on_hand locally over the planning
+contour (selected − finished-goods − ignored) via :func:`_contour` below.
 Direct ORM reads cover physical entries, immutable make/buy reservations and
 their append-only event tape.
 """
@@ -208,9 +208,9 @@ def _iso(value: Any) -> Optional[str]:
 
 def _contour(db: Session):
     """Return (name_by_ref, selected_refs, finished_goods_refs, ignored_refs,
-    has_settings) — the SAME planning contour ``ledger_on_hand_by_item`` sums, so
-    the per-warehouse split adds up to ``on_hand`` (selected, not finished-goods,
-    not ignored)."""
+    has_settings) — the SAME planning contour ``reconcile.contour_warehouse_refs``
+    reports, so the per-warehouse split adds up to ``on_hand`` (selected, not
+    finished-goods, not ignored)."""
     ignored_refs = {
         str(r[0])
         for r in db.query(models.IgnoredWarehouse.warehouse_ref1c).all()

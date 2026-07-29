@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -171,79 +171,6 @@ class WipSupplyLine:
     order_ref1c: Optional[str]
     product_id: int
     source_line_ref: str = ""
-
-
-def active_wip_supply_by_item(
-    db: Session,
-    exclude_product_ids: Optional[Iterable[int]] = None,
-) -> Dict[int, List[WipSupplyLine]]:
-    """
-    Identity-carrying variant of :func:`active_wip_eta_by_item` for the freeze
-    pools. Same active-WIP filter (non-done, non-deleted, effective supply > 0),
-    but each line keeps ``product_id`` / ``order_id`` / ``order_ref1c`` and the
-    list is sorted deterministically ``(eta or date.min, order_ref1c or '',
-    order_id, product_id)`` so allocation rows are stable across refreezes.
-
-    ``exclude_product_ids`` drops a run's OWN materialised production lines: an
-    order created to *execute* a snapshot's net must not double as *coverage*
-    of that same net (else refreeze self-destructs — net → 0 → orders vanish →
-    net back up …). The legacy ``active_wip_eta_by_item`` is left untouched.
-    """
-    exclude = {int(p) for p in (exclude_product_ids or [])}
-    supply_qty = _production_supply_qty_expr()
-    rows = (
-        db.query(
-            ProductionProduct.item_id,
-            ProductionProduct.product_id,
-            ProductionOrder.order_id,
-            ProductionOrder.order_ref1c,
-            ProductionOrderLineState.planned_finish_date,
-            supply_qty.label("remaining_qty"),
-        )
-        .join(ProductionOrder, ProductionOrder.order_id == ProductionProduct.order_id)
-        .outerjoin(
-            ProductionOrderLineState,
-            ProductionOrderLineState.product_id == ProductionProduct.product_id,
-        )
-        .filter(ProductionOrder.deletion_mark.is_(False))
-        .filter(func.lower(func.coalesce(ProductionOrder.order_state_key, "")) != _DONE_STATE_KEY)
-        .filter(supply_qty > 0)
-        .all()
-    )
-
-    result: Dict[int, List[WipSupplyLine]] = {}
-    for iid, product_id, order_id, order_ref1c, eta, remaining in rows:
-        try:
-            item_id = int(iid)
-            qty = float(remaining or 0.0)
-            pid = int(product_id)
-        except Exception:
-            continue
-        if qty <= 1e-12 or pid in exclude:
-            continue
-        eta_date: Optional[date] = eta if isinstance(eta, date) else None
-        result.setdefault(item_id, []).append(
-            WipSupplyLine(
-                eta=eta_date,
-                remaining=qty,
-                fact_at_freeze=qty,
-                order_id=int(order_id),
-                order_ref1c=(str(order_ref1c) if order_ref1c else None),
-                product_id=pid,
-            )
-        )
-
-    sentinel = date.min
-    for lines in result.values():
-        lines.sort(
-            key=lambda w: (
-                w.eta if w.eta is not None else sentinel,
-                w.order_ref1c or "",
-                int(w.order_id),
-                int(w.product_id),
-            )
-        )
-    return result
 
 
 def consume_wip_detailed(

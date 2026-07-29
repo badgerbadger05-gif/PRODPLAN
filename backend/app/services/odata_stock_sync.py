@@ -236,8 +236,6 @@ def _fetch_warehouse_catalog_rows(req: ODataSyncRequest) -> Tuple[List[Dict], st
 def sync_stock_from_odata(
     db: Session,
     req: ODataSyncRequest,
-    *,
-    reconcile_ledger: bool = False,
 ) -> dict:
     """
     Синхронизация остатков из 1С через OData.
@@ -456,31 +454,10 @@ def sync_stock_from_odata(
         stats.items_updated = updated
         stats.items_unchanged = unchanged
 
-        #  after-step (): Balance-reconcile the ledger bins against
-        # the full snapshot + shadow diagnostics. SHADOW — feeds only the unread
-        # stock_bin/SLE. Guarded: a reconcile failure must never break the
-        # ordinary scheduled sweep.
-        if reconcile_ledger:
-            # Ledger writes are owned by the BUILDING physical_refresh
-            # lifecycle. Keep this opt-in only for its internal caller; the
-            # ordinary scheduled stock sweep remains a legacy/read staging
-            # update and can never create a foreign PhysicalImportBatch or
-            # reconcile adjustment.
-            try:
-                from .item_ledger.reconcile import run_balance_reconcile_after_sweep
-
-                rec = run_balance_reconcile_after_sweep(db, full_balance_rows)
-                print(
-                    f"[OData][stock] balance-reconcile: compared={rec.compared} "
-                    f"matched={rec.matched} pending={rec.pending} held={rec.held} "
-                    f"adjusted={rec.adjusted} "
-                    f"discovered_recorders={rec.discovered_recorders} "
-                    f"discovery_skipped={rec.discovery_skipped} "
-                    f"anomalies={rec.anomalies}",
-                    flush=True,
-                )
-            except Exception as e:
-                print(f"[OData][stock] balance-reconcile skipped: {e}", flush=True)
+        # Ledger writes are owned by the BUILDING physical_refresh lifecycle
+        # (physical_refresh_orchestrator / opening_balance_reconcile). This
+        # scheduled stock sweep is a legacy/read staging update only: it never
+        # creates a PhysicalImportBatch and never touches stock_bin/SLE.
 
         if req.dry_run:
             db.rollback()
